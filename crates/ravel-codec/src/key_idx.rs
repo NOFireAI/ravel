@@ -8,8 +8,9 @@
 //! 1. [`key_idx_prefix_range`] bounds the first read from the footer entry's
 //!    `prefix_len` before it is issued, and [`KeyIdxPrefix::parse`] verifies
 //!    the header and its bounds over `[0, prefix_len)`.
-//! 2. [`KeyIdxPrefix::locate`] verifies the field's directory and names the
-//!    byte range of the one bucket the key mixes to.
+//! 2. [`KeyIdxPrefix::locate`] declines when the header names the field
+//!    under a key type other than the caller's, else verifies the field's
+//!    directory and names the byte range of the one bucket the key mixes to.
 //! 3. [`KeyIdxBucket::blocks`] verifies and decodes that bucket and returns
 //!    the blocks holding the key.
 //!
@@ -563,8 +564,8 @@ impl<'a> KeyIdxPrefix<'a> {
     /// entry's value. Verifies `header_crc32c`, the version, `bucket_bits`,
     /// the reserved field, the header's `prefix_len` against the footer's,
     /// field count, names, order and key types, and that every directory
-    /// lies inside the prefix and every bucket area past it and inside the
-    /// section. Directories are verified when a field is located.
+    /// lies inside the prefix past the header's `header_crc32c` and every
+    /// bucket area past the prefix and inside the section. Directories are verified when a field is located.
     pub fn parse(
         prefix: &'a [u8],
         footer_prefix_len: u32,
@@ -734,13 +735,22 @@ impl<'a> KeyIdxPrefix<'a> {
     }
 
     /// Step (b): verifies the field's directory and returns the bucket
-    /// `key8` mixes to, with its byte range in the section. `None` when the
-    /// header does not name the field.
-    pub fn locate(&self, field: &str, key8: &Key8) -> Result<Option<KeyIdxBucket>, CodecError> {
+    /// `key8` mixes to, with its byte range in the section. `key_type` is the
+    /// type the caller derived `key8` under. `None` (decline) when the header
+    /// does not name the field or names it under another `key_type`.
+    pub fn locate(
+        &self,
+        field: &str,
+        key_type: KeyType,
+        key8: &Key8,
+    ) -> Result<Option<KeyIdxBucket>, CodecError> {
         let Some(index) = self.field_index(field) else {
             return Ok(None);
         };
         let header = &self.fields[index];
+        if header.key_type != key_type {
+            return Ok(None);
+        }
         let ends = self.directory(header)?;
         let bucket = mix(key8, self.bucket_bits);
         let (start, end) = bucket_bounds(&ends, bucket)?;
@@ -890,19 +900,22 @@ fn decode_frame(
 }
 
 /// Probes a section held whole in memory: steps (a) to (c) over slices of
-/// `section`. `Ok(None)` when the header does not name `field` (the probe
-/// declines), `Ok(Some(empty))` when the key is absent, otherwise the
-/// ascending blocks whose `key8` matches.
+/// `section`. `key_type` is the type the caller derived `key8` under.
+/// `Ok(None)` when the header does not name `field` or names it under
+/// another `key_type` (the probe declines), `Ok(Some(empty))` when the key
+/// is absent, otherwise the ascending blocks whose `key8` matches.
 pub fn probe(
     section: &[u8],
     footer_prefix_len: u32,
     field: &str,
+    key_type: KeyType,
     key8: &Key8,
 ) -> Result<Option<Vec<u32>>, CodecError> {
     probe_ranged(
         section.len() as u64,
         footer_prefix_len,
         field,
+        key_type,
         key8,
         |range| {
             let start = to_usize(range.start, "range start")?;
@@ -916,11 +929,12 @@ pub fn probe(
 
 /// Steps (a) to (c) through a caller's ranged byte source: one read of
 /// `[0, prefix_len)`, then one read of the bucket the key mixes to, skipped
-/// when that bucket is empty. Same results as [`probe`].
+/// when that bucket is empty or the probe declines. Same results as [`probe`].
 pub fn probe_ranged<B, F>(
     section_len: u64,
     footer_prefix_len: u32,
     field: &str,
+    key_type: KeyType,
     key8: &Key8,
     mut read: F,
 ) -> Result<Option<Vec<u32>>, CodecError>
@@ -931,7 +945,7 @@ where
     let prefix_range = key_idx_prefix_range(footer_prefix_len, section_len)?;
     let prefix_bytes = read(prefix_range)?;
     let prefix = KeyIdxPrefix::parse(prefix_bytes.as_ref(), footer_prefix_len, section_len)?;
-    let Some(bucket) = prefix.locate(field, key8)? else {
+    let Some(bucket) = prefix.locate(field, key_type, key8)? else {
         return Ok(None);
     };
     if bucket.is_empty() {
@@ -1118,8 +1132,13 @@ mod tests {
         }
     }
 
-    fn probe_of(section: &EncodedKeyIdx, field: &str, key: &Key8) -> Option<Vec<u32>> {
-        probe(&section.bytes, section.prefix_len, field, key).expect("probe")
+    fn probe_of(
+        section: &EncodedKeyIdx,
+        field: &str,
+        key_type: KeyType,
+        key: &Key8,
+    ) -> Option<Vec<u32>> {
+        probe(&section.bytes, section.prefix_len, field, key_type, key).expect("probe")
     }
 
     #[test]
@@ -1127,15 +1146,27 @@ mod tests {
         let a = acceptance_section();
         let s = &a.section;
         assert_eq!(
-            probe_of(s, "user_id", &a.key),
+            probe_of(s, "user_id", KeyType::I64, &a.key),
             Some(vec![3, 10, 11, 12, 13, 14, 40, 97])
         );
-        assert_eq!(probe_of(s, "user_id", &a.below), Some(vec![9, 40]));
-        assert_eq!(probe_of(s, "user_id", &a.above), Some(vec![2, 15, 98]));
-        assert_eq!(probe_of(s, "user_id", &a.absent_same_bucket), Some(vec![]));
-        assert_eq!(probe_of(s, "a_str", &key8_str("GET")), Some(vec![0]));
-        assert_eq!(probe_of(s, "empty", &a.key), Some(vec![]));
-        assert_eq!(probe_of(s, "missing", &a.key), None);
+        assert_eq!(
+            probe_of(s, "user_id", KeyType::I64, &a.below),
+            Some(vec![9, 40])
+        );
+        assert_eq!(
+            probe_of(s, "user_id", KeyType::I64, &a.above),
+            Some(vec![2, 15, 98])
+        );
+        assert_eq!(
+            probe_of(s, "user_id", KeyType::I64, &a.absent_same_bucket),
+            Some(vec![])
+        );
+        assert_eq!(
+            probe_of(s, "a_str", KeyType::Str, &key8_str("GET")),
+            Some(vec![0])
+        );
+        assert_eq!(probe_of(s, "empty", KeyType::Bytes, &a.key), Some(vec![]));
+        assert_eq!(probe_of(s, "missing", KeyType::I64, &a.key), None);
 
         // The mix, pinned by hand (python: ((k * 0x9E3779B97F4A7C15) % 2**64) >> 56)
         // and by `reference_bucket`, against the bucket the reader reads.
@@ -1153,7 +1184,7 @@ mod tests {
             let key8 = key.to_be_bytes();
             assert_eq!(reference_bucket(&key8, 8), bucket, "reference mix {key:#x}");
             let located = prefix
-                .locate("user_id", &key8)
+                .locate("user_id", KeyType::I64, &key8)
                 .expect("locate")
                 .expect("field named");
             assert_eq!(
@@ -1189,10 +1220,17 @@ mod tests {
         assert!(!expected_bucket.is_empty());
 
         let mut reads: Vec<Range<u64>> = Vec::new();
-        let blocks = probe_ranged(section_len, s.prefix_len, "user_id", &a.key, |range| {
-            reads.push(range.clone());
-            Ok(s.bytes[range.start as usize..range.end as usize].to_vec())
-        })
+        let blocks = probe_ranged(
+            section_len,
+            s.prefix_len,
+            "user_id",
+            KeyType::I64,
+            &a.key,
+            |range| {
+                reads.push(range.clone());
+                Ok(s.bytes[range.start as usize..range.end as usize].to_vec())
+            },
+        )
         .expect("probe");
         assert_eq!(blocks, Some(vec![3, 10, 11, 12, 13, 14, 40, 97]));
         assert_eq!(
@@ -1206,7 +1244,7 @@ mod tests {
         let prefix = KeyIdxPrefix::parse(&s.bytes[..first.end as usize], s.prefix_len, section_len)
             .expect("prefix");
         let located = prefix
-            .locate("user_id", &a.key)
+            .locate("user_id", KeyType::I64, &a.key)
             .expect("locate")
             .expect("named");
         assert_eq!(located.range(), expected_bucket);
@@ -1241,6 +1279,7 @@ mod tests {
             s.bytes.len() as u64,
             s.prefix_len,
             "user_id",
+            KeyType::I64,
             &absent,
             |r| {
                 reads += 1;
@@ -1250,6 +1289,94 @@ mod tests {
         .expect("probe");
         assert_eq!(blocks, Some(vec![]));
         assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn a_field_probed_under_another_key_type_declines() {
+        let a = acceptance_section();
+        let s = &a.section;
+        // user_id was written as I64. A caller whose column is now STR derives
+        // its key8 from the string form; the header's key_type decides.
+        let as_str = key8_str(&USER_ID.to_string());
+        assert_eq!(probe_of(s, "user_id", KeyType::Str, &as_str), None);
+        // Even the I64 key8 itself, asked under another type, declines.
+        for other in [KeyType::Id16, KeyType::Str, KeyType::Bytes] {
+            assert_eq!(probe_of(s, "user_id", other, &a.key), None, "{other:?}");
+        }
+        assert_eq!(
+            probe_of(s, "user_id", KeyType::I64, &a.key),
+            Some(vec![3, 10, 11, 12, 13, 14, 40, 97])
+        );
+        assert_eq!(
+            probe_of(s, "user_id", KeyType::I64, &a.absent_same_bucket),
+            Some(vec![])
+        );
+        // Str and Bytes derive the same key8; the stored key_type still decides.
+        assert_eq!(key8_bytes(b"GET"), key8_str("GET"));
+        assert_eq!(
+            probe_of(s, "a_str", KeyType::Bytes, &key8_bytes(b"GET")),
+            None
+        );
+        assert_eq!(
+            probe_of(s, "a_str", KeyType::Str, &key8_str("GET")),
+            Some(vec![0])
+        );
+        // A field with no entries proves absence only under its own type.
+        assert_eq!(probe_of(s, "empty", KeyType::I64, &a.key), None);
+        assert_eq!(probe_of(s, "empty", KeyType::Bytes, &a.key), Some(vec![]));
+
+        // Ranged: the decline costs the prefix read only.
+        let section_len = s.bytes.len() as u64;
+        let mut reads: Vec<Range<u64>> = Vec::new();
+        let declined = probe_ranged(
+            section_len,
+            s.prefix_len,
+            "user_id",
+            KeyType::Str,
+            &a.key,
+            |r| {
+                reads.push(r.clone());
+                Ok(s.bytes[r.start as usize..r.end as usize].to_vec())
+            },
+        )
+        .expect("probe");
+        assert_eq!(declined, None);
+        assert_eq!(reads, vec![0..u64::from(s.prefix_len)]);
+        reads.clear();
+        let unnamed = probe_ranged(
+            section_len,
+            s.prefix_len,
+            "missing",
+            KeyType::I64,
+            &a.key,
+            |r| {
+                reads.push(r.clone());
+                Ok(s.bytes[r.start as usize..r.end as usize].to_vec())
+            },
+        )
+        .expect("probe");
+        assert_eq!(unnamed, None);
+        assert_eq!(reads, vec![0..u64::from(s.prefix_len)]);
+
+        // The three-step API applies the same check in `locate`.
+        let prefix =
+            KeyIdxPrefix::parse(&s.bytes[..s.prefix_len as usize], s.prefix_len, section_len)
+                .expect("prefix");
+        assert_eq!(
+            prefix.field("user_id").expect("named").key_type(),
+            KeyType::I64
+        );
+        assert_eq!(
+            prefix
+                .locate("user_id", KeyType::Str, &a.key)
+                .expect("locate"),
+            None
+        );
+        let located = prefix
+            .locate("user_id", KeyType::I64, &a.key)
+            .expect("locate")
+            .expect("named under I64");
+        assert_eq!(located.bucket(), reference_bucket(&a.key, 8));
     }
 
     #[test]
@@ -1336,7 +1463,10 @@ mod tests {
         let (raw, crc_at) = parse_raw_header(&s.bytes).expect("raw");
         assert_eq!(raw.fields[0].dir_offset, crc_at as u64 + 4);
         assert!(raw.fields[63].dir_offset > 1 << 14);
-        assert_eq!(probe_of(&s, "f007", &key8_i64(21)), Some(vec![3]));
+        assert_eq!(
+            probe_of(&s, "f007", KeyType::I64, &key8_i64(21)),
+            Some(vec![3])
+        );
     }
 
     #[test]
@@ -1410,7 +1540,7 @@ mod tests {
         prefix_len: u32,
         key: &Key8,
     ) -> Result<Option<Vec<u32>>, CodecError> {
-        probe(bytes, prefix_len, "user_id", key)
+        probe(bytes, prefix_len, "user_id", KeyType::I64, key)
     }
 
     #[test]
@@ -1463,7 +1593,7 @@ mod tests {
         )
         .expect("prefix");
         let range = prefix
-            .locate("user_id", &a.key)
+            .locate("user_id", KeyType::I64, &a.key)
             .expect("locate")
             .expect("named")
             .range();
@@ -1559,6 +1689,30 @@ mod tests {
     }
 
     #[test]
+    fn a_dir_offset_inside_the_header_is_corrupted() {
+        let a = acceptance_section();
+        let s = &a.section;
+        let p = s.prefix_len;
+        let mut boundary_checked = false;
+        for d in 0..128u64 {
+            let bytes = reseal(&s.bytes, |h| h.fields[2].dir_offset = d);
+            let (_, crc_at) = parse_raw_header(&bytes).expect("raw");
+            let header_len = crc_at as u64 + 4;
+            if d >= header_len {
+                break;
+            }
+            boundary_checked |= d == header_len - 1;
+            let needle = format!("dir_offset {d} outside [{header_len}, {p})");
+            assert_corrupted(probe_user(&bytes, p, &a.key), &needle);
+            assert_corrupted(verify_key_idx(&bytes, p), &needle);
+        }
+        assert!(
+            boundary_checked,
+            "the last header_crc32c byte was not probed"
+        );
+    }
+
+    #[test]
     fn footer_prefix_len_violations_are_corrupted() {
         let a = acceptance_section();
         let s = &a.section;
@@ -1591,6 +1745,7 @@ mod tests {
             padded.len() as u64,
             KEY_IDX_PREFIX_MAX + 1,
             "user_id",
+            KeyType::I64,
             &a.key,
             |r| {
                 reads += 1;
@@ -1673,7 +1828,10 @@ mod tests {
     }
 
     fn frame_check(s: &EncodedKeyIdx, key: &Key8, needle: &str) {
-        assert_corrupted(probe(&s.bytes, s.prefix_len, "k", key), needle);
+        assert_corrupted(
+            probe(&s.bytes, s.prefix_len, "k", KeyType::I64, key),
+            needle,
+        );
         assert_corrupted(verify_key_idx(&s.bytes, s.prefix_len), needle);
     }
 
@@ -1686,7 +1844,7 @@ mod tests {
             3,
         );
         assert_eq!(
-            probe(&s.bytes, s.prefix_len, "k", &lo).expect("probe"),
+            probe(&s.bytes, s.prefix_len, "k", KeyType::I64, &lo).expect("probe"),
             Some(vec![1, 4])
         );
         verify_key_idx(&s.bytes, s.prefix_len).expect("verify");
@@ -1794,7 +1952,10 @@ mod tests {
         let empty = || vec![Vec::new(), Vec::new()];
         let check = |parts: Vec<FieldParts>, needle: &str| {
             let s = assemble(1, &parts).expect("assemble");
-            assert_corrupted(probe(&s.bytes, s.prefix_len, "a", &lo), needle);
+            assert_corrupted(
+                probe(&s.bytes, s.prefix_len, "a", KeyType::I64, &lo),
+                needle,
+            );
             assert_corrupted(verify_key_idx(&s.bytes, s.prefix_len), needle);
         };
         check(
@@ -1819,7 +1980,7 @@ mod tests {
             .collect();
         let s = assemble(1, &ok).expect("assemble");
         assert_eq!(
-            probe(&s.bytes, s.prefix_len, "f063", &lo).expect("probe"),
+            probe(&s.bytes, s.prefix_len, "f063", KeyType::I64, &lo).expect("probe"),
             Some(vec![])
         );
     }
@@ -1830,7 +1991,7 @@ mod tests {
         // Header says 3 entries; the one frame holds 2.
         let s = one_frame_section(0, encode_frame(&[(lo, 1), (hi, 2)]).expect("frame"), 3);
         assert_eq!(
-            probe(&s.bytes, s.prefix_len, "k", &lo).expect("probe"),
+            probe(&s.bytes, s.prefix_len, "k", KeyType::I64, &lo).expect("probe"),
             Some(vec![1])
         );
         assert_corrupted(verify_key_idx(&s.bytes, s.prefix_len), "sum to 2");
@@ -1913,17 +2074,17 @@ mod tests {
                 prop_assert_eq!(field.entry_count, distinct as u64);
                 prop_assert_eq!(field.bucket_entry_counts.len(), 1usize << bucket_bits);
                 for (k, blocks) in &model {
-                    let got = probe(&s.bytes, s.prefix_len, &input.name, k).expect("probe");
+                    let got = probe(&s.bytes, s.prefix_len, &input.name, input.key_type, k).expect("probe");
                     prop_assert_eq!(got, Some(blocks.iter().copied().collect::<Vec<_>>()));
-                    let located = prefix.locate(&input.name, k).expect("locate").expect("named");
+                    let located = prefix.locate(&input.name, input.key_type, k).expect("locate").expect("named");
                     prop_assert_eq!(located.bucket(), reference_bucket(k, bucket_bits));
                 }
                 if !model.contains_key(&absent) {
-                    let got = probe(&s.bytes, s.prefix_len, &input.name, &absent).expect("probe");
+                    let got = probe(&s.bytes, s.prefix_len, &input.name, input.key_type, &absent).expect("probe");
                     prop_assert_eq!(got, Some(vec![]));
                 }
             }
-            let got = probe(&s.bytes, s.prefix_len, "~unnamed", &absent).expect("probe");
+            let got = probe(&s.bytes, s.prefix_len, "~unnamed", KeyType::I64, &absent).expect("probe");
             prop_assert_eq!(got, None);
         }
 
