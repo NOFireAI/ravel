@@ -177,7 +177,11 @@ Identical in shape to RLOG/RSEG:
    of each, every range inside the section area, every
    `uncompressed_len` within the cap. `validate_sections` does not refuse a
    kind it does not know; it checks presence of the mandatory kinds and the
-   range and compression tag of every entry.
+   range and compression tag of every entry. The KEY_IDX entry must be stored
+   uncompressed (`comp` none and `uncompressed_len` equal to `len`), and its
+   `prefix_len` must be non-zero, no larger than the section's `len`, and at
+   most `KEY_IDX_PREFIX_MAX` (4 MiB, `ravel-codec`); `prefix_len` on any other
+   entry is not checked.
 
 ## SpanFooter
 
@@ -492,7 +496,8 @@ writer:
 probe: both return the ascending block ordinals the section names for the
 id's `key8`, an empty list when the key is absent, and `Corrupted` for an
 ordinal at or past the block count anywhere in the bucket read. The ranged
-form takes a range-read callback and issues exactly the two reads above.
+form takes a range-read callback and issues at most the two reads above, the
+second only when the bucket for the key is non-empty.
 Neither takes the SKIP_IDX intersection described next; that is the query
 path's step.
 

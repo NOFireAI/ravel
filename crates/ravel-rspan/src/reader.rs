@@ -308,12 +308,24 @@ mod tests {
     /// skip entry's `min_trace_id` in that entry's block, and returns its
     /// footer entry.
     fn append_key_idx(obj: &mut Vec<u8>, skip_raw: &[u8]) -> crate::footer::SectionDesc {
+        append_key_idx_with(obj, skip_raw, &[])
+    }
+
+    /// [`append_key_idx`] plus `extra` `(trace_id, block ordinal)` pairs,
+    /// which the encoder takes as given, ordinals past the block count
+    /// included.
+    fn append_key_idx_with(
+        obj: &mut Vec<u8>,
+        skip_raw: &[u8],
+        extra: &[([u8; 16], u32)],
+    ) -> crate::footer::SectionDesc {
         let skip = SkipIndex::decode(skip_raw, MAX_BLOCKS).expect("skip index decodes");
         let encoded = crate::key_index::encode_trace_key_idx(
             skip.blocks
                 .iter()
                 .enumerate()
-                .map(|(block, entry)| (entry.min_trace_id, block as u32)),
+                .map(|(block, entry)| (entry.min_trace_id, block as u32))
+                .chain(extra.iter().copied()),
         )
         .expect("encode KEY_IDX");
         let offset = obj.len() as u64;
@@ -663,6 +675,196 @@ mod tests {
             Ok(_) => panic!("expected Corrupted(bloom entry count ...), opened successfully"),
             Err(other) => panic!("expected Corrupted(bloom entry count ...), got {other:?}"),
         }
+    }
+
+    /// A two-block object whose KEY_IDX carries each block's `min_trace_id`
+    /// plus `extra` pairs, every bucket frame well-formed and crc-correct, so
+    /// only the probe's block-count check can refuse an ordinal in `extra`.
+    fn two_block_object(extra: &[([u8; 16], u32)]) -> Vec<u8> {
+        use crate::footer::{COMP_NONE, SectionDesc, write_footer_and_trailer};
+        use crate::skip_index::BlockEntry;
+        use ravel_codec::bloom::BloomBuilder;
+        use ravel_codec::bloom_section::encode_bloom_section;
+
+        let blocks_bytes = vec![0u8; 8];
+        let entry = |block: u8| BlockEntry {
+            block_offset: 4 * u64::from(block),
+            block_len: 4,
+            block_crc32c: 0,
+            record_count: 1,
+            min_trace_id: [block; 16],
+            max_trace_id: [block; 16],
+            min_start_ts: 0,
+            max_end_ts: 1,
+            min_duration_ns: 0,
+            max_duration_ns: 1,
+            status_mask: 0,
+        };
+        let skip_raw = SkipIndex::new(vec![entry(0), entry(1)]).encode();
+        let bloom_raw =
+            encode_bloom_section(&[BloomBuilder::new(0).finish(), BloomBuilder::new(0).finish()]);
+
+        let mut obj = Vec::new();
+        obj.extend_from_slice(&blocks_bytes);
+        let skip_off = obj.len() as u64;
+        obj.extend_from_slice(&skip_raw);
+        let bloom_off = obj.len() as u64;
+        obj.extend_from_slice(&bloom_raw);
+        let key_idx_desc = append_key_idx_with(&mut obj, &skip_raw, extra);
+
+        let sections = vec![
+            SectionDesc {
+                kind: kind::BLOCKS,
+                offset: 0,
+                len: blocks_bytes.len() as u64,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: blocks_bytes.len() as u64,
+                prefix_len: 0,
+            },
+            SectionDesc {
+                kind: kind::SKIP_IDX,
+                offset: skip_off,
+                len: skip_raw.len() as u64,
+                crc32c: crc32c::crc32c(&skip_raw),
+                comp: COMP_NONE,
+                uncomp_len: skip_raw.len() as u64,
+                prefix_len: 0,
+            },
+            SectionDesc {
+                kind: kind::BLOOM,
+                offset: bloom_off,
+                len: bloom_raw.len() as u64,
+                crc32c: crc32c::crc32c(&bloom_raw),
+                comp: COMP_NONE,
+                uncomp_len: bloom_raw.len() as u64,
+                prefix_len: 0,
+            },
+            key_idx_desc,
+        ];
+        let footer = SpanFooter {
+            tenant_hash: [0u8; 16],
+            shard: 0,
+            writer_id: [0u8; 16],
+            writer_epoch: 0,
+            writer_seq: 0,
+            min_start_ts_ns: 0,
+            max_end_ts_ns: 1,
+            record_count: 2,
+            block_count: 2,
+            min_trace_id: [0u8; 16],
+            max_trace_id: [1u8; 16],
+            sections,
+            level: 0,
+            input_set_hash: Vec::new(),
+            part_index: 0,
+        };
+        write_footer_and_trailer(&mut obj, &footer);
+        obj
+    }
+
+    /// Probes `trace` through both readers of `obj`.
+    fn probe_both(obj: &[u8], trace: &[u8; 16]) -> [Result<Option<Vec<u32>>, SpanSegError>; 2] {
+        let whole = RspanReader::new(obj, &RspanConfig::default())
+            .expect("a KEY_IDX naming any ordinal still opens")
+            .probe_trace(trace);
+        let footer = crate::footer::open(obj).expect("footer");
+        let skip_desc = footer.section(kind::SKIP_IDX).expect("skip section");
+        let skip_raw = crate::footer::read_section(obj, skip_desc, DEFAULT_MAX_UNCOMP)
+            .expect("skip section bytes");
+        let ranged = crate::ranged::RspanRangeReader::from_sections(&footer, &skip_raw)
+            .expect("range reader")
+            .probe_trace(trace, |r| {
+                obj.get(r.start as usize..r.end as usize)
+                    .ok_or_else(|| SpanSegError::Corrupted("test read past the object".into()))
+            });
+        [whole, ranged]
+    }
+
+    /// An ordinal at or past the SKIP_IDX block count in the probed bucket is
+    /// `Corrupted` from both readers, whether it belongs to the probed trace or
+    /// to another trace sharing the bucket. The last ordinal below the count is
+    /// answered, so the refusal is the bound and not the construction.
+    #[test]
+    fn key_idx_ordinal_at_or_past_block_count_is_corrupted() {
+        use ravel_codec::key_idx::{KEY_IDX_WRITER_BUCKET_BITS, bucket_index, key8_id16};
+
+        const BLOCK_COUNT: u32 = 2;
+        let probed = [0xabu8; 16];
+        let bucket_of =
+            |t: &[u8; 16]| bucket_index(&key8_id16(t), KEY_IDX_WRITER_BUCKET_BITS).expect("bucket");
+        let neighbour = (0u8..=255)
+            .map(|b| {
+                let mut t = [0x5au8; 16];
+                t[0] = b;
+                t
+            })
+            .find(|t| key8_id16(t) != key8_id16(&probed) && bucket_of(t) == bucket_of(&probed))
+            .expect("a second key8 in the probed bucket");
+
+        for bad in [BLOCK_COUNT, BLOCK_COUNT + 5] {
+            for (owner, extra) in [
+                ("probed trace", vec![(probed, bad)]),
+                ("bucket neighbour", vec![(probed, 0), (neighbour, bad)]),
+            ] {
+                let obj = two_block_object(&extra);
+                for (reader, got) in ["RspanReader", "RspanRangeReader"]
+                    .into_iter()
+                    .zip(probe_both(&obj, &probed))
+                {
+                    match got {
+                        Err(SpanSegError::Corrupted(msg)) => assert!(
+                            msg.contains(&format!("names block {bad}, object has 2 blocks")),
+                            "{reader}, ordinal {bad} on the {owner}: unexpected message {msg}"
+                        ),
+                        other => panic!(
+                            "{reader}, ordinal {bad} on the {owner}: expected Corrupted, got {other:?}"
+                        ),
+                    }
+                }
+            }
+        }
+
+        let obj = two_block_object(&[(probed, BLOCK_COUNT - 1), (neighbour, 0)]);
+        for got in probe_both(&obj, &probed) {
+            assert_eq!(got.expect("in-range ordinal"), Some(vec![BLOCK_COUNT - 1]));
+        }
+    }
+
+    /// A key whose bucket is empty costs the ranged probe one read, the prefix.
+    #[test]
+    fn ranged_probe_of_an_empty_bucket_reads_only_the_prefix() {
+        use ravel_codec::key_idx::{KEY_IDX_WRITER_BUCKET_BITS, bucket_index, key8_id16};
+
+        let obj = two_block_object(&[]);
+        let bucket_of =
+            |t: &[u8; 16]| bucket_index(&key8_id16(t), KEY_IDX_WRITER_BUCKET_BITS).expect("bucket");
+        let occupied = [bucket_of(&[0u8; 16]), bucket_of(&[1u8; 16])];
+        let absent = (2u8..=255)
+            .map(|b| [b; 16])
+            .find(|t| !occupied.contains(&bucket_of(t)))
+            .expect("a key in an empty bucket");
+
+        let footer = crate::footer::open(&obj).expect("footer");
+        let key_idx = *footer.section(kind::KEY_IDX).expect("KEY_IDX section");
+        let skip_desc = footer.section(kind::SKIP_IDX).expect("skip section");
+        let skip_raw = crate::footer::read_section(&obj, skip_desc, DEFAULT_MAX_UNCOMP)
+            .expect("skip section bytes");
+        let ranged = crate::ranged::RspanRangeReader::from_sections(&footer, &skip_raw)
+            .expect("range reader");
+        let mut reads = Vec::new();
+        let got = ranged
+            .probe_trace(&absent, |r| {
+                reads.push(r.clone());
+                obj.get(r.start as usize..r.end as usize)
+                    .ok_or_else(|| SpanSegError::Corrupted("test read past the object".into()))
+            })
+            .expect("probe");
+        assert_eq!(got, Some(vec![]));
+        assert_eq!(
+            reads,
+            vec![key_idx.offset..key_idx.offset + u64::from(key_idx.prefix_len)]
+        );
     }
 }
 
