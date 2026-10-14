@@ -5504,6 +5504,115 @@ mod tests {
         assert_eq!(out.expect("probe"), None);
     }
 
+    /// The writer's bucket check agrees with the codec at the real cap, read
+    /// from a default writer: a bucket of exactly `KEY_IDX_BUCKET_MAX_ENTRIES`
+    /// entries keeps the field and encodes, one entry more leaves the field
+    /// out, and the codec refuses that field. The at-cap field carries one
+    /// more entry in a second bucket, so its total is over the cap and the
+    /// per-bucket count decides.
+    #[test]
+    fn the_writer_bucket_cap_agrees_with_the_codec_at_the_real_cap() {
+        use crate::key_index::{KeyIndexPlan, KeyType, key8_i64};
+        use ravel_codec::key_idx::{
+            KEY_IDX_WRITER_BUCKET_BITS, KeyIdxFieldInput, bucket_index, encode_key_idx,
+            verify_key_idx,
+        };
+
+        let cap = RlogWriter::new(RlogConfig::default(), identity()).key_idx_bucket_cap;
+        let max = u64::from(KEY_IDX_BUCKET_MAX_ENTRIES);
+
+        // The bucket mix multiplies by an odd constant, so it inverts mod 2^64:
+        // `key8(bucket, j)` for distinct `j` are distinct keys whose mixed value
+        // has `bucket` as its top bits.
+        const MIX: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut inv = MIX;
+        for _ in 0..5 {
+            inv = inv.wrapping_mul(2u64.wrapping_sub(MIX.wrapping_mul(inv)));
+        }
+        assert_eq!(MIX.wrapping_mul(inv), 1);
+        let shift = 64 - u32::from(KEY_IDX_WRITER_BUCKET_BITS);
+        let key8 = |bucket: u32, j: u64| {
+            ((u64::from(bucket) << shift) | j)
+                .wrapping_mul(inv)
+                .to_be_bytes()
+        };
+        let (hot, other) = (0x5Au32, 0x5Bu32);
+        let keys = |in_hot: u64, in_other: u64| -> Vec<Key8> {
+            let keys: Vec<Key8> = (0..in_hot)
+                .map(|j| key8(hot, j))
+                .chain((0..in_other).map(|j| key8(other, j)))
+                .collect();
+            for (i, k) in keys.iter().enumerate() {
+                assert_eq!(key8_i64((u64::from_be_bytes(*k) ^ (1 << 63)) as i64), *k);
+                let want = if (i as u64) < in_hot { hot } else { other };
+                assert_eq!(
+                    bucket_index(k, KEY_IDX_WRITER_BUCKET_BITS).expect("writer bucket bits"),
+                    want
+                );
+            }
+            keys
+        };
+        let plan = |keys: &[Key8]| {
+            let mut plan = KeyIndexPlan::new(&[("f".into(), KeyType::I64)])
+                .expect("valid field set")
+                .expect("one field");
+            let (field, _) = plan.attr_field("f").expect("declared");
+            for k in keys {
+                plan.push(field, *k);
+            }
+            plan.seal_block(0);
+            plan
+        };
+        let input = |keys: &[Key8]| {
+            vec![KeyIdxFieldInput {
+                name: "f".into(),
+                key_type: KeyType::I64,
+                entries: keys.iter().map(|k| (*k, 0)).collect(),
+            }]
+        };
+
+        let at_cap = keys(max, 1);
+        let kept = plan(&at_cap)
+            .encode(cap)
+            .expect("encode at the cap")
+            .expect("a bucket of exactly the cap keeps the field");
+        assert!(
+            kept == encode_key_idx(&input(&at_cap)).expect("the codec accepts the cap"),
+            "the writer encodes the field as the codec does"
+        );
+        let summary = verify_key_idx(&kept.bytes, kept.prefix_len).expect("verify");
+        let fields: Vec<(&str, KeyType, u64, u32, u32)> = summary
+            .fields
+            .iter()
+            .map(|f| {
+                (
+                    f.name.as_str(),
+                    f.key_type,
+                    f.entry_count,
+                    f.bucket_entry_counts[hot as usize],
+                    f.bucket_entry_counts[other as usize],
+                )
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            vec![("f", KeyType::I64, max + 1, KEY_IDX_BUCKET_MAX_ENTRIES, 1)]
+        );
+
+        let over_cap = keys(max + 1, 0);
+        let dropped = plan(&over_cap)
+            .encode(cap)
+            .expect("a field over the cap does not fail the encode");
+        assert_eq!(dropped, None, "a bucket of cap + 1 leaves the field out");
+        let refused = encode_key_idx(&input(&over_cap)).expect_err("the codec refuses cap + 1");
+        assert!(
+            refused
+                .to_string()
+                .contains("over KEY_IDX_BUCKET_MAX_ENTRIES"),
+            "{refused}"
+        );
+    }
+
     /// Field-set validation is a typed refusal at finish, never a malformed
     /// section.
     #[test]
