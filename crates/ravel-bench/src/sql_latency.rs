@@ -75,6 +75,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::allocator::Allocator;
+use crate::get_latency::{GetLatencyCapture, GetLatencyReport};
 use crate::report::ModeledCost;
 use crate::sql_corpus::CorpusEntry;
 
@@ -1162,6 +1163,13 @@ pub struct SqlLatencyReport {
     /// a report written before it existed still deserializes.
     #[serde(default)]
     pub modeled_cost: ModeledCost,
+    /// Time to first byte and time to last byte of every GET the measured
+    /// statements issued, cold and warm runs together, by read phase and
+    /// requested size ([`crate::get_latency`], issue #2976). Null on the Flight
+    /// lane, whose GETs run in the server. Defaulted on read so a report
+    /// written before it existed still deserializes.
+    #[serde(default)]
+    pub get_latency: Option<GetLatencyReport>,
 }
 
 /// Total GET wire bytes the pass moved: summed over every recorded run of every
@@ -2397,8 +2405,9 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         logs_projection_break_even_bytes: resolved_logs_fetch.projection_break_even_bytes,
         logs_fetch_policy: cfg.logs_fetch_policy,
     };
+    let get_latency = GetLatencyCapture::wrap(&cfg.store);
     let (entries, skipped, failed) = measure_corpus(
-        &cfg.store,
+        get_latency.store(),
         tenant_hash,
         &cfg.entries,
         &declared,
@@ -2489,6 +2498,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         dataset,
         // Generate is always in process (never Flight).
         modeled_cost: model_pass_cost(false, &cfg.store_cost_profile, &entries),
+        get_latency: Some(get_latency.report()),
         entries,
         skipped,
         failed,
@@ -2595,11 +2605,12 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
     // The two lanes measure the same statements over the same dataset stanza
     // and the same declared-column set; they differ only in what executes the
     // SQL, in process or across a gRPC channel to a server.
+    let get_latency = GetLatencyCapture::wrap(&cfg.store);
     let (entries, skipped, failed) = match &cfg.flight {
         Some(target) => measure_over_flight(target, cfg, &declared).await?,
         None => {
             measure_corpus(
-                &cfg.store,
+                get_latency.store(),
                 tenant_hash,
                 &cfg.entries,
                 &declared,
@@ -2734,6 +2745,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
         // Flight lane models nothing at all: it records no wire bytes, so a
         // nonzero byte price would produce Some(0), a fake known-zero.
         modeled_cost: model_pass_cost(cfg.flight.is_some(), &cfg.store_cost_profile, &entries),
+        get_latency: cfg.flight.is_none().then(|| get_latency.report()),
         entries,
         skipped,
         failed,
