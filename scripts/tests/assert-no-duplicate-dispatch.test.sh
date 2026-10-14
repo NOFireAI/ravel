@@ -692,7 +692,9 @@ d="$(new_case symbol_kinds)"
 open_pr "${d}" 39
 for pair in one:2 Two:5 Three:8 four:11 FIVE:14 Six:17 Seven:20 eight:23 nine:26 ten:31 eleven:34 twelve:37 Thirteen:40 broken:44; do
   sym="${pair%%:*}"; line="${pair##*:}"
-  pr_patch "${d}" 39 src/kinds.rs "@@ -${line},1 +${line},1 @@" "-    old" "+    new"
+  # The removed line is the base's own, so the drift check passes and the
+  # symbol's extent decides.
+  pr_patch "${d}" 39 src/kinds.rs "@@ -${line},1 +${line},1 @@" "-$(sed -n "${line}p" "${work}/kinds.rs")" "+    new"
   out="$(run_base "${d}" --issue 42 --paths "src/kinds.rs#${sym}")"; rc=$?
   check_eq "#${sym}: a change on its line ${line} collides (66)" "66" "${rc}"
   pr_patch "${d}" 39 src/kinds.rs "@@ -48,1 +48,1 @@" "-    48;" "+    49;"
@@ -744,6 +746,178 @@ out="$(run_base "${d}" --issue 42 --paths docs/guide.md:L5-L8)"; rc=$?
 check_eq "a docs range in a different section passes (0)" "0" "${rc}"
 out="$(run_base "${d}" --issue 42 --paths docs/guide.md)"; rc=$?
 check_eq "a bare docs path keeps the whole-file rule (66)" "66" "${rc}"
+
+# A fence closes only on the same character at least as long as its opener.
+# nested.md: Example 3-11 holds a four-backtick fence (5-10) around a
+# three-backtick one (6-9); Other 12-19 holds a tilde fence (14-18) around a
+# three-backtick line. Lines 7 and 16 look like headings and are not.
+cat >"${base}/docs/nested.md" <<'EOF'
+# Nested
+
+## Example
+
+````markdown
+```sh
+## looks like a heading
+echo edited
+```
+````
+
+## Other
+
+~~~
+```
+## also not a heading
+Other text.
+~~~
+
+## Last
+
+End.
+EOF
+# x.py: def main 3-6, a call main() at 9.
+cat >"${base}/scripts/x.py" <<'EOF'
+import sys
+
+def main():
+    a = 1
+    b = 2
+    return a + b
+
+if __name__ == "__main__":
+    main()
+EOF
+git -C "${base}" add docs/nested.md scripts/x.py
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -m nested
+git -C "${base}" update-ref refs/remotes/origin/main HEAD
+
+# Wrong: any fence line toggles (0, line 7 ends Example); a shorter fence of
+# the same character closes (0, line 6 closes the four-backtick fence).
+d="$(new_case docs_nested_fence)"
+open_pr "${d}" 48
+pr_patch "${d}" 48 docs/nested.md '@@ -7,3 +7,3 @@' ' ## looks like a heading' '-echo edited' '+echo edited twice' ' ```'
+out="$(run_base "${d}" --issue 42 --paths 'docs/nested.md#example')"; rc=$?
+check_eq "an edit inside a fence nested in a longer fence is in its section (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths 'docs/nested.md#other')"; rc=$?
+check_eq "and not in the next section (0)" "0" "${rc}"
+# Wrong: a fence of either character closes (0, line 15 closes the tilde
+# fence and line 16 ends Other).
+d="$(new_case docs_tilde_fence)"
+open_pr "${d}" 49
+pr_patch "${d}" 49 docs/nested.md '@@ -16,3 +16,3 @@' ' ## also not a heading' '-Other text.' '+Other text, edited.' ' ~~~'
+out="$(run_base "${d}" --issue 42 --paths 'docs/nested.md#other')"; rc=$?
+check_eq "a backtick line does not close a tilde fence (66)" "66" "${rc}"
+
+# A range that starts past the base file's last line names nothing on the
+# base, so it is compared as the whole file. Wrong: the start clamped to the
+# last line (0, patch G is in Install and the last section is Usage); the
+# range left as it is (0, it covers no section and no line).
+d="$(new_case range_past_eof)"
+open_pr "${d}" 50
+pr_patch "${d}" 50 docs/guide.md "${patch_g[@]}"
+out="$(run_base "${d}" --issue 42 --paths docs/guide.md:L40-L50)"; rc=$?
+check_eq "a docs range past the last line falls back to the whole file (66)" "66" "${rc}"
+check_contains "and says so" "past the last line" "${out}"
+pr_patch "${d}" 50 src/lib.rs "${patch_a[@]}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L40-L50)"; rc=$?
+check_eq "so does a code range past the last line (66)" "66" "${rc}"
+check_contains "and says so" "past the last line" "${out}"
+# A range on a file the base does not have (moved or deleted on main since the
+# pull request forked) has nothing to number against. Wrong: the range read
+# as given (0 when nothing else reads the base, the hunk is at line 10; with
+# the drift check in place it still collides, and only the NOTE says why).
+pr_patch "${d}" 50 src/gone.rs '@@ -10,1 +10,1 @@' '-old' '+new'
+out="$(run_base "${d}" --issue 42 --paths src/gone.rs:L1-L2)"; rc=$?
+check_eq "a range on a file not on the base falls back to the whole file (66)" "66" "${rc}"
+check_contains "and says so" "src/gone.rs is not on origin/main" "${out}"
+out="$(run_base "${d}" --issue 42 --paths 'src/gone.rs#alpha')"; rc=$?
+check_eq "so does a symbol on a file not on the base (66)" "66" "${rc}"
+check_contains "and says so" "'alpha' not found in src/gone.rs" "${out}"
+
+# path#symbol on a file type with no anchor rules is compared as the whole
+# file. Wrong: both rule sets on any other type (0, the shell form takes the
+# call main() on line 9 for the definition); the Rust forms alone (66 via
+# not found, with the wrong NOTE).
+d="$(new_case symbol_other_type)"
+open_pr "${d}" 51
+pr_patch "${d}" 51 scripts/x.py '@@ -4,3 +4,3 @@' '     a = 1' '-    b = 2' '+    b = 3' '     return a + b'
+out="$(run_base "${d}" --issue 42 --paths 'scripts/x.py#main')"; rc=$?
+check_eq "a symbol entry on a .py file is compared as the whole file (66)" "66" "${rc}"
+check_contains "and says the type is not supported" "symbol entries are not supported" "${out}"
+
+# Base drift: the guard reads symbols and ranges from --base-ref, a pull
+# request numbers its hunks on its own merge base. drifted has 20 lines
+# prepended to lib.rs (alpha at 21-26); line4 has line 4 changed and line2
+# has line 2 changed, each with every other line as on origin/main; tail has
+# lines appended after the last one.
+git -C "${base}" checkout -q -b drifted
+{ for i in $(seq 1 20); do printf '// pad %s\n' "${i}"; done; git -C "${base}" show origin/main:src/lib.rs; } >"${work}/drifted.rs"
+cp "${work}/drifted.rs" "${base}/src/lib.rs"
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -am drifted
+git -C "${base}" update-ref refs/drift/main HEAD
+git -C "${base}" show origin/main:src/lib.rs | sed '4s/x + 1/x + 5/' >"${base}/src/lib.rs"
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -am line4
+git -C "${base}" update-ref refs/drift/line4 HEAD
+git -C "${base}" show origin/main:src/lib.rs | sed '2s/^$/\/\/ two/' >"${base}/src/lib.rs"
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -am line2
+git -C "${base}" update-ref refs/drift/line2 HEAD
+{ git -C "${base}" show origin/main:src/lib.rs; printf '\nfn tail() {}\n'; } >"${base}/src/lib.rs"
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -am tail
+git -C "${base}" update-ref refs/drift/tail HEAD
+git -C "${base}" checkout -q -
+
+# Wrong: no drift check (0 for both, alpha read at 21-26 against a hunk at
+# base line 4); every non-bare entry compared as the whole file (the no-drift
+# cases below then collide).
+d="$(new_case base_drift)"
+open_pr "${d}" 52
+pr_patch "${d}" 52 src/lib.rs "${patch_a[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#alpha' --base-ref refs/drift/main)"; rc=$?
+check_eq "a symbol on a drifted base falls back to the whole file (66)" "66" "${rc}"
+check_contains "and names the file and the drift" "NOTE  #52 src/lib.rs: the pull request's base has drifted from refs/drift/main" "${out}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L21-L26 --base-ref refs/drift/main)"; rc=$?
+check_eq "a range on a drifted base falls back to the whole file (66)" "66" "${rc}"
+check_contains "and says so" "has drifted" "${out}"
+# Wrong: removed lines not compared (0, the hunk's context still matches);
+# context lines not compared (0, the removed line still matches).
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L1-L1 --base-ref refs/drift/line4)"; rc=$?
+check_eq "a removed line that differs on the base is drift (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L1-L1 --base-ref refs/drift/line2)"; rc=$?
+check_eq "a context line that differs on the base is drift (66)" "66" "${rc}"
+# A base that differs only outside the hunks is not drift for them.
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#gamma' --base-ref refs/drift/tail)"; rc=$?
+check_eq "a change past the hunks leaves the comparison exact (0)" "0" "${rc}"
+check_eq "without a drift NOTE" "0" "$(grep -c 'has drifted' <<<"${out}")"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#gamma')"; rc=$?
+check_eq "no drift: a symbol the PR does not touch still passes (0)" "0" "${rc}"
+
+# Renames: an entry naming the old path matches, and the patch is numbered on
+# the old file. Wrong: only .filename matched (0 for both); a rename compared
+# as the whole file (the gamma case collides).
+d="$(new_case rename)"
+open_pr "${d}" 53
+jq -n --arg p "$(printf '%s\n' "${patch_a[@]}")" \
+  '[{filename: "src/core.rs", previous_filename: "src/lib.rs", status: "renamed", patch: $p}]' >"${d}/files-53.json"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs)"; rc=$?
+check_eq "a PR renaming the file collides on the old path (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#alpha')"; rc=$?
+check_eq "and on an old-path symbol whose body it edits (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#gamma')"; rc=$?
+check_eq "but not on one it leaves alone (0)" "0" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths src/core.rs)"; rc=$?
+check_eq "the new path still collides (66)" "66" "${rc}"
+
+# DISPATCH_PATHS is written by hand. Wrong: no trim (0, " docs/guide.md"
+# names no file); trimmed but an empty entry skipped (0 for the second).
+d="$(new_case trim_entries)"
+open_pr "${d}" 54
+pr_patch "${d}" 54 docs/guide.md "${patch_e[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/x.rs, docs/guide.md')"; rc=$?
+check_eq "an entry after a comma and a space is trimmed (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths ' docs/guide.md#usage ')"; rc=$?
+check_eq "a symbol entry is trimmed too (66)" "66" "${rc}"
+out="$(run_base "${d}" --issue 42 --paths 'src/x.rs, ,docs/guide.md')"; rc=$?
+check_eq "an entry empty after trimming is a usage error (64)" "64" "${rc}"
 
 # --- a diff that cannot be read is never a pass ---------------------------
 # Wrong: patches fetched in a second call whose failure falls back to the

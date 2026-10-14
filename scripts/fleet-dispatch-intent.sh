@@ -131,7 +131,8 @@ case "${mode}" in
       if [[ ${dup_rc} -ne 0 ]]; then
         echo "fleet-dispatch-intent.sh: duplicate-work guard exited ${dup_rc}; refusing to dispatch." >&2
         echo "  65 = a pull request already addresses #${ticket#\#}; 66 = an open pull request is on" >&2
-        echo "  those files; 69 = the question could not be asked, which is not a clean answer." >&2
+        echo "  those files; 69 = the question could not be asked, which is not a clean answer;" >&2
+        echo "  64 = a DISPATCH_PATHS entry did not parse or was empty." >&2
         echo "  Deliberate second dispatch on this ticket: DISPATCH_SKIP_DUPLICATE_CHECK=1." >&2
         exit "${dup_rc}"
       fi
