@@ -428,14 +428,6 @@ impl IndexedFieldsOverlay {
     }
 }
 
-/// Reject an empty or duplicate field name in a durable indexed-field list, the
-/// SAME check `services/ravel-server`'s `postings_config::validate_list` applies
-/// to the CLI-parsed policy (empty name, duplicate name). Reimplemented here
-/// rather than shared because `ravel-ingest` cannot depend on the server crate; a
-/// durable list that fails this is treated exactly like a failed read, so a
-/// malformed record never produces a writer that indexes the wrong set or panics
-/// on an empty name. Returns `Ok(())` for a valid list, including the empty list
-/// (a valid explicit opt-out).
 /// The RLOG KEY_IDX field set `config` declares: each typed column flagged
 /// `key_index` under its declared type, then `trace_id` as `Id16` when
 /// `index_trace_id` is set. A declaration that does not validate (against the
@@ -482,6 +474,14 @@ pub(crate) fn key_index_fields(
     fields
 }
 
+/// Reject an empty or duplicate field name in a durable indexed-field list, the
+/// SAME check `services/ravel-server`'s `postings_config::validate_list` applies
+/// to the CLI-parsed policy (empty name, duplicate name). Reimplemented here
+/// rather than shared because `ravel-ingest` cannot depend on the server crate; a
+/// durable list that fails this is treated exactly like a failed read, so a
+/// malformed record never produces a writer that indexes the wrong set or panics
+/// on an empty name. Returns `Ok(())` for a valid list, including the empty list
+/// (a valid explicit opt-out).
 fn validate_indexed_list(list: &[String]) -> Result<(), ()> {
     let mut seen: HashSet<&str> = HashSet::with_capacity(list.len());
     for field in list {

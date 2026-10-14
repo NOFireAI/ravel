@@ -154,8 +154,9 @@ pub struct SectionDesc {
     pub crc32c: u32,
     pub comp: u8,
     pub uncomp_len: u64,
-    /// KEY_IDX prefix length (header plus field directories). Non-zero only on
-    /// the [`kind::KEY_IDX`] entry; zero on every other kind.
+    /// KEY_IDX prefix length (header plus field directories). Written only on
+    /// the [`kind::KEY_IDX`] entry and validated only there; readers ignore it
+    /// on every other kind.
     pub prefix_len: u32,
 }
 

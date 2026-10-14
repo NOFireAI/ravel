@@ -4368,7 +4368,8 @@ mod tests {
     }
 
     /// [`seed_logs_indexed`] with the KEY_IDX field set and the writer config
-    /// too, so a fixture can pick the input's block size. A memory test needs inputs of many small blocks:
+    /// too, so a fixture can pick the input's block size. A memory test needs
+    /// inputs of many small blocks:
     /// at the 8192-record default an input's whole stream is one block, and the
     /// merge's decode-side term would scale with the corpus for reasons that
     /// have nothing to do with what is under test.
@@ -5304,15 +5305,6 @@ mod tests {
         );
     }
 
-    /// Running the same LOGS rewrite twice from the same pre-publish state
-    /// converges on one `RewriteRecord`, never a double count of dropped
-    /// records -- the LOGS sibling of the metrics
-    /// `republishing_the_same_rewrite_converges_without_double_counting`
-    /// test above. Flip-line proof: in `publish_rewrite_record`, routing
-    /// `Err(StoreError::AlreadyExists)` to a hard `Err` instead of
-    /// `resolve_already_exists_rewrite` makes the second
-    /// `publish_rewrite_record` call return `Err`, failing
-    /// `.expect("publish 2")`.
     /// An erasure-rewritten part keeps the union of its inputs' KEY_IDX field
     /// sets, and its entries are rebuilt from the surviving records only: a key
     /// held only by dropped records probes as absent.
@@ -5604,6 +5596,15 @@ mod tests {
         );
     }
 
+    /// Running the same LOGS rewrite twice from the same pre-publish state
+    /// converges on one `RewriteRecord`, never a double count of dropped
+    /// records -- the LOGS sibling of the metrics
+    /// `republishing_the_same_rewrite_converges_without_double_counting`
+    /// test above. Flip-line proof: in `publish_rewrite_record`, routing
+    /// `Err(StoreError::AlreadyExists)` to a hard `Err` instead of
+    /// `resolve_already_exists_rewrite` makes the second
+    /// `publish_rewrite_record` call return `Err`, failing
+    /// `.expect("publish 2")`.
     #[tokio::test]
     async fn logs_republishing_same_rewrite_converges_without_double_counting() {
         let store = MemoryStore::new();

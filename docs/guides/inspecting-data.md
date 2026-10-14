@@ -376,8 +376,8 @@ The lines printed before the failing section stay on stdout.
 - A corrupt SKIP_IDX is an error, not a degrade. Its level-0 entries are the
   only source of block byte ranges and per-block checksums.
 - BLOOM and KEY_IDX are read with their whole-section crc verified, so a
-  damaged BLOOM or KEY_IDX fails `rlog inspect`. A query scan over the same object at worst prunes fewer
-  blocks and still answers exactly.
+  damaged BLOOM or KEY_IDX fails `rlog inspect`. A query scan over the same
+  object at worst prunes fewer blocks and still answers exactly.
 
 ## `rlog footprint`
 

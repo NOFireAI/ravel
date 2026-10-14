@@ -2268,8 +2268,8 @@ const FIELD_TYPE_SPAN: usize = FieldType::Bytes as usize;
 const NO_ENTRY: u32 = u32::MAX;
 
 /// Interns the tracked names (`indexed_names` union `numstat_names`, ADR-0095
-/// decision 1, union the KEY_IDX attribute fields `key_names`) into slots, returning the name-ascending slot table and the
-/// name-to-slot map.
+/// decision 1, union the KEY_IDX attribute fields `key_names`) into slots,
+/// returning the name-ascending slot table and the name-to-slot map.
 ///
 /// Ascending slot order is ascending name order, which is the order the
 /// merged view appends record-level winners in.

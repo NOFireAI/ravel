@@ -585,8 +585,9 @@ mod tests {
         }
     }
 
-    /// An omitted flag keeps the stored value; `--key-index` with no value and
-    /// `--index-trace-id false` turn both off without the opt-in.
+    /// An omitted flag keeps the stored value; an empty key-index list (what
+    /// `--no-key-index` produces) and `--index-trace-id false` turn both off
+    /// without the opt-in.
     #[tokio::test]
     async fn omitted_key_index_flags_keep_the_stored_values_and_off_needs_no_opt_in() {
         let store = store();

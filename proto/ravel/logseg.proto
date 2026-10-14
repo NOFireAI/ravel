@@ -37,7 +37,8 @@ message Section {
   uint64 uncompressed_len = 6;
   // Byte length of the KEY_IDX prefix (header plus every field directory).
   // Set only on the kind 9 KEY_IDX entry (ADR-2707), which an RLOG v5 trailer
-  // carries as an optional section; zero (absent) on every other kind.
+  // carries as an optional section. Writers leave it zero (absent) on every
+  // other kind, and readers ignore it there.
   uint32 prefix_len = 7;
 }
 
