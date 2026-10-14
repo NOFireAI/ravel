@@ -103,6 +103,7 @@ mod spans_pushdown;
 mod spans_scan;
 mod spans_schema;
 pub mod spill;
+mod statement;
 pub mod stats_json;
 mod trace_id_planner;
 mod udf;
@@ -155,7 +156,7 @@ pub use error::{
 pub use executor::{
     AnalyzedRun, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting, ParquetPlan,
     PhaseWallTiming, PinnedPlanInputs, PinnedQuery, PinnedResolve, PinnedStream, ScanTiming,
-    SegmentTiming, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
+    SegmentTiming, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, StatementRequest, TargetSignal,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{
@@ -228,6 +229,7 @@ pub use spans_schema::{
     span_links_item_field, span_links_type, spans_schema,
 };
 pub use spill::{OperatorSpill, SpillCounts, SpillScratch};
+pub use statement::{DialectPolicy, LoweredStatement, LoweringContext, StatementTarget};
 pub use udf::{label_match_udf, label_udf};
 pub use validate::{
     DdlIntent, DdlKind, DdlValidationError, StatementKind, ValidationError, ddl_kind,

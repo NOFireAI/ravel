@@ -10,7 +10,7 @@
 //!    now_ns, name_filter)`, with `now_ns` threaded in from the caller's
 //!    injected clock (no `SystemTime::now()` in library logic).
 //!    `signal` is chosen from the query's own `FROM` clause
-//!    ([`SqlExecutor::target_signal`], ADR-0033, extended to `spans` by
+//!    ([`SqlExecutor::statement_tables`], ADR-0033, extended to `spans` by
 //!    ADR-0045 decision 5 and to `alerts`/`audit` by ADR-1101 decision 1):
 //!    `Signal::Logs` for the `logs` table, `Signal::Spans` for `spans`,
 //!    `Signal::Alerts` for `alerts`, `Signal::Audit` for `audit`, otherwise
@@ -146,6 +146,9 @@ use crate::spans_provider::SpansTableProvider;
 use crate::spill::{
     OperatorSpill, SpillBudget, SpillCounts, SpillScratch, accumulate_spill_counts,
 };
+use crate::statement::{
+    LowerError, LoweredStatement, LoweringSite, Statement, session_table_providers,
+};
 use crate::validate::{
     ValidationError, referenced_base_tables, unreadable_table_reference, validate_query,
 };
@@ -190,12 +193,12 @@ impl TargetSignal {
 }
 
 /// The base tables one statement names, split the way the target is chosen.
-struct StatementTables {
+pub(crate) struct StatementTables {
     /// The one signal table named, if any.
-    signal: Option<TargetSignal>,
+    pub(crate) signal: Option<TargetSignal>,
     /// Every other base table name: Parquet tables, or names that are no
     /// table at all.
-    others: BTreeSet<String>,
+    pub(crate) others: BTreeSet<String>,
 }
 
 /// Refuse a statement that names a table function or a URL-shaped table, with
@@ -358,6 +361,20 @@ pub struct SqlRequest {
     /// or request ceiling set for one of them is clamped and then never
     /// consulted. That is a pre-existing gap in those providers, tracked as
     /// issue #1409, not a property of the budgets themselves.
+    pub budgets: Option<RequestBudgets>,
+}
+
+/// One request for a statement that is not SQL text
+/// ([`SqlExecutor::execute_statement_accounted`]): every [`SqlRequest`]
+/// field but the text, with the same meaning.
+#[derive(Debug, Clone)]
+pub struct StatementRequest {
+    pub window: TimeRange,
+    pub min_tokens: Vec<CommitToken>,
+    pub now_ns: i64,
+    pub deadline: Duration,
+    pub row_window: bool,
+    pub max_rows: Option<usize>,
     pub budgets: Option<RequestBudgets>,
 }
 
@@ -1141,6 +1158,10 @@ pub struct SqlExecutor {
     /// rewrite, so a test can make it diverge from the classification plan.
     #[cfg(test)]
     executed_plan_tamper: Option<fn(LogicalPlan) -> LogicalPlan>,
+    /// How many times [`Self::plan_pinned_with`] rebuilt a session without
+    /// spill because the executed plan failed the spill re-check.
+    #[cfg(test)]
+    spill_fallbacks: std::sync::atomic::AtomicUsize,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -1183,6 +1204,8 @@ impl SqlExecutor {
             ddl_min_grace_ms: None,
             #[cfg(test)]
             executed_plan_tamper: None,
+            #[cfg(test)]
+            spill_fallbacks: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1404,9 +1427,59 @@ impl SqlExecutor {
         validate_query(&req.sql)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
-        tokio::time::timeout(req.deadline, self.run(tenant_hash, req, live))
-            .await
-            .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
+        tokio::time::timeout(
+            req.deadline,
+            self.run(tenant_hash, Statement::Sql(&req.sql), req, live),
+        )
+        .await
+        .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
+    }
+
+    /// [`Self::execute_accounted`] for a statement that is not SQL text.
+    ///
+    /// The snapshot retry, spill, the deadline and the accounting are the ones
+    /// a SQL statement gets. Resolve and admission against `max_segments` and
+    /// the request budget run the same code, with one difference for a metrics
+    /// target: no `__name__` postings pruning is derived from a lowered
+    /// statement, so the resolve lists the window unpruned. A statement whose
+    /// SQL form would have pruned therefore counts more segments against
+    /// `max_segments`, gets a larger cost estimate and issues more catalog
+    /// requests; the rows it returns are the same. The statement is lowered
+    /// once per session the request builds, and every plan it lowers must
+    /// pass plan admission ([`LoweredStatement`]); a plan that does not is
+    /// [`SqlError::PlanNotAdmitted`].
+    ///
+    /// The read-only gate ([`crate::validate_query`]), the complexity guard it
+    /// runs and the SQL text's table-function and URL-table check do not run,
+    /// because there is no SQL text. Plan admission refuses every scan outside
+    /// the statement's target in place of the last; the caller must bound the
+    /// statement's size and nesting with its own structural guard before
+    /// calling.
+    pub async fn execute_statement_accounted(
+        &self,
+        tenant_hash: TenantHash,
+        statement: &dyn LoweredStatement,
+        req: &StatementRequest,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
+        let statement = Statement::Lowered(statement);
+        let sql_req = SqlRequest {
+            sql: statement.text().to_string(),
+            window: req.window,
+            min_tokens: req.min_tokens.clone(),
+            now_ns: req.now_ns,
+            deadline: req.deadline,
+            row_window: req.row_window,
+            max_rows: req.max_rows,
+            budgets: req.budgets,
+        };
+        let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
+        tokio::time::timeout(
+            req.deadline,
+            self.run(tenant_hash, statement, &sql_req, live),
+        )
+        .await
+        .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
     }
 
     /// Answer "what would this statement do?" without reading a single data
@@ -1485,7 +1558,8 @@ impl SqlExecutor {
         // caller's own `accounting`, just under the API the shared
         // `resolve_admitted`/`plan_pinned_with` now take.
         let phase_accounting = PhaseAccounting::pooled_over(accounting);
-        Self::statement_tables(&req.sql)?;
+        let statement = Statement::Sql(&req.sql);
+        statement.tables()?;
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         // `resolve_admitted` itself checks the effective `max_s3_requests`
         // right after resolve returns, so `explain` gets that enforcement
@@ -1499,7 +1573,7 @@ impl SqlExecutor {
             parquet,
             ..
         } = self
-            .resolve_admitted(tenant_hash, req, &phase_accounting)
+            .resolve_admitted(tenant_hash, statement, req, &phase_accounting)
             .await?;
         let segments_resolved = snapshot.segments.len();
 
@@ -1507,7 +1581,7 @@ impl SqlExecutor {
             .plan_pinned_with(
                 tenant_hash,
                 snapshot,
-                &req.sql,
+                statement,
                 &phase_accounting,
                 PlanExtras {
                     declared,
@@ -1546,9 +1620,12 @@ impl SqlExecutor {
     }
 
     /// The resolve/plan/execute loop, minus validation and the deadline.
+    ///
+    /// `statement` is what runs; `req.sql` is not read here or below.
     async fn run(
         &self,
         tenant_hash: TenantHash,
+        statement: Statement<'_>,
         req: &SqlRequest,
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
@@ -1569,7 +1646,7 @@ impl SqlExecutor {
         // snapshot resolve has already been paid for. Which target it reads is
         // each attempt's resolve's answer: whether a name is a Parquet table
         // is a fact about the store, not the text.
-        Self::statement_tables(&req.sql)?;
+        statement.tables()?;
 
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
@@ -1595,7 +1672,9 @@ impl SqlExecutor {
                 target,
                 parquet,
                 ..
-            } = self.resolve(tenant_hash, req, &phase_accounting).await?;
+            } = self
+                .resolve(tenant_hash, statement, req, &phase_accounting)
+                .await?;
             let resolve_ns = elapsed_ns(resolve_started);
             stats.resolves += 1;
             stats.attempts += 1;
@@ -1618,6 +1697,7 @@ impl SqlExecutor {
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
                 .attempt(
                     tenant_hash,
+                    statement,
                     req,
                     snapshot,
                     &phase_accounting,
@@ -1739,7 +1819,12 @@ impl SqlExecutor {
             parquet,
             ..
         } = self
-            .resolve(tenant_hash, req, &PhaseAccounting::pooled_over(accounting))
+            .resolve(
+                tenant_hash,
+                Statement::Sql(&req.sql),
+                req,
+                &PhaseAccounting::pooled_over(accounting),
+            )
             .await?;
         Ok(PinnedResolve {
             snapshot,
@@ -1812,7 +1897,7 @@ impl SqlExecutor {
         self.plan_pinned_with(
             tenant_hash,
             snapshot,
-            sql,
+            Statement::Sql(sql),
             &PhaseAccounting::pooled_over(accounting),
             PlanExtras {
                 declared: inputs.declared,
@@ -1855,7 +1940,7 @@ impl SqlExecutor {
         self.plan_pinned_with(
             tenant_hash,
             snapshot,
-            sql,
+            Statement::Sql(sql),
             &PhaseAccounting::pooled_over(accounting),
             PlanExtras {
                 declared: inputs.declared,
@@ -1874,11 +1959,15 @@ impl SqlExecutor {
     /// [`Self::plan_pinned_distributed`]. `extras` carries the optional
     /// coordinator-side distributed scan; with the `flight-sql` feature off it
     /// is a zero-field struct and the metrics provider is always the local one.
+    ///
+    /// `statement` is lowered once for the classification session, when one
+    /// is built, and once for every session that executes, the spill
+    /// fallback's rebuild included.
     async fn plan_pinned_with(
         &self,
         tenant_hash: TenantHash,
         snapshot: Snapshot,
-        sql: &str,
+        statement: Statement<'_>,
         phase_accounting: &PhaseAccounting,
         extras: PlanExtras,
     ) -> Result<PinnedQuery, SqlError> {
@@ -1915,17 +2004,17 @@ impl SqlExecutor {
         // its request's resolve already did, or a Flight ticket pinned their
         // manifest versions, and builds each table's provider before
         // classification, which plans against their schemas.
-        let tables = Self::statement_tables(sql)?;
+        let tables = statement.tables()?;
         let parquet = match extras.parquet {
             ParquetPlan::Resolved(resolution) => resolution,
             ParquetPlan::Pinned(pins) => {
-                self.resolve_pinned_parquet(tenant_hash, sql, &pins, phase_accounting)
+                self.resolve_pinned_parquet(tenant_hash, statement, &pins, phase_accounting)
                     .await?
             }
             ParquetPlan::Unresolved => {
                 self.resolve_parquet_target(
                     tenant_hash,
-                    sql,
+                    statement,
                     &tables,
                     extras.row_window.is_some(),
                     phase_accounting,
@@ -1979,11 +2068,12 @@ impl SqlExecutor {
         {
             self.analyzed_classification_plan(
                 tenant_hash,
-                sql,
+                statement,
+                &tables,
                 &extras.declared,
                 parquet_schemas.as_deref(),
             )
-            .await
+            .await?
         } else {
             None
         };
@@ -2203,6 +2293,7 @@ impl SqlExecutor {
         // if the executed plan fails the re-check below.
         let spill_enabled = matches!(decision, SpillDecision::Enabled { .. });
         let fallback_table = spill_enabled.then(|| clone_session_table(&table));
+        let providers = session_table_providers(&table);
         let mut ctx = build_session(
             config,
             Arc::clone(&pool),
@@ -2220,27 +2311,17 @@ impl SqlExecutor {
         // so a statement whose executed plan the re-check below finds
         // eligible also gets its total order here. The statement therefore
         // returns the same rows with spill on, off or disabled.
-        let mut plan = ctx
-            .sql(sql)
-            .await
-            .map_err(plan_error)?
-            .into_unoptimized_plan();
-        // Before any optimizer rule runs: `replace_distinct_aggregate` adds the
-        // rewrite-only `first_value` calls this check refuses in the caller's
-        // own statement.
-        refuse_unadmitted_planned_shapes(&plan)?;
-        if plan_has_tie_order_edit(&plan) {
-            plan = tie_ordered_or_unchanged(plan);
-        }
-        #[cfg(test)]
-        if let Some(tamper) = self.executed_plan_tamper {
-            plan = tamper(plan);
-        }
+        let mut plan = self
+            .executed_plan(statement, &tables, &ctx, providers)
+            .await?;
+        refuse_unrepeated_exact_typed(statement, config, exact_typed_aggregates, &ctx, &plan)?;
         // The spill decision was taken on `analyzed`, a separate parse. Fail
         // closed if the plan that actually runs is not eligible after the
         // rewrite: rebuild the session with the disk manager disabled and drop
         // the scratch directory, so no Sort without a total key ever runs
-        // with spill.
+        // with spill. SQL keeps the plan it already built. A lowered statement
+        // is lowered again against the rebuilt session and admitted against
+        // it, so its plan binds that session's tables and functions.
         let mut scratch = scratch;
         if let Some(table) = fallback_table
             && !executed_plan_is_spill_eligible(&ctx.state(), &plan)
@@ -2249,6 +2330,7 @@ impl SqlExecutor {
                 "SQL spill disabled for this statement: the plan it executes is not \
                  spill-eligible, although its classification plan was"
             );
+            let providers = session_table_providers(&table);
             ctx = build_session(
                 config,
                 pool,
@@ -2257,7 +2339,22 @@ impl SqlExecutor {
                 SpillDecision::Disabled,
             )
             .map_err(plan_error)?;
+            if statement.sql().is_none() {
+                plan = self
+                    .executed_plan(statement, &tables, &ctx, providers)
+                    .await?;
+                refuse_unrepeated_exact_typed(
+                    statement,
+                    config,
+                    exact_typed_aggregates,
+                    &ctx,
+                    &plan,
+                )?;
+            }
             scratch = None;
+            #[cfg(test)]
+            self.spill_fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         let mut frame = DataFrame::new(ctx.state(), plan);
         // The row window (ADR-1374 decision 3, prerequisite 2), inserted into
@@ -2288,6 +2385,40 @@ impl SqlExecutor {
             row_cap: None,
             window_predicate,
         })
+    }
+
+    /// Lower `statement` against the executing session `ctx` and apply the
+    /// edits every executed plan gets, ahead of the spill re-check.
+    ///
+    /// `providers` are the providers `ctx` was built over
+    /// ([`session_table_providers`]).
+    async fn executed_plan(
+        &self,
+        statement: Statement<'_>,
+        tables: &StatementTables,
+        ctx: &SessionContext,
+        providers: Vec<(String, Arc<dyn TableProvider>)>,
+    ) -> Result<LogicalPlan, SqlError> {
+        let mut plan = match statement
+            .lower(ctx, providers, tables, LoweringSite::Executed)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(LowerError::Plan(err)) => return Err(plan_error(err)),
+            Err(LowerError::NotAdmitted(err)) => return Err(err),
+        };
+        // Before any optimizer rule runs: `replace_distinct_aggregate` adds the
+        // rewrite-only `first_value` calls this check refuses in the caller's
+        // own statement.
+        refuse_unadmitted_planned_shapes(&plan)?;
+        if plan_has_tie_order_edit(&plan) {
+            plan = tie_ordered_or_unchanged(plan);
+        }
+        #[cfg(test)]
+        if let Some(tamper) = self.executed_plan_tamper {
+            plan = tamper(plan);
+        }
+        Ok(plan)
     }
 
     /// Decide whether THIS pinned statement should distribute its samples scan,
@@ -2386,7 +2517,7 @@ impl SqlExecutor {
     }
 
     /// One `Catalog::resolve` plus the `max_segments` budget check. Resolves
-    /// the signal the query's `FROM` clause targets ([`Self::target_signal`]),
+    /// the signal the query's `FROM` clause targets ([`Self::statement_tables`]),
     /// so a metrics-only query never lists the logs keyspace and vice versa.
     ///
     /// Also computes the two-part cost estimate (ADR-0044 "3.", amended): the
@@ -2398,10 +2529,11 @@ impl SqlExecutor {
     async fn resolve(
         &self,
         tenant_hash: TenantHash,
+        statement: Statement<'_>,
         req: &SqlRequest,
         phase_accounting: &PhaseAccounting,
     ) -> Result<Resolved, SqlError> {
-        self.resolve_admitted(tenant_hash, req, phase_accounting)
+        self.resolve_admitted(tenant_hash, statement, req, phase_accounting)
             .await
     }
 
@@ -2427,6 +2559,7 @@ impl SqlExecutor {
     async fn resolve_admitted(
         &self,
         tenant_hash: TenantHash,
+        statement: Statement<'_>,
         req: &SqlRequest,
         phase_accounting: &PhaseAccounting,
     ) -> Result<Resolved, SqlError> {
@@ -2436,7 +2569,7 @@ impl SqlExecutor {
         // (`resolve_snapshot`) paths pass through, so any tenant running a query
         // is kept out of the idle sweep.
         self.touch_tenant(tenant_hash, req.now_ns);
-        let tables = Self::statement_tables(&req.sql)?;
+        let tables = statement.tables()?;
         // ADR-2040: a statement whose only tables are Parquet tables resolves
         // their manifests here instead of a signal's catalog. A Parquet table
         // has no segments, so there is nothing to admit against
@@ -2444,7 +2577,7 @@ impl SqlExecutor {
         if let Some(resolution) = self
             .resolve_parquet_target(
                 tenant_hash,
-                &req.sql,
+                statement,
                 &tables,
                 req.row_window,
                 phase_accounting,
@@ -2506,15 +2639,22 @@ impl SqlExecutor {
         // planning hiccup yields no filter and the resolve simply does not
         // prune, exactly as before, and pruning itself already degrades
         // safely when postings are absent or unusable.
-        let name_filter = match target {
-            TargetSignal::Metrics => self.pushed_down_name_filter(tenant_hash, &req.sql).await,
+        // A statement with no SQL text derives no filter and is not pruned.
+        let name_filter = match (target, statement.sql()) {
+            (TargetSignal::Metrics, Some(sql)) => {
+                self.pushed_down_name_filter(tenant_hash, sql).await
+            }
+            (TargetSignal::Metrics, None) => None,
             // Only a metrics query has a `__name__` postings index; a logs,
             // spans, alerts, or audit query never prunes by it.
-            TargetSignal::Logs
-            | TargetSignal::Spans
-            | TargetSignal::Alerts
-            | TargetSignal::Audit
-            | TargetSignal::Parquet => None,
+            (
+                TargetSignal::Logs
+                | TargetSignal::Spans
+                | TargetSignal::Alerts
+                | TargetSignal::Audit
+                | TargetSignal::Parquet,
+                _,
+            ) => None,
         };
         let catalog_requests = self
             .catalog
@@ -2640,12 +2780,16 @@ impl SqlExecutor {
     async fn resolve_parquet_target(
         &self,
         tenant_hash: TenantHash,
-        sql: &str,
+        statement: Statement<'_>,
         tables: &StatementTables,
         row_window: bool,
         phase_accounting: &PhaseAccounting,
     ) -> Result<Option<ParquetResolution>, SqlError> {
-        refuse_unreadable_table_reference(sql)?;
+        // A lowered plan names no table function or URL table: plan
+        // admission refuses every scan outside its target.
+        if let Some(sql) = statement.sql() {
+            refuse_unreadable_table_reference(sql)?;
+        }
         let Some(sources) = &self.parquet else {
             return Ok(None);
         };
@@ -2685,11 +2829,15 @@ impl SqlExecutor {
     async fn resolve_pinned_parquet(
         &self,
         tenant_hash: TenantHash,
-        sql: &str,
+        statement: Statement<'_>,
         pins: &[ParquetPin],
         phase_accounting: &PhaseAccounting,
     ) -> Result<Option<ParquetResolution>, SqlError> {
-        refuse_unreadable_table_reference(sql)?;
+        // A lowered plan names no table function or URL table: plan
+        // admission refuses every scan outside its target.
+        if let Some(sql) = statement.sql() {
+            refuse_unreadable_table_reference(sql)?;
+        }
         if pins.is_empty() {
             return Ok(None);
         }
@@ -2713,7 +2861,7 @@ impl SqlExecutor {
     /// instrumentation into the per-segment fetch loops in scan.rs/
     /// logs_scan.rs.
     ///
-    /// SQL resolves exactly one target signal per query (`Self::target_signal`
+    /// SQL resolves exactly one target signal per query (`Self::statement_tables`
     /// rejects a statement naming more than one table), never several matcher
     /// plans over several distinct fetch passes the way the PromQL engine's
     /// selector fan-out does. There is therefore no `distinct_plans`/
@@ -2910,7 +3058,7 @@ impl SqlExecutor {
         declared: &[DeclaredColumn],
     ) -> bool {
         match self
-            .analyzed_classification_plan(tenant_hash, sql, declared, None)
+            .sql_classification_plan(tenant_hash, sql, declared, None)
             .await
         {
             Some(plan) => plan_is_exact_typed(&plan),
@@ -2918,10 +3066,37 @@ impl SqlExecutor {
         }
     }
 
-    /// Build the throwaway empty-snapshot session for `sql`'s target signal,
-    /// logical-plan `sql`, and run DataFusion's analyzer (type coercion) over
-    /// the result. `None` on any error (the fail-closed source for
-    /// [`Self::classify_exact_typed`]).
+    /// [`Self::analyzed_classification_plan`] for SQL text, with any error
+    /// read as `None`, as the unit tests below call it.
+    #[cfg(test)]
+    async fn sql_classification_plan(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        declared: &[DeclaredColumn],
+        parquet: Option<&[(String, SchemaRef)]>,
+    ) -> Option<LogicalPlan> {
+        let tables = Self::statement_tables(sql).ok()?;
+        self.analyzed_classification_plan(
+            tenant_hash,
+            Statement::Sql(sql),
+            &tables,
+            declared,
+            parquet,
+        )
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Build the throwaway empty-snapshot session for the statement's target
+    /// signal, lower the statement onto it, and run DataFusion's analyzer
+    /// (type coercion) over the result. `Ok(None)` on any error building,
+    /// lowering or analyzing (the fail-closed source for
+    /// [`Self::classify_exact_typed`]); a lowered plan that fails plan
+    /// admission is that error instead, ahead of the analyzer.
+    ///
+    /// `tables` is `statement.tables()`, which the caller already holds.
     ///
     /// The analyzer step is the `execute_and_check` pass DataFusion's own
     /// physical planning applies before optimization; running it here is what
@@ -2936,10 +3111,11 @@ impl SqlExecutor {
     async fn analyzed_classification_plan(
         &self,
         tenant_hash: TenantHash,
-        sql: &str,
+        statement: Statement<'_>,
+        tables: &StatementTables,
         declared: &[DeclaredColumn],
         parquet: Option<&[(String, SchemaRef)]>,
-    ) -> Option<LogicalPlan> {
+    ) -> Result<Option<LogicalPlan>, SqlError> {
         let table = match parquet {
             Some(schemas) => SessionTable::Parquet(ParquetSession {
                 tables: schemas
@@ -2953,7 +3129,7 @@ impl SqlExecutor {
                 store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant_hash)),
             }),
             None => {
-                let target = Self::target_signal(sql).ok()?;
+                let target = tables.signal.unwrap_or(TargetSignal::Metrics);
                 self.empty_snapshot_table(target, tenant_hash, declared)
             }
         };
@@ -2964,21 +3140,30 @@ impl SqlExecutor {
         // classification decides the real session's value, not this throwaway.
         // Plan-inspection only: this throwaway session never executes, so it
         // never spills whatever the query's own session was granted.
-        let ctx = build_session(
+        let providers = session_table_providers(&table);
+        let Ok(ctx) = build_session(
             &self.config,
             pool,
             table,
             false,
             crate::session::SpillDecision::Disabled,
-        )
-        .ok()?;
+        ) else {
+            return Ok(None);
+        };
         let state = ctx.state();
-        let plan = state.create_logical_plan(sql).await.ok()?;
+        let plan = match statement
+            .lower(&ctx, providers, tables, LoweringSite::Classification)
+            .await
+        {
+            Ok(plan) => plan,
+            Err(LowerError::Plan(_)) => return Ok(None),
+            Err(LowerError::NotAdmitted(err)) => return Err(err),
+        };
         let config_options = Arc::clone(state.config_options());
-        state
+        Ok(state
             .analyzer()
             .execute_and_check(plan, &config_options, |_, _| {})
-            .ok()
+            .ok())
     }
 
     /// Whether any ADR-0850 metadata-only column-statistics path could fire for
@@ -3149,6 +3334,7 @@ impl SqlExecutor {
     /// only Parquet tables returns `Metrics` here, and [`Self::resolve_admitted`]
     /// and [`Self::plan_pinned_with`] choose [`TargetSignal::Parquet`] once the
     /// manifests are resolved.
+    #[cfg(test)]
     fn target_signal(sql: &str) -> Result<TargetSignal, SqlError> {
         Ok(Self::statement_tables(sql)?
             .signal
@@ -3160,7 +3346,7 @@ impl SqlExecutor {
     /// more than [`MAX_STATEMENT_TABLE_NAMES`] other names are
     /// [`SqlError::TooManyTables`], so the Parquet resolve's one LIST per
     /// name is bounded before it starts.
-    fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
+    pub(crate) fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
         let mut tables = referenced_base_tables(sql)?;
         let has_samples = tables.remove(SAMPLES_TABLE);
         let has_logs = tables.remove(LOGS_TABLE);
@@ -3206,9 +3392,11 @@ impl SqlExecutor {
     ///
     /// Returns the batch count alongside the result because the retry
     /// contract turns on whether anything was emitted before the failure.
+    #[allow(clippy::too_many_arguments)]
     async fn attempt(
         &self,
         tenant_hash: TenantHash,
+        statement: Statement<'_>,
         req: &SqlRequest,
         snapshot: Snapshot,
         phase_accounting: &PhaseAccounting,
@@ -3228,7 +3416,7 @@ impl SqlExecutor {
             .plan_pinned_with(
                 tenant_hash,
                 snapshot,
-                &req.sql,
+                statement,
                 phase_accounting,
                 PlanExtras {
                     declared: declared.to_vec(),
@@ -4306,6 +4494,45 @@ fn executed_plan_is_spill_eligible(state: &SessionState, plan: &LogicalPlan) -> 
         .analyzer()
         .execute_and_check(plan.clone(), &config_options, |_, _| {})
         .is_ok_and(|analyzed| plan_is_spill_eligible(&analyzed))
+}
+
+/// Refuse a lowered statement whose executed plan does not give the
+/// exact-typed decision its classification plan gave, with
+/// [`SqlError::PlanNotAdmitted`].
+///
+/// `exact_typed_aggregates` was read off the classification lowering and
+/// already chose `ctx`'s aggregation repartitioning (and a Parquet target's
+/// file groups). Re-derived here from the plan `ctx` executes, analyzed the
+/// same way: a lowering that returned a different aggregate on this call is
+/// not repeatable, and running it would apply an exactness decision taken
+/// for another plan. SQL text is planned by the same binder at both sites
+/// and is not re-checked.
+fn refuse_unrepeated_exact_typed(
+    statement: Statement<'_>,
+    config: &SqlConfig,
+    exact_typed_aggregates: bool,
+    ctx: &SessionContext,
+    plan: &LogicalPlan,
+) -> Result<(), SqlError> {
+    if statement.sql().is_some() {
+        return Ok(());
+    }
+    let state = ctx.state();
+    let config_options = Arc::clone(state.config_options());
+    let executed = config.parallel_final_aggregation
+        && state
+            .analyzer()
+            .execute_and_check(plan.clone(), &config_options, |_, _| {})
+            .is_ok_and(|analyzed| plan_is_exact_typed(&analyzed));
+    if executed == exact_typed_aggregates {
+        return Ok(());
+    }
+    Err(SqlError::PlanNotAdmitted(format!(
+        "the executed plan is {}exact-typed, but the classification plan was {}: \
+         the lowering is not repeatable",
+        if executed { "" } else { "not " },
+        if exact_typed_aggregates { "" } else { "not" },
+    )))
 }
 
 /// A second handle on the table `table` serves, for rebuilding a query's
@@ -6091,7 +6318,7 @@ mod tests {
 
         let exec = eviction_test_executor();
         let plan = exec
-            .analyzed_classification_plan(
+            .sql_classification_plan(
                 TenantHash([9u8; 16]),
                 "SELECT avg(CAST(value AS BIGINT)) AS a FROM samples",
                 &[],
@@ -6139,7 +6366,7 @@ mod tests {
 
         let exec = eviction_test_executor();
         let plan = exec
-            .analyzed_classification_plan(
+            .sql_classification_plan(
                 TenantHash([9u8; 16]),
                 "SELECT avg(value) AS a FROM samples",
                 &[],
@@ -6266,24 +6493,19 @@ mod tests {
         let schemas = vec![("hits".to_string(), schema)];
         let grouped = "SELECT name, count(*) FROM hits GROUP BY name";
         let plan = executor
-            .analyzed_classification_plan(tenant, grouped, &[], Some(&schemas))
+            .sql_classification_plan(tenant, grouped, &[], Some(&schemas))
             .await
             .expect("a plan over the Parquet schema");
         assert!(plan_is_spill_eligible(&plan));
         assert!(plan_is_exact_typed(&plan));
         let float = executor
-            .analyzed_classification_plan(
-                tenant,
-                "SELECT sum(score) FROM hits",
-                &[],
-                Some(&schemas),
-            )
+            .sql_classification_plan(tenant, "SELECT sum(score) FROM hits", &[], Some(&schemas))
             .await
             .expect("a plan over the Parquet schema");
         assert!(!plan_is_exact_typed(&float));
         assert!(
             executor
-                .analyzed_classification_plan(tenant, grouped, &[], None)
+                .sql_classification_plan(tenant, grouped, &[], None)
                 .await
                 .is_none(),
             "without the Parquet arm the statement does not plan"
@@ -6338,7 +6560,7 @@ mod tests {
         let tenant = TenantHash([101u8; 16]);
         let schemas = vec![("q33".to_string(), q33_schema())];
         let plan = executor
-            .analyzed_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
+            .sql_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
             .await
             .expect("the q33 shape plans");
 
@@ -6363,7 +6585,7 @@ mod tests {
         let tenant = TenantHash([102u8; 16]);
         let schemas = vec![("q33".to_string(), q33_schema())];
         let plan = executor
-            .analyzed_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
+            .sql_classification_plan(tenant, Q33_SQL, &[], Some(&schemas))
             .await
             .expect("the q33 shape plans");
         let rewritten = rewrite_sort_group_key_tie_order(plan).expect("the rewrite never errors");
@@ -6399,7 +6621,7 @@ mod tests {
         let sql = "SELECT a, b, count(*) AS c, sum(x) AS sx, avg(y) AS ay \
                    FROM q33 GROUP BY a, b ORDER BY c DESC, a, b LIMIT 10";
         let plan = executor
-            .analyzed_classification_plan(tenant, sql, &[], Some(&schemas))
+            .sql_classification_plan(tenant, sql, &[], Some(&schemas))
             .await
             .expect("the already-total q33 shape plans");
         assert!(
@@ -6428,7 +6650,7 @@ mod tests {
         let sql = "SELECT a, b, count(*) AS c FROM q33 \
                    GROUP BY GROUPING SETS ((a, b), (a)) ORDER BY c DESC LIMIT 10";
         let plan = executor
-            .analyzed_classification_plan(tenant, sql, &[], Some(&schemas))
+            .sql_classification_plan(tenant, sql, &[], Some(&schemas))
             .await
             .expect("the grouping-set shape plans");
         assert!(!plan_is_spill_eligible(&plan));
@@ -6538,7 +6760,7 @@ mod tests {
     async fn q33_plan(sql: &str) -> LogicalPlan {
         let schemas = vec![("q33".to_string(), q33_schema())];
         eviction_test_executor()
-            .analyzed_classification_plan(TenantHash([105u8; 16]), sql, &[], Some(&schemas))
+            .sql_classification_plan(TenantHash([105u8; 16]), sql, &[], Some(&schemas))
             .await
             .expect("the statement plans")
     }
@@ -6684,7 +6906,7 @@ mod tests {
     #[tokio::test]
     async fn a_float_group_key_under_order_by_stays_ineligible() {
         let plan = eviction_test_executor()
-            .analyzed_classification_plan(
+            .sql_classification_plan(
                 TenantHash([109u8; 16]),
                 "SELECT value, count(*) AS c FROM samples GROUP BY value ORDER BY c DESC LIMIT 10",
                 &[],
@@ -6789,6 +7011,91 @@ mod tests {
             0,
             "the scratch directory the classification granted is removed"
         );
+    }
+
+    /// A SQL statement that falls back to spill disabled keeps the plan it
+    /// already built: over one series its rows, and the requests each phase
+    /// issued, equal those of the same statement run without the fallback.
+    /// Each run gets its own executor over the shared store, so both resolve
+    /// and fetch cold.
+    #[tokio::test]
+    async fn sql_through_the_spill_fallback_matches_the_run_without_it() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("spill-fallback-2890", 100, FaultPlan::empty()).await;
+        let root = tempfile::tempdir().expect("spill root");
+        let request = sql_request(
+            "SELECT ts, series_id, count(*) AS c FROM samples \
+             GROUP BY ts, series_id ORDER BY ts DESC LIMIT 10",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 100,
+            },
+        );
+
+        let control = spill_executor_over(store.clone(), root.path());
+        let without = control
+            .execute(tenant_hash, &request)
+            .await
+            .expect("the statement runs with spill granted");
+        assert_eq!(
+            control
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the control must not fall back"
+        );
+
+        let mut fallback = spill_executor_over(store.clone(), root.path());
+        fallback.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let with = fallback
+            .execute(tenant_hash, &request)
+            .await
+            .expect("the statement runs with spill disabled");
+        assert_eq!(
+            fallback
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tampered plan must take the fallback"
+        );
+
+        assert_eq!(ts_values(&with.output), (90..100).rev().collect::<Vec<_>>());
+        assert_eq!(ts_values(&with.output), ts_values(&without.output));
+        assert_eq!(with.output.batches(), without.output.batches());
+        // The memory peak is the one figure allowed to differ: the fallback
+        // runs the tampered one-term sort in a session without a disk manager.
+        let mut with_accounting = with.phase_accounting;
+        let mut without_accounting = without.phase_accounting;
+        with_accounting.scan.peak_intermediate_bytes = 0;
+        without_accounting.scan.peak_intermediate_bytes = 0;
+        assert_eq!(with_accounting, without_accounting);
+        assert!(
+            without.accounting.s3_requests.iter().sum::<u64>() > 0,
+            "the comparison must cover a run that read the store"
+        );
+    }
+
+    /// [`executor_over`] with spill configured at `root`.
+    fn spill_executor_over(
+        store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
+        root: &std::path::Path,
+    ) -> SqlExecutor {
+        let catalog =
+            Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
+        SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(store.clone()),
+            LogSegmentFetcher::new(store.clone()),
+            SpanSegmentFetcher::new(store),
+            SqlConfig {
+                spill: Some(crate::config::SpillConfig {
+                    dir: root.to_path_buf(),
+                    max_bytes: 1 << 30,
+                }),
+                ..SqlConfig::default()
+            },
+            1 << 30,
+        )
     }
 
     /// An executor over an empty store with spill configured at `root` and a
