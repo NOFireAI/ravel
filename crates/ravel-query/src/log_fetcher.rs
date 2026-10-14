@@ -72,6 +72,7 @@ use ravel_logseg::{
     LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SegmentDirectories, SparseObject,
     SuffixOutcome, decode_section_accounted, open_from_suffix, read_section_accounted_from,
 };
+use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -1246,6 +1247,7 @@ impl LogSegmentFetcher {
                     })?;
                     self.store
                         .get(key, GetRange::Range(start, end))
+                        .in_get_phase(phase.into())
                         .await
                         .map_err(store_error)?
                 };
@@ -1703,6 +1705,7 @@ impl LogSegmentFetcher {
                         })?;
                 self.store
                     .get(key, GetRange::Full)
+                    .in_get_phase(ReadPhases::SCAN.blocks.into())
                     .await
                     .map_err(|source| LogFetchError::Store {
                         key: key.to_string(),
@@ -3133,6 +3136,7 @@ impl LogSegmentFetcher {
                         })?;
                 self.store
                     .get(key, GetRange::Full)
+                    .in_get_phase(phase.into())
                     .await
                     .map_err(|source| LogFetchError::Store {
                         key: key.to_string(),
@@ -3163,7 +3167,11 @@ impl LogSegmentFetcher {
                             "GetLimiter semaphore closed unexpectedly".to_string(),
                         )
                     })?;
-                    let got = self.store.get(key, GetRange::Full).await?;
+                    let got = self
+                        .store
+                        .get(key, GetRange::Full)
+                        .in_get_phase(phase.into())
+                        .await?;
                     accounting.record_s3_request(AccountedOp::Get);
                     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
                     self.wire_bytes.record(phase, got.data.len() as u64);
@@ -5143,6 +5151,7 @@ impl BlockRangeFetcher {
         let got = self
             .store
             .get(key, range)
+            .in_get_phase(phase.into())
             .await
             .map_err(|source| LogFetchError::Store {
                 key: key.to_string(),

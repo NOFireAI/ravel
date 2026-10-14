@@ -39,6 +39,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use ravel_object_store::get_latency::GetPhase;
 use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
 
 /// The phases a query's object-store cost is split across (issue #796). See
@@ -85,6 +86,21 @@ impl QueryPhase {
             QueryPhase::Plan => 1,
             QueryPhase::Probe => 2,
             QueryPhase::Scan => 3,
+        }
+    }
+}
+
+/// The phase a fetcher's store GETs are timed under (issue #2976): a fetcher
+/// wraps the future that issues a GET with
+/// [`InGetPhase::in_get_phase`](ravel_object_store::get_latency::InGetPhase)
+/// and the instrumented store reads it back.
+impl From<QueryPhase> for GetPhase {
+    fn from(phase: QueryPhase) -> Self {
+        match phase {
+            QueryPhase::Resolve => GetPhase::Resolve,
+            QueryPhase::Plan => GetPhase::Plan,
+            QueryPhase::Probe => GetPhase::Probe,
+            QueryPhase::Scan => GetPhase::Scan,
         }
     }
 }

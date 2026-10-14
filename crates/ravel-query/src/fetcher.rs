@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use ravel_cache::{Cache, CacheKey, ReadOutcome, SingleFlightError, TieredCache};
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series};
 use ravel_segment::{
@@ -16,7 +17,7 @@ use ravel_segment::{
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
-use crate::phase_accounting::PhaseAccounting;
+use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 use tracing::Instrument;
@@ -1817,6 +1818,7 @@ impl SegmentFetcher {
             Ok((footer, total_size, suffix_etag, regions))
         }
         .instrument(span.clone())
+        .in_get_phase(QueryPhase::Plan.into())
         .await
     }
 
@@ -2007,6 +2009,7 @@ impl SegmentFetcher {
             Ok(self.shrink_to_retained(matched))
         }
         .instrument(span.clone())
+        .in_get_phase(QueryPhase::Probe.into())
         .await
     }
 
@@ -2214,6 +2217,7 @@ impl SegmentFetcher {
             Ok((scalar_planned, histogram_planned))
         }
         .instrument(span.clone())
+        .in_get_phase(QueryPhase::Scan.into())
         .await
     }
 
