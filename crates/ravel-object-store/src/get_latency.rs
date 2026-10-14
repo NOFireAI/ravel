@@ -52,8 +52,9 @@
 //! slots: one slot per value below 8 us, then eight equal slots per power of
 //! two up to 2^32 us (about 71 minutes), the last slot also holding anything
 //! longer. A reported quantile is the largest value of the slot holding that
-//! rank, capped at the exact maximum, so it overstates the true quantile by at
-//! most one eighth (12.5%) and never understates it. `max` is exact to the
+//! rank, capped at the exact maximum, so it never understates the true
+//! quantile and overstates it by at most one eighth (12.5%); a quantile that
+//! falls in the last slot is reported as the maximum. `max` is exact to the
 //! microsecond.
 //!
 //! # Phases
@@ -67,8 +68,8 @@
 //!
 //! # Cost
 //!
-//! The histograms are allocated once, on the first recorded GET; after that a
-//! GET costs a few relaxed atomic adds and no allocation.
+//! The histograms are allocated once, on the first recorded GET; after that,
+//! recording a GET is a few relaxed atomic operations and allocates nothing.
 
 use std::cell::Cell;
 use std::future::Future;
@@ -255,6 +256,11 @@ impl Histogram {
             for (slot, n) in counts.iter().enumerate() {
                 seen += n;
                 if seen >= rank {
+                    // The last slot also holds every longer value, so its top
+                    // is no bound.
+                    if slot == LATENCY_SLOT_COUNT - 1 {
+                        return max_micros;
+                    }
                     return slot_highest_micros(slot).min(max_micros);
                 }
             }
@@ -518,7 +524,10 @@ mod tests {
         let mut next_lowest = 0u64;
         for bucket in 0..SIZE_BUCKET_COUNT {
             let (lowest, highest) = size_bucket_bounds(bucket);
-            assert_eq!(lowest, next_lowest, "bucket {bucket} starts where the last ended");
+            assert_eq!(
+                lowest, next_lowest,
+                "bucket {bucket} starts where the last ended"
+            );
             assert_eq!(size_bucket(lowest), bucket, "{lowest}");
             match highest {
                 Some(highest) => {
@@ -566,6 +575,19 @@ mod tests {
         assert_eq!(q.max_micros, 100_000);
     }
 
+    /// A value past the last slot's top is not understated: a quantile in the
+    /// last slot reads as the exact max.
+    #[test]
+    fn a_quantile_in_the_last_slot_is_the_max() {
+        let histogram = Histogram::new();
+        let two_hours_micros = 2 * 3_600 * 1_000_000u64;
+        histogram.record(two_hours_micros * 1_000);
+        let (count, q) = histogram.summary();
+        assert_eq!(count, 1);
+        assert_eq!(q.p50_micros, two_hours_micros);
+        assert_eq!(q.max_micros, two_hours_micros);
+    }
+
     #[test]
     fn an_empty_recorder_snapshots_to_zero_without_allocating() {
         let recorder = GetLatencyRecorder::default();
@@ -589,9 +611,7 @@ mod tests {
         assert_eq!(current_phase(), GetPhase::Unattributed);
         let seen = async {
             let outer = current_phase();
-            let inner = async { current_phase() }
-                .in_get_phase(GetPhase::Scan)
-                .await;
+            let inner = async { current_phase() }.in_get_phase(GetPhase::Scan).await;
             (outer, inner, current_phase())
         }
         .in_get_phase(GetPhase::Probe)

@@ -498,13 +498,19 @@ async fn generated_lane_reports_get_latency_per_phase_per_bucket() {
         }
     }
     let timed: Vec<u64> = phases.iter().map(count_of).collect();
-    assert!(wire_requests[3] > 0, "the statements read data: {wire_requests:?}");
+    assert!(
+        wire_requests[3] > 0,
+        "the statements read data: {wire_requests:?}"
+    );
     assert_eq!(
         timed[..4],
         wire_requests,
         "resolve, plan, probe, scan: timed GETs against the fetcher's counts"
     );
-    assert!(timed[4] > 0, "the catalog resolve reads are unattributed: {timed:?}");
+    assert!(
+        timed[4] > 0,
+        "the catalog resolve reads are unattributed: {timed:?}"
+    );
 }
 
 /// Count how many times `key` appears as an object key anywhere in `v`.

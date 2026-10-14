@@ -5198,7 +5198,10 @@ mod tests {
             snap.scan.s3_requests(AccountedOp::Get),
             0,
         ];
-        assert!(want[1..4].iter().all(|n| *n > 0), "every phase read: {want:?}");
+        assert!(
+            want[1..4].iter().all(|n| *n > 0),
+            "every phase read: {want:?}"
+        );
         let latency = metrics.get_latency().snapshot();
         let got = GetPhase::ALL.map(|phase| latency.phase(phase).ok_count());
         assert_eq!(got, want, "resolve, plan, probe, scan, unattributed");

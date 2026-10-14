@@ -1755,8 +1755,9 @@ catalog's commit-record reads, for one) is counted as `unattributed`. One call
 is one request: a caller's retry is a second call in whatever phase is in
 scope, and a retry inside `object_store`'s own loop is part of the one call's
 latency (and one more `attempts`). Each histogram holds whole microseconds in
-240 log-scale slots, eight per power of two, so a reported quantile overstates
-the true one by at most 12.5%, and `max` is exact.
+240 log-scale slots, eight per power of two up to about 71 minutes, so a
+reported quantile never understates the true one and, below that, overstates
+it by at most 12.5%; `max` is exact.
 
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
 against all three, multipart included (`assert_multipart_upload` is part of

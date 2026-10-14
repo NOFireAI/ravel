@@ -742,9 +742,10 @@ summed.
 
 ### The report-level `get_latency` block
 
-Wall-clock latency of every GET the measured statements issued, cold and warm
-runs together, measured per request on the bench process's monotonic clock
-(issue #2976). `get_latency.phases` lists `resolve`, `plan`, `probe`, `scan`
+Wall-clock latency of every GET the in-process measurement issued: every run
+of every statement, cold and warm together, plus the `--explain` plans when
+asked for, measured per request on the bench process's monotonic clock (issue
+#2976). `get_latency.phases` lists `resolve`, `plan`, `probe`, `scan`
 and `unattributed` in that order; each carries all 16 size `buckets` and a
 `failed` row. A bucket names its byte span (`bucket`, `min_bytes`, inclusive
 `max_bytes`, null above 64 MiB) and carries `count`, `first_byte_ms` and
@@ -763,7 +764,8 @@ split out; its wait is part of that GET's latency. The fetchers' GETs land in
 (the smoke test asserts it). The catalog's
 commit-record reads carry no phase and are the `unattributed` row. Quantiles
 come from a log-scale histogram with eight slots per power of two, so each
-can read up to 12.5% high; `max` is exact. Null on the Flight lane, whose
+can read up to 12.5% high and never reads low; `max` is exact. Null on the
+Flight lane, whose
 GETs run in the server.
 
 ## 6. Through the server (Flight SQL)

@@ -1163,11 +1163,12 @@ pub struct SqlLatencyReport {
     /// a report written before it existed still deserializes.
     #[serde(default)]
     pub modeled_cost: ModeledCost,
-    /// Time to first byte and time to last byte of every GET the measured
-    /// statements issued, cold and warm runs together, by read phase and
-    /// requested size ([`crate::get_latency`], issue #2976). Null on the Flight
-    /// lane, whose GETs run in the server. Defaulted on read so a report
-    /// written before it existed still deserializes.
+    /// Time to first byte and time to last byte of every GET `measure_corpus`
+    /// issued (every run of every statement, cold and warm together, and the
+    /// `--explain` plans), by read phase and requested size
+    /// ([`crate::get_latency`], issue #2976). Null on the Flight lane, whose
+    /// GETs run in the server. Defaulted on read so a report written before it
+    /// existed still deserializes.
     #[serde(default)]
     pub get_latency: Option<GetLatencyReport>,
 }

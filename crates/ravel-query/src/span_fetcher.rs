@@ -3521,7 +3521,11 @@ mod tests {
         assert_eq!(snap.scan.s3_requests(AccountedOp::Get), 3);
         let latency = store.metrics().get_latency().snapshot();
         let counts = GetPhase::ALL.map(|phase| latency.phase(phase).ok_count());
-        assert_eq!(counts, [0, 0, 1, 3, 0], "resolve, plan, probe, scan, unattributed");
+        assert_eq!(
+            counts,
+            [0, 0, 1, 3, 0],
+            "resolve, plan, probe, scan, unattributed"
+        );
     }
 
     /// With no block set, the trace's whole run is one ranged GET, pruned

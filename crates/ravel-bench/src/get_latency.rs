@@ -1,6 +1,6 @@
 //! The `get_latency` field of the `sql_latency_bench` report (issue #2976):
-//! every GET the measured statements issued, as time to first byte and time to
-//! last byte, by read phase and requested size.
+//! every GET the in-process measurement issued, as time to first byte and time
+//! to last byte, by read phase and requested size.
 //!
 //! [`GetLatencyCapture`] wraps the store the measurement reads through in an
 //! [`InstrumentedStore`], so the figures come from
@@ -191,7 +191,10 @@ mod tests {
             assert_eq!(buckets.len(), SIZE_BUCKET_COUNT);
             assert_eq!(buckets[0]["bucket"], "lt_4KiB");
             assert_eq!(buckets[SIZE_BUCKET_COUNT - 1]["bucket"], "gt_64MiB");
-            assert_eq!(buckets[SIZE_BUCKET_COUNT - 1]["max_bytes"], serde_json::Value::Null);
+            assert_eq!(
+                buckets[SIZE_BUCKET_COUNT - 1]["max_bytes"],
+                serde_json::Value::Null
+            );
             assert!(phase["failed"]["count"].is_u64());
         }
 
