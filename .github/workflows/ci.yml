@@ -1577,6 +1577,8 @@ jobs:
         run: cargo nextest run --locked -p ravel-segment --lib fuzz_mutation
       - name: Fuzz RSEG footer/section reader
         run: cargo nextest run --locked -p ravel-segment --test fuzz_mutation
+      - name: Fuzz KEY_IDX section (ravel-codec)
+        run: cargo nextest run --locked -p ravel-codec --test fuzz_mutation
       - name: Fuzz OTAP Arrow IPC decode
         run: cargo nextest run --locked -p ravel-otap --test fuzz_mutation
       # RLOG has a real hostile-input suite but it otherwise runs only in the
