@@ -3,7 +3,18 @@
 //! Each stage binds against the scope the stage before it left: the visible
 //! columns in order, each with its ES|QL name, internal column name and type.
 //! Until a `KEEP` or `STATS`, a name no column or reserved name claims is an
-//! attribute key read from the hidden `attrs` column.
+//! attribute key read from the hidden `attrs` column, unless a `DROP` removed
+//! it or a `RENAME` renamed it away. After a `KEEP` or `STATS` no name is an
+//! attribute key.
+//!
+//! The reserved names are the native columns' ES|QL names (`@timestamp`,
+//! `observed_ts`, `severity_num`, `severity_text`, `message`, `trace_id`,
+//! `span_id`, `flags`), their table names (`ts`, `body`) and `attrs`. A
+//! declared column whose key is one of them is not bound: the name reads the
+//! native column (or, for `attrs`, nothing), so the declared column is not
+//! reachable from ES|QL. That is the precedence of ADR-2887 D10, native
+//! before declared, applied at `FROM` rather than per reference, so no
+//! reference is ambiguous.
 
 use std::collections::BTreeSet;
 
@@ -125,7 +136,8 @@ struct Scope {
     aliases: Vec<(&'static str, String)>,
     /// Names that never fall through to an attribute key.
     reserved: BTreeSet<String>,
-    /// Attribute keys a `DROP` removed.
+    /// Names a `DROP` removed or a `RENAME` renamed away, which no longer
+    /// fall through to an attribute key.
     blocked: Vec<Pattern>,
 }
 
@@ -152,6 +164,14 @@ impl Scope {
             return Lookup::Attribute;
         }
         Lookup::Unknown
+    }
+
+    /// Stop names `pattern` matches from resolving as attribute keys, while
+    /// attribute keys resolve at all.
+    fn block(&mut self, pattern: Pattern) {
+        if self.attrs.is_some() {
+            self.blocked.push(pattern);
+        }
     }
 }
 
@@ -564,6 +584,7 @@ impl Binder<'_> {
                 match self.scope.lookup(&text) {
                     Lookup::Visible(col) => {
                         self.scope.cols.remove(col);
+                        self.scope.block(pattern);
                     }
                     Lookup::Attribute => self.scope.blocked.push(pattern),
                     Lookup::Unknown => return Err(self.unknown(&text, name.span)),
@@ -603,6 +624,7 @@ impl Binder<'_> {
                 if let Some(col) = self.scope.cols.iter_mut().find(|c| c.internal == internal) {
                     col.name = new;
                 }
+                self.scope.block(Pattern::of(&pair.old));
                 Ok(())
             }
             Lookup::Attribute => {
@@ -610,6 +632,7 @@ impl Binder<'_> {
                     .attribute(&old)
                     .ok_or_else(|| self.unknown(&old, pair.old.span))?;
                 self.define(new, value, EsqlType::Keyword);
+                self.scope.block(Pattern::of(&pair.old));
                 Ok(())
             }
             Lookup::Unknown => Err(self.unknown(&old, pair.old.span)),

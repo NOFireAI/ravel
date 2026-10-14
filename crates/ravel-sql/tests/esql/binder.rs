@@ -1,8 +1,9 @@
 //! Name resolution and the column set each stage leaves (ADR-2887 D9, D10).
 
-use ravel_sql::esql::EsqlError;
+use ravel_sql::esql::{self, EsqlError, PrepareContext};
+use ravel_sql::{DeclaredColumn, DeclaredType};
 
-use crate::support::{fixture, prepare, rows, run};
+use crate::support::{context, fixture, prepare, rows, run};
 
 fn names(source: &str) -> Vec<String> {
     prepare(source)
@@ -56,6 +57,122 @@ fn columns_dropped_by_stats_do_not_resolve_afterwards() {
         names("FROM logs | STATS c = COUNT(*) BY service | EVAL d = c + 1"),
         ["c", "service", "d"]
     );
+}
+
+/// A name a `DROP` removed or a `RENAME` renamed away does not fall through
+/// to an attribute key; neither does any attribute key after `KEEP` or
+/// `STATS`. Before them, an unknown name is still an attribute key.
+#[test]
+fn a_removed_name_does_not_resolve_as_an_attribute_key() {
+    assert_eq!(
+        verification(r#"FROM logs | EVAL x = 1 | DROP x | WHERE x == "a""#),
+        ("Unknown column [x]".to_string(), 1, 41)
+    );
+    assert_eq!(
+        verification(r#"FROM logs | EVAL x = 1 | RENAME x AS y | WHERE x == "a""#),
+        ("Unknown column [x]".to_string(), 1, 48)
+    );
+    // An attribute key renamed away or dropped stays gone.
+    assert_eq!(
+        verification(r#"FROM logs | RENAME service AS s | WHERE service == "a""#),
+        ("Unknown column [service]".to_string(), 1, 41)
+    );
+    assert_eq!(
+        verification(r#"FROM logs | DROP service | WHERE service == "a""#),
+        ("Unknown column [service]".to_string(), 1, 34)
+    );
+    // A declared column dropped is not read back as an attribute key.
+    assert_eq!(
+        verification("FROM logs | DROP region | KEEP region"),
+        ("Unknown column [region]".to_string(), 1, 32)
+    );
+    assert_eq!(
+        verification(r#"FROM logs | KEEP message | WHERE service == "a""#),
+        ("Unknown column [service]".to_string(), 1, 34)
+    );
+    assert_eq!(
+        verification(r#"FROM logs | STATS c = COUNT(*) | WHERE service == "a""#),
+        ("Unknown column [service]".to_string(), 1, 40)
+    );
+
+    // Before the first KEEP or STATS an unknown name is an attribute key,
+    // and a name defined again after a DROP is visible again.
+    assert_eq!(
+        typed(r#"FROM logs | EVAL x = 1 | DROP x | EVAL y = service | KEEP y"#),
+        [("y".to_string(), "keyword".to_string())]
+    );
+    assert_eq!(
+        typed("FROM logs | EVAL x = 1 | DROP x | EVAL x = 2 | KEEP x"),
+        [("x".to_string(), "long".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_name_reads_no_attribute_at_run_time() {
+    let fixture = fixture().await;
+    let outcome = run(
+        &fixture,
+        r#"FROM logs | SORT @timestamp | EVAL service = "z" | DROP service | EVAL s = service | KEEP s"#,
+    )
+    .await;
+    match outcome {
+        Err(EsqlError::Verification { message, .. }) => {
+            assert_eq!(message, "Unknown column [service]")
+        }
+        other => panic!("expected a verification error, got {other:?}"),
+    }
+}
+
+/// A declared column keyed like a native or reserved name is not bound: the
+/// name reads the native column, and the declared column is not visible.
+#[test]
+fn a_declared_column_colliding_with_a_reserved_name_yields_to_it() {
+    let ctx = PrepareContext {
+        declared: vec![
+            DeclaredColumn::new("severity_text", DeclaredType::I64),
+            DeclaredColumn::new("ts", DeclaredType::Bool),
+            DeclaredColumn::new("attrs", DeclaredType::Str),
+            DeclaredColumn::new("dur", DeclaredType::I64),
+        ],
+        ..context()
+    };
+    let prepared = esql::prepare(
+        "FROM logs | KEEP severity_text, dur",
+        &ravel_esql::Limits::default(),
+        &ctx,
+    )
+    .expect("prepares");
+    let columns: Vec<(String, String)> = prepared
+        .columns()
+        .iter()
+        .map(|column| (column.name.clone(), column.ty.name().to_string()))
+        .collect();
+    assert_eq!(
+        columns,
+        [("severity_text", "keyword"), ("dur", "long")].map(|(n, t)| (n.to_string(), t.to_string()))
+    );
+    let all = esql::prepare("FROM logs", &ravel_esql::Limits::default(), &ctx).expect("prepares");
+    let names: Vec<&str> = all.columns().iter().map(|c| c.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "@timestamp",
+            "observed_ts",
+            "severity_num",
+            "severity_text",
+            "message",
+            "trace_id",
+            "span_id",
+            "flags",
+            "dur",
+        ]
+    );
+    match esql::prepare("FROM logs | KEEP attrs", &ravel_esql::Limits::default(), &ctx) {
+        Err(EsqlError::Verification { message, .. }) => {
+            assert_eq!(message, "Unknown column [attrs]")
+        }
+        other => panic!("expected a verification error, got {other:?}"),
+    }
 }
 
 #[test]
