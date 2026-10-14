@@ -25,6 +25,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::TableProvider;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::datasource::{provider_as_source, source_as_provider};
 use datafusion::error::DataFusionError;
@@ -110,7 +111,7 @@ impl LoweringContext {
     /// Snapshot `ctx`'s function registries, and keep from `providers` (the
     /// providers the executor built for `ctx`) those of the tables in
     /// `tables`.
-    fn snapshot(
+    pub(crate) fn snapshot(
         ctx: &SessionContext,
         providers: Vec<(String, Arc<dyn TableProvider>)>,
         tables: &StatementTables,
@@ -147,8 +148,17 @@ impl LoweringContext {
     /// A plan builder over an unprojected, unfiltered scan of `table`, one of
     /// the statement's target tables, through the provider the executor
     /// registered for it.
+    ///
+    /// `table` is the name exactly as the target holds it. The scan names it
+    /// as a bare [`TableReference`], never one parsed from the string, so a
+    /// Parquet table named with capitals or a dot is scanned, and admitted,
+    /// under that same name rather than a lowercased or schema-qualified one.
     pub fn scan(&self, table: &str) -> Result<LogicalPlanBuilder, DataFusionError> {
-        LogicalPlanBuilder::scan(table, provider_as_source(self.provider(table)?), None)
+        LogicalPlanBuilder::scan(
+            TableReference::bare(table),
+            provider_as_source(self.provider(table)?),
+            None,
+        )
     }
 
     /// The schema of `table`, one of the statement's target tables.
@@ -368,7 +378,8 @@ fn target_table_names(tables: &StatementTables) -> BTreeSet<&str> {
     names
 }
 
-/// Whether `node`'s kind may appear in a lowered plan.
+/// Whether `node`'s kind may appear in a lowered plan. `Window` stays out
+/// until window operators have a decision of their own (ADR-2887 D13).
 fn admitted_node(node: &LogicalPlan) -> bool {
     matches!(
         node,
@@ -396,7 +407,8 @@ fn admitted_node(node: &LogicalPlan) -> bool {
 ///
 /// - Every node kind is one of Projection, Filter, Aggregate, Sort, Limit,
 ///   TableScan, SubqueryAlias, Values and EmptyRelation.
-/// - Every `TableScan` names a table in `tables`, and its source is the
+/// - Every `TableScan` names a table in `tables` by a bare reference (the
+///   form [`LoweringContext::scan`] builds), and its source is the
 ///   provider the executor built the session over for that name: a scan
 ///   built over any other provider under an admitted name is refused. It
 ///   carries no filters and no fetch, the shape SQL's planner produces before
@@ -440,20 +452,27 @@ pub(crate) fn admit_lowered_plan(
         }
         if let LogicalPlan::TableScan(scan) = node {
             let name = &scan.table_name;
-            let reason = if !admitted_tables.contains(name.table()) {
+            let bare = match name {
+                TableReference::Bare { table } => Some(table.as_ref()),
+                _ => None,
+            };
+            let reason = if let Some(table) = bare.filter(|table| admitted_tables.contains(table))
+            {
+                if !scan_is_registered(context, table, &scan.source) {
+                    Some(format!(
+                        "a lowered plan scans {name} through a provider the session did not register"
+                    ))
+                } else if !scan.filters.is_empty() {
+                    Some(format!("a lowered plan scans {name} with filters"))
+                } else if scan.fetch.is_some() {
+                    Some(format!("a lowered plan scans {name} with a fetch"))
+                } else {
+                    None
+                }
+            } else {
                 Some(format!(
                     "a lowered plan scans {name}, which is not in its target"
                 ))
-            } else if !scan_is_registered(context, name.table(), &scan.source) {
-                Some(format!(
-                    "a lowered plan scans {name} through a provider the session did not register"
-                ))
-            } else if !scan.filters.is_empty() {
-                Some(format!("a lowered plan scans {name} with filters"))
-            } else if scan.fetch.is_some() {
-                Some(format!("a lowered plan scans {name} with a fetch"))
-            } else {
-                None
             };
             if reason.is_some() {
                 refusal = reason;
@@ -570,16 +589,40 @@ fn refused_instance<F: ?Sized>(
     }
 }
 
-fn node_kind(node: &LogicalPlan) -> String {
-    let display = node.display().to_string();
-    display
-        .split(|c: char| c == ':' || c.is_whitespace())
-        .next()
-        .unwrap_or_default()
-        .to_string()
+/// The name of `node`'s [`LogicalPlan`] variant. Matched without a wildcard,
+/// so a variant DataFusion adds does not compile until it is named here.
+fn node_kind(node: &LogicalPlan) -> &'static str {
+    match node {
+        LogicalPlan::Projection(_) => "Projection",
+        LogicalPlan::Filter(_) => "Filter",
+        LogicalPlan::Window(_) => "Window",
+        LogicalPlan::Aggregate(_) => "Aggregate",
+        LogicalPlan::Sort(_) => "Sort",
+        LogicalPlan::Join(_) => "Join",
+        LogicalPlan::Repartition(_) => "Repartition",
+        LogicalPlan::Union(_) => "Union",
+        LogicalPlan::TableScan(_) => "TableScan",
+        LogicalPlan::EmptyRelation(_) => "EmptyRelation",
+        LogicalPlan::Subquery(_) => "Subquery",
+        LogicalPlan::SubqueryAlias(_) => "SubqueryAlias",
+        LogicalPlan::Limit(_) => "Limit",
+        LogicalPlan::Statement(_) => "Statement",
+        LogicalPlan::Values(_) => "Values",
+        LogicalPlan::Explain(_) => "Explain",
+        LogicalPlan::Analyze(_) => "Analyze",
+        LogicalPlan::Extension(_) => "Extension",
+        LogicalPlan::Distinct(_) => "Distinct",
+        LogicalPlan::Dml(_) => "Dml",
+        LogicalPlan::Ddl(_) => "Ddl",
+        LogicalPlan::Copy(_) => "Copy",
+        LogicalPlan::DescribeTable(_) => "DescribeTable",
+        LogicalPlan::Unnest(_) => "Unnest",
+        LogicalPlan::RecursiveQuery(_) => "RecursiveQuery",
+    }
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -605,5 +648,124 @@ mod tests {
         let _: HashMap<String, Arc<AggregateUDF>> = aggregates;
         let _: HashMap<String, Arc<WindowUDF>> = windows;
         let _: BTreeMap<String, Arc<dyn TableProvider>> = tables;
+    }
+
+    fn empty_provider() -> Arc<dyn TableProvider> {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(datafusion::datasource::empty::EmptyTable::new(Arc::new(
+            Schema::new(vec![Field::new("v", DataType::Int64, true)]),
+        )))
+    }
+
+    fn context_over(names: &[&str]) -> LoweringContext {
+        let state = SessionContext::new().state();
+        LoweringContext {
+            scalars: state.scalar_functions().clone(),
+            aggregates: state.aggregate_functions().clone(),
+            windows: state.window_functions().clone(),
+            tables: names
+                .iter()
+                .map(|name| ((*name).to_string(), empty_provider()))
+                .collect(),
+        }
+    }
+
+    fn parquet_tables(names: &[&str]) -> StatementTables {
+        StatementTables {
+            signal: None,
+            others: names.iter().map(|name| (*name).to_string()).collect(),
+        }
+    }
+
+    /// A Parquet table named with capitals or a dot is scanned under exactly
+    /// that name and admitted. Parsing the name instead would lowercase the
+    /// first and split the second into a schema and a table, and admission
+    /// would then find neither in the target.
+    #[test]
+    fn a_scan_names_its_table_as_the_target_holds_it() {
+        let names = ["Mixed.Case", "UPPER"];
+        let context = context_over(&names);
+        let tables = parquet_tables(&names);
+        for name in names {
+            let plan = context
+                .scan(name)
+                .and_then(LogicalPlanBuilder::build)
+                .expect("scan");
+            let LogicalPlan::TableScan(scan) = &plan else {
+                panic!("expected a TableScan, got {plan:?}");
+            };
+            assert_eq!(scan.table_name, TableReference::bare(name));
+            admit_lowered_plan(&plan, &context, &tables, &DialectPolicy::default())
+                .expect("a scan built by the context is admitted");
+        }
+
+        // The same provider under the parsed reference is not the target's
+        // table.
+        let source = provider_as_source(Arc::clone(&context.tables["Mixed.Case"]));
+        let parsed = LogicalPlanBuilder::scan("Mixed.Case", source, None)
+            .and_then(LogicalPlanBuilder::build)
+            .expect("scan");
+        let err = admit_lowered_plan(&parsed, &context, &tables, &DialectPolicy::default())
+            .expect_err("a parsed reference is refused");
+        assert!(
+            err.to_string().contains("which is not in its target"),
+            "{err}"
+        );
+        assert!(context.scan("mixed.case").is_err());
+    }
+
+    /// A `Window` node is refused even when its function is the session's
+    /// instance under a name the policy lists (ADR-2887 D13).
+    #[test]
+    fn a_window_node_is_refused_under_a_listed_function() {
+        use datafusion::logical_expr::expr::WindowFunction;
+
+        let context = context_over(&["t"]);
+        let tables = parquet_tables(&["t"]);
+        let sum = context.aggregate("sum").expect("sum");
+        let call = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::AggregateUDF(sum),
+            vec![datafusion::prelude::col("v")],
+        )))
+        .alias("s");
+        let plan = context
+            .scan("t")
+            .and_then(|builder| builder.window(vec![call]))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("window plan");
+        assert!(matches!(plan, LogicalPlan::Window(_)), "{plan:?}");
+
+        let listed = DialectPolicy::new(Vec::<String>::new(), ["sum"], Vec::<String>::new());
+        let err = admit_lowered_plan(&plan, &context, &tables, &listed)
+            .expect_err("a window node is refused");
+        assert!(
+            err.to_string()
+                .contains("a lowered plan holds an unadmitted Window node"),
+            "{err}"
+        );
+    }
+
+    /// The refusal names the plan variant. A join displays as `Inner Join:`
+    /// or `Cross Join:`, whose first token is not the node's kind.
+    #[test]
+    fn an_unadmitted_node_is_named_by_its_plan_variant() {
+        let context = context_over(&["t", "u"]);
+        let tables = parquet_tables(&["t", "u"]);
+        let right = context
+            .scan("u")
+            .and_then(LogicalPlanBuilder::build)
+            .expect("scan");
+        let plan = context
+            .scan("t")
+            .and_then(|builder| builder.cross_join(right))
+            .and_then(LogicalPlanBuilder::build)
+            .expect("join plan");
+        let err = admit_lowered_plan(&plan, &context, &tables, &DialectPolicy::default())
+            .expect_err("a join is refused");
+        assert!(
+            err.to_string()
+                .contains("a lowered plan holds an unadmitted Join node"),
+            "{err}"
+        );
     }
 }
