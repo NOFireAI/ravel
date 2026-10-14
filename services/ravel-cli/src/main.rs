@@ -11,6 +11,7 @@ use ravel_cli::{
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, COMP_ZSTD, SortBucketWidth, SortKeyType, kind};
+use ravel_logseg::key_index;
 use ravel_logseg::record::FieldType;
 use ravel_logseg::rlog_bloom::RlogBloomSection;
 use ravel_logseg::skip_index::SkipIndex;
@@ -1296,6 +1297,18 @@ enum BloomScopeCommand {
     },
 }
 
+/// The key-index column list `typed-attr-column set` writes: `None` keeps the
+/// stored list, `Some(vec![])` turns it off.
+fn key_index_columns(key_index: Vec<String>, no_key_index: bool) -> Option<Vec<String>> {
+    if no_key_index {
+        Some(Vec::new())
+    } else if key_index.is_empty() {
+        None
+    } else {
+        Some(key_index)
+    }
+}
+
 /// The storage-layout write opt-in every clustering-key and bloom-scope write
 /// requires (ADR-0066 R1); without it the command exits 2 before any store
 /// request.
@@ -1351,6 +1364,27 @@ enum TypedAttrColumnCommand {
         /// exclusive with positional `KEY:TYPE` specs.
         #[arg(long, value_name = "TOML")]
         from_mapping: Option<std::path::PathBuf>,
+        /// Declared columns the logs flush indexes by exact key into each
+        /// RLOG's KEY_IDX section, replacing the stored list: repeat the flag
+        /// or separate keys with commas. Each must be declared str, i64 or
+        /// bytes; bool is refused. Omitted, the stored list is kept. Queries
+        /// do not read the index yet.
+        #[arg(long = "key-index", value_name = "KEY", value_delimiter = ',')]
+        key_index: Vec<String>,
+        /// Turn the column key index off. Needs no opt-in.
+        #[arg(long, conflicts_with = "key_index")]
+        no_key_index: bool,
+        /// Whether the logs flush also indexes `trace_id` by exact key.
+        /// Omitted, the stored setting is kept.
+        #[arg(long, value_name = "BOOL")]
+        index_trace_id: Option<bool>,
+        /// Assert that every process reading this bucket's tenant config runs
+        /// a release that reads record version 4. Required to turn
+        /// `--key-index` or `--index-trace-id` on; a process that does not
+        /// read version 4 refuses the record, and that tenant's ingest and
+        /// lifecycle fail closed. Turning both off needs no opt-in.
+        #[arg(long)]
+        readers_rolled_out: bool,
     },
 }
 
@@ -2789,27 +2823,44 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant,
                     columns,
                     from_mapping,
+                    key_index,
+                    no_key_index,
+                    index_trace_id,
+                    readers_rolled_out,
                 },
-        } => match from_mapping {
-            Some(mapping_path) => {
-                ravel_cli::typed_attr_column::set_from_mapping(
-                    store::build_store(&cli.store)?,
-                    &tenant,
-                    &mapping_path,
-                    now_ns()?,
-                )
-                .await
+        } => {
+            let key_index = ravel_cli::typed_attr_column::KeyIndexSpec {
+                columns: key_index_columns(key_index, no_key_index),
+                index_trace_id,
+                write: if readers_rolled_out {
+                    ravel_catalog::StorageLayoutWrite::ReadersRolledOut
+                } else {
+                    ravel_catalog::StorageLayoutWrite::Disabled
+                },
+            };
+            match from_mapping {
+                Some(mapping_path) => {
+                    ravel_cli::typed_attr_column::set_from_mapping(
+                        store::build_store(&cli.store)?,
+                        &tenant,
+                        &mapping_path,
+                        &key_index,
+                        now_ns()?,
+                    )
+                    .await
+                }
+                None => {
+                    ravel_cli::typed_attr_column::set(
+                        store::build_store(&cli.store)?,
+                        &tenant,
+                        &columns,
+                        &key_index,
+                        now_ns()?,
+                    )
+                    .await
+                }
             }
-            None => {
-                ravel_cli::typed_attr_column::set(
-                    store::build_store(&cli.store)?,
-                    &tenant,
-                    &columns,
-                    now_ns()?,
-                )
-                .await
-            }
-        },
+        }
         Command::GcConfig {
             command: GcConfigCommand::Show {},
         } => ravel_cli::gc_config::show(store::build_store(&cli.store)?).await,
@@ -3433,6 +3484,7 @@ fn rlog_section_kind_name(kind: u32) -> &'static str {
         kind::BLOOM => "BLOOM",
         kind::POSTINGS => "POSTINGS",
         kind::PAGE_DIR => "PAGE_DIR",
+        kind::KEY_IDX => "KEY_IDX",
         _ => "UNKNOWN",
     }
 }
@@ -3506,8 +3558,9 @@ fn rlog_stat_value(ty: FieldType, bits: u64) -> String {
 /// Inspects a whole RLOG object (docs/log-segment-format.md): footer identity
 /// and summary, the sort descriptor and clustering generation (ADR-2135), the
 /// section table, the level-0 skip index (one line per block plus its numeric
-/// column stats), the stream directory, the field directory, and the columns
-/// BLOOM covers. Every decode is the reader's own path, so a corrupt SKIP_IDX or a
+/// column stats), the stream directory, the field directory, the columns
+/// BLOOM covers, and, when the object carries one, the crc-verified KEY_IDX
+/// summary. Every decode is the reader's own path, so a corrupt SKIP_IDX or a
 /// section crc mismatch surfaces as a typed error with a non-zero exit, never a
 /// panic. BLOOM also goes through `read_section`, so its whole-section crc is
 /// verified and a damaged BLOOM is refused here, where a scan never consults
@@ -3557,8 +3610,14 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     println!("clustering_generation: {}", footer.clustering_generation);
     println!("sections:");
     for section in &footer.sections {
+        // prefix_len is meaningful on the KEY_IDX entry only.
+        let prefix_len = if section.kind == kind::KEY_IDX {
+            format!(" prefix_len={}", section.prefix_len)
+        } else {
+            String::new()
+        };
         println!(
-            "  kind={} name={} offset={} len={} comp={} uncompressed_len={}",
+            "  kind={} name={} offset={} len={} comp={} uncompressed_len={}{prefix_len}",
             section.kind,
             rlog_section_kind_name(section.kind),
             section.offset,
@@ -3646,6 +3705,20 @@ fn rlog_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         println!("  column_id={column_id} name={name} kind={column_kind}");
     }
 
+    // KEY_IDX is optional: an object written without declared key-index fields
+    // has no section and prints no summary.
+    if let Some(desc) = key_index::key_index_section(&footer) {
+        let raw = usize::try_from(desc.offset)
+            .ok()
+            .zip(usize::try_from(desc.len).ok())
+            .and_then(|(start, len)| bytes.get(start..start.checked_add(len)?))
+            .ok_or_else(|| anyhow::anyhow!("KEY_IDX section range is past the object"))?;
+        let summary = key_index::summarize(&footer, raw)
+            .map_err(|err| anyhow::anyhow!("failed to verify KEY_IDX section: {err}"))?
+            .ok_or_else(|| anyhow::anyhow!("KEY_IDX section vanished from the footer"))?;
+        print_key_idx_summary(&summary);
+    }
+
     Ok(())
 }
 
@@ -3718,11 +3791,12 @@ fn rspan_section_kind_name(kind: u32) -> &'static str {
     }
 }
 
-/// Prints the verified KEY_IDX summary (v5, ADR-2707): the section header, then
-/// per field its entry count and the spread of entries over its buckets. The
-/// median is the middle of the sorted per-bucket counts (the upper one of the
-/// two middles for an even bucket count).
-fn print_rspan_key_idx(summary: &ravel_rspan::KeyIdxSummary) {
+/// Prints a verified KEY_IDX summary (ADR-2707; RSPAN v5 and RLOG v5 share the
+/// encoding): the section header, then per field its entry count and the
+/// spread of entries over its buckets. The median is the middle of the sorted
+/// per-bucket counts (the upper one of the two middles for an even bucket
+/// count).
+fn print_key_idx_summary(summary: &ravel_logseg::key_index::KeyIdxSummary) {
     println!(
         "key_idx: version={} bucket_bits={} prefix_len={} fields={}",
         summary.version,
@@ -3875,7 +3949,7 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
         let key_idx = reader
             .key_idx_summary()
             .map_err(|err| anyhow::anyhow!("failed to verify KEY_IDX section: {err}"))?;
-        print_rspan_key_idx(&key_idx);
+        print_key_idx_summary(&key_idx);
 
         // One line per span, in the object's stored (trace_id, start_ts) order.
         // `service_name` is the column lifted out of the attribute map (v3,
@@ -4051,8 +4125,92 @@ mod tests {
     use clap::Parser;
 
     use super::rspan_status_mask_names;
-    use super::{BloomScopeCommand, Cli, ClusteringKeyCommand, Command, tenancy};
+    use super::{
+        BloomScopeCommand, Cli, ClusteringKeyCommand, Command, TypedAttrColumnCommand,
+        key_index_columns, tenancy,
+    };
     use ravel_rspan::skip_index::{STATUS_BIT_ERROR, STATUS_BIT_OK, STATUS_BIT_UNSET};
+
+    /// The `typed-attr-column set` key-index flags as `set` receives them:
+    /// repeated and comma-separated `--key-index` values collect in order,
+    /// `--no-key-index` is the empty list, no flag keeps the stored list, and
+    /// a positional `KEY:TYPE` after `--key-index KEY` stays a declaration.
+    #[test]
+    fn typed_attr_column_set_parses_the_key_index_flags() {
+        let parse = |extra: &[&str]| {
+            let cli = Cli::try_parse_from(
+                ["ravel", "typed-attr-column", "set", "t", "a:str"]
+                    .iter()
+                    .chain(extra),
+            )
+            .expect("parses");
+            let Command::TypedAttrColumn {
+                command:
+                    TypedAttrColumnCommand::Set {
+                        columns,
+                        key_index,
+                        no_key_index,
+                        index_trace_id,
+                        readers_rolled_out,
+                        ..
+                    },
+            } = cli.command
+            else {
+                panic!("expected typed-attr-column set");
+            };
+            (
+                columns,
+                key_index_columns(key_index, no_key_index),
+                index_trace_id,
+                readers_rolled_out,
+            )
+        };
+        let declared = vec!["a:str".to_string()];
+
+        assert_eq!(parse(&[]), (declared.clone(), None, None, false));
+        assert_eq!(
+            parse(&[
+                "--key-index",
+                "a,b",
+                "--key-index",
+                "c",
+                "--index-trace-id",
+                "true",
+                "--readers-rolled-out",
+            ]),
+            (
+                declared.clone(),
+                Some(vec!["a".to_string(), "b".to_string(), "c".to_string()]),
+                Some(true),
+                true
+            )
+        );
+        assert_eq!(
+            parse(&["--no-key-index", "--index-trace-id", "false"]),
+            (declared.clone(), Some(Vec::new()), Some(false), false)
+        );
+        assert_eq!(
+            parse(&["--key-index", "a", "b:i64"]),
+            (
+                vec!["a:str".to_string(), "b:i64".to_string()],
+                Some(vec!["a".to_string()]),
+                None,
+                false
+            )
+        );
+
+        for bad in [
+            &["--key-index", "a", "--no-key-index"][..],
+            &["--index-trace-id", "maybe"][..],
+            &["--index-trace-id"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(["ravel", "typed-attr-column", "set", "t"].iter().chain(bad))
+                    .is_err(),
+                "{bad:?} must not parse"
+            );
+        }
+    }
 
     /// This unit test binary is built from this binary root, so it links the
     /// `#[global_allocator]` above; an integration test in `tests/` links the

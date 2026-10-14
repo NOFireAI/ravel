@@ -20,6 +20,7 @@ pub mod dict_values;
 pub mod error;
 pub mod field_dir;
 pub mod footer;
+pub mod key_index;
 pub mod page;
 pub mod page_dir;
 pub mod postings;

@@ -35,6 +35,10 @@ message Section {
   fixed32 crc32c = 4;         // over stored bytes
   Compression comp = 5;
   uint64 uncompressed_len = 6;
+  // Byte length of the KEY_IDX prefix (header plus every field directory).
+  // Set only on the kind 9 KEY_IDX entry (ADR-2707), which an RLOG v5 trailer
+  // carries as an optional section; zero (absent) on every other kind.
+  uint32 prefix_len = 7;
 }
 
 message LogFooter {

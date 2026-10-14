@@ -394,6 +394,109 @@ fn rlog_inspect_prints_no_clustering_lines_for_a_v4_object() {
     );
 }
 
+/// An object written with declared key-index fields lists its KEY_IDX section
+/// with the entry's `prefix_len`, then the crc-verified summary: version,
+/// bucket_bits, and per field its key type, its distinct (key, block) entry
+/// count and the bucket distribution. Block 0 holds stream 1 (svc=api, codes
+/// 200 and 504) and block 1 holds stream 2 (svc=auth, codes 200 and 401), so
+/// `svc` has 2 entries and `code` has 4.
+#[test]
+fn rlog_inspect_prints_the_key_idx_summary() {
+    use ravel_logseg::key_index::{self, KeyType};
+
+    let object = build_object_with(|w| {
+        w.with_key_index_fields(vec![
+            ("svc".to_string(), KeyType::Str),
+            ("code".to_string(), KeyType::I64),
+        ])
+    });
+    let footer = ravel_logseg::footer::open(&object).expect("object opens");
+    let desc = key_index::key_index_section(&footer).expect("KEY_IDX section");
+    let raw = &object[desc.offset as usize..(desc.offset + desc.len) as usize];
+    let summary = key_index::summarize(&footer, raw)
+        .expect("summary verifies")
+        .expect("summary present");
+
+    let stdout = inspect_stdout(&object, "key-idx");
+    let section_line = format!(
+        "  kind=9 name=KEY_IDX offset={} len={} comp=none uncompressed_len={} prefix_len={}",
+        desc.offset, desc.len, desc.uncomp_len, desc.prefix_len
+    );
+    assert!(
+        stdout.lines().any(|l| l == section_line),
+        "expected {section_line:?} in:\n{stdout}"
+    );
+
+    let mut expected = vec![format!(
+        "key_idx: version={} bucket_bits={} prefix_len={} fields=2",
+        summary.version, summary.bucket_bits, desc.prefix_len
+    )];
+    for (field, key_type, entries) in [("code", "I64", 4), ("svc", "Str", 2)] {
+        let got = summary
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .expect("declared field is summarized");
+        let mut counts = got.bucket_entry_counts.clone();
+        counts.sort_unstable();
+        let empty = counts.iter().filter(|&&c| c == 0).count();
+        assert_eq!(counts.len(), 1 << summary.bucket_bits);
+        expected.push(format!(
+            "  field name={field} key_type={key_type} entries={entries} buckets={} \
+             entries_per_bucket=[min={} median={} max={}] empty_buckets={empty}",
+            counts.len(),
+            counts[0],
+            counts[counts.len() / 2],
+            counts[counts.len() - 1],
+        ));
+    }
+    let mut printed = block(&stdout, "key_idx: ");
+    // The summary lists fields in the order the section stores them.
+    printed[1..].sort_unstable();
+    assert_eq!(printed, expected);
+}
+
+/// An object written without key-index fields has no KEY_IDX section line and
+/// no summary.
+#[test]
+fn rlog_inspect_prints_no_key_idx_for_an_object_without_one() {
+    let stdout = inspect_stdout(&build_object(), "no-key-idx");
+    assert!(!stdout.contains("KEY_IDX"), "{stdout}");
+    assert!(block(&stdout, "key_idx: ").is_empty(), "{stdout}");
+}
+
+/// A flipped KEY_IDX byte fails the whole-section crc and surfaces as a typed
+/// error with a non-zero exit, never a panic.
+#[test]
+fn corrupt_key_idx_prints_typed_error_not_panic() {
+    let object = build_object_with(|w| {
+        w.with_key_index_fields(vec![(
+            "svc".to_string(),
+            ravel_logseg::key_index::KeyType::Str,
+        )])
+    });
+    let footer = ravel_logseg::footer::open(&object).expect("object opens");
+    let desc = ravel_logseg::key_index::key_index_section(&footer).expect("KEY_IDX section");
+    let mut corrupt = object.clone();
+    corrupt[(desc.offset + desc.len) as usize - 1] ^= 0xFF;
+
+    let path = temp_path("corrupt-key-idx");
+    std::fs::write(&path, &corrupt).expect("writes object");
+    let output = run_inspect(&path);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        !output.status.success(),
+        "a corrupt KEY_IDX must be refused"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
+    assert!(
+        stderr.contains("failed to verify KEY_IDX section") && stderr.contains("crc mismatch"),
+        "expected the typed KEY_IDX corruption text on stderr, got: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "inspector panicked: {stderr}");
+}
+
 /// Regenerates `tests/fixtures/rlog_inspect.txt` after a deliberate, versioned
 /// format change (never for an internal refactor). Run explicitly:
 ///   cargo test -p ravel-cli --test rlog_inspect -- --ignored capture

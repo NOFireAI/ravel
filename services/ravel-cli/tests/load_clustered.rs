@@ -215,6 +215,7 @@ async fn declare_region_and_code(store: &Arc<dyn ObjectStoreBackend>, now_ns: i6
         Arc::clone(store),
         TENANT,
         &["region:str".to_string(), "code:i64".to_string()],
+        &typed_attr_column::KeyIndexSpec::default(),
         now_ns,
     )
     .await
@@ -930,6 +931,7 @@ async fn an_undeclared_scope_declaration_takes_a_generation_the_object_names() {
             "code:i64".to_string(),
             "user:i64".to_string(),
         ],
+        &typed_attr_column::KeyIndexSpec::default(),
         fx.now_ns,
     )
     .await
@@ -1045,6 +1047,7 @@ async fn a_record_moved_after_the_read_refuses_the_write() {
             "code:i64".to_string(),
             "user:str".to_string(),
         ],
+        &typed_attr_column::KeyIndexSpec::default(),
         2,
     )
     .await

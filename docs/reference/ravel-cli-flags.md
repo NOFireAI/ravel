@@ -481,6 +481,10 @@ Replace the tenant's declaration wholesale, validating it first and swapping the
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
 | `--from-mapping` |  |  | Derive the declaration from a `load --mapping` TOML instead of positional `KEY:TYPE` specs: every `[[attribute]]` and `[[resource_attribute]]` entry becomes a typed attribute column of the same-named type. `f64`-typed entries are skipped with a per-key warning on stderr (no typed attribute column can be `f64`); the rest are written through the same CAS whole-list replace. Mutually exclusive with positional `KEY:TYPE` specs |
+| `--index-trace-id` |  |  | Whether the logs flush also indexes `trace_id` by exact key. Omitted, the stored setting is kept |
+| `--key-index` |  |  | Declared columns the logs flush indexes by exact key into each RLOG's KEY_IDX section, replacing the stored list: repeat the flag or separate keys with commas. Each must be declared str, i64 or bytes; bool is refused. Omitted, the stored list is kept. Queries do not read the index yet |
+| `--no-key-index` |  |  | Turn the column key index off. Needs no opt-in |
+| `--readers-rolled-out` |  |  | Assert that every process reading this bucket's tenant config runs a release that reads record version 4. Required to turn `--key-index` or `--index-trace-id` on; a process that does not read version 4 refuses the record, and that tenant's ingest and lifecycle fail closed. Turning both off needs no opt-in |
 | `<KEY:TYPE>` |  |  | The declaration, as `KEY:TYPE` specs in schema-append order, where TYPE is one of str/i64/bool/bytes (case-insensitive). A key may contain `:`; the type is split off the right. Mutually exclusive with `--from-mapping` |
 | `<TENANT>` |  |  | The tenant whose declaration to replace |
 

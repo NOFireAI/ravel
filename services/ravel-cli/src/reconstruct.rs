@@ -510,6 +510,7 @@ mod tests {
                 crc32c: 0,
                 comp: 0,
                 uncomp_len: 1,
+                prefix_len: 0,
             }],
             level: 0,
             input_set_hash: Vec::new(),

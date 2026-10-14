@@ -27,6 +27,7 @@ use crate::footer::{
     COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, SortDescriptor, SortKeyType, kind,
     write_footer_and_trailer,
 };
+use crate::key_index::{Key8, KeyIndexPlan, KeyType, TRACE_ID_FIELD, key8_of};
 use crate::page::{SealedPage, seal_page};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
@@ -107,6 +108,8 @@ pub struct RlogWriter {
     /// `push_columnar` each refuse if the other has already been used.
     batches: Vec<ColumnarLogBatch>,
     indexed_fields: Vec<String>,
+    /// The exact-key fields KEY_IDX indexes ([`RlogWriter::with_key_index_fields`]).
+    key_index_fields: Vec<(String, KeyType)>,
     /// The clustered row order and the generation recorded with it
     /// ([`RlogWriter::with_sort_descriptor`]); `None` and 0 by default.
     sort_descriptor: Option<SortDescriptor>,
@@ -218,6 +221,7 @@ impl RlogWriter {
             records: Vec::new(),
             batches: Vec::new(),
             indexed_fields: Vec::new(),
+            key_index_fields: Vec::new(),
             sort_descriptor: None,
             clustering_generation: 0,
             bloom_scope: BloomScope::All,
@@ -286,6 +290,23 @@ impl RlogWriter {
     /// postings, since they are distinct columns.
     pub fn with_indexed_fields(mut self, fields: Vec<String>) -> Self {
         self.indexed_fields = fields;
+        self
+    }
+
+    /// Configures the exact-key fields the KEY_IDX section indexes (ADR-2707
+    /// decision 3): each attribute name with the key type of its declared
+    /// column (`I64`, `Str` or `Bytes`), plus [`TRACE_ID_FIELD`] as `Id16` for
+    /// the fixed `trace_id` column. An empty set, the default, writes no
+    /// KEY_IDX. Otherwise every field is named in the section, one with no
+    /// matching row with no entries. A row contributes the field's value from
+    /// its merged attribute view (the first entry per name, as `find_attr`
+    /// resolves it) only when that value is of the field's type; a NULL,
+    /// absent or differently typed value contributes nothing. The build
+    /// refuses, with [`LogSegError::LimitExceeded`], more than 64 fields, a
+    /// repeated or empty name, and `Id16` on any name but [`TRACE_ID_FIELD`]
+    /// or any other key type on it.
+    pub fn with_key_index_fields(mut self, fields: Vec<(String, KeyType)>) -> Self {
+        self.key_index_fields = fields;
         self
     }
 
@@ -471,6 +492,17 @@ impl RlogWriter {
         // merged-view postings have a column_id to key by.
         let indexed_names: std::collections::HashSet<&str> =
             self.indexed_fields.iter().map(String::as_str).collect();
+        // The tenant's exact-key fields (ADR-2707 decision 3). Their names are
+        // tracked through the stamp like any other merged-view name, but get no
+        // dynamic column of their own, so declaring one changes no other
+        // section's bytes.
+        let mut key_plan = KeyIndexPlan::new(&self.key_index_fields)?;
+        let key_names: std::collections::HashSet<&str> = self
+            .key_index_fields
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| *name != TRACE_ID_FIELD)
+            .collect();
 
         // Dynamic column assignment: distinct (name, type) sorted by
         // (name bytes, type), the first `max_dynamic_columns` get columns.
@@ -584,9 +616,15 @@ impl RlogWriter {
         // a fresh `String` and `BTreeMap` node per cell (#682, #1135). The
         // columnar path interns the same set the same way, so both stamp through
         // one implementation.
-        let (tracked_names, tracked_slot) = intern_tracked_names(&indexed_names, &numstat_names);
-        let stamp_index =
-            StampIndex::build(&tracked_names, &indexed_names, &numstat_names, &column_of);
+        let (tracked_names, tracked_slot) =
+            intern_tracked_names(&indexed_names, &numstat_names, &key_names);
+        let stamp_index = StampIndex::build(
+            &tracked_names,
+            &indexed_names,
+            &numstat_names,
+            key_plan.as_ref(),
+            &column_of,
+        );
 
         // Each stream's resource and scope pairs, restricted to the tracked names
         // (`indexed_names` union `numstat_names`) and resolved to
@@ -616,7 +654,11 @@ impl RlogWriter {
         let mut stamp = StampScratch::default();
         stamp.prepare(stamp_index.slots());
         let mut rows: Vec<ResolvedRow> = Vec::with_capacity(self.records.len());
+        // Each row's KEY_IDX pairs, parallel to `rows`; empty when no field is
+        // declared.
+        let mut row_keys: Vec<Vec<(u32, Key8)>> = Vec::new();
         for r in &self.records {
+            let mut keys = Vec::new();
             rows.push(resolve_row(
                 r,
                 &sorted_ids,
@@ -625,23 +667,43 @@ impl RlogWriter {
                 &stamp_index,
                 &stream_seeds,
                 &mut stamp,
+                &mut keys,
             )?);
+            if key_plan.is_some() {
+                row_keys.push(keys);
+            }
         }
         // Last read: every record resolved against its stream's seed above,
         // through the one stamp scratch.
         drop(stream_seeds);
         drop(stamp);
         match &cluster {
-            None => rows.sort_by(|a, b| {
+            None if key_plan.is_none() => rows.sort_by(|a, b| {
                 a.stream_ref
                     .cmp(&b.stream_ref)
                     .then_with(|| a.ts_ns.cmp(&b.ts_ns))
             }),
+            None => {
+                // The same stable order as the sort above, applied to the
+                // rows and their KEY_IDX pairs alike.
+                let mut perm: Vec<usize> = (0..rows.len()).collect();
+                perm.sort_by(|&a, &b| {
+                    rows[a]
+                        .stream_ref
+                        .cmp(&rows[b].stream_ref)
+                        .then_with(|| rows[a].ts_ns.cmp(&rows[b].ts_ns))
+                });
+                rows = permute(rows, &perm)?;
+                row_keys = permute(row_keys, &perm)?;
+            }
             Some(order) => {
                 let stream_refs: Vec<u32> = rows.iter().map(|r| r.stream_ref).collect();
                 let ts: Vec<i64> = rows.iter().map(|r| r.ts_ns).collect();
                 let perm = clustered_permutation(order, &stream_refs, &ts, &key_values);
                 rows = permute(rows, &perm)?;
+                if key_plan.is_some() {
+                    row_keys = permute(row_keys, &perm)?;
+                }
             }
         }
         // Last read of the clustering key values.
@@ -679,6 +741,16 @@ impl RlogWriter {
         for (blk_idx, span) in block_spans.iter().enumerate() {
             let block_rows = &rows[span.clone()];
             let blk_idx_u32 = blk_idx as u32;
+
+            if let Some(plan) = key_plan.as_mut() {
+                for (row, keys) in block_rows.iter().zip(&row_keys[span.clone()]) {
+                    for &(field, key8) in keys {
+                        plan.push(field, key8);
+                    }
+                    plan.push_trace(row.trace_id.as_ref().map(|t| &t[..]));
+                }
+                plan.seal_block(blk_idx_u32);
+            }
 
             // Columns present in this block, ascending by id.
             let mut present_cols: BTreeSet<u32> = BTreeSet::new();
@@ -813,6 +885,7 @@ impl RlogWriter {
         // count (FIELD_DIR null counts below, the footer's `record_count`).
         let record_count = rows.len() as u64;
         drop(rows);
+        drop(row_keys);
 
         // STREAM_DIR, encoded directly from the blobs `streams` already
         // borrows from `self.records` (ADR-2467 decision 5): no owned
@@ -920,6 +993,7 @@ impl RlogWriter {
             kind::BLOCKS,
             &Stored::raw(blocks_bytes),
         );
+        push_key_idx(&mut object, &mut sections, key_plan)?;
         push_section(
             &mut object,
             &mut sections,
@@ -1105,6 +1179,17 @@ impl RlogWriter {
 
         let indexed_names: std::collections::HashSet<&str> =
             self.indexed_fields.iter().map(String::as_str).collect();
+        // The tenant's exact-key fields (ADR-2707 decision 3). Their names are
+        // tracked through the stamp like any other merged-view name, but get no
+        // dynamic column of their own, so declaring one changes no other
+        // section's bytes.
+        let mut key_plan = KeyIndexPlan::new(&self.key_index_fields)?;
+        let key_names: std::collections::HashSet<&str> = self
+            .key_index_fields
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .filter(|name| *name != TRACE_ID_FIELD)
+            .collect();
 
         // Dynamic column assignment: distinct (name, type) over every batch's
         // dynamic columns (each is one (name, type) pair), plus the
@@ -1169,9 +1254,15 @@ impl RlogWriter {
         // the order the merged view appends record-level winners in. The row
         // path interns the same set the same way and stamps through the same
         // scratch, so the two paths cannot disagree (#1135).
-        let (tracked_names, tracked_slot) = intern_tracked_names(&indexed_names, &numstat_names);
-        let stamp_index =
-            StampIndex::build(&tracked_names, &indexed_names, &numstat_names, &column_of);
+        let (tracked_names, tracked_slot) =
+            intern_tracked_names(&indexed_names, &numstat_names, &key_names);
+        let stamp_index = StampIndex::build(
+            &tracked_names,
+            &indexed_names,
+            &numstat_names,
+            key_plan.as_ref(),
+            &column_of,
+        );
 
         let mut stream_seeds: HashMap<LogStreamId, StreamSeed> = HashMap::new();
         if !tracked_names.is_empty() {
@@ -1485,6 +1576,7 @@ impl RlogWriter {
         let mut blk_indexed_ends: Vec<u32> = Vec::new();
         let mut blk_stat: Vec<(u32, ColumnValue)> = Vec::new();
         let mut blk_stat_ends: Vec<u32> = Vec::new();
+        let mut row_keys: Vec<(u32, Key8)> = Vec::new();
 
         for (blk_idx, span) in spans.iter().enumerate() {
             let block_rows = &perm[span.clone()];
@@ -1542,11 +1634,21 @@ impl RlogWriter {
                     &mut StampOut {
                         indexed: &mut blk_indexed,
                         stat: &mut blk_stat,
+                        key: &mut row_keys,
                     },
                 );
+                if let Some(plan) = key_plan.as_mut() {
+                    for (field, key8) in row_keys.drain(..) {
+                        plan.push(field, key8);
+                    }
+                    plan.push_trace(g_trace[grow]);
+                }
                 blk_indexed_ends.push(blk_indexed.len() as u32);
                 blk_stat_ends.push(blk_stat.len() as u32);
                 blk_cols.push(cols);
+            }
+            if let Some(plan) = key_plan.as_mut() {
+                plan.seal_block(blk_idx_u32);
             }
 
             // Present columns and their FIELD_DIR occurrence counts, read from
@@ -1908,6 +2010,7 @@ impl RlogWriter {
             kind::BLOCKS,
             &Stored::raw(blocks_bytes),
         );
+        push_key_idx(&mut object, &mut sections, key_plan)?;
         push_section(
             &mut object,
             &mut sections,
@@ -2050,6 +2153,7 @@ fn stream_level_column_eligible(
 /// not disagree about which value a reader resolves for a tracked name
 /// (ADR-0095 decision 1). The columnar path stamps through the same scratch, so
 /// the two paths cannot drift.
+#[allow(clippy::too_many_arguments)]
 fn resolve_row(
     r: &LogRecord,
     sorted_ids: &[LogStreamId],
@@ -2058,6 +2162,7 @@ fn resolve_row(
     index: &StampIndex,
     stream_seeds: &HashMap<LogStreamId, StreamSeed>,
     stamp: &mut StampScratch,
+    key_out: &mut Vec<(u32, Key8)>,
 ) -> Result<ResolvedRow, LogSegError> {
     // A miss cannot happen: `build_object`'s only caller builds `sorted_ids`
     // from the stream ids of this same `self.records` slice before resolving
@@ -2111,6 +2216,7 @@ fn resolve_row(
         &mut StampOut {
             indexed: &mut indexed_terms,
             stat: &mut stat_winners,
+            key: key_out,
         },
     );
     Ok(ResolvedRow {
@@ -2142,7 +2248,7 @@ const FIELD_TYPE_SPAN: usize = FieldType::Bytes as usize;
 const NO_ENTRY: u32 = u32::MAX;
 
 /// Interns the tracked names (`indexed_names` union `numstat_names`, ADR-0095
-/// decision 1) into slots, returning the name-ascending slot table and the
+/// decision 1, union the KEY_IDX attribute fields `key_names`) into slots, returning the name-ascending slot table and the
 /// name-to-slot map.
 ///
 /// Ascending slot order is ascending name order, which is the order the
@@ -2150,10 +2256,12 @@ const NO_ENTRY: u32 = u32::MAX;
 fn intern_tracked_names<'a>(
     indexed_names: &std::collections::HashSet<&'a str>,
     numstat_names: &std::collections::HashSet<&'a str>,
+    key_names: &std::collections::HashSet<&'a str>,
 ) -> (Vec<&'a str>, HashMap<&'a str, u32>) {
     let mut names: Vec<&str> = indexed_names
         .iter()
         .chain(numstat_names.iter())
+        .chain(key_names.iter())
         .copied()
         .collect();
     names.sort_unstable();
@@ -2179,6 +2287,8 @@ struct StampIndex {
     indexed: Vec<bool>,
     /// Slot-indexed: the name may key a NumStat.
     numstat: Vec<bool>,
+    /// Slot-indexed: the name's KEY_IDX `(field index, FieldType byte)`.
+    key: Vec<Option<(u32, u8)>>,
     /// `slot * FIELD_TYPE_SPAN + (type byte - 1)` to the dynamic column that
     /// pair takes, exactly as [`column_lookup`] resolves it. `None` when the
     /// pair took no in-budget column.
@@ -2190,14 +2300,17 @@ impl StampIndex {
         names: &[&str],
         indexed_names: &std::collections::HashSet<&str>,
         numstat_names: &std::collections::HashSet<&str>,
+        key_plan: Option<&KeyIndexPlan>,
         column_of: &ColumnIndex,
     ) -> Self {
         let mut indexed = Vec::with_capacity(names.len());
         let mut numstat = Vec::with_capacity(names.len());
+        let mut key = Vec::with_capacity(names.len());
         let mut column_of_slot = vec![None; names.len() * FIELD_TYPE_SPAN];
         for (slot, name) in names.iter().enumerate() {
             indexed.push(indexed_names.contains(name));
             numstat.push(numstat_names.contains(name));
+            key.push(key_plan.and_then(|plan| plan.attr_field(name)));
             for ty in 0..FIELD_TYPE_SPAN {
                 column_of_slot[slot * FIELD_TYPE_SPAN + ty] =
                     column_lookup(column_of, name, ty as u8 + 1);
@@ -2206,6 +2319,7 @@ impl StampIndex {
         Self {
             indexed,
             numstat,
+            key,
             column_of_slot,
         }
     }
@@ -2220,6 +2334,10 @@ impl StampIndex {
 
     fn is_numstat(&self, slot: u32) -> bool {
         self.numstat.get(slot as usize).copied().unwrap_or(false)
+    }
+
+    fn key(&self, slot: u32) -> Option<(u32, u8)> {
+        self.key.get(slot as usize).copied().flatten()
     }
 
     fn column(&self, slot: u32, ty_byte: u8) -> Option<u32> {
@@ -2310,6 +2428,9 @@ struct SlotPick {
     /// A merged-view entry for this slot already reached the NumStat output.
     /// Only the first entry per name counts, matching `rlog_attrs::find_attr`.
     stat_seen: bool,
+    /// A merged-view entry for this slot already reached the KEY_IDX output,
+    /// under the same first-entry-per-name rule as `stat_seen`.
+    key_seen: bool,
 }
 
 impl SlotPick {
@@ -2319,20 +2440,27 @@ impl SlotPick {
         over: NO_ENTRY,
         winner: NO_ENTRY,
         stat_seen: false,
+        key_seen: false,
     };
 
     /// Untouched by this record, so not yet on the `touched` reset list.
     fn is_empty(&self) -> bool {
-        self.cols == NO_ENTRY && self.over == NO_ENTRY && self.winner == NO_ENTRY && !self.stat_seen
+        self.cols == NO_ENTRY
+            && self.over == NO_ENTRY
+            && self.winner == NO_ENTRY
+            && !self.stat_seen
+            && !self.key_seen
     }
 }
 
-/// The two per-record outputs of the stamp. Both are appended to, never
-/// cleared here: the columnar path points them at one block's flat arrays, the
-/// row path at the pair its [`ResolvedRow`] takes ownership of.
+/// The three per-record outputs of the stamp. Each is appended to, never
+/// cleared here: the columnar path points the first two at one block's flat
+/// arrays, the row path at the pair its [`ResolvedRow`] takes ownership of.
+/// `key` takes the record's KEY_IDX `(field index, key8)` pairs.
 struct StampOut<'a> {
     indexed: &'a mut Vec<(u32, ColumnValue)>,
     stat: &'a mut Vec<(u32, ColumnValue)>,
+    key: &'a mut Vec<(u32, Key8)>,
 }
 
 /// The per-record declared-column stat stamp, and the buffers it reuses.
@@ -2552,6 +2680,10 @@ impl StampScratch {
 /// entry, again matching the read side (no column, no value). The
 /// first-per-name mark is taken before those two checks, so a first entry that
 /// yields nothing still shadows any later entry for the name.
+///
+/// KEY_IDX takes the first entry per name by the same rule, from the value's
+/// own type rather than a column: a first entry of a type other than the
+/// field's declared one yields no key and shadows every later entry.
 fn emit_merged(
     index: &StampIndex,
     pick: &mut [SlotPick],
@@ -2565,6 +2697,20 @@ fn emit_merged(
         && let Some(cid) = index.column(slot, ty_byte)
     {
         out.indexed.push((cid, value.clone()));
+    }
+    if let Some((field, key_ty)) = index.key(slot)
+        && let Some(p) = pick.get_mut(slot as usize)
+        && !p.key_seen
+    {
+        if p.is_empty() {
+            touched.push(slot);
+        }
+        p.key_seen = true;
+        if ty_byte == key_ty
+            && let Some(key8) = key8_of(value)
+        {
+            out.key.push((field, key8));
+        }
     }
     if !index.is_numstat(slot) {
         return;
@@ -2673,8 +2819,9 @@ pub mod stamp_probe {
                 })
                 .map(|(name, _, _)| name.as_str())
                 .collect();
-            let (names, slot_of) = intern_tracked_names(&indexed_names, &numstat_names);
-            let index = StampIndex::build(&names, &indexed_names, &numstat_names, &column_of);
+            let (names, slot_of) =
+                intern_tracked_names(&indexed_names, &numstat_names, &HashSet::new());
+            let index = StampIndex::build(&names, &indexed_names, &numstat_names, None, &column_of);
             let seed = StreamSeed::build(stream_attrs.iter().cloned(), &slot_of, index.slots());
             let records = records
                 .iter()
@@ -2734,7 +2881,15 @@ pub mod stamp_probe {
             }
             indexed.clear();
             stat.clear();
-            scratch.finish(index, seed, &mut StampOut { indexed, stat });
+            scratch.finish(
+                index,
+                seed,
+                &mut StampOut {
+                    indexed,
+                    stat,
+                    key: &mut Vec::new(),
+                },
+            );
         }
 
         /// The last [`StampProbe::stamp`]'s `(POSTINGS terms, NumStat winners)`.
@@ -3614,6 +3769,24 @@ fn compress(raw: &[u8], level: i32) -> Result<Stored, LogSegError> {
 }
 
 /// Appends a section's stored bytes and records its descriptor.
+/// Appends the KEY_IDX section when `plan` is present. Stored raw: its prefix
+/// and buckets are read by range, so it is never compressed.
+fn push_key_idx(
+    object: &mut Vec<u8>,
+    sections: &mut Vec<SectionDesc>,
+    plan: Option<KeyIndexPlan>,
+) -> Result<(), LogSegError> {
+    let Some(plan) = plan else {
+        return Ok(());
+    };
+    let encoded = plan.encode()?;
+    push_section(object, sections, kind::KEY_IDX, &Stored::raw(encoded.bytes));
+    if let Some(desc) = sections.last_mut() {
+        desc.prefix_len = encoded.prefix_len;
+    }
+    Ok(())
+}
+
 fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32, stored: &Stored) {
     let offset = object.len() as u64;
     object.extend_from_slice(&stored.bytes);
@@ -3624,6 +3797,7 @@ fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32
         crc32c: crc32c::crc32c(&stored.bytes),
         comp: stored.comp,
         uncomp_len: stored.uncomp_len,
+        prefix_len: 0,
     });
 }
 
@@ -4973,6 +5147,252 @@ mod tests {
                 .collect();
             assert_eq!(blocks, expected, "value s{v}");
         }
+    }
+
+    /// Twenty rows of stream 0, four per block (row `i` in block `i / 4`):
+    /// `user_id = 7` on rows 0..12 (blocks 0, 1, 2), `user_id = 99` on row 13
+    /// (block 3), `request_id = "req-a"` on rows 5 and 6 (block 1), trace
+    /// `T1` on rows 2, 3 and 9 (blocks 0 and 2). Row 17 carries `user_id` as
+    /// the string "7" and row 18 carries `request_id` as the bytes `req-a`,
+    /// each under a type other than the declared one, in block 4.
+    fn key_index_rows() -> Vec<LogRecord> {
+        (0..20i64)
+            .map(|i| {
+                let mut r = base_record(0, i);
+                if i < 12 {
+                    r.attrs.push(("user_id".into(), AttrValue::I64(7)));
+                }
+                if i == 13 {
+                    r.attrs.push(("user_id".into(), AttrValue::I64(99)));
+                }
+                if i == 5 || i == 6 {
+                    r.attrs
+                        .push(("request_id".into(), AttrValue::Str("req-a".into())));
+                }
+                if matches!(i, 2 | 3 | 9) {
+                    r.trace_id = Some(KEY_TRACE);
+                }
+                if i == 17 {
+                    r.attrs.push(("user_id".into(), AttrValue::Str("7".into())));
+                    r.attrs.push(("request_id".into(), AttrValue::I64(5)));
+                }
+                if i == 18 {
+                    r.attrs
+                        .push(("request_id".into(), AttrValue::Bytes(b"req-a".to_vec())));
+                    r.trace_id = Some([0xEE; 16]);
+                }
+                r
+            })
+            .collect()
+    }
+
+    const KEY_TRACE: [u8; 16] = [0x7A; 16];
+
+    fn key_index_declared() -> Vec<(String, crate::key_index::KeyType)> {
+        use crate::key_index::KeyType;
+        vec![
+            ("user_id".into(), KeyType::I64),
+            ("request_id".into(), KeyType::Str),
+            ("trace_id".into(), KeyType::Id16),
+            ("lib".into(), KeyType::I64),
+            ("never_seen".into(), KeyType::Bytes),
+        ]
+    }
+
+    fn key_index_object(fields: Vec<(String, crate::key_index::KeyType)>) -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let mut w = RlogWriter::new(cfg, identity()).with_key_index_fields(fields);
+        for r in key_index_rows() {
+            w.push(r).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    /// A probe's answer and every object range it read.
+    type ProbeTrace = (
+        Result<Option<Vec<u32>>, LogSegError>,
+        Vec<std::ops::Range<u64>>,
+    );
+
+    /// Probes through an object-absolute read closure, returning the answer
+    /// and every range read.
+    fn key_probe(
+        obj: &[u8],
+        footer: &LogFooter,
+        field: &str,
+        key_type: crate::key_index::KeyType,
+        key8: crate::key_index::Key8,
+    ) -> ProbeTrace {
+        let mut reads = Vec::new();
+        let out = crate::key_index::probe_ranged(footer, field, key_type, &key8, |r| {
+            reads.push(r.clone());
+            Ok::<_, LogSegError>(obj[r.start as usize..r.end as usize].to_vec())
+        });
+        (out, reads)
+    }
+
+    #[test]
+    fn a_declared_key_index_column_yields_a_probeable_section_and_an_undeclared_one_yields_none() {
+        use crate::key_index::{KeyType, key8_i64, key8_id16, key8_str, summarize};
+
+        let obj = key_index_object(key_index_declared());
+        let footer = open(&obj).expect("open");
+        assert_eq!(footer.block_count, 5);
+        let desc = *footer.section(kind::KEY_IDX).expect("KEY_IDX present");
+        let blocks_end = footer
+            .section(kind::BLOCKS)
+            .map(|d| d.offset + d.len)
+            .expect("blocks");
+        let skip_start = footer.section(kind::SKIP_IDX).expect("skip").offset;
+        assert_eq!(desc.offset, blocks_end, "KEY_IDX follows BLOCKS");
+        assert_eq!(desc.offset + desc.len, skip_start, "and precedes SKIP_IDX");
+
+        let probe = |field: &str, ty: KeyType, key8| {
+            let (out, reads) = key_probe(&obj, &footer, field, ty, key8);
+            assert!(reads.len() <= 2, "{field}: {} reads", reads.len());
+            assert_eq!(
+                reads.first(),
+                Some(&(desc.offset..desc.offset + u64::from(desc.prefix_len))),
+                "{field}: the first read is exactly the prefix"
+            );
+            out.expect("probe")
+        };
+
+        // A key spanning a run of blocks; row 17's string "7" adds nothing.
+        assert_eq!(
+            probe("user_id", KeyType::I64, key8_i64(7)),
+            Some(vec![0, 1, 2])
+        );
+        // A key in one block.
+        assert_eq!(probe("user_id", KeyType::I64, key8_i64(99)), Some(vec![3]));
+        // Row 18's bytes `req-a` share the string's key8 and add nothing.
+        assert_eq!(
+            probe("request_id", KeyType::Str, key8_str("req-a")),
+            Some(vec![1])
+        );
+        assert_eq!(
+            probe("trace_id", KeyType::Id16, key8_id16(&KEY_TRACE)),
+            Some(vec![0, 2])
+        );
+        // A stream-level (resource scope) value reaches the merged view.
+        assert_eq!(
+            probe("lib", KeyType::I64, key8_i64(0)),
+            Some(vec![0, 1, 2, 3, 4])
+        );
+        // An absent key: the field is named, the key is not in the object.
+        assert_eq!(
+            probe("user_id", KeyType::I64, key8_i64(12345)),
+            Some(vec![])
+        );
+        assert_eq!(
+            probe("trace_id", KeyType::Id16, key8_id16(&[0x01; 16])),
+            Some(vec![])
+        );
+        // Declines: an unnamed field, and a named field under another type.
+        assert_eq!(probe("other", KeyType::I64, key8_i64(7)), None);
+        assert_eq!(probe("user_id", KeyType::Str, key8_str("7")), None);
+
+        // Every declared field is named; one no row carries has no entries.
+        let section = &obj[desc.offset as usize..(desc.offset + desc.len) as usize];
+        let summary = summarize(&footer, section)
+            .expect("summarize")
+            .expect("section present");
+        let named: Vec<(&str, KeyType, u64)> = summary
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.key_type, f.entry_count))
+            .collect();
+        assert_eq!(
+            named,
+            vec![
+                ("lib", KeyType::I64, 5),
+                ("never_seen", KeyType::Bytes, 0),
+                ("request_id", KeyType::Str, 1),
+                ("trace_id", KeyType::Id16, 3),
+                ("user_id", KeyType::I64, 4),
+            ]
+        );
+        assert_eq!(summary.bucket_bits, 8);
+
+        // The same rows with no declared field carry no KEY_IDX, and a probe
+        // on that object declines.
+        let none = key_index_object(Vec::new());
+        let none_footer = open(&none).expect("open");
+        assert!(none_footer.section(kind::KEY_IDX).is_none());
+        let (out, reads) = key_probe(&none, &none_footer, "user_id", KeyType::I64, key8_i64(7));
+        assert_eq!(out.expect("probe"), None);
+        assert!(reads.is_empty(), "no KEY_IDX, nothing read");
+
+        // Declaring fields changes no other section's bytes.
+        assert_eq!(none_footer.sections.len() + 1, footer.sections.len());
+        for d in &none_footer.sections {
+            let with = footer.section(d.kind).expect("same section kinds");
+            assert_eq!(
+                &none[d.offset as usize..(d.offset + d.len) as usize],
+                &obj[with.offset as usize..(with.offset + with.len) as usize],
+                "section kind {} differs",
+                d.kind
+            );
+        }
+    }
+
+    /// The row and the columnar paths write byte-identical objects when
+    /// KEY_IDX fields are declared, as they do without.
+    #[test]
+    fn key_index_row_and_columnar_paths_write_identical_objects() {
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        let rows = key_index_rows();
+        let row_obj = key_index_object(key_index_declared());
+        let mut w = RlogWriter::new(cfg, identity()).with_key_index_fields(key_index_declared());
+        w.push_columnar(ColumnarLogBatch::from_records(&rows[..7]))
+            .expect("push");
+        w.push_columnar(ColumnarLogBatch::from_records(&rows[7..]))
+            .expect("push");
+        let col_obj = w.finish().expect("finish");
+        assert!(
+            open(&col_obj)
+                .expect("open")
+                .section(kind::KEY_IDX)
+                .is_some()
+        );
+        assert_eq!(row_obj, col_obj);
+    }
+
+    /// Field-set validation is a typed refusal at finish, never a malformed
+    /// section.
+    #[test]
+    fn key_index_field_set_is_validated() {
+        use crate::key_index::KeyType;
+        let refused = |fields: Vec<(String, KeyType)>| {
+            let mut w =
+                RlogWriter::new(RlogConfig::default(), identity()).with_key_index_fields(fields);
+            w.push(base_record(0, 0)).expect("push");
+            matches!(w.finish(), Err(LogSegError::LimitExceeded(_)))
+        };
+        assert!(refused(vec![("trace_id".into(), KeyType::Str)]));
+        assert!(refused(vec![("span".into(), KeyType::Id16)]));
+        assert!(refused(vec![
+            ("a".into(), KeyType::I64),
+            ("a".into(), KeyType::Str)
+        ]));
+        assert!(refused(vec![(String::new(), KeyType::I64)]));
+        assert!(refused(vec![("x".repeat(129), KeyType::I64)]));
+        assert!(refused(
+            (0..65)
+                .map(|i| (format!("f{i:02}"), KeyType::I64))
+                .collect()
+        ));
+        assert!(!refused(
+            (0..64)
+                .map(|i| (format!("f{i:02}"), KeyType::I64))
+                .collect()
+        ));
     }
 
     #[test]
