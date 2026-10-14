@@ -59,9 +59,9 @@ use ravel_logseg::{
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{
     CacheFetchError, DEFAULT_FETCH_CONCURRENCY, DEFAULT_LOG_REQUEST_COST_BYTES,
-    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, DEFAULT_MAX_SEGMENTS, EngineConfig, LogSegmentFetcher,
-    LogsFetchPolicy, PhaseWireByteCounter, PhaseWireByteCounts, ProbeMissCounter, QueryPhase,
-    ResolvedLogsFetch, SegmentFetcher, resolve_logs_fetch,
+    DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD, DEFAULT_MAX_SEGMENTS, EngineConfig, EngineConfigError,
+    LogSegmentFetcher, LogsFetchPolicy, PhaseWireByteCounter, PhaseWireByteCounts,
+    ProbeMissCounter, QueryPhase, ResolvedLogsFetch, SegmentFetcher, resolve_logs_fetch,
 };
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, ScanTiming, SpanSegmentFetcher,
@@ -1674,26 +1674,68 @@ struct ColdExecutor {
     get_limiter_permits: usize,
 }
 
+/// An executor setting [`EngineConfig::validate`] refuses, named by the bench
+/// flag that carried it. Boxed into [`Error`]; tests downcast to it.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid {flag}: {source}")]
+pub struct ExecutorConfigError {
+    /// The flag whose value the engine refused, or the config field when no
+    /// bench flag sets it.
+    pub flag: &'static str,
+    #[source]
+    pub source: EngineConfigError,
+}
+
+/// The [`EngineConfig`] an in-process executor runs with, refused through
+/// [`EngineConfig::validate`], the check `ravel-server` runs on its own. A zero
+/// `--sql-partition-count` or `--store-get-concurrency` is an error here, not a
+/// value DataFusion or the GET limiter would reinterpret. `fetch_concurrency`
+/// is clamped to 1 before validation, so `--fetch-concurrency 0` keeps running
+/// at 1 (see [`knob_effective`]).
+fn executor_engine_config(settings: &ExecutorSettings) -> Result<EngineConfig, Error> {
+    let engine = EngineConfig {
+        fetch_concurrency: settings.fetch_concurrency.max(1),
+        sql_partition_count: settings.sql_partition_count,
+        store_get_concurrency: settings.store_get_concurrency,
+        max_segments: settings.max_segments,
+        logs_request_cost_bytes: settings.logs_request_cost_bytes,
+        logs_block_range_threshold: settings.logs_block_range_threshold,
+        logs_projection_break_even_bytes: settings.logs_projection_break_even_bytes,
+        logs_fetch_policy: settings.logs_fetch_policy,
+        ..EngineConfig::default()
+    };
+    engine.validate().map_err(|source| {
+        let flag = match source {
+            EngineConfigError::ZeroSqlPartitionCount => "--sql-partition-count",
+            EngineConfigError::ZeroGetLimiterPermits => "--store-get-concurrency",
+            EngineConfigError::ZeroFetchConcurrency => "--fetch-concurrency",
+            EngineConfigError::ZeroFetchBound => "logs_max_fetch_run_bytes",
+            EngineConfigError::ZeroPromqlFetchFanout => "promql_fetch_fanout",
+        };
+        Error::from(ExecutorConfigError { flag, source })
+    })?;
+    Ok(engine)
+}
+
 fn cold_executor(
     store: &Arc<dyn ObjectStoreBackend>,
     declared: &[DeclaredColumn],
     cache: Option<Arc<Cache<CacheFetchError>>>,
     settings: ExecutorSettings,
 ) -> Result<ColdExecutor, Error> {
+    let engine = executor_engine_config(&settings)?;
     let ExecutorSettings {
         max_query_bytes,
         shard_count,
         fetch_concurrency,
-        sql_partition_count,
         store_get_concurrency,
         tenant_max_bytes,
         parallel_final_aggregation,
-        max_segments,
         logs_block_range_threshold,
         logs_suffix_len,
         logs_request_cost_bytes,
         logs_projection_break_even_bytes,
-        logs_fetch_policy,
+        ..
     } = settings;
     let catalog = Arc::new(Catalog::new(
         Arc::clone(store),
@@ -1742,17 +1784,7 @@ fn cold_executor(
         SpanSegmentFetcher::new(Arc::clone(store)),
         SqlConfig {
             max_query_bytes,
-            engine: EngineConfig {
-                fetch_concurrency: fetch_concurrency.max(1),
-                sql_partition_count,
-                store_get_concurrency,
-                max_segments,
-                logs_request_cost_bytes,
-                logs_block_range_threshold,
-                logs_projection_break_even_bytes,
-                logs_fetch_policy,
-                ..EngineConfig::default()
-            },
+            engine,
             parallel_final_aggregation,
             // The bench reporter is the one reader of the per-segment scan
             // timeline (issue #913): production leaves `SqlConfig::
@@ -2329,18 +2361,20 @@ async fn dataset_info(
     })
 }
 
-/// Run the generated lane: build a wide-schema logs dataset in process, install
-/// the corpus's declared-column union, and measure every statement.
 /// The `*_effective` provenance for one ADR-1195 knob.
 ///
 /// `in_process` is false on the Flight lane, where the override never left this
 /// process and the server's own config governed the quantity: unknown here, so
 /// `None` rather than a guess.
 ///
-/// The fallback clamps, because `cold_executor` stores `fetch_concurrency` as
-/// `.max(1)` and `EngineConfig` resolves against that clamped value. Reporting
-/// the raw figure makes `--fetch-concurrency 0` print `effective = 0` beside a
-/// `fetch_concurrency` field of 1, describing a run that did not happen.
+/// The fallback clamps, because [`executor_engine_config`] stores
+/// `fetch_concurrency` as `.max(1)` and `EngineConfig` resolves against that
+/// clamped value. Reporting the raw figure makes `--fetch-concurrency 0` print
+/// `effective = 0` beside a `fetch_concurrency` field of 1, describing a run
+/// that did not happen. An explicit zero `requested` never gets here on an
+/// in-process lane: `--sql-partition-count 0` and `--store-get-concurrency 0`
+/// are refused by [`executor_engine_config`] before the lane does any work, so
+/// no report is written for them.
 fn knob_effective(
     in_process: bool,
     requested: Option<usize>,
@@ -2349,33 +2383,16 @@ fn knob_effective(
     in_process.then(|| requested.unwrap_or(fetch_concurrency).max(1))
 }
 
+/// Run the generated lane: build a wide-schema logs dataset in process, install
+/// the corpus's declared-column union, and measure every statement.
+///
+/// Always in process, so the executor settings are validated
+/// ([`executor_engine_config`]) before the dataset is generated: a refused
+/// setting costs no store request.
 pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Error> {
-    // Unique tenant per run so repeated runs against one shared bucket never
-    // read each other's objects (mirrors the other bench cores).
-    let tenant = TenantId::new(format!("sql-latency-gen-{}", Uuid::new_v4()));
-    let tenant_hash = tenant.hash();
-
-    let load_start = Instant::now();
-    generate_dataset(&cfg.store, &tenant, cfg).await?;
-    let load_wall_ms = load_start.elapsed().as_secs_f64() * 1e3;
-
-    let window = TimeRange {
-        start_ns: 0,
-        end_ns: NOW_NS,
-    };
-    let declared = declaration_union(&cfg.entries);
     // The generated lane writes shard 0 only by construction (see
     // `generate_dataset`), so a single shard resolves the whole dataset.
     let shard_count = 1;
-    let dataset = dataset_info(
-        &cfg.store,
-        tenant_hash,
-        window,
-        NOW_NS,
-        Some(load_wall_ms),
-        shard_count,
-    )
-    .await?;
     let resolved_logs_fetch = logs_fetch_resolution(
         cfg.logs_fetch_policy,
         &cfg.store_cost_profile,
@@ -2397,6 +2414,31 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         logs_projection_break_even_bytes: resolved_logs_fetch.projection_break_even_bytes,
         logs_fetch_policy: cfg.logs_fetch_policy,
     };
+    executor_engine_config(&settings)?;
+
+    // Unique tenant per run so repeated runs against one shared bucket never
+    // read each other's objects (mirrors the other bench cores).
+    let tenant = TenantId::new(format!("sql-latency-gen-{}", Uuid::new_v4()));
+    let tenant_hash = tenant.hash();
+
+    let load_start = Instant::now();
+    generate_dataset(&cfg.store, &tenant, cfg).await?;
+    let load_wall_ms = load_start.elapsed().as_secs_f64() * 1e3;
+
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: NOW_NS,
+    };
+    let declared = declaration_union(&cfg.entries);
+    let dataset = dataset_info(
+        &cfg.store,
+        tenant_hash,
+        window,
+        NOW_NS,
+        Some(load_wall_ms),
+        shard_count,
+    )
+    .await?;
     let (entries, skipped, failed) = measure_corpus(
         &cfg.store,
         tenant_hash,
@@ -2533,6 +2575,21 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
     let tenant = TenantId::new(cfg.tenant.clone());
     let tenant_hash = tenant.hash();
 
+    let resolved_logs_fetch = logs_fetch_resolution(
+        cfg.logs_fetch_policy,
+        &cfg.store_cost_profile,
+        cfg.logs_request_cost_bytes,
+        cfg.logs_block_range_threshold,
+    );
+    // The in-process lane validates its executor settings before the first
+    // store read. The shard count is not resolved yet and does not reach
+    // `EngineConfig`, so any value validates the same. The Flight lane is
+    // skipped: its settings never leave this process, and the server's own
+    // config, which the server validates, governs the run.
+    if cfg.flight.is_none() {
+        executor_engine_config(&tenant_executor_settings(cfg, 1, &resolved_logs_fetch))?;
+    }
+
     // How many shards to resolve over. Before #677 this was implicitly 1
     // (`CatalogConfig::default()`), so a multi-shard tenant was measured over
     // shard 0 alone and any tenant whose data all sat on a higher shard read as
@@ -2585,16 +2642,12 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
             .into());
         }
     }
-    let resolved_logs_fetch = logs_fetch_resolution(
-        cfg.logs_fetch_policy,
-        &cfg.store_cost_profile,
-        cfg.logs_request_cost_bytes,
-        cfg.logs_block_range_threshold,
-    );
     let settings = tenant_executor_settings(cfg, shard_count, &resolved_logs_fetch);
     // The two lanes measure the same statements over the same dataset stanza
     // and the same declared-column set; they differ only in what executes the
-    // SQL, in process or across a gRPC channel to a server.
+    // SQL, in process or across a gRPC channel to a server. Only the in-process
+    // arm builds an `EngineConfig` from `settings`, which is why only it was
+    // validated above; the Flight arm runs on the server's own validated config.
     let (entries, skipped, failed) = match &cfg.flight {
         Some(target) => measure_over_flight(target, cfg, &declared).await?,
         None => {
@@ -3621,6 +3674,202 @@ mod tests {
             DEFAULT_MAX_SEGMENTS,
             "an omitted flag leaves the compiled-in ceiling unchanged"
         );
+    }
+
+    /// The `ExecutorConfigError` a refused `cold_executor` build carries.
+    fn executor_config_refusal(
+        settings: ExecutorSettings,
+    ) -> (String, &'static str, EngineConfigError) {
+        let err = cold_executor(&empty_store(), &[], None, settings)
+            .err()
+            .expect("cold_executor must refuse these settings");
+        let message = err.to_string();
+        let refusal = err
+            .downcast::<ExecutorConfigError>()
+            .expect("the refusal is an ExecutorConfigError");
+        (message, refusal.flag, refusal.source)
+    }
+
+    /// `--sql-partition-count 0` is refused through `EngineConfig::validate`,
+    /// naming the flag and carrying `ZeroSqlPartitionCount`, rather than
+    /// reaching DataFusion, which reads a zero `target_partitions` as the
+    /// host's core count. A builder that clamped the zero to 1 instead builds
+    /// an executor and fails the first assertion.
+    #[test]
+    fn cold_executor_refuses_zero_sql_partition_count() {
+        let (message, flag, source) = executor_config_refusal(ExecutorSettings {
+            sql_partition_count: Some(0),
+            ..ExecutorSettings::default()
+        });
+        assert_eq!(flag, "--sql-partition-count");
+        assert_eq!(source, EngineConfigError::ZeroSqlPartitionCount);
+        assert!(
+            message.contains("--sql-partition-count"),
+            "the message names the flag: {message}"
+        );
+
+        let built = cold_executor(
+            &empty_store(),
+            &[],
+            None,
+            ExecutorSettings {
+                sql_partition_count: Some(1),
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("a partition count of 1 is accepted");
+        assert_eq!(built.executor.config().engine.sql_partition_count(), 1);
+    }
+
+    /// `--store-get-concurrency 0` is refused the same way, naming its flag and
+    /// carrying `ZeroGetLimiterPermits`, instead of the fetcher's limiter
+    /// running at 1 while the engine config holds 0. An unset override is
+    /// accepted and falls back to `fetch_concurrency`.
+    #[test]
+    fn cold_executor_refuses_zero_store_get_concurrency() {
+        let (message, flag, source) = executor_config_refusal(ExecutorSettings {
+            store_get_concurrency: Some(0),
+            ..ExecutorSettings::default()
+        });
+        assert_eq!(flag, "--store-get-concurrency");
+        assert_eq!(source, EngineConfigError::ZeroGetLimiterPermits);
+        assert!(
+            message.contains("--store-get-concurrency"),
+            "the message names the flag: {message}"
+        );
+
+        let built = cold_executor(
+            &empty_store(),
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 5,
+                store_get_concurrency: None,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("an unset store GET concurrency is accepted");
+        assert_eq!(built.executor.config().engine.store_get_concurrency(), 5);
+        assert_eq!(built.get_limiter_permits, 5);
+    }
+
+    /// `--fetch-concurrency 0` keeps its documented clamp: the builder stores 1
+    /// before validating, so the executor builds and every quantity that falls
+    /// back to `fetch_concurrency` runs at 1.
+    #[test]
+    fn cold_executor_still_clamps_zero_fetch_concurrency_to_one() {
+        let built = cold_executor(
+            &empty_store(),
+            &[],
+            None,
+            ExecutorSettings {
+                fetch_concurrency: 0,
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("a zero fetch_concurrency is clamped, not refused");
+        let engine = built.executor.config().engine;
+        assert_eq!(engine.fetch_concurrency, 1);
+        assert_eq!(engine.sql_partition_count(), 1);
+        assert_eq!(engine.store_get_concurrency(), 1);
+        assert_eq!(built.get_limiter_permits, 1);
+    }
+
+    /// A store that faults every operation and counts each one, so a lane that
+    /// touches it at all leaves a nonzero counter.
+    fn refuse_every_op_store() -> Arc<ravel_object_store::fault::FaultStore<MemoryStore>> {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+        let plan = [Op::Put, Op::Get, Op::Head, Op::List, Op::Delete]
+            .into_iter()
+            .fold(FaultPlan::empty(), |plan, op| {
+                plan.with_rule(Rule::new(
+                    op,
+                    ScriptedFault::Permanent("the lane touched the store".to_string()),
+                ))
+            });
+        Arc::new(FaultStore::new(MemoryStore::new(), plan))
+    }
+
+    /// `run_generated` refuses `--sql-partition-count 0` before generating the
+    /// dataset: zero PUTs, and zero requests of any kind. A version that
+    /// validated only inside `cold_executor` would fault on the first PUT of
+    /// `generate_dataset` instead, returning the store error with a nonzero
+    /// counter.
+    #[tokio::test]
+    async fn run_generated_refuses_bad_executor_settings_before_any_store_request() {
+        use ravel_object_store::fault::{FaultKind, Op};
+        let faulty = refuse_every_op_store();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let cfg = GenerateConfig {
+            store,
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            entries: Vec::new(),
+            runs: 1,
+            records: 4,
+            records_per_object: 4,
+            extra_attrs: 0,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            cache_bytes: 0,
+            deadline: Duration::from_secs(30),
+            continue_on_error: false,
+            fetch_concurrency: 8,
+            sql_partition_count: Some(0),
+            store_get_concurrency: None,
+            progress_jsonl: None,
+            tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
+            parallel_final_aggregation: false,
+            max_segments: DEFAULT_MAX_SEGMENTS,
+            explain_dir: None,
+            warm_catalog: false,
+            logs_suffix_len: None,
+            logs_request_cost_bytes: None,
+            logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
+            logs_block_range_threshold: None,
+            store_cost_profile: StoreCostProfile::reference(),
+        };
+        let err = run_generated(&cfg)
+            .await
+            .expect_err("a zero partition count must refuse the run");
+        assert_eq!(
+            faulty.fault_count(Op::Put, FaultKind::Permanent),
+            0,
+            "no PUT may be issued before the refusal: {err}"
+        );
+        assert!(
+            faulty.counters_snapshot().is_empty(),
+            "no store request of any kind before the refusal: {:?}",
+            faulty.counters_snapshot()
+        );
+        let refusal = err
+            .downcast_ref::<ExecutorConfigError>()
+            .expect("the refusal is the executor config error, not a store error");
+        assert_eq!(refusal.source, EngineConfigError::ZeroSqlPartitionCount);
+    }
+
+    /// The in-process tenant lane refuses `--store-get-concurrency 0` before
+    /// its first store read (shard resolution), the same ordering
+    /// `run_generated` has.
+    #[tokio::test]
+    async fn run_tenant_refuses_bad_executor_settings_before_any_store_request() {
+        let faulty = refuse_every_op_store();
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let mut cfg = tenant_cfg(&store, "refused-settings-tenant", Some(1), 0);
+        cfg.store_get_concurrency = Some(0);
+        let err = run_tenant(&cfg)
+            .await
+            .expect_err("a zero store GET concurrency must refuse the run");
+        assert!(
+            faulty.counters_snapshot().is_empty(),
+            "no store request of any kind before the refusal: {:?}",
+            faulty.counters_snapshot()
+        );
+        let refusal = err
+            .downcast_ref::<ExecutorConfigError>()
+            .expect("the refusal is the executor config error, not a store error");
+        assert_eq!(refusal.flag, "--store-get-concurrency");
+        assert_eq!(refusal.source, EngineConfigError::ZeroGetLimiterPermits);
     }
 
     /// With `continue_on_error`, a statement that fails to execute lands in
