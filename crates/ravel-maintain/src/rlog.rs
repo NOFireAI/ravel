@@ -64,6 +64,11 @@
 //!   ([`RlogCodec::load_input_catalog`]), because per-tenant configuration of
 //!   that list is future per-tenant configuration and does not exist yet. See
 //!   [`input_indexed_fields`] for what is recovered and how.
+//! - The output's KEY_IDX field set is the union of the inputs' KEY_IDX
+//!   headers ([`input_key_index_fields`]), for the compactor and the erasure
+//!   rewrite alike. A field two inputs name under different key types, and a
+//!   field past the writer's 64-field cap, is left out of the output's KEY_IDX
+//!   and logged ([`merged_key_index_fields`]); the merge itself goes ahead.
 //!
 //! # Reuse, not reimplementation
 //!
@@ -239,6 +244,7 @@ use futures::stream::{StreamExt, TryStreamExt, iter as stream_iter};
 use ravel_commit::keys;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, COMP_NONE, SortDescriptor, SuffixOutcome, kind};
+use ravel_logseg::key_index::{self, KeyType};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::postings::PostingsSection;
 use ravel_logseg::reader::MAX_BLOCKS;
@@ -336,6 +342,9 @@ pub struct RlogInputCatalog {
     /// BLOOM covered list names, so the coverage maps to column names without
     /// refetching FIELD_DIR.
     pub string_fields: FieldDir,
+    /// The fields and key types this input's KEY_IDX header names, empty when
+    /// it has no KEY_IDX ([`input_key_index_fields`]).
+    pub key_index_fields: Vec<(String, KeyType)>,
 }
 
 /// The pre-decode admission pricing metadata of one input: the per-block shape
@@ -489,7 +498,9 @@ impl SegmentCodec for RlogCodec {
 /// the erasure rewrite writes its parts with no indexed fields at all
 /// (`erasure_rewrite::build_rewrite_logs`'s doc says why), so recovering a list
 /// it would discard would cost one extra ranged GET per input carrying
-/// POSTINGS and nothing else.
+/// POSTINGS and nothing else. The KEY_IDX field set
+/// ([`input_key_index_fields`]) is recovered on both routes, at one ranged GET
+/// per input carrying KEY_IDX.
 pub(crate) async fn load_catalog_from_object(
     store: &dyn ObjectStoreBackend,
     config: &CompactorConfig,
@@ -547,6 +558,9 @@ pub(crate) async fn load_catalog_from_object(
     } else {
         Vec::new()
     };
+    // Recovered on both routes: the erasure rewrite rebuilds KEY_IDX from the
+    // surviving records, so its parts keep the inputs' field set.
+    let key_index_fields = input_key_index_fields(store, &object_key, &ftr, ledger).await?;
 
     // PAGE_DIR is present exactly on a version-4 input (ADR-0699 decision 2),
     // and the bounded merge cannot admission-price a cursor over an input
@@ -625,6 +639,7 @@ pub(crate) async fn load_catalog_from_object(
         clustering_generation,
         bloom_section,
         string_fields,
+        key_index_fields,
     })
 }
 
@@ -1034,6 +1049,7 @@ pub(crate) async fn merge_catalogs(
     // The entry points refuse a bad level before their first store request
     // ([`check_rlog_zstd_level`]); this covers a direct `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
+    let key_index_fields = merged_key_index_fields(catalogs);
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
     // merged stream_ref is the ordinal in this set (the writer re-derives it
@@ -1093,6 +1109,7 @@ pub(crate) async fn merge_catalogs(
         input_set_hash,
         identity,
         indexed_fields,
+        key_index_fields,
         declared,
         writer,
         tracker,
@@ -1224,6 +1241,8 @@ struct PartSink<'a> {
     input_set_hash: &'a [u8; 32],
     identity: ObjectIdentity,
     indexed_fields: Vec<String>,
+    /// The KEY_IDX field set every part is written with.
+    key_index_fields: Vec<(String, KeyType)>,
     /// The declared eligible columns each output part recomputes stamps for
     /// (ADR-0873 decision 3), with each stream's stream-level values for them.
     /// Empty on the erasure-rewrite route, whose parts stay unstamped (the
@@ -1257,6 +1276,7 @@ impl PartSink<'_> {
             self.current = Some(PartBuilder::new(
                 &self.identity,
                 &self.indexed_fields,
+                &self.key_index_fields,
                 Arc::clone(&self.declared),
                 Arc::clone(&self.writer),
             ));
@@ -1863,6 +1883,8 @@ struct PartBuilder {
     identity: ObjectIdentity,
     /// The POSTINGS field list every part is written with (ADR-0049 decision 6).
     indexed_fields: Vec<String>,
+    /// The KEY_IDX field set every part is written with.
+    key_index_fields: Vec<(String, KeyType)>,
     /// The zstd level, sort descriptor, generation, and bloom scope the part is
     /// encoded with, shared by every part of the merge.
     writer: Arc<PartWriterSettings>,
@@ -1906,12 +1928,14 @@ impl PartBuilder {
     fn new(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
+        key_index_fields: &[(String, KeyType)],
         declared: Arc<DeclaredSchema>,
         writer: Arc<PartWriterSettings>,
     ) -> Self {
         PartBuilder {
             identity: *identity,
             indexed_fields: indexed_fields.to_vec(),
+            key_index_fields: key_index_fields.to_vec(),
             writer,
             records: Vec::new(),
             estimate: 0,
@@ -1970,6 +1994,7 @@ impl PartBuilder {
     fn build_writer(
         identity: &ObjectIdentity,
         indexed_fields: &[String],
+        key_index_fields: &[(String, KeyType)],
         writer: &PartWriterSettings,
         records: Vec<LogRecord>,
     ) -> Result<RlogWriter> {
@@ -1979,6 +2004,7 @@ impl PartBuilder {
         };
         let mut w = RlogWriter::new(cfg, *identity)
             .with_indexed_fields(indexed_fields.to_vec())
+            .with_key_index_fields(key_index_fields.to_vec())
             .with_sort_descriptor(writer.sort_descriptor.clone(), writer.clustering_generation)
             .with_bloom_scope(writer.bloom_scope.clone());
         for r in records {
@@ -2000,10 +2026,17 @@ impl PartBuilder {
     ) -> impl FnOnce() -> Result<(Vec<u8>, WriteStats)> + Send + 'static {
         let identity = self.identity;
         let indexed_fields = self.indexed_fields.clone();
+        let key_index_fields = self.key_index_fields.clone();
         let writer = Arc::clone(&self.writer);
         let records = self.records.clone();
         move || {
-            let w = Self::build_writer(&identity, &indexed_fields, &writer, records)?;
+            let w = Self::build_writer(
+                &identity,
+                &indexed_fields,
+                &key_index_fields,
+                &writer,
+                records,
+            )?;
             Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
         }
     }
@@ -2018,11 +2051,18 @@ impl PartBuilder {
         let PartBuilder {
             identity,
             indexed_fields,
+            key_index_fields,
             writer,
             records,
             ..
         } = self;
-        let w = Self::build_writer(&identity, &indexed_fields, &writer, records)?;
+        let w = Self::build_writer(
+            &identity,
+            &indexed_fields,
+            &key_index_fields,
+            &writer,
+            records,
+        )?;
         Ok(w.finish_compacted_with_stats(1, input_set_hash.to_vec(), part_index)?)
     }
 
@@ -3625,6 +3665,137 @@ fn merged_indexed_fields(catalogs: &[RlogInputCatalog]) -> Vec<String> {
     names.into_iter().map(str::to_string).collect()
 }
 
+/// The fields and key types `object_key`'s KEY_IDX header names, read with one
+/// ranged GET of the section's `[0, prefix_len)` (the header and field
+/// directory, crcs verified), never its buckets. Empty, with no request, when
+/// the object has no KEY_IDX.
+async fn input_key_index_fields(
+    store: &dyn ObjectStoreBackend,
+    object_key: &str,
+    ftr: &footer::LogFooter,
+    ledger: Option<&RequestLedger>,
+) -> Result<Vec<(String, KeyType)>> {
+    let Some(desc) = key_index::key_index_section(ftr) else {
+        return Ok(Vec::new());
+    };
+    let start = desc.offset;
+    let end = desc.offset.saturating_add(u64::from(desc.prefix_len));
+    let got = store.get(object_key, GetRange::Range(start, end)).await;
+    note_get(ledger, RequestPhase::CatalogRead, &got);
+    let prefix = got?.data;
+    let fields = key_index::key_index_fields(ftr, |range| {
+        if range == (start..end) {
+            Ok(prefix.clone())
+        } else {
+            Err(ravel_logseg::LogSegError::Corrupted(format!(
+                "KEY_IDX prefix read {range:?} outside the fetched {start}..{end}"
+            )))
+        }
+    })?;
+    Ok(fields)
+}
+
+/// The output's KEY_IDX field set: the union of the inputs' sets, sorted by
+/// name. Union for the same reason as [`merged_indexed_fields`]: the KEY_IDX
+/// entries are rebuilt from the merged records, so naming a field one input
+/// did not index is never wrong.
+///
+/// The inputs are immutable, so a union the writer would refuse would be
+/// refused on every retry and the bucket would not merge again. Instead a
+/// field the writer cannot take is left out of the output's KEY_IDX, which
+/// is exact: a probe on a field the header does not name declines, and the
+/// object reads as unindexed for it. Each one left out is logged at warn
+/// level, as the POSTINGS distinct-value cap is. Three cases:
+///
+/// - Inputs naming the field under different key types (a column retyped
+///   within the bucket's hour): no single type covers every input's rows.
+/// - A field the writer refuses on its own (a name outside 1..=128 bytes, or
+///   [`key_index::TRACE_ID_FIELD`] and `Id16` not paired). The writer refuses
+///   such a field at finish, so an input it wrote does not name one.
+/// - Fields past [`key_index::KEY_IDX_MAX_FIELDS`] (a declaration changed at
+///   the column cap within the hour). [`key_index_field_cap`] picks which.
+fn merged_key_index_fields(catalogs: &[RlogInputCatalog]) -> Vec<(String, KeyType)> {
+    let mut fields: BTreeMap<&str, (Option<KeyType>, &str)> = BTreeMap::new();
+    for catalog in catalogs {
+        for (name, key_type) in &catalog.key_index_fields {
+            match fields.entry(name.as_str()) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((Some(*key_type), catalog.object_key.as_str()));
+                }
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    let (first, first_object) = *slot.get();
+                    if let Some(first) = first.filter(|first| first != key_type) {
+                        tracing::warn!(
+                            field = %name,
+                            first_key_type = ?first,
+                            first_object,
+                            second_key_type = ?key_type,
+                            second_object = %catalog.object_key,
+                            "KEY_IDX field left out of the merged output: inputs index it \
+                             under different key types"
+                        );
+                        slot.insert((None, first_object));
+                    }
+                }
+            }
+        }
+    }
+    let mut merged: Vec<(String, KeyType)> = Vec::with_capacity(fields.len());
+    for (name, (key_type, _)) in fields {
+        let Some(key_type) = key_type else {
+            continue;
+        };
+        let field = (name.to_string(), key_type);
+        if let Err(e) = key_index::validate_fields(std::slice::from_ref(&field)) {
+            tracing::warn!(
+                field = %name,
+                key_type = ?key_type,
+                error = %e,
+                "KEY_IDX field left out of the merged output: the writer refuses it"
+            );
+            continue;
+        }
+        merged.push(field);
+    }
+    key_index_field_cap(merged)
+}
+
+/// Reduces a name-sorted, valid KEY_IDX field set to at most
+/// [`key_index::KEY_IDX_MAX_FIELDS`] fields, logging each one left out.
+/// [`key_index::TRACE_ID_FIELD`] is kept first, then the remaining names in
+/// ascending byte order up to the cap.
+///
+/// The choice depends on the field names alone, not on input order or on
+/// which input is newest, so a retry or another compactor replica over the
+/// same inputs picks the same set. `trace_id` goes first because it is the
+/// tenant-wide declaration (`index_trace_id`) and holds the slot the
+/// per-column cap reserves for it, so a column change at that cap does not
+/// displace it.
+fn key_index_field_cap(mut fields: Vec<(String, KeyType)>) -> Vec<(String, KeyType)> {
+    let cap = key_index::KEY_IDX_MAX_FIELDS;
+    if fields.len() <= cap {
+        return fields;
+    }
+    if let Some(at) = fields
+        .iter()
+        .position(|(name, _)| name == key_index::TRACE_ID_FIELD)
+    {
+        let trace = fields.remove(at);
+        fields.insert(0, trace);
+    }
+    for (name, key_type) in fields.drain(cap..) {
+        tracing::warn!(
+            field = %name,
+            key_type = ?key_type,
+            cap,
+            "KEY_IDX field left out of the merged output: the inputs' union names more \
+             fields than the cap"
+        );
+    }
+    fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    fields
+}
+
 /// Fetch one required whole-read section by range and return its decompressed,
 /// crc-verified bytes. Fetches exactly `[offset, offset + len)` (the section's
 /// stored bytes), never the whole object.
@@ -3647,6 +3818,76 @@ async fn fetch_section(
         .await;
     note_get(ledger, RequestPhase::CatalogRead, &got);
     Ok(decode_section(got?.data.as_ref(), desc, cfg)?)
+}
+
+/// KEY_IDX readers and a ground-truth oracle over a whole RLOG object, shared
+/// by this module's and the erasure rewrite's tests.
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+pub(crate) mod key_idx_oracle {
+    use std::collections::BTreeSet;
+
+    use ravel_logseg::key_index::{self, Key8, KeyType};
+    use ravel_logseg::skip_index::SkipIndex;
+    use ravel_logseg::{
+        LogRecord, LogSegError, Predicate, RlogConfig, RlogReader, footer, footer::kind,
+        read_section,
+    };
+
+    fn slice(bytes: &[u8], r: std::ops::Range<u64>) -> Result<&[u8], LogSegError> {
+        Ok(&bytes[r.start as usize..r.end as usize])
+    }
+
+    /// `n` field names `f{first:02}` onward, each declared `I64`.
+    pub(crate) fn numbered_i64_fields(first: usize, n: usize) -> Vec<(String, KeyType)> {
+        (first..first + n)
+            .map(|i| (format!("f{i:02}"), KeyType::I64))
+            .collect()
+    }
+
+    /// The fields and key types the object's KEY_IDX header names.
+    pub(crate) fn fields(bytes: &[u8]) -> Vec<(String, KeyType)> {
+        let ftr = footer::open(bytes).expect("open");
+        key_index::key_index_fields(&ftr, |r| slice(bytes, r)).expect("KEY_IDX fields")
+    }
+
+    /// The object's KEY_IDX answer for `key8` of `field` under `key_type`.
+    pub(crate) fn probe(
+        bytes: &[u8],
+        field: &str,
+        key_type: KeyType,
+        key8: &Key8,
+    ) -> Option<Vec<u32>> {
+        let ftr = footer::open(bytes).expect("open");
+        key_index::probe_ranged(&ftr, field, key_type, key8, |r| slice(bytes, r))
+            .expect("KEY_IDX probe")
+    }
+
+    /// The ascending blocks of the object holding a row `hit` accepts, from the
+    /// decoded rows and SKIP_IDX record counts alone, never KEY_IDX.
+    pub(crate) fn true_blocks(bytes: &[u8], hit: impl Fn(&LogRecord) -> bool) -> Vec<u32> {
+        let cfg = RlogConfig::default();
+        let ftr = footer::open(bytes).expect("open");
+        let raw =
+            read_section(bytes, ftr.section(kind::SKIP_IDX).unwrap(), &cfg).expect("skip section");
+        let skip = SkipIndex::decode(&raw, 1 << 24).expect("decode skip");
+        let mut row_blocks = Vec::new();
+        for (i, entry) in skip.l0.iter().enumerate() {
+            for _ in 0..entry.record_count {
+                row_blocks.push(i as u32);
+            }
+        }
+        let reader = RlogReader::new(bytes, &cfg).expect("open");
+        let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(rows.len(), row_blocks.len());
+        let blocks: BTreeSet<u32> = rows
+            .iter()
+            .zip(row_blocks)
+            .filter(|(r, _)| hit(r))
+            .map(|(_, b)| b)
+            .collect();
+        blocks.into_iter().collect()
+    }
 }
 
 #[cfg(test)]
@@ -3782,9 +4023,46 @@ mod tests {
             Some((d, g)) => (Some(d), g),
             None => (None, 0),
         };
-        let mut w = RlogWriter::new(cfg, identity)
+        let w = RlogWriter::new(cfg, identity)
             .with_indexed_fields(indexed.iter().map(|s| (*s).to_string()).collect())
             .with_sort_descriptor(descriptor, generation);
+        seed_l0_writer(store, writer_id, seq, records, w).await
+    }
+
+    /// [`seed`] with the L0 writer's KEY_IDX field set under test control.
+    async fn seed_l0_keyed(
+        store: &dyn ObjectStoreBackend,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+        key_fields: &[(&str, KeyType)],
+    ) -> Bytes {
+        let identity = ObjectIdentity {
+            tenant_hash: tenant_hash().0,
+            shard: SHARD,
+            writer_id: writer_id.into_bytes(),
+            writer_epoch: EPOCH,
+            writer_seq: seq,
+        };
+        let w = RlogWriter::new(RlogConfig::default(), identity).with_key_index_fields(
+            key_fields
+                .iter()
+                .map(|(name, ty)| ((*name).to_string(), *ty))
+                .collect(),
+        );
+        seed_l0_writer(store, writer_id, seq, records, w).await
+    }
+
+    /// Push `records` into `w`, finish it, and seed the object plus its commit
+    /// record exactly as the ingest log shard would.
+    async fn seed_l0_writer(
+        store: &dyn ObjectStoreBackend,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+        mut w: RlogWriter,
+    ) -> Bytes {
+        let th = tenant_hash();
         for r in records {
             w.push(r.clone()).expect("push");
         }
@@ -4643,6 +4921,284 @@ mod tests {
                 .section(kind::POSTINGS)
                 .is_none(),
             "no input indexed anything, so the output indexes nothing"
+        );
+    }
+
+    fn keyed_record(
+        stream_n: u32,
+        ts: i64,
+        attrs: Vec<(String, AttrValue)>,
+        trace: Option<[u8; 16]>,
+    ) -> LogRecord {
+        let mut r = record(stream_n, ts, "keyed", attrs);
+        r.trace_id = trace;
+        r
+    }
+
+    fn has_attr(r: &LogRecord, name: &str, value: &AttrValue) -> bool {
+        r.attrs
+            .iter()
+            .find(|(k, _)| k == name)
+            .is_some_and(|(_, v)| v == value)
+    }
+
+    /// The compacted object's KEY_IDX field set is the union of its inputs'
+    /// headers, and its entries are rebuilt from every merged record: a key
+    /// held only by an input that indexed nothing (or indexed other fields) is
+    /// found in the output, at the output's own block ordinals.
+    #[tokio::test]
+    async fn compacted_key_index_carries_every_inputs_fields_and_probes_true_blocks() {
+        use super::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{key8_i64, key8_id16, key8_str};
+
+        let store = MemoryStore::new();
+        let user = |v: i64| ("user_id".to_string(), AttrValue::I64(v));
+        let req = |v: &str| ("request_id".to_string(), AttrValue::Str(v.to_string()));
+        // Input A indexes user_id and trace_id. It is long enough that the
+        // output's stream 0 spans three 8192-record blocks, and each user_id
+        // value covers a contiguous run of 5000 rows.
+        let a: Vec<LogRecord> = (0..20_000i64)
+            .map(|i| {
+                let trace = [0xA0 + (i / 10_000) as u8; 16];
+                keyed_record(0, i * 10, vec![user(i / 5000)], Some(trace))
+            })
+            .collect();
+        // Input B indexes request_id only, and holds user_id 100 unindexed.
+        let mut b: Vec<LogRecord> = (0..9i64)
+            .map(|i| {
+                keyed_record(
+                    (i % 3) as u32,
+                    i * 10 + 5,
+                    vec![req(&format!("req-{}", i % 3))],
+                    None,
+                )
+            })
+            .collect();
+        b.push(keyed_record(3, 7, vec![user(100), req("req-b-only")], None));
+        // Input C carries no KEY_IDX at all.
+        let c = vec![keyed_record(
+            4,
+            9,
+            vec![user(1), req("req-0")],
+            Some([0xC0; 16]),
+        )];
+        let a_bytes = seed_l0_keyed(
+            &store,
+            Uuid::from_u128(1),
+            1,
+            &a,
+            &[("user_id", KeyType::I64), ("trace_id", KeyType::Id16)],
+        )
+        .await;
+        let b_bytes = seed_l0_keyed(
+            &store,
+            Uuid::from_u128(2),
+            2,
+            &b,
+            &[("request_id", KeyType::Str)],
+        )
+        .await;
+        let c_bytes = seed_l0_keyed(&store, Uuid::from_u128(3), 3, &c, &[]).await;
+        assert_eq!(
+            oracle::fields(&a_bytes),
+            vec![
+                ("trace_id".to_string(), KeyType::Id16),
+                ("user_id".to_string(), KeyType::I64)
+            ]
+        );
+        assert_eq!(
+            oracle::fields(&b_bytes),
+            vec![("request_id".to_string(), KeyType::Str)]
+        );
+        assert!(oracle::fields(&c_bytes).is_empty());
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        let l1 = &parts[0];
+
+        assert_eq!(
+            oracle::fields(l1),
+            vec![
+                ("request_id".to_string(), KeyType::Str),
+                ("trace_id".to_string(), KeyType::Id16),
+                ("user_id".to_string(), KeyType::I64),
+            ]
+        );
+        for v in [0i64, 1, 2, 3, 100, 555] {
+            let want = oracle::true_blocks(l1, |r| has_attr(r, "user_id", &AttrValue::I64(v)));
+            assert_eq!(
+                oracle::probe(l1, "user_id", KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "user_id = {v}"
+            );
+        }
+        // The probes above discriminate: user_id 0 is in some blocks and not
+        // others, and user_id 100, which only B holds and B did not index, is
+        // found.
+        let block_count = footer::open(l1).expect("open l1").block_count;
+        assert!(block_count >= 3, "{block_count} blocks");
+        let user_0 = oracle::true_blocks(l1, |r| has_attr(r, "user_id", &AttrValue::I64(0)));
+        assert!(
+            !user_0.is_empty() && (user_0.len() as u64) < block_count,
+            "{user_0:?}"
+        );
+        assert!(
+            !oracle::true_blocks(l1, |r| has_attr(r, "user_id", &AttrValue::I64(100))).is_empty()
+        );
+        for v in ["req-0", "req-1", "req-2", "req-b-only", "absent"] {
+            let want = oracle::true_blocks(l1, |r| {
+                has_attr(r, "request_id", &AttrValue::Str(v.to_string()))
+            });
+            assert_eq!(
+                oracle::probe(l1, "request_id", KeyType::Str, &key8_str(v)),
+                Some(want),
+                "request_id = {v}"
+            );
+        }
+        for t in [[0xA0u8; 16], [0xA1; 16], [0xC0; 16], [0xEE; 16]] {
+            let want = oracle::true_blocks(l1, |r| r.trace_id == Some(t));
+            assert_eq!(
+                oracle::probe(l1, "trace_id", KeyType::Id16, &key8_id16(&t)),
+                Some(want),
+                "trace_id {t:02x?}"
+            );
+        }
+        assert_eq!(
+            oracle::true_blocks(l1, |r| r.trace_id == Some([0xC0; 16])).len(),
+            1,
+            "C's trace is found though C indexed nothing"
+        );
+    }
+
+    /// No input carries KEY_IDX, so the output carries none.
+    #[tokio::test]
+    async fn no_input_key_index_means_no_output_key_index() {
+        let store = MemoryStore::new();
+        seed(&store, Uuid::from_u128(1), 1, &[svc_record(1, "alpha")]).await;
+        seed(&store, Uuid::from_u128(2), 2, &[svc_record(2, "beta")]).await;
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        assert!(
+            footer::open(&parts[0])
+                .expect("open l1")
+                .section(kind::KEY_IDX)
+                .is_none()
+        );
+    }
+
+    /// Two inputs naming one field under different key types (a column
+    /// retyped within the hour) compact: the output's KEY_IDX names that field
+    /// under neither type, so a probe on it declines, and every other field is
+    /// still indexed and probes its true blocks.
+    #[tokio::test]
+    async fn a_key_type_conflict_between_inputs_leaves_the_field_uncovered() {
+        use super::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{key8_i64, key8_str};
+
+        let store = MemoryStore::new();
+        let k_i64 = ("k".to_string(), AttrValue::I64(1));
+        let k_str = ("k".to_string(), AttrValue::Str("1".into()));
+        let u = |v: i64| ("u".to_string(), AttrValue::I64(v));
+        let a = vec![keyed_record(0, 1, vec![k_i64, u(10)], None)];
+        let b = vec![keyed_record(1, 2, vec![k_str, u(20)], None)];
+        seed_l0_keyed(
+            &store,
+            Uuid::from_u128(1),
+            1,
+            &a,
+            &[("k", KeyType::I64), ("u", KeyType::I64)],
+        )
+        .await;
+        seed_l0_keyed(
+            &store,
+            Uuid::from_u128(2),
+            2,
+            &b,
+            &[("k", KeyType::Str), ("u", KeyType::I64)],
+        )
+        .await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("a key type conflict compacts");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        let l1 = &parts[0];
+
+        assert_eq!(oracle::fields(l1), vec![("u".to_string(), KeyType::I64)]);
+        assert_eq!(oracle::probe(l1, "k", KeyType::I64, &key8_i64(1)), None);
+        assert_eq!(oracle::probe(l1, "k", KeyType::Str, &key8_str("1")), None);
+        for v in [10i64, 20, 30] {
+            let want = oracle::true_blocks(l1, |r| has_attr(r, "u", &AttrValue::I64(v)));
+            assert_eq!(
+                oracle::probe(l1, "u", KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "u = {v}"
+            );
+        }
+        assert_eq!(
+            oracle::probe(l1, "u", KeyType::I64, &key8_i64(20)),
+            Some(vec![0]),
+            "a key only the second input holds is found"
+        );
+    }
+
+    /// A union of 65 fields (a column swapped at the 63-column cap within the
+    /// hour, plus `trace_id`) compacts to exactly 64: `trace_id`, then the
+    /// remaining names in ascending byte order. Input A alone names `f63` and
+    /// input B alone names `f00`, so neither input's set, nor plain byte
+    /// order (which sorts `trace_id` last), nor descending order is the
+    /// answer.
+    #[tokio::test]
+    async fn a_key_index_union_over_the_field_cap_keeps_the_deterministic_64() {
+        use super::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{key8_i64, key8_id16};
+
+        let store = MemoryStore::new();
+        let trace = [0xAB; 16];
+        let f = |i: i64| (format!("f{i:02}"), AttrValue::I64(i));
+        let a = vec![keyed_record(0, 1, vec![f(5), f(63)], Some(trace))];
+        let b = vec![keyed_record(1, 2, vec![f(0)], None)];
+        let mut a_fields = oracle::numbered_i64_fields(1, 63);
+        a_fields.push(("trace_id".to_string(), KeyType::Id16));
+        let a_fields: Vec<(&str, KeyType)> =
+            a_fields.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+        seed_l0_keyed(&store, Uuid::from_u128(1), 1, &a, &a_fields).await;
+        seed_l0_keyed(&store, Uuid::from_u128(2), 2, &b, &[("f00", KeyType::I64)]).await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("a union over the field cap compacts");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        let l1 = &parts[0];
+
+        let mut want = oracle::numbered_i64_fields(0, 63);
+        want.push(("trace_id".to_string(), KeyType::Id16));
+        assert_eq!(want.len(), 64);
+        assert_eq!(oracle::fields(l1), want);
+        assert_eq!(oracle::probe(l1, "f63", KeyType::I64, &key8_i64(63)), None);
+        for (field, v) in [("f00", 0i64), ("f05", 5), ("f05", 6)] {
+            let want = oracle::true_blocks(l1, |r| has_attr(r, field, &AttrValue::I64(v)));
+            assert_eq!(
+                oracle::probe(l1, field, KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "{field} = {v}"
+            );
+        }
+        assert_eq!(
+            oracle::probe(l1, "trace_id", KeyType::Id16, &key8_id16(&trace)),
+            Some(vec![0])
         );
     }
 

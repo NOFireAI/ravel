@@ -755,10 +755,12 @@ mod tests {
                     ravel_proto::sys::v1::TypedAttrColumn {
                         key: "dup".to_string(),
                         r#type: ravel_proto::sys::v1::TypedAttrColumnType::I64 as i32,
+                        key_index: false,
                     },
                     ravel_proto::sys::v1::TypedAttrColumn {
                         key: "dup".to_string(),
                         r#type: ravel_proto::sys::v1::TypedAttrColumnType::I64 as i32,
+                        key_index: false,
                     },
                 ],
             }),

@@ -4356,11 +4356,19 @@ mod tests {
         records: &[LogRecord],
         indexed_fields: &[&str],
     ) {
-        seed_logs_with(store, seq, records, indexed_fields, RlogConfig::default()).await;
+        seed_logs_with(
+            store,
+            seq,
+            records,
+            indexed_fields,
+            &[],
+            RlogConfig::default(),
+        )
+        .await;
     }
 
-    /// [`seed_logs_indexed`] with the writer config too, so a fixture can pick
-    /// the input's block size. A memory test needs inputs of many small blocks:
+    /// [`seed_logs_indexed`] with the KEY_IDX field set and the writer config
+    /// too, so a fixture can pick the input's block size. A memory test needs inputs of many small blocks:
     /// at the 8192-record default an input's whole stream is one block, and the
     /// merge's decode-side term would scale with the corpus for reasons that
     /// have nothing to do with what is under test.
@@ -4369,6 +4377,7 @@ mod tests {
         seq: u64,
         records: &[LogRecord],
         indexed_fields: &[&str],
+        key_fields: &[(&str, ravel_logseg::key_index::KeyType)],
         cfg: RlogConfig,
     ) {
         let th = tenant_hash();
@@ -4381,7 +4390,13 @@ mod tests {
             writer_seq: seq,
         };
         let mut w = RlogWriter::new(cfg, identity)
-            .with_indexed_fields(indexed_fields.iter().map(|f| (*f).to_string()).collect());
+            .with_indexed_fields(indexed_fields.iter().map(|f| (*f).to_string()).collect())
+            .with_key_index_fields(
+                key_fields
+                    .iter()
+                    .map(|(name, ty)| ((*name).to_string(), *ty))
+                    .collect(),
+            );
         for r in records {
             w.push(r.clone()).expect("push log record");
         }
@@ -4944,7 +4959,7 @@ mod tests {
             let recs: Vec<LogRecord> = (0..total / inputs)
                 .map(|i| wide_log_record(i * inputs + j))
                 .collect();
-            seed_logs_with(store, j as u64 + 1, &recs, &[], cfg).await;
+            seed_logs_with(store, j as u64 + 1, &recs, &[], &[], cfg).await;
         }
     }
 
@@ -5298,6 +5313,297 @@ mod tests {
     /// `resolve_already_exists_rewrite` makes the second
     /// `publish_rewrite_record` call return `Err`, failing
     /// `.expect("publish 2")`.
+    /// An erasure-rewritten part keeps the union of its inputs' KEY_IDX field
+    /// sets, and its entries are rebuilt from the surviving records only: a key
+    /// held only by dropped records probes as absent.
+    #[tokio::test]
+    async fn logs_rewrite_key_index_carries_every_inputs_fields_over_the_survivors() {
+        use crate::rlog::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{KeyType, key8_i64, key8_id16, key8_str};
+
+        let store = MemoryStore::new();
+        let svc = |v: &str| ("service".to_string(), LogAttrValue::Str(v.to_string()));
+        let user = |v: i64| ("user_id".to_string(), LogAttrValue::I64(v));
+        let req = |v: &str| ("request_id".to_string(), LogAttrValue::Str(v.to_string()));
+        let traced = |mut r: LogRecord, t: u8| {
+            r.trace_id = Some([t; 16]);
+            r
+        };
+        let one = vec![
+            log_record(1, 10, "a", vec![svc("checkout"), user(7)]),
+            log_record(1, 20, "b", vec![svc("shipping"), user(8)]),
+            log_record(2, 30, "c", vec![svc("shipping"), user(7)]),
+            log_record(1, 40, "d", vec![svc("checkout"), user(9)]),
+        ];
+        let two = vec![
+            traced(
+                log_record(2, 15, "e", vec![svc("shipping"), req("req-a")]),
+                0x11,
+            ),
+            traced(
+                log_record(3, 25, "f", vec![svc("checkout"), req("req-b")]),
+                0x22,
+            ),
+            log_record(3, 35, "g", vec![svc("shipping"), user(8), req("req-a")]),
+        ];
+        seed_logs_with(
+            &store,
+            1,
+            &one,
+            &[],
+            &[("user_id", KeyType::I64)],
+            RlogConfig::default(),
+        )
+        .await;
+        seed_logs_with(
+            &store,
+            2,
+            &two,
+            &[],
+            &[("request_id", KeyType::Str), ("trace_id", KeyType::Id16)],
+            RlogConfig::default(),
+        )
+        .await;
+
+        let request = logs_erasure_request(2, "service", "checkout");
+        let applicable = vec![ApplicableLogRequest {
+            request_id: request.request_id.clone(),
+            matcher: LogErasureMatcher::from_request(&request),
+        }];
+        let b = logs_bucket();
+        let config = CompactorConfig::default();
+        let listing = crate::read::list_bucket(&store, &b)
+            .await
+            .expect("list bucket");
+        let live = resolve_live_inputs(&store, &b, &listing, 1)
+            .await
+            .expect("resolve live inputs");
+        let (object_keys, _) = live_input_object_keys_and_target(live).expect("object keys");
+        let build = build_rewrite_logs(&store, &b, &config, &object_keys, &applicable, &[7u8; 32])
+            .await
+            .expect("build");
+        assert_eq!(build.output_sample_count, 4);
+        assert_eq!(build.parts.len(), 1);
+        let part = build.parts[0].bytes.as_ref().expect("retained part bytes");
+
+        assert_eq!(
+            oracle::fields(part),
+            vec![
+                ("request_id".to_string(), KeyType::Str),
+                ("trace_id".to_string(), KeyType::Id16),
+                ("user_id".to_string(), KeyType::I64),
+            ]
+        );
+        for v in [7i64, 8, 9] {
+            let want = oracle::true_blocks(part, |r| {
+                r.attrs
+                    .iter()
+                    .any(|(k, x)| k == "user_id" && *x == LogAttrValue::I64(v))
+            });
+            assert_eq!(
+                oracle::probe(part, "user_id", KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "user_id = {v}"
+            );
+        }
+        for v in ["req-a", "req-b"] {
+            let want = oracle::true_blocks(part, |r| {
+                r.attrs
+                    .iter()
+                    .any(|(k, x)| k == "request_id" && *x == LogAttrValue::Str(v.to_string()))
+            });
+            assert_eq!(
+                oracle::probe(part, "request_id", KeyType::Str, &key8_str(v)),
+                Some(want),
+                "request_id = {v}"
+            );
+        }
+        // Held only by dropped records, so absent from the rewritten part.
+        assert_eq!(
+            oracle::probe(part, "user_id", KeyType::I64, &key8_i64(9)),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            oracle::probe(part, "request_id", KeyType::Str, &key8_str("req-b")),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            oracle::probe(part, "trace_id", KeyType::Id16, &key8_id16(&[0x22; 16])),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            oracle::probe(part, "trace_id", KeyType::Id16, &key8_id16(&[0x11; 16])),
+            Some(oracle::true_blocks(part, |r| r.trace_id == Some([0x11; 16])))
+        );
+        assert_eq!(
+            oracle::probe(part, "user_id", KeyType::I64, &key8_i64(7)),
+            Some(vec![0]),
+            "the surviving user_id 7 row is found"
+        );
+    }
+
+    /// Runs one erasure pass dropping `service = checkout` from the logs
+    /// bucket, asserts it published one part, and returns the record's dropped
+    /// count, the survivors and the part's bytes.
+    async fn erase_checkout(store: &MemoryStore) -> (u64, Vec<LogRecord>, Bytes) {
+        let request = logs_erasure_request(3, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            store,
+            &clock,
+            &config,
+            &NoLeases,
+            &logs_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("the erasure rewrite completes");
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(parts, 1);
+        assert_eq!(publish, PublishOutcome::Published);
+        let record = read_rewrite_record_for(store, &logs_bucket()).await;
+        assert_eq!(record.drops.len(), 1);
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let survivors = decode_logs_part(store, &part_key).await;
+        let bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data;
+        (record.drops[0].dropped_count, survivors, bytes)
+    }
+
+    /// The erasure rewrite completes over inputs naming one field under
+    /// different key types: the erased record is gone, the rewritten part
+    /// names the field under neither type, and the other field still probes.
+    #[tokio::test]
+    async fn logs_rewrite_completes_over_a_key_type_conflict() {
+        use crate::rlog::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{KeyType, key8_i64, key8_str};
+
+        let store = MemoryStore::new();
+        let svc = |v: &str| ("service".to_string(), LogAttrValue::Str(v.to_string()));
+        let u = |v: i64| ("u".to_string(), LogAttrValue::I64(v));
+        let one = vec![
+            log_record(
+                1,
+                10,
+                "a",
+                vec![svc("checkout"), ("k".into(), LogAttrValue::I64(1)), u(7)],
+            ),
+            log_record(1, 20, "b", vec![svc("shipping"), u(8)]),
+        ];
+        let two = vec![log_record(
+            2,
+            15,
+            "c",
+            vec![
+                svc("shipping"),
+                ("k".into(), LogAttrValue::Str("1".into())),
+                u(9),
+            ],
+        )];
+        let both = |k: KeyType| [("k", k), ("u", KeyType::I64)];
+        seed_logs_with(
+            &store,
+            1,
+            &one,
+            &[],
+            &both(KeyType::I64),
+            RlogConfig::default(),
+        )
+        .await;
+        seed_logs_with(
+            &store,
+            2,
+            &two,
+            &[],
+            &both(KeyType::Str),
+            RlogConfig::default(),
+        )
+        .await;
+
+        let (dropped, survivors, part) = erase_checkout(&store).await;
+        assert_eq!(dropped, 1);
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(oracle::fields(&part), vec![("u".to_string(), KeyType::I64)]);
+        assert_eq!(oracle::probe(&part, "k", KeyType::I64, &key8_i64(1)), None);
+        assert_eq!(
+            oracle::probe(&part, "k", KeyType::Str, &key8_str("1")),
+            None
+        );
+        for (v, want) in [(7i64, Vec::new()), (8, vec![0]), (9, vec![0])] {
+            assert_eq!(
+                oracle::probe(&part, "u", KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "u = {v}"
+            );
+        }
+    }
+
+    /// The erasure rewrite completes over inputs whose KEY_IDX union names 65
+    /// fields, and keeps the same 64 the compactor keeps: `trace_id`, then
+    /// ascending names.
+    #[tokio::test]
+    async fn logs_rewrite_completes_over_a_key_index_union_past_the_cap() {
+        use crate::rlog::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{KeyType, key8_i64};
+
+        let store = MemoryStore::new();
+        let svc = |v: &str| ("service".to_string(), LogAttrValue::Str(v.to_string()));
+        let f = |i: i64| (format!("f{i:02}"), LogAttrValue::I64(i));
+        let one = vec![
+            log_record(1, 10, "a", vec![svc("checkout"), f(5)]),
+            log_record(1, 20, "b", vec![svc("shipping"), f(63)]),
+        ];
+        let two = vec![log_record(2, 15, "c", vec![svc("shipping"), f(0)])];
+        let mut one_fields = oracle::numbered_i64_fields(1, 63);
+        one_fields.push(("trace_id".to_string(), KeyType::Id16));
+        let one_fields: Vec<(&str, KeyType)> =
+            one_fields.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+        seed_logs_with(&store, 1, &one, &[], &one_fields, RlogConfig::default()).await;
+        seed_logs_with(
+            &store,
+            2,
+            &two,
+            &[],
+            &[("f00", KeyType::I64)],
+            RlogConfig::default(),
+        )
+        .await;
+
+        let (dropped, survivors, part) = erase_checkout(&store).await;
+        assert_eq!(dropped, 1);
+        assert_eq!(survivors.len(), 2);
+        let mut want = oracle::numbered_i64_fields(0, 63);
+        want.push(("trace_id".to_string(), KeyType::Id16));
+        assert_eq!(oracle::fields(&part), want);
+        assert_eq!(
+            oracle::probe(&part, "f63", KeyType::I64, &key8_i64(63)),
+            None
+        );
+        assert_eq!(
+            oracle::probe(&part, "f00", KeyType::I64, &key8_i64(0)),
+            Some(vec![0])
+        );
+        assert_eq!(
+            oracle::probe(&part, "f05", KeyType::I64, &key8_i64(5)),
+            Some(Vec::new()),
+            "held only by the erased record"
+        );
+    }
+
     #[tokio::test]
     async fn logs_republishing_same_rewrite_converges_without_double_counting() {
         let store = MemoryStore::new();

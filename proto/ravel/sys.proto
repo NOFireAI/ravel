@@ -536,6 +536,12 @@ enum TypedAttrColumnType {
 message TypedAttrColumn {
   string key = 1;                 // the attribute key; the SQL column name, verbatim
   TypedAttrColumnType type = 2;   // the declared logical type
+  // Exact-key index flag (ADR-2707 decision 3): when true, the logs flush
+  // writes this column's values into the RLOG KEY_IDX section. Eligible types
+  // are I64, STR and BYTES; the config write gate refuses it on BOOL. Added in
+  // TenantConfigRecord format_version 4: a record carrying any true value is
+  // stamped 4, written only behind the readers-rolled-out operator opt-in.
+  bool key_index = 3;
 }
 
 // The set of attribute keys promoted to native typed logs SQL columns for one
@@ -627,8 +633,8 @@ message TenantConfigRecord {
   // reader that only knows a lower version refuses rather than misreading a
   // future layout, matching every other durable record's version guard.
   //
-  // Writers stamp 2 by default and readers accept the SET {1, 2, 3}. Versions 1
-  // and 2 remain fully readable, so a record any earlier build wrote is still
+  // Writers stamp 2 by default and readers accept the SET {1, 2, 3, 4}. Versions
+  // 1 and 2 remain fully readable, so a record any earlier build wrote is still
   // read, and nothing has to be migrated.
   //
   // Version history:
@@ -642,13 +648,17 @@ message TenantConfigRecord {
   //      reader accepts 3 (the R1 reader-first rule). The opt-in is the
   //      operator's statement, not a check; a reader that predates 3 refuses a
   //      version-3 record. A record carrying neither field is still stamped 2.
+  //   4: adds TypedAttrColumn.key_index (field 3 of that message) and
+  //      index_trace_id (field 15), ADR-2707. Written on demand only, behind
+  //      the same operator opt-in: a record carrying a true value in either is
+  //      stamped 4; one carrying neither keeps the stamp versions 2 and 3 give.
   //
   // This record is CAS-mutable (set_tenant_config rebuilds it whole under
   // CasVersion, naming every field it knows), so per the ADR-0066 R1 amendment
   // its reader accepted version 2 fleet-wide one release BEFORE any writer
   // emitted it; the R2 amendment then flipped the writer into that
   // already-accepted ceiling. set_tenant_config REFUSES to rewrite a record above
-  // version 3, the highest this build writes, rather than rebuild it at the older
+  // version 4, the highest this build writes, rather than rebuild it at the older
   // field set and strip a field a newer writer added.
   //
   // A version-1 writer never emits `typed_attr_columns` (field 12): it was added
@@ -703,6 +713,12 @@ message TenantConfigRecord {
   // setter writes a nonzero value, behind the operator opt-in, in a record
   // stamped 3. Setting ALL removes the field.
   BloomScope bloom_scope = 14;
+  // Exact-key index on trace_id for this tenant's logs (ADR-2707 decision 6):
+  // when true, the logs flush adds trace_id (key type Id16) to the RLOG
+  // KEY_IDX section. Added in format_version 4 under the same reader-first
+  // rollout as version 3: emitted only behind the operator opt-in, in a record
+  // stamped 4. A record below version 4 that carries it is refused on rewrite.
+  bool index_trace_id = 15;
 }
 
 // One entry of the durable `sys/auth` token map (ADR-0066 decision 6, epic EM):

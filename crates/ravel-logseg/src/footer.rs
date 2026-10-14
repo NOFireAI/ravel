@@ -8,6 +8,7 @@
 //! returning any descriptor.
 
 use prost::Message;
+use ravel_codec::key_idx::key_idx_prefix_range;
 use ravel_proto::logseg::v1 as pb;
 
 use crate::error::LogSegError;
@@ -137,6 +138,11 @@ pub mod kind {
     /// (ADR-0699 decision 2). Mandatory since trailer version 4, and in
     /// version 5, the only version this build reads.
     pub const PAGE_DIR: u32 = 8;
+    /// Exact-key index from declared field values (and `trace_id`) to the
+    /// level-0 block ordinals holding them (ADR-2707 decision 3). Optional:
+    /// written only when the tenant declares indexed fields, so a version 5
+    /// object without it is legal. Its footer entry carries `prefix_len`.
+    pub const KEY_IDX: u32 = 9;
 }
 
 /// One section table entry (mirrors `ravel.logseg.v1.Section`).
@@ -148,6 +154,9 @@ pub struct SectionDesc {
     pub crc32c: u32,
     pub comp: u8,
     pub uncomp_len: u64,
+    /// KEY_IDX prefix length (header plus field directories). Non-zero only on
+    /// the [`kind::KEY_IDX`] entry; zero on every other kind.
+    pub prefix_len: u32,
 }
 
 /// The decoded footer (mirrors `ravel.logseg.v1.LogFooter`).
@@ -366,6 +375,7 @@ impl LogFooter {
                     crc32c: s.crc32c,
                     comp: i32::from(s.comp),
                     uncompressed_len: s.uncomp_len,
+                    prefix_len: s.prefix_len,
                 })
                 .collect(),
             level: self.level,
@@ -392,6 +402,7 @@ impl LogFooter {
                 crc32c: s.crc32c,
                 comp,
                 uncomp_len: s.uncompressed_len,
+                prefix_len: s.prefix_len,
             });
         }
         let sort_descriptor = p
@@ -637,7 +648,9 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
 
 /// Validates the section table: at most one of each known kind, all five v1
 /// kinds present, every range inside the section area with overflow-checked
-/// arithmetic, and every `uncomp_len` within the cap.
+/// arithmetic, every `uncomp_len` within the cap, and at most one KEY_IDX
+/// entry, stored raw with a `prefix_len` that is non-zero, not past the
+/// section, and at most `KEY_IDX_PREFIX_MAX`.
 pub fn validate_sections(
     footer: &LogFooter,
     section_area_end: u64,
@@ -680,6 +693,27 @@ pub fn validate_sections(
                 s.comp
             )));
         }
+        if s.kind == kind::KEY_IDX {
+            // The probe ranges into the stored bytes, so they must be the
+            // section itself.
+            if s.comp != COMP_NONE || s.uncomp_len != s.len {
+                return Err(LogSegError::Corrupted(
+                    "KEY_IDX section must be stored raw".into(),
+                ));
+            }
+            key_idx_prefix_range(s.prefix_len, s.len)?;
+        }
+    }
+    if footer
+        .sections
+        .iter()
+        .filter(|s| s.kind == kind::KEY_IDX)
+        .count()
+        > 1
+    {
+        return Err(LogSegError::Corrupted(
+            "duplicate section kind KEY_IDX".into(),
+        ));
     }
     // POSTINGS (ADR-0049) is optional: 0 or 1 occurrences, never mandatory.
     // Absent is always legal (docs/adrs/0049-rlog-postings.md decision 5).
@@ -737,6 +771,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::FIELD_DIR,
@@ -745,6 +780,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::BLOCKS,
@@ -753,6 +789,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_NONE,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::SKIP_IDX,
@@ -761,6 +798,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::BLOOM,
@@ -769,6 +807,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_NONE,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
         ];
         let mut obj = vec![0u8; body_len];
@@ -1079,6 +1118,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::FIELD_DIR,
@@ -1087,6 +1127,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::BLOCKS,
@@ -1095,6 +1136,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_NONE,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::SKIP_IDX,
@@ -1103,6 +1145,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
         ];
         let mut obj = vec![0u8; 5];
@@ -1117,6 +1160,98 @@ mod tests {
         assert!(matches!(open(&obj), Err(LogSegError::Corrupted(_))));
     }
 
+    /// Opens a footer carrying the five mandatory sections plus one KEY_IDX
+    /// entry at offset 5 that `edit` may alter, over a body of `body_len` bytes.
+    fn open_with_key_idx(
+        body_len: usize,
+        edit: &dyn Fn(&mut SectionDesc),
+    ) -> Result<LogFooter, LogSegError> {
+        let mut key_idx = SectionDesc {
+            kind: kind::KEY_IDX,
+            offset: 5,
+            len: 1,
+            crc32c: 0,
+            comp: COMP_NONE,
+            uncomp_len: 1,
+            prefix_len: 1,
+        };
+        edit(&mut key_idx);
+        let mut sections = sample_sections();
+        sections.push(key_idx);
+        let mut obj = vec![0u8; body_len];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+        open(&obj)
+    }
+
+    fn assert_corrupted_naming(result: Result<LogFooter, LogSegError>, needle: &str) {
+        match result {
+            Err(LogSegError::Corrupted(message)) => {
+                assert!(message.contains(needle), "{message:?} lacks {needle:?}");
+            }
+            other => panic!("expected Corrupted naming {needle:?}, got {other:?}"),
+        }
+    }
+
+    /// An object with no KEY_IDX entry opens (the section is optional); one
+    /// with a well-formed entry opens and keeps its `prefix_len`; a zero,
+    /// past-the-section, or over-the-cap `prefix_len`, a compressed or
+    /// length-mismatched entry, and a second KEY_IDX entry are each
+    /// `Corrupted` at open.
+    #[test]
+    fn key_idx_footer_entry_is_validated_at_open() {
+        use ravel_codec::key_idx::KEY_IDX_PREFIX_MAX;
+
+        let without = open(&build_object(5)).expect("KEY_IDX is optional");
+        assert!(without.section(kind::KEY_IDX).is_none());
+
+        let with = open_with_key_idx(6, &|_| {}).expect("well-formed entry");
+        assert_eq!(with.section(kind::KEY_IDX).map(|s| s.prefix_len), Some(1));
+
+        assert_corrupted_naming(
+            open_with_key_idx(6, &|s| s.prefix_len = 0),
+            "prefix_len is zero",
+        );
+        assert_corrupted_naming(
+            open_with_key_idx(6, &|s| s.prefix_len = 2),
+            "past the section length",
+        );
+        assert_corrupted_naming(
+            open_with_key_idx(6, &|s| s.prefix_len = KEY_IDX_PREFIX_MAX + 1),
+            "over KEY_IDX_PREFIX_MAX",
+        );
+        assert_corrupted_naming(open_with_key_idx(6, &|s| s.comp = COMP_ZSTD), "stored raw");
+        assert_corrupted_naming(open_with_key_idx(6, &|s| s.uncomp_len = 2), "stored raw");
+
+        // Exactly at the cap is accepted when the section is that long.
+        let cap = KEY_IDX_PREFIX_MAX as usize;
+        let at_cap = open_with_key_idx(5 + cap, &|s| {
+            s.len = u64::from(KEY_IDX_PREFIX_MAX);
+            s.uncomp_len = s.len;
+            s.prefix_len = KEY_IDX_PREFIX_MAX;
+        })
+        .expect("prefix_len at the cap");
+        assert_eq!(
+            at_cap.section(kind::KEY_IDX).map(|s| s.prefix_len),
+            Some(KEY_IDX_PREFIX_MAX)
+        );
+
+        let mut sections = sample_sections();
+        for offset in [5, 6] {
+            sections.push(SectionDesc {
+                kind: kind::KEY_IDX,
+                offset,
+                len: 1,
+                crc32c: 0,
+                comp: COMP_NONE,
+                uncomp_len: 1,
+                prefix_len: 1,
+            });
+        }
+        let mut obj = vec![0u8; 7];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+        assert_corrupted_naming(open(&obj), "duplicate section kind KEY_IDX");
+    }
+
     fn sample_sections() -> Vec<SectionDesc> {
         vec![
             SectionDesc {
@@ -1126,6 +1261,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::FIELD_DIR,
@@ -1134,6 +1270,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::BLOCKS,
@@ -1142,6 +1279,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_NONE,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::SKIP_IDX,
@@ -1150,6 +1288,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_ZSTD,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::BLOOM,
@@ -1158,6 +1297,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_NONE,
                 uncomp_len: 1,
+                prefix_len: 0,
             },
         ]
     }

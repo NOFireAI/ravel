@@ -105,7 +105,7 @@ encodings.
 | STREAM_DIR   stream directory                     |  kind 1
 | FIELD_DIR    field directory                      |  kind 2
 | BLOCKS       row blocks (column pages)            |  kind 3
-| KEY_IDX      per-field exact (key8, block) index  |  kind 9 (optional, ADR-2707 proposed)
+| KEY_IDX      per-field exact (key8, block) index  |  kind 9 (optional, ADR-2707)
 | SKIP_IDX     multi-level min/max index            |  kind 4
 | PAGE_DIR     per row group, per column chunk,     |  kind 8
 |              per page: offset/len/enc/comp/crc    |
@@ -166,7 +166,7 @@ are permitted.
   `block_count`, `stream_count`.
 - `sections`: repeated `Section { kind, offset, len, crc32c, comp,
   uncompressed_len, prefix_len }` (`prefix_len = 7` is additive under
-  ADR-2707, proposed: set only on a KEY_IDX entry, ignored by readers that
+  ADR-2707: set only on a KEY_IDX entry, ignored by readers that
   do not know it); the pre-ADR-2707 form is `Section { kind, offset, len, crc32c, comp
   (0=none, 2=zstd), uncompressed_len }`.
 - compaction identity (ADR-0032, field numbers 14-16, added in trailer
@@ -213,7 +213,7 @@ Validation (all violations `Corrupted`, never panics):
   POSTINGS (kind 6, ADR-0049) is optional: present only when the writer was
   given one or more indexed field names (`RlogWriter::with_indexed_fields`);
   absence is legal and never treated as corruption. KEY_IDX (kind 9,
-  ADR-2707, proposed) is optional the same way: present only when the
+  ADR-2707) is optional the same way: present only when the
   writer was given a non-empty key-index set; absence is legal and never
   treated as corruption, and a reader that does not know the kind skips it.
 - Every section `[offset, offset+len)` lies within
@@ -237,7 +237,7 @@ Validation (all violations `Corrupted`, never panics):
 | 6 | POSTINGS | per-field term -> block-index postings (optional) | none (per-block, zstd inside) |
 | 7 | GRAM_IDX | reserved (ADR-0105, not implemented) | - |
 | 8 | PAGE_DIR | per row group, per column chunk, per page: offset, length, enc/comp, crc32c | zstd |
-| 9 | KEY_IDX | per indexed field, every distinct (key8, block ordinal) pair, bucketed (optional; ADR-2707, proposed) | none (per-bucket, zstd inside) |
+| 9 | KEY_IDX | per indexed field, every distinct (key8, block ordinal) pair, bucketed (optional; ADR-2707) | none (per-bucket, zstd inside) |
 
 STREAM_DIR, FIELD_DIR, and SKIP_IDX are compressed as whole sections
 (zstd level 3 default) and always read whole. BLOCKS, BLOOM, POSTINGS and
@@ -1307,7 +1307,7 @@ existing-section grammar changes the carve-out does not cover, so it took the
 trailer bump to 4 (ADR-0699 decision 3), which is also what lets the version
 byte, rather than a section's presence, be what selects the layout.
 
-KEY_IDX (kind 9, ADR-2707, proposed) is added under the carve-out, as
+KEY_IDX (kind 9, ADR-2707) is added under the carve-out, as
 POSTINGS was: an optional kind an old reader skips and whose absence is
 legal, so the trailer stays at 5 and the section carries its own `version`
 byte. RSPAN adopts the same section as a mandatory kind, which is a legality
@@ -1315,9 +1315,12 @@ change, so there it takes a trailer bump (docs/span-segment-format.md).
 
 ## KEY_IDX
 
-Optional, kind 9 (ADR-2707, proposed: no shipped writer emits this section
-yet; the implementing task lands the writer, the reader and this text's
-"proposed" marker together). Exact block-level pruning for an equality on a
+Optional, kind 9 (ADR-2707). Implemented: the writer
+(`RlogWriter::with_key_index_fields`, driven by the logs flush, L0 to L1
+compaction and the erasure rewrite), the ranged probe and the whole-section
+summary (`ravel_logseg::key_index`), and `ravel-cli rlog inspect`, which
+prints the summary. No query path calls the probe yet, so today the section
+costs bytes and prunes nothing. Exact block-level pruning for an equality on a
 high-cardinality key: a logs `trace_id`, a `request_id`, a typed `I64`
 attribute column such as a user id. POSTINGS cannot serve these (its
 per-field distinct-value cap drops such a field outright, ADR-0049 decision
@@ -1333,12 +1336,19 @@ Which fields are indexed is tenant configuration: a typed attribute column
 declared with `key_index` set (`TypedAttrColumn.key_index`, proto/ravel/sys.proto,
 additive under ADR-0066's R1 rule, readers first), of type `I64`, `STR` or
 `BYTES`, plus the fixed `trace_id` column when
-`TenantConfigRecord.index_trace_id` is set. `BOOL` is never indexed. The
+`TenantConfigRecord.index_trace_id` is set. `BOOL` is never indexed. Either
+setting needs tenant config record version 4, written only under the
+operator's readers-first opt-in (`ravel-cli typed-attr-column set
+--key-index KEY --index-trace-id true --readers-rolled-out`). The
 writer receives that set (`RlogWriter::with_key_index_fields`) and **writes
 it into the section header; a reader never infers it from live config.** A
 declared field with no matching rows in the object is still named, with
 `entry_count = 0`, an all-zero directory and `buckets_len = 0`, so an absent
-key is proved absent by the probe rather than left to a scan. A
+key is proved absent by the probe rather than left to a scan. The one
+declared field left out is one with a bucket that would hold more than
+`KEY_IDX_BUCKET_MAX_ENTRIES` entries, which the codec refuses: the writer
+drops that field from this object's header with a warning and writes the
+object and its other fields as usual. A
 field the header does not name is uncovered in this object for that field,
 whatever the tenant's current declaration says (ADR-0849 section 3).
 
@@ -1477,8 +1487,9 @@ the Stage 0 figures on ADR-2707).
 A present key names its blocks, which the reader intersects with every other
 block-level proof (SKIP_IDX, BLOOM, POSTINGS) under the conjunctive rule
 "Pruning soundness" states; an absent key proves the field's value absent
-from every block and drops the object. The catalog fold reads this section
-by ranged GET to build the per-part `.kidx` leaf
+from every block and drops the object. The catalog fold is to read this
+section by ranged GET to build the per-part `.kidx` leaf, which is not
+implemented yet
 (docs/catalog-and-mvcc.md, "Per-part key-index leaves"), never rows.
 
 A probe declines (no prune, as for an unindexed field) when the section is
@@ -1567,6 +1578,23 @@ The merge is defined entirely in terms of this format:
   of at most `8 + 5 * (10 + string columns)` bytes (the whole section when
   its BLOOM is compressed), and none when that input holds no string column,
   in which case the output covers every string column.
+- **KEY_IDX.** The output names the union of the inputs' KEY_IDX fields,
+  read from each input's section header by one ranged GET of
+  `[0, prefix_len)`, and its entries are rebuilt from the merged blocks; an
+  input's entries are never reused, since the block ordinals differ. A field
+  no output row carries is still named, with `entry_count = 0`. A field two
+  inputs name under different key types is left out of the output's header
+  and logged at warn level, and the merge goes ahead with every other
+  field; a union over 64 fields keeps `trace_id`, when named, and then the
+  first names in ascending byte order up to 64, and logs each field it
+  drops. The choice depends only on the set of (name, key type) pairs the
+  inputs carry, not on their order, so a retried merge writes the same
+  field set. A retype of a key-index column therefore leaves that column
+  uncovered in an output whose inputs mix the two types, and a union over
+  the cap leaves uncovered the names that sort last, which need not be the
+  column that changed; neither blocks compaction or erasure. An output without any
+  input KEY_IDX has none. The erasure rewrite uses the same merge, so its
+  survivors keep every input's field set less those same exclusions.
 - **Compression level.** The compactor and the erasure rewrite encode every
   L1 page and zstd section at `CompactorConfig::rlog_zstd_level`, default 9
   (ADR-2135 decision 4), not the writer's level-3 default. The level changes
@@ -1641,7 +1669,7 @@ framing, which is checked structurally (see below):
 | one BLOOM entry's stored bytes | per-entry `crc32c` | BLOOM container framing | before probing the entry |
 | POSTINGS header (`column_id`, `capped`, `stride`, counts, `first_term`s, offsets, for every field) | whole-section `Section.crc32c` | footer section entry | before `PostingsSection::parse`, in `RlogReader::scan` |
 | one POSTINGS term block's stored bytes | per-block `crc32c` | POSTINGS sparse-index entry | before decompressing the block a probe lands on |
-| KEY_IDX header (`version`, `bucket_bits`, every field's name, type, counts and offsets) | `header_crc32c` | KEY_IDX, right after the header | before any offset in it is followed (ADR-2707, proposed) |
+| KEY_IDX header (`version`, `bucket_bits`, every field's name, type, counts and offsets) | `header_crc32c` | KEY_IDX, right after the header | before any offset in it is followed (ADR-2707) |
 | one KEY_IDX field's directory (`ends[]`) | `dir_crc32c` | KEY_IDX, right after the directory | before a bucket range is computed from it |
 | one KEY_IDX bucket's stored bytes | `frame_crc32c` | KEY_IDX bucket frame | before decompressing the bucket a probe lands on |
 
@@ -1762,7 +1790,7 @@ All violations are `Corrupted`, never panics:
   trailing bytes left over once the declared term count is consumed; a
   declared term or posting count the block's remaining bytes cannot
   support.
-- key_idx (ADR-2707, proposed): header crc mismatch; `version` above the
+- key_idx (ADR-2707): header crc mismatch; `version` above the
   one the reader knows; `bucket_bits` outside 1 to 16; non-zero reserved
   bytes; `field_count` zero or over 64; field names not ascending or not
   unique; an unknown `key_type`; a header `prefix_len` not equal to the

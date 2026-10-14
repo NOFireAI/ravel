@@ -35,7 +35,8 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use ravel_catalog::{DeclaredTypedColumn, read_config_values};
+use ravel_catalog::{DeclaredColumnType, DeclaredTypedColumn, TenantConfig, read_config_values};
+use ravel_logseg::key_index::{KeyType, TRACE_ID_FIELD, validate_fields};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantHash;
 
@@ -88,6 +89,11 @@ struct CacheEntry {
     /// the same read against `typed_columns`. The default layout (never set,
     /// scope `all`) on a base-only entry.
     layout: StorageLayout,
+    /// The RLOG KEY_IDX field set (ADR-2707 decisions 3 and 6) resolved from
+    /// the same read: the typed columns flagged `key_index` and, when
+    /// `index_trace_id` is set, `trace_id`. Empty on a base-only entry. Advisory
+    /// like the rest: a missing field only costs an object its exact-key index.
+    key_index: Vec<(String, KeyType)>,
     refreshed_at_ns: i64,
     attempted_at_ns: i64,
     last_touched_ns: i64,
@@ -212,8 +218,9 @@ impl IndexedFieldsOverlay {
         }
     }
 
-    /// The tenant's declared typed columns (ADR-0873 wave 5a) and storage
-    /// layout (ADR-2135) as last resolved into the cache, both from one entry.
+    /// The tenant's declared typed columns (ADR-0873 wave 5a), storage layout
+    /// (ADR-2135) and KEY_IDX field set (ADR-2707) as last resolved into the
+    /// cache, all from one entry.
     /// Read after the flush has already resolved this tenant's indexed fields
     /// for the same tick (fast path or `refresh`), so the entry exists and both
     /// came from the same durable read; returns an empty list and the default
@@ -224,14 +231,22 @@ impl IndexedFieldsOverlay {
         &self,
         tenant: &TenantHash,
         now_ns: i64,
-    ) -> (Vec<DeclaredTypedColumn>, StorageLayout) {
+    ) -> (
+        Vec<DeclaredTypedColumn>,
+        StorageLayout,
+        Vec<(String, KeyType)>,
+    ) {
         let mut inner = self.lock();
         match inner.cache.get_mut(tenant) {
             Some(entry) => {
                 entry.last_touched_ns = now_ns;
-                (entry.typed_columns.clone(), entry.layout.clone())
+                (
+                    entry.typed_columns.clone(),
+                    entry.layout.clone(),
+                    entry.key_index.clone(),
+                )
             }
-            None => (Vec::new(), StorageLayout::default()),
+            None => (Vec::new(), StorageLayout::default(), Vec::new()),
         }
     }
 
@@ -287,6 +302,10 @@ impl IndexedFieldsOverlay {
                     .as_ref()
                     .map(|c| StorageLayout::resolve(c, &typed_columns))
                     .unwrap_or_default();
+                let key_index = config
+                    .as_ref()
+                    .map(|c| key_index_fields(c, tenant))
+                    .unwrap_or_default();
                 let durable = config.and_then(|c| c.indexed_fields);
                 match durable {
                     // A present durable override: validate before it can replace
@@ -295,12 +314,21 @@ impl IndexedFieldsOverlay {
                     Some(list) if validate_indexed_list(&list).is_err() => {
                         self.serve_on_failure(tenant, now_ns)
                     }
-                    Some(list) => self.install_fresh(tenant, list, typed_columns, layout, now_ns),
+                    Some(list) => {
+                        self.install_fresh(tenant, list, typed_columns, layout, key_index, now_ns)
+                    }
                     // No override: the base's own tenant-override-or-default
                     // resolution stands unchanged.
                     None => {
                         let base_fields = self.base.fields_for(tenant);
-                        self.install_fresh(tenant, base_fields, typed_columns, layout, now_ns)
+                        self.install_fresh(
+                            tenant,
+                            base_fields,
+                            typed_columns,
+                            layout,
+                            key_index,
+                            now_ns,
+                        )
                     }
                 }
             }
@@ -318,6 +346,7 @@ impl IndexedFieldsOverlay {
         fields: Vec<String>,
         typed_columns: Vec<DeclaredTypedColumn>,
         layout: StorageLayout,
+        key_index: Vec<(String, KeyType)>,
         now_ns: i64,
     ) -> RefreshOutcome {
         if let StorageLayout::Unresolved(error) = &layout {
@@ -335,6 +364,7 @@ impl IndexedFieldsOverlay {
                 fields: fields.clone(),
                 typed_columns,
                 layout,
+                key_index,
                 refreshed_at_ns: now_ns,
                 attempted_at_ns: NEVER,
                 last_touched_ns: now_ns,
@@ -373,6 +403,7 @@ impl IndexedFieldsOverlay {
                 // succeeds. Fail-closed to uncovered, never to a wrong stamp.
                 typed_columns: Vec::new(),
                 layout: StorageLayout::default(),
+                key_index: Vec::new(),
                 refreshed_at_ns: NEVER,
                 attempted_at_ns: now_ns,
                 last_touched_ns: now_ns,
@@ -405,6 +436,52 @@ impl IndexedFieldsOverlay {
 /// malformed record never produces a writer that indexes the wrong set or panics
 /// on an empty name. Returns `Ok(())` for a valid list, including the empty list
 /// (a valid explicit opt-out).
+/// The RLOG KEY_IDX field set `config` declares: each typed column flagged
+/// `key_index` under its declared type, then `trace_id` as `Id16` when
+/// `index_trace_id` is set. A declaration that does not validate (against the
+/// config's own typed columns, or against the writer's field-set rules) is
+/// logged and indexes nothing, so it can never fail a flush.
+pub(crate) fn key_index_fields(
+    config: &TenantConfig,
+    tenant: &TenantHash,
+) -> Vec<(String, KeyType)> {
+    let columns = match config.key_index_columns() {
+        Ok(columns) => columns,
+        Err(error) => {
+            tracing::warn!(
+                tenant_hash = %tenant.to_hex(),
+                %error,
+                "tenant key-index columns do not resolve; log objects are written without them"
+            );
+            Vec::new()
+        }
+    };
+    let mut fields: Vec<(String, KeyType)> = columns
+        .into_iter()
+        .filter_map(|column| {
+            let key_type = match column.ty {
+                DeclaredColumnType::I64 => KeyType::I64,
+                DeclaredColumnType::Str => KeyType::Str,
+                DeclaredColumnType::Bytes => KeyType::Bytes,
+                DeclaredColumnType::Bool => return None,
+            };
+            Some((column.key, key_type))
+        })
+        .collect();
+    if config.index_trace_id() {
+        fields.push((TRACE_ID_FIELD.to_string(), KeyType::Id16));
+    }
+    if let Err(error) = validate_fields(&fields) {
+        tracing::warn!(
+            tenant_hash = %tenant.to_hex(),
+            %error,
+            "tenant key-index field set is not writable; log objects are written without KEY_IDX"
+        );
+        return Vec::new();
+    }
+    fields
+}
+
 fn validate_indexed_list(list: &[String]) -> Result<(), ()> {
     let mut seen: HashSet<&str> = HashSet::with_capacity(list.len());
     for field in list {
@@ -687,6 +764,7 @@ mod tests {
                 columns: vec![proto::TypedAttrColumn {
                     key: "region".to_string(),
                     r#type: proto::TypedAttrColumnType::Str as i32,
+                    key_index: false,
                 }],
             }),
             clustering_key: Some(proto::ClusteringKeyConfig {
@@ -736,6 +814,102 @@ mod tests {
         assert_eq!(
             overlay.declared_layout_cached(&t, 40_000).1,
             StorageLayout::default()
+        );
+    }
+
+    /// A version-4 record's key-index declaration resolves from the same read
+    /// as the typed columns: each flagged column under its declared type, then
+    /// `trace_id` when `index_trace_id` is set. A declaration the writer would
+    /// refuse resolves to no field at all, and the typed columns still resolve.
+    #[tokio::test]
+    async fn key_index_fields_resolve_from_the_config_read() {
+        use prost::Message;
+        use ravel_catalog::config_key;
+        use ravel_object_store::PutOptions;
+        use ravel_proto::sys::v1 as proto;
+
+        let column =
+            |key: &str, ty: proto::TypedAttrColumnType, key_index: bool| proto::TypedAttrColumn {
+                key: key.to_string(),
+                r#type: ty as i32,
+                key_index,
+            };
+        let record = |columns: Vec<proto::TypedAttrColumn>, index_trace_id: bool| {
+            proto::TenantConfigRecord {
+                format_version: 4,
+                tenant_hash: tenant(4).0.to_vec(),
+                lifecycle_state: proto::TenantLifecycleState::Active as i32,
+                typed_attr_columns: Some(proto::TypedAttrColumnConfig { columns }),
+                index_trace_id,
+                created_unix_ns: 1,
+                updated_unix_ns: 1,
+                ..Default::default()
+            }
+        };
+        let resolve = |record: proto::TenantConfigRecord| async move {
+            let t = tenant(4);
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            store
+                .put(
+                    &config_key(&t),
+                    record.encode_to_vec().into(),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put config record");
+            let overlay = overlay_over(Arc::new(crate::NoIndexedFields));
+            let out = overlay.refresh(store.as_ref(), &t, 10_000).await;
+            assert!(matches!(out, RefreshOutcome::Fresh(_)));
+            let (typed, _, key_index) = overlay.declared_layout_cached(&t, 10_000);
+            (typed.len(), key_index)
+        };
+
+        let declared = vec![
+            column("user_id", proto::TypedAttrColumnType::I64, true),
+            column("is_error", proto::TypedAttrColumnType::Bool, false),
+            column("request_id", proto::TypedAttrColumnType::Str, true),
+            column("blob", proto::TypedAttrColumnType::Bytes, true),
+            column("region", proto::TypedAttrColumnType::Str, false),
+        ];
+        assert_eq!(
+            resolve(record(declared.clone(), true)).await,
+            (
+                5,
+                vec![
+                    ("user_id".to_string(), KeyType::I64),
+                    ("request_id".to_string(), KeyType::Str),
+                    ("blob".to_string(), KeyType::Bytes),
+                    ("trace_id".to_string(), KeyType::Id16),
+                ]
+            )
+        );
+        assert_eq!(
+            resolve(record(declared, false)).await.1.last(),
+            Some(&("blob".to_string(), KeyType::Bytes))
+        );
+        assert_eq!(
+            resolve(record(Vec::new(), true)).await,
+            (0, vec![("trace_id".to_string(), KeyType::Id16)])
+        );
+        assert_eq!(resolve(record(Vec::new(), false)).await, (0, Vec::new()));
+
+        // A durable key longer than a KEY_IDX field name may be: every
+        // key-index column is dropped rather than failing the flush, and the
+        // trace_id opt-in, which does not depend on them, still applies.
+        let long = "k".repeat(129);
+        let long_columns = || {
+            vec![
+                column(&long, proto::TypedAttrColumnType::Str, true),
+                column("user_id", proto::TypedAttrColumnType::I64, true),
+            ]
+        };
+        assert_eq!(
+            resolve(record(long_columns(), true)).await,
+            (2, vec![("trace_id".to_string(), KeyType::Id16)])
+        );
+        assert_eq!(
+            resolve(record(long_columns(), false)).await,
+            (2, Vec::new())
         );
     }
 }

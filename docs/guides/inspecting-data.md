@@ -296,6 +296,10 @@ Field by field:
   whole-section zstd (`comp=zstd`). BLOCKS and BLOOM are containers that a
   reader reads entry by entry, so they are `comp=none`. `comp` is printed by
   name (`none`/`zstd`).
+
+  `kind=9` `KEY_IDX` is optional and present only when the tenant declared
+  exact-key index fields (see `key_idx` below). Its line adds `prefix_len`,
+  the bytes a probe reads first.
 - `skip_index level 0`: one line per row block. Each line gives its byte
   `offset` (into BLOCKS) and `len`, the `crc32c` that the reader verifies
   before it decodes the block, `record_count`, and the `ts_range` and
@@ -347,6 +351,23 @@ Field by field:
   attribute column). The default scope covers `body`, `severity_text`, and
   every string attribute column. A word or equality predicate on a column that
   the list omits is never bloom-pruned.
+- `key_idx`: printed only when the object has a KEY_IDX section. The header
+  line gives the section's `version` byte, `bucket_bits` (each field has
+  `2^bucket_bits` buckets), `prefix_len`, and the field count. Then one line
+  per indexed field: its `key_type` (`I64`, `Str`, `Bytes`, or `Id16` for
+  `trace_id`), `entries` (distinct key and block pairs), the bucket count,
+  and the spread of entries over buckets (min, median, max, and how many are
+  empty). The object above, written with `svc` and `code` indexed, adds:
+
+  ```
+    kind=9 name=KEY_IDX offset=214 len=2244 comp=none uncompressed_len=2244 prefix_len=2091
+  key_idx: version=1 bucket_bits=8 prefix_len=2091 fields=2
+    field name=code key_type=I64 entries=4 buckets=256 entries_per_bucket=[min=0 median=0 max=2] empty_buckets=253
+    field name=svc key_type=Str entries=2 buckets=256 entries_per_bucket=[min=0 median=0 max=1] empty_buckets=254
+  ```
+
+  The section is crc-verified before anything is printed. No query reads
+  the index yet.
 
 A corrupt object never inspects as a success. The footer open protocol and
 every section decode return a typed `Corrupted` error with a non-zero exit.
@@ -354,8 +375,8 @@ The lines printed before the failing section stay on stdout.
 
 - A corrupt SKIP_IDX is an error, not a degrade. Its level-0 entries are the
   only source of block byte ranges and per-block checksums.
-- BLOOM is read with its whole-section crc verified, so a damaged BLOOM fails
-  `rlog inspect`. A query scan over the same object at worst prunes fewer
+- BLOOM and KEY_IDX are read with their whole-section crc verified, so a
+  damaged BLOOM or KEY_IDX fails `rlog inspect`. A query scan over the same object at worst prunes fewer
   blocks and still answers exactly.
 
 ## `rlog footprint`

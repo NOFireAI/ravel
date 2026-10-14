@@ -44,13 +44,24 @@
 //! window the current `ravel_catalog` API allows. Closing it would need a
 //! `set_tenant_config` variant that takes the version the caller already read,
 //! which `ravel-catalog` does not expose today.
+//!
+//! # Exact-key index fields
+//!
+//! `set` also carries the tenant's exact-key index declaration (ADR-2707
+//! decisions 3 and 6): which declared columns the logs flush writes into the
+//! RLOG KEY_IDX section, and whether `trace_id` joins them. Each is optional on
+//! the command line; an omitted one keeps the stored value. Turning either on
+//! writes a version-4 config record, which a reader from an older release
+//! refuses, so it needs the `--readers-rolled-out` opt-in (ADR-0066 R1).
+//! Turning both off needs none.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use ravel_catalog::{
-    DeclaredColumnType, DeclaredTypedColumn, TenantConfig, TenantConfigSetOutcome,
-    TenantLifecycleState, read_config, set_tenant_config, validate_typed_attr_columns,
+    DeclaredColumnType, DeclaredTypedColumn, StorageLayoutConfigError, StorageLayoutWrite,
+    TenantConfig, TenantConfigSetOutcome, TenantLifecycleState, read_config, set_tenant_config,
+    validate_typed_attr_columns,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_types::TenantId;
@@ -88,6 +99,19 @@ fn parse_spec(spec: &str) -> anyhow::Result<DeclaredTypedColumn> {
     })
 }
 
+/// The exact-key index part of a `set`: each field `None` keeps the stored
+/// value.
+#[derive(Debug, Clone, Default)]
+pub struct KeyIndexSpec {
+    /// The declared columns to index, replacing the stored list; `Some(vec![])`
+    /// turns the column index off.
+    pub columns: Option<Vec<String>>,
+    /// Whether the logs flush indexes `trace_id`.
+    pub index_trace_id: Option<bool>,
+    /// The operator's version-4 opt-in, required to turn either on.
+    pub write: StorageLayoutWrite,
+}
+
 /// The flag spelling for a declared type, so `show` reads back what `set` took.
 pub(crate) fn spelling(ty: DeclaredColumnType) -> &'static str {
     match ty {
@@ -106,7 +130,8 @@ pub(crate) fn spelling(ty: DeclaredColumnType) -> &'static str {
 /// (which replaces the default, including when it is explicitly empty).
 pub async fn show(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
-    match read_config(store.as_ref(), &tenant_hash).await? {
+    let record = read_config(store.as_ref(), &tenant_hash).await?;
+    match &record {
         None => {
             println!(
                 "no config record for tenant {tenant}: typed_attr_columns is unset, so this \
@@ -114,7 +139,7 @@ pub async fn show(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::R
                  (--typed-attr-column / --typed-attr-column-tenant)"
             );
         }
-        Some((config, _version)) => match config.typed_attr_columns {
+        Some((config, _version)) => match &config.typed_attr_columns {
             None => {
                 println!(
                     "tenant {tenant} has a config record but no typed_attr_columns override: \
@@ -133,13 +158,40 @@ pub async fn show(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::R
                      order:",
                     columns.len()
                 );
-                for column in &columns {
+                for column in columns {
                     println!("  {}:{}", column.key, spelling(column.ty));
                 }
             }
         },
     }
+    if let Some((config, _version)) = &record {
+        print_key_index(config)?;
+    }
     Ok(())
+}
+
+/// Prints the key-index columns and the `trace_id` setting.
+fn print_key_index(config: &TenantConfig) -> anyhow::Result<()> {
+    for line in key_index_lines(config)? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// The lines [`print_key_index`] prints, as `show` and `set` report them.
+fn key_index_lines(config: &TenantConfig) -> anyhow::Result<Vec<String>> {
+    let columns = config.key_index_columns()?;
+    let mut lines = Vec::with_capacity(columns.len() + 2);
+    if columns.is_empty() {
+        lines.push("key_index: none".to_string());
+    } else {
+        lines.push("key_index, in declaration order:".to_string());
+        for column in &columns {
+            lines.push(format!("  {}:{}", column.key, spelling(column.ty)));
+        }
+    }
+    lines.push(format!("index_trace_id: {}", config.index_trace_id()));
+    Ok(lines)
 }
 
 /// `typed-attr-column set <TENANT> [KEY:TYPE ...]`: replace the tenant's
@@ -154,17 +206,21 @@ pub async fn show(store: Arc<dyn ObjectStoreBackend>, tenant: &str) -> anyhow::R
 ///
 /// Declaration order is preserved verbatim: it is the order the columns are
 /// appended to the `logs` schema (ADR-0090 decision 3).
+///
+/// `key_index` replaces the exact-key index fields its set members name and
+/// keeps the others (see [`KeyIndexSpec`]).
 pub async fn set(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     specs: &[String],
+    key_index: &KeyIndexSpec,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     let mut columns = Vec::with_capacity(specs.len());
     for spec in specs {
         columns.push(parse_spec(spec)?);
     }
-    set_columns(store, tenant, columns, now_ns).await
+    set_columns(store, tenant, columns, key_index, now_ns).await
 }
 
 /// `typed-attr-column set <TENANT> --from-mapping <TOML>`: derive the
@@ -189,6 +245,7 @@ pub async fn set_from_mapping(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     mapping_path: &Path,
+    key_index: &KeyIndexSpec,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     let text = std::fs::read_to_string(mapping_path).map_err(|e| {
@@ -202,7 +259,7 @@ pub async fn set_from_mapping(
     for warning in &skipped {
         eprintln!("{warning}");
     }
-    set_columns(store, tenant, columns, now_ns).await
+    set_columns(store, tenant, columns, key_index, now_ns).await
 }
 
 /// The `DeclaredColumnType` a mapping `ColType` maps to, or `None` for `F64`
@@ -266,6 +323,7 @@ async fn set_columns(
     store: Arc<dyn ObjectStoreBackend>,
     tenant: &str,
     columns: Vec<DeclaredTypedColumn>,
+    key_index: &KeyIndexSpec,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     let tenant_hash = TenantId::new(tenant).hash();
@@ -277,7 +335,7 @@ async fn set_columns(
     // Carry every other field of the record through unchanged; see the module
     // docs on the read-modify-write window.
     let existing = read_config(store.as_ref(), &tenant_hash).await?;
-    let proposed = match existing {
+    let mut proposed = match existing {
         Some((config, _version)) => TenantConfig {
             typed_attr_columns: Some(columns.clone()),
             ..config
@@ -287,6 +345,7 @@ async fn set_columns(
             ..TenantConfig::new(TenantLifecycleState::Active)
         },
     };
+    apply_key_index(&mut proposed, key_index)?;
 
     match set_tenant_config(store.as_ref(), &tenant_hash, &proposed, now_ns).await? {
         TenantConfigSetOutcome::Created => {
@@ -313,10 +372,42 @@ async fn set_columns(
             println!("  {}:{}", column.key, spelling(column.ty));
         }
     }
+    print_key_index(&proposed)?;
     println!(
         "a query-serving process picks this up within its declared-column staleness horizon \
          (60s by default); no restart is needed"
     );
+    Ok(())
+}
+
+/// Applies `spec` to `proposed` and checks the result against the new
+/// declaration, before any write. A kept key-index column the new declaration
+/// no longer carries, or no longer declares i64, str or bytes, is refused here.
+fn apply_key_index(proposed: &mut TenantConfig, spec: &KeyIndexSpec) -> anyhow::Result<()> {
+    let opt_in_hint = |err: StorageLayoutConfigError| match err {
+        StorageLayoutConfigError::WriterCannotEmit { .. } => anyhow::anyhow!(
+            "{err}; from this command, pass --readers-rolled-out to turn the key index on"
+        ),
+        other => other.into(),
+    };
+    if let Some(columns) = &spec.columns {
+        proposed
+            .set_key_index_columns(columns.clone(), spec.write)
+            .map_err(opt_in_hint)?;
+    }
+    if let Some(on) = spec.index_trace_id {
+        proposed
+            .set_index_trace_id(on, spec.write)
+            .map_err(opt_in_hint)?;
+    }
+    proposed.key_index_columns().map_err(|err| {
+        anyhow::anyhow!(
+            "{err}; the stored key_index names a column this declaration drops or retypes, so \
+             pass --key-index with the columns to keep. A column kept under a new type is \
+             unindexed in compacted objects whose inputs mix the two types; it does not block \
+             compaction or erasure"
+        )
+    })?;
     Ok(())
 }
 
@@ -346,6 +437,262 @@ mod tests {
         list.iter().map(|s| (*s).to_string()).collect()
     }
 
+    /// The raw record's `format_version`.
+    async fn record_version(store: &dyn ObjectStoreBackend, tenant: &str) -> u32 {
+        use prost::Message;
+        let got = store
+            .get(
+                &ravel_catalog::config_key(&TenantId::new(tenant).hash()),
+                GetRange::Full,
+            )
+            .await
+            .expect("the record exists");
+        ravel_proto::sys::v1::TenantConfigRecord::decode(got.data)
+            .expect("the record decodes")
+            .format_version
+    }
+
+    fn key_index(
+        columns: Option<&[&str]>,
+        index_trace_id: Option<bool>,
+        write: StorageLayoutWrite,
+    ) -> KeyIndexSpec {
+        KeyIndexSpec {
+            columns: columns.map(specs),
+            index_trace_id,
+            write,
+        }
+    }
+
+    const KEYED: [&str; 3] = ["dur:i64", "svc:str", "blob:bytes"];
+
+    /// `--key-index` and `--index-trace-id` under `--readers-rolled-out` write
+    /// a version-4 record; the key-index columns read back in declaration
+    /// order, and the lines `show` and `set` print name each with its type.
+    #[tokio::test]
+    async fn key_index_flags_write_a_version_4_record_and_show_reports_them() {
+        let store = store();
+        set(
+            store.clone(),
+            "acme",
+            &specs(&KEYED),
+            &key_index(
+                Some(&["blob", "dur"]),
+                Some(true),
+                StorageLayoutWrite::ReadersRolledOut,
+            ),
+            1,
+        )
+        .await
+        .expect("an opted-in key index is written");
+
+        let config = durable(store.as_ref(), "acme").await.expect("present");
+        assert_eq!(
+            config.key_index_columns().expect("valid"),
+            vec![
+                DeclaredTypedColumn {
+                    key: "dur".into(),
+                    ty: DeclaredColumnType::I64
+                },
+                DeclaredTypedColumn {
+                    key: "blob".into(),
+                    ty: DeclaredColumnType::Bytes
+                },
+            ]
+        );
+        assert!(config.index_trace_id());
+        assert_eq!(record_version(store.as_ref(), "acme").await, 4);
+        assert_eq!(
+            key_index_lines(&config).expect("lines"),
+            [
+                "key_index, in declaration order:",
+                "  dur:i64",
+                "  blob:bytes",
+                "index_trace_id: true",
+            ]
+        );
+    }
+
+    /// A tenant with no key index reports both settings off, and its record
+    /// stays below version 4.
+    #[tokio::test]
+    async fn show_reports_no_key_index_and_the_record_stays_below_version_4() {
+        let store = store();
+        set(
+            store.clone(),
+            "acme",
+            &specs(&KEYED),
+            &KeyIndexSpec::default(),
+            1,
+        )
+        .await
+        .expect("written");
+        let config = durable(store.as_ref(), "acme").await.expect("present");
+        assert_eq!(
+            key_index_lines(&config).expect("lines"),
+            ["key_index: none", "index_trace_id: false"]
+        );
+        assert!(record_version(store.as_ref(), "acme").await < 4);
+    }
+
+    /// Turning either index on without `--readers-rolled-out` is refused with
+    /// the flag named, and nothing is written.
+    #[tokio::test]
+    async fn turning_the_key_index_on_without_the_opt_in_writes_nothing() {
+        let store = store();
+        for spec in [
+            key_index(Some(&["dur"]), None, StorageLayoutWrite::Disabled),
+            key_index(None, Some(true), StorageLayoutWrite::Disabled),
+        ] {
+            let err = set(store.clone(), "acme", &specs(&KEYED), &spec, 1)
+                .await
+                .expect_err("no opt-in must be refused");
+            assert!(
+                err.to_string().contains("pass --readers-rolled-out"),
+                "the error names the flag: {err}"
+            );
+            assert!(
+                durable(store.as_ref(), "acme").await.is_none(),
+                "a refused set wrote a record ({spec:?})"
+            );
+        }
+    }
+
+    /// A bool column, an undeclared column and a column named twice are each
+    /// refused before any write.
+    #[tokio::test]
+    async fn an_ineligible_key_index_column_writes_nothing() {
+        let store = store();
+        for (columns, expected) in [
+            (&["flag"][..], "i64, str and bytes columns only"),
+            (&["nope"][..], "is not a declared typed attribute column"),
+            (&["dur", "dur"][..], "more than once"),
+        ] {
+            let err = set(
+                store.clone(),
+                "acme",
+                &specs(&["dur:i64", "flag:bool"]),
+                &key_index(Some(columns), None, StorageLayoutWrite::ReadersRolledOut),
+                1,
+            )
+            .await
+            .expect_err("an ineligible column must be refused");
+            assert!(
+                err.to_string().contains(expected),
+                "{columns:?}: expected {expected:?} in {err}"
+            );
+            assert!(durable(store.as_ref(), "acme").await.is_none());
+        }
+    }
+
+    /// An omitted flag keeps the stored value; `--key-index` with no value and
+    /// `--index-trace-id false` turn both off without the opt-in.
+    #[tokio::test]
+    async fn omitted_key_index_flags_keep_the_stored_values_and_off_needs_no_opt_in() {
+        let store = store();
+        set(
+            store.clone(),
+            "acme",
+            &specs(&KEYED),
+            &key_index(
+                Some(&["svc"]),
+                Some(true),
+                StorageLayoutWrite::ReadersRolledOut,
+            ),
+            1,
+        )
+        .await
+        .expect("on");
+
+        set(
+            store.clone(),
+            "acme",
+            &specs(&KEYED),
+            &KeyIndexSpec::default(),
+            2,
+        )
+        .await
+        .expect("a set without the flags");
+        let kept = durable(store.as_ref(), "acme").await.expect("present");
+        assert_eq!(
+            key_index_lines(&kept).expect("lines"),
+            [
+                "key_index, in declaration order:",
+                "  svc:str",
+                "index_trace_id: true"
+            ]
+        );
+        assert_eq!(record_version(store.as_ref(), "acme").await, 4);
+
+        set(
+            store.clone(),
+            "acme",
+            &specs(&KEYED),
+            &key_index(Some(&[]), Some(false), StorageLayoutWrite::Disabled),
+            3,
+        )
+        .await
+        .expect("turning both off needs no opt-in");
+        let off = durable(store.as_ref(), "acme").await.expect("present");
+        assert_eq!(
+            key_index_lines(&off).expect("lines"),
+            ["key_index: none", "index_trace_id: false"]
+        );
+        assert!(record_version(store.as_ref(), "acme").await < 4);
+    }
+
+    /// A declaration that drops a kept key-index column is refused with the
+    /// remedy named, and the stored record is unchanged.
+    #[tokio::test]
+    async fn dropping_a_kept_key_index_column_is_refused() {
+        let store = store();
+        set(
+            store.clone(),
+            "acme",
+            &specs(&KEYED),
+            &key_index(Some(&["dur"]), None, StorageLayoutWrite::ReadersRolledOut),
+            1,
+        )
+        .await
+        .expect("on");
+        let before = durable(store.as_ref(), "acme").await.expect("present");
+
+        let err = set(
+            store.clone(),
+            "acme",
+            &specs(&["svc:str"]),
+            &KeyIndexSpec::default(),
+            2,
+        )
+        .await
+        .expect_err("a dropped key-index column must be refused");
+        assert!(
+            err.to_string().contains("pass --key-index"),
+            "the error names the remedy: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("it does not block compaction or erasure"),
+            "the error says what a retype costs: {err}"
+        );
+        assert_eq!(durable(store.as_ref(), "acme").await, Some(before));
+
+        // The remedy works for a retype: naming the column keeps it indexed
+        // under its new type.
+        set(
+            store.clone(),
+            "acme",
+            &specs(&["dur:str"]),
+            &key_index(Some(&["dur"]), None, StorageLayoutWrite::ReadersRolledOut),
+            3,
+        )
+        .await
+        .expect("a retyped column named in --key-index is kept");
+        let lines = key_index_lines(&durable(store.as_ref(), "acme").await.expect("present"))
+            .expect("lines");
+        assert!(lines.contains(&"  dur:str".to_string()), "{lines:?}");
+    }
+
     /// `set` then `show` round-trips exactly what was set, in order, and `show`
     /// on an untouched tenant reports it unset.
     #[tokio::test]
@@ -359,6 +706,7 @@ mod tests {
             store.clone(),
             "acme",
             &specs(&["http.duration_ms:i64", "cache.hit:BOOL", "payload:bytes"]),
+            &KeyIndexSpec::default(),
             1_000,
         )
         .await
@@ -410,12 +758,24 @@ mod tests {
         .await
         .expect("seed the record");
 
-        set(store.clone(), "acme", &specs(&["a:i64", "b:str"]), 2)
-            .await
-            .expect("first set");
-        set(store.clone(), "acme", &specs(&["c:bool"]), 3)
-            .await
-            .expect("second set replaces the first");
+        set(
+            store.clone(),
+            "acme",
+            &specs(&["a:i64", "b:str"]),
+            &KeyIndexSpec::default(),
+            2,
+        )
+        .await
+        .expect("first set");
+        set(
+            store.clone(),
+            "acme",
+            &specs(&["c:bool"]),
+            &KeyIndexSpec::default(),
+            3,
+        )
+        .await
+        .expect("second set replaces the first");
 
         let config = durable(store.as_ref(), "acme").await.expect("present");
         assert_eq!(
@@ -440,7 +800,7 @@ mod tests {
     #[tokio::test]
     async fn set_with_no_specs_writes_an_explicit_empty_declaration() {
         let store = store();
-        set(store.clone(), "acme", &[], 1)
+        set(store.clone(), "acme", &[], &KeyIndexSpec::default(), 1)
             .await
             .expect("an empty declaration is valid");
         assert_eq!(
@@ -470,7 +830,7 @@ mod tests {
             specs(&["dur"]),                // no type
             specs(&["dur:f64"]),            // deferred type
         ] {
-            let err = set(store.clone(), "acme", &bad, 1)
+            let err = set(store.clone(), "acme", &bad, &KeyIndexSpec::default(), 1)
                 .await
                 .expect_err("an invalid declaration must be refused");
             assert!(
@@ -483,12 +843,24 @@ mod tests {
             .expect("show still reports the tenant unset");
 
         // Against a tenant with a good declaration: it survives untouched.
-        set(store.clone(), "acme", &specs(&["good:i64"]), 2)
-            .await
-            .expect("a valid declaration is written");
-        let err = set(store.clone(), "acme", &specs(&["attrs:str"]), 3)
-            .await
-            .expect_err("a fixed-column collision must be refused");
+        set(
+            store.clone(),
+            "acme",
+            &specs(&["good:i64"]),
+            &KeyIndexSpec::default(),
+            2,
+        )
+        .await
+        .expect("a valid declaration is written");
+        let err = set(
+            store.clone(),
+            "acme",
+            &specs(&["attrs:str"]),
+            &KeyIndexSpec::default(),
+            3,
+        )
+        .await
+        .expect_err("a fixed-column collision must be refused");
         assert!(
             err.to_string().contains("fixed logs SQL column"),
             "the error names the rule: {err}"
@@ -518,9 +890,15 @@ mod tests {
         let inner = store();
         let tenant = "acme";
         // Seed a record so both writers read a real version to swap against.
-        set(inner.clone(), tenant, &specs(&["seed:i64"]), 1)
-            .await
-            .expect("seed");
+        set(
+            inner.clone(),
+            tenant,
+            &specs(&["seed:i64"]),
+            &KeyIndexSpec::default(),
+            1,
+        )
+        .await
+        .expect("seed");
 
         // One config PUT per `set`, two writers: two arrivals at the gate,
         // both after their reads.
@@ -531,11 +909,29 @@ mod tests {
 
         let a = tokio::spawn({
             let store = gated.clone();
-            async move { set(store, "acme", &specs(&["a:i64"]), 10).await }
+            async move {
+                set(
+                    store,
+                    "acme",
+                    &specs(&["a:i64"]),
+                    &KeyIndexSpec::default(),
+                    10,
+                )
+                .await
+            }
         });
         let b = tokio::spawn({
             let store = gated.clone();
-            async move { set(store, "acme", &specs(&["b:str"]), 11).await }
+            async move {
+                set(
+                    store,
+                    "acme",
+                    &specs(&["b:str"]),
+                    &KeyIndexSpec::default(),
+                    11,
+                )
+                .await
+            }
         });
         let (ra, rb) = (a.await.expect("join a"), b.await.expect("join b"));
 
@@ -659,7 +1055,7 @@ column = "status"
 type = "i64"
 "#,
         );
-        set_from_mapping(store.clone(), "acme", &path, 1)
+        set_from_mapping(store.clone(), "acme", &path, &KeyIndexSpec::default(), 1)
             .await
             .expect("a mapping-derived declaration is written");
 
@@ -754,7 +1150,7 @@ column = "latency"
 type = "f64"
 "#,
         );
-        set_from_mapping(store.clone(), "acme", &path, 1)
+        set_from_mapping(store.clone(), "acme", &path, &KeyIndexSpec::default(), 1)
             .await
             .expect("the rest is still written after skipping the f64 key");
         assert_eq!(
@@ -791,7 +1187,7 @@ column = "dur_rec"
 type = "i64"
 "#,
         );
-        let err = set_from_mapping(store.clone(), "acme", &path, 1)
+        let err = set_from_mapping(store.clone(), "acme", &path, &KeyIndexSpec::default(), 1)
             .await
             .expect_err("a key declared twice must be refused");
         assert!(
@@ -810,9 +1206,15 @@ type = "i64"
     #[tokio::test]
     async fn the_record_is_written_under_the_tenants_own_prefix() {
         let store = store();
-        set(store.clone(), "acme", &specs(&["dur:i64"]), 1)
-            .await
-            .expect("set");
+        set(
+            store.clone(),
+            "acme",
+            &specs(&["dur:i64"]),
+            &KeyIndexSpec::default(),
+            1,
+        )
+        .await
+        .expect("set");
         let hash: TenantHash = TenantId::new("acme").hash();
         assert!(
             read_config(store.as_ref(), &hash)

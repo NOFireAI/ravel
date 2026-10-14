@@ -117,6 +117,7 @@ fn raw_record(
                         DeclaredColumnType::Bool => sysproto::TypedAttrColumnType::Bool,
                         DeclaredColumnType::Bytes => sysproto::TypedAttrColumnType::Bytes,
                     } as i32,
+                    key_index: false,
                 })
                 .collect(),
         }),

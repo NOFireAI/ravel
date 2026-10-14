@@ -1756,6 +1756,49 @@ pairs get a real column at write time. Pairs beyond the budget go into an
 overflow column and lose columnar access. Watch for that in
 [the observability guide](../observability.md).
 
+### Exact-key index fields
+
+A tenant can name declared typed columns, and `trace_id`, for an exact-key
+index. The logs flush then writes a KEY_IDX section into each log object
+that lists, for every distinct value of each named field, the blocks that
+hold it. Compaction and the erasure rewrite rebuild it. It targets
+high-cardinality keys (a request id, a user id, a trace id) that the
+POSTINGS index drops. **No query reads the index yet**, so today it costs
+bytes and saves nothing.
+
+```sh
+ravel-cli typed-attr-column set <tenant> request.id:str user.id:i64 \
+  --key-index request.id,user.id --index-trace-id true --readers-rolled-out
+ravel-cli typed-attr-column show <tenant>
+```
+
+- `--key-index KEY`, repeated or comma-separated, replaces the indexed
+  column list. Each key must be in the declaration that the same command
+  writes, typed `str`, `i64` or `bytes`. A `bool` column is refused. At most
+  63 columns, one KEY_IDX field being kept for `trace_id`, and each key at
+  most 128 bytes.
+- `--index-trace-id true|false` indexes the fixed `trace_id` column.
+- `--no-key-index` turns the column index off.
+- An omitted flag keeps the stored value. A new declaration that drops or
+  retypes a kept key-index column is refused; pass `--key-index` with the
+  columns to keep. A column kept under a new type is unindexed in compacted
+  log objects whose inputs mix the two types. When the inputs of one
+  compaction together name more than 64 fields, the output keeps
+  `trace_id` and then the names that sort first, so an unchanged column can
+  be the one left unindexed. Neither blocks compaction or erasure; a query
+  on an unindexed column reads the object instead of probing its index.
+- **Turning either index on needs `--readers-rolled-out`.** The setting
+  needs tenant config record version 4. A process on a release that does not
+  read version 4 refuses the record, and that tenant's ingest and lifecycle
+  fail closed. Upgrade every process that reads the bucket first. Turning
+  both off needs no opt-in.
+
+Every refusal writes nothing. `show` and `set` print the indexed columns
+(or `key_index: none`) and `index_trace_id`. A change reaches log objects
+that the flush writes after the ingest process reads the new record. An
+object written before keeps its own field list, and
+[`rlog inspect`](../inspecting-data.md#rlog-inspect) prints it.
+
 ## Per-query budgets
 
 Six flags bound what one query can spend. Unset, each resolves at startup:

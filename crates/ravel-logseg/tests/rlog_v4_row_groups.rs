@@ -123,6 +123,7 @@ struct Section {
     stored: Vec<u8>,
     comp: u8,
     uncomp_len: u64,
+    prefix_len: u32,
 }
 
 /// Splits an object into its footer and its sections' stored bytes.
@@ -139,6 +140,7 @@ fn explode(object: &[u8]) -> (LogFooter, Vec<Section>) {
                 stored: object[start..end].to_vec(),
                 comp: d.comp,
                 uncomp_len: d.uncomp_len,
+                prefix_len: d.prefix_len,
             }
         })
         .collect();
@@ -169,6 +171,7 @@ fn assemble_versioned(mut footer: LogFooter, sections: &[Section], version: u16)
             crc32c: crc32c::crc32c(&s.stored),
             comp: s.comp,
             uncomp_len: s.uncomp_len,
+            prefix_len: s.prefix_len,
         });
     }
     footer.sections = descs;

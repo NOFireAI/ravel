@@ -108,6 +108,7 @@ async fn an_unresolved_key_warns_once_per_refresh() {
             columns: vec![TypedAttrColumn {
                 key: "region".to_string(),
                 r#type: TypedAttrColumnType::Str as i32,
+                key_index: false,
             }],
         }),
         clustering_key: Some(ClusteringKeyConfig {

@@ -297,6 +297,7 @@ async fn a_cli_written_declaration_reaches_a_real_sql_query_as_a_typed_column() 
         Arc::clone(&store),
         TENANT,
         &["dur:i64".to_string()],
+        &ravel_cli::typed_attr_column::KeyIndexSpec::default(),
         CLOCK_NS,
     )
     .await
@@ -430,9 +431,15 @@ async fn an_explicitly_empty_declaration_overrides_the_cli_default() {
     );
 
     // An explicitly empty durable declaration takes the column away.
-    ravel_cli::typed_attr_column::set(Arc::clone(&store), TENANT, &[], CLOCK_NS)
-        .await
-        .expect("an empty declaration is a valid write");
+    ravel_cli::typed_attr_column::set(
+        Arc::clone(&store),
+        TENANT,
+        &[],
+        &ravel_cli::typed_attr_column::KeyIndexSpec::default(),
+        CLOCK_NS,
+    )
+    .await
+    .expect("an empty declaration is a valid write");
     clock.fetch_add(TEST_HORIZON_NS * 4, Ordering::SeqCst);
 
     let (status, body) = post_sql(&app, "SELECT dur FROM logs").await;

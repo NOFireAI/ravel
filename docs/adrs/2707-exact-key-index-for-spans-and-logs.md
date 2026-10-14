@@ -544,7 +544,9 @@ flowchart LR
   completion is settled by #1848 for both object kinds. Until a rewrite
   lands, the pending-erasure predicate filters rows after the index, so the
   index never surfaces an erased subject in a result.
-- **Compaction.** Every object carries KEY_IDX, L0 and L1 alike. For RSPAN
+- **Compaction.** Every object carries KEY_IDX, L0 and L1 alike, except an
+  RLOG object all of whose fields were left out under the T8 compaction
+  amendment below, which carries none and is read as unindexed. For RSPAN
   that follows from the shared flush pipeline (`RspanWriter::finish_compacted`
   builds `trace_id` from rows). For RLOG the indexed set is a builder input
   (`RlogWriter::with_key_index_fields`), so the compactor recovers it the
@@ -554,7 +556,10 @@ flowchart LR
   recovered set, since an index over the surviving rows is still exact and
   an unstamped rewrite would leave the part uncovered for good. T8 owns
   both paths in `ravel-maintain`, with a test that a compacted and an
-  erasure-rewritten object each carry every input's fields. When the
+  erasure-rewritten object each carry every input's fields that can be
+  merged (a field the inputs name under different key types, or one past
+  the field cap, is left uncovered: see the T8 compaction amendment
+  below). When the
   compaction record lands, the fold
   re-encodes the part and rebuilds its leaves from the new entry set.
   Rebuilding reads the sections again (about 2% of a logs part's bytes and
@@ -901,5 +906,27 @@ endpoint passes `start: 0`, as the traces guide says. Two behaviours
 decision 12 left open are now fixed by the shipped code: on the HTTP route
 `start` and `end` choose which objects are read and filter no rows, as on
 the SQL endpoint, while the MCP tool's time range also filters rows.
+
+## Amendment (issue #2759): T8 leaves an unmergeable field uncovered instead of refusing the merge
+
+<!-- amendment-applies: sections="6. Erasure, compaction and resharding" pointer="T8 compaction amendment" -->
+
+Decision 6 has the RLOG compactor and the erasure rewrite carry the union
+of their inputs' KEY_IDX fields. Two cases cannot be carried, and refusing
+the merge in either would wedge that bucket for good, because the inputs
+are immutable and the refusal repeats on every retry, and the erasure
+rewrite would never complete a physical deletion. A field the inputs name
+under different key types (a column retyped while a bucket was open) is
+left out of the output's index. A union over the writer's field cap (a
+column swapped at the cap) keeps `trace_id` first, then names in ascending
+byte order up to the cap. The RLOG writer likewise leaves out of an
+object's index a field one of whose buckets would exceed
+`KEY_IDX_BUCKET_MAX_ENTRIES`, since the bucket mix is invertible for
+`I64` keys and a sender can choose values that fill one bucket. Each
+dropped field is logged. All three are exact under decision 1: a field an
+object's header does not name is uncovered there, the probe declines, and
+the object is read as unindexed for that field. RSPAN cannot drop its one
+mandatory field, so the same bucket overflow there is tracked separately
+as issue #2985.
 
 Refs: #2707, #849, #2680, #1848, #1869, #1987, #1382

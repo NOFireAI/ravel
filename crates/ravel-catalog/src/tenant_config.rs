@@ -42,7 +42,9 @@ use ravel_types::TenantHash;
 /// stamps on a record that carries neither `clustering_key` (field 13) nor a
 /// non-default `bloom_scope` (field 14). A record carrying either is stamped
 /// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`] instead, and only the
-/// opted-in storage-layout setters can put either field on a config.
+/// opted-in storage-layout setters can put either field on a config. A record
+/// carrying a key-index declaration is stamped
+/// [`TENANT_CONFIG_KEY_INDEX_WRITER_VERSION`].
 ///
 /// ADR-0066 R2 raised this from 1 to 2, the writer half of the
 /// readers-before-writers sequence R1 opened. Version 2 carries the same field
@@ -72,26 +74,41 @@ pub const TENANT_CONFIG_FORMAT_VERSION: u32 = 2;
 /// writer stamps 3 by default. Until then a version-3 record is written only on
 /// demand, behind the operator opt-in [`StorageLayoutWrite::ReadersRolledOut`].
 /// The two constants are separate so the writer flip changes only the writer's.
-pub const TENANT_CONFIG_MAX_READ_VERSION: u32 = 3;
+///
+/// Version 4 (ADR-2707, `TypedAttrColumn.key_index` and `index_trace_id` field
+/// 15) repeats it once more: this ceiling is 4 while the default writer version
+/// stays 2, and a version-4 record is written only behind the same opt-in.
+pub const TENANT_CONFIG_MAX_READ_VERSION: u32 = 4;
 
 /// The record version that carries `clustering_key` (field 13) and
 /// `bloom_scope` (field 14). [`set_tenant_config`] stamps it on a record that
-/// carries either field. [`TenantConfig::set_clustering_key`],
+/// carries either field and no key-index declaration.
+/// [`TenantConfig::set_clustering_key`],
 /// [`TenantConfig::clear_clustering_key`] and [`TenantConfig::set_bloom_scope`]
 /// refuse with [`StorageLayoutConfigError::WriterCannotEmit`] unless given
+/// [`StorageLayoutWrite::ReadersRolledOut`].
+pub const TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION: u32 = 3;
+
+/// The record version that carries the exact-key index declaration (ADR-2707):
+/// `TypedAttrColumn.key_index` and `index_trace_id` (field 15).
+/// [`set_tenant_config`] stamps it on a record that carries a key-indexed column
+/// or `index_trace_id`, whatever else the record carries.
+/// [`TenantConfig::set_key_index_columns`] and
+/// [`TenantConfig::set_index_trace_id`] refuse to turn either on with
+/// [`StorageLayoutConfigError::WriterCannotEmit`] unless given
 /// [`StorageLayoutWrite::ReadersRolledOut`].
 ///
 /// It is also the highest version a whole-record rewrite reproduces, since this
 /// build models every field of it, so [`set_tenant_config`] refuses to rewrite a
 /// record declaring a version above it rather than strip a field it does not
 /// model (ADR-0066 decision 5).
-pub const TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION: u32 = 3;
+pub const TENANT_CONFIG_KEY_INDEX_WRITER_VERSION: u32 = 4;
 
-/// The operator's opt-in to write a version-3 record (ADR-2135 decision 7,
-/// ADR-0066 R1). The version-3 reader has not shipped in a release, so a
-/// version-3 record written today is refused by any process still running an
-/// older release. The storage-layout setters take this token so that writing one
-/// is a named decision, never a default.
+/// The operator's opt-in to write a version-3 or version-4 record (ADR-2135
+/// decision 7, ADR-2707, ADR-0066 R1). Neither reader has shipped in a release,
+/// so such a record written today is refused by any process still running an
+/// older release. The storage-layout and key-index setters take this token so
+/// that writing one is a named decision, never a default.
 ///
 /// The token records a decision its caller makes, the operator's CLI once one
 /// sets these fields; it does not enforce one. Nothing here checks which
@@ -107,7 +124,8 @@ pub enum StorageLayoutWrite {
     #[default]
     Disabled,
     /// The operator states that every process reading this bucket's tenant
-    /// config records runs a release whose reader accepts version 3.
+    /// config records runs a release whose reader accepts the version the
+    /// written field needs: 3 for the storage layout, 4 for the key index.
     ReadersRolledOut,
 }
 
@@ -462,10 +480,42 @@ impl StoredBloomScope {
 
 /// The opt-in a value decoded from a record of `format_version` carries.
 fn decoded_write(format_version: u32) -> StorageLayoutWrite {
-    if format_version >= TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION {
+    decoded_write_at(format_version, TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION)
+}
+
+/// The opt-in a value that needs record version `required` carries when decoded
+/// from a record of `format_version`.
+fn decoded_write_at(format_version: u32, required: u32) -> StorageLayoutWrite {
+    if format_version >= required {
         StorageLayoutWrite::ReadersRolledOut
     } else {
         StorageLayoutWrite::Disabled
+    }
+}
+
+/// The exact-key index declaration exactly as the record stores it (ADR-2707):
+/// the declared typed columns whose `key_index` flag is set, and
+/// `index_trace_id`. Opaque, like [`StoredClusteringKey`]: read it through
+/// [`TenantConfig::key_index_columns`] and [`TenantConfig::index_trace_id`],
+/// change it only through [`TenantConfig::set_key_index_columns`] and
+/// [`TenantConfig::set_index_trace_id`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StoredKeyIndex {
+    /// Keys of the declared typed columns flagged `key_index`. A set: the record
+    /// carries the flag on each column, so order is the declaration's.
+    columns: std::collections::BTreeSet<String>,
+    /// The opt-in `columns` was produced under; `Disabled` when it is empty.
+    columns_write: StorageLayoutWrite,
+    trace_id: bool,
+    /// The opt-in `trace_id` was produced under; `Disabled` when it is false.
+    trace_id_write: StorageLayoutWrite,
+}
+
+impl StoredKeyIndex {
+    /// Whether the record carries any part of the declaration, which stamps it
+    /// [`TENANT_CONFIG_KEY_INDEX_WRITER_VERSION`].
+    fn is_set(&self) -> bool {
+        !self.columns.is_empty() || self.trace_id
     }
 }
 
@@ -583,6 +633,39 @@ pub enum StorageLayoutConfigError {
          config was not read from the current record"
     )]
     BloomScopeChangedWithoutGeneration { generation: u64 },
+    /// A key-index column is not in the config record's own
+    /// `typed_attr_columns`, where the record carries the flag.
+    #[error(
+        "key-index column {column:?} is not a declared typed attribute column in this tenant's \
+         config record: declare it in the record's typed_attr_columns first"
+    )]
+    UndeclaredKeyIndexColumn { column: String },
+    /// A key-index column is declared with a type the exact-key index does not
+    /// cover. Eligible types are i64, str and bytes.
+    #[error(
+        "typed attribute column {column:?} is declared {ty:?}, which the exact-key index does \
+         not cover: key_index applies to i64, str and bytes columns only"
+    )]
+    KeyIndexIneligibleType {
+        column: String,
+        ty: DeclaredColumnType,
+    },
+    /// [`TenantConfig::set_key_index_columns`] was given the same column twice.
+    #[error("the key-index column list names {column:?} more than once")]
+    DuplicateKeyIndexColumn { column: String },
+    /// More key-index columns than one KEY_IDX section can name alongside
+    /// `trace_id`.
+    #[error(
+        "{count} key-index columns exceed the limit of {max}: a KEY_IDX section names at most 64 \
+         fields, one of them reserved for trace_id"
+    )]
+    TooManyKeyIndexColumns { count: usize, max: usize },
+    /// A key-index column's key is longer than a KEY_IDX field name may be.
+    #[error(
+        "key-index column key of {len} bytes exceeds the limit of {max}: a KEY_IDX field name \
+         is at most {max} bytes"
+    )]
+    KeyIndexColumnKeyTooLong { len: usize, max: usize },
     /// A storage-layout field was set, or reached [`set_tenant_config`],
     /// without [`StorageLayoutWrite::ReadersRolledOut`]. The message names the
     /// setter that produces the field, which is the only remediation:
@@ -672,10 +755,23 @@ fn check_opted_in(
         StorageLayoutWrite::Disabled => Err(StorageLayoutConfigError::WriterCannotEmit {
             field,
             writer_version: TENANT_CONFIG_FORMAT_VERSION,
-            required: TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION,
+            required: required_version_for(field),
         }),
     }
 }
+
+/// The record version a record carrying `field` is stamped.
+fn required_version_for(field: &str) -> u32 {
+    match field {
+        KEY_INDEX_FIELD | INDEX_TRACE_ID_FIELD => TENANT_CONFIG_KEY_INDEX_WRITER_VERSION,
+        _ => TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION,
+    }
+}
+
+/// The field names [`StorageLayoutConfigError::WriterCannotEmit`] reports for
+/// the key-index declaration.
+const KEY_INDEX_FIELD: &str = "key_index";
+const INDEX_TRACE_ID_FIELD: &str = "index_trace_id";
 
 /// The setters that produce the storage-layout `field`, for
 /// [`StorageLayoutConfigError::WriterCannotEmit`]'s message.
@@ -685,6 +781,8 @@ fn setter_for(field: &str) -> &'static str {
             "TenantConfig::set_clustering_key or TenantConfig::clear_clustering_key"
         }
         "bloom_scope" => "TenantConfig::set_bloom_scope",
+        KEY_INDEX_FIELD => "TenantConfig::set_key_index_columns",
+        INDEX_TRACE_ID_FIELD => "TenantConfig::set_index_trace_id",
         _ => "the field's TenantConfig setter",
     }
 }
@@ -692,6 +790,53 @@ fn setter_for(field: &str) -> &'static str {
 /// The declared type of `column` in `columns`, if it is declared.
 fn declared_type(columns: &[DeclaredTypedColumn], column: &str) -> Option<DeclaredColumnType> {
     columns.iter().find(|d| d.key == column).map(|d| d.ty)
+}
+
+/// The most typed attribute columns that may carry `key_index`: a KEY_IDX
+/// section names at most 64 fields, and one is kept for `trace_id`.
+pub const MAX_KEY_INDEX_COLUMNS: usize = 63;
+
+/// The longest key a key-index column may have: a KEY_IDX field name is at
+/// most 128 bytes.
+pub const MAX_KEY_INDEX_COLUMN_KEY_LEN: usize = 128;
+
+/// Refuse a key-index column `declared` does not carry, carries as a type the
+/// exact-key index does not cover (ADR-2707: i64, str and bytes), or whose key
+/// is too long to name a KEY_IDX field.
+fn validate_key_index_columns(
+    columns: &std::collections::BTreeSet<String>,
+    declared: &[DeclaredTypedColumn],
+) -> Result<(), StorageLayoutConfigError> {
+    if columns.len() > MAX_KEY_INDEX_COLUMNS {
+        return Err(StorageLayoutConfigError::TooManyKeyIndexColumns {
+            count: columns.len(),
+            max: MAX_KEY_INDEX_COLUMNS,
+        });
+    }
+    for column in columns {
+        if column.len() > MAX_KEY_INDEX_COLUMN_KEY_LEN {
+            return Err(StorageLayoutConfigError::KeyIndexColumnKeyTooLong {
+                len: column.len(),
+                max: MAX_KEY_INDEX_COLUMN_KEY_LEN,
+            });
+        }
+        match declared_type(declared, column) {
+            None => {
+                return Err(StorageLayoutConfigError::UndeclaredKeyIndexColumn {
+                    column: column.clone(),
+                });
+            }
+            Some(DeclaredColumnType::Bool) => {
+                return Err(StorageLayoutConfigError::KeyIndexIneligibleType {
+                    column: column.clone(),
+                    ty: DeclaredColumnType::Bool,
+                });
+            }
+            Some(DeclaredColumnType::I64 | DeclaredColumnType::Str | DeclaredColumnType::Bytes) => {
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A tenant's durable config, decoded into a plain struct so consumers (the
@@ -734,6 +879,12 @@ pub struct TenantConfig {
     /// through [`TenantConfig::bloom_scope`]; change it only through
     /// [`TenantConfig::set_bloom_scope`].
     pub stored_bloom_scope: StoredBloomScope,
+    /// The stored exact-key index declaration (ADR-2707, record version 4).
+    /// Read it through [`TenantConfig::key_index_columns`] and
+    /// [`TenantConfig::index_trace_id`]; change it only through
+    /// [`TenantConfig::set_key_index_columns`] and
+    /// [`TenantConfig::set_index_trace_id`].
+    pub stored_key_index: StoredKeyIndex,
 }
 
 impl TenantConfig {
@@ -752,7 +903,82 @@ impl TenantConfig {
             typed_attr_columns: None,
             stored_clustering_key: None,
             stored_bloom_scope: StoredBloomScope::default(),
+            stored_key_index: StoredKeyIndex::default(),
         }
+    }
+
+    /// The declared typed columns the logs flush writes into the RLOG KEY_IDX
+    /// section (ADR-2707 decision 3), in this config's declaration order. Each
+    /// key-index column must be in this config's own `typed_attr_columns` and
+    /// declared i64, str or bytes; otherwise the first offending column is
+    /// refused with [`StorageLayoutConfigError::UndeclaredKeyIndexColumn`] or
+    /// [`StorageLayoutConfigError::KeyIndexIneligibleType`].
+    pub fn key_index_columns(&self) -> Result<Vec<DeclaredTypedColumn>, StorageLayoutConfigError> {
+        validate_key_index_columns(&self.stored_key_index.columns, self.own_typed_columns())?;
+        Ok(self
+            .own_typed_columns()
+            .iter()
+            .filter(|column| self.stored_key_index.columns.contains(&column.key))
+            .cloned()
+            .collect())
+    }
+
+    /// Whether the logs flush adds `trace_id` to the RLOG KEY_IDX section
+    /// (ADR-2707 decision 6, record field 15).
+    pub fn index_trace_id(&self) -> bool {
+        self.stored_key_index.trace_id
+    }
+
+    /// Replace the set of key-index columns with `columns`, each the key of a
+    /// typed attribute column in this config's own `typed_attr_columns`,
+    /// declared i64, str or bytes. An empty list turns the column index off and
+    /// needs no opt-in. A column named twice, undeclared, or of another type is
+    /// refused with the matching [`StorageLayoutConfigError`]; then a non-empty
+    /// list is refused with [`StorageLayoutConfigError::WriterCannotEmit`]
+    /// unless `write` is [`StorageLayoutWrite::ReadersRolledOut`]. On any error
+    /// the config is unchanged.
+    pub fn set_key_index_columns(
+        &mut self,
+        columns: Vec<String>,
+        write: StorageLayoutWrite,
+    ) -> Result<(), StorageLayoutConfigError> {
+        let mut set = std::collections::BTreeSet::new();
+        for column in columns {
+            if set.contains(&column) {
+                return Err(StorageLayoutConfigError::DuplicateKeyIndexColumn { column });
+            }
+            set.insert(column);
+        }
+        validate_key_index_columns(&set, self.own_typed_columns())?;
+        let columns_write = if set.is_empty() {
+            StorageLayoutWrite::Disabled
+        } else {
+            check_opted_in(KEY_INDEX_FIELD, write)?;
+            write
+        };
+        self.stored_key_index.columns = set;
+        self.stored_key_index.columns_write = columns_write;
+        Ok(())
+    }
+
+    /// Turn the `trace_id` key index on or off. Turning it on is refused with
+    /// [`StorageLayoutConfigError::WriterCannotEmit`] unless `write` is
+    /// [`StorageLayoutWrite::ReadersRolledOut`], leaving the config unchanged;
+    /// turning it off needs no opt-in.
+    pub fn set_index_trace_id(
+        &mut self,
+        on: bool,
+        write: StorageLayoutWrite,
+    ) -> Result<(), StorageLayoutConfigError> {
+        let trace_id_write = if on {
+            check_opted_in(INDEX_TRACE_ID_FIELD, write)?;
+            write
+        } else {
+            StorageLayoutWrite::Disabled
+        };
+        self.stored_key_index.trace_id = on;
+        self.stored_key_index.trace_id_write = trace_id_write;
+        Ok(())
     }
 
     /// The tenant's clustering-key state, validated against this config's own
@@ -972,10 +1198,14 @@ impl TenantConfig {
     }
 
     /// The format version [`build_record`] stamps for this config:
+    /// [`TENANT_CONFIG_KEY_INDEX_WRITER_VERSION`] when it carries a key-index
+    /// column or `index_trace_id`, else
     /// [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`] when it carries field 13
     /// or a nonzero field 14, else [`TENANT_CONFIG_FORMAT_VERSION`].
     fn record_format_version(&self) -> u32 {
-        if self.stored_clustering_key.is_some() || self.stored_bloom_scope.is_set() {
+        if self.stored_key_index.is_set() {
+            TENANT_CONFIG_KEY_INDEX_WRITER_VERSION
+        } else if self.stored_clustering_key.is_some() || self.stored_bloom_scope.is_set() {
             TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION
         } else {
             TENANT_CONFIG_FORMAT_VERSION
@@ -991,6 +1221,13 @@ impl TenantConfig {
         }
         if self.stored_bloom_scope.is_set() {
             check_opted_in("bloom_scope", self.stored_bloom_scope.write)?;
+        }
+        let key_index = &self.stored_key_index;
+        if !key_index.columns.is_empty() {
+            check_opted_in(KEY_INDEX_FIELD, key_index.columns_write)?;
+        }
+        if key_index.trace_id {
+            check_opted_in(INDEX_TRACE_ID_FIELD, key_index.trace_id_write)?;
         }
         Ok(())
     }
@@ -1086,6 +1323,7 @@ impl TenantConfig {
         if self.stored_bloom_scope.is_set() {
             self.bloom_scope()?;
         }
+        validate_key_index_columns(&self.stored_key_index.columns, self.own_typed_columns())?;
         Ok(())
     }
 }
@@ -1174,7 +1412,7 @@ pub enum TenantConfigError {
     )]
     VersionBelowFloor { key: String, got: u32, floor: u32 },
     /// [`set_tenant_config`] read a record declaring a version this build's writer
-    /// cannot reproduce (> [`TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION`]). The whole-record
+    /// cannot reproduce (> [`TENANT_CONFIG_KEY_INDEX_WRITER_VERSION`]). The whole-record
     /// CAS-replace rebuilds the body from this build's field set, so a field a
     /// newer writer added would be silently dropped; the write is refused and
     /// nothing is persisted (ADR-0066 decision 5). Checked before the decode
@@ -1182,7 +1420,7 @@ pub enum TenantConfigError {
     /// than the read ceiling.
     #[error(
         "config record {key:?} declares format_version {got}, newer than this build's writer \
-         version {TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION}: refusing to rewrite it whole and \
+         version {TENANT_CONFIG_KEY_INDEX_WRITER_VERSION}: refusing to rewrite it whole and \
          strip fields this \
          build does not model (ADR-0066 decision 5)"
     )]
@@ -1360,7 +1598,41 @@ fn decode_record(
             record.bloom_scope,
             decoded_write(record.format_version),
         ),
+        stored_key_index: decode_key_index(record),
     })
+}
+
+/// The key-index declaration a record carries, unvalidated, each part carrying
+/// the opt-in only when the record is version 4 or above, so a lower record
+/// that carries one is refused on rewrite.
+fn decode_key_index(record: &sysproto::TenantConfigRecord) -> StoredKeyIndex {
+    let write = decoded_write_at(
+        record.format_version,
+        TENANT_CONFIG_KEY_INDEX_WRITER_VERSION,
+    );
+    let columns: std::collections::BTreeSet<String> = record
+        .typed_attr_columns
+        .iter()
+        .flat_map(|config| config.columns.iter())
+        .filter(|column| column.key_index)
+        .map(|column| column.key.clone())
+        .collect();
+    let columns_write = if columns.is_empty() {
+        StorageLayoutWrite::Disabled
+    } else {
+        write
+    };
+    let trace_id_write = if record.index_trace_id {
+        write
+    } else {
+        StorageLayoutWrite::Disabled
+    };
+    StoredKeyIndex {
+        columns,
+        columns_write,
+        trace_id: record.index_trace_id,
+        trace_id_write,
+    }
 }
 
 /// Build the proto record to persist for a tenant's config.
@@ -1392,6 +1664,7 @@ fn build_record(
                     .map(|col| sysproto::TypedAttrColumn {
                         key: col.key.clone(),
                         r#type: col.ty.to_proto() as i32,
+                        key_index: config.stored_key_index.columns.contains(&col.key),
                     })
                     .collect(),
             }
@@ -1406,6 +1679,7 @@ fn build_record(
             }
         }),
         bloom_scope: config.stored_bloom_scope.value,
+        index_trace_id: config.stored_key_index.trace_id,
     }
 }
 
@@ -1485,6 +1759,15 @@ pub enum SetOutcome {
 /// neither removed nor retyped; a carried key must also pass the setter's
 /// validation against `config`'s own `typed_attr_columns`. Each refusal is a
 /// [`TenantConfigError::InvalidStorageLayoutConfig`] and writes nothing.
+///
+/// A config carrying a key-index column or `index_trace_id` stamps
+/// [`TENANT_CONFIG_KEY_INDEX_WRITER_VERSION`] instead, and each is refused the
+/// same way unless produced under the opt-in (by
+/// [`TenantConfig::set_key_index_columns`] or
+/// [`TenantConfig::set_index_trace_id`], or by decoding a version-4 record). A
+/// key-index column must be one of `config`'s own `typed_attr_columns`,
+/// declared i64, str or bytes: a bool column is refused with
+/// [`StorageLayoutConfigError::KeyIndexIneligibleType`] naming it.
 ///
 /// Under [`BloomScope::Undeclared`], a write at the stored clustering generation
 /// that changes the set of declared typed column names is written at the next
@@ -1602,7 +1885,7 @@ async fn write_config(
             // Checked BEFORE decode_record, whose ceiling is the read ceiling: on
             // a write path the operator needs to hear that nothing was persisted
             // and why, not that the record could not be read.
-            if existing.format_version > TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION {
+            if existing.format_version > TENANT_CONFIG_KEY_INDEX_WRITER_VERSION {
                 return Err(TenantConfigError::RefusingToRewriteNewerRecord {
                     key,
                     got: existing.format_version,
@@ -1705,6 +1988,7 @@ mod tests {
             ]),
             stored_clustering_key: None,
             stored_bloom_scope: StoredBloomScope::default(),
+            stored_key_index: StoredKeyIndex::default(),
         }
     }
 
@@ -1964,17 +2248,17 @@ mod tests {
         assert!(matches!(err, TenantConfigError::UnsupportedVersion { .. }));
     }
 
-    /// The read-side supported set is exactly {1, 2, 3}, a set with a floor and a
-    /// ceiling: version-1, -2 and -3 records all read back through
+    /// The read-side supported set is exactly {1, 2, 3, 4}, a set with a floor
+    /// and a ceiling: version-1 to -4 records all read back through
     /// `read_config`; both a version-0 record (below the floor: an unstamped
-    /// record from a writer that never set format_version) and a version-4 record
+    /// record from a writer that never set format_version) and a version-5 record
     /// (above the ceiling) are refused, with the two refusals carrying DIFFERENT
     /// typed errors: VersionBelowFloor and UnsupportedVersion. Pins ADR-0066
     /// decision 4 for the tenant-config reader gate (decode_record), and the
     /// split diagnostic an operator reads off it.
     #[tokio::test]
-    async fn reader_accepts_versions_one_to_three_and_refuses_zero_and_four() {
-        for version in [1u32, 2u32, 3u32] {
+    async fn reader_accepts_versions_one_to_four_and_refuses_zero_and_five() {
+        for version in [1u32, 2u32, 3u32, 4u32] {
             let store = mem();
             let mut record = build_record(
                 &tenant(),
@@ -1998,30 +2282,30 @@ mod tests {
         }
 
         let store = mem();
-        let mut v4 = build_record(
+        let mut v5 = build_record(
             &tenant(),
             &TenantConfig::new(TenantLifecycleState::Active),
             0,
             0,
         );
-        v4.format_version = 4;
+        v5.format_version = 5;
         store
             .put(
                 &config_key(&tenant()),
-                v4.encode_to_vec().into(),
+                v5.encode_to_vec().into(),
                 PutOptions::default(),
             )
             .await
-            .expect("seed v4");
+            .expect("seed v5");
         let err = read_config(store.as_ref(), &tenant())
             .await
-            .expect_err("version 4 must be refused");
+            .expect_err("version 5 must be refused");
         assert!(
             matches!(
                 err,
                 TenantConfigError::UnsupportedVersion {
-                    got: 4,
-                    ceiling: 3,
+                    got: 5,
+                    ceiling: 4,
                     ..
                 }
             ),
@@ -2065,7 +2349,7 @@ mod tests {
         );
     }
 
-    /// A record from a writer newer than this build (version 4, above the
+    /// A record from a writer newer than this build (version 5, above the
     /// highest version this build writes) put through `set_tenant_config`'s
     /// whole-record CAS-replace is REFUSED, not rebuilt: the rebuild names every
     /// field explicitly and would drop any field that newer writer added. The
@@ -2076,12 +2360,12 @@ mod tests {
         let store = mem();
         let key = config_key(&tenant());
         let mut seeded_record = build_record(&tenant(), &full_config(), 1_000, 1_000);
-        seeded_record.format_version = 4;
+        seeded_record.format_version = 5;
         let seeded = seeded_record.encode_to_vec();
         store
             .put(&key, seeded.clone().into(), PutOptions::default())
             .await
-            .expect("seed a version-4 config record");
+            .expect("seed a version-5 config record");
 
         let err = set_tenant_config(
             store.as_ref(),
@@ -2094,7 +2378,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TenantConfigError::RefusingToRewriteNewerRecord { got: 4, .. }
+                TenantConfigError::RefusingToRewriteNewerRecord { got: 5, .. }
             ),
             "got: {err}"
         );
@@ -2103,7 +2387,7 @@ mod tests {
         assert_eq!(
             after.as_ref(),
             seeded.as_slice(),
-            "the stored version-4 record must be byte-for-byte unchanged"
+            "the stored version-5 record must be byte-for-byte unchanged"
         );
     }
 
@@ -2222,28 +2506,33 @@ mod tests {
             "version 1 records stay readable"
         );
         assert_eq!(
-            TENANT_CONFIG_MAX_READ_VERSION, 3,
-            "readers accept versions 1 to 3 (ADR-2135 reader-first step)"
+            TENANT_CONFIG_MAX_READ_VERSION, 4,
+            "readers accept versions 1 to 4 (ADR-2707 reader-first step)"
         );
         assert_eq!(
             TENANT_CONFIG_STORAGE_LAYOUT_WRITER_VERSION, 3,
             "fields 13 and 14 need a version-3 writer"
         );
+        assert_eq!(
+            TENANT_CONFIG_KEY_INDEX_WRITER_VERSION, 4,
+            "key_index and index_trace_id need a version-4 writer"
+        );
     }
 
     // ---- ADR-0066 R2: the writer stamps 2 and a pre-R1 binary fails closed ----
 
-    /// Tag byte for field 15, varint wire type: a field number no
-    /// `TenantConfigRecord` this build models uses (1..=14 are taken). Appended to
+    /// Tag for field 16, varint wire type (`16 << 3` as a two-byte varint): a
+    /// field number no `TenantConfigRecord` this build models uses (1..=15 are
+    /// taken). Appended to
     /// an encoded record it is, on the wire, exactly an additive field a newer
     /// writer added, and prost keeps no unknown fields, so any whole-record
     /// re-encode through this build's field set drops it. That is the strip issue
     /// #1300 is about, reproduced without needing a second binary.
-    const UNMODELED_FIELD_TAG: u8 = 15 << 3;
+    const UNMODELED_FIELD_TAG: [u8; 2] = [0x80, 0x01];
     const UNMODELED_FIELD_VALUE: u8 = 0x2A;
 
     fn with_unmodeled_field(mut encoded: Vec<u8>) -> Vec<u8> {
-        encoded.push(UNMODELED_FIELD_TAG);
+        encoded.extend_from_slice(&UNMODELED_FIELD_TAG);
         encoded.push(UNMODELED_FIELD_VALUE);
         encoded
     }
@@ -2314,13 +2603,13 @@ mod tests {
 
         // And the strip the refusal prevents is real: the bytes a whole-record
         // re-encode produces are the seeded bytes minus exactly the unmodeled
-        // field's two.
+        // field's three.
         let re_encoded = sysproto::TenantConfigRecord::decode(seeded.as_slice())
             .expect("decode")
             .encode_to_vec();
         assert_eq!(
             re_encoded.as_slice(),
-            &seeded[..seeded.len() - 2],
+            &seeded[..seeded.len() - UNMODELED_FIELD_TAG.len() - 1],
             "a whole-record re-encode drops the unmodeled field"
         );
     }
@@ -2499,6 +2788,7 @@ mod tests {
             columns: vec![sysproto::TypedAttrColumn {
                 key: "http.status_code".into(),
                 r#type: sysproto::TypedAttrColumnType::Unspecified as i32,
+                key_index: false,
             }],
         });
         store
@@ -3897,5 +4187,348 @@ mod tests {
                 .expect("still absent"),
             SetOutcome::Created
         );
+    }
+
+    // ---- ADR-2707: key_index (TypedAttrColumn field 3) and index_trace_id (field 15) ----
+
+    fn typed(key: &str, ty: DeclaredColumnType) -> DeclaredTypedColumn {
+        DeclaredTypedColumn {
+            key: key.into(),
+            ty,
+        }
+    }
+
+    fn key_index_declared() -> TenantConfig {
+        TenantConfig {
+            typed_attr_columns: Some(vec![
+                typed("user_id", DeclaredColumnType::I64),
+                typed("request_id", DeclaredColumnType::Str),
+                typed("blob", DeclaredColumnType::Bytes),
+                typed("is_error", DeclaredColumnType::Bool),
+            ]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        }
+    }
+
+    /// A BOOL column is refused by the setter with a typed error naming the
+    /// column, before the opt-in is looked at, and the config is unchanged; the
+    /// write gate refuses the same column carried on a stored record.
+    #[tokio::test]
+    async fn key_index_refuses_a_bool_column_naming_it() {
+        let mut cfg = key_index_declared();
+        let before = cfg.clone();
+        assert_eq!(
+            cfg.set_key_index_columns(names(&["is_error"]), StorageLayoutWrite::ReadersRolledOut),
+            Err(StorageLayoutConfigError::KeyIndexIneligibleType {
+                column: "is_error".into(),
+                ty: DeclaredColumnType::Bool,
+            })
+        );
+        assert_eq!(cfg, before, "a refused setter changes nothing");
+        let message = StorageLayoutConfigError::KeyIndexIneligibleType {
+            column: "is_error".into(),
+            ty: DeclaredColumnType::Bool,
+        }
+        .to_string();
+        assert!(message.contains("\"is_error\""), "{message}");
+
+        // A record whose typed column carries key_index on a BOOL column
+        // decodes, the accessor refuses it, and a rewrite is refused.
+        let mut record = build_record(&tenant(), &key_index_declared(), 0, 0);
+        record.format_version = 4;
+        for column in &mut record
+            .typed_attr_columns
+            .as_mut()
+            .expect("declared")
+            .columns
+        {
+            column.key_index = column.key == "is_error";
+        }
+        let decoded = store_and_read(&record).await;
+        assert_eq!(
+            decoded.key_index_columns(),
+            Err(StorageLayoutConfigError::KeyIndexIneligibleType {
+                column: "is_error".into(),
+                ty: DeclaredColumnType::Bool,
+            })
+        );
+        let err = set_tenant_config(mem().as_ref(), &tenant(), &decoded, 1)
+            .await
+            .expect_err("the write gate refuses a BOOL key-index column");
+        assert!(
+            matches!(
+                err,
+                TenantConfigError::InvalidStorageLayoutConfig {
+                    source: StorageLayoutConfigError::KeyIndexIneligibleType { ref column, .. },
+                    ..
+                } if column == "is_error"
+            ),
+            "got: {err}"
+        );
+    }
+
+    /// An undeclared column, a repeated column, and more columns than the
+    /// section can name are each refused with their own typed error.
+    #[test]
+    fn key_index_refuses_undeclared_repeated_and_too_many_columns() {
+        let rolled = StorageLayoutWrite::ReadersRolledOut;
+        let mut cfg = key_index_declared();
+        assert_eq!(
+            cfg.set_key_index_columns(names(&["missing"]), rolled),
+            Err(StorageLayoutConfigError::UndeclaredKeyIndexColumn {
+                column: "missing".into()
+            })
+        );
+        assert_eq!(
+            cfg.set_key_index_columns(names(&["user_id", "user_id"]), rolled),
+            Err(StorageLayoutConfigError::DuplicateKeyIndexColumn {
+                column: "user_id".into()
+            })
+        );
+        let many: Vec<String> = (0..=MAX_KEY_INDEX_COLUMNS)
+            .map(|i| format!("c{i:03}"))
+            .collect();
+        let mut wide = TenantConfig {
+            typed_attr_columns: Some(
+                many.iter()
+                    .map(|k| typed(k, DeclaredColumnType::I64))
+                    .collect(),
+            ),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        assert_eq!(
+            wide.set_key_index_columns(many.clone(), rolled),
+            Err(StorageLayoutConfigError::TooManyKeyIndexColumns {
+                count: MAX_KEY_INDEX_COLUMNS + 1,
+                max: MAX_KEY_INDEX_COLUMNS,
+            })
+        );
+        wide.set_key_index_columns(many[..MAX_KEY_INDEX_COLUMNS].to_vec(), rolled)
+            .expect("exactly the limit is accepted");
+
+        let at_cap = "k".repeat(MAX_KEY_INDEX_COLUMN_KEY_LEN);
+        let over_cap = "k".repeat(MAX_KEY_INDEX_COLUMN_KEY_LEN + 1);
+        let mut long = TenantConfig {
+            typed_attr_columns: Some(vec![
+                typed(&at_cap, DeclaredColumnType::Str),
+                typed(&over_cap, DeclaredColumnType::Str),
+            ]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        assert_eq!(
+            long.set_key_index_columns(vec![over_cap.clone()], rolled),
+            Err(StorageLayoutConfigError::KeyIndexColumnKeyTooLong {
+                len: MAX_KEY_INDEX_COLUMN_KEY_LEN + 1,
+                max: MAX_KEY_INDEX_COLUMN_KEY_LEN,
+            })
+        );
+        long.set_key_index_columns(vec![at_cap], rolled)
+            .expect("a key of exactly the limit is accepted");
+    }
+
+    /// Without the opt-in, both setters refuse with the writer error naming
+    /// version 4, and `set_tenant_config` refuses a config carrying either
+    /// declaration without writing anything.
+    #[tokio::test]
+    async fn key_index_without_the_opt_in_is_refused() {
+        let disabled = StorageLayoutWrite::Disabled;
+        let mut cfg = key_index_declared();
+        let before = cfg.clone();
+        assert_eq!(
+            cfg.set_key_index_columns(names(&["user_id"]), disabled),
+            Err(StorageLayoutConfigError::WriterCannotEmit {
+                field: "key_index",
+                writer_version: 2,
+                required: 4,
+            })
+        );
+        assert_eq!(
+            cfg.set_index_trace_id(true, disabled),
+            Err(StorageLayoutConfigError::WriterCannotEmit {
+                field: "index_trace_id",
+                writer_version: 2,
+                required: 4,
+            })
+        );
+        assert_eq!(cfg, before, "a refused setter changes nothing");
+        cfg.set_key_index_columns(Vec::new(), disabled)
+            .expect("turning the column index off needs no opt-in");
+        cfg.set_index_trace_id(false, disabled)
+            .expect("turning the trace_id index off needs no opt-in");
+
+        let with_columns = TenantConfig {
+            stored_key_index: StoredKeyIndex {
+                columns: ["user_id".to_string()].into_iter().collect(),
+                columns_write: disabled,
+                ..StoredKeyIndex::default()
+            },
+            ..before.clone()
+        };
+        let with_trace = TenantConfig {
+            stored_key_index: StoredKeyIndex {
+                trace_id: true,
+                trace_id_write: disabled,
+                ..StoredKeyIndex::default()
+            },
+            ..before.clone()
+        };
+        for (cfg, field) in [(with_columns, "key_index"), (with_trace, "index_trace_id")] {
+            let store = mem();
+            let err = set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+                .await
+                .expect_err("the writer cannot emit a key-index declaration");
+            match err {
+                TenantConfigError::InvalidStorageLayoutConfig {
+                    source:
+                        StorageLayoutConfigError::WriterCannotEmit {
+                            field: got,
+                            writer_version: 2,
+                            required: 4,
+                        },
+                    ..
+                } => assert_eq!(got, field),
+                other => panic!("{field}: got {other}"),
+            }
+            assert!(
+                read_config(store.as_ref(), &tenant())
+                    .await
+                    .expect("read")
+                    .is_none(),
+                "{field}: nothing persists"
+            );
+        }
+    }
+
+    async fn stored_record(store: &dyn ObjectStoreBackend) -> sysproto::TenantConfigRecord {
+        let bytes = store
+            .get(&config_key(&tenant()), GetRange::Full)
+            .await
+            .expect("read back")
+            .data;
+        sysproto::TenantConfigRecord::decode(bytes.as_ref()).expect("decode")
+    }
+
+    /// With the opt-in, a record carrying key_index and index_trace_id is
+    /// stamped 4 on the wire, carries both fields, and reads back with the same
+    /// columns in declaration order; a rewrite of the read-back config succeeds
+    /// at 4. Clearing both drops the stamp back to 2.
+    #[tokio::test]
+    async fn key_index_with_the_opt_in_stamps_four_and_reads_back() {
+        let rolled = StorageLayoutWrite::ReadersRolledOut;
+        let mut cfg = key_index_declared();
+        cfg.set_key_index_columns(names(&["request_id", "user_id", "blob"]), rolled)
+            .expect("opted in");
+        cfg.set_index_trace_id(true, rolled).expect("opted in");
+        let store = mem();
+        set_tenant_config(store.as_ref(), &tenant(), &cfg, 1)
+            .await
+            .expect("write");
+
+        let record = stored_record(store.as_ref()).await;
+        assert_eq!(record.format_version, 4);
+        assert!(record.index_trace_id);
+        let flagged: Vec<(&str, bool)> = record
+            .typed_attr_columns
+            .as_ref()
+            .expect("declared")
+            .columns
+            .iter()
+            .map(|c| (c.key.as_str(), c.key_index))
+            .collect();
+        assert_eq!(
+            flagged,
+            vec![
+                ("user_id", true),
+                ("request_id", true),
+                ("blob", true),
+                ("is_error", false)
+            ]
+        );
+
+        let (read, _) = read_config(store.as_ref(), &tenant())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(
+            read.key_index_columns().expect("valid"),
+            vec![
+                typed("user_id", DeclaredColumnType::I64),
+                typed("request_id", DeclaredColumnType::Str),
+                typed("blob", DeclaredColumnType::Bytes),
+            ]
+        );
+        assert!(read.index_trace_id());
+
+        set_tenant_config(store.as_ref(), &tenant(), &read, 2)
+            .await
+            .expect("a version-4 record read back rewrites unchanged");
+        assert_eq!(stored_record(store.as_ref()).await, {
+            let mut expected = record.clone();
+            expected.updated_unix_ns = 2;
+            expected
+        });
+
+        let mut cleared = read.clone();
+        cleared
+            .set_key_index_columns(Vec::new(), StorageLayoutWrite::Disabled)
+            .expect("off");
+        cleared
+            .set_index_trace_id(false, StorageLayoutWrite::Disabled)
+            .expect("off");
+        set_tenant_config(store.as_ref(), &tenant(), &cleared, 3)
+            .await
+            .expect("write cleared");
+        let record = stored_record(store.as_ref()).await;
+        assert_eq!(
+            record.format_version, 2,
+            "no layout field left to stamp 3 or 4"
+        );
+        assert!(!record.index_trace_id);
+        assert!(
+            record
+                .typed_attr_columns
+                .expect("declared")
+                .columns
+                .iter()
+                .all(|c| !c.key_index)
+        );
+    }
+
+    /// A record below version 4 that carries either field (a writer outside
+    /// the readers-first rollout) decodes, but a whole-record rewrite of it is
+    /// refused: its parts carry no opt-in.
+    #[tokio::test]
+    async fn a_record_below_four_carrying_a_key_index_is_refused_on_rewrite() {
+        let mut columns = build_record(&tenant(), &key_index_declared(), 0, 0);
+        columns.format_version = 3;
+        for column in &mut columns
+            .typed_attr_columns
+            .as_mut()
+            .expect("declared")
+            .columns
+        {
+            column.key_index = column.key == "user_id";
+        }
+        let mut trace = build_record(&tenant(), &key_index_declared(), 0, 0);
+        trace.format_version = 3;
+        trace.index_trace_id = true;
+        for (record, field) in [(columns, "key_index"), (trace, "index_trace_id")] {
+            let decoded = store_and_read(&record).await;
+            let err = set_tenant_config(mem().as_ref(), &tenant(), &decoded, 1)
+                .await
+                .expect_err("a below-4 record carrying the field is refused");
+            match err {
+                TenantConfigError::InvalidStorageLayoutConfig {
+                    source:
+                        StorageLayoutConfigError::WriterCannotEmit {
+                            field: got,
+                            required: 4,
+                            ..
+                        },
+                    ..
+                } => assert_eq!(got, field),
+                other => panic!("{field}: got {other}"),
+            }
+        }
     }
 }
