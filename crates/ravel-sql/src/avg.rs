@@ -63,11 +63,14 @@
 //! argument. DataFusion's `SingleDistinctToGroupBy` rule rewrites some of
 //! these into a group by before an accumulator is built, but not a statement
 //! with a second distinct argument, a non-distinct aggregate other than `sum`,
-//! `min` or `max`, or a FILTER clause (#2930), so the accumulators cannot rely
-//! on it. The partial state is one list of the distinct values, which merges
-//! by union; the integer kind sums the set exactly and divides once, and the
-//! float kind keys the set by `f64::to_bits`, sorts it with `f64::total_cmp`
-//! and folds it with the same seeded sequential fold as the plain float kind.
+//! `min` or `max`, or a FILTER or ORDER BY on any aggregate (#2930), so the
+//! accumulators cannot rely on it. A rewritten statement never reaches these
+//! accumulators: it runs the ordinary `avg` over the group keys, in whatever
+//! order the plan emits them for the float kind. The partial state is one list
+//! of the distinct values, which merges by union; the integer kind sums the
+//! set exactly and divides once, and the float kind keys the set by
+//! `f64::to_bits`, sorts it with `f64::total_cmp` and folds it with the same
+//! seeded sequential fold as the plain float kind.
 //! [`SequentialAvg::groups_accumulator_supported`] returns false for a
 //! distinct call of an owned kind, so DataFusion runs the per-group
 //! [`Accumulator`] behind `GroupsAccumulatorAdapter`. A distinct call of the
@@ -1040,11 +1043,8 @@ impl Accumulator for DistinctIntegerAvgAccumulator {
 /// `f64::total_cmp` and folds it with the naive seeded sequential fold of
 /// [`SequentialAvgAccumulator`], then divides once, so the result is a
 /// function of the set alone, not of arrival or merge order, for a statement
-/// that reaches this accumulator. A statement DataFusion's
-/// `SingleDistinctToGroupBy` rule rewrites into a group by (`AVG(DISTINCT
-/// CAST(a AS DOUBLE))` alone, for example) never reaches it: that shape runs
-/// the ordinary float `avg` over the group keys in whatever order the plan
-/// emits them.
+/// that reaches this accumulator (see the module doc's Distinct section for
+/// which statements do).
 #[derive(Debug)]
 struct DistinctFloatAvgAccumulator {
     bits: HashSet<u64>,

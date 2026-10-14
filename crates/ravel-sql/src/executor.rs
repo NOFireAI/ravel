@@ -5143,7 +5143,9 @@ fn group_keys_are_non_float(aggregate: &Aggregate) -> bool {
 ///   `crate::avg`'s exact integer path, an `i128` numerator with checked
 ///   addition and an integer count (ADR-0825 decision 2); the analyzer coerces
 ///   every admitted integer width, plain or dictionary-encoded, to `Int64`, so
-///   a resolved `Int64` argument is the whole of that path.
+///   a resolved `Int64` argument is the whole of that path. `avg(DISTINCT)`
+///   over the same input keeps a set of the distinct values instead, and its
+///   merge is a set union, which does not depend on order either.
 ///
 /// Everything else is ineligible, including `sum` over a float (order-dependent
 /// IEEE addition), `avg` over a float (the same fold), `min`/`max` of any type,
@@ -5359,10 +5361,13 @@ fn aggregate_expr_is_exact(expr: &Expr, schema: &DFSchema) -> bool {
         // UInt8-UInt32, and a Dictionary of one of those; crate::avg's
         // `is_admitted_integer` is the list) to Int64, so a resolved Int64
         // argument's partial sum is exact regardless of partitioning or merge
-        // order. A Float64 argument still runs the plain IEEE f64 fold
-        // (ADR-0094's original amendment for issue #771) and is not exact:
-        // that partial sum is order-dependent. Any other resolved type (Decimal, Duration) is
-        // unreachable on the v1 `samples` surface and fails closed.
+        // order. `avg(DISTINCT)` over Int64 keeps a set of the distinct values
+        // and merges by union, which is exact in any order too (ADR-0825's
+        // #2930 amendment). A Float64 argument still runs the plain IEEE f64
+        // fold (ADR-0094's original amendment for issue #771) and is not
+        // exact: that partial sum is order-dependent. Any other resolved type
+        // (Decimal, Duration) is unreachable on the v1 `samples` surface and
+        // fails closed.
         "avg" | "mean" => match aggregate_function.params.args.first() {
             Some(arg) => matches!(
                 arg.get_type(schema),
