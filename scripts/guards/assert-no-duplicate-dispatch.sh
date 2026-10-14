@@ -24,37 +24,51 @@
 #                 inside it.
 #   path#symbol   a definition on the base: collides only when a hunk changes
 #                 a base line inside it.
-# A changed base line is a removed or replaced line; a pure insertion counts
-# against the base lines on both sides of it; context lines do not count.
+# Each entry is trimmed of leading and trailing whitespace; an entry empty
+# after trimming is a usage error. A changed base line is a removed or
+# replaced line; a pure insertion counts against the base lines on both sides
+# of it; context lines do not count. A range or symbol entry whose file is
+# not on the base, and a range that starts past the base file's last line,
+# are compared as the whole file, with a NOTE.
 #
-# The symbol anchor is plain text, not a parser. It matches a line that
-# defines the name with fn, struct, enum, trait, mod, const, static, type or
-# union (after pub and the async, const, unsafe, default or extern
-# qualifiers), an impl line that names it anywhere in its header, or a shell
-# function definition (`name()` or `function name`). In .rs files only the
-# Rust forms count, in .sh and .bash files only the shell forms, elsewhere
-# both. The definition runs from the anchor line to its matching close
-# brace; to the first semicolon outside brackets when no brace opens first;
-# or, when braces never balance, to the line before the next definition at
-# column 0. Braces in strings and comments are counted like any other, and
-# doc comments and attributes above the anchor are not part of the
-# definition. Every anchor that matches counts. A name not found on the base
-# is compared as the whole file, with a NOTE.
+# The symbol anchor is plain text, not a parser, and applies to .rs files
+# (the Rust forms) and .sh and .bash files (the shell forms). The Rust forms
+# match a line that defines the name with fn, struct, enum, trait, mod,
+# const, static, type or union (after pub and the async, const, unsafe,
+# default or extern qualifiers), or an impl line that names it anywhere in
+# its header; the shell forms match `name()` or `function name`. A symbol
+# entry on any other file type, docs/ markdown aside, is compared as the
+# whole file with a NOTE. The definition runs from the anchor line to its
+# matching close brace; to the first semicolon outside brackets when no
+# brace opens first; or, when braces never balance, to the line before the
+# next definition at column 0. Braces in strings and comments are counted
+# like any other, and a column-0 fn inside a Rust raw string or a column-0
+# name() { inside a shell heredoc reads as the next definition, so each can
+# cut a definition short. Doc comments and attributes above the anchor are
+# not part of the definition. Every anchor that matches counts. A name not
+# found on the base is compared as the whole file, with a NOTE.
 #
 # A .md file under docs/ is compared by heading section instead of by line:
 # a line's section is its nearest preceding ATX heading outside fenced code,
 # and an entry collides only when a hunk changes a line in one of the
-# entry's sections. path#symbol names a heading by its GitHub anchor
-# (docs/x.md#usage for "## Usage") and covers its nested subsections;
-# path:L10-L80 covers every section with a line in the range. A bare docs/
-# path names no section and keeps the whole-file rule.
+# entry's sections. A fence closes only on a fence of the same character
+# (backtick or tilde) at least as long as the one that opened it.
+# path#symbol names a heading by its GitHub anchor (docs/x.md#usage for
+# "## Usage") and covers its nested subsections; path:L10-L80 covers every
+# section with a line in the range. A bare docs/ path names no section and
+# keeps the whole-file rule.
 #
 # Hunks come from the patch field of the same paginated files endpoint, in
 # the same call; a file returned with no patch (a diff too large to inline)
-# is compared as the whole file. Symbols, headings and sections are read
-# from --base-ref (default origin/main), while a pull request's hunks number
-# lines on its own merge base, so the two drift apart by whatever landed in
-# that file since the pull request forked.
+# is compared as the whole file. A file the pull request renamed matches an
+# entry naming either its old or its new path, and its patch is numbered on
+# the old file. Symbols, headings and sections are read from --base-ref
+# (default origin/main), while a pull request's hunks number lines on its
+# own merge base. Before a range, symbol or section comparison trusts a
+# file's hunks, every context and removed line of each hunk must equal the
+# base file's line at the number the hunk header gives it; on any mismatch
+# that file is compared as the whole file, with a NOTE saying the pull
+# request's base has drifted from the base ref.
 #
 # Usage:
 #   assert-no-duplicate-dispatch.sh --issue <n> [--paths a,b,c] [--paths d]
@@ -65,7 +79,8 @@
 #   0   nothing overlapping; dispatch
 #   64  usage, including a --paths entry that does not parse (path:L10 with
 #       no end, a start of 0 or after the end, path# with no symbol, #symbol
-#       with no path, or a path containing ':' or '#' in any other way)
+#       with no path, or a path containing ':' or '#' in any other way) or
+#       is empty after trimming
 #   65  an existing pull request already addresses the issue; skip and log
 #   66  an OPEN, non-draft pull request is already touching the predicted
 #       files, line ranges or definitions (drafts, merged and closed ones are
@@ -105,7 +120,12 @@ while [[ $# -gt 0 ]]; do
       [[ -n "${2:-}" ]] || { echo "assert-no-duplicate-dispatch.sh: --paths needs a value" >&2; exit 64; }
       IFS=',' read -r -a chunk <<<"$2"
       for entry in "${chunk[@]}"; do
-        [[ -z "${entry}" ]] && continue
+        entry="${entry#"${entry%%[![:space:]]*}"}"
+        entry="${entry%"${entry##*[![:space:]]}"}"
+        [[ -n "${entry}" ]] || {
+          echo "assert-no-duplicate-dispatch.sh: --paths has an empty entry in '${2}'" >&2
+          exit 64
+        }
         entry_form "${entry}" >/dev/null || {
           echo "assert-no-duplicate-dispatch.sh: --paths entry '${entry}' is not path, path:L<start>-L<end> or path#symbol" >&2
           exit 64
@@ -310,6 +330,7 @@ fi
 
 # The base lines a patch changes: each removed line, and both neighbours of
 # a pure insertion. Exits 3 on a non-empty patch with no hunk header.
+# shellcheck disable=SC2016 # an awk program; its $ fields are awk's, not the shell's
 changed_lines_awk='
   /^@@ -[0-9]/ {
     h = $2; sub(/^-/, "", h); n = split(h, p, ",")
@@ -323,7 +344,36 @@ changed_lines_awk='
   { base++; rep = 0 }
   END { if (!seen) exit 3 }'
 
+# Exits 1 unless every context and removed line of the patch (read second)
+# equals the base file's line (read first, named by bf) at the base line
+# number its hunk header gives it.
+# shellcheck disable=SC2016 # an awk program; its $ fields are awk's, not the shell's
+drift_awk='
+  FILENAME == bf { line[FNR] = $0; next }
+  /^@@ -[0-9]/ { h = $2; sub(/^-/, "", h); split(h, p, ","); base = p[1] + 0; seen = 1; next }
+  !seen || /^\+/ || /^\\/ { next }
+  {
+    if (!(base in line) || (line[base] "") != (substr($0, 2) "")) { bad = 1; exit }
+    base++
+  }
+  END { exit bad }'
+
+# Opens or closes a fenced code block on a fence line. A fence closes only on
+# the same character at least as long as the one that opened it.
+# shellcheck disable=SC2016 # an awk function; its backticks are fence characters
+fence_awk_fn='
+  function fence(s,   c, n) {
+    sub(/^ ? ? ?/, "", s); c = substr(s, 1, 1)
+    if (c != "`" && c != "~") return 0
+    n = 0; while (substr(s, n + 1, 1) == c) n++
+    if (n < 3) return 0
+    if (fch == "") { fch = c; flen = n; return 1 }
+    if (c == fch && n >= flen) { fch = ""; return 1 }
+    return 0
+  }'
+
 # lo:hi for every definition of `sym` in the file; see the header.
+# shellcheck disable=SC2016 # an awk program; its $ anchors are awk's, not the shell's
 symbol_awk='
   function anchor(s) {
     if (rust && s ~ ("^[ \t]*(pub(\\([^)]*\\))?[ \t]+)?(async[ \t]+|const[ \t]+|unsafe[ \t]+|default[ \t]+|extern[ \t]+(\"[^\"]*\"[ \t]+)?)*(fn|struct|enum|trait|mod|const|static|type|union)[ \t]+(mut[ \t]+)?" sym "([^A-Za-z0-9_]|$)")) return 1
@@ -361,10 +411,11 @@ symbol_awk='
 
 # lo:hi for every ATX heading whose GitHub anchor is `sym`, through its
 # nested subsections.
-heading_awk='
+# shellcheck disable=SC2016 # an awk program; its $ fields are awk's, not the shell's
+heading_awk="${fence_awk_fn}"'
   function slug(s) { s = tolower(s); gsub(/[^a-z0-9 _-]/, "", s); gsub(/ /, "-", s); return s }
-  /^[ ]*(```|~~~)/ { fence = !fence; next }
-  !fence && /^(#|##|###|####|#####|######)([ \t]|$)/ {
+  fence($0) { next }
+  fch == "" && /^(#|##|###|####|#####|######)([ \t]|$)/ {
     h++; at[h] = NR; t = $0; match(t, /^#+/); level[h] = RLENGTH
     sub(/^#+[ \t]*/, "", t); sub(/[ \t]*#*[ \t]*$/, "", t); name[h] = slug(t)
   }
@@ -379,9 +430,10 @@ heading_awk='
 
 # The first changed line in `lines` whose section is one of the sections
 # `ranges` covers. A line before the first heading is in section 0.
-section_hit_awk='
-  /^[ ]*(```|~~~)/ { fence = !fence }
-  !fence && /^(#|##|###|####|#####|######)([ \t]|$)/ { cur = NR }
+# shellcheck disable=SC2016 # an awk program; its $ fields are awk's, not the shell's
+section_hit_awk="${fence_awk_fn}"'
+  { fence($0) }
+  fch == "" &&/^(#|##|###|####|#####|######)([ \t]|$)/ { cur = NR }
   { sec[NR] = cur }
   END {
     sec[0] = 0; sec[NR + 1] = sec[NR]
@@ -403,11 +455,7 @@ section_hit_awk='
 e_path=(); e_label=(); e_mode=(); e_ranges=(); e_base=()
 needs_base=0
 for entry in "${paths[@]}"; do
-  form="$(entry_form "${entry}")"
-  p="${entry%%[:#]*}"
-  if [[ "${form}" == symbol || ("${form}" == range && "${p}" == docs/*.md) ]]; then
-    needs_base=1
-  fi
+  [[ "$(entry_form "${entry}")" == bare ]] || needs_base=1
 done
 scratch=""
 if ((needs_base == 1)); then
@@ -424,7 +472,7 @@ for entry in "${paths[@]}"; do
   mode=whole; ranges=""; bfile=""
   docs=0
   [[ "${p}" == docs/*.md ]] && docs=1
-  if [[ "${form}" != bare && (${docs} == 1 || "${form}" == symbol) ]]; then
+  if [[ "${form}" != bare ]]; then
     bfile="${scratch}/base-${#e_path[@]}"
     git show "${base_ref}:${p}" >"${bfile}" 2>/dev/null || bfile=""
   fi
@@ -432,23 +480,39 @@ for entry in "${paths[@]}"; do
     range)
       [[ "${entry}" =~ :L([0-9]+)-L([0-9]+)$ ]]
       ranges="${BASH_REMATCH[1]}:${BASH_REMATCH[2]}"
-      mode=lines
-      [[ ${docs} == 1 && -n "${bfile}" ]] && mode=sections
+      if [[ -z "${bfile}" ]]; then
+        echo "NOTE  ${entry}: ${p} is not on ${base_ref}; compared as the whole file"
+      else
+        last="$(awk 'END { print NR }' "${bfile}")"
+        if ((BASH_REMATCH[1] > last)); then
+          echo "NOTE  ${entry}: starts past the last line (${last}) of ${p} on ${base_ref}; compared as the whole file"
+        elif ((docs == 1)); then
+          mode=sections
+        else
+          mode=lines
+        fi
+      fi
       ;;
     symbol)
       sym="${entry#*#}"
-      if [[ -n "${bfile}" && ${docs} == 1 ]]; then
-        ranges="$(awk -v sym="${sym}" "${heading_awk}" "${bfile}")"
+      rust=0; shell=0
+      if ((docs == 1)); then
+        [[ -n "${bfile}" ]] && ranges="$(awk -v sym="${sym}" "${heading_awk}" "${bfile}")"
         mode=sections
-      elif [[ -n "${bfile}" ]]; then
-        rust=1; shell=1
-        [[ "${p}" == *.rs ]] && shell=0
-        [[ "${p}" == *.sh || "${p}" == *.bash ]] && rust=0
-        ranges="$(awk -v sym="${sym}" -v rust="${rust}" -v shell="${shell}" "${symbol_awk}" "${bfile}")"
+      elif [[ "${p}" == *.rs ]]; then
+        rust=1
+      elif [[ "${p}" == *.sh || "${p}" == *.bash ]]; then
+        shell=1
+      fi
+      if ((rust == 1 || shell == 1)); then
+        [[ -n "${bfile}" ]] && ranges="$(awk -v sym="${sym}" -v rust="${rust}" -v shell="${shell}" "${symbol_awk}" "${bfile}")"
         mode=lines
       fi
       ranges="${ranges//$'\n'/ }"
-      if [[ -z "${ranges}" ]]; then
+      if ((docs == 0 && rust == 0 && shell == 0)); then
+        echo "NOTE  ${entry}: symbol entries are not supported for this file type (only .rs, .sh, .bash and docs/*.md); compared as the whole file"
+        mode=whole
+      elif [[ -z "${ranges}" ]]; then
         echo "NOTE  ${entry}: '${sym}' not found in ${p} on ${base_ref}; compared as the whole file"
         mode=whole
       fi
@@ -463,41 +527,53 @@ overlap_report=""
 context_report=""
 while IFS=$'\t' read -r num state title; do
   [[ -z "${num}" ]] && continue
-  # One line per file, a JSON array of its name and its patch (null when the
-  # endpoint left the patch out).
-  files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[] | [.filename, .patch] | @json')"
-  names="$(jq -r '.[0]' <<<"${files}")" || exit 69
+  # One line per file, a JSON array of its name, its patch (null when the
+  # endpoint left the patch out) and its name before a rename (null when the
+  # pull request did not rename it).
+  files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[] | [.filename, .patch, .previous_filename] | @json')"
   shared=""
   for i in "${!e_path[@]}"; do
-    grep -qxF -- "${e_path[i]}" <<<"${names}" || continue
+    recs="$(jq -c --arg p "${e_path[i]}" 'select(.[0] == $p or .[2] == $p)' <<<"${files}")" || exit 69
+    [[ -n "${recs}" ]] || continue
     if [[ "${e_mode[i]}" == whole ]]; then
       shared+="${e_label[i]}, "
       continue
     fi
-    patch="$(jq -r --arg p "${e_path[i]}" \
-      'select(.[0] == $p) | if .[1] == null then "-" else "+" + .[1] end' <<<"${files}")" || exit 69
-    if [[ "${patch}" == "-" ]]; then
-      shared+="${e_label[i]} (no patch in the API response; compared as the whole file), "
-      continue
-    fi
-    patch="${patch#+}"
-    [[ -z "${patch}" ]] && continue
-    if ! changed="$(printf '%s\n' "${patch}" | awk "${changed_lines_awk}")"; then
-      shared+="${e_label[i]} (patch did not parse; compared as the whole file), "
-      continue
-    fi
-    changed="${changed//$'\n'/ }"
-    hit=""
-    if [[ "${e_mode[i]}" == sections ]]; then
-      hit="$(awk -v ranges="${e_ranges[i]}" -v lines="${changed}" "${section_hit_awk}" "${e_base[i]}")"
-    else
-      for l in ${changed}; do
-        for r in ${e_ranges[i]}; do
-          if ((l >= ${r%%:*} && l <= ${r##*:})); then hit="${l}"; break 2; fi
+    why=""
+    while IFS= read -r rec; do
+      patch="$(jq -r 'if .[1] == null then "-" else "+" + .[1] end' <<<"${rec}")" || exit 69
+      if [[ "${patch}" == "-" ]]; then
+        why="no patch in the API response; compared as the whole file"
+        break
+      fi
+      patch="${patch#+}"
+      [[ -z "${patch}" ]] && continue
+      if ! changed="$(printf '%s\n' "${patch}" | awk "${changed_lines_awk}")"; then
+        why="patch did not parse; compared as the whole file"
+        break
+      fi
+      if ! printf '%s\n' "${patch}" | awk -v bf="${e_base[i]}" "${drift_awk}" "${e_base[i]}" -; then
+        echo "NOTE  #${num} ${e_path[i]}: the pull request's base has drifted from ${base_ref}; ${e_label[i]} compared as the whole file"
+        why="base drifted; compared as the whole file"
+        break
+      fi
+      changed="${changed//$'\n'/ }"
+      hit=""
+      if [[ "${e_mode[i]}" == sections ]]; then
+        hit="$(awk -v ranges="${e_ranges[i]}" -v lines="${changed}" "${section_hit_awk}" "${e_base[i]}")"
+      else
+        for l in ${changed}; do
+          for r in ${e_ranges[i]}; do
+            if ((l >= ${r%%:*} && l <= ${r##*:})); then hit="${l}"; break 2; fi
+          done
         done
-      done
-    fi
-    [[ -n "${hit}" ]] && shared+="${e_label[i]} (base line ${hit}), "
+      fi
+      if [[ -n "${hit}" ]]; then
+        why="base line ${hit}"
+        break
+      fi
+    done <<<"${recs}"
+    [[ -n "${why}" ]] && shared+="${e_label[i]} (${why}), "
   done
   shared="${shared%, }"
   if [[ -n "${shared}" ]]; then
