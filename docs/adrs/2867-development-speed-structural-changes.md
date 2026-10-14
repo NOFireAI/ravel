@@ -442,17 +442,25 @@ per file is not a bar a split can be held to.
 detection is a heuristic whose answer depends on how much of a file is
 blamed at once. On the `logs_scan.rs` split (cd569a12b), a whole-file
 blame attributes 1,080 of `plan.rs`'s 1,475 lines to the split commit,
-and re-blaming those lines in runs of at most 10 still leaves 96 of them
+and re-blaming the file in 10-line ranges still leaves about 100 lines
 there, though they are moved bodies. It stays useful for finding where a
 line came from, not for deciding whether a split moved it.
 
-What item 3 requires instead is the split commit's line residue: the
-lines it adds that it does not also remove, compared as sorted multisets.
+What item 3 requires instead is the split commit's line residue on both
+sides, over every path the commit touches: the lines it adds that it
+does not also remove, and the lines it removes that it does not add
+back, compared as sorted multisets.
 
-    git show --format= -U0 <split> -- <paths> | grep -v '^+++ \|^--- ' > split.diff
-    sed -n 's/^+//p' split.diff | sort > added
-    sed -n 's/^-//p' split.diff | sort > removed
+    git show --format= -U0 <split> > split.diff || exit 1
+    grep -E '^\+' split.diff | grep -vE '^\+\+\+ (b/|/dev/null)' | cut -c2- | sort > added
+    grep -E '^-' split.diff | grep -vE '^--- (a/|/dev/null)' | cut -c2- | sort > removed
     comm -23 added removed
+    comm -13 added removed
+
+The first command runs on its own so a mistyped ref stops the check
+instead of producing an empty diff that reads as a clean move. The
+header filter matches git's `a/`, `b/` and `/dev/null` prefixes, not any
+line that starts with `++` or `--`.
 
 A pure move leaves only the lines a split has to write: blank lines, the
 new modules' doc headers and `mod` declarations, `use` lines and their
@@ -461,19 +469,25 @@ such as `pub(crate)` on items that crossed a module boundary, references
 rewritten to the new module path (call sites, doc links, doc text that
 names a file), doc prose rewrapped around such a reference, lines rustfmt
 reflowed because one of those edits changed their length, and closing
-delimiters. The reviewer reads every residue
-line against that list, and a line outside it means the split did more
-than move. Edits the commit body names, such as a guard's file list,
-are read against the body.
+delimiters. The reviewer reads every added-side residue line against
+that list. Every removed-side residue line must be the earlier form of an
+added-side line (the same item before its visibility qualifier or path
+changed), or the old file's own header, `use` or blank line. A line
+outside the list on either side means the split did more than move. In
+particular, a function the split drops outright adds nothing and shows
+only as an unpaired removed line. Edits the commit body names, such as a
+guard's file list or a deduplication, are read against the body.
 
 Both splits have been checked this way. The `logs_scan.rs` split
-(cd569a12b, which also produced a fourth part, `batch`) adds 9,843 lines
-with a residue of 79. Every residue line is in the list, two of them a
-function signature rustfmt reflowed after its visibility changed. The
-ingest split (T7, PR #2955 at 373dfd091) adds 1,554 lines with a residue
-of 115. Those are imports, module and attribute lines, call sites and doc
-links rewritten to the new module paths, and the guard file-list edit its
-commit body names. The removed side shows one more change the body names:
-two byte-identical copies of `retry_after_seconds`, in `otlp_http.rs` and
-`remote_write.rs`, became one in `ingest_admission.rs`. Blame did not
-show that change; the residue comparison does.
+(cd569a12b, which also produced a fourth part, `batch`) adds 9,845 lines
+and removes 9,827, with residues of 81 added and 63 removed lines. Every
+residue line is in the list. Two of the added ones are a function
+signature rustfmt reflowed after its visibility changed. The removed ones
+are the same items and fields before they gained `pub(super)`. The ingest
+split (T7, PR #2955 at 373dfd091) adds 1,558 lines and removes 1,506,
+with residues of 119 and 67. Every residue line is in the list, apart from
+two edits its commit body names. One is the guard file-list edit. The
+other shows only on the removed side: two byte-identical copies of
+`retry_after_seconds`, in `otlp_http.rs` and `remote_write.rs`, became
+one in `ingest_admission.rs`. Blame did not show that change; the
+removed-side residue does.
