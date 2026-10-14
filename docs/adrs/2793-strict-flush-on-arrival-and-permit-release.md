@@ -422,8 +422,9 @@ authenticated refusal onto the fallback below. So:
 
 - A shed request whose credential does not resolve gets the 429 with no
   drain. The check reads only the request head, and on this path it has no
-  side effect: it does not call the surface's unauthorized hook or move its
-  rejected-request counter, since the answer is the 429, not a 401.
+  side effect (narrowed by the drain correction below): it does not call the
+  surface's unauthorized hook or move its rejected-request counter, since
+  the answer is the 429, not a 401.
 - The credential check's own 401 is not drained either.
 
 The cost is diagnosability. A client sending a large body with a bad
@@ -689,3 +690,37 @@ flowchart LR
     C --> D[drop in-flight permit]
     D --> E[Submitted.acks holds the<br/>pending-ack permit to the ack]
 ```
+
+## Correction (2026-10-14): what the drain does not count, and the credential check's one side effect
+
+<!-- amendment-supersedes: phrase="on this path it has no side effect" pointer="drain correction" -->
+<!-- amendment-applies: none reason="records two facts about the head-refusal drain found while landing it; it changes no decision, and the one phrase it narrows is covered by the supersedes marker" -->
+
+Two facts about the head-refusal drain amendment, found while landing it
+under issue #2926.
+
+**An authenticated `Expect: 100-continue` shed is neither drained nor
+counted.** Such a client sends no body until it sees `100 Continue`, and
+hyper sends that only when the body is polled. Reading the body would
+therefore invite the upload the refusal is turning away. So the shed is
+answered with `Connection: close` and no drain. It is not counted under
+`ravel_ingest_head_refusal_undrained_total`, since there are normally no
+unread bytes to lose the response to.
+
+The residual case is a client that stops waiting for the `100` and
+uploads anyway, which RFC 9110 permits and curl does after a second. It
+can see the reset this amendment is about, and the counter does not show
+it. An unauthenticated `Expect` shed is still counted as
+`unauthenticated`, since the credential is checked first.
+
+A drain the client abandons midway also ends with `Connection: close` and
+is not counted. There is no one left to read the response.
+
+**The credential check on the shed path has one side effect.** It calls
+neither the unauthorized hook nor the rejected-request counter. But with
+the durable bearer resolver in the chain, an unknown token wakes that
+resolver's `sys/auth` re-read, as any request with an unknown token
+does. That re-read is rate-limited to one per second per process, so a
+flood of shed requests with bad tokens costs at most about one extra
+object-store read a second. Before the drain, a shed request reached no
+credential check at all.
