@@ -4556,12 +4556,12 @@ Schema (fixed columns plus one map, `crates/ravel-sql/src/spans_schema.rs`):
   span attributes. RSPAN stores that merged map directly, so unlike `logs`
   there is no separate stream-identity blob to fold in at scan time.
 - `service_name`: `Utf8`, nullable, populated from `attrs["service.name"]`
-  (NULL when the span has no such attribute). RSPAN v4 stores it as a
+  (NULL when the span has no such attribute). RSPAN stores it as a
   block-local dictionary column (ADR-0054); the scan exposes it as a plain
   column so `WHERE service_name = '...'` is pushdown-eligible.
 - `events`: `List(Struct{ts_unix_nano: Int64, name: Utf8, attrs: Map(Utf8,
   Utf8)})`, nullable (NULL when the span carries no event, never an empty
-  list). Built from RSPAN v4's four nested event columns; the event attribute
+  list). Built from RSPAN's four nested event columns; the event attribute
   map uses the same label map type as `attrs`. The raw protobuf blob remains
   queryable as `attrs["_events_raw"]`.
 - `links`: `List(Struct{trace_id: FixedSizeBinary(16), span_id:

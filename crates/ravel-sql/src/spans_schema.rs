@@ -20,7 +20,7 @@
 //! | attrs          | Map(Utf8, Utf8)               | `attrs` (already-merged map)         |
 //! | service_name   | Utf8, nullable                | `attrs["service.name"]`              |
 //! | duration_ns    | Int64                         | computed: `end_ts - start_ts`        |
-//! | events         | List(Struct), nullable        | `attrs["_events_raw"]` (RSPAN v4 event columns) |
+//! | events         | List(Struct), nullable        | `attrs["_events_raw"]` (RSPAN event columns) |
 //! | links          | List(Struct), nullable        | `attrs["_links_raw"]` (decoded at scan time)  |
 //!
 //! `status_code` is a small integer (`0=Unset`, `1=Ok`, `2=Error`), the exact
@@ -45,7 +45,7 @@
 //! write `end_ts - start_ts` by hand) is what makes `WHERE duration_ns >
 //! 5e8` pushdown-eligible in `spans_pushdown.rs`.
 //!
-//! `events` (issue #1710) exposes RSPAN v4's nested event columns
+//! `events` (issue #1710) exposes RSPAN's nested event columns
 //! ([`ravel_rspan::SpanEvent`], docs/span-segment-format.md "BLOCKS") as a
 //! `List` of `Struct{ts_unix_nano, name, attrs}`, one struct per span event in
 //! the order the sender sent them. Each event's own attributes use
@@ -140,7 +140,7 @@ fn spans_fields() -> Vec<Field> {
         Field::new("service_name", DataType::Utf8, true),
         // Computed end_ts - start_ts (ADR-0045 decision 5), never stored.
         Field::new("duration_ns", DataType::Int64, false),
-        // RSPAN v4's nested event columns (issue #1710). NULL, not an empty
+        // RSPAN's nested event columns (issue #1710). NULL, not an empty
         // list, when the span carried no events.
         Field::new("events", span_events_type(), true),
         // Decoded from attrs["_links_raw"] at scan time (issue #1710 part B),

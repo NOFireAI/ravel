@@ -1,7 +1,8 @@
 # ravel-rspan fuzzing
 
 Coverage-guided (libFuzzer) fuzz target for the RSPAN reader's untrusted-input
-entry points: the whole-object reader (`RspanReader::new` + `scan`) and the
+entry points: the whole-object reader (`RspanReader::new` + `scan`), the
+KEY_IDX trace probe on the whole-object and ranged readers, and the
 footer/suffix parsers (`open`, `open_from_suffix`). It complements, rather than
 duplicates, the byte-mutation proptests in `crates/ravel-rspan` (the
 `decode_never_panics` / `footer_corruption_is_typed_error` family): the
@@ -34,9 +35,9 @@ cargo install cargo-fuzz             # the `cargo fuzz` subcommand
 
 ## Targets
 
-| Target         | Entry point(s) fuzzed                                          |
-| -------------- | ------------------------------------------------------------- |
-| `decode_rspan` | `RspanReader::new` + `scan`, and `open` / `open_from_suffix`   |
+| Target         | Entry point(s) fuzzed                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------------------ |
+| `decode_rspan` | `RspanReader::new` + `scan`, `probe_trace` on `RspanReader` and `RspanRangeReader`, and `open` / `open_from_suffix` |
 
 List targets any time with:
 

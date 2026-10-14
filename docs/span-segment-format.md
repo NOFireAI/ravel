@@ -1,9 +1,8 @@
 # RSPAN: Ravel Span Segment Format
 
 Persistent contract (ADR-0041). Any change bumps the trailer version. The
-current trailer version is 4 (ADR-0045 decision 3 replaced v3's single opaque
-`attrs` blob column with per-key string attribute columns and promoted span
-events into nested columns). Trailer version history:
+current trailer version is 5 (ADR-2707 decision 2 added the mandatory KEY_IDX
+section, the exact per-object `trace_id` index). Trailer version history:
 
 | version | ADR | added |
 |---|---|---|
@@ -11,30 +10,30 @@ events into nested columns). Trailer version history:
 | 2 | ADR-0045 decision 2 | per-block duration bounds and a status mask in SKIP_IDX |
 | 3 | ADR-0054 | mandatory BLOOM section and the `service_name` column |
 | 4 | ADR-0045 decision 3 | per-key attribute columns (`attrs_raw` overflow) and nested span-event columns |
-| 5 | ADR-2707 (proposed) | mandatory KEY_IDX section (kind 4): the exact per-object `trace_id` index |
+| 5 | ADR-2707 decision 2 | mandatory KEY_IDX section (kind 4): the exact per-object `trace_id` index |
 
-**Proposed: trailer version 5 (ADR-2707).** Version 5 adds one mandatory
-section, KEY_IDX (kind 4), and changes no other byte. No shipped writer emits
-it yet: the implementing task lands the v5 writer, the v5 reader, the
-compactor's output version and the marker below together, and until then the
-reader accepts exactly 4. Every "v5" statement in this document describes
-that pending change. Making a kind mandatory changes what a valid object is,
-which is the case the versioning rule reserves the trailer bump for (see
+**Trailer version 5 (ADR-2707).** Version 5 adds one mandatory section,
+KEY_IDX (kind 4), and the additive `prefix_len` field on its footer section
+entry, and changes no other byte. Every writer (`RspanWriter::finish` and
+`finish_compacted`) emits it, and the compactor's output version follows the
+reader's. Making a kind mandatory changes what a valid object is, which is
+the case the versioning rule reserves the trailer bump for (see
 docs/log-segment-format.md, "Version", for the rule and its carve-out), so
 v5 retires v4 the way v4 retired v3: one supported version, no dual reader,
 a v4 object refused with `UnsupportedVersion` from the trailer alone.
 
 Ravel is pre-release: one supported version at a time, earlier versions
 rejected with a typed `UnsupportedVersion` error, never carried by a dual
-reader (ADR-0045 decision 4, ADR-0054 decision 1, ADR-0027 precedent). v4
-retires v3 the same way v3 retired v2 and v2 retired v1: the reader accepts
-only the current version. There is no in-place migration path across a version
-bump: since no dual reader exists, code built against v4 cannot open a v1, v2,
-or v3 object to compact it forward. An older object outside development buckets
-that must remain queryable has to be re-ingested from source under v4; this is
-Ravel's accepted pre-release posture, not a gap to close later.
+reader (ADR-0045 decision 4, ADR-0054 decision 1, ADR-0027 precedent). v5
+retires v4 the same way v4 retired v3 and each earlier version retired its
+predecessor: the reader accepts only the current version. There is no in-place
+migration path across a version bump: since no dual reader exists, code built
+against v5 cannot open a v1 to v4 object to compact it forward. An older object
+outside development buckets that must remain queryable has to be re-ingested
+from source under v5; this is Ravel's accepted pre-release posture, not a gap
+to close later.
 
-<!-- reader-supported-versions: ravel_rspan = 4 -->
+<!-- reader-supported-versions: ravel_rspan = 5 -->
 <!-- Checked against ravel_rspan::footer::SUPPORTED_VERSIONS by
      scripts/check_format_version_docs.py; keep it in step with the current
      trailer version above when the reader window changes. -->
@@ -134,30 +133,31 @@ attribute, a named gap, not an oversight).
 ```
 +---------------------------------------------------+
 | BLOCKS       row blocks (column pages)            |  kind 1
-| KEY_IDX      exact (trace_id prefix, block) index |  kind 4 (v5, ADR-2707 proposed)
+| KEY_IDX      exact (trace_id prefix, block) index |  kind 4 (v5, ADR-2707)
 | SKIP_IDX     interval + trace_id min/max index    |  kind 2
 | BLOOM        per-block service/name token bloom   |  kind 3
 | footer: SpanFooter protobuf bytes                 |
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
 |   footer_crc32c:u32                               |
-|   version:      u16   (= 4; 5 under ADR-2707)     |
+|   version:      u16   (= 5)                       |
 |   signal:       u8    (3 = spans)                 |
 |   reserved:     u8    (= 0)                       |
 |   magic:        [u8;4] = "RSP1"                   |
 +---------------------------------------------------+
 ```
 
-Writers emit the sections physically in kind order today (1..3). Under v5
-the order is BLOCKS, KEY_IDX, SKIP_IDX, BLOOM: KEY_IDX sits between BLOCKS
+Writers emit the sections physically in the order BLOCKS, KEY_IDX,
+SKIP_IDX, BLOOM: KEY_IDX sits between BLOCKS
 and SKIP_IDX, the placement RLOG uses for the same kind, so a suffix probe
 that covers the footer, BLOOM and SKIP_IDX does not have to span KEY_IDX's
-bucket frames (about 6% of the object) to reach them. Readers rely only on
+bucket frames to reach them. The section costs a fixed header and directory
+of about 1 KB at `bucket_bits = 8` plus the bucket frames, so it is a small
+share of a full-size object and most of a small one. Readers rely only on
 the footer's section offsets, never on adjacency. Bytes between sections are
-permitted and MUST be `0x00`; readers never interpret them. All three sections
-are mandatory: the reader rejects an object missing any of them as `Corrupted`.
-Under v5 all four are: a v5 object missing KEY_IDX is `Corrupted` the same
-way.
+permitted and MUST be `0x00`; readers never interpret them. All four sections
+are mandatory: the reader rejects an object missing any of them, KEY_IDX
+included, as `Corrupted`.
 
 `footer_crc32c` is computed over: the `SpanFooter` bytes, then `footer_len`
 (u32 LE), `version` (u16 LE), `signal`, `reserved`, `magic`. Every trailer byte
@@ -175,11 +175,15 @@ Identical in shape to RLOG/RSEG:
    GET.
 4. Verify `footer_crc32c` (over the bytes defined above) before decoding the
    footer.
-5. Validate the section table: all three mandatory kinds present (four under
-   v5), at most one of each, every range inside the section area, every
+5. Validate the section table: all four mandatory kinds present, at most one
+   of each, every range inside the section area, every
    `uncompressed_len` within the cap. `validate_sections` does not refuse a
    kind it does not know; it checks presence of the mandatory kinds and the
-   range and compression tag of every entry.
+   range and compression tag of every entry. The KEY_IDX entry must be stored
+   uncompressed (`comp` none and `uncompressed_len` equal to `len`), and its
+   `prefix_len` must be non-zero, no larger than the section's `len`, and at
+   most `KEY_IDX_PREFIX_MAX` (4 MiB, `ravel-codec`); `prefix_len` on any other
+   entry is not checked.
 
 ## SpanFooter
 
@@ -198,7 +202,8 @@ Fields:
   `record_count`, `block_count`, and `min_trace_id` / `max_trace_id` (16 bytes
   each: the first and last record's trace_id in sort order).
 - `sections`: the section table (`kind`, `offset`, `len`, `crc32c`, `comp`,
-  `uncompressed_len`).
+  `uncompressed_len`, and `prefix_len`, set only on the KEY_IDX entry: the
+  byte length of the section's header and directory, see "KEY_IDX").
 - compaction identity (mirrors ADR-0032's RLOG fields): `level`
   (0 = L0 flush object, 1 = L1 compacted part), `input_set_hash` (empty on L0),
   `part_index` (0 on L0). An L0 object written by the ordinary flush path
@@ -461,7 +466,7 @@ whole-section crc mismatch, a per-entry crc mismatch, a truncated container, or
 an entry count that disagrees with the block count is a typed `Corrupted`
 error, never a silent degrade and never a panic.
 
-## KEY_IDX (trailer version 5, ADR-2707, proposed)
+## KEY_IDX (trailer version 5, ADR-2707)
 
 The exact per-object `trace_id` index: every distinct `(key8, block ordinal)`
 pair in the object, where `key8` is the first 8 bytes of the 16-byte
@@ -488,6 +493,15 @@ writer:
   bucket it needs; neither GET depends on adjacency, and no section byte is
   read before the first GET is sized. A read that is not a `trace_id` lookup
   never touches the section.
+
+`RspanReader::probe_trace` and `RspanRangeReader::probe_trace` implement the
+probe: both return the ascending block ordinals the section names for the
+id's `key8`, an empty list when the key is absent, and `Corrupted` for an
+ordinal at or past the block count anywhere in the bucket read. The ranged
+form takes a range-read callback and issues at most the two reads above, the
+second only when the bucket for the key is non-empty.
+Neither takes the SKIP_IDX intersection described next; that is the query
+path's step.
 
 A `trace_id =` lookup probes KEY_IDX after the SKIP_IDX range test and
 before any block is read: an absent key proves the trace absent from every
@@ -575,7 +589,7 @@ read from bytes outside that crc, and RSPAN adds no separate per-column or
 per-event checksum: the whole-block crc32c is the single covering checksum for
 all of them, exactly as it already was for the v1..v3 columns.
 
-The v5 KEY_IDX section (ADR-2707, proposed) is read by range, so its
+The v5 KEY_IDX section (ADR-2707) is read by range, so its
 whole-section `Section.crc32c` is stored but not what a probe verifies. Its
 own framing carries the access-path checksums docs/log-segment-format.md's
 coverage map lists: a header crc32c over every header byte, a directory
@@ -602,8 +616,8 @@ re-encodes verbatim with no cross-object identity reconciliation. The merge
 decodes each input's records, groups the union by `trace_id`, re-sorts by
 `(trace_id, start_ts)` (this format's canonical order), and rebuilds
 size-capped parts via `RspanWriter::finish_compacted`, splitting output on
-trace boundaries so one trace's spans never straddle two parts. Under v5
-(ADR-2707, proposed) `finish_compacted` emits KEY_IDX through the same
+trace boundaries so one trace's spans never straddle two parts.
+`finish_compacted` emits KEY_IDX (v5, ADR-2707) through the same
 pipeline as `finish`, so an L1 object carries its own index and the catalog
 fold rebuilds the part's `.kidx` leaf from it when the compaction record
 lands.

@@ -1096,9 +1096,9 @@ fn row_column(idx: usize, rows: &[SpanRow]) -> DFResult<ArrayRef> {
 
 /// Build the `events` column (issue #1710) for the row path.
 ///
-/// The source is the span's `_events_raw` attribute, which the RSPAN v4 reader
+/// The source is the span's `_events_raw` attribute, which the RSPAN reader
 /// rebuilds byte-for-byte from the block's nested event columns
-/// ([`ravel_rspan::SpanEvent`]), so this column carries the v4 event data and
+/// ([`ravel_rspan::SpanEvent`]), so this column carries the stored event data and
 /// not a re-parse of some other encoding. A span with no `_events_raw`, or one
 /// whose value does not parse as an events blob, gets a NULL list rather than
 /// an empty one: the attribute is still in `attrs` for a caller that wants the

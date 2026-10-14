@@ -9,22 +9,24 @@
 
 use prost::Message;
 
+use ravel_codec::key_idx::key_idx_prefix_range;
+
 use crate::error::SpanSegError;
 use crate::pb;
 
 /// Trailer magic, last 4 bytes of every RSPAN object.
 pub const MAGIC: [u8; 4] = *b"RSP1";
-/// RSPAN trailer version. v4 (ADR-0045 decision 3) replaces v3's single opaque
-/// `attrs` blob column with RLOG's per-key string columns (1000-column budget,
-/// `attrs_raw` overflow) and promotes span events into nested columns
-/// (`event_ts`/`event_name`/`event_attrs_blob` with a per-row `event_count`),
-/// keeping v3's mandatory BLOOM section ([`kind::BLOOM`]) and lifted
-/// `service_name` column (id 9). v2 (ADR-0045 decision 2) had added per-block
-/// duration bounds and a status mask to SKIP_IDX. Any earlier version (v1, v2,
-/// v3) is rejected with the same typed `unsupported version` error as any other
-/// unknown version (ADR-0045 decision 4, ADR-0054 decision 1: single supported
-/// version, no dual reader; v4 retires v3 with no dual reader).
-pub const VERSION: u16 = 4;
+/// RSPAN trailer version. v5 (ADR-2707 decision 2) adds the mandatory KEY_IDX
+/// section ([`kind::KEY_IDX`]), an exact index from `trace_id` to the blocks
+/// holding it, built on `ravel-codec`'s `key_idx` grammar; the block layout is
+/// v4's. v4 (ADR-0045 decision 3) replaced v3's single opaque `attrs` blob
+/// column with RLOG's per-key string columns and promoted span events into
+/// nested columns, keeping v3's mandatory BLOOM section and lifted
+/// `service_name` column. Any earlier version (v1 to v4) is rejected with the
+/// same typed `unsupported version` error as any other unknown version
+/// (single supported version, no dual reader: v5 retires v4 the way v4
+/// retired v3).
+pub const VERSION: u16 = 5;
 
 /// The set of RSPAN trailer versions this build's reader accepts (ADR-0066
 /// decision 1: "N/N-1 window, readers first"). Writers always emit the current
@@ -101,8 +103,8 @@ pub const COMP_ZSTD: u8 = 2;
 /// Default per-section decompressed-size cap used during open validation.
 pub const DEFAULT_MAX_SECTION_UNCOMP: u64 = 1 << 30;
 
-/// Section kinds (docs/span-segment-format.md). All three kinds are mandatory
-/// as of v3 (ADR-0054); any other kind is skipped.
+/// Section kinds (docs/span-segment-format.md). All four kinds are mandatory
+/// as of v5 (ADR-2707); any other kind is skipped.
 pub mod kind {
     /// Columnar row blocks.
     pub const BLOCKS: u32 = 1;
@@ -113,6 +115,10 @@ pub mod kind {
     /// read through `ravel-codec`'s `bloom_section`. Mandatory: a missing BLOOM
     /// is a `Corrupted` error, the same as a missing SKIP_IDX.
     pub const BLOOM: u32 = 3;
+    /// Exact `trace_id` index (v5, ADR-2707): one `key_idx` field named
+    /// `trace_id` of key type `Id16`, mapping each trace to the SKIP_IDX block
+    /// ordinals holding it. Mandatory; its footer entry carries `prefix_len`.
+    pub const KEY_IDX: u32 = 4;
 }
 
 /// One section table entry (mirrors `ravel.rspan.v1.Section`).
@@ -124,6 +130,9 @@ pub struct SectionDesc {
     pub crc32c: u32,
     pub comp: u8,
     pub uncomp_len: u64,
+    /// KEY_IDX prefix length (header plus field directories). Non-zero only on
+    /// the [`kind::KEY_IDX`] entry; zero on every other kind.
+    pub prefix_len: u32,
 }
 
 /// The decoded footer (mirrors `ravel.rspan.v1.SpanFooter`).
@@ -178,6 +187,7 @@ impl SpanFooter {
                     crc32c: s.crc32c,
                     comp: i32::from(s.comp),
                     uncompressed_len: s.uncomp_len,
+                    prefix_len: s.prefix_len,
                 })
                 .collect(),
             level: self.level,
@@ -206,6 +216,7 @@ impl SpanFooter {
                 crc32c: s.crc32c,
                 comp,
                 uncomp_len: s.uncompressed_len,
+                prefix_len: s.prefix_len,
             });
         }
         Ok(SpanFooter {
@@ -352,15 +363,17 @@ pub fn open_from_suffix(suffix: &[u8], total_size: u64) -> Result<SuffixOutcome,
     Ok(SuffixOutcome::Ready(footer))
 }
 
-/// Validates the section table: at most one of each known kind, all three
+/// Validates the section table: at most one of each known kind, all four
 /// mandatory kinds present, every range inside the section area with
-/// overflow-checked arithmetic, and every `uncomp_len` within the cap.
+/// overflow-checked arithmetic, every `uncomp_len` within the cap, and the
+/// KEY_IDX entry stored raw with a `prefix_len` that is non-zero, not past the
+/// section, and at most `KEY_IDX_PREFIX_MAX`.
 pub fn validate_sections(
     footer: &SpanFooter,
     section_area_end: u64,
     max_uncomp: u64,
 ) -> Result<(), SpanSegError> {
-    let known = [kind::BLOCKS, kind::SKIP_IDX, kind::BLOOM];
+    let known = [kind::BLOCKS, kind::SKIP_IDX, kind::BLOOM, kind::KEY_IDX];
     for k in known {
         let n = footer.sections.iter().filter(|s| s.kind == k).count();
         if n == 0 {
@@ -392,6 +405,16 @@ pub fn validate_sections(
                 "unknown comp tag {}",
                 s.comp
             )));
+        }
+        if s.kind == kind::KEY_IDX {
+            // The probe ranges into the stored bytes, so they must be the
+            // section itself.
+            if s.comp != COMP_NONE || s.uncomp_len != s.len {
+                return Err(SpanSegError::Corrupted(
+                    "KEY_IDX section must be stored raw".into(),
+                ));
+            }
+            key_idx_prefix_range(s.prefix_len, s.len)?;
         }
     }
     Ok(())
@@ -480,38 +503,33 @@ mod tests {
 
     use super::*;
 
-    /// The three mandatory v3 sections, each one byte inside a 3-byte body.
+    fn desc(kind: u32, offset: u64, comp: u8) -> SectionDesc {
+        SectionDesc {
+            kind,
+            offset,
+            len: 1,
+            crc32c: 0,
+            comp,
+            uncomp_len: 1,
+            prefix_len: 0,
+        }
+    }
+
+    /// The four mandatory v5 sections, each one byte inside a 4-byte body.
     fn sample_sections() -> Vec<SectionDesc> {
         vec![
+            desc(kind::BLOCKS, 0, COMP_NONE),
             SectionDesc {
-                kind: kind::BLOCKS,
-                offset: 0,
-                len: 1,
-                crc32c: 0,
-                comp: COMP_NONE,
-                uncomp_len: 1,
+                prefix_len: 1,
+                ..desc(kind::KEY_IDX, 1, COMP_NONE)
             },
-            SectionDesc {
-                kind: kind::SKIP_IDX,
-                offset: 1,
-                len: 1,
-                crc32c: 0,
-                comp: COMP_ZSTD,
-                uncomp_len: 1,
-            },
-            SectionDesc {
-                kind: kind::BLOOM,
-                offset: 2,
-                len: 1,
-                crc32c: 0,
-                comp: COMP_NONE,
-                uncomp_len: 1,
-            },
+            desc(kind::SKIP_IDX, 2, COMP_ZSTD),
+            desc(kind::BLOOM, 3, COMP_NONE),
         ]
     }
 
     /// Body length covered by [`sample_sections`]: one byte per section.
-    const SAMPLE_BODY_LEN: usize = 3;
+    const SAMPLE_BODY_LEN: usize = 4;
 
     fn sample_footer(sections: Vec<SectionDesc>) -> SpanFooter {
         SpanFooter {
@@ -545,8 +563,11 @@ mod tests {
         let got = open(&obj).expect("open");
         assert_eq!(got.shard, 7);
         assert_eq!(got.record_count, 42);
-        assert_eq!(got.section(kind::SKIP_IDX).map(|s| s.offset), Some(1));
-        assert_eq!(got.section(kind::BLOOM).map(|s| s.offset), Some(2));
+        assert_eq!(got.section(kind::KEY_IDX).map(|s| s.offset), Some(1));
+        assert_eq!(got.section(kind::KEY_IDX).map(|s| s.prefix_len), Some(1));
+        assert_eq!(got.section(kind::SKIP_IDX).map(|s| s.offset), Some(2));
+        assert_eq!(got.section(kind::BLOOM).map(|s| s.offset), Some(3));
+        assert_eq!(got.section(kind::BLOOM).map(|s| s.prefix_len), Some(0));
         assert_eq!(got.max_trace_id, [9u8; 16]);
     }
 
@@ -586,7 +607,7 @@ mod tests {
         bad[n - 5] = 9;
         assert!(matches!(open(&bad), Err(SpanSegError::Corrupted(_))));
 
-        // Footer crc mismatch (flip a footer proto byte; the 3-byte body precedes it).
+        // Footer crc mismatch (flip a footer proto byte; the 4-byte body precedes it).
         let mut bad = obj.clone();
         bad[n - TRAILER_LEN - 1] ^= 0xff;
         assert!(matches!(open(&bad), Err(SpanSegError::Corrupted(_))));
@@ -597,12 +618,12 @@ mod tests {
         assert!(matches!(open(&bad), Err(SpanSegError::Corrupted(_))));
     }
 
-    /// Today's RSPAN window resolves to exactly the single current version, so
-    /// the reader's accepted set is byte-for-byte the pre-ADR-0066 behaviour:
-    /// v3 accepted, v1/v2 and a hypothetical v4 rejected. Only the window's
-    /// shape is new machinery.
+    /// Today's RSPAN window resolves to exactly the single current version:
+    /// v5 accepted, v4 and older and a hypothetical v6 rejected.
     #[test]
     fn todays_window_accepts_only_the_current_version() {
+        assert_eq!(VERSION, 5);
+        assert!(!SUPPORTED_VERSIONS.contains(4));
         assert_eq!(SUPPORTED_VERSIONS.newest(), VERSION);
         assert_eq!(SUPPORTED_VERSIONS.oldest(), VERSION);
         assert!(SUPPORTED_VERSIONS.contains(VERSION));
@@ -670,51 +691,66 @@ mod tests {
         }
     }
 
+    /// A trailer naming the retired v4 is refused from the trailer alone: the
+    /// version gate runs before the footer is even crc-checked.
+    #[test]
+    fn rejects_v4_trailer_as_unsupported_version() {
+        let mut obj = build_object(SAMPLE_BODY_LEN);
+        let n = obj.len();
+        obj[n - TRAILER_LEN + 8..n - TRAILER_LEN + 10].copy_from_slice(&4u16.to_le_bytes());
+        assert!(matches!(
+            open(&obj),
+            Err(SpanSegError::UnsupportedVersion(4))
+        ));
+        let suffix = &obj[n - TRAILER_LEN..];
+        assert!(matches!(
+            open_from_suffix(suffix, n as u64),
+            Err(SpanSegError::UnsupportedVersion(4))
+        ));
+    }
+
+    fn open_sections(sections: Vec<SectionDesc>) -> Result<SpanFooter, SpanSegError> {
+        let mut obj = vec![0u8; SAMPLE_BODY_LEN];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+        open(&obj)
+    }
+
+    fn assert_corrupted_naming(got: Result<SpanFooter, SpanSegError>, needle: &str) {
+        match got {
+            Err(SpanSegError::Corrupted(msg)) => {
+                assert!(msg.contains(needle), "expected {needle:?} in {msg:?}");
+            }
+            other => panic!("expected Corrupted naming {needle:?}, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rejects_missing_and_out_of_range_sections() {
-        // Missing SKIP_IDX (and BLOOM): only BLOCKS present.
-        let sections = vec![SectionDesc {
-            kind: kind::BLOCKS,
-            offset: 0,
-            len: 1,
-            crc32c: 0,
-            comp: COMP_NONE,
-            uncomp_len: 1,
-        }];
-        let mut obj = vec![0u8; SAMPLE_BODY_LEN];
-        write_footer_and_trailer(&mut obj, &sample_footer(sections));
-        assert!(matches!(open(&obj), Err(SpanSegError::Corrupted(_))));
+        // Missing SKIP_IDX, BLOOM and KEY_IDX: only BLOCKS present.
+        let sections = vec![desc(kind::BLOCKS, 0, COMP_NONE)];
+        assert!(matches!(
+            open_sections(sections),
+            Err(SpanSegError::Corrupted(_))
+        ));
 
-        // Missing the mandatory BLOOM section (BLOCKS + SKIP_IDX only): the
-        // same mandatory-section rejection a missing SKIP_IDX takes (ADR-0054).
-        let sections = vec![
-            SectionDesc {
-                kind: kind::BLOCKS,
-                offset: 0,
-                len: 1,
-                crc32c: 0,
-                comp: COMP_NONE,
-                uncomp_len: 1,
-            },
-            SectionDesc {
-                kind: kind::SKIP_IDX,
-                offset: 1,
-                len: 1,
-                crc32c: 0,
-                comp: COMP_ZSTD,
-                uncomp_len: 1,
-            },
-        ];
-        let mut obj = vec![0u8; SAMPLE_BODY_LEN];
-        write_footer_and_trailer(&mut obj, &sample_footer(sections));
-        match open(&obj) {
-            Err(SpanSegError::Corrupted(msg)) => {
-                assert!(
-                    msg.contains(&format!("{}", kind::BLOOM)),
-                    "unexpected: {msg}"
-                );
-            }
-            other => panic!("expected missing-BLOOM Corrupted, got {other:?}"),
+        // Each mandatory kind missing on its own, and each duplicated.
+        for k in [kind::BLOCKS, kind::SKIP_IDX, kind::BLOOM, kind::KEY_IDX] {
+            let sections: Vec<_> = sample_sections()
+                .into_iter()
+                .filter(|s| s.kind != k)
+                .collect();
+            assert_corrupted_naming(
+                open_sections(sections),
+                &format!("missing section kind {k}"),
+            );
+
+            let mut sections = sample_sections();
+            let dup = *sections.iter().find(|s| s.kind == k).expect("kind present");
+            sections.push(dup);
+            assert_corrupted_naming(
+                open_sections(sections),
+                &format!("duplicate section kind {k}"),
+            );
         }
 
         // A section pointing past the section area.
@@ -725,7 +761,52 @@ mod tests {
         assert!(matches!(open(&obj), Err(SpanSegError::Corrupted(_))));
     }
 
-    /// Round-trip of a v4 segment. Writes a segment with known service names and
+    /// The KEY_IDX footer entry's `prefix_len` must be non-zero, inside the
+    /// section, and at most `KEY_IDX_PREFIX_MAX`, and the section must be
+    /// stored raw; each violation is `Corrupted` at open.
+    #[test]
+    fn rejects_bad_key_idx_footer_entry() {
+        use ravel_codec::key_idx::KEY_IDX_PREFIX_MAX;
+
+        let with_key_idx = |f: &dyn Fn(&mut SectionDesc)| {
+            let mut sections = sample_sections();
+            let entry = sections
+                .iter_mut()
+                .find(|s| s.kind == kind::KEY_IDX)
+                .expect("KEY_IDX present");
+            f(entry);
+            open_sections(sections)
+        };
+        assert_corrupted_naming(with_key_idx(&|s| s.prefix_len = 0), "prefix_len is zero");
+        assert_corrupted_naming(with_key_idx(&|s| s.prefix_len = 2), "past the section");
+        assert_corrupted_naming(
+            with_key_idx(&|s| {
+                s.prefix_len = KEY_IDX_PREFIX_MAX + 1;
+            }),
+            "over KEY_IDX_PREFIX_MAX",
+        );
+        assert_corrupted_naming(with_key_idx(&|s| s.comp = COMP_ZSTD), "stored raw");
+        assert_corrupted_naming(with_key_idx(&|s| s.uncomp_len = 2), "stored raw");
+
+        // At the cap exactly is accepted when the section is that long.
+        let mut sections = sample_sections();
+        for s in sections.iter_mut().filter(|s| s.kind == kind::KEY_IDX) {
+            s.len = u64::from(KEY_IDX_PREFIX_MAX);
+            s.uncomp_len = s.len;
+            s.prefix_len = KEY_IDX_PREFIX_MAX;
+            s.offset = SAMPLE_BODY_LEN as u64;
+        }
+        let mut obj = vec![0u8; SAMPLE_BODY_LEN + KEY_IDX_PREFIX_MAX as usize];
+        write_footer_and_trailer(&mut obj, &sample_footer(sections));
+        assert!(open(&obj).is_ok());
+
+        // prefix_len on a non-KEY_IDX kind is ignored.
+        let mut sections = sample_sections();
+        sections[0].prefix_len = 99;
+        assert!(open_sections(sections).is_ok());
+    }
+
+    /// Round-trip of a v5 segment. Writes a segment with known service names and
     /// span names across multiple blocks, reads it back, and confirms: the
     /// trailer is at the live `footer::VERSION`
     /// (never a mirrored literal); the mandatory BLOOM section
@@ -734,7 +815,7 @@ mod tests {
     /// corrupted or truncated BLOOM section is a typed `Corrupted` error, not a
     /// panic.
     #[test]
-    fn v4_bloom_and_service_name_column_roundtrip() {
+    fn bloom_and_service_name_column_roundtrip() {
         use ravel_codec::bloom_section::BloomSection;
         use ravel_codec::tokenizer::tokens;
 

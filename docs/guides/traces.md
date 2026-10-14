@@ -209,7 +209,7 @@ FROM (SELECT trace_id, span_id, unnest(links) AS l FROM spans
 WHERE l['attrs']['relationship'] = 'follows_from';
 ```
 
-`events` reads the nested event columns of RSPAN v4. `links` has no separate
+`events` reads RSPAN's nested event columns. `links` has no separate
 column on disk. On every RSPAN version, Ravel decodes `links` straight from
 the plain `_links_raw` attribute. The column costs one protobuf decode per
 row whenever a query selects it.

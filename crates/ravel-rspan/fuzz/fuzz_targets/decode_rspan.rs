@@ -8,7 +8,8 @@
 //! panic or out-of-bounds access. Per CLAUDE.md's corrupt-input testing
 //! pattern, feeding arbitrary bytes to the reader entry points must never
 //! panic. This target asserts exactly that by driving the whole-object reader,
-//! the pruned scan, and the footer/suffix parsers with unstructured input.
+//! the pruned scan, the KEY_IDX probe on both the whole-object and the ranged
+//! reader, and the footer/suffix parsers with unstructured input.
 //!
 //! It is the unbounded, coverage-guided complement to the crate's bounded
 //! `decode_never_panics`-style proptests: the proptests replay a fixed catalog
@@ -16,11 +17,21 @@
 //! under coverage feedback.
 
 use libfuzzer_sys::fuzz_target;
+use ravel_rspan::footer::{DEFAULT_MAX_SECTION_UNCOMP, kind};
 use ravel_rspan::skip_index::SkipIndex;
 use ravel_rspan::{
-    BloomPredicate, BloomSection, COL_NAME, COL_SERVICE_NAME, RspanConfig, RspanReader, SpanQuery,
-    open, open_from_suffix,
+    BloomPredicate, BloomSection, COL_NAME, COL_SERVICE_NAME, RspanConfig, RspanRangeReader,
+    RspanReader, SpanQuery, SpanSegError, open, open_from_suffix, read_section,
 };
+
+/// A trace id taken from the first 16 input bytes (zero-padded), so the
+/// fuzzer steers which KEY_IDX bucket a probe lands in.
+fn probe_id(data: &[u8]) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    let n = data.len().min(16);
+    id[..n].copy_from_slice(&data[..n]);
+    id
+}
 
 fuzz_target!(|data: &[u8]| {
     let cfg = RspanConfig::default();
@@ -82,10 +93,32 @@ fuzz_target!(|data: &[u8]| {
                 &preds,
             );
         }
+
+        // KEY_IDX (v5, ADR-2707): probe a fixed trace and one taken from the
+        // input, and verify every bucket frame for the inspection summary.
+        let _ = reader.probe_trace(&[0u8; 16]);
+        let _ = reader.probe_trace(&probe_id(data));
+        let _ = reader.key_idx_summary();
     }
 
-    // Footer + section table parse in isolation over the whole object.
-    let _ = open(data);
+    // Footer + section table parse in isolation over the whole object, then
+    // the ranged KEY_IDX probe, whose partial reads skip the whole-section crc
+    // and so rest on the grammar's own checks.
+    if let Ok(footer) = open(data)
+        && let Some(skip) = footer.section(kind::SKIP_IDX)
+        && let Ok(skip_raw) = read_section(data, skip, DEFAULT_MAX_SECTION_UNCOMP)
+        && let Ok(ranged) = RspanRangeReader::from_sections(&footer, &skip_raw)
+    {
+        let read = |r: std::ops::Range<u64>| {
+            usize::try_from(r.start)
+                .ok()
+                .zip(usize::try_from(r.end).ok())
+                .and_then(|(start, end)| data.get(start..end))
+                .ok_or_else(|| SpanSegError::Corrupted("range past object".into()))
+        };
+        let _ = ranged.probe_trace(&[0u8; 16], read);
+        let _ = ranged.probe_trace(&probe_id(data), read);
+    }
 
     // Suffix reader protocol: split the input into a declared total object size
     // and the tail bytes so the fuzzer can reach both the `NeedRange` path

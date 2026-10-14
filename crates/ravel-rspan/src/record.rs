@@ -27,7 +27,7 @@ use crate::varint::{get_uvarint, put_uvarint};
 // Fixed column ids (docs/span-segment-format.md BLOCKS). Ids 0..=13 are the
 // reserved fixed columns; dynamic per-key attribute columns start at
 // [`FIRST_DYNAMIC_COL`] and carry their name in the block's own directory
-// (RSPAN v4 blocks are self-describing; there is no object-wide FIELD_DIR
+// (RSPAN blocks are self-describing; there is no object-wide FIELD_DIR
 // section).
 pub const COL_TRACE_ID: u32 = 0;
 pub const COL_SPAN_ID: u32 = 1;

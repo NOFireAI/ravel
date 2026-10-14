@@ -1,24 +1,28 @@
-//! Golden-bytes regression for the RSPAN v4 writer (ADR-0045 decision 3,
+//! Golden-bytes regression for the RSPAN v5 writer (ADR-2707 decision 2,
 //! docs/span-segment-format.md): the writer's output for a fixed representative
-//! input must stay byte-for-byte identical across internal refactors of the v4
-//! encode path. RSPAN v4 is a frozen persistent contract; this test is the
+//! input must stay byte-for-byte identical across internal refactors of the v5
+//! encode path. RSPAN v5 is a frozen persistent contract; this test is the
 //! tripwire for an accidental format change.
 //!
-//! The fixture exercises the v4-added grammar: per-key dynamic string columns
-//! (`http.method`), a lifted `service_name` column, the mandatory BLOOM
-//! section, and the nested event columns (one span carries a `_events_raw`
-//! blob). The writer takes all identity, timestamps, and config as inputs (no
-//! `SystemTime::now`, no randomness), so the output is deterministic and
-//! golden-pinnable.
+//! The fixture exercises the whole grammar: per-key dynamic string columns
+//! (`http.method`), a lifted `service_name` column, the mandatory BLOOM and
+//! KEY_IDX sections, and the nested event columns (one span carries a
+//! `_events_raw` blob). The writer takes all identity, timestamps, and config
+//! as inputs (no `SystemTime::now`, no randomness), so the output is
+//! deterministic and golden-pinnable.
 //!
-//! To regenerate `golden_rspan_v4.bin` after a deliberate, versioned format
+//! `golden_rspan_v4.bin` is the retired v4 writer's output, kept only to pin
+//! that a v4 object is refused with `UnsupportedVersion`.
+//!
+//! To regenerate `golden_rspan_v5.bin` after a deliberate, versioned format
 //! change (never for an internal refactor), run:
-//!   cargo test -p ravel-rspan --test golden_bytes_v4 -- --ignored --nocapture
+//!   cargo test -p ravel-rspan --test golden_bytes_v5 -- --ignored --nocapture
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_rspan::footer::{self, kind};
 use ravel_rspan::{
-    ObjectIdentity, RspanConfig, RspanReader, RspanWriter, SpanQuery, SpanRecord, StatusCode, open,
+    ObjectIdentity, RspanConfig, RspanReader, RspanWriter, SpanQuery, SpanRecord, SpanSegError,
+    StatusCode, open,
 };
 
 fn fixed_identity() -> ObjectIdentity {
@@ -52,8 +56,8 @@ fn events_blob() -> String {
 }
 
 /// A fixed handful of spans across several services and names, one span per
-/// block so each block's BLOOM, service_name, dynamic, and event columns have
-/// known content. The first span carries an events blob.
+/// block so each block's BLOOM, KEY_IDX, service_name, dynamic, and event
+/// columns have known content. The first span carries an events blob.
 fn golden_records() -> Vec<SpanRecord> {
     let rows = [
         ("checkout", "GET /cart", StatusCode::Ok),
@@ -98,23 +102,23 @@ fn write_golden() -> Vec<u8> {
     for rec in golden_records() {
         w.push(rec);
     }
-    w.finish().expect("finish v4 golden")
+    w.finish().expect("finish v5 golden")
 }
 
 #[test]
 fn matches_golden_fixture() {
     let written = write_golden();
-    let fixture: &[u8] = include_bytes!("fixtures/golden_rspan_v4.bin");
+    let fixture: &[u8] = include_bytes!("fixtures/golden_rspan_v5.bin");
     assert_eq!(
         written.as_slice(),
         fixture,
-        "RSPAN v4 writer output diverged from the captured golden fixture; \
-         RSPAN v4 is frozen (docs/span-segment-format.md) -- this must never change \
+        "RSPAN v5 writer output diverged from the captured golden fixture; \
+         RSPAN v5 is frozen (docs/span-segment-format.md) -- this must never change \
          without a version bump and ADR"
     );
 
     // The trailer carries the live footer::VERSION (never a mirrored literal),
-    // and every mandatory section is present, including the BLOOM.
+    // and every mandatory section is present, including BLOOM and KEY_IDX.
     let n = written.len();
     assert_eq!(
         u16::from_le_bytes([written[n - 8], written[n - 7]]),
@@ -122,7 +126,7 @@ fn matches_golden_fixture() {
         "trailer must carry the live footer::VERSION"
     );
     let decoded = open(&written).expect("open golden object");
-    for k in [kind::BLOCKS, kind::SKIP_IDX, kind::BLOOM] {
+    for k in [kind::BLOCKS, kind::SKIP_IDX, kind::BLOOM, kind::KEY_IDX] {
         assert!(
             decoded.section(k).is_some(),
             "mandatory section kind {k} present"
@@ -152,6 +156,27 @@ fn matches_golden_fixture() {
         let want_attrs: Vec<(String, String)> = want_attrs.into_iter().collect();
         assert_eq!(g.attrs, want_attrs);
     }
+
+    // One span per block, written in trace_id order: trace [i; 16] is block i.
+    for i in 0..4u8 {
+        assert_eq!(
+            reader.probe_trace(&[i; 16]).expect("probe"),
+            Some(vec![u32::from(i)])
+        );
+    }
+    assert_eq!(reader.probe_trace(&[9; 16]).expect("probe"), Some(vec![]));
+}
+
+#[test]
+fn v4_golden_fixture_is_unsupported_version() {
+    let v4: &[u8] = include_bytes!("fixtures/golden_rspan_v4.bin");
+    let n = v4.len();
+    assert_eq!(u16::from_le_bytes([v4[n - 8], v4[n - 7]]), 4);
+    assert!(matches!(open(v4), Err(SpanSegError::UnsupportedVersion(4))));
+    assert!(matches!(
+        RspanReader::new(v4, &golden_config()),
+        Err(SpanSegError::UnsupportedVersion(4))
+    ));
 }
 
 #[test]
@@ -159,14 +184,14 @@ fn write_is_deterministic_across_repeated_calls() {
     assert_eq!(
         write_golden(),
         write_golden(),
-        "v4 output must be deterministic"
+        "v5 output must be deterministic"
     );
 }
 
 #[test]
 #[ignore = "regenerates a golden fixture; run explicitly, never in CI"]
-fn capture_golden_rspan_v4() {
+fn capture_golden_rspan_v5() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
     std::fs::create_dir_all(dir).expect("create fixtures dir");
-    std::fs::write(format!("{dir}/golden_rspan_v4.bin"), write_golden()).expect("write fixture");
+    std::fs::write(format!("{dir}/golden_rspan_v5.bin"), write_golden()).expect("write fixture");
 }
