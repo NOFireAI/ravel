@@ -1781,10 +1781,12 @@ ravel-cli typed-attr-column show <tenant>
 - `--no-key-index` turns the column index off.
 - An omitted flag keeps the stored value. A new declaration that drops or
   retypes a kept key-index column is refused; pass `--key-index` with the
-  columns to keep. A column kept under a new type, or a change made at the
-  64-field cap, leaves that column uncovered in compacted log objects whose
-  inputs mix the two declarations, until those inputs age out. It does not
-  block compaction or erasure.
+  columns to keep. A column kept under a new type is unindexed in compacted
+  log objects whose inputs mix the two types. When the inputs of one
+  compaction together name more than 64 fields, the output keeps
+  `trace_id` and then the names that sort first, so an unchanged column can
+  be the one left unindexed. Neither blocks compaction or erasure; a query
+  on an unindexed column reads the object instead of probing its index.
 - **Turning either index on needs `--readers-rolled-out`.** The setting
   needs tenant config record version 4. A process on a release that does not
   read version 4 refuses the record, and that tenant's ingest and lifecycle

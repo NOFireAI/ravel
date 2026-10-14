@@ -544,7 +544,9 @@ flowchart LR
   completion is settled by #1848 for both object kinds. Until a rewrite
   lands, the pending-erasure predicate filters rows after the index, so the
   index never surfaces an erased subject in a result.
-- **Compaction.** Every object carries KEY_IDX, L0 and L1 alike. For RSPAN
+- **Compaction.** Every object carries KEY_IDX, L0 and L1 alike, except an
+  RLOG object all of whose fields were left out under the T8 compaction
+  amendment below, which carries none and is read as unindexed. For RSPAN
   that follows from the shared flush pipeline (`RspanWriter::finish_compacted`
   builds `trace_id` from rows). For RLOG the indexed set is a builder input
   (`RlogWriter::with_key_index_fields`), so the compactor recovers it the

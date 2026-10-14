@@ -1587,11 +1587,12 @@ The merge is defined entirely in terms of this format:
   and logged at warn level, and the merge goes ahead with every other
   field; a union over 64 fields keeps `trace_id`, when named, and then the
   first names in ascending byte order up to 64, and logs each field it
-  drops. The choice depends on the names alone, so a retried merge writes
-  the same field set. A retype of a key-index column, or a change made at
-  the 64-field cap, therefore leaves the affected field uncovered in any
-  output whose inputs mix the two declarations, until those inputs age
-  out, and it does not block compaction or erasure. An output without any
+  drops. The choice depends only on the set of (name, key type) pairs the
+  inputs carry, not on their order, so a retried merge writes the same
+  field set. A retype of a key-index column therefore leaves that column
+  uncovered in an output whose inputs mix the two types, and a union over
+  the cap leaves uncovered the names that sort last, which need not be the
+  column that changed; neither blocks compaction or erasure. An output without any
   input KEY_IDX has none. The erasure rewrite uses the same merge, so its
   survivors keep every input's field set less those same exclusions.
 - **Compression level.** The compactor and the erasure rewrite encode every

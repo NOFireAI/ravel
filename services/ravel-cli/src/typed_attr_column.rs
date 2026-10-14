@@ -404,8 +404,8 @@ fn apply_key_index(proposed: &mut TenantConfig, spec: &KeyIndexSpec) -> anyhow::
         anyhow::anyhow!(
             "{err}; the stored key_index names a column this declaration drops or retypes, so \
              pass --key-index with the columns to keep. A column kept under a new type is \
-             uncovered in compacted objects whose inputs mix the two types, until those inputs \
-             age out; it does not block compaction or erasure"
+             unindexed in compacted objects whose inputs mix the two types; it does not block \
+             compaction or erasure"
         )
     })?;
     Ok(())
