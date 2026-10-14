@@ -234,9 +234,9 @@ that order on OTAP.
 What the permit covered by accident, the count of held response contexts,
 gets an explicit bound: `--max-pending-strict-acks` (default 8,192, 0 =
 unlimited). `submit` takes a pending-ack permit for a strict write before
-sending (see the head pending-ack amendment below: a write admitted at the
-head arrives holding one), and `Submitted` holds it until the acks resolve or the deadline
-passes. A strict request refused here gets the same 429 with `Retry-After`
+sending (see the head pending-ack amendment below: a write admitted at
+the head arrives holding one), and `Submitted` holds it until the acks
+resolve or the deadline passes. A strict request refused here gets the same 429 with `Retry-After`
 and gRPC `RESOURCE_EXHAUSTED` as the in-flight ceiling, with its own body
 text and counter `ravel_ingest_pending_ack_shed_total`, and the gauge
 `ravel_ingest_pending_strict_acks` shows the held count. The two refusals
@@ -569,9 +569,15 @@ HTTP middleware through the admission state each surface instantiates it
 with, and the gRPC admission layer through the strict flush policy, which
 it does not carry today and gains in this change:
 
-- On OTLP HTTP and gRPC the state answers with `resolve_write_mode` over
-  the header or the gRPC metadata, the same function the handler uses, so
-  the head and the handler cannot disagree.
+- On OTLP HTTP the middleware's state answers with `resolve_write_mode`
+  over the request headers, the same call the handler makes.
+- On OTLP gRPC the layer answers with `resolve_write_mode` over the
+  metadata as the handler sees it, rebuilt through
+  `MetadataMap::from_headers` and `metadata_to_headers`. This is the same
+  round trip `grpc_head_tenant` applies so that the head and the handler
+  agree on the tenant. Calling the same function on the raw header map
+  would not be the same input, since the round trip drops binary entries
+  and names that fail to parse.
 - On Remote Write the state answers strict unconditionally, whatever the
   request carries, because the handler writes every Remote Write request
   strictly.
@@ -595,9 +601,16 @@ lands first.
 - The layer takes the permit from the same `Arc<PendingAckBudget>` the
   routers hold, so the bound, the gauge and the shed counter keep one
   source.
-- The permit travels to the handler the way the in-flight release handle
-  does. The handler passes it to the router through a submit entry point
-  that accepts an already-held permit.
+- The permit travels to the handler in its own clonable release handle,
+  because `PendingAckPermit` is a guard with no `Clone` and cannot sit in
+  request extensions itself. The layer keeps a clone of the handle for
+  the request's lifetime, and the handler reads its clone before
+  `request.into_inner()`. So tonic dropping the extensions drops a clone,
+  never the permit. That is the in-flight release handle's design, for the
+  reasons decision 4 gives for it.
+- The handler takes the permit out of the handle and passes it to the
+  router through a submit entry point that accepts an already-held
+  permit.
 - `Submitted` holds it through `acks()` and the deadline, as today.
 - A pre-admitted write never takes a second permit in the router.
 - Callers that do not pass through the admission layer (`ravel-cli load`,
@@ -639,17 +652,25 @@ beside it.
 | Budget 2, PUT held. Two concurrent strict writes. | Both admitted, gauge 2, and a third refused. | Acquiring at the head and again in `submit`: the second is refused. Releasing at `submit`: the third is admitted. |
 | Budget 1, one ack held. A `buffered` request on HTTP and on gRPC. | 200 and OK. | Taking a permit for every mode. Reading the mode from the wrong source on one transport. |
 | Budget 1, one ack held. A Remote Write request carrying `x-ravel-ingest-mode: buffered`. | The pending-ack 429. | Reading the header on Remote Write, which would let any client opt out of the bound. |
-| Budget 1, PUT held. A direct-call gRPC request, with no layer, invoking the service method in-process. | `RESOURCE_EXHAUSTED`, with normalization and `submit` never reached: the router and ingest counters do not move. | A no-layer path that takes no permit at the head: it refuses only after decode. A bare permit dropped with tonic's extensions: the second request is admitted. |
+| Budget 1, its permit held by a strict gRPC request admitted through the layer and parked on a held PUT. A direct-call gRPC request, with no layer, invoking the service method in-process. | `RESOURCE_EXHAUSTED`, with normalization and `submit` never reached: the router and ingest counters do not move. | A no-layer path that takes no permit at the head: it refuses only after decode. A bare permit dropped with tonic's extensions: the second request is admitted. |
 | In-flight ceiling 1, budget 1, one ack held. A strict request is refused by the pending-ack bound, and its body below the drain cap is still draining. A second request, buffered, arrives during that drain. | The second is admitted: the refused request's in-flight slot was returned before its drain. | A drain that runs while the in-flight permit is still held: the second is shed. |
 
 **Follow-through in the code change.** Some text in the tree stops being true
 for admission-layer writes and must change in the same commit as the code:
 
-- the `docs/ingest.md` sentence saying that a strict `submit` takes a
-  pending-ack permit before it charges the byte budget;
+- in `docs/ingest.md`:
+  - the sentence near the top saying that a strict `submit` takes a
+    pending-ack permit before it charges the byte budget;
+  - the admission section's statements that a strict write takes its slot
+    after decode, as its points are submitted, and that the pending-ack
+    refusal comes after decode and so does not replace the head shed;
+  - the "Pending strict-ack budget" section's statement that the refusal
+    is after decode, not a head shed like the in-flight ceiling;
 - the `docs/ingest.md` metric descriptions of the pending-ack gauge and
   shed counter, which describe `submit`;
 - the gauge's HELP text;
+- `docs/guides/operations/configuration.md`, which says the bound limits
+  how many strict writes may wait for their ack at once;
 - the `--max-pending-strict-acks` help, and the flag reference generated
   from it;
 - the module doc of `crates/ravel-ingest/src/pending_ack.rs` and the doc
