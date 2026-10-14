@@ -341,6 +341,14 @@ pub enum SqlError {
     #[error("internal ravel-sql error: {0}")]
     Internal(String),
 
+    /// A plan lowered by a non-SQL front end named a node, table or function
+    /// the session does not admit (crate::statement). The front end built a
+    /// plan it should not have, so this is an engine fault, not an input
+    /// error; the detail names plan internals and is never returned to a
+    /// client.
+    #[error("lowered plan refused: {0}")]
+    PlanNotAdmitted(String),
+
     /// A result cell the JSON encoding cannot represent: a type with no JSON
     /// form, or a value of an encodable type outside what that form can hold
     /// (a timestamp past the i64 nanosecond range, a date outside years 0000
@@ -487,6 +495,7 @@ impl SqlError {
             return ErrorClass::Internal;
         }
         match self {
+            SqlError::PlanNotAdmitted(_) => ErrorClass::Internal,
             SqlError::Validation(_)
             | SqlError::CrossSignalQuery
             | SqlError::TooManyTables { .. } => ErrorClass::BadRequest,
@@ -688,7 +697,9 @@ impl SqlError {
             // variant never carries the value.
             SqlError::UnencodableResult { .. } => self.to_string(),
             SqlError::Execution(_) => MSG_EXECUTION.to_string(),
-            SqlError::Internal(_) | SqlError::OperatorPanic(_) => MSG_INTERNAL.to_string(),
+            SqlError::Internal(_) | SqlError::OperatorPanic(_) | SqlError::PlanNotAdmitted(_) => {
+                MSG_INTERNAL.to_string()
+            }
             SqlError::Shared { message, .. } => message.clone(),
         }
     }
