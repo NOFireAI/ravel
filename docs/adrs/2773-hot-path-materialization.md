@@ -271,7 +271,10 @@ The exact content predicate the SQL scan pushes into `scan_blocks`
   right for attribute, body and severity-text columns, wrong for `ts`
   and `stream_ref`). The resource/scope fallback stays untouched because
   the block predicate never consulted it. `NumRange` stays prune-only
-  (ADR-0095 decision 6).
+  (ADR-0095 decision 6). The language gains one arm, `LIKE` and `NOT
+  LIKE` with a `'%literal%'` pattern on a declared `Str` column, under
+  the contains-arm amendment below; the existing arms keep their
+  semantics.
 - An arm on an attribute that has no FIELD_DIR column of the resolved
   type reads the row's `attrs_raw` cell today (`field_text` and `equals`
   fall through to `overflow_attr`, which decodes the cell and scans it for
@@ -320,6 +323,10 @@ The exact content predicate the SQL scan pushes into `scan_blocks`
 - **Resource and scope fallback values** are appended to the values array
   once per distinct stream in the block, not once per row
   (`logs_scan.rs:6846-6852`, `6904-6912`).
+- On a scan that pushes a contains arm on the column, the column's
+  values are built lazily or for surviving rows only, under the
+  contains-arm amendment below; the build above stays for every other
+  path.
 - The schema stays `Dictionary(Int32, Utf8)` on every path (ADR-0099
   decision 5). The fallback batch of ADR-0099 and the fast-path batch keep
   one schema.
@@ -403,9 +410,9 @@ on the ratio new / main.
 
 | Figure | Band | Miss | Source |
 |---|---|---|---|
-| Set I (q2, q3, q4, q8, q30), warm CPU sum | at most 0.70 | above 0.78 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :417 |
-| Set S (q11, q12, q13, q25, q26, q27), warm CPU sum | at most 0.85 | above 0.92 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :417 |
-| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 (missed at 0.99; see the Set L amendment below) | above 0.92 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :417; the 0.99 miss was measured on #2790, quoted at :589 |
+| Set I (q2, q3, q4, q8, q30), warm CPU sum | at most 0.70 | above 0.78 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :424 |
+| Set S (q11, q12, q13, q25, q26, q27), warm CPU sum | at most 0.85 | above 0.92 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :424 |
+| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.85 (missed at 0.99; see the Set L amendment below) | above 0.92 | predicted from the inclusive shares in the profile table at docs/adrs/2773-hot-path-materialization.md:99, derivation at :424; the 0.99 miss was measured on #2790, quoted at :597 |
 | Set N (11), warm wall sum | at most 0.80 | above 0.88 | predicted |
 | Suite (43), warm CPU sum | at most 0.90 | above 0.95 | predicted |
 | Suite (43), warm wall sum | at most 0.92 | above 0.97 | predicted |
@@ -428,7 +435,8 @@ less the `UTF-8 validation` column it contains is 16.3, 14.0, 19.2, 23.2,
 band did not hold, because those remaining points were treated as
 removable when only the builder's overhead was: about 11 points on q23
 in the profile's leaf frame, about 13.6 on this table's basis). Wall
-bands allow for the serial floor, which does not move.
+bands allow for the serial floor, which does not move. The contains-arm
+amendment below sets its own Set L band, against its own control.
 
 ## Rejected alternatives
 
@@ -597,7 +605,8 @@ new arm against base = `bb171e615` with 011d5fe11, 7e5ffb59a and
 bb171e615 reverted (the control, and the only arm that isolates the
 epic). The measured
 0.99 is the outcome of record; no new band is claimed for these
-statements by this ADR.
+statements by this ADR for D1 to D3 (the contains-arm amendment below
+sets one for its own decision).
 
 What the derivation got wrong. "Targets and bars" took the `Declared Str
 build` column of the profile table less the `UTF-8 validation` column
@@ -664,3 +673,140 @@ language D2 holds fixed and makes D3's per-block values build lazy on
 that path, so it is its own decision: issue #2865, which sizes it at
 about 0.5 to 0.6 for Set L ahead of `DictValues` and about 0.8 behind
 it.
+
+## Amendment (2026-10-14): a contains arm and a survivor-only values build (#2865)
+
+<!-- amendment-applies: sections="D2. A pushed-down block predicate is evaluated as a vector kernel|D3. A declared `Str` column's dictionary is built once per dictionary|Targets and bars" pointer="the contains-arm amendment below" -->
+<!-- amendment-supersedes: phrase="no new band is claimed for these statements by this ADR" pointer="the contains-arm amendment below" -->
+
+The owner approved this decision on 2026-10-14 (issue #2865, comment
+6176290699). The Set L amendment above found that the cost that dominates
+the `LIKE` statements, the decode, validation and copy of long cells, sits
+outside D1 to D3. It named a contains arm evaluated before the values build
+as the decision that moves that cost. This amendment is that decision. It
+adds one arm to D2's pushed predicate and changes D3's values build on that
+arm's path only. No persistent format changes. ADR-0099 decision 5 and
+ADR-0090 decision 7 hold.
+
+### D2 gains a contains arm
+
+- `LIKE '%literal%'` and `NOT LIKE '%literal%'` on a declared `Str` column,
+  as a top-level conjunct of the filter, join the pushed block predicate
+  beside `TsRange`, `StreamIn`, `HasWord` and `Equals`.
+- The arm tests raw page bytes for the literal's bytes. On dictionary pages
+  it tests once per dictionary entry: the entries of the row group's tag 12
+  page, or of the block's tag 7 page. An entry's verdict maps to rows
+  through the ids page: the block's tag 13 page for a row-group dictionary,
+  or the ids section of the tag 7 page itself. On plain pages (tag 1) it
+  tests once per present cell. For a UTF-8 cell and a UTF-8 literal a byte
+  match is a character match: UTF-8 lead bytes and continuation bytes are
+  disjoint, so a match can only start and end on character boundaries.
+- Not pushed, left to DataFusion: a literal containing `_`; a literal
+  containing an escape (an escaped `%` or `_`, or any other escape
+  sequence) or a pattern with an `ESCAPE` clause; a `%` anywhere but the
+  two ends; an anchored pattern (`'abc%'`, `'%abc'`); `ILIKE`; a pattern
+  that is not a literal; any column that is not a declared `Str` column;
+  and a `LIKE` that is not a top-level conjunct (one under `OR`, for
+  example).
+- The provider keeps reporting the filter as `Inexact`.
+  `supports_filters_pushdown` (`crates/ravel-sql/src/logs_provider.rs`)
+  reports `Exact` only for `ts` bounds and `has_word`, and this amendment
+  does not add `LIKE` to that set. `FilterExec` stays the exact evaluator
+  in the first version: the arm may keep a row the filter then drops, and
+  must not drop a row the filter would keep.
+
+### Semantics do not change
+
+The arm is held to the result `FilterExec` computes today on the column's
+value. That value is the record's `Str` cell when it is present and UTF-8;
+otherwise the stream's resource or scope value for the key, when it has
+one (the non-UTF-8 correction above); otherwise NULL.
+
+- A cell whose bytes contain the literal but fail UTF-8 validation reads as
+  absent, exactly as today. The arm must not turn invalid UTF-8 into a hit.
+  Either it validates a byte match before reporting it, or it reports the
+  match, the survivor-only build's validation reads the cell as absent, and
+  `FilterExec` evaluates the row on its absent value.
+- `NOT LIKE` on an absent cell yields NULL, not true, and the row is
+  filtered out, as SQL three-valued logic requires. `LIKE` on an absent
+  cell yields NULL as well.
+- The arm drops a row only when every reading of its cell fails the
+  pattern: read as UTF-8 text, and read as absent (the stream's resource or
+  scope value, else NULL). A row any reading passes is kept, and the build
+  validates its cell like that of any other kept row. The arm either tests
+  a stream's resource or scope value once per distinct stream in the
+  block, or keeps every row of that stream for `FilterExec`. For a stream
+  with no such value, this means `LIKE` keeps exactly the byte matches and
+  `NOT LIKE` keeps exactly the byte misses.
+- A row whose value the build resolves through anything other than the
+  column's own `Str` cell and the stream's resource or scope value (a
+  winning occurrence of the key with another type, or an `attrs_raw` cell)
+  is kept for `FilterExec`, not decided from the page.
+
+### D3 on this path: a survivor-only values build
+
+- On a scan whose pushed predicate carries a contains arm on the column,
+  the block's values for that column are built lazily or for surviving
+  rows only. A cell or dictionary entry the arm rejects is not UTF-8
+  validated, copied or built.
+- Today a dictionary's entries are validated eagerly, every one, when its
+  `DictValues` is built (`validate_entry`,
+  `crates/ravel-logseg/src/dict_values.rs`). That is the pass this path
+  makes lazy. A plain page's cells are validated by `cell_text`
+  (`crates/ravel-sql/src/logs_scan/batch.rs`) as the declared `Str` build
+  reads each surviving row. On plain pages the survivor-only build
+  therefore follows from the arm dropping rows before the build.
+- The once-per-row-group shared dictionary of D3 stays for every other
+  path. A partial values array built on this path is not the shared
+  `DictCache` entry, and a scan without the arm does not read it.
+- The schema stays `Dictionary(Int32, Utf8)` (ADR-0099 decision 5).
+
+### Counters
+
+Each scan counts the cells the arm tests (a dictionary entry counts once
+per test) and the string cells UTF-8 validated (a dictionary entry counts
+once per validation), so the bench report can show the mechanism fired.
+Dictionary entries are validated in the reader and plain-page cells in the
+declared `Str` build, so the validation count has a part in each. A fixture
+test pins both counts to exact values.
+
+### Bands
+
+Measured by the T5 sweep procedure (#2790): the new build and the control
+interleaved on one c6a.4xlarge, three repetitions, against the same tenant
+as the rest of this ADR, median with spread reported. Every ratio is new / control, where
+control is the dispatch-time main build. The validated-cells row is a count
+on the new build, not a ratio.
+
+| Figure | Band | Miss | Source |
+|---|---|---|---|
+| Set L (q21, q22, q23, q24), warm CPU sum | at most 0.65 | above 0.80 | predicted; issue #2865 comment 6157027285, from the issue's own 0.5 to 0.6 (arm ahead of the values build) and 0.8 (arm after it) estimates |
+| Every statement's result digest | equal to control | any difference | predicted |
+| Sets I, S and N | inside the existing ADR-2773 bands | past any of those bands' miss lines | predicted |
+| q21 validated cells of the pushed column, in the bench report | at most 15,911 (the surviving row count), present exactly once | above 15,911, absent, or reported more than once | predicted; issue #2865 comment 6157027285 |
+
+The miss line is 0.80 because #2865 estimates about 0.8 for the cheaper
+arm, the one that runs after the values build and tests values that are
+already validated and built. A Set L result at 0.80 or above is what that
+arm alone gives, so it means the survivor-only build did not take effect.
+
+The existing bands for sets I, S and N are ratios against main before
+wave 1 ("Targets and bars"). This sweep's control already carries D1 to
+D3, so new / control for those sets is not on their basis. The row is
+checked with the new build against that base (`aaebcc008`, the Set L
+amendment's pre-registered base) as a third interleaved arm of the same
+sweep.
+
+### Implementation order
+
+Two implementation tasks, in order:
+
+1. `ravel-logseg`: the arm, its kernel over dictionary entries and plain
+   cells, the survivor-only dictionary build, and the reader's counters,
+   with a property test against the row-by-row `eval` as oracle.
+2. `ravel-sql`: the extraction of the pushed `LIKE` and `NOT LIKE` arms,
+   the plain-page validation count, `docs/query-engine.md`, and the bench
+   report's counter field. This task waits until `ravel-sql` is free of
+   epic #2904's in-flight tasks.
+
+Then the T5 sweep, checked against the bands above.
