@@ -627,7 +627,10 @@ The scan reports its own counters, such as `pages_decoded`, `pages_skipped`,
 - `--start` and `--end` (RFC 3339) bound the event-time window. They default
   to the hour ending now, the HTTP endpoint's default.
 - `--shards` and `--max-ingest-lag` resolve the catalog as they do for
-  `export`. `--deadline` (default `30s`) bounds the whole command, and
+  `export`. `--deadline` (default `30s`) bounds the resolve, the plan and,
+  with `--analyze`, the run. The steps before them, the read of the bucket's
+  tenancy scheme, the tenant-presence check and the read of the tenant's
+  config record, are not bounded by it.
   `--max-rows` stops an `--analyze` run after that many rows plus one, marked
   `(stopped at --max-rows)` on the row line.
 - The engine runs with its default configuration, including its default

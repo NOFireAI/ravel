@@ -960,7 +960,8 @@ enum SqlCommand {
         /// The deployment's `ravel-server --max-ingest-lag`, as for `export`.
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_ingest_lag_ns)]
         max_ingest_lag: Option<i64>,
-        /// Wall deadline for the whole command (humantime, e.g. `30s`).
+        /// Wall deadline for the resolve, plan and (with `--analyze`) the run
+        /// (humantime, e.g. `30s`).
         #[arg(long, value_name = "DURATION", default_value = "30s", value_parser = humantime::parse_duration)]
         deadline: std::time::Duration,
         /// With `--analyze`, stop the run after this many rows plus one.
