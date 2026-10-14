@@ -1,6 +1,13 @@
 # ADR-0996: request-cost-aware fetching and the S3 request ledger
 
-Status: Proposed
+Status: Accepted (2026-10-14).
+Partly implemented: the cost profile, fetch policies and regression gate are
+in `crates/ravel-types/src/cost_profile.rs`,
+`crates/ravel-query/src/config.rs` and
+`crates/ravel-bench/src/cost_regression.rs`; decision 3's per-statement
+attempts and `range_amplification` are not built, so decision 4's bands for
+those and three other figures have no producer
+(`crates/ravel-bench/src/cost_report_source.rs`).
 
 Refs: epic #996. Builds on ADR-0904 (request-cost/latency knob, landed:
 `EngineConfig::logs_request_cost_bytes`, `--logs-request-cost-bytes`),

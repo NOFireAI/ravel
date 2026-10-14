@@ -1,6 +1,8 @@
 # ADR-0093: skip-index and postings pushdown for declared typed logs columns
 
-Status: Proposed
+Status: Accepted (2026-10-14).
+Implemented: the declared-column resolver and extractors in
+`crates/ravel-sql/src/logs_pushdown.rs`.
 
 ## Context
 

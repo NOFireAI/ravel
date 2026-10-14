@@ -1,6 +1,8 @@
 # ADR-0105: GRAM_IDX, byte-trigram block postings for infix substring pruning
 
 Status: Accepted
+Not implemented: section kind 7 is reserved
+(`crates/ravel-logseg/src/footer.rs`); no writer or reader exists.
 
 ## Context
 

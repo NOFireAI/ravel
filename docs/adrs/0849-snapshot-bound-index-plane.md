@@ -1,5 +1,8 @@
 # ADR-0849: A snapshot-bound index plane on object storage
 
+Status: Accepted
+Not implemented: no source file cites it.
+
 ## Context
 
 Ravel's read cost has a floor that no amount of CPU work removes. Measured on

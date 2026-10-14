@@ -1,6 +1,8 @@
 # ADR-0774: TopK late materialization for the logs scan
 
-Status: Proposed.
+Status: Accepted (2026-10-14).
+Implemented: `TopKLateMaterialization` and `LogsRowFetchExec` in
+`crates/ravel-sql/src/late_materialization.rs`.
 
 The number is issue #774's, the ticket that produced this ADR, rather than
 epic #680's. The README's rule ("the number is the GitHub issue number of

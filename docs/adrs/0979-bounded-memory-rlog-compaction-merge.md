@@ -1,6 +1,10 @@
 # ADR-0979: Bounded-memory RLOG compaction merge
 
-Status: Proposed
+Status: Accepted (2026-10-14).
+Partly implemented: D1 to D4 are in `crates/ravel-maintain/src/rlog.rs`,
+`crates/ravel-maintain/src/config.rs` and `crates/ravel-logseg/src/ranged.rs`;
+D5's `--merge-cursor-budget-bytes` flag is not built
+(`services/ravel-cli/src/main.rs` has the other three flags only).
 
 Extends ADR-0032 (RLOG L0→L1 compaction) and the ADR-0065 decision-4 memory
 model as amended by issues #711 (memory split target), #748 (row-group fetch,
