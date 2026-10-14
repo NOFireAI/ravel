@@ -417,7 +417,9 @@ also let such a caller hold all 64 drain slots, which pushes every
 authenticated refusal onto the fallback below. So:
 
 - A shed request whose credential does not resolve gets the 429 with no
-  drain. The check costs nothing extra: it reads only the request head.
+  drain. The check reads only the request head, and on this path it has no
+  side effect: it does not call the surface's unauthorized hook or move its
+  rejected-request counter, since the answer is the 429, not a 401.
 - The credential check's own 401 is not drained either.
 
 The cost is diagnosability. A client sending a large body with a bad
@@ -428,17 +430,25 @@ That client fails either way, and neither response tells it to retry.
 the same status, `Retry-After` and body text, with `Connection: close`
 added. That happens when:
 
+- the credential does not resolve;
 - the body is past the byte cap (a `Content-Length` above it is refused
   without reading a byte);
-- the body is not complete within the deadline;
 - all 64 drain slots are taken;
-- the credential does not resolve.
+- the body is not complete within the deadline.
+
+The conditions are checked in that order, and the first that applies
+names the refusal: an unauthenticated shed declaring a body
+over the cap is counted as `unauthenticated`. A `Content-Length` over the
+cap is caught before a drain slot is taken, and a chunked body that passes
+the cap during the drain is counted as `over_cap`, not `timeout`.
 
 `Connection: close` tells a client that does read the response not to reuse
 the connection. It does not prevent the reset, so an undrained refusal can
 still reach the client as a transport error. A deployment sees how often
 this happens through `ravel_ingest_head_refusal_undrained_total`, with a
-`reason` label of `over_cap`, `timeout`, `busy` or `unauthenticated`.
+`reason` label of `over_cap`, `timeout`, `busy` or `unauthenticated`. It
+counts shed refusals only. A 401 at a ceiling with room is not a shed and
+is not counted.
 
 **The bounds.**
 - The byte cap is 1 MiB, not the routes' 16 MiB body limit. The reset
@@ -463,6 +473,10 @@ this happens through `ravel_ingest_head_refusal_undrained_total`, with a
   still delivers the response headers. That is inferred from the protocol,
   not measured, and the acceptance tests pin it.
 - OTAP, whose refusals answer inside an open stream.
+- An HTTP/2 request on the same routes. The listeners serve HTTP/2 when
+  the build enables it, and there a refusal ends a stream, not the
+  connection. It is answered without a drain and is not counted, so it
+  cannot take the drain slots the HTTP/1 path depends on.
 
 **Acceptance.**
 - A pooled-client test, run while the ceiling is held, sends to each of
@@ -491,7 +505,16 @@ property and must change in the same commit as the code:
 - the admission section of `docs/ingest.md`, whose sentence "a shed request
   costs this process the bytes of one request head" holds afterwards only
   for an unauthenticated caller;
-- any test on the HTTP routes that pins that a shed body is never read;
-  it is changed to pin never decoded and never charged.
+- the doc comment on `try_admit` in
+  `services/ravel-server/src/ingest_concurrency.rs`. It says a shed request
+  does none of the body read or the tenant resolution, and for an
+  authenticated shed both now happen;
+- any test on the HTTP routes that pins that a shed body is never read,
+  or that a shed reaches no credential check. That includes the doc of the
+  over-ceiling case in
+  `services/ravel-server/tests/ingest_admission_before_body.rs`, whose
+  request is unauthenticated and so keeps passing. The test is changed to
+  pin never decoded and never charged, and the credential check is
+  described as side-effect free.
 
 The gRPC `PoisonBody` tests stay as they are.
