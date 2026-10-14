@@ -461,17 +461,79 @@ per-repository config shared by every linked worktree, so one run covers
 them all. A pull-request lookup that cannot be answered refuses rather
 than passing for "no pull request open".
 
-- `scripts/guards/assert-no-duplicate-dispatch.sh --issue <n> [--paths a,b]`:
+- `scripts/guards/assert-no-duplicate-dispatch.sh --issue <n> [--paths a,b]
+  [--base-ref REF]`:
   refuse to dispatch work someone is already doing. Exits 65 when an open or
-  recently-merged pull request already references the issue (skip and log,
-  never open a second one), 66 when an OPEN, non-draft pull request is
-  already touching a predicted file (a draft, or a merged or closed pull
-  request on the same file, is printed under its own heading as context,
-  not a refusal: a held draft once blocked two epics' tickets for a day,
-  #2749), and 69 when the question could not be asked. It reads
-  each candidate's files from the paginated endpoint, because
-  `gh pr list --json files` caps at 100 and would report a wide pull request
-  as touching nothing. It is the pre-dispatch half of the problem;
+  recently-merged pull request already closes the issue with a closing
+  keyword (`Fixes: #N`; a bare citation such as `Refs: #N` is a note) (skip
+  and log, never open a second one), 66 when an OPEN, non-draft pull request
+  is already touching a predicted file, line range or definition (a draft,
+  or a merged or closed pull request on the same file, is printed under its
+  own heading as context, not a refusal: a held draft once blocked two
+  epics' tickets for a day, #2749), 64 on usage, including a `--paths`
+  entry that does not parse or is empty after trimming, and 69 when the
+  question could not be asked (a pull request's files and patches or its
+  merge base could not be fetched, or the base ref does not resolve, among
+  others). A `--paths` entry (and so a `DISPATCH_PATHS` entry) takes one
+  of three forms: `path`, the whole file, where any change the pull
+  request makes to it collides; `path:L10-L80`, a base line range, which
+  collides only when one of the pull request's patch hunks for that file
+  changes a base line inside it; and `path#symbol`, a definition on the
+  base, which collides only when a hunk changes a base line inside it.
+  Entries are separated by commas. Each entry is trimmed of leading and
+  trailing whitespace; an entry empty after trimming, including one left
+  by a leading, trailing or doubled comma, is a usage error, and so is a
+  `--paths` value containing a newline or carriage return, each refused
+  before any gh call. A changed base line is a
+  removed or replaced line; a pure insertion counts against the base lines
+  on both sides of it; context lines do not count. A range or symbol entry
+  whose file is not on the base, and a range that starts past the base
+  file's last line, are compared as the whole file, with a NOTE. The
+  symbol anchor is plain text, not a parser, and applies to `.rs` files
+  (the Rust forms) and `.sh` and `.bash` files (the shell forms): a line
+  that defines the name with fn, struct, enum, trait, mod, const, static,
+  type or union, or an impl line that names it anywhere in its header, in
+  Rust; a function definition in shell; through its matching close brace
+  (the script's header lists the qualifiers and the fallbacks when braces
+  do not balance). A symbol entry on any other file type, `docs/` markdown
+  aside, is compared as the whole file with a NOTE, and so is a name not
+  found on the base. A `.md` file under `docs/` is compared by heading
+  section instead of by line: a line's section is its nearest preceding
+  ATX heading outside fenced code, and an entry collides only when a hunk
+  changes a line in one of the entry's sections. A fence closes only on a
+  fence of the same character (backtick or tilde) at least as long as the
+  one that opened it. `path#symbol` names a heading by its GitHub anchor
+  (`docs/x.md#usage` for "## Usage") and covers its nested subsections;
+  `path:L10-L80` covers every section with a line in the range. A bare
+  `docs/` path names no section and keeps the whole-file rule. It reads
+  each candidate's files and patches from the paginated files endpoint in
+  one call, because `gh pr list --json files` caps at 100 and would report
+  a wide pull request as touching nothing. That endpoint returns at most
+  3000 files, so a pull request listing 3000 or more may touch more than
+  it lists and is taken as colliding with every entry, with a NOTE. A file
+  the pull request renamed matches an entry naming either its old or its
+  new path, and its patch is numbered on the old file. Symbols, headings
+  and sections are read from `--base-ref` (default `origin/main`), while a
+  pull request's hunks number lines on its own merge base. A range, symbol
+  or section entry is compared by line only when all of these hold for the
+  matching file; otherwise that file is compared as the whole file, with a
+  NOTE naming the file and the reason. The file has a patch: one absent or
+  empty (a diff too large to inline) is not compared by line. The pull
+  request neither adds nor deletes the file: status added or removed, or a
+  hunk header with an empty side (`-0,0` or `+0,0`), is not. The merge
+  base is known and present locally. It is read once per pull request, and
+  only when an entry needs it, from the compare endpoint
+  (`repos/OWNER/REPO/compare/BASE...HEAD`, BASE the pull request's base
+  branch and HEAD its head commit, `.merge_base_commit.sha`). A listing
+  with no base branch or head commit, a response naming no merge base, or
+  a merge base this checkout does not have (it is not fetched) each fall
+  back. A gh failure on that call exits 69. The file on the merge base
+  (its old path, for a rename) is the same blob as the entry's file on
+  `--base-ref`. Any difference, wherever it is in the file, means it
+  changed since the pull request forked. Every context and removed line
+  of each hunk equals the base file's line at the number its hunk header
+  gives it, and every hunk has at least one such line to check. It is the
+  pre-dispatch half of the problem;
   `check-duplicate-work.sh` compares patch-ids between pull requests that
   already exist, which a task with no diff yet cannot use.
 - `scripts/guards/assert-green-head.sh <pr> [--rerun]`: the merge gate. Green
@@ -1056,6 +1118,22 @@ chore, optional scope), body explains what and why in plain sentences,
 wrap at 80. Sign off with `git commit -s`. Trailer `Refs: #<issue>` (or
 `Fixes: #<issue>` when the commit fully resolves it). Plain language: no
 em-dashes, no filler adjectives, no AI footers or self-references.
+
+Pull request shape (ADR-2867 change 4):
+
+- One behaviour change per pull request. Two in one share every review
+  round, red check and revert, so a finding on either holds both and
+  reverting one removes the other.
+- A dependency upgrade pull request carries the upgrade and the test
+  re-pins it forces, nothing else. A new mechanism the upgrade enables is
+  stacked as its own pull request, so reverting a bad upgrade does not take
+  the mechanism with it and a reviewer can tell a re-pin from a behaviour
+  change.
+- A pull request that other work depends on and that has been open for
+  more than 24 hours is split or landed, not grown. Every commit added
+  moves the base its dependents rebase onto: #2774, a long-lived pull
+  request on hub files, blocked three workstreams for two days and needed
+  a 41-commit rebase (ADR-2867, Context).
 
 ## Documentation stays current
 
