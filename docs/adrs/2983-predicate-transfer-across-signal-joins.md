@@ -37,7 +37,7 @@ consumer waits for the filter with `DynamicFilterPhysicalExpr::wait_complete`.
 Ravel's session sets none of these options, nor the master switch
 `enable_dynamic_filter_pushdown` that overrides the per-kind switches when
 set; nothing under `crates/` or `services/` names them. It does set
-`with_repartition_joins(false)` (`crates/ravel-sql/src/session.rs:595`), so a
+`with_repartition_joins(false)` (`session_config` in `crates/ravel-sql/src/session.rs`), so a
 hash join builds its table once and one key set exists per join.
 
 DataFusion's own Parquet scan already adopts these filters, so a join over
@@ -142,7 +142,7 @@ rows, the class of issue #2907.
 
 | Join, as written | Side that may receive the other side's keys | Side that may not | Reason |
 |---|---|---|---|
-| Inner | Either side | None | A row without a partner in the other side's key set is never emitted. |
+| Inner | The probe side, with the build side's keys | The build side | A row without a partner in the other side's key set is never emitted. Either side would be sound, but the hash join builds its key set from the build side only, so only the probe side receives one. |
 | Left outer | Neither in this ADR | Left, right | The left side is preserved: an unmatched left row is emitted with nulls, so filtering it drops output rows. |
 | Right outer | Neither in this ADR | Left, right | The mirror of left outer. |
 | Full outer | Neither | Left, right | Both sides are preserved. |
@@ -258,6 +258,10 @@ and bytes per signal and per phase. Transfer follows it:
   `memory_refused`, `no_receiving_arm`). This adds a field to the entry
   ADR-2904 decision 7 defines; `EXPLAIN` carries it with the rest of the
   list.
+- `segmentsPruned` and `stats.pruning.segments` keep their snapshot
+  meaning and never include a prune that transfer caused. Transfer prunes
+  are reported only in the `transfer` object, so the two figures are not
+  to be summed.
 
 ### 8. The receiving arm is a dependency, not part of this ADR
 
