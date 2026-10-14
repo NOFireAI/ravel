@@ -3439,9 +3439,10 @@ impl PinnedQuery {
         )
     }
 
-    /// Run this query to completion and render the plan it executed with
-    /// DataFusion's per-operator metrics, the `EXPLAIN ANALYZE` view (ADR-2867
-    /// change 7 item 3).
+    /// Run this query to completion, or to the row cap, and render the plan it
+    /// executed with DataFusion's per-operator metrics, the `EXPLAIN ANALYZE`
+    /// view (ADR-2867 change 7 item 3). When the row cap stops the run, the
+    /// metrics cover only the rows produced before the cut.
     ///
     /// The batches go through the same [`PinnedStream`] [`Self::execute`]
     /// returns, so the memory ceiling, the row cap and the panic boundary

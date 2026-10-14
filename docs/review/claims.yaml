@@ -220,3 +220,11 @@
   binds: []
   status: verified
   note: "Summarises the worked partial-restoration example above it; no capability is claimed absent."
+
+- id: guide-sql-explain-no-parquet
+  doc: docs/guides/inspecting-data.md
+  quote: "Parquet tables are not supported."
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "services/ravel-cli/src/sql_explain.rs builds its SqlExecutor without with_parquet_sources, and SqlExecutor::resolve_parquet_target returns Ok(None) when no sources are installed. The capability would arrive as a call site, not a new definition, so there is no symbol to bind."

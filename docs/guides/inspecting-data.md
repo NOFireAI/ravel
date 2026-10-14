@@ -645,7 +645,9 @@ differ from the HTTP endpoint's plan for data at the edges of the window.
   tenancy scheme, the tenant-presence check and the read of the tenant's
   config record, are not bounded by it.
   `--max-rows` stops an `--analyze` run after that many rows plus one, marked
-  `(stopped at --max-rows)` on the row line.
+  `(stopped at --max-rows)` on the row line. The plan's metrics then cover
+  only the work done before the cut, so they understate what the whole
+  statement costs.
 - The engine runs with its default configuration, including its default
   per-query memory ceiling, so the plan can differ from the server's. Pass
   `--sql-partitions` with the server's `--sql-partition-count` to get the same
