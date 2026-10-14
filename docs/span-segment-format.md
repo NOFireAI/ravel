@@ -467,7 +467,7 @@ The exact per-object `trace_id` index: every distinct `(key8, block ordinal)`
 pair in the object, where `key8` is the first 8 bytes of the 16-byte
 `trace_id` and the block ordinal is the SKIP_IDX entry index. The grammar is
 the one docs/log-segment-format.md defines under "KEY_IDX" and is not
-restated here: it is built and read through `ravel-codec`'s `key_index`
+restated here: it is built and read through `ravel-codec`'s `key_idx`
 module, shared with RLOG exactly as BLOOM is shared through `bloom_section`
 (ADR-0054), and the section's own `version` byte (1) is separate from the
 trailer version. RSPAN fixes the parameters the shared grammar leaves to the

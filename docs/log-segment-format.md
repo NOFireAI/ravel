@@ -1325,7 +1325,7 @@ per-field distinct-value cap drops such a field outright, ADR-0049 decision
 every distinct `(key8, block ordinal)` pair in the object per indexed field,
 sorted, in buckets a probe reads one at a time by range. One definition
 serves RLOG and RSPAN: the grammar below is implemented once in
-`ravel-codec`'s `key_index` module, as BLOOM is in `bloom_section`, and
+`ravel-codec`'s `key_idx` module, as BLOOM is in `bloom_section`, and
 RSPAN uses it with its own fixed parameters (docs/span-segment-format.md,
 "KEY_IDX").
 
