@@ -1,6 +1,12 @@
 # ADR-1170: One process-wide memory budget for ravel-server
 
-Status: Proposed
+Status: Accepted (2026-10-14).
+Partly implemented: decisions 1 and 2 are in `crates/ravel-memory/src/lib.rs`
+and the fetchers under `crates/ravel-query/src/`, decisions 3 and 4 in
+`services/ravel-server/src/config.rs` and
+`services/ravel-server/src/metrics.rs`; decision 3's measured overhead
+reserve is not built (`MEMORY_OVERHEAD_RESERVE_BYTES` is a provisional
+2 GiB placeholder pending the #1256 calibration run).
 
 ## Context
 

@@ -1,6 +1,11 @@
 # ADR-1196: Keep the cost-first fetch default, add a latency-first policy
 
-- Status: Proposed
+- Status: Accepted (2026-10-14).
+- Partly implemented: decisions 2 to 4 are in
+  `crates/ravel-query/src/config.rs` and `services/ravel-server/src/config.rs`,
+  and decision 1 stands as amended by ADR-2023 and ADR-2414; decision 5's
+  labelled tuned `latency-first` ClickBench entry is not published
+  (`benchmarks/clickbench/` holds stock entries only).
 - Date: 2026-09-03
 - Refs: #1196, #1191, #1170, #1007, #1185, ADR-0904, ADR-0996, ADR-0046
 

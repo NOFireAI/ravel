@@ -1,6 +1,9 @@
 # ADR-2066: Bounded ranged log reads
 
-- Status: Proposed
+- Status: Accepted (2026-10-14).
+- Partly implemented: decision 1 is in `crates/ravel-query/src/log_fetcher.rs`
+  (`place_front_sections`, `bounded_chunk_runs`); decision 2's before/after
+  measurement has no record in the repo.
 - Date: 2026-09-27
 - Refs: #2066, #2023, #1506, ADR-0107, ADR-0699, ADR-0996, ADR-1196, ADR-2014, ADR-2023
 

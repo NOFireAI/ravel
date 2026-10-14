@@ -1,12 +1,17 @@
 # ADR-2414: narrow projections read ranged on S3, and a lone statement gets the tenant's SQL share
 
-Status: Proposed. Issue #2414.
+Status: Accepted (2026-10-14). Issue #2414.
 Amends ADR-2023 (the cost-based fetch policy's rate and the projection
 break-even); it is Accepted and carries an amendment section pointing here,
 added together with this document. ADR-1170 (the derived per-query SQL
 share) is still Proposed, so task B1 edits its share in place and cites this
 ADR there. ADR-0954 (spill) is not amended: see decision B2. No persistent
 format changes.
+
+Implemented: A1 to A3 in `crates/ravel-query/src/config.rs`,
+`crates/ravel-query/src/log_fetcher.rs` and `crates/ravel-sql/src/logs_scan/`,
+B1 in `services/ravel-server/src/config.rs`, B2 as revised by the #2416
+amendment, and B3 in `docs/internal/clickbench-aws-runbook.md`.
 
 ## Context
 

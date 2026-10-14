@@ -1,6 +1,11 @@
 # ADR-0107: Pruning-proportional block-range fetches for logs scans
 
-Status: Proposed
+Status: Accepted (2026-10-14).
+Partly implemented: decisions 1 to 4 are in
+`crates/ravel-query/src/log_fetcher.rs` (`BlockRangeFetcher`) and
+`crates/ravel-types/src/accounting.rs`; decision 5 is not built
+(`docs/guides/caching.md` gives no cache sizing derived from measured
+block-range working sets).
 
 ## Context
 

@@ -1,6 +1,6 @@
 # ADR-0873: per-declared-column min/max on commit records and SegmentRef
 
-Status: Proposed. Issue #873. Builds on ADR-0850 (logs typed column
+Status: Accepted (2026-10-14). Issue #873. Builds on ADR-0850 (logs typed column
 statistics, the `.cstat` plane), ADR-0942 (re-key `.cstat` to snapshot-part
 binding, and its backfill obligation), ADR-0066 (format migration machinery:
 the N/N-1 window, recorded format floors, migration classes A-D), ADR-0101
@@ -10,6 +10,15 @@ carrier). Touches two frozen contracts (the commit-family protobufs under
 `proto/ravel/commit.proto` and the catalog snapshot protobufs under
 `proto/ravel/catalog.proto`), so the format-change skill's procedure governs
 and this ADR is its first step.
+
+Partly implemented: decisions 1, 3, 5 and 6, decision 2 for the stamp, and
+decision 4 as amended are in `proto/ravel/commit.proto`,
+`proto/ravel/catalog.proto`, `crates/ravel-commit/src/declared_stats.rs`,
+`crates/ravel-ingest/src/log_declared_stats.rs`,
+`crates/ravel-catalog/src/fold.rs` and
+`crates/ravel-sql/src/logs_scan/mod.rs`; decision 2's validated `.cstat`
+type and decision 4's per-query coverage figure are not built (no such type
+or figure under `crates/`).
 
 ## Context
 
