@@ -31,6 +31,7 @@ pub mod cost_report_source;
 pub mod distrib_crossover;
 pub mod e2e;
 pub mod generator;
+pub mod get_latency;
 #[cfg(feature = "sql-latency")]
 pub mod groupby_scaling;
 pub mod harness;

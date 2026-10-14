@@ -74,6 +74,7 @@ use ravel_logseg::{
     LogStreamId, Predicate, RlogConfig, RlogReader, ScanStats, SegmentDirectories, SparseObject,
     SuffixOutcome, decode_section_accounted, open_from_suffix, read_section_accounted_from,
 };
+use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
@@ -1248,6 +1249,7 @@ impl LogSegmentFetcher {
                     })?;
                     self.store
                         .get(key, GetRange::Range(start, end))
+                        .in_get_phase(phase.into())
                         .await
                         .map_err(store_error)?
                 };
@@ -1705,6 +1707,7 @@ impl LogSegmentFetcher {
                         })?;
                 self.store
                     .get(key, GetRange::Full)
+                    .in_get_phase(ReadPhases::SCAN.blocks.into())
                     .await
                     .map_err(|source| LogFetchError::Store {
                         key: key.to_string(),
@@ -3135,6 +3138,7 @@ impl LogSegmentFetcher {
                         })?;
                 self.store
                     .get(key, GetRange::Full)
+                    .in_get_phase(phase.into())
                     .await
                     .map_err(|source| LogFetchError::Store {
                         key: key.to_string(),
@@ -3165,7 +3169,11 @@ impl LogSegmentFetcher {
                             "GetLimiter semaphore closed unexpectedly".to_string(),
                         )
                     })?;
-                    let got = self.store.get(key, GetRange::Full).await?;
+                    let got = self
+                        .store
+                        .get(key, GetRange::Full)
+                        .in_get_phase(phase.into())
+                        .await?;
                     accounting.record_s3_request(AccountedOp::Get);
                     accounting.add_s3_bytes(AccountedOp::Get, got.data.len() as u64);
                     self.wire_bytes.record(phase, got.data.len() as u64);
@@ -5150,6 +5158,7 @@ impl BlockRangeFetcher {
         let got = self
             .store
             .get(key, range)
+            .in_get_phase(phase.into())
             .await
             .map_err(|source| LogFetchError::Store {
                 key: key.to_string(),
@@ -14506,6 +14515,81 @@ mod version_refusal_tests {
             .with_block_range_threshold(0)
             .with_projection_break_even_bytes(Some(0))
             .with_suffix_len(PROBE)
+    }
+
+    /// Every GET the logs fetcher issues is timed under the phase its wire
+    /// counter charges (issue #2976): a ranged plan, a ranged scan and a
+    /// whole-object fetch of one valid object, through an instrumented store,
+    /// give per-phase latency counts equal to the per-phase request counts, and
+    /// none is unattributed.
+    ///
+    /// FLIP: dropping the `in_get_phase` in `store_get` leaves every ranged
+    /// GET outside a phase scope: plan and probe read 0, scan keeps only the
+    /// whole-object GET, and unattributed reads the other eight.
+    #[tokio::test]
+    async fn log_gets_are_timed_under_their_wire_counted_phases() {
+        use ravel_object_store::InstrumentedStore;
+        use ravel_object_store::get_latency::GetPhase;
+
+        let bytes = object();
+        let size = bytes.len() as u64;
+        let content_hash = *blake3::hash(&bytes).as_bytes();
+        let memory = MemoryStore::new();
+        memory
+            .put(KEY, Bytes::from(bytes), PutOptions::default())
+            .await
+            .expect("put");
+        let store = Arc::new(InstrumentedStore::new(memory));
+        let seg = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: 1,
+            max_event_ts_ns: 4,
+            ingest_hour_bucket: 0,
+            sample_count: 4,
+            series_count: 1,
+            shard: 0,
+            content_hash,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        let ranged = LogSegmentFetcher::new(store.clone())
+            .with_block_range_threshold(0)
+            .with_projection_break_even_bytes(Some(0))
+            .with_suffix_len(PROBE);
+        let whole = LogSegmentFetcher::new(store.clone());
+        let q = LogQuery::new(0, 10);
+        let acc = QueryAccounting::new();
+        ranged
+            .plan_segment(&seg, TENANT, &q, &acc)
+            .await
+            .expect("plan");
+        ranged
+            .scan_accounted_with_tenant(&seg, TENANT, &q, &ColumnSelection::all(), &acc)
+            .await
+            .expect("ranged scan");
+        whole
+            .fetch_accounted_with_tenant(&seg, TENANT, &q, &acc)
+            .await
+            .expect("whole-object fetch");
+
+        let latency = store.metrics().get_latency().snapshot();
+        let mut want = [0u64; 5];
+        for f in [&ranged, &whole] {
+            let snap = f.phase_wire_byte_counter().snapshot();
+            for phase in QueryPhase::ALL {
+                want[GetPhase::from(phase).index()] += snap.phase_requests(phase);
+            }
+        }
+        assert!(want[GetPhase::Plan.index()] > 0, "the plan read: {want:?}");
+        assert!(want[GetPhase::Scan.index()] > 0, "the scan reads: {want:?}");
+        let got = GetPhase::ALL.map(|phase| latency.phase(phase).ok_count());
+        assert_eq!(got, want, "resolve, plan, probe, scan, unattributed");
     }
 
     /// GET requests and wire bytes per phase, from the fetcher's wire counter,

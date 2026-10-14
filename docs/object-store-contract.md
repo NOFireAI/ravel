@@ -1745,6 +1745,30 @@ else, so a listing that passes through several layers counts once.
 counter labelled `mode` only. A key listed on every pass counts on every
 pass; the warning log is the per-key signal.
 
+Every `get`, `get_pinned` and `get_with_pin` call through the decorator also
+records two durations into `StoreMetrics::get_latency`
+(`crates/ravel-object-store/src/get_latency.rs`): time to last
+byte, from the clock reading before the inner call to the call's return, and
+time to first byte, from the same reading to the instant the backend reports
+the response headers through `get_latency::mark_first_byte`. `S3Store` and
+`ExternalStore` mark it when `object_store`'s request future resolves, before
+the body is read, for whole-object and ranged reads alike; a backend that does
+not mark (`MemoryStore`) records first byte equal to total. A successful call
+is bucketed by its requested byte count (the range length, the suffix length,
+or the bytes returned for a whole-object read): below 4 KiB, power-of-two
+spans from 4 KiB to 64 MiB, and above 64 MiB. A failed call is counted, with
+its total latency, in its phase's `failed` row and in no size bucket. The read
+phase comes from a `tokio` task-local the caller sets with
+`InGetPhase::in_get_phase`; `ravel-query`'s RSEG, RLOG and RSPAN fetchers set
+it around every GET they issue, and a GET issued outside any scope (the
+catalog's commit-record reads, for one) is counted as `unattributed`. One call
+is one request: a caller's retry is a second call in whatever phase is in
+scope, and a retry inside `object_store`'s own loop is part of the one call's
+latency (and one more `attempts`). Each histogram holds whole microseconds in
+240 log-scale slots, eight per power of two up to about 71 minutes, so a
+reported quantile never understates the true one and, below that, overstates
+it by at most 12.5%; `max` is exact.
+
 The contract suite in `crates/ravel-object-store/tests/contract.rs` runs
 against all three, multipart included (`assert_multipart_upload` is part of
 `run_contract_suite`, written against the trait so it holds for the oracle, the

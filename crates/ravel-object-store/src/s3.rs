@@ -2359,6 +2359,8 @@ impl S3Store {
         ))
         .await;
         let result = result.map_err(map_get_error)?;
+        // `get_opts` resolves on the response headers; the body is read below.
+        crate::get_latency::mark_first_byte();
         let etag = result
             .meta
             .e_tag

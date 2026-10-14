@@ -6,6 +6,7 @@ use bytes::Bytes;
 use futures::future::join_all;
 use ravel_cache::{Cache, CacheKey, ReadOutcome, SingleFlightError, TieredCache};
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError, Version};
 use ravel_promql::{LabelMatcher, MatchOp, matches_series};
 use ravel_segment::{
@@ -16,7 +17,7 @@ use ravel_segment::{
 };
 use ravel_types::accounting::{AccountedOp, QueryAccounting};
 
-use crate::phase_accounting::PhaseAccounting;
+use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_types::{LabelSet, Sample, SeriesId, TenantHash};
 use tracing::Instrument;
@@ -1822,6 +1823,7 @@ impl SegmentFetcher {
             Ok((footer, total_size, suffix_etag, regions))
         }
         .instrument(span.clone())
+        .in_get_phase(QueryPhase::Plan.into())
         .await
     }
 
@@ -2012,6 +2014,7 @@ impl SegmentFetcher {
             Ok(self.shrink_to_retained(matched))
         }
         .instrument(span.clone())
+        .in_get_phase(QueryPhase::Probe.into())
         .await
     }
 
@@ -2219,6 +2222,7 @@ impl SegmentFetcher {
             Ok((scalar_planned, histogram_planned))
         }
         .instrument(span.clone())
+        .in_get_phase(QueryPhase::Scan.into())
         .await
     }
 
@@ -5166,6 +5170,46 @@ mod tests {
             "probe path ({} B) should be far under half the object ({object_size} B)",
             probe.bytes
         );
+    }
+
+    /// Every GET the RSEG fetcher issues is timed under the phase its
+    /// `PhaseAccounting` charges (issue #2976): the footer read under plan, the
+    /// sparse catalog probe under probe, the page reads under scan, and none
+    /// unattributed.
+    ///
+    /// FLIP: dropping the `in_get_phase` on `fetch_pages` leaves the page
+    /// GETs outside every phase scope, so scan reads 0 and unattributed reads
+    /// the scan count.
+    #[tokio::test]
+    async fn rseg_gets_are_timed_under_their_accounted_phases() {
+        use ravel_object_store::get_latency::GetPhase;
+
+        let (bytes, tenant_hash, seg_ref) = write_sparse_test_segment(4096, 32).await;
+        let matchers = [LabelMatcher::equal("__name__", "sparse_metric_2000")];
+        let (fetcher, metrics) = metered_fetcher(&seg_ref.data_object_key, bytes).await;
+        let fetcher = fetcher.with_whole_object_threshold(0);
+        let accounting = PhaseAccounting::new();
+        let (soa, _stats) = fetcher
+            .fetch_soa_phase_accounted(tenant_hash, &seg_ref, &matchers, &accounting)
+            .await
+            .expect("fetch_soa probe path");
+        assert_eq!(soa.len(), 1);
+
+        let snap = accounting.snapshot();
+        let want = [
+            0,
+            snap.plan.s3_requests(AccountedOp::Get),
+            snap.probe.s3_requests(AccountedOp::Get),
+            snap.scan.s3_requests(AccountedOp::Get),
+            0,
+        ];
+        assert!(
+            want[1..4].iter().all(|n| *n > 0),
+            "every phase read: {want:?}"
+        );
+        let latency = metrics.get_latency().snapshot();
+        let got = GetPhase::ALL.map(|phase| latency.phase(phase).ok_count());
+        assert_eq!(got, want, "resolve, plan, probe, scan, unattributed");
     }
 
     /// `decode_sparse_catalog` charges the bytes the chunked catalog actually

@@ -622,6 +622,8 @@ impl GenericStore {
             )
             .await
             .map_err(map_external_get_error)?;
+        // `get_opts` resolves on the response headers; the body is read below.
+        crate::get_latency::mark_first_byte();
         let etag = result.meta.e_tag.clone().ok_or_else(|| {
             StoreError::Permanent(format!("the store returned no ETag for {key}"))
         })?;
