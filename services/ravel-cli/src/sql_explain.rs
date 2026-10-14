@@ -20,9 +20,8 @@ use ravel_catalog::{Catalog, CatalogConfig, DeclaredColumnType, read_config_valu
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    DeclaredColumn, DeclaredType, ParquetPlan, PinnedPlanInputs, PinnedResolve,
-    SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlRequest, StaticDeclaredColumns,
-    validate_query,
+    DeclaredColumn, DeclaredType, ParquetPlan, PinnedPlanInputs, PinnedResolve, SpanSegmentFetcher,
+    SqlConfig, SqlError, SqlExecutor, SqlRequest, StaticDeclaredColumns, validate_query,
 };
 use ravel_types::accounting::QueryAccounting;
 use ravel_types::{TenantHash, TenantId, TimeRange};

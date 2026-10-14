@@ -23,9 +23,9 @@ pub mod provision;
 pub mod qualify;
 pub mod reconstruct;
 pub mod rlog_footprint;
-pub mod storage_layout;
 #[cfg(feature = "sql-explain")]
 pub mod sql_explain;
+pub mod storage_layout;
 pub mod store;
 pub mod tenancy;
 #[cfg(test)]

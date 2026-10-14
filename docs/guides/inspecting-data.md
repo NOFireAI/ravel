@@ -581,3 +581,59 @@ that the ingest path uses. Its verdict therefore always matches what a retried
 request experiences. A marker that this command reports as corrupt is one that
 the ingest path also treats as a miss (fail-open to at-least-once), never the
 reverse.
+
+## `sql explain`
+
+The command prints the physical plan of a SQL statement. With `--analyze`, it
+runs the statement and prints the plan that ran, with every operator's own
+metrics, followed by the row count.
+
+The subcommand exists only in a binary built with the `sql-explain` feature:
+
+```sh
+cargo build -p ravel-cli --release --features sql-explain
+```
+
+A default build has no `sql` subcommand and no SQL engine.
+
+```sh
+ravel-cli --store s3 sql explain --unaudited --analyze \
+  --tenant acme \
+  "SELECT body, count(*) AS n FROM logs GROUP BY body"
+```
+
+```
+ProjectionExec: expr=[body@0 as body, count(Int64(1))@1 as n], metrics=[output_rows=4, elapsed_compute=21.03µs, ...]
+  AggregateExec: mode=FinalPartitioned, gby=[body@0 as body], aggr=[count(Int64(1))], metrics=[output_rows=4, elapsed_compute=301.44µs, ...]
+    ...
+      LogsScanExec: partitions=1, ..., metrics=[blocks_scanned=1, pages_decoded=3, pages_skipped=4, ...]
+rows: 4
+```
+
+Each `metrics=[...]` belongs to the operator on that line: `output_rows` is
+the rows that operator emitted and `elapsed_compute` is the CPU time it spent.
+The scan reports its own counters, such as `pages_decoded`, `pages_skipped`,
+`fast_path_whole_object_segments` and `fast_path_ranged_segments`. Without
+`--analyze` the command runs nothing and prints the plan with no metrics.
+
+- `--unaudited` is required. This command writes no query-audit record, so it
+  refuses to run without the flag, before it builds the store or sends a
+  single request.
+- The statement is a plain query, checked by the same read-only gate the HTTP
+  endpoint applies. Do not prefix it with `EXPLAIN`: the gate refuses that
+  word here as it does on `POST /api/v1/sql`, and the HTTP endpoint still
+  refuses every `EXPLAIN` statement. This command is the only way to see a
+  plan with metrics.
+- `--start` and `--end` (RFC 3339) bound the event-time window. They default
+  to the hour ending now, the HTTP endpoint's default.
+- `--shards` and `--max-ingest-lag` resolve the catalog as they do for
+  `export`. `--deadline` (default `30s`) bounds the whole command, and
+  `--max-rows` stops an `--analyze` run after that many rows plus one, marked
+  `(stopped at --max-rows)` on the row line.
+- The engine runs with its default configuration, including its default
+  per-query memory ceiling, so the plan can differ from the server's. Pass
+  `--sql-partitions` with the server's `--sql-partition-count` to get the same
+  partitioning. A tenant's durable typed attribute columns
+  (`typed-attr-column set`) are read from its config record; columns declared
+  only by a server's `--typed-attr-column` or `--typed-attr-column-tenant`
+  flags are not visible to this command.

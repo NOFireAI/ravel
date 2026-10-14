@@ -98,8 +98,8 @@ use datafusion::logical_expr::{
     Aggregate, Distinct, DistinctOn, Expr, ExprSchemable, Filter, LogicalPlan, Projection, Sort,
     SortExpr, WindowFunctionDefinition, lit,
 };
-use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::display::DisplayableExecutionPlan;
+use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};

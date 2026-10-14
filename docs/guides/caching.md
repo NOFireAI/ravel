@@ -438,7 +438,8 @@ tenant is against how narrow the projections of its queries are, so there is
 no representative figure to quote. Measure your own.
 
 Neither counter reaches the query-facing accounting of a running server.
-`EXPLAIN ANALYZE` surfaces the sibling page-count fields,
+`ravel-cli sql explain --analyze` ([inspecting data](inspecting-data.md#sql-explain))
+surfaces the sibling page-count fields,
 `pages_decoded`/`pages_skipped`, not their byte-denominated equivalents. The
 ratio is therefore available only to a caller that reads `QueryAccounting`
 in-process, which is what the `ravel-bench` logs scan does.

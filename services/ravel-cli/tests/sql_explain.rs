@@ -23,7 +23,9 @@ use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
-use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlRequest, ValidationError};
+use ravel_sql::{
+    SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlRequest, ValidationError,
+};
 use ravel_types::{TenantId, TimeRange};
 
 const CLOCK_NS: i64 = 1_700_000_000_000_000_000; // 2023-11-14T22:13:20Z
@@ -315,13 +317,7 @@ async fn refuses_without_unaudited_before_any_store_request() {
 fn binary_refuses_without_unaudited_before_building_the_store() {
     let output = Command::new(env!("CARGO_BIN_EXE_ravel-cli"))
         .args([
-            "--store",
-            "s3",
-            "sql",
-            "explain",
-            "--tenant",
-            TENANT,
-            GROUPED,
+            "--store", "s3", "sql", "explain", "--tenant", TENANT, GROUPED,
         ])
         .env_remove("RAVEL_S3_BUCKET")
         .output()

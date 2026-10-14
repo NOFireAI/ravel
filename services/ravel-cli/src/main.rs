@@ -5708,6 +5708,9 @@ mod tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
+// `cli_reference_is_current` and its helpers are compiled out of a
+// `sql-explain` build; see that test.
+#[cfg_attr(feature = "sql-explain", allow(dead_code, unused_imports))]
 mod cli_reference_tests {
     //! Drift check for `docs/reference/ravel-cli-flags.md` (ADR-1040 decision
     //! 4). The tables are rendered from `Cli`'s clap definition by the shared
@@ -5799,6 +5802,9 @@ mod cli_reference_tests {
     }
 
     /// The committed reference matches what the current command tree renders.
+    /// The page documents the default build, which has no `sql` subcommand, so
+    /// a `sql-explain` build skips this; the default-feature run checks it.
+    #[cfg(not(feature = "sql-explain"))]
     #[test]
     fn cli_reference_is_current() {
         let cmd = Cli::command();
