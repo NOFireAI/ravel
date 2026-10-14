@@ -706,8 +706,9 @@ and the CAS read/write helpers.
   HEAD it is about to CAS. With no HEAD to compare against, such an object is
   indistinguishable from a part a fold is mid-flight on, so it must be left
   alone. The `protection_horizon_ns` gate is therefore a reader-pinning buffer
-  here (`max_query_duration + grace`), not a writer interlock: unlike the orphan
-  and unreferenced-part gates, whose lifetime terms mirror a real writer
+  here (at least `max_query_duration + grace + clock_skew_allowance`), not a
+  writer interlock: unlike the orphan and unreferenced-part gates, whose
+  lifetime terms mirror a real writer
   abandonment deadline, adoption-via-`AlreadyExists` never refreshes
   `last_modified`, so an object's age does not bound the fold that may adopt it;
   what bounds the writer race is the no-anchor rule plus the pre-delete HEAD
@@ -2338,9 +2339,14 @@ carries the decrease-specific straggler slack window.
   publishes a transaction adding outputs and removing inputs; running
   queries keep their pinned set.
 - GC deletes an object only when all hold: unreachable from any snapshot
-  within the protection horizon (>= max_query_duration + grace), not
-  lease-protected, and older than grace + max_flush_lifetime; commit-record
-  absence (for orphans) is re-verified immediately before each delete.
+  within the protection horizon, not lease-protected, and older than its age
+  gate; commit-record absence (for orphans) is re-verified immediately before
+  each delete. The horizon must satisfy `protection_horizon >=
+  max_query_duration + grace + clock_skew_allowance`: setting the GC config
+  refuses a violation and maintain refuses to start against one. The age gate
+  is `grace + max_flush_lifetime` for an orphan `l0/` data object and `grace +
+  max_compaction_lifetime` for an unreferenced `l1/` part. docs/deletion-and-gc.md
+  is normative for both.
 - Deletion (retention/tombstone) is a durable transaction that excludes
   segments from new snapshots first; physical removal follows via GC. The
   retention sweep enforces the "unreachable from any snapshot" precondition
