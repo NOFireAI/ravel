@@ -233,10 +233,11 @@ In ravel:
    A `docs/` path collides only when the same heading section changes.
 3. Two move-only splits, each a single same-day commit in a window when
    no open PR touches the file, with a `git log --follow` check that
-   blame survives (now a `git blame -C -C -C` check; see the blame-check
+   blame survives (now a line-residue check; see the move-check
    amendment below): the ingest handlers into `decode`, `admission` and
    `mode` modules (store-96, after #2797), and `logs_scan.rs` into its
-   plan, scan and threshold parts (ravel-perf, after #2774).
+   plan, scan and threshold parts (ravel-perf, after #2774; landed as
+   cd569a12b with a fourth part, `batch`).
 
 Acceptance: guard cases for a hunk overlap, a same-file different-hunk
 pass, and a docs same-section collision; `cargo check` on each split with
@@ -422,10 +423,10 @@ Item 2's guard does not parse share kinds: it checks that each band row
 carries a source token, and whether the cited shares are the kind the
 band states is a reviewer's check.
 
-## Amendment: a split's blame check uses `git blame -C -C -C` (issue #2875)
+## Amendment: a split's move check is its line residue (issue #2875)
 
-<!-- amendment-applies: sections="4. PR shape rules and hub-file splits" pointer="blame-check amendment" -->
-<!-- amendment-supersedes: phrase="`git log --follow` check that blame survives" pointer="blame-check amendment" -->
+<!-- amendment-applies: sections="4. PR shape rules and hub-file splits" pointer="move-check amendment" -->
+<!-- amendment-supersedes: phrase="`git log --follow` check that blame survives" pointer="move-check amendment" -->
 
 Change 4 item 3 named a `git log --follow` check that blame survives a
 move-only split. That check cannot pass for these splits. `--follow`
@@ -437,15 +438,42 @@ lines). Lowering the threshold far enough makes it follow (`-M30%` on
 `ingest_decode.rs`, `-M5%` on `ingest_mode.rs`), but a threshold tuned
 per file is not a bar a split can be held to.
 
-What item 3 requires instead: `git blame -C -C -C` on each new file
-attributes every moved line to the commit that wrote it before the
-split. The lines it may attribute to the split commit are the ones a
-split has to write: the module's doc header, its `use` lines, visibility
-qualifiers such as `pub(crate)` on items that crossed a module boundary,
-doc prose rewrapped around a new cross-module link, and the new file's
-closing delimiters. On PR #2955 that is 7 of 27 lines in `ingest_mode.rs`
-and 37 of 1,319 in `ingest_decode.rs`. In `ingest_decode.rs` three of the
-37 are rewrapped doc lines and one is the test module's closing brace.
-The reviewer reads every split-attributed line against that list; a line
-outside it is not a move. The same check applies to the `logs_scan.rs`
-split, which has not been made yet.
+`git blame -C -C -C` does not replace it as a bar either. Its copy
+detection is a heuristic whose answer depends on how much of a file is
+blamed at once. On the `logs_scan.rs` split (cd569a12b), a whole-file
+blame attributes 1,080 of `plan.rs`'s 1,475 lines to the split commit,
+and re-blaming those lines in runs of at most 10 still leaves 96 of them
+there, though they are moved bodies. It stays useful for finding where a
+line came from, not for deciding whether a split moved it.
+
+What item 3 requires instead is the split commit's line residue: the
+lines it adds that it does not also remove, compared as sorted multisets.
+
+    git show --format= -U0 <split> -- <paths> | grep -v '^+++ \|^--- ' > split.diff
+    sed -n 's/^+//p' split.diff | sort > added
+    sed -n 's/^-//p' split.diff | sort > removed
+    comm -23 added removed
+
+A pure move leaves only the lines a split has to write: blank lines, the
+new modules' doc headers and `mod` declarations, `use` lines and their
+continuations, attributes on a moved test module, visibility qualifiers
+such as `pub(crate)` on items that crossed a module boundary, references
+rewritten to the new module path (call sites, doc links, doc text that
+names a file), doc prose rewrapped around such a reference, lines rustfmt
+reflowed because one of those edits changed their length, and closing
+delimiters. The reviewer reads every residue
+line against that list, and a line outside it means the split did more
+than move. Edits the commit body names, such as a guard's file list,
+are read against the body.
+
+Both splits have been checked this way. The `logs_scan.rs` split
+(cd569a12b, which also produced a fourth part, `batch`) adds 9,843 lines
+with a residue of 79. Every residue line is in the list, two of them a
+function signature rustfmt reflowed after its visibility changed. The
+ingest split (T7, PR #2955 at 373dfd091) adds 1,554 lines with a residue
+of 115. Those are imports, module and attribute lines, call sites and doc
+links rewritten to the new module paths, and the guard file-list edit its
+commit body names. The removed side shows one more change the body names:
+two byte-identical copies of `retry_after_seconds`, in `otlp_http.rs` and
+`remote_write.rs`, became one in `ingest_admission.rs`. Blame did not
+show that change; the residue comparison does.
