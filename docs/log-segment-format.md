@@ -1344,7 +1344,11 @@ writer receives that set (`RlogWriter::with_key_index_fields`) and **writes
 it into the section header; a reader never infers it from live config.** A
 declared field with no matching rows in the object is still named, with
 `entry_count = 0`, an all-zero directory and `buckets_len = 0`, so an absent
-key is proved absent by the probe rather than left to a scan. A
+key is proved absent by the probe rather than left to a scan. The one
+declared field left out is one with a bucket that would hold more than
+`KEY_IDX_BUCKET_MAX_ENTRIES` entries, which the codec refuses: the writer
+drops that field from this object's header with a warning and writes the
+object and its other fields as usual. A
 field the header does not name is uncovered in this object for that field,
 whatever the tenant's current declaration says (ADR-0849 section 3).
 
@@ -1578,12 +1582,18 @@ The merge is defined entirely in terms of this format:
   read from each input's section header by one ranged GET of
   `[0, prefix_len)`, and its entries are rebuilt from the merged blocks; an
   input's entries are never reused, since the block ordinals differ. A field
-  no output row carries is still named, with `entry_count = 0`. Two inputs
-  that name one field under different key types are refused with
-  `KeyIndexKeyTypeConflict` and nothing is written; a union over 64 fields
-  fails the writer's field-count check the same way. An output without any
+  no output row carries is still named, with `entry_count = 0`. A field two
+  inputs name under different key types is left out of the output's header
+  and logged at warn level, and the merge goes ahead with every other
+  field; a union over 64 fields keeps `trace_id`, when named, and then the
+  first names in ascending byte order up to 64, and logs each field it
+  drops. The choice depends on the names alone, so a retried merge writes
+  the same field set. A retype of a key-index column, or a change made at
+  the 64-field cap, therefore leaves the affected field uncovered in any
+  output whose inputs mix the two declarations, until those inputs age
+  out, and it does not block compaction or erasure. An output without any
   input KEY_IDX has none. The erasure rewrite uses the same merge, so its
-  survivors keep every input's field set.
+  survivors keep every input's field set less those same exclusions.
 - **Compression level.** The compactor and the erasure rewrite encode every
   L1 page and zstd section at `CompactorConfig::rlog_zstd_level`, default 9
   (ADR-2135 decision 4), not the writer's level-3 default. The level changes

@@ -13,8 +13,8 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use ravel_codec::key_idx::{
-    KEY_IDX_MAX_FIELDS, KEY_IDX_MAX_NAME_LEN, KeyIdxFieldInput, KeyIdxPrefix, encode_key_idx,
-    key_idx_prefix_range, verify_key_idx,
+    KEY_IDX_MAX_NAME_LEN, KEY_IDX_WRITER_BUCKET_BITS, KeyIdxFieldInput, KeyIdxPrefix, bucket_index,
+    encode_key_idx, key_idx_prefix_range, verify_key_idx,
 };
 
 use crate::error::LogSegError;
@@ -23,8 +23,8 @@ use crate::record::{ColumnValue, FieldType};
 use crate::source::ByteSource;
 
 pub use ravel_codec::key_idx::{
-    EncodedKeyIdx, Key8, KeyIdxFieldSummary, KeyIdxSummary, KeyType, key8_bytes, key8_i64,
-    key8_id16, key8_str,
+    EncodedKeyIdx, KEY_IDX_BUCKET_MAX_ENTRIES, KEY_IDX_MAX_FIELDS, Key8, KeyIdxFieldSummary,
+    KeyIdxSummary, KeyType, key8_bytes, key8_i64, key8_id16, key8_str,
 };
 
 /// The fixed `trace_id` column's field name, the only field of key type
@@ -160,20 +160,59 @@ impl KeyIndexPlan {
     }
 
     /// Encodes the section. Every declared field is named, with
-    /// `entry_count = 0` when no row matched it.
-    pub(crate) fn encode(self) -> Result<EncodedKeyIdx, LogSegError> {
-        let inputs: Vec<KeyIdxFieldInput> = self
-            .fields
-            .into_iter()
-            .zip(self.entries)
-            .map(|((name, key_type), entries)| KeyIdxFieldInput {
+    /// `entry_count = 0` when no row matched it, except a field with a bucket
+    /// over `bucket_cap` entries: the codec refuses such a bucket, so the field
+    /// is left out of this object's header (a probe on it declines) and a
+    /// warning names it. `None` when every field was left out, so no section
+    /// is written.
+    pub(crate) fn encode(self, bucket_cap: u32) -> Result<Option<EncodedKeyIdx>, LogSegError> {
+        let mut inputs = Vec::with_capacity(self.fields.len());
+        for ((name, key_type), entries) in self.fields.into_iter().zip(self.entries) {
+            if let Some((bucket, count)) = overfull_bucket(&entries, bucket_cap)? {
+                tracing::warn!(
+                    field = %name,
+                    key_type = ?key_type,
+                    bucket,
+                    entries = count,
+                    bucket_cap,
+                    "KEY_IDX field left out of this object: one bucket holds more entries \
+                     than the cap, so the object reads as unindexed for the field"
+                );
+                continue;
+            }
+            inputs.push(KeyIdxFieldInput {
                 name,
                 key_type,
                 entries,
-            })
-            .collect();
-        Ok(encode_key_idx(&inputs)?)
+            });
+        }
+        if inputs.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(encode_key_idx(&inputs)?))
     }
+}
+
+/// The first bucket, at the writer's bucket bits, holding more than `cap` of
+/// `entries`, with its entry count. `entries` is already unique: a block is
+/// sealed once and deduplicates its own pairs, so the count is the one the
+/// codec checks.
+fn overfull_bucket(entries: &[(Key8, u32)], cap: u32) -> Result<Option<(u32, u64)>, LogSegError> {
+    if entries.len() as u64 <= u64::from(cap) {
+        return Ok(None);
+    }
+    let mut counts = vec![0u64; 1usize << KEY_IDX_WRITER_BUCKET_BITS];
+    for (key8, _) in entries {
+        let bucket = bucket_index(key8, KEY_IDX_WRITER_BUCKET_BITS)?;
+        if let Some(count) = counts.get_mut(bucket as usize) {
+            *count += 1;
+        }
+    }
+    Ok(counts
+        .iter()
+        .enumerate()
+        .find(|&(_, &count)| count > u64::from(cap))
+        .map(|(bucket, &count)| (bucket as u32, count)))
 }
 
 /// Checks a field set by the rules [`crate::RlogWriter::with_key_index_fields`]

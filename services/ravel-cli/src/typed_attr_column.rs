@@ -403,7 +403,9 @@ fn apply_key_index(proposed: &mut TenantConfig, spec: &KeyIndexSpec) -> anyhow::
     proposed.key_index_columns().map_err(|err| {
         anyhow::anyhow!(
             "{err}; the stored key_index names a column this declaration drops or retypes, so \
-             pass --key-index with the columns to keep"
+             pass --key-index with the columns to keep. A column kept under a new type is \
+             uncovered in compacted objects whose inputs mix the two types, until those inputs \
+             age out; it does not block compaction or erasure"
         )
     })?;
     Ok(())
@@ -668,7 +670,27 @@ mod tests {
             err.to_string().contains("pass --key-index"),
             "the error names the remedy: {err}"
         );
+        assert!(
+            err.to_string()
+                .contains("it does not block compaction or erasure"),
+            "the error says what a retype costs: {err}"
+        );
         assert_eq!(durable(store.as_ref(), "acme").await, Some(before));
+
+        // The remedy works for a retype: naming the column keeps it indexed
+        // under its new type.
+        set(
+            store.clone(),
+            "acme",
+            &specs(&["dur:str"]),
+            &key_index(Some(&["dur"]), None, StorageLayoutWrite::ReadersRolledOut),
+            3,
+        )
+        .await
+        .expect("a retyped column named in --key-index is kept");
+        let lines = key_index_lines(&durable(store.as_ref(), "acme").await.expect("present"))
+            .expect("lines");
+        assert!(lines.contains(&"  dur:str".to_string()), "{lines:?}");
     }
 
     /// `set` then `show` round-trips exactly what was set, in order, and `show`
