@@ -5,11 +5,12 @@ use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::LogicalPlan;
 use ravel_sql::esql::{
     self, EsqlError, EsqlRun, MAX_BOUND_NODES, MAX_EXPRESSION_DEPTH, MAX_LIMIT, MAX_PLAN_STAGES,
+    PrepareContext,
 };
 
 use crate::lowering::fetch;
 use crate::support::{
-    WORKER_STACK, context, fixture, on_stack, optimized, prepare, request, rows, run, run_with,
+    BASE, NOW, SECOND, WORKER_STACK, context, fixture, on_stack, optimized, prepare, request, rows, run, run_with,
 };
 
 /// Every fetch in `plan`, outermost first.
@@ -232,33 +233,52 @@ fn a_statement_past_the_node_budget_is_refused() {
     assert!(esql::prepare(&row(MAX_BOUND_NODES / 8), &limits, &context()).is_ok());
 }
 
-#[test]
-fn an_expression_past_the_depth_limit_is_refused() {
-    assert_eq!(MAX_EXPRESSION_DEPTH, 24);
-    let refusal = |source: &str| match prepare(source) {
+/// The message, line and column of the verification error refusing `source`.
+fn refusal(source: &str) -> (String, usize, usize) {
+    refusal_in(source, &context())
+}
+
+fn refusal_in(source: &str, ctx: &PrepareContext) -> (String, usize, usize) {
+    match esql::prepare(source, &ravel_esql::Limits::default(), ctx) {
         Err(EsqlError::Verification {
             message,
             line,
             column,
         }) => (message, line, column),
         other => panic!("expected a verification error, got {other:?}"),
-    };
-    // A value deeper than the limit, refused where it is bound.
+    }
+}
+
+/// How the depth limit is counted, as every depth refusal states it.
+const DEPTH_RULE: &str = "each operator, comparison and function call is a level, long \
+    arithmetic takes three levels per operator, and a column computed by ROW, EVAL or STATS \
+    ... BY counts as the expression computing it, so arithmetic chained through EVAL columns \
+    adds up";
+
+#[test]
+fn an_expression_past_the_depth_limit_is_refused() {
+    assert_eq!(MAX_EXPRESSION_DEPTH, 24);
+    // A value deeper than the limit, refused at its command.
     assert_eq!(
         refusal(&format!("ROW x = 9{}", " / 1".repeat(8))),
         (
-            "[9 / 1 / 1 / 1 / 1 / 1 / 1 / 1 / 1] binds to an expression 26 levels deep, \
-             more than the limit of 24"
-                .to_string(),
+            format!(
+                "ROW expression [9 / 1 / 1 / 1 / 1 / 1 / 1 / 1 / 1] is 26 levels deep, past \
+                 the limit of 24: {DEPTH_RULE}"
+            ),
             1,
-            9
+            1
         )
     );
     prepare(&format!("ROW x = 9{}", " / 1".repeat(7))).expect("prepares");
     // A column counts as the depth of what computes it.
     assert_eq!(
-        refusal(&format!("ROW x = 9{} | EVAL y = x / 1", " / 1".repeat(7))).0,
-        "[x / 1] binds to an expression 26 levels deep, more than the limit of 24"
+        refusal(&format!("ROW x = 9{}\n| EVAL y = x / 1", " / 1".repeat(7))),
+        (
+            format!("EVAL expression [x / 1] is 26 levels deep, past the limit of 24: {DEPTH_RULE}"),
+            2,
+            3
+        )
     );
     // A value within the limit that its stage makes deeper: a long sum casts
     // its argument to a decimal.
@@ -267,24 +287,126 @@ fn an_expression_past_the_depth_limit_is_refused() {
     assert_eq!(
         refusal(&format!("FROM logs | STATS s = SUM({argument})")),
         (
-            "the statement binds to an expression 25 levels deep, more than the limit of 24"
-                .to_string(),
+            format!(
+                "STATS argument of [SUM({argument})], cast to a decimal to sum, is 25 levels \
+                 deep, past the limit of 24: {DEPTH_RULE}"
+            ),
             1,
             13
         )
     );
 }
 
+/// Every `WHERE` up to a `LIMIT` runs as one condition, refused once that
+/// condition is past the depth limit.
+#[test]
+fn where_conditions_past_the_depth_limit_together_are_refused() {
+    let conditions = |from: usize, count: usize| {
+        (from..from + count)
+            .map(|j| format!("dur != {j}"))
+            .collect::<Vec<_>>()
+            .join(" AND ")
+    };
+    let statement = |second: usize| {
+        format!(
+            "FROM logs\n| WHERE {}\n| WHERE {}",
+            conditions(0, 12),
+            conditions(12, second)
+        )
+    };
+    prepare(&statement(11)).expect("prepares");
+    assert_eq!(
+        refusal(&statement(12)),
+        (
+            format!(
+                "WHERE brings the statement to 24 conditions joined by AND, the deepest 2 \
+                 levels deep, which run as one condition 25 levels deep, past the limit of 24: \
+                 the conditions of every WHERE since the source command or the last LIMIT run \
+                 as one, and each condition joined by AND adds a level; {DEPTH_RULE}"
+            ),
+            3,
+            3
+        )
+    );
+    // A LIMIT between them keeps the two conditions apart.
+    prepare(&format!(
+        "FROM logs | WHERE {} | LIMIT 100 | WHERE {}",
+        conditions(0, 12),
+        conditions(12, 12)
+    ))
+    .expect("prepares");
+}
+
+/// How the stage limit is counted, as the stage refusal states it.
+const STAGE_RULE: &str = "each WHERE, SORT, LIMIT, KEEP and DROP is one stage and each STATS \
+    two or more; the columns ROW and EVAL fields define are computed in one stage ahead of the \
+    next of those commands or the end of the statement, plus one for each level of them \
+    reading another; FROM, the request time range and the implicit LIMIT do not count";
+
 #[test]
 fn a_statement_past_the_stage_limit_is_refused() {
-    assert_eq!(MAX_PLAN_STAGES, 12);
-    // Each WHERE is a stage, and so are the output projection and the limit.
+    assert_eq!(MAX_PLAN_STAGES, 10);
     let filters = |count: usize| format!("FROM logs{}", " | WHERE dur > 0".repeat(count));
     prepare(&filters(10)).expect("prepares");
-    match prepare(&filters(11)) {
-        Err(EsqlError::Verification { message, .. }) => {
-            assert_eq!(message, "the statement binds to more than 12 plan stages");
-        }
-        other => panic!("expected a verification error, got {other:?}"),
+    assert_eq!(
+        refusal(&filters(11)),
+        (
+            format!("WHERE takes the statement past 10 plan stages: {STAGE_RULE}"),
+            1,
+            173
+        )
+    );
+    // The request time range is not a stage of the statement's own.
+    let ranged = PrepareContext {
+        start: Some(BASE - 60 * SECOND),
+        end: Some(NOW + 1),
+        ..context()
+    };
+    esql::prepare(&filters(10), &ravel_esql::Limits::default(), &ranged).expect("prepares");
+    assert_eq!(
+        refusal_in(&filters(11), &ranged),
+        refusal(&filters(11))
+    );
+}
+
+/// The most times `stage` follows `head` in a statement that prepares.
+fn most(head: &str, stage: &str) -> usize {
+    let mut n = 0;
+    while prepare(&format!("{head}{}", stage.repeat(n + 1))).is_ok() {
+        n += 1;
+        assert!(n <= 2 * MAX_PLAN_STAGES, "{head}{stage} is never refused");
     }
+    n
+}
+
+/// Each count the stage refusal states, one command at a time.
+#[test]
+fn the_stage_limit_counts_the_statements_own_commands() {
+    for stage in [
+        " | WHERE dur > 0",
+        " | SORT dur",
+        " | LIMIT 5",
+        " | KEEP dur",
+    ] {
+        assert_eq!(most("FROM logs", stage), 10, "{stage}");
+    }
+    assert_eq!(most("FROM logs", " | STATS c = COUNT(*) BY service"), 5);
+    // The columns EVAL defines take one stage, and one more per level of
+    // them reading another.
+    assert_eq!(most("FROM logs | EVAL x = dur + 1", " | SORT x"), 9);
+    assert_eq!(
+        most("FROM logs | EVAL x = dur + 1, y = x + 1", " | SORT y"),
+        8
+    );
+    assert_eq!(most("ROW a = 1", " | SORT a"), 9);
+    let drops = |count: usize| {
+        let fields: Vec<String> = (1..=10).map(|i| format!("x{i} = dur + {i}")).collect();
+        let drops: String = (1..=count).map(|i| format!(" | DROP x{i}")).collect();
+        format!("FROM logs | EVAL {}{drops}", fields.join(", "))
+    };
+    prepare(&drops(9)).expect("prepares");
+    assert_eq!(
+        refusal(&drops(10)).0,
+        format!("DROP takes the statement past 10 plan stages: {STAGE_RULE}")
+    );
 }

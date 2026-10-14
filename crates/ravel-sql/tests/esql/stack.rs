@@ -3,9 +3,31 @@
 //! 2 MiB stack: each returns its exact rows, and one step past it is a typed
 //! refusal.
 
-use ravel_sql::esql::{EsqlError, EsqlOutcome, MAX_EXPRESSION_DEPTH};
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::utils::split_conjunction;
+use datafusion::logical_expr::{Expr, LogicalPlan};
+use ravel_sql::esql::{
+    self, EsqlError, EsqlOutcome, MAX_EXPRESSION_DEPTH, MAX_PLAN_STAGES, PrepareContext,
+    PreparedEsql,
+};
 
-use crate::support::{WORKER_STACK, columns, fixture, on_stack, prepare, rows, run_prepared};
+use crate::support::{
+    BASE, NOW, SECOND, WORKER_STACK, columns, context, fixture, on_stack, optimized, prepare,
+    rows, run_prepared,
+};
+
+/// A request time range holding every fixture row.
+const RANGE: (i64, i64) = (BASE - 60 * SECOND, NOW + 1);
+
+/// `source` prepared with the request time range [`RANGE`] when `ranged`.
+fn prepare_in(source: &str, ranged: bool) -> Result<PreparedEsql, EsqlError> {
+    let ctx = PrepareContext {
+        start: ranged.then_some(RANGE.0),
+        end: ranged.then_some(RANGE.1),
+        ..context()
+    };
+    esql::prepare(source, &ravel_esql::Limits::default(), &ctx)
+}
 
 /// The fixture's rows: message, service and dur.
 const LOGS: [(&str, Option<&str>, Option<i64>); 6] = [
@@ -56,9 +78,11 @@ impl Kind {
 enum Shape {
     /// `ROW x1 = e`, then `| EVAL xi = e` per stage.
     Row,
-    /// `FROM logs`, then `| WHERE e >= 0` per stage.
+    /// `FROM logs`, then `| WHERE e != -i` per stage `i`, each `e` with its
+    /// own modulus, so no two conditions are equal.
     Where,
-    /// `FROM logs`, then per stage a `WHERE` of `k` `AND`ed comparisons.
+    /// `FROM logs`, then per stage a `WHERE` of `k + 1` `AND`ed comparisons
+    /// `dur != -j`, each `j` its own.
     And,
     /// `FROM logs`, then `| EVAL xi = e` per stage.
     Eval,
@@ -75,6 +99,10 @@ enum Shape {
     /// `FROM logs | STATS s = SUM(severity_num) WHERE e >= 0 BY service`
     /// over `dur`, then the same over `s` per stage.
     StatsWhere,
+    /// `FROM logs | STATS c = COUNT(*) BY g1 = e` over `dur`, then the same
+    /// over the group before per stage, then `| WHERE e >= 0` over the last
+    /// group.
+    StatsGroup,
 }
 
 impl Shape {
@@ -93,12 +121,17 @@ impl Shape {
             ),
             Shape::Where => format!(
                 "FROM logs{}",
-                stages(&|_| format!(" | WHERE {} >= 0", e("dur")))
+                stages(&|i| format!(" | WHERE {} != -{i}", kind.expr("dur", k, 1000 + i)))
             ),
-            Shape::And => {
-                let and = vec!["dur >= 0"; k + 1].join(" AND ");
-                format!("FROM logs{}", stages(&|_| format!(" | WHERE {and}")))
-            }
+            Shape::And => format!(
+                "FROM logs{}",
+                stages(&|i| {
+                    let and: Vec<String> = (1..=k + 1)
+                        .map(|j| format!("dur != -{}", (i - 1) * (k + 1) + j))
+                        .collect();
+                    format!(" | WHERE {}", and.join(" AND "))
+                })
+            ),
             Shape::Eval => format!(
                 "FROM logs{}",
                 stages(&|i| format!(" | EVAL x{i} = {}", e("dur")))
@@ -146,6 +179,18 @@ impl Shape {
                     };
                     format!(" | STATS s = SUM({sum}) WHERE {} >= 0 BY service", e(over))
                 })
+            ),
+            Shape::StatsGroup => format!(
+                "FROM logs{} | WHERE {} >= 0",
+                stages(&|i| {
+                    let over = if i == 1 {
+                        "dur".to_string()
+                    } else {
+                        format!("g{}", i - 1)
+                    };
+                    format!(" | STATS c = COUNT(*) BY g{i} = {}", e(&over))
+                }),
+                e(&format!("g{n}"))
             ),
         }
     }
@@ -198,6 +243,14 @@ impl Shape {
                 strings(&[["35", "api"], ["5", "web"], ["21", "null"]]),
                 false,
             ),
+            Shape::StatsGroup => (
+                vec!["c".to_string(), format!("g{n}")],
+                LOGS.iter()
+                    .filter(|(_, _, dur)| dur.is_some())
+                    .map(|(_, _, dur)| vec!["1".to_string(), kind.render(*dur)])
+                    .collect(),
+                false,
+            ),
         }
     }
 }
@@ -243,22 +296,27 @@ fn largest(admitted: impl Fn(usize) -> bool) -> usize {
 /// What refused a statement.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
+    /// One expression too deep.
     Depth,
+    /// The `WHERE` conditions merged into one too deep.
+    Merged,
     Stages,
     Parse,
 }
 
 fn refusal(err: &EsqlError) -> Refusal {
+    let depth = format!("levels deep, past the limit of {MAX_EXPRESSION_DEPTH}:");
     match err {
         EsqlError::Parse(_) => Refusal::Parse,
         EsqlError::Verification { message, .. }
-            if message.ends_with(&format!(
-                "levels deep, more than the limit of {MAX_EXPRESSION_DEPTH}"
-            )) =>
+            if message.contains("joined by AND") && message.contains(&depth) =>
         {
-            Refusal::Depth
+            Refusal::Merged
         }
-        EsqlError::Verification { message, .. } if message.contains("plan stages") => {
+        EsqlError::Verification { message, .. } if message.contains(&depth) => Refusal::Depth,
+        EsqlError::Verification { message, .. }
+            if message.contains(&format!("past {MAX_PLAN_STAGES} plan stages:")) =>
+        {
             Refusal::Stages
         }
         other => panic!("not a limit refusal: {other:?}"),
@@ -270,8 +328,19 @@ fn refusal(err: &EsqlError) -> Refusal {
 /// statement at both run to its exact rows, and what refuses `n + 1`. A `k`
 /// the search found is checked to refuse `k + 1` as too deep.
 fn worst_at(kind: Kind, shape: Shape, depth: Option<usize>) -> (usize, usize, Refusal) {
+    worst_in(kind, shape, depth, false)
+}
+
+/// [`worst_at`], each statement prepared with the request time range
+/// [`RANGE`] when `ranged`.
+fn worst_in(
+    kind: Kind,
+    shape: Shape,
+    depth: Option<usize>,
+    ranged: bool,
+) -> (usize, usize, Refusal) {
     on_stack(WORKER_STACK, move || async move {
-        let admitted = |k, n| prepare(&shape.statement(kind, k, n));
+        let admitted = |k, n| prepare_in(&shape.statement(kind, k, n), ranged);
         let k = match depth {
             Some(k) => k,
             None => {
@@ -286,7 +355,9 @@ fn worst_at(kind: Kind, shape: Shape, depth: Option<usize>) -> (usize, usize, Re
 
         let prepared = admitted(k, n).expect("prepares");
         let fixture = fixture().await;
-        let outcome = run_prepared(&fixture, &prepared).await.expect("runs");
+        let outcome = run_prepared(&fixture, &prepared)
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?} {shape:?} at k = {k}, n = {n}: {e}"));
         let (names, mut expected, ordered) = shape.expected(kind, n);
         let mut found = select(&outcome, &names);
         if !ordered {
@@ -314,19 +385,194 @@ fn the_deepest_double_row_runs_on_a_worker_stack() {
     assert_eq!(worst(Kind::Double, Shape::Row), (19, 100, Refusal::Parse));
 }
 
+/// The depth of `e`, counting `e` itself.
+fn expr_depth(e: &Expr) -> usize {
+    let mut deepest = 0;
+    e.apply_children(|child| {
+        deepest = deepest.max(expr_depth(child));
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("walk");
+    deepest + 1
+}
+
+/// The deepest filter predicate in the optimized plan of `source`, on a
+/// 2 MiB thread: its conjunct count and its depth.
+fn merged_filter(source: String) -> (usize, usize) {
+    on_stack(WORKER_STACK, move || async move {
+        let fixture = fixture().await;
+        let plan = optimized(&fixture, &source).await;
+        let mut deepest = (0, 0);
+        plan.apply(|node| {
+            if let LogicalPlan::Filter(filter) = node {
+                let depth = expr_depth(&filter.predicate);
+                if depth > deepest.1 {
+                    deepest = (split_conjunction(&filter.predicate).len(), depth);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })
+        .expect("walk");
+        deepest
+    })
+}
+
+/// DataFusion merges consecutive `WHERE` conditions into one `AND`, so the
+/// merged condition is what is bounded: at the deepest condition a second
+/// `WHERE` is refused. The optimized plan holds one conjunct per `WHERE`, and
+/// after simplification it is shallower than the binder counts it.
 #[test]
 fn the_deepest_long_where_runs_on_a_worker_stack() {
-    assert_eq!(worst(Kind::Long, Shape::Where), (7, 10, Refusal::Stages));
+    assert_eq!(worst(Kind::Long, Shape::Where), (7, 1, Refusal::Merged));
+    assert_eq!(
+        merged_filter(Shape::Where.statement(Kind::Long, 7, 1)),
+        (1, 19)
+    );
+    assert_eq!(
+        worst_at(Kind::Long, Shape::Where, Some(5)),
+        (5, 7, Refusal::Merged)
+    );
+    assert_eq!(
+        merged_filter(Shape::Where.statement(Kind::Long, 5, 7)),
+        (7, 15)
+    );
+    assert_eq!(
+        worst_at(Kind::Long, Shape::Where, Some(1)),
+        (1, 10, Refusal::Stages)
+    );
 }
 
 #[test]
 fn the_deepest_double_where_runs_on_a_worker_stack() {
-    assert_eq!(worst(Kind::Double, Shape::Where), (18, 5, Refusal::Stages));
+    assert_eq!(worst(Kind::Double, Shape::Where), (18, 1, Refusal::Merged));
+    assert_eq!(
+        worst_at(Kind::Double, Shape::Where, Some(17)),
+        (17, 2, Refusal::Merged)
+    );
+}
+
+/// Every conjunct is distinct, so the optimized plan keeps each of them in
+/// one merged condition, and that condition is what is bounded.
+#[test]
+fn the_deepest_and_chain_runs_on_a_worker_stack() {
+    assert_eq!(worst(Kind::Long, Shape::And), (22, 1, Refusal::Merged));
+    assert_eq!(
+        merged_filter(Shape::And.statement(Kind::Long, 22, 1)),
+        (23, 24)
+    );
+    assert_eq!(
+        worst_at(Kind::Long, Shape::And, Some(2)),
+        (2, 7, Refusal::Merged)
+    );
+    assert_eq!(
+        merged_filter(Shape::And.statement(Kind::Long, 2, 7)),
+        (21, 22)
+    );
+}
+
+/// A group counts as the depth of the expression computing it, which a
+/// `WHERE` over it inlines below the aggregate.
+#[test]
+fn the_deepest_long_stats_group_runs_on_a_worker_stack() {
+    assert_eq!(
+        worst(Kind::Long, Shape::StatsGroup),
+        (3, 1, Refusal::Depth)
+    );
+    assert_eq!(
+        worst_at(Kind::Long, Shape::StatsGroup, Some(1)),
+        (1, 4, Refusal::Stages)
+    );
 }
 
 #[test]
-fn the_deepest_and_chain_runs_on_a_worker_stack() {
-    assert_eq!(worst(Kind::Long, Shape::And), (22, 10, Refusal::Stages));
+fn the_deepest_double_stats_group_runs_on_a_worker_stack() {
+    assert_eq!(
+        worst(Kind::Double, Shape::StatsGroup),
+        (7, 1, Refusal::Depth)
+    );
+    assert_eq!(
+        worst_at(Kind::Double, Shape::StatsGroup, Some(1)),
+        (1, 4, Refusal::Depth)
+    );
+}
+
+/// Four groups each computed from the one before, then a `WHERE` over the
+/// last: the second group already inlines past the depth limit.
+#[test]
+fn a_chain_of_groups_filtered_after_the_last_is_refused() {
+    let chain = " / 1".repeat(7);
+    let source = format!(
+        "FROM logs | STATS c = COUNT(*) BY g1 = dur{chain} \
+         | STATS c = COUNT(*) BY g2 = g1{chain} | STATS c = COUNT(*) BY g3 = g2{chain} \
+         | STATS c = COUNT(*) BY g4 = g3{chain} | WHERE g4{chain} >= 0"
+    );
+    let found = on_stack(WORKER_STACK, move || async move {
+        match prepare(&source) {
+            Ok(prepared) => {
+                let fixture = fixture().await;
+                let outcome = run_prepared(&fixture, &prepared).await.expect("runs");
+                Ok(rows(&outcome))
+            }
+            Err(err) => Err(err.to_string()),
+        }
+    });
+    assert_eq!(
+        found,
+        Err(format!(
+            "line 1:74: STATS expression [g1{chain}] is 44 levels deep, past the limit of 24: \
+             each operator, comparison and function call is a level, long arithmetic takes \
+             three levels per operator, and a column computed by ROW, EVAL or STATS ... BY \
+             counts as the expression computing it, so arithmetic chained through EVAL columns \
+             adds up"
+        ))
+    );
+}
+
+/// The request time range is a stage the statement does not write, so it
+/// does not count against the stage limit, and the longest statements still
+/// run with it, its conditions merged into the statement's own.
+#[test]
+fn the_longest_statements_run_with_a_request_range_on_a_worker_stack() {
+    assert_eq!(
+        worst_in(Kind::Long, Shape::Sort, Some(7), true),
+        (7, 10, Refusal::Stages)
+    );
+    assert_eq!(
+        worst_in(Kind::Double, Shape::Sort, Some(19), true),
+        (19, 5, Refusal::Stages)
+    );
+    assert_eq!(
+        worst_in(Kind::Long, Shape::Where, Some(7), true),
+        (7, 1, Refusal::Merged)
+    );
+    assert_eq!(
+        worst_in(Kind::Long, Shape::Where, Some(5), true),
+        (5, 7, Refusal::Merged)
+    );
+    assert_eq!(
+        worst_in(Kind::Long, Shape::Where, Some(1), true),
+        (1, 10, Refusal::Stages)
+    );
+    assert_eq!(
+        worst_in(Kind::Long, Shape::And, Some(22), true),
+        (22, 1, Refusal::Merged)
+    );
+}
+
+#[test]
+fn the_longest_stats_run_with_a_request_range_on_a_worker_stack() {
+    assert_eq!(
+        worst_in(Kind::Long, Shape::StatsField, Some(7), true),
+        (7, 5, Refusal::Stages)
+    );
+    assert_eq!(
+        worst_in(Kind::Long, Shape::StatsGroup, Some(1), true),
+        (1, 4, Refusal::Stages)
+    );
+    assert_eq!(
+        worst_in(Kind::Long, Shape::Eval, Some(7), true),
+        (7, 99, Refusal::Parse)
+    );
 }
 
 #[test]

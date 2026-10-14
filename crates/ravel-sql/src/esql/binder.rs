@@ -31,7 +31,7 @@ use ravel_esql::ast::{
 use super::error::EsqlError;
 use super::ir::{BAggregate, BExpr, BSortKey, Pipeline, Source, Stage};
 use super::types::{EsqlColumn, EsqlType};
-use super::window::WindowBounds;
+use super::window::{WindowBounds, split_and};
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::session::LOGS_TABLE;
 
@@ -48,11 +48,12 @@ pub const MAX_LIMIT: u64 = 10_000;
 /// statement past it is refused with a verification error.
 ///
 /// The densest shapes measured bind to 3 nodes per token (a field of one
-/// double division), and each of at most [`MAX_PLAN_STAGES`] projections
-/// carries at most one column per four tokens (`x = 1,`), so a statement
-/// within the default 65,536-token limit binds to under 3 * 65,536 + 12 *
-/// 16,384 = 393,216 nodes. A statement parsed under a larger token limit
-/// can pass the budget, and is refused.
+/// double division), and each of at most [`MAX_PLAN_STAGES`] projections the
+/// statement's commands create carries at most one column per four tokens
+/// (`x = 1,`), so a statement within the default 65,536-token limit binds to
+/// under 3 * 65,536 + 10 * 16,384 = 360,448 nodes, plus the source
+/// projection's one column per native or declared column. A statement
+/// parsed under a larger token limit can pass the budget, and is refused.
 pub const MAX_BOUND_NODES: usize = 1 << 20;
 
 /// The deepest expression a statement may bind to, a column computed by a
@@ -83,7 +84,19 @@ pub const MAX_EXPRESSION_DEPTH: usize = 24;
 /// stage of a `WHERE`, `SORT`, `EVAL`, `STATS` field or per-aggregate `WHERE`
 /// pipeline plans and runs on 1 MiB, half the 2 MiB stack of a server worker
 /// thread.
-pub const MAX_PLAN_STAGES: usize = 12;
+pub const MAX_PLAN_STAGES: usize = 10;
+
+/// What counts toward [`MAX_EXPRESSION_DEPTH`], as a refusal states it.
+const DEPTH_RULE: &str = "each operator, comparison and function call is a level, long \
+    arithmetic takes three levels per operator, and a column computed by ROW, EVAL or \
+    STATS ... BY counts as the expression computing it, so arithmetic chained through \
+    EVAL columns adds up";
+
+/// What counts toward [`MAX_PLAN_STAGES`], as a refusal states it.
+const STAGE_RULE: &str = "each WHERE, SORT, LIMIT, KEEP and DROP is one stage and each STATS \
+    two or more; the columns ROW and EVAL fields define are computed in one stage ahead of \
+    the next of those commands or the end of the statement, plus one for each level of them \
+    reading another; FROM, the request time range and the implicit LIMIT do not count";
 
 /// An expression the bound output repeats is copied only up to this many
 /// nodes. A larger one is computed once under a fresh internal name ahead of
@@ -125,6 +138,9 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
         pre: Vec::new(),
         post: Vec::new(),
         inlined: HashMap::new(),
+        own_stages: 0,
+        conjuncts: 0,
+        deepest_conjunct: 0,
     };
     match &query.source {
         Command::From(from) => binder.from(from, input)?,
@@ -156,7 +172,7 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
                 *count = MAX_LIMIT;
             }
         }
-        _ => binder.push(Stage::Limit(IMPLICIT_LIMIT))?,
+        _ => binder.push_internal(Stage::Limit(IMPLICIT_LIMIT))?,
     }
     let output = binder
         .scope
@@ -300,6 +316,14 @@ struct Binder<'a> {
     /// The depth of each projected column with the projections under it
     /// inlined, for [`MAX_EXPRESSION_DEPTH`].
     inlined: HashMap<String, usize>,
+    /// The stages the statement's own commands created, against
+    /// [`MAX_PLAN_STAGES`].
+    own_stages: usize,
+    /// The `AND`ed conditions of every `WHERE` since the source or the last
+    /// `LIMIT`, which DataFusion merges into one condition, and the deepest
+    /// of them inlined.
+    conjuncts: usize,
+    deepest_conjunct: usize,
 }
 
 impl Binder<'_> {
@@ -377,29 +401,68 @@ impl Binder<'_> {
         Ok(())
     }
 
+    /// The keyword of the command being bound, upper case.
+    fn command_name(&self) -> String {
+        let text = self.text(self.at);
+        let keyword = text.split_whitespace().next().unwrap_or_default();
+        keyword.to_ascii_uppercase()
+    }
+
+    /// A refusal of an expression `depth` levels deep, `what` naming it
+    /// within the command being bound.
+    fn too_deep(&self, what: &str, depth: usize) -> EsqlError {
+        self.verification(
+            self.at,
+            format!(
+                "{} {what} is {depth} levels deep, past the limit of {MAX_EXPRESSION_DEPTH}: {DEPTH_RULE}",
+                self.command_name()
+            ),
+        )
+    }
+
+    /// Add a stage the statement's own command creates, counting it against
+    /// [`MAX_PLAN_STAGES`].
     fn push(&mut self, stage: Stage) -> Result<(), EsqlError> {
-        if self.stages.len() >= MAX_PLAN_STAGES {
-            return Err(self.verification(
-                self.at,
-                format!("the statement binds to more than {MAX_PLAN_STAGES} plan stages"),
-            ));
-        }
-        let depth = stage.depth(&|name| self.inlined.get(name).copied().unwrap_or(1));
-        if depth > MAX_EXPRESSION_DEPTH {
+        if self.own_stages >= MAX_PLAN_STAGES {
             return Err(self.verification(
                 self.at,
                 format!(
-                    "the statement binds to an expression {depth} levels deep, more than the limit of {MAX_EXPRESSION_DEPTH}"
+                    "{} takes the statement past {MAX_PLAN_STAGES} plan stages: {STAGE_RULE}",
+                    self.command_name()
                 ),
             ));
         }
+        self.own_stages += 1;
+        self.push_internal(stage)
+    }
+
+    /// Add a stage, without counting it against [`MAX_PLAN_STAGES`]: the
+    /// source projection, the request time range and the implicit `LIMIT`,
+    /// which every statement has whatever it says.
+    fn push_internal(&mut self, stage: Stage) -> Result<(), EsqlError> {
+        let depth = stage.depth(&|name| self.inlined.get(name).copied().unwrap_or(1));
+        if depth > MAX_EXPRESSION_DEPTH {
+            return Err(self.too_deep("binds to an expression that", depth));
+        }
         self.nodes = self.nodes.saturating_add(stage.nodes());
         self.within_budget(self.nodes, self.at)?;
-        if let Stage::Project(columns) = &stage {
-            let depths: Vec<usize> = columns.iter().map(|(e, _)| self.inlined_depth(e)).collect();
-            for ((_, name), depth) in columns.iter().zip(depths) {
-                self.inlined.insert(name.clone(), depth);
+        match &stage {
+            Stage::Project(columns) => {
+                let depths: Vec<usize> =
+                    columns.iter().map(|(e, _)| self.inlined_depth(e)).collect();
+                for ((_, name), depth) in columns.iter().zip(depths) {
+                    self.inlined.insert(name.clone(), depth);
+                }
             }
+            // A filter on a group is pushed below the aggregate with the
+            // group's expression in place of the column.
+            Stage::Aggregate { groups, .. } => {
+                let depths: Vec<usize> = groups.iter().map(|(e, _)| self.inlined_depth(e)).collect();
+                for ((_, name), depth) in groups.iter().zip(depths) {
+                    self.inlined.insert(name.clone(), depth);
+                }
+            }
+            Stage::Filter(_) | Stage::Sort(_) | Stage::Limit(_) => {}
         }
         self.stages.push(stage);
         Ok(())
@@ -643,7 +706,7 @@ impl Binder<'_> {
         let ts = self.scope.cols[0].internal.clone();
         let body = self.scope.cols[4].internal.clone();
         self.scope.aliases = vec![("ts", ts.clone()), ("body", body)];
-        self.push(Stage::Project(columns))?;
+        self.push_internal(Stage::Project(columns))?;
 
         let mut range = Vec::new();
         if let Some(start) = input.start {
@@ -664,7 +727,7 @@ impl Binder<'_> {
             .into_iter()
             .reduce(|left, right| BExpr::binary(left, Operator::And, right))
         {
-            self.push(Stage::Filter(condition))?;
+            self.push_internal(Stage::Filter(condition))?;
         }
         self.ts = Some(ts);
         self.window = Some(WindowBounds::default());
@@ -676,6 +739,7 @@ impl Binder<'_> {
             Command::Where(w) => {
                 let (condition, ty) = self.value(&w.condition, &mut Cx::Row)?;
                 let condition = self.condition(condition, ty, w.condition.span())?;
+                self.merge_conjuncts(&condition)?;
                 if let (Some(window), Some(ts)) = (&mut self.window, &self.ts) {
                     window.observe(&condition, ts);
                 }
@@ -734,6 +798,10 @@ impl Binder<'_> {
                 }
                 self.flush_pre(&[])?;
                 self.push(Stage::Limit(limit.count))?;
+                // A filter is not pushed below a limit, so the conditions
+                // above it merge apart from those below.
+                self.conjuncts = 0;
+                self.deepest_conjunct = 0;
             }
             other => {
                 let keyword = self.text(other.span());
@@ -744,6 +812,36 @@ impl Binder<'_> {
                 ));
             }
         }
+        Ok(())
+    }
+
+    /// Refuse a `WHERE` condition that takes the merged condition of every
+    /// `WHERE` since the source or the last `LIMIT` past
+    /// [`MAX_EXPRESSION_DEPTH`]. DataFusion joins the merged conditions into
+    /// one left-deep `AND`, n conditions at most n - 1 levels below its root.
+    fn merge_conjuncts(&mut self, condition: &BExpr) -> Result<(), EsqlError> {
+        let mut parts = Vec::new();
+        split_and(condition, &mut parts);
+        let conjuncts = self.conjuncts + parts.len();
+        let deepest = parts
+            .iter()
+            .map(|part| self.inlined_depth(part))
+            .fold(self.deepest_conjunct, usize::max);
+        let merged = conjuncts - 1 + deepest;
+        if merged > MAX_EXPRESSION_DEPTH {
+            return Err(self.verification(
+                self.at,
+                format!(
+                    "WHERE brings the statement to {conjuncts} conditions joined by AND, the \
+                     deepest {deepest} levels deep, which run as one condition {merged} levels \
+                     deep, past the limit of {MAX_EXPRESSION_DEPTH}: the conditions of every WHERE \
+                     since the source command or the last LIMIT run as one, and each condition \
+                     joined by AND adds a level; {DEPTH_RULE}"
+                ),
+            ));
+        }
+        self.conjuncts = conjuncts;
+        self.deepest_conjunct = deepest;
         Ok(())
     }
 
@@ -981,13 +1079,7 @@ impl Binder<'_> {
         let (value, ty) = self.settle(value, cx, e.span())?;
         let depth = unsettled.max(self.inlined_depth(&value));
         if depth > MAX_EXPRESSION_DEPTH {
-            return Err(self.verification(
-                e.span(),
-                format!(
-                    "[{}] binds to an expression {depth} levels deep, more than the limit of {MAX_EXPRESSION_DEPTH}",
-                    self.text(e.span())
-                ),
-            ));
+            return Err(self.too_deep(&format!("expression [{}]", self.text(e.span())), depth));
         }
         Ok((value, ty))
     }
@@ -1274,12 +1366,17 @@ impl Binder<'_> {
                     EsqlType::Null,
                 ));
             }
-            ("sum", EsqlType::Long) => (
-                "sum",
-                arg.cast(DECIMAL),
-                column.try_cast(DataType::Int64),
-                EsqlType::Long,
-            ),
+            ("sum", EsqlType::Long) => {
+                let arg = arg.cast(DECIMAL);
+                let depth = self.inlined_depth(&arg);
+                if depth > MAX_EXPRESSION_DEPTH {
+                    return Err(self.too_deep(
+                        &format!("argument of [{text}], cast to a decimal to sum,"),
+                        depth,
+                    ));
+                }
+                ("sum", arg, column.try_cast(DataType::Int64), EsqlType::Long)
+            }
             ("sum", EsqlType::Double) => ("sum", arg, self.finite(column, true), EsqlType::Double),
             ("avg", EsqlType::Long | EsqlType::Double) => ("avg", arg, column, EsqlType::Double),
             ("min", ty) if ty != EsqlType::Null => ("min", arg, column, ty),
