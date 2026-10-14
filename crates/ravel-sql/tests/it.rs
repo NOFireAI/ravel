@@ -146,6 +146,8 @@ mod spans_differential;
 mod spans_provider;
 #[path = "spill.rs"]
 mod spill;
+#[path = "sql_postings_multi_scan.rs"]
+mod sql_postings_multi_scan;
 #[path = "sql_postings_prefix_pruning.rs"]
 mod sql_postings_prefix_pruning;
 #[path = "sql_postings_pruning.rs"]
