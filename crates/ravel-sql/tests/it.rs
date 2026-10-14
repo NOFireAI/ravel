@@ -40,6 +40,8 @@ mod distinct_on;
 mod erasure_dedup_positions;
 #[path = "exact_typed_classification_q29.rs"]
 mod exact_typed_classification_q29;
+#[path = "execute_analyzed.rs"]
+mod execute_analyzed;
 #[path = "expr_planner_surface.rs"]
 mod expr_planner_surface;
 #[path = "extract_field.rs"]
