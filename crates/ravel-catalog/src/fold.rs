@@ -2295,6 +2295,7 @@ impl Catalog {
                     watermark_hour: part_watermark,
                     min_hour: part_min_hour,
                     column_stats,
+                    key_index: Vec::new(),
                 });
             }
 

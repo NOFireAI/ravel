@@ -154,6 +154,12 @@ message SnapshotPartRef {
   // has no per-part statistics and is scanned: since ADR-1413 decision 6
   // there is no whole-object fallback. Absence is never an error.
   SnapshotColumnStatsPartRef column_stats = 7;
+  // Additive, ADR-2707 decision 4. One reference per (field, key slice) of
+  // the exact-key index over exactly this part's segments (`.kidx` leaves,
+  // docs/catalog-and-mvcc.md "Per-part key-index leaves"). Absent means the
+  // part is uncovered for every field and is scanned; absence is never an
+  // error. No HEAD_FORMAT_VERSION bump, by the field 6 and 7 precedent.
+  repeated SnapshotKeyIndexLeafRef key_index = 8;
 }
 
 // Reference to a name-postings object (RNP1 envelope), phase P5a.
@@ -265,4 +271,45 @@ message ColumnStatsSegment {
   uint64 writer_epoch = 4;
   uint64 writer_seq = 5;
   repeated ColumnStat columns = 6;
+}
+
+// Reference to one per-part key-index leaf (RKI1 envelope, `.kidx`),
+// ADR-2707 decision 4, at SnapshotPartRef.key_index (field 8). Every field
+// but `key`, `blake3` and `size` copies the leaf's KeyIndexLeafHeader (or,
+// for `prefix_len` and `uncovered_count`, a figure derived from it) so a
+// reader can pick the slice and size its first GET without opening the leaf.
+// The header is authoritative: a reader compares the copies after its first
+// GET and rejects the leaf on any disagreement.
+message SnapshotKeyIndexLeafRef {
+  string key = 1;            // full object key of the leaf
+  bytes blake3 = 2;          // 32, of the leaf's full bytes
+  uint64 size = 3;
+  string field = 4;
+  uint32 key_type = 5;       // ravel_codec::key_idx::KeyType byte, 1..=4
+  uint64 key8_lo = 6;        // inclusive key slice, key8 read as u64 BE
+  uint64 key8_hi = 7;
+  uint32 prefix_len = 8;     // bytes from the object start through dir_crc32c
+  uint32 bucket_bits = 9;
+  uint64 entry_count = 10;   // index entries in this leaf's body
+  uint64 uncovered_count = 11;  // length of the header's uncovered_entry_ordinals
+  bytes part_blake3 = 12;    // 32, the one covered part
+}
+
+// Header of a per-part key-index leaf (RKI1 envelope), under the envelope's
+// header crc32c. Layout and validation: docs/catalog-and-mvcc.md,
+// "Per-part key-index leaves".
+message KeyIndexLeafHeader {
+  uint32 format_version = 1;  // 1
+  bytes tenant_hash = 2;      // 16
+  uint32 signal = 3;
+  bytes part_blake3 = 4;      // 32, binds the leaf to one exact part
+  string field = 5;
+  uint32 key_type = 6;
+  uint64 key8_lo = 7;
+  uint64 key8_hi = 8;
+  uint32 bucket_bits = 9;
+  uint64 entry_count = 10;          // index entries in this leaf's body
+  uint64 part_entry_count = 11;     // the covered part's SnapshotEntry count
+  repeated uint64 uncovered_entry_ordinals = 12;  // each below part_entry_count
+  uint64 body_len = 13;             // stored body bytes after dir_crc32c
 }

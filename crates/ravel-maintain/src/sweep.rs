@@ -5811,6 +5811,7 @@ mod tests {
             watermark_hour: 100,
             min_hour: 0,
             column_stats: None,
+            key_index: Vec::new(),
         }
     }
 

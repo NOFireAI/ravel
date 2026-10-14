@@ -639,6 +639,130 @@ pub fn render_inspect_cstat(bytes: &[u8], out: &mut String) -> anyhow::Result<()
     Ok(())
 }
 
+/// Verifies per-part key-index leaves (`.kidx`, ADR-2707 decision 4) and
+/// prints them. Each leaf is `(key, whole object bytes)`, already read by
+/// the caller.
+pub fn inspect_kidx(leaves: &[(String, Vec<u8>)], entries: bool) -> anyhow::Result<()> {
+    let leaves: Vec<(&str, &[u8])> = leaves
+        .iter()
+        .map(|(key, bytes)| (key.as_str(), bytes.as_slice()))
+        .collect();
+    let mut out = String::new();
+    let result = render_inspect_kidx(&leaves, entries, &mut out);
+    print!("{out}");
+    result
+}
+
+/// Renders `inspect_kidx`'s report into `out`. Every frame of every leaf is
+/// decoded and checked with [`ravel_catalog::verify_key_index_leaf`], and
+/// several leaves must be the slices of one (part, field)
+/// ([`ravel_catalog::check_key_index_leaf_set`]), before anything is
+/// printed, so a corrupt leaf or set prints nothing and returns the typed
+/// rejection. With one leaf the report has no `leaf:` line. The bucket
+/// median is the lower median of the per-bucket entry counts.
+pub fn render_inspect_kidx(
+    leaves: &[(&str, &[u8])],
+    entries: bool,
+    out: &mut String,
+) -> anyhow::Result<()> {
+    let limits = ravel_catalog::KeyIndexLeafLimits::default();
+    let mut summaries = Vec::with_capacity(leaves.len());
+    for (key, bytes) in leaves {
+        let summary = ravel_catalog::verify_key_index_leaf(bytes, &limits)
+            .map_err(|err| anyhow::anyhow!("kidx leaf {key} failed verification: {err}"))?;
+        summaries.push(summary);
+    }
+    ravel_catalog::check_key_index_leaf_set(&summaries)
+        .map_err(|err| anyhow::anyhow!("kidx leaves are not one slice set: {err}"))?;
+    for ((key, _), summary) in leaves.iter().zip(&summaries) {
+        if leaves.len() > 1 {
+            out.push_str(&format!("leaf: {key}\n"));
+        }
+        render_kidx_summary(summary, entries, out);
+    }
+    if leaves.len() > 1 {
+        out.push_str(&format!(
+            "slice set: {} leaves agree and tile the key space\n",
+            leaves.len()
+        ));
+    }
+    Ok(())
+}
+
+fn render_kidx_summary(
+    summary: &ravel_catalog::KeyIndexLeafSummary,
+    entries: bool,
+    out: &mut String,
+) {
+    let header = &summary.header;
+    let signal = i32::try_from(header.signal)
+        .ok()
+        .and_then(|raw| ravel_commit::signal::from_proto(raw).ok())
+        .map_or_else(|| "unknown".to_string(), |signal| format!("{signal:?}"));
+    out.push_str(&format!("format_version: {}\n", header.format_version));
+    out.push_str(&format!(
+        "tenant_hash: {}\n",
+        hex::encode(&header.tenant_hash)
+    ));
+    out.push_str(&format!("signal: {} ({signal})\n", header.signal));
+    out.push_str(&format!(
+        "part_blake3: {}\n",
+        hex::encode(&header.part_blake3)
+    ));
+    out.push_str(&format!("field: {}\n", header.field));
+    out.push_str(&format!(
+        "key_type: {} ({:?})\n",
+        header.key_type, summary.key_type
+    ));
+    out.push_str(&format!("key8_lo: {:#018x}\n", header.key8_lo));
+    out.push_str(&format!("key8_hi: {:#018x}\n", header.key8_hi));
+    out.push_str(&format!("bucket_bits: {}\n", header.bucket_bits));
+    out.push_str(&format!("entry_count: {}\n", header.entry_count));
+    out.push_str(&format!("part_entry_count: {}\n", header.part_entry_count));
+    out.push_str(&format!(
+        "uncovered_entry_ordinals: {:?}\n",
+        header.uncovered_entry_ordinals
+    ));
+    out.push_str(&format!("body_len: {}\n", header.body_len));
+    out.push_str(&format!("prefix_len: {}\n", summary.prefix_len));
+    out.push_str(&format!("size: {}\n", summary.size));
+    out.push_str(&format!("blake3: {}\n", hex::encode(summary.blake3)));
+    out.push_str(&format!(
+        "body_uncompressed_len: {}\n",
+        summary.body_uncompressed_len
+    ));
+
+    let mut counts = summary.bucket_entry_counts.clone();
+    counts.sort_unstable();
+    let empty = counts.iter().filter(|&&count| count == 0).count();
+    let min = counts.first().copied().unwrap_or(0);
+    let median = counts
+        .get(counts.len().saturating_sub(1) / 2)
+        .copied()
+        .unwrap_or(0);
+    let max = counts.last().copied().unwrap_or(0);
+    out.push_str(&format!(
+        "buckets: {} min={min} median={median} max={max} empty={empty}\n",
+        counts.len()
+    ));
+
+    if entries {
+        let mut cursor = 0usize;
+        for (bucket, &count) in summary.bucket_entry_counts.iter().enumerate() {
+            let end = cursor.saturating_add(count as usize);
+            for entry in summary.entries.get(cursor..end).unwrap_or_default() {
+                out.push_str(&format!(
+                    "  bucket={bucket} key8={} entry_ordinal={} blocks={:?}\n",
+                    hex::encode(entry.key8),
+                    entry.entry_ordinal,
+                    entry.blocks
+                ));
+            }
+            cursor = end;
+        }
+    }
+}
+
 /// Re-lists every sealed commit record directly from the store and diffs it
 /// against the current snapshot's entries. Exits nonzero (via the returned
 /// error) only for divergences that indicate the folder under-counted:
@@ -767,6 +891,7 @@ mod tests {
                 watermark_hour: *watermark_hour,
                 min_hour: *min_hour,
                 column_stats: None,
+                key_index: Vec::new(),
             });
         }
 
