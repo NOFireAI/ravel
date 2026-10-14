@@ -62,6 +62,9 @@ enum Shape {
     And,
     /// `FROM logs`, then `| EVAL xi = e` per stage.
     Eval,
+    /// `FROM logs`, then `| EVAL xi = e` per stage over the column the stage
+    /// before defined, `dur` for the first.
+    Chain,
     /// `FROM logs | EVAL x1 = e, x2 = e, ...` with `n` fields.
     EvalFields,
     /// `FROM logs`, then `| SORT e` per stage, each with its own modulus.
@@ -99,6 +102,17 @@ impl Shape {
             Shape::Eval => format!(
                 "FROM logs{}",
                 stages(&|i| format!(" | EVAL x{i} = {}", e("dur")))
+            ),
+            Shape::Chain => format!(
+                "FROM logs{}",
+                stages(&|i| {
+                    let over = if i == 1 {
+                        "dur".to_string()
+                    } else {
+                        format!("x{}", i - 1)
+                    };
+                    format!(" | EVAL x{i} = {}", e(&over))
+                })
             ),
             Shape::EvalFields => format!(
                 "FROM logs | EVAL {}",
@@ -156,7 +170,7 @@ impl Shape {
                     .collect(),
                 false,
             ),
-            Shape::Eval | Shape::EvalFields => (
+            Shape::Eval | Shape::Chain | Shape::EvalFields => (
                 names("x"),
                 LOGS.iter()
                     .map(|(_, _, dur)| vec![kind.render(*dur); n])
@@ -323,6 +337,26 @@ fn the_deepest_long_eval_runs_on_a_worker_stack() {
 #[test]
 fn the_deepest_double_eval_runs_on_a_worker_stack() {
     assert_eq!(worst(Kind::Double, Shape::Eval), (19, 99, Refusal::Parse));
+}
+
+/// A column counts as the depth of what computes it, so a chain of them is
+/// refused once the expression it inlines to is too deep.
+#[test]
+fn the_deepest_long_chain_runs_on_a_worker_stack() {
+    assert_eq!(worst(Kind::Long, Shape::Chain), (7, 1, Refusal::Depth));
+    assert_eq!(
+        worst_at(Kind::Long, Shape::Chain, Some(1)),
+        (1, 7, Refusal::Depth)
+    );
+}
+
+#[test]
+fn the_deepest_double_chain_runs_on_a_worker_stack() {
+    assert_eq!(worst(Kind::Double, Shape::Chain), (19, 1, Refusal::Depth));
+    assert_eq!(
+        worst_at(Kind::Double, Shape::Chain, Some(1)),
+        (1, 5, Refusal::Depth)
+    );
 }
 
 #[test]
