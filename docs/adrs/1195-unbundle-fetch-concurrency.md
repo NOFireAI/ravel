@@ -1,6 +1,9 @@
 # ADR-1195: Unbundle `--fetch-concurrency`, and make GET concurrency a process-wide limit
 
-- Status: Proposed
+- Status: Accepted (2026-10-14).
+- Implemented: `GetLimiter` in `crates/ravel-query/src/limiter.rs`, with the
+  flags and the shared limiter wired in `services/ravel-server/src/config.rs`
+  and `services/ravel-server/src/lib.rs`.
 - Date: 2026-09-03
 - Refs: #1195, #1191, #1170, #1185, ADR-0087, ADR-0088, ADR-0107
 

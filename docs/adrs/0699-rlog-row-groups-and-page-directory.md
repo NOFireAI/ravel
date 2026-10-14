@@ -1,6 +1,12 @@
 # ADR-0699: RLOG row groups with column-major pages and a page directory
 
-Status: Proposed
+Status: Accepted (2026-10-14).
+Partly implemented: decisions 1, 2, 4 and 5 are in
+`crates/ravel-logseg/src/writer.rs`, `crates/ravel-logseg/src/page_dir.rs`
+and `crates/ravel-query/src/log_fetcher.rs`; decision 3's version-4 trailer
+and version-3 reader are no longer current
+(`crates/ravel-logseg/src/footer.rs` reads version 5 only, after ADR-0892
+and ADR-2135).
 
 Issue: #699. Refs #680, #693, #698, ADR-0087, ADR-0102, ADR-0107, ADR-0029,
 ADR-0066, ADR-0010.

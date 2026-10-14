@@ -1,6 +1,11 @@
 # ADR-0904: an operator knob for the request-cost vs latency trade
 
-Status: Proposed
+Status: Accepted (2026-10-14).
+Partly implemented: decisions 1 to 4 are in
+`crates/ravel-query/src/config.rs`, `crates/ravel-query/src/log_fetcher.rs`
+and `services/ravel-server/src/query.rs`; decision 5's opens-by-shape
+counters stop at `QueryAccounting` and are not in the server's per-query
+stats (`accounting_stats_json` in `services/ravel-server/src/query.rs`).
 
 Refs: epic #904. Builds on ADR-0107 (block-range logs fetch) and ADR-0088
 (operator-configurable query budgets); interacts with issue #862/#887 (the
