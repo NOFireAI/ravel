@@ -740,6 +740,34 @@ between the two runs means the plan shape changed, not that the cache helped.
 The `pmiss` column in the bench's text table is the cold run's two phases
 summed.
 
+### The report-level `get_latency` block
+
+Wall-clock latency of every GET the in-process measurement issued: every run
+of every statement, cold and warm together, plus the `--explain` plans when
+asked for, measured per request on the bench process's monotonic clock (issue
+#2976). `get_latency.phases` lists `resolve`, `plan`, `probe`, `scan`
+and `unattributed` in that order; each carries all 16 size `buckets` and a
+`failed` row. A bucket names its byte span (`bucket`, `min_bytes`, inclusive
+`max_bytes`, null above 64 MiB) and carries `count`, `first_byte_ms` and
+`total_ms`, each `{p50, p90, p99, max}` in milliseconds, null when `count` is
+0. `first_byte_ms` ends when the response headers arrived, `total_ms` when the
+body was fully read; against `--store memory` the two are equal, since that
+store has no headers to wait for. A GET is bucketed by the bytes it asked
+for, so a 64 KiB range of a 200 MiB object is a 64 KiB GET.
+
+Retries count as their own requests: a GET that fails is one request in its
+phase's `failed` row (count and `total_ms`, no size bucket), and the retry
+that follows is another. A retry the S3 client makes inside one GET is not
+split out; its wait is part of that GET's latency. The fetchers' GETs land in
+`plan`, `probe` and `scan`; for the logs fetcher they match
+`per_run_accounting`'s `wire_bytes_by_phase` request counts summed over runs
+(the smoke test asserts it). The catalog's
+commit-record reads carry no phase and are the `unattributed` row. Quantiles
+come from a log-scale histogram with eight slots per power of two, so each
+can read up to 12.5% high and never reads low; `max` is exact. Null on the
+Flight lane, whose
+GETs run in the server.
+
 ## 6. Through the server (Flight SQL)
 
 Everything above measures the SQL executor as a library, in the bench's own

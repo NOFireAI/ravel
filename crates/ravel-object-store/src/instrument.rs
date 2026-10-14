@@ -100,6 +100,11 @@
 //!   failures alike (a slow timeout is exactly the latency an operator wants
 //!   to see), measured around the inner call only, so decorator bookkeeping is
 //!   outside the measurement.
+//! - [`StoreMetrics::get_latency`] holds every `get`, `get_pinned` and
+//!   `get_with_pin` call's time to first byte and time to last byte, by
+//!   requested size and read phase ([`crate::get_latency`], issue #2976). Both
+//!   are timed from the same reading as the per-op latency above, so a GET's
+//!   total there and here is the same duration.
 //!
 //! # Time
 //!
@@ -109,12 +114,14 @@
 //! wall-clock jumps), and [`InstrumentedStore::with_clock`] takes a fake for
 //! deterministic histogram tests.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
 
+use crate::get_latency::{self, GetLatencyRecorder};
 use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
     ObjectStoreBackend, PageToken, PutOptions, PutOutcome, StoreError,
@@ -461,6 +468,8 @@ pub struct StoreMetrics {
     /// The bucket-protection control plane's own block; see the
     /// [module docs](self).
     control_plane: ControlPlaneMetrics,
+    /// Per-GET first-byte and total latency by size and phase.
+    get_latency: GetLatencyRecorder,
 }
 
 /// Counters for the bucket-protection control plane's read-only GETs
@@ -552,6 +561,13 @@ impl StoreMetrics {
         self.control_plane
             .response_bytes
             .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// The GET latency histograms [`InstrumentedStore`] records into
+    /// ([`crate::get_latency`]). Separate from [`snapshot`](Self::snapshot):
+    /// its snapshot carries quantiles, not counters.
+    pub fn get_latency(&self) -> &GetLatencyRecorder {
+        &self.get_latency
     }
 
     /// Point-in-time copy of the control plane's block. Separate from
@@ -705,6 +721,45 @@ impl<S: ObjectStoreBackend> InstrumentedStore<S> {
         self.metrics
             .record(op, elapsed, bytes, result.as_ref().err());
     }
+
+    /// Time one GET: the per-op `get` block as every other op, plus its first
+    /// byte and total into [`StoreMetrics::get_latency`]. Two clock readings
+    /// when the backend marks no first byte, three when it does.
+    async fn timed_get<T, F>(
+        &self,
+        range: GetRange,
+        call: F,
+        returned: impl Fn(&T) -> u64,
+    ) -> Result<T, StoreError>
+    where
+        F: Future<Output = Result<T, StoreError>>,
+    {
+        let phase = get_latency::current_phase();
+        let start = self.clock.now_nanos();
+        let (result, first_byte_at) =
+            get_latency::observe_first_byte(Arc::clone(&self.clock), call).await;
+        let end = self.clock.now_nanos();
+        let total = end.saturating_sub(start);
+        // Bytes actually handed back: a ranged read counts the range, not
+        // `total_size`, and a failed read counts nothing.
+        let bytes = result.as_ref().map_or(0, &returned);
+        self.metrics
+            .record(StoreOp::Get, total, bytes, result.as_ref().err());
+        let latency = self.metrics.get_latency();
+        match &result {
+            Ok(_) => {
+                let first_byte = first_byte_at.unwrap_or(end).saturating_sub(start);
+                latency.record_ok(
+                    phase,
+                    get_latency::requested_bytes(range, bytes),
+                    first_byte,
+                    total,
+                );
+            }
+            Err(_) => latency.record_failed(phase, total),
+        }
+        result
+    }
 }
 
 #[async_trait::async_trait]
@@ -725,15 +780,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
     }
 
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        let start = self.clock.now_nanos();
-        let result = self.inner.get(key, range).await;
-        // Bytes actually handed back: a ranged read counts the range, not
-        // `total_size`, and a failed read counts nothing.
-        let bytes = result
-            .as_ref()
-            .map_or(0, |outcome| outcome.data.len() as u64);
-        self.record(StoreOp::Get, start, bytes, &result);
-        result
+        self.timed_get(range, self.inner.get(key, range), |outcome| {
+            outcome.data.len() as u64
+        })
+        .await
     }
 
     /// Counted as a [`StoreOp::Get`], identically to [`Self::get`]: a pinned
@@ -747,13 +797,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         range: GetRange,
         pin: &crate::Pin,
     ) -> Result<crate::PinnedRead, StoreError> {
-        let start = self.clock.now_nanos();
-        let result = self.inner.get_pinned(key, range, pin).await;
-        let bytes = result
-            .as_ref()
-            .map_or(0, |read| read.outcome.data.len() as u64);
-        self.record(StoreOp::Get, start, bytes, &result);
-        result
+        self.timed_get(range, self.inner.get_pinned(key, range, pin), |read| {
+            read.outcome.data.len() as u64
+        })
+        .await
     }
 
     /// Counted as a [`StoreOp::Get`] for the same reason as
@@ -764,13 +811,10 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for InstrumentedStore<S> {
         key: &str,
         range: GetRange,
     ) -> Result<crate::PinnedRead, StoreError> {
-        let start = self.clock.now_nanos();
-        let result = self.inner.get_with_pin(key, range).await;
-        let bytes = result
-            .as_ref()
-            .map_or(0, |read| read.outcome.data.len() as u64);
-        self.record(StoreOp::Get, start, bytes, &result);
-        result
+        self.timed_get(range, self.inner.get_with_pin(key, range), |read| {
+            read.outcome.data.len() as u64
+        })
+        .await
     }
 
     /// One HEAD on the wire, counted as [`StoreOp::Head`] like [`Self::head`].

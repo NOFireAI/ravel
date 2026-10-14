@@ -43,12 +43,13 @@
 use std::sync::Arc;
 
 use crate::fetcher::{ReadCache, gate_not_run};
-use crate::phase_accounting::PhaseAccounting;
+use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::SegmentRef;
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
+use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
 use ravel_rspan::block::{DEFAULT_MAX_UNCOMP, DecodedBlock, read_block, read_block_projected};
 use ravel_rspan::footer::{SectionDesc, kind};
@@ -499,6 +500,7 @@ impl SpanSegmentFetcher {
                 })?;
             self.store
                 .get(key, GetRange::Full)
+                .in_get_phase(QueryPhase::Scan.into())
                 .await
                 .map_err(|source| SpanFetchError::Store {
                     key: key.to_string(),
@@ -786,6 +788,7 @@ impl SpanSegmentFetcher {
         let accounting = accounting.scan();
         let bytes = self
             .whole_object_bytes(seg_ref, tenant_hash, accounting)
+            .in_get_phase(QueryPhase::Scan.into())
             .await?;
 
         // Tenant identity guard: an object whose footer names a different
@@ -849,6 +852,7 @@ impl SpanSegmentFetcher {
             offset: size - probe_len,
             bytes: self
                 .ranged_read(seg_ref, tenant_hash, size - probe_len, probe_len, metadata)
+                .in_get_phase(QueryPhase::Probe.into())
                 .await?,
         };
         let footer = match open_from_suffix(&probe.bytes, size).map_err(bad)? {
@@ -856,6 +860,7 @@ impl SpanSegmentFetcher {
             SuffixOutcome::NeedRange { offset, len } => {
                 let tail = self
                     .ranged_read(seg_ref, tenant_hash, offset, len, metadata)
+                    .in_get_phase(QueryPhase::Probe.into())
                     .await?;
                 match open_from_suffix(&tail, size).map_err(bad)? {
                     SuffixOutcome::Ready(footer) => footer,
@@ -880,6 +885,7 @@ impl SpanSegmentFetcher {
             .ok_or_else(|| bad(SpanSegError::Corrupted("missing SKIP_IDX section".into())))?;
         let skip_stored = self
             .section_bytes(seg_ref, tenant_hash, &probe, skip_desc, metadata)
+            .in_get_phase(QueryPhase::Probe.into())
             .await?;
         let skip_raw =
             decode_section(&skip_stored, skip_desc, self.cfg.max_uncomp_section).map_err(bad)?;
@@ -903,6 +909,7 @@ impl SpanSegmentFetcher {
                 .ok_or_else(|| bad(SpanSegError::Corrupted("missing BLOOM section".into())))?;
             let bloom_stored = self
                 .section_bytes(seg_ref, tenant_hash, &probe, bloom_desc, metadata)
+                .in_get_phase(QueryPhase::Probe.into())
                 .await?;
             let bloom_raw = decode_section(&bloom_stored, bloom_desc, self.cfg.max_uncomp_section)
                 .map_err(bad)?;
@@ -972,6 +979,7 @@ impl SpanSegmentFetcher {
                 Some(bytes) => bytes,
                 None => {
                     self.ranged_read(seg_ref, tenant_hash, run.start(), run.byte_len(), scan)
+                        .in_get_phase(QueryPhase::Scan.into())
                         .await?
                 }
             };
@@ -3460,6 +3468,64 @@ mod tests {
         assert!(out.records.iter().all(|r| r.record.trace_id == trace(11)));
         assert_eq!(out.stats.blocks_after_skip, 2);
         assert_eq!(out.stats.blocks_scanned, 2);
+    }
+
+    /// Every GET the span fetcher issues is timed under the phase its
+    /// accounting charges (issue #2976): the ranged trace read's probe under
+    /// probe and its two block GETs under scan, then a time-range query's
+    /// whole-object read under scan. None is unattributed.
+    ///
+    /// FLIP: dropping the `in_get_phase` on the block-run `ranged_read` leaves
+    /// its two GETs outside every phase scope, so they read as unattributed
+    /// and the scan count is 1, not 3.
+    #[tokio::test]
+    async fn span_gets_are_timed_under_their_accounted_phases() {
+        use ravel_object_store::InstrumentedStore;
+        use ravel_object_store::get_latency::GetPhase;
+
+        let (memory, seg, _blocks, probe) = pruned_middle_fixture().await;
+        let store = Arc::new(InstrumentedStore::new(memory));
+        let fetcher = SpanSegmentFetcher::new(store.clone()).with_trace_probe_bytes(probe);
+        let acct = PhaseAccounting::new();
+        fetcher
+            .fetch_accounted_in_blocks(
+                &seg,
+                TENANT,
+                &SpanQuery::trace(trace(11), i64::MIN, i64::MAX),
+                PRUNE_MIDDLE,
+                None,
+                &[],
+                Some(&[1, 2, 3]),
+                &acct,
+            )
+            .await
+            .expect("ranged fetch")
+            .expect("relevant");
+        fetcher
+            .fetch_accounted_in_blocks(
+                &seg,
+                TENANT,
+                &SpanQuery::ts_range(i64::MIN, i64::MAX),
+                None,
+                None,
+                &[],
+                None,
+                &acct,
+            )
+            .await
+            .expect("whole-object fetch")
+            .expect("relevant");
+
+        let snap = acct.snapshot();
+        assert_eq!(snap.probe.s3_requests(AccountedOp::Get), 1);
+        assert_eq!(snap.scan.s3_requests(AccountedOp::Get), 3);
+        let latency = store.metrics().get_latency().snapshot();
+        let counts = GetPhase::ALL.map(|phase| latency.phase(phase).ok_count());
+        assert_eq!(
+            counts,
+            [0, 0, 1, 3, 0],
+            "resolve, plan, probe, scan, unattributed"
+        );
     }
 
     /// With no block set, the trace's whole run is one ranged GET, pruned
