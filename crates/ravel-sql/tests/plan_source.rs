@@ -632,7 +632,7 @@ async fn lowered_plan_with_an_unadmitted_node_is_refused() {
     let err = run_statement(&fixture, &tenant, &statement, &statement_request())
         .await
         .expect_err("a join is refused");
-    assert_not_admitted(&err, "unadmitted Cross");
+    assert_not_admitted(&err, "unadmitted Join node");
 }
 
 /// A subquery expression is walked as its own `Subquery` node, which is not
