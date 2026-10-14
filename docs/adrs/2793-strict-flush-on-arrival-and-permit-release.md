@@ -1,6 +1,6 @@
 # ADR-2793: Strict flush-on-arrival ack policy and admission permit release
 
-Status: Proposed
+Status: Accepted, amended 2026-10-14 (amendments at the end)
 Date: 2026-10-10
 Epic: #2793
 Amends: ADR-0076 decision 4 (adds a second axis; the aged flush stays the
@@ -239,7 +239,8 @@ and gRPC `RESOURCE_EXHAUSTED` as the in-flight ceiling, with its own body
 text and counter `ravel_ingest_pending_ack_shed_total`, and the gauge
 `ravel_ingest_pending_strict_acks` shows the held count. The two refusals
 differ in where they shed: the in-flight ceiling decides at the request
-head and a shed request never buffers a body, while the pending-ack bound
+head and a shed request never buffers a body (narrowed by the head-refusal
+drain amendment below: it never decodes one), while the pending-ack bound
 is taken inside `submit`, after decode and before the byte charge, so a
 refusal there has paid a full decode and holds no charge. It is a bound
 on held contexts, not a replacement for the head shed. Buffered writes
@@ -364,3 +365,88 @@ flowchart LR
   decision 3's four permits with a per-tenant share leave one permit free
   of any single hung tenant. The shard-actor task of this epic depends on
   #1921 landing, and its acceptance test runs against that tree.
+
+## Amendment (2026-10-14): a head refusal drains the request body before it answers (issue #2926)
+
+<!-- amendment-applies: sections="Decision" pointer="head-refusal drain amendment" -->
+<!-- amendment-supersedes: phrase="a shed request never buffers a body" pointer="head-refusal drain amendment" -->
+
+Decision 4 says a request shed at the head never buffers a body. Taken
+literally, that loses the response it was meant to make cheap. The
+admission middleware answers the in-flight ceiling's 429 before the body
+extractor runs. hyper's HTTP/1 connection then polls the unread body once
+and closes the read side. A socket closed with unread bytes in its receive
+queue is reset by the kernel, and the reset can discard the 429 before the
+client reads it. The client sees a broken pipe or a connection reset, and
+gets no `Retry-After`.
+
+Measured on a pooled HTTP/1.1 client with 8 requests in flight, sending
+Remote Write over loopback:
+
+| Body | Head refusals | Arrived as a transport error | Source |
+|---|---|---|---|
+| 130 B, 14,962 B | 2,000 x 3 runs each | 0 | issue #2926 body |
+| 64,351 B | 2,000 x 3 runs | 262, 254, 260 (about 13%) | issue #2926 body |
+| 6,000 series, x86_64 | 2,000 | 169 | comment 6156727395 |
+
+**Decision.** Every refusal that the admission layer answers at the head of
+an HTTP/1 ingest request reads and discards the request body before it
+sends the response. That covers the in-flight ceiling's 429, the credential
+check's 401, and the pending-ack 429 once issue #2805 moves it to the
+head. Three bounds apply:
+
+- `HEAD_REFUSAL_DRAIN_MAX_BYTES`: 1 MiB of body as sent, before any
+  inflate.
+- `HEAD_REFUSAL_DRAIN_TIMEOUT`: 1 s.
+- `HEAD_REFUSAL_DRAIN_MAX_CONCURRENT`: 64 drains at once, process-wide.
+
+A drained body is never inflated, decoded or charged to any budget. The
+drain holds no admission permit: the in-flight permit is released before
+it starts. The concurrency bound is what limits a drain, because the
+admission permits do not: under the overload that produces refusals, and
+for unauthenticated callers on the 401 path, the drains would otherwise
+have no bound on count.
+
+A refusal that cannot be drained is answered as it is today, with
+`Connection: close` added. That happens when the body is past the byte
+cap, when it is not complete within the deadline, or when all 64 drain
+slots are taken. The status, `Retry-After` and body text are unchanged.
+These refusals are counted in `ravel_ingest_head_refusal_undrained_total`
+with a `reason` label of `over_cap`, `timeout` or `busy`. A deployment
+whose refused bodies outgrow the cap can see it there.
+
+**The cap is 1 MiB, not the routes' 16 MiB body limit.** The reset starts
+at about one socket buffer, near 64 KB on loopback. 1 MiB covers bodies 16
+times that. Draining 16 MiB per refusal, under the overload that makes the
+refusals, holds a connection task for the transfer time of the largest
+legal body. The time bound is what limits a slow sender, and the
+concurrency bound is what limits the total. A deployment that needs a larger cap can
+raise it with its own evidence. This amendment does not add a flag for it.
+
+**Excluded.**
+
+- The body-read timeout's 503: that body did not arrive within 30 s, so
+  there is nothing to drain.
+- The gRPC surfaces. HTTP/2 refuses a stream, not the connection, and
+  delivers the response headers. This is inferred from the protocol, not
+  measured. The acceptance tests below include a gRPC case to pin it.
+- OTAP: its refusals answer inside an open stream.
+
+**Acceptance.** A pooled-client test sends a body larger than the loopback
+socket buffer and below the cap to each of the three OTLP HTTP routes and
+to Remote Write while the ceiling is held. Every refusal must arrive as a
+readable 429 with `Retry-After`, with zero client transport errors. The
+test must rule out three wrong implementations:
+
+- `Connection: close` alone: transport errors stay.
+- A drain that decodes: the decode counters must stay at zero.
+- A drain with no cap: a second case above the cap must get
+  `Connection: close` and move the undrained counter's `over_cap` series
+  by exactly one.
+
+A unit test fills the drain slots and asserts that the next refusal takes
+the `busy` path.
+
+A gRPC case with a large message asserts `RESOURCE_EXHAUSTED`. Tests that
+pin the old never-read property on the HTTP routes change to pin
+never-decoded and never-charged.
