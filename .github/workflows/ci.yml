@@ -1128,6 +1128,9 @@ jobs:
   #   - ravel-bench --features saturation       (ravel-server/jemalloc; the
   #                                              ADR-1702 task 11 bins. Clippy
   #                                              and RUNS the band tests)
+  #   - ravel-cli --features sql-explain        (the `sql explain`
+  #                                              subcommand, issue #2881.
+  #                                              Clippy and RUNS its tests)
   #
   # The `ravel-server --features otap` lane used to live here too. It was split
   # out into `features-otap` below (issue #1590): commit 6951146b added the
@@ -1158,7 +1161,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        lane: [parquet-baseline, sql-latency, sql-latency-wide, stage-timing, saturation]
+        lane: [parquet-baseline, sql-latency, sql-latency-wide, stage-timing, saturation, cli-sql-explain]
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -1196,7 +1199,7 @@ jobs:
           LANE: ${{ matrix.lane }}
         run: |
           case "$LANE" in
-            parquet-baseline|sql-latency|sql-latency-wide|stage-timing|saturation)
+            parquet-baseline|sql-latency|sql-latency-wide|stage-timing|saturation|cli-sql-explain)
               echo "lane: $LANE" ;;
             *)
               echo "::error::unknown features lane '$LANE'; no step would run for it"
@@ -1300,6 +1303,17 @@ jobs:
       - name: Doctests ravel-bench --features saturation
         if: matrix.lane == 'saturation'
         run: cargo test --locked --doc --profile ci -p ravel-bench --features saturation
+      # `sql explain` and its tests compile only under this feature, which no
+      # other lane selects for ravel-cli on its own.
+      - name: Clippy ravel-cli --features sql-explain
+        if: matrix.lane == 'cli-sql-explain'
+        run: cargo clippy --locked --profile ci -p ravel-cli --features sql-explain --all-targets -- -D warnings
+      - name: Test ravel-cli --features sql-explain
+        if: matrix.lane == 'cli-sql-explain'
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-cli --features sql-explain
+      - name: Doctests ravel-cli --features sql-explain
+        if: matrix.lane == 'cli-sql-explain'
+        run: cargo test --locked --doc --profile ci -p ravel-cli --features sql-explain
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
