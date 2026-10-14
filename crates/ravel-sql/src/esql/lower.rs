@@ -62,7 +62,7 @@ pub(crate) fn lower(
             pipeline
                 .output
                 .iter()
-                .map(|(internal, name)| Expr::Column(Column::from_name(internal)).alias(name)),
+                .map(|(internal, name)| named(Expr::Column(Column::from_name(internal)), name)),
         )?
         .build()
 }
@@ -133,4 +133,41 @@ fn expr(e: &BExpr, ctx: &LoweringContext) -> Result<Expr, DataFusionError> {
             },
         )),
     })
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::panic)]
+mod tests {
+    use datafusion::prelude::SessionContext;
+
+    use super::*;
+    use crate::executor::StatementTables;
+
+    /// `ROW _e1 = 1` binds its column to the internal name `_e1`, so the
+    /// final projection leaves that column bare instead of aliasing it to
+    /// its own name.
+    #[test]
+    fn the_final_projection_leaves_a_same_named_column_bare() {
+        let pipeline = Pipeline {
+            source: Source::Row,
+            stages: vec![
+                Stage::Project(vec![(
+                    BExpr::Literal(ScalarValue::Int64(Some(1))),
+                    "_e1".to_string(),
+                )]),
+                Stage::Limit(1000),
+            ],
+            output: vec![("_e1".to_string(), "_e1".to_string())],
+        };
+        let tables = StatementTables {
+            signal: None,
+            others: Default::default(),
+        };
+        let context = LoweringContext::snapshot(&SessionContext::new(), Vec::new(), &tables);
+        let plan = lower(&pipeline, &context).expect("lowers");
+        let LogicalPlan::Projection(projection) = &plan else {
+            panic!("expected the final projection, got {plan:?}");
+        };
+        assert_eq!(projection.expr, vec![Expr::Column(Column::from_name("_e1"))]);
+    }
 }

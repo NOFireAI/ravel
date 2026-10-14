@@ -5,9 +5,10 @@
 //! No HTTP handler calls [`prepare`] yet.
 //!
 //! [`prepare`] parses and binds once, before any session exists, and fixes the
-//! statement's output columns and their ES|QL types, the [`DialectPolicy`]
-//! (exactly the functions the bound pipeline calls) and the time window read
-//! from its `@timestamp` bounds. [`PreparedEsql`] then lowers the same bound
+//! statement's output columns and their ES|QL types and the time window read
+//! from its `@timestamp` bounds. Every statement carries the same
+//! [`DialectPolicy`], the fixed function list below (ADR-2887 D7); `prepare`
+//! refuses a bound pipeline calling anything off it with an internal error. [`PreparedEsql`] then lowers the same bound
 //! pipeline against every session the executor builds for it.
 //!
 //! A `FROM logs` statement reads its window from the conjunctive `@timestamp`
@@ -76,6 +77,35 @@ pub struct PreparedEsql {
     now_ns: i64,
 }
 
+/// The scalar functions an ES|QL lowering may call, by registered name.
+const SCALARS: [&str; 4] = ["get_field", "encode", "date_bin", "nullif"];
+
+/// The aggregate functions an ES|QL lowering may call, by registered name.
+const AGGREGATES: [&str; 5] = ["count", "sum", "min", "max", "avg"];
+
+/// Refuse a bound pipeline calling a function off [`SCALARS`] or
+/// [`AGGREGATES`]. The binder only produces listed names, so a refusal here
+/// is a binder defect, reported as an internal error.
+fn check_functions(pipeline: &Pipeline) -> Result<(), EsqlError> {
+    let (scalars, aggregates) = pipeline.functions();
+    let off = scalars
+        .iter()
+        .find(|name| !SCALARS.contains(name))
+        .map(|name| ("scalar", *name))
+        .or_else(|| {
+            aggregates
+                .iter()
+                .find(|name| !AGGREGATES.contains(name))
+                .map(|name| ("aggregate", *name))
+        });
+    match off {
+        Some((kind, name)) => Err(EsqlError::Execution(crate::SqlError::Internal(format!(
+            "the ES|QL binder produced the {kind} function {name}, which the ES|QL function list does not hold"
+        )))),
+        None => Ok(()),
+    }
+}
+
 /// Parse and bind `source`.
 pub fn prepare(
     source: &str,
@@ -93,8 +123,8 @@ pub fn prepare(
             end: ctx.end,
         },
     )?;
-    let (scalars, aggregates) = bound.pipeline.functions();
-    let policy = DialectPolicy::new(scalars, aggregates, std::iter::empty::<String>());
+    check_functions(&bound.pipeline)?;
+    let policy = DialectPolicy::new(SCALARS, AGGREGATES, std::iter::empty::<String>());
     let window = bound
         .window
         .map(|window| window.resolve(ctx.now_ns, ctx.start, ctx.end));
@@ -174,5 +204,64 @@ impl LoweredStatement for PreparedEsql {
 
     async fn lower(&self, ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
         lower::lower(&self.pipeline, ctx)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use datafusion::common::ScalarValue;
+
+    use super::*;
+    use ir::{BAggregate, BExpr, Stage};
+
+    fn pipeline(stages: Vec<Stage>) -> Pipeline {
+        Pipeline {
+            source: Source::Row,
+            stages,
+            output: Vec::new(),
+        }
+    }
+
+    fn internal(result: Result<(), EsqlError>) -> String {
+        match result {
+            Err(EsqlError::Execution(crate::SqlError::Internal(message))) => message,
+            other => panic!("expected an internal error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pipeline_calling_a_function_off_the_list_is_refused() {
+        let literal = BExpr::Literal(ScalarValue::Utf8(Some("a".to_string())));
+        let scalar = pipeline(vec![Stage::Project(vec![(
+            BExpr::Scalar("upper", vec![literal.clone()]),
+            "_e1".to_string(),
+        )])]);
+        assert_eq!(
+            internal(check_functions(&scalar)),
+            "the ES|QL binder produced the scalar function upper, which the ES|QL function list does not hold"
+        );
+
+        let aggregate = pipeline(vec![Stage::Aggregate {
+            groups: Vec::new(),
+            aggregates: vec![(
+                BAggregate {
+                    function: "median",
+                    args: vec![literal.clone()],
+                    filter: None,
+                },
+                "_e1".to_string(),
+            )],
+        }]);
+        assert_eq!(
+            internal(check_functions(&aggregate)),
+            "the ES|QL binder produced the aggregate function median, which the ES|QL function list does not hold"
+        );
+
+        let listed = pipeline(vec![Stage::Filter(BExpr::Scalar(
+            "nullif",
+            vec![literal.clone(), literal],
+        ))]);
+        check_functions(&listed).unwrap_or_else(|e| panic!("listed functions pass: {e}"));
     }
 }

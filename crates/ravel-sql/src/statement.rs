@@ -378,7 +378,8 @@ fn target_table_names(tables: &StatementTables) -> BTreeSet<&str> {
     names
 }
 
-/// Whether `node`'s kind may appear in a lowered plan.
+/// Whether `node`'s kind may appear in a lowered plan. `Window` stays out
+/// until window operators have a decision of their own (ADR-2887 D13).
 fn admitted_node(node: &LogicalPlan) -> bool {
     matches!(
         node,
@@ -387,7 +388,6 @@ fn admitted_node(node: &LogicalPlan) -> bool {
             | LogicalPlan::Aggregate(_)
             | LogicalPlan::Sort(_)
             | LogicalPlan::Limit(_)
-            | LogicalPlan::Window(_)
             | LogicalPlan::TableScan(_)
             | LogicalPlan::SubqueryAlias(_)
             | LogicalPlan::Values(_)
@@ -406,7 +406,7 @@ fn admitted_node(node: &LogicalPlan) -> bool {
 /// no rewrite can add or hide anything ahead of it.
 ///
 /// - Every node kind is one of Projection, Filter, Aggregate, Sort, Limit,
-///   Window, TableScan, SubqueryAlias, Values and EmptyRelation.
+///   TableScan, SubqueryAlias, Values and EmptyRelation.
 /// - Every `TableScan` names a table in `tables` by a bare reference (the
 ///   form [`LoweringContext::scan`] builds), and its source is the
 ///   provider the executor built the session over for that name: a scan
@@ -714,21 +714,20 @@ mod tests {
         assert!(context.scan("mixed.case").is_err());
     }
 
-    /// A window node is admitted when its function is the session's instance
-    /// under a listed window name, and refused when the policy does not list
-    /// it.
+    /// A `Window` node is refused even when its function is the session's
+    /// instance under a name the policy lists (ADR-2887 D13).
     #[test]
-    fn a_window_node_is_admitted_under_a_listed_window_function() {
+    fn a_window_node_is_refused_under_a_listed_function() {
         use datafusion::logical_expr::expr::WindowFunction;
 
         let context = context_over(&["t"]);
         let tables = parquet_tables(&["t"]);
-        let row_number = context.window("row_number").expect("row_number");
+        let sum = context.aggregate("sum").expect("sum");
         let call = Expr::WindowFunction(Box::new(WindowFunction::new(
-            WindowFunctionDefinition::WindowUDF(row_number),
-            vec![],
+            WindowFunctionDefinition::AggregateUDF(sum),
+            vec![datafusion::prelude::col("v")],
         )))
-        .alias("n");
+        .alias("s");
         let plan = context
             .scan("t")
             .and_then(|builder| builder.window(vec![call]))
@@ -736,14 +735,12 @@ mod tests {
             .expect("window plan");
         assert!(matches!(plan, LogicalPlan::Window(_)), "{plan:?}");
 
-        let listed = DialectPolicy::new(Vec::<String>::new(), Vec::<String>::new(), ["row_number"]);
-        admit_lowered_plan(&plan, &context, &tables, &listed).expect("listed window is admitted");
-
-        let err = admit_lowered_plan(&plan, &context, &tables, &DialectPolicy::default())
-            .expect_err("an unlisted window function is refused");
+        let listed = DialectPolicy::new(Vec::<String>::new(), ["sum"], Vec::<String>::new());
+        let err = admit_lowered_plan(&plan, &context, &tables, &listed)
+            .expect_err("a window node is refused");
         assert!(
             err.to_string()
-                .contains("window function row_number, which its dialect does not list"),
+                .contains("a lowered plan holds an unadmitted Window node"),
             "{err}"
         );
     }

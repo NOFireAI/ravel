@@ -230,6 +230,24 @@ async fn row_runs_without_the_catalog() {
     assert!(matches!(outcome.run, ravel_sql::esql::EsqlRun::Row(_)));
 }
 
+/// A result column named like the binder's internal names leaves the final
+/// projection a column under its own name, which runs.
+#[tokio::test]
+async fn a_result_column_named_like_an_internal_name_runs() {
+    let fixture = fixture().await;
+    let outcome = run(&fixture, "ROW _e1 = 1").await.expect("runs");
+    assert_eq!(columns(&outcome), vec![("_e1".to_string(), "long".to_string())]);
+    assert_eq!(rows(&outcome), vec![vec!["1"]]);
+
+    let outcome = run(
+        &fixture,
+        "FROM logs | SORT @timestamp | LIMIT 1 | EVAL _e1 = 1 | KEEP _e1",
+    )
+    .await
+    .expect("runs");
+    assert_eq!(rows(&outcome), vec![vec!["1"]]);
+}
+
 #[tokio::test]
 async fn row_errors_class_as_bad_request_before_execution() {
     let err = prepare("ROW a = 1 | WHERE a").expect_err("a long is not a condition");
