@@ -3712,7 +3712,38 @@ fn rspan_section_kind_name(kind: u32) -> &'static str {
         ravel_rspan::footer::kind::BLOCKS => "BLOCKS",
         ravel_rspan::footer::kind::SKIP_IDX => "SKIP_IDX",
         ravel_rspan::footer::kind::BLOOM => "BLOOM",
+        ravel_rspan::footer::kind::KEY_IDX => "KEY_IDX",
         _ => "UNKNOWN",
+    }
+}
+
+/// Prints the verified KEY_IDX summary (v5, ADR-2707): the section header, then
+/// per field its entry count and the spread of entries over its buckets. The
+/// median is the middle of the sorted per-bucket counts (the upper one of the
+/// two middles for an even bucket count).
+fn print_rspan_key_idx(summary: &ravel_rspan::KeyIdxSummary) {
+    println!(
+        "key_idx: version={} bucket_bits={} prefix_len={} fields={}",
+        summary.version,
+        summary.bucket_bits,
+        summary.prefix_len,
+        summary.fields.len()
+    );
+    for field in &summary.fields {
+        let mut counts = field.bucket_entry_counts.clone();
+        counts.sort_unstable();
+        let min = counts.first().copied().unwrap_or(0);
+        let median = counts.get(counts.len() / 2).copied().unwrap_or(0);
+        let max = counts.last().copied().unwrap_or(0);
+        let empty = counts.iter().filter(|&&c| c == 0).count();
+        println!(
+            "  field name={} key_type={:?} entries={} buckets={} \
+             entries_per_bucket=[min={min} median={median} max={max}] empty_buckets={empty}",
+            field.name,
+            field.key_type,
+            field.entry_count,
+            counts.len(),
+        );
     }
 }
 
@@ -3738,12 +3769,13 @@ fn rspan_comp_name(comp: u8) -> &'static str {
 }
 
 /// Inspects a whole RSPAN object (docs/span-segment-format.md): footer identity
-/// and summary, the section table, the interval-aware skip index (one line per
-/// block), and, for a v3 object (ADR-0054), the BLOOM section's coverage (the
-/// block count it spans, not its bits) and one line per decoded span record
-/// carrying the `service_name` column value alongside the other span columns.
-/// Every decode is the reader's own path, so a corrupt SKIP_IDX, BLOOM, or block
-/// surfaces as a typed error with a non-zero exit, never a panic.
+/// and summary, the section table (with the KEY_IDX entry's `prefix_len`), the
+/// interval-aware skip index (one line per block), the BLOOM section's coverage
+/// (the block count it spans, not its bits), the verified KEY_IDX summary (v5,
+/// ADR-2707), and one line per decoded span record carrying the `service_name`
+/// column value alongside the other span columns. Every decode is the reader's
+/// own path, so a corrupt SKIP_IDX, BLOOM, KEY_IDX, or block surfaces as a
+/// typed error with a non-zero exit, never a panic.
 fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     let footer = ravel_rspan::open(bytes)
         .map_err(|err| anyhow::anyhow!("failed to parse rspan segment: {err}"))?;
@@ -3767,8 +3799,14 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
     println!("part_index: {}", footer.part_index);
     println!("sections:");
     for section in &footer.sections {
+        // prefix_len is meaningful on the KEY_IDX entry only.
+        let prefix_len = if section.kind == ravel_rspan::footer::kind::KEY_IDX {
+            format!(" prefix_len={}", section.prefix_len)
+        } else {
+            String::new()
+        };
         println!(
-            "  kind={} name={} offset={} len={} comp={} uncompressed_len={}",
+            "  kind={} name={} offset={} len={} comp={} uncompressed_len={}{prefix_len}",
             section.kind,
             rspan_section_kind_name(section.kind),
             section.offset,
@@ -3830,6 +3868,13 @@ fn rspan_inspect(bytes: &[u8]) -> anyhow::Result<()> {
             .bloom()
             .map_err(|err| anyhow::anyhow!("failed to parse bloom section: {err}"))?;
         println!("bloom ({} block(s))", bloom.len());
+
+        // KEY_IDX (v5): every bucket frame is verified, so a corrupt frame is
+        // a non-zero exit here even though a probe would read only one.
+        let key_idx = reader
+            .key_idx_summary()
+            .map_err(|err| anyhow::anyhow!("failed to verify KEY_IDX section: {err}"))?;
+        print_rspan_key_idx(&key_idx);
 
         // One line per span, in the object's stored (trace_id, start_ts) order.
         // `service_name` is the column lifted out of the attribute map (v3,

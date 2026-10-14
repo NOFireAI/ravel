@@ -13,6 +13,7 @@ use ravel_codec::bloom_section::BloomSection;
 use crate::block::{DEFAULT_MAX_UNCOMP, read_block};
 use crate::error::SpanSegError;
 use crate::footer::{SpanFooter, kind, open, read_section};
+use crate::key_index::{self, KeyIdxSummary};
 use crate::record::SpanRecord;
 use crate::skip_index::SkipIndex;
 use crate::writer::RspanConfig;
@@ -69,14 +70,28 @@ pub struct RspanReader<'a> {
     /// re-reading the object. The whole-section crc is verified at open time
     /// by `read_section`; per-entry crcs are verified on probe.
     bloom_raw: Vec<u8>,
+    /// The KEY_IDX section's stored bytes (v5, ADR-2707), crc-verified at open,
+    /// and its footer `prefix_len`.
+    key_idx: &'a [u8],
+    key_idx_prefix_len: u32,
     max_uncomp: u64,
 }
 
 impl<'a> RspanReader<'a> {
-    /// Opens and validates the object, decoding the skip index and reading the
-    /// mandatory BLOOM section.
+    /// Opens and validates the object, decoding the skip index, reading the
+    /// mandatory BLOOM section, and checking the mandatory KEY_IDX section's
+    /// crc and RSPAN parameters (one field, `trace_id`, key type `Id16`).
     pub fn new(bytes: &'a [u8], cfg: &RspanConfig) -> Result<Self, SpanSegError> {
         let footer = open(bytes)?;
+        let key_idx_desc = section(&footer, kind::KEY_IDX)?;
+        let key_idx = section_bytes(bytes, key_idx_desc)?;
+        if crc32c::crc32c(key_idx) != key_idx_desc.crc32c {
+            return Err(SpanSegError::Corrupted(
+                "KEY_IDX section crc mismatch".into(),
+            ));
+        }
+        key_index::check_section(key_idx, key_idx_desc.prefix_len)?;
+        let key_idx_prefix_len = key_idx_desc.prefix_len;
         let skip_desc = section(&footer, kind::SKIP_IDX)?;
         let skip_raw = read_section(bytes, skip_desc, cfg.max_uncomp_section)?;
         let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
@@ -102,6 +117,8 @@ impl<'a> RspanReader<'a> {
             blocks_offset: blocks.offset,
             blocks_len: blocks.len,
             bloom_raw,
+            key_idx,
+            key_idx_prefix_len,
             max_uncomp: DEFAULT_MAX_UNCOMP,
         })
     }
@@ -109,6 +126,35 @@ impl<'a> RspanReader<'a> {
     /// The decoded skip index.
     pub fn skip_index(&self) -> &SkipIndex {
         &self.skip
+    }
+
+    /// The SKIP_IDX block ordinals the KEY_IDX section names for `trace_id`,
+    /// ascending: every block holding a trace whose first 8 bytes equal
+    /// `trace_id`'s. Reads `[0, prefix_len)` of the section and then the one
+    /// bucket the trace mixes to. An ordinal at or past the block count
+    /// anywhere in that bucket is `Corrupted`. `Ok(None)` only when the section
+    /// declines the probe.
+    pub fn probe_trace(&self, trace_id: &[u8; 16]) -> Result<Option<Vec<u32>>, SpanSegError> {
+        let section = self.key_idx;
+        key_index::probe(
+            section.len() as u64,
+            self.key_idx_prefix_len,
+            self.skip.blocks.len(),
+            trace_id,
+            |range| {
+                usize::try_from(range.start)
+                    .ok()
+                    .zip(usize::try_from(range.end).ok())
+                    .and_then(|(start, end)| section.get(start..end))
+                    .ok_or_else(|| SpanSegError::Corrupted("KEY_IDX read past the section".into()))
+            },
+        )
+    }
+
+    /// Verifies every KEY_IDX bucket frame and summarizes the section (field,
+    /// key type, entry count, entries per bucket), for inspection.
+    pub fn key_idx_summary(&self) -> Result<KeyIdxSummary, SpanSegError> {
+        key_index::summarize(self.key_idx, self.key_idx_prefix_len)
     }
 
     /// Parses the object's BLOOM section (v3, ADR-0054). Entry `i` covers block
@@ -206,6 +252,19 @@ fn section(footer: &SpanFooter, k: u32) -> Result<&crate::footer::SectionDesc, S
         .ok_or_else(|| SpanSegError::Corrupted(format!("missing section {k}")))
 }
 
+/// The stored bytes of one section, borrowed from the whole object.
+fn section_bytes<'a>(
+    bytes: &'a [u8],
+    desc: &crate::footer::SectionDesc,
+) -> Result<&'a [u8], SpanSegError> {
+    usize::try_from(desc.offset)
+        .ok()
+        .zip(usize::try_from(desc.len).ok())
+        .and_then(|(start, len)| Some(start..start.checked_add(len)?))
+        .and_then(|range| bytes.get(range))
+        .ok_or_else(|| SpanSegError::Corrupted("section out of bounds".into()))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -243,6 +302,31 @@ mod tests {
             w.push(r);
         }
         w.finish().expect("finish")
+    }
+
+    /// Appends a valid KEY_IDX section for a hand-built object, naming each
+    /// skip entry's `min_trace_id` in that entry's block, and returns its
+    /// footer entry.
+    fn append_key_idx(obj: &mut Vec<u8>, skip_raw: &[u8]) -> crate::footer::SectionDesc {
+        let skip = SkipIndex::decode(skip_raw, MAX_BLOCKS).expect("skip index decodes");
+        let encoded = crate::key_index::encode_trace_key_idx(
+            skip.blocks
+                .iter()
+                .enumerate()
+                .map(|(block, entry)| (entry.min_trace_id, block as u32)),
+        )
+        .expect("encode KEY_IDX");
+        let offset = obj.len() as u64;
+        obj.extend_from_slice(&encoded.bytes);
+        crate::footer::SectionDesc {
+            kind: kind::KEY_IDX,
+            offset,
+            len: encoded.bytes.len() as u64,
+            crc32c: crc32c::crc32c(&encoded.bytes),
+            comp: crate::footer::COMP_NONE,
+            uncomp_len: encoded.bytes.len() as u64,
+            prefix_len: encoded.prefix_len,
+        }
     }
 
     #[test]
@@ -376,6 +460,7 @@ mod tests {
         obj.extend_from_slice(&skip_raw);
         let bloom_off = obj.len() as u64;
         obj.extend_from_slice(&bloom_raw);
+        let key_idx_desc = append_key_idx(&mut obj, &skip_raw);
 
         let sections = vec![
             SectionDesc {
@@ -385,6 +470,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_NONE,
                 uncomp_len: blocks_bytes.len() as u64,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::SKIP_IDX,
@@ -393,6 +479,7 @@ mod tests {
                 crc32c: crc32c::crc32c(&skip_raw),
                 comp: COMP_NONE,
                 uncomp_len: skip_raw.len() as u64,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::BLOOM,
@@ -401,7 +488,9 @@ mod tests {
                 crc32c: crc32c::crc32c(&bloom_raw),
                 comp: COMP_NONE,
                 uncomp_len: bloom_raw.len() as u64,
+                prefix_len: 0,
             },
+            key_idx_desc,
         ];
         let footer = SpanFooter {
             tenant_hash: [0u8; 16],
@@ -513,6 +602,7 @@ mod tests {
         obj.extend_from_slice(&skip_raw);
         let bloom_off = obj.len() as u64;
         obj.extend_from_slice(&bloom_raw);
+        let key_idx_desc = append_key_idx(&mut obj, &skip_raw);
 
         let sections = vec![
             SectionDesc {
@@ -522,6 +612,7 @@ mod tests {
                 crc32c: 0,
                 comp: COMP_NONE,
                 uncomp_len: blocks_bytes.len() as u64,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::SKIP_IDX,
@@ -530,6 +621,7 @@ mod tests {
                 crc32c: crc32c::crc32c(&skip_raw),
                 comp: COMP_NONE,
                 uncomp_len: skip_raw.len() as u64,
+                prefix_len: 0,
             },
             SectionDesc {
                 kind: kind::BLOOM,
@@ -538,7 +630,9 @@ mod tests {
                 crc32c: crc32c::crc32c(&bloom_raw),
                 comp: COMP_NONE,
                 uncomp_len: bloom_raw.len() as u64,
+                prefix_len: 0,
             },
+            key_idx_desc,
         ];
         let footer = SpanFooter {
             tenant_hash: [0u8; 16],
@@ -663,6 +757,12 @@ mod proptests {
         r
     }
 
+    fn key8(trace_id: &[u8; 16]) -> [u8; 8] {
+        let mut k = [0u8; 8];
+        k.copy_from_slice(&trace_id[..8]);
+        k
+    }
+
     fn key(r: &SpanRecord) -> ([u8; 16], [u8; 8], i64) {
         (r.trace_id, r.span_id, r.start_ts_ns)
     }
@@ -694,6 +794,33 @@ mod proptests {
                 .expect("scan");
             prop_assert_eq!(got.len(), spans.len());
             prop_assert_eq!(stats.blocks_scanned, stats.blocks_after_skip);
+
+            // KEY_IDX oracle: the probe for each trace names exactly the
+            // blocks holding a record whose trace_id shares its first 8 bytes.
+            let footer = crate::footer::open(&obj).expect("footer");
+            let skip_desc = footer.section(kind::SKIP_IDX).expect("skip");
+            let skip_raw = crate::footer::read_section(
+                &obj,
+                skip_desc,
+                crate::footer::DEFAULT_MAX_SECTION_UNCOMP,
+            )
+            .expect("skip raw");
+            let ranged =
+                crate::ranged::RspanRangeReader::from_sections(&footer, &skip_raw).expect("ranged");
+            let mut block_keys: Vec<std::collections::BTreeSet<[u8; 8]>> = Vec::new();
+            for i in 0..ranged.block_count() {
+                let loc = ranged.block_loc(i).expect("loc");
+                let rows = ranged
+                    .decode_block(&loc, &obj[loc.start() as usize..loc.end() as usize])
+                    .expect("decode block");
+                block_keys.push(rows.iter().map(|r| key8(&r.trace_id)).collect());
+            }
+            for s in &spans {
+                let want: Vec<u32> = (0..block_keys.len() as u32)
+                    .filter(|&b| block_keys[b as usize].contains(&key8(&s.trace_id)))
+                    .collect();
+                prop_assert_eq!(reader.probe_trace(&s.trace_id).expect("probe"), Some(want));
+            }
 
             let mut want: Vec<SpanRecord> = spans.into_iter().map(canonicalize).collect();
             let mut got = got;

@@ -28,6 +28,7 @@ enum SectionKind {
   SECTION_KIND_BLOCKS = 1;
   SECTION_KIND_SKIP_IDX = 2;
   SECTION_KIND_BLOOM = 3;  // v3 (ADR-0054): per-block token bloom
+  SECTION_KIND_KEY_IDX = 4;  // v5 (ADR-2707): exact trace_id index
 }
 
 message Section {
@@ -37,6 +38,9 @@ message Section {
   fixed32 crc32c = 4;         // over stored bytes
   Compression comp = 5;
   uint64 uncompressed_len = 6;
+  // Byte length of the KEY_IDX prefix (header plus every field directory).
+  // Set only on the kind 4 KEY_IDX entry; zero (absent) on every other kind.
+  uint32 prefix_len = 7;
 }
 
 message SpanFooter {
