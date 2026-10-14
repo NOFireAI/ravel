@@ -191,7 +191,7 @@ impl PreparedEsql {
             let provider = session
                 .table_provider(LOGS_TABLE)
                 .await
-                .map_err(|e| EsqlError::Execution(crate::SqlError::Plan(e.to_string())))?;
+                .map_err(|e| EsqlError::Plan(e.to_string()))?;
             vec![(LOGS_TABLE.to_string(), provider)]
         } else {
             Vec::new()
@@ -199,12 +199,13 @@ impl PreparedEsql {
         let tables = self.tables();
         let context = LoweringContext::snapshot(session, providers, &tables);
         let plan = lower::lower(&self.pipeline, &context)
-            .map_err(|e| EsqlError::Execution(crate::SqlError::Plan(e.to_string())))?;
-        admit_lowered_plan(&plan, &context, &tables, &self.policy).map_err(EsqlError::Execution)?;
+            .map_err(|e| EsqlError::Plan(e.to_string()))?;
+        admit_lowered_plan(&plan, &context, &tables, &self.policy)
+            .map_err(EsqlError::from_executor)?;
         session
             .state()
             .optimize(&plan)
-            .map_err(|e| EsqlError::Execution(crate::SqlError::Plan(e.to_string())))
+            .map_err(|e| EsqlError::Plan(e.to_string()))
     }
 
     fn tables(&self) -> StatementTables {

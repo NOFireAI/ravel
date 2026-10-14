@@ -102,13 +102,13 @@ pub async fn execute(
             let outcome = executor
                 .execute_statement_accounted(tenant, prepared, &statement_request, live)
                 .await
-                .map_err(EsqlError::Execution)?;
+                .map_err(EsqlError::from_executor)?;
             EsqlRun::Catalog(Box::new(outcome))
         }
         None => EsqlRun::Row(
             run_row(executor, tenant, prepared, request.deadline)
                 .await
-                .map_err(EsqlError::Execution)?,
+                .map_err(EsqlError::from_executor)?,
         ),
     };
     Ok(EsqlOutcome {
