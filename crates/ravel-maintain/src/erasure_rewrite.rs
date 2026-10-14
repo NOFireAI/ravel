@@ -5442,6 +5442,137 @@ mod tests {
         );
     }
 
+    /// Runs one erasure pass dropping `service = checkout` from the logs
+    /// bucket, asserts it published one part, and returns the record's dropped
+    /// count, the survivors and the part's bytes.
+    async fn erase_checkout(store: &MemoryStore) -> (u64, Vec<LogRecord>, Bytes) {
+        let request = logs_erasure_request(3, "service", "checkout");
+        let pending = vec![PendingErasureRequest {
+            request_key: "unused-in-memory-only".to_string(),
+            request,
+        }];
+        let clock = FixedClock::new(sealed_now_ns());
+        let config = CompactorConfig::default();
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = erasure_rewrite_bucket(
+            store,
+            &clock,
+            &config,
+            &NoLeases,
+            &logs_bucket(),
+            &pending,
+            &mut memo,
+        )
+        .await
+        .expect("the erasure rewrite completes");
+        let (parts, publish) = match outcome {
+            ErasureRewriteOutcome::Rewritten { parts, publish, .. } => (parts, publish),
+            other => panic!("expected Rewritten, got {other:?}"),
+        };
+        assert_eq!(parts, 1);
+        assert_eq!(publish, PublishOutcome::Published);
+        let record = read_rewrite_record_for(store, &logs_bucket()).await;
+        assert_eq!(record.drops.len(), 1);
+        let part_key =
+            keys::reconstruct_rewrite_part_key(&record, &record.parts[0]).expect("part key");
+        let survivors = decode_logs_part(store, &part_key).await;
+        let bytes = store
+            .get(&part_key, GetRange::Full)
+            .await
+            .expect("get part")
+            .data;
+        (record.drops[0].dropped_count, survivors, bytes)
+    }
+
+    /// The erasure rewrite completes over inputs naming one field under
+    /// different key types: the erased record is gone, the rewritten part
+    /// names the field under neither type, and the other field still probes.
+    #[tokio::test]
+    async fn logs_rewrite_completes_over_a_key_type_conflict() {
+        use crate::rlog::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{KeyType, key8_i64, key8_str};
+
+        let store = MemoryStore::new();
+        let svc = |v: &str| ("service".to_string(), LogAttrValue::Str(v.to_string()));
+        let u = |v: i64| ("u".to_string(), LogAttrValue::I64(v));
+        let one = vec![
+            log_record(1, 10, "a", vec![svc("checkout"), ("k".into(), LogAttrValue::I64(1)), u(7)]),
+            log_record(1, 20, "b", vec![svc("shipping"), u(8)]),
+        ];
+        let two = vec![log_record(
+            2,
+            15,
+            "c",
+            vec![svc("shipping"), ("k".into(), LogAttrValue::Str("1".into())), u(9)],
+        )];
+        let both = |k: KeyType| [("k", k), ("u", KeyType::I64)];
+        seed_logs_with(&store, 1, &one, &[], &both(KeyType::I64), RlogConfig::default()).await;
+        seed_logs_with(&store, 2, &two, &[], &both(KeyType::Str), RlogConfig::default()).await;
+
+        let (dropped, survivors, part) = erase_checkout(&store).await;
+        assert_eq!(dropped, 1);
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(oracle::fields(&part), vec![("u".to_string(), KeyType::I64)]);
+        assert_eq!(oracle::probe(&part, "k", KeyType::I64, &key8_i64(1)), None);
+        assert_eq!(oracle::probe(&part, "k", KeyType::Str, &key8_str("1")), None);
+        for (v, want) in [(7i64, Vec::new()), (8, vec![0]), (9, vec![0])] {
+            assert_eq!(
+                oracle::probe(&part, "u", KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "u = {v}"
+            );
+        }
+    }
+
+    /// The erasure rewrite completes over inputs whose KEY_IDX union names 65
+    /// fields, and keeps the same 64 the compactor keeps: `trace_id`, then
+    /// ascending names.
+    #[tokio::test]
+    async fn logs_rewrite_completes_over_a_key_index_union_past_the_cap() {
+        use crate::rlog::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{KeyType, key8_i64};
+
+        let store = MemoryStore::new();
+        let svc = |v: &str| ("service".to_string(), LogAttrValue::Str(v.to_string()));
+        let f = |i: i64| (format!("f{i:02}"), LogAttrValue::I64(i));
+        let one = vec![
+            log_record(1, 10, "a", vec![svc("checkout"), f(5)]),
+            log_record(1, 20, "b", vec![svc("shipping"), f(63)]),
+        ];
+        let two = vec![log_record(2, 15, "c", vec![svc("shipping"), f(0)])];
+        let mut one_fields = oracle::numbered_i64_fields(1, 63);
+        one_fields.push(("trace_id".to_string(), KeyType::Id16));
+        let one_fields: Vec<(&str, KeyType)> =
+            one_fields.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+        seed_logs_with(&store, 1, &one, &[], &one_fields, RlogConfig::default()).await;
+        seed_logs_with(
+            &store,
+            2,
+            &two,
+            &[],
+            &[("f00", KeyType::I64)],
+            RlogConfig::default(),
+        )
+        .await;
+
+        let (dropped, survivors, part) = erase_checkout(&store).await;
+        assert_eq!(dropped, 1);
+        assert_eq!(survivors.len(), 2);
+        let mut want = oracle::numbered_i64_fields(0, 63);
+        want.push(("trace_id".to_string(), KeyType::Id16));
+        assert_eq!(oracle::fields(&part), want);
+        assert_eq!(oracle::probe(&part, "f63", KeyType::I64, &key8_i64(63)), None);
+        assert_eq!(
+            oracle::probe(&part, "f00", KeyType::I64, &key8_i64(0)),
+            Some(vec![0])
+        );
+        assert_eq!(
+            oracle::probe(&part, "f05", KeyType::I64, &key8_i64(5)),
+            Some(Vec::new()),
+            "held only by the erased record"
+        );
+    }
+
     #[tokio::test]
     async fn logs_republishing_same_rewrite_converges_without_double_counting() {
         let store = MemoryStore::new();

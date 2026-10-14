@@ -27,7 +27,9 @@ use crate::footer::{
     COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, SortDescriptor, SortKeyType, kind,
     write_footer_and_trailer,
 };
-use crate::key_index::{Key8, KeyIndexPlan, KeyType, TRACE_ID_FIELD, key8_of};
+use crate::key_index::{
+    KEY_IDX_BUCKET_MAX_ENTRIES, Key8, KeyIndexPlan, KeyType, TRACE_ID_FIELD, key8_of,
+};
 use crate::page::{SealedPage, seal_page};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
@@ -110,6 +112,10 @@ pub struct RlogWriter {
     indexed_fields: Vec<String>,
     /// The exact-key fields KEY_IDX indexes ([`RlogWriter::with_key_index_fields`]).
     key_index_fields: Vec<(String, KeyType)>,
+    /// The most entries one KEY_IDX bucket of a field may hold before the field
+    /// is left out of this object's index: the codec's
+    /// [`KEY_IDX_BUCKET_MAX_ENTRIES`], lowered only by tests.
+    key_idx_bucket_cap: u32,
     /// The clustered row order and the generation recorded with it
     /// ([`RlogWriter::with_sort_descriptor`]); `None` and 0 by default.
     sort_descriptor: Option<SortDescriptor>,
@@ -222,6 +228,7 @@ impl RlogWriter {
             batches: Vec::new(),
             indexed_fields: Vec::new(),
             key_index_fields: Vec::new(),
+            key_idx_bucket_cap: KEY_IDX_BUCKET_MAX_ENTRIES,
             sort_descriptor: None,
             clustering_generation: 0,
             bloom_scope: BloomScope::All,
@@ -298,7 +305,10 @@ impl RlogWriter {
     /// column (`I64`, `Str` or `Bytes`), plus [`TRACE_ID_FIELD`] as `Id16` for
     /// the fixed `trace_id` column. An empty set, the default, writes no
     /// KEY_IDX. Otherwise every field is named in the section, one with no
-    /// matching row with no entries. A row contributes the field's value from
+    /// matching row with no entries, except a field one of whose buckets would
+    /// hold more than [`KEY_IDX_BUCKET_MAX_ENTRIES`] entries: that field is left
+    /// out of this object's section with a warning, so a probe on it declines,
+    /// and the object is still written. A row contributes the field's value from
     /// its merged attribute view (the first entry per name, as `find_attr`
     /// resolves it) only when that value is of the field's type; a NULL,
     /// absent or differently typed value contributes nothing. The build
@@ -993,7 +1003,7 @@ impl RlogWriter {
             kind::BLOCKS,
             &Stored::raw(blocks_bytes),
         );
-        push_key_idx(&mut object, &mut sections, key_plan)?;
+        push_key_idx(&mut object, &mut sections, key_plan, self.key_idx_bucket_cap)?;
         push_section(
             &mut object,
             &mut sections,
@@ -2010,7 +2020,7 @@ impl RlogWriter {
             kind::BLOCKS,
             &Stored::raw(blocks_bytes),
         );
-        push_key_idx(&mut object, &mut sections, key_plan)?;
+        push_key_idx(&mut object, &mut sections, key_plan, self.key_idx_bucket_cap)?;
         push_section(
             &mut object,
             &mut sections,
@@ -3768,18 +3778,21 @@ fn compress(raw: &[u8], level: i32) -> Result<Stored, LogSegError> {
     })
 }
 
-/// Appends a section's stored bytes and records its descriptor.
-/// Appends the KEY_IDX section when `plan` is present. Stored raw: its prefix
-/// and buckets are read by range, so it is never compressed.
+/// Appends the KEY_IDX section when `plan` is present and keeps a field
+/// ([`KeyIndexPlan::encode`] with `bucket_cap`). Stored raw: its prefix and
+/// buckets are read by range, so it is never compressed.
 fn push_key_idx(
     object: &mut Vec<u8>,
     sections: &mut Vec<SectionDesc>,
     plan: Option<KeyIndexPlan>,
+    bucket_cap: u32,
 ) -> Result<(), LogSegError> {
     let Some(plan) = plan else {
         return Ok(());
     };
-    let encoded = plan.encode()?;
+    let Some(encoded) = plan.encode(bucket_cap)? else {
+        return Ok(());
+    };
     push_section(object, sections, kind::KEY_IDX, &Stored::raw(encoded.bytes));
     if let Some(desc) = sections.last_mut() {
         desc.prefix_len = encoded.prefix_len;
@@ -3787,6 +3800,7 @@ fn push_key_idx(
     Ok(())
 }
 
+/// Appends a section's stored bytes and records its descriptor.
 fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32, stored: &Stored) {
     let offset = object.len() as u64;
     object.extend_from_slice(&stored.bytes);

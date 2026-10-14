@@ -66,8 +66,9 @@
 //!   [`input_indexed_fields`] for what is recovered and how.
 //! - The output's KEY_IDX field set is the union of the inputs' KEY_IDX
 //!   headers ([`input_key_index_fields`]), for the compactor and the erasure
-//!   rewrite alike. A field two inputs name under different key types is
-//!   [`MaintainError::KeyIndexKeyTypeConflict`].
+//!   rewrite alike. A field two inputs name under different key types, and a
+//!   field past the writer's 64-field cap, is left out of the output's KEY_IDX
+//!   and logged ([`merged_key_index_fields`]); the merge itself goes ahead.
 //!
 //! # Reuse, not reimplementation
 //!
@@ -1048,7 +1049,7 @@ pub(crate) async fn merge_catalogs(
     // The entry points refuse a bad level before their first store request
     // ([`check_rlog_zstd_level`]); this covers a direct `build_parts` caller.
     let zstd_level = crate::config::validate_rlog_zstd_level(config.rlog_zstd_level)?;
-    let key_index_fields = merged_key_index_fields(catalogs)?;
+    let key_index_fields = merged_key_index_fields(catalogs);
     // Global stream_ref remap + cross-object stream-identity check. The
     // merged set is the sorted union of every input's STREAM_DIR; the dense
     // merged stream_ref is the ordinal in this set (the writer re-derives it
@@ -3697,38 +3698,102 @@ async fn input_key_index_fields(
 /// The output's KEY_IDX field set: the union of the inputs' sets, sorted by
 /// name. Union for the same reason as [`merged_indexed_fields`]: the KEY_IDX
 /// entries are rebuilt from the merged records, so naming a field one input
-/// did not index is never wrong. The union is checked against the writer's
-/// field-set rules here, so a set it would refuse fails before the merge reads
-/// a block.
-fn merged_key_index_fields(catalogs: &[RlogInputCatalog]) -> Result<Vec<(String, KeyType)>> {
-    let mut fields: BTreeMap<&str, (KeyType, &str)> = BTreeMap::new();
+/// did not index is never wrong.
+///
+/// The inputs are immutable, so a union the writer would refuse would be
+/// refused on every retry and the bucket would never merge again. Instead a
+/// field the writer cannot take is left out of the output's KEY_IDX, which
+/// is exact: a probe on a field the header does not name declines, and the
+/// object reads as unindexed for it. Each one left out is logged at warn
+/// level, as the POSTINGS distinct-value cap is. Three cases:
+///
+/// - Inputs naming the field under different key types (a column retyped
+///   within the bucket's hour): no single type covers every input's rows.
+/// - A field the writer refuses on its own (a name outside 1..=128 bytes, or
+///   [`key_index::TRACE_ID_FIELD`] and `Id16` not paired), which a valid
+///   input never carries.
+/// - Fields past [`key_index::KEY_IDX_MAX_FIELDS`] (a declaration changed at
+///   the column cap within the hour). [`key_index_field_cap`] picks which.
+fn merged_key_index_fields(catalogs: &[RlogInputCatalog]) -> Vec<(String, KeyType)> {
+    let mut fields: BTreeMap<&str, (Option<KeyType>, &str)> = BTreeMap::new();
     for catalog in catalogs {
         for (name, key_type) in &catalog.key_index_fields {
             match fields.entry(name.as_str()) {
                 std::collections::btree_map::Entry::Vacant(slot) => {
-                    slot.insert((*key_type, catalog.object_key.as_str()));
+                    slot.insert((Some(*key_type), catalog.object_key.as_str()));
                 }
-                std::collections::btree_map::Entry::Occupied(slot) => {
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
                     let (first, first_object) = *slot.get();
-                    if first != *key_type {
-                        return Err(MaintainError::KeyIndexKeyTypeConflict {
-                            field: name.clone(),
-                            first: format!("{first:?}"),
-                            first_object: first_object.to_string(),
-                            second: format!("{key_type:?}"),
-                            second_object: catalog.object_key.clone(),
-                        });
+                    if let Some(first) = first.filter(|first| first != key_type) {
+                        tracing::warn!(
+                            field = %name,
+                            first_key_type = ?first,
+                            first_object,
+                            second_key_type = ?key_type,
+                            second_object = %catalog.object_key,
+                            "KEY_IDX field left out of the merged output: inputs index it \
+                             under different key types"
+                        );
+                        slot.insert((None, first_object));
                     }
                 }
             }
         }
     }
-    let merged: Vec<(String, KeyType)> = fields
-        .into_iter()
-        .map(|(name, (key_type, _))| (name.to_string(), key_type))
-        .collect();
-    key_index::validate_fields(&merged)?;
-    Ok(merged)
+    let mut merged: Vec<(String, KeyType)> = Vec::with_capacity(fields.len());
+    for (name, (key_type, _)) in fields {
+        let Some(key_type) = key_type else {
+            continue;
+        };
+        let field = (name.to_string(), key_type);
+        if let Err(e) = key_index::validate_fields(std::slice::from_ref(&field)) {
+            tracing::warn!(
+                field = %name,
+                key_type = ?key_type,
+                error = %e,
+                "KEY_IDX field left out of the merged output: the writer refuses it"
+            );
+            continue;
+        }
+        merged.push(field);
+    }
+    key_index_field_cap(merged)
+}
+
+/// Reduces a name-sorted, valid KEY_IDX field set to at most
+/// [`key_index::KEY_IDX_MAX_FIELDS`] fields, logging each one left out.
+/// [`key_index::TRACE_ID_FIELD`] is kept first, then the remaining names in
+/// ascending byte order up to the cap.
+///
+/// The choice depends on the field names alone, never on input order or on
+/// which input is newest, so every retry and every compactor replica picks the
+/// same set and the merged output stays byte-identical for identical inputs.
+/// `trace_id` goes first because it is the tenant-wide declaration
+/// (`index_trace_id`) and holds the slot the per-column cap reserves for it, so
+/// a column change at that cap never displaces it.
+fn key_index_field_cap(mut fields: Vec<(String, KeyType)>) -> Vec<(String, KeyType)> {
+    let cap = key_index::KEY_IDX_MAX_FIELDS;
+    if fields.len() <= cap {
+        return fields;
+    }
+    if let Some(at) = fields
+        .iter()
+        .position(|(name, _)| name == key_index::TRACE_ID_FIELD)
+    {
+        let trace = fields.remove(at);
+        fields.insert(0, trace);
+    }
+    for (name, key_type) in fields.drain(cap..) {
+        tracing::warn!(
+            field = %name,
+            key_type = ?key_type,
+            cap,
+            "KEY_IDX field left out of the merged output: the inputs' union names more \
+             fields than the cap"
+        );
+    }
+    fields.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    fields
 }
 
 /// Fetch one required whole-read section by range and return its decompressed,
@@ -3771,6 +3836,13 @@ pub(crate) mod key_idx_oracle {
 
     fn slice(bytes: &[u8], r: std::ops::Range<u64>) -> Result<&[u8], LogSegError> {
         Ok(&bytes[r.start as usize..r.end as usize])
+    }
+
+    /// `n` field names `f{first:02}` onward, each declared `I64`.
+    pub(crate) fn numbered_i64_fields(first: usize, n: usize) -> Vec<(String, KeyType)> {
+        (first..first + n)
+            .map(|i| (format!("f{i:02}"), KeyType::I64))
+            .collect()
     }
 
     /// The fields and key types the object's KEY_IDX header names.
@@ -5022,44 +5094,112 @@ mod tests {
         );
     }
 
-    /// Two inputs naming one field under different key types are refused
-    /// before anything is written.
+    /// Two inputs naming one field under different key types (a column
+    /// retyped within the hour) compact: the output's KEY_IDX names that field
+    /// under neither type, so a probe on it declines, and every other field is
+    /// still indexed and probes its true blocks.
     #[tokio::test]
-    async fn a_key_type_conflict_between_inputs_is_a_typed_error() {
+    async fn a_key_type_conflict_between_inputs_leaves_the_field_uncovered() {
+        use super::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{key8_i64, key8_str};
+
         let store = MemoryStore::new();
-        let a = vec![keyed_record(
-            0,
+        let k_i64 = ("k".to_string(), AttrValue::I64(1));
+        let k_str = ("k".to_string(), AttrValue::Str("1".into()));
+        let u = |v: i64| ("u".to_string(), AttrValue::I64(v));
+        let a = vec![keyed_record(0, 1, vec![k_i64, u(10)], None)];
+        let b = vec![keyed_record(1, 2, vec![k_str, u(20)], None)];
+        seed_l0_keyed(
+            &store,
+            Uuid::from_u128(1),
             1,
-            vec![("k".into(), AttrValue::I64(1))],
-            None,
-        )];
-        let b = vec![keyed_record(
-            0,
+            &a,
+            &[("k", KeyType::I64), ("u", KeyType::I64)],
+        )
+        .await;
+        seed_l0_keyed(
+            &store,
+            Uuid::from_u128(2),
             2,
-            vec![("k".into(), AttrValue::Str("1".into()))],
-            None,
-        )];
-        seed_l0_keyed(&store, Uuid::from_u128(1), 1, &a, &[("k", KeyType::I64)]).await;
-        seed_l0_keyed(&store, Uuid::from_u128(2), 2, &b, &[("k", KeyType::Str)]).await;
-        let before = list_all(&store, "").await.expect("list").len();
+            &b,
+            &[("k", KeyType::Str), ("u", KeyType::I64)],
+        )
+        .await;
 
         let clock = FixedClock::new(sealed_now_ns());
-        let err = compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
             .await
-            .expect_err("conflicting key types must not compact");
-        match err {
-            MaintainError::KeyIndexKeyTypeConflict {
-                field,
-                first,
-                second,
-                ..
-            } => {
-                assert_eq!(field, "k");
-                assert_eq!((first.as_str(), second.as_str()), ("I64", "Str"));
-            }
-            other => panic!("expected KeyIndexKeyTypeConflict, got {other:?}"),
+            .expect("a key type conflict compacts");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        let l1 = &parts[0];
+
+        assert_eq!(oracle::fields(l1), vec![("u".to_string(), KeyType::I64)]);
+        assert_eq!(oracle::probe(l1, "k", KeyType::I64, &key8_i64(1)), None);
+        assert_eq!(oracle::probe(l1, "k", KeyType::Str, &key8_str("1")), None);
+        for v in [10i64, 20, 30] {
+            let want = oracle::true_blocks(l1, |r| has_attr(r, "u", &AttrValue::I64(v)));
+            assert_eq!(
+                oracle::probe(l1, "u", KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "u = {v}"
+            );
         }
-        assert_eq!(list_all(&store, "").await.expect("list").len(), before);
+        assert_eq!(
+            oracle::probe(l1, "u", KeyType::I64, &key8_i64(20)),
+            Some(vec![0]),
+            "a key only the second input holds is found"
+        );
+    }
+
+    /// A union of 65 fields (a column swapped at the 63-column cap within the
+    /// hour, plus `trace_id`) compacts to exactly 64: `trace_id`, then the
+    /// remaining names in ascending byte order. Input A alone names `f63` and
+    /// input B alone names `f00`, so neither input's set, nor plain byte
+    /// order (which sorts `trace_id` last), nor descending order is the
+    /// answer.
+    #[tokio::test]
+    async fn a_key_index_union_over_the_field_cap_keeps_the_deterministic_64() {
+        use super::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{key8_i64, key8_id16};
+
+        let store = MemoryStore::new();
+        let trace = [0xAB; 16];
+        let f = |i: i64| (format!("f{i:02}"), AttrValue::I64(i));
+        let a = vec![keyed_record(0, 1, vec![f(5), f(63)], Some(trace))];
+        let b = vec![keyed_record(1, 2, vec![f(0)], None)];
+        let mut a_fields = oracle::numbered_i64_fields(1, 63);
+        a_fields.push(("trace_id".to_string(), KeyType::Id16));
+        let a_fields: Vec<(&str, KeyType)> =
+            a_fields.iter().map(|(n, t)| (n.as_str(), *t)).collect();
+        seed_l0_keyed(&store, Uuid::from_u128(1), 1, &a, &a_fields).await;
+        seed_l0_keyed(&store, Uuid::from_u128(2), 2, &b, &[("f00", KeyType::I64)]).await;
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("a union over the field cap compacts");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        let l1 = &parts[0];
+
+        let mut want = oracle::numbered_i64_fields(0, 63);
+        want.push(("trace_id".to_string(), KeyType::Id16));
+        assert_eq!(want.len(), 64);
+        assert_eq!(oracle::fields(l1), want);
+        assert_eq!(oracle::probe(l1, "f63", KeyType::I64, &key8_i64(63)), None);
+        for (field, v) in [("f00", 0i64), ("f05", 5), ("f05", 6)] {
+            let want = oracle::true_blocks(l1, |r| has_attr(r, field, &AttrValue::I64(v)));
+            assert_eq!(
+                oracle::probe(l1, field, KeyType::I64, &key8_i64(v)),
+                Some(want),
+                "{field} = {v}"
+            );
+        }
+        assert_eq!(
+            oracle::probe(l1, "trace_id", KeyType::Id16, &key8_id16(&trace)),
+            Some(vec![0])
+        );
     }
 
     #[tokio::test]
