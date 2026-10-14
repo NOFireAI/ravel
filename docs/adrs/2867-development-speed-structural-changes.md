@@ -430,16 +430,22 @@ band states is a reviewer's check.
 Change 4 item 3 named a `git log --follow` check that blame survives a
 move-only split. That check cannot pass for these splits. `--follow`
 tracks one file's renames, and a split cuts several new files out of one
-that keeps existing, so it finds no rename at any similarity threshold.
-On the first split (T7, PR #2955), `git log --follow` on both new files,
-`ingest_mode.rs` (27 lines) and `ingest_decode.rs` (1,319 lines), lists
-only the split commit.
+that keeps existing. On the first split (T7, PR #2955), `git log
+--follow` at the default rename threshold lists only the split commit for
+both new files, `ingest_mode.rs` (27 lines) and `ingest_decode.rs` (1,319
+lines). Lowering the threshold far enough makes it follow (`-M30%` on
+`ingest_decode.rs`, `-M5%` on `ingest_mode.rs`), but a threshold tuned
+per file is not a bar a split can be held to.
 
 What item 3 requires instead: `git blame -C -C -C` on each new file
 attributes every moved line to the commit that wrote it before the
-split. The only lines it attributes to the split commit are the ones a
-split has to write: the module's doc header, its `use` lines, and
-visibility qualifiers such as `pub(crate)` on items that crossed a module
-boundary. On PR #2955 that is 7 of 27 lines in `ingest_mode.rs` and 37 of
-1,319 in `ingest_decode.rs`, every one in those classes. The same check
-applies to the `logs_scan.rs` split.
+split. The lines it may attribute to the split commit are the ones a
+split has to write: the module's doc header, its `use` lines, visibility
+qualifiers such as `pub(crate)` on items that crossed a module boundary,
+doc prose rewrapped around a new cross-module link, and the new file's
+closing delimiters. On PR #2955 that is 7 of 27 lines in `ingest_mode.rs`
+and 37 of 1,319 in `ingest_decode.rs`. In `ingest_decode.rs` three of the
+37 are rewrapped doc lines and one is the test module's closing brace.
+The reviewer reads every split-attributed line against that list; a line
+outside it is not a move. The same check applies to the `logs_scan.rs`
+split, which has not been made yet.
