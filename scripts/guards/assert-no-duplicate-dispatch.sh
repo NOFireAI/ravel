@@ -14,7 +14,9 @@
 # endpoint rather than `gh pr list --json files`, which caps at 100 entries
 # and would report a wide pull request as touching none of the paths asked
 # about: a false clean, which is the only wrong answer that costs anything
-# here.
+# here. That endpoint returns at most 3000 files, so a pull request listing
+# 3000 or more may touch more than it lists and is taken as colliding with
+# every entry, with a NOTE.
 #
 # A --paths entry takes one of three forms:
 #   path          the whole file: any change the pull request makes to it
@@ -24,8 +26,10 @@
 #                 inside it.
 #   path#symbol   a definition on the base: collides only when a hunk changes
 #                 a base line inside it.
-# Each entry is trimmed of leading and trailing whitespace; an entry empty
-# after trimming is a usage error. A changed base line is a removed or
+# Entries are separated by commas. Each entry is trimmed of leading and
+# trailing whitespace; an entry empty after trimming, including one left by
+# a leading, trailing or doubled comma, is a usage error, and so is a --paths
+# value containing a newline or carriage return. A changed base line is a removed or
 # replaced line; a pure insertion counts against the base lines on both sides
 # of it; context lines do not count. A range or symbol entry whose file is
 # not on the base, and a range that starts past the base file's last line,
@@ -59,16 +63,30 @@
 # keeps the whole-file rule.
 #
 # Hunks come from the patch field of the same paginated files endpoint, in
-# the same call; a file returned with no patch (a diff too large to inline)
-# is compared as the whole file. A file the pull request renamed matches an
-# entry naming either its old or its new path, and its patch is numbered on
-# the old file. Symbols, headings and sections are read from --base-ref
-# (default origin/main), while a pull request's hunks number lines on its
-# own merge base. Before a range, symbol or section comparison trusts a
-# file's hunks, every context and removed line of each hunk must equal the
-# base file's line at the number the hunk header gives it; on any mismatch
-# that file is compared as the whole file, with a NOTE saying the pull
-# request's base has drifted from the base ref.
+# the same call. A file the pull request renamed matches an entry naming
+# either its old or its new path, and its patch is numbered on the old file.
+# Symbols, headings and sections are read from --base-ref (default
+# origin/main), while a pull request's hunks number lines on its own merge
+# base. A range, symbol or section entry is compared by line only when all
+# of these hold for the matching file; otherwise that file is compared as
+# the whole file, with a NOTE naming the file and the reason:
+#   - the file has a patch: one absent or empty (a diff too large to inline)
+#     is not compared by line;
+#   - the pull request neither adds nor deletes the file: status added or
+#     removed, or a hunk header with an empty side (-0,0 or +0,0), is not;
+#   - the merge base is known and present locally. It is read once per pull
+#     request, and only when an entry needs it, from the compare endpoint
+#     (repos/OWNER/REPO/compare/BASE...HEAD, BASE the pull request's base
+#     branch and HEAD its head commit, .merge_base_commit.sha). A listing
+#     with no base branch or head commit, a response naming no merge base,
+#     or a merge base this checkout does not have (it is not fetched) each
+#     fall back. A gh failure on that call exits 69;
+#   - the file on the merge base (its old path, for a rename) is the same
+#     blob as the entry's file on --base-ref. Any difference, wherever it is
+#     in the file, means it changed since the pull request forked;
+#   - every context and removed line of each hunk equals the base file's
+#     line at the number its hunk header gives it, and every hunk has at
+#     least one such line to check.
 #
 # Usage:
 #   assert-no-duplicate-dispatch.sh --issue <n> [--paths a,b,c] [--paths d]
@@ -79,17 +97,18 @@
 #   0   nothing overlapping; dispatch
 #   64  usage, including a --paths entry that does not parse (path:L10 with
 #       no end, a start of 0 or after the end, path# with no symbol, #symbol
-#       with no path, or a path containing ':' or '#' in any other way) or
-#       is empty after trimming
+#       with no path, or a path containing ':' or '#' in any other way), an
+#       entry empty after trimming, or a --paths value containing a newline
+#       or carriage return; each is refused before any gh call
 #   65  an existing pull request already addresses the issue; skip and log
 #   66  an OPEN, non-draft pull request is already touching the predicted
 #       files, line ranges or definitions (drafts, merged and closed ones are
 #       listed as context only)
 #   69  the question could not be asked (gh failed after its retries, a pull
 #       request list came back as long as its limit and may be truncated, a
-#       pull request's files and patches could not be fetched, or --base-ref
-#       does not resolve); not the same as a clean answer, and never report
-#       it as one
+#       pull request's files and patches or its merge base could not be
+#       fetched, or --base-ref does not resolve); not the same as a clean
+#       answer, and never report it as one
 set -euo pipefail
 
 issue=""
@@ -118,8 +137,14 @@ while [[ $# -gt 0 ]]; do
     --issue) issue="${2:-}"; shift 2 ;;
     --paths)
       [[ -n "${2:-}" ]] || { echo "assert-no-duplicate-dispatch.sh: --paths needs a value" >&2; exit 64; }
-      IFS=',' read -r -a chunk <<<"$2"
-      for entry in "${chunk[@]}"; do
+      [[ "$2" != *$'\n'* && "$2" != *$'\r'* ]] || {
+        echo "assert-no-duplicate-dispatch.sh: --paths contains a newline or carriage return; separate entries with commas" >&2
+        exit 64
+      }
+      rest="$2,"
+      while [[ -n "${rest}" ]]; do
+        entry="${rest%%,*}"
+        rest="${rest#*,}"
         entry="${entry#"${entry%%[![:space:]]*}"}"
         entry="${entry%"${entry##*[![:space:]]}"}"
         [[ -n "${entry}" ]] || {
@@ -199,7 +224,7 @@ cutoff_epoch=$(( $(date +%s) - closed_days * 86400 ))
 # that comes back full may have cut off a candidate, and a candidate that was
 # never listed reads as no overlap, so a full list is refused.
 pr_list_limit="${PR_LIST_LIMIT:-500}"
-pr_fields="number,title,state,isDraft,body,headRefName,updatedAt,mergedAt,closedAt"
+pr_fields="number,title,state,isDraft,body,headRefName,baseRefName,headRefOid,updatedAt,mergedAt,closedAt"
 # Called inside a command substitution, where errexit does not apply, so each
 # failure exits explicitly; falling through here would read as an empty list.
 list_prs() {
@@ -235,7 +260,7 @@ candidates="$(jq -r --argjson cutoff "${cutoff_epoch}" '
       or ((.mergedAt // .closedAt // "") != ""
           and ((.mergedAt // .closedAt) | fromdateiso8601) >= $cutoff)
     ) ]
-  | .[] | "\(.number)\t\(if .state == "OPEN" and .isDraft then "DRAFT" else .state end)\t\(.title)"' <<<"${prs_json}")"
+  | .[] | "\(.number)\t\(if .state == "OPEN" and .isDraft then "DRAFT" else .state end)\t\(if (.baseRefName // "") == "" then "-" else .baseRefName end)\t\(if (.headRefOid // "") == "" then "-" else .headRefOid end)\t\(.title)"' <<<"${prs_json}")"
 
 # A pull request that CLOSES the issue, not one that merely cites it.
 #
@@ -346,17 +371,23 @@ changed_lines_awk='
 
 # Exits 1 unless every context and removed line of the patch (read second)
 # equals the base file's line (read first, named by bf) at the base line
-# number its hunk header gives it.
+# number its hunk header gives it, and 2 when a hunk has no such line.
 # shellcheck disable=SC2016 # an awk program; its $ fields are awk's, not the shell's
-drift_awk='
+hunk_check_awk='
   FILENAME == bf { line[FNR] = $0; next }
-  /^@@ -[0-9]/ { h = $2; sub(/^-/, "", h); split(h, p, ","); base = p[1] + 0; seen = 1; next }
+  /^@@ -[0-9]/ {
+    if (seen && !compared) { bare = 1; exit }
+    h = $2; sub(/^-/, "", h); split(h, p, ","); base = p[1] + 0; seen = 1; compared = 0; next
+  }
   !seen || /^\+/ || /^\\/ { next }
   {
     if (!(base in line) || (line[base] "") != (substr($0, 2) "")) { bad = 1; exit }
-    base++
+    base++; compared = 1
   }
-  END { exit bad }'
+  END {
+    if (bad) exit 1
+    if (bare || (seen && !compared)) exit 2
+  }'
 
 # Opens or closes a fenced code block on a fence line. A fence closes only on
 # the same character at least as long as the one that opened it.
@@ -452,7 +483,7 @@ section_hit_awk="${fence_awk_fn}"'
 # Resolve every entry once against the base. e_mode is whole (any change to
 # the file), lines (a changed line inside e_ranges) or sections (a changed
 # line in a section e_ranges covers, read from e_base).
-e_path=(); e_label=(); e_mode=(); e_ranges=(); e_base=()
+e_path=(); e_label=(); e_mode=(); e_ranges=(); e_base=(); e_blob=()
 needs_base=0
 for entry in "${paths[@]}"; do
   [[ "$(entry_form "${entry}")" == bare ]] || needs_base=1
@@ -518,21 +549,36 @@ for entry in "${paths[@]}"; do
       fi
       ;;
   esac
+  blob=""
+  if [[ "${mode}" != whole ]]; then
+    blob="$(git rev-parse --verify --quiet "${base_ref}:${p}")" || {
+      echo "assert-no-duplicate-dispatch.sh: could not read ${p} on ${base_ref}; refusing to report a clean answer" >&2
+      exit 69
+    }
+  fi
   e_path+=("${p}"); e_label+=("${entry}"); e_mode+=("${mode}")
-  e_ranges+=("${ranges}"); e_base+=("${bfile}")
+  e_ranges+=("${ranges}"); e_base+=("${bfile}"); e_blob+=("${blob}")
 done
 
 collision=0
 overlap_report=""
 context_report=""
-while IFS=$'\t' read -r num state title; do
+files_cap=3000
+while IFS=$'\t' read -r num state pr_base pr_head title; do
   [[ -z "${num}" ]] && continue
   # One line per file, a JSON array of its name, its patch (null when the
-  # endpoint left the patch out) and its name before a rename (null when the
-  # pull request did not rename it).
-  files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[] | [.filename, .patch, .previous_filename] | @json')"
+  # endpoint left the patch out), its name before a rename (null when the
+  # pull request did not rename it) and its status.
+  files="$(ask gh api "repos/${repo}/pulls/${num}/files" --paginate --jq '.[] | [.filename, .patch, .previous_filename, .status] | @json')" || exit 69
   shared=""
+  nfiles="$(awk 'END { print NR }' <<<"${files}")"
+  if ((nfiles >= files_cap)); then
+    echo "NOTE  #${num} lists ${nfiles} files, the endpoint's limit; it may touch more, so every entry collides"
+    for i in "${!e_path[@]}"; do shared+="${e_label[i]}, "; done
+  fi
+  mb_asked=0; mb=""; mb_why=""
   for i in "${!e_path[@]}"; do
+    ((nfiles < files_cap)) || break
     recs="$(jq -c --arg p "${e_path[i]}" 'select(.[0] == $p or .[2] == $p)' <<<"${files}")" || exit 69
     [[ -n "${recs}" ]] || continue
     if [[ "${e_mode[i]}" == whole ]]; then
@@ -541,20 +587,53 @@ while IFS=$'\t' read -r num state title; do
     fi
     why=""
     while IFS= read -r rec; do
-      patch="$(jq -r 'if .[1] == null then "-" else "+" + .[1] end' <<<"${rec}")" || exit 69
-      if [[ "${patch}" == "-" ]]; then
-        why="no patch in the API response; compared as the whole file"
-        break
-      fi
+      reason=""
+      patch="$(jq -r 'if (.[1] // "") == "" then "-" else "+" + .[1] end' <<<"${rec}")" || exit 69
+      status_="$(jq -r '.[3] // ""' <<<"${rec}")" || exit 69
+      hunk_path="$(jq -r '.[2] // .[0]' <<<"${rec}")" || exit 69
       patch="${patch#+}"
-      [[ -z "${patch}" ]] && continue
-      if ! changed="$(printf '%s\n' "${patch}" | awk "${changed_lines_awk}")"; then
-        why="patch did not parse; compared as the whole file"
-        break
+      if [[ "${patch}" == "-" ]]; then
+        reason="no patch in the API response"
+      elif [[ "${status_}" == added || "${status_}" == removed ]] \
+        || grep -Eq '^@@ -0,0 |^@@ -[0-9]+(,[0-9]+)? \+0,0 @@' <<<"${patch}"; then
+        reason="the pull request adds or deletes this file"
       fi
-      if ! printf '%s\n' "${patch}" | awk -v bf="${e_base[i]}" "${drift_awk}" "${e_base[i]}" -; then
-        echo "NOTE  #${num} ${e_path[i]}: the pull request's base has drifted from ${base_ref}; ${e_label[i]} compared as the whole file"
-        why="base drifted; compared as the whole file"
+      if [[ -z "${reason}" ]] && ((mb_asked == 0)); then
+        mb_asked=1
+        if [[ "${pr_base}" == - || "${pr_head}" == - ]]; then
+          mb_why="the listing gives no base branch or head commit"
+        else
+          mb="$(ask gh api "repos/${repo}/compare/${pr_base}...${pr_head}" --jq '.merge_base_commit.sha // ""')" || exit 69
+          if [[ ! "${mb}" =~ ^[0-9a-f]{7,64}$ ]]; then
+            mb_why="the compare endpoint named no merge base"
+          elif ! git cat-file -e "${mb}^{commit}" 2>/dev/null; then
+            mb_why="merge base ${mb} is not available locally"
+          fi
+        fi
+      fi
+      if [[ -z "${reason}" && -n "${mb_why}" ]]; then
+        reason="${mb_why}"
+      elif [[ -z "${reason}" ]]; then
+        mb_blob="$(git rev-parse --verify --quiet "${mb}:${hunk_path}")" || mb_blob=""
+        if [[ -z "${mb_blob}" ]]; then
+          reason="${hunk_path} is not on merge base ${mb}"
+        elif [[ "${mb_blob}" != "${e_blob[i]}" ]]; then
+          reason="changed on ${base_ref} since the pull request forked (merge base ${mb})"
+        elif ! changed="$(printf '%s\n' "${patch}" | awk "${changed_lines_awk}")"; then
+          reason="the patch did not parse"
+        else
+          hc=0
+          printf '%s\n' "${patch}" | awk -v bf="${e_base[i]}" "${hunk_check_awk}" "${e_base[i]}" - || hc=$?
+          if ((hc == 1)); then
+            reason="a hunk does not match ${base_ref}"
+          elif ((hc != 0)); then
+            reason="a hunk has no context or removed line to check its numbering against"
+          fi
+        fi
+      fi
+      if [[ -n "${reason}" ]]; then
+        echo "NOTE  #${num} ${e_path[i]}: ${reason}; ${e_label[i]} compared as the whole file"
+        why="${reason}; compared as the whole file"
         break
       fi
       changed="${changed//$'\n'/ }"
