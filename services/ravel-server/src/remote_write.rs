@@ -13,184 +13,39 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ingest_admission::IngestPermitHeld;
+use crate::ingest_admission::{IngestPermitHeld, retry_after_seconds};
 use crate::ingest_concurrency::IngestConcurrencyController;
+use crate::ingest_decode::decode_body_charged;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use bytes::Bytes;
-use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
+use ravel_cpu_gate::{CpuGateError, WriteGate};
 use ravel_ingest::{
-    AdmissionController, Clock, IngestByteBudget, IngestByteCharge, IngestPoint, IngestRouter,
-    IngestValue, RequestRejection, WriteError, plausible_ingest_clock,
+    AdmissionController, Clock, IngestByteBudget, IngestPoint, IngestRouter, IngestValue,
+    RequestRejection, WriteError, plausible_ingest_clock,
 };
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
-use ravel_remote_write::{
-    ResolvedRequest, Rw1DecodeError, Rw2DecodeError, RwNormalizeOutput, normalize_resolved,
-};
+use ravel_remote_write::{RwNormalizeOutput, normalize_resolved};
 use ravel_types::{SeriesId, Signal, TenantId};
 
 /// Layer 1 (ADR-0051 section 2): the compressed-wire-body cap, ahead of
-/// [`MAX_DECOMPRESSED_PAYLOAD_BYTES`]'s existing post-Snappy cap.
+/// [`crate::ingest_decode::MAX_DECOMPRESSED_PAYLOAD_BYTES`]'s existing post-Snappy cap.
 const MAX_COMPRESSED_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 const SAMPLES_WRITTEN_HEADER: &str = "x-prometheus-remote-write-samples-written";
 const HISTOGRAMS_WRITTEN_HEADER: &str = "x-prometheus-remote-write-histograms-written";
 const EXEMPLARS_WRITTEN_HEADER: &str = "x-prometheus-remote-write-exemplars-written";
-const RETRY_AFTER_HEADER: &str = "retry-after";
-
-/// Snappy decompression cap for a single Remote Write request body, applied
-/// before allocation (same discipline as `ravel-otap`'s
-/// `max_decompressed_payload_bytes`).
-const MAX_DECOMPRESSED_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
-
-/// Why a Remote Write body's snappy inflate could not be charged against the
-/// process-wide ingest byte budget.
-#[derive(Debug, PartialEq, Eq)]
-enum SnappyChargeError {
-    /// Charging the decompressed bytes would push the budget past its ceiling
-    /// (ADR-0069, amended by issue #1419): HTTP 429, the same shed response the
-    /// buffered charge takes.
-    Shed,
-}
-
-/// Charges the process-wide ingest byte budget for the bytes this snappy body
-/// will inflate to, **before** [`ravel_remote_write`] allocates the output
-/// buffer (ADR-0069 as amended by issue #1419).
-///
-/// Snappy block format declares its decompressed length in a varint header, so
-/// unlike gzip the exact figure is known without inflating anything:
-/// `snap::raw::decompress_len` reads only that header. `ravel-remote-write`'s
-/// `snappy::decompress` then allocates `vec![0u8; len]` and truncates to the
-/// bytes actually written, which for a well-formed body is `len` exactly. The
-/// charge is therefore the actual inflated length and the actual size of the
-/// allocation it pays for, taken one step ahead of it: no over-charge of a
-/// well-compressing sender, no undercount, and no growing buffer whose spare
-/// capacity would escape the count (the failure mode `otlp_http`'s
-/// [`crate::otlp_http`] `ChunkedBody` exists to avoid on the gzip path, where no
-/// declared length is available and the charge has to be taken chunk by chunk).
-///
-/// The order is cap, then budget, matching the gzip path: a body whose header
-/// claims more than `cap` takes no charge and is left to the decoder, which
-/// rejects it with the existing typed snappy error (HTTP 400). A tight budget
-/// therefore cannot turn an over-cap body into a 429, and the charge for such a
-/// body is never taken at all.
-///
-/// A malformed header is likewise left to the decoder rather than guessed at:
-/// nothing is charged and the decode call that follows returns its own typed
-/// error. An empty body decompresses to nothing and takes no charge, mirroring
-/// `snappy::decompress`'s own empty-input short circuit.
-///
-/// The caller holds the returned guard through protobuf decode and
-/// normalization and drops it immediately before the router takes its own
-/// buffered charge, so the two never coexist (issue #1297 finding 3); on any
-/// error path the guard drops and refunds the budget exactly.
-fn charge_snappy_inflate(
-    body: &[u8],
-    cap: usize,
-    budget: &Arc<IngestByteBudget>,
-) -> Result<Option<IngestByteCharge>, SnappyChargeError> {
-    if body.is_empty() {
-        return Ok(None);
-    }
-    let Ok(len) = snap::raw::decompress_len(body) else {
-        return Ok(None);
-    };
-    if len > cap {
-        return Ok(None);
-    }
-    match budget.try_charge(len as u64) {
-        Ok(charge) => Ok(Some(charge)),
-        Err(_) => Err(SnappyChargeError::Shed),
-    }
-}
-
-/// The size the write gate compares against its inline floor for the decode of
-/// `body`: the inflated length the snappy header declares, capped at `cap`
-/// (ADR-1702 decision 4). The decoder writes into a buffer of exactly the
-/// declared length and fails a body that does not fill it, so the declared
-/// length bounds both the inflate and the protobuf decode after it. A header
-/// over `cap` is rejected before anything is inflated, so `cap` bounds the
-/// job however large the claim. A header that does not parse is rejected
-/// before any inflate too, and is sized by its compressed length.
-fn snappy_job_bytes(body: &[u8], cap: usize) -> u64 {
-    match snap::raw::decompress_len(body) {
-        Ok(declared) => declared.min(cap) as u64,
-        Err(_) => body.len() as u64,
-    }
-}
-
-/// Snappy-decompresses and protobuf-decodes `body` for `version`, holding a
-/// process-wide ingest byte budget charge for the inflated bytes across the
-/// whole call (ADR-0069 as amended by issue #1419).
-///
-/// Returns the decoded request alongside the charge guard, the same shape
-/// `otlp_http::admit_and_decode_body` returns for the gzip path. The caller
-/// keeps the guard alive through normalization and drops it before the router
-/// charges the normalized batch.
-///
-/// With `write_gate` set, the snappy inflate and protobuf decode run on it as
-/// one job under the `remote_write_snappy` site, sized by [`snappy_job_bytes`]
-/// (ADR-1702). The charge moves into the job and comes back with the decoded
-/// request, so it is held while the job waits for a permit and, if the request
-/// is dropped meanwhile, released only when the job returns.
-///
-/// `Err` says which response to return: 429 for a budget shed, 400 for a body
-/// the decoder rejected (unchanged from before this charge existed), 500 or 503
-/// when the gate returned no result.
-async fn decode_body_charged(
-    body: &Bytes,
-    version: RemoteWriteVersion,
-    budget: &Arc<IngestByteBudget>,
-    write_gate: Option<&WriteGate>,
-) -> Result<(ResolvedRequest, Option<IngestByteCharge>), DecodeChargeError> {
-    // Charge before the decoder allocates: a body whose inflate would cross the
-    // ceiling is shed here, so the process never grows by the expansion.
-    let charge = match charge_snappy_inflate(body, MAX_DECOMPRESSED_PAYLOAD_BYTES, budget) {
-        Ok(charge) => charge,
-        Err(SnappyChargeError::Shed) => return Err(DecodeChargeError::Shed),
-    };
-    let input_bytes = snappy_job_bytes(body, MAX_DECOMPRESSED_PAYLOAD_BYTES);
-    let body = body.clone();
-    let decode = move || {
-        let resolved = match version {
-            RemoteWriteVersion::V1 => {
-                ravel_remote_write::decode_write_request(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES)
-                    .map_err(|err: Rw1DecodeError| err.to_string())
-            }
-            RemoteWriteVersion::V2 => {
-                ravel_remote_write::decode_request(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES)
-                    .map_err(|err: Rw2DecodeError| err.to_string())
-            }
-        };
-        (resolved, charge)
-    };
-    let (resolved, charge) = match write_gate {
-        Some(gate) => gate
-            .run(
-                WriteSite::RemoteWriteSnappy,
-                JobSize::Bytes(input_bytes),
-                decode,
-            )
-            .await
-            .map_err(DecodeChargeError::Gate)?,
-        None => decode(),
-    };
-    match resolved {
-        // On this path `charge` drops here, refunding the budget exactly.
-        Err(message) => Err(DecodeChargeError::Decode(message)),
-        Ok(resolved) => Ok((resolved, charge)),
-    }
-}
+pub(crate) const RETRY_AFTER_HEADER: &str = "retry-after";
 
 /// Why a Remote Write body did not become a decoded request. Carried as a small
 /// value rather than a built [`Response`], which the `result_large_err` lint
 /// rejects in an `Err` variant.
 #[derive(Debug)]
-enum DecodeChargeError {
+pub(crate) enum DecodeChargeError {
     /// The declared inflate would push the ingest byte budget past its ceiling.
     /// Taken before the expansion is allocated.
     Shed,
@@ -225,7 +80,7 @@ impl IntoResponse for DecodeChargeError {
 /// refill estimate: no refill time is tracked, and a slot or budget can free
 /// up as soon as any in-flight request completes, so a short fixed wait is
 /// the right shape.
-const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
+pub(crate) const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
 
 /// 429 for a request shed by the process-wide ingest buffer byte budget
 /// (ADR-0069 decision 1, amended by issue #1419): the body was refused before
@@ -251,7 +106,7 @@ fn ingest_buffer_budget_shed_response() -> Response {
 const RETRY_AFTER_SECONDS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteWriteVersion {
+pub(crate) enum RemoteWriteVersion {
     V1,
     V2,
 }
@@ -448,7 +303,7 @@ fn write_error_response(err: WriteError) -> Response {
     // The pending strict-ack bound (ADR-2793 decision 4): the in-flight
     // shed's 429 with its own body text, shared with the OTLP surfaces.
     if matches!(err, WriteError::PendingAckLimitReached) {
-        return crate::otlp_http::pending_ack_shed_response();
+        return crate::ingest_admission::pending_ack_shed_response();
     }
     // The buffer-budget shed (ADR-0069) is admission backpressure, not a
     // durability failure: 429 + `Retry-After`, matching the byte-rate
@@ -490,11 +345,6 @@ fn admission_rejection_response(rejection: RequestRejection) -> Response {
         response.headers_mut().insert(RETRY_AFTER_HEADER, value);
     }
     response
-}
-
-fn retry_after_seconds(retry_after_ns: i64) -> u64 {
-    let ns = retry_after_ns.max(0) as u64;
-    ns.div_ceil(1_000_000_000).max(1)
 }
 
 /// The in-flight permit and the tenant both come from
@@ -731,7 +581,7 @@ async fn remote_write(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Duration;
 
     use ravel_ingest::{
@@ -779,7 +629,7 @@ mod tests {
             .expect("read body");
         assert_eq!(
             std::str::from_utf8(&body).expect("utf-8 body"),
-            crate::otlp_http::PENDING_ACK_SHED_MESSAGE
+            crate::ingest_admission::PENDING_ACK_SHED_MESSAGE
         );
     }
 
@@ -980,347 +830,7 @@ mod tests {
 
     /// A fixed in-window receiver instant, so normalization accepts the fixture
     /// samples without reading a wall clock.
-    const FIXTURE_NOW_NS: i64 = 1_750_000_000_000_000_000;
-
-    /// A snappy-compressed RW2 body of `points` samples on one series, and the
-    /// exact length it inflates to. Repeated identical samples compress well, so
-    /// the inflated length is many times the compressed length: that gap is what
-    /// makes charging the wrong quantity visible.
-    fn rw2_snappy_body(points: usize) -> (Bytes, u64) {
-        use prost::Message as _;
-        use ravel_remote_write::proto::write_v2::{
-            Request as ProtoRequestV2, Sample as ProtoSampleV2, TimeSeries as ProtoTimeSeriesV2,
-        };
-
-        let ts_ms = FIXTURE_NOW_NS / 1_000_000;
-        let request = ProtoRequestV2 {
-            symbols: vec![
-                String::new(),
-                "__name__".to_string(),
-                "requests_total".to_string(),
-                "job".to_string(),
-                "bench".to_string(),
-            ],
-            timeseries: (0..points)
-                .map(|i| ProtoTimeSeriesV2 {
-                    labels_refs: vec![1, 2, 3, 4],
-                    samples: vec![ProtoSampleV2 {
-                        value: 1.0,
-                        timestamp: ts_ms - i as i64,
-                        start_timestamp: 0,
-                    }],
-                    histograms: vec![],
-                    exemplars: vec![],
-                    metadata: None,
-                })
-                .collect(),
-        };
-        let plain = request.encode_to_vec();
-        let compressed = snap::raw::Encoder::new()
-            .compress_vec(&plain)
-            .expect("fixture compresses");
-        assert!(
-            compressed.len() < plain.len(),
-            "fixture must compress: compressed={} inflated={}",
-            compressed.len(),
-            plain.len()
-        );
-        (Bytes::from(compressed), plain.len() as u64)
-    }
-
-    /// Issue #1419 requirement 3: the settled charge is the ACTUAL inflated
-    /// length, not the 64 MiB cap and not the compressed wire length. Snappy
-    /// declares its decompressed size in a varint header, so the figure is
-    /// exact and is taken before `ravel-remote-write` allocates the buffer it
-    /// pays for.
-    ///
-    /// Non-vacuity: charge `body.len()` (the compressed length) or
-    /// `MAX_DECOMPRESSED_PAYLOAD_BYTES` (the cap) in `charge_snappy_inflate`
-    /// and the first assertion fails, because the fixture pins all three
-    /// quantities as distinct.
-    #[test]
-    fn snappy_inflate_charge_equals_the_exact_inflated_length() {
-        let (body, inflated_len) = rw2_snappy_body(400);
-        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(64 * 1024 * 1024));
-
-        let charge = charge_snappy_inflate(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES, &budget)
-            .expect("a body inside the budget is charged, not shed")
-            .expect("a non-empty body takes a charge");
-
-        assert_eq!(
-            charge.bytes(),
-            inflated_len,
-            "the charge is the exact inflated length"
-        );
-        assert_ne!(
-            inflated_len,
-            body.len() as u64,
-            "the fixture must distinguish the inflated length from the compressed length"
-        );
-        assert_ne!(
-            inflated_len, MAX_DECOMPRESSED_PAYLOAD_BYTES as u64,
-            "the fixture must distinguish the inflated length from the cap"
-        );
-        assert_eq!(
-            budget.in_flight_bytes(),
-            inflated_len,
-            "the budget holds exactly the inflated length while the charge lives"
-        );
-
-        drop(charge);
-        assert_eq!(
-            budget.in_flight_bytes(),
-            0,
-            "dropping the guard refunds the budget exactly"
-        );
-    }
-
-    /// Issue #1419 requirement 2: the charge is held through decode AND
-    /// normalization, not released the moment the inflate finishes. Reading
-    /// `in_flight_bytes` after `decode_body_charged` returns and again after
-    /// `normalize_resolved` has run pins both instants.
-    ///
-    /// Non-vacuity: drop the charge inside `decode_body_charged` (return only
-    /// the request) and the first two assertions read 0 instead of the inflated
-    /// length.
-    #[tokio::test]
-    async fn inflate_charge_is_held_through_decode_and_normalize() {
-        let tenant = TenantId::new("acme");
-        let (body, inflated_len) = rw2_snappy_body(400);
-        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(64 * 1024 * 1024));
-
-        let Ok((resolved, charge)) =
-            decode_body_charged(&body, RemoteWriteVersion::V2, &budget, None).await
-        else {
-            panic!("a well-formed body inside the budget decodes");
-        };
-        let charge = charge.expect("a non-empty body carries its inflate charge past decode");
-
-        assert_eq!(
-            budget.in_flight_bytes(),
-            inflated_len,
-            "the inflate charge is still held after decode"
-        );
-
-        let normalized =
-            normalize_resolved(&tenant, resolved, &IngestLimits::default(), FIXTURE_NOW_NS);
-        assert!(
-            !normalized.points.is_empty(),
-            "the fixture normalizes to real points, so normalization did run"
-        );
-        assert_eq!(
-            budget.in_flight_bytes(),
-            inflated_len,
-            "the inflate charge is still held after normalization, before the router charge"
-        );
-
-        drop(charge);
-        assert_eq!(
-            budget.in_flight_bytes(),
-            0,
-            "the charge is released before the router takes its own"
-        );
-    }
-
-    /// A body whose inflate would cross the ceiling is shed before the
-    /// decompressed buffer is allocated: `charge_snappy_inflate` reports
-    /// [`SnappyChargeError::Shed`], the budget is left untouched, and
-    /// `decode_body_charged` turns that into 429 + `Retry-After` rather than
-    /// decoding the body.
-    ///
-    /// Non-vacuity: remove the `budget.try_charge` call and the body inflates
-    /// and decodes fine, so both the error and the 429 disappear.
-    #[tokio::test]
-    async fn inflate_over_the_ceiling_is_shed_without_allocating() {
-        let (body, inflated_len) = rw2_snappy_body(400);
-        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(inflated_len - 1));
-
-        assert!(
-            matches!(
-                charge_snappy_inflate(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES, &budget),
-                Err(SnappyChargeError::Shed)
-            ),
-            "one byte short of the inflated length sheds"
-        );
-        assert_eq!(
-            budget.in_flight_bytes(),
-            0,
-            "a shed request holds no bytes at all"
-        );
-        assert_eq!(budget.shed_total(), 1, "the shed is counted exactly once");
-
-        let Err(error) = decode_body_charged(&body, RemoteWriteVersion::V2, &budget, None).await
-        else {
-            panic!("a shed body produces a response, not a decoded request");
-        };
-        let response = error.into_response();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            response
-                .headers()
-                .get(RETRY_AFTER_HEADER)
-                .expect("the shed response carries Retry-After")
-                .to_str()
-                .expect("ascii header value"),
-            INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string(),
-        );
-
-        // The exact same body fits once the ceiling covers the inflated length,
-        // so the shed above was the budget and nothing else.
-        let roomy = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(inflated_len));
-        assert!(
-            charge_snappy_inflate(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES, &roomy)
-                .expect("a ceiling equal to the inflated length admits the body")
-                .is_some()
-        );
-    }
-
-    /// Cap before budget, the same order the gzip path uses: a body whose
-    /// declared inflate exceeds the cap takes no charge and is left to the
-    /// decoder's existing typed error (HTTP 400), so a tight budget cannot turn
-    /// an over-cap body into a 429. An empty or malformed body likewise charges
-    /// nothing.
-    #[test]
-    fn over_cap_empty_and_malformed_bodies_take_no_charge() {
-        let (body, inflated_len) = rw2_snappy_body(400);
-        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Bounded(1));
-
-        let over_cap = charge_snappy_inflate(&body, (inflated_len - 1) as usize, &budget)
-            .expect("an over-cap body is not shed");
-        assert!(
-            over_cap.is_none(),
-            "an over-cap body takes no charge; the decoder rejects it"
-        );
-
-        let empty = charge_snappy_inflate(&Bytes::new(), MAX_DECOMPRESSED_PAYLOAD_BYTES, &budget)
-            .expect("an empty body is not shed");
-        assert!(empty.is_none(), "an empty body inflates to nothing");
-
-        // A truncated snappy header has no readable decompressed length.
-        let malformed = Bytes::from_static(&[0xff, 0xff, 0xff]);
-        let malformed = charge_snappy_inflate(&malformed, MAX_DECOMPRESSED_PAYLOAD_BYTES, &budget)
-            .expect("a malformed body is not shed");
-        assert!(
-            malformed.is_none(),
-            "a malformed header charges nothing and is left to the decoder"
-        );
-
-        assert_eq!(
-            budget.in_flight_bytes(),
-            0,
-            "none of these paths charged the budget"
-        );
-        assert_eq!(
-            budget.shed_total(),
-            0,
-            "none of these paths reached the budget at all"
-        );
-    }
-
-    fn snappy(data: &[u8]) -> Bytes {
-        Bytes::from(
-            snap::raw::Encoder::new()
-                .compress_vec(data)
-                .expect("compress"),
-        )
-    }
-
-    fn write_gate(inline_floor_bytes: u64) -> Arc<WriteGate> {
-        Arc::new(WriteGate::new(
-            ravel_cpu_gate::CpuGateConfig {
-                inline_floor_bytes,
-                ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
-            },
-            Arc::new(ravel_cpu_gate::InstantClock::new()),
-        ))
-    }
-
-    fn snappy_site(gate: &WriteGate) -> (u64, u64) {
-        gate.snapshot()
-            .sites
-            .iter()
-            .find(|s| s.site == WriteSite::RemoteWriteSnappy)
-            .map_or((0, 0), |s| (s.jobs, s.inline))
-    }
-
-    /// The decode job is sized by the declared inflated length, capped, not by
-    /// the compressed body: a body that compresses below the gate's default
-    /// floor but inflates above it runs on the gate.
-    #[tokio::test]
-    async fn the_snappy_job_is_sized_by_the_declared_inflated_length() {
-        let body = snappy(&vec![0u8; 1024 * 1024]);
-        assert!((body.len() as u64) < ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
-        assert_eq!(
-            snappy_job_bytes(&body, MAX_DECOMPRESSED_PAYLOAD_BYTES),
-            1024 * 1024
-        );
-        assert_eq!(snappy_job_bytes(&body, 1000), 1000, "capped");
-        let malformed = [0xffu8, 0xff, 0xff];
-        assert_eq!(
-            snappy_job_bytes(&malformed, MAX_DECOMPRESSED_PAYLOAD_BYTES),
-            3
-        );
-
-        let gate = write_gate(ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES);
-        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
-        // A megabyte of zeros is not a valid request; the job still ran.
-        let _ = decode_body_charged(&body, RemoteWriteVersion::V1, &budget, Some(&gate)).await;
-        assert_eq!(snappy_site(&gate), (1, 0));
-        let small = snappy(&[0u8; 100]);
-        let _ = decode_body_charged(&small, RemoteWriteVersion::V1, &budget, Some(&gate)).await;
-        assert_eq!(snappy_site(&gate), (1, 1));
-    }
-
-    /// Decision 6: the inflate charge is taken before submission and held
-    /// while the job waits for a permit. A request dropped while it waits
-    /// refunds the charge, since the job that held it never runs.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_snappy_charge_is_held_while_the_job_waits() {
-        let gate = write_gate(0);
-        let (release, parked) = std::sync::mpsc::channel::<()>();
-        let blocker_gate = Arc::clone(&gate);
-        let blocker = tokio::spawn(async move {
-            blocker_gate
-                .run(WriteSite::OtapDecode, JobSize::Bytes(0), move || {
-                    let _ = parked.recv();
-                })
-                .await
-                .expect("the parked job runs");
-        });
-        while gate.running() == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-
-        let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
-        let body = snappy(&[0u8; 1000]);
-        let waiter = tokio::spawn({
-            let (gate, budget) = (Arc::clone(&gate), Arc::clone(&budget));
-            async move {
-                decode_body_charged(&body, RemoteWriteVersion::V1, &budget, Some(&gate))
-                    .await
-                    .is_ok()
-            }
-        });
-        while gate.queued() == 0 {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
-        assert_eq!(
-            budget.in_flight_bytes(),
-            1000,
-            "the declared inflated length is charged while the job waits"
-        );
-
-        waiter.abort();
-        let _ = waiter.await;
-        assert_eq!(
-            budget.in_flight_bytes(),
-            0,
-            "a request dropped before its job ran refunds the charge"
-        );
-        release.send(()).expect("release the parked job");
-        blocker.await.expect("blocker task");
-        assert_eq!(snappy_site(&gate), (0, 0), "the dropped job never ran");
-    }
+    pub(crate) const FIXTURE_NOW_NS: i64 = 1_750_000_000_000_000_000;
 
     /// The gate's failures answer 500 for a panicked decode job and 503 for a
     /// cancelled one, and a flush whose encode the gate failed answers the

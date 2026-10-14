@@ -1284,7 +1284,7 @@ buffer, which inflates ahead of decode and can reach
 which inflates ahead of decode and can reach `MAX_DECOMPRESSED_PAYLOAD_BYTES`
 (also 64 MiB). The gateway now charges both against that gauge before the bytes
 are retained (the ADR-0069 amendments). On
-the gzip path `services/ravel-server/src/otlp_http.rs` charges the decompressed
+the gzip path `services/ravel-server/src/ingest_decode.rs` charges the decompressed
 bytes into the same `IngestByteBudget` *as they are produced*, chunk by chunk, so
 a decompression whose running total would cross the ceiling is shed mid-inflate
 (HTTP 429, the same `ravel_ingest_buffer_shed_total`) instead of allocating the
@@ -1330,8 +1330,8 @@ no transient inflate buffer
 and takes no gateway charge; its decoded body is bounded by the 16 MiB body
 limit and `--max-inflight-ingest-requests` (term 2 below).
 
-Remote Write (`services/ravel-server/src/remote_write.rs`) charges its snappy
-expansion in one step rather than chunk by chunk, and takes that charge before
+Remote Write (decoded in `services/ravel-server/src/ingest_decode.rs`) charges
+its snappy expansion in one step rather than chunk by chunk, and takes that charge before
 anything is allocated. The snappy block format declares its decompressed length
 in a varint header, so `snap::raw::decompress_len` reads the exact inflated size
 off the header without allocating, and `ravel-remote-write` then allocates

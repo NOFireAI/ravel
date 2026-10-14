@@ -35,6 +35,8 @@ pub mod ingest;
 pub mod ingest_admission;
 pub mod ingest_byte_metrics;
 pub mod ingest_concurrency;
+pub mod ingest_decode;
+pub mod ingest_mode;
 pub mod lifecycle_refresh;
 pub mod logs_ingest;
 pub mod maintain;

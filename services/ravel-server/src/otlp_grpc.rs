@@ -7,13 +7,15 @@ use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::
 use opentelemetry_proto::tonic::collector::metrics::v1::{
     ExportMetricsServiceRequest, ExportMetricsServiceResponse,
 };
-use ravel_ingest::{RequestRejection, WriteError};
+use ravel_ingest::WriteError;
 use ravel_types::Signal;
 use tonic::metadata::{KeyAndValueRef, MetadataMap, MetadataValue};
 use tonic::{Request, Response, Status};
 
 use crate::ingest::IngestRequestError;
-use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, now_ns, resolve_write_mode};
+use crate::ingest_admission::{admission_rejection_status, pending_ack_shed_status};
+use crate::ingest_mode::resolve_write_mode;
+use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, now_ns};
 use crate::wire_byte_count::wire_request_bytes;
 
 pub struct GrpcMetricsService {
@@ -43,37 +45,6 @@ pub(crate) fn metadata_to_headers(metadata: &MetadataMap) -> HeaderMap {
         }
     }
     headers
-}
-
-/// A layer-2/layer-4 whole-request rejection (ADR-0051 section 1) as a gRPC
-/// status: `RESOURCE_EXHAUSTED`, no retry-info attached (the ADR's gRPC
-/// column carries no header equivalent to HTTP's `Retry-After`). Shared by
-/// every gRPC ingest service.
-pub(crate) fn admission_rejection_status(rejection: RequestRejection) -> Status {
-    Status::resource_exhausted(rejection.reason.to_string())
-}
-
-/// A shed over the process-wide in-flight ceiling, as
-/// `RESOURCE_EXHAUSTED`: before tenant resolution or any per-signal
-/// admission check, so a shed request touches no shard and carries no commit
-/// token. Shared by every gRPC ingest service, the same discipline
-/// [`admission_rejection_status`] follows.
-pub(crate) fn ingest_concurrency_shed_status() -> Status {
-    Status::resource_exhausted("process in-flight ingest-request limit reached")
-}
-
-/// A strict write refused by the process-wide pending strict-acknowledgement
-/// bound, as `RESOURCE_EXHAUSTED` with the HTTP body's message. Shared by
-/// every gRPC ingest service.
-pub(crate) fn pending_ack_shed_status() -> Status {
-    Status::resource_exhausted(crate::otlp_http::PENDING_ACK_SHED_MESSAGE)
-}
-
-/// A request whose tenant credential did not resolve, as `UNAUTHENTICATED`.
-/// Shared by `GrpcIngestAdmissionLayer` and every gRPC ingest handler, so a
-/// client sees one status and one message whichever of them refused it.
-pub(crate) fn unauthenticated_status() -> Status {
-    Status::unauthenticated("invalid or missing tenant credentials")
 }
 
 #[tonic::async_trait]

@@ -11,6 +11,7 @@
 use std::fs;
 
 const INGEST_ADMISSION_PATH_FILES: &[&str] = &[
+    "src/ingest_admission.rs",
     "src/otlp_grpc.rs",
     "src/otlp_grpc_logs.rs",
     "src/otlp_grpc_traces.rs",

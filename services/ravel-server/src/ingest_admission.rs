@@ -58,6 +58,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
+use ravel_ingest::RequestRejection;
 use ravel_query::http::TenantResolver;
 use ravel_types::TenantId;
 use tonic::Status;
@@ -252,7 +253,7 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
 ) -> Response {
     let permit = match state.ingest_concurrency().try_admit() {
         Ok(permit) => IngestPermitHandle::new(permit),
-        Err(_) => return crate::otlp_http::ingest_concurrency_shed_response(),
+        Err(_) => return ingest_concurrency_shed_response(),
     };
 
     let tenant = match state.tenant_resolver().resolve(request.headers()) {
@@ -296,7 +297,7 @@ pub(crate) fn admit_grpc_request<T>(
     controller
         .try_admit()
         .map(IngestPermitHandle::new)
-        .map_err(|_| crate::otlp_grpc::ingest_concurrency_shed_status())
+        .map_err(|_| ingest_concurrency_shed_status())
 }
 
 /// The tenant for a gRPC ingest request: the one [`GrpcIngestAdmissionLayer`]
@@ -312,7 +313,7 @@ pub(crate) fn grpc_request_tenant<T>(
     }
     resolver
         .resolve(headers)
-        .map_err(|_| crate::otlp_grpc::unauthenticated_status())
+        .map_err(|_| unauthenticated_status())
 }
 
 /// Resolves the tenant from a gRPC request head exactly as a handler resolves
@@ -326,7 +327,7 @@ fn grpc_head_tenant(
     let metadata = tonic::metadata::MetadataMap::from_headers(headers.clone());
     resolver
         .resolve(&crate::otlp_grpc::metadata_to_headers(&metadata))
-        .map_err(|_| crate::otlp_grpc::unauthenticated_status())
+        .map_err(|_| unauthenticated_status())
 }
 
 /// A [`tower::Layer`] for the tonic ingest listener. When a unary OTLP
@@ -476,10 +477,137 @@ where
 
 /// The shed refusal as a complete gRPC response: a 200 HTTP response whose
 /// trailers carry `grpc-status: 8` (RESOURCE_EXHAUSTED), built from the same
-/// [`crate::otlp_grpc::ingest_concurrency_shed_status`] the handlers return,
+/// [`ingest_concurrency_shed_status`] the handlers return,
 /// so a client sees one status and one message whichever layer refused it.
 fn grpc_shed_response() -> http::Response<TonicBody> {
-    crate::otlp_grpc::ingest_concurrency_shed_status().into_http()
+    ingest_concurrency_shed_status().into_http()
+}
+
+/// Turn a layer-2/layer-4 whole-request rejection into the ADR-0051 HTTP
+/// response: 429 with `Retry-After` in whole seconds (rounded up, minimum
+/// 1), the reason as the body.
+pub(crate) fn admission_rejection_response(rejection: RequestRejection) -> Response {
+    let mut response =
+        (StatusCode::TOO_MANY_REQUESTS, rejection.reason.to_string()).into_response();
+    let retry_after_secs = retry_after_seconds(rejection.retry_after_ns);
+    if let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+pub(crate) fn retry_after_seconds(retry_after_ns: i64) -> u64 {
+    let ns = retry_after_ns.max(0) as u64;
+    ns.div_ceil(1_000_000_000).max(1)
+}
+
+/// A fixed `Retry-After` for the process-wide in-flight shed: the
+/// controller tracks no per-caller refill time the way `RequestRejection`
+/// does, and a slot can free up as soon as any in-flight request completes,
+/// so a short fixed wait is the right shape here (no per-error estimate is
+/// available, the same situation `remote_write::RETRY_AFTER_SECONDS`
+/// documents).
+const INGEST_CONCURRENCY_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// 429 for a request shed by the process-wide in-flight ceiling, before
+/// tenant resolution or any per-signal admission check: no shard is touched
+/// and no commit token is issued.
+pub(crate) fn ingest_concurrency_shed_response() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "process in-flight ingest-request limit reached",
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// The body of a strict write refused by the process-wide pending
+/// strict-acknowledgement bound (`--max-pending-strict-acks`). Shared with the
+/// gRPC status message so both transports say the same thing.
+pub(crate) const PENDING_ACK_SHED_MESSAGE: &str =
+    "process pending strict-acknowledgement limit reached";
+
+/// 429 for a strict write refused by the pending strict-acknowledgement bound
+/// (ADR-2793 decision 4): the same status and `Retry-After` as the in-flight
+/// shed, since a held acknowledgement frees as soon as any strict write
+/// resolves. The refusal comes inside `submit`, after decode and before the
+/// byte charge, so no shard was touched and no commit token issued.
+pub(crate) fn pending_ack_shed_response() -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, PENDING_ACK_SHED_MESSAGE).into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// A fixed `Retry-After` for the process-wide ingest buffer byte budget shed
+/// (ADR-0069): like the in-flight shed above, the budget tracks no per-caller
+/// refill time -- a buffer slot frees as soon as any in-flight flush completes
+/// -- so a short fixed wait is the right shape.
+const INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS: u64 = 1;
+
+/// 429 for a request shed by the process-wide ingest buffer byte budget
+/// (ADR-0069 decision 1): the write was rejected before any buffering, so no
+/// shard was touched and no commit token issued. Same 429 + `Retry-After`
+/// shape as the byte-rate rejection and the in-flight shed.
+pub(crate) fn ingest_buffer_budget_shed_response() -> Response {
+    let mut response = (
+        StatusCode::TOO_MANY_REQUESTS,
+        "ingest buffer byte budget reached",
+    )
+        .into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// 429 for a write refused because a shard it routes to has a flush deferred
+/// for the whole flush deferral cap: refused before any buffering, like the
+/// budget shed above, and answered with the same shape. `message` is the
+/// write error's own text, which names the cap.
+pub(crate) fn ingest_deferral_cap_response(message: String) -> Response {
+    let mut response = (StatusCode::TOO_MANY_REQUESTS, message).into_response();
+    if let Ok(value) = HeaderValue::from_str(&INGEST_BUFFER_BUDGET_RETRY_AFTER_SECONDS.to_string())
+    {
+        response.headers_mut().insert(header::RETRY_AFTER, value);
+    }
+    response
+}
+
+/// A layer-2/layer-4 whole-request rejection (ADR-0051 section 1) as a gRPC
+/// status: `RESOURCE_EXHAUSTED`, no retry-info attached (the ADR's gRPC
+/// column carries no header equivalent to HTTP's `Retry-After`). Shared by
+/// every gRPC ingest service.
+pub(crate) fn admission_rejection_status(rejection: RequestRejection) -> Status {
+    Status::resource_exhausted(rejection.reason.to_string())
+}
+
+/// A shed over the process-wide in-flight ceiling, as
+/// `RESOURCE_EXHAUSTED`: before tenant resolution or any per-signal
+/// admission check, so a shed request touches no shard and carries no commit
+/// token. Shared by every gRPC ingest service, the same discipline
+/// [`admission_rejection_status`] follows.
+pub(crate) fn ingest_concurrency_shed_status() -> Status {
+    Status::resource_exhausted("process in-flight ingest-request limit reached")
+}
+
+/// A strict write refused by the process-wide pending strict-acknowledgement
+/// bound, as `RESOURCE_EXHAUSTED` with the HTTP body's message. Shared by
+/// every gRPC ingest service.
+pub(crate) fn pending_ack_shed_status() -> Status {
+    Status::resource_exhausted(PENDING_ACK_SHED_MESSAGE)
+}
+
+/// A request whose tenant credential did not resolve, as `UNAUTHENTICATED`.
+/// Shared by `GrpcIngestAdmissionLayer` and every gRPC ingest handler, so a
+/// client sees one status and one message whichever of them refused it.
+pub(crate) fn unauthenticated_status() -> Status {
+    Status::unauthenticated("invalid or missing tenant credentials")
 }
 
 #[cfg(test)]
@@ -491,6 +619,7 @@ mod tests {
 
     use bytes::Bytes;
     use http_body::{Body, Frame, SizeHint};
+    use ravel_ingest::{LogWriteError, SpanWriteError, WriteError};
     use ravel_query::http::StaticBearerTokenResolver;
 
     use super::*;
@@ -1194,6 +1323,25 @@ mod tests {
         assert_eq!(
             status.message(),
             "process in-flight ingest-request limit reached"
+        );
+    }
+
+    /// A write refused at the flush deferral cap is a 429 with `Retry-After`
+    /// whose body is the write error's text, which names the cap.
+    #[test]
+    fn a_deferral_cap_refusal_is_429_with_retry_after() {
+        let response = ingest_deferral_cap_response(WriteError::DeferralCapReached.to_string());
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().contains_key(header::RETRY_AFTER));
+        assert!(
+            LogWriteError::DeferralCapReached
+                .to_string()
+                .contains("deferral cap")
+        );
+        assert!(
+            SpanWriteError::DeferralCapReached
+                .to_string()
+                .contains("deferral cap")
         );
     }
 }
