@@ -70,6 +70,19 @@ async fn limit_before_stats_stays_under_the_aggregate_in_the_optimized_plan() {
 
     let outcome = run(&fixture, source).await.expect("runs");
     assert_eq!(rows(&outcome), vec![vec!["3".to_string()]]);
+
+    // The two latest rows are e (22:15:10) and f (22:15:20); a LIMIT moved
+    // above the aggregate would read a (22:13:00) instead.
+    let outcome = run(
+        &fixture,
+        "FROM logs | SORT @timestamp DESC | LIMIT 2 | STATS lo = MIN(@timestamp)",
+    )
+    .await
+    .expect("runs");
+    assert_eq!(
+        rows(&outcome),
+        vec![vec!["2023-11-14T22:15:10".to_string()]]
+    );
 }
 
 #[tokio::test]
@@ -169,7 +182,7 @@ async fn a_lowering_calling_a_function_off_its_policy_is_refused() {
         min_tokens: Vec::new(),
         now_ns: NOW,
         deadline: support::request().deadline,
-        row_window: false,
+        row_window: true,
         max_rows: None,
         budgets: None,
     };
@@ -191,7 +204,7 @@ async fn a_lowering_calling_a_function_off_its_policy_is_refused() {
         window,
         TimeRange {
             start_ns: 0,
-            end_ns: NOW
+            end_ns: NOW + 1
         }
     );
 }

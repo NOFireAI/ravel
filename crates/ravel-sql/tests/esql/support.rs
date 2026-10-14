@@ -1,6 +1,8 @@
-//! The shared fixture of the ES|QL tests: six log records over three minutes
-//! for one tenant, published to a `MemoryStore`, and a `SqlExecutor` with two
-//! declared columns.
+//! The shared fixtures of the ES|QL tests, each published to a `MemoryStore`
+//! for one tenant and read by a `SqlExecutor` with two declared columns:
+//! [`fixture`], six log records over three minutes in one segment, and
+//! [`segmented_fixture`], records on both sides of the query clock laid out
+//! as two segments or as one.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,7 +19,9 @@ use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_by
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{LogSegmentFetcher, PhaseAccounting, SegmentFetcher};
-use ravel_sql::esql::{self, EsqlError, EsqlOutcome, EsqlRequest, PrepareContext, PreparedEsql};
+use ravel_sql::esql::{
+    self, EsqlError, EsqlOutcome, EsqlRequest, EsqlRun, PrepareContext, PreparedEsql,
+};
 use ravel_sql::{
     CeilingBreach, DeclaredColumn, DeclaredType, LiveAccounting, LogsTableProvider, SessionTable,
     SpanSegmentFetcher, SpillDecision, SqlConfig, SqlExecutor, StaticDeclaredColumns,
@@ -133,7 +137,14 @@ fn records() -> Vec<LogRecord> {
         .collect()
 }
 
-async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId, records: &[LogRecord]) {
+/// Publish `records` as one RLOG object under one commit record, the
+/// `writer_seq`-th of the fixture's writer.
+async fn publish_logs(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    records: &[LogRecord],
+    writer_seq: u64,
+) {
     let mut w = RlogWriter::new(
         RlogConfig::default(),
         ObjectIdentity {
@@ -141,7 +152,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId, records
             shard: 0,
             writer_id: [3u8; 16],
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
         },
     );
     for r in records {
@@ -156,7 +167,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId, records
         shard: 0,
         writer_id: Uuid::from_u128(2_891),
         writer_epoch: 1,
-        writer_seq: 1,
+        writer_seq,
         object_size: bytes.len() as u64,
         content_hash: [7u8; 32],
         sample_count: records.len() as u64,
@@ -189,7 +200,148 @@ pub struct Fixture {
 
 pub async fn fixture() -> Fixture {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-    publish_logs(store.as_ref(), &tenant(), &records()).await;
+    publish_logs(store.as_ref(), &tenant(), &records(), 1).await;
+    executor_over(store)
+}
+
+/// One record of the segmented fixture.
+pub struct Event {
+    pub ts: i64,
+    pub severity: u8,
+    pub body: &'static str,
+}
+
+/// Segment A of the segmented fixture: from 30 s before the query clock to
+/// 10 s after it, one record exactly at it.
+pub const SEGMENT_A: [Event; 4] = [
+    Event {
+        ts: NOW - 30 * SECOND,
+        severity: 9,
+        body: "a1",
+    },
+    Event {
+        ts: NOW - 10 * SECOND,
+        severity: 3,
+        body: "a2",
+    },
+    Event {
+        ts: NOW,
+        severity: 11,
+        body: "a3",
+    },
+    Event {
+        ts: NOW + 10 * SECOND,
+        severity: 7,
+        body: "a4",
+    },
+];
+
+/// Segment B of the segmented fixture: from 300 s to 310 s after the query
+/// clock.
+pub const SEGMENT_B: [Event; 3] = [
+    Event {
+        ts: NOW + 300 * SECOND,
+        severity: 5,
+        body: "b1",
+    },
+    Event {
+        ts: NOW + 305 * SECOND,
+        severity: 13,
+        body: "b2",
+    },
+    Event {
+        ts: NOW + 310 * SECOND,
+        severity: 1,
+        body: "b3",
+    },
+];
+
+/// How the segmented fixture lays [`SEGMENT_A`] and [`SEGMENT_B`] out.
+#[derive(Debug, Clone, Copy)]
+pub enum Layout {
+    /// Two commit records, one object each.
+    Split,
+    /// One commit record holding every event, as after compaction.
+    Merged,
+}
+
+pub const LAYOUTS: [Layout; 2] = [Layout::Split, Layout::Merged];
+
+fn event_records(events: &[&Event]) -> Vec<LogRecord> {
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("segmented".to_string()),
+    )];
+    events
+        .iter()
+        .map(|event| LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: event.ts,
+            observed_ts_ns: event.ts,
+            severity_num: event.severity,
+            severity_text: "INFO".into(),
+            body: event.body.into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .collect()
+}
+
+/// [`SEGMENT_A`] and [`SEGMENT_B`] published under `layout`, each commit
+/// record stamped with the ingest hour of its own events.
+pub async fn segmented_fixture(layout: Layout) -> Fixture {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let a: Vec<&Event> = SEGMENT_A.iter().collect();
+    let b: Vec<&Event> = SEGMENT_B.iter().collect();
+    match layout {
+        Layout::Split => {
+            publish_logs(store.as_ref(), &tenant(), &event_records(&a), 1).await;
+            publish_logs(store.as_ref(), &tenant(), &event_records(&b), 2).await;
+        }
+        Layout::Merged => {
+            let all: Vec<&Event> = a.into_iter().chain(b).collect();
+            publish_logs(store.as_ref(), &tenant(), &event_records(&all), 1).await;
+        }
+    }
+    executor_over(store)
+}
+
+/// The number of segments the layout publishes.
+pub fn segment_count(layout: Layout) -> usize {
+    match layout {
+        Layout::Split => 2,
+        Layout::Merged => 1,
+    }
+}
+
+/// Run `source` with the request's `start` and `end`.
+pub async fn run_with_range(
+    fixture: &Fixture,
+    source: &str,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> Result<EsqlOutcome, EsqlError> {
+    let ctx = PrepareContext {
+        start,
+        end,
+        ..context()
+    };
+    let prepared = esql::prepare(source, &ravel_esql::Limits::default(), &ctx)?;
+    run_prepared(fixture, &prepared).await
+}
+
+/// The segments the catalog resolved for `outcome`.
+pub fn segments(outcome: &EsqlOutcome) -> usize {
+    match &outcome.run {
+        EsqlRun::Catalog(outcome) => outcome.stats.segments,
+        EsqlRun::Row(_) => panic!("a ROW statement resolves no segments"),
+    }
+}
+
+fn executor_over(store: Arc<dyn ObjectStoreBackend>) -> Fixture {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(

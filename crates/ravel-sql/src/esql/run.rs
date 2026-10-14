@@ -59,7 +59,9 @@ impl EsqlOutcome {
 /// Run `prepared` for `tenant`.
 ///
 /// A `FROM logs` statement runs through
-/// [`SqlExecutor::execute_statement_accounted`] over the statement's window.
+/// [`SqlExecutor::execute_statement_accounted`] over the statement's window,
+/// which selects the segments the catalog lists and also filters the rows, so
+/// no row outside the window is returned whatever the segment layout.
 ///
 /// A `ROW` statement reads no table, so it resolves no snapshot: it runs as a
 /// `Values` plan in a session that registers no table, built from the
@@ -82,7 +84,7 @@ pub async fn execute(
                 min_tokens: request.min_tokens.clone(),
                 now_ns: prepared.now_ns,
                 deadline: request.deadline,
-                row_window: false,
+                row_window: true,
                 max_rows: None,
                 budgets: request.budgets,
             };

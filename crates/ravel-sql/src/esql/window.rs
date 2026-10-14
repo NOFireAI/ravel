@@ -1,5 +1,16 @@
 //! The time window a `FROM logs` statement reads (ADR-2887 D11), derived from
 //! its own `@timestamp` bounds.
+//!
+//! The executor applies the window twice: the catalog lists the segments whose
+//! event-time range overlaps it, and a row filter on `ts` above the scan keeps
+//! only the rows inside it (`StatementRequest::row_window`). So a row outside
+//! the window is never returned, however the rows are laid out in segments.
+//!
+//! The bounds the window fills in are therefore filters too. A statement with
+//! no upper bound, and a request with no end, returns no row timestamped after
+//! the query clock; Elasticsearch returns such future-dated documents. A
+//! statement with no lower bound, and a request with no start, returns no row
+//! timestamped before the Unix epoch.
 
 use datafusion::common::ScalarValue;
 use datafusion::logical_expr::Operator;
@@ -58,19 +69,30 @@ impl WindowBounds {
         self.closed = true;
     }
 
-    /// The window: the bounds read, a lower bound alone ending at `now_ns`
-    /// and no lower bound starting at the epoch, narrowed by the request's
-    /// half-open `[start, end)`. An empty intersection is a one-point window
-    /// at its start, which the filters then empty.
+    /// The half-open window `[start_ns, end_ns)` the executor's row filter
+    /// applies. The catalog lists segments on the same two bounds, closed,
+    /// which only widens what it lists.
+    ///
+    /// The start is the statement's lower bound, else the Unix epoch, raised to
+    /// the request's inclusive `start`. The end is the statement's inclusive
+    /// upper bound plus one, lowered to the request's exclusive `end`; a
+    /// request `end` is a stated upper bound of its own. With neither, the
+    /// window ends one nanosecond after `now_ns`, so a row at the query clock
+    /// is kept and a row after it is not. An end at or before the start
+    /// collapses the window to the empty `[start, start)`: the catalog lists
+    /// the segments covering that instant and the row filter keeps none of
+    /// their rows.
     pub(crate) fn resolve(&self, now_ns: i64, start: Option<i64>, end: Option<i64>) -> TimeRange {
         let mut start_ns = self.lower.unwrap_or(0);
-        let mut end_ns = self.upper.unwrap_or(now_ns);
         if let Some(start) = start {
             start_ns = start_ns.max(start);
         }
-        if let Some(end) = end {
-            end_ns = end_ns.min(end.saturating_sub(1));
-        }
+        let end_ns = match (self.upper.map(|upper| upper.saturating_add(1)), end) {
+            (Some(upper), Some(end)) => upper.min(end),
+            (Some(upper), None) => upper,
+            (None, Some(end)) => end,
+            (None, None) => now_ns.saturating_add(1),
+        };
         TimeRange {
             start_ns,
             end_ns: end_ns.max(start_ns),

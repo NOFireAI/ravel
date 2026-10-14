@@ -12,10 +12,12 @@
 //!
 //! A `FROM logs` statement reads its window from the conjunctive `@timestamp`
 //! bounds of the `WHERE` stages ahead of the first `LIMIT`, `STATS` or stage
-//! that redefines `@timestamp`; a lower bound alone ends at the query clock,
-//! and no lower bound starts at the epoch. The request's own start and end
-//! narrow that window and are applied as a filter; every `WHERE` stays a
-//! filter as well, so the window only selects what the catalog resolves.
+//! that redefines `@timestamp`, intersected with the request's own start and
+//! end. With no upper bound from either, it ends at the query clock; with no
+//! lower bound from either, it starts at the epoch. The window selects the
+//! segments the catalog resolves and is also applied as a row filter, so the
+//! bounds it fills in are filters: see the `window` module for what that
+//! excludes. Every `WHERE` stays a filter as well.
 //!
 //! Integer overflow, an integer division or remainder by zero, and a double
 //! result that is not finite all read null, as in ES|QL. ES|QL also attaches
@@ -107,7 +109,8 @@ pub fn prepare(
 }
 
 impl PreparedEsql {
-    /// The window the catalog resolves, or `None` for a `ROW` statement.
+    /// The half-open window `[start_ns, end_ns)` the catalog resolves and the
+    /// rows are filtered to, or `None` for a `ROW` statement.
     pub fn window(&self) -> Option<TimeRange> {
         self.window
     }
