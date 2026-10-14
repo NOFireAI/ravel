@@ -77,12 +77,40 @@ the permit is taken from the request head, before the request body is read or
 decoded, and the tenant credential is checked right after it in the same
 place: on the HTTP surfaces by a middleware layer that runs ahead of the body
 extractor, and on the gRPC OTLP services by a tower layer on the listener that
-runs before tonic reads a body frame. So a shed request costs this process the
-bytes of one request head, an unauthenticated caller cannot make it buffer a
-body or inflate a compressed one, and the ceiling bounds concurrent decode
-rather than following it. A refusal keeps its status and message:
-`RESOURCE_EXHAUSTED` for a shed, and `UNAUTHENTICATED` with "invalid or
-missing tenant credentials" for bad credentials on gRPC.
+runs before tonic reads a body frame. So a shed request is never decoded or
+charged, an unauthenticated caller cannot make this process read, buffer or
+inflate a body, and the ceiling bounds concurrent decode rather than following
+it. A refusal keeps its status and message: `RESOURCE_EXHAUSTED` for a shed,
+and `UNAUTHENTICATED` with "invalid or missing tenant credentials" for bad
+credentials on gRPC.
+
+An HTTP/1 server that answers and closes a connection with request bytes still
+unread can reach the client as a reset or a broken pipe instead of the
+response, and a pooled HTTP/1.1 client that is still uploading sees exactly
+that. So when the HTTP layer sheds a request, it reads the request body and
+discards it before sending the 429, if the caller is authenticated: the
+credential is checked on the head with no side effect (no rejected-request
+count moves), and an unauthenticated caller's body is never read. A drained
+body is never inflated, decoded or charged to the byte budget, and the drain
+holds no admission permit. Three fixed bounds apply, constants in
+`ingest_admission.rs` rather than flags: at most 1 MiB of body as sent (before
+any inflate), at most 1 second, and at most 64 drains at once in the process,
+a slot taken without waiting. A drained 429 is answered as before; a shed it
+does not drain keeps its status, `Retry-After` and body and adds
+`Connection: close`. The first reason that applies is counted in
+`ravel_ingest_head_refusal_undrained_total{reason}`, checked in this order:
+`unauthenticated` (the credential did not resolve), `over_cap` (the
+`Content-Length` is above 1 MiB, nothing read), `busy` (no drain slot free),
+then, during the drain, `over_cap` (a chunked body passed 1 MiB) or `timeout`
+(the body did not finish within 1 second). `Connection: close` does not
+prevent the reset: a client still uploading when the connection closes can
+see a transport error regardless. An HTTP/2 shed refuses one stream and keeps
+the connection, so it is answered with no drain, no `Connection` header, and
+no count; so is a request waiting on `Expect: 100-continue`, which has sent no
+body yet (it gets `Connection: close` and is not counted). The 401, the 413
+for a body above the request size limit, the 503 for a body that does not
+arrive in time, gRPC, OTAP, and the 429s a handler returns after decode are
+unchanged.
 
 The permit covers decode through enqueue. It is returned as soon as the
 request's points are enqueued on their shards, before a strict write's

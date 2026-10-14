@@ -21,6 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
+use crate::ingest_admission::HeadRefusalDrain;
+
 /// `--max-inflight-ingest-requests`: `Bounded(n)` caps process-wide in-flight
 /// ingest requests at `n`; `Unlimited` (the flag's `0` value) disables the
 /// gate, matching every other admission ceiling in this crate that spells
@@ -42,6 +44,7 @@ pub struct IngestConcurrencyController {
     /// sheds. `Some` holds the bound as the semaphore's starting permit count.
     semaphore: Option<Arc<Semaphore>>,
     shed_total: AtomicU64,
+    head_refusal_drain: HeadRefusalDrain,
 }
 
 /// A held admission slot. Carries no reference back to the controller: the
@@ -103,6 +106,7 @@ impl IngestConcurrencyController {
         IngestConcurrencyController {
             semaphore,
             shed_total: AtomicU64::new(0),
+            head_refusal_drain: HeadRefusalDrain::default(),
         }
     }
 
@@ -111,12 +115,14 @@ impl IngestConcurrencyController {
     }
 
     /// Admits the caller immediately or sheds it: this never queues. Call
-    /// this on the request head, before the body is read and before tenant
-    /// resolution or any per-signal admission check, so a shed request does
-    /// none of that work and reaches neither a shard channel nor a commit
-    /// token. The transport layers in `crate::ingest_admission` do this for
-    /// every ingest route; a handler takes a permit itself only when no
-    /// layer did.
+    /// this on the request head, before the body is read, before tenant
+    /// resolution and before any per-signal admission check, so a shed
+    /// request is never decoded or charged and reaches neither a shard channel
+    /// nor a commit token. The HTTP layer then checks the shed request's
+    /// credential, with no side effect, only to decide whether to read and
+    /// discard its body before answering (`crate::ingest_admission`). The
+    /// transport layers there call this for every ingest route; a handler
+    /// takes a permit itself only when no layer did.
     pub fn try_admit(&self) -> Result<IngestPermit, IngestShed> {
         let Some(semaphore) = &self.semaphore else {
             return Ok(IngestPermit { _permit: None });
@@ -139,6 +145,12 @@ impl IngestConcurrencyController {
     /// (`services/ravel-server/src/metrics.rs`).
     pub fn shed_total(&self) -> u64 {
         self.shed_total.load(Ordering::Relaxed)
+    }
+
+    /// The drain slots and undrained-refusal counts the HTTP ingest layer
+    /// uses when it answers a shed request (`crate::ingest_admission`).
+    pub fn head_refusal_drain(&self) -> &HeadRefusalDrain {
+        &self.head_refusal_drain
     }
 }
 

@@ -45,10 +45,19 @@
 //! the body is received, so both layers also bound that wait with
 //! [`INGEST_BODY_READ_TIMEOUT`]. Without the bound a client could hold every
 //! permit by sending request heads and then trickling their bodies.
+//!
+//! A shed is still decided from the head, before the body is read. Once
+//! decided, an authenticated HTTP/1 shed request's body is read and
+//! discarded, never decoded or charged, before the 429 is sent
+//! ([`refuse_from_head`], issue #2926): an HTTP/1 server that answers and
+//! closes with request bytes unread can reach a pooled client as a reset
+//! rather than the refusal. The drain is bounded in bytes, time and
+//! concurrency; a refusal it does not drain carries `Connection: close` and
+//! is counted by `ravel_ingest_head_refusal_undrained_total`.
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -61,6 +70,7 @@ use http_body::{Body as HttpBody, Frame, SizeHint};
 use ravel_ingest::RequestRejection;
 use ravel_query::http::TenantResolver;
 use ravel_types::TenantId;
+use tokio::sync::Semaphore;
 use tonic::Status;
 use tonic::body::Body as TonicBody;
 use tower::{Layer, Service};
@@ -214,6 +224,200 @@ fn body_timeout_status() -> Status {
     Status::deadline_exceeded(BodyReadTimedOut.to_string())
 }
 
+/// Most body bytes, as sent on the wire and before any inflate, that
+/// [`refuse_from_head`] reads and discards before answering. A request
+/// declaring more in its `Content-Length` is not read at all; a chunked body
+/// that passes this mid-drain is abandoned.
+pub const HEAD_REFUSAL_DRAIN_MAX_BYTES: u64 = 1024 * 1024;
+
+/// How long [`refuse_from_head`] waits for the rest of a refused request's
+/// body before answering without it.
+pub const HEAD_REFUSAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Process-wide count of head-refusal drains that may run at once. A refusal
+/// that finds every slot taken is answered without a drain.
+pub const HEAD_REFUSAL_DRAIN_MAX_CONCURRENT: usize = 64;
+
+/// Why a head refusal on HTTP/1 was answered with the body left unread, the
+/// `reason` label of `ravel_ingest_head_refusal_undrained_total`. The
+/// variants are listed in the order [`refuse_from_head`] checks them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UndrainedReason {
+    /// The credential on the head did not resolve to a tenant.
+    Unauthenticated,
+    /// The body is larger than [`HEAD_REFUSAL_DRAIN_MAX_BYTES`], by its
+    /// `Content-Length` or as it arrived.
+    OverCap,
+    /// All [`HEAD_REFUSAL_DRAIN_MAX_CONCURRENT`] drain slots were taken.
+    Busy,
+    /// The body did not finish within [`HEAD_REFUSAL_DRAIN_TIMEOUT`].
+    Timeout,
+}
+
+impl UndrainedReason {
+    pub const ALL: [UndrainedReason; 4] = [
+        UndrainedReason::Unauthenticated,
+        UndrainedReason::OverCap,
+        UndrainedReason::Busy,
+        UndrainedReason::Timeout,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UndrainedReason::Unauthenticated => "unauthenticated",
+            UndrainedReason::OverCap => "over_cap",
+            UndrainedReason::Busy => "busy",
+            UndrainedReason::Timeout => "timeout",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            UndrainedReason::Unauthenticated => 0,
+            UndrainedReason::OverCap => 1,
+            UndrainedReason::Busy => 2,
+            UndrainedReason::Timeout => 3,
+        }
+    }
+}
+
+/// The process-wide state of head-refusal drains: the slots bounding how many
+/// run at once, and the count of refusals answered without one. Owned by the
+/// one [`IngestConcurrencyController`] a process builds, so every listener and
+/// both HTTP ingest surfaces share it.
+pub struct HeadRefusalDrain {
+    slots: Arc<Semaphore>,
+    undrained: [AtomicU64; 4],
+}
+
+impl Default for HeadRefusalDrain {
+    fn default() -> Self {
+        HeadRefusalDrain {
+            slots: Arc::new(Semaphore::new(HEAD_REFUSAL_DRAIN_MAX_CONCURRENT)),
+            undrained: Default::default(),
+        }
+    }
+}
+
+impl HeadRefusalDrain {
+    /// Head refusals answered without a drain for `reason` since process
+    /// start, for the `/metrics` counter.
+    pub fn undrained_total(&self, reason: UndrainedReason) -> u64 {
+        self.undrained[reason.index()].load(Ordering::Relaxed)
+    }
+
+    fn undrained(&self, reason: UndrainedReason, refusal: Response) -> Response {
+        self.undrained[reason.index()].fetch_add(1, Ordering::Relaxed);
+        with_connection_close(refusal)
+    }
+}
+
+/// Adds `Connection: close` to a refusal whose request body stays unread, so
+/// an HTTP/1.1 client knows not to reuse the connection. It does not stop the
+/// reset: closing a socket with unread bytes in its receive buffer sends RST,
+/// which can reach the client before it reads this response.
+fn with_connection_close(mut refusal: Response) -> Response {
+    refusal
+        .headers_mut()
+        .insert(header::CONNECTION, HeaderValue::from_static("close"));
+    refusal
+}
+
+/// Why a drain stopped before the body ended.
+enum DrainStopped {
+    OverCap,
+    BodyError,
+}
+
+/// Reads and drops `body` until it ends. Data frames are counted and never
+/// kept, inflated or decoded.
+async fn discard_body(mut body: axum::body::Body) -> Result<(), DrainStopped> {
+    let mut read: u64 = 0;
+    while let Some(frame) = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await {
+        let frame = frame.map_err(|_| DrainStopped::BodyError)?;
+        if let Some(data) = frame.data_ref() {
+            read = read.saturating_add(data.len() as u64);
+            if read > HEAD_REFUSAL_DRAIN_MAX_BYTES {
+                return Err(DrainStopped::OverCap);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Answers `refusal`, a response decided from `request`'s head, after reading
+/// and discarding the body the client is sending, so a pooled HTTP/1.1 client
+/// reads the refusal instead of a reset on a connection closed with its
+/// upload unread. The body is never inflated, decoded or charged to any
+/// budget.
+///
+/// Holds no admission permit while it reads. A caller that took this
+/// request's in-flight permit must release it before calling this; any
+/// [`IngestPermitHeld`] handle still in the request's extensions is released
+/// here before the first byte is read, so a slow sender cannot hold a slot of
+/// the ceiling through its own refusal.
+///
+/// Only an HTTP/1 request whose credential `authenticated` accepts is
+/// drained, and the first of these to apply decides:
+///
+/// 1. HTTP/2 and later: answered as is, uncounted, since a stream reset
+///    leaves the connection usable and a `Connection` header is invalid.
+/// 2. `Expect: 100-continue`: answered with `Connection: close`, uncounted.
+///    The client sends nothing until it sees `100 Continue`, which reading the
+///    body would solicit, so there are no unread bytes to drain.
+/// 3. Not authenticated: `unauthenticated`.
+/// 4. `Content-Length` above [`HEAD_REFUSAL_DRAIN_MAX_BYTES`], with nothing
+///    read: `over_cap`.
+/// 5. No free drain slot ([`HEAD_REFUSAL_DRAIN_MAX_CONCURRENT`]): `busy`.
+/// 6. While draining, the body passes the cap (`over_cap`) or does not end
+///    within [`HEAD_REFUSAL_DRAIN_TIMEOUT`] (`timeout`).
+///
+/// Cases 3 to 6 add `Connection: close` and count one under
+/// `ravel_ingest_head_refusal_undrained_total`. A body that fails mid-drain
+/// (the client went away) also gets `Connection: close` and is not counted.
+pub(crate) async fn refuse_from_head(
+    drain: &HeadRefusalDrain,
+    request: Request,
+    refusal: Response,
+    authenticated: impl FnOnce(&HeaderMap) -> bool,
+) -> Response {
+    if let Some(IngestPermitHeld(handle)) = request.extensions().get::<IngestPermitHeld>() {
+        handle.release();
+    }
+    if !matches!(
+        request.version(),
+        http::Version::HTTP_10 | http::Version::HTTP_11
+    ) {
+        return refusal;
+    }
+    if expects_continue(request.headers()) {
+        return with_connection_close(refusal);
+    }
+    if !authenticated(request.headers()) {
+        return drain.undrained(UndrainedReason::Unauthenticated, refusal);
+    }
+    let body = request.into_body();
+    if body.size_hint().lower() > HEAD_REFUSAL_DRAIN_MAX_BYTES {
+        return drain.undrained(UndrainedReason::OverCap, refusal);
+    }
+    let Ok(_slot) = drain.slots.clone().try_acquire_owned() else {
+        return drain.undrained(UndrainedReason::Busy, refusal);
+    };
+    match tokio::time::timeout(HEAD_REFUSAL_DRAIN_TIMEOUT, discard_body(body)).await {
+        Ok(Ok(())) => refusal,
+        Ok(Err(DrainStopped::OverCap)) => drain.undrained(UndrainedReason::OverCap, refusal),
+        Ok(Err(DrainStopped::BodyError)) => with_connection_close(refusal),
+        Err(_) => drain.undrained(UndrainedReason::Timeout, refusal),
+    }
+}
+
+fn expects_continue(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::EXPECT)
+        .iter()
+        .any(|value| value.as_bytes().eq_ignore_ascii_case(b"100-continue"))
+}
+
 /// What the axum admission middleware needs from the state of whichever
 /// ingest surface it is wrapping: the shared ceiling and the tenant resolver.
 /// Implemented by `otlp_http::GatewayState` and
@@ -253,7 +457,16 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
 ) -> Response {
     let permit = match state.ingest_concurrency().try_admit() {
         Ok(permit) => IngestPermitHandle::new(permit),
-        Err(_) => return ingest_concurrency_shed_response(),
+        Err(_) => {
+            let resolver = state.tenant_resolver();
+            return refuse_from_head(
+                state.ingest_concurrency().head_refusal_drain(),
+                request,
+                ingest_concurrency_shed_response(),
+                |headers| resolver.resolve(headers).is_ok(),
+            )
+            .await;
+        }
     };
 
     let tenant = match state.tenant_resolver().resolve(request.headers()) {
@@ -1167,6 +1380,269 @@ mod tests {
             "the stalled upload's permit was released"
         );
         assert_eq!(controller.shed_total(), 0, "nothing was shed");
+    }
+
+    /// A chunked body with no length in its head: `chunks` frames of 64 KiB,
+    /// counting each frame it hands out in `polled`.
+    struct ChunkedBody {
+        chunks: usize,
+        polled: Arc<AtomicUsize>,
+    }
+
+    impl Body for ChunkedBody {
+        type Data = Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+            if self.chunks == 0 {
+                return Poll::Ready(None);
+            }
+            self.chunks -= 1;
+            self.polled.fetch_add(1, Ordering::SeqCst);
+            Poll::Ready(Some(Ok(Frame::data(Bytes::from(vec![0u8; 64 * 1024])))))
+        }
+    }
+
+    /// The undrained-refusal counts in [`UndrainedReason::ALL`] order:
+    /// unauthenticated, over_cap, busy, timeout.
+    fn undrained_counts(controller: &IngestConcurrencyController) -> [u64; 4] {
+        UndrainedReason::ALL.map(|reason| controller.head_refusal_drain().undrained_total(reason))
+    }
+
+    /// The shed refusal, drained or not: same status, `Retry-After` and body,
+    /// with `Connection: close` only when `connection_close`.
+    async fn assert_shed(response: Response, connection_close: bool) {
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let expected = connection_close.then(|| HeaderValue::from_static("close"));
+        assert_eq!(
+            response.headers().get(header::CONNECTION),
+            expected.as_ref()
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("refusal body reads");
+        assert_eq!(&body[..], b"process in-flight ingest-request limit reached");
+    }
+
+    /// An authenticated shed whose body fits under the drain cap, sized or
+    /// chunked, is read to its end and answered with the plain 429: no
+    /// `Connection: close`, and no undrained reason counted.
+    #[tokio::test(start_paused = true)]
+    async fn a_drained_shed_is_answered_without_connection_close() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let app = http_router(&controller);
+
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            app.clone()
+                .oneshot(http_upload(axum::body::Body::from(vec![0u8; 512 * 1024]))),
+        )
+        .await
+        .expect("answered")
+        .expect("infallible router");
+        assert_shed(response, false).await;
+
+        let polled = Arc::new(AtomicUsize::new(0));
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            app.oneshot(http_upload(axum::body::Body::new(ChunkedBody {
+                chunks: 8,
+                polled: polled.clone(),
+            }))),
+        )
+        .await
+        .expect("answered")
+        .expect("infallible router");
+        assert_shed(response, false).await;
+        assert_eq!(polled.load(Ordering::SeqCst), 8, "read to its end");
+
+        assert_eq!(undrained_counts(&controller), [0, 0, 0, 0]);
+        assert_eq!(controller.shed_total(), 2);
+    }
+
+    /// A chunked shed body is read only until it passes the 1 MiB cap: the
+    /// 17th 64 KiB frame of 32 crosses it, nothing after that is read, and the
+    /// refusal carries `Connection: close`, counted under `over_cap`.
+    #[tokio::test(start_paused = true)]
+    async fn a_chunked_shed_body_past_the_cap_stops_the_drain() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let polled = Arc::new(AtomicUsize::new(0));
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            http_router(&controller).oneshot(http_upload(axum::body::Body::new(ChunkedBody {
+                chunks: 32,
+                polled: polled.clone(),
+            }))),
+        )
+        .await
+        .expect("answered")
+        .expect("infallible router");
+
+        assert_shed(response, true).await;
+        assert_eq!(
+            polled.load(Ordering::SeqCst) as u64,
+            HEAD_REFUSAL_DRAIN_MAX_BYTES / (64 * 1024) + 1
+        );
+        assert_eq!(undrained_counts(&controller), [0, 1, 0, 0]);
+    }
+
+    /// Issue #2926, case E: with every drain slot taken, an authenticated
+    /// shed is answered at once with `Connection: close` and counted under
+    /// `busy`; the slot is taken with `try_acquire`, so the refusal never
+    /// waits for one. A body above the cap is still named `over_cap`, the
+    /// earlier reason. Once the slots are free again the next shed drains.
+    #[tokio::test(start_paused = true)]
+    async fn a_shed_with_no_drain_slot_free_is_answered_busy() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let app = http_router(&controller);
+        let held = controller
+            .head_refusal_drain()
+            .slots
+            .clone()
+            .try_acquire_many_owned(HEAD_REFUSAL_DRAIN_MAX_CONCURRENT as u32)
+            .expect("every drain slot is free");
+
+        let response = tokio::time::timeout(
+            TEST_DEADLINE,
+            app.clone()
+                .oneshot(http_upload(axum::body::Body::from(vec![0u8; 1024]))),
+        )
+        .await
+        .expect("a shed never waits for a drain slot")
+        .expect("infallible router");
+        assert_shed(response, true).await;
+        assert_eq!(undrained_counts(&controller), [0, 0, 1, 0]);
+
+        // A body above the cap is named `over_cap`, which is checked first.
+        let response = app
+            .clone()
+            .oneshot(http_upload(axum::body::Body::from(vec![
+                0u8;
+                2 * HEAD_REFUSAL_DRAIN_MAX_BYTES
+                    as usize
+            ])))
+            .await
+            .expect("infallible router");
+        assert_shed(response, true).await;
+        assert_eq!(undrained_counts(&controller), [0, 1, 1, 0]);
+
+        drop(held);
+        let response = app
+            .oneshot(http_upload(axum::body::Body::from(vec![0u8; 1024])))
+            .await
+            .expect("infallible router");
+        assert_shed(response, false).await;
+        assert_eq!(undrained_counts(&controller), [0, 1, 1, 0]);
+    }
+
+    /// An HTTP/2 shed refuses one stream and keeps the connection, so it is
+    /// answered without a drain, without a `Connection` header (which HTTP/2
+    /// forbids), and is not counted. A body that would stall a drain shows
+    /// none was attempted.
+    #[tokio::test(start_paused = true)]
+    async fn an_http2_shed_is_answered_without_a_drain() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let mut request = http_upload(axum::body::Body::new(StalledBody::new()));
+        *request.version_mut() = http::Version::HTTP_2;
+
+        let started = tokio::time::Instant::now();
+        let response =
+            tokio::time::timeout(TEST_DEADLINE, http_router(&controller).oneshot(request))
+                .await
+                .expect("answered")
+                .expect("infallible router");
+
+        assert_shed(response, false).await;
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
+        assert!(started.elapsed() < HEAD_REFUSAL_DRAIN_TIMEOUT);
+        assert_eq!(undrained_counts(&controller), [0, 0, 0, 0]);
+    }
+
+    /// A request waiting on `Expect: 100-continue` has sent no body, and hyper
+    /// sends the 100 only when the body is polled, so the shed is answered
+    /// without polling it, with `Connection: close`, and not counted.
+    #[tokio::test(start_paused = true)]
+    async fn an_expect_continue_shed_is_answered_without_a_drain() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(0));
+        let mut request = http_upload(axum::body::Body::new(StalledBody::new()));
+        request
+            .headers_mut()
+            .insert(header::EXPECT, HeaderValue::from_static("100-continue"));
+
+        let started = tokio::time::Instant::now();
+        let response =
+            tokio::time::timeout(TEST_DEADLINE, http_router(&controller).oneshot(request))
+                .await
+                .expect("answered")
+                .expect("infallible router");
+
+        assert_shed(response, true).await;
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
+        assert!(started.elapsed() < HEAD_REFUSAL_DRAIN_TIMEOUT);
+        assert_eq!(undrained_counts(&controller), [0, 0, 0, 0]);
+    }
+
+    /// A caller that refuses a request still holding its permit has the
+    /// permit released before the drain starts: under a ceiling of 1 a new
+    /// request is admitted while the stalled body is still being drained,
+    /// and the drain then ends at its timeout, counted under `timeout`.
+    #[tokio::test(start_paused = true)]
+    async fn the_drain_runs_with_no_permit_held() {
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
+        let handle =
+            IngestPermitHandle::new(controller.try_admit().expect("the only permit is free"));
+        let mut request = http_upload(axum::body::Body::new(StalledBody::new()));
+        request
+            .extensions_mut()
+            .insert(IngestPermitHeld(handle.clone()));
+
+        let started = tokio::time::Instant::now();
+        let refusing = tokio::spawn({
+            let controller = controller.clone();
+            async move {
+                refuse_from_head(
+                    controller.head_refusal_drain(),
+                    request,
+                    ingest_concurrency_shed_response(),
+                    |_| true,
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!refusing.is_finished(), "the drain is still waiting");
+        assert!(!handle.is_held());
+        drop(
+            controller
+                .try_admit()
+                .expect("the refused request's permit was released before its drain"),
+        );
+
+        let response = refusing.await.expect("refusal task completes");
+        // hygiene-allow: wall-clock -- `start_paused` makes this tokio's
+        // virtual clock, which moves only when a timer fires.
+        assert!(started.elapsed() >= HEAD_REFUSAL_DRAIN_TIMEOUT);
+        assert_shed(response, true).await;
+        assert_eq!(undrained_counts(&controller), [0, 0, 0, 1]);
     }
 
     /// Stands in for tonic's unary codec: reads the request body to its end
