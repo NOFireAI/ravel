@@ -7,7 +7,8 @@
 //! 1000-column budget with overflow folded into `attrs_raw`, and decode the
 //! `_events_raw` blob into nested event columns), chunk into blocks, build each
 //! block and its interval-aware SKIP_IDX entry plus its token bloom, then emit
-//! the BLOCKS, SKIP_IDX, and BLOOM sections, the footer, and the trailer.
+//! the BLOCKS, KEY_IDX, SKIP_IDX, and BLOOM sections, the footer, and the
+//! trailer.
 //! Identical input yields byte-identical output.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -21,6 +22,7 @@ use crate::error::SpanSegError;
 use crate::footer::{
     COMP_NONE, COMP_ZSTD, SectionDesc, SpanFooter, kind, write_footer_and_trailer,
 };
+use crate::key_index::encode_trace_key_idx;
 use crate::record::{
     COL_NAME, COL_SERVICE_NAME, EVENTS_RAW_KEY, FIRST_DYNAMIC_COL, ResolvedSpanRow,
     SERVICE_NAME_KEY, SpanEvent, SpanRecord, encode_attrs, parse_events,
@@ -209,7 +211,15 @@ impl RspanWriter {
 
         let skip = SkipIndex::new(entries);
 
-        // Assemble sections in kind order: BLOCKS (raw), SKIP_IDX (zstd),
+        // One (trace_id, block ordinal) pair per row; the encoder deduplicates.
+        // The ordinal is the block's SKIP_IDX entry index.
+        let key_idx = encode_trace_key_idx(spans.iter().enumerate().flat_map(|(block, span)| {
+            rows[span.clone()]
+                .iter()
+                .map(move |row| (row.trace_id, block as u32))
+        }))?;
+
+        // Physical order: BLOCKS (raw), KEY_IDX (raw), SKIP_IDX (zstd),
         // BLOOM (raw).
         let mut object = Vec::new();
         let mut sections: Vec<SectionDesc> = Vec::new();
@@ -218,6 +228,15 @@ impl RspanWriter {
             &mut sections,
             kind::BLOCKS,
             Stored::raw(blocks_bytes),
+        );
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::KEY_IDX,
+            Stored {
+                prefix_len: key_idx.prefix_len,
+                ..Stored::raw(key_idx.bytes)
+            },
         );
         let skip_stored = compress(&skip.encode(), self.cfg.zstd_level)?;
         push_section(&mut object, &mut sections, kind::SKIP_IDX, skip_stored);
@@ -397,11 +416,13 @@ fn row_estimate(row: &ResolvedSpanRow) -> usize {
     est
 }
 
-/// A section's stored bytes plus its compression descriptor fields.
+/// A section's stored bytes plus its compression descriptor fields and, for
+/// KEY_IDX only, its prefix length.
 struct Stored {
     bytes: Vec<u8>,
     comp: u8,
     uncomp_len: u64,
+    prefix_len: u32,
 }
 
 impl Stored {
@@ -411,6 +432,7 @@ impl Stored {
             bytes,
             comp: COMP_NONE,
             uncomp_len,
+            prefix_len: 0,
         }
     }
 }
@@ -423,6 +445,7 @@ fn compress(raw: &[u8], level: i32) -> Result<Stored, SpanSegError> {
         bytes: compressed,
         comp: COMP_ZSTD,
         uncomp_len: raw.len() as u64,
+        prefix_len: 0,
     })
 }
 
@@ -437,6 +460,7 @@ fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32
         crc32c: crc32c::crc32c(&stored.bytes),
         comp: stored.comp,
         uncomp_len: stored.uncomp_len,
+        prefix_len: stored.prefix_len,
     });
 }
 

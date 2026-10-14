@@ -1,5 +1,5 @@
-total_size: 768
-version: 4
+total_size: 1903
+version: 5
 signal: 3
 tenant_hash: abababababababababababababababab
 shard: 3
@@ -17,12 +17,15 @@ input_set_hash:
 part_index: 0
 sections:
   kind=1 name=BLOCKS offset=0 len=380 comp=none uncompressed_len=380
-  kind=2 name=SKIP_IDX offset=380 len=57 comp=zstd uncompressed_len=102
-  kind=3 name=BLOOM offset=437 len=164 comp=none uncompressed_len=164
+  kind=4 name=KEY_IDX offset=380 len=1114 comp=none uncompressed_len=1114 prefix_len=1056
+  kind=2 name=SKIP_IDX offset=1494 len=57 comp=zstd uncompressed_len=102
+  kind=3 name=BLOOM offset=1551 len=164 comp=none uncompressed_len=164
 skip_index (2 block(s)):
   block[0] offset=0 len=210 crc32c=4618ec28 record_count=2 trace_id_range=[01010101010101010101010101010101, 01010101010101010101010101010101] start_ts_min=100 end_ts_max=200 duration_ns=[60, 100] status_mask=011 (unset|ok)
   block[1] offset=210 len=170 crc32c=32947f49 record_count=2 trace_id_range=[02020202020202020202020202020202, 02020202020202020202020202020202] start_ts_min=150 end_ts_max=400 duration_ns=[140, 250] status_mask=110 (ok|error)
 bloom (2 block(s))
+key_idx: version=1 bucket_bits=8 prefix_len=1056 fields=1
+  field name=trace_id key_type=Id16 entries=2 buckets=256 entries_per_bucket=[min=0 median=0 max=1] empty_buckets=254
 records (4):
   record[0] trace_id=01010101010101010101010101010101 span_id=0000000000000000 parent_span_id= name=GET /api start_ts_ns=100 end_ts_ns=200 status=ok status_message= service_name=svc1 attrs=http.method=GET events=1
     event[0] ts_ns=170 name=exception attrs_blob=09aa000000000000001209657863657074696f6e1a05737461636b

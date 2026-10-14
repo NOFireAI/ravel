@@ -503,6 +503,7 @@ dependencies = [
  "blake3",
  "crc32c",
  "thiserror",
+ "zstd",
 ]
 
 [[package]]

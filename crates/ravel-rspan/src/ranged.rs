@@ -42,9 +42,12 @@
 //! boundaries from the decoded stream. See `ravel-maintain`'s
 //! `rspan_codec.rs` module doc for the merge itself.
 
+use std::ops::Range;
+
 use crate::block::{DEFAULT_MAX_UNCOMP, read_block};
 use crate::error::SpanSegError;
 use crate::footer::{SpanFooter, kind};
+use crate::key_index;
 use crate::reader::MAX_BLOCKS;
 use crate::record::SpanRecord;
 use crate::skip_index::{BlockEntry, SkipIndex};
@@ -129,6 +132,9 @@ pub struct RspanRangeReader {
     skip: SkipIndex,
     blocks_offset: u64,
     blocks_len: u64,
+    key_idx_offset: u64,
+    key_idx_len: u64,
+    key_idx_prefix_len: u32,
 }
 
 impl RspanRangeReader {
@@ -142,11 +148,53 @@ impl RspanRangeReader {
         let blocks = footer
             .section(kind::BLOCKS)
             .ok_or_else(|| SpanSegError::Corrupted("missing BLOCKS section".into()))?;
+        let key_idx = footer
+            .section(kind::KEY_IDX)
+            .ok_or_else(|| SpanSegError::Corrupted("missing KEY_IDX section".into()))?;
         Ok(RspanRangeReader {
             skip,
             blocks_offset: blocks.offset,
             blocks_len: blocks.len,
+            key_idx_offset: key_idx.offset,
+            key_idx_len: key_idx.len,
+            key_idx_prefix_len: key_idx.prefix_len,
         })
+    }
+
+    /// The SKIP_IDX block ordinals the KEY_IDX section names for `trace_id`,
+    /// ascending: every block holding a trace whose first 8 bytes equal
+    /// `trace_id`'s. `read` fetches an absolute object byte range; it is
+    /// called once for exactly `[offset, offset + prefix_len)` of the section
+    /// and at most once more for the one bucket the trace mixes to, never for
+    /// the rest of the section. A partial read cannot check the whole-section
+    /// crc, so integrity rests on the grammar's own header, directory, and
+    /// bucket frame checksums. An ordinal at or past the block count anywhere
+    /// in the bucket read is `Corrupted`. `Ok(None)` only when the section
+    /// declines the probe.
+    pub fn probe_trace<B, F>(
+        &self,
+        trace_id: &[u8; 16],
+        mut read: F,
+    ) -> Result<Option<Vec<u32>>, SpanSegError>
+    where
+        B: AsRef<[u8]>,
+        F: FnMut(Range<u64>) -> Result<B, SpanSegError>,
+    {
+        let base = self.key_idx_offset;
+        key_index::probe(
+            self.key_idx_len,
+            self.key_idx_prefix_len,
+            self.skip.blocks.len(),
+            trace_id,
+            |range| {
+                let start = base.checked_add(range.start);
+                let end = base.checked_add(range.end);
+                match start.zip(end) {
+                    Some((start, end)) => read(start..end),
+                    None => Err(SpanSegError::Corrupted("KEY_IDX range overflow".into())),
+                }
+            },
+        )
     }
 
     /// The absolute byte range and candidate blocks covering `trace_id`, or

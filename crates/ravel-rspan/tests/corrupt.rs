@@ -3,12 +3,30 @@
 //! must either succeed with exactly the original data (the mutation hit unread
 //! or unverified bytes) or return a typed error. It must never panic and never
 //! return records that differ from the original without an error.
+//!
+//! The KEY_IDX probe gets the same treatment, through both the whole-object
+//! and the ranged reader: a probe on a damaged object returns a superset of
+//! the blocks truly holding the trace, or an error, and the rows read from the
+//! blocks it names are exactly that trace's. Case count honours
+//! `PROPTEST_CASES` (600 when unset); the CI fuzz job raises it.
 #![allow(clippy::expect_used)]
 
+use std::collections::BTreeSet;
+use std::ops::Range;
+
 use proptest::prelude::*;
+use ravel_rspan::footer::{DEFAULT_MAX_SECTION_UNCOMP, kind, write_footer_and_trailer};
 use ravel_rspan::{
-    ObjectIdentity, RspanConfig, RspanReader, RspanWriter, SpanQuery, SpanRecord, StatusCode,
+    ObjectIdentity, RspanConfig, RspanRangeReader, RspanReader, RspanWriter, SpanQuery, SpanRecord,
+    SpanSegError, StatusCode, open, read_section,
 };
+
+fn cases() -> u32 {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(600)
+}
 
 fn tid(n: u8) -> [u8; 16] {
     let mut a = [0u8; 16];
@@ -184,8 +202,203 @@ fn normalize(v: &[SpanRecord]) -> Vec<Vec<u8>> {
     keys
 }
 
+// --- KEY_IDX probe oracle ---------------------------------------------------
+
+/// The traces probed on every case: the five fixture traces plus one absent.
+fn probed_traces() -> Vec<[u8; 16]> {
+    (0..5).map(tid).chain([tid(0xEE)]).collect()
+}
+
+/// A ranged reader over `object`, or `None` when its footer or SKIP_IDX does
+/// not open (a damaged object the ranged path refuses before any probe).
+fn range_reader(object: &[u8]) -> Option<RspanRangeReader> {
+    let footer = open(object).ok()?;
+    let skip_raw = read_section(
+        object,
+        footer.section(kind::SKIP_IDX)?,
+        DEFAULT_MAX_SECTION_UNCOMP,
+    )
+    .ok()?;
+    RspanRangeReader::from_sections(&footer, &skip_raw).ok()
+}
+
+/// The ordinals of the blocks of the unmutated fixture holding `trace`.
+fn true_blocks(object: &[u8], trace: &[u8; 16]) -> BTreeSet<u32> {
+    let ranged = range_reader(object).expect("fixture opens");
+    (0..ranged.block_count())
+        .filter(|&i| {
+            let loc = ranged.block_loc(i).expect("loc");
+            ranged
+                .decode_block(&loc, &object[loc.start() as usize..loc.end() as usize])
+                .expect("decode")
+                .iter()
+                .any(|r| r.trace_id == *trace)
+        })
+        .map(|i| i as u32)
+        .collect()
+}
+
+/// A probe answer on a damaged object: `None` (the section declined, so every
+/// block is a candidate) or a superset of the true blocks; and when every
+/// named block decodes, the rows of `trace` among them are exactly its spans.
+fn check_probe_answer(
+    corpus: &[SpanRecord],
+    original: &[u8],
+    mutated: &[u8],
+    trace: &[u8; 16],
+    answer: Option<Vec<u32>>,
+) -> Result<(), TestCaseError> {
+    let Some(blocks) = answer else {
+        return Ok(());
+    };
+    let named: BTreeSet<u32> = blocks.iter().copied().collect();
+    prop_assert!(
+        named.is_superset(&true_blocks(original, trace)),
+        "probe for {:02x} named {:?}, missing a true block",
+        trace[0],
+        blocks
+    );
+    if let Some(ranged) = range_reader(mutated) {
+        let mut rows = Vec::new();
+        for b in &blocks {
+            let Ok(loc) = ranged.block_loc(*b as usize) else {
+                return Ok(());
+            };
+            let Some(bytes) = mutated.get(loc.start() as usize..loc.end() as usize) else {
+                return Ok(());
+            };
+            let Ok(decoded) = ranged.decode_block(&loc, bytes) else {
+                return Ok(());
+            };
+            rows.extend(decoded.into_iter().filter(|r| r.trace_id == *trace));
+        }
+        prop_assert_eq!(normalize(&rows), normalize(&trace_subset(corpus, *trace)));
+    }
+    Ok(())
+}
+
+/// Probes every traced id through the whole-object reader (when it opens) and
+/// the ranged reader (when its footer and SKIP_IDX open), checking each answer.
+fn check_probes(
+    corpus: &[SpanRecord],
+    original: &[u8],
+    mutated: &[u8],
+) -> Result<(), TestCaseError> {
+    if let Ok(reader) = RspanReader::new(mutated, &RspanConfig::default()) {
+        for trace in probed_traces() {
+            if let Ok(answer) = reader.probe_trace(&trace) {
+                check_probe_answer(corpus, original, mutated, &trace, answer)?;
+            }
+        }
+    }
+    if let Some(ranged) = range_reader(mutated) {
+        for trace in probed_traces() {
+            let read = |r: Range<u64>| {
+                mutated
+                    .get(r.start as usize..r.end as usize)
+                    .ok_or_else(|| SpanSegError::Corrupted("range past object".into()))
+            };
+            if let Ok(answer) = ranged.probe_trace(&trace, read) {
+                check_probe_answer(corpus, original, mutated, &trace, answer)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The object split into its section bytes and decoded footer.
+fn split(object: &[u8]) -> (Vec<u8>, ravel_rspan::SpanFooter) {
+    let footer = open(object).expect("open fixture");
+    let n = object.len();
+    let footer_len = u32::from_le_bytes(object[n - 16..n - 12].try_into().expect("4 bytes"));
+    let body_len = n - 16 - footer_len as usize;
+    (object[..body_len].to_vec(), footer)
+}
+
+fn reassemble(mut body: Vec<u8>, footer: &ravel_rspan::SpanFooter) -> Vec<u8> {
+    write_footer_and_trailer(&mut body, footer);
+    body
+}
+
+fn key_idx_entry(footer: &mut ravel_rspan::SpanFooter) -> &mut ravel_rspan::footer::SectionDesc {
+    footer
+        .sections
+        .iter_mut()
+        .find(|s| s.kind == kind::KEY_IDX)
+        .expect("KEY_IDX entry")
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 600, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
+
+    /// Damage confined to the KEY_IDX section bytes or its footer entry. The
+    /// section crc rewritten to match (op 1) or the footer entry moved (op 2+)
+    /// takes the whole-object reader past its crc check, so the grammar's own
+    /// checks and the RSPAN parameter and ordinal rules are what stand.
+    #[test]
+    fn key_idx_mutation_probe_is_superset_or_error(
+        op in 0u8..7,
+        idx in any::<usize>(),
+        xor in any::<u8>(),
+        value in any::<u32>(),
+    ) {
+        let (corpus, object) = fixture();
+        let (mut body, mut footer) = split(&object);
+        let entry = *key_idx_entry(&mut footer);
+        let section = entry.offset as usize..(entry.offset + entry.len) as usize;
+        let flip = section.start + idx % section.len();
+        let refuse_whole = match op {
+            // A byte flip in the section: the stored crc refuses it at open.
+            0 => {
+                body[flip] ^= xor | 1;
+                true
+            }
+            // The same flip with the footer crc rewritten to match.
+            1 => {
+                body[flip] ^= xor | 1;
+                key_idx_entry(&mut footer).crc32c = crc32c::crc32c(&body[section.clone()]);
+                false
+            }
+            // Footer-entry mutations: prefix_len, offset, len, comp,
+            // uncomp_len, each to an arbitrary value.
+            2 => {
+                key_idx_entry(&mut footer).prefix_len = value;
+                false
+            }
+            3 => {
+                key_idx_entry(&mut footer).offset = u64::from(value) % body.len() as u64;
+                false
+            }
+            4 => {
+                key_idx_entry(&mut footer).len = u64::from(value) % (body.len() as u64 + 1);
+                false
+            }
+            5 => {
+                key_idx_entry(&mut footer).comp = value as u8;
+                false
+            }
+            _ => {
+                key_idx_entry(&mut footer).uncomp_len = u64::from(value);
+                false
+            }
+        };
+        let mutated = reassemble(body, &footer);
+        let cfg = RspanConfig::default();
+        let opened = RspanReader::new(&mutated, &cfg);
+        if refuse_whole {
+            prop_assert!(matches!(opened, Err(SpanSegError::Corrupted(_))));
+        }
+        if let Ok(reader) = &opened
+            && let Ok((got, _)) = reader.scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+        {
+            prop_assert_eq!(normalize(&got), normalize(&corpus));
+        }
+        check_probes(&corpus, &object, &mutated)?;
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: cases(), ..ProptestConfig::default() })]
 
     #[test]
     fn mutation_never_panics_never_wrong(
@@ -239,23 +452,36 @@ proptest! {
                 prop_assert_eq!(normalize(&got), normalize(&trace_subset(&corpus, tid(0))));
             }
         }
+        check_probes(&corpus, &object, &mutated)?;
     }
+}
 
-    /// The unmutated object always scans back to the full corpus, and a
-    /// trace-restricted scan back to exactly that trace's spans.
-    #[test]
-    fn identity_roundtrip(_n in 0u8..1) {
-        let (corpus, object) = fixture();
-        let cfg = RspanConfig::default();
-        let reader = RspanReader::new(&object, &cfg).expect("open");
-        let (got, _) = reader
-            .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
-            .expect("scan");
-        prop_assert_eq!(normalize(&got), normalize(&corpus));
+/// The unmutated object always scans back to the full corpus, a
+/// trace-restricted scan back to exactly that trace's spans, and both probes
+/// name exactly the true blocks. Deterministic, so one run.
+#[test]
+fn identity_roundtrip() {
+    let (corpus, object) = fixture();
+    let cfg = RspanConfig::default();
+    let reader = RspanReader::new(&object, &cfg).expect("open");
+    let (got, _) = reader
+        .scan(&SpanQuery::ts_range(i64::MIN, i64::MAX))
+        .expect("scan");
+    assert_eq!(normalize(&got), normalize(&corpus));
 
-        let (got, _) = reader
-            .scan(&SpanQuery::trace(tid(0), i64::MIN, i64::MAX))
-            .expect("scan");
-        prop_assert_eq!(normalize(&got), normalize(&trace_subset(&corpus, tid(0))));
+    let (got, _) = reader
+        .scan(&SpanQuery::trace(tid(0), i64::MIN, i64::MAX))
+        .expect("scan");
+    assert_eq!(normalize(&got), normalize(&trace_subset(&corpus, tid(0))));
+
+    let ranged = range_reader(&object).expect("ranged");
+    for trace in probed_traces() {
+        let want: Vec<u32> = true_blocks(&object, &trace).into_iter().collect();
+        assert_eq!(
+            reader.probe_trace(&trace).expect("probe"),
+            Some(want.clone())
+        );
+        let read = |r: Range<u64>| Ok::<_, SpanSegError>(&object[r.start as usize..r.end as usize]);
+        assert_eq!(ranged.probe_trace(&trace, read).expect("probe"), Some(want));
     }
 }

@@ -213,6 +213,105 @@ async fn v3_bloom_and_service_name_column_rebuilt_from_union() {
     }
 }
 
+/// v5 coverage (ADR-2707 decision 2): the compacted part's KEY_IDX section is
+/// byte-identical, with the same `prefix_len`, to one encoded from the
+/// `(trace_id, block)` pairs of the part's own decoded blocks. A KEY_IDX copied
+/// from an input, or ordinals off by one, would name the wrong blocks. 42
+/// traces of 250 spans across two inputs overflow the default 8192-record
+/// block target, so the part has two blocks and trace 32 spans both.
+#[tokio::test]
+async fn v5_key_idx_rebuilt_from_compacted_records() {
+    use ravel_rspan::footer::{DEFAULT_MAX_SECTION_UNCOMP, kind};
+    use ravel_rspan::{
+        RspanConfig, RspanRangeReader, RspanReader, StatusCode, encode_trace_key_idx, open,
+        read_section,
+    };
+
+    let span = |t: u8, s: u16| SpanRecord {
+        trace_id: [t; 16],
+        span_id: [t, (s >> 8) as u8, s as u8, 0, 0, 0, 0, 1],
+        parent_span_id: None,
+        name: "op".into(),
+        start_ts_ns: 1_000 + i64::from(s),
+        end_ts_ns: 2_000 + i64::from(s),
+        status_code: StatusCode::Ok,
+        status_message: None,
+        attrs: vec![],
+    };
+    let (mut even, mut odd) = (Vec::new(), Vec::new());
+    for t in 0..42u8 {
+        for s in 0..250u16 {
+            if s % 2 == 0 { &mut even } else { &mut odd }.push(span(t, s));
+        }
+    }
+    let store = MemoryStore::new();
+    seed_rspan_input(&store, Uuid::from_u128(1), EPOCH, 1, &even).await;
+    seed_rspan_input(&store, Uuid::from_u128(2), EPOCH, 2, &odd).await;
+    let clock = FixedClock::new(sealed_now_ns());
+    let bucket = spans_bucket();
+    compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket)
+        .await
+        .expect("compact");
+
+    let prefix = keys::commit_shard_hour_prefix(
+        &bucket.tenant_hash,
+        bucket.signal,
+        bucket.shard,
+        bucket.ingest_hour_bucket,
+    )
+    .unwrap();
+    let rec_key = list_all(&store, &prefix)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.key)
+        .find(|k| {
+            matches!(
+                keys::partition_bucket_entry(k),
+                Ok(keys::BucketEntry::CompactionRecord(_))
+            )
+        })
+        .expect("record key");
+    let rec_bytes = store.get(&rec_key, GetRange::Full).await.unwrap().data;
+    let record = ravel_proto::commit::v1::CompactionRecord::decode(rec_bytes.as_ref()).unwrap();
+    assert_eq!(record.parts.len(), 1, "corpus fits one part");
+    let part_key = keys::reconstruct_l1_part_key(&record, &record.parts[0]).unwrap();
+    let part = store.get(&part_key, GetRange::Full).await.unwrap().data;
+    let part = part.as_ref();
+
+    let footer = open(part).expect("open part");
+    let skip_raw = read_section(
+        part,
+        footer.section(kind::SKIP_IDX).expect("SKIP_IDX"),
+        DEFAULT_MAX_SECTION_UNCOMP,
+    )
+    .expect("skip");
+    let ranged = RspanRangeReader::from_sections(&footer, &skip_raw).expect("ranged");
+    assert_eq!(ranged.block_count(), 2, "10500 spans at 8192 per block");
+    let mut pairs = Vec::new();
+    let mut rows = 0;
+    for b in 0..ranged.block_count() {
+        let loc = ranged.block_loc(b).expect("loc");
+        let records = ranged
+            .decode_block(&loc, &part[loc.start() as usize..loc.end() as usize])
+            .expect("decode block");
+        rows += records.len();
+        pairs.extend(records.iter().map(|r| (r.trace_id, b as u32)));
+    }
+    assert_eq!(rows, 42 * 250, "no span lost or deduplicated");
+
+    let rebuilt = encode_trace_key_idx(pairs).expect("encode");
+    let key_idx = footer.section(kind::KEY_IDX).expect("KEY_IDX");
+    let stored = &part[key_idx.offset as usize..(key_idx.offset + key_idx.len) as usize];
+    assert_eq!(stored, rebuilt.bytes.as_slice(), "KEY_IDX bytes");
+    assert_eq!(key_idx.prefix_len, rebuilt.prefix_len, "KEY_IDX prefix_len");
+
+    let reader = RspanReader::new(part, &RspanConfig::default()).expect("reader");
+    assert_eq!(reader.probe_trace(&[32; 16]).unwrap(), Some(vec![0, 1]));
+    assert_eq!(reader.probe_trace(&[0; 16]).unwrap(), Some(vec![0]));
+    assert_eq!(reader.probe_trace(&[41; 16]).unwrap(), Some(vec![1]));
+}
+
 #[tokio::test]
 async fn same_inputs_same_bytes_and_keys() {
     let (rk_a, rb_a, parts_a) = compact_once(&CompactorConfig::default()).await;
