@@ -450,7 +450,8 @@ the cap during the drain is counted as `over_cap`, not `timeout`.
 `Connection: close` tells a client that does read the response not to reuse
 the connection. It does not prevent the reset, so an undrained refusal can
 still reach the client as a transport error. A deployment sees how often
-this happens through `ravel_ingest_head_refusal_undrained_total`, with a
+a counted undrained refusal happens (two uncounted cases are in the drain
+correction below) through `ravel_ingest_head_refusal_undrained_total`, with a
 `reason` label of `over_cap`, `timeout`, `busy` or `unauthenticated`. It
 counts shed refusals only. A 401 at a ceiling with room is not a shed: it
 is not counted and gets no `Connection: close`, so it is answered exactly
@@ -530,7 +531,8 @@ property and must change in the same commit as the code:
   `services/ravel-server/tests/ingest_admission_before_body.rs`, whose
   request is unauthenticated and so keeps passing. The test is changed to
   pin never decoded and never charged, and the credential check is
-  described as side-effect free.
+  described as side-effect free (narrowed by the drain correction below:
+  it can wake the durable resolver's `sys/auth` re-read).
 
 The gRPC `PoisonBody` tests stay as they are.
 
@@ -691,7 +693,7 @@ flowchart LR
     D --> E[Submitted.acks holds the<br/>pending-ack permit to the ack]
 ```
 
-## Correction (2026-10-14): what the drain does not count, and the credential check's one side effect
+## Correction (2026-10-14), the drain correction: what the drain does not count, and the credential check's one side effect
 
 <!-- amendment-supersedes: phrase="on this path it has no side effect" pointer="drain correction" -->
 <!-- amendment-applies: none reason="records two facts about the head-refusal drain found while landing it; it changes no decision, and the one phrase it narrows is covered by the supersedes marker" -->
@@ -700,7 +702,9 @@ Two facts about the head-refusal drain amendment, found while landing it
 under issue #2926.
 
 **An authenticated `Expect: 100-continue` shed is neither drained nor
-counted.** Such a client sends no body until it sees `100 Continue`, and
+counted.** Unit tests in `ingest_admission.rs` pin this case, for an
+authenticated and an unauthenticated caller. The abandoned drain below
+has no test yet. Such a client sends no body until it sees `100 Continue`, and
 hyper sends that only when the body is polled. Reading the body would
 therefore invite the upload the refusal is turning away. So the shed is
 answered with `Connection: close` and no drain. It is not counted under
