@@ -89,12 +89,30 @@ case "${sub}" in
     # fixture: files-N.json is the endpoint's array (filename and patch),
     # files-N.txt a bare list of filenames with no patch.
     path="${1:-}"
-    num="${path##*/pulls/}"; num="${num%%/*}"
     jq_expr=""
     args=("$@")
     for ((i = 0; i < ${#args[@]}; i++)); do
       [[ "${args[i]}" == "--jq" ]] && jq_expr="${args[i + 1]:-}"
     done
+    # repos/<o>/<r>/compare/<base>...<head>. mb-<head> holds the merge base;
+    # without one the answer is origin/main of the repository the guard runs
+    # in. compare-down-<head> fails every call.
+    if [[ "${path}" == */compare/* ]]; then
+      spec="${path##*/compare/}"; head="${spec##*...}"
+      echo "${spec}" >>"${STUB_DIR}/calls-compare-${head}"
+      if [[ -f "${STUB_DIR}/compare-down-${head}" ]]; then
+        echo "HTTP 502: transient" >&2
+        exit 1
+      fi
+      if [[ -f "${STUB_DIR}/mb-${head}" ]]; then
+        mb="$(cat "${STUB_DIR}/mb-${head}")"
+      else
+        mb="$(git rev-parse --verify --quiet refs/remotes/origin/main)" || exit 1
+      fi
+      jq -r "${jq_expr:-.}" <<<"$(jq -n --arg s "${mb}" '{merge_base_commit: {sha: $s}}')"
+      exit 0
+    fi
+    num="${path##*/pulls/}"; num="${num%%/*}"
     echo x >>"${STUB_DIR}/calls-${num}"
     # fails-N holds how many more calls for pull request N fail first.
     if [[ -f "${STUB_DIR}/gone-${num}" ]]; then
@@ -509,9 +527,10 @@ git -C "${base}" add -A
 git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -m base
 git -C "${base}" update-ref refs/remotes/origin/main HEAD
 
-# open_pr <case> <n>: one open, non-draft pull request #n.
+# open_pr <case> <n>: one open, non-draft pull request #n into main, whose
+# head commit the compare stub knows as h<n>.
 open_pr() {
-  printf '[{"number":%s,"title":"in flight","state":"OPEN","body":"","headRefName":"p","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "$2" >"$1/prs.json"
+  printf '[{"number":%s,"title":"in flight","state":"OPEN","body":"","headRefName":"p","baseRefName":"main","headRefOid":"h%s","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' "$2" "$2" >"$1/prs.json"
 }
 # pr_patch <case> <n> <file> <patch line>...: pull request #n changes <file>
 # with the given patch, as the files endpoint returns it.
@@ -866,30 +885,177 @@ git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -am ta
 git -C "${base}" update-ref refs/drift/tail HEAD
 git -C "${base}" checkout -q -
 
-# Wrong: no drift check (0 for both, alpha read at 21-26 against a hunk at
-# base line 4); every non-bare entry compared as the whole file (the no-drift
-# cases below then collide).
+# The merge base is origin/main unless a case says otherwise. Wrong: no
+# merge-base check (0 for both, alpha read at 21-26 against a hunk at base
+# line 4); every non-bare entry compared as the whole file (the exact cases
+# below then collide).
 d="$(new_case base_drift)"
 open_pr "${d}" 52
 pr_patch "${d}" 52 src/lib.rs "${patch_a[@]}"
 out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#alpha' --base-ref refs/drift/main)"; rc=$?
 check_eq "a symbol on a drifted base falls back to the whole file (66)" "66" "${rc}"
-check_contains "and names the file and the drift" "NOTE  #52 src/lib.rs: the pull request's base has drifted from refs/drift/main" "${out}"
+check_contains "and names the file and the drift" "NOTE  #52 src/lib.rs: changed on refs/drift/main since the pull request forked" "${out}"
 out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L21-L26 --base-ref refs/drift/main)"; rc=$?
 check_eq "a range on a drifted base falls back to the whole file (66)" "66" "${rc}"
-check_contains "and says so" "has drifted" "${out}"
-# Wrong: removed lines not compared (0, the hunk's context still matches);
-# context lines not compared (0, the removed line still matches).
-out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L1-L1 --base-ref refs/drift/line4)"; rc=$?
-check_eq "a removed line that differs on the base is drift (66)" "66" "${rc}"
-out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L1-L1 --base-ref refs/drift/line2)"; rc=$?
-check_eq "a context line that differs on the base is drift (66)" "66" "${rc}"
-# A base that differs only outside the hunks is not drift for them.
+check_contains "and says so" "since the pull request forked" "${out}"
+# A file that differs only past the hunks still differs. Wrong: hunk lines
+# compared against the base ref instead of the file compared (0).
 out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#gamma' --base-ref refs/drift/tail)"; rc=$?
-check_eq "a change past the hunks leaves the comparison exact (0)" "0" "${rc}"
-check_eq "without a drift NOTE" "0" "$(grep -c 'has drifted' <<<"${out}")"
+check_eq "a change past the hunks is still drift (66)" "66" "${rc}"
+check_contains "and says so" "changed on refs/drift/tail since the pull request forked" "${out}"
+# The same file on the merge base and the base ref: exact.
+git -C "${base}" rev-parse refs/drift/tail >"${d}/mb-h52"
+out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#gamma' --base-ref refs/drift/tail)"; rc=$?
+check_eq "a merge base whose file equals the base ref's is exact (0)" "0" "${rc}"
+check_eq "without a NOTE" "0" "$(grep -c '^NOTE' <<<"${out}")"
+# Hunks that disagree with the file the merge base names are not trusted
+# either. Here the merge base is the base ref, so only the hunk check sees
+# it. Wrong: removed lines not compared (0, the hunk's context still
+# matches); context lines not compared (0, the removed line still matches).
+git -C "${base}" rev-parse refs/drift/line4 >"${d}/mb-h52"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L1-L1 --base-ref refs/drift/line4)"; rc=$?
+check_eq "a removed line that differs from the file is not trusted (66)" "66" "${rc}"
+check_contains "and says so" "NOTE  #52 src/lib.rs: a hunk does not match refs/drift/line4" "${out}"
+git -C "${base}" rev-parse refs/drift/line2 >"${d}/mb-h52"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L1-L1 --base-ref refs/drift/line2)"; rc=$?
+check_eq "a context line that differs from the file is not trusted (66)" "66" "${rc}"
+rm -f "${d}/mb-h52"
 out="$(run_base "${d}" --issue 42 --paths 'src/lib.rs#gamma')"; rc=$?
 check_eq "no drift: a symbol the PR does not touch still passes (0)" "0" "${rc}"
+
+# Repeated rows. rows-mb is the pull request's merge base: src/t.rs holds
+# array A (rows 2-21) and array B (rows 24-43), every row "    0,". rows-main
+# adds 12 rows to A, so B runs 35-56 there and base line 30 is inside A,
+# with every line of the hunk still equal to the line at its number.
+rows_file() {
+  local i
+  printf 'const A: [u8; %s] = [\n' "$1"
+  for ((i = 0; i < $1; i++)); do printf '    0,\n'; done
+  printf '];\nconst B: [u8; 20] = [\n'
+  for ((i = 0; i < 20; i++)); do printf '    0,\n'; done
+  printf '];\n'
+}
+git -C "${base}" checkout -q -b rows
+rows_file 20 >"${base}/src/t.rs"
+git -C "${base}" add src/t.rs
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -m rows-mb
+git -C "${base}" update-ref refs/rows/mb HEAD
+rows_file 32 >"${base}/src/t.rs"
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -am rows-main
+git -C "${base}" update-ref refs/rows/main HEAD
+git -C "${base}" checkout -q -
+# The pull request changes base line 30, inside B on its merge base.
+patch_rows=('@@ -27,7 +27,7 @@' '     0,' '     0,' '     0,' '-    0,' '+    1,' '     0,' '     0,' '     0,')
+# Wrong: line equality as the drift test (0, every hunk line matches on
+# rows-main); the merge base asked for but its file not compared (0).
+d="$(new_case rows_drift)"
+open_pr "${d}" 60
+pr_patch "${d}" 60 src/t.rs "${patch_rows[@]}"
+git -C "${base}" rev-parse refs/rows/mb >"${d}/mb-h60"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#B' --base-ref refs/rows/main)"; rc=$?
+check_eq "a shift over repeated rows is drift (66)" "66" "${rc}"
+check_contains "and names the file and the reason" "NOTE  #60 src/t.rs: changed on refs/rows/main since the pull request forked" "${out}"
+check_contains "asking the compare endpoint for the PR's base branch and head" "main...h60" "$(cat "${d}/calls-compare-h60")"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#B' --base-ref refs/rows/mb)"; rc=$?
+check_eq "the same PR against its own base collides on B (66)" "66" "${rc}"
+check_eq "without a NOTE" "0" "$(grep -c '^NOTE' <<<"${out}")"
+# A merge base equal to the base ref and a hunk outside the entry passes.
+# Wrong: every entry compared as the whole file (66). The merge base is
+# asked once per pull request. Wrong: once per entry (2 calls).
+rm -f "${d}/calls-compare-h60"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A,src/t.rs:L1-L3' --base-ref refs/rows/mb)"; rc=$?
+check_eq "an exact merge base and a hunk outside the entry pass (0)" "0" "${rc}"
+check_eq "after one compare call for two entries" "1" "$(wc -l <"${d}/calls-compare-h60" | tr -d ' ')"
+# A merge base this checkout does not have is not compared by line. Wrong:
+# its absence read as a different file (66, but with the drift NOTE).
+d="$(new_case mb_missing)"
+open_pr "${d}" 61
+pr_patch "${d}" 61 src/t.rs "${patch_rows[@]}"
+printf '%040d\n' 7 >"${d}/mb-h61"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
+check_eq "a merge base missing locally falls back to the whole file (66)" "66" "${rc}"
+check_contains "and says so" "NOTE  #61 src/t.rs: merge base $(printf '%040d' 7) is not available locally" "${out}"
+# A compare call that fails is could-not-ask. Wrong: the failure taken as a
+# fallback to the whole file (66); the failure ignored (0).
+d="$(new_case compare_down)"
+open_pr "${d}" 62
+pr_patch "${d}" 62 src/t.rs "${patch_rows[@]}"
+touch "${d}/compare-down-h62"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
+check_eq "a failed merge-base lookup exits 69" "69" "${rc}"
+check_contains "and refuses to call it clean" "refusing to report a clean answer" "${out}"
+# A listing with no head commit cannot ask. Wrong: the compare URL built
+# from empty fields (69, or a lookup of the wrong commits).
+d="$(new_case no_head_oid)"
+printf '[{"number":64,"title":"in flight","state":"OPEN","body":"","headRefName":"p","updatedAt":"2026-09-01T00:00:00Z","mergedAt":null,"closedAt":null}]\n' >"${d}/prs.json"
+pr_patch "${d}" 64 src/t.rs "${patch_rows[@]}"
+out="$(run_base "${d}" --issue 42 --paths 'src/t.rs#A' --base-ref refs/rows/mb)"; rc=$?
+check_eq "a PR listed with no head commit falls back to the whole file (66)" "66" "${rc}"
+check_contains "and says so" "NOTE  #64 src/t.rs: the listing gives no base branch or head commit" "${out}"
+
+# Added, removed and unanchored hunks. thirty.rs has lines "line 1" to
+# "line 30" on origin/main, which is also the merge base in these cases, so
+# only the hunks decide.
+for i in $(seq 1 30); do printf 'line %s\n' "${i}"; done >"${base}/src/thirty.rs"
+git -C "${base}" add src/thirty.rs
+git -C "${base}" -c user.email=t@example.invalid -c user.name=t commit -q -m thirty
+git -C "${base}" update-ref refs/remotes/origin/main HEAD
+# A pull request that adds the file. Wrong: the hunk's base lines 0 and 1
+# compared against the range (0); only removed files covered (0).
+d="$(new_case file_added)"
+open_pr "${d}" 65
+jq -n --arg p "$(printf '%s\n' '@@ -0,0 +1,3 @@' '+a' '+b' '+c')" \
+  '[{filename: "src/thirty.rs", status: "added", patch: $p}]' >"${d}/files-65.json"
+out="$(run_base "${d}" --issue 42 --paths src/thirty.rs:L5-L20)"; rc=$?
+check_eq "a PR adding a file main already has collides as the whole file (66)" "66" "${rc}"
+check_contains "and says so" "NOTE  #65 src/thirty.rs: the pull request adds or deletes this file" "${out}"
+# A pull request that deletes the file it had at 3 lines. Wrong: the removed
+# lines 1-3 compared against the range (0); only added files covered (0).
+d="$(new_case file_removed)"
+open_pr "${d}" 66
+jq -n --arg p "$(printf '%s\n' '@@ -1,3 +0,0 @@' '-line 1' '-line 2' '-line 3')" \
+  '[{filename: "src/thirty.rs", status: "removed", patch: $p}]' >"${d}/files-66.json"
+out="$(run_base "${d}" --issue 42 --paths src/thirty.rs:L20-L25)"; rc=$?
+check_eq "a PR deleting the file collides as the whole file (66)" "66" "${rc}"
+check_contains "and says so" "adds or deletes this file" "${out}"
+# The hunk alone says so when the status field is missing. Wrong: the status
+# field read and the hunk header not (0).
+pr_patch "${d}" 66 src/thirty.rs '@@ -1,3 +0,0 @@' '-line 1' '-line 2' '-line 3'
+out="$(run_base "${d}" --issue 42 --paths src/thirty.rs:L20-L25)"; rc=$?
+check_eq "a hunk with an empty new side collides as the whole file (66)" "66" "${rc}"
+# A zero-context insertion has no line to check its numbering against.
+# Wrong: no such check (0, base lines 13, 30 and 31 are outside L1-L10); the
+# check made for the patch as a whole (0, the first hunk has lines).
+d="$(new_case zero_context)"
+open_pr "${d}" 67
+pr_patch "${d}" 67 src/thirty.rs '@@ -12,3 +12,3 @@' ' line 12' '-line 13' '+line 13b' ' line 14' '@@ -30,0 +31,1 @@' '+new'
+out="$(run_base "${d}" --issue 42 --paths src/thirty.rs:L1-L10)"; rc=$?
+check_eq "a hunk with no context or removed line collides as the whole file (66)" "66" "${rc}"
+check_contains "and says so" "NOTE  #67 src/thirty.rs: a hunk has no context or removed line to check" "${out}"
+
+# An empty patch is no patch. Wrong: an empty patch read as no hunks (0).
+d="$(new_case patch_empty)"
+open_pr "${d}" 68
+printf '[{"filename":"src/core.rs","previous_filename":"src/lib.rs","status":"renamed","patch":""}]\n' >"${d}/files-68.json"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L3-L6)"; rc=$?
+check_eq "a renamed file with an empty patch collides as the whole file (66)" "66" "${rc}"
+check_contains "and says why" "no patch" "${out}"
+printf '[{"filename":"src/lib.rs","status":"modified","patch":""}]\n' >"${d}/files-68.json"
+out="$(run_base "${d}" --issue 42 --paths src/lib.rs:L3-L6)"; rc=$?
+check_eq "so does a modified file with an empty patch (66)" "66" "${rc}"
+
+# GitHub's files endpoint lists at most 3000 files. Wrong: no cap (0, the
+# entries are not in the list); the cap read as more than 3000 (0).
+d="$(new_case files_cap)"
+open_pr "${d}" 69
+for i in $(seq 1 3000); do printf 'src/pad_%s.rs\n' "${i}"; done >"${d}/files-69.txt"
+out="$(run_base "${d}" --issue 42 --paths 'src/mine.rs,src/lib.rs#alpha')"; rc=$?
+check_eq "a PR listing 3000 files collides on every entry (66)" "66" "${rc}"
+check_contains "and says so" "NOTE  #69 lists 3000 files, the endpoint's limit" "${out}"
+check_contains "naming each entry" "src/mine.rs, src/lib.rs#alpha" "${out}"
+sed -i.bak '3000d' "${d}/files-69.txt"
+out="$(run_base "${d}" --issue 42 --paths 'src/mine.rs,src/lib.rs#alpha')"; rc=$?
+check_eq "one fewer is a complete list (0)" "0" "${rc}"
 
 # Renames: an entry naming the old path matches, and the patch is numbered on
 # the old file. Wrong: only .filename matched (0 for both); a rename compared
@@ -918,6 +1084,21 @@ out="$(run_base "${d}" --issue 42 --paths ' docs/guide.md#usage ')"; rc=$?
 check_eq "a symbol entry is trimmed too (66)" "66" "${rc}"
 out="$(run_base "${d}" --issue 42 --paths 'src/x.rs, ,docs/guide.md')"; rc=$?
 check_eq "an entry empty after trimming is a usage error (64)" "64" "${rc}"
+# Wrong: split with read -a, which drops a trailing empty field (66 for the
+# first) and stops at a newline (0 for the newline case, docs/guide.md unread).
+for value in 'docs/guide.md,' ',docs/guide.md' 'src/x.rs,,docs/guide.md'; do
+  out="$(run_base "${d}" --issue 42 --paths "${value}")"; rc=$?
+  check_eq "'${value}' has an empty entry, a usage error (64)" "64" "${rc}"
+done
+d="$(new_case paths_newline)"
+open_pr "${d}" 55
+pr_patch "${d}" 55 docs/guide.md "${patch_e[@]}"
+out="$(run_base "${d}" --issue 42 --paths $'src/x.rs\ndocs/guide.md')"; rc=$?
+check_eq "a newline in --paths is a usage error (64)" "64" "${rc}"
+check_contains "and says so" "newline or carriage return" "${out}"
+out="$(run_base "${d}" --issue 42 --paths $'src/x.rs\rdocs/guide.md')"; rc=$?
+check_eq "so is a carriage return (64)" "64" "${rc}"
+check_eq "before any gh call" "0" "$(find "${d}" -name 'calls-*' | wc -l | tr -d ' ')"
 
 # --- a diff that cannot be read is never a pass ---------------------------
 # Wrong: patches fetched in a second call whose failure falls back to the
