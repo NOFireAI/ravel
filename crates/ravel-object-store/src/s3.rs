@@ -3745,6 +3745,137 @@ mod tests {
             .expect("a non-default http config must build");
     }
 
+    /// Requests by method seen by [`spawn_stalling_endpoint`].
+    #[derive(Default)]
+    struct StallCounts {
+        get: AtomicUsize,
+        put: AtomicUsize,
+    }
+
+    /// Stand up an endpoint that counts each request by method and never
+    /// answers it, so every request ends in the client's request timeout.
+    async fn spawn_stalling_endpoint() -> (String, Arc<StallCounts>) {
+        use axum::Router;
+        use axum::routing::any;
+
+        let counts = Arc::new(StallCounts::default());
+        let handler_counts = Arc::clone(&counts);
+        let handler = move |method: axum::http::Method| {
+            let counts = Arc::clone(&handler_counts);
+            async move {
+                match method {
+                    axum::http::Method::GET => counts.get.fetch_add(1, Ordering::SeqCst),
+                    axum::http::Method::PUT => counts.put.fetch_add(1, Ordering::SeqCst),
+                    _ => 0,
+                };
+                std::future::pending::<axum::response::Response>().await
+            }
+        };
+        let app = Router::new()
+            .route("/", any(handler.clone()))
+            .route("/{*rest}", any(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (endpoint, counts)
+    }
+
+    fn stalling_store(endpoint: String) -> S3Store {
+        S3Store::with_http_config(
+            S3Config {
+                endpoint: Some(endpoint),
+                ..test_config()
+            },
+            S3HttpConfig {
+                request_timeout: Duration::from_millis(200),
+                ..S3HttpConfig::default()
+            },
+        )
+        .expect("store builds")
+    }
+
+    /// Waits until `count` reads at least 2, failing after a generous bound.
+    async fn await_second_attempt(count: &AtomicUsize, what: &str) {
+        let wait = async {
+            while count.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), wait)
+            .await
+            .unwrap_or_else(|_| panic!("{what}: object_store never retried a timed-out request"));
+    }
+
+    /// `object_store` retries a request timeout only for a request it treats
+    /// as idempotent. A conditional PUT (`CreateIfAbsent` and `CasVersion`)
+    /// is not one: it surfaces `Timeout` after exactly one request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timed_out_conditional_put_is_not_retried_by_object_store() {
+        for mode in [
+            PutMode::CreateIfAbsent,
+            PutMode::CasVersion(Version("\"etag\"".to_string())),
+        ] {
+            let (endpoint, counts) = spawn_stalling_endpoint().await;
+            let store = stalling_store(endpoint);
+            let outcome = tokio::time::timeout(
+                Duration::from_secs(30),
+                store.put(
+                    "stall-key",
+                    Bytes::from_static(b"payload"),
+                    PutOptions {
+                        mode: mode.clone(),
+                        checksum: None,
+                    },
+                ),
+            )
+            .await
+            .expect("a timed-out conditional PUT returns without the retry loop");
+            assert!(
+                matches!(outcome, Err(StoreError::Timeout)),
+                "{mode:?}: got {outcome:?}"
+            );
+            assert_eq!(
+                counts.put.load(Ordering::SeqCst),
+                1,
+                "{mode:?}: exactly one PUT reached the endpoint"
+            );
+        }
+    }
+
+    /// The other side of the rule: a plain `Overwrite` PUT and a GET are
+    /// idempotent to `object_store`, so a timed-out attempt is retried
+    /// inside it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn timed_out_overwrite_put_and_get_are_retried_by_object_store() {
+        let (endpoint, counts) = spawn_stalling_endpoint().await;
+        let store = Arc::new(stalling_store(endpoint));
+
+        let put_store = Arc::clone(&store);
+        let put = tokio::spawn(async move {
+            put_store
+                .put(
+                    "stall-key",
+                    Bytes::from_static(b"payload"),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        checksum: None,
+                    },
+                )
+                .await
+        });
+        await_second_attempt(&counts.put, "Overwrite PUT").await;
+        put.abort();
+
+        let get_store = Arc::clone(&store);
+        let get = tokio::spawn(async move { get_store.get("stall-key", GetRange::Full).await });
+        await_second_attempt(&counts.get, "GET").await;
+        get.abort();
+    }
+
     /// Stand up a minimal always-succeeding mock IMDS on an ephemeral loopback
     /// port and return its `http://addr` base. Shared by the InstanceRole
     /// builder tests, whose only need is a working eager fetch.
