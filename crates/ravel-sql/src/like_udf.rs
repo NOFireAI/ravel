@@ -16,9 +16,11 @@
 //! [`LikeUdf::coerce_types`] leaves a `Dictionary(Int32, Utf8)` first argument
 //! **unchanged** (so no coercing `CAST` hydrates it) while coercing every other
 //! first-argument type, and the second argument, to `Utf8` exactly as the
-//! built-in accepted. A [`FunctionRewrite`] ([`LikeToUdf`]) rewrites every
-//! case-sensitive `Expr::Like` into a call to this UDF. It is registered as a
-//! *function rewrite*, not an analyzer rule, so it runs BEFORE type coercion:
+//! built-in accepted. A [`FunctionRewrite`] ([`LikeToUdf`]) rewrites a
+//! case-sensitive `Expr::Like` into a call to this UDF (every one in a
+//! `logs`-only session, only one over `logs` columns beside another table).
+//! It is registered as a *function rewrite*, not an analyzer rule, so it runs
+//! BEFORE type coercion:
 //! the rewrite sees the original operands (a dictionary still a dictionary), and
 //! coercion then applies [`LikeUdf::coerce_types`] to the UDF call it produced.
 //!
@@ -68,6 +70,8 @@ use datafusion::logical_expr::{
     ColumnarValue, Expr, Like, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 use datafusion::scalar::ScalarValue;
+
+use crate::session::LOGS_TABLE;
 
 /// The name of the `like` scalar UDF the `LIKE` rewrite produces.
 pub const LIKE_UDF: &str = "like";
@@ -146,14 +150,53 @@ impl ScalarUDFImpl for LikeUdf {
     }
 }
 
-/// A [`FunctionRewrite`] that turns every case-sensitive `Expr::Like` into a
+/// A [`FunctionRewrite`] that turns a case-sensitive `Expr::Like` into a
 /// call to [`LikeUdf`], so the Ravel evaluator (and its dictionary fast path)
-/// runs instead of DataFusion's built-in `LIKE`. Registered per `logs` session
-/// ([`crate::session::build_session`]); it runs before type coercion, so it sees
-/// the original (un-hydrated) operands. `ILIKE` is left untouched (see the
-/// module doc).
+/// runs instead of DataFusion's built-in `LIKE`. Registered only in a session
+/// that registers `logs` ([`crate::session::build_session_with_tables`]); its
+/// [`LikeScope`] says which `LIKE`s it rewrites. It runs before type
+/// coercion, so it sees the original (un-hydrated) operands. `ILIKE` is left
+/// untouched (see the module doc).
 #[derive(Debug)]
-pub(crate) struct LikeToUdf;
+pub(crate) struct LikeToUdf {
+    scope: LikeScope,
+}
+
+/// Which `LIKE`s [`LikeToUdf`] rewrites.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LikeScope {
+    /// Every case-sensitive `LIKE`: the session registers `logs` and no other
+    /// table.
+    Every,
+    /// Only a `LIKE` whose operands reference at least one column and whose
+    /// every column resolves, through the schema the rewrite is given, to the
+    /// relation `logs` (ADR-2904 decision 4). Any other `LIKE`, including one
+    /// over an aliased `logs` scan or a column the schema cannot resolve, is
+    /// left to the built-in operator.
+    LogsColumnsOnly,
+}
+
+impl LikeToUdf {
+    pub(crate) fn new(scope: LikeScope) -> Self {
+        Self { scope }
+    }
+}
+
+/// Whether every column `operands` reference resolves through `schema` to the
+/// `logs` relation, with at least one column referenced. A column the schema
+/// cannot resolve (unknown, or an ambiguous unqualified name) answers false.
+fn references_only_logs_columns(operands: [&Expr; 2], schema: &DFSchema) -> bool {
+    let mut columns = operands.into_iter().flat_map(Expr::column_refs).peekable();
+    if columns.peek().is_none() {
+        return false;
+    }
+    columns.all(|column| {
+        matches!(
+            schema.qualified_field_from_column(column),
+            Ok((Some(qualifier), _)) if qualifier.table() == LOGS_TABLE
+        )
+    })
+}
 
 impl FunctionRewrite for LikeToUdf {
     fn name(&self) -> &str {
@@ -163,7 +206,7 @@ impl FunctionRewrite for LikeToUdf {
     fn rewrite(
         &self,
         expr: Expr,
-        _schema: &DFSchema,
+        schema: &DFSchema,
         _config: &ConfigOptions,
     ) -> DFResult<Transformed<Expr>> {
         if let Expr::Like(Like {
@@ -174,6 +217,11 @@ impl FunctionRewrite for LikeToUdf {
             case_insensitive: false,
         }) = &expr
         {
+            if self.scope == LikeScope::LogsColumnsOnly
+                && !references_only_logs_columns([inner, pattern], schema)
+            {
+                return Ok(Transformed::no(expr));
+            }
             let udf = Arc::new(ScalarUDF::new_from_impl(LikeUdf::new(
                 *negated,
                 *escape_char,
@@ -578,6 +626,59 @@ mod tests {
         // Empty pattern matches only the empty string.
         assert!(matches("", ""));
         assert!(!matches("", "x"));
+    }
+
+    /// The scoped rewrite resolves an unqualified column through the schema
+    /// and leaves an unresolvable one (ambiguous or unknown) unrewritten
+    /// rather than returning an error.
+    #[test]
+    fn scoped_rewrite_resolves_unqualified_columns_and_never_errs() {
+        use datafusion::arrow::datatypes::{Field, Schema};
+        use datafusion::common::{Column, TableReference};
+
+        let relation = |name: &str, fields: &[&str]| {
+            DFSchema::try_from_qualified_schema(
+                name,
+                &Schema::new(
+                    fields
+                        .iter()
+                        .map(|f| Field::new(*f, DataType::Utf8, false))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+            .unwrap()
+        };
+        let mut schema = relation(LOGS_TABLE, &["body", "shared"]);
+        schema.merge(&relation("samples", &["metric", "shared"]));
+        let like = |column: Column| {
+            Expr::Like(Like {
+                negated: false,
+                expr: Box::new(Expr::Column(column)),
+                pattern: Box::new(Expr::Literal(ScalarValue::from("%x%"), None)),
+                escape_char: None,
+                case_insensitive: false,
+            })
+        };
+        let rewritten = |scope: LikeScope, column: Column| {
+            LikeToUdf::new(scope)
+                .rewrite(like(column), &schema, &ConfigOptions::default())
+                .expect("the rewrite never errs")
+                .transformed
+        };
+        let scoped = LikeScope::LogsColumnsOnly;
+        assert!(rewritten(scoped, Column::from_name("body")));
+        assert!(rewritten(
+            scoped,
+            Column::new(Some(TableReference::bare(LOGS_TABLE)), "body")
+        ));
+        assert!(!rewritten(scoped, Column::from_name("metric")));
+        assert!(!rewritten(scoped, Column::from_name("shared")), "ambiguous");
+        assert!(!rewritten(scoped, Column::from_name("missing")), "unknown");
+        assert!(!rewritten(
+            scoped,
+            Column::new(Some(TableReference::bare("l")), "body")
+        ));
+        assert!(rewritten(LikeScope::Every, Column::from_name("metric")));
     }
 
     #[test]
