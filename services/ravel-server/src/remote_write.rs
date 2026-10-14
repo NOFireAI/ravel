@@ -706,6 +706,14 @@ pub(crate) mod tests {
         tenant_resolver: Arc<dyn TenantResolver>,
         clock: Arc<dyn Clock>,
     ) -> Arc<RemoteWriteState> {
+        state_with_ceiling(tenant_resolver, clock, IngestConcurrencyLimit::Unlimited)
+    }
+
+    fn state_with_ceiling(
+        tenant_resolver: Arc<dyn TenantResolver>,
+        clock: Arc<dyn Clock>,
+        ceiling: IngestConcurrencyLimit,
+    ) -> Arc<RemoteWriteState> {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let router = Arc::new(IngestRouter::new(
             IngestConfig::default(),
@@ -726,9 +734,7 @@ pub(crate) mod tests {
             )),
             recovery: None,
             provisioning: None,
-            ingest_concurrency: IngestConcurrencyController::shared(
-                IngestConcurrencyLimit::Unlimited,
-            ),
+            ingest_concurrency: IngestConcurrencyController::shared(ceiling),
             clock,
             metadata_sink: None,
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
@@ -766,6 +772,50 @@ pub(crate) mod tests {
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(state.metrics.snapshot().requests_rejected, 1);
+    }
+
+    /// A Remote Write shed by the in-flight ceiling whose credential does not
+    /// resolve is answered 429 with its body unread and counted once under
+    /// `unauthenticated`, never under `over_cap` although its body is above
+    /// the drain cap. The credential check on the shed path has no side
+    /// effect: `requests_rejected`, which counts the 401, stays at 0.
+    #[tokio::test]
+    async fn unauthenticated_shed_is_not_counted_as_rejected() {
+        use crate::ingest_admission::{HEAD_REFUSAL_DRAIN_MAX_BYTES, UndrainedReason};
+        use tower::ServiceExt;
+
+        let state = state_with_ceiling(
+            Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+                std::collections::HashMap::new(),
+            )),
+            Arc::new(FixedClock(FIXTURE_NOW_NS)),
+            IngestConcurrencyLimit::Bounded(0),
+        );
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/api/v1/write")
+            .header("authorization", "Bearer not-a-token")
+            .body(axum::body::Body::from(vec![
+                0u8;
+                2 * HEAD_REFUSAL_DRAIN_MAX_BYTES
+                    as usize
+            ]))
+            .expect("request builds");
+
+        let response = router(state.clone())
+            .oneshot(request)
+            .await
+            .expect("infallible router");
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(axum::http::header::CONNECTION),
+            Some(&axum::http::HeaderValue::from_static("close"))
+        );
+        assert_eq!(state.metrics.snapshot().requests_rejected, 0);
+        let drain = state.ingest_concurrency.head_refusal_drain();
+        assert_eq!(drain.undrained_total(UndrainedReason::Unauthenticated), 1);
+        assert_eq!(drain.undrained_total(UndrainedReason::OverCap), 0);
     }
 
     /// A Remote Write request whose

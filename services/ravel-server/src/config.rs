@@ -1721,7 +1721,11 @@ pub struct Cli {
     /// shed immediately, never queued: HTTP gets 429 with `Retry-After`,
     /// gRPC gets `RESOURCE_EXHAUSTED`. The permit is taken from the request
     /// head, before the body is read or decoded and before the tenant
-    /// credential is checked, so a shed request never buffers a body.
+    /// credential is checked. An authenticated HTTP/1 shed request's body is
+    /// then read and discarded, up to 1 MiB, before the 429 is sent, so a
+    /// pooled client reads the 429 rather than a reset; that body is never
+    /// decoded and never charged to any budget. An unauthenticated caller's
+    /// body is never read.
     /// The permit is released once the request's write is enqueued, before
     /// a strict write's durability acknowledgement, so this count bounds
     /// requests reading and decoding at once and no longer covers the

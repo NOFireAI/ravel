@@ -424,6 +424,10 @@ pub enum Label {
     /// `rseg`, `rlog` or `rspan`. A closed enum owned by `ravel_ingest`, which
     /// also owns the spelling the provisioning record's floors use.
     FormatFamily(ravel_ingest::FormatFamily),
+    /// Why an HTTP/1 ingest head refusal left the request body unread (issue
+    /// #2926): `unauthenticated`, `over_cap`, `busy` or `timeout`. Shares the
+    /// `reason` key with the other reason variants.
+    HeadRefusalUndrainedReason(crate::ingest_admission::UndrainedReason),
 }
 
 /// The closed `site` set of `ravel_memory_gate_refusals_total` and
@@ -632,6 +636,7 @@ impl Label {
             Label::RuntimeWorker(_) => "worker",
             Label::MemoryRefusalSite(_) => "site",
             Label::FormatFamily(_) => "family",
+            Label::HeadRefusalUndrainedReason(_) => "reason",
         }
     }
 
@@ -679,6 +684,7 @@ impl Label {
             Label::RuntimeWorker(index) => index.to_string(),
             Label::MemoryRefusalSite(site) => site.name().to_string(),
             Label::FormatFamily(family) => family.as_str().to_string(),
+            Label::HeadRefusalUndrainedReason(reason) => reason.as_str().to_string(),
         }
     }
 
@@ -3042,6 +3048,30 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
         &[Label::Mode(mode)],
         shed_total,
     );
+}
+
+/// HTTP/1 shed refusals answered with the request body unread (issue #2926),
+/// one sample per reason, zeros included. Read from the same process-wide
+/// controller as `render_ingest_concurrency_family` above.
+fn render_head_refusal_undrained_family(
+    out: &mut String,
+    mode: Mode,
+    drain: &crate::ingest_admission::HeadRefusalDrain,
+) {
+    write_header(
+        out,
+        "ravel_ingest_head_refusal_undrained_total",
+        "HTTP/1 ingest requests shed by the in-flight ceiling and answered without reading their body, by reason: unauthenticated (credential did not resolve), over_cap (body above 1 MiB), busy (no drain slot free), timeout (body not complete within 1s). These carry Connection: close, which does not prevent the reset: closing with the body unread can still reach the client as a transport error.",
+        "counter",
+    );
+    for reason in crate::ingest_admission::UndrainedReason::ALL {
+        write_sample(
+            out,
+            "ravel_ingest_head_refusal_undrained_total",
+            &[Label::Mode(mode), Label::HeadRefusalUndrainedReason(reason)],
+            drain.undrained_total(reason),
+        );
+    }
 }
 
 /// The process-wide pending strict-ack family (ADR-2793 decision 4):
@@ -8756,6 +8786,11 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &crate::memory_gate::STATS.snapshot(),
     );
     render_store_control_plane_family(&mut body, state.mode, &state.store_metrics.control_plane());
+    render_head_refusal_undrained_family(
+        &mut body,
+        state.mode,
+        state.ingest_concurrency.head_refusal_drain(),
+    );
     (
         StatusCode::OK,
         [(CONTENT_TYPE, "text/plain; version=0.0.4")],
@@ -9145,6 +9180,9 @@ mod tests {
             Label::RuntimeWorker(0),
             Label::MemoryRefusalSite(MemoryRefusalSite::Reserve),
             Label::FormatFamily(ravel_ingest::FormatFamily::Rseg),
+            Label::HeadRefusalUndrainedReason(
+                crate::ingest_admission::UndrainedReason::Unauthenticated,
+            ),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -9195,6 +9233,7 @@ mod tests {
                 Label::RuntimeWorker(_) => "worker",
                 Label::MemoryRefusalSite(_) => "site",
                 Label::FormatFamily(_) => "family",
+                Label::HeadRefusalUndrainedReason(_) => "reason",
             })
             .collect();
         assert_eq!(
@@ -9262,6 +9301,9 @@ mod tests {
                 // FormatFamily (ADR-1746) is the twenty-second key, for the
                 // format-floor families.
                 "family",
+                // HeadRefusalUndrainedReason (issue #2926) reuses the `reason`
+                // key.
+                "reason",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -9274,8 +9316,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            34,
-            "exactly 34 label variants every build has, 22 distinct keys (sql adds DdlKind, \
+            35,
+            "exactly 35 label variants every build has, 22 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
