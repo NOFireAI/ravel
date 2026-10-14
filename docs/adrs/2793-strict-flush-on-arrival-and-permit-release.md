@@ -436,10 +436,14 @@ as it is today: the same status, `Retry-After` and body text, with
 `Connection: close` added. That happens when:
 
 - the credential does not resolve;
+- the request waits on `Expect: 100-continue` (added by the drain
+  correction below: answered without a drain and not counted);
 - the body is past the byte cap (a `Content-Length` above it is refused
   without reading a byte);
 - all 64 drain slots are taken;
-- the body is not complete within the deadline.
+- the body is not complete within the deadline;
+- the client abandons the drain (also added by the drain correction
+  below, and not counted).
 
 The conditions are checked in that order, and the first that applies
 names the refusal: an unauthenticated shed declaring a body
@@ -702,14 +706,13 @@ Two facts about the head-refusal drain amendment, found while landing it
 under issue #2926.
 
 **An authenticated `Expect: 100-continue` shed is neither drained nor
-counted.** Unit tests in `ingest_admission.rs` pin this case, for an
-authenticated and an unauthenticated caller. The abandoned drain below
-has no test yet. Such a client sends no body until it sees `100 Continue`, and
+counted.** Such a client sends no body until it sees `100 Continue`, and
 hyper sends that only when the body is polled. Reading the body would
 therefore invite the upload the refusal is turning away. So the shed is
 answered with `Connection: close` and no drain. It is not counted under
 `ravel_ingest_head_refusal_undrained_total`, since there are normally no
-unread bytes to lose the response to.
+unread bytes to lose the response to. Unit tests in `ingest_admission.rs`
+pin this case for an authenticated and an unauthenticated caller.
 
 The residual case is a client that stops waiting for the `100` and
 uploads anyway, which RFC 9110 permits and curl does after a second. It
@@ -718,7 +721,8 @@ it. An unauthenticated `Expect` shed is still counted as
 `unauthenticated`, since the credential is checked first.
 
 A drain the client abandons midway also ends with `Connection: close` and
-is not counted. There is no one left to read the response.
+is not counted. There is no one left to read the response. This case has
+no test yet.
 
 **The credential check on the shed path has one side effect.** It calls
 neither the unauthorized hook nor the rejected-request counter. But with
@@ -728,3 +732,9 @@ does. That re-read is rate-limited to one per second per process, so a
 flood of shed requests with bad tokens costs at most about one extra
 object-store read a second. Before the drain, a shed request reached no
 credential check at all.
+
+The doc comment on the over-ceiling case in
+`services/ravel-server/tests/ingest_admission_before_body.rs` still says
+the shed path's credential check has no side effect. That is true of that
+test's own request, which carries no credential, but not of the shed path
+in general. It is corrected with the next change to that file.
