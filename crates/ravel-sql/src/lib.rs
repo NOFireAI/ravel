@@ -68,6 +68,7 @@ pub mod distributed;
 #[cfg(feature = "flight-sql")]
 pub mod distributed_rlog;
 mod error;
+pub mod esql;
 mod executor;
 #[cfg(feature = "flight-sql")]
 pub mod flight;

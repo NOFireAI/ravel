@@ -63,6 +63,10 @@ ravel-memory = { workspace = true }
 # that links datafusion-datasource-parquet. Both are workspace crates.
 ravel-pqtable = { workspace = true }
 ravel-parquet = { workspace = true }
+# The ES|QL front end (ADR-2887 D4): `ravel_esql::parse` turns the text into a
+# syntax tree, and the `esql` module binds and lowers that tree onto a session
+# the executor builds. A workspace crate whose only dependency is thiserror.
+ravel-esql = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the
@@ -350,6 +354,12 @@ path = "tests/logs_scan_block_charge.rs"
 [[test]]
 name = "group_by_string_keys"
 path = "tests/group_by_string_keys.rs"
+
+# The ES|QL lowering's tests, with their modules under tests/esql/. Not yet a
+# member of tests/it.rs; they share no process-wide state and can move there.
+[[test]]
+name = "esql"
+path = "tests/esql.rs"
 
 [[bench]]
 name = "samples_scan"
