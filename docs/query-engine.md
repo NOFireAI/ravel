@@ -439,7 +439,10 @@ directory is worth it; the byte-exact call is still the 75% coverage crossover
 one layer down, which falls back to a single whole-object GET when the projected
 pages turn out to cover the object after all. `LogsScanExec` publishes
 `fast_path_ranged_segments` and `fast_path_whole_object_segments` so
-`EXPLAIN ANALYZE` shows the split without counting store requests.
+`ravel-cli sql explain --analyze` shows the split without counting store
+requests. That command, built with the ravel-cli feature `sql-explain`, is
+the only way to see a plan's per-operator metrics: the SQL endpoint and
+Flight SQL refuse every `EXPLAIN` statement.
 
 ### The ranged fast path's per-partition pipeline
 
@@ -1440,7 +1443,8 @@ Boolean, List or Map value type. The measurement's fallback over-counts a
 ListView, LargeListView, RunEndEncoded or Union column, so a batch carrying
 one tends to pass through uncopied; its values stay correct.
 The cost is one copy of each aggregate output that feeds an exchange or a
-sort; `EXPLAIN` shows the operator and `EXPLAIN ANALYZE` its `copied_bytes`
+sort; `ravel-cli sql explain` shows the operator and its `--analyze` mode the
+operator's `copied_bytes`
 (the referenced bytes of the batches it copied), `compacted_batches` and
 `passed_through_batches` metrics. The regression test
 (`crates/ravel-sql/tests/compact_slices.rs`) pins the repartition edge on
@@ -3935,7 +3939,8 @@ NULL count equal to the row count. The comparison runs in signed `i64` order
 (`false < true` for `bool`), never on the arms' unsigned bit patterns.
 `str`/`bytes` equality never skips a segment, and neither does a shape
 `extract_logs` declines. A skipped segment costs no GET and is counted as
-`segments_pruned_by_stats` in the scan's `EXPLAIN ANALYZE` metrics and in
+`segments_pruned_by_stats` in the scan's metrics (`ravel-cli sql explain
+--analyze` prints them) and in
 `SqlStats`. `max_segments` admission still counts the whole resolved snapshot,
 and the distributed coordinator fan-out does not skip. A Flight SQL `DoGet`
 rebuilds its segments from the ticket, whose pin carries no stamps, so it
@@ -4129,7 +4134,8 @@ Two consequences an operator and a plan reader both see:
   statistics, not decoded pages.
 
 `LogsScanExec` publishes `pages_decoded` and `pages_skipped` per partition
-alongside its block counters, so `EXPLAIN ANALYZE` shows how much of each block
+alongside its block counters, so `ravel-cli sql explain --analyze` shows how
+much of each block
 the projection avoided touching.
 
 Two decode-time byte counters sit next to those page counts on the query's
@@ -4173,7 +4179,8 @@ projection over a 6-block, 8-column-per-block fixture decodes exactly 3
 pages per block (`ts`, `stream_ref`, `body`) against 8 for
 `ColumnSelection::all()` on the same object, and the difference matches
 `pages_skipped` exactly. A user observes the effect in `pages_decoded` on
-`ScanStats` (`EXPLAIN ANALYZE`'s per-partition page counters), in
+`ScanStats` (the per-partition page counters `ravel-cli sql explain
+--analyze` prints), in
 `page_bytes_decoded` on the query's accounting, and in reduced peak decode
 memory, never in request count or wire bytes -- those stay exactly where the
 fast path already put them. The
@@ -4266,7 +4273,8 @@ What it costs is at most `k` logical block fetches (winners in one block
 share a fetch); the object-store requests behind them depend on the fetch
 path, as the next paragraph says. Those are accounted like any other scan read,
 and `LogsRowFetchExec` publishes `row_refs`, `blocks_fetched`, and
-`segments_fetched` per `EXPLAIN ANALYZE` so a report can state phase 2's cost
+`segments_fetched` as metrics (`ravel-cli sql explain --analyze` prints them)
+so a report can state phase 2's cost
 instead of inferring it. With a read cache wired and an object below the
 block-range threshold they land on the cache key phase 1 already admitted and
 cost no request at all; with `--disable-cache` they are one GET each.
@@ -4518,7 +4526,8 @@ oversights.
 
    What an operator sees change is cost, not answers. `LogsScanExec` publishes
    `blocks_total`, `blocks_scanned`, and `blocks_pruned_by_postings` per
-   partition, so `EXPLAIN ANALYZE` shows whether a query pruned; a selective
+   partition, so `ravel-cli sql explain --analyze` shows whether a query
+   pruned; a selective
    equality on an indexed key reads a fraction of the blocks it read before, and
    returns the same rows. A key the object does not index reports
    `blocks_pruned_by_postings=0` and reads everything, which is the widen-only
@@ -4638,7 +4647,7 @@ reconstructed from the nested event columns the fast path exists to skip;
 `links` joins them for a different reason, since it is never promoted into
 nested columns at all, but decoded from the plain `attrs["_links_raw"]` value
 that only the row path's merged `attrs` map carries. Five partition metrics
-show what happened, and `EXPLAIN ANALYZE` prints them:
+show what happened, and `ravel-cli sql explain --analyze` prints them:
 
 - `blocks_decoded`: RSPAN blocks the partition decoded, on either path. A
   `trace_id` lookup decodes only the blocks holding the trace; a scan without
