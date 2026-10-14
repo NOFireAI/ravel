@@ -524,6 +524,15 @@ pub(super) enum LogScanState {
         /// wait for a gate permit.
         started: Instant,
     },
+    /// Up to [`LogScanStream::blocks_per_job`] consecutive columnar blocks
+    /// decoded and built as one read-gate job ([`ColumnarRunJob`], issue
+    /// #2795). Resolved, the scan goes back to [`LogScanState::Columnar`]
+    /// with the run's batches held in [`LogScanStream::pending`] and its
+    /// outcome in [`LogScanStream::decoded`].
+    DecodingRun {
+        job: RunJobFuture,
+        started: Instant,
+    },
     /// One row-path block decoding on the read gate through
     /// [`LogSegmentScan::next_block_on_gate`]. Resolved, the scan goes back
     /// to the state `resume` names with the block in
@@ -570,6 +579,13 @@ pub(super) enum RowResume {
 /// A block a gate job decoded, taken by the state the job resumed.
 pub(super) enum Decoded {
     Columnar(ColumnarStep),
+    /// A run's outcome, its batches already taken into
+    /// [`LogScanStream::pending`]: `clean` blocks went through cleanly and
+    /// `end` says why the run stopped.
+    Run {
+        clean: usize,
+        end: RunEnd,
+    },
     Rows {
         /// The block's whole-object index, read before the decode.
         block: Option<usize>,
@@ -633,7 +649,19 @@ impl ColumnarBlockJob {
     /// call. The decode frees that block, so the charge is resized to the
     /// block it decoded as soon as the decode returns, and freed when it
     /// decoded none.
-    fn run(self, scan: &mut LogSegmentScan, resident: &MemoryReservation) -> ColumnarStep {
+    fn run(mut self, scan: &mut LogSegmentScan, resident: &MemoryReservation) -> ColumnarStep {
+        let block = std::mem::replace(&mut self.block, Ok(None));
+        self.decode(block, scan, resident)
+    }
+
+    /// [`Self::run`] for a block whose row-ref position is `block`, leaving
+    /// the job to decode the next block of a [`ColumnarRunJob`].
+    fn decode(
+        &self,
+        block: DFResult<Option<usize>>,
+        scan: &mut LogSegmentScan,
+        resident: &MemoryReservation,
+    ) -> ColumnarStep {
         match scan.next_block_columnar() {
             Ok(ColumnarBlockOutcome::Exhausted) => {
                 resident.free();
@@ -650,10 +678,12 @@ impl ColumnarBlockJob {
                 if let Err(e) = resident.try_resize(view.decoded_bytes()) {
                     return ColumnarStep::Failed(e);
                 }
+                #[cfg(test)]
+                LAST_DECODED_BYTES.with(|last| last.set(view.decoded_bytes()));
                 if view.has_attrs_raw_page() {
                     return ColumnarStep::Fallback;
                 }
-                let built = self.block.and_then(|block| {
+                let built = block.and_then(|block| {
                     build_columnar_batches(
                         &view,
                         &self.schema,
@@ -704,6 +734,303 @@ fn columnar_block_on_gate(
         })
         .await
     })
+}
+
+/// The charged batch bytes at which a [`ColumnarRunJob`] stops taking blocks
+/// (issue #2795). The run stops after the block that takes its charge to this
+/// or past it, so it holds at most this plus one block's batches.
+pub(super) const RUN_HELD_BYTES_CAP: usize = 32 << 20;
+
+/// Up to [`Self::blocks`] consecutive blocks of one segment's columnar scan,
+/// decoded and built as one read-gate job, so the gate's per-job handoff is
+/// paid once per run rather than once per block (issue #2795).
+///
+/// The blocks decode one at a time through the reader, which frees a block's
+/// decoded columns when it decodes the next, so the run holds one decoded
+/// block at a time, charged in the `resident` reservation that travels with
+/// the scan exactly as a one-block job's does. Each block's batches are
+/// charged to the query pool as they are built ([`RunCharge::hold`]).
+///
+/// After each block the run stops, leaving the next block to the next job,
+/// when it has decoded [`Self::blocks`] blocks or the segment has none left,
+/// when its charged batch bytes have reached [`Self::byte_cap`], when the
+/// next block's stored ts bounds are above [`Self::ceiling`] (the stream then
+/// skips and counts that block as it would between one-block jobs), or when
+/// the next block is in another row group. That last stop keeps the run's
+/// held batches charged: decoding the next row group drops the previous
+/// group's dictionary values from the stream's [`StrValuesCache`], and with
+/// them the charge for values those batches still read.
+///
+/// A block that falls back to the row path or fails ends the run at that
+/// block, with the batches of the blocks before it returned.
+struct ColumnarRunJob {
+    /// Each block's decode and build; its `block` is the first block's
+    /// row-ref position.
+    job: ColumnarBlockJob,
+    /// The most blocks this run decodes.
+    blocks: usize,
+    /// The TopK threshold, read once as the job was built.
+    ceiling: Option<i64>,
+    byte_cap: usize,
+    /// [`block_index`]'s inputs for each later block's row-ref position.
+    row_refs: bool,
+    survivors: Option<Arc<Vec<usize>>>,
+    /// [`LogScanStream::block_cursor`] as the job was built.
+    cursor: usize,
+    key: String,
+}
+
+/// The stream's batch reservation and the counters that split it, moved into
+/// a [`ColumnarRunJob`] and back with its batches, so each block's batches are
+/// admitted once, as they are built, and stay charged until the stream emits
+/// them. While the job runs the stream's own counters are zero, so a stream
+/// that fails or is dropped meanwhile releases nothing twice.
+pub(super) struct RunCharge {
+    reservation: MemoryReservation,
+    /// [`LogScanStream::held`]: the run's batches.
+    held: usize,
+    /// [`LogScanStream::emitted`]: the batch handed downstream last.
+    emitted: usize,
+    /// [`LogScanStream::str_values_charge`].
+    str_values_charge: usize,
+}
+
+impl RunCharge {
+    /// [`LogScanStream::hold_batches`] for one block of a run: charge
+    /// `batches` and queue them behind the run's earlier blocks' batches.
+    fn hold(
+        &mut self,
+        batches: Vec<RecordBatch>,
+        str_values: &SharedStrValuesCache,
+        queue: &mut VecDeque<(RecordBatch, usize)>,
+    ) -> DFResult<()> {
+        let (charged, shared, live) = {
+            let mut cache = lock_str_values(str_values);
+            let live = cache.live_bytes();
+            let (charged, shared) = columnar_charges(batches, &cache);
+            (charged, shared, live)
+        };
+        if live < self.str_values_charge {
+            self.reservation.shrink(self.str_values_charge - live);
+            self.str_values_charge = live;
+        }
+        let bytes = charged.iter().map(|(_, c)| c).sum::<usize>() + shared;
+        let growth = live.saturating_sub(self.str_values_charge);
+        self.reservation.try_grow(bytes + growth)?;
+        self.str_values_charge += growth;
+        self.held += bytes;
+        queue.extend(charged);
+        Ok(())
+    }
+}
+
+/// A [`ColumnarRunJob`]'s batches and outcome.
+pub(super) struct RunStep {
+    /// Every batch of the run's clean blocks, in block order, each with its
+    /// own charge.
+    batches: VecDeque<(RecordBatch, usize)>,
+    /// The blocks decoded and built cleanly, with or without a surviving row.
+    clean: usize,
+    end: RunEnd,
+}
+
+/// Why a [`ColumnarRunJob`] stopped.
+pub(super) enum RunEnd {
+    /// At one of its limits, the next block left to the next job.
+    Stopped,
+    /// At a block that falls back to the row path, which the stream handles
+    /// as [`ColumnarStep::Fallback`].
+    Fallback,
+    /// At a block whose decode, build or charge failed.
+    Failed(DataFusionError),
+}
+
+impl ColumnarRunJob {
+    fn run(
+        mut self,
+        scan: &mut LogSegmentScan,
+        resident: &MemoryReservation,
+        charge: &mut RunCharge,
+    ) -> RunStep {
+        let mut batches = VecDeque::new();
+        let mut clean = 0;
+        let group = scan.next_block_row_group();
+        let mut block = std::mem::replace(&mut self.job.block, Ok(None));
+        let end = loop {
+            match self.job.decode(block, scan, resident) {
+                ColumnarStep::Held { batches: built } => {
+                    clean += 1;
+                    if !built.is_empty()
+                        && let Err(e) = charge.hold(built, &self.job.str_values, &mut batches)
+                    {
+                        break RunEnd::Failed(e);
+                    }
+                }
+                ColumnarStep::Fallback => break RunEnd::Fallback,
+                ColumnarStep::Failed(e) => break RunEnd::Failed(e),
+                // Each decode below has a block left, so this is not reached;
+                // the stream's next turn reports the exhaustion.
+                ColumnarStep::Exhausted(_) => break RunEnd::Stopped,
+            }
+            #[cfg(test)]
+            record_run_point(
+                &self.key,
+                RunPoint::Block {
+                    resident: resident.size(),
+                    decoded: LAST_DECODED_BYTES.with(std::cell::Cell::get),
+                    charged: charge.reservation.size().saturating_sub(charge.emitted),
+                    held: held_bytes(batches.iter().map(|(b, _)| b)),
+                },
+            );
+            if clean >= self.blocks
+                || charge.held >= self.byte_cap
+                || scan.remaining_blocks() == 0
+                || scan.next_block_row_group() != group
+            {
+                break RunEnd::Stopped;
+            }
+            if let Some(ceiling) = self.ceiling
+                && scan
+                    .next_block_ts_bounds()
+                    .is_some_and(|(min, max)| above_ceiling(min, max, ceiling))
+            {
+                break RunEnd::Stopped;
+            }
+            block = match scan.next_block_index() {
+                Some(next) => block_index(
+                    self.row_refs,
+                    self.survivors.as_deref().map(Vec::as_slice),
+                    Some(next),
+                    self.cursor + clean,
+                    &self.key,
+                ),
+                None => Ok(None),
+            };
+        };
+        #[cfg(test)]
+        record_run_point(
+            &self.key,
+            RunPoint::JobReturn {
+                resident: resident.size(),
+                decoded: LAST_DECODED_BYTES.with(std::cell::Cell::get),
+            },
+        );
+        RunStep {
+            batches,
+            clean,
+            end,
+        }
+    }
+}
+
+type RunJobFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    (Box<LogSegmentScan>, MemoryReservation, RunCharge, RunStep),
+                    CpuGateError,
+                >,
+            > + Send,
+    >,
+>;
+
+/// `job` on `gate` as one [`ReadSite::LogBlock`] job, as
+/// [`columnar_block_on_gate`] runs one block, with the batch charge moved in
+/// and back alongside the scan and its `resident` block charge.
+fn columnar_run_on_gate(
+    gate: Arc<ReadGate>,
+    size: JobSize,
+    mut scan: Box<LogSegmentScan>,
+    job: ColumnarRunJob,
+    resident: MemoryReservation,
+    mut charge: RunCharge,
+) -> RunJobFuture {
+    Box::pin(async move {
+        gate.run(ReadSite::LogBlock, size, move || {
+            #[cfg(test)]
+            assert!(!job.job.panic_for_test, "injected columnar block job panic");
+            let step = job.run(&mut scan, &resident, &mut charge);
+            (scan, resident, charge, step)
+        })
+        .await
+    })
+}
+
+/// A run of `blocks` blocks sized at `size`, one block's job size, per block.
+fn run_job_size(size: JobSize, blocks: usize) -> JobSize {
+    match size {
+        JobSize::Bytes(bytes) => {
+            JobSize::Bytes(bytes.saturating_mul(u64::try_from(blocks).unwrap_or(u64::MAX)))
+        }
+        other => other,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The decoded bytes of the block [`ColumnarBlockJob::decode`] decoded
+    /// last on this thread, as the reader reported them.
+    static LAST_DECODED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// A charge a run test reads ([`RUN_POINTS`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum RunPoint {
+    /// After a run block's batches were charged. `charged` is the run's
+    /// reservation less the previously emitted batch, `held` the Arrow bytes
+    /// of the run's queued batches, each array counted once.
+    Block {
+        resident: usize,
+        decoded: usize,
+        charged: usize,
+        held: usize,
+    },
+    /// As a run's job returns: the `resident` charge and the decoded bytes
+    /// of the run's last block, which the reader still holds.
+    JobReturn { resident: usize, decoded: usize },
+    /// As the stream takes a run's batches back, before emitting any.
+    Resumed { charged: usize, held: usize },
+}
+
+/// Object keys whose runs record [`RunPoint`]s, each with what it recorded.
+#[cfg(test)]
+pub(super) static RUN_POINTS: std::sync::Mutex<Vec<(String, Vec<RunPoint>)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_run_point(key: &str, point: RunPoint) {
+    if let Ok(mut armed) = RUN_POINTS.lock()
+        && let Some((_, points)) = armed.iter_mut().find(|(k, _)| k == key)
+    {
+        points.push(point);
+    }
+}
+
+/// The Arrow bytes `batches` hold, each distinct array counted once, so a
+/// dictionary's values shared by several batches count once.
+#[cfg(test)]
+pub(super) fn held_bytes<'a>(batches: impl Iterator<Item = &'a RecordBatch>) -> usize {
+    use datafusion::arrow::array::{Array, AsArray};
+    let mut seen: Vec<ArrayRef> = Vec::new();
+    let mut total = 0;
+    for batch in batches {
+        for column in batch.columns() {
+            let bytes = column.get_array_memory_size();
+            let Some(dict) = column.as_any_dictionary_opt() else {
+                total += bytes;
+                continue;
+            };
+            let values = dict.values();
+            let values_bytes = values.get_array_memory_size();
+            total += bytes.saturating_sub(values_bytes);
+            if !seen.iter().any(|v| Arc::ptr_eq(v, values)) {
+                total += values_bytes;
+                seen.push(Arc::clone(values));
+            }
+        }
+    }
+    total
 }
 
 /// Object keys whose next columnar block job panics on the gate. Keyed by
@@ -1284,7 +1611,7 @@ impl LogScanStream {
     fn next_row_block(&mut self, resume: RowResume) -> RowNext {
         match self.decoded.take() {
             Some(Decoded::Rows { block, next }) => return RowNext::Ready(block, next),
-            Some(Decoded::Columnar(_)) => {
+            Some(Decoded::Columnar(_) | Decoded::Run { .. }) => {
                 return RowNext::Failed(DataFusionError::Internal(
                     "a columnar block resumed on the row path".into(),
                 ));
@@ -1362,6 +1689,7 @@ impl LogScanStream {
             | LogScanState::Opening(_)
             | LogScanState::ReopenRows { .. }
             | LogScanState::DecodingColumnar { .. }
+            | LogScanState::DecodingRun { .. }
             | LogScanState::DecodingRows { .. }
             | LogScanState::Done => {}
         }
@@ -1758,13 +2086,29 @@ impl LogScanStream {
                 LogScanState::Columnar(scan) => {
                     let step = match this.decoded.take() {
                         Some(Decoded::Columnar(step)) => step,
+                        // The run's batches were held, and have been emitted,
+                        // before this turn; what is left is the cursor and
+                        // why the run stopped. Each clean block counts as a
+                        // one-block job's `Held` step does.
+                        Some(Decoded::Run { clean, end }) => {
+                            if clean > 0 {
+                                this.consecutive_fallbacks = 0;
+                            }
+                            this.block_cursor += clean;
+                            match end {
+                                RunEnd::Stopped => continue,
+                                RunEnd::Fallback => ColumnarStep::Fallback,
+                                RunEnd::Failed(e) => ColumnarStep::Failed(e),
+                            }
+                        }
                         Some(Decoded::Rows { .. }) => {
                             return this.fail(DataFusionError::Internal(
                                 "a row-path block resumed on the columnar path".into(),
                             ));
                         }
                         None => {
-                            if let Some(ceiling) = topk_ceiling(this.topk.as_ref()) {
+                            let ceiling = topk_ceiling(this.topk.as_ref());
+                            if let Some(ceiling) = ceiling {
                                 let skipped = skip_blocks_above(scan, ceiling);
                                 this.block_cursor += skipped;
                                 this.blocks.blocks_skipped_by_threshold.add(skipped);
@@ -1808,6 +2152,7 @@ impl LogScanStream {
                                 // Exhaustion decodes nothing, so it submits no
                                 // job.
                                 Some((gate, size)) if scan.remaining_blocks() > 0 => {
+                                    let blocks = this.blocks_per_job.min(scan.remaining_blocks());
                                     let LogScanState::Columnar(scan) =
                                         std::mem::replace(&mut this.state, LogScanState::Done)
                                     else {
@@ -1820,11 +2165,52 @@ impl LogScanStream {
                                     // scan: the reader frees that block only
                                     // when the job's decode runs.
                                     let resident = this.resident.take();
-                                    this.state = LogScanState::DecodingColumnar {
-                                        job: columnar_block_on_gate(
-                                            gate, size, scan, job, resident,
-                                        ),
-                                        started: Instant::now(),
+                                    this.state = if this.blocks_per_job > 1 {
+                                        let run = ColumnarRunJob {
+                                            job,
+                                            blocks,
+                                            ceiling,
+                                            byte_cap: this.run_byte_cap,
+                                            row_refs: this.row_refs,
+                                            survivors: this.current_survivors.clone(),
+                                            cursor: this.block_cursor,
+                                            key: this
+                                                .current_seg
+                                                .as_ref()
+                                                .map_or_else(String::new, |s| {
+                                                    s.data_object_key.clone()
+                                                }),
+                                        };
+                                        // Nothing is pending here, so the
+                                        // reservation covers only the batch
+                                        // emitted last and the cached
+                                        // dictionary values.
+                                        let charge = RunCharge {
+                                            reservation: this.reservation.take(),
+                                            held: std::mem::take(&mut this.held),
+                                            emitted: std::mem::take(&mut this.emitted),
+                                            str_values_charge: std::mem::take(
+                                                &mut this.str_values_charge,
+                                            ),
+                                        };
+                                        LogScanState::DecodingRun {
+                                            job: columnar_run_on_gate(
+                                                gate,
+                                                run_job_size(size, blocks),
+                                                scan,
+                                                run,
+                                                resident,
+                                                charge,
+                                            ),
+                                            started: Instant::now(),
+                                        }
+                                    } else {
+                                        LogScanState::DecodingColumnar {
+                                            job: columnar_block_on_gate(
+                                                gate, size, scan, job, resident,
+                                            ),
+                                            started: Instant::now(),
+                                        }
                                     };
                                     continue;
                                 }
@@ -2069,6 +2455,53 @@ impl LogScanStream {
                         }
                     }
                 }
+                LogScanState::DecodingRun { job, started } => {
+                    let started = *started;
+                    let ran = match job.as_mut().poll(cx) {
+                        Poll::Ready(ran) => ran,
+                        Poll::Pending => return Poll::Pending,
+                    };
+                    this.blocks.decode_build_elapsed.add_elapsed(started);
+                    match ran {
+                        Ok((scan, resident, charge, step)) => {
+                            this.resident = resident;
+                            this.reservation = charge.reservation;
+                            this.held = charge.held;
+                            this.emitted = charge.emitted;
+                            this.str_values_charge = charge.str_values_charge;
+                            let RunStep {
+                                batches,
+                                clean,
+                                end,
+                            } = step;
+                            #[cfg(test)]
+                            record_run_point(
+                                this.current_seg
+                                    .as_ref()
+                                    .map_or("", |s| s.data_object_key.as_str()),
+                                RunPoint::Resumed {
+                                    charged: this.reservation.size().saturating_sub(this.emitted),
+                                    held: held_bytes(batches.iter().map(|(b, _)| b)),
+                                },
+                            );
+                            if !batches.is_empty() {
+                                this.pending = Pending::Batches(batches);
+                            }
+                            this.decoded = Some(Decoded::Run { clean, end });
+                            this.state = LogScanState::Columnar(scan);
+                        }
+                        // The job's reservation went with it, releasing every
+                        // charge it carried; the stream's counters are zero.
+                        Err(err) => {
+                            let key = this
+                                .current_seg
+                                .as_ref()
+                                .map_or("", |s| s.data_object_key.as_str());
+                            let e = log_block_gate_failed(key, err);
+                            return this.fail(e);
+                        }
+                    }
+                }
                 LogScanState::DecodingRows {
                     job,
                     resume,
@@ -2099,6 +2532,9 @@ impl RecordBatchStream for LogScanStream {
         Arc::clone(&self.schema)
     }
 }
+
+#[cfg(test)]
+mod run_tests;
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]

@@ -3309,8 +3309,10 @@ pub async fn start_with_heartbeat(
             )?;
             sql_spill_owner = sql_spill.owner;
             let scan_decode_inline = config.query_budgets.sql_scan_decode_inline;
+            let scan_blocks_per_job = config.query_budgets.sql_scan_blocks_per_job;
             tracing::info!(
                 sql_scan_decode_inline = scan_decode_inline,
+                sql_scan_blocks_per_job = scan_blocks_per_job.get(),
                 "SQL logs and spans scans decode blocks {}",
                 if scan_decode_inline {
                     "inline on the polling worker"
@@ -3354,6 +3356,7 @@ pub async fn start_with_heartbeat(
                 // `--sql-scan-decode-inline` keeps it off those two scans.
                 cpu_gates.read.clone(),
                 scan_decode_inline,
+                scan_blocks_per_job,
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).

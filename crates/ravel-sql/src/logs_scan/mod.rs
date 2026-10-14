@@ -306,10 +306,17 @@
 //! [`LogSegmentScan::next_block_on_gate`], and the stream returns `Pending`
 //! from [`LogScanState::DecodingColumnar`] or [`LogScanState::DecodingRows`]
 //! while it runs. With no gate the decode runs inline.
+//!
+//! With [`LogsScanExec::with_blocks_per_job`] above 1 (issue #2795), one
+//! columnar job decodes up to that many consecutive blocks of the segment,
+//! one at a time, building and charging each block's batches before the next
+//! decode, and returns them together ([`LogScanState::DecodingRun`]). The
+//! row path stays one job per block.
 
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::future::Future;
+use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1165,6 +1172,13 @@ pub struct LogsScanExec {
     /// metric registration) so a production query pays nothing for a
     /// timeline only the bench reporter reads.
     segment_timing: bool,
+    /// The most consecutive blocks of one segment a columnar `log_block`
+    /// read-gate job decodes (`SqlConfig::logs_scan_blocks_per_job`, issue
+    /// #2795). `1` by default, installed with [`Self::with_blocks_per_job`].
+    blocks_per_job: usize,
+    /// The charged batch bytes at which a multi-block job stops taking
+    /// blocks ([`RUN_HELD_BYTES_CAP`] outside tests).
+    run_byte_cap: usize,
     /// Segments the provider skipped by declared-column statistics before
     /// building this scan (ADR-2121 D1), published as the
     /// `segments_pruned_by_stats` counter. Installed with
@@ -1650,6 +1664,7 @@ impl LogsScanExec {
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
+                .with_run_limits(self.blocks_per_job, self.run_byte_cap)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
@@ -1693,6 +1708,7 @@ impl LogsScanExec {
         .map(|scan| {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
+                .with_run_limits(self.blocks_per_job, self.run_byte_cap)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
@@ -1720,6 +1736,32 @@ impl LogsScanExec {
     /// reproduces the pre-gate scan exactly.
     pub(crate) fn with_segment_timing(mut self, segment_timing: bool) -> Self {
         self.segment_timing = segment_timing;
+        self
+    }
+
+    /// Decode up to `blocks` consecutive blocks of one segment in each
+    /// columnar `log_block` read-gate job (`SqlConfig::
+    /// logs_scan_blocks_per_job`, issue #2795). `1` (the default) is one job
+    /// per block, the scan before this setting existed.
+    pub(crate) fn with_blocks_per_job(self, blocks: NonZeroU32) -> Self {
+        let blocks = usize::try_from(blocks.get()).unwrap_or(usize::MAX);
+        let cap = self.run_byte_cap;
+        self.with_run_limits(blocks, cap)
+    }
+
+    /// Install (or carry across a rebuild) the run limits
+    /// [`Self::with_blocks_per_job`] and the run byte cap set.
+    fn with_run_limits(mut self, blocks_per_job: usize, run_byte_cap: usize) -> Self {
+        self.blocks_per_job = blocks_per_job;
+        self.run_byte_cap = run_byte_cap;
+        self
+    }
+
+    /// Stop a multi-block job once its charged batch bytes reach `cap`, in
+    /// place of [`RUN_HELD_BYTES_CAP`].
+    #[cfg(test)]
+    pub(crate) fn with_run_byte_cap(mut self, cap: usize) -> Self {
+        self.run_byte_cap = cap;
         self
     }
 
@@ -1822,6 +1864,8 @@ impl LogsScanExec {
             attr_keys: Arc::clone(&self.attr_keys),
             column_stats: self.column_stats.clone(),
             segment_timing: self.segment_timing,
+            blocks_per_job: self.blocks_per_job,
+            run_byte_cap: self.run_byte_cap,
             segments_pruned_by_stats: self.segments_pruned_by_stats,
             fetch,
             topk,
@@ -1967,6 +2011,8 @@ impl LogsScanExec {
             attr_keys: Arc::new(attr_keys),
             column_stats: None,
             segment_timing: false,
+            blocks_per_job: 1,
+            run_byte_cap: RUN_HELD_BYTES_CAP,
             segments_pruned_by_stats: 0,
             fetch: None,
             topk: None,
@@ -3016,6 +3062,8 @@ impl ExecutionPlan for LogsScanExec {
             blocks,
             metrics: self.metrics.clone(),
             segment_timing: self.segment_timing,
+            blocks_per_job: self.blocks_per_job,
+            run_byte_cap: self.run_byte_cap,
             origin: self.created_at,
             stream_started: Instant::now(),
             open_started: None,
@@ -3276,6 +3324,11 @@ struct LogScanStream {
     /// allocation, no metric registration, so `accumulate_scan_timing` finds
     /// no per-segment rows.
     segment_timing: bool,
+    /// [`LogsScanExec::blocks_per_job`]: above 1, a gated columnar decode is
+    /// a [`ColumnarRunJob`] of up to this many blocks.
+    blocks_per_job: usize,
+    /// [`LogsScanExec::run_byte_cap`].
+    run_byte_cap: usize,
     /// The exec's creation instant; every `*_offset` metric is measured from it.
     origin: Instant,
     /// When this partition's stream was built; `planning_wait_elapsed` and

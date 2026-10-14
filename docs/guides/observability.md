@@ -2549,6 +2549,14 @@ read gate's `span_section` site has no call site yet, so its figures stay at
 inline on the polling worker, so for SQL statements every site their
 fetchers use, `log_block`, `log_postings`, `log_section` and `span_block`,
 stays at 0. PromQL and LogQL reads of the same objects still count there.
+With `--sql-scan-blocks-per-job` above 1, one `log_block` job of the SQL
+`logs` scan's columnar path decodes up to that many consecutive blocks of a
+segment, so for those statements `log_block` counts these multi-block jobs,
+not blocks. Such a job is sized at the object's largest block times the
+blocks it may decode, so blocks each under the inline floor can together take
+a permit.
+The scan's row path, including a block that falls back to it, still counts
+one job per block.
 
 | Metric | Meaning |
 |---|---|

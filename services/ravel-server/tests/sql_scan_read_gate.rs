@@ -116,6 +116,7 @@ async fn publish_object(
     signal: Signal,
     writer_id: Uuid,
     bytes: Vec<u8>,
+    sample_count: u64,
     series_count: u64,
     max_event_ts_ns: i64,
     segment_format_version: u32,
@@ -129,7 +130,7 @@ async fn publish_object(
         writer_seq: 1,
         object_size: bytes.len() as u64,
         content_hash: *blake3::hash(&bytes).as_bytes(),
-        sample_count: BLOCKS,
+        sample_count,
         series_count,
         min_event_ts_ns: 0,
         max_event_ts_ns,
@@ -152,6 +153,17 @@ async fn publish_object(
 
 /// One RLOG object of [`BLOCKS`] one-record blocks, all one stream.
 async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
+    publish_padded_logs(store, tenant, BLOCKS, 0).await;
+}
+
+/// One RLOG object of `blocks` one-record blocks, all one stream, each
+/// record's body `row <ts>` followed by `pad` bytes.
+async fn publish_padded_logs(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    blocks: u64,
+    pad: usize,
+) {
     let writer_id = Uuid::from_u128(4_000);
     let mut writer = RlogWriter::new(
         RlogConfig {
@@ -167,7 +179,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
         },
     );
     let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
-    for ts in 0..BLOCKS as i64 {
+    for ts in 0..blocks as i64 {
         writer
             .push(LogRecord {
                 stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
@@ -176,7 +188,7 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
                 observed_ts_ns: ts,
                 severity_num: 9,
                 severity_text: "INFO".into(),
-                body: format!("row {ts}"),
+                body: format!("row {ts}{}", "x".repeat(pad)),
                 trace_id: None,
                 span_id: None,
                 flags: 0,
@@ -191,8 +203,9 @@ async fn publish_logs(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
         Signal::Logs,
         writer_id,
         bytes,
+        blocks,
         1,
-        BLOCKS as i64 - 1,
+        blocks as i64 - 1,
         u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
     )
     .await;
@@ -234,6 +247,7 @@ async fn publish_spans(store: &dyn ObjectStoreBackend, tenant: &TenantId) {
         Signal::Spans,
         writer_id,
         bytes,
+        BLOCKS,
         BLOCKS,
         BLOCKS as i64,
         u32::from(ravel_ingest::SPAN_SEGMENT_FORMAT_VERSION),
@@ -587,5 +601,70 @@ async fn sql_scan_decode_inline_server_keeps_scan_decodes_off_the_read_gate() {
         jobs + inline >= 1,
         "the catalog still decodes its snapshot part on the read gate: {:?}",
         inline_sites[3]
+    );
+}
+
+/// Blocks in the `--sql-scan-blocks-per-job` fixture's one logs object.
+const PADDED_BLOCKS: u64 = 9;
+/// Body padding per record of that fixture, so each one-record block is over
+/// the read gate's default 256 KiB inline floor and every `log_block` decode
+/// is a gate job rather than an inline run.
+const PADDED_BODY: usize = 300 * 1024;
+
+/// Starts a server over `store` with `--sql-scan-blocks-per-job` at `blocks`,
+/// runs one `logs` statement, and returns its rows with the `log_block`
+/// `(jobs, inline)` counts read after it ran.
+async fn run_blocks_per_job_arm(
+    store: Arc<dyn ObjectStoreBackend>,
+    blocks: u32,
+) -> (Vec<serde_json::Value>, (u64, u64)) {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new(TENANT));
+    let mut config = server_config(tokens);
+    config.query_budgets.sql_scan_blocks_per_job =
+        std::num::NonZeroU32::new(blocks).expect("nonzero");
+    let running = ravel_server::start(
+        config,
+        store.clone(),
+        store,
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts");
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+    let rows = sql_rows(&client, &base, "SELECT ts FROM logs ORDER BY ts").await;
+    let site = read_gate_site(&client, &base, "log_block").await;
+    running.shutdown().await.expect("graceful shutdown");
+    (rows, site)
+}
+
+/// Issue #2795: a server started with `--sql-scan-blocks-per-job 4` returns
+/// the same rows as one started with 1, from three `log_block` gate jobs for
+/// the object's nine blocks rather than nine.
+///
+/// Fails if `start` drops the budget on its way to the SQL executor (the
+/// second arm reads `(9, 0)`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sql_scan_blocks_per_job_server_runs_fewer_log_block_jobs() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    publish_padded_logs(store.as_ref(), &tenant, PADDED_BLOCKS, PADDED_BODY).await;
+
+    let (one_rows, one_site) = run_blocks_per_job_arm(store.clone(), 1).await;
+    let (four_rows, four_site) = run_blocks_per_job_arm(store, 4).await;
+
+    assert_eq!(one_rows.len() as u64, PADDED_BLOCKS);
+    assert_eq!(four_rows, one_rows, "both arms return the same rows");
+    assert_eq!(
+        one_site,
+        (PADDED_BLOCKS, 0),
+        "one gate job per block at 1 block per job"
+    );
+    assert_eq!(
+        four_site,
+        (PADDED_BLOCKS.div_ceil(4), 0),
+        "ceil(9 / 4) gate jobs at 4 blocks per job"
     );
 }

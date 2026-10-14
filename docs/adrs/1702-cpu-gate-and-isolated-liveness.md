@@ -156,7 +156,9 @@ rule on thread placement.
    `ravel-catalog::snapshot_format`) stay synchronous and runtime-free. The
    gate is applied at the async caller. (Qualified by the #2669 amendment
    below: an ingest decompression whose format declares no uncompressed
-   length it can trust is sized by an upper bound on that length.)
+   length it can trust is sized by an upper bound on that length. Extended
+   by the blocks-per-job amendment below: the SQL logs scan's columnar path
+   can make one job of several consecutive blocks.)
 
 5. **Cancellation.** A waiter dropped before it holds a permit never runs.
    A decode that has started runs to completion, because a `zstd::bulk`
@@ -188,7 +190,8 @@ rule on thread placement.
    machine gains a state that holds the pending gate future for one block.
    `poll_next` returns `Pending` while the block decodes. (Given an opt-out
    flag by the scan-decode opt-out amendment below; the default is
-   unchanged.)
+   unchanged. The blocks-per-job amendment below lets the logs scan's job
+   hold several blocks.)
 
 8. **Liveness and readiness get their own listener on their own thread.**
    A new flag `--listen-health <addr>` binds a listener served by a
@@ -876,3 +879,62 @@ The default is unchanged: with the flag unset, decision 7 stands as written.
 The flag exists to measure the gate's cost against its liveness benefit.
 Setting it gives up the isolation decision 7 gives scans: a scan over a large
 part holds a worker for the length of each block's decompress.
+
+## Amendment (2026-10-14): the blocks-per-job amendment (issue #2795)
+
+<!-- amendment-applies: sections="Decision" pointer="blocks-per-job amendment" -->
+
+Decision 4 makes one block one job. For the SQL `logs` scan's columnar path
+that unit becomes up to N consecutive blocks of one segment per `log_block`
+job, where N is `--sql-scan-blocks-per-job` (env
+`RAVEL_SQL_SCAN_BLOCKS_PER_JOB`). The default is 1, which is decision 4 as
+written; 0 is refused at startup. The row path, including a block that falls
+back to it, the late-materialization re-read and the `spans` scan keep one
+block per job.
+
+Why: the regression #2795 tracks came with one job per block, and the
+measurements posted there put most of it in the per-job handoff. On a
+c6a.4xlarge, single stream, 15 read permits, each read-gate statement ran
+13,223 `log_block` jobs; the handoff per job
+(`ravel_cpu_gate_handoff_seconds`) was 102 to 506 us under load against about
+20 us idle; summed and divided by the 11 to 14 jobs running at once, that is
+0.37 to 0.59 s of wall time on q19, q34 and q35, against an inline-decode gap
+of 0.46 to 0.55 s on the same statements. Paired A/Bs there ruled out thread
+locality (x1.011), the cross-thread free (x0.997) and the permit count (30
+permits x0.992, 60 permits x1.120). Fewer jobs pay fewer handoffs.
+
+A job of N blocks decodes them one at a time and builds each block's batches
+before the next decode. After each block it stops, leaving the next block to
+the next job, when it has decoded N blocks or the segment has none left; when
+the batches it holds are charged at 32 MiB or more; when the next block's
+stored ts bounds are above the TopK threshold, which the job reads once when
+it is built and decides each block against, so the stream skips and counts
+that block as it would between one-block jobs; or when the next block is in
+another row group. A block that falls back to the row path ends the job, and
+the batches of the blocks before it are returned and emitted before the
+fallback's rows.
+
+Its memory bounds:
+
+- One decoded block at a time. The reader frees a block's decoded columns
+  when it decodes the next, and the block it holds is charged in the same
+  `resident` reservation a one-block job carries, resized to each block as
+  its decode returns. When the job returns, that charge is the last block's
+  decoded bytes, which the reader still holds, exactly as after a one-block
+  job.
+- Every held batch charged, once. The scan's batch reservation moves into the
+  job and back with the batches, and each block's batches are charged to it as
+  they are built, so they stay charged until the stream emits them and are
+  never admitted a second time when the job returns.
+- The 32 MiB stop is on those charged batch bytes, so a job holds at most
+  32 MiB plus one block's batches.
+- The row-group stop keeps that charge whole. Decoding the next row group
+  drops the previous group's dictionary values from the scan's shared values
+  cache, and with them the charge for values a held batch may still read.
+
+The job is sized at the largest block size of the object
+(`block_job_bytes`, the size a one-block job carries) times the blocks it may
+decode, so the inline floor still compares the job's expected uncompressed
+bytes. `ravel_cpu_gate_jobs_total{site="log_block"}` and
+`ravel_cpu_gate_inline_total{site="log_block"}` count these jobs, not blocks;
+the scan's block counters (`blocks_scanned` and the rest) still count blocks.

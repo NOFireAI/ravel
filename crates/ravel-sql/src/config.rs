@@ -15,6 +15,7 @@
 //! sample cap cannot stand in for a byte cap.
 
 use std::ffi::OsStr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -478,6 +479,14 @@ pub struct SqlConfig {
     /// `sql_latency` reporter is the one caller that turns it on. Set once at
     /// server startup, like every other field here.
     pub segment_timing: bool,
+    /// How many consecutive blocks of one segment the `logs` scan's columnar
+    /// path decodes in one `log_block` read-gate job (issue #2795). `1`, the
+    /// default, is one job per block. Above 1 a job decodes up to this many
+    /// blocks in turn and returns all their batches; see the logs scan's
+    /// `ColumnarRunJob` for where a run stops early. The `spans` scan is
+    /// unaffected. Set once at server startup, from
+    /// `--sql-scan-blocks-per-job`.
+    pub logs_scan_blocks_per_job: NonZeroU32,
 }
 
 impl Default for SqlConfig {
@@ -494,6 +503,7 @@ impl Default for SqlConfig {
             // an operator decision rather than a version upgrade.
             spill: None,
             segment_timing: false,
+            logs_scan_blocks_per_job: NonZeroU32::MIN,
         }
     }
 }
@@ -648,6 +658,13 @@ mod tests {
     fn bounded_topk_defaults_to_a_limit_of_1024() {
         assert_eq!(SqlConfig::default().bounded_topk_max_limit, Some(1024));
         assert_eq!(DEFAULT_BOUNDED_TOPK_MAX_LIMIT, 1024);
+    }
+
+    /// Issue #2795: the logs scan decodes one block per read-gate job unless
+    /// configured otherwise.
+    #[test]
+    fn logs_scan_blocks_per_job_defaults_to_one() {
+        assert_eq!(SqlConfig::default().logs_scan_blocks_per_job.get(), 1);
     }
 
     fn cache_dir_spill(free_bytes: u64, memory_budget_bytes: u64) -> CacheDirSpill<'static> {

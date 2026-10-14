@@ -193,6 +193,7 @@ fn spill_config(spill_dir: PathBuf, scratch_bytes: u64, query_bytes: usize) -> S
             max_bytes: scratch_bytes,
         }),
         segment_timing: false,
+        logs_scan_blocks_per_job: std::num::NonZeroU32::MIN,
     }
 }
 
@@ -843,6 +844,7 @@ fn parallel_config(spill: Option<SpillConfig>) -> SqlConfig {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         spill,
         segment_timing: false,
+        logs_scan_blocks_per_job: std::num::NonZeroU32::MIN,
     }
 }
 
@@ -998,6 +1000,7 @@ async fn spill_off_reproduces_todays_refusal() {
         bounded_topk_max_limit: Some(ravel_sql::DEFAULT_BOUNDED_TOPK_MAX_LIMIT),
         spill: None,
         segment_timing: false,
+        logs_scan_blocks_per_job: std::num::NonZeroU32::MIN,
     };
     assert_eq!(config.spill, None, "this case is the spill-off default");
 

@@ -571,6 +571,7 @@ pub fn build_sql_state(
         None,
         None,
         false,
+        std::num::NonZeroU32::MIN,
         ravel_sql::DEFAULT_MIN_GRACE_MS,
         &SqlSpillInputs::default(),
     )
@@ -1061,6 +1062,8 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// `scan_decode_inline` (`--sql-scan-decode-inline`, issue #2795) keeps the
 /// gate off the logs and spans fetchers only, so those two scans decode
 /// inline while the `samples` scan's catalog decodes stay on the gate.
+/// `scan_blocks_per_job` (`--sql-scan-blocks-per-job`, issue #2795) is the
+/// executor's `SqlConfig::logs_scan_blocks_per_job`.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -1082,6 +1085,7 @@ pub fn build_sql_state_with_parquet(
     spill: &SqlSpillInputs,
     read_gate: Arc<ravel_cpu_gate::ReadGate>,
     scan_decode_inline: bool,
+    scan_blocks_per_job: std::num::NonZeroU32,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -1119,6 +1123,7 @@ pub fn build_sql_state_with_parquet(
         Some(sources),
         Some(read_gate),
         scan_decode_inline,
+        scan_blocks_per_job,
         ddl_min_grace_ms,
         spill,
     )
@@ -1143,6 +1148,7 @@ fn build_sql_state_inner(
     parquet: Option<ravel_sql::ParquetSources>,
     read_gate: Option<Arc<ravel_cpu_gate::ReadGate>>,
     scan_decode_inline: bool,
+    scan_blocks_per_job: std::num::NonZeroU32,
     ddl_min_grace_ms: u64,
     spill: &SqlSpillInputs,
 ) -> anyhow::Result<crate::sql::SqlState> {
@@ -1184,6 +1190,8 @@ fn build_sql_state_inner(
         // default so a production logs query never pays its per-segment
         // metric registrations.
         segment_timing: SqlConfig::default().segment_timing,
+        // Issue #2795: `--sql-scan-blocks-per-job`.
+        logs_scan_blocks_per_job: scan_blocks_per_job,
     }
     .with_spill_resolved(
         spill.off,
@@ -2442,6 +2450,7 @@ mod tests {
             &SqlSpillInputs::default(),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
             false,
+            std::num::NonZeroU32::MIN,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
@@ -2497,9 +2506,56 @@ mod tests {
             &SqlSpillInputs::default(),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
             false,
+            std::num::NonZeroU32::MIN,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
+    }
+
+    /// Issue #2795: `--sql-scan-blocks-per-job`, passed to
+    /// `build_sql_state_with_parquet`, is the executor's
+    /// `SqlConfig::logs_scan_blocks_per_job`. Fails with the `SqlConfig`
+    /// literal in `build_sql_state_inner` back on the default (reads 1).
+    #[test]
+    fn scan_blocks_per_job_reaches_the_executor() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog = build_catalog(
+            store.clone(),
+            1,
+            false,
+            ravel_catalog::DEFAULT_BYTE_CACHE_MAX_BYTES,
+            None,
+            None,
+            None,
+            Duration::from_secs(2),
+        )
+        .expect("catalog");
+        let blocks = std::num::NonZeroU32::new(4).expect("nonzero");
+        let state = build_sql_state_with_parquet(
+            catalog,
+            store,
+            Arc::new(StaticBearerTokenResolver::new(HashMap::new())),
+            None,
+            EngineConfig::default(),
+            Arc::new(GetLimiter::new(1).expect("nonzero permits")),
+            ravel_sql::DEFAULT_MAX_QUERY_BYTES,
+            DEFAULT_MAX_TENANT_BYTES,
+            false,
+            Arc::new(crate::metrics::QueryAccountingMetrics::new(
+                std::collections::HashSet::new(),
+            )),
+            QueryAdmissionController::shared(ravel_query::QueryConcurrencyLimit::Unlimited),
+            None,
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+            None,
+            ravel_sql::DEFAULT_MIN_GRACE_MS,
+            &SqlSpillInputs::default(),
+            crate::cpu_gates::CpuGates::new(Default::default()).read,
+            false,
+            blocks,
+        )
+        .expect("sql state builds");
+        assert_eq!(state.executor.config().logs_scan_blocks_per_job, blocks);
     }
 
     #[test]
@@ -2627,6 +2683,7 @@ mod tests {
                 &SqlSpillInputs::default(),
                 crate::cpu_gates::CpuGates::new(Default::default()).read,
                 false,
+                std::num::NonZeroU32::MIN,
             )
             .expect("sql state builds")
         };
@@ -3346,6 +3403,7 @@ mod tests {
             inputs,
             crate::cpu_gates::CpuGates::new(Default::default()).read,
             false,
+            std::num::NonZeroU32::MIN,
         )
         .expect("sql state builds");
         state.executor.config().spill.clone()

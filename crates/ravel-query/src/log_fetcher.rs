@@ -398,6 +398,16 @@ impl LogSegmentScan {
         self.scan.as_ref().and_then(BlockScan::next_block_ts_bounds)
     }
 
+    /// The first whole-object block index of the row group holding the block
+    /// the next decode call would decode, from the object's PAGE_DIR. `None`
+    /// once the scan is exhausted or its cursor is lost.
+    pub fn next_block_row_group(&self) -> Option<usize> {
+        let scan = self.scan.as_ref()?;
+        let block = u32::try_from(scan.next_block_index()?).ok()?;
+        let (group, _) = scan.page_dir().locate_block(block)?;
+        usize::try_from(group.first_block).ok()
+    }
+
     /// Move past the next surviving block without decoding it; see
     /// [`BlockScan::skip_next_block`]. `false` once the scan is exhausted or
     /// its cursor is lost.

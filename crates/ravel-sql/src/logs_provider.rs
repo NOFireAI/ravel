@@ -24,6 +24,7 @@
 //! never which rows the query returns.
 
 use std::fmt;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -98,6 +99,10 @@ pub struct LogsTableProvider {
     /// per-segment scan timeline (`SqlConfig::segment_timing`). `false` by
     /// default, installed with [`Self::with_segment_timing`].
     segment_timing: bool,
+    /// Blocks per `log_block` read-gate job for every `LogsScanExec` this
+    /// provider builds (`SqlConfig::logs_scan_blocks_per_job`, issue #2795).
+    /// `1` by default, installed with [`Self::with_scan_blocks_per_job`].
+    scan_blocks_per_job: NonZeroU32,
     /// Whether [`Self::build_scan`] skips segments by declared-column
     /// statistics (ADR-2121 D1). Always `true` outside tests, which turn it
     /// off to compare against the unpruned scan.
@@ -128,6 +133,7 @@ impl LogsTableProvider {
             #[cfg(feature = "flight-sql")]
             distributed: None,
             segment_timing: false,
+            scan_blocks_per_job: NonZeroU32::MIN,
             stats_pruning: true,
         }
     }
@@ -245,6 +251,14 @@ impl LogsTableProvider {
         self
     }
 
+    /// Set how many consecutive blocks of a segment every `LogsScanExec` this
+    /// provider builds decodes in one `log_block` read-gate job on its
+    /// columnar path (issue #2795). `1` (the default) is one job per block.
+    pub fn with_scan_blocks_per_job(mut self, blocks: NonZeroU32) -> Self {
+        self.scan_blocks_per_job = blocks;
+        self
+    }
+
     /// Turn plan-time statistics pruning off, so a test can compare the rows
     /// and fetches of the same query with and without it.
     #[cfg(test)]
@@ -317,6 +331,7 @@ impl LogsTableProvider {
         )?
         .with_column_stats(self.column_stats.clone())
         .with_segment_timing(self.segment_timing)
+        .with_blocks_per_job(self.scan_blocks_per_job)
         .with_segments_pruned_by_stats(pruned_by_stats);
         Ok(Arc::new(scan))
     }

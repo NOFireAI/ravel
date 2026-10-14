@@ -662,6 +662,8 @@ fn task_ctx_with_query_bytes(max_query_bytes: usize) -> Arc<TaskContext> {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        // Issue #2795: one block per read-gate job, as on the shipped default.
+        logs_scan_blocks_per_job: std::num::NonZeroU32::MIN,
     };
     let tenant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());

@@ -80,6 +80,8 @@ mod logs_plan_concurrency;
 mod logs_provider;
 #[path = "logs_request_cost_knob_routing.rs"]
 mod logs_request_cost_knob_routing;
+#[path = "logs_scan_blocks_per_job.rs"]
+mod logs_scan_blocks_per_job;
 #[path = "logs_scan_fetch_pushdown.rs"]
 mod logs_scan_fetch_pushdown;
 #[path = "logs_selective_scan_amplification.rs"]

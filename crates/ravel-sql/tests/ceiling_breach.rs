@@ -74,6 +74,8 @@ async fn a_join_that_overruns_the_query_ceiling_aborts_and_frees_the_tenant_budg
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        // Issue #2795: one block per read-gate job, as on the shipped default.
+        logs_scan_blocks_per_job: std::num::NonZeroU32::MIN,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

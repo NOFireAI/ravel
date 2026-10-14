@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -1475,6 +1476,26 @@ pub struct Cli {
     /// otherwise.
     #[arg(long, env = "RAVEL_SQL_SCAN_DECODE_INLINE")]
     pub sql_scan_decode_inline: bool,
+
+    /// Consecutive blocks of one segment the SQL `logs` scan decodes in one
+    /// `log_block` read CPU gate job on its columnar path (issue #2795).
+    /// Default 1, one job per block. Above 1 a job decodes up to this many
+    /// blocks in turn, paying the gate's per-job handoff once for all of
+    /// them, and stops early at the end of the segment or of a row group, at
+    /// a block the TopK threshold skips, at a block that falls back to the
+    /// row path, or once its built batches reach 32 MiB. With a value above
+    /// 1, `ravel_cpu_gate_jobs_total{site="log_block"}` counts these
+    /// multi-block jobs, not blocks. The `spans` scan and the logs row path
+    /// still decode one block per job. 0 is refused at startup. The value is
+    /// logged at startup. Meaningful only in a build with the `sql` feature;
+    /// inert otherwise.
+    #[arg(
+        long,
+        env = "RAVEL_SQL_SCAN_BLOCKS_PER_JOB",
+        default_value_t = 1,
+        value_name = "BLOCKS"
+    )]
+    pub sql_scan_blocks_per_job: u32,
 
     /// Bounded ephemeral SQL spill (ADR-0954, amended by issue #2416). `auto`
     /// (default) spills an exactness-eligible query that exceeds its memory
@@ -2969,6 +2990,11 @@ pub struct QueryBudgets {
     /// their blocks inline rather than on the read CPU gate (issue #2795).
     /// Reaches [`crate::query::build_sql_state_with_parquet`]. Default `false`.
     pub sql_scan_decode_inline: bool,
+    /// `--sql-scan-blocks-per-job`: the most consecutive blocks one columnar
+    /// `log_block` job of the SQL `logs` scan decodes (issue #2795). Reaches
+    /// `SqlConfig::logs_scan_blocks_per_job` through
+    /// [`crate::query::build_sql_state_with_parquet`]. Default 1.
+    pub sql_scan_blocks_per_job: NonZeroU32,
     /// The operator's explicit `--logs-block-range-threshold`, or `None` when
     /// the flag was not set (ADR-0107). Feeds the ADR-0996 resolution as both
     /// the configured value (`None` meaning
@@ -3026,6 +3052,7 @@ impl Default for QueryBudgets {
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
             sql_scan_decode_inline: false,
+            sql_scan_blocks_per_job: NonZeroU32::MIN,
             logs_block_range_threshold: None,
             logs_request_cost_bytes: None,
             logs_fetch_policy: ravel_query::LogsFetchPolicy::default(),
@@ -6402,6 +6429,19 @@ impl Cli {
                 .is_some_and(crate::store::is_loopback_endpoint)
     }
 
+    /// `--sql-scan-blocks-per-job`, refusing 0: a job of no blocks would never
+    /// decode one. [`Self::validate`] calls this so startup refuses before
+    /// anything is written.
+    pub fn resolve_sql_scan_blocks_per_job(&self) -> anyhow::Result<NonZeroU32> {
+        NonZeroU32::new(self.sql_scan_blocks_per_job).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--sql-scan-blocks-per-job '0' would never decode a block: each SQL logs \
+                 scan job decodes at least one. Omit the flag for one block per job, or set \
+                 a positive count."
+            )
+        })
+    }
+
     /// Resolve `--logs-fetch-policy` and its provenance (ADR-1196, ADR-2023
     /// decision 1, ADR-2677 decision 7). The one place this decision is made:
     /// [`Self::query_budgets`] is its only caller, and both the engine-bound
@@ -6460,6 +6500,7 @@ impl Cli {
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
             sql_scan_decode_inline: self.sql_scan_decode_inline,
+            sql_scan_blocks_per_job: self.resolve_sql_scan_blocks_per_job()?,
             logs_block_range_threshold: self.logs_block_range_threshold,
             logs_request_cost_bytes: self.logs_request_cost_bytes,
             logs_fetch_policy: logs_fetch_policy.policy(),
@@ -7364,6 +7405,7 @@ impl Cli {
                 );
             }
         }
+        self.resolve_sql_scan_blocks_per_job()?;
 
         // ADR-0076 decision 4: parsed and range-checked here so a malformed
         // or partially-overridden flush cadence fails startup, not the first
@@ -14048,6 +14090,61 @@ mod tests {
         assert_eq!(
             arg.get_env().and_then(|e| e.to_str()),
             Some("RAVEL_SQL_SCAN_DECODE_INLINE")
+        );
+    }
+
+    /// Issue #2795: `--sql-scan-blocks-per-job` defaults to 1, reads
+    /// `RAVEL_SQL_SCAN_BLOCKS_PER_JOB`, reaches the resolved budgets, and 0 is
+    /// refused by `Cli::validate`.
+    ///
+    /// Fails with the `resolve_sql_scan_blocks_per_job()?` line removed from
+    /// `Cli::validate` (the zero case validates), and with `query_budgets`
+    /// reading anything but the flag (the budgets read 1 for `4`).
+    #[test]
+    fn sql_scan_blocks_per_job_defaults_to_one_and_refuses_zero() {
+        use clap::CommandFactory;
+
+        let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
+        assert_eq!(unset.sql_scan_blocks_per_job, 1);
+        assert_eq!(
+            unset
+                .query_budgets(&resolved_from(&unset))
+                .expect("budgets resolve")
+                .sql_scan_blocks_per_job
+                .get(),
+            1
+        );
+        assert_eq!(QueryBudgets::default().sql_scan_blocks_per_job.get(), 1);
+
+        let set = Cli::try_parse_from(["ravel-server", "--sql-scan-blocks-per-job", "4"])
+            .expect("parses");
+        set.validate().expect("a positive count validates");
+        assert_eq!(
+            set.query_budgets(&resolved_from(&set))
+                .expect("budgets resolve")
+                .sql_scan_blocks_per_job
+                .get(),
+            4
+        );
+
+        let zero = Cli::try_parse_from(["ravel-server", "--sql-scan-blocks-per-job", "0"])
+            .expect("flag parses at the CLI layer");
+        let err = zero
+            .validate()
+            .expect_err("startup must refuse a zero-block job");
+        assert!(
+            err.to_string().contains("--sql-scan-blocks-per-job"),
+            "the refusal names the flag: {err}"
+        );
+
+        let command = Cli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_long() == Some("sql-scan-blocks-per-job"))
+            .expect("the flag is registered");
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("RAVEL_SQL_SCAN_BLOCKS_PER_JOB")
         );
     }
 

@@ -2123,7 +2123,8 @@ impl SqlExecutor {
                     )
                     .with_declared_columns(extras.declared)
                     .with_column_stats(column_stats)
-                    .with_segment_timing(config.segment_timing),
+                    .with_segment_timing(config.segment_timing)
+                    .with_scan_blocks_per_job(config.logs_scan_blocks_per_job),
                 ))
             }
             // The alerts and audit providers are not yet threaded onto the
@@ -3087,7 +3088,8 @@ impl SqlExecutor {
                     PhaseAccounting::new(),
                 )
                 .with_declared_columns(declared.to_vec())
-                .with_segment_timing(self.config.segment_timing),
+                .with_segment_timing(self.config.segment_timing)
+                .with_scan_blocks_per_job(self.config.logs_scan_blocks_per_job),
             )),
             TargetSignal::Spans => SessionTable::Spans(Arc::new(SpansTableProvider::new(
                 empty_snapshot(),
