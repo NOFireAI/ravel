@@ -374,6 +374,9 @@ that redefines `@timestamp`:
   returns for the same window. The response stats state the window that
   was used.
 
+The derived window is also applied to rows; see the row filter amendment
+below.
+
 The request may also pass `start` and `end`. They narrow the window and
 are applied as a filter on `@timestamp`, so they change the result and
 are visible in the request, never implied. `ROW` queries need no window
@@ -563,3 +566,38 @@ Each depends on this one. Those marked with a decision need their own ADR.
   How strongly the syntax coverage and execution compatibility figures can
   be stated does (D3): without an oracle they are claims against the
   published reference.
+
+## Amendment: the derived window is also a row filter
+
+<!-- amendment-applies: sections="D11. The time window is derived or stated, never defaulted" pointer="row filter amendment" -->
+
+D11 derives the window the catalog resolves, and its first implementation
+used that window only to choose which segments to read. A segment is read
+when its event-time range overlaps the window, so the bounds the binder
+fills in (the query clock as the end when the query gives no upper bound,
+the Unix epoch as the start when it gives no lower bound) decided which
+rows came back by segment layout. A row timestamped after the query clock
+was returned when its segment also held earlier rows and dropped when the
+whole segment lay after the clock, so the same query over the same data
+could change its answer after compaction.
+
+The derived window is therefore also applied to every row the scan
+returns, through the executor's existing row-window filter. A row outside
+the window is never returned, whatever the segment layout.
+
+Consequences:
+
+- A query with no upper bound returns no row timestamped after the query
+  clock. Elasticsearch returns such future-dated documents. This is a
+  divergence, recorded in the manifest beside D10's.
+- The window and its row filter apply to the stored event timestamp. A
+  query that redefines `@timestamp` with `EVAL` or `RENAME` before its
+  `WHERE` gets no window from that `WHERE`, so it reads from the epoch to
+  the query clock on the stored timestamp: a row stored after the clock is
+  not returned even when its redefined `@timestamp` passes the `WHERE`.
+- A query with no lower bound returns no row timestamped before the Unix
+  epoch.
+- A lower bound later than the query clock with no upper bound returns no
+  rows. It is not refused.
+- The `WHERE` predicates stay filters as well; the window narrows what is
+  read and what is returned, and never widens either.
