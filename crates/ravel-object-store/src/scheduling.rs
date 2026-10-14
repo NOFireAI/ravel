@@ -88,10 +88,11 @@
 //! [`ClassedStore::passthrough`] is the default construction: both handles are
 //! the inner store itself (`Arc::clone`), so every op delegates directly with
 //! no permit acquire and no added latency -- byte-for-byte today's behavior.
-//! [`ClassedStore::scheduled`] is opt-in and installs the scheduler. The flag
-//! that selects between them (`--store-scheduling`) and the wiring into
-//! `build_store` are a separate task (E5-T2); this module ships the mechanism
-//! and its tests only, constructed but not yet adopted.
+//! [`ClassedStore::scheduled`] is opt-in and installs the scheduler.
+//! `ravel-server`'s `build_store` wraps its store in a `ClassedStore` and picks
+//! between the two with `--store-scheduling` (off by default), sizing the
+//! scheduler from `--store-fg-permits` and `--store-bg-permits` with a
+//! background floor of 1.
 //!
 //! # Metrics
 //!

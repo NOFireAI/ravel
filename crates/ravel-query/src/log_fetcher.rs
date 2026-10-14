@@ -2,8 +2,10 @@
 //! (crate `ravel-logseg`, docs/log-segment-format.md; ADR-0033).
 //!
 //! This is the log-signal sibling of [`crate::SegmentFetcher`], which serves
-//! the RSEG metric path. The two never share code and never touch each other:
-//! RSEG and RLOG share only conventions, not bytes. Where `SegmentFetcher`
+//! the RSEG metric path. The two share no fetch code: RSEG and RLOG share
+//! conventions, not bytes. They do share runtime limits when wired to them: a
+//! [`crate::QueryEngine`] hands its RSEG and RLOG fetchers one GET limiter and
+//! one fetch memory budget. Where `SegmentFetcher`
 //! re-implements the footer-first suffix-GET / range-chase / decode protocol
 //! itself, an RLOG object is read through [`ravel_logseg::RlogReader`], which
 //! already performs the whole open/prune/verify/decode pipeline internally.
@@ -3899,10 +3901,15 @@ pub const DEFAULT_LOG_WHOLE_OBJECT_THRESHOLD: u64 = 512 * 1024;
 /// measurement, not a claim about RSEG's behavior.
 pub const DEFAULT_LOG_COVERAGE_THRESHOLD: f64 = 0.75;
 
-/// Default bound on concurrent byte-range GETs one block-range fetch keeps in
-/// flight. Sized independently from `crate::fetcher::SegmentFetcher`'s semaphore
-/// (ADR-0107 decision 1: "sized independently for RLOG's call volume"); RSEG and
-/// RLOG never share the permit pool.
+/// Permit count of the private [`crate::GetLimiter`]s a standalone RLOG fetcher
+/// starts with: [`LogSegmentFetcher::new`] builds one for its whole-object path
+/// and its internal [`BlockRangeFetcher`] another, and [`BlockRangeFetcher::new`]
+/// builds one for itself. Each bounds in-flight GETs only until
+/// `with_get_limiter` or `with_max_concurrent_gets` replaces it. A
+/// [`crate::QueryEngine`] wires its RLOG and RSEG fetchers to one limiter sized
+/// by `store_get_concurrency()`, and `ravel-server` wires one process-wide
+/// limiter (`--store-get-concurrency`) into every fetcher it builds, so inside
+/// the server this constant bounds nothing.
 pub const DEFAULT_LOG_MAX_CONCURRENT_GETS: usize = 16;
 
 /// Upper bound on decoded SKIP_IDX block count, mirroring the reader's own
