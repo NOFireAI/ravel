@@ -57,8 +57,9 @@ pub const MAX_BOUND_NODES: usize = 1 << 20;
 
 /// An expression the bound output repeats is copied only up to this many
 /// nodes. A larger one is computed once under a fresh internal name ahead of
-/// the stage that reads it, and the copies read that column, so no operand is
-/// copied more than once whatever its size.
+/// the stage that reads it, and the copies read that column, so an operand
+/// larger than this appears once in the bound statement however often it is
+/// read.
 const INLINE_NODES: usize = 4;
 
 /// What binding produced.
