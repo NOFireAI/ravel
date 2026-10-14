@@ -404,10 +404,9 @@ async fn analyze_stuck_on_the_store_returns_the_deadline_error() {
 
     let mut opts = options(GROUPED, true);
     opts.deadline = Duration::from_secs(2);
-    let (result, ()) = tokio::time::timeout(
-        Duration::from_secs(60),
-        async { tokio::join!(explain(store, &opts), gate.wait_until_held(1)) },
-    )
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        tokio::join!(explain(store, &opts), gate.wait_until_held(1))
+    })
     .await
     .expect("the run reaches the held GET and then its deadline");
     let err = result.expect_err("the held GET outlasts the deadline");

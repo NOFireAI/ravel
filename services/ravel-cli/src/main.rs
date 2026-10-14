@@ -969,7 +969,8 @@ enum SqlCommand {
         max_rows: Option<usize>,
         /// The SQL engine's partition count. Defaults to the engine's own
         /// default; the server's `--sql-partition-count` may differ, and the
-        /// plan shape depends on it.
+        /// plan shape depends on it. Zero is refused, as the server refuses
+        /// it.
         #[arg(long)]
         sql_partitions: Option<usize>,
     },
@@ -5727,9 +5728,9 @@ mod cli_reference_tests {
     use std::path::{Path, PathBuf};
 
     use clap::CommandFactory;
-    use ravel_server::cli_reference::{count_data_rows, render_command_tree_block, user_args};
     #[cfg(all(test, not(feature = "sql-explain")))]
     use ravel_server::cli_reference::{BEGIN_MARKER, END_MARKER, splice};
+    use ravel_server::cli_reference::{count_data_rows, render_command_tree_block, user_args};
 
     use super::Cli;
 
