@@ -429,11 +429,15 @@ fn the_deepest_double_stats_where_runs_on_a_worker_stack() {
     );
 }
 
+/// A statement at a nesting count, and the cell `x` it returns when it is
+/// admitted.
+type Nested = (fn(usize) -> String, Option<&'static str>);
+
 /// Each statement at the deepest nesting the parser admits, on a 2 MiB
 /// thread: the rows it returns, or its depth refusal.
 #[test]
 fn the_parsers_deepest_statements_run_or_are_refused_on_a_worker_stack() {
-    let shapes: [(fn(usize) -> String, Option<&str>); 9] = [
+    let shapes: [Nested; 9] = [
         (|c| format!("ROW x = 9{}", " / 1".repeat(c)), None),
         (|c| format!("ROW x = 1.0{}", " + 1".repeat(c)), None),
         (|c| format!("ROW x = {}true", "NOT ".repeat(c)), None),

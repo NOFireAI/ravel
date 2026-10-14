@@ -76,12 +76,13 @@ pub const MAX_EXPRESSION_DEPTH: usize = 24;
 /// it is refused with a verification error.
 ///
 /// Plan depth and expression depth draw on the same recursions, so both
-/// limits were measured together on the unoptimized test build. Alone,
-/// shallow filters overflowed a 1 MiB stack past 22 stages and an `AND`
-/// chain past 45 levels; at these limits, the deepest admitted expression in
-/// every stage of a `WHERE`, `SORT`, `EVAL`, `STATS` field or per-aggregate
-/// `WHERE` pipeline plans and runs on 1 MiB, half the 2 MiB stack of a
-/// server worker thread.
+/// limits were measured together on the unoptimized test build. With neither
+/// limit applied, 21 `WHERE dur > 0` filters (23 stages) ran on a 1 MiB
+/// stack and 22 overflowed it, as did one `WHERE` of 45 `AND`ed comparisons
+/// where 44 ran. At these limits, the deepest admitted expression in every
+/// stage of a `WHERE`, `SORT`, `EVAL`, `STATS` field or per-aggregate `WHERE`
+/// pipeline plans and runs on 1 MiB, half the 2 MiB stack of a server worker
+/// thread.
 pub const MAX_PLAN_STAGES: usize = 12;
 
 /// An expression the bound output repeats is copied only up to this many
