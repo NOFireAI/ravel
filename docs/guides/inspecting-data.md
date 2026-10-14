@@ -618,15 +618,16 @@ slice-compaction node register neither and show their own counters, such as
 `fast_path_ranged_segments` on the scan.
 
 Without `--analyze` the command runs no query and prints the plan with no
-metrics. It still reads the store to plan: catalog LIST and GET requests,
-column-statistics GETs and Parquet footer reads.
+metrics. It still reads the store to plan: catalog LIST and GET requests and
+column-statistics GETs.
 
-The two modes do not plan the same way. `--analyze` plans as the Flight SQL
-path does (`plan_pinned_with_inputs`), whose column-statistics window is the
-one covering the resolved snapshot's segments (`snapshot_covering_window`).
-The plain mode plans as `SqlExecutor::explain` does, with the request's own
-`--start`/`--end` window. The two plans can therefore differ for data at the
-edges of the window.
+The two modes do not plan the same way. The plain mode plans as
+`SqlExecutor::explain` does, with the request's own `--start`/`--end` window
+for column statistics, which is the window `POST /api/v1/sql` also uses.
+`--analyze` plans as the Flight SQL path does (`plan_pinned_with_inputs`),
+whose column-statistics window is the one covering the resolved snapshot's
+segments (`snapshot_covering_window`). An `--analyze` plan can therefore
+differ from the HTTP endpoint's plan for data at the edges of the window.
 
 - `--unaudited` is required. This command writes no query-audit record, so it
   refuses to run without the flag, before it builds the store or sends a
@@ -652,3 +653,7 @@ edges of the window.
   (`typed-attr-column set`) are read from its config record; columns declared
   only by a server's `--typed-attr-column` or `--typed-attr-column-tenant`
   flags are not visible to this command.
+- Parquet tables are not supported. The command installs no Parquet
+  sources, so a Parquet table is never registered in its session and a
+  statement over one cannot be planned, as on a server with no Parquet
+  sources configured.
