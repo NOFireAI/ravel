@@ -215,16 +215,26 @@ The cost is that a split read's extra permits are only those free at that
 moment: a read whose class has no free permit when its first response arrives
 fetches every range one at a time, even if permits free up during it.
 
-**Worst-case wall time for one logical operation.** A request timeout is a
-retryable error, and `object_store` runs its own internal retry loop
-(`RetryConfig`, unchanged: `max_retries = 10`, `retry_timeout = 180 s`,
-jittered exponential backoff), stopping before it *starts* a retry once 180 s
-have elapsed since the first attempt. The final in-flight attempt still runs
-its full 20 s, so one logical operation can spend about `retry_timeout +
-request_timeout` = 180 s + 20 s ≈ 200 s inside the adapter before surfacing an
-error. Callers bound this from above: every caller passes a deadline and the
-trait honors cancellation by drop, so the query deadline (usually well under
-180 s) is what ends one operation in practice.
+**Worst-case wall time for one logical operation.** `object_store` runs its
+own internal retry loop (`RetryConfig`, unchanged: `max_retries = 10`,
+`retry_timeout = 180 s`, jittered exponential backoff), stopping before it
+*starts* a retry once 180 s have elapsed since the first attempt. What it
+retries depends on the failure and the operation. A retryable status (5xx,
+including `503 SlowDown`, and 429) is retried for every operation. A request
+timeout is retried only for a request `object_store` treats as idempotent:
+GET, HEAD, an `Overwrite` PUT and each multipart part PUT are; a conditional
+PUT (`CreateIfAbsent` or `CasVersion`) is not, so a hung conditional PUT
+surfaces `Timeout` after one 20 s request, and the caller's own retry loop
+decides what happens next. Where the loop does retry, the final in-flight
+attempt still runs its full 20 s, so one logical operation can spend about
+`retry_timeout + request_timeout` = 180 s + 20 s ≈ 200 s inside the adapter
+before surfacing an error. The tests
+`timed_out_conditional_put_is_not_retried_by_object_store` and
+`timed_out_overwrite_put_and_get_are_retried_by_object_store` in
+`crates/ravel-object-store/src/s3.rs` pin the per-operation split. Callers
+bound this from above: every caller passes a deadline and the trait honors
+cancellation by drop, so the query deadline (usually well under 180 s) is what
+ends one operation in practice.
 
 ### Semantics adapters MUST honor
 
