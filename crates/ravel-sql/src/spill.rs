@@ -41,8 +41,16 @@
 //! [`SpillRootOwner::sweep_orphaned_spill_roots`] (holding its own) to remove
 //! every sibling root whose lock it can take itself; a sibling whose
 //! ownership cannot be settled either way is left in place and logged, never
-//! guessed at. There is still no node-wide or per-tenant scratch quota;
-//! that remains follow-up work.
+//! guessed at.
+//!
+//! # The ceiling is per process
+//!
+//! `SpillConfig::max_bytes` is one ceiling per [`SqlExecutor`](crate::SqlExecutor):
+//! every query the executor grants spill reserves its own scratch cap from it
+//! before its disk manager is built, and `ravel-server` builds one executor
+//! for the whole process, so the ceiling bounds all of that process's queries
+//! together. No tenant has a quota of its own within it, and nothing bounds
+//! the sum across processes that share one volume.
 //!
 //! # What the figures count
 //!
