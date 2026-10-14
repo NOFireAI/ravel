@@ -1686,7 +1686,7 @@ bounds the number of strict requests waiting for their ack.
 | strict flush policy (process default, all strict surfaces) | `aged` (`--strict-flush-policy`, `RAVEL_STRICT_FLUSH_POLICY`; `arrival` opens a strict write's flush on arrival) |
 | min_flush_bytes (object bytes, not buffered memory) | 256 KiB (`--min-flush-bytes`) |
 | idle_flush_byte_floor (object bytes, all three pipelines) | 0 = disabled (`--idle-flush-byte-floor`, must be below `min_flush_bytes`; a non-zero floor makes a buffer under it wait `max_flush_lifetime` less one `flush_tick` and widens the buffered-mode loss window to match) |
-| put retry budget | 4 attempts, 100ms..2s jittered backoff |
+| put retry budget | 4 retries (5 attempts), 100ms..2s jittered backoff |
 | max in-flight ingest requests (process-wide) | 1024 (`--max-inflight-ingest-requests`, 0 = unlimited) |
 | max pending strict acks (process-wide, one budget shared by the three routers) | 8,192 (`--max-pending-strict-acks`, `RAVEL_MAX_PENDING_STRICT_ACKS`: the in-flight ingest ceiling times eight, 0 = unlimited, refused above the tokio semaphore maximum) |
 | max ingest buffer bytes (process-wide, all signals) | 512 MiB (`--max-ingest-buffer-bytes`, 0 = unlimited) |
