@@ -27,7 +27,9 @@ use crate::footer::{
     COMP_NONE, COMP_ZSTD, LogFooter, SectionDesc, SortDescriptor, SortKeyType, kind,
     write_footer_and_trailer,
 };
-use crate::key_index::{Key8, KeyIndexPlan, KeyType, TRACE_ID_FIELD, key8_of};
+use crate::key_index::{
+    KEY_IDX_BUCKET_MAX_ENTRIES, Key8, KeyIndexPlan, KeyType, TRACE_ID_FIELD, key8_of,
+};
 use crate::page::{SealedPage, seal_page};
 use crate::page_dir::{ChunkEntry, GroupEntry, PageDir, PageEntry};
 use crate::postings::{DEFAULT_STRIDE, FieldTerms, encode_postings_section, term_key};
@@ -110,6 +112,10 @@ pub struct RlogWriter {
     indexed_fields: Vec<String>,
     /// The exact-key fields KEY_IDX indexes ([`RlogWriter::with_key_index_fields`]).
     key_index_fields: Vec<(String, KeyType)>,
+    /// The most entries one KEY_IDX bucket of a field may hold before the field
+    /// is left out of this object's index: the codec's
+    /// [`KEY_IDX_BUCKET_MAX_ENTRIES`], lowered only by tests.
+    key_idx_bucket_cap: u32,
     /// The clustered row order and the generation recorded with it
     /// ([`RlogWriter::with_sort_descriptor`]); `None` and 0 by default.
     sort_descriptor: Option<SortDescriptor>,
@@ -222,6 +228,7 @@ impl RlogWriter {
             batches: Vec::new(),
             indexed_fields: Vec::new(),
             key_index_fields: Vec::new(),
+            key_idx_bucket_cap: KEY_IDX_BUCKET_MAX_ENTRIES,
             sort_descriptor: None,
             clustering_generation: 0,
             bloom_scope: BloomScope::All,
@@ -298,7 +305,10 @@ impl RlogWriter {
     /// column (`I64`, `Str` or `Bytes`), plus [`TRACE_ID_FIELD`] as `Id16` for
     /// the fixed `trace_id` column. An empty set, the default, writes no
     /// KEY_IDX. Otherwise every field is named in the section, one with no
-    /// matching row with no entries. A row contributes the field's value from
+    /// matching row with no entries, except a field one of whose buckets would
+    /// hold more than [`KEY_IDX_BUCKET_MAX_ENTRIES`] entries: that field is left
+    /// out of this object's section with a warning, so a probe on it declines,
+    /// and the object is still written. A row contributes the field's value from
     /// its merged attribute view (the first entry per name, as `find_attr`
     /// resolves it) only when that value is of the field's type; a NULL,
     /// absent or differently typed value contributes nothing. The build
@@ -993,7 +1003,12 @@ impl RlogWriter {
             kind::BLOCKS,
             &Stored::raw(blocks_bytes),
         );
-        push_key_idx(&mut object, &mut sections, key_plan)?;
+        push_key_idx(
+            &mut object,
+            &mut sections,
+            key_plan,
+            self.key_idx_bucket_cap,
+        )?;
         push_section(
             &mut object,
             &mut sections,
@@ -2010,7 +2025,12 @@ impl RlogWriter {
             kind::BLOCKS,
             &Stored::raw(blocks_bytes),
         );
-        push_key_idx(&mut object, &mut sections, key_plan)?;
+        push_key_idx(
+            &mut object,
+            &mut sections,
+            key_plan,
+            self.key_idx_bucket_cap,
+        )?;
         push_section(
             &mut object,
             &mut sections,
@@ -3768,18 +3788,21 @@ fn compress(raw: &[u8], level: i32) -> Result<Stored, LogSegError> {
     })
 }
 
-/// Appends a section's stored bytes and records its descriptor.
-/// Appends the KEY_IDX section when `plan` is present. Stored raw: its prefix
-/// and buckets are read by range, so it is never compressed.
+/// Appends the KEY_IDX section when `plan` is present and keeps at least one
+/// field ([`KeyIndexPlan::encode`] with `bucket_cap`). Stored raw: its prefix and
+/// buckets are read by range, so it is never compressed.
 fn push_key_idx(
     object: &mut Vec<u8>,
     sections: &mut Vec<SectionDesc>,
     plan: Option<KeyIndexPlan>,
+    bucket_cap: u32,
 ) -> Result<(), LogSegError> {
     let Some(plan) = plan else {
         return Ok(());
     };
-    let encoded = plan.encode()?;
+    let Some(encoded) = plan.encode(bucket_cap)? else {
+        return Ok(());
+    };
     push_section(object, sections, kind::KEY_IDX, &Stored::raw(encoded.bytes));
     if let Some(desc) = sections.last_mut() {
         desc.prefix_len = encoded.prefix_len;
@@ -3787,6 +3810,7 @@ fn push_key_idx(
     Ok(())
 }
 
+/// Appends a section's stored bytes and records its descriptor.
 fn push_section(object: &mut Vec<u8>, sections: &mut Vec<SectionDesc>, kind: u32, stored: &Stored) {
     let offset = object.len() as u64;
     object.extend_from_slice(&stored.bytes);
@@ -5151,10 +5175,12 @@ mod tests {
 
     /// Twenty rows of stream 0, four per block (row `i` in block `i / 4`):
     /// `user_id = 7` on rows 0..12 (blocks 0, 1, 2), `user_id = 99` on row 13
-    /// (block 3), `request_id = "req-a"` on rows 5 and 6 (block 1), trace
+    /// (block 3), `request_id = "req-a"` on rows 5 and 6 (block 1),
+    /// `request_id = "req-b"` on rows 7..=12 (blocks 1, 2, 3), trace
     /// `T1` on rows 2, 3 and 9 (blocks 0 and 2). Row 17 carries `user_id` as
     /// the string "7" and row 18 carries `request_id` as the bytes `req-a`,
-    /// each under a type other than the declared one, in block 4.
+    /// each under a type other than the declared one, in block 4; row 18's
+    /// trace `0xEE..` is in block 4 alone.
     fn key_index_rows() -> Vec<LogRecord> {
         (0..20i64)
             .map(|i| {
@@ -5168,6 +5194,10 @@ mod tests {
                 if i == 5 || i == 6 {
                     r.attrs
                         .push(("request_id".into(), AttrValue::Str("req-a".into())));
+                }
+                if (7..=12).contains(&i) {
+                    r.attrs
+                        .push(("request_id".into(), AttrValue::Str("req-b".into())));
                 }
                 if matches!(i, 2 | 3 | 9) {
                     r.trace_id = Some(KEY_TRACE);
@@ -5200,8 +5230,16 @@ mod tests {
     }
 
     fn key_index_object(fields: Vec<(String, crate::key_index::KeyType)>) -> Vec<u8> {
+        key_index_object_grouped(fields, RlogConfig::default().group_target_blocks)
+    }
+
+    fn key_index_object_grouped(
+        fields: Vec<(String, crate::key_index::KeyType)>,
+        group_target_blocks: usize,
+    ) -> Vec<u8> {
         let cfg = RlogConfig {
             block_target_records: 4,
+            group_target_blocks,
             ..RlogConfig::default()
         };
         let mut w = RlogWriter::new(cfg, identity()).with_key_index_fields(fields);
@@ -5236,9 +5274,17 @@ mod tests {
 
     #[test]
     fn a_declared_key_index_column_yields_a_probeable_section_and_an_undeclared_one_yields_none() {
+        // The default layout puts all five blocks in one row group; two blocks
+        // per group splits them across three.
+        for group_target_blocks in [RlogConfig::default().group_target_blocks, 2] {
+            assert_declared_key_index(group_target_blocks);
+        }
+    }
+
+    fn assert_declared_key_index(group_target_blocks: usize) {
         use crate::key_index::{KeyType, key8_i64, key8_id16, key8_str, summarize};
 
-        let obj = key_index_object(key_index_declared());
+        let obj = key_index_object_grouped(key_index_declared(), group_target_blocks);
         let footer = open(&obj).expect("open");
         assert_eq!(footer.block_count, 5);
         let desc = *footer.section(kind::KEY_IDX).expect("KEY_IDX present");
@@ -5252,11 +5298,15 @@ mod tests {
 
         let probe = |field: &str, ty: KeyType, key8| {
             let (out, reads) = key_probe(&obj, &footer, field, ty, key8);
-            assert!(reads.len() <= 2, "{field}: {} reads", reads.len());
+            assert!(
+                reads.len() <= 2,
+                "group {group_target_blocks}, {field}: {} reads",
+                reads.len()
+            );
             assert_eq!(
                 reads.first(),
                 Some(&(desc.offset..desc.offset + u64::from(desc.prefix_len))),
-                "{field}: the first read is exactly the prefix"
+                "group {group_target_blocks}, {field}: the first read is exactly the prefix"
             );
             out.expect("probe")
         };
@@ -5273,9 +5323,19 @@ mod tests {
             probe("request_id", KeyType::Str, key8_str("req-a")),
             Some(vec![1])
         );
+        // A string key spanning a run of blocks.
+        assert_eq!(
+            probe("request_id", KeyType::Str, key8_str("req-b")),
+            Some(vec![1, 2, 3])
+        );
         assert_eq!(
             probe("trace_id", KeyType::Id16, key8_id16(&KEY_TRACE)),
             Some(vec![0, 2])
+        );
+        // A trace in exactly one block.
+        assert_eq!(
+            probe("trace_id", KeyType::Id16, key8_id16(&[0xEE; 16])),
+            Some(vec![4])
         );
         // A stream-level (resource scope) value reaches the merged view.
         assert_eq!(
@@ -5285,6 +5345,10 @@ mod tests {
         // An absent key: the field is named, the key is not in the object.
         assert_eq!(
             probe("user_id", KeyType::I64, key8_i64(12345)),
+            Some(vec![])
+        );
+        assert_eq!(
+            probe("request_id", KeyType::Str, key8_str("req-z")),
             Some(vec![])
         );
         assert_eq!(
@@ -5310,7 +5374,7 @@ mod tests {
             vec![
                 ("lib", KeyType::I64, 5),
                 ("never_seen", KeyType::Bytes, 0),
-                ("request_id", KeyType::Str, 1),
+                ("request_id", KeyType::Str, 4),
                 ("trace_id", KeyType::Id16, 3),
                 ("user_id", KeyType::I64, 4),
             ]
@@ -5319,7 +5383,7 @@ mod tests {
 
         // The same rows with no declared field carry no KEY_IDX, and a probe
         // on that object declines.
-        let none = key_index_object(Vec::new());
+        let none = key_index_object_grouped(Vec::new(), group_target_blocks);
         let none_footer = open(&none).expect("open");
         assert!(none_footer.section(kind::KEY_IDX).is_none());
         let (out, reads) = key_probe(&none, &none_footer, "user_id", KeyType::I64, key8_i64(7));
@@ -5362,6 +5426,82 @@ mod tests {
                 .is_some()
         );
         assert_eq!(row_obj, col_obj);
+    }
+
+    /// A field one of whose buckets would hold more entries than the cap is
+    /// left out of the object's KEY_IDX, and the object is still written with
+    /// every other field indexed. The cap is lowered to 2 so three keys chosen
+    /// to share a bucket overflow it.
+    #[test]
+    fn a_field_over_the_bucket_cap_is_left_out_and_the_rest_are_indexed() {
+        use crate::key_index::{KeyType, key8_i64, key8_str, summarize};
+        use ravel_codec::key_idx::{KEY_IDX_WRITER_BUCKET_BITS, bucket_index};
+
+        let bucket =
+            |key8| bucket_index(&key8, KEY_IDX_WRITER_BUCKET_BITS).expect("writer bucket bits");
+        let target = bucket(key8_i64(0));
+        let hot: Vec<i64> = (0..)
+            .filter(|&v| bucket(key8_i64(v)) == target)
+            .take(3)
+            .collect();
+        // Four keys in four distinct buckets: over the cap in total, at most
+        // one entry per bucket.
+        let mut seen = BTreeSet::new();
+        let spread: Vec<String> = (0..)
+            .map(|i| format!("s{i}"))
+            .filter(|s| seen.insert(bucket(key8_str(s))))
+            .take(4)
+            .collect();
+
+        let object = |fields: Vec<(String, KeyType)>| {
+            let mut w =
+                RlogWriter::new(RlogConfig::default(), identity()).with_key_index_fields(fields);
+            w.key_idx_bucket_cap = 2;
+            for (i, v) in hot.iter().enumerate() {
+                let mut r = base_record(0, i as i64);
+                r.attrs.push(("hot".into(), AttrValue::I64(*v)));
+                w.push(r).expect("push");
+            }
+            for (i, s) in spread.iter().enumerate() {
+                let mut r = base_record(0, 10 + i as i64);
+                r.attrs.push(("spread".into(), AttrValue::Str(s.clone())));
+                w.push(r).expect("push");
+            }
+            w.finish()
+                .expect("an overfull field does not fail the write")
+        };
+
+        let obj = object(vec![
+            ("hot".into(), KeyType::I64),
+            ("spread".into(), KeyType::Str),
+        ]);
+        let footer = open(&obj).expect("open");
+        let desc = *footer.section(kind::KEY_IDX).expect("KEY_IDX present");
+        let section = &obj[desc.offset as usize..(desc.offset + desc.len) as usize];
+        let summary = summarize(&footer, section)
+            .expect("summarize")
+            .expect("section present");
+        let named: Vec<(&str, KeyType, u64)> = summary
+            .fields
+            .iter()
+            .map(|f| (f.name.as_str(), f.key_type, f.entry_count))
+            .collect();
+        assert_eq!(named, vec![("spread", KeyType::Str, 4)]);
+        for v in &hot {
+            let (out, _) = key_probe(&obj, &footer, "hot", KeyType::I64, key8_i64(*v));
+            assert_eq!(out.expect("probe"), None, "hot {v} declines");
+        }
+        for s in &spread {
+            let (out, _) = key_probe(&obj, &footer, "spread", KeyType::Str, key8_str(s));
+            assert_eq!(out.expect("probe"), Some(vec![0]), "spread {s}");
+        }
+
+        // With the overfull field the only one declared, no section is written.
+        let alone = object(vec![("hot".into(), KeyType::I64)]);
+        let alone_footer = open(&alone).expect("open");
+        assert!(alone_footer.section(kind::KEY_IDX).is_none());
+        let (out, _) = key_probe(&alone, &alone_footer, "hot", KeyType::I64, key8_i64(hot[0]));
+        assert_eq!(out.expect("probe"), None);
     }
 
     /// Field-set validation is a typed refusal at finish, never a malformed

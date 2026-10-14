@@ -4734,6 +4734,7 @@ dependencies = [
  "ravel-types",
  "stats_alloc",
  "thiserror",
+ "tracing",
  "zstd",
 ]
 
