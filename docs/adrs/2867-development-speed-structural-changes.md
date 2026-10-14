@@ -233,7 +233,8 @@ In ravel:
    A `docs/` path collides only when the same heading section changes.
 3. Two move-only splits, each a single same-day commit in a window when
    no open PR touches the file, with a `git log --follow` check that
-   blame survives: the ingest handlers into `decode`, `admission` and
+   blame survives (now a `git blame -C -C -C` check; see the blame-check
+   amendment below): the ingest handlers into `decode`, `admission` and
    `mode` modules (store-96, after #2797), and `logs_scan.rs` into its
    plan, scan and threshold parts (ravel-perf, after #2774).
 
@@ -420,3 +421,25 @@ fleet-task-spec CLAIMS AUDIT paragraph states that rule (T11, #2879).
 Item 2's guard does not parse share kinds: it checks that each band row
 carries a source token, and whether the cited shares are the kind the
 band states is a reviewer's check.
+
+## Amendment: a split's blame check uses `git blame -C -C -C` (issue #2875)
+
+<!-- amendment-applies: sections="4. PR shape rules and hub-file splits" pointer="blame-check amendment" -->
+<!-- amendment-supersedes: phrase="`git log --follow` check that blame survives" pointer="blame-check amendment" -->
+
+Change 4 item 3 named a `git log --follow` check that blame survives a
+move-only split. That check cannot pass for these splits. `--follow`
+tracks one file's renames, and a split cuts several new files out of one
+that keeps existing, so it finds no rename at any similarity threshold.
+On the first split (T7, PR #2955), `git log --follow` on both new files,
+`ingest_mode.rs` (27 lines) and `ingest_decode.rs` (1,319 lines), lists
+only the split commit.
+
+What item 3 requires instead: `git blame -C -C -C` on each new file
+attributes every moved line to the commit that wrote it before the
+split. The only lines it attributes to the split commit are the ones a
+split has to write: the module's doc header, its `use` lines, and
+visibility qualifiers such as `pub(crate)` on items that crossed a module
+boundary. On PR #2955 that is 7 of 27 lines in `ingest_mode.rs` and 37 of
+1,319 in `ingest_decode.rs`, every one in those classes. The same check
+applies to the `logs_scan.rs` split.
