@@ -188,6 +188,9 @@ fn eval(rec: &LogRecord, pred: &Predicate) -> bool {
         // `arb_predicate` never generates it. Mirror the reader's exact channel
         // (match every row) so the differential stays correct if one appears.
         Predicate::NumRange { .. } => true,
+        // Keeps rows a later exact filter decides, so it has no record-level
+        // mirror; the reader's own row-by-row oracle covers it.
+        Predicate::Contains { .. } => unreachable!("arb_predicate never generates Contains"),
     }
 }
 

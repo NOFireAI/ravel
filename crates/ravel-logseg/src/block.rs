@@ -891,6 +891,43 @@ impl DictColumn {
         self.keys.len()
     }
 
+    /// The entries the rows in `rows` reference, one bit per entry.
+    pub(crate) fn entries_used_by(&self, rows: &[usize]) -> Validity {
+        let mut used = Validity::unset(self.values.len());
+        for &r in rows {
+            if let Some(k) = self.key(r) {
+                used.set(k as usize);
+            }
+        }
+        used
+    }
+
+    /// Narrows the column to the rows in `rows`, now reading through `values`:
+    /// every other row becomes absent. `values` is the column's dictionary
+    /// built for those rows alone ([`EntryTexts::build`]), the same length as
+    /// the one it replaces, and belongs to this block, so it is charged in
+    /// full.
+    ///
+    /// [`EntryTexts::build`]: crate::dict_values::EntryTexts::build
+    pub(crate) fn restrict_to(&mut self, values: Arc<DictValues>, rows: &[usize]) {
+        let mut present = Validity::unset(self.keys.len());
+        for &r in rows {
+            if self.present.get(r) {
+                present.set(r);
+            }
+        }
+        for (r, key) in self.keys.iter_mut().enumerate() {
+            if !present.get(r) {
+                *key = 0;
+            }
+        }
+        self.present = present;
+        self.values_charge = values.heap_bytes();
+        self.values = values;
+        self.narrow = true;
+        self.legacy = OnceCell::new();
+    }
+
     fn cell(&self, row: usize) -> Option<&[u8]> {
         self.values.entry(self.key(row)? as usize)
     }
@@ -968,6 +1005,12 @@ impl<T> ColMap<T> {
 
     fn get(&self, column_id: u32) -> Option<&T> {
         self.cols.get(column_id as usize).and_then(Option::as_ref)
+    }
+
+    fn get_mut(&mut self, column_id: u32) -> Option<&mut T> {
+        self.cols
+            .get_mut(column_id as usize)
+            .and_then(Option::as_mut)
     }
 
     fn insert(&mut self, column_id: u32, value: T) {
@@ -1202,6 +1245,7 @@ pub struct DecodedBlock {
     page_bytes_decoded: u64,
     decompressed_bytes: u64,
     int_values_buffers: usize,
+    str_cells_validated: u64,
 }
 
 impl DecodedBlock {
@@ -1257,6 +1301,17 @@ impl DecodedBlock {
     /// (tag 11) shares its target's buffer and builds none.
     pub fn int_values_buffers(&self) -> usize {
         self.int_values_buffers
+    }
+
+    /// String dictionary entries this decode UTF-8 validated building a
+    /// per-block dictionary (tag 7), plus whatever the caller added for the
+    /// row group dictionaries it built ([`Self::add_str_cells_validated`]).
+    pub(crate) fn str_cells_validated(&self) -> u64 {
+        self.str_cells_validated
+    }
+
+    pub(crate) fn add_str_cells_validated(&mut self, n: u64) {
+        self.str_cells_validated = self.str_cells_validated.saturating_add(n);
     }
 
     /// Whether this block carries any page for the `attrs_raw` overflow column.
@@ -1396,6 +1451,11 @@ impl DecodedBlock {
         self.str_cols.get(column_id)
     }
 
+    /// [`Self::str_column`], mutable, for the scan's survivor-only build.
+    pub(crate) fn str_column_mut(&mut self, column_id: u32) -> Option<&mut StrColumn> {
+        self.str_cols.get_mut(column_id)
+    }
+
     /// A block holding only the given integer columns, for tests that need
     /// cells no writer produces (an absent `ts` or `stream_ref`).
     #[cfg(test)]
@@ -1419,6 +1479,7 @@ impl DecodedBlock {
             page_bytes_decoded: 0,
             decompressed_bytes: 0,
             int_values_buffers: 0,
+            str_cells_validated: 0,
         }
     }
 
@@ -1542,7 +1603,7 @@ pub fn read_block_pages(
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
-    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &[], plans, counters)
+    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &[], &[], plans, counters)
 }
 
 /// [`read_block_pages`] for a block whose row group carries string
@@ -1563,16 +1624,27 @@ pub fn read_block_pages_with_dicts(
         .map(|(cid, d)| Ok((*cid, Arc::new(DictValues::from_entries(d)?))))
         .collect::<Result<_, LogSegError>>()?;
     let shared: Vec<(u32, &Arc<DictValues>)> = shared.iter().map(|(c, d)| (*c, d)).collect();
-    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &shared, plans, counters)
+    read_block_pages_with_shared_dicts(
+        record_count,
+        descs,
+        page_bytes,
+        &shared,
+        &[],
+        plans,
+        counters,
+    )
 }
 
 /// [`read_block_pages_with_dicts`] over dictionaries already built, which the
-/// block shares rather than copies (ADR-2773 decision D3).
+/// block shares rather than copies (ADR-2773 decision D3). A per-block
+/// dictionary of a column in `deferred` is left unvalidated
+/// ([`decode_columns`]).
 pub(crate) fn read_block_pages_with_shared_dicts(
     record_count: usize,
     descs: &[PageDesc],
     page_bytes: &[Option<Vec<u8>>],
     dicts: &[(u32, &Arc<DictValues>)],
+    deferred: &[u32],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1600,7 +1672,15 @@ pub(crate) fn read_block_pages_with_shared_dicts(
             )));
         }
     }
-    decode_columns(record_count, descs, page_bytes, dicts, plans, counters)
+    decode_columns(
+        record_count,
+        descs,
+        page_bytes,
+        dicts,
+        deferred,
+        plans,
+        counters,
+    )
 }
 
 /// How much of a block's page bytes a read actually touched
@@ -1650,12 +1730,15 @@ fn referenced_i64(
 /// [`DecodedBlock`].
 ///
 /// A page whose entry in `page_bytes` is `None` was not read; its column is
-/// left out of the result exactly as an absent column would be.
+/// left out of the result exactly as an absent column would be. A per-block
+/// dictionary (tag 7) of a column in `deferred` is left
+/// [unvalidated](DictValues::unvalidated) for the scan's survivor-only build.
 fn decode_columns(
     record_count: usize,
     descs: &[PageDesc],
     page_bytes: &[Option<Vec<u8>>],
     dicts: &[(u32, &Arc<DictValues>)],
+    deferred: &[u32],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1698,6 +1781,7 @@ fn decode_columns(
         page_bytes_decoded: counters.bytes_decoded,
         decompressed_bytes: counters.decompressed_bytes,
         int_values_buffers: 0,
+        str_cells_validated: 0,
     };
 
     for column_id in order {
@@ -1779,7 +1863,12 @@ fn decode_columns(
                     match decode_strings_columnar(enc, encoded, present_count)? {
                         DecodedStrings::Plain(vals) => StrColumn::Plain(scatter(&present, vals)?),
                         DecodedStrings::Dict { dict, ids } => {
-                            let values = Arc::new(DictValues::from_entries(&dict)?);
+                            let values = if deferred.contains(&column_id) {
+                                Arc::new(DictValues::unvalidated(&dict)?)
+                            } else {
+                                out.str_cells_validated += dict.len() as u64;
+                                Arc::new(DictValues::from_entries(&dict)?)
+                            };
                             StrColumn::Dict(DictColumn::new(values, &present, ids, false)?)
                         }
                     }
@@ -1913,6 +2002,7 @@ mod tests {
                 page_bytes_decoded: 0,
                 decompressed_bytes: 0,
                 int_values_buffers: 0,
+                str_cells_validated: 0,
             }
         }
 
