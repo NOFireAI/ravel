@@ -467,8 +467,9 @@ const AUDIT_TOKEN_KEY_CONTEXT: &str = "ravel audit query-text token key v1";
 /// structure-preserving tokenization of a query's text, per query language.
 ///
 /// SQL statements go through `ravel_sql::redact` (sqlparser AST, literal
-/// values tokenized), ES|QL statements through `ravel_esql::lex` (string and
-/// value-position number literals tokenized, see `redact_esql`), and
+/// values tokenized), ES|QL statements through `ravel_esql::lex` (string
+/// literals, value-position numbers and `PROMQL` parameter values tokenized,
+/// see `redact_esql`), and
 /// everything else through
 /// `ravel_promql::redact` (PromQL AST, label-matcher values and string
 /// literals tokenized). All three call the same `ravel_promql::audit_token`
@@ -563,9 +564,10 @@ impl AuditQueryTextRedactor {
         self.whole_text_token(query_text)
     }
 
-    /// Redact one ES|QL statement by lexing it: every string literal and
-    /// every number in a value position becomes a quoted token, the query of
-    /// a `PROMQL` command is redacted as PromQL, and every other token keeps
+    /// Redact one ES|QL statement by lexing it: every string literal, every
+    /// number in a value position and every `PROMQL` parameter value becomes a
+    /// quoted token, the query of a `PROMQL` command is redacted as PromQL,
+    /// and every other token keeps
     /// its text. A number that shapes the statement rather than naming a
     /// value, a `LIMIT` count or an interval's magnitude (`5 minutes`), stays
     /// readable, as SQL's structural numbers do. A comment,
@@ -630,10 +632,23 @@ impl AuditQueryTextRedactor {
                     out.push_str(&self.redact_promql(inner));
                     out.push(')');
                 }
+                // A `PROMQL` parameter value (`start=2026-01-01T00:00:00Z`) is
+                // the only source pattern written after `=`; every other one
+                // names a source, a policy or a parameter.
+                TokenKind::SourcePattern => {
+                    let after_assign = index
+                        .checked_sub(1)
+                        .and_then(|previous| tokens.get(previous))
+                        .is_some_and(|previous| matches!(previous.kind(), TokenKind::Assign));
+                    if after_assign {
+                        out.push_str(&quoted(text));
+                    } else {
+                        out.push_str(text);
+                    }
+                }
                 TokenKind::Word
                 | TokenKind::QuotedIdent(_)
                 | TokenKind::NamePattern
-                | TokenKind::SourcePattern
                 | TokenKind::Param(_)
                 | TokenKind::IdentParam(_)
                 | TokenKind::Pipe
@@ -10362,6 +10377,52 @@ mod tests {
         );
         let unterminated = "FROM logs | WHERE body == \"alice";
         assert_eq!(redactor.redact("esql", unterminated), tok(unterminated));
+    }
+
+    /// A `PROMQL` parameter value is a caller-chosen value lexed as a source
+    /// pattern, so it is tokenized whether bare or quoted, while the parameter
+    /// name and a `FROM` source pattern, which name things, stay readable.
+    #[cfg(feature = "esql")]
+    #[test]
+    fn esql_redaction_tokenizes_promql_parameter_values() {
+        use ravel_maintain::QueryTextRedactor;
+
+        let key = [1u8; 32];
+        let redactor = AuditQueryTextRedactor::new(key);
+        let tok = |value: &str| ravel_promql::audit_token(&key, value.as_bytes());
+
+        let promql = "PROMQL index=alice.smith start=2026-01-01T00:00:00Z (up)";
+        let redacted = redactor.redact("esql", promql);
+        assert!(!redacted.contains("alice.smith"), "{redacted}");
+        assert!(!redacted.contains("2026-01-01T00:00:00Z"), "{redacted}");
+        assert!(
+            redacted.contains(&format!("\"{}\"", tok("alice.smith"))),
+            "{redacted}"
+        );
+        assert!(
+            redacted.contains(&format!("\"{}\"", tok("2026-01-01T00:00:00Z"))),
+            "{redacted}"
+        );
+        assert_eq!(
+            redactor.redact("esql", "FROM logs-prod-*, logs-dev | LIMIT 5"),
+            "FROM logs-prod-*, logs-dev | LIMIT 5",
+        );
+        assert_eq!(
+            redacted,
+            format!(
+                "PROMQL index=\"{}\" start=\"{}\" (up)",
+                tok("alice.smith"),
+                tok("2026-01-01T00:00:00Z"),
+            ),
+        );
+        assert_eq!(
+            redactor.redact("esql", "PROMQL index=\"alice.smith\" (up)"),
+            format!("PROMQL index=\"{}\" (up)", tok("alice.smith")),
+        );
+        assert_eq!(
+            redactor.redact("esql", "FROM logs | WHERE ratio > 0.25"),
+            format!("FROM logs | WHERE ratio > \"{}\"", tok("0.25")),
+        );
     }
 
     /// With no `RAVEL_AUDIT_TOKEN_KEY`, no deployment key, and the default

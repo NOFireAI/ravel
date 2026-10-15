@@ -138,7 +138,11 @@ An ES|QL statement is redacted token by token:
   stay readable.
 - A comment becomes one space.
 - The query of a `PROMQL` command is redacted as a PromQL expression.
-- Field names, commands, functions, operators and keywords stay readable.
+- A `PROMQL` parameter value, such as the `2026-01-01T00:00:00Z` in
+  `start=2026-01-01T00:00:00Z`, becomes a quoted token whether it is written
+  bare or quoted. The parameter name stays readable.
+- Field names, source patterns such as `logs-prod-*`, commands, functions,
+  operators and keywords stay readable.
 - A statement that does not lex becomes one token over the whole text.
 
 For example,
@@ -218,6 +222,7 @@ These requests are refused before that and write no record:
 - A query that the fleet-wide admission limit refuses.
 - An ES|QL request that carries `params` or an unknown field, or a statement
   that does not parse.
+- An ES|QL request cancelled before it finishes.
 
 An absent record therefore does not mean an absent request. To count
 statements and not records, leave out the `attempted` rows.
