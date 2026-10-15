@@ -8,8 +8,9 @@ Epic: #2993
 
 Telemetry carries client and peer IP addresses in attribute values:
 `client.address`, `source.address` and `network.peer.address` on spans
-and logs, `instance` and custom labels on metrics. ADR-0062 names IP
-addresses as personal data. Today every one of them is stored as sent,
+and logs, `instance` and custom labels on metrics. An IP address that
+identifies a client is personal data, and ADR-0062 already treats IPs
+as PII inside query text. Today every one of them is stored as sent,
 in every data object, for the tenant's whole retention. The only
 privacy tools in the tree act after the fact:
 
@@ -143,8 +144,9 @@ installed, as `--tenant-kms-config` entries are. Each entry lists rules:
 - `retired_epochs`: the earlier epochs whose data is still retained,
   default none.
 
-One key may carry one rule. The file is read by `ravel-server` and by
-`ravel-cli load`, and both apply it identically. Changing it takes a
+One key may carry one rule. The file is read by `ravel-server`, by
+`ravel-cli load`, which apply it identically, and by `ravel-cli erase
+submit`, which translates matchers with it (decision 8). Changing it takes a
 restart, like every other CLI-only per-tenant setting. A
 durable per-tenant record in `TenantConfig` is deliberately not part of
 this ADR: it is a frozen protobuf whose new field needs a reader-first
@@ -193,9 +195,15 @@ rules are applied to the merged attribute or label set:
 - on exemplar labels, and on the attributes of span events and links
   before those are encoded into their blobs.
 
+The same parameter is added to the three label-byte projection
+functions (`project_resolved_label_bytes`,
+`project_log_resolved_label_bytes` and
+`project_span_resolved_label_bytes`). `ravel-server` calls them outside
+the normalizers, and passes the result in.
+
 Because the parameter has no default, an ingest path that calls a
-normalizer without a rule set (an empty one when the tenant has none)
-does not compile.
+normalizer or a projection without a rule set (an empty one when the
+tenant has none) does not compile.
 
 `ravel-cli load` does not call the normalizers, so the compiler cannot
 guard it. Its label-building paths call the same `ravel-ipcrypt` apply
@@ -206,7 +214,9 @@ A check that runs before encryption counts each value under a rule at
 its largest encrypted length: 47 bytes (a bracketed IPv6 address, a
 colon and a five-digit port), or the raw length when that is larger.
 That keeps the projected label-byte bound and OTAP's raw-length checks
-from undercounting.
+from undercounting. It also counts a value the rule will leave unchanged,
+such as a hostname, at 47 bytes. So a request near the bound may be
+refused where it would have fitted, which is the safe direction.
 
 What is encrypted, given a rule's key:
 
@@ -215,7 +225,10 @@ What is encrypted, given a rule's key:
   - `deterministic` always yields an IPv6 address;
   - `prefix` yields the input's family.
 - **`ip:port` and `[ipv6]:port`.** The address is replaced and the port
-  and syntax are kept.
+  is kept. The bracketing follows the ciphertext's family. So under
+  `deterministic`, `1.2.3.4:443` becomes `[<ipv6>]:443`. The SQL
+  functions render the same way, so a literal matches what ingest
+  stored.
 - **Anything else is left unchanged and counted.** That covers a
   hostname, an address with a zone id, a non-string log value, and free
   text. A hostname in an address attribute is common and is not personal
@@ -251,14 +264,24 @@ no randomness.
 
 **6. A SQL function encrypts with the tenant's key. It takes no key
 argument and needs the `ipcrypt` capability.** It comes in two forms:
-- `ipcrypt_encrypt(ip [, epoch])`;
-- `ipcrypt_prefix_encrypt(ip [, epoch])`.
+- `ipcrypt_encrypt(ip, epoch)`;
+- `ipcrypt_prefix_encrypt(ip, epoch)`.
 
 Each returns the stored form of an address under the calling tenant's
-derived key, at the given epoch or 1. Behaviour:
+derived key at the given epoch. The epoch is required. A `query`-mode
+process does not read the policy file, so it cannot know a rule's
+current epoch.
+A default of 1 would match only retired data once a rule rotates, and
+return zero rows that read as "never seen". To match across a rotation,
+a query ORs one comparison per epoch.
+
+Choosing a variant or epoch that the rule does not use also matches
+nothing, with no error. The function takes an address, not a rule. The
+docs' query guide tells readers to take both values from the rule.
+Behaviour:
 
 - **Pruning.** Both functions are `Immutable`, so
-  `attrs['client.address'] = ipcrypt_encrypt('203.0.113.7')` folds to a
+  `attrs['client.address'] = ipcrypt_encrypt('203.0.113.7', 1)` folds to a
   literal and prunes like any equality predicate.
 - **No key in the query.** There is no key argument, so no key ever
   appears in query text, the audit table, or a plan.
@@ -267,7 +290,11 @@ derived key, at the given epoch or 1. Behaviour:
   table; `build_session` gains the tenant and principal it needs. They
   are built per session from that session's tenant key, so a folded
   literal or a cached plan cannot carry one tenant's ciphertext into
-  another tenant's query.
+  another tenant's query. Each function also gets a row in `ravel-sql`'s
+  conformance registry (`RAVEL_SCALAR_UDFS`), and the admitted-scalar
+  row count moves with it. The conformance fixture session holds a test
+  deployment key and the `ipcrypt` capability, so the row's example
+  runs.
 - **Epoch argument.** Any positive epoch is accepted. Encrypting under an
   epoch no rule ever used reveals nothing about stored data, since
   nothing is stored under that key, and a capability holder may already
@@ -294,7 +321,7 @@ derived key, at the given epoch or 1. Behaviour:
 - **No plaintext audit record.** The functions are not registered when
   the process would write query text to the audit table in plaintext,
   that is, when the query audit is on under the `Plaintext` text policy.
-  There, the literal address in `ipcrypt_encrypt('203.0.113.7')` would
+  There, the literal address in `ipcrypt_encrypt('203.0.113.7', 1)` would
   be written verbatim into object storage, past the very boundary this
   ADR draws. With the audit off (the default) nothing is written, and
   under redaction the query text is stored as a keyed token. That token
@@ -320,8 +347,18 @@ can already derive every tenant's key, so a CLI that needs that key adds
 no new holder.
 
 **8. Erasure by IP matches the stored ciphertext.** When a tenant has a
-rule for a matcher's key, `ravel-cli` encrypts that matcher's value
-under the rule before it submits the erasure request.
+rule for a matcher's key, `ravel-cli erase submit` encrypts that
+matcher's value under the rule before it submits the erasure request.
+- **Policy.** `erase submit` takes `--ipcrypt-config`. Like a writer, it
+  reads the `sys/ipcrypt/policy` marker unconditionally, and refuses on
+  the same conditions as decision 9: a fingerprint mismatch (a missing
+  or stale file included) or a failed read. A missing file would
+  otherwise submit the raw address, match nothing, and report a
+  successful erasure of zero records.
+- **Rule lookup.** The matcher key is looked up the way decision 1
+  matches rules for the request's `--signal`. For the metric signals the
+  key is sanitized first, so `client_address` finds the rule written as
+  `client.address`.
 - **One request per epoch.** Matchers in one request are a conjunction,
   so two ciphertexts of one address in the same request would match no
   record. `ravel-cli` therefore submits one request per configured
@@ -332,8 +369,16 @@ under the rule before it submits the erasure request.
   rule key, it submits one request per combination of those rules'
   epochs. It refuses, before submitting anything, when that would be
   more than 16 requests.
-- **Reporting.** It reports every request id it submitted, and the
-  erasure counts as their sum.
+- **Request ids.** With one request, the supplied or generated
+  `--request-id` is used unchanged. With several, each id is derived
+  deterministically from that base id and the request's epochs, as a
+  UUID-shaped blake3 hash. Retrying the whole command with the same
+  `--request-id` therefore re-submits the same requests. Each one is
+  idempotent under ADR-0064's existing retry rule, so a retry finishes
+  the epochs a failed run left out instead of conflicting with the ones
+  it finished.
+- **Reporting.** It reports the base id and every derived id it
+  submitted, and the erasure counts as their sum.
 - **Non-addresses.** A raw value that is not an address is submitted
   unchanged, matching how ingest stored it.
 
@@ -367,8 +412,9 @@ does not refuses to write.**
   `ravel-cli load` run, reads the marker, whether or not `--ipcrypt-config`
   was given. The forgotten-flag case is exactly a process with an empty
   policy on a bucket whose marker is not empty, so the read cannot depend
-  on the flag. `query` and `maintain` processes write no new attribute
-  values, so they do not read it.
+  on the flag. `ravel-cli erase submit` reads it too (decision 8).
+  `query` and `maintain` processes write no new attribute values, so
+  they do not read it.
   - No marker and an empty local policy: the process proceeds and writes
     no marker.
   - A marker whose fingerprint differs from the process's own, an empty
@@ -383,12 +429,19 @@ does not refuses to write.**
   marker with a CAS on its current ETag. Processes then restart with the
   new file.
 - **Access.** The shipped IAM templates name `sys/` objects one by one,
-  so the implementing task adds `sys/ipcrypt/policy` to them.
-  `gateway.json` gets read and create on it, and `admin.json` already
-  covers `sys/*`. It also updates `deploy/iam/README.md`'s per-key
-  table. The upgrade notes say to grant access before upgrading. Without
-  that grant, the unconditional read is denied and an ingesting process
-  refuses to start.
+  so the implementing task adds `sys/ipcrypt/policy` to them:
+  - `gateway.json` gets read and create, for ingesting servers and
+    `ravel-cli load`;
+  - `admin.json`'s `AdminWrite` statement gets the put that
+    `set-policy`'s CAS and a first create need. Admin already reads
+    `sys/*`, which covers `erase submit`.
+
+  The same commit updates `deploy/iam/README.md`'s per-key table and the
+  template suite that pins every statement
+  (`crates/ravel-commit/tests/iam_templates.rs`). The upgrade notes say
+  to grant access before upgrading. Without that grant, the
+  unconditional read is denied and an ingesting process refuses to
+  start.
 
 The tenancy marker (`sys/tenancy`, ADR-0050) is the precedent. Without
 this check, a forgotten flag on one process (most likely a `ravel-cli
@@ -398,7 +451,8 @@ forgotten flag.
 
 **Rotation.** Bumping a rule's epoch changes the key for new data only.
 - Equality between data written before and after the bump is lost.
-  Queries pass the old epoch to the SQL function to match old data.
+  A query passes each epoch it wants to match to the SQL function
+  (decision 6), ORing one comparison per epoch to span a rotation.
 - Erasure matches every configured epoch, with one request per epoch
   (decision 8).
 - Old epochs are listed in the rule (`retired_epochs`) for as long as
@@ -503,8 +557,9 @@ flowchart LR
   - `ravel-cli load`.
 
   It then scans every byte of every object in the bucket for that
-  address, in both text form and 4- and 16-byte binary form, and asserts
-  it is absent. The scan covers catalog, index, statistics and `del/`
+  address, and asserts it is absent. It looks for the text form, the 4-
+  and 16-byte binary forms, and the lowercase-hex encoding of each,
+  because span event and link blobs are stored hex-encoded. The scan covers catalog, index, statistics and `del/`
   objects, not just data objects. It also asserts that the ciphertext is
   present. A control run of the same ingest with the policy off must
   find the raw address, so a scan that cannot see through compression
