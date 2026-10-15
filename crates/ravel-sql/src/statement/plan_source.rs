@@ -47,6 +47,11 @@ use crate::{
     StatementTarget, TargetSignal, ValidationError,
 };
 
+// `NS_PER_HOUR`, the window and `now_ns` of `request()` below are copies of
+// `NS_PER_HOUR`, `full_window()`, `NOW_NS` and `request()` in
+// `crates/ravel-sql/tests/util/mod.rs`, which is their source of truth: an
+// in-crate test module cannot reach an integration test's helpers. Change
+// them there first.
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
 pub(crate) fn tenant_id(name: &str) -> TenantId {

@@ -225,7 +225,10 @@ fn registered<F: ?Sized>(
 /// }
 /// ```
 ///
-/// and the supertrait cannot be named there to implement it:
+/// The second doctest below implements `Sealed` by its path and fails because
+/// the `sealed` module is private to this crate (E0603). That privacy held
+/// before the trait was sealed, so this doctest proves module privacy, not the
+/// seal; the first doctest is the one that proves the seal:
 ///
 /// ```compile_fail
 /// #[derive(Debug)]
