@@ -104,6 +104,8 @@ pub enum KeyIndexLeafEncodeError {
     /// with [`split_key_index_entries`].
     #[error("key-index leaf body of {body} decompressed bytes exceeds the {ceiling}-byte ceiling")]
     BodyOverCeiling { body: u64, ceiling: u64 },
+    #[error("bucket_bits {bucket_bits} outside {min}..={max}")]
+    BucketBitsOutOfRange { bucket_bits: u8, min: u8, max: u8 },
     #[error("zstd compression failed: {0}")]
     Compress(String),
 }
@@ -300,19 +302,50 @@ pub fn encode_key_index_leaf(
     encode_prepared(input, prepared, bucket_bits)
 }
 
-/// [`encode_key_index_leaf`] at a fixed `bucket_bits`, which may be any
-/// value the reader accepts (1..=16), so a test can build every legal leaf.
+/// [`encode_key_index_leaf`] at a fixed `bucket_bits` within the writer's
+/// bound, 1..=[`KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS`]. Any other value is
+/// [`KeyIndexLeafEncodeError::BucketBitsOutOfRange`].
 pub fn encode_key_index_leaf_with_bucket_bits(
     input: &KeyIndexLeafInput<'_>,
     bucket_bits: u8,
     limits: &KeyIndexLeafLimits,
 ) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
-    if !(KEY_INDEX_LEAF_MIN_BUCKET_BITS..=KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS)
-        .contains(&bucket_bits)
-    {
-        return Err(invalid(format_args!(
-            "bucket_bits {bucket_bits} outside {KEY_INDEX_LEAF_MIN_BUCKET_BITS}..={KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS}"
-        )));
+    encode_with_bucket_bits_up_to(
+        input,
+        bucket_bits,
+        KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS,
+        limits,
+    )
+}
+
+/// Builds a leaf at any `bucket_bits` the reader accepts, 1..=16, so tests
+/// reach 14..=16, which neither public encoder produces.
+#[cfg(test)]
+pub(crate) fn encode_key_index_leaf_with_reader_bucket_bits(
+    input: &KeyIndexLeafInput<'_>,
+    bucket_bits: u8,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    encode_with_bucket_bits_up_to(
+        input,
+        bucket_bits,
+        KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS,
+        limits,
+    )
+}
+
+fn encode_with_bucket_bits_up_to(
+    input: &KeyIndexLeafInput<'_>,
+    bucket_bits: u8,
+    max: u8,
+    limits: &KeyIndexLeafLimits,
+) -> Result<EncodedKeyIndexLeaf, KeyIndexLeafEncodeError> {
+    if !(KEY_INDEX_LEAF_MIN_BUCKET_BITS..=max).contains(&bucket_bits) {
+        return Err(KeyIndexLeafEncodeError::BucketBitsOutOfRange {
+            bucket_bits,
+            min: KEY_INDEX_LEAF_MIN_BUCKET_BITS,
+            max,
+        });
     }
     let prepared = prepare(input, limits)?;
     encode_prepared(input, prepared, bucket_bits)

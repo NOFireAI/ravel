@@ -209,3 +209,42 @@ fn slices_of_one_part_field_must_agree_and_tile() {
         );
     }
 }
+
+#[test]
+fn one_partial_slice_inspects_alone_but_not_beside_a_gap() {
+    let dir = scratch();
+    let low = [entry(0x10, 0, &[0, 2]), entry(0x20, 1, &[1])];
+    let slice = write_leaf(&dir, "slice.kidx", &encode_slice(&low, 0, 99, &[2]));
+
+    let output = run_inspect(&slice, true);
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("utf-8");
+    assert!(stdout.starts_with("format_version: 1\n"), "{stdout}");
+    assert!(
+        stdout.contains("key8_lo: 0x0000000000000000\nkey8_hi: 0x0000000000000063\n"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("entry_count: 2\n"), "{stdout}");
+    assert!(
+        stdout.contains("uncovered_entry_ordinals: [2]\n"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("key8=0000000000000010 entry_ordinal=0 blocks=[0, 2]\n")
+            && stdout.contains("key8=0000000000000020 entry_ordinal=1 blocks=[1]\n"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("leaf: "), "{stdout}");
+    assert!(!stdout.contains("slice set:"), "{stdout}");
+
+    let high = [entry(0x9000, 3, &[4])];
+    let gap = write_leaf(&dir, "gap.kidx", &encode_slice(&high, 101, u64::MAX, &[2]));
+    let output = run_inspect_all(&[&slice, &gap], false);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).expect("utf-8");
+    assert!(
+        stderr.contains("kidx leaves are not one slice set: corrupted key-index leaf"),
+        "{stderr}"
+    );
+}

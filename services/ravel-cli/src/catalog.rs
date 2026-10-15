@@ -658,8 +658,9 @@ pub fn inspect_kidx(leaves: &[(String, Vec<u8>)], entries: bool) -> anyhow::Resu
 /// several leaves must be the slices of one (part, field)
 /// ([`ravel_catalog::check_key_index_leaf_set`]), before anything is
 /// printed, so a corrupt leaf or set prints nothing and returns the typed
-/// rejection. With one leaf the report has no `leaf:` line. The bucket
-/// median is the lower median of the per-bucket entry counts.
+/// rejection. One leaf is verified on its own, so a single partial slice of
+/// a split (part, field) inspects; its report has no `leaf:` line. The
+/// bucket median is the lower median of the per-bucket entry counts.
 pub fn render_inspect_kidx(
     leaves: &[(&str, &[u8])],
     entries: bool,
@@ -672,8 +673,10 @@ pub fn render_inspect_kidx(
             .map_err(|err| anyhow::anyhow!("kidx leaf {key} failed verification: {err}"))?;
         summaries.push(summary);
     }
-    ravel_catalog::check_key_index_leaf_set(&summaries)
-        .map_err(|err| anyhow::anyhow!("kidx leaves are not one slice set: {err}"))?;
+    if summaries.len() > 1 {
+        ravel_catalog::check_key_index_leaf_set(&summaries)
+            .map_err(|err| anyhow::anyhow!("kidx leaves are not one slice set: {err}"))?;
+    }
     for ((key, _), summary) in leaves.iter().zip(&summaries) {
         if leaves.len() > 1 {
             out.push_str(&format!("leaf: {key}\n"));
