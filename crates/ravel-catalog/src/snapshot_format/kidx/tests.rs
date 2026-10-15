@@ -495,11 +495,42 @@ fn encoder_refuses_invalid_input() {
     let mut unnamed = input(part, &[], &[]);
     unnamed.field = "";
     assert!(invalid(encode_key_index_leaf(&unnamed, &limits)));
-    assert!(invalid(encode_key_index_leaf_with_bucket_bits(
-        &input(part, &[], &[]),
-        17,
-        &limits
-    )));
+}
+
+#[test]
+fn bucket_bits_entry_points_refuse_past_their_bound() {
+    let part = part_hash(b"p");
+    let limits = KeyIndexLeafLimits::default();
+    let leaf_input = input(part, &[], &[]);
+    let out_of_range = |bucket_bits, max| {
+        Err(KeyIndexLeafEncodeError::BucketBitsOutOfRange {
+            bucket_bits,
+            min: 1,
+            max,
+        })
+    };
+    for bits in [1, KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS] {
+        let leaf = encode_key_index_leaf_with_bucket_bits(&leaf_input, bits, &limits)
+            .expect("inside the writer bound");
+        assert_eq!(leaf.leaf_ref.bucket_bits, u32::from(bits));
+    }
+    for bits in [0, 14, 16, 17] {
+        assert_eq!(
+            encode_key_index_leaf_with_bucket_bits(&leaf_input, bits, &limits),
+            out_of_range(bits, 13)
+        );
+    }
+    for bits in [14, KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS] {
+        let leaf = encode_key_index_leaf_with_reader_bucket_bits(&leaf_input, bits, &limits)
+            .expect("inside the reader bound");
+        verify_key_index_leaf(&leaf.bytes, &limits).expect("the reader accepts it");
+    }
+    for bits in [0, 17] {
+        assert_eq!(
+            encode_key_index_leaf_with_reader_bucket_bits(&leaf_input, bits, &limits),
+            out_of_range(bits, 16)
+        );
+    }
 }
 
 #[test]
@@ -1302,7 +1333,7 @@ proptest! {
         leaf_input.part_entry_count = 60;
         let limits = KeyIndexLeafLimits::default();
         let leaf = match bucket_bits {
-            Some(bits) => encode_key_index_leaf_with_bucket_bits(&leaf_input, bits, &limits),
+            Some(bits) => encode_key_index_leaf_with_reader_bucket_bits(&leaf_input, bits, &limits),
             None => encode_key_index_leaf(&leaf_input, &limits),
         }
         .expect("encode");
