@@ -371,10 +371,13 @@ flowchart LR
     decompressed length to equal it, and a (part, field)
     whose decompressed body would exceed the ceiling is sliced by key
     range, one leaf per slice, so a lookup opens exactly one leaf per
-    (part, field).
+    (part, field). The build ships off by default behind a switch, for the
+    cost the leaf build switch amendment below sets out.
   - **Lifecycle.** `sweep_unreferenced_catalog_objects` names
     `parts[].key_index[].key` in its reference set in the same change as
-    the first leaf writer (ADR-0849 section 1a). A fold process that
+    the first leaf writer (ADR-0849 section 1a). With the switch off, a
+    part the fold re-encodes is written without refs and a part carried
+    forward keeps its own (see the leaf build switch amendment below). A fold process that
     predates this change strips field 8 from every part it carries
     forward; no HEAD field can constrain it (it predates every field here,
     and the fold rebuilds HEAD as a fresh prost struct, so a stamp would
@@ -566,7 +569,8 @@ flowchart LR
   about 6% of a spans part's per rebuild, derived); merging the previous
   leaf incrementally is left to the
   implementing task if measured necessary, since ordinals shift on every
-  re-encode.
+  re-encode (known necessary before the switch defaults on: see the leaf
+  build switch amendment below).
 - **Resharding.** A trace whose spans straddle an activation sits in two
   shards (docs/guides/traces.md). Routing per hour per generation, with the
   slack window on a decrease, keeps both in the scan set; the leaf is
@@ -930,3 +934,53 @@ mandatory field, so the same bucket overflow there is tracked separately
 as issue #2985.
 
 Refs: #2707, #849, #2680, #1848, #1869, #1987, #1382
+
+## Amendment (issue #2994): the leaf build ships off by default behind a switch
+
+<!-- amendment-applies: sections="4. Tier 2: one `.kidx` leaf per (snapshot part, field, key slice), built at fold from the sections|6. Erasure, compaction and resharding" pointer="leaf build switch amendment" -->
+
+Decision 4's leaf build is implemented and ships off by default, behind
+`CatalogConfig::build_key_index_leaves`, exposed as `ravel-server
+--fold-key-index-leaves` and `ravel-cli catalog fold --key-index-leaves`.
+With it off, the fold issues no footer or KEY_IDX read, writes no leaf, and
+writes a re-encoded part without `key_index` refs (dropping any it had); a
+part carried forward by reference keeps its refs unchanged, and the sweep
+does not read the switch. No query reads a leaf yet. A part sealed while
+the switch is off is carried forward without leaves after it is turned
+on: it gets them only when a later fold re-encodes it or from the repair
+command (`ravel-cli catalog fold --rebuild-key-index`, issue #2995).
+
+It is off because of what the build costs on the tail. The fold re-encodes
+the tail part on every fold that advances the watermark, and a leaf binds
+the part's exact `part_blake3`, so the tail's leaves are rebuilt on each
+such fold from the section of every entry in the tail, not only the new
+ones. A tenant under the seal threshold stays one tail part for good, so
+it pays that rebuild on every advancing fold for as long as it exists. The
+build holds every (key8, entry ordinal) pair of the part in memory at
+once, so memory grows with the part, and the reads of every part a fold
+re-encodes are kept for the whole fold so a lost HEAD CAS does not repeat
+them. A fold that rebuilds HEAD re-encodes every part, so in that case
+the kept reads cover the whole (tenant, signal) at once.
+
+The review's figures, which are estimates from reading the code and have
+not been measured: a fold that advances the watermark issues about `2T`
+ranged GETs (a footer suffix and a section per entry), where `T` is the
+tail's entry count and reaches `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`
+(250,000) before the tail seals, so up to about 500,000 GETs on one fold;
+with the tail averaging half the threshold over its life and one
+advancing fold an hour, that is about 250,000 GETs an hour per (tenant,
+signal) in steady state. Each (key8, ordinal) pair costs about 68 bytes
+of memory during the build (a `KeyIndexLeafEntry` is 40 bytes inline,
+before its block list's allocation). The 256 MiB body ceiling bounds the
+encoded body of one key slice, not the memory or the reads of the build.
+
+The query work does not wait on this. T10 and T11 wire the tier-1
+per-object probe first, which reads only the KEY_IDX sections already in
+every data object and does not depend on leaves. How tier 2 is bounded is
+decided after T12 measures: an incremental tail build, smaller tail parts
+through partitioning, or a per-(part, field) budget. The incremental merge
+decision 6 left to the implementing task "if measured necessary" is
+therefore known to be necessary, in one of those forms, before the switch
+defaults on.
+
+Refs: #2707, #2961, #2994

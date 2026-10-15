@@ -5572,6 +5572,7 @@ mod loop_interval_startup_tests {
                 config.fold = FoldTaskConfig {
                     enabled: true,
                     fold_interval: interval,
+                    ..FoldTaskConfig::default()
                 };
             }
             Loop::Maintain => {

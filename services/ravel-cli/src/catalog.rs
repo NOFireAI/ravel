@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use ravel_catalog::{CatalogConfig, FoldReport, PartLimits, RefoldRequest};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
-use ravel_proto::catalog::v1::SnapshotColumnStatsPartRef;
+use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotKeyIndexLeafRef};
 use ravel_types::{Signal, TenantHash, TenantId};
 use uuid::Uuid;
 
@@ -99,6 +99,7 @@ pub async fn fold(
         signal,
         max_flush_lifetime_ns,
         false,
+        false,
         now_ns,
         json,
     )
@@ -113,6 +114,9 @@ pub async fn fold(
 /// published into a sealed hour is folded by a later fold only until the
 /// seal margin passes that hour, and after that stays invisible to queries
 /// that carry no commit token until a HEAD rebuild. `now_ns` itself is not moved.
+///
+/// `build_key_index_leaves` sets [`CatalogConfig::build_key_index_leaves`]
+/// for this fold (`--key-index-leaves`); [`fold`] passes `false`.
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_with_writers_stopped(
     store: Arc<dyn ObjectStoreBackend>,
@@ -122,6 +126,7 @@ pub async fn fold_with_writers_stopped(
     signal: SignalArg,
     max_flush_lifetime_ns: Option<i64>,
     writers_stopped: bool,
+    build_key_index_leaves: bool,
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
@@ -138,6 +143,7 @@ pub async fn fold_with_writers_stopped(
         signal,
         max_flush_lifetime_ns,
         seal_through_hour,
+        build_key_index_leaves,
         now_ns,
         json,
         None,
@@ -194,6 +200,7 @@ pub async fn fold_inner(
         signal,
         max_flush_lifetime_ns,
         None,
+        false,
         now_ns,
         json,
         column_stats_ceiling_override,
@@ -210,12 +217,14 @@ async fn fold_core(
     signal: SignalArg,
     max_flush_lifetime_ns: Option<i64>,
     seal_through_hour: Option<u32>,
+    build_key_index_leaves: bool,
     now_ns: i64,
     json: bool,
     column_stats_ceiling_override: Option<u64>,
 ) -> anyhow::Result<(FoldReport, String)> {
     let mut catalog_config = CatalogConfig {
         shard_count,
+        build_key_index_leaves,
         ..CatalogConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {
@@ -377,6 +386,26 @@ fn render_fold_report(
     ));
     out.push_str(&format!("stamped_records: {}\n", report.stamped_records));
     out.push_str(&format!("stamped_entries: {}\n", report.stamped_entries));
+    out.push_str(&format!(
+        "key_index_ranged_gets: {}\n",
+        report.key_index_ranged_gets
+    ));
+    out.push_str(&format!(
+        "key_index_bytes_read: {}\n",
+        report.key_index_bytes_read
+    ));
+    out.push_str(&format!(
+        "key_index_leaves_written: {}\n",
+        report.key_index_leaves_written
+    ));
+    out.push_str(&format!(
+        "key_index_leaf_bytes_written: {}\n",
+        report.key_index_leaf_bytes_written
+    ));
+    out.push_str(&format!(
+        "key_index_uncovered_entries: {}\n",
+        report.key_index_uncovered_entries
+    ));
     Ok(out)
 }
 
@@ -485,6 +514,7 @@ pub async fn render_inspect(
             "    column_stats (field 7): {}\n",
             format_column_stats_part_ref(part_ref.column_stats.as_ref())
         ));
+        format_key_index_refs(&part_ref.key_index, out);
         let got = store
             .get(&part_ref.key, GetRange::Full)
             .await
@@ -516,6 +546,23 @@ fn format_column_stats_part_ref(r: Option<&SnapshotColumnStatsPartRef>) -> Strin
     match r {
         Some(r) => format!("key={} size={}", r.key, r.size),
         None => "ABSENT".to_string(),
+    }
+}
+
+/// Appends a part's `key_index` refs (field 8, ADR-2707 decision 4): a
+/// `key_index (field 8): N` line, `ABSENT` when there are none, then one line
+/// per (field, key slice) leaf.
+fn format_key_index_refs(refs: &[SnapshotKeyIndexLeafRef], out: &mut String) {
+    if refs.is_empty() {
+        out.push_str("    key_index (field 8): ABSENT\n");
+        return;
+    }
+    out.push_str(&format!("    key_index (field 8): {}\n", refs.len()));
+    for r in refs {
+        out.push_str(&format!(
+            "      field={} slice={:#018x}..={:#018x} entry_count={} uncovered_count={} key={}\n",
+            r.field, r.key8_lo, r.key8_hi, r.entry_count, r.uncovered_count, r.key
+        ));
     }
 }
 
@@ -894,7 +941,29 @@ mod tests {
                 watermark_hour: *watermark_hour,
                 min_hour: *min_hour,
                 column_stats: None,
-                key_index: Vec::new(),
+                // Part 1 carries a two-slice leaf set for one field; the
+                // others carry none.
+                key_index: if index == 1 {
+                    [(0u64, 0x7fff_u64, 3u64), (0x8000, u64::MAX, 4)]
+                        .into_iter()
+                        .map(|(lo, hi, entry_count)| SnapshotKeyIndexLeafRef {
+                            key: format!("t/x/catalog/m/idx/leaf{lo:x}.kidx"),
+                            blake3: vec![9u8; 32],
+                            size: 64,
+                            field: "user_id".to_string(),
+                            key_type: 2,
+                            key8_lo: lo,
+                            key8_hi: hi,
+                            prefix_len: 32,
+                            bucket_bits: 1,
+                            entry_count,
+                            uncovered_count: 2,
+                            part_blake3: vec![index as u8; 32],
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                },
             });
         }
 
@@ -948,6 +1017,21 @@ mod tests {
         assert!(
             report.contains("part[2] range=12..=20"),
             "missing part[2] range, got:\n{report}"
+        );
+        // Every part's key_index refs (field 8): ABSENT for a part with none,
+        // one line per (field, slice) leaf otherwise.
+        assert_eq!(
+            report.matches("    key_index (field 8): ABSENT\n").count(),
+            2,
+            "parts 0 and 2 carry no leaves, got:\n{report}"
+        );
+        assert!(
+            report.contains(
+                "    key_index (field 8): 2\n\
+                 \x20     field=user_id slice=0x0000000000000000..=0x0000000000007fff entry_count=3 uncovered_count=2 key=t/x/catalog/m/idx/leaf0.kidx\n\
+                 \x20     field=user_id slice=0x0000000000008000..=0xffffffffffffffff entry_count=4 uncovered_count=2 key=t/x/catalog/m/idx/leaf8000.kidx\n"
+            ),
+            "part 1's two slices, got:\n{report}"
         );
     }
 

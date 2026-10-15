@@ -973,6 +973,17 @@ pub struct Cli {
     #[arg(long, default_value_t = 300)]
     pub fold_interval_secs: u64,
 
+    /// Builds per-part key-index leaves (ADR-2707 decision 4) in every fold
+    /// this process runs, scheduled and on-demand. Off by default pending
+    /// measurement, and no query reads the leaves yet. When on, every part a
+    /// fold re-encodes has each entry's KEY_IDX section read by ranged GET,
+    /// up to three GETs per entry, and the tail part is re-encoded on every
+    /// fold that advances the watermark, so each such fold reads the section
+    /// of every entry in the tail. Refused in `--mode gateway`, which runs no
+    /// fold.
+    #[arg(long)]
+    pub fold_key_index_leaves: bool,
+
     /// The interval, in seconds, of the scheduled fold another process runs
     /// for this one's catalog: set it to the maintain tier's
     /// `--fold-interval-secs`. Read only by the request-budget refusal, which
@@ -5585,6 +5596,18 @@ impl Cli {
                 }
             }
         }
+        if !cli.mode.runs_scheduled_fold()
+            && !cli.mode.mounts_on_demand_fold()
+            && passed("fold_key_index_leaves")
+        {
+            return Err(Self::command().error(
+                clap::error::ErrorKind::ArgumentConflict,
+                format!(
+                    "--fold-key-index-leaves configures the catalog fold, which --mode {mode} \
+                     never runs by any route. Drop the flag, or set it on the maintain tier."
+                ),
+            ));
+        }
         if !cli.mode.runs_scheduled_fold() {
             for (id, flag) in [
                 ("disable_fold", "--disable-fold"),
@@ -9837,6 +9860,46 @@ mod tests {
             .expect("a gateway that passes no fold flag starts");
         assert!(!cli.disable_fold);
         assert_eq!(cli.fold_interval_secs, 300);
+    }
+
+    /// ADR-2707 decision 4: `--fold-key-index-leaves` is off by default, is
+    /// accepted in every mode that runs a fold by either route (scheduled in
+    /// `maintain` and `all`, on demand in `query` and `all`), and is refused
+    /// in `gateway`, which runs none.
+    #[test]
+    fn fold_key_index_leaves_is_off_by_default_and_refused_where_no_fold_runs() {
+        for mode in ["maintain", "all", "query"] {
+            let cli = Cli::parse_validated_from(["ravel-server", "--mode", mode])
+                .unwrap_or_else(|err| panic!("--mode {mode} starts without the flag: {err}"));
+            assert!(
+                !cli.fold_key_index_leaves,
+                "--mode {mode}: the leaf build is off by default"
+            );
+            let cli = Cli::parse_validated_from([
+                "ravel-server",
+                "--mode",
+                mode,
+                "--fold-key-index-leaves",
+            ])
+            .unwrap_or_else(|err| panic!("--mode {mode} must accept the flag: {err}"));
+            assert!(
+                cli.fold_key_index_leaves,
+                "--mode {mode}: the flag turns it on"
+            );
+        }
+
+        let err = Cli::parse_validated_from([
+            "ravel-server",
+            "--mode",
+            "gateway",
+            "--fold-key-index-leaves",
+        ])
+        .expect_err("a gateway runs no fold and must refuse the flag");
+        let message = err.to_string();
+        assert!(
+            message.contains("--fold-key-index-leaves") && message.contains("gateway"),
+            "the refusal must name the flag and the mode, got: {message}"
+        );
     }
 
     /// ADR-1306 decision 6, amendment of 2026-10-01: `--fold-lag-interval-secs`

@@ -99,6 +99,14 @@
   status: not-implemented
   note: "No crate or source file names RavelQL, Sigma rules or OCSF (the only 'sigma' hit is a MAD-to-sigma constant in ravel-analytics). No would-be symbol to bind."
 
+- id: catalog-kidx-rebuild-command-proposed
+  doc: docs/catalog-and-mvcc.md
+  quote: "the command below does not exist yet"
+  kind: negative
+  binds: []
+  status: not-implemented
+  note: "ravel-cli catalog fold --rebuild-key-index is ADR-2707's T9c; services/ravel-cli has no rebuild-key-index flag. The flag would arrive as a clap field, not a definition a bind can name ahead of time."
+
 - id: logseg-gram-idx-reserved
   doc: docs/log-segment-format.md
   quote: "reserved (ADR-0105, not implemented)"

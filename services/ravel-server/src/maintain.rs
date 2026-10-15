@@ -92,6 +92,7 @@ use ravel_ingest::{Clock as _, SystemClock};
 use ravel_maintain::scan::{
     MaintainMemo, MaintainReport, Zone, classify_zone, scan_and_maintain_with_memo,
 };
+use ravel_maintain::sweep::CatalogObjectKind;
 use ravel_maintain::worker_set::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, owns, run_bounded,
 };
@@ -158,6 +159,13 @@ pub(crate) const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Log
 /// signals this driver actually loops over (`run_tick`'s `for signal in
 /// MAINTAINED_SIGNALS`), so a signal from outside that set is a caller bug,
 /// not a case to fold into an "other" bucket.
+fn catalog_kind_index(kind: CatalogObjectKind) -> usize {
+    CatalogObjectKind::ALL
+        .iter()
+        .position(|k| *k == kind)
+        .unwrap_or(CatalogObjectKind::ALL.len() - 1)
+}
+
 fn signal_index(signal: Signal) -> usize {
     match signal {
         Signal::Metrics => 0,
@@ -223,6 +231,9 @@ pub struct MaintenanceSafetyMetrics {
     objects_deleted_superseded_records_deleted: AtomicU64,
     objects_deleted_superseded_data_deleted: AtomicU64,
     objects_deleted_unreferenced_parts_deleted: AtomicU64,
+    /// Catalog objects rule 5 deleted, by [`CatalogObjectKind`], summed over
+    /// every signal. Backs `ravel_maintain_catalog_objects_deleted_total`.
+    catalog_objects_deleted: [AtomicU64; CatalogObjectKind::ALL.len()],
     /// Bytes reclaimed by the three sweep deletions whose object size is known
     /// without an extra request, by signal, summed over every sweep pass since
     /// process start: the quarantine reaper and rule 3's unreferenced-part
@@ -727,6 +738,21 @@ impl MaintenanceSafetyMetrics {
     pub fn objects_deleted_unreferenced_parts_deleted(&self) -> u64 {
         self.objects_deleted_unreferenced_parts_deleted
             .load(Ordering::Relaxed)
+    }
+
+    /// Catalog objects of `kind` the unreferenced-catalog-object sweep
+    /// deleted, summed over every pass of every signal since process start
+    /// ([`ravel_maintain::CatalogSweepOutcome::deleted_of`]).
+    pub fn catalog_objects_deleted(&self, kind: CatalogObjectKind) -> u64 {
+        self.catalog_objects_deleted[catalog_kind_index(kind)].load(Ordering::Relaxed)
+    }
+
+    /// Adds one catalog sweep pass's per-kind deletes.
+    pub fn record_catalog_sweep(&self, outcome: &ravel_maintain::CatalogSweepOutcome) {
+        for kind in CatalogObjectKind::ALL {
+            self.catalog_objects_deleted[catalog_kind_index(kind)]
+                .fetch_add(outcome.deleted_of(kind) as u64, Ordering::Relaxed);
+        }
     }
 
     /// Bytes reclaimed for `signal` by the size-known sweep deletions (the
@@ -2873,13 +2899,17 @@ pub async fn run_tick_with_refold<C: Clock + Clone + 'static>(
             match sweep_unreferenced_catalog_objects(store, clock, compactor, &hold, tenant, signal)
                 .await
             {
-                Ok(outcome) => tracing::info!(
-                    tenant = %tenant.to_hex(),
-                    signal = ?signal,
-                    deleted = outcome.deleted,
-                    kept = outcome.kept,
-                    "maintenance: unreferenced catalog object sweep pass complete"
-                ),
+                Ok(outcome) => {
+                    safety.record_catalog_sweep(&outcome);
+                    tracing::info!(
+                        tenant = %tenant.to_hex(),
+                        signal = ?signal,
+                        deleted = outcome.deleted,
+                        deleted_kidx = outcome.deleted_kidx,
+                        kept = outcome.kept,
+                        "maintenance: unreferenced catalog object sweep pass complete"
+                    )
+                }
                 Err(err) => tracing::warn!(
                     tenant = %tenant.to_hex(),
                     signal = ?signal,
@@ -5654,6 +5684,113 @@ mod tests {
         assert!(
             store.get(&referenced_key, GetRange::Full).await.is_ok(),
             "the object the live HEAD still names must survive the sweep"
+        );
+    }
+
+    /// A real logs tick reaps an unreferenced `.kidx` leaf past the horizon,
+    /// keeps the leaf a live part names in `key_index`, and counts the reaped
+    /// one under `kind="kidx"` in the snapshot `/metrics` renders. Without
+    /// `record_catalog_sweep` at the tick the kidx count stays 0; without the
+    /// sweep's field-8 walk the referenced leaf is gone and the count is 2.
+    #[tokio::test]
+    async fn run_tick_counts_reaped_kidx_leaves_for_metrics() {
+        use ravel_proto::catalog::v1::{SnapshotHead, SnapshotKeyIndexLeafRef, SnapshotPartRef};
+
+        let store = MemoryStore::new();
+        let tenant = TenantId::new("acme").hash();
+        let signal = Signal::Logs;
+        let catalog = format!("t/{}/catalog/{}", tenant.to_hex(), signal.key_prefix());
+        let head_key = format!("{catalog}/HEAD");
+        let part_key = format!("{catalog}/snap/20260101T00.aaaa.csnap");
+        let referenced_leaf = format!("{catalog}/idx/20260101T00.1111.kidx");
+        let unreferenced_leaf = format!("{catalog}/idx/20251231T00.2222.kidx");
+        for key in [&part_key, &referenced_leaf, &unreferenced_leaf] {
+            store
+                .put(
+                    key,
+                    bytes::Bytes::from_static(b"catalog-object"),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("seed catalog object");
+        }
+        let head = SnapshotHead {
+            format_version: 1,
+            tenant_hash: tenant.0.to_vec(),
+            signal: 0,
+            shard_count: 1,
+            watermark_hour: 100,
+            parts: vec![SnapshotPartRef {
+                key: part_key.clone(),
+                blake3: vec![1u8; 32],
+                size: 1,
+                entry_count: 1,
+                watermark_hour: 100,
+                min_hour: 0,
+                column_stats: None,
+                key_index: vec![SnapshotKeyIndexLeafRef {
+                    key: referenced_leaf.clone(),
+                    blake3: vec![2u8; 32],
+                    size: 1,
+                    field: "user_id".to_string(),
+                    key_type: 2,
+                    key8_lo: 0,
+                    key8_hi: u64::MAX,
+                    prefix_len: 1,
+                    bucket_bits: 1,
+                    entry_count: 1,
+                    uncovered_count: 0,
+                    part_blake3: vec![1u8; 32],
+                }],
+            }],
+            folder_id: vec![0u8; 16],
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        store
+            .put(
+                &head_key,
+                bytes::Bytes::from(ravel_catalog::encode_head(&head).expect("valid HEAD encodes")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("seed HEAD");
+
+        let compactor = CompactorConfig::default();
+        let clock =
+            ravel_maintain::FixedClock::new(compactor.protection_horizon_ns.saturating_mul(2));
+        let mut memo = MaintainMemo::with_default_interval();
+        let safety = MaintenanceSafetyMetrics::default();
+        let ownership = MaintenanceOwnershipMetrics::new(DEFAULT_STALLED_AFTER_INTERVALS);
+        let worker = solo_worker();
+        run_tick_with_clock(
+            &clock,
+            &store,
+            &tenant,
+            &compactor,
+            &RetentionConfig::default(),
+            1,
+            &mut memo,
+            &safety,
+            &ownership,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await;
+
+        assert!(store.get(&unreferenced_leaf, GetRange::Full).await.is_err());
+        assert!(store.get(&referenced_leaf, GetRange::Full).await.is_ok());
+        let snapshot = crate::metrics::MaintenanceSafetySnapshot::from_metrics(&safety);
+        assert_eq!(
+            snapshot.catalog_objects_deleted,
+            vec![
+                (CatalogObjectKind::Csnap, 0),
+                (CatalogObjectKind::Npost, 0),
+                (CatalogObjectKind::Cstat, 0),
+                (CatalogObjectKind::Kidx, 1),
+                (CatalogObjectKind::Other, 0),
+            ]
         );
     }
 

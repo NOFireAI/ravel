@@ -28,7 +28,7 @@ t/<tenant_hash>/catalog/<signal>/snap/<watermark>.<hash16>.csnap         snapsho
 t/<tenant_hash>/catalog/<signal>/HEAD                                    head pointer (mutable, CAS)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.npost         name postings (immutable)
 t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.cstat         column statistics (immutable; ADR-0850, ADR-0942, ADR-1413)
-t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.kidx          per-part key-index leaf (immutable; ADR-2707, proposed)
+t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.kidx          per-part key-index leaf (immutable; ADR-2707)
 t/<tenant_hash>/pq/grants                                               Parquet table location grants record (CAS whole-record replace, format_version 1; ADR-2040 D1)
 t/<tenant_hash>/pq/t/<table>/v/<version:020>.pqm                        Parquet table manifest version (CreateIfAbsent, immutable, newest version is the table; ADR-2040 D1)
 sys/qualification                                                       store qualification record (once per suite version, re-recorded on a version bump; ADR-1302)
@@ -683,8 +683,8 @@ and the CAS read/write helpers.
   `parts[].key`, the optional `postings.key`, each part's optional
   per-part column-statistics key `parts[].column_stats.key` (field 7), and
   each part's key-index leaf keys `parts[].key_index[].key` (field 8,
-  ADR-2707, proposed: the reference-set change lands in the same change as
-  the first leaf writer, since a leaf HEAD does not name is swept) as
+  ADR-2707, in the same change as the fold's leaf writer, since a leaf HEAD
+  does not name is swept) as
   referenced, and deletes any
   object under the two prefixes that HEAD does not name once its
   `last_modified` age exceeds `CompactorConfig::protection_horizon_ns`. A fresh
@@ -713,7 +713,11 @@ and the CAS read/write helpers.
   `last_modified`, so an object's age does not bound the fold that may adopt it;
   what bounds the writer race is the no-anchor rule plus the pre-delete HEAD
   re-verify. A HEAD present but undecodable fails the pass without deleting, so
-  a corrupt HEAD can never make the live snapshot look unreferenced.
+  a corrupt HEAD can never make the live snapshot look unreferenced. The
+  outcome splits its deletes by kind (`deleted_csnap`, `deleted_npost`,
+  `deleted_cstat`, `deleted_kidx`, and `deleted_other` for any other key under
+  the two prefixes), and the server renders them as
+  `ravel_maintain_catalog_objects_deleted_total{kind=...}`.
 
 ### Per-part column statistics (ADR-1413)
 
@@ -823,12 +827,22 @@ horizon, exactly like any other orphaned catalog object. A v3 per-part
 object HEAD's current parts list still names is unaffected and is never
 swept as unreferenced while its owning part is live.
 
-### Per-part key-index leaves (ADR-2707, proposed)
+### Per-part key-index leaves (ADR-2707)
 
-This section describes objects no shipped fold writes yet. The proto
-fields, the leaf codec and the single-leaf probe exist; the fold's leaf
-build, HEAD attachment, the sweep's `kidx` kind and the query path do not,
-and the task that lands them removes this "proposed" marker.
+The proto fields, the leaf codec, the single-leaf probe, the fold's leaf
+build and HEAD attachment, and the sweep's `kidx` kind are implemented: the
+fold (the server's scheduled and on-demand fold and `ravel-cli catalog
+fold`) can write leaves for logs and spans. The leaf build is behind a
+switch that is off by default (`CatalogConfig::build_key_index_leaves`,
+`ravel-server --fold-key-index-leaves`, `ravel-cli catalog fold
+--key-index-leaves`), pending the measurement ADR-2707's leaf build
+switch amendment describes. Every process that runs a fold for a tenant
+(a maintain-mode process, and a query-mode process serving on-demand
+folds) should agree on the switch: a fold without it writes the re-encoded tail
+without refs. Two parts are proposed and marked so below: the query
+path ("Reader", no query probes a leaf yet) and the
+`--rebuild-key-index` repair under "Rollout". The task that
+lands each removes its marker.
 
 The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
 crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
@@ -941,7 +955,8 @@ the part. The reader subtracts exactly those from coverage and scans them
 Coverage is read from the leaf header and never inferred from the tenant's
 current declaration.
 
-**Reader.** For a lookup on `field = value`, the resolve narrows HEAD's parts
+**Reader (proposed: no query path calls the probe yet).** For a lookup on
+`field = value`, the resolve narrows HEAD's parts
 to the window as `load_snapshot` does; a lookup with no time bound covers
 every part. A (part, field)'s slices tile the whole `key8` space: a single
 unsliced leaf has `key8_lo = 0` and `key8_hi = u64::MAX`, and a split
@@ -981,14 +996,36 @@ every entry and tail object outside the shard `shard_for_span` selects for
 that hour's generation (ADR-0052). These probes are their own cost phase
 (`keyIndex` under `stats.phases`) and are never pooled into a scan counter.
 
-**Fold.** The fold writes leaves for exactly the parts it re-encodes this
-fold (a part carried forward by reference keeps its refs, as for field 7),
-for every field the tenant's key-index set names at fold time plus every
-field any entry's section header names, from the tier-1 sections and never
-from rows: per entry, a suffix GET for the footer and a ranged GET of the
+**Fold.** With the switch off (the default), the fold reads no footer or
+KEY_IDX section, writes no leaf, and re-encodes every part it re-encodes
+without `key_index` refs, dropping any the part carried; a part carried
+forward by reference keeps its refs unchanged. The sweep does not read the
+switch. With the switch on, the fold writes leaves for exactly the
+parts it re-encodes this fold (a part carried forward by reference keeps
+its refs, as for field 7),
+for every field the tenant's key-index set names at fold time (logs: the
+declared `key_index` columns, plus `trace_id` when `index_trace_id` is set;
+spans: `trace_id`) plus every field any entry's section header names, from
+the tier-1 sections and never from rows: per entry, a suffix GET of the
+last `min(8 KiB, object size)` bytes for the footer (a footer longer than
+that costs one more GET of the footer's own range) and a ranged GET of the
 KEY_IDX section (about 2% of a logs object and about 6% of a spans object
-on the ADR-2707 Stage 0 corpora), merged across the part's entries, sorted,
-bucketed and written before the part PUT, so a refusal writes no object.
+on the ADR-2707 Stage 0 corpora), issued under the fold's
+`fold_bucket_concurrency` bound, merged across the part's entries, sorted,
+bucketed and PUT before the part PUT, so a failed leaf PUT fails the fold
+with no part written. An encode refusal is not a failed PUT: it leaves the
+field uncovered for that part (every entry counted in
+`key_index_uncovered_entries`, logged at error level) and the part is
+published without that field's refs. A logs tenant whose key-index set is
+empty (no declared `key_index` column and `index_trace_id` off) reads no
+section and writes no leaf. Each data object's footer and section are read
+once per fold, not once per HEAD CAS attempt: the result is kept by data
+object key for the rest of the fold, so an attempt after a lost CAS issues
+no further reads for an object already read; a transient GET failure is logged at warn level naming the
+object key, and the entry is uncovered in the part that fold writes (for
+the life of the part if it seals in that fold). A field's key type is the declared one, else the type
+the first entry naming the field gives it. Each leaf is PUT
+`CreateIfAbsent`.
 The object is content-addressed by its own bytes (`hash16` is the blake3
 of the leaf), not by the part's hash, for the reason the
 column-statistics section gives:
@@ -1031,7 +1068,8 @@ zero delta, or overflows `u32`; a frame whose `entry_count` is zero; a
 header `uncovered_entry_ordinals` list that is not strictly ascending; a
 `part_blake3` not 32 bytes, or for a whole-object reader a `tenant_hash`
 not 16 (a probe compares the tenant first, so there it is the
-`FieldMismatch` above); an empty `field` or
+`FieldMismatch` above); an empty `field`, a `field` longer than
+`KEY_IDX_MAX_NAME_LEN` (128 bytes, which the encoder also refuses), or
 `key8_lo` above `key8_hi`; a ref `size` other than the header's
 `prefix_len + body_len`, and, for a whole-object reader, an object of any
 other length. The body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
@@ -1046,20 +1084,36 @@ over the whole object by `inspect kidx`; it is not a bound on `body_len`
 (the stored bytes, which are smaller).
 A (part, field) whose decompressed body would exceed it is split by key
 range into several leaves under the ceiling, each with its own ref and
-slice, so a lookup opens exactly one leaf per (part, field). A per-entry
-failure lands the entry in `uncovered_entry_ordinals` and never aborts the
-leaf; the fold report counts section reads, bytes, leaves written and
-uncovered entries per fold.
+slice, so a lookup opens exactly one leaf per (part, field). A slice cuts
+only between distinct `key8` values, so a single `key8` whose own entries'
+encodings exceed the ceiling cannot be sliced: every entry carrying that
+`key8` is listed in `uncovered_entry_ordinals` for the field (it stays a
+candidate, so the lookup stays exact; an uncovered entry is uncovered for
+every key of the field, so its other keys leave the leaf too) and the leaf
+holds the rest. A per-entry
+failure (no KEY_IDX section, a section that does not name the field or
+names it under another key type, a failed GET, a corrupt section) lands the
+entry in `uncovered_entry_ordinals` and never aborts the leaf. A field with
+no covered entry in the part writes no leaf (absence is uncovered). The
+fold report counts `key_index_ranged_gets` and `key_index_bytes_read` (the
+footer and section GETs and the bytes they returned, also counted in
+`get_requests`) as the total the fold issued across its CAS attempts, and
+`key_index_leaves_written`, `key_index_leaf_bytes_written` and
+`key_index_uncovered_entries` (per re-encoded part and field, the entries
+no leaf covers) for the CAS attempt that published. All five are zero with
+the switch off.
 
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite
 therefore removes the subject's `key8` from the next leaf; the stale leaf is
 unreferenced and swept past the protection horizon. A leaf holds key values
 (an `I64` subject value verbatim, an 8-byte hash prefix of a string value, a
-trace id), so the catalog family is no longer free of subject values; the
-erasure completion rule for stale catalog objects is settled together with
-the column-statistics case, and the pending-erasure predicate keeps
-filtering rows after the index until the rewrite lands.
+trace id), so the catalog family is no longer free of subject values
+(ADR-0064, `.kidx` amendment): the erasure completion rule for stale
+catalog objects covers a stale `.kidx` the same way it covers
+a stale `.cstat`, and the query path, once it reads leaves, keeps the
+pending-erasure predicate filtering rows after the index until the rewrite
+lands.
 
 **Rollout.** A fold process that predates field 8 re-encodes HEAD without
 it for every part it carries forward; the leaves those parts had are then
@@ -1073,7 +1127,9 @@ builds HEAD as a fresh struct, so an unknown field does not survive its
 CAS. The regular fold re-indexes a part only when it re-encodes it, and a
 sealed, compacted historical part with no erasure pending is never
 re-encoded by the regular fold, so the repair is explicit and is not a
-fold: `ravel-cli catalog fold --rebuild-key-index [--field <name>]`
+fold (proposed: the command below does not exist yet, and
+this paragraph's account of it is its specification):
+`ravel-cli catalog fold --rebuild-key-index [--field <name>]`
 attaches leaves to parts it leaves unchanged. For every part in HEAD that
 lacks a `key_index` ref for a declared field (every part, for spans) it
 reads the part object once, reads each entry's footer suffix and KEY_IDX
@@ -1110,21 +1166,28 @@ the rerun skips every part whose ref an earlier batch published. A
 one-part tenant is a single batch, and an interruption there loses the
 whole run. Like the plain CLI fold it holds no claim and keeps no cursor
 (HEAD is the cursor), and it takes `--writers-stopped` as the same
-assertion the plain fold takes. Detection: this sweep reports
-`CatalogSweepOutcome { deleted, kept }` with no per-kind split and no
-metric of its own today, so the leaf writer's change adds `deleted_kidx`
-to the outcome and renders it as
+assertion the plain fold takes. Detection: the sweep's
+`CatalogSweepOutcome` splits its deletes by kind, and the server renders
+`deleted_kidx` as
 `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
-rising while HEAD carries no `key_index` refs is the signature an operator
-acts on. The cost of a bad rollout is one rebuild run over the affected
+rising while HEAD carries no `key_index` refs (`ravel-cli catalog inspect`
+prints each part's `key_index (field 8)` line) is the signature an operator
+acts on. A sweeper that predates field 8 names no leaf in its reference
+set, so it deletes live leaves past the horizon with the same outcome: the
+parts read as uncovered until a fold re-encodes them or the repair runs.
+The cost of a bad rollout is one rebuild run over the affected
 parts, `2 x entries` ranged GETs in total (a footer suffix and a section
 range per entry, at most `2 x max(batch_entries, largest part's entries)`
 per attempt, 500,000 at the default while no part exceeds the seal
 threshold) plus the sections' bytes, and that run scans until it has run;
-nothing is retained and nothing is silent. The mixed-version combinations
-(old folder then new sweeper, old sweeper against a new HEAD, new folder
-after an old folder, then the rebuild) are
-tested, not assumed (ADR-0849 section 1a).
+nothing is retained and nothing is silent. Of the mixed-version
+combinations ADR-0849 section 1a requires tested (old folder then new
+sweeper, old sweeper against a new HEAD, new folder after an old folder,
+then the rebuild), the first is tested
+(`leaves_a_field_8_stripping_fold_drops_are_reaped_and_the_part_reads_uncovered`
+in `crates/ravel-maintain/src/sweep.rs`: a HEAD republished without field 8,
+the sweep reaping its leaves, and the lookup finding no ref); the others
+land with the rebuild command.
 
 ### Idempotency marker body layout
 

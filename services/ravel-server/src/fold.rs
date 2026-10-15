@@ -67,6 +67,11 @@ pub struct FoldTaskConfig {
     /// and the fold-lag threshold. [`check_spawnable`](Self::check_spawnable)
     /// re-refuses it at the enabled loop's spawn site.
     pub fold_interval: Duration,
+    /// Whether this process's folds, scheduled and on-demand, build per-part
+    /// key-index leaves (`--fold-key-index-leaves`, ADR-2707 decision 4).
+    /// [`crate::query::build_catalog_for_server`] maps it onto
+    /// `CatalogConfig::build_key_index_leaves`. Default `false`.
+    pub build_key_index_leaves: bool,
 }
 
 /// Why [`spawn`] refused to start the fold loops. Nothing is spawned.
@@ -96,6 +101,7 @@ impl Default for FoldTaskConfig {
         FoldTaskConfig {
             enabled: true,
             fold_interval: DEFAULT_FOLD_INTERVAL,
+            build_key_index_leaves: false,
         }
     }
 }
@@ -1619,6 +1625,7 @@ mod tests {
         let config = FoldTaskConfig {
             enabled: true,
             fold_interval: Duration::ZERO,
+            ..FoldTaskConfig::default()
         };
         match spawn(
             catalog,
@@ -2047,6 +2054,7 @@ mod tests {
         let fold = |enabled| FoldTaskConfig {
             enabled,
             fold_interval: DEFAULT_FOLD_INTERVAL,
+            ..FoldTaskConfig::default()
         };
         let given = |mode, enabled| {
             refold_queue_for_maintain(mode, &fold(enabled), &queue)

@@ -95,6 +95,7 @@ use ravel_ingest::{
 };
 use ravel_maintain::ScrubLevel;
 use ravel_maintain::UnreadableReason;
+use ravel_maintain::sweep::CatalogObjectKind;
 use ravel_object_store::StoreMetrics;
 use ravel_object_store::instrument::{
     ControlPlaneMetricsSnapshot, LATENCY_BUCKET_BOUNDS_MICROS, LATENCY_BUCKET_COUNT,
@@ -328,6 +329,10 @@ pub enum Label {
     CacheTier(CacheTier),
     MergeMemoryKind(MergeMemoryKind),
     DeletedObjectKind(DeletedObjectKind),
+    /// Which catalog object kind the unreferenced-catalog-object sweep deleted:
+    /// `csnap`, `npost`, `cstat`, `kidx` or `other`. A closed enum owned by
+    /// `ravel_maintain::sweep`. Shares the `kind` key with `DeletedObjectKind`.
+    CatalogObjectKind(CatalogObjectKind),
     /// How one alert evaluation tick ended (issue #532). A closed enum owned by
     /// [`crate::alerting`], since the outcomes are the alerting loop's own, not
     /// a dimension this renderer invents.
@@ -614,6 +619,7 @@ impl Label {
             Label::CacheTier(_) => "tier",
             Label::MergeMemoryKind(_) => "kind",
             Label::DeletedObjectKind(_) => "kind",
+            Label::CatalogObjectKind(_) => "kind",
             Label::AlertOutcome(_) => "outcome",
             Label::AlertHistorySkipReason(_) => "reason",
             #[cfg(feature = "sql")]
@@ -662,6 +668,7 @@ impl Label {
             Label::CacheTier(tier) => tier.name().to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
             Label::DeletedObjectKind(kind) => kind.name().to_string(),
+            Label::CatalogObjectKind(kind) => kind.name().to_string(),
             Label::AlertOutcome(outcome) => alert_outcome_name(*outcome).to_string(),
             Label::AlertHistorySkipReason(reason) => reason.name().to_string(),
             #[cfg(feature = "sql")]
@@ -4346,6 +4353,11 @@ pub struct MaintenanceSafetySnapshot {
     /// Unreferenced L1 parts rule 3 physically deleted, summed over every
     /// sweep pass since process start.
     pub objects_deleted_unreferenced_parts_deleted: u64,
+    /// Catalog objects rule 5 (the unreferenced-catalog-object sweep)
+    /// physically deleted, summed over every signal since process start: one
+    /// entry per [`CatalogObjectKind::ALL`] member, in that order. Backs
+    /// `ravel_maintain_catalog_objects_deleted_total`.
+    pub catalog_objects_deleted: Vec<(CatalogObjectKind, u64)>,
     /// Tenant ticks whose alert retention sweep was skipped, by reason, since
     /// process start (ADR-1688 decision 3). One entry per
     /// [`crate::maintain::AlertRetentionSkipReason::ALL`] member, in that order.
@@ -4400,6 +4412,10 @@ impl MaintenanceSafetySnapshot {
                 .objects_deleted_superseded_data_deleted(),
             objects_deleted_unreferenced_parts_deleted: metrics
                 .objects_deleted_unreferenced_parts_deleted(),
+            catalog_objects_deleted: CatalogObjectKind::ALL
+                .iter()
+                .map(|&kind| (kind, metrics.catalog_objects_deleted(kind)))
+                .collect(),
             alert_retention_skipped: crate::maintain::AlertRetentionSkipReason::ALL
                 .iter()
                 .map(|&reason| (reason, metrics.alert_retention_skipped(reason)))
@@ -5173,6 +5189,28 @@ fn render_maintain_safety_family(
             "ravel_maintain_objects_deleted_total",
             &kind_labels(mode, kind),
             value,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_maintain_catalog_objects_deleted_total",
+        "Unreferenced catalog objects the catalog sweep physically deleted past the protection \
+         horizon, by kind: csnap (snapshot parts), npost (name postings), cstat (column \
+         statistics), kidx (key-index leaves) or other (any other key under the snap/ and idx/ \
+         prefixes). Not signal-scoped: summed across every signal this process has swept. kidx \
+         also counts the leaves a fold superseded by re-encoding their part, so it rises in \
+         normal operation; rising while HEAD's logs or spans parts carry no key_index refs \
+         (ravel-cli catalog inspect) is the signature of a fold or sweeper that predates \
+         key-index leaves.",
+        "counter",
+    );
+    for (kind, value) in &snapshot.catalog_objects_deleted {
+        write_sample(
+            out,
+            "ravel_maintain_catalog_objects_deleted_total",
+            &[Label::Mode(mode), Label::CatalogObjectKind(*kind)],
+            *value,
         );
     }
 }
@@ -9166,6 +9204,7 @@ mod tests {
             Label::CacheTier(CacheTier::Ram),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
             Label::DeletedObjectKind(DeletedObjectKind::QuarantineReaped),
+            Label::CatalogObjectKind(CatalogObjectKind::Kidx),
             Label::AlertOutcome(crate::alerting::AlertTickOutcome::Evaluated),
             Label::AlertHistorySkipReason(
                 crate::alerting::AlertHistorySkipReason::UnsupportedVersion,
@@ -9209,6 +9248,7 @@ mod tests {
                 Label::CacheTier(_) => "tier",
                 Label::MergeMemoryKind(_) => "kind",
                 Label::DeletedObjectKind(_) => "kind",
+                Label::CatalogObjectKind(_) => "kind",
                 Label::AlertOutcome(_) => "outcome",
                 Label::AlertHistorySkipReason(_) => "reason",
                 // Asserted by `sql_ddl_family_renders_exact_samples`, since
@@ -9281,6 +9321,8 @@ mod tests {
                 // allowlist of distinct keys is unchanged; two variants map to
                 // it.
                 "kind",
+                // CatalogObjectKind (ADR-2707 decision 4) reuses the `kind` key.
+                "kind",
                 "outcome",
                 // AlertHistorySkipReason (ADR-2708 decision D6) reuses the
                 // `reason` key.
@@ -9318,8 +9360,8 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            35,
-            "exactly 35 label variants every build has, 22 distinct keys (sql adds DdlKind, \
+            36,
+            "exactly 36 label variants every build has, 22 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
@@ -12540,6 +12582,13 @@ mod tests {
             objects_deleted_superseded_records_deleted: 11,
             objects_deleted_superseded_data_deleted: 12,
             objects_deleted_unreferenced_parts_deleted: 13,
+            catalog_objects_deleted: vec![
+                (CatalogObjectKind::Csnap, 40),
+                (CatalogObjectKind::Npost, 41),
+                (CatalogObjectKind::Cstat, 42),
+                (CatalogObjectKind::Kidx, 43),
+                (CatalogObjectKind::Other, 0),
+            ],
             alert_retention_skipped: Vec::new(),
             unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 14), (Signal::Audit, 0)],
             unmaintained_superseded: Vec::new(),
@@ -12732,6 +12781,29 @@ mod tests {
             assert!(
                 body.contains(&sample),
                 "missing objects_deleted_total sample {sample}:\n{body}"
+            );
+        }
+        assert!(
+            body.contains("# TYPE ravel_maintain_catalog_objects_deleted_total counter"),
+            "catalog_objects_deleted_total must carry a counter TYPE header:\n{body}"
+        );
+        assert!(
+            body.contains("# HELP ravel_maintain_catalog_objects_deleted_total "),
+            "catalog_objects_deleted_total must carry HELP text:\n{body}"
+        );
+        for (kind, value) in [
+            ("csnap", 40),
+            ("npost", 41),
+            ("cstat", 42),
+            ("kidx", 43),
+            ("other", 0),
+        ] {
+            let sample = format!(
+                "ravel_maintain_catalog_objects_deleted_total{{mode=\"maintain\",kind=\"{kind}\"}} {value}"
+            );
+            assert!(
+                body.contains(&sample),
+                "missing catalog_objects_deleted_total sample {sample}:\n{body}"
             );
         }
         assert!(
@@ -13769,6 +13841,82 @@ mod tests {
         }
     }
 
+    /// The catalog sweep's per-kind deletes reach `/metrics` through the chain
+    /// the maintenance tick drives: `CatalogSweepOutcome` to
+    /// `record_catalog_sweep` to `from_metrics` to the rendered family. Two
+    /// passes are recorded, so each sample is their sum, and every kind has a
+    /// distinct value, so a renderer reading another kind's count fails.
+    #[test]
+    fn render_includes_catalog_objects_deleted_by_kind() {
+        let safety = crate::maintain::MaintenanceSafetyMetrics::default();
+        for _ in 0..2 {
+            safety.record_catalog_sweep(&ravel_maintain::CatalogSweepOutcome {
+                deleted: 15,
+                kept: 99,
+                deleted_csnap: 1,
+                deleted_npost: 2,
+                deleted_cstat: 3,
+                deleted_kidx: 4,
+                deleted_other: 5,
+            });
+        }
+        let snapshot = MaintenanceSafetySnapshot::from_metrics(&safety);
+        let body = render(
+            Mode::Maintain,
+            &StoreMetricsSnapshot::default(),
+            &[],
+            &CatalogCountersSnapshot::default(),
+            None,
+            Some(&snapshot),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &AdmissionCountersSnapshot::default(),
+            &[],
+            0,
+            IngestBufferBudgetSnapshot::default(),
+            PendingStrictAckSnapshot::default(),
+            None,
+            None,
+            &[],
+            None,
+            crate::mem_stats::AllocatorStats::Other { name: "test" },
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            MemoryBudgetSnapshot::default(),
+            false,
+        );
+        assert_eq!(
+            body.matches("# TYPE ravel_maintain_catalog_objects_deleted_total counter\n")
+                .count(),
+            1,
+            "exactly one TYPE header:\n{body}"
+        );
+        let samples: Vec<&str> = body
+            .lines()
+            .filter(|line| line.starts_with("ravel_maintain_catalog_objects_deleted_total{"))
+            .collect();
+        assert_eq!(
+            samples,
+            vec![
+                "ravel_maintain_catalog_objects_deleted_total{mode=\"maintain\",kind=\"csnap\"} 2",
+                "ravel_maintain_catalog_objects_deleted_total{mode=\"maintain\",kind=\"npost\"} 4",
+                "ravel_maintain_catalog_objects_deleted_total{mode=\"maintain\",kind=\"cstat\"} 6",
+                "ravel_maintain_catalog_objects_deleted_total{mode=\"maintain\",kind=\"kidx\"} 8",
+                "ravel_maintain_catalog_objects_deleted_total{mode=\"maintain\",kind=\"other\"} 10",
+            ]
+        );
+    }
+
     /// The quarantine leg of orphan GC reaches `/metrics` (ADR-0058
     /// amendment), through the same `MaintenanceSafetyMetrics` the server
     /// already feeds every `SweepReport` into. The report is what a sweep pass
@@ -13969,6 +14117,10 @@ mod tests {
             objects_deleted_superseded_records_deleted: 1,
             objects_deleted_superseded_data_deleted: 1,
             objects_deleted_unreferenced_parts_deleted: 1,
+            catalog_objects_deleted: CatalogObjectKind::ALL
+                .iter()
+                .map(|&kind| (kind, 1))
+                .collect(),
             alert_retention_skipped: Vec::new(),
             unmaintained_orphan_breaker_trips: vec![(Signal::Alerts, 1), (Signal::Audit, 1)],
             unmaintained_superseded: [Signal::Alerts, Signal::Audit]
@@ -14094,7 +14246,9 @@ mod tests {
                 || line.starts_with("ravel_maintain_erasure_unwritable_objects_total")
             {
                 vec!["mode", "signal", "reason"]
-            } else if line.starts_with("ravel_maintain_objects_deleted_total") {
+            } else if line.starts_with("ravel_maintain_objects_deleted_total")
+                || line.starts_with("ravel_maintain_catalog_objects_deleted_total")
+            {
                 vec!["mode", "kind"]
             } else {
                 continue;
