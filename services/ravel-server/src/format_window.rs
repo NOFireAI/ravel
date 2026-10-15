@@ -575,6 +575,7 @@ mod tests {
                 watermark_hour: hour,
                 min_hour: hour,
                 column_stats: None,
+                key_index: Vec::new(),
             });
             store
                 .put(&key, Bytes::from(bytes), PutOptions::default())

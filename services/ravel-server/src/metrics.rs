@@ -11755,6 +11755,7 @@ mod tests {
                     segment_count: 0,
                     part_blake3: vec![part_hash.to_vec()],
                 }),
+                key_index: Vec::new(),
             }],
             folder_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
             shard_generation_count: 1,

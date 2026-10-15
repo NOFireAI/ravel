@@ -1232,6 +1232,7 @@ async fn signal_mismatched_head_is_not_cached_and_warns_on_every_resolve() {
             watermark_hour: 10,
             min_hour: 0,
             column_stats: None,
+            key_index: Vec::new(),
         }],
         folder_id: Uuid::new_v4().into_bytes().to_vec(),
         created_unix_ns: 0,

@@ -143,7 +143,7 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::Rspan { .. }
         | Command::Store { .. }
         | Command::Idem { .. }
-        // `inspect cstat` takes an explicit object key, exactly like
+        // `inspect cstat` and `inspect kidx` take an explicit object key, exactly like
         // `segment inspect`/`rlog inspect`: no tenant to hash.
         | Command::Inspect { .. }
         // `tenancy show` decodes the marker itself and takes no `--tenant`;
@@ -308,7 +308,7 @@ fn command_is_write(command: &Command) -> bool {
         | Command::Idem { .. }
         | Command::Tenancy { .. }
         | Command::Cache { .. }
-        // `inspect cstat` only reads the named object.
+        // `inspect cstat` and `inspect kidx` only read the named object.
         | Command::Inspect { .. } => false,
     }
 }
@@ -1659,6 +1659,21 @@ enum InspectCommand {
         /// Local file path or object store key.
         key: String,
     },
+    /// Verify per-part key-index leaves (`.kidx`, ADR-2707 decision 4):
+    /// decode every bucket frame and print every header field, the
+    /// bucket-size distribution and, with `--entries`, every entry. Several
+    /// keys must be the slices of one (part, field): same identity, same
+    /// uncovered entries, tiling the key space. A leaf or set that fails any
+    /// check exits non-zero with the typed error and prints no report.
+    Kidx {
+        /// Local file paths or object store keys.
+        #[arg(required = true)]
+        keys: Vec<String>,
+        /// Also print every entry: its bucket, key8, entry ordinal and
+        /// block list.
+        #[arg(long)]
+        entries: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2337,6 +2352,16 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
         } => {
             let bytes = store::read_bytes(&cli.store, &key).await?;
             catalog::inspect_cstat(&bytes)
+        }
+        Command::Inspect {
+            command: InspectCommand::Kidx { keys, entries },
+        } => {
+            let mut leaves = Vec::with_capacity(keys.len());
+            for key in keys {
+                let bytes = store::read_bytes(&cli.store, &key).await?;
+                leaves.push((key, bytes));
+            }
+            catalog::inspect_kidx(&leaves, entries)
         }
         Command::Catalog {
             command: CatalogCommand::Inspect { tenant, signal },

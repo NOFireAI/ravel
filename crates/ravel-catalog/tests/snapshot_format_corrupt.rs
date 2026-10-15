@@ -509,6 +509,7 @@ fn base_head() -> SnapshotHead {
             watermark_hour: 5,
             min_hour: 0,
             column_stats: None,
+            key_index: Vec::new(),
         }],
         postings: None,
         folder_id: vec![0x33; 16],

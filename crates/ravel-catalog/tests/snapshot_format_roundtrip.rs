@@ -207,6 +207,7 @@ fn arb_head() -> impl Strategy<Value = SnapshotHead> {
                         watermark_hour,
                         min_hour,
                         column_stats: None,
+                        key_index: Vec::new(),
                     }
                 })
                 .collect();

@@ -178,6 +178,15 @@ Decode a column-statistics (`.cstat`) object's envelope and header (ADR-0850/ADR
 | --- | --- | --- | --- |
 | `<KEY>` |  |  | Local file path or object store key |
 
+### inspect kidx
+
+Verify per-part key-index leaves (`.kidx`, ADR-2707 decision 4): decode every bucket frame and print every header field, the bucket-size distribution and, with `--entries`, every entry. Several keys must be the slices of one (part, field): same identity, same uncovered entries, tiling the key space. A leaf or set that fails any check exits non-zero with the typed error and prints no report
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--entries` |  |  | Also print every entry: its bucket, key8, entry ordinal and block list |
+| `<KEYS>` |  |  | Local file paths or object store keys |
+
 ## maintain
 
 Run and inspect maintenance: compaction, sweep, retention, version audit

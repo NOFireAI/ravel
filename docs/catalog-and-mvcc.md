@@ -825,9 +825,30 @@ swept as unreferenced while its owning part is live.
 
 ### Per-part key-index leaves (ADR-2707, proposed)
 
-This section describes objects no shipped fold writes yet; the implementing
-task lands the writer, the reader, the proto fields and the removal of this
-"proposed" marker together.
+This section describes objects no shipped fold writes yet. The proto
+fields, the leaf codec and the single-leaf probe exist; the fold's leaf
+build, HEAD attachment, the sweep's `kidx` kind and the query path do not,
+and the task that lands them removes this "proposed" marker.
+
+The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
+crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
+`choose_key_index_bucket_bits`) and `encode_key_index_leaf_with_bucket_bits`
+write one leaf and its ref (with an empty `key`), refusing a body over the
+ceiling as `BodyOverCeiling`; `split_key_index_entries` cuts a sorted
+(part, field) entry list into key slices that tile `[0, u64::MAX]` and each
+fit the ceiling, cutting only between distinct `key8` values;
+`select_key_index_slice` picks the one ref whose slice holds a `key8` after
+checking that the refs agree and tile; `probe_key_index_leaf_ranged` runs
+the two-GET probe below over a caller-supplied ranged byte source, and
+`Catalog::probe_key_index_leaf` runs it over the catalog's store, turning a
+tenant or signal disagreement into `CatalogError::FieldMismatch` and the
+breach counter; `verify_key_index_leaf` and `check_key_index_leaf_set` are
+the whole-object reader `ravel-cli inspect kidx KEY...` uses. A probe
+returns `Matches` or `Absent`, each with the leaf's uncovered entry
+ordinals, or `Rejected` with the reason the part reads as uncovered:
+`Corrupted`, `UnsupportedVersion`, `PartBindingMismatch`, `RequestMismatch`
+(a valid leaf for another field, key type or key slice than the lookup), or
+`Read` (a failed GET).
 
 `SnapshotPartRef` carries an additive field 8, `repeated
 SnapshotKeyIndexLeafRef key_index`: one reference per (field, key slice) of
@@ -869,11 +890,11 @@ slice of the pair) and `part_blake3` (32, the one covered part).
   u32 LE      header_crc32c       (over magic, header_len, prefix_len and
                                    header)
   u32 LE      ends[2^bucket_bits] (cumulative bucket ends, relative to body)
-  u32 LE      dir_crc32c
+  u32 LE      dir_crc32c          (over the ends bytes)
   body:       bucket frames tiling [0, body_len) exactly (an empty bucket
               occupies zero bytes and carries no frame: its end equals
               the previous end), each
-              u32 LE entry_count, u32 LE uncompressed_len (checked against
+              u32 LE entry_count (>= 1), u32 LE uncompressed_len (checked against
               the body ceiling before the buffer is allocated; the
               decompressed length must equal it exactly),
               u32 LE frame_crc32c (over the zstd bytes),
@@ -881,15 +902,18 @@ slice of the pair) and `part_blake3` (32, the one covered part).
                 key8 [8]
                 uvarint entry_ordinal      (part-local SnapshotEntry ordinal)
                 uvarint block_count        (>= 1)
-                uvarint block_delta[block_count]  (ascending block ordinals,
-                                                   delta-coded from -1)
+                uvarint block_delta[block_count]  (strictly ascending block
+                                                   ordinals, delta-coded from
+                                                   -1, so every delta >= 1)
 ```
 
 Within a bucket, entries are sorted ascending by `(key8, entry_ordinal)`
 and unique, so a probe is a binary search. Buckets are selected by the same
 mix the section uses
 (`(u64::from_be_bytes(key8).wrapping_mul(0x9E3779B97F4A7C15)) >> (64 -
-bucket_bits)`), over the key slice. A block set is the block bitmap
+bucket_bits)`), applied to the full `key8` (not to its offset within the
+leaf's slice), so a key's bucket depends only on the key and the leaf's
+`bucket_bits`. A block set is the block bitmap
 ADR-0849 section 1b requires, in the encoding that is small for the sets
 measured (p50 one object per key on the ClickBench corpus).
 
@@ -942,7 +966,8 @@ the one bucket the header's `bucket_bits` and the mix select: its declared
 `uncompressed_len` is checked against the body ceiling before any buffer
 is allocated, then the frame crc and the exact decompressed length are
 verified, and a binary search yields the `(entry_ordinal, block set)`
-matches. Exactly two ranged GETs per covering
+matches; an empty bucket needs no GET 2 and answers absent from the
+directory alone. At most two ranged GETs per covering
 part, issued concurrently across parts, under a per-query ceiling of 2,048
 leaf GETs; parts beyond the ceiling are scanned, not probed, at either
 tier. Candidates are the matches over covered entries plus every uncovered
@@ -1001,8 +1026,15 @@ from the covered part ref's `entry_count` in the HEAD the lookup resolved
 (so coverage is never narrower than the part); an entry ordinal at or past
 the header's `part_entry_count`; a `key8` outside the leaf's slice; a
 `key8` that does not mix to the bucket it sits in; unsorted or duplicate
-`(key8, entry ordinal)` pairs; a block delta list that is empty or that
-overflows `u32`. The body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
+`(key8, entry ordinal)` pairs; a block delta list that is empty, holds a
+zero delta, or overflows `u32`; a frame whose `entry_count` is zero; a
+header `uncovered_entry_ordinals` list that is not strictly ascending; a
+`part_blake3` not 32 bytes, or for a whole-object reader a `tenant_hash`
+not 16 (a probe compares the tenant first, so there it is the
+`FieldMismatch` above); an empty `field` or
+`key8_lo` above `key8_hi`; a ref `size` other than the header's
+`prefix_len + body_len`, and, for a whole-object reader, an object of any
+other length. The body ceiling is `DEFAULT_MAX_COLUMN_STATS_BYTES`
 (256 MiB) in that constant's own meaning, a cap on declared decompressed
 size applied before allocation, and the reader applies it per frame, the
 only bound a single-bucket probe can check (a frame declaring up to the

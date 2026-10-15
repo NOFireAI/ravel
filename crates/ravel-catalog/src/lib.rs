@@ -104,6 +104,18 @@ pub use snapshot_format::{
     decode_column_stats, decode_column_stats_header, decode_head, decode_part, decode_postings,
     encode_column_stats_v3, encode_head, encode_part, encode_postings, validate_min_max_presence,
 };
+pub use snapshot_format::{
+    DEFAULT_MAX_KEY_INDEX_LEAF_BODY_BYTES, EncodedKeyIndexLeaf, KEY_INDEX_LEAF_FORMAT_VERSION,
+    KEY_INDEX_LEAF_MAGIC, KEY_INDEX_LEAF_MIN_BUCKET_BITS, KEY_INDEX_LEAF_READER_MAX_BUCKET_BITS,
+    KEY_INDEX_LEAF_WRITER_MAX_BUCKET_BITS, KeyIndexBucketRange, KeyIndexLeafBreach,
+    KeyIndexLeafEncodeError, KeyIndexLeafEntry, KeyIndexLeafError, KeyIndexLeafInput,
+    KeyIndexLeafLimits, KeyIndexLeafPrefix, KeyIndexLeafProbe, KeyIndexLeafRejection,
+    KeyIndexLeafRequest, KeyIndexLeafSummary, KeyIndexMatch, KeyIndexSlice,
+    check_key_index_leaf_set, choose_key_index_bucket_bits, encode_key_index_leaf,
+    encode_key_index_leaf_with_bucket_bits, encoded_entry_len, key_index_leaf_prefix_range,
+    probe_key_index_leaf_ranged, select_key_index_slice, split_key_index_entries,
+    verify_key_index_leaf,
+};
 pub use tenant_config::{
     BloomScope, ClusteringBucketWidth, ClusteringKey, ClusteringKeyState, DeclaredColumnType,
     DeclaredTypedColumn, FIXED_LOGS_SQL_COLUMNS, MAX_CLUSTERING_KEY_COLUMNS,

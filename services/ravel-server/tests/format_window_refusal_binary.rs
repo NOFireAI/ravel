@@ -135,6 +135,7 @@ async fn seeded_bucket() -> (String, Arc<fake_s3::FakeS3>) {
             watermark_hour: 10,
             min_hour: 0,
             column_stats: None,
+            key_index: Vec::new(),
         }],
         postings: None,
         folder_id: vec![0x33; 16],

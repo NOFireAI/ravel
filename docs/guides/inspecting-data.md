@@ -522,7 +522,7 @@ envelope_version: 3
 header_len: 84
 format_version: 1
 tenant_hash: 3f2a1c9e4b7d0a62
-signal: 3
+signal: 2
 part_blake3: 98c85b7a1f2e3d4c
 segment_count: 2617
 body_uncompressed_len: 268427456
@@ -539,8 +539,8 @@ values, state the same minimum, maximum and NULL count, and otherwise reads
 the segment.
 
 `signal` is the raw numeric code from the header, not a word: 1 is metrics,
-2 is spans, 3 is logs. `part_blake3` is comma-joined when a header covers
-more than one part.
+2 is logs, 3 is spans (the commit record's `Signal` numbering).
+`part_blake3` is comma-joined when a header covers more than one part.
 
 Read `body_uncompressed_len` and the `over_ceiling` verdict first. A reader
 refuses any object that declares more than 256 MiB **before** it decompresses
@@ -567,6 +567,57 @@ Under the ceiling, the command prints one
 
 A truncated, bad-magic, wrong-version or checksum-mismatched object fails
 with the specific reason, not a generic error.
+
+## `inspect kidx`
+
+The command shows what a per-part key-index leaf declares, after verifying
+the whole object: its header, directory and every bucket frame.
+
+```sh
+ravel-cli inspect kidx \
+  "t/3f2a.../catalog/l/idx/20260910T09.5c0e....kidx"
+```
+
+```
+format_version: 1
+tenant_hash: 11111111111111111111111111111111
+signal: 2 (Logs)
+part_blake3: 2222222222222222222222222222222222222222222222222222222222222222
+field: service.name
+key_type: 3 (Str)
+key8_lo: 0x0000000000000000
+key8_hi: 0xffffffffffffffff
+bucket_bits: 3
+entry_count: 5
+part_entry_count: 7
+uncovered_entry_ordinals: [3, 6]
+body_len: 142
+prefix_len: 148
+size: 290
+blake3: ca7633f6e4c56394f4df4ae4c5da96ea53f20df604185ae6fc653d1805b244b4
+body_uncompressed_len: 58
+buckets: 8 min=0 median=0 max=2 empty=4
+```
+
+A `.kidx` leaf is the second tier of the exact-key index: for one part of
+the catalog snapshot, one indexed field and one range of `key8` values, it
+lists which of the part's entries hold each key and in which blocks.
+
+- `part_blake3` is the one part the leaf belongs to. A probe made for a
+  different part rejects the leaf, and that part counts as unindexed for
+  the field.
+- `uncovered_entry_ordinals` are the part's entries the leaf could not index
+  for this field. Every probe reports them, whatever it finds for the key,
+  so they stay candidates.
+- `key8_lo` and `key8_hi` bound the slice. An unsliced leaf covers the whole
+  range, as here.
+- `buckets` is the bucket size distribution, in entries per bucket.
+
+With `--entries` the command also prints one line per entry: its bucket,
+`key8`, entry ordinal and block list. Given several leaves of one part and
+field, the command also checks that their slices tile the whole `key8`
+range and agree on the uncovered entries. A truncated, corrupt or
+disagreeing leaf fails with the specific reason and prints no report.
 
 ## `idem inspect`
 

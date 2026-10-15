@@ -12,6 +12,9 @@ ravel-commit = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
+# The KEY_IDX bucket mix and key types the per-part `.kidx` leaves share with
+# the tier-1 section (ADR-2707 decision 4).
+ravel-codec = { workspace = true }
 ravel-cache = { workspace = true }
 # Process-wide byte accountant (ADR-1170, ADR-1702 decision 6). The resolve
 # path reserves each part, postings and column-stats object's declared
