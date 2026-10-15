@@ -289,12 +289,18 @@ pub enum SqlError {
     /// duration and a metric name. Only the resolve-boundary check in
     /// `executor.rs` resolves a verdict; the per-segment check in `scan.rs`
     /// builds its budget from the session config alone and always renders the
-    /// plain message.
-    #[error("query issued {requests} S3 requests, exceeding the budget of {max}{fold_lag}")]
+    /// plain message. `table` names the signal table whose lane was refused
+    /// when the statement names more than one (ADR-2904 decision 6), and is
+    /// `None`, rendering nothing, otherwise.
+    #[error(
+        "query issued {requests} S3 requests, exceeding the budget of {max}{fold_lag}{}",
+        lane_suffix(.table)
+    )]
     RequestBudgetExceeded {
         requests: u64,
         max: u64,
         fold_lag: FoldLag,
+        table: Option<&'static str>,
     },
 
     /// The per-query or per-tenant byte budget was exhausted. The detail is
@@ -422,6 +428,7 @@ impl From<ParquetQueryError> for SqlError {
                     requests,
                     max,
                     fold_lag: FoldLag::Healthy,
+                    table: None,
                 }
             }
             Some(&ParquetReadError::BytesBudgetExceeded { scanned, max }) => {
@@ -728,6 +735,15 @@ impl SqlError {
                 ..
             })
         )
+    }
+}
+
+/// The clause a refused lane adds to [`SqlError::RequestBudgetExceeded`]:
+/// nothing for a statement over one signal table.
+fn lane_suffix(table: &Option<&'static str>) -> String {
+    match table {
+        Some(table) => format!(" (refused on table {table})"),
+        None => String::new(),
     }
 }
 
@@ -1795,6 +1811,7 @@ mod tests {
             requests: 30_001,
             max: 30_000,
             fold_lag: FoldLag::Healthy,
+            table: None,
         };
         assert_eq!(request_budget.client_message(), request_budget.to_string());
         assert_eq!(request_budget.class(), ErrorClass::Unsupported);
@@ -1844,6 +1861,7 @@ mod tests {
                 requests: *requests,
                 max: *max,
                 fold_lag: *fold_lag,
+                table: None,
             };
 
             // Same text on both sides of the wrap, so the two crates cannot
@@ -1858,6 +1876,7 @@ mod tests {
             requests: 30_001,
             max: 30_000,
             fold_lag: lagging,
+            table: None,
         };
         let message = wrapped.client_message();
         assert!(
@@ -1874,6 +1893,7 @@ mod tests {
             requests: 30_001,
             max: 30_000,
             fold_lag: FoldLag::Healthy,
+            table: None,
         };
         assert_eq!(
             healthy.client_message(),

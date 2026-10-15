@@ -695,6 +695,7 @@ async fn prepare_partition(
                 requests,
                 max,
                 fold_lag,
+                table: None,
             }
             .into());
         }

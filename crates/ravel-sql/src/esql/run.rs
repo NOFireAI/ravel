@@ -153,10 +153,7 @@ async fn run_row_inner(
         SpillDecision::Disabled,
     )
     .map_err(|e| SqlError::Plan(e.to_string()))?;
-    let tables = StatementTables {
-        signal: None,
-        others: Default::default(),
-    };
+    let tables = StatementTables::one(None);
     let context = LoweringContext::snapshot(&session, Vec::new(), &tables);
     let plan = prepared
         .lower(&context)

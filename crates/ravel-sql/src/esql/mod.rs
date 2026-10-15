@@ -210,10 +210,7 @@ impl PreparedEsql {
     }
 
     fn tables(&self) -> StatementTables {
-        StatementTables {
-            signal: self.needs_catalog().then_some(TargetSignal::Logs),
-            others: Default::default(),
-        }
+        StatementTables::one(self.needs_catalog().then_some(TargetSignal::Logs))
     }
 }
 
