@@ -1,6 +1,6 @@
 # ADR-2993: IPCrypt pseudonymization of IP-valued attributes
 
-Status: Accepted (approved by the maintainer on 2026-10-15)
+Status: Proposed. The maintainer approved an earlier text on 2026-10-15; decisions 1, 3, 6, 8 and 9 were revised after review, and the revised text awaits re-approval.
 Date: 2026-10-15
 Epic: #2993
 
@@ -66,14 +66,43 @@ Facts in this tree that constrain the design:
   block API. The reference Rust implementation, `ipcrypt-rs` 0.10 (ISC,
   by the draft's author), implements all four variants on RustCrypto
   `aes` 0.9 without `unsafe` in its own code. Its default feature
-  `random` pulls `rand` 0.10, which only the non-deterministic variants
-  need. ISC is on `deny.toml`'s allow list.
+  `random` pulls `rand`, which only the non-deterministic variants need.
+  ISC is on `deny.toml`'s allow list.
+- **Normalizers take positional arguments, not an options struct.** Each
+  entry point takes the tenant, the decoded request, a limits struct and
+  the ingest time. The limits structs (`IngestLimits`, `LogIngestLimits`,
+  `SpanIngestLimits`) are built once per process, shared by every tenant,
+  and have a `Default` that hundreds of call sites use. The log and trace
+  normalizers take no tenant at all.
+- **`ravel-cli load` does not call the normalizers.** It reimplements
+  their label building, limits and series identity for its columnar
+  inputs, in its own modules.
+- **Some checks run before normalization, on raw lengths.** The projected
+  label-byte bound (`ravel-otlp`'s `label_projection`, which must never
+  undercount) and OTAP's raw-length checks both measure the values as
+  sent.
+- **Metric label names are sanitized.** `client.address` is stored as
+  `client_address` on every metric surface, and Remote Write carries
+  only the sanitized form. Log and span attribute keys are stored as
+  sent.
+- **Span events and links are stored as encoded protobuf blobs** inside
+  reserved span attributes, so their attributes never pass through the
+  span attribute conversion.
 - **SQL scalar functions are registered per query against a fail-closed
   allow-list** (`ADMITTED_SCALARS`, ADR-0097). DataFusion folds an
   `Immutable` function with literal arguments into a literal before the
-  pushdown extractors run. Query text reaches the audit table verbatim
-  unless audit redaction is on. No per-function privilege exists: a
-  principal is a tenant plus a `ddl` flag.
+  pushdown extractors run. The query audit is off by default; when it is
+  on, query text reaches the audit table verbatim unless redaction is on.
+  No per-function privilege exists: a principal is a tenant plus a `ddl`
+  flag. The static token grammar accepts exactly one suffix, `;ddl`,
+  split at the last `;`, and the ingest router shares that parser. The
+  durable `sys/auth` resolver and Flight SQL authentication resolve a
+  tenant only, so neither can grant `ddl` today.
+- **Erasure matchers are a conjunction.** An ADR-0064 request matches a
+  record only when every matcher matches it, and v1 has no disjunction.
+- **The least-privilege IAM templates name `sys/` objects one by one**
+  (`deploy/iam/gateway.json`, `query.json`, `maintain.json`). A new
+  `sys/` key is unreadable under them until it is added.
 
 ## Decision
 
@@ -96,12 +125,18 @@ The deployment key holder, the operator, is trusted: it can derive
 every tenant's key.
 
 **1. An operator declares which attribute keys hold IP addresses, per
-tenant, in a policy file.** `--ipcrypt-config <file>` names a file in the
-format the other per-tenant config files use. It holds a process
-default and per-tenant overrides, with tenant ids hashed at load as
-`--tenant-kms-config` does. Each tenant entry lists rules:
+tenant, in a policy file.** `--ipcrypt-config <file>` names a TOML file
+in the `--limits-file` shape: a `[defaults]` table and `[tenants.<id>]`
+overrides. Tenant ids are hashed once the tenant-hash scheme is
+installed, as `--tenant-kms-config` entries are. Each entry lists rules:
 
-- `key`: the exact attribute key or label name;
+- `key`: the attribute key as the client sends it, for example
+  `client.address`. On the metric surfaces (OTLP metrics, OTAP and
+  Remote Write) the rule matches the sanitized label name that key is
+  stored under (`client_address`), derived with the same sanitizing
+  function the normalizers use. On logs and traces it matches the key
+  as sent. Two rule keys that sanitize to the same label name are
+  refused;
 - `variant`: `deterministic` or `prefix` (ipcrypt-pfx);
 - `epoch`: a positive integer, default 1, the epoch new data is written
   under;
@@ -117,11 +152,12 @@ rollout, and a file covers the deployments this epic is for. A
 follow-up adds it under the format-change procedure if a deployment
 needs rules changed without a restart.
 
-`ravel-server` refuses to start with an `--ipcrypt-config` under
-`--tenant-hash-unkeyed`, since there is no key to derive from. It also
-refuses a file it cannot parse, a duplicate key, an empty key, or an
-epoch of zero. Deployments and tenants with no rules are untouched,
-byte for byte.
+Both `ravel-server` and `ravel-cli load` refuse a non-empty policy when
+the process has no deployment key to derive from. That covers
+`--tenant-hash-unkeyed`, and also a v1 bucket started with neither
+tenant-hash flag. Both also refuse a file they cannot parse, a duplicate
+key, an empty key, or an epoch of zero. Deployments and tenants with no
+rules are untouched, byte for byte.
 
 **2. Keys are derived, never stored.** For tenant `t`, variant `v` and
 epoch `e`:
@@ -136,21 +172,41 @@ log line, or a metric. The derivation is a pure function, tested
 against fixed vectors in its own crate.
 
 **3. Values are encrypted inside normalization, before identity, limits
-and encoding.** Each normalizer takes the tenant's resolved rules as a
-required field of the options it already receives. They are applied to
-the merged attribute or label set:
+and encoding.** Every normalizer entry point takes the tenant's resolved
+rules as a new positional parameter of a type with no `Default`. It is
+not a field of the limits structs, which are per process and defaulted
+everywhere. That covers the OTLP metrics, logs and traces entry points
+(the `_with_exemplars`, `_with_metadata` and `_projected` forms
+included), the Remote Write entry points and the OTAP entry points. The
+rules are applied to the merged attribute or label set:
 
 - before metric series identity is computed and before the `SeriesIdMemo`
-  lookup, so identity is the identity of the stored labels;
+  lookup, so identity is the identity of the stored labels. The memo and
+  OTAP's group cache are built per call and keyed on raw values; because
+  encryption is deterministic for a fixed rule set, a raw key still
+  names one stored label set, and neither cache outlives the call or
+  crosses tenants;
 - before label and attribute size limits, so the limits see the bytes
   that are stored;
 - before log stream attributes are canonically encoded, so resource and
   scope attributes are covered;
-- on exemplar labels too.
+- on exemplar labels, and on the attributes of span events and links
+  before those are encoded into their blobs.
 
-Required means no normalizer can be called without a rule set (an empty
-one when the tenant has none). That makes a new ingest path that forgets
-the policy a compile error, not a silent leak.
+Because the parameter has no default, an ingest path that calls a
+normalizer without a rule set (an empty one when the tenant has none)
+does not compile.
+
+`ravel-cli load` does not call the normalizers, so the compiler cannot
+guard it. Its label-building paths call the same `ravel-ipcrypt` apply
+function at the same points, and the acceptance test in Consequences,
+which scans the store after a load, is what guards them.
+
+A check that runs before encryption counts each value under a rule at
+its largest encrypted length: 47 bytes (a bracketed IPv6 address, a
+colon and a five-digit port), or the raw length when that is larger.
+That keeps the projected label-byte bound and OTAP's raw-length checks
+from undercounting.
 
 What is encrypted, given a rule's key:
 
@@ -176,7 +232,8 @@ not what the rule assumed.
 **4. Only the deterministic and prefix variants are offered.** Both keep
 the properties the rest of the system relies on:
 - exact-match erasure (ADR-0064);
-- the exact-key index (ADR-2707);
+- the exact-key index (ADR-2707, still Proposed; the property is assumed
+  for it, not yet shipped);
 - equality predicates and pushdown;
 - `GROUP BY`;
 - dictionary compression of repeated values.
@@ -188,8 +245,9 @@ the counter's outcome type. The crate's tests pin every
 `ipcrypt-deterministic` and `ipcrypt-pfx` vector from the draft's
 machine-readable `test_vectors.json`, and the vector file is checked
 in. The new `Cargo.lock` entries are `ipcrypt-rs`, `aes` and their
-RustCrypto dependencies. Disabling the `random` feature keeps
-`rand` 0.10 out.
+RustCrypto dependencies. Disabling the `random` feature keeps `rand` out
+of `ravel-ipcrypt`'s dependency graph, since the offered variants need
+no randomness.
 
 **6. A SQL function encrypts with the tenant's key. It takes no key
 argument and needs the `ipcrypt` capability.** It comes in two forms:
@@ -206,21 +264,45 @@ derived key, at the given epoch or 1. Behaviour:
   appears in query text, the audit table, or a plan.
 - **Wiring.** The functions are built in `build_session` from the
   tenant's derived keys and added to `ADMITTED_SCALARS` for every signal
-  table. They are built per session from that session's tenant key, so
-  a folded literal or a cached plan cannot carry one tenant's ciphertext
-  into another tenant's query.
+  table; `build_session` gains the tenant and principal it needs. They
+  are built per session from that session's tenant key, so a folded
+  literal or a cached plan cannot carry one tenant's ciphertext into
+  another tenant's query.
+- **Epoch argument.** Any positive epoch is accepted. Encrypting under an
+  epoch no rule ever used reveals nothing about stored data, since
+  nothing is stored under that key, and a capability holder may already
+  encrypt under every epoch that is in use.
 - **Capability gate.** The functions are registered only for a principal
   holding a new `ipcrypt` capability, the way `ddl` gates DDL (ADR-2040
   decision 4). Without it, the call is refused like any unknown function.
-  The capability is granted with a static token suffix (`;ipcrypt`) or an
-  OIDC claim, through the same resolver path `ddl` uses. Per decision 0,
-  this is what stops an ordinary reader from reversing the
-  pseudonymization by encrypting guesses.
-- **Audit redaction required.** The functions are registered only when
-  audit query-text redaction is on. Under the default `Plaintext` policy
-  the literal address in `ipcrypt_encrypt('203.0.113.7')` would be
-  written verbatim into the audit table in object storage, past the very
-  boundary this ADR draws. Under redaction it is stored as a keyed token.
+  Per decision 0, this is what stops an ordinary reader from reversing
+  the pseudonymization by encrypting guesses. The capability is granted
+  in two ways:
+  - **Static token.** The suffix after the last `;` becomes a
+    comma-separated capability list drawn from `ddl` and `ipcrypt`, each
+    at most once and the list never empty. So `acme;ddl`, `acme;ipcrypt`
+    and `acme;ddl,ipcrypt` all name tenant `acme`, and an existing
+    `;ddl` token parses as it does today. Any other suffix is refused.
+    The ingest router shares the parser and ignores the capabilities.
+  - **OIDC.** A boolean claim named by a new flag beside
+    `--oidc-ddl-claim`.
+
+  Durable `sys/auth` tokens and Flight SQL authentication resolve a
+  tenant only, and grant neither `ddl` nor `ipcrypt` under this ADR. A
+  capability field on `sys/auth` entries is a format change for a later
+  ADR.
+- **No plaintext audit record.** The functions are not registered when
+  the process would write query text to the audit table in plaintext,
+  that is, when the query audit is on under the `Plaintext` text policy.
+  There, the literal address in `ipcrypt_encrypt('203.0.113.7')` would
+  be written verbatim into object storage, past the very boundary this
+  ADR draws. With the audit off (the default) nothing is written, and
+  under redaction the query text is stored as a keyed token. That token
+  is deterministic, so the same address queried twice is linkable across
+  audit records, which is the same linkability the stored pseudonym
+  already has. A key argument would instead put the key itself in the
+  audit table under `Plaintext`, and a linkable token of the key under
+  redaction.
 - **No deployment key.** On a deployment without one, the functions are
   not registered.
 - **Port forms.** A string the function cannot parse as an address
@@ -240,10 +322,20 @@ no new holder.
 **8. Erasure by IP matches the stored ciphertext.** When a tenant has a
 rule for a matcher's key, `ravel-cli` encrypts that matcher's value
 under the rule before it submits the erasure request.
-- One matcher is written per configured epoch, newest first, so data
-  written under an older epoch is matched too.
-- A raw value that is not an address is submitted unchanged, matching
-  how ingest stored it.
+- **One request per epoch.** Matchers in one request are a conjunction,
+  so two ciphertexts of one address in the same request would match no
+  record. `ravel-cli` therefore submits one request per configured
+  epoch (the rule's `epoch` and each of its `retired_epochs`). Each
+  request carries the full matcher set with that epoch's ciphertext, so
+  data written under an older epoch is matched too.
+- **Several encrypted matchers.** When more than one matcher carries a
+  rule key, it submits one request per combination of those rules'
+  epochs. It refuses, before submitting anything, when that would be
+  more than 16 requests.
+- **Reporting.** It reports every request id it submitted, and the
+  erasure counts as their sum.
+- **Non-addresses.** A raw value that is not an address is submitted
+  unchanged, matching how ingest stored it.
 
 The request records the encrypted value, never the raw one: the
 erasure log is itself retained data.
@@ -270,11 +362,13 @@ does not refuses to write.**
 - **First write.** A process whose local policy is non-empty and that
   finds no marker creates it with `CreateIfAbsent`. A process that loses
   that race re-reads the marker and compares, as below.
-- **Startup check, unconditional.** Every `ravel-server` start and every
-  `ravel-cli load` run reads the marker, whether or not `--ipcrypt-config`
+- **Startup check, unconditional for every writer.** Every `ravel-server`
+  start in a mode that ingests (`all` and `gateway`), and every
+  `ravel-cli load` run, reads the marker, whether or not `--ipcrypt-config`
   was given. The forgotten-flag case is exactly a process with an empty
   policy on a bucket whose marker is not empty, so the read cannot depend
-  on the flag.
+  on the flag. `query` and `maintain` processes write no new attribute
+  values, so they do not read it.
   - No marker and an empty local policy: the process proceeds and writes
     no marker.
   - A marker whose fingerprint differs from the process's own, an empty
@@ -288,6 +382,13 @@ does not refuses to write.**
   `ravel-cli ipcrypt set-policy --ipcrypt-config <file>` replaces the
   marker with a CAS on its current ETag. Processes then restart with the
   new file.
+- **Access.** The shipped IAM templates name `sys/` objects one by one,
+  so the implementing task adds `sys/ipcrypt/policy` to them.
+  `gateway.json` gets read and create on it, and `admin.json` already
+  covers `sys/*`. It also updates `deploy/iam/README.md`'s per-key
+  table. The upgrade notes say to grant access before upgrading. Without
+  that grant, the unconditional read is denied and an ingesting process
+  refuses to start.
 
 The tenancy marker (`sys/tenancy`, ADR-0050) is the precedent. Without
 this check, a forgotten flag on one process (most likely a `ravel-cli
@@ -298,7 +399,8 @@ forgotten flag.
 **Rotation.** Bumping a rule's epoch changes the key for new data only.
 - Equality between data written before and after the bump is lost.
   Queries pass the old epoch to the SQL function to match old data.
-- Erasure matches every configured epoch.
+- Erasure matches every configured epoch, with one request per epoch
+  (decision 8).
 - Old epochs are listed in the rule (`retired_epochs`) for as long as
   data under them is retained.
 
@@ -311,7 +413,7 @@ flowchart LR
         K[deployment key file] --> D[derive per-tenant<br/>per-variant per-epoch key]
         P[--ipcrypt-config rules] --> N
         D --> N[normalize: encrypt configured keys<br/>before identity, limits, encoding]
-        D --> Q[SQL ipcrypt_encrypt<br/>ipcrypt capability, audit redacted]
+        D --> Q[SQL ipcrypt_encrypt<br/>ipcrypt capability, no plaintext audit]
         D --> X[ravel-cli ipcrypt decrypt<br/>operator only]
     end
     subgraph store[Object storage<br/>trust boundary: no raw address, no key]
@@ -332,6 +434,11 @@ flowchart LR
   argument also puts key material into query text, which reaches the
   audit table verbatim unless redaction is on. Even under redaction it
   is tokenized deterministically, so it is linkable across queries.
+- **Carry the rules as a field of the limits structs.** It would avoid a
+  new parameter on every normalizer entry point. But those structs are
+  per process while the rules are per tenant, and every literal and
+  most call sites take `Default`, so a forgotten rule set would compile
+  as an empty one and store raw addresses.
 - **Encrypt in the `ravel-ingest` routers.** It is the one chokepoint
   every surface shares, but it runs after normalization. Metric series
   identity, the memo caches, the size limits and the log stream-attribute
@@ -389,14 +496,19 @@ flowchart LR
 - A tenant with rules stores no raw address under a configured key, on
   any ingest surface. One acceptance test ingests a known address
   through each surface:
-  - OTLP metrics, logs and traces over HTTP and gRPC;
+  - OTLP metrics, logs and traces over HTTP and gRPC, with the address
+    also in a span event and a span link;
   - Remote Write samples and exemplars;
   - OTAP;
   - `ravel-cli load`.
 
-  It then scans every byte of every object written to the store for
-  that address, in both text form and 4- and 16-byte binary form, and
-  asserts it is absent. It also asserts that the ciphertext is present.
+  It then scans every byte of every object in the bucket for that
+  address, in both text form and 4- and 16-byte binary form, and asserts
+  it is absent. The scan covers catalog, index, statistics and `del/`
+  objects, not just data objects. It also asserts that the ciphertext is
+  present. A control run of the same ingest with the policy off must
+  find the raw address, so a scan that cannot see through compression
+  fails instead of passing.
 - **Cost.**
   - `deterministic` is one AES-128 block per configured value.
   - `prefix` is 64 AES operations per IPv4 and 256 per IPv6. A test pins
@@ -404,17 +516,22 @@ flowchart LR
   - Tenants without rules pay one empty-rule-set check per record.
 - **Text forms and size.** An IPv4 value under `deterministic` is stored
   as IPv6 text. A test pins the canonical text form of each variant. A
-  stored value grows to at most 39 bytes plus any port, and the size
-  limits see the stored length.
+  stored value grows to at most 39 bytes, or 47 in the `[ipv6]:port`
+  form, and the size limits see the stored length.
 - **Exact semantics hold.** Equality, `GROUP BY`, `count(DISTINCT)`,
   exact-match erasure and the exact-key index behave on ciphertext
-  exactly as on the raw values, with the `ip:port` limit of decision 8. Under `prefix`, prefix grouping of the stored text (a /24
-  on IPv4, a /64 on IPv6) matches grouping of the raw addresses. Range
+  exactly as on the raw values, with the `ip:port` limit of decision 8.
+  Under `prefix`, grouping the stored addresses by network prefix
+  (parse, mask to a /24 or a /64, group) matches the same grouping of
+  the raw addresses. Grouping by a prefix of the stored text does not:
+  RFC 5952 text drops leading zeros and compresses zero runs, so two
+  IPv6 values in one /64 need not share a text prefix. Range
   predicates and CIDR containment on raw addresses are not supported on
   encrypted keys, and the docs say so.
 - **A new principal capability.** `ipcrypt` joins `ddl` in
-  `ravel-tenant-resolve`'s `Principal`, with the same token and claim
-  syntax.
+  `ravel-tenant-resolve`'s `Principal`. The static token suffix becomes
+  a capability list (decision 6), shared with the ingest router, and a
+  new OIDC claim flag grants it.
 - **New flag and metric.**
   - `--ipcrypt-config` on `ravel-server` and `ravel-cli`.
   - `ravel_ingest_ipcrypt_values_total`.
@@ -423,7 +540,9 @@ flowchart LR
 
   These go into `docs/reference/ravel-server-flags.md`, the metrics
   reference, `docs/ingest.md` (a new pseudonymization section),
-  `docs/guides/`, the SQL function list, and README.md.
+  `docs/guides/`, the SQL function list, and README.md. The IAM
+  templates and `deploy/iam/README.md` gain `sys/ipcrypt/policy`
+  (decision 9).
 - **Losing the deployment key loses the addresses.** Every stored
   address under a rule becomes unrecoverable, and no `ipcrypt_encrypt`
   call can match stored data again, because no key derived from a
@@ -442,9 +561,10 @@ flowchart LR
   Data written before a rule was added stays as it was:
   the policy is not retroactive, and the docs say to use erasure or
   retention for older data.
-- **Reachability.** The decision 3 rule set is a required normalizer
-  input, and the acceptance test above drives the shipped binaries'
-  entry points. Together they prove the capability is constructed on
-  every path.
+- **Reachability.** The decision 3 rule set is a required parameter of
+  every normalizer entry point, which covers every server ingest path at
+  compile time. `ravel-cli load`, which has its own label-building
+  paths, is covered by the acceptance test above, which drives the
+  shipped entry points of both binaries.
 - **Supply chain.** `ipcrypt-rs`, `aes` and its RustCrypto dependencies
   join `Cargo.lock` and pass `cargo deny`.
