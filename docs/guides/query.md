@@ -1044,9 +1044,14 @@ Integer overflow, integer division or remainder by zero, and a double result
 that is not finite each read null, as in ES|QL. Elasticsearch attaches a
 warning for each; this endpoint does not.
 
-Every ES|QL request writes a query audit record with `query.language` set to
-`esql`. See the [audit guide](audit.md#query-text) for how its text is
-redacted.
+An ES|QL statement that parses and is admitted writes one query audit record
+with `query.language` set to `esql`, and `query.status` set to `ok` or
+`error` by its outcome. A request refused before admission writes none: one
+that fails authentication, a refused body (`params`, an unknown field, or a
+malformed `start`, `end` or `timeout`), a statement that does not parse, and
+one the admission limit refuses. A request cancelled before it finishes
+writes none either. See the [audit guide](audit.md#query-text) for how its
+text is redacted.
 
 ## Alerting on these queries
 

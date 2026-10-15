@@ -76,9 +76,19 @@ struct EsqlBody {
     /// Per-request wall deadline in seconds. Clamped to the server maximum.
     #[serde(default)]
     timeout: Option<f64>,
-    /// Accepted by the parser only to refuse it by name.
-    #[serde(default)]
+    /// Accepted by the parser only to refuse it by name. `Some` whenever the
+    /// key is present, `null` included.
+    #[serde(default, deserialize_with = "present")]
     params: Option<serde_json::Value>,
+}
+
+/// `Some` for any value, `null` included, so a field's presence is what the
+/// caller sees rather than whether its value was `null`.
+fn present<'de, D>(deserializer: D) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde_json::Value::deserialize(deserializer).map(Some)
 }
 
 async fn handle(State(state): State<SqlState>, req: Request<Body>) -> Response {
@@ -244,14 +254,19 @@ mod tests {
 
     #[test]
     fn params_are_refused_by_name() {
-        let err = build_query(
-            body(r#"{"query":"ROW a = ?x","params":[{"x":1}]}"#).expect("body"),
-            0,
-            MAX,
-        )
-        .expect_err("rejected");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("\"params\""), "{}", err.message);
+        for json in [
+            r#"{"query":"ROW a = ?x","params":[{"x":1}]}"#,
+            r#"{"query":"ROW a = 1","params":null}"#,
+            r#"{"query":"ROW a = 1","params":[]}"#,
+        ] {
+            let err = build_query(body(json).expect("body"), 0, MAX).expect_err(json);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(
+                err.message.contains("\"params\""),
+                "{json}: {}",
+                err.message
+            );
+        }
     }
 
     #[test]
