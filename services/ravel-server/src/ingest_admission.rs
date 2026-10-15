@@ -134,11 +134,6 @@ impl PendingAckHandle {
         self.slot().take()
     }
 
-    /// Whether the slot still holds the permit.
-    pub fn is_held(&self) -> bool {
-        self.slot().is_some()
-    }
-
     fn slot(&self) -> MutexGuard<'_, Option<PendingAckPermit>> {
         // The guarded value is an `Option` with no invariant a panicking
         // holder could have broken, so a poisoned lock is still usable.
@@ -617,24 +612,22 @@ pub(crate) fn grpc_request_tenant<T>(
 /// The pending strict-ack handle for a gRPC ingest request, called after
 /// [`admit_grpc_request`] and [`grpc_request_tenant`]: a clone of the one
 /// [`GrpcIngestAdmissionLayer`] decided at the request head, or, on the
-/// direct-call path where no layer ran, decided here the same way. A strict
-/// write (by `resolve_write_mode` over `headers`, the request's metadata)
+/// direct-call path where no layer ran, decided here the same way. `mode` is
+/// the write mode the handler resolved and will submit with: a strict write
 /// takes its permit from `budget`; a buffered one gets an empty handle. A
 /// refusal releases `permit`, the request's in-flight handle, and is the
 /// pending-ack `RESOURCE_EXHAUSTED`, before anything is normalized or
 /// submitted. Read it before `request.into_inner()`.
 pub(crate) fn admit_grpc_pending_ack<T>(
     budget: &PendingAckBudget,
-    policy: crate::config::StrictFlushPolicy,
+    mode: ravel_ingest::WriteMode,
     request: &tonic::Request<T>,
-    headers: &HeaderMap,
     permit: &IngestPermitHandle,
 ) -> Result<PendingAckHandle, Status> {
     if let Some(PendingAckHeld(handle)) = request.extensions().get::<PendingAckHeld>() {
         return Ok(handle.clone());
     }
-    if crate::ingest_mode::resolve_write_mode(headers, policy) == ravel_ingest::WriteMode::Buffered
-    {
+    if mode == ravel_ingest::WriteMode::Buffered {
         return Ok(PendingAckHandle::default());
     }
     match budget.try_acquire() {

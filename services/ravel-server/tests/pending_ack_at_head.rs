@@ -370,6 +370,76 @@ async fn a_buffered_export_takes_no_pending_ack_permit_on_http_or_grpc() {
     server.shutdown().await;
 }
 
+/// A message that is not a valid `ExportLogsServiceRequest`: field 1 is a
+/// repeated, length-delimited message there, and this encodes it as a varint,
+/// so tonic's decode refuses the frame with a wire-type error.
+#[derive(Clone, PartialEq, prost::Message)]
+struct UndecodableExport {
+    #[prost(uint64, tag = "1")]
+    not_a_resource_list: u64,
+}
+
+/// With a budget of 1 held by a strict export waiting on its held data PUT,
+/// a strict unary OTLP gRPC logs export sent through the real listener's
+/// admission layer, whose message does not decode, is refused
+/// `RESOURCE_EXHAUSTED` with the pending-ack message and counted once in
+/// `ravel_ingest_pending_ack_shed_total`. Only the layer's head refusal can
+/// answer that: the handler's own pending-ack check runs after tonic's
+/// decode, which fails first with its decode error.
+#[tokio::test]
+async fn an_undecodable_strict_grpc_export_over_the_bound_is_refused_by_the_layer() {
+    let server = start(1).await;
+    let grpc_addr = server.running.grpc_addr.expect("gateway mode binds gRPC");
+
+    let pending = spawn_export(&server, Some("strict"), "pending strict log line");
+    server.wait_for_data_put().await;
+
+    let channel = tonic::transport::Channel::from_shared(format!("http://{grpc_addr}"))
+        .expect("valid endpoint uri")
+        .connect()
+        .await
+        .expect("gRPC client connects");
+    let mut grpc = tonic::client::Grpc::new(channel);
+    grpc.ready().await.expect("channel ready");
+    let mut request = tonic::Request::new(UndecodableExport {
+        not_a_resource_list: 7,
+    });
+    let metadata = request.metadata_mut();
+    metadata.insert(
+        "authorization",
+        format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+    );
+    metadata.insert("x-ravel-ingest-mode", "strict".parse().expect("ascii"));
+    let status = tokio::time::timeout(
+        WAIT,
+        grpc.unary::<UndecodableExport, UndecodableExport, _>(
+            request,
+            http::uri::PathAndQuery::from_static(
+                "/opentelemetry.proto.collector.logs.v1.LogsService/Export",
+            ),
+            tonic_prost::ProstCodec::default(),
+        ),
+    )
+    .await
+    .expect("the gRPC export is answered")
+    .expect_err("an export over the pending-ack bound is refused");
+
+    assert_eq!(
+        status.code(),
+        tonic::Code::ResourceExhausted,
+        "refused at the head for the pending-ack bound, not by the decode: {status:?}"
+    );
+    assert_eq!(status.message(), SHED_BODY);
+    assert_eq!(pending_ack_shed_total(&server).await, 1);
+
+    let pending = release_until(&server.gate, pending)
+        .await
+        .expect("export task");
+    assert_eq!(pending.status(), 200);
+
+    server.shutdown().await;
+}
+
 /// Remote Write reads no mode header: with a budget of 1 held by a strict
 /// export waiting on its held data PUT, a Remote Write carrying
 /// `x-ravel-ingest-mode: buffered` is still refused with the pending-ack 429.
