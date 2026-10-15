@@ -449,10 +449,11 @@ does not refuses to write.**
   The same commit updates `deploy/iam/README.md` and the template suite
   that pins every statement (`crates/ravel-commit/tests/iam_templates.rs`).
   In the README it updates the per-key table and adds the key to the
-  bootstrap-key table ("Read by, and what absence means"). The upgrade notes say
-  to grant access before upgrading. Without that grant, the
-  unconditional read is denied and an ingesting process refuses to
-  start.
+  bootstrap-key table ("Read by, and what absence means"). This is not
+  an upgrade accommodation: a fresh deployment on the shipped templates
+  needs the same grants, because a read of an absent key without list
+  access answers AccessDenied, and the unconditional read would then
+  refuse to start every ingesting process.
 
 The tenancy marker (`sys/tenancy`, ADR-0050) is the precedent. Without
 this check, a forgotten flag on one process (most likely a `ravel-cli
