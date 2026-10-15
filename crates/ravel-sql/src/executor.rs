@@ -368,7 +368,7 @@ pub struct SqlRequest {
 /// ([`SqlExecutor::execute_statement_accounted`]): every [`SqlRequest`]
 /// field but the text, with the same meaning.
 #[derive(Debug, Clone)]
-pub struct StatementRequest {
+pub(crate) struct StatementRequest {
     pub window: TimeRange,
     pub min_tokens: Vec<CommitToken>,
     pub now_ns: i64,
@@ -1454,8 +1454,9 @@ impl SqlExecutor {
     /// because there is no SQL text. Plan admission refuses every scan outside
     /// the statement's target in place of the last; the caller must bound the
     /// statement's size and nesting with its own structural guard before
-    /// calling.
-    pub async fn execute_statement_accounted(
+    /// calling. The statement's [`LoweredStatement::text`] is not read or
+    /// audited here; the caller records it.
+    pub(crate) async fn execute_statement_accounted(
         &self,
         tenant_hash: TenantHash,
         statement: &dyn LoweredStatement,
@@ -1464,7 +1465,7 @@ impl SqlExecutor {
     ) -> Result<SqlOutcome, SqlError> {
         let statement = Statement::Lowered(statement);
         let sql_req = SqlRequest {
-            sql: statement.text().to_string(),
+            sql: String::new(),
             window: req.window,
             min_tokens: req.min_tokens.clone(),
             now_ns: req.now_ns,

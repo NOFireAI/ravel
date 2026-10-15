@@ -422,11 +422,7 @@ async fn stats_over_null_returns_a_row_per_group() {
             .unwrap_or_else(|e| panic!("{source}: {e}"));
         assert_eq!(
             rows(&outcome),
-            vec![
-                vec![value, "api"],
-                vec![value, "web"],
-                vec![value, "null"],
-            ],
+            vec![vec![value, "api"], vec![value, "web"], vec![value, "null"],],
             "{source}"
         );
     }
