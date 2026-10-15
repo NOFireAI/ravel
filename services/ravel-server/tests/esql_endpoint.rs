@@ -467,6 +467,57 @@ mod with_esql {
         assert_eq!(body["data"]["rows"], json!([[recent]]));
         assert_catalog_stats(&body["stats"]);
 
+        // The HTTP reference's example statement.
+        let (status, body) = fx
+            .esql(
+                "FROM logs | WHERE @timestamp >= NOW() - 1 hour | STATS errors = COUNT(*) \
+                 WHERE log.level == \"ERROR\" BY service.name | SORT service.name",
+            )
+            .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["data"]["columns"],
+            json!([
+                { "name": "errors", "type": "long" },
+                { "name": "service.name", "type": "keyword" },
+            ]),
+        );
+        let per_service = |service: &str| {
+            (0..ROWS)
+                .filter(|i| service_of(*i) == service && is_error(*i))
+                .count()
+        };
+        assert_eq!((per_service("api"), per_service("web")), (9, 9));
+        assert_eq!(body["data"]["rows"], json!([[9, "api"], [9, "web"]]));
+        assert_catalog_stats(&body["stats"]);
+
+        fx.running.shutdown().await.expect("graceful shutdown");
+    }
+
+    /// A construct outside the supported set is a typed 400 naming it and
+    /// where it starts.
+    #[tokio::test]
+    async fn an_unsupported_construct_is_a_typed_400() {
+        let fx = Fixture::start(false).await;
+        fx.ingest().await;
+
+        for (query, message) in [
+            (
+                "FROM metrics",
+                "line 1:6: source [metrics] is not supported",
+            ),
+            (
+                "FROM logs | EVAL x = TO_UPPER(message)",
+                "line 1:22: function [TO_UPPER] is not supported",
+            ),
+        ] {
+            let (status, body) = fx.esql(query).await;
+            assert_eq!(status, 400, "{query}: {body}");
+            assert_eq!(body["status"], "error");
+            assert_eq!(body["errorType"], "bad_data");
+            assert_eq!(body["error"], message, "{query}");
+        }
+
         fx.running.shutdown().await.expect("graceful shutdown");
     }
 
