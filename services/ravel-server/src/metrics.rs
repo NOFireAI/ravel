@@ -3075,7 +3075,9 @@ fn render_head_refusal_undrained_family(
 }
 
 /// The process-wide pending strict-ack family (ADR-2793 decision 4):
-/// strict writes enqueued and awaiting their acknowledgement, and the
+/// strict writes holding a pending-ack permit (a write the admission layer
+/// admitted from its request head to its ack, any other caller from submit to
+/// its ack), and the
 /// cumulative refusals at `--max-pending-strict-acks`. Mode-only labeled like
 /// `render_ingest_concurrency_family` above: one budget is shared across
 /// metrics, logs and traces with no per-signal breakdown.
@@ -3087,7 +3089,7 @@ fn render_pending_strict_ack_family(
     write_header(
         out,
         "ravel_ingest_pending_strict_acks",
-        "Strict ingest requests holding a pending-ack permit, from admission to their durability acknowledgement, process-wide.",
+        "Strict ingest requests holding a pending-ack permit until their durability acknowledgement, counted from request-head admission for OTLP HTTP, Remote Write and unary OTLP gRPC and from submit for other callers (OTAP, ravel-cli load), process-wide.",
         "gauge",
     );
     write_sample(
