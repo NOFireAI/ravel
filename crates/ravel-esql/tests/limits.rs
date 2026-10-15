@@ -1,7 +1,8 @@
 //! Structural limits: each is accepted at its value and refused one past it,
 //! and the refusal comes before parsing, so a syntax error placed ahead of
 //! the breach does not mask it. The worst shapes the default limits admit,
-//! nested pipelines included, parse, print, compare with `==`, clone, format
+//! nested pipelines and option maps included, parse, print, compare with
+//! `==`, clone, format
 //! with `{:?}` and drop on a 2 MiB stack, and on a 1 MiB one for twice that
 //! headroom.
 
@@ -296,7 +297,12 @@ fn from_subqueries(levels: usize, rest: &str) -> String {
 /// `FROM t | FORK (FORK ( ... ) (WHERE true)) (WHERE true)`: `levels` `FORK`
 /// commands, each nesting the next in its first branch.
 fn nested_forks(levels: usize) -> String {
-    let mut inner = "FORK (WHERE true) (WHERE true)".to_owned();
+    nested_forks_around(levels, "WHERE true")
+}
+
+/// [`nested_forks`] with `branch` as the innermost `FORK`'s first branch.
+fn nested_forks_around(levels: usize, branch: &str) -> String {
+    let mut inner = format!("FORK ({branch}) (WHERE true)");
     for _ in 1..levels {
         inner = format!("FORK ({inner}) (WHERE true)");
     }
@@ -306,17 +312,28 @@ fn nested_forks(levels: usize) -> String {
 /// `FROM t | WHERE a IN (FROM t | WHERE a IN ( ... (FROM t) ... ))` with
 /// `levels` `IN` subqueries.
 fn in_subqueries(levels: usize) -> String {
-    let mut inner = "FROM t".to_owned();
+    in_subqueries_around(levels, "")
+}
+
+/// [`in_subqueries`] with `rest` after the innermost `FROM t`.
+fn in_subqueries_around(levels: usize, rest: &str) -> String {
+    let mut inner = format!("FROM t{rest}");
     for _ in 0..levels {
         inner = format!("FROM t | WHERE a IN ({inner})");
     }
     inner
 }
 
-/// The deepest nested pipelines the default limits admit, as whole
-/// statements, each with the statement one step past it and the limit that
-/// refuses that one. Every command in a nested pipeline, a `FORK` branch's
-/// included, is a stage, and every nested pipeline is a nesting level.
+/// `{"a": {"a": ... {"a": 1} ... }}` with `levels` maps.
+fn nested_maps(levels: usize) -> String {
+    nested("{\"a\": ", "1", "}", levels)
+}
+
+/// The deepest nested pipelines and option maps the default limits admit, as
+/// whole statements, each with the statement one step past it and the limit
+/// that refuses that one. Every command in a nested pipeline, a `FORK`
+/// branch's included, is a stage, and every nested pipeline is a nesting
+/// level.
 fn worst_admitted_pipelines(limits: &Limits) -> Vec<(String, String, LimitKind)> {
     let d = limits.max_depth;
     let stages = limits.max_pipeline_stages;
@@ -331,7 +348,51 @@ fn worst_admitted_pipelines(limits: &Limits) -> Vec<(String, String, LimitKind)>
     // one level per subquery, one for the condition and one per call.
     let mixed = stages - 2;
     let calls = |levels| format!(" | WHERE {}", nested("f(", "1", ")", levels));
+    // A `FORK` branch condition sits one level inside its branch, like a
+    // subquery's.
+    let fork_where = |levels| format!("WHERE {}", nested("f(", "1", ")", levels));
+    let completion = |levels| format!("COMPLETION y = \"p\" WITH {}", nested_maps(levels));
     vec![
+        // The deepest `FORK` nesting, its innermost branch spending the rest
+        // of the depth on calls, then on an option map.
+        (
+            nested_forks_around(fork, &fork_where(d - fork - 1)),
+            nested_forks_around(fork, &fork_where(d - fork)),
+            LimitKind::NestingDepth,
+        ),
+        (
+            nested_forks_around(fork, &completion(d - fork - 1)),
+            nested_forks_around(fork, &completion(d - fork)),
+            LimitKind::NestingDepth,
+        ),
+        // The deepest `IN` subqueries with one more stage innermost, so the
+        // statement holds every stage, and that stage's condition spending
+        // the rest of the depth: two levels per subquery, one for the
+        // condition and one per call.
+        (
+            in_subqueries_around(in_list, &calls(d - 2 * in_list - 1)),
+            in_subqueries_around(in_list, &calls(d - 2 * in_list)),
+            LimitKind::NestingDepth,
+        ),
+        // The deepest `FROM` subqueries with an option map spending the rest
+        // of the depth.
+        (
+            from_subqueries(mixed, &format!(" | {}", completion(d - mixed - 1))),
+            from_subqueries(mixed, &format!(" | {}", completion(d - mixed))),
+            LimitKind::NestingDepth,
+        ),
+        // Option maps nested as deep as they go in a setting and as an
+        // argument.
+        (
+            format!("SET a = {}; ROW x = 1", nested_maps(d - 1)),
+            format!("SET a = {}; ROW x = 1", nested_maps(d)),
+            LimitKind::NestingDepth,
+        ),
+        (
+            format!("ROW x = f({})", nested_maps(d - 2)),
+            format!("ROW x = f({})", nested_maps(d - 1)),
+            LimitKind::NestingDepth,
+        ),
         (
             from_subqueries(from, ""),
             from_subqueries(from + 1, ""),
@@ -362,6 +423,20 @@ fn nested_pipelines_count_against_the_limits() {
         accepted(&at, &limits);
         refused(&past, &limits, kind);
     }
+    // The `IN` and `FORK` shapes that spend the rest of the depth also hold
+    // every stage: one more command is refused.
+    let in_list = (limits.max_pipeline_stages - 1) / 2;
+    refused(
+        &in_subqueries_around(in_list, " | WHERE true | LIMIT 1"),
+        &limits,
+        LimitKind::PipelineStages,
+    );
+    let fork = (limits.max_pipeline_stages - 2) / 2;
+    refused(
+        &nested_forks_around(fork, "WHERE true | LIMIT 1"),
+        &limits,
+        LimitKind::PipelineStages,
+    );
 }
 
 /// Parses `source`, prints it, reparses the printed text and compares, clones,
