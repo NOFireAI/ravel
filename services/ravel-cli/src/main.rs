@@ -2140,7 +2140,37 @@ enum CatalogCommand {
         /// signals ignore it.
         #[arg(long)]
         key_index_leaves: bool,
-        /// Print the full `FoldReport` as JSON instead of the human-readable
+        /// Instead of folding, attach key-index leaves to the parts already in
+        /// HEAD that lack a ref for a declared field (ADR-2707 decision 4,
+        /// "Lifecycle"; docs/catalog-and-mvcc.md "Rollout"). Each such part is
+        /// read once and each of its entries costs the fold's ranged KEY_IDX
+        /// reads (two GETs, three when the footer is larger than the 8 KiB
+        /// suffix); no part is re-encoded and no part, `.csnap` or `.cstat` is
+        /// written. Publishes HEAD once per batch (`--batch-entries`), so an
+        /// interrupted run keeps every earlier batch and a rerun skips the
+        /// parts they indexed; a part with an entry whose ranged GET failed
+        /// gains no ref and is read again by a rerun (`parts_deferred`). Needs
+        /// no `--key-index-leaves` (and refuses it), holds no claim and seals
+        /// no hour, so `--writers-stopped` changes nothing here. Applies to
+        /// `--signal spans` and to a logs tenant that declares a key-index
+        /// field; a logs tenant that declares none is refused.
+        #[arg(long, conflicts_with_all = ["key_index_leaves", "max_flush_lifetime"])]
+        rebuild_key_index: bool,
+        /// With `--rebuild-key-index`, rebuild only this field. Refused unless
+        /// the tenant declares it (`trace_id` for spans; a logs tenant's
+        /// key-index columns, and `trace_id` when trace-id indexing is on).
+        #[arg(long, value_name = "NAME", requires = "rebuild_key_index")]
+        field: Option<String>,
+        /// With `--rebuild-key-index`, the entry total one HEAD publish
+        /// covers: a batch is the longest run of the remaining unindexed parts
+        /// whose entries stay at or below this, and at least one part, so a
+        /// part larger than it is a batch of its own. At least 1.
+        #[arg(long, value_name = "N", requires = "rebuild_key_index",
+              default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
+              value_parser = clap::value_parser!(u64).range(1..))]
+        batch_entries: u64,
+        /// Print the full `FoldReport` (with `--rebuild-key-index`, the
+        /// `KeyIndexRebuildReport`) as JSON instead of the human-readable
         /// text report. Either form carries every counter on the report.
         #[arg(long)]
         json: bool,
@@ -2339,11 +2369,38 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant,
                     shards,
                     signal,
+                    rebuild_key_index: true,
+                    field,
+                    batch_entries,
+                    json,
+                    tenant_kms,
+                    ..
+                },
+        } => catalog::rebuild_key_index(
+            store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
+                .await?,
+            cli.store.selection(),
+            &tenant,
+            shards,
+            signal,
+            field,
+            batch_entries,
+            json,
+        )
+        .await
+        .map(|_report| ()),
+        Command::Catalog {
+            command:
+                CatalogCommand::Fold {
+                    tenant,
+                    shards,
+                    signal,
                     max_flush_lifetime,
                     writers_stopped,
                     key_index_leaves,
                     json,
                     tenant_kms,
+                    ..
                 },
         } => catalog::fold_with_writers_stopped(
             store::build_tenant_data_store(&cli.store, &tenant_kms, &tenant, false, now_ns()?, log)
@@ -4469,6 +4526,81 @@ mod tests {
         };
         assert!(!parse(&[]), "the leaf build is off by default");
         assert!(parse(&["--key-index-leaves"]), "the flag turns it on");
+    }
+
+    /// `catalog fold --rebuild-key-index` (ADR-2707 decision 4): `--field`
+    /// and `--batch-entries` are refused without it, it is refused beside
+    /// `--key-index-leaves` and `--max-flush-lifetime`, and it accepts
+    /// `--writers-stopped`. `--batch-entries` defaults to 250,000 and refuses
+    /// 0 at parse time.
+    #[test]
+    fn catalog_fold_rebuild_key_index_flags() {
+        let try_parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            Cli::try_parse_from(argv)
+        };
+        let parse = |extra: &[&str]| {
+            let Command::Catalog {
+                command:
+                    super::CatalogCommand::Fold {
+                        rebuild_key_index,
+                        field,
+                        batch_entries,
+                        writers_stopped,
+                        ..
+                    },
+            } = try_parse(extra)
+                .expect("a catalog fold invocation parses")
+                .command
+            else {
+                panic!("expected the catalog fold subcommand");
+            };
+            (rebuild_key_index, field, batch_entries, writers_stopped)
+        };
+        assert_eq!(parse(&[]), (false, None, 250_000, false));
+        assert_eq!(
+            parse(&[
+                "--rebuild-key-index",
+                "--field",
+                "user_id",
+                "--batch-entries",
+                "7",
+                "--writers-stopped",
+            ]),
+            (true, Some("user_id".to_string()), 7, true)
+        );
+        for (extra, kind) in [
+            (
+                &["--field", "user_id"][..],
+                clap::error::ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["--batch-entries", "7"],
+                clap::error::ErrorKind::MissingRequiredArgument,
+            ),
+            (
+                &["--rebuild-key-index", "--key-index-leaves"],
+                clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["--rebuild-key-index", "--max-flush-lifetime", "0s"],
+                clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["--rebuild-key-index", "--batch-entries", "0"],
+                clap::error::ErrorKind::ValueValidation,
+            ),
+        ] {
+            let err = match try_parse(extra) {
+                Ok(_) => panic!("{extra:?} must be refused"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), kind, "{extra:?}: {err}");
+        }
     }
 
     /// The shipped write-concurrency and object-size defaults, read where an

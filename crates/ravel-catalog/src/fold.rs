@@ -25,8 +25,8 @@ use ravel_object_store::{
     Version, list_all,
 };
 use ravel_proto::catalog::v1::{
-    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotEntry, SnapshotHead, SnapshotPartRef,
-    SnapshotPostingsRef,
+    ColumnStatsSegment, SnapshotColumnStatsPartRef, SnapshotEntry, SnapshotHead,
+    SnapshotKeyIndexLeafRef, SnapshotPartRef, SnapshotPostingsRef,
 };
 use ravel_proto::commit::v1::{CommitRecord, CompactionPart, CompactionRecord, RewriteRecord};
 use ravel_segment::{ExpectedIdentity, ReaderLimits, SegmentError};
@@ -86,7 +86,7 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// Bounded retry budget for HEAD's CAS loop: a folder that keeps losing to concurrent folders
 /// gives up with [`CatalogError::FoldCasRetriesExhausted`] rather than
 /// retrying forever.
-const MAX_HEAD_CAS_ATTEMPTS: u32 = 8;
+pub(crate) const MAX_HEAD_CAS_ATTEMPTS: u32 = 8;
 
 /// Placeholder for future compaction/retention transactions.
 /// `fold`'s entry point accepts a
@@ -348,7 +348,7 @@ pub struct FoldReport {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-struct RequestCounters {
+pub(crate) struct RequestCounters {
     list_requests: u64,
     get_requests: u64,
     put_requests: u64,
@@ -357,7 +357,7 @@ struct RequestCounters {
 }
 
 /// HEAD as read at the top of one fold attempt.
-enum HeadState {
+pub(crate) enum HeadState {
     Absent,
     /// `head` is boxed so this large variant does not inflate every
     /// `HeadState` value (`clippy::large_enum_variant`): `SnapshotHead` grew
@@ -1141,18 +1141,78 @@ fn declared_logs_key_index_fields(
     fields
 }
 
+/// The key-index fields `signal`'s objects carry for a tenant whose config is
+/// `config`: the declared logs fields (see [`declared_logs_key_index_fields`],
+/// none without a config), and `trace_id` for spans. `None` for a signal whose
+/// objects carry no KEY_IDX section.
+pub(crate) fn declared_key_index_fields(
+    signal: Signal,
+    config: Option<&crate::tenant_config::TenantConfig>,
+    tenant: &TenantHash,
+) -> Option<Vec<(String, KeyType)>> {
+    match signal {
+        Signal::Logs => Some(
+            config
+                .map(|cfg| declared_logs_key_index_fields(cfg, tenant))
+                .unwrap_or_default(),
+        ),
+        Signal::Spans => Some(vec![(
+            ravel_rspan::TRACE_ID_FIELD.to_string(),
+            KeyType::Id16,
+        )]),
+        _ => None,
+    }
+}
+
+/// PUTs one encoded leaf at its content-addressed key under the covered
+/// part's `watermark_hour` and returns its ref with `key` filled in. A leaf
+/// already stored under that key holds identical bytes, so `AlreadyExists` is
+/// success.
+pub(crate) async fn put_key_index_leaf(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantHash,
+    signal: Signal,
+    watermark_hour: u32,
+    leaf: EncodedKeyIndexLeaf,
+) -> Result<SnapshotKeyIndexLeafRef, StoreError> {
+    let EncodedKeyIndexLeaf {
+        bytes,
+        mut leaf_ref,
+    } = leaf;
+    let leaf_key = key_index_object_key(
+        tenant,
+        signal,
+        watermark_hour,
+        &hex_encode(&leaf_ref.blake3)[..16],
+    );
+    let leaf_crc = crc32c::crc32c(&bytes);
+    match store
+        .put(
+            &leaf_key,
+            Bytes::from(bytes),
+            PutOptions::create_if_absent().with_checksum(UploadChecksum::Crc32c(leaf_crc)),
+        )
+        .await
+    {
+        Ok(_) | Err(StoreError::AlreadyExists) => {}
+        Err(e) => return Err(e),
+    }
+    leaf_ref.key = leaf_key;
+    Ok(leaf_ref)
+}
+
 /// One entry's tier-1 KEY_IDX fields, or why the entry is uncovered for every
 /// field.
-type EntryKeyIndex = Result<Vec<KeyIdxFieldEntries>, String>;
+pub(crate) type EntryKeyIndex = Result<Vec<KeyIdxFieldEntries>, String>;
 
 /// One data object's KEY_IDX read and the ranged GETs and bytes it cost.
-struct EntryKeyIndexRead {
-    fields: EntryKeyIndex,
+pub(crate) struct EntryKeyIndexRead {
+    pub(crate) fields: EntryKeyIndex,
     /// Whether a GET failed, as opposed to the object's bytes not yielding a
     /// section.
-    get_failed: bool,
-    gets: u64,
-    bytes: u64,
+    pub(crate) get_failed: bool,
+    pub(crate) gets: u64,
+    pub(crate) bytes: u64,
 }
 
 /// Why an object's KEY_IDX read leaves its entry uncovered.
@@ -1225,7 +1285,7 @@ fn open_key_idx_footer(
 /// when the footer is longer than [`KEY_INDEX_FOOTER_SUFFIX_LEN`]), then one
 /// GET of the section. Never reads rows. Every failure leaves the entry
 /// uncovered rather than failing the fold.
-async fn read_entry_key_index(
+pub(crate) async fn read_entry_key_index(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantHash,
     signal: Signal,
@@ -1346,24 +1406,26 @@ async fn read_entry_key_index_counted(
 
 /// One part's leaves, every `leaf_ref.key` still empty, and its uncovered
 /// (entry, field) count.
-struct PartKeyIndexLeaves {
-    leaves: Vec<EncodedKeyIndexLeaf>,
-    uncovered_entries: u64,
+pub(crate) struct PartKeyIndexLeaves {
+    pub(crate) leaves: Vec<EncodedKeyIndexLeaf>,
+    pub(crate) uncovered_entries: u64,
 }
 
 /// Builds one part's leaves from its entries' KEY_IDX reads (`reads[i]` is
 /// part entry `i`): one leaf per (field, key slice) for every field in
-/// `declared` and every field a section names, the declared key type winning,
-/// else the key type of the first entry naming the field. An entry is
+/// `declared` and, when `section_named_fields`, every field a section names,
+/// the declared key type winning, else the key type of the first entry naming
+/// the field. An entry is
 /// uncovered for a field when its read failed or its section does not name
 /// the field under that key type. Every entry carrying a `key8` whose own
 /// entries exceed the body ceiling is uncovered for the field too, since no
 /// slice can hold that `key8`. A field with no covered entry writes no leaf.
-fn build_part_key_index_leaves(
+pub(crate) fn build_part_key_index_leaves(
     tenant: &TenantHash,
     signal: Signal,
     part_blake3: [u8; 32],
     declared: &[(String, KeyType)],
+    section_named_fields: bool,
     reads: &[&EntryKeyIndex],
     limits: &KeyIndexLeafLimits,
 ) -> PartKeyIndexLeaves {
@@ -1372,11 +1434,13 @@ fn build_part_key_index_leaves(
     for (name, key_type) in declared {
         field_types.entry(name.as_str()).or_insert(*key_type);
     }
-    for fields in reads.iter().filter_map(|read| (*read).as_ref().ok()) {
-        for field in fields {
-            field_types
-                .entry(field.name.as_str())
-                .or_insert(field.key_type);
+    if section_named_fields {
+        for fields in reads.iter().filter_map(|read| (*read).as_ref().ok()) {
+            for field in fields {
+                field_types
+                    .entry(field.name.as_str())
+                    .or_insert(field.key_type);
+            }
         }
     }
     let mut built = PartKeyIndexLeaves {
@@ -1774,20 +1838,11 @@ impl Catalog {
         // switch is off, the signal's objects carry no KEY_IDX section, or a
         // logs tenant declares no key-index field.
         let key_index_fields: Option<Vec<(String, KeyType)>> =
-            match (self.config().build_key_index_leaves, signal) {
-                (false, _) => None,
-                (true, Signal::Logs) => Some(
-                    tenant_config
-                        .as_ref()
-                        .map(|cfg| declared_logs_key_index_fields(cfg, tenant))
-                        .unwrap_or_default(),
-                )
-                .filter(|declared| !declared.is_empty()),
-                (true, Signal::Spans) => Some(vec![(
-                    ravel_rspan::TRACE_ID_FIELD.to_string(),
-                    KeyType::Id16,
-                )]),
-                (true, _) => None,
+            if self.config().build_key_index_leaves {
+                declared_key_index_fields(signal, tenant_config.as_ref(), tenant)
+                    .filter(|declared| !declared.is_empty())
+            } else {
+                None
             };
         let typed_attr_columns: Vec<DeclaredTypedColumn> = tenant_config
             .and_then(|cfg| cfg.typed_attr_columns)
@@ -2826,38 +2881,20 @@ impl Catalog {
                         signal,
                         *part_hash.as_bytes(),
                         declared,
+                        true,
                         &entry_fields,
                         &KeyIndexLeafLimits::default(),
                     );
                     key_index_uncovered_entries += built.uncovered_entries;
-                    for EncodedKeyIndexLeaf {
-                        bytes,
-                        mut leaf_ref,
-                    } in built.leaves
-                    {
-                        let leaf_hash16 = &hex_encode(&leaf_ref.blake3)[..16];
-                        let leaf_key =
-                            key_index_object_key(tenant, signal, part_watermark, leaf_hash16);
-                        let leaf_crc = crc32c::crc32c(&bytes);
-                        let put_result = self
-                            .store()
-                            .put(
-                                &leaf_key,
-                                Bytes::from(bytes),
-                                PutOptions::create_if_absent()
-                                    .with_checksum(UploadChecksum::Crc32c(leaf_crc)),
-                            )
-                            .await;
+                    for leaf in built.leaves {
+                        let put_result =
+                            put_key_index_leaf(self.store(), tenant, signal, part_watermark, leaf)
+                                .await;
                         // Request-issued, like every PUT counter here (#1598).
                         counters.put_requests += 1;
-                        match put_result {
-                            // Keyed by the leaf's own blake3: identical bytes.
-                            Ok(_) | Err(StoreError::AlreadyExists) => {}
-                            Err(e) => return Err(CatalogError::Store(e)),
-                        }
+                        let leaf_ref = put_result.map_err(CatalogError::Store)?;
                         key_index_leaves_written += 1;
                         key_index_leaf_bytes_written += leaf_ref.size;
-                        leaf_ref.key = leaf_key;
                         key_index.push(leaf_ref);
                     }
                 }
@@ -3127,7 +3164,7 @@ impl Catalog {
         }
     }
 
-    async fn get_head(
+    pub(crate) async fn get_head(
         &self,
         head_key: &str,
         counters: &mut RequestCounters,
@@ -3215,7 +3252,7 @@ impl Catalog {
 
     /// Load one part HEAD names, verifying its bytes against the recorded
     /// blake3 before decoding them.
-    async fn load_part_entries(
+    pub(crate) async fn load_part_entries(
         &self,
         part_ref: &SnapshotPartRef,
         counters: &mut RequestCounters,
@@ -4171,7 +4208,7 @@ fn no_op_report(
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
@@ -4199,11 +4236,11 @@ mod tests {
         + DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
         + DEFAULT_FOLD_SAFETY_MARGIN_NS;
 
-    fn tenant() -> TenantHash {
+    pub(crate) fn tenant() -> TenantHash {
         TenantHash([0xcd; 16])
     }
 
-    fn config(shard_count: u32) -> CatalogConfig {
+    pub(crate) fn config(shard_count: u32) -> CatalogConfig {
         CatalogConfig {
             shard_count,
             ..Default::default()
@@ -4212,7 +4249,7 @@ mod tests {
 
     /// `now_ns` at which ingest hour `hour` has just sealed under default
     /// margins: the exact boundary of `sealed_watermark_hour`.
-    fn now_at_seal(hour: u32) -> i64 {
+    pub(crate) fn now_at_seal(hour: u32) -> i64 {
         (i64::from(hour) + 1) * NS_PER_HOUR + DEFAULT_MARGIN_NS
     }
 
@@ -6134,7 +6171,7 @@ mod tests {
         assert_status_column(rec1, 3, 0, 200, 500, &[(200, 1), (500, 2)], 1200);
     }
 
-    async fn list_all_keys(store: &dyn ObjectStoreBackend, prefix: &str) -> Vec<String> {
+    pub(crate) async fn list_all_keys(store: &dyn ObjectStoreBackend, prefix: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut page_token = None;
         loop {
@@ -10908,16 +10945,16 @@ mod tests {
     };
     use ravel_codec::key_idx::{key8_i64, key8_id16};
 
-    const USER_ID: &str = "user_id";
+    pub(crate) const USER_ID: &str = "user_id";
     /// The hour the single-hour key-index fixtures publish into.
-    const KIDX_HOUR: u32 = 470_000;
+    pub(crate) const KIDX_HOUR: u32 = 470_000;
 
     /// Publishes one L0 RLOG object into `hour`: row `i` carries
     /// `user_id = user_ids[i]`, rows go `rows_per_block` to a level-0 block, and
     /// each body is padded with `body_bytes` hex characters derived from
     /// `(writer_seq, i)`. The KEY_IDX section indexes `user_id` as I64 when
     /// `with_key_idx`. Returns the record and the object's bytes.
-    async fn publish_user_id_logs(
+    pub(crate) async fn publish_user_id_logs(
         store: &dyn ObjectStoreBackend,
         writer_seq: u64,
         hour: u32,
@@ -11012,7 +11049,7 @@ mod tests {
 
     /// Publishes one L0 RSPAN object into [`KIDX_HOUR`] with one span per
     /// trace id, all in block 0 (the default block holds 8192 spans).
-    async fn publish_trace_spans(
+    pub(crate) async fn publish_trace_spans(
         store: &dyn ObjectStoreBackend,
         writer_seq: u64,
         trace_ids: &[[u8; 16]],
@@ -11076,7 +11113,7 @@ mod tests {
     }
 
     /// Declares `user_id` as an I64 typed column carrying `key_index`.
-    async fn declare_user_id_key_index(store: &dyn ObjectStoreBackend) {
+    pub(crate) async fn declare_user_id_key_index(store: &dyn ObjectStoreBackend) {
         use crate::tenant_config::{
             DeclaredColumnType, StorageLayoutWrite, TenantConfig, TenantLifecycleState,
         };
@@ -11105,7 +11142,7 @@ mod tests {
         }
     }
 
-    async fn fold_through(catalog: &Catalog, signal: Signal, hour: u32) -> FoldReport {
+    pub(crate) async fn fold_through(catalog: &Catalog, signal: Signal, hour: u32) -> FoldReport {
         catalog
             .fold(
                 &tenant(),
@@ -11119,7 +11156,10 @@ mod tests {
             .expect("fold")
     }
 
-    async fn read_signal_head(store: &dyn ObjectStoreBackend, signal: Signal) -> SnapshotHead {
+    pub(crate) async fn read_signal_head(
+        store: &dyn ObjectStoreBackend,
+        signal: Signal,
+    ) -> SnapshotHead {
         let got = store
             .get(&head_object_key(&tenant(), signal), GetRange::Full)
             .await
@@ -11128,7 +11168,7 @@ mod tests {
     }
 
     /// `writer_seq` to part entry ordinal, read off the part object.
-    async fn part_ordinals(
+    pub(crate) async fn part_ordinals(
         store: &dyn ObjectStoreBackend,
         part: &SnapshotPartRef,
     ) -> HashMap<u64, u64> {
@@ -11146,7 +11186,7 @@ mod tests {
     }
 
     /// Probes `part`'s leaf for `field` through the catalog probe API.
-    async fn probe_part(
+    pub(crate) async fn probe_part(
         catalog: &Catalog,
         signal: Signal,
         part: &SnapshotPartRef,
@@ -11175,7 +11215,7 @@ mod tests {
             .expect("no isolation breach")
     }
 
-    fn matches(found: &[(u64, &[u32])], uncovered: &[u64]) -> KeyIndexLeafProbe {
+    pub(crate) fn matches(found: &[(u64, &[u32])], uncovered: &[u64]) -> KeyIndexLeafProbe {
         let mut matches: Vec<KeyIndexMatch> = found
             .iter()
             .map(|(entry_ordinal, blocks)| KeyIndexMatch {
@@ -11660,7 +11700,10 @@ mod tests {
             .collect()
     }
 
-    async fn kidx_objects(store: &dyn ObjectStoreBackend, signal: Signal) -> Vec<String> {
+    pub(crate) async fn kidx_objects(
+        store: &dyn ObjectStoreBackend,
+        signal: Signal,
+    ) -> Vec<String> {
         let prefix = format!("t/{}/catalog/{}/", tenant().to_hex(), signal.key_prefix());
         list_all_keys(store, &prefix)
             .await
@@ -11941,6 +11984,7 @@ mod tests {
                 (USER_ID.to_string(), KeyType::I64),
                 ("order_id".to_string(), KeyType::I64),
             ],
+            true,
             &reads.iter().collect::<Vec<_>>(),
             &limits,
         );

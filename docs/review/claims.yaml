@@ -101,11 +101,13 @@
 
 - id: catalog-kidx-rebuild-command-proposed
   doc: docs/catalog-and-mvcc.md
-  quote: "the command below does not exist yet"
-  kind: negative
-  binds: []
-  status: not-implemented
-  note: "ravel-cli catalog fold --rebuild-key-index is ADR-2707's T9c; services/ravel-cli has no rebuild-key-index flag. The flag would arrive as a clap field, not a definition a bind can name ahead of time."
+  quote: "attaches leaves to parts it leaves unchanged"
+  kind: positive
+  binds:
+    - crates/ravel-catalog/src/key_index_rebuild.rs::KeyIndexRebuildReport
+    - crates/ravel-catalog/src/key_index_rebuild.rs::tests::rebuild_attaches_leaves_to_a_stripped_part_and_the_probe_names_the_blocks
+  status: verified
+  note: "ADR-2707 T9c (#2995) landed the command; the proposed marker this entry used to quote is gone. The bound test asserts HEAD is byte-identical outside key_index and that the only PUTs are the leaf and HEAD."
 
 - id: logseg-gram-idx-reserved
   doc: docs/log-segment-format.md

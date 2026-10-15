@@ -16,6 +16,7 @@ mod declared_stats;
 mod error;
 mod fold;
 mod key_epoch;
+mod key_index_rebuild;
 mod metrics_meta;
 mod provisioning;
 mod read_gate;
@@ -71,6 +72,10 @@ pub use key_epoch::{
     EpochDefect, KEY_EPOCH_FORMAT_VERSION, KEY_EPOCH_MAX_READ_VERSION, KEY_EPOCH_MIN_READ_VERSION,
     KeyEpoch, KeyEpochError, KeyEpochOutcome, enc_key, epoch_for_write, read_epochs,
     read_epochs_checked, read_epochs_from_store, record_key_epoch,
+};
+pub use key_index_rebuild::{
+    DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES, KeyIndexRebuildAttempt, KeyIndexRebuildError,
+    KeyIndexRebuildOptions, KeyIndexRebuildReport,
 };
 pub use metrics_meta::{
     DEFAULT_METRICS_META_ENTRY_CAP, MAX_METRICS_META_DECOMPRESSED_BYTES,

@@ -13,7 +13,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use ravel_catalog::{CatalogConfig, FoldReport, PartLimits, RefoldRequest};
+use ravel_catalog::{
+    CatalogConfig, FoldReport, KeyIndexRebuildError, KeyIndexRebuildOptions, KeyIndexRebuildReport,
+    PartLimits, RefoldRequest,
+};
 use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_proto::catalog::v1::{SnapshotColumnStatsPartRef, SnapshotKeyIndexLeafRef};
 use ravel_types::{Signal, TenantHash, TenantId};
@@ -406,6 +409,170 @@ fn render_fold_report(
         "key_index_uncovered_entries: {}\n",
         report.key_index_uncovered_entries
     ));
+    Ok(out)
+}
+
+/// `catalog fold --rebuild-key-index` (ADR-2707 decision 4, "Lifecycle"):
+/// attaches key-index leaves to the parts in the signal's HEAD that lack a
+/// ref for a declared field, or for `field` only, without re-encoding any
+/// part. See [`ravel_catalog::Catalog::rebuild_key_index`].
+///
+/// It seals no hour and reads no commit record, so `--writers-stopped`,
+/// which the command accepts as the plain fold's assertion, has nothing to
+/// change here and is not passed in. On an error that leaves earlier batches
+/// published, the partial report is printed before the error is returned, so
+/// what landed is never silent.
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_key_index(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    field: Option<String>,
+    batch_entries: u64,
+    json: bool,
+) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
+    let (result, out) = rebuild_key_index_outcome(
+        store,
+        selection,
+        tenant,
+        shard_count,
+        signal,
+        field,
+        batch_entries,
+        json,
+    )
+    .await?;
+    print!("{out}");
+    result
+        .map(|report| (report, out))
+        .map_err(|err| anyhow::anyhow!("key-index rebuild failed for tenant {tenant:?}: {err}"))
+}
+
+/// The testable core of [`rebuild_key_index`]: the rebuild's own result and
+/// the text the command prints for it, which is empty for an error that
+/// carries no report (one raised before any batch ran).
+#[allow(clippy::too_many_arguments)]
+pub async fn rebuild_key_index_outcome(
+    store: Arc<dyn ObjectStoreBackend>,
+    selection: StoreSelection,
+    tenant: &str,
+    shard_count: u32,
+    signal: SignalArg,
+    field: Option<String>,
+    batch_entries: u64,
+    json: bool,
+) -> anyhow::Result<(Result<KeyIndexRebuildReport, KeyIndexRebuildError>, String)> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    require_tenant_data_present(
+        selection,
+        store.as_ref(),
+        "catalog fold --rebuild-key-index",
+        tenant,
+        &tenant_hash,
+    )
+    .await?;
+    let catalog = enforcing_catalog(
+        store,
+        CatalogConfig {
+            shard_count,
+            ..CatalogConfig::default()
+        },
+    )
+    .map_err(|err| anyhow::anyhow!("failed to build catalog: {err}"))?;
+    let options = KeyIndexRebuildOptions {
+        field,
+        batch_entries,
+    };
+    let result = catalog
+        .rebuild_key_index(&tenant_hash, signal.to_signal(), &options)
+        .await;
+    let report = match &result {
+        Ok(report) => Some(report),
+        Err(err) => err.report(),
+    };
+    let out = match report {
+        Some(report) => render_rebuild_report(report, selection, signal, json)?,
+        None => String::new(),
+    };
+    Ok((result, out))
+}
+
+/// Renders a [`KeyIndexRebuildReport`] as JSON or as `name: value` lines,
+/// `largest_unindexed_part_entries` first after the store and signal: it bounds what one attempt can
+/// cost when a part exceeds `--batch-entries`.
+pub fn render_rebuild_report(
+    report: &KeyIndexRebuildReport,
+    selection: StoreSelection,
+    signal: SignalArg,
+    json: bool,
+) -> anyhow::Result<String> {
+    if json {
+        let mut value = serde_json::to_value(report)
+            .map_err(|err| anyhow::anyhow!("failed to serialize rebuild report: {err}"))?;
+        let header = selection.header();
+        let store_value = header.strip_prefix("store: ").unwrap_or(&header);
+        let Some(obj) = value.as_object_mut() else {
+            anyhow::bail!("rebuild report did not serialize to a JSON object");
+        };
+        for (key, value) in [
+            ("store", store_value.to_string()),
+            ("signal", signal_word(signal.to_signal()).to_string()),
+        ] {
+            if obj
+                .insert(key.to_string(), serde_json::Value::String(value))
+                .is_some()
+            {
+                anyhow::bail!(
+                    "KeyIndexRebuildReport now has a `{key}` field, which collides with the \
+                     report-level key of the same name; rename one of them"
+                );
+            }
+        }
+        let body = serde_json::to_string_pretty(&value)
+            .map_err(|err| anyhow::anyhow!("failed to serialize rebuild report: {err}"))?;
+        return Ok(format!("{body}\n"));
+    }
+    let mut out = String::new();
+    out.push_str(&format!("{}\n", selection.header()));
+    out.push_str(&format!("signal: {}\n", signal_word(signal.to_signal())));
+    out.push_str(&format!(
+        "largest_unindexed_part_entries: {}\n",
+        report.largest_unindexed_part_entries
+    ));
+    out.push_str(&format!("fields: {}\n", report.fields.join(",")));
+    out.push_str(&format!("parts_unindexed: {}\n", report.parts_unindexed));
+    out.push_str(&format!("parts_rebuilt: {}\n", report.parts_rebuilt));
+    out.push_str(&format!("parts_deferred: {}\n", report.parts_deferred));
+    out.push_str(&format!("leaves_written: {}\n", report.leaves_written));
+    out.push_str(&format!(
+        "leaf_bytes_written: {}\n",
+        report.leaf_bytes_written
+    ));
+    out.push_str(&format!(
+        "section_bytes_read: {}\n",
+        report.section_bytes_read
+    ));
+    out.push_str(&format!("ranged_gets: {}\n", report.ranged_gets));
+    out.push_str(&format!(
+        "uncovered_entries: {}\n",
+        report.uncovered_entries
+    ));
+    out.push_str(&format!("attempt_count: {}\n", report.attempt_count));
+    for (i, attempt) in report.attempts.iter().enumerate() {
+        out.push_str(&format!(
+            "attempt {}: parts={} part_gets={} ranged_gets={} leaf_puts={} \
+             head_cas_tries={} parts_published={}\n",
+            i + 1,
+            attempt.parts,
+            attempt.part_gets,
+            attempt.ranged_gets,
+            attempt.leaf_puts,
+            attempt.head_cas_tries,
+            attempt.parts_published
+        ));
+    }
     Ok(out)
 }
 

@@ -839,10 +839,10 @@ switch that is off by default (`CatalogConfig::build_key_index_leaves`,
 switch amendment describes. Every process that runs a fold for a tenant
 (a maintain-mode process, and a query-mode process serving on-demand
 folds) should agree on the switch: a fold without it writes the re-encoded tail
-without refs. Two parts are proposed and marked so below: the query
-path ("Reader", no query probes a leaf yet) and the
-`--rebuild-key-index` repair under "Rollout". The task that
-lands each removes its marker.
+without refs; `ravel-cli catalog fold --rebuild-key-index` (under
+"Rollout") attaches them afterwards. One part is proposed and marked so
+below: the query path ("Reader", no query probes a leaf yet). The task
+that lands it removes its marker.
 
 The codec is `ravel_catalog::snapshot_format::kidx`, re-exported at the
 crate root: `encode_key_index_leaf` (choosing `bucket_bits` with
@@ -1129,46 +1129,78 @@ builds HEAD as a fresh struct, so an unknown field does not survive its
 CAS. The regular fold re-indexes a part only when it re-encodes it, and a
 sealed, compacted historical part with no erasure pending is never
 re-encoded by the regular fold, so the repair is explicit and is not a
-fold (proposed: the command below does not exist yet, and
-this paragraph's account of it is its specification):
-`ravel-cli catalog fold --rebuild-key-index [--field <name>]`
-attaches leaves to parts it leaves unchanged. For every part in HEAD that
-lacks a `key_index` ref for a declared field (every part, for spans) it
-reads the part object once, reads each entry's footer suffix and KEY_IDX
-section (the two ranged GETs per entry of the fold's own leaf build),
-writes the leaves, and publishes a HEAD whose part refs are the current
+fold: `ravel-cli catalog fold --rebuild-key-index [--field <name>]
+[--batch-entries <n>]` (`Catalog::rebuild_key_index`,
+`crates/ravel-catalog/src/key_index_rebuild.rs`) attaches leaves to parts
+it leaves unchanged. For every part in HEAD that lacks a `key_index` ref
+for a declared field (every part, for spans), or for `--field` alone,
+which is refused unless the tenant declares it, it reads the part object
+once, reads each entry's footer suffix and KEY_IDX section (the ranged
+GETs of the fold's own leaf build: two per entry, and a third when the
+footer is larger than the 8 KiB suffix), writes the leaves for the
+declared fields under the fold's key layout (for a declared field the
+leaf is byte-identical to the one a fold with `build_key_index_leaves`
+on writes for the same part; a field a KEY_IDX section names that the
+tenant does not declare gets none), and publishes a HEAD whose part refs are the current
 ones with `key_index` attached (`SnapshotHead.parts` carries the refs
-inline, so the publish is the HEAD CAS alone). The part objects, their
-blake3 and their `.csnap` baselines are untouched, so none of the fold's
-per-part machinery runs: no content-hash carry-forward, no dirty-hour
-reconcile, no column-stats baseline, no part or `.csnap` PUT, no window
-LIST. It publishes in batches bounded in entries: a batch is the longest
-run of the remaining unindexed parts whose entry total stays at or below
+inline, so the publish is the HEAD CAS alone). A part that already holds
+a ref for every requested field costs no GET; one that holds refs for
+some keeps them and gains the rest. The part objects, their blake3 and
+their `.csnap` baselines are untouched, so none of the fold's per-part
+machinery runs: no content-hash carry-forward, no dirty-hour reconcile,
+no column-stats baseline, no part, `.csnap` or `.cstat` PUT, no window
+LIST. It runs regardless of `build_key_index_leaves`, and the CLI refuses
+it beside `--key-index-leaves` and `--max-flush-lifetime`. A logs tenant
+that declares no key-index field, or has no tenant config, is refused
+before HEAD is read, with a typed error naming the tenant
+(`KeyIndexRebuildError::NoFieldDeclared`). It publishes
+in batches bounded in entries: a batch is the longest run of the
+remaining unindexed parts whose entry total stays at or below
 `--batch-entries`, and at least one part, so an attempt costs at most
-`2 x max(batch_entries, largest part's entries)` ranged GETs. The default
-is 250,000, the fold's `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, which is a seal
-threshold rather than a cap (`partition_parts` splits only at hour
-boundaries, so one ingest hour larger than it yields one part above it),
-so the ceiling is `2 x batch_entries` only while no unindexed part exceeds
-the setting and `2 x` the largest part otherwise; the report states the
-largest unindexed part's entries up front. Each batch is one HEAD CAS,
-bounded like the fold's at `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the
-attempt re-reads HEAD, keeps the refs for the batch parts whose blake3 the
-new HEAD still names (a leaf is keyed by `part_blake3`) and drops the
-rest, whose leaves this sweep deletes. The report carries the largest
-unindexed part's entries, parts rebuilt, leaves written, section bytes
-read, ranged GETs issued (footer suffix and section together), the attempt
-count, and per attempt the part GETs, leaf PUTs and HEAD CAS tries (an
+`2 x max(batch_entries, largest part's entries)` ranged GETs while every
+footer fits the suffix (`3 x` otherwise). The default is 250,000, the
+fold's `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, which is a seal threshold
+rather than a cap (`partition_parts` splits only at hour boundaries, so
+one ingest hour larger than it yields one part above it), so the ceiling
+is `2 x batch_entries` only while no unindexed part exceeds the setting
+and `2 x` the largest part otherwise (`3 x` in either case once a footer
+is larger than the 8 KiB suffix); the report states the largest
+unindexed part's entries up front, computed from HEAD before the first
+part GET. Each batch is one HEAD CAS, bounded like the fold's at
+`MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt re-reads HEAD, keeps
+the refs for the batch parts whose blake3 the new HEAD still names (a
+leaf is keyed by `part_blake3`) and drops the rest, whose leaves this
+sweep deletes; it reads no section again. The report carries the largest
+unindexed part's entries, parts rebuilt, parts deferred, leaves written
+and their bytes, section bytes read, ranged GETs issued (footer suffixes,
+any extra footer ranges and sections together, a failed GET included),
+uncovered entries, the attempt count, and per attempt the part
+GETs, ranged GETs, leaf PUTs, HEAD CAS tries and parts published (an
 attempt is one batch's publish including its retries, at most
-`MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt). A
-run that stops or exhausts the CAS retries on one batch has
-therefore published every earlier batch, loses at most `2 x` the entries
-in that batch, and leaves that batch's leaves unreferenced for this sweep;
-the rerun skips every part whose ref an earlier batch published. A
+`MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt).
+A run that stops or exhausts the CAS retries on one batch has therefore
+published every earlier batch (the error says how many parts, and the
+CLI prints the report so far), loses at most the ranged GETs of that
+batch's entries, and leaves that batch's leaves unreferenced for this
+sweep; the rerun skips every part whose ref an earlier batch published. A
 one-part tenant is a single batch, and an interruption there loses the
-whole run. Like the plain CLI fold it holds no claim and keeps no cursor
-(HEAD is the cursor), and it takes `--writers-stopped` as the same
-assertion the plain fold takes. Detection: the sweep's
+whole run. A part none of whose entries carries the field (or whose leaf
+encode is refused) gains no ref, so every rerun reads it again; a batch
+in which no part gains a ref issues no HEAD CAS. A part with an entry
+whose ranged GET failed with a store error is deferred: no leaf is built
+for it, it gains no ref this run, the report counts it under parts
+deferred (`parts_deferred`), a warning names the object and the part,
+and a rerun reads it again. A KEY_IDX section that is absent or does not
+decode is not a failed GET; that entry reads as uncovered. A failed or
+mismatched part GET stops the run with the report so far, and the batch
+it was in publishes nothing. A rebuilt
+ref is carried forward by every later fold that carries the part by
+reference, and a fold that re-encodes the part while
+`build_key_index_leaves` is off drops it, so the rebuild must be rerun
+after such a re-encode. Like the plain CLI fold it holds no claim and
+keeps no cursor (HEAD is the cursor). It accepts `--writers-stopped` as
+the same assertion the plain fold takes, but seals no hour and reads no
+commit record, so the flag changes nothing it does. Detection: the sweep's
 `CatalogSweepOutcome` splits its deletes by kind, and the server renders
 `deleted_kidx` as
 `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`; that series
@@ -1178,18 +1210,25 @@ acts on. A sweeper that predates field 8 names no leaf in its reference
 set, so it deletes live leaves past the horizon with the same outcome: the
 parts read as uncovered until a fold re-encodes them or the repair runs.
 The cost of a bad rollout is one rebuild run over the affected
-parts, `2 x entries` ranged GETs in total (a footer suffix and a section
-range per entry, at most `2 x max(batch_entries, largest part's entries)`
-per attempt, 500,000 at the default while no part exceeds the seal
-threshold) plus the sections' bytes, and that run scans until it has run;
-nothing is retained and nothing is silent. Of the mixed-version
-combinations ADR-0849 section 1a requires tested (old folder then new
-sweeper, old sweeper against a new HEAD, new folder after an old folder,
-then the rebuild), the first is tested
+parts, `2 x entries` ranged GETs in total while every footer fits the
+suffix (a footer suffix and a section range per entry, at most
+`2 x max(batch_entries, largest part's entries)` per attempt, 500,000 at
+the default while no part exceeds the seal threshold) plus the sections'
+bytes, and that run scans until it has run; nothing is retained and
+nothing is silent. Of the mixed-version combinations ADR-0849 section 1a
+requires tested (old folder then new sweeper, old sweeper against a new
+HEAD, new folder after an old folder, then the rebuild), the first is
+tested
 (`leaves_a_field_8_stripping_fold_drops_are_reaped_and_the_part_reads_uncovered`
 in `crates/ravel-maintain/src/sweep.rs`: a HEAD republished without field 8,
-the sweep reaping its leaves, and the lookup finding no ref); the others
-land with the rebuild command.
+the sweep reaping its leaves, and the lookup finding no ref). The rebuild
+half of the third is tested by
+`rebuild_attaches_leaves_to_a_stripped_part_and_the_probe_names_the_blocks`
+in `crates/ravel-catalog/src/key_index_rebuild.rs`: a HEAD whose parts
+carry no field 8 (folded with the leaf build off, which writes the same
+HEAD an old folder does), then the rebuild, HEAD otherwise unchanged, and
+the probe naming the exact blocks. The second, and a new folder running
+between the old one and the rebuild, are not tested yet.
 
 ### Idempotency marker body layout
 
