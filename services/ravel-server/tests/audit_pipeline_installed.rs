@@ -1209,6 +1209,48 @@ async fn redacted_mode_tokenizes_sql_string_literals_and_keeps_structure() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// `POST /api/v1/esql` under `--audit-text redacted` writes exactly one
+/// `kind=query` record with `query.language=esql`, and its `query.text` is the
+/// lexer-based tokenization, pinned exactly: the commands, the field name, the
+/// operator and the `LIMIT` count stay readable, the string literal becomes a
+/// token, and the literal appears nowhere in the record.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_query_writes_one_redacted_query_audit_record() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let running = start_server_text(store.clone(), redacted_text_policy()).await;
+    let base = format!("http://{}", running.http_addr);
+
+    let secret = "checkout-secret";
+    let statement = format!("FROM logs | WHERE service.name == \"{secret}\" | LIMIT 10");
+    let response = reqwest::Client::new()
+        .post(format!("{base}/api/v1/esql"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/json")
+        .body(serde_json::json!({ "query": statement }).to_string())
+        .send()
+        .await
+        .expect("esql request sent");
+    assert_eq!(response.status(), 200, "the esql query should succeed");
+
+    let tenant = TenantId::new(TENANT);
+    let records = query_audit_records(store.as_ref(), &tenant).await;
+    assert_eq!(records.len(), 1, "exactly one query-audit record");
+    let row = &records[0];
+    assert_eq!(attr(row, "query.language"), Some("esql"));
+    assert_eq!(attr(row, "query.status"), Some("ok"));
+    assert_eq!(
+        attr(row, "query.text"),
+        Some("FROM logs | WHERE service.name == \"tok_bd520f187c7f6f86\" | LIMIT 10"),
+    );
+    assert!(
+        !format!("{row:?}").contains(secret),
+        "the literal must appear nowhere in the record"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// `--audit-text redacted`: the `query.text` stored for a PromQL expression
 /// tokenizes the label-matcher value and leaves the metric name, the matcher's
 /// label name, and the operator readable.

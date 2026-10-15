@@ -665,9 +665,11 @@ impl QueryService {
             .ok_or_else(|| ServiceError::unsupported_surface("ES|QL"))?;
         let limits = ravel_esql::Limits::default();
         let text = query.query.as_str();
-        ravel_esql::parse(text, &limits).map_err(|err| {
+        let parsed = ravel_esql::parse(text, &limits).map_err(|err| {
             ServiceError::from_esql(ravel_sql::esql::EsqlError::Parse(err), text, tenant_hash)
         })?;
+        // `ROW` binds no column, so it needs no declared-column read.
+        let reads_logs = !matches!(parsed.source, ravel_esql::ast::Command::Row(_));
 
         let _permit = self.controls.admit()?;
         let row_cap = usize::try_from(ravel_sql::esql::MAX_LIMIT).unwrap_or(usize::MAX);
@@ -695,11 +697,16 @@ impl QueryService {
         let span = query_span("esql_query", tenant_hash);
         let mut window = None;
         let result = async {
-            let ctx = ravel_sql::esql::PrepareContext {
-                declared: state
+            let declared = if reads_logs {
+                state
                     .executor
                     .resolve_declared_columns(tenant_hash, query.now_ns)
-                    .await,
+                    .await
+            } else {
+                Vec::new()
+            };
+            let ctx = ravel_sql::esql::PrepareContext {
+                declared,
                 now_ns: query.now_ns,
                 start: query.start,
                 end: query.end,
