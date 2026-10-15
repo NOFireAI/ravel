@@ -429,9 +429,12 @@ async fn wait_for_parked(gate: &GateHandle, want: usize) {
 ///   2. The status is exactly 429, not 401. Admission is decided before
 ///      authentication, so an unauthenticated request over the ceiling is
 ///      shed rather than rejected. The shed path does run the credential
-///      check, only to decide whether to drain the body, and with no side
-///      effect: it answers no 401, and for an unauthenticated shed like this
-///      one the body is not read (issue #2926).
+///      check, only to decide whether to drain the body: it answers no 401
+///      and calls neither the unauthorized hook nor the rejected-request
+///      counter, and for an unauthenticated shed like this one the body is
+///      not read (issue #2926). It is not free of every effect: with the
+///      durable bearer resolver an unknown token wakes its rate-limited
+///      `sys/auth` re-read. This test's own request carries no credential.
 ///   3. `ravel_ingest_concurrency_shed_total` reads exactly 1 and
 ///      `ravel_ingest_buffered_items_total` is still 0: the refused request
 ///      was counted by the existing shed counter, and nothing of its body was

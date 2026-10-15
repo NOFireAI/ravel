@@ -795,8 +795,11 @@ pub struct ServerConfig {
     /// `query_concurrency_limit` above, this is never reconciled fleet-wide:
     /// each process sheds independently against its own local bound.
     pub ingest_concurrency_limit: ingest_concurrency::IngestConcurrencyLimit,
-    /// The process-wide ceiling on strict writes enqueued and awaiting their
-    /// durability acknowledgement, from `--max-pending-strict-acks` (default
+    /// The process-wide ceiling on strict writes holding a pending-ack
+    /// permit: a write admitted by the ingest admission layer (OTLP HTTP,
+    /// Remote Write, unary OTLP gRPC) from its request head to its durability
+    /// acknowledgement, any other caller (OTAP, `ravel-cli load`) from its
+    /// submit to the ack. From `--max-pending-strict-acks` (default
     /// 8,192, `0` = unlimited). [`start`] builds one shared
     /// [`ravel_ingest::PendingAckBudget`] from this for the metrics, log, and
     /// span routers, and refuses a value above

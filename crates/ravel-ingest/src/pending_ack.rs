@@ -98,8 +98,11 @@ impl PendingAckBudget {
 /// elapses (the duration is captured at submit and the clock starts at the
 /// first poll of `acks()`), or when the `Submitted` value is dropped. A
 /// `Submitted` that is never polled holds its permit until it is dropped. A
-/// plain RAII guard gives all three, with no explicit release call on any
-/// path.
+/// permit taken before submit and never submitted releases when its holder
+/// drops it: for one ravel-server's admission layer took at the request head,
+/// that is when the last clone of the request's `PendingAckHandle` drops, at
+/// the end of a request that never reached `submit_admitted`. A plain RAII
+/// guard gives every case, with no explicit release call on any path.
 #[derive(Debug)]
 pub struct PendingAckPermit {
     held: Arc<AtomicU64>,

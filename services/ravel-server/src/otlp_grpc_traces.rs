@@ -54,9 +54,8 @@ impl TraceService for GrpcTraceService {
         // one taken here on the direct-call path (issue #2805).
         let pending_ack = crate::ingest_admission::admit_grpc_pending_ack(
             self.state.traces_ingest.router.pending_ack_budget(),
-            self.state.strict_flush_policy,
+            mode,
             &request,
-            &headers,
             &permit,
         )?;
 
