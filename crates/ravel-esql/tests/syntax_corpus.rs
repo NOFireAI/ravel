@@ -1830,6 +1830,17 @@ fn an_in_list_opening_with_the_word_from_prints_parenthesised() {
         1,
         19,
     );
+    // Kept refused rather than told apart by what follows the source: a
+    // subquery may list several sources, so `(FROM a, b | ...)` and a list
+    // `(from, b)` differ only after the comma.
+    assert_unexpected(
+        "ROW x = a IN (from, b)",
+        Some(","),
+        "a source pattern",
+        18,
+        1,
+        19,
+    );
     for (source, printed) in [
         ("ROW x = a IN ((from), b)", "ROW x = a IN ((from), b)"),
         ("ROW x = a IN ((FROM.c + 1))", "ROW x = a IN ((FROM.c + 1))"),

@@ -1759,6 +1759,8 @@ impl<'a> Parser<'a> {
         if self.peek_kind() != Some(&TokenKind::LParen) {
             return Err(self.unexpected("`(`"));
         }
+        // The first word alone decides, as in the lexer: `(from, b)` is
+        // refused, since `(FROM a, b | ...)` only differs after the comma.
         if self.token_is_word(self.peek_at(1), "FROM") {
             return self.in_subquery_rhs(lhs, negated);
         }
