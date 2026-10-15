@@ -2749,9 +2749,11 @@ impl Catalog {
 
                 // ADR-2707 decision 4: this part's key-index leaves, built from
                 // its entries' KEY_IDX sections by ranged GET and PUT before
-                // the part object below, so a failed leaf PUT fails the fold
-                // with no part written. The reads share the fold's bucket
-                // concurrency bound.
+                // the part object below. A failed leaf PUT fails the fold
+                // before this part's PUT and before any HEAD CAS, so no HEAD
+                // references a part without its leaves; parts this fold
+                // already wrote are unreferenced and left to the catalog
+                // sweep. The reads share the fold's bucket concurrency bound.
                 let mut key_index = Vec::new();
                 if let Some(declared) = &key_index_fields {
                     let data_keys: Vec<Result<String, EntryKeyIndex>> = part_entries
