@@ -1466,8 +1466,11 @@ fn build_survivor_values(
             continue;
         }
         let used = d.entries_used_by(surviving);
-        let built =
-            texts_slot(&mut memo.texts, col, &values).build(&values, &used, &mut stats.str_cells_validated)?;
+        let built = texts_slot(&mut memo.texts, col, &values).build(
+            &values,
+            &used,
+            &mut stats.str_cells_validated,
+        )?;
         d.restrict_to(Arc::new(built), surviving);
     }
     Ok(())
@@ -1880,9 +1883,7 @@ fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate
                 needle,
                 negated,
             } => Arm::Contains {
-                col: field_dir
-                    .column(key, FieldType::Str)
-                    .map(|e| e.column_id),
+                col: field_dir.column(key, FieldType::Str).map(|e| e.column_id),
                 others: field_dir
                     .entries()
                     .iter()
@@ -2316,7 +2317,8 @@ fn contains_kernel(
     }
     let mut fallback = |row: usize| -> Result<bool, LogSegError> {
         let raw = refs.get(row).ok_or_else(|| missing_i64(COL_STREAM_REF))?;
-        let r = u32::try_from(raw).map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+        let r =
+            u32::try_from(raw).map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
         if let Some(Some(pass)) = streams.get(r as usize) {
             return Ok(*pass);
         }
@@ -7585,8 +7587,11 @@ mod tests {
             const NEEDLES: [&str; 9] = ["", "a", "ab", "aba", "aa", "zz", "b", "xa", "q"];
 
             fn tilde_to_ff(b: &[u8]) -> Option<Vec<u8>> {
-                b.contains(&b'~')
-                    .then(|| b.iter().map(|&c| if c == b'~' { 0xff } else { c }).collect())
+                b.contains(&b'~').then(|| {
+                    b.iter()
+                        .map(|&c| if c == b'~' { 0xff } else { c })
+                        .collect()
+                })
             }
 
             fn build_raw(cfg: RlogConfig, recs: Vec<LogRecord>) -> Vec<u8> {
@@ -7867,11 +7872,9 @@ mod tests {
                     })
                     .collect();
                 let mut seen_invalid = false;
-                for (mode, group_target_blocks, want) in [
-                    (1, 1, Enc::Plain),
-                    (0, 1, Enc::Dict),
-                    (0, 3, Enc::DictPage),
-                ] {
+                for (mode, group_target_blocks, want) in
+                    [(1, 1, Enc::Plain), (0, 1, Enc::Dict), (0, 3, Enc::DictPage)]
+                {
                     let (mut recs, columns) = c_corpus(&rows, mode);
                     if mode == 0 {
                         // Repeat the pool so every block holds a dictionary.
@@ -7901,7 +7904,10 @@ mod tests {
                     while scan.next_block_columnar(&obj).expect("decode").is_some() {
                         let block = scan.current.as_ref().expect("decoded");
                         for r in 0..block.record_count() {
-                            if block.str_at(col, r).is_some_and(|b| std::str::from_utf8(b).is_err()) {
+                            if block
+                                .str_at(col, r)
+                                .is_some_and(|b| std::str::from_utf8(b).is_err())
+                            {
                                 seen_invalid = true;
                             }
                         }
@@ -7936,7 +7942,11 @@ mod tests {
             /// A value, made unique per row when `unique` so it lands on a
             /// plain page; the suffix keeps the value's validity.
             fn val(v: &str, unique: bool, i: i64) -> String {
-                if unique { format!("{v}{i}") } else { v.to_string() }
+                if unique {
+                    format!("{v}{i}")
+                } else {
+                    v.to_string()
+                }
             }
 
             /// A byte match inside an invalid UTF-8 cell is not a hit: the
@@ -8032,7 +8042,11 @@ mod tests {
                 });
                 for (obj, cfg, enc) in objects {
                     let kept = kept_ts(&obj, &cfg, &contains("s", "", false));
-                    assert_eq!(kept, vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15], "{enc:?}");
+                    assert_eq!(
+                        kept,
+                        vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15],
+                        "{enc:?}"
+                    );
                     let kept = kept_ts(&obj, &cfg, &contains("s", "", true));
                     assert_eq!(kept, Vec::<i64>::new(), "{enc:?}");
                 }
@@ -8063,7 +8077,10 @@ mod tests {
                 assert!(reader.field_dir.column("s", FieldType::I64).is_some());
                 assert!(reader.field_dir.column("zz", FieldType::Str).is_none());
                 assert_eq!(kept_ts(&obj, &cfg, &contains("s", "ab", false)), vec![1, 5]);
-                assert_eq!(kept_ts(&obj, &cfg, &contains("zz", "ab", false)), vec![2, 6]);
+                assert_eq!(
+                    kept_ts(&obj, &cfg, &contains("zz", "ab", false)),
+                    vec![2, 6]
+                );
             }
 
             /// One row group of four blocks whose `s` chunk is a row group
@@ -8115,7 +8132,11 @@ mod tests {
                 assert_eq!(reader.page_dir.groups.len(), 1, "one row group");
                 let none = Predicate::And(Vec::new());
                 let all = ColumnSelection::all();
-                let fresh = s_cells(reader.scan_blocks(&none, &[], &all).expect("scan"), &obj, col);
+                let fresh = s_cells(
+                    reader.scan_blocks(&none, &[], &all).expect("scan"),
+                    &obj,
+                    col,
+                );
                 assert_eq!(fresh.iter().flatten().count(), 24);
 
                 let mut with_arm = reader
@@ -8164,7 +8185,10 @@ mod tests {
                 ]));
                 assert_eq!(rows, 12);
                 assert_eq!(stats.contains_cells_tested, 6 + 24, "N + M");
-                assert_eq!(stats.str_cells_validated, 3, "the K entries survivors reference");
+                assert_eq!(
+                    stats.str_cells_validated, 3,
+                    "the K entries survivors reference"
+                );
 
                 let (rows, stats) = run(Predicate::And(Vec::new()));
                 assert_eq!(rows, 24);

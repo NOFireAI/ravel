@@ -1008,7 +1008,9 @@ impl<T> ColMap<T> {
     }
 
     fn get_mut(&mut self, column_id: u32) -> Option<&mut T> {
-        self.cols.get_mut(column_id as usize).and_then(Option::as_mut)
+        self.cols
+            .get_mut(column_id as usize)
+            .and_then(Option::as_mut)
     }
 
     fn insert(&mut self, column_id: u32, value: T) {

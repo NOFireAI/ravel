@@ -97,6 +97,10 @@ pub struct ObjectIdentity {
     pub writer_seq: u64,
 }
 
+/// A test-only rewrite of one string cell; `None` keeps the cell.
+#[cfg(test)]
+type StrCellRewrite = fn(&[u8]) -> Option<Vec<u8>>;
+
 /// Buffers records and emits one RLOG object.
 pub struct RlogWriter {
     cfg: RlogConfig,
@@ -117,7 +121,7 @@ pub struct RlogWriter {
     unchecked_stream_attrs: bool,
     /// Set by [`RlogWriter::with_str_cell_rewrite`].
     #[cfg(test)]
-    str_cell_rewrite: Option<fn(&[u8]) -> Option<Vec<u8>>>,
+    str_cell_rewrite: Option<StrCellRewrite>,
 }
 
 /// Which string columns BLOOM covers (ADR-2135 decision 5). A column outside
@@ -235,7 +239,7 @@ impl RlogWriter {
     /// row-major path through `f` (a `None` keeps the cell), so a test can
     /// store string cells a `LogRecord` cannot carry, such as invalid UTF-8.
     #[cfg(test)]
-    pub(crate) fn with_str_cell_rewrite(mut self, f: fn(&[u8]) -> Option<Vec<u8>>) -> Self {
+    pub(crate) fn with_str_cell_rewrite(mut self, f: StrCellRewrite) -> Self {
         self.str_cell_rewrite = Some(f);
         self
     }
