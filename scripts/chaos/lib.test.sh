@@ -168,12 +168,51 @@ check "orphan gauges" "7/7" \
 # stubbed curl that serves the sample.
 # ---------------------------------------------------------------------------
 
+# Scenario 2's symmetric trigger scrapes two URLs (worker A's and worker B's)
+# per round; serve-metrics-ab picks a body by a "stub-a"/"stub-b" substring
+# in the last argument (the scraped URL) so A and B can answer differently.
+# wait_for_compaction_in_flight_any reads each round's body via
+# body="$(curl ...)" -- a command substitution, which forks a subshell per
+# call. A round index kept in a shell variable would be reset on every call
+# instead of advancing, since the mutation never survives past that subshell.
+# The index is kept in a file under SCRATCH instead, which both persists
+# across the subshell boundary and lets the two workers' sequences step
+# independently. ab_body takes a fixed "a"/"b" selector rather than an array
+# name passed through a `local -n` nameref: nameref requires bash 4.3, which
+# macOS's bash 3.2 does not have, and this file otherwise only needs 3.2.
+AB_INFLIGHT_A=(0); AB_UNITS_A=(0)
+AB_INFLIGHT_B=(0); AB_UNITS_B=(0)
+AB_IDX_FILE_A="${SCRATCH}/ab-idx-a"
+AB_IDX_FILE_B="${SCRATCH}/ab-idx-b"
+ab_body() { # which(a|b) idx_file
+  local which="$1" idx_file="$2"
+  local i infl units len
+  i="$(cat "${idx_file}" 2>/dev/null)"
+  [[ "${i}" =~ ^[0-9]+$ ]] || i=0
+  if [[ "${which}" == "a" ]]; then
+    infl="${AB_INFLIGHT_A[i]}"; units="${AB_UNITS_A[i]}"; len="${#AB_INFLIGHT_A[@]}"
+  else
+    infl="${AB_INFLIGHT_B[i]}"; units="${AB_UNITS_B[i]}"; len="${#AB_INFLIGHT_B[@]}"
+  fi
+  printf '# TYPE ravel_maintain_compactions_in_flight gauge\nravel_maintain_compactions_in_flight{mode="maintain"} %s\n# TYPE ravel_maintain_units_owned gauge\nravel_maintain_units_owned{mode="maintain"} %s\n' \
+    "${infl}" "${units}"
+  if (( i < len - 1 )); then
+    printf '%s' "$(( i + 1 ))" >"${idx_file}"
+  fi
+}
+
 CURL_MODE="serve-metrics"
 CURL_ARGS_FILE="${SCRATCH}/curl-args"
 curl() {
   printf '%s\n' "$@" >"${CURL_ARGS_FILE}"
   case "${CURL_MODE}" in
     serve-metrics) printf '%s\n' "${METRICS_SAMPLE}" ;;
+    serve-metrics-ab)
+      case "${@: -1}" in
+        *stub-a*) ab_body a "${AB_IDX_FILE_A}" ;;
+        *stub-b*) ab_body b "${AB_IDX_FILE_B}" ;;
+      esac
+      ;;
     unreachable) return 7 ;;
     slow-metrics) sleep 2; printf '%s\n' "${METRICS_SAMPLE}" ;;
     metrics-file) cat "${METRICS_FILE}" ;;
@@ -264,7 +303,7 @@ first_kill_line="$(scenario1_line 'sigkill_pid "$SERVER_PID"')"
 # Between the detecting poll and the kill: nothing but comments, blank lines
 # and the flag or epoch the branch records.
 only_bookkeeping_between() { # file from to
-  awk -v a="$2" -v b="$3" 'NR > a && NR < b && $0 !~ /^[[:space:]]*(#.*)?$/ && $0 !~ /^[[:space:]]*(FLUSH_OBSERVED=1|KILL_EPOCH="\$\(date \+%s\)")[[:space:]]*$/ { n++ } END { print n + 0 }' "$1"
+  awk -v a="$2" -v b="$3" 'NR > a && NR < b && $0 !~ /^[[:space:]]*(#.*)?$/ && $0 !~ /^[[:space:]]*(FLUSH_OBSERVED=1|KILL_EPOCH="\$\(date \+%s\)"|VICTIM_PID_VAR="WORKER_\$\{CHAOS_VICTIM\^\^\}_PID")[[:space:]]*$/ { n++ } END { print n + 0 }' "$1"
 }
 check "scenario 1 sends the SIGKILL with nothing but bookkeeping after the detecting poll" "0" \
   "$([[ -n "${detect_line}" && "${first_kill_line:-0}" -gt "${detect_line}" ]] && only_bookkeeping_between "${CHAOS_DIR}/kill-ingest-flush.sh" "${detect_line}" "${first_kill_line}" || echo missing)"
@@ -533,29 +572,82 @@ AWS_MODE=absent records "${BUCKET_Y}" >/dev/null
 check "records: the LIST is of <bucket>l1. in the chaos bucket" "yes" \
   "$(grep -qxF -- "${BUCKET_Y}l1." "${AWS_ARGS_FILE}" && grep -qxF -- "${RAVEL_S3_BUCKET}" "${AWS_ARGS_FILE}" && grep -qxF list-objects-v2 "${AWS_ARGS_FILE}" && echo yes || echo no)"
 
-# The scenario-2 trigger reads ravel_maintain_compactions_in_flight, as
-# render_maintain_ownership_family renders it.
-inflight_body() {
-  printf '%s\n# TYPE ravel_maintain_compactions_in_flight gauge\nravel_maintain_compactions_in_flight{mode="maintain"} %s\n' \
-    "${METRICS_SAMPLE}" "$1"
+# The scenario-2 trigger scrapes BOTH workers each round and SIGKILLs
+# whichever first reads ravel_maintain_compactions_in_flight>=1
+# (wait_for_compaction_in_flight_any): a trigger that only ever watched one
+# worker would kill it having never compacted, on a night where the other
+# worker owned all the data-bearing units (nightly run 38674293885, issue
+# #2666). ab_reset loads a sequence per worker; wait_for_compaction_in_flight_any
+# steps one entry per scrape, holding the last entry once a sequence runs out.
+ab_reset() { # infl_a units_a infl_b units_b -- each a space-separated sequence
+  read -r -a AB_INFLIGHT_A <<<"$1"
+  read -r -a AB_UNITS_A <<<"$2"
+  read -r -a AB_INFLIGHT_B <<<"$3"
+  read -r -a AB_UNITS_B <<<"$4"
+  printf '0' >"${AB_IDX_FILE_A}"
+  printf '0' >"${AB_IDX_FILE_B}"
 }
-inflight_wait() { METRICS_SAMPLE="$1" rc_of wait_for_compaction_in_flight http://stub 1; }
-check "in-flight trigger fires on the gauge at 1" "0" "$(inflight_wait "$(inflight_body 1)")"
-check "in-flight trigger does not fire on the gauge at 0" "1" "$(inflight_wait "$(inflight_body 0)")"
-check "in-flight trigger scrapes once before it reads a deadline already past" "0" \
-  "$(METRICS_SAMPLE="$(inflight_body 1)" rc_of wait_for_compaction_in_flight http://stub 0)"
-check "in-flight trigger does not fire with the gauge absent" "1" "$(inflight_wait "${METRICS_SAMPLE}")"
-check "in-flight trigger does not fire on an unreachable worker" "1" \
-  "$(CURL_MODE=unreachable rc_of wait_for_compaction_in_flight http://stub 1)"
-inflight_polls() {
-  CHAOS_COMPACTION_POLL_SECONDS=0.1 METRICS_SAMPLE="$(inflight_body 0)" \
-    wait_for_compaction_in_flight http://stub 2 >/dev/null 2>&1
-  echo "${CHAOS_COMPACTION_POLLS}"
-}
-check "in-flight trigger scrapes more than once a second at the poll interval" "yes" \
-  "$([[ "$(inflight_polls)" -gt 4 ]] && echo yes || echo no)"
-check "in-flight trigger records the units owned it read" "4" \
-  "$(METRICS_SAMPLE="$(inflight_body 1)" wait_for_compaction_in_flight http://stub 1 >/dev/null 2>&1; echo "${CHAOS_A_MAX_UNITS_OWNED}")"
+ab_run() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 wait_for_compaction_in_flight_any http://stub-a http://stub-b "$1" >/dev/null 2>&1; }
+ab_wait() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 rc_of wait_for_compaction_in_flight_any http://stub-a http://stub-b "$1"; }
+
+check "symmetric trigger: A fires first returns 0" "0" \
+  "$(ab_reset "1" "2" "0" "3"; ab_wait 1)"
+check "symmetric trigger: A fires first picks victim a" "a" \
+  "$(ab_reset "1" "2" "0" "3"; ab_run 1; echo "${CHAOS_VICTIM}")"
+check "symmetric trigger: B fires on a later round while A stays at 0 picks victim b (the 10-15 night)" "b" \
+  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_run 2; echo "${CHAOS_VICTIM}")"
+check "symmetric trigger: B fires on a later round while A stays at 0 returns 0" "0" \
+  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_wait 2)"
+check "symmetric trigger: neither fires within budget returns nonzero" "1" \
+  "$(ab_reset "0" "1" "0" "4"; ab_wait 0)"
+check "symmetric trigger: neither fires within budget leaves victim at the budget-fallback a" "a" \
+  "$(ab_reset "0" "1" "0" "4"; ab_run 0; echo "${CHAOS_VICTIM}")"
+check "symmetric trigger: does not fire on an unreachable pair" "1" \
+  "$(CURL_MODE=unreachable rc_of wait_for_compaction_in_flight_any http://stub-a http://stub-b 0)"
+check "symmetric trigger: per-worker peak units_owned is kept separately for A" "2" \
+  "$(ab_reset "0 1" "2 2" "0 0" "5 5"; ab_run 2; echo "${CHAOS_A_MAX_UNITS_OWNED}")"
+check "symmetric trigger: per-worker peak units_owned is kept separately for B" "5" \
+  "$(ab_reset "0 1" "2 2" "0 0" "5 5"; ab_run 2; echo "${CHAOS_B_MAX_UNITS_OWNED}")"
+check "symmetric trigger: total scrape count sums both workers' polls" "yes" \
+  "$(ab_reset "0 0" "1 1" "0 0" "1 1"; ab_run 0; [[ "${CHAOS_COMPACTION_POLLS}" -ge 2 ]] && echo yes || echo no)"
+
+# DISTINGUISHING(a): a helper that only ever scrapes worker A (dropping the
+# second curl/metric read for worker B inside wait_for_compaction_in_flight_any)
+# would never see B's gauge fire, so this exact case -- B firing on a later
+# round while A stays at 0 -- would time out and leave CHAOS_VICTIM at its
+# "a" fallback instead of "b". Pinned again here under the mutant's name for
+# traceability; it is the same assertion as the "10-15 night" case above.
+check "DISTINGUISHING(a) scrape-only-A would report victim a here; the real victim is b" "b" \
+  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_run 2; echo "${CHAOS_VICTIM}")"
+
+# assert_takeover_observable_or_unmeasured: the two takeover oracles
+# (sibling-takeover-within-3H-plus-tick, no-orphaned-lease) only discriminate
+# when the survivor did not already own the expected total before the kill
+# (scenario 2's other bug: a 4-unit EXPECTED_TOTAL_UNITS default against a
+# survivor that already owned 6 of the tenant's 12 units pre-kill made both
+# oracles pass vacuously).
+check "takeover precondition: survivor peak below the expected total is observable" "0" \
+  "$(rc_of assert_takeover_observable_or_unmeasured 6 12)"
+check "takeover precondition: survivor peak equal to the expected total is could-not-measure" "${CHAOS_UNMEASURED_EXIT}" \
+  "$(rc_of assert_takeover_observable_or_unmeasured 12 12)"
+check "takeover precondition: survivor peak above the expected total is could-not-measure" "${CHAOS_UNMEASURED_EXIT}" \
+  "$(rc_of assert_takeover_observable_or_unmeasured 13 12)"
+check "takeover precondition records both takeover oracles as unmeasured, never as a pass" "yes" \
+  "$(ORACLE_UNMEASURED=(); assert_takeover_observable_or_unmeasured 12 12 >/dev/null 2>&1 || true
+     [[ "${#ORACLE_UNMEASURED[@]}" -eq 2 && \
+        "${ORACLE_UNMEASURED[0]}" == sibling-takeover-within-3H-plus-tick:* && \
+        "${ORACLE_UNMEASURED[1]}" == no-orphaned-lease:* ]] && echo yes || echo no)"
+# DISTINGUISHING(c), part 1: the real call site in kill-maintain-worker.sh
+# must pass the derived $EXPECTED_TOTAL_UNITS to this precondition, not a
+# literal: a script that substituted a bare 4 back in (scenario 2's old
+# default) would call a survivor peak of 6 could-not-measure, since 6 >= 4,
+# even though the real derived total is 12 and 6 is genuinely below it. The
+# library-level check above (line 629) cannot tell a call site passing a
+# derived variable from one passing a literal that happens to equal it, so
+# this is checked against the script's own source text instead.
+takeover_call_text="$(grep -F 'assert_takeover_observable_or_unmeasured "$SURVIVOR_PEAK_UNITS_OWNED"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "DISTINGUISHING(c) the takeover precondition call site passes \$EXPECTED_TOTAL_UNITS, not a literal" "yes" \
+  "$([[ "${takeover_call_text}" == *'"$EXPECTED_TOTAL_UNITS"'* ]] && echo yes || echo no)"
 
 # Args: A's log, B's log, aborts baseline, CHAOS_KILL_ON_GAUGE. B's line
 # count at the kill is 1, and the wait is 0 (one read). The store LIST reads
@@ -726,19 +818,77 @@ check "scenario 2 goes on after a partly rejected load and stops only below the 
 
 scenario2_body="$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")"
 universe_line="$(scenario2_line 'assert_single_tenant_universe || true')"
-inflight_wait_line="$(scenario2_line 'if wait_for_compaction_in_flight')"
-first_a_kill_line="$(scenario2_line 'sigkill_pid "$WORKER_A_PID"')"
+inflight_wait_line="$(scenario2_line 'if wait_for_compaction_in_flight_any')"
+first_kill_line="$(grep -n -F 'sigkill_pid "${!VICTIM_PID_VAR}"' "${CHAOS_DIR}/kill-maintain-worker.sh" | head -1 | cut -d: -f1)"
 check "scenario 2 checks the universe before the wait, and kills right after it" "yes" \
-  "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_a_kill_line:-0}" -gt "${inflight_wait_line:-0}" && "$(only_bookkeeping_between "${CHAOS_DIR}/kill-maintain-worker.sh" "${inflight_wait_line}" "${first_a_kill_line}")" == 0 ]] && echo yes || echo no)"
-b_count_line="$(scenario2_line 'B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"')"
-last_a_kill_line="$(grep -n -F 'sigkill_pid "$WORKER_A_PID"' "${CHAOS_DIR}/kill-maintain-worker.sh" | tail -1 | cut -d: -f1)"
-cons_call_line="$(scenario2_line '"$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true')"
-check "scenario 2 counts B's log after the last kill and passes it to the conservation oracle" "yes" \
-  "$([[ -n "${b_count_line}" && -n "${cons_call_line}" && "${b_count_line}" -gt "${last_a_kill_line:-999999}" && "${b_count_line}" -lt "${cons_call_line}" ]] && echo yes || echo no)"
+  "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_kill_line:-0}" -gt "${inflight_wait_line:-0}" && "$(only_bookkeeping_between "${CHAOS_DIR}/kill-maintain-worker.sh" "${inflight_wait_line}" "${first_kill_line}")" == 0 ]] && echo yes || echo no)"
+survivor_count_line="$(scenario2_line 'SURVIVOR_LOG_LINES_AT_KILL="$(chaos_line_count "$SURVIVOR_LOG")"')"
+last_kill_line="$(grep -n -F 'sigkill_pid "${!VICTIM_PID_VAR}"' "${CHAOS_DIR}/kill-maintain-worker.sh" | tail -1 | cut -d: -f1)"
+cons_call_line="$(scenario2_line '"$SURVIVOR_URL" "$CONS_BASELINE" "$SURVIVOR_LOG" "$SURVIVOR_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true')"
+check "scenario 2 counts the survivor's log after the last kill and passes it to the conservation oracle" "yes" \
+  "$([[ -n "${survivor_count_line}" && -n "${cons_call_line}" && "${survivor_count_line}" -gt "${last_kill_line:-999999}" && "${survivor_count_line}" -lt "${cons_call_line}" ]] && echo yes || echo no)"
 check "scenario 2 headers make no 'provably' claim" "no" \
   "$([[ "${scenario2_body}" == *provabl* ]] && echo yes || echo no)"
-check "scenario 2 triggers on the gauge, not on worker A's log" "yes" \
-  "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
+check "scenario 2 triggers on either worker's gauge, not on a fixed worker A" "yes" \
+  "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight_any "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
+
+# DISTINGUISHING(b): a script that picks victim b (CHAOS_VICTIM=b) but still
+# hands the takeover and leak oracles worker B's URL/log, unconditionally,
+# instead of the survivor's -- here, worker A's -- would call
+# oracle_sibling_takeover_within_bound/oracle_no_orphaned_lease/
+# oracle_no_partial_output_leak with "$WORKER_B_URL" hardcoded in place of
+# "$SURVIVOR_URL". Every flipped line contains "$WORKER_B_URL" literally,
+# which a correct caller never does: it always reads $SURVIVOR_URL, which is
+# worker A's URL when B is the victim.
+sibling_call_text="$(grep -F 'oracle_sibling_takeover_within_bound' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+orphan_call_text="$(grep -F 'oracle_no_orphaned_lease' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+leak_call_text="$(grep -F 'oracle_no_partial_output_leak' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "DISTINGUISHING(b) the takeover and leak oracles read \$SURVIVOR_URL, never a hardcoded \$WORKER_A_URL/\$WORKER_B_URL" "yes" \
+  "$([[ "${sibling_call_text}" == *'"$SURVIVOR_URL"'* && "${orphan_call_text}" == *'"$SURVIVOR_URL"'* && "${leak_call_text}" == *'"$SURVIVOR_URL"'* \
+     && "${sibling_call_text}" != *'WORKER_A_URL'* && "${sibling_call_text}" != *'WORKER_B_URL'* \
+     && "${orphan_call_text}" != *'WORKER_A_URL'* && "${orphan_call_text}" != *'WORKER_B_URL'* \
+     && "${leak_call_text}" != *'WORKER_A_URL'* && "${leak_call_text}" != *'WORKER_B_URL'* ]] && echo yes || echo no)"
+
+# chaos_select_survivor: the victim-to-survivor mapping DISTINGUISHING(b)
+# above only pins at the text level (the oracle calls read $SURVIVOR_URL, not
+# a hardcoded worker). This covers the mapping itself behaviourally: for each
+# victim letter, every SURVIVOR_*/VICTIM_* output and baseline must come from
+# the OTHER worker (and the victim's own label/log for the VICTIM_* outputs),
+# and the victim's own PID global must be cleared to "" while the survivor's
+# is left untouched.
+select_survivor_case() { # victim(a|b)
+  WORKER_A_LOG="log-a"; WORKER_B_LOG="log-b"
+  WORKER_A_URL="http://a"; WORKER_B_URL="http://b"
+  CHAOS_A_MAX_UNITS_OWNED=3; CHAOS_B_MAX_UNITS_OWNED=9
+  CONS_BASELINE_A=1; CONS_BASELINE_B=2
+  BREAKER_BASELINE_A=5; BREAKER_BASELINE_B=6
+  WORKER_A_PID=111; WORKER_B_PID=222
+  chaos_select_survivor "$1"
+  printf 'VICTIM_LABEL=%s VICTIM_LOG=%s SURVIVOR_LABEL=%s SURVIVOR_URL=%s SURVIVOR_LOG=%s SURVIVOR_PEAK_UNITS_OWNED=%s CONS_BASELINE=%s BREAKER_BASELINE=%s WORKER_A_PID=%s WORKER_B_PID=%s' \
+    "${VICTIM_LABEL}" "${VICTIM_LOG}" "${SURVIVOR_LABEL}" "${SURVIVOR_URL}" "${SURVIVOR_LOG}" \
+    "${SURVIVOR_PEAK_UNITS_OWNED}" "${CONS_BASELINE}" "${BREAKER_BASELINE}" "${WORKER_A_PID}" "${WORKER_B_PID}"
+}
+check "chaos_select_survivor a: survivor is worker-b with B's URL/log/peak/baselines, A's pid cleared" \
+  "VICTIM_LABEL=worker-a VICTIM_LOG=log-a SURVIVOR_LABEL=worker-b SURVIVOR_URL=http://b SURVIVOR_LOG=log-b SURVIVOR_PEAK_UNITS_OWNED=9 CONS_BASELINE=2 BREAKER_BASELINE=6 WORKER_A_PID= WORKER_B_PID=222" \
+  "$(select_survivor_case a)"
+check "chaos_select_survivor b: survivor is worker-a with A's URL/log/peak/baselines, B's pid cleared" \
+  "VICTIM_LABEL=worker-b VICTIM_LOG=log-b SURVIVOR_LABEL=worker-a SURVIVOR_URL=http://a SURVIVOR_LOG=log-a SURVIVOR_PEAK_UNITS_OWNED=3 CONS_BASELINE=1 BREAKER_BASELINE=5 WORKER_A_PID=111 WORKER_B_PID=" \
+  "$(select_survivor_case b)"
+
+# DISTINGUISHING(c), part 2: a script that substitutes a bare literal 4 back
+# in for the derived signals x shards total, or for CHAOS_SHARD_COUNT in the
+# custody oracle call, reintroduces the vacuous-pass bug this task fixes
+# (deliverable 2). The flipped lines are EXPECTED_TOTAL_UNITS's default
+# falling back to "${CHAOS_EXPECTED_TOTAL_UNITS:-4}" instead of the
+# signals*shards product, and
+# oracle_custody_and_catalog_verify_clean's second argument reading a bare
+# " 4 " instead of "$CHAOS_SHARD_COUNT".
+expected_units_line="$(grep -F 'EXPECTED_TOTAL_UNITS="${CHAOS_EXPECTED_TOTAL_UNITS:-' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+custody_call_text="$(grep -F 'oracle_custody_and_catalog_verify_clean' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "DISTINGUISHING(c) EXPECTED_TOTAL_UNITS derives from signals x shards, not a literal 4" "yes" \
+  "$([[ "${expected_units_line}" == *'CHAOS_MAINTAINED_SIGNALS * CHAOS_SHARD_COUNT'* && "${expected_units_line}" != *':-4}'* ]] && echo yes || echo no)"
+check "DISTINGUISHING(c) the custody oracle gets \$CHAOS_SHARD_COUNT, not a literal 4" "yes" \
+  "$([[ "${custody_call_text}" == *'"$CHAOS_SHARD_COUNT"'* && "${custody_call_text}" != *' 4 '* ]] && echo yes || echo no)"
 
 # The conservation oracle waits, from the kill, until the bound or a survivor
 # publish of A's interrupted bucket that lands after the kill line, then

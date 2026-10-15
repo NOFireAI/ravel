@@ -22,30 +22,37 @@
 # ordinary failure, and from >2 setup/usage errors) so the distinction is
 # legible to the ADR-0077 section 3 rehearsal record.
 #
-# MID-COMPACTION TRIGGER (named explicitly): worker A's
-# ravel_maintain_compactions_in_flight gauge. The SIGKILL fires on the first
-# scrape that reads it >= 1: a bucket merge has started (gates passed, the
-# claim held where the run takes one, commit records read) and has not yet
-# published, failed, or been abandoned.
-# A is scraped every CHAOS_COMPACTION_POLL_SECONDS (0.05 s) plus the scrape
-# itself; the run logs the scrapes it made and the seconds it waited. If the
-# gauge never reads >= 1 within the window the kill still happens, with a
-# warning, and CHAOS_KILL_ON_GAUGE is 0.
+# MID-COMPACTION TRIGGER (named explicitly): the victim is whichever of the
+# two workers FIRST reads >= 1 on its own
+# ravel_maintain_compactions_in_flight gauge; both are scraped every round.
+# The SIGKILL fires on that first scrape: a bucket merge has started (gates
+# passed, the claim held where the run takes one, commit records read) and
+# has not yet published, failed, or been abandoned. Which worker turns out to
+# be the victim depends on the rendezvous-hash ownership split for the run,
+# not on a fixed A-vs-B assignment: a prior failure mode fixed the wait to
+# worker A only, so on a night where A owned no data-bearing units it still
+# killed A through the budget fallback below but never exercised a kill
+# during an actual compaction.
+# Each worker is scraped every CHAOS_COMPACTION_POLL_SECONDS (0.05 s) plus the
+# scrape itself; the run logs the scrapes it made and the seconds it waited.
+# If neither gauge ever reads >= 1 within the window the kill still happens
+# against worker A (the budget-fallback default), with a warning, and
+# CHAOS_KILL_ON_GAUGE is 0.
 #
-# CONSERVATION: after the kill, A's log names every bucket it was merging:
-# each "compaction merge started" line with no "compaction merge ended" line
-# for the same bucket. A runs several units at once, so more than one can be
-# open. The oracle waits up to chaos_conservation_wait_seconds from the kill
-# (the takeover bound, one more tick, and
-# CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS; 1080 s at the defaults), ending
-# the wait early once the survivor has logged a publish for every open
-# bucket, then lists `<bucket>l1.` in the store for each: a compaction record
-# there counts, whichever worker wrote it. With the gauge seen and the
-# buckets known, any open bucket with no record by then is a FAIL. Without
-# the gauge or an open bucket, or with a LIST that fails while every listed
-# bucket has a record, the run could not measure conservation. It also logs
-# the merge durations it can pair from both workers' logs and, per open
-# bucket, whether the survivor started and published it.
+# CONSERVATION: after the kill, the victim's log names every bucket it was
+# merging: each "compaction merge started" line with no "compaction merge
+# ended" line for the same bucket. A worker runs several units at once, so
+# more than one can be open. The oracle waits up to
+# chaos_conservation_wait_seconds from the kill (the takeover bound, one more
+# tick, and CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS; 1080 s at the
+# defaults), ending the wait early once the survivor has logged a publish for
+# every open bucket, then lists `<bucket>l1.` in the store for each: a
+# compaction record there counts, whichever worker wrote it. With the gauge
+# seen and the buckets known, any open bucket with no record by then is a
+# FAIL. Without the gauge or an open bucket, or with a LIST that fails while
+# every listed bucket has a record, the run could not measure conservation.
+# It also logs the merge durations it can pair from both workers' logs and,
+# per open bucket, whether the survivor started and published it.
 #
 # SEAL WAIT: an ingest hour is compactable once the compactor's seal margin
 # has passed the end of the hour (CompactorConfig::seal_margin_ns, 3900 s at
@@ -64,12 +71,18 @@
 # Exit status: 0 when every pinned oracle assertion held; 2 when any failed
 # (release-blocking); 3 on a setup error, when the server log carries no
 # parseable `seal_margin_secs=`, or when conservation could not be measured
-# and no other assertion failed. Could-not-measure means the survivor's
-# conservation-abort counter did not rise and either the kill did not fire on
-# the gauge, worker A's log at the kill names no interrupted bucket, or a
-# store LIST of an interrupted bucket's compaction records failed while every
-# bucket it could list had a record (oracle_conservation_or_unmeasured in
-# lib.sh). It also exits 3 before the kill when fewer than
+# and no other assertion failed. Could-not-measure also covers the takeover
+# oracles: if the survivor's peak units_owned during the wait was already at
+# or above EXPECTED_TOTAL_UNITS, a real takeover cannot be distinguished from
+# ownership the survivor already held, so both takeover assertions are
+# recorded unmeasured rather than passed vacuously
+# (assert_takeover_observable_or_unmeasured in lib.sh). For conservation,
+# could-not-measure means the survivor's conservation-abort counter did not
+# rise and either the kill did not fire on the gauge, the victim's log at the
+# kill names no interrupted bucket, or a store LIST of an interrupted
+# bucket's compaction records failed while every bucket it could list had a
+# record (oracle_conservation_or_unmeasured in lib.sh). It also exits 3
+# before the kill when fewer than
 # CHAOS_MAINTAIN_MIN_EXPORTS exports of the load were accepted; 64 on a usage
 # error.
 #
@@ -91,12 +104,14 @@ cd "$ROOT_DIR"
 # shellcheck source=scripts/chaos/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
-# Two maintain workers expose metrics on separate addresses. Worker A is the
-# one we SIGKILL; worker B is the survivor whose takeover we assert.
+# Two maintain workers expose metrics on separate addresses. Whichever one is
+# first observed mid-compaction (wait_for_compaction_in_flight_any, below) is
+# the victim we SIGKILL; the other is the survivor whose takeover we assert.
 WORKER_A_HTTP="${CHAOS_WORKER_A_HTTP:-127.0.0.1:14328}"
 WORKER_A_GRPC="${CHAOS_WORKER_A_GRPC:-127.0.0.1:14327}"
 WORKER_B_HTTP="${CHAOS_WORKER_B_HTTP:-127.0.0.1:14338}"
 WORKER_B_GRPC="${CHAOS_WORKER_B_GRPC:-127.0.0.1:14337}"
+WORKER_A_URL="http://${WORKER_A_HTTP}"
 WORKER_B_URL="http://${WORKER_B_HTTP}"
 
 # An ingest server drives the load that creates compactable buckets before the
@@ -111,9 +126,15 @@ INGEST_GRPC="${CHAOS_INGEST_GRPC:-127.0.0.1:14317}"
 EXPORT_COUNT="${CHAOS_MAINTAIN_EXPORT_COUNT}"
 
 # Total ownable units across the world under test; the survivor must own all
-# of them after takeover. Sized by the load the setup drives (tenants x
-# signals x shards). Overridable so the orchestrator can match its fixture.
-EXPECTED_TOTAL_UNITS="${CHAOS_EXPECTED_TOTAL_UNITS:-4}"
+# of them after takeover. A unit is one (signal, shard) pair for the chaos
+# tenant: MAINTAINED_SIGNALS in services/ravel-server/src/maintain.rs lists 3
+# signals (Metrics, Logs, Spans) today, crossed with CHAOS_SHARD_COUNT shards,
+# giving 12 -- not all data-bearing, since only Metrics carries load, but all
+# ownable and so all subject to takeover. CHAOS_EXPECTED_TOTAL_UNITS
+# overrides the derived total so the orchestrator can match its fixture.
+CHAOS_MAINTAINED_SIGNALS="${CHAOS_MAINTAINED_SIGNALS:-3}"
+CHAOS_SHARD_COUNT="${CHAOS_SHARD_COUNT:-4}"
+EXPECTED_TOTAL_UNITS="${CHAOS_EXPECTED_TOTAL_UNITS:-$(( CHAOS_MAINTAINED_SIGNALS * CHAOS_SHARD_COUNT ))}"
 
 usage() {
   cat <<'EOF'
@@ -149,11 +170,12 @@ if [[ "$MODE" == "check" ]]; then
   echo "== kill-maintain-worker.sh --check (scenario 2: kill maintain worker mid-compaction) =="
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
-  echo "mid-compaction trigger: worker A ravel_maintain_compactions_in_flight>=1, scraped every ${CHAOS_COMPACTION_POLL_SECONDS}s plus the scrape"
-  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance, ended early by a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'), then a store LIST of <bucket>l1. for a compaction record of every bucket an unended '${CHAOS_COMPACTION_START_MARKER}' in worker A's log names"
+  echo "mid-compaction trigger: whichever worker first reads ravel_maintain_compactions_in_flight>=1 is the victim, both scraped every ${CHAOS_COMPACTION_POLL_SECONDS}s plus the scrape"
+  echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance, ended early by a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'), then a store LIST of <bucket>l1. for a compaction record of every bucket an unended '${CHAOS_COMPACTION_START_MARKER}' in the victim's log names"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
   echo "load: ${EXPORT_COUNT} exports of ${CHAOS_MAINTAIN_FIXTURE_SERIES} series x ${CHAOS_MAINTAIN_FIXTURE_POINTS} points, at most one per ${CHAOS_MAINTAIN_EXPORT_INTERVAL_SECONDS}s, stopped at ${CHAOS_MAINTAIN_LOAD_MAX_SECONDS}s, at least ${CHAOS_MAINTAIN_MIN_EXPORTS} accepted to go on"
   echo "seal wait: end of the ingest server's exit hour + seal_margin_secs from the ingest log + ${CHAOS_SEAL_SAFETY_SECONDS}s"
+  echo "expected total units: ${EXPECTED_TOTAL_UNITS} (${CHAOS_MAINTAINED_SIGNALS} signals x ${CHAOS_SHARD_COUNT} shards, override with CHAOS_EXPECTED_TOTAL_UNITS)"
   rc=0
   check_dependencies || rc=$?
   exit "$rc"
@@ -312,13 +334,22 @@ start_worker "$WORKER_B_HTTP" "$WORKER_B_GRPC" "$WORKER_B_LOG" WORKER_B_PID
 chaos_wait_for "worker A metrics" 60 worker_reachable "$WORKER_A_HTTP"
 chaos_wait_for "worker B metrics" 60 worker_reachable "$WORKER_B_HTTP"
 
-# Baselines for delta-based oracles, read from the survivor (worker B).
-CONS_BASELINE="$(metric_value "$WORKER_B_URL" ravel_maintain_conservation_aborts_total)" \
-  || CONS_BASELINE=0
-[[ "${CONS_BASELINE%.*}" =~ ^[0-9]+$ ]] || CONS_BASELINE=0
-BREAKER_BASELINE="$(metric_value "$WORKER_B_URL" ravel_maintain_orphan_breaker_tripped_total)" \
-  || BREAKER_BASELINE=0
-[[ "${BREAKER_BASELINE%.*}" =~ ^[0-9]+$ ]] || BREAKER_BASELINE=0
+# Baselines for delta-based oracles, read from BOTH workers before the kill:
+# which one is the survivor is not known until wait_for_compaction_in_flight_any
+# below returns, so both are captured here and the survivor's pair is picked
+# after the kill.
+CONS_BASELINE_A="$(metric_value "$WORKER_A_URL" ravel_maintain_conservation_aborts_total)" \
+  || CONS_BASELINE_A=0
+[[ "${CONS_BASELINE_A%.*}" =~ ^[0-9]+$ ]] || CONS_BASELINE_A=0
+CONS_BASELINE_B="$(metric_value "$WORKER_B_URL" ravel_maintain_conservation_aborts_total)" \
+  || CONS_BASELINE_B=0
+[[ "${CONS_BASELINE_B%.*}" =~ ^[0-9]+$ ]] || CONS_BASELINE_B=0
+BREAKER_BASELINE_A="$(metric_value "$WORKER_A_URL" ravel_maintain_orphan_breaker_tripped_total)" \
+  || BREAKER_BASELINE_A=0
+[[ "${BREAKER_BASELINE_A%.*}" =~ ^[0-9]+$ ]] || BREAKER_BASELINE_A=0
+BREAKER_BASELINE_B="$(metric_value "$WORKER_B_URL" ravel_maintain_orphan_breaker_tripped_total)" \
+  || BREAKER_BASELINE_B=0
+[[ "${BREAKER_BASELINE_B%.*}" =~ ^[0-9]+$ ]] || BREAKER_BASELINE_B=0
 
 # The >= comparison in the two takeover oracles below only discriminates while
 # the store holds this scenario's tenant alone. See
@@ -327,43 +358,53 @@ BREAKER_BASELINE="$(metric_value "$WORKER_B_URL" ravel_maintain_orphan_breaker_t
 # so nothing runs between the in-flight observation and the kill.
 assert_single_tenant_universe || true
 
-log "waiting for worker A to be mid-compaction"
+log "waiting for either worker to be mid-compaction"
 # Timestamp the kill so the takeover oracle can measure wall-clock against the
 # 3*H + tick bound. `date +%s` is the real clock ADR-0077 section 4 requires.
-# One maintenance tick plus two minutes, so worker A runs at least one pass
+# One maintenance tick plus two minutes, so each worker runs at least one pass
 # after its startup pass inside the window.
 INFLIGHT_BUDGET_SECONDS=$(( CHAOS_MAINTAIN_TICK_SECONDS + 120 ))
 INFLIGHT_WAIT_START="$(date +%s)"
-if wait_for_compaction_in_flight "http://${WORKER_A_HTTP}" "$INFLIGHT_BUDGET_SECONDS"; then
+if wait_for_compaction_in_flight_any "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS"; then
   KILL_EPOCH="$(date +%s)"
-  sigkill_pid "$WORKER_A_PID"
+  VICTIM_PID_VAR="WORKER_${CHAOS_VICTIM^^}_PID"
+  sigkill_pid "${!VICTIM_PID_VAR}"
   CHAOS_KILL_ON_GAUGE=1
-  log "worker A observed mid-compaction -- SIGKILL issued"
+  log "victim: worker-${CHAOS_VICTIM} (gauge)"
 else
   KILL_EPOCH="$(date +%s)"
   CHAOS_KILL_ON_GAUGE=0
-  sigkill_pid "$WORKER_A_PID"
-  log "did not observe worker A mid-compaction within budget; SIGKILL issued anyway"
-  echo "::warning::chaos scenario 2 killed worker A without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
+  VICTIM_PID_VAR="WORKER_${CHAOS_VICTIM^^}_PID"
+  sigkill_pid "${!VICTIM_PID_VAR}"
+  log "victim: worker-${CHAOS_VICTIM} (budget fallback)"
+  echo "::warning::chaos scenario 2 killed worker-${CHAOS_VICTIM} without observing it mid-compaction; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
 fi
-WORKER_A_PID=""
-B_LOG_LINES_AT_KILL="$(chaos_line_count "$WORKER_B_LOG")"
-log "worker A max units_owned seen while waiting: ${CHAOS_A_MAX_UNITS_OWNED:-0}; /metrics scrapes: ${CHAOS_COMPACTION_POLLS:-0} in $(( KILL_EPOCH - INFLIGHT_WAIT_START ))s"
-log "$(chaos_worker_activity_line worker-a "$WORKER_A_LOG")"
-log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; worker A's interrupted buckets: $(chaos_interrupted_buckets "$WORKER_A_LOG" | tr '\n' ' ' || true)"
 
-# ---- Oracle (each pinned assertion independently, survivor = worker B) ----
-oracle_sibling_takeover_within_bound "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
-oracle_no_orphaned_lease "$WORKER_B_URL" "$EXPECTED_TOTAL_UNITS" || true
-# Worker A is dead, so its log is its state at the kill: every bucket it had
+# Select victim/survivor identity now that CHAOS_VICTIM is known, and use
+# these EVERYWHERE below instead of a hardcoded worker.
+chaos_select_survivor "$CHAOS_VICTIM"
+SURVIVOR_LOG_LINES_AT_KILL="$(chaos_line_count "$SURVIVOR_LOG")"
+log "worker-a max units_owned seen while waiting: ${CHAOS_A_MAX_UNITS_OWNED:-0}; worker-b max units_owned seen while waiting: ${CHAOS_B_MAX_UNITS_OWNED:-0}; /metrics scrapes: ${CHAOS_COMPACTION_POLLS:-0} in $(( KILL_EPOCH - INFLIGHT_WAIT_START ))s"
+log "$(chaos_worker_activity_line "$VICTIM_LABEL" "$VICTIM_LOG")"
+log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; ${VICTIM_LABEL}'s interrupted buckets: $(chaos_interrupted_buckets "$VICTIM_LOG" | tr '\n' ' ' || true)"
+
+# ---- Oracle (each pinned assertion independently, survivor = $SURVIVOR_LABEL) ----
+# The survivor's peak units_owned during the wait must be below the expected
+# total: a survivor that already owned everything cannot be observed taking
+# anything over, so the two takeover oracles only run when that holds.
+if assert_takeover_observable_or_unmeasured "$SURVIVOR_PEAK_UNITS_OWNED" "$EXPECTED_TOTAL_UNITS"; then
+  oracle_sibling_takeover_within_bound "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
+  oracle_no_orphaned_lease "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" || true
+fi
+# The victim is dead, so its log is its state at the kill: every bucket it had
 # open, read from it, must have a compaction record in the store. The oracle
 # also reads CHAOS_KILL_ON_GAUGE, set above.
-oracle_conservation_or_unmeasured "$WORKER_A_LOG" \
-  "$WORKER_B_URL" "$CONS_BASELINE" "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true
-oracle_no_partial_output_leak "$WORKER_B_URL" "$BREAKER_BASELINE" || true
-log "$(chaos_worker_activity_line worker-b "$WORKER_B_LOG")"
-log "$(chaos_worker_activity_line worker-b-after-kill "$WORKER_B_LOG" "$B_LOG_LINES_AT_KILL")"
-oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" 4 || true
+oracle_conservation_or_unmeasured "$VICTIM_LOG" \
+  "$SURVIVOR_URL" "$CONS_BASELINE" "$SURVIVOR_LOG" "$SURVIVOR_LOG_LINES_AT_KILL" "$KILL_EPOCH" || true
+oracle_no_partial_output_leak "$SURVIVOR_URL" "$BREAKER_BASELINE" || true
+log "$(chaos_worker_activity_line "$SURVIVOR_LABEL" "$SURVIVOR_LOG")"
+log "$(chaos_worker_activity_line "${SURVIVOR_LABEL}-after-kill" "$SURVIVOR_LOG" "$SURVIVOR_LOG_LINES_AT_KILL")"
+oracle_custody_and_catalog_verify_clean "$CHAOS_TENANT_NAME" "$CHAOS_SHARD_COUNT" || true
 
 # Release-blocking: pass `blocking` so a failure exits 2 and prints the
 # RELEASE-BLOCKING severity line. A could-not-measure run exits 3, and only
