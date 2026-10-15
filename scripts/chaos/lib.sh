@@ -1214,22 +1214,37 @@ chaos_worker_activity_line() {
     END { printf "WORKER-ACTIVITY: %s publishes=%d passes=%d compacted=%d not_sealed=%d\n", name, p, n, c, u }' <<<"$body"
 }
 
-# Wait until a maintain worker reports a bucket merge in flight
-# (`ravel_maintain_compactions_in_flight >= 1`), scraping every
+# Wait until EITHER of two maintain workers reports a bucket merge in flight
+# (`ravel_maintain_compactions_in_flight >= 1`), scraping both every
 # CHAOS_COMPACTION_POLL_SECONDS. This is the scenario-2 "mid-compaction"
-# trigger. Args: base_url deadline_seconds. Returns 0 when seen, 1 when the
-# deadline passes first; it scrapes at least once whatever the deadline.
-# Also keeps the highest `ravel_maintain_units_owned` read in
-# CHAOS_A_MAX_UNITS_OWNED and the number of scrapes in CHAOS_COMPACTION_POLLS,
-# from the same scrape.
-wait_for_compaction_in_flight() {
-  local base_url="$1"
-  local deadline_seconds="$2"
+# trigger, and whichever worker fires it first is the victim: on a tenant
+# whose units are not spread evenly (nightly run 38674293885: worker B alone
+# owned Metrics 0-3, Logs 3 and Spans 3 -- 6 of the chaos tenant's 12 units,
+# including every unit that carries data -- while worker A owned 6 empty
+# Logs/Spans shards), the gauge can rise on either side and a helper that
+# only ever scraped one would kill it having never compacted anything.
+#
+# Args: url_a url_b deadline_seconds. Returns 0 when either gauge is seen,
+# 1 when the deadline passes first; it scrapes both at least once whatever
+# the deadline. The victim is reported via the global CHAOS_VICTIM ("a" or
+# "b"), never on stdout: a caller that captures this function's stdout via
+# $(...) runs it in a subshell, and a subshell's variable assignments do not
+# reach the caller. CHAOS_VICTIM starts at "a" and is left there on a 1
+# return, matching the scenario's existing budget-fallback behavior (kill A,
+# B survives). Also keeps the highest `ravel_maintain_units_owned` read from
+# each worker, separately, in CHAOS_A_MAX_UNITS_OWNED /
+# CHAOS_B_MAX_UNITS_OWNED, and the total scrape count (both workers, summed)
+# in CHAOS_COMPACTION_POLLS.
+wait_for_compaction_in_flight_any() {
+  local url_a="$1"
+  local url_b="$2"
+  local deadline_seconds="$3"
   local start body owned inflight
   CHAOS_COMPACTION_POLLS=0
+  CHAOS_VICTIM="a"
   start="$(date +%s)"
   while :; do
-    body="$(curl --silent --fail --max-time 5 "${base_url}/metrics")" || body=""
+    body="$(curl --silent --fail --max-time 5 "${url_a}/metrics")" || body=""
     CHAOS_COMPACTION_POLLS=$(( CHAOS_COMPACTION_POLLS + 1 ))
     owned="$(metric_value_from_body "$body" ravel_maintain_units_owned)"
     if [[ "${owned%.*}" =~ ^[0-9]+$ ]] && [[ "${owned%.*}" -gt "${CHAOS_A_MAX_UNITS_OWNED:-0}" ]]; then
@@ -1237,8 +1252,22 @@ wait_for_compaction_in_flight() {
     fi
     inflight="$(metric_value_from_body "$body" ravel_maintain_compactions_in_flight)"
     if [[ "${inflight%.*}" =~ ^[0-9]+$ ]] && [[ "${inflight%.*}" -ge 1 ]]; then
+      CHAOS_VICTIM="a"
       return 0
     fi
+
+    body="$(curl --silent --fail --max-time 5 "${url_b}/metrics")" || body=""
+    CHAOS_COMPACTION_POLLS=$(( CHAOS_COMPACTION_POLLS + 1 ))
+    owned="$(metric_value_from_body "$body" ravel_maintain_units_owned)"
+    if [[ "${owned%.*}" =~ ^[0-9]+$ ]] && [[ "${owned%.*}" -gt "${CHAOS_B_MAX_UNITS_OWNED:-0}" ]]; then
+      CHAOS_B_MAX_UNITS_OWNED="${owned%.*}"
+    fi
+    inflight="$(metric_value_from_body "$body" ravel_maintain_compactions_in_flight)"
+    if [[ "${inflight%.*}" =~ ^[0-9]+$ ]] && [[ "${inflight%.*}" -ge 1 ]]; then
+      CHAOS_VICTIM="b"
+      return 0
+    fi
+
     (( $(date +%s) - start < deadline_seconds )) || return 1
     sleep "$CHAOS_COMPACTION_POLL_SECONDS"
   done
@@ -1407,6 +1436,30 @@ oracle_strict_ack_implies_durable() {
   return 0
 }
 
+# Precondition for the two takeover oracles below: a survivor that already
+# owned every unit before the kill cannot be observed taking anything over,
+# and the >= comparison those oracles make would pass vacuously (the scenario
+# 2 bug this guards: a 4-unit EXPECTED_TOTAL_UNITS default against a survivor
+# that already owned 6 of the tenant's 12 units pre-kill). Args:
+# survivor_peak_units_owned (the highest `ravel_maintain_units_owned` the
+# survivor read during the wait, before the kill), expected_total_units.
+# Returns 0 when the takeover is observable (the caller should run both
+# oracles); when the survivor's peak was already at or above the expected
+# total it instead records BOTH takeover oracles into ORACLE_UNMEASURED by
+# their pinned names and returns CHAOS_UNMEASURED_EXIT, and the caller must
+# not call them (a could-not-measure assertion is never a pass).
+assert_takeover_observable_or_unmeasured() {
+  local survivor_peak="$1"
+  local expected_total="$2"
+  if [[ "${survivor_peak}" =~ ^[0-9]+$ ]] && [[ "${survivor_peak}" -ge "${expected_total}" ]]; then
+    ORACLE_UNMEASURED+=("sibling-takeover-within-3H-plus-tick: could not measure: the survivor already owned ${survivor_peak}/${expected_total} units before the kill, so no takeover is observable")
+    ORACLE_UNMEASURED+=("no-orphaned-lease: could not measure: the survivor already owned ${survivor_peak}/${expected_total} units before the kill, so no takeover is observable")
+    log "could not measure takeover: survivor's peak units_owned before the kill (${survivor_peak}) was already >= the expected total (${expected_total})"
+    return "$CHAOS_UNMEASURED_EXIT"
+  fi
+  return 0
+}
+
 # 2. sibling-takeover-within-3H-plus-tick.
 #    After one worker is SIGKILLed, the surviving sibling takes over the dead
 #    worker's units within `3 * H` + one maintenance tick. Measured as
@@ -1508,7 +1561,7 @@ CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS="${CHAOS_CONSERVATION_MERGE_ALLOWANCE
 CHAOS_CONSERVATION_WAIT_SECONDS="${CHAOS_CONSERVATION_WAIT_SECONDS:-}"
 # Seconds between reads of the survivor's log while waiting.
 CHAOS_CONSERVATION_POLL_SECONDS="${CHAOS_CONSERVATION_POLL_SECONDS:-5}"
-# 1 when the kill fired on wait_for_compaction_in_flight seeing the gauge at
+# 1 when the kill fired on wait_for_compaction_in_flight_any seeing a gauge at
 # 1 or more, 0 when it fired without that. The kill script sets it; the
 # conservation oracle reads it.
 CHAOS_KILL_ON_GAUGE="${CHAOS_KILL_ON_GAUGE:-0}"
