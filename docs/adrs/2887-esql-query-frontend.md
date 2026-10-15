@@ -104,6 +104,9 @@ not in the manifest. Released preview features are in it, marked preview.
 A later Elasticsearch release is a new manifest file and a new profile with
 a visible diff; it never widens an existing claim.
 
+The manifest's file name and its development-only section changed when it
+was written; see the manifest naming amendment below.
+
 ### D2. Three measures, and a gap is a gap
 
 `docs/esql-conformance.md` is generated from the manifest and the test
@@ -601,3 +604,24 @@ Consequences:
   rows. It is not refused.
 - The `WHERE` predicates stay filters as well; the window narrows what is
   read and what is returned, and never widens either.
+
+## Amendment: the manifest naming and its development-only section
+
+<!-- amendment-applies: sections="D1. The compatibility target is a pinned release, recorded in a manifest" pointer="manifest naming amendment" -->
+
+D1 names the manifest `esql-9.5.5.toml` and leaves development-only
+features out of it. As written, it differs in two ways, both following
+from D3.
+
+The file is `crates/ravel-esql/manifest/esql-9.5.toml`, named after the
+release line its entries were authored against: the published reference
+for the 9.5 line, not the released 9.5.5 binary, which no test has
+reconciled them with. The target stays Elasticsearch 9.5.5. The file takes
+the patch version in its name once its entries are reconciled with that
+binary.
+
+Commands the parser treats as development-only are listed in a separate
+section of the manifest, outside every denominator, rather than left out.
+Some of them may be released in 9.5.5, and only the binary can settle
+that; listing them, each marked unverified where that doubt applies, keeps
+the doubt visible in the generated report instead of hiding it.
