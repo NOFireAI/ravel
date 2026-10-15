@@ -2334,7 +2334,8 @@ fn contains_kernel(
         let raw = stream_refs
             .and_then(|col| col.get(row))
             .ok_or_else(|| missing_i64(COL_STREAM_REF))?;
-        let r = u32::try_from(raw).map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+        let r =
+            u32::try_from(raw).map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
         if let Some(&v) = streams.get(&r) {
             return Ok(v);
         }
@@ -2614,10 +2615,9 @@ fn contains_eval(
         ),
     };
     if let Some(name) = name {
-        let other_type = field_dir
-            .entries()
-            .iter()
-            .any(|e| e.name == name && e.ty != FieldType::Str && cell_present(block, e.column_id, e.ty, row));
+        let other_type = field_dir.entries().iter().any(|e| {
+            e.name == name && e.ty != FieldType::Str && cell_present(block, e.column_id, e.ty, row)
+        });
         if other_type || block.str_at(COL_ATTRS_RAW, row).is_some() {
             return Ok(true);
         }
@@ -7690,8 +7690,7 @@ mod tests {
             }
 
             fn contains_corpus(rows: &[CRow]) -> Vec<LogRecord> {
-                rows
-                    .iter()
+                rows.iter()
                     .enumerate()
                     .map(|(i, r)| {
                         let mut attrs = Vec::new();
@@ -7873,8 +7872,12 @@ mod tests {
 
             fn s_cols(fd: &FieldDir) -> (u32, u32) {
                 (
-                    fd.column("s", FieldType::Str).expect("s string column").column_id,
-                    fd.column("s", FieldType::I64).expect("s integer column").column_id,
+                    fd.column("s", FieldType::Str)
+                        .expect("s string column")
+                        .column_id,
+                    fd.column("s", FieldType::I64)
+                        .expect("s integer column")
+                        .column_id,
                 )
             }
 
@@ -8111,9 +8114,8 @@ mod tests {
                     assert_eq!(oracle, want, "eval, {s:?}");
                     let got = kernel(sd, fd, pred, &loc, &block).expect("kernel");
                     assert_eq!(got, want, "kernel, {s:?}");
-                    let (lazy, _) =
-                        filtered(sd, fd, pred, &loc, block, &mut ScanStats::default())
-                            .expect("lazy");
+                    let (lazy, _) = filtered(sd, fd, pred, &loc, block, &mut ScanStats::default())
+                        .expect("lazy");
                     assert_eq!(lazy, want, "lazy, {s:?}");
                 }
             }
@@ -8235,7 +8237,10 @@ mod tests {
                     }
                 }
                 assert!(kinds.contains(&true), "a row group dictionary: {kinds:?}");
-                assert!(kinds.contains(&false), "a block's own dictionary: {kinds:?}");
+                assert!(
+                    kinds.contains(&false),
+                    "a block's own dictionary: {kinds:?}"
+                );
             }
 
             /// Four blocks of one row group over a three-entry dictionary, then
@@ -8342,7 +8347,10 @@ mod tests {
                 while all.next_block_columnar(&obj).expect("decode").is_some() {
                     let block = all.current.take().expect("decoded");
                     let d = block.str_dict(s).expect("s on a dictionary");
-                    assert!(d.is_group() && d.values().len() == 3, "one group dictionary");
+                    assert!(
+                        d.is_group() && d.values().len() == 3,
+                        "one group dictionary"
+                    );
                     whole.push(block);
                 }
                 assert_eq!(whole.len(), 4);
@@ -8355,7 +8363,11 @@ mod tests {
                 while scan.next_block_columnar(&obj).expect("decode").is_some() {
                     let want = oracle(sd, fd, &pred, &whole[i]).expect("oracle");
                     assert_eq!(scan.surviving, want, "block {i}");
-                    let d = scan.current.as_ref().and_then(|b| b.str_dict(s)).expect("s");
+                    let d = scan
+                        .current
+                        .as_ref()
+                        .and_then(|b| b.str_dict(s))
+                        .expect("s");
                     assert_eq!(d.values().len(), 1, "block {i} keeps one entry");
                     i += 1;
                 }

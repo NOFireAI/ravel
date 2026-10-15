@@ -1695,7 +1695,15 @@ pub(crate) fn read_block_pages_with_shared_dicts(
             )));
         }
     }
-    decode_columns(record_count, descs, page_bytes, dicts, lazy, plans, counters)
+    decode_columns(
+        record_count,
+        descs,
+        page_bytes,
+        dicts,
+        lazy,
+        plans,
+        counters,
+    )
 }
 
 /// How much of a block's page bytes a read actually touched
