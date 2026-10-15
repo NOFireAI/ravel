@@ -931,6 +931,7 @@ async fn the_server_registers_the_real_flight_sql_service() {
         fold: FoldTaskConfig {
             enabled: false,
             fold_interval: Duration::from_secs(60),
+            ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),

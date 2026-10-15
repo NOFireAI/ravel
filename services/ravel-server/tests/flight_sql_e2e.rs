@@ -379,6 +379,7 @@ async fn flight_sql_against_rustfs_returns_rows_and_isolates_tenants() {
         fold: FoldTaskConfig {
             enabled: false,
             fold_interval: Duration::from_secs(60),
+            ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
