@@ -135,7 +135,7 @@ without it. Transfer only removes objects and blocks from a scan's read set.
 ### 3. Which side may receive a transferred filter
 
 This decision applies ADR-2904 "### 5. Plan-derived work is attributed per
-table". A transferred filter that removes a segment or block from a scan is
+table". A transferred filter that removes an object or block from a scan is
 a new prune source, and it may prune a scan only when every row that scan
 contributes to the result must satisfy it. Getting this wrong returns wrong
 rows, the class of issue #2907.
@@ -252,7 +252,7 @@ and bytes per signal and per phase. Transfer follows it:
 - The build side's cost stays in its own signal's entry and does not change
   with transfer.
 - Each `stats.signals` entry gains a `transfer` object: whether a filter was
-  adopted, the number of keys, `segmentsPrunedByTransfer`,
+  adopted, the number of keys, `objectsPrunedByTransfer`,
   `blocksPrunedByTransfer`, and when nothing was adopted, the reason
   (`disabled`, `join_type`, `path`, `not_in_list`, `over_k`,
   `memory_refused`, `no_receiving_arm`). This adds a field to the entry
@@ -405,9 +405,10 @@ join's probe does.
   not admit runs exactly as without this ADR.
 - The receiving scan pays KEY_IDX probes to save block reads. Above k, and
   for a join with no receiving arm, it pays nothing new.
-- `stats.signals` entries gain a `transfer` object. When this ADR is
-  accepted, ADR-2904 gets an amendment section pointing here for that
-  field.
+- `stats.signals` entries gain a `transfer` object. ADR-2904 is not
+  amended now: its amendment section for that field lands with Stage 2's
+  code, after issue #2912 has built the `stats.signals` shape and epic
+  #2904 is closed.
 - A transfer-on session pins four DataFusion options that today ride on
   defaults. A transfer-off session is configured as today.
 - No persistent format changes: no RSEG, RLOG or RSPAN layout, no protobuf
