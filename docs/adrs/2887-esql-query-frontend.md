@@ -127,7 +127,8 @@ entry that Ravel rejects stays in the denominator as an execution gap,
 however clear the rejection. Negative tests (invalid input is refused) are
 counted on their own line and never raise the positive figures. ADR-0035
 and the SQL and PromQL scores are unchanged. The development-only section
-is outside every denominator; see the manifest naming amendment below.
+is outside every denominator, and syntax coverage is reported in two
+parts; see the manifest naming amendment below.
 
 "Full support" may be claimed only when no released entry of the manifest
 is a gap. Until then the report says which entries work.
@@ -632,6 +633,18 @@ that; listing them, each marked unverified where that doubt applies, keeps
 the doubt visible in the generated report instead of hiding it. So the
 denominator in D2, and the gaps D9 reports, are the released entries of
 the manifest, not every entry in the file.
+
+D2's syntax coverage is reported in two parts. The parser accepts any name
+in function call, cast and field position through generic rules that never
+look at the name, so an entry reached only that way proves nothing about
+the name it records. Entries whose form has its own grammar are counted on
+the syntax coverage line; entries accepted through a generic rule are
+counted on a separate line that says the parser does not check the name.
+Each entry records which applies, and a test checks the parsed shape
+against it. An execution pass compares the columns with their types, the
+rows and the warnings against an answer recorded by hand for the release;
+an entry that runs and differs in a listed way is counted as divergent,
+not compatible.
 
 The manifest inventories language forms, not source names. A `FROM`
 naming `spans`, `alerts`, `audit` or `samples` is refused by D10's
