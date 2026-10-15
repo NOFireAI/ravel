@@ -3557,23 +3557,104 @@ fn is_keyhash32(s: &str) -> bool {
 
 // --- Rule 5: unreferenced catalog-object sweep ----------
 
+/// The kind of a catalog object rule 5 lists, from its key's suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatalogObjectKind {
+    /// A snapshot part, `snap/*.csnap`.
+    Csnap,
+    /// A name-postings object, `idx/*.npost`.
+    Npost,
+    /// A column-statistics object, `idx/*.cstat`.
+    Cstat,
+    /// A key-index leaf, `idx/*.kidx` (ADR-2707 decision 4).
+    Kidx,
+    /// Any other key under the two prefixes.
+    Other,
+}
+
+impl CatalogObjectKind {
+    pub const ALL: [CatalogObjectKind; 5] = [
+        CatalogObjectKind::Csnap,
+        CatalogObjectKind::Npost,
+        CatalogObjectKind::Cstat,
+        CatalogObjectKind::Kidx,
+        CatalogObjectKind::Other,
+    ];
+
+    /// The `kind` label value: the key suffix without its dot, or `other`.
+    pub fn name(self) -> &'static str {
+        match self {
+            CatalogObjectKind::Csnap => "csnap",
+            CatalogObjectKind::Npost => "npost",
+            CatalogObjectKind::Cstat => "cstat",
+            CatalogObjectKind::Kidx => "kidx",
+            CatalogObjectKind::Other => "other",
+        }
+    }
+
+    pub fn of_key(key: &str) -> CatalogObjectKind {
+        CatalogObjectKind::ALL
+            .into_iter()
+            .find(|kind| {
+                *kind != CatalogObjectKind::Other && key.ends_with(&format!(".{}", kind.name()))
+            })
+            .unwrap_or(CatalogObjectKind::Other)
+    }
+}
+
 /// What one unreferenced-catalog-object sweep pass did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CatalogSweepOutcome {
-    /// Superseded snapshot parts / postings objects deleted (or, under
-    /// `dry_run`, that would have been).
+    /// Unreferenced catalog objects deleted (or, under `dry_run`, that would
+    /// have been): the sum of the five per-kind counts below.
     pub deleted: usize,
     /// Objects left in place: named by the current HEAD, younger than the
     /// protection horizon, lease-protected, or spared because there was no
     /// present HEAD to anchor the sweep (the no-anchor case, in which every
     /// listed object is kept).
     pub kept: usize,
+    /// Of `deleted`, snapshot parts (`.csnap`).
+    pub deleted_csnap: usize,
+    /// Of `deleted`, name-postings objects (`.npost`).
+    pub deleted_npost: usize,
+    /// Of `deleted`, column-statistics objects (`.cstat`).
+    pub deleted_cstat: usize,
+    /// Of `deleted`, key-index leaves (`.kidx`).
+    pub deleted_kidx: usize,
+    /// Of `deleted`, keys with none of those four suffixes.
+    pub deleted_other: usize,
+}
+
+impl CatalogSweepOutcome {
+    /// The per-kind count for `kind`.
+    pub fn deleted_of(&self, kind: CatalogObjectKind) -> usize {
+        match kind {
+            CatalogObjectKind::Csnap => self.deleted_csnap,
+            CatalogObjectKind::Npost => self.deleted_npost,
+            CatalogObjectKind::Cstat => self.deleted_cstat,
+            CatalogObjectKind::Kidx => self.deleted_kidx,
+            CatalogObjectKind::Other => self.deleted_other,
+        }
+    }
+
+    fn count_deleted(&mut self, key: &str) {
+        self.deleted += 1;
+        match CatalogObjectKind::of_key(key) {
+            CatalogObjectKind::Csnap => self.deleted_csnap += 1,
+            CatalogObjectKind::Npost => self.deleted_npost += 1,
+            CatalogObjectKind::Cstat => self.deleted_cstat += 1,
+            CatalogObjectKind::Kidx => self.deleted_kidx += 1,
+            CatalogObjectKind::Other => self.deleted_other += 1,
+        }
+    }
 }
 
 /// Delete every snapshot part (`t/<tenant_hash>/catalog/<signal>/snap/`) and
-/// name-postings object (sibling `.../idx/`) that the current
-/// `.../catalog/<signal>/HEAD` does not name, once the object's `last_modified`
-/// age exceeds `config.protection_horizon_ns`.
+/// index object (sibling `.../idx/`: name postings, column statistics and
+/// key-index leaves) that the current `.../catalog/<signal>/HEAD` does not
+/// name, once the object's `last_modified` age exceeds
+/// `config.protection_horizon_ns`. The outcome splits `deleted` by
+/// [`CatalogObjectKind`].
 ///
 /// A fold supersedes a part or postings object by writing a fresh
 /// content-addressed key and swapping HEAD; the old object is deliberately left
@@ -3589,9 +3670,11 @@ pub struct CatalogSweepOutcome {
 ///   between the two reads -- is dropped, so a part a completed fold just
 ///   published is never swept.
 /// - **Reference set from a present, decodable HEAD only.** The referenced set
-///   is HEAD's `parts[].key`, its optional `postings.key`, and each part's
+///   is HEAD's `parts[].key`, its optional `postings.key`, each part's
 ///   optional per-part column-statistics key (`parts[].column_stats.key`,
-///   field 7). An object under the two prefixes but not in that set is
+///   field 7), and each part's key-index leaf keys
+///   (`parts[].key_index[].key`, field 8). An object under the two prefixes
+///   but not in that set is
 ///   superseded or orphaned. ADR-1413 decision 6 retired the whole-object
 ///   forms, so a legacy v1/v2 `.cstat` is named by no HEAD and is swept.
 /// - **No anchor, no sweep.** An absent HEAD sweeps nothing for the
@@ -3669,8 +3752,8 @@ pub async fn sweep_unreferenced_catalog_objects(
         HeadReference::Present(set) => set,
         HeadReference::Absent => {
             return Ok(CatalogSweepOutcome {
-                deleted: 0,
                 kept: listed.len(),
+                ..CatalogSweepOutcome::default()
             });
         }
     };
@@ -3708,8 +3791,8 @@ pub async fn sweep_unreferenced_catalog_objects(
             HeadReference::Present(set) => set,
             HeadReference::Absent => {
                 return Ok(CatalogSweepOutcome {
-                    deleted: 0,
                     kept: kept + candidates.len(),
+                    ..CatalogSweepOutcome::default()
                 });
             }
         };
@@ -3724,15 +3807,18 @@ pub async fn sweep_unreferenced_catalog_objects(
         candidates = survivors;
     }
 
-    let mut deleted = 0usize;
+    let mut outcome = CatalogSweepOutcome {
+        kept,
+        ..CatalogSweepOutcome::default()
+    };
     for meta in &candidates {
         if !config.dry_run {
             store.delete(&meta.key).await?;
         }
-        deleted += 1;
+        outcome.count_deleted(&meta.key);
     }
 
-    Ok(CatalogSweepOutcome { deleted, kept })
+    Ok(outcome)
 }
 
 /// The outcome of reading the catalog HEAD for one `(tenant, signal)`.
@@ -3741,8 +3827,9 @@ pub async fn sweep_unreferenced_catalog_objects(
 /// [`read_head_reference`] fails the whole pass on it (fail-closed).
 enum HeadReference {
     /// HEAD is present and decoded: the set of keys it names (every
-    /// `parts[].key`, the optional `postings.key`, and each part's optional
-    /// per-part column-statistics key `parts[].column_stats.key`).
+    /// `parts[].key`, the optional `postings.key`, each part's optional
+    /// per-part column-statistics key `parts[].column_stats.key`, and each
+    /// part's key-index leaf keys `parts[].key_index[].key`).
     Present(HashSet<String>),
     /// HEAD is absent. There is no anchor to compare against, so rule 5 sweeps
     /// nothing for this (tenant, signal) (a fold rebuilding from no HEAD adopts
@@ -3784,6 +3871,10 @@ async fn read_head_reference(
                 if let Some(column_stats) = &part.column_stats {
                     referenced.insert(column_stats.key.clone());
                 }
+                // ADR-2707 decision 4: `part.key_index` (field 8) names the
+                // part's `.kidx` leaves under the same `idx/` prefix, reachable
+                // only through the part, exactly like field 7 above.
+                referenced.extend(part.key_index.iter().map(|leaf| leaf.key.clone()));
             }
             if let Some(postings) = &head.postings {
                 referenced.insert(postings.key.clone());
@@ -4324,7 +4415,8 @@ mod tests {
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_proto::catalog::v1::{
-        SnapshotColumnStatsPartRef, SnapshotHead, SnapshotPartRef, SnapshotPostingsRef,
+        SnapshotColumnStatsPartRef, SnapshotHead, SnapshotKeyIndexLeafRef, SnapshotPartRef,
+        SnapshotPostingsRef,
     };
     use ravel_proto::commit::v1::CompactionPart;
     use ravel_types::TenantId;
@@ -6345,6 +6437,339 @@ mod tests {
             !present(&store, &unreferenced_cstat).await,
             "an old v3 object no part references must still be swept"
         );
+    }
+
+    fn key_index_leaf_ref(key: &str, part_blake3: [u8; 32]) -> SnapshotKeyIndexLeafRef {
+        SnapshotKeyIndexLeafRef {
+            key: key.to_string(),
+            blake3: [7u8; 32].to_vec(),
+            size: 1,
+            field: "user_id".to_string(),
+            key_type: 2,
+            key8_lo: 0,
+            key8_hi: u64::MAX,
+            prefix_len: 1,
+            bucket_bits: 1,
+            entry_count: 1,
+            uncovered_count: 0,
+            part_blake3: part_blake3.to_vec(),
+        }
+    }
+
+    /// ADR-2707 decision 4: a `.kidx` leaf a live part names in
+    /// `key_index` (field 8) is kept however old it is; an unreferenced leaf
+    /// past the protection horizon is deleted and counted in `deleted_kidx`,
+    /// and one younger than the horizon is kept. One old unreferenced object of
+    /// every other kind pins the per-kind split: each lands in its own count
+    /// and the five sum to `deleted`.
+    ///
+    /// Against the pre-change sweep (no field-8 walk) the referenced leaf is
+    /// deleted too, so `deleted_kidx` is 2 and `referenced_kidx` is gone.
+    #[tokio::test]
+    async fn catalog_sweep_reaps_unreferenced_kidx_and_keeps_referenced_leaves() {
+        let tenant = tenant();
+        let signal = Signal::Logs;
+        let store = MemoryStore::new();
+        let config = CompactorConfig::default();
+        let now_ns = config.protection_horizon_ns.saturating_mul(2);
+        let snap = catalog_snap_prefix(&tenant, signal);
+        let idx = catalog_idx_prefix(&tenant, signal);
+
+        let part = format!("{snap}20260101T00.aaaa.csnap");
+        let referenced_kidx = format!("{idx}20260101T00.1111.kidx");
+        let unreferenced_kidx = format!("{idx}20251231T00.2222.kidx");
+        let old_csnap = format!("{snap}20251230T00.3333.csnap");
+        let old_npost = format!("{idx}20251230T00.4444.npost");
+        let old_cstat = format!("{idx}20251230T00.5555.cstat");
+        let old_other = format!("{idx}20251230T00.6666.tmp");
+        for key in [
+            &part,
+            &referenced_kidx,
+            &unreferenced_kidx,
+            &old_csnap,
+            &old_npost,
+            &old_cstat,
+            &old_other,
+        ] {
+            put_catalog_object(&store, key).await;
+        }
+        put_head(
+            &store,
+            &tenant,
+            signal,
+            vec![SnapshotPartRef {
+                key_index: vec![key_index_leaf_ref(&referenced_kidx, [1u8; 32])],
+                ..part_ref(&part, [1u8; 32])
+            }],
+            None,
+        )
+        .await;
+        store.set_clock_ms((now_ns / 1_000_000) as u64);
+        let young_kidx = format!("{idx}20260201T00.7777.kidx");
+        put_catalog_object(&store, &young_kidx).await;
+
+        let clock = FixedClock::new(now_ns);
+        let outcome =
+            sweep_unreferenced_catalog_objects(&store, &clock, &config, &NoLeases, &tenant, signal)
+                .await
+                .expect("sweep must succeed");
+
+        assert_eq!(
+            outcome,
+            CatalogSweepOutcome {
+                deleted: 5,
+                kept: 3,
+                deleted_csnap: 1,
+                deleted_npost: 1,
+                deleted_cstat: 1,
+                deleted_kidx: 1,
+                deleted_other: 1,
+            }
+        );
+        assert_eq!(
+            CatalogObjectKind::ALL
+                .iter()
+                .map(|kind| outcome.deleted_of(*kind))
+                .sum::<usize>(),
+            outcome.deleted
+        );
+        assert!(present(&store, &part).await);
+        assert!(
+            present(&store, &referenced_kidx).await,
+            "a leaf a live part names in key_index must survive"
+        );
+        assert!(
+            present(&store, &young_kidx).await,
+            "an unreferenced leaf younger than the horizon is kept"
+        );
+        for gone in [
+            &unreferenced_kidx,
+            &old_csnap,
+            &old_npost,
+            &old_cstat,
+            &old_other,
+        ] {
+            assert!(!present(&store, gone).await, "{gone} must be swept");
+        }
+    }
+
+    /// Publishes one L0 RLOG object into `hour` whose KEY_IDX section indexes
+    /// `user_id` (I64), one row per value.
+    async fn publish_user_id_logs(
+        store: &MemoryStore,
+        writer_seq: u64,
+        hour: u32,
+        user_ids: &[i64],
+    ) {
+        use ravel_commit::publish::{self, RetryPolicy};
+        use ravel_commit::record::{self, NewCommitRecord};
+        use ravel_logseg::writer::ObjectIdentity;
+        use ravel_logseg::{LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+        use ravel_types::logstream::{AttrValue, log_stream_id};
+
+        let writer_id = uuid::Uuid::from_u128(u128::from(writer_seq));
+        let resource = vec![(
+            "service.name".to_string(),
+            AttrValue::Str("api".to_string()),
+        )];
+        let mut w = RlogWriter::new(
+            RlogConfig::default(),
+            ObjectIdentity {
+                tenant_hash: tenant().0,
+                shard: 0,
+                writer_id: *writer_id.as_bytes(),
+                writer_epoch: 1,
+                writer_seq,
+            },
+        )
+        .with_key_index_fields(vec![(
+            "user_id".to_string(),
+            ravel_logseg::key_index::KeyType::I64,
+        )]);
+        let base_ts = i64::from(hour) * NS_PER_HOUR + 60_000_000_000;
+        for (i, user_id) in user_ids.iter().enumerate() {
+            let ts = base_ts + i as i64;
+            w.push(LogRecord {
+                stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+                stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+                ts_ns: ts,
+                observed_ts_ns: ts,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: format!("row {i}"),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![("user_id".to_string(), AttrValue::I64(*user_id))],
+            })
+            .expect("push");
+        }
+        let bytes = Bytes::from(w.finish().expect("finish"));
+        let record = record::build(NewCommitRecord {
+            tenant_hash: tenant(),
+            signal: Signal::Logs,
+            shard: 0,
+            writer_id,
+            writer_epoch: 1,
+            writer_seq,
+            object_size: bytes.len() as u64,
+            content_hash: *blake3::hash(&bytes).as_bytes(),
+            sample_count: user_ids.len() as u64,
+            series_count: 1,
+            min_event_ts_ns: base_ts,
+            max_event_ts_ns: base_ts + user_ids.len() as i64,
+            min_ingest_ts_ns: base_ts,
+            max_ingest_ts_ns: base_ts + user_ids.len() as i64,
+            segment_format_version: 1,
+            created_unix_ns: base_ts,
+            ingest_hour_bucket: hour,
+        })
+        .expect("valid record");
+        let data_key = ravel_commit::keys::reconstruct_data_key(&record).expect("data key");
+        publish::put_data_object(store, &data_key, bytes)
+            .await
+            .expect("put data object");
+        publish::publish(store, &record, &RetryPolicy::default())
+            .await
+            .expect("publish");
+    }
+
+    async fn read_catalog_head(store: &MemoryStore, signal: Signal) -> SnapshotHead {
+        let got = store
+            .get(&catalog_head_key(&tenant(), signal), GetRange::Full)
+            .await
+            .expect("HEAD present");
+        ravel_catalog::decode_head(&got.data).expect("HEAD decodes")
+    }
+
+    /// ADR-2707 decision 4, mixed versions: a HEAD written by a fold that
+    /// predates field 8 (simulated by stripping `key_index` from every part ref
+    /// and republishing) leaves the leaves the new fold wrote unreferenced. The
+    /// sweep keeps them while HEAD names them, reaps them past the horizon once
+    /// it does not, and counts them in `deleted_kidx`; the part itself stays.
+    /// A lookup then finds no ref for the field, so the part is uncovered and
+    /// scanned: the documented, refused-not-silent outcome.
+    #[tokio::test]
+    async fn leaves_a_field_8_stripping_fold_drops_are_reaped_and_the_part_reads_uncovered() {
+        let signal = Signal::Logs;
+        let hour = 470_000u32;
+        let store = std::sync::Arc::new(MemoryStore::new());
+        publish_user_id_logs(&store, 1, hour, &[10, 20]).await;
+        publish_user_id_logs(&store, 2, hour, &[10, 30]).await;
+        let catalog = ravel_catalog::Catalog::new(
+            store.clone(),
+            ravel_catalog::CatalogConfig {
+                shard_count: 1,
+                ..ravel_catalog::CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        let sealed_at = (i64::from(hour) + 1) * NS_PER_HOUR
+            + ravel_catalog::DEFAULT_MAX_FLUSH_LIFETIME_NS
+            + ravel_catalog::DEFAULT_CLOCK_SKEW_ALLOWANCE_NS
+            + ravel_catalog::DEFAULT_FOLD_SAFETY_MARGIN_NS;
+        catalog
+            .fold(
+                &tenant(),
+                signal,
+                uuid::Uuid::new_v4(),
+                sealed_at,
+                &[],
+                None,
+            )
+            .await
+            .expect("fold");
+        let mut head = read_catalog_head(&store, signal).await;
+        let leaves: Vec<String> = head
+            .parts
+            .iter()
+            .flat_map(|part| part.key_index.iter().map(|leaf| leaf.key.clone()))
+            .collect();
+        assert_eq!(leaves.len(), 1, "the new fold attached one leaf");
+
+        let config = CompactorConfig::default();
+        let clock = FixedClock::new(config.protection_horizon_ns.saturating_mul(2));
+        let before = sweep_unreferenced_catalog_objects(
+            store.as_ref(),
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant(),
+            signal,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!(before.deleted_kidx, 0, "a referenced leaf is kept");
+
+        for part in &mut head.parts {
+            part.key_index.clear();
+        }
+        store
+            .put(
+                &catalog_head_key(&tenant(), signal),
+                Bytes::from(ravel_catalog::encode_head(&head).expect("encode")),
+                PutOptions::default(),
+            )
+            .await
+            .expect("republish HEAD without field 8");
+
+        let after = sweep_unreferenced_catalog_objects(
+            store.as_ref(),
+            &clock,
+            &config,
+            &NoLeases,
+            &tenant(),
+            signal,
+        )
+        .await
+        .expect("sweep");
+        assert_eq!((after.deleted, after.deleted_kidx), (1, 1), "{after:?}");
+        for leaf in &leaves {
+            assert!(!present(store.as_ref(), leaf).await, "{leaf} reaped");
+        }
+        let head = read_catalog_head(&store, signal).await;
+        assert!(present(store.as_ref(), &head.parts[0].key).await);
+        assert_eq!(
+            ravel_catalog::select_key_index_slice(
+                &head.parts[0].key_index,
+                "user_id",
+                &ravel_logseg::key_index::key8_i64(10),
+            ),
+            Ok(None),
+            "no ref for the field: the part is uncovered and scanned"
+        );
+    }
+
+    #[test]
+    fn catalog_object_kind_reads_the_key_suffix() {
+        for (key, kind) in [
+            (
+                "t/x/catalog/logs/snap/20260101T00.aa.csnap",
+                CatalogObjectKind::Csnap,
+            ),
+            (
+                "t/x/catalog/logs/idx/20260101T00.aa.npost",
+                CatalogObjectKind::Npost,
+            ),
+            (
+                "t/x/catalog/logs/idx/20260101T00.aa.cstat",
+                CatalogObjectKind::Cstat,
+            ),
+            (
+                "t/x/catalog/logs/idx/20260101T00.aa.kidx",
+                CatalogObjectKind::Kidx,
+            ),
+            (
+                "t/x/catalog/logs/idx/20260101T00.aa.kidx.tmp",
+                CatalogObjectKind::Other,
+            ),
+            (
+                "t/x/catalog/logs/idx/20260101T00.aaother",
+                CatalogObjectKind::Other,
+            ),
+        ] {
+            assert_eq!(CatalogObjectKind::of_key(key), kind, "{key}");
+        }
     }
 
     /// A legal hold over the object's prefix spares an otherwise-eligible old

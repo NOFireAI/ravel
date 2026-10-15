@@ -383,8 +383,10 @@ pub(crate) async fn fetch_segment_column_stats(
     Ok(segment_from_columns(entry, columns))
 }
 
-/// The key of the RLOG object `entry` addresses.
-fn segment_data_key(
+/// The key of the data object `entry` addresses under `signal`. Also the
+/// fold's key-index leaf build's (`fold.rs`) key derivation, for logs and
+/// spans.
+pub(crate) fn segment_data_key(
     tenant: &TenantHash,
     signal: Signal,
     entry: &ravel_proto::catalog::v1::SnapshotEntry,

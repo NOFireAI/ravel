@@ -974,10 +974,28 @@ pub struct KeyIdxFieldSummary {
     pub bucket_entry_counts: Vec<u32>,
 }
 
-/// Verifies a whole section: everything a probe checks, for every field and
-/// every frame, plus that each field's frames tile `[0, buckets_len)` exactly
-/// and their entry counts sum to the field's `entry_count`.
-pub fn verify_key_idx(section: &[u8], footer_prefix_len: u32) -> Result<KeyIdxSummary, CodecError> {
+/// One field of a whole section and every `(key8, block)` entry it holds, in
+/// bucket order and sorted by `(key8, block)` within each bucket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyIdxFieldEntries {
+    pub name: String,
+    pub key_type: KeyType,
+    pub entries: Vec<(Key8, u32)>,
+}
+
+/// One field as [`walk_section`] verified it.
+struct WalkedField {
+    summary: KeyIdxFieldSummary,
+    entries: Vec<(Key8, u32)>,
+}
+
+/// Verifies every field and frame of a whole section, keeping the decoded
+/// entries when `keep_entries` is set.
+fn walk_section(
+    section: &[u8],
+    footer_prefix_len: u32,
+    keep_entries: bool,
+) -> Result<(u8, u32, Vec<WalkedField>), CodecError> {
     let section_len = section.len() as u64;
     let prefix_range = key_idx_prefix_range(footer_prefix_len, section_len)?;
     let prefix_end = to_usize(prefix_range.end, "prefix_len")?;
@@ -988,6 +1006,7 @@ pub fn verify_key_idx(section: &[u8], footer_prefix_len: u32) -> Result<KeyIdxSu
         let ends = prefix.directory(header)?;
         let area_start = to_usize(header.buckets_offset, "buckets_offset")?;
         let mut counts = Vec::with_capacity(ends.len());
+        let mut kept = Vec::new();
         let mut total = 0u64;
         let mut start = 0u32;
         for (bucket, &end) in ends.iter().enumerate() {
@@ -1002,6 +1021,9 @@ pub fn verify_key_idx(section: &[u8], footer_prefix_len: u32) -> Result<KeyIdxSu
             let n = entries.len() as u32;
             counts.push(n);
             total += u64::from(n);
+            if keep_entries {
+                kept.extend(entries);
+            }
             start = end;
         }
         if total != header.entry_count {
@@ -1010,19 +1032,47 @@ pub fn verify_key_idx(section: &[u8], footer_prefix_len: u32) -> Result<KeyIdxSu
                 header.name, header.entry_count
             )));
         }
-        fields.push(KeyIdxFieldSummary {
-            name: header.name.clone(),
-            key_type: header.key_type,
-            entry_count: header.entry_count,
-            bucket_entry_counts: counts,
+        fields.push(WalkedField {
+            summary: KeyIdxFieldSummary {
+                name: header.name.clone(),
+                key_type: header.key_type,
+                entry_count: header.entry_count,
+                bucket_entry_counts: counts,
+            },
+            entries: kept,
         });
     }
+    Ok((bits, prefix.prefix_len, fields))
+}
+
+/// Verifies a whole section: everything a probe checks, for every field and
+/// every frame, plus that each field's frames tile `[0, buckets_len)` exactly
+/// and their entry counts sum to the field's `entry_count`.
+pub fn verify_key_idx(section: &[u8], footer_prefix_len: u32) -> Result<KeyIdxSummary, CodecError> {
+    let (bucket_bits, prefix_len, fields) = walk_section(section, footer_prefix_len, false)?;
     Ok(KeyIdxSummary {
         version: KEY_IDX_VERSION,
-        bucket_bits: bits,
-        prefix_len: prefix.prefix_len,
-        fields,
+        bucket_bits,
+        prefix_len,
+        fields: fields.into_iter().map(|f| f.summary).collect(),
     })
+}
+
+/// Every field of a whole section with its entries, after the checks
+/// [`verify_key_idx`] makes.
+pub fn decode_key_idx(
+    section: &[u8],
+    footer_prefix_len: u32,
+) -> Result<Vec<KeyIdxFieldEntries>, CodecError> {
+    let (_, _, fields) = walk_section(section, footer_prefix_len, true)?;
+    Ok(fields
+        .into_iter()
+        .map(|f| KeyIdxFieldEntries {
+            name: f.summary.name,
+            key_type: f.summary.key_type,
+            entries: f.entries,
+        })
+        .collect())
 }
 
 #[cfg(test)]
@@ -2057,6 +2107,16 @@ mod tests {
             let summary = verify_key_idx(&s.bytes, s.prefix_len).expect("verify");
             prop_assert_eq!(summary.bucket_bits, bucket_bits);
             prop_assert_eq!(summary.fields.len(), inputs.len());
+            let decoded = decode_key_idx(&s.bytes, s.prefix_len).expect("decode");
+            prop_assert_eq!(decoded.len(), inputs.len());
+            for (input, field) in inputs.iter().zip(&decoded) {
+                let model: BTreeSet<(Key8, u32)> = input.entries.iter().copied().collect();
+                let got: BTreeSet<(Key8, u32)> = field.entries.iter().copied().collect();
+                prop_assert_eq!(&field.name, &input.name);
+                prop_assert_eq!(field.key_type, input.key_type);
+                prop_assert_eq!(field.entries.len(), model.len());
+                prop_assert_eq!(got, model);
+            }
             let prefix = KeyIdxPrefix::parse(
                 &s.bytes[..s.prefix_len as usize],
                 s.prefix_len,

@@ -12,6 +12,9 @@ ravel-commit = { workspace = true }
 ravel-object-store = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
+# The RSPAN footer and its KEY_IDX section entry, read by the fold's key-index
+# leaf build for spans (ADR-2707 decision 4).
+ravel-rspan = { workspace = true }
 # The KEY_IDX bucket mix and key types the per-part `.kidx` leaves share with
 # the tier-1 section (ADR-2707 decision 4).
 ravel-codec = { workspace = true }
