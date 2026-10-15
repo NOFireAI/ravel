@@ -254,6 +254,23 @@ impl ravel_cpu_gate::MonotonicClock for TtlSteppingClock {
     }
 }
 
+/// The SQL executor every harness here builds over `catalog` and `store`, with
+/// the executor's default declared-column source, which reads no store.
+#[cfg(feature = "sql")]
+fn sql_executor(
+    catalog: Arc<Catalog>,
+    store: &Arc<dyn ObjectStoreBackend>,
+) -> ravel_sql::SqlExecutor {
+    ravel_sql::SqlExecutor::new(
+        catalog,
+        ravel_query::SegmentFetcher::new(Arc::clone(store)),
+        ravel_query::LogSegmentFetcher::new(Arc::clone(store)),
+        ravel_sql::SpanSegmentFetcher::new(Arc::clone(store)),
+        sql_config(),
+        1 << 30,
+    )
+}
+
 fn harness_over_catalog(
     catalog: Catalog,
     store: Arc<dyn ObjectStoreBackend>,
@@ -303,14 +320,7 @@ fn harness_over_catalog(
 
     #[cfg(feature = "sql")]
     let sql = crate::sql::SqlState {
-        executor: Arc::new(ravel_sql::SqlExecutor::new(
-            Arc::clone(&catalog),
-            ravel_query::SegmentFetcher::new(Arc::clone(&store)),
-            ravel_query::LogSegmentFetcher::new(Arc::clone(&store)),
-            ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
-            sql_config(),
-            1 << 30,
-        )),
+        executor: Arc::new(sql_executor(Arc::clone(&catalog), &store)),
         tenant_resolver: Arc::clone(&resolver),
         store: Arc::clone(&store),
         audit_sink: Arc::clone(&audit_sink),
@@ -1396,6 +1406,246 @@ async fn esql_parse_error_takes_no_permit_and_reads_no_store() {
         .esql_execute(h.tenant_hash, &esql("FROM logs | LIMIT 1"))
         .await;
     assert!(reads() > 0, "an admitted statement reads the store");
+    assert_eq!(h.admission.in_flight(), 0);
+}
+
+/// An ES|QL statement under `deadline`, at the fixed clock's now.
+#[cfg(feature = "esql")]
+fn esql_query(text: &str, deadline: Duration) -> crate::service::EsqlQuery {
+    crate::service::EsqlQuery {
+        query: text.to_string(),
+        now_ns: NOW_NS,
+        start: None,
+        end: None,
+        request: ravel_sql::esql::EsqlRequest {
+            min_tokens: Vec::new(),
+            deadline,
+            budgets: None,
+            max_rows: None,
+        },
+    }
+}
+
+/// `h` with its SQL executor resolving declared columns the way a server does,
+/// through the tenant configuration object in `store`, on both the service and
+/// the SQL transports.
+#[cfg(feature = "esql")]
+fn with_tenant_config_declared_columns(h: Harness, store: Arc<dyn ObjectStoreBackend>) -> Harness {
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let source = crate::declared_columns::TenantConfigDeclaredColumns::new(
+        crate::typed_attr_config::TypedAttrColumnConfig::default(),
+        Arc::clone(&store),
+    );
+    let executor = sql_executor(catalog, &store).with_declared_column_source(Arc::new(source));
+    let sql = crate::sql::SqlState {
+        executor: Arc::new(executor),
+        ..h.transports.sql.clone()
+    };
+    Harness {
+        service: h.service.with_sql(sql.clone()),
+        transports: Transports {
+            sql,
+            ..h.transports
+        },
+        ..h
+    }
+}
+
+/// An audit sink that keeps every event it accepts.
+#[derive(Default)]
+struct RecordingAuditSink {
+    events: Mutex<Vec<AuditEvent>>,
+}
+
+impl RecordingAuditSink {
+    /// `(query.language, query.status)` of each accepted event, in order.
+    fn records(&self) -> Vec<(String, String)> {
+        let attr = |event: &AuditEvent, key: &str| {
+            event
+                .attrs
+                .iter()
+                .find(|(name, _)| name == key)
+                .and_then(|(_, value)| match value {
+                    ravel_logseg::AttrValue::Str(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        self.events
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|event| (attr(event, "query.language"), attr(event, "query.status")))
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl QueryAuditSink for RecordingAuditSink {
+    async fn submit(&self, event: AuditEvent) -> Result<(), MaintainError> {
+        self.events.lock().expect("lock").push(event);
+        Ok(())
+    }
+}
+
+/// The tenant-configuration read that binds declared columns runs inside the
+/// request's clamped deadline: with that read held forever, the request ends
+/// at its own deadline with the timeout the SQL surface gives, and its permit
+/// is back. The outer guard is four deadlines long, so a read outside the
+/// deadline fails the `expect` instead of hanging the test.
+#[cfg(feature = "esql")]
+#[tokio::test(start_paused = true)]
+async fn esql_declared_column_read_runs_inside_the_deadline() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let config_key = ravel_catalog::config_key(&tenant().hash());
+    let gate = fault_store.hold(Op::Get, Some(config_key.clone()), Occurrence::Nth(1));
+    let store: Arc<dyn ObjectStoreBackend> = fault_store;
+    let h = with_tenant_config_declared_columns(
+        harness(
+            Arc::clone(&store),
+            QueryConcurrencyLimit::Bounded(1),
+            Arc::new(NoopQueryAuditSink),
+            None,
+        ),
+        store,
+    );
+    let deadline = Duration::from_secs(5);
+    let started = tokio::time::Instant::now();
+
+    let result = tokio::time::timeout(
+        deadline * 4,
+        h.service
+            .esql_execute(h.tenant_hash, &esql_query("FROM logs | LIMIT 1", deadline)),
+    )
+    .await
+    .expect("the request's own deadline ends it, not this guard");
+    let err = err_of(result);
+
+    let sql_timeout = ServiceError::from_sql(
+        ravel_sql::SqlError::DeadlineExceeded { millis: 5_000 },
+        h.tenant_hash,
+    );
+    assert_eq!(err.kind, sql_timeout.kind, "{}", err.message);
+    assert_eq!(err.kind, ServiceErrorKind::Deadline);
+    assert_eq!(err.status, sql_timeout.status);
+    assert_eq!(err.status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(err.error_type, sql_timeout.error_type);
+    assert_eq!(err.message, sql_timeout.message);
+    assert!(started.elapsed() >= deadline);
+    let held: Vec<(Op, String)> = gate
+        .held_details()
+        .into_iter()
+        .map(|(_, op, key)| (op, key))
+        .collect();
+    assert_eq!(held, vec![(Op::Get, config_key)]);
+    assert_eq!(h.admission.in_flight(), 0);
+}
+
+/// Which `/api/v1/esql` requests write a query audit record: one that parses
+/// and is admitted writes exactly one, `error` or `ok` by its outcome, and
+/// every request refused before admission writes none. The refusals run with
+/// the ceiling free, so each is refused for its own reason; the admission
+/// refusal holds the ceiling's one permit.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_audits_only_parsed_and_admitted_statements() {
+    use axum::body::Body;
+    use axum::http::Request;
+
+    let audit = Arc::new(RecordingAuditSink::default());
+    let h = harness(
+        Arc::new(MemoryStore::new()),
+        QueryConcurrencyLimit::Bounded(1),
+        Arc::clone(&audit) as Arc<dyn QueryAuditSink>,
+        None,
+    );
+    let post = |token: &str, body: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/esql")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("request")
+    };
+    let status = |request| route_status(crate::esql::router(h.transports.sql.clone()), request);
+
+    assert_eq!(
+        status(post("not-a-token", r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    for body in [
+        r#"{"query":"ROW a = 1","params":[]}"#,
+        r#"{"query":"ROW a = 1","params":null}"#,
+        r#"{"query":"ROW a = 1","filter":{}}"#,
+        r#"{"query":"ROW a = 1","start":1e300}"#,
+        r#"{"query":"ROW a = 1","end":1e300}"#,
+        r#"{"query":"ROW a = 1","timeout":0}"#,
+        r#"{"query":"FROM logs\n| WHERE"}"#,
+    ] {
+        assert_eq!(
+            status(post(TOKEN, body)).await,
+            StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    let held = h.admission.try_admit().expect("the ceiling's one permit");
+    assert_eq!(
+        status(post(TOKEN, r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+    drop(held);
+    assert_eq!(audit.records(), Vec::<(String, String)>::new());
+
+    assert_eq!(
+        status(post(TOKEN, r#"{"query":"FROM metrics"}"#)).await,
+        StatusCode::BAD_REQUEST,
+    );
+    assert_eq!(
+        audit.records(),
+        vec![("esql".to_string(), "error".to_string())]
+    );
+
+    assert_eq!(
+        status(post(TOKEN, r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        audit.records(),
+        vec![
+            ("esql".to_string(), "error".to_string()),
+            ("esql".to_string(), "ok".to_string()),
+        ]
+    );
+}
+
+/// An ES|QL request cancelled while its run is parked in a store call writes
+/// no audit record: the record is written once the run returns, and a dropped
+/// request never returns.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_cancelled_request_writes_no_audit_record() {
+    let fault_store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let gate: GateHandle = fault_store.hold(Op::List, None, Occurrence::Nth(1));
+    let audit = Arc::new(RecordingAuditSink::default());
+    let h = harness(
+        fault_store,
+        QueryConcurrencyLimit::Unlimited,
+        Arc::clone(&audit) as Arc<dyn QueryAuditSink>,
+        None,
+    );
+
+    let query = esql_query("FROM logs | LIMIT 1", Duration::from_secs(30));
+    let mut run = Box::pin(h.service.esql_execute(h.tenant_hash, &query));
+    tokio::select! {
+        _ = &mut run => panic!("the run is held inside the store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(gate.held_count(), 1);
+    drop(run);
+
+    assert_eq!(audit.records(), Vec::<(String, String)>::new());
     assert_eq!(h.admission.in_flight(), 0);
 }
 
