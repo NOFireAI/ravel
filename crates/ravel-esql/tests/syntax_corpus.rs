@@ -316,7 +316,7 @@ fn admitted() -> Vec<(&'static str, &'static str, Check)> {
         }),
         (
             "TS",
-            "TS metrics-*, \"k8s\" METADATA _index, _id",
+            "TS metrics-*, \"pods\" METADATA _index, _id",
             |q, s| {
                 let Command::Ts(ts) = &q.source else {
                     panic!("not TS: {q:#?}");
@@ -326,7 +326,7 @@ fn admitted() -> Vec<(&'static str, &'static str, Check)> {
                     .iter()
                     .map(|p| (p.text.as_str(), p.quoted))
                     .collect();
-                assert_eq!(sources, [("metrics-*", false), ("k8s", true)]);
+                assert_eq!(sources, [("metrics-*", false), ("pods", true)]);
                 let metadata = ts.metadata.as_ref().expect("metadata");
                 assert_eq!(names(&metadata.fields), ["_index", "_id"]);
                 assert_eq!(text(s, ts.span), s);
@@ -334,7 +334,7 @@ fn admitted() -> Vec<(&'static str, &'static str, Check)> {
         ),
         (
             "TS",
-            "TS k8s | STATS max(rate(bytes)) BY TBUCKET(1 hour)",
+            "TS pods | STATS max(rate(bytes)) BY TBUCKET(1 hour)",
             |q, _| {
                 assert!(matches!(q.source, Command::Ts(_)));
                 assert!(matches!(q.processing.as_slice(), [Command::Stats(_)]));
@@ -618,20 +618,20 @@ fn admitted() -> Vec<(&'static str, &'static str, Check)> {
             },
         ),
         // ---- ENRICH ----
-        ("ENRICH", "FROM t | ENRICH languages_policy", |q, s| {
+        ("ENRICH", "FROM t | ENRICH regions_policy", |q, s| {
             let c = enrich(q);
-            assert_eq!(c.policy.text, "languages_policy");
+            assert_eq!(c.policy.text, "regions_policy");
             assert!(c.on.is_none());
             assert!(c.with.is_empty());
-            assert_eq!(text(s, c.span), "ENRICH languages_policy");
+            assert_eq!(text(s, c.span), "ENRICH regions_policy");
         }),
         (
             "ENRICH",
-            "FROM t | ENRICH languages_policy ON language_code",
+            "FROM t | ENRICH regions_policy ON region_code",
             |q, s| {
                 let c = enrich(q);
-                assert_eq!(c.on.as_ref().map(dotted).as_deref(), Some("language_code"));
-                assert_eq!(text(s, c.span), "ENRICH languages_policy ON language_code");
+                assert_eq!(c.on.as_ref().map(dotted).as_deref(), Some("region_code"));
+                assert_eq!(text(s, c.span), "ENRICH regions_policy ON region_code");
             },
         ),
         (
