@@ -128,8 +128,6 @@ mod parquet_ddl;
 mod parquet_tables;
 #[path = "pipeline.rs"]
 mod pipeline;
-#[path = "plan_source.rs"]
-mod plan_source;
 #[path = "pushdown_memory.rs"]
 mod pushdown_memory;
 #[path = "query_accounting.rs"]

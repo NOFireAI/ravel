@@ -1,19 +1,11 @@
 //! The plan shape a pipeline lowers to, the rows it returns, and plan
 //! admission of the lowered plans.
 
-use async_trait::async_trait;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::error::DataFusionError;
-use datafusion::logical_expr::expr::ScalarFunction;
-use datafusion::logical_expr::{Expr, FetchType, LogicalPlan, LogicalPlanBuilder};
-use ravel_sql::esql::{EsqlError, PreparedEsql};
-use ravel_sql::{
-    DialectPolicy, LiveAccounting, LoweredStatement, LoweringContext, SqlError, StatementRequest,
-    StatementTarget,
-};
-use ravel_types::TimeRange;
+use datafusion::logical_expr::{FetchType, LogicalPlan};
+use ravel_sql::esql::EsqlError;
 
-use crate::support::{self, NOW, columns, fixture, optimized, prepare, rows, run};
+use crate::support::{self, columns, fixture, optimized, prepare, rows, run};
 
 /// The row count a `Limit` or a `Sort` node stops at, if it has one.
 pub fn fetch(node: &LogicalPlan) -> Option<usize> {
@@ -169,76 +161,6 @@ async fn a_sort_repeating_an_earlier_key_runs() {
         let expected: Vec<Vec<String>> = expected.iter().map(|m| vec![m.to_string()]).collect();
         assert_eq!(found, expected, "{source}");
     }
-}
-
-/// A [`PreparedEsql`] whose lowering wraps the plan in a projection calling
-/// `upper`, which the statement's policy does not name.
-#[derive(Debug)]
-struct Corrupted(PreparedEsql);
-
-#[async_trait]
-impl LoweredStatement for Corrupted {
-    fn target(&self) -> StatementTarget {
-        self.0.target()
-    }
-
-    fn text(&self) -> &str {
-        self.0.text()
-    }
-
-    fn policy(&self) -> &DialectPolicy {
-        self.0.policy()
-    }
-
-    async fn lower(&self, ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
-        let plan = self.0.lower(ctx).await?;
-        LogicalPlanBuilder::from(plan)
-            .project(vec![
-                Expr::ScalarFunction(ScalarFunction::new_udf(
-                    ctx.scalar("upper")?,
-                    vec![datafusion::prelude::col("message")],
-                ))
-                .alias("m"),
-            ])?
-            .build()
-    }
-}
-
-#[tokio::test]
-async fn a_lowering_calling_a_function_off_its_policy_is_refused() {
-    let fixture = fixture().await;
-    let prepared = prepare("FROM logs | KEEP message").expect("prepares");
-    let window = prepared.window().expect("a FROM statement has a window");
-    let request = StatementRequest {
-        window,
-        min_tokens: Vec::new(),
-        now_ns: NOW,
-        deadline: support::request().deadline,
-        row_window: true,
-        max_rows: None,
-        budgets: None,
-    };
-    let err = fixture
-        .executor
-        .execute_statement_accounted(
-            support::tenant().hash(),
-            &Corrupted(prepared),
-            &request,
-            &LiveAccounting::new(),
-        )
-        .await
-        .expect_err("refused");
-    let SqlError::PlanNotAdmitted(reason) = &err else {
-        panic!("expected PlanNotAdmitted, got {err}");
-    };
-    assert!(reason.contains("upper"), "{reason}");
-    assert_eq!(
-        window,
-        TimeRange {
-            start_ns: 0,
-            end_ns: NOW + 1
-        }
-    );
 }
 
 #[tokio::test]

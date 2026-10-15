@@ -1,6 +1,6 @@
 //! ES|QL over the `logs` table (ADR-2887): bind a statement parsed by
-//! [`ravel_esql::parse`] and lower it to a DataFusion logical plan that runs
-//! through [`SqlExecutor::execute_statement_accounted`].
+//! [`ravel_esql::parse`] and lower it to a DataFusion logical plan that
+//! [`execute`] runs through the [`SqlExecutor`](crate::SqlExecutor).
 //!
 //! No HTTP handler calls [`prepare`] yet.
 //!
@@ -81,13 +81,12 @@ pub struct PrepareContext {
 
 /// A parsed and bound ES|QL statement, ready to run.
 ///
-/// Run it through [`execute`]. A `ROW` statement must not be handed to
-/// [`SqlExecutor::execute_statement_accounted`] directly: its
-/// [`target`](LoweredStatement::target) still names the `logs` signal while
-/// [`needs_catalog`](Self::needs_catalog) says it reads no catalog, and only
-/// [`execute`] routes it to a session that registers no table.
-///
-/// [`SqlExecutor::execute_statement_accounted`]: crate::executor::SqlExecutor::execute_statement_accounted
+/// It runs only through [`execute`], which routes on its
+/// [`window`](Self::window). Its [`target`](LoweredStatement::target) names
+/// the `logs` signal for a `ROW` statement too, while
+/// [`needs_catalog`](Self::needs_catalog) is false for one: [`execute`] runs
+/// a `ROW` statement in a session that registers no table, and it reads
+/// neither [`EsqlRequest::budgets`] nor [`EsqlRequest::max_rows`].
 #[derive(Debug, Clone)]
 pub struct PreparedEsql {
     text: String,
@@ -218,13 +217,12 @@ impl PreparedEsql {
     }
 }
 
+impl crate::statement::sealed::Sealed for PreparedEsql {}
+
 #[async_trait]
 impl LoweredStatement for PreparedEsql {
     /// The `logs` signal, for a `ROW` statement as well, which reads no
-    /// catalog: run a `ROW` statement through [`execute`], never through
-    /// [`SqlExecutor::execute_statement_accounted`] directly.
-    ///
-    /// [`SqlExecutor::execute_statement_accounted`]: crate::executor::SqlExecutor::execute_statement_accounted
+    /// catalog; [`execute`] does not run a `ROW` statement over this target.
     fn target(&self) -> StatementTarget {
         StatementTarget::Signal(TargetSignal::Logs)
     }

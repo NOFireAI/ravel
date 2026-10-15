@@ -24,14 +24,16 @@ pub struct EsqlRequest {
     pub min_tokens: Vec<CommitToken>,
     /// The whole request's deadline.
     pub deadline: Duration,
-    /// The request's resource budgets, passed to the executor as
-    /// [`StatementRequest::budgets`]. A `ROW` statement scans no segment and
-    /// issues no store request, so it does not read them; it runs under the
-    /// tenant's memory budget alone.
+    /// The request's resource budgets, which bound a `FROM logs` statement's
+    /// run through the executor as they bound a SQL request's
+    /// ([`SqlRequest::budgets`](crate::executor::SqlRequest::budgets)). A
+    /// `ROW` statement scans no segment and issues no store request, so it
+    /// does not read them; it runs under the tenant's memory budget alone.
     pub budgets: Option<RequestBudgets>,
-    /// The caller's row cap, passed to the executor as
-    /// [`StatementRequest::max_rows`]: a `FROM logs` statement returning more
-    /// rows reports [`SqlStats::row_cap_hit`](crate::executor::SqlStats::row_cap_hit).
+    /// The caller's row cap: a `FROM logs` statement returning more rows
+    /// reports [`SqlStats::row_cap_hit`](crate::executor::SqlStats::row_cap_hit),
+    /// as a SQL request does under
+    /// [`SqlRequest::max_rows`](crate::executor::SqlRequest::max_rows).
     /// A `ROW` statement returns one row and does not read it.
     pub max_rows: Option<usize>,
 }
@@ -69,17 +71,20 @@ impl EsqlOutcome {
 
 /// Run `prepared` for `tenant`.
 ///
-/// A `FROM logs` statement runs through
-/// [`SqlExecutor::execute_statement_accounted`] over the statement's window,
-/// which selects the segments the catalog lists and also filters the rows, so
-/// no row outside the window is returned whatever the segment layout.
+/// The statement is routed on its [`PreparedEsql::window`]. A `FROM logs`
+/// statement runs through the executor's lowered-statement path over that
+/// window, which selects the segments the catalog lists and also filters the
+/// rows, so no row outside the window is returned whatever the segment
+/// layout; it reads every [`EsqlRequest`] field.
 ///
-/// A `ROW` statement reads no table, so it resolves no snapshot: it runs as a
-/// `Values` plan in a session that registers no table, built from the
-/// executor's configuration with a memory pool that charges `tenant`'s budget
-/// under the per-query ceiling, and it is lowered, admitted, executed and
-/// collected under `request.deadline`. It reports no [`SqlOutcome`] and moves
-/// nothing through `live`.
+/// A `ROW` statement has no window and reads no table, so it resolves no
+/// snapshot, although its [`target`](LoweredStatement::target) names the
+/// `logs` signal: it runs as a `Values` plan in a session that registers no
+/// table, built from the executor's configuration with a memory pool that
+/// charges `tenant`'s budget under the per-query ceiling, and it is lowered,
+/// admitted, executed and collected under `request.deadline`. It reads no
+/// other `request` field, reports no [`SqlOutcome`] and moves nothing through
+/// `live`.
 pub async fn execute(
     executor: &SqlExecutor,
     tenant: TenantHash,

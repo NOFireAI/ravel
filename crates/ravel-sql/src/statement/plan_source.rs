@@ -2,17 +2,17 @@
 //!
 //! The statements here are built with DataFusion's `LogicalPlanBuilder` and
 //! expression API over the `LoweringContext` the executor hands the lowering,
-//! which is what a non-SQL front end does. Each one counts its lowerings and
-//! records the provider it scanned, so a test can tell the classification
-//! session, the executed session and a retry's rebuilt session apart.
+//! which is what a non-SQL front end does. Each one counts its lowerings,
+//! records the site each was for and the provider it scanned, so a test can
+//! tell the classification session, the executed session and a retry's
+//! rebuilt session apart.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
-
-use crate::util;
+#![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
@@ -24,6 +24,7 @@ use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction};
 use datafusion::logical_expr::{
     AggregateUDF, Expr, LogicalPlan, LogicalPlanBuilder, ScalarUDF, cast, col, exists, lit,
 };
+use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
@@ -34,15 +35,61 @@ use ravel_object_store::fault::{
 };
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
-use ravel_query::{RequestBudgets, RequestLimit};
-use ravel_sql::{
-    DialectPolicy, ErrorClass, LiveAccounting, LoweredStatement, LoweringContext, MSG_INTERNAL,
-    SpillConfig, SqlConfig, SqlError, SqlOutcome, SqlRequest, StatementRequest, StatementTarget,
-    TargetSignal, ValidationError,
-};
-use ravel_types::{Signal, TenantId, logstream};
-use util::{Fixture, request, tenant_id};
+use ravel_query::{LogSegmentFetcher, RequestBudgets, RequestLimit, SegmentFetcher};
+use ravel_types::{Signal, TenantId, TimeRange, logstream};
 use uuid::Uuid;
+
+use super::LoweringSite;
+use crate::executor::StatementRequest;
+use crate::{
+    DialectPolicy, ErrorClass, LiveAccounting, LoweredStatement, LoweringContext, MSG_INTERNAL,
+    SpanSegmentFetcher, SpillConfig, SqlConfig, SqlError, SqlExecutor, SqlOutcome, SqlRequest,
+    StatementTarget, TargetSignal, ValidationError,
+};
+
+const NS_PER_HOUR: i64 = 3_600_000_000_000;
+
+pub(crate) fn tenant_id(name: &str) -> TenantId {
+    TenantId::new(name.to_string())
+}
+
+/// A `SqlRequest` over the first three hours, four hours in.
+pub(crate) fn request(sql: &str) -> SqlRequest {
+    SqlRequest {
+        sql: sql.to_string(),
+        window: TimeRange {
+            start_ns: 0,
+            end_ns: 3 * NS_PER_HOUR,
+        },
+        min_tokens: Vec::new(),
+        now_ns: 4 * NS_PER_HOUR,
+        deadline: Duration::from_secs(30),
+        row_window: false,
+        max_rows: None,
+        budgets: None,
+    }
+}
+
+/// An executor over a store a test published to.
+pub(crate) struct Fixture {
+    pub(crate) executor: SqlExecutor,
+}
+
+impl Fixture {
+    fn build(store: Arc<dyn ObjectStoreBackend>, config: SqlConfig) -> Self {
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let executor = SqlExecutor::new(
+            catalog,
+            SegmentFetcher::new(Arc::clone(&store)),
+            LogSegmentFetcher::new(Arc::clone(&store)),
+            SpanSegmentFetcher::new(Arc::clone(&store)),
+            config,
+            1 << 30,
+        );
+        Fixture { executor }
+    }
+}
 
 /// `(ts_ns, severity_num, severity_text, body)` for each published record.
 const RECORDS: [(i64, u8, &str, &str); 6] = [
@@ -65,11 +112,13 @@ type Lowering =
 
 /// A programmatic statement over a fixed target: `build` lowers it against the
 /// context it is handed.
-struct Programmatic {
+pub(crate) struct Programmatic {
     target: StatementTarget,
     policy: DialectPolicy,
     build: Box<Lowering>,
     lowerings: AtomicUsize,
+    /// The site of each lowering, in order.
+    sites: Mutex<Vec<LoweringSite>>,
     /// The `logs` provider each lowering's context held, kept alive so two
     /// sessions' providers cannot share an address.
     providers: Mutex<Vec<Arc<dyn TableProvider>>>,
@@ -85,7 +134,7 @@ impl std::fmt::Debug for Programmatic {
 }
 
 impl Programmatic {
-    fn over_logs<F>(policy: DialectPolicy, build: F) -> Self
+    pub(crate) fn over_logs<F>(policy: DialectPolicy, build: F) -> Self
     where
         F: Fn(&LoweringContext, usize) -> Result<LogicalPlan, DataFusionError>
             + Send
@@ -97,17 +146,22 @@ impl Programmatic {
             policy,
             build: Box::new(build),
             lowerings: AtomicUsize::new(0),
+            sites: Mutex::new(Vec::new()),
             providers: Mutex::new(Vec::new()),
         }
     }
 
-    fn lowerings(&self) -> usize {
+    pub(crate) fn lowerings(&self) -> usize {
         self.lowerings.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn sites(&self) -> Vec<LoweringSite> {
+        self.sites.lock().unwrap().clone()
     }
 
     /// How many different `logs` providers the lowerings were handed: one
     /// per session, since every session is built over its own provider.
-    fn distinct_sessions(&self) -> usize {
+    pub(crate) fn distinct_sessions(&self) -> usize {
         let providers = self.providers.lock().unwrap();
         let mut distinct: Vec<&Arc<dyn TableProvider>> = Vec::new();
         for provider in providers.iter() {
@@ -116,6 +170,12 @@ impl Programmatic {
             }
         }
         distinct.len()
+    }
+}
+
+impl super::sealed::Sealed for Programmatic {
+    fn lowering_at(&self, site: LoweringSite) {
+        self.sites.lock().unwrap().push(site);
     }
 }
 
@@ -158,7 +218,7 @@ fn logs_scan_node(
 
 /// A call carrying `func` itself. `AggregateUDF::call` would wrap a copy,
 /// which admission refuses as a foreign instance.
-fn aggregate_call(func: Arc<AggregateUDF>, args: Vec<Expr>) -> Expr {
+pub(crate) fn aggregate_call(func: Arc<AggregateUDF>, args: Vec<Expr>) -> Expr {
     Expr::AggregateFunction(AggregateFunction::new_udf(
         func,
         args,
@@ -210,7 +270,7 @@ fn unordered_grouped_statement() -> Programmatic {
     })
 }
 
-fn statement_request() -> StatementRequest {
+pub(crate) fn statement_request() -> StatementRequest {
     let req = request("");
     StatementRequest {
         window: req.window,
@@ -223,10 +283,10 @@ fn statement_request() -> StatementRequest {
     }
 }
 
-async fn run_statement(
+pub(crate) async fn run_statement(
     fixture: &Fixture,
     tenant: &TenantId,
-    statement: &Programmatic,
+    statement: &dyn LoweredStatement,
     req: &StatementRequest,
 ) -> Result<SqlOutcome, SqlError> {
     fixture
@@ -248,7 +308,7 @@ async fn run_sql(
 
 /// A fixture over a fresh `FaultStore` carrying `plan`, with the logs records
 /// published for `tenant`.
-async fn logs_fixture(
+pub(crate) async fn logs_fixture(
     plan: FaultPlan,
     tenant: &TenantId,
     config: SqlConfig,
@@ -256,12 +316,12 @@ async fn logs_fixture(
     let store = Arc::new(FaultStore::new(MemoryStore::new(), plan));
     let backend: Arc<dyn ObjectStoreBackend> = Arc::clone(&store) as Arc<dyn ObjectStoreBackend>;
     publish_logs(backend.as_ref(), tenant).await;
-    let fixture = Fixture::build(backend, &[], config, 1 << 30).await;
+    let fixture = Fixture::build(backend, config);
     (store, fixture)
 }
 
 /// Every cell of every row, rendered with Arrow's display formatter.
-fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+pub(crate) fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
@@ -277,7 +337,7 @@ fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     out
 }
 
-fn owned(rows: &[&[&str]]) -> Vec<Vec<String>> {
+pub(crate) fn owned(rows: &[&[&str]]) -> Vec<Vec<String>> {
     rows.iter()
         .map(|row| row.iter().map(|cell| (*cell).to_string()).collect())
         .collect()
@@ -418,7 +478,7 @@ fn spill_subdirs(root: &Path) -> usize {
         .count()
 }
 
-fn spill_enabled_config(dir: &Path) -> SqlConfig {
+pub(crate) fn spill_enabled_config(dir: &Path) -> SqlConfig {
     SqlConfig {
         spill: Some(SpillConfig {
             dir: dir.to_path_buf(),
@@ -557,6 +617,10 @@ async fn lowered_plan_with_an_unlisted_function_is_refused() {
         .await
         .expect_err("a function the policy does not list is refused");
     assert_not_admitted(&err, "does not list");
+    // The default configuration builds a classification session, and its
+    // admission refuses before the executed session lowers.
+    assert_eq!(statement.lowerings(), 1, "refused at classification");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// DataFusion's own `min` under the admitted name `min`: the session
@@ -588,6 +652,7 @@ async fn lowered_plan_with_a_foreign_function_instance_is_refused() {
         .await
         .expect_err("a same-named foreign instance is refused");
     assert_not_admitted(&err, "not the session's instance");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// A scan outside the target is refused by name, and a scan of the target
@@ -610,6 +675,7 @@ async fn lowered_plan_scanning_another_table_is_refused() {
         .await
         .expect_err("a scan outside the target is refused");
     assert_not_admitted(&err, "not in its target");
+    assert_eq!(elsewhere.sites(), [LoweringSite::Classification]);
 
     let impostor = Programmatic::over_logs(DialectPolicy::default(), |_ctx, _call| {
         LogicalPlanBuilder::scan("logs", provider_as_source(foreign_table()), None)?.build()
@@ -618,6 +684,7 @@ async fn lowered_plan_scanning_another_table_is_refused() {
         .await
         .expect_err("a foreign provider under the target's name is refused");
     assert_not_admitted(&err, "did not register");
+    assert_eq!(impostor.sites(), [LoweringSite::Classification]);
 }
 
 #[tokio::test]
@@ -633,6 +700,7 @@ async fn lowered_plan_with_an_unadmitted_node_is_refused() {
         .await
         .expect_err("a join is refused");
     assert_not_admitted(&err, "unadmitted Join node");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// A subquery expression is walked as its own `Subquery` node, which is not
@@ -653,6 +721,7 @@ async fn lowered_plan_with_a_subquery_is_refused() {
         .await
         .expect_err("a subquery is refused");
     assert_not_admitted(&err, "unadmitted Subquery");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// `AggregateUDF::call` wraps a copy of the session's instance in a new
@@ -680,6 +749,7 @@ async fn lowered_plan_with_a_copy_of_the_session_instance_is_refused() {
         .await
         .expect_err("a copy of the session's count is refused");
     assert_not_admitted(&err, "not the session's instance");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// The Parquet signal names no table, so it is not a statement target.
@@ -695,6 +765,7 @@ async fn parquet_signal_target_is_refused() {
         .expect_err("the Parquet signal target is refused");
     assert_not_admitted(&err, "Parquet target");
     assert_eq!(statement.lowerings(), 0, "refused before any lowering");
+    assert!(statement.sites().is_empty());
 }
 
 /// SQL through the routed path: exact rows, or the exact error variant, for
@@ -904,6 +975,7 @@ async fn stock_scalar_under_a_name_the_session_replaced_is_refused() {
         .await
         .expect_err("the stock character_length under length is refused");
     assert_not_admitted(&err, "not the session's instance");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// The session did not replace `count`, so DataFusion's own handle is the
@@ -974,6 +1046,7 @@ async fn foreign_function_is_refused_at_the_executed_site() {
         .expect_err("the executed site refuses a foreign min");
     assert_not_admitted(&err, "not the session's instance");
     assert_eq!(statement.lowerings(), 1, "only the executed site lowered");
+    assert_eq!(statement.sites(), [LoweringSite::Executed]);
 }
 
 /// Clean for the classification session, foreign for the executed one: the
@@ -995,6 +1068,10 @@ async fn lowering_refused_only_on_its_second_call_is_refused() {
         .expect_err("the second lowering is refused");
     assert_not_admitted(&err, "not the session's instance");
     assert_eq!(statement.lowerings(), 2, "one classification, one executed");
+    assert_eq!(
+        statement.sites(),
+        [LoweringSite::Classification, LoweringSite::Executed]
+    );
 }
 
 /// The snapshot retry's executed lowering is admitted on its own: the first
@@ -1027,6 +1104,10 @@ async fn retry_lowering_is_admitted_again() {
     assert_not_admitted(&err, "not the session's instance");
     assert_eq!(statement.lowerings(), 2, "one per attempt");
     assert_eq!(statement.distinct_sessions(), 2);
+    assert_eq!(
+        statement.sites(),
+        [LoweringSite::Executed, LoweringSite::Executed]
+    );
 }
 
 /// A scan whose `filters` are set, the shape only the optimizer's pushdown
@@ -1045,6 +1126,7 @@ async fn lowered_scan_with_filters_is_refused() {
         .await
         .expect_err("a scan carrying filters is refused");
     assert_not_admitted(&err, "with filters");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// A scan whose `fetch` is set is refused.
@@ -1062,6 +1144,7 @@ async fn lowered_scan_with_a_fetch_is_refused() {
         .await
         .expect_err("a scan carrying a fetch is refused");
     assert_not_admitted(&err, "with a fetch");
+    assert_eq!(statement.sites(), [LoweringSite::Classification]);
 }
 
 /// The classification lowering sums an integer column, which is exact-typed;
@@ -1094,6 +1177,49 @@ async fn lowering_that_changes_an_aggregate_input_type_is_refused() {
         .expect_err("a lowering whose aggregate changes type is refused");
     assert_not_admitted(&err, "not repeatable");
     assert_eq!(statement.lowerings(), 2, "one classification, one executed");
+    assert_eq!(
+        statement.sites(),
+        [LoweringSite::Classification, LoweringSite::Executed]
+    );
+}
+
+/// The other direction: the classification lowering sums the cast, which is
+/// not exact-typed, so the session aggregates serially; the executed lowering
+/// sums the integer column, which is. A serial aggregation is correct for
+/// an exact-typed plan, so the statement runs.
+#[tokio::test]
+async fn lowering_exact_typed_only_on_its_executed_call_runs() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(Vec::<String>::new(), ["sum"], Vec::<String>::new()),
+        |ctx, call| {
+            let sum = ctx.aggregate("sum")?;
+            let input = match call {
+                1 => cast(col("severity_num"), DataType::Float64),
+                _ => col("severity_num"),
+            };
+            ctx.scan("logs")?
+                .aggregate(
+                    vec![col("severity_text")],
+                    vec![aggregate_call(sum, vec![input]).alias("s")],
+                )?
+                .sort(vec![col("severity_text").sort(true, false)])?
+                .build()
+        },
+    );
+
+    let outcome = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect("an executed plan more exact than its classification runs");
+    assert_eq!(
+        rows(outcome.output.batches()),
+        owned(&[&["DEBUG", "5"], &["INFO", "27"], &["WARN", "26"]])
+    );
+    assert_eq!(
+        statement.sites(),
+        [LoweringSite::Classification, LoweringSite::Executed]
+    );
 }
 
 /// The control for the case above: the integer sum on both calls runs.
@@ -1123,4 +1249,75 @@ async fn lowering_with_the_same_aggregate_on_both_calls_runs() {
         owned(&[&["DEBUG", "5"], &["INFO", "27"], &["WARN", "26"]])
     );
     assert_eq!(statement.lowerings(), 2);
+}
+
+/// A [`PreparedEsql`](crate::esql::PreparedEsql) whose lowering wraps the
+/// plan in a projection calling `upper`, which the statement's policy does
+/// not name.
+#[derive(Debug)]
+struct Corrupted(crate::esql::PreparedEsql);
+
+impl super::sealed::Sealed for Corrupted {}
+
+#[async_trait]
+impl LoweredStatement for Corrupted {
+    fn target(&self) -> StatementTarget {
+        self.0.target()
+    }
+
+    fn text(&self) -> &str {
+        self.0.text()
+    }
+
+    fn policy(&self) -> &DialectPolicy {
+        self.0.policy()
+    }
+
+    async fn lower(&self, ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
+        let plan = self.0.lower(ctx).await?;
+        LogicalPlanBuilder::from(plan)
+            .project(vec![
+                scalar_call(ctx.scalar("upper")?, vec![col("message")]).alias("m"),
+            ])?
+            .build()
+    }
+}
+
+#[tokio::test]
+async fn a_lowering_calling_a_function_off_its_policy_is_refused() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let now = 4 * NS_PER_HOUR;
+    let prepared = crate::esql::prepare(
+        "FROM logs | KEEP message",
+        &ravel_esql::Limits::default(),
+        &crate::esql::PrepareContext {
+            declared: Vec::new(),
+            now_ns: now,
+            start: None,
+            end: None,
+        },
+    )
+    .expect("prepares");
+    let window = prepared.window().expect("a FROM statement has a window");
+    let request = StatementRequest {
+        window,
+        now_ns: now,
+        row_window: true,
+        ..statement_request()
+    };
+    let err = run_statement(&fixture, &tenant, &Corrupted(prepared), &request)
+        .await
+        .expect_err("refused");
+    let SqlError::PlanNotAdmitted(reason) = &err else {
+        panic!("expected PlanNotAdmitted, got {err}");
+    };
+    assert!(reason.contains("upper"), "{reason}");
+    assert_eq!(
+        window,
+        TimeRange {
+            start_ns: 0,
+            end_ns: now + 1
+        }
+    );
 }

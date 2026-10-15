@@ -368,7 +368,7 @@ pub struct SqlRequest {
 /// ([`SqlExecutor::execute_statement_accounted`]): every [`SqlRequest`]
 /// field but the text, with the same meaning.
 #[derive(Debug, Clone)]
-pub struct StatementRequest {
+pub(crate) struct StatementRequest {
     pub window: TimeRange,
     pub min_tokens: Vec<CommitToken>,
     pub now_ns: i64,
@@ -1162,6 +1162,9 @@ pub struct SqlExecutor {
     /// spill because the executed plan failed the spill re-check.
     #[cfg(test)]
     spill_fallbacks: std::sync::atomic::AtomicUsize,
+    /// How many times [`Self::executed_plan`] built a plan to execute.
+    #[cfg(test)]
+    executed_plan_builds: std::sync::atomic::AtomicUsize,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -1206,6 +1209,8 @@ impl SqlExecutor {
             executed_plan_tamper: None,
             #[cfg(test)]
             spill_fallbacks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            executed_plan_builds: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1454,8 +1459,9 @@ impl SqlExecutor {
     /// because there is no SQL text. Plan admission refuses every scan outside
     /// the statement's target in place of the last; the caller must bound the
     /// statement's size and nesting with its own structural guard before
-    /// calling.
-    pub async fn execute_statement_accounted(
+    /// calling. The statement's [`LoweredStatement::text`] is not read or
+    /// audited here; the caller records it.
+    pub(crate) async fn execute_statement_accounted(
         &self,
         tenant_hash: TenantHash,
         statement: &dyn LoweredStatement,
@@ -1464,7 +1470,7 @@ impl SqlExecutor {
     ) -> Result<SqlOutcome, SqlError> {
         let statement = Statement::Lowered(statement);
         let sql_req = SqlRequest {
-            sql: statement.text().to_string(),
+            sql: String::new(),
             window: req.window,
             min_tokens: req.min_tokens.clone(),
             now_ns: req.now_ns,
@@ -2314,7 +2320,7 @@ impl SqlExecutor {
         let mut plan = self
             .executed_plan(statement, &tables, &ctx, providers)
             .await?;
-        refuse_unrepeated_exact_typed(statement, config, exact_typed_aggregates, &ctx, &plan)?;
+        refuse_unrepeated_exact_typed(statement, exact_typed_aggregates, &ctx, &plan)?;
         // The spill decision was taken on `analyzed`, a separate parse. Fail
         // closed if the plan that actually runs is not eligible after the
         // rewrite: rebuild the session with the disk manager disabled and drop
@@ -2343,13 +2349,7 @@ impl SqlExecutor {
                 plan = self
                     .executed_plan(statement, &tables, &ctx, providers)
                     .await?;
-                refuse_unrepeated_exact_typed(
-                    statement,
-                    config,
-                    exact_typed_aggregates,
-                    &ctx,
-                    &plan,
-                )?;
+                refuse_unrepeated_exact_typed(statement, exact_typed_aggregates, &ctx, &plan)?;
             }
             scratch = None;
             #[cfg(test)]
@@ -2399,6 +2399,9 @@ impl SqlExecutor {
         ctx: &SessionContext,
         providers: Vec<(String, Arc<dyn TableProvider>)>,
     ) -> Result<LogicalPlan, SqlError> {
+        #[cfg(test)]
+        self.executed_plan_builds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut plan = match statement
             .lower(ctx, providers, tables, LoweringSite::Executed)
             .await
@@ -4588,43 +4591,40 @@ fn executed_plan_is_spill_eligible(state: &SessionState, plan: &LogicalPlan) -> 
         .is_ok_and(|analyzed| plan_is_spill_eligible(&analyzed))
 }
 
-/// Refuse a lowered statement whose executed plan does not give the
-/// exact-typed decision its classification plan gave, with
-/// [`SqlError::PlanNotAdmitted`].
+/// Refuse a lowered statement whose classification plan was exact-typed and
+/// whose executed plan is not, with [`SqlError::PlanNotAdmitted`].
 ///
 /// `exact_typed_aggregates` was read off the classification lowering and
-/// already chose `ctx`'s aggregation repartitioning (and a Parquet target's
-/// file groups). Re-derived here from the plan `ctx` executes, analyzed the
-/// same way: a lowering that returned a different aggregate on this call is
-/// not repeatable, and running it would apply an exactness decision taken
-/// for another plan. SQL text is planned by the same binder at both sites
-/// and is not re-checked.
+/// already chose `ctx`'s parallel aggregation (and a Parquet target's file
+/// groups), which only an exact-typed plan may run under. Re-derived here
+/// from the plan `ctx` executes, analyzed the same way. The other direction
+/// runs: a session chosen for a plan that is not exact-typed, or built with
+/// no classification plan, repartitions neither its aggregation nor its file
+/// scans, which every plan is correct under. SQL text is planned by the same
+/// binder at both sites and is not re-checked.
 fn refuse_unrepeated_exact_typed(
     statement: Statement<'_>,
-    config: &SqlConfig,
     exact_typed_aggregates: bool,
     ctx: &SessionContext,
     plan: &LogicalPlan,
 ) -> Result<(), SqlError> {
-    if statement.sql().is_some() {
+    if statement.sql().is_some() || !exact_typed_aggregates {
         return Ok(());
     }
     let state = ctx.state();
     let config_options = Arc::clone(state.config_options());
-    let executed = config.parallel_final_aggregation
-        && state
-            .analyzer()
-            .execute_and_check(plan.clone(), &config_options, |_, _| {})
-            .is_ok_and(|analyzed| plan_is_exact_typed(&analyzed));
-    if executed == exact_typed_aggregates {
+    let executed = state
+        .analyzer()
+        .execute_and_check(plan.clone(), &config_options, |_, _| {})
+        .is_ok_and(|analyzed| plan_is_exact_typed(&analyzed));
+    if executed {
         return Ok(());
     }
-    Err(SqlError::PlanNotAdmitted(format!(
-        "the executed plan is {}exact-typed, but the classification plan was {}: \
-         the lowering is not repeatable",
-        if executed { "" } else { "not " },
-        if exact_typed_aggregates { "" } else { "not" },
-    )))
+    Err(SqlError::PlanNotAdmitted(
+        "the classification plan was exact-typed and the executed plan is not: \
+         the lowering is not repeatable"
+            .to_string(),
+    ))
 }
 
 /// A second handle on the table `table` serves, for rebuilding a query's
@@ -7169,6 +7169,120 @@ mod tests {
         assert!(
             without.accounting.s3_requests.iter().sum::<u64>() > 0,
             "the comparison must cover a run that read the store"
+        );
+    }
+
+    /// SQL that falls back to spill disabled keeps the plan it already built:
+    /// the executed plan is built once.
+    #[tokio::test]
+    async fn sql_plans_once_on_the_spill_fallback() {
+        let (store, tenant_hash, _data_key) =
+            one_metrics_segment("spill-fallback-2967", 100, FaultPlan::empty()).await;
+        let root = tempfile::tempdir().expect("spill root");
+        let request = sql_request(
+            "SELECT ts, series_id, count(*) AS c FROM samples \
+             GROUP BY ts, series_id ORDER BY ts DESC LIMIT 10",
+            TimeRange {
+                start_ns: 0,
+                end_ns: 100,
+            },
+        );
+        let mut executor = spill_executor_over(store, root.path());
+        executor.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let outcome = executor
+            .execute(tenant_hash, &request)
+            .await
+            .expect("the statement runs with spill disabled");
+        assert_eq!(
+            executor
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tampered plan must take the fallback"
+        );
+        assert_eq!(
+            executor
+                .executed_plan_builds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "SQL is not planned again on the fallback"
+        );
+        assert_eq!(
+            ts_values(&outcome.output),
+            (90..100).rev().collect::<Vec<_>>()
+        );
+    }
+
+    /// A lowered statement that falls back to spill disabled is lowered
+    /// again, for the rebuilt session, and that lowering is the one that
+    /// runs.
+    #[tokio::test]
+    async fn lowered_statement_relowers_on_the_spill_fallback() {
+        use datafusion::logical_expr::{col, lit};
+        use ravel_object_store::fault::FaultPlan;
+
+        use crate::statement::plan_source::{
+            Programmatic, aggregate_call, logs_fixture, owned, rows, run_statement,
+            spill_enabled_config, statement_request, tenant_id,
+        };
+        use crate::statement::{DialectPolicy, LoweringSite};
+
+        let tenant = tenant_id("acme-logs");
+        let root = tempfile::tempdir().expect("spill root");
+        let (_store, mut fixture) = logs_fixture(
+            FaultPlan::empty(),
+            &tenant,
+            spill_enabled_config(root.path()),
+        )
+        .await;
+        fixture.executor.executed_plan_tamper = Some(keep_the_first_sort_term);
+        let statement = Programmatic::over_logs(
+            DialectPolicy::new(Vec::<String>::new(), ["count"], Vec::<String>::new()),
+            |ctx, _call| {
+                let count = ctx.aggregate("count")?;
+                ctx.scan("logs")?
+                    .aggregate(
+                        vec![col("severity_text")],
+                        vec![aggregate_call(count, vec![lit(1i64)]).alias("n")],
+                    )?
+                    .sort(vec![col("n").sort(false, false)])?
+                    .limit(0, Some(10))?
+                    .build()
+            },
+        );
+
+        let outcome = run_statement(&fixture, &tenant, &statement, &statement_request())
+            .await
+            .expect("the statement runs with spill disabled");
+        let executor = &fixture.executor;
+        assert_eq!(
+            executor
+                .spill_fallbacks
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the tampered plan must take the fallback"
+        );
+        assert_eq!(
+            executor
+                .executed_plan_builds
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the first executed session's plan and the rebuilt session's"
+        );
+        assert_eq!(
+            statement.sites(),
+            [
+                LoweringSite::Classification,
+                LoweringSite::Executed,
+                LoweringSite::Executed
+            ]
+        );
+        // The rebuilt session is built over the first executed session's
+        // providers (`clone_session_table`).
+        assert_eq!(statement.distinct_sessions(), 2);
+        assert_eq!(
+            rows(outcome.output.batches()),
+            owned(&[&["INFO", "3"], &["WARN", "2"], &["DEBUG", "1"]])
         );
     }
 
