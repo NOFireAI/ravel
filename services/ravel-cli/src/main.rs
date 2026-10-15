@@ -2148,10 +2148,12 @@ enum CatalogCommand {
         /// suffix); no part is re-encoded and no part, `.csnap` or `.cstat` is
         /// written. Publishes HEAD once per batch (`--batch-entries`), so an
         /// interrupted run keeps every earlier batch and a rerun skips the
-        /// parts they indexed. Needs no `--key-index-leaves` (and refuses
-        /// it), holds no claim and seals no hour, so `--writers-stopped`
-        /// changes nothing here. Applies to `--signal spans` and `--signal
-        /// logs`.
+        /// parts they indexed; a part with an entry whose ranged GET failed
+        /// gains no ref and is read again by a rerun (`parts_deferred`). Needs
+        /// no `--key-index-leaves` (and refuses it), holds no claim and seals
+        /// no hour, so `--writers-stopped` changes nothing here. Applies to
+        /// `--signal spans` and to a logs tenant that declares a key-index
+        /// field; a logs tenant that declares none is refused.
         #[arg(long, conflicts_with_all = ["key_index_leaves", "max_flush_lifetime"])]
         rebuild_key_index: bool,
         /// With `--rebuild-key-index`, rebuild only this field. Refused unless
@@ -2162,9 +2164,10 @@ enum CatalogCommand {
         /// With `--rebuild-key-index`, the entry total one HEAD publish
         /// covers: a batch is the longest run of the remaining unindexed parts
         /// whose entries stay at or below this, and at least one part, so a
-        /// part larger than it is a batch of its own.
+        /// part larger than it is a batch of its own. At least 1.
         #[arg(long, value_name = "N", requires = "rebuild_key_index",
-              default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES)]
+              default_value_t = ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
+              value_parser = clap::value_parser!(u64).range(1..))]
         batch_entries: u64,
         /// Print the full `FoldReport` (with `--rebuild-key-index`, the
         /// `KeyIndexRebuildReport`) as JSON instead of the human-readable
@@ -4528,7 +4531,8 @@ mod tests {
     /// `catalog fold --rebuild-key-index` (ADR-2707 decision 4): `--field`
     /// and `--batch-entries` are refused without it, it is refused beside
     /// `--key-index-leaves` and `--max-flush-lifetime`, and it accepts
-    /// `--writers-stopped`. `--batch-entries` defaults to 250,000.
+    /// `--writers-stopped`. `--batch-entries` defaults to 250,000 and refuses
+    /// 0 at parse time.
     #[test]
     fn catalog_fold_rebuild_key_index_flags() {
         let try_parse = |extra: &[&str]| {
@@ -4585,6 +4589,10 @@ mod tests {
             (
                 &["--rebuild-key-index", "--max-flush-lifetime", "0s"],
                 clap::error::ErrorKind::ArgumentConflict,
+            ),
+            (
+                &["--rebuild-key-index", "--batch-entries", "0"],
+                clap::error::ErrorKind::ValueValidation,
             ),
         ] {
             let err = match try_parse(extra) {

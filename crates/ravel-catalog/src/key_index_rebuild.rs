@@ -4,10 +4,12 @@
 //! "Rollout").
 //!
 //! The leaves are built by the fold's own leaf build from the same ranged
-//! KEY_IDX reads, so a rebuilt leaf is byte-identical to the one a fold with
-//! `build_key_index_leaves` on would have written for the same part.
+//! KEY_IDX reads, so for a declared field a rebuilt leaf is byte-identical to
+//! the one a fold with `build_key_index_leaves` on writes for the same part.
+//! The fold also indexes fields a KEY_IDX section names that the tenant does
+//! not declare; the rebuild does not.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use futures::stream::{self, StreamExt};
@@ -81,6 +83,9 @@ pub struct KeyIndexRebuildReport {
     pub parts_unindexed: u64,
     /// Parts a published HEAD attached at least one ref to.
     pub parts_rebuilt: u64,
+    /// Parts given no ref this run because a ranged GET for one of their
+    /// entries failed with a store error; a rerun reads them again.
+    pub parts_deferred: u64,
     /// Leaves PUT, including any a lost CAS left unreferenced.
     pub leaves_written: u64,
     /// Total bytes of those leaves.
@@ -88,10 +93,11 @@ pub struct KeyIndexRebuildReport {
     /// Bytes the ranged GETs returned: footer suffixes, any extra footer
     /// ranges, and KEY_IDX sections, as transferred, retries excluded.
     pub section_bytes_read: u64,
-    /// Ranged GETs of data objects, footer suffix and section together.
+    /// Ranged GETs of data objects: footer suffixes, any extra footer
+    /// ranges, and KEY_IDX sections together.
     pub ranged_gets: u64,
-    /// For each part built and each field built for it, the part entries no
-    /// leaf covers, summed.
+    /// For each part built (deferred parts excluded) and each field built for
+    /// it, the part entries no leaf covers, summed.
     pub uncovered_entries: u64,
     /// Batches that reached their publish step.
     pub attempt_count: u64,
@@ -112,6 +118,10 @@ pub enum KeyIndexRebuildError {
     },
     #[error("{0:?} objects carry no KEY_IDX section; the key-index rebuild covers logs and spans")]
     UnsupportedSignal(Signal),
+    #[error(
+        "tenant {tenant} declares no key-index field for {signal:?}; declare a key_index column or turn on trace-id indexing first"
+    )]
+    NoFieldDeclared { tenant: String, signal: Signal },
     #[error("tenant config read failed: {0}")]
     TenantConfig(#[from] TenantConfigError),
     #[error("HEAD at {key} does not decode; run a plain fold to rebuild it first")]
@@ -149,6 +159,7 @@ impl KeyIndexRebuildError {
             | Self::HeadLost { report, .. }
             | Self::Interrupted { report, .. } => Some(report),
             Self::FieldNotDeclared { .. }
+            | Self::NoFieldDeclared { .. }
             | Self::UnsupportedSignal(_)
             | Self::TenantConfig(_)
             | Self::CorruptHead { .. } => None,
@@ -224,7 +235,9 @@ impl Catalog {
     /// Attaches key-index leaves to the parts in `signal`'s HEAD that lack a
     /// ref for a declared field (or for `options.field` only), without
     /// re-encoding any part (ADR-2707 decision 4, "Lifecycle"). Runs
-    /// whatever [`crate::CatalogConfig::build_key_index_leaves`] says.
+    /// regardless of [`crate::CatalogConfig::build_key_index_leaves`]. A
+    /// tenant declaring no key-index field for `signal` is refused, as is an
+    /// undeclared `options.field`, before HEAD is read.
     ///
     /// Each part is read once and verified against its `blake3`; each of its
     /// entries costs the fold's ranged KEY_IDX reads. The leaves are built and
@@ -237,7 +250,9 @@ impl Catalog {
     /// re-reads HEAD and attaches refs only to batch parts whose `blake3` the
     /// new HEAD still names; it reads no section again. A part already holding
     /// a ref for every requested field costs no GET, and a part holding some
-    /// keeps them and gains the rest.
+    /// keeps them and gains the rest. A part one of whose entries' ranged
+    /// GETs failed with a store error is deferred: it gains no ref this run,
+    /// so a rerun reads it again.
     pub async fn rebuild_key_index(
         &self,
         tenant: &TenantHash,
@@ -262,13 +277,16 @@ impl Catalog {
                 }
             },
         };
+        if requested.is_empty() {
+            return Err(KeyIndexRebuildError::NoFieldDeclared {
+                tenant: tenant.to_hex(),
+                signal,
+            });
+        }
         let mut report = KeyIndexRebuildReport {
             fields: requested.iter().map(|(name, _)| name.clone()).collect(),
             ..KeyIndexRebuildReport::default()
         };
-        if requested.is_empty() {
-            return Ok(report);
-        }
 
         let head_key = head_object_key(tenant, signal);
         let mut counters = RequestCounters::default();
@@ -371,6 +389,7 @@ impl Catalog {
         let mut attempt = KeyIndexRebuildAttempt::default();
         let mut counters = RequestCounters::default();
         let mut reads: HashMap<String, EntryKeyIndex> = HashMap::new();
+        let mut failed_gets: HashSet<String> = HashSet::new();
         let mut built: Vec<(Vec<u8>, Vec<SnapshotKeyIndexLeafRef>)> = Vec::new();
         for target in batch {
             // A part an earlier batch's CAS loss showed replaced, or already
@@ -431,17 +450,32 @@ impl Catalog {
                 attempt.ranged_gets += read.gets;
                 report.ranged_gets += read.gets;
                 report.section_bytes_read += read.bytes;
-                if read.get_failed
-                    && let Err(reason) = &read.fields
-                {
-                    tracing::warn!(
-                        tenant = %tenant.to_hex(),
-                        object_key = %key,
-                        reason = %reason,
-                        "KEY_IDX read GET failed; the entry is uncovered by the rebuilt key-index leaves"
-                    );
+                if read.get_failed {
+                    if let Err(reason) = &read.fields {
+                        tracing::warn!(
+                            tenant = %tenant.to_hex(),
+                            object_key = %key,
+                            reason = %reason,
+                            "KEY_IDX read GET failed; the parts naming this entry are deferred to a rerun"
+                        );
+                    }
+                    failed_gets.insert(key.clone());
                 }
                 reads.insert(key, read.fields);
+            }
+            let failed_entries = data_keys
+                .iter()
+                .filter(|key| matches!(key, Ok(key) if failed_gets.contains(key)))
+                .count();
+            if failed_entries > 0 {
+                report.parts_deferred += 1;
+                tracing::warn!(
+                    tenant = %tenant.to_hex(),
+                    part_key = %part.key,
+                    failed_entries,
+                    "a KEY_IDX GET failed for this part's entries; the part gains no key-index ref this run and a rerun reads it again"
+                );
+                continue;
             }
             let not_read: EntryKeyIndex = Err("KEY_IDX not read".to_string());
             let entry_fields: Vec<&EntryKeyIndex> = data_keys
@@ -579,13 +613,14 @@ mod tests {
     use ravel_codec::key_idx::{key8_i64, key8_id16};
     use ravel_commit::keys;
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Op, ScriptedFault, Sequence,
+        FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{
         Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta,
         ObjectStoreBackend, PageToken, PutOutcome,
     };
+    use ravel_proto::catalog::v1::SnapshotPostingsRef;
     use ravel_proto::commit::v1::CommitRecord;
 
     use super::*;
@@ -784,6 +819,7 @@ mod tests {
                 fields: vec![USER_ID.to_string()],
                 parts_unindexed: 1,
                 parts_rebuilt: 1,
+                parts_deferred: 0,
                 leaves_written: 1,
                 leaf_bytes_written: report.leaf_bytes_written,
                 section_bytes_read: report.section_bytes_read,
@@ -939,13 +975,16 @@ mod tests {
     /// Three parts of two entries, `--batch-entries 2`, so each part is its own
     /// batch; every HEAD CAS of batch 3 is lost. The run fails with the CAS
     /// budget exhausted on batch 3 after publishing batches 1 and 2, which
-    /// HEAD then names with refs. A rerun reads no section and no part object
-    /// of parts 1 and 2, issues exactly the config GET, the HEAD GET, part 3's
-    /// GET and its four ranged GETs, and completes part 3.
+    /// HEAD then names with refs. The failed run issues exactly four ranged
+    /// GETs per batch, twelve in all, by the report and by the store's own
+    /// record, however many CAS tries batch 3 spends. A rerun reads no section
+    /// and no part object of parts 1 and 2, issues exactly the config GET, the
+    /// HEAD GET, part 3's GET and its four ranged GETs, and completes part 3.
     ///
     /// A rebuild that published every batch in one CAS at the end leaves no
-    /// ref on HEAD here; one that did not skip indexed parts re-reads parts 1
-    /// and 2 on the rerun.
+    /// ref on HEAD here; one that re-read sections on a CAS retry issues more
+    /// than twelve ranged GETs; one that did not skip indexed parts re-reads
+    /// parts 1 and 2 on the rerun.
     #[tokio::test]
     async fn rebuild_interrupted_publishes_earlier_batches_and_rerun_skips_them() {
         let inner = recording_store();
@@ -965,6 +1004,7 @@ mod tests {
             field: None,
             batch_entries: 2,
         };
+        inner.clear();
         let err = catalog
             .rebuild_key_index(&tenant(), Signal::Logs, &options)
             .await
@@ -983,6 +1023,18 @@ mod tests {
         assert_eq!(report.attempt_count, 3, "{report:?}");
         let tries: Vec<u32> = report.attempts.iter().map(|a| a.head_cas_tries).collect();
         assert_eq!(tries, vec![1, 1, MAX_HEAD_CAS_ATTEMPTS]);
+        let ranged: Vec<u64> = report.attempts.iter().map(|a| a.ranged_gets).collect();
+        assert_eq!(ranged, vec![4, 4, 4], "{report:?}");
+        assert_eq!(report.ranged_gets, 12, "{report:?}");
+        let read = inner.data_ranged_gets();
+        assert_eq!(
+            read.len(),
+            12,
+            "no section re-read on a CAS retry: {read:?}"
+        );
+        let read_keys: BTreeSet<String> = read.iter().map(|(key, _, _)| key.clone()).collect();
+        let all_keys: BTreeSet<String> = part_keys.iter().flatten().cloned().collect();
+        assert_eq!(read_keys, all_keys);
         assert_eq!(
             faulty.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
             u64::from(MAX_HEAD_CAS_ATTEMPTS)
@@ -1066,33 +1118,99 @@ mod tests {
         }
     }
 
-    /// One batch of two parts. Between the leaf build and the HEAD CAS another
-    /// writer publishes a HEAD in which the second part is replaced (a
-    /// different `part_blake3`). The retry re-reads HEAD, reads no section
-    /// again, and attaches a ref only to the part that survived; the leaf
-    /// built for the replaced part is stored, binds the old part, and no HEAD
-    /// names it. A rebuild that kept every built ref would attach a leaf
-    /// binding another part's blake3 to the replacement.
+    /// Three parts of two entries, `--batch-entries 4`: batch 1 is parts 1
+    /// and 2, batch 2 is part 3. Between batch 1's leaf build and its HEAD CAS
+    /// another writer publishes a HEAD that replaces part 2 (a different
+    /// `part_blake3`), drops part 3, appends a new part (advancing the
+    /// watermark), and changes the folder id, the postings ref and the shard
+    /// generation count. The retry re-reads HEAD, reads no section again (the
+    /// eight ranged GETs are batch 1's, by the report and by the store's
+    /// record), and publishes the winner's HEAD byte for byte plus part 1's
+    /// ref. The leaf built for the replaced part is stored, binds the old part,
+    /// and no HEAD names it. Part 3 is gone, so batch 2 costs no GET.
+    ///
+    /// A rebuild that kept every built ref attaches a leaf binding another
+    /// part's blake3 to the replacement; one that re-read sections on the
+    /// retry issues more than eight ranged GETs; one that took the winner's
+    /// parts but kept its own watermark, postings and generation count
+    /// publishes a HEAD that is not the winner's outside `key_index`.
     #[tokio::test]
-    async fn rebuild_lost_cas_keeps_only_refs_whose_part_survived() {
+    async fn rebuild_lost_cas_publishes_the_winner_plus_refs_for_surviving_batch_parts() {
         let store = recording_store();
-        let (catalog, _) = two_entry_parts(&store, 2).await;
+        let (catalog, part_keys) = two_entry_parts(&store, 3).await;
         let original = read_signal_head(store.as_ref(), Signal::Logs).await;
-        let mut raced = original.clone();
-        raced.parts[1].blake3 = vec![0xee; 32];
+        let mut winner = original.clone();
+        winner.parts[1].blake3 = vec![0xee; 32];
+        winner.parts.truncate(2);
+        let mut added = original.parts[2].clone();
+        added.key = format!("{}.winner", added.key);
+        added.blake3 = vec![0xdd; 32];
+        added.min_hour = KIDX_HOUR + 5;
+        added.watermark_hour = KIDX_HOUR + 5;
+        winner.parts.push(added);
+        winner.watermark_hour = KIDX_HOUR + 5;
+        winner.folder_id = vec![0xab; 16];
+        winner.created_unix_ns = original.created_unix_ns + 1;
+        winner.shard_generation_count = original.shard_generation_count + 1;
+        winner.postings = Some(SnapshotPostingsRef {
+            key: "winner.postings".to_string(),
+            blake3: vec![0xcc; 32],
+            size: 7,
+            name_count: 3,
+            part_blake3: winner.parts.iter().map(|p| p.blake3.clone()).collect(),
+        });
+        assert_ne!(winner.watermark_hour, original.watermark_hour);
+        assert_ne!(winner.postings, original.postings);
+        assert_ne!(winner.folder_id, original.folder_id);
         *store.head_race.lock().expect("lock") = Some(Bytes::from(
-            snapshot_format::encode_head(&raced).expect("encode"),
+            snapshot_format::encode_head(&winner).expect("encode"),
         ));
 
         store.clear();
-        let report = rebuild(&catalog, Signal::Logs).await;
-        assert_eq!(report.leaves_written, 2, "{report:?}");
-        assert_eq!(report.parts_rebuilt, 1, "{report:?}");
-        assert_eq!(report.attempts.len(), 1, "{report:?}");
-        assert_eq!(report.attempts[0].head_cas_tries, 2, "{report:?}");
-        assert_eq!(report.attempts[0].parts_published, 1, "{report:?}");
-        assert_eq!(report.ranged_gets, 8, "{report:?}");
-        assert_eq!(store.data_ranged_gets().len(), 8, "no section re-read");
+        let report = catalog
+            .rebuild_key_index(
+                &tenant(),
+                Signal::Logs,
+                &KeyIndexRebuildOptions {
+                    field: None,
+                    batch_entries: 4,
+                },
+            )
+            .await
+            .expect("rebuild");
+        assert_eq!(
+            report,
+            KeyIndexRebuildReport {
+                largest_unindexed_part_entries: 2,
+                fields: vec![USER_ID.to_string()],
+                parts_unindexed: 3,
+                parts_rebuilt: 1,
+                parts_deferred: 0,
+                leaves_written: 2,
+                leaf_bytes_written: report.leaf_bytes_written,
+                section_bytes_read: report.section_bytes_read,
+                ranged_gets: 8,
+                uncovered_entries: 0,
+                attempt_count: 1,
+                attempts: vec![KeyIndexRebuildAttempt {
+                    parts: 2,
+                    part_gets: 2,
+                    ranged_gets: 8,
+                    leaf_puts: 2,
+                    head_cas_tries: 2,
+                    parts_published: 1,
+                }],
+            }
+        );
+        let read = store.data_ranged_gets();
+        assert_eq!(read.len(), 8, "no section re-read: {read:?}");
+        let read_keys: BTreeSet<String> = read.iter().map(|(key, _, _)| key.clone()).collect();
+        let batch_one: BTreeSet<String> = part_keys[0].union(&part_keys[1]).cloned().collect();
+        assert_eq!(read_keys, batch_one, "batch 1's objects, each once");
+        assert_eq!(
+            report.section_bytes_read,
+            read.iter().map(|(_, _, len)| len).sum::<u64>()
+        );
 
         let head = read_signal_head(store.as_ref(), Signal::Logs).await;
         assert_eq!(head.parts[0].key_index.len(), 1);
@@ -1100,12 +1218,20 @@ mod tests {
             head.parts[0].key_index[0].part_blake3,
             original.parts[0].blake3
         );
-        assert!(
-            head.parts[1].key_index.is_empty(),
-            "the replaced part gains nothing: {:?}",
-            head.parts[1].key_index
+        let mut expected = winner.clone();
+        expected.parts[0].key_index = head.parts[0].key_index.clone();
+        let published = store
+            .get(&head_key(Signal::Logs), GetRange::Full)
+            .await
+            .expect("head")
+            .data;
+        assert_eq!(
+            published.as_ref(),
+            snapshot_format::encode_head(&expected)
+                .expect("encode")
+                .as_slice(),
+            "the winner's HEAD byte for byte plus part 1's ref"
         );
-        assert_eq!(head.parts[1].blake3, vec![0xee; 32]);
         let referenced = &head.parts[0].key_index[0].key;
         let orphans: Vec<String> = kidx_objects(store.as_ref(), Signal::Logs)
             .await
@@ -1120,6 +1246,402 @@ mod tests {
         let summary =
             verify_key_index_leaf(&got.data, &KeyIndexLeafLimits::default()).expect("valid leaf");
         assert_eq!(summary.header.part_blake3, original.parts[1].blake3);
+    }
+
+    /// One batch of two parts. Between the leaf build and the HEAD CAS a
+    /// racing rebuild publishes first and gives part 1 its `user_id` ref (the
+    /// leaf this run built too, since leaves are content-addressed). The
+    /// retry attaches part 2's ref alone: part 1 keeps exactly the one ref the
+    /// winner gave it, and both parts probe. A retry that did not skip a field
+    /// the part already carries gives part 1 a second `user_id` ref for the
+    /// same slice and counts it as published.
+    #[tokio::test]
+    async fn rebuild_lost_cas_to_a_racing_rebuild_adds_no_second_ref_for_a_field() {
+        let store = recording_store();
+        let (catalog, _) = two_entry_parts(&store, 2).await;
+        let key = head_key(Signal::Logs);
+        let stripped = store.get(&key, GetRange::Full).await.expect("head").data;
+        rebuild(&catalog, Signal::Logs).await;
+        let indexed = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let mut winner = indexed.clone();
+        winner.parts[1].key_index.clear();
+        let current = store.get(&key, GetRange::Full).await.expect("head");
+        store
+            .put(
+                &key,
+                stripped,
+                PutOptions {
+                    mode: PutMode::CasVersion(current.version),
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("restore the stripped HEAD");
+        *store.head_race.lock().expect("lock") = Some(Bytes::from(
+            snapshot_format::encode_head(&winner).expect("encode"),
+        ));
+
+        store.clear();
+        let report = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(
+            (report.parts_rebuilt, report.leaves_written),
+            (1, 2),
+            "{report:?}"
+        );
+        assert_eq!(report.attempts.len(), 1, "{report:?}");
+        assert_eq!(report.attempts[0].head_cas_tries, 2, "{report:?}");
+        assert_eq!(report.attempts[0].parts_published, 1, "{report:?}");
+        let head = read_signal_head(store.as_ref(), Signal::Logs).await;
+        let refs: Vec<usize> = head.parts.iter().map(|p| p.key_index.len()).collect();
+        assert_eq!(refs, vec![1, 1], "one user_id ref a part: {head:?}");
+        assert_eq!(head, indexed);
+        for part in &head.parts {
+            let ordinal = part_ordinals(store.as_ref(), part).await;
+            let seqs: Vec<u64> = ordinal.keys().copied().collect();
+            assert_eq!(seqs.len(), 2);
+            let probe = probe_part(
+                &catalog,
+                Signal::Logs,
+                part,
+                KeyType::I64,
+                USER_ID,
+                key8_i64(10),
+            )
+            .await;
+            assert_eq!(
+                probe,
+                matches(&[(ordinal[&seqs[0]], &[0]), (ordinal[&seqs[1]], &[0])], &[])
+            );
+        }
+    }
+
+    /// A logs tenant declaring `user_id` whose objects carry no KEY_IDX
+    /// section: the part is read once, each entry costs its footer suffix GET
+    /// alone, no leaf is built, and no HEAD CAS is issued (no PUT at all).
+    /// Nothing marks the part as tried, so a rerun reads it again at the same
+    /// cost. A rebuild that CASed HEAD for a batch that built no leaf reports
+    /// a CAS try and PUTs HEAD.
+    #[tokio::test]
+    async fn a_part_with_no_section_for_the_field_publishes_nothing_and_is_read_again() {
+        let store = recording_store();
+        declare_user_id_key_index(store.as_ref()).await;
+        for seq in 1..=2u64 {
+            publish_user_id_logs(store.as_ref(), seq, KIDX_HOUR, &[10, 20], 2, 0, false).await;
+        }
+        let catalog = off_catalog(store.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
+        let before = read_signal_head(store.as_ref(), Signal::Logs).await;
+        assert_eq!(before.parts.len(), 1);
+        let part_key = before.parts[0].key.clone();
+        for run in ["first run", "rerun"] {
+            store.clear();
+            let report = rebuild(&catalog, Signal::Logs).await;
+            assert_eq!(
+                report,
+                KeyIndexRebuildReport {
+                    largest_unindexed_part_entries: 2,
+                    fields: vec![USER_ID.to_string()],
+                    parts_unindexed: 1,
+                    parts_rebuilt: 0,
+                    parts_deferred: 0,
+                    leaves_written: 0,
+                    leaf_bytes_written: 0,
+                    section_bytes_read: report.section_bytes_read,
+                    ranged_gets: 2,
+                    uncovered_entries: 2,
+                    attempt_count: 1,
+                    attempts: vec![KeyIndexRebuildAttempt {
+                        parts: 1,
+                        part_gets: 1,
+                        ranged_gets: 2,
+                        leaf_puts: 0,
+                        head_cas_tries: 0,
+                        parts_published: 0,
+                    }],
+                },
+                "{run}"
+            );
+            let part_gets = store
+                .gets()
+                .into_iter()
+                .filter(|(key, range, _)| key == &part_key && matches!(range, GetRange::Full))
+                .count();
+            assert_eq!(part_gets, 1, "{run}: the part is read");
+            assert_eq!(store.data_ranged_gets().len(), 2, "{run}");
+            assert!(
+                store.puts().is_empty(),
+                "{run}: no leaf PUT and no HEAD PUT: {:?}",
+                store.puts()
+            );
+            assert_eq!(
+                read_signal_head(store.as_ref(), Signal::Logs).await,
+                before,
+                "{run}"
+            );
+        }
+    }
+
+    /// A part GET that fails, and a part whose bytes do not match the
+    /// `blake3` HEAD names, each stop the run with the typed `Interrupted`
+    /// error once the fault has fired, and the batch publishes nothing: no
+    /// HEAD PUT, HEAD as it was. Fixture: one batch of two parts, the fault
+    /// on the second part's object.
+    #[tokio::test]
+    async fn a_failed_or_mismatched_part_get_interrupts_and_publishes_nothing() {
+        for (fault, kind) in [
+            (ScriptedFault::Timeout, FaultKind::Timeout),
+            (ScriptedFault::CorruptRange, FaultKind::CorruptRange),
+        ] {
+            let inner = recording_store();
+            two_entry_parts(&inner, 2).await;
+            let before = read_signal_head(inner.as_ref(), Signal::Logs).await;
+            let faulty = Arc::new(FaultStore::new(
+                Arc::clone(&inner),
+                FaultPlan::empty().with_rule(
+                    Rule::new(Op::Get, fault).with_key_contains(before.parts[1].key.clone()),
+                ),
+            ));
+            let catalog = off_catalog(faulty.clone(), 2);
+            inner.clear();
+            let err = catalog
+                .rebuild_key_index(&tenant(), Signal::Logs, &KeyIndexRebuildOptions::default())
+                .await
+                .expect_err("part 2 does not load");
+            assert_eq!(faulty.fault_count(Op::Get, kind), 1, "{kind:?}");
+            let KeyIndexRebuildError::Interrupted { source, report } = &err else {
+                panic!("{kind:?}: {err:?}");
+            };
+            if kind == FaultKind::Timeout {
+                assert!(matches!(source, CatalogError::Store(_)), "{source:?}");
+            } else {
+                assert!(
+                    matches!(
+                        source,
+                        CatalogError::FieldMismatch {
+                            field: "blake3",
+                            ..
+                        }
+                    ),
+                    "{source:?}"
+                );
+            }
+            assert_eq!(
+                (report.parts_rebuilt, report.attempt_count),
+                (0, 0),
+                "{kind:?}: {report:?}"
+            );
+            assert!(
+                !inner.puts().iter().any(|key| key.ends_with("/HEAD")),
+                "{kind:?}: {:?}",
+                inner.puts()
+            );
+            assert_eq!(
+                read_signal_head(inner.as_ref(), Signal::Logs).await,
+                before,
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// For a declared field the rebuild's leaf is the fold's leaf: the same
+    /// data folded once with `build_key_index_leaves` on, and once with it
+    /// off and then rebuilt, gives the same part, the same `key_index` ref
+    /// and byte-identical leaf objects.
+    #[tokio::test]
+    async fn a_rebuilt_leaf_is_byte_identical_to_the_folds_leaf_for_a_declared_field() {
+        async fn publish(store: &RecordingStore) {
+            declare_user_id_key_index(store).await;
+            for (seq, user_ids) in [
+                (1, &[10i64, 10, 20, 30, 40, 40][..]),
+                (2, &[50, 10, 60, 10]),
+                (3, &[70, 80]),
+            ] {
+                publish_user_id_logs(store, seq, KIDX_HOUR, user_ids, 2, 0, true).await;
+            }
+        }
+        let folded = recording_store();
+        publish(&folded).await;
+        let on = Catalog::new(
+            folded.clone(),
+            CatalogConfig {
+                build_key_index_leaves: true,
+                ..config(1)
+            },
+        )
+        .expect("catalog");
+        fold_through(&on, Signal::Logs, KIDX_HOUR).await;
+
+        let rebuilt = recording_store();
+        publish(&rebuilt).await;
+        let off = off_catalog(rebuilt.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&off, Signal::Logs, KIDX_HOUR).await;
+        rebuild(&off, Signal::Logs).await;
+
+        let fold_head = read_signal_head(folded.as_ref(), Signal::Logs).await;
+        let rebuild_head = read_signal_head(rebuilt.as_ref(), Signal::Logs).await;
+        assert_eq!(fold_head.parts.len(), 1);
+        assert_eq!(fold_head.parts[0].blake3, rebuild_head.parts[0].blake3);
+        let fold_refs: Vec<SnapshotKeyIndexLeafRef> = fold_head.parts[0]
+            .key_index
+            .iter()
+            .filter(|r| r.field == USER_ID)
+            .cloned()
+            .collect();
+        assert_eq!(fold_refs.len(), 1);
+        assert_eq!(fold_refs, rebuild_head.parts[0].key_index);
+        for leaf in &fold_refs {
+            let a = folded
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("fold leaf");
+            let b = rebuilt
+                .get(&leaf.key, GetRange::Full)
+                .await
+                .expect("rebuilt leaf");
+            assert_eq!(a.data, b.data, "{}", leaf.key);
+        }
+    }
+
+    /// A ranged GET that fails with a store error for one entry defers its
+    /// part: no leaf is built for it and it gains no ref this run, the report
+    /// counts it in `parts_deferred`, and the other part of the batch
+    /// publishes. The failed GET is a ranged GET the report counts and the
+    /// store never served. A rerun with the fault cleared reads the deferred
+    /// part again and attaches it, every entry covered.
+    ///
+    /// A rebuild that built the deferred part's leaf with the failed entry
+    /// uncovered attaches a ref to it on the first run, which no rerun can
+    /// then repair; one that dropped the whole batch publishes neither part.
+    #[tokio::test]
+    async fn a_failed_section_get_defers_the_part_and_a_rerun_attaches_it() {
+        let inner = recording_store();
+        let (_, part_keys) = two_entry_parts(&inner, 2).await;
+        let failing = part_keys[1].iter().next().expect("a data key").clone();
+        let faulty = Arc::new(FaultStore::new(
+            Arc::clone(&inner),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Timeout).with_key_contains(failing.clone()),
+            ),
+        ));
+        let catalog = off_catalog(faulty.clone(), 2);
+        inner.clear();
+        let report = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Timeout), 1);
+        assert_eq!(
+            report,
+            KeyIndexRebuildReport {
+                largest_unindexed_part_entries: 2,
+                fields: vec![USER_ID.to_string()],
+                parts_unindexed: 2,
+                parts_rebuilt: 1,
+                parts_deferred: 1,
+                leaves_written: 1,
+                leaf_bytes_written: report.leaf_bytes_written,
+                section_bytes_read: report.section_bytes_read,
+                ranged_gets: 7,
+                uncovered_entries: 0,
+                attempt_count: 1,
+                attempts: vec![KeyIndexRebuildAttempt {
+                    parts: 2,
+                    part_gets: 2,
+                    ranged_gets: 7,
+                    leaf_puts: 1,
+                    head_cas_tries: 1,
+                    parts_published: 1,
+                }],
+            }
+        );
+        assert_eq!(inner.data_ranged_gets().len(), 6);
+        let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        let refs: Vec<usize> = head.parts.iter().map(|p| p.key_index.len()).collect();
+        assert_eq!(refs, vec![1, 0], "part 2 is deferred");
+
+        let catalog = off_catalog(inner.clone(), 2);
+        inner.clear();
+        let rerun = rebuild(&catalog, Signal::Logs).await;
+        assert_eq!(
+            (
+                rerun.parts_unindexed,
+                rerun.parts_rebuilt,
+                rerun.parts_deferred,
+                rerun.leaves_written,
+                rerun.uncovered_entries
+            ),
+            (1, 1, 0, 1, 0),
+            "{rerun:?}"
+        );
+        let read_keys: BTreeSet<String> = inner
+            .data_ranged_gets()
+            .into_iter()
+            .map(|(key, _, _)| key)
+            .collect();
+        assert_eq!(read_keys, part_keys[1]);
+        let head = read_signal_head(inner.as_ref(), Signal::Logs).await;
+        let refs: Vec<usize> = head.parts.iter().map(|p| p.key_index.len()).collect();
+        assert_eq!(refs, vec![1, 1]);
+        let part = &head.parts[1];
+        let ordinal = part_ordinals(inner.as_ref(), part).await;
+        assert_eq!(
+            probe_part(
+                &catalog,
+                Signal::Logs,
+                part,
+                KeyType::I64,
+                USER_ID,
+                key8_i64(10)
+            )
+            .await,
+            matches(&[(ordinal[&3], &[0]), (ordinal[&4], &[0])], &[])
+        );
+    }
+
+    /// A logs tenant that declares no key-index field is refused before HEAD
+    /// is read, with a typed error naming the tenant: with no tenant config
+    /// (the config GET is the only request) and with a config that declares
+    /// none. HEAD exists in both cases, and nothing is written.
+    #[tokio::test]
+    async fn a_logs_tenant_declaring_no_key_index_field_is_refused() {
+        use crate::tenant_config::{TenantConfig, TenantLifecycleState};
+        let store = recording_store();
+        publish_user_id_logs(store.as_ref(), 1, KIDX_HOUR, &[10, 20], 2, 0, false).await;
+        let catalog = off_catalog(store.clone(), DEFAULT_SNAPSHOT_PART_MAX_ENTRIES);
+        fold_through(&catalog, Signal::Logs, KIDX_HOUR).await;
+        for case in ["no tenant config", "a config declaring none"] {
+            if case == "a config declaring none" {
+                crate::tenant_config::set_tenant_config(
+                    store.as_ref(),
+                    &tenant(),
+                    &TenantConfig::new(TenantLifecycleState::Active),
+                    1,
+                )
+                .await
+                .expect("write config");
+            }
+            store.clear();
+            let err = catalog
+                .rebuild_key_index(&tenant(), Signal::Logs, &KeyIndexRebuildOptions::default())
+                .await
+                .expect_err(case);
+            assert!(
+                matches!(
+                    &err,
+                    KeyIndexRebuildError::NoFieldDeclared { tenant: named, signal: Signal::Logs }
+                        if *named == tenant().to_hex()
+                ),
+                "{case}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(&tenant().to_hex()), "{message}");
+            assert!(message.contains("declares no key-index field"), "{message}");
+            assert_eq!(err.report(), None);
+            let gets: Vec<String> = store.gets().into_iter().map(|(key, _, _)| key).collect();
+            assert_eq!(
+                gets,
+                vec![crate::tenant_config::config_key(&tenant())],
+                "{case}"
+            );
+            assert!(store.puts().is_empty(), "{case}: {:?}", store.puts());
+        }
     }
 
     /// The rebuild's ranged GET count is exactly two per entry rebuilt, and

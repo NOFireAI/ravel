@@ -447,7 +447,7 @@ pub async fn rebuild_key_index(
     print!("{out}");
     result
         .map(|report| (report, out))
-        .map_err(|err| anyhow::anyhow!("key-index rebuild failed: {err}"))
+        .map_err(|err| anyhow::anyhow!("key-index rebuild failed for tenant {tenant:?}: {err}"))
 }
 
 /// The testable core of [`rebuild_key_index`]: the rebuild's own result and
@@ -544,6 +544,7 @@ pub fn render_rebuild_report(
     out.push_str(&format!("fields: {}\n", report.fields.join(",")));
     out.push_str(&format!("parts_unindexed: {}\n", report.parts_unindexed));
     out.push_str(&format!("parts_rebuilt: {}\n", report.parts_rebuilt));
+    out.push_str(&format!("parts_deferred: {}\n", report.parts_deferred));
     out.push_str(&format!("leaves_written: {}\n", report.leaves_written));
     out.push_str(&format!(
         "leaf_bytes_written: {}\n",

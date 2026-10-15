@@ -1137,8 +1137,11 @@ for a declared field (every part, for spans), or for `--field` alone,
 which is refused unless the tenant declares it, it reads the part object
 once, reads each entry's footer suffix and KEY_IDX section (the ranged
 GETs of the fold's own leaf build: two per entry, and a third when the
-footer is larger than the 8 KiB suffix), writes the leaves under the
-fold's key layout, and publishes a HEAD whose part refs are the current
+footer is larger than the 8 KiB suffix), writes the leaves for the
+declared fields under the fold's key layout (for a declared field the
+leaf is byte-identical to the one a fold with `build_key_index_leaves`
+on writes for the same part; a field a KEY_IDX section names that the
+tenant does not declare gets none), and publishes a HEAD whose part refs are the current
 ones with `key_index` attached (`SnapshotHead.parts` carries the refs
 inline, so the publish is the HEAD CAS alone). A part that already holds
 a ref for every requested field costs no GET; one that holds refs for
@@ -1146,8 +1149,11 @@ some keeps them and gains the rest. The part objects, their blake3 and
 their `.csnap` baselines are untouched, so none of the fold's per-part
 machinery runs: no content-hash carry-forward, no dirty-hour reconcile,
 no column-stats baseline, no part, `.csnap` or `.cstat` PUT, no window
-LIST. It runs whatever `build_key_index_leaves` says, and the CLI refuses
-it beside `--key-index-leaves` and `--max-flush-lifetime`. It publishes
+LIST. It runs regardless of `build_key_index_leaves`, and the CLI refuses
+it beside `--key-index-leaves` and `--max-flush-lifetime`. A logs tenant
+that declares no key-index field, or has no tenant config, is refused
+before HEAD is read, with a typed error naming the tenant
+(`KeyIndexRebuildError::NoFieldDeclared`). It publishes
 in batches bounded in entries: a batch is the longest run of the
 remaining unindexed parts whose entry total stays at or below
 `--batch-entries`, and at least one part, so an attempt costs at most
@@ -1157,16 +1163,18 @@ fold's `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`, which is a seal threshold
 rather than a cap (`partition_parts` splits only at hour boundaries, so
 one ingest hour larger than it yields one part above it), so the ceiling
 is `2 x batch_entries` only while no unindexed part exceeds the setting
-and `2 x` the largest part otherwise; the report states the largest
+and `2 x` the largest part otherwise (`3 x` in either case once a footer
+is larger than the 8 KiB suffix); the report states the largest
 unindexed part's entries up front, computed from HEAD before the first
 part GET. Each batch is one HEAD CAS, bounded like the fold's at
 `MAX_HEAD_CAS_ATTEMPTS`; on a lost CAS the attempt re-reads HEAD, keeps
 the refs for the batch parts whose blake3 the new HEAD still names (a
 leaf is keyed by `part_blake3`) and drops the rest, whose leaves this
 sweep deletes; it reads no section again. The report carries the largest
-unindexed part's entries, parts rebuilt, leaves written and their bytes,
-section bytes read, ranged GETs issued (footer suffix and section
-together), uncovered entries, the attempt count, and per attempt the part
+unindexed part's entries, parts rebuilt, parts deferred, leaves written
+and their bytes, section bytes read, ranged GETs issued (footer suffixes,
+any extra footer ranges and sections together, a failed GET included),
+uncovered entries, the attempt count, and per attempt the part
 GETs, ranged GETs, leaf PUTs, HEAD CAS tries and parts published (an
 attempt is one batch's publish including its retries, at most
 `MAX_HEAD_CAS_ATTEMPTS` tries, so a lost CAS adds a try, not an attempt).
@@ -1177,7 +1185,15 @@ batch's entries, and leaves that batch's leaves unreferenced for this
 sweep; the rerun skips every part whose ref an earlier batch published. A
 one-part tenant is a single batch, and an interruption there loses the
 whole run. A part none of whose entries carries the field (or whose leaf
-encode is refused) gains no ref, so every rerun reads it again. A rebuilt
+encode is refused) gains no ref, so every rerun reads it again; a batch
+in which no part gains a ref issues no HEAD CAS. A part with an entry
+whose ranged GET failed with a store error is deferred: no leaf is built
+for it, it gains no ref this run, the report counts it under parts
+deferred (`parts_deferred`), a warning names the object and the part,
+and a rerun reads it again. A KEY_IDX section that is absent or does not
+decode is not a failed GET; that entry reads as uncovered. A failed or
+mismatched part GET stops the run with the report so far, and the batch
+it was in publishes nothing. A rebuilt
 ref is carried forward by every later fold that carries the part by
 reference, and a fold that re-encodes the part while
 `build_key_index_leaves` is off drops it, so the rebuild must be rerun

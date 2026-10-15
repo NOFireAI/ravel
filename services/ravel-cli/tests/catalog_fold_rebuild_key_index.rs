@@ -19,7 +19,7 @@ use ravel_cli::store::{StoreKind, StoreSelection};
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
 use ravel_proto::catalog::v1::SnapshotHead;
@@ -38,8 +38,8 @@ const TENANT: &str = "cli-fold-rebuild-key-index";
 const SEALED_AGE_NS: i64 = 3 * NS_PER_HOUR;
 
 /// Publishes one RSPAN object, which always carries a KEY_IDX section over
-/// `trace_id`, with one span per trace id. Returns the object's size.
-async fn publish_spans(store: &MemoryStore, now_ns: i64) -> u64 {
+/// `trace_id`, with one span per trace id. Returns the object's size and key.
+async fn publish_spans(store: &MemoryStore, now_ns: i64) -> (u64, String) {
     let tenant_hash = TenantId::new(TENANT).hash();
     let writer_id = Uuid::from_u128(1);
     let mut writer = RspanWriter::new(
@@ -95,7 +95,7 @@ async fn publish_spans(store: &MemoryStore, now_ns: i64) -> u64 {
     publish::publish(store, &commit, &RetryPolicy::default())
         .await
         .expect("publish");
-    size
+    (size, data_key)
 }
 
 fn catalog_prefix() -> String {
@@ -122,11 +122,11 @@ async fn read_head(store: &MemoryStore) -> SnapshotHead {
 }
 
 /// A spans tenant folded with the leaf build off, so its one part has no
-/// `key_index` ref. Returns the store, the clock reading and the object size.
-async fn folded_without_leaves() -> (Arc<MemoryStore>, u64) {
+/// `key_index` ref. Returns the store, the object size and the object key.
+async fn folded_without_leaves() -> (Arc<MemoryStore>, u64, String) {
     let now = ravel_cli::now_ns().expect("system clock readable");
     let store = Arc::new(MemoryStore::new());
-    let object_size = publish_spans(&store, now).await;
+    let (object_size, data_key) = publish_spans(&store, now).await;
     let (report, _printed) = catalog::fold_with_writers_stopped(
         Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
         MEMORY,
@@ -143,7 +143,7 @@ async fn folded_without_leaves() -> (Arc<MemoryStore>, u64) {
     .expect("fold succeeds");
     assert_eq!(report.entry_count, 1, "the spans object is folded");
     assert_eq!(report.key_index_leaves_written, 0, "folded with leaves off");
-    (store, object_size)
+    (store, object_size, data_key)
 }
 
 async fn rebuild(
@@ -151,12 +151,27 @@ async fn rebuild(
     field: Option<&str>,
     json: bool,
 ) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
-    catalog::rebuild_key_index(
+    rebuild_on(
         Arc::clone(store) as Arc<dyn ObjectStoreBackend>,
+        SignalArg::Spans,
+        field,
+        json,
+    )
+    .await
+}
+
+async fn rebuild_on(
+    store: Arc<dyn ObjectStoreBackend>,
+    signal: SignalArg,
+    field: Option<&str>,
+    json: bool,
+) -> anyhow::Result<(KeyIndexRebuildReport, String)> {
+    catalog::rebuild_key_index(
+        store,
         MEMORY,
         TENANT,
         1,
-        SignalArg::Spans,
+        signal,
         field.map(str::to_string),
         ravel_catalog::DEFAULT_KEY_INDEX_REBUILD_BATCH_ENTRIES,
         json,
@@ -172,7 +187,7 @@ async fn rebuild(
 /// suffix GET returns all of it and the section bytes read exceed its size.
 #[tokio::test]
 async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
-    let (store, object_size) = folded_without_leaves().await;
+    let (store, object_size, _) = folded_without_leaves().await;
     let before_head = read_head(&store).await;
     assert!(before_head.parts[0].key_index.is_empty());
     let before_keys = catalog_keys(&store).await;
@@ -206,6 +221,7 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
          fields: trace_id\n\
          parts_unindexed: 1\n\
          parts_rebuilt: 1\n\
+         parts_deferred: 0\n\
          leaves_written: 1\n\
          leaf_bytes_written: {}\n\
          section_bytes_read: {}\n\
@@ -244,7 +260,7 @@ async fn rebuild_attaches_a_leaf_and_prints_every_report_field() {
 /// field and the declared set named, and publishes nothing.
 #[tokio::test]
 async fn rebuild_refuses_an_undeclared_field() {
-    let (store, _) = folded_without_leaves().await;
+    let (store, _, _) = folded_without_leaves().await;
     let before = catalog_keys(&store).await;
     let err = rebuild(&store, Some("user_id"), false)
         .await
@@ -260,7 +276,7 @@ async fn rebuild_refuses_an_undeclared_field() {
 /// the attempt spent, and no part published.
 #[tokio::test]
 async fn rebuild_that_exhausts_its_cas_tries_prints_the_report_so_far() {
-    let (store, _) = folded_without_leaves().await;
+    let (store, _, _) = folded_without_leaves().await;
     let faulty = Arc::new(FaultStore::new(
         Arc::clone(&store),
         FaultPlan::empty().with_rule(
@@ -301,4 +317,59 @@ async fn rebuild_that_exhausts_its_cas_tries_prints_the_report_so_far() {
         "{printed}"
     );
     assert!(read_head(&store).await.parts[0].key_index.is_empty());
+}
+
+/// A ranged GET that fails for the part's one entry defers the part: the
+/// command prints `parts_deferred: 1` and publishes no ref, and a rerun once
+/// the store answers attaches the leaf.
+#[tokio::test]
+async fn rebuild_prints_a_deferred_part_and_a_rerun_attaches_it() {
+    let (store, _, data_key) = folded_without_leaves().await;
+    let faulty = Arc::new(FaultStore::new(
+        Arc::clone(&store),
+        FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, ScriptedFault::Timeout).with_key_contains(data_key)),
+    ));
+    let (report, printed) = rebuild_on(
+        Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>,
+        SignalArg::Spans,
+        None,
+        false,
+    )
+    .await
+    .expect("a deferred part is not an error");
+    assert_eq!(faulty.fault_count(Op::Get, FaultKind::Timeout), 1);
+    assert_eq!((report.parts_rebuilt, report.parts_deferred), (0, 1));
+    assert!(printed.contains("parts_rebuilt: 0\n"), "{printed}");
+    assert!(printed.contains("parts_deferred: 1\n"), "{printed}");
+    assert!(read_head(&store).await.parts[0].key_index.is_empty());
+
+    let (rerun, printed) = rebuild(&store, None, false).await.expect("rerun");
+    assert_eq!((rerun.parts_rebuilt, rerun.parts_deferred), (1, 0));
+    assert!(printed.contains("parts_deferred: 0\n"), "{printed}");
+    assert_eq!(read_head(&store).await.parts[0].key_index.len(), 1);
+}
+
+/// A logs tenant that declares no key-index field is refused with the tenant
+/// named, and nothing is written.
+#[tokio::test]
+async fn rebuild_refuses_a_logs_tenant_declaring_no_key_index_field() {
+    let (store, _, _) = folded_without_leaves().await;
+    let before = catalog_keys(&store).await;
+    let err = rebuild_on(
+        Arc::clone(&store) as Arc<dyn ObjectStoreBackend>,
+        SignalArg::Logs,
+        None,
+        false,
+    )
+    .await
+    .expect_err("no logs key-index field is declared");
+    let message = format!("{err:#}");
+    assert!(message.contains(TENANT), "{message}");
+    assert!(
+        message.contains(&TenantId::new(TENANT).hash().to_hex()),
+        "{message}"
+    );
+    assert!(message.contains("declares no key-index field"), "{message}");
+    assert_eq!(catalog_keys(&store).await, before);
 }
