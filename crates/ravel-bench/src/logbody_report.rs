@@ -68,8 +68,14 @@ strictly increasing; observed_ts_ns equals ts_ns; severity_num 9, severity_text 
 no attributes.";
 /// What the timed decodes include.
 pub const CLOCK: &str = "std::time::Instant (monotonic); each figure is decoded bytes divided by \
-the median of the runs, in MB/s (10^6 bytes per second). A production page's decode includes \
-its zstd envelope when it is compressed; a FastLanes page is decoded raw.";
+the median of the runs, in MB/s (10^6 bytes per second). body_encoding.decode_mb_per_s times the \
+full page read: envelope parse, zstd decompression when the page is compressed, and the string \
+codec. integer_pages' current_decode_mb_per_s and fastlanes_*_decode_mb_per_s time only the \
+integer codec decode (decode_i64 or decode_gcd_i64 on the production side, fastlanes::decode on \
+the FastLanes side) on bytes already unsealed before the timer starts: both exclude the envelope \
+parse, the crc check, and zstd decompression when the production page is compressed, so the two \
+are compared on the codec alone. The enveloped byte-size figures (current_bytes, \
+fastlanes_*_enveloped_bytes) are unaffected and still include that envelope.";
 
 const BASE_TS_NS: i64 = 1_700_000_000_000_000_000;
 const TS_STEP_NS: i64 = 1_000_000;
@@ -590,18 +596,53 @@ fn unseal(page: &SealedPage) -> Result<Vec<u8>, ReportError> {
     read_page(&buf, &desc, DEFAULT_MAX_UNCOMP).map_err(|e| fail(format!("read page: {e}")))
 }
 
+/// Decodes the integer codec alone, on bytes already unsealed: no envelope
+/// parse, crc check, or decompression.
+fn decode_int_from_raw(enc: Enc, raw: &[u8], count: usize) -> Result<Vec<i64>, ReportError> {
+    match enc {
+        Enc::GcdI64 => decode_gcd_i64(raw, count).map_err(|e| fail(e.to_string())),
+        enc => decode_i64(enc, raw, count).map_err(|e| fail(e.to_string())),
+    }
+}
+
 fn decode_int_page(page: &SealedPage, count: usize) -> Result<Vec<i64>, ReportError> {
     let raw = unseal(page)?;
-    let out = match page.enc {
-        Enc::GcdI64 => decode_gcd_i64(&raw, count).map_err(|e| fail(e.to_string()))?,
-        enc => decode_i64(enc, &raw, count).map_err(|e| fail(e.to_string()))?,
-    };
-    Ok(out)
+    decode_int_from_raw(page.enc, &raw, count)
 }
 
 fn decode_str_page(page: &SealedPage, count: usize) -> Result<Vec<Vec<u8>>, ReportError> {
     let raw = unseal(page)?;
     decode_strings(page.enc, &raw, count).map_err(|e| fail(e.to_string()))
+}
+
+/// Counts rows whose body does not rebuild from the decoded template-split
+/// pages. `splits` is the pre-encode ground truth: each row's variable-window
+/// length comes from `splits[row].vars.len()`, not from the decoded
+/// template, so the cursor into `got_vars` advances by the same amount for
+/// every row regardless of whether that row's own id or dictionary lookup
+/// succeeds. A row whose own lookup is corrupted still only costs that one
+/// row, instead of shifting every later row's window.
+fn rebuild_mismatches(
+    splits: &[template::Split<'_>],
+    got_ids: &[i64],
+    got_dict: &[Vec<u8>],
+    got_vars: &[Vec<u8>],
+    bodies: &[&[u8]],
+) -> u64 {
+    let mut at = 0usize;
+    let mut mismatches = 0u64;
+    for (row, body) in bodies.iter().enumerate() {
+        let n = splits[row].vars.len();
+        let v = got_vars.get(at..at + n);
+        at += n;
+        let rebuilt = got_ids
+            .get(row)
+            .and_then(|&id| got_dict.get(usize::try_from(id).ok()?))
+            .zip(v)
+            .and_then(|(t, v)| template::reconstruct(t, v));
+        mismatches += u64::from(rebuilt.as_deref() != Some(*body));
+    }
+    mismatches
 }
 
 /// The stored length and encoding PAGE_DIR gives `column` in `block`, if the
@@ -635,6 +676,9 @@ fn page_dir_dict_bytes(dir: &PageDir, column: u32) -> u64 {
 pub fn run(cfg: &Config) -> Result<Report, ReportError> {
     if cfg.block_records == 0 || cfg.object_records == 0 {
         return Err(fail("block and object record counts must be nonzero"));
+    }
+    if cfg.decode_runs == 0 {
+        return Err(fail("decode_runs must be nonzero"));
     }
     let needles = read_needles(&cfg.needles)?;
     let (sha256, byte_count) = file_digest(&cfg.corpus)?;
@@ -974,22 +1018,8 @@ impl State {
         let got_ids = decode_int_page(&ids_page, ids.len())?;
         let got_dict = decode_str_page(&dict_page, dict.len())?;
         let got_vars = decode_str_page(&vars_page, vars.len())?;
-        let mut at = 0usize;
-        for (row, body) in values.iter().enumerate() {
-            self.lines_checked += 1;
-            let rebuilt = got_ids
-                .get(row)
-                .and_then(|&id| got_dict.get(usize::try_from(id).ok()?))
-                .and_then(|t| {
-                    let n = template::placeholder_count(t);
-                    let v = got_vars.get(at..at + n)?;
-                    at += n;
-                    template::reconstruct(t, v)
-                });
-            if rebuilt.as_deref() != Some(*body) {
-                self.mismatches += 1;
-            }
-        }
+        self.lines_checked += values.len() as u64;
+        self.mismatches += rebuild_mismatches(&splits, &got_ids, &got_dict, &got_vars, &values);
 
         let total =
             (ids_page.stored.len() + dict_page.stored.len() + vars_page.stored.len()) as u64;
@@ -1054,7 +1084,10 @@ impl State {
                 return Err(fail(format!("block {global} {name}: page does not decode")));
             }
             let decoded = values.len() as u64 * 8;
-            let cur_secs = time_median(runs, || decode_int_page(&current, values.len()));
+            let current_raw = unseal(&current)?;
+            let cur_secs = time_median(runs, || {
+                decode_int_from_raw(current.enc, &current_raw, values.len())
+            });
             let mut fl = [(0u64, 0u64, 0f64); 2];
             for (slot, variant) in fl.iter_mut().zip([Variant::For, Variant::Delta]) {
                 let page = fastlanes::encode(values, variant);
@@ -1566,5 +1599,82 @@ mod tests {
         for i in 0..10_000 {
             assert!(ts_of(i) < ts_of(i + 1));
         }
+    }
+
+    #[test]
+    fn zero_decode_runs_is_rejected() {
+        let mut cfg = Config::new(
+            fixture("corpus.log"),
+            fixture("needles.txt"),
+            "2026-10-14".to_string(),
+            "test".to_string(),
+        );
+        cfg.block_records = BLOCK;
+        cfg.decode_runs = 0;
+        let err = run(&cfg).expect_err("decode_runs=0 must be rejected");
+        assert!(err.to_string().contains("decode_runs"), "{err}");
+    }
+
+    /// The pre-fix behaviour, reproduced only to prove the fix matters: `at`
+    /// advances solely from `template::placeholder_count` on the decoded
+    /// dictionary entry, inside an `and_then` chain that one corrupted row's
+    /// id or dictionary lookup short-circuits, so a row after it reads the
+    /// wrong variable window.
+    fn rebuild_mismatches_pre_fix(
+        got_ids: &[i64],
+        got_dict: &[Vec<u8>],
+        got_vars: &[Vec<u8>],
+        bodies: &[&[u8]],
+    ) -> u64 {
+        let mut at = 0usize;
+        let mut mismatches = 0u64;
+        for (row, body) in bodies.iter().enumerate() {
+            let rebuilt = got_ids
+                .get(row)
+                .and_then(|&id| got_dict.get(usize::try_from(id).ok()?))
+                .and_then(|t| {
+                    let n = template::placeholder_count(t);
+                    let v = got_vars.get(at..at + n)?;
+                    at += n;
+                    template::reconstruct(t, v)
+                });
+            mismatches += u64::from(rebuilt.as_deref() != Some(*body));
+        }
+        mismatches
+    }
+
+    #[test]
+    fn one_corrupted_row_does_not_cascade_into_later_rows() {
+        // Two one-placeholder templates; three rows, each rebuildable from
+        // its own id, dict entry, and variable. Row 1's id is corrupted
+        // (out of range), so row 1 must mismatch on its own -- but rows 0
+        // and 2 must still rebuild.
+        let dict: Vec<Vec<u8>> = vec![b"A \0 end".to_vec(), b"B \0 end".to_vec()];
+        let splits = vec![
+            template::Split {
+                template: dict[0].clone(),
+                vars: vec![b"1".as_slice()],
+            },
+            template::Split {
+                template: dict[1].clone(),
+                vars: vec![b"2".as_slice()],
+            },
+            template::Split {
+                template: dict[0].clone(),
+                vars: vec![b"3".as_slice()],
+            },
+        ];
+        let got_ids: Vec<i64> = vec![0, 99, 0]; // row 1's id is out of range.
+        let got_vars: Vec<Vec<u8>> = vec![b"1".to_vec(), b"2".to_vec(), b"3".to_vec()];
+        let bodies: Vec<&[u8]> = vec![b"A 1 end", b"B 2 end", b"A 3 end"];
+
+        let fixed = rebuild_mismatches(&splits, &got_ids, &dict, &got_vars, &bodies);
+        assert_eq!(fixed, 1, "only row 1's own corruption should mismatch");
+
+        let pre_fix = rebuild_mismatches_pre_fix(&got_ids, &dict, &got_vars, &bodies);
+        assert_eq!(
+            pre_fix, 2,
+            "pre-fix code lets row 1's failure desync row 2's variable window too"
+        );
     }
 }
