@@ -109,7 +109,9 @@ concrete failure rows:
   amended 2026-09-23) hold no subject identifiers, *provided* subject
   identifiers appear only as label/
   attribute values, never inside metric names. That proviso becomes a
-  documented requirement (§7).
+  documented requirement (§7). (No longer true of every catalog object:
+  `.cstat` and `.kidx` hold attribute values; see the kidx subject-values
+  amendment below.)
 
 ## Decision
 
@@ -502,7 +504,10 @@ objects and ADR-0028 analytics CANNOT hold a record matching an erasure
 subject, so the commit-record pass is sufficient, not under-asserting.
 Index objects (`SnapshotEntry`, `SnapshotPartHeader`, name postings) carry
 identities, hashes, counts, and metric names -- never label/attribute values
-(§7 point 5's requirement). ADR-0028 analytics is a pure query-time stage
+(§7 point 5's requirement; narrowed by the kidx subject-values amendment
+below, since `.kidx` leaves and `.cstat` objects do hold attribute values
+and are cleared by the fold and the catalog sweep instead). ADR-0028
+analytics is a pure query-time stage
 (`ravel-analytics` has no clock/IO/object-store/catalog) that runs *after*
 the query-time exclusion filter and persists nothing durable, so a derived
 result can never surface an erased subject and there is no derived object to
@@ -615,7 +620,9 @@ Stated explicitly, per ADR-0055's own consequence:
   `prov`, `catalog/*` (narrowed to `catalog/*/HEAD` by ADR-0055's 2026-09-23
   amendment, which is what lets an unreferenced `.cstat` holding an erased
   value be deleted at all), and `u/**` hold no subject attribute values
-  (Context; §7 requirement), so the WORM boundary and subject erasure are
+  (Context; §7 requirement; `catalog/*/idx/` `.cstat` and `.kidx` objects
+  are the exception, see the kidx subject-values amendment below), so the
+  WORM boundary and subject erasure are
   disjoint by construction — except the audit keyspace, which ADR-0062
   fixes (Consequences).
 - **Legal hold wins over erasure, and the precedence is visible.** The
@@ -914,3 +921,39 @@ fold that is not a no-op, as before, and after a no-op fold only when that
 fold reconciled at least one requested hour. A request whose hours all lie
 in the held range counts zero and stays queued until the first fold that
 advances the watermark, which removes it.
+
+## Amendment (2026-10-15, #2994): `.kidx` leaves carry subject values
+
+<!-- amendment-applies: sections="Constraints already landed that this ADR must compose with|Amendment: completion routes through the catalog resolver, and the `.done` scope is stated to match what the pass verifies|6. Interaction with ADR-0055 (WORM / credential scoping / legal hold) — the landed-second obligation" pointer="kidx subject-values amendment" -->
+
+ADR-2707 decision 4 adds the per-part key-index leaf,
+`t/<tenant_hash>/catalog/<signal>/idx/<watermark>.<hash16>.kidx`, which the
+catalog fold now writes for logs and spans (docs/catalog-and-mvcc.md,
+"Per-part key-index leaves"). A leaf holds the `key8` of every indexed
+value: an `I64` value verbatim (its sign-flipped big-endian bytes, which
+are reversible), the first 8 bytes of the blake3 of a string or bytes
+value, and the first 8 bytes of a trace id. The Context's catalog-contents
+bullet, the F3 determination in the completion resolver amendment, and §6's
+statement that `catalog/*` holds no subject attribute values each say that
+index objects carry no label or attribute values. That stops being true for
+`.kidx`, as it already had for the per-part `.cstat` (issue #1848), whose
+statistics hold declared column values.
+
+What follows for erasure:
+
+- The erasure completion rule for stale catalog objects (issue #1848)
+  covers `.kidx` the same way it covers `.cstat`. An erasure rewrite
+  supersedes its inputs; the fold that applies the rewrite record
+  re-encodes the covering part and builds its leaves from the rewritten
+  entries' own KEY_IDX sections, so the new leaf no longer holds the
+  subject's `key8`; the stale leaf is then named by no HEAD, and the catalog
+  sweep deletes it past the protection horizon and counts it in
+  `ravel_maintain_catalog_objects_deleted_total{kind="kidx"}`. Leaves live
+  under `catalog/*/idx/`, which ADR-0055's 2026-09-23 amendment lets
+  Maintain delete.
+- Until the rewrite lands, the pending-erasure predicate (§2) keeps
+  filtering rows after the index. A leaf names part entries and blocks,
+  never rows, so a lookup through it reads the rows the predicate then
+  filters, and the index cannot surface an erased subject in a result. No
+  query reads a leaf yet; the query path ADR-2707 plans (T10, T11) must keep
+  this order.

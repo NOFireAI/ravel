@@ -4504,6 +4504,7 @@ dependencies = [
  "ravel-memory",
  "ravel-object-store",
  "ravel-proto",
+ "ravel-rspan",
  "ravel-segment",
  "ravel-types",
  "serde",

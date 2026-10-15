@@ -1086,6 +1086,12 @@ fn every_prefix_corruption_is_a_typed_rejection() {
     );
     expect_rejected(&with(&|h| h.field.clear()), &k, &limits, "field name empty");
     expect_rejected(
+        &with(&|h| h.field = "f".repeat(KEY_IDX_MAX_NAME_LEN + 1)),
+        &k,
+        &limits,
+        "too long",
+    );
+    expect_rejected(
         &with(&|h| {
             h.key8_lo = 1;
             h.key8_hi = 0;

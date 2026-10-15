@@ -3,9 +3,9 @@
 //! per (part, field, key slice). docs/catalog-and-mvcc.md "Per-part key-index
 //! leaves" is the normative layout and reader procedure.
 //!
-//! Encode, split, decode and probe only: no fold writes a leaf and no query
-//! reads one yet. The object key is the caller's to fill in on the returned
-//! [`SnapshotKeyIndexLeafRef`].
+//! Encode, split, decode and probe. The fold (`fold.rs`) writes the leaves;
+//! no query reads one yet. The object key is the caller's to fill in on the
+//! returned [`SnapshotKeyIndexLeafRef`].
 
 use std::future::Future;
 use std::ops::Range;

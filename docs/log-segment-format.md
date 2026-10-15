@@ -1487,9 +1487,8 @@ the Stage 0 figures on ADR-2707).
 A present key names its blocks, which the reader intersects with every other
 block-level proof (SKIP_IDX, BLOOM, POSTINGS) under the conjunctive rule
 "Pruning soundness" states; an absent key proves the field's value absent
-from every block and drops the object. The catalog fold is to read this
-section by ranged GET to build the per-part `.kidx` leaf, which is not
-implemented yet
+from every block and drops the object. The catalog fold reads this
+section by ranged GET to build the per-part `.kidx` leaf
 (docs/catalog-and-mvcc.md, "Per-part key-index leaves"), never rows.
 
 A probe declines (no prune, as for an unindexed field) when the section is
