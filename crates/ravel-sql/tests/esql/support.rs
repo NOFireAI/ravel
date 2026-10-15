@@ -205,6 +205,28 @@ pub async fn fixture() -> Fixture {
     executor_over(store)
 }
 
+/// The value of the [`shadow_fixture`] record's `message` attribute.
+pub const SHADOWED_MESSAGE: &str = "from the attribute";
+
+/// The first fixture record alone, its attributes replaced by one keyed
+/// `message` and one keyed `@timestamp`.
+pub async fn shadow_fixture() -> Fixture {
+    let mut record = records().swap_remove(0);
+    record.attrs = vec![
+        (
+            "message".to_string(),
+            AttrValue::Str(SHADOWED_MESSAGE.to_string()),
+        ),
+        (
+            "@timestamp".to_string(),
+            AttrValue::Str("not a time".to_string()),
+        ),
+    ];
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    publish_logs(store.as_ref(), &tenant(), &[record], 1).await;
+    executor_over(store)
+}
+
 /// One record of the segmented fixture.
 pub struct Event {
     pub ts: i64,

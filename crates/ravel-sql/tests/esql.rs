@@ -14,6 +14,8 @@ mod bucket;
 mod limits;
 #[path = "esql/lowering.rs"]
 mod lowering;
+#[path = "esql/manifest.rs"]
+mod manifest;
 #[path = "esql/settings_params.rs"]
 mod settings_params;
 #[path = "esql/stack.rs"]

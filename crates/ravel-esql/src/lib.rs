@@ -27,6 +27,11 @@
 //! ([`ast::Query::eq_ignoring_spans`]); the printer adds spaces and escapes,
 //! so text printed from a statement at a limit can exceed it.
 //!
+//! [`manifest`] loads the release manifest, `manifest/esql-9.5.toml`, which
+//! records every released form and the state of each of Ravel's layers for
+//! it, and renders the conformance report generated from it. Nothing at
+//! runtime reads the manifest yet; only tests do.
+//!
 //! No production caller reaches this crate yet: binding and lowering the tree
 //! into SQL plans, and serving it over HTTP, land in later changes.
 
@@ -35,6 +40,7 @@ pub mod error;
 mod guard;
 pub mod lexer;
 pub mod limits;
+pub mod manifest;
 mod parser;
 pub mod span;
 
