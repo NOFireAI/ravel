@@ -428,6 +428,42 @@ async fn stats_over_null_returns_a_row_per_group() {
     }
 }
 
+/// With BY, a STATS field that calls no aggregate function binds, and its
+/// value repeats on the one row of each group.
+#[tokio::test]
+async fn a_stats_field_without_an_aggregate_binds_with_by() {
+    let fixture = fixture().await;
+    let source = "FROM logs | STATS s = 1 BY service | SORT service";
+    let outcome = run(&fixture, source)
+        .await
+        .unwrap_or_else(|e| panic!("{source}: {e}"));
+    assert_eq!(
+        columns(&outcome),
+        vec![
+            ("s".to_string(), "long".to_string()),
+            ("service".to_string(), "keyword".to_string())
+        ]
+    );
+    assert_eq!(
+        rows(&outcome),
+        vec![vec!["1", "api"], vec!["1", "web"], vec!["1", "null"]]
+    );
+}
+
+/// Over no rows, STATS without BY still returns its one row: SUM of null is
+/// null and COUNT of null is 0.
+#[tokio::test]
+async fn stats_over_null_and_no_rows_returns_one_row() {
+    let fixture = fixture().await;
+    for (function, value) in [("SUM", "null"), ("COUNT", "0")] {
+        let source = format!("FROM logs | WHERE false | STATS s = {function}(null)");
+        let outcome = run(&fixture, &source)
+            .await
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(rows(&outcome), vec![vec![value]], "{source}");
+    }
+}
+
 /// Without BY, a STATS field that calls no aggregate function is refused at
 /// its own position, named by its text and its place among the fields.
 #[test]

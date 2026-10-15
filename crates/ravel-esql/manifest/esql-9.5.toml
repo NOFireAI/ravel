@@ -3293,12 +3293,7 @@ evidence = "crates/ravel-sql/tests/esql/limits.rs::a_final_limit_above_the_ceili
 [[divergence]]
 name = "overflow and division by zero give null without a warning"
 description = "Integer overflow, division by zero and remainder by zero give null, and the response carries no warning for them."
-evidence = "crates/ravel-sql/tests/esql/types.rs::integer_division_by_zero_and_overflow_give_null"
-
-[[divergence]]
-name = "a command with more than about 1,450 fields is refused"
-description = "Each EVAL, ROW or RENAME field binds a projection that carries every visible column, so bound size grows with the square of the field count; past about 1,450 fields in one command the binder's 1,048,576-node budget refuses the statement although the parser admits it."
-evidence = "crates/ravel-sql/tests/esql/manifest.rs::a_command_past_about_1450_fields_is_refused_by_the_node_budget"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::an_overflow_gives_null_without_a_warning"
 
 [[divergence]]
 name = "an integer literal is a long"
