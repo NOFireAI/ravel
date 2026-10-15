@@ -79,7 +79,7 @@ pub struct KeyIndexRebuildReport {
     pub largest_unindexed_part_entries: u64,
     /// The fields the run rebuilds.
     pub fields: Vec<String>,
-    /// Parts in HEAD lacking a ref for at least one of `fields`.
+    /// Non-empty parts in HEAD lacking a ref for at least one of `fields`.
     pub parts_unindexed: u64,
     /// Parts a published HEAD attached at least one ref to.
     pub parts_rebuilt: u64,
@@ -428,10 +428,11 @@ impl Catalog {
                 })
                 .collect();
             let mut unread: Vec<(String, u64)> = Vec::new();
+            let mut queued: HashSet<&str> = HashSet::new();
             for (entry, key) in entries.iter().zip(&data_keys) {
                 if let Ok(key) = key
                     && !reads.contains_key(key)
-                    && !unread.iter().any(|(queued, _)| queued == key)
+                    && queued.insert(key.as_str())
                 {
                     unread.push((key.clone(), entry.object_size));
                 }
