@@ -1857,3 +1857,69 @@ fn an_in_list_opening_with_the_word_from_prints_parenthesised() {
         );
     }
 }
+
+/// A `|`, `)`, quote or `#` inside a PromQL string, regex or comment belongs
+/// to the query: the region ends at its own closing parenthesis and the
+/// pipeline continues after it.
+#[test]
+fn a_promql_region_ends_at_its_own_closing_parenthesis() {
+    let cases = [
+        // A regex with `|` and an escaped `)`.
+        (
+            r#"PROMQL (up{job=~"a|b\\)"}) | WHERE value > 0"#,
+            r#"up{job=~"a|b\\)"}"#,
+        ),
+        // An escaped double quote before `)` and `|`.
+        (
+            r#"PROMQL (up{job="a\")|("}) | WHERE value > 0"#,
+            r#"up{job="a\")|("}"#,
+        ),
+        // A single-quoted string holding a double quote and `#`.
+        (
+            r#"PROMQL (count(up{path='/"(x|y)#'})) | WHERE value > 0"#,
+            r#"count(up{path='/"(x|y)#'})"#,
+        ),
+        // A raw string holding `)`, `|`, `#` and a double quote.
+        (
+            r#"PROMQL (up{path=`a|"b)#`}) | WHERE value > 0"#,
+            r#"up{path=`a|"b)#`}"#,
+        ),
+        // A comment holding `)`, `|` and a quote, ended by the newline.
+        (
+            "PROMQL (sum(up) # ) | \"x' (\n) | WHERE value > 0",
+            "sum(up) # ) | \"x' (\n",
+        ),
+    ];
+    for (source, inner) in cases {
+        let query = round_trip(source);
+        let c = promql(&query);
+        assert_eq!(c.query.text, inner, "{source:?}");
+        assert_eq!(text(source, c.query.span), inner, "{source:?}");
+        assert!(c.query.error.is_none(), "{source:?}: {:#?}", c.query.error);
+        assert_eq!(
+            text(source, c.span),
+            format!("PROMQL ({inner})"),
+            "{source:?}"
+        );
+        assert!(
+            matches!(query.processing.as_slice(), [Command::Where(_)]),
+            "{source:?}: {:#?}",
+            query.processing
+        );
+    }
+}
+
+/// `parse_guarded` reports a message and no position, so a refusal inside
+/// such a region spans the whole query text between the parentheses.
+#[test]
+fn a_refused_promql_region_spans_its_query_text() {
+    let source = r#"PROMQL (up{job=~"a|b)"} + # ) |
+) | WHERE value > 0"#;
+    let query = round_trip(source);
+    let c = promql(&query);
+    let error = c.query.error.as_ref().expect("`up +` is refused");
+    assert!(!error.message.is_empty());
+    assert_eq!(error.span, c.query.span);
+    assert_eq!(text(source, error.span), "up{job=~\"a|b)\"} + # ) |\n");
+    assert!(matches!(query.processing.as_slice(), [Command::Where(_)]));
+}
