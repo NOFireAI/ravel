@@ -67,13 +67,17 @@ enum Region {
         /// `len + 1` offsets into `text`; a non-UTF-8 entry's span is empty.
         text_offsets: Vec<i32>,
     },
+    /// The entries' bytes with no entry validated yet
+    /// ([`DictValues::unvalidated`]): every entry reads as not UTF-8 until an
+    /// [`EntryTexts`] decides it.
+    Raw(Vec<u8>),
 }
 
 impl Region {
     fn bytes(&self) -> &[u8] {
         match self {
             Region::Text(s) => s.as_bytes(),
-            Region::Mixed { raw, .. } => raw,
+            Region::Mixed { raw, .. } | Region::Raw(raw) => raw,
         }
     }
 }
@@ -153,6 +157,35 @@ impl DictValues {
         })
     }
 
+    /// The dictionary over `entries` with no entry validated: what a scan
+    /// testing a `LIKE` contains arm on the column holds, so only the entries
+    /// that arm or a surviving row needs are ever validated
+    /// ([`EntryTexts`]). Never shared through the row group cache, and never
+    /// left in a block a caller reads: [`EntryTexts::build`] replaces it.
+    pub(crate) fn unvalidated(entries: &[Vec<u8>]) -> Result<Self, LogSegError> {
+        let total: usize = entries.iter().map(Vec::len).sum();
+        check_offset_range(entries.len(), total)?;
+        let mut raw = Vec::with_capacity(total);
+        let mut offsets = Vec::with_capacity(entries.len() + 1);
+        offsets.push(0i32);
+        for entry in entries {
+            raw.extend_from_slice(entry);
+            offsets.push(raw.len() as i32);
+        }
+        Ok(DictValues {
+            region: Region::Raw(raw),
+            offsets,
+            valid: Validity::unset(entries.len()),
+        })
+    }
+
+    /// Whether each entry's UTF-8 was decided when the dictionary was built,
+    /// so [`is_valid`](Self::is_valid) is the answer; `false` for an
+    /// [`unvalidated`](Self::unvalidated) one.
+    pub(crate) fn validated(&self) -> bool {
+        !matches!(self.region, Region::Raw(_))
+    }
+
     /// The number of entries.
     pub fn len(&self) -> usize {
         self.offsets.len() - 1
@@ -197,6 +230,7 @@ impl DictValues {
                 let (a, b) = span(text_offsets, k)?;
                 text.get(a..b)
             }
+            Region::Raw(_) => None,
         }
     }
 
@@ -214,6 +248,7 @@ impl DictValues {
                 text,
                 text_offsets,
             } => raw.capacity() + text.capacity() + text_offsets.capacity() * 4,
+            Region::Raw(raw) => raw.capacity(),
         };
         region + self.offsets.capacity() * std::mem::size_of::<i32>() + self.valid.heap_bytes()
     }
@@ -230,7 +265,7 @@ impl DictValues {
             bytes += self.entry_heap_bytes(k);
         }
         let leading = match self.region {
-            Region::Text(_) => 1,
+            Region::Text(_) | Region::Raw(_) => 1,
             Region::Mixed { .. } => 2,
         };
         bytes
@@ -247,12 +282,145 @@ impl DictValues {
         };
         let offsets = std::mem::size_of::<i32>();
         match &self.region {
-            Region::Text(_) => (b - a) + offsets,
+            Region::Text(_) | Region::Raw(_) => (b - a) + offsets,
             Region::Mixed { text_offsets, .. } => {
                 let text = span(text_offsets, k).map_or(0, |(c, d)| d - c);
                 (b - a) + offsets + text + offsets
             }
         }
+    }
+}
+
+/// The UTF-8 of an [`unvalidated`](DictValues::unvalidated) dictionary's
+/// entries, decided one entry at a time as a scan needs it and kept, so the
+/// blocks sharing the dictionary validate each entry at most once.
+#[derive(Debug)]
+pub(crate) struct EntryTexts {
+    /// The text of every entry found UTF-8, concatenated in the order found.
+    text: String,
+    spans: Vec<EntrySpan>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum EntrySpan {
+    Unchecked,
+    Invalid,
+    /// The entry's text, `text[a..b]`.
+    Valid(usize, usize),
+}
+
+impl EntryTexts {
+    /// Nothing decided yet, for a dictionary of `len` entries.
+    pub(crate) fn new(len: usize) -> Self {
+        EntryTexts {
+            text: String::new(),
+            spans: vec![EntrySpan::Unchecked; len],
+        }
+    }
+
+    /// Whether entry `k` of `dict` is UTF-8; `false` out of range. An entry of
+    /// an unvalidated `dict` is validated on its first query, adding one to
+    /// `validated`; a [`validated`](DictValues::validated) `dict` answers from
+    /// its own bits and counts nothing.
+    pub(crate) fn is_valid(&mut self, dict: &DictValues, k: usize, validated: &mut u64) -> bool {
+        self.text_of(dict, k, validated).is_some()
+    }
+
+    fn text_of<'d>(
+        &'d mut self,
+        dict: &'d DictValues,
+        k: usize,
+        validated: &mut u64,
+    ) -> Option<&'d str> {
+        if dict.validated() {
+            return dict.text(k);
+        }
+        let span = *self.spans.get(k)?;
+        let span = match span {
+            EntrySpan::Unchecked => {
+                let bytes = dict.entry(k)?;
+                *validated += 1;
+                let span = match validate_entry(bytes) {
+                    Some(t) => {
+                        let a = self.text.len();
+                        self.text.push_str(t);
+                        EntrySpan::Valid(a, self.text.len())
+                    }
+                    None => EntrySpan::Invalid,
+                };
+                self.spans[k] = span;
+                span
+            }
+            decided => decided,
+        };
+        match span {
+            EntrySpan::Valid(a, b) => self.text.get(a..b),
+            EntrySpan::Unchecked | EntrySpan::Invalid => None,
+        }
+    }
+
+    /// `dict` narrowed to the entries set in `used`: the same number of
+    /// entries, each used one holding its bytes and its UTF-8 decided (once,
+    /// through [`is_valid`](Self::is_valid)'s memo), each unused one empty.
+    /// Only the used entries are validated and copied.
+    pub(crate) fn build(
+        &mut self,
+        dict: &DictValues,
+        used: &Validity,
+        validated: &mut u64,
+    ) -> Result<DictValues, LogSegError> {
+        let n = dict.len();
+        let mut total = 0usize;
+        let mut any_invalid = false;
+        for k in (0..n).filter(|&k| used.get(k)) {
+            total += dict.entry(k).map_or(0, <[u8]>::len);
+            any_invalid |= !self.is_valid(dict, k, validated);
+        }
+        check_offset_range(n, total)?;
+        let mut offsets = Vec::with_capacity(n + 1);
+        offsets.push(0i32);
+        let mut valid = Validity::unset(n);
+        let region = if any_invalid {
+            let mut raw = Vec::with_capacity(total);
+            let mut text = String::new();
+            let mut text_offsets = Vec::with_capacity(n + 1);
+            text_offsets.push(0i32);
+            for k in 0..n {
+                if used.get(k) {
+                    raw.extend_from_slice(dict.entry(k).unwrap_or_default());
+                    if let Some(t) = self.text_of(dict, k, validated) {
+                        text.push_str(t);
+                        valid.set(k);
+                    }
+                } else {
+                    valid.set(k);
+                }
+                offsets.push(raw.len() as i32);
+                text_offsets.push(text.len() as i32);
+            }
+            Region::Mixed {
+                raw,
+                text,
+                text_offsets,
+            }
+        } else {
+            let mut text = String::with_capacity(total);
+            for k in 0..n {
+                if used.get(k)
+                    && let Some(t) = self.text_of(dict, k, validated)
+                {
+                    text.push_str(t);
+                }
+                valid.set(k);
+                offsets.push(text.len() as i32);
+            }
+            Region::Text(text)
+        };
+        Ok(DictValues {
+            region,
+            offsets,
+            valid,
+        })
     }
 }
 

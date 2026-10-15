@@ -668,6 +668,9 @@ fn content_columns(pred: &Predicate, fixed: &mut BTreeSet<usize>, attrs: &mut BT
                 attrs.insert(name.clone());
             }
         },
+        Predicate::Contains { key, .. } => {
+            attrs.insert(key.clone());
+        }
     }
 }
 

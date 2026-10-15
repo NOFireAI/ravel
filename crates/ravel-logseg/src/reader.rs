@@ -19,7 +19,7 @@ use crate::block::{
 };
 use crate::columnar::ColumnarBlockView;
 use crate::columns::ColumnSelection;
-use crate::dict_values::DictValues;
+use crate::dict_values::{DictValues, EntryTexts};
 use crate::error::LogSegError;
 use crate::field_dir::FieldDir;
 use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open_source};
@@ -111,6 +111,21 @@ pub struct ScanStats {
     /// block was counted in [`Self::blocks_predicate_dropped`]. Grows as blocks
     /// are decoded, like [`Self::pages_decoded`].
     pub rows_predicate_evaluated: u64,
+    /// Cells a [`Predicate::Contains`] arm tested for its needle: a dictionary
+    /// entry once per test (once per dictionary for a row group dictionary,
+    /// however many of its blocks read it), a plain-page cell once. Grows as
+    /// blocks are decoded, like [`Self::pages_decoded`] (ADR-2773, contains-arm
+    /// amendment).
+    pub contains_cells_tested: u64,
+    /// String dictionary entries this reader UTF-8 validated, once per
+    /// validation: every entry of a dictionary built eagerly, and on the
+    /// survivor-only build of a [`Predicate::Contains`] column only the entries
+    /// that arm had to read as text or a surviving row references. This is
+    /// the reader's part of the count only: plain-page cells are validated by
+    /// the declared `Str` build in `ravel-sql`, which counts them, and are
+    /// never counted here. Grows as blocks are decoded, like
+    /// [`Self::pages_decoded`].
+    pub str_cells_validated: u64,
 }
 
 /// An opened RLOG object ready to scan.
@@ -732,6 +747,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             });
         }
 
+        let compiled = compile_arms(&self.stream_dir, &self.field_dir, &arms);
+        let deferred = contains_columns(&compiled);
         Ok(BlockScan {
             stream_dir: self.stream_dir.clone(),
             field_dir: self.field_dir.clone(),
@@ -739,7 +756,8 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             columns: columns
                 .resolve(&self.field_dir)
                 .map(|s| s.into_iter().collect()),
-            arms: compile_arms(&self.stream_dir, &self.field_dir, &arms),
+            arms: compiled,
+            deferred,
             blocks,
             page_dir: self.page_dir.clone(),
             blocks_offset: self.blocks_offset,
@@ -866,6 +884,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
             plans: Vec::new(),
             columns: None,
             arms: Vec::new(),
+            deferred: Vec::new(),
             blocks: Vec::new(),
             page_dir: Arc::new(PageDir::default()),
             blocks_offset: 0,
@@ -1146,6 +1165,10 @@ pub struct BlockScan {
     /// The exact content filter, its arms resolved against the directories
     /// once per scan and evaluated per decoded block ([`block_survivors`]).
     arms: Vec<Arm>,
+    /// The `Str` columns a [`Predicate::Contains`] arm tests, whose
+    /// dictionaries get the survivor-only values build
+    /// ([`build_survivor_values`]) rather than the eager one.
+    deferred: Vec<u32>,
     blocks: Vec<BlockLoc>,
     /// The object's shared decoded PAGE_DIR. One [`Arc`] copy per scan, cloned
     /// from the reader, through which [`Self::decode_block`] resolves each
@@ -1367,16 +1390,21 @@ impl BlockScan {
             loc.block_index,
             &mut self.dicts,
         )?;
-        let decoded = decode_v4_block_with(
+        let mut decoded = decode_v4_block_with(
             |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
             loc.record_count,
             loc.crc32c,
             &pages,
             &dict_pages,
             &mut self.dicts,
+            &self.deferred,
             &self.plans,
             self.columns.as_ref(),
         )?;
+        self.stats.str_cells_validated = self
+            .stats
+            .str_cells_validated
+            .saturating_add(decoded.str_cells_validated());
         self.stats.blocks_scanned += 1;
         self.stats.pages_decoded += decoded.pages_decoded() as u64;
         self.stats.int_values_buffers += decoded.int_values_buffers() as u64;
@@ -1404,9 +1432,45 @@ impl BlockScan {
             &mut self.stats,
             &mut self.surviving,
         )?;
+        build_survivor_values(
+            &self.deferred,
+            &mut decoded,
+            &self.surviving,
+            &mut self.dict_memo,
+            &mut self.stats,
+        )?;
         self.current = Some(decoded);
         Ok(true)
     }
+}
+
+/// The survivor-only values build: each `deferred` column held in dictionary
+/// form gets a dictionary of its own, holding only the entries `surviving`
+/// rows reference, each validated at most once per dictionary (through the
+/// memo the contains kernel validated through), and every other row of the
+/// column reads as absent. The unvalidated dictionary it replaces stays where
+/// it was; nothing here touches the row group cache.
+fn build_survivor_values(
+    deferred: &[u32],
+    block: &mut DecodedBlock,
+    surviving: &[usize],
+    memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
+) -> Result<(), LogSegError> {
+    for &col in deferred {
+        let Some(StrColumn::Dict(d)) = block.str_column_mut(col) else {
+            continue;
+        };
+        let values = Arc::clone(d.values());
+        if values.validated() {
+            continue;
+        }
+        let used = d.entries_used_by(surviving);
+        let built =
+            texts_slot(&mut memo.texts, col, &values).build(&values, &used, &mut stats.str_cells_validated)?;
+        d.restrict_to(Arc::new(built), surviving);
+    }
+    Ok(())
 }
 
 /// Reads and decodes one version-4 block, given its pages located through
@@ -1456,6 +1520,7 @@ pub(crate) fn decode_v4_block(
         pages,
         dict_pages,
         dicts,
+        &[],
         plans,
         columns,
     )
@@ -1495,10 +1560,17 @@ pub(crate) fn located_block_pages(
 /// block of another group comes up, so residency stays one group's
 /// dictionaries however many groups a scan crosses. Only a successful decode
 /// is stored, so a corrupt dictionary still fails every block of its chunk.
+///
+/// A column a `LIKE` contains arm tests is decoded
+/// [unvalidated](DictValues::unvalidated) and kept apart, in `raw`: its
+/// dictionary is never in `entries`, so a scan without the arm sharing the
+/// cache never reads one whose entries were not all validated, and the
+/// survivor-only build ([`build_survivor_values`]) never writes into it.
 #[derive(Debug, Default)]
 pub(crate) struct DictCache {
     group: Option<u32>,
     entries: Vec<(DictKey, Arc<DictValues>)>,
+    raw: Vec<(DictKey, Arc<DictValues>)>,
 }
 
 /// A dictionary page's `(offset, column_id)`.
@@ -1511,12 +1583,16 @@ impl DictCache {
         let group = page_dir.locate_block(block).map(|(g, _)| g.first_block);
         if group != self.group || group.is_none() {
             self.entries.clear();
+            self.raw.clear();
             self.group = group;
         }
     }
 
-    fn get(&self, key: DictKey) -> Option<&Arc<DictValues>> {
-        self.entries.iter().find(|(k, _)| *k == key).map(|(_, d)| d)
+    /// The dictionary for `key`: the unvalidated one when `deferred`, the
+    /// shared validated one otherwise.
+    fn get(&self, key: DictKey, deferred: bool) -> Option<&Arc<DictValues>> {
+        let entries = if deferred { &self.raw } else { &self.entries };
+        entries.iter().find(|(k, _)| *k == key).map(|(_, d)| d)
     }
 }
 
@@ -1548,6 +1624,11 @@ pub(crate) fn dict_page_decodes() -> u64 {
 /// if it had been (one decoded page, its stored and decompressed lengths), so
 /// [`ScanStats`] figures do not depend on which block of a chunk came first.
 /// [`located_block_pages`] readies `dicts` for the block.
+///
+/// A dictionary, row group or per-block, of a column in `deferred` is left
+/// [unvalidated](DictValues::unvalidated) for the scan's survivor-only build;
+/// every other one is validated in full and counted in the block's
+/// [`DecodedBlock::str_cells_validated`].
 #[allow(clippy::too_many_arguments)]
 fn decode_v4_block_with<'s>(
     page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,
@@ -1556,6 +1637,7 @@ fn decode_v4_block_with<'s>(
     pages: &[PageLoc],
     dict_pages: &[PageLoc],
     dicts: &mut DictCache,
+    deferred: &[u32],
     plans: &[ColumnPlan],
     columns: Option<&ColumnIdSet>,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1566,6 +1648,7 @@ fn decode_v4_block_with<'s>(
     let mut descs: Vec<crate::page::PageDesc> = Vec::with_capacity(pages.len());
     let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(pages.len());
     let mut counters = PageCounters::default();
+    let mut validated = 0u64;
     for p in dict_pages {
         counters.bytes_fetched = counters.bytes_fetched.saturating_add(p.desc.len);
         let key = (p.offset, p.desc.column_id);
@@ -1573,7 +1656,8 @@ fn decode_v4_block_with<'s>(
             counters.skipped += 1;
             continue;
         }
-        if dicts.get(key).is_some() {
+        let defer = deferred.contains(&p.desc.column_id);
+        if dicts.get(key, defer).is_some() {
             if p.desc.comp == crate::page::COMP_ZSTD {
                 counters.decompressed_bytes = counters
                     .decompressed_bytes
@@ -1588,9 +1672,15 @@ fn decode_v4_block_with<'s>(
         let decoded = decode_dict_page(&produced)?;
         #[cfg(test)]
         DICT_PAGE_DECODES.with(|n| n.set(n.get() + 1));
-        dicts
-            .entries
-            .push((key, Arc::new(DictValues::from_entries(&decoded)?)));
+        if defer {
+            dicts
+                .raw
+                .push((key, Arc::new(DictValues::unvalidated(&decoded)?)));
+        } else {
+            let values = DictValues::from_entries(&decoded)?;
+            validated += decoded.len() as u64;
+            dicts.entries.push((key, Arc::new(values)));
+        }
     }
     let mut block_crc = 0u32;
     let mut all_read = true;
@@ -1615,7 +1705,10 @@ fn decode_v4_block_with<'s>(
         .filter(|p| wanted(p.desc.column_id))
         .map(|p| {
             dicts
-                .get((p.offset, p.desc.column_id))
+                .get(
+                    (p.offset, p.desc.column_id),
+                    deferred.contains(&p.desc.column_id),
+                )
                 .map(|d| (p.desc.column_id, d))
                 .ok_or_else(|| {
                     LogSegError::Corrupted(format!(
@@ -1625,7 +1718,17 @@ fn decode_v4_block_with<'s>(
                 })
         })
         .collect::<Result<_, _>>()?;
-    read_block_pages_with_shared_dicts(record_count, &descs, &page_bytes, &dicts, plans, counters)
+    let mut block = read_block_pages_with_shared_dicts(
+        record_count,
+        &descs,
+        &page_bytes,
+        &dicts,
+        deferred,
+        plans,
+        counters,
+    )?;
+    block.add_str_cells_validated(validated);
+    Ok(block)
 }
 
 /// Checks one kept page's stored bytes against its PAGE_DIR crc, then
@@ -1693,6 +1796,16 @@ enum Arm {
     Word {
         col: u32,
         word: String,
+    },
+    /// `Contains` on attribute `key`: `col` is its FIELD_DIR `Str` column, if
+    /// any, and `others` its columns of every other type, whose present cell
+    /// keeps a row whatever the test says.
+    Contains {
+        col: Option<u32>,
+        others: Vec<(u32, FieldType)>,
+        key: String,
+        needle: Vec<u8>,
+        negated: bool,
     },
     /// An `Equals` that no row can satisfy (`body` against a non-string).
     Never,
@@ -1762,10 +1875,42 @@ fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate
                     }
                 }
             },
+            Predicate::Contains {
+                key,
+                needle,
+                negated,
+            } => Arm::Contains {
+                col: field_dir
+                    .column(key, FieldType::Str)
+                    .map(|e| e.column_id),
+                others: field_dir
+                    .entries()
+                    .iter()
+                    .filter(|e| e.name == *key && e.ty != FieldType::Str)
+                    .map(|e| (e.column_id, e.ty))
+                    .collect(),
+                key: key.clone(),
+                needle: needle.as_bytes().to_vec(),
+                negated: *negated,
+            },
         };
         out.push(arm);
     }
     out
+}
+
+/// The `Str` columns the `Contains` arms test, each once, in arm order: the
+/// columns whose dictionaries get the survivor-only values build.
+fn contains_columns(arms: &[Arm]) -> Vec<u32> {
+    let mut cols = Vec::new();
+    for arm in arms {
+        if let Arm::Contains { col: Some(c), .. } = arm
+            && !cols.contains(c)
+        {
+            cols.push(*c);
+        }
+    }
+    cols
 }
 
 /// The equality arm for a FIELD_DIR column of the type `value` resolves to,
@@ -1846,10 +1991,42 @@ thread_local! {
 /// so the blocks of a row group, which share one dictionary, pay for it once:
 /// the keys a `BytesEq` target equals, and a `Word` arm's `phrase_match`
 /// result per entry so far. Indexed by the arm's position in the scan.
+///
+/// A `Contains` arm keeps its needle test per entry in `contains`, and its
+/// stream fallback verdict per `stream_ref` in `streams`, which holds for the
+/// whole scan. `texts` is per column, not per arm: the UTF-8 of an unvalidated
+/// dictionary's entries, decided once and shared by every arm on the column
+/// and by the survivor-only build ([`build_survivor_values`]).
 #[derive(Default)]
 struct DictArmMemo {
     hits: Vec<DictSlot<Vec<i32>>>,
     words: Vec<DictSlot<Vec<Option<bool>>>>,
+    contains: Vec<DictSlot<Vec<Option<bool>>>>,
+    streams: Vec<Vec<Option<bool>>>,
+    texts: Vec<(u32, DictSlot<EntryTexts>)>,
+}
+
+/// Column `col`'s [`EntryTexts`] over `dict`, started afresh unless it
+/// already holds `dict`'s.
+fn texts_slot<'m>(
+    texts: &'m mut Vec<(u32, DictSlot<EntryTexts>)>,
+    col: u32,
+    dict: &Arc<DictValues>,
+) -> &'m mut EntryTexts {
+    let at = match texts.iter().position(|(c, _)| *c == col) {
+        Some(at) => at,
+        None => {
+            texts.push((col, None));
+            texts.len() - 1
+        }
+    };
+    let slot = &mut texts[at].1;
+    if !matches!(slot, Some((w, _)) if std::ptr::eq(w.as_ptr(), Arc::as_ptr(dict))) {
+        *slot = None;
+    }
+    &mut slot
+        .get_or_insert_with(|| (Arc::downgrade(dict), EntryTexts::new(dict.len())))
+        .1
 }
 
 /// Work keyed by the identity of the shared [`DictValues`] it was done over.
@@ -1924,7 +2101,7 @@ fn block_survivors(
                 }
                 #[cfg(test)]
                 KERNEL_ARMS.with(|c| c.set(c.get() + 1));
-                apply_arm(arm, i, block, memo, &mut sel)?;
+                apply_arm(arm, i, stream_dir, block, memo, stats, &mut sel)?;
             }
         }
     }
@@ -1944,11 +2121,34 @@ fn block_survivors(
 fn apply_arm(
     arm: &Arm,
     index: usize,
+    stream_dir: &StreamDir,
     block: &DecodedBlock,
     memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
     sel: &mut RowSelection,
 ) -> Result<(), LogSegError> {
     match arm {
+        Arm::Contains {
+            col,
+            others,
+            key,
+            needle,
+            negated,
+        } => contains_kernel(
+            ContainsArm {
+                index,
+                col: *col,
+                others,
+                key,
+                needle,
+                negated: *negated,
+            },
+            stream_dir,
+            block,
+            memo,
+            stats,
+            sel,
+        ),
         Arm::Ts { min, max } => {
             let (min, max) = (*min, *max);
             i64_kernel(block.i64_column(COL_TS), Some(COL_TS), sel, |v| {
@@ -2059,6 +2259,178 @@ fn apply_arm(
 
 fn missing_i64(col: u32) -> LogSegError {
     LogSegError::Corrupted(format!("missing i64 col {col}"))
+}
+
+/// A `Contains` arm's fields, borrowed for [`contains_kernel`].
+struct ContainsArm<'a> {
+    /// The arm's slot in the scan's [`DictArmMemo`].
+    index: usize,
+    col: Option<u32>,
+    others: &'a [(u32, FieldType)],
+    key: &'a str,
+    needle: &'a [u8],
+    negated: bool,
+}
+
+/// Clears from `sel` the rows a `Contains` arm rejects: the rows [`eval`]
+/// rejects one by one (ADR-2773, contains-arm amendment).
+///
+/// A row reads its `Str` cell when that cell is present and UTF-8, else its
+/// stream's resource or scope `Str` value, decided once per stream for the
+/// scan. The needle test runs on the cell's raw bytes, once per dictionary
+/// entry through `memo` or once per present plain cell, and counts in
+/// [`ScanStats::contains_cells_tested`]. UTF-8 is decided only where it
+/// changes the answer, when the cell's verdict and the stream's differ: a
+/// dictionary entry through the column's [`EntryTexts`], counted in
+/// [`ScanStats::str_cells_validated`] when the dictionary was left
+/// unvalidated, and a plain cell in place, uncounted. A row with a present cell
+/// of another type for `key`, or an `attrs_raw` entry for it, is kept.
+fn contains_kernel(
+    arm: ContainsArm<'_>,
+    stream_dir: &StreamDir,
+    block: &DecodedBlock,
+    memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
+    sel: &mut RowSelection,
+) -> Result<(), LogSegError> {
+    let Some(refs) = block.i64_column(COL_STREAM_REF) else {
+        return sel.reject_all_or(missing_i64(COL_STREAM_REF));
+    };
+    let DictArmMemo {
+        contains,
+        streams,
+        texts,
+        ..
+    } = memo;
+    let ScanStats {
+        contains_cells_tested: tested,
+        str_cells_validated: validated,
+        ..
+    } = stats;
+    if streams.len() <= arm.index {
+        streams.resize_with(arm.index + 1, Vec::new);
+    }
+    let streams = &mut streams[arm.index];
+    if streams.len() < stream_dir.len() {
+        streams.resize(stream_dir.len(), None);
+    }
+    let mut fallback = |row: usize| -> Result<bool, LogSegError> {
+        let raw = refs.get(row).ok_or_else(|| missing_i64(COL_STREAM_REF))?;
+        let r = u32::try_from(raw).map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+        if let Some(Some(pass)) = streams.get(r as usize) {
+            return Ok(*pass);
+        }
+        let pass = stream_contains(stream_dir, r, arm.key, arm.needle, arm.negated)?;
+        if let Some(slot) = streams.get_mut(r as usize) {
+            *slot = Some(pass);
+        }
+        Ok(pass)
+    };
+    let elsewhere = |row: usize| resolved_elsewhere(block, arm.others, arm.key, row);
+    match arm.col.and_then(|c| Some((c, block.str_column(c)?))) {
+        None => sel.retain(|row| Ok(fallback(row)? || elsewhere(row)?)),
+        Some((_, StrColumn::Plain(cells))) => sel.retain(|row| {
+            let fb = fallback(row)?;
+            let pass = match cells.get(row).and_then(Option::as_deref) {
+                None => fb,
+                Some(cell) => {
+                    *tested += 1;
+                    let t = contains_bytes(cell, arm.needle) != arm.negated;
+                    if t == fb || std::str::from_utf8(cell).is_ok() {
+                        t
+                    } else {
+                        fb
+                    }
+                }
+            };
+            Ok(pass || elsewhere(row)?)
+        }),
+        Some((col, StrColumn::Dict(d))) => {
+            let values = d.values();
+            let verdicts = dict_slot(contains, arm.index, values, |v| vec![None; v.len()]);
+            let entry_texts = texts_slot(texts, col, values);
+            sel.retain(|row| {
+                let fb = fallback(row)?;
+                let pass = match d.key(row) {
+                    None => fb,
+                    Some(k) => {
+                        let k = k as usize;
+                        let t = match verdicts.get(k).copied().flatten() {
+                            Some(t) => t,
+                            None => {
+                                *tested += 1;
+                                let t = values
+                                    .entry(k)
+                                    .is_some_and(|e| contains_bytes(e, arm.needle))
+                                    != arm.negated;
+                                if let Some(slot) = verdicts.get_mut(k) {
+                                    *slot = Some(t);
+                                }
+                                t
+                            }
+                        };
+                        if t == fb || entry_texts.is_valid(values, k, validated) {
+                            t
+                        } else {
+                            fb
+                        }
+                    }
+                };
+                Ok(pass || elsewhere(row)?)
+            })
+        }
+    }
+}
+
+/// Whether `needle` occurs in `hay` as a contiguous run of bytes. An empty
+/// needle occurs in every value.
+fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// A `Contains` arm's verdict on stream `stream_ref`'s value for `key`: its
+/// resource or scope `Str` value contains `needle`, flipped when `negated`.
+/// `false` when the stream has no `Str` value for `key`, a NULL neither
+/// `LIKE` nor `NOT LIKE` keeps. A ref past the STREAM_DIR is the same
+/// `Corrupted` error [`rebuild_record`] gives.
+fn stream_contains(
+    stream_dir: &StreamDir,
+    stream_ref: u32,
+    key: &str,
+    needle: &[u8],
+    negated: bool,
+) -> Result<bool, LogSegError> {
+    let entry = stream_dir
+        .entries()
+        .get(stream_ref as usize)
+        .ok_or_else(|| LogSegError::Corrupted("stream_ref out of range".into()))?;
+    let value = stream_attr_pairs(&entry.blob)?
+        .into_iter()
+        .filter(|(_, v)| !matches!(v, AttrValue::List(_) | AttrValue::Map(_)))
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v);
+    Ok(match value {
+        Some(AttrValue::Str(s)) => contains_bytes(s.as_bytes(), needle) != negated,
+        _ => false,
+    })
+}
+
+/// Whether row `row` has a present cell for `key` in one of the columns
+/// `others`, or an `attrs_raw` entry for it: a reading other than the `Str`
+/// cell and the stream value, which a `Contains` arm never drops.
+fn resolved_elsewhere(
+    block: &DecodedBlock,
+    others: &[(u32, FieldType)],
+    key: &str,
+    row: usize,
+) -> Result<bool, LogSegError> {
+    if others
+        .iter()
+        .any(|&(col, ty)| get_attr_value(block, col, ty, row).is_some())
+    {
+        return Ok(true);
+    }
+    Ok(overflow_attr(block, row, key)?.is_some())
 }
 
 /// Clears from `sel` the rows of an integer column whose value fails `keep`,
@@ -2226,6 +2598,29 @@ fn eval(
             }
         }
         Predicate::Equals { field, value } => equals(field_dir, field, value, block, row)?,
+        Predicate::Contains {
+            key,
+            needle,
+            negated,
+        } => {
+            let needle = needle.as_bytes();
+            let r = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            let stream = stream_contains(stream_dir, r, key, needle, *negated)?;
+            let cell = field_dir
+                .column(key, FieldType::Str)
+                .and_then(|e| block.str_at(e.column_id, row))
+                .filter(|c| std::str::from_utf8(c).is_ok());
+            let pass = match cell {
+                Some(c) => contains_bytes(c, needle) != *negated,
+                None => stream,
+            };
+            pass || field_dir.entries().iter().any(|e| {
+                e.name == *key
+                    && e.ty != FieldType::Str
+                    && get_attr_value(block, e.column_id, e.ty, row).is_some()
+            }) || overflow_attr(block, row, key)?.is_some()
+        }
         // `NumRange` is prune-only (ADR-0095 decision 6): it drives block
         // pruning through `scan_blocks`'s `prune` channel and is never an exact
         // per-row filter. Reaching exact evaluation means the caller wired it

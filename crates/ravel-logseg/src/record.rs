@@ -518,6 +518,24 @@ pub enum Predicate {
         field: FieldSel,
         value: AttrValue,
     },
+    /// `key LIKE '%needle%'`, or `NOT LIKE` when `negated`, on the attribute
+    /// `key` read as a declared `Str` column (ADR-2773, contains-arm
+    /// amendment). The value tested is the record's `Str` cell when it is
+    /// present and UTF-8; otherwise the stream's resource or scope `Str`
+    /// value for `key`; otherwise NULL, which neither `LIKE` nor `NOT LIKE`
+    /// keeps. The test is a byte-substring test, which for UTF-8 text and a
+    /// UTF-8 needle is a character-substring test. An empty needle matches
+    /// every non-NULL value.
+    ///
+    /// A row whose `key` the merged view resolves through anything other than
+    /// that cell or the stream value (a present cell of another type, or an
+    /// `attrs_raw` entry) is kept whatever the test says, so the arm is exact
+    /// on the rows it drops and the caller re-evaluates the rows it keeps.
+    Contains {
+        key: String,
+        needle: String,
+        negated: bool,
+    },
     /// Prune-only inclusive numeric range on a dynamic numeric column
     /// (I64/F64/Bool), selected by attribute name and exact column type.
     ///
