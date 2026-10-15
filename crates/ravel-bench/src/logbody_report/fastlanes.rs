@@ -81,7 +81,7 @@ fn unpack(bytes: &[u8], width: u8, out: &mut [u64; VECTOR]) -> Option<()> {
     }
     let need = w * LANES * 8;
     let src = bytes.get(..need)?;
-    let mut words = vec![0u64; w * LANES];
+    let mut words = [0u64; 64 * LANES];
     for (dst, chunk) in words.iter_mut().zip(src.chunks_exact(8)) {
         *dst = u64::from_le_bytes(chunk.try_into().ok()?);
     }
@@ -160,9 +160,16 @@ pub fn encode(values: &[i64], variant: Variant) -> Vec<u8> {
 /// Decodes a page written by [`encode`]. `None` on malformed input.
 pub fn decode(bytes: &[u8], variant: Variant) -> Option<Vec<i64>> {
     let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
-    // `count` comes from untrusted input; do not let a corrupted huge count
-    // drive a multi-GB allocation before the payload length is checked.
-    let mut out = Vec::new();
+    // Every vector costs at least its frame header (plus the lane heads for
+    // Delta), so a count the payload cannot hold is refused before reserving.
+    let min_vector_bytes = match variant {
+        Variant::For => 9,
+        Variant::Delta => LANES * 8 + 9,
+    };
+    if count.div_ceil(VECTOR) > (bytes.len() - 4) / min_vector_bytes {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count);
     let mut at = 4;
     let mut vec = [0i64; VECTOR];
     let mut scratch = [0u64; VECTOR];
@@ -253,6 +260,19 @@ mod tests {
         page.extend_from_slice(&[0u8; 16]);
         assert!(decode(&page, Variant::For).is_none());
         assert!(decode(&page, Variant::Delta).is_none());
+    }
+
+    #[test]
+    fn minimum_size_pages_decode_at_the_count_bound() {
+        // Width-0 vectors are the smallest a page can be, so their count sits
+        // exactly on the bound `decode` checks before reserving.
+        let v = vec![5i64; 2 * VECTOR];
+        for variant in [Variant::For, Variant::Delta] {
+            let mut page = encode(&v, variant);
+            assert_eq!(decode(&page, variant).unwrap(), v);
+            page[..4].copy_from_slice(&(2 * VECTOR as u32 + 1).to_le_bytes());
+            assert!(decode(&page, variant).is_none());
+        }
     }
 
     #[test]
