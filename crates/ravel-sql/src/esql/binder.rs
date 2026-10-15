@@ -152,6 +152,15 @@ pub(crate) struct BindInput<'a> {
 }
 
 pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, EsqlError> {
+    // No setting changes how a statement runs here, so honouring none of them
+    // silently would answer a different question than the one asked.
+    if let Some(setting) = query.settings.first() {
+        return Err(EsqlError::unsupported(
+            input.source,
+            setting.span,
+            format!("query setting [{}]", setting.name.text),
+        ));
+    }
     let mut binder = Binder {
         source: input.source,
         now_ns: input.now_ns,
@@ -173,8 +182,8 @@ pub(crate) fn bind(query: &ast::Query, input: &BindInput<'_>) -> Result<Bound, E
         Command::From(from) => binder.from(from, input)?,
         Command::Row(row) => {
             for field in &row.fields {
+                let name = binder.field_name(field)?;
                 let (value, ty) = binder.value(&field.expr, &mut Cx::Row)?;
-                let name = binder.field_name(field);
                 binder.define(name, value, ty);
             }
         }
@@ -385,10 +394,19 @@ impl Binder<'_> {
         )
     }
 
-    fn field_name(&self, field: &ast::Field) -> String {
+    fn field_name(&self, field: &ast::Field) -> Result<String, EsqlError> {
         match &field.name {
-            Some(name) => name_text(name),
-            None => self.text(field.expr.span()),
+            Some(name) => self.name(name),
+            None => Ok(self.text(field.expr.span())),
+        }
+    }
+
+    /// A name as written. A parameter in any part of it is refused: nothing
+    /// supplies parameter values, so its text would stand in as the name.
+    fn name(&self, name: &QualifiedName) -> Result<String, EsqlError> {
+        match name.parts.iter().find_map(|part| part.param.as_ref()) {
+            Some(param) => Err(self.unsupported(param.span, "query parameter")),
+            None => Ok(name_text(name)),
         }
     }
 
@@ -779,8 +797,8 @@ impl Binder<'_> {
             }
             Command::Eval(eval) => {
                 for field in &eval.fields {
+                    let name = self.field_name(field)?;
                     let (value, ty) = self.value(&field.expr, &mut Cx::Row)?;
-                    let name = self.field_name(field);
                     self.define(name, value, ty);
                 }
             }
@@ -916,9 +934,9 @@ impl Binder<'_> {
         };
         let mut attributes: Vec<(usize, String)> = Vec::new();
         for (at, name) in patterns.iter().enumerate() {
+            let text = self.name(name)?;
             let pattern = Pattern::of(name);
             if !pattern.is_wildcard() {
-                let text = name_text(name);
                 match self.scope.lookup(&text) {
                     Lookup::Visible(col) => place(&mut best, col, at, 2),
                     Lookup::Attribute => {
@@ -938,10 +956,9 @@ impl Binder<'_> {
                 }
             }
             if !matched {
-                return Err(self.verification(
-                    name.span,
-                    format!("No matches found for pattern [{}]", name_text(name)),
-                ));
+                return Err(
+                    self.verification(name.span, format!("No matches found for pattern [{text}]"))
+                );
             }
         }
         let mut cols = Vec::new();
@@ -975,9 +992,9 @@ impl Binder<'_> {
 
     fn drop(&mut self, patterns: &[QualifiedName], span: Span) -> Result<(), EsqlError> {
         for name in patterns {
+            let text = self.name(name)?;
             let pattern = Pattern::of(name);
             if !pattern.is_wildcard() {
-                let text = name_text(name);
                 match self.scope.lookup(&text) {
                     Lookup::Visible(col) => {
                         self.scope.cols.remove(col);
@@ -993,10 +1010,9 @@ impl Binder<'_> {
             if self.scope.attrs.is_some() {
                 self.scope.blocked.push(pattern);
             } else if self.scope.cols.len() == before {
-                return Err(self.verification(
-                    name.span,
-                    format!("No matches found for pattern [{}]", name_text(name)),
-                ));
+                return Err(
+                    self.verification(name.span, format!("No matches found for pattern [{text}]"))
+                );
             }
         }
         if self.scope.cols.is_empty() {
@@ -1009,8 +1025,8 @@ impl Binder<'_> {
     }
 
     fn rename(&mut self, pair: &ast::RenamePair) -> Result<(), EsqlError> {
-        let old = name_text(&pair.old);
-        let new = name_text(&pair.new);
+        let old = self.name(&pair.old)?;
+        let new = self.name(&pair.new)?;
         match self.scope.lookup(&old) {
             Lookup::Visible(col) => {
                 let internal = self.scope.cols[col].internal.clone();
@@ -1039,6 +1055,7 @@ impl Binder<'_> {
         let mut aggregates = Vec::new();
         let mut outputs: Vec<(String, BExpr, EsqlType)> = Vec::new();
         for (position, aggregate) in stats.aggregates.iter().enumerate() {
+            let name = self.field_name(&aggregate.field)?;
             let filter = match &aggregate.filter {
                 Some(filter) => {
                     let (condition, ty) = self.value(filter, &mut Cx::Row)?;
@@ -1067,7 +1084,7 @@ impl Binder<'_> {
                     ),
                 ));
             }
-            outputs.push((self.field_name(&aggregate.field), value, ty));
+            outputs.push((name, value, ty));
         }
         if aggregates.is_empty() && stats.groupings.is_empty() {
             // Every field is an aggregate over a null, which adds no call, and
@@ -1085,10 +1102,11 @@ impl Binder<'_> {
         }
         let mut groups = Vec::new();
         for grouping in &stats.groupings {
+            let name = self.field_name(grouping)?;
             let (value, ty) = self.value(&grouping.expr, &mut Cx::Row)?;
             let internal = self.fresh();
             groups.push((value, internal.clone()));
-            outputs.push((self.field_name(grouping), BExpr::Column(internal), ty));
+            outputs.push((name, BExpr::Column(internal), ty));
         }
         let mut reads: Vec<&BExpr> = groups.iter().map(|(e, _)| e).collect();
         for (call, _) in &aggregates {
@@ -1188,7 +1206,7 @@ impl Binder<'_> {
                     .map(|nanos| Value::Duration(nanos, period))
             }
             Expr::Field(name) => {
-                let text = name_text(name);
+                let text = self.name(name)?;
                 if matches!(cx, Cx::Stats { .. }) {
                     return Err(self.verification(
                         name.span,
@@ -2050,5 +2068,41 @@ mod tests {
     #[test]
     fn a_chain_of_long_divisions_binds_to_linearly_many_nodes() {
         linear("9", "/", [(1, 8), (3, 22), (7, 50)], 7);
+    }
+
+    /// The parser never puts a parameter in a field reference, so the tree is
+    /// built by hand: the binder still refuses one there.
+    #[test]
+    fn a_parameter_part_in_a_field_reference_is_refused() {
+        let source = r#"FROM logs | WHERE message == "a""#;
+        let mut query = ravel_esql::parse(source, &ravel_esql::Limits::default()).expect("parses");
+        let Some(Command::Where(filter)) = query.processing.first_mut() else {
+            panic!("a WHERE");
+        };
+        let Expr::Binary(binary) = &mut filter.condition else {
+            panic!("a comparison");
+        };
+        let Expr::Field(name) = binary.left.as_mut() else {
+            panic!("a field");
+        };
+        let span = name.parts[0].span;
+        name.parts[0].param = Some(ravel_esql::ast::Parameter {
+            name: ravel_esql::ast::ParamName::Named("message".to_string()),
+            identifier: true,
+            span,
+        });
+        let input = BindInput {
+            source,
+            declared: &[],
+            now_ns: 0,
+            start: None,
+            end: None,
+        };
+        match bind(&query, &input) {
+            Err(EsqlError::Unsupported { name, line, column }) => {
+                assert_eq!((name.as_str(), line, column), ("query parameter", 1, 19));
+            }
+            other => panic!("expected the parameter refused, got {:?}", other.err()),
+        }
     }
 }
