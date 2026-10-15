@@ -17,6 +17,8 @@ pub mod declared_columns;
 pub mod distrib;
 #[cfg(test)]
 mod erasure_e2e;
+#[cfg(feature = "esql")]
+pub mod esql;
 pub mod exemplars;
 #[cfg(feature = "flight-sql")]
 pub mod flight;
@@ -3375,6 +3377,10 @@ pub async fn start_with_heartbeat(
             sweep_sql_executor = Some(state.executor.clone());
             http_router = http_router.merge(sql::router(state.clone()));
             http_router = http_router.merge(traces::router(state.clone()));
+            #[cfg(feature = "esql")]
+            {
+                http_router = http_router.merge(esql::router(state.clone()));
+            }
             // The mTLS listener's SQL route shares the same executor (built
             // once above) rather than calling `build_sql_state` a second
             // time, which would stand up a second `Catalog`/`SqlExecutor`
@@ -3385,6 +3391,10 @@ pub async fn start_with_heartbeat(
             });
             if let Some(mtls_state) = mtls_sql_query_state.clone() {
                 mtls_router = mtls_router.merge(sql::router(mtls_state.clone()));
+                #[cfg(feature = "esql")]
+                {
+                    mtls_router = mtls_router.merge(esql::router(mtls_state.clone()));
+                }
                 mtls_router = mtls_router.merge(traces::router(mtls_state));
             }
             #[cfg(feature = "flight-sql")]

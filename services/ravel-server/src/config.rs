@@ -467,10 +467,12 @@ const AUDIT_TOKEN_KEY_CONTEXT: &str = "ravel audit query-text token key v1";
 /// structure-preserving tokenization of a query's text, per query language.
 ///
 /// SQL statements go through `ravel_sql::redact` (sqlparser AST, literal
-/// values tokenized) and everything else through `ravel_promql::redact`
-/// (PromQL AST, label-matcher values and string literals tokenized). Both call
-/// the same `ravel_promql::audit_token` generator, so one value tokenizes
-/// identically whichever surface queried it.
+/// values tokenized), ES|QL statements through `ravel_esql::lex` (string and
+/// number literals tokenized, see `redact_esql`), and everything else through
+/// `ravel_promql::redact` (PromQL AST, label-matcher values and string
+/// literals tokenized). All three call the same `ravel_promql::audit_token`
+/// generator, so one value tokenizes identically whichever surface queried
+/// it.
 pub struct AuditQueryTextRedactor {
     token_key: Box<[u8; 32]>,
 }
@@ -524,12 +526,105 @@ impl AuditQueryTextRedactor {
     fn redact_sql(&self, query_text: &str) -> String {
         self.whole_text_token(query_text)
     }
+
+    /// Redact one ES|QL statement by lexing it: every string and number
+    /// literal becomes a quoted token, the query of a `PROMQL` command is
+    /// redacted as PromQL, and every other token keeps its text. A comment,
+    /// which may carry anything, becomes one space. Text that does not lex,
+    /// or lexes to a token kind this arm does not know, becomes one token over
+    /// the whole text.
+    #[cfg(feature = "esql")]
+    fn redact_esql(&self, query_text: &str) -> String {
+        use ravel_esql::TokenKind;
+
+        let Ok(tokens) = ravel_esql::lex(query_text, &ravel_esql::Limits::default()) else {
+            return self.whole_text_token(query_text);
+        };
+        let mut out = String::with_capacity(query_text.len());
+        let mut at = 0;
+        for token in &tokens {
+            let span = token.span();
+            let (Some(gap), Some(text)) = (
+                query_text.get(at..span.start),
+                span.slice(query_text),
+            ) else {
+                return self.whole_text_token(query_text);
+            };
+            if gap.chars().all(char::is_whitespace) {
+                out.push_str(gap);
+            } else {
+                out.push(' ');
+            }
+            at = span.end;
+            let quoted = |value: &str| {
+                format!("\"{}\"", ravel_promql::audit_token(&self.token_key, value.as_bytes()))
+            };
+            match token.kind() {
+                TokenKind::String(value) => out.push_str(&quoted(value)),
+                TokenKind::Integer | TokenKind::Decimal => out.push_str(&quoted(text)),
+                TokenKind::PromqlRegion => {
+                    let inner = text
+                        .strip_prefix('(')
+                        .and_then(|rest| rest.strip_suffix(')'))
+                        .unwrap_or(text);
+                    out.push('(');
+                    out.push_str(&self.redact_promql(inner));
+                    out.push(')');
+                }
+                TokenKind::Word
+                | TokenKind::QuotedIdent(_)
+                | TokenKind::NamePattern
+                | TokenKind::SourcePattern
+                | TokenKind::Param(_)
+                | TokenKind::IdentParam(_)
+                | TokenKind::Pipe
+                | TokenKind::Semicolon
+                | TokenKind::Comma
+                | TokenKind::Dot
+                | TokenKind::LParen
+                | TokenKind::RParen
+                | TokenKind::LBracket
+                | TokenKind::RBracket
+                | TokenKind::LBrace
+                | TokenKind::RBrace
+                | TokenKind::Assign
+                | TokenKind::Eq
+                | TokenKind::NotEq
+                | TokenKind::Lt
+                | TokenKind::LtEq
+                | TokenKind::Gt
+                | TokenKind::GtEq
+                | TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::Percent
+                | TokenKind::Cast
+                | TokenKind::Colon => out.push_str(text),
+                _ => return self.whole_text_token(query_text),
+            }
+        }
+        match query_text.get(at..) {
+            Some(rest) if rest.chars().all(char::is_whitespace) => out.push_str(rest),
+            Some(_) => out.push(' '),
+            None => return self.whole_text_token(query_text),
+        }
+        out
+    }
+
+    /// Without the `esql` feature this process serves no ES|QL surface; the
+    /// arm still fails safe rather than echoing the text.
+    #[cfg(not(feature = "esql"))]
+    fn redact_esql(&self, query_text: &str) -> String {
+        self.whole_text_token(query_text)
+    }
 }
 
 impl ravel_maintain::QueryTextRedactor for AuditQueryTextRedactor {
     fn redact(&self, language: &str, query_text: &str) -> String {
         match language {
             "sql" => self.redact_sql(query_text),
+            "esql" => self.redact_esql(query_text),
             // Every other surface records PromQL: one expression for `promql`
             // and `analytics`, a selector for `exemplars`, and the joined
             // selector list for `labels`, `label_values`, and `series`.

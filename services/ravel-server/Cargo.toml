@@ -188,6 +188,10 @@ ravel-alerting = { path = "../../crates/ravel-alerting", version = "0.24.0" }
 # internal crate is pinned.
 ravel-sql = { path = "../../crates/ravel-sql", version = "0.24.0", optional = true }
 
+# The ES|QL lexer and parser, for the `esql` feature: the handler's structural
+# guard and parse before admission, and the audit redactor's lexing.
+ravel-esql = { workspace = true, optional = true }
+
 # The transport-independent MCP tool layer (ADR-1374): the envelope, the
 # cursor codec, the budget clamp, the compact renderer, the tool catalog, and
 # the dispatch this crate's adapter calls into. A path dependency pinned to a
@@ -238,6 +242,11 @@ sql = ["dep:ravel-sql"]
 # the published image turns it on. Ad-hoc statements are served by ravel-sql's
 # `flight` module, and the prepared-statement methods answer UNIMPLEMENTED.
 flight-sql = ["sql", "ravel-sql/flight-sql", "dep:arrow-flight"]
+
+# `POST /api/v1/esql` (ADR-2887). Implies `sql`: an ES|QL statement is lowered
+# and run by ravel-sql's executor through the same query service. Off by
+# default for the same reason `sql` is.
+esql = ["sql", "dep:ravel-esql"]
 
 # The native MCP adapter at `POST /mcp` (ADR-1374 decision 9). Implies `sql`:
 # four of the nine tools execute SQL through the query service, so there is no

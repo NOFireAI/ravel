@@ -247,6 +247,77 @@ impl ServiceError {
         }
     }
 
+    /// Classify an [`EsqlError`](ravel_sql::esql::EsqlError) for `source`, the
+    /// statement text it was raised against (ADR-2887 D12).
+    ///
+    /// A statement that does not parse, does not bind, or uses something the
+    /// lowering does not execute is the caller's statement: 400 `bad_data`,
+    /// with the 1-based line and column in the message. A lowered statement
+    /// DataFusion cannot plan is 422 `execution` under a fixed message, its
+    /// detail logged only. An execution error keeps the mapping and redaction
+    /// of [`ServiceError::from_sql`].
+    #[cfg(feature = "esql")]
+    pub fn from_esql(
+        err: ravel_sql::esql::EsqlError,
+        source: &str,
+        tenant_hash: ravel_types::TenantHash,
+    ) -> Self {
+        use ravel_sql::esql::EsqlError;
+
+        let (kind, status, error_type, message) = match err {
+            EsqlError::Execution(inner) => return ServiceError::from_sql(inner, tenant_hash),
+            EsqlError::Parse(parse) => {
+                let at = parse.line_col(source);
+                (
+                    ServiceErrorKind::InvalidArgument,
+                    StatusCode::BAD_REQUEST,
+                    "bad_data",
+                    format!("line {}:{}: {parse}", at.line, at.column),
+                )
+            }
+            err @ EsqlError::Verification { .. } => (
+                ServiceErrorKind::Validation,
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                err.to_string(),
+            ),
+            err @ EsqlError::Unsupported { .. } => (
+                ServiceErrorKind::Unsupported,
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                err.to_string(),
+            ),
+            err @ EsqlError::Plan(_) => {
+                if let EsqlError::Plan(detail) = &err {
+                    tracing::warn!(
+                        tenant = %tenant_hash.to_hex(),
+                        error = %detail,
+                        "esql plan error redacted from client response",
+                    );
+                }
+                (
+                    ServiceErrorKind::Unsupported,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "execution",
+                    err.to_string(),
+                )
+            }
+        };
+        if status == StatusCode::BAD_REQUEST {
+            tracing::debug!(
+                tenant = %tenant_hash.to_hex(),
+                client_message = %message,
+                "esql request rejected",
+            );
+        }
+        ServiceError {
+            kind,
+            message,
+            status,
+            error_type,
+        }
+    }
+
     /// Classify and redact a [`ravel_sql::DdlExecuteError`], and log the
     /// unredacted form once: at debug for a client-caused status (4xx), so a
     /// scripted client cannot flood the warn level, and at warn otherwise.
