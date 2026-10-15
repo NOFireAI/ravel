@@ -478,6 +478,13 @@ echo "==> scripts/guards/check-guarded-sql-parse.sh"
 echo "==> scripts/guards/check-guarded-promql-parse.sh"
 "$(dirname "$0")/guards/check-guarded-promql-parse.sh"
 
+# ES|QL source text enters only through ravel_esql::parse and ravel_esql::lex,
+# which apply the byte, token, nesting and stage limits; this refuses any
+# other public entry in the crate and any caller path to its lexer or parser
+# modules (issue #2892). A source scan, no build.
+echo "==> scripts/guards/check-guarded-esql-parse.sh"
+"$(dirname "$0")/guards/check-guarded-esql-parse.sh"
+
 # A parsed tenant query could reach an evaluator unreachable!() arm and abort
 # the process instead of rejecting the query (issue #1701). That round
 # converted every reachable arm to Error::Unsupported and left only the arms

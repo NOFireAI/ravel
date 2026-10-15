@@ -22,11 +22,13 @@ impl Span {
 
     /// The text this span covers, or `None` when it does not fall on
     /// character boundaries of `source`.
+    // guarded-esql-parse-allow: indexes the text a span came from; reads no syntax.
     pub fn slice<'a>(&self, source: &'a str) -> Option<&'a str> {
         source.get(self.start..self.end)
     }
 
     /// The 1-based line and column of the span's first byte.
+    // guarded-esql-parse-allow: counts lines and characters; reads no syntax.
     pub fn line_col(&self, source: &str) -> LineCol {
         LineCol::at(source, self.start)
     }
@@ -46,6 +48,7 @@ impl LineCol {
     /// The line and column of byte `offset` in `source`. An offset inside a
     /// multi-byte character reports that character's column; an offset at or
     /// past the end reports the position just after the last character.
+    // guarded-esql-parse-allow: counts lines and characters; reads no syntax.
     pub fn at(source: &str, offset: usize) -> LineCol {
         let mut line = 1;
         let mut column = 1;

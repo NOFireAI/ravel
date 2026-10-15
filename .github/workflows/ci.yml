@@ -388,6 +388,13 @@ jobs:
         run: bash scripts/guards/check-guarded-promql-parse.test.sh
       - name: Guarded-PromQL-parse guard (issue #1817)
         run: bash scripts/guards/check-guarded-promql-parse.sh
+      # ES|QL source text enters only through ravel_esql::parse and lex, which
+      # apply the limits; the guard scans the crate and its callers (issue
+      # #2892). Cases first, same reason as the SQL pair above.
+      - name: Guarded-ES|QL-parse guard cases (issue #2892)
+        run: bash scripts/guards/check-guarded-esql-parse.test.sh
+      - name: Guarded-ES|QL-parse guard (issue #2892)
+        run: bash scripts/guards/check-guarded-esql-parse.sh
       # A parsed tenant query could reach an evaluator unreachable!() arm and
       # abort the process instead of rejecting the query (issue #1701). Cases
       # first, same reason as the guards above.

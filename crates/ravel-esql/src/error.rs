@@ -44,6 +44,14 @@ pub enum Error {
         span: Span,
     },
 
+    /// The query of a `PROMQL` command has no `)` matching its `(`, or ends
+    /// inside a PromQL string.
+    #[error("unterminated PROMQL query starting at byte {}", .span.start)]
+    UnterminatedPromql {
+        /// The query's opening parenthesis.
+        span: Span,
+    },
+
     /// A backslash escape in a string literal other than `\"`, `\\`, `\n`,
     /// `\r` or `\t`.
     #[error("invalid escape sequence at byte {}", .span.start)]
@@ -81,7 +89,9 @@ pub enum Error {
         span: Span,
     },
 
-    /// An ES|QL command this parser recognises but does not parse yet.
+    /// An ES|QL command this parser recognises by keyword and refuses: one
+    /// that exists only in development builds of Elasticsearch, or that the
+    /// released language this parser follows does not include.
     #[error("the {command} command is not supported yet (byte {})", .span.start)]
     UnsupportedSyntax {
         /// The command's keywords, upper-cased and separated by one space,
@@ -100,6 +110,7 @@ impl Error {
             | Error::UnterminatedString { span }
             | Error::UnterminatedQuotedIdentifier { span }
             | Error::UnterminatedComment { span }
+            | Error::UnterminatedPromql { span }
             | Error::InvalidEscape { span }
             | Error::UnexpectedCharacter { span, .. }
             | Error::UnexpectedToken { span, .. }
@@ -110,6 +121,7 @@ impl Error {
 
     /// The 1-based line and column of the error in `source`, the statement
     /// it was produced from.
+    // guarded-esql-parse-allow: counts lines and characters; reads no syntax.
     pub fn line_col(&self, source: &str) -> LineCol {
         self.span().line_col(source)
     }

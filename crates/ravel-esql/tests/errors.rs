@@ -177,7 +177,7 @@ fn unexpected_token() {
         &Limits::default(),
         Error::UnexpectedToken {
             found: "`WHERE`".into(),
-            expected: "a source command (`FROM` or `ROW`)",
+            expected: "`SET` or a source command (`FROM`, `ROW`, `TS`, `SHOW` or `PROMQL`)",
             span: Span::new(0, 5),
         },
         1,
@@ -273,23 +273,23 @@ fn integer_out_of_range() {
 
 #[test]
 fn unsupported_syntax_names_the_command() {
-    let source = "FROM logs\n| WHERE level == \"ERROR\"\n| grok message \"%{WORD:verb}\"";
+    let source = "FROM logs\n| WHERE level == \"ERROR\"\n| lookup  logs ON a";
     assert_error(
         source,
         &Limits::default(),
         Error::UnsupportedSyntax {
-            command: "GROK".into(),
-            span: Span::new(37, 41),
+            command: "LOOKUP".into(),
+            span: Span::new(37, 43),
         },
         3,
         3,
     );
     assert_error(
-        "SHOW INFO",
+        "EXPLAIN (FROM t)",
         &Limits::default(),
         Error::UnsupportedSyntax {
-            command: "SHOW".into(),
-            span: Span::new(0, 4),
+            command: "EXPLAIN".into(),
+            span: Span::new(0, 7),
         },
         1,
         1,
@@ -297,13 +297,13 @@ fn unsupported_syntax_names_the_command() {
     let error = refuse(source, &Limits::default());
     assert_eq!(
         error.to_string(),
-        "the GROK command is not supported yet (byte 37)"
+        "the LOOKUP command is not supported yet (byte 37)"
     );
 }
 
 #[test]
 fn every_known_unsupported_command_is_named_with_its_span() {
-    let source_commands = ["EXPLAIN", "METRICS", "SET", "SHOW", "TS"];
+    let source_commands = ["EXPLAIN", "METRICS"];
     for command in source_commands {
         let source = format!("{command} x");
         assert_error(
@@ -319,23 +319,22 @@ fn every_known_unsupported_command_is_named_with_its_span() {
     }
     // (as written, as reported)
     let processing_commands = [
-        ("CHANGE_POINT", "CHANGE_POINT"),
-        ("COMPLETION", "COMPLETION"),
-        ("DISSECT", "DISSECT"),
-        ("ENRICH", "ENRICH"),
-        ("FORK", "FORK"),
-        ("FUSE", "FUSE"),
-        ("GROK", "GROK"),
-        ("INLINE STATS", "INLINE STATS"),
-        ("inline\n  Stats", "INLINE STATS"),
-        ("INLINESTATS", "INLINESTATS"),
+        ("DEDUP", "DEDUP"),
+        ("FULL JOIN", "FULL JOIN"),
+        ("full\n  Join", "FULL JOIN"),
+        ("HIGHLIGHT", "HIGHLIGHT"),
+        ("IP_LOCATION", "IP_LOCATION"),
         ("JOIN", "JOIN"),
-        ("LOOKUP JOIN", "LOOKUP JOIN"),
-        ("lookup  join", "LOOKUP JOIN"),
+        ("LEFT JOIN", "LEFT JOIN"),
+        ("left  join", "LEFT JOIN"),
         ("LOOKUP", "LOOKUP"),
-        ("MV_EXPAND", "MV_EXPAND"),
-        ("RERANK", "RERANK"),
-        ("SAMPLE", "SAMPLE"),
+        ("METRICS_INFO", "METRICS_INFO"),
+        ("REGISTERED_DOMAIN", "REGISTERED_DOMAIN"),
+        ("RIGHT JOIN", "RIGHT JOIN"),
+        ("TS_COLLAPSE", "TS_COLLAPSE"),
+        ("TS_INFO", "TS_INFO"),
+        ("URI_PARTS", "URI_PARTS"),
+        ("USER_AGENT", "USER_AGENT"),
     ];
     const PREFIX: &str = "FROM t | ";
     for (written, reported) in processing_commands {

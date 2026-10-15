@@ -12,7 +12,8 @@ use std::fmt;
 ///
 /// The defaults are sized so that the deepest tree they admit parses, prints,
 /// compares with `==`, clones, formats with `{:?}` and drops on a thread
-/// with a 2 MiB stack; `tests/limits.rs` runs each worst-case shape there.
+/// with a 1 MiB stack in an unoptimised build; `tests/limits.rs` runs each
+/// worst-case shape there, nested pipelines and option maps included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// Maximum statement length in bytes.
