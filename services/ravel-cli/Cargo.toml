@@ -35,7 +35,7 @@ pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
 # Optional: see the `sql-explain` feature above. Path crate, not in
 # `[workspace.dependencies]`, so named by path exactly as the dev-dependency
 # entry below names it; no new external crate.
-ravel-sql = { path = "../../crates/ravel-sql", version = "0.23.0", optional = true }
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.24.0", optional = true }
 ravel-types = { workspace = true }
 ravel-proto = { workspace = true }
 ravel-object-store = { workspace = true }
@@ -138,7 +138,7 @@ ravel-codec = { workspace = true }
 # `LogsTableProvider` logs path is in ravel-sql's default build (the
 # `flight-sql` feature only gates the Flight transport), so no feature is
 # needed here.
-ravel-sql = { path = "../../crates/ravel-sql", version = "0.23.0" }
+ravel-sql = { path = "../../crates/ravel-sql", version = "0.24.0" }
 # build_sql_state's process_memory_budget argument (ADR-1170) needs an
 # Arc<MemoryBudget> at test call sites. Workspace pin, test construction only.
 ravel-memory = { workspace = true }
@@ -154,7 +154,7 @@ async-trait = { workspace = true }
 # ravel-server is a workspace path crate not listed in
 # `[workspace.dependencies]`, so it is named by path with a pinned version here,
 # exactly as ravel-sql above is; no new external crate enters Cargo.lock.
-ravel-server = { path = "../ravel-server", version = "0.23.0", features = ["sql"] }
+ravel-server = { path = "../ravel-server", version = "0.24.0", features = ["sql"] }
 # The reachability test's axum request/response plumbing (the same shape
 # ravel-server's own endpoint tests use). Already resolved in this workspace's
 # dependency graph; test-only.

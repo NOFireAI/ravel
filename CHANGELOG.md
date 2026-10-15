@@ -6,6 +6,952 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-10-15
+
+### Changed
+
+- **`--distributed-query` now requires `--fragment-listener` and
+  `--sql-ticket-key-file` (ADR-1689 release B).** `ravel-server` refuses to
+  start `--distributed-query` without `--fragment-listener` (with its three
+  `--fragment-tls-*` files), and, in a build that serves Flight SQL such as the
+  published image, without `--sql-ticket-key-file`. Each error names the
+  missing flag. The release A startup warning is gone, and so is the
+  plaintext layout it announced: every fragment fetch and SQL slice `DoGet`
+  between nodes of one cluster is dialed over mutual TLS to the dedicated
+  listener, and no SQL ticket key is derived from the fragment key file. The
+  query-worker heartbeat record no longer carries `flight_sql_endpoint`; a
+  record from an earlier release still decodes. `--advertise-fragment-endpoint`
+  now applies to the fragment listener alone, so a wildcard `--listen-grpc` no
+  longer needs it, and the refusal of a port in it without
+  `--fragment-listener` is gone. A new counter,
+  `ravel_sql_slice_tls_dials_total`, counts the SQL slice fetches a
+  coordinator dials over TLS; no metric was removed. A `RavelCluster` with
+  `spec.query.distributedQuery.enabled` and all four Secret references set
+  already renders both flags. A fleet that runs the previous release without
+  them should turn both on before upgrading; see the deployment guide.
+- **The ingest write path and maintenance run their CPU-bound codec work on
+  the CPU gates** (ADR-1702 tasks 9 and 10). On the write gate
+  (`--cpu-gate-write-permits`): the metrics, log and span shard flush encodes,
+  an OTAP payload's zstd decompression, an OTLP-HTTP gzip body's inflate and a
+  Remote Write body's snappy decode, under the `ravel_cpu_gate_jobs_total`
+  sites `metrics_flush`, `log_flush`, `span_flush`, `otap_decode`,
+  `otlp_http_gzip` and `remote_write_snappy`. On the read gate
+  (`--cpu-gate-read-permits`): compaction's decode and re-encode (`compaction`),
+  retention's and the sweep's snapshot reads (`reachability`), scrub's
+  full-object hash (`scrub`) and the on-demand fold route's snapshot part
+  decodes (`fold`). The scheduled catalog fold's own decodes, RLOG
+  compaction's block decode, the directory decodes of RLOG and RSPAN
+  compaction inputs, scrub's footer and postings reads and the fold route's
+  HEAD decodes still run on the runtime workers. A unit under the
+  gate's 256 KiB inline floor still runs on its task and counts in
+  `ravel_cpu_gate_inline_total`. An ingest decompression is measured against
+  the floor by its inflated size: the length a snappy body or a zstd payload
+  declares, and for gzip, or zstd with no declared size, the compressed size
+  times the format's maximum expansion; an OTAP payload now stops
+  decompressing one byte past the size its frames declare. Acknowledgement
+  order, byte charges and stored objects are unchanged. If the write gate
+  returns no result, the unit fails as a server fault: a flush answers its
+  strict writers with the retryable `ShardUnavailable` (503), drops its
+  buffered rows and counts in the new
+  `ravel_ingest_flush_gate_faults_total` (by `mode` and `signal`), not in any
+  `ravel_ingest_abandoned_*` counter, an HTTP request gets 500 or 503, and an
+  OTAP batch is nacked INTERNAL or UNAVAILABLE and its stream ends. A flush
+  whose `max_flush_lifetime` runs out while it waits on the write gate or
+  while its encode runs is abandoned before any PUT and counts in
+  `ravel_ingest_abandoned_queue_deadline_total`. If the read gate returns no
+  result for a maintenance unit, that compaction, retention pass or sweep
+  pass fails with an error, the fold route
+  reports `published` without comparing the snapshots, and a scrubbed object
+  reports a retryable read error rather than a finding.
+- **A format floor raised by `maintain migrate` now records the census it was
+  verified against, and the provisioning record is written at
+  `format_version` 3** (ADR-1746 Release B, issues #1746 and #2674). The raised
+  floor carries the live entries the zero-straggler re-audit counted, the
+  newest `created_unix_ns` among them, and the shard range it scanned, so
+  `maintain audit-versions` can classify it `current` or `stale` instead of
+  `unknown`. A floor raised earlier keeps no basis: its entry stays
+  `unknown` (or `contradicted` while a live record sits below it) until the
+  next version raise of its family appends a new entry that carries one. A
+  release before v0.20.0 reads only versions 1 and 2, so it refuses a record
+  this release writes on every path, the ingest flush's generation read
+  included; v0.20.0 (Release A) and later read it. Every server, `ravel-cli`
+  and `ravel-operator` must run v0.20.0 or later before any process runs this
+  release. A v0.20.0 to v0.23.0 binary reads a version-3 record but refuses to
+  rewrite it, so its `ravel-cli provision reshard`, `ravel-cli maintain
+  migrate` and the operator's reshard fail with `RefusingToRewriteNewerRecord`
+  on any record a process of this release wrote, which includes every tenant
+  first provisioned after the upgrade. Upgrade `ravel-cli` and
+  `ravel-operator` with the servers, or hold reshards and migrations until
+  the rollout has finished.
+- **A log segment at or under the plan bound is read once, without a plan
+  read, when the scan holds enough of them** (ADR-2677 decision 2, issue
+  #2682). The plan bound is the larger of `--logs-block-range-threshold` and
+  the projection break-even. When a SQL scan of logs holds at least as many
+  segments at or under the bound (relevant to the query window) as it has
+  target partitions, it no longer probes them in its plan phase: one partition
+  opens each with a single whole-object GET and prunes blocks from the
+  directory that read holds. A selective statement over many small objects
+  issues one GET per object instead of several, and an undecidable predicate
+  (`has_word`) no longer reads such an object twice when it falls outside the
+  plan carry. A new `LogsScanExec` metric, `segments_unplanned`, counts these
+  segments, and they no longer count in `plan_full_reads`. With a read cache
+  wired, such segments are no longer striped across partitions. A scan with
+  fewer such segments than target partitions keeps the planned route for every
+  segment, as before: the plan carry budget covers that many objects, and a
+  read cache can still stripe their blocks across partitions. The decision is
+  made once per scan over its whole segment list, so every partition routes a
+  segment the same way. Segments above the bound keep the planned route.
+- **On a loopback S3 endpoint, `--logs-fetch-policy` defaults to
+  `latency-first` and the fetcher cache carves 24% of the process memory
+  budget instead of 40%** (ADR-2677 decision 7, amending ADR-2023 decisions 1
+  and 3). Both changes apply only to a `--store s3` deployment whose
+  `--s3-endpoint` is a loopback address; a remote endpoint keeps
+  `cost-based` and the 25% carve. The `logs fetch policy resolved` startup
+  line names the new default with `policy_source="default-loopback"`, and the
+  `cache_max_bytes` line keeps the source `budget-carve-loopback` with the
+  smaller value. `--store-get-concurrency` keeps its core-derived default. On
+  ClickBench over a RustFS loopback endpoint on c6a.4xlarge boxes (issue
+  #2044 comment 6115248576, one run per arm), `latency-first` cut cold time
+  from 478.1 s to 368.6 s, and a cache of 7 GB, 23.8% of those boxes'
+  budget, cut the concurrent error ratio from 0.099 to 0.029 at about the
+  same hot time. The smaller cache alone also cut concurrent throughput by
+  11%, 0.512 QPS against 0.574. The two together measured 370.2 s cold at an
+  error ratio of 0.040 and raised concurrent throughput to 0.678 QPS. To
+  keep the earlier behaviour, pass `--logs-fetch-policy cost-based` and set
+  `--cache-max-bytes` to the size you want.
+- **On a keyed bucket, an unkeyed `--remote-cluster` is refused at startup.**
+  This affects a default deployment: every keyed bucket, which is the default
+  for a fresh bucket (`--tenant-hash-key-file` is required unless
+  `--tenant-hash-unkeyed`). In all, gateway or query mode on a keyed bucket,
+  durable `sys/auth` bearer tokens can onboard a tenant without a restart, so
+  the federation startup guard now counts the process as serving more than one
+  local tenant and requires `tenant=` on every `--remote-cluster`, even with a
+  single `--tenant-token`. Add `tenant=<local tenant>` to each spec before
+  upgrading. A `tenant=` naming a tenant known only through `sys/auth` is now
+  accepted instead of refused as a mapping that can never fire.
+- **SQL runs on DataFusion 55.2 and Arrow/Parquet 59.3** (issue #2720). Seven
+  behaviors change. `GROUP BY` puts `-0.0` and `0.0` in one group, because
+  DataFusion 55 canonicalizes negative zero in group keys; NaN payloads still
+  group apart. `count(DISTINCT)` over a float counts the two zeros once only
+  where DataFusion rewrites the distinct argument into a group key: every
+  distinct aggregate in the statement takes that one argument and the others
+  are limited to `sum`, `min` and `max`. Beside another aggregate such as
+  `count(*)` or `avg` it still compares bit patterns and counts them twice.
+  The new upstream functions `any_value`, `input_file_name` and
+  `file_row_index` are refused like every other function Ravel has not
+  admitted. A single-stage
+  `GROUP BY` that spills to disk now needs about half of its in-memory peak
+  under `--sql-max-query-bytes` to finish, where a quarter used to be enough:
+  DataFusion 55 replays the spill runs through a merge and an ordered
+  aggregate that reserve more than the old path did. A statement refused by
+  the spill scratch quota names the bytes the spill files held when the
+  refusal arrived, which is now below the quota and can be zero, because
+  DataFusion 55 refuses the write before it lands. Flight SQL `GetSqlInfo`
+  reports Arrow version 59. Most grouped aggregates now run on DataFusion
+  55's new aggregate streams, which keep their emitted output reserved until
+  the last slice of it is handed out and release it then, so the SQL memory
+  pool's new aggregate hold (issue #2633, under Fixed) does not apply to
+  them; it covers a legacy aggregate that DataFusion 55.2 marks as unable to
+  spill, such as a single-stage `SELECT DISTINCT ... LIMIT`, and never a
+  partial aggregate or a final aggregate that can spill. On 55.2, `length`,
+  `octet_length` and the other string functions that return an integer
+  still return a plain integer over a declared string column, so
+  `-length(<Str column>)` plans and `avg(length(<Str column>))` keeps its
+  exact integer average with a partitioned final aggregation (issues #2901,
+  #2916, #2918).
+- **`ravel-cli load` writes objects of about 250,000 rows by default, on
+  logs, metrics and spans.** With `--target-bytes` unset the flush target is
+  derived as 250,000 rows times the first batch's estimated bytes per row,
+  and with `--pipeline-depth` unset the depth is derived as the lowest of
+  ceil(250,000 x `--shards` / `--batch-rows`), the memory bound (the load
+  memory budget divided by the estimated object bytes of one batch, at least
+  1) and 1,024. The budget is `--load-memory-bytes`, or with it unset the
+  host or cgroup memory total less the loader's own floor, or a 4 GiB
+  fallback when that total cannot be read. With the target derived, the
+  loader flushes every shard (`flush_all`) once the oldest batch pending on
+  any shard is `--pipeline-depth` batches old; a size flush restarts only
+  its own shard's window, and an explicit `--target-bytes` turns that depth
+  flush off. At the previous defaults a 510,000-row single-shard load wrote
+  51 objects; it now writes 3. The loader prints the resolved target and
+  depth as one `load geometry:` line on stderr before the first write, and
+  every signal's summary prints them with what decided each, whether the
+  depth window kept realigning on size flushes (`realign_gave_up` in the
+  JSON), the flush trigger mix (size, age, arrival, depth, manual), the
+  `--target-bytes` no-effect warning when it applies, and the same report as
+  one `load report json :` line. Three behaviors change beside the layout:
+  an unset `--max-flush-delay` now reaches the router as 60s instead of the
+  router's 2s default; the end-of-input `flush_all` runs after
+  `wait_enqueued`, so it covers every submitted write; and a load that fails
+  on a refused row or a failed write flushes its buffered writes before it
+  waits on them, so it reports without waiting out the age trigger. To get
+  one object per batch per shard and four writes in flight, pass
+  `--target-bytes 1 --pipeline-depth 4` with an explicit `--batch-rows`.
+- **RSPAN objects are now trailer version 5, with a mandatory exact trace_id
+  index section (KEY_IDX).** Every span object a writer or the compactor
+  produces carries the index, and a reader can find the blocks holding a trace
+  with two small ranged reads instead of scanning the object's blocks. The
+  reader accepts only version 5: stored spans written as version 4 objects are
+  refused and must be re-ingested from source to stay queryable. A scan
+  reports them as `UnsupportedVersion`; a `trace_id` lookup, which reads the
+  object by ranges, reports them as corrupt. Query paths do not use the index
+  yet.
+- **OTLP requests are projected once instead of twice.** The OTLP metrics,
+  logs and traces handlers walk a request once for its resolved-label bytes
+  and use that value both for the ingest byte budget charge and for the
+  normalizer's bound check, which used to repeat the walk. No behaviour
+  change: the same requests are admitted, charged and rejected.
+- **SQL log scans build integer and timestamp columns from one decode pass.**
+  An integer column page now decodes straight into the value and validity
+  buffers the query's Arrow columns are built from, and a columnar SQL scan
+  builds each column by copying the block's span of those buffers once (and
+  taking the surviving rows from that copy when a filter removed some)
+  instead of appending each cell. A declared integer column
+  whose missing values are filled from a resource or scope attribute is still
+  rebuilt cell by cell. Results are unchanged.
+  The SQL response's `stats.accounting.intValuesBuffers` and the
+  `int_values_buffers` scan metric in `EXPLAIN ANALYZE` count the integer value
+  buffers built. On a ranged read of a version-4 log object, the directory
+  sections fetched to plan the read are no longer decoded a second time when
+  the object is opened, so `stats.accounting` reports their decompressed bytes
+  once.
+- **SQL log scans build a declared string column's dictionary values once per
+  dictionary and set of fallback values.** A string dictionary shared by a row
+  group's blocks is decoded once, and its Arrow values are built once per scan
+  however many blocks and 8192-row batches read it. A block that also shows
+  resource or scope values in missing cells reads a copy with those values
+  appended, deduplicated and sorted, so blocks showing the same set of values
+  share one copy whatever order their streams carry them in; the copy is
+  freed once no batch reads it, and built again if a later block needs it.
+  Each batch's declared `str` column carries its own keys over those shared
+  values instead of a copy of the dictionary. A block whose string cells are
+  stored plainly checks each cell's UTF-8 once and builds its values once, and
+  a resource or scope value filling a missing cell is stored once per stream
+  in the block. Results and the column's `Dictionary(Int32, Utf8)` type are
+  unchanged. The SQL response's `stats.accounting.strDictValuesBuilt` and the
+  `str_dict_values_built` scan metric in `EXPLAIN ANALYZE` count every values
+  array built, appended copies and rebuilt ones included. Against
+  `--sql-max-query-bytes` a scan charges each shared values array once while
+  it is in use, plus each batch's own keys, where it used to charge a copy of
+  the block's dictionary per batch; a decoded block is charged the entries of
+  a row group dictionary its rows reference. In a distributed log query, a
+  dictionary a worker sends once and its following batches reuse counts once
+  toward the bytes-scanned limit, on the batch that brought it; a dictionary
+  sent again counts again.
+- **Log scans evaluate their exact filter a block at a time.** A `ts` window or
+  stream filter that a block's stored time and stream bounds already satisfy is
+  no longer checked row by row, and the remaining filters run over each block's
+  decoded columns. Results are unchanged, except on corrupt input (an absent
+  `ts` or `stream_ref` cell, or an undecodable `attrs_raw` cell): the filters
+  now run one at a time over the block rather than row by row, so which row's
+  error surfaces first can differ, and whether such a row is reported as an
+  error or excluded can differ from the filter's written order, because
+  attribute filters answered from `attrs_raw` run after the column filters.
+  `POST /api/v1/sql` reports two new
+  counters under `stats.pruning`: `blocksPredicateDropped`, scanned blocks kept
+  whole without evaluating any row, and `rowsPredicateEvaluated`, rows of the
+  other scanned blocks; `EXPLAIN ANALYZE` shows them as
+  `blocks_predicate_dropped` and `rows_predicate_evaluated`.
+- **The query audit is opt-in, and `--audit-mode` now defaults to `off`**
+  (ADR-0062 amendment, issue #2791). A process under `off` installs no audit
+  pipeline, writes no `kind = query` record, renders no `ravel_audit_*`
+  metric family and does not need `RAVEL_AUDIT_TOKEN_KEY`; a key set there is
+  accepted and unused. `--audit-mode required` (fail closed, the recommended
+  value) and `--audit-mode best-effort` turn the audit on with the same
+  behavior as before. A query-serving process (`all` or `query`) refuses an
+  explicit `--audit-text`, `--audit-max-batch` or `--audit-max-age` under
+  `off` at startup with a message naming `--audit-mode required`, so a tuned
+  deployment cannot lose its audit silently; `gateway` and `maintain` keep
+  ignoring those flags. A query-serving process under `off` with
+  `RAVEL_AUDIT_TOKEN_KEY` set logs a warning that the key is unused and names
+  `--audit-mode required`. A deployment that relied on the audit without
+  naming the mode must set `--audit-mode required` (or
+  `RAVEL_AUDIT_MODE=required`) before it runs this release; the
+  docker-compose quickstart already does. An operator-managed cluster cannot
+  set it yet: the `RavelCluster` resource has no field for the mode and
+  passes no `RAVEL_AUDIT_MODE` through, so its query-serving processes run
+  with the audit off, and the operator still withholds their Deployment when
+  neither `auditTokenKeySecretRef` nor `deploymentKeySecretRef` is set,
+  whatever the mode (#2803).
+- **SQL scans of logs and spans decode their blocks on the read CPU gate**
+  (ADR-1702 follow-up task 8, issue #2668). A SQL scan of the `logs`,
+  `spans`, `alerts` or `audit` table runs each block decode, and on the
+  columnar logs path the block's Arrow build with it, as a `log_block` or
+  `span_block` job on the read gate instead of on the tokio worker polling
+  the scan. SQL scans therefore compete for `--cpu-gate-read-permits` with
+  PromQL, LogQL, analytics and maintenance work. Issue #2795 records this as
+  an accepted cost; `--sql-scan-decode-inline` (see Added) puts these
+  decodes back on the polling worker.
+- **A catalog resolve reads each listed commit record once** (issue #2752).
+  A resolve prewarmed a bucket's level-0 commit records into the per-tenant
+  record cache and then re-read each from the cache, so once a resolve
+  touched more records than the cache held, the two passes evicted each
+  other's entries and every record was fetched twice. The resolve now looks
+  every listed record up in the cache once, fetches the misses once and hands
+  the decoded records to the include pass, so a resolve over N uncached
+  records issues N record GETs whatever the cache cap. This covers the
+  listing path only: a `min_token` lookup can still re-fetch its record when
+  a later miss evicted it, compaction records keep their own prewarm and
+  cache re-read, and rewrite records are not cached. The cache cap bounds the
+  cache's memory, not what a resolve holds: the records it found cached stay
+  referenced while it runs, and each in-flight bucket holds its fetched
+  records, up to `--catalog-resolve-concurrency` buckets at once (derived
+  when unset; 1,024 on a default server).
+- **Upgrade: ravel-server refuses to start on a `sys/qualification` record
+  written at conformance suite version 2.** The suite version rises to 3 with
+  the `listed_keys_round_trip_plus_and_space` probe (issue #2637). Before
+  upgrading the servers of a production store, run this release's
+  `ravel-cli store qualify` against each bucket; it replaces the version 2
+  record in place. A v0.23.0 server accepts the version 3 record, so the
+  bucket can be qualified before the rollout. The memory store is exempt.
+- **Upgrade: `--max-inflight-flushes` now defaults to 4 per shard (was 1).**
+  A deployment that relied on the old default runs up to four flushes per
+  shard at once; set `--max-inflight-flushes 1` to keep the previous
+  behaviour. The new `--max-inflight-flushes-per-tenant`
+  (`RAVEL_MAX_INFLIGHT_FLUSHES_PER_TENANT`,
+  `spec.gateway.maxInflightFlushesPerTenant` on the operator) is refused at
+  startup when it is 0 or above `--max-inflight-flushes`; left unset, it
+  derives `max(1, N - 1)`. See the stalled-flush entry under Fixed.
+
+### Fixed
+
+- **One tenant's stalled flush leaves a flush permit free for a co-resident
+  tenant's strict writes.** `--max-inflight-flushes` now defaults to 4
+  permits per shard, and the new `--max-inflight-flushes-per-tenant`
+  (`RAVEL_MAX_INFLIGHT_FLUSHES_PER_TENANT`,
+  `spec.gateway.maxInflightFlushesPerTenant` on the operator) caps how many
+  one tenant may hold, defaulting to `max(1, N - 1)`. A tenant at its share
+  defers its trigger and counts it on
+  `ravel_ingest_flush_trigger_deferred_total`. A deferred buffer whose object
+  reaches 4x `target_bytes` flushes regardless. The isolation has limits: a
+  share refusal counts toward the shard's flush deferral cap like any other
+  deferral, and that cap refuses new writes for every tenant on the shard,
+  and two stalled tenants on one shard can still take all four permits. A
+  flush, strict or buffered, granted its permit after its pinned ingest
+  hour's end plus the flush lifetime is now abandoned without a PUT, its
+  writers answered with a retryable error, and counted on
+  `ravel_ingest_abandoned_hour_bound_total`, instead of publishing into an
+  hour the catalog has already sealed. The server warns at startup when
+  `--max-inflight-flushes` is 1.
+- **A columnar log batch with two dynamic columns of the same name and type
+  is refused at `push_columnar`.** Previously the second column silently won,
+  double-counting present rows and losing the first column's values.
+- **The SQL memory pool keeps a legacy grouped aggregate's released bytes
+  charged until its stream ends** (issues #2633, #2720). DataFusion's legacy
+  grouped hash aggregate shrinks its reservation when it emits, while the
+  emitted batch still holds those bytes, and the pool used to hand them to
+  other queries at once. The pool now holds them on the query, tenant and
+  process budgets until the aggregate's stream is dropped. DataFusion 55.2
+  runs that legacy aggregate only for the shapes it has not moved to its new
+  aggregate streams, for example a single-stage aggregate with a limit (such
+  as `SELECT DISTINCT ... LIMIT` under `--sql-partition-count 1`) or over
+  ordered input. The new streams keep their emitted output reserved
+  themselves and are not held. The
+  hold is chosen per stream: it applies to a legacy aggregate DataFusion
+  marks as unable to spill, and never to a partial aggregate or to a final
+  aggregate that can spill to disk. While a downstream operator, for example
+  a Sort, reserves the emitted batches it is handed, the same bytes are
+  charged twice, so a statement that fits under `--sql-max-query-bytes`
+  without the hold can be refused with 422 `ResourcesExhausted`. The extra
+  charge is bounded by the aggregate's own peak reservation. The sizing
+  guidance for `--sql-max-query-bytes` is unchanged: a `GROUP BY` matrix
+  measured on DataFusion 54.1 showed no peak change beyond run-to-run spread,
+  though a statement that reserves the aggregate's output downstream was not
+  measured.
+- **Object keys no store operation can reach are refused and reported
+  instead of silently rewritten** (issue #2637). A key that `object_store`
+  would encode into a different key, such as one holding a control
+  character, `*`, `#`, `%`, a non-ASCII byte or an empty segment, could be
+  written beside the intended key or reported deleted while it stayed. Every
+  get, head, pin, put and delete of such a key now fails with
+  `StoreError::UnaddressableKey`, never retried, before any request is sent.
+  A listing reports such keys in a new `unaddressable` field rather than as
+  objects, and `list_delimited` reports such common prefixes in
+  `unaddressable_prefixes`. Each skipped key is logged once per process and
+  counted on `ravel_store_list_unaddressable_total`. `ravel-cli parquet
+  repair --table` names every such key under the table's `v/` prefix, and
+  `repair --stray` every such `.pqm` key under no valid table name, escaped
+  and with the key a request for it reaches; both mark it undeletable by
+  Ravel and never delete it, with or without `--delete`.
+- **S3 listings return raw keys, so a key holding a control character no
+  longer fails the whole listing** (issue #2637). `S3Store::list`,
+  `list_after` and `list_delimited` now send their own signed ListObjectsV2
+  request instead of listing through `object_store`: the prefix and the
+  resume key go on the wire as written, keys come back URL-decoded, and an
+  unaddressable key or common prefix is reported in `unaddressable` or
+  `unaddressable_prefixes` with the rest of its page intact. A key or common
+  prefix holding a `%` not followed by two hex digits is reported there too,
+  with its still-encoded text, counted in
+  `ravel_store_list_unaddressable_total` and warned about. A page that ends
+  on a key holding `#` or `*` now resumes from that key itself, so the next
+  page neither skips keys nor repeats them. A listing that repeats a
+  continuation token, runs past its response ceiling or reports truncation
+  with no token fails with a typed error instead of looping. The response
+  ceiling of a `list` or `list_after` call counts keyless responses in a
+  row, 16 at most, and a response carrying a key starts the count again, so
+  a page over a mostly deleted prefix keeps going while it receives keys;
+  one call receives at most `16 × page_size` responses. A 5xx, 408 or 429 is
+  retried; a 403, 3xx or any other 4xx is not. A 3xx is not followed either,
+  with or without a `Location` header: it fails as a permanent error that
+  says to check the configured region and endpoint. `store qualify` gains
+  the `listed_keys_round_trip_plus_and_space` probe, which checks that keys
+  holding `+` and spaces list back verbatim, and the conformance suite
+  version rises from 2 to 3 with it; see the upgrade note under Changed.
+- **Parquet table listings count the keys the store could not address, and
+  `ravel-cli parquet ls` names them** (issue #2637). A resolve or sweep
+  listing that skips such a key is now counted in a per-tenant count of
+  listings, `resolve::unaddressable_listings`, beside the invalid-table
+  count; nothing exports that count yet, so an operator sees such keys
+  through the store's warning and `parquet ls`. `TenantListing` carries how
+  many keys it skipped and the first 16 of them in a new `unaddressable`
+  field. `parquet ls` prints how many keys the store's path encoding cannot
+  address and names up to 16 of them, escaped and with the key a request for
+  each reaches. For a value that is neither a readable file nor an
+  addressable key, such as a missing absolute path, `segment inspect` and
+  the other commands that take a file path or a store key fail before
+  contacting the store, with a not-found error that says the value is not a
+  readable file and names the key a request for it would reach.
+- **The server's PromQL, LogQL, analytics and SQL `samples` reads now run
+  their catalog and section decodes and their large PromQL evaluations on the
+  read CPU gate** (issue #2695, ADR-1702). A started server built its query
+  engine without the gate, so those decodes behind `/api/v1/query`,
+  `/api/v1/query_range`, LogQL, analytics and alert rule evaluation ran on a
+  tokio worker, as did every PromQL evaluation however many samples it read.
+  The engine now carries the server's read gate. What moved: RSEG catalog and
+  section decodes (`segment_section`), the sparse catalog
+  (`segment_sparse_catalog`), and RLOG postings, block and section decodes
+  (`log_postings`, `log_block`, `log_section`), each counted under
+  `ravel_cpu_gate_jobs_total{gate="read"}` (or `inline_total` below the
+  256 KiB floor), and PromQL evaluations of at least 100,000 samples, which
+  run as `promql_eval` jobs. The SQL `samples` table's RSEG catalog decodes,
+  the distributed fragment worker's slice fetches and the startup cache
+  warmup now run on the same gate, and so do the block decodes of SQL scans
+  of `logs`, `spans`, `alerts` and `audit` (see Changed), unless
+  `--sql-scan-decode-inline` is set. What did not move, as an ADR-1702
+  amendment records: RSEG page decodes, an RLOG object's plan-phase
+  directory sections, an RSPAN object's open (footer, skip index and bloom),
+  the exemplars endpoint's RSEG decodes, and the alert evaluator's fold of
+  its own alert-state RLOG objects. These still run inline on a tokio
+  worker.
+- **OTLP requests are bounded by the label bytes normalization would build.**
+  A metrics, logs or traces request under the 16 MiB body cap could still make
+  normalization copy hundreds of megabytes of labels: each histogram bucket,
+  summary quantile, log record and span gets its own copy of the attributes it
+  inherits. A read-only projection now runs before normalization allocates. A
+  request projecting over `max_resolved_label_bytes_per_request` (256 MiB) is
+  rejected whole with a partial success and counted under
+  `ravel_admission_rejected_total{reason="resolved_label_bytes"}`; a request
+  under it is charged to the ingest buffer byte budget and shed when the
+  budget cannot admit it, with HTTP 429 on OTLP HTTP and `RESOURCE_EXHAUSTED`
+  on OTLP gRPC. Summary data points with more than 64 quantiles
+  are rejected the way histograms over 160 buckets already were.
+- **OTAP metrics keep their resource identity.** OTAP ingest now reads
+  `RESOURCE_ATTRS` and gives each point the `job`, `instance` and allowlisted
+  resource labels the OTLP path gives the same input, so series from
+  different services no longer merge. When a resource repeats a key, the
+  first row in table order wins, so the two transports agree whenever a
+  resource's keys are unique. Points under a resource that breaks a resource
+  limit (attribute count, a complex value or an overlong value on a key the
+  builder reads) are now rejected, where before they were written without
+  resource labels. A resource that cannot be read (an unreadable
+  `RESOURCE_ATTRS` column, a null `parent_id`, an unrecognized id encoding)
+  rejects the points under it instead of being read as no resource; a
+  METRICS `resource` column or `id` child of the wrong type rejects every
+  point in the batch.
+  Dictionary-encoded attribute columns are now decoded: a
+  dictionary-encoded string value used to read as empty, and a
+  dictionary-encoded key column dropped every attribute in its table. OTAP
+  batches take the same resolved-label byte bound, ingest budget charge and
+  per-point summary quantile cap as OTLP, and the bound is checked from
+  value lengths before any label is built. Their dropped resource attributes
+  count on `ravel_ingest_resource_attrs_dropped_total`, except for a resource
+  whose only points are exponential histograms, which OTAP rejects as
+  unsupported. Points stored earlier keep their data, but new points move to
+  new series when they sit under a labelled resource or come from a producer
+  that dictionary-encodes its attribute columns; a point under no resource
+  with plain attribute columns keeps its series. No migration is needed.
+- **An alert history object at an RLOG version this build cannot read no
+  longer stops alert evaluation.** The alert history fold now skips such an
+  object, counts it on the new
+  `ravel_alert_history_records_skipped_total{reason="unsupported_version"}`,
+  and logs a warning naming the tenant and object key, then evaluates the
+  tenant's rules (ADR-2708 decision D6). Only an object whose bytes match its
+  commit record's content hash is skipped, so one whose version bytes were
+  corrupted reads as corrupt: a corrupt or unreachable object still fails the
+  tick with `outcome="history_unavailable"`. The
+  `RavelAlertPipelineBlocked` description no longer claims a blocked tenant
+  also trips `RavelAlertLoopStalled`: the liveness gauge is process-wide.
+- **A grouped aggregate's output slices are charged their own bytes, not the
+  whole output's, before an exchange, a sort or a nested-loop join** (issue
+  #2720). A grouped aggregate hands its output out as slices of one
+  materialized batch, and a round-robin `RepartitionExec`, a `SortExec` or a
+  `SortPreservingMergeExec` charges each slice the size of the whole batch,
+  so the charge grows with the number of slices in flight and a statement
+  that fits the query pool several times over can be refused with "the query
+  memory pool is full and spill is disabled". A `NestedLoopJoinExec` (the
+  plan for a non-equi join) or a `CrossJoinExec` charges the batches of its
+  left input, which it collects, the same way; a `HashJoinExec` does not.
+  The SQL session now inserts a `CompactSlicesExec` above every aggregate
+  whose output feeds one of those operators; it copies each over-charged
+  slice into new buffers that hold the bytes its rows reference, so the
+  consumer charges about the slice's bytes. It
+  copies each such aggregate output once, into its nested columns (a List's
+  child range, a Dictionary's keys slice plus each distinct value its keys
+  point at, a Struct's children), and passes a batch that already owns its
+  buffers through untouched. A Dictionary whose value type has no per-value
+  size here (anything but a fixed-width primitive, FixedSizeBinary, Utf8,
+  Binary, their Large forms and the byte views: a Boolean, List or Map, for
+  example) counts its values in full. `samples.labels`, a Dictionary of Map,
+  is one, so a slice whose bytes are mostly labels values can still pass
+  through with the over-charge: over-counting passes an over-charged batch
+  through, where under-counting would cost a copy. In the regression test's
+  labels query (2,560 groups in 10 slices) all 10 slices are copied and none
+  passes through. `concat` through a Map or FixedSizeList copies exactly the
+  rows of a plain child but keeps a byte-view or Dictionary child's buffers
+  whole. A Dictionary whose value type arrow's cast cannot pack (Boolean,
+  List, Map and others: the cast errors), or whose values hold a null (every
+  value of a Null value type is one), is copied by `concat` instead and
+  keeps its values whole unless `should_merge_dictionary_values` merges
+  them, which it never does for a Boolean, List or Map value type. A
+  ListView, LargeListView, RunEndEncoded or Union column is over-counted, so
+  a batch carrying one tends to pass through uncopied; its values stay
+  correct. `EXPLAIN` shows the operator and `EXPLAIN ANALYZE` its
+  `copied_bytes`, `compacted_batches` and `passed_through_batches` metrics.
+  A hash or range `RepartitionExec` gets no copy, for a narrower reason
+  than owning its buffers: its `take` reuses a Utf8View or Dictionary
+  column's data buffers and each partition's piece is a slice of the taken
+  batch, and it is the exchange's coalescer, copying pieces of at most half
+  a `batch_size`, that bounds the charge there; a piece above that size
+  (two partitions, or skewed keys), `preserve_order` and unbounded input
+  keep the over-count. The regression test (a `HAVING ... ORDER BY ...
+  LIMIT` grouped aggregate over 20,000 groups in 79 slices, 4 partitions)
+  measures the peak at 6.0x the
+  aggregate's output without the operator and 2.2x with it, checks every
+  column of the output is the same on both sides, and at a pool of 4x the
+  output (8,844,276 bytes) the run without the operator is refused with the
+  spill-disabled error and the run with it answers. Upstream:
+  apache/datafusion#24704.
+- **A stored object outside this build's reader window is reported as
+  unsupported, not as corruption.** When a metrics (RSEG), logs (RLOG) or
+  spans (RSPAN) data object's trailer declares a format version this build
+  does not read, and the object's bytes match the content hash recorded for
+  it, a PromQL or SQL query now answers HTTP 422 `execution` with `stored
+  object version N is outside this build's reader window; it needs
+  migration`, where it used to answer 500 "stored data failed integrity
+  validation". The SQL `logs` table gives the same answer, without reading
+  the object, when the commit record itself declares such a version, and
+  names that version as recorded even when it does not fit in 16 bits. A
+  distributed worker reports the object as `Unsupported`, so the coordinator
+  runs the query locally. Three lanes do not yet give the 422: a spans
+  lookup that pins a `trace_id`, which reads the object by range and reports
+  an out-of-window trailer as corruption without checking the hash; a
+  statement over the distributed Flight SQL fan-out, where the coordinator
+  reports a worker's refusal as an internal error when the commit record's
+  version is in the window and only the trailer's is not (#2843); and a
+  federated query whose remote cluster refuses the object, which is treated
+  like an unavailable remote: a retryable 503 by default, or 200 with
+  partial results and the `remote cluster X unavailable; results are
+  partial` warning when `skip_unavailable` is set. An object whose trailer
+  version does not match its recorded content hash is still reported as
+  corruption (500), with "content hash mismatch" in the server-side error.
+  Confirming the hash costs no extra request when the read that refused the
+  version already holds the whole object. Otherwise, for metrics and logs,
+  the object is read once more in 8 MiB ranges, each admitted by the GET
+  limiter and the fetch memory budget, and each range's request and wire
+  bytes are charged to the query phase whose read refused the version;
+  spans hash the bytes already fetched.
+- **One out-of-window compaction input no longer stops compaction of a whole
+  shard.** An L0 object whose format version this build does not read, with
+  bytes that match its commit record's content hash, now holds its own bucket:
+  nothing is published for it, a warning names the object and version, and
+  the new `ravel_maintain_buckets_held_out_of_window_total` counter moves by
+  one per held bucket per pass. This includes a metrics input whose commit
+  record carries the newer version. Later hours still compact, the held
+  bucket is retried every pass, and the unit is not reported as stalled. An
+  object whose bytes do not match its content hash is still treated as
+  corruption and fails the scan. `ravel-cli maintain compact-tenant` reports
+  held buckets on a new `held_out_of_window` summary line.
+- **A memory budget refusal of a segment fetch or a catalog decode now
+  answers 422, not 503** (issue #2732, ADR-2633 section 5). Until now the
+  fetch-layer refusal (`FetchMemoryExhausted` on the metrics, log and span
+  fetchers) and the catalog decode refusal (`CatalogError::MemoryExhausted`)
+  answered 503 `unavailable` with "upstream storage temporarily unavailable"
+  (ADR-1702 decision 6 and the HTTP error redaction, per ADR-2633 section 5),
+  so a process short of memory told clients that storage was down. On the
+  PromQL HTTP API, the SQL HTTP API and Flight SQL they now take the status
+  the SQL memory pool's own refusal takes: 422 `execution` over HTTP and
+  `FailedPrecondition` on Flight SQL, with the budget's own message. A
+  refusal by the ledger's limit reads "memory exhausted: requested N bytes, R
+  of L byte limit already reserved", and a refusal by the new host-memory
+  gate (see Added) takes the same status and reads "memory exhausted: host
+  available memory A bytes is below the F byte floor (requested N)". A SQL
+  column-statistics decode refusal and a refusal relayed from a distributed
+  query worker take the same status. The message carries byte figures only,
+  never an object key or a tenant value. A client that retried these on 503
+  should treat a 422 whose message contains "memory exhausted: " the same
+  way. On PromQL the message starts with the path's own prefix, such as
+  "fetch memory exhausted:" or "catalog decode refused:"; SQL and Flight SQL
+  wrap it further, for example "segment fetch failed: fetch memory
+  exhausted: ..." or "snapshot resolution failed: catalog decode refused:
+  ...". A catalog decode charge the host-memory gate refuses does not run
+  the decoded-cache eviction pass or its retry; a refusal by the ledger's
+  limit runs both when evicting cached decodes could make room.
+- **A dictionary-encoded float GROUP BY key or `SUM`/`MIN`/`MAX` argument
+  keeps the single-partition final aggregation** (issue #2901). Deciding
+  whether a grouped aggregate's final stage may be split across partitions,
+  the SQL engine now looks through a dictionary to its value type, so a
+  dictionary of floats is treated as a plain float column is.
+- **A SQL `__name__` filter no longer prunes rows another part of the
+  statement still reads.** The equality `__name__` predicate on one branch of a
+  `UNION ALL`, one side of a self-join, or the outer query of an
+  `IN (SELECT ...)` subquery pruned the snapshot every scan in the statement
+  reads, so the other scans returned no rows from segments without that
+  metric. The same predicate written above a window function or an
+  `ORDER BY ... LIMIT` in a derived table pruned the rows that node ranks, so
+  `row_number()` and the limit saw only the filtered metric. The prune key is
+  now derived per scan from the filters that bind that scan's rows directly,
+  and the snapshot is pruned only when every scan of `samples` requires the
+  same `__name__` value.
+- **`AVG(DISTINCT ..)` now averages the distinct values in every statement
+  shape.** Before, it returned the plain average of all the rows when the
+  statement also had a `DISTINCT` aggregate over a different argument, a
+  non-distinct aggregate other than `SUM`, `MIN` or `MAX` (such as `AVG(b)`),
+  or a `FILTER` or `ORDER BY` clause on any aggregate in the statement, with
+  or without `GROUP BY` (issue #2930). A statement DataFusion rewrites into a
+  group by, such as `AVG(DISTINCT a)` alone or beside `COUNT(DISTINCT a)` or
+  `SUM(b)`, was already correct and is unchanged. `AVG(DISTINCT ..)` over an
+  integer argument stays exact and keeps its partitioned final aggregation.
+
+### Added
+
+- **`ravel_maintain_compactions_in_flight` reports bucket merges in
+  progress.** The gauge rises when a merge starts, after its gates and, for a
+  run that takes a claim, its claim, before its first catalog or block read,
+  and falls when the merge publishes, fails, is abandoned, or its task is
+  dropped. The same points log `compaction merge started` and
+  `compaction merge ended` with the bucket's commit prefix, the end line with
+  an `outcome=` (`published`, `converged`, `abandoned`, `skipped`, `held`,
+  `failed`, `cancelled`, `dry-run`, or `dropped`). The nightly chaos scenario
+  that kills a maintain worker mid-compaction now fires its kill on this
+  gauge instead of on the worker's log. Its conservation check takes every
+  bucket the killed worker still had open, each start line with no end line
+  (a worker merges several units at once), waits up to the takeover bound
+  plus one maintenance tick plus a 300 s merge allowance after the kill
+  (ending early once the surviving worker has logged a publish for each of
+  them), and then passes only when the object store holds a compaction record
+  for each of them, whichever worker wrote it. It logs the merge durations it
+  can pair from both workers' logs. The scenario's load stops at 1500 s
+  whatever count it has reached, and the scenario stops as could-not-measure
+  when fewer than 20 of its exports were accepted.
+- **The real-S3 performance envelope is committed, and every weekly bench-s3
+  run is compared against it.** `bench/baselines/s3-envelope.json` holds five
+  runs of the weekly lane at one load point and the min and max of each
+  compared figure; `scripts/bench-s3-compare.py` warns on a latency figure
+  past the max plus 25 percent, a GET, LIST, billed attempt or byte count
+  past the max plus 10 percent, and any change in PUTs, accepted points or
+  matched series, and refuses a report from a different environment. The
+  lane runs it after every run and never fails on it. The cost-model guide's
+  new "Measured envelope" section quotes the range, and
+  `scripts/bench/fresh-box.sh` records a tier B timing baseline on a fresh
+  EC2 instance that it terminates afterwards.
+- **A writer refuses to publish below a bucket's recorded format floor.** An
+  ingest write, a `maintain` process's compaction or erasure rewrite, or a
+  `ravel-cli` compaction or `maintain migrate` run that would write an object
+  below the tenant's recorded floor for its format family is refused before
+  any PUT. An ingest write, strict or buffered, is refused at admission, before
+  it is buffered, with HTTP 503; rows already buffered when a refresh raised
+  the floor are dropped when their flush opens. Ingest and `maintain`
+  refusals count under `ravel_format_floor_refused_total{family}`. A
+  `ravel-cli` refusal is not counted anywhere, since `ravel-cli` renders no
+  `/metrics`: the command fails with the refusal, naming the family, floor and
+  version, on stderr and exits 1. At startup each ingest and `maintain`
+  process warns once per bucket of its `--tenant-token`,
+  `--tenant-token-file` and `--maintain-tenant` tenants whose floor is above
+  what it writes, and sets `ravel_format_floor_above_writer{family}`; it
+  starts either way. `--write-below-format-floor` writes those objects
+  instead, counts each under `ravel_format_floor_writes_below_total{family}`,
+  and leaves the floor `contradicted` for `ravel-cli maintain audit-versions`
+  (ADR-1746).
+- **A corrupt format-floor history stops ingest for its tenant and signal.**
+  The ingest routers now decode the floors from the provisioning record they
+  read for routing, so a record whose floor history fails validation, in any
+  family, fails that read like a corrupt generation history: writes are
+  refused with `StaleProvisioningView` (HTTP 503). For a tenant with no cached
+  view this is immediate; for one with a cached view it starts when the
+  view's grace window ends. A `maintain` compaction or erasure rewrite of that
+  tenant's buckets fails its floor read and writes nothing.
+- **A logs load can seal the hours it wrote, and a fold can seal the hour it
+  runs in.** `ravel-cli load --fold-after-load` folds the tenant's logs catalog
+  once the load succeeds, sealing through the latest ingest hour the load wrote,
+  so the next query resolves those hours from the snapshot instead of listing
+  them; the summary prints the fold's figures, and its time is part of the
+  load's elapsed. A metrics or spans load with the flag is refused before any
+  row is read, and so is a logs load whose current ingest hour the logs HEAD
+  has already sealed, since its objects would be invisible to queries without
+  a commit token. After the fold, the load checks that the snapshot of the
+  HEAD it left holds every commit the load published, directly or through a
+  compaction or rewrite it holds; a commit missing from it (for example
+  because another fold sealed its hour while the load was writing and the seal
+  margin passed that hour before the load's own fold), or a HEAD
+  or part the check cannot read, makes the load exit non-zero naming the hours
+  and up to ten of the missing commits, or saying the check could not be
+  made. A fold with nothing left to seal succeeds when that snapshot holds
+  every commit, and the summary line prints the parts, buckets and records
+  the check read. `ravel-cli catalog fold --writers-stopped` seals through
+  the hour the fold runs in, without moving its clock. Both assert that no
+  other writer will publish into those hours and are unsafe under a live
+  writer (ADR-2677).
+- **An hour sealed early by `--writers-stopped` or `--fold-after-load` stays
+  open to late commits until its natural seal.** Every fold, the scheduled
+  fold included, re-lists each hour above its own seal margin hour and at or
+  below the HEAD watermark, one LIST per shard, and folds any commit the
+  snapshot does not hold, so a commit another writer publishes into such an
+  hour is visible to queries without a commit token from the next fold. A
+  commit published after the natural seal stays invisible until a HEAD
+  rebuild. Besides those LISTs, a fold reads each snapshot part covering the
+  held-open hours once whenever their listing names any commit record, and
+  loads the whole snapshot when a listing names a commit HEAD does not hold,
+  when a held-open hour was compacted before its seal, or when a targeted
+  re-fold request is queued; a compacted held-open hour or a queued request
+  costs that load on every fold while hours are held open. A fold whose seal
+  margin already covers HEAD's watermark issues no extra request. A load
+  whose hours another fold sealed while it was writing succeeds with every
+  commit in the snapshot, as long as its own fold runs before those hours'
+  natural seal. A fold over held-open hours also runs a queued targeted
+  re-fold request, so the fold report's `refold_hours_reconciled` can be
+  above zero on a no-op fold.
+- **The SQL JSON response reports per-stage wall times and pruning counts.**
+  `POST /api/v1/sql` now returns `stats.timings` (the successful attempt's
+  resolve, plan, stream start, first batch and drain wall times, the audit
+  wait, the attempt count, and the logs scan's cross-partition timers) and
+  `stats.pruning` (segments resolved, segments skipped by typed attribute
+  column statistics, and blocks seen, read and ruled out by POSTINGS). The
+  five executor stages are sequential and the scan timers overlap them;
+  none of them sums to client latency. `stats.timings.scans` counts the
+  plan's logs scans; `planInitMs`, `firstBatchMinMs` and `streamMaxMs` are
+  rendered only when it is 1, and the eight counts after `segments` are sums
+  over scans; `segments` is the snapshot's count.
+  `stats.phases` and `stats.io` are unchanged; Arrow-IPC, Flight SQL and MCP
+  responses carry neither new object.
+- **`ORDER BY ts LIMIT k` over logs skips blocks and segments that cannot
+  reach the result.** Once the TopK holds `k` rows, a logs scan skips every
+  block, and does not open any segment for its blocks, whose minimum `ts` is
+  strictly above the TopK's current worst `ts`, and it opens segments in
+  ascending minimum `ts` so that threshold tightens early. On the
+  whole-segment fast path a skipped segment is never fetched, and neither is
+  a segment the scan opens unplanned (at or under the plan bound; see
+  Changed). On the planned path (a block predicate, a `ts` bound that cuts a
+  segment) the plan phase has already read each planned segment's footer and
+  directories and counted its blocks in `blocksTotal`, so for those the skip
+  saves only the block reads and decodes. The answer is unchanged, ties and
+  a second sort key included. Only an
+  ascending, nulls-last TopK on the bare `ts` column is served: a
+  descending or `NULLS FIRST` TopK, a non-`ts` leading key, and the
+  dynamic filters of aggregates and joins skip nothing and keep the scan's
+  usual visit order and open pipelining. `stats.pruning` reports the skips
+  as `blocksSkippedByThreshold` and `segmentsSkippedByThreshold`, and
+  `EXPLAIN` shows `topk_threshold=ts` on a scan that acts on the threshold
+  (ADR-2677).
+- **`ravel-server --format-window-check {off|warn|refuse}` reports catalog
+  entries outside this build's reader window at startup (ADR-2708 D5c).** The
+  check is off by default (`off` reads nothing) and is enabled with `warn` or
+  `refuse`, which download the catalogs below before any listener binds and
+  can take up to the timeout. For each statically known tenant
+  (`--tenant-token`, `--tenant-token-file`, `--maintain-tenant`,
+  `--alert-rules-file`) and each of metrics, logs, spans, alerts and audit,
+  the server reads the catalog HEAD and its snapshot parts and counts entries
+  whose recorded format version the readers would refuse (nothing folds alerts
+  or audit today, so those two report nothing). `warn` logs one line per
+  (signal, version) with the count and starts; `refuse` exits non-zero before
+  any listener binds, naming the signal and version. A store error is reported
+  as a check that could not run, and `refuse` exits non-zero on it. The check
+  reads up to 8 (tenant, signal) pairs at once and stops at
+  `--format-window-check-timeout` (default `20s`); pairs not finished by then
+  are logged as not checked under `warn` and make `refuse` exit. It costs one
+  logical read (GET) per tenant and signal plus one per snapshot part (the
+  store may split a large part into ranged requests), downloads each known
+  tenant's folded catalog, and issues no LIST, so commit records not yet
+  folded are not checked. The maintain IAM role's tenant bootstrap list grant
+  now names the alerts and audit catalog HEADs, so the check reads an absent
+  one as absent rather than denied. See "Format crossings at startup" in the
+  maintenance guide.
+- **A memory gate samples host memory and jemalloc, purges under pressure,
+  and refuses memory reservations when the host is close to running out**
+  (issues #2730, #2806, #2838). Each `all`, `query` and `maintain` process
+  runs a `ravel-memory-gate` thread that reads host available memory and
+  jemalloc `stats.resident` every `--memory-gate-interval-ms` (default 100).
+  Host available memory is `MemAvailable` from `/proc/meminfo`, or under a
+  finite cgroup memory limit the smaller of that and the cgroup's headroom
+  (`memory.max` minus `memory.current` plus `memory.stat`'s
+  `inactive_file`), re-read on every sample. The gate closes on that
+  reading, never on the process's resident size. Below
+  `--memory-gate-purge-available-bytes` (default the smaller of twice the
+  close floor and a quarter of host memory) the thread forces a purge of
+  every arena's dirty and muzzy pages, at most once per
+  `--memory-gate-purge-min-interval-ms` (default 5000), restores their decay
+  settings, and re-reads. After `--memory-gate-close-after-samples`
+  consecutive samples (default 3, accepted 1 to 100) below
+  `--memory-gate-min-available-bytes`, the gate closes and refuses memory
+  reservations; it reopens on the first sample at or above that floor. At
+  the default interval three samples span about 200 ms, so a dip shorter
+  than that never closes the gate.
+  The close floor defaults to `min(max(512 MiB, 2 % of host memory), host
+  memory / 8)` (687 MB on a 32 GiB host, 128 MiB on 1 GiB; a derived floor
+  under the flag's 64 MiB minimum is accepted). Startup refuses a flagged
+  purge floor not above the close floor, a flagged close floor at or above
+  host memory, and a close floor flagged at or above a quarter of host
+  memory unless `--memory-gate-purge-available-bytes` is also passed; a
+  derived configuration never refuses. A refusal names the host's available
+  memory and the floor. The gate is off in `gateway` mode, with a
+  fallback-sized budget, under `--disable-memory-gate`, without jemalloc,
+  and when `MemAvailable` or `MemTotal` cannot be read
+  (`disabled-no-host-memory`); the `memory gate resolved` startup line says
+  which and stamps `available_source` (`meminfo` or `meminfo+cgroup`) and
+  `close_after_samples`. `--memory-gate-wait-ms` is resolved and stamped but
+  not yet read. New `/metrics` families: `ravel_memory_gate_resident_bytes`
+  (the last resident reading), `ravel_memory_gate_available_bytes` (the last
+  available reading, which shows a dip the gate stayed open through),
+  `ravel_memory_gate_available_floor_bytes`,
+  `ravel_memory_gate_purge_floor_bytes`, `ravel_memory_gate_purges_total`,
+  `ravel_memory_gate_samples_total`,
+  `ravel_memory_gate_samples_below_floor_total` (every sample below the
+  close floor, whether or not it closed the gate),
+  `ravel_memory_gate_epoch_refresh_seconds_total`,
+  `ravel_memory_gate_purge_seconds`, and `ravel_memory_gate_refusals_total`
+  and `ravel_memory_budget_refusals_total` by `site`.
+- **Spans `trace_id` lookups read the trace's block run by range.** A lookup
+  that pins a `trace_id` reads the object's 64 KiB tail (the footer and, when
+  it reaches them, SKIP_IDX and BLOOM), then the trace's whole SKIP_IDX block
+  run in one ranged GET, pruned blocks inside the run included, never the
+  whole object through `GetRange::Full`; only the run's blocks that pass the
+  skip-index and bloom prune are decoded. A caller-supplied block set is
+  instead read as one ranged GET per contiguous run of its intersection with
+  the candidate blocks. A pruned block read as part of a run is neither
+  decoded nor counted in `blocks_after_skip` or `blocks_scanned`. The probe
+  phase carries the tail probe and the section reads, and the scan phase
+  carries the block runs, requests and wire bytes as transferred; a run the
+  tail probe already holds (an object no larger than the probe) is sliced out
+  of it, issues no GET, and so adds nothing to the scan phase. The process
+  read cache now fronts span reads as it fronts logs and metrics reads, keyed
+  by tenant, object content hash, offset and length, so a repeated lookup
+  issues no GET.
+  `RspanRangeReader::block_run_span` reads one explicit contiguous block run
+  and refuses any other set.
+- **`EXPLAIN ANALYZE` on a spans query reports `blocks_decoded`.** The
+  `SpansScanExec` line now carries a `blocks_decoded` partition metric, the
+  RSPAN blocks the scan decoded, and its plan line prints `ts=[lo, hi]` when the
+  query bounds the start time. A partition whose columnar attempt falls back to
+  the row path counts the abandoned attempt's blocks as well. The distributed
+  logs and spans scan node, `DistributedSliceScanExec`, prints
+  `pushdown=spans|logs|none`; production plans do not contain that node yet.
+  The SQL slice ticket can now carry the coordinator's time bounds, trace id
+  and logs prune predicates, as version 9 of the ticket, for the distributed
+  logs and spans path that #2899 will serve; a ticket without them is
+  unchanged at version 8.
+- **Fetch one trace by id, with or without a time range.**
+  `GET /api/traces/<trace_id>` (`sql` feature) returns every span of a trace
+  as rows of the `spans` table, under the same envelope, authentication,
+  limits, deadline and query audit record as `POST /api/v1/sql`. The id is 32
+  hexadecimal characters in either case; anything else is a 400 `bad_data`,
+  and a trace the tenant does not hold is a 200 with zero rows. `start` and
+  `end` are optional. A lookup pinned to one trace id with no explicit start
+  resolves from time zero, so it covers every folded part and the unsealed
+  tail the tenant still retains, instead of the one-hour default; explicit
+  bounds are kept exactly. Its cost grows with retention. The published
+  image serves this route. The MCP tool `ravel_get_trace` is now served
+  through the same lookup under the tool's row budget, with `time_range`
+  optional and the same rule when it is omitted; it needs the `mcp` feature,
+  which the released images do not build. On the HTTP route `start` and
+  `end` choose which objects are read and filter no rows; the tool's
+  `time_range`, when given, also drops every span that starts outside it.
+  `POST /api/v1/sql` keeps its one-hour default for every statement,
+  including one that pins a `trace_id`.
+- **`--sql-scan-decode-inline` puts the SQL `logs` and `spans` scan-block
+  decode back on the polling worker** (env `RAVEL_SQL_SCAN_DECODE_INLINE`,
+  default off). When set, those scans, and the `alerts` and `audit` table
+  scans that read through the same logs fetcher, decode their blocks inline
+  instead of on the read CPU gate, and every gate site their fetchers use
+  (`log_block`, `log_postings`, `log_section` and `span_block`) counts
+  nothing for SQL statements. The catalog, PromQL, maintenance and SQL
+  `samples` gate sites keep the gate. Startup logs which mode the SQL scans
+  run in. The flag exists to A/B the gate's cost against its liveness
+  benefit (issue #2795); setting it gives up the isolation the gate gives
+  scans.
+- **Ingest routers can enqueue a strict write and await its acknowledgement
+  as two steps.** `submit` charges the byte budget and sends the rows to
+  their shards, and the returned handle's `acks` waits for the commit
+  records; `write` remains the two in sequence, so callers see no change.
+  Each router takes a shared `PendingAckBudget` that bounds pending strict
+  acknowledgements (0 = unlimited) and refuses a strict submit past it with
+  a retryable error before anything is charged or sent, and the router
+  metrics report the held count and the refusals. `ravel-server` uses the
+  two steps and sizes one budget for its three routers from
+  `--max-pending-strict-acks` (next entry, #2797). The `IngestConfig` field
+  `max_pending_strict_acks` (default 8,192) only records the default an
+  embedder passes; no router reads it. The `ravel-ingest-router` service
+  proxies requests and applies no such bound.
+- **Strict ingest writes no longer hold an in-flight ingest slot while they
+  wait for their durability acknowledgement, and a new
+  `--max-pending-strict-acks` bounds those waits instead.** The
+  `--max-inflight-ingest-requests` permit is now returned once a request's
+  points are enqueued, so that ceiling counts requests reading and decoding at
+  once rather than strict writes parked on a flush, and a slow flush no longer
+  sheds unrelated buffered traffic at the request head. The new flag
+  (`RAVEL_MAX_PENDING_STRICT_ACKS`, default 8,192, `0` for unlimited, refused
+  at startup above the tokio semaphore maximum) is one process-wide budget
+  shared by the metrics, logs and traces pipelines. A strict write over it is
+  refused after decode and before anything is buffered, with HTTP 429,
+  `Retry-After: 1` and "process pending strict-acknowledgement limit reached",
+  or gRPC `RESOURCE_EXHAUSTED`. `/metrics` reports the current count as
+  `ravel_ingest_pending_strict_acks` and the refusals as
+  `ravel_ingest_pending_ack_shed_total`.
+- **A strict write can ask for its flush on arrival.** With the arrival
+  policy, the shard flushes the write from inside its handler instead of
+  waiting for the age tick, so the acknowledgement follows two storage
+  round trips rather than `max_flush_delay`. The flush opens only when the
+  tenant has no flush in flight on that shard; later arrivals coalesce into
+  one flush when it completes, so a tenant issues at most one arrival flush
+  per flush duration per shard. The acknowledgement contract is unchanged,
+  and the aged flush stays the default. The `x-ravel-ingest-mode` header and
+  `--strict-flush-policy` select the policy (next entry). The ingest metrics
+  count arrival flushes and coalesced writes separately.
+- **Strict writes can flush on arrival, per request (per stream on OTAP) or
+  process-wide.** The `x-ravel-ingest-mode` header on OTLP HTTP, OTLP gRPC
+  and OTAP accepts two new values: `strict-arrival` opens the write's flush
+  as soon as it is buffered instead of waiting for the `--max-flush-delay`
+  age threshold, and `strict-aged` keeps the age-threshold flush. On OTAP
+  the header applies to the whole stream. The new server flag
+  `--strict-flush-policy aged|arrival` (environment variable
+  `RAVEL_STRICT_FLUSH_POLICY`, default `aged`) sets the policy for `strict`,
+  an absent header and an unknown value, and is the only selector for
+  Prometheus Remote Write, which reads no header. Both policies acknowledge
+  on the same terms; `arrival` lowers strict write latency and can raise
+  the PUT rate up to 20 times for a tenant sending ten strict requests per
+  second on one shard. `/metrics` reports
+  `ravel_ingest_flushes_by_arrival_total` and
+  `ravel_ingest_arrival_coalesced_total`.
+- **Per-site CPU gate handoff and post-return times on `/metrics`.** Two new
+  summaries, `ravel_cpu_gate_handoff_seconds{gate,site}` and
+  `ravel_cpu_gate_return_seconds{gate,site}`, each a `_sum` / `_count` pair,
+  time a gated job's trip from `spawn_blocking` to its first instruction on
+  the blocking pool, and from its last instruction back to the waiting caller
+  resuming. Inline jobs record neither; a job that panics or whose caller
+  stopped waiting records its handoff and no post-return (ADR-1702, handoff
+  and post-return amendment).
+- **`ravel-cli sql explain` prints a statement's plan, and with `--analyze`
+  the executed plan with per-operator metrics.** Operators that register
+  DataFusion's baseline metrics show their own `output_rows` and
+  `elapsed_compute`; the slice-compaction and logs-scan nodes show their own
+  counters instead. An `--analyze` run ends with the exact row count, or,
+  when `--max-rows` stopped it, with `rows: <max-rows>+ (stopped at
+  --max-rows)`. The subcommand exists only in a `--features sql-explain`
+  build, which the released images do not use, and refuses to run without
+  `--unaudited`, because it writes no query-audit record. The statement
+  passes the same read-only gate as `POST /api/v1/sql`, which still refuses
+  `EXPLAIN`. Parquet tables are not supported. `--sql-partitions 0` is
+  refused before any store request, as the server refuses a zero
+  `--sql-partition-count`. `--start` equal to `--end` is accepted, matching
+  `POST /api/v1/sql`; only `--start` after `--end` is refused.
+
 ## [0.23.0] - 2026-10-09
 
 ### Changed
