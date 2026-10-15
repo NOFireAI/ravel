@@ -211,8 +211,8 @@ mod tests {
 
     #[test]
     fn an_absent_window_leaves_both_bounds_to_the_statement() {
-        let query = build_query(body(r#"{"query":"ROW a = 1"}"#).expect("body"), 7, MAX)
-            .expect("query");
+        let query =
+            build_query(body(r#"{"query":"ROW a = 1"}"#).expect("body"), 7, MAX).expect("query");
         assert_eq!((query.start, query.end, query.now_ns), (None, None, 7));
         assert_eq!(query.request.deadline, MAX);
         assert_eq!(query.request.max_rows, None);

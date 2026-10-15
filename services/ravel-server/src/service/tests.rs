@@ -1225,6 +1225,16 @@ async fn unauthenticated_request_consumes_no_permit() {
         StatusCode::UNAUTHORIZED,
         "sql",
     );
+    #[cfg(feature = "esql")]
+    assert_eq!(
+        route_status(
+            crate::esql::router(h.transports.sql.clone()),
+            anonymous("/api/v1/esql".to_string(), "{}"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "esql",
+    );
 
     // None of them reached admission, so the stock is still exactly the one
     // permit this test holds.
@@ -1308,6 +1318,85 @@ async fn malformed_selector_rejected_before_admission_permit() {
     assert_eq!(h.usage.records().len(), 0);
 
     drop(held);
+}
+
+/// An ES|QL statement that does not parse is refused before `admit()` and
+/// before any store call. With the ceiling's one permit held, a service that
+/// admitted first would answer `Unavailable`; with every read faulted, one that
+/// resolved declared columns or the catalog first would bump a fault counter.
+/// The well-formed controls show both observers work: the same ceiling turns
+/// a statement that parses away as `Unavailable`, and once the permit is free
+/// that statement reaches the faulted store.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_parse_error_takes_no_permit_and_reads_no_store() {
+    let fault = || ScriptedFault::Permanent("no read expected".to_string());
+    let store = Arc::new(FaultStore::new(
+        MemoryStore::new(),
+        FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, fault()))
+            .with_rule(Rule::new(Op::Head, fault()))
+            .with_rule(Rule::new(Op::List, fault())),
+    ));
+    let h = harness(
+        store.clone(),
+        QueryConcurrencyLimit::Bounded(1),
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+    let reads = || {
+        [Op::Get, Op::Head, Op::List]
+            .into_iter()
+            .map(|op| store.fault_count(op, FaultKind::Permanent))
+            .sum::<u64>()
+    };
+    let esql = |text: &str| crate::service::EsqlQuery {
+        query: text.to_string(),
+        now_ns: NOW_NS,
+        start: None,
+        end: None,
+        request: ravel_sql::esql::EsqlRequest {
+            min_tokens: Vec::new(),
+            deadline: Duration::from_secs(30),
+            budgets: None,
+            max_rows: None,
+        },
+    };
+
+    let held = h.admission.try_admit().expect("the ceiling's one permit");
+
+    let err = err_of(
+        h.service
+            .esql_execute(h.tenant_hash, &esql("FROM logs\n| WHERE"))
+            .await,
+    );
+    assert_eq!(
+        err.kind,
+        ServiceErrorKind::InvalidArgument,
+        "{}",
+        err.message
+    );
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(err.message.starts_with("line 2:"), "{}", err.message);
+    assert_eq!(h.admission.in_flight(), 1);
+    assert_eq!(reads(), 0);
+    assert_eq!(h.usage.records().len(), 0);
+
+    let err = err_of(
+        h.service
+            .esql_execute(h.tenant_hash, &esql("FROM logs | LIMIT 1"))
+            .await,
+    );
+    assert_eq!(err.kind, ServiceErrorKind::Unavailable, "{}", err.message);
+    assert_eq!(reads(), 0);
+
+    drop(held);
+    let _ = h
+        .service
+        .esql_execute(h.tenant_hash, &esql("FROM logs | LIMIT 1"))
+        .await;
+    assert!(reads() > 0, "an admitted statement reads the store");
+    assert_eq!(h.admission.in_flight(), 0);
 }
 
 /// Step 2 on the SQL surface, which used to skip it: `sql_execute` and

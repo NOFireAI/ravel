@@ -679,7 +679,12 @@ impl QueryService {
                 self.controls
                     .clamp_budgets(Some(budgets), &state.executor.config().engine)
             }),
-            max_rows: Some(query.request.max_rows.map_or(row_cap, |rows| rows.min(row_cap))),
+            max_rows: Some(
+                query
+                    .request
+                    .max_rows
+                    .map_or(row_cap, |rows| rows.min(row_cap)),
+            ),
             min_tokens: query.request.min_tokens.clone(),
         };
         let live = ravel_sql::LiveAccounting::new();
@@ -701,8 +706,7 @@ impl QueryService {
             };
             let prepared = ravel_sql::esql::prepare(text, &limits, &ctx)?;
             window = prepared.window();
-            ravel_sql::esql::execute(&state.executor, tenant_hash, &prepared, &request, &live)
-                .await
+            ravel_sql::esql::execute(&state.executor, tenant_hash, &prepared, &request, &live).await
         }
         .instrument(span.clone())
         .await
