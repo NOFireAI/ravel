@@ -154,10 +154,10 @@ rollout, and a file covers the deployments this epic is for. A
 follow-up adds it under the format-change procedure if a deployment
 needs rules changed without a restart.
 
-Both `ravel-server` and `ravel-cli load` refuse a non-empty policy when
-the process has no deployment key to derive from. That covers
-`--tenant-hash-unkeyed`, and also a v1 bucket started with neither
-tenant-hash flag. Both also refuse a file they cannot parse, a duplicate
+All three readers (`ravel-server`, `ravel-cli load` and `ravel-cli erase
+submit`) refuse a non-empty policy when the process has no deployment
+key to derive from. That covers `--tenant-hash-unkeyed`, and also a v1
+bucket started with neither tenant-hash flag. All three also refuse a file they cannot parse, a duplicate
 key, an empty key, or an epoch of zero. Deployments and tenants with no
 rules are untouched, byte for byte.
 
@@ -195,11 +195,14 @@ rules are applied to the merged attribute or label set:
 - on exemplar labels, and on the attributes of span events and links
   before those are encoded into their blobs.
 
-The same parameter is added to the three label-byte projection
-functions (`project_resolved_label_bytes`,
-`project_log_resolved_label_bytes` and
-`project_span_resolved_label_bytes`). `ravel-server` calls them outside
-the normalizers, and passes the result in.
+The same parameter is added to every label-byte projection the server
+computes outside a normalizer and passes in:
+- `ravel-otlp`'s `project_resolved_label_bytes`,
+  `project_log_resolved_label_bytes` and
+  `project_span_resolved_label_bytes`;
+- `ravel-otap`'s `prepare_batch` and its own
+  `project_resolved_label_bytes`, which the OTAP path charges to the
+  budget.
 
 Because the parameter has no default, an ingest path that calls a
 normalizer or a projection without a rule set (an empty one when the
@@ -368,7 +371,9 @@ matcher's value under the rule before it submits the erasure request.
 - **Several encrypted matchers.** When more than one matcher carries a
   rule key, it submits one request per combination of those rules'
   epochs. It refuses, before submitting anything, when that would be
-  more than 16 requests.
+  more than 16 requests, and names the rules whose epoch lists multiply.
+  The operator then drops `retired_epochs` whose data has aged out of
+  retention, or submits fewer encrypted matchers per command.
 - **Request ids.** With one request, the supplied or generated
   `--request-id` is used unchanged. With several, each id is derived
   deterministically from that base id and the request's epochs, as a
@@ -430,15 +435,21 @@ does not refuses to write.**
   new file.
 - **Access.** The shipped IAM templates name `sys/` objects one by one,
   so the implementing task adds `sys/ipcrypt/policy` to them:
-  - `gateway.json` gets read and create, for ingesting servers and
-    `ravel-cli load`;
+  - `gateway.json`, for ingesting servers and `ravel-cli load`, gets:
+    - the key in `GatewayListBootstrapKeys`, so a read of the absent
+      marker answers not-found rather than AccessDenied;
+    - read;
+    - a create-only put conditioned on `s3:if-none-match: "*"`, like
+      `GatewayProvCreate`, so a gateway credential cannot replace the
+      marker;
   - `admin.json`'s `AdminWrite` statement gets the put that
     `set-policy`'s CAS and a first create need. Admin already reads
     `sys/*`, which covers `erase submit`.
 
-  The same commit updates `deploy/iam/README.md`'s per-key table and the
-  template suite that pins every statement
-  (`crates/ravel-commit/tests/iam_templates.rs`). The upgrade notes say
+  The same commit updates `deploy/iam/README.md` and the template suite
+  that pins every statement (`crates/ravel-commit/tests/iam_templates.rs`).
+  In the README it updates the per-key table and adds the key to the
+  bootstrap-key table ("Read by, and what absence means"). The upgrade notes say
   to grant access before upgrading. Without that grant, the
   unconditional read is denied and an ingesting process refuses to
   start.
