@@ -154,11 +154,8 @@ impl Clock for SharedClock {
 /// the legal-hold shard is never a delete target at all.
 pub(crate) const MAINTAINED_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
 
-/// Position of `signal` within [`MAINTAINED_SIGNALS`], and therefore within
-/// [`MaintenanceSafetyMetrics`]'s per-signal arrays. Exhaustive over the
-/// signals this driver actually loops over (`run_tick`'s `for signal in
-/// MAINTAINED_SIGNALS`), so a signal from outside that set is a caller bug,
-/// not a case to fold into an "other" bucket.
+/// Position of `kind` within [`CatalogObjectKind::ALL`], falling back to the
+/// last slot, the `Other` bucket.
 fn catalog_kind_index(kind: CatalogObjectKind) -> usize {
     CatalogObjectKind::ALL
         .iter()
@@ -166,6 +163,11 @@ fn catalog_kind_index(kind: CatalogObjectKind) -> usize {
         .unwrap_or(CatalogObjectKind::ALL.len() - 1)
 }
 
+/// Position of `signal` within [`MAINTAINED_SIGNALS`], and therefore within
+/// [`MaintenanceSafetyMetrics`]'s per-signal arrays. Exhaustive over the
+/// signals this driver actually loops over (`run_tick`'s `for signal in
+/// MAINTAINED_SIGNALS`), so a signal from outside that set is a caller bug,
+/// not a case to fold into an "other" bucket.
 fn signal_index(signal: Signal) -> usize {
     match signal {
         Signal::Metrics => 0,

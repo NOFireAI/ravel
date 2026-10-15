@@ -6634,6 +6634,30 @@ mod tests {
             .expect("publish");
     }
 
+    /// Declares `user_id` as an I64 typed column carrying the key index, so a
+    /// fold with `build_key_index_leaves` on builds a leaf for it on logs.
+    async fn declare_user_id_key_index(store: &MemoryStore) {
+        use ravel_catalog::{
+            DeclaredColumnType, DeclaredTypedColumn, StorageLayoutWrite, TenantConfig,
+            TenantLifecycleState,
+        };
+        let mut cfg = TenantConfig {
+            typed_attr_columns: Some(vec![DeclaredTypedColumn {
+                key: "user_id".to_string(),
+                ty: DeclaredColumnType::I64,
+            }]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        cfg.set_key_index_columns(
+            vec!["user_id".to_string()],
+            StorageLayoutWrite::ReadersRolledOut,
+        )
+        .expect("declare the key index");
+        ravel_catalog::set_tenant_config(store, &tenant(), &cfg, 1)
+            .await
+            .expect("write tenant config");
+    }
+
     async fn read_catalog_head(store: &MemoryStore, signal: Signal) -> SnapshotHead {
         let got = store
             .get(&catalog_head_key(&tenant(), signal), GetRange::Full)
@@ -6654,12 +6678,14 @@ mod tests {
         let signal = Signal::Logs;
         let hour = 470_000u32;
         let store = std::sync::Arc::new(MemoryStore::new());
+        declare_user_id_key_index(&store).await;
         publish_user_id_logs(&store, 1, hour, &[10, 20]).await;
         publish_user_id_logs(&store, 2, hour, &[10, 30]).await;
         let catalog = ravel_catalog::Catalog::new(
             store.clone(),
             ravel_catalog::CatalogConfig {
                 shard_count: 1,
+                build_key_index_leaves: true,
                 ..ravel_catalog::CatalogConfig::default()
             },
         )

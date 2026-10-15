@@ -1012,8 +1012,10 @@ that costs one more GET of the footer's own range) and a ranged GET of the
 KEY_IDX section (about 2% of a logs object and about 6% of a spans object
 on the ADR-2707 Stage 0 corpora), issued under the fold's
 `fold_bucket_concurrency` bound, merged across the part's entries, sorted,
-bucketed and PUT before the part PUT, so a failed leaf PUT fails the fold
-with no part written. An encode refusal is not a failed PUT: it leaves the
+bucketed and PUT before the part PUT. A failed leaf PUT fails the fold
+before that part's PUT and before any HEAD CAS, so no HEAD references a
+part without its leaves; parts the same fold wrote earlier are
+unreferenced and reaped by the catalog sweep. An encode refusal is not a failed PUT: it leaves the
 field uncovered for that part (every entry counted in
 `key_index_uncovered_entries`, logged at error level) and the part is
 published without that field's refs. A logs tenant whose key-index set is
