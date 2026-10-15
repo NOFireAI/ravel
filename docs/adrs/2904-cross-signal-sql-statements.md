@@ -160,7 +160,9 @@ only when every column its operands reference resolves to the registered
 `logs` relation. The test is on the relation a column resolves to, not on
 its name: `attrs`, `ts`, `trace_id` and `span_id` are column names `logs`
 shares with other tables. Any other `LIKE` is evaluated by the engine's
-built-in operator, as it is in a session without `logs` today.
+built-in operator, as it is in a session without `logs` today. The LIKE-scope
+amendment below says how this rule applies to a logs-only session and what
+it costs beside another table.
 
 ### 5. Plan-derived work is attributed per table
 
@@ -389,3 +391,35 @@ single response that says what each side read.
   "Intentionally rejected" to supported.
 - No persistent format changes: no RSEG, RLOG or RSPAN layout, no protobuf
   schema, no commit token, no object key.
+
+## Amendment (2026-10-14): the LIKE scope per session shape (#2909)
+
+<!-- amendment-applies: sections="4. The session registers the tables the statement names, for one tenant" pointer="LIKE-scope amendment" -->
+
+Decision 4's `LIKE` rule is applied per session shape:
+
+- **A session that registers only `logs`** rewrites every case-sensitive
+  `LIKE`, as it does today, including a `LIKE` over a derived table, CTE or
+  alias of `logs`. Single-signal statements keep their exact behaviour,
+  which this ADR promises; the rule as written would have moved some of
+  them to the built-in operator.
+- **A session that registers `logs` beside another table** rewrites a `LIKE`
+  only when all of these hold:
+  - every column its operands reference is qualified `logs`;
+  - neither operand contains an outer reference;
+  - both operands are string typed;
+  - its escape is absent or backslash.
+
+  The schema the rewrite sees carries only a qualifier's name, so the first
+  condition cannot tell the `logs` table from another relation aliased
+  `logs`. The type and escape conditions make such a misclassified `LIKE`
+  one the built-in operator also plans, so the alias cannot change what is
+  accepted.
+- **The cost.** In a session beside another table, a `LIKE` on a genuine
+  `logs` column with a custom escape, or with a non-string operand, goes to
+  the built-in operator, which refuses it. The same predicate runs in a
+  logs-only session. Until the qualifier test is exact, whether such a
+  predicate is accepted depends on whether the statement names another
+  table. Issue #2910 tracks closing this. One way is to refuse, in a
+  multi-table statement, a relation alias that shadows a registered table
+  name; the type and escape conditions could then go.

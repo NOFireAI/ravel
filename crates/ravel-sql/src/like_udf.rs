@@ -17,11 +17,8 @@
 //! **unchanged** (so no coercing `CAST` hydrates it) while coercing every other
 //! first-argument type, and the second argument, to `Utf8` exactly as the
 //! built-in accepted. A [`FunctionRewrite`] ([`LikeToUdf`]) rewrites a
-//! case-sensitive `Expr::Like` into a call to this UDF: every one in a
-//! `logs`-only session; beside another table, only one whose columns are
-//! all qualified `logs`, with string-typed operands, no outer reference, and
-//! no escape other than backslash ([`LikeScope::LogsColumnsOnly`], which says
-//! why a qualifier test alone is not enough).
+//! case-sensitive `Expr::Like` into a call to this UDF; [`LikeScope`] says
+//! which ones, per session shape.
 //! It is registered as a *function rewrite*, not an analyzer rule, so it runs
 //! BEFORE type coercion:
 //! the rewrite sees the original operands (a dictionary still a dictionary), and
@@ -169,8 +166,10 @@ pub(crate) struct LikeToUdf {
 /// Which `LIKE`s [`LikeToUdf`] rewrites.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LikeScope {
-    /// Every case-sensitive `LIKE`: the session registers `logs` and no other
-    /// table.
+    /// Every case-sensitive `LIKE`, including one over a derived table, CTE or
+    /// alias of `logs`: the session registers `logs` and no other table, so
+    /// single-signal statements keep today's behaviour (ADR-2904, LIKE-scope
+    /// amendment).
     Every,
     /// Only a `LIKE` that meets all of: its operands reference at least one
     /// column and every column resolves, through the schema the rewrite is
@@ -187,6 +186,12 @@ pub(crate) enum LikeScope {
     /// type and escape conditions keep that harmless: a `LIKE` meeting them
     /// is one the built-in operator also plans, so a misclassified `LIKE` is
     /// evaluated by the UDF where the built-in would have accepted it too.
+    ///
+    /// The cost falls on genuine `logs` predicates: a `LIKE` on a `logs`
+    /// column with a custom escape, or with a non-string operand, goes to the
+    /// built-in operator, which refuses it, while the same predicate runs in a
+    /// logs-only session ([`LikeScope::Every`]). Issue #2910 tracks closing
+    /// that gap.
     LogsColumnsOnly,
 }
 

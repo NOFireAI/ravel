@@ -727,18 +727,19 @@ fn check_table_set(tables: &[SessionTable]) -> DFResult<()> {
 /// in `tables`, each under its own name, with `pool` installed as the query's
 /// memory pool.
 ///
+/// The caller must build every provider in `tables` from the one
+/// `tenant_hash` the request authenticated as (ADR-2904 decision 4). The
+/// providers expose no tenant to compare, so neither this function nor
+/// `check_table_set` can check it.
+///
 /// The per-registry allowlists (aggregate, scalar, window, table function)
 /// and the total-order/sequential-fold UDAF replacements run once, whatever
 /// the set, because those are the hard registration boundaries behind the
 /// parse gate and must not depend on which tables are registered. The
 /// table-specific scalar UDFs are the union over the set: the metric
 /// `label`/`label_match` UDFs when `samples` is in it, and `has_word` and the
-/// `LIKE` rewrite when `logs` is in it. Beside another table the `LIKE`
-/// rewrite is scoped to columns qualified `logs` with string-typed operands,
-/// no outer reference and no custom escape ([`LikeScope::LogsColumnsOnly`]).
-/// The qualifier test cannot tell an alias named `logs` from the table; the
-/// other conditions limit a misclassified `LIKE` to one the built-in operator
-/// also plans.
+/// `LIKE` rewrite when `logs` is in it. Which `LIKE`s the rewrite takes
+/// beside another table is [`LikeScope::LogsColumnsOnly`].
 ///
 /// Refused with a plan error before anything is registered: an empty set,
 /// two entries for one table name, and a Parquet entry beside any other entry
