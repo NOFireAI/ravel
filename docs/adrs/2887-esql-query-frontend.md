@@ -121,14 +121,16 @@ today. It reports three figures separately:
 
 The scoring rule differs from ADR-0035 on purpose. ADR-0035 scores the SQL
 and PromQL surfaces on the claimed subset, and an intentional rejection
-counts as conforming. Here the denominator is the whole manifest. A valid
+counts as conforming. Here the denominator is every released entry of the
+manifest. A valid
 entry that Ravel rejects stays in the denominator as an execution gap,
 however clear the rejection. Negative tests (invalid input is refused) are
 counted on their own line and never raise the positive figures. ADR-0035
-and the SQL and PromQL scores are unchanged.
+and the SQL and PromQL scores are unchanged. The development-only section
+is outside every denominator; see the manifest naming amendment below.
 
-"Full support" may be claimed only when the manifest has no gap. Until
-then the report says which entries work.
+"Full support" may be claimed only when no released entry of the manifest
+is a gap. Until then the report says which entries work.
 
 ### D3. An independent implementation
 
@@ -306,7 +308,9 @@ aggregate, and a test asserts that the optimized plan keeps it there. The
 implicit final row limit of the release is applied to the final stage
 only and never to the input of an aggregate.
 
-Everything else in the manifest is reported as an execution gap.
+Every other released entry of the manifest is reported as an execution
+gap; development-only entries are listed apart (see the manifest naming
+amendment below).
 
 ### D10. Sources and fields without a dataset catalog
 
@@ -321,7 +325,8 @@ spans merge attributes in the opposite precedence to logs. `samples` reads
 labels through `label()`, not a map subscript, and its name-filter
 pushdown is a third place where the driver plans SQL text
 (`executor.rs:2872`), which D6 does not need to touch while metrics stay
-out. Each is an execution gap in the manifest.
+out. Each is refused like any other source name; the manifest naming
+amendment below says why that is not a manifest entry.
 
 A pattern such as `logs-prod-*` is not treated as an alias for the `logs`
 table. That would return every log in the tenant for a query that asked
@@ -607,7 +612,7 @@ Consequences:
 
 ## Amendment: the manifest naming and its development-only section
 
-<!-- amendment-applies: sections="D1. The compatibility target is a pinned release, recorded in a manifest" pointer="manifest naming amendment" -->
+<!-- amendment-applies: sections="D1. The compatibility target is a pinned release, recorded in a manifest|D2. Three measures, and a gap is a gap|D9. What executes in this epic|D10. Sources and fields without a dataset catalog" pointer="manifest naming amendment" -->
 
 D1 names the manifest `esql-9.5.5.toml` and leaves development-only
 features out of it. As written, it differs in two ways, both following
@@ -624,4 +629,12 @@ Commands the parser treats as development-only are listed in a separate
 section of the manifest, outside every denominator, rather than left out.
 Some of them may be released in 9.5.5, and only the binary can settle
 that; listing them, each marked unverified where that doubt applies, keeps
-the doubt visible in the generated report instead of hiding it.
+the doubt visible in the generated report instead of hiding it. So the
+denominator in D2, and the gaps D9 reports, are the released entries of
+the manifest, not every entry in the file.
+
+The manifest inventories language forms, not source names. A `FROM`
+naming `spans`, `alerts`, `audit` or `samples` is refused by D10's
+one-source rule, and the gap it leaves is the dataset catalog follow-up,
+not a manifest entry; D10 no longer calls each of them an execution gap
+in the manifest.
