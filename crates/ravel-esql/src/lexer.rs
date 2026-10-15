@@ -26,13 +26,29 @@ use crate::error::Error;
 use crate::limits::{LimitKind, Limits};
 use crate::span::Span;
 
-/// One token and the bytes it was lexed from.
+/// One token and the bytes it was lexed from. Only [`lex`] makes one, so a
+/// token outside this crate always came through the byte and token limits.
+///
+/// ```compile_fail,E0451
+/// use ravel_esql::{Span, Token, TokenKind};
+/// let token = Token { kind: TokenKind::Pipe, span: Span::new(0, 1) };
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Token {
+    pub(crate) kind: TokenKind,
+    pub(crate) span: Span,
+}
+
+impl Token {
     /// What was lexed.
-    pub kind: TokenKind,
+    pub fn kind(&self) -> &TokenKind {
+        &self.kind
+    }
+
     /// Where, including any quotes or sigils.
-    pub span: Span,
+    pub fn span(&self) -> Span {
+        self.span
+    }
 }
 
 /// Token kinds. Kinds without a payload take their text from the span.

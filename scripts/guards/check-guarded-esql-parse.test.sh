@@ -267,6 +267,68 @@ RS
 check "flags an old entry name defined as its own function" "${d}" 1 \
   "lexer.rs:5: source-entry:"
 
+# Tokens are lexed source: a public way to parse them skips guard::check's
+# nesting and stage limits even when `lex` produced them.
+d="$(new_repo token_slice)"
+cat >>"${d}/crates/ravel-esql/src/parser.rs" <<'RS'
+
+pub fn parse_tokens(tokens: &[Token], limits: &Limits) -> Result<Query, Error> {
+    Parser { tokens }.query()
+}
+RS
+check "flags a public function taking a slice of tokens" "${d}" 1 \
+  "parser.rs:21: source-entry: public \`parse_tokens\` takes lexed tokens"
+
+d="$(new_repo token_vec)"
+cat >"${d}/crates/ravel-esql/src/guard.rs" <<'RS'
+impl Query {
+    pub fn from_tokens(
+        tokens: Vec< Token >,
+    ) -> Result<Self, Error> {
+        todo()
+    }
+}
+RS
+check "flags a public method taking a vector of tokens" "${d}" 1 \
+  "guard.rs:2: source-entry: public \`from_tokens\` takes lexed tokens"
+
+d="$(new_repo token_iter)"
+cat >"${d}/crates/ravel-esql/src/guard.rs" <<'RS'
+pub fn parse_iter<I: IntoIterator<Item = Token>>(tokens: I) -> Result<Query, Error> {
+    todo()
+}
+RS
+check "flags a public function taking an iterator of tokens" "${d}" 1 \
+  "guard.rs:1: source-entry: public \`parse_iter\` takes lexed tokens"
+
+d="$(new_repo token_from)"
+cat >"${d}/crates/ravel-esql/src/guard.rs" <<'RS'
+impl From<Vec<Token>> for Query {
+    fn from(tokens: Vec<Token>) -> Self {
+        todo()
+    }
+}
+RS
+check "flags From over a vector of tokens" "${d}" 1 "guard.rs:1: source-entry:"
+
+d="$(new_repo token_internal)"
+cat >"${d}/crates/ravel-esql/src/guard.rs" <<'RS'
+pub(crate) fn check(tokens: &[Token], limits: &Limits) -> Result<(), Error> {
+    Ok(())
+}
+
+impl Query {
+    pub fn tokens(&self) -> &[Token] {
+        &self.tokens
+    }
+
+    pub fn describe(kind: &TokenKind, all: &[TokenKind]) -> String {
+        String::new()
+    }
+}
+RS
+check "passes crate-private token use, returned tokens and token kinds" "${d}" 0 ""
+
 # --- findings, caller roots ------------------------------------------------
 #
 # The cases a crate-only scan cannot fail: the crate is clean, and a caller
@@ -358,7 +420,7 @@ check "ignores references in comments and string literals" "${d}" 0 ""
 d="$(new_repo marker_inline)"
 cat >"${d}/crates/ravel-esql/src/span.rs" <<'RS'
 impl Span {
-    pub fn slice<'a>(&self, source: &'a str) -> &'a str { // guarded-parse-allow: indexes text
+    pub fn slice<'a>(&self, source: &'a str) -> &'a str { // guarded-esql-parse-allow: indexes text
         &source[self.start..self.end]
     }
 }
@@ -369,7 +431,7 @@ d="$(new_repo marker_block)"
 cat >"${d}/crates/ravel-esql/src/span.rs" <<'RS'
 impl Span {
     /// The line and column of the span's start.
-    // guarded-parse-allow: counts lines and characters; reads no syntax.
+    // guarded-esql-parse-allow: counts lines and characters; reads no syntax.
     pub fn line_col(&self, source: &str) -> LineCol {
         LineCol::at(source, self.start)
     }
@@ -380,7 +442,7 @@ check "a marker in the block directly above the line suppresses" "${d}" 0 ""
 d="$(new_repo marker_no_reason)"
 cat >"${d}/crates/ravel-esql/src/span.rs" <<'RS'
 impl Span {
-    // guarded-parse-allow:
+    // guarded-esql-parse-allow:
     pub fn line_col(&self, source: &str) -> LineCol {
         LineCol::at(source, self.start)
     }
@@ -390,7 +452,7 @@ check "a marker with no reason does not suppress" "${d}" 1 "span.rs:3: source-en
 
 d="$(new_repo marker_stale)"
 cat >"${d}/crates/ravel-sql/src/esql/raw.rs" <<'RS'
-// guarded-parse-allow: this reason belongs to the function below it.
+// guarded-esql-parse-allow: this reason belongs to the function below it.
 fn documented() {}
 
 fn later(source: &str) -> usize {
@@ -403,11 +465,50 @@ check "a marker does not carry past its own comment block" "${d}" 1 \
 d="$(new_repo marker_in_string)"
 cat >"${d}/crates/ravel-sql/src/esql/raw.rs" <<'RS'
 fn later(source: &str) -> usize {
-    ravel_esql::lexer::Lexer::new(source).expect("guarded-parse-allow: not a comment")
+    ravel_esql::lexer::Lexer::new(source).expect("guarded-esql-parse-allow: not a comment")
 }
 RS
 check "the marker only counts from a comment, not a string" "${d}" 1 \
   "raw.rs:2: unguarded-reference:"
+
+# The SQL guard's marker answers a different question; it must not silence
+# this guard, in either root, inline or in the block above.
+d="$(new_repo marker_sql_crate)"
+cat >"${d}/crates/ravel-esql/src/span.rs" <<'RS'
+impl Span {
+    // guarded-parse-allow: counts lines and characters; reads no syntax.
+    pub fn line_col(&self, source: &str) -> LineCol {
+        LineCol::at(source, self.start)
+    }
+
+    pub fn slice<'a>(&self, source: &'a str) -> &'a str { // guarded-parse-allow: indexes text
+        &source[self.start..self.end]
+    }
+}
+RS
+check "the SQL guard's marker does not suppress in the crate" "${d}" 1 \
+  "span.rs:3: source-entry:"
+check "the SQL guard's inline marker does not suppress in the crate" "${d}" 1 \
+  "span.rs:7: source-entry:"
+
+d="$(new_repo marker_sql_caller)"
+cat >"${d}/crates/ravel-sql/src/esql/raw.rs" <<'RS'
+fn later(source: &str) -> usize {
+    // guarded-parse-allow: parses fixture text.
+    ravel_esql::lexer::Lexer::new(source).count()
+}
+RS
+check "the SQL guard's marker does not suppress in a caller" "${d}" 1 \
+  "raw.rs:3: unguarded-reference:"
+
+d="$(new_repo marker_tokens)"
+cat >"${d}/crates/ravel-esql/src/guard.rs" <<'RS'
+// guarded-esql-parse-allow: replays tokens a parse already checked.
+pub fn replay(tokens: &[Token]) -> usize {
+    tokens.len()
+}
+RS
+check "this guard's marker suppresses a token finding" "${d}" 0 ""
 
 # --- anchors ---------------------------------------------------------------
 

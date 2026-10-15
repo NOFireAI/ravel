@@ -17,6 +17,9 @@
 #     parser.rs and `pub fn lex` in lexer.rs. Visibility is read from the
 #     declaration alone: a bare `pub` inside a private module counts, because
 #     one `pub use` exports it. Internal helpers say `pub(crate)`;
+#   * the same for lexed tokens, `[Token]`, `Vec<Token>` or `Item = Token`:
+#     tokens from `lex` have not been through the nesting and stage checks
+#     that `parse` runs before the recursive parser;
 #   * a function inside a `pub trait` body taking any of those;
 #   * an `impl` of `FromStr`, or of `From`/`TryFrom` over any of those.
 # The return type is not read: `fn symbol(self) -> &'static str` takes no
@@ -56,11 +59,13 @@
 # Escape hatch, per finding, on the flagged line's own comment or anywhere in
 # the contiguous comment block immediately above it:
 #
-#   // guarded-parse-allow: <reason>
+#   // guarded-esql-parse-allow: <reason>
 #
 # The reason is required: the marker without one does not suppress. A public
 # helper that maps spans to positions in text already parsed is what it is
 # for. A new parse or lex entry is not: route it through `parse` or `lex`.
+# The marker is this guard's own: check-guarded-sql-parse.sh's
+# `guarded-parse-allow:` does not suppress a finding here.
 set -uo pipefail
 
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -75,7 +80,7 @@ roots=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -h | --help)
-      sed -n '2,62p' "$0"
+      sed -n '2,68p' "$0"
       exit 0
       ;;
     -*)
@@ -210,6 +215,29 @@ function takes_text(s) {
   return s ~ /(^|[^A-Za-z0-9_])(str|String|Read|BufRead)([^A-Za-z0-9_]|$)/ ||
          s ~ /\[[ \t]*u8[ \t]*\]/
 }
+function takes_tokens(s) {
+  return s ~ /\[[ \t]*Token[ \t]*\]/ ||
+         s ~ /(^|[^A-Za-z0-9_])Vec[ \t]*<[ \t]*Token[ \t]*>/ ||
+         s ~ /(^|[^A-Za-z0-9_])Item[ \t]*=[ \t]*Token([^A-Za-z0-9_]|$)/
+}
+function takes_input(s) {
+  return takes_text(s) || takes_tokens(s)
+}
+# The type argument of a `From<...>` or `TryFrom<...>` in an impl header, up
+# to its matching `>`, so `From<Vec<Token>>` keeps its inner type and
+# `for Wrapper<String>` stays out of it.
+function from_arg(header,   at, i, n, c, open) {
+  if (!match(header, /(^|[^A-Za-z0-9_])(Try)?From[ \t]*</)) return ""
+  at = RSTART + RLENGTH
+  n = length(header)
+  open = 1
+  for (i = at; i <= n; i++) {
+    c = substr(header, i, 1)
+    if (c == "<") open++
+    else if (c == ">" && --open == 0) break
+  }
+  return substr(header, at, i - at)
+}
 function count_char(s, ch,   n, i) {
   n = 0
   for (i = 1; i <= length(s); i++) if (substr(s, i, 1) == ch) n++
@@ -265,12 +293,13 @@ function sig_finish(   where_at, text) {
     if (takes_text(text)) lex_reads++
     return
   }
-  if (takes_text(text) && !sig_marked) {
-    printf "%s:%d: source-entry: public `%s` takes source text; only" \
+  if (takes_input(text) && !sig_marked) {
+    printf "%s:%d: source-entry: public `%s` takes %s; only" \
            " ravel_esql::parse and ravel_esql::lex may, because they apply" \
            " the limits (issue #2892). Make it pub(crate), route it through" \
            " parse or lex, or mark the line with `// %s <reason>`\n", \
-           FILENAME, sig_line, sig_name, MARKER
+           FILENAME, sig_line, sig_name, \
+           (takes_text(text) ? "source text" : "lexed tokens"), MARKER
     findings++
   }
 }
@@ -338,7 +367,7 @@ function allowed_alt(   name, alt) {
 
 BEGIN {
   SQ = sprintf("%c", 39)
-  MARKER = "guarded-parse-allow:"
+  MARKER = "guarded-esql-parse-allow:"
   findings = 0
   parse_defs = 0; parse_reads = 0; lex_defs = 0; lex_reads = 0
   entry_refs = 0
@@ -392,8 +421,7 @@ FNR == 1 {
         header = impl_buf
         sub(/[{;].*/, "", header)
         if ((header ~ /(^|[^A-Za-z0-9_])FromStr([^A-Za-z0-9_]|$)/ ||
-             (match(header, /(^|[^A-Za-z0-9_])(Try)?From[ \t]*<[^>]*/) &&
-              takes_text(substr(header, RSTART, RLENGTH)))) &&
+             takes_input(from_arg(header))) &&
             header ~ /(^|[^A-Za-z0-9_])for([^A-Za-z0-9_]|$)/ && !impl_marked) {
           printf "%s:%d: source-entry: a conversion from source text is a" \
                  " public entry that skips the limits; only ravel_esql::parse" \

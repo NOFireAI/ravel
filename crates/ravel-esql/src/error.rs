@@ -121,7 +121,7 @@ impl Error {
 
     /// The 1-based line and column of the error in `source`, the statement
     /// it was produced from.
-    // guarded-parse-allow: counts lines and characters; reads no syntax.
+    // guarded-esql-parse-allow: counts lines and characters; reads no syntax.
     pub fn line_col(&self, source: &str) -> LineCol {
         self.span().line_col(source)
     }
