@@ -1,20 +1,19 @@
-//! Security invariant 2: per-query, single-tenant `SessionContext`.
+//! Security invariant 2: per-query `SessionContext` for one tenant, the named
+//! tables (ADR-2904 decision 4).
 //!
-//! [`build_session`] constructs a complete, throwaway DataFusion session for
-//! exactly one query: its own `SessionConfig`, its own `RuntimeEnv`, its own
-//! memory pool, and either exactly one signal table -- the requesting
-//! tenant's `samples` provider over a `Signal::Metrics` snapshot, its `logs`
-//! provider over a `Signal::Logs` snapshot, and so on (ADR-0033 decision C: no
-//! v1 query spans two signals, so the session registers one, chosen by
-//! [`SessionTable`]) -- or the requesting tenant's Parquet tables the statement
-//! names (ADR-2040). Nothing is cached, pooled, or reused across queries or
-//! tenants.
+//! [`build_session_with_tables`] constructs a complete, throwaway DataFusion
+//! session for exactly one query: its own `SessionConfig`, its own
+//! `RuntimeEnv`, its own memory pool, and the named tables of the requesting
+//! tenant -- one or more signal tables (its `samples` provider over a
+//! `Signal::Metrics` snapshot, its `logs` provider over a `Signal::Logs`
+//! snapshot, and so on, each a [`SessionTable`]) or its Parquet tables the
+//! statement names (ADR-2040). [`build_session`] is its one-table form.
+//! Nothing is cached, pooled, or reused across queries or tenants.
 //!
-//! The session widens no further than the one table the query needs (ADR-0033,
-//! "one SQL endpoint, two tables"): a `samples` query registers `samples` and
-//! the metric scalar UDFs; a `logs` query registers `logs` and `has_word`. The
-//! aggregate allowlist below is enforced for both, because `count(*)` and the
-//! numeric aggregates are reachable from either table.
+//! The session widens no further than the tables the query names: `samples`
+//! brings the metric scalar UDFs, `logs` brings `has_word` and the `LIKE`
+//! rewrite. The aggregate allowlist below is enforced for every set, because
+//! `count(*)` and the numeric aggregates are reachable from any table.
 //!
 //! This is the tenant-isolation mechanism, not a performance shortcut
 //! (framing it as "context construction is cheap enough" invites a later
@@ -122,8 +121,10 @@
 //! plan, and `RepartitionExec` -- which appears in no logical plan -- spills in
 //! DataFusion 55. See [`repartition_free`].
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use datafusion::common::plan_err;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::MemoryPool;
@@ -147,6 +148,7 @@ use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
 use crate::late_materialization::TopKLateMaterialization;
+use crate::like_udf::{LikeScope, LikeToUdf};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_scan::ConfirmTopKThreshold;
 use crate::logs_udf::has_word_udf;
@@ -174,9 +176,8 @@ pub const ALERTS_TABLE: &str = "alerts";
 /// The audit table name (`Signal::Audit`, ADR-1101 decision 1).
 pub const AUDIT_TABLE: &str = "audit";
 
-/// The single table a query's session registers. ADR-0033 decision C admits
-/// exactly one signal per query in v1, so the executor resolves one snapshot
-/// and hands [`build_session`] one provider; the enum keeps the provider
+/// One table a query's session registers; [`build_session_with_tables`]
+/// takes a set of them (ADR-2904 decision 4). The enum keeps the provider
 /// types (metrics vs logs vs spans vs alerts vs audit) apart without a
 /// `dyn TableProvider` erasure.
 pub enum SessionTable {
@@ -670,17 +671,8 @@ fn repartition_free(spill: SpillDecision<'_>) -> bool {
 }
 
 /// Build a fresh, single-tenant `SessionContext` around `table` with `pool`
-/// installed as the query's memory pool.
-///
-/// `table` selects which single table the session exposes (ADR-0033 decision
-/// C: one signal per query). The per-registry allowlists (aggregate, scalar,
-/// window, table function), the total-order/sequential-fold UDAF replacements,
-/// and the table-function deregistration run for every table, because those
-/// are the hard registration boundaries behind the parse gate and must not
-/// depend on which table is registered. The table-specific scalar UDFs are registered per table: the
-/// metric `label`/`label_match` UDFs only alongside `samples`, and `has_word`
-/// only alongside `logs`, so the session exposes exactly the surface the one
-/// query needs and no more.
+/// installed as the query's memory pool: [`build_session_with_tables`] over
+/// the one-table set `[table]`.
 ///
 /// The caller owns `pool` (typically a `TenantDelegatingPool` from
 /// [`SqlConfig::query_pool`](crate::SqlConfig::query_pool)) so it can read
@@ -692,14 +684,84 @@ pub fn build_session(
     exact_typed_aggregates: bool,
     spill: SpillDecision<'_>,
 ) -> DFResult<SessionContext> {
+    build_session_with_tables(config, pool, vec![table], exact_typed_aggregates, spill)
+}
+
+/// The name a signal table registers under; `None` for a Parquet entry,
+/// which registers the names its [`ParquetSession`] carries.
+fn signal_table_name(table: &SessionTable) -> Option<&'static str> {
+    match table {
+        SessionTable::Metrics(_) => Some(SAMPLES_TABLE),
+        SessionTable::Logs(_) => Some(LOGS_TABLE),
+        SessionTable::Spans(_) => Some(SPANS_TABLE),
+        SessionTable::Alerts(_) => Some(ALERTS_TABLE),
+        SessionTable::Audit(_) => Some(AUDIT_TABLE),
+        SessionTable::Parquet(_) => None,
+    }
+}
+
+/// Refuse a table set [`build_session_with_tables`] does not build: an empty
+/// set, two entries for one table name, or a Parquet entry beside any other
+/// entry.
+fn check_table_set(tables: &[SessionTable]) -> DFResult<()> {
+    if tables.is_empty() {
+        return plan_err!("a SQL session needs at least one table");
+    }
+    if tables.len() > 1
+        && tables
+            .iter()
+            .any(|table| matches!(table, SessionTable::Parquet(_)))
+    {
+        return plan_err!("a Parquet table cannot be queried beside another table");
+    }
+    let mut names = BTreeSet::new();
+    for name in tables.iter().filter_map(signal_table_name) {
+        if !names.insert(name) {
+            return plan_err!("table {name} is named twice in one SQL session");
+        }
+    }
+    Ok(())
+}
+
+/// Build a fresh, single-tenant `SessionContext` that registers every table
+/// in `tables`, each under its own name, with `pool` installed as the query's
+/// memory pool.
+///
+/// The per-registry allowlists (aggregate, scalar, window, table function)
+/// and the total-order/sequential-fold UDAF replacements run once, whatever
+/// the set, because those are the hard registration boundaries behind the
+/// parse gate and must not depend on which tables are registered. The
+/// table-specific scalar UDFs are the union over the set: the metric
+/// `label`/`label_match` UDFs when `samples` is in it, and `has_word` and the
+/// `LIKE` rewrite when `logs` is in it. Beside another table the `LIKE`
+/// rewrite is scoped to columns qualified `logs` with string-typed operands,
+/// no outer reference and no custom escape ([`LikeScope::LogsColumnsOnly`]).
+/// The qualifier test cannot tell an alias named `logs` from the table; the
+/// other conditions limit a misclassified `LIKE` to one the built-in operator
+/// also plans.
+///
+/// Refused with a plan error before anything is registered: an empty set,
+/// two entries for one table name, and a Parquet entry beside any other entry
+/// (epic #2904 ticket T7 lifts that one, per ADR-2904 decision 11). Only a set of
+/// exactly one Parquet entry gets a store registry that answers anything.
+pub fn build_session_with_tables(
+    config: &SqlConfig,
+    pool: Arc<dyn MemoryPool>,
+    tables: Vec<SessionTable>,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+) -> DFResult<SessionContext> {
+    check_table_set(&tables)?;
+    let parquet_store = match tables.as_slice() {
+        [SessionTable::Parquet(session)] => Some(Arc::clone(&session.store)),
+        _ => None,
+    };
     // ADR-2040 D4: only a Parquet session can resolve a store, and only its
     // own tenant's `ravel-pq://<tenant_hash>/`; every other session keeps the
     // registry that answers nothing.
-    let registry: Arc<dyn ObjectStoreRegistry> = match &table {
-        SessionTable::Parquet(session) => {
-            Arc::new(SingleStoreRegistry::new(Arc::clone(&session.store)))
-        }
-        _ => Arc::new(EmptyObjectStoreRegistry),
+    let registry: Arc<dyn ObjectStoreRegistry> = match &parquet_store {
+        Some(store) => Arc::new(SingleStoreRegistry::new(Arc::clone(store))),
+        None => Arc::new(EmptyObjectStoreRegistry),
     };
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
@@ -707,7 +769,7 @@ pub fn build_session(
         .with_disk_manager_builder(disk_manager_builder(spill))
         .build_arc()?;
     let mut session = session_config(config, exact_typed_aggregates, spill);
-    if matches!(table, SessionTable::Parquet(_)) {
+    if parquet_store.is_some() {
         session = parquet_session_config(session, exact_typed_aggregates);
     }
 
@@ -895,8 +957,8 @@ pub fn build_session(
     // others rather than removed by hardcoded name. `with_default_features()`
     // (inside `new_with_config_rt` above) registers `range`/`generate_series`
     // unconditionally; they generate rows in memory and so are not blocked by
-    // `EmptyObjectStoreRegistry`. The admitted set is empty: the one table this
-    // session can query is the one registered below, and a DataFusion release
+    // `EmptyObjectStoreRegistry`. The admitted set is empty: the tables this
+    // session can query are the ones registered below, and a DataFusion release
     // adding a third table function is deregistered by default instead of
     // shipping into the surface.
     let excluded_udtfs: Vec<String> = ctx
@@ -910,42 +972,50 @@ pub fn build_session(
         ctx.deregister_udtf(name);
     }
 
-    // Register exactly the one table this query needs, plus that table's own
-    // scalar UDFs. A metrics query never sees `has_word` and a logs query
-    // never sees the `label`/`label_match` UDFs, matching the security
-    // invariant's stance that the session exposes only what one query needs.
-    match table {
-        SessionTable::Metrics(provider) => {
-            ctx.register_udf(label_udf());
-            ctx.register_udf(label_match_udf());
-            ctx.register_table(SAMPLES_TABLE, provider)?;
-        }
-        SessionTable::Logs(provider) => {
-            ctx.register_udf(has_word_udf());
-            // Rewrite `col LIKE 'pattern'` into the Ravel `like` UDF (#479) so a
-            // declared `Str` column's dictionary reaches the matcher intact,
-            // matched once per distinct value. Registered as a function rewrite
-            // (runs before type coercion) so it sees the un-hydrated operands;
-            // see `crate::like_udf`.
-            ctx.register_function_rewrite(Arc::new(crate::like_udf::LikeToUdf))?;
-            ctx.register_table(LOGS_TABLE, provider)?;
-        }
-        SessionTable::Spans(provider) => {
-            ctx.register_table(SPANS_TABLE, provider)?;
-        }
-        // Neither RLOG-backed table registers a scalar UDF: every predicate
-        // their pushdown extractors accept is a plain column comparison or an
-        // `attrs['k']` subscript, which the map-field planner registered above
-        // already serves.
-        SessionTable::Alerts(provider) => {
-            ctx.register_table(ALERTS_TABLE, provider)?;
-        }
-        SessionTable::Audit(provider) => {
-            ctx.register_table(AUDIT_TABLE, provider)?;
-        }
-        SessionTable::Parquet(session) => {
-            for (name, provider) in session.tables {
-                ctx.register_table(name.as_str(), provider)?;
+    // Register exactly the tables this query names, plus those tables' own
+    // scalar UDFs. A session without `samples` never sees the
+    // `label`/`label_match` UDFs and one without `logs` never sees
+    // `has_word`, matching the security invariant's stance that the session
+    // exposes only what one query needs.
+    let like_scope = if tables.len() == 1 {
+        LikeScope::Every
+    } else {
+        LikeScope::LogsColumnsOnly
+    };
+    for table in tables {
+        match table {
+            SessionTable::Metrics(provider) => {
+                ctx.register_udf(label_udf());
+                ctx.register_udf(label_match_udf());
+                ctx.register_table(SAMPLES_TABLE, provider)?;
+            }
+            SessionTable::Logs(provider) => {
+                ctx.register_udf(has_word_udf());
+                // Rewrite `col LIKE 'pattern'` into the Ravel `like` UDF (#479)
+                // so a declared `Str` column's dictionary reaches the matcher
+                // intact, matched once per distinct value. Registered as a
+                // function rewrite (runs before type coercion) so it sees the
+                // un-hydrated operands; see `crate::like_udf`.
+                ctx.register_function_rewrite(Arc::new(LikeToUdf::new(like_scope)))?;
+                ctx.register_table(LOGS_TABLE, provider)?;
+            }
+            SessionTable::Spans(provider) => {
+                ctx.register_table(SPANS_TABLE, provider)?;
+            }
+            // Neither RLOG-backed table registers a scalar UDF: every predicate
+            // their pushdown extractors accept is a plain column comparison or
+            // an `attrs['k']` subscript, which the map-field planner registered
+            // above already serves.
+            SessionTable::Alerts(provider) => {
+                ctx.register_table(ALERTS_TABLE, provider)?;
+            }
+            SessionTable::Audit(provider) => {
+                ctx.register_table(AUDIT_TABLE, provider)?;
+            }
+            SessionTable::Parquet(session) => {
+                for (name, provider) in session.tables {
+                    ctx.register_table(name.as_str(), provider)?;
+                }
             }
         }
     }
@@ -1918,5 +1988,303 @@ mod tests {
         );
         let s3 = Url::parse("s3://bucket/").expect("valid url");
         assert!(registry.get_store(&s3).is_err());
+    }
+
+    fn session_with(tables: Vec<SessionTable>) -> SessionContext {
+        build_session_with_tables(
+            &SqlConfig::default(),
+            test_pool(),
+            tables,
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("session builds")
+    }
+
+    fn samples_and_logs() -> SessionContext {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        session_with(vec![metrics_table(&store), logs_table(&store)])
+    }
+
+    /// Every table registered in any catalog and schema of `ctx`.
+    fn registered_tables(ctx: &SessionContext) -> BTreeSet<String> {
+        let mut tables = BTreeSet::new();
+        for catalog_name in ctx.catalog_names() {
+            let catalog = ctx.catalog(&catalog_name).expect("listed catalog");
+            for schema_name in catalog.schema_names() {
+                let schema = catalog.schema(&schema_name).expect("listed schema");
+                tables.extend(schema.table_names());
+            }
+        }
+        tables
+    }
+
+    /// Whether the optimized logical plan of `sql` calls `(the Ravel like
+    /// UDF, the built-in LIKE)`. A pushed-down filter appears both in its
+    /// `Filter` and in the scan's filters, so presence is what is compared.
+    async fn like_calls(ctx: &SessionContext, sql: &str) -> (bool, bool) {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::Expr;
+
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("statement plans")
+            .into_optimized_plan()
+            .expect("statement optimizes");
+        let (mut udf, mut builtin) = (0, 0);
+        plan.apply_with_subqueries(|node| {
+            node.apply_expressions(|expr| {
+                expr.apply(|e| {
+                    match e {
+                        Expr::ScalarFunction(call)
+                            if call.func.name() == crate::like_udf::LIKE_UDF =>
+                        {
+                            udf += 1;
+                        }
+                        Expr::Like(_) => builtin += 1,
+                        _ => {}
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })
+        .expect("plan walk");
+        (udf > 0, builtin > 0)
+    }
+
+    #[test]
+    fn session_registers_exactly_the_named_tables_and_their_functions() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let has =
+            |ctx: &SessionContext, name: &str| ctx.state().scalar_functions().contains_key(name);
+
+        let both = samples_and_logs();
+        assert_eq!(
+            registered_tables(&both),
+            BTreeSet::from([SAMPLES_TABLE.to_string(), LOGS_TABLE.to_string()])
+        );
+        for name in ["label", "label_match", "has_word"] {
+            assert!(
+                has(&both, name),
+                "a samples plus logs session registers {name}"
+            );
+        }
+
+        let samples = session_with(vec![metrics_table(&store)]);
+        assert_eq!(
+            registered_tables(&samples),
+            BTreeSet::from([SAMPLES_TABLE.to_string()])
+        );
+        assert!(has(&samples, "label"));
+        assert!(
+            !has(&samples, "has_word"),
+            "a samples-only session has no has_word"
+        );
+
+        let logs = session_with(vec![logs_table(&store)]);
+        assert_eq!(
+            registered_tables(&logs),
+            BTreeSet::from([LOGS_TABLE.to_string()])
+        );
+        assert!(has(&logs, "has_word"));
+        assert!(!has(&logs, "label"), "a logs-only session has no label");
+        assert!(
+            !has(&logs, "label_match"),
+            "a logs-only session has no label_match"
+        );
+    }
+
+    #[tokio::test]
+    async fn like_on_a_samples_column_is_not_rewritten_beside_logs() {
+        let ctx = samples_and_logs();
+        for sql in [
+            "SELECT value FROM samples WHERE label(labels, 'job') LIKE '%x%'",
+            "SELECT s.value FROM samples s JOIN logs ON s.ts = logs.ts \
+             WHERE label(s.labels, 'job') LIKE '%x%'",
+        ] {
+            assert_eq!(
+                like_calls(&ctx, sql).await,
+                (false, true),
+                "a LIKE on a samples column stays on the built-in operator: {sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn like_on_a_logs_column_is_still_rewritten_beside_samples() {
+        let ctx = samples_and_logs();
+        for sql in [
+            "SELECT body FROM logs WHERE logs.body LIKE '%x%'",
+            "SELECT body FROM logs WHERE body LIKE '%x%'",
+            "SELECT logs.body FROM logs JOIN samples ON logs.ts = samples.ts \
+             WHERE body LIKE '%x%'",
+        ] {
+            assert_eq!(
+                like_calls(&ctx, sql).await,
+                (true, false),
+                "a LIKE on logs.body plans to the Ravel like UDF: {sql}"
+            );
+        }
+        // An aliased logs scan is not the relation `logs`, so its LIKE stays
+        // on the built-in operator and the statement still plans.
+        assert_eq!(
+            like_calls(
+                &ctx,
+                "SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts \
+                 WHERE l.body LIKE '%x%'"
+            )
+            .await,
+            (false, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn like_on_a_derived_logs_column_is_rewritten_in_a_logs_only_session() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ctx = session_with(vec![logs_table(&store)]);
+        assert_eq!(
+            like_calls(
+                &ctx,
+                "SELECT d.b FROM (SELECT body AS b FROM logs) d WHERE d.b LIKE '%x%'"
+            )
+            .await,
+            (true, false),
+            "a logs-only session rewrites every LIKE, a derived table's included"
+        );
+    }
+
+    /// [`like_calls`] for `sql`, or the error that refused it while building
+    /// its logical, optimized or physical plan.
+    async fn like_outcome(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> Result<(bool, bool), datafusion::error::DataFusionError> {
+        let df = ctx.sql(sql).await?;
+        df.clone().create_physical_plan().await?;
+        Ok(like_calls(ctx, sql).await)
+    }
+
+    #[tokio::test]
+    async fn an_alias_named_logs_over_samples_is_not_rewritten() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let samples_only = session_with(vec![metrics_table(&store)]);
+        let builtin = like_outcome(
+            &samples_only,
+            "SELECT value FROM samples WHERE value LIKE '1%'",
+        )
+        .await;
+        let aliased = like_outcome(
+            &samples_and_logs(),
+            "SELECT logs.value FROM samples AS logs JOIN logs AS l ON logs.ts = l.ts \
+             WHERE logs.value LIKE '1%'",
+        )
+        .await;
+        assert!(
+            builtin.is_err(),
+            "the built-in LIKE refuses a Float64 operand: {builtin:?}"
+        );
+        assert!(
+            aliased.is_err(),
+            "a LIKE over samples aliased logs is refused as the built-in refuses it: {aliased:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_escape_beside_samples_stays_on_the_builtin() {
+        let ctx = samples_and_logs();
+        for sql in [
+            "SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts \
+             WHERE l.body LIKE 'a#%' ESCAPE '#'",
+            "SELECT logs.body FROM logs JOIN samples s ON logs.ts = s.ts \
+             WHERE logs.body LIKE 'a#%' ESCAPE '#'",
+        ] {
+            assert_eq!(
+                like_calls(&ctx, sql).await,
+                (false, true),
+                "a custom ESCAPE stays on the built-in operator: {sql}"
+            );
+            let refused = like_outcome(&ctx, sql).await;
+            assert!(
+                refused.as_ref().is_err_and(|e| e
+                    .to_string()
+                    .contains("escape_char other than the backslash")),
+                "the built-in refuses a custom ESCAPE at physical planning: {refused:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_like_mixing_logs_and_samples_columns_is_not_rewritten() {
+        assert_eq!(
+            like_calls(
+                &samples_and_logs(),
+                "SELECT logs.body FROM logs JOIN samples ON logs.ts = samples.ts \
+                 WHERE logs.body LIKE label(samples.labels, 'job')"
+            )
+            .await,
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn the_dictionary_probe_wraps_the_same_functions_in_a_two_table_session() {
+        use crate::value_typed_results::ValueTypedResult;
+
+        let wrapped = |ctx: &SessionContext| -> BTreeSet<String> {
+            ctx.state()
+                .scalar_functions()
+                .iter()
+                .filter(|(_, udf)| udf.inner().is::<ValueTypedResult>())
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let one_table = session_with(vec![logs_table(&store)]);
+        let two_tables = samples_and_logs();
+        assert!(
+            wrapped(&one_table).contains("length"),
+            "a logs session replaces length with its value-typed wrapper"
+        );
+        assert!(
+            wrapped(&two_tables).contains("length"),
+            "a samples plus logs session replaces length the same way"
+        );
+        assert_eq!(wrapped(&two_tables), wrapped(&one_table));
+    }
+
+    #[test]
+    fn build_session_with_tables_refuses_empty_duplicate_and_mixed_parquet() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantHash([0u8; 16]);
+        let refusal = |tables: Vec<SessionTable>| -> String {
+            match build_session_with_tables(
+                &SqlConfig::default(),
+                test_pool(),
+                tables,
+                false,
+                SpillDecision::Disabled,
+            ) {
+                Ok(_) => panic!("the table set must be refused"),
+                Err(DataFusionError::Plan(message)) => message,
+                Err(other) => panic!("expected a plan error, got {other}"),
+            }
+        };
+        assert_eq!(
+            refusal(Vec::new()),
+            "a SQL session needs at least one table"
+        );
+        assert_eq!(
+            refusal(vec![logs_table(&store), logs_table(&store)]),
+            "table logs is named twice in one SQL session"
+        );
+        assert_eq!(
+            refusal(vec![parquet_table(tenant), metrics_table(&store)]),
+            "a Parquet table cannot be queried beside another table"
+        );
+        assert_eq!(
+            refusal(vec![parquet_table(tenant), parquet_table(tenant)]),
+            "a Parquet table cannot be queried beside another table"
+        );
     }
 }
