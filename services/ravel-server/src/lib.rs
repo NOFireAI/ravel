@@ -4018,7 +4018,10 @@ pub async fn start_with_heartbeat(
         // authenticates the tenant, so a request over the ceiling is refused
         // RESOURCE_EXHAUSTED, and one without credentials UNAUTHENTICATED,
         // before tonic reads, decompresses or decodes its message; the handler
-        // behind it reuses that permit and tenant. It authenticates the OTAP
+        // behind it reuses that permit and tenant. A strict export then takes
+        // its pending strict-ack permit from `pending_ack_budget`, the one the
+        // routers hold, on the same head (issue #2805), and the handler hands
+        // that permit to the router's submit. It authenticates the OTAP
         // stream's head the same way, without a permit (OTAP takes one per
         // batch). It leaves every other service on this listener alone, and
         // no HTTP/2 stream cap is derived from the ingest ceiling: that
@@ -4039,6 +4042,8 @@ pub async fn start_with_heartbeat(
                 ingest_concurrency.clone(),
                 config.tenant_resolver.clone(),
                 grpc_ingest_services,
+                pending_ack_budget.clone(),
+                config.strict_flush_policy,
             ))
             .add_optional_service(metrics_service)
             .add_optional_service(logs_service)

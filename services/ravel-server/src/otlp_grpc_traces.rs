@@ -50,6 +50,15 @@ impl TraceService for GrpcTraceService {
             &headers,
         )?;
         let mode = resolve_write_mode(&headers, self.state.strict_flush_policy);
+        // See `otlp_grpc::export`: the layer's pending strict-ack permit, or
+        // one taken here on the direct-call path (issue #2805).
+        let pending_ack = crate::ingest_admission::admit_grpc_pending_ack(
+            self.state.traces_ingest.router.pending_ack_budget(),
+            self.state.strict_flush_policy,
+            &request,
+            &headers,
+            &permit,
+        )?;
 
         // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every
         // signal including spans, even though spans get no layer-4 admission
@@ -80,6 +89,7 @@ impl TraceService for GrpcTraceService {
             now_ns(),
             idempotency_key,
             &permit,
+            &pending_ack,
         )
         .await
         .map_err(|err| match err {

@@ -70,6 +70,16 @@ impl MetricsService for GrpcMetricsService {
             &headers,
         )?;
         let mode = resolve_write_mode(&headers, self.state.strict_flush_policy);
+        // The pending strict-ack permit, the same way: normally the layer's,
+        // taken on the head; on the direct-call path taken here, before
+        // anything normalizes or submits the message (issue #2805).
+        let pending_ack = crate::ingest_admission::admit_grpc_pending_ack(
+            self.state.ingest.router.pending_ack_budget(),
+            self.state.strict_flush_policy,
+            &request,
+            &headers,
+            &permit,
+        )?;
 
         // Layer 2 (ADR-0051 section 2): byte rate counted by
         // `WireByteCountLayer` as tonic's decoder reads the request body. For a
@@ -98,6 +108,7 @@ impl MetricsService for GrpcMetricsService {
             request.into_inner(),
             now_ns(),
             &permit,
+            &pending_ack,
         )
         .await
         .map_err(|err| match err {
@@ -147,6 +158,7 @@ impl MetricsService for GrpcMetricsService {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
     use ravel_ingest::AdmissionLimits;
     use tonic::Code;
 
@@ -188,5 +200,209 @@ mod tests {
             "a permanent write error must map to a non-retryable gRPC code, got {:?}",
             status.code()
         );
+    }
+
+    /// The counters a log export moves before its router submit: the
+    /// tenant's admission usage for logs, its wire bytes, and the log
+    /// router's own snapshot.
+    fn log_counters(
+        state: &GatewayState,
+    ) -> (
+        Vec<ravel_ingest::TenantUsage>,
+        Vec<crate::ingest_byte_metrics::TenantWireBytes>,
+        ravel_ingest::LogIngestMetricsSnapshot,
+    ) {
+        let usage = state
+            .admission
+            .usage_snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Logs)
+            .collect();
+        let wire = state
+            .ingest_byte_metrics
+            .snapshot()
+            .into_iter()
+            .filter(|row| row.signal == Signal::Logs)
+            .collect();
+        (usage, wire, state.logs_ingest.router.metrics_snapshot())
+    }
+
+    fn strict_log_export(body: &str) -> Request<ExportLogsServiceRequest> {
+        use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+
+        let mut request = Request::new(ExportLogsServiceRequest {
+            resource_logs: vec![ResourceLogs {
+                scope_logs: vec![ScopeLogs {
+                    log_records: vec![LogRecord {
+                        time_unix_nano: now_ns() as u64,
+                        body: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                            value: Some(
+                                opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                                    body.to_string(),
+                                ),
+                            ),
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        });
+        request.metadata_mut().insert(
+            crate::otlp_http::INGEST_MODE_HEADER,
+            "strict-arrival".parse().expect("ascii metadata"),
+        );
+        request
+    }
+
+    /// A direct call to a gRPC export service method takes its pending-ack
+    /// permit from the same budget as the layer: with a budget of 1 held by a
+    /// strict export that came through the real listener's layer stack and
+    /// waits on its held provisioning-record PUT, a direct
+    /// `GrpcLogsService::export` is refused `RESOURCE_EXHAUSTED` before it
+    /// charges admission, records wire bytes, or reaches the store or the
+    /// router, and the layered export still acks once the PUT is released.
+    /// That PUT is issued after the handler read its permit out of the
+    /// extensions and before `submit`, so the permit holding the budget there
+    /// is the one taken on the head, not one the router took.
+    #[tokio::test]
+    async fn direct_call_export_is_refused_while_a_layered_export_holds_the_pending_ack_budget() {
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_client::LogsServiceClient;
+        use opentelemetry_proto::tonic::collector::logs::v1::logs_service_server::{
+            LogsService, LogsServiceServer,
+        };
+        use ravel_ingest::{IngestByteBudget, IngestByteBudgetLimit, PendingAckBudget};
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_types::TenantId;
+
+        use crate::ingest_admission::{GrpcIngestAdmissionLayer, GrpcIngestServices};
+        use crate::otlp_grpc_logs::GrpcLogsService;
+        use crate::otlp_http::tests::{TENANT, state_with_pending_ack};
+
+        const WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let faults = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+        let gate = faults.hold(
+            Op::Put,
+            Some(ravel_catalog::provisioning_key(
+                &TenantId::new(TENANT).hash(),
+                ravel_types::Signal::Logs,
+            )),
+            Occurrence::Always,
+        );
+        let pending_ack = Arc::new(PendingAckBudget::new(1));
+        let mut state = Arc::into_inner(state_with_pending_ack(
+            faults.clone(),
+            AdmissionLimits::default(),
+            IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
+            pending_ack.clone(),
+        ))
+        .expect("the fixture's state is not shared yet");
+        state.logs_ingest.provisioning = Some(Arc::new(
+            crate::provisioning::ProvisioningRecordWriter::new(faults, 1),
+        ));
+        let state = Arc::new(state);
+
+        let server = tonic::transport::Server::builder()
+            .layer(crate::wire_byte_count::WireByteCountLayer)
+            .layer(GrpcIngestAdmissionLayer::new(
+                state.ingest_concurrency.clone(),
+                state.tenant_resolver.clone(),
+                GrpcIngestServices {
+                    otlp: true,
+                    otap: false,
+                },
+                pending_ack.clone(),
+                state.strict_flush_policy,
+            ))
+            .add_service(LogsServiceServer::new(GrpcLogsService::new(state.clone())));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            server
+                .serve_with_incoming_shutdown(
+                    tonic::transport::server::TcpIncoming::from(listener),
+                    async {
+                        let _ = stopped.await;
+                    },
+                )
+                .await
+                .expect("listener serves");
+        });
+
+        let mut client = LogsServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("gRPC client connects");
+        let mut layered = tokio::spawn(async move {
+            client
+                .export(strict_log_export("layered strict log line"))
+                .await
+        });
+        tokio::time::timeout(WAIT, gate.wait_until_held(1))
+            .await
+            .expect("the layered export reaches its provisioning PUT");
+        let before = log_counters(&state);
+
+        let mut direct = strict_log_export("direct strict log line");
+        direct
+            .extensions_mut()
+            .insert(WireByteCounter::for_test_with_message(false, 64));
+        let direct_service = GrpcLogsService::new(state.clone());
+        let status = tokio::time::timeout(WAIT, async {
+            tokio::select! {
+                out = direct_service.export(direct) => out,
+                () = gate.wait_until_held(2) => panic!(
+                    "the direct call was admitted and issued its own provisioning PUT"
+                ),
+            }
+        })
+        .await
+        .expect("the direct call is answered")
+        .expect_err("the direct call is over the pending-ack budget");
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+        assert_eq!(
+            status.message(),
+            "process pending strict-acknowledgement limit reached"
+        );
+        let (usage, wire, router) = before;
+        assert_eq!(
+            log_counters(&state),
+            (
+                usage,
+                wire,
+                ravel_ingest::LogIngestMetricsSnapshot {
+                    pending_ack_shed: router.pending_ack_shed + 1,
+                    ..router
+                }
+            ),
+            "the direct call was refused before admission, wire bytes and the router, \
+             and only the shed counter moved"
+        );
+        assert_eq!(pending_ack.shed_total(), 1);
+        assert_eq!(pending_ack.held(), 1);
+
+        let response = tokio::time::timeout(WAIT, async {
+            loop {
+                tokio::select! {
+                    out = &mut layered => return out,
+                    () = gate.wait_until_held(1) => {
+                        for id in gate.held() {
+                            gate.release(id);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the layered export completes once its PUT is released")
+        .expect("export task");
+        response.expect("the layered export acks");
+        assert_eq!(pending_ack.held(), 0, "the ack returned the permit");
+        let _ = stop.send(());
     }
 }

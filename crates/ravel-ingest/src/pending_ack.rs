@@ -10,8 +10,13 @@
 //! buffered-byte ceiling.
 //!
 //! A strict `submit` takes a permit before charging the byte budget and before
-//! touching any shard, so a refused submit holds no byte charge. When the
-//! permit is released is stated once, on [`PendingAckPermit`].
+//! touching any shard, so a refused submit holds no byte charge. A
+//! pre-admitted write carries one in instead: ravel-server's admission layer
+//! takes the permit from the same budget at the request head, before the body
+//! is read, and hands it to the router's `submit_admitted`, which takes no
+//! second one (issue #2805). Callers outside that layer keep acquiring in
+//! `submit`. When the permit is released is stated once, on
+//! [`PendingAckPermit`].
 //!
 //! The gauge and counter are process-wide only when every router is built
 //! from one shared `Arc<PendingAckBudget>`; each router reports the budget it

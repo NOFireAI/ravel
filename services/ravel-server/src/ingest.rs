@@ -17,6 +17,7 @@ use ravel_otlp::normalize::normalize_metrics_with_metadata_projected;
 use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
 
+use crate::ingest_admission::PendingAckHandle;
 use crate::ingest_concurrency::IngestPermitHandle;
 
 pub struct IngestState {
@@ -162,6 +163,7 @@ pub async fn handle_export(
         request,
         ingest_ts_ns,
         &IngestPermitHandle::default(),
+        &PendingAckHandle::default(),
     )
     .await
 }
@@ -169,7 +171,10 @@ pub async fn handle_export(
 /// [`handle_export`] for a transport that holds the request's in-flight
 /// permit: `permit` is released once the write is enqueued, before the
 /// strict ack is awaited (ADR-2793 decision 4), so the ack wait holds no slot
-/// of the in-flight ceiling.
+/// of the in-flight ceiling. `pending_ack` carries the pending strict-ack
+/// permit the admission layer took at the request head, which the router's
+/// `submit_admitted` uses instead of taking its own; an empty handle leaves
+/// the router to take it (issue #2805).
 pub async fn handle_export_releasing(
     state: &IngestState,
     tenant: TenantId,
@@ -177,6 +182,7 @@ pub async fn handle_export_releasing(
     request: ExportMetricsServiceRequest,
     ingest_ts_ns: i64,
     permit: &IngestPermitHandle,
+    pending_ack: &PendingAckHandle,
 ) -> Result<IngestOutcome, IngestRequestError> {
     // Receiver-clock plausibility (ADR-0051 amendment): the admission
     // clock must sit above the 2020 floor and yield a representable hour bucket
@@ -336,7 +342,14 @@ pub async fn handle_export_releasing(
     };
     let submitted = state
         .router
-        .submit_values_with_exemplars(tenant, points, exemplars, mode, state.ack_deadline)
+        .submit_admitted(
+            tenant,
+            points,
+            exemplars,
+            mode,
+            state.ack_deadline,
+            pending_ack.take(),
+        )
         .await
         .map_err(classify)?;
     permit.release();

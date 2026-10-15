@@ -18,9 +18,13 @@ enqueues to every involved shard and returns once that is done, without
 waiting on any ack; the returned `Submitted` value's `acks()` then awaits
 strict-mode acks under the `ack_deadline` duration passed to `submit`, its
 clock starting at the first poll of `acks()` (buffered mode's `acks()`
-returns immediately). A strict `submit` takes a pending-ack permit from the
-router's `PendingAckBudget` before it charges the byte budget or touches a
-shard, released as "Pending strict-ack budget" below states.
+returns immediately). A strict write holds a pending-ack permit from the
+router's `PendingAckBudget` before `submit` charges the byte budget or touches
+a shard, released as "Pending strict-ack budget" below states. A
+pre-admitted write carries one in: ravel-server's admission layer takes it at
+the request head and hands it to `submit_admitted`, which takes no second
+one. A strict `submit` from any other caller (`ravel-cli load`, OTAP, tests)
+takes its own.
 
 Remote Write (`POST /api/v1/write`, ADR-0015) is a second gateway handler
 in front of the same router, decode/normalize swapped for the RW-specific
@@ -116,7 +120,8 @@ other. A drain the client abandons midway also ends with `Connection: close`
 and is not counted. The 401, the 413
 for a body above the request size limit, the 503 for a body that does not
 arrive in time, gRPC, OTAP, and the 429s a handler returns after decode are
-unchanged.
+unchanged. The pending strict-ack refusal described below is also decided
+on the head of an authenticated request, and is drained the same way.
 
 The permit covers decode through enqueue. It is returned as soon as the
 request's points are enqueued on their shards, before a strict write's
@@ -141,15 +146,27 @@ it waits for a frame.
 The strict acknowledgement wait has its own process-wide bound,
 `--max-pending-strict-acks` (default 8,192, 0 disables it): one budget shared
 by the metrics, logs and traces routers counts the strict and strict-arrival
-writes that are enqueued and still waiting for their ack. A strict write takes
-its slot after decode, as its points are submitted, and returns it when the
-ack resolves or the request deadline elapses; a buffered write never takes
-one. Over the bound the write is refused before anything is buffered, with
-HTTP 429 and `Retry-After: 1` (body "process pending
-strict-acknowledgement limit reached") or gRPC `RESOURCE_EXHAUSTED`. This shed
-comes after decode, so it does not replace the head shed above as the memory
-bound, and the slot holds no ingest byte charge of its own: the points a
-pending write enqueued are already charged to the ADR-0069 byte budget.
+requests from admission to their ack. On OTLP HTTP, Remote Write and the unary
+OTLP gRPC services, the same admission layer takes a strict request's slot on
+its head, right after the in-flight permit and the credential check and before
+the body is read (ADR-2793, head pending-ack amendment). Strictness is the
+surface's: OTLP resolves `x-ravel-ingest-mode` exactly as the handler does,
+gRPC over the metadata the handler sees, and every Remote Write is strict
+whatever it carries. The slot is held through the body read and the decode,
+handed to the router's submit, and returned when the ack resolves, the request
+deadline elapses, or the request ends without a write; a buffered write never
+takes one. Over the bound the request is refused at the head, with its
+in-flight slot returned first and an HTTP/1 body drained as for the shed
+above, with HTTP 429 and `Retry-After: 1` (body "process pending
+strict-acknowledgement limit reached") or gRPC `RESOURCE_EXHAUSTED`. A gRPC
+service method called directly, with no layer in front of it, takes the slot
+itself before normalizing. OTAP batches take theirs after decode, when they
+are submitted (see the OTAP paragraph below). The slot holds no ingest byte
+charge of its own: the points a pending write enqueued are already charged to
+the ADR-0069 byte budget. Because a slot is held while a body is still being
+read or decoded, a bound below the in-flight ceiling, or a finite bound while
+that ceiling is 0, also bounds strict requests in that phase, and strict
+writes can be shed while fewer acks than the bound are pending.
 
 The OTAP `ArrowMetricsService` stream differs. The same tower layer checks its
 tenant credential on the stream's request head, before any frame is read, but
@@ -1686,26 +1703,43 @@ ten strict requests per second on one shard, 32x at saturation.
 
 ## Pending strict-ack budget (ADR-2793 decision 4)
 
-`PendingAckBudget` bounds how many strict-mode `submit`s may have an
-outstanding ack wait at once (0 = unlimited). Each router takes an
+`PendingAckBudget` bounds how many strict-mode writes may hold a pending-ack
+permit at once (0 = unlimited). Each router takes an
 `Arc<PendingAckBudget>` at construction; the bound is process-wide across
 all three pipelines only when every router is built from one shared `Arc`.
 ravel-server builds exactly one, sized by `--max-pending-strict-acks`
 (`RAVEL_MAX_PENDING_STRICT_ACKS`, default 8,192), and hands it to the
 metrics, logs and traces routers; a value above the tokio semaphore maximum
-is refused at startup rather than clamped. A strict `submit` takes the permit before it charges the byte budget
-and before it sends to any shard, so a refusal here holds no byte charge
-and touches no shard; it is a refusal after decode, not a head shed like
-the in-flight request ceiling above. ravel-server answers it with HTTP 429,
-`Retry-After: 1` and the body "process pending strict-acknowledgement limit
-reached" on OTLP/HTTP and Remote Write, and `RESOURCE_EXHAUSTED` on OTLP
-gRPC and as an OTAP batch status. The permit is released when the
-returned `Submitted`'s `acks()` resolves, when its deadline elapses after
-`acks()` is first polled, or when the `Submitted` is dropped. A
-`Submitted` that is never polled holds its permit until it is dropped.
-ravel-server returns the request's in-flight ingest permit between `submit`
-and `acks()`, so this budget, not `--max-inflight-ingest-requests`, is what
-bounds the number of strict requests waiting for their ack.
+is refused at startup rather than clamped.
+
+On OTLP/HTTP, Remote Write and the unary OTLP gRPC services, ravel-server's
+admission layer takes the permit from that same budget at the request head,
+after the in-flight permit and the credential check, before the body is read,
+and only for a request the surface writes strictly (every Remote Write is).
+The refusal there is a head shed like the in-flight request ceiling above,
+answered after the in-flight permit is returned. The permit travels to the
+handler in a clonable `PendingAckHandle`, of which the layer keeps a clone
+until the request ends, so a permit no handler took goes back then. The
+handler takes it out and passes it to the router's `submit_admitted` (one per
+router), which uses it and takes no second one. A gRPC service method called
+with no layer in front of it decides the same way before it normalizes
+anything.
+
+A strict `submit` from any other caller (`ravel-cli load`, OTAP batches,
+tests), or `submit_admitted` given no permit, takes the permit before it
+charges the byte budget and before it sends to any shard, so a refusal there
+holds no byte charge and touches no shard; for OTAP it is a refusal after
+decode. ravel-server answers either refusal with HTTP 429, `Retry-After: 1`
+and the body "process pending strict-acknowledgement limit reached" on
+OTLP/HTTP and Remote Write, and `RESOURCE_EXHAUSTED` on OTLP gRPC and as an
+OTAP batch status, counted by `ravel_ingest_pending_ack_shed_total`. Once
+submitted, the permit is released when the returned `Submitted`'s `acks()`
+resolves, when its deadline elapses after `acks()` is first polled, or when
+the `Submitted` is dropped. A `Submitted` that is never polled holds its
+permit until it is dropped. ravel-server returns the request's in-flight
+ingest permit between `submit` and `acks()`, so this budget, not
+`--max-inflight-ingest-requests`, is what bounds the number of strict requests
+waiting for their ack.
 
 ## Sizing defaults (config, all overridable)
 
@@ -2017,10 +2051,13 @@ Counters recorded today:
   (`IngestMetrics::in_flight_flushes_by_shard`) before being summed into this
   flat total; a shard with no flush in flight contributes 0.
 - `pending_strict_acks`: gauge, `PendingAckBudget::held()` -- strict-mode
-  `submit`s currently holding a pending-ack permit.
+  writes currently holding a pending-ack permit, from the request head where
+  ravel-server's admission layer took it (from `submit` otherwise) to the
+  ack.
 - `pending_ack_shed`: counter, `PendingAckBudget::shed_total()` -- strict
-  `submit`s refused because the pending-ack budget was already at its
-  ceiling. Cumulative since the budget was constructed.
+  writes refused because the pending-ack budget was already at its ceiling,
+  at the request head or in `submit`. Cumulative since the budget was
+  constructed.
 
   Both are read from the router's own budget, so only the router-level
   `IngestRouter::metrics_snapshot()` (and its `LogIngestRouter` and

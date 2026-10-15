@@ -20,6 +20,7 @@ use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize
 use ravel_types::logstream::LogStreamId;
 use ravel_types::{CommitToken, Signal, TenantId};
 
+use crate::ingest_admission::PendingAckHandle;
 use crate::ingest_concurrency::IngestPermitHandle;
 use crate::otlp_http::{
     MAX_IDEMPOTENCY_KEY_BYTES, encode_commit_tokens, request_ingest_hour_bucket,
@@ -281,13 +282,17 @@ pub async fn handle_export_logs(
         ingest_ts_ns,
         idempotency_key,
         &IngestPermitHandle::default(),
+        &PendingAckHandle::default(),
     )
     .await
 }
 
 /// [`handle_export_logs`] for a transport that holds the request's in-flight
 /// permit: `permit` is released once the write is enqueued, before the
-/// strict ack is awaited (ADR-2793 decision 4).
+/// strict ack is awaited (ADR-2793 decision 4). A pending-ack permit the
+/// admission layer took at the request head is taken out of `pending_ack`
+/// and handed to the router; an empty handle makes the router acquire one.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_export_logs_releasing(
     state: &LogIngestState,
     tenant: TenantId,
@@ -296,6 +301,7 @@ pub async fn handle_export_logs_releasing(
     ingest_ts_ns: i64,
     idempotency_key: Option<Vec<u8>>,
     permit: &IngestPermitHandle,
+    pending_ack: &PendingAckHandle,
 ) -> Result<LogIngestOutcome, LogIngestRequestError> {
     // Receiver-clock plausibility (ADR-0051 amendment): checked before
     // any other work, since the hour bucket the marker path and normalize both
@@ -466,11 +472,12 @@ pub async fn handle_export_logs_releasing(
     };
     let submitted = state
         .router
-        .submit(
+        .submit_admitted(
             tenant.clone(),
             records,
             mode,
             router_write_budget(keyed_deadline, state.ack_deadline),
+            pending_ack.take(),
         )
         .await
         .map_err(classify)?;

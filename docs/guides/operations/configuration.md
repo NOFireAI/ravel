@@ -740,8 +740,14 @@ write waits for its durability acknowledgement, and the decompression buffer
 is gone by then. So the ack wait is not bounded by
 `--max-inflight-ingest-requests`. A separate process-wide ceiling,
 `--max-pending-strict-acks` (default 8,192, 0 = unlimited), bounds how many
-strict writes may wait for their ack at once, and refuses one over it with
-HTTP 429 or gRPC `RESOURCE_EXHAUSTED` before anything is buffered. A waiting
+strict requests may be between admission and their ack at once, and refuses
+one over it with HTTP 429 or gRPC `RESOURCE_EXHAUSTED` before anything is
+buffered. On OTLP HTTP, OTLP gRPC and Remote Write a strict request takes its
+slot at the request head, before its body is read, so the slot also covers the
+body read and the decode: a value below `--max-inflight-ingest-requests`, or
+any value while that ceiling is 0, also bounds strict requests still being
+read or decoded, and can shed strict writes while fewer acks than the bound
+are pending. A waiting
 write holds no decompression buffer: the memory its enqueued points occupy is
 counted by the ingest buffer budget, so this ceiling adds no term to the sum
 above.
