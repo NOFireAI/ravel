@@ -1,8 +1,9 @@
 //! Structural limits: each is accepted at its value and refused one past it,
 //! and the refusal comes before parsing, so a syntax error placed ahead of
-//! the breach does not mask it. The worst shapes the default limits admit
-//! parse, print, compare with `==`, clone, format with `{:?}` and drop on a
-//! 2 MiB stack.
+//! the breach does not mask it. The worst shapes the default limits admit,
+//! nested pipelines included, parse, print, compare with `==`, clone, format
+//! with `{:?}` and drop on a 2 MiB stack, and on a 1 MiB one for twice that
+//! headroom.
 
 #![allow(clippy::expect_used)]
 
@@ -256,7 +257,14 @@ fn worst_admitted_inputs(limits: &Limits) -> Vec<String> {
     vec![
         nested("(", "1", ")", d - 1),
         nested("f(", "1", ")", d - 1),
-        nested("a IN (", "1", ")", d - 1),
+        // An `IN` element is a value, so each step nests a parenthesised
+        // `IN`: two levels per step, like the shapes below.
+        nested(
+            "(",
+            &nested("a IN ((", "1", "))", (d - 1) / 2),
+            ")",
+            1 - d % 2,
+        ),
         format!("{}true", "NOT ".repeat(d - 1)),
         format!("{}1", "-".repeat(d - 1)),
         format!("1{}", " + 1".repeat(d - 1)),
@@ -275,33 +283,136 @@ fn worst_admitted_inputs(limits: &Limits) -> Vec<String> {
     ]
 }
 
+/// `FROM t, (FROM t, ( ... (FROM t <rest>) ... ))`: `levels` subqueries, each
+/// one stage and one nesting level.
+fn from_subqueries(levels: usize, rest: &str) -> String {
+    format!(
+        "FROM {}t{rest}{}",
+        "t, (FROM ".repeat(levels),
+        ")".repeat(levels)
+    )
+}
+
+/// `FROM t | FORK (FORK ( ... ) (WHERE true)) (WHERE true)`: `levels` `FORK`
+/// commands, each nesting the next in its first branch.
+fn nested_forks(levels: usize) -> String {
+    let mut inner = "FORK (WHERE true) (WHERE true)".to_owned();
+    for _ in 1..levels {
+        inner = format!("FORK ({inner}) (WHERE true)");
+    }
+    format!("FROM t | {inner}")
+}
+
+/// `FROM t | WHERE a IN (FROM t | WHERE a IN ( ... (FROM t) ... ))` with
+/// `levels` `IN` subqueries.
+fn in_subqueries(levels: usize) -> String {
+    let mut inner = "FROM t".to_owned();
+    for _ in 0..levels {
+        inner = format!("FROM t | WHERE a IN ({inner})");
+    }
+    inner
+}
+
+/// The deepest nested pipelines the default limits admit, as whole
+/// statements, each with the statement one step past it and the limit that
+/// refuses that one. Every command in a nested pipeline, a `FORK` branch's
+/// included, is a stage, and every nested pipeline is a nesting level.
+fn worst_admitted_pipelines(limits: &Limits) -> Vec<(String, String, LimitKind)> {
+    let d = limits.max_depth;
+    let stages = limits.max_pipeline_stages;
+    // The outer `FROM` and one per subquery.
+    let from = stages - 1;
+    // `FROM t | FORK` and, per `FORK`, its `(WHERE true)` branch; the first
+    // `FORK` has two.
+    let fork = (stages - 2) / 2;
+    // The innermost `FROM t` and, per level, `FROM t | WHERE`.
+    let in_list = (stages - 1) / 2;
+    // Subqueries around a `WHERE` that spends the rest of the depth on calls:
+    // one level per subquery, one for the condition and one per call.
+    let mixed = stages - 2;
+    let calls = |levels| format!(" | WHERE {}", nested("f(", "1", ")", levels));
+    vec![
+        (
+            from_subqueries(from, ""),
+            from_subqueries(from + 1, ""),
+            LimitKind::PipelineStages,
+        ),
+        (
+            nested_forks(fork),
+            nested_forks(fork + 1),
+            LimitKind::PipelineStages,
+        ),
+        (
+            in_subqueries(in_list),
+            in_subqueries(in_list + 1),
+            LimitKind::PipelineStages,
+        ),
+        (
+            from_subqueries(mixed, &calls(d - mixed - 1)),
+            from_subqueries(mixed, &calls(d - mixed)),
+            LimitKind::NestingDepth,
+        ),
+    ]
+}
+
 #[test]
-fn worst_admitted_input_fits_a_two_mebibyte_stack() {
+fn nested_pipelines_count_against_the_limits() {
+    let limits = Limits::default();
+    for (at, past, kind) in worst_admitted_pipelines(&limits) {
+        accepted(&at, &limits);
+        refused(&past, &limits, kind);
+    }
+}
+
+/// Parses `source`, prints it, reparses the printed text and compares, clones,
+/// compares with `==`, formats with `{:?}` and drops every tree.
+fn exercise(source: &str, limits: &Limits) {
+    let query = parse(source, limits).expect("admitted");
+    let printed = print(&query, limits).expect("prints");
+    let reparsed = parse(&printed, limits).expect("printed text parses");
+    assert!(reparsed.eq_ignoring_spans(&query), "{printed}");
+    let copy = query.clone();
+    assert!(copy == query);
+    assert_eq!(format!("{copy:?}"), format!("{query:?}"));
+    drop(copy);
+    drop(reparsed);
+    drop(query);
+}
+
+/// Runs [`exercise`] over every worst admitted shape on a thread with
+/// `stack_bytes` of stack.
+fn worst_admitted_fit(stack_bytes: usize) {
     let handle = std::thread::Builder::new()
-        .stack_size(2 * 1024 * 1024)
+        .stack_size(stack_bytes)
         .spawn(|| {
             let limits = Limits::default();
             for expr in worst_admitted_inputs(&limits) {
                 let source = format!(
                     "ROW x = {expr} | WHERE {expr} | STATS y = {expr} WHERE {expr} BY {expr}"
                 );
-                let query = parse(&source, &limits).expect("admitted");
-                let printed = print(&query, &limits).expect("prints");
-                let reparsed = parse(&printed, &limits).expect("printed text parses");
-                assert!(reparsed.eq_ignoring_spans(&query), "{printed}");
-                let copy = query.clone();
-                assert!(copy == query);
-                assert_eq!(format!("{copy:?}"), format!("{query:?}"));
-                drop(copy);
-                drop(reparsed);
-                drop(query);
+                exercise(&source, &limits);
                 let one_deeper = format!("ROW x = ({expr})");
                 assert!(
                     parse(&one_deeper, &limits).is_err(),
                     "one level past the limit"
                 );
             }
+            for (source, _, _) in worst_admitted_pipelines(&limits) {
+                exercise(&source, &limits);
+            }
         })
         .expect("spawn");
     handle.join().expect("no stack overflow");
+}
+
+#[test]
+fn worst_admitted_input_fits_a_two_mebibyte_stack() {
+    worst_admitted_fit(2 * 1024 * 1024);
+}
+
+/// Half the 2 MiB budget, so the worst admitted input keeps twice its stack
+/// as headroom in an unoptimised build.
+#[test]
+fn worst_admitted_input_fits_a_one_mebibyte_stack() {
+    worst_admitted_fit(1024 * 1024);
 }

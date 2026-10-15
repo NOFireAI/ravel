@@ -17,12 +17,18 @@ const AFTER_COMPARISON: &str = "`AND`, `OR`, `|` or end of input (a comparison, 
      `LIKE`, `RLIKE` or `IS NULL` does not chain and is not an operand of arithmetic or `::` \
      unless parenthesised)";
 
+/// The same refusal inside a `ROW` or `EVAL` field, where `,` may follow.
+const AFTER_COMPARISON_IN_FIELD: &str = "`AND`, `OR`, `,`, `|` or end of input (a comparison, \
+     `:`, `IN`, `LIKE`, `RLIKE` or `IS NULL` does not chain and is not an operand of arithmetic \
+     or `::` unless parenthesised)";
+
 fn col(text: &str) -> Expr {
     Expr::Field(QualifiedName {
         parts: vec![NamePart {
             text: text.to_owned(),
             quoted: false,
             span: NO_SPAN,
+            param: None,
         }],
         span: NO_SPAN,
     })
@@ -113,7 +119,11 @@ fn assert_refused(source: &str, found: &str, start: usize, column: usize) {
     };
     let expected = Error::UnexpectedToken {
         found: format!("`{found}`"),
-        expected: AFTER_COMPARISON,
+        expected: if source.starts_with("ROW ") {
+            AFTER_COMPARISON_IN_FIELD
+        } else {
+            AFTER_COMPARISON
+        },
         span: Span::new(start, start + found.len()),
     };
     assert_eq!(error, expected, "{source:?}");

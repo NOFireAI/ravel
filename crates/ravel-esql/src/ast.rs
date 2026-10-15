@@ -1,25 +1,45 @@
-//! Syntax tree for the core ES|QL pipeline. Every node carries the [`Span`]
-//! of the text it was parsed from; a parenthesised expression's span covers
-//! its parentheses.
+//! Syntax tree for ES|QL statements. Every node carries the [`Span`] of the
+//! text it was parsed from; a parenthesised expression's span covers its
+//! parentheses.
 
+mod eq;
 mod print;
 
 pub use print::print;
 
 use crate::span::Span;
 
-/// A query: a source command followed by processing commands.
+/// A query: optional `SET` directives, a source command, then processing
+/// commands. A nested pipeline (a `FORK` branch, a subquery in `FROM` or in
+/// `IN`) is a [`Query`] or a list of [`Command`]s inside its parent's tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Query {
-    /// `FROM` or `ROW`.
+    /// The source command, such as `FROM` or `ROW`.
     pub source: Command,
     /// The commands after each `|`, in order.
     pub processing: Vec<Command>,
-    /// From the source command's keyword to the end of the last command.
+    /// From the source command's keyword to the end of the last command;
+    /// `SET` directives before the source are outside it.
+    pub span: Span,
+    /// The `SET name = value;` directives before the source command, in
+    /// order. Always empty in a nested query.
+    pub settings: Vec<Setting>,
+}
+
+/// `SET name = value;`, a query setting written before the source command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Setting {
+    /// The setting's name.
+    pub name: NamePart,
+    /// A constant (a literal, an optionally signed number or a parameter) or
+    /// a [`MapLiteral`].
+    pub value: Expr,
+    /// From `SET` to the semicolon.
     pub span: Span,
 }
 
-/// One pipeline stage.
+/// One pipeline stage. A command larger than [`FromCommand`] is boxed, so a
+/// `Command`, and every parser frame holding one, stays that size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Command {
@@ -43,6 +63,42 @@ pub enum Command {
     Sort(SortCommand),
     /// `LIMIT n`
     Limit(LimitCommand),
+    /// `SHOW INFO`
+    Show(ShowCommand),
+    /// `TS sources [METADATA fields]`: a time series source, shaped like
+    /// `FROM`.
+    Ts(FromCommand),
+    /// `FROM` with at least one parenthesised subquery among its sources.
+    FromQueries(FromQueriesCommand),
+    /// `PROMQL [name = value ...] (query)`
+    Promql(Box<PromqlCommand>),
+    /// `DISSECT input "pattern" [APPEND_SEPARATOR = "separator"]`
+    Dissect(Box<DissectCommand>),
+    /// `GROK input "pattern"`
+    Grok(Box<GrokCommand>),
+    /// `MV_EXPAND field`
+    MvExpand(MvExpandCommand),
+    /// `LOOKUP JOIN index ON field, ...`
+    LookupJoin(Box<LookupJoinCommand>),
+    /// `ENRICH policy [ON field] [WITH [name =] field, ...]`
+    Enrich(Box<EnrichCommand>),
+    /// `INLINE STATS aggregates [BY groupings]`, also spelled `INLINESTATS`.
+    InlineStats(StatsCommand),
+    /// `FORK (commands) (commands) ...`
+    Fork(ForkCommand),
+    /// `FUSE [method] [SCORE BY field] [KEY BY fields] [GROUP BY field]
+    /// [WITH options]`
+    Fuse(Box<FuseCommand>),
+    /// `CHANGE_POINT value [ON key] [AS type_name, pvalue_name]`
+    ChangePoint(Box<ChangePointCommand>),
+    /// `SAMPLE probability`
+    Sample(SampleCommand),
+    /// `COMPLETION [target =] prompt WITH options`
+    Completion(Box<CompletionCommand>),
+    /// `RERANK [target =] query ON fields WITH options`
+    Rerank(Box<RerankCommand>),
+    /// `LIMIT n BY fields`
+    LimitBy(LimitByCommand),
 }
 
 impl Command {
@@ -50,17 +106,308 @@ impl Command {
     pub fn span(&self) -> Span {
         match self {
             Command::Row(c) => c.span,
-            Command::From(c) => c.span,
+            Command::From(c) | Command::Ts(c) => c.span,
             Command::Where(c) => c.span,
             Command::Eval(c) => c.span,
             Command::Keep(c) => c.span,
             Command::Drop(c) => c.span,
             Command::Rename(c) => c.span,
-            Command::Stats(c) => c.span,
+            Command::Stats(c) | Command::InlineStats(c) => c.span,
             Command::Sort(c) => c.span,
             Command::Limit(c) => c.span,
+            Command::Show(c) => c.span,
+            Command::FromQueries(c) => c.span,
+            Command::Promql(c) => c.span,
+            Command::Dissect(c) => c.span,
+            Command::Grok(c) => c.span,
+            Command::MvExpand(c) => c.span,
+            Command::LookupJoin(c) => c.span,
+            Command::Enrich(c) => c.span,
+            Command::Fork(c) => c.span,
+            Command::Fuse(c) => c.span,
+            Command::ChangePoint(c) => c.span,
+            Command::Sample(c) => c.span,
+            Command::Completion(c) => c.span,
+            Command::Rerank(c) => c.span,
+            Command::LimitBy(c) => c.span,
         }
     }
+}
+
+/// `SHOW INFO`: the deployment's build information.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShowCommand {
+    /// From `SHOW` to `INFO`.
+    pub span: Span,
+}
+
+/// `FROM` whose sources include a subquery, such as
+/// `FROM logs, (FROM archive | WHERE level == "error")`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromQueriesCommand {
+    /// The sources in order; at least one index pattern comes first and at
+    /// least one subquery follows somewhere.
+    pub sources: Vec<FromSource>,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// One source of a [`FromQueriesCommand`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FromSource {
+    /// An index pattern.
+    Pattern(SourcePattern),
+    /// A parenthesised pipeline that starts with `FROM`.
+    Query(Subquery),
+}
+
+/// A parenthesised nested query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Subquery {
+    /// The nested query; its `settings` are empty.
+    pub query: Box<Query>,
+    /// From `(` to `)`.
+    pub span: Span,
+}
+
+/// `PROMQL [name = value ...] (query)`: a PromQL query embedded as a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlCommand {
+    /// The `name = value` parameters before the query, in order.
+    pub params: Vec<PromqlParam>,
+    /// The parenthesised PromQL text.
+    pub query: PromqlQuery,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// One `name = value` parameter of a [`PromqlCommand`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlParam {
+    /// The parameter's name as written.
+    pub name: String,
+    /// Its value.
+    pub value: PromqlValue,
+    /// From the name to the value.
+    pub span: Span,
+}
+
+/// The value of a [`PromqlParam`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromqlValue {
+    /// An unquoted word or pattern such as `metrics-*` or `5m`, or a string.
+    Text(SourcePattern),
+    /// A query parameter.
+    Param(Parameter),
+}
+
+/// The embedded PromQL text and the outcome of parsing it. The ES|QL parser
+/// never splits this region on `|`; it hands the text to the guarded PromQL
+/// parser and keeps only whether that succeeded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlQuery {
+    /// The text between the parentheses, verbatim.
+    pub text: String,
+    /// The text between the parentheses.
+    pub span: Span,
+    /// `None` when the PromQL parser accepted the text, else its refusal.
+    pub error: Option<PromqlError>,
+}
+
+/// Why the guarded PromQL parser refused an embedded query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlError {
+    /// The PromQL parser's or complexity guard's message.
+    pub message: String,
+    /// The embedded PromQL text the message is about.
+    pub span: Span,
+}
+
+/// `DISSECT input "pattern" [APPEND_SEPARATOR = "separator"]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DissectCommand {
+    /// The text to split: a field, call, constant, parameter, cast or
+    /// parenthesised expression.
+    pub input: Expr,
+    /// The decoded dissect pattern.
+    pub pattern: String,
+    /// The decoded `APPEND_SEPARATOR` value, when written.
+    pub append_separator: Option<String>,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `GROK input "pattern"`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrokCommand {
+    /// The text to match, as for [`DissectCommand::input`].
+    pub input: Expr,
+    /// The decoded grok pattern.
+    pub pattern: String,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `MV_EXPAND field`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MvExpandCommand {
+    /// The multivalued column to expand into rows.
+    pub field: QualifiedName,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `LOOKUP JOIN index ON field, ...`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LookupJoinCommand {
+    /// The lookup index.
+    pub index: SourcePattern,
+    /// The join keys, at least one.
+    pub on: Vec<QualifiedName>,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `ENRICH policy [ON field] [WITH [name =] field, ...]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichCommand {
+    /// The policy name, with any `_mode:` prefix, as written.
+    pub policy: SourcePattern,
+    /// The match field, when written.
+    pub on: Option<QualifiedName>,
+    /// The enrich fields to add; empty when there is no `WITH`.
+    pub with: Vec<EnrichField>,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// One `[name =] field` of an `ENRICH ... WITH`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnrichField {
+    /// The output column name, when the field is renamed.
+    pub name: Option<QualifiedName>,
+    /// The policy's enrich field.
+    pub field: QualifiedName,
+    /// From the name (or field) to the field.
+    pub span: Span,
+}
+
+/// `FORK (commands) (commands) ...`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkCommand {
+    /// The branches, at least two.
+    pub branches: Vec<ForkBranch>,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// One parenthesised branch of a `FORK`: processing commands separated by
+/// `|`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkBranch {
+    /// At least one processing command.
+    pub commands: Vec<Command>,
+    /// From `(` to `)`.
+    pub span: Span,
+}
+
+/// `FUSE [method] [SCORE BY field] [KEY BY fields] [GROUP BY field]
+/// [WITH options]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuseCommand {
+    /// `RRF` or `LINEAR`, when written.
+    pub method: Option<FuseMethod>,
+    /// The `SCORE BY` column, when written.
+    pub score_by: Option<QualifiedName>,
+    /// The `KEY BY` columns; empty when there is no `KEY BY`.
+    pub key_by: Vec<QualifiedName>,
+    /// The `GROUP BY` column, when written.
+    pub group_by: Option<QualifiedName>,
+    /// The `WITH` options, when written.
+    pub options: Option<MapLiteral>,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// How `FUSE` combines scores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FuseMethod {
+    /// `RRF`, reciprocal rank fusion.
+    Rrf,
+    /// `LINEAR`, a weighted sum of scores.
+    Linear,
+}
+
+/// `CHANGE_POINT value [ON key] [AS type_name, pvalue_name]`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangePointCommand {
+    /// The metric column.
+    pub value: QualifiedName,
+    /// The ordering column, when written.
+    pub key: Option<QualifiedName>,
+    /// The two output column names, when written.
+    pub output: Option<ChangePointOutput>,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `AS type_name, pvalue_name` on a `CHANGE_POINT`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangePointOutput {
+    /// The column for the change point's type.
+    pub type_name: QualifiedName,
+    /// The column for its p-value.
+    pub pvalue_name: QualifiedName,
+    /// From `AS` to the second name.
+    pub span: Span,
+}
+
+/// `SAMPLE probability`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SampleCommand {
+    /// The probability's digits as written, such as `0.25`.
+    pub probability: String,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `COMPLETION [target =] prompt WITH options`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletionCommand {
+    /// The output column, when named.
+    pub target: Option<QualifiedName>,
+    /// The prompt, as for [`DissectCommand::input`].
+    pub prompt: Expr,
+    /// The `WITH` options, such as the inference endpoint.
+    pub options: MapLiteral,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `RERANK [target =] query ON fields WITH options`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RerankCommand {
+    /// The output score column, when named.
+    pub target: Option<QualifiedName>,
+    /// The query text: a string or a parameter.
+    pub query: Expr,
+    /// The columns to rerank on, at least one.
+    pub on: Vec<QualifiedName>,
+    /// The `WITH` options, such as the inference endpoint.
+    pub options: MapLiteral,
+    /// The whole command.
+    pub span: Span,
+}
+
+/// `LIMIT n BY fields`: at most `n` rows for each distinct key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitByCommand {
+    /// The row count per key.
+    pub count: u64,
+    /// The key columns, at least one.
+    pub groupings: Vec<QualifiedName>,
+    /// The whole command.
+    pub span: Span,
 }
 
 /// `ROW`: one row of computed fields.
@@ -247,7 +594,8 @@ pub struct Field {
 pub struct QualifiedName {
     /// At least one part.
     pub parts: Vec<NamePart>,
-    /// From the first part to the last.
+    /// From the first part to the last. When the name is a parenthesised
+    /// expression such as `(a.b)`, the span covers the parentheses.
     pub span: Span,
 }
 
@@ -255,12 +603,17 @@ pub struct QualifiedName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamePart {
     /// The part as written when unquoted (spelling kept), or the decoded
-    /// identifier when backtick-quoted.
+    /// identifier when backtick-quoted. A parameter part keeps its text as
+    /// written, such as `?name` or `??name`.
     pub text: String,
     /// Whether the part was backtick-quoted.
     pub quoted: bool,
     /// The part, backticks included.
     pub span: Span,
+    /// The parameter standing for this part, when it is `?name`, `?1` or
+    /// `??name` rather than a name: an identifier parameter, or a pattern
+    /// parameter where the command takes name patterns.
+    pub param: Option<Parameter>,
 }
 
 /// A query parameter's name.
@@ -302,6 +655,11 @@ pub enum Expr {
     Cast(Cast),
     /// `[1, 2, 3]`
     Array(ArrayLiteral),
+    /// `x [NOT] IN (FROM ... | ...)`
+    InSubquery(InSubquery),
+    /// `{"key": value, ...}`, an option map: the last argument of a call, or
+    /// a `SET` or `WITH` value.
+    Map(MapLiteral),
 }
 
 /// A literal value.
@@ -309,7 +667,43 @@ pub enum Expr {
 pub struct Literal {
     /// The value.
     pub value: LiteralValue,
-    /// The literal as written.
+    /// The literal as written; for a parenthesised literal such as `(1)`,
+    /// the parentheses too.
+    pub span: Span,
+}
+
+/// `x [NOT] IN (subquery)`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InSubquery {
+    /// The tested value.
+    pub expr: Box<Expr>,
+    /// The parenthesised query; its `settings` are empty.
+    pub query: Subquery,
+    /// `NOT IN`
+    pub negated: bool,
+    /// From the tested value to the closing parenthesis.
+    pub span: Span,
+}
+
+/// `{"key": value, ...}`
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapLiteral {
+    /// At least one entry, keys distinct, in written order.
+    pub entries: Vec<MapEntry>,
+    /// From `{` to `}`.
+    pub span: Span,
+}
+
+/// One `"key": value` of a [`MapLiteral`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MapEntry {
+    /// The decoded key.
+    pub key: String,
+    /// The key, quotes included.
+    pub key_span: Span,
+    /// A constant, an array of constants or a nested [`MapLiteral`].
+    pub value: Expr,
+    /// From the key to the value.
     pub span: Span,
 }
 
@@ -636,6 +1030,8 @@ impl Expr {
             Expr::IsNull(e) => e.span,
             Expr::Cast(e) => e.span,
             Expr::Array(e) => e.span,
+            Expr::InSubquery(e) => e.span,
+            Expr::Map(e) => e.span,
         }
     }
 
@@ -653,6 +1049,8 @@ impl Expr {
             Expr::IsNull(e) => &mut e.span,
             Expr::Cast(e) => &mut e.span,
             Expr::Array(e) => &mut e.span,
+            Expr::InSubquery(e) => &mut e.span,
+            Expr::Map(e) => &mut e.span,
         }
     }
 
@@ -664,185 +1062,29 @@ impl Expr {
                 UnaryOp::Not => prec::NOT,
                 UnaryOp::Minus | UnaryOp::Plus => prec::UNARY,
             },
-            Expr::In(_) | Expr::Like(_) | Expr::IsNull(_) => prec::COMPARISON,
+            Expr::In(_) | Expr::InSubquery(_) | Expr::Like(_) | Expr::IsNull(_) => prec::COMPARISON,
             Expr::Cast(_) => prec::CAST,
             Expr::Literal(_)
             | Expr::Interval(_)
             | Expr::Field(_)
             | Expr::Param(_)
             | Expr::Call(_)
-            | Expr::Array(_) => prec::PRIMARY,
+            | Expr::Array(_)
+            | Expr::Map(_) => prec::PRIMARY,
         }
     }
 
     /// Structural equality that ignores every span. Iterative, so it does not
     /// recurse on the tree's depth.
     pub fn eq_ignoring_spans(&self, other: &Expr) -> bool {
-        exprs_eq(vec![(self, other)])
+        eq::exprs_equal(self, other)
     }
 }
 
 impl Query {
     /// Structural equality that ignores every span: the equality the printer
-    /// round trip preserves.
+    /// round trip preserves. Iterative over expressions and nested queries.
     pub fn eq_ignoring_spans(&self, other: &Query) -> bool {
-        if self.processing.len() != other.processing.len() {
-            return false;
-        }
-        let mut pending = Vec::new();
-        command_eq(&self.source, &other.source, &mut pending)
-            && self
-                .processing
-                .iter()
-                .zip(&other.processing)
-                .all(|(a, b)| command_eq(a, b, &mut pending))
-            && exprs_eq(pending)
+        eq::queries_equal(self, other)
     }
-}
-
-type Pending<'a> = Vec<(&'a Expr, &'a Expr)>;
-
-fn name_eq(a: &QualifiedName, b: &QualifiedName) -> bool {
-    a.parts.len() == b.parts.len()
-        && a.parts
-            .iter()
-            .zip(&b.parts)
-            .all(|(x, y)| x.text == y.text && x.quoted == y.quoted)
-}
-
-fn names_eq(a: &[QualifiedName], b: &[QualifiedName]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| name_eq(x, y))
-}
-
-fn field_eq<'a>(a: &'a Field, b: &'a Field, pending: &mut Pending<'a>) -> bool {
-    let names = match (&a.name, &b.name) {
-        (None, None) => true,
-        (Some(x), Some(y)) => name_eq(x, y),
-        _ => false,
-    };
-    pending.push((&a.expr, &b.expr));
-    names
-}
-
-fn fields_eq<'a>(a: &'a [Field], b: &'a [Field], pending: &mut Pending<'a>) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| field_eq(x, y, pending))
-}
-
-fn opt_expr_eq<'a>(a: &'a Option<Expr>, b: &'a Option<Expr>, pending: &mut Pending<'a>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => {
-            pending.push((x, y));
-            true
-        }
-        _ => false,
-    }
-}
-
-fn list_eq<'a>(a: &'a [Expr], b: &'a [Expr], pending: &mut Pending<'a>) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    pending.extend(a.iter().zip(b));
-    true
-}
-
-fn command_eq<'a>(a: &'a Command, b: &'a Command, pending: &mut Pending<'a>) -> bool {
-    match (a, b) {
-        (Command::Row(x), Command::Row(y)) => fields_eq(&x.fields, &y.fields, pending),
-        (Command::From(x), Command::From(y)) => {
-            let sources = x.sources.len() == y.sources.len()
-                && x.sources
-                    .iter()
-                    .zip(&y.sources)
-                    .all(|(s, t)| s.text == t.text && s.quoted == t.quoted);
-            let metadata = match (&x.metadata, &y.metadata) {
-                (None, None) => true,
-                (Some(m), Some(n)) => names_eq(&m.fields, &n.fields),
-                _ => false,
-            };
-            sources && metadata
-        }
-        (Command::Where(x), Command::Where(y)) => {
-            pending.push((&x.condition, &y.condition));
-            true
-        }
-        (Command::Eval(x), Command::Eval(y)) => fields_eq(&x.fields, &y.fields, pending),
-        (Command::Keep(x), Command::Keep(y)) => names_eq(&x.patterns, &y.patterns),
-        (Command::Drop(x), Command::Drop(y)) => names_eq(&x.patterns, &y.patterns),
-        (Command::Rename(x), Command::Rename(y)) => {
-            x.renames.len() == y.renames.len()
-                && x.renames
-                    .iter()
-                    .zip(&y.renames)
-                    .all(|(r, s)| name_eq(&r.old, &s.old) && name_eq(&r.new, &s.new))
-        }
-        (Command::Stats(x), Command::Stats(y)) => {
-            x.aggregates.len() == y.aggregates.len()
-                && x.aggregates.iter().zip(&y.aggregates).all(|(p, q)| {
-                    field_eq(&p.field, &q.field, pending)
-                        && opt_expr_eq(&p.filter, &q.filter, pending)
-                })
-                && fields_eq(&x.groupings, &y.groupings, pending)
-        }
-        (Command::Sort(x), Command::Sort(y)) => {
-            x.keys.len() == y.keys.len()
-                && x.keys.iter().zip(&y.keys).all(|(p, q)| {
-                    pending.push((&p.expr, &q.expr));
-                    p.order == q.order && p.nulls == q.nulls
-                })
-        }
-        (Command::Limit(x), Command::Limit(y)) => x.count == y.count,
-        _ => false,
-    }
-}
-
-fn exprs_eq(mut pending: Pending<'_>) -> bool {
-    while let Some((a, b)) = pending.pop() {
-        let same = match (a, b) {
-            (Expr::Literal(x), Expr::Literal(y)) => x.value == y.value,
-            (Expr::Interval(x), Expr::Interval(y)) => x.value == y.value && x.unit == y.unit,
-            (Expr::Field(x), Expr::Field(y)) => name_eq(x, y),
-            (Expr::Param(x), Expr::Param(y)) => x.name == y.name && x.identifier == y.identifier,
-            (Expr::Call(x), Expr::Call(y)) => {
-                x.name == y.name
-                    && match (&x.args, &y.args) {
-                        (CallArgs::Star, CallArgs::Star) => true,
-                        (CallArgs::List(p), CallArgs::List(q)) => list_eq(p, q, &mut pending),
-                        _ => false,
-                    }
-            }
-            (Expr::Unary(x), Expr::Unary(y)) => {
-                pending.push((&x.operand, &y.operand));
-                x.op == y.op
-            }
-            (Expr::Binary(x), Expr::Binary(y)) => {
-                pending.push((&x.left, &y.left));
-                pending.push((&x.right, &y.right));
-                x.op == y.op
-            }
-            (Expr::In(x), Expr::In(y)) => {
-                pending.push((&x.expr, &y.expr));
-                x.negated == y.negated && list_eq(&x.list, &y.list, &mut pending)
-            }
-            (Expr::Like(x), Expr::Like(y)) => {
-                pending.push((&x.expr, &y.expr));
-                x.kind == y.kind && x.pattern == y.pattern && x.negated == y.negated
-            }
-            (Expr::IsNull(x), Expr::IsNull(y)) => {
-                pending.push((&x.expr, &y.expr));
-                x.negated == y.negated
-            }
-            (Expr::Cast(x), Expr::Cast(y)) => {
-                pending.push((&x.expr, &y.expr));
-                x.type_name == y.type_name
-            }
-            (Expr::Array(x), Expr::Array(y)) => list_eq(&x.elements, &y.elements, &mut pending),
-            _ => false,
-        };
-        if !same {
-            return false;
-        }
-    }
-    true
 }
