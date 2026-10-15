@@ -3,7 +3,7 @@
 use ravel_sql::esql::{self, EsqlError, PrepareContext};
 use ravel_sql::{DeclaredColumn, DeclaredType};
 
-use crate::support::{context, fixture, prepare, rows, run};
+use crate::support::{columns, context, fixture, prepare, rows, run};
 
 fn names(source: &str) -> Vec<String> {
     prepare(source)
@@ -391,4 +391,69 @@ fn aggregates_bind_only_in_stats() {
         verification("FROM logs | STATS x = message").0,
         "column [message] must appear in the STATS BY clause or be used in an aggregate function"
     );
+}
+
+/// Over a null-typed argument SUM, AVG, MIN and MAX return null and COUNT
+/// returns 0: one row without BY, one per group with it.
+#[tokio::test]
+async fn stats_over_null_returns_a_row_per_group() {
+    let fixture = fixture().await;
+    for (function, value, ty) in [
+        ("SUM", "null", "null"),
+        ("AVG", "null", "null"),
+        ("MIN", "null", "null"),
+        ("MAX", "null", "null"),
+        ("COUNT", "0", "long"),
+    ] {
+        let source = format!("FROM logs | STATS s = {function}(null)");
+        let outcome = run(&fixture, &source)
+            .await
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(
+            columns(&outcome),
+            vec![("s".to_string(), ty.to_string())],
+            "{source}"
+        );
+        assert_eq!(rows(&outcome), vec![vec![value]], "{source}");
+
+        let source = format!("FROM logs | STATS s = {function}(null) BY service | SORT service");
+        let outcome = run(&fixture, &source)
+            .await
+            .unwrap_or_else(|e| panic!("{source}: {e}"));
+        assert_eq!(
+            rows(&outcome),
+            vec![vec![value, "api"], vec![value, "web"], vec![value, "null"],],
+            "{source}"
+        );
+    }
+}
+
+/// Without BY, a STATS field that calls no aggregate function is refused at
+/// its own position, named by its text and its place among the fields.
+#[test]
+fn a_stats_field_without_an_aggregate_is_refused_without_by() {
+    assert_eq!(
+        verification("FROM logs | STATS s = 1"),
+        (
+            "STATS field 1 [s = 1] calls no aggregate function, which a STATS without BY requires"
+                .to_string(),
+            1,
+            19
+        )
+    );
+    assert_eq!(
+        verification("FROM logs | STATS c = COUNT(*), n = NOW()"),
+        (
+            "STATS field 2 [n = NOW()] calls no aggregate function, which a STATS without BY requires"
+                .to_string(),
+            1,
+            33
+        )
+    );
+    assert_eq!(
+        verification("FROM logs | STATS 1 + 2").0,
+        "STATS field 1 [1 + 2] calls no aggregate function, which a STATS without BY requires"
+    );
+    // An aggregate over a null is still an aggregate.
+    assert_eq!(names("FROM logs | STATS s = SUM(null)"), vec!["s"]);
 }

@@ -300,6 +300,9 @@ enum Cx<'c> {
     Stats {
         calls: &'c mut Vec<(BAggregate, String)>,
         filter: Option<&'c BExpr>,
+        /// The aggregate functions the field names, including one over a
+        /// null that adds no call.
+        named: &'c mut usize,
     },
 }
 
@@ -943,7 +946,7 @@ impl Binder<'_> {
         }
         let mut cols = Vec::new();
         let mut columns = Vec::new();
-        for at in 0..patterns.len() {
+        for (at, name) in patterns.iter().enumerate() {
             for (col, placed) in best.iter().enumerate() {
                 if placed.is_some_and(|(i, _)| i == at) {
                     let col = self.scope.cols[col].clone();
@@ -954,7 +957,7 @@ impl Binder<'_> {
             for (_, key) in attributes.iter().filter(|(i, _)| *i == at) {
                 let value = self
                     .attribute(key)
-                    .ok_or_else(|| self.unknown(key, Span::new(0, 0)))?;
+                    .ok_or_else(|| self.unknown(key, name.span))?;
                 let internal = self.fresh();
                 columns.push((value, internal.clone()));
                 cols.push(Col {
@@ -1035,7 +1038,7 @@ impl Binder<'_> {
     fn stats(&mut self, stats: &ast::StatsCommand) -> Result<(), EsqlError> {
         let mut aggregates = Vec::new();
         let mut outputs: Vec<(String, BExpr, EsqlType)> = Vec::new();
-        for aggregate in &stats.aggregates {
+        for (position, aggregate) in stats.aggregates.iter().enumerate() {
             let filter = match &aggregate.filter {
                 Some(filter) => {
                     let (condition, ty) = self.value(filter, &mut Cx::Row)?;
@@ -1045,14 +1048,40 @@ impl Binder<'_> {
                 }
                 None => None,
             };
+            let mut named = 0;
             let (value, ty) = self.value(
                 &aggregate.field.expr,
                 &mut Cx::Stats {
                     calls: &mut aggregates,
                     filter: filter.as_ref(),
+                    named: &mut named,
                 },
             )?;
+            if named == 0 && stats.groupings.is_empty() {
+                return Err(self.verification(
+                    aggregate.field.span,
+                    format!(
+                        "STATS field {} [{}] calls no aggregate function, which a STATS without BY requires",
+                        position + 1,
+                        self.text(aggregate.field.span)
+                    ),
+                ));
+            }
             outputs.push((self.field_name(&aggregate.field), value, ty));
+        }
+        if aggregates.is_empty() && stats.groupings.is_empty() {
+            // Every field is an aggregate over a null, which adds no call, and
+            // an aggregate with neither groups nor calls does not plan. COUNT(*)
+            // keeps its one row; no field reads it.
+            let internal = self.fresh();
+            aggregates.push((
+                BAggregate {
+                    function: "count",
+                    args: vec![BExpr::Literal(ScalarValue::Int64(Some(1)))],
+                    filter: None,
+                },
+                internal,
+            ));
         }
         let mut groups = Vec::new();
         for grouping in &stats.groupings {
@@ -1357,7 +1386,12 @@ impl Binder<'_> {
         cx: &mut Cx<'_>,
     ) -> Result<Value, EsqlError> {
         let text = self.text(call.span);
-        let Cx::Stats { calls, filter } = cx else {
+        let Cx::Stats {
+            calls,
+            filter,
+            named,
+        } = cx
+        else {
             let message = match cx {
                 Cx::InAggregate => format!("nested aggregate [{text}] is not allowed"),
                 _ => format!("aggregate function [{text}] not allowed outside STATS command"),
@@ -1384,6 +1418,7 @@ impl Binder<'_> {
                 ));
             }
         };
+        **named += 1;
         let internal = self.fresh();
         let column = BExpr::Column(internal.clone());
         let (function, arg, value, result) = match (name, ty) {
@@ -1407,8 +1442,8 @@ impl Binder<'_> {
             }
             ("sum", EsqlType::Double) => ("sum", arg, self.finite(column, true), EsqlType::Double),
             ("avg", EsqlType::Long | EsqlType::Double) => ("avg", arg, column, EsqlType::Double),
-            ("min", ty) if ty != EsqlType::Null => ("min", arg, column, ty),
-            ("max", ty) if ty != EsqlType::Null => ("max", arg, column, ty),
+            ("min", ty) => ("min", arg, column, ty),
+            ("max", ty) => ("max", arg, column, ty),
             (_, other) => {
                 return Err(self.verification(
                     call.span,

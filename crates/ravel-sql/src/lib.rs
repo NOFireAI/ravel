@@ -157,7 +157,7 @@ pub use error::{
 pub use executor::{
     AnalyzedRun, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting, ParquetPlan,
     PhaseWallTiming, PinnedPlanInputs, PinnedQuery, PinnedResolve, PinnedStream, ScanTiming,
-    SegmentTiming, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, StatementRequest, TargetSignal,
+    SegmentTiming, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{

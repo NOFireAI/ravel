@@ -7,7 +7,8 @@
 //! fires. A statement is therefore not a plan but a lowering the executor can
 //! call once per session, each call binding the plan to that session's tables
 //! and functions. SQL text is one such lowering; [`LoweredStatement`] is the
-//! other. No production caller constructs a non-SQL statement yet.
+//! other, sealed so that only this crate's front ends implement it. No
+//! production caller constructs a non-SQL statement yet.
 //!
 //! SQL passes the read-only gate and the complexity guard before any of this
 //! runs, and the binder can only name what the session registered. A lowered
@@ -193,17 +194,67 @@ fn registered<F: ?Sized>(
 /// returns, placed in the expression unchanged), never from a plan or handle
 /// kept from an earlier call. It returns the unoptimized plan; the executor
 /// admits it, then runs the analyzer and the optimizer itself.
+///
+/// The trait is sealed: its supertrait lives in a module private to this
+/// crate, so only this crate's front ends implement it, and nothing outside
+/// the crate runs a lowered statement. A complete implementation written
+/// outside the crate is refused for the missing supertrait alone:
+///
+/// ```compile_fail
+/// use datafusion::error::DataFusionError;
+/// use datafusion::logical_expr::LogicalPlan;
+/// use ravel_sql::{DialectPolicy, LoweredStatement, LoweringContext, StatementTarget, TargetSignal};
+///
+/// #[derive(Debug)]
+/// struct Outside(DialectPolicy);
+///
+/// #[async_trait::async_trait]
+/// impl LoweredStatement for Outside {
+///     fn target(&self) -> StatementTarget {
+///         StatementTarget::Signal(TargetSignal::Logs)
+///     }
+///     fn text(&self) -> &str {
+///         "outside"
+///     }
+///     fn policy(&self) -> &DialectPolicy {
+///         &self.0
+///     }
+///     async fn lower(&self, ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
+///         ctx.scan("logs")?.build()
+///     }
+/// }
+/// ```
+///
+/// and the supertrait cannot be named there to implement it:
+///
+/// ```compile_fail
+/// #[derive(Debug)]
+/// struct Outside;
+///
+/// impl ravel_sql::statement::sealed::Sealed for Outside {}
+/// ```
 #[async_trait]
-pub trait LoweredStatement: Send + Sync + Debug {
+pub trait LoweredStatement: sealed::Sealed + Send + Sync + Debug {
     /// The tables the statement reads. Fixed for the statement's lifetime.
     fn target(&self) -> StatementTarget;
-    /// The statement as the caller wrote it, for the audit record and for
-    /// error detail.
+    /// The statement as the caller wrote it. The executor does not read it:
+    /// the caller that runs the statement audits it.
     fn text(&self) -> &str;
     /// The functions the statement's dialect may call.
     fn policy(&self) -> &DialectPolicy;
     /// Lower the statement against `ctx`.
     async fn lower(&self, ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError>;
+}
+
+pub(crate) mod sealed {
+    /// The supertrait of [`super::LoweredStatement`]. Public in a module
+    /// private to the crate, so no other crate can name or implement it.
+    pub trait Sealed {
+        /// Called with the site before every lowering.
+        #[cfg(test)]
+        #[allow(private_interfaces)]
+        fn lowering_at(&self, _site: super::LoweringSite) {}
+    }
 }
 
 /// Which session a statement is being lowered for. SQL plans each with the
@@ -244,14 +295,6 @@ impl<'a> Statement<'a> {
         }
     }
 
-    /// The text to audit and to carry in errors.
-    pub(crate) fn text(self) -> &'a str {
-        match self {
-            Statement::Sql(sql) => sql,
-            Statement::Lowered(statement) => statement.text(),
-        }
-    }
-
     /// The SQL text, for the steps that read the statement's syntax tree.
     pub(crate) fn sql(self) -> Option<&'a str> {
         match self {
@@ -287,6 +330,8 @@ impl<'a> Statement<'a> {
                 .await
                 .map_err(LowerError::Plan),
             (Statement::Lowered(statement), _) => {
+                #[cfg(test)]
+                statement.lowering_at(site);
                 let context = LoweringContext::snapshot(ctx, providers, tables);
                 let plan = statement.lower(&context).await.map_err(LowerError::Plan)?;
                 admit_lowered_plan(&plan, &context, tables, statement.policy())
@@ -622,6 +667,9 @@ fn node_kind(node: &LogicalPlan) -> &'static str {
 }
 
 #[cfg(test)]
+pub(crate) mod plan_source;
+
+#[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
@@ -648,6 +696,47 @@ mod tests {
         let _: HashMap<String, Arc<AggregateUDF>> = aggregates;
         let _: HashMap<String, Arc<WindowUDF>> = windows;
         let _: BTreeMap<String, Arc<dyn TableProvider>> = tables;
+    }
+
+    #[derive(Debug)]
+    struct Outside(DialectPolicy);
+
+    impl sealed::Sealed for Outside {}
+
+    #[async_trait]
+    impl LoweredStatement for Outside {
+        fn target(&self) -> StatementTarget {
+            StatementTarget::Signal(TargetSignal::Logs)
+        }
+        fn text(&self) -> &str {
+            "outside"
+        }
+        fn policy(&self) -> &DialectPolicy {
+            &self.0
+        }
+        async fn lower(&self, ctx: &LoweringContext) -> Result<LogicalPlan, DataFusionError> {
+            ctx.scan("logs")?.build()
+        }
+    }
+
+    /// Outside the crate the trait is unimplementable: the `compile_fail`
+    /// doctests on [`LoweredStatement`] are a complete implementation that
+    /// fails to compile for the missing [`sealed::Sealed`] (rustc reports
+    /// E0277), and an implementation of `Sealed` that fails because its module
+    /// is private (E0603). The fences carry no error code, which stable rustdoc
+    /// does not check. `Outside`
+    /// here is the first doctest's implementation plus the one `Sealed` line
+    /// it cannot write there, so it compiles and its plan is admitted: the
+    /// doctest fails for the supertrait and for nothing else.
+    #[tokio::test]
+    async fn lowered_statement_cannot_be_implemented_outside_the_crate() {
+        let statement = Outside(DialectPolicy::default());
+        let tables = lowered_tables(statement.target()).expect("a logs target");
+        let context = context_over(&[LOGS_TABLE]);
+        let plan = statement.lower(&context).await.expect("lowers");
+        admit_lowered_plan(&plan, &context, &tables, statement.policy())
+            .expect("the plan is admitted");
+        assert!(matches!(plan, LogicalPlan::TableScan(_)), "{plan:?}");
     }
 
     fn empty_provider() -> Arc<dyn TableProvider> {
