@@ -887,6 +887,12 @@ impl DictColumn {
     }
 
     /// The number of block rows.
+    /// Whether `values` is a row group dictionary.
+    #[cfg(test)]
+    pub(crate) fn is_group(&self) -> bool {
+        self.narrow
+    }
+
     pub(crate) fn rows(&self) -> usize {
         self.keys.len()
     }
@@ -1422,6 +1428,32 @@ impl DecodedBlock {
             int_values_buffers: 0,
             dict_entries_validated: 0,
         }
+    }
+
+    /// Adds string column `column_id` in plain form, for tests that need cells
+    /// no writer produces (bytes that are not UTF-8).
+    #[cfg(test)]
+    pub(crate) fn with_plain_str(mut self, column_id: u32, cells: Vec<Option<Vec<u8>>>) -> Self {
+        self.str_cols.insert(column_id, StrColumn::Plain(cells));
+        self
+    }
+
+    /// Adds string column `column_id` in dictionary form over `values`, one
+    /// key per row (`None` for an absent row); `group` marks `values` a row
+    /// group dictionary.
+    #[cfg(test)]
+    pub(crate) fn with_dict_str(
+        mut self,
+        column_id: u32,
+        values: Arc<DictValues>,
+        keys: &[Option<u32>],
+        group: bool,
+    ) -> Result<Self, LogSegError> {
+        let present: Vec<bool> = keys.iter().map(Option::is_some).collect();
+        let ids = keys.iter().flatten().copied().collect();
+        let col = DictColumn::new(values, &present, ids, group)?;
+        self.str_cols.insert(column_id, StrColumn::Dict(col));
+        Ok(self)
     }
 
     /// The dictionary form of string column `column_id`: its shared dictionary
