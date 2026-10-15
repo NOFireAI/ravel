@@ -30,8 +30,9 @@
 # has not yet published, failed, or been abandoned. Which worker turns out to
 # be the victim depends on the rendezvous-hash ownership split for the run,
 # not on a fixed A-vs-B assignment: a prior failure mode fixed the wait to
-# worker A only and silently never exercised a kill on a night where A owned
-# no data-bearing units.
+# worker A only, so on a night where A owned no data-bearing units it still
+# killed A through the budget fallback below but never exercised a kill
+# during an actual compaction.
 # Each worker is scraped every CHAOS_COMPACTION_POLL_SECONDS (0.05 s) plus the
 # scrape itself; the run logs the scrapes it made and the seconds it waited.
 # If neither gauge ever reads >= 1 within the window the kill still happens
@@ -381,19 +382,7 @@ fi
 
 # Select victim/survivor identity now that CHAOS_VICTIM is known, and use
 # these EVERYWHERE below instead of a hardcoded worker.
-if [[ "$CHAOS_VICTIM" == "a" ]]; then
-  VICTIM_LABEL="worker-a"; VICTIM_LOG="$WORKER_A_LOG"
-  SURVIVOR_LABEL="worker-b"; SURVIVOR_URL="$WORKER_B_URL"; SURVIVOR_LOG="$WORKER_B_LOG"
-  SURVIVOR_PEAK_UNITS_OWNED="${CHAOS_B_MAX_UNITS_OWNED:-0}"
-  CONS_BASELINE="$CONS_BASELINE_B"; BREAKER_BASELINE="$BREAKER_BASELINE_B"
-  WORKER_A_PID=""
-else
-  VICTIM_LABEL="worker-b"; VICTIM_LOG="$WORKER_B_LOG"
-  SURVIVOR_LABEL="worker-a"; SURVIVOR_URL="$WORKER_A_URL"; SURVIVOR_LOG="$WORKER_A_LOG"
-  SURVIVOR_PEAK_UNITS_OWNED="${CHAOS_A_MAX_UNITS_OWNED:-0}"
-  CONS_BASELINE="$CONS_BASELINE_A"; BREAKER_BASELINE="$BREAKER_BASELINE_A"
-  WORKER_B_PID=""
-fi
+chaos_select_survivor "$CHAOS_VICTIM"
 SURVIVOR_LOG_LINES_AT_KILL="$(chaos_line_count "$SURVIVOR_LOG")"
 log "worker-a max units_owned seen while waiting: ${CHAOS_A_MAX_UNITS_OWNED:-0}; worker-b max units_owned seen while waiting: ${CHAOS_B_MAX_UNITS_OWNED:-0}; /metrics scrapes: ${CHAOS_COMPACTION_POLLS:-0} in $(( KILL_EPOCH - INFLIGHT_WAIT_START ))s"
 log "$(chaos_worker_activity_line "$VICTIM_LABEL" "$VICTIM_LOG")"

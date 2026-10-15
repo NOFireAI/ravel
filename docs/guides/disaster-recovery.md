@@ -854,7 +854,12 @@ A failure of the second scenario is release-blocking. The exit codes are:
   `compaction merge ended` line for its bucket), or a store LIST after the
   wait failed while every bucket it did list had a record. With the gauge
   seen and the buckets known, any open bucket with no compaction record in
-  the store at the end of the wait is a failure, exit 2. The scenario also
+  the store at the end of the wait is a failure, exit 2. It also exits 3
+  when the two takeover oracles (sibling takes over within the bound, no
+  orphaned lease) could not measure: the survivor's peak units_owned during
+  the wait before the kill was already at or above the expected total unit
+  count, so no real takeover is observable and both are recorded
+  could-not-measure rather than passed vacuously. The scenario also
   exits 3 before the kill when fewer than 20 exports of its load were
   accepted. The
   summary names the could-not-measure reason in a

@@ -173,24 +173,30 @@ check "orphan gauges" "7/7" \
 # in the last argument (the scraped URL) so A and B can answer differently.
 # wait_for_compaction_in_flight_any reads each round's body via
 # body="$(curl ...)" -- a command substitution, which forks a subshell per
-# call. A round index kept in a shell variable (even via a `local -n`
-# nameref) would be reset on every call instead of advancing, since the
-# mutation never survives past that subshell. The index is kept in a file
-# under SCRATCH instead, which both persists across the subshell boundary
-# and lets the two workers' sequences step independently.
+# call. A round index kept in a shell variable would be reset on every call
+# instead of advancing, since the mutation never survives past that subshell.
+# The index is kept in a file under SCRATCH instead, which both persists
+# across the subshell boundary and lets the two workers' sequences step
+# independently. ab_body takes a fixed "a"/"b" selector rather than an array
+# name passed through a `local -n` nameref: nameref requires bash 4.3, which
+# macOS's bash 3.2 does not have, and this file otherwise only needs 3.2.
 AB_INFLIGHT_A=(0); AB_UNITS_A=(0)
 AB_INFLIGHT_B=(0); AB_UNITS_B=(0)
 AB_IDX_FILE_A="${SCRATCH}/ab-idx-a"
 AB_IDX_FILE_B="${SCRATCH}/ab-idx-b"
-ab_body() { # inflight_seq_name units_seq_name idx_file
-  local -n _infl="$1" _units="$2"
-  local idx_file="$3"
-  local i
+ab_body() { # which(a|b) idx_file
+  local which="$1" idx_file="$2"
+  local i infl units len
   i="$(cat "${idx_file}" 2>/dev/null)"
   [[ "${i}" =~ ^[0-9]+$ ]] || i=0
+  if [[ "${which}" == "a" ]]; then
+    infl="${AB_INFLIGHT_A[i]}"; units="${AB_UNITS_A[i]}"; len="${#AB_INFLIGHT_A[@]}"
+  else
+    infl="${AB_INFLIGHT_B[i]}"; units="${AB_UNITS_B[i]}"; len="${#AB_INFLIGHT_B[@]}"
+  fi
   printf '# TYPE ravel_maintain_compactions_in_flight gauge\nravel_maintain_compactions_in_flight{mode="maintain"} %s\n# TYPE ravel_maintain_units_owned gauge\nravel_maintain_units_owned{mode="maintain"} %s\n' \
-    "${_infl[i]}" "${_units[i]}"
-  if (( i < ${#_infl[@]} - 1 )); then
+    "${infl}" "${units}"
+  if (( i < len - 1 )); then
     printf '%s' "$(( i + 1 ))" >"${idx_file}"
   fi
 }
@@ -203,8 +209,8 @@ curl() {
     serve-metrics) printf '%s\n' "${METRICS_SAMPLE}" ;;
     serve-metrics-ab)
       case "${@: -1}" in
-        *stub-a*) ab_body AB_INFLIGHT_A AB_UNITS_A "${AB_IDX_FILE_A}" ;;
-        *stub-b*) ab_body AB_INFLIGHT_B AB_UNITS_B "${AB_IDX_FILE_B}" ;;
+        *stub-a*) ab_body a "${AB_IDX_FILE_A}" ;;
+        *stub-b*) ab_body b "${AB_IDX_FILE_B}" ;;
       esac
       ;;
     unreachable) return 7 ;;
@@ -631,15 +637,17 @@ check "takeover precondition records both takeover oracles as unmeasured, never 
      [[ "${#ORACLE_UNMEASURED[@]}" -eq 2 && \
         "${ORACLE_UNMEASURED[0]}" == sibling-takeover-within-3H-plus-tick:* && \
         "${ORACLE_UNMEASURED[1]}" == no-orphaned-lease:* ]] && echo yes || echo no)"
-# DISTINGUISHING(c), part 1: a precondition comparing against a literal 4
-# (scenario 2's old EXPECTED_TOTAL_UNITS default) would call this survivor
-# peak (6) could-not-measure, since 6 >= 4; the real derived total is 12, so
-# a peak of 6 is genuinely below it and the takeover IS observable. The
-# structural half of mutant (c) -- the script itself substituting a literal 4
-# for the derived total or for CHAOS_SHARD_COUNT -- is pinned further down
-# against kill-maintain-worker.sh's own source text.
-check "DISTINGUISHING(c) comparing against a literal 4 would wrongly call this could-not-measure; the real 12-unit total makes it observable" "0" \
-  "$(rc_of assert_takeover_observable_or_unmeasured 6 12)"
+# DISTINGUISHING(c), part 1: the real call site in kill-maintain-worker.sh
+# must pass the derived $EXPECTED_TOTAL_UNITS to this precondition, not a
+# literal: a script that substituted a bare 4 back in (scenario 2's old
+# default) would call a survivor peak of 6 could-not-measure, since 6 >= 4,
+# even though the real derived total is 12 and 6 is genuinely below it. The
+# library-level check above (line 629) cannot tell a call site passing a
+# derived variable from one passing a literal that happens to equal it, so
+# this is checked against the script's own source text instead.
+takeover_call_text="$(grep -F 'assert_takeover_observable_or_unmeasured "$SURVIVOR_PEAK_UNITS_OWNED"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "DISTINGUISHING(c) the takeover precondition call site passes \$EXPECTED_TOTAL_UNITS, not a literal" "yes" \
+  "$([[ "${takeover_call_text}" == *'"$EXPECTED_TOTAL_UNITS"'* ]] && echo yes || echo no)"
 
 # Args: A's log, B's log, aborts baseline, CHAOS_KILL_ON_GAUGE. B's line
 # count at the kill is 1, and the wait is 0 (one read). The store LIST reads
@@ -840,6 +848,32 @@ check "DISTINGUISHING(b) the takeover and leak oracles read \$SURVIVOR_URL, neve
      && "${sibling_call_text}" != *'WORKER_A_URL'* && "${sibling_call_text}" != *'WORKER_B_URL'* \
      && "${orphan_call_text}" != *'WORKER_A_URL'* && "${orphan_call_text}" != *'WORKER_B_URL'* \
      && "${leak_call_text}" != *'WORKER_A_URL'* && "${leak_call_text}" != *'WORKER_B_URL'* ]] && echo yes || echo no)"
+
+# chaos_select_survivor: the victim-to-survivor mapping DISTINGUISHING(b)
+# above only pins at the text level (the oracle calls read $SURVIVOR_URL, not
+# a hardcoded worker). This covers the mapping itself behaviourally: for each
+# victim letter, every SURVIVOR_*/VICTIM_* output and baseline must come from
+# the OTHER worker (and the victim's own label/log for the VICTIM_* outputs),
+# and the victim's own PID global must be cleared to "" while the survivor's
+# is left untouched.
+select_survivor_case() { # victim(a|b)
+  WORKER_A_LOG="log-a"; WORKER_B_LOG="log-b"
+  WORKER_A_URL="http://a"; WORKER_B_URL="http://b"
+  CHAOS_A_MAX_UNITS_OWNED=3; CHAOS_B_MAX_UNITS_OWNED=9
+  CONS_BASELINE_A=1; CONS_BASELINE_B=2
+  BREAKER_BASELINE_A=5; BREAKER_BASELINE_B=6
+  WORKER_A_PID=111; WORKER_B_PID=222
+  chaos_select_survivor "$1"
+  printf 'VICTIM_LABEL=%s VICTIM_LOG=%s SURVIVOR_LABEL=%s SURVIVOR_URL=%s SURVIVOR_LOG=%s SURVIVOR_PEAK_UNITS_OWNED=%s CONS_BASELINE=%s BREAKER_BASELINE=%s WORKER_A_PID=%s WORKER_B_PID=%s' \
+    "${VICTIM_LABEL}" "${VICTIM_LOG}" "${SURVIVOR_LABEL}" "${SURVIVOR_URL}" "${SURVIVOR_LOG}" \
+    "${SURVIVOR_PEAK_UNITS_OWNED}" "${CONS_BASELINE}" "${BREAKER_BASELINE}" "${WORKER_A_PID}" "${WORKER_B_PID}"
+}
+check "chaos_select_survivor a: survivor is worker-b with B's URL/log/peak/baselines, A's pid cleared" \
+  "VICTIM_LABEL=worker-a VICTIM_LOG=log-a SURVIVOR_LABEL=worker-b SURVIVOR_URL=http://b SURVIVOR_LOG=log-b SURVIVOR_PEAK_UNITS_OWNED=9 CONS_BASELINE=2 BREAKER_BASELINE=6 WORKER_A_PID= WORKER_B_PID=222" \
+  "$(select_survivor_case a)"
+check "chaos_select_survivor b: survivor is worker-a with A's URL/log/peak/baselines, B's pid cleared" \
+  "VICTIM_LABEL=worker-b VICTIM_LOG=log-b SURVIVOR_LABEL=worker-a SURVIVOR_URL=http://a SURVIVOR_LOG=log-a SURVIVOR_PEAK_UNITS_OWNED=3 CONS_BASELINE=1 BREAKER_BASELINE=5 WORKER_A_PID=111 WORKER_B_PID=" \
+  "$(select_survivor_case b)"
 
 # DISTINGUISHING(c), part 2: a script that substitutes a bare literal 4 back
 # in for the derived signals x shards total, or for CHAOS_SHARD_COUNT in the
