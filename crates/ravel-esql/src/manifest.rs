@@ -402,7 +402,9 @@ impl Expected {
                     && project(&actual.rows) == project(&expected.rows)
                     && is_sub_multiset(&actual.rows, &expected.rows)
             }
-            Order::Any(n) => actual.rows.len() == *n && is_sub_multiset(&actual.rows, &expected.rows),
+            Order::Any(n) => {
+                actual.rows.len() == *n && is_sub_multiset(&actual.rows, &expected.rows)
+            }
         };
         if holds { Ok(()) } else { Err(rows_differ()) }
     }
@@ -411,13 +413,14 @@ impl Expected {
 /// Whether every row of `part` can be matched to a distinct row of `whole`.
 fn is_sub_multiset(part: &[Vec<Cell>], whole: &[Vec<Cell>]) -> bool {
     let mut left: Vec<&Vec<Cell>> = whole.iter().collect();
-    part.iter().all(|row| match left.iter().position(|r| *r == row) {
-        Some(index) => {
-            left.swap_remove(index);
-            true
-        }
-        None => false,
-    })
+    part.iter()
+        .all(|row| match left.iter().position(|r| *r == row) {
+            Some(index) => {
+                left.swap_remove(index);
+                true
+            }
+            None => false,
+        })
 }
 
 fn show_columns(columns: &[Column]) -> String {
@@ -710,15 +713,18 @@ pub fn load(text: &str) -> Result<Manifest, ManifestError> {
     unique_names("negative", negatives.iter().map(|(l, n)| (*l, &n.name)))?;
     unique_names("transport", transport.iter().map(|(l, t)| (*l, &t.name)))?;
     unique_names("divergence", divergences.iter().map(|(l, d)| (*l, &d.name)))?;
-    unique_names("divergence id", divergences.iter().map(|(l, d)| (*l, &d.id)))?;
+    unique_names(
+        "divergence id",
+        divergences.iter().map(|(l, d)| (*l, &d.id)),
+    )?;
     for entry in &entries {
-        if let Some(id) = &entry.divergence {
-            if !divergences.iter().any(|(_, d)| &d.id == id) {
-                return Err(field(
-                    entry.line,
-                    &format!("{:?}: no divergence has id {id:?}", entry.name),
-                ));
-            }
+        if let Some(id) = &entry.divergence
+            && !divergences.iter().any(|(_, d)| &d.id == id)
+        {
+            return Err(field(
+                entry.line,
+                &format!("{:?}: no divergence has id {id:?}", entry.name),
+            ));
         }
     }
     for (line, divergence) in &divergences {
@@ -949,16 +955,23 @@ fn read_expected(table: &mut RawTable, name: &str) -> Result<Option<Expected>, M
                     Ok(row)
                 })
                 .collect::<Result<Vec<Vec<Cell>>, ManifestError>>()?;
-            let order = Order::parse(&order)
-                .ok_or_else(|| wrong(&format!("order {order:?} is not exact, multiset, key COLUMNS or any N")))?;
+            let order = Order::parse(&order).ok_or_else(|| {
+                wrong(&format!(
+                    "order {order:?} is not exact, multiset, key COLUMNS or any N"
+                ))
+            })?;
             match &order {
                 Order::Key(keys) => {
-                    if let Some(key) = keys.iter().find(|k| !columns.iter().any(|c| &c.name == *k)) {
+                    if let Some(key) = keys.iter().find(|k| !columns.iter().any(|c| &c.name == *k))
+                    {
                         return Err(wrong(&format!("order key {key:?} is not a column")));
                     }
                 }
                 Order::Any(n) if *n > rows.len() => {
-                    return Err(wrong(&format!("order any {n} exceeds the {} rows listed", rows.len())));
+                    return Err(wrong(&format!(
+                        "order any {n} exceeds the {} rows listed",
+                        rows.len()
+                    )));
                 }
                 _ => {}
             }
@@ -986,10 +999,10 @@ fn read_row(text: &str) -> Result<Vec<Cell>, String> {
     let mut cells = Vec::new();
     loop {
         rest = rest.trim_start();
-        if cells.is_empty() {
-            if let Some(after) = rest.strip_prefix(']') {
-                return finish_row(cells, after);
-            }
+        if cells.is_empty()
+            && let Some(after) = rest.strip_prefix(']')
+        {
+            return finish_row(cells, after);
         }
         let (cell, after) = read_cell(rest)?;
         cells.push(cell);
@@ -1091,7 +1104,8 @@ fn validate_entries(entries: &[Entry]) -> Result<(), ManifestError> {
                 .iter()
                 .filter(|e| e.section == Section::Released && &e.name == target)
                 .collect();
-            let wrong = |message: String| field(entry.line, &format!("{:?}: {message}", entry.name));
+            let wrong =
+                |message: String| field(entry.line, &format!("{:?}: {message}", entry.name));
             let [resolved] = targets.as_slice() else {
                 return Err(wrong(format!(
                     "refused_by {target:?} names {} released entries, not one",
@@ -1176,7 +1190,8 @@ impl Manifest {
     /// the ones whose example it accepts.
     pub fn syntax_coverage(&self) -> Figure {
         count(
-            self.released().filter(|entry| entry.grammar == Grammar::Own),
+            self.released()
+                .filter(|entry| entry.grammar == Grammar::Own),
             |entry| entry.parser == State::Supported,
         )
     }
@@ -1186,7 +1201,8 @@ impl Manifest {
     /// those, the ones whose example the parser accepts.
     pub fn generic_rule_coverage(&self) -> Figure {
         count(
-            self.released().filter(|entry| entry.grammar != Grammar::Own),
+            self.released()
+                .filter(|entry| entry.grammar != Grammar::Own),
             |entry| entry.parser == State::Supported,
         )
     }
@@ -1961,7 +1977,11 @@ evidence = "a.rs::t"
     fn a_running_entry_carries_the_release_answer() {
         let manifest = load(&format!("{ENTRY}{RUNS}")).expect("loads");
         let entry = &manifest.entries[2];
-        let Some(Expected::Answer { answer: expected, order }) = &entry.expected else {
+        let Some(Expected::Answer {
+            answer: expected,
+            order,
+        }) = &entry.expected
+        else {
             panic!("no answer: {:?}", entry.expected);
         };
         assert_eq!(order, &Order::Exact);
@@ -1973,11 +1993,13 @@ evidence = "a.rs::t"
         assert_eq!(manifest.ran().to_string(), "1/3");
         assert_eq!(manifest.divergent().to_string(), "1/3");
         assert_eq!(manifest.execution_compatibility().to_string(), "0/3");
-        let compatible = RUNS.replacen("divergence = \"integer-literal\"\n", "", 1).replacen(
-            "evidence = \"a.rs::t\"\n\n[[divergence]]",
-            "evidence = \"a.rs::t\"\n\n[[divergence]]\nno_entry = \"r\"",
-            1,
-        );
+        let compatible = RUNS
+            .replacen("divergence = \"integer-literal\"\n", "", 1)
+            .replacen(
+                "evidence = \"a.rs::t\"\n\n[[divergence]]",
+                "evidence = \"a.rs::t\"\n\n[[divergence]]\nno_entry = \"r\"",
+                1,
+            );
         let manifest = load(&format!("{ENTRY}{compatible}")).expect("loads");
         assert_eq!(manifest.execution_compatibility().to_string(), "1/3");
         assert_eq!(manifest.divergent().to_string(), "0/3");
@@ -2001,13 +2023,12 @@ evidence = "a.rs::t"
 
     #[test]
     fn a_release_error_needs_a_divergence() {
-        let text = format!("{ENTRY}{RUNS}")
-            .replacen(
-                "columns = [\"a:integer\", \"b:keyword\"]\nrows = [\n  '[1, \"x\"]',\n]\n\
+        let text = format!("{ENTRY}{RUNS}").replacen(
+            "columns = [\"a:integer\", \"b:keyword\"]\nrows = [\n  '[1, \"x\"]',\n]\n\
                  order = \"exact\"\nwarnings = []\n",
-                "release_error = \"refused\"\n",
-                1,
-            );
+            "release_error = \"refused\"\n",
+            1,
+        );
         assert!(load(&text).is_ok(), "{:?}", load(&text).err());
         let text = text.replacen("divergence = \"integer-literal\"\n", "", 1);
         assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
@@ -2047,7 +2068,10 @@ evidence = "a.rs::t"
         let manifest = load(&refused_by("TO_STRING")).expect("loads");
         assert_eq!(manifest.entries[1].refusal_marker(), "[TO_STR]");
         assert_eq!(manifest.entries[0].refusal_marker(), "[TO_STRING]");
-        assert!(matches!(load(&refused_by("TO_TEXT")), Err(ManifestError::Field { .. })));
+        assert!(matches!(
+            load(&refused_by("TO_TEXT")),
+            Err(ManifestError::Field { .. })
+        ));
         let text = format!("{}{RUNS}", refused_by("ROW"));
         assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
         let text = refused_by("TO_STRING").replacen(
@@ -2067,20 +2091,44 @@ evidence = "a.rs::t"
     #[test]
     fn the_comparison_names_the_first_difference() {
         let expected = Expected::Answer {
-            answer: answer(&[("a", "long")], vec![vec![Cell::Long(1)], vec![Cell::Long(2)]]),
+            answer: answer(
+                &[("a", "long")],
+                vec![vec![Cell::Long(1)], vec![Cell::Long(2)]],
+            ),
             order: Order::Exact,
         };
-        let same = answer(&[("a", "long")], vec![vec![Cell::Long(1)], vec![Cell::Long(2)]]);
+        let same = answer(
+            &[("a", "long")],
+            vec![vec![Cell::Long(1)], vec![Cell::Long(2)]],
+        );
         assert_eq!(expected.compare(&same), Ok(()));
-        let swapped = answer(&[("a", "long")], vec![vec![Cell::Long(2)], vec![Cell::Long(1)]]);
-        assert!(expected.compare(&swapped).expect_err("order").starts_with("rows"));
+        let swapped = answer(
+            &[("a", "long")],
+            vec![vec![Cell::Long(2)], vec![Cell::Long(1)]],
+        );
+        assert!(
+            expected
+                .compare(&swapped)
+                .expect_err("order")
+                .starts_with("rows")
+        );
         let retyped = answer(&[("a", "integer")], same.rows.clone());
-        assert!(expected.compare(&retyped).expect_err("type").starts_with("columns"));
+        assert!(
+            expected
+                .compare(&retyped)
+                .expect_err("type")
+                .starts_with("columns")
+        );
         let warned = Answer {
             warnings: vec!["w".to_owned()],
             ..same.clone()
         };
-        assert!(expected.compare(&warned).expect_err("warning").starts_with("warnings"));
+        assert!(
+            expected
+                .compare(&warned)
+                .expect_err("warning")
+                .starts_with("warnings")
+        );
         let refused = Expected::Error("no".to_owned());
         assert!(refused.compare(&same).is_err());
 
@@ -2089,13 +2137,19 @@ evidence = "a.rs::t"
             order: Order::Multiset,
         };
         assert_eq!(multiset.compare(&swapped), Ok(()));
-        let doubled = answer(&[("a", "long")], vec![vec![Cell::Long(1)], vec![Cell::Long(1)]]);
+        let doubled = answer(
+            &[("a", "long")],
+            vec![vec![Cell::Long(1)], vec![Cell::Long(1)]],
+        );
         assert!(multiset.compare(&doubled).is_err());
         let any = Expected::Answer {
             answer: answer(&[("a", "long")], same.rows.clone()),
             order: Order::Any(1),
         };
-        assert_eq!(any.compare(&answer(&[("a", "long")], vec![vec![Cell::Long(2)]])), Ok(()));
+        assert_eq!(
+            any.compare(&answer(&[("a", "long")], vec![vec![Cell::Long(2)]])),
+            Ok(())
+        );
         assert!(any.compare(&same).is_err());
     }
 
@@ -2150,7 +2204,10 @@ evidence = "a.rs::t"
     fn the_parser_sentence_follows_the_parser_states() {
         let manifest = load(ENTRY).expect("loads");
         let entries: Vec<&Entry> = manifest.entries.iter().collect();
-        assert_eq!(parser_state_sentence(&entries), "The parser accepts each of these.");
+        assert_eq!(
+            parser_state_sentence(&entries),
+            "The parser accepts each of these."
+        );
         let mut refused = manifest.entries[1].clone();
         refused.parser = State::Refused;
         let entries = vec![&manifest.entries[0], &refused];

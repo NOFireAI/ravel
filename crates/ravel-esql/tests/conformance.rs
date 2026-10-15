@@ -348,7 +348,10 @@ fn the_figures_count_released_entries_only() {
         .count();
     assert_eq!(manifest.ran().numerator, ran);
     assert_eq!(manifest.divergent().numerator, divergent);
-    assert_eq!(manifest.execution_compatibility().numerator, ran - divergent);
+    assert_eq!(
+        manifest.execution_compatibility().numerator,
+        ran - divergent
+    );
     assert!(divergent > 0 && divergent < ran);
     let rendered = manifest.render_report();
     for line in [

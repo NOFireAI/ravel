@@ -62,7 +62,10 @@ fn iso_nanos(ns: i64) -> String {
 
 fn cell(ty: &EsqlType, array: &ArrayRef, row: usize) -> Cell {
     // A `NullArray` has no validity buffer; its nulls are logical.
-    if array.logical_nulls().is_some_and(|nulls| nulls.is_null(row)) {
+    if array
+        .logical_nulls()
+        .is_some_and(|nulls| nulls.is_null(row))
+    {
         return Cell::Null;
     }
     let text = || array_value_to_string(array, row).expect("cell");
@@ -229,13 +232,18 @@ async fn check_refusals(manifest: &Manifest, fixture: &Fixture) -> (usize, Vec<S
             continue;
         }
         let prepared = prepare(&entry.example);
-        let shown = || format!("prepare gives {:?}", prepared.as_ref().map(|_| "a statement"));
+        let shown = || {
+            format!(
+                "prepare gives {:?}",
+                prepared.as_ref().map(|_| "a statement")
+            )
+        };
         let verdict = match (entry.parser, entry.binder, &prepared) {
-            (State::Refused, _, Err(EsqlError::Parse(error)))
-                if matches!(error, ravel_esql::Error::UnsupportedSyntax { .. }) =>
-            {
-                Ok(())
-            }
+            (
+                State::Refused,
+                _,
+                Err(EsqlError::Parse(ravel_esql::Error::UnsupportedSyntax { .. })),
+            ) => Ok(()),
             (State::Absent, _, Err(EsqlError::Parse(error)))
                 if !matches!(error, ravel_esql::Error::UnsupportedSyntax { .. }) =>
             {
@@ -244,7 +252,9 @@ async fn check_refusals(manifest: &Manifest, fixture: &Fixture) -> (usize, Vec<S
             (State::Supported, State::Refused, _) => binder_refusal(manifest, entry, &prepared),
             (State::Supported, State::Supported, Ok(prepared)) => {
                 match run_prepared(fixture, prepared).await {
-                    Err(error) if is_typed_refusal(&error) == (entry.executor == State::Refused) => {
+                    Err(error)
+                        if is_typed_refusal(&error) == (entry.executor == State::Refused) =>
+                    {
                         Ok(())
                     }
                     Err(error) => Err(format!("the run fails with {error:?}")),
@@ -327,17 +337,24 @@ async fn the_refusal_check_drives_the_arms_the_manifest_does_not_reach() {
 
     let (refused, wrong) = check(one_entry("ROW a = 1", "absent", "absent", "absent")).await;
     assert_eq!(refused, 0);
-    assert!(wrong[0].contains("prepare gives Ok(\"a statement\")"), "{wrong:#?}");
+    assert!(
+        wrong[0].contains("prepare gives Ok(\"a statement\")"),
+        "{wrong:#?}"
+    );
 
-    let (refused, wrong) =
-        check(one_entry("ROW a = 1", "supported", "supported", "refused")).await;
+    let (refused, wrong) = check(one_entry("ROW a = 1", "supported", "supported", "refused")).await;
     assert_eq!(refused, 0);
-    assert!(wrong[0].ends_with("the statement prepares and runs"), "{wrong:#?}");
+    assert!(
+        wrong[0].ends_with("the statement prepares and runs"),
+        "{wrong:#?}"
+    );
 
-    let (refused, wrong) =
-        check(one_entry("ROW a = 1", "supported", "supported", "absent")).await;
+    let (refused, wrong) = check(one_entry("ROW a = 1", "supported", "supported", "absent")).await;
     assert_eq!(refused, 0);
-    assert!(wrong[0].ends_with("the statement prepares and runs"), "{wrong:#?}");
+    assert!(
+        wrong[0].ends_with("the statement prepares and runs"),
+        "{wrong:#?}"
+    );
 }
 
 /// A binder refusal must be an `Unsupported` error naming the construct: a
@@ -347,7 +364,12 @@ async fn the_refusal_check_drives_the_arms_the_manifest_does_not_reach() {
 async fn a_binder_refusal_must_name_the_construct() {
     let fixture = fixture().await;
     let (refused, wrong) = check_refusals(
-        &one_entry("FROM logs | WHERE nope(1) > 0", "supported", "refused", "refused"),
+        &one_entry(
+            "FROM logs | WHERE nope(1) > 0",
+            "supported",
+            "refused",
+            "refused",
+        ),
         &fixture,
     )
     .await;
@@ -369,7 +391,10 @@ fn a_timestamp_renders_with_nine_fraction_digits() {
     assert_eq!(iso_nanos(NOW + 7), "2023-11-14T22:23:00.000000007Z");
     assert_eq!(iso_nanos(0), "1970-01-01T00:00:00.000000000Z");
     assert_eq!(iso_nanos(-1), "1969-12-31T23:59:59.999999999Z");
-    assert_eq!(iso_nanos(951_782_400 * SECOND), "2000-02-29T00:00:00.000000000Z");
+    assert_eq!(
+        iso_nanos(951_782_400 * SECOND),
+        "2000-02-29T00:00:00.000000000Z"
+    );
 }
 
 /// FROM without KEEP lists the native columns in a fixed order, not sorted
@@ -377,7 +402,10 @@ fn a_timestamp_renders_with_nine_fraction_digits() {
 #[tokio::test]
 async fn from_lists_the_native_columns_in_a_fixed_order() {
     let outcome = run(&fixture().await, "FROM logs").await.expect("runs");
-    let names: Vec<String> = columns(&outcome).into_iter().map(|(name, _)| name).collect();
+    let names: Vec<String> = columns(&outcome)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
     assert_eq!(
         names,
         [
@@ -498,13 +526,14 @@ async fn an_overflow_gives_null_without_a_warning() {
 #[tokio::test]
 async fn the_comparison_reports_a_changed_value_and_a_changed_type() {
     let manifest = load();
-    let entry = manifest
-        .released()
-        .find(|e| e.name == "SUM")
-        .expect("SUM");
+    let entry = manifest.released().find(|e| e.name == "SUM").expect("SUM");
     let outcome = run(&fixture().await, &entry.example).await.expect("runs");
     let actual = answer(&outcome);
-    let Some(Expected::Answer { answer: release, order }) = entry.expected.clone() else {
+    let Some(Expected::Answer {
+        answer: release,
+        order,
+    }) = entry.expected.clone()
+    else {
         panic!("SUM records an answer");
     };
     let with = |answer: Answer| Expected::Answer {
