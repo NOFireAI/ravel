@@ -329,8 +329,10 @@ pub struct IntegerPage {
     pub current_bytes: u64,
     pub current_decode_mb_per_s: f64,
     pub fastlanes_for_bytes: u64,
+    pub fastlanes_for_enveloped_bytes: u64,
     pub fastlanes_for_decode_mb_per_s: f64,
     pub fastlanes_delta_bytes: u64,
+    pub fastlanes_delta_enveloped_bytes: u64,
     pub fastlanes_delta_decode_mb_per_s: f64,
 }
 
@@ -1120,8 +1122,10 @@ impl State {
                 current_bytes: pd_bytes,
                 current_decode_mb_per_s: mb_per_s(decoded, cur_secs),
                 fastlanes_for_bytes: fl[0].0,
+                fastlanes_for_enveloped_bytes: fl[0].1,
                 fastlanes_for_decode_mb_per_s: mb_per_s(decoded, fl[0].2),
                 fastlanes_delta_bytes: fl[1].0,
+                fastlanes_delta_enveloped_bytes: fl[1].1,
                 fastlanes_delta_decode_mb_per_s: mb_per_s(decoded, fl[1].2),
             });
         }
@@ -1520,6 +1524,22 @@ mod tests {
             .collect();
         assert_eq!(cols, ["ts", "stream_ref", "severity_num", "flags"]);
         assert_eq!(v["integer_pages"]["excluded"][0]["column"], "observed_ts");
+        let mut per_page_fields = [
+            "block",
+            "column",
+            "values",
+            "current_enc",
+            "current_bytes",
+            "current_decode_mb_per_s",
+            "fastlanes_for_bytes",
+            "fastlanes_for_enveloped_bytes",
+            "fastlanes_for_decode_mb_per_s",
+            "fastlanes_delta_bytes",
+            "fastlanes_delta_enveloped_bytes",
+            "fastlanes_delta_decode_mb_per_s",
+        ];
+        per_page_fields.sort_unstable();
+        assert_eq!(keys(&v["integer_pages"]["per_page"][0]), per_page_fields);
     }
 
     #[test]

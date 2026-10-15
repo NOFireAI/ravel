@@ -160,7 +160,9 @@ pub fn encode(values: &[i64], variant: Variant) -> Vec<u8> {
 /// Decodes a page written by [`encode`]. `None` on malformed input.
 pub fn decode(bytes: &[u8], variant: Variant) -> Option<Vec<i64>> {
     let count = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?) as usize;
-    let mut out = Vec::with_capacity(count);
+    // `count` comes from untrusted input; do not let a corrupted huge count
+    // drive a multi-GB allocation before the payload length is checked.
+    let mut out = Vec::new();
     let mut at = 4;
     let mut vec = [0i64; VECTOR];
     let mut scratch = [0u64; VECTOR];
@@ -243,6 +245,14 @@ mod tests {
         let d = encode(&v, Variant::Delta);
         assert_eq!(d.len(), 4 + LANES * 8 + 9);
         assert_eq!(decode(&d, Variant::Delta).unwrap(), v);
+    }
+
+    #[test]
+    fn huge_count_with_short_payload_is_refused() {
+        let mut page = u32::MAX.to_le_bytes().to_vec();
+        page.extend_from_slice(&[0u8; 16]);
+        assert!(decode(&page, Variant::For).is_none());
+        assert!(decode(&page, Variant::Delta).is_none());
     }
 
     #[test]
