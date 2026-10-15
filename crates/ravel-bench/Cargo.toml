@@ -61,6 +61,10 @@ uuid = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
+# logbody_report: sha256 of the corpus for the report stamp, and gzip corpus
+# input (LogHub ships .gz). Both are workspace dependencies already.
+ring = { workspace = true }
+flate2 = { workspace = true }
 # The cost-regression gate (ADR-0996 task 996-7) loads its per-figure bands from
 # a checked-in TOML document (`cost_regression_bands.toml`). `toml` is not in the
 # workspace `[workspace.dependencies]`; it is named by version here exactly as
@@ -350,6 +354,11 @@ bench = false
 [[bin]]
 name = "histogram_size"
 path = "src/bin/histogram_size.rs"
+bench = false
+
+[[bin]]
+name = "logbody_report"
+path = "src/bin/logbody_report.rs"
 bench = false
 
 [[bin]]

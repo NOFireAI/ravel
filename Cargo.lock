@@ -4454,6 +4454,7 @@ dependencies = [
  "ravel-sql",
  "ravel-types",
  "reqwest 0.13.4",
+ "ring",
  "rustix",
  "serde",
  "serde_json",
