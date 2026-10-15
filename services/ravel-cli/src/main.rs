@@ -2129,6 +2129,17 @@ enum CatalogCommand {
         /// writer process has exited.
         #[arg(long)]
         writers_stopped: bool,
+        /// Build per-part key-index leaves (ADR-2707 decision 4) in this
+        /// fold. Off by default pending measurement, and no query reads the
+        /// leaves yet. When on, every part the fold re-encodes has each
+        /// entry's KEY_IDX section read by ranged GET, up to three GETs per
+        /// entry, and the tail part is re-encoded on every fold that advances
+        /// the watermark, so each such fold reads the section of every entry
+        /// in the tail. Applies to `--signal spans` and to a logs tenant that
+        /// declares a key-index column or turns on trace-id indexing; other
+        /// signals ignore it.
+        #[arg(long)]
+        key_index_leaves: bool,
         /// Print the full `FoldReport` as JSON instead of the human-readable
         /// text report. Either form carries every counter on the report.
         #[arg(long)]
@@ -2330,6 +2341,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     signal,
                     max_flush_lifetime,
                     writers_stopped,
+                    key_index_leaves,
                     json,
                     tenant_kms,
                 },
@@ -2342,6 +2354,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             signal,
             max_flush_lifetime,
             writers_stopped,
+            key_index_leaves,
             now_ns()?,
             json,
         )
@@ -4429,6 +4442,33 @@ mod tests {
             assert_eq!(got, want, "--scope {name}");
         }
         assert!(scope_set("none").is_err());
+    }
+
+    /// `catalog fold --key-index-leaves` is off unless passed (ADR-2707
+    /// decision 4).
+    #[test]
+    fn catalog_fold_key_index_leaves_is_off_unless_passed() {
+        let parse = |extra: &[&str]| {
+            let argv = ["ravel", "catalog", "fold", "--tenant", "acme"]
+                .iter()
+                .chain(extra)
+                .copied()
+                .collect::<Vec<_>>();
+            let Command::Catalog {
+                command:
+                    super::CatalogCommand::Fold {
+                        key_index_leaves, ..
+                    },
+            } = Cli::try_parse_from(argv)
+                .expect("a catalog fold invocation parses")
+                .command
+            else {
+                panic!("expected the catalog fold subcommand");
+            };
+            key_index_leaves
+        };
+        assert!(!parse(&[]), "the leaf build is off by default");
+        assert!(parse(&["--key-index-leaves"]), "the flag turns it on");
     }
 
     /// The shipped write-concurrency and object-size defaults, read where an

@@ -553,6 +553,7 @@ fn test_config(mode: Mode, tenant: &TenantId, fold_interval: Duration) -> Server
         fold: FoldTaskConfig {
             enabled: true,
             fold_interval,
+            ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),

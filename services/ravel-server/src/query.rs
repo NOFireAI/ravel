@@ -178,6 +178,32 @@ pub fn build_catalog(
     max_ingest_lag_ns: Option<i64>,
     max_flush_delay: Duration,
 ) -> anyhow::Result<Arc<Catalog>> {
+    build_catalog_from(
+        server_catalog_config_base(),
+        store,
+        shard_count,
+        disable_cache,
+        cache_max_bytes,
+        cache_dir,
+        resolve_ceiling,
+        max_ingest_lag_ns,
+        max_flush_delay,
+    )
+}
+
+/// [`build_catalog`] over `base` instead of [`server_catalog_config_base`].
+#[allow(clippy::too_many_arguments)]
+fn build_catalog_from(
+    base: CatalogConfig,
+    store: Arc<dyn ObjectStoreBackend>,
+    shard_count: u32,
+    disable_cache: bool,
+    cache_max_bytes: u64,
+    cache_dir: Option<PathBuf>,
+    resolve_ceiling: Option<usize>,
+    max_ingest_lag_ns: Option<i64>,
+    max_flush_delay: Duration,
+) -> anyhow::Result<Arc<Catalog>> {
     // `0` is the byte cache's disabled sentinel (ravel_catalog::CatalogConfig):
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
     // --disable-cache into a `None` fetcher cache.
@@ -197,7 +223,7 @@ pub fn build_catalog(
         shard_count,
         byte_cache_max_bytes,
         cache_capacity_per_tenant,
-        ..server_catalog_config_base()
+        ..base
     };
     // Override the catalog listing window; see `crate::resolve_ingest_lag`.
     if let Some(ns) = max_ingest_lag_ns {
@@ -285,7 +311,11 @@ pub fn build_catalog_for_server(
     config: &ServerConfig,
     catalog_window_ns: i64,
 ) -> anyhow::Result<Arc<Catalog>> {
-    build_catalog(
+    build_catalog_from(
+        CatalogConfig {
+            build_key_index_leaves: config.fold.build_key_index_leaves,
+            ..server_catalog_config_base()
+        },
         store,
         config.shard_count,
         config.disable_cache,
@@ -1822,6 +1852,34 @@ mod catalog_cache_tests {
             catalog.config().resolve_get_concurrency,
             derived,
             "the resolved per-process ceiling must reach the catalog the server queries"
+        );
+    }
+
+    /// `--fold-key-index-leaves` reaches the catalog both the scheduled and
+    /// the on-demand fold run with, and the leaf build stays off without it.
+    #[test]
+    fn build_catalog_for_server_maps_the_key_index_leaf_switch() {
+        for enabled in [false, true] {
+            let config = crate::ServerConfig {
+                fold: crate::FoldTaskConfig {
+                    build_key_index_leaves: enabled,
+                    ..crate::FoldTaskConfig::default()
+                },
+                cpu_gate_permits: Default::default(),
+                ..server_config()
+            };
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let catalog = build_catalog_for_server(store, &config, 7_200_000_000_000)
+                .expect("catalog builds");
+            assert_eq!(
+                catalog.config().build_key_index_leaves,
+                enabled,
+                "the fold's key-index leaf switch must reach the server catalog"
+            );
+        }
+        assert!(
+            !crate::FoldTaskConfig::default().build_key_index_leaves,
+            "the leaf build is off by default"
         );
     }
 

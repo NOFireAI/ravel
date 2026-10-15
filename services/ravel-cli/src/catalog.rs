@@ -99,6 +99,7 @@ pub async fn fold(
         signal,
         max_flush_lifetime_ns,
         false,
+        false,
         now_ns,
         json,
     )
@@ -113,6 +114,9 @@ pub async fn fold(
 /// published into a sealed hour is folded by a later fold only until the
 /// seal margin passes that hour, and after that stays invisible to queries
 /// that carry no commit token until a HEAD rebuild. `now_ns` itself is not moved.
+///
+/// `build_key_index_leaves` sets [`CatalogConfig::build_key_index_leaves`]
+/// for this fold (`--key-index-leaves`); [`fold`] passes `false`.
 #[allow(clippy::too_many_arguments)]
 pub async fn fold_with_writers_stopped(
     store: Arc<dyn ObjectStoreBackend>,
@@ -122,6 +126,7 @@ pub async fn fold_with_writers_stopped(
     signal: SignalArg,
     max_flush_lifetime_ns: Option<i64>,
     writers_stopped: bool,
+    build_key_index_leaves: bool,
     now_ns: i64,
     json: bool,
 ) -> anyhow::Result<(FoldReport, String)> {
@@ -138,6 +143,7 @@ pub async fn fold_with_writers_stopped(
         signal,
         max_flush_lifetime_ns,
         seal_through_hour,
+        build_key_index_leaves,
         now_ns,
         json,
         None,
@@ -194,6 +200,7 @@ pub async fn fold_inner(
         signal,
         max_flush_lifetime_ns,
         None,
+        false,
         now_ns,
         json,
         column_stats_ceiling_override,
@@ -210,12 +217,14 @@ async fn fold_core(
     signal: SignalArg,
     max_flush_lifetime_ns: Option<i64>,
     seal_through_hour: Option<u32>,
+    build_key_index_leaves: bool,
     now_ns: i64,
     json: bool,
     column_stats_ceiling_override: Option<u64>,
 ) -> anyhow::Result<(FoldReport, String)> {
     let mut catalog_config = CatalogConfig {
         shard_count,
+        build_key_index_leaves,
         ..CatalogConfig::default()
     };
     if let Some(ns) = max_flush_lifetime_ns {

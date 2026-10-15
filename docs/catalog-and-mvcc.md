@@ -831,8 +831,12 @@ swept as unreferenced while its owning part is live.
 
 The proto fields, the leaf codec, the single-leaf probe, the fold's leaf
 build and HEAD attachment, and the sweep's `kidx` kind are implemented: the
-fold (the server's maintain loop and `ravel-cli catalog fold`) writes leaves
-for logs and spans. Two parts are proposed and marked so below: the query
+fold (the server's scheduled and on-demand fold and `ravel-cli catalog
+fold`) can write leaves for logs and spans. The leaf build is behind a
+switch that is off by default (`CatalogConfig::build_key_index_leaves`,
+`ravel-server --fold-key-index-leaves`, `ravel-cli catalog fold
+--key-index-leaves`), pending the measurement ADR-2707's 2026-10-15
+amendment describes. Two parts are proposed and marked so below: the query
 path ("Reader", no query probes a leaf yet) and the
 `--rebuild-key-index` repair under "Rollout". The task that
 lands each removes its marker.
@@ -989,8 +993,13 @@ every entry and tail object outside the shard `shard_for_span` selects for
 that hour's generation (ADR-0052). These probes are their own cost phase
 (`keyIndex` under `stats.phases`) and are never pooled into a scan counter.
 
-**Fold.** The fold writes leaves for exactly the parts it re-encodes this
-fold (a part carried forward by reference keeps its refs, as for field 7),
+**Fold.** With the switch off (the default), the fold reads no footer or
+KEY_IDX section, writes no leaf, and re-encodes every part it re-encodes
+without `key_index` refs, dropping any the part carried; a part carried
+forward by reference keeps its refs unchanged. The sweep does not read the
+switch. With the switch on, the fold writes leaves for exactly the
+parts it re-encodes this fold (a part carried forward by reference keeps
+its refs, as for field 7),
 for every field the tenant's key-index set names at fold time (logs: the
 declared `key_index` columns, plus `trace_id` when `index_trace_id` is set;
 spans: `trace_id`) plus every field any entry's section header names, from
@@ -1001,7 +1010,16 @@ KEY_IDX section (about 2% of a logs object and about 6% of a spans object
 on the ADR-2707 Stage 0 corpora), issued under the fold's
 `fold_bucket_concurrency` bound, merged across the part's entries, sorted,
 bucketed and PUT before the part PUT, so a failed leaf PUT fails the fold
-with no part written. A field's key type is the declared one, else the type
+with no part written. An encode refusal is not a failed PUT: it leaves the
+field uncovered for that part (every entry counted in
+`key_index_uncovered_entries`, logged at error level) and the part is
+published without that field's refs. A logs tenant whose key-index set is
+empty (no declared `key_index` column and `index_trace_id` off) reads no
+section and writes no leaf. Each data object's footer and section are read
+once per fold, not once per HEAD CAS attempt: the result is kept by data
+object key for the rest of the fold, so an attempt after a lost CAS issues
+no further reads for an object already read; a transient GET failure is logged at warn level naming the
+object key, and the entry is uncovered for that fold. A field's key type is the declared one, else the type
 the first entry naming the field gives it. Each leaf is PUT
 `CreateIfAbsent`.
 The object is content-addressed by its own bytes (`hash16` is the blake3
@@ -1073,11 +1091,13 @@ failure (no KEY_IDX section, a section that does not name the field or
 names it under another key type, a failed GET, a corrupt section) lands the
 entry in `uncovered_entry_ordinals` and never aborts the leaf. A field with
 no covered entry in the part writes no leaf (absence is uncovered). The
-fold report counts, per fold, `key_index_ranged_gets` and
-`key_index_bytes_read` (the footer and section GETs and the bytes they
-returned, also counted in `get_requests`), `key_index_leaves_written`,
-`key_index_leaf_bytes_written` and `key_index_uncovered_entries` (per
-re-encoded part and field, the entries no leaf covers).
+fold report counts `key_index_ranged_gets` and `key_index_bytes_read` (the
+footer and section GETs and the bytes they returned, also counted in
+`get_requests`) as the total the fold issued across its CAS attempts, and
+`key_index_leaves_written`, `key_index_leaf_bytes_written` and
+`key_index_uncovered_entries` (per re-encoded part and field, the entries
+no leaf covers) for the CAS attempt that published. All five are zero with
+the switch off.
 
 When a compaction or erasure rewrite record lands, the fold re-encodes the
 part and rebuilds its leaves from the new entry set. An erasure rewrite

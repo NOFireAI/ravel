@@ -618,6 +618,14 @@ pub struct CatalogConfig {
     /// discovery I/O, mirroring the resolve path's in-flight semaphore.
     /// Default [`DEFAULT_FOLD_BUCKET_CONCURRENCY`].
     pub fold_bucket_concurrency: usize,
+    /// Whether the fold builds per-part key-index leaves (`.kidx`, ADR-2707
+    /// decision 4). Off by default pending measurement: when on, every part
+    /// the fold re-encodes has each entry's KEY_IDX section read by ranged
+    /// GET, and the tail part is re-encoded on every fold that advances the
+    /// watermark. When off the fold reads no section, writes no leaf, and a
+    /// part it re-encodes carries no `key_index` refs; a part carried forward
+    /// by reference keeps the refs it has. Default `false`.
+    pub build_key_index_leaves: bool,
     /// How far back of the previous fold's watermark the post-fold reconcile
     /// pass re-lists commit buckets, in hours (ADR-0063 section 4). Each fold
     /// re-lists the window `[watermark_hour_old - fold_reconcile_window_hours,
@@ -763,6 +771,7 @@ impl Default for CatalogConfig {
             prefix_list_crossover_requests: DEFAULT_PREFIX_LIST_CROSSOVER_REQUESTS,
             snapshot_part_max_entries: DEFAULT_SNAPSHOT_PART_MAX_ENTRIES,
             fold_bucket_concurrency: DEFAULT_FOLD_BUCKET_CONCURRENCY,
+            build_key_index_leaves: false,
             fold_reconcile_window_hours: DEFAULT_FOLD_RECONCILE_WINDOW_HOURS,
             protection_horizon_ns: DEFAULT_PROTECTION_HORIZON_NS,
             frontier_reconcile_max_hours: DEFAULT_FRONTIER_RECONCILE_MAX_HOURS,

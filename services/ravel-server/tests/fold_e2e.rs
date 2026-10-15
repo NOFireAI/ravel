@@ -363,6 +363,7 @@ async fn background_fold_writes_logs_head_independently_of_metrics() {
         fold: FoldTaskConfig {
             enabled: true,
             fold_interval: Duration::from_millis(200),
+            ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),
@@ -523,6 +524,7 @@ async fn background_fold_writes_head_for_a_sealed_hour() {
         fold: FoldTaskConfig {
             enabled: true,
             fold_interval: Duration::from_millis(200),
+            ..FoldTaskConfig::default()
         },
         maintain: ravel_server::MaintenanceTaskConfig::default(),
         alerting: ravel_server::AlertEvalConfig::default(),

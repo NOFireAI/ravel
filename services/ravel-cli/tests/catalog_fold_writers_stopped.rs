@@ -129,6 +129,7 @@ async fn fold(
         SignalArg::Metrics,
         max_flush_lifetime_ns,
         writers_stopped,
+        false,
         now,
         json,
     )

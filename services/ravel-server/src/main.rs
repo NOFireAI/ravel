@@ -585,6 +585,7 @@ async fn main() -> anyhow::Result<()> {
         fold: FoldTaskConfig {
             enabled: !cli.disable_fold,
             fold_interval: Duration::from_secs(cli.fold_interval_secs),
+            build_key_index_leaves: cli.fold_key_index_leaves,
         },
         maintain: MaintenanceTaskConfig {
             enabled: matches!(cli.mode, Mode::Maintain),
