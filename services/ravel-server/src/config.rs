@@ -1745,19 +1745,26 @@ pub struct Cli {
     #[arg(long = "max-inflight-ingest-requests", default_value_t = 1024)]
     pub max_inflight_ingest_requests: u64,
 
-    /// The process-wide ceiling on strict writes that are enqueued and
-    /// waiting for their durability acknowledgement, summed across metrics,
-    /// logs, traces and Remote Write, every listener and every transport.
-    /// A strict write takes a slot when it is enqueued, after its body was
-    /// read and decoded, and returns it when its acknowledgement resolves or
-    /// its ack deadline elapses.
-    /// Over the limit, the write is refused before it is buffered and holds
+    /// The process-wide ceiling on strict write requests between admission
+    /// and their durability acknowledgement, summed across metrics, logs,
+    /// traces and Remote Write, every listener and every transport.
+    /// On OTLP HTTP, OTLP gRPC and Remote Write a strict request takes a
+    /// slot at its request head, after the in-flight permit and the
+    /// credential check and before its body is read, and holds it through
+    /// the body read, the decode and the ack wait. It returns the slot when
+    /// its acknowledgement resolves, its ack deadline elapses, or the request
+    /// ends without a write. An OTAP batch takes its slot after decode, when
+    /// it is submitted.
+    /// Over the limit, the request is refused before it is buffered and holds
     /// no buffer byte charge: HTTP gets 429 with `Retry-After`, gRPC gets
-    /// `RESOURCE_EXHAUSTED`. This sheds after decode and does not replace
-    /// `--max-inflight-ingest-requests`, which sheds at the request head.
-    /// Buffered writes never take a slot. `0` disables the limit; a value
-    /// above the tokio semaphore's maximum permit count is refused at
-    /// startup.
+    /// `RESOURCE_EXHAUSTED`. Every Remote Write is strict; buffered OTLP
+    /// writes never take a slot.
+    /// Because a slot is held while the body is still being read or decoded,
+    /// a limit below `--max-inflight-ingest-requests`, or any limit while
+    /// that ceiling is `0`, also bounds strict requests still in that phase,
+    /// and strict writes can be shed while fewer acknowledgements than the
+    /// limit are pending. `0` disables the limit; a value above the tokio
+    /// semaphore's maximum permit count is refused at startup.
     #[arg(
         long = "max-pending-strict-acks",
         env = "RAVEL_MAX_PENDING_STRICT_ACKS",

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::ingest_admission::{IngestPermitHeld, retry_after_seconds};
+use crate::ingest_admission::{IngestPermitHeld, PendingAckHeld, retry_after_seconds};
 use crate::ingest_concurrency::IngestConcurrencyController;
 use crate::ingest_decode::decode_body_charged;
 use axum::Router;
@@ -242,6 +242,16 @@ impl crate::ingest_admission::IngestAdmissionState for RemoteWriteState {
     fn on_unauthorized(&self) {
         self.metrics.record_request_rejected();
     }
+
+    fn pending_ack_budget(&self) -> &Arc<ravel_ingest::PendingAckBudget> {
+        self.router.pending_ack_budget()
+    }
+
+    /// Every Remote Write is strict: this surface reads no mode header, so a
+    /// client cannot opt out of the pending-ack bound.
+    fn strict_write(&self, _headers: &HeaderMap) -> bool {
+        true
+    }
 }
 
 pub fn router(state: Arc<RemoteWriteState>) -> Router {
@@ -354,6 +364,7 @@ async fn remote_write(
     State(state): State<Arc<RemoteWriteState>>,
     Extension(tenant): Extension<TenantId>,
     Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
+    Extension(PendingAckHeld(pending_ack)): Extension<PendingAckHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -507,11 +518,13 @@ async fn remote_write(
     // strict, so this is the surface whose ack wait the permit covered most.
     let written = match state
         .router
-        .submit_values(
+        .submit_admitted(
             tenant,
             ingest_points,
+            Vec::new(),
             state.strict_flush_policy.write_mode(),
             state.ack_deadline,
+            pending_ack.take(),
         )
         .await
     {
@@ -846,6 +859,9 @@ pub(crate) mod tests {
             Extension(tenant.clone()),
             Extension(IngestPermitHeld(
                 crate::ingest_concurrency::IngestPermitHandle::default(),
+            )),
+            Extension(PendingAckHeld(
+                crate::ingest_admission::PendingAckHandle::default(),
             )),
             HeaderMap::new(),
             Bytes::new(),

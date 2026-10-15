@@ -3087,7 +3087,7 @@ fn render_pending_strict_ack_family(
     write_header(
         out,
         "ravel_ingest_pending_strict_acks",
-        "Strict ingest writes enqueued and awaiting their durability acknowledgement, process-wide.",
+        "Strict ingest requests holding a pending-ack permit, from admission to their durability acknowledgement, process-wide.",
         "gauge",
     );
     write_sample(

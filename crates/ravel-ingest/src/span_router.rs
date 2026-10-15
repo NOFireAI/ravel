@@ -84,8 +84,9 @@ pub struct SpanWriteReceipt {
 /// [`Self::acks`] is the other half of what [`SpanIngestRouter::write`] used
 /// to do in one step.
 ///
-/// Holds the strict-mode pending-ack permit this submit took, released as
-/// [`crate::PendingAckPermit`] states.
+/// Holds the strict-mode pending-ack permit this submit took, or the one a
+/// pre-admitted write brought in through [`SpanIngestRouter::submit_admitted`],
+/// released as [`crate::PendingAckPermit`] states.
 #[must_use = "a submitted strict write is only acknowledged once acks() resolves"]
 pub struct SpanSubmitted<'a> {
     router: &'a SpanIngestRouter,
@@ -401,6 +402,13 @@ impl SpanIngestRouter {
         }
     }
 
+    /// The pending strict-ack budget this router's strict submits draw on,
+    /// for an admission layer that takes the permit before the request body
+    /// is read and hands it back through [`Self::submit_admitted`].
+    pub fn pending_ack_budget(&self) -> &Arc<PendingAckBudget> {
+        &self.pending_ack_budget
+    }
+
     /// Whether every shard actor this router owns is live enough to serve:
     /// false once the router has observed a shard actor dead (a write or ack
     /// found its channel closed), since that first observed death condemns a
@@ -499,13 +507,33 @@ impl SpanIngestRouter {
     /// a full channel: that backpressure is intentional (docs/ingest.md
     /// "Channel"). A strict submit takes a pending-ack permit before the byte
     /// budget is charged, so a refused submit holds no charge; call
-    /// [`SpanSubmitted::acks`] to await the shard acks this returns.
+    /// [`SpanSubmitted::acks`] to await the shard acks this returns. A write
+    /// whose permit was already taken at its request head carries it in
+    /// through [`Self::submit_admitted`] instead.
     pub async fn submit(
         &self,
         tenant: ravel_types::TenantId,
         spans: Vec<NormalizedSpan>,
         mode: WriteMode,
         ack_deadline: Duration,
+    ) -> Result<SpanSubmitted<'_>, SpanWriteError> {
+        self.submit_admitted(tenant, spans, mode, ack_deadline, None)
+            .await
+    }
+
+    /// [`Self::submit`] for a write whose pending-ack permit may already be
+    /// held: one an admission layer took from the shared budget at the
+    /// request head (issue #2805). A strict write given `Some` keeps that
+    /// permit through [`SpanSubmitted::acks`] and takes no second one; given
+    /// `None` it takes one here, as `submit` does. A buffered write takes none
+    /// and drops any permit it is given.
+    pub async fn submit_admitted(
+        &self,
+        tenant: ravel_types::TenantId,
+        spans: Vec<NormalizedSpan>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+        pending_ack: Option<PendingAckPermit>,
     ) -> Result<SpanSubmitted<'_>, SpanWriteError> {
         if spans.is_empty() {
             return Ok(SpanSubmitted {
@@ -516,12 +544,15 @@ impl SpanIngestRouter {
 
         // The router's pending-strict-ack budget (ADR-2793 decision 4): taken
         // before the byte budget below, so a refused submit holds no charge.
+        // A pre-admitted write brings its permit in and never takes a second.
         let permit = match mode {
-            WriteMode::Strict | WriteMode::StrictArrival => Some(
-                self.pending_ack_budget
+            WriteMode::Strict | WriteMode::StrictArrival => Some(match pending_ack {
+                Some(permit) => permit,
+                None => self
+                    .pending_ack_budget
                     .try_acquire()
                     .ok_or(SpanWriteError::PendingAckLimitReached)?,
-            ),
+            }),
             WriteMode::Buffered => None,
         };
 

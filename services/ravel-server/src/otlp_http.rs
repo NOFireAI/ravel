@@ -26,8 +26,8 @@ use ravel_types::{Signal, TenantId};
 
 use crate::ingest::{IngestRequestError, IngestState};
 use crate::ingest_admission::{
-    IngestPermitHeld, admission_rejection_response, ingest_buffer_budget_shed_response,
-    ingest_deferral_cap_response, pending_ack_shed_response,
+    IngestPermitHeld, PendingAckHeld, admission_rejection_response,
+    ingest_buffer_budget_shed_response, ingest_deferral_cap_response, pending_ack_shed_response,
 };
 use crate::ingest_concurrency::IngestConcurrencyController;
 use crate::ingest_decode::{MAX_REQUEST_BODY_BYTES, admit_and_decode_body};
@@ -114,6 +114,18 @@ impl crate::ingest_admission::IngestAdmissionState for GatewayState {
 
     fn tenant_resolver(&self) -> &Arc<dyn TenantResolver> {
         &self.tenant_resolver
+    }
+
+    /// The metrics router's budget. The server builds all three routers from
+    /// one `Arc<PendingAckBudget>`, so this is the budget the log and span
+    /// routers hold too.
+    fn pending_ack_budget(&self) -> &Arc<ravel_ingest::PendingAckBudget> {
+        self.ingest.router.pending_ack_budget()
+    }
+
+    /// The handlers resolve the mode the same way from the same headers.
+    fn strict_write(&self, headers: &HeaderMap) -> bool {
+        resolve_write_mode(headers, self.strict_flush_policy) != ravel_ingest::WriteMode::Buffered
     }
 }
 
@@ -225,6 +237,7 @@ async fn export_metrics(
     State(state): State<Arc<GatewayState>>,
     Extension(tenant): Extension<TenantId>,
     Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
+    Extension(PendingAckHeld(pending_ack)): Extension<PendingAckHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -268,6 +281,7 @@ async fn export_metrics(
         request,
         now_ns(),
         &permit,
+        &pending_ack,
     )
     .await
     {
@@ -321,6 +335,7 @@ async fn export_logs(
     State(state): State<Arc<GatewayState>>,
     Extension(tenant): Extension<TenantId>,
     Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
+    Extension(PendingAckHeld(pending_ack)): Extension<PendingAckHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -362,6 +377,7 @@ async fn export_logs(
         now_ns(),
         idempotency_key,
         &permit,
+        &pending_ack,
     )
     .await
     {
@@ -410,6 +426,7 @@ async fn export_traces(
     State(state): State<Arc<GatewayState>>,
     Extension(tenant): Extension<TenantId>,
     Extension(IngestPermitHeld(permit)): Extension<IngestPermitHeld>,
+    Extension(PendingAckHeld(pending_ack)): Extension<PendingAckHeld>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -451,6 +468,7 @@ async fn export_traces(
         now_ns(),
         idempotency_key,
         &permit,
+        &pending_ack,
     )
     .await
     {
@@ -545,13 +563,25 @@ pub(crate) mod tests {
         limits: AdmissionLimits,
         budget: Arc<IngestByteBudget>,
     ) -> Arc<GatewayState> {
+        state_with_pending_ack(store, limits, budget, Arc::new(PendingAckBudget::new(0)))
+    }
+
+    /// [`state_with_store_and_budget`] whose three routers share `pending_ack`
+    /// as their pending strict-ack budget, as the server builds them, so the
+    /// admission layer's `pending_ack_budget` is each router's.
+    pub(crate) fn state_with_pending_ack(
+        store: Arc<dyn ObjectStoreBackend>,
+        limits: AdmissionLimits,
+        budget: Arc<IngestByteBudget>,
+        pending_ack: Arc<PendingAckBudget>,
+    ) -> Arc<GatewayState> {
         let metrics_router = Arc::new(
             IngestRouter::new(
                 IngestConfig::default(),
                 store.clone(),
                 Signal::Metrics,
                 Arc::new(SystemClock),
-                Arc::new(PendingAckBudget::new(0)),
+                pending_ack.clone(),
             )
             .with_budget(budget.clone()),
         );
@@ -560,7 +590,7 @@ pub(crate) mod tests {
                 IngestConfig::default(),
                 store.clone(),
                 Arc::new(SystemClock),
-                Arc::new(PendingAckBudget::new(0)),
+                pending_ack.clone(),
             )
             .with_budget(budget.clone()),
         );
@@ -569,7 +599,7 @@ pub(crate) mod tests {
                 IngestConfig::default(),
                 store.clone(),
                 Arc::new(SystemClock),
-                Arc::new(PendingAckBudget::new(0)),
+                pending_ack.clone(),
             )
             .with_budget(budget.clone()),
         );
@@ -809,6 +839,14 @@ pub(crate) mod tests {
         ))
     }
 
+    /// The pending-ack marker a handler called directly sees: an empty
+    /// handle, so the router takes the permit itself for a strict write.
+    fn no_pending_ack() -> Extension<PendingAckHeld> {
+        Extension(PendingAckHeld(
+            crate::ingest_admission::PendingAckHandle::default(),
+        ))
+    }
+
     pub(crate) fn gzip_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
@@ -838,6 +876,7 @@ pub(crate) mod tests {
             State(state.clone()),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             gzip_headers(),
             Bytes::from(compressed.clone()),
         )
@@ -894,6 +933,7 @@ pub(crate) mod tests {
             State(state),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             gzip_headers(),
             Bytes::from(compressed),
         )
@@ -940,6 +980,7 @@ pub(crate) mod tests {
             State(state),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             gzip_headers(),
             Bytes::from(compressed),
         )
@@ -996,6 +1037,7 @@ pub(crate) mod tests {
             State(state.clone()),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             gzip_headers(),
             Bytes::from(two_member),
         )
@@ -1026,6 +1068,7 @@ pub(crate) mod tests {
             State(state),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             gzip_headers(),
             Bytes::from(body),
         )
@@ -1054,6 +1097,7 @@ pub(crate) mod tests {
                 State(state),
                 admitted_tenant(),
                 no_permit(),
+                no_pending_ack(),
                 headers,
                 Bytes::from(gzip(&encoded)),
             )
@@ -1078,6 +1122,7 @@ pub(crate) mod tests {
             State(state.clone()),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             HeaderMap::new(),
             Bytes::from(encoded.clone()),
         )
@@ -1102,6 +1147,7 @@ pub(crate) mod tests {
             State(state),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             headers,
             Bytes::from(gzip(&encoded)),
         )
@@ -1139,6 +1185,7 @@ pub(crate) mod tests {
             State(state.clone()),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             gzip_headers(),
             not_gzip,
         )
@@ -1176,6 +1223,7 @@ pub(crate) mod tests {
             State(state),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             HeaderMap::new(),
             Bytes::from(encoded),
         )
@@ -1209,6 +1257,7 @@ pub(crate) mod tests {
             State(state),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             HeaderMap::new(),
             Bytes::from(encoded),
         )
@@ -1239,6 +1288,7 @@ pub(crate) mod tests {
             State(state.clone()),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             HeaderMap::new(),
             Bytes::from(compressible_request(1).encode_to_vec()),
         )
@@ -1253,6 +1303,7 @@ pub(crate) mod tests {
             State(state.clone()),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             HeaderMap::new(),
             Bytes::from(minimal_log_request().encode_to_vec()),
         )
@@ -1267,6 +1318,7 @@ pub(crate) mod tests {
             State(state),
             admitted_tenant(),
             no_permit(),
+            no_pending_ack(),
             HeaderMap::new(),
             Bytes::from(minimal_trace_request().encode_to_vec()),
         )

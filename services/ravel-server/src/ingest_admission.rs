@@ -56,8 +56,8 @@
 //! is counted by `ravel_ingest_head_refusal_undrained_total`.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -67,7 +67,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use http_body::{Body as HttpBody, Frame, SizeHint};
-use ravel_ingest::RequestRejection;
+use ravel_ingest::{PendingAckBudget, PendingAckPermit, RequestRejection};
 use ravel_query::http::TenantResolver;
 use ravel_types::TenantId;
 use tokio::sync::Semaphore;
@@ -110,6 +110,50 @@ const OTAP_ARROW_METRICS_PATH: &str =
 /// request ends.
 #[derive(Debug, Clone)]
 pub struct IngestPermitHeld(pub IngestPermitHandle);
+
+/// The handle a strict request's pending strict-ack permit travels in, from
+/// the admission layer that took it at the request head to the handler that
+/// hands it to the router (issue #2805). Every clone shares one slot, for the
+/// reason [`IngestPermitHeld`] carries a handle rather than the permit: the
+/// layer keeps a clone for the request's lifetime, so tonic dropping the
+/// extensions drops a clone and never the permit. The handler takes the
+/// permit out with [`Self::take`] and passes it to the router's
+/// `submit_admitted`, whose `Submitted` then holds it through the ack wait.
+/// A permit nobody took goes back when the last clone drops, at the end of
+/// the request. A buffered request carries an empty handle.
+#[derive(Debug, Clone, Default)]
+pub struct PendingAckHandle(Arc<Mutex<Option<PendingAckPermit>>>);
+
+impl PendingAckHandle {
+    pub fn new(permit: PendingAckPermit) -> Self {
+        PendingAckHandle(Arc::new(Mutex::new(Some(permit))))
+    }
+
+    /// Takes the permit out of the slot, leaving it empty for every clone.
+    pub fn take(&self) -> Option<PendingAckPermit> {
+        self.slot().take()
+    }
+
+    /// Whether the slot still holds the permit.
+    pub fn is_held(&self) -> bool {
+        self.slot().is_some()
+    }
+
+    fn slot(&self) -> MutexGuard<'_, Option<PendingAckPermit>> {
+        // The guarded value is an `Option` with no invariant a panicking
+        // holder could have broken, so a poisoned lock is still usable.
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Marks a request whose admission layer already decided its pending
+/// strict-ack permit at the head: the handle holds the permit for a strict
+/// write and is empty for a buffered one. Present on every request the layer
+/// admitted, so a handler that finds it never takes a second permit.
+#[derive(Debug, Clone)]
+pub struct PendingAckHeld(pub PendingAckHandle);
 
 /// How long an admitted ingest request may take to deliver its whole body,
 /// counted from the moment its head was admitted. A request that has not
@@ -419,13 +463,23 @@ fn expects_continue(headers: &HeaderMap) -> bool {
 }
 
 /// What the axum admission middleware needs from the state of whichever
-/// ingest surface it is wrapping: the shared ceiling and the tenant resolver.
-/// Implemented by `otlp_http::GatewayState` and
+/// ingest surface it is wrapping: the shared ceiling, the tenant resolver,
+/// and the pending strict-ack budget with the surface's own rule for which
+/// requests are strict. Implemented by `otlp_http::GatewayState` and
 /// `remote_write::RemoteWriteState`, the two axum ingest surfaces.
 pub trait IngestAdmissionState: Send + Sync + 'static {
     fn ingest_concurrency(&self) -> &Arc<IngestConcurrencyController>;
 
     fn tenant_resolver(&self) -> &Arc<dyn TenantResolver>;
+
+    /// The one process-wide budget the routers behind this surface draw on,
+    /// the same `Arc` they hold, so a permit taken here is the permit the
+    /// router would have taken.
+    fn pending_ack_budget(&self) -> &Arc<PendingAckBudget>;
+
+    /// Whether the handler behind this surface will write this request
+    /// strictly, decided from its head exactly as the handler decides it.
+    fn strict_write(&self, headers: &HeaderMap) -> bool;
 
     /// Called instead of returning the 401 body directly, for a surface that
     /// keeps its own rejected-request counter. The default does nothing.
@@ -450,6 +504,16 @@ pub trait IngestAdmissionState: Send + Sync + 'static {
 /// is bounded by [`INGEST_BODY_READ_TIMEOUT`]: a body still incomplete then
 /// fails the handler's body extractor, so the handler never runs, and the
 /// request is answered 503 with `Retry-After`.
+///
+/// Once the tenant resolves, a request the surface writes strictly takes its
+/// pending strict-ack permit here too (issue #2805), so a strict write over
+/// `--max-pending-strict-acks` is refused before its body is read or decoded.
+/// The refusal is the one `submit` used to give, the pending-ack 429 counted
+/// by `ravel_ingest_pending_ack_shed_total`, answered after the in-flight
+/// permit is released and through [`refuse_from_head`]. An admitted request
+/// carries the permit to its handler in a [`PendingAckHeld`] handle, empty
+/// for a buffered write, of which this layer keeps a clone until the request
+/// ends.
 pub async fn admit_ingest_request<S: IngestAdmissionState>(
     State(state): State<Arc<S>>,
     request: Request,
@@ -477,14 +541,35 @@ pub async fn admit_ingest_request<S: IngestAdmissionState>(
         }
     };
 
+    let pending_ack = if state.strict_write(request.headers()) {
+        match state.pending_ack_budget().try_acquire() {
+            Some(pending_ack) => PendingAckHandle::new(pending_ack),
+            None => {
+                permit.release();
+                return refuse_from_head(
+                    state.ingest_concurrency().head_refusal_drain(),
+                    request,
+                    pending_ack_shed_response(),
+                    // The tenant resolved just above.
+                    |_| true,
+                )
+                .await;
+            }
+        }
+    } else {
+        PendingAckHandle::default()
+    };
+
     let expired = Arc::new(AtomicBool::new(false));
     let mut request =
         request.map(|body| axum::body::Body::new(DeadlineBody::new(body, expired.clone())));
     let extensions = request.extensions_mut();
     extensions.insert(IngestPermitHeld(permit.clone()));
+    extensions.insert(PendingAckHeld(pending_ack.clone()));
     extensions.insert(tenant);
     let response = next.run(request).await;
     drop(permit);
+    drop(pending_ack);
     if expired.load(Ordering::SeqCst) {
         return body_timeout_response();
     }
@@ -529,18 +614,46 @@ pub(crate) fn grpc_request_tenant<T>(
         .map_err(|_| unauthenticated_status())
 }
 
-/// Resolves the tenant from a gRPC request head exactly as a handler resolves
-/// it from the decoded request's metadata: tonic builds that metadata from
-/// these same headers, and [`crate::otlp_grpc::metadata_to_headers`] is the
-/// same filter the handlers apply.
-fn grpc_head_tenant(
-    resolver: &dyn TenantResolver,
+/// The pending strict-ack handle for a gRPC ingest request, called after
+/// [`admit_grpc_request`] and [`grpc_request_tenant`]: a clone of the one
+/// [`GrpcIngestAdmissionLayer`] decided at the request head, or, on the
+/// direct-call path where no layer ran, decided here the same way. A strict
+/// write (by `resolve_write_mode` over `headers`, the request's metadata)
+/// takes its permit from `budget`; a buffered one gets an empty handle. A
+/// refusal releases `permit`, the request's in-flight handle, and is the
+/// pending-ack `RESOURCE_EXHAUSTED`, before anything is normalized or
+/// submitted. Read it before `request.into_inner()`.
+pub(crate) fn admit_grpc_pending_ack<T>(
+    budget: &PendingAckBudget,
+    policy: crate::config::StrictFlushPolicy,
+    request: &tonic::Request<T>,
     headers: &HeaderMap,
-) -> Result<TenantId, Status> {
+    permit: &IngestPermitHandle,
+) -> Result<PendingAckHandle, Status> {
+    if let Some(PendingAckHeld(handle)) = request.extensions().get::<PendingAckHeld>() {
+        return Ok(handle.clone());
+    }
+    if crate::ingest_mode::resolve_write_mode(headers, policy) == ravel_ingest::WriteMode::Buffered
+    {
+        return Ok(PendingAckHandle::default());
+    }
+    match budget.try_acquire() {
+        Some(pending_ack) => Ok(PendingAckHandle::new(pending_ack)),
+        None => {
+            permit.release();
+            Err(pending_ack_shed_status())
+        }
+    }
+}
+
+/// A gRPC request head's headers as a handler sees them in the decoded
+/// request's metadata: tonic builds that metadata from these same headers,
+/// and [`crate::otlp_grpc::metadata_to_headers`] is the same filter the
+/// handlers apply. The round trip drops binary entries and names that fail to
+/// parse, so the raw head is not the same input.
+fn grpc_head_headers(headers: &HeaderMap) -> HeaderMap {
     let metadata = tonic::metadata::MetadataMap::from_headers(headers.clone());
-    resolver
-        .resolve(&crate::otlp_grpc::metadata_to_headers(&metadata))
-        .map_err(|_| unauthenticated_status())
+    crate::otlp_grpc::metadata_to_headers(&metadata)
 }
 
 /// A [`tower::Layer`] for the tonic ingest listener. When a unary OTLP
@@ -553,6 +666,14 @@ fn grpc_head_tenant(
 ///
 /// The ordering is the HTTP middleware's: the ceiling decides first, so a
 /// request over it is shed even when its credentials are also bad.
+///
+/// After the tenant, a unary export the handler will write strictly (by
+/// `resolve_write_mode` over its metadata under the layer's strict flush
+/// policy) takes its pending strict-ack permit from the routers' shared
+/// budget (issue #2805). Over the bound it is refused with the pending-ack
+/// `RESOURCE_EXHAUSTED` once its in-flight permit is released, before tonic
+/// reads its message. The permit reaches the handler in a [`PendingAckHeld`]
+/// handle of which the layer keeps a clone. The OTAP stream takes none.
 ///
 /// An admitted unary export whose message has not fully arrived within
 /// [`INGEST_BODY_READ_TIMEOUT`] is refused `DEADLINE_EXCEEDED` and its permit
@@ -569,6 +690,8 @@ pub struct GrpcIngestAdmissionLayer {
     controller: Arc<IngestConcurrencyController>,
     resolver: Arc<dyn TenantResolver>,
     services: GrpcIngestServices,
+    pending_ack: Arc<PendingAckBudget>,
+    strict_flush_policy: crate::config::StrictFlushPolicy,
 }
 
 /// Which ingest services the listener behind a [`GrpcIngestAdmissionLayer`]
@@ -582,15 +705,22 @@ pub struct GrpcIngestServices {
 }
 
 impl GrpcIngestAdmissionLayer {
+    /// `pending_ack` is the budget the routers behind the listener hold, and
+    /// `strict_flush_policy` the default their handlers resolve a write's
+    /// mode under.
     pub fn new(
         controller: Arc<IngestConcurrencyController>,
         resolver: Arc<dyn TenantResolver>,
         services: GrpcIngestServices,
+        pending_ack: Arc<PendingAckBudget>,
+        strict_flush_policy: crate::config::StrictFlushPolicy,
     ) -> Self {
         GrpcIngestAdmissionLayer {
             controller,
             resolver,
             services,
+            pending_ack,
+            strict_flush_policy,
         }
     }
 }
@@ -604,6 +734,8 @@ impl<S> Layer<S> for GrpcIngestAdmissionLayer {
             controller: self.controller.clone(),
             resolver: self.resolver.clone(),
             services: self.services,
+            pending_ack: self.pending_ack.clone(),
+            strict_flush_policy: self.strict_flush_policy,
         }
     }
 }
@@ -614,6 +746,8 @@ pub struct GrpcIngestAdmissionService<S> {
     controller: Arc<IngestConcurrencyController>,
     resolver: Arc<dyn TenantResolver>,
     services: GrpcIngestServices,
+    pending_ack: Arc<PendingAckBudget>,
+    strict_flush_policy: crate::config::StrictFlushPolicy,
 }
 
 impl<S> Service<http::Request<TonicBody>> for GrpcIngestAdmissionService<S>
@@ -652,12 +786,13 @@ where
             None
         };
         let (mut parts, body) = req.into_parts();
-        let tenant = match grpc_head_tenant(self.resolver.as_ref(), &parts.headers) {
+        let headers = grpc_head_headers(&parts.headers);
+        let tenant = match self.resolver.resolve(&headers) {
             Ok(tenant) => tenant,
-            Err(status) => {
+            Err(_) => {
                 // The permit, if one was taken, is released here with the
                 // unread body.
-                let response = status.into_http();
+                let response = unauthenticated_status().into_http();
                 return Box::pin(async move { Ok(response) });
             }
         };
@@ -666,17 +801,35 @@ where
         let Some(permit) = permit else {
             return Box::pin(self.inner.call(http::Request::from_parts(parts, body)));
         };
+        let strict = crate::ingest_mode::resolve_write_mode(&headers, self.strict_flush_policy)
+            != ravel_ingest::WriteMode::Buffered;
+        let pending_ack = if strict {
+            match self.pending_ack.try_acquire() {
+                Some(pending_ack) => PendingAckHandle::new(pending_ack),
+                None => {
+                    permit.release();
+                    let response = pending_ack_shed_status().into_http();
+                    return Box::pin(async move { Ok(response) });
+                }
+            }
+        } else {
+            PendingAckHandle::default()
+        };
         parts.extensions.insert(IngestPermitHeld(permit.clone()));
+        parts.extensions.insert(PendingAckHeld(pending_ack.clone()));
         let expired = Arc::new(AtomicBool::new(false));
         let body = TonicBody::new(DeadlineBody::new(body, expired.clone()));
         let future = self.inner.call(http::Request::from_parts(parts, body));
         Box::pin(async move {
-            // This clone keeps the permit through the body read and tonic's
-            // decode, and returns it when this future finishes or is
-            // cancelled if the handler never released it. The handler
-            // releases it through its own clone once its write is enqueued.
+            // These clones keep both permits through the body read and
+            // tonic's decode, and return them when this future finishes or
+            // is cancelled if the handler never released or took them. The
+            // handler releases the in-flight permit through its own clone
+            // once its write is enqueued, and takes the pending-ack permit
+            // out of its clone into the router's submit.
             let response = future.await;
             drop(permit);
+            drop(pending_ack);
             let response = response?;
             // An expired body failed tonic's decode, so the handler never
             // ran; answer with the timeout rather than the decode error.
@@ -746,8 +899,10 @@ pub(crate) const PENDING_ACK_SHED_MESSAGE: &str =
 /// 429 for a strict write refused by the pending strict-acknowledgement bound
 /// (ADR-2793 decision 4): the same status and `Retry-After` as the in-flight
 /// shed, since a held acknowledgement frees as soon as any strict write
-/// resolves. The refusal comes inside `submit`, after decode and before the
-/// byte charge, so no shard was touched and no commit token issued.
+/// resolves. On the OTLP HTTP and Remote Write surfaces [`admit_ingest_request`]
+/// gives it from the request head, before the body is read; a router `submit`
+/// that takes its own permit gives the same refusal before the byte charge.
+/// Either way no shard was touched and no commit token issued.
 pub(crate) fn pending_ack_shed_response() -> Response {
     let mut response = (StatusCode::TOO_MANY_REQUESTS, PENDING_ACK_SHED_MESSAGE).into_response();
     if let Ok(value) = HeaderValue::from_str(&INGEST_CONCURRENCY_RETRY_AFTER_SECONDS.to_string()) {
@@ -853,7 +1008,13 @@ mod tests {
     };
 
     fn layer(controller: &Arc<IngestConcurrencyController>) -> GrpcIngestAdmissionLayer {
-        GrpcIngestAdmissionLayer::new(controller.clone(), resolver(), ALL_INGEST_SERVICES)
+        GrpcIngestAdmissionLayer::new(
+            controller.clone(),
+            resolver(),
+            ALL_INGEST_SERVICES,
+            Arc::new(PendingAckBudget::new(0)),
+            crate::config::StrictFlushPolicy::default(),
+        )
     }
 
     /// The status a gRPC client decodes from a trailers-only refusal.
@@ -1219,6 +1380,8 @@ mod tests {
                 otlp: false,
                 otap: false,
             },
+            Arc::new(PendingAckBudget::new(0)),
+            crate::config::StrictFlushPolicy::default(),
         )
         .layer(inner.clone());
 
@@ -1290,6 +1453,7 @@ mod tests {
     struct HttpTestState {
         controller: Arc<IngestConcurrencyController>,
         resolver: Arc<dyn TenantResolver>,
+        pending_ack: Arc<PendingAckBudget>,
     }
 
     impl IngestAdmissionState for HttpTestState {
@@ -1300,14 +1464,32 @@ mod tests {
         fn tenant_resolver(&self) -> &Arc<dyn TenantResolver> {
             &self.resolver
         }
+
+        fn pending_ack_budget(&self) -> &Arc<PendingAckBudget> {
+            &self.pending_ack
+        }
+
+        fn strict_write(&self, headers: &HeaderMap) -> bool {
+            crate::ingest_mode::resolve_write_mode(headers, crate::config::StrictFlushPolicy::Aged)
+                != ravel_ingest::WriteMode::Buffered
+        }
     }
 
     /// An ingest route shaped like the real ones: the handler takes the body
     /// through the `Bytes` extractor, behind the admission middleware.
     fn http_router(controller: &Arc<IngestConcurrencyController>) -> axum::Router {
+        http_router_with_budget(controller, Arc::new(PendingAckBudget::new(0)))
+    }
+
+    /// [`http_router`] whose strict requests draw on `pending_ack`.
+    fn http_router_with_budget(
+        controller: &Arc<IngestConcurrencyController>,
+        pending_ack: Arc<PendingAckBudget>,
+    ) -> axum::Router {
         let state = Arc::new(HttpTestState {
             controller: controller.clone(),
             resolver: resolver(),
+            pending_ack,
         });
         axum::Router::new()
             .route(
@@ -1670,6 +1852,66 @@ mod tests {
         assert!(started.elapsed() >= HEAD_REFUSAL_DRAIN_TIMEOUT);
         assert_shed(response, true).await;
         assert_eq!(undrained_counts(&controller), [0, 0, 0, 1]);
+    }
+
+    /// A strict upload refused at the head for the pending-ack bound returns
+    /// its in-flight permit before its body is drained: under an in-flight
+    /// ceiling of 1 and a pending-ack budget of 1 whose permit is held, a
+    /// buffered upload sent while the refused body is still being drained is
+    /// admitted, and the refusal is the pending-ack 429 once the drain ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_pending_ack_head_refusal_drains_with_no_in_flight_permit_held() {
+        use tower::ServiceExt;
+
+        let controller = IngestConcurrencyController::shared(IngestConcurrencyLimit::Bounded(1));
+        let budget = Arc::new(PendingAckBudget::new(1));
+        let _held_ack = budget.try_acquire().expect("the only pending-ack permit");
+        let app = http_router_with_budget(&controller, budget.clone());
+
+        let refusing = tokio::spawn(
+            app.clone()
+                .oneshot(http_upload(axum::body::Body::new(StalledBody::new()))),
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            !refusing.is_finished(),
+            "the refused body is still draining"
+        );
+
+        let mut buffered = http_upload(axum::body::Body::from("payload"));
+        buffered.headers_mut().insert(
+            crate::otlp_http::INGEST_MODE_HEADER,
+            HeaderValue::from_static("buffered"),
+        );
+        let response = app.oneshot(buffered).await.expect("infallible router");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "a buffered upload is admitted during the refused body's drain"
+        );
+        assert!(
+            !refusing.is_finished(),
+            "admitted while the drain still ran"
+        );
+
+        let response = refusing
+            .await
+            .expect("refusal task completes")
+            .expect("infallible router");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("refusal body reads");
+        assert_eq!(
+            &body[..],
+            b"process pending strict-acknowledgement limit reached"
+        );
+        assert_eq!(undrained_counts(&controller), [0, 0, 0, 1]);
+        assert_eq!(controller.shed_total(), 0, "nothing was shed in flight");
     }
 
     /// Stands in for tonic's unary codec: reads the request body to its end

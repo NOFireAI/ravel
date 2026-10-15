@@ -58,8 +58,9 @@ pub struct WriteReceipt {
 /// `submit_*` siblings. [`Self::acks`] is the other half of what
 /// [`IngestRouter::write`] used to do in one step.
 ///
-/// Holds the strict-mode pending-ack permit this submit took, released as
-/// [`crate::PendingAckPermit`] states.
+/// Holds the strict-mode pending-ack permit this submit took, or the one a
+/// pre-admitted write brought in through [`IngestRouter::submit_admitted`],
+/// released as [`crate::PendingAckPermit`] states.
 #[must_use = "a submitted strict write is only acknowledged once acks() resolves"]
 pub struct Submitted<'a> {
     router: &'a IngestRouter,
@@ -652,6 +653,11 @@ impl IngestRouter {
     /// `points` to every involved shard and returns as soon as they are
     /// enqueued, without awaiting any strict ack. Call [`Submitted::acks`] on
     /// the result to get what `write` used to return in one step.
+    ///
+    /// A strict submit takes a pending-ack permit before it charges the byte
+    /// budget, so a refused submit holds no charge. A write whose permit was
+    /// already taken at its request head carries it in through
+    /// [`Self::submit_admitted`] instead.
     pub async fn submit(
         &self,
         tenant: TenantId,
@@ -665,6 +671,7 @@ impl IngestRouter {
             Vec::new(),
             mode,
             ack_deadline,
+            None,
         )
         .await
     }
@@ -697,7 +704,7 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<Submitted<'_>, WriteError> {
-        self.submit_points(tenant, points, Vec::new(), mode, ack_deadline)
+        self.submit_points(tenant, points, Vec::new(), mode, ack_deadline, None)
             .await
     }
 
@@ -731,8 +738,35 @@ impl IngestRouter {
         mode: WriteMode,
         ack_deadline: Duration,
     ) -> Result<Submitted<'_>, WriteError> {
-        self.submit_points(tenant, points, exemplars, mode, ack_deadline)
+        self.submit_points(tenant, points, exemplars, mode, ack_deadline, None)
             .await
+    }
+
+    /// [`Self::submit_values_with_exemplars`] for a write whose pending-ack
+    /// permit may already be held: one an admission layer took from
+    /// [`Self::pending_ack_budget`] at the request head (issue #2805). A
+    /// strict write given `Some` keeps that permit through [`Submitted::acks`]
+    /// and takes no second one; given `None` it takes one here, as every
+    /// other submit does. A buffered write takes none and drops any permit
+    /// it is given.
+    pub async fn submit_admitted(
+        &self,
+        tenant: TenantId,
+        points: Vec<IngestPoint>,
+        exemplars: Vec<IngestExemplar>,
+        mode: WriteMode,
+        ack_deadline: Duration,
+        pending_ack: Option<PendingAckPermit>,
+    ) -> Result<Submitted<'_>, WriteError> {
+        self.submit_points(tenant, points, exemplars, mode, ack_deadline, pending_ack)
+            .await
+    }
+
+    /// The pending strict-ack budget this router's strict submits draw on,
+    /// for an admission layer that takes the permit before the request body
+    /// is read and hands it back through [`Self::submit_admitted`].
+    pub fn pending_ack_budget(&self) -> &Arc<PendingAckBudget> {
+        &self.pending_ack_budget
     }
 
     async fn submit_points(
@@ -742,6 +776,7 @@ impl IngestRouter {
         exemplars: Vec<IngestExemplar>,
         mode: WriteMode,
         ack_deadline: Duration,
+        pending_ack: Option<PendingAckPermit>,
     ) -> Result<Submitted<'_>, WriteError> {
         // An empty write never routes and never fails: nothing to flush, so a
         // stale provisioning view is irrelevant to it.
@@ -755,13 +790,16 @@ impl IngestRouter {
         // The router's pending-strict-ack budget (ADR-2793 decision 4): take
         // the permit, strict mode only, before the byte budget below is
         // charged and before any shard is touched, so a submit this refuses
-        // holds no charge and sends nothing.
+        // holds no charge and sends nothing. A pre-admitted write brings its
+        // permit in and never takes a second one.
         let permit = match mode {
-            WriteMode::Strict | WriteMode::StrictArrival => Some(
-                self.pending_ack_budget
+            WriteMode::Strict | WriteMode::StrictArrival => Some(match pending_ack {
+                Some(permit) => permit,
+                None => self
+                    .pending_ack_budget
                     .try_acquire()
                     .ok_or(WriteError::PendingAckLimitReached)?,
-            ),
+            }),
             WriteMode::Buffered => None,
         };
 
