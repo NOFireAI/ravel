@@ -8123,8 +8123,8 @@ mod tests {
             /// (none for stream 2, `abc` for stream 0).
             ///
             /// Flipped: `if valid() { Ok(true) } else { fallback() }` in
-            /// `present_cell_verdict` changed to `Ok(true)` keeps row 0 on
-            /// every layout.
+            /// `present_cell_verdict` changed to `Ok(true)` keeps rows 0 and 3
+            /// as well.
             #[test]
             fn a_byte_match_in_a_cell_that_is_not_utf8_is_not_a_hit() {
                 let rows = s_rows(&[(2, Some(7)), (2, Some(4)), (0, Some(7)), (2, Some(9))]);
@@ -8315,8 +8315,8 @@ mod tests {
             ///
             /// Flipped: writing each lazy column's narrowed dictionary back
             /// over its `DictCache` entry after `filter_block` in
-            /// `decode_block` fails block 1's decode with "dictionary id 1 out
-            /// of range for 1 entries".
+            /// `decode_block` fails block 1's decode with "dictionary id page
+            /// holds 2 bytes, 6 ids at width 0 need 0".
             #[test]
             fn a_survivor_only_dictionary_never_reaches_the_shared_cache() {
                 let recs = (0..24)
