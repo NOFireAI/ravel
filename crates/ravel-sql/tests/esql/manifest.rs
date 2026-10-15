@@ -1,13 +1,17 @@
 //! The binder and executor states the release manifest
 //! (`crates/ravel-esql/manifest/esql-9.5.toml`) records for each entry,
-//! checked against `esql::prepare` and `esql::execute` on the fixture, and
-//! the divergences the manifest cites this file for.
+//! checked against `esql::prepare` and `esql::execute` on the fixture, the
+//! answers it records against the answers Ravel gives, and the divergences
+//! the manifest cites this file for.
 
-use ravel_esql::manifest::{self, Entry, Manifest, State};
-use ravel_sql::esql::{EsqlError, EsqlOutcome, MAX_BOUND_NODES};
+use datafusion::arrow::array::{Array, ArrayRef, TimestampNanosecondArray};
+use datafusion::arrow::util::display::array_value_to_string;
+use ravel_esql::manifest::{self, Answer, Cell, Column, Entry, Expected, Manifest, State};
+use ravel_sql::esql::{EsqlError, EsqlOutcome, EsqlType, MAX_BOUND_NODES, PreparedEsql};
 
 use crate::support::{
-    SHADOWED_MESSAGE, columns, fixture, prepare, rows, run, run_prepared, shadow_fixture,
+    BASE, Fixture, NOW, SECOND, SHADOWED_MESSAGE, columns, fixture, prepare, rows, run,
+    run_prepared, shadow_fixture,
 };
 
 const MANIFEST: &str = include_str!("../../../ravel-esql/manifest/esql-9.5.toml");
@@ -32,14 +36,93 @@ fn is_typed_refusal(error: &EsqlError) -> bool {
     )
 }
 
+/// `ns` nanoseconds after the epoch as the release renders a `date_nanos`.
+fn iso_nanos(ns: i64) -> String {
+    const DAY: i64 = 86_400 * SECOND;
+    let (days, rest) = (ns.div_euclid(DAY), ns.rem_euclid(DAY));
+    // Days to a proleptic Gregorian civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    let secs = rest / SECOND;
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:09}Z",
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60,
+        rest % SECOND
+    )
+}
+
+fn cell(ty: &EsqlType, array: &ArrayRef, row: usize) -> Cell {
+    // A `NullArray` has no validity buffer; its nulls are logical.
+    if array.logical_nulls().is_some_and(|nulls| nulls.is_null(row)) {
+        return Cell::Null;
+    }
+    let text = || array_value_to_string(array, row).expect("cell");
+    match ty {
+        EsqlType::Keyword => Cell::Text(text()),
+        EsqlType::Long => Cell::Long(text().parse().expect("a long")),
+        EsqlType::Double => Cell::Double(text().parse().expect("a double")),
+        EsqlType::Boolean => Cell::Bool(text().parse().expect("a boolean")),
+        EsqlType::DateNanos => Cell::Text(iso_nanos(
+            array
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("nanosecond timestamps")
+                .value(row),
+        )),
+        EsqlType::Null => Cell::Null,
+    }
+}
+
+/// Ravel's answer in the manifest's terms. The outcome has no field that
+/// carries a warning (`an_overflow_gives_null_without_a_warning` destructures
+/// it), so the warnings are always empty.
+fn answer(outcome: &EsqlOutcome) -> Answer {
+    let mut rows = Vec::new();
+    for batch in outcome.output().batches() {
+        for row in 0..batch.num_rows() {
+            rows.push(
+                outcome
+                    .columns
+                    .iter()
+                    .zip(batch.columns())
+                    .map(|(column, array)| cell(&column.ty, array, row))
+                    .collect(),
+            );
+        }
+    }
+    Answer {
+        columns: outcome
+            .columns
+            .iter()
+            .map(|column| Column {
+                name: column.name.clone(),
+                ty: column.ty.name().to_string(),
+            })
+            .collect(),
+        rows,
+        warnings: Vec::new(),
+    }
+}
+
 /// Every entry marked binder-supported prepares, and every entry marked
-/// executor-supported also runs on the fixture.
+/// executor-supported runs on the fixture and gives the answer the manifest
+/// records for the release, column names, types, rows and warnings, unless
+/// it names a divergence, in which case its answer must differ.
 #[tokio::test]
-async fn every_executor_supported_entry_runs() {
+async fn every_executor_supported_entry_gives_the_release_answer() {
     let manifest = load();
     let fixture = fixture().await;
     let mut wrong = Vec::new();
-    let mut ran = 0;
+    let (mut compatible, mut divergent) = (0, 0);
     for entry in &manifest.entries {
         if entry.binder != State::Supported {
             continue;
@@ -57,73 +140,141 @@ async fn every_executor_supported_entry_runs() {
         if entry.executor != State::Supported {
             continue;
         }
-        match run_prepared(&fixture, &prepared).await {
-            Ok(_) => ran += 1,
-            Err(error) => wrong.push(format!(
-                "{} is executor-supported but does not run: {error:?}",
+        let outcome = match run_prepared(&fixture, &prepared).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                wrong.push(format!(
+                    "{} is executor-supported but does not run: {error:?}",
+                    describe(entry)
+                ));
+                continue;
+            }
+        };
+        let Some(expected) = &entry.expected else {
+            wrong.push(format!("{} records no answer", describe(entry)));
+            continue;
+        };
+        let actual = answer(&outcome);
+        match (expected.compare(&actual), &entry.divergence) {
+            (Ok(()), None) => compatible += 1,
+            (Err(_), Some(_)) => divergent += 1,
+            (Err(difference), None) => wrong.push(format!(
+                "{} differs from the release with no named divergence: {difference}",
+                describe(entry)
+            )),
+            (Ok(()), Some(id)) => wrong.push(format!(
+                "{} names divergence {id:?} but gives the release's answer",
                 describe(entry)
             )),
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
-    assert_eq!(ran, manifest.execution_compatibility().numerator);
+    assert_eq!(compatible, manifest.execution_compatibility().numerator);
+    assert_eq!(divergent, manifest.divergent().numerator);
 }
 
-/// Every entry marked refused at a layer is refused there with a typed
-/// error, and every entry marked binder-absent fails to parse.
-#[tokio::test]
-async fn every_refused_entry_is_refused_with_a_typed_error() {
-    let manifest = load();
-    let fixture = fixture().await;
+/// The text of `example` from 1-based `line` and `column` on.
+fn text_at(example: &str, line: usize, column: usize) -> String {
+    example
+        .lines()
+        .nth(line.saturating_sub(1))
+        .map(|text| text.chars().skip(column.saturating_sub(1)).collect())
+        .unwrap_or_default()
+}
+
+/// Whether `prepared` is the binder's refusal of `entry`: an `Unsupported`
+/// error naming the entry's construct, or, for an entry refused through an
+/// earlier construct, naming that construct. A message that names no
+/// construct ("this expression") must point at text starting with it.
+fn binder_refusal(
+    manifest: &Manifest,
+    entry: &Entry,
+    prepared: &Result<PreparedEsql, EsqlError>,
+) -> Result<(), String> {
+    let marker = match &entry.refused_by {
+        Some(by) => manifest
+            .released()
+            .find(|e| &e.name == by)
+            .map(Entry::refusal_marker)
+            .ok_or_else(|| format!("refused_by {by:?} names no released entry"))?,
+        None => entry.refusal_marker(),
+    };
+    match prepared {
+        Err(EsqlError::Unsupported { name, line, column }) => {
+            let positional = name.starts_with("this ");
+            if name.contains(&marker)
+                || (positional && text_at(&entry.example, *line, *column).starts_with(&marker))
+            {
+                Ok(())
+            } else {
+                Err(format!(
+                    "the refusal names {name:?} at {line}:{column}, not {marker:?}"
+                ))
+            }
+        }
+        other => Err(format!(
+            "prepare gives {:?}, not an Unsupported error naming {marker:?}",
+            other.as_ref().map(|_| "a statement")
+        )),
+    }
+}
+
+/// Check every entry not marked executor-supported against the layer its
+/// states say refuses it, returning how many hold and what does not.
+async fn check_refusals(manifest: &Manifest, fixture: &Fixture) -> (usize, Vec<String>) {
     let mut wrong = Vec::new();
     let mut refused = 0;
     for entry in &manifest.entries {
+        if entry.executor == State::Supported {
+            continue;
+        }
         let prepared = prepare(&entry.example);
-        let mut found = format!(
-            "prepare gives {:?}",
-            prepared.as_ref().map(|_| "a statement")
-        );
-        let holds = match (entry.parser, entry.binder, &prepared) {
-            (State::Refused, _, Err(EsqlError::Parse(error))) => {
-                matches!(error, ravel_esql::Error::UnsupportedSyntax { .. })
-            }
-            (State::Supported, State::Absent, _) => false,
-            (_, State::Absent, Err(EsqlError::Parse(_))) => true,
-            (State::Supported, State::Refused, Err(error)) => {
-                matches!(
-                    error,
-                    EsqlError::Unsupported { .. } | EsqlError::Verification { .. }
-                )
-            }
-            (State::Supported, State::Supported, Ok(prepared))
-                if entry.executor == State::Refused =>
+        let shown = || format!("prepare gives {:?}", prepared.as_ref().map(|_| "a statement"));
+        let verdict = match (entry.parser, entry.binder, &prepared) {
+            (State::Refused, _, Err(EsqlError::Parse(error)))
+                if matches!(error, ravel_esql::Error::UnsupportedSyntax { .. }) =>
             {
-                match run_prepared(&fixture, prepared).await {
-                    Err(error) => {
-                        found = format!("the run fails with {error:?}");
-                        is_typed_refusal(&error)
+                Ok(())
+            }
+            (State::Absent, _, Err(EsqlError::Parse(error)))
+                if !matches!(error, ravel_esql::Error::UnsupportedSyntax { .. }) =>
+            {
+                Ok(())
+            }
+            (State::Supported, State::Refused, _) => binder_refusal(manifest, entry, &prepared),
+            (State::Supported, State::Supported, Ok(prepared)) => {
+                match run_prepared(fixture, prepared).await {
+                    Err(error) if is_typed_refusal(&error) == (entry.executor == State::Refused) => {
+                        Ok(())
                     }
-                    Ok(_) => {
-                        found = "the statement prepares and runs".to_string();
-                        false
-                    }
+                    Err(error) => Err(format!("the run fails with {error:?}")),
+                    Ok(_) => Err("the statement prepares and runs".to_string()),
                 }
             }
-            (_, State::Supported, Ok(_)) if entry.executor == State::Supported => continue,
-            _ => false,
+            _ => Err(shown()),
         };
-        if holds {
-            refused += 1;
-        } else {
-            wrong.push(format!(
+        match verdict {
+            Ok(()) => refused += 1,
+            Err(found) => wrong.push(format!(
                 "{} is marked parser = {}, binder = {}, executor = {} but {found}",
                 describe(entry),
                 entry.parser,
                 entry.binder,
                 entry.executor,
-            ));
+            )),
         }
     }
+    (refused, wrong)
+}
+
+/// Every entry marked refused at a layer is refused there with a typed
+/// error: by the parser with `UnsupportedSyntax`, by the binder with an
+/// `Unsupported` error naming the entry's own construct (or the construct
+/// its refused_by field names). A verification error never counts.
+#[tokio::test]
+async fn every_refused_entry_is_refused_with_a_typed_error() {
+    let manifest = load();
+    let (refused, wrong) = check_refusals(&manifest, &fixture().await).await;
     assert!(wrong.is_empty(), "{wrong:#?}");
     assert_eq!(
         refused,
@@ -132,6 +283,132 @@ async fn every_refused_entry_is_refused_with_a_typed_error() {
             .iter()
             .filter(|e| e.executor != State::Supported)
             .count()
+    );
+    assert!(manifest.entries.iter().any(|e| e.refused_by.is_some()));
+}
+
+/// A manifest of one released entry with the given states and example.
+fn one_entry(example: &str, parser: &str, binder: &str, executor: &str) -> Manifest {
+    manifest::load(&format!(
+        r#"
+[release]
+line = "9.5"
+binary = "9.5.5"
+reconciled = false
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "X"
+preview = false
+example = '{example}'
+parser = "{parser}"
+binder = "{binder}"
+executor = "{executor}"
+evidence = "a.rs::t"
+"#
+    ))
+    .expect("the test manifest loads")
+}
+
+/// The arms the real manifest does not reach: a parser-absent entry holds
+/// only when its example fails to parse without a typed refusal, and an
+/// entry the executor is said to refuse fails the check when it runs.
+#[tokio::test]
+async fn the_refusal_check_drives_the_arms_the_manifest_does_not_reach() {
+    let fixture = fixture().await;
+    let check = |manifest: Manifest| {
+        let fixture = &fixture;
+        async move { check_refusals(&manifest, fixture).await }
+    };
+
+    let (refused, wrong) = check(one_entry("FROM logs |", "absent", "absent", "absent")).await;
+    assert_eq!((refused, wrong.len()), (1, 0), "{wrong:#?}");
+
+    let (refused, wrong) = check(one_entry("ROW a = 1", "absent", "absent", "absent")).await;
+    assert_eq!(refused, 0);
+    assert!(wrong[0].contains("prepare gives Ok(\"a statement\")"), "{wrong:#?}");
+
+    let (refused, wrong) =
+        check(one_entry("ROW a = 1", "supported", "supported", "refused")).await;
+    assert_eq!(refused, 0);
+    assert!(wrong[0].ends_with("the statement prepares and runs"), "{wrong:#?}");
+
+    let (refused, wrong) =
+        check(one_entry("ROW a = 1", "supported", "supported", "absent")).await;
+    assert_eq!(refused, 0);
+    assert!(wrong[0].ends_with("the statement prepares and runs"), "{wrong:#?}");
+}
+
+/// A binder refusal must be an `Unsupported` error naming the construct: a
+/// verification error, or an `Unsupported` error naming another construct,
+/// does not count.
+#[tokio::test]
+async fn a_binder_refusal_must_name_the_construct() {
+    let fixture = fixture().await;
+    let (refused, wrong) = check_refusals(
+        &one_entry("FROM logs | WHERE nope(1) > 0", "supported", "refused", "refused"),
+        &fixture,
+    )
+    .await;
+    assert_eq!(refused, 0);
+    assert!(wrong[0].contains("not \"[X]\""), "{wrong:#?}");
+
+    let (refused, wrong) = check_refusals(
+        &one_entry("ROW a = 1 hour", "supported", "refused", "refused"),
+        &fixture,
+    )
+    .await;
+    assert_eq!(refused, 0);
+    assert!(wrong[0].contains("Verification"), "{wrong:#?}");
+}
+
+#[test]
+fn a_timestamp_renders_with_nine_fraction_digits() {
+    assert_eq!(iso_nanos(BASE), "2023-11-14T22:13:00.000000000Z");
+    assert_eq!(iso_nanos(NOW + 7), "2023-11-14T22:23:00.000000007Z");
+    assert_eq!(iso_nanos(0), "1970-01-01T00:00:00.000000000Z");
+    assert_eq!(iso_nanos(-1), "1969-12-31T23:59:59.999999999Z");
+    assert_eq!(iso_nanos(951_782_400 * SECOND), "2000-02-29T00:00:00.000000000Z");
+}
+
+/// FROM without KEEP lists the native columns in a fixed order, not sorted
+/// by name as the release lists mapped fields.
+#[tokio::test]
+async fn from_lists_the_native_columns_in_a_fixed_order() {
+    let outcome = run(&fixture().await, "FROM logs").await.expect("runs");
+    let names: Vec<String> = columns(&outcome).into_iter().map(|(name, _)| name).collect();
+    assert_eq!(
+        names,
+        [
+            "@timestamp",
+            "observed_ts",
+            "severity_num",
+            "severity_text",
+            "message",
+            "trace_id",
+            "span_id",
+            "flags",
+            "dur",
+            "region",
+        ]
+    );
+    let mut sorted = names.clone();
+    sorted.sort();
+    assert_ne!(names, sorted);
+}
+
+/// NOW() is a date_nanos at the query clock, where the release gives a date.
+#[tokio::test]
+async fn now_is_typed_date_nanos() {
+    let outcome = run(&fixture().await, "ROW t = NOW()").await.expect("runs");
+    assert_eq!(
+        columns(&outcome),
+        vec![("t".to_string(), "date_nanos".to_string())]
+    );
+    assert_eq!(
+        answer(&outcome).rows,
+        vec![vec![Cell::Text(iso_nanos(NOW))]]
     );
 }
 
@@ -154,7 +431,7 @@ async fn timestamp_and_message_shadow_attributes_of_the_same_name() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], "a");
     assert_ne!(rows[0][0], SHADOWED_MESSAGE);
-    assert_ne!(rows[0][1], "not a time");
+    assert_eq!(rows[0][1], "2023-11-14T22:13:00");
 }
 
 /// The manifest records no field-count divergence: one ROW or EVAL command
@@ -197,21 +474,48 @@ async fn an_integer_literal_is_typed_long() {
     assert_eq!(rows(&outcome), vec![vec!["1"]]);
 }
 
-/// An overflow and a division by zero read null, and the outcome has no
-/// field that could carry a warning about them.
+/// An overflow, a division by zero and a remainder by zero read null, and
+/// the outcome has no field that could carry a warning about them.
 #[tokio::test]
 async fn an_overflow_gives_null_without_a_warning() {
     let outcome = run(
         &fixture().await,
-        "ROW a = 9223372036854775807 + 1, b = 5 / 0",
+        "ROW a = 9223372036854775807 + 1, b = 5 / 0, c = 5 % 0",
     )
     .await
     .expect("runs");
-    assert_eq!(rows(&outcome), vec![vec!["null", "null"]]);
+    assert_eq!(rows(&outcome), vec![vec!["null", "null", "null"]]);
     let EsqlOutcome {
         columns: _,
         run: _,
         clamped_limit,
     } = outcome;
     assert_eq!(clamped_limit, None);
+}
+
+/// The expected answers compare cell by cell, types included: a row value or
+/// a column type that differs from Ravel's answer is a difference.
+#[tokio::test]
+async fn the_comparison_reports_a_changed_value_and_a_changed_type() {
+    let manifest = load();
+    let entry = manifest
+        .released()
+        .find(|e| e.name == "SUM")
+        .expect("SUM");
+    let outcome = run(&fixture().await, &entry.example).await.expect("runs");
+    let actual = answer(&outcome);
+    let Some(Expected::Answer { answer: release, order }) = entry.expected.clone() else {
+        panic!("SUM records an answer");
+    };
+    let with = |answer: Answer| Expected::Answer {
+        answer,
+        order: order.clone(),
+    };
+    assert_eq!(with(release.clone()).compare(&actual), Ok(()));
+    let mut value = release.clone();
+    value.rows[0][0] = Cell::Long(44);
+    assert!(with(value).compare(&actual).is_err());
+    let mut ty = release;
+    ty.columns[0].ty = "double".to_string();
+    assert!(with(ty).compare(&actual).is_err());
 }

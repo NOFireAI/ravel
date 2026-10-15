@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-use ravel_esql::manifest::{self, Kind, Manifest, Section, State};
+use ravel_esql::manifest::{self, Entry, Expected, Grammar, Kind, Manifest, Section, State};
 use ravel_esql::{Error, Limits, parse};
 
 fn crate_dir() -> &'static Path {
@@ -82,6 +82,38 @@ fn a_full_toml_parser_reads_the_same_entries() {
             assert_eq!(field("evidence"), Some(entry.evidence.as_str()));
             assert_eq!(field("family"), entry.family.map(|f| f.as_str()));
             assert_eq!(field("alias_of"), entry.alias_of.as_deref());
+            assert_eq!(field("grammar"), Some(entry.grammar.as_str()));
+            assert_eq!(field("divergence"), entry.divergence.as_deref());
+            assert_eq!(field("refusal"), entry.refusal.as_deref());
+            assert_eq!(field("refused_by"), entry.refused_by.as_deref());
+            match &entry.expected {
+                None => {
+                    for key in ["columns", "rows", "order", "warnings", "release_error"] {
+                        assert!(raw.get(key).is_none(), "{} {key}", entry.name);
+                    }
+                }
+                Some(Expected::Error(message)) => {
+                    assert_eq!(field("release_error"), Some(message.as_str()));
+                }
+                Some(Expected::Answer { answer, order }) => {
+                    let strings = |key: &str| -> Vec<&str> {
+                        raw.get(key)
+                            .and_then(toml::Value::as_array)
+                            .map(|a| a.iter().filter_map(toml::Value::as_str).collect())
+                            .unwrap_or_else(|| panic!("{} {key}", entry.name))
+                    };
+                    let columns: Vec<String> = answer
+                        .columns
+                        .iter()
+                        .map(|c| format!("{}:{}", c.name, c.ty))
+                        .collect();
+                    assert_eq!(strings("columns"), columns, "{}", entry.name);
+                    assert_eq!(strings("rows").len(), answer.rows.len(), "{}", entry.name);
+                    assert_eq!(strings("warnings"), answer.warnings, "{}", entry.name);
+                    let order_text = order.to_string();
+                    assert_eq!(field("order"), Some(order_text.as_str()));
+                }
+            }
             assert_eq!(
                 raw.get("preview").and_then(toml::Value::as_bool),
                 Some(entry.preview)
@@ -107,6 +139,17 @@ fn a_full_toml_parser_reads_the_same_entries() {
     ] {
         assert_eq!(table[key].as_array().map(Vec::len), Some(len), "{key}");
     }
+    let raw = table["divergence"].as_array().expect("array of tables");
+    for (raw, divergence) in raw.iter().zip(&manifest.divergences) {
+        let field = |name: &str| raw.get(name).and_then(toml::Value::as_str);
+        assert_eq!(field("id"), Some(divergence.id.as_str()));
+        assert_eq!(field("name"), Some(divergence.name.as_str()));
+        assert_eq!(field("no_entry"), divergence.no_entry.as_deref());
+    }
+    assert_eq!(
+        table["release"].get("binary").and_then(toml::Value::as_str),
+        Some(manifest.release_binary.as_str())
+    );
 }
 
 /// Every `path::test` the manifest cites is a test function in that file.
@@ -161,6 +204,105 @@ fn every_manifest_entry_marked_parsed_has_an_example_that_parses() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Why the parsed tree of `example` does not fit `grammar` for an entry
+/// named `name`, or `None` when it does. An own-grammar entry must not reach
+/// the tree as a call or a cast of its own name, which is what the generic
+/// rules make of any name; a call or cast entry must reach it that way; a
+/// field entry as neither.
+fn shape_error(name: &str, kind: Kind, grammar: Grammar, example: &str) -> Option<String> {
+    let tree = match parse(example, &Limits::default()) {
+        Ok(tree) => format!("{tree:?}").to_ascii_lowercase(),
+        Err(error) => return Some(format!("does not parse: {error:?}")),
+    };
+    let lower = name.to_ascii_lowercase();
+    let call_of_name = tree.contains(&format!("call(call {{ name: \"{lower}\""));
+    let cast_to_name = tree.contains(&format!("type_name: \"{lower}\""));
+    let any_call = tree.contains("call(call {");
+    let any_cast = tree.contains("cast(cast {");
+    let fits = match grammar {
+        Grammar::Own => !call_of_name && !cast_to_name,
+        Grammar::Call if matches!(kind, Kind::Function | Kind::Alias) => call_of_name,
+        Grammar::Call => any_call,
+        Grammar::Cast => any_cast,
+        Grammar::Field => !any_call && !any_cast,
+    };
+    (!fits).then(|| format!("is classified {grammar} but parses as {tree}"))
+}
+
+/// Every released entry whose example parses has the parsed shape its
+/// grammar classification claims.
+#[test]
+fn every_parsed_entry_has_the_shape_its_grammar_claims() {
+    let manifest = load();
+    let mut wrong = Vec::new();
+    let mut checked = 0;
+    for entry in manifest.released().filter(|e| e.parser == State::Supported) {
+        checked += 1;
+        if let Some(error) = shape_error(&entry.name, entry.kind, entry.grammar, &entry.example) {
+            wrong.push(format!("{} {:?} {error}", entry.kind, entry.name));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(
+        checked,
+        manifest.syntax_coverage().numerator + manifest.generic_rule_coverage().numerator
+    );
+}
+
+/// The generic rules accept names no release defines, which is why an entry
+/// they accept is not counted as syntax coverage, and the shape check tells
+/// such an entry apart from one with a rule of its own.
+#[test]
+fn a_made_up_name_parses_through_the_generic_rules() {
+    let call = "ROW a = NOT_A_FUNCTION(1)";
+    let cast = "ROW a = 1::not_a_type";
+    assert_eq!(
+        shape_error("NOT_A_FUNCTION", Kind::Function, Grammar::Call, call),
+        None
+    );
+    assert_eq!(
+        shape_error("not_a_type", Kind::Type, Grammar::Cast, cast),
+        None
+    );
+    assert!(shape_error("NOT_A_FUNCTION", Kind::Function, Grammar::Own, call).is_some());
+    assert!(shape_error("not_a_type", Kind::Type, Grammar::Own, cast).is_some());
+    assert!(shape_error("not_a_type", Kind::Type, Grammar::Field, cast).is_some());
+    let field = "FROM logs | KEEP not_a_field";
+    assert_eq!(
+        shape_error("not_a_field", Kind::Type, Grammar::Field, field),
+        None
+    );
+    assert!(shape_error("not_a_field", Kind::Type, Grammar::Cast, field).is_some());
+}
+
+/// Entries whose example cannot reach their form without an earlier refused
+/// construct are listed in the report under their own heading.
+#[test]
+fn the_report_lists_the_entries_refused_through_an_earlier_construct() {
+    let manifest = load();
+    let rendered = manifest.render_report();
+    let (_, section) = rendered
+        .split_once("\n## Refused through an earlier construct\n")
+        .expect("the section");
+    let section = section.split("\n## ").next().unwrap_or_default();
+    let listed: Vec<&Entry> = manifest
+        .released()
+        .filter(|e| e.refused_by.is_some())
+        .collect();
+    assert!(!listed.is_empty());
+    for entry in listed {
+        let by = entry.refused_by.as_deref().unwrap_or_default();
+        assert!(
+            section.contains(&format!(
+                "- `{}` ({}): refused at `{by}`\n",
+                entry.name, entry.kind
+            )),
+            "{} refused by {by} is not listed",
+            entry.name
+        );
+    }
+}
+
 #[test]
 fn every_negative_statement_is_refused_by_the_parser() {
     let manifest = load();
@@ -178,22 +320,52 @@ fn every_negative_statement_is_refused_by_the_parser() {
 fn the_figures_count_released_entries_only() {
     let manifest = load();
     let released = manifest.released().count();
-    assert_eq!(manifest.syntax_coverage().denominator, released);
+    let own = manifest
+        .released()
+        .filter(|e| e.grammar == Grammar::Own)
+        .count();
+    assert_eq!(manifest.syntax_coverage().denominator, own);
+    assert_eq!(manifest.generic_rule_coverage().denominator, released - own);
     assert_eq!(manifest.execution_compatibility().denominator, released);
-    assert_eq!(
-        manifest.syntax_coverage().numerator,
+    assert_eq!(manifest.divergent().denominator, released);
+    assert_eq!(manifest.ran().denominator, released);
+    let parsed = |grammar_is_own: bool| {
         manifest
             .released()
+            .filter(|e| (e.grammar == Grammar::Own) == grammar_is_own)
             .filter(|e| e.parser == State::Supported)
             .count()
-    );
-    assert_eq!(
-        manifest.execution_compatibility().numerator,
-        manifest
-            .released()
-            .filter(|e| e.executor == State::Supported)
-            .count()
-    );
+    };
+    assert_eq!(manifest.syntax_coverage().numerator, parsed(true));
+    assert_eq!(manifest.generic_rule_coverage().numerator, parsed(false));
+    let ran = manifest
+        .released()
+        .filter(|e| e.executor == State::Supported)
+        .count();
+    let divergent = manifest
+        .released()
+        .filter(|e| e.executor == State::Supported && e.divergence.is_some())
+        .count();
+    assert_eq!(manifest.ran().numerator, ran);
+    assert_eq!(manifest.divergent().numerator, divergent);
+    assert_eq!(manifest.execution_compatibility().numerator, ran - divergent);
+    assert!(divergent > 0 && divergent < ran);
+    let rendered = manifest.render_report();
+    for line in [
+        format!(
+            "| Execution compatibility | {}/{released} |",
+            ran - divergent
+        ),
+        format!("Ran and diverged: {divergent}/{released},"),
+        format!("Ran: {ran}/{released},"),
+        format!(
+            "Accepted through a generic rule: {}/{},",
+            parsed(false),
+            released - own
+        ),
+    ] {
+        assert!(rendered.contains(&line), "the report lacks {line:?}");
+    }
     let transport = manifest.transport_compatibility();
     assert_eq!(transport.numerator, 0);
     assert_eq!(transport.denominator, manifest.transport.len());
@@ -236,8 +408,12 @@ fn an_unimplemented_valid_entry_lowers_execution_compatibility() {
     let entry = flipped
         .entries
         .iter_mut()
-        .find(|e| e.section == Section::Released && e.executor == State::Supported)
-        .expect("an executor-supported entry");
+        .find(|e| {
+            e.section == Section::Released
+                && e.executor == State::Supported
+                && e.divergence.is_none()
+        })
+        .expect("a compatible entry");
     entry.binder = State::Refused;
     entry.executor = State::Refused;
     assert_eq!(
@@ -331,6 +507,7 @@ fn the_report_names_the_release_line_and_no_date() {
         "February",
         "March",
         "April",
+        "May",
         "June",
         "July",
         "August",
