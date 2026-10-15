@@ -5,23 +5,27 @@
 //! 1. Parse and validate (security invariant 1, crate::validate) -- before
 //!    anything else, so a rejected statement costs no catalog LIST and
 //!    builds no plan.
-//! 2. Resolve the snapshot exactly once, through
-//!    `catalog.resolve_pruned(&tenant_hash, signal, window, min_tokens,
-//!    now_ns, name_filter)`, with `now_ns` threaded in from the caller's
-//!    injected clock (no `SystemTime::now()` in library logic).
-//!    `signal` is chosen from the query's own `FROM` clause
-//!    ([`SqlExecutor::statement_tables`], ADR-0033, extended to `spans` by
-//!    ADR-0045 decision 5 and to `alerts`/`audit` by ADR-1101 decision 1):
-//!    `Signal::Logs` for the `logs` table, `Signal::Spans` for `spans`,
-//!    `Signal::Alerts` for `alerts`, `Signal::Audit` for `audit`, otherwise
-//!    `Signal::Metrics`. A query referencing two of the five tables is rejected
-//!    here, before the LIST, because v1 admits one signal per query
-//!    (decision C). `name_filter` is the equality
-//!    `__name__` value derived from the query's pushed-down predicates
-//!    ([`SqlExecutor::pushed_down_name_filter`]), so a metrics query
-//!    naming one metric prunes by postings exactly as PromQL does; a logs
-//!    query or one with no such predicate resolves unpruned, identical to the
-//!    former plain `resolve`.
+//! 2. Resolve one snapshot per signal table the statement names, each once per
+//!    attempt, through `catalog.resolve_pruned(&tenant_hash, signal, window,
+//!    min_tokens, now_ns, name_filter)`, every lane at the same `now_ns` and
+//!    window, with `now_ns` threaded in from the caller's injected clock (no
+//!    `SystemTime::now()` in library logic). The signals are read off the
+//!    query's own `FROM` clause ([`SqlExecutor::statement_tables`], ADR-0033,
+//!    extended to `spans` by ADR-0045 decision 5 and to `alerts`/`audit` by
+//!    ADR-1101 decision 1): `Signal::Metrics` for `samples`, `Signal::Logs`
+//!    for `logs`, `Signal::Spans` for `spans`, `Signal::Alerts` for `alerts`,
+//!    `Signal::Audit` for `audit`, in that order, and `Signal::Metrics` alone
+//!    for a statement naming none. Every public entry point still rejects a
+//!    query referencing two of the five tables with
+//!    [`SqlError::CrossSignalQuery`] before any catalog request, because v1
+//!    admits one signal per query (decision C); the per-signal resolve is
+//!    reachable only from a test executor. `name_filter` is the equality
+//!    `__name__` value derived from the `samples` scans' pushed-down
+//!    predicates ([`SqlExecutor::pushed_down_name_filter`]) and is passed to
+//!    the metrics resolve alone, so a metrics query naming one metric prunes
+//!    by postings exactly as PromQL does; any other signal, or a query with
+//!    no such predicate, resolves unpruned, identical to the former plain
+//!    `resolve`.
 //!
 //!    A statement whose only tables are Parquet tables of the caller's tenant
 //!    (ADR-2040) resolves no catalog: [`SqlExecutor::resolve_parquet_target`]
@@ -29,8 +33,8 @@
 //!    instead, and refuses a file outside every grant. A Parquet table beside
 //!    a signal table is [`SqlError::CrossSignalQuery`].
 //! 3. Build the fresh single-tenant `SessionContext` around the owned
-//!    `Snapshot`, registering the one table the query targets, or its Parquet
-//!    tables (security invariant 2, crate::session).
+//!    snapshots, registering one table per resolved signal, or the query's
+//!    Parquet tables (security invariant 2, crate::session).
 //! 4. Plan, then execute, draining the stream under the wall deadline.
 //!
 //! # Snapshot retry contract
@@ -40,8 +44,9 @@
 //! that means:
 //!
 //! - A store `NotFound` raised **before the first batch has been emitted**
-//!   re-resolves with the *same* `now_ns` and the *same* `min_tokens`,
-//!   rebuilds the whole session (new pool, new provider, new context), and
+//!   re-resolves every signal the statement names with the *same* `now_ns`
+//!   and the *same* `min_tokens`, rebuilds the whole session (new pool, new
+//!   providers, new context), and
 //!   re-executes the query exactly once. A second `NotFound` fails
 //!   [`SqlError::SnapshotInvalidated`].
 //! - A store `NotFound` raised **after** at least one batch has been emitted
@@ -75,7 +80,7 @@
 //! never returned (docs/query-engine.md "Budgets").
 
 use std::borrow::Cow;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -103,7 +108,7 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
-use ravel_catalog::{Catalog, Snapshot};
+use ravel_catalog::{Catalog, SegmentOrigins, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
@@ -111,9 +116,9 @@ use ravel_promql::{LabelMatcher, MatchOp};
 use ravel_query::erasure::{ErasurePredicate, snapshot_pending_erasure_predicates};
 use ravel_query::io_shape::{IoShapeCounts, PlanClass, QueryIoShape, count_unfolded_segments};
 use ravel_query::{
-    LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError, RequestBudget,
-    RequestBudgets, SegmentAdmission, SegmentFetcher, admit, request_budget_exceeded,
-    resolved_fold_lag,
+    EngineConfig, LogSegmentFetcher, PhaseAccounting, PhaseAccountingSnapshot, QueryError,
+    RequestBudget, RequestBudgets, SegmentAdmission, SegmentFetcher, admit,
+    request_budget_exceeded, resolved_fold_lag,
 };
 use ravel_types::accounting::{
     AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
@@ -138,8 +143,8 @@ use crate::parquet::{
 use crate::provider::RavelTableProvider;
 use crate::pushdown::extract;
 use crate::session::{
-    ALERTS_TABLE, AUDIT_TABLE, LOGS_TABLE, REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SPANS_TABLE,
-    SessionTable, SpillDecision, build_session,
+    LOGS_TABLE, REWRITE_ONLY_AGGREGATES, SAMPLES_TABLE, SessionTable, SpillDecision,
+    build_session_with_tables,
 };
 use crate::spans_fetcher::SpanSegmentFetcher;
 use crate::spans_provider::SpansTableProvider;
@@ -194,11 +199,66 @@ impl TargetSignal {
 
 /// The base tables one statement names, split the way the target is chosen.
 pub(crate) struct StatementTables {
-    /// The one signal table named, if any.
-    pub(crate) signal: Option<TargetSignal>,
+    /// The signal tables named, each once, in [`SIGNAL_LANE_ORDER`].
+    pub(crate) signals: Vec<TargetSignal>,
     /// Every other base table name: Parquet tables, or names that are no
     /// table at all.
     pub(crate) others: BTreeSet<String>,
+}
+
+/// The order a statement's signal tables are resolved, planned and reported
+/// in (ADR-2904 decision 2).
+pub(crate) const SIGNAL_LANE_ORDER: [TargetSignal; 5] = [
+    TargetSignal::Metrics,
+    TargetSignal::Logs,
+    TargetSignal::Spans,
+    TargetSignal::Alerts,
+    TargetSignal::Audit,
+];
+
+impl StatementTables {
+    /// A statement naming `signal` and nothing else.
+    pub(crate) fn one(signal: Option<TargetSignal>) -> Self {
+        StatementTables {
+            signals: signal.into_iter().collect(),
+            others: BTreeSet::new(),
+        }
+    }
+
+    /// The signal snapshots a catalog resolve of this statement reads: one
+    /// per named signal table, or the `samples` snapshot alone when it names
+    /// none (the pre-ADR-0033 default for a constant query).
+    pub(crate) fn lanes(&self) -> Vec<TargetSignal> {
+        if self.signals.is_empty() {
+            vec![TargetSignal::Metrics]
+        } else {
+            self.signals.clone()
+        }
+    }
+
+    /// The first of [`Self::lanes`]: the statement's target signal when it
+    /// names at most one signal table.
+    pub(crate) fn first_lane(&self) -> TargetSignal {
+        self.signals
+            .first()
+            .copied()
+            .unwrap_or(TargetSignal::Metrics)
+    }
+
+    /// Whether the statement names more than one base table of any kind.
+    #[cfg(feature = "flight-sql")]
+    pub(crate) fn names_several_tables(&self) -> bool {
+        self.signals.len() + self.others.len() > 1
+    }
+}
+
+/// Refuse a statement naming two or more signal tables. Every public entry
+/// point that takes statement text calls this before any catalog request.
+pub(crate) fn refuse_cross_signal(tables: &StatementTables) -> Result<(), SqlError> {
+    if tables.signals.len() > 1 {
+        return Err(SqlError::CrossSignalQuery);
+    }
+    Ok(())
 }
 
 /// Refuse a statement that names a table function or a URL-shaped table, with
@@ -256,12 +316,59 @@ pub struct PinnedResolve {
 
 /// What one resolve produced for one statement.
 struct Resolved {
-    snapshot: Snapshot,
-    admission: SegmentAdmission,
+    /// One entry per named signal table, in [`SIGNAL_LANE_ORDER`], all
+    /// resolved by the same attempt; a statement naming none has the one
+    /// `samples` lane, and a Parquet statement one empty Parquet lane.
+    lanes: Vec<ResolvedLane>,
+    /// The sum of the lanes' estimates.
     estimate: CostEstimate,
     unfolded_segments_resolved: u64,
     target: TargetSignal,
     parquet: Option<ParquetResolution>,
+}
+
+/// One signal's snapshot within a [`Resolved`] statement.
+struct ResolvedLane {
+    signal: TargetSignal,
+    snapshot: Snapshot,
+    admission: SegmentAdmission,
+}
+
+impl Resolved {
+    /// Segments resolved across every lane.
+    fn segments_resolved(&self) -> usize {
+        self.lanes
+            .iter()
+            .map(|lane| lane.snapshot.segments.len())
+            .sum()
+    }
+
+    /// The lanes' admission counts, summed.
+    fn admission(&self) -> SegmentAdmission {
+        SegmentAdmission {
+            sealed_count: self
+                .lanes
+                .iter()
+                .map(|lane| lane.admission.sealed_count)
+                .sum(),
+            exempt_count: self
+                .lanes
+                .iter()
+                .map(|lane| lane.admission.exempt_count)
+                .sum(),
+        }
+    }
+
+    /// The `(signal, snapshot)` pairs a plan is built over.
+    fn into_snapshots(self) -> (Vec<(TargetSignal, Snapshot)>, Option<ParquetResolution>) {
+        (
+            self.lanes
+                .into_iter()
+                .map(|lane| (lane.signal, lane.snapshot))
+                .collect(),
+            self.parquet,
+        )
+    }
 }
 
 /// The coordinator-side distributed samples scan for one query: the minted
@@ -848,25 +955,37 @@ fn snapshot_covering_window(snapshot: &Snapshot) -> (TimeRange, i64) {
 /// A `Filter` preserves its input's schema, so the planned result schema is
 /// unchanged and the caller's `DataFrame` can be rebuilt around the new plan.
 ///
-/// Returns the rewritten plan and the display of the predicate actually built,
-/// which is what [`SqlStats::window_predicate`] reports; `None` when the plan
-/// carries no `TableScan` at all and nothing was filtered.
+/// Each scan is filtered on its own table's column ([`window_ts_column`]),
+/// read off `scan.table_name`, which names the registered table even under an
+/// alias. A scan of a table that is not a signal table gets no window.
+///
+/// Returns the rewritten plan and the display of the predicates actually
+/// built, which is what [`SqlStats::window_predicate`] reports: one entry per
+/// signal table, in [`SIGNAL_LANE_ORDER`], joined by `"; "`, so a statement
+/// over one table reports exactly the one predicate. `None` when no scan was
+/// filtered.
 fn apply_row_window(
     plan: LogicalPlan,
-    ts_col: &str,
     window: TimeRange,
 ) -> Result<(LogicalPlan, Option<String>), SqlError> {
-    let mut applied: Option<String> = None;
+    let mut applied: BTreeMap<usize, String> = BTreeMap::new();
     let rewritten = plan
         .transform_up_with_subqueries(|node| {
             if let LogicalPlan::TableScan(scan) = &node {
+                let Some(signal) = crate::statement::signal_table(scan.table_name.table()) else {
+                    return Ok(Transformed::no(node));
+                };
+                let (Some(ts_col), Some(lane)) = (
+                    window_ts_column(signal),
+                    SIGNAL_LANE_ORDER.iter().position(|s| *s == signal),
+                ) else {
+                    return Ok(Transformed::no(node));
+                };
                 let predicate = window_filter_expr(&scan.table_name, ts_col, window);
                 // Rendered from the expression that is about to be planted, so
                 // the reported text cannot describe a different filter than the
-                // one that ran. A session registers exactly one table provider
-                // (crate::session::build_session), so every scan in a plan
-                // names the same relation and renders identically.
-                applied = Some(predicate.to_string());
+                // one that ran.
+                applied.insert(lane, predicate.to_string());
                 // An unresolvable column surfaces here as a typed plan error,
                 // never as a silently unfiltered scan.
                 let filter = Filter::try_new(predicate, Arc::new(node))?;
@@ -876,7 +995,9 @@ fn apply_row_window(
         })
         .map(|transformed| transformed.data)
         .map_err(plan_error)?;
-    Ok((rewritten, applied))
+    let reported =
+        (!applied.is_empty()).then(|| applied.into_values().collect::<Vec<_>>().join("; "));
+    Ok((rewritten, reported))
 }
 
 /// What [`SqlExecutor::explain`] found out about a statement without reading
@@ -884,7 +1005,9 @@ fn apply_row_window(
 #[derive(Debug, Clone)]
 pub struct ExplainReport {
     /// The signal the validated statement targets, chosen from its `FROM`
-    /// clause the same way execution chooses it.
+    /// clause the same way execution chooses it: for a statement naming
+    /// several signal tables, which only a test executor admits, the first it
+    /// names in the order `samples`, `logs`, `spans`, `alerts`, `audit`.
     pub target: TargetSignal,
     /// The effective result schema, declared typed columns (ADR-0090)
     /// included.
@@ -937,6 +1060,22 @@ fn unbounded_estimate_components(target: TargetSignal) -> Vec<&'static str> {
             "estimated_decompressed_bytes",
         ],
     }
+}
+
+/// [`unbounded_estimate_components`] over every lane of a statement, each
+/// component named once, in the order the lanes first name it. A summed
+/// estimate is unbounded wherever one of its terms is.
+fn unbounded_lane_components(lanes: &[ResolvedLane]) -> Vec<&'static str> {
+    let mut components = Vec::new();
+    for component in lanes
+        .iter()
+        .flat_map(|lane| unbounded_estimate_components(lane.signal))
+    {
+        if !components.contains(&component) {
+            components.push(component);
+        }
+    }
+    components
 }
 
 /// A completed query.
@@ -1165,6 +1304,10 @@ pub struct SqlExecutor {
     /// How many times [`Self::executed_plan`] built a plan to execute.
     #[cfg(test)]
     executed_plan_builds: std::sync::atomic::AtomicUsize,
+    /// Skip [`refuse_cross_signal`] at the entry points, so a test can run a
+    /// statement naming several signal tables (ADR-2904, part A).
+    #[cfg(test)]
+    allow_cross_signal: bool,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -1211,6 +1354,8 @@ impl SqlExecutor {
             spill_fallbacks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             executed_plan_builds: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            allow_cross_signal: false,
         }
     }
 
@@ -1430,6 +1575,7 @@ impl SqlExecutor {
     ) -> Result<SqlOutcome, SqlError> {
         // Step 1: the security gate runs before any catalog or plan work.
         validate_query(&req.sql)?;
+        self.admit_statement_tables(Statement::Sql(&req.sql))?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
@@ -1469,6 +1615,7 @@ impl SqlExecutor {
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
         let statement = Statement::Lowered(statement);
+        self.admit_statement_tables(statement)?;
         let sql_req = SqlRequest {
             sql: String::new(),
             window: req.window,
@@ -1493,7 +1640,7 @@ impl SqlExecutor {
     /// table's schema.
     ///
     /// Runs the same first half [`Self::execute`] runs -- validate, resolve
-    /// the target signal's snapshot, admit it, estimate its cost, build the
+    /// each named signal's snapshot, admit them, estimate the cost, build the
     /// session and plan -- and stops before execution. The catalog reads the
     /// resolve issues are real (a plan over an imagined snapshot would answer
     /// a different question than the one asked); no segment is fetched,
@@ -1536,6 +1683,7 @@ impl SqlExecutor {
         // statement costs no catalog LIST here either, and it runs outside the
         // timeout because a rejection is not a thing that can time out.
         validate_query(&req.sql)?;
+        self.admit_statement_tables(Statement::Sql(&req.sql))?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
@@ -1571,22 +1719,20 @@ impl SqlExecutor {
         // right after resolve returns, so `explain` gets that enforcement
         // for free here without ever reaching the segment-fetch loop in
         // scan.rs (which it never runs: explain fetches no segment).
-        let Resolved {
-            snapshot,
-            admission,
-            estimate,
-            target,
-            parquet,
-            ..
-        } = self
+        let resolved = self
             .resolve_admitted(tenant_hash, statement, req, &phase_accounting)
             .await?;
-        let segments_resolved = snapshot.segments.len();
+        let segments_resolved = resolved.segments_resolved();
+        let admission = resolved.admission();
+        let estimate = resolved.estimate;
+        let target = resolved.target;
+        let unbounded_components = unbounded_lane_components(&resolved.lanes);
+        let (lanes, parquet) = resolved.into_snapshots();
 
         let planned = self
             .plan_pinned_with(
                 tenant_hash,
-                snapshot,
+                lanes,
                 statement,
                 &phase_accounting,
                 PlanExtras {
@@ -1619,7 +1765,7 @@ impl SqlExecutor {
             segments_admitted: admission.sealed_count,
             segments_recent_exempt: admission.exempt_count,
             estimate,
-            unbounded_components: unbounded_estimate_components(target),
+            unbounded_components,
             window_predicate,
             plan_text,
         })
@@ -1648,7 +1794,7 @@ impl SqlExecutor {
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
 
         // Checked from the statement text alone, before the loop, so a
-        // statement naming two signal tables fails here rather than after a
+        // statement naming too many tables fails here rather than after a
         // snapshot resolve has already been paid for. Which target it reads is
         // each attempt's resolve's answer: whether a name is a Parquet table
         // is a fact about the store, not the text.
@@ -1669,43 +1815,45 @@ impl SqlExecutor {
             // `max_s3_requests` right after resolve returns, so a statement
             // whose snapshot resolves to zero segments cannot slip past this
             // ceiling on the strength that it never reaches the
-            // segment-fetch loop in scan.rs.
+            // segment-fetch loop in scan.rs. Each attempt resolves every
+            // signal table the statement names again, so a retry never pairs
+            // a fresh snapshot of one table with a stale one of another.
             let resolve_started = Instant::now();
-            let Resolved {
-                snapshot,
-                estimate,
-                unfolded_segments_resolved,
-                target,
-                parquet,
-                ..
-            } = self
+            let resolved = self
                 .resolve(tenant_hash, statement, req, &phase_accounting)
                 .await?;
             let resolve_ns = elapsed_ns(resolve_started);
             stats.resolves += 1;
             stats.attempts += 1;
-            stats.segments = snapshot.segments.len();
-            // Read off this attempt's snapshot, before it is moved into
-            // `attempt`, so it describes the snapshot the returned rows were
-            // read from and not one a retry resolved afterwards. The I/O
+            stats.segments = resolved.segments_resolved();
+            let estimate = resolved.estimate;
+            let target = resolved.target;
+            let unfolded_segments_resolved = resolved.unfolded_segments_resolved;
+            let (lanes, parquet) = resolved.into_snapshots();
+            // Read off this attempt's snapshots, before they are moved into
+            // `attempt`, so they describe the snapshots the returned rows were
+            // read from and not ones a retry resolved afterwards. The I/O
             // shape (issue #1214) is likewise a pure function of the resolved
-            // snapshot and this attempt's own phase accounting, computable
+            // snapshots and this attempt's own phase accounting, computable
             // here before a single segment is fetched (mirroring
             // `ravel_query::engine`'s `io_shape_for_resolve`).
-            let pending_erasure = snapshot_pending_erasure_predicates(&snapshot);
-            let io_shape = self.sql_io_shape(
-                target,
-                &snapshot,
-                &phase_accounting,
-                unfolded_segments_resolved,
-            );
+            let pending_erasure = lanes
+                .iter()
+                .flat_map(|(_, snapshot)| snapshot_pending_erasure_predicates(snapshot))
+                .collect();
+            let lane_refs: Vec<(TargetSignal, &Snapshot)> = lanes
+                .iter()
+                .map(|(signal, snapshot)| (*signal, snapshot))
+                .collect();
+            let io_shape =
+                self.sql_io_shape(&lane_refs, &phase_accounting, unfolded_segments_resolved);
 
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
                 .attempt(
                     tenant_hash,
                     statement,
                     req,
-                    snapshot,
+                    lanes,
                     &phase_accounting,
                     &declared,
                     parquet,
@@ -1819,12 +1967,11 @@ impl SqlExecutor {
         // phase-split handle to hand in): `pooled_over` shares this same
         // handle's counters across all four phases, so the resolve's cost
         // still lands on `accounting` exactly as before.
-        let Resolved {
-            snapshot,
-            estimate,
-            parquet,
-            ..
-        } = self
+        //
+        // A Flight ticket pins one snapshot, so this path refuses a statement
+        // over several signal tables whatever the executor allows.
+        refuse_cross_signal(&Statement::Sql(&req.sql).tables()?)?;
+        let resolved = self
             .resolve(
                 tenant_hash,
                 Statement::Sql(&req.sql),
@@ -1832,6 +1979,13 @@ impl SqlExecutor {
                 &PhaseAccounting::pooled_over(accounting),
             )
             .await?;
+        let estimate = resolved.estimate;
+        let (lanes, parquet) = resolved.into_snapshots();
+        let Some((_, snapshot)) = lanes.into_iter().next() else {
+            return Err(SqlError::Internal(
+                "a resolve returned no snapshot".to_string(),
+            ));
+        };
         Ok(PinnedResolve {
             snapshot,
             estimate,
@@ -1854,8 +2008,9 @@ impl SqlExecutor {
     ///
     /// `accounting` is this query's [`QueryAccounting`] handle: it is cloned
     /// into the query's memory pool (peak intermediate bytes) and into
-    /// whichever table provider the query targets (every store fetch the
-    /// scan issues).
+    /// the one table provider built over `snapshot` (every store fetch the
+    /// scan issues). A ticket pins one snapshot, so a statement naming two
+    /// signal tables is [`SqlError::CrossSignalQuery`] here.
     pub async fn plan_pinned(
         &self,
         tenant_hash: TenantHash,
@@ -1896,13 +2051,14 @@ impl SqlExecutor {
         inputs: PinnedPlanInputs,
     ) -> Result<PinnedQuery, SqlError> {
         let (window, now_ns) = snapshot_covering_window(&snapshot);
+        let lanes = Self::pinned_lane(sql, snapshot)?;
         // Public two-RPC Flight SQL surface: the caller holds a pooled
         // `&QueryAccounting`, so `pooled_over` bridges it to the phase-split
         // API `plan_pinned_with` now takes without changing where the cost
         // lands.
         self.plan_pinned_with(
             tenant_hash,
-            snapshot,
+            lanes,
             Statement::Sql(sql),
             &PhaseAccounting::pooled_over(accounting),
             PlanExtras {
@@ -1943,9 +2099,10 @@ impl SqlExecutor {
         inputs: PinnedPlanInputs,
     ) -> Result<PinnedQuery, SqlError> {
         let (window, now_ns) = snapshot_covering_window(&snapshot);
+        let lanes = Self::pinned_lane(sql, snapshot)?;
         self.plan_pinned_with(
             tenant_hash,
-            snapshot,
+            lanes,
             Statement::Sql(sql),
             &PhaseAccounting::pooled_over(accounting),
             PlanExtras {
@@ -1961,6 +2118,18 @@ impl SqlExecutor {
         .await
     }
 
+    /// The one lane a Flight-pinned `snapshot` plans `sql` over: a ticket pins
+    /// one snapshot, so a statement naming several signal tables is refused
+    /// here whatever the executor allows.
+    fn pinned_lane(
+        sql: &str,
+        snapshot: Snapshot,
+    ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
+        let tables = Statement::Sql(sql).tables()?;
+        refuse_cross_signal(&tables)?;
+        Ok(vec![(tables.first_lane(), snapshot)])
+    }
+
     /// The one body behind [`Self::plan_pinned_with_inputs`] and
     /// [`Self::plan_pinned_distributed`]. `extras` carries the optional
     /// coordinator-side distributed scan; with the `flight-sql` feature off it
@@ -1969,10 +2138,15 @@ impl SqlExecutor {
     /// `statement` is lowered once for the classification session, when one
     /// is built, and once for every session that executes, the spill
     /// fallback's rebuild included.
+    ///
+    /// `lanes` carries one snapshot per signal table the statement names, in
+    /// [`SIGNAL_LANE_ORDER`]; each table's provider reads only its own lane's
+    /// snapshot, and every provider shares the statement's one memory pool. A
+    /// Parquet statement reads none of them.
     async fn plan_pinned_with(
         &self,
         tenant_hash: TenantHash,
-        snapshot: Snapshot,
+        lanes: Vec<(TargetSignal, Snapshot)>,
         statement: Statement<'_>,
         phase_accounting: &PhaseAccounting,
         extras: PlanExtras,
@@ -2031,8 +2205,11 @@ impl SqlExecutor {
         let target = if parquet.is_some() {
             TargetSignal::Parquet
         } else {
-            tables.signal.unwrap_or(TargetSignal::Metrics)
+            lanes
+                .first()
+                .map_or(TargetSignal::Metrics, |(signal, _)| *signal)
         };
+        let several_tables = parquet.is_none() && lanes.len() > 1;
         let parquet_tables = match (parquet, &self.parquet) {
             (Some(resolution), Some(sources)) => {
                 // One ledger per query, shared by every reader it opens, over
@@ -2065,7 +2242,11 @@ impl SqlExecutor {
         let parquet_schemas = parquet_tables
             .as_ref()
             .map(|(_, tables)| parquet::schemas(tables));
-        let wants_stats_gate = matches!(target, TargetSignal::Logs) && !extras.declared.is_empty();
+        let wants_stats_gate = parquet_tables.is_none()
+            && lanes
+                .iter()
+                .any(|(signal, _)| matches!(signal, TargetSignal::Logs))
+            && !extras.declared.is_empty();
         // ADR-0954: the spill eligibility predicate reads the same analyzed
         // plan, so a configured-spill deployment is a third consumer of it
         // rather than a second analyze pass.
@@ -2146,147 +2327,169 @@ impl SqlExecutor {
         // repartition_free`).
         let exact_typed_aggregates =
             config.parallel_final_aggregation && analyzed.as_ref().is_some_and(plan_is_exact_typed);
-        // Build the one table the query targets over the snapshot resolved for
-        // its signal. `resolve` already resolved `snapshot` against exactly
-        // this signal, so the provider and the snapshot always agree.
-        let table = match target {
-            TargetSignal::Metrics => {
-                #[cfg_attr(not(feature = "flight-sql"), allow(unused_mut))]
-                let mut provider = RavelTableProvider::new(
-                    snapshot,
-                    tenant_hash,
-                    self.fetcher.clone(),
-                    config.clone(),
-                    phase_accounting.clone(),
-                );
-                // Install the distributed samples scan for this query only, when
-                // the coordinator decided to fan out. `None`/feature-off leaves
-                // the provider byte-identical to the local path.
-                #[cfg(feature = "flight-sql")]
-                if let Some((endpoints, client)) = extras.distributed {
-                    provider = provider.with_distributed_scan(endpoints, client);
-                }
-                SessionTable::Metrics(Arc::new(provider))
-            }
-            // The declared typed attribute columns (ADR-0090) resolved once per
-            // plan are installed on the logs provider here; they widen the
-            // table's schema and are consumed only by this provider. A metrics-
-            // or spans-target query leaves `extras.declared` unused.
-            TargetSignal::Logs => {
-                // ADR-0850: resolved once per plan from the current folded
-                // catalog HEAD, independently of `snapshot` (a different
-                // object, not versioned against the pinned snapshot). `None`
-                // -- nothing folded yet, no configured typed columns, or the
-                // last fold's build/PUT failed -- reproduces the
-                // pre-ADR-0850 provider exactly; every metadata-only path
-                // keyed off it degrades to scanning on a `None`.
-                let column_stats = if extras.declared.is_empty() {
-                    // No configured typed columns: no metadata-only column path
-                    // can ever apply, so skip the HEAD GET load_column_stats
-                    // would issue. This keeps a predicate-free COUNT(*) on a
-                    // tenant with no declared columns reading zero objects, and
-                    // reproduces the pre-ADR-0850 provider exactly.
-                    None
-                } else if !self.logs_column_stats_eligible(
-                    &snapshot,
-                    analyzed.as_ref(),
-                    &extras.declared,
-                ) {
-                    // Issue #888: no metadata-only column path can fire for this
-                    // plan (decided from the plan and the resolved snapshot
-                    // alone, ahead of the load), so skip the two GETs
-                    // load_column_stats would issue. A `None` here reproduces
-                    // the pre-ADR-0850 provider exactly, the same as an absent
-                    // stats object would, so every failing-open behavior is
-                    // preserved.
-                    None
-                } else {
-                    self.catalog
-                        .load_column_stats(
-                            &tenant_hash,
-                            Signal::Logs,
-                            extras.column_stats_window,
-                            extras.column_stats_now_ns,
-                            phase_accounting.plan(),
-                        )
-                        .await?
-                };
-                SessionTable::Logs(Arc::new(
-                    LogsTableProvider::new(
-                        snapshot,
-                        tenant_hash,
-                        self.log_fetcher.clone(),
-                        phase_accounting.clone(),
-                    )
-                    .with_declared_columns(extras.declared)
-                    .with_column_stats(column_stats)
-                    .with_segment_timing(config.segment_timing),
-                ))
-            }
-            // The alerts and audit providers are not yet threaded onto the
-            // per-phase seam (issue #1367 scoped its phase split to the
-            // `samples`/`logs` tables): each still takes one pooled
-            // `QueryAccounting`, fed here by extracting the Scan-phase handle,
-            // matching where every other pooled reader in this crate now
-            // lands (`RowFetchSource`, `distributed_samples_plan`). Every
-            // alert or audit GET is still recorded, just not split by phase.
-            //
-            // The spans provider takes the per-phase handles (issue #2754): a
-            // trace lookup's footer and section reads land on the plan phase
-            // and its block runs on the scan phase; a whole-object span read
-            // lands on the scan phase. Every fetch is tenant-checked (fails
-            // closed on a footer tenant_hash mismatch).
-            TargetSignal::Spans => SessionTable::Spans(Arc::new(
-                SpansTableProvider::new(
-                    snapshot,
-                    tenant_hash,
-                    self.span_fetcher.clone(),
-                    phase_accounting.scan().clone(),
-                )
-                .with_phase_accounting(phase_accounting.clone()),
-            )),
-            // The two RLOG-backed tables (ADR-1101 decision 1) read through the
-            // executor's existing `log_fetcher`: an alert and an audit record
-            // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
-            // tenant-checked fetch funnel and its caches. No declared columns
-            // and no column statistics apply to either.
-            TargetSignal::Alerts => SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
-                snapshot,
-                tenant_hash,
-                self.log_fetcher.clone(),
-                phase_accounting.scan().clone(),
-            ))),
-            TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
-                snapshot,
-                tenant_hash,
-                self.log_fetcher.clone(),
-                phase_accounting.scan().clone(),
-            ))),
+        // Build one table per signal lane over the snapshot resolved for that
+        // signal. `resolve` resolved each lane's snapshot against exactly its
+        // signal, so every provider and its snapshot agree.
+        #[cfg(feature = "flight-sql")]
+        let mut distributed = extras.distributed;
+        #[cfg(feature = "flight-sql")]
+        if distributed.is_some() && lanes.len() > 1 {
+            return Err(SqlError::Internal(
+                "a distributed samples scan reached a statement over several signal tables"
+                    .to_string(),
+            ));
+        }
+        let mut session_tables = Vec::with_capacity(lanes.len());
+        if let Some((resolution, tables)) = parquet_tables {
             // ADR-2040 D6: an exact-typed statement scans in up to
             // `target_partitions` file groups; every other one scans one group
             // in manifest file order, so its aggregates fold in a fixed order.
-            TargetSignal::Parquet => {
-                let Some((resolution, tables)) = parquet_tables else {
+            let tables = if exact_typed_aggregates {
+                tables
+                    .into_iter()
+                    .map(|(name, provider)| {
+                        provider
+                            .with_parallel(true)
+                            .map(|provider| (name, provider))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ParquetQueryError::from)?
+            } else {
+                tables
+            };
+            session_tables.push(SessionTable::Parquet(parquet::session_tables(
+                tenant_hash,
+                &resolution,
+                tables,
+            )));
+        }
+        for (signal, snapshot) in lanes {
+            if target == TargetSignal::Parquet {
+                break;
+            }
+            let table = match signal {
+                TargetSignal::Metrics => {
+                    #[cfg_attr(not(feature = "flight-sql"), allow(unused_mut))]
+                    let mut provider = RavelTableProvider::new(
+                        snapshot,
+                        tenant_hash,
+                        self.fetcher.clone(),
+                        config.clone(),
+                        phase_accounting.clone(),
+                    );
+                    // Install the distributed samples scan for this query only,
+                    // when the coordinator decided to fan out. `None`/feature-off
+                    // leaves the provider byte-identical to the local path.
+                    #[cfg(feature = "flight-sql")]
+                    if let Some((endpoints, client)) = distributed.take() {
+                        provider = provider.with_distributed_scan(endpoints, client);
+                    }
+                    SessionTable::Metrics(Arc::new(provider))
+                }
+                // The declared typed attribute columns (ADR-0090) resolved once per
+                // plan are installed on the logs provider here; they widen the
+                // table's schema and are consumed only by this provider. Every
+                // other table leaves `extras.declared` unused.
+                TargetSignal::Logs => {
+                    // ADR-0850: resolved once per plan from the current folded
+                    // catalog HEAD, independently of `snapshot` (a different
+                    // object, not versioned against the pinned snapshot). `None`
+                    // -- nothing folded yet, no configured typed columns, or the
+                    // last fold's build/PUT failed -- reproduces the
+                    // pre-ADR-0850 provider exactly; every metadata-only path
+                    // keyed off it degrades to scanning on a `None`.
+                    let column_stats = if extras.declared.is_empty() {
+                        // No configured typed columns: no metadata-only column path
+                        // can ever apply, so skip the HEAD GET load_column_stats
+                        // would issue. This keeps a predicate-free COUNT(*) on a
+                        // tenant with no declared columns reading zero objects, and
+                        // reproduces the pre-ADR-0850 provider exactly.
+                        None
+                    } else if !self.logs_column_stats_eligible(
+                        &snapshot,
+                        analyzed.as_ref(),
+                        &extras.declared,
+                        several_tables,
+                    ) {
+                        // Issue #888: no metadata-only column path can fire for this
+                        // plan (decided from the plan and the resolved snapshot
+                        // alone, ahead of the load), so skip the two GETs
+                        // load_column_stats would issue. A `None` here reproduces
+                        // the pre-ADR-0850 provider exactly, the same as an absent
+                        // stats object would, so every failing-open behavior is
+                        // preserved.
+                        None
+                    } else {
+                        self.catalog
+                            .load_column_stats(
+                                &tenant_hash,
+                                Signal::Logs,
+                                extras.column_stats_window,
+                                extras.column_stats_now_ns,
+                                phase_accounting.plan(),
+                            )
+                            .await?
+                    };
+                    SessionTable::Logs(Arc::new(
+                        LogsTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.log_fetcher.clone(),
+                            phase_accounting.clone(),
+                        )
+                        .with_declared_columns(extras.declared.clone())
+                        .with_column_stats(column_stats)
+                        .with_segment_timing(config.segment_timing),
+                    ))
+                }
+                // The alerts and audit providers are not yet threaded onto the
+                // per-phase seam (issue #1367 scoped its phase split to the
+                // `samples`/`logs` tables): each still takes one pooled
+                // `QueryAccounting`, fed here by extracting the Scan-phase handle,
+                // matching where every other pooled reader in this crate now
+                // lands (`RowFetchSource`, `distributed_samples_plan`). Every
+                // alert or audit GET is still recorded, just not split by phase.
+                //
+                // The spans provider takes the per-phase handles (issue #2754): a
+                // trace lookup's footer and section reads land on the plan phase
+                // and its block runs on the scan phase; a whole-object span read
+                // lands on the scan phase. Every fetch is tenant-checked (fails
+                // closed on a footer tenant_hash mismatch).
+                TargetSignal::Spans => SessionTable::Spans(Arc::new(
+                    SpansTableProvider::new(
+                        snapshot,
+                        tenant_hash,
+                        self.span_fetcher.clone(),
+                        phase_accounting.scan().clone(),
+                    )
+                    .with_phase_accounting(phase_accounting.clone()),
+                )),
+                // The two RLOG-backed tables (ADR-1101 decision 1) read through the
+                // executor's existing `log_fetcher`: an alert and an audit record
+                // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
+                // tenant-checked fetch funnel and its caches. No declared columns
+                // and no column statistics apply to either.
+                TargetSignal::Alerts => SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+                    snapshot,
+                    tenant_hash,
+                    self.log_fetcher.clone(),
+                    phase_accounting.scan().clone(),
+                ))),
+                TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
+                    snapshot,
+                    tenant_hash,
+                    self.log_fetcher.clone(),
+                    phase_accounting.scan().clone(),
+                ))),
+                // A Parquet statement built its tables above and reads no lane.
+                TargetSignal::Parquet => {
                     return Err(SqlError::Internal(
                         "the Parquet target was chosen without its tables".to_string(),
                     ));
-                };
-                let tables = if exact_typed_aggregates {
-                    tables
-                        .into_iter()
-                        .map(|(name, provider)| {
-                            provider
-                                .with_parallel(true)
-                                .map(|provider| (name, provider))
-                        })
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(ParquetQueryError::from)?
-                } else {
-                    tables
-                };
-                SessionTable::Parquet(parquet::session_tables(tenant_hash, &resolution, tables))
-            }
-        };
+                }
+            };
+            session_tables.push(table);
+        }
 
         let decision = match &scratch {
             Some((scratch, max_bytes)) => SpillDecision::Enabled {
@@ -2298,12 +2501,20 @@ impl SqlExecutor {
         // Kept only while spill is enabled, to rebuild the session without it
         // if the executed plan fails the re-check below.
         let spill_enabled = matches!(decision, SpillDecision::Enabled { .. });
-        let fallback_table = spill_enabled.then(|| clone_session_table(&table));
-        let providers = session_table_providers(&table);
-        let mut ctx = build_session(
+        let fallback_tables = spill_enabled.then(|| {
+            session_tables
+                .iter()
+                .map(clone_session_table)
+                .collect::<Vec<_>>()
+        });
+        let providers = session_tables
+            .iter()
+            .flat_map(session_table_providers)
+            .collect();
+        let mut ctx = build_session_with_tables(
             config,
             Arc::clone(&pool),
-            table,
+            session_tables,
             exact_typed_aggregates,
             decision,
         )
@@ -2329,18 +2540,21 @@ impl SqlExecutor {
         // is lowered again against the rebuilt session and admitted against
         // it, so its plan binds that session's tables and functions.
         let mut scratch = scratch;
-        if let Some(table) = fallback_table
+        if let Some(fallback_tables) = fallback_tables
             && !executed_plan_is_spill_eligible(&ctx.state(), &plan)
         {
             tracing::warn!(
                 "SQL spill disabled for this statement: the plan it executes is not \
                  spill-eligible, although its classification plan was"
             );
-            let providers = session_table_providers(&table);
-            ctx = build_session(
+            let providers = fallback_tables
+                .iter()
+                .flat_map(session_table_providers)
+                .collect();
+            ctx = build_session_with_tables(
                 config,
                 pool,
-                table,
+                fallback_tables,
                 exact_typed_aggregates,
                 SpillDecision::Disabled,
             )
@@ -2366,10 +2580,10 @@ impl SqlExecutor {
             Some(window) => {
                 // A Parquet target with a row window was refused at resolve
                 // (`resolve_parquet_target`); this is the type's fallback.
-                let ts_column =
-                    window_ts_column(target).ok_or(ParquetQueryError::RowWindowUnsupported)?;
-                let (plan, predicate) =
-                    apply_row_window(frame.logical_plan().clone(), ts_column, window)?;
+                if window_ts_column(target).is_none() {
+                    return Err(ParquetQueryError::RowWindowUnsupported.into());
+                }
+                let (plan, predicate) = apply_row_window(frame.logical_plan().clone(), window)?;
                 frame = DataFrame::new(ctx.state(), plan);
                 predicate
             }
@@ -2431,7 +2645,9 @@ impl SqlExecutor {
     /// snapshot clears the cost gate, advertises more than one worker slice, and
     /// has workers to serve them (see
     /// [`plan_distributed_slices`](crate::distributed::plan_distributed_slices)).
-    /// Logs have no distributed path, so a logs-target query is always `None`.
+    /// Logs have no distributed path, so a logs-target query is always `None`,
+    /// and so is a statement naming more than one table of any kind: the
+    /// distributed scan replaces one `samples` scan over one pinned snapshot.
     ///
     /// The gate re-derives the cost estimate from the ticket-pinned snapshot
     /// with `catalog_requests = 0`. [`should_distribute`] reads only the
@@ -2448,10 +2664,9 @@ impl SqlExecutor {
         template: &crate::flight_ticket::FlightTicket,
     ) -> Option<Vec<crate::distributed::WorkerSlice>> {
         let tables = Self::statement_tables(sql).ok()?;
-        if !matches!(
-            tables.signal.unwrap_or(TargetSignal::Metrics),
-            TargetSignal::Metrics
-        ) || !tables.others.is_empty()
+        if tables.names_several_tables()
+            || !matches!(tables.first_lane(), TargetSignal::Metrics)
+            || !tables.others.is_empty()
         {
             return None;
         }
@@ -2507,7 +2722,7 @@ impl SqlExecutor {
         // The worker fragment plans no SQL and runs no aggregation, so it never
         // spills: the disk manager stays disabled regardless of the deployment's
         // spill configuration.
-        let ctx = build_session(
+        let ctx = crate::session::build_session(
             &self.config,
             pool,
             SessionTable::Metrics(Arc::clone(&provider)),
@@ -2519,16 +2734,17 @@ impl SqlExecutor {
         PinnedStream::start(ctx, plan, schema, breach)
     }
 
-    /// One `Catalog::resolve` plus the `max_segments` budget check. Resolves
-    /// the signal the query's `FROM` clause targets ([`Self::statement_tables`]),
-    /// so a metrics-only query never lists the logs keyspace and vice versa.
+    /// One `Catalog::resolve` per signal table the query's `FROM` clause
+    /// names ([`Self::statement_tables`]), plus the `max_segments` check on
+    /// their summed sealed segments, so a metrics-only query never lists the
+    /// logs keyspace and vice versa.
     ///
-    /// Also computes the two-part cost estimate (ADR-0044 "3.", amended): the
-    /// catalog term from `shard_count` and the window's hour-bucket count,
-    /// computed here *before* `resolve_pruned_with_accounting` runs (resolve
-    /// itself is not free, and an estimate computed only after resolve
-    /// structurally cannot bound resolve's own spend), and the segment term
-    /// from the pinned snapshot's `SegmentRef`s, computed after.
+    /// Also computes the two-part cost estimate (ADR-0044 "3.", amended), per
+    /// signal and summed: the catalog term from `shard_count` and the window's
+    /// hour-bucket count, computed *before* that signal's resolve runs
+    /// (resolve itself is not free, and an estimate computed only after
+    /// resolve structurally cannot bound resolve's own spend), and the segment
+    /// term from the resolved snapshot's `SegmentRef`s, computed after.
     async fn resolve(
         &self,
         tenant_hash: TenantHash,
@@ -2610,28 +2826,31 @@ impl SqlExecutor {
                     requests,
                     max,
                     fold_lag,
+                    table: None,
                 });
             }
             return Ok(Resolved {
-                snapshot: Snapshot {
-                    segments: Vec::new(),
-                    segments_pruned: 0,
-                    pending_erasure: Vec::new(),
-                },
-                admission: SegmentAdmission {
-                    sealed_count: 0,
-                    exempt_count: 0,
-                },
+                lanes: vec![ResolvedLane {
+                    signal: TargetSignal::Parquet,
+                    snapshot: Snapshot {
+                        segments: Vec::new(),
+                        segments_pruned: 0,
+                        pending_erasure: Vec::new(),
+                    },
+                    admission: SegmentAdmission {
+                        sealed_count: 0,
+                        exempt_count: 0,
+                    },
+                }],
                 estimate,
                 unfolded_segments_resolved: 0,
                 target: TargetSignal::Parquet,
                 parquet: Some(resolution),
             });
         }
-        let target = tables.signal.unwrap_or(TargetSignal::Metrics);
-        let signal = target.signal().ok_or_else(|| {
-            SqlError::Internal("a signal-table resolve reached the Parquet target".to_string())
-        })?;
+        let lanes = tables.lanes();
+        let several = lanes.len() > 1;
+        let target = tables.first_lane();
         // Postings pruning by the equality `__name__` predicate pushed down
         // from the query's WHERE clause. Without this the SQL
         // path called plain `Catalog::resolve`, so the measured 5.9-40.9x
@@ -2643,67 +2862,128 @@ impl SqlExecutor {
         // prune, exactly as before, and pruning itself already degrades
         // safely when postings are absent or unusable.
         // A statement with no SQL text derives no filter and is not pruned.
-        let name_filter = match (target, statement.sql()) {
-            (TargetSignal::Metrics, Some(sql)) => {
-                self.pushed_down_name_filter(tenant_hash, sql).await
+        // Only the metrics snapshot has a `__name__` postings index, so only
+        // the `samples` lane is resolved with the filter, and the filter is
+        // derived from the `samples` scans alone.
+        let name_filter = match statement.sql() {
+            Some(sql) if lanes.contains(&TargetSignal::Metrics) => {
+                self.pushed_down_name_filter(tenant_hash, sql, &lanes).await
             }
-            (TargetSignal::Metrics, None) => None,
-            // Only a metrics query has a `__name__` postings index; a logs,
-            // spans, alerts, or audit query never prunes by it.
-            (
+            _ => None,
+        };
+        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
+        // Every lane is admitted against the statement's one `max_segments`,
+        // so each is checked here unbounded and the running sum against the
+        // ceiling below.
+        let lane_admission_config = EngineConfig {
+            max_segments: usize::MAX,
+            ..engine_config
+        };
+        let mut resolved = Vec::with_capacity(lanes.len());
+        let mut estimate = CostEstimate::new(0, 0, 0, 0, 0);
+        let mut unfolded_segments_resolved = 0_u64;
+        let mut sealed_total = 0_u64;
+        // Every lane resolves at the request's one `now_ns` and window, in
+        // `SIGNAL_LANE_ORDER`, before anything is planned.
+        for lane in lanes {
+            let signal = lane.signal().ok_or_else(|| {
+                SqlError::Internal("a signal-table resolve reached the Parquet target".to_string())
+            })?;
+            let lane_name_filter = match lane {
+                TargetSignal::Metrics => name_filter.as_deref(),
                 TargetSignal::Logs
                 | TargetSignal::Spans
                 | TargetSignal::Alerts
                 | TargetSignal::Audit
-                | TargetSignal::Parquet,
-                _,
-            ) => None,
-        };
-        let catalog_requests = self
-            .catalog
-            .estimated_catalog_requests(req.window, req.now_ns);
-        let (snapshot, origins) = self
-            .catalog
-            .resolve_pruned_with_admission(
-                &tenant_hash,
-                signal,
-                req.window,
-                &req.min_tokens,
-                req.now_ns,
-                name_filter.as_deref(),
-                phase_accounting.resolve(),
-            )
-            .await?;
-        // Exact count of `SegmentOrigin::Recent` entries (issue #1214): the
-        // one origin a folded catalog has not yet sealed, so it is never
-        // served from the RSEG cache the way a folded, below-watermark
-        // segment can be.
-        let unfolded_segments_resolved = count_unfolded_segments(&origins.origins);
-        // Sealed, below-watermark segments count against `max_segments`;
-        // recent and token-resolved segments are exempt (ADR-0073 decision
-        // 2), the same seam `ravel_query::engine::resolve_bounded` uses for
-        // PromQL. Their cost is bounded separately by the
-        // request budget checked incrementally during fetch (see scan.rs).
-        //
-        // Checked against the request's EFFECTIVE `max_segments`: a caller's
-        // lowered budget is a smaller ceiling here, never a larger one.
-        let admission = admit(
-            &snapshot,
-            &origins,
-            &self.effective_config(req.budgets.as_ref()).engine,
-        )
-        .map_err(admission_error_to_sql)?;
-        let estimate = match target {
-            TargetSignal::Metrics => estimate_metrics_cost(&snapshot, catalog_requests),
-            // The `alerts` and `audit` scans fetch through the same RLOG funnel
-            // the `logs` scan does, one GET per segment, so they share its
-            // estimate rather than a renamed copy of it (ADR-1101 decision 1).
-            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
-                estimate_logs_cost(&snapshot, catalog_requests)
+                | TargetSignal::Parquet => None,
+            };
+            let catalog_requests = self
+                .catalog
+                .estimated_catalog_requests(req.window, req.now_ns);
+            let (snapshot, origins) = self
+                .catalog
+                .resolve_pruned_with_admission(
+                    &tenant_hash,
+                    signal,
+                    req.window,
+                    &req.min_tokens,
+                    req.now_ns,
+                    lane_name_filter,
+                    phase_accounting.resolve(),
+                )
+                .await?;
+            // Exact count of `SegmentOrigin::Recent` entries (issue #1214): the
+            // one origin a folded catalog has not yet sealed, so it is never
+            // served from the RSEG cache the way a folded, below-watermark
+            // segment can be.
+            unfolded_segments_resolved += count_unfolded_segments(&origins.origins);
+            // Sealed, below-watermark segments count against `max_segments`;
+            // recent and token-resolved segments are exempt (ADR-0073 decision
+            // 2), the same seam `ravel_query::engine::resolve_bounded` uses for
+            // PromQL. Their cost is bounded separately by the
+            // request budget checked incrementally during fetch (see scan.rs).
+            //
+            // Checked against the request's EFFECTIVE `max_segments`: a caller's
+            // lowered budget is a smaller ceiling here, never a larger one.
+            // The sum across lanes is what is checked (ADR-2904 decision 6).
+            let admission = admit(&snapshot, &origins, &lane_admission_config)
+                .map_err(admission_error_to_sql)?;
+            sealed_total = sealed_total.saturating_add(admission.sealed_count);
+            if usize::try_from(sealed_total).unwrap_or(usize::MAX) > engine_config.max_segments {
+                return Err(admission_error_to_sql(QueryError::TooManySegments {
+                    count: usize::try_from(sealed_total).unwrap_or(usize::MAX),
+                    max: engine_config.max_segments,
+                }));
             }
-            TargetSignal::Spans => estimate_spans_cost(&snapshot, catalog_requests),
-            TargetSignal::Parquet => CostEstimate::new(0, 0, 0, 0, 0),
-        };
+            estimate = estimate.saturating_add(&match lane {
+                TargetSignal::Metrics => estimate_metrics_cost(&snapshot, catalog_requests),
+                // The `alerts` and `audit` scans fetch through the same RLOG funnel
+                // the `logs` scan does, one GET per segment, so they share its
+                // estimate rather than a renamed copy of it (ADR-1101 decision 1).
+                TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => {
+                    estimate_logs_cost(&snapshot, catalog_requests)
+                }
+                TargetSignal::Spans => estimate_spans_cost(&snapshot, catalog_requests),
+                TargetSignal::Parquet => CostEstimate::new(0, 0, 0, 0, 0),
+            });
+            self.check_lane_request_budget(
+                phase_accounting,
+                &snapshot,
+                &origins,
+                req.now_ns,
+                &engine_config,
+                several
+                    .then(|| crate::statement::signal_table_name(lane))
+                    .flatten(),
+            )?;
+            resolved.push(ResolvedLane {
+                signal: lane,
+                snapshot,
+                admission,
+            });
+        }
+        Ok(Resolved {
+            lanes: resolved,
+            estimate,
+            unfolded_segments_resolved,
+            target,
+            parquet: None,
+        })
+    }
+
+    /// The request budget checked after one lane's resolve, against what the
+    /// statement's resolve has issued so far across every lane, so the last
+    /// lane's check holds the sum. `table` names the lane in the refusal when
+    /// the statement names more than one signal table.
+    fn check_lane_request_budget(
+        &self,
+        phase_accounting: &PhaseAccounting,
+        snapshot: &Snapshot,
+        origins: &SegmentOrigins,
+        now_ns: i64,
+        engine_config: &EngineConfig,
+        table: Option<&'static str>,
+    ) -> Result<(), SqlError> {
         // Checked here, in the one resolve path `execute`, `explain`, and the
         // Flight SQL `resolve_snapshot` all funnel through, right after
         // resolve returns and not only in the segment-fetch loop in scan.rs:
@@ -2720,7 +3000,6 @@ impl SqlExecutor {
         // SQL check with a resolve verdict in hand: the per-segment check in
         // scan.rs builds its budget from the session config alone, so a
         // refusal raised mid-scan renders the plain message.
-        let engine_config = self.effective_config(req.budgets.as_ref()).engine;
         if let Some(QueryError::RequestBudgetExceeded {
             requests,
             max,
@@ -2730,9 +3009,9 @@ impl SqlExecutor {
             RequestBudget::new(
                 engine_config.max_s3_requests,
                 resolved_fold_lag(
-                    &snapshot,
-                    &origins,
-                    req.now_ns,
+                    snapshot,
+                    origins,
+                    now_ns,
                     engine_config.fold_lag_threshold(),
                 ),
             ),
@@ -2741,16 +3020,10 @@ impl SqlExecutor {
                 requests,
                 max,
                 fold_lag,
+                table,
             });
         }
-        Ok(Resolved {
-            snapshot,
-            admission,
-            estimate,
-            unfolded_segments_resolved,
-            target,
-            parquet: None,
-        })
+        Ok(())
     }
 
     /// The Parquet tables `sql` reads, when it reads any (ADR-2040 D3, D6).
@@ -2799,18 +3072,18 @@ impl SqlExecutor {
         if tables.others.is_empty() {
             return Ok(None);
         }
-        if row_window && tables.signal.is_none() {
+        if row_window && tables.signals.is_empty() {
             return Err(ParquetQueryError::RowWindowUnsupported.into());
         }
         let accounting = phase_accounting.resolve();
-        if tables.signal.is_some() || !sources.is_configured() {
+        if !tables.signals.is_empty() || !sources.is_configured() {
             // The first live table decides the outcome, so the resolve stops
             // there rather than listing every name.
             let named =
                 parquet::first_live_table(sources, &tenant_hash, &tables.others, accounting)
                     .await?;
             return match named {
-                Some(_) if tables.signal.is_some() => Err(SqlError::CrossSignalQuery),
+                Some(_) if !tables.signals.is_empty() => Err(SqlError::CrossSignalQuery),
                 Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
                 None => Ok(None),
             };
@@ -2858,18 +3131,17 @@ impl SqlExecutor {
 
     /// This query's [`QueryIoShape`] (issue #1214), mirroring
     /// `ravel_query::engine`'s private `io_shape_for_resolve`: every figure
-    /// here is a pure function of the resolved `snapshot`, this attempt's
+    /// here is a pure function of the resolved snapshots, this attempt's
     /// `phase_accounting`, and static configuration, computed before a single
     /// segment is fetched. Deliberately does not thread any new
     /// instrumentation into the per-segment fetch loops in scan.rs/
     /// logs_scan.rs.
     ///
-    /// SQL resolves exactly one target signal per query (`Self::statement_tables`
-    /// rejects a statement naming more than one table), never several matcher
-    /// plans over several distinct fetch passes the way the PromQL engine's
-    /// selector fan-out does. There is therefore no `distinct_plans`/
-    /// `service_fetch_multiplier` concept to sum waves over here: this is the
-    /// single-plan reduction `service_batches_over_plan_waves`'s own doc
+    /// SQL resolves one snapshot per signal table a statement names, never
+    /// several matcher plans over several distinct fetch passes of one table
+    /// the way the PromQL engine's selector fan-out does. There is therefore
+    /// no `distinct_plans`/`service_fetch_multiplier` concept to sum waves
+    /// over here: per lane this is the single-plan reduction `service_batches_over_plan_waves`'s own doc
     /// comment names, `service_batches(segments, min(sql_partition_count,
     /// shared_get_permits))` -- the same reduction `ravel_query::engine`
     /// computes for a single-plan PromQL query, both reading the same
@@ -2877,14 +3149,89 @@ impl SqlExecutor {
     /// query.rs` wires the identical `Arc<GetLimiter>` into this crate's
     /// metrics, logs, and spans fetchers alike), so the two surfaces' figures
     /// are directly comparable.
+    ///
+    /// A statement over several signal tables (ADR-2904) reads each lane's
+    /// segments through that lane's own fetcher: the dependency depth is the
+    /// deepest lane's, the service batches are the sum of each lane's, and the
+    /// plan class is `Unclassified`.
     fn sql_io_shape(
         &self,
-        target: TargetSignal,
-        snapshot: &Snapshot,
+        lanes: &[(TargetSignal, &Snapshot)],
         phase_accounting: &PhaseAccounting,
         unfolded_segments_resolved: u64,
     ) -> QueryIoShape {
-        let (whole_object_threshold, shared_get_permits) = match target {
+        let mut counts = IoShapeCounts::default();
+        let concurrency = self.config.engine.sql_partition_count().max(1) as u64;
+        let mut depth = 0;
+        let mut service_batches = 0u32;
+        for (target, snapshot) in lanes {
+            let (whole_object_threshold, shared_get_permits) = self.io_shape_bounds(*target);
+            depth = snapshot
+                .segments
+                .iter()
+                .map(|seg| {
+                    ravel_query::io_shape::depth_for_object(seg.object_size, whole_object_threshold)
+                })
+                .fold(depth, u32::max);
+            // The two bounds `service_batches` divides by, mirroring
+            // `ravel_query::engine::io_shape_for_resolve`: the fan-out this
+            // crate's own scan partitions the segments into
+            // (`sql_partition_count`) and `target`'s own fetcher's permit
+            // count. The three fetchers this executor holds are not guaranteed
+            // to share one `GetLimiter` (ADR-1195 lets a caller wire each to
+            // its own private limiter, which
+            // `crates/ravel-bench/src/sql_latency.rs`'s `cold_executor` does
+            // for its logs fetcher); reading permits off `target`'s own
+            // fetcher rather than a fixed one keeps this figure correct
+            // regardless of how the embedder wired them, exactly like the
+            // PromQL engine reads its own `get_limiter` rather than a copy.
+            service_batches =
+                service_batches.saturating_add(ravel_query::io_shape::service_batches(
+                    snapshot.segments.len() as u64,
+                    concurrency.min(shared_get_permits),
+                ));
+        }
+        counts.record_dependency_chain(depth);
+        counts.record_service_batches(service_batches);
+        let resolve_snapshot = phase_accounting.resolve().snapshot();
+        let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
+        counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
+        // A metrics query's resolve carries a real pruning signal
+        // (`pushed_down_name_filter` above), so its `Snapshot::segments_pruned`
+        // genuinely distinguishes a pruned fetch from a full scan. The
+        // RLOG/RSPAN/alerts/audit lanes, and a statement over several lanes,
+        // report `PlanClass::Unclassified` instead; see that variant's doc on
+        // `ravel_query::io_shape::PlanClass` for why.
+        //
+        // This does not yet distinguish SQL's metadata-only fast paths (a
+        // predicate-free `SELECT COUNT(*)` answered from partition statistics
+        // with no scan node in the plan, or a declared-column min/max/count
+        // answered from ingest stamps) from a real scan: both still report
+        // `SelectiveIndexed`/`ExhaustiveScan`/`Unclassified` here rather than
+        // `MetadataOnly`, since this function has no signal for "the
+        // optimizer removed the scan node entirely" and adding one is out of
+        // scope for this change.
+        let plan_class = match lanes {
+            [(TargetSignal::Metrics, snapshot)] => {
+                if snapshot.segments_pruned > 0 {
+                    PlanClass::SelectiveIndexed
+                } else {
+                    PlanClass::ExhaustiveScan
+                }
+            }
+            _ => PlanClass::Unclassified,
+        };
+        counts.into_shape(
+            unfolded_segments_resolved,
+            resolve_snapshot.commit_record_cache_hits,
+            plan_class,
+        )
+    }
+
+    /// The whole-object bound and GET permit count of `target`'s fetcher, the
+    /// two per-lane inputs of [`Self::sql_io_shape`].
+    fn io_shape_bounds(&self, target: TargetSignal) -> (u64, u64) {
+        match target {
             TargetSignal::Metrics => (
                 self.fetcher.whole_object_threshold(),
                 self.fetcher.get_limiter_permits() as u64,
@@ -2915,71 +3262,7 @@ impl SqlExecutor {
             // A Parquet statement resolves no segments, so neither figure is
             // read; the scan's own reads go through the same process limiter.
             TargetSignal::Parquet => (u64::MAX, self.fetcher.get_limiter_permits() as u64),
-        };
-        let mut counts = IoShapeCounts::default();
-        let depth = snapshot
-            .segments
-            .iter()
-            .map(|seg| {
-                ravel_query::io_shape::depth_for_object(seg.object_size, whole_object_threshold)
-            })
-            .max()
-            .unwrap_or(0);
-        counts.record_dependency_chain(depth);
-        // The two bounds `service_batches` divides by, mirroring
-        // `ravel_query::engine::io_shape_for_resolve`: the fan-out this
-        // crate's own scan partitions the segments into
-        // (`sql_partition_count`) and `target`'s own fetcher's permit count,
-        // read off the same per-target match as `whole_object_threshold`
-        // above. The three fetchers this executor holds are not guaranteed to
-        // share one `GetLimiter` (ADR-1195 lets a caller wire each to its own
-        // private limiter, which `crates/ravel-bench/src/sql_latency.rs`'s
-        // `cold_executor` does for its logs fetcher); reading permits off
-        // `target`'s own fetcher rather than a fixed one keeps this figure
-        // correct regardless of how the embedder wired them, exactly like the
-        // PromQL engine reads its own `get_limiter` rather than a copy.
-        let concurrency = self.config.engine.sql_partition_count().max(1) as u64;
-        counts.record_service_batches(ravel_query::io_shape::service_batches(
-            snapshot.segments.len() as u64,
-            concurrency.min(shared_get_permits),
-        ));
-        let resolve_snapshot = phase_accounting.resolve().snapshot();
-        let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
-        counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
-        // A metrics query's resolve carries a real pruning signal
-        // (`pushed_down_name_filter` above), so its `Snapshot::segments_pruned`
-        // genuinely distinguishes a pruned fetch from a full scan. The
-        // RLOG/RSPAN/alerts/audit lanes report `PlanClass::Unclassified`
-        // instead; see that variant's doc on
-        // `ravel_query::io_shape::PlanClass` for why.
-        //
-        // This does not yet distinguish SQL's metadata-only fast paths (a
-        // predicate-free `SELECT COUNT(*)` answered from partition statistics
-        // with no scan node in the plan, or a declared-column min/max/count
-        // answered from ingest stamps) from a real scan: both still report
-        // `SelectiveIndexed`/`ExhaustiveScan`/`Unclassified` here rather than
-        // `MetadataOnly`, since this function has no signal for "the
-        // optimizer removed the scan node entirely" and adding one is out of
-        // scope for this change.
-        let plan_class = match target {
-            TargetSignal::Metrics => {
-                if snapshot.segments_pruned > 0 {
-                    PlanClass::SelectiveIndexed
-                } else {
-                    PlanClass::ExhaustiveScan
-                }
-            }
-            TargetSignal::Logs
-            | TargetSignal::Spans
-            | TargetSignal::Alerts
-            | TargetSignal::Audit
-            | TargetSignal::Parquet => PlanClass::Unclassified,
-        };
-        counts.into_shape(
-            unfolded_segments_resolved,
-            resolve_snapshot.commit_record_cache_hits,
-            plan_class,
-        )
+        }
     }
 
     /// The equality `__name__` value a metrics query's pushed-down predicates
@@ -2995,48 +3278,62 @@ impl SqlExecutor {
     /// requires at the top level: pruning to it drops only segments whose
     /// rows the residual filter would drop anyway. The key is derived per
     /// scan from the filters that bind that scan alone
-    /// ([`per_scan_name_keys`]), and one is returned only when every scan
-    /// yields the same key. Any planning error yields
+    /// ([`per_scan_name_keys`]), and one is returned only when every
+    /// `samples` scan yields the same key; scans of the other tables in
+    /// `lanes` read other snapshots and do not count. Any planning error yields
     /// `None` (no prune); the real plan surfaces such errors later through
     /// [`Self::plan_pinned`].
-    async fn pushed_down_name_filter(&self, tenant_hash: TenantHash, sql: &str) -> Option<String> {
-        // Route through `build_session`, the same construction
+    async fn pushed_down_name_filter(
+        &self,
+        tenant_hash: TenantHash,
+        sql: &str,
+        lanes: &[TargetSignal],
+    ) -> Option<String> {
+        // Route through `build_session_with_tables`, the same construction
         // `analyzed_classification_plan` uses, rather than a bare
         // `SessionContext::new()` (ADR-0097 decision 7). This carries the
         // `EmptyObjectStoreRegistry` (ADR-0013 security invariant 1) and the
         // per-registry allowlist deregistrations plus the UDAF replacements,
         // so the two throwaway-session sites converge on one path. The
         // per-table `label`/`label_match` UDFs a metrics session needs are
-        // registered by `build_session` itself. This is a metrics-only site
-        // (its sole caller resolves the `__name__` postings filter).
-        let table = self.empty_snapshot_table(TargetSignal::Metrics, tenant_hash, &[]);
+        // registered by the session builder itself.
+        let tables = lanes
+            .iter()
+            .map(|lane| self.empty_snapshot_table(*lane, tenant_hash, &[]))
+            .collect();
         // A private, unbounded pool: this session only logical-plans and never
         // executes, so nothing is reserved against it and it never touches the
         // tenant accountant.
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         // Plan-inspection only: this throwaway session never executes, so it
         // never spills whatever the query's own session was granted.
-        let ctx = build_session(
+        let ctx = build_session_with_tables(
             &self.config,
             pool,
-            table,
+            tables,
             false,
             crate::session::SpillDecision::Disabled,
         )
         .ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
-        // Every `samples` scan reads the one pruned snapshot, so a key is
-        // usable only when every scan requires it (issue #2907). Scans of
-        // other relations are counted too, which only makes the rule
-        // stricter. A key count that differs from the scan count means the
-        // walk missed a scan, so decline rather than let the rest prune.
+        // Every `samples` scan reads the one pruned metrics snapshot, so a key
+        // is usable only when every `samples` scan requires it (issue #2907).
+        // A key count that differs from the scan count means the walk missed
+        // a scan, which could be a `samples` scan, so decline rather than let
+        // the rest prune.
         let mut keys = Vec::new();
-        per_scan_name_keys(&plan, &[], &mut keys);
+        per_scan_name_keys(&plan, &mut keys);
         if keys.len() != count_table_scans(&plan) {
             return None;
         }
-        let (first, rest) = keys.split_first()?;
-        rest.iter().all(|k| k == first).then(|| first.clone())?
+        let mut samples = keys
+            .into_iter()
+            .filter(|(table, _)| table == SAMPLES_TABLE)
+            .map(|(_, key)| key);
+        let first = samples.next()??;
+        samples
+            .all(|key| key.as_ref() == Some(&first))
+            .then_some(first)
     }
 
     /// ADR-0094 decision 1: whether every aggregate expression and GROUP BY key
@@ -3131,8 +3428,8 @@ impl SqlExecutor {
         declared: &[DeclaredColumn],
         parquet: Option<&[(String, SchemaRef)]>,
     ) -> Result<Option<LogicalPlan>, SqlError> {
-        let table = match parquet {
-            Some(schemas) => SessionTable::Parquet(ParquetSession {
+        let session_tables = match parquet {
+            Some(schemas) => vec![SessionTable::Parquet(ParquetSession {
                 tables: schemas
                     .iter()
                     .map(|(name, schema)| {
@@ -3142,11 +3439,12 @@ impl SqlExecutor {
                     })
                     .collect(),
                 store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant_hash)),
-            }),
-            None => {
-                let target = tables.signal.unwrap_or(TargetSignal::Metrics);
-                self.empty_snapshot_table(target, tenant_hash, declared)
-            }
+            })],
+            None => tables
+                .lanes()
+                .into_iter()
+                .map(|lane| self.empty_snapshot_table(lane, tenant_hash, declared))
+                .collect(),
         };
         // A private, unbounded pool: this session never executes, so nothing is
         // ever reserved against it and it never touches the tenant accountant.
@@ -3155,11 +3453,14 @@ impl SqlExecutor {
         // classification decides the real session's value, not this throwaway.
         // Plan-inspection only: this throwaway session never executes, so it
         // never spills whatever the query's own session was granted.
-        let providers = session_table_providers(&table);
-        let Ok(ctx) = build_session(
+        let providers = session_tables
+            .iter()
+            .flat_map(session_table_providers)
+            .collect();
+        let Ok(ctx) = build_session_with_tables(
             &self.config,
             pool,
-            table,
+            session_tables,
             false,
             crate::session::SpillDecision::Disabled,
         ) else {
@@ -3198,11 +3499,16 @@ impl SqlExecutor {
     /// all are aggregates referencing a declared column. This mirrors exactly
     /// those necessary conditions; anything they cannot prove is left to
     /// decline downstream and still loads here.
+    ///
+    /// `several_tables` is whether the statement names more than one signal
+    /// table; the pushdown checks then read only the `logs` scans' own
+    /// conjuncts.
     fn logs_column_stats_eligible(
         &self,
         snapshot: &Snapshot,
         analyzed: Option<&LogicalPlan>,
         declared: &[DeclaredColumn],
+        several_tables: bool,
     ) -> bool {
         // Pending selective erasure (ADR-0064) rejects the ENTIRE query for
         // every metadata-only path (safety lemma): a pending erasure removes
@@ -3227,6 +3533,9 @@ impl SqlExecutor {
         if !plan_has_aggregate(plan) || !plan_references_declared(plan, declared) {
             return false;
         }
+        if several_tables {
+            return Self::some_logs_scan_may_use_column_stats(snapshot, plan, declared);
+        }
         // Re-derive the reader pushdown from the plan's filter conjuncts with
         // the SAME extractor the scan uses, so the content/prune/ts decisions
         // match `stats_are_exact` exactly. A content or prune predicate makes
@@ -3244,16 +3553,46 @@ impl SqlExecutor {
         // resolves (`pruned_segments`); a segment fully outside the bound is
         // pruned away and never reaches the containment check, so it must not
         // count as a clip here either.
-        let (ts_min, ts_max) = (pushdown.ts_min(), pushdown.ts_max());
-        let clips = snapshot
+        !Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())
+    }
+
+    /// Whether `[ts_min, ts_max]` clips a segment of `snapshot` it touches.
+    fn ts_bound_clips(snapshot: &Snapshot, ts_min: i64, ts_max: i64) -> bool {
+        snapshot
             .segments
             .iter()
             .filter(|s| LogSegmentFetcher::ts_range_relevant(s, ts_min, ts_max))
-            .any(|s| !(ts_min <= s.min_event_ts_ns && s.max_event_ts_ns <= ts_max));
-        if clips {
-            return false;
+            .any(|s| !(ts_min <= s.min_event_ts_ns && s.max_event_ts_ns <= ts_max))
+    }
+
+    /// [`Self::logs_column_stats_eligible`]'s pushdown checks for a plan that
+    /// scans several tables, where only the `logs` scans read the logs
+    /// snapshot: each `logs` scan is checked on its own conjuncts
+    /// ([`per_scan_conjuncts`]), and the load is skipped only when every one
+    /// of them declines. A walk that misses a scan keeps the load.
+    fn some_logs_scan_may_use_column_stats(
+        snapshot: &Snapshot,
+        plan: &LogicalPlan,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let mut scans = Vec::new();
+        per_scan_conjuncts(plan, &[], &mut scans);
+        if scans.len() != count_table_scans(plan) {
+            return true;
         }
-        true
+        let mut logs_scans = scans
+            .iter()
+            .filter(|(table, _)| table == LOGS_TABLE)
+            .peekable();
+        if logs_scans.peek().is_none() {
+            return true;
+        }
+        logs_scans.any(|(_, own)| {
+            let pushdown = extract_logs(own, declared);
+            pushdown.content.is_empty()
+                && pushdown.prune.is_empty()
+                && !Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())
+        })
     }
 
     /// A throwaway [`SessionTable`] over an empty snapshot for `target`,
@@ -3351,59 +3690,58 @@ impl SqlExecutor {
     /// manifests are resolved.
     #[cfg(test)]
     fn target_signal(sql: &str) -> Result<TargetSignal, SqlError> {
-        Ok(Self::statement_tables(sql)?
-            .signal
-            .unwrap_or(TargetSignal::Metrics))
+        let tables = Self::statement_tables(sql)?;
+        refuse_cross_signal(&tables)?;
+        Ok(tables.first_lane())
     }
 
-    /// The base tables `sql` names: the one signal table, if any, and every
-    /// other name. Two signal tables are [`SqlError::CrossSignalQuery`], and
-    /// more than [`MAX_STATEMENT_TABLE_NAMES`] other names are
+    /// The base tables `sql` names: every signal table, in
+    /// [`SIGNAL_LANE_ORDER`], and every other name. More than
+    /// [`MAX_STATEMENT_TABLE_NAMES`] other names are
     /// [`SqlError::TooManyTables`], so the Parquet resolve's one LIST per
-    /// name is bounded before it starts.
+    /// name is bounded before it starts. Two signal tables are not refused
+    /// here; [`refuse_cross_signal`] does that at the entry points.
     pub(crate) fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
         let mut tables = referenced_base_tables(sql)?;
-        let has_samples = tables.remove(SAMPLES_TABLE);
-        let has_logs = tables.remove(LOGS_TABLE);
-        let has_spans = tables.remove(SPANS_TABLE);
-        let has_alerts = tables.remove(ALERTS_TABLE);
-        let has_audit = tables.remove(AUDIT_TABLE);
-        // Naming two of the five real tables crosses signals: v1 resolves one
-        // snapshot per query, so this is rejected before any catalog listing.
-        let named = u8::from(has_samples)
-            + u8::from(has_logs)
-            + u8::from(has_spans)
-            + u8::from(has_alerts)
-            + u8::from(has_audit);
-        if named > 1 {
-            return Err(SqlError::CrossSignalQuery);
-        }
+        let signals: Vec<TargetSignal> = SIGNAL_LANE_ORDER
+            .into_iter()
+            .filter(|signal| {
+                crate::statement::signal_table_name(*signal).is_some_and(|name| tables.remove(name))
+            })
+            .collect();
         if tables.len() > MAX_STATEMENT_TABLE_NAMES {
             return Err(SqlError::TooManyTables {
                 count: tables.len(),
                 max: MAX_STATEMENT_TABLE_NAMES,
             });
         }
-        let signal = if has_logs {
-            Some(TargetSignal::Logs)
-        } else if has_spans {
-            Some(TargetSignal::Spans)
-        } else if has_alerts {
-            Some(TargetSignal::Alerts)
-        } else if has_audit {
-            Some(TargetSignal::Audit)
-        } else if has_samples {
-            Some(TargetSignal::Metrics)
-        } else {
-            None
-        };
         Ok(StatementTables {
-            signal,
+            signals,
             others: tables,
         })
     }
 
-    /// Build a session over `snapshot`, plan, and drain the stream.
+    /// The cross-signal refusal every public entry point applies before any
+    /// catalog request: `statement`'s tables, refused when they name two or
+    /// more signal tables. A test executor may switch the refusal off
+    /// ([`Self::allow_cross_signal_for_test`]); nothing else can.
+    fn admit_statement_tables(&self, statement: Statement<'_>) -> Result<(), SqlError> {
+        let tables = statement.tables()?;
+        #[cfg(test)]
+        if self.allow_cross_signal {
+            return Ok(());
+        }
+        refuse_cross_signal(&tables)
+    }
+
+    /// Let this executor run statements naming several signal tables.
+    #[cfg(test)]
+    pub(crate) fn allow_cross_signal_for_test(mut self) -> Self {
+        self.allow_cross_signal = true;
+        self
+    }
+
+    /// Build a session over each lane's snapshot, plan, and drain the stream.
     ///
     /// Returns the batch count alongside the result because the retry
     /// contract turns on whether anything was emitted before the failure.
@@ -3413,7 +3751,7 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         statement: Statement<'_>,
         req: &SqlRequest,
-        snapshot: Snapshot,
+        lanes: Vec<(TargetSignal, Snapshot)>,
         phase_accounting: &PhaseAccounting,
         declared: &[DeclaredColumn],
         parquet: Option<ParquetResolution>,
@@ -3430,7 +3768,7 @@ impl SqlExecutor {
         let planned = match self
             .plan_pinned_with(
                 tenant_hash,
-                snapshot,
+                lanes,
                 statement,
                 phase_accounting,
                 PlanExtras {
@@ -4349,6 +4687,12 @@ fn classify_shared(err: &DataFusionError) -> Option<SqlError> {
 /// the plan's inputs so a predicate under a projection or aggregate is still
 /// seen; the extractor treats each collected expression as an implicit
 /// top-level AND conjunct and splits nested `AND`s itself.
+///
+/// The result pools predicates from every scan and every branch, so it is
+/// sound only for a decision that cannot drop rows (such as skipping a load
+/// that would only have been consulted). Anything that prunes what a scan
+/// reads must take its predicates per scan, from [`per_scan_name_keys`] or
+/// [`per_scan_conjuncts`].
 fn collect_filter_predicates(plan: &LogicalPlan, out: &mut Vec<Expr>) {
     if let LogicalPlan::Filter(filter) = plan {
         out.push(filter.predicate.clone());
@@ -4372,8 +4716,22 @@ fn count_table_scans(plan: &LogicalPlan) -> usize {
 }
 
 /// Push one entry per `TableScan` in `plan` (subquery plans included) onto
-/// `keys`: the `__name__` pruning key that scan's rows are required to
-/// satisfy, or `None`.
+/// `keys`: the registered table the scan reads, and the `__name__` pruning
+/// key that scan's rows are required to satisfy, or `None`.
+fn per_scan_name_keys(plan: &LogicalPlan, keys: &mut Vec<(String, Option<String>)>) {
+    let mut scans = Vec::new();
+    per_scan_conjuncts(plan, &[], &mut scans);
+    keys.extend(
+        scans
+            .into_iter()
+            .map(|(table, own)| (table, equality_name_filter(&extract(&own).matchers))),
+    );
+}
+
+/// Push one entry per `TableScan` in `plan` (subquery plans included) onto
+/// `scans`: the registered table the scan reads, and the conjuncts every row
+/// it contributes is required to satisfy, with columns qualified by the
+/// scan's own relation (its alias, when it has one).
 ///
 /// `inherited` holds the predicates of the `Filter` nodes above `plan` that
 /// still constrain the rows it produces. They pass down only through a
@@ -4381,39 +4739,49 @@ fn count_table_scans(plan: &LogicalPlan) -> usize {
 /// other node can rename, aggregate, or null-extend its input, so its inputs
 /// start with none. At a scan, only the conjuncts whose columns all carry
 /// that scan's qualifier, and that reference no outer column, count.
-fn per_scan_name_keys(plan: &LogicalPlan, inherited: &[Expr], keys: &mut Vec<Option<String>>) {
-    let scan_key = |qualifier: &TableReference, inherited: &[Expr]| {
-        let own: Vec<Expr> = inherited
+fn per_scan_conjuncts(
+    plan: &LogicalPlan,
+    inherited: &[Expr],
+    scans: &mut Vec<(String, Vec<Expr>)>,
+) {
+    let own = |qualifier: &TableReference, inherited: &[Expr]| -> Vec<Expr> {
+        inherited
             .iter()
             .flat_map(|p| datafusion::logical_expr::utils::split_conjunction(p))
             .filter(|c| conjunct_is_scoped_to(c, qualifier))
             .cloned()
-            .collect();
-        equality_name_filter(&extract(&own).matchers)
+            .collect()
     };
     // Subquery plans nested in this node's expressions see none of the
     // filters above it.
     let _ = plan.apply_subqueries(|sub| {
-        per_scan_name_keys(sub, &[], keys);
+        per_scan_conjuncts(sub, &[], scans);
         Ok(TreeNodeRecursion::Continue)
     });
     match plan {
-        LogicalPlan::TableScan(scan) => keys.push(scan_key(&scan.table_name, inherited)),
-        LogicalPlan::SubqueryAlias(alias) if matches!(*alias.input, LogicalPlan::TableScan(_)) => {
-            keys.push(scan_key(&alias.alias, inherited));
-        }
+        LogicalPlan::TableScan(scan) => scans.push((
+            scan.table_name.table().to_string(),
+            own(&scan.table_name, inherited),
+        )),
+        LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
+            LogicalPlan::TableScan(scan) => scans.push((
+                scan.table_name.table().to_string(),
+                own(&alias.alias, inherited),
+            )),
+            input => per_scan_conjuncts(input, &[], scans),
+        },
         LogicalPlan::Filter(filter) => {
             let mut next = inherited.to_vec();
             next.push(filter.predicate.clone());
-            per_scan_name_keys(&filter.input, &next, keys);
+            per_scan_conjuncts(&filter.input, &next, scans);
         }
         LogicalPlan::Join(join) if join.join_type == datafusion::common::JoinType::Inner => {
-            per_scan_name_keys(&join.left, inherited, keys);
-            per_scan_name_keys(&join.right, inherited, keys);
+            per_scan_conjuncts(&join.left, inherited, scans);
+            per_scan_conjuncts(&join.right, inherited, scans);
         }
         other => {
             for input in other.inputs() {
-                per_scan_name_keys(input, &[], keys);
+                per_scan_conjuncts(input, &[], scans);
             }
         }
     }
@@ -5558,7 +5926,7 @@ mod name_filter_tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
+pub(crate) mod tests {
     use datafusion::arrow::array::TimestampNanosecondArray;
     use ravel_catalog::CatalogConfig;
     use ravel_commit::publish::RetryPolicy;
@@ -5610,7 +5978,7 @@ mod tests {
         }
     }
 
-    fn empty_store() -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
+    pub(crate) fn empty_store() -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
         Arc::new(InstrumentedStore::new(FaultStore::new(
             MemoryStore::new(),
             FaultPlan::empty(),
@@ -5806,6 +6174,7 @@ mod tests {
             requests,
             max,
             fold_lag,
+            table: None,
         } = &err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
@@ -5893,6 +6262,7 @@ mod tests {
             requests,
             max,
             fold_lag: _,
+            table: None,
         } = err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {err:?}");
@@ -5923,6 +6293,7 @@ mod tests {
             requests: explain_requests,
             max: explain_max,
             fold_lag: _,
+            table: None,
         } = explain_err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {explain_err:?}");
@@ -5950,6 +6321,7 @@ mod tests {
             requests: snapshot_requests,
             max: snapshot_max,
             fold_lag: _,
+            table: None,
         } = snapshot_err
         else {
             panic!("expected SqlError::RequestBudgetExceeded, got {snapshot_err:?}");
@@ -7555,7 +7927,11 @@ mod tests {
             segments_pruned: 0,
             pending_erasure: Vec::new(),
         };
-        let shape = exec.sql_io_shape(TargetSignal::Logs, &snapshot, &PhaseAccounting::new(), 0);
+        let shape = exec.sql_io_shape(
+            &[(TargetSignal::Logs, &snapshot)],
+            &PhaseAccounting::new(),
+            0,
+        );
         assert_eq!(shape.dependency_depth, 1);
     }
 
@@ -7930,27 +8306,46 @@ mod tests {
         String,
     ) {
         let tenant = TenantId::new(tenant_name.to_string());
-        let tenant_hash = tenant.hash();
-        let labels = LabelSet::new(vec![Label {
-            name: "__name__".to_string(),
-            value: "m".to_string(),
-        }])
-        .expect("valid labels");
-        let series_id = SeriesId::compute(&tenant, "m", &labels).expect("series id");
         let samples: Vec<Sample> = (0..count)
             .map(|i| Sample {
                 ts_ns: i,
                 value: i as f64,
             })
             .collect();
+        let memory = MemoryStore::new();
+        let data_key = publish_metric_samples(&memory, &tenant, 1, "m", samples).await;
+        let store = Arc::new(InstrumentedStore::new(FaultStore::new(memory, plan)));
+        (store, tenant.hash(), data_key)
+    }
 
-        let writer_id = Uuid::from_u128(1_376);
+    /// The writer every published fixture segment names.
+    const FIXTURE_WRITER: u128 = 1_376;
+
+    /// Write one series of `metric` holding `samples` as an RSEG segment of
+    /// writer sequence `writer_seq`, put it into `memory` and publish its
+    /// commit record into ingest hour 0. Returns the data object's key.
+    pub(crate) async fn publish_metric_samples(
+        memory: &MemoryStore,
+        tenant: &TenantId,
+        writer_seq: u64,
+        metric: &str,
+        samples: Vec<Sample>,
+    ) -> String {
+        let tenant_hash = tenant.hash();
+        let labels = LabelSet::new(vec![Label {
+            name: "__name__".to_string(),
+            value: metric.to_string(),
+        }])
+        .expect("valid labels");
+        let series_id = SeriesId::compute(tenant, metric, &labels).expect("series id");
+
+        let writer_id = Uuid::from_u128(FIXTURE_WRITER);
         let identity = SegmentIdentity {
             tenant_hash: tenant_hash.0,
             shard: 0,
             writer_id: writer_id.to_string(),
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
         };
         let bounds = IngestBounds {
             min_ingest_ts_ns: 0,
@@ -7973,7 +8368,7 @@ mod tests {
             shard: 0,
             writer_id,
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
             object_size: written.bytes.len() as u64,
             content_hash: written.summary.blake3,
             sample_count: written.summary.sample_count,
@@ -7986,20 +8381,26 @@ mod tests {
             created_unix_ns: 1,
             ingest_hour_bucket: 0,
         };
+        put_and_publish(memory, new_record, written.bytes).await
+    }
+
+    /// Put `bytes` into `memory` as the data object `new_record` names and
+    /// publish the record. Returns the data object's key.
+    async fn put_and_publish(
+        memory: &MemoryStore,
+        new_record: NewCommitRecord,
+        bytes: bytes::Bytes,
+    ) -> String {
         let rec = record::build(new_record).expect("valid commit record");
         let data_key = keys::reconstruct_data_key(&rec).expect("data key");
-
-        let memory = MemoryStore::new();
         memory
-            .put(&data_key, written.bytes, PutOptions::default())
+            .put(&data_key, bytes, PutOptions::default())
             .await
             .expect("put data object");
-        publish::publish(&memory, &rec, &RetryPolicy::default())
+        publish::publish(memory, &rec, &RetryPolicy::default())
             .await
             .expect("publish");
-
-        let store = Arc::new(InstrumentedStore::new(FaultStore::new(memory, plan)));
-        (store, tenant_hash, data_key)
+        data_key
     }
 
     /// One published RSPAN segment holding `count` spans whose `start_ts` is
@@ -8012,7 +8413,6 @@ mod tests {
     ) -> (Arc<InstrumentedStore<FaultStore<MemoryStore>>>, TenantHash) {
         let tenant = TenantId::new(tenant_name.to_string());
         let tenant_hash = tenant.hash();
-        let writer_id = Uuid::from_u128(1_376);
         let records: Vec<SpanRecord> = (0..count)
             .map(|i| SpanRecord {
                 trace_id: [1u8; 16],
@@ -8026,34 +8426,49 @@ mod tests {
                 attrs: vec![("service.name".to_string(), "checkout".to_string())],
             })
             .collect();
+        let memory = MemoryStore::new();
+        publish_spans(&memory, tenant_hash, 1, &records).await;
+        (wrap_fixture_store(memory), tenant_hash)
+    }
 
+    /// Encode `records` as one RSPAN object of writer sequence `writer_seq`,
+    /// put it into `memory` and publish its `Signal::Spans` commit record.
+    /// Returns the data object's key.
+    pub(crate) async fn publish_spans(
+        memory: &MemoryStore,
+        tenant_hash: TenantHash,
+        writer_seq: u64,
+        records: &[SpanRecord],
+    ) -> String {
         let identity = SpanObjectIdentity {
             tenant_hash: tenant_hash.0,
             shard: 0,
-            writer_id: *writer_id.as_bytes(),
+            writer_id: *Uuid::from_u128(FIXTURE_WRITER).as_bytes(),
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
         };
         let mut writer = RspanWriter::new(RspanConfig::default(), identity);
-        for record in &records {
+        for record in records {
             writer.push(record.clone());
         }
         let bytes = writer.finish().expect("finish span object");
 
         let min = records.iter().map(|r| r.start_ts_ns).min().expect("rows");
         let max = records.iter().map(|r| r.end_ts_ns).max().expect("rows");
-        let store = publish_one_segment(
-            tenant_hash,
-            Signal::Spans,
-            writer_id,
-            bytes,
-            records.len() as u64,
-            min,
-            max,
-            1,
+        publish_encoded(
+            memory,
+            EncodedSegment {
+                tenant_hash,
+                signal: Signal::Spans,
+                writer_seq,
+                bytes,
+                row_count: records.len() as u64,
+                min_event_ts_ns: min,
+                max_event_ts_ns: max,
+                segment_format_version: 1,
+            },
         )
-        .await;
-        (store, tenant_hash)
+        .await
     }
 
     /// One published RLOG segment on the audit stream holding `count` records
@@ -8066,103 +8481,132 @@ mod tests {
     ) -> (Arc<InstrumentedStore<FaultStore<MemoryStore>>>, TenantHash) {
         let tenant = TenantId::new(tenant_name.to_string());
         let tenant_hash = tenant.hash();
-        let writer_id = Uuid::from_u128(1_376);
-        let records: Vec<LogRecord> = (0..count)
-            .map(|i| LogRecord {
-                stream_id: ravel_types::logstream::log_stream_id(&[], "audit", "1", &[]),
-                stream_attrs: stream_attrs_bytes(&[], "audit", "1", &[]),
-                ts_ns: i * 100,
-                observed_ts_ns: i * 100,
-                severity_num: 0,
-                severity_text: "INFO".to_string(),
-                body: "query".to_string(),
-                trace_id: None,
-                span_id: None,
-                flags: 0,
-                attrs: Vec::new(),
-            })
-            .collect();
+        let records: Vec<LogRecord> = (0..count).map(|i| log_record("audit", i * 100)).collect();
+        let memory = MemoryStore::new();
+        publish_log_records(&memory, tenant_hash, Signal::Audit, 1, &records).await;
+        (wrap_fixture_store(memory), tenant_hash)
+    }
 
+    /// One `INFO` record on the log stream of scope `scope`, at `ts_ns`.
+    pub(crate) fn log_record(scope: &str, ts_ns: i64) -> LogRecord {
+        LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&[], scope, "1", &[]),
+            stream_attrs: stream_attrs_bytes(&[], scope, "1", &[]),
+            ts_ns,
+            observed_ts_ns: ts_ns,
+            severity_num: 0,
+            severity_text: "INFO".to_string(),
+            body: "query".to_string(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    /// Encode `records` as one RLOG object of writer sequence `writer_seq`,
+    /// put it into `memory` and publish its commit record under `signal`
+    /// (`Logs` or `Audit`). The RLOG footer carries a tenant hash the read
+    /// path checks, so the identity names `tenant_hash`. Returns the data
+    /// object's key.
+    pub(crate) async fn publish_log_records(
+        memory: &MemoryStore,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        writer_seq: u64,
+        records: &[LogRecord],
+    ) -> String {
         let identity = LogObjectIdentity {
             tenant_hash: tenant_hash.0,
             shard: 0,
-            writer_id: *writer_id.as_bytes(),
+            writer_id: *Uuid::from_u128(FIXTURE_WRITER).as_bytes(),
             writer_epoch: 1,
-            writer_seq: 1,
+            writer_seq,
         };
         let mut writer = RlogWriter::new(RlogConfig::default(), identity);
-        for record in &records {
-            writer.push(record.clone()).expect("push audit record");
+        for record in records {
+            writer.push(record.clone()).expect("push log record");
         }
-        let bytes = writer.finish().expect("finish audit object");
+        let bytes = writer.finish().expect("finish log object");
 
         let min = records.iter().map(|r| r.ts_ns).min().expect("rows");
         let max = records.iter().map(|r| r.ts_ns).max().expect("rows");
-        let store = publish_one_segment(
-            tenant_hash,
-            Signal::Audit,
-            writer_id,
-            bytes,
-            records.len() as u64,
-            min,
-            max,
-            u32::from(ravel_logseg::footer::VERSION),
+        publish_encoded(
+            memory,
+            EncodedSegment {
+                tenant_hash,
+                signal,
+                writer_seq,
+                bytes,
+                row_count: records.len() as u64,
+                min_event_ts_ns: min,
+                max_event_ts_ns: max,
+                segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            },
         )
-        .await;
-        (store, tenant_hash)
+        .await
     }
 
-    /// Put one already-encoded data object and publish its commit record, then
-    /// wrap the store the way [`one_metrics_segment`] does.
-    #[allow(clippy::too_many_arguments)]
-    async fn publish_one_segment(
+    /// One already-encoded data object and the commit-record fields that
+    /// describe it.
+    struct EncodedSegment {
         tenant_hash: TenantHash,
         signal: Signal,
-        writer_id: Uuid,
+        writer_seq: u64,
         bytes: Vec<u8>,
         row_count: u64,
         min_event_ts_ns: i64,
         max_event_ts_ns: i64,
         segment_format_version: u32,
-    ) -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
+    }
+
+    /// Put `segment` into `memory` and publish its commit record into ingest
+    /// hour 0. Returns the data object's key.
+    async fn publish_encoded(memory: &MemoryStore, segment: EncodedSegment) -> String {
         let new_record = NewCommitRecord {
-            tenant_hash,
-            signal,
+            tenant_hash: segment.tenant_hash,
+            signal: segment.signal,
             shard: 0,
-            writer_id,
+            writer_id: Uuid::from_u128(FIXTURE_WRITER),
             writer_epoch: 1,
-            writer_seq: 1,
-            object_size: bytes.len() as u64,
-            content_hash: *blake3::hash(&bytes).as_bytes(),
-            sample_count: row_count,
+            writer_seq: segment.writer_seq,
+            object_size: segment.bytes.len() as u64,
+            content_hash: *blake3::hash(&segment.bytes).as_bytes(),
+            sample_count: segment.row_count,
             series_count: 0,
-            min_event_ts_ns,
-            max_event_ts_ns,
-            min_ingest_ts_ns: min_event_ts_ns,
-            max_ingest_ts_ns: max_event_ts_ns,
-            segment_format_version,
+            min_event_ts_ns: segment.min_event_ts_ns,
+            max_event_ts_ns: segment.max_event_ts_ns,
+            min_ingest_ts_ns: segment.min_event_ts_ns,
+            max_ingest_ts_ns: segment.max_event_ts_ns,
+            segment_format_version: segment.segment_format_version,
             created_unix_ns: 1,
             ingest_hour_bucket: 0,
         };
-        let rec = record::build(new_record).expect("valid commit record");
-        let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+        put_and_publish(memory, new_record, bytes::Bytes::from(segment.bytes)).await
+    }
 
-        let memory = MemoryStore::new();
-        memory
-            .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
-            .await
-            .expect("put data object");
-        publish::publish(&memory, &rec, &RetryPolicy::default())
-            .await
-            .expect("publish");
-
+    /// `memory` under the counting, fault-injecting wrapper every fixture
+    /// store uses, with no fault planned.
+    pub(crate) fn wrap_fixture_store(
+        memory: MemoryStore,
+    ) -> Arc<InstrumentedStore<FaultStore<MemoryStore>>> {
         Arc::new(InstrumentedStore::new(FaultStore::new(
             memory,
             FaultPlan::empty(),
         )))
     }
 
-    fn executor_over(store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>) -> SqlExecutor {
+    pub(crate) fn executor_over(
+        store: Arc<InstrumentedStore<FaultStore<MemoryStore>>>,
+    ) -> SqlExecutor {
+        executor_with(store, SqlConfig::default())
+    }
+
+    /// An executor over `store` under `config`, with its own catalog handle.
+    pub(crate) fn executor_with(
+        store: Arc<dyn ObjectStoreBackend>,
+        config: SqlConfig,
+    ) -> SqlExecutor {
         let catalog =
             Arc::new(Catalog::new(store.clone(), CatalogConfig::default()).expect("catalog"));
         SqlExecutor::new(
@@ -8170,7 +8614,7 @@ mod tests {
             SegmentFetcher::new(store.clone()),
             LogSegmentFetcher::new(store.clone()),
             SpanSegmentFetcher::new(store),
-            SqlConfig::default(),
+            config,
             1 << 30,
         )
     }
@@ -8183,7 +8627,7 @@ mod tests {
     /// The named event-time column of a result, as raw nanoseconds. Every
     /// table's event-time column is `Timestamp(Nanosecond, None)`, so the same
     /// reader serves `ts`, `start_ts`, and `ts_ns`.
-    fn ts_column_values(output: &QueryOutput, name: &str) -> Vec<i64> {
+    pub(crate) fn ts_column_values(output: &QueryOutput, name: &str) -> Vec<i64> {
         let mut values = Vec::new();
         for batch in output.batches() {
             let column = batch.column_by_name(name).expect("event-time column");
@@ -8198,7 +8642,7 @@ mod tests {
 
     /// A request carrying the T1 defaults off: the struct names no table, so
     /// the statement is the only thing that selects one.
-    fn sql_request(sql: &str, window: TimeRange) -> SqlRequest {
+    pub(crate) fn sql_request(sql: &str, window: TimeRange) -> SqlRequest {
         SqlRequest {
             sql: sql.to_string(),
             window,

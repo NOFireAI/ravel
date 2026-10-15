@@ -173,10 +173,7 @@ mod tests {
             ],
             output: vec![("_e1".to_string(), "_e1".to_string())],
         };
-        let tables = StatementTables {
-            signal: None,
-            others: Default::default(),
-        };
+        let tables = StatementTables::one(None);
         let context = LoweringContext::snapshot(&SessionContext::new(), Vec::new(), &tables);
         let plan = lower(&pipeline, &context).expect("lowers");
         let LogicalPlan::Projection(projection) = &plan else {

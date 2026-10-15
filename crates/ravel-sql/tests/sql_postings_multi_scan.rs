@@ -139,6 +139,7 @@ async fn subquery_scan_keeps_rows_the_outer_filter_excludes() {
     let (fixture, tenant) = folded_fixture("multi-scan-subquery").await;
     // The subquery reads only `b` rows (T1, T2); the outer `a` rows at those
     // two timestamps survive.
+    const SHARED_TS_A_ROWS: usize = 2;
     let outcome = run(
         &fixture,
         &tenant,
@@ -146,8 +147,28 @@ async fn subquery_scan_keeps_rows_the_outer_filter_excludes() {
          AND ts IN (SELECT ts FROM samples WHERE label(labels, '__name__') = 'b')",
     )
     .await;
-    assert_eq!(value_counts(&outcome), (B_ROWS, 0, B_ROWS));
+    assert_eq!(
+        value_counts(&outcome),
+        (SHARED_TS_A_ROWS, 0, SHARED_TS_A_ROWS)
+    );
     assert_eq!(outcome.stats.segments, 2);
+}
+
+#[tokio::test]
+async fn subquery_scan_with_the_outer_filter_still_prunes() {
+    let (fixture, tenant) = folded_fixture("multi-scan-subquery-same").await;
+    let outcome = run(
+        &fixture,
+        &tenant,
+        "SELECT value FROM samples WHERE label(labels, '__name__') = 'a' \
+         AND ts IN (SELECT ts FROM samples WHERE label(labels, '__name__') = 'a')",
+    )
+    .await;
+    assert_eq!(value_counts(&outcome), (A_ROWS, 0, A_ROWS));
+    assert_eq!(
+        outcome.stats.segments, 1,
+        "both scans filter on a, so the snapshot prunes to its segment"
+    );
 }
 
 #[tokio::test]

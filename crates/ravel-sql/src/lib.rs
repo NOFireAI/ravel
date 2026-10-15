@@ -59,6 +59,8 @@ pub mod complexity_guard;
 mod config;
 pub mod conformance;
 mod cost;
+#[cfg(test)]
+mod cross_signal_tests;
 mod ddl;
 mod ddl_cost;
 mod declared;
