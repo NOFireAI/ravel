@@ -79,6 +79,10 @@ async fn every_refused_entry_is_refused_with_a_typed_error() {
     let mut refused = 0;
     for entry in &manifest.entries {
         let prepared = prepare(&entry.example);
+        let mut found = format!(
+            "prepare gives {:?}",
+            prepared.as_ref().map(|_| "a statement")
+        );
         let holds = match (entry.parser, entry.binder, &prepared) {
             (State::Refused, _, Err(EsqlError::Parse(error))) => {
                 matches!(error, ravel_esql::Error::UnsupportedSyntax { .. })
@@ -95,8 +99,14 @@ async fn every_refused_entry_is_refused_with_a_typed_error() {
                 if entry.executor == State::Refused =>
             {
                 match run_prepared(&fixture, prepared).await {
-                    Err(error) => is_typed_refusal(&error),
-                    Ok(_) => false,
+                    Err(error) => {
+                        found = format!("the run fails with {error:?}");
+                        is_typed_refusal(&error)
+                    }
+                    Ok(_) => {
+                        found = "the statement prepares and runs".to_string();
+                        false
+                    }
                 }
             }
             (_, State::Supported, Ok(_)) if entry.executor == State::Supported => continue,
@@ -106,12 +116,11 @@ async fn every_refused_entry_is_refused_with_a_typed_error() {
             refused += 1;
         } else {
             wrong.push(format!(
-                "{} is marked parser = {}, binder = {}, executor = {} but prepares to {:?}",
+                "{} is marked parser = {}, binder = {}, executor = {} but {found}",
                 describe(entry),
                 entry.parser,
                 entry.binder,
                 entry.executor,
-                prepared.as_ref().map(|_| "a statement")
             ));
         }
     }
