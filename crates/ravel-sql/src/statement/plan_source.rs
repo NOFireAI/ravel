@@ -218,7 +218,7 @@ fn logs_scan_node(
 
 /// A call carrying `func` itself. `AggregateUDF::call` would wrap a copy,
 /// which admission refuses as a foreign instance.
-fn aggregate_call(func: Arc<AggregateUDF>, args: Vec<Expr>) -> Expr {
+pub(crate) fn aggregate_call(func: Arc<AggregateUDF>, args: Vec<Expr>) -> Expr {
     Expr::AggregateFunction(AggregateFunction::new_udf(
         func,
         args,
@@ -321,7 +321,7 @@ pub(crate) async fn logs_fixture(
 }
 
 /// Every cell of every row, rendered with Arrow's display formatter.
-fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
+pub(crate) fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     for batch in batches {
         for row in 0..batch.num_rows() {
@@ -337,7 +337,7 @@ fn rows(batches: &[RecordBatch]) -> Vec<Vec<String>> {
     out
 }
 
-fn owned(rows: &[&[&str]]) -> Vec<Vec<String>> {
+pub(crate) fn owned(rows: &[&[&str]]) -> Vec<Vec<String>> {
     rows.iter()
         .map(|row| row.iter().map(|cell| (*cell).to_string()).collect())
         .collect()
@@ -478,7 +478,7 @@ fn spill_subdirs(root: &Path) -> usize {
         .count()
 }
 
-fn spill_enabled_config(dir: &Path) -> SqlConfig {
+pub(crate) fn spill_enabled_config(dir: &Path) -> SqlConfig {
     SqlConfig {
         spill: Some(SpillConfig {
             dir: dir.to_path_buf(),
@@ -1177,6 +1177,45 @@ async fn lowering_that_changes_an_aggregate_input_type_is_refused() {
         .expect_err("a lowering whose aggregate changes type is refused");
     assert_not_admitted(&err, "not repeatable");
     assert_eq!(statement.lowerings(), 2, "one classification, one executed");
+    assert_eq!(
+        statement.sites(),
+        [LoweringSite::Classification, LoweringSite::Executed]
+    );
+}
+
+/// The other direction: the classification lowering sums the cast, which is
+/// not exact-typed, so the session aggregates serially; the executed lowering
+/// sums the integer column, which is. A serial aggregation is correct for
+/// an exact-typed plan, so the statement runs.
+#[tokio::test]
+async fn lowering_exact_typed_only_on_its_executed_call_runs() {
+    let tenant = tenant_id("acme-logs");
+    let (_store, fixture) = logs_fixture(FaultPlan::empty(), &tenant, SqlConfig::default()).await;
+    let statement = Programmatic::over_logs(
+        DialectPolicy::new(Vec::<String>::new(), ["sum"], Vec::<String>::new()),
+        |ctx, call| {
+            let sum = ctx.aggregate("sum")?;
+            let input = match call {
+                1 => cast(col("severity_num"), DataType::Float64),
+                _ => col("severity_num"),
+            };
+            ctx.scan("logs")?
+                .aggregate(
+                    vec![col("severity_text")],
+                    vec![aggregate_call(sum, vec![input]).alias("s")],
+                )?
+                .sort(vec![col("severity_text").sort(true, false)])?
+                .build()
+        },
+    );
+
+    let outcome = run_statement(&fixture, &tenant, &statement, &statement_request())
+        .await
+        .expect("an executed plan more exact than its classification runs");
+    assert_eq!(
+        rows(outcome.output.batches()),
+        owned(&[&["DEBUG", "5"], &["INFO", "27"], &["WARN", "26"]])
+    );
     assert_eq!(
         statement.sites(),
         [LoweringSite::Classification, LoweringSite::Executed]
