@@ -31,6 +31,7 @@ fn name(dotted: &str) -> QualifiedName {
                 text: part.to_owned(),
                 quoted: false,
                 span: NO_SPAN,
+                param: None,
             })
             .collect(),
         span: NO_SPAN,
@@ -42,6 +43,7 @@ fn quoted(text: &str) -> NamePart {
         text: text.to_owned(),
         quoted: true,
         span: NO_SPAN,
+        param: None,
     }
 }
 
@@ -153,6 +155,7 @@ fn query(source: Command, processing: Vec<Command>) -> Query {
         source,
         processing,
         span: NO_SPAN,
+        settings: Vec::new(),
     }
 }
 

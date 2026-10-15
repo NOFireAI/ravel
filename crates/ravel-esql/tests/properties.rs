@@ -8,14 +8,18 @@
 
 use proptest::prelude::*;
 use ravel_esql::ast::{
-    Aggregate, ArrayLiteral, Binary, BinaryOp, Call, CallArgs, Cast, Command, DropCommand,
-    EvalCommand, Expr, Field, FromCommand, InList, Interval, IsNull, KeepCommand, Like, LikeKind,
-    LimitCommand, Literal, LiteralValue, Metadata, NamePart, NullsOrder, ParamName, Parameter,
-    QualifiedName, Query, RenameCommand, RenamePair, RowCommand, SortCommand, SortKey, SortOrder,
-    SourcePattern, StatsCommand, Unary, UnaryOp, WhereCommand,
+    Aggregate, ArrayLiteral, Binary, BinaryOp, Call, CallArgs, Cast, ChangePointCommand,
+    ChangePointOutput, Command, CompletionCommand, DissectCommand, DropCommand, EnrichCommand,
+    EnrichField, EvalCommand, Expr, Field, ForkBranch, ForkCommand, FromCommand,
+    FromQueriesCommand, FromSource, FuseCommand, FuseMethod, GrokCommand, InList, InSubquery,
+    Interval, IsNull, KeepCommand, Like, LikeKind, LimitByCommand, LimitCommand, Literal,
+    LiteralValue, LookupJoinCommand, MapEntry, MapLiteral, Metadata, MvExpandCommand, NamePart,
+    NullsOrder, ParamName, Parameter, PromqlCommand, PromqlParam, PromqlQuery, PromqlValue,
+    QualifiedName, Query, RenameCommand, RenamePair, RerankCommand, RowCommand, SampleCommand,
+    Setting, ShowCommand, SortCommand, SortKey, SortOrder, SourcePattern, StatsCommand, Subquery,
+    Unary, UnaryOp, WhereCommand,
 };
-use ravel_esql::lexer::tokenize;
-use ravel_esql::{Error, LimitKind, Limits, Span, parse, print};
+use ravel_esql::{Error, LimitKind, Limits, Span, lex, parse, print};
 
 const NO_SPAN: Span = Span::new(0, 0);
 
@@ -82,6 +86,39 @@ const VOCABULARY: &[&str] = &[
     "GROK",
     "SHOW",
     "ENRICH",
+    "SET",
+    "INFO",
+    "TS",
+    "PROMQL",
+    "DISSECT",
+    "APPEND_SEPARATOR",
+    "MV_EXPAND",
+    "LOOKUP",
+    "JOIN",
+    "ON",
+    "WITH",
+    "INLINE",
+    "INLINESTATS",
+    "FORK",
+    "FUSE",
+    "RRF",
+    "LINEAR",
+    "SCORE",
+    "KEY",
+    "GROUP",
+    "CHANGE_POINT",
+    "SAMPLE",
+    "COMPLETION",
+    "RERANK",
+    "(FROM t)",
+    "IN (FROM t | KEEP a)",
+    ";",
+    "{",
+    "}",
+    "{\"k\": 1}",
+    "\"k\":",
+    "0.5",
+    "??f",
     "|",
     ",",
     "(",
@@ -154,11 +191,13 @@ fn name_part() -> impl Strategy<Value = NamePart> {
             text,
             quoted: false,
             span: NO_SPAN,
+            param: None,
         }),
         1 => "[a-z `.é\n*|]{1,6}".prop_map(|text| NamePart {
             text,
             quoted: true,
             span: NO_SPAN,
+            param: None,
         }),
     ]
 }
@@ -179,12 +218,42 @@ fn pattern() -> impl Strategy<Value = QualifiedName> {
                 text,
                 quoted: false,
                 span: NO_SPAN,
+                param: None,
             }),
     ];
     prop::collection::vec(part, 1..3).prop_map(|parts| QualifiedName {
         parts,
         span: NO_SPAN,
     })
+}
+
+/// A parameter standing for a whole name, as `?x` or `??x`.
+fn param_name_part() -> impl Strategy<Value = QualifiedName> {
+    (param_name(), any::<bool>()).prop_map(|(name, identifier)| {
+        let mut text = (if identifier { "??" } else { "?" }).to_owned();
+        match &name {
+            ParamName::Positional => {}
+            ParamName::Numbered(digits) => text.push_str(digits),
+            ParamName::Named(named) => text.push_str(named),
+        }
+        QualifiedName {
+            parts: vec![NamePart {
+                text,
+                quoted: false,
+                span: NO_SPAN,
+                param: Some(Parameter {
+                    name,
+                    identifier,
+                    span: NO_SPAN,
+                }),
+            }],
+            span: NO_SPAN,
+        }
+    })
+}
+
+fn name_or_param() -> impl Strategy<Value = QualifiedName> {
+    prop_oneof![4 => name(), 1 => param_name_part()]
 }
 
 fn literal(value: LiteralValue) -> Expr {
@@ -226,13 +295,16 @@ fn signed_number() -> impl Strategy<Value = Expr> {
         .prop_map(|(value, sign)| signed(value, sign))
 }
 
-fn param(identifier: bool) -> impl Strategy<Value = Expr> {
+fn param_name() -> impl Strategy<Value = ParamName> {
     prop_oneof![
         Just(ParamName::Positional),
         "[0-9]{1,3}".prop_map(ParamName::Numbered),
         "[a-z_][a-z0-9_]{0,5}".prop_map(ParamName::Named),
     ]
-    .prop_map(move |name| {
+}
+
+fn param(identifier: bool) -> impl Strategy<Value = Expr> {
+    param_name().prop_map(move |name| {
         Expr::Param(Parameter {
             name,
             identifier,
@@ -271,6 +343,34 @@ fn array() -> impl Strategy<Value = Expr> {
             span: NO_SPAN,
         })
     })
+}
+
+/// Map entries with distinct keys, from candidate pairs.
+fn map_from(pairs: Vec<(String, Expr)>) -> MapLiteral {
+    let mut entries: Vec<MapEntry> = Vec::new();
+    for (key, value) in pairs {
+        if entries.iter().all(|e| e.key != key) {
+            entries.push(MapEntry {
+                key,
+                key_span: NO_SPAN,
+                value,
+                span: NO_SPAN,
+            });
+        }
+    }
+    MapLiteral {
+        entries,
+        span: NO_SPAN,
+    }
+}
+
+/// `{"key": value, ...}`: a value is a constant, an array or, one level
+/// down, another map.
+fn map_literal() -> impl Strategy<Value = MapLiteral> {
+    let scalar = prop_oneof![scalar_constant(), array()];
+    let inner = prop::collection::vec((string_value(), scalar.clone()), 1..3).prop_map(map_from);
+    let value = prop_oneof![3 => scalar, 1 => inner.prop_map(Expr::Map)];
+    prop::collection::vec((string_value(), value), 1..4).prop_map(map_from)
 }
 
 fn cast(expr: Expr, type_name: &str) -> Expr {
@@ -395,13 +495,19 @@ fn expr() -> impl Strategy<Value = Expr> {
                 span: NO_SPAN,
             })),
             (inner.clone(), prop::sample::select(TYPES)).prop_map(|(e, t)| cast(e, t)),
-            (function_name(), prop::collection::vec(inner, 0..3)).prop_map(|(name, args)| {
-                Expr::Call(Call {
-                    name,
-                    args: CallArgs::List(args),
-                    span: NO_SPAN,
-                })
-            }),
+            (
+                function_name(),
+                prop::collection::vec(inner, 0..3),
+                prop::option::of(map_literal())
+            )
+                .prop_map(|(name, mut args, options)| {
+                    args.extend(options.map(Expr::Map));
+                    Expr::Call(Call {
+                        name,
+                        args: CallArgs::List(args),
+                        span: NO_SPAN,
+                    })
+                }),
         ]
     })
 }
@@ -419,8 +525,8 @@ fn field(named: bool) -> impl Strategy<Value = Field> {
     })
 }
 
-fn source_command() -> impl Strategy<Value = Command> {
-    let source = prop_oneof![
+fn source_pattern() -> impl Strategy<Value = SourcePattern> {
+    prop_oneof![
         prop_oneof![
             "[a-z*][a-z0-9_.*:-]{0,8}",
             Just("metadata".to_owned()),
@@ -436,29 +542,363 @@ fn source_command() -> impl Strategy<Value = Command> {
             quoted: true,
             span: NO_SPAN,
         }),
-    ];
+    ]
+}
+
+/// An `ENRICH` policy or a `LOOKUP JOIN` index: one source, no `*`.
+fn single_source() -> impl Strategy<Value = SourcePattern> {
+    prop_oneof![
+        "(_any:)?[a-z_][a-z0-9_.-]{0,8}".prop_map(|text| SourcePattern {
+            text,
+            quoted: false,
+            span: NO_SPAN,
+        }),
+        string_value()
+            .prop_filter("wildcard", |text| !text.contains('*'))
+            .prop_map(|text| SourcePattern {
+                text,
+                quoted: true,
+                span: NO_SPAN,
+            }),
+    ]
+}
+
+/// `FROM` or `TS` sources with optional metadata.
+fn from_command() -> impl Strategy<Value = FromCommand> {
     let metadata = prop::collection::vec(name(), 1..3).prop_map(|fields| Metadata {
         fields,
         span: NO_SPAN,
     });
+    (
+        prop::collection::vec(source_pattern(), 1..3),
+        prop::option::of(metadata),
+    )
+        .prop_map(|(sources, metadata)| FromCommand {
+            sources,
+            metadata,
+            span: NO_SPAN,
+        })
+}
+
+/// `FROM` with at least one subquery `depth` levels deep or less. The first
+/// source is a pattern.
+fn from_queries(depth: u32) -> BoxedStrategy<Command> {
+    let mixed = prop_oneof![
+        2 => source_pattern().prop_map(FromSource::Pattern),
+        1 => subquery(depth).prop_map(FromSource::Query),
+    ];
+    (
+        source_pattern(),
+        prop::collection::vec(mixed, 0..2),
+        subquery(depth),
+    )
+        .prop_map(|(first, mut rest, last)| {
+            let mut sources = vec![FromSource::Pattern(first)];
+            sources.append(&mut rest);
+            sources.push(FromSource::Query(last));
+            Command::FromQueries(FromQueriesCommand {
+                sources,
+                span: NO_SPAN,
+            })
+        })
+        .boxed()
+}
+
+/// A parenthesised pipeline starting with `FROM`, `depth` levels deep.
+fn subquery(depth: u32) -> BoxedStrategy<Subquery> {
+    let source = if depth == 0 {
+        from_command().prop_map(Command::From).boxed()
+    } else {
+        prop_oneof![
+            3 => from_command().prop_map(Command::From),
+            1 => from_queries(depth - 1),
+        ]
+        .boxed()
+    };
+    (
+        source,
+        prop::collection::vec(processing_command(depth), 0..3),
+    )
+        .prop_map(|(source, processing)| Subquery {
+            query: Box::new(Query {
+                source,
+                processing,
+                span: NO_SPAN,
+                settings: Vec::new(),
+            }),
+            span: NO_SPAN,
+        })
+        .boxed()
+}
+
+fn promql_command() -> impl Strategy<Value = Command> {
+    const QUERIES: &[&str] = &[
+        "up",
+        "rate(http_requests_total[5m])",
+        "sum by (job) (up)",
+        "up{job=\"a\"} > 0",
+        "histogram_quantile(0.9, rate(h[1m]))",
+    ];
+    let value = prop_oneof![
+        "[a-z0-9][a-z0-9_.*:-]{0,8}".prop_map(|text| PromqlValue::Text(SourcePattern {
+            text,
+            quoted: false,
+            span: NO_SPAN,
+        })),
+        string_value().prop_map(|text| PromqlValue::Text(SourcePattern {
+            text,
+            quoted: true,
+            span: NO_SPAN,
+        })),
+        param_name().prop_map(|name| PromqlValue::Param(Parameter {
+            name,
+            identifier: false,
+            span: NO_SPAN,
+        })),
+    ];
+    let param = ("[a-z][a-z0-9_]{0,6}", value).prop_map(|(name, value)| PromqlParam {
+        name,
+        value,
+        span: NO_SPAN,
+    });
+    (
+        prop::collection::vec(param, 0..3),
+        prop::sample::select(QUERIES),
+    )
+        .prop_map(|(params, text)| {
+            Command::Promql(Box::new(PromqlCommand {
+                params,
+                query: PromqlQuery {
+                    text: text.to_owned(),
+                    span: NO_SPAN,
+                    error: None,
+                },
+                span: NO_SPAN,
+            }))
+        })
+}
+
+fn source_command() -> impl Strategy<Value = Command> {
     prop_oneof![
         prop::collection::vec(field(true), 1..3).prop_map(|fields| Command::Row(RowCommand {
             fields,
             span: NO_SPAN,
         })),
-        (
-            prop::collection::vec(source, 1..3),
-            prop::option::of(metadata)
-        )
-            .prop_map(|(sources, metadata)| Command::From(FromCommand {
-                sources,
-                metadata,
-                span: NO_SPAN,
-            })),
+        from_command().prop_map(Command::From),
+        from_command().prop_map(Command::Ts),
+        Just(Command::Show(ShowCommand { span: NO_SPAN })),
+        promql_command(),
+        from_queries(1),
     ]
 }
 
-fn processing_command() -> impl Strategy<Value = Command> {
+fn setting() -> impl Strategy<Value = Setting> {
+    let value = prop_oneof![3 => scalar_constant(), 1 => map_literal().prop_map(Expr::Map)];
+    (name_part(), value).prop_map(|(name, value)| Setting {
+        name,
+        value,
+        span: NO_SPAN,
+    })
+}
+
+fn stats_command(
+    aggregate: impl Strategy<Value = Aggregate>,
+) -> impl Strategy<Value = StatsCommand> {
+    (
+        prop::collection::vec(aggregate, 0..3),
+        prop::collection::vec(field(false), 1..3),
+        any::<bool>(),
+    )
+        .prop_map(|(aggregates, groupings, by)| {
+            let groupings = if by || aggregates.is_empty() {
+                groupings
+            } else {
+                Vec::new()
+            };
+            StatsCommand {
+                aggregates,
+                groupings,
+                span: NO_SPAN,
+            }
+        })
+}
+
+/// The processing commands added for the released syntax that hold no
+/// nested pipeline.
+fn released_command() -> impl Strategy<Value = Command> {
+    let aggregate =
+        (field(false), prop::option::of(expr())).prop_map(|(field, filter)| Aggregate {
+            field,
+            filter,
+            span: NO_SPAN,
+        });
+    let enrich_field =
+        (prop::option::of(name_or_param()), name_or_param()).prop_map(|(name, field)| {
+            EnrichField {
+                name,
+                field,
+                span: NO_SPAN,
+            }
+        });
+    let change_point_output =
+        (name(), name()).prop_map(|(type_name, pvalue_name)| ChangePointOutput {
+            type_name,
+            pvalue_name,
+            span: NO_SPAN,
+        });
+    let rerank_query = prop_oneof![
+        string_value().prop_map(|s| literal(LiteralValue::String(s))),
+        param(false),
+    ];
+    prop_oneof![
+        (expr(), string_value(), prop::option::of(string_value())).prop_map(
+            |(input, pattern, append_separator)| Command::Dissect(Box::new(DissectCommand {
+                input,
+                pattern,
+                append_separator,
+                span: NO_SPAN,
+            }))
+        ),
+        (expr(), string_value()).prop_map(|(input, pattern)| Command::Grok(Box::new(
+            GrokCommand {
+                input,
+                pattern,
+                span: NO_SPAN,
+            }
+        ))),
+        name_or_param().prop_map(|field| Command::MvExpand(MvExpandCommand {
+            field,
+            span: NO_SPAN,
+        })),
+        (
+            single_source(),
+            prop::collection::vec(name_or_param(), 1..3)
+        )
+            .prop_map(
+                |(index, on)| Command::LookupJoin(Box::new(LookupJoinCommand {
+                    index,
+                    on,
+                    span: NO_SPAN,
+                }))
+            ),
+        (
+            single_source(),
+            prop::option::of(name_or_param()),
+            prop::collection::vec(enrich_field, 0..3)
+        )
+            .prop_map(
+                |(policy, on, with)| Command::Enrich(Box::new(EnrichCommand {
+                    policy,
+                    on,
+                    with,
+                    span: NO_SPAN,
+                }))
+            ),
+        stats_command(aggregate).prop_map(Command::InlineStats),
+        (
+            prop::option::of(prop_oneof![Just(FuseMethod::Rrf), Just(FuseMethod::Linear)]),
+            prop::option::of(name()),
+            prop::collection::vec(name(), 0..3),
+            prop::option::of(name()),
+            prop::option::of(map_literal())
+        )
+            .prop_map(|(method, score_by, key_by, group_by, options)| {
+                Command::Fuse(Box::new(FuseCommand {
+                    method,
+                    score_by,
+                    key_by,
+                    group_by,
+                    options,
+                    span: NO_SPAN,
+                }))
+            }),
+        (
+            name(),
+            prop::option::of(name()),
+            prop::option::of(change_point_output)
+        )
+            .prop_map(|(value, key, output)| Command::ChangePoint(Box::new(
+                ChangePointCommand {
+                    value,
+                    key,
+                    output,
+                    span: NO_SPAN,
+                }
+            ))),
+        "0\\.[0-9]{1,3}|\\.[0-9]{1,3}".prop_map(|probability| Command::Sample(SampleCommand {
+            probability,
+            span: NO_SPAN,
+        })),
+        (prop::option::of(name_or_param()), expr(), map_literal()).prop_map(
+            |(target, prompt, options)| Command::Completion(Box::new(CompletionCommand {
+                target,
+                prompt,
+                options,
+                span: NO_SPAN,
+            }))
+        ),
+        (
+            prop::option::of(name_or_param()),
+            rerank_query,
+            prop::collection::vec(name(), 1..3),
+            map_literal()
+        )
+            .prop_map(|(target, query, on, options)| Command::Rerank(Box::new(
+                RerankCommand {
+                    target,
+                    query,
+                    on,
+                    options,
+                    span: NO_SPAN,
+                }
+            ))),
+        (any::<u64>(), prop::collection::vec(name(), 1..3)).prop_map(|(count, groupings)| {
+            Command::LimitBy(LimitByCommand {
+                count,
+                groupings,
+                span: NO_SPAN,
+            })
+        }),
+    ]
+}
+
+/// A processing command; with `depth` above zero, also a `FORK` and a
+/// `WHERE` testing `IN` against a subquery, whose pipelines are one level
+/// shallower.
+fn processing_command(depth: u32) -> BoxedStrategy<Command> {
+    let flat = prop_oneof![3 => core_command(), 2 => released_command()];
+    if depth == 0 {
+        return flat.boxed();
+    }
+    let branch = prop::collection::vec(processing_command(depth - 1), 1..3).prop_map(|commands| {
+        ForkBranch {
+            commands,
+            span: NO_SPAN,
+        }
+    });
+    let fork = prop::collection::vec(branch, 2..4).prop_map(|branches| {
+        Command::Fork(ForkCommand {
+            branches,
+            span: NO_SPAN,
+        })
+    });
+    let in_subquery =
+        (expr(), subquery(depth - 1), any::<bool>()).prop_map(|(expr, query, negated)| {
+            Command::Where(WhereCommand {
+                condition: Expr::InSubquery(InSubquery {
+                    expr: Box::new(expr),
+                    query,
+                    negated,
+                    span: NO_SPAN,
+                }),
+                span: NO_SPAN,
+            })
+        });
+    prop_oneof![8 => flat, 1 => fork, 1 => in_subquery].boxed()
+}
+
+/// The processing commands the parser admitted before the released syntax.
+fn core_command() -> impl Strategy<Value = Command> {
     let aggregate =
         (field(false), prop::option::of(expr())).prop_map(|(field, filter)| Aggregate {
             field,
@@ -476,7 +916,7 @@ fn processing_command() -> impl Strategy<Value = Command> {
             nulls,
             span: NO_SPAN,
         });
-    let rename = (name(), name()).prop_map(|(old, new)| RenamePair {
+    let rename = (name_or_param(), name_or_param()).prop_map(|(old, new)| RenamePair {
         old,
         new,
         span: NO_SPAN,
@@ -502,23 +942,7 @@ fn processing_command() -> impl Strategy<Value = Command> {
             renames,
             span: NO_SPAN,
         })),
-        (
-            prop::collection::vec(aggregate, 0..3),
-            prop::collection::vec(field(false), 1..3),
-            any::<bool>()
-        )
-            .prop_map(|(aggregates, groupings, by)| {
-                let groupings = if by || aggregates.is_empty() {
-                    groupings
-                } else {
-                    Vec::new()
-                };
-                Command::Stats(StatsCommand {
-                    aggregates,
-                    groupings,
-                    span: NO_SPAN,
-                })
-            }),
+        stats_command(aggregate).prop_map(Command::Stats),
         prop::collection::vec(sort_key, 1..3).prop_map(|keys| Command::Sort(SortCommand {
             keys,
             span: NO_SPAN,
@@ -532,13 +956,15 @@ fn processing_command() -> impl Strategy<Value = Command> {
 
 fn query() -> impl Strategy<Value = Query> {
     (
+        prop::collection::vec(setting(), 0..3),
         source_command(),
-        prop::collection::vec(processing_command(), 0..4),
+        prop::collection::vec(processing_command(1), 0..4),
     )
-        .prop_map(|(source, processing)| Query {
+        .prop_map(|(settings, source, processing)| Query {
             source,
             processing,
             span: NO_SPAN,
+            settings,
         })
 }
 
@@ -607,6 +1033,13 @@ fn soup() -> impl Strategy<Value = String> {
         "FROM t | STATS ",
         "FROM t | SORT ",
         "FROM t | KEEP ",
+        "SET a = ",
+        "PROMQL ",
+        "FROM a, (",
+        "FROM t | FORK (",
+        "FROM t | WHERE a IN (",
+        "FROM t | RERANK ",
+        "FROM t | FUSE ",
     ]);
     (
         prefix,
@@ -642,7 +1075,7 @@ fn tree_or_typed_error(source: &str) -> Result<(), TestCaseError> {
                         max_tokens: usize::MAX,
                         ..limits
                     };
-                    let tokens = tokenize(&printed, &unlimited).expect("printed text lexes");
+                    let tokens = lex(&printed, &unlimited).expect("printed text lexes");
                     prop_assert!(tokens.len() > limits.max_tokens);
                 }
                 Err(error) => {

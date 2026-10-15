@@ -4616,6 +4616,7 @@ name = "ravel-esql"
 version = "0.24.0"
 dependencies = [
  "proptest",
+ "ravel-promql",
  "thiserror",
 ]
 

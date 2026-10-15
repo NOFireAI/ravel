@@ -6,9 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 # A pure front end (ADR-2887): text in, syntax tree or typed error out. The
-# lexer, structural guard and parser are written in-crate, so thiserror is the
-# only dependency and proptest the only dev-dependency.
+# lexer, structural guard and parser are written in-crate. ravel-promql is
+# here only for its guarded parser, which checks the query of a PROMQL source
+# command at parse time.
 [dependencies]
+ravel-promql = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
