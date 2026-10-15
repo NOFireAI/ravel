@@ -149,7 +149,9 @@ impl Family {
     }
 
     fn parse(text: &str) -> Option<Family> {
-        Family::ALL.into_iter().find(|family| family.as_str() == text)
+        Family::ALL
+            .into_iter()
+            .find(|family| family.as_str() == text)
     }
 }
 
@@ -455,8 +457,7 @@ fn read_entry(mut table: RawTable, section: Section) -> Result<Entry, ManifestEr
     let name = table.take_string("name")?;
     let family = match table.take_optional_string("family")? {
         Some(text) => Some(
-            Family::parse(&text)
-                .ok_or_else(|| field(line, &format!("unknown family {text:?}")))?,
+            Family::parse(&text).ok_or_else(|| field(line, &format!("unknown family {text:?}")))?,
         ),
         None => None,
     };
@@ -485,7 +486,10 @@ fn read_entry(mut table: RawTable, section: Section) -> Result<Entry, ManifestEr
         }
         (Kind::Function, Some(_)) | (_, None) => {}
         (_, Some(_)) => {
-            return Err(field(line, &format!("{kind} {name:?} cannot have a family")));
+            return Err(field(
+                line,
+                &format!("{kind} {name:?} cannot have a family"),
+            ));
         }
     }
     match (kind, &alias_of) {
@@ -494,7 +498,10 @@ fn read_entry(mut table: RawTable, section: Section) -> Result<Entry, ManifestEr
         }
         (Kind::Alias, Some(_)) | (_, None) => {}
         (_, Some(_)) => {
-            return Err(field(line, &format!("{kind} {name:?} cannot have alias_of")));
+            return Err(field(
+                line,
+                &format!("{kind} {name:?} cannot have alias_of"),
+            ));
         }
     }
     if kind == Kind::Alias && !aliases.is_empty() {
@@ -590,9 +597,7 @@ fn validate_entries(entries: &[Entry]) -> Result<(), ManifestError> {
                 )));
             };
             if resolved.section != entry.section {
-                return Err(unresolved(format!(
-                    "{target:?} is in the other section"
-                )));
+                return Err(unresolved(format!("{target:?} is in the other section")));
             }
             if !resolved.aliases.contains(&entry.name) {
                 return Err(unresolved(format!(
@@ -710,7 +715,10 @@ impl Manifest {
             out,
             "  Generated from crates/ravel-esql/manifest/esql-{line}.toml by"
         )?;
-        writeln!(out, "  crates/ravel-esql/tests/conformance.rs. Regenerate with:")?;
+        writeln!(
+            out,
+            "  crates/ravel-esql/tests/conformance.rs. Regenerate with:"
+        )?;
         writeln!(
             out,
             "      REGEN_ESQL_CONFORMANCE=1 cargo test -p ravel-esql --test conformance"
@@ -940,11 +948,7 @@ fn write_breakdown_row(out: &mut String, label: &str, entries: &[&Entry]) -> fmt
 
 /// `text` as a markdown code span that is safe inside a table cell.
 fn code(text: &str) -> String {
-    let longest_run = text
-        .split(|c| c != '`')
-        .map(str::len)
-        .max()
-        .unwrap_or(0);
+    let longest_run = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
     let fence = "`".repeat(longest_run + 1);
     let pad = if text.starts_with('`') || text.ends_with('`') {
         " "
