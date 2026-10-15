@@ -134,6 +134,8 @@ pub fn reconstruct<V: AsRef<[u8]>>(template: &[u8], vars: &[V]) -> Option<Vec<u8
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use proptest::prelude::*;
+
     use super::*;
 
     fn vars_of(s: &str) -> Vec<String> {
@@ -174,5 +176,13 @@ mod tests {
         let mut more = s.vars.clone();
         more.push(b"3");
         assert!(reconstruct(&s.template, &more).is_none());
+    }
+
+    proptest! {
+        #[test]
+        fn split_reconstruct_round_trips(body in proptest::collection::vec(any::<u8>(), 0..200)) {
+            let s = split(&body);
+            prop_assert_eq!(reconstruct(&s.template, &s.vars), Some(body));
+        }
     }
 }
