@@ -7569,5 +7569,608 @@ mod tests {
             assert_eq!(rows, 16, "the rows whose lo is \"x\" or \"x y\"");
             assert_eq!(dict_word_memos() - memos, 1, "one memo for the dictionary");
         }
+
+        /// The `Contains` arm (ADR-2773, contains-arm amendment).
+        mod contains {
+            use super::*;
+            use crate::encoding::Enc;
+            use std::collections::HashMap;
+
+            /// Values for the `s` attribute. [`build_raw`] stores each `~` as
+            /// the byte 0xff, so the last three are invalid UTF-8 cells that
+            /// still hold the bytes `ab`.
+            const S: [&str; 12] = [
+                "", "ab", "abzz", "zabz", "zzab", "ababa", "aaa", "ba", "zz", "a~b", "~ab", "ab~",
+            ];
+            const NEEDLES: [&str; 9] = ["", "a", "ab", "aba", "aa", "zz", "b", "xa", "q"];
+
+            fn tilde_to_ff(b: &[u8]) -> Option<Vec<u8>> {
+                b.contains(&b'~')
+                    .then(|| b.iter().map(|&c| if c == b'~' { 0xff } else { c }).collect())
+            }
+
+            fn build_raw(cfg: RlogConfig, recs: Vec<LogRecord>) -> Vec<u8> {
+                let mut w = RlogWriter::new(cfg, identity()).with_str_cell_rewrite(tilde_to_ff);
+                for r in recs {
+                    w.push(r).expect("push");
+                }
+                w.finish().expect("finish")
+            }
+
+            /// Stream `n`'s resource and scope: a resource `s` of `"xab"` (0)
+            /// or `"zz"` (1), a non-string resource `s` (2), a scope `s` of
+            /// `"ab"` (4), and no `s` at all (3 and 5).
+            fn stream_blob(n: u8) -> Vec<u8> {
+                let mut res = vec![attr("service.name", AttrValue::Str(format!("svc{n}")))];
+                let mut scope = Vec::new();
+                match n {
+                    0 => res.push(attr("s", AttrValue::Str("xab".into()))),
+                    1 => res.push(attr("s", AttrValue::Str("zz".into()))),
+                    2 => res.push(attr("s", AttrValue::I64(1))),
+                    4 => scope.push(attr("s", AttrValue::Str("ab".into()))),
+                    _ => {}
+                }
+                crate::record::stream_attrs_bytes(&res, "scope", "1", &scope)
+            }
+
+            fn srec(stream: u8, ts: i64, attrs: Vec<(String, AttrValue)>) -> LogRecord {
+                let mut r = rec_attrs(stream, ts, "b", attrs);
+                r.stream_attrs = stream_blob(stream);
+                r
+            }
+
+            fn s(v: &str) -> (String, AttrValue) {
+                attr("s", AttrValue::Str(v.into()))
+            }
+
+            fn contains(key: &str, needle: &str, negated: bool) -> Predicate {
+                Predicate::Contains {
+                    key: key.into(),
+                    needle: needle.into(),
+                    negated,
+                }
+            }
+
+            /// The encoding tags of every page of column `col`.
+            fn encs(reader: &RlogReader, col: u32) -> Vec<Enc> {
+                reader
+                    .page_dir
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.chunks.iter())
+                    .filter(|c| c.column_id == col)
+                    .flat_map(|c| c.pages.iter().map(|p| p.enc))
+                    .collect()
+            }
+
+            fn s_col(reader: &RlogReader) -> u32 {
+                reader
+                    .field_dir
+                    .column("s", FieldType::Str)
+                    .expect("s column")
+                    .column_id
+            }
+
+            fn ts_of(block: &DecodedBlock, rows: &[usize]) -> Vec<i64> {
+                rows.iter()
+                    .map(|&r| block.i64_column(COL_TS).and_then(|c| c.get(r)).expect("ts"))
+                    .collect()
+            }
+
+            /// The `ts` of every row the scan keeps under `pred`, after
+            /// asserting they are the rows [`eval`] keeps one by one.
+            fn kept_ts(obj: &[u8], cfg: &RlogConfig, pred: &Predicate) -> Vec<i64> {
+                let reader = RlogReader::new(obj, cfg).expect("open object");
+                let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                let mut want = Vec::new();
+                let mut all = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                while all.next_block_columnar(obj).expect("decode").is_some() {
+                    let block = all.current.as_ref().expect("decoded");
+                    want.extend(ts_of(block, &oracle(sd, fd, pred, block).expect("oracle")));
+                }
+                let mut got = Vec::new();
+                let mut scan = reader
+                    .scan_blocks(pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                while scan.next_block_columnar(obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    got.extend(ts_of(block, &scan.surviving));
+                }
+                got.sort_unstable();
+                want.sort_unstable();
+                assert_eq!(got, want, "kernel and row-by-row eval disagree");
+                got
+            }
+
+            /// A value of `s` for a generated row: a string from [`S`], an
+            /// integer (an occurrence of another type), or none.
+            #[derive(Clone, Debug)]
+            enum SVal {
+                None,
+                Str(usize),
+                I64(i64),
+            }
+
+            #[derive(Clone, Debug)]
+            struct CRow {
+                stream: u8,
+                ts: i64,
+                s: SVal,
+                unique: bool,
+                zz: Option<usize>,
+            }
+
+            fn c_row() -> impl Strategy<Value = CRow> {
+                (
+                    0u8..6,
+                    0i64..40,
+                    prop_oneof![
+                        4 => (0usize..S.len()).prop_map(SVal::Str),
+                        1 => (-1i64..2).prop_map(SVal::I64),
+                        1 => Just(SVal::None),
+                    ],
+                    any::<bool>(),
+                    proptest::option::of(0usize..S.len()),
+                )
+                    .prop_map(|(stream, ts, s, unique, zz)| CRow {
+                        stream,
+                        ts,
+                        s,
+                        unique,
+                        zz,
+                    })
+            }
+
+            /// The records, and the dynamic column cap that gives `s` its
+            /// columns and leaves `zz` (last in the writer's `(name, type)`
+            /// order) in `attrs_raw`. `mode` 0 keeps every `s` value in the
+            /// small pool (dictionary pages), 1 makes every one unique (plain
+            /// pages), 2 makes the rows whose `unique` is set unique. A unique
+            /// value puts its row number before or after the pooled value, so
+            /// needles still land at the start, middle and end.
+            fn c_corpus(rows: &[CRow], mode: u8) -> (Vec<LogRecord>, usize) {
+                let mut pairs = std::collections::BTreeSet::new();
+                let recs = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut attrs = Vec::new();
+                        match r.s {
+                            SVal::None => {}
+                            SVal::Str(v) => {
+                                let unique = mode == 1 || (mode == 2 && r.unique);
+                                let v = match (unique, i % 2) {
+                                    (false, _) => S[v].to_string(),
+                                    (true, 0) => format!("{}#{i}", S[v]),
+                                    (true, _) => format!("{i}#{}", S[v]),
+                                };
+                                attrs.push(s(&v));
+                                pairs.insert("s:str");
+                            }
+                            SVal::I64(v) => {
+                                attrs.push(attr("s", AttrValue::I64(v)));
+                                pairs.insert("s:i64");
+                            }
+                        }
+                        if let Some(v) = r.zz {
+                            attrs.push(attr("zz", AttrValue::Str(S[v].into())));
+                        }
+                        srec(r.stream, r.ts, attrs)
+                    })
+                    .collect();
+                (recs, pairs.len())
+            }
+
+            fn c_arm() -> impl Strategy<Value = Predicate> {
+                prop_oneof![
+                    5 => (0usize..4, 0usize..NEEDLES.len(), any::<bool>()).prop_map(
+                        |(k, n, negated)| contains(["s", "s", "zz", "missing"][k], NEEDLES[n], negated)
+                    ),
+                    1 => ts_arm(),
+                    1 => (0usize..S.len()).prop_map(|i| Predicate::Equals {
+                        field: FieldSel::Attr("s".into()),
+                        value: AttrValue::Str(S[i].into()),
+                    }),
+                    1 => (-1i64..2).prop_map(|v| Predicate::Equals {
+                        field: FieldSel::Attr("s".into()),
+                        value: AttrValue::I64(v),
+                    }),
+                ]
+            }
+
+            proptest! {
+                #![proptest_config(ProptestConfig::with_cases(256))]
+
+                /// The contains kernel keeps exactly the rows [`eval`] keeps,
+                /// over plain, per-block dictionary and row group dictionary
+                /// pages holding invalid UTF-8 and empty values, absent cells,
+                /// cells of another type, an overflowing key, and streams with
+                /// and without a resource or scope value, alone and in
+                /// conjunction with `TsRange` and `Equals`. The scan's
+                /// survivor-only build keeps every surviving row's `s` bytes
+                /// and reads each as text exactly when it is UTF-8.
+                #[test]
+                fn contains_kernel_matches_row_by_row_eval(
+                    rows in proptest::collection::vec(c_row(), 1..60),
+                    mode in 0u8..3,
+                    block_target_records in 2usize..12,
+                    group_target_blocks in 1usize..4,
+                    arms in proptest::collection::vec(c_arm(), 1..=4),
+                ) {
+                    let (recs, columns) = c_corpus(&rows, mode);
+                    let cfg = RlogConfig {
+                        block_target_records,
+                        group_target_blocks,
+                        max_dynamic_columns: columns,
+                        ..RlogConfig::default()
+                    };
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                    let col = fd.column("s", FieldType::Str).map(|e| e.column_id);
+                    let pred = Predicate::And(arms);
+
+                    let mut want = HashMap::new();
+                    let mut all = reader
+                        .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                        .expect("scan");
+                    while all.next_block_columnar(&obj).expect("decode").is_some() {
+                        let loc = all.blocks[all.next - 1];
+                        let block = all.current.as_ref().expect("decoded");
+                        let w = oracle(sd, fd, &pred, block).expect("oracle");
+                        let got = kernel(sd, fd, &pred, &loc, block).expect("kernel");
+                        prop_assert_eq!(&got, &w, "block {}", loc.block_index);
+                        let cells: Vec<Option<Vec<u8>>> = (0..block.record_count())
+                            .map(|r| col.and_then(|c| block.str_at(c, r)).map(<[u8]>::to_vec))
+                            .collect();
+                        want.insert(loc.block_index, (w, cells));
+                    }
+
+                    let mut scan = reader
+                        .scan_blocks(&pred, &[], &ColumnSelection::all())
+                        .expect("scan");
+                    while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                        let loc = scan.blocks[scan.next - 1];
+                        let block = scan.current.as_ref().expect("decoded");
+                        let (w, cells) = want.remove(&loc.block_index).expect("block decoded once");
+                        prop_assert_eq!(&scan.surviving, &w, "block {}", loc.block_index);
+                        for &r in &w {
+                            let bytes = col.and_then(|c| block.str_at(c, r));
+                            prop_assert_eq!(bytes, cells[r].as_deref(), "row {}", r);
+                            if let Some(StrColumn::Dict(d)) = col.and_then(|c| block.str_column(c)) {
+                                let text = d.key(r).and_then(|k| d.values().text(k as usize));
+                                let utf8 = cells[r].as_deref().and_then(|b| std::str::from_utf8(b).ok());
+                                prop_assert_eq!(text, utf8, "row {}", r);
+                            }
+                        }
+                    }
+                    for (block, (w, _)) in want {
+                        prop_assert!(w.is_empty(), "block {block} pruned with survivors {w:?}");
+                    }
+                }
+            }
+
+            /// The property's generator reaches every page shape it claims:
+            /// `s` on plain, per-block dictionary and row group dictionary
+            /// pages, invalid UTF-8 cells, and `zz` in `attrs_raw`.
+            #[test]
+            fn contains_corpus_reaches_plain_dict_and_group_dict_pages() {
+                let rows: Vec<CRow> = (0..24)
+                    .map(|i| CRow {
+                        stream: (i % 6) as u8,
+                        ts: i,
+                        s: SVal::Str(i as usize % S.len()),
+                        unique: false,
+                        zz: Some(i as usize % 3),
+                    })
+                    .collect();
+                let mut seen_invalid = false;
+                for (mode, group_target_blocks, want) in [
+                    (1, 1, Enc::Plain),
+                    (0, 1, Enc::Dict),
+                    (0, 3, Enc::DictPage),
+                ] {
+                    let (mut recs, columns) = c_corpus(&rows, mode);
+                    if mode == 0 {
+                        // Repeat the pool so every block holds a dictionary.
+                        recs.extend(c_corpus(&rows, mode).0);
+                    }
+                    let cfg = RlogConfig {
+                        block_target_records: 11,
+                        group_target_blocks,
+                        max_dynamic_columns: columns,
+                        ..RlogConfig::default()
+                    };
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let col = s_col(&reader);
+                    assert!(
+                        reader.field_dir.column("zz", FieldType::Str).is_none(),
+                        "zz overflows"
+                    );
+                    let tags = encs(&reader, col);
+                    assert!(tags.contains(&want), "mode {mode}: {tags:?}");
+                    if want == Enc::DictPage {
+                        assert!(tags.contains(&Enc::DictIds), "{tags:?}");
+                    }
+                    let mut scan = reader
+                        .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                        .expect("scan");
+                    while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                        let block = scan.current.as_ref().expect("decoded");
+                        for r in 0..block.record_count() {
+                            if block.str_at(col, r).is_some_and(|b| std::str::from_utf8(b).is_err()) {
+                                seen_invalid = true;
+                            }
+                        }
+                    }
+                }
+                assert!(seen_invalid, "the corpus stores invalid UTF-8 cells");
+            }
+
+            /// The records `recs(unique)` builds, as one block on a per-block
+            /// dictionary page and then as blocks of plain pages, each object
+            /// with its configuration.
+            fn dict_and_plain(
+                recs: impl Fn(bool) -> Vec<LogRecord>,
+            ) -> Vec<(Vec<u8>, RlogConfig, Enc)> {
+                [(false, 64, Enc::Dict), (true, 4, Enc::Plain)]
+                    .into_iter()
+                    .map(|(unique, block_target_records, want)| {
+                        let cfg = RlogConfig {
+                            block_target_records,
+                            group_target_blocks: 1,
+                            ..RlogConfig::default()
+                        };
+                        let obj = build_raw(cfg, recs(unique));
+                        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                        let tags = encs(&reader, s_col(&reader));
+                        assert!(tags.contains(&want), "{want:?}: {tags:?}");
+                        (obj, cfg, want)
+                    })
+                    .collect()
+            }
+
+            /// A value, made unique per row when `unique` so it lands on a
+            /// plain page; the suffix keeps the value's validity.
+            fn val(v: &str, unique: bool, i: i64) -> String {
+                if unique { format!("{v}{i}") } else { v.to_string() }
+            }
+
+            /// A byte match inside an invalid UTF-8 cell is not a hit: the
+            /// cell reads as NULL and, on a stream with no `s`, the row drops.
+            #[test]
+            fn invalid_utf8_cell_holding_the_needle_is_not_a_hit() {
+                let objects = dict_and_plain(|unique| {
+                    (0..8)
+                        .map(|i| {
+                            let v = if i % 2 == 0 { "ab" } else { "~ab" };
+                            srec(3, i, vec![s(&val(v, unique, i))])
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", false));
+                    assert_eq!(kept, vec![0, 2, 4, 6], "{enc:?}");
+                    // NOT LIKE drops the NULL too.
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "zz", true));
+                    assert_eq!(kept, vec![0, 2, 4, 6], "{enc:?}");
+                }
+            }
+
+            /// `NOT LIKE` on a NULL drops the row: an absent cell on a stream
+            /// with no `s`, or with a non-string `s`.
+            #[test]
+            fn not_like_drops_absent_cells() {
+                let objects = dict_and_plain(|unique| {
+                    (0..8)
+                        .map(|i| {
+                            let stream = if i < 4 { 3 } else { 2 };
+                            let attrs = if i % 2 == 0 {
+                                vec![s(&val("zz", unique, i))]
+                            } else {
+                                Vec::new()
+                            };
+                            srec(stream, i, attrs)
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", true));
+                    assert_eq!(kept, vec![0, 2, 4, 6], "{enc:?}");
+                }
+            }
+
+            /// A row whose `s` cell is absent or invalid reads its stream's
+            /// resource or scope value, which the kernel tests rather than
+            /// dropping the row.
+            #[test]
+            fn absent_or_invalid_cell_reads_the_stream_value() {
+                let objects = dict_and_plain(|unique| {
+                    (0..12)
+                        .map(|i| {
+                            let stream = [0, 4, 1][(i % 3) as usize];
+                            let attrs = match i % 4 {
+                                0 => vec![s(&val("zz", unique, i))],
+                                1 => vec![s(&val("~zz", unique, i))],
+                                _ => Vec::new(),
+                            };
+                            srec(stream, i, attrs)
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    // Stream 0 reads "xab", stream 4 "ab" and stream 1 "zz";
+                    // rows 0, 4 and 8 hold a valid "zz" of their own.
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", false));
+                    assert_eq!(kept, vec![1, 3, 6, 7, 9, 10], "{enc:?}");
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", true));
+                    assert_eq!(kept, vec![0, 2, 4, 5, 8, 11], "{enc:?}");
+                }
+            }
+
+            /// An empty needle matches every non-NULL value, so `LIKE '%%'`
+            /// keeps exactly the rows whose value is not NULL and `NOT LIKE
+            /// '%%'` keeps none.
+            #[test]
+            fn empty_needle_matches_every_non_null_value() {
+                let objects = dict_and_plain(|unique| {
+                    (0..16)
+                        .map(|i| {
+                            let stream = if i < 8 { 3 } else { 0 };
+                            let attrs = match i % 4 {
+                                0 => vec![s(&val("", unique, i))],
+                                1 => vec![s(&val("ab", unique, i))],
+                                2 => vec![s(&val("~", unique, i))],
+                                _ => Vec::new(),
+                            };
+                            srec(stream, i, attrs)
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "", false));
+                    assert_eq!(kept, vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15], "{enc:?}");
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "", true));
+                    assert_eq!(kept, Vec::<i64>::new(), "{enc:?}");
+                }
+            }
+
+            /// A row whose `s` resolves to another type's cell, or to an
+            /// `attrs_raw` entry, is kept for the exact filter above the scan.
+            #[test]
+            fn other_type_and_overflow_readings_are_kept() {
+                let recs: Vec<LogRecord> = (0..8)
+                    .map(|i| {
+                        let attrs = match i % 4 {
+                            0 => vec![s("zz")],
+                            1 => vec![attr("s", AttrValue::I64(i))],
+                            2 => vec![attr("zz", AttrValue::Str("zz".into()))],
+                            _ => Vec::new(),
+                        };
+                        srec(3, i, attrs)
+                    })
+                    .collect();
+                let cfg = RlogConfig {
+                    block_target_records: 4,
+                    max_dynamic_columns: 2,
+                    ..RlogConfig::default()
+                };
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                assert!(reader.field_dir.column("s", FieldType::I64).is_some());
+                assert!(reader.field_dir.column("zz", FieldType::Str).is_none());
+                assert_eq!(kept_ts(&obj, &cfg, &contains("s", "ab", false)), vec![1, 5]);
+                assert_eq!(kept_ts(&obj, &cfg, &contains("zz", "ab", false)), vec![2, 6]);
+            }
+
+            /// One row group of four blocks whose `s` chunk is a row group
+            /// dictionary over six values on a stream with no `s`.
+            fn group_dict_object() -> (Vec<u8>, RlogConfig) {
+                let pool = ["ab0", "ab1", "ab2", "zz0", "zz1", "zz2"];
+                let recs = (0..24)
+                    .map(|i| {
+                        srec(
+                            3,
+                            i,
+                            vec![
+                                s(pool[i as usize % pool.len()]),
+                                attr("u", AttrValue::Str(format!("u{i}"))),
+                            ],
+                        )
+                    })
+                    .collect();
+                let cfg = RlogConfig {
+                    block_target_records: 6,
+                    group_target_blocks: 4,
+                    ..RlogConfig::default()
+                };
+                (build_raw(cfg, recs), cfg)
+            }
+
+            /// Every row's `s` bytes, block after block, read by `scan`.
+            fn s_cells(mut scan: BlockScan, obj: &[u8], col: u32) -> Vec<Option<Vec<u8>>> {
+                let mut out = Vec::new();
+                while scan.next_block_columnar(obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    out.extend(
+                        (0..block.record_count()).map(|r| block.str_at(col, r).map(<[u8]>::to_vec)),
+                    );
+                }
+                out
+            }
+
+            /// The survivor-only build never reaches the row group cache: a
+            /// scan without the arm that inherits the cache of a scan with it
+            /// reads every entry of the dictionary.
+            #[test]
+            fn survivor_only_build_leaves_the_shared_cache_whole() {
+                let (obj, cfg) = group_dict_object();
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let col = s_col(&reader);
+                let tags = encs(&reader, col);
+                assert!(tags.contains(&Enc::DictPage), "{tags:?}");
+                assert_eq!(reader.page_dir.groups.len(), 1, "one row group");
+                let none = Predicate::And(Vec::new());
+                let all = ColumnSelection::all();
+                let fresh = s_cells(reader.scan_blocks(&none, &[], &all).expect("scan"), &obj, col);
+                assert_eq!(fresh.iter().flatten().count(), 24);
+
+                let mut with_arm = reader
+                    .scan_blocks(&contains("s", "ab", false), &[], &all)
+                    .expect("scan");
+                let mut rows = 0;
+                while let Some(view) = with_arm.next_block_columnar(&obj).expect("decode") {
+                    rows += view.surviving_count();
+                }
+                assert_eq!(rows, 12, "the rows whose s holds \"ab\"");
+                let mut after = reader.scan_blocks(&none, &[], &all).expect("scan");
+                after.dicts = std::mem::take(&mut with_arm.dicts);
+                assert_eq!(s_cells(after, &obj, col), fresh);
+            }
+
+            /// The counters, exactly: a row group dictionary of six entries
+            /// tested once each across its four blocks, 24 plain cells tested
+            /// once each, and the three matching entries, the distinct ones
+            /// the surviving rows reference, the only ones validated. Without
+            /// the arm the dictionary is validated whole, once.
+            #[test]
+            fn contains_counters_count_each_test_and_validation_once() {
+                let (obj, cfg) = group_dict_object();
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let u = reader
+                    .field_dir
+                    .column("u", FieldType::Str)
+                    .expect("u column")
+                    .column_id;
+                assert!(encs(&reader, s_col(&reader)).contains(&Enc::DictPage));
+                assert!(encs(&reader, u).iter().all(|e| *e == Enc::Plain));
+                let cols = ColumnSelection::fixed_only().with_attr("s").with_attr("u");
+                let run = |pred: Predicate| {
+                    let mut scan = reader.scan_blocks(&pred, &[], &cols).expect("scan");
+                    let mut rows = 0;
+                    while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                        rows += view.surviving_count();
+                    }
+                    assert_eq!(scan.stats().blocks_scanned, 4);
+                    (rows, scan.stats())
+                };
+
+                let (rows, stats) = run(Predicate::And(vec![
+                    contains("u", "u", false),
+                    contains("s", "ab", false),
+                ]));
+                assert_eq!(rows, 12);
+                assert_eq!(stats.contains_cells_tested, 6 + 24, "N + M");
+                assert_eq!(stats.str_cells_validated, 3, "the K entries survivors reference");
+
+                let (rows, stats) = run(Predicate::And(Vec::new()));
+                assert_eq!(rows, 24);
+                assert_eq!(stats.contains_cells_tested, 0);
+                assert_eq!(stats.str_cells_validated, 6, "the dictionary, once");
+            }
+        }
     }
 }
