@@ -856,3 +856,34 @@ async fn in_flight_permit_is_released_before_the_strict_ack() {
 
     server.shutdown().await;
 }
+
+/// With the pending strict-ack budget at one, a Remote Write takes that one
+/// permit at its head and the router takes no second one: the write reaches
+/// its buffer instead of being refused, the gauge reads one while it waits on
+/// its held data PUT, and it acks once the gate releases.
+#[tokio::test]
+async fn a_remote_write_takes_its_head_permit_once() {
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        config.max_pending_strict_acks = 1;
+    })
+    .await;
+
+    let mut write = spawn_write(&server, None, "single_permit_rw_metric");
+    server.wait_for_buffered_while_pending(1, &mut write).await;
+    assert_eq!(
+        strict_flush::process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
+        1,
+        "the write holds exactly its head permit"
+    );
+
+    let write = release_until(&server.gate, write)
+        .await
+        .expect("write task");
+    assert_strict_ack(&write);
+    assert_eq!(
+        strict_flush::process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
+        0
+    );
+
+    server.shutdown().await;
+}

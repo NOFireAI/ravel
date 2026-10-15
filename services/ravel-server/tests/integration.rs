@@ -380,3 +380,45 @@ async fn in_flight_permit_is_released_before_the_strict_ack() {
 
     server.shutdown().await;
 }
+
+/// With the pending strict-ack budget at one, an OTLP HTTP metrics export
+/// takes that one permit at its head and the router takes no second one: the
+/// export reaches its buffer instead of being refused, the gauge reads one
+/// while it waits on its held data PUT, and it acks once the gate releases.
+#[tokio::test]
+async fn a_strict_metrics_export_takes_its_head_permit_once() {
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        config.max_pending_strict_acks = 1;
+    })
+    .await;
+
+    let client = server.client.clone();
+    let url = format!("{}/v1/metrics", server.base);
+    let mut export = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf")
+            .body(export_request("single_permit_metric", "demo", 1.0, now_ns()).encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes")
+    });
+    server.wait_for_buffered_while_pending(1, &mut export).await;
+    assert_eq!(
+        strict_flush::process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
+        1,
+        "the export holds exactly its head permit"
+    );
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task");
+    assert_eq!(response.status(), 200, "strict export should succeed");
+    assert_eq!(
+        strict_flush::process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
+        0
+    );
+
+    server.shutdown().await;
+}

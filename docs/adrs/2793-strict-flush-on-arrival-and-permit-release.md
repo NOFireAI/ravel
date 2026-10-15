@@ -574,8 +574,8 @@ it does not carry today and gains in this change:
 - On OTLP gRPC the layer answers with `resolve_write_mode` over the
   metadata as the handler sees it, rebuilt through
   `MetadataMap::from_headers` and `metadata_to_headers`. This is the same
-  round trip `grpc_head_tenant` applies so that the head and the handler
-  agree on the tenant. Calling the same function on the raw header map
+  round trip `grpc_head_headers` applies so that the head and the handler
+  agree on the tenant and the mode. Calling the same function on the raw header map
   would not be the same input, since the round trip drops binary entries
   and names that fail to parse.
 - On Remote Write the state answers strict unconditionally, whatever the
