@@ -208,9 +208,9 @@ fi
 # `flight-lane` feature left main uncompilable under
 # `--features sql-latency,profiling,flight-lane` because nothing gated it.
 #
-# Mirrors CI's `lint`, `flight-sql`, and `features` jobs. In scoped mode each
-# lane runs when a crate it covers is in the closure computed above, so
-# `-p ravel-query` runs the sql and flight-sql lanes (ravel-sql and
+# Mirrors CI's `lint`, `sql`, `flight-sql`, and `features` jobs. In scoped
+# mode each lane runs when a crate it covers is in the closure computed above,
+# so `-p ravel-query` runs the sql, flight-sql and esql lanes (ravel-sql and
 # ravel-server depend on it) and `-p ravel-affinity` runs none.
 #
 # Under --dry-run every cargo command below is printed by `run` and not
@@ -276,12 +276,14 @@ run_feature_lane() {
 
 want_sql=0
 want_flight_sql=0
+want_esql=0
 want_bench=0
 want_stage_timing=0
 want_cli_sql_explain=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sql=1
   want_flight_sql=1
+  want_esql=1
   want_bench=1
   want_stage_timing=1
   want_cli_sql_explain=1
@@ -292,6 +294,9 @@ else
     esac
     case "${c}" in
       ravel-server | ravel-sql) want_flight_sql=1 ;;
+    esac
+    case "${c}" in
+      ravel-server | ravel-sql | ravel-esql) want_esql=1 ;;
     esac
     # ravel-bench's feature tests exercise these crates, so any of them in
     # scope should pay for the bench lanes.
@@ -315,6 +320,11 @@ run_feature_lanes() {
   fi
   if [[ ${want_flight_sql} -eq 1 ]]; then
     run_feature_lane flight-sql -p ravel-server -p ravel-sql
+  fi
+  # POST /api/v1/esql and its tests compile only under `esql`, which `sql`
+  # does not imply.
+  if [[ ${want_esql} -eq 1 ]]; then
+    run_feature_lane esql -p ravel-server
   fi
 
   # ravel-bench bench lanes. The ClickBench box builds

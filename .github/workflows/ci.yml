@@ -163,7 +163,7 @@ jobs:
           if echo "$changed" | grep -qE '^services/ravel-server/|^services/ravel-operator/|^deploy/|^scripts/kind-up\.sh$|^scripts/kind-demo\.sh$|^scripts/kind-down\.sh$|^Dockerfile$|^Dockerfile\.prebuilt$|^\.dockerignore$'; then
             server_or_operator=true
           fi
-          if echo "$changed" | grep -qE '^crates/ravel-sql/|^services/ravel-server/|^crates/ravel-query/'; then
+          if echo "$changed" | grep -qE '^crates/ravel-sql/|^services/ravel-server/|^crates/ravel-query/|^crates/ravel-esql/'; then
             sql_area=true
           fi
           if echo "$changed" | grep -qE '^crates/ravel-promql/|^crates/ravel-promql-difftest/|^crates/ravel-query/'; then
@@ -861,6 +861,9 @@ jobs:
       # SQL service, its stream, and their tests unlinted.
       - name: Clippy (flight-sql feature)
         run: cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings
+      # Nor does it imply `esql`, which compiles POST /api/v1/esql and its tests.
+      - name: Clippy (esql feature)
+        run: cargo clippy --locked -p ravel-server --features esql --all-targets -- -D warnings
 
   # The workspace test run, split across four runners (issue #2518). The test
   # phase is CPU-bound: 9,483 tests summed to 2,374 CPU-seconds and took 641 s
@@ -1001,7 +1004,8 @@ jobs:
   sql:
     needs: changes
     # docs_only skips it entirely; the sql_area gate (ADR-0053 D4) further
-    # skips it when no ravel-sql / ravel-server / ravel-query path changed.
+    # skips it when no ravel-sql / ravel-server / ravel-query / ravel-esql path
+    # changed.
     # The now-removed "Clippy (sql feature)" step moved to the `lint` job (D3).
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
@@ -1039,6 +1043,8 @@ jobs:
           key: ci-profile
       - name: SQL endpoint tests
         run: cargo nextest run --locked --cargo-profile ci -p ravel-server --features sql
+      - name: ES|QL endpoint tests
+        run: cargo nextest run --locked --cargo-profile ci -p ravel-server --features esql
       - name: Differential correctness gate
         env:
           # Well above the in-file default so CI explores far more of the
