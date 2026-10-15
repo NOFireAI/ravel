@@ -67,13 +67,17 @@ enum Region {
         /// `len + 1` offsets into `text`; a non-UTF-8 entry's span is empty.
         text_offsets: Vec<i32>,
     },
+    /// The raw bytes of a dictionary whose entries were not validated
+    /// ([`DictValues::unchecked`]); each validity or text read validates its
+    /// entry.
+    Unchecked(Vec<u8>),
 }
 
 impl Region {
     fn bytes(&self) -> &[u8] {
         match self {
             Region::Text(s) => s.as_bytes(),
-            Region::Mixed { raw, .. } => raw,
+            Region::Mixed { raw, .. } | Region::Unchecked(raw) => raw,
         }
     }
 }
@@ -106,9 +110,19 @@ impl DictValues {
     /// `i32::MAX` bytes (or number more than `i32::MAX`) is refused as
     /// [`LogSegError::Corrupted`].
     pub(crate) fn from_entries(entries: &[Vec<u8>]) -> Result<Self, LogSegError> {
-        let total: usize = entries.iter().map(Vec::len).sum();
+        let checked: Vec<(&[u8], Option<&str>)> = entries
+            .iter()
+            .map(|e| (e.as_slice(), validate_entry(e)))
+            .collect();
+        Self::from_checked(&checked)
+    }
+
+    /// Builds the dictionary from entries already validated: each entry's
+    /// bytes beside its text when they are UTF-8. Validates nothing.
+    pub(crate) fn from_checked(entries: &[(&[u8], Option<&str>)]) -> Result<Self, LogSegError> {
+        let total: usize = entries.iter().map(|(e, _)| e.len()).sum();
         check_offset_range(entries.len(), total)?;
-        let texts: Vec<Option<&str>> = entries.iter().map(|e| validate_entry(e)).collect();
+        let texts: Vec<Option<&str>> = entries.iter().map(|&(_, t)| t).collect();
         let mut valid = Validity::unset(entries.len());
         for (k, t) in texts.iter().enumerate() {
             if t.is_some() {
@@ -119,7 +133,7 @@ impl DictValues {
         let mut offsets = Vec::with_capacity(entries.len() + 1);
         offsets.push(0i32);
         let mut at = 0usize;
-        for entry in entries {
+        for (entry, _) in entries {
             at += entry.len();
             offsets.push(at as i32);
         }
@@ -129,7 +143,7 @@ impl DictValues {
             Region::Text(s)
         } else {
             let mut raw = Vec::with_capacity(total);
-            for entry in entries {
+            for (entry, _) in entries {
                 raw.extend_from_slice(entry);
             }
             let text_total: usize = texts.iter().flatten().map(|t| t.len()).sum();
@@ -153,6 +167,33 @@ impl DictValues {
         })
     }
 
+    /// Builds the dictionary from its entries without validating any of them,
+    /// for a scan that tests the entries' raw bytes and validates only the
+    /// ones its surviving rows use. Each [`is_valid`](Self::is_valid) or
+    /// [`text`](Self::text) read then validates the entry it reads. The same
+    /// offset-range refusal as [`from_entries`](Self::from_entries).
+    pub(crate) fn unchecked(entries: &[Vec<u8>]) -> Result<Self, LogSegError> {
+        let total: usize = entries.iter().map(Vec::len).sum();
+        check_offset_range(entries.len(), total)?;
+        let mut offsets = Vec::with_capacity(entries.len() + 1);
+        offsets.push(0i32);
+        let mut raw = Vec::with_capacity(total);
+        for entry in entries {
+            raw.extend_from_slice(entry);
+            offsets.push(raw.len() as i32);
+        }
+        Ok(DictValues {
+            region: Region::Unchecked(raw),
+            offsets,
+            valid: Validity::default(),
+        })
+    }
+
+    /// Whether this dictionary was built by [`unchecked`](Self::unchecked).
+    pub(crate) fn is_unchecked(&self) -> bool {
+        matches!(self.region, Region::Unchecked(_))
+    }
+
     /// The number of entries.
     pub fn len(&self) -> usize {
         self.offsets.len() - 1
@@ -165,7 +206,11 @@ impl DictValues {
 
     /// Whether every entry is UTF-8.
     pub fn all_valid(&self) -> bool {
-        matches!(self.region, Region::Text(_))
+        match &self.region {
+            Region::Text(_) => true,
+            Region::Mixed { .. } => false,
+            Region::Unchecked(_) => (0..self.len()).all(|k| self.is_valid(k)),
+        }
     }
 
     /// Entry `k`'s bytes, or `None` when `k` is out of range.
@@ -176,17 +221,25 @@ impl DictValues {
 
     /// Whether entry `k` is UTF-8; `false` out of range.
     pub fn is_valid(&self, k: usize) -> bool {
-        self.valid.get(k)
+        match self.region {
+            Region::Unchecked(_) => self.text(k).is_some(),
+            _ => self.valid.get(k),
+        }
     }
 
     /// Entry `k` as text, or `None` when it is not UTF-8 or out of range. O(1)
-    /// for every dictionary: the UTF-8 was checked once, in
-    /// [`from_entries`](Self::from_entries).
+    /// for a dictionary built by [`from_entries`](Self::from_entries) or
+    /// [`from_checked`](Self::from_checked), whose UTF-8 was checked once; a
+    /// validation per read for one built by [`unchecked`](Self::unchecked).
     pub fn text(&self, k: usize) -> Option<&str> {
+        if let Region::Unchecked(_) = self.region {
+            return validate_entry(self.entry(k)?);
+        }
         if !self.valid.get(k) {
             return None;
         }
         match &self.region {
+            Region::Unchecked(_) => None,
             Region::Text(s) => {
                 let (a, b) = span(&self.offsets, k)?;
                 s.get(a..b)
@@ -214,6 +267,7 @@ impl DictValues {
                 text,
                 text_offsets,
             } => raw.capacity() + text.capacity() + text_offsets.capacity() * 4,
+            Region::Unchecked(raw) => raw.capacity(),
         };
         region + self.offsets.capacity() * std::mem::size_of::<i32>() + self.valid.heap_bytes()
     }
@@ -230,7 +284,7 @@ impl DictValues {
             bytes += self.entry_heap_bytes(k);
         }
         let leading = match self.region {
-            Region::Text(_) => 1,
+            Region::Text(_) | Region::Unchecked(_) => 1,
             Region::Mixed { .. } => 2,
         };
         bytes
@@ -247,7 +301,7 @@ impl DictValues {
         };
         let offsets = std::mem::size_of::<i32>();
         match &self.region {
-            Region::Text(_) => (b - a) + offsets,
+            Region::Text(_) | Region::Unchecked(_) => (b - a) + offsets,
             Region::Mixed { text_offsets, .. } => {
                 let text = span(text_offsets, k).map_or(0, |(c, d)| d - c);
                 (b - a) + offsets + text + offsets

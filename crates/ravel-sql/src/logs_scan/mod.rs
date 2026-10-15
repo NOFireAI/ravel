@@ -657,7 +657,9 @@ fn content_columns(pred: &Predicate, fixed: &mut BTreeSet<usize>, attrs: &mut BT
         // exact content channel, so it reads no columns, same as ts/stream. The
         // planner-side pushdown that would emit it is #278's job.
         Predicate::TsRange { .. } | Predicate::StreamIn(_) | Predicate::NumRange { .. } => {}
-        Predicate::HasWord { field, .. } | Predicate::Equals { field, .. } => match field {
+        Predicate::HasWord { field, .. }
+        | Predicate::Equals { field, .. }
+        | Predicate::Contains { field, .. } => match field {
             FieldSel::Body => {
                 fixed.insert(LOG_COL_BODY);
             }

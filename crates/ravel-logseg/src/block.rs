@@ -1202,6 +1202,7 @@ pub struct DecodedBlock {
     page_bytes_decoded: u64,
     decompressed_bytes: u64,
     int_values_buffers: usize,
+    dict_entries_validated: u64,
 }
 
 impl DecodedBlock {
@@ -1419,6 +1420,7 @@ impl DecodedBlock {
             page_bytes_decoded: 0,
             decompressed_bytes: 0,
             int_values_buffers: 0,
+            dict_entries_validated: 0,
         }
     }
 
@@ -1432,6 +1434,53 @@ impl DecodedBlock {
             StrColumn::Dict(d) => Some(d),
             StrColumn::Plain(_) => None,
         }
+    }
+
+    /// String dictionary entries validated decoding this block
+    /// ([`PageCounters::dict_entries_validated`]).
+    pub(crate) fn dict_entries_validated(&self) -> u64 {
+        self.dict_entries_validated
+    }
+
+    /// Replaces dictionary column `column_id` with one over a dictionary of
+    /// just the entries `rows` reference, ascending by key, and marks every
+    /// other row absent. `entry` gives an entry's bytes and, when they are
+    /// UTF-8, its text; nothing here validates. `rows` must ascend. A column
+    /// that is absent or plain is left as it is.
+    pub(crate) fn retain_dict_rows<'t>(
+        &mut self,
+        column_id: u32,
+        rows: &[usize],
+        mut entry: impl FnMut(usize) -> Option<(&'t [u8], Option<&'t str>)>,
+    ) -> Result<(), LogSegError> {
+        let Some(StrColumn::Dict(d)) = self.str_cols.get(column_id) else {
+            return Ok(());
+        };
+        let mut keys: Vec<i32> = rows.iter().filter_map(|&r| d.key(r)).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let entries = keys
+            .iter()
+            .map(|&k| {
+                entry(k as usize).ok_or_else(|| {
+                    LogSegError::Corrupted(format!("dictionary key {k} out of range"))
+                })
+            })
+            .collect::<Result<Vec<_>, LogSegError>>()?;
+        let values = Arc::new(DictValues::from_checked(&entries)?);
+        let mut present = vec![false; d.rows()];
+        let mut ids = Vec::with_capacity(rows.len());
+        for &r in rows {
+            if let (Some(k), Some(p)) = (d.key(r), present.get_mut(r))
+                && let Ok(id) = keys.binary_search(&k)
+            {
+                *p = true;
+                ids.push(id as u32);
+            }
+        }
+        let col = DictColumn::new(values, &present, ids, false)?;
+        self.str_cols.insert(column_id, StrColumn::Dict(col));
+        Ok(())
     }
 
     pub fn fixed_col(&self, column_id: u32) -> Option<&[Option<Vec<u8>>]> {
@@ -1542,7 +1591,7 @@ pub fn read_block_pages(
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
-    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &[], plans, counters)
+    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &[], &[], plans, counters)
 }
 
 /// [`read_block_pages`] for a block whose row group carries string
@@ -1562,17 +1611,31 @@ pub fn read_block_pages_with_dicts(
         .iter()
         .map(|(cid, d)| Ok((*cid, Arc::new(DictValues::from_entries(d)?))))
         .collect::<Result<_, LogSegError>>()?;
+    let mut counters = counters;
+    counters.dict_entries_validated += shared.iter().map(|(_, d)| d.len() as u64).sum::<u64>();
     let shared: Vec<(u32, &Arc<DictValues>)> = shared.iter().map(|(c, d)| (*c, d)).collect();
-    read_block_pages_with_shared_dicts(record_count, descs, page_bytes, &shared, plans, counters)
+    read_block_pages_with_shared_dicts(
+        record_count,
+        descs,
+        page_bytes,
+        &shared,
+        &[],
+        plans,
+        counters,
+    )
 }
 
 /// [`read_block_pages_with_dicts`] over dictionaries already built, which the
-/// block shares rather than copies (ADR-2773 decision D3).
+/// block shares rather than copies (ADR-2773 decision D3). A tag 7 page of a
+/// column in `lazy` decodes into an unvalidated dictionary
+/// ([`DictValues::unchecked`]), which the caller must replace before the block
+/// leaves the scan.
 pub(crate) fn read_block_pages_with_shared_dicts(
     record_count: usize,
     descs: &[PageDesc],
     page_bytes: &[Option<Vec<u8>>],
     dicts: &[(u32, &Arc<DictValues>)],
+    lazy: &[u32],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1600,7 +1663,7 @@ pub(crate) fn read_block_pages_with_shared_dicts(
             )));
         }
     }
-    decode_columns(record_count, descs, page_bytes, dicts, plans, counters)
+    decode_columns(record_count, descs, page_bytes, dicts, lazy, plans, counters)
 }
 
 /// How much of a block's page bytes a read actually touched
@@ -1617,6 +1680,10 @@ pub struct PageCounters {
     /// a `COMP_ZSTD` page contributes, and it contributes its decompressed
     /// buffer's actual length, so a short frame is counted as what it produced.
     pub decompressed_bytes: u64,
+    /// String dictionary entries validated as UTF-8 building this block's
+    /// dictionaries, a row group dictionary's counted by the block whose read
+    /// built it.
+    pub dict_entries_validated: u64,
 }
 
 /// The values of a tag-11 column: `target`'s already-decoded buffers, shared
@@ -1656,6 +1723,7 @@ fn decode_columns(
     descs: &[PageDesc],
     page_bytes: &[Option<Vec<u8>>],
     dicts: &[(u32, &Arc<DictValues>)],
+    lazy: &[u32],
     plans: &[ColumnPlan],
     counters: PageCounters,
 ) -> Result<DecodedBlock, LogSegError> {
@@ -1698,6 +1766,7 @@ fn decode_columns(
         page_bytes_decoded: counters.bytes_decoded,
         decompressed_bytes: counters.decompressed_bytes,
         int_values_buffers: 0,
+        dict_entries_validated: counters.dict_entries_validated,
     };
 
     for column_id in order {
@@ -1779,7 +1848,12 @@ fn decode_columns(
                     match decode_strings_columnar(enc, encoded, present_count)? {
                         DecodedStrings::Plain(vals) => StrColumn::Plain(scatter(&present, vals)?),
                         DecodedStrings::Dict { dict, ids } => {
-                            let values = Arc::new(DictValues::from_entries(&dict)?);
+                            let values = Arc::new(if lazy.contains(&column_id) {
+                                DictValues::unchecked(&dict)?
+                            } else {
+                                out.dict_entries_validated += dict.len() as u64;
+                                DictValues::from_entries(&dict)?
+                            });
                             StrColumn::Dict(DictColumn::new(values, &present, ids, false)?)
                         }
                     }
@@ -1913,6 +1987,7 @@ mod tests {
                 page_bytes_decoded: 0,
                 decompressed_bytes: 0,
                 int_values_buffers: 0,
+                dict_entries_validated: 0,
             }
         }
 

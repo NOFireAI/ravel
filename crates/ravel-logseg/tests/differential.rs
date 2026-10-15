@@ -184,6 +184,32 @@ fn eval(rec: &LogRecord, pred: &Predicate) -> bool {
                 .iter()
                 .any(|(k, v)| k == name && value_eq(v, value)),
         },
+        // `arb_predicate` never generates it; the reader keeps a superset (a
+        // row whose value it cannot decide from a string cell), which this
+        // mirrors only for a record value of another type.
+        Predicate::Contains {
+            field,
+            needle,
+            negated,
+        } => {
+            let hit = |s: &str| s.contains(needle.as_str()) != *negated;
+            match field {
+                FieldSel::Body => hit(&rec.body),
+                FieldSel::SeverityText => hit(&rec.severity_text),
+                FieldSel::Attr(name) => match rec.attrs.iter().find(|(k, _)| k == name) {
+                    Some((_, AttrValue::Str(s))) => hit(s),
+                    Some(_) => true,
+                    None => ravel_logseg::stream_attr_pairs(&rec.stream_attrs)
+                        .ok()
+                        .and_then(|pairs| {
+                            pairs.into_iter().find(|(k, v)| {
+                                k == name && !matches!(v, AttrValue::Map(_) | AttrValue::List(_))
+                            })
+                        })
+                        .is_some_and(|(_, v)| matches!(v, AttrValue::Str(s) if hit(&s))),
+                },
+            }
+        }
         // Prune-only (ADR-0095 decision 6): never an exact per-row filter, and
         // `arb_predicate` never generates it. Mirror the reader's exact channel
         // (match every row) so the differential stays correct if one appears.

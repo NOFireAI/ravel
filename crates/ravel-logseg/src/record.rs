@@ -518,6 +518,30 @@ pub enum Predicate {
         field: FieldSel,
         value: AttrValue,
     },
+    /// `LIKE '%needle%'`, or `NOT LIKE '%needle%'` when `negated`, on a string
+    /// field, tested against the raw page bytes (ADR-2773, contains-arm
+    /// amendment).
+    ///
+    /// The field's value is the record's string cell when it is present and
+    /// UTF-8. For an attribute whose cell is absent or not UTF-8, it is the
+    /// first value the stream's resource then scope attributes carry for the
+    /// name (map and list values skipped), which must be a string. Otherwise it
+    /// is NULL, and both forms reject a NULL value. Bytes containing the needle
+    /// in a cell that is not UTF-8 are therefore not a match: the cell reads as
+    /// absent and the stream's value decides. An empty needle is contained in
+    /// every value, so `LIKE` keeps every row with a non-NULL value and
+    /// `NOT LIKE` keeps none.
+    ///
+    /// An attribute row whose value a reader resolves some other way (a cell
+    /// of the name in a FIELD_DIR column of another type, which wins over the
+    /// string cell, or any `attrs_raw` cell) is kept rather than decided, so
+    /// this arm keeps a superset of the rows the full value semantics would.
+    /// The caller re-evaluates the pattern exactly above the scan.
+    Contains {
+        field: FieldSel,
+        needle: String,
+        negated: bool,
+    },
     /// Prune-only inclusive numeric range on a dynamic numeric column
     /// (I64/F64/Bool), selected by attribute name and exact column type.
     ///
