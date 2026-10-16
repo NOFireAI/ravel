@@ -5379,6 +5379,11 @@ mod tests {
         let part = build.parts[0].bytes.as_ref().expect("retained part bytes");
 
         assert_eq!(
+            oracle::version(part),
+            Some(ravel_logseg::key_index::RLOG_KEY_IDX_VERSION),
+            "the rewrite's KEY_IDX carries the reader-rule version"
+        );
+        assert_eq!(
             oracle::fields(part),
             vec![
                 ("request_id".to_string(), KeyType::Str),
