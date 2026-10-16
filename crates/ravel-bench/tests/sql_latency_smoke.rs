@@ -489,9 +489,14 @@ async fn generated_lane_reports_get_latency_per_phase_per_bucket() {
     for entry in json["entries"].as_array().expect("entries") {
         for run in entry["per_run_accounting"].as_array().expect("runs") {
             for phase in run["wire_bytes_by_phase"].as_array().into_iter().flatten() {
+                // KEY_IDX reads are timed under the probe GET phase.
+                let timed_as = match phase["phase"].as_str().expect("phase name") {
+                    "keyIndex" => "probe",
+                    other => other,
+                };
                 let at = names
                     .iter()
-                    .position(|name| phase["phase"] == *name)
+                    .position(|name| *name == timed_as)
                     .expect("a known phase");
                 wire_requests[at] += phase["get_requests"].as_u64().expect("get_requests");
             }
