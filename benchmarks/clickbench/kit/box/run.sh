@@ -1026,7 +1026,9 @@ concurrent_worker() {
   local RQ_MAX_TIME="" RQ_DEFER=1 RQ_EXTRA="\"round\": $r, \"connection\": $c"
   local nq="${#order[@]}" k
   while :; do
-    now="$(date +%s)" || return 1
+    # bash 5's EPOCHSECONDS, so a call does not fork date; else date.
+    now="${EPOCHSECONDS:-}"
+    [ -n "$now" ] || now="$(date +%s)" || return 1
     [ "$now" -lt "$deadline" ] || return 0
     k="${order[i]}"
     try=$((try + 1))
