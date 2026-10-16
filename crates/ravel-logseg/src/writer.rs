@@ -2408,9 +2408,12 @@ impl StampIndex {
 struct StreamSeed {
     entries: Vec<SeedEntry>,
     /// Slot-indexed: `entries` carries this slot at all. A record-level winner
-    /// for a slot that is absent here appends to the merged view instead of
+    /// for a slot that is absent here appends to the POSTINGS terms instead of
     /// overriding an entry.
     has_slot: Vec<bool>,
+    /// Slot-indexed: `entries` carries a scalar entry for this slot, the
+    /// [`StreamSeed::has_slot`] of the reader's merged view.
+    has_view_slot: Vec<bool>,
 }
 
 /// One resolved stream-level pair.
@@ -2420,9 +2423,18 @@ struct SeedEntry {
     value: ColumnValue,
     /// The first entry for this slot. Duplicate names *within* the stream layer
     /// (the same key on both the resource and the scope) are kept as the blob
-    /// carries them, exactly as `merged_attrs` keeps them, and a record-level
-    /// winner overrides only the first of them.
+    /// carries them, and a record-level winner overrides only the first of
+    /// them in the POSTINGS terms.
     first_of_slot: bool,
+    /// The first scalar entry for this slot: where a record-level winner
+    /// overrides the reader's merged view, as `merged_attrs` overrides the
+    /// first matching entry of a stream layer that holds no nested values.
+    first_in_view: bool,
+    /// A top-level `Map` or `List` value. The reader's stream layer
+    /// (`ravel_query::erasure::stream_identity_attrs`) drops these, so such an
+    /// entry is outside the merged view: it feeds POSTINGS only, never
+    /// KEY_IDX or the NumStat, and neither yields nor shadows their value.
+    nested: bool,
 }
 
 /// The seed of a stream with no tracked pairs, and of a record whose stream is
@@ -2430,6 +2442,7 @@ struct SeedEntry {
 static EMPTY_STREAM_SEED: StreamSeed = StreamSeed {
     entries: Vec::new(),
     has_slot: Vec::new(),
+    has_view_slot: Vec::new(),
 };
 
 impl StreamSeed {
@@ -2440,25 +2453,48 @@ impl StreamSeed {
     ) -> Self {
         let mut entries = Vec::new();
         let mut has_slot = vec![false; slots];
+        let mut has_view_slot = vec![false; slots];
         for (k, v) in pairs {
             let Some(&slot) = slot_of.get(k.as_str()) else {
                 continue;
             };
+            let nested = matches!(
+                v,
+                ravel_types::logstream::AttrValue::Map(_)
+                    | ravel_types::logstream::AttrValue::List(_)
+            );
             let (ty, cv) = resolve_value(&v);
             let first_of_slot = !has_slot[slot as usize];
             has_slot[slot as usize] = true;
+            let first_in_view = !nested && !has_view_slot[slot as usize];
+            if !nested {
+                has_view_slot[slot as usize] = true;
+            }
             entries.push(SeedEntry {
                 slot,
                 ty_byte: ty.to_u8(),
                 value: cv,
                 first_of_slot,
+                first_in_view,
+                nested,
             });
         }
-        Self { entries, has_slot }
+        Self {
+            entries,
+            has_slot,
+            has_view_slot,
+        }
     }
 
     fn carries(&self, slot: u32) -> bool {
         self.has_slot.get(slot as usize).copied().unwrap_or(false)
+    }
+
+    fn carries_in_view(&self, slot: u32) -> bool {
+        self.has_view_slot
+            .get(slot as usize)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -2586,19 +2622,20 @@ impl StampScratch {
     /// amendment 2026-08-20).
     ///
     /// The merged view then lays those winners over the stream layer with the
-    /// precedence `ravel_sql::rlog_attrs::merged_attrs` produces: the stream
-    /// seed first, in blob order, each slot's first entry replaced by the
-    /// record-level winner when the record carries one, then the winners of
-    /// slots the seed does not carry, appended ascending by slot (which is
-    /// ascending by name). A name absent from the record keeps its stream-level
-    /// value rather than being dropped, and the record wins a collision.
-    ///
-    /// Both consumers read that one merged answer. They used to derive their
-    /// own, and diverged: the stats saw only the record layer, so a name a
-    /// record carried only on its resource or scope contributed nothing to the
-    /// stat even though a reader resolves the stream-level value for it, and
-    /// the stat then under-bounded its own column (ADR-0095 decision 1,
-    /// corrected). Adding a value here reaches both.
+    /// precedence `ravel_sql::rlog_attrs::merged_attrs` produces over
+    /// `ravel_query::erasure::stream_identity_attrs`: the stream seed's scalar
+    /// entries first, in blob order (resource before scope), each slot's first
+    /// one replaced by the record-level winner when the record carries one,
+    /// then the winners of slots without a scalar seed entry, appended
+    /// ascending by slot (which is ascending by name). A name absent from the
+    /// record keeps its stream-level value rather than being dropped, and the
+    /// record wins a collision. A nested (`Map`/`List`) seed entry is not in
+    /// that view, as the reader drops it from the stream layer. The KEY_IDX
+    /// keys and the NumStat winners are both read from that view, so the key a
+    /// probe answers for and the stat's bounds are the value the declared
+    /// column materializes. The POSTINGS terms are read from a superset of it:
+    /// every seed entry, nested ones included, with the winner replacing the
+    /// slot's first entry.
     fn finish(&mut self, index: &StampIndex, seed: &StreamSeed, out: &mut StampOut<'_>) {
         let Self {
             cols,
@@ -2666,37 +2703,39 @@ impl StampScratch {
             winners.push(winner);
         }
 
-        // The merged view, emitted in order: the stream layer with winners
-        // overriding in place, then the record-only winners.
+        // POSTINGS terms, in order: the stream layer as the blob carries it,
+        // nested entries included, with winners overriding in place, then the
+        // record-only winners.
         for entry in &seed.entries {
-            let winner = if entry.first_of_slot {
-                pick.get(entry.slot as usize)
-                    .map(|p| p.winner)
-                    .filter(|w| *w != NO_ENTRY)
-                    .and_then(|w| winners.get(w as usize))
-            } else {
-                None
-            };
-            match winner {
-                Some((_, ty_byte, value)) => {
-                    emit_merged(index, pick, touched, entry.slot, *ty_byte, value, out);
-                }
-                None => emit_merged(
-                    index,
-                    pick,
-                    touched,
-                    entry.slot,
-                    entry.ty_byte,
-                    &entry.value,
-                    out,
-                ),
+            match winner_of(pick, winners, entry.slot).filter(|_| entry.first_of_slot) {
+                Some((_, ty_byte, value)) => emit_postings(index, entry.slot, *ty_byte, value, out),
+                None => emit_postings(index, entry.slot, entry.ty_byte, &entry.value, out),
             }
         }
         for (slot, ty_byte, value) in winners.iter() {
-            if seed.carries(*slot) {
+            if !seed.carries(*slot) {
+                emit_postings(index, *slot, *ty_byte, value, out);
+            }
+        }
+
+        // The reader's merged view, in order: the stream layer's scalar
+        // entries with winners overriding in place, then the winners of slots
+        // it holds no scalar for.
+        for entry in &seed.entries {
+            if entry.nested {
                 continue;
             }
-            emit_merged(index, pick, touched, *slot, *ty_byte, value, out);
+            let (ty_byte, value) =
+                match winner_of(pick, winners, entry.slot).filter(|_| entry.first_in_view) {
+                    Some((_, ty_byte, value)) => (*ty_byte, value),
+                    None => (entry.ty_byte, &entry.value),
+                };
+            emit_view(index, pick, touched, entry.slot, ty_byte, value, out);
+        }
+        for (slot, ty_byte, value) in winners.iter() {
+            if !seed.carries_in_view(*slot) {
+                emit_view(index, pick, touched, *slot, *ty_byte, value, out);
+            }
         }
 
         for &slot in touched.iter() {
@@ -2711,14 +2750,43 @@ impl StampScratch {
     }
 }
 
-/// Projects one merged-view entry onto the two per-record outputs.
+/// The materialized record-level winner of `slot`, if the record carries one.
+fn winner_of<'w>(
+    pick: &[SlotPick],
+    winners: &'w [(u32, u8, ColumnValue)],
+    slot: u32,
+) -> Option<&'w (u32, u8, ColumnValue)> {
+    pick.get(slot as usize)
+        .map(|p| p.winner)
+        .filter(|w| *w != NO_ENTRY)
+        .and_then(|w| winners.get(w as usize))
+}
+
+/// Projects one stream-layer or record-level entry onto the POSTINGS terms.
 ///
 /// POSTINGS takes every indexed entry, including a name the resource and the
-/// scope both carry: the term set a posting list holds may be a superset of
-/// what `find_attr` resolves, which costs precision and never soundness (an
-/// extra term keeps a block, it cannot drop one). A field with no matching
-/// dynamic column contributes nothing; absence is legal, no posting for a field
-/// means no pruning on it, never a wrong prune.
+/// scope both carry and a nested stream-layer value the reader's merged view
+/// drops: the term set a posting list holds may be a superset of what
+/// `find_attr` resolves, which costs precision and never soundness (an extra
+/// term keeps a block, it cannot drop one). A field with no matching dynamic
+/// column contributes nothing; absence is legal, no posting for a field means
+/// no pruning on it, never a wrong prune.
+fn emit_postings(
+    index: &StampIndex,
+    slot: u32,
+    ty_byte: u8,
+    value: &ColumnValue,
+    out: &mut StampOut<'_>,
+) {
+    if index.is_indexed(slot)
+        && let Some(cid) = index.column(slot, ty_byte)
+    {
+        out.indexed.push((cid, value.clone()));
+    }
+}
+
+/// Projects one entry of the reader's merged view onto the KEY_IDX keys and
+/// the NumStat winners.
 ///
 /// The NumStat takes only the first entry per name, matching
 /// `rlog_attrs::find_attr`, which is how a declared typed column resolves the
@@ -2734,7 +2802,7 @@ impl StampScratch {
 /// KEY_IDX takes the first entry per name by the same rule, from the value's
 /// own type rather than a column: a first entry of a type other than the
 /// field's declared one yields no key and shadows every later entry.
-fn emit_merged(
+fn emit_view(
     index: &StampIndex,
     pick: &mut [SlotPick],
     touched: &mut Vec<u32>,
@@ -2743,11 +2811,6 @@ fn emit_merged(
     value: &ColumnValue,
     out: &mut StampOut<'_>,
 ) {
-    if index.is_indexed(slot)
-        && let Some(cid) = index.column(slot, ty_byte)
-    {
-        out.indexed.push((cid, value.clone()));
-    }
     if let Some((field, key_ty)) = index.key(slot)
         && let Some(p) = pick.get_mut(slot as usize)
         && !p.key_seen
@@ -5545,7 +5608,7 @@ mod tests {
         use crate::key_index::{KeyIndexPlan, KeyType, key8_i64};
         use ravel_codec::key_idx::{
             KEY_IDX_WRITER_BUCKET_BITS, KeyIdxFieldInput, bucket_index, encode_key_idx,
-            verify_key_idx,
+            encode_key_idx_with, verify_key_idx,
         };
 
         let cap = RlogWriter::new(RlogConfig::default(), identity()).key_idx_bucket_cap;
@@ -5607,7 +5670,12 @@ mod tests {
             .expect("encode at the cap")
             .expect("a bucket of exactly the cap keeps the field");
         assert!(
-            kept == encode_key_idx(&input(&at_cap)).expect("the codec accepts the cap"),
+            kept == encode_key_idx_with(
+                &input(&at_cap),
+                crate::key_index::RLOG_KEY_IDX_VERSION,
+                KEY_IDX_WRITER_BUCKET_BITS
+            )
+            .expect("the codec accepts the cap"),
             "the writer encodes the field as the codec does"
         );
         let summary = verify_key_idx(&kept.bytes, kept.prefix_len).expect("verify");
@@ -6881,6 +6949,8 @@ mod tests {
         type StampOutputs = (Vec<(u32, ColumnValue)>, Vec<(u32, ColumnValue)>);
 
         // ---- reference copy of the pre-#1135 path (frozen) ----------------
+        // Its NumStat reads the reader's merged view, whose stream layer drops
+        // top-level `Map`/`List` entries; its POSTINGS terms read every entry.
 
         fn record_level_winners_slot(
             cols: &[(u32, u8, ColumnValue)],
@@ -6992,6 +7062,9 @@ mod tests {
         struct Reference<'a> {
             names: Vec<&'a str>,
             seed: TrackedValues,
+            /// `seed` less its top-level `Map`/`List` entries: the stream
+            /// layer of the reader's merged view, which the NumStat reads.
+            view_seed: TrackedValues,
             indexed_names: HashSet<&'a str>,
             numstat_names: HashSet<&'a str>,
             column_of: ColumnIndex,
@@ -7025,15 +7098,20 @@ mod tests {
                 names.dedup();
 
                 let mut seed: TrackedValues = Vec::new();
+                let mut view_seed: TrackedValues = Vec::new();
                 for (k, v) in &setup.stream_attrs {
                     if indexed_names.contains(k.as_str()) || numstat_names.contains(k.as_str()) {
                         let (ty, cv) = resolve_value(v);
-                        seed.push((k.clone(), (ty.to_u8(), cv)));
+                        seed.push((k.clone(), (ty.to_u8(), cv.clone())));
+                        if !matches!(v, AttrValue::Map(_) | AttrValue::List(_)) {
+                            view_seed.push((k.clone(), (ty.to_u8(), cv)));
+                        }
                     }
                 }
                 Reference {
                     names,
                     seed,
+                    view_seed,
                     indexed_names,
                     numstat_names,
                     column_of,
@@ -7044,9 +7122,10 @@ mod tests {
                 let winners =
                     record_level_winners_slot(rec.columnar(), rec.overflow(), &self.names);
                 let resolved = resolved_tracked_values(&self.seed, &winners);
+                let view = resolved_tracked_values(&self.view_seed, &winners);
                 (
                     indexed_term_columns(&resolved, &self.indexed_names, &self.column_of),
-                    stat_winner_columns(&resolved, &self.numstat_names, &self.column_of),
+                    stat_winner_columns(&view, &self.numstat_names, &self.column_of),
                 )
             }
         }

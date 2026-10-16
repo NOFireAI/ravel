@@ -76,6 +76,8 @@ mod logs_declared_minmax_from_stamps;
 mod logs_differential;
 #[path = "logs_fast_path_projection_routing.rs"]
 mod logs_fast_path_projection_routing;
+#[path = "logs_key_idx_reader_rule.rs"]
+mod logs_key_idx_reader_rule;
 #[path = "logs_metadata_agg.rs"]
 mod logs_metadata_agg;
 #[path = "logs_plan_concurrency.rs"]

@@ -454,6 +454,42 @@ fn rlog_inspect_prints_the_key_idx_summary() {
     // The summary lists fields in the order the section stores them.
     printed[1..].sort_unstable();
     assert_eq!(printed, expected);
+    assert_eq!(summary.version, key_index::RLOG_KEY_IDX_VERSION);
+    assert!(
+        printed[0].starts_with("key_idx: version=2 "),
+        "{}",
+        printed[0]
+    );
+}
+
+/// An object an older RLOG writer left, its KEY_IDX at version 1, still
+/// inspects, and the summary line names version 1 with the same fields and
+/// entry counts as the version-2 section it was rewritten from.
+#[test]
+fn rlog_inspect_prints_a_version_one_key_idx_summary() {
+    use ravel_logseg::key_index::{self, KEY_IDX_VERSION_1, KeyType};
+
+    let current = build_object_with(|w| {
+        w.with_key_index_fields(vec![
+            ("svc".to_string(), KeyType::Str),
+            ("code".to_string(), KeyType::I64),
+        ])
+    });
+    let legacy = key_index::rewrite_key_index(&current, KEY_IDX_VERSION_1, |_, _, entries| entries)
+        .expect("rewrite as version 1");
+    let field_lines = |stdout: &str| -> Vec<String> {
+        block(stdout, "key_idx: ")[1..]
+            .iter()
+            .map(|l| (*l).to_string())
+            .collect()
+    };
+    let current_stdout = inspect_stdout(&current, "key-idx-v2");
+    let legacy_stdout = inspect_stdout(&legacy, "key-idx-v1");
+
+    let header = block(&legacy_stdout, "key_idx: ")[0];
+    assert!(header.starts_with("key_idx: version=1 "), "{header}");
+    assert_eq!(field_lines(&legacy_stdout).len(), 2, "{legacy_stdout}");
+    assert_eq!(field_lines(&legacy_stdout), field_lines(&current_stdout));
 }
 
 /// An object written without key-index fields has no KEY_IDX section line and
