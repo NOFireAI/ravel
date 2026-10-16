@@ -950,8 +950,9 @@ def fold_perf(lines):
 
 
 def _concurrent_errors(tgz):
-    """Each statement's failed (non-2xx) concurrent calls, from the arm's
-    evidence tarball, and the total calls read."""
+    """Each statement's failed concurrent calls (not a 2xx answer with a
+    completed transfer, as _ok_2xx judges), from the arm's evidence tarball,
+    and the total calls read."""
     try:
         with tarfile.open(tgz) as t:
             f = t.extractfile("out/concurrent/calls.jsonl")

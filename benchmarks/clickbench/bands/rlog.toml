@@ -32,11 +32,12 @@ error_pooled_max_delta = 0.02
 # on both arms or arm A had no successful call. Basis: the 0.95 this file carried before the concurrent phase existed,
 # kept by issue #2873.
 qps_min_ratio = 0.95
-# Concurrent error ratio: arm B's error_ratio_weighted (non-2xx calls over all
-# concurrent calls, summed across rounds) at most arm A's plus this. The
-# results.json concurrent block also reports error_ratio_mean_of_rounds, the
-# mean of each round's ratio, only for comparison with earlier readouts; no
-# band judges it. Inconclusive when the phase did not run on both arms.
+# Concurrent error ratio: arm B's error_ratio_weighted (failed calls over all
+# concurrent calls, summed across rounds; a call fails unless it got a 2xx
+# answer and its transfer completed, curl exit 0) at most arm A's plus this.
+# The results.json concurrent block also reports error_ratio_mean_of_rounds,
+# the mean of each round's ratio, only for comparison with earlier readouts;
+# no band judges it. Inconclusive when the phase did not run on both arms.
 # Basis: issue #2873, the same 0.02 as error_pooled_max_delta.
 concurrent_error_pooled_max_delta = 0.02
 # q29 probe: arm B's min_s (the fastest timed run, warmup excluded) at most
