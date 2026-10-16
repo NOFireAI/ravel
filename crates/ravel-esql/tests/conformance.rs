@@ -603,17 +603,62 @@ fn the_report_lists_the_entries_refused_through_an_earlier_construct() {
     }
 }
 
+/// Why `error`'s position does not lie inside `statement`, or `None` when
+/// it does: its span is a slice of the statement, and its line and column
+/// name a line of the statement and a character of that line, or the
+/// position just after the line's last.
+fn position_error(statement: &str, error: &Error) -> Option<String> {
+    let span = error.span();
+    if span.slice(statement).is_none() {
+        return Some(format!("span {span:?} is not a slice of the statement"));
+    }
+    let at = error.line_col(statement);
+    let Some(line) = statement.split('\n').nth(at.line.wrapping_sub(1)) else {
+        return Some(format!("line {} is not a line of the statement", at.line));
+    };
+    (at.column == 0 || at.column > line.chars().count() + 1)
+        .then(|| format!("column {} is not on line {line:?}", at.column))
+}
+
+/// Every negative statement fails to parse, with an error whose line and
+/// column lie inside the statement.
 #[test]
 fn every_negative_statement_is_refused_by_the_parser() {
     let manifest = load();
     assert!(!manifest.negatives.is_empty());
-    let parsed: Vec<&str> = manifest
-        .negatives
-        .iter()
-        .filter(|n| parse(&n.example, &Limits::default()).is_ok())
-        .map(|n| n.example.as_str())
-        .collect();
-    assert!(parsed.is_empty(), "negatives that parse: {parsed:#?}");
+    let mut wrong = Vec::new();
+    for negative in &manifest.negatives {
+        match parse(&negative.example, &Limits::default()) {
+            Ok(_) => wrong.push(format!("{:?} parses", negative.example)),
+            Err(error) => {
+                if let Some(found) = position_error(&negative.example, &error) {
+                    wrong.push(format!("{:?}: {error:?}: {found}", negative.example));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The position check fails an error whose span lies past the statement,
+/// such as one from a longer statement.
+#[test]
+fn a_negative_error_position_must_lie_inside_the_statement() {
+    let statement = "ROW a = 1\n| WHERE (";
+    let error = parse(statement, &Limits::default()).expect_err("unclosed");
+    assert_eq!(position_error(statement, &error), None);
+    let longer = "ROW a = 1 | WHERE dur > 1 | LIMIT )";
+    let error = parse(longer, &Limits::default()).expect_err("no count");
+    assert_eq!(position_error(longer, &error), None);
+    assert!(position_error(statement, &error).is_some());
+    let past = Error::UnexpectedCharacter {
+        found: '#',
+        span: ravel_esql::Span {
+            start: statement.len() + 1,
+            end: statement.len() + 2,
+        },
+    };
+    assert!(position_error(statement, &past).is_some());
 }
 
 #[test]
