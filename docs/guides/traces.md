@@ -26,6 +26,12 @@ The full, normative spec of the on-disk layout is
 
 A `trace_id =` query decodes only the blocks that can hold the trace. The
 skip index drops every block whose `trace_id` range excludes the target.
+Each object the skip index keeps is then probed in its KEY_IDX section, which
+indexes the first 8 bytes of every trace id the object holds. At most two
+small ranged reads answer the probe. A trace KEY_IDX does not find is absent
+from the object, so the object is not read further. A trace it does find may
+be another trace sharing those 8 bytes; the decoded rows are matched against
+the full trace id, which removes it.
 
 Ingest routes each span to a shard by its `trace_id`. The router hashes the
 `trace_id` with BLAKE3 and picks the shard from the hash. All spans of one
@@ -34,7 +40,10 @@ into a contiguous block run.
 
 The catalog listing at query time does not use this routing. A `trace_id =`
 query lists and opens the segments of every shard in the matched time window,
-the same as any other query. Only the per-object decode is bounded.
+the same as any other query, and probes the KEY_IDX of each one the skip
+index keeps a block in. Objects KEY_IDX ruled out are counted in
+`stats.pruning.segmentsPrunedByKeyIndex`, and the KEY_IDX reads are reported
+under the `keyIndex` entry of `stats.phases`.
 
 Online resharding can move a tenant to a new shard count while spans still
 arrive. A trace whose spans straddle a reshard activation can split across

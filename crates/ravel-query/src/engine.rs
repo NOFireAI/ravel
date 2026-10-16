@@ -3083,6 +3083,7 @@ fn combine_phase_accounting(
         plan: a.plan.saturating_add(&b.plan),
         probe: a.probe.saturating_add(&b.probe),
         scan: a.scan.saturating_add(&b.scan),
+        key_index: a.key_index.saturating_add(&b.key_index),
     }
 }
 

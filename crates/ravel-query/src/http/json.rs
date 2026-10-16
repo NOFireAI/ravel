@@ -99,7 +99,7 @@ pub struct QueryStatsJson {
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
     pub accounting: QueryAccountingJson,
-    /// The same GETs and bytes `accounting` pools, split across the four
+    /// The same GETs and bytes `accounting` pools, split across the five
     /// phases of a query's object-store cost (issue #935, ADR-0927 decision 7;
     /// the split itself is issue #796's `PhaseAccounting`, which until now
     /// reached no reader outside the engine's own unit tests). One entry per
@@ -1053,7 +1053,7 @@ mod tests {
         matched: u64,
     }
 
-    /// A `QueryStats` whose four phase handles carry a distinct, exactly known
+    /// A `QueryStats` whose five phase handles carry a distinct, exactly known
     /// figure in every counter `stats.phases` renders, so a test can name the
     /// expected number per phase per field and a swapped or pooled phase is a
     /// failing assertion rather than a plausible-looking total.
@@ -1126,6 +1126,19 @@ mod tests {
         phases.scan().add_segments_opened(15);
         phases.scan().add_series_matched(16);
 
+        // keyIndex: KEY_IDX prefix and bucket reads of a trace lookup.
+        for _ in 0..17 {
+            phases.key_index().record_s3_request(AccountedOp::Get);
+        }
+        phases.key_index().add_s3_bytes(AccountedOp::Get, 16_000);
+        for _ in 0..18 {
+            phases.key_index().record_cache_hit();
+        }
+        for _ in 0..19 {
+            phases.key_index().record_cache_miss();
+        }
+        phases.key_index().add_cache_bytes(55);
+
         let snapshot = phases.snapshot();
         crate::QueryStats {
             // `accounting` is the pooled sum in production
@@ -1155,7 +1168,7 @@ mod tests {
         let value = serde_json::to_value(&json).expect("serializes");
 
         let phases = value["phases"].as_array().expect("phases is an array");
-        assert_eq!(phases.len(), 4, "four phases, no more and no fewer");
+        assert_eq!(phases.len(), 5, "five phases, no more and no fewer");
 
         // The exact names, in order. Not a set comparison: the order is
         // `QueryPhase::ALL`'s, and a report that pairs a phase name with the
@@ -1164,12 +1177,12 @@ mod tests {
             .iter()
             .map(|p| p["phase"].as_str().expect("phase name is a string"))
             .collect();
-        assert_eq!(names, vec!["resolve", "plan", "probe", "scan"]);
+        assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
 
         // Each name appears exactly once. A figure emitted twice is as much a
         // defect as one emitted wrong: a consumer summing the array would
         // double-count that phase.
-        for want in ["resolve", "plan", "probe", "scan"] {
+        for want in ["resolve", "plan", "probe", "scan", "keyIndex"] {
             assert_eq!(
                 names.iter().filter(|n| **n == want).count(),
                 1,
@@ -1231,6 +1244,19 @@ mod tests {
                 opened: 15,
                 matched: 16,
             },
+            ExpectedPhase {
+                phase: "keyIndex",
+                gets: 17,
+                wire_bytes: 16_000,
+                lists: 0,
+                hits: 18,
+                misses: 19,
+                cache_bytes: 55,
+                decompressed: 0,
+                reused: 0,
+                opened: 0,
+                matched: 0,
+            },
         ];
         for (got, want) in phases.iter().zip(expected) {
             let name = want.phase;
@@ -1278,18 +1304,21 @@ mod tests {
                 .sum()
         };
 
-        assert_eq!(sum("s3GetRequests"), 3 + 5 + 7 + 11);
-        assert_eq!(value["accounting"]["s3GetRequests"], 26);
-        assert_eq!(sum("s3GetWireBytes"), 1_000 + 2_000 + 4_000 + 8_000);
-        assert_eq!(value["accounting"]["s3GetBytes"], 15_000);
+        assert_eq!(sum("s3GetRequests"), 3 + 5 + 7 + 11 + 17);
+        assert_eq!(value["accounting"]["s3GetRequests"], 43);
+        assert_eq!(
+            sum("s3GetWireBytes"),
+            1_000 + 2_000 + 4_000 + 8_000 + 16_000
+        );
+        assert_eq!(value["accounting"]["s3GetBytes"], 31_000);
         assert_eq!(sum("s3ListRequests"), 2);
         assert_eq!(value["accounting"]["s3ListRequests"], 2);
-        assert_eq!(sum("cacheHits"), 1 + 3 + 8 + 13);
-        assert_eq!(value["accounting"]["cacheHits"], 25);
-        assert_eq!(sum("cacheMisses"), 2 + 4 + 9 + 14);
-        assert_eq!(value["accounting"]["cacheMisses"], 29);
-        assert_eq!(sum("cacheServedBytes"), 11 + 22 + 33 + 44);
-        assert_eq!(value["accounting"]["cacheBytes"], 110);
+        assert_eq!(sum("cacheHits"), 1 + 3 + 8 + 13 + 18);
+        assert_eq!(value["accounting"]["cacheHits"], 43);
+        assert_eq!(sum("cacheMisses"), 2 + 4 + 9 + 14 + 19);
+        assert_eq!(value["accounting"]["cacheMisses"], 48);
+        assert_eq!(sum("cacheServedBytes"), 11 + 22 + 33 + 44 + 55);
+        assert_eq!(value["accounting"]["cacheBytes"], 165);
         assert_eq!(sum("decompressedOutputBytes"), 5_000);
         assert_eq!(value["accounting"]["decompressedBytes"], 5_000);
         assert_eq!(sum("reusedRegionBytes"), 640);

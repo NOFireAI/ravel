@@ -81,6 +81,7 @@ use futures::Stream;
 use ravel_catalog::SegmentRef;
 use ravel_query::PhaseAccounting;
 use ravel_query::erasure::{ErasurePredicate, is_erased_span};
+use ravel_query::span_fetcher::KeyIndexPruning;
 use ravel_rspan::block::DecodedBlock;
 use ravel_rspan::record::{
     COL_END_TS, COL_PARENT_SPAN_ID, COL_SPAN_ID, COL_START_TS, COL_STATUS_CODE, COL_STATUS_MESSAGE,
@@ -117,6 +118,13 @@ const METRIC_PAGES_SKIPPED: &str = "pages_skipped";
 /// Metric name for the RSPAN blocks the decode decompressed, on either path:
 /// what the trace id, time window and skip-index pruning left to read.
 const METRIC_BLOCKS_DECODED: &str = "blocks_decoded";
+/// Metric name for the segments a `trace_id` lookup opened and read no block of
+/// because the object's KEY_IDX section says the trace is absent (ADR-2707
+/// decision 5).
+const METRIC_SEGMENTS_PRUNED_BY_KEY_INDEX: &str = "segments_pruned_by_key_index";
+/// Metric name for the skip-index candidate blocks of an opened segment that
+/// KEY_IDX named no entry for.
+const METRIC_BLOCKS_PRUNED_BY_KEY_INDEX: &str = "blocks_pruned_by_key_index";
 
 /// The query-shape half of the columnar fast-path eligibility rule (ADR-0110
 /// decision 3), decided once at plan time by the provider and re-derived by the
@@ -451,6 +459,7 @@ impl ExecutionPlan for SpansScanExec {
             self.projection.clone(),
             self.accounting.clone(),
             metrics.blocks_decoded.clone(),
+            metrics.key_index.clone(),
         ));
         Ok(Box::pin(SpanScanStream {
             schema,
@@ -490,6 +499,9 @@ struct SpanScanMetrics {
     /// query (`attrs` projected, a pending erasure predicate) or an eligible one
     /// that hit a block carrying an `attrs_raw` overflow page.
     rowpath_batches: Count,
+    /// What the KEY_IDX probe of a `trace_id` lookup pruned in this partition's
+    /// segments (ADR-2707 decision 5).
+    key_index: KeyIndexCounters,
 }
 
 impl SpanScanMetrics {
@@ -501,7 +513,28 @@ impl SpanScanMetrics {
             columnar_batches: MetricBuilder::new(metrics)
                 .counter(METRIC_COLUMNAR_BATCHES, partition),
             rowpath_batches: MetricBuilder::new(metrics).counter(METRIC_ROWPATH_BATCHES, partition),
+            key_index: KeyIndexCounters {
+                segments: MetricBuilder::new(metrics)
+                    .counter(METRIC_SEGMENTS_PRUNED_BY_KEY_INDEX, partition),
+                blocks: MetricBuilder::new(metrics)
+                    .counter(METRIC_BLOCKS_PRUNED_BY_KEY_INDEX, partition),
+            },
         }
+    }
+}
+
+/// The `segments_pruned_by_key_index` and `blocks_pruned_by_key_index`
+/// counters of one partition.
+#[derive(Clone)]
+struct KeyIndexCounters {
+    segments: Count,
+    blocks: Count,
+}
+
+impl KeyIndexCounters {
+    fn add(&self, pruned: KeyIndexPruning) {
+        self.segments.add(pruned.segments_pruned as usize);
+        self.blocks.add(pruned.blocks_pruned as usize);
     }
 }
 
@@ -594,6 +627,7 @@ async fn prepare_partition(
     projection: Option<Arc<Vec<usize>>>,
     accounting: PhaseAccounting,
     blocks_decoded: Count,
+    key_index: KeyIndexCounters,
 ) -> DFResult<Prepared> {
     // The bloom predicates for this scan: one per pushed literal, field-scoped
     // to the column it names (ADR-0054). The same set applies to every segment.
@@ -633,6 +667,7 @@ async fn prepare_partition(
             &proj,
             &accounting,
             &blocks_decoded,
+            &key_index,
         )
         .await?
         {
@@ -674,6 +709,7 @@ async fn prepare_partition(
         pages_decoded += output.pages_decoded;
         pages_skipped += output.pages_skipped;
         blocks_decoded.add(output.stats.blocks_scanned as usize);
+        key_index.add(output.key_index);
         out.extend(output.records);
     }
     // Selective-erasure exclusion (ADR-0064 decision 2): applied
@@ -715,9 +751,13 @@ async fn prepare_columnar(
     projection: &Arc<Vec<usize>>,
     accounting: &PhaseAccounting,
     blocks_decoded: &Count,
+    key_index: &KeyIndexCounters,
 ) -> DFResult<ColumnarAttempt> {
     let union = union_projected_columns(projection);
     let mut blocks: Vec<HeldBlock> = Vec::new();
+    // Published only when the attempt is kept: a fallback re-fetches every
+    // segment on the row path, which counts the same probes itself.
+    let mut pruned = KeyIndexPruning::default();
     let mut pages_decoded = 0usize;
     let mut pages_skipped = 0usize;
     for seg in segs {
@@ -738,6 +778,8 @@ async fn prepare_columnar(
         else {
             continue;
         };
+        pruned.segments_pruned += scan.key_index().segments_pruned;
+        pruned.blocks_pruned += scan.key_index().blocks_pruned;
         // A block at or above the inline floor of the fetcher's read gate, when
         // it carries one (`SpanSegmentFetcher::with_read_gate`), decodes on the
         // gate, so this partition's future is pending and the worker free.
@@ -789,6 +831,7 @@ async fn prepare_columnar(
     }
     keyed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let order: Vec<(usize, usize)> = keyed.into_iter().map(|(_, _, bi, r)| (bi, r)).collect();
+    key_index.add(pruned);
 
     Ok(ColumnarAttempt::Ready(ColumnarPartition {
         blocks,

@@ -899,7 +899,7 @@ mod tests {
         let split = actual["phases"]
             .as_object()
             .expect("the split is an object");
-        assert_eq!(split.len(), 4);
+        assert_eq!(split.len(), 5);
         for phase in QueryPhase::ALL {
             assert_eq!(split[phase.name()]["store_requests"], json!(0));
             assert_eq!(split[phase.name()]["wire_bytes"], json!(0));
@@ -1013,8 +1013,8 @@ mod tests {
 
         let figures = phase_figures(&phases);
 
-        assert_eq!(figures.len(), 4);
+        assert_eq!(figures.len(), 5);
         let names: Vec<&str> = figures.iter().map(|(phase, _, _)| phase.name()).collect();
-        assert_eq!(names, vec!["resolve", "plan", "probe", "scan"]);
+        assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
     }
 }

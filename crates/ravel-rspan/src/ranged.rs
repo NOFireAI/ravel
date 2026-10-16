@@ -47,7 +47,9 @@ use std::ops::Range;
 use crate::block::{DEFAULT_MAX_UNCOMP, read_block};
 use crate::error::SpanSegError;
 use crate::footer::{SpanFooter, kind};
-use crate::key_index;
+use ravel_codec::key_idx::{KeyIdxBucket, key_idx_prefix_range};
+
+use crate::key_index::{self, Located, TraceKeyProbe};
 use crate::reader::MAX_BLOCKS;
 use crate::record::SpanRecord;
 use crate::skip_index::{BlockEntry, SkipIndex};
@@ -90,6 +92,40 @@ impl TraceBlockSpan {
     /// The candidate block ordinals, ascending and contiguous.
     pub fn blocks(&self) -> &[usize] {
         &self.blocks
+    }
+}
+
+/// The result of [`RspanRangeReader::locate_trace_key`]: the probe's answer
+/// from the prefix alone, or the one bucket still to read.
+#[derive(Clone, Debug)]
+pub enum TraceKeyStep {
+    /// Answered without a second read.
+    Done(TraceKeyProbe),
+    /// Read [`TraceKeyBucket::range`] and pass it to
+    /// [`TraceKeyBucket::finish`].
+    Bucket(TraceKeyBucket),
+}
+
+/// The one KEY_IDX bucket a trace probe reads second, addressed absolutely in
+/// the object.
+#[derive(Clone, Debug)]
+pub struct TraceKeyBucket {
+    bucket: KeyIdxBucket,
+    range: Range<u64>,
+    block_count: usize,
+}
+
+impl TraceKeyBucket {
+    /// Absolute byte range of the bucket frame in the object.
+    pub fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+
+    /// Verifies and decodes the frame (exactly [`Self::range`]'s bytes) once
+    /// and answers for the probed trace. An ordinal at or past the object's
+    /// block count anywhere in the bucket, under any key, is `Corrupted`.
+    pub fn finish(&self, frame: &[u8]) -> Result<TraceKeyProbe, SpanSegError> {
+        key_index::finish(&self.bucket, frame, self.block_count)
     }
 }
 
@@ -169,32 +205,69 @@ impl RspanRangeReader {
     /// the rest of the section. A partial read cannot check the whole-section
     /// crc, so integrity rests on the grammar's own header, directory, and
     /// bucket frame checksums. An ordinal at or past the block count anywhere
-    /// in the bucket read is `Corrupted`. `Ok(None)` only when the section
-    /// declines the probe.
+    /// in the bucket read is `Corrupted`.
+    ///
+    /// A caller whose reads are asynchronous drives the same two steps itself
+    /// with [`Self::key_idx_prefix_span`], [`Self::locate_trace_key`] and
+    /// [`TraceKeyBucket::finish`].
     pub fn probe_trace<B, F>(
         &self,
         trace_id: &[u8; 16],
         mut read: F,
-    ) -> Result<Option<Vec<u32>>, SpanSegError>
+    ) -> Result<TraceKeyProbe, SpanSegError>
     where
         B: AsRef<[u8]>,
         F: FnMut(Range<u64>) -> Result<B, SpanSegError>,
     {
+        let prefix = read(self.key_idx_prefix_span()?)?;
+        match self.locate_trace_key(trace_id, prefix.as_ref())? {
+            TraceKeyStep::Done(answer) => Ok(answer),
+            TraceKeyStep::Bucket(bucket) => {
+                let frame = read(bucket.range())?;
+                bucket.finish(frame.as_ref())
+            }
+        }
+    }
+
+    /// The absolute byte range of the KEY_IDX section's `[0, prefix_len)`
+    /// (header and directory): the probe's first read, sized from the footer's
+    /// section entry alone.
+    pub fn key_idx_prefix_span(&self) -> Result<Range<u64>, SpanSegError> {
+        let range = key_idx_prefix_range(self.key_idx_prefix_len, self.key_idx_len)?;
+        self.absolute(range)
+    }
+
+    /// The probe's middle step: parses the bytes of
+    /// [`Self::key_idx_prefix_span`], applies RSPAN's parameter rules, and
+    /// either answers (an empty bucket is [`TraceKeyProbe::Absent`]) or names
+    /// the one bucket left to read.
+    pub fn locate_trace_key(
+        &self,
+        trace_id: &[u8; 16],
+        prefix: &[u8],
+    ) -> Result<TraceKeyStep, SpanSegError> {
+        match key_index::locate(self.key_idx_len, self.key_idx_prefix_len, trace_id, prefix)? {
+            Located::Done(answer) => Ok(TraceKeyStep::Done(answer)),
+            Located::Bucket(bucket) => {
+                let range = self.absolute(bucket.range())?;
+                Ok(TraceKeyStep::Bucket(TraceKeyBucket {
+                    bucket,
+                    range,
+                    block_count: self.skip.blocks.len(),
+                }))
+            }
+        }
+    }
+
+    fn absolute(&self, range: Range<u64>) -> Result<Range<u64>, SpanSegError> {
         let base = self.key_idx_offset;
-        key_index::probe(
-            self.key_idx_len,
-            self.key_idx_prefix_len,
-            self.skip.blocks.len(),
-            trace_id,
-            |range| {
-                let start = base.checked_add(range.start);
-                let end = base.checked_add(range.end);
-                match start.zip(end) {
-                    Some((start, end)) => read(start..end),
-                    None => Err(SpanSegError::Corrupted("KEY_IDX range overflow".into())),
-                }
-            },
-        )
+        match base
+            .checked_add(range.start)
+            .zip(base.checked_add(range.end))
+        {
+            Some((start, end)) => Ok(start..end),
+            None => Err(SpanSegError::Corrupted("KEY_IDX range overflow".into())),
+        }
     }
 
     /// The absolute byte range and candidate blocks covering `trace_id`, or

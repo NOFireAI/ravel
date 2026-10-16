@@ -488,7 +488,18 @@ async fn cold(store: &Arc<MemoryStore>, th: TenantHash, query: &str) -> Cost {
         Value::Matrix(m) => m.iter().map(|(_, s)| s.len()).sum(),
         other => panic!("expected a range vector, got {other:?}"),
     };
-    let phases = QueryPhase::ALL.map(|p| {
+    assert_eq!(
+        stats.phase_accounting.key_index,
+        Default::default(),
+        "a PromQL query issues no KEY_IDX read"
+    );
+    let phases = [
+        QueryPhase::Resolve,
+        QueryPhase::Plan,
+        QueryPhase::Probe,
+        QueryPhase::Scan,
+    ]
+    .map(|p| {
         let s = stats.phase_accounting.phase(p);
         [
             s.s3_requests(AccountedOp::Get),

@@ -120,7 +120,7 @@ derived; the measured section size is a T7 acceptance figure).
 ```mermaid
 flowchart TD
   Q["lookup: field = value<br/>(trace_id, request_id, UserID)"] --> R["resolve: HEAD + parts + tail LIST<br/>each commit record read once (D8)"]
-  R --> S["shard routing (spans): shard_for_span per generation<br/>drops every other shard's tail objects and leaf entries"]
+  R --> S["shard routing (spans): shard_for_span per generation<br/>drops every other shard's tail objects and leaf entries<br/>(deferred: see the spans routing deferral amendment)"]
   S --> L2["tier 2, per covering part with a leaf:<br/>GET 1 [0, prefix_len): header + bucket directory<br/>GET 2 one bucket: (key8, entry ordinal, block set)"]
   S --> T["uncovered: tail hours above the watermark,<br/>token-resolved, de-declared, failed leaf"]
   L2 --> C["candidates = leaf matches over covered parts<br/>+ every uncovered segment (ADR-0849 lemma)"]
@@ -474,7 +474,8 @@ flowchart LR
   the decrease slack window), and drops every other shard's tail objects
   before any GET and every other shard's leaf entries after the bucket read
   (the part's decoded entries give each ordinal's shard). Logs are not
-  routable by key and probe every shard.
+  routable by key and probe every shard. Spans routing is not wired yet; see
+  the spans routing deferral amendment below.
 - **Tier 2.** For each covering part that carries a leaf for the field:
   GET 1 is `[0, prefix_len)` (header plus directory), GET 2 is one bucket.
   The result is a set of `(entry ordinal, block set)`. Two ranged GETs per
@@ -578,7 +579,8 @@ flowchart LR
 
 ### 7. Read-path wiring and statistics
 
-- **Spans.** `SpansTableProvider::pruned_segments` gains shard routing,
+- **Spans.** `SpansTableProvider::pruned_segments` gains shard routing
+  (deferred; see the spans routing deferral amendment below),
   then the tier-2 probe, then the tier-1 probe for uncovered candidates;
   `SpanSegmentFetcher` reads a trace by `block_run_span`/`decode_trace`
   (`trace_block_span` only when no block set is known) instead of
@@ -984,3 +986,27 @@ therefore known to be necessary, in one of those forms, before the switch
 defaults on.
 
 Refs: #2707, #2961, #2994
+
+## Amendment (issue #2761): spans shard routing is deferred
+
+<!-- amendment-applies: sections="5. Lookup: route, probe tier 2, probe tier 1, read blocks; exact by the safety lemma|7. Read-path wiring and statistics" pointer="spans routing deferral amendment" -->
+
+Decision 5's spans routing drops an object unless the trace routes to its
+shard under a count in its hour's scan set. Ingest does not keep to that
+rule: its in-place span paths in `crates/ravel-ingest/src/span_shard.rs`
+(a failed hand-off, the deferral cap, a dead target, unenforced lag, and
+`mismatch_in_place`) write a span under the count it arrived with, so an
+object on a shard below the hour's scan count can hold a trace routed by a
+count that hour no longer admits. The catalog lists that object, and a
+lookup that routed would drop it and return fewer rows with no error.
+
+The tier-1 probe ships without routing and stays exact: every object the
+catalog lists is a candidate, and an object is dropped only when its own
+KEY_IDX says the trace is absent. The cost is the probe on every object of
+another shard that the skip index keeps a block in: at most two small
+ranged reads of its KEY_IDX section (one when the trace's bucket is empty,
+none when the fetcher's tail probe already holds the section), and no
+block read. Issue #3034 derives the routing
+rule from every ingest path that writes spans before routing is wired.
+
+Refs: #2707, #2761, #3034

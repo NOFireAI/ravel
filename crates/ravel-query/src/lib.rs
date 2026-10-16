@@ -71,4 +71,6 @@ pub use segment_admission::{
     RequestBudget, SegmentAdmission, admit, request_budget_exceeded, resolved_fold_lag,
     resolved_unsealed_tail,
 };
-pub use span_fetcher::{SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher};
+pub use span_fetcher::{
+    KeyIndexPruning, SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher,
+};

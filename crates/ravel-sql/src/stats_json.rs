@@ -121,6 +121,8 @@ pub fn pruning_json(stats: &SqlStats) -> Json {
     json!({
         "segments": stats.segments,
         "segmentsPrunedByStats": stats.segments_pruned_by_stats,
+        "segmentsPrunedByKeyIndex": stats.segments_pruned_by_key_index,
+        "blocksPrunedByKeyIndex": stats.blocks_pruned_by_key_index,
         "blocksTotal": stats.blocks_total,
         "blocksScanned": stats.blocks_scanned,
         "blocksPrunedByPostings": stats.blocks_pruned_by_postings,
@@ -139,10 +141,10 @@ mod tests {
 
     use super::*;
 
-    /// Every phase renders exactly once, in `resolve`/`plan`/`probe`/`scan`
-    /// order, with no phase missing and none duplicated: a phase emitted
-    /// twice or missing here fails a client's per-phase sum the same way a
-    /// wrong number does.
+    /// Every phase renders exactly once, in
+    /// `resolve`/`plan`/`probe`/`scan`/`keyIndex` order, with no phase missing
+    /// and none duplicated: a phase emitted twice or missing here fails a
+    /// client's per-phase sum the same way a wrong number does.
     #[test]
     fn phase_costs_json_names_every_phase_exactly_once() {
         let phases = PhaseAccounting::new();
@@ -152,7 +154,7 @@ mod tests {
             .iter()
             .map(|e| e["phase"].as_str().expect("phase is a string"))
             .collect();
-        assert_eq!(names, vec!["resolve", "plan", "probe", "scan"]);
+        assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
     }
 
     /// A query's per-phase requests and bytes sum back to the pooled total
@@ -167,6 +169,7 @@ mod tests {
             (phases.plan(), 10),
             (phases.probe(), 1),
             (phases.scan(), 1000),
+            (phases.key_index(), 10_000),
         ] {
             phase.record_s3_request(AccountedOp::Get);
             phase.add_s3_bytes(AccountedOp::Get, bytes);
@@ -183,10 +186,10 @@ mod tests {
             .map(|e| e["s3GetRequests"].as_u64().expect("u64"))
             .sum();
         assert_eq!(
-            total_bytes, 1111,
-            "100 + 10 + 1 + 1000 resolve/plan/probe/scan"
+            total_bytes, 11_111,
+            "100 + 10 + 1 + 1000 + 10000 resolve/plan/probe/scan/keyIndex"
         );
-        assert_eq!(total_requests, 4, "one GET recorded per phase");
+        assert_eq!(total_requests, 5, "one GET recorded per phase");
         assert_eq!(total_bytes, snapshot.pooled().total_s3_bytes());
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
     }
@@ -277,6 +280,8 @@ mod tests {
             attempts: 2,
             segments: 7,
             segments_pruned_by_stats: 3,
+            segments_pruned_by_key_index: 23,
+            blocks_pruned_by_key_index: 29,
             blocks_total: 40,
             blocks_scanned: 11,
             blocks_pruned_by_postings: 5,
@@ -368,7 +373,7 @@ mod tests {
         }
     }
 
-    /// `pruning_json`'s key set is exactly the nine counters below, each
+    /// `pruning_json`'s key set is exactly the eleven counters below, each
     /// carrying its own `SqlStats` field.
     #[test]
     fn pruning_json_names_every_field_exactly_once() {
@@ -376,6 +381,8 @@ mod tests {
         let expected: std::collections::BTreeSet<&str> = [
             "segments",
             "segmentsPrunedByStats",
+            "segmentsPrunedByKeyIndex",
+            "blocksPrunedByKeyIndex",
             "blocksTotal",
             "blocksScanned",
             "blocksPrunedByPostings",
@@ -390,6 +397,8 @@ mod tests {
         for (key, value) in [
             ("segments", 7),
             ("segmentsPrunedByStats", 3),
+            ("segmentsPrunedByKeyIndex", 23),
+            ("blocksPrunedByKeyIndex", 29),
             ("blocksTotal", 40),
             ("blocksScanned", 11),
             ("blocksPrunedByPostings", 5),

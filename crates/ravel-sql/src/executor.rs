@@ -412,6 +412,20 @@ pub struct SqlStats {
     /// prunes the same snapshot again, so the sum can exceed it. Zero for a
     /// metrics query and for a logs plan with no scan node.
     pub segments_pruned_by_stats: u64,
+    /// Spans segments a `trace_id` equality lookup opened and then read no
+    /// block of, because the object's KEY_IDX section says the trace is absent
+    /// (ADR-2707 decision 5), read off the spans scans'
+    /// `segments_pruned_by_key_index` counter. Counted within
+    /// [`Self::segments`]. Zero for any other query.
+    pub segments_pruned_by_key_index: u64,
+    /// Skip-index candidate blocks of the spans segments such a lookup did
+    /// read that KEY_IDX named no entry for, read off the spans scans'
+    /// `blocks_pruned_by_key_index` counter. It is 0 when the skip index
+    /// already narrows the object to the trace's blocks, which it does on
+    /// every object written in trace order, as `RspanWriter::finish` writes
+    /// every object today. An absent trace's segment is counted in
+    /// [`Self::segments_pruned_by_key_index`], not here.
+    pub blocks_pruned_by_key_index: u64,
     /// Blocks of opened segments, and owned segments never opened, that the
     /// successful attempt's logs scans skipped because their minimum `ts` was
     /// above an `ORDER BY ts ... LIMIT k` TopK's threshold (ADR-2677 decision
@@ -669,6 +683,8 @@ struct BlockCounts {
     scanned: u64,
     pruned_by_postings: u64,
     segments_pruned_by_stats: u64,
+    segments_pruned_by_key_index: u64,
+    blocks_pruned_by_key_index: u64,
     blocks_skipped_by_threshold: u64,
     segments_skipped_by_threshold: u64,
     int_values_buffers: u64,
@@ -690,8 +706,11 @@ struct BlockCounts {
 /// descendants, plus the metrics scan's `histogram_series_skipped`. Only
 /// `LogsScanExec` publishes the first ten names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
-/// nested it, and a plan carrying neither scan contributes nothing. Reads the
-/// counters the scans already maintain rather than counting a second time.
+/// nested it, and a plan carrying neither scan contributes nothing. The
+/// `segments_pruned_by_key_index` and `blocks_pruned_by_key_index` sums come
+/// from `SpansScanExec`
+/// (crate::spans_scan) the same way. Reads the counters the scans already
+/// maintain rather than counting a second time.
 fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
     // One walk, one `metrics()` call per node: that call clones the node's
     // whole `MetricsSet` out of its mutex, and with the per-segment timeline on
@@ -709,6 +728,8 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.scanned += sum("blocks_scanned");
         counts.pruned_by_postings += sum("blocks_pruned_by_postings");
         counts.segments_pruned_by_stats += sum("segments_pruned_by_stats");
+        counts.segments_pruned_by_key_index += sum("segments_pruned_by_key_index");
+        counts.blocks_pruned_by_key_index += sum("blocks_pruned_by_key_index");
         counts.blocks_skipped_by_threshold += sum("blocks_skipped_by_threshold");
         counts.segments_skipped_by_threshold += sum("segments_skipped_by_threshold");
         counts.int_values_buffers += sum("int_values_buffers");
@@ -1559,7 +1580,7 @@ impl SqlExecutor {
         // `explain` keeps the pre-#1367 pooled `&QueryAccounting` signature
         // (`ExplainReport` carries no phase or I/O-shape breakdown; only
         // `SqlOutcome`, from `execute`/`run`, does): `pooled_over` wraps it in
-        // a `PhaseAccounting` whose four phases are clones of the same
+        // a `PhaseAccounting` whose five phases are clones of the same
         // shared handle, so every store call below still lands on the
         // caller's own `accounting`, just under the API the shared
         // `resolve_admitted`/`plan_pinned_with` now take.
@@ -1729,6 +1750,8 @@ impl SqlExecutor {
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
                     stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
+                    stats.segments_pruned_by_key_index = blocks.segments_pruned_by_key_index;
+                    stats.blocks_pruned_by_key_index = blocks.blocks_pruned_by_key_index;
                     stats.blocks_skipped_by_threshold = blocks.blocks_skipped_by_threshold;
                     stats.segments_skipped_by_threshold = blocks.segments_skipped_by_threshold;
                     stats.int_values_buffers = blocks.int_values_buffers;
@@ -1817,7 +1840,7 @@ impl SqlExecutor {
         // Kept on the pooled `&QueryAccounting` signature (this is the public
         // Flight SQL `GetFlightInfo`-side resolve, and its caller has no
         // phase-split handle to hand in): `pooled_over` shares this same
-        // handle's counters across all four phases, so the resolve's cost
+        // handle's counters across all five phases, so the resolve's cost
         // still lands on `accounting` exactly as before.
         let Resolved {
             snapshot,

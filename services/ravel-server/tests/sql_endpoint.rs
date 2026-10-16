@@ -2320,7 +2320,7 @@ async fn sql_response_carries_phase_and_io_shape_stats() {
 
     assert_eq!(status, StatusCode::OK, "{value}");
     let phases = value["stats"]["phases"].as_array().expect("phases array");
-    assert_eq!(phases.len(), 4, "{value}");
+    assert_eq!(phases.len(), 5, "{value}");
     assert_eq!(
         value["stats"]["io"]["planClass"], "exhaustive_scan",
         "{value}"
@@ -2387,6 +2387,8 @@ const TIMINGS_KEYS: &[&str] = &[
 const PRUNING_KEYS: &[&str] = &[
     "segments",
     "segmentsPrunedByStats",
+    "segmentsPrunedByKeyIndex",
+    "blocksPrunedByKeyIndex",
     "blocksTotal",
     "blocksScanned",
     "blocksPrunedByPostings",
@@ -2441,6 +2443,9 @@ async fn sql_response_carries_timings_and_pruning_stats() {
     );
     for key in ["blocksPredicateDropped", "rowsPredicateEvaluated"] {
         assert_eq!(pruning[key], 0, "{key} with no logs scan: {value}");
+    }
+    for key in ["segmentsPrunedByKeyIndex", "blocksPrunedByKeyIndex"] {
+        assert_eq!(pruning[key], 0, "{key} with no trace lookup: {value}");
     }
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());

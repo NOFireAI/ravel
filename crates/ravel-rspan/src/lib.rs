@@ -47,8 +47,8 @@ pub(crate) mod pb {
 pub use columnar::{BytesColumn, ColumnarBlockView, I64Column};
 pub use error::SpanSegError;
 pub use footer::{SpanFooter, SuffixOutcome, decode_section, open, open_from_suffix, read_section};
-pub use key_index::{KeyIdxSummary, TRACE_ID_FIELD, encode_trace_key_idx};
-pub use ranged::{BlockLoc, RspanRangeReader, TraceBlockSpan};
+pub use key_index::{KeyIdxSummary, TRACE_ID_FIELD, TraceKeyProbe, encode_trace_key_idx};
+pub use ranged::{BlockLoc, RspanRangeReader, TraceBlockSpan, TraceKeyBucket, TraceKeyStep};
 pub use reader::{RspanReader, ScanStats, SpanQuery};
 pub use record::{
     COL_NAME, COL_SERVICE_NAME, ResolvedSpanRow, SpanEvent, SpanRecord, StatusCode, merge_attrs,

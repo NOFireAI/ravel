@@ -803,6 +803,25 @@ impl KeyIdxBucket {
     /// [`KeyIdxBucket::range`]) and returns the blocks whose `key8` equals
     /// the probed one, ascending.
     pub fn blocks(&self, bucket_bytes: &[u8]) -> Result<Vec<u32>, CodecError> {
+        Ok(self.matching(&self.entries(bucket_bytes)?))
+    }
+
+    /// The blocks of `entries` (as [`KeyIdxBucket::entries`] returns them)
+    /// whose `key8` equals the probed one, ascending.
+    pub fn matching(&self, entries: &[(Key8, u32)]) -> Vec<u32> {
+        entries
+            .iter()
+            .filter(|(k, _)| *k == self.key8)
+            .map(|&(_, b)| b)
+            .collect()
+    }
+
+    /// Verifies and decodes the bucket's bytes (exactly
+    /// [`KeyIdxBucket::range`]) and returns every `(key8, block)` entry of
+    /// the bucket, whichever key it belongs to, in stored order. The frame's
+    /// crc, entry count, decompressed size, bucket membership and sort order
+    /// are checked first. Empty bytes (an empty bucket) are no entries.
+    pub fn entries(&self, bucket_bytes: &[u8]) -> Result<Vec<(Key8, u32)>, CodecError> {
         if bucket_bytes.len() as u64 != self.range.end - self.range.start {
             return Err(corrupted(format_args!(
                 "bucket read is {} bytes, directory says {}",
@@ -813,17 +832,12 @@ impl KeyIdxBucket {
         if bucket_bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let entries = decode_frame(
+        decode_frame(
             bucket_bytes,
             self.bucket,
             self.bucket_bits,
             self.field_entry_count,
-        )?;
-        Ok(entries
-            .into_iter()
-            .filter(|(k, _)| *k == self.key8)
-            .map(|(_, b)| b)
-            .collect())
+        )
     }
 }
 
@@ -1302,6 +1316,41 @@ mod tests {
         assert_eq!(
             located.blocks(bytes).expect("blocks"),
             vec![3, 10, 11, 12, 13, 14, 40, 97]
+        );
+    }
+
+    #[test]
+    fn entries_return_the_whole_bucket_and_matching_filters_it_to_the_key() {
+        let a = acceptance_section();
+        let s = &a.section;
+        let section_len = s.bytes.len() as u64;
+        let prefix =
+            KeyIdxPrefix::parse(&s.bytes[..s.prefix_len as usize], s.prefix_len, section_len)
+                .expect("prefix");
+        let located = prefix
+            .locate("user_id", KeyType::I64, &a.key)
+            .expect("locate")
+            .expect("named");
+        let bytes = &s.bytes[located.range().start as usize..located.range().end as usize];
+        let entries = located.entries(bytes).expect("entries");
+        assert!(
+            entries.iter().any(|(k, _)| *k != a.key),
+            "the bucket holds other keys too: {entries:?}"
+        );
+        let mut sorted = entries.clone();
+        sorted.sort_unstable();
+        assert_eq!(entries, sorted, "entries come back in stored order");
+        assert_eq!(
+            located.matching(&entries),
+            vec![3, 10, 11, 12, 13, 14, 40, 97]
+        );
+        assert_eq!(
+            located.matching(&entries),
+            located.blocks(bytes).expect("blocks")
+        );
+        assert!(
+            located.entries(&bytes[1..]).is_err(),
+            "a short read is refused"
         );
     }
 

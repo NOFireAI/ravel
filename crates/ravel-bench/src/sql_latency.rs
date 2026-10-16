@@ -5325,7 +5325,11 @@ mod tests {
             let by_phase = per_run[run]["wire_bytes_by_phase"]
                 .as_array()
                 .expect("wire_bytes_by_phase is a JSON array");
-            assert_eq!(by_phase.len(), 4, "run {run}: four phases, no phase twice");
+            assert_eq!(
+                by_phase.len(),
+                QueryPhase::ALL.len(),
+                "run {run}: every phase, no phase twice"
+            );
             let serialized: Vec<&str> = by_phase
                 .iter()
                 .map(|p| p["phase"].as_str().expect("phase name"))
@@ -5754,7 +5758,7 @@ mod tests {
         assert_eq!(
             attributed + cold.wire_bytes_unattributed,
             cold.object_store_bytes,
-            "the four phases plus the catalog residual are the pooled total"
+            "the five phases plus the catalog residual are the pooled total"
         );
         assert_eq!(
             cold.object_store_get_bytes, cold.object_store_bytes,
@@ -5808,7 +5812,7 @@ mod tests {
         );
     }
 
-    /// The same flip in the other direction: keep all four phases but charge a
+    /// The same flip in the other direction: keep all five phases but charge a
     /// phase's GET bytes to a second phase as well, which is what a call site
     /// that recorded into the wrong handle alongside the right one would
     /// produce. The pooled GET total does not move, so the attributed sum rises
