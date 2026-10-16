@@ -28,6 +28,7 @@
 mod keys;
 
 pub mod fingerprint;
+#[cfg(feature = "marker")]
 pub mod marker;
 pub mod policy;
 pub mod render;

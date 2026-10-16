@@ -1,7 +1,10 @@
 //! Value encryption/rendering (ADR-2993 decision 3): IPv4/IPv6 text (no zone
 //! id) is replaced by its ciphertext in canonical text (RFC 5952 for IPv6);
 //! `ip:port` / `[ipv6]:port` keep the port and bracket by the OUTPUT
-//! family; anything else is reported unparsed and returned unchanged.
+//! family; anything else is reported unparsed and returned unchanged. That
+//! "anything else" covers a hostname, an address with a zone id, an empty
+//! string, and a bracketed IPv6 address with no port (`[2001:db8::1]`,
+//! distinct from the `[ipv6]:port` form above, which does parse).
 //!
 //! [`key_from_bytes`] refuses a degenerate prefix key (equal 16-byte
 //! halves) the same way [`crate::keys::derive_key`] does, via the shared
@@ -80,15 +83,15 @@ fn format_with_port(ip: IpAddr, port: u16) -> String {
 
 fn encrypt_ip(key: &DerivedKey, ip: IpAddr) -> IpAddr {
     match key {
-        DerivedKey::Deterministic(k) => Ipcrypt::new(*k).encrypt_ipaddr(ip),
-        DerivedKey::Prefix(k) => IpcryptPfx::new(*k).encrypt_ipaddr(ip),
+        DerivedKey::Deterministic(cipher) => cipher.encrypt_ipaddr(ip),
+        DerivedKey::Prefix(cipher) => cipher.encrypt_ipaddr(ip),
     }
 }
 
 fn decrypt_ip(key: &DerivedKey, ip: IpAddr) -> IpAddr {
     match key {
-        DerivedKey::Deterministic(k) => Ipcrypt::new(*k).decrypt_ipaddr(ip),
-        DerivedKey::Prefix(k) => IpcryptPfx::new(*k).decrypt_ipaddr(ip),
+        DerivedKey::Deterministic(cipher) => cipher.decrypt_ipaddr(ip),
+        DerivedKey::Prefix(cipher) => cipher.decrypt_ipaddr(ip),
     }
 }
 
@@ -124,7 +127,7 @@ fn key_from_bytes(variant: Variant, key_bytes: &[u8]) -> Result<DerivedKey, Rend
                     expected: 16,
                     got: key_bytes.len(),
                 })?;
-            Ok(DerivedKey::Deterministic(arr))
+            Ok(DerivedKey::Deterministic(Box::new(Ipcrypt::new(arr))))
         }
         Variant::Prefix => {
             let arr: [u8; 32] = key_bytes
@@ -137,7 +140,7 @@ fn key_from_bytes(variant: Variant, key_bytes: &[u8]) -> Result<DerivedKey, Rend
             if keys::is_degenerate_prefix_key(&arr) {
                 return Err(RenderKeyError::DegeneratePrefixKey);
             }
-            Ok(DerivedKey::Prefix(arr))
+            Ok(DerivedKey::Prefix(Box::new(IpcryptPfx::new(arr))))
         }
     }
 }
@@ -180,7 +183,7 @@ mod tests {
 
     #[test]
     fn ipv4_renders_canonical() {
-        let key = DerivedKey::Deterministic([1u8; 16]);
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
         let (out, outcome) = apply_value(&key, "192.0.2.1");
         assert_eq!(outcome, RenderOutcome::Encrypted);
         assert!(
@@ -191,7 +194,7 @@ mod tests {
 
     #[test]
     fn deterministic_always_yields_ipv6() {
-        let key = DerivedKey::Deterministic([1u8; 16]);
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
         let (v4_out, _) = apply_value(&key, "192.0.2.1");
         let (v6_out, _) = apply_value(&key, "2001:db8::1");
         assert!(v4_out.parse::<Ipv6Addr>().is_ok());
@@ -200,7 +203,7 @@ mod tests {
 
     #[test]
     fn prefix_preserves_family() {
-        let key = DerivedKey::Prefix(pfx_key(2, 9));
+        let key = DerivedKey::Prefix(Box::new(IpcryptPfx::new(pfx_key(2, 9))));
         let (v4_out, _) = apply_value(&key, "192.0.2.1");
         let (v6_out, _) = apply_value(&key, "2001:db8::1");
         assert!(v4_out.parse::<Ipv4Addr>().is_ok(), "{v4_out}");
@@ -210,7 +213,7 @@ mod tests {
     #[test]
     fn ipv4_port_keeps_port_and_brackets_by_output_family_v4() {
         // prefix preserves the v4 family, so the output stays unbracketed.
-        let key = DerivedKey::Prefix(pfx_key(2, 9));
+        let key = DerivedKey::Prefix(Box::new(IpcryptPfx::new(pfx_key(2, 9))));
         let (out, outcome) = apply_value(&key, "192.0.2.1:8080");
         assert_eq!(outcome, RenderOutcome::Encrypted);
         assert!(out.ends_with(":8080"));
@@ -221,7 +224,7 @@ mod tests {
     fn ipv4_port_deterministic_output_is_bracketed_ipv6() {
         // deterministic always yields ipv6, so the OUTPUT family forces brackets
         // even though the input was v4:port.
-        let key = DerivedKey::Deterministic([1u8; 16]);
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
         let (out, outcome) = apply_value(&key, "192.0.2.1:8080");
         assert_eq!(outcome, RenderOutcome::Encrypted);
         assert!(out.starts_with('['));
@@ -230,7 +233,7 @@ mod tests {
 
     #[test]
     fn bracketed_ipv6_port_round_trips_shape() {
-        let key = DerivedKey::Prefix(pfx_key(2, 9));
+        let key = DerivedKey::Prefix(Box::new(IpcryptPfx::new(pfx_key(2, 9))));
         let (out, outcome) = apply_value(&key, "[2001:db8::1]:443");
         assert_eq!(outcome, RenderOutcome::Encrypted);
         assert!(out.starts_with('['));
@@ -239,7 +242,7 @@ mod tests {
 
     #[test]
     fn hostname_unparsed_unchanged() {
-        let key = DerivedKey::Deterministic([1u8; 16]);
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
         let (out, outcome) = apply_value(&key, "example.com");
         assert_eq!(outcome, RenderOutcome::Unparsed);
         assert_eq!(out, "example.com");
@@ -247,15 +250,26 @@ mod tests {
 
     #[test]
     fn zone_id_unparsed_unchanged() {
-        let key = DerivedKey::Deterministic([1u8; 16]);
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
         let (out, outcome) = apply_value(&key, "fe80::1%eth0");
         assert_eq!(outcome, RenderOutcome::Unparsed);
         assert_eq!(out, "fe80::1%eth0");
     }
 
     #[test]
+    fn bracketed_ipv6_without_port_unparsed_unchanged() {
+        // ADR-2993 decision 3: only the `[ipv6]:port` shape parses. A
+        // bracketed address with no port is a different shape and is left
+        // unchanged, same as a hostname or a zone-id address.
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
+        let (out, outcome) = apply_value(&key, "[2001:db8::1]");
+        assert_eq!(outcome, RenderOutcome::Unparsed);
+        assert_eq!(out, "[2001:db8::1]");
+    }
+
+    #[test]
     fn empty_string_unparsed_unchanged() {
-        let key = DerivedKey::Deterministic([1u8; 16]);
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
         let (out, outcome) = apply_value(&key, "");
         assert_eq!(outcome, RenderOutcome::Unparsed);
         assert_eq!(out, "");
@@ -263,7 +277,7 @@ mod tests {
 
     #[test]
     fn longest_output_within_bound() {
-        let key = DerivedKey::Deterministic([1u8; 16]);
+        let key = DerivedKey::Deterministic(Box::new(Ipcrypt::new([1u8; 16])));
         let (out, _) = apply_value(&key, "[2001:db8::1]:65535");
         assert!(out.len() <= MAX_RENDERED_LEN, "{out} ({} bytes)", out.len());
     }
@@ -271,8 +285,8 @@ mod tests {
     #[test]
     fn encrypt_then_decrypt_round_trips() {
         for key in [
-            DerivedKey::Deterministic([3u8; 16]),
-            DerivedKey::Prefix(pfx_key(4, 9)),
+            DerivedKey::Deterministic(Box::new(Ipcrypt::new([3u8; 16]))),
+            DerivedKey::Prefix(Box::new(IpcryptPfx::new(pfx_key(4, 9)))),
         ] {
             let (encrypted, outcome) = apply_value(&key, "192.0.2.1:53");
             assert_eq!(outcome, RenderOutcome::Encrypted);
@@ -287,7 +301,10 @@ mod tests {
         let key_bytes = [5u8; 16];
         let (via_entry, outcome) =
             encrypt_address(Variant::Deterministic, &key_bytes, "192.0.2.1").expect("ok");
-        let (via_internal, _) = apply_value(&DerivedKey::Deterministic(key_bytes), "192.0.2.1");
+        let (via_internal, _) = apply_value(
+            &DerivedKey::Deterministic(Box::new(Ipcrypt::new(key_bytes))),
+            "192.0.2.1",
+        );
         assert_eq!(via_entry, via_internal);
         assert_eq!(outcome, RenderOutcome::Encrypted);
 

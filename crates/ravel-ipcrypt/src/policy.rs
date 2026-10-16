@@ -96,6 +96,14 @@ pub enum PolicyError {
         epoch: u32,
     },
     #[error(
+        "ipcrypt policy: {table}: key {key:?} lists retired_epochs entry {epoch} more than once"
+    )]
+    DuplicateRetiredEpoch {
+        table: String,
+        key: String,
+        epoch: u32,
+    },
+    #[error(
         "ipcrypt policy: {table}: keys {a:?} and {b:?} both sanitize to metric label {label:?}"
     )]
     SanitizeCollision {
@@ -204,6 +212,7 @@ fn validate_table(table: &RuleTableToml, context: &str) -> Result<RuleTable, Pol
                 key: r.key.clone(),
             });
         }
+        let mut seen_retired: HashMap<u32, ()> = HashMap::with_capacity(r.retired_epochs.len());
         for &retired in &r.retired_epochs {
             if retired == 0 {
                 return Err(PolicyError::ZeroRetiredEpoch {
@@ -218,6 +227,14 @@ fn validate_table(table: &RuleTableToml, context: &str) -> Result<RuleTable, Pol
                     epoch: r.epoch,
                 });
             }
+            if seen_retired.contains_key(&retired) {
+                return Err(PolicyError::DuplicateRetiredEpoch {
+                    table: context.to_string(),
+                    key: r.key.clone(),
+                    epoch: retired,
+                });
+            }
+            seen_retired.insert(retired, ());
         }
 
         seen_keys.insert(r.key.clone(), ());

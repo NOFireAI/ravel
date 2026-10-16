@@ -7,18 +7,26 @@
 //! so this check must run before any key material reaches that
 //! constructor).
 
+use ipcrypt_rs::{Ipcrypt, IpcryptPfx};
 use ravel_types::TenantHash;
 
 use crate::policy::Variant;
 
 const CONTEXT_PREFIX: &str = "ravel ipcrypt v1 ";
 
-/// A derived IPCrypt key. Holds raw key material; never implements the
-/// derived `Debug`, and the hand-written impl below prints a placeholder
-/// instead of any byte.
+/// A derived IPCrypt key, holding the constructed cipher ready to encrypt or
+/// decrypt (built once here, after the degenerate-key check, rather than
+/// reconstructed from raw bytes on every call -- see [`crate::render`]'s
+/// `encrypt_ip`/`decrypt_ip`). Holds key material inside the cipher; never
+/// implements the derived `Debug`, and the hand-written impl below prints a
+/// placeholder instead of any byte.
+// Both variants are boxed: each `Aes128` round-key schedule is large enough
+// (one for `Ipcrypt`, two for `IpcryptPfx`) that an unboxed enum would make
+// every `DerivedKey` reserve space for its larger variant regardless of
+// which one is active (clippy::large_enum_variant).
 pub(crate) enum DerivedKey {
-    Deterministic([u8; 16]),
-    Prefix([u8; 32]),
+    Deterministic(Box<Ipcrypt>),
+    Prefix(Box<IpcryptPfx>),
 }
 
 impl std::fmt::Debug for DerivedKey {
@@ -67,7 +75,7 @@ pub(crate) fn derive_key(
         Variant::Deterministic => {
             let mut key = [0u8; 16];
             key.copy_from_slice(&full[..16]);
-            Ok(DerivedKey::Deterministic(key))
+            Ok(DerivedKey::Deterministic(Box::new(Ipcrypt::new(key))))
         }
         Variant::Prefix => prefix_key_from_bytes(full, rule_key, epoch),
     }
@@ -102,20 +110,36 @@ fn prefix_key_from_bytes(
             epoch,
         });
     }
-    Ok(DerivedKey::Prefix(full))
+    Ok(DerivedKey::Prefix(Box::new(IpcryptPfx::new(full))))
 }
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
+
+    const PROBE_IP: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
 
     fn tenant_hash(byte: u8) -> TenantHash {
         TenantHash([byte; 16])
     }
 
+    fn encrypt(key: &DerivedKey, ip: IpAddr) -> IpAddr {
+        match key {
+            DerivedKey::Deterministic(cipher) => cipher.encrypt_ipaddr(ip),
+            DerivedKey::Prefix(cipher) => cipher.encrypt_ipaddr(ip),
+        }
+    }
+
     #[test]
     fn fixed_output_deterministic() {
+        // `Ipcrypt`/`IpcryptPfx` expose no byte accessor, so this pins the
+        // derived key indirectly: encrypting a fixed probe address under it
+        // must match encrypting the same address under an independently
+        // constructed cipher from the exact bytes blake3 derivation is known
+        // to produce for this input (the bytes the pre-item-4 version of
+        // this test asserted directly).
         let dep_key = [7u8; 32];
         let key = derive_key(
             &dep_key,
@@ -125,17 +149,11 @@ mod tests {
             "client.ip",
         )
         .expect("derivation succeeds");
-        match key {
-            DerivedKey::Deterministic(bytes) => {
-                assert_eq!(
-                    bytes,
-                    [
-                        247, 80, 47, 71, 88, 41, 37, 3, 177, 44, 74, 216, 164, 252, 216, 109,
-                    ]
-                );
-            }
-            DerivedKey::Prefix(_) => unreachable!("deterministic variant yields Deterministic"),
-        }
+        let expected_bytes = [
+            247, 80, 47, 71, 88, 41, 37, 3, 177, 44, 74, 216, 164, 252, 216, 109,
+        ];
+        let expected = Ipcrypt::new(expected_bytes);
+        assert_eq!(encrypt(&key, PROBE_IP), expected.encrypt_ipaddr(PROBE_IP));
     }
 
     #[test]
@@ -157,10 +175,7 @@ mod tests {
             "client.ip",
         )
         .expect("derivation succeeds");
-        let (DerivedKey::Deterministic(b1), DerivedKey::Deterministic(b2)) = (k1, k2) else {
-            unreachable!("deterministic variant yields Deterministic");
-        };
-        assert_ne!(b1, b2);
+        assert_ne!(encrypt(&k1, PROBE_IP), encrypt(&k2, PROBE_IP));
     }
 
     #[test]
@@ -176,13 +191,9 @@ mod tests {
         .expect("derivation succeeds");
         let pfx = derive_key(&dep_key, &tenant_hash(1), 1, Variant::Prefix, "client.ip")
             .expect("derivation succeeds");
-        let DerivedKey::Deterministic(det_bytes) = det else {
-            unreachable!("deterministic variant yields Deterministic");
-        };
-        let DerivedKey::Prefix(pfx_bytes) = pfx else {
-            unreachable!("prefix variant yields Prefix");
-        };
-        assert_ne!(det_bytes, pfx_bytes[..16]);
+        assert!(matches!(det, DerivedKey::Deterministic(_)));
+        assert!(matches!(pfx, DerivedKey::Prefix(_)));
+        assert_ne!(encrypt(&det, PROBE_IP), encrypt(&pfx, PROBE_IP));
     }
 
     #[test]
@@ -204,10 +215,7 @@ mod tests {
             "client.ip",
         )
         .expect("derivation succeeds");
-        let (DerivedKey::Deterministic(b1), DerivedKey::Deterministic(b2)) = (k1, k2) else {
-            unreachable!("deterministic variant yields Deterministic");
-        };
-        assert_ne!(b1, b2);
+        assert_ne!(encrypt(&k1, PROBE_IP), encrypt(&k2, PROBE_IP));
     }
 
     #[test]
@@ -228,10 +236,8 @@ mod tests {
         let mut distinct = [7u8; 32];
         distinct[31] = 8;
         let key = prefix_key_from_bytes(distinct, "client.ip", 1).expect("halves differ");
-        match key {
-            DerivedKey::Prefix(bytes) => assert_eq!(bytes, distinct),
-            DerivedKey::Deterministic(_) => unreachable!(),
-        }
+        let expected = IpcryptPfx::new(distinct);
+        assert_eq!(encrypt(&key, PROBE_IP), expected.encrypt_ipaddr(PROBE_IP));
     }
 
     #[test]
@@ -247,17 +253,14 @@ mod tests {
         .expect("derivation succeeds");
         let pfx = derive_key(&dep_key, &tenant_hash(3), 1, Variant::Prefix, "client.ip")
             .expect("derivation succeeds");
-        let det_bytes = match &det {
-            DerivedKey::Deterministic(b) => *b,
-            DerivedKey::Prefix(_) => unreachable!(),
-        };
-        let pfx_bytes = match &pfx {
-            DerivedKey::Prefix(b) => *b,
-            DerivedKey::Deterministic(_) => unreachable!(),
-        };
         let rendered = format!("{det:?} {pfx:?}");
-        assert!(!rendered.contains(&hex::encode(det_bytes)));
-        assert!(!rendered.contains(&hex::encode(pfx_bytes)));
-        assert!(rendered.contains("<redacted>"));
+        // Neither cipher exposes its bytes, so the strongest check available
+        // here is that the Debug output is exactly the redaction placeholder
+        // (no accessor exists to assert the absence of a specific byte
+        // string, unlike the pre-item-4 version of this test).
+        assert_eq!(
+            rendered,
+            "DerivedKey::Deterministic(<redacted>) DerivedKey::Prefix(<redacted>)"
+        );
     }
 }

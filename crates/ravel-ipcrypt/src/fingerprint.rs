@@ -71,6 +71,7 @@ fn encode_table(buf: &mut Vec<u8>, tenant_hash: &[u8; 16], rules: &[Rule]) {
 
         let mut retired = rule.retired_epochs.clone();
         retired.sort_unstable();
+        retired.dedup();
         buf.extend_from_slice(&(retired.len() as u64).to_le_bytes());
         for epoch in retired {
             buf.extend_from_slice(&epoch.to_le_bytes());
@@ -250,6 +251,29 @@ mod tests {
             tenants: HashMap::new(),
         };
         assert_ne!(
+            policy_fingerprint(&policy_a, hash_tenant),
+            policy_fingerprint(&policy_b, hash_tenant)
+        );
+    }
+
+    #[test]
+    fn unchanged_under_duplicate_retired_epoch_entries() {
+        // A hand-built PolicyFile (bypassing parse_policy_file, which refuses
+        // a duplicate retired_epochs entry) must still fingerprint the same
+        // as its deduplicated equivalent: the encoding dedupes after sorting.
+        let policy_a = PolicyFile {
+            defaults: RuleTable {
+                rules: vec![rule("client.ip", Variant::Deterministic, 3, &[1, 2])],
+            },
+            tenants: HashMap::new(),
+        };
+        let policy_b = PolicyFile {
+            defaults: RuleTable {
+                rules: vec![rule("client.ip", Variant::Deterministic, 3, &[2, 1, 2, 1])],
+            },
+            tenants: HashMap::new(),
+        };
+        assert_eq!(
             policy_fingerprint(&policy_a, hash_tenant),
             policy_fingerprint(&policy_b, hash_tenant)
         );

@@ -196,7 +196,9 @@ pub async fn check_marker(
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
+    };
     use ravel_object_store::memory::MemoryStore;
 
     #[tokio::test]
@@ -259,15 +261,64 @@ mod tests {
         assert!(matches!(err, CheckError::Mismatch { .. }));
     }
 
+    /// Builds a store where a winner's marker is already present in the
+    /// inner [`MemoryStore`], wrapped so the caller's own `check_marker`
+    /// call actually takes the lost-create-race branch: its first `get`
+    /// reports not-found (so it attempts `create_marker`) and its `put`
+    /// fails as a conditional-write rejection (so it falls through to the
+    /// re-read-and-compare arm), rather than the real backend's natural
+    /// `AlreadyExists` short-circuiting the scenario before that branch
+    /// ever runs.
+    async fn lost_race_store(winner_fp: [u8; 32]) -> FaultStore<MemoryStore> {
+        let inner = MemoryStore::new();
+        create_marker(&inner, winner_fp)
+            .await
+            .expect("winner creates");
+
+        let plan = FaultPlan::empty()
+            .with_sequence(
+                Sequence::new(Op::Get)
+                    .with_key_contains(IPCRYPT_POLICY_KEY)
+                    .then_fault(ScriptedFault::NotFoundBlip)
+                    .then_passthrough(),
+            )
+            .with_rule(Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite));
+        FaultStore::new(inner, plan)
+    }
+
     #[tokio::test]
-    async fn lost_create_race_with_matching_winner_proceeds() {
-        let store = MemoryStore::new();
+    async fn lost_create_race_against_a_matching_winner_proceeds() {
         let fp = [5u8; 32];
-        // Simulate the race: another process already created the marker
-        // with the same fingerprint this call would have written.
-        create_marker(&store, fp).await.expect("create");
+        let store = lost_race_store(fp).await;
+
         let outcome = check_marker(&store, fp).await.expect("ok");
         assert_eq!(outcome, CheckOutcome::Matched);
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_create_race_against_a_mismatching_winner_refuses_naming_both_fingerprints() {
+        let winner_fp = [5u8; 32];
+        let local_fp = [6u8; 32];
+        let store = lost_race_store(winner_fp).await;
+
+        let err = check_marker(&store, local_fp).await.unwrap_err();
+        match err {
+            CheckError::Mismatch { stored, local } => {
+                assert_eq!(stored, hex::encode(winner_fp));
+                assert_eq!(local, hex::encode(local_fp));
+            }
+            other => unreachable!("expected Mismatch, got {other:?}"),
+        }
+        assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+        assert_eq!(
+            store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+            1
+        );
     }
 
     #[tokio::test]

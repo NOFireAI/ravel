@@ -165,6 +165,29 @@ fn retired_epoch_equal_to_current_epoch_is_refused() {
 }
 
 #[test]
+fn duplicate_retired_epoch_is_refused() {
+    // Two occurrences of the same retired epoch would otherwise make two
+    // semantically-equal policies fingerprint differently, since the naive
+    // encoding records the list's length and every entry rather than only
+    // the distinct set.
+    let text = r#"
+        [defaults]
+        rules = [
+            { key = "client.ip", variant = "deterministic", epoch = 3, retired_epochs = [1, 1] },
+        ]
+    "#;
+    let err = parse_policy_file(text, dots_to_underscores).unwrap_err();
+    assert_eq!(
+        err,
+        PolicyError::DuplicateRetiredEpoch {
+            table: "[defaults]".to_string(),
+            key: "client.ip".to_string(),
+            epoch: 1,
+        }
+    );
+}
+
+#[test]
 fn positive_retired_epochs_distinct_from_current_are_accepted() {
     let text = r#"
         [defaults]

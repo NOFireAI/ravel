@@ -120,12 +120,21 @@ impl TenantRules {
                 });
             }
             label_to_key.insert(label, key.clone());
+            // `parse_policy_file` already refuses a duplicate retired epoch
+            // within one table; dedupe here too so a hand-built `PolicyFile`
+            // that bypassed parsing cannot produce a `RuleInfo` whose
+            // `retired_epochs` and a fingerprint of the same rule disagree
+            // (`fingerprint::encode_table` dedupes the same list after
+            // sorting it).
+            let mut retired_epochs = rule.retired_epochs;
+            retired_epochs.sort_unstable();
+            retired_epochs.dedup();
             by_key.insert(
                 key,
                 ResolvedRule {
                     variant: rule.variant,
                     epoch: rule.epoch,
-                    retired_epochs: rule.retired_epochs,
+                    retired_epochs,
                     key: derived,
                 },
             );
@@ -373,6 +382,30 @@ mod tests {
             err,
             ResolveError::SanitizeCollision { label, .. } if label == "client_ip"
         ));
+    }
+
+    #[test]
+    fn resolve_dedupes_retired_epochs_in_a_hand_built_policy() {
+        // parse_policy_file already refuses a duplicate retired_epochs entry
+        // (PolicyError::DuplicateRetiredEpoch); resolve() must not trust that
+        // every caller went through it.
+        let policy = PolicyFile {
+            defaults: RuleTable {
+                rules: vec![Rule {
+                    key: "client.ip".to_string(),
+                    variant: Variant::Deterministic,
+                    epoch: 3,
+                    retired_epochs: vec![2, 1, 2, 1],
+                }],
+            },
+            tenants: HashMap::new(),
+        };
+        let dep_key = [1u8; 32];
+        let hash = TenantHash([9u8; 16]);
+        let rules =
+            TenantRules::resolve(&policy, "acme", &hash, &dep_key, test_sanitize).expect("ok");
+        let info = rules.lookup_raw("client.ip").expect("present");
+        assert_eq!(info.retired_epochs, &[1, 2]);
     }
 
     #[test]

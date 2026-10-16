@@ -10,9 +10,12 @@
 use prost::Message;
 use ravel_ipcrypt::fingerprint::EMPTY_POLICY_FINGERPRINT;
 use ravel_ipcrypt::marker::{
-    CheckError, CheckOutcome, MarkerError, check_marker, read_marker, replace_marker,
+    CheckError, CheckOutcome, IPCRYPT_POLICY_KEY, MarkerError, check_marker, read_marker,
+    replace_marker,
 };
-use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::fault::{
+    FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault, Sequence,
+};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
 use ravel_proto::sys::v1 as sysproto;
@@ -134,20 +137,72 @@ async fn unknown_format_version_refuses() {
     ));
 }
 
+/// Builds a store where a winner's marker is already present in the inner
+/// [`MemoryStore`], wrapped so the caller's own `check_marker` call actually
+/// takes the lost-create-race branch: its first `get` reports not-found (so
+/// it attempts to create the marker) and its `put` fails as a
+/// conditional-write rejection (so it falls through to the
+/// re-read-and-compare arm), rather than the real backend's natural
+/// `AlreadyExists` short-circuiting the scenario before that branch ever
+/// runs.
+async fn lost_race_store(winner_fp: [u8; 32]) -> FaultStore<MemoryStore> {
+    let inner = MemoryStore::new();
+    check_marker(&inner, winner_fp)
+        .await
+        .expect("winner creates");
+
+    let plan = FaultPlan::empty()
+        .with_sequence(
+            Sequence::new(Op::Get)
+                .with_key_contains(IPCRYPT_POLICY_KEY)
+                .then_fault(ScriptedFault::NotFoundBlip)
+                .then_passthrough(),
+        )
+        .with_rule(Rule::new(Op::Put, ScriptedFault::FailedConditionalWrite));
+    FaultStore::new(inner, plan)
+}
+
 #[tokio::test]
 async fn lost_create_race_against_a_matching_winner_proceeds() {
     // A real race (two processes both seeing no marker and both racing
-    // `CreateIfAbsent`) collapses to the same observable state as this
-    // sequential setup: by the time the "loser" calls `check_marker`, the
-    // marker the "winner" created is already present with the loser's own
-    // fingerprint.
-    let store = MemoryStore::new();
+    // `CreateIfAbsent`) ends with the loser's `create_marker` call failing
+    // with `AlreadyExists` and falling through to a re-read-and-compare
+    // against whichever fingerprint the winner wrote. The scripted faults
+    // force `check_marker` through exactly that branch instead of relying on
+    // the real backend's natural conflict behavior.
     let fp = [66u8; 32];
-    check_marker(&store, fp).await.expect("winner creates");
+    let store = lost_race_store(fp).await;
+
     let outcome = check_marker(&store, fp)
         .await
         .expect("loser re-reads and matches");
     assert_eq!(outcome, CheckOutcome::Matched);
+    assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+        1
+    );
+}
+
+#[tokio::test]
+async fn lost_create_race_against_a_mismatching_winner_refuses_naming_both_fingerprints() {
+    let winner_fp = [66u8; 32];
+    let local_fp = [67u8; 32];
+    let store = lost_race_store(winner_fp).await;
+
+    let err = check_marker(&store, local_fp).await.unwrap_err();
+    match err {
+        CheckError::Mismatch { stored, local } => {
+            assert_eq!(stored, hex::encode(winner_fp));
+            assert_eq!(local, hex::encode(local_fp));
+        }
+        other => panic!("expected Mismatch, got {other:?}"),
+    }
+    assert_eq!(store.fault_count(Op::Get, FaultKind::NotFoundBlip), 1);
+    assert_eq!(
+        store.fault_count(Op::Put, FaultKind::FailedConditionalWrite),
+        1
+    );
 }
 
 #[tokio::test]

@@ -9,7 +9,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_ipcrypt::policy::Variant;
-use ravel_ipcrypt::render::{decrypt_address, encrypt_address};
+use ravel_ipcrypt::render::{RenderOutcome, decrypt_address, encrypt_address};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -51,20 +51,32 @@ fn every_vector_encrypts_and_decrypts() {
             other => panic!("unexpected variant in vector file: {other}"),
         };
 
-        let (encrypted, _outcome) =
+        let (encrypted, outcome) =
             encrypt_address(variant, &key_bytes, &v.ip).expect("encrypt succeeds");
         assert_eq!(
             encrypted, v.encrypted_ip,
             "encrypt mismatch for ip={} key={}",
             v.ip, v.key
         );
+        assert_eq!(
+            outcome,
+            RenderOutcome::Encrypted,
+            "expected every vector's address to parse, got Unparsed for ip={}",
+            v.ip
+        );
 
-        let (decrypted, _outcome) =
+        let (decrypted, outcome) =
             decrypt_address(variant, &key_bytes, &v.encrypted_ip).expect("decrypt succeeds");
         assert_eq!(
             decrypted, v.ip,
             "decrypt mismatch for encrypted_ip={} key={}",
             v.encrypted_ip, v.key
+        );
+        assert_eq!(
+            outcome,
+            RenderOutcome::Encrypted,
+            "expected every vector's ciphertext to parse, got Unparsed for encrypted_ip={}",
+            v.encrypted_ip
         );
     }
 

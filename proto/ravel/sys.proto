@@ -937,9 +937,9 @@ message MetricMetadataRecord {
 //
 // Its own top-level message, sharing no field number with the markers above.
 message IpcryptPolicyMarker {
-  // Format floor: the minimum reader version that understands this record. A
-  // reader that only knows a lower version refuses rather than misreading a
-  // future layout, matching every other durable record's version guard.
+  // The only marker body version this build writes and reads. A reader that
+  // sees any other value refuses rather than misreading a future layout,
+  // matching every other durable record's version guard.
   uint32 format_version = 1;
   // blake3 digest of the effective policy (defaults plus every tenant
   // overlay), canonically encoded and order-independent (ADR-2993 decision

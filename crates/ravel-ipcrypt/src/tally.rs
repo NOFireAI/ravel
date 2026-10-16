@@ -22,7 +22,8 @@ impl IpcryptTally {
     }
 
     pub fn record(&mut self, variant: Variant, outcome: RenderOutcome) {
-        *self.counts.entry((variant, outcome)).or_insert(0) += 1;
+        let entry = self.counts.entry((variant, outcome)).or_insert(0);
+        *entry = entry.saturating_add(1);
     }
 
     pub fn count(&self, variant: Variant, outcome: RenderOutcome) -> u64 {
@@ -31,7 +32,8 @@ impl IpcryptTally {
 
     pub fn merge(&mut self, other: &IpcryptTally) {
         for (key, count) in &other.counts {
-            *self.counts.entry(*key).or_insert(0) += count;
+            let entry = self.counts.entry(*key).or_insert(0);
+            *entry = entry.saturating_add(*count);
         }
     }
 }
