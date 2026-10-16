@@ -1700,6 +1700,14 @@ impl Manifest {
 
         writeln!(out, "## Transport")?;
         writeln!(out)?;
+        writeln!(
+            out,
+            "These are the options of the Elasticsearch query endpoint, \
+             `POST /_query`, which Ravel does not serve. Ravel's own \
+             `POST /api/v1/esql` takes a statement in a request body of its \
+             own shape and is not scored here."
+        )?;
+        writeln!(out)?;
         writeln!(out, "| Option | Description | State |")?;
         writeln!(out, "|---|---|---|")?;
         for option in &self.transport {

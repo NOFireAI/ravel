@@ -79,7 +79,10 @@
 #           assume the release reads an index that maps the fixture's ten
 #           native columns at the types Ravel gives them and maps no
 #           `service` field, and evaluates NOW() at the fixture's query
-#           clock.
+#           clock. Every answer recorded here has no warnings, and the
+#           test reads none from the executor (the lowered-LIMIT warning is
+#           added by the HTTP endpoint, not the executor), so the warnings
+#           comparison holds no information yet.
 # divergence
 #           The id of the known divergence that makes Ravel's answer differ
 #           from the release's. The entry then counts as divergent: in the
@@ -3948,8 +3951,9 @@ example = 'SET a = 1 ROW x = 1'
 
 # ---------------------------------------------------------------------------
 # Transport: the options of the Elasticsearch query endpoint
-# (`POST /_query`). None is served yet: Ravel's own ES|QL endpoint and the
-# Elasticsearch-shaped adapter are later work (ADR-2887 D12).
+# (`POST /_query`), which Ravel does not serve. Ravel serves its own
+# `POST /api/v1/esql`, whose request body has a different shape and is not
+# scored here; the Elasticsearch-shaped adapter is later work (ADR-2887 D12).
 # ---------------------------------------------------------------------------
 
 [[transport]]

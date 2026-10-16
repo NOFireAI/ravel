@@ -125,6 +125,8 @@ Valid statements Ravel answers differently from the release, each pinned by a te
 
 ## Transport
 
+These are the options of the Elasticsearch query endpoint, `POST /_query`, which Ravel does not serve. Ravel's own `POST /api/v1/esql` takes a statement in a request body of its own shape and is not scored here.
+
 | Option | Description | State |
 |---|---|---|
 | `query` | the statement text in the request body | absent |
