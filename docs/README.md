@@ -131,6 +131,10 @@ Come back to one lane when you have a specific question.
 - [sql-conformance.md](sql-conformance.md): every SQL construct Ravel
   claims, classified as supported, intentionally rejected, or unclassified,
   generated from the conformance suite's recorded verdicts.
+- [esql-conformance.md](esql-conformance.md): every entry of Ravel's
+  inventory of the ES|QL language it targets, with its parser, binder and
+  executor state and the syntax, execution and transport figures,
+  generated from the release manifest.
 - [query-engine.md](query-engine.md) holds the PromQL conformance table. It
   is generated from a Ravel-only run that measures which constructs Ravel
   reaches and answers. Agreement with the pinned Prometheus binary is a
