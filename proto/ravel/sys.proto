@@ -914,3 +914,35 @@ message MetricMetadataRecord {
   // tenant's metadata, the TenantConfigRecord misfile guard.
   bytes tenant_hash = 3;
 }
+
+// The durable, deployment-wide IPCrypt policy marker at the bucket root
+// `sys/ipcrypt/policy` (ADR-2993 decision 9). It is deployment-wide, not
+// per-tenant, so it lives at the bucket root beside `sys/tenancy` and
+// `sys/gc`, never under a tenant prefix: the IPCrypt policy (which attribute
+// keys are pseudonymized, under which variant and epoch) is configured once
+// per deployment, with per-tenant overlays expressed inside that one policy
+// rather than as separate per-tenant objects.
+//
+// Written once via CreateIfAbsent by whichever process first resolves a
+// non-empty policy; a racing loser re-reads and compares fingerprints rather
+// than overwriting the winner. Mutated only by an explicit `set-policy`
+// operation, which swaps the object with CasVersion so a concurrent change
+// is caught, never silently overwritten. The marker holds only a fingerprint
+// of the effective policy, never the policy text or any key material: every
+// process computes its own fingerprint from its locally loaded policy file
+// and refuses to start when it disagrees with the stored one (ADR-2993
+// decision 9), the same "compute and compare, never trust a stored blob as
+// the source of truth" shape as the tenant-hash-scheme check in
+// TenancyMarker.
+//
+// Its own top-level message, sharing no field number with the markers above.
+message IpcryptPolicyMarker {
+  // The only marker body version this build writes and reads. A reader that
+  // sees any other value refuses rather than misreading a future layout,
+  // matching every other durable record's version guard.
+  uint32 format_version = 1;
+  // blake3 digest of the effective policy (defaults plus every tenant
+  // overlay), canonically encoded and order-independent (ADR-2993 decision
+  // 9). Exactly 32 bytes; never contains key material or a raw tenant id.
+  bytes fingerprint = 2;
+}
