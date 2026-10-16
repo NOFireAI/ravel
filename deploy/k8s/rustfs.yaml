@@ -1,0 +1,312 @@
+# RustFS as the fallback fake-S3 backend for the kind development environment
+# (ADR-0034 decision 8). floci is the default after its capability contract
+# went green; this manifest exists so that a floci release which stops
+# satisfying `Capabilities::mandatory()` or multipart is a one-flag switch
+# (`RAVEL_FAKE_S3_BACKEND=rustfs` in scripts/kind-up.sh) rather than new work.
+# RustFS is the backend this repository's object-store-contract CI job runs
+# the full contract suite against on every change.
+#
+# This is a development backend only: no PersistentVolumeClaim, so the bucket
+# lives in the pod's ephemeral filesystem and is gone when the pod restarts.
+# Credentials match deploy/docker-compose/rustfs.yml so the two dev paths use
+# the same values. Production points `spec.storage.s3.endpoint` at real S3 or a
+# real RustFS with real credentials.
+#
+# The `ravel-system` Namespace is not defined here on purpose; see the same
+# note in deploy/k8s/floci.yaml.
+#
+# Apply with:
+#   kubectl apply -f deploy/k8s/rustfs.yaml
+#   kubectl wait --for=condition=Complete --timeout=180s \
+#     -n ravel-system job/rustfs-create-bucket
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustfs
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: rustfs
+    app.kubernetes.io/component: fake-s3
+spec:
+  replicas: 1
+  # Recreate, not RollingUpdate: single-node RustFS stores objects on the pod's
+  # own filesystem, so overlapping replicas would serve diverging buckets.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustfs
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustfs
+        app.kubernetes.io/component: fake-s3
+    spec:
+      containers:
+        # ghcr.io rather than Docker Hub: rationale in deploy/README.md. Same
+        # digest ci.yml's object-store-contract job pins for its own RustFS
+        # `docker run`, so the kind dev cluster and CI run the identical build.
+        - name: rustfs
+          image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+          imagePullPolicy: IfNotPresent
+          # `server` is the default subcommand, so the data directory is the
+          # only required argument. The console port serves nothing until
+          # --console-enable is passed; with it, the UI is at /rustfs/console/.
+          args: ["--console-enable", "--console-address", ":9001", "/data"]
+          ports:
+            - name: s3
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          env:
+            - name: RUSTFS_ACCESS_KEY
+              value: ravel
+            - name: RUSTFS_SECRET_KEY
+              value: ravel-dev-secret
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          # RustFS's own health route on the S3 port, the same one
+          # scripts/demo.sh and the object-store-contract CI job poll. It needs
+          # no credentials, so a probe cannot be confused with an auth failure.
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: s3
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: s3
+            initialDelaySeconds: 3
+            periodSeconds: 3
+            timeoutSeconds: 3
+            failureThreshold: 40
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+      volumes:
+        # emptyDir, not a PVC: dev-only, and kind's default storage class would
+        # otherwise leave a host-path volume behind after `kind-down.sh`.
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustfs
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: rustfs
+    app.kubernetes.io/component: fake-s3
+spec:
+  selector:
+    app.kubernetes.io/name: rustfs
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: s3
+    - name: console
+      port: 9001
+      targetPort: console
+---
+# Bucket creation, the direct equivalent of the `createbucket` sidecar in
+# deploy/docker-compose/rustfs.yml. Unlike floci, RustFS verifies SigV4
+# signatures, so this needs a real S3 client: the AWS CLI, the same one the
+# compose file and the CI job use.
+#
+# The operator passes --require-bucket-protection to every RavelCluster, so the
+# bucket must pass the startup check (docs/object-store-contract.md "Required
+# bucket configuration"): Object Lock enabled at creation, versioning on, and
+# one whole-bucket lifecycle rule carrying the sanctioned actions, the same rule
+# set deploy/k8s/floci.yaml sends. crates/ravel-object-store's
+# `launcher_lifecycle_documents_pass_every_in_process_condition` test reads the
+# lifecycle document from this file.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rustfs-create-bucket
+  namespace: ravel-system
+  labels:
+    app.kubernetes.io/name: rustfs
+    app.kubernetes.io/component: fake-s3
+spec:
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustfs
+        app.kubernetes.io/component: fake-s3
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: create-bucket
+          # Same digest ci.yml pins for its own AWS CLI invocation.
+          image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+          imagePullPolicy: IfNotPresent
+          env:
+            # Must match spec.storage.s3.bucket of the RavelCluster that uses
+            # this backend (deploy/k8s/examples/ravelcluster-dev.yaml).
+            - name: BUCKET
+              value: ravel
+            - name: ENDPOINT
+              value: http://rustfs.ravel-system.svc:9000
+            - name: AWS_ACCESS_KEY_ID
+              value: ravel
+            - name: AWS_SECRET_ACCESS_KEY
+              value: ravel-dev-secret
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            # No IMDS in this cluster; without this the CLI spends its metadata
+            # timeout on every call before using the static credentials above.
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+          # The image's entrypoint is the `aws` binary itself, so a multi-step
+          # script needs an explicit shell.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              # A signed S3 call is the readiness wait: the Service can route
+              # to the pod before RustFS finishes starting.
+              i=0
+              while [ "$i" -lt 60 ]; do
+                if aws --endpoint-url "$ENDPOINT" s3api list-buckets >/dev/null 2>&1; then
+                  echo "RustFS is ready"
+                  break
+                fi
+                i=$((i + 1))
+                sleep 2
+              done
+              if [ "$i" -ge 60 ]; then
+                echo "RustFS did not become ready in time" >&2
+                exit 1
+              fi
+              # NoncurrentDays 1 keeps a dev bucket's noncurrent versions
+              # briefly; a production bucket sets its own E_v
+              # (docs/guides/disaster-recovery.md).
+              LIFECYCLE='{"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+              # An existing bucket is a success rather than an error, so a
+              # rerun of this Job on a live cluster is a no-op. Object Lock can
+              # only be enabled when the bucket is created.
+              if ! aws --endpoint-url "$ENDPOINT" s3api head-bucket --bucket "$BUCKET" 2>/dev/null; then
+                aws --endpoint-url "$ENDPOINT" s3api create-bucket --bucket "$BUCKET" \
+                  --object-lock-enabled-for-bucket
+              fi
+              # Verify rather than trust: head-bucket fails if the bucket is
+              # absent, so getting past it proves it exists.
+              aws --endpoint-url "$ENDPOINT" s3api head-bucket --bucket "$BUCKET" >/dev/null
+              # Object Lock is read before anything is put. A bucket created by
+              # an older manifest without Object Lock fails here; delete the
+              # rustfs pod to start from an empty store.
+              lock="$(aws --endpoint-url "$ENDPOINT" s3api get-object-lock-configuration \
+                --bucket "$BUCKET" --query ObjectLockConfiguration.ObjectLockEnabled --output text)"
+              if [ "$lock" != "Enabled" ]; then
+                echo "bucket ${BUCKET} does not have Object Lock enabled (${lock})" >&2
+                exit 1
+              fi
+              # Versioning and the lifecycle rule are each read first and put
+              # only when the read does not already match, then read back, so
+              # a rerun of this Job against a bucket that is already set up
+              # issues no put.
+              versioning="$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-versioning \
+                --bucket "$BUCKET" --query Status --output text)"
+              if [ "$versioning" = "Enabled" ]; then
+                echo "bucket ${BUCKET} already has versioning Enabled; not putting it"
+              else
+                aws --endpoint-url "$ENDPOINT" s3api put-bucket-versioning --bucket "$BUCKET" \
+                  --versioning-configuration Status=Enabled
+                versioning="$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-versioning \
+                  --bucket "$BUCKET" --query Status --output text)"
+                if [ "$versioning" != "Enabled" ]; then
+                  echo "bucket ${BUCKET} does not have versioning enabled (${versioning})" >&2
+                  exit 1
+                fi
+              fi
+              # lifecycle_ok reads the lifecycle configuration once and checks
+              # it whole, as tab-separated fields: rule count, Status, scope
+              # (the rule's Filter and legacy Prefix as one JSON object), then
+              # the three actions. Every field goes through to_string, so none
+              # is empty. It returns 1 with the mismatch in $why, including
+              # when the read fails because the bucket has no configuration.
+              lifecycle_ok() {
+                if ! lifecycle="$(aws --endpoint-url "$ENDPOINT" s3api get-bucket-lifecycle-configuration \
+                  --bucket "$BUCKET" --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')"; then
+                  why="could not read the lifecycle configuration of bucket ${BUCKET}"
+                  return 1
+                fi
+                tab="$(printf '\t')"
+                set -f
+                IFS="$tab"
+                set -- $lifecycle
+                unset IFS
+                set +f
+                if [ "$#" -ne 6 ]; then
+                  why="bucket ${BUCKET} lifecycle read-back is malformed (${lifecycle})"
+                  return 1
+                fi
+                if [ "$1" != "1" ]; then
+                  why="bucket ${BUCKET} carries $1 lifecycle rules, not exactly one"
+                  return 1
+                fi
+                if [ "$2" != "Enabled" ]; then
+                  why="bucket ${BUCKET} lifecycle rule is not enabled ($2)"
+                  return 1
+                fi
+                # The whole-bucket spellings the server's rule parser reads as
+                # an empty prefix. This reads through botocore, which drops
+                # unknown elements and text inside Filter and keeps only the
+                # first of two Filters. Text beside a Filter's one Prefix is
+                # harmless: the server ignores it too and reads the whole
+                # bucket. An unknown element inside Filter, text in a Filter
+                # with no child, or a second Filter reads back as an accepted
+                # spelling here, while the server reads it as an unrecognized
+                # filter, reports the lifecycle conditions unknown, and starts
+                # with a warning rather than refusing.
+                case "$3" in
+                  '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | \
+                    '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
+                  *)
+                    why="bucket ${BUCKET} lifecycle rule is not scoped to the whole bucket ($3)"
+                    return 1
+                    ;;
+                esac
+                if [ "$4" != "true" ]; then
+                  why="bucket ${BUCKET} does not carry the expired-delete-marker rule ($4)"
+                  return 1
+                fi
+                if [ "$5" != "1" ]; then
+                  why="bucket ${BUCKET} does not carry the noncurrent-expiration rule ($5)"
+                  return 1
+                fi
+                if [ "$6" != "7" ]; then
+                  why="bucket ${BUCKET} does not carry the multipart-abort rule ($6)"
+                  return 1
+                fi
+              }
+              if lifecycle_ok 2>/dev/null; then
+                echo "bucket ${BUCKET} already carries the lifecycle rule; not putting it"
+              else
+                echo "putting the lifecycle rule: ${why}"
+                aws --endpoint-url "$ENDPOINT" s3api put-bucket-lifecycle-configuration \
+                  --bucket "$BUCKET" --lifecycle-configuration "$LIFECYCLE"
+                if ! lifecycle_ok; then
+                  echo "$why" >&2
+                  exit 1
+                fi
+              fi
+              echo "bucket ${BUCKET} ready: Object Lock, versioning and lifecycle rules set"
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi

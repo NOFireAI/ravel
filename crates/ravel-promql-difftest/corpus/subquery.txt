@@ -1,0 +1,186 @@
+# Subquery corpus (ticket P10, docs/promql-evaluator-plan.md section 8):
+# `expr[range:step]` evaluation against
+# crates/ravel-promql-difftest/src/generator.rs's fixed dataset. Every
+# offset is relative to the dataset's base_ts_ms, so a corpus file never
+# encodes an absolute timestamp, except where the query text itself
+# requires one for the `@` modifier (matching selectors.txt's own
+# precedent: the absolute value is base_ts_ms/1000 plus a stated offset).
+#
+# `diff_gauge_walk` and `diff_counter_total{shape="reset"}` are both
+# regularly sampled every 30s across the dataset's full ~1170s span
+# (generator.rs's `regular_timestamps`), so every subquery window below
+# stays inside real sample coverage.
+#
+# `mode: unordered` is correct for every success entry here, for the same
+# reason as selectors.txt (ADR-0021 decision 3).
+
+name: instant_rate_over_subquery_of_a_recording_style_expression
+query: rate(sum(diff_counter_total{shape="reset"})[5m:1m])
+kind: instant
+time: +900s
+mode: unordered
+
+# ADR-0025 allowlist (arithmetic residue, same class as rate.txt's
+# rate/deriv/predict_linear entries): the inner rate() extrapolates over an
+# IEEE 754 delta/divide, then max_over_time and the outer subquery grid
+# carry that residue forward, so any gap is arithmetic residue rather than a
+# transcendental libm difference. Measured 1 ULP against the pinned
+# Prometheus v3.13.1 binary: the last grid point, 0.0952088821309351 vs
+# 0.09520888213093512, is a single f64::to_bits step apart, and it is the
+# only point in this matrix that differs (a fully observed value, not a
+# sampled worst case). tolerance: 2 is 1 ULP of headroom, matching the
+# sibling `instant_subquery_at_modifier_pins_the_grids_own_end` entry below
+# and rate.txt's own 1-ULP entries.
+name: instant_nested_subquery_through_an_intervening_range_function
+query: max_over_time(rate(diff_counter_total{shape="reset"}[2m])[5m:1m])[10m:2m]
+kind: instant
+time: +1080s
+mode: unordered
+tolerance: 2
+
+name: instant_subquery_step_defaults_to_the_evaluation_interval
+query: avg_over_time(diff_gauge_walk[5m:])
+kind: instant
+time: +900s
+mode: unordered
+
+name: instant_subquery_grid_start_is_epoch_aligned_not_window_relative
+# base_ts_ms (1_700_000_000_000 ms) is 20s past the nearest absolute
+# minute boundary, so this subquery's nominal (window-relative) start
+# never lands on a 1m-epoch multiple: the point count only comes out
+# right if both engines align the grid to the epoch, not to the window.
+query: count_over_time(diff_gauge_walk[3m:1m])
+kind: instant
+time: +600s
+mode: unordered
+
+# ADR-0025 allowlist (arithmetic residue, same class as rate.txt's
+# rate/deriv/predict_linear entries): avg_over_time sums the subquery
+# grid's values then divides by the count, using only IEEE 754 +/- and /,
+# so any gap is arithmetic residue, not a transcendental libm difference.
+# Measured up to 5 ULPs across this range's grid points; the
+# representative pair, -4.242539167465618 vs -4.242539167465619, is 1 ULP
+# by f64::to_bits, and it is the only grid point directly observed.
+# tolerance: 8 is the next power of two above the 5-ULP worst case;
+# tighten it if a live run shows a smaller observed max (ADR-0025
+# Consequences: a tightenable tolerance is a signal worth checking).
+name: range_subquery_over_a_stepped_grid
+query: avg_over_time(diff_gauge_walk[3m:1m])
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+tolerance: 8
+
+name: instant_subquery_offset_shifts_the_grids_own_end
+query: avg_over_time(diff_gauge_walk[3m:1m] offset 2m)
+kind: instant
+time: +900s
+mode: unordered
+
+# ADR-0025 allowlist (arithmetic residue, same class as rate.txt's
+# rate/deriv/predict_linear entries): avg_over_time sums then divides,
+# IEEE 754 arithmetic only, so this is residue rather than a libm
+# difference. Measured 1 ULP: the exact values
+# (-3.4712031303800788 vs -3.4712031303800783) are adjacent doubles by
+# f64::to_bits. This is a single, fully observed value (one instant
+# result), not a sampled worst case, so the measurement is exact.
+# tolerance: 2 is 1 ULP of headroom, matching rate.txt's 1-ULP entries.
+name: instant_subquery_at_modifier_pins_the_grids_own_end
+query: avg_over_time(diff_gauge_walk[3m:1m] @ 1700000600.000)
+kind: instant
+time: +0s
+mode: unordered
+tolerance: 2
+
+# The two entries below use a 20s subquery step deliberately: base_ts_ms
+# (1_700_000_000_000 ms) is an exact multiple of 20_000ms (though not of
+# 30_000ms or 60_000ms, see the epoch-aligned entry above), so choosing a
+# 20s step plus offsets/ranges that are themselves whole multiples of 20s
+# makes every `end - range` target land exactly on a step boundary in
+# absolute epoch time. Before the fix, `align_up_to_step` used a closed
+# `>=` rule and would have admitted that boundary point into the grid;
+# the corrected left-open `>` rule excludes it. Every corpus entry
+# above this point has a target that is never step-aligned (by construction
+# or by accident), so none of them actually exercised the closed-vs-open
+# difference; these two are chosen specifically so they do.
+
+name: instant_subquery_grid_start_excludes_a_step_aligned_boundary
+# time=+600s, range=2m, step=20s: target = base + 600s - 120s = base +
+# 480s, a multiple of 20s in absolute epoch time. Left-open start is
+# base + 500s, giving grid points {500, 520, 540, 560, 580, 600}s relative
+# to base_ts_ms -- 6 points. Before the fix the closed rule would have
+# also admitted 480s, giving 7. Every point is well inside the dataset's
+# continuous 30s-sampled span (0..1170s) and the default 5m lookback, so
+# `diff_gauge_walk` resolves at every grid instant and count_over_time
+# reports the point count directly: 6.
+query: count_over_time(diff_gauge_walk[2m:20s])
+kind: instant
+time: +600s
+mode: unordered
+
+name: nested_subquery_grid_start_excludes_a_step_aligned_boundary_at_both_levels
+# Same time/range/step as the entry above for the outer subquery, and the
+# inner subquery reuses the identical 2m:20s shape. Because both are whole
+# multiples of 20s and base_ts_ms is itself a multiple of 20s, the outer
+# target (base + 480s) *and* the inner target at every one of the outer's
+# 6 grid instants (t - 120s, for t in {500..600}s step 20s, i.e.
+# {380..480}s) each land exactly on a 20s epoch boundary -- the
+# left-open rule excludes all of them, at both nesting levels
+# simultaneously.
+# Outer grid: {500, 520, 540, 560, 580, 600}s (6 points, as above). At each
+# outer instant t, the inner count_over_time(diff_gauge_walk[2m:20s])
+# grid is {t-100, t-80, t-60, t-40, t-20, t}s (6 points), all within
+# [380s, 600s] -- still inside the dataset's 0..1170s span and 5m
+# lookback, so the inner count_over_time is 6 at every one of the 6 outer
+# instants. The outer count_over_time then counts those 6 defined
+# instants: 6.
+query: count_over_time(count_over_time(diff_gauge_walk[2m:20s])[2m:20s])
+kind: instant
+time: +600s
+mode: unordered
+
+# Cap-exceeded entries: Ravel enforces a resolution cap (11_000 points,
+# docs/query-engine.md "Budgets") independently at every subquery
+# evaluation node, before that node's grid is built. Both entries below
+# ask for a single node's grid alone to exceed it, one directly and one
+# through one level of nesting.
+#
+# Verified against the pinned Prometheus v3.13.1 binary: Prometheus
+# SUCCEEDS on both, Ravel errors by design. This is intentional,
+# documented divergence, not a bug and not
+# a missing prometheus_process.rs flag. Prometheus has no per-subquery-
+# node step-count cap, and neither of its query resource limits fires
+# here: --query.max-samples is a yielded-sample memory budget (these
+# sparse 30s-sampled series yield far too few samples to trip it), and
+# query_range's outer 11_000-step check never runs because both entries
+# are instant queries. Ravel additionally classifies its cap rejection
+# as a 422 "execution" budget error (TooManyPoints -> Unsupported), not
+# the 400 "bad_data" class Prometheus uses for its own outer resolution
+# limit, so the two engines diverge on error class as well as on whether
+# they error at all. See
+# docs/adrs/0030-promql-subquery-point-cap-divergence.md for the full
+# investigation and decision.
+#
+# These use `mode: ravel_error_prom_success`, the comparator's ADR-0030
+# one-sided-divergence allowlist (comparator.rs): it asserts exactly this
+# shape, Ravel errors by design and Prometheus succeeds, and treats any
+# other outcome (both erroring, both succeeding, Prometheus erroring) as a
+# real mismatch. ADR-0030 recorded this as a follow-up when it first
+# accepted the divergence with the entries still `mode: error`, and a
+# later follow-up added the comparator mode so the entries turn green
+# rather than staying manually known-divergent. The per-node cap itself
+# stays covered by ravel-promql's eval.rs unit tests.
+
+name: error_subquery_grid_exceeds_the_point_cap
+query: max_over_time(diff_gauge_walk[100d:1s])
+kind: instant
+time: +0s
+mode: ravel_error_prom_success
+
+name: error_nested_subquery_inner_grid_exceeds_the_point_cap
+query: avg_over_time(max_over_time(diff_gauge_walk[50d:1s])[1m:1s])
+kind: instant
+time: +0s
+mode: ravel_error_prom_success

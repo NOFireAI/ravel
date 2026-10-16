@@ -1,0 +1,14 @@
+# smoke.cfg depth is "-" (not enforced): TLC's reported BFS depth overshoots
+# by a level when workers race (measured 25 at -workers 2, seen 25 and 26 at
+# -workers auto on identical input, distinct=426976 stable across both;
+# issues #1353, #1439, #1638). distinct is worker-independent and stays
+# exactly enforced. See check_bands in scripts/check-tla.sh for the sentinel.
+#
+# exhaustive.cfg still pins an exact depth (36 36) and runs under
+# RAVEL_TLA_WORKERS=auto in tla-nightly.yml, so it carries the same overshoot
+# exposure this file's smoke.cfg row was loosened for. #1671 tracks measuring
+# and loosening it.
+cfg	min_distinct	max_distinct	min_depth	max_depth
+smoke.cfg	426976	426976	-	-
+exhaustive.cfg	5466239	5466239	36	36
+live.cfg	1616	1616	11	11

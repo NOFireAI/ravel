@@ -1,0 +1,397 @@
+# Binary operator corpus (docs/promql-evaluator-plan.md section P7),
+# against crates/ravel-promql-difftest/src/generator.rs's fixed dataset.
+# Every offset is relative to the dataset's base_ts_ms
+# (1_700_000_000_000 ms, i.e. 2023-11-14T22:13:20Z).
+#
+# Covers: scalar/scalar and scalar/vector arithmetic (including atan2),
+# vector/vector one-to-one matching (default, on(), ignoring()), filter-
+# and bool-mode comparisons, NaN/-0.0 comparison edge cases (diff_special_
+# values), group_left/group_right many-to-one matching with label copy,
+# set operators (and/or/unless), and matching-cardinality error cases
+# (diff_dup_left/diff_dup_right, and an implicit-many-to-one on diff_
+# group_left/diff_group_right).
+
+name: instant_scalar_scalar_add
+query: 2 + 3
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_scalar_mod
+query: 7 % 2
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_scalar_pow
+query: 2 ^ 10
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_scalar_atan2
+query: 1 atan2 2
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_scalar_vector_add
+query: diff_gauge_walk + 10
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_vector_scalar_sub
+query: diff_gauge_walk - 10
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_scalar_vector_pow
+query: diff_gauge_walk ^ 2
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_vector_scalar_atan2
+query: diff_gauge_walk atan2 1
+kind: instant
+time: +300s
+mode: unordered
+
+# `diff_agg_group` rather than `diff_gauge_walk`: the walk's sign at any
+# instant depends on the dataset seed, so `diff_gauge_walk > 0` answered with
+# an empty vector for the default seed and this entry pinned nothing about
+# keeping the metric name. The agg-group values are fixed (10/20/20 and
+# 5/5/15), so `> 10` always drops three series and keeps three.
+name: instant_filter_comparison_keeps_name
+query: diff_agg_group > 10
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_bool_comparison
+query: diff_gauge_walk > bool 0
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_le_filter_comparison_keeps_name
+query: diff_gauge_walk <= 0
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_le_bool_comparison
+query: diff_gauge_walk <= bool 0
+kind: instant
+time: +300s
+mode: unordered
+
+name: instant_nan_eq_filter_is_empty
+query: diff_special_values == diff_special_values
+kind: instant
+time: +120s
+mode: unordered
+expect: empty
+
+name: instant_nan_ne_bool_is_true
+query: diff_special_values != bool diff_special_values
+kind: instant
+time: +120s
+mode: unordered
+
+name: instant_nan_ge_bool_is_false
+query: diff_special_values >= bool 0
+kind: instant
+time: +120s
+mode: unordered
+
+name: instant_negative_zero_eq_zero
+query: diff_special_values == bool 0
+kind: instant
+time: +150s
+mode: unordered
+
+name: instant_one_to_one_default_match
+query: diff_match_left + diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_one_to_one_on_multi_label_bool
+query: diff_match_left > bool on(job, instance) diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_one_to_one_ignoring_absent_label
+query: diff_match_left != bool ignoring(nonexistent) diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_group_left_many_to_one
+query: diff_group_left * on(job) group_left diff_group_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_group_right_one_to_many
+query: diff_group_right * on(job) group_right diff_group_left
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_group_left_copies_label
+query: diff_group_left * on(job) group_left(version) diff_group_meta
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_set_and
+query: diff_match_left and diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_set_or
+query: diff_match_left or diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_set_unless
+query: diff_match_left unless diff_match_right
+kind: instant
+time: +0s
+mode: unordered
+
+name: range_vector_vector_add
+query: diff_match_left + on(job, instance) diff_match_right
+kind: range
+start: +0s
+end: +300s
+step: 30s
+mode: unordered
+
+name: error_duplicate_signature_rhs
+query: diff_dup_left * on(job) diff_dup_right
+kind: instant
+time: +0s
+mode: error
+
+name: error_implicit_many_to_one
+query: diff_group_left * on(job) diff_group_right
+kind: instant
+time: +0s
+mode: error
+
+# Native-histogram binary operators (#1700). Prometheus v3.13.1 defines a
+# specific supported set over native histograms and drops-and-annotates the
+# rest; Ravel now computes the same set with the FloatHistogram primitives and
+# raises the same info annotation on the rest, instead of the old blanket 422.
+# The supported set below was enumerated empirically against the pinned binary
+# (operator x {histogram, float} on each side x {filter, bool}); this block
+# pins every cell. `diff_native_hist` is the fixed dataset's native-histogram
+# counter series (see histogram_native.txt); at +0s it has count 7, sum 12.
+#
+# The comparator matches the `infos` annotation channel by presence, so a
+# drop-and-annotate cell is pinned as `expect: empty` (Prometheus and Ravel
+# both answer empty and both raise an info). A supported filter comparison that
+# simply does not hold also answers empty, but with NO annotation on either
+# side; `hist_ne_two_histograms` below is that case, distinct from the
+# annotated drops.
+
+# --- Supported: arithmetic that returns a histogram ---
+name: hist_mul_scalar
+query: diff_native_hist * 2
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_scalar_mul
+query: 2 * diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_div_scalar
+query: diff_native_hist / 2
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_add_hist
+query: diff_native_hist + diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_sub_hist
+query: diff_native_hist - diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+
+# A divisor from query text can be zero or negative, which no in-crate caller
+# of FloatHistogram::div ever passes. These two cells are what pin that
+# behaviour against the binary rather than against a recollection of it.
+name: hist_div_zero
+query: diff_native_hist / 0
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_div_negative_scalar
+query: diff_native_hist / -2
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_mul_zero
+query: diff_native_hist * 0
+kind: instant
+time: +0s
+mode: unordered
+
+# --- Supported: two histograms at different schemas ---
+# `diff_native_hist_schema` runs at schema 1 between samples 13 (+390s) and 27
+# (+810s) while `diff_native_hist` stays at schema 0 throughout, so at +600s
+# these two series are a mixed-schema pair matched one-to-one on their shared
+# kind="counter" label. Both sides must down-convert to the coarser schema
+# before merging buckets; merging by raw bucket index instead keeps the finer
+# operand's schema and lands each count in a bucket covering a different value
+# range, which these cells detect through the rendered bucket bounds. The
+# finer operand is on the left in both, the direction an unaligned merge gets
+# wrong.
+name: hist_add_mixed_schema
+query: diff_native_hist_schema + diff_native_hist
+kind: instant
+time: +600s
+mode: unordered
+
+name: hist_sub_mixed_schema
+query: diff_native_hist_schema - diff_native_hist
+kind: instant
+time: +600s
+mode: unordered
+
+# --- Supported: == / != between two histograms ---
+# Filter `==` holds (a histogram equals itself), so the left histogram passes
+# through unchanged. Filter `!=` does not hold, so the sample drops with no
+# annotation. Bool mode synthesizes 1/0.
+name: hist_eq_two_histograms
+query: diff_native_hist == diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_ne_two_histograms
+query: diff_native_hist != diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_eq_bool_two_histograms
+query: diff_native_hist == bool diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+
+name: hist_ne_bool_two_histograms
+query: diff_native_hist != bool diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+
+# --- Unsupported: dropped with an info annotation ---
+# Arithmetic between a histogram and a float, or histogram*histogram,
+# float/histogram, histogram/histogram, and every %/^/atan2 pairing.
+name: hist_add_scalar_drops
+query: diff_native_hist + 2
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_scalar_sub_drops
+query: 2 - diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_mul_hist_drops
+query: diff_native_hist * diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_scalar_div_drops
+query: 2 / diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_div_hist_drops
+query: diff_native_hist / diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_mod_scalar_drops
+query: diff_native_hist % 2
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_pow_scalar_drops
+query: diff_native_hist ^ 2
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_atan2_scalar_drops
+query: diff_native_hist atan2 2
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+# --- Unsupported: comparisons that carry a histogram operand ---
+# A histogram compared against a float (any operator), or an ordering
+# comparison between two histograms, is not defined.
+name: hist_eq_scalar_drops
+query: diff_native_hist == 2
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_gt_scalar_drops
+query: diff_native_hist > 2
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_gt_bool_scalar_drops
+query: diff_native_hist > bool 2
+kind: instant
+time: +0s
+mode: unordered
+expect: empty
+
+name: hist_gt_two_histograms_drops
+query: diff_native_hist > diff_native_hist
+kind: instant
+time: +0s
+mode: unordered
+expect: empty

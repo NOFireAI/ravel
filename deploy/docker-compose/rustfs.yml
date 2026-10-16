@@ -1,0 +1,117 @@
+services:
+  # ghcr.io rather than Docker Hub: rationale in deploy/README.md. Pinned to
+  # a release tag plus an immutable @sha256: manifest digest (issue #1720),
+  # the same pin deploy/docker-compose/ravel.yml carries for the same image
+  # (ravel.yml documents this file as its RustFS mirror).
+  rustfs:
+    image: ghcr.io/rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    # `server` is the default subcommand, so the data directory is the only
+    # required argument. The console port serves nothing until
+    # --console-enable is passed; with it, the UI is at /rustfs/console/.
+    command: ["--console-enable", "--console-address", ":9001", "/data"]
+    # The image runs as uid 10001, and on a Linux host the bind-mounted
+    # rustfs-data/ below is created root-owned, so RustFS cannot write its
+    # disk there. Root in this dev-only container keeps the bind mount
+    # working the way it did for MinIO, which ran as root.
+    user: "0:0"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: ravel
+      RUSTFS_SECRET_KEY: ravel-dev-secret
+    volumes:
+      - ../../rustfs-data:/data
+  createbucket:
+    image: public.ecr.aws/aws-cli/aws-cli:2.37.2@sha256:e38214027df83cb6631adcf980a092a98d1d29788789bff2a0f424e87e3da8ed
+    depends_on: [rustfs]
+    environment:
+      AWS_ACCESS_KEY_ID: ravel
+      AWS_SECRET_ACCESS_KEY: ravel-dev-secret
+      AWS_DEFAULT_REGION: us-east-1
+      # No IMDS on a developer laptop or a CI runner; without this the CLI
+      # spends its metadata timeout on every call before using the static
+      # credentials above.
+      AWS_EC2_METADATA_DISABLED: "true"
+    # A signed S3 call fails until RustFS is serving, so the until-loop is the
+    # readiness wait; the service exits 0 only once the bucket exists. The
+    # image's entrypoint is the `aws` binary itself, so running more than one
+    # command needs an explicit shell.
+    #
+    # The bucket is created the way a --require-bucket-protection deployment
+    # needs it (docs/object-store-contract.md "Required bucket configuration"):
+    # Object Lock enabled at creation, versioning on, and one whole-bucket
+    # lifecycle rule carrying the sanctioned actions, the same script as
+    # deploy/docker-compose/ravel.yml. NoncurrentDays 1 keeps a dev bucket's
+    # noncurrent versions briefly. A `rustfs-data/` created before this bucket
+    # carried Object Lock fails the read-back below; remove it to start over.
+    # crates/ravel-object-store's
+    # `launcher_lifecycle_documents_pass_every_in_process_condition` test reads
+    # the lifecycle document from this file.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        LIFECYCLE='{"Rules":[{"ID":"ravel","Filter":{"Prefix":""},"Status":"Enabled","Expiration":{"ExpiredObjectDeleteMarker":true},"NoncurrentVersionExpiration":{"NoncurrentDays":1},"AbortIncompleteMultipartUpload":{"DaysAfterInitiation":7}}]}'
+        s3() { aws --endpoint-url http://rustfs:9000 s3api "$$@"; }
+        i=0
+        until s3 list-buckets >/dev/null 2>&1; do
+          i=$$((i + 1))
+          if [ $$i -ge 120 ]; then echo 'rustfs did not answer a signed call in 120 s'; exit 1; fi
+          echo 'waiting for rustfs'; sleep 1
+        done
+        s3 head-bucket --bucket ravel-dev 2>/dev/null ||
+          s3 create-bucket --bucket ravel-dev --object-lock-enabled-for-bucket
+        s3 head-bucket --bucket ravel-dev
+        # Object Lock is read before anything is put. Versioning and the
+        # lifecycle rule are each read first and put only when the read does
+        # not already match, then read back: rustfs-data/ outlives
+        # `docker compose down`, and bringing the stack up again on the same
+        # directory then issues no put.
+        lock="$$(s3 get-object-lock-configuration --bucket ravel-dev --query ObjectLockConfiguration.ObjectLockEnabled --output text)" || lock=none
+        test "$$lock" = Enabled || { echo "bucket ravel-dev does not have Object Lock enabled ($$lock); remove rustfs-data/ to start over"; exit 1; }
+        if [ "$$(s3 get-bucket-versioning --bucket ravel-dev --query Status --output text)" = Enabled ]; then
+          echo 'bucket ravel-dev already has versioning Enabled; not putting it'
+        else
+          s3 put-bucket-versioning --bucket ravel-dev --versioning-configuration Status=Enabled
+          test "$$(s3 get-bucket-versioning --bucket ravel-dev --query Status --output text)" = Enabled
+        fi
+        # lifecycle_ok: one read of the whole lifecycle configuration, tab
+        # separated: rule count, Status, scope (Filter and legacy Prefix as one
+        # JSON object), then the three actions. Every field goes through
+        # to_string. Returns 1 with the mismatch in $$why, including when the
+        # read fails because the bucket has no configuration.
+        lifecycle_ok() {
+          lc="$$(s3 get-bucket-lifecycle-configuration --bucket ravel-dev --output text --query '[to_string(length(Rules)), to_string(Rules[0].Status), to_string({f: Rules[0].Filter, p: Rules[0].Prefix}), to_string(Rules[0].Expiration.ExpiredObjectDeleteMarker), to_string(Rules[0].NoncurrentVersionExpiration.NoncurrentDays), to_string(Rules[0].AbortIncompleteMultipartUpload.DaysAfterInitiation)]')" ||
+            { why='could not be read'; return 1; }
+          want() { test "$$2" = "$$3" || { why="want $$1 $$2, read $$3 ($$lc)"; return 1; }; }
+          tab="$$(printf '\t')"; set -f; IFS="$$tab"; set -- $$lc; unset IFS; set +f
+          want fields 6 "$$#" || return 1
+          want rules 1 "$$1" || return 1
+          want status Enabled "$$2" || return 1
+          # The whole-bucket spellings the server's rule parser reads as an
+          # empty prefix. This reads through botocore, which drops unknown
+          # elements and text inside Filter and keeps only the first of two
+          # Filters. Text beside a Filter's one Prefix is harmless: the server
+          # ignores it too and reads the whole bucket. An unknown element
+          # inside Filter, text in a Filter with no child, or a second Filter
+          # reads back as an accepted spelling here, while the server reads it
+          # as an unrecognized filter, reports the lifecycle conditions
+          # unknown, and starts with a warning rather than refusing.
+          case "$$3" in
+            '{"f":{"Prefix":""},"p":null}' | '{"f":{},"p":null}' | '{"f":{"And":{"Prefix":""}},"p":null}' | '{"f":null,"p":""}') ;;
+            *) why="rule is not scoped to the whole bucket ($$3)"; return 1 ;;
+          esac
+          want ExpiredObjectDeleteMarker true "$$4" || return 1
+          want NoncurrentDays 1 "$$5" || return 1
+          want DaysAfterInitiation 7 "$$6"
+        }
+        if lifecycle_ok 2>/dev/null; then
+          echo 'bucket ravel-dev already carries the lifecycle rule; not putting it'
+        else
+          echo "putting the lifecycle rule: bucket ravel-dev lifecycle: $$why"
+          s3 put-bucket-lifecycle-configuration --bucket ravel-dev --lifecycle-configuration "$$LIFECYCLE"
+          lifecycle_ok || { echo "bucket ravel-dev lifecycle: $$why"; exit 1; }
+        fi
+        echo 'bucket ravel-dev ready: Object Lock, versioning and lifecycle rules set'

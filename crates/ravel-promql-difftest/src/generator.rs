@@ -1,0 +1,903 @@
+//! Seeded, deterministic dataset generator. Same seed and [`DatasetConfig`]
+//! always produce the same series, labels, and samples, following the
+//! bench-generator discipline (`crates/ravel-bench/src/generator.rs`):
+//! timestamps are derived from `config.base_ts_ms`, never sampled from the
+//! clock.
+//!
+//! Constraints imposed by the Prometheus side of the harness:
+//! every series is in strictly ascending timestamp order, no timestamp
+//! repeats with a different value, and no sample accidentally carries the
+//! stale-marker bit pattern ([`STALE_MARKER_BITS`]) unless the scenario is
+//! explicitly about staleness.
+
+use rand::rngs::StdRng;
+use rand::{RngExt, SeedableRng};
+
+/// Bit pattern Prometheus and Ravel treat as "series absent at
+/// this instant" rather than a live value (docs/adrs/0010.md
+/// section 5). Distinct from a quiet NaN ([`f64::NAN`]'s bit pattern is
+/// `0x7ff8_0000_0000_0000`), so ordinary NaN injections never collide with
+/// it by accident.
+pub const STALE_MARKER_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+pub fn stale_marker() -> f64 {
+    f64::from_bits(STALE_MARKER_BITS)
+}
+
+/// One generated series: full label set (including `__name__`, always the
+/// first entry) and its samples in ascending timestamp order.
+#[derive(Debug, Clone)]
+pub struct GeneratedSeries {
+    pub labels: Vec<(String, String)>,
+    /// `(ts_ms, value)`, strictly ascending by `ts_ms`.
+    pub samples: Vec<(i64, f64)>,
+}
+
+impl GeneratedSeries {
+    pub fn metric_name(&self) -> &str {
+        self.labels
+            .first()
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default()
+    }
+}
+
+/// One native-histogram sample in the generated dataset. Deliberately
+/// minimal: positive buckets only, integer counts, which is
+/// enough to exercise the native `histogram_count`/`_sum`/`_avg`,
+/// `histogram_quantile`, `rate`, and `sum`/`avg` forms. `positive_buckets`
+/// are absolute counts (the remote-write encoder delta-encodes them);
+/// `positive_spans` are `(offset, length)` pairs. `schema` is per sample, and
+/// one series ([`schema_transition_counter`]) changes it mid-series in both
+/// directions so the counter-reset schema term has an oracle.
+#[derive(Debug, Clone)]
+pub struct GeneratedHistogramPoint {
+    pub ts_ms: i64,
+    pub schema: i32,
+    pub zero_threshold: f64,
+    pub zero_count: u64,
+    pub count: u64,
+    pub sum: f64,
+    pub positive_spans: Vec<(i32, u32)>,
+    pub positive_buckets: Vec<u64>,
+    /// Prometheus `Histogram.ResetHint` value (0 UNKNOWN, 1 YES, 2 NO,
+    /// 3 GAUGE).
+    pub reset_hint: i32,
+}
+
+/// One generated native-histogram series: label set and histogram samples in
+/// ascending timestamp order.
+#[derive(Debug, Clone)]
+pub struct GeneratedHistogramSeries {
+    pub labels: Vec<(String, String)>,
+    pub points: Vec<GeneratedHistogramPoint>,
+}
+
+impl GeneratedHistogramSeries {
+    pub fn metric_name(&self) -> &str {
+        self.labels
+            .first()
+            .map(|(_, v)| v.as_str())
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Dataset {
+    pub series: Vec<GeneratedSeries>,
+    /// Native-histogram series. Pushed to Prometheus over remote write
+    /// by the encoder. NOTE: the in-process Ravel side (`ravel_stack`) cannot
+    /// ingest these yet: its ingest path (`NormalizedPoint`) and the query
+    /// read path are still f64-only, so a native-histogram corpus entry has no
+    /// Ravel data to compare against until that gap closes. Kept here so the
+    /// generator and remote-write encoder support are ready for the moment the
+    /// read path carries histograms.
+    pub histogram_series: Vec<GeneratedHistogramSeries>,
+}
+
+/// Knobs for [`generate`]. `base_ts_ms` anchors every series' first sample;
+/// corpus entries reference offsets from it rather than wall-clock time
+/// (CLAUDE.md: "time is injected").
+#[derive(Debug, Clone, Copy)]
+pub struct DatasetConfig {
+    pub seed: u64,
+    pub base_ts_ms: i64,
+    /// Nominal scrape interval in milliseconds.
+    pub step_ms: i64,
+    /// Samples per regularly-spaced series.
+    pub sample_count: usize,
+}
+
+impl Default for DatasetConfig {
+    fn default() -> Self {
+        DatasetConfig {
+            seed: 0xD1FF_7E57,
+            base_ts_ms: 1_700_000_000_000,
+            step_ms: 30_000,
+            sample_count: 40,
+        }
+    }
+}
+
+fn labels(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect()
+}
+
+fn metric(name: &str, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    let mut out = vec![("__name__".to_string(), name.to_string())];
+    out.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+    out
+}
+
+/// Builds the full selector-corpus dataset: every shape the harness requires,
+/// each under a distinct `diff_*` metric name so corpus entries can select
+/// exactly one scenario by name.
+pub fn generate(config: &DatasetConfig) -> Dataset {
+    let mut rng = StdRng::seed_from_u64(config.seed);
+    let mut series = vec![
+        gauge_walk(&mut rng, config),
+        counter_with_reset(&mut rng, config),
+        counter_reset_at_boundary(config),
+        sparse_jittered(&mut rng, config),
+        boundary_aligned(config),
+        special_values(config),
+        stale_then_live(config),
+    ];
+    series.extend(classic_histogram_family(&mut rng, config, false));
+    series.extend(classic_histogram_family(&mut rng, config, true));
+    series.extend(vector_matching_shapes(&mut rng, config));
+    series.extend(aggregation_group(config));
+    series.extend(aggregation_special(config));
+
+    let histogram_series = native_histogram_families(config);
+    Dataset {
+        series,
+        histogram_series,
+    }
+}
+
+/// Sample index at which `diff_native_hist_schema` switches from schema 0 up
+/// to schema 1 (a schema INCREASE, which Prometheus treats as a counter reset
+/// whatever the buckets did).
+pub const SCHEMA_INCREASE_AT: usize = 13;
+
+/// Sample index at which `diff_native_hist_schema` switches from schema 1 back
+/// down to schema 0 (a schema DECREASE, which is only a reset if a bucket
+/// shrank once both sides are aligned to the coarser schema).
+pub const SCHEMA_DECREASE_AT: usize = 27;
+
+/// Native-histogram series for the native-histogram corpus: a monotonic counter histogram
+/// (`diff_native_hist`, cumulative bucket counts growing each scrape, reset
+/// hint NO after the first sample), a two-series family
+/// (`diff_native_hist_agg`, `i="1"`/`i="2"`) for `sum`/`avg` aggregation, and
+/// a schema-transition counter (`diff_native_hist_schema`) that changes schema
+/// in both directions mid-series.
+/// Schema 0, three positive buckets from index 1, zero bucket populated, so
+/// `histogram_quantile` has interior buckets to interpolate.
+fn native_histogram_families(config: &DatasetConfig) -> Vec<GeneratedHistogramSeries> {
+    let timestamps = regular_timestamps(config);
+
+    // Monotonic counter: each scrape adds a fixed increment per bucket.
+    let counter = GeneratedHistogramSeries {
+        labels: metric("diff_native_hist", &[("kind", "counter")]),
+        points: timestamps
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                let step = (i + 1) as u64;
+                let buckets = vec![2 * step, 3 * step, step];
+                histogram_point(*ts, buckets, 1, i)
+            })
+            .collect(),
+    };
+
+    // Aggregation family: two series with distinct but overlapping bucket
+    // populations, constant across time so `sum`/`avg` are stable.
+    let agg = |instance: &str, buckets: Vec<u64>| GeneratedHistogramSeries {
+        labels: metric("diff_native_hist_agg", &[("i", instance)]),
+        points: timestamps
+            .iter()
+            .map(|ts| histogram_point(*ts, buckets.clone(), 0, 0))
+            .collect(),
+    };
+
+    vec![
+        counter,
+        agg("1", vec![1, 2, 3]),
+        agg("2", vec![4, 5, 6]),
+        schema_transition_counter(&timestamps),
+    ]
+}
+
+/// A monotonic counter native histogram that changes schema twice: up at
+/// [`SCHEMA_INCREASE_AT`] (0 -> 1) and back down at [`SCHEMA_DECREASE_AT`]
+/// (1 -> 0). Prometheus' counter-reset detection is directional about that
+/// schema term (an increase is a reset on its own, a decrease is only a reset
+/// if an aligned bucket shrank), so without a series that transitions in both
+/// directions the differential gate cannot tell a directional implementation
+/// from a symmetric one (issue #679).
+///
+/// Two shape choices make the schema term the ONLY thing either side can be
+/// reacting to:
+///
+/// * One positive bucket at index 1 throughout. Down-converting index 1 from
+///   any finer schema lands on index 1 again (`((1 - 1) >> shift) + 1 == 1`),
+///   so the aligned per-bucket comparison across the decrease is a plain
+///   `later >= earlier` on one number, with no merge to reason about.
+/// * Every population strictly grows and the zero bucket is constant, so the
+///   count, zero-count, and per-bucket checks can never fire.
+///
+/// The reset hint is UNKNOWN on the first sample of each schema run and NO
+/// elsewhere, modelling what a reader sees out of a Prometheus histogram
+/// chunk: a schema change ends the current chunk, and samples after a chunk's
+/// first carry NotCounterReset. UNKNOWN at the transitions is what makes both
+/// sides actually run detection there rather than short-circuit on the hint.
+fn schema_transition_counter(timestamps: &[i64]) -> GeneratedHistogramSeries {
+    let points = timestamps
+        .iter()
+        .enumerate()
+        .map(|(i, ts)| {
+            let schema = if i < SCHEMA_INCREASE_AT {
+                0
+            } else if i < SCHEMA_DECREASE_AT {
+                1
+            } else {
+                0
+            };
+            let bucket = 2 * (i as u64 + 1);
+            let zero_count = 1;
+            let reset_hint = if i == 0 || i == SCHEMA_INCREASE_AT || i == SCHEMA_DECREASE_AT {
+                0
+            } else {
+                2
+            };
+            GeneratedHistogramPoint {
+                ts_ms: *ts,
+                schema,
+                zero_threshold: 1e-9,
+                zero_count,
+                count: bucket + zero_count,
+                sum: bucket as f64 * 1.5,
+                positive_spans: vec![(1, 1)],
+                positive_buckets: vec![bucket],
+                reset_hint,
+            }
+        })
+        .collect();
+    GeneratedHistogramSeries {
+        labels: metric("diff_native_hist_schema", &[("kind", "counter")]),
+        points,
+    }
+}
+
+/// Build one histogram point from absolute positive bucket counts at schema 0.
+/// `zero_count` fixed at 1, `sum` derived so it is monotonic with the
+/// populations. `reset_hint`: 2 (NO) for `sample_index > 0`, else 0 (UNKNOWN).
+fn histogram_point(
+    ts_ms: i64,
+    positive_buckets: Vec<u64>,
+    zero_count: u64,
+    sample_index: usize,
+) -> GeneratedHistogramPoint {
+    let bucket_total: u64 = positive_buckets.iter().sum();
+    let count = bucket_total + zero_count;
+    // A representative sum: each bucket contributes its count times a value
+    // near the bucket's own scale (bucket i covers up to 2^i at schema 0).
+    let sum = positive_buckets
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| c as f64 * 2f64.powi(i as i32))
+        .sum();
+    let reset_hint = if sample_index > 0 { 2 } else { 0 };
+    GeneratedHistogramPoint {
+        ts_ms,
+        schema: 0,
+        zero_threshold: 1e-9,
+        zero_count,
+        count,
+        sum,
+        positive_spans: vec![(1, positive_buckets.len() as u32)],
+        positive_buckets,
+        reset_hint,
+    }
+}
+
+fn regular_timestamps(config: &DatasetConfig) -> Vec<i64> {
+    (0..config.sample_count as i64)
+        .map(|i| config.base_ts_ms + i * config.step_ms)
+        .collect()
+}
+
+fn gauge_walk(rng: &mut StdRng, config: &DatasetConfig) -> GeneratedSeries {
+    let mut value = 0.0f64;
+    let samples = regular_timestamps(config)
+        .into_iter()
+        .map(|ts| {
+            value += rng.random_range(-1.0..1.0);
+            (ts, value)
+        })
+        .collect();
+    GeneratedSeries {
+        labels: metric("diff_gauge_walk", &[("shape", "walk")]),
+        samples,
+    }
+}
+
+/// A monotonically increasing counter with one deliberate reset (value
+/// drops back near zero) partway through, exercising the rate-family
+/// counter-reset path; in the selector corpus it is exercised only as a plain
+/// selector.
+fn counter_with_reset(rng: &mut StdRng, config: &DatasetConfig) -> GeneratedSeries {
+    let reset_at = config.sample_count / 2;
+    let mut value = 0.0f64;
+    let samples = regular_timestamps(config)
+        .into_iter()
+        .enumerate()
+        .map(|(i, ts)| {
+            if i == reset_at {
+                value = rng.random_range(0.0..2.0);
+            } else {
+                value += rng.random_range(0.0..5.0);
+            }
+            (ts, value)
+        })
+        .collect();
+    GeneratedSeries {
+        labels: metric("diff_counter_total", &[("shape", "reset")]),
+        samples,
+    }
+}
+
+/// Reset lands exactly on a 5m-lookback window boundary relative to
+/// `base_ts_ms`, so instant/range queries anchored on that boundary
+/// exercise the left-open-interval edge deterministically.
+fn counter_reset_at_boundary(config: &DatasetConfig) -> GeneratedSeries {
+    let lookback_steps = (300_000 / config.step_ms.max(1)).max(1);
+    let samples: Vec<(i64, f64)> = regular_timestamps(config)
+        .into_iter()
+        .enumerate()
+        .map(|(i, ts)| {
+            let idx = i as i64;
+            let value = if idx < lookback_steps {
+                (idx as f64) * 10.0
+            } else {
+                ((idx - lookback_steps) as f64) * 10.0
+            };
+            (ts, value)
+        })
+        .collect();
+    GeneratedSeries {
+        labels: metric("diff_counter_total", &[("shape", "reset_at_boundary")]),
+        samples,
+    }
+}
+
+/// Irregular, always-increasing gaps around the nominal step (scrape
+/// jitter): every gap is `step_ms + jitter`, jitter drawn from `[0,
+/// step_ms/2]`, so ordering is preserved by construction.
+fn sparse_jittered(rng: &mut StdRng, config: &DatasetConfig) -> GeneratedSeries {
+    let max_jitter = (config.step_ms / 2).max(1);
+    let mut ts = config.base_ts_ms;
+    let mut value = 0.0f64;
+    let mut samples = Vec::with_capacity(config.sample_count);
+    for _ in 0..config.sample_count {
+        value += rng.random_range(-1.0..1.0);
+        samples.push((ts, value));
+        ts += config.step_ms + rng.random_range(0..=max_jitter);
+    }
+    GeneratedSeries {
+        labels: metric("diff_sparse_jitter", &[("shape", "sparse")]),
+        samples,
+    }
+}
+
+/// One sample landing exactly on the start, middle, and end of a 5m
+/// lookback window relative to `base_ts_ms`, for boundary-inclusive /
+/// left-open-exclusive lookback assertions.
+fn boundary_aligned(config: &DatasetConfig) -> GeneratedSeries {
+    let samples = vec![
+        (config.base_ts_ms, 1.0),
+        (config.base_ts_ms + 300_000, 2.0),
+        (config.base_ts_ms + 600_000, 3.0),
+    ];
+    GeneratedSeries {
+        labels: metric("diff_boundary", &[("shape", "boundary")]),
+        samples,
+    }
+}
+
+/// +Inf / -Inf / NaN / -0.0 interleaved with ordinary values, one per
+/// timestamp so a selector at each exact instant isolates one special
+/// value.
+fn special_values(config: &DatasetConfig) -> GeneratedSeries {
+    let values = [
+        1.5,
+        f64::INFINITY,
+        -1.5,
+        f64::NEG_INFINITY,
+        f64::NAN,
+        -0.0,
+        0.0,
+    ];
+    let samples = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (config.base_ts_ms + i as i64 * config.step_ms, *v))
+        .collect();
+    GeneratedSeries {
+        labels: metric("diff_special_values", &[("shape", "special")]),
+        samples,
+    }
+}
+
+/// A live sample, then a stale marker, then another live sample: the
+/// staleness acceptance shape (series absent exactly at the stale instant,
+/// present again after).
+fn stale_then_live(config: &DatasetConfig) -> GeneratedSeries {
+    let samples = vec![
+        (config.base_ts_ms, 5.0),
+        (config.base_ts_ms + config.step_ms, stale_marker()),
+        (config.base_ts_ms + 2 * config.step_ms, 6.0),
+    ];
+    GeneratedSeries {
+        labels: metric("diff_stale", &[("shape", "stale")]),
+        samples,
+    }
+}
+
+/// Classic `le`-bucketed histogram family. `bad` selects a deliberately
+/// non-monotonic bucket count at the last timestamp (a lower `le` bucket
+/// reports a higher count than the next one up), which is otherwise
+/// well-formed (has `+Inf`).
+fn classic_histogram_family(
+    rng: &mut StdRng,
+    config: &DatasetConfig,
+    bad: bool,
+) -> Vec<GeneratedSeries> {
+    let buckets = ["0.1", "0.5", "1", "2.5", "+Inf"];
+    let variant = if bad { "nonmonotonic" } else { "wellformed" };
+    let timestamps = regular_timestamps(config);
+    let mut cumulative = vec![0.0f64; buckets.len()];
+    let mut per_bucket_series: Vec<GeneratedSeries> = buckets
+        .iter()
+        .map(|le| GeneratedSeries {
+            labels: metric("diff_histogram_bucket", &[("variant", variant), ("le", le)]),
+            samples: Vec::with_capacity(timestamps.len()),
+        })
+        .collect();
+
+    for (t_idx, ts) in timestamps.iter().enumerate() {
+        for c in cumulative.iter_mut() {
+            *c += rng.random_range(0.0..3.0);
+        }
+        // Monotonicity fixup: running max so far keeps le-order monotonic.
+        for b in 1..buckets.len() {
+            if cumulative[b] < cumulative[b - 1] {
+                cumulative[b] = cumulative[b - 1];
+            }
+        }
+        let mut row = cumulative.clone();
+        if bad && t_idx == timestamps.len() - 1 && row.len() >= 2 {
+            let last = row.len() - 1;
+            row[last - 1] = row[last] + 5.0;
+        }
+        for (b, series) in per_bucket_series.iter_mut().enumerate() {
+            series.samples.push((*ts, row[b]));
+        }
+    }
+    per_bucket_series
+}
+
+/// Label shapes for vector-matching: a one-to-one matching pair, a
+/// non-matching pair, a many-to-one (`group_left`) shape, and (for the
+/// binary-operator corpus) duplicate-signature shapes for
+/// matching-cardinality error cases plus an extra `group_left` "one" side
+/// carrying a label absent from the "many" side, for the label-copy
+/// delete case.
+fn vector_matching_shapes(rng: &mut StdRng, config: &DatasetConfig) -> Vec<GeneratedSeries> {
+    let ts = regular_timestamps(config);
+    let mut make = |name: &str, extra: &[(&str, &str)]| -> GeneratedSeries {
+        let mut value = rng.random_range(0.0..10.0);
+        let samples = ts
+            .iter()
+            .map(|t| {
+                value += rng.random_range(-0.5..0.5);
+                (*t, value)
+            })
+            .collect();
+        GeneratedSeries {
+            labels: metric(name, extra),
+            samples,
+        }
+    };
+    vec![
+        make("diff_match_left", &[("job", "api"), ("instance", "1")]),
+        make("diff_match_right", &[("job", "api"), ("instance", "1")]),
+        make("diff_match_left", &[("job", "api"), ("instance", "2")]),
+        make("diff_match_right", &[("job", "other"), ("instance", "2")]),
+        make("diff_group_left", &[("job", "batch"), ("instance", "1")]),
+        make("diff_group_left", &[("job", "batch"), ("instance", "2")]),
+        make("diff_group_right", &[("job", "batch")]),
+        // Two `diff_dup_left` series that agree on `job` (their on(job)
+        // matching signature) but differ on `replica`: an `on(job)` match
+        // against either dup side is ambiguous.
+        make("diff_dup_left", &[("job", "dup"), ("replica", "a")]),
+        make("diff_dup_left", &[("job", "dup"), ("replica", "b")]),
+        // Symmetric duplicate on the right-hand side.
+        make("diff_dup_right", &[("job", "dup"), ("region", "us")]),
+        make("diff_dup_right", &[("job", "dup"), ("region", "eu")]),
+        // A `group_left` "one" side carrying `version`, a label
+        // `diff_group_left`'s series never had: the copied-label delete
+        // case (the many side's own `version`, if any, is removed since
+        // the one side is absent for it).
+        make("diff_group_meta", &[("job", "batch"), ("version", "v2")]),
+    ]
+}
+
+/// Label/value shapes for the aggregation corpus: two `job` groups, each with
+/// three `instance`s, and constant values
+/// (not randomized) so a `topk`/`bottomk` tie is exact and stable at every
+/// timestamp rather than depending on where in the walk the query lands.
+/// `job="a"` carries an exact duplicate at its own maximum (`instance`s `2`
+/// and `3` both `20.0`), used for an ungrouped `topk`/`bottomk` scenario
+/// where the whole tied pair is retained (`k=2`, matching the full width of
+/// the tie, so no implementation-dependent boundary cut is exercised).
+/// `job="b"`'s own duplicate (`instance`s `1` and `2` both `5.0`) provides
+/// the ungrouped bottom tie.
+fn aggregation_group(config: &DatasetConfig) -> Vec<GeneratedSeries> {
+    let ts = regular_timestamps(config);
+    let defs: &[(&str, &str, f64)] = &[
+        ("a", "1", 10.0),
+        ("a", "2", 20.0),
+        ("a", "3", 20.0),
+        ("b", "1", 5.0),
+        ("b", "2", 5.0),
+        ("b", "3", 15.0),
+    ];
+    defs.iter()
+        .map(|(job, instance, value)| GeneratedSeries {
+            labels: metric("diff_agg_group", &[("job", job), ("instance", instance)]),
+            samples: ts.iter().map(|t| (*t, *value)).collect(),
+        })
+        .collect()
+}
+
+/// Three series, one per special value, all present at the same instant (in
+/// contrast to `special_values`, whose one series holds them one per
+/// timestamp): exercises aggregation's NaN-skipping `min`/`max`, NaN-
+/// propagating `sum`, and NaN-sorts-last `topk`/`bottomk` against a mix that
+/// also includes a `-0.0` sample.
+fn aggregation_special(config: &DatasetConfig) -> Vec<GeneratedSeries> {
+    let ts = regular_timestamps(config);
+    let defs: &[(&str, f64)] = &[("nan", f64::NAN), ("negzero", -0.0), ("one", 1.0)];
+    defs.iter()
+        .map(|(kind, value)| GeneratedSeries {
+            labels: metric("diff_agg_special", &[("kind", kind)]),
+            samples: ts.iter().map(|t| (*t, *value)).collect(),
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+fn unused_labels_helper_silencer() {
+    let _ = labels(&[]);
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deterministic_by_seed() {
+        let config = DatasetConfig::default();
+        let a = generate(&config);
+        let b = generate(&config);
+        assert_eq!(a.series.len(), b.series.len());
+        for (x, y) in a.series.iter().zip(b.series.iter()) {
+            assert_eq!(x.labels, y.labels);
+            for ((ts_a, va), (ts_b, vb)) in x.samples.iter().zip(y.samples.iter()) {
+                assert_eq!(ts_a, ts_b);
+                assert_eq!(va.to_bits(), vb.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn native_histogram_family_is_generated_and_monotonic() {
+        let dataset = generate(&DatasetConfig::default());
+        assert!(
+            dataset
+                .histogram_series
+                .iter()
+                .any(|s| s.metric_name() == "diff_native_hist"),
+            "counter native histogram present"
+        );
+        let counter = dataset
+            .histogram_series
+            .iter()
+            .find(|s| s.metric_name() == "diff_native_hist")
+            .expect("counter series");
+        // Counter total count strictly increases scrape over scrape.
+        for pair in counter.points.windows(2) {
+            assert!(
+                pair[1].count > pair[0].count,
+                "counter histogram count must be monotonic"
+            );
+            assert_eq!(pair[1].reset_hint, 2, "post-first samples hint NO reset");
+        }
+        // Two aggregation series exist.
+        let agg = dataset
+            .histogram_series
+            .iter()
+            .filter(|s| s.metric_name() == "diff_native_hist_agg")
+            .count();
+        assert_eq!(agg, 2);
+    }
+
+    #[allow(clippy::expect_used)]
+    fn schema_transition_series() -> GeneratedHistogramSeries {
+        generate(&DatasetConfig::default())
+            .histogram_series
+            .into_iter()
+            .find(|s| s.metric_name() == "diff_native_hist_schema")
+            .expect("schema-transition series present")
+    }
+
+    #[test]
+    fn schema_transition_series_changes_schema_in_both_directions() {
+        let series = schema_transition_series();
+        assert!(
+            series.points.len() > SCHEMA_DECREASE_AT,
+            "the dataset must be long enough to carry both transitions"
+        );
+        for (i, point) in series.points.iter().enumerate() {
+            let expected = if (SCHEMA_INCREASE_AT..SCHEMA_DECREASE_AT).contains(&i) {
+                1
+            } else {
+                0
+            };
+            assert_eq!(point.schema, expected, "schema at sample {i}");
+        }
+        let transitions: Vec<(usize, i32, i32)> = series
+            .points
+            .windows(2)
+            .enumerate()
+            .filter(|(_, w)| w[0].schema != w[1].schema)
+            .map(|(i, w)| (i + 1, w[0].schema, w[1].schema))
+            .collect();
+        assert_eq!(
+            transitions,
+            vec![(SCHEMA_INCREASE_AT, 0, 1), (SCHEMA_DECREASE_AT, 1, 0)],
+            "exactly one increase and one decrease, at the declared indices"
+        );
+    }
+
+    #[test]
+    fn schema_transition_series_leaves_the_schema_term_as_the_only_reset_signal() {
+        // Every other input to Prometheus' counter-reset detection is
+        // monotonic or constant, so whatever either side reports at the two
+        // transitions is the schema term and nothing else.
+        let series = schema_transition_series();
+        for pair in series.points.windows(2) {
+            assert!(
+                pair[1].count > pair[0].count,
+                "count must strictly grow: {:?} -> {:?}",
+                pair[0].count,
+                pair[1].count
+            );
+            assert_eq!(
+                pair[0].zero_count, pair[1].zero_count,
+                "constant zero bucket"
+            );
+            assert_eq!(
+                pair[0].zero_threshold.to_bits(),
+                pair[1].zero_threshold.to_bits(),
+                "a changing zero threshold is its own reset signal"
+            );
+            assert_eq!(
+                pair[0].positive_spans,
+                vec![(1, 1)],
+                "one bucket at index 1"
+            );
+            assert!(
+                pair[1].positive_buckets[0] > pair[0].positive_buckets[0],
+                "the single bucket must strictly grow"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_transition_series_hints_unknown_exactly_at_the_transitions() {
+        // UNKNOWN is what makes detection actually run; a NO hint at a
+        // transition would short-circuit both implementations and the entry
+        // would prove nothing about the schema direction.
+        let series = schema_transition_series();
+        let unknown: Vec<usize> = series
+            .points
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.reset_hint == 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(unknown, vec![0, SCHEMA_INCREASE_AT, SCHEMA_DECREASE_AT]);
+        assert!(
+            series
+                .points
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.reset_hint == 0 || (i > 0 && p.reset_hint == 2)),
+            "every other sample hints NO"
+        );
+    }
+
+    #[test]
+    fn native_histogram_generation_is_deterministic_by_seed() {
+        let config = DatasetConfig::default();
+        let a = generate(&config);
+        let b = generate(&config);
+        assert_eq!(a.histogram_series.len(), b.histogram_series.len());
+        for (x, y) in a.histogram_series.iter().zip(b.histogram_series.iter()) {
+            assert_eq!(x.labels, y.labels);
+            for (px, py) in x.points.iter().zip(y.points.iter()) {
+                assert_eq!(px.ts_ms, py.ts_ms);
+                assert_eq!(px.count, py.count);
+                assert_eq!(px.positive_buckets, py.positive_buckets);
+                assert_eq!(px.sum.to_bits(), py.sum.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn different_seed_diverges_values_not_identity() {
+        let mut config = DatasetConfig::default();
+        let a = generate(&config);
+        config.seed ^= 0xABCD;
+        let b = generate(&config);
+        let walk_a = a
+            .series
+            .iter()
+            .find(|s| s.metric_name() == "diff_gauge_walk")
+            .expect("gauge walk series");
+        let walk_b = b
+            .series
+            .iter()
+            .find(|s| s.metric_name() == "diff_gauge_walk")
+            .expect("gauge walk series");
+        assert_ne!(walk_a.samples, walk_b.samples);
+    }
+
+    #[test]
+    fn every_series_is_strictly_ascending_and_dup_free() {
+        let dataset = generate(&DatasetConfig::default());
+        for series in &dataset.series {
+            for pair in series.samples.windows(2) {
+                assert!(
+                    pair[0].0 < pair[1].0,
+                    "series {:?} out of order at {:?}",
+                    series.labels,
+                    pair
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn no_sample_accidentally_carries_the_stale_marker() {
+        let dataset = generate(&DatasetConfig::default());
+        for series in &dataset.series {
+            let is_stale_scenario = series
+                .labels
+                .iter()
+                .any(|(k, v)| k == "shape" && v == "stale");
+            for (_, value) in &series.samples {
+                let is_marker = value.to_bits() == STALE_MARKER_BITS;
+                assert!(
+                    is_stale_scenario || !is_marker,
+                    "series {:?} carries an accidental stale marker",
+                    series.labels
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stale_scenario_has_exactly_one_stale_sample() {
+        let dataset = generate(&DatasetConfig::default());
+        let stale = dataset
+            .series
+            .iter()
+            .find(|s| s.metric_name() == "diff_stale")
+            .expect("stale series present");
+        let count = stale
+            .samples
+            .iter()
+            .filter(|(_, v)| v.to_bits() == STALE_MARKER_BITS)
+            .count();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn histogram_family_has_the_inf_bucket_and_is_monotonic_when_wellformed() {
+        let dataset = generate(&DatasetConfig::default());
+        let inf_bucket = dataset.series.iter().find(|s| {
+            s.metric_name() == "diff_histogram_bucket"
+                && s.labels.iter().any(|(k, v)| k == "le" && v == "+Inf")
+                && s.labels
+                    .iter()
+                    .any(|(k, v)| k == "variant" && v == "wellformed")
+        });
+        assert!(inf_bucket.is_some());
+
+        let wellformed: Vec<&GeneratedSeries> = dataset
+            .series
+            .iter()
+            .filter(|s| {
+                s.metric_name() == "diff_histogram_bucket"
+                    && s.labels
+                        .iter()
+                        .any(|(k, v)| k == "variant" && v == "wellformed")
+            })
+            .collect();
+        for t_idx in 0..wellformed[0].samples.len() {
+            let mut counts: Vec<f64> = wellformed.iter().map(|s| s.samples[t_idx].1).collect();
+            let sorted = {
+                let mut c = counts.clone();
+                c.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in histogram counts"));
+                c
+            };
+            counts.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+            assert_eq!(counts, sorted);
+        }
+    }
+
+    #[test]
+    fn bad_histogram_variant_is_non_monotonic_at_the_last_timestamp() {
+        let dataset = generate(&DatasetConfig::default());
+        let bad: Vec<&GeneratedSeries> = dataset
+            .series
+            .iter()
+            .filter(|s| {
+                s.metric_name() == "diff_histogram_bucket"
+                    && s.labels
+                        .iter()
+                        .any(|(k, v)| k == "variant" && v == "nonmonotonic")
+            })
+            .collect();
+        let last = bad[0].samples.len() - 1;
+        let mut by_le: Vec<(&str, f64)> = bad
+            .iter()
+            .map(|s| {
+                let le = s
+                    .labels
+                    .iter()
+                    .find(|(k, _)| k == "le")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or_default();
+                (le, s.samples[last].1)
+            })
+            .collect();
+        by_le.sort_by(|a, b| a.0.cmp(b.0));
+        // Bucket order in generation is 0.1, 0.5, 1, 2.5, +Inf; assert the
+        // deliberate violation exists somewhere in the last row.
+        let counts: Vec<f64> = ["0.1", "0.5", "1", "2.5", "+Inf"]
+            .iter()
+            .map(|le| {
+                bad.iter()
+                    .find(|s| {
+                        s.metric_name() == "diff_histogram_bucket"
+                            && s.labels.iter().any(|(k, v)| k == "le" && v == le)
+                    })
+                    .expect("bucket")
+                    .samples[last]
+                    .1
+            })
+            .collect();
+        let is_monotonic = counts.windows(2).all(|w| w[0] <= w[1]);
+        assert!(!is_monotonic, "expected a deliberate non-monotonic bucket");
+        let _ = by_le;
+    }
+}

@@ -1,0 +1,8256 @@
+//! Pruned scan reader (docs/log-segment-format.md "Pruning soundness").
+//!
+//! [`RlogReader::scan`] resolves a predicate to coarse ts/stream bounds, prunes
+//! blocks through the skip index and per-block blooms, then reads, verifies, and
+//! re-evaluates the survivors exactly. Pruning is proof-based: a block is
+//! dropped only when the skip index proves its bounds disjoint or a bloom proves
+//! a required word absent. A corrupt BLOOM section degrades to no bloom pruning
+//! (scan the skip survivors) and surfaces a counter; corrupt BLOCKS data is a
+//! loud `Corrupted` error.
+
+use std::borrow::Cow;
+use std::sync::Arc;
+
+use ravel_types::logstream::AttrValue;
+
+use crate::block::{
+    ColumnIdSet, ColumnPlan, DecodedBlock, I64Column, PageCounters, StrColumn,
+    read_block_pages_with_shared_dicts,
+};
+use crate::columnar::ColumnarBlockView;
+use crate::columns::ColumnSelection;
+use crate::dict_values::{DictValues, EntryTexts};
+use crate::error::LogSegError;
+use crate::field_dir::FieldDir;
+use crate::footer::{COMP_ZSTD, LogFooter, SectionDesc, kind, open_source};
+use crate::page::{DEFAULT_MAX_UNCOMP, read_page};
+use crate::page_dir::{PageDir, PageLoc};
+use crate::postings::{POSTINGS_VERSION_V1, PostingsSection, term_key};
+use crate::record::{
+    COL_ATTRS_RAW, COL_BODY, COL_FLAGS, COL_OBSERVED_TS, COL_SEVERITY_NUM, COL_SEVERITY_TEXT,
+    COL_SPAN_ID, COL_STREAM_REF, COL_TRACE_ID, COL_TS, FieldSel, FieldType, LogRecord, Predicate,
+    resolve_value,
+};
+use crate::rlog_bloom::RlogBloomSection;
+use crate::rlog_codec::decode_dict_page;
+use crate::skip_index::{NumRangeArm, SkipIndex};
+use crate::source::ByteSource;
+use crate::stream_dir::StreamDir;
+use crate::tokenizer::tokens;
+use crate::writer::RlogConfig;
+
+pub(crate) const MAX_STREAMS: u64 = 1 << 24;
+pub(crate) const MAX_FIELDS: u64 = 1 << 20;
+/// Upper bound on an object's block count (untrusted-input guard). PAGE_DIR
+/// derives its group and block caps from this (ADR-0699 decision 2).
+pub const MAX_BLOCKS: u64 = 1 << 24;
+
+/// Counters describing how much a scan pruned (docs/log-segment-format.md).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScanStats {
+    pub blocks_total: u32,
+    pub blocks_after_skip: u32,
+    pub blocks_after_postings: u32,
+    pub blocks_after_bloom: u32,
+    pub blocks_scanned: u32,
+    /// Set when the BLOOM section could not be parsed and bloom pruning was
+    /// skipped (the scan still returns correct results).
+    pub bloom_degraded: bool,
+    /// Set when the POSTINGS section (or a probed entry within it) could not
+    /// be parsed and postings pruning was skipped for that arm (the scan
+    /// still returns correct results via bloom + exact scan).
+    pub postings_degraded: bool,
+    /// Block pages this scan decompressed and decoded. Grows as blocks are
+    /// decoded, so a partially-drained [`BlockScan`] reports what it has read
+    /// so far, not what it will read. A row-group dictionary page (tag 12) is
+    /// counted for every block that reads through it, though the scan verifies
+    /// and decodes it once per chunk and shares the result.
+    pub pages_decoded: u64,
+    /// Block pages this scan skipped because the [`ColumnSelection`] excluded
+    /// their column. Zero for an all-columns scan; the observable proof that
+    /// column projection reached the page level (ADR-0087 decision 3).
+    pub pages_skipped: u64,
+    /// Block-length integer value buffers this scan's decodes built: one per
+    /// integer column decoded from its own value page, per block. A
+    /// column-reference column shares its target's buffer and adds nothing.
+    /// Grows as blocks are decoded, like [`Self::pages_decoded`].
+    pub int_values_buffers: u64,
+    /// Stored bytes of pages present in the blocks this scan decoded,
+    /// regardless of the [`ColumnSelection`]. A decode-time column-filtering
+    /// measurement, distinct from any wire-byte count. Grows as blocks are
+    /// decoded (ADR-0107 decision 4). A row-group dictionary page (tag 12) is
+    /// counted in every block that reads through it, so a scan over a whole
+    /// group adds each dictionary page once per block of its chunk, not once
+    /// per fetch; `page_bytes_decoded` counts a kept one the same way.
+    pub page_bytes_fetched: u64,
+    /// Stored bytes of the pages this scan actually decoded after column
+    /// filtering. Equal to `page_bytes_fetched` for an all-columns scan; the
+    /// gap to it is the column-filtering waste (ADR-0107 decision 4).
+    pub page_bytes_decoded: u64,
+    /// Bytes zstd produced decompressing this object's sections for this scan:
+    /// the directory sections opened at [`RlogReader::new`] plus every block
+    /// page the scan decoded (issue #1401). Seeded at scan construction with the
+    /// open-time directory total and grown as blocks are decoded, so a
+    /// partially-drained [`BlockScan`] reports the directories plus what it has
+    /// decoded so far. A raw/`COMP_NONE` section or page contributes nothing (it
+    /// was never decompressed); a zstd one contributes its decompressed buffer's
+    /// actual length. Decompressed, not stored or wire, bytes. A dictionary
+    /// page is charged to every block that reads through it, like
+    /// `pages_decoded`: the figure is the decompressed bytes each block
+    /// consumed, which bounds the bytes actually inflated from above.
+    pub decompressed_bytes: u64,
+    /// Decoded blocks whose rows were all kept without evaluating the exact
+    /// predicate on any of them: every arm was proven true for the whole block
+    /// by its skip-index bounds (a `TsRange` containing the block's ts bounds,
+    /// a `StreamIn` holding every stream ref in its ref bounds), or the
+    /// predicate had no exact arm to begin with. Grows as blocks are decoded,
+    /// like [`Self::pages_decoded`] (ADR-2773 decision D2).
+    pub blocks_predicate_dropped: u64,
+    /// Rows of the decoded blocks that kept at least one exact predicate arm,
+    /// i.e. the rows the predicate was evaluated over. Zero when every decoded
+    /// block was counted in [`Self::blocks_predicate_dropped`]. Grows as blocks
+    /// are decoded, like [`Self::pages_decoded`].
+    pub rows_predicate_evaluated: u64,
+    /// Cells a [`Predicate::Contains`] arm tested for its needle: a dictionary
+    /// entry once per test (once per dictionary for a row group dictionary,
+    /// however many of its blocks read it), a plain-page cell once. Grows as
+    /// blocks are decoded, like [`Self::pages_decoded`] (ADR-2773, contains-arm
+    /// amendment).
+    pub contains_cells_tested: u64,
+    /// String dictionary entries this reader UTF-8 validated, once per
+    /// validation: every entry of a dictionary built eagerly, and on the
+    /// survivor-only build of a [`Predicate::Contains`] column only the entries
+    /// that arm had to read as text or a surviving row references. This is
+    /// the reader's part of the count only: plain-page cells are validated by
+    /// the declared `Str` build in `ravel-sql`, which counts them, and are
+    /// never counted here. Grows as blocks are decoded, like
+    /// [`Self::pages_decoded`].
+    pub str_cells_validated: u64,
+}
+
+/// An opened RLOG object ready to scan.
+///
+/// `S` is where the object's bytes come from ([`ByteSource`]): the whole object
+/// by default, or a [`crate::SparseObject`] holding only the regions a ranged
+/// read placed, opened with [`RlogReader::from_source`].
+pub struct RlogReader<'a, S: ByteSource + ?Sized = [u8]> {
+    source: &'a S,
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    skip: Arc<SkipIndex>,
+    blocks_offset: u64,
+    /// The object's decoded PAGE_DIR (ADR-0699 decision 2), through which
+    /// every block's pages are located.
+    ///
+    /// Behind an [`Arc`] so a [`BlockScan`] shares this one decoded copy and
+    /// resolves each surviving block's pages at decode time, rather than
+    /// materializing a `Vec<PageLoc>` per surviving block when the scan is
+    /// pruned: the survivor list then stays proportional to the surviving-block
+    /// count with one shared copy of the page metadata, not proportional to
+    /// surviving blocks times pages-per-block (issue #760).
+    page_dir: Arc<PageDir>,
+    bloom: SectionDesc,
+    /// Absent when the object was written with no indexed fields
+    /// (docs/log-segment-format.md: POSTINGS is an optional section).
+    postings: Option<SectionDesc>,
+    /// Bytes zstd produced decompressing the directory sections this open
+    /// decompressed (STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR), summed at
+    /// [`Self::new`] (issue #1401). A directory stored raw contributes nothing.
+    /// Each scan seeds its [`ScanStats::decompressed_bytes`] with this so the
+    /// figure counts opening the object as well as decoding its blocks.
+    open_decompressed_bytes: u64,
+    /// [`SegmentDirectories::decoded_bytes`] of the directories this reader
+    /// was built over, so [`RlogReader::directories`] reports it.
+    directories_decoded_bytes: u64,
+}
+
+/// The decoded footer directories for one segment (STREAM_DIR, FIELD_DIR,
+/// SKIP_IDX, PAGE_DIR) plus the trailer facts [`RlogReader::from_decoded`]
+/// needs beside them (ADR-2414 decision A1).
+///
+/// Decoding a segment's directories is the expensive, cacheable half of
+/// opening it; placing its pages is cheap and source-specific (a whole
+/// object vs. a [`crate::SparseObject`] holding only a partition's own
+/// ranged extents). Splitting [`RlogReader::from_source`] into
+/// [`RlogReader::decode_directories`] plus [`RlogReader::from_decoded`] lets
+/// a caller that opens the same segment more than once within one query (a
+/// striped scan dealing more than one partition's worth of blocks from it)
+/// decode this struct exactly once and clone it into each
+/// [`RlogReader`]/[`BlockScan`] it builds, rather than re-running the zstd
+/// decompression and validation this struct represents on every open.
+#[derive(Clone)]
+pub struct SegmentDirectories {
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    skip: Arc<SkipIndex>,
+    blocks_offset: u64,
+    page_dir: Arc<PageDir>,
+    bloom: SectionDesc,
+    postings: Option<SectionDesc>,
+    /// Bytes zstd produced decoding these four sections, summed once here so
+    /// every [`RlogReader::from_decoded`] built from a shared, cached copy
+    /// seeds [`ScanStats::decompressed_bytes`] with the same open-time total
+    /// without re-decompressing anything to get it.
+    open_decompressed_bytes: u64,
+    /// Decoded length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
+    /// together (each section's `uncomp_len`), counted for a section stored
+    /// raw as well, unlike [`Self::open_decompressed_bytes`].
+    decoded_bytes: u64,
+}
+
+impl SegmentDirectories {
+    /// The object's decoded PAGE_DIR, through which a raw whole-object block
+    /// index resolves to its row group (ADR-2414 decision A1): a caller
+    /// dealing whole row groups to partitions (`ravel_sql::logs_scan::owned_work`)
+    /// needs this before any reader is built over the segment.
+    pub fn page_dir(&self) -> &Arc<PageDir> {
+        &self.page_dir
+    }
+
+    /// The object's decoded SKIP_IDX, for a caller that needs
+    /// [`SkipIndex::candidate_blocks`] without placing BLOCKS/BLOOM/POSTINGS
+    /// bytes a full [`RlogReader::scan_blocks`] would need (ADR-2414 decision
+    /// A1's plan-phase skip-decidable branch, `ravel_query::log_fetcher`).
+    pub fn skip_index(&self) -> &SkipIndex {
+        &self.skip
+    }
+
+    /// The object's decoded STREAM_DIR, for resolving stream-attribute
+    /// equalities without decoding the section again on every open.
+    pub fn stream_dir(&self) -> &StreamDir {
+        &self.stream_dir
+    }
+
+    /// The object's decoded FIELD_DIR, for resolving
+    /// [`FieldDir::numeric_range_arms`] against a prune channel without a
+    /// full reader (same caller as [`Self::skip_index`]).
+    pub fn field_dir(&self) -> &FieldDir {
+        &self.field_dir
+    }
+
+    /// Bytes zstd produced decoding STREAM_DIR, FIELD_DIR, SKIP_IDX, and
+    /// PAGE_DIR for this segment. A caller that decodes these once per
+    /// (query, segment) and reuses them across every partition that opens
+    /// the segment (ADR-2414 decision A1) charges this exactly once, at the
+    /// point the decode actually happened, rather than once per open.
+    pub fn open_decompressed_bytes(&self) -> u64 {
+        self.open_decompressed_bytes
+    }
+
+    /// Decompressed length of STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR
+    /// together (each section's `uncomp_len`). It is a proxy for the heap a
+    /// holder of the decoded directories keeps resident, not a measurement of
+    /// it: the decoded structures differ from the section bytes in layout and
+    /// allocation overhead. It is the figure reserved against a memory budget
+    /// while the directories are held.
+    /// [`Self::open_decompressed_bytes`] differs for a section stored raw,
+    /// which it does not count because nothing was decompressed.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes
+    }
+}
+
+impl<'a> RlogReader<'a> {
+    /// Opens and validates the object, decoding the directories and the skip
+    /// index. The skip index carries the block framing, so a corrupt SKIP_IDX
+    /// (unlike a corrupt BLOOM) is a loud `Corrupted` error rather than a
+    /// degrade: without it no block can be located.
+    pub fn new(bytes: &'a [u8], cfg: &RlogConfig) -> Result<Self, LogSegError> {
+        RlogReader::from_source(bytes, cfg)
+    }
+}
+
+impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
+    /// Decodes STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR from `source` and
+    /// returns them as a [`SegmentDirectories`], without constructing a
+    /// reader. A caller that will open this same segment more than once
+    /// within one query calls this once and passes the result to
+    /// [`RlogReader::from_decoded`] for every subsequent open, instead of
+    /// paying this decode again (ADR-2414 decision A1).
+    pub fn decode_directories(
+        source: &S,
+        cfg: &RlogConfig,
+    ) -> Result<SegmentDirectories, LogSegError> {
+        let footer = open_source(source)?;
+        let mut open_decompressed_bytes = 0u64;
+        let mut decoded_bytes = 0u64;
+        let stream_desc = *section(&footer, kind::STREAM_DIR)?;
+        let stream_raw = read_section_from(source, &stream_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
+        decoded_bytes += stream_raw.len() as u64;
+        let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
+        let field_desc = *section(&footer, kind::FIELD_DIR)?;
+        let field_raw = read_section_from(source, &field_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
+        decoded_bytes += field_raw.len() as u64;
+        let field_dir = FieldDir::decode(&field_raw, MAX_FIELDS)?;
+        let skip_desc = *section(&footer, kind::SKIP_IDX)?;
+        let skip_raw = read_section_from(source, &skip_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&skip_desc, &skip_raw);
+        decoded_bytes += skip_raw.len() as u64;
+        let skip = SkipIndex::decode(&skip_raw, MAX_BLOCKS)?;
+        let blocks = *section(&footer, kind::BLOCKS)?;
+        let bloom = *section(&footer, kind::BLOOM)?;
+        let postings = footer.section(kind::POSTINGS).copied();
+        // PAGE_DIR is mandatory (ADR-0699 decision 2): a block's pages are
+        // located only through it. Like SKIP_IDX and unlike BLOOM it is not
+        // optional and a corrupt one never degrades, and an object missing it
+        // is refused rather than read under a guessed layout, which would
+        // decode another block's bytes as this one's.
+        let page_dir = {
+            let desc = *footer
+                .section(kind::PAGE_DIR)
+                .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
+            let raw = read_section_from(source, &desc, cfg)?;
+            open_decompressed_bytes += section_decompressed_len(&desc, &raw);
+            decoded_bytes += raw.len() as u64;
+            Arc::new(PageDir::decode_validated(
+                &raw,
+                blocks.len,
+                skip.l0.len(),
+                &field_dir,
+            )?)
+        };
+        Ok(SegmentDirectories {
+            stream_dir: Arc::new(stream_dir),
+            field_dir: Arc::new(field_dir),
+            skip: Arc::new(skip),
+            blocks_offset: blocks.offset,
+            page_dir,
+            bloom,
+            postings,
+            open_decompressed_bytes,
+            decoded_bytes,
+        })
+    }
+
+    /// Builds a reader over `source` from an already-decoded
+    /// [`SegmentDirectories`], sharing its four directory sections by [`Arc`]
+    /// rather than decoding or copying anything. `source` may hold a different placement than whatever
+    /// source `dirs` was originally decoded from (a different partition's
+    /// [`crate::SparseObject`] over the same segment, holding only that
+    /// partition's own ranged extents) -- only the directory CONTENT is
+    /// shared, never the placed bytes.
+    ///
+    /// The reader's scans do NOT seed [`ScanStats::decompressed_bytes`] with
+    /// the directories' decode: that decode happened once, in
+    /// [`RlogReader::decode_directories`], and whoever ran it charges
+    /// [`SegmentDirectories::open_decompressed_bytes`] there. Seeding it here
+    /// too would charge the same decode once per reader built from `dirs`.
+    pub fn from_decoded(source: &'a S, dirs: &SegmentDirectories) -> Self {
+        RlogReader {
+            source,
+            stream_dir: Arc::clone(&dirs.stream_dir),
+            field_dir: Arc::clone(&dirs.field_dir),
+            skip: Arc::clone(&dirs.skip),
+            blocks_offset: dirs.blocks_offset,
+            page_dir: Arc::clone(&dirs.page_dir),
+            bloom: dirs.bloom,
+            postings: dirs.postings,
+            open_decompressed_bytes: 0,
+            directories_decoded_bytes: dirs.decoded_bytes,
+        }
+    }
+
+    /// [`RlogReader::new`] over any [`ByteSource`]. Every byte the open and the
+    /// later scans address is read through `source`, so a sparse source must
+    /// hold the footer and trailer, STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR,
+    /// BLOOM, POSTINGS when present, and the pages of every block a scan
+    /// decodes. A range it does not hold fails with
+    /// [`LogSegError::Unplaced`].
+    ///
+    /// Decodes the directories fresh every call. A caller opening the same
+    /// segment more than once within one query should call
+    /// [`RlogReader::decode_directories`] once instead and build each
+    /// reader with [`RlogReader::from_decoded`] (ADR-2414 decision A1).
+    pub fn from_source(source: &'a S, cfg: &RlogConfig) -> Result<Self, LogSegError> {
+        let dirs = Self::decode_directories(source, cfg)?;
+        let mut reader = Self::from_decoded(source, &dirs);
+        reader.open_decompressed_bytes = dirs.open_decompressed_bytes;
+        Ok(reader)
+    }
+
+    /// [`RlogReader::from_source`] for a caller that already decoded SKIP_IDX,
+    /// PAGE_DIR and possibly FIELD_DIR from this object (ADR-2773 decision 5):
+    /// only the sections not passed in are decoded from `source`, and the
+    /// passed PAGE_DIR gets the same cross-checks against the block framing
+    /// and FIELD_DIR a fresh decode would. The reader's scans seed
+    /// [`ScanStats::decompressed_bytes`] with the sections decoded here only;
+    /// the caller charged its own decodes.
+    pub fn from_source_reusing(
+        source: &'a S,
+        cfg: &RlogConfig,
+        skip: Arc<SkipIndex>,
+        page_dir: Arc<PageDir>,
+        field_dir: Option<Arc<FieldDir>>,
+    ) -> Result<Self, LogSegError> {
+        let footer = open_source(source)?;
+        let mut open_decompressed_bytes = 0u64;
+        let stream_desc = *section(&footer, kind::STREAM_DIR)?;
+        let stream_raw = read_section_from(source, &stream_desc, cfg)?;
+        open_decompressed_bytes += section_decompressed_len(&stream_desc, &stream_raw);
+        let mut decoded_bytes = stream_raw.len() as u64;
+        let stream_dir = StreamDir::decode(&stream_raw, MAX_STREAMS)?;
+        let field_desc = *section(&footer, kind::FIELD_DIR)?;
+        let field_dir = match field_dir {
+            Some(field_dir) => {
+                decoded_bytes = decoded_bytes.saturating_add(field_desc.uncomp_len);
+                field_dir
+            }
+            None => {
+                let field_raw = read_section_from(source, &field_desc, cfg)?;
+                open_decompressed_bytes += section_decompressed_len(&field_desc, &field_raw);
+                decoded_bytes += field_raw.len() as u64;
+                Arc::new(FieldDir::decode(&field_raw, MAX_FIELDS)?)
+            }
+        };
+        let skip_desc = *section(&footer, kind::SKIP_IDX)?;
+        let page_desc = *footer
+            .section(kind::PAGE_DIR)
+            .ok_or_else(|| LogSegError::Corrupted("missing PAGE_DIR section".into()))?;
+        decoded_bytes = decoded_bytes
+            .saturating_add(skip_desc.uncomp_len)
+            .saturating_add(page_desc.uncomp_len);
+        let blocks = *section(&footer, kind::BLOCKS)?;
+        page_dir.validate_framing(blocks.len, skip.l0.len(), &field_dir)?;
+        let dirs = SegmentDirectories {
+            stream_dir: Arc::new(stream_dir),
+            field_dir,
+            skip,
+            blocks_offset: blocks.offset,
+            page_dir,
+            bloom: *section(&footer, kind::BLOOM)?,
+            postings: footer.section(kind::POSTINGS).copied(),
+            open_decompressed_bytes,
+            decoded_bytes,
+        };
+        let mut reader = Self::from_decoded(source, &dirs);
+        reader.open_decompressed_bytes = open_decompressed_bytes;
+        Ok(reader)
+    }
+
+    /// This reader's already-decoded directories, as a [`SegmentDirectories`]
+    /// a later open of the same (immutable) object can reuse via
+    /// [`RlogReader::from_decoded`] (ADR-2414 decision A1). Shares the sections
+    /// decoded once at construction by [`Arc`], never a re-decode or a copy. The returned
+    /// [`SegmentDirectories::open_decompressed_bytes`] is the figure this
+    /// reader was seeded with: the decode's total for a reader built by
+    /// [`RlogReader::from_source`], zero for one built by
+    /// [`RlogReader::from_decoded`].
+    pub fn directories(&self) -> SegmentDirectories {
+        SegmentDirectories {
+            stream_dir: Arc::clone(&self.stream_dir),
+            field_dir: Arc::clone(&self.field_dir),
+            skip: Arc::clone(&self.skip),
+            blocks_offset: self.blocks_offset,
+            page_dir: Arc::clone(&self.page_dir),
+            bloom: self.bloom,
+            postings: self.postings,
+            open_decompressed_bytes: self.open_decompressed_bytes,
+            decoded_bytes: self.directories_decoded_bytes,
+        }
+    }
+
+    /// The byte extent in BLOCKS of one `(row group, column)` column chunk,
+    /// absolute in the object: `(offset, length)`, covering exactly the pages
+    /// PAGE_DIR lists for that column in that group, contiguous and in order.
+    ///
+    /// This is the seam ADR-0699 decision 5's fetcher reads: one ranged GET per
+    /// surviving `(row group, projected column)` replaces one per block. It
+    /// returns `None` for a group index past the last, and for a column the
+    /// group carries no page for.
+    pub fn column_chunk_range(&self, group: usize, column_id: u32) -> Option<(u64, u64)> {
+        let (offset, len) = self.page_dir.chunk_range(group, column_id)?;
+        Some((self.blocks_offset.checked_add(offset)?, len))
+    }
+
+    /// The number of row groups in the object.
+    pub fn row_group_count(&self) -> usize {
+        self.page_dir.groups.len()
+    }
+
+    /// The column plans for every dynamic column, for block decode.
+    fn plans(&self) -> Vec<ColumnPlan> {
+        column_plans(&self.field_dir)
+    }
+
+    /// This object's FIELD_DIR. Test-only: production resolution of a
+    /// [`ColumnSelection`] happens inside [`RlogReader::scan_blocks`], which
+    /// reaches the directory directly; `columns.rs`'s unit tests need a real
+    /// writer-produced FIELD_DIR to resolve against.
+    #[cfg(test)]
+    pub(crate) fn field_dir(&self) -> &FieldDir {
+        &self.field_dir
+    }
+
+    /// Scans the object for records matching `pred`, evaluated exactly per row.
+    ///
+    /// Equivalent to [`RlogReader::scan_pruned`] with an empty prune channel.
+    pub fn scan(&self, pred: &Predicate) -> Result<(Vec<LogRecord>, ScanStats), LogSegError> {
+        self.scan_pruned(pred, &[])
+    }
+
+    /// Scans for records matching `content` exactly, with `prune` an additional
+    /// prune-only predicate channel.
+    ///
+    /// `content` is the sole exact filter: every surviving block's rows are
+    /// re-evaluated against it, exactly as [`RlogReader::scan`] does, and only
+    /// matches are returned. `prune` never contributes to that per-row filter.
+    /// Its arms drive POSTINGS block pruning and nothing else: an `Equals` on an
+    /// indexed attribute field intersects the candidate blocks with that term's
+    /// exact block list, and an arm whose field the POSTINGS index does not
+    /// cover contributes no pruning at all (the `Ok(None)` path). Postings are
+    /// exact sets, never sketches, so this channel only ever drops blocks proven
+    /// to hold no record carrying the term; it is widen-only by construction
+    /// (docs/adrs/0013, docs/adrs/0049 decision 7).
+    ///
+    /// A version 1 object declines POSTINGS pruning outright: its lists index
+    /// the per-record column layer only, and a record-level duplicate key (which
+    /// the v1 format records nothing about) can put the merged-view winner in a
+    /// value no posting indexes, so an exact index over one layer cannot prune a
+    /// merged-view query. A version 2 object indexes the merged view directly and
+    /// prunes normally. See [`RlogReader::scan_blocks`] and
+    /// [`RlogReader::prune_postings_arms`].
+    ///
+    /// The separation is deliberate and load-bearing. A `prune` `Equals` on
+    /// `FieldSel::Attr` resolves against a record's own dynamic column and
+    /// `attrs_raw` overflow only (see [`RlogReader::equals`]), never against
+    /// resource or scope stream attributes, so the per-record equality is a
+    /// strict subset of a merged-view SQL equality (`ravel_sql::rlog_attrs`).
+    /// Evaluating it per row would silently drop a record whose match lives only
+    /// in its resource or scope attributes; driving only block pruning does not.
+    /// The exact residual over the merged view stays the SQL layer's job.
+    pub fn scan_pruned(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+    ) -> Result<(Vec<LogRecord>, ScanStats), LogSegError> {
+        let mut cursor = self.scan_blocks(content, prune, &ColumnSelection::all())?;
+        let mut out = Vec::new();
+        while let Some(rows) = cursor.next_block(self.source)? {
+            out.extend(rows);
+        }
+        Ok((out, cursor.stats()))
+    }
+
+    /// The block-at-a-time form of [`RlogReader::scan_pruned`], plus column
+    /// projection (ADR-0087).
+    ///
+    /// Pruning is identical: the same skip-index, POSTINGS, and bloom steps run
+    /// here, once, and the returned [`BlockScan`] names exactly the surviving
+    /// blocks. What differs is that nothing is decoded yet. The caller drives
+    /// [`BlockScan::next_block`] one block at a time and can release each
+    /// block's records before asking for the next, so peak resident decoded
+    /// memory is one block rather than one object.
+    ///
+    /// `columns` narrows what each block decodes.
+    /// [`ColumnSelection::all`] reproduces `scan_pruned` exactly, which is how
+    /// `scan_pruned` itself is implemented; a narrower selection leaves the
+    /// unselected columns undecoded, so the rebuilt records carry a *partial*
+    /// view (an unselected fixed column reads as its zero value, an unselected
+    /// attribute is simply absent from `attrs`). A caller that narrows the
+    /// selection is responsible for having included every column it, or
+    /// anything downstream of it, reads.
+    pub fn scan_blocks(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+    ) -> Result<BlockScan, LogSegError> {
+        let mut stats = ScanStats {
+            blocks_total: self.skip.l0.len() as u32,
+            // Opening the object already decompressed its directory sections;
+            // seed the scan with that so the figure counts the open plus the
+            // block pages the scan goes on to decode (issue #1401).
+            decompressed_bytes: self.open_decompressed_bytes,
+            ..ScanStats::default()
+        };
+
+        // Collect the And-flattened arms of the exact `content` predicate.
+        let mut arms: Vec<&Predicate> = Vec::new();
+        flatten(content, &mut arms);
+
+        // Prune-only arms: flattened. They feed POSTINGS pruning below and
+        // nothing else -- never the ts/stream/bloom bounds, never per-row eval.
+        let mut prune_arms: Vec<&Predicate> = Vec::new();
+        for p in prune {
+            flatten(p, &mut prune_arms);
+        }
+
+        // Coarse ts range: intersect every TsRange arm.
+        let mut ts_min = i64::MIN;
+        let mut ts_max = i64::MAX;
+        for a in &arms {
+            if let Predicate::TsRange { min_ns, max_ns } = a {
+                ts_min = ts_min.max(*min_ns);
+                ts_max = ts_max.min(*max_ns);
+            }
+        }
+        if ts_min > ts_max {
+            return Ok(self.empty_scan(stats));
+        }
+
+        // Stream filter: intersect every StreamIn arm's resolved refs.
+        let mut stream_refs: Option<Vec<u32>> = None;
+        for a in &arms {
+            if let Predicate::StreamIn(ids) = a {
+                let mut refs: Vec<u32> = ids
+                    .iter()
+                    .filter_map(|id| self.stream_dir.stream_ref(id))
+                    .collect();
+                refs.sort_unstable();
+                refs.dedup();
+                stream_refs = Some(match stream_refs {
+                    None => refs,
+                    Some(prev) => prev.into_iter().filter(|r| refs.contains(r)).collect(),
+                });
+            }
+        }
+        if stream_refs.as_ref().is_some_and(|r| r.is_empty()) {
+            return Ok(self.empty_scan(stats));
+        }
+
+        // Numeric-range prune arms (ADR-0095 decision 6): resolved from the
+        // prune-only channel, they drive block pruning through the skip index
+        // and nothing else. An arm whose field does not resolve to a dynamic
+        // column of that exact type contributes zero pruning (the `Ok(None)`
+        // shape of the unindexed POSTINGS path), never an error.
+        let numeric = self.numeric_range_arms(&prune_arms);
+
+        // Skip-index pruning.
+        let mut candidates =
+            self.skip
+                .candidate_blocks(ts_min, ts_max, stream_refs.as_deref(), &numeric);
+        stats.blocks_after_skip = candidates.len() as u32;
+
+        // Postings pruning. Exact (not probabilistic): a probed term's block
+        // list is the whole truth for that field, so it can prune down to
+        // zero (docs/log-segment-format.md "Pruning soundness"). An arm whose
+        // field is unindexed or capped returns `Ok(None)` and is skipped
+        // (falls through to bloom + exact scan); a corrupt section or entry
+        // degrades the same way and sets `postings_degraded`.
+        if let Some(desc) = &self.postings {
+            // Both the exact `content` Equals arms and the prune-only arms drive
+            // postings pruning; an unindexed or capped field on either falls
+            // through to bloom + exact scan via the `Ok(None)` path below.
+            //
+            // Both channels resolve to equality arms; building them first tells
+            // us whether any postings work exists at all, so a query with no
+            // eligible arm still skips the section exactly as before.
+            let content_arms = self.postings_arms(&arms);
+            let prune_arms = self.prune_postings_arms(&prune_arms);
+            if !content_arms.is_empty() || !prune_arms.is_empty() {
+                // A section the source never held is not a corrupt one: degrading
+                // would widen the survivors past what a ranged fetch placed.
+                let stored = self.postings_section_verified(desc);
+                if let Err(LogSegError::Unplaced { start, end }) = stored {
+                    return Err(LogSegError::Unplaced { start, end });
+                }
+                match stored
+                    .as_deref()
+                    .map_err(|_| ())
+                    .and_then(|s| PostingsSection::parse(s).map_err(|_| ()))
+                {
+                    Ok(section) => {
+                        // A version 1 POSTINGS list indexes the per-record
+                        // column layer's first occurrence per type only. A
+                        // record that carries one indexed key more than once
+                        // (any type) has a merged-view winner the list can omit
+                        // -- a same-type duplicate's later value lands in
+                        // `attrs_raw`, which no posting indexes -- and a v1
+                        // object records nothing that distinguishes "had such a
+                        // duplicate" from "did not". So a v1 object declines ALL
+                        // equality pruning, on both channels, widen-only
+                        // (ADR-0013): it costs the optimization on legacy
+                        // objects, never correctness (docs/adrs/0049 amendment
+                        // 2026-08-20, issue #333). A v2 list indexes the merged
+                        // view and prunes both channels. This subsumes the old
+                        // version-1 resource/scope exclusion, which only covered
+                        // the stream-level hazard.
+                        if section.version() != POSTINGS_VERSION_V1 {
+                            let mut postings_arms = content_arms;
+                            postings_arms.extend(prune_arms);
+                            for (cid, term) in &postings_arms {
+                                match section.probe_accounted(*cid, term) {
+                                    Ok((Some(blocks), decompressed)) => {
+                                        stats.decompressed_bytes =
+                                            stats.decompressed_bytes.saturating_add(decompressed);
+                                        let allowed: std::collections::HashSet<usize> =
+                                            blocks.iter().map(|&b| b as usize).collect();
+                                        candidates.retain(|b| allowed.contains(b));
+                                    }
+                                    Ok((None, decompressed)) => {
+                                        stats.decompressed_bytes =
+                                            stats.decompressed_bytes.saturating_add(decompressed);
+                                    }
+                                    Err(_) => stats.postings_degraded = true,
+                                }
+                            }
+                        }
+                    }
+                    Err(_) => stats.postings_degraded = true,
+                }
+            }
+        }
+        stats.blocks_after_postings = candidates.len() as u32;
+
+        // Bloom pruning. A parse failure, including a covered-column list that
+        // fails its crc or its validation, degrades to no bloom pruning.
+        let bloom_bytes = self.section_stored(&self.bloom)?;
+        let bloom_section = match RlogBloomSection::parse(&bloom_bytes, &self.field_dir) {
+            Ok(s) => Some(s),
+            Err(_) => {
+                stats.bloom_degraded = true;
+                None
+            }
+        };
+        let bloom_arms = match &bloom_section {
+            Some(section) => self.bloom_arms(&arms, section),
+            None => Vec::new(),
+        };
+
+        let mut survivors: Vec<usize> = Vec::new();
+        for &b in &candidates {
+            if let Some(section) = &bloom_section
+                && self.block_pruned_by_bloom(section, b, &bloom_arms)
+            {
+                continue;
+            }
+            survivors.push(b);
+        }
+        stats.blocks_after_bloom = survivors.len() as u32;
+
+        // Locate the survivors. Nothing is read or decoded here: the caller
+        // drives the decode one block at a time through `BlockScan::next_block`.
+        // A survivor is named by its whole-object block index only; its pages
+        // are resolved through the shared PAGE_DIR at decode time
+        // (`BlockScan::decode_block`), so the survivor list holds one fixed-size
+        // handle per surviving block rather than a `Vec<PageLoc>` of that
+        // block's pages, keeping it O(surviving blocks) not O(surviving blocks
+        // times pages-per-block) (issue #760).
+        let mut blocks = Vec::with_capacity(survivors.len());
+        for &b in &survivors {
+            let entry =
+                self.skip.l0.get(b).ok_or_else(|| {
+                    LogSegError::Corrupted("skip block index out of range".into())
+                })?;
+            let block_index =
+                u32::try_from(b).map_err(|_| LogSegError::Corrupted("block index range".into()))?;
+            blocks.push(BlockLoc {
+                record_count: entry.record_count as usize,
+                crc32c: entry.block_crc32c,
+                block_index,
+                min_ts: entry.min_ts,
+                max_ts: entry.max_ts,
+                min_stream_ref: entry.min_stream_ref,
+                max_stream_ref: entry.max_stream_ref,
+            });
+        }
+
+        let compiled = compile_arms(&self.stream_dir, &self.field_dir, &arms);
+        let deferred = contains_columns(&compiled);
+        Ok(BlockScan {
+            stream_dir: self.stream_dir.clone(),
+            field_dir: self.field_dir.clone(),
+            plans: self.plans(),
+            columns: columns
+                .resolve(&self.field_dir)
+                .map(|s| s.into_iter().collect()),
+            arms: compiled,
+            deferred,
+            blocks,
+            page_dir: self.page_dir.clone(),
+            blocks_offset: self.blocks_offset,
+            next: 0,
+            stats,
+            current: None,
+            surviving: Vec::new(),
+            dicts: DictCache::default(),
+            dict_memo: DictArmMemo::default(),
+        })
+    }
+
+    /// Like [`RlogReader::scan_blocks`], but the returned cursor drains only the
+    /// surviving blocks at the positions named in `indices`, in the order given,
+    /// rather than every surviving block (intra-segment scan partitioning,
+    /// ADR-0102).
+    ///
+    /// `indices` are positions into the full surviving-block list
+    /// [`scan_blocks`](Self::scan_blocks) would produce for the same
+    /// `content`/`prune`: the same skip-index, POSTINGS, and bloom pruning runs
+    /// here, once, and produces the same ordered survivor list; this then keeps
+    /// only the entries the caller named. Callers derive `indices` from a prior
+    /// `scan_blocks` (or an equivalent count) over the SAME immutable object, so
+    /// the two survivor lists are identical by construction and an index at or
+    /// past the survivor count can only mean corruption -- it is a typed
+    /// `Corrupted` error, never a panic.
+    ///
+    /// It is deliberately an explicit index list, not a contiguous range: the
+    /// SQL logs scan hands one segment's blocks to several partitions on a
+    /// `pos % n` stride, so a partition owns a non-contiguous subset (0, n, 2n,
+    /// ...) that a range cannot express.
+    ///
+    /// The returned cursor's [`ScanStats`] totals (`blocks_total`,
+    /// `blocks_after_skip`/`_postings`/`_bloom`) describe the WHOLE segment's
+    /// pruning, exactly as `scan_blocks` reports them, because the same pruning
+    /// ran; only `blocks_scanned`/`pages_*` grow as this subset drains. A caller
+    /// striping one segment across partitions must therefore attribute the
+    /// whole-segment totals to a single partition to avoid counting them once
+    /// per partition (see `ravel_sql::logs_scan`).
+    ///
+    /// [`scan_blocks`](Self::scan_blocks) itself, and every other caller, is
+    /// unchanged: this adds a way to restrict which of the already-pruned blocks
+    /// a cursor drains, and changes nothing about what is read from the object.
+    pub fn scan_blocks_subset(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+        indices: &[usize],
+    ) -> Result<BlockScan, LogSegError> {
+        let mut scan = self.scan_blocks(content, prune, columns)?;
+        let mut subset = Vec::with_capacity(indices.len());
+        for &i in indices {
+            let loc =
+                scan.blocks.get(i).cloned().ok_or_else(|| {
+                    LogSegError::Corrupted("subset block index out of range".into())
+                })?;
+            subset.push(loc);
+        }
+        scan.blocks = subset;
+        scan.next = 0;
+        Ok(scan)
+    }
+
+    /// Like [`RlogReader::scan_blocks_subset`], but `wanted` names whole-object
+    /// block indices (the same space [`BlockScan::survivor_block_indices`]
+    /// reports), not ordinal positions into the survivor list.
+    ///
+    /// A caller dealing whole row groups to partitions (ADR-2414 decision A1,
+    /// `ravel_sql::logs_scan::owned_work`) groups the plan phase's survivor
+    /// list, which is already the result of pruning, by PAGE_DIR row-group
+    /// boundaries and deals each group's whole-object block indices to a
+    /// partition. Those indices are therefore a subset of the plan's survivor
+    /// list, and this call names them by value instead of by their ordinal
+    /// position in the survivor list this call computes for itself.
+    ///
+    /// `expected_survivors` is the plan's survivor list, in the same
+    /// whole-object-index space [`BlockScan::survivor_block_indices`] reports.
+    /// This call runs the same skip, POSTINGS, and bloom pruning over the same
+    /// immutable object with the same predicate and prune arms, so the two
+    /// lists are expected to be equal. When they are not, `wanted` was dealt
+    /// from a list this scan does not have, and a row-ref position derived from
+    /// it would address the wrong block, so the call refuses with a typed
+    /// [`LogSegError::Corrupted`] instead of keeping the intersection. A
+    /// `wanted` index that is not among the survivors is refused the same way,
+    /// where [`RlogReader::scan_blocks_subset`] refuses an ordinal past the end.
+    pub fn scan_blocks_raw_subset(
+        &self,
+        content: &Predicate,
+        prune: &[Predicate],
+        columns: &ColumnSelection,
+        wanted: &[usize],
+        expected_survivors: &[usize],
+    ) -> Result<BlockScan, LogSegError> {
+        let mut scan = self.scan_blocks(content, prune, columns)?;
+        let actual = scan.survivor_block_indices();
+        if actual != expected_survivors {
+            return Err(LogSegError::Corrupted(format!(
+                "segment survivor mismatch: expected {} survivors, this open found {}",
+                expected_survivors.len(),
+                actual.len(),
+            )));
+        }
+        let wanted: std::collections::HashSet<usize> = wanted.iter().copied().collect();
+        let survivors: std::collections::HashSet<usize> = actual.iter().copied().collect();
+        if let Some(stray) = wanted.iter().find(|w| !survivors.contains(w)) {
+            return Err(LogSegError::Corrupted(format!(
+                "raw block subset: block {stray} is not among the surviving blocks"
+            )));
+        }
+        scan.blocks
+            .retain(|b| wanted.contains(&(b.block_index as usize)));
+        scan.next = 0;
+        Ok(scan)
+    }
+
+    /// A cursor over zero surviving blocks, for the two pre-decode short
+    /// circuits (an empty ts range, an empty resolved stream set). Draining it
+    /// yields nothing, which is what those paths returned before.
+    fn empty_scan(&self, stats: ScanStats) -> BlockScan {
+        BlockScan {
+            stream_dir: self.stream_dir.clone(),
+            field_dir: self.field_dir.clone(),
+            plans: Vec::new(),
+            columns: None,
+            arms: Vec::new(),
+            deferred: Vec::new(),
+            blocks: Vec::new(),
+            page_dir: Arc::new(PageDir::default()),
+            blocks_offset: 0,
+            next: 0,
+            stats,
+            current: None,
+            surviving: Vec::new(),
+            dicts: DictCache::default(),
+            dict_memo: DictArmMemo::default(),
+        }
+    }
+
+    /// The bloom-eligible arms: HasWord on any field, and Equals on a short
+    /// string field. Each yields `(column_id, key tokens)` where all tokens must
+    /// probe positive for a block to survive. An arm that cannot map to a bloom
+    /// column (e.g. HasWord over a name that is not a string column), or whose
+    /// column `section` does not cover, is omitted so it never prunes.
+    fn bloom_arms(
+        &self,
+        arms: &[&Predicate],
+        section: &RlogBloomSection<'_>,
+    ) -> Vec<(u32, Vec<Vec<u8>>)> {
+        let covered_column =
+            |field: &FieldSel| self.word_column(field).filter(|&cid| section.covers(cid));
+        let mut out = Vec::new();
+        for a in arms {
+            match a {
+                Predicate::HasWord { field, word } => {
+                    if let Some(cid) = covered_column(field) {
+                        let toks = tokens(word);
+                        if !toks.is_empty() {
+                            out.push((cid, toks));
+                        }
+                    }
+                }
+                Predicate::Equals {
+                    field,
+                    value: AttrValue::Str(s),
+                } if s.len() <= 64 => {
+                    if let Some(cid) = covered_column(field) {
+                        out.push((cid, vec![s.clone().into_bytes()]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// The postings-eligible arms: `Equals` on an attribute field that has a
+    /// dynamic column, paired with its term-key bytes. A field with no such
+    /// column (unindexed, overflowed, or not yet seen by FIELD_DIR) is
+    /// omitted; [`PostingsSection::probe`] separately reports "not indexed or
+    /// capped" for a column that has no POSTINGS entry, so both cases fall
+    /// through to bloom + exact scan without narrowing results.
+    fn postings_arms(&self, arms: &[&Predicate]) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for a in arms {
+            if let Predicate::Equals {
+                field: FieldSel::Attr(name),
+                value,
+            } = a
+            {
+                let (ty, cv) = resolve_value(value);
+                if let Some(entry) = self.field_dir.column(name, ty) {
+                    out.push((entry.column_id, term_key(&cv)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Prune-only postings arms for a merged-view query.
+    ///
+    /// A `prune` arm is the SQL merged-view equality pushed down over the `attrs`
+    /// column, which DataFusion re-applies exactly above the scan, so this may
+    /// only ever widen the fetch (ADR-0013). It answers, per arm, "which blocks
+    /// can hold a record whose merged `attrs[name]` equals this value", by
+    /// probing the `(name, type)` column the literal resolves to. Version
+    /// handling (a version 1 object declines pruning entirely) lives in
+    /// [`RlogReader::scan_blocks`], which knows the grammar version after parse.
+    ///
+    /// One arm is declined here regardless of version: a `Str` literal on a name
+    /// that also has a non-`Str` column. SQL's `attrs` is `Map(Utf8, Utf8)`, so
+    /// `attrs['k'] = 'v'` arrives as a `Str` literal, but a value of another
+    /// type that stringifies to the same text is a merged-view match too and
+    /// lives in a different column's postings. POSTINGS terms are bit-exact per
+    /// type, never stringified, so probing only the `(name, Str)` column would
+    /// prune away a block whose match is, say, an `I64` value with that text.
+    /// Declining is widen-only; the exact SQL residual still filters. This is a
+    /// distinct hazard from the duplicate-occurrence fold order (issue #333):
+    /// the term written is right, the column probed is wrong.
+    fn prune_postings_arms(&self, arms: &[&Predicate]) -> Vec<(u32, Vec<u8>)> {
+        let mut out = Vec::new();
+        for a in arms {
+            if let Predicate::Equals {
+                field: FieldSel::Attr(name),
+                value,
+            } = a
+            {
+                let (ty, cv) = resolve_value(value);
+                if ty == FieldType::Str && self.name_has_non_str_column(name) {
+                    continue;
+                }
+                if let Some(entry) = self.field_dir.column(name, ty) {
+                    out.push((entry.column_id, term_key(&cv)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolves the prune-only `NumRange` arms to [`NumRangeArm`] inputs for
+    /// [`SkipIndex::candidate_blocks`].
+    ///
+    /// Each arm names an attribute and its exact column type; it resolves to the
+    /// dynamic column [`FieldDir::column`] returns for that `(name, type)`. An
+    /// arm whose field does not resolve to such a column -- an unknown name, a
+    /// name stored only under other types, or a non-attribute selector -- yields
+    /// no [`NumRangeArm`] and so prunes nothing, matching the degrade-safe
+    /// fallthrough the unindexed POSTINGS field takes. The bounds pass straight
+    /// through as bit patterns; the range is prune-only, so the exact residual
+    /// stays the caller's (SQL layer's) job (ADR-0095 decision 6, ADR-0013).
+    fn numeric_range_arms(&self, arms: &[&Predicate]) -> Vec<NumRangeArm> {
+        self.field_dir.numeric_range_arms(arms)
+    }
+
+    /// Whether `name` has any dynamic column of a type other than `Str` in this
+    /// object. A `Str`-literal merged-view prune on such a name is unsound
+    /// (a non-`Str` value can stringify to the same text yet sit in a different
+    /// column's postings), so [`RlogReader::prune_postings_arms`] declines it.
+    fn name_has_non_str_column(&self, name: &str) -> bool {
+        self.field_dir
+            .entries()
+            .iter()
+            .any(|e| e.name == name && e.ty != FieldType::Str)
+    }
+
+    /// The bloom column id for a string field selector, if one exists.
+    fn word_column(&self, field: &FieldSel) -> Option<u32> {
+        match field {
+            FieldSel::Body => Some(COL_BODY),
+            FieldSel::SeverityText => Some(COL_SEVERITY_TEXT),
+            FieldSel::Attr(name) => self
+                .field_dir
+                .column(name, FieldType::Str)
+                .map(|e| e.column_id),
+        }
+    }
+
+    /// True if `block`'s bloom proves some required arm's key absent.
+    fn block_pruned_by_bloom(
+        &self,
+        section: &RlogBloomSection<'_>,
+        block: usize,
+        arms: &[(u32, Vec<Vec<u8>>)],
+    ) -> bool {
+        if arms.is_empty() {
+            return false;
+        }
+        let view = match section.entry(block) {
+            Ok(v) => v,
+            // A corrupt entry cannot prune: scan the block instead.
+            Err(_) => return false,
+        };
+        for (cid, toks) in arms {
+            if !toks.iter().all(|t| view.may_contain(*cid, t)) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Slices and crc-verifies the POSTINGS section's stored bytes before
+    /// [`PostingsSection::parse`] sees them. Unlike BLOCKS, whose per-page and
+    /// per-block crcs are the checksums consulted, and BLOOM, whose
+    /// covered-column list and entries each carry their own crc, the POSTINGS
+    /// sparse-index header sits in front of every probe and is otherwise
+    /// unchecksummed on this access path: `desc.crc32c` is computed and stored
+    /// by the writer over the whole section (same as STREAM_DIR/FIELD_DIR/
+    /// SKIP_IDX) but was
+    /// never consulted here, so a single corrupted header byte that
+    /// redirects a probe to a different, still crc-valid term block passed
+    /// silently. Checking it costs no fetch: the whole section is
+    /// already resident. [`PostingsSection::probe`]'s own structural check
+    /// (a decoded block's first term must match the sparse entry that
+    /// pointed at it) is the complementary guard that still holds under a
+    /// future ranged reader that fetches less than the whole section.
+    fn postings_section_verified(&self, desc: &SectionDesc) -> Result<Cow<'a, [u8]>, LogSegError> {
+        let stored = self.section_stored(desc)?;
+        if crc32c::crc32c(&stored) != desc.crc32c {
+            return Err(LogSegError::Corrupted(
+                "postings section crc mismatch".into(),
+            ));
+        }
+        Ok(stored)
+    }
+
+    /// Absolute slice of a section's stored bytes.
+    fn section_stored(&self, desc: &SectionDesc) -> Result<Cow<'a, [u8]>, LogSegError> {
+        source_extent(self.source, desc.offset, desc.len, "section")
+    }
+}
+
+/// The stored bytes of `[offset, offset + len)` from `source`, with the range
+/// checks every whole-object slice here has always made, each naming `what`
+/// ("section", "page"): a range past the object's end is `Corrupted("<what>
+/// out of bounds")` whatever the source, and only an in-bounds range reaches
+/// [`ByteSource::read`], so a whole-object source can fail no other way and a
+/// sparse one adds only [`LogSegError::Unplaced`].
+fn source_extent<'s, S: ByteSource + ?Sized>(
+    source: &'s S,
+    offset: u64,
+    len: u64,
+    what: &str,
+) -> Result<Cow<'s, [u8]>, LogSegError> {
+    let start = usize::try_from(offset)
+        .map_err(|_| LogSegError::Corrupted(format!("{what} offset range")))?;
+    let n =
+        usize::try_from(len).map_err(|_| LogSegError::Corrupted(format!("{what} len range")))?;
+    let end = start
+        .checked_add(n)
+        .ok_or_else(|| LogSegError::Corrupted(format!("{what} range overflow")))?;
+    if end as u64 > source.object_len() {
+        return Err(LogSegError::Corrupted(format!("{what} out of bounds")));
+    }
+    source.read(offset, len)
+}
+
+/// Which surviving block to decode: its whole-object block index, resolved to
+/// the block's pages through the [`BlockScan`]'s shared PAGE_DIR at decode time
+/// rather than carried here (issue #760), plus what the skip index says about
+/// it.
+///
+/// `crc32c` is the block crc, defined over the concatenation of the block's
+/// pages in `column_id` order, so it is verifiable only by a reader that took
+/// all of them; a page-subset read verifies each page's own crc instead.
+///
+/// `Copy` is load-bearing: it is what proves a survivor entry cannot own a
+/// `Vec<PageLoc>`, so the pruned survivor list holds one fixed-size handle per
+/// surviving block, not that block's page list. Reintroducing a per-block page
+/// vector here (the pre-#760 shape) fails to compile against this derive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BlockLoc {
+    record_count: usize,
+    crc32c: u32,
+    block_index: u32,
+    /// The block's skip-index ts bounds, as stored: an empty block reads 0
+    /// for both, and nothing here checks `min_ts <= max_ts`.
+    min_ts: i64,
+    max_ts: i64,
+    /// The block's skip-index stream ref bounds, as stored.
+    min_stream_ref: u32,
+    max_stream_ref: u32,
+}
+
+/// A pruned scan that has not decoded anything yet: the surviving block list,
+/// the directories needed to rebuild records, and the resolved column filter.
+///
+/// [`RlogReader::scan_pruned`] is this type drained in a loop. The point of
+/// exposing it is that a caller can drain it *incrementally* and drop each
+/// block's records before asking for the next, which is what bounds the SQL
+/// logs scan's peak memory to one block rather than one partition (ADR-0087).
+///
+/// It owns everything it needs (the two directories are shared out of the
+/// reader by `Arc`), so it does not borrow the object bytes. The bytes are supplied per
+/// call instead, which lets the caller hold them however it likes -- an owned
+/// `Bytes` from a cache hit, say -- without a self-referential struct.
+pub struct BlockScan {
+    stream_dir: Arc<StreamDir>,
+    field_dir: Arc<FieldDir>,
+    plans: Vec<ColumnPlan>,
+    /// `None` decodes every column (see [`ColumnSelection::resolve`]). Column
+    /// ids are self-generated and dense (docs on [`ColumnIdSet`]), so this
+    /// re-collects `resolve`'s std `HashSet<u32>` into the crate's faster set
+    /// rather than paying SipHash on every page of every block decoded.
+    columns: Option<ColumnIdSet>,
+    /// The exact content filter, its arms resolved against the directories
+    /// once per scan and evaluated per decoded block ([`block_survivors`]).
+    arms: Vec<Arm>,
+    /// The `Str` columns a [`Predicate::Contains`] arm tests, whose
+    /// dictionaries get the survivor-only values build
+    /// ([`build_survivor_values`]) rather than the eager one.
+    deferred: Vec<u32>,
+    blocks: Vec<BlockLoc>,
+    /// The object's shared decoded PAGE_DIR. One [`Arc`] copy per scan, cloned
+    /// from the reader, through which [`Self::decode_block`] resolves each
+    /// survivor's pages at decode time. This is what keeps the pruned survivor
+    /// list proportional to the surviving-block count rather than to blocks
+    /// times pages-per-block (issue #760).
+    page_dir: Arc<PageDir>,
+    /// Absolute offset of the BLOCKS section, added to the PAGE_DIR-relative
+    /// page offsets when a block is resolved at decode time.
+    blocks_offset: u64,
+    next: usize,
+    stats: ScanStats,
+    /// The block [`Self::decode_block`] most recently decoded, held only for as
+    /// long as one of the two exits is reading it. Dropped at the start of the
+    /// next decode, and dropped by [`Self::next_block`] before it returns, so
+    /// the row path holds exactly one block's decoded columns at a time as it
+    /// did before the columnar exit existed (ADR-0087 decision 2).
+    current: Option<DecodedBlock>,
+    /// Row positions of [`Self::current`] that matched `content`, ascending.
+    surviving: Vec<usize>,
+    /// The current row group's decoded dictionaries, shared by its blocks.
+    dicts: DictCache,
+    /// Per-arm work over a shared dictionary, reused by the blocks of its row
+    /// group.
+    dict_memo: DictArmMemo,
+}
+
+impl BlockScan {
+    /// Pruning counters. `blocks_total`/`blocks_after_*` are final from
+    /// construction; `blocks_scanned`, `pages_decoded`, and `pages_skipped`
+    /// grow as blocks are drained, so read this after the last
+    /// [`Self::next_block`] to get the whole scan's figures.
+    pub fn stats(&self) -> ScanStats {
+        self.stats
+    }
+
+    /// Surviving blocks not yet decoded.
+    pub fn remaining_blocks(&self) -> usize {
+        self.blocks.len().saturating_sub(self.next)
+    }
+
+    /// The object's decoded PAGE_DIR, shared via the same [`Arc`] every
+    /// reader opened from one [`SegmentDirectories`] holds (ADR-2414
+    /// decision A1). A caller sizing the read gate's job from this scan's
+    /// segment reads the directory here instead of decoding PAGE_DIR again.
+    pub fn page_dir(&self) -> &Arc<PageDir> {
+        &self.page_dir
+    }
+
+    /// The whole-object block index of every surviving block, in the order
+    /// [`Self::next_block`] drains them. A caller grouping survivors into
+    /// row groups (PAGE_DIR's `groups[i].block_count` boundaries, ADR-2414
+    /// decision A1) needs the real block index, not the ordinal position
+    /// [`RlogReader::scan_blocks_subset`]'s `indices` addresses.
+    pub fn survivor_block_indices(&self) -> Vec<usize> {
+        self.blocks.iter().map(|b| b.block_index as usize).collect()
+    }
+
+    /// The whole-object block index of the block the next call to
+    /// [`Self::next_block`] or [`Self::next_block_columnar`] will decode, or
+    /// `None` once the cursor is exhausted.
+    ///
+    /// Read before the decode call, this names the block the cursor itself is
+    /// about to yield, so a caller stamping a row address does not count
+    /// blocks in a list of its own that can drift from this cursor's order.
+    pub fn next_block_index(&self) -> Option<usize> {
+        self.blocks.get(self.next).map(|b| b.block_index as usize)
+    }
+
+    /// The skip index's `(min_ts, max_ts)` for the block the next decode call
+    /// would decode, or `None` once the cursor is exhausted. The bounds are
+    /// the stored ones: a caller must treat `min_ts > max_ts` as no bound.
+    pub fn next_block_ts_bounds(&self) -> Option<(i64, i64)> {
+        self.blocks.get(self.next).map(|b| (b.min_ts, b.max_ts))
+    }
+
+    /// Move the cursor past the next surviving block without reading or
+    /// decoding any of it, so it is not counted in `blocks_scanned`. Returns
+    /// `false`, and does nothing, once the cursor is exhausted.
+    ///
+    /// The previously decoded block, if any, stays held until the next decode
+    /// call releases it, exactly as if this block had not been there.
+    pub fn skip_next_block(&mut self) -> bool {
+        if self.next >= self.blocks.len() {
+            return false;
+        }
+        self.next += 1;
+        true
+    }
+
+    /// Decode the next surviving block and return the rows of it that match the
+    /// exact filter, or `None` once every surviving block has been decoded.
+    ///
+    /// `object_bytes` MUST be the RLOG object the [`RlogReader`] this cursor
+    /// came from was opened on, or a [`ByteSource`] over it: block extents are
+    /// absolute offsets into it. A block whose extent falls outside the object
+    /// is a typed `Corrupted` error, and one whose pages the source does not
+    /// hold is [`LogSegError::Unplaced`], never a panic.
+    ///
+    /// Returning `Some(vec![])` is normal and distinct from `None`: a block can
+    /// survive pruning and still have no row matching the exact filter. Only
+    /// `None` means the scan is finished.
+    pub fn next_block<S: ByteSource + ?Sized>(
+        &mut self,
+        object_bytes: &S,
+    ) -> Result<Option<Vec<LogRecord>>, LogSegError> {
+        if !self.decode_block(object_bytes)? {
+            return Ok(None);
+        }
+        let Some(decoded) = self.current.take() else {
+            return Err(LogSegError::Corrupted("block not decoded".into()));
+        };
+        let strict = self.columns.is_none();
+        let mut out = Vec::with_capacity(self.surviving.len());
+        for &row in &self.surviving {
+            out.push(rebuild_record_projected(
+                &self.stream_dir,
+                &self.field_dir,
+                &decoded,
+                row,
+                strict,
+            )?);
+        }
+        self.surviving.clear();
+        Ok(Some(out))
+    }
+
+    /// Decode the next surviving block and return a borrowed columnar view of
+    /// the rows of it that match the exact filter, or `None` once every
+    /// surviving block has been decoded (ADR-0099 decision 1).
+    ///
+    /// This is the second exit next to [`Self::next_block`], over the same
+    /// decode primitive: the view's surviving rows are exactly the rows
+    /// `next_block` would have returned records for, in the same order. What
+    /// differs is that nothing is rebuilt -- no `String`, no cloned STREAM_DIR
+    /// blob, no per-attribute key clone -- so a caller that is about to build
+    /// columnar output does not pay for a row form first.
+    ///
+    /// `object_bytes` has the same contract as [`Self::next_block`]'s, and the
+    /// same malformed-block cases are the same typed `Corrupted` errors, never
+    /// panics. Two of them are checked here rather than while rebuilding a
+    /// record: every surviving row must have a `ts` and a `stream_ref` that
+    /// resolves to a STREAM_DIR entry. The row path rejects both while building
+    /// each record; this exit builds nothing, so it checks them up front rather
+    /// than handing out a view whose `ts` and stream identity read as absent.
+    ///
+    /// The returned view borrows this cursor, so it must be dropped before the
+    /// next call. The decoded block is released on the next call to either
+    /// exit.
+    pub fn next_block_columnar<S: ByteSource + ?Sized>(
+        &mut self,
+        object_bytes: &S,
+    ) -> Result<Option<ColumnarBlockView<'_>>, LogSegError> {
+        if !self.decode_block(object_bytes)? {
+            return Ok(None);
+        }
+        let Some(decoded) = self.current.as_ref() else {
+            return Err(LogSegError::Corrupted("block not decoded".into()));
+        };
+        // Resolve stream_ref and ts once for the whole block, not once per
+        // surviving row (#875): the per-row body then only indexes the resolved
+        // slices, and the error text stays identical to the per-cell `i64_at`.
+        let stream_refs = decoded.i64_column(COL_STREAM_REF);
+        let ts = decoded.i64_column(COL_TS);
+        let entries = self.stream_dir.entries();
+        for &row in &self.surviving {
+            let raw = stream_refs.and_then(|c| c.get(row)).ok_or_else(|| {
+                LogSegError::Corrupted(format!("missing i64 col {COL_STREAM_REF}"))
+            })?;
+            let sref = u32::try_from(raw)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            if entries.get(sref as usize).is_none() {
+                return Err(LogSegError::Corrupted("stream_ref out of range".into()));
+            }
+            ts.and_then(|c| c.get(row))
+                .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {COL_TS}")))?;
+        }
+        Ok(Some(ColumnarBlockView::new(
+            &self.stream_dir,
+            &self.field_dir,
+            decoded,
+            &self.surviving,
+        )))
+    }
+
+    /// The decode primitive both exits run on: locate the next surviving block,
+    /// decode its selected columns, account for its pages, and evaluate the
+    /// exact content predicate into [`Self::surviving`].
+    ///
+    /// `Ok(false)` means the cursor is exhausted and nothing was decoded.
+    /// `Ok(true)` leaves the decoded block in [`Self::current`] and its
+    /// surviving row positions, ascending, in [`Self::surviving`].
+    ///
+    /// Having one primitive is what keeps the two exits from drifting: the
+    /// surviving row set is computed once, by one predicate evaluation, so a
+    /// columnar view cannot disagree with the records `next_block` would have
+    /// produced for the same block.
+    fn decode_block<S: ByteSource + ?Sized>(
+        &mut self,
+        object_bytes: &S,
+    ) -> Result<bool, LogSegError> {
+        // Release the previous block before decoding the next, so peak resident
+        // decoded memory stays one block rather than two.
+        self.current = None;
+        self.surviving.clear();
+
+        let Some(loc) = self.blocks.get(self.next).cloned() else {
+            return Ok(false);
+        };
+        self.next += 1;
+        // Resolve the block's pages now, from the shared PAGE_DIR, rather than
+        // from a per-block list built at scan time (issue #760). `block_pages`
+        // returns offsets relative to the BLOCKS section; shift them to
+        // absolute object offsets, exactly what the scan-time build produced,
+        // so the decode is byte-identical.
+        let (pages, dict_pages) = located_block_pages(
+            &self.page_dir,
+            self.blocks_offset,
+            loc.block_index,
+            &mut self.dicts,
+        )?;
+        let mut decoded = decode_v4_block_with(
+            |p: &PageLoc| source_extent(object_bytes, p.offset, p.desc.len, "page"),
+            loc.record_count,
+            loc.crc32c,
+            &pages,
+            &dict_pages,
+            &mut self.dicts,
+            &self.deferred,
+            &self.plans,
+            self.columns.as_ref(),
+        )?;
+        self.stats.str_cells_validated = self
+            .stats
+            .str_cells_validated
+            .saturating_add(decoded.str_cells_validated());
+        self.stats.blocks_scanned += 1;
+        self.stats.pages_decoded += decoded.pages_decoded() as u64;
+        self.stats.int_values_buffers += decoded.int_values_buffers() as u64;
+        self.stats.pages_skipped += decoded.pages_skipped() as u64;
+        self.stats.page_bytes_fetched = self
+            .stats
+            .page_bytes_fetched
+            .saturating_add(decoded.page_bytes_fetched());
+        self.stats.page_bytes_decoded = self
+            .stats
+            .page_bytes_decoded
+            .saturating_add(decoded.page_bytes_decoded());
+        self.stats.decompressed_bytes = self
+            .stats
+            .decompressed_bytes
+            .saturating_add(decoded.decompressed_bytes());
+
+        block_survivors(
+            &self.stream_dir,
+            &self.field_dir,
+            &self.arms,
+            &loc,
+            &decoded,
+            &mut self.dict_memo,
+            &mut self.stats,
+            &mut self.surviving,
+        )?;
+        build_survivor_values(
+            &self.deferred,
+            &mut decoded,
+            &self.surviving,
+            &mut self.dict_memo,
+            &mut self.stats,
+        )?;
+        self.current = Some(decoded);
+        Ok(true)
+    }
+}
+
+/// The survivor-only values build: each `deferred` column held in dictionary
+/// form gets a dictionary of its own, holding only the entries `surviving`
+/// rows reference, each validated at most once per dictionary (through the
+/// memo the contains kernel validated through), and every other row of the
+/// column reads as absent. The unvalidated dictionary it replaces stays where
+/// it was; nothing here touches the row group cache.
+fn build_survivor_values(
+    deferred: &[u32],
+    block: &mut DecodedBlock,
+    surviving: &[usize],
+    memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
+) -> Result<(), LogSegError> {
+    for &col in deferred {
+        let Some(StrColumn::Dict(d)) = block.str_column_mut(col) else {
+            continue;
+        };
+        let values = Arc::clone(d.values());
+        if values.validated() {
+            continue;
+        }
+        let used = d.entries_used_by(surviving);
+        let built = texts_slot(&mut memo.texts, col, &values).build(
+            &values,
+            &used,
+            &mut stats.str_cells_validated,
+        )?;
+        d.restrict_to(Arc::new(built), surviving);
+    }
+    Ok(())
+}
+
+/// Reads and decodes one version-4 block, given its pages located through
+/// PAGE_DIR (ADR-0699 decisions 1 and 2).
+///
+/// Every page whose column the projection keeps is checksum-verified against
+/// its own PAGE_DIR `crc32c` before it is decompressed, so a page-subset read
+/// verifies every byte it goes on to interpret without touching the rest of the
+/// block. A page whose column the projection drops is never read at all: under
+/// version 3 its stored bytes were inside the block extent already fetched and
+/// were merely walked past, here they are simply not addressed.
+///
+/// When the projection keeps everything, the block's SKIP_IDX level-0 crc is
+/// verified too, over the concatenation of the pages in `column_id` order,
+/// which is what a whole-block read assembles. That is a check on PAGE_DIR's
+/// placement claim, not a duplicate of the per-page checks: it fails if the
+/// directory pointed at the right bytes in the wrong order, or at another
+/// block's pages.
+/// `bytes` need not be the whole object: `base` is the absolute offset its
+/// first byte sits at, so a caller holding one fetched range passes that
+/// range's start and a whole-object caller passes 0. A caller decoding
+/// several blocks of one row group passes the same `dicts` to each, so each
+/// dictionary page is decoded once per chunk rather than once per block.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn decode_v4_block(
+    bytes: &[u8],
+    base: u64,
+    record_count: usize,
+    block_crc32c: u32,
+    pages: &[PageLoc],
+    dict_pages: &[PageLoc],
+    dicts: &mut DictCache,
+    plans: &[ColumnPlan],
+    columns: Option<&ColumnIdSet>,
+) -> Result<DecodedBlock, LogSegError> {
+    let page = |p: &PageLoc| {
+        let rel = p
+            .offset
+            .checked_sub(base)
+            .ok_or_else(|| LogSegError::Corrupted("page before fetched range".into()))?;
+        source_extent(bytes, rel, p.desc.len, "page")
+    };
+    decode_v4_block_with(
+        page,
+        record_count,
+        block_crc32c,
+        pages,
+        dict_pages,
+        dicts,
+        &[],
+        plans,
+        columns,
+    )
+}
+
+/// Block `block`'s pages and the row group dictionary pages they need, each
+/// with its offset shifted from BLOCKS-relative to absolute in the object.
+/// `dicts` is readied for the block, so the decode that follows shares the
+/// dictionaries already decoded for its row group and no other.
+pub(crate) fn located_block_pages(
+    page_dir: &PageDir,
+    blocks_offset: u64,
+    block: u32,
+    dicts: &mut DictCache,
+) -> Result<(Vec<PageLoc>, Vec<PageLoc>), LogSegError> {
+    dicts.enter_block(page_dir, block);
+    let mut pages = page_dir
+        .block_pages(block)
+        .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+    let mut dict_pages = page_dir
+        .block_dict_pages(block)
+        .ok_or_else(|| LogSegError::Corrupted("block not in page_dir".into()))?;
+    for p in pages.iter_mut().chain(dict_pages.iter_mut()) {
+        p.offset = blocks_offset
+            .checked_add(p.offset)
+            .ok_or_else(|| LogSegError::Corrupted("page offset overflow".into()))?;
+    }
+    Ok((pages, dict_pages))
+}
+
+/// Row group dictionaries (tag-12 pages) already verified and decoded, so the
+/// blocks of one column chunk share one decode (ADR-2135 decision 6).
+///
+/// Keyed by the dictionary page's `(offset, column_id)`. That page leads its
+/// chunk, so its offset is the chunk's, and no two chunks share one. The cache
+/// holds one row group at a time: [`Self::enter_block`] empties it when a
+/// block of another group comes up, so residency stays one group's
+/// dictionaries however many groups a scan crosses. Only a successful decode
+/// is stored, so a corrupt dictionary still fails every block of its chunk.
+///
+/// A column a `LIKE` contains arm tests is decoded
+/// [unvalidated](DictValues::unvalidated) and kept apart, in `raw`: its
+/// dictionary is never in `entries`, so a scan without the arm sharing the
+/// cache never reads one whose entries were not all validated, and the
+/// survivor-only build ([`build_survivor_values`]) never writes into it.
+#[derive(Debug, Default)]
+pub(crate) struct DictCache {
+    group: Option<u32>,
+    entries: Vec<(DictKey, Arc<DictValues>)>,
+    raw: Vec<(DictKey, Arc<DictValues>)>,
+}
+
+/// A dictionary page's `(offset, column_id)`.
+type DictKey = (u64, u32);
+
+impl DictCache {
+    /// Prepares the cache for whole-object block index `block`: entries of
+    /// any other row group are dropped.
+    pub(crate) fn enter_block(&mut self, page_dir: &PageDir, block: u32) {
+        let group = page_dir.locate_block(block).map(|(g, _)| g.first_block);
+        if group != self.group || group.is_none() {
+            self.entries.clear();
+            self.raw.clear();
+            self.group = group;
+        }
+    }
+
+    /// The dictionary for `key`: the unvalidated one when `deferred`, the
+    /// shared validated one otherwise.
+    fn get(&self, key: DictKey, deferred: bool) -> Option<&Arc<DictValues>> {
+        let entries = if deferred { &self.raw } else { &self.entries };
+        entries.iter().find(|(k, _)| *k == key).map(|(_, d)| d)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Dictionary pages `decode_v4_block_with` has decoded on this thread.
+    static DICT_PAGE_DECODES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Dictionary pages decoded on this thread so far, for tests that pin one
+/// decode per chunk.
+#[cfg(test)]
+pub(crate) fn dict_page_decodes() -> u64 {
+    DICT_PAGE_DECODES.with(std::cell::Cell::get)
+}
+
+/// [`decode_v4_block`] with each kept page's stored bytes supplied by `page`,
+/// which is only called for a page the projection keeps.
+///
+/// `dict_pages` are the row group dictionary pages of the block's column
+/// chunks (ADR-2135 decision 6). Each one whose column the projection keeps is
+/// checksum-verified against its own PAGE_DIR crc and decoded before any of
+/// the block's pages is, on the whole-block and the subset path alike, so a
+/// corrupt dictionary fails every block of its chunk. It belongs to the
+/// chunk rather than the block, so the block crc does not cover it.
+///
+/// A dictionary already in `dicts` is reused rather than fetched through
+/// `page`, verified and decoded again. The block is charged for it exactly as
+/// if it had been (one decoded page, its stored and decompressed lengths), so
+/// [`ScanStats`] figures do not depend on which block of a chunk came first.
+/// [`located_block_pages`] readies `dicts` for the block.
+///
+/// A dictionary, row group or per-block, of a column in `deferred` is left
+/// [unvalidated](DictValues::unvalidated) for the scan's survivor-only build;
+/// every other one is validated in full and counted in the block's
+/// [`DecodedBlock::str_cells_validated`].
+#[allow(clippy::too_many_arguments)]
+fn decode_v4_block_with<'s>(
+    page: impl Fn(&PageLoc) -> Result<Cow<'s, [u8]>, LogSegError>,
+    record_count: usize,
+    block_crc32c: u32,
+    pages: &[PageLoc],
+    dict_pages: &[PageLoc],
+    dicts: &mut DictCache,
+    deferred: &[u32],
+    plans: &[ColumnPlan],
+    columns: Option<&ColumnIdSet>,
+) -> Result<DecodedBlock, LogSegError> {
+    let wanted = |cid: u32| match columns {
+        None => true,
+        Some(set) => set.contains(&cid),
+    };
+    let mut descs: Vec<crate::page::PageDesc> = Vec::with_capacity(pages.len());
+    let mut page_bytes: Vec<Option<Vec<u8>>> = Vec::with_capacity(pages.len());
+    let mut counters = PageCounters::default();
+    let mut validated = 0u64;
+    for p in dict_pages {
+        counters.bytes_fetched = counters.bytes_fetched.saturating_add(p.desc.len);
+        let key = (p.offset, p.desc.column_id);
+        if !wanted(p.desc.column_id) {
+            counters.skipped += 1;
+            continue;
+        }
+        let defer = deferred.contains(&p.desc.column_id);
+        if dicts.get(key, defer).is_some() {
+            if p.desc.comp == crate::page::COMP_ZSTD {
+                counters.decompressed_bytes = counters
+                    .decompressed_bytes
+                    .saturating_add(p.desc.uncomp_len);
+            }
+            counters.decoded += 1;
+            counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
+            continue;
+        }
+        let stored = page(p)?;
+        let produced = verify_and_read(&stored, p, &mut counters)?;
+        let decoded = decode_dict_page(&produced)?;
+        #[cfg(test)]
+        DICT_PAGE_DECODES.with(|n| n.set(n.get() + 1));
+        if defer {
+            dicts
+                .raw
+                .push((key, Arc::new(DictValues::unvalidated(&decoded)?)));
+        } else {
+            let values = DictValues::from_entries(&decoded)?;
+            validated += decoded.len() as u64;
+            dicts.entries.push((key, Arc::new(values)));
+        }
+    }
+    let mut block_crc = 0u32;
+    let mut all_read = true;
+    for p in pages {
+        counters.bytes_fetched = counters.bytes_fetched.saturating_add(p.desc.len);
+        descs.push(p.desc);
+        if !wanted(p.desc.column_id) {
+            counters.skipped += 1;
+            all_read = false;
+            page_bytes.push(None);
+            continue;
+        }
+        let stored = page(p)?;
+        block_crc = crc32c::crc32c_append(block_crc, &stored);
+        page_bytes.push(Some(verify_and_read(&stored, p, &mut counters)?));
+    }
+    if all_read && block_crc != block_crc32c {
+        return Err(LogSegError::Corrupted("block crc mismatch".into()));
+    }
+    let dicts: Vec<(u32, &Arc<DictValues>)> = dict_pages
+        .iter()
+        .filter(|p| wanted(p.desc.column_id))
+        .map(|p| {
+            dicts
+                .get(
+                    (p.offset, p.desc.column_id),
+                    deferred.contains(&p.desc.column_id),
+                )
+                .map(|d| (p.desc.column_id, d))
+                .ok_or_else(|| {
+                    LogSegError::Corrupted(format!(
+                        "dictionary for column {} not decoded",
+                        p.desc.column_id
+                    ))
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let mut block = read_block_pages_with_shared_dicts(
+        record_count,
+        &descs,
+        &page_bytes,
+        &dicts,
+        deferred,
+        plans,
+        counters,
+    )?;
+    block.add_str_cells_validated(validated);
+    Ok(block)
+}
+
+/// Checks one kept page's stored bytes against its PAGE_DIR crc, then
+/// decompresses them, counting the page as decoded.
+fn verify_and_read(
+    stored: &[u8],
+    p: &PageLoc,
+    counters: &mut PageCounters,
+) -> Result<Vec<u8>, LogSegError> {
+    if crc32c::crc32c(stored) != p.crc32c {
+        return Err(LogSegError::Corrupted(format!(
+            "page crc mismatch for column {}",
+            p.desc.column_id
+        )));
+    }
+    let produced = read_page(stored, &p.desc, DEFAULT_MAX_UNCOMP)?;
+    // Only a zstd page was decompressed; count what it actually produced
+    // (equal to `uncomp_len` for a valid page, which `read_page` already
+    // checked). A raw page was copied, not decompressed (issue #1401).
+    if p.desc.comp == crate::page::COMP_ZSTD {
+        counters.decompressed_bytes = counters
+            .decompressed_bytes
+            .saturating_add(produced.len() as u64);
+    }
+    counters.decoded += 1;
+    counters.bytes_decoded = counters.bytes_decoded.saturating_add(p.desc.len);
+    Ok(produced)
+}
+
+// --- per-block evaluation (ADR-2773 decision D2) ----------------------------
+
+/// One arm of the exact content predicate, resolved against the object's
+/// STREAM_DIR and FIELD_DIR once per scan.
+#[derive(Clone, Debug)]
+enum Arm {
+    /// `TsRange`, inclusive at both ends.
+    Ts {
+        min: i64,
+        max: i64,
+    },
+    /// `StreamIn`, as the sorted, deduplicated stream refs its ids resolve to.
+    /// An id this object has no stream for matches no row, so it has no ref.
+    Stream {
+        refs: Vec<u32>,
+    },
+    /// Equality on a string or bytes column (plain or dictionary pages).
+    BytesEq {
+        col: u32,
+        target: Vec<u8>,
+    },
+    I64Eq {
+        col: u32,
+        target: i64,
+    },
+    /// Equality on an f64 column by bit pattern.
+    F64Eq {
+        col: u32,
+        bits: u64,
+    },
+    BoolEq {
+        col: u32,
+        target: bool,
+    },
+    /// `HasWord` on a string column.
+    Word {
+        col: u32,
+        word: String,
+    },
+    /// `Contains` on attribute `key`: `col` is its FIELD_DIR `Str` column, if
+    /// any, and `others` its columns of every other type, whose present cell
+    /// keeps a row whatever the test says.
+    Contains {
+        col: Option<u32>,
+        others: Vec<(u32, FieldType)>,
+        key: String,
+        needle: Vec<u8>,
+        negated: bool,
+    },
+    /// An `Equals` that no row can satisfy (`body` against a non-string).
+    Never,
+    /// An attribute arm whose field has no FIELD_DIR column of the type the
+    /// value resolves to: evaluated per row against `attrs_raw`.
+    Overflow(Predicate),
+}
+
+/// Resolves the flattened exact arms. `NumRange` is prune-only and matches
+/// every row (see [`eval`]), so it contributes no arm.
+fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate]) -> Vec<Arm> {
+    let mut out = Vec::with_capacity(arms.len());
+    for &p in arms {
+        let arm = match p {
+            // `flatten` leaves no `And`; an empty one matches every row.
+            Predicate::And(_) | Predicate::NumRange { .. } => continue,
+            Predicate::TsRange { min_ns, max_ns } => Arm::Ts {
+                min: *min_ns,
+                max: *max_ns,
+            },
+            Predicate::StreamIn(ids) => {
+                let mut refs: Vec<u32> = ids
+                    .iter()
+                    .filter_map(|id| stream_dir.stream_ref(id))
+                    .collect();
+                refs.sort_unstable();
+                refs.dedup();
+                Arm::Stream { refs }
+            }
+            Predicate::HasWord { field, word } => match field {
+                FieldSel::Body => Arm::Word {
+                    col: COL_BODY,
+                    word: word.clone(),
+                },
+                FieldSel::SeverityText => Arm::Word {
+                    col: COL_SEVERITY_TEXT,
+                    word: word.clone(),
+                },
+                FieldSel::Attr(name) => match field_dir.column(name, FieldType::Str) {
+                    Some(e) => Arm::Word {
+                        col: e.column_id,
+                        word: word.clone(),
+                    },
+                    None => Arm::Overflow(p.clone()),
+                },
+            },
+            Predicate::Equals { field, value } => match field {
+                FieldSel::Body | FieldSel::SeverityText => {
+                    let col = if matches!(field, FieldSel::Body) {
+                        COL_BODY
+                    } else {
+                        COL_SEVERITY_TEXT
+                    };
+                    match value {
+                        AttrValue::Str(s) => Arm::BytesEq {
+                            col,
+                            target: s.as_bytes().to_vec(),
+                        },
+                        _ => Arm::Never,
+                    }
+                }
+                FieldSel::Attr(name) => {
+                    let (ty, _) = resolve_value(value);
+                    match field_dir.column(name, ty) {
+                        Some(e) => column_eq_arm(e.column_id, value),
+                        None => Arm::Overflow(p.clone()),
+                    }
+                }
+            },
+            Predicate::Contains {
+                key,
+                needle,
+                negated,
+            } => Arm::Contains {
+                col: field_dir.column(key, FieldType::Str).map(|e| e.column_id),
+                others: field_dir
+                    .entries()
+                    .iter()
+                    .filter(|e| e.name == *key && e.ty != FieldType::Str)
+                    .map(|e| (e.column_id, e.ty))
+                    .collect(),
+                key: key.clone(),
+                needle: needle.as_bytes().to_vec(),
+                negated: *negated,
+            },
+        };
+        out.push(arm);
+    }
+    out
+}
+
+/// The `Str` columns the `Contains` arms test, each once, in arm order: the
+/// columns whose dictionaries get the survivor-only values build.
+fn contains_columns(arms: &[Arm]) -> Vec<u32> {
+    let mut cols = Vec::new();
+    for arm in arms {
+        if let Arm::Contains { col: Some(c), .. } = arm
+            && !cols.contains(c)
+        {
+            cols.push(*c);
+        }
+    }
+    cols
+}
+
+/// The equality arm for a FIELD_DIR column of the type `value` resolves to,
+/// matching exactly the rows [`attr_equals`] does.
+fn column_eq_arm(col: u32, value: &AttrValue) -> Arm {
+    match value {
+        // A string column cell reads as `Str` only when it is UTF-8, and the
+        // query string is UTF-8, so equal bytes are the whole condition.
+        AttrValue::Str(s) => Arm::BytesEq {
+            col,
+            target: s.as_bytes().to_vec(),
+        },
+        AttrValue::Bytes(b) => Arm::BytesEq {
+            col,
+            target: b.clone(),
+        },
+        AttrValue::I64(v) => Arm::I64Eq { col, target: *v },
+        AttrValue::F64(f) => Arm::F64Eq {
+            col,
+            bits: f.to_bits(),
+        },
+        AttrValue::Bool(b) => Arm::BoolEq { col, target: *b },
+        // A list or map is stored in a bytes column as its canonical bytes.
+        other => Arm::BytesEq {
+            col,
+            target: crate::record::canonical_value_bytes(other),
+        },
+    }
+}
+
+impl Arm {
+    /// Whether the block's skip-index bounds prove this arm true for every
+    /// row, so it can be left out of the block's evaluation. A block whose
+    /// `ts` or `stream_ref` column has an absent cell keeps the arm, so the
+    /// kernel still reports that cell as corrupt.
+    fn holds_for_block(&self, loc: &BlockLoc, block: &DecodedBlock) -> bool {
+        let n = block.record_count();
+        let complete = |col: u32| {
+            block
+                .i64_column(col)
+                .is_some_and(|c| c.len() == n && c.null_count() == 0)
+        };
+        match self {
+            Arm::Ts { min, max } => {
+                loc.min_ts <= loc.max_ts
+                    && *min <= loc.min_ts
+                    && loc.max_ts <= *max
+                    && complete(COL_TS)
+            }
+            Arm::Stream { refs } => {
+                let (lo, hi) = (loc.min_stream_ref, loc.max_stream_ref);
+                if lo > hi {
+                    return false;
+                }
+                // Every ref in `lo..=hi` is in the set: the set's refs inside
+                // the bounds number as many as the bounds span.
+                let inside = refs.partition_point(|&r| r <= hi) - refs.partition_point(|&r| r < lo);
+                inside as u64 == u64::from(hi - lo) + 1 && complete(COL_STREAM_REF)
+            }
+            _ => false,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Calls to [`eval`] on this thread.
+    static EVAL_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Arms [`block_survivors`] ran as a block kernel on this thread.
+    static KERNEL_ARMS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Dictionary entries a `BytesEq` arm compared with its target.
+    static DICT_ENTRY_VISITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// `phrase_match` memos a `Word` arm allocated over a dictionary.
+    static DICT_WORD_MEMOS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// What each dictionary arm learned about the dictionary it last ran over,
+/// so the blocks of a row group, which share one dictionary, pay for it once:
+/// the keys a `BytesEq` target equals, and a `Word` arm's `phrase_match`
+/// result per entry so far. Indexed by the arm's position in the scan.
+///
+/// A `Contains` arm keeps its needle test per entry in `contains`, and its
+/// stream fallback verdict per `stream_ref` in `streams`, which holds for the
+/// whole scan. `texts` is per column, not per arm: the UTF-8 of an unvalidated
+/// dictionary's entries, decided once and shared by every arm on the column
+/// and by the survivor-only build ([`build_survivor_values`]).
+#[derive(Default)]
+struct DictArmMemo {
+    hits: Vec<DictSlot<Vec<i32>>>,
+    words: Vec<DictSlot<Vec<Option<bool>>>>,
+    contains: Vec<DictSlot<Vec<Option<bool>>>>,
+    streams: Vec<Vec<Option<bool>>>,
+    texts: Vec<(u32, DictSlot<EntryTexts>)>,
+}
+
+/// Column `col`'s [`EntryTexts`] over `dict`, started afresh unless it
+/// already holds `dict`'s.
+fn texts_slot<'m>(
+    texts: &'m mut Vec<(u32, DictSlot<EntryTexts>)>,
+    col: u32,
+    dict: &Arc<DictValues>,
+) -> &'m mut EntryTexts {
+    let at = match texts.iter().position(|(c, _)| *c == col) {
+        Some(at) => at,
+        None => {
+            texts.push((col, None));
+            texts.len() - 1
+        }
+    };
+    let slot = &mut texts[at].1;
+    if !matches!(slot, Some((w, _)) if std::ptr::eq(w.as_ptr(), Arc::as_ptr(dict))) {
+        *slot = None;
+    }
+    &mut slot
+        .get_or_insert_with(|| (Arc::downgrade(dict), EntryTexts::new(dict.len())))
+        .1
+}
+
+/// Work keyed by the identity of the shared [`DictValues`] it was done over.
+/// The [`Weak`](std::sync::Weak) keeps that allocation from being reused for
+/// another dictionary while the slot names it, without keeping a past row
+/// group's entries resident.
+type DictSlot<T> = Option<(std::sync::Weak<DictValues>, T)>;
+
+/// Slot `arm` of `slots`, rebuilt by `init` unless it holds `dict`'s work.
+fn dict_slot<'m, T>(
+    slots: &'m mut Vec<DictSlot<T>>,
+    arm: usize,
+    dict: &Arc<DictValues>,
+    init: impl FnOnce(&DictValues) -> T,
+) -> &'m mut T {
+    if slots.len() <= arm {
+        slots.resize_with(arm + 1, || None);
+    }
+    let slot = &mut slots[arm];
+    if !matches!(slot, Some((w, _)) if std::ptr::eq(w.as_ptr(), Arc::as_ptr(dict))) {
+        *slot = None;
+    }
+    &mut slot
+        .get_or_insert_with(|| (Arc::downgrade(dict), init(dict)))
+        .1
+}
+
+/// The rows of `block` matching `arms`, ascending, appended to `out`: the
+/// rows [`eval`] accepts one by one over the whole content predicate.
+///
+/// Arms the block's skip-index bounds prove true are dropped first; a block
+/// left with no arm keeps every row and evaluates nothing. The remaining
+/// column arms run as kernels over the decoded column buffers, each clearing
+/// rows from one selection bitmap in arm order. Overflow arms run last, per
+/// row, on the rows the column arms kept. `memo` carries dictionary work
+/// between the blocks of one scan.
+#[allow(clippy::too_many_arguments)]
+fn block_survivors(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    arms: &[Arm],
+    loc: &BlockLoc,
+    block: &DecodedBlock,
+    memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
+    out: &mut Vec<usize>,
+) -> Result<(), LogSegError> {
+    let n = block.record_count();
+    let live: Vec<(usize, &Arm)> = arms
+        .iter()
+        .enumerate()
+        .filter(|(_, a)| !a.holds_for_block(loc, block))
+        .collect();
+    if live.is_empty() {
+        stats.blocks_predicate_dropped += 1;
+        out.extend(0..n);
+        return Ok(());
+    }
+    stats.rows_predicate_evaluated += n as u64;
+    let mut sel = RowSelection::all(n);
+    // Without a decoded `attrs_raw` column an overflow arm matches no row
+    // (`overflow_attr` reads `None`), so it clears the selection in place.
+    let attrs_raw = live.iter().any(|(_, a)| matches!(a, Arm::Overflow(_)))
+        && block.str_column(COL_ATTRS_RAW).is_some();
+    let mut deferred: Vec<&Predicate> = Vec::new();
+    for (i, arm) in live {
+        match arm {
+            Arm::Overflow(p) if attrs_raw => deferred.push(p),
+            _ => {
+                if sel.is_empty() {
+                    break;
+                }
+                #[cfg(test)]
+                KERNEL_ARMS.with(|c| c.set(c.get() + 1));
+                apply_arm(arm, i, stream_dir, block, memo, stats, &mut sel)?;
+            }
+        }
+    }
+    for p in deferred {
+        if sel.is_empty() {
+            break;
+        }
+        sel.retain(|row| eval(stream_dir, field_dir, p, block, row))?;
+    }
+    sel.extend_rows(out);
+    Ok(())
+}
+
+/// Clears from `sel` the rows `arm` rejects. An absent `ts` or `stream_ref`
+/// cell on a selected row is the same `Corrupted` error [`i64_at`] gives.
+/// `index` is the arm's position in the scan's arms, its slot in `memo`.
+fn apply_arm(
+    arm: &Arm,
+    index: usize,
+    stream_dir: &StreamDir,
+    block: &DecodedBlock,
+    memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
+    sel: &mut RowSelection,
+) -> Result<(), LogSegError> {
+    match arm {
+        Arm::Contains {
+            col,
+            others,
+            key,
+            needle,
+            negated,
+        } => contains_kernel(
+            ContainsArm {
+                index,
+                col: *col,
+                others,
+                key,
+                needle,
+                negated: *negated,
+            },
+            stream_dir,
+            block,
+            memo,
+            stats,
+            sel,
+        ),
+        Arm::Ts { min, max } => {
+            let (min, max) = (*min, *max);
+            i64_kernel(block.i64_column(COL_TS), Some(COL_TS), sel, |v| {
+                (min..=max).contains(&v)
+            })
+        }
+        Arm::Stream { refs } => {
+            let Some(col) = block.i64_column(COL_STREAM_REF) else {
+                return sel.reject_all_or(missing_i64(COL_STREAM_REF));
+            };
+            sel.retain(|row| {
+                let raw = col.get(row).ok_or_else(|| missing_i64(COL_STREAM_REF))?;
+                let r = u32::try_from(raw)
+                    .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+                Ok(refs.binary_search(&r).is_ok())
+            })
+        }
+        Arm::I64Eq { col, target } => {
+            let target = *target;
+            i64_kernel(block.i64_column(*col), None, sel, |v| v == target)
+        }
+        Arm::F64Eq { col, bits } => match block.f64_col(*col) {
+            Some(cells) => sel.retain(|row| Ok(cells.get(row).copied().flatten() == Some(*bits))),
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::BoolEq { col, target } => match block.bool_col(*col) {
+            Some(cells) => sel.retain(|row| Ok(cells.get(row).copied().flatten() == Some(*target))),
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::BytesEq { col, target } => match block.str_column(*col) {
+            Some(StrColumn::Plain(cells)) => {
+                sel.retain(|row| Ok(cells.get(row).and_then(Option::as_deref) == Some(target)))
+            }
+            Some(StrColumn::Dict(d)) => {
+                // The entries equal to the target, found once per dictionary;
+                // each row then compares its key.
+                let hits = dict_slot(&mut memo.hits, index, d.values(), |values| {
+                    (0..values.len())
+                        .filter(|&k| {
+                            #[cfg(test)]
+                            DICT_ENTRY_VISITS.with(|c| c.set(c.get() + 1));
+                            values.entry(k) == Some(target.as_slice())
+                        })
+                        .filter_map(|k| i32::try_from(k).ok())
+                        .collect()
+                });
+                if hits.is_empty() {
+                    sel.clear();
+                    return Ok(());
+                }
+                sel.retain(|row| Ok(d.key(row).is_some_and(|k| hits.contains(&k))))
+            }
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::Word { col, word } => match block.str_column(*col) {
+            Some(StrColumn::Plain(cells)) => sel.retain(|row| {
+                Ok(cells
+                    .get(row)
+                    .and_then(Option::as_deref)
+                    .is_some_and(|c| phrase_match(c, word)))
+            }),
+            Some(StrColumn::Dict(d)) => {
+                // One `phrase_match` per dictionary entry a selected row uses,
+                // over every block sharing the dictionary.
+                let values = d.values();
+                let memo = dict_slot(&mut memo.words, index, values, |values| {
+                    #[cfg(test)]
+                    DICT_WORD_MEMOS.with(|c| c.set(c.get() + 1));
+                    vec![None; values.len()]
+                });
+                sel.retain(|row| {
+                    let Some(k) = d.key(row) else {
+                        return Ok(false);
+                    };
+                    let k = k as usize;
+                    Ok(match memo.get(k).copied().flatten() {
+                        Some(hit) => hit,
+                        None => {
+                            let hit = values.entry(k).is_some_and(|c| phrase_match(c, word));
+                            if let Some(slot) = memo.get_mut(k) {
+                                *slot = Some(hit);
+                            }
+                            hit
+                        }
+                    })
+                })
+            }
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        },
+        Arm::Never | Arm::Overflow(_) => {
+            sel.clear();
+            Ok(())
+        }
+    }
+}
+
+fn missing_i64(col: u32) -> LogSegError {
+    LogSegError::Corrupted(format!("missing i64 col {col}"))
+}
+
+/// A `Contains` arm's fields, borrowed for [`contains_kernel`].
+struct ContainsArm<'a> {
+    /// The arm's slot in the scan's [`DictArmMemo`].
+    index: usize,
+    col: Option<u32>,
+    others: &'a [(u32, FieldType)],
+    key: &'a str,
+    needle: &'a [u8],
+    negated: bool,
+}
+
+/// Clears from `sel` the rows a `Contains` arm rejects: the rows [`eval`]
+/// rejects one by one (ADR-2773, contains-arm amendment).
+///
+/// A row reads its `Str` cell when that cell is present and UTF-8, else its
+/// stream's resource or scope `Str` value, decided once per stream for the
+/// scan. The needle test runs on the cell's raw bytes, once per dictionary
+/// entry through `memo` or once per present plain cell, and counts in
+/// [`ScanStats::contains_cells_tested`]. UTF-8 is decided only where it
+/// changes the answer, when the cell's verdict and the stream's differ: a
+/// dictionary entry through the column's [`EntryTexts`], counted in
+/// [`ScanStats::str_cells_validated`] when the dictionary was left
+/// unvalidated, and a plain cell in place, uncounted. A row with a present cell
+/// of another type for `key`, or an `attrs_raw` entry for it, is kept.
+fn contains_kernel(
+    arm: ContainsArm<'_>,
+    stream_dir: &StreamDir,
+    block: &DecodedBlock,
+    memo: &mut DictArmMemo,
+    stats: &mut ScanStats,
+    sel: &mut RowSelection,
+) -> Result<(), LogSegError> {
+    let Some(refs) = block.i64_column(COL_STREAM_REF) else {
+        return sel.reject_all_or(missing_i64(COL_STREAM_REF));
+    };
+    let DictArmMemo {
+        contains,
+        streams,
+        texts,
+        ..
+    } = memo;
+    let ScanStats {
+        contains_cells_tested: tested,
+        str_cells_validated: validated,
+        ..
+    } = stats;
+    if streams.len() <= arm.index {
+        streams.resize_with(arm.index + 1, Vec::new);
+    }
+    let streams = &mut streams[arm.index];
+    if streams.len() < stream_dir.len() {
+        streams.resize(stream_dir.len(), None);
+    }
+    let mut fallback = |row: usize| -> Result<bool, LogSegError> {
+        let raw = refs.get(row).ok_or_else(|| missing_i64(COL_STREAM_REF))?;
+        let r =
+            u32::try_from(raw).map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+        if let Some(Some(pass)) = streams.get(r as usize) {
+            return Ok(*pass);
+        }
+        let pass = stream_contains(stream_dir, r, arm.key, arm.needle, arm.negated)?;
+        if let Some(slot) = streams.get_mut(r as usize) {
+            *slot = Some(pass);
+        }
+        Ok(pass)
+    };
+    let elsewhere = |row: usize| resolved_elsewhere(block, arm.others, arm.key, row);
+    match arm.col.and_then(|c| Some((c, block.str_column(c)?))) {
+        None => sel.retain(|row| Ok(fallback(row)? || elsewhere(row)?)),
+        Some((_, StrColumn::Plain(cells))) => sel.retain(|row| {
+            let fb = fallback(row)?;
+            let pass = match cells.get(row).and_then(Option::as_deref) {
+                None => fb,
+                Some(cell) => {
+                    *tested += 1;
+                    let t = contains_bytes(cell, arm.needle) != arm.negated;
+                    if t == fb || std::str::from_utf8(cell).is_ok() {
+                        t
+                    } else {
+                        fb
+                    }
+                }
+            };
+            Ok(pass || elsewhere(row)?)
+        }),
+        Some((col, StrColumn::Dict(d))) => {
+            let values = d.values();
+            let verdicts = dict_slot(contains, arm.index, values, |v| vec![None; v.len()]);
+            let entry_texts = texts_slot(texts, col, values);
+            sel.retain(|row| {
+                let fb = fallback(row)?;
+                let pass = match d.key(row) {
+                    None => fb,
+                    Some(k) => {
+                        let k = k as usize;
+                        let t = match verdicts.get(k).copied().flatten() {
+                            Some(t) => t,
+                            None => {
+                                *tested += 1;
+                                let t = values
+                                    .entry(k)
+                                    .is_some_and(|e| contains_bytes(e, arm.needle))
+                                    != arm.negated;
+                                if let Some(slot) = verdicts.get_mut(k) {
+                                    *slot = Some(t);
+                                }
+                                t
+                            }
+                        };
+                        if t == fb || entry_texts.is_valid(values, k, validated) {
+                            t
+                        } else {
+                            fb
+                        }
+                    }
+                };
+                Ok(pass || elsewhere(row)?)
+            })
+        }
+    }
+}
+
+/// Whether `needle` occurs in `hay` as a contiguous run of bytes. An empty
+/// needle occurs in every value.
+fn contains_bytes(hay: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// A `Contains` arm's verdict on stream `stream_ref`'s value for `key`: its
+/// resource or scope `Str` value contains `needle`, flipped when `negated`.
+/// `false` when the stream has no `Str` value for `key`, a NULL neither
+/// `LIKE` nor `NOT LIKE` keeps. A ref past the STREAM_DIR is the same
+/// `Corrupted` error [`rebuild_record`] gives.
+fn stream_contains(
+    stream_dir: &StreamDir,
+    stream_ref: u32,
+    key: &str,
+    needle: &[u8],
+    negated: bool,
+) -> Result<bool, LogSegError> {
+    let entry = stream_dir
+        .entries()
+        .get(stream_ref as usize)
+        .ok_or_else(|| LogSegError::Corrupted("stream_ref out of range".into()))?;
+    let value = stream_attr_pairs(&entry.blob)?
+        .into_iter()
+        .filter(|(_, v)| !matches!(v, AttrValue::List(_) | AttrValue::Map(_)))
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v);
+    Ok(match value {
+        Some(AttrValue::Str(s)) => contains_bytes(s.as_bytes(), needle) != negated,
+        _ => false,
+    })
+}
+
+/// Whether row `row` has a present cell for `key` in one of the columns
+/// `others`, or an `attrs_raw` entry for it: a reading other than the `Str`
+/// cell and the stream value, which a `Contains` arm never drops.
+fn resolved_elsewhere(
+    block: &DecodedBlock,
+    others: &[(u32, FieldType)],
+    key: &str,
+    row: usize,
+) -> Result<bool, LogSegError> {
+    if others
+        .iter()
+        .any(|&(col, ty)| get_attr_value(block, col, ty, row).is_some())
+    {
+        return Ok(true);
+    }
+    Ok(overflow_attr(block, row, key)?.is_some())
+}
+
+/// Clears from `sel` the rows of an integer column whose value fails `keep`,
+/// 64 rows to a word. An absent cell never matches; with `strict` naming the
+/// column, an absent cell on a selected row is an error instead.
+fn i64_kernel(
+    col: Option<&I64Column>,
+    strict: Option<u32>,
+    sel: &mut RowSelection,
+    keep: impl Fn(i64) -> bool,
+) -> Result<(), LogSegError> {
+    let Some(col) = col else {
+        return match strict {
+            Some(id) => sel.reject_all_or(missing_i64(id)),
+            None => {
+                sel.clear();
+                Ok(())
+            }
+        };
+    };
+    let values = col.values();
+    let validity = col.validity();
+    for (wi, word) in sel.words.iter_mut().enumerate() {
+        if *word == 0 {
+            continue;
+        }
+        let start = wi * 64;
+        let chunk = values.get(start..).unwrap_or(&[]);
+        let chunk = &chunk[..chunk.len().min(64)];
+        let valid = validity_word(validity, wi) & low_bits(chunk.len());
+        if let Some(id) = strict
+            && *word & !valid != 0
+        {
+            return Err(missing_i64(id));
+        }
+        let mut hit = 0u64;
+        for (j, &v) in chunk.iter().enumerate() {
+            hit |= u64::from(keep(v)) << j;
+        }
+        *word &= hit & valid;
+    }
+    Ok(())
+}
+
+/// Bits `[64 * wi, 64 * wi + 64)` of an LSB-first validity bitmap; all set
+/// when there is no bitmap.
+fn validity_word(validity: Option<&[u8]>, wi: usize) -> u64 {
+    let Some(bits) = validity else {
+        return u64::MAX;
+    };
+    let mut word = [0u8; 8];
+    if let Some(src) = bits.get(wi * 8..) {
+        let n = src.len().min(8);
+        word[..n].copy_from_slice(&src[..n]);
+    }
+    u64::from_le_bytes(word)
+}
+
+/// A word with its low `n` bits set, `n <= 64`.
+fn low_bits(n: usize) -> u64 {
+    if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+}
+
+/// The rows of one block still selected, one bit per row.
+struct RowSelection {
+    words: Vec<u64>,
+}
+
+impl RowSelection {
+    fn all(n: usize) -> Self {
+        let mut words = vec![u64::MAX; n.div_ceil(64)];
+        if let Some(last) = words.last_mut() {
+            *last = low_bits(n - (n.div_ceil(64) - 1) * 64);
+        }
+        RowSelection { words }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.words.iter().all(|&w| w == 0)
+    }
+
+    fn clear(&mut self) {
+        self.words.iter_mut().for_each(|w| *w = 0);
+    }
+
+    /// Clears every row, or returns `err` when any row is still selected:
+    /// for a column every selected row must have.
+    fn reject_all_or(&mut self, err: LogSegError) -> Result<(), LogSegError> {
+        if self.is_empty() { Ok(()) } else { Err(err) }
+    }
+
+    /// Keeps the selected rows `keep` accepts, visiting them in row order.
+    fn retain(
+        &mut self,
+        mut keep: impl FnMut(usize) -> Result<bool, LogSegError>,
+    ) -> Result<(), LogSegError> {
+        for (wi, word) in self.words.iter_mut().enumerate() {
+            let mut rest = *word;
+            while rest != 0 {
+                let bit = rest.trailing_zeros();
+                rest &= rest - 1;
+                if !keep(wi * 64 + bit as usize)? {
+                    *word &= !(1u64 << bit);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn extend_rows(&self, out: &mut Vec<usize>) {
+        for (wi, &word) in self.words.iter().enumerate() {
+            let mut rest = word;
+            while rest != 0 {
+                out.push(wi * 64 + rest.trailing_zeros() as usize);
+                rest &= rest - 1;
+            }
+        }
+    }
+}
+
+// --- exact evaluation -------------------------------------------------------
+
+/// Evaluate the exact filter against one decoded row.
+///
+/// Free rather than a [`RlogReader`] method because [`BlockScan`] evaluates the
+/// same predicate without holding a reader: both need only the two directories.
+/// The scan reaches it only for an overflow arm ([`block_survivors`]); the
+/// whole-predicate form is the row-by-row oracle the block kernels are tested
+/// against.
+fn eval(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    pred: &Predicate,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<bool, LogSegError> {
+    #[cfg(test)]
+    EVAL_CALLS.with(|c| c.set(c.get() + 1));
+    Ok(match pred {
+        Predicate::And(v) => {
+            for p in v {
+                if !eval(stream_dir, field_dir, p, block, row)? {
+                    return Ok(false);
+                }
+            }
+            true
+        }
+        Predicate::TsRange { min_ns, max_ns } => {
+            let ts = i64_at(block, COL_TS, row)?;
+            ts >= *min_ns && ts <= *max_ns
+        }
+        Predicate::StreamIn(ids) => {
+            let r = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            match stream_dir.stream_id(r) {
+                Some(sid) => ids.contains(sid),
+                None => false,
+            }
+        }
+        Predicate::HasWord { field, word } => {
+            let value = field_text(field_dir, field, block, row)?;
+            match value {
+                Some(bytes) => phrase_match(&bytes, word),
+                None => false,
+            }
+        }
+        Predicate::Equals { field, value } => equals(field_dir, field, value, block, row)?,
+        Predicate::Contains {
+            key,
+            needle,
+            negated,
+        } => {
+            let needle = needle.as_bytes();
+            let r = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
+                .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+            let stream = stream_contains(stream_dir, r, key, needle, *negated)?;
+            let cell = field_dir
+                .column(key, FieldType::Str)
+                .and_then(|e| block.str_at(e.column_id, row))
+                .filter(|c| std::str::from_utf8(c).is_ok());
+            let pass = match cell {
+                Some(c) => contains_bytes(c, needle) != *negated,
+                None => stream,
+            };
+            pass || field_dir.entries().iter().any(|e| {
+                e.name == *key
+                    && e.ty != FieldType::Str
+                    && get_attr_value(block, e.column_id, e.ty, row).is_some()
+            }) || overflow_attr(block, row, key)?.is_some()
+        }
+        // `NumRange` is prune-only (ADR-0095 decision 6): it drives block
+        // pruning through `scan_blocks`'s `prune` channel and is never an exact
+        // per-row filter. Reaching exact evaluation means the caller wired it
+        // into `content`; it matches every row (a no-op) rather than filtering,
+        // and the caller re-evaluates the real, exactly-typed range above the
+        // scan.
+        Predicate::NumRange { .. } => true,
+    })
+}
+
+/// The tokenizable text of a field for a row, if present.
+fn field_text(
+    field_dir: &FieldDir,
+    field: &FieldSel,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<Option<Vec<u8>>, LogSegError> {
+    Ok(match field {
+        FieldSel::Body => str_at(block, COL_BODY, row),
+        FieldSel::SeverityText => str_at(block, COL_SEVERITY_TEXT, row),
+        FieldSel::Attr(name) => {
+            match field_dir.column(name, FieldType::Str) {
+                Some(e) => str_at(block, e.column_id, row),
+                // Fall back to an overflow attr of type Str.
+                None => overflow_attr(block, row, name)?.and_then(|v| match v {
+                    AttrValue::Str(s) => Some(s.into_bytes()),
+                    _ => None,
+                }),
+            }
+        }
+    })
+}
+
+fn equals(
+    field_dir: &FieldDir,
+    field: &FieldSel,
+    value: &AttrValue,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<bool, LogSegError> {
+    match field {
+        FieldSel::Body | FieldSel::SeverityText => {
+            let col = if matches!(field, FieldSel::Body) {
+                COL_BODY
+            } else {
+                COL_SEVERITY_TEXT
+            };
+            let stored = str_at(block, col, row);
+            Ok(match (value, stored) {
+                (AttrValue::Str(s), Some(b)) => s.as_bytes() == b.as_slice(),
+                _ => false,
+            })
+        }
+        FieldSel::Attr(name) => {
+            let (ty, _) = resolve_value(value);
+            if let Some(entry) = field_dir.column(name, ty) {
+                Ok(attr_equals(block, entry.column_id, ty, value, row))
+            } else {
+                // Overflow: compare against the decoded attrs_raw value.
+                Ok(overflow_attr(block, row, name)?
+                    .as_ref()
+                    .is_some_and(|v| attr_value_eq(v, value)))
+            }
+        }
+    }
+}
+
+/// Looks up an attribute by name in a row's decoded `attrs_raw`, if any.
+fn overflow_attr(
+    block: &DecodedBlock,
+    row: usize,
+    name: &str,
+) -> Result<Option<AttrValue>, LogSegError> {
+    let raw = match block.str_at(crate::record::COL_ATTRS_RAW, row) {
+        Some(bytes) => bytes,
+        None => return Ok(None),
+    };
+    let attrs = decode_canonical_attrs(raw)?;
+    Ok(attrs.into_iter().find(|(k, _)| k == name).map(|(_, v)| v))
+}
+
+/// The column plans for every dynamic column, for block decode. Shared by the
+/// whole-object [`RlogReader`] and the ranged [`crate::ranged::RlogRangeReader`]
+/// so both decode blocks through one column-plan derivation.
+pub(crate) fn column_plans(field_dir: &FieldDir) -> Vec<ColumnPlan> {
+    field_dir
+        .entries()
+        .iter()
+        .map(|e| ColumnPlan {
+            column_id: e.column_id,
+            ty: e.ty,
+        })
+        .collect()
+}
+
+/// Rebuilds a full [`LogRecord`] from a decoded row, given the object's
+/// STREAM_DIR and FIELD_DIR. Shared by the whole-object [`RlogReader`] and the
+/// ranged [`crate::ranged::RlogRangeReader`], so a record decoded through a
+/// selective block fetch is byte-for-byte the record the whole-object reader
+/// would produce.
+pub(crate) fn rebuild_record(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    block: &DecodedBlock,
+    row: usize,
+) -> Result<LogRecord, LogSegError> {
+    rebuild_record_projected(stream_dir, field_dir, block, row, true)
+}
+
+/// [`rebuild_record`] over a possibly column-projected block.
+///
+/// `strict` is the all-columns contract: every fixed numeric column must be
+/// present, and its absence is a `Corrupted` error, because for an unprojected
+/// decode absence really does mean the block is malformed. Under a projection
+/// (`strict == false`) an undecoded fixed numeric column is expected, so it
+/// reads as `0` rather than erroring -- the caller asked not to decode it and
+/// must not read the field. `ts` and `stream_ref` are exempt: a
+/// [`ColumnSelection`](crate::ColumnSelection) always keeps them, so their
+/// absence is a real corruption under either mode and still errors.
+///
+/// String and fixed-width columns need no mode: they are `Option` at the block
+/// level already, so an undecoded one reads as empty/`None` exactly as an
+/// absent one does.
+pub(crate) fn rebuild_record_projected(
+    stream_dir: &StreamDir,
+    field_dir: &FieldDir,
+    block: &DecodedBlock,
+    row: usize,
+    strict: bool,
+) -> Result<LogRecord, LogSegError> {
+    let sref = u32::try_from(i64_at(block, COL_STREAM_REF, row)?)
+        .map_err(|_| LogSegError::Corrupted("stream_ref range".into()))?;
+    // The STREAM_DIR entry carries both the stream id and the canonical
+    // resource+scope blob it was derived from, so a rebuilt record is a
+    // faithful round-trip of what the writer was handed.
+    let stream_entry = stream_dir
+        .entries()
+        .get(sref as usize)
+        .ok_or_else(|| LogSegError::Corrupted("stream_ref out of range".into()))?;
+    let stream_id = stream_entry.stream_id;
+    let stream_attrs = stream_entry.blob.clone();
+    let severity_text = str_at(block, COL_SEVERITY_TEXT, row)
+        .map(string_from_bytes)
+        .transpose()?
+        .unwrap_or_default();
+    let body = str_at(block, COL_BODY, row)
+        .map(string_from_bytes)
+        .transpose()?
+        .unwrap_or_default();
+    let trace_id = fixed_at(block, COL_TRACE_ID, row)
+        .map(|v| <[u8; 16]>::try_from(v.as_slice()))
+        .transpose()
+        .map_err(|_| LogSegError::Corrupted("trace_id width".into()))?;
+    let span_id = fixed_at(block, COL_SPAN_ID, row)
+        .map(|v| <[u8; 8]>::try_from(v.as_slice()))
+        .transpose()
+        .map_err(|_| LogSegError::Corrupted("span_id width".into()))?;
+
+    let mut attrs = Vec::new();
+    for e in field_dir.entries() {
+        if let Some(v) = get_attr_value(block, e.column_id, e.ty, row) {
+            attrs.push((e.name.clone(), v));
+        }
+    }
+    if let Some(raw) = block.str_at(crate::record::COL_ATTRS_RAW, row) {
+        attrs.extend(decode_canonical_attrs(raw)?);
+    }
+
+    Ok(LogRecord {
+        stream_id,
+        stream_attrs,
+        ts_ns: i64_at(block, COL_TS, row)?,
+        observed_ts_ns: i64_projected(block, COL_OBSERVED_TS, row, strict)?,
+        severity_num: i64_projected(block, COL_SEVERITY_NUM, row, strict)? as u8,
+        severity_text,
+        body,
+        trace_id,
+        span_id,
+        flags: i64_projected(block, COL_FLAGS, row, strict)? as u32,
+        attrs,
+    })
+}
+
+/// A fixed numeric column's value, or `0` when the column was projected away.
+/// Under `strict` (an all-columns decode) an absent column is corruption and
+/// errors, exactly as before column projection existed.
+fn i64_projected(
+    block: &DecodedBlock,
+    col: u32,
+    row: usize,
+    strict: bool,
+) -> Result<i64, LogSegError> {
+    match block.i64_column(col) {
+        Some(_) => i64_at(block, col, row),
+        None if strict => i64_at(block, col, row),
+        None => Ok(0),
+    }
+}
+
+fn section(footer: &LogFooter, k: u32) -> Result<&SectionDesc, LogSegError> {
+    footer
+        .section(k)
+        .ok_or_else(|| LogSegError::Corrupted(format!("missing section {k}")))
+}
+
+/// Reads and decompresses a whole-read section, verifying its crc first.
+///
+/// This is the section-access path for the whole-read sections STREAM_DIR,
+/// FIELD_DIR, and SKIP_IDX (docs/log-segment-format.md): slice the section's
+/// stored bytes from `desc`, verify `crc32c` against `desc.crc32c`, reject an
+/// `uncomp_len` over `cfg.max_uncomp_section`, then zstd-decompress or pass the
+/// raw bytes through, checking the result is exactly `desc.uncomp_len` long.
+/// BLOCKS has its own per-block access path and never routes through here. A
+/// scan reads BLOOM through its stored bytes and per-entry crcs so a damaged
+/// section degrades instead of refusing; the `ravel-cli` inspector reads BLOOM
+/// through here on purpose, so that it refuses damage a query is allowed to
+/// survive.
+///
+/// Exposed so tools (the `ravel-cli` inspector) can reconstruct a section from
+/// its public [`SectionDesc`] without reimplementing the crc-and-decompress
+/// discipline. In this crate, [`RlogReader::new`] and the bloom coverage tests
+/// call it.
+pub fn read_section(
+    bytes: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+) -> Result<Vec<u8>, LogSegError> {
+    read_section_from(bytes, desc, cfg)
+}
+
+/// [`read_section`] over any [`ByteSource`].
+pub fn read_section_from<S: ByteSource + ?Sized>(
+    source: &S,
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+) -> Result<Vec<u8>, LogSegError> {
+    decode_section(
+        &source_extent(source, desc.offset, desc.len, "section")?,
+        desc,
+        cfg,
+    )
+}
+
+/// [`read_section`], additionally charging the bytes zstd produced to
+/// `accounting` (issue #1401 finding 3), the same way
+/// [`decode_section_accounted`] does for a caller that has already sliced the
+/// section's stored bytes out of an assembled buffer.
+pub fn read_section_accounted(
+    bytes: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    read_section_accounted_from(bytes, desc, cfg, accounting)
+}
+
+/// [`read_section_accounted`] over any [`ByteSource`].
+pub fn read_section_accounted_from<S: ByteSource + ?Sized>(
+    source: &S,
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    decode_section_accounted(
+        &source_extent(source, desc.offset, desc.len, "section")?,
+        desc,
+        cfg,
+        accounting,
+    )
+}
+
+/// The crc-and-decompress half of [`read_section`], taking a section's stored
+/// bytes directly (offset 0) rather than slicing them out of a whole object.
+///
+/// This is what a ranged reader ([`crate::ranged::RlogRangeReader`]) uses: it
+/// fetches exactly `[desc.offset, desc.offset + desc.len)` with a ranged GET,
+/// so the fetched buffer *is* the stored section, and passes it here. `stored`
+/// MUST be exactly `desc.len` bytes. The crc is verified against `desc.crc32c`
+/// before any decompression, the `uncomp_len` is rejected above
+/// `cfg.max_uncomp_section` before allocating, and the decompressed length must
+/// equal `desc.uncomp_len` exactly (the same discipline [`read_section`]
+/// applies to a whole-object slice).
+pub fn decode_section(
+    stored: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+) -> Result<Vec<u8>, LogSegError> {
+    if stored.len() as u64 != desc.len {
+        return Err(LogSegError::Corrupted(
+            "section stored length != desc.len".into(),
+        ));
+    }
+    if crc32c::crc32c(stored) != desc.crc32c {
+        return Err(LogSegError::Corrupted("section crc mismatch".into()));
+    }
+    if desc.uncomp_len > cfg.max_uncomp_section {
+        return Err(LogSegError::Corrupted("section uncomp_len over cap".into()));
+    }
+    if desc.comp == COMP_ZSTD {
+        let raw = zstd::bulk::decompress(stored, desc.uncomp_len as usize)
+            .map_err(|e| LogSegError::Corrupted(format!("section zstd: {e}")))?;
+        if raw.len() as u64 != desc.uncomp_len {
+            return Err(LogSegError::Corrupted("section decompressed length".into()));
+        }
+        Ok(raw)
+    } else {
+        if stored.len() as u64 != desc.uncomp_len {
+            return Err(LogSegError::Corrupted(
+                "raw section length != uncomp_len".into(),
+            ));
+        }
+        Ok(stored.to_vec())
+    }
+}
+
+/// Bytes zstd produced decoding one section: the produced buffer's own length
+/// for a `COMP_ZSTD` section, zero for one stored raw (nothing was
+/// decompressed). Used both by [`RlogReader::new`] for the directory sections
+/// it opens and by [`decode_section_accounted`] (issue #1401).
+fn section_decompressed_len(desc: &SectionDesc, produced: &[u8]) -> u64 {
+    if desc.comp == COMP_ZSTD {
+        produced.len() as u64
+    } else {
+        0
+    }
+}
+
+/// [`decode_section`], additionally charging the bytes zstd produced to
+/// `accounting` (issue #1401).
+///
+/// The charge is the returned buffer's actual length, not `desc.uncomp_len`,
+/// for a `COMP_ZSTD` section, and nothing for a raw section (which was copied,
+/// not decompressed). `decode_section` has already checked the two are equal for
+/// a valid section, so a short or corrupt frame is charged as what it produced
+/// only in the error paths it also rejects. Callers pass the phase handle for
+/// the phase the read belongs to (`PhaseAccounting::scan`/`plan`), the same way
+/// the surrounding fetch already charges its GET requests and bytes.
+pub fn decode_section_accounted(
+    stored: &[u8],
+    desc: &SectionDesc,
+    cfg: &RlogConfig,
+    accounting: &ravel_types::accounting::QueryAccounting,
+) -> Result<Vec<u8>, LogSegError> {
+    let produced = decode_section(stored, desc, cfg)?;
+    accounting.add_decompressed_bytes(section_decompressed_len(desc, &produced));
+    Ok(produced)
+}
+
+fn flatten<'p>(pred: &'p Predicate, out: &mut Vec<&'p Predicate>) {
+    match pred {
+        Predicate::And(v) => {
+            for p in v {
+                flatten(p, out);
+            }
+        }
+        other => out.push(other),
+    }
+}
+
+pub(crate) fn i64_at(block: &DecodedBlock, col: u32, row: usize) -> Result<i64, LogSegError> {
+    block
+        .i64_column(col)
+        .and_then(|c| c.get(row))
+        .ok_or_else(|| LogSegError::Corrupted(format!("missing i64 col {col}")))
+}
+
+fn str_at(block: &DecodedBlock, col: u32, row: usize) -> Option<Vec<u8>> {
+    block.str_at(col, row).map(<[u8]>::to_vec)
+}
+
+fn fixed_at(block: &DecodedBlock, col: u32, row: usize) -> Option<Vec<u8>> {
+    block
+        .fixed_col(col)
+        .and_then(|c| c.get(row).cloned())
+        .flatten()
+}
+
+fn string_from_bytes(bytes: Vec<u8>) -> Result<String, LogSegError> {
+    String::from_utf8(bytes).map_err(|_| LogSegError::Corrupted("value not utf-8".into()))
+}
+
+/// The `AttrValue` for a dynamic column at a row, if present.
+fn get_attr_value(block: &DecodedBlock, cid: u32, ty: FieldType, row: usize) -> Option<AttrValue> {
+    match ty {
+        FieldType::Str => str_at(block, cid, row)
+            .and_then(|b| String::from_utf8(b).ok())
+            .map(AttrValue::Str),
+        FieldType::Bytes => str_at(block, cid, row).map(AttrValue::Bytes),
+        FieldType::I64 => block
+            .i64_column(cid)
+            .and_then(|c| c.get(row))
+            .map(AttrValue::I64),
+        FieldType::F64 => block
+            .f64_col(cid)
+            .and_then(|c| c.get(row).copied())
+            .flatten()
+            .map(|bits| AttrValue::F64(f64::from_bits(bits))),
+        FieldType::Bool => block
+            .bool_col(cid)
+            .and_then(|c| c.get(row).copied())
+            .flatten()
+            .map(AttrValue::Bool),
+    }
+}
+
+/// Compares a stored column value at a row against a query value (bit-exact for
+/// f64).
+fn attr_equals(
+    block: &DecodedBlock,
+    cid: u32,
+    ty: FieldType,
+    value: &AttrValue,
+    row: usize,
+) -> bool {
+    match get_attr_value(block, cid, ty, row) {
+        Some(stored) => attr_value_eq(&stored, value),
+        None => false,
+    }
+}
+
+/// Value equality that treats f64 by bit pattern (so -0.0 != 0.0 and NaN
+/// payloads compare exactly), and canonicalizes list/map on both sides.
+fn attr_value_eq(a: &AttrValue, b: &AttrValue) -> bool {
+    match (a, b) {
+        (AttrValue::F64(x), AttrValue::F64(y)) => x.to_bits() == y.to_bits(),
+        // A Bytes column stores a canonicalized list/map; compare a query
+        // list/map by its canonical bytes too.
+        (AttrValue::Bytes(x), other @ (AttrValue::List(_) | AttrValue::Map(_))) => {
+            *x == crate::record::canonical_value_bytes(other)
+        }
+        (other @ (AttrValue::List(_) | AttrValue::Map(_)), AttrValue::Bytes(y)) => {
+            crate::record::canonical_value_bytes(other) == *y
+        }
+        _ => a == b,
+    }
+}
+
+/// Phrase/word match: `word` tokenizes to one or more query tokens; a single
+/// token requires containment, multiple tokens require an in-order contiguous
+/// run in the tokenized value (docs/log-segment-format.md "Tokenizer").
+///
+/// `pub` so `ravel-sql`'s `has_word` UDF calls this directly instead of
+/// keeping its own copy: the pushed `Predicate::HasWord` filter here and the
+/// UDF re-applied above the scan must agree on every row for the pushdown to
+/// stay sound, and two independently maintained implementations can drift
+/// without either crate's own tests noticing.
+pub fn phrase_match(value: &[u8], word: &str) -> bool {
+    let query = tokens(word);
+    if query.is_empty() {
+        return true;
+    }
+    let text = match std::str::from_utf8(value) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let toks = tokens(text);
+    toks.windows(query.len()).any(|w| w == query.as_slice())
+}
+
+/// The resource and scope attribute `(name, value)` pairs a STREAM_DIR blob
+/// carries, in blob order (the resource set first, then the scope set). The
+/// blob layout is `canonical_attr_bytes(resource) || len+scope_name ||
+/// len+scope_version || canonical_attr_bytes(scope)` (see
+/// [`crate::record::stream_attrs_bytes`]); the two length-prefixed scope
+/// strings are positional, not key-value entries, so they are left out of the
+/// pairs.
+///
+/// Implemented on [`crate::record::decode_stream_attrs`], the reader's decoder,
+/// so it refuses exactly the blobs that function refuses, with the same
+/// [`LogSegError`] (a scope name or version that is not UTF-8 included). The
+/// writer validates every STREAM_DIR blob through this function, which is what
+/// keeps it from writing a blob a reader cannot decode.
+///
+/// Used by the writer's merged-view POSTINGS accumulation (to index the union
+/// of a record's stream and per-record attributes). Kept in this crate so the
+/// merge does not depend on `ravel-sql`
+/// (docs/adrs/0049-rlog-postings.md amendment 2026-08-03).
+///
+/// Public because the declared-column statistics producers resolve the same
+/// merged view: `ravel-ingest`'s flush fold and `ravel-maintain`'s compaction
+/// fold both need a stream's attributes to decide what a record that does not
+/// set a declared key reads. The blob grammar is frozen, so a second decoder
+/// elsewhere would be a copy that can drift from this one.
+pub fn stream_attr_pairs(blob: &[u8]) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    let crate::record::StreamAttrs {
+        resource: mut pairs,
+        scope_attrs,
+        ..
+    } = crate::record::decode_stream_attrs(blob)?;
+    pairs.extend(scope_attrs);
+    Ok(pairs)
+}
+
+/// Decodes canonical attribute bytes (the write-side [`canonical_attr_bytes`])
+/// back into attributes. Used for `attrs_raw` overflow.
+///
+/// Its bounds, applied to every attribute set and value it decodes:
+///
+/// * a map entry set nested inside more than [`ATTRS_RAW_MAP_DEPTH_CAP`] maps
+///   and lists, the map that holds it included, is refused;
+/// * a map or list nested inside [`ATTRS_RAW_READ_DEPTH_CAP`] maps and lists
+///   is refused before its entry count is read, so an empty one there is
+///   refused too; a scalar there is read;
+/// * an attribute set or list with more than
+///   [`crate::record::MAX_ATTR_ENTRIES`] entries is refused.
+///
+/// These are looser than the admission rule
+/// ([`crate::record::attr_value_fits_storage`]) because objects written under
+/// the older bound exist in storage and must stay readable and rewritable.
+/// The writer holds `attrs_raw` to these bounds and no others
+/// ([`check_attrs_raw_decodable`]).
+pub(crate) fn decode_canonical_attrs(
+    bytes: &[u8],
+) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    let mut pos = 0usize;
+    let out = decode_attr_set(bytes, &mut pos, 0)?;
+    if pos != bytes.len() {
+        return Err(LogSegError::Corrupted("attrs_raw trailing bytes".into()));
+    }
+    Ok(out)
+}
+
+/// The `attrs_raw` decoder's map bound: a map entry set nested inside more
+/// than this many maps and lists, the map that holds it included, is refused.
+/// This is the read-side bound every `attrs_raw` value was written under
+/// before the admission rule ([`crate::record::MAX_ATTR_DEPTH`], a separate
+/// constant with a stricter accounting) existed, so it must not tighten.
+const ATTRS_RAW_MAP_DEPTH_CAP: u32 = 32;
+
+/// The `attrs_raw` decoder's stack-safety bound: a map or list nested inside
+/// this many maps and lists is refused, before its entry count is read,
+/// instead of recursed into. It is above the 100 levels OTLP admission ever
+/// accepted, so no `attrs_raw` value admitted through OTLP reaches it. It is
+/// not the admission cap ([`crate::record::MAX_ATTR_DEPTH`]).
+const ATTRS_RAW_READ_DEPTH_CAP: u32 = 128;
+
+/// The error the `attrs_raw` decoder returns for nesting past its bounds,
+/// which the writer also returns when it refuses an overflow value nested
+/// past them.
+pub(crate) fn attrs_raw_too_deep() -> LogSegError {
+    LogSegError::Corrupted("attrs_raw too deep".into())
+}
+
+/// Refuses overflow attributes the `attrs_raw` decoder would refuse: `Ok`
+/// exactly when [`decode_canonical_attrs`] decodes
+/// `canonical_attr_bytes(attrs)`, and otherwise the error that decoder
+/// returns for the first refused value in `attrs` order (the encoding sorts
+/// entries, so with several refused values the decoder may name another).
+///
+/// It walks the values through the decoder's own checks, in the decoder's
+/// order, instead of encoding and decoding them. The decoder's other refusals
+/// (truncation, an unknown tag, a key or string that is not UTF-8, trailing
+/// bytes) cannot arise from encoding an [`AttrValue`]. Recursion stops at
+/// [`ATTRS_RAW_READ_DEPTH_CAP`], as the decoder's does.
+pub(crate) fn check_attrs_raw_decodable(attrs: &[(String, AttrValue)]) -> Result<(), LogSegError> {
+    check_attrs_raw_set(attrs, 0)
+}
+
+fn check_attrs_raw_set(attrs: &[(String, AttrValue)], depth: u32) -> Result<(), LogSegError> {
+    attrs_raw_set_depth(depth)?;
+    attrs_raw_set_count(attrs.len() as u64)?;
+    attrs
+        .iter()
+        .try_for_each(|(_, v)| check_attrs_raw_value(v, depth))
+}
+
+fn check_attrs_raw_value(value: &AttrValue, depth: u32) -> Result<(), LogSegError> {
+    match value {
+        AttrValue::List(items) => {
+            let inner = attrs_raw_inner_depth(depth)?;
+            attrs_raw_list_count(items.len() as u64)?;
+            items
+                .iter()
+                .try_for_each(|v| check_attrs_raw_value(v, inner))
+        }
+        AttrValue::Map(entries) => check_attrs_raw_set(entries, attrs_raw_inner_depth(depth)?),
+        _ => Ok(()),
+    }
+}
+
+/// The map bound for an attribute set at `depth`, the number of maps and
+/// lists enclosing it, the map that holds it included.
+fn attrs_raw_set_depth(depth: u32) -> Result<(), LogSegError> {
+    if depth > ATTRS_RAW_MAP_DEPTH_CAP {
+        return Err(attrs_raw_too_deep());
+    }
+    Ok(())
+}
+
+/// The entry cap for an attribute set of `count` entries.
+fn attrs_raw_set_count(count: u64) -> Result<(), LogSegError> {
+    if count > crate::record::MAX_ATTR_ENTRIES {
+        return Err(LogSegError::Corrupted("attrs_raw count over cap".into()));
+    }
+    Ok(())
+}
+
+/// The entry cap for a list of `n` elements.
+fn attrs_raw_list_count(n: u64) -> Result<(), LogSegError> {
+    if n > crate::record::MAX_ATTR_ENTRIES {
+        return Err(LogSegError::Corrupted("attr list over cap".into()));
+    }
+    Ok(())
+}
+
+/// `depth` is how many maps and lists enclose the set being decoded, the map
+/// that holds it included.
+fn decode_attr_set(
+    bytes: &[u8],
+    pos: &mut usize,
+    depth: u32,
+) -> Result<Vec<(String, AttrValue)>, LogSegError> {
+    attrs_raw_set_depth(depth)?;
+    use crate::varint::get_uvarint;
+    let count = get_uvarint(bytes, pos)?;
+    attrs_raw_set_count(count)?;
+    let mut out = Vec::with_capacity((count as usize).min(1 << 12));
+    for _ in 0..count {
+        let klen = usize::try_from(get_uvarint(bytes, pos)?)
+            .map_err(|_| LogSegError::Corrupted("attr key len".into()))?;
+        let kend = pos
+            .checked_add(klen)
+            .ok_or_else(|| LogSegError::Corrupted("attr key overflow".into()))?;
+        let kbytes = bytes
+            .get(*pos..kend)
+            .ok_or_else(|| LogSegError::Corrupted("attr key truncated".into()))?;
+        let key = std::str::from_utf8(kbytes)
+            .map_err(|_| LogSegError::Corrupted("attr key not utf-8".into()))?
+            .to_string();
+        *pos = kend;
+        let value = decode_attr_value(bytes, pos, depth)?;
+        out.push((key, value));
+    }
+    Ok(out)
+}
+
+/// The nesting level of a map's or list's contents, given `depth`, the number
+/// of maps and lists enclosing the map or list itself; past
+/// [`ATTRS_RAW_READ_DEPTH_CAP`] it is refused before any recursion.
+fn attrs_raw_inner_depth(depth: u32) -> Result<u32, LogSegError> {
+    let inner = depth.saturating_add(1);
+    if inner > ATTRS_RAW_READ_DEPTH_CAP {
+        return Err(attrs_raw_too_deep());
+    }
+    Ok(inner)
+}
+
+/// `depth` is how many maps and lists enclose the value being decoded.
+fn decode_attr_value(bytes: &[u8], pos: &mut usize, depth: u32) -> Result<AttrValue, LogSegError> {
+    use crate::varint::{get_uvarint, zigzag_decode};
+    let tag = *bytes
+        .get(*pos)
+        .ok_or_else(|| LogSegError::Corrupted("attr tag truncated".into()))?;
+    *pos += 1;
+    Ok(match tag {
+        1 => {
+            let len = usize::try_from(get_uvarint(bytes, pos)?)
+                .map_err(|_| LogSegError::Corrupted("attr str len".into()))?;
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| LogSegError::Corrupted("attr str overflow".into()))?;
+            let s = bytes
+                .get(*pos..end)
+                .ok_or_else(|| LogSegError::Corrupted("attr str truncated".into()))?;
+            let v = std::str::from_utf8(s)
+                .map_err(|_| LogSegError::Corrupted("attr str not utf-8".into()))?
+                .to_string();
+            *pos = end;
+            AttrValue::Str(v)
+        }
+        2 => AttrValue::I64(zigzag_decode(get_uvarint(bytes, pos)?)),
+        3 => {
+            let s = bytes
+                .get(*pos..*pos + 8)
+                .ok_or_else(|| LogSegError::Corrupted("attr f64 truncated".into()))?;
+            let mut a = [0u8; 8];
+            a.copy_from_slice(s);
+            *pos += 8;
+            AttrValue::F64(f64::from_bits(u64::from_le_bytes(a)))
+        }
+        4 => {
+            let b = *bytes
+                .get(*pos)
+                .ok_or_else(|| LogSegError::Corrupted("attr bool truncated".into()))?;
+            *pos += 1;
+            AttrValue::Bool(b != 0)
+        }
+        5 => {
+            let len = usize::try_from(get_uvarint(bytes, pos)?)
+                .map_err(|_| LogSegError::Corrupted("attr bytes len".into()))?;
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| LogSegError::Corrupted("attr bytes overflow".into()))?;
+            let b = bytes
+                .get(*pos..end)
+                .ok_or_else(|| LogSegError::Corrupted("attr bytes truncated".into()))?
+                .to_vec();
+            *pos = end;
+            AttrValue::Bytes(b)
+        }
+        6 => {
+            let inner = attrs_raw_inner_depth(depth)?;
+            let n = get_uvarint(bytes, pos)?;
+            attrs_raw_list_count(n)?;
+            let mut items = Vec::with_capacity((n as usize).min(1 << 12));
+            for _ in 0..n {
+                items.push(decode_attr_value(bytes, pos, inner)?);
+            }
+            AttrValue::List(items)
+        }
+        7 => AttrValue::Map(decode_attr_set(bytes, pos, attrs_raw_inner_depth(depth)?)?),
+        other => {
+            return Err(LogSegError::Corrupted(format!("attr tag {other}")));
+        }
+    })
+}
+
+/// A one-stream object of two row groups of four blocks, each group's `svc`
+/// chunk a dictionary over three long values of its own, for tests that count
+/// dictionary decodes on the scan and the ranged paths.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) mod dict_fixture {
+    use super::*;
+    use crate::encoding::Enc;
+    use crate::footer::open;
+    use crate::record::LogRecord;
+    use crate::writer::{ObjectIdentity, RlogWriter};
+    use ravel_types::logstream::LogStreamId;
+
+    pub(crate) const STREAM: LogStreamId = LogStreamId([5u8; 16]);
+
+    fn word(i: usize) -> String {
+        let mut x = 0x9E37_79B9u64.wrapping_mul(i as u64 + 1);
+        (0..24)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                char::from(b'a' + ((x >> 33) % 26) as u8)
+            })
+            .collect()
+    }
+
+    /// 32 records, four to a block and four blocks to a group.
+    pub(crate) fn two_group_object() -> (Vec<LogRecord>, Vec<u8>) {
+        let records: Vec<LogRecord> = (0..32usize)
+            .map(|i| LogRecord {
+                stream_id: STREAM,
+                stream_attrs: crate::record::stream_attrs_bytes(
+                    &[("service.name".into(), AttrValue::Str("svc".into()))],
+                    "scope",
+                    "1",
+                    &[],
+                ),
+                ts_ns: 1_000 + i as i64,
+                observed_ts_ns: 1_000 + i as i64,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "ok".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs: vec![(
+                    "svc".into(),
+                    AttrValue::Str(word(3 * (i / 16) + i % 3).repeat(8)),
+                )],
+            })
+            .collect();
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            group_target_blocks: 4,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [1u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut w = RlogWriter::new(cfg, identity);
+        for r in records.clone() {
+            w.push(r).expect("push");
+        }
+        (records, w.finish().expect("finish"))
+    }
+
+    pub(crate) fn page_dir(object: &[u8]) -> PageDir {
+        let footer = open(object).expect("open");
+        let desc = footer.section(kind::PAGE_DIR).expect("PAGE_DIR");
+        let raw = read_section(object, desc, &RlogConfig::default()).expect("PAGE_DIR bytes");
+        PageDir::decode(&raw).expect("parse PAGE_DIR")
+    }
+
+    /// `(dictionary pages, block reads through one)` over the whole object:
+    /// one decode per chunk is the first figure, one per block the second.
+    pub(crate) fn dictionary_reads(object: &[u8]) -> (u64, u64) {
+        let dir = page_dir(object);
+        assert_eq!(dir.groups.len(), 2, "fixture must hold two row groups");
+        let mut pages = 0u64;
+        let mut per_block = 0u64;
+        for group in &dir.groups {
+            assert_eq!(group.block_count, 4, "fixture groups hold four blocks");
+            let mut zstd_dicts = 0;
+            for c in &group.chunks {
+                if let Some(dict) = c.dict_page() {
+                    pages += 1;
+                    per_block += u64::from(group.block_count);
+                    zstd_dicts += u32::from(dict.comp == COMP_ZSTD);
+                }
+            }
+            assert!(
+                zstd_dicts > 0,
+                "every group must carry a zstd dictionary, or the byte charge proves nothing"
+            );
+        }
+        (pages, per_block)
+    }
+
+    /// `(pages, zstd decompressed bytes)` a whole-object read charges with
+    /// every dictionary page charged once per block that reads through it.
+    pub(crate) fn per_block_charges(object: &[u8]) -> (u64, u64) {
+        let mut pages = 0u64;
+        let mut bytes = 0u64;
+        for chunk in page_dir(object).groups.iter().flat_map(|g| &g.chunks) {
+            let mut blocks: Vec<u32> = chunk.pages.iter().map(|p| p.block).collect();
+            blocks.dedup();
+            let readers = blocks.len() as u64 - u64::from(chunk.dict_page().is_some());
+            for p in &chunk.pages {
+                let times = if p.enc == Enc::DictPage { readers } else { 1 };
+                pages += times;
+                if p.comp == COMP_ZSTD {
+                    bytes += p.uncomp_len * times;
+                }
+            }
+        }
+        (pages, bytes)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use crate::footer::open;
+    use crate::record::LogRecord;
+    use crate::writer::{ObjectIdentity, RlogWriter};
+    use ravel_types::accounting::QueryAccounting;
+    use ravel_types::logstream::{AttrValue, LogStreamId};
+
+    fn identity() -> ObjectIdentity {
+        ObjectIdentity {
+            tenant_hash: [0u8; 16],
+            shard: 0,
+            writer_id: [0u8; 16],
+            writer_epoch: 0,
+            writer_seq: 0,
+        }
+    }
+
+    fn sid(n: u8) -> LogStreamId {
+        let mut a = [0u8; 16];
+        a[0] = n;
+        LogStreamId(a)
+    }
+
+    fn rec(stream: u8, ts: i64, body: &str) -> LogRecord {
+        LogRecord {
+            stream_id: sid(stream),
+            stream_attrs: crate::record::stream_attrs_bytes(
+                &[(
+                    "service.name".into(),
+                    AttrValue::Str(format!("svc{stream}")),
+                )],
+                "scope",
+                "1",
+                &[],
+            ),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: body.into(),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        }
+    }
+
+    fn build(cfg: RlogConfig, recs: Vec<LogRecord>) -> Vec<u8> {
+        let mut w = RlogWriter::new(cfg, identity());
+        for r in recs {
+            w.push(r).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    /// The on-object stored bytes of a section (`[offset, offset+len)`).
+    fn section_stored<'a>(obj: &'a [u8], desc: &SectionDesc) -> &'a [u8] {
+        let start = desc.offset as usize;
+        &obj[start..start + desc.len as usize]
+    }
+
+    /// An object whose directory sections AND block pages clear the writer's
+    /// compression floor and are stored `COMP_ZSTD`, so decoding either produces
+    /// strictly more bytes than it read: 200 distinct streams (a distinct
+    /// `service.name` each), each with a long, highly compressible body so its
+    /// `body` page is well over the 512-byte page floor and zstd-encoded.
+    fn object_with_zstd_dirs() -> Vec<u8> {
+        let cfg = RlogConfig::default();
+        let body = "log message body ".repeat(200);
+        let mut recs = Vec::new();
+        for s in 0..200u8 {
+            recs.push(rec(s, i64::from(s), &body));
+        }
+        build(cfg, recs)
+    }
+
+    /// A section descriptor of `kind`, asserted to be zstd-compressed so its
+    /// `uncomp_len` is the exact byte count one decode produces. (The writer
+    /// stores every whole-read directory section `COMP_ZSTD` unconditionally, so
+    /// this holds for any object; `uncomp_len` may be below `len` for a tiny
+    /// section zstd could not shrink, which does not change what one decode
+    /// produces.)
+    fn zstd_section(obj: &[u8], k: u32) -> SectionDesc {
+        let footer = open(obj).expect("open");
+        let desc = *footer.section(k).expect("section present");
+        assert_eq!(
+            desc.comp, COMP_ZSTD,
+            "fixture section {k} must be zstd-compressed for this test"
+        );
+        desc
+    }
+
+    /// One `decode_section_accounted` charges exactly the section's `uncomp_len`
+    /// (the bytes zstd produced), and N calls charge exactly N times it. The
+    /// pre-fix `decode_section` charged nothing, so this reads 0 there; the
+    /// flipped line is the `add_decompressed_bytes` call in
+    /// `decode_section_accounted` (issue #1401).
+    #[test]
+    fn decode_section_accounted_charges_uncomp_len_per_read() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let desc = zstd_section(&obj, kind::STREAM_DIR);
+        let stored = section_stored(&obj, &desc);
+        let acct = QueryAccounting::new();
+
+        let raw = decode_section_accounted(stored, &desc, &cfg, &acct).expect("decode");
+        assert_eq!(
+            raw.len() as u64,
+            desc.uncomp_len,
+            "decode produces uncomp_len"
+        );
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            desc.uncomp_len,
+            "one section read charges exactly the section's uncomp_len"
+        );
+
+        // Four more reads: the counter is exactly five times the section.
+        for _ in 0..4 {
+            decode_section_accounted(stored, &desc, &cfg, &acct).expect("decode");
+        }
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            desc.uncomp_len * 5,
+            "N reads charge exactly N times the section's uncomp_len"
+        );
+    }
+
+    /// Two sections of DIFFERENT uncompressed size sum to the byte, so a counter
+    /// that charged the wrong section, `desc.len` instead of `uncomp_len`, or
+    /// double-charged one would miss the exact total (issue #1401).
+    #[test]
+    fn decode_section_accounted_sums_two_distinct_sections() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let stream_desc = zstd_section(&obj, kind::STREAM_DIR);
+        let field_desc = zstd_section(&obj, kind::FIELD_DIR);
+        assert_ne!(
+            stream_desc.uncomp_len, field_desc.uncomp_len,
+            "the two sections must differ in uncompressed size for this test"
+        );
+        let acct = QueryAccounting::new();
+        decode_section_accounted(
+            section_stored(&obj, &stream_desc),
+            &stream_desc,
+            &cfg,
+            &acct,
+        )
+        .expect("decode stream_dir");
+        decode_section_accounted(section_stored(&obj, &field_desc), &field_desc, &cfg, &acct)
+            .expect("decode field_dir");
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            stream_desc.uncomp_len + field_desc.uncomp_len,
+            "two distinct sections sum to the byte"
+        );
+    }
+
+    /// A raw (`COMP_NONE`) section decodes without decompression, so it charges
+    /// nothing: the counter is bytes zstd PRODUCED, not bytes copied. The writer
+    /// always zstd-compresses whole-read sections, so this synthesizes a raw
+    /// section descriptor (the shape `decode_section`'s `COMP_NONE` branch and a
+    /// ranged reader over an uncompressed section both accept).
+    #[test]
+    fn decode_section_accounted_charges_nothing_for_raw_section() {
+        let cfg = RlogConfig::default();
+        let payload = b"an uncompressed section body".to_vec();
+        let desc = SectionDesc {
+            kind: kind::STREAM_DIR,
+            offset: 0,
+            len: payload.len() as u64,
+            crc32c: crc32c::crc32c(&payload),
+            comp: crate::footer::COMP_NONE,
+            uncomp_len: payload.len() as u64,
+            prefix_len: 0,
+        };
+        let acct = QueryAccounting::new();
+        let raw = decode_section_accounted(&payload, &desc, &cfg, &acct).expect("decode raw");
+        assert_eq!(raw, payload, "a raw section decodes to its own bytes");
+        assert_eq!(
+            acct.snapshot().decompressed_bytes,
+            0,
+            "a raw section was copied, not decompressed, so it charges nothing"
+        );
+    }
+
+    /// A whole-object scan's `ScanStats.decompressed_bytes` is the object's
+    /// zstd directory total plus every zstd block page it decodes, and it grows
+    /// only as blocks are drained: opening the reader seeds the directory total,
+    /// each `next_block` adds that block's produced page bytes. A second scan of
+    /// the same reader reports the same figure, proving the seed is per-scan and
+    /// not accumulated across scans (issue #1401).
+    #[test]
+    fn scan_stats_decompressed_bytes_covers_open_and_pages() {
+        let obj = object_with_zstd_dirs();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // The seed equals the sum of the object's zstd directory sections.
+        let footer = open(&obj).expect("open");
+        let mut open_total = 0u64;
+        for k in [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ] {
+            let desc = *footer.section(k).expect("section");
+            if desc.comp == COMP_ZSTD {
+                open_total += desc.uncomp_len;
+            }
+        }
+        assert!(
+            open_total > 0,
+            "fixture must have at least one zstd directory"
+        );
+
+        // Independent reference for the page total below (issue #1401 finding
+        // 4): every page PAGE_DIR lists, across every group and chunk, summed
+        // by its own `uncomp_len` when it is stored COMP_ZSTD and contributing
+        // nothing when it is raw -- read straight from the directory rather
+        // than through `decode_v4_block`'s own counters, and gated on each
+        // page's own `comp` field rather than assumed, so a charge that only
+        // covers the first page of each block (which would still clear a bare
+        // `> open_total` bound) is caught by the sum falling short.
+        let page_desc = *footer.section(kind::PAGE_DIR).expect("PAGE_DIR section");
+        let page_dir_raw = read_section(&obj, &page_desc, &cfg).expect("decode PAGE_DIR");
+        let page_dir = PageDir::decode(&page_dir_raw).expect("parse PAGE_DIR");
+        let mut page_total = 0u64;
+        for group in &page_dir.groups {
+            for chunk in &group.chunks {
+                for page in &chunk.pages {
+                    if page.comp == COMP_ZSTD {
+                        page_total += page.uncomp_len;
+                    }
+                }
+            }
+        }
+        assert!(page_total > 0, "fixture must decode at least one zstd page");
+
+        let mut cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        // Before any block is decoded the figure is exactly the open-time total.
+        assert_eq!(cursor.stats().decompressed_bytes, open_total);
+        while cursor.next_block(&obj).expect("next").is_some() {}
+        let total = cursor.stats().decompressed_bytes;
+        assert_eq!(
+            total,
+            open_total + page_total,
+            "draining every block adds exactly the zstd pages PAGE_DIR lists, \
+             on top of the open total"
+        );
+
+        // A second, independent scan reports the identical figure: the seed is
+        // per-scan, not accumulated onto the reader.
+        let mut again = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+        while again.next_block(&obj).expect("next").is_some() {}
+        assert_eq!(
+            again.stats().decompressed_bytes,
+            total,
+            "a re-scan of the same reader charges the same, not double"
+        );
+    }
+
+    /// A scan over two row groups of four blocks decodes each dictionary page
+    /// once per chunk, not once per block, and still returns every record in
+    /// order. The scan's stats still charge each block for the dictionary it
+    /// reads through, so they match a per-block decode exactly.
+    ///
+    /// Wrong implementations this rules out, each shown failing: no cache (a
+    /// decode per block); a cache cleared before every block; a reused
+    /// dictionary left out of `pages_decoded` or of `decompressed_bytes`. It
+    /// does not pin the cache's residency: a cache that never empties on a
+    /// group change passes it too, since each group has one chunk per column.
+    #[test]
+    fn scan_decodes_each_dictionary_page_once_per_chunk() {
+        let (records, object) = dict_fixture::two_group_object();
+        let (dict_pages, per_block) = dict_fixture::dictionary_reads(&object);
+        assert!(per_block > dict_pages, "{per_block} vs {dict_pages}");
+        let (charged_pages, charged_bytes) = dict_fixture::per_block_charges(&object);
+
+        let reader = RlogReader::new(&object, &RlogConfig::default()).expect("open");
+        // No block survives this range, so the scan's decompressed bytes are
+        // the directories alone.
+        let (none, dirs) = reader
+            .scan(&Predicate::TsRange {
+                min_ns: 0,
+                max_ns: 10,
+            })
+            .expect("empty scan");
+        assert!(none.is_empty());
+        let before = dict_page_decodes();
+        let (rows, stats) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+        assert_eq!(dict_page_decodes() - before, dict_pages);
+        assert_eq!(rows, records);
+        assert_eq!(
+            (stats.pages_decoded, stats.pages_skipped),
+            (charged_pages, 0)
+        );
+        assert_eq!(
+            stats.decompressed_bytes - dirs.decompressed_bytes,
+            charged_bytes
+        );
+
+        // A projection that drops `svc` skips its dictionary in every block
+        // and decodes none, so decoded plus skipped is the same figure.
+        let mut narrow = reader
+            .scan_blocks(
+                &Predicate::And(Vec::new()),
+                &[],
+                &ColumnSelection::fixed_only(),
+            )
+            .expect("scan");
+        let before = dict_page_decodes();
+        while narrow.next_block(&object).expect("next").is_some() {}
+        let narrow = narrow.stats();
+        assert_eq!(dict_page_decodes() - before, 0);
+        assert_eq!(narrow.pages_decoded + narrow.pages_skipped, charged_pages);
+    }
+
+    /// A record carrying `cols` int columns and `cols` string columns, all
+    /// present in every row, so each is its own dynamic column and contributes
+    /// at least one value page per block: the object is wide enough that a
+    /// block's page count dwarfs 1.
+    fn wide_rec(ts: i64, cols: usize) -> LogRecord {
+        let mut attrs = Vec::with_capacity(2 * cols);
+        for c in 0..cols as i64 {
+            attrs.push((format!("i{c}"), AttrValue::I64(ts * 31 + c)));
+            attrs.push((format!("s{c}"), AttrValue::Str(format!("v{c}-{ts}"))));
+        }
+        LogRecord {
+            stream_id: sid(0),
+            stream_attrs: crate::record::stream_attrs_bytes(
+                &[("service.name".into(), AttrValue::Str("svc".into()))],
+                "scope",
+                "1",
+                &[],
+            ),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("body {ts}"),
+            trace_id: Some([(ts % 251) as u8; 16]),
+            span_id: Some([(ts % 251) as u8; 8]),
+            flags: ts as u32 & 0xf,
+            attrs,
+        }
+    }
+
+    /// The number of resident page-location handles the pruned survivor list
+    /// holds: one whole-object block index per surviving block, never one per
+    /// page. `BlockLoc` is `Copy` (asserted below), so an entry cannot own a
+    /// `Vec<PageLoc>`, and the sum is the survivor count.
+    fn resident_page_locations(scan: &BlockScan) -> usize {
+        scan.blocks.len()
+    }
+
+    /// The version-4 survivor list holds one shared copy of the page metadata
+    /// and resolves each block's pages at decode time, so the pruning stage
+    /// retains one fixed-size handle per surviving block, not that block's page
+    /// list: the resident page-location count is the surviving-block count, not
+    /// blocks times pages-per-block (issue #760).
+    #[test]
+    fn v4_scan_survivor_list_is_o_surviving_blocks_not_blocks_times_pages() {
+        // A survivor entry is a fixed-size Copy handle. `Vec<PageLoc>` is not
+        // `Copy`, so the pre-#760 shape (a per-block page vector in `BlockLoc`)
+        // would not compile here: this pins the O(1)-per-survivor structure at
+        // compile time, so the resident count below cannot silently regress to
+        // one PageLoc per page.
+        fn assert_copy<T: Copy>() {}
+        assert_copy::<BlockLoc>();
+
+        // A wide (50 dynamic columns => >=50 pages/block), long (8 blocks over
+        // 2 row groups) version-4 object.
+        const COLS: usize = 25; // 25 int + 25 str = 50 dynamic columns
+        const RECS_PER_BLOCK: usize = 4;
+        const BLOCKS: usize = 8;
+        const GROUP: usize = 4; // 8 blocks / 4-block groups = 2 groups
+        let cfg = RlogConfig {
+            block_target_records: RECS_PER_BLOCK,
+            group_target_blocks: GROUP,
+            ..RlogConfig::default()
+        };
+        let recs: Vec<LogRecord> = (0..(BLOCKS * RECS_PER_BLOCK) as i64)
+            .map(|ts| wide_rec(ts, COLS))
+            .collect();
+        let obj = build(cfg, recs);
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open reader");
+        let dir = reader.page_dir.clone();
+        assert_eq!(dir.block_count(), BLOCKS as u64, "8 blocks as configured");
+        assert_eq!(
+            dir.groups.len(),
+            2,
+            "8 blocks at a 4-block group is 2 groups"
+        );
+
+        // Pages per block: the wide corpus makes this comfortably >= 50, so
+        // blocks x pages is an order of magnitude above the block count.
+        let pages_per_block: Vec<usize> = (0..BLOCKS as u32)
+            .map(|b| dir.block_pages(b).expect("block in dir").len())
+            .collect();
+        let min_p = *pages_per_block.iter().min().expect("blocks");
+        assert!(
+            min_p >= 50,
+            "fixture must be wide: pages-per-block {pages_per_block:?} (min {min_p}) must be >= 50"
+        );
+        let total_pages: usize = pages_per_block.iter().sum();
+
+        // Shape 1: all blocks survive (predicate-free scan).
+        let all = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan all");
+        assert_eq!(all.blocks.len(), BLOCKS, "all 8 blocks survive");
+        // One shared copy of the page metadata, not one per survivor.
+        assert!(
+            Arc::ptr_eq(&all.page_dir, &reader.page_dir),
+            "the scan shares the reader's one decoded PAGE_DIR"
+        );
+        let all_resident = resident_page_locations(&all);
+        println!(
+            "all-survive: survivors={} resident_page_locations={all_resident} \
+             (pre-#760 would retain total_pages={total_pages} across 8 blocks x {min_p}+ pages)",
+            all.blocks.len()
+        );
+        assert_eq!(
+            all_resident, BLOCKS,
+            "resident page-location handles must equal the surviving-block count"
+        );
+        assert_ne!(
+            all_resident, total_pages,
+            "the survivor list must not hold one handle per page (blocks x pages)"
+        );
+
+        // Shape 2: all blocks pruned but one. Each block holds 4 consecutive
+        // ts; [0,3] is exactly block 0, so the ts prune drops the other 7.
+        let one = reader
+            .scan_blocks(
+                &Predicate::TsRange {
+                    min_ns: 0,
+                    max_ns: 3,
+                },
+                &[],
+                &ColumnSelection::all(),
+            )
+            .expect("scan one");
+        assert_eq!(one.blocks.len(), 1, "ts range [0,3] leaves exactly block 0");
+        let one_resident = resident_page_locations(&one);
+        println!(
+            "one-survivor: survivors={} resident_page_locations={one_resident} \
+             (pre-#760 would retain pages_per_block[0]={} for the surviving block)",
+            one.blocks.len(),
+            pages_per_block[0]
+        );
+        assert_eq!(
+            one_resident, 1,
+            "one surviving block retains exactly one resident page-location handle"
+        );
+        assert_ne!(
+            one_resident, pages_per_block[0],
+            "the surviving block must not hold its whole page list resident"
+        );
+    }
+
+    /// Resolving each survivor's pages lazily, out of the shared PAGE_DIR at
+    /// decode time, does not depend on how those pages were placed: the same
+    /// corpus written across several row groups and written as one decodes to
+    /// the same records, in the same order, over a multi-block, multi-page,
+    /// wide-column segment.
+    ///
+    /// The two objects differ in exactly where every page landed, so a
+    /// resolution that mixed up two blocks' pages, or shifted a page offset,
+    /// diverges here. The exact `ts` sequence is pinned alongside, so a decode
+    /// that agreed with itself while dropping or reordering rows also fails.
+    #[test]
+    fn lazy_page_resolution_does_not_depend_on_the_row_group_size() {
+        const COLS: usize = 25;
+        const RECS: i64 = 32;
+        let many_groups = RlogConfig {
+            block_target_records: 4,
+            group_target_blocks: 4,
+            ..RlogConfig::default()
+        };
+        let one_group = RlogConfig {
+            group_target_blocks: usize::MAX,
+            ..many_groups
+        };
+        let recs: Vec<LogRecord> = (0..RECS).map(|ts| wide_rec(ts, COLS)).collect();
+
+        let many = build(many_groups, recs.clone());
+        let one = build(one_group, recs);
+        assert_ne!(many, one, "the two placements must be different bytes");
+
+        let cfg = RlogConfig::default();
+        let reader_many = RlogReader::new(&many, &cfg).expect("open many-group");
+        let reader_one = RlogReader::new(&one, &cfg).expect("open one-group");
+        assert_eq!(
+            (reader_many.row_group_count(), reader_one.row_group_count()),
+            (2, 1),
+            "32 records at 4 per block is 8 blocks: 2 groups at 4 per group, 1 when ungrouped"
+        );
+
+        let pred = Predicate::And(Vec::new());
+        let (rows_many, _) = reader_many.scan(&pred).expect("scan many-group");
+        let (rows_one, _) = reader_one.scan(&pred).expect("scan one-group");
+
+        let ts: Vec<i64> = rows_many.iter().map(|r| r.ts_ns).collect();
+        assert_eq!(
+            ts,
+            (0..RECS).collect::<Vec<_>>(),
+            "every record comes back exactly once, in stored order"
+        );
+        assert_eq!(
+            rows_many, rows_one,
+            "lazy page resolution decodes identically whatever the row group size"
+        );
+    }
+
+    #[test]
+    fn read_section_standalone_valid_and_crc_mismatch() {
+        use crate::footer::{COMP_NONE, SectionDesc, kind};
+
+        // A hand-built raw (uncompressed) section: stored bytes are the section
+        // payload verbatim, uncomp_len equals its length, crc32c covers it.
+        let payload = b"hand-built section bytes".to_vec();
+        let cfg = RlogConfig::default();
+        let good = SectionDesc {
+            kind: kind::STREAM_DIR,
+            offset: 0,
+            len: payload.len() as u64,
+            crc32c: crc32c::crc32c(&payload),
+            comp: COMP_NONE,
+            uncomp_len: payload.len() as u64,
+            prefix_len: 0,
+        };
+        // Usable without an RlogReader: it takes bytes + a descriptor directly.
+        let got = read_section(&payload, &good, &cfg).expect("valid section reads");
+        assert_eq!(got, payload);
+
+        // A crc that does not match the stored bytes is a loud Corrupted error,
+        // before any decompression or grammar parse.
+        let bad = SectionDesc {
+            crc32c: good.crc32c ^ 0xFFFF_FFFF,
+            ..good
+        };
+        let err = read_section(&payload, &bad, &cfg).expect_err("crc mismatch rejected");
+        assert!(matches!(err, LogSegError::Corrupted(_)), "got {err:?}");
+    }
+
+    /// #693 part 2 premise: the write-time `LogFooter.block_count` counter
+    /// equals the read-time `ScanStats.blocks_total` and the unpruned survivor
+    /// count for a well-formed object, across a single block, a handful, and
+    /// enough blocks to span multiple skip-index level-1 groups (FANOUT = 64).
+    /// The predicate-free plan fast path substitutes the footer count for the
+    /// read-time count, so the two must agree on every object the writer emits.
+    ///
+    /// They are structurally tied: the writer stamps `block_count` from
+    /// `block_spans.len()` and pushes exactly one `Level0Entry` per span, and
+    /// `SkipIndex::encode`/`decode` round-trip that entry count, so
+    /// `blocks_total` (`skip.l0.len()`) reads back the same counter.
+    #[test]
+    fn footer_block_count_matches_unpruned_blocks_total() {
+        for n in [1usize, 5, 130] {
+            let cfg = RlogConfig {
+                block_target_records: 1,
+                ..RlogConfig::default()
+            };
+            // block_target_records=1 => one block per record, so n records span
+            // n blocks (n=130 > FANOUT spans 3 level-1 groups).
+            let recs: Vec<LogRecord> = (0..n as i64).map(|i| rec(0, i, "msg")).collect();
+            let obj = build(cfg, recs);
+
+            let footer = open(&obj).expect("open footer");
+            assert_eq!(
+                footer.block_count, n as u64,
+                "n={n}: writer stamps one block per record at block_target_records=1"
+            );
+
+            let reader = RlogReader::new(&obj, &cfg).expect("open reader");
+            let scan = reader
+                .scan_blocks(
+                    &Predicate::TsRange {
+                        min_ns: i64::MIN,
+                        max_ns: i64::MAX,
+                    },
+                    &[],
+                    &ColumnSelection::all(),
+                )
+                .expect("scan_blocks");
+            assert_eq!(
+                scan.stats().blocks_total,
+                footer.block_count as u32,
+                "n={n}: blocks_total == footer.block_count"
+            );
+            assert_eq!(
+                scan.remaining_blocks(),
+                footer.block_count as usize,
+                "n={n}: unpruned survivor count == footer.block_count"
+            );
+        }
+    }
+
+    #[test]
+    fn ts_range_prunes_to_three_blocks() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        // 100 single-record blocks, ts 0..100.
+        let recs: Vec<LogRecord> = (0..100).map(|i| rec(0, i, "msg")).collect();
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan(&Predicate::TsRange {
+                min_ns: 40,
+                max_ns: 42,
+            })
+            .expect("scan");
+        assert_eq!(stats.blocks_total, 100);
+        assert_eq!(stats.blocks_after_skip, 3);
+        assert_eq!(rows.len(), 3);
+    }
+
+    #[test]
+    fn absent_word_prunes_all_blocks() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let recs: Vec<LogRecord> = (0..20).map(|i| rec(0, i, "connection refused")).collect();
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan(&Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "timeout".into(),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 0);
+        assert_eq!(stats.blocks_after_bloom, 0);
+        assert_eq!(stats.blocks_scanned, 0);
+    }
+
+    #[test]
+    fn word_present_in_one_block() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut recs: Vec<LogRecord> = (0..20).map(|i| rec(0, i, "all good")).collect();
+        recs[7].body = "request timeout here".into();
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan(&Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "timeout".into(),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts_ns, 7);
+        // Bloom leaves at most a few blocks (target FPR ~1%).
+        assert!(stats.blocks_scanned <= 2);
+    }
+
+    #[test]
+    fn phrase_requires_order() {
+        let cfg = RlogConfig::default();
+        let mut a = rec(0, 1, "connection timeout occurred");
+        a.attrs.clear();
+        let b = rec(0, 2, "timeout on connection");
+        let obj = build(cfg, vec![a, b]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, _) = reader
+            .scan(&Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "connection timeout".into(),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts_ns, 1);
+    }
+
+    #[test]
+    fn stream_selection() {
+        let cfg = RlogConfig::default();
+        let recs = vec![
+            rec(1, 1, "a"),
+            rec(2, 2, "b"),
+            rec(3, 3, "c"),
+            rec(2, 4, "d"),
+        ];
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, _) = reader
+            .scan(&Predicate::StreamIn(vec![sid(2)]))
+            .expect("scan");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.stream_id == sid(2)));
+    }
+
+    #[test]
+    fn f64_equality_is_bit_exact() {
+        let cfg = RlogConfig::default();
+        let mut neg = rec(0, 1, "x");
+        neg.attrs.push(("v".into(), AttrValue::F64(-0.0)));
+        let mut pos = rec(0, 2, "x");
+        pos.attrs.push(("v".into(), AttrValue::F64(0.0)));
+        let mut nan = rec(0, 3, "x");
+        nan.attrs.push((
+            "v".into(),
+            AttrValue::F64(f64::from_bits(f64::NAN.to_bits() | 0x7)),
+        ));
+        let obj = build(cfg, vec![neg, pos, nan]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let (rows, _) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("v".into()),
+                value: AttrValue::F64(-0.0),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts_ns, 1);
+
+        let (rows, _) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("v".into()),
+                value: AttrValue::F64(f64::from_bits(f64::NAN.to_bits() | 0x7)),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ts_ns, 3);
+    }
+
+    #[test]
+    fn canonical_attrs_roundtrip() {
+        use ravel_types::logstream::canonical_attr_bytes;
+        let attrs = vec![
+            ("s".to_string(), AttrValue::Str("hi".into())),
+            ("n".to_string(), AttrValue::I64(-9)),
+            ("f".to_string(), AttrValue::F64(-0.0)),
+            ("b".to_string(), AttrValue::Bool(true)),
+            ("y".to_string(), AttrValue::Bytes(vec![1, 2, 3])),
+        ];
+        let bytes = canonical_attr_bytes(&attrs);
+        let got = decode_canonical_attrs(&bytes).expect("decode");
+        // canonical_attr_bytes sorts by (key, value); compare as sets.
+        let mut a = attrs;
+        let mut b = got;
+        a.sort_by(|x, y| x.0.cmp(&y.0));
+        b.sort_by(|x, y| x.0.cmp(&y.0));
+        for ((ka, va), (kb, vb)) in a.iter().zip(b.iter()) {
+            assert_eq!(ka, kb);
+            assert!(attr_value_eq(va, vb));
+        }
+    }
+
+    fn rec_with_svc(ts: i64, svc: &str) -> LogRecord {
+        let mut r = rec(0, ts, "msg");
+        r.attrs
+            .push(("svc".to_string(), AttrValue::Str(svc.to_string())));
+        r
+    }
+
+    fn build_indexed(cfg: RlogConfig, recs: Vec<LogRecord>, fields: &[&str]) -> Vec<u8> {
+        let mut w = RlogWriter::new(cfg, identity())
+            .with_indexed_fields(fields.iter().map(|s| s.to_string()).collect());
+        for r in recs {
+            w.push(r).expect("push");
+        }
+        w.finish().expect("finish")
+    }
+
+    /// Every block containing a matching record survives postings pruning
+    /// (soundness), and blocks
+    /// proven not to contain the term are pruned before bloom or exact scan
+    /// (pruning). 12 blocks of 5 records each, `svc` constant within a block
+    /// and cycling through 3 values across blocks, so a probe for one value
+    /// prunes to exactly the 4 blocks that carry it.
+    #[test]
+    fn postings_prune_exactly_and_absent_is_legal() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // Pruning: "s0" only appears in blocks 0,3,6,9 (4 of 12); postings
+        // proves the other 8 absent without touching bloom or BLOCKS.
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("s0".into()),
+            })
+            .expect("scan");
+        assert_eq!(stats.blocks_total, 12);
+        assert_eq!(stats.blocks_after_postings, 4);
+        assert_eq!(stats.blocks_scanned, 4);
+        // Soundness: every one of the 20 matching records is present, i.e. no
+        // block that actually contains a match was pruned.
+        assert_eq!(rows.len(), 20);
+        assert!(rows.iter().all(|r| (r.ts_ns / 5) % 3 == 0));
+
+        // A term proven absent everywhere prunes to zero blocks outright.
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("nope".into()),
+            })
+            .expect("scan");
+        assert_eq!(stats.blocks_after_postings, 0);
+        assert_eq!(rows.len(), 0);
+        assert!(!stats.postings_degraded);
+    }
+
+    #[test]
+    fn no_postings_section_scans_correctly() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let recs: Vec<LogRecord> = (0..20).map(|i| rec_with_svc(i, "s0")).collect();
+        // No with_indexed_fields: object has no POSTINGS section at all.
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("s0".into()),
+            })
+            .expect("scan");
+        assert_eq!(rows.len(), 20);
+        assert!(!stats.postings_degraded);
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+    }
+
+    #[test]
+    fn corrupt_postings_section_degrades_to_exact_scan() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let mut obj = build_indexed(cfg, recs, &["svc"]);
+
+        let footer = crate::footer::open(&obj).expect("open footer");
+        let desc = *footer
+            .section(crate::footer::kind::POSTINGS)
+            .expect("postings section present");
+        let at = desc.offset as usize;
+        obj[at] ^= 0xFF; // corrupt the POSTINGS version byte
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("svc".into()),
+                value: AttrValue::Str("s0".into()),
+            })
+            .expect("scan degrades, not errors");
+        assert!(stats.postings_degraded);
+        // Falls back to bloom + exact scan: still the exact right answer.
+        assert_eq!(rows.len(), 20);
+        assert!(rows.iter().all(|r| (r.ts_ns / 5) % 3 == 0));
+    }
+
+    /// A one-byte flip of a POSTINGS sparse-index `first_term`, corrupting no
+    /// term block, must degrade to bloom + exact scan rather than reach `scan`
+    /// as `postings_degraded == false` with a silently narrowed (wrong)
+    /// result. Four terms `aa, bz, ca, cz` with `postings_stride: 2` (one per
+    /// its own physical block, so a probe hit is exactly one row) split into
+    /// term blocks `B0 = [aa, bz]` and `B1 = [ca, cz]`; flipping `B1`'s
+    /// declared `first_term` from `"ca"` to `"ba"` preserves ascending order
+    /// and every term-block crc, so without a whole-section check
+    /// `RlogReader::new` and `PostingsSection::parse` would both accept it and
+    /// a probe for `"bz"` would land on `B1`, miss, and report the term absent
+    /// -- baseline 1 row, mutated 0 rows, no error, no counter. The
+    /// whole-section `crc32c` verified before `parse` catches the flip
+    /// regardless of which term is probed, degrading to bloom + exact scan
+    /// instead.
+    #[test]
+    fn corrupted_first_term_header_byte_degrades_instead_of_narrowing() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            postings_stride: 2,
+            ..RlogConfig::default()
+        };
+        let recs = vec![
+            rec_with_svc(0, "aa"),
+            rec_with_svc(1, "bz"),
+            rec_with_svc(2, "ca"),
+            rec_with_svc(3, "cz"),
+        ];
+        let mut obj = build_indexed(cfg, recs, &["svc"]);
+
+        let pred = Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("bz".into()),
+        };
+
+        let baseline_reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = baseline_reader.scan(&pred).expect("baseline scan");
+        assert_eq!(rows.len(), 1, "baseline: exactly the one \"bz\" row");
+        assert!(!stats.postings_degraded);
+
+        let footer = crate::footer::open(&obj).expect("open footer");
+        let desc = *footer
+            .section(crate::footer::kind::POSTINGS)
+            .expect("postings section present");
+        // Same header-layout offset as postings::tests:
+        // corrupted_first_term_header_byte_is_caught_not_silently_narrowed --
+        // B1's declared first_term "ca" at [42, 44) relative to the section.
+        let corrupt_at = desc.offset as usize + 42;
+        assert_eq!(&obj[corrupt_at..corrupt_at + 2], b"ca");
+        obj[corrupt_at] = b'b';
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let (rows, stats) = reader.scan(&pred).expect("scan degrades, not errors");
+        assert!(
+            stats.postings_degraded,
+            "the whole-section crc must catch the corrupted header"
+        );
+        assert_eq!(
+            rows.len(),
+            1,
+            "degraded pruning must fall back to bloom + exact scan, never silently drop the row"
+        );
+    }
+
+    /// Soundness: a prune equality whose per-record resolution does
+    /// NOT match, on a record whose match lives only in its resource/scope
+    /// stream attributes, must still return that record. The prune-only channel
+    /// drives block pruning alone, so a `service.name` that is a resource
+    /// attribute (not a per-record column) resolves to no postings arm and
+    /// prunes nothing. Wiring the same equality into `content` -- the exact
+    /// per-row filter -- drops the record, because `equals(FieldSel::Attr(..))`
+    /// reads only the per-record column plus `attrs_raw`, never the
+    /// resource/scope blob. This test proves the two channels diverge there.
+    #[test]
+    fn prune_channel_keeps_resource_only_match_that_content_would_drop() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        // 20 records on stream 0: resource `service.name = "svc0"` for every
+        // record (see `rec`), each also carrying an indexed per-record `svc`.
+        let recs: Vec<LogRecord> = (0..20).map(|i| rec_with_svc(i, "s0")).collect();
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // service.name lives only in the resource stream attrs; it is not a
+        // per-record column, so the prune arm resolves to no postings entry and
+        // prunes nothing. content is match-all, so every record is returned.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(rows.len(), 20, "resource-only match must survive the prune");
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+
+        // The same equality wired into `content` drops every record: `equals`
+        // never reads the resource blob. This is the unsound coupling the
+        // prune-only channel exists to avoid.
+        let (wrong, _) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("service.name".into()),
+                value: AttrValue::Str("svc0".into()),
+            })
+            .expect("scan");
+        assert_eq!(
+            wrong.len(),
+            0,
+            "content wiring drops the resource-only match"
+        );
+    }
+
+    /// A key that is an indexed per-record column for SOME records and a
+    /// resource attribute for OTHERS must not let the prune drop a record the
+    /// query needs.
+    ///
+    /// `field_dir` is object-wide, so one record carrying `service.name` as a
+    /// per-record attribute makes it an indexed column for the whole object.
+    /// A record whose `service.name` comes from its resource blob has no value
+    /// in that column, so it is in no posting list, so probing the term would
+    /// prune its block. The merged SQL view
+    /// (`ravel_sql::rlog_attrs::merged_attrs`) is the union of both layers and
+    /// needs that record. This is the same union-over-two-layers problem,
+    /// relocated into the prune channel.
+    ///
+    /// Under version 2 the writer indexes the merged view, so the resource-only
+    /// records ARE in the `"svc0"` posting list and the prune keeps their block
+    /// rather than dropping it: `prune_postings_arms` no longer needs the
+    /// stream-attribute exclusion (that is now version-1-only). Every record the
+    /// merged view matches is returned. See
+    /// [`super::tests::version_1_object_declines_to_prune_key_at_stream_level`]
+    /// for the conservative version-1 behaviour this replaces.
+    #[test]
+    fn prune_must_not_drop_a_resource_only_match_when_the_key_is_also_a_column() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        // Block 0: stream 0, resource `service.name = "svc0"`, no per-record
+        // `service.name`. These are the records the merged view must return.
+        for i in 0..5i64 {
+            recs.push(rec(0, i, "resource-only"));
+        }
+        // Block 1: stream 1, resource `service.name = "svc1"`, but each record
+        // carries a per-record `service.name = "svc0"`. This is what makes
+        // `service.name` an indexed column for the whole object.
+        for i in 5..10i64 {
+            let mut r = rec(1, i, "per-record");
+            r.attrs.push((
+                "service.name".to_string(),
+                AttrValue::Str("svc0".to_string()),
+            ));
+            recs.push(r);
+        }
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, _stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+
+        // Ten records match `attrs['service.name'] = 'svc0'` on the merged
+        // view: five by resource attribute, five by per-record attribute.
+        assert_eq!(
+            rows.len(),
+            10,
+            "the prune dropped the block whose match lives only in the resource blob"
+        );
+    }
+
+    /// The prune-only channel actually skips blocks. 12 blocks of 5 records, an
+    /// indexed per-record `svc` cycling through 3 values, so a prune for one
+    /// value proves the other 8 blocks absent through POSTINGS. Asserted on
+    /// ScanStats, not on the rows, so the test proves pruning happened rather
+    /// than merely that the answer is right.
+    #[test]
+    fn prune_channel_skips_blocks_via_postings() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("s0".into()),
+        }];
+        let (_rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        // "s0" occupies blocks 0,3,6,9 -- 4 of 12; postings proves the other 8
+        // absent before bloom or BLOCKS. A 3:1 block-prune ratio.
+        assert_eq!(stats.blocks_total, 12);
+        assert_eq!(stats.blocks_after_skip, 12);
+        assert_eq!(stats.blocks_after_postings, 4);
+        assert_eq!(stats.blocks_scanned, 4);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// A postings-eligible prune arm decompresses one POSTINGS term block
+    /// (`PostingsSection::probe_accounted`), and that block's bytes must land
+    /// in `ScanStats.decompressed_bytes` alongside the open-time directory
+    /// total: before this fix nothing on the postings path charged
+    /// `decompressed_bytes` at all (issue #1401 finding 1). Three distinct
+    /// `svc` values fit inside one `DEFAULT_STRIDE` (128) term block, so the
+    /// section holds exactly one postings term block and
+    /// `total_block_uncompressed_len` names its exact byte count independent
+    /// of `probe_accounted`'s own block selection. Read right after
+    /// `scan_blocks` returns, before any block page is decoded, so no page
+    /// bytes are in the figure to account for.
+    #[test]
+    fn scan_blocks_charges_postings_probe_decompression() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let footer = open(&obj).expect("open");
+        let mut open_total = 0u64;
+        for k in [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ] {
+            let desc = *footer.section(k).expect("section");
+            if desc.comp == COMP_ZSTD {
+                open_total += desc.uncomp_len;
+            }
+        }
+
+        let postings_bytes = postings_bytes_of(&obj);
+        let section = PostingsSection::parse(&postings_bytes).expect("parse postings");
+        let postings_total = section.total_block_uncompressed_len();
+        assert!(
+            postings_total > 0,
+            "fixture must produce at least one postings term block"
+        );
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("s0".into()),
+        }];
+        let cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &prune, &ColumnSelection::all())
+            .expect("scan");
+
+        assert_eq!(
+            cursor.stats().decompressed_bytes,
+            open_total + postings_total,
+            "scan_blocks charges the postings probe's decompressed term block \
+             on top of the open-time directory total"
+        );
+    }
+
+    /// An attribute the POSTINGS index does not cover prunes nothing. `region`
+    /// is a real per-record column but is not in the indexed-field list, so it
+    /// has no POSTINGS entry: the probe reports "not indexed" (`Ok(None)`) and
+    /// no block is dropped, so every matching record is returned.
+    #[test]
+    fn prune_channel_uncovered_field_prunes_nothing() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..20i64 {
+            let mut r = rec(0, i, "msg");
+            r.attrs.push(("region".into(), AttrValue::Str("us".into())));
+            recs.push(r);
+        }
+        // Index "svc" (absent here), never "region": region has a column but no
+        // postings entry, so a probe on it prunes nothing.
+        let obj = build_indexed(cfg, recs, &["svc"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("region".into()),
+            value: AttrValue::Str("us".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            20,
+            "an uncovered field must not prune any match"
+        );
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// A record on stream `stream` whose resource `service.name` is
+    /// `resource_svc` (overriding [`rec`]'s default), for building objects where
+    /// a key lives at resource level on one stream and per-record on another.
+    fn rec_res(stream: u8, ts: i64, resource_svc: &str) -> LogRecord {
+        let mut r = rec(stream, ts, "msg");
+        r.stream_attrs = crate::record::stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str(resource_svc.into()))],
+            "scope",
+            "1",
+            &[],
+        );
+        r
+    }
+
+    /// Like [`rec_res`] but with an explicit scope name, so two records can
+    /// share a resource `service.name` yet land in distinct streams (distinct
+    /// `stream_attrs` blobs, hence distinct blocks). Used to place a
+    /// resource-level-only key's matching records in more than one block.
+    fn rec_res_scope(stream: u8, ts: i64, resource_svc: &str, scope: &str) -> LogRecord {
+        let mut r = rec(stream, ts, "msg");
+        r.stream_attrs = crate::record::stream_attrs_bytes(
+            &[("service.name".into(), AttrValue::Str(resource_svc.into()))],
+            scope,
+            "1",
+            &[],
+        );
+        r
+    }
+
+    /// Rewrites a freshly written (version 2) object's POSTINGS section version
+    /// byte to 1 and fixes both the section crc and the footer crc, producing a
+    /// structurally valid version-1 object for the reader to exercise the
+    /// conservative path against. Used to build a v1 fixture without a v1
+    /// writer, exactly as the format-change task specifies (pin the version byte
+    /// in a fixture).
+    fn downgrade_postings_to_v1(obj: &[u8]) -> Vec<u8> {
+        use crate::footer::{TRAILER_LEN, kind, open, write_footer_and_trailer};
+        let footer = open(obj).expect("open");
+        let postings = *footer
+            .section(kind::POSTINGS)
+            .expect("object has a POSTINGS section");
+        let n = obj.len();
+        let footer_len =
+            u32::from_le_bytes([obj[n - 16], obj[n - 15], obj[n - 14], obj[n - 13]]) as usize;
+        let footer_start = n - TRAILER_LEN - footer_len;
+        let mut body = obj[..footer_start].to_vec();
+
+        let voff = postings.offset as usize;
+        assert_eq!(
+            body[voff],
+            crate::postings::POSTINGS_VERSION,
+            "fixture must start as a version 2 object"
+        );
+        body[voff] = crate::postings::POSTINGS_VERSION_V1;
+        let new_crc = crc32c::crc32c(&body[voff..voff + postings.len as usize]);
+
+        let mut footer = footer;
+        for s in &mut footer.sections {
+            if s.kind == kind::POSTINGS {
+                s.crc32c = new_crc;
+            }
+        }
+        write_footer_and_trailer(&mut body, &footer);
+        body
+    }
+
+    /// The soundness case: a key that is a resource attribute on
+    /// one stream and a per-record attribute on another. The version 2 writer
+    /// indexes the merged view, so every record the merged view matches is
+    /// returned AND a block holding no match is actually pruned. Asserted on
+    /// `ScanStats`, not only on the rows.
+    ///
+    /// Three streams, one block each: block 0 has `service.name = "svc0"` as a
+    /// resource attribute only; block 1 has resource `service.name = "other"`
+    /// but each record overrides it per-record to `"svc0"`; block 2 has resource
+    /// `service.name = "svc2"` only. A merged-view prune for `"svc0"` must keep
+    /// blocks 0 and 1 (ten records) and drop block 2.
+    #[test]
+    fn merged_view_prune_returns_every_match_and_skips_nonmatching_blocks() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        // Block 0: stream 0, resource service.name = "svc0", no per-record.
+        for i in 0..5i64 {
+            recs.push(rec_res(0, i, "svc0"));
+        }
+        // Block 1: stream 1, resource service.name = "other", per-record
+        // service.name = "svc0" (this is what creates the object-wide column).
+        for i in 5..10i64 {
+            let mut r = rec_res(1, i, "other");
+            r.attrs.push((
+                "service.name".to_string(),
+                AttrValue::Str("svc0".to_string()),
+            ));
+            recs.push(r);
+        }
+        // Block 2: stream 2, resource service.name = "svc2", no per-record.
+        for i in 10..15i64 {
+            recs.push(rec_res(2, i, "svc2"));
+        }
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+
+        // Soundness: all ten merged-view matches returned (five resource-only,
+        // five per-record).
+        assert_eq!(rows.len(), 10);
+        // Pruning: block 2 (svc2) is proven absent and skipped, not scanned.
+        assert_eq!(stats.blocks_total, 3);
+        assert_eq!(stats.blocks_after_skip, 3);
+        assert_eq!(stats.blocks_after_postings, 2);
+        assert_eq!(stats.blocks_scanned, 2);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// Record-wins precedence: a key present at resource level and
+    /// per-record on the same record indexes the record's value. A probe for the
+    /// record's value matches the block; a probe for the (overridden) resource
+    /// value prunes it away.
+    #[test]
+    fn record_value_wins_over_resource_value_in_postings() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        // One stream, one block: resource service.name = "svcR", every record
+        // overrides it per-record to "svcP".
+        let mut recs = Vec::new();
+        for i in 0..5i64 {
+            let mut r = rec_res(0, i, "svcR");
+            r.attrs.push((
+                "service.name".to_string(),
+                AttrValue::Str("svcP".to_string()),
+            ));
+            recs.push(r);
+        }
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // The record's own value is indexed: its block survives.
+        let prune_record = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svcP".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune_record)
+            .expect("scan");
+        assert_eq!(rows.len(), 5);
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+
+        // The overridden resource value is NOT indexed for these records: the
+        // term is absent, so the exact posting list prunes the block to zero.
+        let prune_resource = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svcR".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune_resource)
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            0,
+            "the overridden resource value must not match"
+        );
+        assert_eq!(stats.blocks_after_postings, 0);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// A version 1 object declines POSTINGS pruning outright, even for a key
+    /// that is NOT at stream level and carries no duplicates: the v1 grammar
+    /// records nothing that could prove a record-level duplicate was absent, so
+    /// the reader cannot know its per-record-layer index is complete, and
+    /// declines rather than risk dropping a merged-view match (widen-only,
+    /// ADR-0013; docs/adrs/0049 amendment 2026-08-20). It still reads back every
+    /// record; the identical v2 object below prunes, proving the decline is a
+    /// version choice, not a missing index. Built by pinning the version byte in
+    /// a fixture.
+    #[test]
+    fn version_1_object_declines_all_equality_pruning() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        // `svc` is per-record only, 12 blocks cycling 3 values.
+        let mut recs = Vec::new();
+        for i in 0..60i64 {
+            let block = i / 5;
+            recs.push(rec_with_svc(i, &format!("s{}", block % 3)));
+        }
+        let v2 = build_indexed(cfg, recs, &["svc"]);
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("svc".into()),
+            value: AttrValue::Str("s0".into()),
+        }];
+
+        // v2 prunes to the 4 blocks that carry "s0".
+        let reader = RlogReader::new(&v2, &cfg).expect("open v2");
+        let (_rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(stats.blocks_after_postings, 4, "v2 prunes");
+
+        // The same object read as v1 declines: no block is pruned, and every
+        // record still reads back (content is match-all here).
+        let v1 = downgrade_postings_to_v1(&v2);
+        let reader = RlogReader::new(&v1, &cfg).expect("open v1");
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(stats.blocks_total, 12);
+        assert_eq!(
+            stats.blocks_after_postings, stats.blocks_after_skip,
+            "v1 declines to prune"
+        );
+        assert_eq!(rows.len(), 60, "every record survives");
+        assert!(!stats.postings_degraded);
+    }
+
+    /// Step-4 regression for issue #333: a v1-grammar object carrying a
+    /// cross-type duplicate-key record must decline to prune, returning the row
+    /// a wrong v1 prune would drop. The record has `dur = I64(5)` and
+    /// `dur = Str("x")`; its merged-view winner is the reconstruction-order last
+    /// occurrence, `I64(5)` (`Str` type byte < `I64`, so the `(dur, Str)` column
+    /// sorts first and `(dur, I64)` last). A v2 posting therefore lists this
+    /// block only under `(dur, I64) = 5`. Downgrading the version byte models a
+    /// v1 object; under v1 the reader declines all equality pruning, so a prune
+    /// on `Str("x")` -- which resolves to the `(dur, Str)` column whose posting
+    /// is empty and would otherwise drop the block -- keeps it.
+    #[test]
+    fn version_1_object_with_cross_type_duplicate_declines_to_prune() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut r = rec(0, 0, "msg");
+        r.attrs.push(("dur".into(), AttrValue::I64(5)));
+        r.attrs.push(("dur".into(), AttrValue::Str("x".into())));
+        let obj = downgrade_postings_to_v1(&build_indexed(cfg, vec![r], &["dur"]));
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // A prune whose literal resolves to the empty (dur, Str) posting would
+        // drop the only block if v1 pruned; declining keeps it.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::Str("x".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(rows.len(), 1, "v1 declines: the row survives");
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// The `attrs` merged view a query sees for one record, duplicating
+    /// `ravel_sql::rlog_attrs::merged_attrs` inline (a test dependency on
+    /// ravel-sql would be a dependency cycle): its decoded stream (resource +
+    /// scope) attributes, then its own attributes folded last-wins by name.
+    /// Operates on a record already reconstructed by `rebuild_record` (i.e. one
+    /// returned by `scan`), so its `attrs` are in on-disk reconstruction order.
+    fn merged_attrs_local(r: &LogRecord) -> Vec<(String, AttrValue)> {
+        let mut merged = stream_attr_pairs(&r.stream_attrs).expect("decode stream_attrs");
+        for (k, v) in &r.attrs {
+            if let Some(slot) = merged.iter_mut().find(|(mk, _)| mk == k) {
+                slot.1 = v.clone();
+            } else {
+                merged.push((k.clone(), v.clone()));
+            }
+        }
+        merged
+    }
+
+    /// Decodes an object's FIELD_DIR.
+    fn field_dir_of(obj: &[u8]) -> FieldDir {
+        let cfg = RlogConfig::default();
+        let footer = open(obj).expect("open");
+        let desc = footer.section(kind::FIELD_DIR).expect("field_dir");
+        let raw = read_section(obj, desc, &cfg).expect("read field_dir");
+        FieldDir::decode(&raw, 1 << 20).expect("decode field_dir")
+    }
+
+    /// The POSTINGS section bytes of an object, for a `PostingsSection::parse`.
+    fn postings_bytes_of(obj: &[u8]) -> Vec<u8> {
+        let footer = open(obj).expect("open");
+        let desc = footer.section(kind::POSTINGS).expect("postings");
+        obj[desc.offset as usize..(desc.offset + desc.len) as usize].to_vec()
+    }
+
+    /// Issue #333 repro 1 (cross-type duplicate). A record carrying `dur = I64(5)`
+    /// then `dur = Str("x")`, with `dur` indexed. The read-side merged view is
+    /// the reconstruction-order last occurrence: `Str` type byte (1) sorts before
+    /// `I64` (2), so `rebuild_record` lays out `(dur, Str) = "x"` then
+    /// `(dur, I64) = 5`, and `merged_attrs` folds to `I64(5)`. Before the fix the
+    /// writer folded over write-time order and chose `Str("x")`, leaving the
+    /// `(dur, I64)` posting empty, so a prune on `I64(5)` dropped the block. It
+    /// must now keep it.
+    #[test]
+    fn issue_333_cross_type_duplicate_prune_keeps_row() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut r = rec(0, 0, "msg");
+        r.attrs.push(("dur".into(), AttrValue::I64(5)));
+        r.attrs.push(("dur".into(), AttrValue::Str("x".into())));
+        let obj = build_indexed(cfg, vec![r], &["dur"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::I64(5),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the merged view returns dur=I64(5); the prune must not drop its block"
+        );
+        assert!(!stats.postings_degraded);
+
+        // Directly: the (dur, I64) posting lists this block for term 5.
+        let fd = field_dir_of(&obj);
+        let cid = fd
+            .column("dur", FieldType::I64)
+            .expect("(dur, I64) column")
+            .column_id;
+        let pd = postings_bytes_of(&obj);
+        let section = PostingsSection::parse(&pd).expect("parse postings");
+        assert_eq!(
+            section
+                .probe(cid, &term_key(&resolve_value(&AttrValue::I64(5)).1))
+                .expect("probe"),
+            Some(vec![0]),
+            "the winning I64(5) value must be the indexed term"
+        );
+    }
+
+    /// Issue #333 repro 2 (cross-type stringification). Two single-record blocks,
+    /// `dur = I64(5)` and `dur = Str("q")`, `dur` indexed. This is not about
+    /// duplicates: it is the reader resolving a `Str` prune literal only against
+    /// the `(dur, Str)` column. A prune on the I64 value keeps the I64 block; a
+    /// prune on `Str("5")` must NOT drop the I64 block, because `I64(5)`
+    /// stringifies to `"5"` in the merged view and would match. The fix declines
+    /// a `Str`-literal prune on a name that also has a non-`Str` column.
+    #[test]
+    fn issue_333_cross_type_stringification_prune_does_not_overprune() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let mut r0 = rec(0, 0, "msg");
+        r0.attrs.push(("dur".into(), AttrValue::I64(5)));
+        let mut r1 = rec(0, 1, "msg");
+        r1.attrs.push(("dur".into(), AttrValue::Str("q".into())));
+        let obj = build_indexed(cfg, vec![r0, r1], &["dur"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // A prune on the I64 value keeps the I64 record's block.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::I64(5),
+        }];
+        let (rows, _stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert!(
+            rows.iter().any(|r| r.ts_ns == 0),
+            "an I64 prune must keep the I64 record's block"
+        );
+
+        // A Str("5") prune must not drop the I64 block: I64(5) stringifies to
+        // "5" and is a merged-view match. The reader declines the arm.
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("dur".into()),
+            value: AttrValue::Str("5".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert!(
+            rows.iter().any(|r| r.ts_ns == 0),
+            "a Str('5') prune must not drop the block holding I64(5), which stringifies to '5'"
+        );
+        assert_eq!(
+            stats.blocks_after_postings, stats.blocks_after_skip,
+            "the cross-type Str arm is declined, not pruned on"
+        );
+        assert!(!stats.postings_degraded);
+    }
+
+    /// The general differential test for issue #333: for varied duplicate-key
+    /// shapes, the POSTINGS term the writer chose for an indexed name must equal
+    /// what a full write-then-read round trip through `rebuild_record` (via
+    /// `scan`) and `merged_attrs` (via [`merged_attrs_local`]) reports. Each
+    /// shape is written as its own one-record object, so the block index is
+    /// trivially 0 and the probe assertion is exact. This proves the fix in
+    /// general, not just for the two known repros, and checks write against an
+    /// independent read path rather than against the writer's own algorithm.
+    #[test]
+    fn issue_333_write_side_winner_matches_read_side_merged_view() {
+        // Each shape: the record's per-record attrs (dur duplicated variously),
+        // plus an optional resource-level dur to exercise layer precedence.
+        struct Shape {
+            name: &'static str,
+            record_attrs: Vec<AttrValue>,
+            resource_dur: Option<AttrValue>,
+        }
+        let shapes = vec![
+            Shape {
+                name: "two same type",
+                record_attrs: vec![AttrValue::I64(5), AttrValue::I64(6)],
+                resource_dur: None,
+            },
+            Shape {
+                name: "three same type, encoded order != write order",
+                record_attrs: vec![AttrValue::I64(3), AttrValue::I64(10), AttrValue::I64(7)],
+                resource_dur: None,
+            },
+            Shape {
+                name: "two different types",
+                record_attrs: vec![AttrValue::I64(5), AttrValue::Str("x".into())],
+                resource_dur: None,
+            },
+            Shape {
+                name: "three different types",
+                record_attrs: vec![
+                    AttrValue::Str("s".into()),
+                    AttrValue::Bool(true),
+                    AttrValue::I64(42),
+                ],
+                resource_dur: None,
+            },
+            Shape {
+                name: "duplicate plus resource-level same name",
+                record_attrs: vec![AttrValue::I64(5), AttrValue::I64(9)],
+                resource_dur: Some(AttrValue::Str("R".into())),
+            },
+        ];
+
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        for shape in &shapes {
+            let mut r = rec(0, 0, "msg");
+            if let Some(rd) = &shape.resource_dur {
+                r.stream_attrs = crate::record::stream_attrs_bytes(
+                    &[
+                        ("service.name".into(), AttrValue::Str("svc0".into())),
+                        ("dur".into(), rd.clone()),
+                    ],
+                    "scope",
+                    "1",
+                    &[],
+                );
+            }
+            for v in &shape.record_attrs {
+                r.attrs.push(("dur".into(), v.clone()));
+            }
+            let obj = build_indexed(cfg, vec![r], &["dur"]);
+            let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+            // Read side: reconstruct the record and compute the merged value.
+            let (rows, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+            assert_eq!(rows.len(), 1, "{}", shape.name);
+            let merged = merged_attrs_local(&rows[0]);
+            let value = merged
+                .iter()
+                .find(|(k, _)| k == "dur")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| panic!("{}: merged view has dur", shape.name));
+            let (ty, cv) = resolve_value(&value);
+
+            // Write side: the POSTINGS term for dur must be exactly that value.
+            let fd = field_dir_of(&obj);
+            let cid = fd
+                .column("dur", ty)
+                .unwrap_or_else(|| panic!("{}: (dur, {ty:?}) column exists", shape.name))
+                .column_id;
+            let pd = postings_bytes_of(&obj);
+            let section = PostingsSection::parse(&pd).expect("parse postings");
+            assert_eq!(
+                section.probe(cid, &term_key(&cv)).expect("probe"),
+                Some(vec![0]),
+                "{}: write-side POSTINGS term must equal the read-side merged winner {value:?}",
+                shape.name
+            );
+        }
+    }
+
+    /// A version 1 object declines to prune (here for a key that also appears at
+    /// stream level, one of the hazards): a v1 posting list indexes the
+    /// per-record layer only, so an exact index over one layer cannot prune a
+    /// merged-view query over two. Every record the merged view matches is
+    /// returned, and no block is pruned. This is the conservative behaviour
+    /// version 2 replaces
+    /// (see [`prune_must_not_drop_a_resource_only_match_when_the_key_is_also_a_column`]).
+    #[test]
+    fn version_1_object_declines_to_prune_key_at_stream_level() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        // Block 0: resource service.name = "svc0", no per-record.
+        for i in 0..5i64 {
+            recs.push(rec_res(0, i, "svc0"));
+        }
+        // Block 1: resource service.name = "other", per-record svc0 (creates the
+        // object-wide column).
+        for i in 5..10i64 {
+            let mut r = rec_res(1, i, "other");
+            r.attrs.push((
+                "service.name".to_string(),
+                AttrValue::Str("svc0".to_string()),
+            ));
+            recs.push(r);
+        }
+        let obj = downgrade_postings_to_v1(&build_indexed(cfg, recs, &["service.name"]));
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        // Conservative rule: the key is at stream level, so v1 declines to prune.
+        assert_eq!(rows.len(), 10, "every merged-view match must survive");
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// The per-field distinct-value cap now counts merged values
+    /// (docs/adrs/0049-rlog-postings.md amendment, decision 4). Five streams,
+    /// each with a distinct resource `service.name`, and a cap of 2: the field
+    /// is dropped and the counter fires. Under the old per-record-only counting
+    /// only one distinct value (the single per-record `service.name` that
+    /// creates the column) would have been seen, well under the cap, so this
+    /// object is exactly the one the amendment changes.
+    #[test]
+    fn distinct_value_cap_counts_merged_values() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            postings_max_distinct: 2,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..5u8 {
+            // rec(i, ..) sets resource service.name = "svc{i}", five distinct.
+            let mut r = rec(i, i64::from(i), "msg");
+            if i == 0 {
+                // One per-record service.name so the (service.name, Str) column
+                // exists; its value equals the resource value, so the merged
+                // distinct count is driven entirely by the resource attributes.
+                r.attrs.push((
+                    "service.name".to_string(),
+                    AttrValue::Str("svc0".to_string()),
+                ));
+            }
+            recs.push(r);
+        }
+        let mut w =
+            RlogWriter::new(cfg, identity()).with_indexed_fields(vec!["service.name".to_string()]);
+        for r in recs {
+            w.push(r).expect("push");
+        }
+        let (obj, stats) = w.finish_with_stats().expect("finish");
+        assert_eq!(
+            stats.postings_capped_fields, 1,
+            "five distinct merged values must exceed the cap of 2"
+        );
+
+        // The capped field reads back as not-indexed (probe None), never a
+        // narrowed result.
+        let footer = crate::footer::open(&obj).expect("open");
+        let fd_desc = footer
+            .section(crate::footer::kind::FIELD_DIR)
+            .expect("field_dir");
+        let start = fd_desc.offset as usize;
+        let end = start + fd_desc.len as usize;
+        let raw = zstd::bulk::decompress(&obj[start..end], fd_desc.uncomp_len as usize)
+            .expect("decompress");
+        let fd = FieldDir::decode(&raw, 1 << 20).expect("decode");
+        let cid = fd
+            .column("service.name", FieldType::Str)
+            .expect("column exists")
+            .column_id;
+        let pd_desc = footer
+            .section(crate::footer::kind::POSTINGS)
+            .expect("postings present");
+        let pd_bytes = &obj[pd_desc.offset as usize..(pd_desc.offset + pd_desc.len) as usize];
+        let section = crate::postings::PostingsSection::parse(pd_bytes).expect("parse");
+        assert_eq!(section.probe(cid, b"svc0").expect("probe"), None);
+    }
+
+    /// A key that is resource-level on EVERY record and per-record on none.
+    /// Without a FIELD_DIR column it would have no posting list, so a
+    /// merged-view prune for it would skip nothing -- the ordinary
+    /// single/few-service OTLP deployment the ADR-0049 amendment was written
+    /// for. The writer gives it a stream-level-only column, so the prune
+    /// proves non-matching blocks absent AND every matching record survives.
+    ///
+    /// Three streams, one block each: resource `service.name` = svc0 (block 0),
+    /// svc1 (block 1), svc0 again on a different stream (block 2). A prune for
+    /// svc0 must keep blocks 0 and 2 (ten records, in two non-adjacent blocks,
+    /// so completeness is non-trivial) and drop block 1. No record carries
+    /// `service.name` per-record.
+    #[test]
+    fn resource_only_key_prunes_blocks_and_returns_every_match() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..5i64 {
+            recs.push(rec_res_scope(0, i, "svc0", "sa"));
+        }
+        for i in 5..10i64 {
+            recs.push(rec_res_scope(1, i, "svc1", "sb"));
+        }
+        for i in 10..15i64 {
+            recs.push(rec_res_scope(2, i, "svc0", "sc"));
+        }
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        // Pruning: block 1 (svc1) is proven absent through POSTINGS and skipped.
+        assert_eq!(stats.blocks_total, 3);
+        assert_eq!(stats.blocks_after_skip, 3);
+        assert_eq!(stats.blocks_after_postings, 2);
+        assert_eq!(stats.blocks_scanned, 2);
+        // Soundness: every merged-view svc0 match returned, across both blocks.
+        assert_eq!(rows.len(), 10);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// Soundness: adding a stream-level-only column must NOT turn
+    /// `equals` (the exact per-record channel) into a merged-view match. A
+    /// record whose `service.name` comes solely from its resource blob must not
+    /// match a `content` equals for it, because the column carries no per-record
+    /// value (it is a POSTINGS key, all-null in every block). This is the exact
+    /// mistake the spec warns against: if the writer materialized the resource
+    /// value into every row, this would match and the prune/exact channels would
+    /// no longer be a sound subset relationship.
+    #[test]
+    fn equals_on_resource_only_key_stays_a_per_record_predicate() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        // Every record: resource service.name = svc0, no per-record attribute.
+        let recs: Vec<LogRecord> = (0..10).map(|i| rec_res_scope(0, i, "svc0", "sa")).collect();
+        let obj = build_indexed(cfg, recs, &["service.name"]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        // The stream-level column now exists, so a prune would match; but
+        // `content` reads the per-record layer only, which is empty here.
+        let (rows, _stats) = reader
+            .scan(&Predicate::Equals {
+                field: FieldSel::Attr("service.name".into()),
+                value: AttrValue::Str("svc0".into()),
+            })
+            .expect("scan");
+        assert_eq!(
+            rows.len(),
+            0,
+            "a resource-only value must not match a content equals: equals is per-record"
+        );
+
+        // The rebuilt records must not have gained a phantom per-record
+        // service.name attribute from the all-null column either.
+        let (all, _) = reader.scan(&Predicate::And(Vec::new())).expect("scan all");
+        assert_eq!(all.len(), 10);
+        assert!(
+            all.iter()
+                .all(|r| !r.attrs.iter().any(|(k, _)| k == "service.name")),
+            "the stream-level column must not materialize a per-record attribute"
+        );
+    }
+
+    /// Under version 1: a resource-level-only key has a column
+    /// and a posting list, but a v1 posting list indexes the per-record layer
+    /// only, so the conservative rule must decline to prune it (the key is at
+    /// stream level). Every merged-view match still reads back; no block is
+    /// pruned. Built by pinning the version byte in a fixture.
+    #[test]
+    fn version_1_object_declines_to_prune_resource_only_key() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..5i64 {
+            recs.push(rec_res_scope(0, i, "svc0", "sa"));
+        }
+        for i in 5..10i64 {
+            recs.push(rec_res_scope(1, i, "svc1", "sb"));
+        }
+        for i in 10..15i64 {
+            recs.push(rec_res_scope(2, i, "svc0", "sc"));
+        }
+        let obj = downgrade_postings_to_v1(&build_indexed(cfg, recs, &["service.name"]));
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        // service.name is at stream level, so v1 declines to prune: all blocks
+        // survive and every record reads back.
+        assert_eq!(rows.len(), 15, "v1 conservative rule keeps every record");
+        assert_eq!(stats.blocks_after_postings, stats.blocks_after_skip);
+        assert!(!stats.postings_degraded);
+    }
+
+    /// A truncated POSTINGS section on an object whose only indexed field is
+    /// resource-level still degrades to a typed error
+    /// path, never a panic: the scan falls back to bloom + exact scan and sets
+    /// `postings_degraded`.
+    #[test]
+    fn corrupt_postings_on_resource_only_key_degrades_not_panics() {
+        let cfg = RlogConfig {
+            block_target_records: 5,
+            ..RlogConfig::default()
+        };
+        let mut recs = Vec::new();
+        for i in 0..5i64 {
+            recs.push(rec_res_scope(0, i, "svc0", "sa"));
+        }
+        for i in 5..10i64 {
+            recs.push(rec_res_scope(1, i, "svc1", "sb"));
+        }
+        let mut obj = build_indexed(cfg, recs, &["service.name"]);
+        let footer = crate::footer::open(&obj).expect("open footer");
+        let desc = *footer
+            .section(crate::footer::kind::POSTINGS)
+            .expect("postings present");
+        // Flip the version byte: the whole-section crc no longer matches, so the
+        // reader degrades this arm instead of pruning on corrupt bytes.
+        obj[desc.offset as usize] ^= 0xFF;
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let prune = [Predicate::Equals {
+            field: FieldSel::Attr("service.name".into()),
+            value: AttrValue::Str("svc0".into()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan degrades, not errors");
+        assert!(stats.postings_degraded);
+        // No pruning applied, so every record survives.
+        assert_eq!(rows.len(), 10);
+    }
+
+    /// A record carrying an i64 attribute `code`, in `stream`, at `ts`.
+    fn rec_code(stream: u8, ts: i64, code: i64) -> LogRecord {
+        let mut r = rec(stream, ts, "msg");
+        r.attrs.push(("code".into(), AttrValue::I64(code)));
+        r
+    }
+
+    /// Decodes an object's level-0 skip index.
+    fn skip_of(obj: &[u8]) -> SkipIndex {
+        let cfg = RlogConfig::default();
+        let footer = open(obj).expect("open");
+        let raw = read_section(obj, footer.section(kind::SKIP_IDX).expect("skip"), &cfg)
+            .expect("read skip");
+        SkipIndex::decode(&raw, MAX_BLOCKS).expect("decode skip")
+    }
+
+    /// Reachability (ADR-0095 decision 6): a `NumRange` prune arm, driven
+    /// through the real public `scan_pruned` entry point, excludes the block
+    /// whose merged-view winner for the column falls outside the range and keeps
+    /// the block whose winner falls inside it.
+    ///
+    /// Two single-record blocks: block 0 resolves `code = 200`, block 1 resolves
+    /// `code = 999`. A prune for `code IN [900, 1000]` must drop block 0 and keep
+    /// block 1. Asserted on `ScanStats` (the block actually left the candidate
+    /// set) and on the returned rows, not on either alone.
+    #[test]
+    fn num_range_prune_excludes_out_of_range_block_keeps_in_range() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let obj = build(cfg, vec![rec_code(0, 0, 200), rec_code(0, 1, 999)]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::I64,
+            min: Some(900i64 as u64),
+            max: Some(1000i64 as u64),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+
+        assert_eq!(stats.blocks_total, 2);
+        assert_eq!(
+            stats.blocks_after_skip, 1,
+            "the out-of-range block (code=200) is pruned by the numeric arm"
+        );
+        assert_eq!(rows.len(), 1, "only the in-range block's record survives");
+        assert_eq!(rows[0].ts_ns, 1);
+        assert_eq!(
+            rows[0]
+                .attrs
+                .iter()
+                .find(|(k, _)| k == "code")
+                .map(|(_, v)| v),
+            Some(&AttrValue::I64(999))
+        );
+    }
+
+    /// Soundness (ADR-0095 decision 6, ADR-0013): a block that resolves no value
+    /// for the arm's column carries no stat for it, and such a block is NEVER
+    /// pruned by the arm -- even though a naive "the block holds no matching
+    /// value" reading would drop it. Getting this backwards silently drops
+    /// correct results.
+    ///
+    /// Three single-record blocks: block 0 resolves `code = 15`, block 1 carries
+    /// no `code` at all (and its resource has none), block 2 resolves
+    /// `code = 999`. A prune for `code IN [10, 20]` keeps block 0 (in range),
+    /// prunes block 2 (out of range), and MUST keep block 1 (no stat). The test
+    /// first proves the premise off the decoded index -- block 1 genuinely has
+    /// no `code` stat -- so it is testing the absent-stat path, not a stat that
+    /// merely happens to overlap.
+    #[test]
+    fn num_range_prune_keeps_block_with_no_stat_for_the_column() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        // Block 1 (ts 1) carries no `code`; `rec` gives it only a resource
+        // `service.name`, so no row of block 1 resolves the `code` column.
+        let obj = build(
+            cfg,
+            vec![
+                rec_code(0, 0, 15),
+                rec(0, 1, "no-code"),
+                rec_code(0, 2, 999),
+            ],
+        );
+
+        // Premise: the (code, i64) column exists object-wide, and block 1 has no
+        // stat for it. Blocks are one record each, sorted by ts, so l0[1] is the
+        // no-code block.
+        let fd = field_dir_of(&obj);
+        let cid = fd
+            .column("code", FieldType::I64)
+            .expect("(code, i64) column exists")
+            .column_id;
+        let skip = skip_of(&obj);
+        assert_eq!(skip.l0.len(), 3, "one record per block");
+        assert!(
+            !skip.l0[1].stats.iter().any(|s| s.column_id == cid),
+            "block 1 must genuinely carry no stat for the code column"
+        );
+        assert!(
+            skip.l0[0].stats.iter().any(|s| s.column_id == cid)
+                && skip.l0[2].stats.iter().any(|s| s.column_id == cid),
+            "blocks 0 and 2 do carry a code stat"
+        );
+
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let prune = [Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::I64,
+            min: Some(10i64 as u64),
+            max: Some(20i64 as u64),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+
+        // Block 2 (code=999) pruned; blocks 0 and 1 survive.
+        assert_eq!(stats.blocks_total, 3);
+        assert_eq!(stats.blocks_after_skip, 2);
+        let by_ts: Vec<i64> = rows.iter().map(|r| r.ts_ns).collect();
+        assert!(
+            by_ts.contains(&1),
+            "the no-stat block must survive: absence is no information, never no match"
+        );
+        assert!(
+            !by_ts.contains(&2),
+            "the out-of-range block (code=999) is pruned"
+        );
+        assert!(by_ts.contains(&0), "the in-range block (code=15) survives");
+    }
+
+    /// A `NumRange` arm whose field does not resolve to a dynamic column of the
+    /// named type prunes nothing (degrade-safe fallthrough), the same way an
+    /// unindexed POSTINGS field does. Here `code` exists as i64 but the arm asks
+    /// for it as f64, which resolves to no column, so every block survives.
+    #[test]
+    fn num_range_prune_unresolved_column_prunes_nothing() {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let obj = build(cfg, vec![rec_code(0, 0, 200), rec_code(0, 1, 999)]);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let prune = [Predicate::NumRange {
+            field: FieldSel::Attr("code".into()),
+            ty: FieldType::F64,
+            min: Some(0.0f64.to_bits()),
+            max: Some(1.0f64.to_bits()),
+        }];
+        let (rows, stats) = reader
+            .scan_pruned(&Predicate::And(Vec::new()), &prune)
+            .expect("scan");
+        assert_eq!(
+            stats.blocks_after_skip, stats.blocks_total,
+            "a NumRange over an unresolved (name, type) must not prune"
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    // --- columnar block view (ADR-0099 decision 1) ---------------------------
+
+    /// The attribute key that overflows the dynamic-column budget in
+    /// [`columnar_corpus`] and therefore lands in `attrs_raw`.
+    const OVERFLOW_KEY: &str = "z_over";
+
+    /// The dynamic-column budget [`columnar_corpus`] is built against: exactly
+    /// enough for its five columned attribute names, so the sixth
+    /// ([`OVERFLOW_KEY`], last in the writer's `(name, type)` order) spills into
+    /// `attrs_raw`.
+    const COLUMNAR_MAX_COLUMNS: usize = 5;
+
+    fn rec_attrs(stream: u8, ts: i64, body: &str, attrs: Vec<(String, AttrValue)>) -> LogRecord {
+        let mut r = rec(stream, ts, body);
+        r.attrs = attrs;
+        r
+    }
+
+    fn attr(k: &str, v: AttrValue) -> (String, AttrValue) {
+        (k.to_string(), v)
+    }
+
+    /// A corpus for the columnar view, deliberately awkward: two streams, five
+    /// columned attribute types plus one that overflows into `attrs_raw`, rows
+    /// with no attributes at all (so every dynamic column is partially present),
+    /// an empty `body`, an empty string attribute, a negative and an extreme
+    /// integer, a negative zero, and rows with and without trace/span ids.
+    ///
+    /// Bodies are worded so `HasWord(body, "keep")` keeps a non-contiguous
+    /// subset of every block's rows: an accessor that read a surviving-row index
+    /// as a raw block row position would return another row's data.
+    fn columnar_corpus() -> Vec<LogRecord> {
+        vec![
+            rec_attrs(
+                0,
+                100,
+                "keep alpha",
+                vec![
+                    attr("a_str", AttrValue::Str("x".into())),
+                    attr("b_int", AttrValue::I64(7)),
+                    attr("c_f64", AttrValue::F64(1.5)),
+                    attr("d_bool", AttrValue::Bool(true)),
+                    attr("e_bytes", AttrValue::Bytes(vec![1, 2])),
+                    attr(OVERFLOW_KEY, AttrValue::Str("ov".into())),
+                ],
+            ),
+            rec_attrs(0, 101, "drop beta", Vec::new()),
+            rec_attrs(
+                0,
+                102,
+                "keep gamma",
+                vec![attr("a_str", AttrValue::Str("y".into()))],
+            ),
+            rec_attrs(
+                0,
+                103,
+                "",
+                vec![
+                    attr("b_int", AttrValue::I64(-3)),
+                    attr("c_f64", AttrValue::F64(2.5)),
+                ],
+            ),
+            rec_attrs(
+                0,
+                104,
+                "keep delta",
+                vec![
+                    attr("a_str", AttrValue::Str(String::new())),
+                    attr("d_bool", AttrValue::Bool(false)),
+                ],
+            ),
+            rec_attrs(
+                1,
+                105,
+                "drop epsilon",
+                vec![attr("e_bytes", AttrValue::Bytes(vec![9]))],
+            ),
+            rec_attrs(
+                1,
+                106,
+                "keep zeta",
+                vec![attr(OVERFLOW_KEY, AttrValue::Str("ov2".into()))],
+            ),
+            rec_attrs(1, 107, "drop eta", Vec::new()),
+            rec_attrs(
+                1,
+                108,
+                "keep theta",
+                vec![attr("b_int", AttrValue::I64(i64::MIN))],
+            ),
+            {
+                let mut r = rec_attrs(1, 109, "", Vec::new());
+                r.trace_id = Some([3u8; 16]);
+                r.span_id = Some([4u8; 8]);
+                r
+            },
+            rec_attrs(
+                1,
+                110,
+                "keep iota",
+                vec![attr("c_f64", AttrValue::F64(-0.0))],
+            ),
+            {
+                let mut r = rec_attrs(
+                    1,
+                    111,
+                    "drop kappa",
+                    vec![
+                        attr("a_str", AttrValue::Str("z".into())),
+                        attr("d_bool", AttrValue::Bool(true)),
+                    ],
+                );
+                r.trace_id = Some([5u8; 16]);
+                r
+            },
+        ]
+    }
+
+    /// Which columns a [`ColumnSelection`] under test keeps, so the comparison
+    /// knows when a `None` from the view is the projection working rather than a
+    /// disagreement with the row path.
+    struct Kept {
+        observed_ts: bool,
+        severity_num: bool,
+        flags: bool,
+    }
+
+    /// Reads every field of surviving row `i` through the view and asserts it
+    /// equals the corresponding field of `r`, the record the row exit produced
+    /// for the same block at the same position.
+    fn assert_row_matches(view: &ColumnarBlockView<'_>, i: usize, r: &LogRecord, kept: &Kept) {
+        assert_eq!(view.ts(i), Some(r.ts_ns), "ts at surviving row {i}");
+        assert_eq!(
+            view.stream_id(i),
+            Some(&r.stream_id),
+            "stream_id at surviving row {i}"
+        );
+        assert_eq!(
+            view.stream_attrs(i),
+            Some(r.stream_attrs.as_slice()),
+            "stream_attrs at surviving row {i}"
+        );
+        // The blob is borrowed from STREAM_DIR, so two rows of the same stream
+        // read the identical slice rather than two clones.
+        assert_eq!(
+            view.stream_attrs(i),
+            view.stream_ref(i).and_then(|s| view.stream_attrs_of(s)),
+            "row and stream_ref forms of the blob must agree"
+        );
+
+        assert_eq!(
+            view.observed_ts(i),
+            kept.observed_ts.then_some(r.observed_ts_ns),
+            "observed_ts at surviving row {i}"
+        );
+        assert_eq!(
+            view.severity_num(i),
+            kept.severity_num.then_some(i64::from(r.severity_num)),
+            "severity_num at surviving row {i}"
+        );
+        assert_eq!(
+            view.flags(i),
+            kept.flags.then_some(i64::from(r.flags)),
+            "flags at surviving row {i}"
+        );
+
+        // `severity_text` and `body` are always-present columns whose value can
+        // be empty; the row path reads an absent one as `""` and so does this.
+        assert_eq!(
+            view.severity_text(i).unwrap_or(b""),
+            r.severity_text.as_bytes(),
+            "severity_text at surviving row {i}"
+        );
+        assert_eq!(
+            view.body(i).unwrap_or(b""),
+            r.body.as_bytes(),
+            "body at surviving row {i}"
+        );
+        assert_eq!(
+            view.trace_id(i).map(<[u8]>::to_vec),
+            r.trace_id.map(|t| t.to_vec()),
+            "trace_id at surviving row {i}"
+        );
+        assert_eq!(
+            view.span_id(i).map(<[u8]>::to_vec),
+            r.span_id.map(|s| s.to_vec()),
+            "span_id at surviving row {i}"
+        );
+
+        // Attributes reachable through FIELD_DIR columns, resolved once for the
+        // block and read per row. The row path pushes these in FIELD_DIR order
+        // and then appends whatever `attrs_raw` decoded, so the view-derived
+        // list must be a prefix of the record's and the remainder must be
+        // overflow keys only.
+        let mut got: Vec<(String, AttrValue)> = Vec::new();
+        for (name, col) in view.attr_columns() {
+            let v = match col.ty {
+                FieldType::Str => view
+                    .bytes_at(col.column_id, i)
+                    .and_then(|b| String::from_utf8(b.to_vec()).ok())
+                    .map(AttrValue::Str),
+                FieldType::Bytes => view
+                    .bytes_at(col.column_id, i)
+                    .map(|b| AttrValue::Bytes(b.to_vec())),
+                FieldType::I64 => view.i64_at(col.column_id, i).map(AttrValue::I64),
+                FieldType::F64 => view
+                    .f64_bits_at(col.column_id, i)
+                    .map(|bits| AttrValue::F64(f64::from_bits(bits))),
+                FieldType::Bool => view.bool_at(col.column_id, i).map(AttrValue::Bool),
+            };
+            if let Some(v) = v {
+                // Resolution by key must land on the same column.
+                assert_eq!(
+                    view.resolve_attr(name, col.ty),
+                    Some(col),
+                    "resolve_attr({name}) must match the enumerated column"
+                );
+                got.push((name.to_string(), v));
+            }
+        }
+        assert!(
+            got.len() <= r.attrs.len(),
+            "view produced {} attrs for surviving row {i}, record has {}",
+            got.len(),
+            r.attrs.len()
+        );
+        let (prefix, tail) = r.attrs.split_at(got.len());
+        for (g, w) in got.iter().zip(prefix) {
+            assert_eq!(g.0, w.0, "attr key at surviving row {i}");
+            assert!(
+                attr_value_eq(&g.1, &w.1),
+                "attr {} at surviving row {i}: view {:?} vs record {:?}",
+                g.0,
+                g.1,
+                w.1
+            );
+        }
+        for (k, _) in tail {
+            assert_eq!(
+                k, OVERFLOW_KEY,
+                "record attr {k} at surviving row {i} is not reachable through a \
+                 FIELD_DIR column and is not the known overflow key"
+            );
+        }
+        assert!(
+            view.resolve_attr(OVERFLOW_KEY, FieldType::Str).is_none(),
+            "the overflow key must have no FIELD_DIR column, or the corpus no \
+             longer exercises attrs_raw"
+        );
+    }
+
+    /// Drives the row exit and the columnar exit over the same object with the
+    /// same predicate and column selection, block for block, and asserts they
+    /// agree on every field of every surviving row. Returns each block's
+    /// `attrs_raw` page flag paired with whether that block's records actually
+    /// carried an overflow attribute.
+    fn compare_exits(
+        reader: &RlogReader<'_>,
+        obj: &[u8],
+        pred: &Predicate,
+        columns: &ColumnSelection,
+        kept: &Kept,
+        case: &str,
+    ) -> Vec<(bool, bool)> {
+        let mut rows_cursor = reader
+            .scan_blocks(pred, &[], columns)
+            .expect("open row cursor");
+        let mut col_cursor = reader
+            .scan_blocks(pred, &[], columns)
+            .expect("open columnar cursor");
+        let mut flags = Vec::new();
+        loop {
+            let records = rows_cursor.next_block(obj).expect("row exit");
+            let view = col_cursor.next_block_columnar(obj).expect("columnar exit");
+            match (records, view) {
+                (None, None) => break,
+                (Some(records), Some(view)) => {
+                    assert_eq!(
+                        view.surviving_count(),
+                        records.len(),
+                        "{case}: surviving row count must equal the row exit's record count"
+                    );
+                    assert!(
+                        view.record_count() >= view.surviving_count(),
+                        "{case}: surviving rows cannot outnumber the block's rows"
+                    );
+                    for (i, r) in records.iter().enumerate() {
+                        assert_row_matches(&view, i, r, kept);
+                    }
+                    // Out-of-range reads are `None`, never another row's data.
+                    assert_eq!(view.ts(view.surviving_count()), None, "{case}");
+
+                    // The gather iterators walk the same cells in the same order
+                    // as the per-row readers.
+                    let ts_iter: Vec<Option<i64>> = view.iter_ts().collect();
+                    let ts_rows: Vec<Option<i64>> =
+                        (0..view.surviving_count()).map(|i| view.ts(i)).collect();
+                    assert_eq!(ts_iter, ts_rows, "{case}: iter_ts");
+                    let body_iter: Vec<Option<&[u8]>> = view.iter_body().collect();
+                    let body_rows: Vec<Option<&[u8]>> =
+                        (0..view.surviving_count()).map(|i| view.body(i)).collect();
+                    assert_eq!(body_iter, body_rows, "{case}: iter_body");
+                    assert_eq!(
+                        view.iter_stream_ref().collect::<Vec<_>>(),
+                        (0..view.surviving_count())
+                            .map(|i| view.stream_ref(i))
+                            .collect::<Vec<_>>(),
+                        "{case}: iter_stream_ref"
+                    );
+
+                    if columns.is_all() {
+                        assert_eq!(
+                            view.pages_skipped(),
+                            0,
+                            "{case}: an all-columns decode skips no page"
+                        );
+                    }
+                    assert!(
+                        view.pages_decoded() > 0,
+                        "{case}: a surviving block decodes at least one page"
+                    );
+
+                    let record_has_overflow = records
+                        .iter()
+                        .any(|r| r.attrs.iter().any(|(k, _)| k == OVERFLOW_KEY));
+                    flags.push((view.has_attrs_raw_page(), record_has_overflow));
+                }
+                (records, view) => panic!(
+                    "{case}: exits disagree on exhaustion (row exit {}, columnar exit {})",
+                    records.is_some(),
+                    view.is_some()
+                ),
+            }
+        }
+        assert_eq!(
+            rows_cursor.stats(),
+            col_cursor.stats(),
+            "{case}: both exits must account for the same blocks and pages"
+        );
+        flags
+    }
+
+    /// Acceptance test for the columnar block view (issue #413): every field of
+    /// every surviving row, read through the view, equals the corresponding
+    /// field of the `LogRecord` the row exit produces for the same block at the
+    /// same position -- across an all-columns and a projected decode, and a
+    /// match-everything and a selective predicate.
+    ///
+    /// The selective predicate is the load-bearing half: it keeps a
+    /// non-contiguous subset of each block's rows, so an accessor that read its
+    /// index as a raw block row position would disagree here.
+    #[test]
+    fn columnar_view_matches_rebuilt_records() {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            max_dynamic_columns: COLUMNAR_MAX_COLUMNS,
+            ..RlogConfig::default()
+        };
+        let obj = build(cfg, columnar_corpus());
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+
+        let all_rows = Predicate::And(Vec::new());
+        let selective = Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "keep".into(),
+        };
+        // Projected: no observed_ts, severity_num, flags, trace_id or span_id,
+        // and only one of the five dynamic columns.
+        let projected = ColumnSelection::fixed_only()
+            .with_body()
+            .with_severity_text()
+            .with_attr("a_str");
+        let all_kept = Kept {
+            observed_ts: true,
+            severity_num: true,
+            flags: true,
+        };
+        let projected_kept = Kept {
+            observed_ts: false,
+            severity_num: false,
+            flags: false,
+        };
+
+        let flags = compare_exits(
+            &reader,
+            &obj,
+            &all_rows,
+            &ColumnSelection::all(),
+            &all_kept,
+            "match-all / all-columns",
+        );
+        // With a match-everything predicate every row survives, so the row
+        // exit's records cover the whole block and the `attrs_raw` page flag is
+        // exactly "some record here spilled".
+        assert!(flags.len() > 1, "corpus must produce several blocks");
+        for (has_page, record_has_overflow) in &flags {
+            assert_eq!(
+                has_page, record_has_overflow,
+                "attrs_raw page presence must match the block's spilled records"
+            );
+        }
+        assert!(
+            flags.iter().any(|(p, _)| *p),
+            "corpus must include a block whose records spill to attrs_raw"
+        );
+        assert!(
+            flags.iter().any(|(p, _)| !*p),
+            "corpus must include a block with no attrs_raw spill"
+        );
+
+        compare_exits(
+            &reader,
+            &obj,
+            &selective,
+            &ColumnSelection::all(),
+            &all_kept,
+            "selective / all-columns",
+        );
+        compare_exits(
+            &reader,
+            &obj,
+            &all_rows,
+            &projected,
+            &projected_kept,
+            "match-all / projected",
+        );
+        let selective_projected = compare_exits(
+            &reader,
+            &obj,
+            &selective,
+            &projected,
+            &projected_kept,
+            "selective / projected",
+        );
+        // The projected decode leaves `attrs_raw` decodable (naming an attribute
+        // key keeps it, since the key may have spilled), so the page flag is
+        // still answered from descriptors and still varies across blocks.
+        assert!(selective_projected.iter().any(|(p, _)| *p));
+        assert!(selective_projected.iter().any(|(p, _)| !*p));
+
+        // A projected decode really did skip pages, so the comparison above was
+        // over a partial decode rather than a silently-full one.
+        let mut cursor = reader
+            .scan_blocks(&all_rows, &[], &projected)
+            .expect("open cursor");
+        while cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .is_some()
+        {}
+        assert!(
+            cursor.stats().pages_skipped > 0,
+            "the projected selection must leave pages undecoded"
+        );
+    }
+
+    /// `ColumnarBlockView::str_dict` hands out a dictionary-encoded string
+    /// column intact, and fusing it back through the dictionary yields exactly
+    /// the per-row bytes the byte accessor returns for the same surviving rows
+    /// (ADR-0099 decision 4, deliverable 5). Presence is carried by the id
+    /// vector, so a surviving row whose column value is absent reads `None`
+    /// through both, an empty-string value survives as an empty dictionary
+    /// entry, and a plain-page column exposes no dictionary at all.
+    ///
+    /// The selective predicate drops a middle row, so the surviving rows are
+    /// non-contiguous: a dictionary that addressed ids by raw block row rather
+    /// than by surviving-row index would disagree here.
+    #[test]
+    fn columnar_str_dict_fuses_to_byte_accessor() {
+        let cfg = RlogConfig {
+            block_target_records: 8,
+            max_dynamic_columns: COLUMNAR_MAX_COLUMNS,
+            ..RlogConfig::default()
+        };
+        // "svc" is low cardinality (3 distinct across 6 present of 8 rows -> a
+        // dictionary page), carries an empty-string value, and is absent from
+        // two rows. Bodies are all distinct -> a plain page, and worded so
+        // `keep` drops one row to make the survivors non-contiguous.
+        let recs = vec![
+            rec_attrs(
+                0,
+                100,
+                "keep a",
+                vec![attr("svc", AttrValue::Str("api".into()))],
+            ),
+            rec_attrs(
+                0,
+                101,
+                "keep b",
+                vec![attr("svc", AttrValue::Str("".into()))],
+            ),
+            rec_attrs(0, 102, "drop c", Vec::new()),
+            rec_attrs(
+                0,
+                103,
+                "keep d",
+                vec![attr("svc", AttrValue::Str("api".into()))],
+            ),
+            rec_attrs(
+                0,
+                104,
+                "keep e",
+                vec![attr("svc", AttrValue::Str("db".into()))],
+            ),
+            rec_attrs(0, 105, "keep f", Vec::new()),
+            rec_attrs(
+                0,
+                106,
+                "keep g",
+                vec![attr("svc", AttrValue::Str("db".into()))],
+            ),
+            rec_attrs(
+                0,
+                107,
+                "keep h",
+                vec![attr("svc", AttrValue::Str("api".into()))],
+            ),
+        ];
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "keep".into(),
+        };
+
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let mut saw_dict = false;
+        let mut saw_absent = false;
+        let mut saw_empty = false;
+        while let Some(view) = cursor.next_block_columnar(&obj).expect("columnar exit") {
+            // A plain-page column (all-distinct bodies) exposes no dictionary.
+            assert!(
+                view.str_dict(COL_BODY).is_none(),
+                "a plain page must not be forced into a dictionary"
+            );
+
+            let svc = view
+                .resolve_attr("svc", FieldType::Str)
+                .expect("svc has a FIELD_DIR column");
+            let dict = view
+                .str_dict(svc.column_id)
+                .expect("the svc column is a dictionary page");
+            saw_dict = true;
+            assert_eq!(
+                dict.len(),
+                view.surviving_count(),
+                "the dictionary column spans exactly the surviving rows"
+            );
+
+            for i in 0..view.surviving_count() {
+                let via_bytes = view.bytes_at(svc.column_id, i);
+                // Fusing the dictionary form equals the byte accessor cell.
+                assert_eq!(dict.value_at(i), via_bytes, "surviving row {i}");
+                match dict.id_at(i) {
+                    Some(id) => {
+                        let entry = dict.dict()[id as usize].as_slice();
+                        assert_eq!(Some(entry), via_bytes, "id maps through dict() at {i}");
+                        if entry.is_empty() {
+                            saw_empty = true;
+                        }
+                    }
+                    None => {
+                        saw_absent = true;
+                        assert_eq!(via_bytes, None, "an absent id must read absent bytes");
+                    }
+                }
+            }
+            // The gather form agrees with the per-row form.
+            let ids_iter: Vec<Option<u32>> = dict.iter_ids().collect();
+            let ids_rows: Vec<Option<u32>> =
+                (0..view.surviving_count()).map(|i| dict.id_at(i)).collect();
+            assert_eq!(ids_iter, ids_rows, "iter_ids");
+        }
+        assert!(
+            saw_dict,
+            "the corpus must produce a dictionary-encoded svc page"
+        );
+        assert!(saw_absent, "a surviving row must carry an absent svc value");
+        assert!(
+            saw_empty,
+            "a surviving row must carry an empty-string svc value"
+        );
+    }
+
+    /// A four-row single-block fixture whose rows all match `keep`, carrying one
+    /// column of every declared attribute type. Used by the cursor tests below.
+    fn cursor_fixture() -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        let recs = vec![
+            rec_attrs(
+                0,
+                100,
+                "keep a",
+                vec![
+                    attr("b_int", AttrValue::I64(1)),
+                    attr("c_f64", AttrValue::F64(1.0)),
+                    attr("d_bool", AttrValue::Bool(true)),
+                    attr("a_str", AttrValue::Str("p".into())),
+                    attr("e_bytes", AttrValue::Bytes(vec![1])),
+                ],
+            ),
+            rec_attrs(0, 101, "keep b", vec![attr("b_int", AttrValue::I64(2))]),
+            rec_attrs(0, 102, "keep c", vec![attr("c_f64", AttrValue::F64(3.0))]),
+            // Row 3 sets no attribute at all: every dynamic column has a null
+            // cell here.
+            rec_attrs(0, 103, "keep d", Vec::new()),
+        ];
+        build(cfg, recs)
+    }
+
+    fn cursor_reader_cfg() -> RlogConfig {
+        RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        }
+    }
+
+    /// Deliverable 1 (#875): a cursor resolves its column once per block, so the
+    /// scan does O(columns) resolutions, never O(rows x columns). Pins the exact
+    /// count for a known 4-row, single-block fixture. The per-cell accessor --
+    /// the pre-change path -- is shown resolving the column on every cell (R per
+    /// column), so the exact-count assertion here fails against it: flipping the
+    /// cursor loop's `cur.at(i)` back to `view.i64_at(col, i)` turns 6 into
+    /// 6 * R.
+    #[test]
+    fn cursor_resolves_each_column_once_per_block() {
+        let obj = cursor_fixture();
+        let cfg = cursor_reader_cfg();
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::And(Vec::new());
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let view = cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let rows = view.surviving_count();
+        assert_eq!(rows, 4, "match-all keeps every row of the single block");
+
+        // Resolving these does not touch the block's column maps (FIELD_DIR
+        // lookups), so they do not move the counter.
+        let b_int = view.resolve_attr("b_int", FieldType::I64).expect("b_int");
+        let c_f64 = view.resolve_attr("c_f64", FieldType::F64).expect("c_f64");
+        let d_bool = view
+            .resolve_attr("d_bool", FieldType::Bool)
+            .expect("d_bool");
+        let a_str = view.resolve_attr("a_str", FieldType::Str).expect("a_str");
+        let e_bytes = view
+            .resolve_attr("e_bytes", FieldType::Bytes)
+            .expect("e_bytes");
+
+        let base = view.column_lookups();
+        // ts plus one column of every declared type: six distinct columns.
+        let cur_ts = view.ts_cursor();
+        let cur_bi = view.i64_cursor(b_int.column_id);
+        let cur_cf = view.f64_bits_cursor(c_f64.column_id);
+        let cur_db = view.bool_cursor(d_bool.column_id);
+        let cur_as = view.bytes_cursor(a_str.column_id);
+        let cur_eb = view.bytes_cursor(e_bytes.column_id);
+        const COLUMNS: u64 = 6;
+        // Walking every surviving row through the cursors adds no resolution.
+        for i in 0..rows {
+            let _ = (
+                cur_ts.at(i),
+                cur_bi.at(i),
+                cur_cf.at(i),
+                cur_db.at(i),
+                cur_as.at(i),
+                cur_eb.at(i),
+            );
+        }
+        let cursor_lookups = view.column_lookups() - base;
+        assert_eq!(
+            cursor_lookups, COLUMNS,
+            "one resolution per column, independent of the {rows} rows"
+        );
+
+        // The pre-change shape: the per-cell accessor resolves the column on
+        // every cell. Over the two i64 columns (ts, b_int) that is exactly 2 per
+        // row -- O(rows x columns), the cost this change deletes.
+        let before = view.column_lookups();
+        for i in 0..rows {
+            let _ = view.i64_at(COL_TS, i);
+            let _ = view.i64_at(b_int.column_id, i);
+        }
+        let per_cell = view.column_lookups() - before;
+        assert_eq!(
+            per_cell,
+            2 * rows as u64,
+            "per-cell accessor resolves once per cell"
+        );
+        assert!(
+            per_cell > COLUMNS,
+            "the pre-change per-cell path fails the O(columns) bound"
+        );
+    }
+
+    /// Deliverable 1 correctness bar (#875): a cursor keeps an absent column and
+    /// a present-but-null cell distinguishable, both directions. Both read as
+    /// `None` at the value level -- byte-identical to the per-cell accessor the
+    /// scan used before -- while `is_column_present` tells the two apart.
+    #[test]
+    fn cursor_distinguishes_absent_column_from_null_cell() {
+        let obj = cursor_fixture();
+        let cfg = cursor_reader_cfg();
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::And(Vec::new());
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let view = cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let b_int = view.resolve_attr("b_int", FieldType::I64).expect("b_int");
+
+        // Present column, null cell: b_int is decoded but row 3 sets no value.
+        let bi = view.i64_cursor(b_int.column_id);
+        assert!(bi.is_column_present(), "b_int is a decoded column");
+        assert_eq!(bi.at(0), Some(1), "row 0 sets b_int");
+        assert_eq!(bi.at(3), None, "row 3 has a null b_int cell");
+
+        // Absent column: b_int has no f64 storage, so an f64 cursor over its id
+        // resolves to no column at all.
+        let bi_as_f64 = view.f64_bits_cursor(b_int.column_id);
+        assert!(
+            !bi_as_f64.is_column_present(),
+            "there is no f64 column for b_int"
+        );
+        assert_eq!(bi_as_f64.at(0), None, "an absent column reads None");
+
+        // Both directions read None as a value, and the two are still
+        // distinguishable through `is_column_present`.
+        assert_eq!(bi.at(3), None, "null cell reads None");
+        assert_eq!(bi_as_f64.at(0), None, "absent column reads None");
+        assert_ne!(
+            bi.is_column_present(),
+            bi_as_f64.is_column_present(),
+            "null cell and absent column stay distinguishable"
+        );
+    }
+
+    /// Deliverable correctness bar (#875): the f64 cursor round-trips the exact
+    /// stored bit pattern, so `-0.0` stays distinct from `+0.0` and a NaN payload
+    /// survives. `f64_bits_at`/the cursor return bits for exactly this reason.
+    #[test]
+    fn f64_cursor_preserves_exact_bit_pattern() {
+        let cfg = RlogConfig {
+            block_target_records: 16,
+            max_dynamic_columns: 8,
+            ..RlogConfig::default()
+        };
+        let nan_payload = f64::from_bits(f64::NAN.to_bits() | 0x7);
+        let recs = vec![
+            rec_attrs(0, 100, "keep a", vec![attr("v", AttrValue::F64(-0.0))]),
+            rec_attrs(0, 101, "keep b", vec![attr("v", AttrValue::F64(0.0))]),
+            rec_attrs(
+                0,
+                102,
+                "keep c",
+                vec![attr("v", AttrValue::F64(nan_payload))],
+            ),
+            rec_attrs(0, 103, "keep d", vec![attr("v", AttrValue::F64(1.5))]),
+        ];
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+        let pred = Predicate::And(Vec::new());
+        let mut cursor = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor");
+        let view = cursor
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let v = view.resolve_attr("v", FieldType::F64).expect("v col");
+        let cur = view.f64_bits_cursor(v.column_id);
+        assert_eq!(cur.at(0), Some((-0.0f64).to_bits()), "-0.0 bit pattern");
+        assert_eq!(cur.at(1), Some(0.0f64.to_bits()), "+0.0 bit pattern");
+        assert_ne!(
+            cur.at(0),
+            cur.at(1),
+            "-0.0 and +0.0 are distinct bit patterns"
+        );
+        assert_eq!(
+            cur.at(2),
+            Some(nan_payload.to_bits()),
+            "NaN payload preserved"
+        );
+        assert_eq!(cur.at(3), Some(1.5f64.to_bits()));
+    }
+
+    /// Both exits reject a corrupt block with the same typed error, and neither
+    /// panics. The flipped byte is inside block 0's stored extent, so its
+    /// crc32c no longer matches its SKIP_IDX entry.
+    #[test]
+    fn corrupt_block_is_a_typed_error_through_both_exits() {
+        let cfg = RlogConfig {
+            block_target_records: 3,
+            ..RlogConfig::default()
+        };
+        let good = build(cfg, columnar_corpus());
+        let blocks_offset = open(&good)
+            .expect("open footer")
+            .section(kind::BLOCKS)
+            .expect("BLOCKS section")
+            .offset;
+        let skip = skip_of(&good);
+        let entry = skip.l0.first().expect("a first block");
+        // The block's first byte. Under version 4 `block_len` spans the whole
+        // row group (the block's pages are interleaved with its neighbours'),
+        // so a midpoint offset would land in another block; `block_offset` is
+        // the first block's own first page either way (ADR-0699 decision 1).
+        let at = usize::try_from(blocks_offset + entry.block_offset).expect("offset fits");
+        let mut obj = good.clone();
+        obj[at] ^= 0xff;
+
+        let pred = Predicate::And(Vec::new());
+        let reader = RlogReader::new(&obj, &cfg).expect("footer and sections are intact");
+        let err = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor")
+            .next_block(&obj)
+            .expect_err("row exit rejects the corrupt block");
+        assert!(matches!(err, LogSegError::Corrupted(_)), "{err:?}");
+        let err = reader
+            .scan_blocks(&pred, &[], &ColumnSelection::all())
+            .expect("open cursor")
+            .next_block_columnar(&obj)
+            .expect_err("columnar exit rejects the corrupt block");
+        assert!(matches!(err, LogSegError::Corrupted(_)), "{err:?}");
+
+        // Same object, uncorrupted: both exits succeed, so the assertions above
+        // are about the flipped byte and not about the fixture.
+        let reader = RlogReader::new(&good, &cfg).expect("open");
+        assert!(
+            reader
+                .scan_blocks(&pred, &[], &ColumnSelection::all())
+                .expect("open cursor")
+                .next_block(&good)
+                .expect("row exit")
+                .is_some()
+        );
+        assert!(
+            reader
+                .scan_blocks(&pred, &[], &ColumnSelection::all())
+                .expect("open cursor")
+                .next_block_columnar(&good)
+                .expect("columnar exit")
+                .is_some()
+        );
+    }
+
+    /// `ColumnarBlockView::decoded_bytes` reports the block's real resident
+    /// footprint: it counts every string cell's own allocation, not just the
+    /// column spines, and it tracks what the column selection actually decoded.
+    ///
+    /// The bodies are 4 KiB each and all distinct, so the body column is a plain
+    /// page and its per-cell term (8 x 4096 = 32768 bytes) dwarfs the spines a
+    /// `record_count`-based estimate would see. Distinct is deliberate: an
+    /// identical-body column would dictionary-encode to one 4 KiB entry plus
+    /// eight narrow ids (ADR-0099 decision 4), which is the case
+    /// `dict_decoded_bytes_reports_dictionary_footprint` pins. A figure that
+    /// counted spines only would land under the cell total and fail the first
+    /// assertion; a figure that ignored the column filter would fail the last
+    /// two.
+    #[test]
+    fn decoded_bytes_counts_cells_and_follows_the_column_selection() {
+        const ROWS: i64 = 8;
+        const BODY: usize = 4096;
+        let cfg = RlogConfig {
+            block_target_records: 64,
+            ..RlogConfig::default()
+        };
+        // Distinct bodies (a per-row suffix) keep the column a plain page, so the
+        // per-cell accounting under test is exercised rather than dictionary
+        // deduplication.
+        let recs: Vec<LogRecord> = (0..ROWS)
+            .map(|i| {
+                let body = format!("{}{i:08}", "b".repeat(BODY - 8));
+                rec_attrs(0, i, &body, Vec::new())
+            })
+            .collect();
+        let obj = build(cfg, recs);
+        let pred = Predicate::And(Vec::new());
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+
+        let bytes_with = |sel: &ColumnSelection| -> usize {
+            let mut cursor = reader.scan_blocks(&pred, &[], sel).expect("open cursor");
+            let view = cursor
+                .next_block_columnar(&obj)
+                .expect("columnar exit")
+                .expect("one block");
+            assert_eq!(view.surviving_count(), ROWS as usize);
+            view.decoded_bytes()
+        };
+
+        let with_body = bytes_with(&ColumnSelection::fixed_only().with_body());
+        let cells = ROWS as usize * BODY;
+        assert!(
+            with_body > cells,
+            "the body column's cells alone are {cells} bytes; got {with_body}"
+        );
+
+        let fixed_only = bytes_with(&ColumnSelection::fixed_only());
+        assert!(
+            fixed_only < cells,
+            "a decode that skipped the body column must not carry its \
+             {cells} bytes of cells; got {fixed_only}"
+        );
+        assert!(
+            with_body - fixed_only >= cells,
+            "adding the body column must add at least its cells \
+             ({cells}); with_body={with_body}, fixed_only={fixed_only}"
+        );
+    }
+
+    fn drain_ts(scan: &mut BlockScan, object: &[u8]) -> Vec<i64> {
+        let mut ts = Vec::new();
+        while let Some(rows) = scan.next_block(object).expect("block") {
+            ts.extend(rows.iter().map(|r| r.ts_ns));
+        }
+        ts
+    }
+
+    /// ADR-2414 decision A1: a reader built from decoded directories does not
+    /// seed its scans with the directories' decode, because whoever ran
+    /// [`RlogReader::decode_directories`] charges
+    /// [`SegmentDirectories::open_decompressed_bytes`] once; a reader that
+    /// decodes for itself still seeds it.
+    ///
+    /// Fails if `from_decoded` copies the open-time total into the reader (the
+    /// two scans would then report the same figure, one decode charged once per
+    /// reader), and if `from_source` stops seeding it (the difference would be
+    /// zero).
+    #[test]
+    fn a_decoded_reader_does_not_recharge_the_directory_decode() {
+        let (_, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let all = Predicate::TsRange {
+            min_ns: i64::MIN,
+            max_ns: i64::MAX,
+        };
+        let total = |reader: &RlogReader<'_>| {
+            let mut scan = reader
+                .scan_blocks(&all, &[], &ColumnSelection::all())
+                .expect("scan");
+            drain_ts(&mut scan, &object);
+            scan.stats().decompressed_bytes
+        };
+
+        let dirs = RlogReader::decode_directories(&object[..], &cfg).expect("directories");
+        assert!(dirs.open_decompressed_bytes() > 0, "the sections are zstd");
+        let own = RlogReader::new(&object, &cfg).expect("open");
+        assert_eq!(
+            own.directories().open_decompressed_bytes(),
+            dirs.open_decompressed_bytes(),
+            "one decode, one figure, however the directories are obtained"
+        );
+        let shared = RlogReader::from_decoded(&object[..], &dirs);
+        let pages = total(&shared);
+        assert!(pages > 0, "the blocks' zstd pages are charged");
+        assert_eq!(
+            total(&own),
+            pages + dirs.open_decompressed_bytes(),
+            "the self-decoding reader's scan adds exactly the directory decode"
+        );
+        assert_eq!(
+            total(&shared),
+            pages,
+            "and a second decoded reader adds none"
+        );
+    }
+
+    /// ADR-2773 decision 5: a reader given the SKIP_IDX, PAGE_DIR and
+    /// FIELD_DIR its caller already decoded seeds its scans with the sections
+    /// it decoded itself and no others, and scans the same rows as a reader
+    /// that decoded everything.
+    #[test]
+    fn a_reader_reusing_fetched_directories_charges_only_its_own_decodes() {
+        let (_, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let all = Predicate::TsRange {
+            min_ns: i64::MIN,
+            max_ns: i64::MAX,
+        };
+        let scanned = |reader: &RlogReader<'_>| {
+            let mut scan = reader
+                .scan_blocks(&all, &[], &ColumnSelection::all())
+                .expect("scan");
+            let ts = drain_ts(&mut scan, &object);
+            (ts, scan.stats().decompressed_bytes)
+        };
+        let footer = open_source(&object[..]).expect("footer");
+        let decompressed = |id| {
+            let desc = *section(&footer, id).expect("section");
+            let raw = read_section_from(&object[..], &desc, &cfg).expect("read");
+            section_decompressed_len(&desc, &raw)
+        };
+        let stream = decompressed(kind::STREAM_DIR);
+        let field = decompressed(kind::FIELD_DIR);
+
+        let dirs = RlogReader::decode_directories(&object[..], &cfg).expect("directories");
+        assert!(
+            dirs.open_decompressed_bytes() > stream + field,
+            "SKIP_IDX or PAGE_DIR is zstd, so reusing them changes the figure"
+        );
+        let own = RlogReader::new(&object, &cfg).expect("open");
+        let (own_ts, own_total) = scanned(&own);
+        let pages = own_total - dirs.open_decompressed_bytes();
+
+        let reusing = |field_dir: Option<Arc<FieldDir>>| {
+            RlogReader::from_source_reusing(
+                &object[..],
+                &cfg,
+                Arc::clone(&dirs.skip),
+                Arc::clone(&dirs.page_dir),
+                field_dir,
+            )
+            .expect("open reusing")
+        };
+        let all_passed = reusing(Some(Arc::clone(&dirs.field_dir)));
+        assert_eq!(all_passed.directories().open_decompressed_bytes(), stream);
+        assert_eq!(scanned(&all_passed), (own_ts.clone(), pages + stream));
+        let field_decoded = reusing(None);
+        assert_eq!(
+            field_decoded.directories().open_decompressed_bytes(),
+            stream + field
+        );
+        assert_eq!(scanned(&field_decoded), (own_ts, pages + stream + field));
+    }
+
+    /// `scan_blocks_raw_subset` names whole-object block indices, and the drain
+    /// follows the scan's own block order.
+    ///
+    /// Fails against the ordinal reading of `wanted` (`scan_blocks_subset`
+    /// positions): with blocks 0 and 1 pruned, positions 0 and 1 are blocks 2
+    /// and 3 and position 6 does not exist.
+    #[test]
+    fn a_raw_subset_names_whole_object_block_indices() {
+        let (records, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&object, &cfg).expect("open");
+        // Four records per block, so ts >= 1008 prunes blocks 0 and 1.
+        let from_block_two = Predicate::TsRange {
+            min_ns: 1_008,
+            max_ns: i64::MAX,
+        };
+        let block_ts =
+            |b: usize| -> Vec<i64> { records[4 * b..4 * b + 4].iter().map(|r| r.ts_ns).collect() };
+
+        let expected_survivors = [2, 3, 4, 5, 6, 7];
+        let mut scan = reader
+            .scan_blocks_raw_subset(
+                &from_block_two,
+                &[],
+                &ColumnSelection::all(),
+                &[6, 5],
+                &expected_survivors,
+            )
+            .expect("raw subset");
+        assert_eq!(scan.survivor_block_indices(), vec![5, 6]);
+        let mut want = block_ts(5);
+        want.extend(block_ts(6));
+        assert_eq!(drain_ts(&mut scan, &object), want);
+
+        let mut none = reader
+            .scan_blocks_raw_subset(
+                &from_block_two,
+                &[],
+                &ColumnSelection::all(),
+                &[],
+                &expected_survivors,
+            )
+            .expect("an empty share");
+        assert_eq!(none.remaining_blocks(), 0);
+        assert!(drain_ts(&mut none, &object).is_empty());
+    }
+
+    /// A survivor-list mismatch (the open's own pruning disagrees with the
+    /// caller's `expected_survivors`) refuses with a typed error instead of
+    /// silently keeping whatever intersection of `wanted` still exists.
+    ///
+    /// Fails against a wrong implementation that only compares survivor
+    /// *counts*: `[2, 3, 4, 5, 6, 7]` (6 real survivors) vs the wrong
+    /// `[0, 1, 2, 3, 4, 5]` below (also 6 entries, same length, different
+    /// blocks) would pass a length check but must still be refused here.
+    /// Also fails against a wrong implementation that ignores
+    /// `expected_survivors` entirely and just applies `wanted`: that version
+    /// returns `Ok` with the two requested blocks instead of `Err`. A share
+    /// naming a block the survivor lists do not hold (here block 0, which the
+    /// window prunes) is refused too, where a plain `retain` returns it as
+    /// absent.
+    #[test]
+    fn a_raw_subset_refuses_on_survivor_mismatch() {
+        let (_records, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let reader = RlogReader::new(&object, &cfg).expect("open");
+        let from_block_two = Predicate::TsRange {
+            min_ns: 1_008,
+            max_ns: i64::MAX,
+        };
+        let wrong_expected = [0, 1, 2, 3, 4, 5];
+        let result = reader.scan_blocks_raw_subset(
+            &from_block_two,
+            &[],
+            &ColumnSelection::all(),
+            &[2, 3],
+            &wrong_expected,
+        );
+        match result {
+            Err(LogSegError::Corrupted(_)) => {}
+            Err(other) => panic!("expected a typed Corrupted error, got {other:?}"),
+            Ok(_) => panic!("mismatched survivor list must refuse, not silently subset"),
+        }
+
+        let stray = reader.scan_blocks_raw_subset(
+            &from_block_two,
+            &[],
+            &ColumnSelection::all(),
+            &[0, 5],
+            &[2, 3, 4, 5, 6, 7],
+        );
+        match stray {
+            Err(LogSegError::Corrupted(msg)) => assert!(msg.contains("block 0"), "{msg}"),
+            Err(other) => panic!("expected a typed Corrupted error, got {other:?}"),
+            Ok(_) => panic!("a pruned block in the share must refuse, not drop"),
+        }
+    }
+
+    /// Readers built from one decoded [`SegmentDirectories`] share its STREAM_DIR,
+    /// FIELD_DIR and SKIP_IDX by reference rather than copying them, and report
+    /// the decoded length of all four sections.
+    ///
+    /// Fails against a `from_decoded` that clones the three sections (each
+    /// reader's `directories()` then points at a different allocation), and
+    /// against one that drops `decoded_bytes` when it rebuilds the directories
+    /// (the later copies report zero).
+    #[test]
+    fn readers_share_the_decoded_directories_and_report_their_decoded_length() {
+        let (_records, object) = dict_fixture::two_group_object();
+        let cfg = RlogConfig::default();
+        let dirs = RlogReader::decode_directories(&object[..], &cfg).expect("directories");
+        let first = RlogReader::from_decoded(&object[..], &dirs).directories();
+        let second = RlogReader::from_decoded(&object[..], &first).directories();
+        for later in [&first, &second] {
+            assert!(std::ptr::eq(dirs.stream_dir(), later.stream_dir()));
+            assert!(std::ptr::eq(dirs.field_dir(), later.field_dir()));
+            assert!(std::ptr::eq(dirs.skip_index(), later.skip_index()));
+            assert!(Arc::ptr_eq(dirs.page_dir(), later.page_dir()));
+            assert_eq!(later.decoded_bytes(), dirs.decoded_bytes());
+        }
+        let footer = crate::footer::open(&object).expect("footer");
+        let want: u64 = [
+            kind::STREAM_DIR,
+            kind::FIELD_DIR,
+            kind::SKIP_IDX,
+            kind::PAGE_DIR,
+        ]
+        .iter()
+        .map(|k| footer.section(*k).expect("section").uncomp_len)
+        .sum();
+        assert_eq!(dirs.decoded_bytes(), want);
+    }
+
+    /// ADR-2677 decision 6: the cursor reports each surviving block's stored
+    /// `ts` bounds before decoding it, and a skipped block is neither decoded
+    /// nor counted in `blocks_scanned`, while the blocks after it still decode
+    /// their own rows. Two streams make the block minima non-monotone.
+    #[test]
+    fn block_ts_bounds_and_skip_leave_later_blocks_intact() {
+        let cfg = RlogConfig {
+            block_target_records: 4,
+            ..RlogConfig::default()
+        };
+        // Each stream holds a low block and a high block, so in either stream
+        // order the second block (the first stream's high one) is above the
+        // third (the second stream's low one).
+        let mut recs = Vec::new();
+        for (stream, base) in [(1u8, 0i64), (2, 10)] {
+            for i in 0..4 {
+                recs.push(rec(stream, base + i, &format!("s{stream}-lo{i}")));
+                recs.push(rec(stream, base + 100 + i, &format!("s{stream}-hi{i}")));
+            }
+        }
+        let obj = build(cfg, recs);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut cursor = reader
+            .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+            .expect("scan");
+
+        let mut bounds = Vec::new();
+        let mut bodies = Vec::new();
+        while let Some(b) = cursor.next_block_ts_bounds() {
+            bounds.push(b);
+            if bounds.len() == 2 {
+                assert!(cursor.skip_next_block());
+                continue;
+            }
+            let rows = cursor.next_block(&obj).expect("next").expect("a block");
+            bodies.extend(rows.into_iter().map(|r| r.body));
+        }
+        assert_eq!(bounds.len(), 4);
+        assert!(
+            bounds[1].0 >= 100 && bounds[2].0 < 100,
+            "block minima are not monotone: {bounds:?}"
+        );
+        let mut sorted = bounds.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, vec![(0, 3), (10, 13), (100, 103), (110, 113)]);
+        assert!(
+            !cursor.skip_next_block(),
+            "an exhausted cursor skips nothing"
+        );
+        assert_eq!(
+            cursor.stats().blocks_scanned,
+            3,
+            "the skipped block is not scanned"
+        );
+        assert_eq!(bodies.len(), 12);
+        let skipped_stream = if bounds[1].0 == 100 { 1 } else { 2 };
+        assert!(
+            bodies
+                .iter()
+                .all(|b| !b.starts_with(&format!("s{skipped_stream}-hi"))),
+            "the skipped block's rows are not returned: {bodies:?}"
+        );
+        assert_eq!(
+            bodies.iter().filter(|b| b.contains("-lo")).count(),
+            8,
+            "both low blocks, the one after the skip included, decode whole"
+        );
+    }
+
+    /// Per-block content evaluation (ADR-2773 decision D2) against the
+    /// row-by-row [`eval`] it replaced.
+    mod block_predicate {
+        use super::*;
+        use proptest::prelude::*;
+
+        const BODIES: [&str; 5] = ["alpha beta", "beta gamma", "gamma", "", "alpha delta"];
+        const LO: [&str; 3] = ["x", "y", "x y"];
+        const ZZ: [&str; 3] = ["p q", "q", "p"];
+        const F: [f64; 3] = [0.0, -0.0, 1.5];
+
+        /// One generated record: indexes into the pools above, `None` for an
+        /// attribute the record does not carry.
+        #[derive(Clone, Debug)]
+        struct Row {
+            stream: u8,
+            ts: i64,
+            body: usize,
+            lo: Option<usize>,
+            hi: bool,
+            n: Option<i64>,
+            flag: Option<bool>,
+            blob: Option<u8>,
+            f: Option<usize>,
+            zz: Option<usize>,
+        }
+
+        fn row() -> impl Strategy<Value = Row> {
+            (
+                (0u8..6, 0i64..40, 0usize..BODIES.len()),
+                (
+                    proptest::option::of(0usize..LO.len()),
+                    any::<bool>(),
+                    proptest::option::of(-2i64..3),
+                    proptest::option::of(any::<bool>()),
+                ),
+                (
+                    proptest::option::of(0u8..3),
+                    proptest::option::of(0usize..F.len()),
+                    proptest::option::of(0usize..ZZ.len()),
+                ),
+            )
+                .prop_map(|((stream, ts, body), (lo, hi, n, flag), (blob, f, zz))| {
+                    Row {
+                        stream,
+                        ts,
+                        body,
+                        lo,
+                        hi,
+                        n,
+                        flag,
+                        blob,
+                        f,
+                        zz,
+                    }
+                })
+        }
+
+        fn blob(b: u8) -> Vec<u8> {
+            [vec![], vec![1], vec![2, 3]][b as usize].clone()
+        }
+
+        /// The records, and the dynamic column cap that gives every attribute
+        /// but `zz` (last in the writer's `(name, type)` order) a column, so
+        /// `zz` always overflows into `attrs_raw`.
+        fn corpus(rows: &[Row]) -> (Vec<LogRecord>, usize) {
+            let mut pairs = std::collections::BTreeSet::new();
+            let recs = rows
+                .iter()
+                .enumerate()
+                .map(|(i, r)| {
+                    let mut attrs = Vec::new();
+                    if let Some(v) = r.lo {
+                        attrs.push(attr("lo", AttrValue::Str(LO[v].into())));
+                    }
+                    if r.hi {
+                        attrs.push(attr("hi", AttrValue::Str(format!("u{i}"))));
+                    }
+                    if let Some(v) = r.n {
+                        attrs.push(attr("n", AttrValue::I64(v)));
+                    }
+                    if let Some(v) = r.flag {
+                        attrs.push(attr("flag", AttrValue::Bool(v)));
+                    }
+                    if let Some(v) = r.blob {
+                        attrs.push(attr("blob", AttrValue::Bytes(blob(v))));
+                    }
+                    if let Some(v) = r.f {
+                        attrs.push(attr("f", AttrValue::F64(F[v])));
+                    }
+                    for (k, _) in &attrs {
+                        pairs.insert(k.clone());
+                    }
+                    if let Some(v) = r.zz {
+                        attrs.push(attr("zz", AttrValue::Str(ZZ[v].into())));
+                    }
+                    rec_attrs(r.stream, r.ts, BODIES[r.body], attrs)
+                })
+                .collect();
+            (recs, pairs.len())
+        }
+
+        /// The attribute equality arms: every column type, a dictionary and a
+        /// plain string column, values present and absent, and arms whose
+        /// value type has no column (`n` as a string, `zz` as an integer) or
+        /// whose field overflows (`zz`), which take the per-row path.
+        fn attr_equals() -> Vec<(&'static str, AttrValue)> {
+            vec![
+                ("lo", AttrValue::Str("x".into())),
+                ("lo", AttrValue::Str("x y".into())),
+                ("lo", AttrValue::Str("nope".into())),
+                ("hi", AttrValue::Str("u3".into())),
+                ("hi", AttrValue::Str("u0".into())),
+                ("n", AttrValue::I64(0)),
+                ("n", AttrValue::I64(2)),
+                ("n", AttrValue::Str("1".into())),
+                ("flag", AttrValue::Bool(true)),
+                ("flag", AttrValue::Bool(false)),
+                ("blob", AttrValue::Bytes(vec![2, 3])),
+                ("blob", AttrValue::Bytes(vec![])),
+                ("f", AttrValue::F64(0.0)),
+                ("f", AttrValue::F64(-0.0)),
+                ("zz", AttrValue::Str("q".into())),
+                ("zz", AttrValue::Str("p q".into())),
+                ("zz", AttrValue::I64(1)),
+                ("missing", AttrValue::Str("x".into())),
+            ]
+        }
+
+        fn ts_arm() -> impl Strategy<Value = Predicate> {
+            (-2i64..42, 0i64..24).prop_map(|(min_ns, len)| Predicate::TsRange {
+                min_ns,
+                max_ns: min_ns + len,
+            })
+        }
+
+        fn stream_arm() -> impl Strategy<Value = Predicate> {
+            proptest::collection::vec(0u8..8, 1..6)
+                .prop_map(|s| Predicate::StreamIn(s.into_iter().map(sid).collect()))
+        }
+
+        /// A window over every `ts` a hand-built block draws (`0..30`), so
+        /// the block's bounds always fall inside it.
+        fn covering_ts_arm() -> impl Strategy<Value = Predicate> {
+            (-2i64..1, 31i64..34).prop_map(|(min_ns, len)| Predicate::TsRange {
+                min_ns,
+                max_ns: min_ns + len,
+            })
+        }
+
+        /// Every stream the corpus can hold, so a hand-built block whose refs
+        /// all resolve has bounds the set covers.
+        fn covering_stream_arm() -> impl Strategy<Value = Predicate> {
+            Just(Predicate::StreamIn((0u8..8).map(sid).collect()))
+        }
+
+        fn arm() -> impl Strategy<Value = Predicate> {
+            let words = ["alpha", "beta", "gamma delta", "x", "u1", "p", "q", "1"];
+            prop_oneof![
+                3 => ts_arm(),
+                3 => stream_arm(),
+                1 => (0usize..BODIES.len()).prop_map(|b| Predicate::Equals {
+                    field: FieldSel::Body,
+                    value: AttrValue::Str(BODIES[b].into()),
+                }),
+                1 => Just(Predicate::Equals {
+                    field: FieldSel::Body,
+                    value: AttrValue::I64(1),
+                }),
+                1 => prop_oneof![Just("INFO"), Just("WARN")].prop_map(|s| Predicate::Equals {
+                    field: FieldSel::SeverityText,
+                    value: AttrValue::Str(s.into()),
+                }),
+                1 => (0usize..words.len()).prop_map(move |w| Predicate::HasWord {
+                    field: FieldSel::Body,
+                    word: words[w].into(),
+                }),
+                3 => (0usize..attr_equals().len()).prop_map(|i| {
+                    let (name, value) = attr_equals().swap_remove(i);
+                    Predicate::Equals {
+                        field: FieldSel::Attr(name.into()),
+                        value,
+                    }
+                }),
+                2 => (0usize..4, 0usize..words.len()).prop_map(move |(f, w)| {
+                    Predicate::HasWord {
+                        field: FieldSel::Attr(["lo", "hi", "zz", "n"][f].into()),
+                        word: words[w].into(),
+                    }
+                }),
+                1 => Just(Predicate::NumRange {
+                    field: FieldSel::Attr("n".into()),
+                    ty: FieldType::I64,
+                    min: Some(1),
+                    max: Some(1),
+                }),
+            ]
+        }
+
+        /// What [`eval`] gives row by row over the whole predicate: the
+        /// matching rows ascending, or an error if any row errors.
+        fn oracle(
+            sd: &StreamDir,
+            fd: &FieldDir,
+            pred: &Predicate,
+            block: &DecodedBlock,
+        ) -> Result<Vec<usize>, LogSegError> {
+            let mut out = Vec::new();
+            for row in 0..block.record_count() {
+                if eval(sd, fd, pred, block, row)? {
+                    out.push(row);
+                }
+            }
+            Ok(out)
+        }
+
+        fn kernel(
+            sd: &StreamDir,
+            fd: &FieldDir,
+            pred: &Predicate,
+            loc: &BlockLoc,
+            block: &DecodedBlock,
+        ) -> Result<Vec<usize>, LogSegError> {
+            let mut flat = Vec::new();
+            flatten(pred, &mut flat);
+            let arms = compile_arms(sd, fd, &flat);
+            let mut out = Vec::new();
+            block_survivors(
+                sd,
+                fd,
+                &arms,
+                loc,
+                block,
+                &mut DictArmMemo::default(),
+                &mut ScanStats::default(),
+                &mut out,
+            )?;
+            Ok(out)
+        }
+
+        /// An integer column cell: absent, or a value.
+        fn cell(range: std::ops::Range<i64>) -> impl Strategy<Value = Option<i64>> {
+            proptest::option::weighted(0.9, range)
+        }
+
+        /// A block's honest skip-index bounds over its present cells. A
+        /// negative ref has no `u32` bound, so a block holding one reads as
+        /// bounds no ref satisfies.
+        fn loc_for(ts: &[Option<i64>], refs: &[Option<i64>]) -> BlockLoc {
+            let ts: Vec<i64> = ts.iter().flatten().copied().collect();
+            let present: Vec<i64> = refs.iter().flatten().copied().collect();
+            let (min_stream_ref, max_stream_ref) = match (
+                present.iter().min().map(|&v| u32::try_from(v)),
+                present.iter().max().map(|&v| u32::try_from(v)),
+            ) {
+                (Some(Ok(lo)), Some(Ok(hi))) => (lo, hi),
+                _ => (1, 0),
+            };
+            BlockLoc {
+                record_count: refs.len(),
+                crc32c: 0,
+                block_index: 0,
+                min_ts: ts.iter().min().copied().unwrap_or(0),
+                max_ts: ts.iter().max().copied().unwrap_or(0),
+                min_stream_ref,
+                max_stream_ref,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            /// The block kernels keep exactly the rows the old per-row
+            /// [`eval`] kept, over writer-built objects (dictionary and plain
+            /// string pages, NULL attribute cells, an overflowing attribute in
+            /// `attrs_raw`) and over hand-built blocks with absent and
+            /// out-of-range `ts`/`stream_ref` cells.
+            #[test]
+            fn block_predicate_kernel_matches_row_by_row_eval(
+                rows in proptest::collection::vec(row(), 1..60),
+                block_target_records in 2usize..12,
+                group_target_blocks in 1usize..4,
+                arms in proptest::collection::vec(arm(), 1..=4),
+                cells in (1usize..140).prop_flat_map(|n| (
+                    proptest::collection::vec(cell(0..30), n),
+                    proptest::collection::vec(cell(-1..8), n),
+                    proptest::collection::vec(cell(-1..3), n),
+                )),
+                synthetic_arms in proptest::collection::vec(
+                    prop_oneof![
+                        ts_arm(),
+                        stream_arm(),
+                        (-1i64..3).prop_map(|v| Predicate::Equals {
+                            field: FieldSel::Attr("n".into()),
+                            value: AttrValue::I64(v),
+                        }),
+                    ],
+                    1..=4,
+                ),
+                // Drawn after the parameters above so the committed seeds
+                // still replay the cases they recorded.
+                narrow in any::<bool>(),
+                covering_arms in proptest::collection::vec(
+                    prop_oneof![covering_ts_arm(), covering_stream_arm()],
+                    0..=2,
+                ),
+            ) {
+                let (recs, columns) = corpus(&rows);
+                let cfg = RlogConfig {
+                    block_target_records,
+                    group_target_blocks,
+                    max_dynamic_columns: columns,
+                    ..RlogConfig::default()
+                };
+                let obj = build(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                let pred = Predicate::And(arms);
+
+                // Every block, decoded whole: the kernel sees windows and
+                // stream sets that cover, cut, and miss it, which pruning
+                // would otherwise keep it from seeing.
+                let mut all = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                while all.next_block_columnar(&obj).expect("decode").is_some() {
+                    let loc = all.blocks[all.next - 1];
+                    let block = all.current.as_ref().expect("decoded");
+                    let want = oracle(sd, fd, &pred, block).expect("oracle");
+                    let got = kernel(sd, fd, &pred, &loc, block).expect("kernel");
+                    prop_assert_eq!(got, want, "block {}", loc.block_index);
+                }
+
+                // The scan itself, pruning included.
+                let mut scan = reader
+                    .scan_blocks(&pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    let want = oracle(sd, fd, &pred, block).expect("oracle");
+                    prop_assert_eq!(&scan.surviving, &want);
+                }
+
+                // Hand-built blocks with absent cells, a negative ref, and
+                // refs past the directory, or (`narrow`) refs only within the
+                // first three streams; covering arms put such a block's bounds
+                // wholly inside a window or stream set while a cell is absent.
+                // Only the outcome is compared on an error: the kernels visit
+                // arm by arm, so which row's error surfaces first may differ.
+                let (ts, mut refs, n) = cells;
+                if narrow {
+                    for r in refs.iter_mut().flatten() {
+                        *r = r.rem_euclid(3);
+                    }
+                }
+                let synthetic_arms: Vec<Predicate> =
+                    synthetic_arms.into_iter().chain(covering_arms).collect();
+                let mut cols = vec![
+                    (COL_TS, I64Column::from_options(&ts)),
+                    (COL_STREAM_REF, I64Column::from_options(&refs)),
+                ];
+                if let Some(e) = fd.column("n", FieldType::I64) {
+                    cols.push((e.column_id, I64Column::from_options(&n)));
+                }
+                let loc = loc_for(&ts, &refs);
+                let block = DecodedBlock::with_i64_columns(refs.len(), cols);
+                let pred = Predicate::And(synthetic_arms);
+                let want = oracle(sd, fd, &pred, &block);
+                let got = kernel(sd, fd, &pred, &loc, &block);
+                match (&got, &want) {
+                    (Ok(g), Ok(w)) => prop_assert_eq!(g, w),
+                    (Err(_), Err(_)) => {}
+                    _ => prop_assert!(false, "kernel {got:?}, row-by-row {want:?}"),
+                }
+            }
+        }
+
+        /// The generator's corpus reaches the page shapes the property claims
+        /// to cover: `lo` stored on dictionary pages, the per-row-unique `hi`
+        /// on plain pages, and `zz` in `attrs_raw`.
+        #[test]
+        fn kernel_corpus_reaches_dict_plain_and_overflow_pages() {
+            let rows: Vec<Row> = (0..24)
+                .map(|i| Row {
+                    stream: (i % 3) as u8,
+                    ts: i,
+                    body: i as usize % BODIES.len(),
+                    lo: Some(i as usize % 2),
+                    hi: true,
+                    n: (i % 4 != 0).then_some(i % 3),
+                    flag: Some(i % 2 == 0),
+                    blob: Some((i % 3) as u8),
+                    f: Some(i as usize % F.len()),
+                    zz: Some(i as usize % ZZ.len()),
+                })
+                .collect();
+            let (recs, columns) = corpus(&rows);
+            let cfg = RlogConfig {
+                block_target_records: 8,
+                max_dynamic_columns: columns,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            let fd = &*reader.field_dir;
+            let lo = fd
+                .column("lo", FieldType::Str)
+                .expect("lo column")
+                .column_id;
+            let hi = fd
+                .column("hi", FieldType::Str)
+                .expect("hi column")
+                .column_id;
+            assert!(fd.column("zz", FieldType::Str).is_none(), "zz overflows");
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut blocks = 0;
+            while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                let block = scan.current.as_ref().expect("decoded");
+                assert!(matches!(block.str_column(lo), Some(StrColumn::Dict(_))));
+                assert!(matches!(block.str_column(hi), Some(StrColumn::Plain(_))));
+                assert!(block.str_column(COL_ATTRS_RAW).is_some());
+                blocks += 1;
+            }
+            assert_eq!(blocks, 3);
+        }
+
+        fn eval_calls() -> u64 {
+            EVAL_CALLS.with(std::cell::Cell::get)
+        }
+
+        fn kernel_arms() -> u64 {
+            KERNEL_ARMS.with(std::cell::Cell::get)
+        }
+
+        /// A block the window and the stream set both cover keeps every row
+        /// without evaluating any; an overflow attribute arm on top of them
+        /// costs exactly one [`eval`] per row and no kernel.
+        #[test]
+        fn block_wholly_inside_the_window_makes_no_per_row_eval() {
+            let recs: Vec<LogRecord> = (0..24)
+                .map(|i| {
+                    rec_attrs(
+                        1 + (i % 2) as u8,
+                        100 + i,
+                        "b",
+                        vec![
+                            attr("a", AttrValue::I64(i)),
+                            attr("zz", AttrValue::Str(ZZ[(i % 3) as usize].into())),
+                        ],
+                    )
+                })
+                .collect();
+            let cfg = RlogConfig {
+                block_target_records: 6,
+                max_dynamic_columns: 1,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            assert!(
+                reader.field_dir.column("zz", FieldType::Str).is_none(),
+                "zz overflows into attrs_raw"
+            );
+            let covering = vec![
+                Predicate::TsRange {
+                    min_ns: 100,
+                    max_ns: 123,
+                },
+                Predicate::StreamIn(vec![sid(1), sid(2), sid(9)]),
+            ];
+
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(
+                    &Predicate::And(covering.clone()),
+                    &[],
+                    &ColumnSelection::all(),
+                )
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(rows, 24, "every row survives");
+            assert_eq!(stats.blocks_scanned, 4);
+            assert_eq!(eval_calls() - evals, 0, "no per-row eval");
+            assert_eq!(kernel_arms() - kernels, 0, "no block kernel");
+            assert_eq!(
+                stats.blocks_predicate_dropped, 4,
+                "every block drops every arm"
+            );
+            assert_eq!(stats.rows_predicate_evaluated, 0);
+
+            let mut with_overflow = covering;
+            with_overflow.push(Predicate::Equals {
+                field: FieldSel::Attr("zz".into()),
+                value: AttrValue::Str("q".into()),
+            });
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(with_overflow), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(rows, 8, "the rows whose zz is \"q\"");
+            assert_eq!(eval_calls() - evals, 24, "one eval per row the bounds kept");
+            assert_eq!(kernel_arms() - kernels, 0, "the ts and stream arms dropped");
+            assert_eq!(stats.blocks_predicate_dropped, 0);
+            assert_eq!(stats.rows_predicate_evaluated, 24);
+
+            // A window cutting the two blocks that hold ts 100..=102 runs the
+            // ts kernel on both, and the overflow arm only on the three rows
+            // it kept.
+            let cut = vec![
+                Predicate::TsRange {
+                    min_ns: 100,
+                    max_ns: 102,
+                },
+                Predicate::Equals {
+                    field: FieldSel::Attr("zz".into()),
+                    value: AttrValue::Str("q".into()),
+                },
+            ];
+            let (evals, kernels) = (eval_calls(), kernel_arms());
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(cut), &[], &ColumnSelection::all())
+                .expect("scan");
+            let mut rows = 0;
+            while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                rows += view.surviving_count();
+            }
+            let stats = scan.stats();
+            assert_eq!(
+                rows, 1,
+                "ts 101, the one row in the window whose zz is \"q\""
+            );
+            assert_eq!(stats.blocks_scanned, 2);
+            assert_eq!(kernel_arms() - kernels, 2, "one ts kernel per block");
+            assert_eq!(eval_calls() - evals, 3, "one eval per row the ts arm kept");
+            assert_eq!(stats.blocks_predicate_dropped, 0);
+            assert_eq!(stats.rows_predicate_evaluated, 12);
+        }
+
+        /// An object with streams 0, 1 and 2, for its directories.
+        fn three_stream_reader_object() -> Vec<u8> {
+            let recs = (0..6)
+                .map(|i| rec_attrs((i % 3) as u8, i, "b", Vec::new()))
+                .collect();
+            build(RlogConfig::default(), recs)
+        }
+
+        /// A hand-built block of three rows whose middle row has no cell in
+        /// `absent` (`COL_TS` or `COL_STREAM_REF`), the other column complete.
+        fn block_with_absent_cell(sd: &StreamDir, absent: u32) -> (BlockLoc, DecodedBlock) {
+            let r0 = i64::from(sd.stream_ref(&sid(0)).expect("stream 0"));
+            let r1 = i64::from(sd.stream_ref(&sid(1)).expect("stream 1"));
+            let (ts, refs) = if absent == COL_TS {
+                (
+                    vec![Some(5), None, Some(7)],
+                    vec![Some(r0), Some(r1), Some(r0)],
+                )
+            } else {
+                (
+                    vec![Some(5), Some(6), Some(7)],
+                    vec![Some(r0), None, Some(r1)],
+                )
+            };
+            let loc = loc_for(&ts, &refs);
+            let block = DecodedBlock::with_i64_columns(
+                3,
+                vec![
+                    (COL_TS, I64Column::from_options(&ts)),
+                    (COL_STREAM_REF, I64Column::from_options(&refs)),
+                ],
+            );
+            (loc, block)
+        }
+
+        /// A block whose `ts` bounds lie wholly inside the window still runs
+        /// the `ts` arm when a row has no `ts` cell, and reports it corrupt,
+        /// as the row-by-row evaluation does, rather than keeping every row.
+        #[test]
+        fn absent_ts_cell_in_a_covered_block_is_corrupted() {
+            let obj = three_stream_reader_object();
+            let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open object");
+            let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+            let (loc, block) = block_with_absent_cell(sd, COL_TS);
+            let pred = Predicate::TsRange {
+                min_ns: 0,
+                max_ns: 10,
+            };
+            assert_eq!((loc.min_ts, loc.max_ts), (5, 7), "bounds inside the window");
+            let want = oracle(sd, fd, &pred, &block);
+            let got = kernel(sd, fd, &pred, &loc, &block);
+            assert!(
+                matches!(want, Err(LogSegError::Corrupted(_))),
+                "row-by-row: {want:?}"
+            );
+            assert!(
+                matches!(got, Err(LogSegError::Corrupted(_))),
+                "kernel: {got:?}"
+            );
+        }
+
+        /// A block whose `stream_ref` bounds the stream set covers still runs
+        /// the stream arm when a row has no `stream_ref` cell, and reports it
+        /// corrupt, as the row-by-row evaluation does.
+        #[test]
+        fn absent_stream_ref_cell_in_a_covered_block_is_corrupted() {
+            let obj = three_stream_reader_object();
+            let reader = RlogReader::new(&obj, &RlogConfig::default()).expect("open object");
+            let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+            let (loc, block) = block_with_absent_cell(sd, COL_STREAM_REF);
+            let pred = Predicate::StreamIn(vec![sid(0), sid(1)]);
+            let covered: Vec<u32> = [sid(0), sid(1)]
+                .iter()
+                .filter_map(|id| sd.stream_ref(id))
+                .collect();
+            assert!(
+                (loc.min_stream_ref..=loc.max_stream_ref).all(|r| covered.contains(&r)),
+                "bounds {}..={} inside the set {covered:?}",
+                loc.min_stream_ref,
+                loc.max_stream_ref
+            );
+            let want = oracle(sd, fd, &pred, &block);
+            let got = kernel(sd, fd, &pred, &loc, &block);
+            assert!(
+                matches!(want, Err(LogSegError::Corrupted(_))),
+                "row-by-row: {want:?}"
+            );
+            assert!(
+                matches!(got, Err(LogSegError::Corrupted(_))),
+                "kernel: {got:?}"
+            );
+        }
+
+        fn dict_entry_visits() -> u64 {
+            DICT_ENTRY_VISITS.with(std::cell::Cell::get)
+        }
+
+        fn dict_word_memos() -> u64 {
+            DICT_WORD_MEMOS.with(std::cell::Cell::get)
+        }
+
+        /// The blocks of a row group share its dictionary, and a scan does a
+        /// dictionary arm's per-entry work once per dictionary: an `Equals`
+        /// compares each entry with its target once, and a `HasWord`
+        /// allocates one memo, however many blocks read the dictionary.
+        #[test]
+        fn dictionary_arm_work_is_done_once_per_dictionary() {
+            let recs: Vec<LogRecord> = (0..24)
+                .map(|i| {
+                    rec_attrs(
+                        0,
+                        i,
+                        "b",
+                        vec![attr("lo", AttrValue::Str(LO[(i % 3) as usize].into()))],
+                    )
+                })
+                .collect();
+            let cfg = RlogConfig {
+                block_target_records: 6,
+                ..RlogConfig::default()
+            };
+            let obj = build(cfg, recs);
+            let reader = RlogReader::new(&obj, &cfg).expect("open object");
+            let lo = reader
+                .field_dir
+                .column("lo", FieldType::Str)
+                .expect("lo column")
+                .column_id;
+
+            let mut dicts: Vec<Arc<DictValues>> = Vec::new();
+            let mut scan = reader
+                .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                .expect("scan");
+            while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                let block = scan.current.as_ref().expect("decoded");
+                let Some(StrColumn::Dict(d)) = block.str_column(lo) else {
+                    panic!("lo is on dictionary pages");
+                };
+                dicts.push(d.values().clone());
+            }
+            assert_eq!(dicts.len(), 4, "four blocks");
+            assert!(
+                dicts.iter().all(|d| Arc::ptr_eq(d, &dicts[0])),
+                "one row group dictionary shared by every block"
+            );
+            let entries = dicts[0].len() as u64;
+            assert_eq!(entries, 3);
+            drop(dicts);
+
+            let run = |pred: Predicate| {
+                let mut scan = reader
+                    .scan_blocks(&pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                let mut rows = 0;
+                while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                    rows += view.surviving_count();
+                }
+                assert_eq!(scan.stats().blocks_scanned, 4);
+                assert_eq!(scan.stats().rows_predicate_evaluated, 24);
+                rows
+            };
+
+            let visits = dict_entry_visits();
+            let rows = run(Predicate::Equals {
+                field: FieldSel::Attr("lo".into()),
+                value: AttrValue::Str("x".into()),
+            });
+            assert_eq!(rows, 8, "the rows whose lo is \"x\"");
+            assert_eq!(
+                dict_entry_visits() - visits,
+                entries,
+                "each entry compared once for the scan's four blocks"
+            );
+
+            let memos = dict_word_memos();
+            let rows = run(Predicate::HasWord {
+                field: FieldSel::Attr("lo".into()),
+                word: "x".into(),
+            });
+            assert_eq!(rows, 16, "the rows whose lo is \"x\" or \"x y\"");
+            assert_eq!(dict_word_memos() - memos, 1, "one memo for the dictionary");
+        }
+
+        /// The `Contains` arm (ADR-2773, contains-arm amendment).
+        mod contains {
+            use super::*;
+            use crate::encoding::Enc;
+            use std::collections::HashMap;
+
+            /// Values for the `s` attribute. [`build_raw`] stores each `~` as
+            /// the byte 0xff, so the last three are invalid UTF-8 cells that
+            /// still hold the bytes `ab`.
+            const S: [&str; 12] = [
+                "", "ab", "abzz", "zabz", "zzab", "ababa", "aaa", "ba", "zz", "a~b", "~ab", "ab~",
+            ];
+            const NEEDLES: [&str; 9] = ["", "a", "ab", "aba", "aa", "zz", "b", "xa", "q"];
+
+            fn tilde_to_ff(b: &[u8]) -> Option<Vec<u8>> {
+                b.contains(&b'~').then(|| {
+                    b.iter()
+                        .map(|&c| if c == b'~' { 0xff } else { c })
+                        .collect()
+                })
+            }
+
+            fn build_raw(cfg: RlogConfig, recs: Vec<LogRecord>) -> Vec<u8> {
+                let mut w = RlogWriter::new(cfg, identity()).with_str_cell_rewrite(tilde_to_ff);
+                for r in recs {
+                    w.push(r).expect("push");
+                }
+                w.finish().expect("finish")
+            }
+
+            /// Stream `n`'s resource and scope: a resource `s` of `"xab"` (0)
+            /// or `"zz"` (1), a non-string resource `s` (2), a scope `s` of
+            /// `"ab"` (4), and no `s` at all (3 and 5).
+            fn stream_blob(n: u8) -> Vec<u8> {
+                let mut res = vec![attr("service.name", AttrValue::Str(format!("svc{n}")))];
+                let mut scope = Vec::new();
+                match n {
+                    0 => res.push(attr("s", AttrValue::Str("xab".into()))),
+                    1 => res.push(attr("s", AttrValue::Str("zz".into()))),
+                    2 => res.push(attr("s", AttrValue::I64(1))),
+                    4 => scope.push(attr("s", AttrValue::Str("ab".into()))),
+                    _ => {}
+                }
+                crate::record::stream_attrs_bytes(&res, "scope", "1", &scope)
+            }
+
+            fn srec(stream: u8, ts: i64, attrs: Vec<(String, AttrValue)>) -> LogRecord {
+                let mut r = rec_attrs(stream, ts, "b", attrs);
+                r.stream_attrs = stream_blob(stream);
+                r
+            }
+
+            fn s(v: &str) -> (String, AttrValue) {
+                attr("s", AttrValue::Str(v.into()))
+            }
+
+            fn contains(key: &str, needle: &str, negated: bool) -> Predicate {
+                Predicate::Contains {
+                    key: key.into(),
+                    needle: needle.into(),
+                    negated,
+                }
+            }
+
+            /// The encoding tags of every page of column `col`.
+            fn encs(reader: &RlogReader, col: u32) -> Vec<Enc> {
+                reader
+                    .page_dir
+                    .groups
+                    .iter()
+                    .flat_map(|g| g.chunks.iter())
+                    .filter(|c| c.column_id == col)
+                    .flat_map(|c| c.pages.iter().map(|p| p.enc))
+                    .collect()
+            }
+
+            fn s_col(reader: &RlogReader) -> u32 {
+                reader
+                    .field_dir
+                    .column("s", FieldType::Str)
+                    .expect("s column")
+                    .column_id
+            }
+
+            fn ts_of(block: &DecodedBlock, rows: &[usize]) -> Vec<i64> {
+                rows.iter()
+                    .map(|&r| block.i64_column(COL_TS).and_then(|c| c.get(r)).expect("ts"))
+                    .collect()
+            }
+
+            /// The `ts` of every row the scan keeps under `pred`, after
+            /// asserting they are the rows [`eval`] keeps one by one.
+            fn kept_ts(obj: &[u8], cfg: &RlogConfig, pred: &Predicate) -> Vec<i64> {
+                let reader = RlogReader::new(obj, cfg).expect("open object");
+                let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                let mut want = Vec::new();
+                let mut all = reader
+                    .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                    .expect("scan");
+                while all.next_block_columnar(obj).expect("decode").is_some() {
+                    let block = all.current.as_ref().expect("decoded");
+                    want.extend(ts_of(block, &oracle(sd, fd, pred, block).expect("oracle")));
+                }
+                let mut got = Vec::new();
+                let mut scan = reader
+                    .scan_blocks(pred, &[], &ColumnSelection::all())
+                    .expect("scan");
+                while scan.next_block_columnar(obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    got.extend(ts_of(block, &scan.surviving));
+                }
+                got.sort_unstable();
+                want.sort_unstable();
+                assert_eq!(got, want, "kernel and row-by-row eval disagree");
+                got
+            }
+
+            /// A value of `s` for a generated row: a string from [`S`], an
+            /// integer (an occurrence of another type), or none.
+            #[derive(Clone, Debug)]
+            enum SVal {
+                None,
+                Str(usize),
+                I64(i64),
+            }
+
+            #[derive(Clone, Debug)]
+            struct CRow {
+                stream: u8,
+                ts: i64,
+                s: SVal,
+                unique: bool,
+                zz: Option<usize>,
+            }
+
+            fn c_row() -> impl Strategy<Value = CRow> {
+                (
+                    0u8..6,
+                    0i64..40,
+                    prop_oneof![
+                        4 => (0usize..S.len()).prop_map(SVal::Str),
+                        1 => (-1i64..2).prop_map(SVal::I64),
+                        1 => Just(SVal::None),
+                    ],
+                    any::<bool>(),
+                    proptest::option::of(0usize..S.len()),
+                )
+                    .prop_map(|(stream, ts, s, unique, zz)| CRow {
+                        stream,
+                        ts,
+                        s,
+                        unique,
+                        zz,
+                    })
+            }
+
+            /// The records, and the dynamic column cap that gives `s` its
+            /// columns and leaves `zz` (last in the writer's `(name, type)`
+            /// order) in `attrs_raw`. `mode` 0 keeps every `s` value in the
+            /// small pool (dictionary pages), 1 makes every one unique (plain
+            /// pages), 2 makes the rows whose `unique` is set unique. A unique
+            /// value puts its row number before or after the pooled value, so
+            /// needles still land at the start, middle and end.
+            fn c_corpus(rows: &[CRow], mode: u8) -> (Vec<LogRecord>, usize) {
+                let mut pairs = std::collections::BTreeSet::new();
+                let recs = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| {
+                        let mut attrs = Vec::new();
+                        match r.s {
+                            SVal::None => {}
+                            SVal::Str(v) => {
+                                let unique = mode == 1 || (mode == 2 && r.unique);
+                                let v = match (unique, i % 2) {
+                                    (false, _) => S[v].to_string(),
+                                    (true, 0) => format!("{}#{i}", S[v]),
+                                    (true, _) => format!("{i}#{}", S[v]),
+                                };
+                                attrs.push(s(&v));
+                                pairs.insert("s:str");
+                            }
+                            SVal::I64(v) => {
+                                attrs.push(attr("s", AttrValue::I64(v)));
+                                pairs.insert("s:i64");
+                            }
+                        }
+                        if let Some(v) = r.zz {
+                            attrs.push(attr("zz", AttrValue::Str(S[v].into())));
+                        }
+                        srec(r.stream, r.ts, attrs)
+                    })
+                    .collect();
+                (recs, pairs.len())
+            }
+
+            fn c_arm() -> impl Strategy<Value = Predicate> {
+                prop_oneof![
+                    5 => (0usize..4, 0usize..NEEDLES.len(), any::<bool>()).prop_map(
+                        |(k, n, negated)| contains(["s", "s", "zz", "missing"][k], NEEDLES[n], negated)
+                    ),
+                    1 => ts_arm(),
+                    1 => (0usize..S.len()).prop_map(|i| Predicate::Equals {
+                        field: FieldSel::Attr("s".into()),
+                        value: AttrValue::Str(S[i].into()),
+                    }),
+                    1 => (-1i64..2).prop_map(|v| Predicate::Equals {
+                        field: FieldSel::Attr("s".into()),
+                        value: AttrValue::I64(v),
+                    }),
+                ]
+            }
+
+            proptest! {
+                #![proptest_config(ProptestConfig::with_cases(256))]
+
+                /// The contains kernel keeps exactly the rows [`eval`] keeps,
+                /// over plain, per-block dictionary and row group dictionary
+                /// pages holding invalid UTF-8 and empty values, absent cells,
+                /// cells of another type, an overflowing key, and streams with
+                /// and without a resource or scope value, alone and in
+                /// conjunction with `TsRange` and `Equals`. The scan's
+                /// survivor-only build keeps every surviving row's `s` bytes
+                /// and reads each as text exactly when it is UTF-8.
+                #[test]
+                fn contains_kernel_matches_row_by_row_eval(
+                    rows in proptest::collection::vec(c_row(), 1..60),
+                    mode in 0u8..3,
+                    block_target_records in 2usize..12,
+                    group_target_blocks in 1usize..4,
+                    arms in proptest::collection::vec(c_arm(), 1..=4),
+                ) {
+                    let (recs, columns) = c_corpus(&rows, mode);
+                    let cfg = RlogConfig {
+                        block_target_records,
+                        group_target_blocks,
+                        max_dynamic_columns: columns,
+                        ..RlogConfig::default()
+                    };
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let (sd, fd) = (&*reader.stream_dir, &*reader.field_dir);
+                    let col = fd.column("s", FieldType::Str).map(|e| e.column_id);
+                    let pred = Predicate::And(arms);
+
+                    let mut want = HashMap::new();
+                    let mut all = reader
+                        .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                        .expect("scan");
+                    while all.next_block_columnar(&obj).expect("decode").is_some() {
+                        let loc = all.blocks[all.next - 1];
+                        let block = all.current.as_ref().expect("decoded");
+                        let w = oracle(sd, fd, &pred, block).expect("oracle");
+                        let got = kernel(sd, fd, &pred, &loc, block).expect("kernel");
+                        prop_assert_eq!(&got, &w, "block {}", loc.block_index);
+                        let cells: Vec<Option<Vec<u8>>> = (0..block.record_count())
+                            .map(|r| col.and_then(|c| block.str_at(c, r)).map(<[u8]>::to_vec))
+                            .collect();
+                        want.insert(loc.block_index, (w, cells));
+                    }
+
+                    let mut scan = reader
+                        .scan_blocks(&pred, &[], &ColumnSelection::all())
+                        .expect("scan");
+                    while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                        let loc = scan.blocks[scan.next - 1];
+                        let block = scan.current.as_ref().expect("decoded");
+                        let (w, cells) = want.remove(&loc.block_index).expect("block decoded once");
+                        prop_assert_eq!(&scan.surviving, &w, "block {}", loc.block_index);
+                        for &r in &w {
+                            let bytes = col.and_then(|c| block.str_at(c, r));
+                            prop_assert_eq!(bytes, cells[r].as_deref(), "row {}", r);
+                            if let Some(StrColumn::Dict(d)) = col.and_then(|c| block.str_column(c)) {
+                                let text = d.key(r).and_then(|k| d.values().text(k as usize));
+                                let utf8 = cells[r].as_deref().and_then(|b| std::str::from_utf8(b).ok());
+                                prop_assert_eq!(text, utf8, "row {}", r);
+                            }
+                        }
+                    }
+                    for (block, (w, _)) in want {
+                        prop_assert!(w.is_empty(), "block {block} pruned with survivors {w:?}");
+                    }
+                }
+            }
+
+            /// The property's generator reaches every page shape it claims:
+            /// `s` on plain, per-block dictionary and row group dictionary
+            /// pages, invalid UTF-8 cells, and `zz` in `attrs_raw`.
+            #[test]
+            fn contains_corpus_reaches_plain_dict_and_group_dict_pages() {
+                let rows: Vec<CRow> = (0..24)
+                    .map(|i| CRow {
+                        stream: (i % 6) as u8,
+                        ts: i,
+                        s: SVal::Str(i as usize % S.len()),
+                        unique: false,
+                        zz: Some(i as usize % 3),
+                    })
+                    .collect();
+                let mut seen_invalid = false;
+                for (mode, group_target_blocks, want) in
+                    [(1, 1, Enc::Plain), (0, 1, Enc::Dict), (0, 3, Enc::DictPage)]
+                {
+                    let (mut recs, columns) = c_corpus(&rows, mode);
+                    if mode == 0 {
+                        // Repeat the pool so every block holds a dictionary.
+                        recs.extend(c_corpus(&rows, mode).0);
+                    }
+                    let cfg = RlogConfig {
+                        block_target_records: 11,
+                        group_target_blocks,
+                        max_dynamic_columns: columns,
+                        ..RlogConfig::default()
+                    };
+                    let obj = build_raw(cfg, recs);
+                    let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                    let col = s_col(&reader);
+                    assert!(
+                        reader.field_dir.column("zz", FieldType::Str).is_none(),
+                        "zz overflows"
+                    );
+                    let tags = encs(&reader, col);
+                    assert!(tags.contains(&want), "mode {mode}: {tags:?}");
+                    if want == Enc::DictPage {
+                        assert!(tags.contains(&Enc::DictIds), "{tags:?}");
+                    }
+                    let mut scan = reader
+                        .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
+                        .expect("scan");
+                    while scan.next_block_columnar(&obj).expect("decode").is_some() {
+                        let block = scan.current.as_ref().expect("decoded");
+                        for r in 0..block.record_count() {
+                            if block
+                                .str_at(col, r)
+                                .is_some_and(|b| std::str::from_utf8(b).is_err())
+                            {
+                                seen_invalid = true;
+                            }
+                        }
+                    }
+                }
+                assert!(seen_invalid, "the corpus stores invalid UTF-8 cells");
+            }
+
+            /// The records `recs(unique)` builds, as one block on a per-block
+            /// dictionary page and then as blocks of plain pages, each object
+            /// with its configuration.
+            fn dict_and_plain(
+                recs: impl Fn(bool) -> Vec<LogRecord>,
+            ) -> Vec<(Vec<u8>, RlogConfig, Enc)> {
+                [(false, 64, Enc::Dict), (true, 4, Enc::Plain)]
+                    .into_iter()
+                    .map(|(unique, block_target_records, want)| {
+                        let cfg = RlogConfig {
+                            block_target_records,
+                            group_target_blocks: 1,
+                            ..RlogConfig::default()
+                        };
+                        let obj = build_raw(cfg, recs(unique));
+                        let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                        let tags = encs(&reader, s_col(&reader));
+                        assert!(tags.contains(&want), "{want:?}: {tags:?}");
+                        (obj, cfg, want)
+                    })
+                    .collect()
+            }
+
+            /// A value, made unique per row when `unique` so it lands on a
+            /// plain page; the suffix keeps the value's validity.
+            fn val(v: &str, unique: bool, i: i64) -> String {
+                if unique {
+                    format!("{v}{i}")
+                } else {
+                    v.to_string()
+                }
+            }
+
+            /// A byte match inside an invalid UTF-8 cell is not a hit: the
+            /// cell reads as NULL and, on a stream with no `s`, the row drops.
+            #[test]
+            fn invalid_utf8_cell_holding_the_needle_is_not_a_hit() {
+                let objects = dict_and_plain(|unique| {
+                    (0..8)
+                        .map(|i| {
+                            let v = if i % 2 == 0 { "ab" } else { "~ab" };
+                            srec(3, i, vec![s(&val(v, unique, i))])
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", false));
+                    assert_eq!(kept, vec![0, 2, 4, 6], "{enc:?}");
+                    // NOT LIKE drops the NULL too.
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "zz", true));
+                    assert_eq!(kept, vec![0, 2, 4, 6], "{enc:?}");
+                }
+            }
+
+            /// `NOT LIKE` on a NULL drops the row: an absent cell on a stream
+            /// with no `s`, or with a non-string `s`.
+            #[test]
+            fn not_like_drops_absent_cells() {
+                let objects = dict_and_plain(|unique| {
+                    (0..8)
+                        .map(|i| {
+                            let stream = if i < 4 { 3 } else { 2 };
+                            let attrs = if i % 2 == 0 {
+                                vec![s(&val("zz", unique, i))]
+                            } else {
+                                Vec::new()
+                            };
+                            srec(stream, i, attrs)
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", true));
+                    assert_eq!(kept, vec![0, 2, 4, 6], "{enc:?}");
+                }
+            }
+
+            /// A row whose `s` cell is absent or invalid reads its stream's
+            /// resource or scope value, which the kernel tests rather than
+            /// dropping the row.
+            #[test]
+            fn absent_or_invalid_cell_reads_the_stream_value() {
+                let objects = dict_and_plain(|unique| {
+                    (0..12)
+                        .map(|i| {
+                            let stream = [0, 4, 1][(i % 3) as usize];
+                            let attrs = match i % 4 {
+                                0 => vec![s(&val("zz", unique, i))],
+                                1 => vec![s(&val("~zz", unique, i))],
+                                _ => Vec::new(),
+                            };
+                            srec(stream, i, attrs)
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    // Stream 0 reads "xab", stream 4 "ab" and stream 1 "zz";
+                    // rows 0, 4 and 8 hold a valid "zz" of their own.
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", false));
+                    assert_eq!(kept, vec![1, 3, 6, 7, 9, 10], "{enc:?}");
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "ab", true));
+                    assert_eq!(kept, vec![0, 2, 4, 5, 8, 11], "{enc:?}");
+                }
+            }
+
+            /// An empty needle matches every non-NULL value, so `LIKE '%%'`
+            /// keeps exactly the rows whose value is not NULL and `NOT LIKE
+            /// '%%'` keeps none.
+            #[test]
+            fn empty_needle_matches_every_non_null_value() {
+                let objects = dict_and_plain(|unique| {
+                    (0..16)
+                        .map(|i| {
+                            let stream = if i < 8 { 3 } else { 0 };
+                            let attrs = match i % 4 {
+                                0 => vec![s(&val("", unique, i))],
+                                1 => vec![s(&val("ab", unique, i))],
+                                2 => vec![s(&val("~", unique, i))],
+                                _ => Vec::new(),
+                            };
+                            srec(stream, i, attrs)
+                        })
+                        .collect()
+                });
+                for (obj, cfg, enc) in objects {
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "", false));
+                    assert_eq!(
+                        kept,
+                        vec![0, 1, 4, 5, 8, 9, 10, 11, 12, 13, 14, 15],
+                        "{enc:?}"
+                    );
+                    let kept = kept_ts(&obj, &cfg, &contains("s", "", true));
+                    assert_eq!(kept, Vec::<i64>::new(), "{enc:?}");
+                }
+            }
+
+            /// A row whose `s` resolves to another type's cell, or to an
+            /// `attrs_raw` entry, is kept for the exact filter above the scan.
+            #[test]
+            fn other_type_and_overflow_readings_are_kept() {
+                let recs: Vec<LogRecord> = (0..8)
+                    .map(|i| {
+                        let attrs = match i % 4 {
+                            0 => vec![s("zz")],
+                            1 => vec![attr("s", AttrValue::I64(i))],
+                            2 => vec![attr("zz", AttrValue::Str("zz".into()))],
+                            _ => Vec::new(),
+                        };
+                        srec(3, i, attrs)
+                    })
+                    .collect();
+                let cfg = RlogConfig {
+                    block_target_records: 4,
+                    max_dynamic_columns: 2,
+                    ..RlogConfig::default()
+                };
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                assert!(reader.field_dir.column("s", FieldType::I64).is_some());
+                assert!(reader.field_dir.column("zz", FieldType::Str).is_none());
+                assert_eq!(kept_ts(&obj, &cfg, &contains("s", "ab", false)), vec![1, 5]);
+                assert_eq!(
+                    kept_ts(&obj, &cfg, &contains("zz", "ab", false)),
+                    vec![2, 6]
+                );
+            }
+
+            /// One row group of four blocks whose `s` chunk is a row group
+            /// dictionary over six values on a stream with no `s`.
+            fn group_dict_object() -> (Vec<u8>, RlogConfig) {
+                let pool = ["ab0", "ab1", "ab2", "zz0", "zz1", "zz2"];
+                let recs = (0..24)
+                    .map(|i| {
+                        srec(
+                            3,
+                            i,
+                            vec![
+                                s(pool[i as usize % pool.len()]),
+                                attr("u", AttrValue::Str(format!("u{i}"))),
+                            ],
+                        )
+                    })
+                    .collect();
+                let cfg = RlogConfig {
+                    block_target_records: 6,
+                    group_target_blocks: 4,
+                    ..RlogConfig::default()
+                };
+                (build_raw(cfg, recs), cfg)
+            }
+
+            /// Every row's `s` bytes and dictionary text, block after block,
+            /// read by `scan`.
+            fn s_cells(
+                mut scan: BlockScan,
+                obj: &[u8],
+                col: u32,
+            ) -> Vec<(Option<Vec<u8>>, Option<String>)> {
+                let mut out = Vec::new();
+                while scan.next_block_columnar(obj).expect("decode").is_some() {
+                    let block = scan.current.as_ref().expect("decoded");
+                    let Some(StrColumn::Dict(d)) = block.str_column(col) else {
+                        panic!("s is a dictionary column");
+                    };
+                    out.extend((0..block.record_count()).map(|r| {
+                        let text = d.key(r).and_then(|k| d.values().text(k as usize));
+                        (
+                            block.str_at(col, r).map(<[u8]>::to_vec),
+                            text.map(str::to_owned),
+                        )
+                    }));
+                }
+                out
+            }
+
+            /// The survivor-only build never reaches the row group cache: a
+            /// scan without the arm that inherits the cache of a scan with it
+            /// reads every entry of the dictionary, as bytes and as text.
+            #[test]
+            fn survivor_only_build_leaves_the_shared_cache_whole() {
+                let (obj, cfg) = group_dict_object();
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let col = s_col(&reader);
+                let tags = encs(&reader, col);
+                assert!(tags.contains(&Enc::DictPage), "{tags:?}");
+                assert_eq!(reader.page_dir.groups.len(), 1, "one row group");
+                let none = Predicate::And(Vec::new());
+                let all = ColumnSelection::all();
+                let fresh = s_cells(
+                    reader.scan_blocks(&none, &[], &all).expect("scan"),
+                    &obj,
+                    col,
+                );
+                assert_eq!(fresh.iter().filter(|(_, t)| t.is_some()).count(), 24);
+
+                let mut with_arm = reader
+                    .scan_blocks(&contains("s", "ab", false), &[], &all)
+                    .expect("scan");
+                let mut rows = 0;
+                while let Some(view) = with_arm.next_block_columnar(&obj).expect("decode") {
+                    rows += view.surviving_count();
+                }
+                assert_eq!(rows, 12, "the rows whose s holds \"ab\"");
+                let mut after = reader.scan_blocks(&none, &[], &all).expect("scan");
+                after.dicts = std::mem::take(&mut with_arm.dicts);
+                assert_eq!(s_cells(after, &obj, col), fresh);
+            }
+
+            /// The counters, exactly: a row group dictionary of six entries
+            /// tested once each across its four blocks, 24 plain cells tested
+            /// once each, and the three matching entries, the distinct ones
+            /// the surviving rows reference, the only ones validated. Without
+            /// the arm the dictionary is validated whole, once.
+            #[test]
+            fn contains_counters_count_each_test_and_validation_once() {
+                let (obj, cfg) = group_dict_object();
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let u = reader
+                    .field_dir
+                    .column("u", FieldType::Str)
+                    .expect("u column")
+                    .column_id;
+                assert!(encs(&reader, s_col(&reader)).contains(&Enc::DictPage));
+                assert!(encs(&reader, u).iter().all(|e| *e == Enc::Plain));
+                let cols = ColumnSelection::fixed_only().with_attr("s").with_attr("u");
+                let run = |pred: Predicate| {
+                    let mut scan = reader.scan_blocks(&pred, &[], &cols).expect("scan");
+                    let mut rows = 0;
+                    while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                        rows += view.surviving_count();
+                    }
+                    assert_eq!(scan.stats().blocks_scanned, 4);
+                    (rows, scan.stats())
+                };
+
+                let (rows, stats) = run(Predicate::And(vec![
+                    contains("u", "u", false),
+                    contains("s", "ab", false),
+                ]));
+                assert_eq!(rows, 12);
+                assert_eq!(stats.contains_cells_tested, 6 + 24, "N + M");
+                assert_eq!(
+                    stats.str_cells_validated, 3,
+                    "the K entries survivors reference"
+                );
+
+                let (rows, stats) = run(Predicate::And(Vec::new()));
+                assert_eq!(rows, 24);
+                assert_eq!(stats.contains_cells_tested, 0);
+                assert_eq!(stats.str_cells_validated, 6, "the dictionary, once");
+            }
+
+            /// The counters over per-block dictionaries (tag 7): each block's
+            /// four entries tested once, the two matching entries of each
+            /// block the only ones validated, and without the arm every entry
+            /// of both dictionaries validated once.
+            #[test]
+            fn contains_counters_over_per_block_dictionaries() {
+                let pool = ["ab0", "ab1", "zz0", "zz1"];
+                let recs = (0..16)
+                    .map(|i| srec(3, i, vec![s(pool[i as usize % pool.len()])]))
+                    .collect();
+                let cfg = RlogConfig {
+                    block_target_records: 8,
+                    group_target_blocks: 1,
+                    ..RlogConfig::default()
+                };
+                let obj = build_raw(cfg, recs);
+                let reader = RlogReader::new(&obj, &cfg).expect("open object");
+                let tags = encs(&reader, s_col(&reader));
+                assert_eq!(tags, vec![Enc::Dict, Enc::Dict], "two tag 7 pages");
+                // Only `s`, so no other column's dictionary is counted.
+                let cols = ColumnSelection::fixed_only().with_attr("s");
+                let run = |pred: Predicate| {
+                    let mut scan = reader.scan_blocks(&pred, &[], &cols).expect("scan");
+                    let mut rows = 0;
+                    while let Some(view) = scan.next_block_columnar(&obj).expect("decode") {
+                        rows += view.surviving_count();
+                    }
+                    assert_eq!(scan.stats().blocks_scanned, 2);
+                    (rows, scan.stats())
+                };
+
+                let (rows, stats) = run(contains("s", "ab", false));
+                assert_eq!(rows, 8);
+                assert_eq!(stats.contains_cells_tested, 4 + 4);
+                assert_eq!(stats.str_cells_validated, 2 + 2);
+
+                let (rows, stats) = run(Predicate::And(Vec::new()));
+                assert_eq!(rows, 16);
+                assert_eq!(stats.contains_cells_tested, 0);
+                assert_eq!(stats.str_cells_validated, 4 + 4);
+            }
+        }
+    }
+}

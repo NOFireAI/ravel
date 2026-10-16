@@ -1,0 +1,743 @@
+//! SQL-lane distributed read fan-out for the RLOG family: logs, alerts, and
+//! audit (ADR-0071; #326, the SQL half of #63's T6). The signal sibling of
+//! [`crate::distributed`], which owns the metrics lane.
+//!
+//! # What is signal-generic here, and what is not
+//!
+//! Everything in this module except the three per-signal total-order keys is
+//! signal-neutral. [`DistributedSliceScanExec`] takes a [`SchemaRef`] and an
+//! ordering column list and knows nothing about logs, alerts, or audit;
+//! [`distributed_slice_plan`] assembles the fan-out around any schema and key.
+//! The `spans` table (#327, T6b) reuses both verbatim by passing the spans
+//! schema and the span total-order key -- it does not reimplement the scan exec,
+//! the merge assembly, the byte accounting, or the schema validation. The only
+//! signal-specific surface is
+//! [`LOGS_ORDER_COLS`]/[`ALERTS_ORDER_COLS`]/[`AUDIT_ORDER_COLS`]/[`SPAN_ORDER_COLS`]
+//! and the thin wrappers ([`distributed_logs_plan`] and siblings, plus
+//! [`distributed_spans_plan`]) that bind a signal's public schema to its key.
+//!
+//! The slice-ticket plumbing is not reimplemented here at all: the fan-out
+//! reuses [`crate::distributed`]'s [`WorkerSlice`], [`WorkerSliceClient`],
+//! [`WorkerEndpoints`], [`DistributedFlightConfig`], and
+//! [`plan_distributed_slices`](crate::distributed::plan_distributed_slices)
+//! unchanged. Those are already signal-agnostic: a slice ticket pins a subset
+//! of a resolved snapshot and carries no signal discriminator, so the same
+//! minting/redeeming path serves every table.
+//!
+//! # The merge rule this reproduces: total order, NO dedup
+//!
+//! This is where the correctness rule differs from the metrics lane, and it is
+//! the whole point of the split. The metrics coordinator runs
+//! `SortPreservingMergeExec -> RsegDedupExec`: a `(series_id, ts)` sample can be
+//! written through segments in different shards, and the greatest-wins winner
+//! is only decidable once every slice's candidates meet, so the coordinator's
+//! dedup is authoritative.
+//!
+//! Logs, alerts, audit, and spans have **no query-time dedup**
+//! (`docs/consistency-model.md`, "logs and spans"; ADR-0051 section 5). A retry
+//! after a lost acknowledgement produces byte-identical rows that are
+//! legitimately duplicate user data and MUST stay visible. So the merge is
+//! a `SortPreservingMergeExec` under a total-order key and **nothing above it**:
+//! no dedup node, no `.dedup_by`, no distinct. Every row every slice returns is
+//! emitted. This mirrors [`ravel_query::distrib`]'s `merge_log_records`, which
+//! flattens the per-slice pool and stable-sorts under a total key without ever
+//! collapsing an equal-key pair.
+//!
+//! Because there is no dedup, the multiset of rows is preserved under *any*
+//! union of the slice partitions; the sort exists to reproduce a deterministic,
+//! local-equivalent ordering (and to make the reshard-straddle differential
+//! test non-vacuous: a slice-order concatenation is observably wrong once one
+//! stream's segments straddle two slices, an order the sorted merge never
+//! produces). The key is the orderable public columns in a fixed sequence; the
+//! `attrs` `Map` column is deliberately excluded because Arrow maps are not
+//! orderable, which is sound precisely because there is no dedup -- two rows
+//! that tie on every orderable column are indistinguishable to SQL, so their
+//! relative order never matters.
+//!
+//! # Reachability
+//!
+//! Like the metrics lane today, nothing in the shipping binary reaches this
+//! yet: an RLOG distributed scan is installed on a provider via
+//! [`LogsTableProvider::with_distributed_scan`](crate::LogsTableProvider) (and
+//! the alerts/audit siblings) and is exercised end to end by the acceptance
+//! tests (`tests/flight_distributed.rs`) driving `provider.scan(..)`. The
+//! server-side coordinator that installs the context from
+//! `get_flight_info_statement`, and the worker `do_get` slice-fragment branch
+//! that runs [`LogsTableProvider::worker_fragment`], are later wiring (see the
+//! task report).
+
+use std::fmt;
+use std::sync::Arc;
+
+use datafusion::arrow::array::{Array, ArrayData, AsArray};
+use datafusion::arrow::compute::SortOptions;
+use datafusion::arrow::datatypes::{Schema, SchemaRef};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::physical_expr::PhysicalExpr;
+use datafusion::physical_expr::expressions::col;
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalSortExpr};
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
+use datafusion::physical_plan::limit::GlobalLimitExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+};
+use futures::StreamExt;
+use ravel_query::ByteLimit;
+use ravel_types::accounting::{AccountedOp, QueryAccounting};
+
+use crate::distributed::{WorkerSlice, WorkerSliceClient};
+use crate::error::SqlError;
+use crate::flight_ticket::SlicePushdown;
+
+/// The `logs` table's total-order key: the orderable fixed public columns in a
+/// fixed sequence (ADR-0033 schema order). `attrs` is excluded (Arrow maps are
+/// not orderable); declared typed columns are excluded because they are a
+/// per-tenant tail that need not participate for the order to be deterministic
+/// on the fixed columns. `ts` first mirrors the local read's natural order.
+pub const LOGS_ORDER_COLS: &[&str] = &[
+    "ts",
+    "observed_ts",
+    "severity_num",
+    "severity_text",
+    "body",
+    "trace_id",
+    "span_id",
+    "flags",
+];
+
+/// The `alerts` table's total-order key: the orderable public columns in schema
+/// order (ADR-0040). `attrs` excluded, as above.
+pub const ALERTS_ORDER_COLS: &[&str] = &[
+    "ts_ns",
+    "alert_id",
+    "rule_id",
+    "state",
+    "generation",
+    "writer_id",
+    "writer_epoch",
+    "writer_seq",
+];
+
+/// The `audit` table's total-order key: the orderable public columns in schema
+/// order (ADR-0040). `attrs` excluded, as above.
+pub const AUDIT_ORDER_COLS: &[&str] = &["ts_ns", "severity_text", "body"];
+
+/// The `spans` table's total-order key (ADR-0041): the orderable public columns
+/// in the exact field sequence `ravel_query::distrib`'s `span_cmp`/
+/// `span_order_key` use -- `(trace_id, span_id, start_ts_ns, end_ts_ns,
+/// parent_span_id, name, status_code, status_message, service_name)` -- mapped
+/// to the public `spans` schema column names (`start_ts`/`end_ts` for the two
+/// timestamp columns). The trailing `attrs` `Map` column is excluded because
+/// Arrow maps are not orderable; this is sound because spans have no query-time
+/// dedup, so two rows tying on every orderable column are indistinguishable to
+/// SQL and their relative order never matters (the same rationale that excludes
+/// `attrs` from the RLOG keys above and from the queryfrag-layer span key).
+pub const SPAN_ORDER_COLS: &[&str] = &[
+    "trace_id",
+    "span_id",
+    "start_ts",
+    "end_ts",
+    "parent_span_id",
+    "name",
+    "status_code",
+    "status_message",
+    "service_name",
+];
+
+/// A coordinator-side distributed RLOG scan context (ADR-0071): the worker
+/// endpoints one query fans out to, and the client that fetches each slice.
+/// Held in an `Option` on each RLOG provider; installed via that provider's
+/// `with_distributed_scan`, absent (the default) means the local scan path.
+///
+/// Signal-neutral by construction -- it carries no schema or key -- so the
+/// three RLOG providers (and, later, the spans provider) share it unchanged.
+pub(crate) struct DistributedRlogContext {
+    pub(crate) endpoints: Vec<WorkerSlice>,
+    pub(crate) client: Arc<dyn WorkerSliceClient>,
+}
+
+/// Build a lexicographic ascending ordering over `cols`, resolved against
+/// `schema`. `nulls_first: false` matches every RLOG scan's declared ordering
+/// and the metrics lane, so a nullable promoted column (an absent `alert_id`)
+/// sorts last rather than first.
+fn lex_ordering(schema: &SchemaRef, cols: &[&str]) -> DFResult<LexOrdering> {
+    let asc = SortOptions {
+        descending: false,
+        nulls_first: false,
+    };
+    let exprs = cols
+        .iter()
+        .map(|name| Ok(PhysicalSortExpr::new(col(name, schema)?, asc)))
+        .collect::<DFResult<Vec<_>>>()?;
+    LexOrdering::new(exprs)
+        .ok_or_else(|| DataFusionError::Internal("empty distributed RLOG ordering".into()))
+}
+
+/// Wrap a signal's local (multi-partition, unordered) scan in a single
+/// globally-sorted partition under `ordering_cols`: the shape a worker streams
+/// back for the coordinator's [`SortPreservingMergeExec`] to k-way merge.
+///
+/// `SortExec` with the default `preserve_partitioning = false` sorts and
+/// coalesces every input partition into one, so the result is one partition
+/// sorted by the signal's total-order key -- exactly what
+/// [`DistributedSliceScanExec`] declares each worker partition to be. This is
+/// the RLOG analog of the metrics worker fragment's
+/// `RsegScanExec -> SortPreservingMergeExec`, but a full `SortExec` rather than
+/// a merge because the RLOG scans declare no leaf ordering (ADR-0087) for the
+/// merge to preserve.
+pub fn sort_slice_fragment(
+    scan: Arc<dyn ExecutionPlan>,
+    schema: &SchemaRef,
+    ordering_cols: &[&str],
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let ordering = lex_ordering(schema, ordering_cols)?;
+    Ok(Arc::new(SortExec::new(ordering, scan)))
+}
+
+/// The leaf of an RLOG family distributed pipeline: one DataFusion partition per
+/// worker endpoint, each partition the worker's public-schema slice stream,
+/// declared sorted by the signal's total-order key.
+///
+/// Signal-generic: it holds a [`SchemaRef`] and the ordering column names, so it
+/// is the same struct for logs, alerts, audit, and (later) spans. It mirrors the
+/// metrics [`crate::distributed::DistributedScanExec`] -- the same per-slice
+/// byte accounting, the same declared-ordering trick that keeps the optimizer
+/// from striking the merge above it -- but carries the public signal schema
+/// rather than the metrics internal provenance schema, and never feeds a dedup.
+pub struct DistributedSliceScanExec {
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    /// Best-effort fetch-stop hint threaded to each worker (ADR-0071). Any exact
+    /// limit is re-applied above the merge by [`distributed_slice_plan`], so this
+    /// may over-fetch but never causes under-fetch.
+    limit: Option<usize>,
+    /// The coordinator's byte-accounting handle (ADR-0044, ADR-0061 decision 1):
+    /// each worker batch is folded in by `get_array_memory_size`, exactly as the
+    /// metrics lane folds its worker batches.
+    accounting: QueryAccounting,
+    /// The per-tenant bytes-scanned budget. `Unlimited` (the RLOG default, since
+    /// these providers carry no per-query byte budget) never trips and still
+    /// folds the bytes.
+    max_bytes_scanned: ByteLimit,
+    /// The signal's public output schema, validated against every worker batch.
+    schema: SchemaRef,
+    /// The coordinator's extracted scan pushdown, handed to every worker with
+    /// its slice ticket (issue #2755). `None` asks each worker for every block
+    /// of its slice.
+    pushdown: Option<SlicePushdown>,
+    properties: Arc<PlanProperties>,
+}
+
+impl DistributedSliceScanExec {
+    /// Build a scan over one worker endpoint per slice, declaring each partition
+    /// sorted by `ordering_cols` over `schema`. `endpoints` must be non-empty: a
+    /// distributed plan with no worker is a caller bug, not a silently-empty
+    /// result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        endpoints: Vec<WorkerSlice>,
+        client: Arc<dyn WorkerSliceClient>,
+        schema: SchemaRef,
+        ordering_cols: &[&str],
+        limit: Option<usize>,
+        accounting: QueryAccounting,
+        max_bytes_scanned: ByteLimit,
+    ) -> DFResult<Self> {
+        if endpoints.is_empty() {
+            return Err(DataFusionError::Internal(
+                "DistributedSliceScanExec needs at least one worker endpoint".into(),
+            ));
+        }
+        let properties = Arc::new(Self::compute_properties(
+            &schema,
+            ordering_cols,
+            endpoints.len(),
+        )?);
+        Ok(DistributedSliceScanExec {
+            endpoints,
+            client,
+            limit,
+            accounting,
+            max_bytes_scanned,
+            schema,
+            pushdown: None,
+            properties,
+        })
+    }
+
+    /// Hand `pushdown` to every worker with its slice ticket.
+    pub fn with_pushdown(mut self, pushdown: Option<SlicePushdown>) -> Self {
+        self.pushdown = pushdown;
+        self
+    }
+
+    /// Declare the signal's total-order ordering per partition. Declaring it is
+    /// what lets the [`SortPreservingMergeExec`] above merge on it rather than
+    /// re-sort, and (like the metrics dedup's required-ordering) keeps the
+    /// optimizer from striking the merge when the plan is optimized rather than
+    /// executed directly.
+    fn compute_properties(
+        schema: &SchemaRef,
+        ordering_cols: &[&str],
+        n: usize,
+    ) -> DFResult<PlanProperties> {
+        let ordering = lex_ordering(schema, ordering_cols)?;
+        let eq = EquivalenceProperties::new_with_orderings(Arc::clone(schema), vec![ordering]);
+        Ok(PlanProperties::new(
+            eq,
+            Partitioning::UnknownPartitioning(n),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        ))
+    }
+}
+
+impl fmt::Debug for DistributedSliceScanExec {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DistributedSliceScanExec {{ endpoints: {} }}",
+            self.endpoints.len()
+        )
+    }
+}
+
+impl DisplayAs for DistributedSliceScanExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(
+            f,
+            "DistributedSliceScanExec: endpoints={}, limit={:?}, pushdown={}",
+            self.endpoints.len(),
+            self.limit,
+            match &self.pushdown {
+                Some(p) if p.as_spans().is_some() => "spans",
+                Some(_) => "logs",
+                None => "none",
+            }
+        )
+    }
+}
+
+impl ExecutionPlan for DistributedSliceScanExec {
+    fn name(&self) -> &str {
+        "DistributedSliceScanExec"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    // Visits nothing: this node holds no physical expression it evaluates.
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> DFResult<TreeNodeRecursion>,
+    ) -> DFResult<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let endpoint = self.endpoints.get(partition).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "DistributedSliceScanExec: partition {partition} out of range"
+            ))
+        })?;
+        // Threaded rather than defaulted for the reason on
+        // `WorkerSliceClient::fetch_slice`: a client that decodes in this
+        // process must reserve against this query's memory pool. This lane has
+        // no coordinator-local fallback today, so every client here is remote
+        // and ignores it, and passing the real context keeps that a property of
+        // the client rather than of the call site.
+        let inner = self.client.fetch_slice_with_pushdown(
+            &endpoint.location,
+            &endpoint.ticket,
+            self.pushdown.as_ref(),
+            self.limit,
+            &context,
+        )?;
+
+        // Validate every worker batch against this exec's declared schema, then
+        // fold its bytes into the coordinator's accounting and enforce the
+        // per-tenant budget. The metrics lane folds each batch's whole Arrow
+        // footprint; this fold leaves out dictionary values that arrived in an
+        // earlier batch (`batch_bytes_scanned`). A version-skewed
+        // or buggy worker that streams a different layout must fail typed here,
+        // not feed mismatched columns into the merge's key resolution downstream.
+        let expected = Arc::clone(&self.schema);
+        let accounting = self.accounting.clone();
+        let max_bytes_scanned = self.max_bytes_scanned;
+        let mut last_values = Vec::new();
+        let folded = inner.map(move |item| {
+            let batch = item?;
+            validate_schema(batch.schema().as_ref(), expected.as_ref())?;
+            let bytes = batch_bytes_scanned(&batch, &mut last_values) as u64;
+            accounting.add_s3_bytes(AccountedOp::Get, bytes);
+            let scanned = accounting.snapshot().total_s3_bytes();
+            if max_bytes_scanned.is_exceeded_by(scanned) {
+                let max = match max_bytes_scanned {
+                    ByteLimit::Bounded(max) => max,
+                    ByteLimit::Unlimited => scanned,
+                };
+                return Err(DataFusionError::from(SqlError::TooManyBytesScanned {
+                    scanned,
+                    max,
+                }));
+            }
+            Ok(batch)
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&self.schema),
+            folded,
+        )))
+    }
+}
+
+/// The bytes one worker batch adds to the scanned figure: its Arrow footprint,
+/// less the values of each dictionary column whose values sit in the same
+/// buffers that column carried in the previous batch. The IPC reader wraps
+/// the dictionary it last decoded in a new values array for every record
+/// batch, so the comparison is on buffer identity (`ArrayData::ptr_eq`), not
+/// on the `Arc`: a dictionary the worker sends once counts once per arrival,
+/// not once per batch. Equal values in distinct buffers count again. `last`
+/// holds each column's most recent dictionary values.
+fn batch_bytes_scanned(batch: &RecordBatch, last: &mut Vec<Option<ArrayData>>) -> usize {
+    last.resize(batch.num_columns(), None);
+    batch
+        .columns()
+        .iter()
+        .zip(last.iter_mut())
+        .map(|(column, last)| {
+            let bytes = column.get_array_memory_size();
+            let Some(dict) = column.as_any_dictionary_opt() else {
+                *last = None;
+                return bytes;
+            };
+            let values = dict.values();
+            let data = values.to_data();
+            if last.as_ref().is_some_and(|v| v.ptr_eq(&data)) {
+                return bytes.saturating_sub(values.get_array_memory_size());
+            }
+            *last = Some(data);
+            bytes
+        })
+        .sum()
+}
+
+/// Verify a worker's slice stream carries this scan's declared public schema
+/// (ADR-0071). Column count, names, data types, and nullability must match
+/// exactly; incidental schema-level metadata Flight encode/decode may carry is
+/// not compared. A mismatch is a typed error, never a panic or a wrong result
+/// downstream.
+fn validate_schema(actual: &Schema, expected: &Schema) -> DFResult<()> {
+    let same = actual.fields().len() == expected.fields().len()
+        && actual.fields().iter().zip(expected.fields()).all(|(a, e)| {
+            a.name() == e.name()
+                && a.data_type() == e.data_type()
+                && a.is_nullable() == e.is_nullable()
+        });
+    if same {
+        Ok(())
+    } else {
+        Err(DataFusionError::Internal(format!(
+            "worker slice stream schema does not match the expected RLOG scan schema: \
+             expected {expected:?}, got {actual:?}"
+        )))
+    }
+}
+
+/// Assemble the signal-generic RLOG distributed pipeline:
+///
+/// ```text
+/// DistributedSliceScanExec (one partition per worker slice, sorted by key)
+///   -> SortPreservingMergeExec (key)   [NO dedup]
+///   [-> GlobalLimitExec(limit)         when a fetch limit is present]
+/// ```
+///
+/// There is deliberately no dedup node above the merge: logs/alerts/audit have
+/// no query-time dedup, so every row every slice returns is emitted (see the
+/// module docs). The `SortPreservingMergeExec` reproduces the local read's
+/// deterministic total order over `ordering_cols`; when `limit` is `Some`, an
+/// exact [`GlobalLimitExec`] sits above the merge so the plan returns exactly
+/// `limit` rows without ever under-fetching (the per-worker hint may over-fetch).
+///
+/// Signal-neutral: pass any table's public schema and total-order key. The three
+/// RLOG wrappers below are the only signal-aware callers today; T6b calls it
+/// with the spans schema and key.
+///
+/// `pushdown` is the coordinator's extracted scan pushdown, handed to every
+/// worker with its slice ticket ([`SlicePushdown`]). It narrows which blocks a
+/// worker decodes and nothing else: the caller's filters stay above this plan.
+#[allow(clippy::too_many_arguments)]
+pub fn distributed_slice_plan(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    schema: SchemaRef,
+    ordering_cols: &[&str],
+    limit: Option<usize>,
+    accounting: QueryAccounting,
+    max_bytes_scanned: ByteLimit,
+    pushdown: Option<SlicePushdown>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let scan: Arc<dyn ExecutionPlan> = Arc::new(
+        DistributedSliceScanExec::new(
+            endpoints,
+            client,
+            Arc::clone(&schema),
+            ordering_cols,
+            limit,
+            accounting,
+            max_bytes_scanned,
+        )?
+        .with_pushdown(pushdown),
+    );
+    let ordering = lex_ordering(&schema, ordering_cols)?;
+    let merge: Arc<dyn ExecutionPlan> = Arc::new(SortPreservingMergeExec::new(ordering, scan));
+    match limit {
+        Some(fetch) => Ok(Arc::new(GlobalLimitExec::new(merge, 0, Some(fetch)))),
+        None => Ok(merge),
+    }
+}
+
+/// The `logs` distributed plan: [`distributed_slice_plan`] bound to the `logs`
+/// public schema and [`LOGS_ORDER_COLS`]. `schema` is the provider's resolved
+/// schema (`logs_schema_with_declared`), so a query with declared columns still
+/// merges on the fixed key present in every row.
+pub fn distributed_logs_plan(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    schema: SchemaRef,
+    limit: Option<usize>,
+    accounting: QueryAccounting,
+    max_bytes_scanned: ByteLimit,
+    pushdown: Option<SlicePushdown>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    distributed_slice_plan(
+        endpoints,
+        client,
+        schema,
+        LOGS_ORDER_COLS,
+        limit,
+        accounting,
+        max_bytes_scanned,
+        pushdown,
+    )
+}
+
+/// The `alerts` distributed plan: [`distributed_slice_plan`] bound to the
+/// `alerts` public schema and [`ALERTS_ORDER_COLS`].
+pub fn distributed_alerts_plan(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    schema: SchemaRef,
+    limit: Option<usize>,
+    accounting: QueryAccounting,
+    max_bytes_scanned: ByteLimit,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    distributed_slice_plan(
+        endpoints,
+        client,
+        schema,
+        ALERTS_ORDER_COLS,
+        limit,
+        accounting,
+        max_bytes_scanned,
+        None,
+    )
+}
+
+/// The `audit` distributed plan: [`distributed_slice_plan`] bound to the `audit`
+/// public schema and [`AUDIT_ORDER_COLS`].
+pub fn distributed_audit_plan(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    schema: SchemaRef,
+    limit: Option<usize>,
+    accounting: QueryAccounting,
+    max_bytes_scanned: ByteLimit,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    distributed_slice_plan(
+        endpoints,
+        client,
+        schema,
+        AUDIT_ORDER_COLS,
+        limit,
+        accounting,
+        max_bytes_scanned,
+        None,
+    )
+}
+
+/// The `spans` distributed plan (#327, T6b): [`distributed_slice_plan`] bound to
+/// the `spans` public schema and [`SPAN_ORDER_COLS`]. Like the RLOG wrappers it
+/// merges under the total-order key with NO dedup above it, because spans have
+/// no query-time dedup (see the module docs).
+pub fn distributed_spans_plan(
+    endpoints: Vec<WorkerSlice>,
+    client: Arc<dyn WorkerSliceClient>,
+    schema: SchemaRef,
+    limit: Option<usize>,
+    accounting: QueryAccounting,
+    max_bytes_scanned: ByteLimit,
+    pushdown: Option<SlicePushdown>,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    distributed_slice_plan(
+        endpoints,
+        client,
+        schema,
+        SPAN_ORDER_COLS,
+        limit,
+        accounting,
+        max_bytes_scanned,
+        pushdown,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::array::{ArrayRef, DictionaryArray, Int32Array, StringArray};
+    use datafusion::arrow::datatypes::Int32Type;
+
+    fn batch(values: &ArrayRef, keys: &[i32], other: &[i32]) -> RecordBatch {
+        let dict = DictionaryArray::<Int32Type>::try_new(
+            Int32Array::from(keys.to_vec()),
+            Arc::clone(values),
+        )
+        .expect("dictionary");
+        RecordBatch::try_from_iter([
+            ("region", Arc::new(dict) as ArrayRef),
+            ("n", Arc::new(Int32Array::from(other.to_vec())) as ArrayRef),
+        ])
+        .expect("batch")
+    }
+
+    /// A dictionary the worker shares across batches counts once, on the batch
+    /// that brought it; a batch carrying different values counts them again.
+    /// Flipped: charging `get_array_memory_size` per batch (the former fold)
+    /// counts `shared` three times where twice is expected.
+    #[test]
+    fn a_shared_worker_dictionary_counts_once_per_arrival() {
+        let shared: ArrayRef = Arc::new(StringArray::from(vec!["emea", "apac", "amer"]));
+        let other: ArrayRef = Arc::new(StringArray::from(vec!["emea", "apac", "amer"]));
+        let batches = [
+            batch(&shared, &[0, 1, 2, 0], &[1, 2, 3, 4]),
+            batch(&shared, &[2, 2], &[5, 6]),
+            batch(&other, &[1], &[7]),
+            batch(&shared, &[0], &[8]),
+        ];
+        let mut last = Vec::new();
+        let counted: Vec<usize> = batches
+            .iter()
+            .map(|b| batch_bytes_scanned(b, &mut last))
+            .collect();
+        let full: Vec<usize> = batches.iter().map(|b| b.get_array_memory_size()).collect();
+        let values = shared.get_array_memory_size();
+        assert_eq!(values, other.get_array_memory_size());
+        assert_eq!(
+            counted,
+            vec![full[0], full[1] - values, full[2], full[3]],
+            "the second batch reuses the first's values; the third and fourth each bring a different array"
+        );
+    }
+
+    /// The same sequence through the wire the coordinator reads: the worker's
+    /// encoder with `DictionaryHandling::Resend` and arrow-flight's decoder.
+    /// Three batches of one row group share one values array, so the worker
+    /// sends the dictionary once and the decoded batches each carry a new values
+    /// `Arc` over the same buffers; the group's values count once. The fourth
+    /// batch brings another group's values, and the fifth returns to the first
+    /// group's array, which the encoder sends again (A-B-A), so both count.
+    /// Flipped: an `Arc::ptr_eq` comparison counts the values on all five.
+    #[tokio::test]
+    async fn a_dictionary_sent_once_over_flight_counts_once() {
+        use arrow_flight::decode::FlightRecordBatchStream;
+        use arrow_flight::encode::{DictionaryHandling, FlightDataEncoderBuilder};
+        use futures::TryStreamExt;
+
+        let group: ArrayRef = Arc::new(StringArray::from(
+            (0..64)
+                .map(|i| format!("region-{i:03}"))
+                .collect::<Vec<_>>(),
+        ));
+        let next: ArrayRef = Arc::new(StringArray::from(
+            (0..64).map(|i| format!("zone-{i:03}")).collect::<Vec<_>>(),
+        ));
+        let sent = vec![
+            batch(&group, &[0, 1, 2, 3], &[1, 2, 3, 4]),
+            batch(&group, &[63, 62], &[5, 6]),
+            batch(&group, &[7], &[7]),
+            batch(&next, &[1, 2], &[8, 9]),
+            batch(&group, &[0], &[10]),
+        ];
+        let schema = sent[0].schema();
+        let encoded: Vec<_> = FlightDataEncoderBuilder::new()
+            .with_dictionary_handling(DictionaryHandling::Resend)
+            .with_schema(schema)
+            .build(futures::stream::iter(sent.into_iter().map(Ok)))
+            .try_collect()
+            .await
+            .expect("encode");
+        let decoded: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(
+            futures::stream::iter(encoded.into_iter().map(Ok)),
+        )
+        .try_collect()
+        .await
+        .expect("decode");
+        assert_eq!(decoded.len(), 5, "one decoded batch per sent batch");
+
+        let values: Vec<ArrayRef> = decoded
+            .iter()
+            .map(|b| Arc::clone(b.column(0).as_any_dictionary().values()))
+            .collect();
+        assert!(
+            !Arc::ptr_eq(&values[0], &values[1]),
+            "the decoder wraps the stored dictionary in a new values array per batch"
+        );
+        assert!(
+            values[0].to_data().ptr_eq(&values[1].to_data()),
+            "a dictionary sent once decodes into the same buffers for every batch"
+        );
+
+        let mut last = Vec::new();
+        let counted: Vec<usize> = decoded
+            .iter()
+            .map(|b| batch_bytes_scanned(b, &mut last))
+            .collect();
+        let full: Vec<usize> = decoded.iter().map(|b| b.get_array_memory_size()).collect();
+        let values_bytes: Vec<usize> = values.iter().map(|v| v.get_array_memory_size()).collect();
+        assert!(values_bytes.iter().all(|&v| v > 0));
+        assert_eq!(
+            counted,
+            vec![
+                full[0],
+                full[1] - values_bytes[1],
+                full[2] - values_bytes[2],
+                full[3],
+                full[4],
+            ],
+            "the group's values count on the batch that brought them; the next group's \
+             values and the resent first group each count again"
+        );
+    }
+}

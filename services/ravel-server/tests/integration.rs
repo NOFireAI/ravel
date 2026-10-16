@@ -1,0 +1,424 @@
+//! End-to-end coverage: real OTLP HTTP export against an in-process server
+//! backed by `MemoryStore`, followed by a query for the ingested sample.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
+use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
+use opentelemetry_proto::tonic::metrics::v1::metric::Data as MetricData;
+use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value as NumberValue;
+use opentelemetry_proto::tonic::metrics::v1::{
+    Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics,
+};
+use opentelemetry_proto::tonic::resource::v1::Resource;
+use prost::Message;
+use ravel_object_store::memory::MemoryStore;
+use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_types::TenantId;
+
+#[path = "support/strict_flush.rs"]
+mod strict_flush;
+
+use ravel_server::config::StrictFlushPolicy;
+use strict_flush::{Signal, release_until};
+
+const TOKEN: &str = "testtoken";
+
+fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before epoch")
+        .as_nanos() as i64
+}
+
+fn string_kv(key: &str, value: &str) -> KeyValue {
+    KeyValue {
+        key: key.to_string(),
+        value: Some(AnyValue {
+            value: Some(AnyValueVariant::StringValue(value.to_string())),
+        }),
+        ..Default::default()
+    }
+}
+
+fn export_request(
+    metric_name: &str,
+    job: &str,
+    value: f64,
+    ts_ns: i64,
+) -> ExportMetricsServiceRequest {
+    ExportMetricsServiceRequest {
+        resource_metrics: vec![ResourceMetrics {
+            resource: Some(Resource {
+                attributes: vec![string_kv("service.name", job)],
+                ..Default::default()
+            }),
+            scope_metrics: vec![ScopeMetrics {
+                metrics: vec![Metric {
+                    name: metric_name.to_string(),
+                    data: Some(MetricData::Gauge(Gauge {
+                        data_points: vec![NumberDataPoint {
+                            time_unix_nano: ts_ns as u64,
+                            value: Some(NumberValue::AsDouble(value)),
+                            ..Default::default()
+                        }],
+                    })),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }],
+    }
+}
+
+async fn start_test_server() -> ravel_server::Running {
+    let mut tokens = HashMap::new();
+    tokens.insert(TOKEN.to_string(), TenantId::new("acme"));
+    let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
+    let store = Arc::new(MemoryStore::new());
+    let config = ServerConfig {
+        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        audit_pipeline: Default::default(),
+        audit_text: Default::default(),
+        query_budgets: Default::default(),
+        max_inflight_flushes: 1,
+        max_inflight_flushes_per_tenant: None,
+        max_queued_flushes: 8,
+        adaptive_flush_delay: false,
+        max_flush_delay: std::time::Duration::from_secs(2),
+        max_flush_delay_idle: std::time::Duration::from_secs(40),
+        min_flush_bytes: 256 * 1024,
+        idle_flush_byte_floor: 0,
+        mode: Mode::All,
+        listen_http: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        listen_grpc: "127.0.0.1:0".parse().expect("valid loopback addr"),
+        shard_count: 1,
+        tenant_resolver,
+        mtls_listener: None,
+        fold_tenants: Vec::new(),
+        fold: FoldTaskConfig {
+            enabled: false,
+            ..FoldTaskConfig::default()
+        },
+        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        alerting: ravel_server::AlertEvalConfig::default(),
+        oidc_refresh: None,
+        otap: false,
+        metrics_tenant_labels: false,
+        limits: ravel_server::LimitsConfig::default(),
+        max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
+        deployment_key: None,
+        gc: ravel_maintain::GcConfigValues::maintain_defaults(),
+        query_deadline: ravel_query::EngineConfig::default().deadline,
+        store_probe_interval: ravel_server::store_probe::DEFAULT_STORE_PROBE_INTERVAL,
+        admission_reconcile_interval: ravel_ingest::DEFAULT_ADMISSION_RECONCILE_INTERVAL,
+        query_concurrency_limit: ravel_query::QueryConcurrencyLimit::Unlimited,
+        max_s3_requests: ravel_query::EngineConfig::default().max_s3_requests,
+        scrub_period: std::time::Duration::from_secs(7 * 86_400),
+        indexed_fields: Default::default(),
+        typed_attr_columns: Default::default(),
+        parquet_profiles: None,
+        disable_cache: false,
+        cache_max_bytes: 256 * 1024 * 1024,
+        catalog_cache_max_bytes: 256 * 1024 * 1024,
+        process_memory_budget_bytes: u64::MAX,
+        process_memory_budget_is_fallback: false,
+        cache_dir: None,
+        catalog_resolve_concurrency: None,
+        cpu_gate_permits: Default::default(),
+        max_pending_strict_acks: 8_192,
+        ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
+        idle_tenant_state_ttl: std::time::Duration::from_secs(3600),
+        distrib: None,
+        remote_clusters: Vec::new(),
+        shutdown_timeout: ravel_server::DEFAULT_SHUTDOWN_TIMEOUT,
+        drain_settle_interval: std::time::Duration::ZERO,
+        ingest_concurrency_limit: ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(
+            1024,
+        ),
+    };
+    ravel_server::start(
+        config,
+        store.clone(),
+        store.clone(),
+        Arc::new(ravel_object_store::StoreMetrics::default()),
+        None,
+    )
+    .await
+    .expect("server starts")
+}
+
+#[tokio::test]
+async fn ingest_then_query_round_trips_sample() {
+    let running = start_test_server().await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let request = export_request("cpu_usage", "demo", 42.5, now_ns());
+    let body = request.encode_to_vec();
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .body(body)
+        .send()
+        .await
+        .expect("export request succeeds");
+
+    assert_eq!(response.status(), 200, "export should succeed");
+    let commit_token = response
+        .headers()
+        .get("x-ravel-commit-token")
+        .expect("commit token header present")
+        .to_str()
+        .expect("commit token header is ascii")
+        .to_string();
+
+    let query_response = client
+        .get(format!("{base}/api/v1/query"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .query(&[
+            ("query", "cpu_usage"),
+            ("min_commit_token", commit_token.as_str()),
+        ])
+        .send()
+        .await
+        .expect("query request succeeds");
+
+    assert_eq!(query_response.status(), 200, "query should succeed");
+    let body: serde_json::Value = query_response.json().await.expect("query response is JSON");
+    assert_eq!(body["status"], "success");
+    let result = body["data"]["result"]
+        .as_array()
+        .expect("result is an array");
+    assert_eq!(result.len(), 1, "expected exactly one series: {body}");
+    let sample = &result[0];
+    assert_eq!(sample["metric"]["__name__"], "cpu_usage");
+    assert_eq!(sample["metric"]["job"], "demo");
+    let value_str = sample["value"][1].as_str().expect("value is a string");
+    let value: f64 = value_str.parse().expect("value parses as f64");
+    assert!(
+        (value - 42.5).abs() < f64::EPSILON,
+        "unexpected value: {value_str}"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn buffered_mode_header_is_honored() {
+    let running = start_test_server().await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let request = export_request("buffered_metric", "demo", 7.0, now_ns());
+    let body = request.encode_to_vec();
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("authorization", format!("Bearer {TOKEN}"))
+        .header("content-type", "application/x-protobuf")
+        .header("x-ravel-ingest-mode", "buffered")
+        .body(body)
+        .send()
+        .await
+        .expect("export request succeeds");
+
+    assert_eq!(response.status(), 200, "buffered export should succeed");
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+#[tokio::test]
+async fn missing_credentials_yield_401() {
+    let running = start_test_server().await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
+
+    let request = export_request("cpu_usage", "demo", 1.0, now_ns());
+    let body = request.encode_to_vec();
+    let response = client
+        .post(format!("{base}/v1/metrics"))
+        .header("content-type", "application/x-protobuf")
+        .body(body)
+        .send()
+        .await
+        .expect("export request completes");
+
+    assert_eq!(
+        response.status(),
+        401,
+        "missing bearer token should be rejected"
+    );
+
+    let query_response = client
+        .get(format!("{base}/api/v1/query"))
+        .query(&[("query", "cpu_usage")])
+        .send()
+        .await
+        .expect("query request completes");
+    assert_eq!(
+        query_response.status(),
+        401,
+        "unauthenticated query should be rejected"
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// `strict-arrival` under the default `aged` policy opens the flush from the
+/// write itself: the data PUT is issued while the age threshold is still
+/// ahead, and the ack follows it once the gate lets it through.
+#[tokio::test]
+async fn strict_arrival_header_acks_without_the_age_tick() {
+    let server = strict_flush::start(StrictFlushPolicy::Aged, Signal::Metrics).await;
+
+    let client = server.client.clone();
+    let url = format!("{}/v1/metrics", server.base);
+    let export = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf")
+            .header("x-ravel-ingest-mode", "strict-arrival")
+            .body(export_request("arrival_metric", "demo", 1.0, now_ns()).encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes")
+    });
+    server.wait_for_data_put().await;
+    assert!(
+        !export.is_finished(),
+        "the strict ack waits for the held data PUT"
+    );
+    assert_eq!(server.flushes_by_age().await, 0, "no age flush opened");
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task");
+    assert_eq!(response.status(), 200, "strict export should succeed");
+    assert!(
+        response
+            .headers()
+            .get("x-ravel-commit-token")
+            .is_some_and(|value| !value.is_empty()),
+        "a strict export acks with a commit token"
+    );
+    assert_eq!(server.flushes_by_arrival().await, 1);
+
+    server.shutdown().await;
+}
+
+/// The metrics gRPC handler returns its in-flight permit at enqueue too: with
+/// the ceiling at one, a second strict export is admitted while the first
+/// still waits on its held data PUT, and both ack with commit-token metadata
+/// once the gate releases.
+#[tokio::test]
+async fn in_flight_permit_is_released_before_the_strict_ack() {
+    use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_client::MetricsServiceClient;
+
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        config.ingest_concurrency_limit =
+            ravel_server::ingest_concurrency::IngestConcurrencyLimit::Bounded(1);
+    })
+    .await;
+    let grpc_addr = server.running.grpc_addr.expect("gateway mode binds gRPC");
+    let spawn_export = |metric: &'static str| {
+        tokio::spawn(async move {
+            let mut client = MetricsServiceClient::connect(format!("http://{grpc_addr}"))
+                .await
+                .expect("gRPC client connects");
+            let mut request = tonic::Request::new(export_request(metric, "demo", 1.0, now_ns()));
+            request.metadata_mut().insert(
+                "authorization",
+                format!("Bearer {TOKEN}").parse().expect("ascii metadata"),
+            );
+            client.export(request).await
+        })
+    };
+
+    let mut first = spawn_export("first_grpc_metric");
+    server.wait_for_buffered_while_pending(1, &mut first).await;
+    let mut second = spawn_export("second_grpc_metric");
+    server.wait_for_buffered_while_pending(2, &mut second).await;
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "both strict acks wait for the held data PUTs"
+    );
+    assert_eq!(
+        strict_flush::process_sample(
+            &server.scrape().await,
+            "ravel_ingest_concurrency_shed_total"
+        ),
+        0,
+        "the second export was admitted, not shed"
+    );
+
+    let (first, second) = release_until(&server.gate, async {
+        (
+            first.await.expect("export task"),
+            second.await.expect("export task"),
+        )
+    })
+    .await;
+    for response in [first, second] {
+        let response = response.expect("gRPC export succeeds");
+        assert!(
+            response
+                .metadata()
+                .get("x-ravel-commit-token")
+                .is_some_and(|value| !value.is_empty()),
+            "a strict export acks with commit-token metadata"
+        );
+    }
+
+    server.shutdown().await;
+}
+
+/// With the pending strict-ack budget at one, an OTLP HTTP metrics export
+/// takes that one permit at its head and the router takes no second one: the
+/// export reaches its buffer instead of being refused, the gauge reads one
+/// while it waits on its held data PUT, and it acks once the gate releases.
+#[tokio::test]
+async fn a_strict_metrics_export_takes_its_head_permit_once() {
+    let server = strict_flush::start_with(StrictFlushPolicy::Arrival, Signal::Metrics, |config| {
+        config.max_pending_strict_acks = 1;
+    })
+    .await;
+
+    let client = server.client.clone();
+    let url = format!("{}/v1/metrics", server.base);
+    let mut export = tokio::spawn(async move {
+        client
+            .post(url)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .header("content-type", "application/x-protobuf")
+            .body(export_request("single_permit_metric", "demo", 1.0, now_ns()).encode_to_vec())
+            .send()
+            .await
+            .expect("export request completes")
+    });
+    server.wait_for_buffered_while_pending(1, &mut export).await;
+    assert_eq!(
+        strict_flush::process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
+        1,
+        "the export holds exactly its head permit"
+    );
+
+    let response = release_until(&server.gate, export)
+        .await
+        .expect("export task");
+    assert_eq!(response.status(), 200, "strict export should succeed");
+    assert_eq!(
+        strict_flush::process_sample(&server.scrape().await, "ravel_ingest_pending_strict_acks"),
+        0
+    );
+
+    server.shutdown().await;
+}

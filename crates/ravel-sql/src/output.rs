@@ -1,0 +1,1632 @@
+//! Query results and their two wire encodings.
+//!
+//! [`QueryOutput`] owns the collected `RecordBatch`es and hides every arrow
+//! and DataFusion type behind its own surface. That is deliberate: the HTTP
+//! endpoint lives in services/ravel-server, which must not link datafusion
+//! (ADR-0013 structural isolation). The endpoint picks an encoding from the `Accept` header and
+//! gets back bytes or a `serde_json::Value`; it never touches a batch.
+//!
+//! # JSON float encoding
+//!
+//! JSON has no NaN or infinity literal. Ravel's exactness posture makes
+//! those values significant (NaN payloads and -0.0 are preserved
+//! bit-exactly through the storage and dedup path), so they are encoded as
+//! the strings `"NaN"`, `"+Inf"`, and `"-Inf"` -- the same spelling
+//! Prometheus uses in its own JSON API, so a client that already speaks the
+//! PromQL endpoint needs no new rule. Finite values are JSON numbers,
+//! including `-0.0`, which `serde_json` renders with its sign preserved.
+//! `Float16` is widened to f64, which is exact, and follows the same rules.
+//!
+//! Arrow IPC has no such problem and carries the exact bit patterns; it is
+//! the encoding to use when bit-exactness matters to the caller.
+//!
+//! # JSON encoding of the other scalar types
+//!
+//! Integers of every width are JSON numbers. A timestamp of any unit is an
+//! integer count of nanoseconds since the epoch, its time zone dropped; one
+//! with no i64 nanosecond count is an error. Such a count is usually past
+//! 2^53, so a client must parse JSON integers exactly to keep it. A `Time32`
+//! or `Time64` of any unit is an integer count of nanoseconds since midnight;
+//! a negative value, or one of a whole day or more, is an error. A
+//! `Duration` of any unit is a signed integer count of nanoseconds; one with
+//! no i64 nanosecond count is an error. `Date32`
+//! and `Date64` are `YYYY-MM-DD` strings, and a value with no such form (a
+//! year outside 0000 to 9999, or a `Date64` that is not a whole day) is an
+//! error. Every decimal width (`Decimal32` to `Decimal256`) is a string of
+//! its exact decimal text. Binary types are lowercase hex strings.
+//!
+//! An `Interval` of any unit is an object with all three of `months`, `days`
+//! and `nanoseconds` (integers; a unit without a component sets it to 0). The
+//! components stay apart because none converts into another exactly (a month
+//! has no fixed number of days), and ISO 8601 durations cannot carry a
+//! negative component beside a positive one. Every list layout (`List`,
+//! `LargeList`, `FixedSizeList`, `ListView`, `LargeListView`) is a JSON array
+//! whose elements follow these same rules, and a `Dictionary` with any
+//! integer key type encodes as the value its key addresses.
+//!
+//! # Unencodable results
+//!
+//! A type with no arm, and every value error above, is
+//! [`SqlError::UnencodableResult`]: the column's name, the Arrow type of the
+//! array that failed, and a fixed reason, never the value. It has the same
+//! class as a plan error, so `/api/v1/sql` answers 422 `execution` with that
+//! message, which tells the caller to request Arrow IPC, the encoding that
+//! carries every type exactly. A type with no arm is also logged at `warn`,
+//! since it is a gap in this encoder rather than a value out of range. A
+//! failed downcast, a dictionary key out of bounds, a map whose keys or values
+//! are not Utf8, and an Arrow IPC writer error stay `SqlError::Internal`:
+//! those are faults in the engine, not in the caller's choice of encoding.
+
+use std::fmt::Write as _;
+
+use datafusion::arrow::array::{
+    Array, ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
+    Decimal32Array, Decimal64Array, Decimal128Array, Decimal256Array, DictionaryArray,
+    DurationMicrosecondArray, DurationMillisecondArray, DurationNanosecondArray,
+    DurationSecondArray, FixedSizeBinaryArray, FixedSizeListArray, Float16Array, Float32Array,
+    Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, IntervalDayTimeArray,
+    IntervalMonthDayNanoArray, IntervalYearMonthArray, LargeBinaryArray, LargeListArray,
+    LargeListViewArray, LargeStringArray, ListArray, ListViewArray, MapArray, StringArray,
+    StringViewArray, StructArray, Time32MillisecondArray, Time32SecondArray,
+    Time64MicrosecondArray, Time64NanosecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
+};
+use datafusion::arrow::datatypes::{
+    ArrowDictionaryKeyType, ArrowNativeType, DataType, Int8Type, Int16Type, Int32Type, Int64Type,
+    IntervalUnit, SchemaRef, TimeUnit, UInt8Type, UInt16Type, UInt32Type, UInt64Type, i256,
+};
+use datafusion::arrow::ipc::writer::StreamWriter;
+use datafusion::arrow::record_batch::RecordBatch;
+use serde_json::{Map as JsonMap, Value as Json, json};
+
+use crate::error::SqlError;
+
+/// The collected result of one SQL query.
+#[derive(Debug, Clone)]
+pub struct QueryOutput {
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+}
+
+impl QueryOutput {
+    pub(crate) fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        QueryOutput { schema, batches }
+    }
+
+    /// Column names in output order.
+    pub fn column_names(&self) -> Vec<String> {
+        self.schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    /// Total rows across all batches.
+    pub fn num_rows(&self) -> usize {
+        self.batches.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Number of batches the plan emitted. Exposed for the memory-accounting
+    /// tests, which need to prove more than one batch went through the pool.
+    pub fn num_batches(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// The collected batches, for in-crate tests and the differential gate.
+    pub fn batches(&self) -> &[RecordBatch] {
+        &self.batches
+    }
+
+    /// Encode as an Arrow IPC stream (schema message followed by one record
+    /// batch message per batch). Bit-exact for every float.
+    pub fn to_arrow_ipc(&self) -> Result<Vec<u8>, SqlError> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, self.schema.as_ref())
+                .map_err(|e| SqlError::Internal(format!("arrow IPC writer: {e}")))?;
+            for batch in &self.batches {
+                writer
+                    .write(batch)
+                    .map_err(|e| SqlError::Internal(format!("arrow IPC write: {e}")))?;
+            }
+            writer
+                .finish()
+                .map_err(|e| SqlError::Internal(format!("arrow IPC finish: {e}")))?;
+        }
+        Ok(buf)
+    }
+
+    /// Encode as JSON: `{"columns": [...], "rows": [[...], ...]}`.
+    ///
+    /// Row-major rather than column-major because a SQL result is
+    /// heterogeneous by column and clients consume it row-wise; the columnar
+    /// answer for clients that want it is Arrow IPC.
+    pub fn to_json(&self) -> Result<Json, SqlError> {
+        let columns: Vec<Json> = self
+            .schema
+            .fields()
+            .iter()
+            .map(|f| json!({ "name": f.name(), "type": f.data_type().to_string() }))
+            .collect();
+
+        let mut rows: Vec<Json> = Vec::with_capacity(self.num_rows());
+        for batch in &self.batches {
+            for row in 0..batch.num_rows() {
+                let mut cells = Vec::with_capacity(batch.num_columns());
+                for (field, col) in batch.schema_ref().fields().iter().zip(batch.columns()) {
+                    cells.push(cell_to_json(field.name(), col, row)?);
+                }
+                rows.push(Json::Array(cells));
+            }
+        }
+
+        Ok(json!({ "columns": columns, "rows": rows }))
+    }
+}
+
+/// Encode one cell of the result column named `column`. A type with no JSON
+/// form, or a value outside what its form can hold, is
+/// [`SqlError::UnencodableResult`] rather than a lossy stringification:
+/// silently rendering a value we cannot represent would be a quiet
+/// correctness hole in an endpoint whose whole contract is exactness. A
+/// nested cell keeps the top-level column's name, and the error names the
+/// type of the innermost array that failed.
+fn cell_to_json(column: &str, array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
+    if array.is_null(row) {
+        return Ok(Json::Null);
+    }
+    let value = match array.data_type() {
+        DataType::Null => Json::Null,
+        DataType::Boolean => Json::Bool(downcast::<BooleanArray>(array, "Boolean")?.value(row)),
+        DataType::Int8 => json!(downcast::<Int8Array>(array, "Int8")?.value(row)),
+        DataType::Int16 => json!(downcast::<Int16Array>(array, "Int16")?.value(row)),
+        DataType::Int32 => json!(downcast::<Int32Array>(array, "Int32")?.value(row)),
+        DataType::Int64 => json!(downcast::<Int64Array>(array, "Int64")?.value(row)),
+        // `spans.status_code` is a `UInt8` (the OTLP status byte), reachable
+        // through the public spans table (ADR-0045 decision 5); without this
+        // arm a `SELECT status_code FROM spans` fails JSON encoding with a
+        // generic internal error.
+        DataType::UInt8 => json!(downcast::<UInt8Array>(array, "UInt8")?.value(row)),
+        DataType::UInt16 => json!(downcast::<UInt16Array>(array, "UInt16")?.value(row)),
+        DataType::UInt32 => json!(downcast::<UInt32Array>(array, "UInt32")?.value(row)),
+        DataType::UInt64 => json!(downcast::<UInt64Array>(array, "UInt64")?.value(row)),
+        DataType::Float16 => float_to_json(
+            downcast::<Float16Array>(array, "Float16")?
+                .value(row)
+                .to_f64(),
+        ),
+        DataType::Float32 => float_to_json(f64::from(
+            downcast::<Float32Array>(array, "Float32")?.value(row),
+        )),
+        DataType::Float64 => float_to_json(downcast::<Float64Array>(array, "Float64")?.value(row)),
+        DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+            json!(downcast::<TimestampNanosecondArray>(array, "Timestamp(ns)")?.value(row))
+        }
+        DataType::Timestamp(TimeUnit::Microsecond, _) => json!(scale_to_nanos(
+            column,
+            array,
+            downcast::<TimestampMicrosecondArray>(array, "Timestamp(us)")?.value(row),
+            1_000,
+        )?),
+        DataType::Timestamp(TimeUnit::Millisecond, _) => json!(scale_to_nanos(
+            column,
+            array,
+            downcast::<TimestampMillisecondArray>(array, "Timestamp(ms)")?.value(row),
+            1_000_000,
+        )?),
+        DataType::Timestamp(TimeUnit::Second, _) => json!(scale_to_nanos(
+            column,
+            array,
+            downcast::<TimestampSecondArray>(array, "Timestamp(s)")?.value(row),
+            1_000_000_000,
+        )?),
+        DataType::Time32(TimeUnit::Second) => json!(time_of_day_nanos(
+            column,
+            array,
+            i64::from(downcast::<Time32SecondArray>(array, "Time32(s)")?.value(row)),
+            1_000_000_000,
+        )?),
+        DataType::Time32(TimeUnit::Millisecond) => json!(time_of_day_nanos(
+            column,
+            array,
+            i64::from(downcast::<Time32MillisecondArray>(array, "Time32(ms)")?.value(row)),
+            1_000_000,
+        )?),
+        DataType::Time64(TimeUnit::Microsecond) => json!(time_of_day_nanos(
+            column,
+            array,
+            downcast::<Time64MicrosecondArray>(array, "Time64(us)")?.value(row),
+            1_000,
+        )?),
+        DataType::Time64(TimeUnit::Nanosecond) => json!(time_of_day_nanos(
+            column,
+            array,
+            downcast::<Time64NanosecondArray>(array, "Time64(ns)")?.value(row),
+            1,
+        )?),
+        DataType::Duration(TimeUnit::Second) => json!(duration_nanos(
+            column,
+            array,
+            downcast::<DurationSecondArray>(array, "Duration(s)")?.value(row),
+            1_000_000_000,
+        )?),
+        DataType::Duration(TimeUnit::Millisecond) => json!(duration_nanos(
+            column,
+            array,
+            downcast::<DurationMillisecondArray>(array, "Duration(ms)")?.value(row),
+            1_000_000,
+        )?),
+        DataType::Duration(TimeUnit::Microsecond) => json!(duration_nanos(
+            column,
+            array,
+            downcast::<DurationMicrosecondArray>(array, "Duration(us)")?.value(row),
+            1_000,
+        )?),
+        DataType::Duration(TimeUnit::Nanosecond) => {
+            json!(downcast::<DurationNanosecondArray>(array, "Duration(ns)")?.value(row))
+        }
+        DataType::Date32 => {
+            let days = downcast::<Date32Array>(array, "Date32")?.value(row);
+            json!(date_text(i64::from(days)).ok_or_else(|| not_a_date(column, array))?)
+        }
+        DataType::Date64 => {
+            let millis = downcast::<Date64Array>(array, "Date64")?.value(row);
+            let text = (millis.rem_euclid(MILLIS_PER_DAY) == 0)
+                .then(|| date_text(millis.div_euclid(MILLIS_PER_DAY)))
+                .flatten()
+                .ok_or_else(|| not_a_date(column, array))?;
+            json!(text)
+        }
+        DataType::Decimal32(_, scale) => json!(decimal_text(
+            downcast::<Decimal32Array>(array, "Decimal32")?.value(row),
+            *scale
+        )),
+        DataType::Decimal64(_, scale) => json!(decimal_text(
+            downcast::<Decimal64Array>(array, "Decimal64")?.value(row),
+            *scale
+        )),
+        DataType::Decimal128(_, scale) => json!(decimal_text(
+            downcast::<Decimal128Array>(array, "Decimal128")?.value(row),
+            *scale
+        )),
+        DataType::Decimal256(_, scale) => json!(decimal_text(
+            downcast::<Decimal256Array>(array, "Decimal256")?.value(row),
+            *scale
+        )),
+        DataType::Utf8 => json!(downcast::<StringArray>(array, "Utf8")?.value(row)),
+        DataType::LargeUtf8 => json!(downcast::<LargeStringArray>(array, "LargeUtf8")?.value(row)),
+        DataType::Utf8View => json!(downcast::<StringViewArray>(array, "Utf8View")?.value(row)),
+        DataType::FixedSizeBinary(_) => json!(hex(downcast::<FixedSizeBinaryArray>(
+            array,
+            "FixedSizeBinary"
+        )?
+        .value(row))),
+        DataType::Binary => json!(hex(downcast::<BinaryArray>(array, "Binary")?.value(row))),
+        DataType::LargeBinary => json!(hex(
+            downcast::<LargeBinaryArray>(array, "LargeBinary")?.value(row)
+        )),
+        DataType::BinaryView => json!(hex(
+            downcast::<BinaryViewArray>(array, "BinaryView")?.value(row)
+        )),
+        DataType::Interval(IntervalUnit::YearMonth) => {
+            let months = downcast::<IntervalYearMonthArray>(array, "Interval(YearMonth)")?;
+            interval_json(months.value(row), 0, 0)
+        }
+        DataType::Interval(IntervalUnit::DayTime) => {
+            let value = downcast::<IntervalDayTimeArray>(array, "Interval(DayTime)")?.value(row);
+            // An i32 count of milliseconds times 10^6 always fits an i64.
+            interval_json(0, value.days, i64::from(value.milliseconds) * 1_000_000)
+        }
+        DataType::Interval(IntervalUnit::MonthDayNano) => {
+            let value =
+                downcast::<IntervalMonthDayNanoArray>(array, "Interval(MonthDayNano)")?.value(row);
+            interval_json(value.months, value.days, value.nanoseconds)
+        }
+        DataType::Dictionary(key, value) => {
+            let (values, index) = match **key {
+                DataType::Int8 => dictionary_entry::<Int8Type>(array, row)?,
+                DataType::Int16 => dictionary_entry::<Int16Type>(array, row)?,
+                DataType::Int32 => dictionary_entry::<Int32Type>(array, row)?,
+                DataType::Int64 => dictionary_entry::<Int64Type>(array, row)?,
+                DataType::UInt8 => dictionary_entry::<UInt8Type>(array, row)?,
+                DataType::UInt16 => dictionary_entry::<UInt16Type>(array, row)?,
+                DataType::UInt32 => dictionary_entry::<UInt32Type>(array, row)?,
+                DataType::UInt64 => dictionary_entry::<UInt64Type>(array, row)?,
+                _ => return Err(no_json_encoding(column, array)),
+            };
+            if matches!(**value, DataType::Map(_, _)) {
+                map_to_json(values, index)
+            } else {
+                cell_to_json(column, values, index)
+            }?
+        }
+        DataType::Map(_, _) => map_to_json(array, row)?,
+        // `spans.events` is a `List(Struct{...})` (issue #1710). A list cell
+        // becomes a JSON array and a struct cell a JSON object, each element
+        // encoded by the same rules as a top-level cell, so a nested Utf8 or
+        // Map reads exactly as it would in a column of its own. Every list
+        // layout encodes the same way.
+        DataType::List(_) => list_json(column, &downcast::<ListArray>(array, "List")?.value(row))?,
+        DataType::LargeList(_) => list_json(
+            column,
+            &downcast::<LargeListArray>(array, "LargeList")?.value(row),
+        )?,
+        DataType::FixedSizeList(_, _) => list_json(
+            column,
+            &downcast::<FixedSizeListArray>(array, "FixedSizeList")?.value(row),
+        )?,
+        DataType::ListView(_) => list_json(
+            column,
+            &downcast::<ListViewArray>(array, "ListView")?.value(row),
+        )?,
+        DataType::LargeListView(_) => list_json(
+            column,
+            &downcast::<LargeListViewArray>(array, "LargeListView")?.value(row),
+        )?,
+        DataType::Struct(fields) => {
+            let columns = downcast::<StructArray>(array, "Struct")?;
+            let mut object = JsonMap::with_capacity(fields.len());
+            for (i, field) in fields.iter().enumerate() {
+                let child = columns.column(i);
+                object.insert(field.name().to_string(), cell_to_json(column, child, row)?);
+            }
+            Json::Object(object)
+        }
+        _ => return Err(no_json_encoding(column, array)),
+    };
+    Ok(value)
+}
+
+const NO_ARM: &str = "this type has no JSON encoding";
+const EPOCH_NANOS_OVERFLOW: &str = "the value has no i64 count of nanoseconds since the epoch";
+const DURATION_NANOS_OVERFLOW: &str = "the value has no i64 count of nanoseconds";
+const NOT_A_TIME_OF_DAY: &str =
+    "a JSON time must be at least 0 and less than one day since midnight";
+const NOT_A_DATE: &str = "a JSON date must be a whole day from 0000-01-01 to 9999-12-31";
+
+/// The error for a cell of `column` that `array`'s JSON form cannot hold. It
+/// names the column, the type and a fixed reason, never the value.
+fn unencodable(column: &str, array: &ArrayRef, reason: &'static str) -> SqlError {
+    SqlError::UnencodableResult {
+        column: column.to_string(),
+        data_type: array.data_type().to_string(),
+        reason,
+    }
+}
+
+/// A type with no arm. Unlike a value out of range, this is a gap in the
+/// encoder a new column type can open, so it is logged for the operator too.
+fn no_json_encoding(column: &str, array: &ArrayRef) -> SqlError {
+    tracing::warn!(
+        column,
+        data_type = %array.data_type(),
+        "SQL result column has no JSON encoding"
+    );
+    unencodable(column, array, NO_ARM)
+}
+
+/// The elements of one list cell of `column`, each encoded by the top-level
+/// rules.
+fn list_json(column: &str, values: &ArrayRef) -> Result<Json, SqlError> {
+    let mut items = Vec::with_capacity(values.len());
+    for i in 0..values.len() {
+        items.push(cell_to_json(column, values, i)?);
+    }
+    Ok(Json::Array(items))
+}
+
+/// An interval of any unit as its three components. They are kept apart
+/// because none converts into another exactly: a month has no fixed number of
+/// days, and a day has no fixed number of nanoseconds across a DST change.
+fn interval_json(months: i32, days: i32, nanoseconds: i64) -> Json {
+    json!({ "months": months, "days": days, "nanoseconds": nanoseconds })
+}
+
+/// The dictionary values of a `Dictionary(K, _)` cell and the index its key
+/// resolves to.
+fn dictionary_entry<K: ArrowDictionaryKeyType>(
+    array: &ArrayRef,
+    row: usize,
+) -> Result<(&ArrayRef, usize), SqlError> {
+    let dict = downcast::<DictionaryArray<K>>(array, "Dictionary")?;
+    let index = resolve_key(dict.keys().value(row), dict.values().len())?;
+    Ok((dict.values(), index))
+}
+
+/// A `Map(Utf8, Utf8)` cell becomes a JSON object. Ravel's only map column
+/// is `labels`, whose keys are non-null Utf8 by construction (crate::schema).
+fn map_to_json(array: &ArrayRef, row: usize) -> Result<Json, SqlError> {
+    let map = downcast::<MapArray>(array, "Map")?;
+    if map.is_null(row) {
+        return Ok(Json::Null);
+    }
+    let entries = map.value(row);
+    let keys = entries
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| SqlError::Internal("map keys are not Utf8".to_string()))?;
+    let values = entries
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| SqlError::Internal("map values are not Utf8".to_string()))?;
+
+    let mut object = JsonMap::with_capacity(keys.len());
+    for i in 0..keys.len() {
+        let value = if values.is_null(i) {
+            Json::Null
+        } else {
+            Json::String(values.value(i).to_string())
+        };
+        object.insert(keys.value(i).to_string(), value);
+    }
+    Ok(Json::Object(object))
+}
+
+/// NaN and the infinities have no JSON literal; encode them the way
+/// Prometheus does so a client needs one rule, not two.
+fn float_to_json(value: f64) -> Json {
+    if value.is_nan() {
+        Json::String("NaN".to_string())
+    } else if value == f64::INFINITY {
+        Json::String("+Inf".to_string())
+    } else if value == f64::NEG_INFINITY {
+        Json::String("-Inf".to_string())
+    } else {
+        // `serde_json::Number::from_f64` only returns None for non-finite
+        // input, which the branches above already handled.
+        json!(value)
+    }
+}
+
+const MILLIS_PER_DAY: i64 = 86_400_000;
+
+/// A timestamp of a coarser unit as nanoseconds since the epoch, the encoding
+/// `Timestamp(ns)` already has. A value with no i64 nanosecond count is an
+/// error rather than a wrapped number.
+fn scale_to_nanos(
+    column: &str,
+    array: &ArrayRef,
+    value: i64,
+    nanos_per_unit: i64,
+) -> Result<i64, SqlError> {
+    value
+        .checked_mul(nanos_per_unit)
+        .ok_or_else(|| unencodable(column, array, EPOCH_NANOS_OVERFLOW))
+}
+
+/// A duration of a coarser unit as a signed count of nanoseconds. A value
+/// with no i64 nanosecond count is an error rather than a wrapped number.
+fn duration_nanos(
+    column: &str,
+    array: &ArrayRef,
+    value: i64,
+    nanos_per_unit: i64,
+) -> Result<i64, SqlError> {
+    value
+        .checked_mul(nanos_per_unit)
+        .ok_or_else(|| unencodable(column, array, DURATION_NANOS_OVERFLOW))
+}
+
+const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
+/// A time of day of any unit as nanoseconds since midnight. A negative value,
+/// one that is a whole day or more, or one whose nanosecond count overflows
+/// an i64 is an error rather than a number no time of day has; all three
+/// report the same reason.
+fn time_of_day_nanos(
+    column: &str,
+    array: &ArrayRef,
+    value: i64,
+    nanos_per_unit: i64,
+) -> Result<i64, SqlError> {
+    value
+        .checked_mul(nanos_per_unit)
+        .filter(|nanos| (0..NANOS_PER_DAY).contains(nanos))
+        .ok_or_else(|| unencodable(column, array, NOT_A_TIME_OF_DAY))
+}
+
+fn not_a_date(column: &str, array: &ArrayRef) -> SqlError {
+    unencodable(column, array, NOT_A_DATE)
+}
+
+/// `days` since 1970-01-01 as `YYYY-MM-DD` in the proleptic Gregorian
+/// calendar, or `None` outside years 0000 to 9999. Howard Hinnant's
+/// `civil_from_days`; every step not marked checked works on a remainder
+/// already bounded to one 400-year era.
+fn date_text(days: i64) -> Option<String> {
+    let shifted = days.checked_add(719_468)?;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = era
+        .checked_mul(400)?
+        .checked_add(year_of_era)?
+        .checked_add(i64::from(month <= 2))?;
+    (0..=9999)
+        .contains(&year)
+        .then(|| format!("{year:04}-{month:02}-{day:02}"))
+}
+
+/// An unscaled decimal value whose `Display` is its exact base-10 text: the
+/// integer types the Arrow decimal arrays store. Kept private and implemented
+/// only for those, so a float or a string cannot reach [`decimal_text`].
+trait ExactDecimalDigits: std::fmt::Display {}
+impl ExactDecimalDigits for i32 {}
+impl ExactDecimalDigits for i64 {}
+impl ExactDecimalDigits for i128 {}
+impl ExactDecimalDigits for i256 {}
+
+/// The exact decimal text of an unscaled `value` at `scale`: `12345` at
+/// scale 2 is `123.45`, `12` at scale -2 is `1200`.
+fn decimal_text(value: impl ExactDecimalDigits, scale: i8) -> String {
+    let text = value.to_string();
+    let (sign, digits) = match text.strip_prefix('-') {
+        Some(magnitude) => ("-", magnitude),
+        None => ("", text.as_str()),
+    };
+    let scale_digits = usize::from(scale.unsigned_abs());
+    if scale <= 0 {
+        if digits == "0" {
+            return "0".to_string();
+        }
+        format!("{sign}{digits}{}", "0".repeat(scale_digits))
+    } else if digits.len() > scale_digits {
+        let (whole, fraction) = digits.split_at(digits.len() - scale_digits);
+        format!("{sign}{whole}.{fraction}")
+    } else {
+        format!("{sign}0.{digits:0>scale_digits$}")
+    }
+}
+
+/// Resolve a dictionary key of any integer key type into a valid index into
+/// the `len` distinct values. A negative key (via `to_usize`) or an index
+/// `>= len` is a corrupt column, so it becomes a typed `SqlError::Internal`
+/// rather than an out-of-bounds index panic on `dict.values()`. This mirrors
+/// the sibling decoder in `labels.rs`, which rejects the identical condition
+/// on the same `Dictionary(Int32, Map)` column, so both decoders fail loudly
+/// and the same way. Callers handle a null cell before reaching here.
+fn resolve_key<K: ArrowNativeType>(key: K, len: usize) -> Result<usize, SqlError> {
+    let k = key
+        .to_usize()
+        .ok_or_else(|| SqlError::Internal(format!("negative dictionary key {key:?}")))?;
+    if k >= len {
+        return Err(SqlError::Internal(format!(
+            "dictionary key {k} out of range for {len} entries"
+        )));
+    }
+    Ok(k)
+}
+
+fn downcast<'a, T: Array + 'static>(array: &'a ArrayRef, what: &str) -> Result<&'a T, SqlError> {
+    array
+        .as_any()
+        .downcast_ref::<T>()
+        .ok_or_else(|| SqlError::Internal(format!("expected {what} array")))
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        // Writing to a String is infallible.
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::datatypes::{Field, Schema};
+
+    use super::*;
+
+    fn float_output(values: Vec<f64>) -> QueryOutput {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Float64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Float64Array::from(values)) as ArrayRef],
+        )
+        .expect("batch");
+        QueryOutput::new(schema, vec![batch])
+    }
+
+    #[test]
+    fn json_encodes_nan_and_infinities_as_prometheus_strings() {
+        let out = float_output(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.5]);
+        let json = out.to_json().expect("json");
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], Json::String("NaN".to_string()));
+        assert_eq!(rows[1][0], Json::String("+Inf".to_string()));
+        assert_eq!(rows[2][0], Json::String("-Inf".to_string()));
+        assert_eq!(rows[3][0], json!(1.5));
+    }
+
+    #[test]
+    fn json_preserves_the_sign_of_negative_zero() {
+        let out = float_output(vec![-0.0, 0.0]);
+        let json = out.to_json().expect("json");
+        let text = serde_json::to_string(&json["rows"]).expect("serialize");
+        assert!(
+            text.contains("-0.0"),
+            "-0.0 must keep its sign in JSON: {text}"
+        );
+    }
+
+    /// Arrow IPC is the bit-exact encoding: a NaN payload must survive a
+    /// round trip through it unchanged.
+    #[test]
+    fn arrow_ipc_round_trips_nan_payloads_bit_exactly() {
+        use datafusion::arrow::ipc::reader::StreamReader;
+
+        let payload = f64::from_bits(0x7ff8_0000_0000_00ab);
+        let out = float_output(vec![payload, -0.0, f64::NEG_INFINITY]);
+        let bytes = out.to_arrow_ipc().expect("ipc");
+
+        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader");
+        let batches: Vec<RecordBatch> = reader.map(|b| b.expect("batch")).collect();
+        assert_eq!(batches.len(), 1);
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .expect("f64 col");
+        assert_eq!(col.value(0).to_bits(), payload.to_bits());
+        assert_eq!(col.value(1).to_bits(), (-0.0f64).to_bits());
+        assert_eq!(col.value(2).to_bits(), f64::NEG_INFINITY.to_bits());
+    }
+
+    /// `spans.status_code` is a `UInt8` reachable through the public spans
+    /// table (ADR-0045 decision 5). It must JSON-encode as a plain integer, not
+    /// fall through to the "no JSON encoding for arrow type" internal error the
+    /// generic `other =>` arm produces for an unhandled type.
+    #[test]
+    fn json_encodes_uint8_columns_as_integers() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "status_code",
+            DataType::UInt8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(UInt8Array::from(vec![0u8, 1, 2])) as ArrayRef],
+        )
+        .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], json!(0));
+        assert_eq!(rows[1][0], json!(1));
+        assert_eq!(rows[2][0], json!(2));
+    }
+
+    #[test]
+    fn out_of_range_dictionary_key_is_typed_error() {
+        // Arrow's safe DictionaryArray constructors validate key bounds, so a
+        // corrupt key is unconstructible through safe APIs and cannot be driven
+        // end to end without `unsafe`, which is denied workspace-wide.
+        // resolve_key is the guard cell_to_json calls before indexing
+        // dict.values(); test it directly. A negative key and an out-of-range
+        // positive key must each be a typed Internal error, never a panic; a
+        // valid key resolves.
+        assert!(matches!(resolve_key(-1, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(4, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(3, 4), Ok(3)));
+    }
+
+    #[test]
+    fn fixed_size_binary_is_hex_encoded() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "series_id",
+            DataType::FixedSizeBinary(4),
+            false,
+        )]));
+        let array =
+            FixedSizeBinaryArray::try_from_iter(vec![[0xde_u8, 0xad, 0xbe, 0xef]].into_iter())
+                .expect("array");
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(array) as ArrayRef])
+            .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+        assert_eq!(json["rows"][0][0], json!("deadbeef"));
+    }
+
+    /// A declared `Str` column arrives as `Dictionary(Int32, Utf8)` after
+    /// ADR-0099 decision 5, but the HTTP JSON output must be byte-for-byte what
+    /// the pre-dictionary plain `Utf8` column produced: a string per row, JSON
+    /// `null` for a NULL key, and JSON `null` for a key addressing a NULL
+    /// (non-UTF-8) dictionary value. This asserts the existing
+    /// `Dictionary(Int32, _)` arm already covers the new column type.
+    #[test]
+    fn json_encodes_declared_str_dictionary_like_a_plain_string_column() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+
+        // Values 0="api", 1=<null>. Keys: "api", reuse "api", NULL key,
+        // key->null value.
+        let values = StringArray::from(vec![Some("api"), None]);
+        let keys = Int32Array::from(vec![Some(0), Some(0), None, Some(1)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+            .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], json!("api"));
+        assert_eq!(rows[1][0], json!("api"));
+        assert_eq!(rows[2][0], Json::Null, "a NULL key is JSON null");
+        assert_eq!(
+            rows[3][0],
+            Json::Null,
+            "a key pointing at a NULL dictionary value is JSON null"
+        );
+    }
+
+    /// The JSON row *values* of a declared `Str` column are plain strings, but
+    /// the response envelope's declared `columns[].type` is the dictionary type,
+    /// not `Utf8`: `to_json` reports `f.data_type().to_string()`, so a client
+    /// reading the column type sees the ADR-0099 decision 5 change. The docs must
+    /// not claim JSON renders "exactly as a plain string column".
+    #[test]
+    fn json_envelope_reports_declared_str_column_as_dictionary_type() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+
+        let values = StringArray::from(vec![Some("api"), Some("worker")]);
+        let keys = Int32Array::from(vec![Some(0), Some(1)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "name",
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+            .expect("batch");
+        let json = QueryOutput::new(schema, vec![batch])
+            .to_json()
+            .expect("json");
+
+        let rows = json["rows"].as_array().expect("rows");
+        assert_eq!(rows[0][0], json!("api"), "values are plain strings");
+        assert_eq!(rows[1][0], json!("worker"));
+
+        let cols = json["columns"].as_array().expect("columns");
+        assert_eq!(cols[0]["name"], json!("name"));
+        assert_eq!(
+            cols[0]["type"],
+            json!("Dictionary(Int32, Utf8)"),
+            "the envelope declares the dictionary type, not Utf8"
+        );
+    }
+
+    /// The Arrow IPC surface (`to_arrow_ipc`, served by ravel-server's SQL
+    /// endpoint for an `Accept: application/vnd.apache.arrow.stream` request)
+    /// hands the schema and batches to `StreamWriter` unchanged, so a declared
+    /// `Str` column's `Dictionary(Int32, Utf8)` type crosses the wire verbatim:
+    /// both the IPC schema and the batch column are a dictionary, not `Utf8`.
+    /// The docs must not claim Arrow IPC renders it as a plain string column.
+    #[test]
+    fn arrow_ipc_carries_the_declared_str_dictionary_type() {
+        use datafusion::arrow::array::{Int32Array, StringArray};
+        use datafusion::arrow::ipc::reader::StreamReader;
+
+        let values = StringArray::from(vec![Some("api"), Some("worker")]);
+        let keys = Int32Array::from(vec![Some(0), Some(1), Some(0)]);
+        let dict = DictionaryArray::<Int32Type>::try_new(keys, Arc::new(values)).expect("dict");
+        let dict_ty = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("name", dict_ty.clone(), true)]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(dict) as ArrayRef])
+            .expect("batch");
+        let bytes = QueryOutput::new(schema, vec![batch])
+            .to_arrow_ipc()
+            .expect("ipc");
+
+        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader");
+        let batches: Vec<RecordBatch> = reader.map(|b| b.expect("batch")).collect();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0].schema().field(0).data_type(),
+            &dict_ty,
+            "the IPC schema carries the dictionary type verbatim, not Utf8"
+        );
+        let col = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<DictionaryArray<Int32Type>>()
+            .expect("the IPC batch column is a real dictionary");
+        let vals = col
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("utf8 dictionary values");
+        assert_eq!(vals.value(col.keys().value(0) as usize), "api");
+        assert_eq!(vals.value(col.keys().value(2) as usize), "api");
+    }
+
+    /// The JSON encoding of every row of a one-column batch holding `array`.
+    fn column_json(array: ArrayRef) -> Result<Vec<Json>, SqlError> {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
+            "c",
+            array.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![array]).expect("batch");
+        let json = QueryOutput::new(schema, vec![batch]).to_json()?;
+        let rows = json["rows"].as_array().expect("rows");
+        Ok(rows.iter().map(|row| row[0].clone()).collect())
+    }
+
+    /// Encoding `array` as column "c" fails with `UnencodableResult` naming
+    /// the column, the array's type and `reason`, in a message that is also
+    /// the client message and holds none of the digits of `value`.
+    fn assert_unencodable(array: ArrayRef, value: &str, reason: &str) {
+        let data_type = array.data_type().to_string();
+        let err = column_json(array).expect_err("the cell is unencodable");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            format!(
+                "column \"c\" of type {data_type} cannot be encoded as JSON: {reason}; \
+                 request the Arrow IPC format to read it exactly"
+            )
+        );
+        assert_eq!(err.client_message(), message);
+        assert_eq!(err.class(), crate::error::ErrorClass::Unsupported);
+        assert!(
+            !message.contains(value),
+            "the message must not carry the value {value}: {message}"
+        );
+        match err {
+            SqlError::UnencodableResult {
+                column,
+                data_type: reported,
+                reason: reported_reason,
+            } => {
+                assert_eq!(column, "c");
+                assert_eq!(reported, data_type);
+                assert_eq!(reported_reason, reason);
+            }
+            other => panic!("expected SqlError::UnencodableResult, got {other:?}"),
+        }
+    }
+
+    /// The digits of `value` without its sign, which is what a leak of the
+    /// value would put in a message.
+    fn digits(value: i64) -> String {
+        value.unsigned_abs().to_string()
+    }
+
+    #[test]
+    fn int8_is_a_json_number() {
+        use datafusion::arrow::array::Int8Array;
+        let array = Arc::new(Int8Array::from(vec![i8::MIN, i8::MAX])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(-128), json!(127)]
+        );
+    }
+
+    #[test]
+    fn int16_is_a_json_number() {
+        use datafusion::arrow::array::Int16Array;
+        let array = Arc::new(Int16Array::from(vec![i16::MIN, i16::MAX])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(-32768), json!(32767)]
+        );
+    }
+
+    #[test]
+    fn uint16_is_a_json_number() {
+        use datafusion::arrow::array::UInt16Array;
+        let array = Arc::new(UInt16Array::from(vec![0, u16::MAX])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(0), json!(65535)]
+        );
+    }
+
+    /// Day counts checked against Python's `datetime.date`: the epoch, the
+    /// day before it, the day after the non-leap 1900-02-28, a leap day, and
+    /// both ends of the four-digit-year range. Python has no year 0, so
+    /// 0000-01-01 is its 0001-01-01 (-719_162) less the 366 days of leap
+    /// year 0.
+    #[test]
+    fn date32_is_a_yyyy_mm_dd_string() {
+        use datafusion::arrow::array::Date32Array;
+        let array = Arc::new(Date32Array::from(vec![
+            0, -1, -25_508, 11_016, 19_675, -719_528, 2_932_896,
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!("1970-01-01"),
+                json!("1969-12-31"),
+                json!("1900-03-01"),
+                json!("2000-02-29"),
+                json!("2023-11-14"),
+                json!("0000-01-01"),
+                json!("9999-12-31"),
+            ]
+        );
+    }
+
+    #[test]
+    fn date32_outside_four_digit_years_is_a_typed_error() {
+        use datafusion::arrow::array::Date32Array;
+        for days in [-719_529, 2_932_897, i32::MIN, i32::MAX] {
+            assert_unencodable(
+                Arc::new(Date32Array::from(vec![days])) as ArrayRef,
+                &digits(days.into()),
+                NOT_A_DATE,
+            );
+        }
+    }
+
+    #[test]
+    fn date64_is_a_yyyy_mm_dd_string() {
+        use datafusion::arrow::array::Date64Array;
+        let array = Arc::new(Date64Array::from(vec![-86_400_000, 11_016 * 86_400_000])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!("1969-12-31"), json!("2000-02-29")]
+        );
+    }
+
+    /// Writing only the date of a Date64 that is not a whole number of days
+    /// would drop its time of day, and a day count past 9999-12-31 has no
+    /// `YYYY-MM-DD` form.
+    #[test]
+    fn date64_that_is_not_a_date_is_a_typed_error() {
+        use datafusion::arrow::array::Date64Array;
+        for millis in [123_456_789, -123_456_789, 2_932_897 * 86_400_000, i64::MIN] {
+            assert_unencodable(
+                Arc::new(Date64Array::from(vec![millis])) as ArrayRef,
+                &digits(millis),
+                NOT_A_DATE,
+            );
+        }
+    }
+
+    #[test]
+    fn timestamp_seconds_are_json_nanoseconds() {
+        use datafusion::arrow::array::TimestampSecondArray;
+        let array = Arc::new(TimestampSecondArray::from(vec![1_700_000_000, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_700_000_000_000_000_000_i64), json!(-1_000_000_000)]
+        );
+    }
+
+    #[test]
+    fn timestamp_milliseconds_are_json_nanoseconds() {
+        use datafusion::arrow::array::TimestampMillisecondArray;
+        let array =
+            Arc::new(TimestampMillisecondArray::from(vec![1_700_000_000_123, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_700_000_000_123_000_000_i64), json!(-1_000_000)]
+        );
+    }
+
+    #[test]
+    fn timestamp_microseconds_are_json_nanoseconds() {
+        use datafusion::arrow::array::TimestampMicrosecondArray;
+        let array = Arc::new(TimestampMicrosecondArray::from(vec![
+            1_700_000_000_123_456,
+            -1,
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_700_000_000_123_456_000_i64), json!(-1_000)]
+        );
+    }
+
+    /// The time zone is dropped, as it is for `Timestamp(ns)`: the value is
+    /// the same nanosecond count with or without one.
+    #[test]
+    fn timestamp_time_zone_is_dropped() {
+        use datafusion::arrow::array::{TimestampMillisecondArray, TimestampNanosecondArray};
+        let millis = TimestampMillisecondArray::from(vec![1_500]).with_timezone("+02:00");
+        let nanos = TimestampNanosecondArray::from(vec![1_500]).with_timezone("+02:00");
+        assert_eq!(
+            column_json(Arc::new(millis) as ArrayRef).expect("json"),
+            vec![json!(1_500_000_000)]
+        );
+        assert_eq!(
+            column_json(Arc::new(nanos) as ArrayRef).expect("json"),
+            vec![json!(1_500)]
+        );
+    }
+
+    /// `i64::MAX` nanoseconds is 9_223_372_036.854775807 seconds, so one
+    /// second (or millisecond, or microsecond) past that range on either side
+    /// has no i64 nanosecond count.
+    #[test]
+    fn timestamp_overflowing_i64_nanoseconds_is_a_typed_error() {
+        use datafusion::arrow::array::{
+            TimestampMicrosecondArray, TimestampMillisecondArray, TimestampSecondArray,
+        };
+        let cases: Vec<(ArrayRef, i64)> = vec![
+            (
+                Arc::new(TimestampSecondArray::from(vec![9_223_372_037])),
+                9_223_372_037,
+            ),
+            (
+                Arc::new(TimestampSecondArray::from(vec![-9_223_372_037])),
+                -9_223_372_037,
+            ),
+            (
+                Arc::new(TimestampMillisecondArray::from(vec![9_223_372_036_855])),
+                9_223_372_036_855,
+            ),
+            (
+                Arc::new(TimestampMicrosecondArray::from(vec![
+                    -9_223_372_036_854_776,
+                ])),
+                -9_223_372_036_854_776,
+            ),
+        ];
+        for (array, value) in cases {
+            assert_unencodable(array, &digits(value), EPOCH_NANOS_OVERFLOW);
+        }
+    }
+
+    #[test]
+    fn decimal128_is_its_exact_decimal_text() {
+        use datafusion::arrow::array::Decimal128Array;
+        let positive = Decimal128Array::from(vec![12_345, -5, 100])
+            .with_precision_and_scale(10, 2)
+            .expect("decimal");
+        assert_eq!(
+            column_json(Arc::new(positive) as ArrayRef).expect("json"),
+            vec![json!("123.45"), json!("-0.05"), json!("1.00")]
+        );
+        let negative_scale = Decimal128Array::from(vec![12, 0])
+            .with_precision_and_scale(10, -2)
+            .expect("decimal");
+        assert_eq!(
+            column_json(Arc::new(negative_scale) as ArrayRef).expect("json"),
+            vec![json!("1200"), json!("0")]
+        );
+    }
+
+    #[test]
+    fn decimal32_and_decimal64_are_their_exact_decimal_text() {
+        use datafusion::arrow::array::{Decimal32Array, Decimal64Array};
+        let narrow = Decimal32Array::from(vec![12_345, -5, i32::MAX])
+            .with_precision_and_scale(9, 2)
+            .expect("decimal32");
+        assert_eq!(
+            column_json(Arc::new(narrow) as ArrayRef).expect("json"),
+            vec![json!("123.45"), json!("-0.05"), json!("21474836.47")]
+        );
+        let wide = Decimal64Array::from(vec![i64::MIN, 12])
+            .with_precision_and_scale(18, -3)
+            .expect("decimal64");
+        assert_eq!(
+            column_json(Arc::new(wide) as ArrayRef).expect("json"),
+            vec![json!("-9223372036854775808000"), json!("12000")]
+        );
+    }
+
+    #[test]
+    fn large_binary_is_hex_encoded() {
+        use datafusion::arrow::array::LargeBinaryArray;
+        let array = Arc::new(LargeBinaryArray::from(vec![&[0xde_u8, 0xad][..]])) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), vec![json!("dead")]);
+    }
+
+    #[test]
+    fn binary_view_is_hex_encoded() {
+        use datafusion::arrow::array::BinaryViewArray;
+        let array = Arc::new(BinaryViewArray::from(vec![&[0xbe_u8, 0xef][..]])) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), vec![json!("beef")]);
+    }
+
+    #[test]
+    fn decimal_text_is_exact_at_the_i128_extremes() {
+        assert_eq!(
+            decimal_text(i128::MIN, 0),
+            "-170141183460469231731687303715884105728"
+        );
+        assert_eq!(
+            decimal_text(i128::MAX, 38),
+            "1.70141183460469231731687303715884105727"
+        );
+        assert_eq!(
+            decimal_text(i128::MIN, 39),
+            "-0.170141183460469231731687303715884105728"
+        );
+        assert_eq!(decimal_text(-7, -3), "-7000");
+    }
+
+    #[test]
+    fn date_text_refuses_day_counts_whose_arithmetic_overflows() {
+        assert_eq!(date_text(i64::MAX), None);
+        assert_eq!(date_text(i64::MIN), None);
+    }
+
+    /// `i128::MAX + 1` and `i128::MIN * 10` have no i128 form, so neither can
+    /// pass through the `Decimal128` path, nor through an f64 without losing
+    /// digits.
+    #[test]
+    fn decimal256_beyond_i128_is_its_exact_decimal_text() {
+        use datafusion::arrow::array::Decimal256Array;
+        use datafusion::arrow::datatypes::i256;
+        let above = i256::from_i128(i128::MAX)
+            .checked_add(i256::ONE)
+            .expect("in range");
+        let below = i256::from_i128(i128::MIN)
+            .checked_mul(i256::from_i128(10))
+            .expect("in range");
+        let array = Decimal256Array::from(vec![above, below, i256::from_i128(-5)])
+            .with_precision_and_scale(50, 2)
+            .expect("decimal");
+        assert_eq!(
+            column_json(Arc::new(array) as ArrayRef).expect("json"),
+            vec![
+                json!("1701411834604692317316873037158841057.28"),
+                json!("-17014118346046923173168730371588410572.80"),
+                json!("-0.05"),
+            ]
+        );
+    }
+
+    #[test]
+    fn decimal256_negative_scale_is_its_exact_decimal_text() {
+        use datafusion::arrow::array::Decimal256Array;
+        use datafusion::arrow::datatypes::i256;
+        let array = Decimal256Array::from(vec![i256::from_i128(12), i256::ZERO])
+            .with_precision_and_scale(40, -3)
+            .expect("decimal");
+        assert_eq!(
+            column_json(Arc::new(array) as ArrayRef).expect("json"),
+            vec![json!("12000"), json!("0")]
+        );
+    }
+
+    #[test]
+    fn decimal_text_is_exact_at_the_i256_extremes() {
+        use datafusion::arrow::datatypes::i256;
+        assert_eq!(
+            decimal_text(i256::MAX, 0),
+            "57896044618658097711785492504343953926634992332820282019728792003956564819967"
+        );
+        assert_eq!(
+            decimal_text(i256::MIN, 76),
+            "-5.7896044618658097711785492504343953926634992332820282019728792003956564819968"
+        );
+    }
+
+    /// `Float16` widens to f64 exactly, so `0.1` reads back as the nearest
+    /// half-precision value, and the non-finite values take the float
+    /// strings.
+    #[test]
+    fn float16_widens_to_f64_with_the_float_rules() {
+        use datafusion::arrow::array::Float16Array;
+        use datafusion::arrow::datatypes::{ArrowPrimitiveType, Float16Type};
+        type F16 = <Float16Type as ArrowPrimitiveType>::Native;
+        let array = Float16Array::from(vec![
+            F16::NAN,
+            F16::INFINITY,
+            F16::NEG_INFINITY,
+            F16::from_f64(1.5),
+            F16::from_f64(0.1),
+            F16::MAX,
+        ]);
+        assert_eq!(
+            column_json(Arc::new(array) as ArrayRef).expect("json"),
+            vec![
+                json!("NaN"),
+                json!("+Inf"),
+                json!("-Inf"),
+                json!(1.5),
+                json!(0.0999755859375),
+                json!(65504.0),
+            ]
+        );
+        let zero = Float16Array::from(vec![F16::NEG_ZERO]);
+        let text = serde_json::to_string(&column_json(Arc::new(zero) as ArrayRef).expect("json"))
+            .expect("serialize");
+        assert_eq!(text, "[-0.0]");
+    }
+
+    #[test]
+    fn time32_seconds_are_json_nanoseconds_since_midnight() {
+        use datafusion::arrow::array::Time32SecondArray;
+        let array = Arc::new(Time32SecondArray::from(vec![0, 3_661, 86_399])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!(0),
+                json!(3_661_000_000_000_i64),
+                json!(86_399_000_000_000_i64)
+            ]
+        );
+    }
+
+    #[test]
+    fn time32_milliseconds_are_json_nanoseconds_since_midnight() {
+        use datafusion::arrow::array::Time32MillisecondArray;
+        let array = Arc::new(Time32MillisecondArray::from(vec![3_661_123, 86_399_999])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(3_661_123_000_000_i64), json!(86_399_999_000_000_i64)]
+        );
+    }
+
+    #[test]
+    fn time64_microseconds_are_json_nanoseconds_since_midnight() {
+        use datafusion::arrow::array::Time64MicrosecondArray;
+        let array = Arc::new(Time64MicrosecondArray::from(vec![
+            3_661_123_456,
+            86_399_999_999,
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(3_661_123_456_000_i64), json!(86_399_999_999_000_i64)]
+        );
+    }
+
+    #[test]
+    fn time64_nanoseconds_are_json_nanoseconds_since_midnight() {
+        use datafusion::arrow::array::Time64NanosecondArray;
+        let array = Arc::new(Time64NanosecondArray::from(vec![
+            3_661_123_456_789,
+            86_399_999_999_999,
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(3_661_123_456_789_i64), json!(86_399_999_999_999_i64)]
+        );
+    }
+
+    /// One day is 86_400 seconds: that instant, anything negative, and a
+    /// count whose nanosecond scaling overflows i64 are all outside it.
+    #[test]
+    fn time_outside_one_day_is_a_typed_error() {
+        use datafusion::arrow::array::{
+            Time32MillisecondArray, Time32SecondArray, Time64MicrosecondArray,
+            Time64NanosecondArray,
+        };
+        let cases: Vec<(ArrayRef, i64)> = vec![
+            (Arc::new(Time32SecondArray::from(vec![86_400])), 86_400),
+            (Arc::new(Time32SecondArray::from(vec![-1])), -1),
+            (
+                Arc::new(Time32MillisecondArray::from(vec![86_400_000])),
+                86_400_000,
+            ),
+            (
+                Arc::new(Time64MicrosecondArray::from(vec![i64::MAX])),
+                i64::MAX,
+            ),
+            (
+                Arc::new(Time64NanosecondArray::from(vec![86_400_000_000_000])),
+                86_400_000_000_000,
+            ),
+            (Arc::new(Time64NanosecondArray::from(vec![-1])), -1),
+        ];
+        for (array, value) in cases {
+            assert_unencodable(array, &digits(value), NOT_A_TIME_OF_DAY);
+        }
+    }
+
+    #[test]
+    fn duration_seconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationSecondArray;
+        let array = Arc::new(DurationSecondArray::from(vec![90, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(90_000_000_000_i64), json!(-1_000_000_000)]
+        );
+    }
+
+    #[test]
+    fn duration_milliseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationMillisecondArray;
+        let array = Arc::new(DurationMillisecondArray::from(vec![1_500, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_500_000_000), json!(-1_000_000)]
+        );
+    }
+
+    #[test]
+    fn duration_microseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationMicrosecondArray;
+        let array = Arc::new(DurationMicrosecondArray::from(vec![1_500, -1])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(1_500_000), json!(-1_000)]
+        );
+    }
+
+    #[test]
+    fn duration_nanoseconds_are_signed_json_nanoseconds() {
+        use datafusion::arrow::array::DurationNanosecondArray;
+        let array =
+            Arc::new(DurationNanosecondArray::from(vec![i64::MAX, -1, i64::MIN])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!(i64::MAX), json!(-1), json!(i64::MIN)]
+        );
+    }
+
+    /// One unit past the i64 nanosecond range on either side has no JSON
+    /// nanosecond count.
+    #[test]
+    fn duration_overflowing_i64_nanoseconds_is_a_typed_error() {
+        use datafusion::arrow::array::{
+            DurationMicrosecondArray, DurationMillisecondArray, DurationSecondArray,
+        };
+        let cases: Vec<(ArrayRef, i64)> = vec![
+            (
+                Arc::new(DurationSecondArray::from(vec![9_223_372_037])),
+                9_223_372_037,
+            ),
+            (
+                Arc::new(DurationSecondArray::from(vec![-9_223_372_037])),
+                -9_223_372_037,
+            ),
+            (
+                Arc::new(DurationMillisecondArray::from(vec![9_223_372_036_855])),
+                9_223_372_036_855,
+            ),
+            (
+                Arc::new(DurationMicrosecondArray::from(vec![-9_223_372_036_854_776])),
+                -9_223_372_036_854_776,
+            ),
+        ];
+        for (array, value) in cases {
+            assert_unencodable(array, &digits(value), DURATION_NANOS_OVERFLOW);
+        }
+    }
+
+    /// No display-formatter fallback: a type with no arm still fails, naming
+    /// the type. `RunEndEncoded` is the example because parquet's Arrow
+    /// reader never returns it for a column: it derives each column type from
+    /// the physical and logical type, keeps an embedded schema hint only for a
+    /// fixed set of primitive, list, struct, map and dictionary types, and its
+    /// writer refuses a run-end encoded column outright.
+    #[test]
+    fn a_type_with_no_arm_is_a_typed_error_naming_it() {
+        use datafusion::arrow::array::RunArray;
+        let array: RunArray<Int32Type> = vec!["zq-cell-text", "zq-cell-text"].into_iter().collect();
+        let array = Arc::new(array) as ArrayRef;
+        assert!(
+            array.data_type().to_string().starts_with("RunEndEncoded"),
+            "{}",
+            array.data_type()
+        );
+        assert_unencodable(array, "zq-cell-text", NO_ARM);
+    }
+
+    /// A cell nested in a list or a struct is reported under the top-level
+    /// column's name, with the type of the nested array that failed.
+    #[test]
+    fn a_nested_unencodable_cell_names_the_top_level_column_and_the_inner_type() {
+        use datafusion::arrow::datatypes::Field as ArrowField;
+        let dates = Arc::new(Date64Array::from(vec![123_456_789])) as ArrayRef;
+        let list = ListArray::new(
+            Arc::new(ArrowField::new_list_field(DataType::Date64, true)),
+            datafusion::arrow::buffer::OffsetBuffer::from_lengths([1]),
+            dates,
+            None,
+        );
+        match column_json(Arc::new(list) as ArrayRef) {
+            Err(SqlError::UnencodableResult {
+                column, data_type, ..
+            }) => {
+                assert_eq!(column, "c");
+                assert_eq!(data_type, "Date64");
+            }
+            other => panic!("expected SqlError::UnencodableResult, got {other:?}"),
+        }
+    }
+
+    /// The column name comes from the schema field beside the failing array,
+    /// not from the first column or a fixed index.
+    #[test]
+    fn the_unencodable_column_is_named_from_its_own_schema_field() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("fine", DataType::Int8, false),
+            Field::new("when", DataType::Date64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int8Array::from(vec![1])) as ArrayRef,
+                Arc::new(Date64Array::from(vec![123_456_789])),
+            ],
+        )
+        .expect("batch");
+        match QueryOutput::new(schema, vec![batch]).to_json() {
+            Err(SqlError::UnencodableResult { column, .. }) => assert_eq!(column, "when"),
+            other => panic!("expected SqlError::UnencodableResult, got {other:?}"),
+        }
+    }
+
+    /// A map whose keys are not Utf8 is an engine fault, not an encoding
+    /// choice the caller can change, so it stays `Internal`.
+    #[test]
+    fn a_map_with_non_utf8_keys_stays_internal() {
+        use datafusion::arrow::array::{Int32Builder, MapBuilder, StringBuilder};
+        let mut builder = MapBuilder::new(None, Int32Builder::new(), StringBuilder::new());
+        builder.keys().append_value(7);
+        builder.values().append_value("v");
+        builder.append(true).expect("map entry");
+        let array = Arc::new(builder.finish()) as ArrayRef;
+        assert!(
+            matches!(column_json(array), Err(SqlError::Internal(_))),
+            "a non-Utf8 map key is an Internal error"
+        );
+    }
+
+    #[test]
+    fn interval_year_month_is_months_only() {
+        let array =
+            Arc::new(IntervalYearMonthArray::from(vec![Some(-14), None, Some(3)])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!({ "months": -14, "days": 0, "nanoseconds": 0 }),
+                Json::Null,
+                json!({ "months": 3, "days": 0, "nanoseconds": 0 }),
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_day_time_is_days_and_nanoseconds() {
+        use datafusion::arrow::datatypes::IntervalDayTime;
+        let array = Arc::new(IntervalDayTimeArray::from(vec![
+            Some(IntervalDayTime::new(-2, -1_500)),
+            None,
+            Some(IntervalDayTime::new(i32::MAX, i32::MAX)),
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!({ "months": 0, "days": -2, "nanoseconds": -1_500_000_000_i64 }),
+                Json::Null,
+                json!({
+                    "months": 0,
+                    "days": i32::MAX,
+                    "nanoseconds": i64::from(i32::MAX) * 1_000_000,
+                }),
+            ]
+        );
+    }
+
+    #[test]
+    fn interval_month_day_nano_copies_its_three_fields() {
+        use datafusion::arrow::datatypes::IntervalMonthDayNano;
+        let array = Arc::new(IntervalMonthDayNanoArray::from(vec![
+            Some(IntervalMonthDayNano::new(-1, 2, -3)),
+            None,
+            Some(IntervalMonthDayNano::new(i32::MIN, i32::MAX, i64::MIN)),
+        ])) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![
+                json!({ "months": -1, "days": 2, "nanoseconds": -3 }),
+                Json::Null,
+                json!({ "months": i32::MIN, "days": i32::MAX, "nanoseconds": i64::MIN }),
+            ]
+        );
+    }
+
+    /// The cells every list layout below holds: a list with a negative and a
+    /// null element, a null list, and an empty list.
+    fn list_cells() -> Vec<Option<Vec<Option<i32>>>> {
+        vec![Some(vec![Some(-1), None, Some(2)]), None, Some(vec![])]
+    }
+
+    fn expected_list_json() -> Vec<Json> {
+        vec![json!([-1, null, 2]), Json::Null, json!([])]
+    }
+
+    #[test]
+    fn large_list_is_a_json_array() {
+        let array = Arc::new(LargeListArray::from_iter_primitive::<Int32Type, _, _>(
+            list_cells(),
+        )) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), expected_list_json());
+    }
+
+    #[test]
+    fn list_view_is_a_json_array() {
+        let array = Arc::new(ListViewArray::from_iter_primitive::<Int32Type, _, _>(
+            list_cells(),
+        )) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), expected_list_json());
+    }
+
+    #[test]
+    fn large_list_view_is_a_json_array() {
+        let array = Arc::new(LargeListViewArray::from_iter_primitive::<Int32Type, _, _>(
+            list_cells(),
+        )) as ArrayRef;
+        assert_eq!(column_json(array).expect("json"), expected_list_json());
+    }
+
+    #[test]
+    fn fixed_size_list_is_a_json_array() {
+        let array = Arc::new(FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+            vec![
+                Some(vec![Some(-1), None]),
+                None,
+                Some(vec![Some(3), Some(4)]),
+            ],
+            2,
+        )) as ArrayRef;
+        assert_eq!(
+            column_json(array).expect("json"),
+            vec![json!([-1, null]), Json::Null, json!([3, 4])]
+        );
+    }
+
+    /// One dictionary column per integer key type, each holding a value with a
+    /// negative number in it, a null key, and a key addressing a null value.
+    /// Every key type must encode as the plain value column would.
+    #[test]
+    fn dictionary_with_any_integer_key_is_its_value() {
+        fn check<K: ArrowDictionaryKeyType>(keys: Vec<Option<K::Native>>) {
+            let values = Arc::new(Int64Array::from(vec![Some(-7), None])) as ArrayRef;
+            let keys: datafusion::arrow::array::PrimitiveArray<K> = keys.into_iter().collect();
+            let dict = DictionaryArray::<K>::try_new(keys, values).expect("dict");
+            let key_type = dict.keys().data_type().clone();
+            assert_eq!(
+                column_json(Arc::new(dict) as ArrayRef).expect("json"),
+                vec![json!(-7), Json::Null, Json::Null, json!(-7)],
+                "key type {key_type}"
+            );
+        }
+        check::<Int8Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<Int16Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<Int32Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<Int64Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt8Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt16Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt32Type>(vec![Some(0), None, Some(1), Some(0)]);
+        check::<UInt64Type>(vec![Some(0), None, Some(1), Some(0)]);
+    }
+
+    #[test]
+    fn dictionary_keys_of_every_width_are_bounds_checked() {
+        assert!(matches!(resolve_key(-1_i8, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(-1_i64, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(resolve_key(4_u16, 4), Err(SqlError::Internal(_))));
+        assert!(matches!(
+            resolve_key(u64::MAX, 4),
+            Err(SqlError::Internal(_))
+        ));
+        assert!(matches!(resolve_key(3_u8, 4), Ok(3)));
+    }
+}

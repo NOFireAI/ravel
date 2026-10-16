@@ -1,0 +1,69 @@
+// RSEG footer metadata. Persistent contract: field numbers are frozen.
+// Readers skip unknown fields and unknown section kinds: an object written by
+// a newer writer still decodes, and a section whose kind is not in SectionKind
+// is ignored rather than rejected. Unknown fields are NOT preserved. The
+// generated Rust types (crates/ravel-proto) come from prost, which has no
+// unknown-field storage, so decoding and re-encoding a message drops every
+// field this schema does not name. Any component that rewrites a footer
+// (compaction, a migration, a repair tool) must therefore treat this schema as
+// fully known and build the new value explicitly, never by round-tripping a
+// decoded one. If unknown-field preservation is genuinely needed later, it is
+// an explicit format-change decision recorded in an ADR, not a guarantee a
+// reader may assume today.
+syntax = "proto3";
+
+package ravel.segment.v1;
+
+enum Compression {
+  COMPRESSION_NONE = 0;
+  COMPRESSION_LZ4 = 1;
+  COMPRESSION_ZSTD = 2;
+}
+
+// Section kinds; values are part of the format. See docs/segment-format.md.
+// SERIES_IDS and SERIES_META are RSEG v2 only (ADR-0027); v1 objects use
+// SERIES_TABLE instead and never emit these two.
+// HIST_PAGES is RSEG v3 only (ADR-0017); v1/v2 objects never emit it.
+enum SectionKind {
+  SECTION_KIND_UNSPECIFIED = 0;
+  SECTION_KIND_LABEL_DICT = 1;
+  SECTION_KIND_SERIES_TABLE = 2;
+  SECTION_KIND_TS_PAGES = 3;
+  SECTION_KIND_VAL_PAGES = 4;
+  SECTION_KIND_SERIES_IDS = 5;
+  SECTION_KIND_SERIES_META = 6;
+  SECTION_KIND_HIST_PAGES = 7;
+}
+
+message Section {
+  uint32 kind = 1;            // SectionKind; unknown kinds skipped
+  uint64 offset = 2;          // from object start
+  uint64 len = 3;             // stored (possibly compressed) length
+  fixed32 crc32c = 4;         // over stored bytes
+  Compression comp = 5;
+  uint64 uncompressed_len = 6;
+}
+
+message Footer {
+  bytes tenant_hash = 1;      // 16 bytes
+  uint32 shard = 2;
+  string writer_id = 3;       // uuid
+  uint64 writer_epoch = 4;
+  uint64 writer_seq = 5;
+  sfixed64 min_event_ts_ns = 6;
+  sfixed64 max_event_ts_ns = 7;
+  sfixed64 min_ingest_ts_ns = 8;
+  sfixed64 max_ingest_ts_ns = 9;
+  uint64 sample_count = 10;
+  uint64 series_count = 11;
+  repeated Section sections = 12;
+
+  // RSEG v4 only (ADR-0018); zero/absent on v1/v2/v3 objects, required
+  // nonzero semantics only when the trailer version is 4. See
+  // docs/segment-format.md "RSEG v4 amendment".
+  sfixed64 base_created_unix_ns = 13; // min created_unix_ns over all runs
+  uint32 ingest_hour_bucket = 14;
+  bytes input_set_hash = 15;
+  uint32 part_index = 16;
+  uint32 level = 17;
+}

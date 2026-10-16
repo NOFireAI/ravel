@@ -1,0 +1,10 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 13902561b5b680da650e213852ad5b09806c2b6c35e684bfb2fc218438a6efbc # shrinks to mutation = Flip(Index(8773783739637334743), 45)
+cc dc3f8ac9adcec1a6c550d2d5a9d28944dffab5fdaf372a2bfe61ea7b51987c74 # shrinks to mutation = Flip(Index(16430408680128300775), 2)
+cc 54ab91990cd58961f87ac8a29c201bac3fcf50856a9aee8240aa90e93823c7e7 # shrinks to mutation = FlipPageIndex(Index(16051063025175843614), 75)
+cc 3e81defb64fe16df944f79667fd765b9bcd36aef482113d5c5b42fa37bec627b # shrinks to mutation = Splice(Index(847260924571603501), 14, [5, 22, 71, 25, 152])
