@@ -372,7 +372,11 @@ fn holds_own_node(kind: Kind, name: &str, example: &str, query: &Query) -> Optio
             command(&|c| matches!(c, Command::From(from) if from.sources.len() > 1))
         }
         (Kind::Syntax, "FROM source pattern") => source(&|s| s.text.contains('*')),
-        (Kind::Syntax, "FROM remote source") => source(&|s| s.text.contains(':')),
+        (Kind::Syntax, "FROM remote source") => source(&|s| {
+            s.text.split_once(':').is_some_and(|(cluster, index)| {
+                !cluster.is_empty() && !index.is_empty() && !index.starts_with(':')
+            })
+        }),
         (Kind::Syntax, "FROM METADATA") => {
             command(&|c| matches!(c, Command::From(from) if from.metadata.is_some()))
         }
@@ -410,9 +414,14 @@ fn holds_own_node(kind: Kind, name: &str, example: &str, query: &Query) -> Optio
             matches!(c, Command::Keep(keep)
                 if keep.patterns.iter().flat_map(|p| &p.parts).any(|part| part.quoted))
         }),
-        (Kind::Syntax, "triple-quoted string") => {
-            literal(&|v| matches!(v, LiteralValue::String(s) if s.contains('"')))
-        }
+        (Kind::Syntax, "triple-quoted string") => expr(&|e| {
+            matches!(e, Expr::Literal(l) if matches!(l.value, LiteralValue::String(_))
+                && l.span.slice(example).is_some_and(|written| {
+                    written
+                        .trim_start_matches(|c: char| c == '(' || c.is_whitespace())
+                        .starts_with("\"\"\"")
+                }))
+        }),
         (Kind::Syntax, "comments") => {
             let comment = example.find("/*").or_else(|| example.find("//"));
             matches!((&query.source, comment), (Command::Row(row), Some(at))
@@ -569,6 +578,19 @@ fn an_own_grammar_entry_needs_its_own_node() {
     assert!(own(Kind::ProcessingCommand, "LIMIT", "ROW a = 1 | LIMIT 1 BY a").is_some());
     assert!(own(Kind::Syntax, "RENAME with =", "ROW a = 1 | RENAME a AS b").is_some());
     assert!(own(Kind::Parameter, "??", "ROW a = ?").is_some());
+    let lacks_node =
+        |error: Option<String>| error.is_some_and(|e| e.starts_with("does not hold its own node"));
+    let triple = |example| own(Kind::Syntax, "triple-quoted string", example);
+    assert_eq!(triple("ROW s = \"\"\"a \"quoted\" word\"\"\""), None);
+    assert_eq!(triple("ROW s = (\"\"\"a\"\"\")"), None);
+    assert!(lacks_node(triple("ROW s = \"a\"")));
+    assert!(lacks_node(triple("ROW s = \"a \\\"quoted\\\" word\"")));
+    let remote = |example| own(Kind::Syntax, "FROM remote source", example);
+    assert_eq!(remote("FROM remote:logs"), None);
+    assert!(lacks_node(remote("FROM logs")));
+    assert!(lacks_node(remote("FROM \":logs\"")));
+    assert!(lacks_node(remote("FROM \"logs:\"")));
+    assert!(lacks_node(remote("FROM \"logs::data\"")));
     assert_eq!(
         own(Kind::Syntax, "not a construct", "ROW a = 1"),
         Some("has no own node this check knows".to_owned())
