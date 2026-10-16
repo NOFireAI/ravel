@@ -27,7 +27,11 @@
 #               benchmark's endpoint and window; its one cell must equal
 #               rows_expected, and the three counts are stamped as row_count
 #   phases      each phase run.toml names, in order; phase NAME is the
-#               function phase_NAME and writes /root/kit/out/NAME/
+#               function phase_NAME and writes /root/kit/out/NAME/:
+#               benchmark (every statement cold, then hot twice), concurrent
+#               (upstream ClickBench's bench_concurrent_qps, concurrent_rounds
+#               times), q29_probe (q29 alone, warmed up, then timed) and perf
+#               (folded perf stacks of one hot call per statement)
 #   results     /root/kit/results.json (SqlLatencyReport's entries and failed
 #               rows, which the runbook's analyse.py reads, plus the
 #               provenance stamps and the absolute bands when run.toml's
@@ -47,7 +51,9 @@
 # in out/<phase>/calls.jsonl: statement, arm, phase, start, duration, HTTP
 # status, rows, outcome and refusal class. A 200 answer whose row count is not
 # the expected one (the corpus's expected_rows, else the first try's) is an
-# error of class wrong_answer, not a success. Every request body names its
+# error of class wrong_answer, not a success. The concurrent phase's figures
+# follow upstream instead: any 2xx answer succeeds, and a wrong_answer there is
+# counted beside them as a diagnostic. Every request body names its
 # window: start window_hours (default 200000, the runbook's --window-hours)
 # before end, the epoch second the verify step began. A new phase is a phase_NAME
 # function plus its name in kit.py's KNOWN_PHASES; wrapping run_query wraps
@@ -56,8 +62,11 @@
 # KIT_ROOT (default /root) relocates every path, and KIT_RUN_SH_LIB=1 defines
 # the functions without running main; kit.test.sh uses both. It also sets
 # KIT_READY_TRIES and KIT_READY_INTERVAL (the server readiness poll, default 600
-# tries 1 s apart) and KIT_CPUINFO and KIT_MEMINFO (the hardware stamp's
-# sources, default /proc/cpuinfo and /proc/meminfo).
+# tries 1 s apart), KIT_WATCHDOG_INTERVAL and KIT_WATCHDOG_READY_TRIES (the
+# concurrent phase's readyz poll and restart wait, default 5 s and 60 tries),
+# KIT_PERF_SETTLE (seconds perf record gets before the profiled call, default
+# 1) and KIT_CPUINFO and KIT_MEMINFO (the hardware stamp's sources, default
+# /proc/cpuinfo and /proc/meminfo).
 
 set -uo pipefail
 
@@ -82,6 +91,9 @@ IMDS="${KIT_IMDS:-http://169.254.169.254}"
 DROP_CACHES_FILE="${KIT_DROP_CACHES_FILE:-/proc/sys/vm/drop_caches}"
 READY_TRIES="${KIT_READY_TRIES:-600}"
 READY_INTERVAL="${KIT_READY_INTERVAL:-1}"
+WATCHDOG_INTERVAL="${KIT_WATCHDOG_INTERVAL:-5}"
+WATCHDOG_READY_TRIES="${KIT_WATCHDOG_READY_TRIES:-60}"
+PERF_SETTLE="${KIT_PERF_SETTLE:-1}"
 CPUINFO="${KIT_CPUINFO:-/proc/cpuinfo}"
 MEMINFO="${KIT_MEMINFO:-/proc/meminfo}"
 RUSTFS_ENDPOINT="http://127.0.0.1:9000"
@@ -189,6 +201,13 @@ load_config() {
   EXPECTED_STATEMENTS="$(toml_or expected_statements 43)"
   FOLD_MIN_RATIO="$(toml_or fold_min_entry_ratio 0.8)"
   QUERY_TIMEOUT_S="$(toml_or query_timeout_s 900)"
+  CONC_ROUNDS="$(toml_or concurrent_rounds 3)"
+  CONC_CONNECTIONS="$(toml_or concurrent_connections 10)"
+  CONC_DURATION="$(toml_or concurrent_duration_s 600)"
+  CONC_SEED="$(toml_or concurrent_seed clickbench)"
+  Q29_WARMUP="$(toml_or q29_probe_warmup 1)"
+  Q29_RUNS="$(toml_or q29_probe_runs 3)"
+  PERF_RECORD="$(toml_or perf_record false)"
   WINDOW_HOURS="$(toml_or window_hours 200000)"
   BAND_SECTIONS="$(toml_or band_sections "$(printf 'relative\nabsolute')" | tr '\n' ' ')"
   PHASES="$(toml phases | tr '\n' ' ')" || return 1
@@ -691,15 +710,24 @@ print(n)' "$dir/count.json" 2>/dev/null)" \
 # answer with a row count other than EXPECT_ROWS is an error of class
 # wrong_answer, and one whose rows cannot be read is unreadable_answer.
 # Returns non-zero only when the record could not be written.
+#
+# Optional globals: RQ_CALLS and RQ_RESP_DIR move the calls file and the
+# responses directory, RQ_MAX_TIME replaces query_timeout_s (empty sets no
+# client timeout), RQ_EXTRA is appended to the record as JSON members
+# (`"round": 1, "connection": 3`), and RQ_STATS=1 records the response's
+# stats object.
 run_query() {
   local phase="$1" number="$2" statement="$3" try="$4" body="$5" expect="${6:-}"
-  local dir="$OUT/$phase" resp w code=0 parsed err=""
-  mkdir -p "$dir/responses" || return 1
-  resp="$dir/responses/$number-$try.json"
+  local dir="$OUT/$phase" resp w code=0 parsed err="" stats=""
+  local calls="${RQ_CALLS:-$dir/calls.jsonl}" rdir="${RQ_RESP_DIR:-$dir/responses}"
+  local limit="${RQ_MAX_TIME-$QUERY_TIMEOUT_S}" opts=()
+  [ -z "$limit" ] || opts=(--max-time "$limit")
+  mkdir -p "$rdir" || return 1
+  resp="$rdir/$number-$try.json"
   RQ_START="$(utc_now)"
-  w="$(curl -sS -o "$resp" -w '%{http_code} %{time_total}' --max-time "$QUERY_TIMEOUT_S" \
+  w="$(curl -sS -o "$resp" -w '%{http_code} %{time_total}' "${opts[@]}" \
     -H @"$AUTH_HEADER" -H 'Content-Type: application/json' \
-    --data-binary @"$body" "$SQL_URL" 2>"$dir/responses/$number-$try.curl")" || code=$?
+    --data-binary @"$body" "$SQL_URL" 2>"$rdir/$number-$try.curl")" || code=$?
   RQ_HTTP="${w%% *}"
   RQ_DURATION="${w##* }"
   RQ_CLASS=""
@@ -711,7 +739,7 @@ run_query() {
   elif [ "$code" -ne 0 ] || [ "${RQ_HTTP:-000}" = 000 ]; then
     RQ_OUTCOME=unreachable
     RQ_CLASS=transport
-    err="curl exit $code: $(head -c 300 "$dir/responses/$number-$try.curl" 2>/dev/null)"
+    err="curl exit $code: $(head -c 300 "$rdir/$number-$try.curl" 2>/dev/null)"
   elif [ "$RQ_HTTP" = 200 ]; then
     RQ_ROWS="$(python3 -c 'import json, sys
 print(len(json.load(open(sys.argv[1]))["data"]["rows"]))' "$resp" 2>/dev/null)" || RQ_ROWS=""
@@ -736,13 +764,19 @@ print("%s\t%s" % (d.get("errorType", ""), str(d.get("error", ""))[:300]))' "$res
     err="${parsed#*$'\t'}"
     [ -n "$RQ_CLASS" ] || RQ_CLASS=unclassified
   fi
+  if [ "${RQ_STATS:-}" = 1 ]; then
+    stats="$(python3 -c 'import json, sys
+print(json.dumps(json.load(open(sys.argv[1])).get("stats")))' "$resp" 2>/dev/null)" || stats=""
+    stats=", \"stats\": ${stats:-null}"
+  fi
   # Keep the first try's answer and every error; later ok answers repeat it.
   [ "$RQ_OUTCOME" = ok ] && [ "$try" != 1 ] && rm -f "$resp"
-  printf '{"statement": %s, "number": %s, "arm": %s, "phase": %s, "try": %s, "start": %s, "duration_s": %s, "http_status": %s, "rows": %s, "outcome": %s, "refusal_class": %s, "error": %s}\n' \
+  printf '{"statement": %s, "number": %s, "arm": %s, "phase": %s, "try": %s, "start": %s, "duration_s": %s, "http_status": %s, "rows": %s, "outcome": %s, "refusal_class": %s, "error": %s%s%s}\n' \
     "$(json_str "$statement")" "$(json_num "$((10#$number))")" "$(json_str "$ARM")" \
     "$(json_str "$phase")" "$(json_num "$try")" "$(json_str "$RQ_START")" \
     "$(json_num "$RQ_DURATION")" "$(json_num "${RQ_HTTP:-0}")" "$(json_num "$RQ_ROWS")" \
-    "$(json_str "$RQ_OUTCOME")" "$(json_str "$RQ_CLASS")" "$(json_str "$err")" >>"$dir/calls.jsonl"
+    "$(json_str "$RQ_OUTCOME")" "$(json_str "$RQ_CLASS")" "$(json_str "$err")" \
+    "${RQ_EXTRA:+, $RQ_EXTRA}" "$stats" >>"$calls"
 }
 
 # --- phases ----------------------------------------------------------------
@@ -777,6 +811,202 @@ phase_benchmark() {
   stop_samplers
   [ "$(wc -l <"$dir/calls.jsonl" | tr -d ' ')" = "$((count * 3))" ] \
     || { say "benchmark recorded $(wc -l <"$dir/calls.jsonl") calls, expected $((count * 3))"; return 1; }
+}
+
+# now_us: microseconds since the epoch, from bash's EPOCHREALTIME.
+now_us() {
+  local t="${EPOCHREALTIME:-}"
+  [ -n "$t" ] || { say "this bash has no EPOCHREALTIME"; return 1; }
+  printf '%s\n' "${t//[.,]/}"
+}
+
+# phase_requests DIR: the corpus's request bodies under DIR/requests, which
+# must hold expected_statements of them.
+phase_requests() {
+  local count
+  [ -n "${WINDOW_END:-}" ] || set_query_window
+  count="$(kit_py request-bodies "$CORPUS" "$1/requests" "$WINDOW_START" "$WINDOW_END")" || return 1
+  [ "$count" = "$EXPECTED_STATEMENTS" ] \
+    || { say "corpus holds $count statements, run.toml expects $EXPECTED_STATEMENTS"; return 1; }
+}
+
+# phase_concurrent: upstream ClickBench's bench_concurrent_qps, run
+# concurrent_rounds times back to back. Each round restarts the server on a
+# dropped page cache, then concurrent_connections connections each loop over
+# every statement in their own seeded order until concurrent_duration_s has
+# passed, with no client timeout; a call in flight at the deadline completes
+# and is counted. A watchdog restarts a server that stops answering readyz
+# without telling the connections, so calls during the outage are errors.
+# kit.py concurrent-summary turns calls.jsonl and rounds.jsonl into the
+# results.json block.
+phase_concurrent() {
+  local dir="$OUT/concurrent" r
+  phase_requests "$dir" || return 1
+  : >"$dir/calls.jsonl"
+  : >"$dir/rounds.jsonl"
+  start_samplers concurrent
+  for ((r = 1; r <= CONC_ROUNDS; r++)); do
+    concurrent_round "$r" || { stop_samplers; return 1; }
+  done
+  stop_server
+  stop_samplers
+  kit_py concurrent-summary "$dir" >"$dir/summary.json"
+}
+
+# concurrent_round ROUND: one round into out/concurrent/round-ROUND/, then its
+# calls appended to calls.jsonl in connection order and its line to
+# rounds.jsonl.
+concurrent_round() {
+  local r="$1" dir="$OUT/concurrent" rdir n id exp c nq start deadline end last pids="" failed=0
+  local numbers=() ids=() expects=() orders=()
+  rdir="$dir/round-$r"
+  rm -rf "$rdir"
+  mkdir -p "$rdir" || return 1
+  while IFS=$'\t' read -r n id exp; do
+    numbers+=("$n")
+    ids+=("$id")
+    expects+=("$exp")
+  done <"$dir/requests/index.tsv"
+  nq="${#numbers[@]}"
+  for ((c = 1; c <= CONC_CONNECTIONS; c++)); do
+    orders[c]="$(kit_py permutation "$CONC_SEED" "$c" "$nq" | tr '\n' ' ')" || return 1
+  done
+  stop_server
+  drop_caches || return 1
+  start_server || return 1
+  stamp "concurrent round=$r connections=$CONC_CONNECTIONS duration_s=$CONC_DURATION"
+  start="$(now_us)" || return 1
+  deadline=$((start + CONC_DURATION * 1000000))
+  for ((c = 1; c <= CONC_CONNECTIONS; c++)); do
+    concurrent_worker "$r" "$c" "$deadline" "${orders[c]}" &
+    pids="$pids $!"
+  done
+  concurrent_watchdog "$deadline" >"$rdir/watchdog.log" 2>&1 &
+  pids="$pids $!"
+  for c in $pids; do wait "$c" || failed=1; done
+  end="$(now_us)" || return 1
+  [ "$failed" = 0 ] || { say "a concurrent connection could not record its calls in round $r"; return 1; }
+  SERVER_PID="$(cat "$KIT/server.pid")"
+  last="$(sed -n 's/^.*restart n=\([0-9]*\) .*$/\1/p' "$rdir/watchdog.log" | tail -n 1)"
+  [ -z "$last" ] || SERVER_N="$last"
+  for ((c = 1; c <= CONC_CONNECTIONS; c++)); do
+    [ ! -f "$rdir/conn-$c.jsonl" ] || cat "$rdir/conn-$c.jsonl" >>"$dir/calls.jsonl" || return 1
+    rm -f "$rdir/conn-$c.jsonl"
+  done
+  find "$rdir" -name '*.curl' -size 0 -delete
+  printf '{"round": %s, "duration_s": %s, "wall_s": %s, "connections": %s, "statements": %s, "seed": %s}\n' \
+    "$r" "$(json_num "$CONC_DURATION")" \
+    "$(awk -v a="$start" -v b="$end" 'BEGIN { printf "%.6f", (b - a) / 1000000 }')" \
+    "$CONC_CONNECTIONS" "$nq" "$(json_str "$CONC_SEED")" >>"$dir/rounds.jsonl"
+}
+
+# concurrent_worker ROUND CONNECTION DEADLINE_US ORDER: connection
+# CONNECTION's loop, reading numbers, ids and expects from concurrent_round.
+# It checks the deadline before each call and never after one.
+concurrent_worker() {
+  local r="$1" c="$2" deadline="$3" i=0 try=0 now expect
+  # shellcheck disable=SC2206 # ORDER is a space-separated list of indexes
+  local order=($4)
+  local RQ_CALLS="$OUT/concurrent/round-$r/conn-$c.jsonl"
+  local RQ_RESP_DIR="$OUT/concurrent/round-$r/conn-$c"
+  local RQ_MAX_TIME="" RQ_EXTRA="\"round\": $r, \"connection\": $c"
+  local nq="${#order[@]}" k
+  while :; do
+    now="$(now_us)" || return 1
+    [ "$now" -lt "$deadline" ] || return 0
+    k="${order[i]}"
+    try=$((try + 1))
+    expect="${expects[k]}"
+    [ "$expect" != - ] || expect=""
+    run_query concurrent "${numbers[k]}" "${ids[k]}" "$try" \
+      "$OUT/concurrent/requests/${numbers[k]}.json" "$expect" || return 1
+    i=$(((i + 1) % nq))
+  done
+}
+
+# concurrent_watchdog DEADLINE_US: polls readyz every KIT_WATCHDOG_INTERVAL
+# seconds (default 5) until the deadline; on a failed poll it restarts the
+# server and waits up to KIT_WATCHDOG_READY_TRIES tries (default 60) for
+# readiness. Each restart is logged as `restart n=N pid=P`. It never fails
+# the round.
+concurrent_watchdog() {
+  local deadline="$1" now nap
+  local READY_TRIES="$WATCHDOG_READY_TRIES"
+  while :; do
+    now="$(now_us)" || return 0
+    [ "$now" -lt "$deadline" ] || return 0
+    nap="$(awk -v d="$deadline" -v n="$now" -v s="$WATCHDOG_INTERVAL" \
+      'BEGIN { r = (d - n) / 1000000; printf "%.3f", (r < s ? r : s) }')"
+    sleep "$nap"
+    now="$(now_us)" || return 0
+    [ "$now" -lt "$deadline" ] || return 0
+    curl -sf --max-time 2 "$READY_URL" >/dev/null 2>&1 && continue
+    stamp "concurrent watchdog: readyz failed, restarting the server"
+    stop_server
+    start_server || echo "restart failed: server not ready"
+    echo "restart n=$SERVER_N pid=$SERVER_PID"
+  done
+}
+
+# phase_q29_probe: the corpus's q29 alone on a restarted server,
+# q29_probe_warmup untimed calls then q29_probe_runs timed ones, each recorded
+# with its duration and the response's stats. kit.py q29-summary takes min and
+# median over the timed runs only.
+phase_q29_probe() {
+  local dir="$OUT/q29_probe" n id exp q="" expect i total probe
+  phase_requests "$dir" || return 1
+  while IFS=$'\t' read -r n id exp; do
+    [[ "$id" =~ ^q29_ ]] || continue
+    q="$n"
+    break
+  done <"$dir/requests/index.tsv"
+  [ -n "$q" ] || { say "the corpus has no q29 statement"; return 1; }
+  : >"$dir/calls.jsonl"
+  stop_server
+  start_server || return 1
+  expect=""
+  [ "$exp" = - ] || expect="$exp"
+  total=$((Q29_WARMUP + Q29_RUNS))
+  for ((i = 1; i <= total; i++)); do
+    probe=run
+    [ "$i" -gt "$Q29_WARMUP" ] || probe=warmup
+    RQ_STATS=1 RQ_EXTRA="\"probe\": \"$probe\"" \
+      run_query q29_probe "$q" "$id" "$i" "$dir/requests/$q.json" "$expect" || return 1
+    [ -n "$expect" ] || expect="$RQ_ROWS"
+  done
+  stop_server
+  kit_py q29-summary "$dir" >"$dir/summary.json"
+}
+
+# phase_perf: needs perf_record = true (check_run refuses it otherwise). Per
+# statement, one warm call, then one hot call under
+# `perf record -F 99 -g -p <server pid>`; the samples are kept as folded
+# stacks in out/perf/NN.folded, never as perf.data.
+phase_perf() {
+  local dir="$OUT/perf" n id exp expect ppid
+  [ "$PERF_RECORD" = true ] || { say "phase perf needs perf_record = true"; return 1; }
+  command -v perf >/dev/null || { say "phase perf needs perf on the box"; return 1; }
+  phase_requests "$dir" || return 1
+  : >"$dir/calls.jsonl"
+  stop_server
+  start_server || return 1
+  while IFS=$'\t' read -r n id exp; do
+    expect=""
+    [ "$exp" = - ] || expect="$exp"
+    RQ_EXTRA='"profiled": false' run_query perf "$n" "$id" 1 "$dir/requests/$n.json" "$expect" || return 1
+    [ -n "$expect" ] || expect="$RQ_ROWS"
+    perf record -F 99 -g -p "$SERVER_PID" -o "$dir/$n.data" >"$dir/$n.record.log" 2>&1 &
+    ppid=$!
+    sleep "$PERF_SETTLE"
+    RQ_EXTRA='"profiled": true' run_query perf "$n" "$id" 2 "$dir/requests/$n.json" "$expect" \
+      || { kill -TERM "$ppid" 2>/dev/null; wait "$ppid"; return 1; }
+    kill -TERM "$ppid" 2>/dev/null
+    wait "$ppid"
+    perf script -i "$dir/$n.data" 2>"$dir/$n.script.log" | kit_py fold-perf >"$dir/$n.folded" \
+      || { say "perf script for statement $id failed; see $dir/$n.script.log"; return 1; }
+    rm -f "$dir/$n.data"
+  done <"$dir/requests/index.tsv"
+  stop_server
 }
 
 run_phases() {
@@ -832,8 +1062,13 @@ write_stamps() {
 }
 
 write_results() {
-  local lane bands="" sections code=0
+  local lane bands="" sections code=0 phase extra=()
   write_stamps || return 1
+  for phase in $PHASES; do
+    case "$phase" in
+      concurrent|q29_probe) extra+=("$phase=$OUT/$phase/summary.json") ;;
+    esac
+  done
   for lane in $LANES; do bands="${bands:+$bands,}$lane:$SRC/bands/$lane.toml"; done
   # shellcheck disable=SC2086 # PHASES is a space-separated list of names
   kit_py phases "$OUT" $PHASES >"$KIT/phases.json" || return 1
@@ -842,7 +1077,7 @@ write_results() {
   kit_py assemble out="$KIT/results.json" calls="$OUT/benchmark/calls.jsonl" \
     index="$OUT/benchmark/requests/index.tsv" server_logs="$BENCHMARK_SERVER_LOGS" \
     bands="$bands" sections="${sections%,}" provenance="$STAMPS" arm="$ARM" sha="$SHA" \
-    binary="$SERVER_BIN" tenant="$TENANT" phases_json="$KIT/phases.json" || return 1
+    binary="$SERVER_BIN" tenant="$TENANT" phases_json="$KIT/phases.json" "${extra[@]}" || return 1
   kit_py absolute "$ARM" "$KIT/results.json" >/dev/null || code=$?
   case "$code" in
     0) BANDS_VERDICT=pass ;;
