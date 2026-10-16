@@ -627,7 +627,11 @@ naming the key.
   (the mean of the rounds' ratios), with `qps_pooled` the mean of the
   rounds' non-null QPS, so a round whose calls all failed counts as 0. The
   bands judge `error_ratio_weighted`; the mean of rounds is reported only
-  for comparison with earlier readouts. The pooled error rate
+  for comparison with earlier readouts. `error_ratio_weighted` is weighted by
+  attempts: during an outage a connection's calls fail fast and it makes many
+  more of them, so the figure depends on how quickly failures return, and
+  `concurrent_error_pooled_max_delta` and `concurrent_error_pooled_max` must
+  be calibrated on that basis. The pooled error rate
   (`error_pooled`, judged by `error_pooled_max_delta` and
   `error_pooled_max`) covers the benchmark phase only: neither the
   concurrent calls, which have their own band, nor the `q29_probe` and

@@ -35,6 +35,9 @@ qps_min_ratio = 0.95
 # Concurrent error ratio: arm B's error_ratio_weighted (failed calls over all
 # concurrent calls, summed across rounds; a call fails unless it got a 2xx
 # answer and its transfer completed, curl exit 0) at most arm A's plus this.
+# The figure is weighted by attempts: during an outage a connection's calls
+# fail fast and it makes many more of them, so the figure depends on how
+# quickly failures return, and this bound must be calibrated on that basis.
 # The results.json concurrent block also reports error_ratio_mean_of_rounds,
 # the mean of each round's ratio, only for comparison with earlier readouts;
 # no band judges it. Inconclusive when the phase did not run on both arms.
@@ -63,7 +66,9 @@ cold_sum_s_max = "FILL-IN-ON-REFERENCE-MACHINE"
 # Pooled error ratio over the benchmark phase's calls only, as above.
 error_pooled_max = "FILL-IN-ON-REFERENCE-MACHINE"
 # Concurrent qps_pooled at least this, error_ratio_weighted at most this, and
-# the q29 probe's min_s in seconds at most this. Each is inconclusive when its
+# the q29 probe's min_s in seconds at most this. error_ratio_weighted is
+# weighted by attempts, as concurrent_error_pooled_max_delta above says, and
+# its bound must be calibrated on that basis. Each is inconclusive when its
 # phase did not run. Basis: none yet; each is set from the reference machine's
 # first paired run (issue #2873), and until then a run that selects
 # "absolute" is refused.
