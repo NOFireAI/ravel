@@ -411,6 +411,7 @@ impl Expected {
     /// divergence it does not show; so does one the normalisation does not
     /// apply to, and one that still differs afterwards, naming the first
     /// difference.
+    // guarded-esql-parse-allow: takes a divergence id, not ES|QL source text
     pub fn compare_divergent(&self, id: &str, actual: &Answer) -> Result<(), String> {
         if self.compare(actual).is_ok() {
             return Err(format!(
