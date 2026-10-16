@@ -5953,7 +5953,7 @@ mod tests {
     /// against a 400-byte all-kinds total whose GET share is 360, and the ratio
     /// its own scan and decode figures produce.
     fn synthetic_run_accounting() -> RunAccounting {
-        let by_phase = [0u64, 100, 50, 150];
+        let by_phase = [0u64, 100, 50, 150, 0];
         RunAccounting {
             object_store_get_requests: 4,
             object_store_list_requests: 1,

@@ -72,7 +72,8 @@ impl QueryPhase {
         QueryPhase::KeyIndex,
     ];
 
-    /// Lower-case, stable name for a report table column or a JSON key.
+    /// Stable name for a report table column or a JSON key, exactly the
+    /// `stats.phases` key (`keyIndex` is camelCase, the rest lower-case).
     #[must_use]
     pub fn name(self) -> &'static str {
         match self {
