@@ -603,13 +603,26 @@ naming the key.
   shorter) and counts as failed, so a server that accepts the connection and
   never answers is restarted instead of stalling the watchdog. The server
   start before each round polls that check, and a watchdog runs it every
-  5 s and restarts a server that fails it, polling up to 60 times 1 s apart
-  for readiness, without telling the connections, so calls during the outage
-  are errors. A refusal of `SELECT 1` under memory pressure therefore
-  restarts the server even while `/readyz` answers. Unlike upstream, the
-  watchdog's last sleep ends at the deadline and no check runs after it.
+  5 s and restarts a server that fails it, without telling the connections,
+  so calls during the outage are errors. A refusal of `SELECT 1` under memory
+  pressure therefore restarts the server even while `/readyz` answers. Unlike
+  upstream, the watchdog's last sleep ends at the deadline and no check runs
+  after it. Also unlike upstream, which polls a restarted server for
+  readiness 60 times 1 s apart, the watchdog polls as long as the kit's own
+  server start does (`KIT_READY_TRIES`, 600 tries 1 s apart), or until the
+  deadline, and runs no check while it waits: a server that needs more than
+  60 s to come up, as one on a page cache just dropped can, would otherwise
+  be given up on and stopped by the next failed check while still booting,
+  again and again until the deadline, and the whole round would read as an
+  outage.
   Every call is a line of `out/concurrent/calls.jsonl` with the benchmark's
-  fields plus `round` and `connection`. Every phase's call lines carry
+  fields plus `round` and `connection`. In every phase a failed call's curl
+  stderr file is removed once its line is written (the line's `error`
+  quotes its first 300 bytes for a transport or transfer failure), and
+  `evidence.tgz` leaves out the per-connection answer directories
+  (`out/concurrent/round-*/conn-*`), so an outage that makes hundreds of
+  thousands of fast-failing calls leaves no file per call for the evidence
+  step to copy and redact. Every phase's call lines carry
   `curl_exit`, and `http_status` is 0 when nothing answered. The figures
   follow upstream: a call succeeds when it gets a 2xx answer and its
   transfer completed
@@ -617,7 +630,11 @@ naming the key.
   otherwise, and a round's QPS is its successful calls over its nominal
   duration (`concurrent_duration_s`, not the measured wall time), 0 when
   the round made calls and none succeeded and null only when it made no
-  call; its error ratio is errors over calls. A 2xx
+  call; its error ratio is errors over calls. Because a call in flight at
+  the deadline still counts while QPS divides by the nominal duration, a
+  round whose `wall_s` exceeds `concurrent_duration_s` by more than 10
+  percent carries an `overran` note with both figures (null otherwise), and
+  `fetch.sh` prints it beside that round; the QPS formula is unchanged. A 2xx
   answer with the wrong row count is a success under that rule and is
   counted separately as `wrong_answer`; `outcome` and `refusal_class` stay
   in the call lines as diagnostics. `results.json`'s `concurrent` block
@@ -627,7 +644,11 @@ naming the key.
   (the mean of the rounds' ratios), with `qps_pooled` the mean of the
   rounds' non-null QPS, so a round whose calls all failed counts as 0. The
   bands judge `error_ratio_weighted`; the mean of rounds is reported only
-  for comparison with earlier readouts. The pooled error rate
+  for comparison with earlier readouts. `error_ratio_weighted` is weighted by
+  attempts: during an outage a connection's calls fail fast and it makes many
+  more of them, so the figure depends on how quickly failures return, and
+  `concurrent_error_pooled_max_delta` and `concurrent_error_pooled_max` must
+  be calibrated on that basis. The pooled error rate
   (`error_pooled`, judged by `error_pooled_max_delta` and
   `error_pooled_max`) covers the benchmark phase only: neither the
   concurrent calls, which have their own band, nor the `q29_probe` and

@@ -62,9 +62,9 @@
 # KIT_ROOT (default /root) relocates every path, and KIT_RUN_SH_LIB=1 defines
 # the functions without running main; kit.test.sh uses both. It also sets
 # KIT_READY_TRIES and KIT_READY_INTERVAL (the server readiness poll, default 600
-# tries 1 s apart), KIT_WATCHDOG_INTERVAL and KIT_WATCHDOG_READY_TRIES (the
-# concurrent phase's SELECT 1 check interval and restart wait, default 5 s and
-# 60 tries),
+# tries 1 s apart, which also bounds the concurrent watchdog's restart wait),
+# KIT_WATCHDOG_INTERVAL (the concurrent phase's SELECT 1 check interval,
+# default 5 s),
 # KIT_PERF_SETTLE (seconds perf record gets before the profiled call, default
 # 1) and KIT_CPUINFO and KIT_MEMINFO (the hardware stamp's sources, default
 # /proc/cpuinfo and /proc/meminfo).
@@ -93,7 +93,6 @@ DROP_CACHES_FILE="${KIT_DROP_CACHES_FILE:-/proc/sys/vm/drop_caches}"
 READY_TRIES="${KIT_READY_TRIES:-600}"
 READY_INTERVAL="${KIT_READY_INTERVAL:-1}"
 WATCHDOG_INTERVAL="${KIT_WATCHDOG_INTERVAL:-5}"
-WATCHDOG_READY_TRIES="${KIT_WATCHDOG_READY_TRIES:-60}"
 PERF_SETTLE="${KIT_PERF_SETTLE:-1}"
 CPUINFO="${KIT_CPUINFO:-/proc/cpuinfo}"
 MEMINFO="${KIT_MEMINFO:-/proc/meminfo}"
@@ -542,6 +541,13 @@ load_arm_env() {
 }
 
 start_server() {
+  launch_server || return 1
+  wait_server_ready
+}
+
+# launch_server: the server started in the background from arm.env, its pid in
+# SERVER_PID and server.pid, without waiting for readiness.
+launch_server() {
   load_arm_env || return 1
   make_secrets || return 1
   # The server reads the key only for redacted audit text and reports it set
@@ -555,10 +561,17 @@ start_server() {
   SERVER_PID=$!
   printf '%s\n' "$SERVER_PID" >"$KIT/server.pid"
   stamp "server start n=$SERVER_N pid=$SERVER_PID log=$(basename "$SERVER_LOG")"
+}
+
+# wait_server_ready [DEADLINE]: polls READY_CHECK (default readyz_check) up to
+# READY_TRIES times READY_INTERVAL apart. Returns 1 when the server exits or
+# never becomes ready, and 2 when DEADLINE (whole epoch seconds) passes first.
+wait_server_ready() {
   local i
   for ((i = 1; i <= READY_TRIES; i++)); do
     "${READY_CHECK:-readyz_check}" && return 0
     kill -0 "$SERVER_PID" 2>/dev/null || { say "server exited before ready; see $SERVER_LOG"; return 1; }
+    [ -z "${1:-}" ] || [ "$(date +%s)" -lt "$1" ] || return 2
     sleep "$READY_INTERVAL"
   done
   say "server not ready after $READY_TRIES tries ${READY_INTERVAL}s apart"
@@ -847,6 +860,9 @@ print("%s\t%s" % (d.get("errorType", ""), str(d.get("error", ""))[:300]))' "$res
     err="${parsed#*$'\t'}"
     [ -n "$RQ_CLASS" ] || RQ_CLASS=unclassified
   fi
+  # A failed call's curl stderr is in err now; a call that exited 0 printed
+  # none, and concurrent_round removes its empty file after the round.
+  [ "$code" = 0 ] || rm -f "$rdir/$number-$try.curl"
   if [ "${RQ_STATS:-}" = 1 ]; then
     stats="$(python3 -c 'import json, sys
 print(json.dumps(json.load(open(sys.argv[1])).get("stats")))' "$resp" 2>/dev/null)" || stats=""
@@ -1026,7 +1042,9 @@ concurrent_worker() {
   local RQ_MAX_TIME="" RQ_DEFER=1 RQ_EXTRA="\"round\": $r, \"connection\": $c"
   local nq="${#order[@]}" k
   while :; do
-    now="$(date +%s)" || return 1
+    # bash 5's EPOCHSECONDS, so a call does not fork date; else date.
+    now="${EPOCHSECONDS:-}"
+    [ -n "$now" ] || now="$(date +%s)" || return 1
     [ "$now" -lt "$deadline" ] || return 0
     k="${order[i]}"
     try=$((try + 1))
@@ -1041,17 +1059,22 @@ concurrent_worker() {
 # concurrent_watchdog DEADLINE: upstream's watchdog loop. While the deadline
 # (whole epoch seconds) is ahead it sleeps KIT_WATCHDOG_INTERVAL seconds
 # (default 5), then runs sql_check; on a failure it restarts the server and
-# polls sql_check up to KIT_WATCHDOG_READY_TRIES times (default 60)
-# KIT_READY_INTERVAL apart. Each restart is logged as `restart n=N pid=P`. It
-# never fails the round.
+# polls sql_check up to KIT_READY_TRIES times (default 600) KIT_READY_INTERVAL
+# apart, or until the deadline. Each restart is logged as `restart n=N pid=P`.
+# It never fails the round.
 #
-# One difference from upstream, on purpose: the last sleep is cut short at the
-# deadline and no check runs after it, where upstream sleeps the full interval
-# and checks once more, so the round ends at its deadline. A check upstream
-# runs after the deadline affects no call.
+# Two differences from upstream, on purpose. The last sleep is cut short at
+# the deadline and no check runs after it, where upstream sleeps the full
+# interval and checks once more, so the round ends at its deadline; a check
+# upstream runs after the deadline affects no call. And the restart waits as
+# long as the kit's own server start (READY_TRIES), where upstream polls 60
+# times 1 s apart: a server that needs longer, as one on a page cache just
+# dropped can, would otherwise be given up on and then stopped by the next
+# failed check while still booting, again and again until the deadline, and
+# the whole round would read as an outage. No check runs while the restart's
+# wait is in progress, so the watchdog never stops a server it is waiting on.
 concurrent_watchdog() {
-  local deadline="$1" now nap
-  local READY_TRIES="$WATCHDOG_READY_TRIES"
+  local deadline="$1" now nap code
   while :; do
     now="$(now_us)" || return 0
     [ "$now" -lt "$((deadline * 1000000))" ] || return 0
@@ -1062,8 +1085,14 @@ concurrent_watchdog() {
     sql_check && continue
     stamp "concurrent watchdog: SELECT 1 check failed, restarting the server"
     stop_server
-    start_server || echo "restart failed: server not ready"
+    launch_server || { echo "restart failed: server not started"; continue; }
     echo "restart n=$SERVER_N pid=$SERVER_PID"
+    code=0
+    wait_server_ready "$deadline" || code=$?
+    case "$code" in
+      1) echo "restart failed: server not ready" ;;
+      2) echo "restart still starting at the round's deadline" ;;
+    esac
   done
 }
 
@@ -1259,7 +1288,9 @@ write_evidence() {
   mkdir -p "$stage" || return 1
   # shellcheck disable=SC2086 # items is a space-separated list of names
   (cd "$KIT" && cp -R $items "$stage/") || return 1
-  rm -rf "$stage"/out/*/requests "$stage"/verify/requests
+  # Per-call response files: the call lines already carry what they hold, and a
+  # long outage leaves enough of them that scrubbing each one outlasts the box.
+  rm -rf "$stage"/out/*/requests "$stage"/verify/requests "$stage"/out/concurrent/round-*/conn-*
   while IFS= read -r f; do
     scrub "$f" || return 1
   done < <(find "$stage" -type f)
