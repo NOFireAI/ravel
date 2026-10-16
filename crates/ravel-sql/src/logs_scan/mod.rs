@@ -13,7 +13,11 @@
 //!   min(total_block_count.max(1))`. This lets a query touching fewer segments
 //!   than `target_partitions` still fan out to `target_partitions` partitions:
 //!   the old segment-granular rule (`min(target_partitions, segment_count)`)
-//!   pinned such a query to at most `segment_count` partitions.
+//!   pinned such a query to at most `segment_count` partitions. Under a
+//!   confirmed ascending `ts` TopK the list is instead every row group sorted
+//!   by its blocks' least minimum `ts` across all segments, an unplanned
+//!   segment by its own minimum ([`global_deal`]), so each partition reads the
+//!   earliest row groups first.
 //! - **Un-cached: segment-granular.** Each segment is assigned whole to one
 //!   partition (relevant segment `j` in snapshot order to partition `j % n`),
 //!   so every segment is opened by exactly one partition. The partition count is
@@ -1356,8 +1360,10 @@ struct BlockMetrics {
     /// `Opening` polls that returned `Pending`, the count of times this
     /// partition yielded to the runtime with an open in flight.
     open_pending_polls: Count,
-    /// Segments this partition opened (first opens only; the `attrs_raw`
-    /// reopen counts under [`Self::reopens`]).
+    /// Owned segments this partition opened (on the striped path, owned
+    /// shares of a segment, several of one segment under [`global_deal`];
+    /// first opens only, the `attrs_raw` reopen counts under
+    /// [`Self::reopens`]).
     segments_opened: Count,
     /// Wall time in `ReopenRows` opens (the `attrs_raw` fallback), kept apart
     /// from [`Self::open_elapsed`] so a fallback's second open is visible.
@@ -2986,6 +2992,7 @@ impl ExecutionPlan for LogsScanExec {
                     Arc::clone(&self.segments),
                     self.target_partitions,
                     self.stripe_blocks,
+                    self.active_topk().is_some(),
                     blocks.plan_init_elapsed.clone(),
                 );
                 (VecDeque::new(), false, LogScanState::Planning(counts_fut))
@@ -3143,7 +3150,9 @@ struct LogScanStream {
     prefetch_share: usize,
     /// [`LogsScanExec::active_topk`]: the confirmed TopK threshold this
     /// partition reads before opening each owned segment and before decoding
-    /// each block, and that orders the planned path's segments.
+    /// each block, and whose presence selects [`global_deal`] over
+    /// segment-then-group order on the striped path (`visit_order`
+    /// elsewhere, by whole segment, when no read cache is wired).
     topk: Option<TopKThreshold>,
     /// The statement's prefetch pool, shared with the exec and every other
     /// partition's stream. This partition's issued opens of the owned
@@ -3225,18 +3234,22 @@ struct LogScanStream {
     /// footer it first used. `None` on the whole-segment fast path.
     current_footer: Option<LogFooter>,
     /// The plan fallback's whole-object bytes for [`Self::current_seg`]
-    /// (issue #835), consumed exactly once per stream by the FIRST open of
-    /// this segment (`Option::take` at the `NextSegment` state, before
-    /// `open_segment_subset`). `None` whenever the plan phase did not carry
-    /// whole-object bytes forward for this segment, always `None` on the
-    /// whole-segment fast path, and `None` here after that first take even
-    /// though the carry existed -- a later `ReopenRows`/`attrs_raw`-overflow
-    /// reopen of the SAME segment therefore takes the normal fetch/cache path
-    /// rather than reusing these bytes a second time.
+    /// (issue #835), consumed once per [`OwnedSeg`] open of this segment by
+    /// the FIRST open of each (`Option::take` at the `NextSegment` state,
+    /// before `open_segment_subset`): under [`global_deal`] a stream can hold
+    /// several `OwnedSeg`s of one segment, each its own `NextSegment`
+    /// transition and each taking its own carry. `None` whenever the plan
+    /// phase did not carry whole-object bytes forward for this segment,
+    /// always `None` on the whole-segment fast path, and `None` here after
+    /// that open's take even though the carry existed -- a later
+    /// `ReopenRows`/`attrs_raw`-overflow reopen of the SAME `OwnedSeg`
+    /// therefore takes the normal fetch/cache path rather than reusing these
+    /// bytes a second time.
     ///
-    /// Once per stream, not once per buffer: under block striping a segment's
-    /// survivors can be owned by several partitions, each of which clones the
-    /// carry and charges the object's length to
+    /// Once per `OwnedSeg` open, not once per buffer: under block striping a
+    /// segment's survivors can be owned by several partitions, and under
+    /// [`global_deal`] by several `OwnedSeg`s of one partition, each of which
+    /// clones the carry and charges the object's length to
     /// `QueryAccounting::add_bytes_reused`. That matches what the figure
     /// counts, one avoided store call per open, and is the same convention
     /// those opens were charged under as cache hits before this carry existed.
