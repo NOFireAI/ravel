@@ -302,7 +302,7 @@ async fn plan_phase_prunes_to_fewer_requests_than_the_unpruned_query() {
     assert_eq!(unpruned_plan.s3_bytes(AccountedOp::Get), len_a + len_b);
 }
 
-/// Per-phase requests and bytes, summed over all four phases of a real
+/// Per-phase requests and bytes, summed over all five phases of a real
 /// executed query, equal the pooled (`SqlOutcome::accounting`) total exactly:
 /// the same invariant `stats_json`'s unit test pins against a synthetic
 /// `PhaseAccounting`, now pinned against the executor's actual output.
@@ -327,8 +327,8 @@ async fn per_phase_figures_sum_to_the_pooled_total_on_a_real_query() {
     assert_eq!(summed_bytes, outcome.accounting.total_s3_bytes());
 }
 
-/// The JSON rendering names each of the four phases exactly once, in
-/// `resolve`/`plan`/`probe`/`scan` order, on a real executed query's
+/// The JSON rendering names each of the five phases exactly once, in
+/// `resolve`/`plan`/`probe`/`scan`/`keyIndex` order, on a real executed query's
 /// accounting -- not just on a synthetic `PhaseAccounting` as in
 /// `stats_json`'s own unit test.
 #[tokio::test]
@@ -344,7 +344,7 @@ async fn wire_rendering_names_each_phase_exactly_once_on_a_real_query() {
         .iter()
         .map(|e| e["phase"].as_str().expect("phase is a string"))
         .collect();
-    assert_eq!(names, vec!["resolve", "plan", "probe", "scan"]);
+    assert_eq!(names, vec!["resolve", "plan", "probe", "scan", "keyIndex"]);
 }
 
 /// `SqlOutcome::io_shape` on this fixture's two queries, pinned by exact

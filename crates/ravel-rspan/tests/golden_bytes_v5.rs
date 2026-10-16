@@ -22,7 +22,7 @@
 use ravel_rspan::footer::{self, kind};
 use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanReader, RspanWriter, SpanQuery, SpanRecord, SpanSegError,
-    StatusCode, open,
+    StatusCode, TraceKeyProbe, open,
 };
 
 fn fixed_identity() -> ObjectIdentity {
@@ -161,10 +161,13 @@ fn matches_golden_fixture() {
     for i in 0..4u8 {
         assert_eq!(
             reader.probe_trace(&[i; 16]).expect("probe"),
-            Some(vec![u32::from(i)])
+            TraceKeyProbe::Present(vec![u32::from(i)])
         );
     }
-    assert_eq!(reader.probe_trace(&[9; 16]).expect("probe"), Some(vec![]));
+    assert_eq!(
+        reader.probe_trace(&[9; 16]).expect("probe"),
+        TraceKeyProbe::Absent
+    );
 }
 
 #[test]

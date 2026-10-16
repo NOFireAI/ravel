@@ -11,8 +11,8 @@
 use std::ops::Range;
 
 use ravel_codec::key_idx::{
-    KEY_IDX_ENTRY_LEN, KeyIdxBucket, KeyIdxFieldInput, KeyIdxPrefix, encode_key_idx,
-    key_idx_prefix_range, key8_id16, verify_key_idx,
+    KeyIdxBucket, KeyIdxFieldInput, KeyIdxPrefix, encode_key_idx, key_idx_prefix_range, key8_id16,
+    verify_key_idx,
 };
 
 use crate::error::SpanSegError;
@@ -74,64 +74,100 @@ pub(crate) fn summarize(section: &[u8], prefix_len: u32) -> Result<KeyIdxSummary
     Ok(verify_key_idx(section, prefix_len)?)
 }
 
+/// What a KEY_IDX probe for one trace says about one object (ADR-2707
+/// decision 5, tier 1). The three arms are opposite pruning decisions, so a
+/// caller matches on all three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TraceKeyProbe {
+    /// No entry of the section has the trace's `key8`: no block of the object
+    /// holds the trace, and the caller drops the object without a block read.
+    Absent,
+    /// The ascending, non-empty SKIP_IDX block ordinals holding every trace
+    /// whose `key8` equals the probed one. Only these blocks can hold the
+    /// trace; a prefix collision can add a block that does not.
+    Present(Vec<u32>),
+    /// The section does not index `trace_id` under `Id16`, so it says nothing
+    /// and every block stays a candidate. RSPAN's parameter rules refuse such
+    /// a section as `Corrupted` before the lookup, so a section that passed
+    /// them never declines; the arm exists so a caller cannot read "declined"
+    /// as "absent".
+    Declined,
+}
+
+/// The first step of a probe over `[0, prefix_len)`: either the answer, or the
+/// one bucket left to read.
+#[derive(Debug, Clone)]
+pub(crate) enum Located {
+    Done(TraceKeyProbe),
+    Bucket(KeyIdxBucket),
+}
+
+/// Parses the section's `[0, prefix_len)` bytes (`prefix_bytes`), applies the
+/// RSPAN parameter rules, and locates the bucket `trace_id`'s `key8` mixes to.
+/// An empty bucket is [`TraceKeyProbe::Absent`] with no second read.
+pub(crate) fn locate(
+    section_len: u64,
+    prefix_len: u32,
+    trace_id: &[u8; 16],
+    prefix_bytes: &[u8],
+) -> Result<Located, SpanSegError> {
+    let prefix = KeyIdxPrefix::parse(prefix_bytes, prefix_len, section_len)?;
+    check_parameters(&prefix)?;
+    let Some(bucket) = prefix.locate(TRACE_ID_FIELD, KeyType::Id16, &key8_id16(trace_id))? else {
+        return Ok(Located::Done(TraceKeyProbe::Declined));
+    };
+    if bucket.is_empty() {
+        return Ok(Located::Done(TraceKeyProbe::Absent));
+    }
+    Ok(Located::Bucket(bucket))
+}
+
+/// The second step: verifies and decodes the bucket's bytes once and answers
+/// for the probed key. Every entry of the bucket, whichever key it belongs to,
+/// must name a block below `block_count`, so one bad ordinal fails the whole
+/// bucket as `Corrupted` rather than trusting the rest of a frame that is
+/// already known to be wrong.
+pub(crate) fn finish(
+    bucket: &KeyIdxBucket,
+    frame: &[u8],
+    block_count: usize,
+) -> Result<TraceKeyProbe, SpanSegError> {
+    let entries = bucket.entries(frame)?;
+    if let Some(&(_, block)) = entries.iter().find(|(_, b)| *b as usize >= block_count) {
+        return Err(SpanSegError::Corrupted(format!(
+            "KEY_IDX bucket {} names block {block}, object has {block_count} blocks",
+            bucket.bucket()
+        )));
+    }
+    let blocks = bucket.matching(&entries);
+    Ok(if blocks.is_empty() {
+        TraceKeyProbe::Absent
+    } else {
+        TraceKeyProbe::Present(blocks)
+    })
+}
+
 /// Probes for `trace_id` through `read`, which returns the section bytes for a
 /// section-relative range. Reads exactly `[0, prefix_len)`, then the one bucket
 /// the trace's `key8` mixes to (no second read when that bucket is empty).
-/// Every ordinal in the bucket read must be below `block_count`, whichever key
-/// it belongs to. `Ok(None)` only when the section declines the probe, which
-/// the parameter rules make unreachable for a section that passed them.
 pub(crate) fn probe<B, F>(
     section_len: u64,
     prefix_len: u32,
     block_count: usize,
     trace_id: &[u8; 16],
     mut read: F,
-) -> Result<Option<Vec<u32>>, SpanSegError>
+) -> Result<TraceKeyProbe, SpanSegError>
 where
     B: AsRef<[u8]>,
     F: FnMut(Range<u64>) -> Result<B, SpanSegError>,
 {
     let prefix_range = key_idx_prefix_range(prefix_len, section_len)?;
     let prefix_bytes = read(prefix_range)?;
-    let prefix = KeyIdxPrefix::parse(prefix_bytes.as_ref(), prefix_len, section_len)?;
-    check_parameters(&prefix)?;
-    let Some(bucket) = prefix.locate(TRACE_ID_FIELD, KeyType::Id16, &key8_id16(trace_id))? else {
-        return Ok(None);
-    };
-    if bucket.is_empty() {
-        return Ok(Some(Vec::new()));
-    }
-    let bucket_bytes = read(bucket.range())?;
-    blocks_in_range(&bucket, bucket_bytes.as_ref(), block_count).map(Some)
-}
-
-/// [`KeyIdxBucket::blocks`] plus the block-count check over every entry of
-/// the frame, not only the probed key's.
-fn blocks_in_range(
-    bucket: &KeyIdxBucket,
-    frame: &[u8],
-    block_count: usize,
-) -> Result<Vec<u32>, SpanSegError> {
-    // Verifies the frame's crc, entry count, size, order and bucket membership,
-    // so the decode below runs on a well-formed frame.
-    let blocks = bucket.blocks(frame)?;
-    let count = frame
-        .get(..4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
-        .ok_or_else(|| SpanSegError::Corrupted("KEY_IDX bucket frame truncated".into()))?;
-    let payload = frame
-        .get(8..)
-        .ok_or_else(|| SpanSegError::Corrupted("KEY_IDX bucket frame truncated".into()))?;
-    let raw = zstd::bulk::decompress(payload, count * KEY_IDX_ENTRY_LEN)
-        .map_err(|e| SpanSegError::Corrupted(format!("KEY_IDX bucket frame zstd: {e}")))?;
-    for entry in raw.chunks_exact(KEY_IDX_ENTRY_LEN) {
-        let block = u32::from_le_bytes([entry[8], entry[9], entry[10], entry[11]]);
-        if block as usize >= block_count {
-            return Err(SpanSegError::Corrupted(format!(
-                "KEY_IDX bucket {} names block {block}, object has {block_count} blocks",
-                bucket.bucket()
-            )));
+    match locate(section_len, prefix_len, trace_id, prefix_bytes.as_ref())? {
+        Located::Done(answer) => Ok(answer),
+        Located::Bucket(bucket) => {
+            let frame = read(bucket.range())?;
+            finish(&bucket, frame.as_ref(), block_count)
         }
     }
-    Ok(blocks)
 }

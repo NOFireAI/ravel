@@ -9,7 +9,7 @@ use std::ops::Range;
 use ravel_rspan::footer::{DEFAULT_MAX_SECTION_UNCOMP, kind};
 use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanRangeReader, RspanReader, RspanWriter, SpanRecord,
-    SpanSegError, StatusCode, open, read_section,
+    SpanSegError, StatusCode, TraceKeyProbe, open, read_section,
 };
 
 fn identity() -> ObjectIdentity {
@@ -83,7 +83,7 @@ fn ranged_probe(
     obj: &[u8],
     reader: &RspanRangeReader,
     trace: &[u8; 16],
-) -> (Option<Vec<u32>>, Vec<Range<u64>>) {
+) -> (TraceKeyProbe, Vec<Range<u64>>) {
     let reads = RefCell::new(Vec::new());
     let got = reader
         .probe_trace(trace, |r: Range<u64>| {
@@ -114,14 +114,19 @@ fn v5_object_probe_names_the_trace_blocks_and_v4_is_refused() {
         (&[0x99; 16], vec![]),
     ];
     for (trace, want) in cases {
+        let answer = if want.is_empty() {
+            TraceKeyProbe::Absent
+        } else {
+            TraceKeyProbe::Present(want.clone())
+        };
         assert_eq!(
             reader.probe_trace(trace).expect("probe"),
-            Some(want.clone()),
+            answer,
             "whole-object probe for {:02x}",
             trace[0]
         );
         let (got, reads) = ranged_probe(&obj, &ranged, trace);
-        assert_eq!(got, Some(want.clone()), "ranged probe for {:02x}", trace[0]);
+        assert_eq!(got, answer, "ranged probe for {:02x}", trace[0]);
         // Exactly the prefix first, then at most one bucket inside the section
         // past the prefix; a present trace always needs its bucket.
         assert_eq!(reads[0], prefix, "first read is exactly [0, prefix_len)");
@@ -145,8 +150,14 @@ fn v5_object_probe_names_the_trace_blocks_and_v4_is_refused() {
         })
         .find(|t| ranged_probe(&obj, &ranged, t).1.get(1) == b_reads.get(1))
         .expect("some absent trace shares B's bucket");
-    assert_eq!(reader.probe_trace(&shared).expect("probe"), Some(vec![]));
-    assert_eq!(ranged_probe(&obj, &ranged, &shared).0, Some(vec![]));
+    assert_eq!(
+        reader.probe_trace(&shared).expect("probe"),
+        TraceKeyProbe::Absent
+    );
+    assert_eq!(
+        ranged_probe(&obj, &ranged, &shared).0,
+        TraceKeyProbe::Absent
+    );
 
     let v4: &[u8] = include_bytes!("fixtures/golden_rspan_v4.bin");
     assert!(matches!(open(v4), Err(SpanSegError::UnsupportedVersion(4))));

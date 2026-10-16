@@ -5325,7 +5325,11 @@ mod tests {
             let by_phase = per_run[run]["wire_bytes_by_phase"]
                 .as_array()
                 .expect("wire_bytes_by_phase is a JSON array");
-            assert_eq!(by_phase.len(), 4, "run {run}: four phases, no phase twice");
+            assert_eq!(
+                by_phase.len(),
+                QueryPhase::ALL.len(),
+                "run {run}: every phase, no phase twice"
+            );
             let serialized: Vec<&str> = by_phase
                 .iter()
                 .map(|p| p["phase"].as_str().expect("phase name"))
