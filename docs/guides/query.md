@@ -1035,9 +1035,14 @@ counts the errors among the latest 100 rows, not all errors.
 Everything else is refused with a typed 400 before the statement runs: `LIKE`
 and `RLIKE`, casts, other functions such as `TO_UPPER`, calendar intervals
 such as `1 month`, query parameters, query settings, and other commands.
-The message names the construct and where it starts, such as
-`line 1:6: source [metrics] is not supported` for `FROM metrics`. A
-statement that does not parse is refused the same way and takes no slot
+The message names the construct and where it starts. For `FROM metrics` it
+reads:
+
+```text
+line 1:6: source [metrics] is not supported
+```
+
+A statement that does not parse is refused the same way and takes no slot
 from the query concurrency ceiling.
 
 Integer overflow, integer division or remainder by zero, and a double result

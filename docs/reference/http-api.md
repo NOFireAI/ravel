@@ -270,11 +270,17 @@ Errors use the shared body, `{"status": "error", "errorType": ..., "error":
 | --- | --- | --- |
 | The statement does not parse, or passes a structural limit; the message starts `line L:C:` and states no byte offset | 400 | `bad_data` |
 | The statement parses and does not bind: an unknown column, a type mismatch, an aggregate outside `STATS` | 400 | `bad_data` |
-| A command, source, function, operator or type this build does not run; the message is `line L:C: <name> is not supported` | 400 | `bad_data` |
+| A command, source, function, operator or type this build does not run; the message starts `line L:C:` and names the construct, as shown below | 400 | `bad_data` |
 | `params`, an unknown field, a body that is not JSON, or `start` after `end` | 400 | `bad_data` |
 | A bound statement the planner cannot plan; the message does not carry the planner's text | 422 | `execution` |
 | A statement whose time window is wider than the catalog serves | 422 | `execution` |
 | A failure while the statement runs | As for `/api/v1/sql` | As for `/api/v1/sql` |
+
+The refusal of a construct this build does not run reads, for `FROM metrics`:
+
+```text
+line 1:6: source [metrics] is not supported
+```
 
 A statement that does not parse is refused before it takes a permit from the
 admission ceiling and before any object-store read, and it writes no audit
