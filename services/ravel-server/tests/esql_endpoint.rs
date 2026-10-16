@@ -7,7 +7,8 @@
 //! The ES|QL tests are behind `feature = "esql"`; the one test that proves the
 //! route is absent without it is behind `not(feature = "esql")`, so both
 //! halves of the packaging decision are covered by the builds the gate list
-//! runs.
+//! runs. The test that the default feature set leaves `esql` off reads the
+//! manifest and compiles in every build.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -133,6 +134,62 @@ async fn feature_off_build_serves_no_esql_route() {
     running.shutdown().await.expect("server stops");
 }
 
+/// The chain of feature entries from one of `roots` to an entry that turns the
+/// ES|QL surface on (the `esql` feature, or the `ravel-esql` dependency by any
+/// spelling), following each entry that names another feature of this crate.
+fn path_to_esql(features: &toml::Table, roots: &[&str]) -> Option<Vec<String>> {
+    let mut queue: Vec<Vec<String>> = roots.iter().map(|root| vec![root.to_string()]).collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(path) = queue.pop() {
+        let entry = path.last().expect("a path is never empty").clone();
+        if entry == "esql"
+            || entry == "ravel-esql"
+            || entry.starts_with("dep:ravel-esql")
+            || entry.starts_with("ravel-esql/")
+            || entry.starts_with("ravel-esql?/")
+        {
+            return Some(path);
+        }
+        if !seen.insert(entry.clone()) {
+            continue;
+        }
+        let Some(enabled) = features.get(&entry).and_then(toml::Value::as_array) else {
+            continue;
+        };
+        for next in enabled.iter().filter_map(toml::Value::as_str) {
+            let mut longer = path.clone();
+            longer.push(next.to_string());
+            queue.push(longer);
+        }
+    }
+    None
+}
+
+/// The ES|QL surface is opt-in: no feature in the crate's default set enables
+/// it, directly or through another feature. Compiled in every build, so the
+/// default build checks its own manifest. The walk is shown able to find the
+/// surface from `esql` itself, so an empty answer is not a walk that could
+/// never have found one.
+#[test]
+fn default_features_do_not_enable_esql() {
+    let manifest = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .expect("read the crate manifest");
+    let manifest: toml::Table = manifest.parse().expect("the manifest is TOML");
+    let features = manifest
+        .get("features")
+        .and_then(toml::Value::as_table)
+        .expect("the manifest has a [features] table");
+    assert!(
+        path_to_esql(features, &["esql"]).is_some(),
+        "the esql feature is not where this test looks for it"
+    );
+    assert_eq!(
+        path_to_esql(features, &["default"]),
+        None,
+        "the default features enable the ES|QL surface"
+    );
+}
+
 #[cfg(feature = "esql")]
 mod with_esql {
     use super::*;
@@ -182,8 +239,23 @@ mod with_esql {
             }
         }
 
-        fn len(&self) -> usize {
-            self.0.lock().expect("lock").len()
+        /// The reads a query request can issue before it reaches segment
+        /// data: GETs, HEADs and LISTs under the tenant's catalog prefix and
+        /// of its configuration record. A background flush or maintenance
+        /// write is not one, so it cannot move this count.
+        fn query_reads(&self) -> usize {
+            let tenant = tenant_hash().to_hex();
+            let catalog = format!("t/{tenant}/catalog/");
+            let config = format!("t/{tenant}/config");
+            self.0
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter(|(op, key)| {
+                    matches!(*op, "get" | "head" | "list")
+                        && (key.starts_with(&catalog) || *key == config)
+                })
+                .count()
         }
     }
 
@@ -522,9 +594,9 @@ mod with_esql {
     }
 
     /// A malformed statement is a 400 naming its line and column, and the
-    /// server answers it without a single store call for the tenant. The
-    /// well-formed statement after it is the control: the same observer sees
-    /// the reads a statement that parses does issue. The permit half, which a
+    /// server answers it without reading the tenant's catalog or
+    /// configuration. The well-formed statement after it is the control: the
+    /// same observer sees the reads a statement that parses does issue. The permit half, which a
     /// started server does not expose, is
     /// `service::tests::esql_parse_error_takes_no_permit_and_reads_no_store`.
     #[tokio::test]
@@ -532,19 +604,19 @@ mod with_esql {
         let fx = Fixture::start(false).await;
         fx.ingest().await;
 
-        let before = fx.ops.len();
+        let before = fx.ops.query_reads();
         let (status, body) = fx.esql("FROM logs\n| WHERE").await;
         assert_eq!(status, 400, "{body}");
         assert_eq!(body["status"], "error");
         assert_eq!(body["errorType"], "bad_data");
         let message = body["error"].as_str().expect("error message");
         assert!(message.starts_with("line 2:"), "{message}");
-        assert_eq!(fx.ops.len(), before, "a malformed statement reads nothing");
+        assert_eq!(fx.ops.query_reads(), before, "a malformed statement reads nothing");
 
         let (status, body) = fx.esql("FROM logs | LIMIT 1").await;
         assert_eq!(status, 200, "{body}");
         assert!(
-            fx.ops.len() > before,
+            fx.ops.query_reads() > before,
             "the control statement reads the store"
         );
 
@@ -627,7 +699,7 @@ mod with_esql {
     #[tokio::test]
     async fn a_row_statement_reads_nothing() {
         let fx = Fixture::start(false).await;
-        let before = fx.ops.len();
+        let before = fx.ops.query_reads();
         let (status, body) = fx.esql("ROW a = 1, b = \"x\"").await;
         assert_eq!(status, 200, "{body}");
         assert_eq!(
@@ -648,7 +720,11 @@ mod with_esql {
         assert_eq!(keys, ["accounting", "estimate"], "{body}");
         assert_eq!(body["stats"]["accounting"]["s3GetRequests"], 0);
         assert_eq!(body["stats"]["estimate"]["estimatedRequests"], 0);
-        assert_eq!(fx.ops.len(), before, "no store call for a ROW statement");
+        assert_eq!(
+            fx.ops.query_reads(),
+            before,
+            "no catalog or configuration read for a ROW statement"
+        );
         fx.running.shutdown().await.expect("graceful shutdown");
     }
 }
