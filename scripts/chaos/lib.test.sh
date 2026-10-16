@@ -1268,5 +1268,110 @@ for ARGV_BRANCH in path cargo; do
     "$(cli_argv CHAOS_TENANT_HASH_MODE=keyed CHAOS_TENANT_HASH_KEY_FILE="${KEY_FILE}")"
 done
 
+# ---------------------------------------------------------------------------
+# chaos_aws picks CHAOS_AWS, then an aws on PATH, then the pinned container
+# image; rustfs_up starts only the rustfs service (issue #2666). The cases run
+# the real functions in a fresh bash, because the cases above replace
+# chaos_aws with a stub. PATH holds only the stub directory, so no aws that
+# the host happens to have can leak into the no-aws case. Each stub records
+# its argv in one file and the credential variables it received in another.
+# ---------------------------------------------------------------------------
+
+AWS_SEL_SECRET="s3cr3t-do-not-leak-0123456789"
+AWS_SEL_DIR="${SCRATCH}/aws-select"
+mkdir -p "${AWS_SEL_DIR}/host" "${AWS_SEL_DIR}/docker-ok" "${AWS_SEL_DIR}/docker-fail" \
+  "${AWS_SEL_DIR}/override"
+
+# stub_cmd DIR NAME EXIT: DIR/NAME records argv to $REC/NAME.argv and the
+# credential variables in its environment to $REC/NAME.env, then exits EXIT.
+stub_cmd() {
+  printf '#!%s\nprintf "%%s\\n" "$@" >>"${REC}/%s.argv"\nprintf "%%s\\n" "KEY=${AWS_ACCESS_KEY_ID-}" "SECRET=${AWS_SECRET_ACCESS_KEY-}" "IMDS=${AWS_EC2_METADATA_DISABLED-}" >>"${REC}/%s.env"\nexit %s\n' \
+    "${BASH}" "$2" "$2" "$3" >"$1/$2"
+  chmod +x "$1/$2"
+}
+stub_cmd "${AWS_SEL_DIR}/host" aws 0
+stub_cmd "${AWS_SEL_DIR}/override" my-aws 0
+stub_cmd "${AWS_SEL_DIR}/docker-ok" docker 0
+stub_cmd "${AWS_SEL_DIR}/docker-fail" docker 97
+
+# sel_run PATHDIRS... -- ARGS...: chaos_aws ARGS in a fresh shell whose PATH is
+# PATHDIRS, with a fresh record directory in $REC (also printed as REC_DIR).
+# CHAOS_AWS is whatever the caller exports.
+sel_run() {
+  local dirs="" a
+  for a in "$@"; do
+    shift
+    [[ "${a}" == "--" ]] && break
+    dirs="${dirs:+${dirs}:}${a}"
+  done
+  REC_DIR="$(mktemp -d "${SCRATCH}/rec.XXXXXX")"
+  REC="${REC_DIR}" PATH="${dirs}" RAVEL_S3_SECRET_KEY="${AWS_SEL_SECRET}" \
+    "${BASH}" -c 'source "$1" && shift && chaos_aws "$@"' _ "${CHAOS_DIR}/lib.sh" "$@" \
+    >/dev/null 2>&1
+}
+rec_lines() { # file: its lines joined by spaces, or "none" when never written
+  if [[ -f "$1" ]]; then paste -sd' ' - <"$1"; else echo none; fi
+}
+no_secret_in() { # file...: yes when the secret value is in none of them
+  if cat "$@" 2>/dev/null | grep -qF "${AWS_SEL_SECRET}"; then echo no; else echo yes; fi
+}
+
+# A host aws on PATH wins, and docker (stubbed to exit 97) is never invoked.
+sel_run "${AWS_SEL_DIR}/host" "${AWS_SEL_DIR}/docker-fail" -- s3 ls s3://b/
+check "chaos_aws: an aws on PATH runs with --endpoint-url and the arguments" \
+  "--endpoint-url ${CHAOS_RUSTFS_ENDPOINT} s3 ls s3://b/" "$(rec_lines "${REC_DIR}/aws.argv")"
+check "chaos_aws: an aws on PATH leaves docker uninvoked" "none" "$(rec_lines "${REC_DIR}/docker.argv")"
+check "chaos_aws: the host aws gets the credentials and IMDS off in its environment" \
+  "KEY=${RAVEL_S3_ACCESS_KEY} SECRET=${AWS_SEL_SECRET} IMDS=true" "$(rec_lines "${REC_DIR}/aws.env")"
+check "chaos_aws: the host aws argv carries no credential" "yes" "$(no_secret_in "${REC_DIR}/aws.argv")"
+
+# CHAOS_AWS names the binary, ahead of an aws on PATH.
+CHAOS_AWS="${AWS_SEL_DIR}/override/my-aws" sel_run "${AWS_SEL_DIR}/host" "${AWS_SEL_DIR}/docker-fail" -- s3 ls
+check "chaos_aws: CHAOS_AWS runs the named binary with --endpoint-url" \
+  "--endpoint-url ${CHAOS_RUSTFS_ENDPOINT} s3 ls" "$(rec_lines "${REC_DIR}/my-aws.argv")"
+check "chaos_aws: CHAOS_AWS takes precedence over an aws on PATH" "none" "$(rec_lines "${REC_DIR}/aws.argv")"
+check "chaos_aws: CHAOS_AWS leaves docker uninvoked" "none" "$(rec_lines "${REC_DIR}/docker.argv")"
+CHAOS_AWS="${AWS_SEL_DIR}/override/my-aws" sel_run "${AWS_SEL_DIR}/docker-fail" -- s3 ls
+check "chaos_aws: CHAOS_AWS works with no aws on PATH" \
+  "--endpoint-url ${CHAOS_RUSTFS_ENDPOINT} s3 ls" "$(rec_lines "${REC_DIR}/my-aws.argv")"
+
+# No aws anywhere: the pinned image under docker, credentials by name only.
+sel_run "${AWS_SEL_DIR}/docker-ok" -- s3api create-bucket --bucket b
+check "chaos_aws: with no aws, docker runs the pinned image then --endpoint-url and the arguments" \
+  "run --rm --network host -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION -e AWS_EC2_METADATA_DISABLED ${CHAOS_AWS_CLI_IMAGE} --endpoint-url ${CHAOS_RUSTFS_ENDPOINT} s3api create-bucket --bucket b" \
+  "$(rec_lines "${REC_DIR}/docker.argv")"
+check "chaos_aws: the docker argv carries no credential" "yes" "$(no_secret_in "${REC_DIR}/docker.argv")"
+check "chaos_aws: docker gets the credentials and IMDS off in its environment" \
+  "KEY=${RAVEL_S3_ACCESS_KEY} SECRET=${AWS_SEL_SECRET} IMDS=true" "$(rec_lines "${REC_DIR}/docker.env")"
+check "chaos_aws: the exit code of the container path is the command's" "97" \
+  "$(REC="$(mktemp -d "${SCRATCH}/rec.XXXXXX")" PATH="${AWS_SEL_DIR}/docker-fail" "${BASH}" -c 'source "$1"; chaos_aws s3 ls; echo $?' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null)"
+
+# --check names the client the run will use.
+dep_line() { # PATHDIRS: the "aws CLI:" line of check_dependencies
+  PATH="$1" "${BASH}" -c 'source "$1"; check_dependencies' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null |
+    grep -F 'aws CLI:' | sed 's/^ *OK *//'
+}
+check "check_dependencies: names the host aws when one is on PATH" \
+  "aws CLI: host (${AWS_SEL_DIR}/host/aws)" "$(dep_line "${AWS_SEL_DIR}/host")"
+check "check_dependencies: names the container image when only docker is" \
+  "aws CLI: container ${CHAOS_AWS_CLI_IMAGE}" "$(dep_line "${AWS_SEL_DIR}/docker-ok")"
+
+# rustfs_up names the rustfs service, so compose does not start createbucket
+# (which pulls the AWS CLI image from ECR Public). The stubbed docker records
+# its argv; the health probe fails once so the compose branch runs.
+RUSTFS_UP_REC="$(mktemp -d "${SCRATCH}/rec.XXXXXX")"
+REC="${RUSTFS_UP_REC}" PATH="${AWS_SEL_DIR}/docker-ok" "${BASH}" -c '
+  source "$1"
+  log() { :; }
+  run_capture() { :; }
+  chaos_aws() { :; }
+  probes=0
+  chaos_rustfs_healthy() { probes=$((probes + 1)); [[ "${probes}" -gt 1 ]]; }
+  rustfs_up' _ "${CHAOS_DIR}/lib.sh" >/dev/null 2>&1
+check "rustfs_up: compose is told to start only the rustfs service" \
+  "compose -f ${CHAOS_RUSTFS_COMPOSE} up -d rustfs" "$(rec_lines "${RUSTFS_UP_REC}/docker.argv")"
+check "rustfs_up: the compose file names a rustfs service" "1" \
+  "$(grep -c '^  rustfs:$' "${REPO_ROOT}/${CHAOS_RUSTFS_COMPOSE}")"
+
 printf '\n%d passed, %d failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]

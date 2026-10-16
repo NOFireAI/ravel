@@ -278,22 +278,30 @@ print_oracle_summary() {
 # any absent real-run dependency fail the check.
 CHAOS_REAL_RUN_TOOLS=(curl docker jq)
 
-# The S3 client is always the pinned AWS CLI container image scripts/demo.sh
-# also uses, so check_dependencies only needs docker.
 chaos_have_command() {
   command -v "$1" >/dev/null 2>&1
 }
 
-# Report whether an S3 client is reachable, without starting anything.
+# The aws binary chaos_aws runs on the host, or nothing when it falls back to
+# the pinned container image: CHAOS_AWS when set, else `aws` on PATH.
+chaos_aws_host_binary() {
+  if [[ -n "${CHAOS_AWS:-}" ]]; then
+    printf '%s\n' "${CHAOS_AWS}"
+  elif chaos_have_command aws; then
+    command -v aws
+  else
+    return 1
+  fi
+}
+
+# Report whether an S3 client is reachable, without starting anything: a host
+# aws, or docker for the pinned image. The image is not pulled here (that
+# would touch the network).
 chaos_s3_client_available() {
-  # chaos_aws always runs the pinned AWS CLI image, so docker is the only path.
-  if chaos_have_command docker; then
-    # demo.sh drives the AWS CLI via `docker run`; docker presence is the gate
-    # for that path. We do not pull the image here (that would touch the
-    # network); we only report the capability exists.
+  if chaos_aws_host_binary >/dev/null; then
     return 0
   fi
-  return 1
+  chaos_have_command docker
 }
 
 # Report whether the ravel binaries are runnable: either prebuilt on PATH or
@@ -363,7 +371,12 @@ check_dependencies() {
   done
 
   if chaos_s3_client_available; then
-    echo "  OK    S3 client path available (docker)"
+    local host_aws
+    if host_aws="$(chaos_aws_host_binary)"; then
+      echo "  OK    aws CLI: host (${host_aws})"
+    else
+      echo "  OK    aws CLI: container ${CHAOS_AWS_CLI_IMAGE}"
+    fi
   else
     echo "  WARN  no S3 client (aws) and no docker: a real run cannot manage the store"
     warnings=$(( warnings + 1 ))
@@ -404,18 +417,24 @@ chaos_rustfs_healthy() {
     "${CHAOS_RUSTFS_ENDPOINT}/health" >/dev/null 2>&1
 }
 
-# Run one AWS CLI command against the chaos store, in the pinned container,
-# with the chaos credentials. Arguments are the aws subcommand and its flags.
+# Run one AWS CLI command against the chaos store with the chaos credentials:
+# the CHAOS_AWS binary when set, else an aws on PATH, else the pinned container
+# image. Arguments are the aws subcommand and its flags.
 chaos_aws() {
   # Credentials are exported in a subshell and passed by name, so the secret
-  # never reaches the docker argv or docker inspect (the same rule as dr_aws).
+  # never reaches an argv (the same rule as dr_aws).
   (
     export AWS_ACCESS_KEY_ID="${RAVEL_S3_ACCESS_KEY}"
     export AWS_SECRET_ACCESS_KEY="${RAVEL_S3_SECRET_KEY}"
     export AWS_DEFAULT_REGION="${RAVEL_S3_REGION}"
-    docker run --rm --network host \
+    export AWS_EC2_METADATA_DISABLED=true
+    local host_aws
+    if host_aws="$(chaos_aws_host_binary)"; then
+      exec "$host_aws" --endpoint-url "$CHAOS_RUSTFS_ENDPOINT" "$@"
+    fi
+    exec docker run --rm --network host \
       -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \
-      -e AWS_EC2_METADATA_DISABLED=true \
+      -e AWS_EC2_METADATA_DISABLED \
       "$CHAOS_AWS_CLI_IMAGE" \
       --endpoint-url "$CHAOS_RUSTFS_ENDPOINT" \
       "$@"
@@ -446,7 +465,9 @@ rustfs_up() {
     log "RustFS already running at ${CHAOS_RUSTFS_ENDPOINT}"
   else
     log "starting RustFS via docker compose"
-    docker compose -f "$CHAOS_RUSTFS_COMPOSE" up -d
+    # Only the rustfs service: the file's createbucket service pulls the AWS
+    # CLI image from ECR Public, and the bucket is created below by chaos_aws.
+    docker compose -f "$CHAOS_RUSTFS_COMPOSE" up -d rustfs
     CHAOS_STARTED_RUSTFS=1
     chaos_wait_for "RustFS to become healthy" 30 chaos_rustfs_healthy || return 1
   fi
