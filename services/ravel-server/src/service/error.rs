@@ -266,15 +266,12 @@ impl ServiceError {
 
         let (kind, status, error_type, message) = match err {
             EsqlError::Execution(inner) => return ServiceError::from_sql(inner, tenant_hash),
-            EsqlError::Parse(parse) => {
-                let at = parse.line_col(source);
-                (
-                    ServiceErrorKind::InvalidArgument,
-                    StatusCode::BAD_REQUEST,
-                    "bad_data",
-                    format!("line {}:{}: {parse}", at.line, at.column),
-                )
-            }
+            EsqlError::Parse(parse) => (
+                ServiceErrorKind::InvalidArgument,
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                esql_parse_message(&parse, source),
+            ),
             err @ EsqlError::Verification { .. } => (
                 ServiceErrorKind::Validation,
                 StatusCode::BAD_REQUEST,
@@ -387,6 +384,34 @@ impl ServiceError {
         };
         ServiceError::new(kind, api)
     }
+}
+
+/// The client message for an ES|QL statement that does not parse: `line L:C: `
+/// and the parser's own message, without the byte offset the parser's message
+/// also carries, so the body states the position once.
+#[cfg(feature = "esql")]
+pub(crate) fn esql_parse_message(parse: &ravel_esql::Error, source: &str) -> String {
+    let at = parse.line_col(source);
+    let start = parse.span().start;
+    let mut detail = parse.to_string();
+    for marker in [
+        format!(" starting at byte {start}"),
+        format!(" at byte {start}"),
+        format!(" (byte {start})"),
+    ] {
+        // The last occurrence, so text the statement quotes earlier in the
+        // message cannot be taken for the offset; and one not followed by a
+        // digit, so offset 1 does not match the start of 12.
+        let found = detail.rfind(&marker).filter(|&pos| {
+            !detail[pos + marker.len()..]
+                .starts_with(|c: char| c.is_ascii_digit())
+        });
+        if let Some(pos) = found {
+            detail.replace_range(pos..pos + marker.len(), "");
+            break;
+        }
+    }
+    format!("line {}:{}: {detail}", at.line, at.column)
 }
 
 /// The failure class, HTTP status and `errorType` tag a DDL failure class

@@ -155,7 +155,9 @@ same `--features` list to cargo.
 - `POST /api/v1/esql` runs one ES|QL statement over logs. The route is
   compiled in only with `--features esql`, which turns on `sql` too; the
   published image does not carry it. A statement outside the supported subset
-  is refused with a typed 400, never answered approximately. See
+  is refused with a 400, and one the planner cannot plan, or whose time window
+  is wider than the catalog serves, with a 422. None is answered
+  approximately. See
   [ES|QL queries](docs/guides/query.md#esql-queries).
 
   ```esql

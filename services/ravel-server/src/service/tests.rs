@@ -1399,6 +1399,82 @@ async fn esql_parse_error_takes_no_permit_and_reads_no_store() {
     assert_eq!(h.admission.in_flight(), 0);
 }
 
+/// A parse error's message states the statement position once, as
+/// `line L:C:`, and carries no byte offset: an unexpected token, an
+/// unterminated string and comment, a bad escape, a stray character, and a
+/// misplaced source command.
+#[cfg(feature = "esql")]
+#[test]
+fn esql_parse_error_states_its_position_once() {
+    let limits = ravel_esql::Limits::default();
+    for (text, line_col) in [
+        ("FROM logs\n| WHERE", "line 2:8: "),
+        ("ROW a = \"open", "line 1:9: "),
+        ("ROW a = 1 /* open", "line 1:11: "),
+        ("ROW a = \"\\q\"", "line 1:10: "),
+        ("ROW a = 1 ^ 2", "line 1:11: "),
+        ("ROW a = 1\n| ROW", "line 2:3: "),
+    ] {
+        let parse = ravel_esql::parse(text, &limits).expect_err(text);
+        let message = super::error::esql_parse_message(&parse, text);
+        assert!(message.starts_with(line_col), "{text:?}: {message}");
+        assert!(!message.contains("byte"), "{text:?}: {message}");
+        assert!(message.len() > line_col.len(), "{text:?}: {message}");
+    }
+}
+
+/// What the README and the HTTP reference say an ES|QL statement outside what
+/// this build runs gets: a parse error, a bind error and an unsupported
+/// construct are 400, while a statement the planner cannot plan and one whose
+/// window is wider than the catalog serves are 422.
+#[cfg(feature = "esql")]
+#[test]
+fn esql_refusals_are_400_and_plan_and_window_failures_are_422() {
+    use ravel_sql::esql::EsqlError;
+
+    let tenant_hash = tenant().hash();
+    let limits = ravel_esql::Limits::default();
+    let source = "FROM logs\n| WHERE";
+    let parse = ravel_esql::parse(source, &limits).expect_err("does not parse");
+    let refusals = [
+        (EsqlError::Parse(parse), source),
+        (
+            EsqlError::Verification {
+                message: "unknown column [x]".to_string(),
+                line: 1,
+                column: 1,
+            },
+            "",
+        ),
+        (
+            EsqlError::Unsupported {
+                name: "source [metrics]".to_string(),
+                line: 1,
+                column: 6,
+            },
+            "",
+        ),
+    ];
+    for (err, source) in refusals {
+        let err = ServiceError::from_esql(err, source, tenant_hash);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+        assert_eq!(err.error_type, "bad_data");
+    }
+
+    let window = ravel_sql::SqlError::Catalog(ravel_catalog::CatalogError::WindowTooWide {
+        estimate: 9,
+        limit: 8,
+    });
+    for err in [
+        EsqlError::Plan("no physical plan".to_string()),
+        EsqlError::Execution(window),
+    ] {
+        let err = ServiceError::from_esql(err, "FROM logs", tenant_hash);
+        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", err.message);
+        assert_eq!(err.error_type, "execution");
+    }
+}
+
 /// One ES|QL statement at the fixed clock's now, with `deadline` as its wall
 /// deadline and nothing else asked for.
 #[cfg(feature = "esql")]
