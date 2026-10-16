@@ -5,8 +5,10 @@ Amends ADR-2023 (the cost-based fetch policy's rate and the projection
 break-even); it is Accepted and carries an amendment section pointing here,
 added together with this document. ADR-1170 (the derived per-query SQL
 share) is still Proposed, so task B1 edits its share in place and cites this
-ADR there. ADR-0954 (spill) is not amended: see decision B2. No persistent
-format changes.
+ADR there. (See the ADR-1170 status correction below: B1 landed as an
+amendment section, and ADR-1170 has been Accepted since 2026-10-14.)
+ADR-0954 (spill) is not amended: see decision B2. No persistent format
+changes.
 
 Implemented: A1 to A3 in `crates/ravel-query/src/config.rs`,
 `crates/ravel-query/src/log_fetcher.rs` and `crates/ravel-sql/src/logs_scan/`,
@@ -384,3 +386,17 @@ config), `a_3mb_l0_object_reads_whole_on_the_reference_profile`,
 `logs_fast_path_projection_routing`), and
 `an_explicit_request_cost_flag_keeps_its_deployment_on_the_ranged_route`
 (ravel-server `logs_fetch_policy_e2e`).
+
+## Correction (2026-10-15): ADR-1170 is Accepted, and B1 amended it (issue #3016)
+
+<!-- amendment-supersedes: phrase="is still Proposed, so task B1 edits its share in place" pointer="ADR-1170 status correction" -->
+
+The status paragraph's sentence on ADR-1170 was written on 2026-10-03, while
+ADR-1170 was Proposed, as the plan for decision B1. B1 landed the same day
+(PR #2431, merged with this ADR's PR #2415) and did not edit ADR-1170's share
+in place: it added the section "Amendment (2026-10-03, ADR-2414 decision B1):
+the per-query SQL share is the tenant's share" at the end of ADR-1170, with an
+inline pointer beside the retired per-query figure in that ADR's "What the
+code does today", and that amendment cites this ADR. ADR-1170 moved to
+Accepted on 2026-10-14 and is partly implemented; its own status line names
+the decisions that are built. Decision B1 is unchanged.
