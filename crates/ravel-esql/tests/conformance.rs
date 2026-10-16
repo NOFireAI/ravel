@@ -88,14 +88,11 @@ fn a_full_toml_parser_reads_the_same_entries() {
             assert_eq!(field("refused_by"), entry.refused_by.as_deref());
             match &entry.expected {
                 None => {
-                    for key in ["columns", "rows", "order", "warnings", "release_error"] {
+                    for key in ["columns", "rows", "order", "warnings"] {
                         assert!(raw.get(key).is_none(), "{} {key}", entry.name);
                     }
                 }
-                Some(Expected::Error(message)) => {
-                    assert_eq!(field("release_error"), Some(message.as_str()));
-                }
-                Some(Expected::Answer { answer, order }) => {
+                Some(Expected { answer, order }) => {
                     let strings = |key: &str| -> Vec<&str> {
                         raw.get(key)
                             .and_then(toml::Value::as_array)

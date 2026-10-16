@@ -336,33 +336,29 @@ impl fmt::Display for Order {
     }
 }
 
-/// What the release returns for an entry's example.
+/// What the release returns for an entry's example: an answer, with the
+/// order its rows are compared on.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Expected {
-    /// An answer, with the order its rows are compared on.
-    Answer {
-        /// The answer.
-        answer: Answer,
-        /// How its rows compare.
-        order: Order,
-    },
-    /// An error, with the message the release gives.
-    Error(String),
+pub struct Expected {
+    /// The answer.
+    pub answer: Answer,
+    /// How its rows compare.
+    pub order: Order,
 }
+
+/// The divergences an entry can name: each has a normalisation that undoes
+/// exactly what it changes in Ravel's answer.
+pub const NORMALISED_DIVERGENCES: [&str; 3] = ["from-columns", "integer-literal", "now-type"];
 
 impl Expected {
     /// Whether `actual` is the release's answer: the same columns, names and
     /// types in order, the same warnings, and the same rows under the
     /// expected order. The error names the first difference found.
     pub fn compare(&self, actual: &Answer) -> Result<(), String> {
-        let (expected, order) = match self {
-            Expected::Error(message) => {
-                return Err(format!(
-                    "the release refuses the statement ({message}); Ravel answers it"
-                ));
-            }
-            Expected::Answer { answer, order } => (answer, order),
-        };
+        let Expected {
+            answer: expected,
+            order,
+        } = self;
         if actual.columns != expected.columns {
             return Err(format!(
                 "columns {} where the release has {}",
@@ -408,6 +404,161 @@ impl Expected {
         };
         if holds { Ok(()) } else { Err(rows_differ()) }
     }
+
+    /// Whether `actual`, Ravel's answer for an entry that names divergence
+    /// `id`, is the release's answer once exactly that divergence is undone.
+    /// An answer that already matches fails, since the entry then names a
+    /// divergence it does not show; so does one the normalisation does not
+    /// apply to, and one that still differs afterwards, naming the first
+    /// difference.
+    pub fn compare_divergent(&self, id: &str, actual: &Answer) -> Result<(), String> {
+        if self.compare(actual).is_ok() {
+            return Err(format!(
+                "Ravel gives the release's answer without undoing {id}, so the entry \
+                 does not show it"
+            ));
+        }
+        let normalised = undo_divergence(id, &self.answer, actual)
+            .map_err(|message| format!("cannot undo {id}: {message}"))?;
+        self.compare(&normalised)
+            .map_err(|message| format!("after undoing {id}: {message}"))
+    }
+}
+
+/// Ravel's answer with divergence `id` undone against the release's
+/// `expected` columns. Only what the divergence changes moves: a type it
+/// does not explain, a value, a row or a warning is left as Ravel gave it.
+fn undo_divergence(id: &str, expected: &Answer, actual: &Answer) -> Result<Answer, String> {
+    if let Some(row) = actual.rows.iter().find(|r| r.len() != actual.columns.len()) {
+        return Err(format!(
+            "a row of {} cells for {} columns",
+            row.len(),
+            actual.columns.len()
+        ));
+    }
+    match id {
+        "from-columns" => undo_from_columns(expected, actual),
+        "integer-literal" => retype(expected, actual, "long", "integer", |cell| match cell {
+            Cell::Long(value) if i32::try_from(*value).is_err() => {
+                Err(format!("{value} does not fit an integer"))
+            }
+            Cell::Long(_) | Cell::Null => Ok(cell.clone()),
+            other => Err(format!("{other:?} in a long column")),
+        }),
+        "now-type" => retype(expected, actual, "date_nanos", "date", |cell| match cell {
+            Cell::Null => Ok(Cell::Null),
+            Cell::Text(text) => millisecond_date(text).map(Cell::Text),
+            other => Err(format!("{other:?} in a date_nanos column")),
+        }),
+        other => Err(format!("divergence {other:?} has no normalisation")),
+    }
+}
+
+/// Ravel's columns reordered by name into the release's order, each row's
+/// cells moving with their column. The names must be the release's, in a
+/// different order.
+fn undo_from_columns(expected: &Answer, actual: &Answer) -> Result<Answer, String> {
+    let names = |columns: &[Column]| -> Vec<String> {
+        let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        names.sort();
+        names
+    };
+    if names(&actual.columns) != names(&expected.columns) {
+        return Err(format!(
+            "columns {} are not the release's {} in another order",
+            show_columns(&actual.columns),
+            show_columns(&expected.columns)
+        ));
+    }
+    let positions: Vec<usize> = expected
+        .columns
+        .iter()
+        .filter_map(|e| actual.columns.iter().position(|a| a.name == e.name))
+        .collect();
+    if positions.iter().enumerate().all(|(i, &p)| i == p) {
+        return Err("Ravel's columns are already in the release's order".to_owned());
+    }
+    Ok(Answer {
+        columns: positions
+            .iter()
+            .map(|&p| actual.columns[p].clone())
+            .collect(),
+        rows: actual
+            .rows
+            .iter()
+            .map(|row| positions.iter().map(|&p| row[p].clone()).collect())
+            .collect(),
+        warnings: actual.warnings.clone(),
+    })
+}
+
+/// Ravel's answer with each column of type `from`, where the release's
+/// column at the same position and of the same name is of type `to`, given
+/// type `to` and its cells passed through `cell`. At least one column must
+/// change.
+fn retype(
+    expected: &Answer,
+    actual: &Answer,
+    from: &str,
+    to: &str,
+    cell: impl Fn(&Cell) -> Result<Cell, String>,
+) -> Result<Answer, String> {
+    let retyped: Vec<usize> = actual
+        .columns
+        .iter()
+        .zip(&expected.columns)
+        .enumerate()
+        .filter(|(_, (a, e))| a.name == e.name && a.ty == from && e.ty == to)
+        .map(|(i, _)| i)
+        .collect();
+    if retyped.is_empty() {
+        return Err(format!(
+            "no {from} column where the release has {to}: columns {} against {}",
+            show_columns(&actual.columns),
+            show_columns(&expected.columns)
+        ));
+    }
+    let mut columns = actual.columns.clone();
+    for &i in &retyped {
+        columns[i].ty = to.to_owned();
+    }
+    let rows = actual
+        .rows
+        .iter()
+        .map(|row| {
+            row.iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    if retyped.contains(&i) {
+                        cell(c)
+                    } else {
+                        Ok(c.clone())
+                    }
+                })
+                .collect::<Result<Vec<Cell>, String>>()
+        })
+        .collect::<Result<Vec<Vec<Cell>>, String>>()?;
+    Ok(Answer {
+        columns,
+        rows,
+        warnings: actual.warnings.clone(),
+    })
+}
+
+/// A nanosecond date rendering (`…:SS.fffffffffZ`) as the release renders a
+/// date: three fraction digits. The six dropped digits must be zeros.
+fn millisecond_date(text: &str) -> Result<String, String> {
+    let shape = || format!("{text:?} is not a date rendered with nine fraction digits");
+    let body = text.strip_suffix('Z').ok_or_else(shape)?;
+    let (head, fraction) = body.rsplit_once('.').ok_or_else(shape)?;
+    if fraction.len() != 9 || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(shape());
+    }
+    let (millis, rest) = fraction.split_at(3);
+    if rest != "000000" {
+        return Err(format!("{text:?} has precision below a millisecond"));
+    }
+    Ok(format!("{head}.{millis}Z"))
 }
 
 /// Whether every row of `part` can be matched to a distinct row of `whole`.
@@ -726,6 +877,18 @@ pub fn load(text: &str) -> Result<Manifest, ManifestError> {
                 &format!("{:?}: no divergence has id {id:?}", entry.name),
             ));
         }
+        if let Some(id) = &entry.divergence
+            && !NORMALISED_DIVERGENCES.contains(&id.as_str())
+        {
+            return Err(field(
+                entry.line,
+                &format!(
+                    "{:?}: divergence {id:?} has no normalisation, so the entry's answer \
+                     could not be compared",
+                    entry.name
+                ),
+            ));
+        }
     }
     for (line, divergence) in &divergences {
         let named = entries
@@ -860,12 +1023,6 @@ fn read_entry(mut table: RawTable, section: Section) -> Result<Entry, ManifestEr
             ),
         ));
     }
-    if matches!(expected, Some(Expected::Error(_))) && divergence.is_none() {
-        return Err(field(
-            line,
-            &format!("{name:?}: an example the release refuses and Ravel runs is a divergence"),
-        ));
-    }
     if divergence.is_some() && !runs {
         return Err(field(
             line,
@@ -909,25 +1066,18 @@ fn read_entry(mut table: RawTable, section: Section) -> Result<Entry, ManifestEr
     })
 }
 
-/// Read an entry's expected answer from its `columns`, `rows`, `order`,
-/// `warnings` and `release_error` keys.
+/// Read an entry's expected answer from its `columns`, `rows`, `order` and
+/// `warnings` keys.
 fn read_expected(table: &mut RawTable, name: &str) -> Result<Option<Expected>, ManifestError> {
     let line = table.line;
     let columns = table.take_optional_strings("columns")?;
     let rows = table.take_optional_strings("rows")?;
     let order = table.take_optional_string("order")?;
     let warnings = table.take_optional_strings("warnings")?;
-    let release_error = table.take_optional_string("release_error")?;
     let wrong = |message: &str| field(line, &format!("{name:?}: {message}"));
-    match (columns, rows, order, warnings, release_error) {
-        (None, None, None, None, None) => Ok(None),
-        (None, None, None, None, Some(message)) => {
-            if message.is_empty() {
-                return Err(wrong("release_error is empty"));
-            }
-            Ok(Some(Expected::Error(message)))
-        }
-        (Some(columns), Some(rows), Some(order), Some(warnings), None) => {
+    match (columns, rows, order, warnings) {
+        (None, None, None, None) => Ok(None),
+        (Some(columns), Some(rows), Some(order), Some(warnings)) => {
             let columns = columns
                 .iter()
                 .map(|text| match text.rsplit_once(':') {
@@ -975,7 +1125,7 @@ fn read_expected(table: &mut RawTable, name: &str) -> Result<Option<Expected>, M
                 }
                 _ => {}
             }
-            Ok(Some(Expected::Answer {
+            Ok(Some(Expected {
                 answer: Answer {
                     columns,
                     rows,
@@ -985,7 +1135,7 @@ fn read_expected(table: &mut RawTable, name: &str) -> Result<Option<Expected>, M
             }))
         }
         _ => Err(wrong(
-            "an answer needs columns, rows, order and warnings together, and no release_error",
+            "an answer needs columns, rows, order and warnings together",
         )),
     }
 }
@@ -1332,8 +1482,10 @@ impl Manifest {
         writeln!(
             out,
             "Ran and diverged: {}, released entries whose example runs and \
-             gives an answer that differs from the release's by a known \
-             divergence.",
+             gives an answer that differs from the release's by exactly one \
+             known divergence: the answer differs as given, and undoing that \
+             divergence in it gives the release's columns, types, rows and \
+             warnings.",
             self.divergent()
         )?;
         writeln!(out)?;
@@ -1977,7 +2129,7 @@ evidence = "a.rs::t"
     fn a_running_entry_carries_the_release_answer() {
         let manifest = load(&format!("{ENTRY}{RUNS}")).expect("loads");
         let entry = &manifest.entries[2];
-        let Some(Expected::Answer {
+        let Some(Expected {
             answer: expected,
             order,
         }) = &entry.expected
@@ -2011,7 +2163,7 @@ evidence = "a.rs::t"
         assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
         let text = ENTRY.replacen(
             "evidence = \"a.rs::t\"",
-            "release_error = \"x\"\nevidence = \"a.rs::t\"",
+            "order = \"exact\"\nevidence = \"a.rs::t\"",
             1,
         );
         assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
@@ -2022,16 +2174,198 @@ evidence = "a.rs::t"
     }
 
     #[test]
-    fn a_release_error_needs_a_divergence() {
-        let text = format!("{ENTRY}{RUNS}").replacen(
+    fn an_entry_names_only_a_divergence_with_a_normalisation() {
+        let renamed = format!("{ENTRY}{RUNS}").replace("\"integer-literal\"", "\"widening\"");
+        let error = load(&renamed).expect_err("no normalisation");
+        assert!(
+            error.to_string().contains("has no normalisation"),
+            "{error}"
+        );
+        let release_error = format!("{ENTRY}{RUNS}").replacen(
             "columns = [\"a:integer\", \"b:keyword\"]\nrows = [\n  '[1, \"x\"]',\n]\n\
                  order = \"exact\"\nwarnings = []\n",
             "release_error = \"refused\"\n",
             1,
         );
-        assert!(load(&text).is_ok(), "{:?}", load(&text).err());
-        let text = text.replacen("divergence = \"integer-literal\"\n", "", 1);
-        assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
+        assert!(matches!(
+            load(&release_error),
+            Err(ManifestError::Field { .. })
+        ));
+    }
+
+    fn divergent(expected: &Answer, order: Order) -> Expected {
+        Expected {
+            answer: expected.clone(),
+            order,
+        }
+    }
+
+    #[test]
+    fn a_divergent_answer_compares_in_full_once_the_divergence_is_undone() {
+        let text = |t: &str| Cell::Text(t.to_owned());
+        let release = answer(
+            &[("a", "keyword"), ("b", "long")],
+            vec![
+                vec![text("x"), Cell::Long(1)],
+                vec![text("y"), Cell::Long(2)],
+            ],
+        );
+        let expected = divergent(&release, Order::Exact);
+        let ravel = answer(
+            &[("b", "long"), ("a", "keyword")],
+            vec![
+                vec![Cell::Long(1), text("x")],
+                vec![Cell::Long(2), text("y")],
+            ],
+        );
+        assert_eq!(expected.compare_divergent("from-columns", &ravel), Ok(()));
+        let mut changed = ravel.clone();
+        changed.rows[1][0] = Cell::Long(3);
+        let error = expected
+            .compare_divergent("from-columns", &changed)
+            .expect_err("a changed value");
+        assert!(
+            error.starts_with("after undoing from-columns: rows"),
+            "{error}"
+        );
+        let mut retyped = ravel.clone();
+        retyped.columns[0].ty = "integer".to_owned();
+        let error = expected
+            .compare_divergent("from-columns", &retyped)
+            .expect_err("a changed type");
+        assert!(
+            error.starts_with("after undoing from-columns: columns"),
+            "{error}"
+        );
+        let warned = Answer {
+            warnings: vec!["w".to_owned()],
+            ..ravel.clone()
+        };
+        let error = expected
+            .compare_divergent("from-columns", &warned)
+            .expect_err("a warning");
+        assert!(
+            error.starts_with("after undoing from-columns: warnings"),
+            "{error}"
+        );
+        let error = expected
+            .compare_divergent("from-columns", &release)
+            .expect_err("no divergence shown");
+        assert!(error.contains("without undoing"), "{error}");
+        let swapped_rows = answer(
+            &[("a", "keyword"), ("b", "long")],
+            vec![
+                vec![text("y"), Cell::Long(2)],
+                vec![text("x"), Cell::Long(1)],
+            ],
+        );
+        let error = expected
+            .compare_divergent("from-columns", &swapped_rows)
+            .expect_err("columns already in order");
+        assert!(error.contains("already in the release's order"), "{error}");
+        let renamed = answer(&[("c", "long"), ("a", "keyword")], ravel.rows.clone());
+        let error = expected
+            .compare_divergent("from-columns", &renamed)
+            .expect_err("another column");
+        assert!(error.starts_with("cannot undo from-columns"), "{error}");
+        let error = expected
+            .compare_divergent("integer-literal", &ravel)
+            .expect_err("a divergence the answer does not show");
+        assert!(error.starts_with("cannot undo integer-literal"), "{error}");
+        let error = expected
+            .compare_divergent("attribute-fallback", &ravel)
+            .expect_err("no normalisation");
+        assert!(error.contains("has no normalisation"), "{error}");
+    }
+
+    #[test]
+    fn an_integer_literal_is_read_as_an_integer_only_where_the_release_has_one() {
+        let release = answer(
+            &[("a", "integer"), ("b", "long")],
+            vec![vec![Cell::Long(3), Cell::Long(4)]],
+        );
+        let expected = divergent(&release, Order::Exact);
+        let ravel = answer(
+            &[("a", "long"), ("b", "long")],
+            vec![vec![Cell::Long(3), Cell::Long(4)]],
+        );
+        assert_eq!(
+            expected.compare_divergent("integer-literal", &ravel),
+            Ok(())
+        );
+        let mut changed = ravel.clone();
+        changed.rows[0][0] = Cell::Long(4);
+        let error = expected
+            .compare_divergent("integer-literal", &changed)
+            .expect_err("a changed value");
+        assert!(
+            error.starts_with("after undoing integer-literal: rows"),
+            "{error}"
+        );
+        let wide = answer(
+            &[("a", "long"), ("b", "long")],
+            vec![vec![Cell::Long(1 << 40), Cell::Long(4)]],
+        );
+        let error = expected
+            .compare_divergent("integer-literal", &wide)
+            .expect_err("a value past 32 bits");
+        assert!(error.contains("does not fit an integer"), "{error}");
+        let both = divergent(
+            &answer(&[("a", "integer"), ("b", "integer")], release.rows.clone()),
+            Order::Exact,
+        );
+        assert_eq!(both.compare_divergent("integer-literal", &ravel), Ok(()));
+        let double = answer(
+            &[("a", "double"), ("b", "long")],
+            vec![vec![Cell::Double(3.0), Cell::Long(4)]],
+        );
+        let error = expected
+            .compare_divergent("integer-literal", &double)
+            .expect_err("a double is not a widened integer");
+        assert!(error.starts_with("cannot undo integer-literal"), "{error}");
+    }
+
+    #[test]
+    fn now_is_read_as_a_millisecond_date_only_where_the_release_has_one() {
+        let release = answer(
+            &[("t", "date")],
+            vec![vec![Cell::Text("2023-11-14T22:23:00.000Z".to_owned())]],
+        );
+        let expected = divergent(&release, Order::Exact);
+        let ravel = |rendered: &str| {
+            answer(
+                &[("t", "date_nanos")],
+                vec![vec![Cell::Text(rendered.to_owned())]],
+            )
+        };
+        assert_eq!(
+            expected.compare_divergent("now-type", &ravel("2023-11-14T22:23:00.000000000Z")),
+            Ok(())
+        );
+        let error = expected
+            .compare_divergent("now-type", &ravel("2023-11-14T22:23:01.000000000Z"))
+            .expect_err("a changed value");
+        assert!(error.starts_with("after undoing now-type: rows"), "{error}");
+        let error = expected
+            .compare_divergent("now-type", &ravel("2023-11-14T22:23:00.000000500Z"))
+            .expect_err("sub-millisecond precision");
+        assert!(error.contains("below a millisecond"), "{error}");
+        let error = expected
+            .compare_divergent("now-type", &ravel("2023-11-14T22:23:00Z"))
+            .expect_err("another rendering");
+        assert!(error.contains("nine fraction digits"), "{error}");
+        let error = expected
+            .compare_divergent(
+                "now-type",
+                &answer(
+                    &[("t", "keyword")],
+                    vec![vec![Cell::Text(
+                        "2023-11-14T22:23:00.000000000Z".to_owned(),
+                    )]],
+                ),
+            )
+            .expect_err("a keyword is not a date_nanos");
+        assert!(error.starts_with("cannot undo now-type"), "{error}");
     }
 
     #[test]
@@ -2090,7 +2424,7 @@ evidence = "a.rs::t"
 
     #[test]
     fn the_comparison_names_the_first_difference() {
-        let expected = Expected::Answer {
+        let expected = Expected {
             answer: answer(
                 &[("a", "long")],
                 vec![vec![Cell::Long(1)], vec![Cell::Long(2)]],
@@ -2129,10 +2463,7 @@ evidence = "a.rs::t"
                 .expect_err("warning")
                 .starts_with("warnings")
         );
-        let refused = Expected::Error("no".to_owned());
-        assert!(refused.compare(&same).is_err());
-
-        let multiset = Expected::Answer {
+        let multiset = Expected {
             answer: answer(&[("a", "long")], same.rows.clone()),
             order: Order::Multiset,
         };
@@ -2142,7 +2473,7 @@ evidence = "a.rs::t"
             vec![vec![Cell::Long(1)], vec![Cell::Long(1)]],
         );
         assert!(multiset.compare(&doubled).is_err());
-        let any = Expected::Answer {
+        let any = Expected {
             answer: answer(&[("a", "long")], same.rows.clone()),
             order: Order::Any(1),
         };
@@ -2162,7 +2493,7 @@ evidence = "a.rs::t"
                 .collect::<Vec<_>>()
         };
         let columns = [("k", "long"), ("v", "keyword")];
-        let expected = Expected::Answer {
+        let expected = Expected {
             answer: answer(&columns, rows([(1, "a"), (1, "b"), (2, "c")])),
             order: Order::Key(vec!["k".to_owned()]),
         };

@@ -19,10 +19,10 @@ Each figure counts released entries only; development-only commands are listed b
 | Figure | Score | What counts |
 |---|---|---|
 | Syntax coverage | 84/84 | released entries with a parser rule of their own whose example the parser accepts |
-| Execution compatibility | 17/260 | released entries whose example runs and gives the release's answer, columns, types, rows and warnings; a valid entry Ravel refuses or answers differently is a gap |
+| Execution compatibility | 24/260 | released entries whose example runs and gives the release's answer, columns, types, rows and warnings; a valid entry Ravel refuses or answers differently is a gap |
 | Transport compatibility | 0/13 | options of the Elasticsearch query endpoint that Ravel serves |
 
-Ran and diverged: 34/260, released entries whose example runs and gives an answer that differs from the release's by a known divergence.
+Ran and diverged: 27/260, released entries whose example runs and gives an answer that differs from the release's by exactly one known divergence: the answer differs as given, and undoing that divergence in it gives the release's columns, types, rows and warnings.
 
 Ran: 51/260, released entries whose example runs, whether or not the answer matches.
 
@@ -37,10 +37,10 @@ Negative statements: 14, each refused by the parser. They are counted on this li
 | source_command | 5 | 5/5 | 2/5 | 0/5 |
 | processing_command | 20 | 20/20 | 8/20 | 2/20 |
 | directive | 1 | 1/1 | 0/1 | 0/1 |
-| syntax | 19 | 19/19 | 8/19 | 2/19 |
+| syntax | 19 | 19/19 | 8/19 | 5/19 |
 | function | 152 | 152/152 | 7/152 | 6/152 |
 | alias | 9 | 9/9 | 0/9 | 0/9 |
-| operator | 26 | 26/26 | 19/26 | 0/26 |
+| operator | 26 | 26/26 | 19/26 | 4/26 |
 | type | 22 | 22/22 | 7/22 | 7/22 |
 | parameter | 6 | 6/6 | 0/6 | 0/6 |
 
@@ -112,7 +112,7 @@ Released entries whose example cannot reach the form without an earlier construc
 
 Valid statements Ravel answers differently from the release, each pinned by a test. The list is not shown to be complete: no test compares a Ravel answer with the released 9.5.5 binary, only with answers written by hand in the manifest, so a divergence nobody wrote down is not found.
 
-- **An unmapped field reads an attribute key** (`attribute-fallback`). A field name that is not a native column or a typed attribute column resolves to the log record's attribute of that key, read as a keyword, and reads null where a record lacks it (ADR-2887 D10 rule 4). The release reports an unknown column. Test: `crates/ravel-sql/tests/esql/binder.rs::an_attribute_reads_null_when_absent`. Shown by: `STATS BY`, `STATS aggregate WHERE`, `SORT NULLS FIRST and LAST`, `==`, `!=`, `IN`, `NOT IN`.
+- **An unmapped field reads an attribute key** (`attribute-fallback`). A field name that is not a native column or a typed attribute column resolves to the log record's attribute of that key, read as a keyword, and reads null where a record lacks it (ADR-2887 D10 rule 4). The release reports an unknown column. Test: `crates/ravel-sql/tests/esql/binder.rs::an_attribute_reads_null_when_absent`. No entry shows it: The release refuses a statement that names an unmapped field, so an example showing the divergence has no release answer to compare Ravel's with.
 - **@timestamp and message shadow attributes** (`shadowing`). @timestamp and message always name the record's timestamp and body; an attribute with either key is not reachable under that name. Test: `crates/ravel-sql/tests/esql/manifest.rs::timestamp_and_message_shadow_attributes_of_the_same_name`. No entry shows it: The logs fixture carries no attribute named @timestamp or message, so no example run on it can reach a shadowed attribute.
 - **No rows after the query clock without an upper bound** (`clock-bound`). A statement with no upper bound on @timestamp and no request end returns no record later than the query clock (the ADR-2887 D11 amendment). Test: `crates/ravel-sql/tests/esql/window.rs::a_lower_bound_alone_returns_rows_up_to_the_clock_on_every_layout`. No entry shows it: Every record of the logs fixture is earlier than its query clock, so no example run on it returns a record the bound removes.
 - **Expression depth limit of 24** (`depth-limit`). A statement that binds to an expression deeper than 24 is refused with a verification error. Test: `crates/ravel-sql/tests/esql/limits.rs::an_expression_past_the_depth_limit_is_refused`. No entry shows it: No example binds to an expression deeper than 24.
@@ -180,10 +180,10 @@ Grammar is `own` for a form the parser has a rule for, and `call`, `cast` or `fi
 | syntax | `FROM remote source` |  |  | own | supported | refused | refused |  | remote cluster | `FROM remote:logs` |
 | syntax | `FROM METADATA` |  |  | own | supported | refused | refused |  |  | `FROM logs METADATA _index` |
 | syntax | `FROM subquery` |  | yes | own | supported | refused | refused |  |  | `FROM logs, (FROM logs \| WHERE dur > 5)` |
-| syntax | `STATS BY` |  |  | own | supported | supported | supported | `attribute-fallback` |  | `FROM logs \| STATS c = COUNT(*) BY service` |
-| syntax | `STATS aggregate WHERE` |  |  | own | supported | supported | supported | `attribute-fallback` |  | `FROM logs \| STATS c = COUNT(*) WHERE severity_num > 10 BY service` |
+| syntax | `STATS BY` |  |  | own | supported | supported | supported |  |  | `FROM logs \| STATS c = COUNT(*) BY region` |
+| syntax | `STATS aggregate WHERE` |  |  | own | supported | supported | supported |  |  | `FROM logs \| STATS c = COUNT(*) WHERE severity_num > 10 BY region` |
 | syntax | `RENAME with =` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| RENAME msg = message` |
-| syntax | `SORT NULLS FIRST and LAST` |  |  | own | supported | supported | supported | `attribute-fallback` |  | `FROM logs \| SORT dur ASC NULLS FIRST, service DESC NULLS LAST` |
+| syntax | `SORT NULLS FIRST and LAST` |  |  | own | supported | supported | supported |  |  | `FROM logs \| SORT region DESC NULLS LAST, dur ASC NULLS FIRST \| KEEP message` |
 | syntax | `LIMIT BY` |  | yes | own | supported | refused | refused |  |  | `FROM logs \| LIMIT 1 BY service` |
 | syntax | `DISSECT APPEND_SEPARATOR` |  |  | own | supported | refused | refused |  |  | `FROM logs \| DISSECT message "%{+a} %{+a}" APPEND_SEPARATOR = "-"` |
 | syntax | `ENRICH WITH` |  |  | own | supported | refused | refused |  | enrich policy | `FROM logs \| ENRICH regions_policy ON region WITH country = name` |
@@ -358,8 +358,8 @@ Grammar is `own` for a form the parser has a rule for, and `call`, `cast` or `fi
 | operator | `OR` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE dur > 10 OR dur < 5` |
 | operator | `AND` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE dur > 1 AND dur < 20` |
 | operator | `NOT` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE NOT dur > 10` |
-| operator | `==` |  |  | own | supported | supported | supported | `attribute-fallback` |  | `FROM logs \| WHERE service == "api"` |
-| operator | `!=` |  |  | own | supported | supported | supported | `attribute-fallback` |  | `FROM logs \| WHERE service != "api"` |
+| operator | `==` |  |  | own | supported | supported | supported |  |  | `FROM logs \| WHERE message == "b" \| KEEP message, dur` |
+| operator | `!=` |  |  | own | supported | supported | supported |  |  | `FROM logs \| WHERE message != "a" \| KEEP message` |
 | operator | `<` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE dur < 10` |
 | operator | `<=` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE dur <= 10` |
 | operator | `>` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE dur > 10` |
@@ -372,8 +372,8 @@ Grammar is `own` for a form the parser has a rule for, and `call`, `cast` or `fi
 | operator | `unary -` |  |  | own | supported | supported | supported | `integer-literal` |  | `ROW a = -(1 + 2)` |
 | operator | `IS NULL` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE dur IS NULL` |
 | operator | `IS NOT NULL` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE dur IS NOT NULL` |
-| operator | `IN` |  |  | own | supported | supported | supported | `attribute-fallback` |  | `FROM logs \| WHERE service IN ("api", "web")` |
-| operator | `NOT IN` |  |  | own | supported | supported | supported | `attribute-fallback` |  | `FROM logs \| WHERE service NOT IN ("api")` |
+| operator | `IN` |  |  | own | supported | supported | supported |  |  | `FROM logs \| WHERE message IN ("a", "b") \| KEEP message` |
+| operator | `NOT IN` |  |  | own | supported | supported | supported |  |  | `FROM logs \| WHERE message NOT IN ("a") \| KEEP message` |
 | operator | `IN subquery` |  | yes | own | supported | refused | refused |  |  | `FROM logs \| WHERE service IN (FROM logs \| WHERE dur > 5 \| KEEP service)` |
 | operator | `LIKE` |  |  | own | supported | refused | refused |  |  | `FROM logs \| WHERE message LIKE "a*"` |
 | operator | `NOT LIKE` |  |  | own | supported | refused | refused |  |  | `FROM logs \| WHERE message NOT LIKE "a*"` |

@@ -87,10 +87,18 @@ fn cell(ty: &EsqlType, array: &ArrayRef, row: usize) -> Cell {
 
 /// Ravel's answer in the manifest's terms. The outcome has no field that
 /// carries a warning (`an_overflow_gives_null_without_a_warning` destructures
-/// it), so the warnings are always empty.
+/// it), so the warnings are always empty. Each batch must carry the
+/// outcome's columns by name, in order, before cells pair by position.
 fn answer(outcome: &EsqlOutcome) -> Answer {
     let mut rows = Vec::new();
+    let names: Vec<&str> = outcome.columns.iter().map(|c| c.name.as_str()).collect();
     for batch in outcome.output().batches() {
+        let schema = batch.schema();
+        let batch_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(
+            batch_names, names,
+            "a batch's columns are not the outcome's columns"
+        );
         for row in 0..batch.num_rows() {
             rows.push(
                 outcome
@@ -118,8 +126,9 @@ fn answer(outcome: &EsqlOutcome) -> Answer {
 
 /// Every entry marked binder-supported prepares, and every entry marked
 /// executor-supported runs on the fixture and gives the answer the manifest
-/// records for the release, column names, types, rows and warnings, unless
-/// it names a divergence, in which case its answer must differ.
+/// records for the release, column names, types, rows and warnings. An entry
+/// that names a divergence gives that answer once exactly that divergence is
+/// undone, and must not give it without the undo.
 #[tokio::test]
 async fn every_executor_supported_entry_gives_the_release_answer() {
     let manifest = load();
@@ -158,17 +167,18 @@ async fn every_executor_supported_entry_gives_the_release_answer() {
             continue;
         };
         let actual = answer(&outcome);
-        match (expected.compare(&actual), &entry.divergence) {
-            (Ok(()), None) => compatible += 1,
-            (Err(_), Some(_)) => divergent += 1,
-            (Err(difference), None) => wrong.push(format!(
-                "{} differs from the release with no named divergence: {difference}",
-                describe(entry)
-            )),
-            (Ok(()), Some(id)) => wrong.push(format!(
-                "{} names divergence {id:?} but gives the release's answer",
-                describe(entry)
-            )),
+        match &entry.divergence {
+            None => match expected.compare(&actual) {
+                Ok(()) => compatible += 1,
+                Err(difference) => wrong.push(format!(
+                    "{} differs from the release with no named divergence: {difference}",
+                    describe(entry)
+                )),
+            },
+            Some(id) => match expected.compare_divergent(id, &actual) {
+                Ok(()) => divergent += 1,
+                Err(difference) => wrong.push(format!("{}: {difference}", describe(entry))),
+            },
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -529,14 +539,14 @@ async fn the_comparison_reports_a_changed_value_and_a_changed_type() {
     let entry = manifest.released().find(|e| e.name == "SUM").expect("SUM");
     let outcome = run(&fixture().await, &entry.example).await.expect("runs");
     let actual = answer(&outcome);
-    let Some(Expected::Answer {
+    let Some(Expected {
         answer: release,
         order,
     }) = entry.expected.clone()
     else {
         panic!("SUM records an answer");
     };
-    let with = |answer: Answer| Expected::Answer {
+    let with = |answer: Answer| Expected {
         answer,
         order: order.clone(),
     };
@@ -547,4 +557,39 @@ async fn the_comparison_reports_a_changed_value_and_a_changed_type() {
     let mut ty = release;
     ty.columns[0].ty = "double".to_string();
     assert!(with(ty).compare(&actual).is_err());
+}
+
+/// A divergent entry's rows are compared after the undo: a changed row value
+/// in the release's answer fails the WHERE entry (from-columns: the first
+/// row's dur, 20, as 21) and the `ROW a = 7 / 2` entry (integer-literal: 3
+/// as 4), each naming the rows.
+#[tokio::test]
+async fn a_divergent_entry_fails_on_a_changed_row_value() {
+    let manifest = load();
+    let fixture = fixture().await;
+    for (kind, name, id, column, value) in [
+        ("processing_command", "WHERE", "from-columns", 1, 21),
+        ("operator", "/", "integer-literal", 0, 4),
+    ] {
+        let entry = manifest
+            .released()
+            .find(|e| e.kind.as_str() == kind && e.name == name)
+            .unwrap_or_else(|| panic!("{kind} {name}"));
+        assert_eq!(entry.divergence.as_deref(), Some(id), "{name}");
+        let expected = entry.expected.clone().expect("an answer");
+        let outcome = run(&fixture, &entry.example).await.expect("runs");
+        let actual = answer(&outcome);
+        assert_eq!(expected.compare_divergent(id, &actual), Ok(()), "{name}");
+        let mut changed = expected.clone();
+        let first = changed.answer.rows.first_mut().expect("a row");
+        assert_eq!(first[column], Cell::Long(value - 1), "{name}");
+        first[column] = Cell::Long(value);
+        let error = changed
+            .compare_divergent(id, &actual)
+            .expect_err("a changed value");
+        assert!(
+            error.starts_with(&format!("after undoing {id}: rows")),
+            "{name}: {error}"
+        );
+    }
 }

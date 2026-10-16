@@ -5,10 +5,10 @@
 # reference for the 9.5 line. No part of the Elasticsearch source tree was
 # fetched, opened, copied or paraphrased to write it: not its grammar, its
 # function registry, its documentation sources or its test fixtures. It has
-# NOT been reconciled with the released 9.5 binary (ADR-2887 D3), so an entry
-# can be missing, misnamed, or carry the wrong preview flag; an entry whose
-# release status is in doubt carries `unverified = true` and a comment saying
-# why.
+# NOT been reconciled with the released 9.5.5 binary (ADR-2887 D3), so an
+# entry can be missing, misnamed, or carry the wrong preview flag; an entry
+# whose release status is in doubt carries `unverified = true` and a comment
+# saying why.
 #
 # `docs/esql-conformance.md` is generated from this file:
 #
@@ -80,14 +80,18 @@
 #           native columns at the types Ravel gives them and maps no
 #           `service` field, and evaluates NOW() at the fixture's query
 #           clock.
-# release_error
-#           Instead of the four keys above: the error the release gives for
-#           an example Ravel runs, without its line:column prefix. Always
-#           paired with a divergence.
 # divergence
 #           The id of the known divergence that makes Ravel's answer differ
 #           from the release's. The entry then counts as divergent: in the
-#           denominator, not compatible.
+#           denominator, not compatible. Its answer is still compared in
+#           full: the test undoes exactly that divergence in Ravel's answer
+#           and requires the result to be the release's answer, and fails
+#           an entry whose answer matches without the undo. from-columns
+#           reorders Ravel's columns by name into the release's order, the
+#           cells moving with them; integer-literal reads a long column as
+#           integer where the release's column is integer; now-type reads a
+#           date_nanos column as date where the release's column is date,
+#           rendered to the millisecond. No other divergence can be named.
 # refusal   Binder-refused entries only: the text the binder's typed
 #           refusal names the form by, when it is not the name in brackets.
 # refused_by
@@ -604,12 +608,17 @@ kind = "syntax"
 grammar = "own"
 name = "STATS BY"
 preview = false
-example = 'FROM logs | STATS c = COUNT(*) BY service'
+example = 'FROM logs | STATS c = COUNT(*) BY region'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-release_error = "Unknown column [service]"
-divergence = "attribute-fallback"
+columns = ["c:long", "region:keyword"]
+rows = [
+  '[1, "eu"]',
+  '[5, null]',
+]
+order = "multiset"
+warnings = []
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -617,12 +626,17 @@ kind = "syntax"
 grammar = "own"
 name = "STATS aggregate WHERE"
 preview = false
-example = 'FROM logs | STATS c = COUNT(*) WHERE severity_num > 10 BY service'
+example = 'FROM logs | STATS c = COUNT(*) WHERE severity_num > 10 BY region'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-release_error = "Unknown column [service]"
-divergence = "attribute-fallback"
+columns = ["c:long", "region:keyword"]
+rows = [
+  '[0, "eu"]',
+  '[4, null]',
+]
+order = "multiset"
+warnings = []
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -653,12 +667,21 @@ kind = "syntax"
 grammar = "own"
 name = "SORT NULLS FIRST and LAST"
 preview = false
-example = 'FROM logs | SORT dur ASC NULLS FIRST, service DESC NULLS LAST'
+example = 'FROM logs | SORT region DESC NULLS LAST, dur ASC NULLS FIRST | KEEP message'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-release_error = "Unknown column [service]"
-divergence = "attribute-fallback"
+columns = ["message:keyword"]
+rows = [
+  '["a"]',
+  '["c"]',
+  '["f"]',
+  '["d"]',
+  '["e"]',
+  '["b"]',
+]
+order = "exact"
+warnings = []
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -873,12 +896,16 @@ kind = "operator"
 grammar = "own"
 name = "=="
 preview = false
-example = 'FROM logs | WHERE service == "api"'
+example = 'FROM logs | WHERE message == "b" | KEEP message, dur'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-release_error = "Unknown column [service]"
-divergence = "attribute-fallback"
+columns = ["message:keyword", "dur:long"]
+rows = [
+  '["b", 20]',
+]
+order = "exact"
+warnings = []
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -886,12 +913,20 @@ kind = "operator"
 grammar = "own"
 name = "!="
 preview = false
-example = 'FROM logs | WHERE service != "api"'
+example = 'FROM logs | WHERE message != "a" | KEEP message'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-release_error = "Unknown column [service]"
-divergence = "attribute-fallback"
+columns = ["message:keyword"]
+rows = [
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
+]
+order = "multiset"
+warnings = []
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -1113,12 +1148,17 @@ kind = "operator"
 grammar = "own"
 name = "IN"
 preview = false
-example = 'FROM logs | WHERE service IN ("api", "web")'
+example = 'FROM logs | WHERE message IN ("a", "b") | KEEP message'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-release_error = "Unknown column [service]"
-divergence = "attribute-fallback"
+columns = ["message:keyword"]
+rows = [
+  '["a"]',
+  '["b"]',
+]
+order = "multiset"
+warnings = []
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -1126,12 +1166,20 @@ kind = "operator"
 grammar = "own"
 name = "NOT IN"
 preview = false
-example = 'FROM logs | WHERE service NOT IN ("api")'
+example = 'FROM logs | WHERE message NOT IN ("a") | KEEP message'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-release_error = "Unknown column [service]"
-divergence = "attribute-fallback"
+columns = ["message:keyword"]
+rows = [
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
+]
+order = "multiset"
+warnings = []
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -3969,6 +4017,7 @@ id = "attribute-fallback"
 name = "an unmapped field reads an attribute key"
 description = "A field name that is not a native column or a typed attribute column resolves to the log record's attribute of that key, read as a keyword, and reads null where a record lacks it (ADR-2887 D10 rule 4). The release reports an unknown column."
 evidence = "crates/ravel-sql/tests/esql/binder.rs::an_attribute_reads_null_when_absent"
+no_entry = "The release refuses a statement that names an unmapped field, so an example showing the divergence has no release answer to compare Ravel's with."
 
 [[divergence]]
 id = "shadowing"
