@@ -1598,17 +1598,21 @@ def conc(qps):
 '
 # Catches: a QPS band that stays inconclusive when both arms ran the
 # concurrent phase, or compares the wrong way: B's 0.9 against 0.95 x A's 1.0
-# misses.
+# misses. Also catches fetch not printing a round's overran note (B's round
+# ran 700 s of a nominal 600) or printing one for a round that has none.
 edit_arm "$TMP/fixture-pass" "$TMP/fixture-qps-a" "$CONC_PY"'
 r["concurrent"] = conc(1.0)'
 as_arm_b "$TMP/fixture-pass" "$TMP/fixture-qps-b" "$CONC_PY"'
-r["concurrent"] = conc(0.9)'
+r["concurrent"] = conc(0.9)
+r["concurrent"]["rounds"][0].update(wall_s=700.0, overran={"wall_s": 700.0, "duration_s": 600})'
 fixture run-qps "$TMP/fixture-qps-a" "$TMP/fixture-qps-b"
 fetch qps run-qps --timeout 30
 if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *qps_pooled >= 0.95 x A  *0.900  *0.950$' "$TMP/fetch-qps.out" \
   && grep -q '^PASS  *B vs A  *concurrent error_ratio_weighted <= A + 0.02  *0.000  *0.020$' "$TMP/fetch-qps.out" \
   && grep -q '^concurrent B round 1: qps 0.900 error_ratio 0.000 ' "$TMP/fetch-qps.out" \
   && grep -q '^concurrent B pooled: qps_pooled 0.900 error_ratio_weighted 0.000 ' "$TMP/fetch-qps.out" \
+  && grep -q '^concurrent B round 1 overran: wall 700.0 s against a nominal 600 s, more than 10% over; ' "$TMP/fetch-qps.out" \
+  && [ "$(grep -c ' overran: ' "$TMP/fetch-qps.out")" = 1 ] \
   && [ "$(grep -c '^MISS' "$TMP/fetch-qps.out")" = 1 ]; then
   pass "a QPS under the ratio misses when both arms measured it"
 else
@@ -1999,6 +2003,26 @@ if [ -z "$out" ]; then
   pass "a round with no call has QPS null and stays out of qps_pooled"
 else
   fail "no-call round" "$out"
+fi
+
+# Catches: a round that ran more than 10% past its nominal duration not
+# marked "overran" with both figures, one within 10% marked, or the overrun
+# changing the QPS formula (successful calls over the nominal duration).
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+ok = [{"http_status": 200, "curl_exit": 0}] * 20
+for wall, want in ((11.5, {"wall_s": 11.5, "duration_s": 10}), (10.9, None), (10.0, None)):
+    rd = kit.concurrent_round({"round": 1, "duration_s": 10, "wall_s": wall, "connections": 1}, ok)
+    if rd["overran"] != want or rd["qps"] != 2.0:
+        print("wall", wall, rd)
+PY
+)"
+if [ -z "$out" ]; then
+  pass "a round more than 10% over its nominal duration is marked overran with both figures, its QPS formula unchanged"
+else
+  fail "overran round" "$out"
 fi
 
 # Catches: a 200 whose transfer then failed counted as a success, where

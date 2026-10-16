@@ -617,7 +617,11 @@ naming the key.
   otherwise, and a round's QPS is its successful calls over its nominal
   duration (`concurrent_duration_s`, not the measured wall time), 0 when
   the round made calls and none succeeded and null only when it made no
-  call; its error ratio is errors over calls. A 2xx
+  call; its error ratio is errors over calls. Because a call in flight at
+  the deadline still counts while QPS divides by the nominal duration, a
+  round whose `wall_s` exceeds `concurrent_duration_s` by more than 10
+  percent carries an `overran` note with both figures (null otherwise), and
+  `fetch.sh` prints it beside that round; the QPS formula is unchanged. A 2xx
   answer with the wrong row count is a success under that rule and is
   counted separately as `wrong_answer`; `outcome` and `refusal_class` stay
   in the call lines as diagnostics. `results.json`'s `concurrent` block

@@ -846,16 +846,29 @@ def concurrent_answers(d):
     print("settled %d calls, %d wrong answers" % (settled, wrong))
 
 
+# A round whose wall time exceeds its nominal duration by more than this
+# fraction is marked "overran".
+OVERRUN_FRACTION = 0.10
+
+
 def concurrent_round(meta, calls):
+    """One round's figures. Its qps divides by the nominal duration while a
+    call in flight at the deadline still counts, so a round that ran well past
+    its deadline reads high; such a round carries "overran" with both
+    figures, else null. The formula itself follows upstream."""
     duration = meta["duration_s"]
     ok = sum(1 for c in calls if _ok_2xx(c))
     err = len(calls) - ok
+    overran = None
+    if meta["wall_s"] > duration * (1 + OVERRUN_FRACTION):
+        overran = {"wall_s": meta["wall_s"], "duration_s": duration}
     return {
         "round": meta["round"], "duration_s": duration, "wall_s": meta["wall_s"],
         "connections": meta["connections"], "calls": len(calls), "ok": ok, "err": err,
         "wrong_answer": sum(1 for c in calls if c.get("refusal_class") == "wrong_answer"),
         "qps": ok / float(duration) if calls else None,
         "error_ratio": err / float(len(calls)) if calls else None,
+        "overran": overran,
     }
 
 
@@ -987,6 +1000,12 @@ def concurrent_detail(bands_dir, a_json, a_tgz, b_json, b_tgz):
                   "wall %.1f s of %s s)" % (arm, rd["round"], _fmt(rd["qps"]),
                                             _fmt(rd["error_ratio"]), rd["ok"], rd["err"],
                                             rd["wrong_answer"], rd["wall_s"], rd["duration_s"]))
+            if rd.get("overran"):
+                print("concurrent %s round %d overran: wall %.1f s against a nominal %s s, more "
+                      "than %d%% over; its qps counts calls that finished after the deadline "
+                      "over the nominal duration, so it reads high"
+                      % (arm, rd["round"], rd["overran"]["wall_s"], rd["overran"]["duration_s"],
+                         round(OVERRUN_FRACTION * 100)))
         p = conc["pooled"]
         print("concurrent %s pooled: qps_pooled %s error_ratio_weighted %s "
               "error_ratio_mean_of_rounds %s (ok %d, err %d over %d rounds; the bands judge "
