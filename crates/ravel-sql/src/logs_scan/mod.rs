@@ -13,7 +13,11 @@
 //!   min(total_block_count.max(1))`. This lets a query touching fewer segments
 //!   than `target_partitions` still fan out to `target_partitions` partitions:
 //!   the old segment-granular rule (`min(target_partitions, segment_count)`)
-//!   pinned such a query to at most `segment_count` partitions.
+//!   pinned such a query to at most `segment_count` partitions. Under a
+//!   confirmed ascending `ts` TopK the list is instead every row group sorted
+//!   by its blocks' least minimum `ts` across all segments, an unplanned
+//!   segment by its own minimum ([`global_deal`]), so each partition reads the
+//!   earliest row groups first.
 //! - **Un-cached: segment-granular.** Each segment is assigned whole to one
 //!   partition (relevant segment `j` in snapshot order to partition `j % n`),
 //!   so every segment is opened by exactly one partition. The partition count is
@@ -1356,8 +1360,10 @@ struct BlockMetrics {
     /// `Opening` polls that returned `Pending`, the count of times this
     /// partition yielded to the runtime with an open in flight.
     open_pending_polls: Count,
-    /// Segments this partition opened (first opens only; the `attrs_raw`
-    /// reopen counts under [`Self::reopens`]).
+    /// Owned segments this partition opened (on the striped path, owned
+    /// shares of a segment, several of one segment under [`global_deal`];
+    /// first opens only, the `attrs_raw` reopen counts under
+    /// [`Self::reopens`]).
     segments_opened: Count,
     /// Wall time in `ReopenRows` opens (the `attrs_raw` fallback), kept apart
     /// from [`Self::open_elapsed`] so a fallback's second open is visible.
@@ -2986,6 +2992,7 @@ impl ExecutionPlan for LogsScanExec {
                     Arc::clone(&self.segments),
                     self.target_partitions,
                     self.stripe_blocks,
+                    self.active_topk().is_some(),
                     blocks.plan_init_elapsed.clone(),
                 );
                 (VecDeque::new(), false, LogScanState::Planning(counts_fut))
