@@ -10,11 +10,16 @@ sha_a = "FILL-IN-BASELINE-COMMIT"
 sha_b = "FILL-IN-CANDIDATE-COMMIT"
 
 # Lanes whose band files the run is judged by, and the phases box/run.sh runs
-# in order. `benchmark` (the 43 statements over HTTP, cold and hot) is the only
-# phase, and `rlog` the only lane. The parquet lane (clickbench_parquet_bench,
-# bands/parquet.toml) is not run by the kit yet; check-run refuses it.
+# in order. `rlog` is the only lane. The parquet lane (clickbench_parquet_bench,
+# bands/parquet.toml) is not run by the kit yet; check-run refuses it. Phases:
+#   benchmark   the 43 statements over HTTP, cold and hot; required
+#   concurrent  upstream ClickBench's bench_concurrent_qps, concurrent_rounds
+#               times (keys below)
+#   q29_probe   q29 alone on a restarted server, warmed up, then timed
+#   perf        one hot call per statement under perf record, kept as folded
+#               stacks; refused unless perf_record = true
 lanes = ["rlog"]
-phases = ["benchmark"]
+phases = ["benchmark", "concurrent", "q29_probe"]
 
 # Which sections of each lane's band file the run is judged by: "relative"
 # (arm B against arm A, in fetch.sh) and "absolute" (each arm on its own, on
@@ -74,6 +79,22 @@ audit_mode = "off"
 # statement is sent with an explicit start and end window_hours apart, ending
 # when the verify step starts, as sql_latency_bench --window-hours does;
 # without one the server reads only the last hour.
+
+# Optional phase keys, each shown at its default. launch.sh writes any left out
+# into the run.toml it uploads, at its default, and check-run refuses a value
+# of the wrong type, naming the key.
+# Concurrent phase: rounds back to back, connections per round, each round's
+# nominal duration in seconds, and the seed each connection's statement order
+# is drawn from (sha256 of "<seed>-<connection>").
+# concurrent_rounds = 3
+# concurrent_connections = 10
+# concurrent_duration_s = 600
+# concurrent_seed = "clickbench"
+# q29 probe: untimed warmup calls, then timed runs.
+# q29_probe_warmup = 1
+# q29_probe_runs = 3
+# perf phase: must be true for phases to name perf.
+# perf_record = false
 
 # One band file per lane, relative to the repository root.
 [bands]
