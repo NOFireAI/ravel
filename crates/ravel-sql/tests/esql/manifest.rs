@@ -6,7 +6,9 @@
 
 use datafusion::arrow::array::{Array, ArrayRef, TimestampNanosecondArray};
 use datafusion::arrow::util::display::array_value_to_string;
+use ravel_esql::ast::{BinaryOp, Command, Expr, Query};
 use ravel_esql::manifest::{self, Answer, Cell, Column, Entry, Expected, Manifest, State};
+use ravel_esql::{Limits, Span};
 use ravel_sql::esql::{EsqlError, EsqlOutcome, EsqlType, MAX_BOUND_NODES, PreparedEsql};
 
 use crate::support::{
@@ -219,27 +221,142 @@ fn starts_with_token(text: &str, marker: &str) -> bool {
     })
 }
 
+/// The binder's name for an expression kind it has no binding for. It names
+/// no construct, so a refusal by this name is matched by where the refused
+/// expression lies, never by its name.
+const ANY_EXPRESSION: &str = "this expression";
+
+/// Every expression in the WHERE conditions of `query`, through the
+/// operands of unary, binary and IN subquery expressions.
+fn where_expressions(query: &Query) -> Vec<&Expr> {
+    fn push<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+        out.push(expr);
+        match expr {
+            Expr::Unary(unary) => push(&unary.operand, out),
+            Expr::Binary(binary) => {
+                push(&binary.left, out);
+                push(&binary.right, out);
+            }
+            Expr::InSubquery(in_subquery) => push(&in_subquery.expr, out),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for command in &query.processing {
+        if let Command::Where(filter) = command {
+            push(&filter.condition, &mut out);
+        }
+    }
+    out
+}
+
+/// `example` with the text `span` covers replaced by `null`.
+fn nulled(example: &str, span: Span) -> String {
+    format!("{}null{}", &example[..span.start], &example[span.end..])
+}
+
+/// Whether an `ANY_EXPRESSION` refusal at `line`:`column` of `example` is
+/// the refusal of the one expression the entry named `owner` is about, and
+/// of no other expression starting where it starts. The error carries only
+/// where the refused expression starts, so its end is pinned by two
+/// replacements: replacing the expression with `null` must remove the
+/// refusal, which rules out an expression enclosing it, and replacing its
+/// operand that starts there with `null` must keep it, which rules out that
+/// operand and anything inside it.
+fn refuses_own_expression(
+    owner: &str,
+    example: &str,
+    line: usize,
+    column: usize,
+) -> Result<(), String> {
+    let is_own: fn(&Expr) -> bool = match owner {
+        "IN subquery" => |e| matches!(e, Expr::InSubquery(_)),
+        "AND" => |e| matches!(e, Expr::Binary(b) if b.op == BinaryOp::And),
+        _ => {
+            return Err(format!(
+                "{owner:?} names no expression kind a {ANY_EXPRESSION:?} refusal is placed against"
+            ));
+        }
+    };
+    let query = ravel_esql::parse(example, &Limits::default())
+        .map_err(|error| format!("the example does not parse: {error:?}"))?;
+    let own: Vec<&Expr> = where_expressions(&query)
+        .into_iter()
+        .filter(|e| is_own(e))
+        .collect();
+    let [expr] = own.as_slice() else {
+        return Err(format!(
+            "the example's WHERE conditions hold {} {owner} expressions, not one",
+            own.len()
+        ));
+    };
+    let span = expr.span();
+    let start = span.line_col(example);
+    if (line, column) != (start.line, start.column) {
+        return Err(format!(
+            "the refusal is at {line}:{column}, not at {}:{} where the {owner} expression starts",
+            start.line, start.column
+        ));
+    }
+    let refused_here = |source: &str| {
+        matches!(
+            prepare(source),
+            Err(EsqlError::Unsupported { name, line: l, column: c })
+                if name == ANY_EXPRESSION && (l, c) == (line, column)
+        )
+    };
+    if refused_here(&nulled(example, span)) {
+        return Err(format!(
+            "the refusal at {line}:{column} stays with the {owner} expression replaced by null, so it refuses an expression enclosing it"
+        ));
+    }
+    let operand = match expr {
+        Expr::InSubquery(in_subquery) => Some(&*in_subquery.expr),
+        Expr::Binary(binary) => Some(&*binary.left),
+        _ => None,
+    };
+    if let Some(operand) = operand.filter(|o| o.span().start == span.start)
+        && !refused_here(&nulled(example, operand.span()))
+    {
+        return Err(format!(
+            "the refusal at {line}:{column} goes with the {owner} expression's left operand replaced by null, so it refuses that operand"
+        ));
+    }
+    Ok(())
+}
+
 /// Whether `prepared` is the binder's refusal of `entry`: an `Unsupported`
 /// error naming the entry's construct as a whole token, or, for an entry
 /// refused through an earlier construct, naming that construct. A refused
 /// source command is named "this source command", so for it the text at the
-/// refusal's position must start with the construct as a whole token; no
-/// other refusal is matched by position, since an expression starts where an
-/// infix form whose left operand it is starts.
+/// refusal's position must start with the construct as a whole token. A
+/// refusal named `ANY_EXPRESSION` must be of exactly the expression the
+/// construct is about (`refuses_own_expression`), since an expression starts
+/// where an infix form whose left operand it is starts. No other refusal is
+/// matched by position.
 fn binder_refusal(
     manifest: &Manifest,
     entry: &Entry,
     prepared: &Result<PreparedEsql, EsqlError>,
 ) -> Result<(), String> {
-    let marker = match &entry.refused_by {
+    let (owner, marker) = match &entry.refused_by {
         Some(by) => manifest
             .released()
             .find(|e| &e.name == by)
-            .map(Entry::refusal_marker)
+            .map(|e| (e.name.clone(), e.refusal_marker()))
             .ok_or_else(|| format!("refused_by {by:?} names no released entry"))?,
-        None => entry.refusal_marker(),
+        None => (entry.name.clone(), entry.refusal_marker()),
     };
     match prepared {
+        Err(EsqlError::Unsupported { name, line, column }) if marker == ANY_EXPRESSION => {
+            if name == ANY_EXPRESSION {
+                refuses_own_expression(&owner, &entry.example, *line, *column)
+            } else {
+                Err(format!(
+                    "the refusal names {name:?} at {line}:{column}, not {marker:?}"
+                ))
+            }
+        }
         Err(EsqlError::Unsupported { name, line, column }) => {
             let at = text_at(&entry.example, *line, *column);
             if names_token(name, &marker)
@@ -354,8 +471,32 @@ fn binder_refused(example: &str, refusal: &str) -> Manifest {
     )
 }
 
+/// `binder_refused` for an entry named `name`.
+fn named_binder_refused(name: &str, example: &str, refusal: &str) -> Manifest {
+    named_entry(
+        name,
+        example,
+        "supported",
+        "refused",
+        "refused",
+        &format!("refusal = \"{refusal}\"\n"),
+    )
+}
+
 /// `one_entry` with `extra` appended to the entry's table.
 fn entry_with(example: &str, parser: &str, binder: &str, executor: &str, extra: &str) -> Manifest {
+    named_entry("X", example, parser, binder, executor, extra)
+}
+
+/// `entry_with` for an entry named `name`.
+fn named_entry(
+    name: &str,
+    example: &str,
+    parser: &str,
+    binder: &str,
+    executor: &str,
+    extra: &str,
+) -> Manifest {
     manifest::load(&format!(
         r#"
 [release]
@@ -366,7 +507,7 @@ reconciled = false
 [[entry]]
 kind = "syntax"
 grammar = "own"
-name = "X"
+name = "{name}"
 preview = false
 example = '{example}'
 parser = "{parser}"
@@ -489,7 +630,10 @@ async fn a_refusal_marker_matches_a_whole_token() {
 
 /// A refusal of "this expression" reports where the refused expression
 /// starts, which is also where an infix form whose left operand it is
-/// starts, so it is matched by its name and never by the text there.
+/// starts, so it is never matched by the text there, and it satisfies only
+/// the entry whose own expression is exactly the one refused: the IN
+/// subquery entry, not the AND entry whose left operand that IN subquery
+/// is, and no entry with no expression kind to place it against.
 #[tokio::test]
 async fn a_refused_left_operand_does_not_name_the_infix_form() {
     let fixture = fixture().await;
@@ -504,9 +648,74 @@ async fn a_refused_left_operand_does_not_name_the_infix_form() {
         wrong[0].contains("the refusal names \"this expression\" at 1:19"),
         "{wrong:#?}"
     );
+    let (refused, wrong) = check_refusals(
+        &named_binder_refused("IN subquery", example, "this expression"),
+        &fixture,
+    )
+    .await;
+    assert_eq!((refused, wrong.len()), (1, 0), "{wrong:#?}");
+    let (refused, wrong) = check_refusals(
+        &named_binder_refused("AND", example, "this expression"),
+        &fixture,
+    )
+    .await;
+    assert_eq!(refused, 0);
+    assert!(
+        wrong[0].contains(
+            "the refusal at 1:19 goes with the AND expression's left operand replaced by null, so it refuses that operand"
+        ),
+        "{wrong:#?}"
+    );
     let (refused, wrong) =
         check_refusals(&binder_refused(example, "this expression"), &fixture).await;
-    assert_eq!((refused, wrong.len()), (1, 0), "{wrong:#?}");
+    assert_eq!(refused, 0);
+    assert!(
+        wrong[0].contains("\"X\" names no expression kind"),
+        "{wrong:#?}"
+    );
+}
+
+/// The IN subquery entry's own example is refused as "this expression" at
+/// the IN expression's start, and an IN subquery whose refusal falls
+/// elsewhere, or whose example holds two, does not satisfy it.
+#[tokio::test]
+async fn an_in_subquery_refusal_is_placed_at_the_in_expression() {
+    let fixture = fixture().await;
+    let manifest = load();
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|e| e.name == "IN subquery")
+        .expect("the manifest has an IN subquery entry");
+    assert_eq!(entry.refusal.as_deref(), Some(ANY_EXPRESSION));
+    let own = entry.example.as_str();
+    assert_eq!(
+        own,
+        "FROM logs | WHERE service IN (FROM logs | WHERE dur > 5 | KEEP service)"
+    );
+    assert!(matches!(
+        prepare(own),
+        Err(EsqlError::Unsupported { ref name, line: 1, column: 19 }) if name == ANY_EXPRESSION
+    ));
+    assert_eq!(refuses_own_expression("IN subquery", own, 1, 19), Ok(()));
+    assert_eq!(
+        refuses_own_expression("IN subquery", own, 1, 20),
+        Err(
+            "the refusal is at 1:20, not at 1:19 where the IN subquery expression starts"
+                .to_string()
+        )
+    );
+    let two = "FROM logs | WHERE dur IN (FROM logs | KEEP dur) OR dur IN (FROM logs | KEEP dur)";
+    let (refused, wrong) = check_refusals(
+        &named_binder_refused("IN subquery", two, "this expression"),
+        &fixture,
+    )
+    .await;
+    assert_eq!(refused, 0);
+    assert!(
+        wrong[0].contains("hold 2 IN subquery expressions, not one"),
+        "{wrong:#?}"
+    );
 }
 
 #[test]
