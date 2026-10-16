@@ -258,7 +258,11 @@ mod tests {
         ] {
             let err = build_query(body(json).expect("body"), 0, MAX).expect_err(json);
             assert_eq!(err.status, StatusCode::BAD_REQUEST, "{json}");
-            assert!(err.message.contains("\"params\""), "{json}: {}", err.message);
+            assert!(
+                err.message.contains("\"params\""),
+                "{json}: {}",
+                err.message
+            );
         }
     }
 

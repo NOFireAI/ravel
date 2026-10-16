@@ -402,10 +402,9 @@ pub(crate) fn esql_parse_message(parse: &ravel_esql::Error, source: &str) -> Str
         // The last occurrence, so text the statement quotes earlier in the
         // message cannot be taken for the offset; and one not followed by a
         // digit, so offset 1 does not match the start of 12.
-        let found = detail.rfind(&marker).filter(|&pos| {
-            !detail[pos + marker.len()..]
-                .starts_with(|c: char| c.is_ascii_digit())
-        });
+        let found = detail
+            .rfind(&marker)
+            .filter(|&pos| !detail[pos + marker.len()..].starts_with(|c: char| c.is_ascii_digit()));
         if let Some(pos) = found {
             detail.replace_range(pos..pos + marker.len(), "");
             break;

@@ -611,7 +611,11 @@ mod with_esql {
         assert_eq!(body["errorType"], "bad_data");
         let message = body["error"].as_str().expect("error message");
         assert!(message.starts_with("line 2:"), "{message}");
-        assert_eq!(fx.ops.query_reads(), before, "a malformed statement reads nothing");
+        assert_eq!(
+            fx.ops.query_reads(),
+            before,
+            "a malformed statement reads nothing"
+        );
 
         let (status, body) = fx.esql("FROM logs | LIMIT 1").await;
         assert_eq!(status, 200, "{body}");

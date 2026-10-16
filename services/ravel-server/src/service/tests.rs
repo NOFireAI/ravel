@@ -1470,7 +1470,12 @@ fn esql_refusals_are_400_and_plan_and_window_failures_are_422() {
         EsqlError::Execution(window),
     ] {
         let err = ServiceError::from_esql(err, "FROM logs", tenant_hash);
-        assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", err.message);
+        assert_eq!(
+            err.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            err.message
+        );
         assert_eq!(err.error_type, "execution");
     }
 }
@@ -1511,7 +1516,8 @@ fn harness_with_held_tenant_config(audit_sink: Arc<dyn QueryAuditSink>) -> (Harn
         audit_sink,
         None,
     );
-    let catalog = Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = ravel_sql::SqlExecutor::new(
         catalog,
         ravel_query::SegmentFetcher::new(Arc::clone(&store)),
@@ -1532,7 +1538,10 @@ fn harness_with_held_tenant_config(audit_sink: Arc<dyn QueryAuditSink>) -> (Harn
     };
     let h = Harness {
         service: h.service.with_sql(sql.clone()),
-        transports: Transports { sql, ..h.transports },
+        transports: Transports {
+            sql,
+            ..h.transports
+        },
         ..h
     };
     (h, gate)
@@ -1579,7 +1588,12 @@ async fn esql_declared_column_read_runs_inside_the_deadline() {
     assert_eq!(esql.error_type, "timeout");
     assert_eq!(esql.status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
-        (esql.kind, esql.status, esql.error_type, esql.message.as_str()),
+        (
+            esql.kind,
+            esql.status,
+            esql.error_type,
+            esql.message.as_str()
+        ),
         (sql.kind, sql.status, sql.error_type, sql.message.as_str()),
     );
 }
