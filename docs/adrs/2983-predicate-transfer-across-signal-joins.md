@@ -1,6 +1,7 @@
 # ADR-2983: Predicate transfer across signal joins
 
-Status: Proposed (2026-10-14). Needs owner approval before any code.
+Status: Accepted (2026-10-15). Not implemented: no code before the gates in
+Sequencing are met.
 Date: 2026-10-14
 Issue: #2983.
 Builds on: ADR-2904 (cross-signal SQL statements), ADR-2707 (exact-key
