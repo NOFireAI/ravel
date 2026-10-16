@@ -136,7 +136,9 @@ cat >"$STUBS/curl" <<'STUB'
 # the check-refuse file exists, answered 503 (curl exit 22 under
 # --fail-with-body); while the check-hang file exists it is never answered, as
 # a server that accepts the connection and then hangs: curl exits 28 after its
-# --max-time, or never returns without one. STUB_SQL_TRUNCATE_N names a statement whose answer
+# --max-time, or never returns without one. STUB_SQL_TIMEOUT_N names a
+# statement whose call times out at once (curl exit 28, status 000).
+# STUB_SQL_TRUNCATE_N names a statement whose answer
 # prints status 200 and then fails the transfer (curl exit 18). A SQL call
 # logs its request body to
 # sql-bodies, writes an answer to -o and prints "<status> <seconds>":
@@ -210,7 +212,11 @@ case "$url" in
     try="${out##*-}"
     try="${try%.json}"
     { cat "$body"; echo; } >>"$STUB_DIR/sql-bodies"
-    if [ "$n" = "${STUB_SQL_TRUNCATE_N:-none}" ]; then
+    if [ "$n" = "${STUB_SQL_TIMEOUT_N:-none}" ]; then
+      printf '000 0.3'
+      echo "curl: (28) Operation timed out" >&2
+      exit 28
+    elif [ "$n" = "${STUB_SQL_TRUNCATE_N:-none}" ]; then
       printf '{"status":"success","data":{"col' >"$out"
       printf '200 0.2'
       echo "curl: (18) transfer closed with outstanding read data remaining" >&2
@@ -2593,6 +2599,38 @@ if [ "$code" = 0 ] && [ "$in_window" = 0 ] && [ -z "$out" ]; then
   pass "a concurrent round starts no python3 in its timed window and still reports wrong answers after it"
 else
   fail "concurrent harness cost" "exit $code, python3 started $in_window times in the window: $(head -n 2 "$STUB_DIR/py-window" 2>/dev/null) $out $(tail -n 3 "$TMP/py-window.log")"
+fi
+
+# Catches: a client timeout's error naming a limit the call never had: the
+# concurrent phase sets none, so its error says so, and a call with a limit
+# names that limit rather than query_timeout_s.
+BOX_X="$TMP/box-timeout-text"
+lib_box "$BOX_X"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_X/lib-setup.sh"
+  export STUB_SQL_TIMEOUT_N=07
+  phase_requests "$OUT/concurrent" || exit 1
+  start_server || exit 1
+  RQ_MAX_TIME="" run_query concurrent 07 q07 1 "$OUT/concurrent/requests/07.json" || exit 1
+  RQ_MAX_TIME=7 run_query concurrent 07 q07 2 "$OUT/concurrent/requests/07.json" || exit 1
+  stop_server
+) >"$TMP/timeout-text.log" 2>&1
+code=$?
+out="$(python3 - "$BOX_X/kit/out/concurrent/calls.jsonl" <<'PY' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+want = [("timeout", 28, "transfer timed out (curl exit 28) with no client time limit set"),
+        ("timeout", 28, "no answer within 7 s")]
+got = [(c["outcome"], c["curl_exit"], c["error"]) for c in calls]
+if got != want:
+    print("got", got)
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "a client timeout names the call's own limit, or says it had none"
+else
+  fail "timeout error text" "exit $code: $out $(tail -n 3 "$TMP/timeout-text.log")"
 fi
 
 # Catches: a perf phase that fails after perf record and leaves the raw

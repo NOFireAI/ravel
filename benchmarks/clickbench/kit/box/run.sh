@@ -804,7 +804,11 @@ run_query() {
   if [ "$code" -eq 28 ]; then
     RQ_OUTCOME=timeout
     RQ_CLASS=client_timeout
-    err="no answer within ${QUERY_TIMEOUT_S} s"
+    if [ -n "$limit" ]; then
+      err="no answer within $limit s"
+    else
+      err="transfer timed out (curl exit 28) with no client time limit set"
+    fi
   elif [ "${RQ_HTTP:-000}" = 000 ]; then
     RQ_OUTCOME=unreachable
     RQ_CLASS=transport
