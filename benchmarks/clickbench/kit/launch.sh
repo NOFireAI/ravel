@@ -9,9 +9,10 @@
 # s3:GetObject the run's in/ prefix and s3:PutObject its out/ prefix (refusing
 # with the role's name otherwise), tars the kit with a SHA256SUMS sidecar,
 # uploads kit.tgz, kit.sha256 (a record; the box does not read it) and
-# run.toml to s3://<bucket>/<prefix>/runs/<run-id>/in/, and launches arm A and
-# arm B under that run id. Each instance gets the instance profile, a 500 GB
-# gp3 root volume, --instance-initiated-shutdown-behavior terminate, and a
+# run.toml to s3://<bucket>/<prefix>/runs/<run-id>/in/ (the given run.toml
+# with every phase key it left out, concurrent_rounds through perf_record,
+# written in at its default), and launches arm A and arm B under that run id.
+# Each instance gets the instance profile, a 500 GB gp3 root volume, --instance-initiated-shutdown-behavior terminate, and a
 # user-data that arms `shutdown -h +600`, downloads kit.tgz and run.toml with
 # the instance role, checks them against the sha256 digests written into the
 # user-data itself, checks SHA256SUMS inside the kit, writes the arm name to /root/kit/ARM and starts
@@ -225,7 +226,8 @@ done <"$STAGE/kit-files" >"$STAGE/SHA256SUMS"
   || { echo "launch: SHA256SUMS does not list every kit file" >&2; exit 1; }
 mv "$STAGE/SHA256SUMS" "$STAGE/kit/SHA256SUMS"
 COPYFILE_DISABLE=1 tar -czf "$STAGE/in/kit.tgz" -C "$STAGE" kit
-cp "$RUN_TOML" "$STAGE/in/run.toml"
+kit_py resolved-run "$RUN_TOML" "$STAGE/in/run.toml" \
+  || { echo "launch: cannot write the resolved run.toml" >&2; exit 1; }
 (cd "$STAGE/in" && sha256 kit.tgz run.toml >kit.sha256)
 # The user-data carries these two digests itself and the box checks against
 # them, so rewriting kit.tgz and kit.sha256 in S3 together does not pass.

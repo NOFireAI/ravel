@@ -21,12 +21,29 @@ min_both_answered = 43
 # Each statement both arms answered must return the same row count on B as on
 # A; a difference is a miss naming the statement. No key: there is no
 # tolerance.
-# Pooled error ratio (failed or wrong-answer calls over all calls) at most
-# arm A's plus this.
+# Pooled error ratio (failed or wrong-answer calls over all calls of the
+# benchmark phase only; concurrent has its own band below, and q29_probe and
+# perf calls are not counted) at most arm A's plus this.
 error_pooled_max_delta = 0.02
-# Queries per second at least this times arm A's. Inconclusive until a
-# concurrency phase exists.
+# Concurrent queries per second: arm B's qps_pooled (the mean of its rounds'
+# QPS, each round's successful calls over its nominal duration, a round with
+# calls but no success counted as 0 and only a round with no call left out) at
+# least this times arm A's. Inconclusive when the concurrent phase did not run
+# on both arms or arm A had no successful call. Basis: the 0.95 this file carried before the concurrent phase existed,
+# kept by issue #2873.
 qps_min_ratio = 0.95
+# Concurrent error ratio: arm B's error_ratio_weighted (non-2xx calls over all
+# concurrent calls, summed across rounds) at most arm A's plus this. The
+# results.json concurrent block also reports error_ratio_mean_of_rounds, the
+# mean of each round's ratio, only for comparison with earlier readouts; no
+# band judges it. Inconclusive when the phase did not run on both arms.
+# Basis: issue #2873, the same 0.02 as error_pooled_max_delta.
+concurrent_error_pooled_max_delta = 0.02
+# q29 probe: arm B's min_s (the fastest timed run, warmup excluded) at most
+# this times arm A's. Inconclusive when the probe did not run on both arms or
+# a run failed on arm A; a failed run on arm B is a miss. Basis: issue #2873,
+# the same 1.15 as hot_statement_max_ratio.
+q29_probe_max_ratio = 1.15
 # Each statement's hot time at most max(ratio x A's, floor), so noise on a
 # sub-floor statement is not a miss.
 hot_statement_max_ratio = 1.15
@@ -42,7 +59,16 @@ cold_sum_max_ratio = 1.05
 [absolute]
 hot_sum_s_max = "FILL-IN-ON-REFERENCE-MACHINE"
 cold_sum_s_max = "FILL-IN-ON-REFERENCE-MACHINE"
+# Pooled error ratio over the benchmark phase's calls only, as above.
 error_pooled_max = "FILL-IN-ON-REFERENCE-MACHINE"
+# Concurrent qps_pooled at least this, error_ratio_weighted at most this, and
+# the q29 probe's min_s in seconds at most this. Each is inconclusive when its
+# phase did not run. Basis: none yet; each is set from the reference machine's
+# first paired run (issue #2873), and until then a run that selects
+# "absolute" is refused.
+concurrent_qps_min = "FILL-IN-ON-REFERENCE-MACHINE"
+concurrent_error_pooled_max = "FILL-IN-ON-REFERENCE-MACHINE"
+q29_probe_s_max = "FILL-IN-ON-REFERENCE-MACHINE"
 
 # Each statement's hot time in seconds, keyed by its id's qNN prefix. A
 # statement that did not answer misses its band.

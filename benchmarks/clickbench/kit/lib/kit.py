@@ -24,8 +24,22 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                write DIR/NN.json ({"query", "start", "end"})
                                and DIR/index.tsv (NN, statement id, expected
                                row count or -) per statement
+  resolved-run FILE OUT        write FILE to OUT with each phase key FILE
+                               leaves out set to its default
   phases OUT PHASE...          print per-phase call and error counts from
                                OUT/<phase>/calls.jsonl as JSON
+  permutation SEED CONN NQ     print connection CONN's statement order, as
+                               upstream bench_concurrent_qps draws it
+  concurrent-summary DIR       print the concurrent block from DIR's
+                               rounds.jsonl and calls.jsonl as JSON
+  q29-summary DIR              print the q29_probe block from DIR/calls.jsonl
+  fold-perf                    fold `perf script` output on stdin into one
+                               `stack count` line per distinct stack
+  concurrent-detail BANDS_DIR A.json A.tgz B.json B.tgz
+                               print each arm's per-round and pooled concurrent
+                               figures and, on a missed concurrent error band,
+                               that arm's errors by statement from its
+                               evidence tarball
   assemble ARGS...             write results.json from the box's phase output
   validate FILE                refuse a results.json missing a field the
                                shape below requires
@@ -46,15 +60,20 @@ null: an HTTP answer carries no executor accounting, as on the Flight lane.
 min_ms (hot) is the best of tries 2 and 3 and cold_ms is try 1; median_ms and
 max_ms run over all three tries. The report says so in its own
 timing_definition string, because SqlLatencyReport's min_ms runs over all
-three. The kit's own blocks sit beside them: provenance, totals, error_pooled,
-concurrency, phases and bands.
+three. The kit's own blocks sit beside them: provenance, totals, error_pooled
+(the benchmark phase's calls only), concurrent and q29_probe
+(null when the phase did not run), phases and bands.
 """
 
+import hashlib
 import json
 import math
 import os
+import random
 import re
+import statistics
 import sys
+import tarfile
 import traceback
 
 PLACEHOLDER_PREFIX = "FILL-IN"
@@ -62,8 +81,11 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
 
-# Phases box/run.sh implements. T5 adds its phases here and in run.sh.
-KNOWN_PHASES = ("benchmark",)
+# Phases box/run.sh implements, each a phase_NAME function there.
+KNOWN_PHASES = ("benchmark", "concurrent", "q29_probe", "perf")
+# Phases whose calls error_pooled counts. Only the benchmark phase's, so the
+# figure and its bands do not change with which other phases a run names.
+POOLED_PHASES = ("benchmark",)
 
 # Band file sections a run.toml can select. `absolute` covers the [absolute]
 # table and every [absolute.*] table under it.
@@ -79,9 +101,10 @@ LANE_BANDS = {
         "relative": (
             "error_pooled_max_delta", "qps_min_ratio", "hot_statement_max_ratio",
             "hot_statement_floor_s", "hot_sum_max_ratio", "cold_sum_max_ratio",
-            "min_both_answered",
+            "min_both_answered", "concurrent_error_pooled_max_delta", "q29_probe_max_ratio",
         ),
-        "absolute": ("hot_sum_s_max", "cold_sum_s_max", "error_pooled_max"),
+        "absolute": ("hot_sum_s_max", "cold_sum_s_max", "error_pooled_max",
+                     "concurrent_qps_min", "concurrent_error_pooled_max", "q29_probe_s_max"),
         "absolute.hot_s_max": STATEMENT_KEYS,
     },
 }
@@ -97,13 +120,21 @@ RUN_REQUIRED = (
     "dataset_url", "dataset_sha256", "rows_expected", "rustfs_url",
     "rustfs_sha256", "memory_budget_bytes", "audit_mode",
 )
-# Read by box/run.sh (band_sections through query_timeout_s) or launch.sh
-# (band_sections, ami through key_name) when present.
+# The phase keys box/run.sh reads, with the defaults launch.sh writes into the
+# run.toml it stages when the file leaves them out.
+RUN_DEFAULTS = (
+    ("concurrent_rounds", 3), ("concurrent_connections", 10), ("concurrent_duration_s", 600),
+    ("concurrent_seed", "clickbench"), ("q29_probe_warmup", 1), ("q29_probe_runs", 3),
+    ("perf_record", False),
+)
+# Read by box/run.sh (band_sections through query_timeout_s, and the
+# RUN_DEFAULTS keys) or launch.sh (band_sections, ami through key_name) when
+# present.
 RUN_OPTIONAL = (
     "band_sections", "window_hours", "audit_text", "expected_statements",
     "fold_min_entry_ratio", "query_timeout_s", "ami", "subnet",
     "security_group", "key_name",
-)
+) + tuple(k for k, _ in RUN_DEFAULTS)
 # run.toml's only table.
 RUN_TABLES = ("bands",)
 DEFAULT_WINDOW_HOURS = 200000
@@ -116,8 +147,23 @@ FAILED_FIELDS = ("id", "run", "error", "answer")
 ANSWER_FIELDS = ("answered", "rows", "expected_rows", "match")
 REPORT_FIELDS = (
     "provenance", "timing_definition", "entries", "skipped", "failed", "totals",
-    "error_pooled", "concurrency", "phases", "bands",
+    "error_pooled", "concurrent", "q29_probe", "phases", "bands",
 )
+CONCURRENT_ROUND_FIELDS = (
+    "round", "duration_s", "wall_s", "connections", "calls", "ok", "err", "wrong_answer",
+    "qps", "error_ratio",
+)
+CONCURRENT_POOLED_FIELDS = (
+    "rounds", "calls", "ok", "err", "wrong_answer", "error_ratio_weighted",
+    "error_ratio_mean_of_rounds", "qps_pooled",
+)
+Q29_PROBE_FIELDS = ("statement", "warmup", "runs", "runs_s", "errors", "min_s", "median_s")
+CONCURRENT_DEFINITION = (
+    "upstream ClickBench bench_concurrent_qps: a call succeeds on a 2xx answer whose transfer "
+    "completed (curl exit 0); a round's qps is its successful calls over the nominal "
+    "duration_s (0 with none, null when it made no call) and its error_ratio its failed calls "
+    "over all its calls; qps_pooled is the mean of the non-null round qps, error_ratio_weighted all rounds' failed calls over all their "
+    "calls, error_ratio_mean_of_rounds the mean of the non-null round error_ratio")
 TIMING_DEFINITION = ("hot (min_ms) is the best of tries 2 and 3; cold (cold_ms) is try 1; "
                      "median_ms and max_ms are over all three tries")
 PROVENANCE_FIELDS = (
@@ -301,6 +347,26 @@ def check_run(path):
         if phase not in KNOWN_PHASES:
             raise Refusal("run.toml %s: phase %r is not one box/run.sh implements (%s)"
                           % (path, phase, ", ".join(KNOWN_PHASES)))
+    if "benchmark" not in data["phases"]:
+        raise Refusal("run.toml %s: phases must include benchmark: results.json's statements "
+                      "come from it" % path)
+    wrong = []
+    for key, default in RUN_DEFAULTS:
+        v = data.get(key, default)
+        if isinstance(default, bool):
+            if not isinstance(v, bool):
+                wrong.append("%s must be true or false, got %r" % (key, v))
+        elif isinstance(default, str):
+            if not isinstance(v, str) or not v:
+                wrong.append("%s must be a non-empty string, got %r" % (key, v))
+        else:
+            least = 0 if key == "q29_probe_warmup" else 1
+            if not isinstance(v, int) or isinstance(v, bool) or v < least:
+                wrong.append("%s must be a whole number of at least %d, got %r" % (key, least, v))
+    if wrong:
+        raise Refusal("run.toml %s: %s" % (path, "; ".join(wrong)))
+    if "perf" in data["phases"] and data.get("perf_record") is not True:
+        raise Refusal("run.toml %s: phase perf needs perf_record = true" % path)
     for lane in data["lanes"]:
         if lane not in LANE_BANDS:
             raise Refusal("run.toml %s: lane %r is not one the kit runs (%s)"
@@ -414,22 +480,46 @@ def _row(kind, band, value, bound, verdict, note="", statement=None):
     return row
 
 
-def run_metrics(report):
+def pooled_errors(phases):
     calls = errors = 0
-    for phase in (report.get("phases") or {}).values():
+    for name, phase in (phases or {}).items():
+        if name not in POOLED_PHASES:
+            continue
         calls += phase.get("calls", 0)
         errors += phase.get("errors", 0)
-    conc = report.get("concurrency")
+    return calls, errors
+
+
+def run_metrics(report):
+    calls, errors = pooled_errors(report.get("phases"))
+    conc = report.get("concurrent")
+    pooled = conc["pooled"] if isinstance(conc, dict) else None
     return {
         "hot_sum_s": report["totals"]["hot_sum_s"],
         "cold_sum_s": report["totals"]["cold_sum_s"],
         "error_pooled": (errors / calls) if calls else None,
-        "qps": conc.get("qps") if isinstance(conc, dict) else None,
+        "concurrent": pooled,
+        "q29_probe": report.get("q29_probe"),
     }
 
 
+def _qps(pooled):
+    """A concurrent phase's pooled QPS, 0.0 when no round made a call (each
+    round's QPS is then null), with the note saying so."""
+    if pooled["qps_pooled"] is None:
+        return 0.0, "no round made a call"
+    return pooled["qps_pooled"], ""
+
+
+def _probe_failed(probe):
+    if probe["errors"] or probe["min_s"] is None:
+        return "%d of %d probe runs failed" % (probe["errors"], probe["runs"])
+    return ""
+
+
 def absolute_bands(lane, path, sections, report):
-    """One arm judged against the lane's absolute section, when selected."""
+    """One arm judged against the lane's absolute section, when selected. A
+    band whose phase did not run is inconclusive."""
     if "absolute" not in sections:
         return []
     data = check_bands(lane, path, sections)
@@ -443,6 +533,33 @@ def absolute_bands(lane, path, sections, report):
             out.append(_row("absolute", label, None, bound, "miss", "not measured"))
         else:
             out.append(_row("absolute", label, value, bound, "pass" if value <= bound else "miss"))
+    conc = m["concurrent"]
+    label = "concurrent qps >= concurrent_qps_min"
+    bound = ab["concurrent_qps_min"]
+    if conc is None:
+        out.append(_row("absolute", label, None, bound, "inconclusive", "no concurrent phase ran"))
+    else:
+        value, note = _qps(conc)
+        out.append(_row("absolute", label, value, bound, "pass" if value >= bound else "miss", note))
+    label = "concurrent error_ratio_weighted <= concurrent_error_pooled_max"
+    bound = ab["concurrent_error_pooled_max"]
+    if conc is None:
+        out.append(_row("absolute", label, None, bound, "inconclusive", "no concurrent phase ran"))
+    elif conc["error_ratio_weighted"] is None:
+        out.append(_row("absolute", label, None, bound, "miss", "no concurrent call recorded"))
+    else:
+        value = conc["error_ratio_weighted"]
+        out.append(_row("absolute", label, value, bound, "pass" if value <= bound else "miss"))
+    probe = m["q29_probe"]
+    label = "q29_probe min_s <= q29_probe_s_max"
+    bound = ab["q29_probe_s_max"]
+    if probe is None:
+        out.append(_row("absolute", label, None, bound, "inconclusive", "no q29_probe phase ran"))
+    elif _probe_failed(probe):
+        out.append(_row("absolute", label, probe["min_s"], bound, "miss", _probe_failed(probe)))
+    else:
+        out.append(_row("absolute", label, probe["min_s"], bound,
+                        "pass" if probe["min_s"] <= bound else "miss"))
     answered = {e["id"]: e for e in report["entries"]}
     for sid in sorted(set(answered) | set(f["id"] for f in report["failed"])):
         q = sid.split("_", 1)[0]
@@ -500,12 +617,44 @@ def relative_bands(path, a, b):
             "pass" if mb["error_pooled"] <= bound else "miss")
     else:
         add("error_pooled <= A + %g" % d, None, None, "inconclusive", "no calls recorded")
+    absent = [arm for arm, m in (("A", ma), ("B", mb)) if m["concurrent"] is None]
+    ca, cb = ma["concurrent"], mb["concurrent"]
     r = rel["qps_min_ratio"]
-    if _num(ma["qps"]) and _num(mb["qps"]):
-        bound = r * ma["qps"]
-        add("qps >= %g x A" % r, mb["qps"], bound, "pass" if mb["qps"] >= bound else "miss")
+    label = "qps_pooled >= %g x A" % r
+    if absent:
+        add(label, None, None, "inconclusive", "no concurrent phase ran on %s" % " or ".join(absent))
+    elif ca["qps_pooled"] is None or not ca["ok"]:
+        add(label, _qps(cb)[0], None, "inconclusive", "arm A had no successful concurrent call")
     else:
-        add("qps >= %g x A" % r, None, None, "inconclusive", "no concurrency phase ran")
+        value, note = _qps(cb)
+        bound = r * ca["qps_pooled"]
+        add(label, value, bound, "pass" if value >= bound else "miss", note)
+    d = rel["concurrent_error_pooled_max_delta"]
+    label = "concurrent error_ratio_weighted <= A + %g" % d
+    if absent:
+        add(label, None, None, "inconclusive", "no concurrent phase ran on %s" % " or ".join(absent))
+    elif ca["error_ratio_weighted"] is None:
+        add(label, cb["error_ratio_weighted"], None, "inconclusive",
+            "arm A recorded no concurrent call")
+    elif cb["error_ratio_weighted"] is None:
+        add(label, None, None, "miss", "arm B recorded no concurrent call")
+    else:
+        bound = ca["error_ratio_weighted"] + d
+        add(label, cb["error_ratio_weighted"], bound,
+            "pass" if cb["error_ratio_weighted"] <= bound else "miss")
+    pa, pb = ma["q29_probe"], mb["q29_probe"]
+    r = rel["q29_probe_max_ratio"]
+    label = "q29_probe min_s <= %g x A" % r
+    absent = [arm for arm, p in (("A", pa), ("B", pb)) if p is None]
+    if absent:
+        add(label, None, None, "inconclusive", "no q29_probe phase ran on %s" % " or ".join(absent))
+    elif _probe_failed(pa):
+        add(label, pb["min_s"], None, "inconclusive", "arm A: " + _probe_failed(pa))
+    elif _probe_failed(pb):
+        add(label, pb["min_s"], r * pa["min_s"], "miss", "arm B: " + _probe_failed(pb))
+    else:
+        bound = r * pa["min_s"]
+        add(label, pb["min_s"], bound, "pass" if pb["min_s"] <= bound else "miss")
 
     ea = {e["id"]: e for e in a["entries"]}
     eb = {e["id"]: e for e in b["entries"]}
@@ -582,6 +731,227 @@ def request_bodies(corpus, out_dir, start, end):
             expected = e.get("expected_rows")
             idx.write("%02d\t%s\t%s\n" % (n, e["id"], "-" if expected is None else int(expected)))
     print(len(entries))
+
+
+def resolved_run(path, out):
+    """run.toml with every RUN_DEFAULTS key it leaves out written in at its
+    default, before the first table, so the box runs what the laptop saw."""
+    data = check_run(path)
+    lines = open(path).read().splitlines()
+    at = next((i for i, l in enumerate(lines) if _strip_comment(l).startswith("[")), len(lines))
+    fill = []
+    for key, default in RUN_DEFAULTS:
+        if key not in data:
+            if isinstance(default, bool):
+                v = "true" if default else "false"
+            elif isinstance(default, str):
+                v = json.dumps(default)
+            else:
+                v = str(default)
+            fill.append("%s = %s" % (key, v))
+    if fill:
+        fill = ["# Defaults launch.sh wrote for the phase keys this file left out."] + fill + [""]
+    with open(out, "w") as f:
+        f.write("\n".join(lines[:at] + fill + lines[at:]) + "\n")
+
+
+# --- concurrent, q29_probe and perf phases ---------------------------------
+
+def permutation(seed, connection, nq):
+    """Connection CONNECTION's statement order, as upstream ClickBench's
+    bench_concurrent_qps draws it: the first 8 bytes of sha256("<seed>-<c>"),
+    big-endian, seed random.Random, which shuffles range(nq)."""
+    digest = hashlib.sha256(("%s-%s" % (seed, connection)).encode("utf-8")).digest()
+    order = list(range(int(nq)))
+    random.Random(int.from_bytes(digest[:8], "big")).shuffle(order)
+    return order
+
+
+def _jsonl(path):
+    out = []
+    for n, line in enumerate(open(path), 1):
+        try:
+            out.append(json.loads(line))
+        except ValueError as e:
+            raise Refusal("%s:%d is not a JSON line: %s" % (path, n, e))
+    return out
+
+
+def _ok_2xx(call):
+    """Upstream's success: curl --fail-with-body exiting 0, so a 2xx answer
+    whose transfer also completed (curl_exit 0)."""
+    status = call.get("http_status")
+    return (isinstance(status, int) and 200 <= status <= 299
+            and call.get("curl_exit") == 0)
+
+
+def concurrent_round(meta, calls):
+    duration = meta["duration_s"]
+    ok = sum(1 for c in calls if _ok_2xx(c))
+    err = len(calls) - ok
+    return {
+        "round": meta["round"], "duration_s": duration, "wall_s": meta["wall_s"],
+        "connections": meta["connections"], "calls": len(calls), "ok": ok, "err": err,
+        "wrong_answer": sum(1 for c in calls if c.get("refusal_class") == "wrong_answer"),
+        "qps": ok / float(duration) if calls else None,
+        "error_ratio": err / float(len(calls)) if calls else None,
+    }
+
+
+def pool_rounds(rounds):
+    calls = sum(r["calls"] for r in rounds)
+    err = sum(r["err"] for r in rounds)
+    ratios = [r["error_ratio"] for r in rounds if r["error_ratio"] is not None]
+    qps = [r["qps"] for r in rounds if r["qps"] is not None]
+    return {
+        "rounds": len(rounds), "calls": calls, "ok": sum(r["ok"] for r in rounds), "err": err,
+        "wrong_answer": sum(r["wrong_answer"] for r in rounds),
+        "error_ratio_weighted": err / float(calls) if calls else None,
+        "error_ratio_mean_of_rounds": sum(ratios) / len(ratios) if ratios else None,
+        "qps_pooled": sum(qps) / len(qps) if qps else None,
+    }
+
+
+def concurrent_summary(d):
+    """The results.json concurrent block from DIR/rounds.jsonl (one line per
+    round run.sh ran) and DIR/calls.jsonl."""
+    metas = _jsonl(os.path.join(d, "rounds.jsonl"))
+    if not metas:
+        raise Refusal("concurrent-summary: %s/rounds.jsonl records no round" % d)
+    by_round = {}
+    for c in _jsonl(os.path.join(d, "calls.jsonl")):
+        if not isinstance(c.get("round"), int) or not isinstance(c.get("connection"), int):
+            raise Refusal("concurrent-summary: a call in %s/calls.jsonl has no round and "
+                          "connection: %r" % (d, c))
+        by_round.setdefault(c["round"], []).append(c)
+    unknown = sorted(set(by_round) - set(m["round"] for m in metas))
+    if unknown:
+        raise Refusal("concurrent-summary: calls for round(s) %s, which rounds.jsonl does not "
+                      "record" % ", ".join(str(u) for u in unknown))
+    rounds = [concurrent_round(m, by_round.get(m["round"], [])) for m in metas]
+    return {
+        "definition": CONCURRENT_DEFINITION,
+        "seed": metas[0]["seed"],
+        "connections": metas[0]["connections"],
+        "duration_s": metas[0]["duration_s"],
+        "statements": metas[0]["statements"],
+        "rounds": rounds,
+        "pooled": pool_rounds(rounds),
+    }
+
+
+def q29_summary(d):
+    """The results.json q29_probe block from DIR/calls.jsonl: min and median
+    over the timed runs that answered, never the warmup."""
+    calls = _jsonl(os.path.join(d, "calls.jsonl"))
+    runs = [c for c in calls if c.get("probe") == "run"]
+    if not runs:
+        raise Refusal("q29-summary: %s/calls.jsonl records no timed run" % d)
+    good = [float(c["duration_s"]) for c in runs if c.get("outcome") == "ok"]
+    return {
+        "statement": runs[0]["statement"],
+        "warmup": sum(1 for c in calls if c.get("probe") == "warmup"),
+        "runs": len(runs),
+        "runs_s": [c.get("duration_s") for c in runs],
+        "errors": len(runs) - len(good),
+        "min_s": min(good) if good else None,
+        "median_s": statistics.median(good) if good else None,
+    }
+
+
+def fold_perf(lines):
+    """`perf script` output folded to one `comm;outer;...;leaf count` line per
+    distinct stack, the form flamegraph.pl and inferno read."""
+    counts, state = {}, {"comm": None, "frames": []}
+
+    def flush():
+        if state["comm"] is not None:
+            key = ";".join([state["comm"]] + state["frames"][::-1])
+            counts[key] = counts.get(key, 0) + 1
+        state["comm"], state["frames"] = None, []
+
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if not line.strip():
+            flush()
+        elif line[0] in " \t":
+            parts = line.split(None, 1)
+            sym = parts[1] if len(parts) > 1 else "[unknown]"
+            sym = re.sub(r"\s+\([^)]*\)$", "", sym)
+            sym = re.sub(r"\+0x[0-9a-f]+$", "", sym)
+            state["frames"].append(sym.replace(";", ":") or "[unknown]")
+        else:
+            flush()
+            m = re.match(r"^\s*(.+?)\s+[0-9]+(?:/[0-9]+)?\s", line)
+            state["comm"] = (m.group(1) if m else line.split(None, 1)[0]).replace(" ", "_")
+    flush()
+    return ["%s %d" % (k, v) for k, v in sorted(counts.items())]
+
+
+def _concurrent_errors(tgz):
+    """Each statement's failed (non-2xx) concurrent calls, from the arm's
+    evidence tarball, and the total calls read."""
+    try:
+        with tarfile.open(tgz) as t:
+            f = t.extractfile("out/concurrent/calls.jsonl")
+            lines = f.read().decode("utf-8").splitlines() if f else None
+    except (OSError, KeyError, tarfile.TarError) as e:
+        raise Refusal("cannot read out/concurrent/calls.jsonl from %s: %s" % (tgz, e))
+    if lines is None:
+        raise Refusal("%s holds no out/concurrent/calls.jsonl" % tgz)
+    errors = {}
+    for line in lines:
+        c = json.loads(line)
+        if not _ok_2xx(c):
+            errors[c["statement"]] = errors.get(c["statement"], 0) + 1
+    return errors, len(lines)
+
+
+def _fmt(v):
+    return "null" if v is None else ("%.3f" % v if isinstance(v, float) else str(v))
+
+
+def concurrent_detail(bands_dir, a_json, a_tgz, b_json, b_tgz):
+    """Each arm's per-round QPS and error ratio beside its pooled figures, and
+    on a missed concurrent error band, the missing arm's errors by statement."""
+    arms = (("A", validate(a_json), a_tgz), ("B", validate(b_json), b_tgz))
+    for arm, r, _ in arms:
+        conc = r["concurrent"]
+        if conc is None:
+            print("concurrent %s: no concurrent phase ran" % arm)
+            continue
+        for rd in conc["rounds"]:
+            print("concurrent %s round %d: qps %s error_ratio %s (ok %d, err %d, wrong_answer %d, "
+                  "wall %.1f s of %s s)" % (arm, rd["round"], _fmt(rd["qps"]),
+                                            _fmt(rd["error_ratio"]), rd["ok"], rd["err"],
+                                            rd["wrong_answer"], rd["wall_s"], rd["duration_s"]))
+        p = conc["pooled"]
+        print("concurrent %s pooled: qps_pooled %s error_ratio_weighted %s "
+              "error_ratio_mean_of_rounds %s (ok %d, err %d over %d rounds; the bands judge "
+              "error_ratio_weighted)" % (arm, _fmt(p["qps_pooled"]), _fmt(p["error_ratio_weighted"]),
+                                         _fmt(p["error_ratio_mean_of_rounds"]), p["ok"], p["err"],
+                                         p["rounds"]))
+    missed = set()
+    for arm, r, _ in arms:
+        if any(b["verdict"] == "miss" and b["band"].startswith("concurrent error")
+               for b in r.get("bands") or []):
+            missed.add(arm)
+    a, b = arms[0][1], arms[1][1]
+    for name in sorted(os.listdir(bands_dir)):
+        if not name.endswith(".toml"):
+            continue
+        rows = relative_bands(os.path.join(bands_dir, name), a, b)
+        if any(row["verdict"] == "miss" and row["band"].startswith("concurrent error")
+               for row in rows):
+            missed.add("B")
+    for arm, r, tgz in arms:
+        if arm not in missed:
+            continue
+        errors, calls = _concurrent_errors(tgz)
+        total = sum(errors.values())
+        print("concurrent %s errors by statement (%d errors of %d calls):" % (arm, total, calls))
+        for sid, n in sorted(errors.items(), key=lambda kv: (-kv[1], kv[0])):
+            print("  %-40s %d / %d" % (sid, n, total))
 
 
 # --- results.json ----------------------------------------------------------
@@ -667,7 +1037,8 @@ def assemble(args):
     server_logs (comma-separated, every benchmark server start), bands
     (lane:path[,lane:path]), sections (comma-separated band sections),
     provenance (a directory of stamp files, one per provenance key), arm, sha,
-    binary, tenant, phases_json."""
+    binary, tenant, phases_json. Optional: concurrent and q29_probe, each the
+    phase's summary.json, when that phase ran."""
     kv = dict(a.split("=", 1) for a in args)
     for key in ("out", "calls", "index", "server_logs", "bands", "sections", "provenance",
                 "arm", "sha", "binary", "tenant", "phases_json"):
@@ -721,8 +1092,10 @@ def assemble(args):
         except ValueError:
             provenance[name] = text.rstrip("\n")
     phases = json.load(open(kv["phases_json"]))
-    calls = sum(p.get("calls", 0) for p in phases.values())
-    errors = sum(p.get("errors", 0) for p in phases.values())
+    calls, errors = pooled_errors(phases)
+    blocks = {}
+    for key in ("concurrent", "q29_probe"):
+        blocks[key] = json.load(open(kv[key])) if kv.get(key) else None
     report = {
         "provenance": provenance,
         "timing_definition": TIMING_DEFINITION,
@@ -731,8 +1104,10 @@ def assemble(args):
         "failed": failed,
         "totals": totals,
         "error_pooled": {"calls": calls, "errors": errors,
-                         "ratio": (errors / calls) if calls else None},
-        "concurrency": None,
+                         "ratio": (errors / calls) if calls else None,
+                         "phases": list(POOLED_PHASES)},
+        "concurrent": blocks["concurrent"],
+        "q29_probe": blocks["q29_probe"],
         "phases": phases,
     }
     report["bands"] = []
@@ -827,6 +1202,24 @@ def validate(path):
     for k in ("cold_sum_s", "hot_sum_s"):
         if not _num(r["totals"][k]):
             raise Refusal("%s: totals.%s is %r, not a number" % (path, k, r["totals"][k]))
+    conc = r["concurrent"]
+    if conc is not None:
+        if not isinstance(conc, dict) or not isinstance(conc.get("rounds"), list) \
+                or not isinstance(conc.get("pooled"), dict):
+            raise Refusal("%s: concurrent is neither null nor a block with rounds and pooled" % path)
+        for rd in conc["rounds"]:
+            miss = [k for k in CONCURRENT_ROUND_FIELDS if k not in rd]
+            if miss:
+                raise Refusal("%s: concurrent round %r missing %s"
+                              % (path, rd.get("round"), ", ".join(miss)))
+        miss = [k for k in CONCURRENT_POOLED_FIELDS if k not in conc["pooled"]]
+        if miss:
+            raise Refusal("%s: concurrent.pooled missing %s" % (path, ", ".join(miss)))
+    probe = r["q29_probe"]
+    if probe is not None:
+        miss = [k for k in Q29_PROBE_FIELDS if k not in (probe if isinstance(probe, dict) else {})]
+        if miss:
+            raise Refusal("%s: q29_probe missing %s" % (path, ", ".join(miss)))
     for b in r["bands"]:
         if b.get("verdict") not in ("pass", "miss", "inconclusive"):
             raise Refusal("%s: band %r has verdict %r" % (path, b.get("band"), b.get("verdict")))
@@ -853,6 +1246,19 @@ def main(argv):
             request_bodies(*args)
         elif cmd == "phases" and len(args) >= 2:
             phases_summary(args[0], args[1:])
+        elif cmd == "resolved-run" and len(args) == 2:
+            resolved_run(*args)
+        elif cmd == "permutation" and len(args) == 3:
+            print(" ".join(str(i) for i in permutation(*args)))
+        elif cmd == "concurrent-summary" and len(args) == 1:
+            print(json.dumps(concurrent_summary(args[0]), indent=2, sort_keys=True))
+        elif cmd == "q29-summary" and len(args) == 1:
+            print(json.dumps(q29_summary(args[0]), indent=2, sort_keys=True))
+        elif cmd == "fold-perf" and not args:
+            for line in fold_perf(sys.stdin):
+                print(line)
+        elif cmd == "concurrent-detail" and len(args) == 5:
+            concurrent_detail(*args)
         elif cmd == "assemble":
             assemble(args)
         elif cmd == "validate" and len(args) == 1:

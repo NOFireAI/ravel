@@ -577,6 +577,83 @@ then writes `results.json`, `evidence.tgz` and `progress.log`, uploads them
 with `DONE` (or `FAILED`, naming the step) to its `out/<arm>/` prefix, and
 terminates itself.
 
+`run.toml`'s `phases` must name `benchmark` and can name three more, run in
+the order listed, before the results are written. Each of their keys is
+optional; `launch.sh` writes any key the file leaves out into the uploaded
+`run.toml` at its default, and `check-run` refuses a value of the wrong type,
+naming the key.
+
+- `concurrent` reproduces upstream ClickBench's `bench_concurrent_qps`. Its
+  keys are `concurrent_rounds` (default 3), `concurrent_connections` (10),
+  `concurrent_duration_s` (600) and `concurrent_seed` (`"clickbench"`). Each
+  round stops the server, drops the page cache, starts it and waits for
+  readiness, then runs every one of the 43 statements, registered failures
+  included and none weighted, on each connection `c` from 1 to
+  `concurrent_connections`. Connection `c` visits them in the order
+  `random.Random(seed_int).shuffle(list(range(43)))` gives, where `seed_int`
+  is the first 8 bytes of the sha256 of `"<seed>-<c>"` read big-endian, and
+  loops over that order. A connection checks the deadline (`concurrent_duration_s`
+  after the round starts) before each call; a call in flight at the deadline
+  completes and is counted. The deadline is whole seconds, `date +%s` plus
+  `concurrent_duration_s`, as upstream computes it. No call has a client
+  timeout. Readiness in this phase uses upstream's check, not `/readyz`: a
+  POST of `SELECT 1` to `/api/v1/sql` with `curl --fail-with-body` and no
+  timeout, its body naming the same window as every other call. The server
+  start before each round polls that check, and a watchdog runs it every
+  5 s and restarts a server that fails it, polling up to 60 times 1 s apart
+  for readiness, without telling the connections, so calls during the outage
+  are errors. A refusal of `SELECT 1` under memory pressure therefore
+  restarts the server even while `/readyz` answers. Unlike upstream, the
+  watchdog's last sleep ends at the deadline and no check runs after it.
+  Every call is a line of `out/concurrent/calls.jsonl` with the benchmark's
+  fields plus `round` and `connection`. Every phase's call lines carry
+  `curl_exit`, and `http_status` is 0 when nothing answered. The figures
+  follow upstream: a call succeeds when it gets a 2xx answer and its
+  transfer completed
+  (curl exit 0, as `curl --fail-with-body` reports it) and is an error
+  otherwise, and a round's QPS is its successful calls over its nominal
+  duration (`concurrent_duration_s`, not the measured wall time), 0 when
+  the round made calls and none succeeded and null only when it made no
+  call; its error ratio is errors over calls. A 2xx
+  answer with the wrong row count is a success under that rule and is
+  counted separately as `wrong_answer`; `outcome` and `refusal_class` stay
+  in the call lines as diagnostics. `results.json`'s `concurrent` block
+  holds each round's `qps`, `error_ratio`, `ok`, `err`, `wrong_answer` and
+  `wall_s`, and the rounds pooled two ways: `error_ratio_weighted` (all
+  rounds' errors over all rounds' calls) and `error_ratio_mean_of_rounds`
+  (the mean of the rounds' ratios), with `qps_pooled` the mean of the
+  rounds' non-null QPS, so a round whose calls all failed counts as 0. The
+  bands judge `error_ratio_weighted`; the mean of rounds is reported only
+  for comparison with earlier readouts. The pooled error rate
+  (`error_pooled`, judged by `error_pooled_max_delta` and
+  `error_pooled_max`) covers the benchmark phase only: neither the
+  concurrent calls, which have their own band, nor the `q29_probe` and
+  `perf` calls are in it, so its verdict does not change with which phases
+  a run names.
+- `q29_probe` restarts the server and sends the corpus's q29 alone,
+  `q29_probe_warmup` times untimed (default 1), then `q29_probe_runs` times
+  timed (default 3). `out/q29_probe/calls.jsonl` records each call's
+  duration and the response's `stats` object. `results.json`'s `q29_probe`
+  block holds every timed run's duration and their `min_s` and `median_s`;
+  the warmup is in neither.
+- `perf` needs `perf_record = true` (default false), and `check-run` refuses
+  it otherwise. Per statement it sends one warm call, then one hot call under
+  `perf record -F 99 -g -p <server pid>`, and keeps the samples as folded
+  stacks in `out/perf/<NN>.folded`, which `evidence.tgz` carries; each
+  statement's `perf.data` is removed whether or not its profile succeeded.
+
+The rlog lane's band file judges the `concurrent` and `q29_probe` phases in
+its existing file, `bands/rlog.toml`, not a file of their own: B's
+`qps_pooled` at least `qps_min_ratio` times A's, B's `error_ratio_weighted`
+at most A's plus `concurrent_error_pooled_max_delta`, and B's q29 `min_s` at
+most `q29_probe_max_ratio` times A's, with absolute counterparts that are
+placeholders until the reference machine sets them. A band whose phase did
+not run on both arms is inconclusive, never a pass. `fetch.sh` prints each
+arm's per-round QPS and error ratio beside its pooled figures, and on a
+missed concurrent error band it prints that arm's errors by statement as
+`count / total`, read from `out/concurrent/calls.jsonl` in its
+`evidence.tgz`.
+
 ## 9. Check the report before reading the headline
 
 A number printed and not asserted on is decoration. Write the expected figures

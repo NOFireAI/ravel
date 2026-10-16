@@ -2,7 +2,8 @@
 # Cases for the ClickBench kit: launch.sh, the user-data it writes, box/run.sh
 # and fetch.sh. Nothing here reaches AWS or builds anything. Stubs first on
 # PATH stand in for `aws` (S3 is a local directory, $FAKE_S3), `curl` (the
-# instance metadata service and the SQL endpoint), `shutdown` and `nohup`; a
+# instance metadata service and the SQL endpoint), `perf`, `shutdown` and
+# `nohup`; a
 # box is a local directory standing in for /root (KIT_ROOT), with stub
 # ravel-cli and ravel-server binaries. Each case names the mutation it
 # catches.
@@ -127,12 +128,19 @@ STUB
 cat >"$STUBS/curl" <<'STUB'
 #!/usr/bin/env bash
 # IMDS answers at once. Readiness and SQL answer only while the stub server's
-# ready file exists, as a server that is not listening refuses (curl exit 7);
-# the stub server writes it only after logging its argv and settings, and
-# removes it when stopped. A SQL call logs its request body to
+# ready file exists, as a server that is not listening refuses (curl exit 7,
+# printing "000 <seconds>" for a -w format as curl does); the stub server
+# writes it only after logging its argv and settings, and removes it when
+# stopped. A readyz call is logged to readyz-calls. A body named check.json is
+# the concurrent phase's SELECT 1 check: it is logged to check-calls and, while
+# the check-refuse file exists, answered 503 (curl exit 22 under
+# --fail-with-body). STUB_SQL_TRUNCATE_N names a statement whose answer
+# prints status 200 and then fails the transfer (curl exit 18). A SQL call
+# logs its request body to
 # sql-bodies, writes an answer to -o and prints "<status> <seconds>":
 # STUB_SQL_TIME seconds (default 0.5), or the try's field of STUB_SQL_TIMES
-# ("cold hot hot"), and a 422 resource_exhausted refusal for statement
+# ("cold hot hot"), or for a q29_probe call the try's field of
+# STUB_PROBE_TIMES, and a 422 resource_exhausted refusal for statement
 # STUB_SQL_REFUSE_N. An answer holds the statement's expected row count from
 # the index.tsv beside its body (3 rows where the corpus states none), or
 # STUB_SQL_ROWS rows for statement STUB_SQL_ROWS_N (only on try
@@ -143,11 +151,15 @@ cat >"$STUBS/curl" <<'STUB'
 out=""
 body=""
 url=""
+wfmt=""
+fwb=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2; continue ;;
     --data-binary) body="${2#@}"; shift 2; continue ;;
-    -w|--max-time|-H|-X) shift 2; continue ;;
+    -w) wfmt="$2"; shift 2; continue ;;
+    --fail-with-body) fwb=1 ;;
+    --max-time|-H|-X) shift 2; continue ;;
     http*) url="$1" ;;
   esac
   shift
@@ -157,11 +169,25 @@ case "$url" in
   */meta-data/instance-id) echo i-0b0x00000000000001 ;;
   */meta-data/instance-type) echo c6a.4xlarge ;;
   */readyz)
+    echo readyz >>"$STUB_DIR/readyz-calls"
     [ -f "$STUB_DIR/server-ready" ] || { echo "curl: (7) Failed to connect" >&2; exit 7; }
     echo ready ;;
   */api/v1/sql)
-    [ -f "$STUB_DIR/server-ready" ] || { echo "curl: (7) Failed to connect" >&2; exit 7; }
+    if [ ! -f "$STUB_DIR/server-ready" ]; then
+      [ -z "$wfmt" ] || printf '000 0.000412'
+      echo "curl: (7) Failed to connect" >&2
+      exit 7
+    fi
     case "$body" in
+      */check.json)
+        echo check >>"$STUB_DIR/check-calls"
+        if [ -f "$STUB_DIR/check-refuse" ]; then
+          printf '{"status":"error","errorType":"unavailable","error":"memory pressure"}' >"$out"
+          [ -z "$fwb" ] || exit 22
+          exit 0
+        fi
+        printf '{"status":"success","data":{"columns":["1"],"rows":[[1]]},"stats":{}}' >"$out"
+        exit 0 ;;
       */verify/*)
         { cat "$body"; echo; } >>"$STUB_DIR/verify-bodies"
         printf '{"status":"success","data":{"columns":["count(*)"],"rows":[[%s]]},"stats":{}}' \
@@ -174,7 +200,12 @@ case "$url" in
     try="${out##*-}"
     try="${try%.json}"
     { cat "$body"; echo; } >>"$STUB_DIR/sql-bodies"
-    if [ "$n" = "${STUB_SQL_REFUSE_N:-none}" ]; then
+    if [ "$n" = "${STUB_SQL_TRUNCATE_N:-none}" ]; then
+      printf '{"status":"success","data":{"col' >"$out"
+      printf '200 0.2'
+      echo "curl: (18) transfer closed with outstanding read data remaining" >&2
+      exit 18
+    elif [ "$n" = "${STUB_SQL_REFUSE_N:-none}" ]; then
       printf '{"status":"error","errorType":"resource_exhausted","error":"query pool exhausted"}' >"$out"
       printf '422 0.1'
     else
@@ -190,6 +221,9 @@ case "$url" in
       printf '{"status":"success","data":{"columns":["c"],"rows":%s},"stats":{}}' "$json" >"$out"
       seconds="${STUB_SQL_TIME:-0.5}"
       [ -z "${STUB_SQL_TIMES:-}" ] || seconds="$(printf '%s\n' $STUB_SQL_TIMES | sed -n "${try}p")"
+      case "$out" in
+        */q29_probe/*) [ -z "${STUB_PROBE_TIMES:-}" ] || seconds="$(printf '%s\n' $STUB_PROBE_TIMES | sed -n "${try}p")" ;;
+      esac
       printf '200 %s' "$seconds"
     fi
     ;;
@@ -207,9 +241,40 @@ cat >"$STUBS/nohup" <<'STUB'
 echo "nohup $*" >>"$STUB_LOG"
 STUB
 
+# `perf record` logs its argv, writes its -o file and records until TERM;
+# `perf script -i FILE` prints two samples of one stack from that file, or
+# fails when STUB_PERF_SCRIPT_FAIL is set.
+cat >"$STUBS/perf" <<'STUB'
+#!/usr/bin/env bash
+echo "perf $*" >>"$STUB_DIR/perf-argv"
+case "$1" in
+  record)
+    out=""
+    while [ $# -gt 0 ]; do
+      [ "$1" != -o ] || out="$2"
+      shift
+    done
+    echo stub-perf-data >"$out"
+    sleep 30 &
+    pid=$!
+    trap 'kill "$pid" 2>/dev/null; exit 0' TERM
+    wait "$pid" ;;
+  script)
+    [ "$2" = -i ] && [ -f "$3" ] || { echo "perf script: no $3" >&2; exit 1; }
+    [ -z "${STUB_PERF_SCRIPT_FAIL:-}" ] || { echo "perf script: stub failure" >&2; exit 1; }
+    for t in 1.000000 1.010101; do
+      printf 'ravel-server 4242 [000] %s: 10101010 cpu-clock:\n' "$t"
+      printf '\t    5555aaaa scan_rows+0x10 (/bin/ravel-server)\n'
+      printf '\t    5555bbbb execute (/bin/ravel-server)\n'
+      printf '\t    5555cccc main (/bin/ravel-server)\n\n'
+    done ;;
+esac
+STUB
+
 # The box's binaries. The server logs its argv, the five settings stamps and
 # the store keys and audit key it was given (the evidence must not carry
-# them), then after STUB_READY_DELAY seconds (default 0.05) writes the ready
+# them), removes the check-refuse file, then after the seconds in the
+# ready-delay file, else STUB_READY_DELAY (default 0.05), writes the ready
 # file and sleeps until stopped; the CLI logs its argv, and `load` adds 100
 # objects to the store and prints ravel-cli's load summary with
 # STUB_LOAD_ROWS rows written (default the hits row count). STUB_FOLD=unsealed
@@ -223,7 +288,8 @@ for kv in fetch_concurrency=32 store_get_concurrency=32 cache_max_bytes=76890777
   printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' "${kv%%=*}" "${kv#*=}"
 done
 echo "stub-server: store access_key=${RAVEL_S3_ACCESS_KEY:-} secret_key=${RAVEL_S3_SECRET_KEY:-} audit_key=${RAVEL_AUDIT_TOKEN_KEY:-none}"
-sleep "${STUB_READY_DELAY:-0.05}"
+rm -f "$STUB_DIR/check-refuse"
+sleep "$(cat "$STUB_DIR/ready-delay" 2>/dev/null || echo "${STUB_READY_DELAY:-0.05}")"
 sleep 120 &
 pid=$!
 trap 'rm -f "$STUB_DIR/server-ready"; kill "$pid" 2>/dev/null; exit 0' TERM
@@ -262,6 +328,9 @@ BANDS="$TMP/rlog.toml"
 sed -e 's/^hot_sum_s_max = .*/hot_sum_s_max = 30/' \
   -e 's/^cold_sum_s_max = .*/cold_sum_s_max = 30/' \
   -e 's/^error_pooled_max = .*/error_pooled_max = 0.1/' \
+  -e 's/^concurrent_qps_min = .*/concurrent_qps_min = 1.0/' \
+  -e 's/^concurrent_error_pooled_max = .*/concurrent_error_pooled_max = 0.1/' \
+  -e 's/^q29_probe_s_max = .*/q29_probe_s_max = 1.0/' \
   -e 's/^\(q[0-9][0-9]\) = .*/\1 = 1.0/' \
   "$REPO_ROOT/benchmarks/clickbench/bands/rlog.toml" >"$BANDS"
 DATASET_SHA=1111111111111111111111111111111111111111111111111111111111111111
@@ -365,7 +434,7 @@ write_run_toml "$TMP/run-placeholder.toml" "benchmarks/clickbench/bands/rlog.tom
 code=0
 bash "$KIT_SRC/launch.sh" --dry-run "$TMP/run-placeholder.toml" >"$TMP/ph.out" 2>"$TMP/ph.err" || code=$?
 if [ "$code" = 64 ] \
-  && grep -q 'placeholder value in absolute.hot_sum_s_max, absolute.cold_sum_s_max, absolute.error_pooled_max, absolute.hot_s_max.q01, ' "$TMP/ph.err" \
+  && grep -q 'placeholder value in absolute.hot_sum_s_max, absolute.cold_sum_s_max, absolute.error_pooled_max, absolute.concurrent_qps_min, absolute.concurrent_error_pooled_max, absolute.q29_probe_s_max, absolute.hot_s_max.q01, ' "$TMP/ph.err" \
   && grep -q 'absolute.hot_s_max.q43; fill it in' "$TMP/ph.err" && ! grep -q 'DRY-RUN' "$TMP/ph.err"; then
   pass "a placeholder in a selected band section is refused, naming the keys"
 else
@@ -444,6 +513,29 @@ parquet = "benchmarks/clickbench/bands/parquet.toml"' 'unknown key(s) bands.parq
 
 run_case "a truncated rustfs_sha256" 's/^rustfs_sha256 = .*/rustfs_sha256 = "abc123"/' \
   'rustfs_sha256 must be 64 lowercase hex digits'
+
+# Catches: a perf phase that runs without the run.toml saying perf_record =
+# true, whether the key is false or left at its default.
+run_case "phase perf with perf_record false" \
+  's/^phases = .*/phases = ["benchmark", "perf"]\nperf_record = false/' 'phase perf needs perf_record = true'
+run_case "phase perf with perf_record left out" \
+  's/^phases = .*/phases = ["benchmark", "perf"]/' 'phase perf needs perf_record = true'
+# Catches: a phase key of the wrong type reaching the box, where bash
+# arithmetic or the seed would take it as something else.
+run_case "a string concurrent_rounds" 's/^shards = /concurrent_rounds = "3"\n&/' \
+  "concurrent_rounds must be a whole number of at least 1, got '3'"
+run_case "a zero concurrent_connections" 's/^shards = /concurrent_connections = 0\n&/' \
+  'concurrent_connections must be a whole number of at least 1, got 0'
+run_case "a boolean concurrent_duration_s" 's/^shards = /concurrent_duration_s = true\n&/' \
+  'concurrent_duration_s must be a whole number of at least 1, got True'
+run_case "a numeric concurrent_seed" 's/^shards = /concurrent_seed = 7\n&/' \
+  'concurrent_seed must be a non-empty string, got 7'
+run_case "a negative q29_probe_warmup" 's/^shards = /q29_probe_warmup = -1\n&/' \
+  'q29_probe_warmup must be a whole number of at least 0, got -1'
+run_case "a zero q29_probe_runs" 's/^shards = /q29_probe_runs = 0\n&/' \
+  'q29_probe_runs must be a whole number of at least 1, got 0'
+run_case "a string perf_record" 's/^shards = /perf_record = "true"\n&/' \
+  "perf_record must be true or false, got 'true'"
 
 # Catches: a stamped server setting that a start logged zero times or twice
 # being stamped as a list, which two arms then compare equal on.
@@ -578,10 +670,21 @@ boot_box A "$BOX_UD" || code=$?
 if [ "$code" = 0 ] && grep -q "^nohup bash $BOX_UD/kit/kit/box/run.sh\$" "$STUB_LOG" \
   && grep -q '^shutdown -h +600$' "$STUB_LOG" && ! grep -q '^shutdown -h now' "$STUB_LOG" \
   && [ "$(cat "$BOX_UD/kit/ARM")" = A ] && [ "$(cat "$BOX_UD/kit/RUN_ID")" = "$RUN_ID" ] \
-  && cmp -s "$BOX_UD/kit/run.toml" "$RUN_TOML" && [ -f "$BOX_UD/kit/kit/box/run.sh" ]; then
+  && cmp -s "$BOX_UD/kit/run.toml" "$IN_SAVED/run.toml" && [ -f "$BOX_UD/kit/kit/box/run.sh" ]; then
   pass "user-data arms shutdown -h +600, verifies the kit and starts run.sh under nohup"
 else
   fail "user-data" "exit $code; log: $(tr '\n' ';' <"$STUB_LOG" | head -c 400)"
+fi
+
+# Catches: launch uploading the run.toml as given, so the box falls back to
+# defaults the laptop never recorded, or changing a key the file did set.
+added="$(diff "$RUN_TOML" "$IN_SAVED/run.toml" | sed -n 's/^> //p' | grep -v '^#' | grep -v '^$' | tr '\n' ';')"
+removed="$(diff "$RUN_TOML" "$IN_SAVED/run.toml" | grep -c '^<')"
+if [ "$added" = 'concurrent_rounds = 3;concurrent_connections = 10;concurrent_duration_s = 600;concurrent_seed = "clickbench";q29_probe_warmup = 1;q29_probe_runs = 3;perf_record = false;' ] \
+  && [ "$removed" = 0 ] && python3 "$KIT_SRC/lib/kit.py" check-run "$IN_SAVED/run.toml" >/dev/null; then
+  pass "launch uploads run.toml with every phase key it left out written at its default"
+else
+  fail "resolved run.toml" "added '$added', removed $removed line(s)"
 fi
 
 # Catches: dropping or weakening the kit.sha256 check: a tampered kit.tgz
@@ -760,8 +863,8 @@ bad = []
 def want(cond, what):
     if not cond:
         bad.append(what)
-for k in ("provenance", "entries", "skipped", "failed", "totals", "error_pooled", "concurrency",
-          "phases", "bands", "timing_definition"):
+for k in ("provenance", "entries", "skipped", "failed", "totals", "error_pooled", "concurrent",
+          "q29_probe", "phases", "bands", "timing_definition"):
     want(k in r, "field " + k)
 for k in ("git_sha", "binary", "arm", "tenant", "server", "server_logs", "server_settings",
           "band_sections", "kit_arm", "run_id", "lanes", "toolchain", "hardware", "backend",
@@ -809,11 +912,20 @@ for e in entries:
          e["id"] + " answer " + json.dumps(e["answer"]))
     want(e["rows_returned"] == e["answer"]["rows"], e["id"] + " rows_returned")
 want(r["totals"] == {"answered": 43, "failed": [], "hot_sum_s": 21.5, "cold_sum_s": 21.5}, "totals")
-want(r["error_pooled"] == {"calls": 129, "errors": 0, "ratio": 0.0}, "error_pooled")
+want(r["error_pooled"] == {"calls": 129, "errors": 0, "ratio": 0.0, "phases": ["benchmark"]},
+     "error_pooled")
+want(r["concurrent"] is None and r["q29_probe"] is None, "no concurrent or q29_probe block")
 want(r["phases"]["benchmark"]["calls"] == 129 and r["phases"]["benchmark"]["errors"] == 0
      and r["phases"]["benchmark"]["refusal_classes"] == {}, "phases block")
 verdicts = {b["band"]: b["verdict"] for b in r["bands"]}
-want(len(r["bands"]) == 46 and set(verdicts.values()) == {"pass"}, "46 passing absolute bands")
+want(len(r["bands"]) == 49 and [b["verdict"] for b in r["bands"]].count("pass") == 46,
+     "46 passing absolute bands")
+want([b["band"] for b in r["bands"] if b["verdict"] != "pass"]
+     == ["concurrent qps >= concurrent_qps_min",
+         "concurrent error_ratio_weighted <= concurrent_error_pooled_max",
+         "q29_probe min_s <= q29_probe_s_max"]
+     and all(b["verdict"] == "inconclusive" for b in r["bands"] if b["verdict"] != "pass"),
+     "the three phase bands inconclusive with their phases not run")
 want(verdicts.get("hot_sum_s <= hot_sum_s_max") == "pass", "hot band")
 want(verdicts.get("q01 hot_s <= hot_s_max.q01") == "pass", "q01 band")
 want(all(b.get("lane") == "rlog" and "id" not in b for b in r["bands"]), "band lanes and ids")
@@ -1007,7 +1119,8 @@ want(q19.get("answer", {}).get("answered") is False, "q19 answer")
 want(len(r["entries"]) == 41 and r["totals"]["answered"] == 41 and r["totals"]["hot_sum_s"] == 20.5, "totals")
 want(r["phases"]["benchmark"]["errors"] == 6 and r["phases"]["benchmark"]["refusal_classes"]
      == {"resource_exhausted": 3, "wrong_answer": 3}, "phases %r" % r["phases"]["benchmark"])
-want(r["error_pooled"] == {"calls": 129, "errors": 6, "ratio": 6 / 129}, "error_pooled")
+want(r["error_pooled"] == {"calls": 129, "errors": 6, "ratio": 6 / 129, "phases": ["benchmark"]},
+     "error_pooled")
 rows = {b["band"]: b for b in r["bands"]}
 for q in ("q02", "q19"):
     b = rows.get("%s hot_s <= hot_s_max.%s" % (q, q), {})
@@ -1362,7 +1475,9 @@ fixture run-pass "$TMP/fixture-pass" "$TMP/fixture-pass-b"
 fetch pass run-pass --timeout 30
 if [ "$code" = 0 ] && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-pass.out" \
   && grep -q '^PASS  *B vs A  *error_pooled <= A + 0.02' "$TMP/fetch-pass.out" \
-  && grep -q '^INCONCLUSIVE  *B vs A  *qps >= 0.95 x A' "$TMP/fetch-pass.out" \
+  && grep -q '^INCONCLUSIVE  *B vs A  *qps_pooled >= 0.95 x A  *None  *None  *no concurrent phase ran on A or B$' "$TMP/fetch-pass.out" \
+  && grep -q '^INCONCLUSIVE  *B vs A  *q29_probe min_s <= 1.15 x A  *None  *None  *no q29_probe phase ran on A or B$' "$TMP/fetch-pass.out" \
+  && grep -q '^concurrent B: no concurrent phase ran$' "$TMP/fetch-pass.out" \
   && grep -q '^PASS  *B vs A  *q01 hot_s <= max(1.15 x A, 0.2 s)' "$TMP/fetch-pass.out" \
   && grep -q '^PASS  *B vs A  *both answered >= 43  *43  *43$' "$TMP/fetch-pass.out" \
   && grep -q '^PASS  *B vs A  *rows_returned = A (43 both answered)  *0  *0$' "$TMP/fetch-pass.out" \
@@ -1455,13 +1570,29 @@ else
   fail "cold sum" "exit $code: $(grep -v '^PASS' "$TMP/fetch-cold.out" | head -n 4)"
 fi
 
-# Catches: a QPS band that stays inconclusive when both arms ran a concurrency
-# phase, or compares the wrong way: B's 0.9 against 0.95 x A's 1.0 misses.
-edit_arm "$TMP/fixture-pass" "$TMP/fixture-qps-a" 'r["concurrency"] = {"qps": 1.0}'
-as_arm_b "$TMP/fixture-pass" "$TMP/fixture-qps-b" 'r["concurrency"] = {"qps": 0.9}'
+# CONC_PY: a python edit helper for edit_arm. conc(qps) is a one-round
+# concurrent block whose qps_pooled is qps, with no errors.
+CONC_PY='
+def conc(qps):
+    rd = {"round": 1, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+          "ok": 100, "err": 0, "wrong_answer": 0, "qps": qps, "error_ratio": 0.0}
+    return {"rounds": [rd], "pooled": {"rounds": 1, "calls": 100, "ok": 100, "err": 0,
+            "wrong_answer": 0, "error_ratio_weighted": 0.0, "error_ratio_mean_of_rounds": 0.0,
+            "qps_pooled": qps}}
+'
+# Catches: a QPS band that stays inconclusive when both arms ran the
+# concurrent phase, or compares the wrong way: B's 0.9 against 0.95 x A's 1.0
+# misses.
+edit_arm "$TMP/fixture-pass" "$TMP/fixture-qps-a" "$CONC_PY"'
+r["concurrent"] = conc(1.0)'
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-qps-b" "$CONC_PY"'
+r["concurrent"] = conc(0.9)'
 fixture run-qps "$TMP/fixture-qps-a" "$TMP/fixture-qps-b"
 fetch qps run-qps --timeout 30
-if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *qps >= 0.95 x A  *0.900  *0.950$' "$TMP/fetch-qps.out" \
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *qps_pooled >= 0.95 x A  *0.900  *0.950$' "$TMP/fetch-qps.out" \
+  && grep -q '^PASS  *B vs A  *concurrent error_ratio_weighted <= A + 0.02  *0.000  *0.020$' "$TMP/fetch-qps.out" \
+  && grep -q '^concurrent B round 1: qps 0.900 error_ratio 0.000 ' "$TMP/fetch-qps.out" \
+  && grep -q '^concurrent B pooled: qps_pooled 0.900 error_ratio_weighted 0.000 ' "$TMP/fetch-qps.out" \
   && [ "$(grep -c '^MISS' "$TMP/fetch-qps.out")" = 1 ]; then
   pass "a QPS under the ratio misses when both arms measured it"
 else
@@ -1729,6 +1860,649 @@ if [ "$code" = 3 ] && grep -q 'no marker from both arms within 2 s' "$TMP/fetch-
   pass "no marker within --timeout exits 3"
 else
   fail "timeout" "exit $code: $(tail -n 2 "$TMP/fetch-pending.err")"
+fi
+
+# --- concurrent, q29_probe and perf phases ----------------------------------
+
+# Catches: a statement order that is not upstream bench_concurrent_qps's
+# (another hash, byte order or shuffle), which would make the two kits' QPS
+# figures incomparable. The indexes are pinned literals, not recomputed.
+perm="$(python3 "$KIT_SRC/lib/kit.py" permutation clickbench 1 43)"
+if [ "$(echo "$perm" | cut -d' ' -f1-5)" = "14 23 41 9 1" ] \
+  && [ "$(echo "$perm" | tr ' ' '\n' | sort -n | tr '\n' ' ')" = "$(seq 0 42 | tr '\n' ' ')" ]; then
+  pass "seed clickbench, connection 1, 43 statements: the order starts 14 23 41 9 1"
+else
+  fail "permutation" "got '$perm'"
+fi
+
+# A concurrent phase directory of three rounds of 2 s nominal, each with a
+# measured wall time over it and a different call count:
+#   round 1: 10 calls, 9 of them 2xx (one a wrong answer), 1 a 500
+#   round 2: 30 calls, all 2xx
+#   round 3:  4 calls, all 503
+CONC_DIR="$TMP/conc-units"
+mkdir -p "$CONC_DIR"
+python3 - "$CONC_DIR" <<'PY'
+import json, os, sys
+d = sys.argv[1]
+with open(os.path.join(d, "rounds.jsonl"), "w") as f:
+    for r, wall in ((1, 2.5), (2, 2.25), (3, 3.0)):
+        f.write(json.dumps({"round": r, "duration_s": 2, "wall_s": wall, "connections": 2,
+                            "statements": 43, "seed": "clickbench"}) + "\n")
+calls = []
+def call(r, status, cls=""):
+    calls.append({"statement": "q01_count_all", "round": r, "connection": 1 + len(calls) % 2,
+                  "http_status": status, "curl_exit": 0, "refusal_class": cls})
+for i in range(8):
+    call(1, 200)
+call(1, 200, "wrong_answer")
+call(1, 500, "internal")
+for i in range(30):
+    call(2, 200)
+for i in range(4):
+    call(3, 503, "unavailable")
+with open(os.path.join(d, "calls.jsonl"), "w") as f:
+    for c in calls:
+        f.write(json.dumps(c) + "\n")
+PY
+code=0
+python3 "$KIT_SRC/lib/kit.py" concurrent-summary "$CONC_DIR" >"$TMP/conc-units.json" 2>"$TMP/conc-units.err" || code=$?
+
+# conc_check NAME PYTHON: PYTHON run against the summary as s, rounds as rd;
+# it prints nothing when the claim holds.
+conc_check() {
+  python3 - "$TMP/conc-units.json" "$2" <<'PY' 2>&1
+import json, sys
+s = json.load(open(sys.argv[1]))
+rd = dict((r["round"], r) for r in s["rounds"])
+p = s["pooled"]
+exec(sys.argv[2])
+PY
+}
+
+# Catches: a round's QPS divided by its measured wall time (2.5 s, 2.25 s)
+# instead of the nominal duration_s (2 s): 9 / 2.5 is 3.6, not 4.5.
+out="$(conc_check qps '
+if (rd[1]["qps"], rd[2]["qps"]) != (4.5, 15.0) or rd[1]["wall_s"] == rd[1]["duration_s"]:
+    print("qps", rd[1]["qps"], rd[2]["qps"])')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "a round's QPS is its 2xx calls over the nominal duration, not the wall time"
+else
+  fail "round qps" "exit $code: $out $(head -c 300 "$TMP/conc-units.err")"
+fi
+
+# Catches: a round that made calls but had no successful one reported as
+# null QPS, which the pooled mean would then leave out, or its errors dropped.
+out="$(conc_check zero '
+if rd[3]["qps"] != 0.0 or rd[3]["error_ratio"] != 1.0 or (rd[3]["ok"], rd[3]["err"]) != (0, 4):
+    print(rd[3])')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "an all-error round has QPS 0 and error ratio 1.0"
+else
+  fail "all-error round" "$out"
+fi
+
+# Catches: qps_pooled leaving the all-error round out ((4.5 + 15) / 2 =
+# 9.75), so arm B with one dead round could pass qps_min_ratio against arm
+# A's three good ones, rather than the mean with it as 0 ((4.5 + 15 + 0) / 3
+# = 6.5), and the mean of the round error ratios ((0.1 + 0 + 1) / 3)
+# reported under error_ratio_weighted, whose value is all errors over all
+# calls (5 / 44).
+out="$(conc_check pooled '
+want = {"rounds": 3, "calls": 44, "ok": 39, "err": 5, "wrong_answer": 1, "qps_pooled": 6.5}
+for k, v in want.items():
+    if p[k] != v:
+        print(k, p[k], "want", v)
+if abs(p["error_ratio_weighted"] - 5 / 44.0) > 1e-12:
+    print("error_ratio_weighted", p["error_ratio_weighted"], "want", 5 / 44.0)
+if abs(p["error_ratio_mean_of_rounds"] - 1.1 / 3) > 1e-12:
+    print("error_ratio_mean_of_rounds", p["error_ratio_mean_of_rounds"], "want", 1.1 / 3)
+if abs(p["error_ratio_weighted"] - p["error_ratio_mean_of_rounds"]) < 0.1:
+    print("the two error forms do not differ")')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "three rounds, one with no success, pool to qps_pooled 6.5 (that round as 0), error_ratio_weighted 5/44 and mean_of_rounds 1.1/3"
+else
+  fail "pooling" "$out"
+fi
+
+# Catches: a round that made no call at all counted as 0 in qps_pooled, when
+# it has nothing to measure: it stays null and out of the mean.
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+meta = lambda r: {"round": r, "duration_s": 2, "wall_s": 2.0, "connections": 1}
+ok = {"http_status": 200, "curl_exit": 0}
+rounds = [kit.concurrent_round(meta(1), [dict(ok)] * 6), kit.concurrent_round(meta(2), [])]
+p = kit.pool_rounds(rounds)
+if rounds[1]["qps"] is not None or p["qps_pooled"] != 3.0:
+    print(rounds[1], p)
+PY
+)"
+if [ -z "$out" ]; then
+  pass "a round with no call has QPS null and stays out of qps_pooled"
+else
+  fail "no-call round" "$out"
+fi
+
+# Catches: a 200 whose transfer then failed counted as a success, where
+# upstream's curl --fail-with-body exits non-zero and the call is an error.
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+meta = {"round": 1, "duration_s": 2, "wall_s": 2.0, "connections": 1}
+rd = kit.concurrent_round(meta, [{"http_status": 200, "curl_exit": 0},
+                                 {"http_status": 200, "curl_exit": 18}])
+if (rd["ok"], rd["err"], rd["qps"]) != (1, 1, 0.5):
+    print(rd)
+PY
+)"
+if [ -z "$out" ]; then
+  pass "a 200 whose transfer failed (curl exit 18) is a concurrent error"
+else
+  fail "transfer failure" "$out"
+fi
+
+# Catches: error_pooled counting any phase but the benchmark's, so its verdict
+# would change with which phases a run names: the same benchmark calls must
+# give the same figure with q29_probe and perf calls beside them.
+out="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+def report(phases):
+    return {"totals": {"hot_sum_s": 1.0, "cold_sum_s": 1.0}, "phases": phases}
+bench = {"benchmark": {"calls": 129, "errors": 6}}
+more = dict(bench, q29_probe={"calls": 4, "errors": 4}, perf={"calls": 86, "errors": 0},
+            concurrent={"calls": 5000, "errors": 900})
+a, b = kit.run_metrics(report(bench)), kit.run_metrics(report(more))
+if a["error_pooled"] != 6 / 129.0 or b["error_pooled"] != a["error_pooled"]:
+    print("error_pooled", a["error_pooled"], b["error_pooled"])
+if kit.pooled_errors(more) != (129, 6):
+    print("pooled_errors", kit.pooled_errors(more))
+PY
+)"
+if [ -z "$out" ]; then
+  pass "error_pooled counts the benchmark phase only, whichever other phases ran"
+else
+  fail "error_pooled phases" "$out"
+fi
+
+# Catches: a 2xx answer with the wrong row count counted as an error in the
+# concurrent phase, where upstream counts any 2xx as a success.
+out="$(conc_check wrong '
+if (rd[1]["ok"], rd[1]["err"], rd[1]["wrong_answer"]) != (9, 1, 1):
+    print(rd[1])')"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "a 2xx with the wrong row count counts as ok and in wrong_answer"
+else
+  fail "wrong answer in concurrent" "$out"
+fi
+
+# Each new band key judged pass, miss and inconclusive (its phase absent),
+# against the filled band file: relative qps_min_ratio 0.95,
+# concurrent_error_pooled_max_delta 0.02, q29_probe_max_ratio 1.15; absolute
+# concurrent_qps_min 1.0, concurrent_error_pooled_max 0.1, q29_probe_s_max 1.0.
+python3 - "$KIT_SRC/lib" "$BANDS" "$TMP/fixture-pass/results.json" >"$TMP/bandkeys.out" 2>&1 <<'PY'
+import copy, json, sys
+sys.path.insert(0, sys.argv[1])
+import kit
+bands, base = sys.argv[2], json.load(open(sys.argv[3]))
+
+def conc(qps, weighted, mean=None):
+    return {"rounds": [], "pooled": {
+        "rounds": 1, "calls": 100, "ok": 90, "err": 10, "wrong_answer": 0,
+        "error_ratio_weighted": weighted,
+        "error_ratio_mean_of_rounds": weighted if mean is None else mean, "qps_pooled": qps}}
+
+def probe(min_s):
+    return {"statement": "q29_referer_length_by_host", "warmup": 1, "runs": 3,
+            "runs_s": [min_s] * 3, "errors": 0, "min_s": min_s, "median_s": min_s}
+
+def report(c=None, p=None):
+    r = copy.deepcopy(base)
+    r["concurrent"], r["q29_probe"] = c, p
+    return r
+
+def one(rows, prefix):
+    hits = [x["verdict"] for x in rows if x["band"].startswith(prefix)]
+    return hits[0] if len(hits) == 1 else "%d rows" % len(hits)
+
+def rel(b, prefix, a=None):
+    a = a or report(conc(10.0, 0.01), probe(1.0))
+    return one(kit.relative_bands(bands, a, b), prefix)
+
+def ab(r, prefix):
+    return one(kit.absolute_bands("rlog", bands, ["absolute"], r), prefix)
+
+A = report(conc(10.0, 0.01), probe(1.0))
+cases = {
+    "relative.qps_min_ratio": [
+        (rel(report(conc(9.6, 0.01)), "qps_pooled >="), "pass"),
+        (rel(report(conc(9.4, 0.01)), "qps_pooled >="), "miss"),
+        (rel(report(None, probe(1.0)), "qps_pooled >="), "inconclusive"),
+        (rel(A, "qps_pooled >=", a=report(None, probe(1.0))), "inconclusive")],
+    # The mean-of-rounds figure is set to flip each verdict, so a band that
+    # read it would give the opposite answer.
+    "relative.concurrent_error_pooled_max_delta": [
+        (rel(report(conc(10.0, 0.025, mean=0.5)), "concurrent error_ratio_weighted <= A"), "pass"),
+        (rel(report(conc(10.0, 0.035, mean=0.0)), "concurrent error_ratio_weighted <= A"), "miss"),
+        (rel(report(None, probe(1.0)), "concurrent error_ratio_weighted <= A"), "inconclusive")],
+    "relative.q29_probe_max_ratio": [
+        (rel(report(conc(10.0, 0.01), probe(1.1)), "q29_probe min_s <= 1.15"), "pass"),
+        (rel(report(conc(10.0, 0.01), probe(1.2)), "q29_probe min_s <= 1.15"), "miss"),
+        (rel(report(conc(10.0, 0.01), None), "q29_probe min_s <= 1.15"), "inconclusive")],
+    "absolute.concurrent_qps_min": [
+        (ab(report(conc(2.0, 0.0)), "concurrent qps >="), "pass"),
+        (ab(report(conc(0.5, 0.0)), "concurrent qps >="), "miss"),
+        (ab(report(), "concurrent qps >="), "inconclusive")],
+    "absolute.concurrent_error_pooled_max": [
+        (ab(report(conc(2.0, 0.05, mean=0.5)), "concurrent error_ratio_weighted <= concurrent"), "pass"),
+        (ab(report(conc(2.0, 0.2, mean=0.0)), "concurrent error_ratio_weighted <= concurrent"), "miss"),
+        (ab(report(), "concurrent error_ratio_weighted <= concurrent"), "inconclusive")],
+    "absolute.q29_probe_s_max": [
+        (ab(report(p=probe(0.8)), "q29_probe min_s <= q29_probe_s_max"), "pass"),
+        (ab(report(p=probe(1.5)), "q29_probe min_s <= q29_probe_s_max"), "miss"),
+        (ab(report(), "q29_probe min_s <= q29_probe_s_max"), "inconclusive")],
+}
+for key in sorted(cases):
+    got = [g for g, _ in cases[key]]
+    want = [w for _, w in cases[key]]
+    print("%s\t%s" % (key, "" if got == want else "got %s, want %s" % (got, want)))
+PY
+bandkeys=0
+while IFS=$'\t' read -r key problem; do
+  bandkeys=$((bandkeys + 1))
+  # Catches: a new band key never judged, judged on the wrong figure, or
+  # passing (rather than inconclusive) when its phase did not run.
+  if [ -z "$problem" ]; then
+    pass "band $key: pass, miss, and inconclusive with its phase absent"
+  else
+    fail "band $key" "$problem"
+  fi
+done <"$TMP/bandkeys.out"
+[ "$bandkeys" = 6 ] || fail "band keys" "$(head -c 600 "$TMP/bandkeys.out")"
+
+# The whole box with every phase on stubs: two rounds of two connections for
+# 2 s each. Statement 02 is refused (422) and statement 01 answers 5 rows
+# where the corpus expects 1, on every call; connection 2's order starts with
+# them, so each round has at least one of each. The q29 probe's warmup is the
+# fastest call, so a summary that took it in would report 0.1.
+BOX_C="$TMP/box-conc"
+code=0
+rm -f "$STUB_DIR/perf-argv"
+BOX_TOML_SED='s/^phases = .*/phases = ["benchmark", "concurrent", "q29_probe", "perf"]/
+s/^concurrent_rounds = .*/concurrent_rounds = 2/
+s/^concurrent_connections = .*/concurrent_connections = 2/
+s/^concurrent_duration_s = .*/concurrent_duration_s = 2/
+s/^perf_record = .*/perf_record = true/' \
+  run_box A box-conc STUB_SQL_REFUSE_N=02 STUB_SQL_ROWS_N=01 STUB_SQL_ROWS=5 \
+  'STUB_PROBE_TIMES=0.1 0.3 0.7 0.4' KIT_PERF_SETTLE=0.05 || code=$?
+rm -rf "$TMP/fixture-conc"
+mv "$RUN_DIR/out/A" "$TMP/fixture-conc"
+if [ "$code" = 0 ] && [ -f "$TMP/fixture-conc/DONE" ] && [ -f "$TMP/fixture-conc/results.json" ]; then
+  pass "a box with every phase finishes DONE"
+else
+  fail "box with every phase" "exit $code; $(head -n 3 "$TMP/fixture-conc/FAILED" 2>/dev/null); run.log: $(tail -n 5 "$BOX_C/kit/run.log")"
+fi
+
+# box_check PYTHON: PYTHON run against the box's results.json as r, its
+# concurrent calls as calls, its q29 probe calls as probe; it prints nothing
+# when the claim holds.
+box_check() {
+  python3 - "$TMP/fixture-conc/results.json" "$BOX_C/kit/out" "$1" <<'PY' 2>&1
+import json, os, sys
+r = json.load(open(sys.argv[1]))
+def lines(p):
+    return [json.loads(l) for l in open(os.path.join(sys.argv[2], p))]
+calls = lines("concurrent/calls.jsonl")
+probe = lines("q29_probe/calls.jsonl")
+exec(sys.argv[3])
+PY
+}
+
+# Catches: a concurrent call recorded without its round and connection, a
+# round whose calls are not all in calls.jsonl, or connections that do not
+# follow their seeded order: connection 1 starts q15 q24, connection 2 q02 q01.
+out="$(box_check '
+c = r["concurrent"]
+if [x["round"] for x in c["rounds"]] != [1, 2] or c["connections"] != 2 or c["duration_s"] != 2:
+    print("block", c["rounds"], c["connections"], c["duration_s"])
+for x in calls:
+    if x.get("phase") != "concurrent" or x.get("round") not in (1, 2) or x.get("connection") not in (1, 2):
+        print("call", x)
+for rd in c["rounds"]:
+    n = sum(1 for x in calls if x["round"] == rd["round"])
+    if n != rd["calls"] or n < 4:
+        print("round", rd["round"], "has", n, "lines, reports", rd["calls"])
+    for conn, first in ((1, ["q15", "q24"]), (2, ["q02", "q01"])):
+        got = [x["statement"][:3] for x in calls if x["round"] == rd["round"] and x["connection"] == conn][:2]
+        if got != first:
+            print("round", rd["round"], "connection", conn, "starts", got)
+if r["error_pooled"]["phases"] != ["benchmark"]:
+    print("error_pooled", r["error_pooled"])')"
+if [ -z "$out" ]; then
+  pass "a stub round writes one line per call with its round and connection, in seeded order"
+else
+  fail "concurrent calls" "$out"
+fi
+
+# Catches: a box round's QPS taken from anything but its 2xx calls over the
+# nominal duration_s, or a 2xx wrong answer counted as an error there.
+out="$(box_check '
+for rd in r["concurrent"]["rounds"]:
+    mine = [x for x in calls if x["round"] == rd["round"]]
+    ok = sum(1 for x in mine if 200 <= x["http_status"] <= 299 and x["curl_exit"] == 0)
+    wrong = [x for x in mine if x["refusal_class"] == "wrong_answer"]
+    if rd["ok"] != ok or rd["qps"] != ok / 2.0 or rd["wall_s"] < 1:
+        print("round", rd)
+    if not wrong or rd["wrong_answer"] != len(wrong) or any(x["http_status"] != 200 for x in wrong):
+        print("wrong answers", rd["wrong_answer"], len(wrong))
+    if rd["err"] != sum(1 for x in mine if x["http_status"] == 422) or rd["err"] < 1:
+        print("errors", rd["err"])')"
+if [ -z "$out" ]; then
+  pass "a box round's QPS is its 2xx calls over 2 s, wrong answers among them"
+else
+  fail "box concurrent figures" "$out"
+fi
+
+# Catches: the q29 probe timing its warmup, skipping the stats, or reporting
+# min and median over anything but the timed runs (0.3, 0.7, 0.4).
+out="$(box_check '
+if [x.get("probe") for x in probe] != ["warmup", "run", "run", "run"] or any("stats" not in x for x in probe):
+    print("calls", probe)
+if any(not x["statement"].startswith("q29_") for x in probe):
+    print("statements", [x["statement"] for x in probe])
+q = r["q29_probe"]
+want = {"warmup": 1, "runs": 3, "runs_s": [0.3, 0.7, 0.4], "errors": 0, "min_s": 0.3, "median_s": 0.4}
+for k, v in want.items():
+    if q[k] != v:
+        print(k, q[k], "want", v)')"
+if [ -z "$out" ]; then
+  pass "the q29 probe logs warmup and runs, with min and median from the timed runs only"
+else
+  fail "q29 probe" "$out"
+fi
+
+# Catches: perf recording another process or at another rate, perf.data kept
+# instead of folded stacks, or the stacks left out of the evidence.
+perf_lines="$(grep -c '^perf record -F 99 -g -p [0-9][0-9]* -o .*/out/perf/[0-9][0-9]\.data$' "$STUB_DIR/perf-argv" 2>/dev/null)"
+folded="$(cat "$BOX_C"/kit/out/perf/*.folded 2>/dev/null | sort | uniq -c | sed 's/^ *//')"
+in_tgz="$(tar -tzf "$TMP/fixture-conc/evidence.tgz" | grep -c '^out/perf/[0-9][0-9]\.folded$')"
+profiled="$(grep -c '"profiled": true' "$BOX_C/kit/out/perf/calls.jsonl")"
+if [ "$perf_lines" = 43 ] && [ "$folded" = "43 ravel-server;main;execute;scan_rows 2" ] && [ "$in_tgz" = 43 ] \
+  && [ "$profiled" = 43 ] && ! ls "$BOX_C"/kit/out/perf/*.data >/dev/null 2>&1; then
+  pass "perf records each statement's hot call and keeps folded stacks in the evidence"
+else
+  fail "perf" "record lines $perf_lines, folded '$folded', in evidence $in_tgz, profiled $profiled"
+fi
+
+# Catches: fetch printing no per-round figures, or a share table on a
+# concurrent error miss that does not add up to the arm's concurrent errors.
+# Arm A is the box above with its concurrent errors edited away and the band
+# file's delta set to 0, so arm B, the same box, misses on its 422s.
+edit_arm "$TMP/fixture-conc" "$TMP/fixture-share-a" '
+r["concurrent"]["pooled"].update(err=0, error_ratio_weighted=0.0)
+for b in r["bands"]:
+    if b["band"].startswith("concurrent error"):
+        b["verdict"] = "pass"'
+as_arm_b "$TMP/fixture-conc" "$TMP/fixture-share-b"
+fixture run-share "$TMP/fixture-share-a" "$TMP/fixture-share-b"
+SHARE_RUN="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-share"
+rm -rf "$TMP/share-kit"
+mkdir -p "$TMP/share-kit"
+tar -xzf "$SHARE_RUN/in/kit.tgz" -C "$TMP/share-kit"
+sed 's/^concurrent_error_pooled_max_delta = .*/concurrent_error_pooled_max_delta = 0/' \
+  "$TMP/share-kit/kit/bands/rlog.toml" >"$TMP/share-kit/rlog.toml"
+mv "$TMP/share-kit/rlog.toml" "$TMP/share-kit/kit/bands/rlog.toml"
+tar -czf "$SHARE_RUN/in/kit.tgz" -C "$TMP/share-kit" kit
+fetch share run-share --timeout 30
+out="$(python3 - "$TMP/fetch-share.out" "$TMP/fixture-share-b/results.json" <<'PY' 2>&1
+import re, sys
+text = open(sys.argv[1]).read()
+import json
+p = json.load(open(sys.argv[2]))["concurrent"]["pooled"]
+if not re.search(r"^MISS +B vs A +concurrent error_ratio_weighted <= A \+ 0 ", text, re.M):
+    print("no concurrent error miss")
+for arm in "AB":
+    for n in (1, 2):
+        if not re.search(r"^concurrent %s round %d: qps \S+ error_ratio \S+ \(ok \d+" % (arm, n), text, re.M):
+            print("no round %d line for %s" % (n, arm))
+    if not re.search(r"^concurrent %s pooled: qps_pooled \S+ error_ratio_weighted \S+ "
+                     r"error_ratio_mean_of_rounds \S+" % arm, text, re.M):
+        print("no pooled line for", arm)
+m = re.search(r"^concurrent B errors by statement \((\d+) errors of (\d+) calls\):\n((?:  .*\n)*)", text, re.M)
+if not m:
+    print("no share table for B")
+else:
+    rows = re.findall(r"^  (\S+) +(\d+) / (\d+)$", m.group(3), re.M)
+    if int(m.group(1)) != p["err"] or int(m.group(2)) != p["calls"]:
+        print("header", m.group(1), m.group(2), "want", p["err"], p["calls"])
+    if sum(int(n) for _, n, _ in rows) != p["err"] or any(int(t) != p["err"] for _, _, t in rows):
+        print("rows", rows, "do not sum to", p["err"])
+    if [s for s, _, _ in rows] != ["q02_count_adv_engine"]:
+        print("statements", rows)
+if "concurrent A errors by statement" in text:
+    print("a share table for A, which did not miss")
+PY
+)"
+if [ "$code" = 1 ] && [ -z "$out" ]; then
+  pass "fetch prints per-round figures and, on a concurrent error miss, a share table summing to its errors"
+else
+  fail "share table" "exit $code: $out $(tail -n 3 "$TMP/fetch-share.err")"
+fi
+
+# lib_box BOX: boot an arm A box in BOX and write BOX/lib-setup.sh, which a
+# case's subshell sources: run.sh in library mode with its config loaded, the
+# stub server installed, arm.env written and the query window set.
+lib_box() {
+  local box="$1"
+  reset_log
+  rm -f "$STUB_DIR/readyz-calls" "$STUB_DIR/check-calls" "$STUB_DIR/ready-delay" \
+    "$STUB_DIR/check-refuse" "$STUB_DIR/server-ready"
+  boot_box A "$box" || return 1
+  cat >"$box/lib-setup.sh" <<SETUP
+export KIT_ROOT="$box" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
+export KIT_DROP_CACHES_FILE="$box/drop_caches"
+. "$box/kit/kit/box/run.sh"
+mkdir -p "\$STAMPS"
+load_config || exit 1
+mkdir -p "\$BIN_DIR"
+cp "$BINSTUBS/ravel-server" "\$BIN_DIR/ravel-server-\$SHA"
+resolve_arm_env || exit 1
+set_query_window
+SETUP
+}
+
+# conc_outage_check BOX DURATION: prints nothing when BOX's one concurrent
+# round parsed, ended at its deadline with exactly one watchdog restart, and
+# never polled readyz.
+conc_outage_check() {
+  python3 - "$1/kit/out/concurrent" "$2" "$STUB_DIR" <<'PY' 2>&1
+import json, os, sys
+d, duration, stub = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+calls = [json.loads(l) for l in open(os.path.join(d, "calls.jsonl"))]
+s = json.load(open(os.path.join(d, "summary.json")))
+rd = s["rounds"][0]
+bad = [c for c in calls if not (200 <= c["http_status"] <= 299 and c["curl_exit"] == 0)]
+if (s["pooled"]["calls"], s["pooled"]["err"]) != (len(calls), len(bad)):
+    print("summary", s["pooled"], "calls", len(calls), "errors", len(bad))
+log = open(os.path.join(d, "round-1", "watchdog.log")).read()
+if log.count("restart n=") != 1 or "restart failed" in log:
+    print("watchdog log", repr(log))
+if not duration - 1 <= rd["wall_s"] < duration + 1.5:
+    print("wall_s", rd["wall_s"], "for a", duration, "s round")
+if os.path.exists(os.path.join(stub, "readyz-calls")):
+    print("readyz polled", open(os.path.join(stub, "readyz-calls")).read().count("readyz"), "times")
+if open(os.path.join(stub, "check-calls")).read().count("check") < 2:
+    print("SELECT 1 check not used")
+PY
+}
+
+# Catches: run_query writing curl's "000" as the status of a call to a
+# server that is down (invalid JSON, so the concurrent summary refuses the
+# file and one outage fails the run), a watchdog that does not restart a dead
+# server exactly once, a round that does not end at its whole-second deadline
+# with the watchdog collected, and readiness read from readyz. The server dies
+# 0.5 s into the round and its restart takes 1 s, so calls in between are
+# errors.
+BOX_O="$TMP/box-outage"
+lib_box "$BOX_O"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_O/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=5
+  WATCHDOG_INTERVAL=0.3 WATCHDOG_READY_TRIES=300
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.5
+    echo 1.0 >"$STUB_DIR/ready-delay"
+    kill -TERM "$(cat "$KIT/server.pid")"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  rm -f "$STUB_DIR/ready-delay"
+  stop_server
+) >"$TMP/outage.log" 2>&1
+code=$?
+rm -f "$STUB_DIR/ready-delay"
+out="$(conc_outage_check "$BOX_O" 5)"
+down="$(python3 - "$BOX_O/kit/out/concurrent/calls.jsonl" <<'PY' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+down = [i for i, c in enumerate(calls) if c["http_status"] == 0]
+if not down or any((calls[i]["outcome"], calls[i]["curl_exit"]) != ("unreachable", 7) for i in down):
+    print("calls during the outage", [calls[i] for i in down][:3])
+by_conn = {}
+for c in calls:
+    by_conn.setdefault(c["connection"], []).append(c)
+for conn, mine in by_conn.items():
+    last_down = max([i for i, c in enumerate(mine) if c["http_status"] == 0] or [-1])
+    if not any(c["outcome"] == "ok" for c in mine[last_down + 1:]):
+        print("connection", conn, "has no success after the outage")
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ -z "$down" ]; then
+  pass "a server dying mid-round: outage calls are errors with status 0, one restart, the round ends at its deadline"
+else
+  fail "concurrent outage" "exit $code: $out $down $(tail -n 3 "$TMP/outage.log")"
+fi
+
+# Catches: a watchdog or pre-round poll that reads readyz instead of
+# upstream's SELECT 1 check: here SELECT 1 is refused (memory pressure) while
+# readyz would answer, and upstream restarts the server.
+BOX_M="$TMP/box-check-refuse"
+lib_box "$BOX_M"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_M/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=1 CONC_DURATION=3
+  WATCHDOG_INTERVAL=0.3 WATCHDOG_READY_TRIES=300
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.2
+    touch "$STUB_DIR/check-refuse"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  stop_server
+) >"$TMP/check-refuse.log" 2>&1
+code=$?
+out="$(conc_outage_check "$BOX_M" 3)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ ! -e "$STUB_DIR/check-refuse" ]; then
+  pass "a refused SELECT 1 check restarts the server once; readyz is never polled"
+else
+  fail "SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-refuse.log")"
+fi
+
+# Catches: run_query recording an answer whose status line said 200 but whose
+# transfer then failed as a success, or without its curl exit code.
+BOX_T="$TMP/box-transfer"
+lib_box "$BOX_T"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_T/lib-setup.sh"
+  export STUB_SQL_TRUNCATE_N=05
+  phase_requests "$OUT/concurrent" || exit 1
+  start_server || exit 1
+  RQ_MAX_TIME="" RQ_EXTRA='"round": 1, "connection": 1' run_query concurrent 05 q05 1 \
+    "$OUT/concurrent/requests/05.json" || exit 1
+  RQ_MAX_TIME="" RQ_EXTRA='"round": 1, "connection": 1' run_query concurrent 06 q06 2 \
+    "$OUT/concurrent/requests/06.json" || exit 1
+  stop_server
+) >"$TMP/transfer.log" 2>&1
+code=$?
+out="$(python3 - "$KIT_SRC/lib" "$BOX_T/kit/out/concurrent/calls.jsonl" <<'PY' 2>&1
+import json, sys
+sys.path.insert(0, sys.argv[1])
+import kit
+calls = [json.loads(l) for l in open(sys.argv[2])]
+t = calls[0]
+if (t["http_status"], t["curl_exit"], t["outcome"], t["refusal_class"]) != (200, 18, "error", "transfer"):
+    print("truncated call", t)
+if (calls[1]["http_status"], calls[1]["curl_exit"], calls[1]["outcome"]) != (200, 0, "ok"):
+    print("good call", calls[1])
+rd = kit.concurrent_round({"round": 1, "duration_s": 1, "wall_s": 1.0, "connections": 1}, calls)
+if (rd["ok"], rd["err"]) != (1, 1):
+    print("round", rd)
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "run_query records a 200 with a failed transfer as curl_exit 18, an error in the concurrent figures"
+else
+  fail "run_query transfer" "exit $code: $out $(tail -n 3 "$TMP/transfer.log")"
+fi
+
+# Catches: a perf phase that fails after perf record and leaves the raw
+# perf.data in out/perf/, which evidence.tgz would then carry.
+BOX_F="$TMP/box-perf-fail"
+lib_box "$BOX_F"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_F/lib-setup.sh"
+  PERF_RECORD=true PERF_SETTLE=0.05
+  export STUB_PERF_SCRIPT_FAIL=1
+  mkdir -p "$OUT/perf"
+  phase_perf && exit 1
+  stop_server
+  exit 0
+) >"$TMP/perf-fail.log" 2>&1
+code=$?
+if [ "$code" = 0 ] && [ -f "$BOX_F/kit/out/perf/01.record.log" ] \
+  && ! ls "$BOX_F"/kit/out/perf/*.data >/dev/null 2>&1; then
+  pass "a failed perf script leaves no perf.data behind"
+else
+  fail "perf cleanup" "exit $code; left: $(ls "$BOX_F/kit/out/perf" 2>&1 | tr '\n' ' ')"
+fi
+
+# Catches: now_us failing where bash has no EPOCHREALTIME (macOS's bash 3.2),
+# through GNU date or, where date has no %N, python3.
+mkdir -p "$TMP/bsd-date"
+printf '#!/bin/sh\necho 1792174430N\n' >"$TMP/bsd-date/date"
+chmod +x "$TMP/bsd-date/date"
+out="$(
+  KIT_RUN_SH_LIB=1 KIT_ROOT="$TMP/no-box"
+  # shellcheck source=/dev/null
+  . "$KIT_SRC/box/run.sh"
+  unset EPOCHREALTIME
+  ref="$(python3 -c 'import time; print(time.time_ns() // 1000)')"
+  a="$(now_us)" || echo "date path failed"
+  b="$(PATH="$TMP/bsd-date:$PATH" now_us)" || echo "python path failed"
+  for v in "$a" "$b"; do
+    [[ "$v" =~ ^[0-9]{16}$ ]] && [ $((v - ref)) -lt 5000000 ] && [ $((ref - v)) -lt 5000000 ] \
+      || echo "now_us gave '$v' against $ref"
+  done
+)"
+# An array that can be empty must use the expansion bash 3.2 accepts under
+# set -u, which expands to nothing.
+unguarded="$(grep -nE '"\$\{(opts|extra)\[@\]\}"' "$KIT_SRC/box/run.sh" | grep -vE '\$\{(opts|extra)\[@\]\+')"
+if [ -z "$out" ] && [ -z "$unguarded" ]; then
+  pass "now_us works without EPOCHREALTIME and empty arrays expand guarded"
+else
+  fail "bash 3.2" "$out $unguarded"
 fi
 
 # --- syntax -----------------------------------------------------------------

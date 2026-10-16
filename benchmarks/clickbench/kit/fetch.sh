@@ -10,9 +10,13 @@
 # absolute band table followed by every lane's relative bands, arm B against
 # arm A, when run.toml's band_sections selected them:
 #
-#   pooled error rate   at most A's + relative.error_pooled_max_delta; a
-#                       wrong-answer call counts as an error
-#   QPS                 at least relative.qps_min_ratio x A's
+#   pooled error rate   the benchmark phase's calls only, at most A's +
+#                       relative.error_pooled_max_delta; a wrong-answer call
+#                       counts as an error
+#   concurrent QPS      qps_pooled at least relative.qps_min_ratio x A's
+#   concurrent errors   error_ratio_weighted at most A's +
+#                       relative.concurrent_error_pooled_max_delta
+#   q29 probe           min_s at most relative.q29_probe_max_ratio x A's
 #   each statement hot  at most max(relative.hot_statement_max_ratio x A's,
 #                       relative.hot_statement_floor_s)
 #   hot sum, cold sum   each at most relative.hot_sum_max_ratio /
@@ -21,16 +25,23 @@
 #   each statement      a statement A answered and B did not is a miss,
 #                       named by id
 #
-# A band that cannot be judged (QPS with no concurrency phase, a statement
-# arm A failed) is printed INCONCLUSIVE and is not a miss.
+# A band that cannot be judged (a concurrent or q29_probe band on a run where
+# that phase did not run on both arms, a statement arm A failed) is printed
+# INCONCLUSIVE and is not a miss.
+#
+# After the tables it prints each arm's concurrent rounds (QPS and error
+# ratio per round) beside its pooled figures, and, for an arm that missed a
+# concurrent error band, that arm's concurrent errors by statement as
+# "count / total", read from out/concurrent/calls.jsonl in its evidence.tgz.
 #
 # Written for bash 3.2 (macOS /bin/bash).
 #
 # Exit codes:
 #   0   both arms DONE and every band passed or was inconclusive
 #   1   a band missed, absolute on either arm or relative
-#   2   an arm wrote FAILED (its content is printed), or a results.json is
-#       missing or malformed
+#   2   an arm wrote FAILED (its content is printed), a results.json is
+#       missing or malformed, or an arm that missed a concurrent error band
+#       has no out/concurrent/calls.jsonl in its evidence.tgz
 #   3   --timeout elapsed before both arms wrote a marker
 #   4   S3 unreachable: --unreachable-tries consecutive polls failed (default
 #       3), or a download failed with an error other than a missing key
@@ -237,6 +248,8 @@ for band in "$OUT_DIR"/kit/bands/*.toml; do
     *) exit 2 ;;
   esac
 done
+kit_py concurrent-detail "$OUT_DIR/kit/bands" "$OUT_DIR/A/results.json" "$OUT_DIR/A/evidence.tgz" \
+  "$OUT_DIR/B/results.json" "$OUT_DIR/B/evidence.tgz" || exit 2
 if [ "$miss" = 1 ]; then
   echo "fetch: at least one band MISSED; results under $OUT_DIR" >&2
   exit 1
