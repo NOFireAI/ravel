@@ -1500,6 +1500,12 @@ impl LogScanStream {
                                 this.blocks.record_segment_totals(&plan.stats);
                             }
                             this.blocks.plan_full_reads.add(counts.full_reads);
+                            this.blocks
+                                .segments_pruned_by_key_index
+                                .add(counts.key_index.segments_pruned as usize);
+                            this.blocks
+                                .blocks_pruned_by_key_index
+                                .add(counts.key_index.blocks_pruned as usize);
                         }
                         let order = visit_order(&this.segments, this.topk.is_some());
                         this.work = owned_work(

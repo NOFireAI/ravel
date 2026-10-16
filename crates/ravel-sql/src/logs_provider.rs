@@ -165,8 +165,9 @@ impl LogsTableProvider {
     /// [`Self::worker_fragment`], scanning under the coordinator's pushdown the
     /// slice ticket carried (issue #2755): its time bounds window the read and
     /// its prune comparisons (attribute equalities and declared column
-    /// comparisons) drive segment stats pruning and block pruning, so the
-    /// worker decodes only the blocks they admit. `None`, or a spans pushdown,
+    /// comparisons) drive segment stats pruning and block pruning, and its
+    /// exact-key equalities drive the plan's KEY_IDX probe (ADR-2707 decision
+    /// 5), so the worker decodes only the blocks they admit. `None`, or a spans pushdown,
     /// is the no-pushdown read. The coordinator re-applies every filter above
     /// the merge, so the pushdown only narrows what is decoded.
     #[cfg(feature = "flight-sql")]
@@ -317,7 +318,8 @@ impl LogsTableProvider {
         )?
         .with_column_stats(self.column_stats.clone())
         .with_segment_timing(self.segment_timing)
-        .with_segments_pruned_by_stats(pruned_by_stats);
+        .with_segments_pruned_by_stats(pruned_by_stats)
+        .with_key_equals(Arc::new(pushdown.key_equals.clone()));
         Ok(Arc::new(scan))
     }
 

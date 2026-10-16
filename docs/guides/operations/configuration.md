@@ -1769,8 +1769,13 @@ index. The logs flush then writes a KEY_IDX section into each log object
 that lists, for every distinct value of each named field, the blocks that
 hold it. Compaction and the erasure rewrite rebuild it. It targets
 high-cardinality keys (a request id, a user id, a trace id) that the
-POSTINGS index drops. **No query reads the index yet**, so today it costs
-bytes and saves nothing.
+POSTINGS index drops. A logs SQL equality on an indexed column or on
+`trace_id` probes it: an object without the value is dropped after one or
+two small index reads, and an object with it reads only the blocks holding
+it. That reads fewer bytes, but possibly more requests, since every probed
+object pays the index reads. See
+[the query guide](../query.md#typed-attribute-columns) for the shapes that
+probe.
 
 ```sh
 ravel-cli typed-attr-column set <tenant> request.id:str user.id:i64 \

@@ -2382,7 +2382,7 @@ alter it without the slice key (`crates/ravel-sql/src/flight_ticket.rs`,
 | Table | Carried | Not carried |
 |---|---|---|
 | `spans` | `ts_lo`, `ts_hi`, `trace_id` | `duration_ns` window, `status_code` mask, `service_name`, `name` |
-| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range | the content channel (`has_word`) |
+| `logs` | `ts_lo`, `ts_hi`, prune predicates: attribute or declared-column string/bytes equality, I64/F64/Bool range; exact-key equalities (field, key type, 8-byte key) for the KEY_IDX probe | the content channel (`has_word`) |
 
 The pushdown-aware fragment is built by the provider's
 `worker_fragment_with_pushdown`. No production `DoGet` calls it yet: the Flight
@@ -2777,7 +2777,9 @@ doc's own vocabulary:
   `LogSegmentFetcher::scan_accounted_with_tenant`).
 - **keyIndex** -- the KEY_IDX prefix and bucket reads of a spans
   `trace_id =` lookup (`SpanSegmentFetcher`'s ranged trace path, ADR-2707
-  decision 5). The store's GET latency histogram has no key-index slot, so
+  decision 5) and of a logs exact-key equality
+  (`LogSegmentFetcher::plan_segment_keyed`, see "Exact-key probe" under
+  "Declared typed attribute columns" below). The store's GET latency histogram has no key-index slot, so
   these reads are timed there under `probe`.
 
 Decode (turning fetched bytes into typed samples/rows) is deliberately
@@ -3051,8 +3053,8 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   `QueryPhase::ALL` order, each phase present one time only: `resolve` (catalog
   snapshot resolve), `plan` (footer and skip-index probing), `probe`
   (segment catalog fetch), `scan` (block and page data reads), `keyIndex`
-  (the KEY_IDX reads of a spans `trace_id =` lookup; 0 on every other
-  statement). The rendering iterates `QueryPhase::ALL`, so a phase added to
+  (the KEY_IDX reads of a spans `trace_id =` lookup or a logs exact-key
+  equality; 0 on every other statement). The rendering iterates `QueryPhase::ALL`, so a phase added to
   the enum cannot be silently dropped. Per-phase fields: `phase`,
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
   `cacheMisses`, `cacheServedBytes`, `decompressedOutputBytes`,
@@ -3167,15 +3169,16 @@ and block-level reported independently:
 - `segmentsPrunedByStats`: segments a logs scan skipped before any fetch
   because a typed attribute column's stamped statistics excluded a
   pushed-down predicate (ADR-2121 D1).
-- `segmentsPrunedByKeyIndex`: segments a spans `trace_id =` lookup read no
-  blocks of because their KEY_IDX section proved the trace absent
-  (ADR-2707 decision 5).
+- `segmentsPrunedByKeyIndex`: segments a spans `trace_id =` lookup or a logs
+  exact-key equality read no blocks of because their KEY_IDX section proved
+  the key absent (ADR-2707 decision 5).
 - `blocksPrunedByKeyIndex`: blocks the skip index kept, in the segments that
-  lookup did read, that KEY_IDX named no entry for. It is 0 when the skip
-  index already narrows the object to the trace's blocks, which it does on
-  every object written in trace order, as `RspanWriter::finish` writes every
-  object today. An absent trace's segment counts in
-  `segmentsPrunedByKeyIndex`, not here.
+  lookup did read, that KEY_IDX named no entry for. On spans it is 0 when the
+  skip index already narrows the object to the trace's blocks, which it does
+  on every object written in trace order, as `RspanWriter::finish` writes
+  every object today. On logs it is the kept blocks outside the KEY_IDX block
+  set. An absent key's segment counts in `segmentsPrunedByKeyIndex`, not
+  here.
 - `blocksTotal`: blocks a logs scan saw in the segments it read.
 - `blocksScanned`: of those, blocks it read.
 - `blocksPrunedByPostings`: blocks POSTINGS ruled out.
@@ -4028,6 +4031,44 @@ column decodes only the pages it needs. Moving an equality predicate from
 `attrs['k'] = 'v'` to a declared `k = 'v'` now prunes through the same POSTINGS
 index (subject to the section-version caveat above). Declare for typed
 comparisons and aggregates, which the map cannot express at all.
+
+#### Exact-key probe (KEY_IDX tier 1, ADR-2707 decision 5)
+
+An equality on a declared `i64`, `str` or `bytes` column, or on `trace_id`,
+also probes each object's KEY_IDX section (`LogsPushdown::key_equals`,
+`LogSegmentFetcher::plan_segment_keyed`). The shapes are a bare column against
+a literal of exactly the declared type, in either operand order, and `trace_id`
+against a 16-byte value (a 32-character hex string or a 16-byte binary
+literal). A negation, a `Cast`-wrapped column (`status_code + 0 = 500`), a
+literal of another type, a `bool` column, `attrs['k']`
+and an `OR` carry no key. The pushdown stays `Inexact`.
+
+Each object the catalog keeps and the plan opens reads the section's prefix
+(header, field directory and bucket directory) and at most one bucket, as
+range GETs on the `keyIndex` phase. The answer is one of four:
+
+- The section does not index the field, or the object has no KEY_IDX section:
+  the probe declines and the object is planned from SKIP_IDX alone.
+- The key is absent: the object is dropped before any directory past its tail
+  probe is read (`segmentsPrunedByKeyIndex`).
+- The key is present: the plan reads only the named blocks among those
+  SKIP_IDX kept (`blocksPrunedByKeyIndex` counts the rest).
+- The section fails to decode: the probe warns, naming the object, and the
+  object is planned as if it had no KEY_IDX. A store error on a KEY_IDX read
+  fails the query with the store's typed error.
+
+Several equalities joined by `AND` intersect: an object any one key is absent
+from is dropped, and the blocks read are those every key names. An object at
+or under the plan's whole-object bound is read whole and not probed.
+
+A row whose stored value has another type than the declaration cannot match
+a probed equality, so dropping it loses nothing: the writer indexes only values
+stored under the field's KEY_IDX type, and the scan reads such a row as NULL in
+the typed attribute column. `attrs['k'] = '500'` still finds it.
+
+The probe trades block reads for index reads: a selective equality reads
+fewer bytes, but every object probed pays one or two more GETs whether or not
+it holds the key.
 
 There is also a wire-size trade for a *high-cardinality* `str` column. ADR-0099
 decision 5's "leaves that case exactly as expensive as it is today" is a

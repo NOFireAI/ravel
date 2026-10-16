@@ -118,6 +118,27 @@
 //! an absent stat is "no information", never "no match" (ADR-0013), so an object
 //! predating the column's declaration falls through and is scanned, not pruned.
 //!
+//! # Exact-key equalities (tier-1 KEY_IDX probe, ADR-2707 decision 5)
+//!
+//! The same `=` comparisons also feed [`LogsPushdown::key_equals`], beside the
+//! prune arm above: a bare declared `I64` column against an `Int64` literal, a
+//! bare declared `Str` column against a UTF-8 literal (bare or in the
+//! `Dictionary` scalar the column's coercion wraps it in), a bare declared
+//! `Bytes` column against a binary literal, and the fixed `trace_id` column
+//! against a 16-byte binary literal (`FixedSizeBinary(16)` after the column's
+//! coercion). Either operand order is recognized. A negation, a
+//! `Cast`-wrapped column, a `Bool` column, any other operator, and a literal of
+//! another type contribute nothing. The plan probes each candidate object's
+//! KEY_IDX section with them; an object whose section does not index the
+//! field declines, so a column declared without `key_index` costs one section
+//! read and prunes nothing. `OR` is not handled: a disjunction of equalities
+//! contributes no key.
+//!
+//! A row whose attribute is stored under another type than the declared one
+//! is never indexed for the field, and is never matched by the SQL comparison
+//! either: the declared column reads such a row as NULL, with no cast
+//! (ADR-0090 decision 7), so dropping its block cannot drop a matching row.
+//!
 //! F64 is out of scope (no `DeclaredType::F64` exists yet). The dispatch is one
 //! `match` on [`DeclaredType`], so F64 is a one-arm addition once its plumbing
 //! lands -- but that arm MUST honor [`Predicate::NumRange`]'s float contract:
@@ -133,7 +154,9 @@
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{Between, BinaryExpr, Expr, Operator};
 use datafusion::scalar::ScalarValue;
+use ravel_logseg::key_index::{KeyType, TRACE_ID_FIELD, key8_bytes, key8_i64, key8_id16, key8_str};
 use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
+use ravel_query::KeyEquals;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
 use crate::logs_udf::HAS_WORD_UDF;
@@ -161,6 +184,11 @@ pub struct LogsPushdown {
     /// resource/scope-only match. The merged residual stays the sole exact
     /// evaluator, so pushdown stays `Inexact`. See the module doc.
     pub prune: Vec<Predicate>,
+    /// Prune-only exact-key equalities for the tier-1 KEY_IDX probe (ADR-2707
+    /// decision 5): a declared I64/Str/Bytes column `=` a literal of exactly
+    /// its type, and `trace_id` `=` a 16-byte literal. Like `prune`, they only
+    /// narrow which blocks are read; see the module doc.
+    pub key_equals: Vec<KeyEquals>,
 }
 
 impl LogsPushdown {
@@ -228,7 +256,7 @@ pub fn filter_is_exact(filter: &Expr, declared: &[DeclaredColumn]) -> bool {
 fn leaf_is_exact(expr: &Expr, declared: &[DeclaredColumn]) -> bool {
     let mut out = LogsPushdown::default();
     handle_leaf(expr, &mut out, declared);
-    if !out.prune.is_empty() {
+    if !out.prune.is_empty() || !out.key_equals.is_empty() {
         return false;
     }
     match expr {
@@ -300,6 +328,11 @@ fn handle_binary(be: &BinaryExpr, out: &mut LogsPushdown, declared: &[DeclaredCo
     if let Some((op, ts_ns)) = ts_comparison(be) {
         apply_ts_bound(out, op, ts_ns);
         return;
+    }
+    // An exact-key equality feeds the KEY_IDX probe alongside whatever prune
+    // arm the same comparison builds below.
+    if let Some(k) = key_equality(be, declared) {
+        out.key_equals.push(k);
     }
     // A merged-attribute equality `attrs['k'] = 'v'` feeds the prune-only
     // channel. It never becomes a content predicate: the reader would evaluate
@@ -404,6 +437,56 @@ fn declared_comparison_predicate(
             })
         }
     }
+}
+
+/// An `=` (either operand order) the tier-1 KEY_IDX probe can answer: a bare
+/// declared I64/Str/Bytes column against a literal of exactly its type, or the
+/// fixed `trace_id` column against a 16-byte binary literal. Any other operator,
+/// a `Cast`-wrapped column, a declared Bool column, and a literal of another
+/// type all decline. Whether an object actually indexes the field is its
+/// KEY_IDX header's answer, read by the probe.
+fn key_equality(be: &BinaryExpr, declared: &[DeclaredColumn]) -> Option<KeyEquals> {
+    if be.op != Operator::Eq {
+        return None;
+    }
+    let (col, lit) = match (&*be.left, &*be.right) {
+        (Expr::Column(c), lit) | (lit, Expr::Column(c)) => (c, lit),
+        _ => return None,
+    };
+    if col.name == TRACE_ID_FIELD {
+        let id = lit_id16(lit)?;
+        return Some(KeyEquals::new(
+            TRACE_ID_FIELD,
+            KeyType::Id16,
+            key8_id16(&id),
+        ));
+    }
+    let dc = resolve_declared(&Expr::Column(col.clone()), declared)?;
+    let (key_type, key8) = match dc.ty {
+        DeclaredType::I64 => (KeyType::I64, key8_i64(lit_i64(lit)?)),
+        DeclaredType::Str => {
+            let Expr::Literal(sv, _) = lit else {
+                return None;
+            };
+            (KeyType::Str, key8_str(&scalar_utf8(sv)?))
+        }
+        DeclaredType::Bytes => (KeyType::Bytes, key8_bytes(&lit_bytes(lit)?)),
+        DeclaredType::Bool => return None,
+    };
+    Some(KeyEquals::new(dc.key.clone(), key_type, key8))
+}
+
+/// A 16-byte binary literal: the `FixedSizeBinary(16)` the `trace_id` column
+/// coerces to, or a plain binary literal of exactly 16 bytes.
+fn lit_id16(e: &Expr) -> Option<[u8; 16]> {
+    let bytes = match e {
+        Expr::Literal(ScalarValue::FixedSizeBinary(16, Some(b)), _) => b.as_slice(),
+        Expr::Literal(ScalarValue::Binary(Some(b)), _)
+        | Expr::Literal(ScalarValue::LargeBinary(Some(b)), _)
+        | Expr::Literal(ScalarValue::BinaryView(Some(b)), _) => b.as_slice(),
+        _ => return None,
+    };
+    <[u8; 16]>::try_from(bytes).ok()
 }
 
 /// `col BETWEEN low AND high` (non-negated) against a declared I64/Bool column ->
@@ -1156,5 +1239,136 @@ mod tests {
     fn undeclared_column_falls_through() {
         let p = extract_logs(&[col("status_code").eq(lit(500i64))], &[]);
         assert_eq!(p, LogsPushdown::default());
+    }
+
+    fn keyed_decl() -> Vec<DeclaredColumn> {
+        vec![
+            DeclaredColumn::new("status_code", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+            DeclaredColumn::new("digest", DeclaredType::Bytes),
+            DeclaredColumn::new("is_active", DeclaredType::Bool),
+        ]
+    }
+
+    /// An equality on a declared I64, Str or Bytes column yields one exact
+    /// key in either operand order, next to the prune arm the same comparison
+    /// already built.
+    #[test]
+    fn declared_equalities_yield_one_exact_key_in_either_order() {
+        let d = keyed_decl();
+        let digest = vec![0xde, 0xad, 0xbe, 0xef];
+        let cases = [
+            (
+                col("status_code").eq(lit(500i64)),
+                KeyEquals::new("status_code", KeyType::I64, key8_i64(500)),
+            ),
+            (
+                lit(500i64).eq(col("status_code")),
+                KeyEquals::new("status_code", KeyType::I64, key8_i64(500)),
+            ),
+            (
+                col("region").eq(lit("eu-west-1")),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ),
+            (
+                lit("eu-west-1").eq(col("region")),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ),
+            (
+                col("region").eq(lit(ScalarValue::Dictionary(
+                    Box::new(datafusion::arrow::datatypes::DataType::Int32),
+                    Box::new(ScalarValue::Utf8(Some("eu-west-1".into()))),
+                ))),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ),
+            (
+                col("digest").eq(lit(ScalarValue::Binary(Some(digest.clone())))),
+                KeyEquals::new("digest", KeyType::Bytes, key8_bytes(&digest)),
+            ),
+        ];
+        for (expr, want) in cases {
+            let p = extract_logs(std::slice::from_ref(&expr), &d);
+            assert_eq!(p.key_equals, vec![want], "unexpected key for {expr:?}");
+            assert_eq!(p.prune.len(), 1, "the prune arm must survive for {expr:?}");
+            assert!(!filter_is_exact(&expr, &d), "{expr:?} must stay Inexact");
+        }
+    }
+
+    /// `trace_id` against a 16-byte literal yields an Id16 key under the
+    /// writer's field name; any other length declines.
+    #[test]
+    fn trace_id_equality_yields_an_id16_key() {
+        let id: [u8; 16] = std::array::from_fn(|i| i as u8 + 1);
+        let want = vec![KeyEquals::new(
+            TRACE_ID_FIELD,
+            KeyType::Id16,
+            key8_id16(&id),
+        )];
+        for l in [
+            lit(ScalarValue::FixedSizeBinary(16, Some(id.to_vec()))),
+            lit(ScalarValue::Binary(Some(id.to_vec()))),
+        ] {
+            let e = col("trace_id").eq(l.clone());
+            let p = extract_logs(std::slice::from_ref(&e), &[]);
+            assert_eq!(p.key_equals, want, "{e:?}");
+            assert!(!filter_is_exact(&e, &[]));
+            let p = extract_logs(&[l.eq(col("trace_id"))], &[]);
+            assert_eq!(p.key_equals, want);
+        }
+        let short = col("trace_id").eq(lit(ScalarValue::Binary(Some(id[..8].to_vec()))));
+        assert!(extract_logs(&[short], &[]).key_equals.is_empty());
+    }
+
+    /// Every shape outside exact equality on the declared type declines the
+    /// key: a mismatched literal type, a cast-wrapped column, `!=`, a range,
+    /// a Bool column, an undeclared or fixed column, and an OR.
+    #[test]
+    fn non_exact_shapes_yield_no_key() {
+        let d = keyed_decl();
+        let declines = [
+            col("status_code").eq(lit(500i32)),
+            col("status_code").eq(lit("500")),
+            col("region").eq(lit(5i64)),
+            col("digest").eq(lit("dead")),
+            datafusion::prelude::cast(
+                col("status_code"),
+                datafusion::arrow::datatypes::DataType::Utf8,
+            )
+            .eq(lit("500")),
+            col("status_code").not_eq(lit(500i64)),
+            col("status_code").gt_eq(lit(500i64)),
+            col("is_active").eq(lit(true)),
+            col("undeclared").eq(lit(500i64)),
+            col("body").eq(lit("x")),
+            or(
+                col("status_code").eq(lit(500i64)),
+                col("status_code").eq(lit(503i64)),
+            ),
+        ];
+        for e in declines {
+            let p = extract_logs(std::slice::from_ref(&e), &d);
+            assert!(p.key_equals.is_empty(), "{e:?} must not yield a key");
+        }
+    }
+
+    /// An AND of two equalities carries both keys, which the fetcher
+    /// intersects.
+    #[test]
+    fn a_conjunction_carries_every_key() {
+        let d = keyed_decl();
+        let p = extract_logs(
+            &[and(
+                col("status_code").eq(lit(500i64)),
+                col("region").eq(lit("eu-west-1")),
+            )],
+            &d,
+        );
+        assert_eq!(
+            p.key_equals,
+            vec![
+                KeyEquals::new("status_code", KeyType::I64, key8_i64(500)),
+                KeyEquals::new("region", KeyType::Str, key8_str("eu-west-1")),
+            ]
+        );
     }
 }

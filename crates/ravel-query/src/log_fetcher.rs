@@ -59,6 +59,7 @@ use crate::erasure::ErasurePredicate;
 use crate::fetcher::{MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, bound_runs, gate_not_run};
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
+use crate::span_fetcher::KeyIndexPruning;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::{SegmentLevel, SegmentRef};
@@ -66,6 +67,9 @@ use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_logseg::block::NumStat;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{self, SectionDesc, kind};
+use ravel_logseg::key_index::{
+    Key8, KeyProbe, KeyProbeStep, KeyType, key_probe_prefix_range, locate_key,
+};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::skip_index::{Level0Entry, NumRangeArm, SkipIndex, merge_stats};
 use ravel_logseg::stream_dir::StreamDir;
@@ -111,6 +115,28 @@ impl StreamAttrEquals {
         StreamAttrEquals {
             key: key.into(),
             value,
+        }
+    }
+}
+
+/// An equality on one KEY_IDX-indexed field (ADR-2707 decision 5, tier 1): the
+/// field's name, the key type its column is declared with, and the `key8` of
+/// the compared literal. It is prune-only, like [`LogQuery::prune`]: a probe
+/// narrows which blocks of an object are read and never removes a row, so the
+/// caller's own filter stays the exact evaluator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyEquals {
+    pub field: String,
+    pub key_type: KeyType,
+    pub key8: Key8,
+}
+
+impl KeyEquals {
+    pub fn new(field: impl Into<String>, key_type: KeyType, key8: Key8) -> Self {
+        KeyEquals {
+            field: field.into(),
+            key_type,
+            key8,
         }
     }
 }
@@ -169,6 +195,12 @@ pub struct LogQuery {
     /// such hop: `QueryEngine` reads `Snapshot::pending_erasure` directly at its
     /// own fetch funnels.
     pub erasure: Vec<ErasurePredicate>,
+    /// Prune-only KEY_IDX equalities, ANDed. Only
+    /// [`LogSegmentFetcher::plan_segment_keyed`] reads them: it probes each
+    /// planned object's KEY_IDX section and restricts the blocks read to the
+    /// intersection of the answers. Every other entry point ignores them, so
+    /// they never remove a record, only block reads.
+    pub key_equals: Vec<KeyEquals>,
 }
 
 impl LogQuery {
@@ -182,7 +214,15 @@ impl LogQuery {
             content: Vec::new(),
             prune: Vec::new(),
             erasure: Vec::new(),
+            key_equals: Vec::new(),
         }
+    }
+
+    /// Adds one KEY_IDX equality (see [`LogQuery::key_equals`]).
+    #[must_use]
+    pub fn with_key_equals(mut self, key: KeyEquals) -> Self {
+        self.key_equals.push(key);
+        self
     }
 
     #[must_use]
@@ -240,8 +280,13 @@ impl LogQuery {
             content,
             prune,
             erasure,
+            key_equals,
         } = self;
-        content.is_empty() && prune.is_empty() && stream_attrs.is_empty() && erasure.is_empty()
+        content.is_empty()
+            && prune.is_empty()
+            && stream_attrs.is_empty()
+            && erasure.is_empty()
+            && key_equals.is_empty()
     }
 }
 
@@ -2337,6 +2382,117 @@ impl LogSegmentFetcher {
         })
     }
 
+    /// [`plan_segment`](Self::plan_segment) with the tier-1 KEY_IDX probe
+    /// (ADR-2707 decision 5) for a query carrying [`KeyEquals`] arms.
+    ///
+    /// The probe runs on an object above
+    /// [`plan_whole_object_bound`](Self::plan_whole_object_bound) whose span
+    /// overlaps the query window; every other segment, and every query with no
+    /// arm, is planned by `plan_segment` unchanged with nothing restricted. The
+    /// probe's reads are charged to `key_index_accounting`, the rest to
+    /// `plan_accounting`.
+    ///
+    /// An absent arm returns no plan: no block of the object is read, and
+    /// `key_index.segments_pruned` is 1. A present set leaves the plan's
+    /// survivors as the reader names them and puts the ones the set holds in
+    /// `key_blocks`; `key_index.blocks_pruned` counts the rest. A declined or
+    /// corrupt probe restricts nothing.
+    pub async fn plan_segment_keyed(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        plan_accounting: &QueryAccounting,
+        key_index_accounting: &QueryAccounting,
+    ) -> Result<KeyedSegmentPlan, LogFetchError> {
+        if query.key_equals.is_empty()
+            || seg_ref.object_size <= self.plan_whole_object_bound()
+            || seg_ref.min_event_ts_ns > seg_ref.max_event_ts_ns
+            || !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
+        {
+            let plan = self
+                .plan_segment(seg_ref, tenant_hash, query, plan_accounting)
+                .await?;
+            return Ok(KeyedSegmentPlan {
+                plan,
+                key_blocks: None,
+                key_index: KeyIndexPruning::default(),
+            });
+        }
+        let phase = PhaseAccounting::new();
+        let accounting = phase.plan();
+        let fetch_span = tracing::debug_span!(
+            "page_fetch",
+            signal = "logs",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+            probe_misses = tracing::field::Empty,
+        );
+        let result = self
+            .block_range
+            .fetch_keyed_plan(seg_ref, tenant_hash, query, accounting, phase.key_index())
+            .instrument(fetch_span.clone())
+            .await;
+        let result = self
+            .settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
+            .await;
+        let snapshot = phase.snapshot();
+        plan_accounting.merge_snapshot(snapshot.phase(QueryPhase::Plan));
+        key_index_accounting.merge_snapshot(snapshot.phase(QueryPhase::KeyIndex));
+        let read = result?;
+        let fetch = match &read {
+            KeyedPlanRead::Absent { fetch } | KeyedPlanRead::Planned { fetch, .. } => fetch,
+        };
+        let requests = fetch.probe_gets + fetch.metadata_gets + fetch.block_range_gets;
+        fetch_span.record("s3_requests", requests);
+        fetch_span.record("s3_bytes", fetch.block_bytes_fetched);
+        self.record_probe_misses(&fetch_span, fetch, ProbePhase::Plan);
+        let KeyedPlanRead::Planned {
+            footer,
+            dirs,
+            survivors,
+            stats,
+            fetch: _,
+            key_blocks,
+        } = read
+        else {
+            return Ok(KeyedSegmentPlan {
+                plan: None,
+                key_blocks: None,
+                key_index: KeyIndexPruning {
+                    segments_pruned: 1,
+                    blocks_pruned: 0,
+                },
+            });
+        };
+        let (key_blocks, key_index) = match key_blocks {
+            None => (None, KeyIndexPruning::default()),
+            Some(set) => {
+                let kept: Vec<usize> = survivors
+                    .iter()
+                    .copied()
+                    .filter(|b| u32::try_from(*b).is_ok_and(|b| set.binary_search(&b).is_ok()))
+                    .collect();
+                let pruned = KeyIndexPruning {
+                    segments_pruned: 0,
+                    blocks_pruned: (survivors.len() - kept.len()) as u64,
+                };
+                (Some(kept), pruned)
+            }
+        };
+        // A touch is a block read: the restricted set when the probe named
+        // one, else every survivor.
+        let touched = !key_blocks.as_ref().unwrap_or(&survivors).is_empty();
+        if touched {
+            plan_accounting.add_data_objects_touched(1);
+        }
+        Ok(KeyedSegmentPlan {
+            plan: Some((survivors, dirs, stats, Some(*footer), None)),
+            key_blocks,
+            key_index,
+        })
+    }
+
     /// Whether [`plan_segment`](Self::plan_segment)'s survivor count can be read
     /// from the skip index alone, without fetching or decoding any block (#761).
     ///
@@ -2372,6 +2528,9 @@ impl LogSegmentFetcher {
             content,
             prune,
             erasure: _,
+            // The KEY_IDX probe narrows the blocks read, never the survivor
+            // list the reader names (`plan_segment_keyed`).
+            key_equals: _,
         } = query;
         content.is_empty()
             && stream_attrs.is_empty()
@@ -4240,6 +4399,51 @@ struct OwnedBlocks<'a> {
 /// object's rows wherever both objects decode. The key alone would settle it
 /// in practice (a data-object key embeds the tenant hex), but the tenant is
 /// stored and checked too rather than inferred from that.
+/// One segment's plan result: the surviving whole-object block indices, the
+/// decoded directories, the prune stats, a carried footer and a carried
+/// whole-object body. `None` when the segment holds no block the query can
+/// read. See [`LogSegmentFetcher::plan_segment`].
+pub type SegmentPlan = Option<(
+    Vec<usize>,
+    Arc<SegmentDirectories>,
+    ScanStats,
+    Option<footer::LogFooter>,
+    Option<CarriedWholeObject>,
+)>;
+
+/// [`LogSegmentFetcher::plan_segment_keyed`]'s result: the plan
+/// [`LogSegmentFetcher::plan_segment`] would return, narrowed by the tier-1
+/// KEY_IDX probe (ADR-2707 decision 5).
+#[derive(Clone)]
+pub struct KeyedSegmentPlan {
+    /// The plan. `None` also when the probe proved a [`KeyEquals`] arm
+    /// absent from the object.
+    pub plan: SegmentPlan,
+    /// The survivor block indices the probe left: only these are read. A
+    /// subsequence of the plan's survivors, which stay the reader's own list.
+    /// `None` when the probe restricted nothing.
+    pub key_blocks: Option<Vec<usize>>,
+    /// What the probe pruned.
+    pub key_index: KeyIndexPruning,
+}
+
+/// What [`BlockRangeFetcher::fetch_keyed_plan`] read for one segment.
+pub(crate) enum KeyedPlanRead {
+    /// A KEY_IDX probe proved an arm absent: no directory past the footer and
+    /// no block was read.
+    Absent { fetch: BlockRangeStats },
+    /// The directories and the reader's survivors, with the KEY_IDX block set
+    /// (`None` when the probe restricted nothing).
+    Planned {
+        footer: Box<footer::LogFooter>,
+        dirs: Arc<SegmentDirectories>,
+        survivors: Vec<usize>,
+        stats: ScanStats,
+        fetch: BlockRangeStats,
+        key_blocks: Option<Vec<u32>>,
+    },
+}
+
 #[derive(Clone)]
 pub struct CarriedWholeObject {
     bytes: LogObjectBytes,
@@ -5716,14 +5920,48 @@ impl BlockRangeFetcher {
         tenant_hash: TenantHash,
         accounting: &QueryAccounting,
     ) -> Result<(footer::LogFooter, Arc<SegmentDirectories>, BlockRangeStats), LogFetchError> {
-        let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
         let phase = ReadPhases::PLAN.metadata;
-        let (footer, mut resident) = self
+        let (footer, resident) = self
             .probe_footer(seg_ref, tenant_hash, phase, &pin, accounting, &mut stats)
             .await?;
+        let (dirs, _) = self
+            .plan_directories_after_probe(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                resident,
+                &[],
+                &pin,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        Ok((footer, dirs, stats))
+    }
 
+    /// The directory half of [`fetch_plan_directories`](Self::fetch_plan_directories)
+    /// over a footer `probe_footer` already read: brings SKIP_IDX, PAGE_DIR,
+    /// the `extra_tail` kinds, STREAM_DIR and FIELD_DIR into `resident`,
+    /// decodes the four directories, and returns them with the sparse object
+    /// holding every region read.
+    #[allow(clippy::too_many_arguments)]
+    async fn plan_directories_after_probe(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &footer::LogFooter,
+        mut resident: Vec<(u64, Bytes)>,
+        extra_tail: &[u32],
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<(Arc<SegmentDirectories>, SparseObject), LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let phase = ReadPhases::PLAN.metadata;
+        let mut tail = vec![kind::SKIP_IDX, kind::PAGE_DIR];
+        tail.extend_from_slice(extra_tail);
         // SKIP_IDX and PAGE_DIR are the tail sections whose probe misses the
         // plan phase counts. The front pair is brought through a scratch stats
         // value: a front section is never inside the suffix probe, so counting
@@ -5732,24 +5970,24 @@ impl BlockRangeFetcher {
         self.ensure_tail_plan_sections(
             seg_ref,
             tenant_hash,
-            &footer,
-            &[kind::SKIP_IDX, kind::PAGE_DIR],
+            footer,
+            &tail,
             phase,
             &mut resident,
-            &pin,
+            pin,
             accounting,
-            &mut stats,
+            stats,
         )
         .await?;
         let mut front_stats = BlockRangeStats::default();
         self.ensure_tail_plan_sections(
             seg_ref,
             tenant_hash,
-            &footer,
+            footer,
             &[kind::STREAM_DIR, kind::FIELD_DIR],
             phase,
             &mut resident,
-            &pin,
+            pin,
             accounting,
             &mut front_stats,
         )
@@ -5764,7 +6002,259 @@ impl BlockRangeFetcher {
         }
         let dirs = RlogReader::decode_directories(&sparse, &self.cfg)
             .map_err(|source| corrupt(key, source))?;
-        Ok((footer, Arc::new(dirs), stats))
+        Ok((Arc::new(dirs), sparse))
+    }
+
+    /// The plan read of one segment for a query carrying [`KeyEquals`] arms
+    /// (ADR-2707 decision 5, tier 1): the footer probe, the object's KEY_IDX
+    /// probe for every arm, and, unless an arm is absent, the four directories
+    /// and the block survivors.
+    ///
+    /// The KEY_IDX reads (the section's `[0, prefix_len)` once, then at most one
+    /// bucket per arm, each sliced from the probe when it covers it) are
+    /// charged to `key_accounting` under [`QueryPhase::KeyIndex`]; everything
+    /// else is a plan read on `accounting`. An absent arm returns
+    /// [`KeyedPlanRead::Absent`] before any directory past the footer is read.
+    ///
+    /// The survivors are the ones the reader's prune names over the same
+    /// directories, so a subset open dealt any of them sees the same list:
+    /// `candidate_blocks` for a skip-decidable shape, otherwise
+    /// [`RlogReader::scan_blocks`] over a sparse object holding the tail
+    /// sections (BLOOM and POSTINGS included), with no BLOCKS byte read.
+    pub(crate) async fn fetch_keyed_plan(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        accounting: &QueryAccounting,
+        key_accounting: &QueryAccounting,
+    ) -> Result<KeyedPlanRead, LogFetchError> {
+        let key = seg_ref.data_object_key.as_str();
+        let mut stats = BlockRangeStats::default();
+        let pin = EtagPin::default();
+        let (footer, resident) = self
+            .probe_footer(
+                seg_ref,
+                tenant_hash,
+                ReadPhases::PLAN.metadata,
+                &pin,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        let key_blocks = match self
+            .probe_key_index(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                &resident,
+                &query.key_equals,
+                &pin,
+                key_accounting,
+            )
+            .await?
+        {
+            Some(KeyProbe::Absent) => return Ok(KeyedPlanRead::Absent { fetch: stats }),
+            Some(KeyProbe::Present(blocks)) => Some(blocks),
+            Some(KeyProbe::Declined) | None => None,
+        };
+
+        // `plan_skip_decidable` without its at-least-one-arm rule, which is a
+        // cost choice: with no content, stream or POSTINGS arm the reader's
+        // prune is its skip step, an empty prune list included.
+        let skip_decidable = query.content.is_empty()
+            && query.stream_attrs.is_empty()
+            && query
+                .prune
+                .iter()
+                .all(|p| matches!(p, Predicate::NumRange { .. }));
+        let extra_tail: &[u32] = if skip_decidable {
+            &[]
+        } else {
+            &[kind::BLOOM, kind::POSTINGS]
+        };
+        let (dirs, sparse) = self
+            .plan_directories_after_probe(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                resident,
+                extra_tail,
+                &pin,
+                accounting,
+                &mut stats,
+            )
+            .await?;
+        accounting.add_decompressed_bytes(dirs.open_decompressed_bytes());
+        let blocks_total = dirs.skip_index().l0.len() as u32;
+        let (survivors, plan_stats) = if skip_decidable {
+            let refs: Vec<&Predicate> = query.prune.iter().collect();
+            let numeric = dirs.field_dir().numeric_range_arms(&refs);
+            let survivors = dirs.skip_index().candidate_blocks(
+                query.ts_min_ns,
+                query.ts_max_ns,
+                None,
+                &numeric,
+            );
+            let n = survivors.len() as u32;
+            let plan_stats = ScanStats {
+                blocks_total,
+                blocks_after_skip: n,
+                blocks_after_postings: n,
+                blocks_after_bloom: n,
+                ..ScanStats::default()
+            };
+            (survivors, plan_stats)
+        } else {
+            let stream_ids = if query.stream_attrs.is_empty() {
+                None
+            } else {
+                Some(matching_streams_in(dirs.stream_dir(), &query.stream_attrs))
+            };
+            let pred = combined_predicate_with_streams(query, stream_ids);
+            let scan = RlogReader::from_decoded(&sparse, &dirs)
+                .scan_blocks(&pred, &query.prune, &ColumnSelection::all())
+                .map_err(|source| corrupt(key, source))?;
+            let plan_stats = scan.stats();
+            accounting.add_decompressed_bytes(plan_stats.decompressed_bytes);
+            (scan.survivor_block_indices(), plan_stats)
+        };
+        Ok(KeyedPlanRead::Planned {
+            footer: Box::new(footer),
+            dirs,
+            survivors,
+            stats: plan_stats,
+            fetch: stats,
+            key_blocks,
+        })
+    }
+
+    /// The tier-1 KEY_IDX probe of one object for every arm in `keys`: the
+    /// section's prefix read once, then at most one bucket per arm. `None`
+    /// prunes nothing: the object has no KEY_IDX, no arm's field is indexed
+    /// under its key type, or a prefix or bucket is corrupt (logged with the
+    /// object key). `Some(Absent)` when any arm is absent (the arms are a
+    /// conjunction), else `Some(Present)` with the intersection of the
+    /// present arms' block sets. A failed read is a typed error, never a
+    /// fallback.
+    #[allow(clippy::too_many_arguments)]
+    async fn probe_key_index(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        footer: &footer::LogFooter,
+        resident: &[(u64, Bytes)],
+        keys: &[KeyEquals],
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+    ) -> Result<Option<KeyProbe>, LogFetchError> {
+        let object = &seg_ref.data_object_key;
+        let fall_back = |err: LogSegError| {
+            tracing::warn!(
+                object = %object,
+                error = %err,
+                "KEY_IDX probe failed; pruning by SKIP_IDX alone"
+            );
+        };
+        let prefix_range = match key_probe_prefix_range(footer) {
+            Ok(Some(range)) => range,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                fall_back(err);
+                return Ok(None);
+            }
+        };
+        let prefix = self
+            .key_index_read(
+                seg_ref,
+                tenant_hash,
+                resident,
+                prefix_range,
+                pin,
+                accounting,
+            )
+            .await?;
+        let mut present: Option<Vec<u32>> = None;
+        for arm in keys {
+            let answer = match locate_key(footer, &arm.field, arm.key_type, &arm.key8, &prefix) {
+                Ok(KeyProbeStep::Done(answer)) => answer,
+                Ok(KeyProbeStep::Bucket(bucket)) => {
+                    let frame = self
+                        .key_index_read(
+                            seg_ref,
+                            tenant_hash,
+                            resident,
+                            bucket.range(),
+                            pin,
+                            accounting,
+                        )
+                        .await?;
+                    match bucket.finish(&frame) {
+                        Ok(answer) => answer,
+                        Err(err) => {
+                            fall_back(err);
+                            return Ok(None);
+                        }
+                    }
+                }
+                Err(err) => {
+                    fall_back(err);
+                    return Ok(None);
+                }
+            };
+            match answer {
+                KeyProbe::Absent => return Ok(Some(KeyProbe::Absent)),
+                KeyProbe::Declined => {}
+                KeyProbe::Present(mut blocks) => {
+                    blocks.sort_unstable();
+                    blocks.dedup();
+                    present = Some(match present {
+                        None => blocks,
+                        Some(mut prev) => {
+                            prev.retain(|b| blocks.binary_search(b).is_ok());
+                            prev
+                        }
+                    });
+                }
+            }
+        }
+        Ok(match present {
+            // An empty intersection proves no block holds every arm's value.
+            Some(blocks) if blocks.is_empty() => Some(KeyProbe::Absent),
+            Some(blocks) => Some(KeyProbe::Present(blocks)),
+            None => None,
+        })
+    }
+
+    /// One KEY_IDX read of the absolute `range`: sliced from a resident probe
+    /// region when one covers it, otherwise one cache-routed ranged GET
+    /// charged under [`QueryPhase::KeyIndex`].
+    async fn key_index_read(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        resident: &[(u64, Bytes)],
+        range: std::ops::Range<u64>,
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+    ) -> Result<Bytes, LogFetchError> {
+        let len = range.end.saturating_sub(range.start);
+        if let Some(bytes) = resident_slice(resident, range.start, len) {
+            return Ok(bytes);
+        }
+        let (bytes, _) = self
+            .cached_extent(
+                seg_ref,
+                tenant_hash,
+                range.start,
+                len,
+                GetRange::Range(range.start, range.end),
+                QueryPhase::KeyIndex,
+                pin,
+                accounting,
+            )
+            .await?;
+        Ok(bytes)
     }
 
     /// Fetch one segment's object as decode-ready [`LogObjectBytes`], reading
@@ -6352,11 +6842,12 @@ impl BlockRangeFetcher {
         // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
         // GET each, never coalesced with the front across the BLOCKS gap. The
         // reader re-verifies each section's crc on decode, so a corrupt section
-        // hit fails closed there (ADR-0046).
+        // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
+        // reader does not read it, and the plan probes it by range.
         for section in &footer.sections {
             if matches!(
                 section.kind,
-                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR
+                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR | kind::KEY_IDX
             ) {
                 continue;
             }
@@ -6788,12 +7279,13 @@ impl BlockRangeFetcher {
         // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
         // GET each, never coalesced with the front across the BLOCKS gap. The
         // reader re-verifies each section's crc on decode, so a corrupt section
-        // hit fails closed there (ADR-0046). With `dirs`, SKIP_IDX and PAGE_DIR
+        // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
+        // reader does not read it, and the plan probes it by range. With `dirs`, SKIP_IDX and PAGE_DIR
         // are not placed either: nothing reads them from the buffer.
         for section in &footer.sections {
             if matches!(
                 section.kind,
-                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR
+                kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR | kind::KEY_IDX
             ) || (dirs.is_some() && matches!(section.kind, kind::SKIP_IDX | kind::PAGE_DIR))
             {
                 continue;
