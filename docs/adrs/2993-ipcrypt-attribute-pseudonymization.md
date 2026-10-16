@@ -1,6 +1,6 @@
 # ADR-2993: IPCrypt pseudonymization of IP-valued attributes
 
-Status: Proposed. The maintainer approved an earlier text on 2026-10-15; decisions 1, 3, 6, 8 and 9 were revised after review, and the revised text awaits re-approval.
+Status: Accepted (2026-10-16)
 Date: 2026-10-15
 Epic: #2993
 
