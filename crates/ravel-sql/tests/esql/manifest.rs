@@ -259,6 +259,18 @@ fn binder_refusal(
     }
 }
 
+/// Whether the run of a statement the binder accepts holds for an entry the
+/// executor is marked `executor` for: it fails, with a typed refusal where
+/// the executor refuses the entry and with an untyped error where it is
+/// absent.
+fn run_verdict<T>(executor: State, run: &Result<T, EsqlError>) -> Result<(), String> {
+    match run {
+        Err(error) if is_typed_refusal(error) == (executor == State::Refused) => Ok(()),
+        Err(error) => Err(format!("the run fails with {error:?}")),
+        Ok(_) => Err("the statement prepares and runs".to_string()),
+    }
+}
+
 /// Check every entry not marked executor-supported against the layer its
 /// states say refuses it, returning how many hold and what does not.
 async fn check_refusals(manifest: &Manifest, fixture: &Fixture) -> (usize, Vec<String>) {
@@ -288,15 +300,7 @@ async fn check_refusals(manifest: &Manifest, fixture: &Fixture) -> (usize, Vec<S
             }
             (State::Supported, State::Refused, _) => binder_refusal(manifest, entry, &prepared),
             (State::Supported, State::Supported, Ok(prepared)) => {
-                match run_prepared(fixture, prepared).await {
-                    Err(error)
-                        if is_typed_refusal(&error) == (entry.executor == State::Refused) =>
-                    {
-                        Ok(())
-                    }
-                    Err(error) => Err(format!("the run fails with {error:?}")),
-                    Ok(_) => Err("the statement prepares and runs".to_string()),
-                }
+                run_verdict(entry.executor, &run_prepared(fixture, prepared).await)
             }
             _ => Err(shown()),
         };
@@ -407,6 +411,32 @@ async fn the_refusal_check_drives_the_arms_the_manifest_does_not_reach() {
     assert!(
         wrong[0].ends_with("the statement prepares and runs"),
         "{wrong:#?}"
+    );
+}
+
+/// The run arms no entry reaches today, driven with constructed errors: a
+/// typed refusal holds for an entry the executor refuses and an untyped
+/// error for one it lacks, and neither holds for the other.
+#[test]
+fn the_run_verdict_holds_for_the_error_the_executor_state_names() {
+    let typed: Result<(), EsqlError> = Err(EsqlError::Unsupported {
+        name: "[X]".to_string(),
+        line: 1,
+        column: 1,
+    });
+    let untyped: Result<(), EsqlError> = Err(EsqlError::Plan("no plan".to_string()));
+    assert_eq!(run_verdict(State::Refused, &typed), Ok(()));
+    assert_eq!(run_verdict(State::Absent, &untyped), Ok(()));
+    let wrong = run_verdict(State::Refused, &untyped).expect_err("untyped");
+    assert!(wrong.starts_with("the run fails with Plan("), "{wrong}");
+    let wrong = run_verdict(State::Absent, &typed).expect_err("typed");
+    assert!(
+        wrong.starts_with("the run fails with Unsupported"),
+        "{wrong}"
+    );
+    assert_eq!(
+        run_verdict(State::Refused, &Ok::<(), EsqlError>(())),
+        Err("the statement prepares and runs".to_string())
     );
 }
 
