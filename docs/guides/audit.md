@@ -219,6 +219,10 @@ These requests are refused before that and write no record:
 - An ES|QL request that carries `params` or an unknown field, or a statement
   that does not parse.
 
+An ES|QL request whose client disconnects before its statement ends writes no
+record either: the server writes the record when the statement ends, and the
+disconnect drops the statement first.
+
 An absent record therefore does not mean an absent request. To count
 statements and not records, leave out the `attempted` rows.
 

@@ -1421,7 +1421,7 @@ fn esql_query(text: &str, deadline: Duration) -> crate::service::EsqlQuery {
 /// released, with the SQL executor resolving declared columns through that
 /// store the way a serving process does. The handle is the hold.
 #[cfg(feature = "esql")]
-fn harness_with_held_tenant_config() -> (Harness, GateHandle) {
+fn harness_with_held_tenant_config(audit_sink: Arc<dyn QueryAuditSink>) -> (Harness, GateHandle) {
     let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
     let gate = store.hold(
         Op::Get,
@@ -1432,7 +1432,7 @@ fn harness_with_held_tenant_config() -> (Harness, GateHandle) {
     let h = harness(
         Arc::clone(&store),
         QueryConcurrencyLimit::Bounded(1),
-        Arc::new(NoopQueryAuditSink),
+        audit_sink,
         None,
     );
     let catalog = Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
@@ -1475,7 +1475,7 @@ async fn esql_declared_column_read_runs_inside_the_deadline() {
     let deadline = Duration::from_secs(5);
     let bound = Duration::from_secs(60);
 
-    let (h, gate) = harness_with_held_tenant_config();
+    let (h, gate) = harness_with_held_tenant_config(Arc::new(NoopQueryAuditSink));
     let esql = tokio::time::timeout(
         bound,
         h.service
@@ -1487,7 +1487,7 @@ async fn esql_declared_column_read_runs_inside_the_deadline() {
     assert!(gate.held_count() >= 1, "the tenant-config read was held");
     assert_eq!(h.admission.in_flight(), 0);
 
-    let (h, gate) = harness_with_held_tenant_config();
+    let (h, gate) = harness_with_held_tenant_config(Arc::new(NoopQueryAuditSink));
     let request = ravel_sql::SqlRequest {
         deadline,
         ..sql_request("SELECT count(*) FROM logs")
@@ -1500,11 +1500,155 @@ async fn esql_declared_column_read_runs_inside_the_deadline() {
     assert_eq!(h.admission.in_flight(), 0);
 
     assert_eq!(esql.kind, ServiceErrorKind::Deadline, "{}", esql.message);
+    assert_eq!(esql.error_type, "timeout");
     assert_eq!(esql.status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(
         (esql.kind, esql.status, esql.error_type, esql.message.as_str()),
         (sql.kind, sql.status, sql.error_type, sql.message.as_str()),
     );
+}
+
+/// Every audit event submitted, as `(query.language, query.status)`.
+#[cfg(feature = "esql")]
+#[derive(Default)]
+struct RecordingAuditSink {
+    events: Mutex<Vec<(String, String)>>,
+}
+
+#[cfg(feature = "esql")]
+impl RecordingAuditSink {
+    fn events(&self) -> Vec<(String, String)> {
+        self.events.lock().expect("lock").clone()
+    }
+}
+
+#[cfg(feature = "esql")]
+#[async_trait::async_trait]
+impl QueryAuditSink for RecordingAuditSink {
+    async fn submit(&self, event: AuditEvent) -> Result<(), MaintainError> {
+        let attr = |key: &str| {
+            event
+                .attrs
+                .iter()
+                .find_map(|(k, v)| match v {
+                    ravel_logseg::AttrValue::Str(s) if k == key => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("audit event has no {key} attr"))
+        };
+        let recorded = (attr("query.language"), attr("query.status"));
+        self.events.lock().expect("lock").push(recorded);
+        Ok(())
+    }
+}
+
+/// Which ES|QL requests write a query audit record, as the query guide and the
+/// audit guide state it: one that passes authentication, the body checks, the
+/// parse and admission writes exactly one, whether its statement then succeeds
+/// or fails; a request refused before any of those, or dropped before its
+/// statement ends, writes none. Each request is driven through the router, so
+/// the transport's own refusals are covered too.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_audit_records_only_admitted_statements() {
+    use axum::body::Body;
+    use axum::http::Request;
+
+    let audit = Arc::new(RecordingAuditSink::default());
+    let h = harness(
+        Arc::new(MemoryStore::new()),
+        QueryConcurrencyLimit::Bounded(1),
+        Arc::clone(&audit) as Arc<dyn QueryAuditSink>,
+        None,
+    );
+    let post = |token: &str, body: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/esql")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    };
+    let route = |request| route_status(crate::esql::router(h.transports.sql.clone()), request);
+
+    assert_eq!(
+        route(post("not-a-token", r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    for body in [
+        "not json",
+        r#"{"query":"ROW a = 1","params":[]}"#,
+        r#"{"query":"ROW a = 1","params":null}"#,
+        r#"{"query":"ROW a = 1","filter":{}}"#,
+        r#"{"query":"ROW a = 1","timeout":-1}"#,
+        r#"{"query":"ROW a = 1","start":"yesterday"}"#,
+        r#"{"query":"ROW a = 1","start":10,"end":1}"#,
+        r#"{"query":"FROM logs\n| WHERE"}"#,
+    ] {
+        assert_eq!(
+            route(post(TOKEN, body)).await,
+            StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    assert_eq!(audit.events(), Vec::<(String, String)>::new());
+
+    let held = h.admission.try_admit().expect("the ceiling's one permit");
+    assert_eq!(
+        route(post(TOKEN, r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+    drop(held);
+    assert_eq!(audit.events(), Vec::<(String, String)>::new());
+
+    // Admitted, then refused by binding: one record, with status error.
+    assert_eq!(
+        route(post(TOKEN, r#"{"query":"FROM metrics"}"#)).await,
+        StatusCode::BAD_REQUEST,
+    );
+    assert_eq!(
+        audit.events(),
+        vec![("esql".to_string(), "error".to_string())]
+    );
+
+    // The positive control: an admitted statement that succeeds writes one too.
+    assert_eq!(
+        route(post(TOKEN, r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        audit.events(),
+        vec![
+            ("esql".to_string(), "error".to_string()),
+            ("esql".to_string(), "ok".to_string()),
+        ]
+    );
+}
+
+/// A request dropped while its statement is still running, here held inside
+/// the declared-column read, writes no audit record: the record is written
+/// once the statement ends, and the drop comes first. The permit goes back.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_cancelled_request_writes_no_audit_record() {
+    let audit = Arc::new(RecordingAuditSink::default());
+    let (h, gate) = harness_with_held_tenant_config(Arc::clone(&audit) as Arc<dyn QueryAuditSink>);
+
+    let query = esql_query("FROM logs | LIMIT 1", Duration::from_secs(30));
+    let mut request = Box::pin(h.service.esql_execute(h.tenant_hash, &query));
+    tokio::select! {
+        _ = &mut request => panic!("the statement is held inside the store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(h.admission.in_flight(), 1);
+    drop(request);
+
+    assert_eq!(h.admission.in_flight(), 0);
+    assert_eq!(audit.events(), Vec::<(String, String)>::new());
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
 }
 
 /// Step 2 on the SQL surface, which used to skip it: `sql_execute` and

@@ -76,9 +76,16 @@ struct EsqlBody {
     /// Per-request wall deadline in seconds. Clamped to the server maximum.
     #[serde(default)]
     timeout: Option<f64>,
-    /// Accepted by the parser only to refuse it by name.
-    #[serde(default)]
-    params: Option<serde_json::Value>,
+    /// Whether the body has a `params` key, whatever its value (`null`
+    /// included), so it can be refused by name.
+    #[serde(default, deserialize_with = "key_present")]
+    params: bool,
+}
+
+/// `true` for any value, so a field read with it records that its key was
+/// present. An absent key takes the field's `Default`, `false`.
+fn key_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
 }
 
 async fn handle(State(state): State<SqlState>, req: Request<Body>) -> Response {
@@ -113,7 +120,7 @@ fn build_query(
     now_ns: i64,
     max_deadline: std::time::Duration,
 ) -> Result<EsqlQuery, ApiError> {
-    if body.params.is_some() {
+    if body.params {
         return Err(ApiError::bad_request(
             "\"params\" is not supported: write each value into the statement".to_string(),
         ));
@@ -244,14 +251,15 @@ mod tests {
 
     #[test]
     fn params_are_refused_by_name() {
-        let err = build_query(
-            body(r#"{"query":"ROW a = ?x","params":[{"x":1}]}"#).expect("body"),
-            0,
-            MAX,
-        )
-        .expect_err("rejected");
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("\"params\""), "{}", err.message);
+        for json in [
+            r#"{"query":"ROW a = ?x","params":[{"x":1}]}"#,
+            r#"{"query":"ROW a = 1","params":null}"#,
+            r#"{"query":"ROW a = 1","params":[]}"#,
+        ] {
+            let err = build_query(body(json).expect("body"), 0, MAX).expect_err(json);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST, "{json}");
+            assert!(err.message.contains("\"params\""), "{json}: {}", err.message);
+        }
     }
 
     #[test]
