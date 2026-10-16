@@ -77,8 +77,8 @@ and stays conformant.
 
 ## Score
 
-- Supported and covered: 58
-- Intentionally rejected: 71
+- Supported and covered: 59
+- Intentionally rejected: 70
 - Unclassified / broken: 0
 - **Conformance: 129 / 129 = 100.0%**
 
@@ -212,6 +212,6 @@ and stays conformant.
 | Write / DDL statement | `Transaction control` | `BEGIN TRANSACTION` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `UPDATE` | `UPDATE samples SET value = 1` | Intentionally rejected | `ValidationError::NotReadOnly` | read-only endpoint; refused before planning (crate::validate) |
 | Write / DDL statement | `Write nested in a query body` | `WITH c AS (SELECT 1) INSERT INTO samples VALUES (1, 2.0)` | Intentionally rejected | `ValidationError::WriteInQuery` | read-only endpoint; refused before planning (crate::validate) |
-| Table dispatch | `both tables (cross-signal)` | `SELECT * FROM samples JOIN logs ON samples.ts = logs.ts` | Intentionally rejected | `SqlError::CrossSignalQuery` | one signal per query in v1 (ADR-0033 decision C) |
+| Table dispatch | `both tables (cross-signal)` | `SELECT samples.value, logs.body FROM samples JOIN logs ON CAST(logs.ts AS BIGINT) = CAST(samples.ts AS BIGINT) + 999` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | one snapshot per signal, joined on the coordinator (ADR-2904) |
 | Table dispatch | `logs -> Signal::Logs` | `SELECT ts, body FROM logs` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | logs dispatch via referenced_base_tables (ADR-0033) |
 | Table dispatch | `samples -> Signal::Metrics` | `SELECT ts, value FROM samples` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | metrics dispatch via referenced_base_tables (ADR-0033) |
