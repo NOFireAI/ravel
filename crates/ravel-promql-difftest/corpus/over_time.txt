@@ -1,0 +1,138 @@
+# over_time aggregation function corpus (ticket P5, docs/promql-evaluator-plan.md
+# section 8): avg, min, max, sum, count, stddev, stdvar, quantile, present,
+# last, absent _over_time, all against
+# crates/ravel-promql-difftest/src/generator.rs's fixed dataset. Every offset
+# is relative to the dataset's base_ts_ms.
+#
+# `diff_special_values` (one sample every 30s: 1.5, +Inf, -1.5, -Inf, NaN,
+# -0.0, 0.0) is the source for the all-NaN, single-sample, and -0.0-sum
+# fixtures the ticket calls for: a 30s window ending exactly on the NaN
+# sample isolates it alone, a 7m window spanning the whole series exercises
+# min/max's skip-unless-all-NaN rule end to end, and a 60s window ending on
+# the last sample sums exactly the `-0.0`/`0.0` pair. `diff_boundary` (three
+# samples 5m apart) supplies both a single-sample window and, queried
+# entirely before `base_ts_ms`, a genuinely empty one (the matched series
+# has no sample in range at all, so the whole result vector is empty).
+#
+# `mode: unordered` is correct throughout, for the same reason as
+# selectors.txt (ADR-0021 decision 3).
+
+name: instant_avg_over_time_gauge_walk
+query: avg_over_time(diff_gauge_walk[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: range_avg_over_time_gauge_walk
+query: avg_over_time(diff_gauge_walk[5m])
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: instant_min_over_time_special_values_single_nan_window
+query: min_over_time(diff_special_values[30s])
+kind: instant
+time: +120s
+mode: unordered
+
+name: instant_min_over_time_special_values_full_window_skips_nan
+query: min_over_time(diff_special_values[7m])
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_max_over_time_special_values_full_window_skips_nan
+query: max_over_time(diff_special_values[7m])
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_sum_over_time_special_values_negative_zero_tie
+query: sum_over_time(diff_special_values[60s])
+kind: instant
+time: +180s
+mode: unordered
+
+name: instant_count_over_time_boundary_single_sample_window
+query: count_over_time(diff_boundary[1m])
+kind: instant
+time: +0s
+mode: unordered
+
+name: instant_sum_over_time_boundary_window_entirely_before_data_is_absent
+query: sum_over_time(diff_boundary[1m])
+kind: instant
+time: -600s
+mode: unordered
+expect: empty
+
+name: range_stddev_over_time_gauge_walk
+query: stddev_over_time(diff_gauge_walk[5m])
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: range_stdvar_over_time_gauge_walk
+query: stdvar_over_time(diff_gauge_walk[5m])
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: instant_quantile_over_time_median_gauge_walk
+query: quantile_over_time(0.5, diff_gauge_walk[10m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_quantile_over_time_q_above_one_clamps_to_infinity
+query: quantile_over_time(1.5, diff_gauge_walk[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: instant_quantile_over_time_q_below_zero_clamps_to_negative_infinity
+query: quantile_over_time(-0.5, diff_gauge_walk[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: range_last_over_time_boundary_tracks_the_most_recent_sample
+query: last_over_time(diff_boundary[10m])
+kind: range
+start: +0s
+end: +600s
+step: 300s
+mode: unordered
+
+name: instant_present_over_time_window_after_a_stale_marker
+query: present_over_time(diff_stale[3m])
+kind: instant
+time: +60s
+mode: unordered
+
+name: instant_absent_over_time_is_empty_when_the_series_exists
+query: absent_over_time(diff_gauge_walk[5m])
+kind: instant
+time: +600s
+mode: unordered
+expect: empty
+
+name: instant_absent_over_time_synthesizes_labels_from_the_selector
+query: absent_over_time(diff_gauge_walk{shape="nonexistent"}[5m])
+kind: instant
+time: +600s
+mode: unordered
+
+name: range_absent_over_time_toggles_exactly_at_the_stale_instant
+query: absent_over_time(diff_stale[30s])
+kind: range
+start: +0s
+end: +60s
+step: 30s
+mode: unordered

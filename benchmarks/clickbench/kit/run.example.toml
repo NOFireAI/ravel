@@ -1,0 +1,80 @@
+# One ClickBench kit run: copy this file, fill it in, and pass it to
+# benchmarks/clickbench/kit/launch.sh. Every key without "optional" is
+# required, and a key or table not named here is refused, naming it. Arrays
+# sit on one line. No key here is a credential: the instance role carries
+# every permission the boxes need.
+
+# The two commits, as full 40-character SHAs. Arm A is the baseline fetch.sh
+# judges arm B against.
+sha_a = "FILL-IN-BASELINE-COMMIT"
+sha_b = "FILL-IN-CANDIDATE-COMMIT"
+
+# Lanes whose band files the run is judged by, and the phases box/run.sh runs
+# in order. `benchmark` (the 43 statements over HTTP, cold and hot) is the only
+# phase, and `rlog` the only lane. The parquet lane (clickbench_parquet_bench,
+# bands/parquet.toml) is not run by the kit yet; check-run refuses it.
+lanes = ["rlog"]
+phases = ["benchmark"]
+
+# Which sections of each lane's band file the run is judged by: "relative"
+# (arm B against arm A, in fetch.sh) and "absolute" (each arm on its own, on
+# the box). A placeholder value is refused only in a selected section, and
+# rlog.toml's absolute section is still placeholders: select it once those are
+# filled in on the reference machine. Optional; the default is both.
+band_sections = ["relative"]
+
+# Where the boxes run and where the run's in/ and out/ live:
+# s3://<bucket>/<prefix>/runs/<run-id>/.
+instance_type = "c6a.4xlarge"
+region = "us-east-1"
+bucket = "FILL-IN-BUCKET-NAME"
+prefix = "clickbench-kit"
+# Its role needs s3:GetObject on <prefix>/runs/*/in/* and s3:PutObject on
+# <prefix>/runs/*/out/*; launch.sh checks both before launching. With
+# ec2:TerminateInstances, ec2:DescribeVolumes and cloudwatch:GetMetricStatistics
+# as well, a box terminates itself through the API and stamps the root
+# volume's type; without them it shuts itself down, which terminates it too.
+instance_profile = "ravel-clickbench-box"
+
+# Optional: ami (default: the latest Amazon Linux 2023 from SSM), subnet,
+# security_group, key_name (only for logging in to watch).
+# ami = "ami-..."
+# subnet = "subnet-..."
+# security_group = "sg-..."
+# key_name = "..."
+
+repo_url = "https://github.com/NOFireAI/ravel.git"
+tenant = "clickbench-v4"
+shards = 8
+# Relative to the repository root. launch.sh ships it in the kit, so both arms
+# run the same statements whatever their own checkout holds.
+corpus = "benchmarks/clickbench/hits.corpus.json"
+dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+# The dataset's sha256. A box whose download has another digest fails, and
+# fetch.sh refuses two arms that did not load the same dataset.
+dataset_sha256 = "FILL-IN-DATASET-SHA256"
+# The rows the dataset holds: hits.parquet has 99,997,497. The load must report
+# exactly this many rows_written, and SELECT COUNT(*) FROM logs (the corpus's
+# q01, sent once before the benchmark through the same endpoint and window)
+# must answer it, or the box fails at step load or step verify.
+rows_expected = 99997497
+
+# The loopback RustFS release the store runs on, pinned by digest.
+rustfs_url = "FILL-IN-RUSTFS-RELEASE-URL"
+rustfs_sha256 = "FILL-IN-RUSTFS-RELEASE-SHA256"
+
+# Pinned the same on both arms so the budget is not the variable that differs
+# (clickbench-aws-runbook.md section 8).
+memory_budget_bytes = 25769803776
+# off, or required (then audit_text = "redacted" or "plaintext").
+audit_mode = "off"
+
+# Optional: expected_statements (default 43), fold_min_entry_ratio (default
+# 0.8), query_timeout_s (default 900), window_hours (default 200000). Every
+# statement is sent with an explicit start and end window_hours apart, ending
+# when the verify step starts, as sql_latency_bench --window-hours does;
+# without one the server reads only the last hour.
+
+# One band file per lane, relative to the repository root.
+[bands]
+rlog = "benchmarks/clickbench/bands/rlog.toml"

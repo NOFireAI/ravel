@@ -1,0 +1,340 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "mb_absent_instant",
+      "class": "metadata_only",
+      "promql": "absent(metricsbench_absent_metric)",
+      "eval": "instant",
+      "constructs": ["function call", "absent", "vector selector"]
+    },
+    {
+      "id": "mb_absent_over_time_window",
+      "class": "metadata_only",
+      "promql": "absent_over_time(metricsbench_absent_metric[1h])",
+      "eval": "instant",
+      "constructs": [
+        "function call",
+        "absent_over_time",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_absent_selective_labels",
+      "class": "metadata_only",
+      "promql": "absent(metricsbench_absent_metric{job=\"metricsbench-api\",region=\"eu-west-1\"})",
+      "eval": "instant",
+      "constructs": [
+        "function call",
+        "absent",
+        "vector selector",
+        "label matcher ="
+      ]
+    },
+    {
+      "id": "mb_single_gauge_instant",
+      "class": "single_series",
+      "promql": "metricsbench_gauge_cpu_percent{job=\"metricsbench-api\",region=\"eu-west-1\",instance=\"metricsbench-instance-0\"}",
+      "eval": "instant",
+      "constructs": ["vector selector", "label matcher ="]
+    },
+    {
+      "id": "mb_single_counter_rate",
+      "class": "single_series",
+      "promql": "rate(metricsbench_requests_total{job=\"metricsbench-api\",method=\"GET\",status=\"200\",instance=\"metricsbench-instance-0\"}[5m])",
+      "eval": "range",
+      "constructs": [
+        "function call",
+        "rate",
+        "matrix selector",
+        "vector selector",
+        "label matcher ="
+      ]
+    },
+    {
+      "id": "mb_single_gauge_delta",
+      "class": "single_series",
+      "promql": "delta(metricsbench_gauge_cpu_percent{job=\"metricsbench-api\",region=\"eu-west-1\",instance=\"metricsbench-instance-0\"}[15m])",
+      "eval": "instant",
+      "constructs": [
+        "function call",
+        "delta",
+        "matrix selector",
+        "vector selector",
+        "label matcher ="
+      ]
+    },
+    {
+      "id": "mb_selective_job_rate_sum",
+      "class": "selective_multi_series",
+      "promql": "sum by (job) (rate(metricsbench_requests_total{job=\"metricsbench-api\"}[5m]))",
+      "eval": "range",
+      "constructs": [
+        "aggregate expression",
+        "sum",
+        "by",
+        "paren expression",
+        "function call",
+        "rate",
+        "matrix selector",
+        "vector selector",
+        "label matcher ="
+      ]
+    },
+    {
+      "id": "mb_selective_region_avg",
+      "class": "selective_multi_series",
+      "promql": "avg by (region) (metricsbench_gauge_cpu_percent{region=~\"eu-.*\"})",
+      "eval": "instant",
+      "constructs": [
+        "aggregate expression",
+        "avg",
+        "by",
+        "paren expression",
+        "vector selector",
+        "label matcher =~"
+      ]
+    },
+    {
+      "id": "mb_selective_error_ratio",
+      "class": "selective_multi_series",
+      "promql": "sum(rate(metricsbench_requests_total{status=\"500\"}[5m])) / sum(rate(metricsbench_requests_total{status!=\"500\"}[5m]))",
+      "eval": "range",
+      "constructs": [
+        "binary expression",
+        "/",
+        "aggregate expression",
+        "sum",
+        "function call",
+        "rate",
+        "matrix selector",
+        "vector selector",
+        "label matcher =",
+        "label matcher !="
+      ]
+    },
+    {
+      "id": "mb_fanout_total_rate",
+      "class": "high_fan_out",
+      "promql": "sum(rate(metricsbench_requests_total[5m]))",
+      "eval": "range",
+      "constructs": [
+        "aggregate expression",
+        "sum",
+        "function call",
+        "rate",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_fanout_topk_instances",
+      "class": "high_fan_out",
+      "promql": "topk(25, metricsbench_gauge_cpu_percent)",
+      "eval": "instant",
+      "constructs": [
+        "aggregate expression",
+        "topk",
+        "number literal",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_fanout_count_by_instance",
+      "class": "high_fan_out",
+      "promql": "count by (instance) (metricsbench_gauge_cpu_percent)",
+      "eval": "instant",
+      "constructs": [
+        "aggregate expression",
+        "count",
+        "by",
+        "paren expression",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_full_range_avg_over_time",
+      "class": "full_range",
+      "promql": "avg_over_time(metricsbench_gauge_cpu_percent[30m])",
+      "eval": "range",
+      "constructs": [
+        "function call",
+        "avg_over_time",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_full_range_max_by_job",
+      "class": "full_range",
+      "promql": "max by (job) (max_over_time(metricsbench_gauge_cpu_percent[30m]))",
+      "eval": "instant",
+      "constructs": [
+        "aggregate expression",
+        "max",
+        "by",
+        "paren expression",
+        "function call",
+        "max_over_time",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_full_range_counter_increase",
+      "class": "full_range",
+      "promql": "sum(increase(metricsbench_requests_total[30m]))",
+      "eval": "instant",
+      "constructs": [
+        "aggregate expression",
+        "sum",
+        "function call",
+        "increase",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_join_cpu_on_build_version",
+      "class": "join",
+      "promql": "metricsbench_gauge_cpu_percent * on (job, instance) group_left (version) metricsbench_build_info",
+      "eval": "instant",
+      "constructs": [
+        "binary expression",
+        "*",
+        "on",
+        "group_left",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_join_saturated_and_busy",
+      "class": "join",
+      "promql": "metricsbench_gauge_cpu_percent{region=\"eu-west-1\"} > 80 and on (job, instance) rate(metricsbench_requests_total[5m]) > 10",
+      "eval": "instant",
+      "constructs": [
+        "binary expression",
+        "and",
+        "on",
+        ">",
+        "number literal",
+        "function call",
+        "rate",
+        "matrix selector",
+        "vector selector",
+        "label matcher ="
+      ]
+    },
+    {
+      "id": "mb_join_unless_quiet_instances",
+      "class": "join",
+      "promql": "metricsbench_gauge_cpu_percent unless on (job, instance) (rate(metricsbench_requests_total[5m]) > 0)",
+      "eval": "instant",
+      "constructs": [
+        "binary expression",
+        "unless",
+        "on",
+        "paren expression",
+        ">",
+        "number literal",
+        "function call",
+        "rate",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_histogram_classic_p99",
+      "class": "histogram",
+      "promql": "histogram_quantile(0.99, sum by (le) (rate(metricsbench_request_duration_seconds_bucket[5m])))",
+      "eval": "range",
+      "constructs": [
+        "function call",
+        "histogram_quantile",
+        "number literal",
+        "aggregate expression",
+        "sum",
+        "by",
+        "paren expression",
+        "rate",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_histogram_native_p95",
+      "class": "histogram",
+      "promql": "histogram_quantile(0.95, metricsbench_latency_native)",
+      "eval": "instant",
+      "constructs": [
+        "function call",
+        "histogram_quantile",
+        "number literal",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_histogram_native_fraction",
+      "class": "histogram",
+      "promql": "histogram_fraction(0, 0.5, rate(metricsbench_latency_native[5m]))",
+      "eval": "instant",
+      "constructs": [
+        "function call",
+        "histogram_fraction",
+        "number literal",
+        "rate",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_long_range_7d_avg",
+      "class": "long_range",
+      "promql": "avg_over_time(metricsbench_gauge_cpu_percent{job=\"metricsbench-api\"}[7d])",
+      "eval": "instant",
+      "profiles": ["history"],
+      "constructs": [
+        "function call",
+        "avg_over_time",
+        "matrix selector",
+        "vector selector",
+        "label matcher ="
+      ]
+    },
+    {
+      "id": "mb_long_range_subquery_max",
+      "class": "long_range",
+      "promql": "max_over_time(sum(rate(metricsbench_requests_total[5m]))[1d:5m])",
+      "eval": "instant",
+      "profiles": ["history"],
+      "constructs": [
+        "subquery",
+        "function call",
+        "max_over_time",
+        "aggregate expression",
+        "sum",
+        "rate",
+        "matrix selector",
+        "vector selector"
+      ]
+    },
+    {
+      "id": "mb_long_range_predict_linear",
+      "class": "long_range",
+      "promql": "predict_linear(metricsbench_gauge_cpu_percent{job=\"metricsbench-api\"}[6h], 4 * 3600)",
+      "eval": "instant",
+      "profiles": ["history", "churn"],
+      "constructs": [
+        "function call",
+        "predict_linear",
+        "matrix selector",
+        "vector selector",
+        "label matcher =",
+        "number literal",
+        "binary expression",
+        "*"
+      ]
+    }
+  ]
+}

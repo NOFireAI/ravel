@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 2cd39f01b2a6692769e7b1972636b9fc4d123c324d8d5e7768385771849f6ec9 # shrinks to (dict, ids) = ([[], [4, 166, 59, 252, 254, 75, 214, 154], [21, 136, 135, 248, 47, 161, 222, 252], [103, 27, 209, 232, 17, 146], [164, 230, 29, 60, 10, 185, 156, 237], [230, 69, 236, 153, 63, 27, 55]], [3, 2, 2, 5, 1, 1, 1, 1, 2, 3, 5, 2, 1, 3, 1, 2, 3, 4, 0, 3, 0, 4, 2, 0, 3, 4, 0, 5, 0, 0, 2, 3, 3, 1, 0, 0, 3, 0, 2, 5, 5, 5, 0, 2, 5, 3, 5, 0, 0, 5, 3, 4, 4, 5, 0, 0, 5, 0, 2]), kind = 255, at = 17139325385286236444, bit = 53, splice = [146]

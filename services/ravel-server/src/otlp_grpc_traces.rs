@@ -1,0 +1,131 @@
+//! OTLP gRPC `TraceService::export`, the span-pipeline counterpart of
+//! [`crate::otlp_grpc_logs`]. It shares [`crate::otlp_grpc`]'s
+//! metadata-to-header conversion, so a client authenticates and selects a
+//! write mode the same way on any of the three services.
+
+use std::sync::Arc;
+
+use opentelemetry_proto::tonic::collector::trace::v1::trace_service_server::TraceService;
+use opentelemetry_proto::tonic::collector::trace::v1::{
+    ExportTraceServiceRequest, ExportTraceServiceResponse,
+};
+use ravel_types::Signal;
+use tonic::metadata::MetadataValue;
+use tonic::{Request, Response, Status};
+
+use crate::ingest_admission::admission_rejection_status;
+use crate::ingest_mode::resolve_write_mode;
+use crate::otlp_grpc::metadata_to_headers;
+use crate::otlp_http::{COMMIT_TOKEN_HEADER, GatewayState, idempotency_key_from_headers, now_ns};
+use crate::traces_ingest::SpanIngestRequestError;
+use crate::wire_byte_count::wire_request_bytes;
+
+pub struct GrpcTraceService {
+    state: Arc<GatewayState>,
+}
+
+impl GrpcTraceService {
+    pub fn new(state: Arc<GatewayState>) -> Self {
+        GrpcTraceService { state }
+    }
+}
+
+#[tonic::async_trait]
+impl TraceService for GrpcTraceService {
+    async fn export(
+        &self,
+        request: Request<ExportTraceServiceRequest>,
+    ) -> Result<Response<ExportTraceServiceResponse>, Status> {
+        // See `otlp_grpc::export`: normally a clone of the release handle
+        // `GrpcIngestAdmissionLayer` took on the request head (issue #1705),
+        // and a permit taken here only on the direct-call path. Read before
+        // `into_inner`, which drops the extensions.
+        let permit =
+            crate::ingest_admission::admit_grpc_request(&self.state.ingest_concurrency, &request)?;
+
+        let headers = metadata_to_headers(request.metadata());
+        let tenant = crate::ingest_admission::grpc_request_tenant(
+            self.state.tenant_resolver.as_ref(),
+            &request,
+            &headers,
+        )?;
+        let mode = resolve_write_mode(&headers, self.state.strict_flush_policy);
+        // See `otlp_grpc::export`: the layer's pending strict-ack permit, or
+        // one taken here on the direct-call path (issue #2805).
+        let pending_ack = crate::ingest_admission::admit_grpc_pending_ack(
+            self.state.traces_ingest.router.pending_ack_budget(),
+            mode,
+            &request,
+            &permit,
+        )?;
+
+        // Layer 2 (ADR-0051 section 2): byte rate applies uniformly to every
+        // signal including spans, even though spans get no layer-4 admission
+        // (ADR-0051 excludes spans from series/stream admission). Counted by
+        // `WireByteCountLayer` off the request body; a gzip-compressed frame is
+        // charged its decoded message size, not the compressed wire length
+        // (ADR-0084 decision 4).
+        let charge = wire_request_bytes(&request)?;
+        if let Err(rejection) = self.state.admission.check_byte_rate(
+            &tenant,
+            Signal::Spans,
+            charge.charge_bytes,
+            now_ns(),
+        ) {
+            return Err(admission_rejection_status(rejection));
+        }
+        self.state
+            .ingest_byte_metrics
+            .record_wire_bytes(&tenant, Signal::Spans, charge.wire_bytes);
+
+        let idempotency_key = idempotency_key_from_headers(&headers);
+
+        let outcome = crate::traces_ingest::handle_export_traces_releasing(
+            &self.state.traces_ingest,
+            tenant,
+            mode,
+            request.into_inner(),
+            now_ns(),
+            idempotency_key,
+            &permit,
+            &pending_ack,
+        )
+        .await
+        .map_err(|err| match err {
+            // Receiver-clock floor (ADR-0051 amendment): UNAVAILABLE,
+            // the replica's fault; a retry against a healthy one succeeds.
+            err @ SpanIngestRequestError::ClockImplausible(_) => {
+                Status::unavailable(err.to_string())
+            }
+            err @ SpanIngestRequestError::InvalidIdempotencyKey { .. } => {
+                Status::invalid_argument(err.to_string())
+            }
+            // Buffer-budget shed (ADR-0069): RESOURCE_EXHAUSTED, not the
+            // UNAVAILABLE the other retryable write failures take.
+            err @ SpanIngestRequestError::Write(
+                ravel_ingest::SpanWriteError::BufferBudgetExceeded,
+            ) => Status::resource_exhausted(err.to_string()),
+            SpanIngestRequestError::Write(ravel_ingest::SpanWriteError::PendingAckLimitReached) => {
+                crate::ingest_admission::pending_ack_shed_status()
+            }
+            // A shard at the flush deferral cap refused the write before
+            // buffering it: the same backpressure class as the budget shed.
+            err @ SpanIngestRequestError::Write(
+                ravel_ingest::SpanWriteError::DeferralCapReached,
+            ) => Status::resource_exhausted(err.to_string()),
+            err if err.is_retryable() => Status::unavailable(err.to_string()),
+            err => Status::internal(err.to_string()),
+        })?;
+
+        // Verbatim on a replay, encoded-from-tokens otherwise. Built before
+        // `outcome.response` is moved.
+        let commit_token = outcome.commit_token_header();
+        let mut response = Response::new(outcome.response);
+        if let Some(encoded) = commit_token
+            && let Ok(value) = MetadataValue::try_from(encoded.as_str())
+        {
+            response.metadata_mut().insert(COMMIT_TOKEN_HEADER, value);
+        }
+        Ok(response)
+    }
+}

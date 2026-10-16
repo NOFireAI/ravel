@@ -1,0 +1,2291 @@
+//! Security invariant 2: per-query `SessionContext` for one tenant, the named
+//! tables (ADR-2904 decision 4).
+//!
+//! [`build_session_with_tables`] constructs a complete, throwaway DataFusion
+//! session for exactly one query: its own `SessionConfig`, its own
+//! `RuntimeEnv`, its own memory pool, and the named tables of the requesting
+//! tenant -- one or more signal tables (its `samples` provider over a
+//! `Signal::Metrics` snapshot, its `logs` provider over a `Signal::Logs`
+//! snapshot, and so on, each a [`SessionTable`]) or its Parquet tables the
+//! statement names (ADR-2040). [`build_session`] is its one-table form.
+//! Nothing is cached, pooled, or reused across queries or tenants.
+//!
+//! The session widens no further than the tables the query names: `samples`
+//! brings the metric scalar UDFs, `logs` brings `has_word` and the `LIKE`
+//! rewrite. The aggregate allowlist below is enforced for every set, because
+//! `count(*)` and the numeric aggregates are reachable from any table.
+//!
+//! This is the tenant-isolation mechanism, not a performance shortcut
+//! (framing it as "context construction is cheap enough" invites a later
+//! caching optimization that silently converts it into a cross-tenant leak).
+//! If context construction ever proves too expensive, the fix is cheaper
+//! construction; sharing state requires an ADR.
+//!
+//! Defense in depth behind the parse gate (crate::validate):
+//!
+//! - `information_schema` is disabled, so there is no metadata surface to
+//!   enumerate even within a single-tenant session.
+//! - A signal-table session's `RuntimeEnv` carries
+//!   [`EmptyObjectStoreRegistry`], which holds no stores and refuses every
+//!   lookup. DataFusion's default registry auto-registers a local filesystem
+//!   store for `file://`; that default is replaced here, so a
+//!   `CREATE EXTERNAL TABLE`/`COPY` that somehow slipped the parse gate has
+//!   nothing to bind to. `RsegScanExec` does its own I/O through
+//!   `SegmentFetcher` and never consults this registry.
+//! - A Parquet session's `RuntimeEnv` carries a [`SingleStoreRegistry`]
+//!   instead (ADR-2040 decision D4). It answers exactly the requesting
+//!   tenant's `ravel-pq://<tenant_hash>/` URL, with a store that serves the
+//!   sizes of the files of the manifests this query resolved and refuses every
+//!   read, write and list; every other URL is an error, and `register_store`
+//!   installs nothing. The files themselves are read by the provider's own
+//!   pinned reader, never through this registry.
+//! - Function registration is an allowlist across every registry (ADR-0022
+//!   decision 2 for aggregates, ADR-0097 decisions 2/4/6 for the rest):
+//!   [`build_session`] enumerates each of `aggregate_functions()`,
+//!   `scalar_functions()`, `window_functions()`, and `table_functions()` and
+//!   deregisters every name outside that registry's admitted set
+//!   ([`ADMITTED_AGGREGATES`], [`ADMITTED_SCALARS`], [`ADMITTED_WINDOWS`],
+//!   [`ADMITTED_TABLE_FUNCTIONS`]). This backstops the subset check in
+//!   crate::validate and fails closed under DataFusion upgrades -- a newly added
+//!   default function in any registry is excluded by default rather than
+//!   silently reachable by name. The allowlist governs name resolution only;
+//!   syntax an `ExprPlanner` rewrites is governed as described beside the
+//!   planner registrations in [`build_session`]. `avg`/`mean` are admitted
+//!   (ADR-0022 decisions 3, 4): they stay in the admitted set so the
+//!   deregistration loop keeps them, and
+//!   their built-in accumulator is then replaced by the sequential-fold UDAF
+//!   (crate::avg), the same registry-replacement pattern min/max use.
+//! - The table-function admitted set is empty, so `range`/`generate_series`
+//!   (registered unconditionally by DataFusion's `with_default_features()`
+//!   inside `SessionContext::new_with_config_rt`) are deregistered like any
+//!   other non-admitted name. Neither registry lets a table function read
+//!   anything, but one that generates rows in memory needs no store, so
+//!   `SELECT count(*) FROM range(0, 1e18)` would otherwise reach the planner
+//!   as a second, ungoverned data source alongside the registered tables. The
+//!   executor also refuses a statement naming a table function before it
+//!   resolves anything (crate::validate's `unreadable_table_reference`).
+//!
+//! Determinism:
+//! every `repartition_*` knob except aggregation is turned off unconditionally.
+//! Float aggregation is order-dependent, so v1 requires it to execute
+//! single-partitioned above the merged, deduplicated stream. Left on,
+//! `EnforceDistribution` would insert a `RepartitionExec` above
+//! `RsegDedupExec` and fan an aggregate out across partitions, reordering
+//! summation and breaking bit-exactness against the differential gate's
+//! reference.
+//!
+//! `repartition_aggregations` is the one exception (ADR-0094): it reads the
+//! `exact_typed_aggregates` argument [`session_config`] receives, rather than a
+//! hardcoded `false`. That argument is `true` only when a per-query
+//! classification (`executor::SqlExecutor`) has proven every aggregate and
+//! GROUP BY key in the query is order/partition-independent -- `count` and
+//! `count distinct` over any input, and `sum`/`min`/`max` over a resolved
+//! non-float input, with no float group key;
+//! `avg`/`mean` over a resolved integer input other than `UInt64`,
+//! dictionary-encoded or not, is eligible too (ADR-0825 decision 3): its
+//! partial sum is exact `i128` accumulation, never plain f64 addition.
+//! `avg`/`mean` over a Float64 or `UInt64` input (both resolve to Float64 and
+//! run plain IEEE f64 addition), `sum`/`min`/`max` over a float input, and any
+//! float group key are never eligible. It is `false` for every other query,
+//! and for every query when the operator turns
+//! `SqlConfig::parallel_final_aggregation` off (it defaults on); either way
+//! the plan is byte-identical to the old single-partition plan. The
+//! join/sort/window/file-scan knobs stay unconditionally `false`: their
+//! determinism requirements are out of ADR-0094's scope.
+//!
+//! Aggregation state size (issue #680, ADR-0102 decision 2's amendment):
+//! [`session_config`] also tightens DataFusion's two skip-partial-aggregation
+//! probe thresholds ([`SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`],
+//! [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`]) whenever
+//! `SqlConfig::skip_partial_aggregation` is on, which it is by default. This is
+//! a memory decision, not a determinism one: the partial stage keeps one hash
+//! table per input partition, so a key whose distinct values appear in every
+//! partition costs `partitions x distinct` entries before the final stage ever
+//! merges them. Giving up early bounds that at `partitions x probe rows`. It
+//! cannot change a result -- the final stage sees the same rows and computes
+//! the same groups either way -- so it is orthogonal to the determinism rules
+//! above.
+//!
+//! Spill (ADR-0954): the disk manager is configured explicitly in both
+//! directions, never left to DataFusion's default. [`build_session`] takes a
+//! per-query [`SpillDecision`]; `Disabled` is ADR-0102 decision 3 unchanged,
+//! and `Enabled` names one directory and one byte ceiling. See
+//! [`disk_manager_builder`].
+//!
+//! A `SpillDecision::Enabled` query is also repartition-free: [`session_config`]
+//! forces `repartition_aggregations` off for it, whatever the ADR-0094
+//! classification said, and disables DataFusion's round-robin repartitioning
+//! too. The reason is a scope mismatch, not a determinism one: the spill
+//! eligibility predicate classifies LOGICAL plan nodes, while an enabled disk
+//! manager is a permission held by every operator in the session's PHYSICAL
+//! plan, and `RepartitionExec` -- which appears in no logical plan -- spills in
+//! DataFusion 55. See [`repartition_free`].
+
+use std::collections::BTreeSet;
+use std::sync::Arc;
+
+use datafusion::common::plan_err;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
+use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::object_store::ObjectStoreRegistry;
+use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion::functions::datetime::planner::DatetimeFunctionPlanner;
+use datafusion::functions::unicode::planner::UnicodeFunctionPlanner;
+use datafusion::logical_expr::registry::FunctionRegistry;
+use datafusion::object_store::ObjectStore;
+use datafusion::prelude::{SessionConfig, SessionContext};
+use ravel_parquet::SingleStoreRegistry;
+use url::Url;
+
+use crate::alerts_provider::AlertsTableProvider;
+use crate::attrs_per_key::AttrsPerKeyProjection;
+use crate::audit_provider::AuditTableProvider;
+use crate::avg::sequential_avg_udaf;
+use crate::bounded_topk::BoundedTopKAggregate;
+use crate::compact_slices::CompactSlices;
+use crate::config::SqlConfig;
+use crate::group_keys::DictionaryGroupKeysAsViews;
+use crate::late_materialization::TopKLateMaterialization;
+use crate::like_udf::{LikeScope, LikeToUdf};
+use crate::logs_provider::LogsTableProvider;
+use crate::logs_scan::ConfirmTopKThreshold;
+use crate::logs_udf::has_word_udf;
+use crate::map_field_planner::map_field_access_planner;
+use crate::metadata_agg::MetadataOnlyAggregate;
+use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
+use crate::parquet::ParquetSession;
+use crate::provider::RavelTableProvider;
+use crate::spans_provider::SpansTableProvider;
+use crate::trace_id_planner::trace_id_hex_literal_planner;
+use crate::udf::{label_match_udf, label_udf};
+
+/// The metrics table name (`Signal::Metrics`).
+pub const SAMPLES_TABLE: &str = "samples";
+
+/// The logs table name (`Signal::Logs`, ADR-0033).
+pub const LOGS_TABLE: &str = "logs";
+
+/// The spans table name (`Signal::Spans`, ADR-0045 decision 5).
+pub const SPANS_TABLE: &str = "spans";
+
+/// The alerts table name (`Signal::Alerts`, ADR-1101 decision 1).
+pub const ALERTS_TABLE: &str = "alerts";
+
+/// The audit table name (`Signal::Audit`, ADR-1101 decision 1).
+pub const AUDIT_TABLE: &str = "audit";
+
+/// One table a query's session registers; [`build_session_with_tables`]
+/// takes a set of them (ADR-2904 decision 4). The enum keeps the provider
+/// types (metrics vs logs vs spans vs alerts vs audit) apart without a
+/// `dyn TableProvider` erasure.
+pub enum SessionTable {
+    /// The `samples` table over a resolved `Signal::Metrics` snapshot.
+    Metrics(Arc<RavelTableProvider>),
+    /// The `logs` table over a resolved `Signal::Logs` snapshot.
+    Logs(Arc<LogsTableProvider>),
+    /// The `spans` table over a resolved `Signal::Spans` snapshot (ADR-0045
+    /// decision 5). Needs no table-specific scalar UDF: unlike `logs`'
+    /// `has_word` and metrics' `label`/`label_match`, every `spans` predicate
+    /// this ships (ts, trace_id, duration, status_code, service_name) is a
+    /// plain column comparison.
+    Spans(Arc<SpansTableProvider>),
+    /// The `alerts` table over a resolved `Signal::Alerts` snapshot (ADR-1101
+    /// decision 1).
+    Alerts(Arc<AlertsTableProvider>),
+    /// The `audit` table over a resolved `Signal::Audit` snapshot (ADR-1101
+    /// decision 1).
+    Audit(Arc<AuditTableProvider>),
+    /// One or more Parquet tables of the caller's tenant (ADR-2040), each
+    /// under its own name. The only arm whose session carries an object store
+    /// registry that answers anything: a [`SingleStoreRegistry`] over the
+    /// session's [`TenantParquetStore`](ravel_parquet::TenantParquetStore).
+    Parquet(ParquetSession),
+}
+
+/// The v1 SQL aggregate allowlist (ADR-0022 decision 2). [`build_session`]
+/// enumerates the aggregate UDAFs the default session registers and
+/// deregisters every name outside this set and [`REWRITE_ONLY_AGGREGATES`],
+/// so exclusion is the default state
+/// and a DataFusion upgrade that adds a default aggregate fails closed.
+/// `avg`/`mean` are admitted (ADR-0022 decisions 3, 4): they are kept in this
+/// set so the deregistration loop preserves the built-in entries, which
+/// [`build_session`] then replaces with the sequential-fold UDAF (crate::avg).
+///
+/// The complement within the default registrations lives in
+/// [`crate::validate::EXCLUDED_AGGREGATES`]; the two are kept exhaustive by
+/// `admitted_and_excluded_aggregates_cover_the_default_registrations` below.
+pub const ADMITTED_AGGREGATES: [&str; 6] = ["count", "sum", "min", "max", "avg", "mean"];
+
+/// Aggregates [`build_session`] keeps registered although no statement may
+/// name them (ADR-0022, DISTINCT ON amendment). DataFusion's
+/// `replace_distinct_aggregate` optimizer rule rewrites a `DISTINCT ON` into
+/// an ordered `first_value` aggregate that it looks up by name in the session
+/// registry, after the caller's statement has been planned. Each name here is
+/// also in [`crate::validate::EXCLUDED_AGGREGATES`], so the text walk refuses
+/// it, and `crate::executor` refuses a planned statement that still calls one
+/// before any optimizer rule runs, which is the gate for every spelling the
+/// text walk misses. The rewrite is exact only under the total-order gate on
+/// `DISTINCT ON` in `crate::executor`.
+pub const REWRITE_ONLY_AGGREGATES: [&str; 1] = ["first_value"];
+
+/// The v1 SQL scalar allowlist (ADR-0097 decisions 2, 4). [`build_session`]
+/// enumerates the scalar UDFs the default session registers and deregisters
+/// every name outside this set, the same fail-closed pattern
+/// [`ADMITTED_AGGREGATES`] uses. Scalars are pure per-row transforms, so
+/// ADR-0022's sequential-accumulation concern does not apply and the whole
+/// registered surface stays admitted except the eight in [`EXCLUDED_SCALARS`].
+///
+/// Ravel's own per-table scalar UDFs (`label` and `label_match` for Metrics,
+/// `has_word` for Logs) are part of this set: they are registered *after* the
+/// deregistration loop, per table, so they are never enumerated by it, but the
+/// drift test counts them here. No single session registers all three; each
+/// table's session registers the upstream admitted scalars plus that table's
+/// own UDFs (ADR-0097 decision 2: "one upstream set plus a per-table
+/// addendum").
+///
+/// The complement within the upstream default registrations lives in
+/// [`EXCLUDED_SCALARS`]; the two are kept exhaustive by
+/// `admitted_and_excluded_cover_all_registries_for_every_table` below.
+pub const ADMITTED_SCALARS: [&str; 127] = [
+    // Ravel's own per-table scalar UDFs (registered after the loop, per table).
+    "label",
+    "label_match",
+    "has_word",
+    // The upstream datafusion-functions scalar packs (string, unicode,
+    // datetime, math, regex, encoding), minus the eight in EXCLUDED_SCALARS.
+    "abs",
+    "acos",
+    "acosh",
+    "arrow_cast",
+    "arrow_field",
+    "arrow_metadata",
+    "arrow_try_cast",
+    "arrow_typeof",
+    "ascii",
+    "asin",
+    "asinh",
+    "atan",
+    "atan2",
+    "atanh",
+    "bit_length",
+    "btrim",
+    "cast_to_type",
+    "cbrt",
+    "ceil",
+    "char_length",
+    "character_length",
+    "chr",
+    "coalesce",
+    "concat",
+    "concat_ws",
+    "contains",
+    "cos",
+    "cosh",
+    "cot",
+    "date_bin",
+    "date_format",
+    "date_part",
+    "date_trunc",
+    "datepart",
+    "datetrunc",
+    "decode",
+    "degrees",
+    "encode",
+    "ends_with",
+    "exp",
+    "factorial",
+    "find_in_set",
+    "floor",
+    "from_unixtime",
+    "gcd",
+    "get_field",
+    "greatest",
+    "ifnull",
+    "initcap",
+    "instr",
+    "isnan",
+    "iszero",
+    "lcm",
+    "least",
+    "left",
+    "length",
+    "levenshtein",
+    "ln",
+    "log",
+    "log10",
+    "log2",
+    "lower",
+    "lpad",
+    "ltrim",
+    "make_date",
+    "make_time",
+    "named_struct",
+    "nanvl",
+    "nullif",
+    "nvl",
+    "nvl2",
+    "octet_length",
+    "overlay",
+    "pi",
+    "position",
+    "pow",
+    "power",
+    "radians",
+    "regexp_count",
+    "regexp_instr",
+    "regexp_like",
+    "regexp_match",
+    "regexp_replace",
+    "repeat",
+    "replace",
+    "reverse",
+    "right",
+    "round",
+    "row",
+    "rpad",
+    "rtrim",
+    "signum",
+    "sin",
+    "sinh",
+    "split_part",
+    "sqrt",
+    "starts_with",
+    "strpos",
+    "struct",
+    "substr",
+    "substr_index",
+    "substring",
+    "substring_index",
+    "tan",
+    "tanh",
+    "to_char",
+    "to_date",
+    "to_hex",
+    "to_local_time",
+    "to_time",
+    "to_timestamp",
+    "to_timestamp_micros",
+    "to_timestamp_millis",
+    "to_timestamp_nanos",
+    "to_timestamp_seconds",
+    "to_unixtime",
+    "translate",
+    "trim",
+    "trunc",
+    "try_cast_to_type",
+    "union_extract",
+    "union_tag",
+    "upper",
+    "with_metadata",
+];
+
+/// The scalar UDFs the default DataFusion session registers that are **not**
+/// admitted (ADR-0097 decision 4): nondeterministic or environment-reading, so
+/// unattestable by the differential conformance oracle. `uuid`/`random`/`rand`
+/// return a different answer for identical input; `now`/`current_timestamp`/
+/// `current_date`/`current_time` read the wall clock (query-time is available
+/// through the request's own time range); `version` reports the DataFusion
+/// build to any caller. [`build_session`] deregisters these, and the drift test
+/// keeps this list exhaustive against the upstream registrations.
+///
+/// `today` is here even though ADR-0097 decision 4 names only eight: it is a
+/// DataFusion alias of `current_date` (datafusion-functions 55's
+/// `current_date.rs` registers `aliases: vec!["today"]`), so it reads the same
+/// wall clock and is caught by the same rationale. It also cannot be admitted
+/// independently: deregistering `current_date` removes the shared UDF, dropping
+/// the `today` key too, so admitting it would make the drift test fail closed.
+///
+/// `input_file_name` and `file_row_index` (DataFusion 55 defaults) read the
+/// scan's file environment: the path of the object a row came from and the
+/// row's position in it. Neither is a function of the row's values, so they
+/// are unattestable by the same rationale.
+pub const EXCLUDED_SCALARS: [&str; 11] = [
+    "uuid",
+    "random",
+    "rand",
+    "now",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "version",
+    "today",
+    "input_file_name",
+    "file_row_index",
+];
+
+/// The v1 SQL window allowlist (ADR-0097 decision 6). The rank/offset families
+/// carry no floating-point accumulation and are deterministic under the
+/// single-partition rule; `cume_dist`/`percent_rank` return one correctly
+/// rounded IEEE division of two exact integer counts, deterministic and
+/// bit-reproducible. [`build_session`] enumerates `window_functions()` and
+/// deregisters every name outside this set.
+pub const ADMITTED_WINDOWS: [&str; 8] = [
+    "row_number",
+    "rank",
+    "dense_rank",
+    "ntile",
+    "lag",
+    "lead",
+    "cume_dist",
+    "percent_rank",
+];
+
+/// The window UDWFs the default session registers that are **not** admitted
+/// (ADR-0097 decision 6). Until this enumeration existed these three were
+/// refused only incidentally, because their names collide with
+/// [`crate::validate::EXCLUDED_AGGREGATES`], a list written about aggregates.
+/// Deregistering them here makes the refusal explicit and window-aware; whether
+/// they are ever readmitted is a conformance-row decision, not a default.
+pub const EXCLUDED_WINDOWS: [&str; 3] = ["first_value", "last_value", "nth_value"];
+
+/// The v1 SQL table-function allowlist (ADR-0097 decision 2): empty. No table
+/// function is reachable today and none should become reachable by an upstream
+/// addition. [`build_session`] enumerates `table_functions()` and deregisters
+/// every name, replacing the earlier two hardcoded `deregister_udtf` calls so a
+/// DataFusion release adding a third table function cannot ship it into the
+/// surface.
+pub const ADMITTED_TABLE_FUNCTIONS: [&str; 0] = [];
+
+/// The table functions the default session registers, all excluded (ADR-0097
+/// decision 2). `range`/`generate_series` generate rows in memory, so
+/// [`EmptyObjectStoreRegistry`] does not block them; they reach the planner as
+/// a second, ungoverned data source unless deregistered. Kept exhaustive
+/// against the upstream registrations by the drift test.
+pub const EXCLUDED_TABLE_FUNCTIONS: [&str; 2] = ["generate_series", "range"];
+
+/// Rows one partial aggregation partition processes before it checks whether
+/// its group key is worth aggregating at all
+/// (`datafusion.execution.skip_partial_aggregation_probe_rows_threshold`,
+/// DataFusion's default 100,000). Issue #680.
+///
+/// One Arrow batch. The threshold is not a tuning preference, it is the size of
+/// the state a partition is allowed to build before the probe can save it:
+/// whatever a partial partition has accumulated when it gives up stays resident
+/// for the rest of the scan, and every partition pays it, so the cost of the
+/// probe itself is `partitions x this`. DataFusion's 100,000 also never fires
+/// at all on a partition that holds fewer rows than that, which is the common
+/// case here once `target_partitions` divides a tenant's hour.
+///
+/// Not smaller: [`SKIP_PARTIAL_AGGREGATION_PROBE_RATIO`] is judged from a
+/// sample of exactly this many rows, and a smaller sample starts reading a
+/// genuinely reducible mid-cardinality key as unreducible.
+pub const SKIP_PARTIAL_AGGREGATION_PROBE_ROWS: usize = 8192;
+
+/// Distinct-groups-to-rows ratio above which a partial aggregation partition
+/// gives up
+/// (`datafusion.execution.skip_partial_aggregation_probe_ratio_threshold`,
+/// DataFusion's default 0.8). Issue #680.
+///
+/// At 0.5 a partition stops aggregating when its probe found a new group for
+/// more than every other row: at that ratio the partial stage is spending a
+/// hash-table entry per two rows and returning at most a factor of two, which
+/// does not pay for `partitions` copies of the state. Below it the partial
+/// stage still reduces enough to be worth its memory and nothing changes.
+/// Skipping never changes a result, only where the state lives; a
+/// falsely-skipped partition costs rows pushed to the final stage, never a
+/// wrong group.
+pub const SKIP_PARTIAL_AGGREGATION_PROBE_RATIO: f64 = 0.5;
+
+/// An `ObjectStoreRegistry` that holds nothing and registers nothing.
+///
+/// `register_store` silently declines (returning `None`, the trait's "no
+/// previous store" answer) and `get_store` always errors. Both halves
+/// matter: declining registration is what keeps a store from being
+/// installed at runtime, and erroring on lookup is what makes an attempted
+/// use fail loudly instead of falling back to a default local filesystem.
+#[derive(Debug, Default)]
+pub struct EmptyObjectStoreRegistry;
+
+impl ObjectStoreRegistry for EmptyObjectStoreRegistry {
+    fn register_store(
+        &self,
+        _url: &Url,
+        _store: Arc<dyn ObjectStore>,
+    ) -> Option<Arc<dyn ObjectStore>> {
+        None
+    }
+
+    fn get_store(&self, _url: &Url) -> DFResult<Arc<dyn ObjectStore>> {
+        Err(DataFusionError::Execution(
+            "this SQL session registers no object store; \
+             external table and file access are not available"
+                .to_string(),
+        ))
+    }
+}
+
+/// Whether THIS query may spill, and where (ADR-0954). Decided per query by
+/// the caller ([`crate::SqlExecutor`]), never inferred here: spill needs both
+/// an operator-configured [`SpillConfig`](crate::SpillConfig) and a plan whose
+/// every aggregate is exactness-preserving under spill, and only the caller
+/// has the plan.
+#[derive(Debug, Clone, Copy)]
+pub enum SpillDecision<'a> {
+    /// No spill. Identical to the pre-ADR-0954 behavior in every respect: an
+    /// operator that wants to spill gets DataFusion's own
+    /// `"... (DiskManager is disabled)"` `ResourcesExhausted`, which
+    /// [`SqlError::resources_exhausted_reattributed`](crate::SqlError::resources_exhausted_reattributed)
+    /// then re-attributes to the pool that actually filled. This is what an
+    /// unconfigured deployment gets, and what an ineligible plan gets on a
+    /// configured one.
+    Disabled,
+    /// Spill into `dir`, capped at `max_bytes` for this query.
+    Enabled {
+        /// This query's own scratch directory (a
+        /// [`SpillScratch`](crate::spill::SpillScratch) subdirectory, not the
+        /// operator-configured root). DataFusion creates its own temporary
+        /// directory inside it and removes that on `RuntimeEnv` drop.
+        dir: &'a std::path::Path,
+        /// The per-query scratch ceiling, in spill-file bytes on disk.
+        max_bytes: u64,
+    },
+}
+
+/// The disk manager for one query.
+///
+/// [`SpillDecision::Disabled`] is `DiskManagerMode::Disabled`, unchanged from
+/// ADR-0102 decision 3 and for its reasons: budget exhaustion is a typed error,
+/// never a partial result, and no durability may depend on local disk. Leaving
+/// the disk manager unconfigured instead would restore DataFusion's
+/// `OsTmpDirectory` default with a 100 GB ceiling, which routes around the
+/// pool's `try_grow` enforcement entirely; that default is never reachable from
+/// this crate, in either arm.
+///
+/// [`SpillDecision::Enabled`] names exactly one directory and one ceiling.
+/// Both are explicit: a directory with DataFusion's default ceiling would be
+/// the same unbounded behavior in a different place.
+fn disk_manager_builder(spill: SpillDecision<'_>) -> DiskManagerBuilder {
+    match spill {
+        SpillDecision::Disabled => {
+            DiskManagerBuilder::default().with_mode(DiskManagerMode::Disabled)
+        }
+        SpillDecision::Enabled { dir, max_bytes } => DiskManagerBuilder::default()
+            .with_mode(DiskManagerMode::Directories(vec![dir.to_path_buf()]))
+            .with_max_temp_directory_size(max_bytes),
+    }
+}
+
+/// Build the per-query `SessionConfig`. Separated from [`build_session`] so
+/// the invariants above can be asserted without constructing a provider.
+///
+/// `exact_typed_aggregates` (ADR-0094 decision 2) is one per-query input:
+/// `true` only when the caller's classification proved the query's aggregates
+/// and GROUP BY keys are order/partition-independent, allowing DataFusion to
+/// fan the final aggregation across partitions. `false` for every other query,
+/// which reproduces the old single-partition plan exactly.
+///
+/// `spill` is the other, and it OVERRIDES the first: a
+/// [`SpillDecision::Enabled`] query gets no `RepartitionExec` at all, so
+/// `repartition_aggregations` is forced off and DataFusion's round-robin
+/// repartitioning is disabled with it. See [`repartition_free`] for why.
+pub fn session_config(
+    config: &SqlConfig,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+) -> SessionConfig {
+    let repartition_free = repartition_free(spill);
+    let mut session = SessionConfig::new()
+        .with_information_schema(false)
+        .with_target_partitions(config.engine.sql_partition_count())
+        // ADR-0094: the only knob that is ever true, and only for a query whose
+        // aggregates and group keys are all exact-typed. See the module docs.
+        // ADR-0954 takes it back for a spill-enabled query.
+        .with_repartition_aggregations(exact_typed_aggregates && !repartition_free)
+        .with_repartition_joins(false)
+        .with_repartition_sorts(false)
+        .with_repartition_windows(false)
+        .with_repartition_file_scans(false);
+
+    // Issue #680 / ADR-0102 decision 2's amendment. Neither option has a
+    // fluent `with_*` setter in DataFusion 55, so both are written through
+    // `options_mut` as typed fields (no string keys, so a renamed option is a
+    // compile error rather than a silently ignored setting).
+    if config.skip_partial_aggregation {
+        let options = session.options_mut();
+        options
+            .execution
+            .skip_partial_aggregation_probe_rows_threshold = SKIP_PARTIAL_AGGREGATION_PROBE_ROWS;
+        options
+            .execution
+            .skip_partial_aggregation_probe_ratio_threshold = SKIP_PARTIAL_AGGREGATION_PROBE_RATIO;
+    }
+
+    // Issue #1402. DataFusion's own `TopKAggregation` rule defaults ON
+    // (`enable_topk_aggregation`), and it admits two shapes ravel must not
+    // take: a float `min`/`max`, whose answer would come from the priority
+    // map's ordering instead of ADR-0023's total order, and an arbitrarily
+    // large `LIMIT`, where the bound is no longer worth its per-row
+    // comparison. It is turned off here for every query and
+    // `crate::BoundedTopKAggregate`, installed by `build_session`, re-admits
+    // exactly the vetted shape. Written as a typed field for the same reason
+    // the knobs above are.
+    session.options_mut().optimizer.enable_topk_aggregation = false;
+
+    if repartition_free {
+        // The `repartition_*` knobs above do not cover DataFusion's round-robin
+        // fan-out, which `EnforceDistribution` inserts on its own whenever an
+        // operator's input has fewer partitions than `target_partitions`. It
+        // has no fluent setter either, so it is written as a typed field for
+        // the same reason.
+        session
+            .options_mut()
+            .optimizer
+            .enable_round_robin_repartition = false;
+    }
+
+    session
+}
+
+/// Whether this query's plan must contain no `RepartitionExec` (ADR-0954).
+///
+/// True for exactly a [`SpillDecision::Enabled`] query, and it is the second
+/// half of the spill mechanism's fail-closed argument. The eligibility
+/// predicate that produced the decision (`executor::plan_is_spill_eligible`)
+/// classifies LOGICAL plan nodes, and it fails closed on anything it cannot
+/// classify. The permission the decision grants is not logical and not per
+/// node: an enabled disk manager lets EVERY operator in the session's physical
+/// plan spill.
+///
+/// `RepartitionExec` is the gap between those two scopes. It exists in no
+/// logical plan, so the predicate never sees it, and it spills in DataFusion 55:
+/// each output channel that the memory pool refuses falls back to a `SpillPool`
+/// channel (`datafusion::physical_plan::repartition`, whose disabled-disk-manager
+/// error is the `SpillPool (DiskManager is disabled)` message
+/// [`MSG_SPILL_DISABLED_MARKER`](crate::MSG_SPILL_DISABLED_MARKER) matches).
+/// Nothing in this crate has classified an exchange spill's exactness, so the
+/// conservative order is to remove the node rather than grant it the
+/// permission: both knobs that can introduce one are turned off for a
+/// spill-enabled query.
+///
+/// The cost is parallelism, on queries that today are refused outright, and it
+/// is bounded: `RsegScanExec` still scans its objects in parallel, and the
+/// grouped aggregate that spill exists for still spills. What is given up is
+/// the fan-out ABOVE the merged, deduplicated stream.
+fn repartition_free(spill: SpillDecision<'_>) -> bool {
+    match spill {
+        SpillDecision::Enabled { .. } => true,
+        SpillDecision::Disabled => false,
+    }
+}
+
+/// Build a fresh, single-tenant `SessionContext` around `table` with `pool`
+/// installed as the query's memory pool: [`build_session_with_tables`] over
+/// the one-table set `[table]`.
+///
+/// The caller owns `pool` (typically a `TenantDelegatingPool` from
+/// [`SqlConfig::query_pool`](crate::SqlConfig::query_pool)) so it can read
+/// the reserved-byte counters after the query finishes.
+pub fn build_session(
+    config: &SqlConfig,
+    pool: Arc<dyn MemoryPool>,
+    table: SessionTable,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+) -> DFResult<SessionContext> {
+    build_session_with_tables(config, pool, vec![table], exact_typed_aggregates, spill)
+}
+
+/// The name a signal table registers under; `None` for a Parquet entry,
+/// which registers the names its [`ParquetSession`] carries.
+fn signal_table_name(table: &SessionTable) -> Option<&'static str> {
+    match table {
+        SessionTable::Metrics(_) => Some(SAMPLES_TABLE),
+        SessionTable::Logs(_) => Some(LOGS_TABLE),
+        SessionTable::Spans(_) => Some(SPANS_TABLE),
+        SessionTable::Alerts(_) => Some(ALERTS_TABLE),
+        SessionTable::Audit(_) => Some(AUDIT_TABLE),
+        SessionTable::Parquet(_) => None,
+    }
+}
+
+/// Refuse a table set [`build_session_with_tables`] does not build: an empty
+/// set, two entries for one table name, or a Parquet entry beside any other
+/// entry.
+fn check_table_set(tables: &[SessionTable]) -> DFResult<()> {
+    if tables.is_empty() {
+        return plan_err!("a SQL session needs at least one table");
+    }
+    if tables.len() > 1
+        && tables
+            .iter()
+            .any(|table| matches!(table, SessionTable::Parquet(_)))
+    {
+        return plan_err!("a Parquet table cannot be queried beside another table");
+    }
+    let mut names = BTreeSet::new();
+    for name in tables.iter().filter_map(signal_table_name) {
+        if !names.insert(name) {
+            return plan_err!("table {name} is named twice in one SQL session");
+        }
+    }
+    Ok(())
+}
+
+/// Build a fresh, single-tenant `SessionContext` that registers every table
+/// in `tables`, each under its own name, with `pool` installed as the query's
+/// memory pool.
+///
+/// The caller must build every provider in `tables` from the one
+/// `tenant_hash` the request authenticated as (ADR-2904 decision 4). The
+/// providers expose no tenant to compare, so neither this function nor
+/// `check_table_set` can check it.
+///
+/// The per-registry allowlists (aggregate, scalar, window, table function)
+/// and the total-order/sequential-fold UDAF replacements run once, whatever
+/// the set, because those are the hard registration boundaries behind the
+/// parse gate and must not depend on which tables are registered. The
+/// table-specific scalar UDFs are the union over the set: the metric
+/// `label`/`label_match` UDFs when `samples` is in it, and `has_word` and the
+/// `LIKE` rewrite when `logs` is in it. Which `LIKE`s the rewrite takes
+/// beside another table is [`LikeScope::LogsColumnsOnly`].
+///
+/// Refused with a plan error before anything is registered: an empty set,
+/// two entries for one table name, and a Parquet entry beside any other entry
+/// (epic #2904 ticket T7 lifts that one, per ADR-2904 decision 11). Only a set of
+/// exactly one Parquet entry gets a store registry that answers anything.
+pub fn build_session_with_tables(
+    config: &SqlConfig,
+    pool: Arc<dyn MemoryPool>,
+    tables: Vec<SessionTable>,
+    exact_typed_aggregates: bool,
+    spill: SpillDecision<'_>,
+) -> DFResult<SessionContext> {
+    check_table_set(&tables)?;
+    let parquet_store = match tables.as_slice() {
+        [SessionTable::Parquet(session)] => Some(Arc::clone(&session.store)),
+        _ => None,
+    };
+    // ADR-2040 D4: only a Parquet session can resolve a store, and only its
+    // own tenant's `ravel-pq://<tenant_hash>/`; every other session keeps the
+    // registry that answers nothing.
+    let registry: Arc<dyn ObjectStoreRegistry> = match &parquet_store {
+        Some(store) => Arc::new(SingleStoreRegistry::new(Arc::clone(store))),
+        None => Arc::new(EmptyObjectStoreRegistry),
+    };
+    let runtime = RuntimeEnvBuilder::new()
+        .with_memory_pool(pool)
+        .with_object_store_registry(registry)
+        .with_disk_manager_builder(disk_manager_builder(spill))
+        .build_arc()?;
+    let mut session = session_config(config, exact_typed_aggregates, spill);
+    if parquet_store.is_some() {
+        session = parquet_session_config(session, exact_typed_aggregates);
+    }
+
+    // `SessionContext::new_with_config_rt` with one extra physical optimizer
+    // rule. `DictionaryGroupKeysAsViews` keeps a `GROUP BY` over a declared
+    // `Str` column (Arrow `Dictionary(Int32, Utf8)`) off DataFusion's
+    // `RowConverter` group-value path, whose emit cannot exceed `i32::MAX`
+    // decoded bytes in one array (issue #737). It is schema-preserving, so no
+    // caller sees a different result type; see `crate::group_keys`. Appended
+    // after the default rules, which is where `with_physical_optimizer_rule`
+    // puts it: the rewrite must see the final partial/final aggregation split
+    // that `EnforceDistribution` chose.
+    let mut builder = SessionStateBuilder::new()
+        .with_config(session)
+        .with_runtime_env(runtime)
+        .with_default_features()
+        .with_physical_optimizer_rule(Arc::new(DictionaryGroupKeysAsViews))
+        // ADR-0850 item 2: answer `COUNT(*) WHERE <declared column> <>
+        // <literal>` and `GROUP BY <declared column>, COUNT(*)` from exact
+        // per-object column statistics, with zero data-block GETs, when the
+        // loaded statistics can prove the answer exact. Appended after the
+        // default rules for the same reason `DictionaryGroupKeysAsViews` is:
+        // it must see the final partial/final aggregation split
+        // `EnforceDistribution` chose. See `crate::metadata_agg`.
+        .with_physical_optimizer_rule(Arc::new(MetadataOnlyAggregate))
+        // Issue #1768: rewrite a `logs` scan whose `attrs` map is read only
+        // through literal-key `attrs['k']` subscripts into one that
+        // materializes those keys as per-key `Utf8` columns, so the scan
+        // decodes one key's pages instead of every dynamic column and stays on
+        // the columnar path. Appended after the default rules for the same
+        // reason the rules above are: it must see the final
+        // projection/filter/aggregate shape the default rules chose (projection
+        // pushdown decides which columns the scan projects, and this rewrite
+        // keys off the `attrs` map being one of them). It is fail-safe: any
+        // shape it does not recognize is left on the existing row path. See
+        // `crate::attrs_per_key`.
+        .with_physical_optimizer_rule(Arc::new(AttrsPerKeyProjection));
+    // ADR-0774: split a wide `logs` TopK into a narrow scan carrying row refs
+    // and a `k`-row block fetch. Appended after `DictionaryGroupKeysAsViews`
+    // for the same reason that one is appended after the defaults: it must see
+    // the final `SortExec`/`FilterExec`/`CoalescePartitionsExec` shape the
+    // default rules chose, and the pass-through allowlist it walks is written
+    // against that shape. `None` does not install it at all, which is the
+    // operator opt-out and the "before" side of the regression fixture.
+    if let Some(extra_columns) = config.late_materialization_extra_columns {
+        builder = builder
+            .with_physical_optimizer_rule(Arc::new(TopKLateMaterialization::new(extra_columns)));
+    }
+    // Issue #1402: bound a grouped aggregate whose only consumer is a top-k
+    // sort. Appended after the default rules for the same reason the rules
+    // above are: the shape it matches is the partial/final aggregation split
+    // `EnforceDistribution` chose, under the `SortExec` fetch DataFusion's
+    // limit pushdown produced. `None` does not install it at all, which is the
+    // operator opt-out and the "before" side of the regression fixture.
+    if let Some(max_limit) = config.bounded_topk_max_limit {
+        builder =
+            builder.with_physical_optimizer_rule(Arc::new(BoundedTopKAggregate::new(max_limit)));
+    }
+    // ADR-2677 decision 6: confirm a `logs` scan's kept TopK filter only when
+    // it is the filter of an ascending nulls-last `ORDER BY ts ... LIMIT k`,
+    // and drop it otherwise. Appended last because it must see every filter
+    // installed before it: DataFusion's post-optimization filter pushdown and
+    // `TopKLateMaterialization`'s phase-1 TopK. See
+    // `crate::logs_scan::ConfirmTopKThreshold`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(ConfirmTopKThreshold));
+    // Issue #2720: give an aggregate's output slices buffers of their own
+    // before a `RepartitionExec` or a sort charges each slice the whole
+    // materialized output. Appended after every rule above because each of
+    // them matches the aggregate shape `EnforceDistribution` chose, or walks a
+    // pass-through allowlist that does not include `CompactSlicesExec`
+    // (`BoundedTopKAggregate` walks down from its `SortExec` through
+    // `ProjectionExec` and an allowlist of `CoalescePartitionsExec`,
+    // `CooperativeExec` and `RepartitionExec` to the `AggregateExec`, and
+    // refuses on any other node). Placed last, it decorates the final plan
+    // and nothing has to see through it. See `crate::compact_slices`.
+    builder = builder.with_physical_optimizer_rule(Arc::new(CompactSlices));
+    let state = builder.build();
+    let mut ctx = SessionContext::new_with_state(state);
+
+    // Expression planners (ADR-0097, amendment of issue #2583). A planner
+    // rewrites SQL syntax into a call it builds from the function value, not
+    // by name, so the scalar allowlist below never sees the rewrite target:
+    // an unadmitted target would execute without passing it. Planner-rewritten
+    // syntax is governed instead by the planner pin
+    // (`registered_expr_planners_are_pinned_for_every_table`) and by
+    // `tests/expr_planner_surface.rs`, which pins per syntax whether it plans
+    // and which function the planned expression calls, and asserts every
+    // scalar it calls is in `ADMITTED_SCALARS`.
+
+    // `col['key']` on a map column such as `logs.attrs`, and a string key on
+    // a struct, to `get_field`, instead of failing with `GetFieldAccess not
+    // supported`. See `crate::map_field_planner` for why this small planner
+    // is used instead of the `nested_expressions` feature. `samples.labels`
+    // subscripts do not plan: that column is a dictionary-wrapped map, which
+    // `get_field` rejects.
+    ctx.register_expr_planner(map_field_access_planner())?;
+
+    // Register the `trace_id = '<32-hex>'` planner. See
+    // `crate::trace_id_planner` module docs for why it exists and what it
+    // covers.
+    ctx.register_expr_planner(trace_id_hex_literal_planner())?;
+
+    // `with_default_features()` installs the `EXTRACT(field FROM expr)` and
+    // the `POSITION`/`SUBSTRING` planners only under the facade's
+    // `datetime_expressions` and `unicode_expressions` features, which this
+    // crate leaves off; the planner types themselves are compiled, because
+    // datafusion-functions is a mandatory dependency with those packs on.
+    ctx.register_expr_planner(Arc::new(DatetimeFunctionPlanner))?;
+    ctx.register_expr_planner(Arc::new(UnicodeFunctionPlanner))?;
+
+    // Allowlist enforcement (ADR-0022 decision 2), the hard registration
+    // boundary behind the parse gate. Enumerate every aggregate UDAF the
+    // default session registered and deregister every name outside the admitted
+    // set, so a DataFusion upgrade that registers a new default aggregate fails
+    // closed instead of silently widening the SQL surface. Names are collected
+    // first because deregistration mutates the same map the accessor borrows.
+    // The rewrite-only aggregates stay registered for the optimizer; statements
+    // naming them are refused before it runs (see REWRITE_ONLY_AGGREGATES).
+    let excluded: Vec<String> = ctx
+        .state()
+        .aggregate_functions()
+        .keys()
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !ADMITTED_AGGREGATES.contains(&lower.as_str())
+                && !REWRITE_ONLY_AGGREGATES.contains(&lower.as_str())
+        })
+        .cloned()
+        .collect();
+    for name in &excluded {
+        ctx.deregister_udaf(name);
+    }
+
+    // The same fail-closed boundary for the scalar registry (ADR-0097
+    // decisions 2, 4). Running before the per-table UDF registration below
+    // keeps this enumeration over upstream defaults only. That order is
+    // defensive, not load-bearing: `label`, `label_match`, and `has_word` are
+    // in ADMITTED_SCALARS, so the filter spares them from either position. It
+    // becomes load-bearing if a Ravel UDF ever leaves that list, which is the
+    // membership `per_table_scalar_udfs_survive_the_scalar_gate` asserts.
+    let excluded_scalars: Vec<String> = ctx
+        .state()
+        .scalar_functions()
+        .keys()
+        .filter(|name| !ADMITTED_SCALARS.contains(&name.to_ascii_lowercase().as_str()))
+        .cloned()
+        .collect();
+    for name in &excluded_scalars {
+        ctx.deregister_udf(name);
+    }
+
+    // And the window registry (ADR-0097 decision 6). Before this enumeration
+    // existed, `first_value`/`last_value`/`nth_value` were refused only because
+    // their names collide with the aggregate deny-list in crate::validate; the
+    // other eight window functions executed with no gate at all.
+    let excluded_windows: Vec<String> = ctx
+        .state()
+        .window_functions()
+        .keys()
+        .filter(|name| !ADMITTED_WINDOWS.contains(&name.to_ascii_lowercase().as_str()))
+        .cloned()
+        .collect();
+    for name in &excluded_windows {
+        ctx.deregister_udwf(name);
+    }
+
+    // Replace the built-in min/max with the total-order UDAF (ADR-0023):
+    // `register_udaf` inserts by name and displaces the built-in entry, so
+    // grouped and ungrouped MIN/MAX over floating point both use the
+    // `f64::total_cmp` order. Non-float input delegates to the wrapped
+    // built-in, so `min(ts)` and friends are unchanged. This is the
+    // structural guard that replaced the old validation-time rejection of
+    // grouped min/max.
+    ctx.register_udaf(total_order_min_udaf());
+    ctx.register_udaf(total_order_max_udaf());
+    // Replace the built-in avg/mean with the sequential-fold UDAF (ADR-0022
+    // decisions 3, 4): `register_udaf` inserts by name and by the `mean` alias,
+    // displacing both built-in entries so avg's numerator is a naive f64 fold
+    // in deterministic order rather than arrow's lane-parallel batch sum. avg
+    // stays in `ADMITTED_AGGREGATES` so the loop above keeps the built-in until
+    // this line replaces it. This is independent of the public `sum` UDAF,
+    // which is untouched (ADR-0024).
+    ctx.register_udaf(sequential_avg_udaf());
+    // The table-function registry (ADR-0097 decision 2), enumerated like the
+    // others rather than removed by hardcoded name. `with_default_features()`
+    // (inside `new_with_config_rt` above) registers `range`/`generate_series`
+    // unconditionally; they generate rows in memory and so are not blocked by
+    // `EmptyObjectStoreRegistry`. The admitted set is empty: the tables this
+    // session can query are the ones registered below, and a DataFusion release
+    // adding a third table function is deregistered by default instead of
+    // shipping into the surface.
+    let excluded_udtfs: Vec<String> = ctx
+        .state()
+        .table_functions()
+        .keys()
+        .filter(|name| !ADMITTED_TABLE_FUNCTIONS.contains(&name.to_ascii_lowercase().as_str()))
+        .cloned()
+        .collect();
+    for name in &excluded_udtfs {
+        ctx.deregister_udtf(name);
+    }
+
+    // Register exactly the tables this query names, plus those tables' own
+    // scalar UDFs. A session without `samples` never sees the
+    // `label`/`label_match` UDFs and one without `logs` never sees
+    // `has_word`, matching the security invariant's stance that the session
+    // exposes only what one query needs.
+    let like_scope = if tables.len() == 1 {
+        LikeScope::Every
+    } else {
+        LikeScope::LogsColumnsOnly
+    };
+    for table in tables {
+        match table {
+            SessionTable::Metrics(provider) => {
+                ctx.register_udf(label_udf());
+                ctx.register_udf(label_match_udf());
+                ctx.register_table(SAMPLES_TABLE, provider)?;
+            }
+            SessionTable::Logs(provider) => {
+                ctx.register_udf(has_word_udf());
+                // Rewrite `col LIKE 'pattern'` into the Ravel `like` UDF (#479)
+                // so a declared `Str` column's dictionary reaches the matcher
+                // intact, matched once per distinct value. Registered as a
+                // function rewrite (runs before type coercion) so it sees the
+                // un-hydrated operands; see `crate::like_udf`.
+                ctx.register_function_rewrite(Arc::new(LikeToUdf::new(like_scope)))?;
+                ctx.register_table(LOGS_TABLE, provider)?;
+            }
+            SessionTable::Spans(provider) => {
+                ctx.register_table(SPANS_TABLE, provider)?;
+            }
+            // Neither RLOG-backed table registers a scalar UDF: every predicate
+            // their pushdown extractors accept is a plain column comparison or
+            // an `attrs['k']` subscript, which the map-field planner registered
+            // above already serves.
+            SessionTable::Alerts(provider) => {
+                ctx.register_table(ALERTS_TABLE, provider)?;
+            }
+            SessionTable::Audit(provider) => {
+                ctx.register_table(AUDIT_TABLE, provider)?;
+            }
+            SessionTable::Parquet(session) => {
+                for (name, provider) in session.tables {
+                    ctx.register_table(name.as_str(), provider)?;
+                }
+            }
+        }
+    }
+    // After the last scalar registration, so every registered function that
+    // returns a dictionary of non-strings for a dictionary-typed string
+    // argument is typed by the dictionary's value type. Only those functions
+    // are replaced; see `crate::value_typed_results` for how they are found.
+    crate::value_typed_results::unpack_dictionary_results(&ctx);
+    Ok(ctx)
+}
+
+/// ADR-2040 D6 on top of [`session_config`] for a Parquet session: the reader
+/// evaluates pushed-down filters, and file-scan repartitioning follows
+/// `exact_typed_aggregates`, the same value that chose the provider's file
+/// groups. A spill-enabled session keeps it: byte-range splits are scan
+/// partitions, not the `RepartitionExec` [`repartition_free`] removes.
+fn parquet_session_config(
+    mut session: SessionConfig,
+    exact_typed_aggregates: bool,
+) -> SessionConfig {
+    session = session.with_repartition_file_scans(exact_typed_aggregates);
+    session.options_mut().execution.parquet.pushdown_filters = true;
+    session
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use ravel_catalog::Snapshot;
+    use ravel_object_store::memory::MemoryStore;
+
+    use ravel_query::PhaseAccounting;
+    use ravel_types::accounting::QueryAccounting;
+
+    use super::*;
+    use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+    use crate::spans_fetcher::SpanSegmentFetcher;
+
+    fn test_pool() -> Arc<dyn MemoryPool> {
+        let tenant = TenantMemoryAccountant::new(1 << 30);
+        let breach = CeilingBreach::new();
+        // The pool reports its reserved high-water mark into per-query
+        // accounting (ADR-0044 decision 1's `peak_intermediate_bytes`), so it
+        // takes a handle. These session tests do not assert on it.
+        Arc::new(TenantDelegatingPool::new(
+            1 << 30,
+            tenant,
+            breach,
+            QueryAccounting::new(),
+        ))
+    }
+
+    /// Collect every `WHERE`/`HAVING` predicate in `plan` as a top-level AND
+    /// conjunct, mirroring `executor::collect_filter_predicates`: recurses
+    /// through the plan's inputs so the filter is found regardless of which
+    /// operators DataFusion places above it.
+    fn collect_filter_predicates(
+        plan: &datafusion::logical_expr::LogicalPlan,
+        out: &mut Vec<datafusion::logical_expr::Expr>,
+    ) {
+        if let datafusion::logical_expr::LogicalPlan::Filter(filter) = plan {
+            out.push(filter.predicate.clone());
+        }
+        for input in plan.inputs() {
+            collect_filter_predicates(input, out);
+        }
+    }
+
+    /// The ADR-0045 decision 5 acceptance test: `spans` plans through
+    /// `build_session` (registration), and a real `WHERE` clause conjoining
+    /// `duration_ns`, `status_code`, and `service_name` -- parsed and
+    /// type-coerced by DataFusion itself, not hand-built through the fluent
+    /// `col()`/`lit()` API `spans_pushdown`'s own unit tests use -- extracts
+    /// into exactly the `SpansPushdown` bounds those predicates prove.
+    #[tokio::test]
+    async fn spans_table_is_registered_and_prunes_duration_status_service() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let fetcher = SpanSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = crate::spans_provider::SpansTableProvider::new(
+            snapshot,
+            ravel_types::TenantHash([0u8; 16]),
+            fetcher,
+            QueryAccounting::new(),
+        );
+        let ctx = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            SessionTable::Spans(Arc::new(provider)),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("spans session builds");
+
+        // Registration and planning proof: a trivial SELECT * still executes
+        // over the empty snapshot.
+        let df = ctx
+            .sql("SELECT * FROM spans")
+            .await
+            .expect("SELECT * FROM spans plans");
+        let batches = df.collect().await.expect("empty snapshot scan executes");
+        assert!(batches.iter().all(|b| b.num_rows() == 0));
+
+        // The pruning proof: extract_spans over the real, SQL-parsed filter.
+        let sql = "SELECT * FROM spans WHERE duration_ns > 500000000 \
+                   AND status_code = 2 AND service_name = 'checkout'";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("filtered query plans");
+        let mut predicates = Vec::new();
+        collect_filter_predicates(&plan, &mut predicates);
+        let pushdown = crate::spans_pushdown::extract_spans(&predicates);
+
+        assert_eq!(pushdown.duration_lo, Some(500_000_001));
+        assert_eq!(pushdown.duration_hi, None);
+        assert_eq!(
+            pushdown.status_mask,
+            Some(ravel_rspan::skip_index::STATUS_BIT_ERROR)
+        );
+        assert_eq!(pushdown.service_name, Some("checkout".to_string()));
+    }
+
+    /// ADR-1195: `target_partitions` follows the resolved
+    /// `sql_partition_count` knob, not the legacy `fetch_concurrency` field
+    /// directly, once an explicit override is set.
+    #[test]
+    fn target_partitions_follows_the_resolved_sql_partition_count() {
+        let config = SqlConfig {
+            engine: ravel_query::EngineConfig {
+                fetch_concurrency: 9,
+                sql_partition_count: Some(5),
+                ..ravel_query::EngineConfig::default()
+            },
+            ..SqlConfig::default()
+        };
+        let session = session_config(&config, false, SpillDecision::Disabled);
+        assert_eq!(session.options().execution.target_partitions, 5);
+    }
+
+    #[test]
+    fn information_schema_is_disabled_and_repartitioning_is_off() {
+        let config = session_config(&SqlConfig::default(), false, SpillDecision::Disabled);
+        let options = config.options();
+        assert!(
+            !options.catalog.information_schema,
+            "information_schema must stay disabled (security invariant 1)"
+        );
+        assert!(!options.optimizer.repartition_aggregations);
+        assert!(!options.optimizer.repartition_joins);
+        assert!(!options.optimizer.repartition_sorts);
+        assert!(!options.optimizer.repartition_windows);
+        assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// Issue #1402: DataFusion's own ungated top-k aggregation rule is off in
+    /// every session, whatever the other per-query inputs say. It defaults ON
+    /// upstream, so this is the assertion that a DataFusion upgrade cannot
+    /// quietly restore it: `crate::BoundedTopKAggregate` is the only path to a
+    /// bounded grouped aggregate here, and it is the only one whose gate has
+    /// been argued.
+    #[test]
+    fn datafusion_topk_aggregation_is_off_in_every_session() {
+        for exact_typed in [false, true] {
+            let config =
+                session_config(&SqlConfig::default(), exact_typed, SpillDecision::Disabled);
+            assert!(
+                !config.options().optimizer.enable_topk_aggregation,
+                "exact_typed_aggregates={exact_typed}"
+            );
+        }
+    }
+
+    /// ADR-0094 decision 2: `exact_typed_aggregates = true` flips ONLY
+    /// `repartition_aggregations` on; every other `repartition_*` knob stays
+    /// unconditionally off, and `information_schema` stays disabled.
+    #[test]
+    fn exact_typed_aggregates_flips_only_repartition_aggregations() {
+        let config = session_config(&SqlConfig::default(), true, SpillDecision::Disabled);
+        let options = config.options();
+        assert!(!options.catalog.information_schema);
+        assert!(
+            options.optimizer.repartition_aggregations,
+            "exact-typed queries repartition their final aggregation (ADR-0094)"
+        );
+        assert!(!options.optimizer.repartition_joins);
+        assert!(!options.optimizer.repartition_sorts);
+        assert!(!options.optimizer.repartition_windows);
+        assert!(!options.optimizer.repartition_file_scans);
+    }
+
+    /// ADR-0954: a spill-enabled session is repartition-free. The spill
+    /// decision overrides the ADR-0094 classification (`exact_typed_aggregates
+    /// = true` here, the case that would otherwise turn the hash exchange on),
+    /// and it also turns off the round-robin fan-out `EnforceDistribution`
+    /// inserts on its own -- no `repartition_*` knob covers that one, and it is
+    /// how a `RepartitionExec` reached a spill-enabled plan even with every
+    /// repartition knob off.
+    ///
+    /// Both are here because an enabled disk manager is a session-wide
+    /// permission and `RepartitionExec` spills: it is the node the logical
+    /// eligibility predicate cannot classify. See [`repartition_free`].
+    #[test]
+    fn a_spill_enabled_session_is_repartition_free() {
+        let dir = std::path::PathBuf::from("/tmp/does-not-need-to-exist");
+        let spill = SpillDecision::Enabled {
+            dir: dir.as_path(),
+            max_bytes: 1 << 20,
+        };
+        let config = session_config(&SqlConfig::default(), true, spill);
+        let options = config.options();
+        assert!(
+            !options.optimizer.repartition_aggregations,
+            "a spill-enabled query must not repartition its final aggregation, \
+             whatever the exact-typed classification said (ADR-0954)"
+        );
+        assert!(
+            !options.optimizer.enable_round_robin_repartition,
+            "a spill-enabled query must not get the round-robin fan-out either: \
+             no repartition_* knob covers it and RepartitionExec spills"
+        );
+        assert!(!options.optimizer.repartition_joins);
+        assert!(!options.optimizer.repartition_sorts);
+        assert!(!options.optimizer.repartition_windows);
+        assert!(!options.optimizer.repartition_file_scans);
+
+        // The override is the spill decision's, not a new unconditional
+        // default: the same config with spill off keeps both.
+        let without_spill = session_config(&SqlConfig::default(), true, SpillDecision::Disabled);
+        assert!(
+            without_spill.options().optimizer.repartition_aggregations,
+            "spill off must leave the ADR-0094 knob exactly as it was"
+        );
+        assert!(
+            without_spill
+                .options()
+                .optimizer
+                .enable_round_robin_repartition,
+            "spill off must leave DataFusion's round-robin default alone"
+        );
+    }
+
+    /// Issue #680: a default session tightens both skip-partial-aggregation
+    /// probe thresholds, and `skip_partial_aggregation = false` leaves
+    /// DataFusion's own values untouched.
+    ///
+    /// The "off" half reads the stock values from a plain `SessionConfig`
+    /// rather than hardcoding 0.8/100_000, so a DataFusion release that moves
+    /// its defaults does not turn this into a stale change detector -- what is
+    /// pinned is "off changes nothing", which is the property the escape hatch
+    /// promises.
+    #[test]
+    fn skip_partial_aggregation_sets_both_probe_thresholds() {
+        let on = session_config(&SqlConfig::default(), false, SpillDecision::Disabled);
+        assert_eq!(
+            on.options()
+                .execution
+                .skip_partial_aggregation_probe_rows_threshold,
+            SKIP_PARTIAL_AGGREGATION_PROBE_ROWS
+        );
+        assert_eq!(
+            on.options()
+                .execution
+                .skip_partial_aggregation_probe_ratio_threshold,
+            SKIP_PARTIAL_AGGREGATION_PROBE_RATIO
+        );
+
+        let stock = SessionConfig::new();
+        let stock_rows = stock
+            .options()
+            .execution
+            .skip_partial_aggregation_probe_rows_threshold;
+        let stock_ratio = stock
+            .options()
+            .execution
+            .skip_partial_aggregation_probe_ratio_threshold;
+        assert!(
+            SKIP_PARTIAL_AGGREGATION_PROBE_ROWS < stock_rows
+                && SKIP_PARTIAL_AGGREGATION_PROBE_RATIO < stock_ratio,
+            "both Ravel thresholds must be tighter than DataFusion's stock \
+             {stock_rows} rows / {stock_ratio} ratio, or the setting is a no-op"
+        );
+
+        let off = session_config(
+            &SqlConfig {
+                skip_partial_aggregation: false,
+                ..SqlConfig::default()
+            },
+            false,
+            SpillDecision::Disabled,
+        );
+        assert_eq!(
+            off.options()
+                .execution
+                .skip_partial_aggregation_probe_rows_threshold,
+            stock_rows
+        );
+        assert_eq!(
+            off.options()
+                .execution
+                .skip_partial_aggregation_probe_ratio_threshold,
+            stock_ratio
+        );
+    }
+
+    /// ADR-0022 decision 2: the validation reject-list
+    /// (`crate::validate::EXCLUDED_AGGREGATES`) plus the registration allowlist
+    /// ([`ADMITTED_AGGREGATES`]) must exactly cover every aggregate UDAF the
+    /// default DataFusion session registers -- primary spellings and aliases.
+    /// A version bump that adds a default aggregate breaks this test instead of
+    /// silently widening the SQL surface, and a stale entry (a name no longer
+    /// registered) is caught the same way.
+    #[test]
+    fn admitted_and_excluded_aggregates_cover_the_default_registrations() {
+        use std::collections::BTreeSet;
+
+        // A default context registers the same aggregate UDAFs `build_session`
+        // starts from; the session_config flags do not add or remove any.
+        let ctx = SessionContext::new();
+        let registered: BTreeSet<String> = ctx
+            .state()
+            .aggregate_functions()
+            .keys()
+            .map(|name| name.to_ascii_lowercase())
+            .collect();
+
+        let mut classified: BTreeSet<String> = BTreeSet::new();
+        for name in ADMITTED_AGGREGATES {
+            assert!(
+                classified.insert(name.to_string()),
+                "duplicate admitted aggregate name {name}"
+            );
+        }
+        for name in crate::validate::EXCLUDED_AGGREGATES {
+            assert!(
+                classified.insert(name.to_string()),
+                "{name} appears in both the admitted set and the excluded list"
+            );
+        }
+
+        let unclassified: Vec<&String> = registered.difference(&classified).collect();
+        let stale: Vec<&String> = classified.difference(&registered).collect();
+        assert!(
+            unclassified.is_empty() && stale.is_empty(),
+            "aggregate allowlist/reject-list drifted from the default registrations.\n  \
+             registered but unclassified (surface silently widened; add to the admitted set \
+             or crate::validate::EXCLUDED_AGGREGATES): {unclassified:?}\n  \
+             classified but not registered (stale entry to remove): {stale:?}"
+        );
+
+        // A rewrite-only aggregate stays registered for the optimizer, so the
+        // reject-list is what refuses a statement naming it: it must be a
+        // default registration, excluded, and never admitted.
+        for name in REWRITE_ONLY_AGGREGATES {
+            assert!(
+                registered.contains(name),
+                "rewrite-only aggregate {name} is not a default registration"
+            );
+            assert!(
+                crate::validate::EXCLUDED_AGGREGATES.contains(&name),
+                "rewrite-only aggregate {name} must stay in crate::validate::EXCLUDED_AGGREGATES"
+            );
+            assert!(
+                !ADMITTED_AGGREGATES.contains(&name),
+                "rewrite-only aggregate {name} must not be admitted"
+            );
+        }
+    }
+
+    /// The `v` a `DISTINCT ON (k) k, v` statement over two rows of one ON
+    /// group returns, run straight through a [`build_session`] session, with
+    /// none of the executor's checks in front of it.
+    async fn distinct_on_survivor(rows: &str, order_by: &str) -> String {
+        use datafusion::arrow::array::{Array, StringArray};
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ctx = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            metrics_table(&store),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("session builds");
+        let sql = format!(
+            "SELECT DISTINCT ON (k) k, v FROM (VALUES {rows}) AS t(k, v) ORDER BY {order_by}"
+        );
+        let batches = ctx
+            .sql(&sql)
+            .await
+            .expect("plans")
+            .collect()
+            .await
+            .expect("the DISTINCT ON rewrite finds first_value in the session registry");
+        let values: Vec<String> = batches
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("utf8 v");
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values.len(), 1, "one ON group, one row: {sql}");
+        values.into_iter().next().expect("one row")
+    }
+
+    /// What the executor's total-order gate on `DISTINCT ON` stands in front
+    /// of. The session plans a `DISTINCT ON` (it failed with "There is no UDAF
+    /// named first_value in the registry" while `first_value` was
+    /// deregistered), and with an `ORDER BY` that ties, the row it keeps
+    /// follows the input's row order: the same two rows in the other order
+    /// give the other answer. With every selected column in the `ORDER BY`,
+    /// the answer is the same for both orders.
+    #[tokio::test]
+    async fn distinct_on_keeps_an_input_order_row_unless_its_order_is_total() {
+        let forward = "(1, 'a'), (1, 'b')";
+        let reversed = "(1, 'b'), (1, 'a')";
+
+        assert_eq!(distinct_on_survivor(forward, "k").await, "a");
+        assert_eq!(distinct_on_survivor(reversed, "k").await, "b");
+
+        assert_eq!(distinct_on_survivor(forward, "k, v").await, "a");
+        assert_eq!(distinct_on_survivor(reversed, "k, v").await, "a");
+        assert_eq!(distinct_on_survivor(forward, "k, v DESC").await, "b");
+        assert_eq!(distinct_on_survivor(reversed, "k, v DESC").await, "b");
+    }
+
+    fn empty_snapshot() -> Snapshot {
+        Snapshot {
+            segments: Vec::new(),
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        }
+    }
+
+    fn metrics_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Metrics(Arc::new(crate::provider::RavelTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::SegmentFetcher::new(store.clone()),
+            SqlConfig::default(),
+            PhaseAccounting::new(),
+        )))
+    }
+
+    fn logs_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Logs(Arc::new(crate::logs_provider::LogsTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store.clone()),
+            PhaseAccounting::new(),
+        )))
+    }
+
+    fn spans_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Spans(Arc::new(crate::spans_provider::SpansTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            SpanSegmentFetcher::new(store.clone()),
+            QueryAccounting::new(),
+        )))
+    }
+
+    fn alerts_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store.clone()),
+            QueryAccounting::new(),
+        )))
+    }
+
+    /// A Parquet session over one empty table named `hits` for `tenant`.
+    fn parquet_table(tenant: ravel_types::TenantHash) -> SessionTable {
+        let schema = Arc::new(datafusion::arrow::datatypes::Schema::new(vec![
+            datafusion::arrow::datatypes::Field::new(
+                "id",
+                datafusion::arrow::datatypes::DataType::Int64,
+                false,
+            ),
+        ]));
+        SessionTable::Parquet(ParquetSession {
+            tables: vec![(
+                "hits".to_string(),
+                Arc::new(datafusion::datasource::empty::EmptyTable::new(schema)),
+            )],
+            store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant)),
+        })
+    }
+
+    fn audit_table(store: &Arc<dyn ravel_object_store::ObjectStoreBackend>) -> SessionTable {
+        SessionTable::Audit(Arc::new(AuditTableProvider::new(
+            empty_snapshot(),
+            ravel_types::TenantHash([0u8; 16]),
+            ravel_query::LogSegmentFetcher::new(store.clone()),
+            QueryAccounting::new(),
+        )))
+    }
+
+    /// ADR-0097 decisions 2, 3, 4, 6: the fail-closed boundary now covers all
+    /// four registries, not aggregates alone. For every table variant and every
+    /// registry, the admitted and excluded name sets must be disjoint, must
+    /// together cover exactly the upstream default registrations (so a
+    /// DataFusion upgrade that adds any function to any registry fails this test
+    /// naming it), and a session built by [`build_session`] must register
+    /// exactly the upstream admitted names plus that table's own Ravel UDFs (so
+    /// a per-table UDF that goes missing or lands on the wrong table also fails
+    /// it), plus [`REWRITE_ONLY_AGGREGATES`] in the aggregate registry, each of
+    /// which must also be excluded. All comparisons are lowercased.
+    #[test]
+    fn admitted_and_excluded_cover_all_registries_for_every_table() {
+        use std::collections::BTreeSet;
+
+        fn set<'a>(names: impl IntoIterator<Item = &'a &'a str>) -> BTreeSet<String> {
+            names.into_iter().map(|n| n.to_ascii_lowercase()).collect()
+        }
+        fn keys(names: impl Iterator<Item = String>) -> BTreeSet<String> {
+            names.map(|n| n.to_ascii_lowercase()).collect()
+        }
+
+        /// Assert one registry for one table. `admitted`/`excluded` are the
+        /// full per-registry constants (scalar admits include Ravel's own
+        /// UDFs); `all_ravel` is every Ravel-added name in this registry across
+        /// all tables (empty except for scalars); `ravel_for_table` is the
+        /// subset registered for THIS table; `default_upstream` is what a plain
+        /// `SessionContext::new()` registers; `rewrite_only` is the excluded
+        /// names the gate keeps registered for an optimizer rewrite (empty
+        /// except for aggregates); `registered` is what `build_session` left
+        /// after the gate.
+        #[allow(clippy::too_many_arguments)]
+        fn check(
+            table: &str,
+            registry: &str,
+            admitted: &BTreeSet<String>,
+            excluded: &BTreeSet<String>,
+            all_ravel: &BTreeSet<String>,
+            ravel_for_table: &BTreeSet<String>,
+            default_upstream: &BTreeSet<String>,
+            rewrite_only: &BTreeSet<String>,
+            registered: &BTreeSet<String>,
+        ) {
+            let not_excluded: Vec<&String> = rewrite_only.difference(excluded).collect();
+            assert!(
+                not_excluded.is_empty(),
+                "{table}/{registry}: rewrite-only names missing from the excluded set: \
+                 {not_excluded:?}"
+            );
+            let overlap: Vec<&String> = admitted.intersection(excluded).collect();
+            assert!(
+                overlap.is_empty(),
+                "{table}/{registry}: names in both admitted and excluded: {overlap:?}"
+            );
+
+            // The upstream slice of the admitted set (Ravel's own UDFs are not
+            // upstream defaults) plus the excluded set must exactly cover the
+            // default registrations. This is the drift guard.
+            let admitted_upstream: BTreeSet<String> =
+                admitted.difference(all_ravel).cloned().collect();
+            let classified: BTreeSet<String> = admitted_upstream.union(excluded).cloned().collect();
+            let unclassified: Vec<&String> = default_upstream.difference(&classified).collect();
+            let stale: Vec<&String> = classified.difference(default_upstream).collect();
+            assert!(
+                unclassified.is_empty() && stale.is_empty(),
+                "{table}/{registry}: allowlist/excluded drifted from the default registrations.\n  \
+                 registered but unclassified (surface widened; admit it or add to the excluded list): {unclassified:?}\n  \
+                 classified but not registered (stale entry to remove): {stale:?}"
+            );
+
+            // build_session must leave exactly the upstream admitted names plus
+            // this table's own Ravel UDFs plus the rewrite-only names: nothing
+            // else excluded survives, and the per-table UDFs land on the right
+            // table.
+            let expected: BTreeSet<String> = admitted_upstream
+                .union(ravel_for_table)
+                .cloned()
+                .collect::<BTreeSet<String>>()
+                .union(rewrite_only)
+                .cloned()
+                .collect();
+            let missing: Vec<&String> = expected.difference(registered).collect();
+            let extra: Vec<&String> = registered.difference(&expected).collect();
+            assert!(
+                missing.is_empty() && extra.is_empty(),
+                "{table}/{registry}: build_session registrations differ from the admitted set.\n  \
+                 admitted but not registered (per-table UDF missing, or gate dropped it): {missing:?}\n  \
+                 registered but not admitted (gate failed to remove it, or wrong table): {extra:?}"
+            );
+        }
+
+        // Upstream default registrations, the reference every registry covers.
+        let default = SessionContext::new();
+        let dstate = default.state();
+        let default_scalars = keys(dstate.scalar_functions().keys().cloned());
+        let default_windows = keys(dstate.window_functions().keys().cloned());
+        let default_aggregates = keys(dstate.aggregate_functions().keys().cloned());
+        let default_tables = keys(dstate.table_functions().keys().cloned());
+
+        let admitted_scalars = set(ADMITTED_SCALARS.iter());
+        let excluded_scalars = set(EXCLUDED_SCALARS.iter());
+        let admitted_windows = set(ADMITTED_WINDOWS.iter());
+        let excluded_windows = set(EXCLUDED_WINDOWS.iter());
+        let admitted_aggregates = set(ADMITTED_AGGREGATES.iter());
+        let excluded_aggregates = set(crate::validate::EXCLUDED_AGGREGATES.iter());
+        let admitted_tables = set(ADMITTED_TABLE_FUNCTIONS.iter());
+        let excluded_tables = set(EXCLUDED_TABLE_FUNCTIONS.iter());
+        let rewrite_only_aggregates = set(REWRITE_ONLY_AGGREGATES.iter());
+
+        // Every Ravel-added scalar UDF across all tables, and the per-table
+        // subset. Non-scalar registries have no per-table addendum.
+        let all_ravel_scalars = set(["label", "label_match", "has_word"].iter());
+        let empty: BTreeSet<String> = BTreeSet::new();
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+        for (table_label, table, ravel_scalars) in [
+            (
+                "metrics",
+                metrics_table(&store),
+                set(["label", "label_match"].iter()),
+            ),
+            ("logs", logs_table(&store), set(["has_word"].iter())),
+            ("spans", spans_table(&store), empty.clone()),
+            // ADR-1101 decision 1: neither RLOG-backed table registers a scalar
+            // UDF of its own, so a leaked `has_word` (or any other per-table
+            // addendum) on one of them fails here.
+            ("alerts", alerts_table(&store), empty.clone()),
+            ("audit", audit_table(&store), empty.clone()),
+            (
+                "parquet",
+                parquet_table(ravel_types::TenantHash([0u8; 16])),
+                empty.clone(),
+            ),
+        ] {
+            let ctx = build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                table,
+                false,
+                SpillDecision::Disabled,
+            )
+            .expect("session builds");
+            let state = ctx.state();
+            let reg_scalars = keys(state.scalar_functions().keys().cloned());
+            let reg_windows = keys(state.window_functions().keys().cloned());
+            let reg_aggregates = keys(state.aggregate_functions().keys().cloned());
+            let reg_tables = keys(state.table_functions().keys().cloned());
+
+            check(
+                table_label,
+                "scalar",
+                &admitted_scalars,
+                &excluded_scalars,
+                &all_ravel_scalars,
+                &ravel_scalars,
+                &default_scalars,
+                &empty,
+                &reg_scalars,
+            );
+            check(
+                table_label,
+                "window",
+                &admitted_windows,
+                &excluded_windows,
+                &empty,
+                &empty,
+                &default_windows,
+                &empty,
+                &reg_windows,
+            );
+            check(
+                table_label,
+                "aggregate",
+                &admitted_aggregates,
+                &excluded_aggregates,
+                &empty,
+                &empty,
+                &default_aggregates,
+                &rewrite_only_aggregates,
+                &reg_aggregates,
+            );
+            check(
+                table_label,
+                "table",
+                &admitted_tables,
+                &excluded_tables,
+                &empty,
+                &empty,
+                &default_tables,
+                &empty,
+                &reg_tables,
+            );
+        }
+    }
+
+    /// Ravel's per-table UDFs survive the scalar gate: a logs session keeps
+    /// `has_word`, a metrics session keeps `label`/`label_match`.
+    ///
+    /// They survive by membership in [`ADMITTED_SCALARS`], not by the
+    /// deregistration loop running before registration, so this test does not
+    /// pin that ordering: inverting the two leaves every assertion here
+    /// passing. What it pins is the membership that makes the ordering safe to
+    /// get wrong, which is why the membership is asserted directly below.
+    #[test]
+    fn per_table_scalar_udfs_survive_the_scalar_gate() {
+        for name in ["label", "label_match", "has_word"] {
+            assert!(
+                ADMITTED_SCALARS.contains(&name),
+                "{name} must stay in ADMITTED_SCALARS: the scalar gate spares \
+                 Ravel's own UDFs by admitting them, and dropping one here \
+                 makes the loop's position relative to per-table registration \
+                 load-bearing"
+            );
+        }
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+
+        let logs = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            logs_table(&store),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("logs session builds");
+        assert!(
+            logs.state().scalar_functions().contains_key("has_word"),
+            "a logs session must keep has_word after the scalar gate"
+        );
+
+        let metrics = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            metrics_table(&store),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("metrics session builds");
+        let metrics_state = metrics.state();
+        let metrics_scalars = metrics_state.scalar_functions();
+        assert!(
+            metrics_scalars.contains_key("label"),
+            "a metrics session must keep label after the scalar gate"
+        );
+        assert!(
+            metrics_scalars.contains_key("label_match"),
+            "a metrics session must keep label_match after the scalar gate"
+        );
+    }
+
+    /// The expression planners every session carries, in registration order
+    /// (issues #2476 and #2583); why this pin exists is stated beside the
+    /// planner registrations in [`build_session`]. A planner appearing,
+    /// disappearing, or moving fails here; each syntax's outcome and rewrite
+    /// target are pinned by `tests/expr_planner_surface.rs`.
+    ///
+    /// Each name is the planner's `Debug` output cut at the first character
+    /// that cannot be part of a Rust identifier. Every planner below derives
+    /// `Debug` on a fieldless struct, which prints exactly the type name; the
+    /// cut keeps the name stable if an upstream planner later gains a field.
+    /// `std::any::type_name` is not usable here, since the session hands back
+    /// `Arc<dyn ExprPlanner>` and the concrete type is erased.
+    #[test]
+    fn registered_expr_planners_are_pinned_for_every_table() {
+        const EXPECTED: [&str; 7] = [
+            // From `with_default_features()`, admitted deliberately (ADR-0097,
+            // amendment of issue #2583). Struct literal `STRUCT(1, 2)` /
+            // `STRUCT(1 AS a)` to `struct`/`named_struct`, dictionary literal
+            // `{'a': 1}` to `named_struct`, `OVERLAY(x PLACING y FROM n)` to
+            // `overlay`, and struct field access `s.a` to `get_field`. All four
+            // targets are in ADMITTED_SCALARS.
+            "CoreFunctionPlanner",
+            // From `with_default_features()`, admitted deliberately. Normalizes
+            // the arguments of an aggregate call such as `count()` /
+            // `count(*)`; it plans no new syntax and targets whichever admitted
+            // aggregate was named.
+            "AggregateFunctionPlanner",
+            // From `with_default_features()`, admitted deliberately. The same
+            // normalization for a function used with `OVER`, such as
+            // `count(*) OVER ()`.
+            "WindowFunctionPlanner",
+            // `build_session`: `map_col['key']` subscript to `get_field`.
+            "MapFieldAccessPlanner",
+            // `build_session`: `trace_id = '<32-hex>'` / `<>` to a native
+            // `FixedSizeBinary(16)` literal comparison; no function call.
+            "TraceIdHexLiteralPlanner",
+            // `build_session`: `EXTRACT(field FROM expr)` to `date_part`.
+            "DatetimeFunctionPlanner",
+            // `build_session`: `POSITION(x IN y)` to `strpos`, and
+            // `SUBSTRING(x FROM y [FOR z])` plus unquoted `substr(...)` /
+            // `substring(...)` calls to `substr`.
+            "UnicodeFunctionPlanner",
+        ];
+
+        fn planner_name(
+            planner: &Arc<dyn datafusion::logical_expr::planner::ExprPlanner>,
+        ) -> String {
+            format!("{planner:?}")
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect()
+        }
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        for (label, table) in [
+            ("metrics", metrics_table(&store)),
+            ("logs", logs_table(&store)),
+            ("spans", spans_table(&store)),
+            ("alerts", alerts_table(&store)),
+            ("audit", audit_table(&store)),
+            ("parquet", parquet_table(ravel_types::TenantHash([0u8; 16]))),
+        ] {
+            let ctx = build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                table,
+                false,
+                SpillDecision::Disabled,
+            )
+            .expect("session builds");
+            let registered: Vec<String> = ctx
+                .state()
+                .expr_planners()
+                .iter()
+                .map(planner_name)
+                .collect();
+            assert_eq!(
+                registered, EXPECTED,
+                "{label}: the registered expression planners changed. Each planner \
+                 widens the SQL surface by syntax the scalar allowlist cannot see; \
+                 re-read what the new or removed planner admits before updating \
+                 this list"
+            );
+        }
+    }
+
+    /// ADR-2040 D6: a Parquet session evaluates filters in the reader and
+    /// repartitions file scans exactly when the statement is exact-typed,
+    /// spill or not; a signal-table session never repartitions a file scan.
+    #[test]
+    fn a_parquet_session_repartitions_file_scans_only_when_exact_typed() {
+        let dir = tempfile::tempdir().expect("scratch");
+        let spill = SpillDecision::Enabled {
+            dir: dir.path(),
+            max_bytes: 1 << 20,
+        };
+        for (exact, decision) in [
+            (true, SpillDecision::Disabled),
+            (false, SpillDecision::Disabled),
+            (true, spill),
+        ] {
+            let ctx = build_session(
+                &SqlConfig::default(),
+                test_pool(),
+                parquet_table(ravel_types::TenantHash([7u8; 16])),
+                exact,
+                decision,
+            )
+            .expect("parquet session");
+            let state = ctx.state();
+            let options = state.config().options();
+            assert_eq!(
+                options.optimizer.repartition_file_scans, exact,
+                "{decision:?}"
+            );
+            assert!(options.execution.parquet.pushdown_filters);
+        }
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let logs = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            logs_table(&store),
+            true,
+            SpillDecision::Disabled,
+        )
+        .expect("logs session");
+        assert!(
+            !logs
+                .state()
+                .config()
+                .options()
+                .optimizer
+                .repartition_file_scans
+        );
+    }
+
+    /// ADR-2040 D4 at the one place a session is built: a Parquet session's
+    /// runtime resolves its own tenant's `ravel-pq://` URL and nothing else,
+    /// and every other session's resolves nothing, not even the local
+    /// filesystem DataFusion's default registry answers `file://` with.
+    #[tokio::test]
+    async fn only_a_parquet_session_resolves_a_store_and_only_its_tenants() {
+        use datafusion::execution::object_store::ObjectStoreUrl;
+
+        let tenant = ravel_types::TenantHash([7u8; 16]);
+        let other = ravel_types::TenantHash([8u8; 16]);
+        let own = ObjectStoreUrl::parse(ravel_parquet::store_url(&tenant)).expect("url");
+        let refused = [
+            ravel_parquet::store_url(&other),
+            "s3://lake/".to_string(),
+            "gs://lake/".to_string(),
+            "az://lake/".to_string(),
+            "file:///".to_string(),
+            "http://example.com/".to_string(),
+            "https://example.com/".to_string(),
+        ];
+        let parquet = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            parquet_table(tenant),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("parquet session");
+        let runtime = parquet.runtime_env();
+        let found = runtime.object_store(&own).expect("the tenant's own URL");
+        assert!(found.to_string().contains(&tenant.to_hex()), "{found}");
+        for url in &refused {
+            let url = ObjectStoreUrl::parse(url).expect("url");
+            let err = runtime
+                .object_store(&url)
+                .err()
+                .unwrap_or_else(|| panic!("{url} must not resolve"));
+            assert!(err.to_string().contains("reads only"), "{url}: {err}");
+        }
+        let intruder: Arc<dyn ObjectStore> =
+            Arc::new(ravel_parquet::TenantParquetStore::new(other));
+        let s3 = Url::parse("s3://lake/").expect("url");
+        runtime.register_object_store(&s3, intruder);
+        assert!(
+            runtime
+                .object_store(ObjectStoreUrl::parse("s3://lake/").expect("url"))
+                .is_err()
+        );
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let logs = build_session(
+            &SqlConfig::default(),
+            test_pool(),
+            logs_table(&store),
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("logs session");
+        for url in refused.iter().chain([&ravel_parquet::store_url(&tenant)]) {
+            let url = ObjectStoreUrl::parse(url).expect("url");
+            assert!(
+                logs.runtime_env().object_store(&url).is_err(),
+                "a logs session must not resolve {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_empty_registry_refuses_lookups_and_registrations() {
+        let registry = EmptyObjectStoreRegistry;
+        let url = Url::parse("file:///tmp/").expect("valid url");
+        assert!(
+            registry.get_store(&url).is_err(),
+            "an empty registry must not resolve file:// to a local store"
+        );
+        let s3 = Url::parse("s3://bucket/").expect("valid url");
+        assert!(registry.get_store(&s3).is_err());
+    }
+
+    fn session_with(tables: Vec<SessionTable>) -> SessionContext {
+        build_session_with_tables(
+            &SqlConfig::default(),
+            test_pool(),
+            tables,
+            false,
+            SpillDecision::Disabled,
+        )
+        .expect("session builds")
+    }
+
+    fn samples_and_logs() -> SessionContext {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        session_with(vec![metrics_table(&store), logs_table(&store)])
+    }
+
+    /// Every table registered in any catalog and schema of `ctx`.
+    fn registered_tables(ctx: &SessionContext) -> BTreeSet<String> {
+        let mut tables = BTreeSet::new();
+        for catalog_name in ctx.catalog_names() {
+            let catalog = ctx.catalog(&catalog_name).expect("listed catalog");
+            for schema_name in catalog.schema_names() {
+                let schema = catalog.schema(&schema_name).expect("listed schema");
+                tables.extend(schema.table_names());
+            }
+        }
+        tables
+    }
+
+    /// Whether the optimized logical plan of `sql` calls `(the Ravel like
+    /// UDF, the built-in LIKE)`. A pushed-down filter appears both in its
+    /// `Filter` and in the scan's filters, so presence is what is compared.
+    async fn like_calls(ctx: &SessionContext, sql: &str) -> (bool, bool) {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+        use datafusion::logical_expr::Expr;
+
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("statement plans")
+            .into_optimized_plan()
+            .expect("statement optimizes");
+        let (mut udf, mut builtin) = (0, 0);
+        plan.apply_with_subqueries(|node| {
+            node.apply_expressions(|expr| {
+                expr.apply(|e| {
+                    match e {
+                        Expr::ScalarFunction(call)
+                            if call.func.name() == crate::like_udf::LIKE_UDF =>
+                        {
+                            udf += 1;
+                        }
+                        Expr::Like(_) => builtin += 1,
+                        _ => {}
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })
+        .expect("plan walk");
+        (udf > 0, builtin > 0)
+    }
+
+    #[test]
+    fn session_registers_exactly_the_named_tables_and_their_functions() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let has =
+            |ctx: &SessionContext, name: &str| ctx.state().scalar_functions().contains_key(name);
+
+        let both = samples_and_logs();
+        assert_eq!(
+            registered_tables(&both),
+            BTreeSet::from([SAMPLES_TABLE.to_string(), LOGS_TABLE.to_string()])
+        );
+        for name in ["label", "label_match", "has_word"] {
+            assert!(
+                has(&both, name),
+                "a samples plus logs session registers {name}"
+            );
+        }
+
+        let samples = session_with(vec![metrics_table(&store)]);
+        assert_eq!(
+            registered_tables(&samples),
+            BTreeSet::from([SAMPLES_TABLE.to_string()])
+        );
+        assert!(has(&samples, "label"));
+        assert!(
+            !has(&samples, "has_word"),
+            "a samples-only session has no has_word"
+        );
+
+        let logs = session_with(vec![logs_table(&store)]);
+        assert_eq!(
+            registered_tables(&logs),
+            BTreeSet::from([LOGS_TABLE.to_string()])
+        );
+        assert!(has(&logs, "has_word"));
+        assert!(!has(&logs, "label"), "a logs-only session has no label");
+        assert!(
+            !has(&logs, "label_match"),
+            "a logs-only session has no label_match"
+        );
+    }
+
+    #[tokio::test]
+    async fn like_on_a_samples_column_is_not_rewritten_beside_logs() {
+        let ctx = samples_and_logs();
+        for sql in [
+            "SELECT value FROM samples WHERE label(labels, 'job') LIKE '%x%'",
+            "SELECT s.value FROM samples s JOIN logs ON s.ts = logs.ts \
+             WHERE label(s.labels, 'job') LIKE '%x%'",
+        ] {
+            assert_eq!(
+                like_calls(&ctx, sql).await,
+                (false, true),
+                "a LIKE on a samples column stays on the built-in operator: {sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn like_on_a_logs_column_is_still_rewritten_beside_samples() {
+        let ctx = samples_and_logs();
+        for sql in [
+            "SELECT body FROM logs WHERE logs.body LIKE '%x%'",
+            "SELECT body FROM logs WHERE body LIKE '%x%'",
+            "SELECT logs.body FROM logs JOIN samples ON logs.ts = samples.ts \
+             WHERE body LIKE '%x%'",
+        ] {
+            assert_eq!(
+                like_calls(&ctx, sql).await,
+                (true, false),
+                "a LIKE on logs.body plans to the Ravel like UDF: {sql}"
+            );
+        }
+        // An aliased logs scan is not the relation `logs`, so its LIKE stays
+        // on the built-in operator and the statement still plans.
+        assert_eq!(
+            like_calls(
+                &ctx,
+                "SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts \
+                 WHERE l.body LIKE '%x%'"
+            )
+            .await,
+            (false, true)
+        );
+    }
+
+    #[tokio::test]
+    async fn like_on_a_derived_logs_column_is_rewritten_in_a_logs_only_session() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let ctx = session_with(vec![logs_table(&store)]);
+        assert_eq!(
+            like_calls(
+                &ctx,
+                "SELECT d.b FROM (SELECT body AS b FROM logs) d WHERE d.b LIKE '%x%'"
+            )
+            .await,
+            (true, false),
+            "a logs-only session rewrites every LIKE, a derived table's included"
+        );
+    }
+
+    /// [`like_calls`] for `sql`, or the error that refused it while building
+    /// its logical, optimized or physical plan.
+    async fn like_outcome(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> Result<(bool, bool), datafusion::error::DataFusionError> {
+        let df = ctx.sql(sql).await?;
+        df.clone().create_physical_plan().await?;
+        Ok(like_calls(ctx, sql).await)
+    }
+
+    #[tokio::test]
+    async fn an_alias_named_logs_over_samples_is_not_rewritten() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let samples_only = session_with(vec![metrics_table(&store)]);
+        let builtin = like_outcome(
+            &samples_only,
+            "SELECT value FROM samples WHERE value LIKE '1%'",
+        )
+        .await;
+        let aliased = like_outcome(
+            &samples_and_logs(),
+            "SELECT logs.value FROM samples AS logs JOIN logs AS l ON logs.ts = l.ts \
+             WHERE logs.value LIKE '1%'",
+        )
+        .await;
+        assert!(
+            builtin.is_err(),
+            "the built-in LIKE refuses a Float64 operand: {builtin:?}"
+        );
+        assert!(
+            aliased.is_err(),
+            "a LIKE over samples aliased logs is refused as the built-in refuses it: {aliased:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_escape_beside_samples_stays_on_the_builtin() {
+        let ctx = samples_and_logs();
+        for sql in [
+            "SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts \
+             WHERE l.body LIKE 'a#%' ESCAPE '#'",
+            "SELECT logs.body FROM logs JOIN samples s ON logs.ts = s.ts \
+             WHERE logs.body LIKE 'a#%' ESCAPE '#'",
+        ] {
+            assert_eq!(
+                like_calls(&ctx, sql).await,
+                (false, true),
+                "a custom ESCAPE stays on the built-in operator: {sql}"
+            );
+            let refused = like_outcome(&ctx, sql).await;
+            assert!(
+                refused.as_ref().is_err_and(|e| e
+                    .to_string()
+                    .contains("escape_char other than the backslash")),
+                "the built-in refuses a custom ESCAPE at physical planning: {refused:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_like_mixing_logs_and_samples_columns_is_not_rewritten() {
+        assert_eq!(
+            like_calls(
+                &samples_and_logs(),
+                "SELECT logs.body FROM logs JOIN samples ON logs.ts = samples.ts \
+                 WHERE logs.body LIKE label(samples.labels, 'job')"
+            )
+            .await,
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn the_dictionary_probe_wraps_the_same_functions_in_a_two_table_session() {
+        use crate::value_typed_results::ValueTypedResult;
+
+        let wrapped = |ctx: &SessionContext| -> BTreeSet<String> {
+            ctx.state()
+                .scalar_functions()
+                .iter()
+                .filter(|(_, udf)| udf.inner().is::<ValueTypedResult>())
+                .map(|(key, _)| key.clone())
+                .collect()
+        };
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let one_table = session_with(vec![logs_table(&store)]);
+        let two_tables = samples_and_logs();
+        assert!(
+            wrapped(&one_table).contains("length"),
+            "a logs session replaces length with its value-typed wrapper"
+        );
+        assert!(
+            wrapped(&two_tables).contains("length"),
+            "a samples plus logs session replaces length the same way"
+        );
+        assert_eq!(wrapped(&two_tables), wrapped(&one_table));
+    }
+
+    #[test]
+    fn build_session_with_tables_refuses_empty_duplicate_and_mixed_parquet() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantHash([0u8; 16]);
+        let refusal = |tables: Vec<SessionTable>| -> String {
+            match build_session_with_tables(
+                &SqlConfig::default(),
+                test_pool(),
+                tables,
+                false,
+                SpillDecision::Disabled,
+            ) {
+                Ok(_) => panic!("the table set must be refused"),
+                Err(DataFusionError::Plan(message)) => message,
+                Err(other) => panic!("expected a plan error, got {other}"),
+            }
+        };
+        assert_eq!(
+            refusal(Vec::new()),
+            "a SQL session needs at least one table"
+        );
+        assert_eq!(
+            refusal(vec![logs_table(&store), logs_table(&store)]),
+            "table logs is named twice in one SQL session"
+        );
+        assert_eq!(
+            refusal(vec![parquet_table(tenant), metrics_table(&store)]),
+            "a Parquet table cannot be queried beside another table"
+        );
+        assert_eq!(
+            refusal(vec![parquet_table(tenant), parquet_table(tenant)]),
+            "a Parquet table cannot be queried beside another table"
+        );
+    }
+}

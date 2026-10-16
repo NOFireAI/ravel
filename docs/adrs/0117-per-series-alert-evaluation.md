@@ -1,0 +1,338 @@
+# ADR-0117: per-series alert evaluation
+
+Status: Accepted (2026-09-16). Issue #117. Amends ADR-1294 (the one-alert-per-rule
+premise in its Context). Amended 2026-09-26 (unique rule id amendment).
+
+## Context
+
+A PromQL alert rule evaluates to an instant vector, one entry per matched
+series (`crates/ravel-promql/src/eval.rs:141-142`). The evaluator throws the
+series labels away before the condition runs: `promql_summary`
+(`services/ravel-server/src/alerting.rs:1657-1672`) maps each sample to its
+bare value, and `QueryResultSummary::Numeric(Vec<f64>)`
+(`crates/ravel-alerting/src/condition.rs:14-22`) has nowhere to keep them.
+`condition_met` then collapses the vector with `any()`
+(`condition.rs:65-67`), so a rule over `up == 0` across ten instances raises
+one alert with the rule's static labels, and the user guide says so
+(`docs/guides/alerting.md:66`).
+
+Alert identity is already a hash of a rule id plus a label set:
+`compute_alert_id(rule_id, labels)` (`crates/ravel-alerting/src/record.rs:79`)
+sorts the labels and hashes them under the `ravel-alert-id-v1` domain string
+(`record.rs:74, 87`). The record format carries labels as `label.<k>` attrs
+and the decoder ignores unknown attrs (`record.rs:145-168, 215`). The alert
+stream is one per rule, keyed by `rule.id` alone (`record.rs:30-36`), and the
+state machine folds records by `alert_id`, not by `rule_id`
+(`crates/ravel-alerting/src/state.rs:3-5`). So the persistent side can hold
+per-series identity today. What assumes one alert per rule is the evaluator:
+`build_transition_record` takes both the id and the labels from `rule.labels`
+(`record.rs:272-275`), `evaluate_rule` computes one id before it runs the
+query (`alerting.rs:1086-1089`), `queue_repeat_if_due` does the same
+(`alerting.rs:1035`), and the `undelivered` map is documented as "Bounded by
+the rule count" (`alerting.rs:601-604`).
+
+ADR-1294 built the alert state memo on that assumption: "a rule maps to
+exactly one `alert_id` for its lifetime. The fold's output therefore holds at
+most `R` entries" (`docs/adrs/1294-alert-state-memo.md:22-27`). The memo keeps
+one entry per identity ever seen and is never pruned; pruning is issue #1438
+(`1294-alert-state-memo.md:219-223`). Per-series identity multiplies the
+number of identities a tenant can accumulate, so the cap on how many a rule
+may produce has to be decided here, together with what happens above it.
+
+No cap exists today. The query engine's `max_series` (default 10,000,
+`crates/ravel-query/src/config.rs:9-10, 401`) bounds the series a query reads
+and fails with the typed `TooManySeries` error
+(`crates/ravel-query/src/error.rs:35`); it says nothing about how many alerts a
+rule may raise. Rule failures are `anyhow` errors that count in
+`rules_failed` and log a warning; the prior state is left as it was
+(`alerting.rs:771-790, 1188-1190`). `AlertError`
+(`crates/ravel-alerting/src/error.rs:6-46`) is the crate's typed error and
+holds no evaluation-cap variant.
+
+## Decision
+
+1. **A PromQL threshold rule raises one alert per matched series.** The
+   summary keeps the labels: `QueryResultSummary::Numeric` becomes a vector
+   of `(LabelSet, f64)` pairs, and a new `matching_series` function returns
+   the series whose value satisfies the condition, each with its labels.
+   `condition_met` stays as the boolean "at least one matched" for the SQL
+   path and for callers that only need the boolean. Native-histogram samples
+   stay excluded, as they are today (`alerting.rs:1653-1656`).
+
+2. **Alert identity is `compute_alert_id(rule_id, merged)`, where `merged` is
+   the series labels without `__name__`, overlaid by the rule labels.** A rule
+   label wins on a name clash, the order Prometheus uses and the order the
+   Alertmanager sink already applies to `alertname`
+   (`services/ravel-server/src/alert_sink.rs:319-323`). The preimage and the
+   `ravel-alert-id-v1` domain string do not change: a rule whose query
+   returns a scalar has an empty series label set, so its identity is the
+   one it has today. Two series of one rule that produce the same merged set
+   in one tick are a typed error (`AlertError::DuplicateAlertIdentity`) and
+   the rule fails that tick; a silent overwrite would hide one of them.
+
+3. **A rule may raise at most `MAX_ALERTS_PER_RULE = 1000` alerts.** The cap
+   counts matched series after decision 1, not the size of the result vector.
+   Above it the rule fails the tick with the typed
+   `AlertError::TooManyAlerts { rule_id, count, limit }`: no record is
+   written, prior state is untouched, `rules_failed` increments, and the
+   warning names the count and the limit. The tick is otherwise unaffected.
+   The cap is a crate constant, not a flag, so every tenant's memo, sink
+   fan-out and per-tick publish cost have one known bound. That per-tick publish
+   bound is `2 x MAX_ALERTS_PER_RULE`, not `MAX_ALERTS_PER_RULE`, because one
+   tick also writes a resolution per previously-open alert now absent: see the
+   per-tick publish bound amendment below.
+
+4. **A series that stops matching resolves.** After computing the matched set
+   the evaluator walks the folded `latest` entries whose `rule_id` is the
+   rule's and whose state is Pending or Firing, and feeds
+   `evaluate_transition` `condition_met = false` for each identity absent
+   from the matched set. `evaluate_transition` is pure and per identity
+   (`state.rs:129-175`), so it needs no change. `queue_repeat_if_due` iterates
+   the same set instead of computing one id from the rule's labels. Two
+   rules sharing a `rule_id` would resolve each other's alerts in this walk;
+   see the unique rule id amendment below.
+
+5. **SQL rules are unchanged.** `RowCount` (`condition.rs:68`) has no series
+   identity, so a SQL rule keeps one alert with the rule's labels.
+
+6. **Storage, formats and the `alerts` table do not change.** One RLOG object
+   still holds one record (`alerting.rs:1273-1275`), series labels travel as
+   `label.<k>` attrs, keys derive from writer identity and ingest hour, and
+   the `alerts` table already exposes labels through `attrs['label.<name>']`
+   and partitions current state by `alert_id` (`docs/guides/alerting.md:196-218`,
+   ADR-1101 decision 1).
+
+```mermaid
+flowchart LR
+    Q[PromQL query] --> V[instant vector<br/>one entry per series, labels kept]
+    V --> M[matching_series<br/>threshold per series]
+    M -->|count > 1000| E[AlertError::TooManyAlerts<br/>rule fails tick, no record]
+    M -->|matched set| ID[merge labels, drop __name__,<br/>rule labels win, compute_alert_id]
+    ID --> T[evaluate_transition per alert_id]
+    L[(memo: latest per alert_id)] --> R[Pending/Firing ids of this rule<br/>absent from matched set]
+    R -->|condition_met = false| T
+    T --> W[one RLOG object per transition]
+    W --> S[(t/tenant/a/c/0/hour)]
+    T --> N[sinks: one notification per transition<br/>labels = alertname + merged]
+```
+
+## Rejected alternatives
+
+- **Truncate to the first 1000 matched series instead of failing.** Which
+  series survive would depend on result order, so the set of alerts a rule
+  raises would change between ticks with no change in the data. An alert
+  that silently never fires is worse than a rule that visibly fails.
+- **Cap the result vector rather than the matched set.** Resolution
+  (decision 4) needs only the matched set and the memo, so a large vector of
+  healthy series costs nothing this ADR has to bound; the engine's
+  `max_series` already bounds what the query materialises.
+- **Make the cap a per-rule or per-tenant setting.** A raised cap raises the
+  memo growth, the sink fan-out and the sequential per-tick publish cost
+  together, and each of those is sized against one number. Lowering the cap
+  per rule buys nothing a narrower query does not.
+- **Keep `__name__` in the identity.** Two rules on different metrics already
+  differ by `rule_id`, so the metric name adds no identity within a rule
+  unless the query selects several names, and then decision 2's typed error
+  reports the clash instead of hiding it in a label users do not expect in
+  an alert.
+- **Emit one notification per rule carrying all matched series.** The
+  Alertmanager sink treats the label set as the alert's identity
+  (`alert_sink.rs:319-323`), so a grouped body would need a different
+  identity model at the sink than in the store.
+- **Widen the alert id preimage to a v2 domain string.** Not needed: the
+  preimage already takes an arbitrary label set, and every existing identity
+  (rule labels only) stays byte-identical.
+
+## Consequences
+
+- The memo holds up to 1000 live identities per rule plus every retired
+  series identity, and nothing prunes it until #1438 lands. A rule over a
+  churning label (pod name, request id) grows the memo by one entry per
+  retired series. #1438 moves from housekeeping to a precondition for such
+  rules and stays a versioned change, readers first
+  (`1294-alert-state-memo.md:234-242`).
+- Series label values now reach the memo and the alert history, and neither
+  is reached by any erasure path (`1294-alert-state-memo.md:246-262`).
+  The alerting guide states that a rule's labels and the labels its query
+  returns are retained with the alert record.
+- A tick that flips 1000 series writes 1000 sequential object-plus-commit
+  pairs (`alerting.rs:1261-1288`) and sends 1000 notifications per sink.
+  The cap bounds it; the lease TTL and query deadline
+  (`alerting.rs:876-884`) still have to cover the worst case. This figure
+  counts only the matched set and omits the resolutions the same tick writes
+  for previously-open alerts now absent; the true per-tick worst case is
+  `2 x MAX_ALERTS_PER_RULE`, corrected in the per-tick publish bound amendment
+  below.
+- Identities left behind by a rule label change were never resolved before;
+  decision 4's walk resolves them once. An operator sees one Resolved
+  transition per stale identity after the upgrade.
+- The startup duplicate-identity check (`alerting.rs:1857-1865`) keeps its
+  rule-level meaning; `rule_id` is in the preimage, so series-level
+  collisions across rules cannot occur. See the unique rule id amendment
+  below: neither holds, and rule ids are now unique per tenant.
+- What changes for an operator: rules like the guide's
+  `max by (instance) (cpu_usage)` example (`docs/guides/alerting.md:37`) now
+  raise one alert per instance; Alertmanager grouping and silences work on
+  the series labels; `rules_failed` rising with a `TooManyAlerts` warning
+  means the rule needs a narrower selector or an aggregation.
+- Follow-up tasks, in order:
+  1. Matcher and labelled summary in `ravel-alerting`: the paired summary
+     type, `matching_series`, the merged-label identity, the two new
+     `AlertError` variants and the cap constant, with a test feeding a
+     ten-series vector and asserting ten matches each carrying its own
+     `instance` label.
+  2. Evaluator fan-out in `ravel-server`: per-identity transitions,
+     resolution by absence, repeat handling per identity, the guide update,
+     and a test asserting ten `AlertRecord`s with distinct alert ids from
+     one rule.
+  3. Memo pruning (#1438) sequenced before per-series rules are recommended
+     for churning label sets.
+  4. A batching follow-up for the per-tick publish path if measurement shows
+     the sequential 1000-object worst case breaches the lease TTL.
+
+## Amendment (2026-09-26): rule ids are unique per tenant
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="unique rule id amendment" -->
+<!-- amendment-supersedes: phrase="keeps its rule-level meaning" pointer="unique rule id amendment" -->
+<!-- amendment-supersedes: phrase="collisions across rules cannot occur" pointer="unique rule id amendment" -->
+
+The Consequences bullet on the startup duplicate check is wrong: the check
+cannot keep its rule-level meaning under per-series evaluation, and
+series-level collisions across rules can occur. Both follow once two rules in
+one tenant share a `rule_id`:
+
+- Decision 4 walks every Pending or Firing entry in `latest` whose `rule_id`
+  is the rule's. Rule A's walk reaches rule B's alerts, finds them absent from
+  A's matched set, and resolves them; B's evaluation raises them again. The
+  two rules resolve each other's alerts every tick, whatever their labels.
+- Decision 2 builds identity from the series labels overlaid by the rule
+  labels, so rule labels no longer keep two rules' identities apart. Two
+  rules sharing a `rule_id` with rule labels `{}` and `{shard: "2"}` produce
+  the same merged set, and so the same `alert_id`, for every series that
+  carries `shard="2"`. The `rule_id` in the preimage separates rules only when
+  their rule ids differ.
+
+Decision: a `rule_id` is unique per tenant. Startup refuses a rules file in
+which two rules of one tenant share a `rule_id`, whatever their labels, with
+`rule id "<id>" is used by more than one rule in tenant "<tenant>"; rule ids
+must be unique per tenant`. This replaces the rule-level duplicate-identity
+check, which compared rule id plus rule labels and let both cases above
+through. The same `rule_id` in two tenants is still two independent rules.
+
+Consequence: a rule set with duplicate rule ids in one tenant, which loaded
+before, now fails at startup. The changelog entry and the alerting guide
+carry this as an upgrade note. Nothing else in the decision changes: the
+identity preimage, the cap, and the storage format are as written above, and
+records already written stay readable.
+
+Two code citations above have moved: the startup duplicate check cited in
+Consequences now lives in `parse_rules` in
+`services/ravel-server/src/alerting.rs`, and the `RowCount` summary cited in
+decision 5 is the `QueryResultSummary::RowCount` variant in
+`crates/ravel-alerting/src/condition.rs`. The `condition_met` function that
+decision 1 keeps for the SQL path was removed once nothing called it: the SQL
+path goes through `matching_series` like the PromQL one.
+
+## Amendment (2026-09-28): the per-tick publish bound includes resolutions
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="per-tick publish bound amendment" -->
+
+Decision 3 and the Consequences bullet on the per-tick cost both state the
+per-tick publish bound as `MAX_ALERTS_PER_RULE` (1000): "a tick that flips 1000
+series writes 1000 sequential object-plus-commit pairs and sends 1000
+notifications per sink." That counts only the matched set and omits the
+resolutions the same tick writes for alerts that were open on the previous tick
+and are absent from this tick's matched set.
+
+The correct worst case for one rule in one tick is
+`2 x MAX_ALERTS_PER_RULE` records: the matched set, at most
+`MAX_ALERTS_PER_RULE` (decision 3), plus one resolution per alert that was
+Pending or Firing at the end of the previous tick and is now absent, also at
+most `MAX_ALERTS_PER_RULE`. `evaluate_rule` writes a transition record for each
+of the two groups in one pass: the matched instances with `condition_met = true`
+and then the absent Pending/Firing instances with `condition_met = false`
+(decision 4). Each of the two iterables is bounded by `MAX_ALERTS_PER_RULE`:
+
+- The matched set is bounded directly. `alert_instances` returns
+  `AlertError::TooManyAlerts` when a rule matches more than
+  `MAX_ALERTS_PER_RULE` series (`crates/ravel-alerting/src/instance.rs`), so the
+  rule fails the tick before any write above the cap.
+- The absent set is bounded transitively, and only for a tick that follows a
+  fully successful one. After a tick that ran every one of the rule's writes to
+  completion, the only Pending or Firing entries left for the rule are those in
+  that tick's matched set (an absent entry is fed `condition_met = false` and
+  resolves to a terminal state), so the live Pending/Firing count for the rule
+  is at most `MAX_ALERTS_PER_RULE`. The next tick's absent set is a subset of
+  that live count, hence also at most `MAX_ALERTS_PER_RULE`.
+
+Both groups can be disjoint in one tick: 1000 previously-firing series all stop
+matching while 1000 new series start matching. That tick writes up to 1000
+resolutions plus up to 1000 new transitions, so up to 2000 object-plus-commit
+pairs and up to 2000 notifications per sink. The lease TTL (`alerting.rs`
+`LEASE_TTL_TICKS`, the evaluator's `lease_ttl`) and the query deadline
+(`DEFAULT_QUERY_DEADLINE`, `AlertEvalConfig::query_deadline`) still have to
+cover this doubled worst case, not the halved figure the original text implied.
+
+`2 x MAX_ALERTS_PER_RULE` is therefore the bound for a tick that follows a
+fully successful one, and nothing else. `absent` is built from the folded
+`latest` map, which is whatever history holds, not from anything this tick or
+this version wrote, and three routes leave more than `MAX_ALERTS_PER_RULE`
+Pending or Firing identities in it for one `rule_id`:
+
+- **Pre-upgrade history.** Before decision 4 existed no walk resolved an
+  identity a rule label change had orphaned, so each rule label revision could
+  leave a Firing entry that is still Firing at upgrade time. The Consequences
+  bullet above already names this ("Identities left behind by a rule label
+  change were never resolved before; decision 4's walk resolves them once"). On
+  the first tick after the upgrade the absent set is the number of such
+  orphaned identities, which can exceed the cap, and the tick writes one
+  resolution for each.
+- **A tick that fails partway.** `evaluate_rule` writes the matched instances
+  first and the absent ones after, in one pass, and `write_transition` returns
+  the error as soon as a PUT or a publish fails. So a rule whose write path
+  fails mid-pass leaves the matched instances it already wrote open and the
+  absent ones it had not reached still open, and `rules_failed` counts the rule
+  rather than the tick rolling anything back. The live Pending/Firing set for
+  that rule can then exceed `MAX_ALERTS_PER_RULE`, and the next tick's absent
+  set with it, so that next tick can write more than
+  `2 x MAX_ALERTS_PER_RULE` records. A failed rule leaving prior state as it
+  was, which the Context section states for rule failures in general and
+  decision 3 states for `TooManyAlerts`, holds only for a rule that fails
+  *before* its first write, which is what `TooManyAlerts` and a failed query
+  do; it is not true of a failure inside the write loop.
+- **Overlapping lease holders.** `acquire_lease` permits a two-holder overlap
+  during a handover (`alerting.rs`, `acquire_lease` and `seal_bound_hour`), and
+  the lease is advisory rather than a fencing token. Each holder's own tick is
+  capped, but the two run against independently folded `latest` maps, so a
+  holder that folded before the other's writes landed walks an absent set the
+  other has already resolved and writes a second resolution for each. Over one
+  interval the keyspace can take up to twice what one tick's bound allows. The
+  duplicates are what ADR-0043 decision 6 already tolerates. The fold
+  (`fold_commit_entries`) keeps, per identity, the record with the greatest
+  `(ts_ns, epoch, seq)`, taking `ts_ns` from the record and `epoch` and `seq`
+  from its commit key, and on an exact tie keeps the one it folded first; the
+  commit key's `writer_id`, which is what keeps two holders' keys distinct, is
+  not part of that order. Every replica folding the same history therefore
+  converges on one of the duplicates. The bound above is still per tick, not
+  per interval.
+
+For pre-upgrade history and overlapping lease holders the excess is a
+transient: a tick that walks the oversized absent set to the end writes a
+resolution for every identity in it, so the excess does not compound. A tick
+that fails partway does not have that property. It never walks the rest of the
+absent set, so those identities stay open, and while the write path keeps
+failing after the matched instances are written, each tick can open up to
+`MAX_ALERTS_PER_RULE` new identities for a rule whose matched series change
+while resolving none of the old ones. The open set, and the next successful
+tick's absent set with it, grows by up to the cap per failing tick until a
+tick's writes succeed through the end of the rule. Bounding the live set
+itself is memo pruning's problem (#1438), not this amendment's; a deployment
+upgrading a rule set with a long label-change history, or one whose object
+store is failing writes mid-rule, should expect ticks above the bound.
+
+This corrects the stated bound only; the code already publishes resolutions
+this way, and this amendment changes no publish behaviour. The cap, the
+identity preimage, and the storage format are unchanged. The bound is on what
+one tick publishes and queues, not on what one tick delivers: sink delivery
+carries notifications across ticks and is bounded separately, by the per-tick
+delivery deadline in `flush_sinks` (issue #2063).

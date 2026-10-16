@@ -1,0 +1,707 @@
+//! `ravel-cli load --parquet` (ADR-0089, widened by ADR-1751): bulk-import a
+//! Parquet file into the signal named by `--signal`, through the existing
+//! [`ravel_ingest::LogIngestRouter`] (logs), [`ravel_ingest::IngestRouter`]
+//! (metrics) or [`ravel_ingest::SpanIngestRouter`] (spans).
+//!
+//! This is a new *caller* of existing public APIs, not a new ingest path. The
+//! loader constructs its own router in-process against the target tenant's
+//! object store and provisioned shard count, reuses
+//! [`ravel_otlp::NormalizedLogRecord`] / [`ravel_otlp::NormalizedPoint`] /
+//! [`ravel_otlp::NormalizedSpan`] as the record shape, re-implements the
+//! `ravel-otlp` admission checks the ADR says to keep (future skew, length
+//! caps), relaxes the ones it says to relax (past-event-time lag, per-record
+//! attribute cap), and writes with [`WriteMode::Strict`] so every returned
+//! success has no buffered-but-unflushed data.
+//!
+//! Which `ravel-otlp` rules this path keeps, relaxes, or bypasses, and why, is
+//! documented in `docs/guides/ingest.md` ("Bulk import") per ADR-0089;
+//! ADR-1751 decision 1 states that the same table applies per signal, with
+//! that signal's own OTLP limits.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arrow::array::AsArray;
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
+    TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+    TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
+};
+use arrow::array::{BinaryArray, FixedSizeBinaryArray, MapArray, new_null_array};
+use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
+};
+use ravel_catalog::{AbsentPolicy, validate_or_adopt};
+#[cfg(feature = "stage-timing")]
+use ravel_ingest::LogStageSnapshot;
+use ravel_ingest::{
+    Clock, FlushTriggerMix, IngestByteBudget, IngestByteCharge, IngestConfig, IngestRouter,
+    LogIngestMetricsSnapshot, LogIngestRouter, LogWriteError, LogWriteReceipt, PendingAckBudget,
+    RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError,
+    SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
+};
+use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, stream_attrs_bytes};
+use ravel_object_store::ObjectStoreBackend;
+use ravel_otlp::logs_limits::LogIngestLimits;
+use ravel_otlp::normalize::{prometheus_family_name, sanitize_label_name, sanitize_metric_name};
+use ravel_otlp::promcompat::format_float;
+use ravel_otlp::traces_limits::SpanIngestLimits;
+use ravel_otlp::traces_normalize::{is_reserved_key, status_code_from_i32};
+use ravel_otlp::{IngestLimits, MetricKind, NormalizedLogRecord, NormalizedPoint, NormalizedSpan};
+use ravel_rspan::{StatusCode, merge_attrs};
+use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
+use ravel_types::{
+    CommitToken, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantId,
+};
+use serde::{Deserialize, Serialize};
+
+use crate::maintain::SignalArg;
+
+/// The label the classic-histogram explosion synthesizes per bucket, carrying
+/// that bucket's upper bound (`ravel_otlp::normalize`'s `explode_histogram`).
+const LE_LABEL: &str = "le";
+
+/// Per-record attribute cap for the loader (ADR-0089 relaxation of the
+/// `ravel-otlp` 128-per-record network cap).
+///
+/// 1024, deliberately far above OTLP's 128: bulk import is an offline,
+/// operator-initiated action reading a file the operator already controls, a
+/// different threat model than a networked OTLP sender, so a wide structured
+/// export is admitted rather than rejected. This is a *per-record* axis and is
+/// intentionally unrelated to the RLOG object's 1000-distinct-`(name, type)`
+/// dynamic-column budget (`RlogConfig::max_dynamic_columns`): past that
+/// per-object budget, extra columns fold into the `attrs_raw` overflow column
+/// rather than being rejected, and the loader inherits that object-level
+/// behavior from the writer unchanged (it writes no overflow logic of its own).
+pub const LOADER_MAX_ATTRIBUTES_PER_RECORD: usize = 1024;
+
+/// Default rows per Strict write. With the derived flush target a shard
+/// buffer holds several batches' slices before it flushes, so this bounds the
+/// memory held while building one batch, not the object size.
+pub const DEFAULT_BATCH_ROWS: usize = 10_000;
+
+/// Default number of decoded batches allowed to sit queued between the Parquet
+/// decode/build stage and the shard-write stage (issue #680). The decoder runs
+/// ahead by up to this many batches while the encoders drain earlier ones, so
+/// decode and encode overlap instead of running in lockstep. Bounds the memory
+/// the queue holds to roughly this count times one batch's built size; stacks
+/// with `--pipeline-depth`'s own in-flight-write working set.
+pub const DEFAULT_DECODE_QUEUE_BATCHES: usize = 2;
+
+/// The fixed pipeline depth ADR-0807 measured and the CLI defaulted to before
+/// issue #2753 (issues #800, #807): the `--pipeline-depth` lever is the OUTER
+/// of the two write concurrency windows. The CLI default is now derived from
+/// [`DEFAULT_OBJECT_ROWS`] and the memory budget ([`resolve_geometry`]); this
+/// value remains the depth [`DEFAULT_MAX_INFLIGHT_FLUSHES`] is pinned to and
+/// the explicit depth the library entry points' callers pass.
+///
+/// The measurement behind it:
+///
+/// At `1` the submit loop awaits a batch's every-shard ack before it submits the
+/// next, so each batch's encode, data PUT, and commit-record PUT are serial with
+/// every other batch's, and the machine has nothing to run in between. Measured
+/// on the logs pipeline's own per-shard skew counters (issue #865), that idle is
+/// where a bulk load's wall goes: the shards report their whole flush duration
+/// as `off_actor_ns` and a `flush_permit_wait_ns` of exactly zero, so the flush
+/// tier is never the constraint at depth 1 -- the loader simply stops asking it
+/// for work.
+///
+/// `4` is chosen, not `--shards` and not higher:
+///
+/// - It is the largest depth with a *measured* result behind it. ADR-0807
+///   measured `--pipeline-depth 4 --max-inflight-flushes 4` at 1,519.75 s
+///   against 4,466.76 s at `1`/`1` on the 100M-row ClickBench corpus, with the
+///   object count unchanged at 8,424. A depth of 16 with the inner window left
+///   at 1 aborted outright with `timed out waiting for shard ack`, because a
+///   depth the inner window cannot absorb just queues batches behind the
+///   [`write_ack_deadline`].
+/// - It bounds the memory cost at a stated multiple rather than at the shard
+///   count, which is a provisioning decision an operator may set far above 4.
+///   The loader holds at most `--pipeline-depth` built batches for their
+///   in-flight writes, plus `--decode-queue-batches` queued ahead, so this
+///   depth takes the resident batch working set from `1 + 2` to `4 + 2`
+///   batches of `--batch-rows` rows.
+/// - It is at least the default `--shards` (4), so every shard of a
+///   default-provisioned signal can hold a write at once.
+pub const MEASURED_PIPELINE_DEPTH: usize = 4;
+
+/// Default per-shard bound on concurrently in-flight flushes (issues #800,
+/// #807), the `--max-inflight-flushes` lever and the INNER of the two write
+/// concurrency windows.
+///
+/// Pinned to [`MEASURED_PIPELINE_DEPTH`] by
+/// `default_max_inflight_flushes_matches_pipeline_depth`, because the two
+/// windows compose as
+/// `shards * min(pipeline_depth, max_inflight_flushes, max_queued_flushes)`
+/// (ADR-0807, third term added by the ADR-1642 amendment and issue #1740: a
+/// shard refuses an ordinary trigger once it holds `max_queued_flushes`
+/// spawned and unreaped flush tasks, so it never spawns enough to use more
+/// permits than that; a drain and a buffer over its memory backstop are exempt
+/// and spawn past the cap, so the third term binds the steady state, not every
+/// instant). The loader leaves that cap at the `IngestConfig` default of 8 and
+/// does not carry `ravel-server`'s `Cli::resolve_flush_concurrency` raise, so
+/// a `--max-inflight-flushes` or `--pipeline-depth` above 8 is silently
+/// capped at 8 here rather than warned about; at their own defaults of 4 the
+/// cap is above both and never binds. An inner window below the
+/// outer one re-serialises each shard's
+/// PUT round trips and makes batches queue behind a semaphore they will still
+/// have to clear before [`write_ack_deadline`] elapses, and an inner window
+/// above the outer one is unreachable, since the loader never hands any shard
+/// more concurrent work than `--pipeline-depth` batches.
+///
+/// Unlike the outer window this one costs no additional memory on the bulk path.
+/// The resident flush working set is whatever the outstanding batches carry, and
+/// `--pipeline-depth` already caps that; this knob only decides whether that
+/// same bounded set of objects is encoded and PUT concurrently or one at a time.
+/// (On `ravel-server` the same field does bound memory, because there is no
+/// outer window upstream of it; ADR-0067 decision 2 governs that default, which
+/// this does not change.)
+///
+/// This deliberately no longer tracks [`IngestConfig::max_inflight_flushes`]'s
+/// own default (4, ADR-2708 D3): that default governs the client-facing
+/// serving path, whose Strict ack contract ADR-0067 froze, and the bulk loader
+/// is a different workload with a different memory owner.
+pub const DEFAULT_MAX_INFLIGHT_FLUSHES: u32 = MEASURED_PIPELINE_DEPTH as u32;
+
+/// Build the router [`IngestConfig`] a load drives, given the three
+/// operator-facing flush levers.
+///
+/// `max_flush_delay` `None` leaves the field at its [`IngestConfig::default`]
+/// value, so it produces a byte-for-byte default config. The CLI never passes
+/// `None`: an unset `--max-flush-delay` is [`DEFAULT_MAX_FLUSH_DELAY`] there,
+/// and `None` is what a library caller gets. `Some(d)` overrides only
+/// the router's age trigger, the third binding constraint on object layout
+/// beside `target_bytes` and a batch's per-shard slice footprint (issue #801):
+/// a shard buffer flushes when it reaches `target_bytes`, when its oldest point
+/// ages past `max_flush_delay`, or on a drain (the final drain, or the
+/// loader's depth, budget-stall and straggler flushes). At the library default
+/// of 2s a buffer that fills slower than one target's worth every 2s is
+/// released by age before it ever reaches a large `target_bytes`, which is why
+/// the CLI defaults the delay to 60s.
+pub(crate) fn build_ingest_config(
+    shards: u32,
+    target_bytes: usize,
+    max_inflight_flushes: u32,
+    max_flush_delay: Option<Duration>,
+) -> IngestConfig {
+    let delay = max_flush_delay.unwrap_or_else(|| IngestConfig::default().max_flush_delay);
+    IngestConfig {
+        shard_count: shards,
+        target_bytes,
+        max_inflight_flushes,
+        // A load drives one tenant, so the ADR-2708 D3 share (N-1 by
+        // default) would only take a permit away from `--max-inflight-flushes`.
+        max_inflight_flushes_per_tenant: usize::try_from(max_inflight_flushes).ok(),
+        max_flush_delay: delay,
+        // ADR-0076 decision 4: follows the actually-configured
+        // `max_flush_delay`, not just its default, so the adaptive corridor
+        // never contradicts the configured cadence. Must EXCEED the delay by
+        // the same reserve `IngestConfig::default()` uses; setting it equal
+        // collapses the corridor to its floor. Same derivation as
+        // `services/ravel-server/src/lib.rs`'s router construction.
+        strict_visibility_budget_ns: i64::try_from(delay.as_nanos())
+            .unwrap_or(i64::MAX)
+            .saturating_add(STRICT_VISIBILITY_RESERVE_NS),
+        ..IngestConfig::default()
+    }
+}
+
+/// Floor for a Strict write's ack deadline. Generous: a bulk load values
+/// completing over racing a slow store.
+const WRITE_ACK_DEADLINE_FLOOR: Duration = Duration::from_secs(60);
+
+/// Headroom added over `--max-flush-delay` by [`write_ack_deadline`]: the
+/// window the released flush still needs to encode and PUT its object once the
+/// age trigger has opened it.
+const WRITE_ACK_DEADLINE_MARGIN: Duration = Duration::from_secs(60);
+
+/// Ack deadline for each Strict write, scaled to the configured age trigger.
+///
+/// A write whose shard buffer never reaches `--target-bytes` is answered by the
+/// age trigger, so its ack can legitimately take `--max-flush-delay` plus the
+/// flush itself. A fixed 60s deadline therefore turns any raised delay into a
+/// `LogWriteError::AckTimeout` on the very batches the raised delay was meant
+/// to let accumulate, failing a whole load at its documented settings. Scaling
+/// keeps the deadline what it always was for an unset flag
+/// ([`WRITE_ACK_DEADLINE_FLOOR`] exactly) while leaving a raised delay one
+/// [`WRITE_ACK_DEADLINE_MARGIN`] of room past the trigger it configured.
+pub(crate) fn write_ack_deadline(max_flush_delay: Option<Duration>) -> Duration {
+    match max_flush_delay {
+        None => WRITE_ACK_DEADLINE_FLOOR,
+        Some(delay) => {
+            WRITE_ACK_DEADLINE_FLOOR.max(delay.saturating_add(WRITE_ACK_DEADLINE_MARGIN))
+        }
+    }
+}
+
+mod mapping;
+pub use mapping::*;
+mod cli;
+pub use cli::*;
+mod logs;
+pub use logs::*;
+mod memory;
+pub use memory::*;
+mod input;
+pub use input::*;
+mod columns;
+use columns::*;
+mod columnar;
+use columnar::*;
+mod metrics;
+pub use metrics::*;
+mod sequential;
+use sequential::*;
+mod spans;
+pub use spans::*;
+mod geometry;
+pub use geometry::*;
+
+/// Result of a successful (or partially-durable) load, for the summary output.
+#[derive(Debug, Clone, Default)]
+pub struct LoadReport {
+    pub rows_processed: u64,
+    /// `--skip-rows` (issue #1713): count of leading file rows dropped before
+    /// mapping, by FILE-absolute position. `min(skip_rows, total file rows)`,
+    /// computed once from Parquet footer metadata before decode starts. This
+    /// is a positional offset with no idempotency marker: nothing here detects
+    /// a wrong value. `rows_skipped + rows_written` is the next run's offset
+    /// only when this run used one read cursor and a pipeline depth of 1; see
+    /// [`ResumeFigures`].
+    pub rows_skipped: u64,
+    /// The `--skip-rows` value as the operator gave it, before the clamp to the
+    /// file's row count, and the file's own total. They differ only when the
+    /// requested offset is past the end of the file, which is always an
+    /// operator error: a resume of an already-complete file needs
+    /// `skip_rows == total_rows` exactly. `run_warning_to` reports that case,
+    /// because the clamped `rows_skipped` alone cannot show it.
+    pub skip_rows_requested: u64,
+    /// The file's total row count, read from the Parquet footer.
+    pub file_total_rows: u64,
+    /// One token per shard acked, across every batch, in submission order. At
+    /// `--target-bytes 1` that is one token per object written; at a larger
+    /// or derived target one flush answers several batches' acks with the same
+    /// token, so the list repeats it once per batch that flush carried. Use
+    /// [`LoadReport::objects_written`] for the object count.
+    pub tokens: Vec<CommitToken>,
+    pub elapsed: Duration,
+    /// Wall time the submit loop spent blocked waiting for a decoded batch to
+    /// arrive from the decode/build stage (issue #800). Together with
+    /// [`LoadReport::write_wait`] this partitions the loop's own wall clock into
+    /// the two things it can be waiting on, so "the load is slow" resolves to a
+    /// side without guessing: a large `decode_wait` means the single decoder
+    /// task is the constraint, a large `write_wait` means the write path is.
+    ///
+    /// Bracketed on [`Instant`], not the injected `Clock`: these are
+    /// measurements of the loader process, and a test clock (which the loader
+    /// itself never installs) would report them as zero.
+    pub decode_wait: Duration,
+    /// Wall time the submit loop spent blocked resolving an in-flight write
+    /// (issue #800). At `--pipeline-depth 1` this is the cross-batch barrier:
+    /// the loop resolves each batch's every-shard ack before submitting the
+    /// next, so this figure approaches the whole load and nothing else runs
+    /// while it accrues. Raising the depth is what turns it back into overlap.
+    pub write_wait: Duration,
+    /// The router's cumulative write metrics, snapshotted once the load
+    /// finished. Carries the dynamic-column counters (ADR-0100 decision 1) the
+    /// caller reads to emit an overflow or near-cap warning; there is no other
+    /// return path for a per-load signal (`LogIngestRouter::metrics()` is only
+    /// reachable by whoever constructed the router, which is `load` itself).
+    pub metrics: LogIngestMetricsSnapshot,
+    /// Per-shard flush counts split by the router's trigger causes (size, age,
+    /// arrival, final drain), snapshotted with `metrics` once the load
+    /// finished (issue #983). This is the honest basis for comparing two loads
+    /// of the same input: the raw object count is not a function of the
+    /// command line (input order concentrates consecutive rows on one shard,
+    /// and the age trigger makes host speed change the layout), but the
+    /// trigger mix that produced it is. Sorted by shard index; a shard that
+    /// never flushed is absent.
+    pub flush_trigger_mix: Vec<(u32, FlushTriggerMix)>,
+    /// Per shard, how many of its `final_drain` flushes the loader's depth
+    /// flush opened (issue #2753). [`LoadReport::flush_mix_report`] moves them
+    /// from `manual` to `depth`. Sorted by shard index; a shard no depth flush
+    /// released is absent.
+    pub depth_flushes_by_shard: Vec<(u32, u64)>,
+    /// The flush target and pipeline depth the load ran with. `None` when the
+    /// load decoded no rows, so nothing was resolved.
+    pub geometry: Option<LoadGeometry>,
+    /// The target-no-effect warning ([`target_bytes_no_effect_warning`]),
+    /// computed once the load finished.
+    pub target_bytes_no_effect_warning: Option<String>,
+    /// How many times the depth window gave up realigning on size flushes
+    /// (`DepthWindow::realign_gave_up`): 0, or 1 when the shards had not
+    /// handled a batch within the 30 s settle timeout.
+    pub realign_gave_up: u64,
+    /// The early shard-skew warning (issue #560), set at most once, the first
+    /// time the check at [`SKEW_CHECK_AFTER_BATCHES`](logs::SKEW_CHECK_AFTER_BATCHES) data batches finds the
+    /// spread at or below the [`SKEW_WARN_DENOMINATOR`](logs::SKEW_WARN_DENOMINATOR) threshold. `None` when
+    /// the load never reached the check point or stayed above it.
+    pub skew_warning: Option<String>,
+    /// Number of columnar batches this load built and drove through
+    /// `LogIngestRouter::write_columnar` (ADR-0109). Nonzero only on the columnar
+    /// fast path [`load`] uses; the row differential path leaves it 0. This is
+    /// the reachability signal a caller of the real entry point can observe to
+    /// prove the columnar path ran, not merely that its builder compiles.
+    pub columnar_batches_built: u64,
+    /// The memory budget the columnar logs path ran under (issue #2626).
+    /// Zeroed on the metrics, spans and row paths, which charge nothing.
+    pub load_memory: LoadMemory,
+    /// The highest reading of the load's memory budget gauge: the most bytes
+    /// CHARGED at once, not the bytes the pipeline held. A batch is charged an
+    /// estimate before its build (0 for the first) and its measured size only
+    /// after, so a batch being built can hold more than it is charged. The
+    /// peak can exceed `load_memory.budget_bytes`: a charge or a growing
+    /// resize larger than the room left is admitted once nothing else is held,
+    /// which a derived budget below one batch does for every batch.
+    pub load_memory_peak_bytes: u64,
+    /// The largest measured heap bytes of one built batch the load charged.
+    pub load_memory_max_batch_bytes: u64,
+    /// How many times the decoder found no room in the budget and waited,
+    /// counted since the load's budget was created. 0 when the budget never
+    /// bound.
+    pub load_memory_waits: u64,
+    /// Set at most once, the first time a batch larger than a derived budget
+    /// is admitted on its own (issue #2626 decision A). `None` under an
+    /// explicit `--load-memory-bytes`, which refuses such a batch instead.
+    pub load_memory_warning: Option<String>,
+    /// The `--fold-after-load` fold's figures (ADR-2677 decision 1). `None`
+    /// when the flag was not given. Its time is inside [`LoadReport::elapsed`].
+    pub fold: Option<LoadFold>,
+    /// The logs pipeline's per-stage timing breakdown (ADR-0104 decision 1),
+    /// snapshotted once the load finished. Present only under the
+    /// `stage-timing` feature; with it off this field does not exist, so a
+    /// default build carries no timing seam.
+    #[cfg(feature = "stage-timing")]
+    pub stage_timings: LogStageSnapshot,
+}
+
+impl LoadReport {
+    /// Distinct commit tokens in [`LoadReport::tokens`], which is the number of
+    /// RLOG objects the load wrote. Counting the list's length instead would
+    /// report batches-times-shards, which only equals the object count while
+    /// every write gets its own flush (`--target-bytes 1`).
+    pub fn objects_written(&self) -> usize {
+        let mut seen = std::collections::HashSet::new();
+        self.tokens
+            .iter()
+            .filter(|t| seen.insert(t.encode()))
+            .count()
+    }
+
+    /// The machine-readable per-shard flush trigger mix plus its totals (issue
+    /// #983), the serializable projection of [`LoadReport::flush_trigger_mix`]
+    /// and [`LoadReport::depth_flushes_by_shard`]. The router counts
+    /// strict-arrival flushes apart from age and so does this report: the
+    /// five keys (`size`, `age`, `arrival`, `depth`, `manual`) are disjoint
+    /// and sum to the flushes. The loader writes only `WriteMode::Strict`, so
+    /// `arrival` is 0 on every load. The drains split into `depth` and
+    /// `manual`.
+    pub fn flush_mix_report(&self) -> FlushMixReport {
+        let shards: Vec<ShardFlushMix> = self
+            .flush_trigger_mix
+            .iter()
+            .map(|(shard, mix)| {
+                let depth = self
+                    .depth_flushes_by_shard
+                    .iter()
+                    .find(|(s, _)| s == shard)
+                    .map_or(0, |(_, d)| *d)
+                    .min(mix.final_drain);
+                ShardFlushMix {
+                    shard: *shard,
+                    counts: FlushMixCounts {
+                        size: mix.size,
+                        age: mix.age,
+                        arrival: mix.arrival,
+                        depth,
+                        manual: mix.final_drain - depth,
+                    },
+                }
+            })
+            .collect();
+        let mut totals = FlushMixCounts::default();
+        for s in &shards {
+            totals.size += s.counts.size;
+            totals.age += s.counts.age;
+            totals.arrival += s.counts.arrival;
+            totals.depth += s.counts.depth;
+            totals.manual += s.counts.manual;
+        }
+        FlushMixReport { shards, totals }
+    }
+
+    /// The layout report the summary renders and prints as JSON.
+    pub fn layout_report(&self) -> LoadLayoutReport {
+        LoadLayoutReport {
+            signal: "logs".to_string(),
+            objects_written: self.objects_written(),
+            geometry: self.geometry,
+            flush_mix: self.flush_mix_report(),
+            target_bytes_no_effect_warning: self.target_bytes_no_effect_warning.clone(),
+            realign_gave_up: self.realign_gave_up,
+        }
+    }
+}
+
+/// What `--fold-after-load` did (ADR-2677 decision 1): one fold of the loaded
+/// signal, sealing through the highest ingest hour the load wrote.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LoadFold {
+    /// Wall time of the router shutdown, the fold and the check that its
+    /// snapshot covers every commit the load wrote, already counted in
+    /// [`LoadReport::elapsed`].
+    pub elapsed: Duration,
+    /// Entries across every part of the HEAD the fold wrote. `0` on a no-op,
+    /// which writes no HEAD, and when no fold ran.
+    pub entry_count: u64,
+    /// HEAD's watermark hour after the fold. `None` when no fold ran.
+    pub watermark_hour: Option<u32>,
+    /// The seal-through hour asserted: the highest `ingest_hour_bucket` over
+    /// the load's commit tokens. `None` when the load wrote nothing, so there
+    /// was no hour to seal and no fold ran.
+    pub seal_through_hour: Option<u32>,
+    /// `true` when HEAD already covered that hour, so the fold sealed nothing.
+    /// The load still succeeds only when that HEAD's snapshot holds every
+    /// commit it wrote, and fails with [`LoadError::FoldLeftCommitsUncovered`]
+    /// otherwise; `false` when no fold ran.
+    pub no_op: bool,
+    /// Snapshot part GETs the coverage check made. `0` when no fold ran or
+    /// the check could not read the snapshot.
+    pub parts_read: usize,
+    /// `(shard, hour)` buckets the coverage check listed, for commits it found
+    /// in no level-0 entry.
+    pub buckets_listed: usize,
+    /// Compaction and rewrite records the coverage check fetched from those
+    /// buckets.
+    pub records_read: usize,
+}
+
+/// The two figures a failed run has to hand back for `--skip-rows` to be
+/// usable: the offset that run started from and the rows it acked durable
+/// before it failed. Their sum is the next run's `--skip-rows` value, but only
+/// under `--read-cursors 1 --pipeline-depth 1`, where the acked rows are a
+/// contiguous prefix of the file. With K cursors the loader reads K far-apart
+/// partitions concurrently, and at a depth above 1 a batch submitted after the
+/// failing one can still commit, so what landed has holes and no single offset
+/// describes it. See [`resume_hint`], which is what states that to the
+/// operator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResumeFigures {
+    /// `--skip-rows` as the failed run applied it (capped at the file's total
+    /// row count), i.e. [`LoadReport::rows_skipped`].
+    pub rows_skipped: u64,
+    /// Rows from writes that acked durable, in submission order, before the
+    /// failure, i.e. [`LoadReport::rows_processed`] at that moment. It does
+    /// not count rows a later in-flight write committed after the failure
+    /// ([`harvest_after_failure`](logs::harvest_after_failure) recovers those as tokens, not as rows),
+    /// which is one of the reasons the sum below is not an offset at a depth
+    /// above 1.
+    pub rows_written: u64,
+}
+
+impl ResumeFigures {
+    fn from_report(report: &LoadReport) -> Self {
+        ResumeFigures {
+            rows_skipped: report.rows_skipped,
+            rows_written: report.rows_processed,
+        }
+    }
+
+    /// The `--skip-rows` value a resume would use. Valid only under the two
+    /// settings named on this type.
+    pub fn next_skip_rows(&self) -> u64 {
+        self.rows_skipped + self.rows_written
+    }
+}
+
+/// A load failure. Every variant that can occur after some data is already
+/// durable carries the durable commit tokens, so the caller reports the
+/// genuine partial load rather than swallowing it into a generic error
+/// (ADR-0089: a failed flush is a partial load, not a rollback). Those same
+/// variants carry [`ResumeFigures`], because the report holding them is
+/// dropped on this path and the operator needs them to decide the next run's
+/// `--skip-rows`.
+#[derive(Debug, thiserror::Error)]
+pub enum LoadError {
+    /// Setup failed before any record was written (mapping, provisioning, file
+    /// open, Parquet reader construction). Nothing is durable. Not used once
+    /// the batch loop starts — a failure there uses `BatchFailed` instead,
+    /// since earlier batches in the same run may already be durable.
+    #[error("{0}")]
+    Setup(String),
+    /// A batch failed to decode, or its columns failed to resolve against the
+    /// mapping, once the loop has already started (a later Parquet batch may
+    /// have a schema/type Parquet itself allows but the mapping cannot
+    /// handle). Distinct from `Setup`: earlier batches in the same run may
+    /// already be durable, and this variant reports them rather than
+    /// silently losing them.
+    #[error("{reason}")]
+    BatchFailed {
+        reason: String,
+        durable: Vec<CommitToken>,
+        resume: ResumeFigures,
+    },
+    /// A row failed a kept admission check (future skew, length cap, or the
+    /// loader per-record attribute cap). Fail-fast: the run stops at the first
+    /// bad row. Any tokens listed are batches durable before this row.
+    #[error("row {row}: {reason}")]
+    RowRejected {
+        row: u64,
+        reason: String,
+        durable: Vec<CommitToken>,
+        resume: ResumeFigures,
+    },
+    /// A flush (object-store PUT) failed. The tokens are what was durable from
+    /// *earlier* batches, plus any shard of the failing batch itself that acked
+    /// its commit durably before a sibling shard failed:
+    /// `LogIngestRouter::write` returns those recovered tokens on the error via
+    /// `LogWriteError::durable_tokens` (issue #296), and this variant appends
+    /// them. This list is therefore exact for the common partial-flush case (a
+    /// shard's flush abandoned or rejected while a sibling committed, all
+    /// within a completed ack round). It remains a lower bound only when the
+    /// ack round itself did not resolve: an ack-deadline timeout, or a shard's
+    /// channel dying at send time, returns before any per-shard ack is
+    /// observed, so no sibling token can be attributed even though one may have
+    /// landed. See [`print_durable_tokens`](cli::print_durable_tokens).
+    #[error("flush failed: {cause}")]
+    Flush {
+        durable: Vec<CommitToken>,
+        cause: String,
+        resume: ResumeFigures,
+    },
+    /// The `--fold-after-load` fold failed after every row was written. The
+    /// load's objects are all durable; only the snapshot is missing them, so
+    /// the fix is a fold, not a resumed load. `report` is the finished load's
+    /// summary, printed ahead of this error.
+    #[error(
+        "fold after load failed: {cause}. Every loaded object is already durable, so do not \
+         load the file again; seal them with `{rerun}` once the cause is fixed"
+    )]
+    Fold {
+        durable: Vec<CommitToken>,
+        cause: String,
+        /// The `catalog fold` command line that seals the loaded hours.
+        rerun: String,
+        report: Box<LoadReport>,
+    },
+    /// The `--fold-after-load` preflight found the clock's current ingest
+    /// hour already sealed in the logs catalog HEAD, which only an earlier
+    /// operator-asserted seal does. Refused before any row was read or any
+    /// object was written.
+    #[error(
+        "--fold-after-load refused this load before any row was read or any object was written: \
+         the current ingest hour {hour} is already sealed for tenant {tenant:?}, signal logs \
+         (the catalog HEAD's watermark is hour {watermark_hour}). Rows written into a sealed \
+         hour are not visible to queries that carry no commit token until the catalog HEAD is \
+         rebuilt. Either wait until hour {first_open_hour} begins and run the load again, or \
+         rebuild the HEAD first (docs/guides/operations/troubleshooting.md, \"Rebuild the \
+         snapshot\")"
+    )]
+    HourAlreadySealed {
+        tenant: String,
+        hour: u32,
+        watermark_hour: u32,
+        /// `watermark_hour + 1`, the first hour the HEAD has not sealed.
+        first_open_hour: u64,
+    },
+    /// After the `--fold-after-load` fold, the snapshot of the catalog HEAD
+    /// it left does not hold every commit this load wrote, as a level-0 entry
+    /// or superseded by a compaction or rewrite whose parts it holds; or that
+    /// snapshot could not be read, so coverage could not be checked. Every
+    /// object is durable. `report` is the finished load's summary, printed
+    /// ahead of this error.
+    #[error(
+        "every object this load wrote is durable, but {finding}. A commit outside the snapshot \
+         is not visible to queries that carry no commit token. Do not load the file again. Run \
+         `{verify}` to list the commits missing from the snapshot, then rebuild the catalog HEAD \
+         (docs/guides/operations/troubleshooting.md, \"Rebuild the snapshot\")"
+    )]
+    FoldLeftCommitsUncovered {
+        durable: Vec<CommitToken>,
+        /// The ingest hours of the uncovered commits, or of every commit when
+        /// coverage could not be checked, comma-separated.
+        hours: String,
+        /// Names the hours, how many commits are missing and up to ten of
+        /// them, or why coverage could not be checked.
+        finding: String,
+        /// The `catalog verify` command line for this tenant and signal.
+        verify: String,
+        report: Box<LoadReport>,
+    },
+}
+
+impl LoadError {
+    /// The commit tokens already durable when this error occurred (empty for a
+    /// setup error, since `Setup` never occurs once any batch could have
+    /// flushed).
+    pub fn durable_tokens(&self) -> &[CommitToken] {
+        match self {
+            LoadError::Setup(_) | LoadError::HourAlreadySealed { .. } => &[],
+            LoadError::BatchFailed { durable, .. }
+            | LoadError::RowRejected { durable, .. }
+            | LoadError::Flush { durable, .. }
+            | LoadError::Fold { durable, .. }
+            | LoadError::FoldLeftCommitsUncovered { durable, .. } => durable,
+        }
+    }
+
+    /// The rows skipped and the rows acked durable when this error occurred.
+    /// `None` for [`LoadError::Setup`], which occurs before the load applies an
+    /// offset or writes anything, so it has no figures to resume from, and for
+    /// [`LoadError::HourAlreadySealed`], which occurs before anything either,
+    /// and for [`LoadError::Fold`] and [`LoadError::FoldLeftCommitsUncovered`],
+    /// which occur once every row is durable, so there is nothing to resume.
+    pub fn resume_figures(&self) -> Option<ResumeFigures> {
+        match self {
+            LoadError::Setup(_)
+            | LoadError::HourAlreadySealed { .. }
+            | LoadError::Fold { .. }
+            | LoadError::FoldLeftCommitsUncovered { .. } => None,
+            LoadError::BatchFailed { resume, .. }
+            | LoadError::RowRejected { resume, .. }
+            | LoadError::Flush { resume, .. } => Some(*resume),
+        }
+    }
+
+    /// The durable-token list, for a caller that still has outstanding writes to
+    /// fold into it ([`harvest_after_failure`](logs::harvest_after_failure)). `None` for
+    /// [`LoadError::Setup`], which carries no list because it never occurs once
+    /// a batch could have flushed.
+    fn durable_tokens_mut(&mut self) -> Option<&mut Vec<CommitToken>> {
+        match self {
+            LoadError::Setup(_) | LoadError::HourAlreadySealed { .. } => None,
+            LoadError::BatchFailed { durable, .. }
+            | LoadError::RowRejected { durable, .. }
+            | LoadError::Flush { durable, .. }
+            | LoadError::Fold { durable, .. }
+            | LoadError::FoldLeftCommitsUncovered { durable, .. } => Some(durable),
+        }
+    }
+
+    /// The finished load's report, for the two `--fold-after-load` errors
+    /// that occur once every row is durable. `None` for every other variant.
+    pub fn finished_report(&self) -> Option<&LoadReport> {
+        match self {
+            LoadError::Fold { report, .. } | LoadError::FoldLeftCommitsUncovered { report, .. } => {
+                Some(report)
+            }
+            LoadError::Setup(_)
+            | LoadError::HourAlreadySealed { .. }
+            | LoadError::BatchFailed { .. }
+            | LoadError::RowRejected { .. }
+            | LoadError::Flush { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod test_support;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests;

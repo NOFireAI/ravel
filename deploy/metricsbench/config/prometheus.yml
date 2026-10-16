@@ -1,0 +1,13 @@
+# Prometheus configuration for the MetricsBench comparator (ADR-0927).
+#
+# Deliberately minimal. In the MetricsBench portable lane Prometheus receives
+# its samples over Remote Write 1.0 (enabled by --web.enable-remote-write-receiver
+# in docker-compose.yml), NOT by scraping, so there are no scrape_configs. Adding
+# a scrape job would inject samples the other comparators never see and break the
+# "every system receives the same logical samples" contract (ADR-0927 decision 1).
+global:
+  # Present only because Prometheus requires a global block; it does not scrape
+  # anything here. No evaluation_interval / rule_files: recording and alerting
+  # rules are out of scope for MetricsBench v1 (ADR-0927 decision 6).
+  scrape_interval: 15s
+  evaluation_interval: 15s

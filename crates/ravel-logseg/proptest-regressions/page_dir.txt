@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e35af98e586937ee837f931c6ec4e343d878587f17a8d71b5d8a7c18b47d6420 # shrinks to dir = PageDir { groups: [GroupEntry { first_block: 0, block_count: 1, chunks: [ChunkEntry { column_id: 0, offset: 0, pages: [PageEntry { block: 1, enc: DictPage, comp: 0, len: 1, uncomp_len: 1, crc32c: 0 }, PageEntry { block: 0, enc: DictIds, comp: 0, len: 0, uncomp_len: 0, crc32c: 0 }] }] }] }
+cc a7e966b4067aa7807cb5922b241c76f32e030b1a9b195219e795c4df842793a6 # shrinks to dir = PageDir { groups: [GroupEntry { first_block: 0, block_count: 1, chunks: [ChunkEntry { column_id: 0, offset: 0, pages: [PageEntry { block: 1, enc: DictPage, comp: 0, len: 1, uncomp_len: 1, crc32c: 0 }, PageEntry { block: 0, enc: DictIds, comp: 0, len: 0, uncomp_len: 0, crc32c: 0 }] }] }] }
