@@ -94,6 +94,8 @@
 #           rendered to the millisecond. No other divergence can be named.
 # refusal   Binder-refused entries only: the text the binder's typed
 #           refusal names the form by, when it is not the name in brackets.
+#           A refused source command is named "this source command", so
+#           its refusal is the text the command starts with.
 # refused_by
 #           Binder-refused entries only: the released entry the binder
 #           refuses first, because the example cannot reach this form
@@ -1191,7 +1193,7 @@ example = 'FROM logs | WHERE service IN (FROM logs | WHERE dur > 5 | KEEP servic
 parser = "supported"
 binder = "refused"
 executor = "refused"
-refusal = "service IN (FROM"
+refusal = "this expression"
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
 
 [[entry]]

@@ -212,10 +212,20 @@ fn names_token(text: &str, marker: &str) -> bool {
     })
 }
 
+/// Whether `text` starts with `marker` as a whole token.
+fn starts_with_token(text: &str, marker: &str) -> bool {
+    text.strip_prefix(marker).is_some_and(|rest| {
+        !(marker.chars().last().is_some_and(is_word) && rest.chars().next().is_some_and(is_word))
+    })
+}
+
 /// Whether `prepared` is the binder's refusal of `entry`: an `Unsupported`
 /// error naming the entry's construct as a whole token, or, for an entry
-/// refused through an earlier construct, naming that construct. A message that names no
-/// construct ("this expression") must point at text starting with it.
+/// refused through an earlier construct, naming that construct. A refused
+/// source command is named "this source command", so for it the text at the
+/// refusal's position must start with the construct as a whole token; no
+/// other refusal is matched by position, since an expression starts where an
+/// infix form whose left operand it is starts.
 fn binder_refusal(
     manifest: &Manifest,
     entry: &Entry,
@@ -231,9 +241,9 @@ fn binder_refusal(
     };
     match prepared {
         Err(EsqlError::Unsupported { name, line, column }) => {
-            let positional = name.starts_with("this ");
+            let at = text_at(&entry.example, *line, *column);
             if names_token(name, &marker)
-                || (positional && text_at(&entry.example, *line, *column).starts_with(&marker))
+                || (name == "this source command" && starts_with_token(&at, &marker))
             {
                 Ok(())
             } else {
@@ -445,6 +455,28 @@ async fn a_refusal_marker_matches_a_whole_token() {
         wrong[0].contains("the refusal names \"RLIKE\""),
         "{wrong:#?}"
     );
+}
+
+/// A refusal of "this expression" reports where the refused expression
+/// starts, which is also where an infix form whose left operand it is
+/// starts, so it is matched by its name and never by the text there.
+#[tokio::test]
+async fn a_refused_left_operand_does_not_name_the_infix_form() {
+    let fixture = fixture().await;
+    let example = "FROM logs | WHERE dur IN (FROM logs | KEEP dur) AND dur > 1";
+    let (refused, wrong) = check_refusals(
+        &binder_refused(example, "dur IN (FROM logs | KEEP dur) AND"),
+        &fixture,
+    )
+    .await;
+    assert_eq!(refused, 0);
+    assert!(
+        wrong[0].contains("the refusal names \"this expression\" at 1:19"),
+        "{wrong:#?}"
+    );
+    let (refused, wrong) =
+        check_refusals(&binder_refused(example, "this expression"), &fixture).await;
+    assert_eq!((refused, wrong.len()), (1, 0), "{wrong:#?}");
 }
 
 #[test]
