@@ -10,8 +10,11 @@ exceptions are:
 - `/api/v1/status/buildinfo` takes no credential.
 - `/api/v1/metadata` answers an empty object to a request it cannot resolve.
 
-`POST /api/v1/sql` and `POST /api/v1/analytics` return a described-schema JSON
-envelope, documented with each. Operators trigger the maintenance route
+A build with the `esql` cargo feature registers a twelfth,
+`POST /api/v1/esql`, described under [ES|QL queries](#esql-queries).
+
+`POST /api/v1/sql`, `POST /api/v1/esql` and `POST /api/v1/analytics` return a
+described-schema JSON envelope, documented with each. Operators trigger the maintenance route
 `POST /api/v1/admin/fold`, which is not a query route. The Prometheus-shaped
 endpoints return the Prometheus-compatible JSON envelope:
 
@@ -954,6 +957,106 @@ The `x-ravel-idempotency-key` suppresses this for keyed sequential retries.
 Unkeyed ingest gets plain at-least-once. See
 [consistency-model.md](../consistency-model.md#duplicates-and-idempotency)
 for the full contract.
+
+## ES|QL queries
+
+`POST /api/v1/esql` runs one ES|QL statement over the tenant's logs. The
+route exists only in a build with the `esql` cargo feature, which the
+published image does not carry; build `ravel-server` with
+`--features esql` to get it. The request, response and status codes are in
+the [HTTP API reference](../reference/http-api.md#apiv1esql).
+
+```esql
+FROM logs
+| WHERE @timestamp >= NOW() - 1 hour
+| STATS errors = COUNT(*) WHERE log.level == "ERROR"
+    BY window = BUCKET(@timestamp, 5 minutes), service.name
+| SORT window ASC, service.name ASC
+```
+
+What runs today:
+
+- Source commands: `FROM logs` and `ROW`. `ROW` reads nothing from storage.
+- Processing commands: `WHERE`, `EVAL`, `KEEP`, `DROP`, `RENAME`,
+  `STATS ... BY` (with a per-aggregate `WHERE`), `SORT` and `LIMIT`.
+- Functions: `NOW()`, `BUCKET(@timestamp, <duration>)`, and the aggregates
+  `COUNT`, `SUM`, `MIN`, `MAX` and `AVG`.
+- Operators: comparison, arithmetic, `AND`, `OR`, `NOT`, `IS NULL`,
+  `IS NOT NULL`, and `IN` over literal values. A time-duration literal such
+  as `1 hour` or `5 minutes` shifts a date.
+- Column types: `keyword`, `long`, `double`, `boolean`, `date_nanos` and
+  `null`.
+
+`FROM` accepts `logs` only. Another source, a pattern such as `logs*`, a
+second source, a remote source and `METADATA` are each refused.
+
+Field names map onto the `logs` table this way:
+
+- `@timestamp` is the `ts` column, typed `date_nanos`.
+- `message` is the `body` column.
+- `observed_ts`, `severity_num`, `severity_text`, `trace_id`, `span_id` and
+  `flags` are the native columns of the same names.
+- A declared typed attribute column has its declared type.
+- Any other name, such as `log.level` or `service.name`, reads that key
+  from the `attrs` map, which merges the resource, scope and record
+  attributes with the record's value winning, as a `keyword`. A row without the key reads null. After a `KEEP` or a `STATS`,
+  only the columns it kept or produced resolve.
+
+The time window. The statement's own `@timestamp` bounds choose the
+segments read: the `WHERE` conditions joined by `AND` ahead of the first
+`LIMIT`, `STATS`, or stage that redefines `@timestamp`, compared against a
+date constant such as `NOW() - 1 hour`. The request's `start` and `end`
+narrow that window. The window is a row filter too, so the bounds it fills
+in when the statement gives none also filter rows:
+
+- With no upper bound from the statement or the request, the window ends at
+  the query clock, and a row timestamped after the query clock is not
+  returned. Elasticsearch returns such future-dated rows; give an upper
+  bound to read them.
+- With no lower bound from either, the window starts at the Unix epoch. A
+  statement with no lower bound can therefore read the tenant's whole
+  retention, and the catalog list request budget can refuse it with 422
+  (`query window too wide`).
+
+Row limits. A statement that does not end in its own `LIMIT` returns at most
+1,000 rows. A final `LIMIT` above 10,000 runs as `LIMIT 10000`, and the
+response's `warnings` says so. A `LIMIT` before a later stage limits that
+stage's input, so it changes the answer:
+
+```esql
+FROM logs
+| SORT @timestamp DESC
+| LIMIT 100
+| STATS recent_errors = COUNT(*) WHERE log.level == "ERROR"
+```
+
+counts the errors among the latest 100 rows, not all errors.
+
+Everything else is refused with a typed 400 before the statement runs: `LIKE`
+and `RLIKE`, casts, other functions such as `TO_UPPER`, calendar intervals
+such as `1 month`, query parameters, query settings, and other commands.
+The message names the construct and where it starts. For `FROM metrics` it
+reads:
+
+```text
+line 1:6: source [metrics] is not supported
+```
+
+A statement that does not parse is refused the same way and takes no slot
+from the query concurrency ceiling.
+
+Integer overflow, integer division or remainder by zero, and a double result
+that is not finite each read null, as in ES|QL. Elasticsearch attaches a
+warning for each; this endpoint does not.
+
+An ES|QL request whose statement parses and is admitted writes one query
+audit record with `query.language` set to `esql`, whether the statement then
+succeeds or fails. A request refused before that writes none: one that fails
+authentication, a body the endpoint refuses (`params`, an unknown field, a bad
+`start`, `end` or `timeout`), a statement that does not parse, and one the
+admission limit refuses. A request whose client disconnects before the
+statement ends writes none either. See the [audit guide](audit.md#query-text) for how its text is
+redacted.
 
 ## Alerting on these queries
 

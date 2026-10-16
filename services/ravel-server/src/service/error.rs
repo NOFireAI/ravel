@@ -247,6 +247,74 @@ impl ServiceError {
         }
     }
 
+    /// Classify an [`EsqlError`](ravel_sql::esql::EsqlError) for `source`, the
+    /// statement text it was raised against (ADR-2887 D12).
+    ///
+    /// A statement that does not parse, does not bind, or uses something the
+    /// lowering does not execute is the caller's statement: 400 `bad_data`,
+    /// with the 1-based line and column in the message. A lowered statement
+    /// DataFusion cannot plan is 422 `execution` under a fixed message, its
+    /// detail logged only. An execution error keeps the mapping and redaction
+    /// of [`ServiceError::from_sql`].
+    #[cfg(feature = "esql")]
+    pub fn from_esql(
+        err: ravel_sql::esql::EsqlError,
+        source: &str,
+        tenant_hash: ravel_types::TenantHash,
+    ) -> Self {
+        use ravel_sql::esql::EsqlError;
+
+        let (kind, status, error_type, message) = match err {
+            EsqlError::Execution(inner) => return ServiceError::from_sql(inner, tenant_hash),
+            EsqlError::Parse(parse) => (
+                ServiceErrorKind::InvalidArgument,
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                esql_parse_message(&parse, source),
+            ),
+            err @ EsqlError::Verification { .. } => (
+                ServiceErrorKind::Validation,
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                err.to_string(),
+            ),
+            err @ EsqlError::Unsupported { .. } => (
+                ServiceErrorKind::Unsupported,
+                StatusCode::BAD_REQUEST,
+                "bad_data",
+                err.to_string(),
+            ),
+            err @ EsqlError::Plan(_) => {
+                if let EsqlError::Plan(detail) = &err {
+                    tracing::warn!(
+                        tenant = %tenant_hash.to_hex(),
+                        error = %detail,
+                        "esql plan error redacted from client response",
+                    );
+                }
+                (
+                    ServiceErrorKind::Unsupported,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "execution",
+                    err.to_string(),
+                )
+            }
+        };
+        if status == StatusCode::BAD_REQUEST {
+            tracing::debug!(
+                tenant = %tenant_hash.to_hex(),
+                client_message = %message,
+                "esql request rejected",
+            );
+        }
+        ServiceError {
+            kind,
+            message,
+            status,
+            error_type,
+        }
+    }
+
     /// Classify and redact a [`ravel_sql::DdlExecuteError`], and log the
     /// unredacted form once: at debug for a client-caused status (4xx), so a
     /// scripted client cannot flood the warn level, and at warn otherwise.
@@ -316,6 +384,33 @@ impl ServiceError {
         };
         ServiceError::new(kind, api)
     }
+}
+
+/// The client message for an ES|QL statement that does not parse: `line L:C: `
+/// and the parser's own message, without the byte offset the parser's message
+/// also carries, so the body states the position once.
+#[cfg(feature = "esql")]
+pub(crate) fn esql_parse_message(parse: &ravel_esql::Error, source: &str) -> String {
+    let at = parse.line_col(source);
+    let start = parse.span().start;
+    let mut detail = parse.to_string();
+    for marker in [
+        format!(" starting at byte {start}"),
+        format!(" at byte {start}"),
+        format!(" (byte {start})"),
+    ] {
+        // The last occurrence, so text the statement quotes earlier in the
+        // message cannot be taken for the offset; and one not followed by a
+        // digit, so offset 1 does not match the start of 12.
+        let found = detail
+            .rfind(&marker)
+            .filter(|&pos| !detail[pos + marker.len()..].starts_with(|c: char| c.is_ascii_digit()));
+        if let Some(pos) = found {
+            detail.replace_range(pos..pos + marker.len(), "");
+            break;
+        }
+    }
+    format!("line {}:{}: {detail}", at.line, at.column)
 }
 
 /// The failure class, HTTP status and `errorType` tag a DDL failure class

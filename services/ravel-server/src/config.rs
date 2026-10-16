@@ -467,13 +467,52 @@ const AUDIT_TOKEN_KEY_CONTEXT: &str = "ravel audit query-text token key v1";
 /// structure-preserving tokenization of a query's text, per query language.
 ///
 /// SQL statements go through `ravel_sql::redact` (sqlparser AST, literal
-/// values tokenized) and everything else through `ravel_promql::redact`
-/// (PromQL AST, label-matcher values and string literals tokenized). Both call
-/// the same `ravel_promql::audit_token` generator, so one value tokenizes
-/// identically whichever surface queried it.
+/// values tokenized), ES|QL statements through `ravel_esql::lex` (string and
+/// value-position number literals and `PROMQL` parameter values tokenized,
+/// see `redact_esql`), and
+/// everything else through
+/// `ravel_promql::redact` (PromQL AST, label-matcher values and string
+/// literals tokenized). All three call the same `ravel_promql::audit_token`
+/// generator, so one value tokenizes identically whichever surface queried
+/// it.
 pub struct AuditQueryTextRedactor {
     token_key: Box<[u8; 32]>,
 }
+
+/// The interval units ES|QL accepts (`ravel_esql::ast::Interval::kind`): a
+/// number written before one is an interval's magnitude, not a value.
+#[cfg(feature = "esql")]
+const ESQL_INTERVAL_UNITS: &[&str] = &[
+    "millisecond",
+    "milliseconds",
+    "ms",
+    "second",
+    "seconds",
+    "sec",
+    "s",
+    "minute",
+    "minutes",
+    "min",
+    "hour",
+    "hours",
+    "h",
+    "day",
+    "days",
+    "d",
+    "week",
+    "weeks",
+    "w",
+    "month",
+    "months",
+    "mo",
+    "quarter",
+    "quarters",
+    "q",
+    "year",
+    "years",
+    "yr",
+    "y",
+];
 
 impl AuditQueryTextRedactor {
     /// A redactor tokenizing under `token_key`.
@@ -524,12 +563,139 @@ impl AuditQueryTextRedactor {
     fn redact_sql(&self, query_text: &str) -> String {
         self.whole_text_token(query_text)
     }
+
+    /// Redact one ES|QL statement by lexing it: every string literal, every
+    /// number in a value position and every `PROMQL` parameter value becomes
+    /// a quoted token, the query of a `PROMQL` command is redacted as PromQL,
+    /// and every other token keeps its text. A number that shapes the statement rather than naming a
+    /// value, a `LIMIT` count or an interval's magnitude (`5 minutes`), stays
+    /// readable, as SQL's structural numbers do. A comment,
+    /// which may carry anything, becomes one space. Text that does not lex,
+    /// or lexes to a token kind this arm does not know, becomes one token over
+    /// the whole text.
+    #[cfg(feature = "esql")]
+    fn redact_esql(&self, query_text: &str) -> String {
+        use ravel_esql::TokenKind;
+
+        let Ok(tokens) = ravel_esql::lex(query_text, &ravel_esql::Limits::default()) else {
+            return self.whole_text_token(query_text);
+        };
+        let mut out = String::with_capacity(query_text.len());
+        let mut at = 0;
+        let word_at = |index: Option<usize>| {
+            index
+                .and_then(|index| tokens.get(index))
+                .filter(|token| matches!(token.kind(), TokenKind::Word))
+                .and_then(|token| token.span().slice(query_text))
+        };
+        for (index, token) in tokens.iter().enumerate() {
+            let span = token.span();
+            let (Some(gap), Some(text)) = (query_text.get(at..span.start), span.slice(query_text))
+            else {
+                return self.whole_text_token(query_text);
+            };
+            if gap.chars().all(char::is_whitespace) {
+                out.push_str(gap);
+            } else {
+                out.push(' ');
+            }
+            at = span.end;
+            let quoted = |value: &str| {
+                format!(
+                    "\"{}\"",
+                    ravel_promql::audit_token(&self.token_key, value.as_bytes())
+                )
+            };
+            match token.kind() {
+                TokenKind::String(value) => out.push_str(&quoted(value)),
+                TokenKind::Integer | TokenKind::Decimal => {
+                    let after_limit = word_at(index.checked_sub(1))
+                        .is_some_and(|word| word.eq_ignore_ascii_case("LIMIT"));
+                    let before_unit = word_at(index.checked_add(1)).is_some_and(|word| {
+                        ESQL_INTERVAL_UNITS
+                            .iter()
+                            .any(|unit| unit.eq_ignore_ascii_case(word))
+                    });
+                    if after_limit || before_unit {
+                        out.push_str(text);
+                    } else {
+                        out.push_str(&quoted(text));
+                    }
+                }
+                // A `PROMQL` parameter's value (`index=alice.smith`) lexes
+                // as a source pattern after `=`; a source name never follows
+                // one.
+                TokenKind::SourcePattern
+                    if index
+                        .checked_sub(1)
+                        .and_then(|previous| tokens.get(previous))
+                        .is_some_and(|previous| matches!(previous.kind(), TokenKind::Assign)) =>
+                {
+                    out.push_str(&quoted(text));
+                }
+                TokenKind::PromqlRegion => {
+                    let inner = text
+                        .strip_prefix('(')
+                        .and_then(|rest| rest.strip_suffix(')'))
+                        .unwrap_or(text);
+                    out.push('(');
+                    out.push_str(&self.redact_promql(inner));
+                    out.push(')');
+                }
+                TokenKind::Word
+                | TokenKind::QuotedIdent(_)
+                | TokenKind::NamePattern
+                | TokenKind::SourcePattern
+                | TokenKind::Param(_)
+                | TokenKind::IdentParam(_)
+                | TokenKind::Pipe
+                | TokenKind::Semicolon
+                | TokenKind::Comma
+                | TokenKind::Dot
+                | TokenKind::LParen
+                | TokenKind::RParen
+                | TokenKind::LBracket
+                | TokenKind::RBracket
+                | TokenKind::LBrace
+                | TokenKind::RBrace
+                | TokenKind::Assign
+                | TokenKind::Eq
+                | TokenKind::NotEq
+                | TokenKind::Lt
+                | TokenKind::LtEq
+                | TokenKind::Gt
+                | TokenKind::GtEq
+                | TokenKind::Plus
+                | TokenKind::Minus
+                | TokenKind::Star
+                | TokenKind::Slash
+                | TokenKind::Percent
+                | TokenKind::Cast
+                | TokenKind::Colon => out.push_str(text),
+                _ => return self.whole_text_token(query_text),
+            }
+        }
+        match query_text.get(at..) {
+            Some(rest) if rest.chars().all(char::is_whitespace) => out.push_str(rest),
+            Some(_) => out.push(' '),
+            None => return self.whole_text_token(query_text),
+        }
+        out
+    }
+
+    /// Without the `esql` feature this process serves no ES|QL surface; the
+    /// arm still fails safe rather than echoing the text.
+    #[cfg(not(feature = "esql"))]
+    fn redact_esql(&self, query_text: &str) -> String {
+        self.whole_text_token(query_text)
+    }
 }
 
 impl ravel_maintain::QueryTextRedactor for AuditQueryTextRedactor {
     fn redact(&self, language: &str, query_text: &str) -> String {
         match language {
             "sql" => self.redact_sql(query_text),
+            "esql" => self.redact_esql(query_text),
             // Every other surface records PromQL: one expression for `promql`
             // and `analytics`, a selector for `exemplars`, and the joined
             // selector list for `labels`, `label_values`, and `series`.
@@ -10164,6 +10330,88 @@ mod tests {
         let policy = resolve_audit_text_policy(AuditTextArg::Plaintext, None, None)
             .expect("plaintext must resolve without a key");
         assert!(matches!(policy, ravel_maintain::AuditTextPolicy::Plaintext));
+    }
+
+    /// The `esql` arm keeps the statement's structure and tokenizes its
+    /// values: a string literal and a value-position number become quoted
+    /// tokens, a `LIMIT` count and an interval magnitude stay readable, a
+    /// comment becomes one space, a `PROMQL` query is redacted as PromQL, and
+    /// text that does not lex becomes one token.
+    #[cfg(feature = "esql")]
+    #[test]
+    fn esql_redaction_tokenizes_values_and_keeps_structure() {
+        use ravel_maintain::QueryTextRedactor;
+
+        let key = [1u8; 32];
+        let redactor = AuditQueryTextRedactor::new(key);
+        let tok = |value: &str| ravel_promql::audit_token(&key, value.as_bytes());
+
+        assert_eq!(
+            redactor.redact(
+                "esql",
+                "FROM logs | WHERE service.name == \"checkout\" AND severity_num >= 13 | LIMIT 100",
+            ),
+            format!(
+                "FROM logs | WHERE service.name == \"{}\" AND severity_num >= \"{}\" | LIMIT 100",
+                tok("checkout"),
+                tok("13"),
+            ),
+        );
+        assert_eq!(
+            redactor.redact(
+                "esql",
+                "FROM logs | WHERE @timestamp >= NOW() - 1 hour | STATS c = COUNT(*) BY b = BUCKET(@timestamp, 5 minutes)",
+            ),
+            "FROM logs | WHERE @timestamp >= NOW() - 1 hour | STATS c = COUNT(*) BY b = BUCKET(@timestamp, 5 minutes)",
+        );
+        assert_eq!(
+            redactor.redact("esql", "FROM logs // alice@example.com\n| LIMIT 5"),
+            "FROM logs | LIMIT 5",
+        );
+        assert_eq!(
+            redactor.redact("esql", "PROMQL (up{job=\"checkout\"})"),
+            format!("PROMQL (up{{job=\"{}\"}})", tok("checkout")),
+        );
+        assert_eq!(
+            redactor.redact("esql", "FROM logs | WHERE ratio > 0.25"),
+            format!("FROM logs | WHERE ratio > \"{}\"", tok("0.25")),
+        );
+        let unterminated = "FROM logs | WHERE body == \"alice";
+        assert_eq!(redactor.redact("esql", unterminated), tok(unterminated));
+    }
+
+    /// A `PROMQL` parameter's value lexes as a source pattern after `=`, and
+    /// is a value the caller chose: it becomes a quoted token while the
+    /// parameter's name stays readable. A `FROM` source pattern follows no
+    /// `=` and stays readable, as the audit guide says source names do.
+    #[cfg(feature = "esql")]
+    #[test]
+    fn esql_redaction_tokenizes_promql_parameter_values() {
+        use ravel_maintain::QueryTextRedactor;
+
+        let key = [1u8; 32];
+        let redactor = AuditQueryTextRedactor::new(key);
+        let tok = |value: &str| ravel_promql::audit_token(&key, value.as_bytes());
+
+        let redacted = redactor.redact(
+            "esql",
+            "PROMQL index=alice.smith start=2026-01-01T00:00:00Z (up)",
+        );
+        assert!(!redacted.contains("alice.smith"), "{redacted}");
+        assert!(!redacted.contains("2026-01-01T00:00:00Z"), "{redacted}");
+        assert_eq!(
+            redacted,
+            format!(
+                "PROMQL index=\"{}\" start=\"{}\" (up)",
+                tok("alice.smith"),
+                tok("2026-01-01T00:00:00Z"),
+            ),
+        );
+
+        assert_eq!(
+            redactor.redact("esql", "FROM logs-prod-* | LIMIT 5"),
+            "FROM logs-prod-* | LIMIT 5",
+        );
     }
 
     /// With no `RAVEL_AUDIT_TOKEN_KEY`, no deployment key, and the default

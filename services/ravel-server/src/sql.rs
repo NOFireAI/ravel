@@ -280,12 +280,27 @@ pub(crate) fn respond(
     // `stats`; a metrics query passes zeros and moves nothing. Separate from
     // the cost aggregator in the service layer: that one answers "what did this
     // query spend", this one answers "how much did POSTINGS let it skip".
+    record_postings(&outcome);
+    let stats = stats_json(&outcome, audit_elapsed);
+    encode(headers, &outcome, tenant_hash, stats)
+}
+
+/// Fold an executed statement's LogsScanExec block counters into the
+/// process-global prune-selectivity totals.
+pub(crate) fn record_postings(outcome: &ravel_sql::SqlOutcome) {
     crate::query_postings_metrics::record(
         outcome.stats.blocks_total,
         outcome.stats.blocks_scanned,
         outcome.stats.blocks_pruned_by_postings,
     );
+}
 
+/// The JSON `stats` object of an executed statement: its cost accounting and
+/// estimate, per-phase costs, I/O shape, timings and pruning counters.
+pub(crate) fn stats_json(
+    outcome: &ravel_sql::SqlOutcome,
+    audit_elapsed: Duration,
+) -> serde_json::Value {
     let mut stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
     if let serde_json::Value::Object(ref mut map) = stats {
         map.insert(
@@ -317,7 +332,7 @@ pub(crate) fn respond(
             );
         }
     }
-    encode(headers, &outcome, tenant_hash, stats)
+    stats
 }
 
 /// The request's wall deadline: a client may shorten its own deadline but

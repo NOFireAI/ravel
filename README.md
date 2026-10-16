@@ -113,14 +113,16 @@ format.
 
 ## What works
 
-Ravel ingests OTLP natively and answers PromQL and SQL. Each surface below is
+Ravel ingests OTLP natively and answers PromQL and SQL, and ES|QL over logs in
+a build with the `esql` feature. Each surface below is
 in the published container image or behind a named cargo feature, and the
 matrix says which.
 
 The matrix describes `main`. Its "In published image" column means that the
 image built from `main` compiles the surface in. A surface that lands after
 the tag that the quickstart pins is not yet in the quickstart image. Every
-entry below is in the pinned `0.24.0` image. After the next feature lands,
+entry below that the published image compiles in is in the pinned `0.24.0`
+image. After the next feature lands,
 `git log v0.24.0..main` tells you whether that is still true. `CHANGELOG.md`
 records the release that each surface first shipped in.
 
@@ -134,6 +136,7 @@ records the release that each surface first shipped in.
 | PromQL HTTP API | metrics, logs as `ravel_log_lines` and `ravel_log_bytes` | `none` | yes |
 | SQL over `POST /api/v1/sql` | metrics as `samples` (scalar samples only, never native histograms), logs as `logs`, traces as `spans`, alert history as `alerts`, audit records as `audit` | `sql` | yes |
 | Flight SQL | the same five tables, with the same `samples` limit | `flight-sql` | yes |
+| ES&vert;QL over `POST /api/v1/esql` | logs, as `FROM logs` | `esql` | no |
 | Parquet tables over both SQL surfaces | Parquet files read in place from an S3, GCS or Azure location granted to the tenant (`ravel-cli tenant parquet-grant add`, `ravel-server --parquet-profiles`); described below the matrix | `sql` | yes |
 
 <!-- END SUPPORT MATRIX -->
@@ -149,6 +152,20 @@ same `--features` list to cargo.
 - OTAP ingest is registered only when the process starts with `--otap`
   ([docs/otap-ingest.md](docs/otap-ingest.md)).
 - SQL is the only way to query traces, alerts, and audit records.
+- `POST /api/v1/esql` runs one ES|QL statement over logs. The route is
+  compiled in only with `--features esql`, which turns on `sql` too; the
+  published image does not carry it. A statement outside the supported subset
+  is refused with a 400, and one the planner cannot plan, or whose time window
+  is wider than the catalog serves, with a 422. None is answered
+  approximately. See
+  [ES|QL queries](docs/guides/query.md#esql-queries).
+
+  ```esql
+  FROM logs
+  | WHERE @timestamp >= NOW() - 1 hour
+  | STATS errors = COUNT(*) WHERE log.level == "ERROR" BY service.name
+  | SORT service.name
+  ```
 
 A tenant can also query Parquet tables. These are Parquet files read in place,
 in an S3, GCS or Azure location that an operator granted the tenant with

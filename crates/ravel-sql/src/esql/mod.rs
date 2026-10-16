@@ -2,7 +2,8 @@
 //! [`ravel_esql::parse`] and lower it to a DataFusion logical plan that
 //! [`execute`] runs through the [`SqlExecutor`](crate::SqlExecutor).
 //!
-//! No HTTP handler calls [`prepare`] yet.
+//! `ravel-server`'s `POST /api/v1/esql` handler calls [`prepare`] and
+//! [`execute`] through its query service's `esql_execute`.
 //!
 //! [`prepare`] parses and binds once, before any session exists, and fixes the
 //! statement's output columns and their ES|QL types and the time window read

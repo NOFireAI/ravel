@@ -5128,6 +5128,7 @@ dependencies = [
  "ravel-catalog",
  "ravel-commit",
  "ravel-cpu-gate",
+ "ravel-esql",
  "ravel-fleet",
  "ravel-ingest",
  "ravel-logseg",

@@ -21,6 +21,7 @@ required` (or `RAVEL_AUDIT_MODE=required`) to enable it, or `best-effort`
 `kind = query` record. This applies to every query surface:
 
 - `POST /api/v1/sql` and Flight SQL
+- `POST /api/v1/esql`, in a build with the `esql` feature
 - `/api/v1/query` and `/api/v1/query_range`
 - `/api/v1/labels`, `/api/v1/label_values`, and `/api/v1/series`
 - `/api/v1/analytics`
@@ -128,6 +129,37 @@ and Ravel does not store the value. Tokenization runs before the record
 reaches the pipeline, so Ravel writes no verbatim text to the audit object or
 to its commit record.
 
+An ES|QL statement is redacted token by token:
+
+- A string literal becomes a quoted `"tok_<hex>"` token.
+- A number in a value position, such as the `13` in `severity_num >= 13`,
+  becomes a quoted token of its text too.
+- A `LIMIT` count and an interval magnitude, such as the `5` in `5 minutes`,
+  stay readable.
+- A comment becomes one space.
+- The query of a `PROMQL` command is redacted as a PromQL expression, and
+  the value of each of its `name=value` parameters becomes a quoted token.
+- Field names, source names such as the pattern after `FROM`, commands,
+  functions, operators and keywords stay readable.
+- A statement that does not lex becomes one token over the whole text.
+
+For example,
+
+```esql
+FROM logs | WHERE service.name == "checkout" AND severity_num >= 13 | LIMIT 100
+```
+
+is recorded as follows, where each `tok_…` is the full token of `checkout`
+and of `13`:
+
+```esql
+FROM logs | WHERE service.name == "tok_…" AND severity_num >= "tok_…" | LIMIT 100
+```
+
+The token of `checkout` is the token a SQL statement's `'checkout'` literal
+gets under the same key, so an ES|QL record correlates with SQL and PromQL
+records.
+
 `plaintext` is an explicit opt-in for a regime that requires the original
 text. It puts everything that the query carried into the audit trail for the
 whole retention window of that trail. This includes personal data in a
@@ -155,7 +187,7 @@ under a lost key stay readable, but they do not correlate with later records.
 
 #### Attributes
 
-- `query.language`: the surface that produced the record: `sql`, `promql`,
+- `query.language`: the surface that produced the record: `sql`, `esql`, `promql`,
   `labels`, `label_values`, `series`, `analytics`, or `exemplars`.
 - `query.tenant`: the hex hash of the resolved tenant. The record names the
   tenant that Ravel authenticated, whatever identity the client claimed.
@@ -186,6 +218,12 @@ These requests are refused before that and write no record:
 - A body that is not valid JSON.
 - A malformed `timeout`, `start` or `end`.
 - A query that the fleet-wide admission limit refuses.
+- An ES|QL request that carries `params` or an unknown field, or a statement
+  that does not parse.
+
+An ES|QL request whose client disconnects before its statement ends writes no
+record either: the server writes the record when the statement ends, and the
+disconnect drops the statement first.
 
 An absent record therefore does not mean an absent request. To count
 statements and not records, leave out the `attempted` rows.
@@ -195,6 +233,7 @@ statements and not records, leave out the `attempted` rows.
 | `query.language` | `query.text` |
 |---|---|
 | `sql` | The SQL statement. |
+| `esql` | The ES&vert;QL statement. |
 | `promql`, `analytics` | The PromQL expression. |
 | `labels`, `label_values`, `series` | The joined selector list. |
 | `exemplars` | The selector. |
@@ -204,6 +243,7 @@ The window attributes hold this range for each surface:
 | Surface | Recorded window |
 |---|---|
 | `sql`, `analytics` | The resolved range of the request. |
+| `esql` | The statement's resolved window. A `ROW` statement, and one refused before binding finished, records the query clock as both ends. |
 | `promql` instant query | Its one instant, as `(t, t)`. |
 | `promql` range query | `(start, end)`. |
 | `labels`, `label_values`, `series` | The resolved selector window. |

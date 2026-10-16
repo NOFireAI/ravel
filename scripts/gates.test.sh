@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Cases for the scoped selection in scripts/gates.sh and scripts/affected-tests.sh
 # (issue #2877): scoped mode gates the reverse-dependency closure of the named
-# crates, and the sql and flight-sql lanes follow that closure.
+# crates, and the sql, flight-sql and esql lanes follow that closure.
 #
 # Run by the doc-scripts job in .github/workflows/ci.yml, and by hand with
 #   bash scripts/gates.test.sh
 #
 # No toolchain: a stub `cargo` first on PATH answers `cargo metadata` with a
 # synthetic workspace whose edges mirror the real ones these cases are about
-# (ravel-sql and ravel-server depend on ravel-query, ravel-cli on ravel-sql,
+# (ravel-sql and ravel-server depend on ravel-query and ravel-esql, ravel-cli
+# on ravel-sql,
 # ravel-query, ravel-logseg, ravel-ingest and, as a dev-dependency,
 # ravel-server, ravel-ingest on ravel-logseg, ravel-ingest-router on
 # ravel-affinity), logs every other call
@@ -60,9 +61,11 @@ pkg() {
   printf ','
   pkg ravel-query ravel-types
   printf ','
-  pkg ravel-sql ravel-query
+  pkg ravel-esql ravel-types
   printf ','
-  pkg ravel-server ravel-sql ravel-query
+  pkg ravel-sql ravel-query ravel-esql
+  printf ','
+  pkg ravel-server ravel-sql ravel-query ravel-esql
   printf ','
   pkg ravel-logseg ravel-types
   printf ','
@@ -108,6 +111,8 @@ sql_clippy='==> cargo clippy --locked -p ravel-server --features sql --all-targe
 sql_test='==> cargo nextest run --locked -p ravel-server --features sql'
 flight_clippy='==> cargo clippy --locked -p ravel-server -p ravel-sql --features flight-sql --all-targets -- -D warnings'
 flight_test='==> cargo nextest run --locked -p ravel-server -p ravel-sql --features flight-sql'
+esql_clippy='==> cargo clippy --locked -p ravel-server --features esql --all-targets -- -D warnings'
+esql_test='==> cargo nextest run --locked -p ravel-server --features esql'
 stage_clippy='==> cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings'
 cli_explain_clippy='==> cargo clippy --locked -p ravel-cli --features sql-explain --all-targets -- -D warnings'
 cli_explain_test='==> cargo nextest run --locked -p ravel-cli --features sql-explain'
@@ -123,6 +128,8 @@ check_eq "gates -p ravel-query: sql lane clippy" "1" "$(count "${out}" "${sql_cl
 check_eq "gates -p ravel-query: sql lane tests" "1" "$(count "${out}" "${sql_test}")"
 check_eq "gates -p ravel-query: flight-sql lane clippy" "1" "$(count "${out}" "${flight_clippy}")"
 check_eq "gates -p ravel-query: flight-sql lane tests" "1" "$(count "${out}" "${flight_test}")"
+check_eq "gates -p ravel-query: esql lane clippy" "1" "$(count "${out}" "${esql_clippy}")"
+check_eq "gates -p ravel-query: esql lane tests" "1" "$(count "${out}" "${esql_test}")"
 check_eq "gates -p ravel-query: scoped clippy covers ravel-sql and ravel-server" "1" \
   "$(count_matching "${out}" '^==> cargo clippy --locked (-p [a-z-]+ )*-p ravel-sql (-p [a-z-]+ )*--all-targets' )"
 check_eq "gates -p ravel-query: scoped clippy names ravel-server" "1" \
@@ -189,6 +196,19 @@ check_eq "gates -p ravel-affinity: scoped clippy" "1" \
   "$(count "${out}" '==> cargo clippy --locked -p ravel-affinity -p ravel-ingest-router --all-targets -- -D warnings')"
 check_eq "gates -p ravel-affinity: no feature lane" "0" "$(count_matching "${out}" '--features')"
 
+# -p ravel-esql: ravel-sql and ravel-server depend on it, so the esql lane
+# runs, and with it the lanes that follow ravel-server.
+run_stubbed esql bash "${SCRIPTS}/gates.sh" -p ravel-esql --dry-run
+out="${tmp}/esql.out"
+check_eq "gates -p ravel-esql: exit 0" "0" "${rc}"
+check_eq "gates -p ravel-esql: esql lane clippy" "1" "$(count "${out}" "${esql_clippy}")"
+check_eq "gates -p ravel-esql: esql lane tests" "1" "$(count "${out}" "${esql_test}")"
+check_eq "gates -p ravel-esql: sql lane clippy" "1" "$(count "${out}" "${sql_clippy}")"
+
+# -p ravel-logseg reaches no crate the esql lane covers.
+check_eq "gates -p ravel-logseg: no esql lane" "0" \
+  "$(count "${tmp}/logseg.out" "${esql_clippy}")"
+
 # Workspace mode: every lane, and no cargo call at all. The hatch is set
 # because this checkout may itself sit under the fleet work root (the
 # orchestrator host does), and the refusal has its own cases above.
@@ -199,8 +219,9 @@ check_eq "gates --dry-run: workspace clippy" "1" \
   "$(count "${out}" '==> cargo clippy --locked --workspace --all-targets -- -D warnings')"
 check_eq "gates --dry-run: sql lane" "1" "$(count "${out}" "${sql_clippy}")"
 check_eq "gates --dry-run: flight-sql lane" "1" "$(count "${out}" "${flight_clippy}")"
+check_eq "gates --dry-run: esql lane" "1" "$(count "${out}" "${esql_clippy}")"
 check_eq "gates --dry-run: sql-explain lane" "1" "$(count "${out}" "${cli_explain_clippy}")"
-check_eq "gates --dry-run: feature lane clippy runs" "6" \
+check_eq "gates --dry-run: feature lane clippy runs" "7" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
 check_eq "gates --dry-run: no cargo call" "0" "$(wc -l <"${tmp}/workspace.calls" | tr -d ' ')"
 
@@ -220,7 +241,8 @@ check_eq "affected-tests -n: it is the closure line" "1" \
   "$(count_matching "${tmp}/at-dry.out" '^affected crates: ravel-query ')"
 check_eq "affected-tests -n: runs no test" "0" "$(builds "${tmp}/at-dry.calls")"
 
-# ravel-server in the closure: the sql and flight-sql test runs, ci profile.
+# ravel-server in the closure: the sql, flight-sql and esql test runs, ci
+# profile.
 run_stubbed at-query bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
 calls="${tmp}/at-query.calls"
 check_eq "affected-tests -p ravel-query: exit 0" "0" "${rc}"
@@ -228,6 +250,8 @@ check_eq "affected-tests -p ravel-query: sql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features sql')"
 check_eq "affected-tests -p ravel-query: flight-sql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server -p ravel-sql --features flight-sql')"
+check_eq "affected-tests -p ravel-query: esql tests" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features esql')"
 
 # Neither crate in the closure: no feature run.
 run_stubbed at-affinity bash "${SCRIPTS}/affected-tests.sh" -p ravel-affinity
@@ -240,6 +264,12 @@ CARGO_STUB_FAIL_ON="--features sql" run_stubbed at-fail bash "${SCRIPTS}/affecte
 check_eq "affected-tests, sql run fails: exit 3" "3" "${rc}"
 check_eq "affected-tests, sql run fails: flight-sql still ran" "1" \
   "$(count_matching "${tmp}/at-fail.calls" '--features flight-sql$')"
+
+# A failing esql run fails the script too.
+CARGO_STUB_FAIL_ON="--features esql" run_stubbed at-esql-fail bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
+check_eq "affected-tests, esql run fails: exit 3" "3" "${rc}"
+check_eq "affected-tests, esql run fails: sql still ran" "1" \
+  "$(count_matching "${tmp}/at-esql-fail.calls" '--features sql$')"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]

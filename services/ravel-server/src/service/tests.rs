@@ -1225,6 +1225,16 @@ async fn unauthenticated_request_consumes_no_permit() {
         StatusCode::UNAUTHORIZED,
         "sql",
     );
+    #[cfg(feature = "esql")]
+    assert_eq!(
+        route_status(
+            crate::esql::router(h.transports.sql.clone()),
+            anonymous("/api/v1/esql".to_string(), "{}"),
+        )
+        .await,
+        StatusCode::UNAUTHORIZED,
+        "esql",
+    );
 
     // None of them reached admission, so the stock is still exactly the one
     // permit this test holds.
@@ -1308,6 +1318,427 @@ async fn malformed_selector_rejected_before_admission_permit() {
     assert_eq!(h.usage.records().len(), 0);
 
     drop(held);
+}
+
+/// An ES|QL statement that does not parse is refused before `admit()` and
+/// before any store call. With the ceiling's one permit held, a service that
+/// admitted first would answer `Unavailable`; with every read faulted, one that
+/// resolved declared columns or the catalog first would bump a fault counter.
+/// The well-formed controls show both observers work: the same ceiling turns
+/// a statement that parses away as `Unavailable`, and once the permit is free
+/// that statement reaches the faulted store.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_parse_error_takes_no_permit_and_reads_no_store() {
+    let fault = || ScriptedFault::Permanent("no read expected".to_string());
+    let store = Arc::new(FaultStore::new(
+        MemoryStore::new(),
+        FaultPlan::empty()
+            .with_rule(Rule::new(Op::Get, fault()))
+            .with_rule(Rule::new(Op::Head, fault()))
+            .with_rule(Rule::new(Op::List, fault())),
+    ));
+    let h = harness(
+        store.clone(),
+        QueryConcurrencyLimit::Bounded(1),
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+    let reads = || {
+        [Op::Get, Op::Head, Op::List]
+            .into_iter()
+            .map(|op| store.fault_count(op, FaultKind::Permanent))
+            .sum::<u64>()
+    };
+    let esql = |text: &str| crate::service::EsqlQuery {
+        query: text.to_string(),
+        now_ns: NOW_NS,
+        start: None,
+        end: None,
+        request: ravel_sql::esql::EsqlRequest {
+            min_tokens: Vec::new(),
+            deadline: Duration::from_secs(30),
+            budgets: None,
+            max_rows: None,
+        },
+    };
+
+    let held = h.admission.try_admit().expect("the ceiling's one permit");
+
+    let err = err_of(
+        h.service
+            .esql_execute(h.tenant_hash, &esql("FROM logs\n| WHERE"))
+            .await,
+    );
+    assert_eq!(
+        err.kind,
+        ServiceErrorKind::InvalidArgument,
+        "{}",
+        err.message
+    );
+    assert_eq!(err.status, StatusCode::BAD_REQUEST);
+    assert!(err.message.starts_with("line 2:"), "{}", err.message);
+    assert_eq!(h.admission.in_flight(), 1);
+    assert_eq!(reads(), 0);
+    assert_eq!(h.usage.records().len(), 0);
+
+    let err = err_of(
+        h.service
+            .esql_execute(h.tenant_hash, &esql("FROM logs | LIMIT 1"))
+            .await,
+    );
+    assert_eq!(err.kind, ServiceErrorKind::Unavailable, "{}", err.message);
+    assert_eq!(reads(), 0);
+
+    drop(held);
+    let _ = h
+        .service
+        .esql_execute(h.tenant_hash, &esql("FROM logs | LIMIT 1"))
+        .await;
+    assert!(reads() > 0, "an admitted statement reads the store");
+    assert_eq!(h.admission.in_flight(), 0);
+}
+
+/// A parse error's message states the statement position once, as
+/// `line L:C:`, and carries no byte offset: an unexpected token, an
+/// unterminated string and comment, a bad escape, a stray character, and a
+/// misplaced source command.
+#[cfg(feature = "esql")]
+#[test]
+fn esql_parse_error_states_its_position_once() {
+    let limits = ravel_esql::Limits::default();
+    for (text, line_col) in [
+        ("FROM logs\n| WHERE", "line 2:8: "),
+        ("ROW a = \"open", "line 1:9: "),
+        ("ROW a = 1 /* open", "line 1:11: "),
+        ("ROW a = \"\\q\"", "line 1:10: "),
+        ("ROW a = 1 ^ 2", "line 1:11: "),
+        ("ROW a = 1\n| ROW", "line 2:3: "),
+    ] {
+        let parse = ravel_esql::parse(text, &limits).expect_err(text);
+        let message = super::error::esql_parse_message(&parse, text);
+        assert!(message.starts_with(line_col), "{text:?}: {message}");
+        assert!(!message.contains("byte"), "{text:?}: {message}");
+        assert!(message.len() > line_col.len(), "{text:?}: {message}");
+    }
+}
+
+/// What the README and the HTTP reference say an ES|QL statement outside what
+/// this build runs gets: a parse error, a bind error and an unsupported
+/// construct are 400, while a statement the planner cannot plan and one whose
+/// window is wider than the catalog serves are 422.
+#[cfg(feature = "esql")]
+#[test]
+fn esql_refusals_are_400_and_plan_and_window_failures_are_422() {
+    use ravel_sql::esql::EsqlError;
+
+    let tenant_hash = tenant().hash();
+    let limits = ravel_esql::Limits::default();
+    let source = "FROM logs\n| WHERE";
+    let parse = ravel_esql::parse(source, &limits).expect_err("does not parse");
+    let refusals = [
+        (EsqlError::Parse(parse), source),
+        (
+            EsqlError::Verification {
+                message: "unknown column [x]".to_string(),
+                line: 1,
+                column: 1,
+            },
+            "",
+        ),
+        (
+            EsqlError::Unsupported {
+                name: "source [metrics]".to_string(),
+                line: 1,
+                column: 6,
+            },
+            "",
+        ),
+    ];
+    for (err, source) in refusals {
+        let err = ServiceError::from_esql(err, source, tenant_hash);
+        assert_eq!(err.status, StatusCode::BAD_REQUEST, "{}", err.message);
+        assert_eq!(err.error_type, "bad_data");
+    }
+
+    let window = ravel_sql::SqlError::Catalog(ravel_catalog::CatalogError::WindowTooWide {
+        estimate: 9,
+        limit: 8,
+    });
+    for err in [
+        EsqlError::Plan("no physical plan".to_string()),
+        EsqlError::Execution(window),
+    ] {
+        let err = ServiceError::from_esql(err, "FROM logs", tenant_hash);
+        assert_eq!(
+            err.status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{}",
+            err.message
+        );
+        assert_eq!(err.error_type, "execution");
+    }
+}
+
+/// One ES|QL statement at the fixed clock's now, with `deadline` as its wall
+/// deadline and nothing else asked for.
+#[cfg(feature = "esql")]
+fn esql_query(text: &str, deadline: Duration) -> crate::service::EsqlQuery {
+    crate::service::EsqlQuery {
+        query: text.to_string(),
+        now_ns: NOW_NS,
+        start: None,
+        end: None,
+        request: ravel_sql::esql::EsqlRequest {
+            min_tokens: Vec::new(),
+            deadline,
+            budgets: None,
+            max_rows: None,
+        },
+    }
+}
+
+/// [`harness`] over a store whose every tenant-configuration GET is held until
+/// released, with the SQL executor resolving declared columns through that
+/// store the way a serving process does. The handle is the hold.
+#[cfg(feature = "esql")]
+fn harness_with_held_tenant_config(audit_sink: Arc<dyn QueryAuditSink>) -> (Harness, GateHandle) {
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let gate = store.hold(
+        Op::Get,
+        Some(ravel_catalog::config_key(&tenant().hash())),
+        Occurrence::Always,
+    );
+    let store: Arc<dyn ObjectStoreBackend> = store;
+    let h = harness(
+        Arc::clone(&store),
+        QueryConcurrencyLimit::Bounded(1),
+        audit_sink,
+        None,
+    );
+    let catalog =
+        Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let executor = ravel_sql::SqlExecutor::new(
+        catalog,
+        ravel_query::SegmentFetcher::new(Arc::clone(&store)),
+        ravel_query::LogSegmentFetcher::new(Arc::clone(&store)),
+        ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
+        sql_config(),
+        1 << 30,
+    )
+    .with_declared_column_source(Arc::new(
+        crate::declared_columns::TenantConfigDeclaredColumns::new(
+            Default::default(),
+            Arc::clone(&store),
+        ),
+    ));
+    let sql = crate::sql::SqlState {
+        executor: Arc::new(executor),
+        ..h.transports.sql.clone()
+    };
+    let h = Harness {
+        service: h.service.with_sql(sql.clone()),
+        transports: Transports {
+            sql,
+            ..h.transports
+        },
+        ..h
+    };
+    (h, gate)
+}
+
+/// The declared-column read an ES|QL statement over `logs` needs runs inside
+/// the request's deadline, as it does for SQL, whose executor reads it inside
+/// its own timeout. With the tenant-configuration GET held and the clock
+/// paused, the deadline is the only thing that can end either request: both
+/// end in the same timeout error and status, and both give the permit back.
+/// The outer bound turns a read outside the deadline into a failure rather
+/// than a hang.
+#[cfg(feature = "esql")]
+#[tokio::test(start_paused = true)]
+async fn esql_declared_column_read_runs_inside_the_deadline() {
+    let deadline = Duration::from_secs(5);
+    let bound = Duration::from_secs(60);
+
+    let (h, gate) = harness_with_held_tenant_config(Arc::new(NoopQueryAuditSink));
+    let esql = tokio::time::timeout(
+        bound,
+        h.service
+            .esql_execute(h.tenant_hash, &esql_query("FROM logs | LIMIT 1", deadline)),
+    )
+    .await
+    .expect("the request deadline ends a held declared-column read");
+    let esql = err_of(esql);
+    assert!(gate.held_count() >= 1, "the tenant-config read was held");
+    assert_eq!(h.admission.in_flight(), 0);
+
+    let (h, gate) = harness_with_held_tenant_config(Arc::new(NoopQueryAuditSink));
+    let request = ravel_sql::SqlRequest {
+        deadline,
+        ..sql_request("SELECT count(*) FROM logs")
+    };
+    let sql = tokio::time::timeout(bound, h.service.sql_execute(h.tenant_hash, &request))
+        .await
+        .expect("the SQL deadline ends a held declared-column read");
+    let sql = err_of(sql);
+    assert!(gate.held_count() >= 1, "the tenant-config read was held");
+    assert_eq!(h.admission.in_flight(), 0);
+
+    assert_eq!(esql.kind, ServiceErrorKind::Deadline, "{}", esql.message);
+    assert_eq!(esql.error_type, "timeout");
+    assert_eq!(esql.status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        (
+            esql.kind,
+            esql.status,
+            esql.error_type,
+            esql.message.as_str()
+        ),
+        (sql.kind, sql.status, sql.error_type, sql.message.as_str()),
+    );
+}
+
+/// Every audit event submitted, as `(query.language, query.status)`.
+#[cfg(feature = "esql")]
+#[derive(Default)]
+struct RecordingAuditSink {
+    events: Mutex<Vec<(String, String)>>,
+}
+
+#[cfg(feature = "esql")]
+impl RecordingAuditSink {
+    fn events(&self) -> Vec<(String, String)> {
+        self.events.lock().expect("lock").clone()
+    }
+}
+
+#[cfg(feature = "esql")]
+#[async_trait::async_trait]
+impl QueryAuditSink for RecordingAuditSink {
+    async fn submit(&self, event: AuditEvent) -> Result<(), MaintainError> {
+        let attr = |key: &str| {
+            event
+                .attrs
+                .iter()
+                .find_map(|(k, v)| match v {
+                    ravel_logseg::AttrValue::Str(s) if k == key => Some(s.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("audit event has no {key} attr"))
+        };
+        let recorded = (attr("query.language"), attr("query.status"));
+        self.events.lock().expect("lock").push(recorded);
+        Ok(())
+    }
+}
+
+/// Which ES|QL requests write a query audit record, as the query guide and the
+/// audit guide state it: one that passes authentication, the body checks, the
+/// parse and admission writes exactly one, whether its statement then succeeds
+/// or fails; a request refused before any of those, or dropped before its
+/// statement ends, writes none. Each request is driven through the router, so
+/// the transport's own refusals are covered too.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_audit_records_only_admitted_statements() {
+    use axum::body::Body;
+    use axum::http::Request;
+
+    let audit = Arc::new(RecordingAuditSink::default());
+    let h = harness(
+        Arc::new(MemoryStore::new()),
+        QueryConcurrencyLimit::Bounded(1),
+        Arc::clone(&audit) as Arc<dyn QueryAuditSink>,
+        None,
+    );
+    let post = |token: &str, body: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/esql")
+            .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request")
+    };
+    let route = |request| route_status(crate::esql::router(h.transports.sql.clone()), request);
+
+    assert_eq!(
+        route(post("not-a-token", r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::UNAUTHORIZED,
+    );
+    for body in [
+        "not json",
+        r#"{"query":"ROW a = 1","params":[]}"#,
+        r#"{"query":"ROW a = 1","params":null}"#,
+        r#"{"query":"ROW a = 1","filter":{}}"#,
+        r#"{"query":"ROW a = 1","timeout":-1}"#,
+        r#"{"query":"ROW a = 1","start":"yesterday"}"#,
+        r#"{"query":"ROW a = 1","start":10,"end":1}"#,
+        r#"{"query":"FROM logs\n| WHERE"}"#,
+    ] {
+        assert_eq!(
+            route(post(TOKEN, body)).await,
+            StatusCode::BAD_REQUEST,
+            "{body}"
+        );
+    }
+    assert_eq!(audit.events(), Vec::<(String, String)>::new());
+
+    let held = h.admission.try_admit().expect("the ceiling's one permit");
+    assert_eq!(
+        route(post(TOKEN, r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::SERVICE_UNAVAILABLE,
+    );
+    drop(held);
+    assert_eq!(audit.events(), Vec::<(String, String)>::new());
+
+    // Admitted, then refused by binding: one record, with status error.
+    assert_eq!(
+        route(post(TOKEN, r#"{"query":"FROM metrics"}"#)).await,
+        StatusCode::BAD_REQUEST,
+    );
+    assert_eq!(
+        audit.events(),
+        vec![("esql".to_string(), "error".to_string())]
+    );
+
+    // The positive control: an admitted statement that succeeds writes one too.
+    assert_eq!(
+        route(post(TOKEN, r#"{"query":"ROW a = 1"}"#)).await,
+        StatusCode::OK,
+    );
+    assert_eq!(
+        audit.events(),
+        vec![
+            ("esql".to_string(), "error".to_string()),
+            ("esql".to_string(), "ok".to_string()),
+        ]
+    );
+}
+
+/// A request dropped while its statement is still running, here held inside
+/// the declared-column read, writes no audit record: the record is written
+/// once the statement ends, and the drop comes first. The permit goes back.
+#[cfg(feature = "esql")]
+#[tokio::test]
+async fn esql_cancelled_request_writes_no_audit_record() {
+    let audit = Arc::new(RecordingAuditSink::default());
+    let (h, gate) = harness_with_held_tenant_config(Arc::clone(&audit) as Arc<dyn QueryAuditSink>);
+
+    let query = esql_query("FROM logs | LIMIT 1", Duration::from_secs(30));
+    let mut request = Box::pin(h.service.esql_execute(h.tenant_hash, &query));
+    tokio::select! {
+        _ = &mut request => panic!("the statement is held inside the store call"),
+        () = gate.wait_until_held(1) => {}
+    }
+    assert_eq!(h.admission.in_flight(), 1);
+    drop(request);
+
+    assert_eq!(h.admission.in_flight(), 0);
+    assert_eq!(audit.events(), Vec::<(String, String)>::new());
+    let usage = h.usage.records();
+    assert_eq!(usage.len(), 1);
+    assert_eq!(usage[0].1, UsageStatus::Canceled);
 }
 
 /// Step 2 on the SQL surface, which used to skip it: `sql_execute` and

@@ -84,8 +84,8 @@ mid-query cannot change the answer. A caller that holds commit tokens passes
 them back as repeated `min_commit_token` values for read-your-write.
 
 The Prometheus-shaped routes take form-encoded parameters: on GET, the query
-string, and on POST, the body. `/api/v1/sql` and `/api/v1/analytics` take a
-JSON body.
+string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
+`/api/v1/analytics` take a JSON body.
 
 | Method | Path | Request | Response | Status codes | Credential | Modes | Feature |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -99,6 +99,7 @@ JSON body.
 | GET, POST | `/api/v1/query_exemplars` | `query`, `start`, `end` | Prometheus exemplars JSON envelope | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/analytics` | JSON: `query`, `start`, `end`, `step`, `op`, optional `timeout`, `min_commit_token`, `allow_partial` | JSON analytics envelope, one entry per series | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/sql` | JSON: `query`, `start`, `end`, optional `timeout`, `min_commit_token` | Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
+| POST | `/api/v1/esql` | JSON: `query`, optional `start`, `end`, `timeout` | JSON: typed columns, rows, `stats`, and `warnings` when there are any | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `esql` |
 | GET | `/api/traces/{trace_id}` | path `trace_id`, plus optional `start`, `end`, `timeout`, `min_commit_token` | The `/api/v1/sql` response for every span of the trace: Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
 | POST | `/mcp` | One MCP JSON-RPC message (revision `2026-07-28` or `2025-11-25`) | JSON or `text/event-stream`, per revision; a tool result carries the result envelope | 200, 400, 401, 403, 405, 413, 500 | Yes | `all`, `query` | `mcp` |
 
@@ -201,6 +202,89 @@ the Arrow IPC format to read it exactly`.
 To get an Arrow IPC stream instead, send
 `Accept: application/vnd.apache.arrow.stream`. The stream is bit-exact for
 every type and reads every such column.
+
+### `/api/v1/esql`
+
+`/api/v1/esql` runs one ES|QL statement over the `logs` table. It is behind
+the `esql` cargo feature, which turns on `sql` too. The published server
+image does not build `esql`, so the route is absent there, and a build
+without the feature answers 404. A build with it serves the route on the
+main HTTP listener and on the mTLS listener, each under its own credential.
+The statement runs through the same admission ceiling, deadline, usage
+record, query audit record and cost recording as `/api/v1/sql`. See
+[ES|QL queries](../guides/query.md#esql-queries) for the language that runs.
+
+Request body, JSON:
+
+| Field | Required | Meaning |
+| --- | --- | --- |
+| `query` | Yes | The statement text. |
+| `start` | No | Unix seconds, a float. The window starts no earlier than this, inclusive. |
+| `end` | No | Unix seconds, a float. The window ends before this, exclusive. |
+| `timeout` | No | Seconds. It can only lower the server deadline. |
+
+`start` and `end` narrow the window the statement's own `@timestamp`
+bounds give it; they never widen it. Any other field is 400. `params` is
+refused by name: the route runs no parameterised statement, so write each
+value into the statement. The route takes no `min_commit_token`. The body is
+capped at 64 KiB.
+
+```sh
+curl -s -X POST http://127.0.0.1:4318/api/v1/esql \
+  -H "Authorization: Bearer demo-token" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "FROM logs | WHERE @timestamp >= NOW() - 1 hour | STATS errors = COUNT(*) WHERE log.level == \"ERROR\" BY service.name | SORT service.name"}'
+```
+
+The response is always JSON. Here, with the row values illustrative and the
+`stats` sections shown empty for brevity:
+
+```json
+{"status": "success",
+ "data": {"columns": [{"name": "errors", "type": "long"},
+                      {"name": "service.name", "type": "keyword"}],
+          "rows": [[3, "api"], [2, "web"]]},
+ "stats": {"accounting": {}, "estimate": {}, "io": {}, "phases": [],
+           "pruning": {}, "timings": {}}}
+```
+
+- Each column's `type` is its ES|QL type: `keyword`, `long`, `double`,
+  `boolean`, `date_nanos` or `null`.
+- A `date_nanos` value is an integer count of nanoseconds since the Unix
+  epoch.
+- `stats` has the sections `/api/v1/sql` reports for a statement that reads
+  the catalog: `accounting`, `estimate`, `io`, `phases`, `pruning` and
+  `timings`. A `ROW` statement reads no object, and its `stats` holds only
+  `accounting` and `estimate`, with no request counted.
+- `warnings`, an array of strings, is present only when there is something
+  to say. Today that is one case: the statement's own `LIMIT` was above
+  10,000 and was lowered to it, as in
+  `the statement's LIMIT 20000 was lowered to 10000, the most rows an ES|QL
+  query returns`.
+
+Errors use the shared body, `{"status": "error", "errorType": ..., "error":
+...}`. The status follows the shared mapping in
+[Query status codes](#query-status-codes), with these ES|QL cases:
+
+| Condition | Status | `errorType` |
+| --- | --- | --- |
+| The statement does not parse, or passes a structural limit; the message starts `line L:C:` and states no byte offset | 400 | `bad_data` |
+| The statement parses and does not bind: an unknown column, a type mismatch, an aggregate outside `STATS` | 400 | `bad_data` |
+| A command, source, function, operator or type this build does not run; the message starts `line L:C:` and names the construct, as shown below | 400 | `bad_data` |
+| `params`, an unknown field, a body that is not JSON, or `start` after `end` | 400 | `bad_data` |
+| A bound statement the planner cannot plan; the message does not carry the planner's text | 422 | `execution` |
+| A statement whose time window is wider than the catalog serves | 422 | `execution` |
+| A failure while the statement runs | As for `/api/v1/sql` | As for `/api/v1/sql` |
+
+The refusal of a construct this build does not run reads, for `FROM metrics`:
+
+```text
+line 1:6: source [metrics] is not supported
+```
+
+A statement that does not parse is refused before it takes a permit from the
+admission ceiling and before any object-store read, and it writes no audit
+or usage record.
 
 ### `/api/traces/{trace_id}`
 

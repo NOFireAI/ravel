@@ -641,6 +641,122 @@ impl QueryService {
         })
     }
 
+    /// `POST /api/v1/esql`: one ES|QL statement over the `logs` table
+    /// (ADR-2887), through the same steps as [`Self::sql_execute_timed`].
+    ///
+    /// The statement's structural guard and parse run first, before the
+    /// admission permit: a statement that does not parse takes no permit,
+    /// reads no catalog and no tenant configuration, and writes no audit or
+    /// usage record, the same as a request body that is not JSON. Binding needs
+    /// the tenant's declared log columns, which is a store read, so it runs
+    /// after admission, inside the usage guard and the request's deadline,
+    /// like the run itself: a stalled tenant-configuration read ends in the
+    /// same timeout error a stalled SQL run does.
+    ///
+    /// The run's row cap is [`ravel_sql::esql::MAX_LIMIT`], whatever the
+    /// request asked for.
+    #[cfg(feature = "esql")]
+    pub async fn esql_execute(
+        &self,
+        tenant_hash: TenantHash,
+        query: &EsqlQuery,
+    ) -> Result<EsqlExecution, ServiceError> {
+        let state = self
+            .sql
+            .as_ref()
+            .ok_or_else(|| ServiceError::unsupported_surface("ES|QL"))?;
+        let limits = ravel_esql::Limits::default();
+        let text = query.query.as_str();
+        let parsed = ravel_esql::parse(text, &limits).map_err(|err| {
+            ServiceError::from_esql(ravel_sql::esql::EsqlError::Parse(err), text, tenant_hash)
+        })?;
+        // `ROW` binds no column, so it needs no declared-column read.
+        let reads_logs = !matches!(parsed.source, ravel_esql::ast::Command::Row(_));
+
+        let _permit = self.controls.admit()?;
+        let row_cap = usize::try_from(ravel_sql::esql::MAX_LIMIT).unwrap_or(usize::MAX);
+        let request = ravel_sql::esql::EsqlRequest {
+            deadline: self
+                .controls
+                .clamp_deadline(query.request.deadline, state.max_deadline),
+            budgets: query.request.budgets.as_ref().map(|budgets| {
+                self.controls
+                    .clamp_budgets(Some(budgets), &state.executor.config().engine)
+            }),
+            max_rows: Some(
+                query
+                    .request
+                    .max_rows
+                    .map_or(row_cap, |rows| rows.min(row_cap)),
+            ),
+            min_tokens: query.request.min_tokens.clone(),
+        };
+        let live = ravel_sql::LiveAccounting::new();
+        let guard = self
+            .controls
+            .usage_guard(tenant_hash, Arc::new(SqlLiveUsage(live.clone())));
+
+        let span = query_span("esql_query", tenant_hash);
+        let mut window = None;
+        let millis = u64::try_from(request.deadline.as_millis()).unwrap_or(u64::MAX);
+        let run = async {
+            let declared = if reads_logs {
+                state
+                    .executor
+                    .resolve_declared_columns(tenant_hash, query.now_ns)
+                    .await
+            } else {
+                Vec::new()
+            };
+            let ctx = ravel_sql::esql::PrepareContext {
+                declared,
+                now_ns: query.now_ns,
+                start: query.start,
+                end: query.end,
+            };
+            let prepared = ravel_sql::esql::prepare(text, &limits, &ctx)?;
+            window = prepared.window();
+            ravel_sql::esql::execute(&state.executor, tenant_hash, &prepared, &request, &live).await
+        };
+        let result = tokio::time::timeout(request.deadline, run)
+            .instrument(span.clone())
+            .await
+            .unwrap_or(Err(ravel_sql::esql::EsqlError::Execution(
+                ravel_sql::SqlError::DeadlineExceeded { millis },
+            )))
+            .map_err(|err| ServiceError::from_esql(err, text, tenant_hash));
+
+        let cost_of = |outcome: &ravel_sql::esql::EsqlOutcome| match &outcome.run {
+            ravel_sql::esql::EsqlRun::Catalog(outcome) => (outcome.accounting, outcome.estimate),
+            ravel_sql::esql::EsqlRun::Row(_) => (live.snapshot(), core::zero_estimate()),
+        };
+        let status = finish_usage(guard, &result, cost_of);
+
+        // A `ROW` statement, and one refused before binding finished, has no
+        // window; its record carries the query clock as both bounds.
+        let window = window.map_or((query.now_ns, query.now_ns), |window| {
+            (window.start_ns, window.end_ns)
+        });
+        let audit_started = std::time::Instant::now();
+        self.controls
+            .audit(tenant_hash, query.now_ns, text, "esql", window, status)
+            .await?;
+        let audit_elapsed = audit_started.elapsed();
+        let outcome = result?;
+
+        // Like SQL, ES|QL has no federated fan-out, so step 6 is vacuous.
+        let (accounting, estimate) = cost_of(&outcome);
+        record_span_cost(&span, &accounting);
+        self.controls
+            .record_cost(tenant_hash, &accounting, &estimate);
+        Ok(EsqlExecution {
+            outcome,
+            accounting,
+            estimate,
+            audit_elapsed,
+        })
+    }
+
     /// The plan and cost of a statement, without running it. The MCP adapter
     /// (issue #1381) is its caller; no HTTP route exposes it.
     #[cfg(feature = "sql")]
@@ -696,6 +812,33 @@ impl QueryService {
 #[cfg(feature = "sql")]
 pub struct SqlExecution {
     pub outcome: ravel_sql::SqlOutcome,
+    pub audit_elapsed: std::time::Duration,
+}
+
+/// One ES|QL request as [`QueryService::esql_execute`] runs it.
+#[cfg(feature = "esql")]
+#[derive(Debug, Clone)]
+pub struct EsqlQuery {
+    /// The statement text.
+    pub query: String,
+    /// The query clock: `NOW()`, and the end of a window with no upper bound.
+    pub now_ns: i64,
+    /// The request's inclusive start, in nanoseconds.
+    pub start: Option<i64>,
+    /// The request's exclusive end, in nanoseconds.
+    pub end: Option<i64>,
+    /// The run's inputs, before the service clamps them.
+    pub request: ravel_sql::esql::EsqlRequest,
+}
+
+/// What [`QueryService::esql_execute`] returns: the statement's outcome, the
+/// cost it was recorded under (zero for a `ROW` statement, which reads no
+/// store), and the wall time of the audit wait.
+#[cfg(feature = "esql")]
+pub struct EsqlExecution {
+    pub outcome: ravel_sql::esql::EsqlOutcome,
+    pub accounting: QueryAccountingSnapshot,
+    pub estimate: CostEstimate,
     pub audit_elapsed: std::time::Duration,
 }
 
