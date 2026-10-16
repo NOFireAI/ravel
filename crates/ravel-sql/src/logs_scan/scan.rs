@@ -1606,13 +1606,17 @@ impl LogScanStream {
                             this.current_footer = footer.clone();
                             let open_dirs = dirs.as_ref().map(|c| Arc::clone(&c.dirs));
                             this.current_dirs = dirs;
-                            // Moved, not cloned: this stream consumes the carried
-                            // whole object exactly once, by whichever open below
-                            // `take()`s it first. A later `ReopenRows` reopen
-                            // must see `None` and pay for its own fetch (real GET
-                            // or read-cache hit), or `tenant_bytes_with_footer`
-                            // charges `add_bytes_reused` twice for one buffer
-                            // (issue #835 follow-up).
+                            // Moved, not cloned: this `OwnedSeg` open consumes its
+                            // carried whole object exactly once, by whichever open
+                            // below `take()`s it first. Under `global_deal` a
+                            // stream can reach this transition several times for
+                            // the same segment, one `OwnedSeg` at a time, each
+                            // with its own carry. A later `ReopenRows` reopen of
+                            // the SAME `OwnedSeg` must see `None` and pay for its
+                            // own fetch (real GET or read-cache hit), or
+                            // `tenant_bytes_with_footer` charges
+                            // `add_bytes_reused` twice for one buffer (issue #835
+                            // follow-up).
                             this.current_whole_object = whole_object;
                             this.current_unplanned = unplanned;
                             this.retrying = false;
