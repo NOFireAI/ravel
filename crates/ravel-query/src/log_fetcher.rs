@@ -14598,12 +14598,12 @@ mod version_refusal_tests {
 
     /// GET requests and wire bytes per phase, from the fetcher's wire counter,
     /// in `QueryPhase::ALL` order.
-    fn wire(f: &LogSegmentFetcher) -> [(u64, u64); 4] {
+    fn wire(f: &LogSegmentFetcher) -> [(u64, u64); QueryPhase::ALL.len()] {
         let snap = f.phase_wire_byte_counter().snapshot();
         QueryPhase::ALL.map(|p| (snap.phase_requests(p), snap.phase(p)))
     }
 
-    fn only(phase: QueryPhase, requests: u64, bytes: u64) -> [(u64, u64); 4] {
+    fn only(phase: QueryPhase, requests: u64, bytes: u64) -> [(u64, u64); QueryPhase::ALL.len()] {
         QueryPhase::ALL.map(|p| {
             if p == phase {
                 (requests, bytes)

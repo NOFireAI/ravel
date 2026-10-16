@@ -22,7 +22,7 @@ use ravel_commit::keys;
 use ravel_maintain::{CompactorConfig, FixedClock, compact_bucket};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{GetRange, ObjectStoreBackend, list_all};
-use ravel_rspan::SpanRecord;
+use ravel_rspan::{SpanRecord, TraceKeyProbe};
 use uuid::Uuid;
 
 const EPOCH: u64 = 10;
@@ -307,9 +307,18 @@ async fn v5_key_idx_rebuilt_from_compacted_records() {
     assert_eq!(key_idx.prefix_len, rebuilt.prefix_len, "KEY_IDX prefix_len");
 
     let reader = RspanReader::new(part, &RspanConfig::default()).expect("reader");
-    assert_eq!(reader.probe_trace(&[32; 16]).unwrap(), Some(vec![0, 1]));
-    assert_eq!(reader.probe_trace(&[0; 16]).unwrap(), Some(vec![0]));
-    assert_eq!(reader.probe_trace(&[41; 16]).unwrap(), Some(vec![1]));
+    assert_eq!(
+        reader.probe_trace(&[32; 16]).unwrap(),
+        TraceKeyProbe::Present(vec![0, 1])
+    );
+    assert_eq!(
+        reader.probe_trace(&[0; 16]).unwrap(),
+        TraceKeyProbe::Present(vec![0])
+    );
+    assert_eq!(
+        reader.probe_trace(&[41; 16]).unwrap(),
+        TraceKeyProbe::Present(vec![1])
+    );
 }
 
 #[tokio::test]

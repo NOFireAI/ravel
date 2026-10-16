@@ -10,7 +10,9 @@
 //! [`ravel_rspan::SpanQuery`] (the trace fast path when a `trace_id =` equality
 //! was pushed, else a bare window scan) plus the optional `service_name`/`name`
 //! bloom-probe literals (ADR-0054, per-block bloom pruning), and builds a single
-//! [`SpansScanExec`] leaf.
+//! [`SpansScanExec`] leaf. A `trace_id =` equality also drops every segment the
+//! trace cannot route to under its hour's shard counts (ADR-2707 decision 7),
+//! when the resolve supplied the tenant's shard generations.
 //!
 //! `supports_filters_pushdown` returns `Inexact` for every filter, exactly like
 //! the logs provider: DataFusion always re-applies the originals above the
@@ -30,7 +32,7 @@ use datafusion::physical_expr::expressions::col;
 use datafusion::physical_plan::ExecutionPlan;
 #[cfg(feature = "flight-sql")]
 use datafusion::physical_plan::projection::ProjectionExec;
-use ravel_catalog::{SegmentRef, Snapshot};
+use ravel_catalog::{DEFAULT_SCAN_SLACK_HOURS, SegmentRef, ShardGeneration, Snapshot};
 #[cfg(feature = "flight-sql")]
 use ravel_query::ByteLimit;
 use ravel_query::PhaseAccounting;
@@ -67,6 +69,11 @@ pub struct SpansTableProvider {
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `SpansScanExec` the provider builds.
     erasure: Arc<Vec<ErasurePredicate>>,
+    /// The tenant's shard-generation history, read by the same resolve that
+    /// produced `snapshot`. A `trace_id` equality drops a segment whose shard
+    /// no admitted generation routes the trace to (ADR-2707 decision 7).
+    /// Empty, the default, routes nothing out.
+    shard_generations: Arc<Vec<ShardGeneration>>,
     /// The coordinator-side distributed fan-out (ADR-0071; #327, T6b). `None` --
     /// the default, and every non-Flight build -- is the local scan path
     /// unchanged. Reuses the signal-neutral [`DistributedRlogContext`], which
@@ -94,9 +101,19 @@ impl SpansTableProvider {
             schema: spans_schema(),
             accounting: PhaseAccounting::pooled_over(&accounting),
             erasure,
+            shard_generations: Arc::new(Vec::new()),
             #[cfg(feature = "flight-sql")]
             distributed: None,
         }
+    }
+
+    /// Route a `trace_id` lookup by shard over `generations`, the tenant's
+    /// shard-generation history as the snapshot's resolve read it. Without
+    /// it no segment is routed out.
+    #[must_use]
+    pub fn with_shard_generations(mut self, generations: Vec<ShardGeneration>) -> Self {
+        self.shard_generations = Arc::new(generations);
+        self
     }
 
     /// Record every scan's reads on `phases`, split by the phase that issued
@@ -226,7 +243,7 @@ impl SpansTableProvider {
         pushdown: &SpansPushdown,
         projection: Option<Vec<usize>>,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let segments = self.pruned_segments(pushdown);
+        let (segments, routed_out) = self.pruned_segments(pushdown);
         let scan = SpansScanExec::new(
             self.tenant_hash,
             self.fetcher.clone(),
@@ -241,25 +258,51 @@ impl SpansTableProvider {
             projection,
             QueryAccounting::new(),
         )?
-        .with_phase_accounting(self.accounting.clone());
+        .with_phase_accounting(self.accounting.clone())
+        .with_segments_pruned_by_routing(routed_out);
         Ok(Arc::new(scan))
     }
 
-    /// Segments whose event-time span overlaps the extracted ts window.
-    /// Widen-only: a segment is dropped only when its whole span lies outside
-    /// the proven-required window (via [`SpanSegmentFetcher::ts_range_relevant`],
-    /// the same catalog-summary check `fetch` uses); with no bound, every
-    /// segment is kept. Finer pruning -- by trace_id range and per-block time
-    /// interval -- is the reader's skip index, at block granularity inside each
-    /// object, so it is not (and need not be) reproduced here.
-    fn pruned_segments(&self, pushdown: &SpansPushdown) -> Vec<SegmentRef> {
+    /// Segments whose event-time span overlaps the extracted ts window and,
+    /// for a `trace_id` equality, whose shard the trace can route to, with
+    /// the count of ts-relevant segments dropped by routing.
+    ///
+    /// Widen-only: a segment is dropped by time only when its whole span lies
+    /// outside the proven-required window (via
+    /// [`SpanSegmentFetcher::ts_range_relevant`], the same catalog-summary
+    /// check `fetch` uses), and by routing only when no generation admitted
+    /// for its ingest-hour bucket maps the trace to its shard (via
+    /// [`SpanSegmentFetcher::trace_may_route_to`], with
+    /// [`DEFAULT_SCAN_SLACK_HOURS`], the slack the catalog's own scan rule
+    /// uses). Finer pruning, by the object's KEY_IDX and per-block time
+    /// interval, is the reader's, inside each object.
+    fn pruned_segments(&self, pushdown: &SpansPushdown) -> (Vec<SegmentRef>, usize) {
         let (ts_min, ts_max) = (pushdown.ts_min(), pushdown.ts_max());
-        self.snapshot
+        let trace_id = pushdown.span_query().trace_id;
+        let mut routed_out = 0;
+        let kept = self
+            .snapshot
             .segments
             .iter()
             .filter(|s| SpanSegmentFetcher::ts_range_relevant(s, ts_min, ts_max))
+            .filter(|s| {
+                let Some(trace_id) = &trace_id else {
+                    return true;
+                };
+                let may = SpanSegmentFetcher::trace_may_route_to(
+                    s,
+                    trace_id,
+                    &self.shard_generations,
+                    DEFAULT_SCAN_SLACK_HOURS,
+                );
+                if !may {
+                    routed_out += 1;
+                }
+                may
+            })
             .cloned()
-            .collect()
+            .collect();
+        (kept, routed_out)
     }
 }
 

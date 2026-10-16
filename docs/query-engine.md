@@ -2760,7 +2760,7 @@ figure alone cannot say which stage is responsible for a runaway
 request count.
 
 `crates/ravel-query/src/phase_accounting.rs`'s `PhaseAccounting` wraps
-four independent `QueryAccounting` handles, one per phase, using this
+five independent `QueryAccounting` handles, one per phase, using this
 doc's own vocabulary:
 
 - **resolve** -- the catalog snapshot resolve's commit-record GETs
@@ -2775,16 +2775,20 @@ doc's own vocabulary:
 - **scan** -- the actual block/page/chunk data reads
   (`SegmentFetcher::fetch_scalar_pages`/`fetch_histogram_pages`,
   `LogSegmentFetcher::scan_accounted_with_tenant`).
+- **keyIndex** -- the KEY_IDX prefix and bucket reads of a spans
+  `trace_id =` lookup (`SpanSegmentFetcher`'s ranged trace path, ADR-2707
+  decision 5). The store's GET latency histogram has no key-index slot, so
+  these reads are timed there under `probe`.
 
 Decode (turning fetched bytes into typed samples/rows) is deliberately
-not a fifth phase: it issues no store request, so it has nothing to
+not a sixth phase: it issues no store request, so it has nothing to
 attribute a request or wire-byte counter to. Its own byte figures
 (`decompressed_bytes`, `page_bytes_fetched`/`page_bytes_decoded`) stay on
 whichever handle its call site is passed -- by convention the `scan`
 handle, since decode always follows a scan in this crate's fetch
 pipelines.
 
-`PhaseAccountingSnapshot::pooled()` sums all four phases back to one
+`PhaseAccountingSnapshot::pooled()` sums all five phases back to one
 pooled number: `QueryStats::accounting` is computed as
 `phase_accounting.pooled()`. `QueryStats` additionally carries the
 full `phase_accounting: PhaseAccountingSnapshot` for callers that want
@@ -3046,9 +3050,10 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   per `QueryPhase`, in
   `QueryPhase::ALL` order, each phase present one time only: `resolve` (catalog
   snapshot resolve), `plan` (footer and skip-index probing), `probe`
-  (segment catalog fetch), `scan` (block and page data reads). The
-  rendering iterates `QueryPhase::ALL`, so a phase added to the enum
-  cannot be silently dropped. Per-phase fields: `phase`,
+  (segment catalog fetch), `scan` (block and page data reads), `keyIndex`
+  (the KEY_IDX reads of a spans `trace_id =` lookup; 0 on every other
+  statement). The rendering iterates `QueryPhase::ALL`, so a phase added to
+  the enum cannot be silently dropped. Per-phase fields: `phase`,
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
   `cacheMisses`, `cacheServedBytes`, `decompressedOutputBytes`,
   `reusedRegionBytes`, `segmentsOpened`, `seriesMatched`.
@@ -3162,6 +3167,16 @@ and block-level reported independently:
 - `segmentsPrunedByStats`: segments a logs scan skipped before any fetch
   because a typed attribute column's stamped statistics excluded a
   pushed-down predicate (ADR-2121 D1).
+- `segmentsPrunedByKeyIndex`: segments a spans `trace_id =` lookup read no
+  blocks of because their KEY_IDX section proved the trace absent
+  (ADR-2707 decision 5).
+- `blocksPrunedByKeyIndex`: blocks the skip index kept for that lookup and
+  KEY_IDX ruled out. On a writer-sorted object the skip index already keeps
+  only the trace's blocks, so this is usually 0.
+- `segmentsPrunedByRouting`: segments of the resolved snapshot a spans
+  `trace_id =` lookup never read because the trace cannot route to their
+  shard under any shard count their ingest hour is scanned under (ADR-2707
+  decision 7; see "Bounded trace reads" in `docs/guides/traces.md`).
 - `blocksTotal`: blocks a logs scan saw in the segments it read.
 - `blocksScanned`: of those, blocks it read.
 - `blocksPrunedByPostings`: blocks POSTINGS ruled out.
@@ -3182,7 +3197,9 @@ and block-level reported independently:
 - `rowsPredicateEvaluated`: rows of the other scanned blocks, which the
   predicate's remaining arms evaluated a block at a time.
 
-All eight counts after `segments` are 0 for a statement with no logs scan.
+The three key-index and routing counts are 0 for a statement with no spans
+`trace_id =` lookup and are sums over every spans scan in the plan. The
+other eight counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
 while `segments` counts the one snapshot all of them read. With one scan,
 `segmentsPrunedByStats` is a subset of `segments`; with two, each scan
@@ -3190,6 +3207,8 @@ prunes the same snapshot on its own, so the sum can exceed `segments`, and a
 block both scans read counts in `blocksTotal` twice.
 `services/ravel-server/tests/sql_declared_prune_reachability_e2e.rs` drives
 both pruning levels through `POST /api/v1/sql`.
+`services/ravel-server/tests/spans_trace_key_index_routing.rs` drives the
+three key-index and routing counts the same way.
 
 Neither object reaches the Arrow-IPC encoding or Flight SQL, for the reasons
 given above. The MCP `sql_execute` tool's envelope renders neither, and it
@@ -4598,6 +4617,11 @@ prune and is evaluated as a residual only:
   `SpanQuery::trace` lookup, and the skip index drops every block whose
   `[min_trace_id, max_trace_id]` range excludes the target: a bounded
   single-trace scan instead of a full window scan.
+  Each object the skip index keeps is probed in its KEY_IDX section first, and
+  one that does not hold the trace is not read further; objects whose shard
+  the trace cannot route to under any shard count of their ingest hour are
+  not read at all (ADR-2707 decisions 5 and 7, reported in `stats.pruning`
+  and the `keyIndex` phase above).
 - `start_ts` / `end_ts` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and
   `BETWEEN`): both columns fold into one inclusive `[ts_min, ts_max]` window
   the reader prunes blocks against by time-interval overlap. Folding both

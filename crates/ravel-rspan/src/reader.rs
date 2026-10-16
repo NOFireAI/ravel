@@ -13,7 +13,7 @@ use ravel_codec::bloom_section::BloomSection;
 use crate::block::{DEFAULT_MAX_UNCOMP, read_block};
 use crate::error::SpanSegError;
 use crate::footer::{SpanFooter, kind, open, read_section};
-use crate::key_index::{self, KeyIdxSummary};
+use crate::key_index::{self, KeyIdxSummary, TraceKeyProbe};
 use crate::record::SpanRecord;
 use crate::skip_index::SkipIndex;
 use crate::writer::RspanConfig;
@@ -132,9 +132,8 @@ impl<'a> RspanReader<'a> {
     /// ascending: every block holding a trace whose first 8 bytes equal
     /// `trace_id`'s. Reads `[0, prefix_len)` of the section and then the one
     /// bucket the trace mixes to. An ordinal at or past the block count
-    /// anywhere in that bucket is `Corrupted`. `Ok(None)` only when the section
-    /// declines the probe.
-    pub fn probe_trace(&self, trace_id: &[u8; 16]) -> Result<Option<Vec<u32>>, SpanSegError> {
+    /// anywhere in that bucket is `Corrupted`.
+    pub fn probe_trace(&self, trace_id: &[u8; 16]) -> Result<TraceKeyProbe, SpanSegError> {
         let section = self.key_idx;
         key_index::probe(
             section.len() as u64,
@@ -764,7 +763,7 @@ mod tests {
     }
 
     /// Probes `trace` through both readers of `obj`.
-    fn probe_both(obj: &[u8], trace: &[u8; 16]) -> [Result<Option<Vec<u32>>, SpanSegError>; 2] {
+    fn probe_both(obj: &[u8], trace: &[u8; 16]) -> [Result<TraceKeyProbe, SpanSegError>; 2] {
         let whole = RspanReader::new(obj, &RspanConfig::default())
             .expect("a KEY_IDX naming any ordinal still opens")
             .probe_trace(trace);
@@ -827,7 +826,10 @@ mod tests {
 
         let obj = two_block_object(&[(probed, BLOCK_COUNT - 1), (neighbour, 0)]);
         for got in probe_both(&obj, &probed) {
-            assert_eq!(got.expect("in-range ordinal"), Some(vec![BLOCK_COUNT - 1]));
+            assert_eq!(
+                got.expect("in-range ordinal"),
+                TraceKeyProbe::Present(vec![BLOCK_COUNT - 1])
+            );
         }
     }
 
@@ -860,7 +862,7 @@ mod tests {
                     .ok_or_else(|| SpanSegError::Corrupted("test read past the object".into()))
             })
             .expect("probe");
-        assert_eq!(got, Some(vec![]));
+        assert_eq!(got, TraceKeyProbe::Absent);
         assert_eq!(
             reads,
             vec![key_idx.offset..key_idx.offset + u64::from(key_idx.prefix_len)]
@@ -1021,7 +1023,7 @@ mod proptests {
                 let want: Vec<u32> = (0..block_keys.len() as u32)
                     .filter(|&b| block_keys[b as usize].contains(&key8(&s.trace_id)))
                     .collect();
-                prop_assert_eq!(reader.probe_trace(&s.trace_id).expect("probe"), Some(want));
+                prop_assert_eq!(reader.probe_trace(&s.trace_id).expect("probe"), TraceKeyProbe::Present(want));
             }
 
             let mut want: Vec<SpanRecord> = spans.into_iter().map(canonicalize).collect();

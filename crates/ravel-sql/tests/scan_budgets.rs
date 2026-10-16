@@ -478,16 +478,16 @@ async fn max_s3_requests_rejects_before_every_segment_is_fetched() {
     );
 }
 
-/// A `PhaseAccounting` built by `pooled_over` has four phases that are clones
+/// A `PhaseAccounting` built by `pooled_over` has five phases that are clones
 /// of one shared `QueryAccounting`, so reducing its snapshot with
-/// `.pooled()` reads that one counter four times and reports 4x the real
+/// `.pooled()` reads that one counter five times and reports 5x the real
 /// total. `RsegScanExec`'s S3-request budget check must cost an aliased
 /// handle exactly like an independent one: the real GET count cannot depend
 /// on which `PhaseAccounting` constructor built the handle it was given.
 /// This fixture issues exactly one GET per segment (confirmed by
 /// `max_s3_requests_rejects_before_every_segment_is_fetched` above), so a
 /// budget of 6 comfortably fits the 5 real GETs both handles must issue;
-/// pre-fix, the aliased handle's 4x-inflated reduction reports 8 after only
+/// pre-fix, the aliased handle's 5x-inflated reduction reports 10 after only
 /// 2 real GETs and trips early.
 #[tokio::test]
 async fn pooled_over_handle_does_not_quadruple_count_the_request_budget() {
@@ -549,7 +549,7 @@ async fn pooled_over_handle_does_not_quadruple_count_the_request_budget() {
         acc.snapshot().total_s3_requests(),
         5,
         "the real, non-aliased request total behind the aliased handle must equal \
-         the split handle's real total (5), not 4x it (20)"
+         the split handle's real total (5), not 5x it (25)"
     );
 }
 
@@ -565,7 +565,7 @@ async fn pooled_over_handle_does_not_quadruple_count_the_bytes_scanned_budget() 
     // Learn the real total bytes scanned across all 5 segments, the same way
     // `max_bytes_scanned_rejects_before_every_segment_is_fetched` sizes its
     // cap, then use that exact total as the budget: not exceeded by the real
-    // total, but exceeded by a 4x-inflated pooled reduction partway through.
+    // total, but exceeded by a 5x-inflated pooled reduction partway through.
     let probe_store = CountingStore::wrap(raw_store.clone());
     let probe_fetcher =
         SegmentFetcher::new(Arc::clone(&probe_store) as Arc<dyn ObjectStoreBackend>);
@@ -640,7 +640,7 @@ async fn pooled_over_handle_does_not_quadruple_count_the_bytes_scanned_budget() 
         acc.snapshot().total_s3_bytes(),
         total_bytes,
         "the real byte total behind the aliased handle must equal the split \
-         handle's real total, not 4x it"
+         handle's real total, not 5x it"
     );
 }
 

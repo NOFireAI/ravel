@@ -18,7 +18,7 @@ use proptest::prelude::*;
 use ravel_rspan::footer::{DEFAULT_MAX_SECTION_UNCOMP, kind, write_footer_and_trailer};
 use ravel_rspan::{
     ObjectIdentity, RspanConfig, RspanRangeReader, RspanReader, RspanWriter, SpanQuery, SpanRecord,
-    SpanSegError, StatusCode, open, read_section,
+    SpanSegError, StatusCode, TraceKeyProbe, open, read_section,
 };
 
 fn cases() -> u32 {
@@ -246,10 +246,12 @@ fn check_probe_answer(
     original: &[u8],
     mutated: &[u8],
     trace: &[u8; 16],
-    answer: Option<Vec<u32>>,
+    answer: TraceKeyProbe,
 ) -> Result<(), TestCaseError> {
-    let Some(blocks) = answer else {
-        return Ok(());
+    let blocks = match answer {
+        TraceKeyProbe::Absent => Vec::new(),
+        TraceKeyProbe::Present(blocks) => blocks,
+        TraceKeyProbe::Declined => return Ok(()),
     };
     let named: BTreeSet<u32> = blocks.iter().copied().collect();
     prop_assert!(
@@ -477,11 +479,13 @@ fn identity_roundtrip() {
     let ranged = range_reader(&object).expect("ranged");
     for trace in probed_traces() {
         let want: Vec<u32> = true_blocks(&object, &trace).into_iter().collect();
-        assert_eq!(
-            reader.probe_trace(&trace).expect("probe"),
-            Some(want.clone())
-        );
+        let want = if want.is_empty() {
+            TraceKeyProbe::Absent
+        } else {
+            TraceKeyProbe::Present(want)
+        };
+        assert_eq!(reader.probe_trace(&trace).expect("probe"), want);
         let read = |r: Range<u64>| Ok::<_, SpanSegError>(&object[r.start as usize..r.end as usize]);
-        assert_eq!(ranged.probe_trace(&trace, read).expect("probe"), Some(want));
+        assert_eq!(ranged.probe_trace(&trace, read).expect("probe"), want);
     }
 }

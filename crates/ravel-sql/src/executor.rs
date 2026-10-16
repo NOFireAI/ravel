@@ -103,7 +103,7 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
-use ravel_catalog::{Catalog, Snapshot};
+use ravel_catalog::{Catalog, ShardGeneration, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
@@ -262,6 +262,10 @@ struct Resolved {
     unfolded_segments_resolved: u64,
     target: TargetSignal,
     parquet: Option<ParquetResolution>,
+    /// The shard-generation history this resolve computed its scan set from;
+    /// the spans provider routes a trace lookup by it. Empty for a Parquet
+    /// resolve, which reads no generation history.
+    shard_generations: Vec<ShardGeneration>,
 }
 
 /// The coordinator-side distributed samples scan for one query: the minted
@@ -308,6 +312,10 @@ struct PlanExtras {
     /// The Parquet tables the statement reads, when its resolve already
     /// resolved them.
     parquet: ParquetPlan,
+    /// The shard-generation history the snapshot was resolved under, for the
+    /// spans provider's trace routing. Empty routes nothing out, which is
+    /// what the entry points planning an already-resolved snapshot pass.
+    shard_generations: Vec<ShardGeneration>,
 }
 
 /// One SQL request, fully resolved from its transport.
@@ -412,6 +420,26 @@ pub struct SqlStats {
     /// prunes the same snapshot again, so the sum can exceed it. Zero for a
     /// metrics query and for a logs plan with no scan node.
     pub segments_pruned_by_stats: u64,
+    /// Spans segments a `trace_id` equality lookup opened and then read no
+    /// block of, because the object's KEY_IDX section says the trace is absent
+    /// (ADR-2707 decision 5), read off the spans scans'
+    /// `segments_pruned_by_key_index` counter. Counted within
+    /// [`Self::segments`]. Zero for any other query.
+    pub segments_pruned_by_key_index: u64,
+    /// Skip-index candidate blocks of the spans segments such a lookup did
+    /// read that KEY_IDX named no entry for, read off the spans scans'
+    /// `blocks_pruned_by_key_index` counter. An object the writer laid out in
+    /// trace order has no such block, so this is zero on every object the
+    /// writer produced; an absent trace's segment is counted in
+    /// [`Self::segments_pruned_by_key_index`], not here.
+    pub blocks_pruned_by_key_index: u64,
+    /// Spans segments a `trace_id` equality lookup left out of the snapshot
+    /// before any fetch because their shard is not the one the trace routes
+    /// to under any shard count provisioned for their ingest hour (ADR-2707
+    /// decision 7), read off the spans scans' `segments_pruned_by_routing`
+    /// counter. Counted within [`Self::segments`], which is the resolved
+    /// snapshot before routing. Zero for any other query.
+    pub segments_pruned_by_routing: u64,
     /// Blocks of opened segments, and owned segments never opened, that the
     /// successful attempt's logs scans skipped because their minimum `ts` was
     /// above an `ORDER BY ts ... LIMIT k` TopK's threshold (ADR-2677 decision
@@ -669,6 +697,9 @@ struct BlockCounts {
     scanned: u64,
     pruned_by_postings: u64,
     segments_pruned_by_stats: u64,
+    segments_pruned_by_key_index: u64,
+    blocks_pruned_by_key_index: u64,
+    segments_pruned_by_routing: u64,
     blocks_skipped_by_threshold: u64,
     segments_skipped_by_threshold: u64,
     int_values_buffers: u64,
@@ -690,8 +721,11 @@ struct BlockCounts {
 /// descendants, plus the metrics scan's `histogram_series_skipped`. Only
 /// `LogsScanExec` publishes the first ten names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
-/// nested it, and a plan carrying neither scan contributes nothing. Reads the
-/// counters the scans already maintain rather than counting a second time.
+/// nested it, and a plan carrying neither scan contributes nothing. The
+/// `segments_pruned_by_key_index`, `blocks_pruned_by_key_index` and
+/// `segments_pruned_by_routing` sums come from `SpansScanExec`
+/// (crate::spans_scan) the same way. Reads the counters the scans already
+/// maintain rather than counting a second time.
 fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
     // One walk, one `metrics()` call per node: that call clones the node's
     // whole `MetricsSet` out of its mutex, and with the per-segment timeline on
@@ -709,6 +743,9 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.scanned += sum("blocks_scanned");
         counts.pruned_by_postings += sum("blocks_pruned_by_postings");
         counts.segments_pruned_by_stats += sum("segments_pruned_by_stats");
+        counts.segments_pruned_by_key_index += sum("segments_pruned_by_key_index");
+        counts.blocks_pruned_by_key_index += sum("blocks_pruned_by_key_index");
+        counts.segments_pruned_by_routing += sum("segments_pruned_by_routing");
         counts.blocks_skipped_by_threshold += sum("blocks_skipped_by_threshold");
         counts.segments_skipped_by_threshold += sum("segments_skipped_by_threshold");
         counts.int_values_buffers += sum("int_values_buffers");
@@ -1559,7 +1596,7 @@ impl SqlExecutor {
         // `explain` keeps the pre-#1367 pooled `&QueryAccounting` signature
         // (`ExplainReport` carries no phase or I/O-shape breakdown; only
         // `SqlOutcome`, from `execute`/`run`, does): `pooled_over` wraps it in
-        // a `PhaseAccounting` whose four phases are clones of the same
+        // a `PhaseAccounting` whose five phases are clones of the same
         // shared handle, so every store call below still lands on the
         // caller's own `accounting`, just under the API the shared
         // `resolve_admitted`/`plan_pinned_with` now take.
@@ -1577,6 +1614,7 @@ impl SqlExecutor {
             estimate,
             target,
             parquet,
+            shard_generations,
             ..
         } = self
             .resolve_admitted(tenant_hash, statement, req, &phase_accounting)
@@ -1598,6 +1636,7 @@ impl SqlExecutor {
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
+                    shard_generations,
                 },
             )
             .await?;
@@ -1677,6 +1716,7 @@ impl SqlExecutor {
                 unfolded_segments_resolved,
                 target,
                 parquet,
+                shard_generations,
                 ..
             } = self
                 .resolve(tenant_hash, statement, req, &phase_accounting)
@@ -1709,6 +1749,7 @@ impl SqlExecutor {
                     &phase_accounting,
                     &declared,
                     parquet,
+                    shard_generations,
                 )
                 .await;
             stats.batches_emitted += emitted;
@@ -1729,6 +1770,9 @@ impl SqlExecutor {
                     stats.blocks_scanned = blocks.scanned;
                     stats.blocks_pruned_by_postings = blocks.pruned_by_postings;
                     stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
+                    stats.segments_pruned_by_key_index = blocks.segments_pruned_by_key_index;
+                    stats.blocks_pruned_by_key_index = blocks.blocks_pruned_by_key_index;
+                    stats.segments_pruned_by_routing = blocks.segments_pruned_by_routing;
                     stats.blocks_skipped_by_threshold = blocks.blocks_skipped_by_threshold;
                     stats.segments_skipped_by_threshold = blocks.segments_skipped_by_threshold;
                     stats.int_values_buffers = blocks.int_values_buffers;
@@ -1817,7 +1861,7 @@ impl SqlExecutor {
         // Kept on the pooled `&QueryAccounting` signature (this is the public
         // Flight SQL `GetFlightInfo`-side resolve, and its caller has no
         // phase-split handle to hand in): `pooled_over` shares this same
-        // handle's counters across all four phases, so the resolve's cost
+        // handle's counters across all five phases, so the resolve's cost
         // still lands on `accounting` exactly as before.
         let Resolved {
             snapshot,
@@ -1917,6 +1961,7 @@ impl SqlExecutor {
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
                 parquet: inputs.parquet,
+                shard_generations: Vec::new(),
             },
         )
         .await
@@ -1956,6 +2001,7 @@ impl SqlExecutor {
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
                 parquet: inputs.parquet,
+                shard_generations: Vec::new(),
             },
         )
         .await
@@ -2243,7 +2289,8 @@ impl SqlExecutor {
                     self.span_fetcher.clone(),
                     phase_accounting.scan().clone(),
                 )
-                .with_phase_accounting(phase_accounting.clone()),
+                .with_phase_accounting(phase_accounting.clone())
+                .with_shard_generations(extras.shard_generations),
             )),
             // The two RLOG-backed tables (ADR-1101 decision 1) read through the
             // executor's existing `log_fetcher`: an alert and an audit record
@@ -2626,6 +2673,7 @@ impl SqlExecutor {
                 unfolded_segments_resolved: 0,
                 target: TargetSignal::Parquet,
                 parquet: Some(resolution),
+                shard_generations: Vec::new(),
             });
         }
         let target = tables.signal.unwrap_or(TargetSignal::Metrics);
@@ -2662,9 +2710,9 @@ impl SqlExecutor {
         let catalog_requests = self
             .catalog
             .estimated_catalog_requests(req.window, req.now_ns);
-        let (snapshot, origins) = self
+        let (snapshot, origins, shard_generations) = self
             .catalog
-            .resolve_pruned_with_admission(
+            .resolve_pruned_with_generations(
                 &tenant_hash,
                 signal,
                 req.window,
@@ -2750,6 +2798,7 @@ impl SqlExecutor {
             unfolded_segments_resolved,
             target,
             parquet: None,
+            shard_generations,
         })
     }
 
@@ -3417,6 +3466,7 @@ impl SqlExecutor {
         phase_accounting: &PhaseAccounting,
         declared: &[DeclaredColumn],
         parquet: Option<ParquetResolution>,
+        shard_generations: Vec<ShardGeneration>,
     ) -> (
         Result<QueryOutput, SqlError>,
         usize,
@@ -3442,6 +3492,7 @@ impl SqlExecutor {
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
+                    shard_generations,
                 },
             )
             .await

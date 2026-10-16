@@ -660,9 +660,9 @@ async fn prepare_partition(
         // `pooled_snapshot()`, not `snapshot().pooled()`: this handle can be
         // `PhaseAccounting::pooled_over` a single shared `QueryAccounting`
         // (see `executor.rs`'s `plan_pinned`/`plan_pinned_distributed`/
-        // `worker_fragment_stream`), whose four phases are clones of one
-        // counter. Summing four snapshots of that one counter would report
-        // 4x the real total.
+        // `worker_fragment_stream`), whose five phases are clones of one
+        // counter. Summing five snapshots of that one counter would report
+        // 5x the real total.
         let scanned = phase_accounting.pooled_snapshot().total_s3_bytes();
         if max_bytes_scanned.is_exceeded_by(scanned) {
             let max = match max_bytes_scanned {
