@@ -649,7 +649,9 @@ impl QueryService {
     /// reads no catalog and no tenant configuration, and writes no audit or
     /// usage record, the same as a request body that is not JSON. Binding needs
     /// the tenant's declared log columns, which is a store read, so it runs
-    /// after admission, inside the usage guard, like the run itself.
+    /// after admission, inside the usage guard and the request's deadline,
+    /// like the run itself: a stalled tenant-configuration read ends in the
+    /// same timeout error a stalled SQL run does.
     ///
     /// The run's row cap is [`ravel_sql::esql::MAX_LIMIT`], whatever the
     /// request asked for.
@@ -696,7 +698,8 @@ impl QueryService {
 
         let span = query_span("esql_query", tenant_hash);
         let mut window = None;
-        let result = async {
+        let millis = u64::try_from(request.deadline.as_millis()).unwrap_or(u64::MAX);
+        let run = async {
             let declared = if reads_logs {
                 state
                     .executor
@@ -714,10 +717,14 @@ impl QueryService {
             let prepared = ravel_sql::esql::prepare(text, &limits, &ctx)?;
             window = prepared.window();
             ravel_sql::esql::execute(&state.executor, tenant_hash, &prepared, &request, &live).await
-        }
-        .instrument(span.clone())
-        .await
-        .map_err(|err| ServiceError::from_esql(err, text, tenant_hash));
+        };
+        let result = tokio::time::timeout(request.deadline, run)
+            .instrument(span.clone())
+            .await
+            .unwrap_or(Err(ravel_sql::esql::EsqlError::Execution(
+                ravel_sql::SqlError::DeadlineExceeded { millis },
+            )))
+            .map_err(|err| ServiceError::from_esql(err, text, tenant_hash));
 
         let cost_of = |outcome: &ravel_sql::esql::EsqlOutcome| match &outcome.run {
             ravel_sql::esql::EsqlRun::Catalog(outcome) => (outcome.accounting, outcome.estimate),

@@ -1399,6 +1399,114 @@ async fn esql_parse_error_takes_no_permit_and_reads_no_store() {
     assert_eq!(h.admission.in_flight(), 0);
 }
 
+/// One ES|QL statement at the fixed clock's now, with `deadline` as its wall
+/// deadline and nothing else asked for.
+#[cfg(feature = "esql")]
+fn esql_query(text: &str, deadline: Duration) -> crate::service::EsqlQuery {
+    crate::service::EsqlQuery {
+        query: text.to_string(),
+        now_ns: NOW_NS,
+        start: None,
+        end: None,
+        request: ravel_sql::esql::EsqlRequest {
+            min_tokens: Vec::new(),
+            deadline,
+            budgets: None,
+            max_rows: None,
+        },
+    }
+}
+
+/// [`harness`] over a store whose every tenant-configuration GET is held until
+/// released, with the SQL executor resolving declared columns through that
+/// store the way a serving process does. The handle is the hold.
+#[cfg(feature = "esql")]
+fn harness_with_held_tenant_config() -> (Harness, GateHandle) {
+    let store = Arc::new(FaultStore::new(MemoryStore::new(), FaultPlan::empty()));
+    let gate = store.hold(
+        Op::Get,
+        Some(ravel_catalog::config_key(&tenant().hash())),
+        Occurrence::Always,
+    );
+    let store: Arc<dyn ObjectStoreBackend> = store;
+    let h = harness(
+        Arc::clone(&store),
+        QueryConcurrencyLimit::Bounded(1),
+        Arc::new(NoopQueryAuditSink),
+        None,
+    );
+    let catalog = Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    let executor = ravel_sql::SqlExecutor::new(
+        catalog,
+        ravel_query::SegmentFetcher::new(Arc::clone(&store)),
+        ravel_query::LogSegmentFetcher::new(Arc::clone(&store)),
+        ravel_sql::SpanSegmentFetcher::new(Arc::clone(&store)),
+        sql_config(),
+        1 << 30,
+    )
+    .with_declared_column_source(Arc::new(
+        crate::declared_columns::TenantConfigDeclaredColumns::new(
+            Default::default(),
+            Arc::clone(&store),
+        ),
+    ));
+    let sql = crate::sql::SqlState {
+        executor: Arc::new(executor),
+        ..h.transports.sql.clone()
+    };
+    let h = Harness {
+        service: h.service.with_sql(sql.clone()),
+        transports: Transports { sql, ..h.transports },
+        ..h
+    };
+    (h, gate)
+}
+
+/// The declared-column read an ES|QL statement over `logs` needs runs inside
+/// the request's deadline, as it does for SQL, whose executor reads it inside
+/// its own timeout. With the tenant-configuration GET held and the clock
+/// paused, the deadline is the only thing that can end either request: both
+/// end in the same timeout error and status, and both give the permit back.
+/// The outer bound turns a read outside the deadline into a failure rather
+/// than a hang.
+#[cfg(feature = "esql")]
+#[tokio::test(start_paused = true)]
+async fn esql_declared_column_read_runs_inside_the_deadline() {
+    let deadline = Duration::from_secs(5);
+    let bound = Duration::from_secs(60);
+
+    let (h, gate) = harness_with_held_tenant_config();
+    let esql = tokio::time::timeout(
+        bound,
+        h.service
+            .esql_execute(h.tenant_hash, &esql_query("FROM logs | LIMIT 1", deadline)),
+    )
+    .await
+    .expect("the request deadline ends a held declared-column read");
+    let esql = err_of(esql);
+    assert!(gate.held_count() >= 1, "the tenant-config read was held");
+    assert_eq!(h.admission.in_flight(), 0);
+
+    let (h, gate) = harness_with_held_tenant_config();
+    let request = ravel_sql::SqlRequest {
+        deadline,
+        ..sql_request("SELECT count(*) FROM logs")
+    };
+    let sql = tokio::time::timeout(bound, h.service.sql_execute(h.tenant_hash, &request))
+        .await
+        .expect("the SQL deadline ends a held declared-column read");
+    let sql = err_of(sql);
+    assert!(gate.held_count() >= 1, "the tenant-config read was held");
+    assert_eq!(h.admission.in_flight(), 0);
+
+    assert_eq!(esql.kind, ServiceErrorKind::Deadline, "{}", esql.message);
+    assert_eq!(esql.status, StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(
+        (esql.kind, esql.status, esql.error_type, esql.message.as_str()),
+        (sql.kind, sql.status, sql.error_type, sql.message.as_str()),
+    );
+}
+
 /// Step 2 on the SQL surface, which used to skip it: `sql_execute` and
 /// `sql_explain` took the request's own deadline and budgets as given and
 /// relied on the HTTP transport having clamped them first.
