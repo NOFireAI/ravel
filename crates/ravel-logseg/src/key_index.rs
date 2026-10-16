@@ -11,9 +11,9 @@
 //!
 //! This writer marks its sections [`RLOG_KEY_IDX_VERSION`]: every declared
 //! value was resolved by the SQL reader's merged-view rule. A section an
-//! earlier writer left at version 1 still reads, probes and verifies, but its
-//! keys may disagree with the reader, so [`section_resolves_like_the_reader`]
-//! is false for it.
+//! earlier writer left at version 1 still reads and verifies, but its keys
+//! may disagree with the reader, so [`section_resolves_like_the_reader`] is
+//! false for it and a probe declines on it.
 
 use std::collections::HashMap;
 use std::ops::Range;
@@ -43,9 +43,10 @@ pub const RLOG_KEY_IDX_VERSION: u8 = KEY_IDX_VERSION_2;
 /// Whether an RLOG KEY_IDX section of header `version` was written by the
 /// reader's resolution rule, so a probe miss on it proves no row's declared
 /// column holds the value. False for a version 1 section: an earlier RLOG
-/// writer let a nested resource or scope entry, or a later scalar, decide a
-/// field's key, so its entries may name a value the column does not hold and
-/// miss one it does.
+/// writer let a top-level `Map` or `List` resource or scope entry claim a
+/// field's name, so a scalar behind it was never keyed, and under a `Bytes`
+/// field it keyed that nested entry's canonical bytes, a value the reader
+/// drops. [`probe_ranged`] and [`probe_source`] decline on such a section.
 pub fn section_resolves_like_the_reader(version: u8) -> bool {
     version == RLOG_KEY_IDX_VERSION
 }
@@ -316,8 +317,11 @@ where
 /// mixes to, skipped when that bucket is empty.
 ///
 /// `Ok(None)` declines (no prune): the object has no KEY_IDX, or its header
-/// does not name `field`, or names it under another key type.
-/// `Ok(Some(blocks))` is the ascending level-0 block ordinals holding the
+/// is at a version [`section_resolves_like_the_reader`] rejects (a version 1
+/// RLOG section, read after its prefix only), or does not name `field`, or
+/// names it under another key type. A caller cannot tell a declined version 1
+/// section from a field it does not name, and does not need to: neither
+/// proves a key absent. `Ok(Some(blocks))` is the ascending level-0 block ordinals holding the
 /// key, empty when the key is absent from the object. An ordinal at or past
 /// the footer's `block_count`, or any grammar violation, is
 /// [`LogSegError::Corrupted`].
@@ -338,6 +342,9 @@ where
     let prefix_range = key_idx_prefix_range(desc.prefix_len, desc.len)?;
     let prefix_bytes = read(absolute(desc, prefix_range)?)?;
     let prefix = KeyIdxPrefix::parse(prefix_bytes.as_ref(), desc.prefix_len, desc.len)?;
+    if !section_resolves_like_the_reader(prefix.version()) {
+        return Ok(None);
+    }
     let Some(bucket) = prefix.locate(field, key_type, key8)? else {
         return Ok(None);
     };
@@ -600,8 +607,8 @@ mod tests {
     }
 
     /// The writer stamps [`RLOG_KEY_IDX_VERSION`]; the same entries under
-    /// version 1 read, probe, verify and name their fields the same, and only
-    /// the predicate tells the two apart.
+    /// version 1 read, verify and name their fields the same, the predicate
+    /// tells the two apart, and a probe declines on version 1.
     #[test]
     fn both_versions_read_alike_and_only_version_two_resolves_like_the_reader() {
         let v2 = object();
@@ -632,16 +639,42 @@ mod tests {
             key_index_fields(&f1, whole(&v1)).expect("v1"),
             key_index_fields(&f2, whole(&v2)).expect("v2")
         );
+        let decoded = |obj: &[u8], footer: &LogFooter| {
+            ravel_codec::key_idx::decode_key_idx(
+                section_of(obj, footer),
+                key_index_section(footer).expect("KEY_IDX").prefix_len,
+            )
+            .expect("decode")
+        };
+        assert_eq!(decoded(&v1, &f1), decoded(&v2, &f2));
+        // Version 1 holds every key version 2 does, and still declines after
+        // reading its prefix alone; version 2 answers.
+        let user_entries = &decoded(&v1, &f1)[0].entries;
         for v in 0..5 {
-            let probe = |obj: &[u8], footer: &LogFooter| {
-                probe_source(footer, obj, "user_id", KeyType::I64, &key8_i64(v)).expect("probe")
-            };
-            assert_eq!(probe(&v1, &f1), probe(&v2, &f2), "value {v}");
+            assert_eq!(
+                user_entries.contains(&(key8_i64(v), v as u32)),
+                v < 4,
+                "value {v}"
+            );
+            let mut reads = Vec::new();
+            let declined = probe_ranged(&f1, "user_id", KeyType::I64, &key8_i64(v), |r| {
+                reads.push(r.clone());
+                Ok::<_, LogSegError>(&v1[r.start as usize..r.end as usize])
+            })
+            .expect("probe v1");
+            assert_eq!(declined, None, "version 1, value {v}");
+            assert_eq!(reads.len(), 1, "version 1 reads the prefix only");
+            assert_eq!(
+                probe_source(&f1, &v1[..], "user_id", KeyType::I64, &key8_i64(v)).expect("v1"),
+                None
+            );
+            let want = if v < 4 { vec![v as u32] } else { Vec::new() };
+            assert_eq!(
+                probe_source(&f2, &v2[..], "user_id", KeyType::I64, &key8_i64(v)).expect("v2"),
+                Some(want),
+                "version 2, value {v}"
+            );
         }
-        assert_eq!(
-            probe_source(&f1, &v1[..], "user_id", KeyType::I64, &key8_i64(2)).expect("probe"),
-            Some(vec![2])
-        );
         // Everything outside the section's version byte, header crc and footer
         // section crc is unchanged.
         let desc = *key_index_section(&f2).expect("KEY_IDX");

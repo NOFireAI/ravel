@@ -1641,6 +1641,28 @@ mod tests {
             corrupted_message(probe_user(&bytes, v2.prefix_len, &a.key));
             corrupted_message(verify_key_idx(&bytes, v2.prefix_len));
         }
+        // Each version byte is accepted on its own, so only the header crc
+        // can tell a v1 section claiming v2 (or the reverse) from a real one.
+        for (section, swapped) in [(v1, KEY_IDX_VERSION_2), (&v2, KEY_IDX_VERSION_1)] {
+            let mut bytes = section.bytes.clone();
+            bytes[0] = swapped;
+            assert_corrupted(
+                probe_user(&bytes, section.prefix_len, &a.key),
+                "header_crc32c mismatch",
+            );
+            assert_corrupted(
+                verify_key_idx(&bytes, section.prefix_len),
+                "header_crc32c mismatch",
+            );
+            assert_corrupted(
+                KeyIdxPrefix::parse(
+                    &bytes[..section.prefix_len as usize],
+                    section.prefix_len,
+                    bytes.len() as u64,
+                ),
+                "header_crc32c mismatch",
+            );
+        }
         for version in [0u8, 3, 255] {
             assert_corrupted(
                 encode_key_idx_with(&fields, version, KEY_IDX_WRITER_BUCKET_BITS),

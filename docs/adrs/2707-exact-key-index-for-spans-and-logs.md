@@ -1027,14 +1027,16 @@ reads for the row. The first writer did not resolve a declared field the
 way the reader does. It took the first resource or scope entry with the
 field's name, nested or not, so a top-level Map or List resource entry
 claimed the name and a scalar scope entry under it was never keyed, while
-the reader skips the nested entry and returns the scope scalar. The probe
-then said the key was absent from a block whose rows SQL returns it for. A
+the reader skips the nested entry and returns the scope scalar. Under a
+`BYTES` field it keyed that nested entry's canonical bytes, a value the
+reader drops. The probe then said the key was absent from a block whose
+rows SQL returns it for. A
 writer that skipped nested entries but let a later scalar of the declared
 type win over an earlier one of another type would fail the other way: the
 reader returns nothing for that row, so the key names a block no row
-materializes it in. The numeric declared stats (the SKIP_IDX `NumStat` of
-a declared `I64` column) were built from the same resolution and miss the
-same rows.
+materializes it in. The numeric stats (the SKIP_IDX `NumStat` of every
+`I64`, `F64` and `Bool` attribute column, declared or not) were built from
+the same resolution and miss the same rows.
 
 The rule, for every declared field, is the reader's
 (`find_attr` in `crates/ravel-sql/src/rlog_attrs.rs`, over the merged
@@ -1047,8 +1049,8 @@ view):
 4. a winning entry whose type is not the declared one yields no value, and
    it still shadows every later entry.
 
-The writer keys KEY_IDX and stamps the numeric declared stats from that
-one resolution. POSTINGS keeps its own projection, unchanged.
+The writer keys KEY_IDX and stamps those numeric stats from that one
+resolution. POSTINGS keeps its own projection, unchanged.
 
 An RLOG writer that follows the rule writes its KEY_IDX section at
 `version` 2. Version 2 has the same grammar as version 1 and differs only
@@ -1059,10 +1061,11 @@ same shape, and only the writer that produced them knows which rule chose
 the keys. Decision 1's version byte is the field the grammar already
 reserves for that, so no footer or trailer field is added.
 `ravel_logseg::key_index::section_resolves_like_the_reader(version)` is
-true only for 2. Every reader accepts both versions. The logs probe, when
-one is wired (issue #2762), declines on an RLOG section that is not marked
-and reads that object as unindexed for the field, because a version 1
-section does not prove a key absent.
+true only for 2. Every reader accepts both versions. The logs probe
+(`probe_ranged` and `probe_source`) declines on an RLOG section that is not
+marked and reads that object as unindexed for the field, because a version
+1 section does not prove a key absent. No logs query prunes on it yet
+(issue #2762).
 
 The section is Class A. Compaction and the erasure rewrite rebuild KEY_IDX
 from the records they re-encode and write version 2 whatever their inputs
@@ -1071,9 +1074,11 @@ bucket to version 2. A binary from before this change refuses a version 2
 section as corrupt: its probe and `rlog inspect` fail on such an object,
 and its compactor and erasure rewrite fail the bucket and retry until they
 are rolled forward. Roll compactors and maintenance before ingest writes
-version 2.
+version 2. The reverse holds on rollback: once ingest writes version 2, a
+compactor or maintenance process rolled back to a binary that refuses
+version 2 fails those buckets, which retry, so roll ingest back first.
 
-Numeric declared stats already stamped into version 1 objects carry the
+Numeric stats already stamped into version 1 objects carry the
 old resolution and stay exposed to any reader that prunes or answers from
 them until those objects are rewritten. The section marker does not cover
 them; issue #3040 tracks that.

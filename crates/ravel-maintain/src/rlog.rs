@@ -5164,6 +5164,13 @@ mod tests {
         ));
         assert_eq!(
             oracle::probe(&inputs[0], "region", KeyType::Str, &key8_str("ap-south-1")),
+            None,
+            "a version 1 input declines"
+        );
+        let relabelled = rewrite_key_index(&inputs[0], RLOG_KEY_IDX_VERSION, |_, _, e| e)
+            .expect("relabel as version 2");
+        assert_eq!(
+            oracle::probe(&relabelled, "region", KeyType::Str, &key8_str("ap-south-1")),
             Some(vec![]),
             "the input is keyed by the old rule"
         );

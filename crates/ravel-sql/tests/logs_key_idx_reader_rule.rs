@@ -45,6 +45,7 @@ use ravel_sql::{
     DeclaredColumn, DeclaredType, SpanSegmentFetcher, SqlConfig, SqlExecutor, SqlRequest,
     StaticDeclaredColumns,
 };
+use ravel_types::logstream::canonical_attr_bytes;
 use ravel_types::{Signal, TenantId, TimeRange};
 use uuid::Uuid;
 
@@ -58,6 +59,8 @@ struct Case {
     resource: Attrs,
     scope: Attrs,
     record: Attrs,
+    /// Store `scope` in the order given rather than the canonical order.
+    scope_as_given: bool,
 }
 
 /// The cases of issue #3039 for one key type. `scalar(n)` is a value of the
@@ -71,6 +74,7 @@ fn cases(scalar: impl Fn(i64) -> AttrValue, wrong: AttrValue) -> Vec<Case> {
         resource,
         scope,
         record,
+        scope_as_given: false,
     };
     vec![
         case(
@@ -107,12 +111,12 @@ fn cases(scalar: impl Fn(i64) -> AttrValue, wrong: AttrValue) -> Vec<Case> {
         case(
             "nested, then a wrong-type scalar",
             k(nested_list.clone()),
-            k(wrong),
+            k(wrong.clone()),
             vec![],
         ),
         case(
             "record-level over a nested-only stream layer",
-            k(nested_map),
+            k(nested_map.clone()),
             vec![],
             k(scalar(8)),
         ),
@@ -120,9 +124,64 @@ fn cases(scalar: impl Fn(i64) -> AttrValue, wrong: AttrValue) -> Vec<Case> {
             "record-level nested over a stream scalar",
             vec![],
             k(scalar(9)),
-            k(nested_list),
+            k(nested_list.clone()),
+        ),
+        case(
+            "duplicate names within the resource",
+            vec![
+                (FIELD.to_string(), nested_list),
+                (FIELD.to_string(), scalar(11)),
+                (FIELD.to_string(), scalar(10)),
+            ],
+            k(scalar(13)),
+            vec![],
+        ),
+        // The canonical blob sorts a name's scalar values ahead of its nested
+        // ones, so only a blob stored in another order puts a nested scope
+        // entry in front of a scope scalar. The writer accepts such a blob and
+        // the reader resolves it in stored order.
+        Case {
+            scope_as_given: true,
+            ..case(
+                "duplicate names within the scope, nested stored first",
+                vec![],
+                vec![
+                    (FIELD.to_string(), nested_map),
+                    (FIELD.to_string(), scalar(12)),
+                ],
+                vec![],
+            )
+        },
+        case(
+            "resource and scope scalars of the declared type",
+            k(scalar(14)),
+            k(scalar(15)),
+            vec![],
+        ),
+        case(
+            "record-level wrong type over a stream scalar",
+            vec![],
+            k(scalar(16)),
+            k(wrong),
         ),
     ]
+}
+
+/// The STREAM_DIR blob of `c`: canonical, or with the scope attributes in the
+/// order the case gives them.
+fn stream_blob(c: &Case, scope_name: &str) -> Vec<u8> {
+    if !c.scope_as_given {
+        return stream_attrs_bytes(&c.resource, scope_name, "1", &c.scope);
+    }
+    let mut blob = stream_attrs_bytes(&c.resource, scope_name, "1", &[]);
+    assert_eq!(blob.pop(), Some(0), "an empty scope set is one zero count");
+    assert!(c.scope.len() < 0x80);
+    blob.push(c.scope.len() as u8);
+    for pair in &c.scope {
+        // One entry's encoding, less its set's one-byte count.
+        blob.extend_from_slice(&canonical_attr_bytes(std::slice::from_ref(pair))[1..]);
+    }
+    blob
 }
 
 fn tenant(tag: &str) -> TenantId {
@@ -160,7 +219,7 @@ async fn publish_cases(
                 "1",
                 &c.scope,
             ),
-            stream_attrs: stream_attrs_bytes(&c.resource, &scope_name, "1", &c.scope),
+            stream_attrs: stream_blob(c, &scope_name),
             ts_ns: ts,
             observed_ts_ns: ts,
             severity_num: 9,
@@ -398,11 +457,15 @@ async fn assert_keys_follow_the_reader(
     // Every value a case carries anywhere, so a key the writer stamps for a
     // shadowed or dropped entry is a candidate too.
     let mut candidates: BTreeSet<Key8> = got.iter().flatten().map(|(k, _)| *k).collect();
-    for n in [1, 2, 4, 5, 55, 6, 8, 9, 90, 91] {
+    for n in [1, 2, 4, 5, 55, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 90, 91] {
         candidates.insert(key_of(&scalar(n)));
     }
     candidates.insert(key_of(&wrong));
     candidates.insert(key_of(&AttrValue::List(vec![scalar(90)])));
+    candidates.insert(key_of(&AttrValue::Map(vec![(
+        "inner".to_string(),
+        scalar(91),
+    )])));
     for key8 in candidates {
         let want: BTreeSet<u32> = got
             .iter()
@@ -444,6 +507,10 @@ fn expected(
         None,
         Some(scalar(8)),
         record_nested,
+        Some(scalar(10)),
+        Some(scalar(12)),
+        Some(scalar(14)),
+        None,
     ]
 }
 

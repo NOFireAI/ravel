@@ -474,8 +474,9 @@ pair in the object, where `key8` is the first 8 bytes of the 16-byte
 the one docs/log-segment-format.md defines under "KEY_IDX" and is not
 restated here: it is built and read through `ravel-codec`'s `key_idx`
 module, shared with RLOG exactly as BLOOM is shared through `bloom_section`
-(ADR-0054), and the section's own `version` byte (1) is separate from the
-trailer version. RSPAN fixes the parameters the shared grammar leaves to the
+(ADR-0054), and the section's own `version` byte is separate from the
+trailer version. RSPAN writers write `version` 1; RSPAN readers parse the
+header through the shared codec, which accepts 1 or 2. RSPAN fixes the parameters the shared grammar leaves to the
 writer:
 
 - exactly one field, named `trace_id`, key type `Id16` (1); a header naming
