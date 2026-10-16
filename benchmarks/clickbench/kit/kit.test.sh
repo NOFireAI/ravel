@@ -134,7 +134,9 @@ cat >"$STUBS/curl" <<'STUB'
 # stopped. A readyz call is logged to readyz-calls. A body named check.json is
 # the concurrent phase's SELECT 1 check: it is logged to check-calls and, while
 # the check-refuse file exists, answered 503 (curl exit 22 under
-# --fail-with-body). STUB_SQL_TRUNCATE_N names a statement whose answer
+# --fail-with-body); while the check-hang file exists it is never answered, as
+# a server that accepts the connection and then hangs: curl exits 28 after its
+# --max-time, or never returns without one. STUB_SQL_TRUNCATE_N names a statement whose answer
 # prints status 200 and then fails the transfer (curl exit 18). A SQL call
 # logs its request body to
 # sql-bodies, writes an answer to -o and prints "<status> <seconds>":
@@ -153,13 +155,15 @@ body=""
 url=""
 wfmt=""
 fwb=""
+maxtime=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2; continue ;;
+    --max-time) maxtime="$2"; shift 2; continue ;;
     --data-binary) body="${2#@}"; shift 2; continue ;;
     -w) wfmt="$2"; shift 2; continue ;;
     --fail-with-body) fwb=1 ;;
-    --max-time|-H|-X) shift 2; continue ;;
+    -H|-X) shift 2; continue ;;
     http*) url="$1" ;;
   esac
   shift
@@ -181,6 +185,12 @@ case "$url" in
     case "$body" in
       */check.json)
         echo check >>"$STUB_DIR/check-calls"
+        if [ -f "$STUB_DIR/check-hang" ]; then
+          [ -n "$maxtime" ] || exec sleep 3600
+          sleep "$maxtime"
+          echo "curl: (28) Operation timed out after $maxtime seconds with 0 bytes received" >&2
+          exit 28
+        fi
         if [ -f "$STUB_DIR/check-refuse" ]; then
           printf '{"status":"error","errorType":"unavailable","error":"memory pressure"}' >"$out"
           [ -z "$fwb" ] || exit 22
@@ -273,7 +283,7 @@ STUB
 
 # The box's binaries. The server logs its argv, the five settings stamps and
 # the store keys and audit key it was given (the evidence must not carry
-# them), removes the check-refuse file, then after the seconds in the
+# them), removes the check-refuse and check-hang files, then after the seconds in the
 # ready-delay file, else STUB_READY_DELAY (default 0.05), writes the ready
 # file and sleeps until stopped; the CLI logs its argv, and `load` adds 100
 # objects to the store and prints ravel-cli's load summary with
@@ -288,7 +298,7 @@ for kv in fetch_concurrency=32 store_get_concurrency=32 cache_max_bytes=76890777
   printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' "${kv%%=*}" "${kv#*=}"
 done
 echo "stub-server: store access_key=${RAVEL_S3_ACCESS_KEY:-} secret_key=${RAVEL_S3_SECRET_KEY:-} audit_key=${RAVEL_AUDIT_TOKEN_KEY:-none}"
-rm -f "$STUB_DIR/check-refuse"
+rm -f "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang"
 sleep "$(cat "$STUB_DIR/ready-delay" 2>/dev/null || echo "${STUB_READY_DELAY:-0.05}")"
 sleep 120 &
 pid=$!
@@ -2300,7 +2310,7 @@ lib_box() {
   local box="$1"
   reset_log
   rm -f "$STUB_DIR/readyz-calls" "$STUB_DIR/check-calls" "$STUB_DIR/ready-delay" \
-    "$STUB_DIR/check-refuse" "$STUB_DIR/server-ready"
+    "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang" "$STUB_DIR/server-ready"
   boot_box A "$box" || return 1
   cat >"$box/lib-setup.sh" <<SETUP
 export KIT_ROOT="$box" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
@@ -2417,6 +2427,57 @@ if [ "$code" = 0 ] && [ -z "$out" ] && [ ! -e "$STUB_DIR/check-refuse" ]; then
 else
   fail "SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-refuse.log")"
 fi
+
+# kill_tree PID: SIGKILL PID and every process below it.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1"); do kill_tree "$child"; done
+  kill -KILL "$1" 2>/dev/null
+}
+
+# Catches: a SELECT 1 check with no client time limit. A server that accepts
+# the connection and never answers then blocks the watchdog in the check
+# forever, so it never restarts the server or reaches its deadline, and the
+# round never ends. Here the check starts hanging 0.2 s into a 3 s round; the
+# case gives the round 20 s before calling it hung and killing it.
+BOX_H="$TMP/box-check-hang"
+lib_box "$BOX_H"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=1 CONC_DURATION=3
+  WATCHDOG_INTERVAL=0.3 WATCHDOG_READY_TRIES=300
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.2
+    touch "$STUB_DIR/check-hang"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  stop_server
+) >"$TMP/check-hang.log" 2>&1 &
+hang_pid=$!
+waited=0
+while kill -0 "$hang_pid" 2>/dev/null && [ "$waited" -lt 200 ]; do
+  sleep 0.1
+  waited=$((waited + 1))
+done
+if kill -0 "$hang_pid" 2>/dev/null; then
+  kill_tree "$hang_pid"
+  wait "$hang_pid" 2>/dev/null
+  code="hung for 20 s"
+else
+  code=0
+  wait "$hang_pid" || code=$?
+fi
+out="$(conc_outage_check "$BOX_H" 3)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ ! -e "$STUB_DIR/check-hang" ]; then
+  pass "a SELECT 1 check that never answers times out, restarts the server once, and the round ends at its deadline"
+else
+  fail "hung SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-hang.log")"
+fi
+rm -f "$STUB_DIR/check-hang"
 
 # Catches: run_query recording an answer whose status line said 200 but whose
 # transfer then failed as a success, or without its curl exit code.

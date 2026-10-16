@@ -572,12 +572,19 @@ readyz_check() {
 }
 
 # sql_check: upstream ClickBench's ravel/check, a POST of SELECT 1 to the SQL
-# endpoint with curl --fail-with-body and no timeout, its body naming the
-# window every other call names (CHECK_BODY, written by phase_concurrent). It
-# fails on a refusal of SELECT 1 that readyz would not see.
+# endpoint with curl --fail-with-body, its body naming the window every other
+# call names (CHECK_BODY, written by phase_concurrent). It fails on a refusal
+# of SELECT 1 that readyz would not see.
+#
+# The one deliberate difference from upstream, whose check has no timeout:
+# CHECK_MAX_TIME (phase_concurrent sets it to 5 s or the watchdog interval,
+# whichever is smaller) bounds it, so a server that accepts the connection and
+# never answers fails the check and is restarted, instead of blocking the
+# watchdog, and with it the round's end, forever. It is a health probe, not a
+# measured call.
 sql_check() {
-  curl -sS --fail-with-body -o /dev/null -H @"$AUTH_HEADER" -H 'Content-Type: application/json' \
-    --data-binary @"$CHECK_BODY" "$SQL_URL" >/dev/null 2>&1
+  curl -sS --fail-with-body --max-time "${CHECK_MAX_TIME:-5}" -o /dev/null -H @"$AUTH_HEADER" \
+    -H 'Content-Type: application/json' --data-binary @"$CHECK_BODY" "$SQL_URL" >/dev/null 2>&1
 }
 
 stop_server() {
@@ -928,14 +935,16 @@ phase_requests() {
 # passed, with no client timeout; a call in flight at the deadline completes
 # and is counted. The round's deadline is whole seconds, `date +%s` plus the
 # duration, as upstream computes it. A watchdog restarts a server that fails
-# upstream's check (sql_check, also the pre-round readiness poll) without
-# telling the connections, so calls during the outage are errors.
+# upstream's check (sql_check, also the pre-round readiness poll, bounded by
+# CHECK_MAX_TIME where upstream's has no timeout) without telling the
+# connections, so calls during the outage are errors.
 # kit.py concurrent-summary turns calls.jsonl and rounds.jsonl into the
 # results.json block.
 phase_concurrent() {
   local dir="$OUT/concurrent" r
   phase_requests "$dir" || return 1
   CHECK_BODY="$dir/check.json"
+  CHECK_MAX_TIME="$(awk -v s="$WATCHDOG_INTERVAL" 'BEGIN { print (s < 5 ? s : 5) }')"
   printf '{"query": "SELECT 1", "start": %s, "end": %s}\n' "$WINDOW_START" "$WINDOW_END" >"$CHECK_BODY"
   : >"$dir/calls.jsonl"
   : >"$dir/rounds.jsonl"
