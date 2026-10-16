@@ -1,0 +1,4089 @@
+# ES|QL release manifest: the released language of the Elasticsearch 9.5 line
+# (ADR-2887 D1).
+#
+# This file was written from knowledge of the published ES|QL language
+# reference for the 9.5 line. No part of the Elasticsearch source tree was
+# fetched, opened, copied or paraphrased to write it: not its grammar, its
+# function registry, its documentation sources or its test fixtures. It has
+# NOT been reconciled with the released 9.5.5 binary (ADR-2887 D3), so an
+# entry can be missing, misnamed, or carry the wrong preview flag; an entry
+# whose release status is in doubt carries `unverified = true` and a comment
+# saying why.
+#
+# `docs/esql-conformance.md` is generated from this file:
+#
+#     REGEN_ESQL_CONFORMANCE=1 cargo test -p ravel-esql --test conformance
+#
+# Tables:
+#
+# [release]        The release line, the release of it the expected answers
+#                  describe (binary), and whether this file has been
+#                  reconciled with that released binary.
+# [[entry]]        One released form: a source or processing command, a
+#                  directive, a syntax variant, a function, a function or
+#                  command alias, an operator, a type or a parameter form.
+#                  Every released entry is in every denominator of the report.
+# [[development]]  A command that exists only in development builds, with the
+#                  same fields as an entry. Excluded from every denominator.
+# [[negative]]     An invalid statement that must be refused. Counted on its
+#                  own line of the report, never in a positive figure.
+# [[transport]]    An option of the Elasticsearch query endpoint, scored by
+#                  transport compatibility.
+# [[divergence]]   A place where Ravel's answer to a valid statement differs
+#                  from the release's, with the test that pins Ravel's. Its
+#                  id is what an entry's divergence field names. Every
+#                  divergence is named by at least one released entry, or
+#                  carries no_entry: the reason no released entry's example
+#                  can show it.
+#
+# Entry fields:
+#
+# kind      source_command, processing_command, directive, syntax, function,
+#           alias, operator, type or parameter.
+# name      The form's name, upper-case for keywords and functions. Unique
+#           per kind.
+# family    Functions only: scalar, aggregate, grouping, conversion,
+#           multivalue, date, string, math, ip, spatial, search or
+#           time_series.
+# aliases   The names of the alias entries that resolve to this entry.
+# alias_of  Aliases only: the entry the alias resolves to.
+# preview   Whether the release marks the form technical preview.
+# example   One statement that uses the form, run against the `logs` fixture
+#           of the ravel-sql ES|QL tests where it reads `FROM logs`.
+# grammar   own: the parser has a rule of its own for the form. call, cast,
+#           field: the parser reads the example only through the generic
+#           call rule name(args), the generic cast rule value::type, or as a
+#           plain field reference, none of which checks the entry's name.
+#           Syntax coverage counts own entries only.
+# parser    supported: the example parses. refused: the parser recognises the
+#           form and refuses it with a typed error. absent: the parser does
+#           not know it, and fails as on any invalid text.
+# binder    supported: the example binds. refused: the binder refuses it with
+#           a typed error. absent: the binder never sees it, because the
+#           parser does not accept the example.
+# executor  supported: the example prepares and runs. refused: the statement
+#           is refused with a typed error at some layer. absent: it fails
+#           without one.
+# columns, rows, order, warnings
+#           Released, executor-supported entries only: the answer the 9.5.5
+#           release gives for the example on the fixture, written by hand
+#           from the published language reference (ADR-2887 D3). columns
+#           lists name:type in order. Each row is a bracketed list of
+#           cells: null, true, false, a number (a double when written with
+#           a fraction or an exponent) or a double-quoted string; a date
+#           is the string the release renders. order is exact when the
+#           example fixes the whole order, multiset when it fixes none,
+#           key COLUMNS when it sorts on those columns and leaves ties
+#           unordered, and any N when it keeps N rows without fixing which
+#           (the answer has N rows, each one of those listed). The answers
+#           assume the release reads an index that maps the fixture's ten
+#           native columns at the types Ravel gives them and maps no
+#           `service` field, and evaluates NOW() at the fixture's query
+#           clock.
+# divergence
+#           The id of the known divergence that makes Ravel's answer differ
+#           from the release's. The entry then counts as divergent: in the
+#           denominator, not compatible. Its answer is still compared in
+#           full: the test undoes exactly that divergence in Ravel's answer
+#           and requires the result to be the release's answer, and fails
+#           an entry whose answer matches without the undo. from-columns
+#           reorders Ravel's columns by name into the release's order, the
+#           cells moving with them, and applies only to an answer whose
+#           columns are all among the ten FROM gives, arrive in FROM's
+#           fixed order, and are sorted by name in the release's answer; an
+#           entry naming it with any other column does not load.
+#           integer-literal reads a long column as
+#           integer where the release's column is integer; now-type reads a
+#           date_nanos column as date where the release's column is date,
+#           rendered to the millisecond. No other divergence can be named.
+# refusal   Binder-refused entries only: the text the binder's typed
+#           refusal names the form by, when it is not the name in brackets.
+#           A refused source command is named "this source command", so
+#           its refusal is the text the command starts with. An expression
+#           kind the binder has no binding for is named "this expression",
+#           which names no form, so such a refusal counts only where it
+#           starts exactly at the entry's own expression and refuses no
+#           expression enclosing it and no operand starting with it.
+# refused_by
+#           Binder-refused entries only: the released entry the binder
+#           refuses first, because the example cannot reach this form
+#           without it. The refusal must name that entry instead.
+# needs     A backend or data resource the form needs, when it needs one.
+# evidence  The test that proves the entry's states, as path::test.
+# unverified  The release status of the form is in doubt (see its comment).
+#
+# A layer never claims more than the layer before it: a binder state other
+# than absent needs a parsed example, and a supported executor needs a
+# supported binder.
+
+[release]
+line = "9.5"
+binary = "9.5.5"
+reconciled = false
+
+# ---------------------------------------------------------------------------
+# Source commands
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "source_command"
+grammar = "own"
+name = "FROM"
+preview = false
+example = 'FROM logs'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "source_command"
+grammar = "own"
+name = "ROW"
+preview = false
+example = 'ROW a = 1, b = "x"'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer", "b:keyword"]
+rows = ['[1, "x"]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "source_command"
+grammar = "own"
+name = "SHOW INFO"
+preview = false
+example = 'SHOW INFO'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "SHOW INFO"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "source_command"
+grammar = "own"
+name = "TS"
+preview = true
+example = 'TS metrics | STATS r = SUM(RATE(requests))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "TS metrics"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "source_command"
+grammar = "own"
+name = "PROMQL"
+preview = true
+example = 'PROMQL (rate(http_requests_total[5m]))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "PROMQL"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Processing commands
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "WHERE"
+preview = false
+example = 'FROM logs | WHERE severity_num > 10'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "EVAL"
+preview = false
+example = 'FROM logs | EVAL d2 = dur * 2 | KEEP dur, d2'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["dur:long", "d2:long"]
+rows = [
+  '[10, 20]',
+  '[20, 40]',
+  '[null, null]',
+  '[5, 10]',
+  '[7, 14]',
+  '[1, 2]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "KEEP"
+preview = false
+example = 'FROM logs | KEEP @timestamp, message'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "message:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", "a"]',
+  '["2023-11-14T22:13:10.000000000Z", "b"]',
+  '["2023-11-14T22:14:10.000000000Z", "c"]',
+  '["2023-11-14T22:14:20.000000000Z", "d"]',
+  '["2023-11-14T22:15:10.000000000Z", "e"]',
+  '["2023-11-14T22:15:20.000000000Z", "f"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "DROP"
+preview = false
+example = 'FROM logs | DROP trace_id, span_id'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO"]',
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO"]',
+  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO"]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO"]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO"]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO"]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "RENAME"
+preview = false
+example = 'FROM logs | RENAME message AS msg | KEEP msg'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["msg:keyword"]
+rows = [
+  '["a"]',
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "STATS"
+preview = false
+example = 'FROM logs | STATS c = COUNT(*)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["c:long"]
+rows = ['[6]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "SORT"
+preview = false
+example = 'FROM logs | SORT severity_num DESC'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+]
+order = "key severity_num"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "LIMIT"
+preview = false
+example = 'FROM logs | LIMIT 3'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "any 3"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "DISSECT"
+preview = false
+example = 'FROM logs | DISSECT message "%{a} %{b}"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "GROK"
+preview = false
+example = 'FROM logs | GROK message "%{WORD:verb} %{NUMBER:code}"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "MV_EXPAND"
+preview = true
+example = 'FROM logs | MV_EXPAND service'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "ENRICH"
+preview = false
+example = 'FROM logs | ENRICH regions_policy ON region'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "enrich policy"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "LOOKUP JOIN"
+preview = false
+example = 'FROM logs | LOOKUP JOIN services_lookup ON service'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "command [LOOKUP]"
+needs = "lookup index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "INLINE STATS"
+aliases = ["INLINESTATS"]
+preview = true
+example = 'FROM logs | INLINE STATS m = MAX(dur) BY service'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "command [INLINE]"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "FORK"
+preview = true
+example = 'FROM logs | FORK (WHERE dur > 5) (WHERE dur <= 5 | LIMIT 2)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "FUSE"
+preview = true
+example = 'FROM logs METADATA _id, _index, _score | FORK (WHERE dur > 5) (WHERE dur <= 5) | FUSE'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "FROM METADATA"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "CHANGE_POINT"
+preview = true
+example = 'FROM logs | STATS c = COUNT(*) BY t = BUCKET(@timestamp, 1 minute) | CHANGE_POINT c ON t'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "SAMPLE"
+preview = true
+example = 'FROM logs | SAMPLE 0.5'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "COMPLETION"
+preview = true
+example = 'FROM logs | COMPLETION answer = message WITH {"inference_id": "my-llm"}'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "inference endpoint"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "processing_command"
+grammar = "own"
+name = "RERANK"
+preview = true
+example = 'FROM logs | RERANK "timeout" ON message WITH {"inference_id": "reranker"}'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "inference endpoint"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "own"
+name = "INLINESTATS"
+alias_of = "INLINE STATS"
+preview = true
+example = 'FROM logs | INLINESTATS m = MAX(dur) BY service'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Directives
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "directive"
+grammar = "own"
+name = "SET"
+preview = true
+example = 'SET time_zone = "Europe/Paris"; ROW a = 1'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "query setting"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Syntax variants of the commands above
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "FROM over several sources"
+preview = false
+example = 'FROM logs, archive'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "FROM over more than one source"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "FROM source pattern"
+preview = false
+example = 'FROM logs-*'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "source pattern"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "FROM remote source"
+preview = false
+example = 'FROM remote:logs'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "remote source"
+needs = "remote cluster"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "FROM METADATA"
+preview = false
+example = 'FROM logs METADATA _index'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "METADATA"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "FROM subquery"
+preview = true
+example = 'FROM logs, (FROM logs | WHERE dur > 5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "FROM logs, (FROM"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "STATS BY"
+preview = false
+example = 'FROM logs | STATS c = COUNT(*) BY region'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["c:long", "region:keyword"]
+rows = [
+  '[1, "eu"]',
+  '[5, null]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "STATS aggregate WHERE"
+preview = false
+example = 'FROM logs | STATS c = COUNT(*) WHERE severity_num > 10 BY region'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["c:long", "region:keyword"]
+rows = [
+  '[0, "eu"]',
+  '[4, null]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "RENAME with ="
+preview = false
+example = 'FROM logs | RENAME msg = message | KEEP msg'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["msg:keyword"]
+rows = [
+  '["a"]',
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "SORT NULLS FIRST and LAST"
+preview = false
+example = 'FROM logs | SORT region DESC NULLS LAST, dur ASC NULLS FIRST | KEEP message'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["message:keyword"]
+rows = [
+  '["a"]',
+  '["c"]',
+  '["f"]',
+  '["d"]',
+  '["e"]',
+  '["b"]',
+]
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "LIMIT BY"
+preview = true
+example = 'FROM logs | LIMIT 1 BY service'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "command [LIMIT]"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "DISSECT APPEND_SEPARATOR"
+preview = false
+example = 'FROM logs | DISSECT message "%{+a} %{+a}" APPEND_SEPARATOR = "-"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "DISSECT"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "ENRICH WITH"
+preview = false
+example = 'FROM logs | ENRICH regions_policy ON region WITH country = name'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "ENRICH"
+needs = "enrich policy"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "quoted identifier"
+preview = false
+example = 'FROM logs | KEEP `message`'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["message:keyword"]
+rows = ['["a"]', '["b"]', '["c"]', '["d"]', '["e"]', '["f"]']
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "triple-quoted string"
+preview = false
+example = 'ROW s = """a "quoted" word"""'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["s:keyword"]
+rows = ['["a \"quoted\" word"]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "comments"
+preview = false
+example = 'ROW a = 1 /* block */ // line'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer"]
+rows = ['[1]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "time duration literal"
+preview = false
+example = 'FROM logs | WHERE @timestamp > NOW() - 1 hour'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "date period literal"
+preview = false
+example = 'FROM logs | WHERE @timestamp > NOW() - 1 month'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "calendar interval"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "multivalue literal"
+preview = false
+example = 'ROW a = [1, 2, 3]'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "array literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "syntax"
+grammar = "own"
+name = "function options map"
+preview = true
+example = 'FROM logs | WHERE MATCH(message, "timeout", {"fuzziness": 1})'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "MATCH"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Operators
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "OR"
+preview = false
+example = 'FROM logs | WHERE dur > 10 OR dur < 5'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "AND"
+preview = false
+example = 'FROM logs | WHERE dur > 1 AND dur < 20'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "NOT"
+preview = false
+example = 'FROM logs | WHERE NOT dur > 10'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "=="
+preview = false
+example = 'FROM logs | WHERE message == "b" | KEEP message, dur'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["message:keyword", "dur:long"]
+rows = [
+  '["b", 20]',
+]
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "!="
+preview = false
+example = 'FROM logs | WHERE message != "a" | KEEP message'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["message:keyword"]
+rows = [
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "<"
+preview = false
+example = 'FROM logs | WHERE dur < 10'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "<="
+preview = false
+example = 'FROM logs | WHERE dur <= 10'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = ">"
+preview = false
+example = 'FROM logs | WHERE dur > 10'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = ">="
+preview = false
+example = 'FROM logs | WHERE dur >= 10'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "+"
+preview = false
+example = 'ROW a = 1 + 2'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer"]
+rows = ['[3]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "-"
+preview = false
+example = 'ROW a = 5 - 2'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer"]
+rows = ['[3]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "*"
+preview = false
+example = 'ROW a = 2 * 3'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer"]
+rows = ['[6]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "/"
+preview = false
+example = 'ROW a = 7 / 2'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer"]
+rows = ['[3]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "%"
+preview = false
+example = 'ROW a = 7 % 2'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer"]
+rows = ['[1]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "unary -"
+preview = false
+example = 'ROW a = -(1 + 2)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:integer"]
+rows = ['[-3]']
+order = "exact"
+warnings = []
+divergence = "integer-literal"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "IS NULL"
+preview = false
+example = 'FROM logs | WHERE dur IS NULL'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "IS NOT NULL"
+preview = false
+example = 'FROM logs | WHERE dur IS NOT NULL'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
+  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
+  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
+  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+]
+order = "multiset"
+warnings = []
+divergence = "from-columns"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "IN"
+preview = false
+example = 'FROM logs | WHERE message IN ("a", "b") | KEEP message'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["message:keyword"]
+rows = [
+  '["a"]',
+  '["b"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "NOT IN"
+preview = false
+example = 'FROM logs | WHERE message NOT IN ("a") | KEEP message'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["message:keyword"]
+rows = [
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+# The binder refuses this example as "this expression" at 1:19, where the IN
+# expression starts; it gives no more specific name for an IN subquery.
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "IN subquery"
+preview = true
+example = 'FROM logs | WHERE service IN (FROM logs | WHERE dur > 5 | KEEP service)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "this expression"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "LIKE"
+preview = false
+example = 'FROM logs | WHERE message LIKE "a*"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "LIKE"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "NOT LIKE"
+preview = false
+example = 'FROM logs | WHERE message NOT LIKE "a*"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "LIKE"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "RLIKE"
+preview = false
+example = 'FROM logs | WHERE message RLIKE "a.*"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "RLIKE"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "NOT RLIKE"
+preview = false
+example = 'FROM logs | WHERE message NOT RLIKE "a.*"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "RLIKE"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = ":"
+preview = true
+example = 'FROM logs | WHERE message : "timeout"'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "operator"
+grammar = "own"
+name = "::"
+preview = false
+example = 'ROW a = "1"::long'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "cast to"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Types
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "type"
+grammar = "own"
+name = "keyword"
+preview = false
+example = 'ROW a = "x"'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:keyword"]
+rows = ['["x"]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "text"
+preview = false
+example = 'ROW a = "x"::text'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "field"
+name = "long"
+preview = false
+example = 'FROM logs | KEEP severity_num'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["severity_num:long"]
+rows = ['[9]', '[13]', '[17]', '[13]', '[5]', '[21]']
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "integer"
+preview = false
+example = 'ROW a = "1"::integer'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "unsigned_long"
+preview = false
+example = 'ROW a = "1"::unsigned_long'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "own"
+name = "double"
+preview = false
+example = 'ROW a = 1.5'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:double"]
+rows = ['[1.5]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "type"
+grammar = "own"
+name = "boolean"
+preview = false
+example = 'ROW a = true'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:boolean"]
+rows = ['[true]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "date"
+preview = false
+example = 'ROW a = "2024-01-01T00:00:00Z"::datetime'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "cast to [datetime]"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "field"
+name = "date_nanos"
+preview = false
+example = 'FROM logs | KEEP @timestamp'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["@timestamp:date_nanos"]
+rows = [
+  '["2023-11-14T22:13:00.000000000Z"]',
+  '["2023-11-14T22:13:10.000000000Z"]',
+  '["2023-11-14T22:14:10.000000000Z"]',
+  '["2023-11-14T22:14:20.000000000Z"]',
+  '["2023-11-14T22:15:10.000000000Z"]',
+  '["2023-11-14T22:15:20.000000000Z"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "type"
+grammar = "own"
+name = "null"
+preview = false
+example = 'ROW a = null'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:null"]
+rows = ['[null]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "ip"
+preview = false
+example = 'ROW a = "10.0.0.1"::ip'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "version"
+preview = false
+example = 'ROW a = "1.2.3"::version'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "geo_point"
+preview = false
+example = 'ROW a = "POINT(1 2)"::geo_point'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "geo_shape"
+preview = false
+example = 'ROW a = "POINT(1 2)"::geo_shape'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "cartesian_point"
+preview = false
+example = 'ROW a = "POINT(1 2)"::cartesian_point'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "cast"
+name = "cartesian_shape"
+preview = false
+example = 'ROW a = "POINT(1 2)"::cartesian_shape'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "own"
+name = "time_duration"
+preview = false
+example = 'FROM logs | EVAL t = @timestamp + 1 hour | KEEP t'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["t:date_nanos"]
+rows = [
+  '["2023-11-14T23:13:00.000000000Z"]',
+  '["2023-11-14T23:13:10.000000000Z"]',
+  '["2023-11-14T23:14:10.000000000Z"]',
+  '["2023-11-14T23:14:20.000000000Z"]',
+  '["2023-11-14T23:15:10.000000000Z"]',
+  '["2023-11-14T23:15:20.000000000Z"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "type"
+grammar = "own"
+name = "date_period"
+preview = false
+example = 'ROW a = 1 month'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "calendar interval"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "field"
+name = "counter_long"
+preview = true
+example = 'TS metrics | KEEP requests'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "field"
+name = "counter_integer"
+preview = true
+example = 'TS metrics | KEEP connections'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "field"
+name = "counter_double"
+preview = true
+example = 'TS metrics | KEEP bytes'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "type"
+grammar = "call"
+name = "aggregate_metric_double"
+preview = true
+example = 'ROW a = TO_AGGREGATE_METRIC_DOUBLE(1.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TO_AGGREGATE_METRIC_DOUBLE"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Parameter forms
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "parameter"
+grammar = "own"
+name = "?"
+preview = false
+example = 'ROW a = ?'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "query parameter"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "parameter"
+grammar = "own"
+name = "?n"
+preview = false
+example = 'ROW a = ?1'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "query parameter"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "parameter"
+grammar = "own"
+name = "?name"
+preview = false
+example = 'ROW a = ?limit'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "query parameter"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "parameter"
+grammar = "own"
+name = "??"
+preview = true
+example = 'FROM logs | KEEP ??'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "query parameter"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "parameter"
+grammar = "own"
+name = "??n"
+preview = true
+example = 'FROM logs | KEEP ??1'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "query parameter"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "parameter"
+grammar = "own"
+name = "??name"
+preview = true
+example = 'FROM logs | KEEP ??field'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refusal = "query parameter"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: aggregate
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "AVG"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS a = AVG(dur)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["a:double"]
+rows = ['[8.6]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "COUNT"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS c = COUNT(dur), all = COUNT(*)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["c:long", "all:long"]
+rows = ['[5, 6]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "COUNT_DISTINCT"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS c = COUNT_DISTINCT(service)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MAX"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS m = MAX(dur)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["m:long"]
+rows = ['[20]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MEDIAN"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS m = MEDIAN(dur)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MEDIAN_ABSOLUTE_DEVIATION"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS m = MEDIAN_ABSOLUTE_DEVIATION(dur)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MIN"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS m = MIN(dur)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["m:long"]
+rows = ['[1]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "PERCENTILE"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS p = PERCENTILE(dur, 95)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SAMPLE"
+family = "aggregate"
+preview = true
+example = 'FROM logs | STATS s = SAMPLE(message, 2)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_CENTROID_AGG"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS c = ST_CENTROID_AGG(location)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_EXTENT_AGG"
+family = "aggregate"
+preview = true
+example = 'FROM logs | STATS e = ST_EXTENT_AGG(location)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "STD_DEV"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS s = STD_DEV(dur)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SUM"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS s = SUM(dur)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["s:long"]
+rows = ['[43]']
+order = "exact"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TOP"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS t = TOP(dur, 3, "desc")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "VALUES"
+family = "aggregate"
+preview = true
+example = 'FROM logs | STATS v = VALUES(service)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "WEIGHTED_AVG"
+family = "aggregate"
+preview = false
+example = 'FROM logs | STATS w = WEIGHTED_AVG(dur, severity_num)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: grouping
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "BUCKET"
+family = "grouping"
+preview = false
+example = 'FROM logs | STATS c = COUNT(*) BY b = BUCKET(@timestamp, 1 minute)'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["c:long", "b:date_nanos"]
+rows = [
+  '[2, "2023-11-14T22:13:00.000000000Z"]',
+  '[2, "2023-11-14T22:14:00.000000000Z"]',
+  '[2, "2023-11-14T22:15:00.000000000Z"]',
+]
+order = "multiset"
+warnings = []
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "CATEGORIZE"
+family = "grouping"
+preview = true
+example = 'FROM logs | STATS c = COUNT(*) BY k = CATEGORIZE(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TBUCKET"
+family = "grouping"
+preview = true
+example = 'TS metrics | STATS r = MAX(RATE(requests)) BY TBUCKET(1 hour)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: scalar (conditional)
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "CASE"
+family = "scalar"
+preview = false
+example = 'FROM logs | EVAL level = CASE(severity_num > 12, "high", "low")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "COALESCE"
+family = "scalar"
+preview = false
+example = 'FROM logs | EVAL s = COALESCE(service, "none")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "GREATEST"
+family = "scalar"
+preview = false
+example = 'ROW g = GREATEST(1, 5, 3)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LEAST"
+family = "scalar"
+preview = false
+example = 'ROW l = LEAST(1, 5, 3)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: conversion
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_AGGREGATE_METRIC_DOUBLE"
+family = "conversion"
+preview = true
+example = 'ROW a = TO_AGGREGATE_METRIC_DOUBLE(1.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_BOOLEAN"
+family = "conversion"
+aliases = ["TO_BOOL"]
+preview = false
+example = 'ROW a = TO_BOOLEAN("true")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_CARTESIANPOINT"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_CARTESIANPOINT("POINT(1 2)")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_CARTESIANSHAPE"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_CARTESIANSHAPE("POINT(1 2)")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_DATEPERIOD"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_DATEPERIOD("3 days")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_DATETIME"
+family = "conversion"
+aliases = ["TO_DT"]
+preview = false
+example = 'ROW a = TO_DATETIME("2024-01-01T00:00:00Z")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_DATE_NANOS"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_DATE_NANOS("2024-01-01T00:00:00.123456789Z")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_DEGREES"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_DEGREES(3.14)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_DOUBLE"
+family = "conversion"
+aliases = ["TO_DBL"]
+preview = false
+example = 'ROW a = TO_DOUBLE("1.5")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_GEOPOINT"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_GEOPOINT("POINT(1 2)")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_GEOSHAPE"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_GEOSHAPE("POINT(1 2)")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_INTEGER"
+family = "conversion"
+aliases = ["TO_INT"]
+preview = false
+example = 'ROW a = TO_INTEGER("42")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_IP"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_IP("10.0.0.1")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_LONG"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_LONG("42")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_RADIANS"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_RADIANS(180.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_STRING"
+family = "conversion"
+aliases = ["TO_STR"]
+preview = false
+example = 'ROW a = TO_STRING(42)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_TIMEDURATION"
+family = "conversion"
+preview = false
+example = 'ROW a = TO_TIMEDURATION("3 hours")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_UNSIGNED_LONG"
+family = "conversion"
+aliases = ["TO_UL", "TO_ULONG"]
+preview = false
+example = 'ROW a = TO_UNSIGNED_LONG("42")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_VERSION"
+family = "conversion"
+aliases = ["TO_VER"]
+preview = false
+example = 'ROW a = TO_VERSION("1.2.3")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_BOOL"
+alias_of = "TO_BOOLEAN"
+preview = false
+example = 'ROW a = TO_BOOL("true")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_DT"
+alias_of = "TO_DATETIME"
+preview = false
+example = 'ROW a = TO_DT("2024-01-01T00:00:00Z")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_DBL"
+alias_of = "TO_DOUBLE"
+preview = false
+example = 'ROW a = TO_DBL("1.5")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_INT"
+alias_of = "TO_INTEGER"
+preview = false
+example = 'ROW a = TO_INT("42")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_STR"
+alias_of = "TO_STRING"
+preview = false
+example = 'ROW a = TO_STR(42)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_UL"
+alias_of = "TO_UNSIGNED_LONG"
+preview = false
+example = 'ROW a = TO_UL("42")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_ULONG"
+alias_of = "TO_UNSIGNED_LONG"
+preview = false
+example = 'ROW a = TO_ULONG("42")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "alias"
+grammar = "call"
+name = "TO_VER"
+alias_of = "TO_VERSION"
+preview = false
+example = 'ROW a = TO_VER("1.2.3")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: date
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "DATE_DIFF"
+family = "date"
+preview = false
+example = 'FROM logs | EVAL d = DATE_DIFF("second", @timestamp, NOW())'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "DATE_EXTRACT"
+family = "date"
+preview = false
+example = 'FROM logs | EVAL h = DATE_EXTRACT("hour_of_day", @timestamp)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "DATE_FORMAT"
+family = "date"
+preview = false
+example = 'FROM logs | EVAL d = DATE_FORMAT("yyyy-MM-dd", @timestamp)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "DATE_PARSE"
+family = "date"
+preview = false
+example = 'ROW d = DATE_PARSE("yyyy-MM-dd", "2024-01-01")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "DATE_TRUNC"
+family = "date"
+preview = false
+example = 'FROM logs | EVAL h = DATE_TRUNC(1 hour, @timestamp)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "NOW"
+family = "date"
+preview = false
+example = 'ROW t = NOW()'
+parser = "supported"
+binder = "supported"
+executor = "supported"
+columns = ["t:date"]
+rows = ['["2023-11-14T22:23:00.000Z"]']
+order = "exact"
+warnings = []
+divergence = "now-type"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
+
+# ---------------------------------------------------------------------------
+# Functions: IP
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "CIDR_MATCH"
+family = "ip"
+preview = false
+example = 'ROW m = CIDR_MATCH(TO_IP("10.0.0.1"), "10.0.0.0/8")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "IP_PREFIX"
+family = "ip"
+preview = false
+example = 'ROW p = IP_PREFIX(TO_IP("10.1.2.3"), 24, 0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: math
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ABS"
+family = "math"
+preview = false
+example = 'ROW a = ABS(-1)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ACOS"
+family = "math"
+preview = false
+example = 'ROW a = ACOS(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ASIN"
+family = "math"
+preview = false
+example = 'ROW a = ASIN(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ATAN"
+family = "math"
+preview = false
+example = 'ROW a = ATAN(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ATAN2"
+family = "math"
+preview = false
+example = 'ROW a = ATAN2(1.0, 2.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "CBRT"
+family = "math"
+preview = false
+example = 'ROW a = CBRT(27.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "CEIL"
+family = "math"
+preview = false
+example = 'ROW a = CEIL(1.2)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "COS"
+family = "math"
+preview = false
+example = 'ROW a = COS(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "COSH"
+family = "math"
+preview = false
+example = 'ROW a = COSH(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "E"
+family = "math"
+preview = false
+example = 'ROW a = E()'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "EXP"
+family = "math"
+preview = false
+example = 'ROW a = EXP(1.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "FLOOR"
+family = "math"
+preview = false
+example = 'ROW a = FLOOR(1.8)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "HYPOT"
+family = "math"
+preview = false
+example = 'ROW a = HYPOT(3.0, 4.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LOG"
+family = "math"
+preview = false
+example = 'ROW a = LOG(2.0, 8.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LOG10"
+family = "math"
+preview = false
+example = 'ROW a = LOG10(100.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "PI"
+family = "math"
+preview = false
+example = 'ROW a = PI()'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "POW"
+family = "math"
+preview = false
+example = 'ROW a = POW(2.0, 10)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ROUND"
+family = "math"
+preview = false
+example = 'ROW a = ROUND(1.2345, 2)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ROUND_TO"
+family = "math"
+preview = false
+example = 'ROW a = ROUND_TO(7, 0, 5, 10)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SIGNUM"
+family = "math"
+preview = false
+example = 'ROW a = SIGNUM(-3.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SIN"
+family = "math"
+preview = false
+example = 'ROW a = SIN(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SINH"
+family = "math"
+preview = false
+example = 'ROW a = SINH(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SQRT"
+family = "math"
+preview = false
+example = 'ROW a = SQRT(16.0)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TAN"
+family = "math"
+preview = false
+example = 'ROW a = TAN(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TANH"
+family = "math"
+preview = false
+example = 'ROW a = TANH(0.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TAU"
+family = "math"
+preview = false
+example = 'ROW a = TAU()'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: search
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "KQL"
+family = "search"
+preview = true
+example = 'FROM logs | WHERE KQL("message: timeout")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MATCH"
+family = "search"
+preview = true
+example = 'FROM logs | WHERE MATCH(message, "timeout")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MATCH_PHRASE"
+family = "search"
+preview = true
+example = 'FROM logs | WHERE MATCH_PHRASE(message, "connection timeout")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MULTI_MATCH"
+family = "search"
+preview = true
+example = 'FROM logs | WHERE MULTI_MATCH("timeout", message, service)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "QSTR"
+family = "search"
+preview = true
+example = 'FROM logs | WHERE QSTR("message:timeout")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+needs = "search index"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: spatial
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_CONTAINS"
+family = "spatial"
+preview = false
+example = 'ROW c = ST_CONTAINS(TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"), TO_GEOPOINT("POINT(1 1)"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_DISJOINT"
+family = "spatial"
+preview = false
+example = 'ROW d = ST_DISJOINT(TO_GEOPOINT("POINT(5 5)"), TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_DISTANCE"
+family = "spatial"
+preview = false
+example = 'ROW d = ST_DISTANCE(TO_GEOPOINT("POINT(0 0)"), TO_GEOPOINT("POINT(1 1)"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_ENVELOPE"
+family = "spatial"
+preview = true
+example = 'ROW e = ST_ENVELOPE(TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_GEOHASH"
+family = "spatial"
+preview = true
+example = 'ROW h = ST_GEOHASH(TO_GEOPOINT("POINT(1 2)"), 5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_GEOHEX"
+family = "spatial"
+preview = true
+example = 'ROW h = ST_GEOHEX(TO_GEOPOINT("POINT(1 2)"), 5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_GEOTILE"
+family = "spatial"
+preview = true
+example = 'ROW t = ST_GEOTILE(TO_GEOPOINT("POINT(1 2)"), 5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_INTERSECTS"
+family = "spatial"
+preview = false
+example = 'ROW i = ST_INTERSECTS(TO_GEOPOINT("POINT(1 1)"), TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_WITHIN"
+family = "spatial"
+preview = false
+example = 'ROW w = ST_WITHIN(TO_GEOPOINT("POINT(1 1)"), TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_X"
+family = "spatial"
+preview = false
+example = 'ROW x = ST_X(TO_GEOPOINT("POINT(1 2)"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_XMAX"
+family = "spatial"
+preview = true
+example = 'ROW x = ST_XMAX(TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_XMIN"
+family = "spatial"
+preview = true
+example = 'ROW x = ST_XMIN(TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_Y"
+family = "spatial"
+preview = false
+example = 'ROW y = ST_Y(TO_GEOPOINT("POINT(1 2)"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_YMAX"
+family = "spatial"
+preview = true
+example = 'ROW y = ST_YMAX(TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ST_YMIN"
+family = "spatial"
+preview = true
+example = 'ROW y = ST_YMIN(TO_GEOSHAPE("POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))"))'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: string
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "BIT_LENGTH"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL n = BIT_LENGTH(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "BYTE_LENGTH"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL n = BYTE_LENGTH(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "CONCAT"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL s = CONCAT(message, "-", severity_text)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "ENDS_WITH"
+family = "string"
+preview = false
+example = 'FROM logs | WHERE ENDS_WITH(message, "a")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "FROM_BASE64"
+family = "string"
+preview = false
+example = 'ROW s = FROM_BASE64("ZWxhc3RpYw==")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "HASH"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL h = HASH("sha256", message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LEFT"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL s = LEFT(message, 1)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LENGTH"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL n = LENGTH(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LOCATE"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL p = LOCATE(message, "a")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LTRIM"
+family = "string"
+preview = false
+example = 'ROW s = LTRIM("  a")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MD5"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL h = MD5(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "REPEAT"
+family = "string"
+preview = false
+example = 'ROW s = REPEAT("ab", 3)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "REPLACE"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL s = REPLACE(message, "a", "b")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "REVERSE"
+family = "string"
+preview = false
+example = 'ROW s = REVERSE("abc")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "RIGHT"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL s = RIGHT(message, 1)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "RTRIM"
+family = "string"
+preview = false
+example = 'ROW s = RTRIM("a  ")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SHA1"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL h = SHA1(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SHA256"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL h = SHA256(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SPACE"
+family = "string"
+preview = false
+example = 'ROW s = SPACE(3)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SPLIT"
+family = "string"
+preview = false
+example = 'ROW s = SPLIT("a,b,c", ",")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "STARTS_WITH"
+family = "string"
+preview = false
+example = 'FROM logs | WHERE STARTS_WITH(message, "a")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SUBSTRING"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL s = SUBSTRING(message, 1, 1)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_BASE64"
+family = "string"
+preview = false
+example = 'ROW s = TO_BASE64("elastic")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_LOWER"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL s = TO_LOWER(severity_text)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TO_UPPER"
+family = "string"
+preview = false
+example = 'FROM logs | EVAL s = TO_UPPER(message)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "TRIM"
+family = "string"
+preview = false
+example = 'ROW s = TRIM("  a  ")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: multivalue
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_APPEND"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_APPEND([1, 2], 3)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_AVG"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_AVG([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_CONCAT"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_CONCAT(["a", "b"], ",")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_COUNT"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_COUNT([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_DEDUPE"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_DEDUPE([1, 1, 2])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_FIRST"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_FIRST([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_LAST"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_LAST([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_MAX"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_MAX([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_MEDIAN"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_MEDIAN([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_MEDIAN_ABSOLUTE_DEVIATION"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_MEDIAN_ABSOLUTE_DEVIATION([1, 2, 5])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_MIN"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_MIN([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_PERCENTILE"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_PERCENTILE([1, 2, 3], 50)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_PSERIES_WEIGHTED_SUM"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_PSERIES_WEIGHTED_SUM([1.0, 2.0, 3.0], 1.5)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_SLICE"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_SLICE([1, 2, 3], 0, 1)'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_SORT"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_SORT([3, 1, 2], "desc")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_SUM"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_SUM([1, 2, 3])'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MV_ZIP"
+family = "multivalue"
+preview = false
+example = 'ROW m = MV_ZIP(["a", "b"], ["x", "y"], "-")'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Functions: time series (all inside STATS of a TS source)
+# ---------------------------------------------------------------------------
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "RATE"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS r = SUM(RATE(requests)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "IRATE"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS r = SUM(IRATE(requests)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "DELTA"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS d = SUM(DELTA(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "IDELTA"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS d = SUM(IDELTA(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "INCREASE"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS i = SUM(INCREASE(requests)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "AVG_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS a = MAX(AVG_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "COUNT_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS c = SUM(COUNT_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "COUNT_DISTINCT_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS c = SUM(COUNT_DISTINCT_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "FIRST_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS f = MAX(FIRST_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "LAST_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS l = MAX(LAST_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MAX_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS m = MAX(MAX_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "MIN_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS m = MIN(MIN_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+[[entry]]
+kind = "function"
+grammar = "call"
+name = "SUM_OVER_TIME"
+family = "time_series"
+preview = true
+example = 'TS metrics | STATS s = SUM(SUM_OVER_TIME(temperature)) BY host'
+parser = "supported"
+binder = "refused"
+executor = "refused"
+refused_by = "TS"
+needs = "time series data stream"
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_refused_entry_is_refused_with_a_typed_error"
+
+# ---------------------------------------------------------------------------
+# Development-only commands. Not released in 9.5; excluded from every
+# denominator. The parser recognises each by keyword and refuses it with a
+# typed error, so the statement never reaches the binder.
+# ---------------------------------------------------------------------------
+
+[[development]]
+kind = "source_command"
+grammar = "own"
+name = "EXPLAIN"
+preview = false
+example = 'EXPLAIN (ROW a = 1)'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "source_command"
+grammar = "own"
+name = "METRICS"
+preview = false
+example = 'METRICS metrics'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "DEDUP"
+preview = false
+example = 'FROM logs | DEDUP service'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "HIGHLIGHT"
+preview = false
+example = 'FROM logs | HIGHLIGHT message'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "LOOKUP"
+preview = false
+example = 'FROM logs | LOOKUP services ON service'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "JOIN"
+preview = false
+example = 'FROM logs | JOIN services ON service'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "LEFT JOIN"
+preview = false
+example = 'FROM logs | LEFT JOIN services ON service'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "RIGHT JOIN"
+preview = false
+example = 'FROM logs | RIGHT JOIN services ON service'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "FULL JOIN"
+preview = false
+example = 'FROM logs | FULL JOIN services ON service'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+
+# The seven commands below are unverified. Each was recalled as a command that
+# appeared in Elasticsearch development builds, and none could be confirmed as
+# present or absent in the published 9.5 reference without consulting
+# material this file may not use. They are kept here, excluded from the
+# denominators, and the parser refuses them. If the 9.5 release ships one, it
+# moves to the released section and adds one to every denominator as a gap.
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "IP_LOCATION"
+preview = false
+example = 'FROM logs | IP_LOCATION client_ip'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+unverified = true
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "METRICS_INFO"
+preview = false
+example = 'TS metrics | METRICS_INFO'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+unverified = true
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "REGISTERED_DOMAIN"
+preview = false
+example = 'FROM logs | REGISTERED_DOMAIN host'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+unverified = true
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "TS_COLLAPSE"
+preview = false
+example = 'TS metrics | TS_COLLAPSE'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+unverified = true
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "TS_INFO"
+preview = false
+example = 'TS metrics | TS_INFO'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+unverified = true
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "URI_PARTS"
+preview = false
+example = 'FROM logs | URI_PARTS url'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+unverified = true
+
+[[development]]
+kind = "processing_command"
+grammar = "own"
+name = "USER_AGENT"
+preview = false
+example = 'FROM logs | USER_AGENT agent'
+parser = "refused"
+binder = "absent"
+executor = "refused"
+evidence = "crates/ravel-esql/tests/conformance.rs::every_manifest_entry_marked_parsed_has_an_example_that_parses"
+unverified = true
+
+# ---------------------------------------------------------------------------
+# Negative statements: invalid text every layer must refuse. Counted on their
+# own line of the report; they never raise a positive figure.
+# ---------------------------------------------------------------------------
+
+[[negative]]
+name = "source command with no source"
+example = 'FROM'
+
+[[negative]]
+name = "processing command first"
+example = 'WHERE a > 1'
+
+[[negative]]
+name = "empty pipeline stage"
+example = 'FROM logs | | LIMIT 1'
+
+[[negative]]
+name = "trailing pipe"
+example = 'ROW a = 1 |'
+
+[[negative]]
+name = "field without a value"
+example = 'ROW a ='
+
+[[negative]]
+name = "unknown command"
+example = 'FROM logs | FROBNICATE message'
+
+[[negative]]
+name = "LIMIT without a count"
+example = 'FROM logs | LIMIT'
+
+[[negative]]
+name = "negative LIMIT"
+example = 'FROM logs | LIMIT -1'
+
+[[negative]]
+name = "SORT without a key"
+example = 'FROM logs | SORT'
+
+[[negative]]
+name = "unclosed call"
+example = 'ROW a = ABS(1'
+
+[[negative]]
+name = "unterminated string"
+example = 'ROW a = "x'
+
+[[negative]]
+name = "comparison chain"
+example = 'FROM logs | WHERE a == 1 == 2'
+
+[[negative]]
+name = "FORK with one branch"
+example = 'FROM logs | FORK (WHERE dur > 5)'
+
+[[negative]]
+name = "SET without a terminator"
+example = 'SET a = 1 ROW x = 1'
+
+# ---------------------------------------------------------------------------
+# Transport: the options of the Elasticsearch query endpoint
+# (`POST /_query`). None is served yet: Ravel's own ES|QL endpoint and the
+# Elasticsearch-shaped adapter are later work (ADR-2887 D12).
+# ---------------------------------------------------------------------------
+
+[[transport]]
+name = "query"
+description = "the statement text in the request body"
+state = "absent"
+
+[[transport]]
+name = "params"
+description = "positional and named parameter values"
+state = "absent"
+
+[[transport]]
+name = "filter"
+description = "a query DSL filter applied before the statement"
+state = "absent"
+
+[[transport]]
+name = "columnar"
+description = "values returned column by column"
+state = "absent"
+
+[[transport]]
+name = "locale"
+description = "the locale for formatting"
+state = "absent"
+
+[[transport]]
+name = "profile"
+description = "a profile of the execution returned with the result"
+state = "absent"
+
+[[transport]]
+name = "include_ccs_metadata"
+description = "per-cluster metadata in the response"
+state = "absent"
+
+[[transport]]
+name = "tables"
+description = "inline tables for lookup"
+state = "absent"
+
+[[transport]]
+name = "format"
+description = "the response format: json, csv, tsv, txt, yaml, cbor, smile or arrow"
+state = "absent"
+
+[[transport]]
+name = "delimiter"
+description = "the separator of the csv format"
+state = "absent"
+
+[[transport]]
+name = "drop_null_columns"
+description = "columns that are null in every row left out"
+state = "absent"
+
+[[transport]]
+name = "async query"
+description = "POST /_query/async, with wait_for_completion_timeout, keep_alive and keep_on_completion"
+state = "absent"
+
+[[transport]]
+name = "warnings"
+description = "warnings returned as Warning response headers"
+state = "absent"
+
+# ---------------------------------------------------------------------------
+# Divergences: valid statements Ravel answers differently from the release.
+# ---------------------------------------------------------------------------
+
+[[divergence]]
+id = "attribute-fallback"
+name = "an unmapped field reads an attribute key"
+description = "A field name that is not a native column or a typed attribute column resolves to the log record's attribute of that key, read as a keyword, and reads null where a record lacks it (ADR-2887 D10 rule 4). The release reports an unknown column."
+evidence = "crates/ravel-sql/tests/esql/binder.rs::an_attribute_reads_null_when_absent"
+no_entry = "The release refuses a statement that names an unmapped field, so an example showing the divergence has no release answer to compare Ravel's with."
+
+[[divergence]]
+id = "shadowing"
+name = "@timestamp and message shadow attributes"
+description = "@timestamp and message always name the record's timestamp and body; an attribute with either key is not reachable under that name."
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::timestamp_and_message_shadow_attributes_of_the_same_name"
+no_entry = "The logs fixture carries no attribute named @timestamp or message, so no example run on it can reach a shadowed attribute."
+
+[[divergence]]
+id = "clock-bound"
+name = "no rows after the query clock without an upper bound"
+description = "A statement with no upper bound on @timestamp and no request end returns no record later than the query clock (the ADR-2887 D11 amendment)."
+evidence = "crates/ravel-sql/tests/esql/window.rs::a_lower_bound_alone_returns_rows_up_to_the_clock_on_every_layout"
+no_entry = "Every record of the logs fixture is earlier than its query clock, so no example run on it returns a record the bound removes."
+
+[[divergence]]
+id = "depth-limit"
+name = "expression depth limit of 24"
+description = "A statement that binds to an expression deeper than 24 is refused with a verification error."
+evidence = "crates/ravel-sql/tests/esql/limits.rs::an_expression_past_the_depth_limit_is_refused"
+no_entry = "No example binds to an expression deeper than 24."
+
+[[divergence]]
+id = "stage-limit"
+name = "plan stage limit of 10"
+description = "A statement with more than 10 processing commands is refused with a verification error."
+evidence = "crates/ravel-sql/tests/esql/limits.rs::a_statement_past_the_stage_limit_is_refused"
+no_entry = "No example has more than 10 processing commands."
+
+[[divergence]]
+id = "row-cap"
+name = "10,000-row result cap"
+description = "A final LIMIT above 10,000 is lowered to 10,000."
+evidence = "crates/ravel-sql/tests/esql/limits.rs::a_final_limit_above_the_ceiling_is_lowered_to_it"
+no_entry = "The logs fixture has six records, so no example returns more than 10,000 rows."
+
+[[divergence]]
+id = "overflow-null"
+name = "overflow and division by zero give null without a warning"
+description = "Integer overflow, division by zero and remainder by zero give null, and the response carries no warning for them."
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::an_overflow_gives_null_without_a_warning"
+no_entry = "No example overflows or divides by zero."
+
+[[divergence]]
+id = "integer-literal"
+name = "an integer literal is a long"
+description = "An integer literal that fits in 32 bits is typed long, where the release types it integer."
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::an_integer_literal_is_typed_long"
+
+[[divergence]]
+id = "from-columns"
+name = "FROM lists the native columns in a fixed order"
+description = "FROM without KEEP returns the native columns in Ravel's fixed order (@timestamp, observed_ts, severity_num, severity_text, message, trace_id, span_id, flags, dur, region), where the release lists the mapped fields sorted by name."
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::from_lists_the_native_columns_in_a_fixed_order"
+
+[[divergence]]
+id = "now-type"
+name = "NOW() is a date_nanos"
+description = "NOW() is typed date_nanos, where the release types it date at millisecond precision."
+evidence = "crates/ravel-sql/tests/esql/manifest.rs::now_is_typed_date_nanos"
