@@ -241,7 +241,8 @@ check_eq "affected-tests -n: it is the closure line" "1" \
   "$(count_matching "${tmp}/at-dry.out" '^affected crates: ravel-query ')"
 check_eq "affected-tests -n: runs no test" "0" "$(builds "${tmp}/at-dry.calls")"
 
-# ravel-server in the closure: the sql and flight-sql test runs, ci profile.
+# ravel-server in the closure: the sql, flight-sql and esql test runs, ci
+# profile.
 run_stubbed at-query bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
 calls="${tmp}/at-query.calls"
 check_eq "affected-tests -p ravel-query: exit 0" "0" "${rc}"
@@ -249,6 +250,8 @@ check_eq "affected-tests -p ravel-query: sql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features sql')"
 check_eq "affected-tests -p ravel-query: flight-sql tests" "1" \
   "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server -p ravel-sql --features flight-sql')"
+check_eq "affected-tests -p ravel-query: esql tests" "1" \
+  "$(count "${calls}" 'cargo nextest run --cargo-profile ci -p ravel-server --features esql')"
 
 # Neither crate in the closure: no feature run.
 run_stubbed at-affinity bash "${SCRIPTS}/affected-tests.sh" -p ravel-affinity
@@ -261,6 +264,12 @@ CARGO_STUB_FAIL_ON="--features sql" run_stubbed at-fail bash "${SCRIPTS}/affecte
 check_eq "affected-tests, sql run fails: exit 3" "3" "${rc}"
 check_eq "affected-tests, sql run fails: flight-sql still ran" "1" \
   "$(count_matching "${tmp}/at-fail.calls" '--features flight-sql$')"
+
+# A failing esql run fails the script too.
+CARGO_STUB_FAIL_ON="--features esql" run_stubbed at-esql-fail bash "${SCRIPTS}/affected-tests.sh" -p ravel-query
+check_eq "affected-tests, esql run fails: exit 3" "3" "${rc}"
+check_eq "affected-tests, esql run fails: sql still ran" "1" \
+  "$(count_matching "${tmp}/at-esql-fail.calls" '--features sql$')"
 
 printf '\n%d passed, %d failed\n' "${pass}" "${fail}"
 [[ ${fail} -eq 0 ]]

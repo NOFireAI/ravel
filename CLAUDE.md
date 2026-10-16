@@ -230,9 +230,10 @@ connection, a pushed-but-broken main).
   args runs the full workspace gate; `-p CRATE` (repeatable) scopes
   clippy/test/doc to the named crates and every workspace crate that
   depends on them, transitively (the closure `affected-tests.sh -n`
-  prints). It also runs the `sql` and `flight-sql` feature lanes, always
-  in workspace mode, and in scoped mode `sql` when `ravel-server` is in
-  the closure and `flight-sql` when `ravel-sql` or `ravel-server` is.
+  prints). It also runs the `sql`, `flight-sql` and `esql` feature lanes,
+  always in workspace mode, and in scoped mode `sql` when `ravel-server`
+  is in the closure, `flight-sql` when `ravel-sql` or `ravel-server` is,
+  and `esql` when `ravel-esql`, `ravel-sql` or `ravel-server` is.
   This is the executor's gate in fleet specs. A scoped run writes no
   gates-pass receipt. `--dry-run` prints the closure and every cargo
   command the same arguments would run, then exits 0 without building;
@@ -392,9 +393,9 @@ connection, a pushed-but-broken main).
   for the named crates plus every workspace crate that depends on them
   (transitively), with the `ci` cargo profile; `-n` prints the affected
   set without running. When ravel-server is in the closure it also runs
-  `-p ravel-server --features sql`, and when ravel-sql or ravel-server
-  is, `-p ravel-server -p ravel-sql --features flight-sql`, on the same
-  profile. Full-workspace tests still run at merge time
+  `-p ravel-server --features sql` and `-p ravel-server --features
+  esql`, and when ravel-sql or ravel-server is, `-p ravel-server -p
+  ravel-sql --features flight-sql`, on the same profile. Full-workspace tests still run at merge time
   (verify-dispatch-gates.sh and PR CI), so executors only pay for the
   blast radius of their change; fleet specs gate with `scripts/gates.sh
   -p`, which reads its closure from this script's `-n`. Doctests included

@@ -12,12 +12,12 @@
 # artifacts) and cargo-nextest when installed, plain `cargo test` otherwise.
 # Doctests run separately: nextest does not execute them.
 #
-# ravel-server's `sql` and `flight-sql` surfaces compile only under their
-# features, which are off by default, so the plain closure run does not test
-# them with the feature selected on its own. When ravel-server is in the
-# closure this also runs
-# `-p ravel-server --features sql`, and when ravel-sql or ravel-server is, `-p
-# ravel-server -p ravel-sql --features flight-sql`, both on the `ci` profile.
+# ravel-server's `sql`, `flight-sql` and `esql` surfaces compile only under
+# their features, which are off by default, so the plain closure run does not
+# test them with the feature selected on its own. When ravel-server is in the
+# closure this also runs `-p ravel-server --features sql` and `-p ravel-server
+# --features esql`, and when ravel-sql or ravel-server is, `-p ravel-server -p
+# ravel-sql --features flight-sql`, all on the `ci` profile.
 # The exit code is the first failing run's, after every run has finished.
 #
 # scripts/gates.sh reads its scoped closure from `-n`, so `-n` prints the
@@ -133,7 +133,14 @@ case "$affected" in
     ;;
 esac
 
-for code in "$rc" "$doc_rc" "$sql_rc" "$flight_rc"; do
+esql_rc=0
+case "$affected" in
+  *" ravel-server "*)
+    run_tests -p ravel-server --features esql || esql_rc=$?
+    ;;
+esac
+
+for code in "$rc" "$doc_rc" "$sql_rc" "$flight_rc" "$esql_rc"; do
   if [ "$code" -ne 0 ]; then
     exit "$code"
   fi
