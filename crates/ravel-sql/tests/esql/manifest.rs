@@ -195,9 +195,26 @@ fn text_at(example: &str, line: usize, column: usize) -> String {
         .unwrap_or_default()
 }
 
+fn is_word(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `marker` occurs in `text` as a whole token: no word character
+/// joins it on either side where its own edge is a word character, so
+/// `LIKE` is not found inside `RLIKE`.
+fn names_token(text: &str, marker: &str) -> bool {
+    let starts_word = marker.chars().next().is_some_and(is_word);
+    let ends_word = marker.chars().last().is_some_and(is_word);
+    text.match_indices(marker).any(|(at, _)| {
+        let before = text[..at].chars().next_back();
+        let after = text[at + marker.len()..].chars().next();
+        !(starts_word && before.is_some_and(is_word)) && !(ends_word && after.is_some_and(is_word))
+    })
+}
+
 /// Whether `prepared` is the binder's refusal of `entry`: an `Unsupported`
-/// error naming the entry's construct, or, for an entry refused through an
-/// earlier construct, naming that construct. A message that names no
+/// error naming the entry's construct as a whole token, or, for an entry
+/// refused through an earlier construct, naming that construct. A message that names no
 /// construct ("this expression") must point at text starting with it.
 fn binder_refusal(
     manifest: &Manifest,
@@ -215,7 +232,7 @@ fn binder_refusal(
     match prepared {
         Err(EsqlError::Unsupported { name, line, column }) => {
             let positional = name.starts_with("this ");
-            if name.contains(&marker)
+            if names_token(name, &marker)
                 || (positional && text_at(&entry.example, *line, *column).starts_with(&marker))
             {
                 Ok(())
@@ -309,6 +326,22 @@ async fn every_refused_entry_is_refused_with_a_typed_error() {
 
 /// A manifest of one released entry with the given states and example.
 fn one_entry(example: &str, parser: &str, binder: &str, executor: &str) -> Manifest {
+    entry_with(example, parser, binder, executor, "")
+}
+
+/// A manifest of one binder-refused entry whose refusal must name `refusal`.
+fn binder_refused(example: &str, refusal: &str) -> Manifest {
+    entry_with(
+        example,
+        "supported",
+        "refused",
+        "refused",
+        &format!("refusal = \"{refusal}\"\n"),
+    )
+}
+
+/// `one_entry` with `extra` appended to the entry's table.
+fn entry_with(example: &str, parser: &str, binder: &str, executor: &str, extra: &str) -> Manifest {
     manifest::load(&format!(
         r#"
 [release]
@@ -326,7 +359,7 @@ parser = "{parser}"
 binder = "{binder}"
 executor = "{executor}"
 evidence = "a.rs::t"
-"#
+{extra}"#
     ))
     .expect("the test manifest loads")
 }
@@ -393,6 +426,25 @@ async fn a_binder_refusal_must_name_the_construct() {
     .await;
     assert_eq!(refused, 0);
     assert!(wrong[0].contains("Verification"), "{wrong:#?}");
+}
+
+/// A refusal marker matches the refusal's construct as a whole token: an
+/// RLIKE refusal does not hold for an entry whose refusal names LIKE.
+#[tokio::test]
+async fn a_refusal_marker_matches_a_whole_token() {
+    let fixture = fixture().await;
+    let like = r#"FROM logs | WHERE message LIKE "a*""#;
+    let rlike = r#"FROM logs | WHERE message RLIKE "a.*""#;
+    let (refused, wrong) = check_refusals(&binder_refused(like, "LIKE"), &fixture).await;
+    assert_eq!((refused, wrong.len()), (1, 0), "{wrong:#?}");
+    let (refused, wrong) = check_refusals(&binder_refused(rlike, "RLIKE"), &fixture).await;
+    assert_eq!((refused, wrong.len()), (1, 0), "{wrong:#?}");
+    let (refused, wrong) = check_refusals(&binder_refused(rlike, "LIKE"), &fixture).await;
+    assert_eq!(refused, 0);
+    assert!(
+        wrong[0].contains("the refusal names \"RLIKE\""),
+        "{wrong:#?}"
+    );
 }
 
 #[test]
