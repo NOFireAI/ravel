@@ -603,11 +603,18 @@ naming the key.
   shorter) and counts as failed, so a server that accepts the connection and
   never answers is restarted instead of stalling the watchdog. The server
   start before each round polls that check, and a watchdog runs it every
-  5 s and restarts a server that fails it, polling up to 60 times 1 s apart
-  for readiness, without telling the connections, so calls during the outage
-  are errors. A refusal of `SELECT 1` under memory pressure therefore
-  restarts the server even while `/readyz` answers. Unlike upstream, the
-  watchdog's last sleep ends at the deadline and no check runs after it.
+  5 s and restarts a server that fails it, without telling the connections,
+  so calls during the outage are errors. A refusal of `SELECT 1` under memory
+  pressure therefore restarts the server even while `/readyz` answers. Unlike
+  upstream, the watchdog's last sleep ends at the deadline and no check runs
+  after it. Also unlike upstream, which polls a restarted server for
+  readiness 60 times 1 s apart, the watchdog polls as long as the kit's own
+  server start does (`KIT_READY_TRIES`, 600 tries 1 s apart), or until the
+  deadline, and runs no check while it waits: a server that needs more than
+  60 s to come up, as one on a page cache just dropped can, would otherwise
+  be given up on and stopped by the next failed check while still booting,
+  again and again until the deadline, and the whole round would read as an
+  outage.
   Every call is a line of `out/concurrent/calls.jsonl` with the benchmark's
   fields plus `round` and `connection`. In every phase a failed call's curl
   stderr file is removed once its line is written (the line's `error`

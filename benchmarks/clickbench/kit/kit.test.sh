@@ -132,7 +132,8 @@ cat >"$STUBS/curl" <<'STUB'
 # printing "000 <seconds>" for a -w format as curl does); the stub server
 # writes it only after logging its argv and settings, and removes it when
 # stopped. A readyz call is logged to readyz-calls. A body named check.json is
-# the concurrent phase's SELECT 1 check: it is logged to check-calls and, while
+# the concurrent phase's SELECT 1 check: it is logged to check-calls, whether
+# or not the server is ready, and, while
 # the check-refuse file exists, answered 503 (curl exit 22 under
 # --fail-with-body); while the check-hang file exists it is never answered, as
 # a server that accepts the connection and then hangs: curl exits 28 after its
@@ -181,6 +182,7 @@ case "$url" in
     [ -f "$STUB_DIR/server-ready" ] || { echo "curl: (7) Failed to connect" >&2; exit 7; }
     echo ready ;;
   */api/v1/sql)
+    case "$body" in */check.json) echo check >>"$STUB_DIR/check-calls" ;; esac
     if [ ! -f "$STUB_DIR/server-ready" ]; then
       [ -z "$wfmt" ] || printf '000 0.000412'
       echo "curl: (7) Failed to connect" >&2
@@ -188,7 +190,6 @@ case "$url" in
     fi
     case "$body" in
       */check.json)
-        echo check >>"$STUB_DIR/check-calls"
         if [ -f "$STUB_DIR/check-hang" ]; then
           [ -n "$maxtime" ] || exec sleep 3600
           sleep "$maxtime"
@@ -297,8 +298,10 @@ STUB
 # The box's binaries. The server logs its argv, the five settings stamps and
 # the store keys and audit key it was given (the evidence must not carry
 # them), removes the check-refuse and check-hang files, then after the seconds in the
-# ready-delay file, else STUB_READY_DELAY (default 0.05), writes the ready
-# file and sleeps until stopped; the CLI logs its argv, and `load` adds 100
+# ready-delay file, else STUB_READY_DELAY (default 0.05), and while the
+# ready-after-checks file exists until that many more SELECT 1 checks have
+# been logged, writes the ready file and sleeps until stopped; the CLI logs
+# its argv, and `load` adds 100
 # objects to the store and prints ravel-cli's load summary with
 # STUB_LOAD_ROWS rows written (default the hits row count). STUB_FOLD=unsealed
 # makes the fold seal nothing, STUB_FOLD=twice prints entry_count twice, and
@@ -313,6 +316,13 @@ done
 echo "stub-server: store access_key=${RAVEL_S3_ACCESS_KEY:-} secret_key=${RAVEL_S3_SECRET_KEY:-} audit_key=${RAVEL_AUDIT_TOKEN_KEY:-none}"
 rm -f "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang"
 sleep "$(cat "$STUB_DIR/ready-delay" 2>/dev/null || echo "${STUB_READY_DELAY:-0.05}")"
+if [ -f "$STUB_DIR/ready-after-checks" ]; then
+  want=$(($(cat "$STUB_DIR/check-calls" 2>/dev/null | wc -l) + $(cat "$STUB_DIR/ready-after-checks")))
+  for ((i = 0; i < 6000; i++)); do
+    [ "$(cat "$STUB_DIR/check-calls" 2>/dev/null | wc -l)" -lt "$want" ] || break
+    sleep 0.01
+  done
+fi
 sleep 120 &
 pid=$!
 trap 'rm -f "$STUB_DIR/server-ready"; kill "$pid" 2>/dev/null; exit 0' TERM
@@ -2347,7 +2357,8 @@ lib_box() {
   local box="$1"
   reset_log
   rm -f "$STUB_DIR/readyz-calls" "$STUB_DIR/check-calls" "$STUB_DIR/ready-delay" \
-    "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang" "$STUB_DIR/server-ready"
+    "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang" "$STUB_DIR/server-ready" \
+    "$STUB_DIR/ready-after-checks"
   boot_box A "$box" || return 1
   cat >"$box/lib-setup.sh" <<SETUP
 export KIT_ROOT="$box" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
@@ -2400,7 +2411,7 @@ lib_box "$BOX_O"
   # shellcheck source=/dev/null
   . "$BOX_O/lib-setup.sh"
   CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=5
-  WATCHDOG_INTERVAL=0.3 WATCHDOG_READY_TRIES=300
+  WATCHDOG_INTERVAL=0.3
   (
     until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
     sleep 0.5
@@ -2446,7 +2457,7 @@ lib_box "$BOX_M"
   # shellcheck source=/dev/null
   . "$BOX_M/lib-setup.sh"
   CONC_ROUNDS=1 CONC_CONNECTIONS=1 CONC_DURATION=3
-  WATCHDOG_INTERVAL=0.3 WATCHDOG_READY_TRIES=300
+  WATCHDOG_INTERVAL=0.3
   (
     until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
     sleep 0.2
@@ -2483,7 +2494,7 @@ lib_box "$BOX_H"
   # shellcheck source=/dev/null
   . "$BOX_H/lib-setup.sh"
   CONC_ROUNDS=1 CONC_CONNECTIONS=1 CONC_DURATION=3
-  WATCHDOG_INTERVAL=0.3 WATCHDOG_READY_TRIES=300
+  WATCHDOG_INTERVAL=0.3
   (
     until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
     sleep 0.2
@@ -2515,6 +2526,51 @@ else
   fail "hung SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-hang.log")"
 fi
 rm -f "$STUB_DIR/check-hang"
+
+# Catches: a watchdog whose restart waits less than the kit's own startup
+# (READY_TRIES): a server that needs more polls than that to come up is given
+# up on, stopped by the next failed check while it is still booting, and
+# restarted again until the round ends, so the whole round reads as an outage.
+# The server dies 0.5 s into the round and its restart answers only after 70
+# checks: more than upstream's 60, fewer than lib_box's KIT_READY_TRIES of 100.
+BOX_S="$TMP/box-slow-restart"
+lib_box "$BOX_S"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_S/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=10
+  WATCHDOG_INTERVAL=0.3
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.5
+    echo 70 >"$STUB_DIR/ready-after-checks"
+    kill -TERM "$(cat "$KIT/server.pid")"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  rm -f "$STUB_DIR/ready-after-checks"
+  stop_server
+) >"$TMP/slow-restart.log" 2>&1
+code=$?
+rm -f "$STUB_DIR/ready-after-checks"
+out="$(conc_outage_check "$BOX_S" 10)"
+starts="$(grep -c 'server start' "$BOX_S/kit/progress.log")"
+ok_after="$(python3 - "$BOX_S/kit/out/concurrent/calls.jsonl" <<'PY2' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+for conn in sorted(set(c["connection"] for c in calls)):
+    mine = [c for c in calls if c["connection"] == conn]
+    last_down = max([i for i, c in enumerate(mine) if c["http_status"] == 0] or [-1])
+    if last_down < 0 or not any(c["outcome"] == "ok" for c in mine[last_down + 1:]):
+        print("connection", conn, "saw no outage, or no success after it")
+PY2
+)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ "$starts" = 2 ] && [ -z "$ok_after" ]; then
+  pass "a restart slower than 60 polls is waited for, not stopped while it boots, and calls succeed once it is up"
+else
+  fail "slow watchdog restart" "exit $code, $starts server starts: $out $ok_after $(grep -c restart "$BOX_S/kit/out/concurrent/round-1/watchdog.log") restarts; $(tail -n 3 "$TMP/slow-restart.log")"
+fi
 
 # Catches: a failed concurrent call leaving its curl stderr file behind. A
 # connection to a dead endpoint fails fast and loops, so one outage leaves a
