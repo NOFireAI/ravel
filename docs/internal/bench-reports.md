@@ -34,8 +34,13 @@ format change would need numbers for before anyone builds it:
 3. **Integer pages.** For `ts`, `stream_ref`, `severity_num`, and `flags`: the
    PAGE_DIR page size against a FastLanes-style transposed bit-packed layout
    (1024-value vectors, 16 lanes, scalar code; frame-of-reference and
-   lane-delta variants), with decode throughput for all three. `observed_ts`
-   is listed under `excluded` when the writer stores it as a column reference.
+   lane-delta variants), with decode throughput for all three. A FastLanes
+   page pads its last vector to 1024 values, so its throughput is given twice:
+   over the page's real values, and over `padded_values`, the values it
+   unpacks. The two differ only on a page that is not a multiple of 1024
+   values, which is every page when `--block-records` is under 1024.
+   `observed_ts` is listed under `excluded` when the writer stores it as a
+   column reference.
 
 Each record is one corpus line as its body, in one stream, with a strictly
 increasing synthetic timestamp; the report's `stamp` states the exact rules.

@@ -75,7 +75,11 @@ integer codec decode (decode_i64 or decode_gcd_i64 on the production side, fastl
 the FastLanes side) on bytes already unsealed before the timer starts: both exclude the envelope \
 parse, the crc check, and zstd decompression when the production page is compressed, so the two \
 are compared on the codec alone. The enveloped byte-size figures (current_bytes, \
-fastlanes_*_enveloped_bytes) are unaffected and still include that envelope.";
+fastlanes_*_enveloped_bytes) are unaffected and still include that envelope. Integer throughput \
+divides by values * 8 bytes on both sides, so a FastLanes page whose last vector is padded to \
+1024 values pays for the padding in fastlanes_*_decode_mb_per_s; \
+fastlanes_*_padded_decode_mb_per_s divides the same time by padded_values * 8, the values \
+fastlanes::decode unpacks, and the two agree when values is a multiple of 1024.";
 
 const BASE_TS_NS: i64 = 1_700_000_000_000_000_000;
 const TS_STEP_NS: i64 = 1_000_000;
@@ -301,15 +305,18 @@ pub struct IntegerColumn {
     pub column_id: u32,
     pub pages: u64,
     pub values: u64,
+    pub padded_values: u64,
     pub current_bytes: u64,
     pub current_encodings: BTreeMap<String, u64>,
     pub current_decode_mb_per_s: f64,
     pub fastlanes_for_bytes: u64,
     pub fastlanes_for_enveloped_bytes: u64,
     pub fastlanes_for_decode_mb_per_s: f64,
+    pub fastlanes_for_padded_decode_mb_per_s: f64,
     pub fastlanes_delta_bytes: u64,
     pub fastlanes_delta_enveloped_bytes: u64,
     pub fastlanes_delta_decode_mb_per_s: f64,
+    pub fastlanes_delta_padded_decode_mb_per_s: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -325,15 +332,18 @@ pub struct IntegerPage {
     pub block: u64,
     pub column: &'static str,
     pub values: u64,
+    pub padded_values: u64,
     pub current_enc: String,
     pub current_bytes: u64,
     pub current_decode_mb_per_s: f64,
     pub fastlanes_for_bytes: u64,
     pub fastlanes_for_enveloped_bytes: u64,
     pub fastlanes_for_decode_mb_per_s: f64,
+    pub fastlanes_for_padded_decode_mb_per_s: f64,
     pub fastlanes_delta_bytes: u64,
     pub fastlanes_delta_enveloped_bytes: u64,
     pub fastlanes_delta_decode_mb_per_s: f64,
+    pub fastlanes_delta_padded_decode_mb_per_s: f64,
 }
 
 impl Report {
@@ -510,6 +520,7 @@ impl FprAcc {
 struct IntAcc {
     pages: u64,
     values: u64,
+    padded_values: u64,
     current_bytes: u64,
     encodings: BTreeMap<String, u64>,
     current_secs: f64,
@@ -581,6 +592,11 @@ fn time_median<T>(runs: usize, mut f: impl FnMut() -> T) -> f64 {
 
 fn mb_per_s(bytes: u64, secs: f64) -> f64 {
     bytes as f64 / secs / 1e6
+}
+
+/// Values `fastlanes::decode` actually unpacks for a page of `n` values.
+fn padded_len(n: usize) -> u64 {
+    (n.div_ceil(fastlanes::VECTOR) * fastlanes::VECTOR) as u64
 }
 
 fn ratio(a: u64, b: u64) -> f64 {
@@ -1086,6 +1102,7 @@ impl State {
                 return Err(fail(format!("block {global} {name}: page does not decode")));
             }
             let decoded = values.len() as u64 * 8;
+            let padded_values = padded_len(values.len());
             let current_raw = unseal(&current)?;
             let cur_secs = time_median(runs, || {
                 decode_int_from_raw(current.enc, &current_raw, values.len())
@@ -1105,6 +1122,7 @@ impl State {
             }
             acc.pages += 1;
             acc.values += values.len() as u64;
+            acc.padded_values += padded_values;
             acc.current_bytes += pd_bytes;
             bump(&mut acc.encodings, enc_name(pd_enc));
             acc.current_secs += cur_secs;
@@ -1118,15 +1136,18 @@ impl State {
                 block: global,
                 column: name,
                 values: values.len() as u64,
+                padded_values,
                 current_enc: enc_name(pd_enc),
                 current_bytes: pd_bytes,
                 current_decode_mb_per_s: mb_per_s(decoded, cur_secs),
                 fastlanes_for_bytes: fl[0].0,
                 fastlanes_for_enveloped_bytes: fl[0].1,
                 fastlanes_for_decode_mb_per_s: mb_per_s(decoded, fl[0].2),
+                fastlanes_for_padded_decode_mb_per_s: mb_per_s(padded_values * 8, fl[0].2),
                 fastlanes_delta_bytes: fl[1].0,
                 fastlanes_delta_enveloped_bytes: fl[1].1,
                 fastlanes_delta_decode_mb_per_s: mb_per_s(decoded, fl[1].2),
+                fastlanes_delta_padded_decode_mb_per_s: mb_per_s(padded_values * 8, fl[1].2),
             });
         }
         Ok(())
@@ -1250,20 +1271,24 @@ impl State {
                 continue;
             }
             let decoded = acc.values * 8;
+            let padded = acc.padded_values * 8;
             columns.push(IntegerColumn {
                 column: name,
                 column_id,
                 pages: acc.pages,
                 values: acc.values,
+                padded_values: acc.padded_values,
                 current_bytes: acc.current_bytes,
                 current_encodings: acc.encodings,
                 current_decode_mb_per_s: mb_per_s(decoded, acc.current_secs),
                 fastlanes_for_bytes: acc.for_bytes,
                 fastlanes_for_enveloped_bytes: acc.for_enveloped,
                 fastlanes_for_decode_mb_per_s: mb_per_s(decoded, acc.for_secs),
+                fastlanes_for_padded_decode_mb_per_s: mb_per_s(padded, acc.for_secs),
                 fastlanes_delta_bytes: acc.delta_bytes,
                 fastlanes_delta_enveloped_bytes: acc.delta_enveloped,
                 fastlanes_delta_decode_mb_per_s: mb_per_s(decoded, acc.delta_secs),
+                fastlanes_delta_padded_decode_mb_per_s: mb_per_s(padded, acc.delta_secs),
             });
         }
 
@@ -1528,18 +1553,53 @@ mod tests {
             "block",
             "column",
             "values",
+            "padded_values",
             "current_enc",
             "current_bytes",
             "current_decode_mb_per_s",
             "fastlanes_for_bytes",
             "fastlanes_for_enveloped_bytes",
             "fastlanes_for_decode_mb_per_s",
+            "fastlanes_for_padded_decode_mb_per_s",
             "fastlanes_delta_bytes",
             "fastlanes_delta_enveloped_bytes",
             "fastlanes_delta_decode_mb_per_s",
+            "fastlanes_delta_padded_decode_mb_per_s",
         ];
         per_page_fields.sort_unstable();
         assert_eq!(keys(&v["integer_pages"]["per_page"][0]), per_page_fields);
+    }
+
+    #[test]
+    fn padded_throughput_divides_by_the_values_fastlanes_unpacks() {
+        // BLOCK records per block is under one vector, so every page is padded.
+        let r = fixture_report();
+        let mut pages = 0;
+        for p in &r.integer_pages.per_page {
+            assert!(p.values > 0 && p.values <= BLOCK as u64);
+            assert_eq!(p.padded_values, 1024, "block {} {}", p.block, p.column);
+            let scale = p.padded_values as f64 / p.values as f64;
+            for (plain, padded) in [
+                (
+                    p.fastlanes_for_decode_mb_per_s,
+                    p.fastlanes_for_padded_decode_mb_per_s,
+                ),
+                (
+                    p.fastlanes_delta_decode_mb_per_s,
+                    p.fastlanes_delta_padded_decode_mb_per_s,
+                ),
+            ] {
+                assert!(
+                    (padded / plain - scale).abs() < 1e-9 * scale,
+                    "{plain} {padded}"
+                );
+            }
+            pages += 1;
+        }
+        assert_eq!(pages, 28);
+        for c in &r.integer_pages.columns {
+            assert_eq!(c.padded_values, c.pages * 1024, "{}", c.column);
+        }
     }
 
     #[test]

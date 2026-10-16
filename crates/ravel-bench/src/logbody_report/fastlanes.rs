@@ -72,8 +72,14 @@ fn pack(offsets: &[u64; VECTOR], width: u8, out: &mut Vec<u8>) {
     }
 }
 
-/// Inverse of [`pack`]: reads `width * LANES` words from `bytes`.
-fn unpack(bytes: &[u8], width: u8, out: &mut [u64; VECTOR]) -> Option<()> {
+/// Inverse of [`pack`]: reads `width * LANES` words from `bytes` into the
+/// front of `words`, which the caller owns so a page decode zeroes it once.
+fn unpack(
+    bytes: &[u8],
+    width: u8,
+    words: &mut [u64; 64 * LANES],
+    out: &mut [u64; VECTOR],
+) -> Option<()> {
     let w = usize::from(width);
     if w == 0 {
         out.fill(0);
@@ -81,7 +87,6 @@ fn unpack(bytes: &[u8], width: u8, out: &mut [u64; VECTOR]) -> Option<()> {
     }
     let need = w * LANES * 8;
     let src = bytes.get(..need)?;
-    let mut words = [0u64; 64 * LANES];
     for (dst, chunk) in words.iter_mut().zip(src.chunks_exact(8)) {
         *dst = u64::from_le_bytes(chunk.try_into().ok()?);
     }
@@ -118,13 +123,18 @@ fn frame(values: &[i64; VECTOR], out: &mut Vec<u8>) {
 }
 
 /// Reads one frame written by [`frame`] into `out`; returns the bytes read.
-fn unframe(bytes: &[u8], out: &mut [i64; VECTOR], scratch: &mut [u64; VECTOR]) -> Option<usize> {
+fn unframe(
+    bytes: &[u8],
+    out: &mut [i64; VECTOR],
+    words: &mut [u64; 64 * LANES],
+    scratch: &mut [u64; VECTOR],
+) -> Option<usize> {
     let base = i64::from_le_bytes(bytes.get(..8)?.try_into().ok()?);
     let width = *bytes.get(8)?;
     if width > 64 {
         return None;
     }
-    unpack(bytes.get(9..)?, width, scratch)?;
+    unpack(bytes.get(9..)?, width, words, scratch)?;
     for (o, &s) in out.iter_mut().zip(scratch.iter()) {
         *o = base.wrapping_add(s as i64);
     }
@@ -136,7 +146,9 @@ pub fn encode(values: &[i64], variant: Variant) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(values.len() as u32).to_le_bytes());
     for chunk in values.chunks(VECTOR) {
-        // Pad with the chunk's last value: offset or delta 0 past the end.
+        // Pad with the chunk's last value. For FOR that adds no new offset, so
+        // the width is unchanged; for Delta the first padded lane-row holds
+        // last minus a real value and every later padded row holds 0.
         let pad = chunk.last().copied().unwrap_or(0);
         let mut v = [pad; VECTOR];
         v[..chunk.len()].copy_from_slice(chunk);
@@ -173,10 +185,11 @@ pub fn decode(bytes: &[u8], variant: Variant) -> Option<Vec<i64>> {
     let mut at = 4;
     let mut vec = [0i64; VECTOR];
     let mut scratch = [0u64; VECTOR];
+    let mut words = [0u64; 64 * LANES];
     while out.len() < count {
         match variant {
             Variant::For => {
-                at += unframe(bytes.get(at..)?, &mut vec, &mut scratch)?;
+                at += unframe(bytes.get(at..)?, &mut vec, &mut words, &mut scratch)?;
             }
             Variant::Delta => {
                 let mut heads = [0i64; LANES];
@@ -185,7 +198,7 @@ pub fn decode(bytes: &[u8], variant: Variant) -> Option<Vec<i64>> {
                     *h = i64::from_le_bytes(bytes.get(s..s + 8)?.try_into().ok()?);
                 }
                 at += LANES * 8;
-                at += unframe(bytes.get(at..)?, &mut vec, &mut scratch)?;
+                at += unframe(bytes.get(at..)?, &mut vec, &mut words, &mut scratch)?;
                 vec[..LANES].copy_from_slice(&heads);
                 for i in LANES..VECTOR {
                     vec[i] = vec[i - LANES].wrapping_add(vec[i]);
