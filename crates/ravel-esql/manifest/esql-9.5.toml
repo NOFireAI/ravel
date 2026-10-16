@@ -88,7 +88,10 @@
 #           and requires the result to be the release's answer, and fails
 #           an entry whose answer matches without the undo. from-columns
 #           reorders Ravel's columns by name into the release's order, the
-#           cells moving with them; integer-literal reads a long column as
+#           cells moving with them, and applies only to an answer whose
+#           columns are all among the ten FROM gives and arrive in FROM's
+#           fixed order; an entry naming it with any other column does not
+#           load. integer-literal reads a long column as
 #           integer where the release's column is integer; now-type reads a
 #           date_nanos column as date where the release's column is date,
 #           rendered to the millisecond. No other divergence can be named.
@@ -224,22 +227,21 @@ kind = "processing_command"
 grammar = "own"
 name = "EVAL"
 preview = false
-example = 'FROM logs | EVAL d2 = dur * 2'
+example = 'FROM logs | EVAL d2 = dur * 2 | KEEP dur, d2'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "message:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword", "d2:long"]
+columns = ["dur:long", "d2:long"]
 rows = [
-  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab", 20]',
-  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null, 40]',
-  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null, null]',
-  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null, 10]',
-  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null, 14]',
-  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null, 2]',
+  '[10, 20]',
+  '[20, 40]',
+  '[null, null]',
+  '[5, 10]',
+  '[7, 14]',
+  '[1, 2]',
 ]
 order = "multiset"
 warnings = []
-divergence = "from-columns"
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -292,22 +294,21 @@ kind = "processing_command"
 grammar = "own"
 name = "RENAME"
 preview = false
-example = 'FROM logs | RENAME message AS msg'
+example = 'FROM logs | RENAME message AS msg | KEEP msg'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "msg:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+columns = ["msg:keyword"]
 rows = [
-  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
-  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
-  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
-  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
-  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
-  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+  '["a"]',
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
 ]
 order = "multiset"
 warnings = []
-divergence = "from-columns"
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]
@@ -646,22 +647,21 @@ kind = "syntax"
 grammar = "own"
 name = "RENAME with ="
 preview = false
-example = 'FROM logs | RENAME msg = message'
+example = 'FROM logs | RENAME msg = message | KEEP msg'
 parser = "supported"
 binder = "supported"
 executor = "supported"
-columns = ["@timestamp:date_nanos", "dur:long", "flags:long", "msg:keyword", "observed_ts:date_nanos", "region:keyword", "severity_num:long", "severity_text:keyword", "span_id:keyword", "trace_id:keyword"]
+columns = ["msg:keyword"]
 rows = [
-  '["2023-11-14T22:13:00.000000000Z", 10, 0, "a", "2023-11-14T22:13:00.000000000Z", "eu", 9, "INFO", null, "abababababababababababababababab"]',
-  '["2023-11-14T22:13:10.000000000Z", 20, 0, "b", "2023-11-14T22:13:10.000000000Z", null, 13, "INFO", null, null]',
-  '["2023-11-14T22:14:10.000000000Z", null, 0, "c", "2023-11-14T22:14:10.000000000Z", null, 17, "INFO", null, null]',
-  '["2023-11-14T22:14:20.000000000Z", 5, 0, "d", "2023-11-14T22:14:20.000000000Z", null, 13, "INFO", null, null]',
-  '["2023-11-14T22:15:10.000000000Z", 7, 0, "e", "2023-11-14T22:15:10.000000000Z", null, 5, "INFO", null, null]',
-  '["2023-11-14T22:15:20.000000000Z", 1, 0, "f", "2023-11-14T22:15:20.000000000Z", null, 21, "INFO", null, null]',
+  '["a"]',
+  '["b"]',
+  '["c"]',
+  '["d"]',
+  '["e"]',
+  '["f"]',
 ]
 order = "multiset"
 warnings = []
-divergence = "from-columns"
 evidence = "crates/ravel-sql/tests/esql/manifest.rs::every_executor_supported_entry_gives_the_release_answer"
 
 [[entry]]

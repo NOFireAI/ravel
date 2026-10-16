@@ -455,10 +455,39 @@ fn undo_divergence(id: &str, expected: &Answer, actual: &Answer) -> Result<Answe
     }
 }
 
+/// The columns `FROM logs` gives on the conformance fixture, in Ravel's
+/// fixed order: the native columns, then the fixture's declared `dur` and
+/// `region`. The from-columns divergence is this order where the release
+/// sorts by name, and nothing else.
+pub const FROM_COLUMNS: [&str; 10] = [
+    "@timestamp",
+    "observed_ts",
+    "severity_num",
+    "severity_text",
+    "message",
+    "trace_id",
+    "span_id",
+    "flags",
+    "dur",
+    "region",
+];
+
 /// Ravel's columns reordered by name into the release's order, each row's
-/// cells moving with their column. The names must be the release's, in a
-/// different order.
+/// cells moving with their column. The names must be the release's, every
+/// one of them in [`FROM_COLUMNS`], and Ravel's order must be that fixed
+/// order limited to the names present, so no other reordering is undone.
 fn undo_from_columns(expected: &Answer, actual: &Answer) -> Result<Answer, String> {
+    if let Some(column) = expected
+        .columns
+        .iter()
+        .chain(&actual.columns)
+        .find(|c| !FROM_COLUMNS.contains(&c.name.as_str()))
+    {
+        return Err(format!(
+            "column {:?} is not one FROM gives in a fixed order",
+            column.name
+        ));
+    }
     let names = |columns: &[Column]| -> Vec<String> {
         let mut names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
         names.sort();
@@ -469,6 +498,18 @@ fn undo_from_columns(expected: &Answer, actual: &Answer) -> Result<Answer, Strin
             "columns {} are not the release's {} in another order",
             show_columns(&actual.columns),
             show_columns(&expected.columns)
+        ));
+    }
+    let fixed: Vec<&str> = FROM_COLUMNS
+        .into_iter()
+        .filter(|name| actual.columns.iter().any(|c| c.name == *name))
+        .collect();
+    let order: Vec<&str> = actual.columns.iter().map(|c| c.name.as_str()).collect();
+    if order != fixed {
+        return Err(format!(
+            "Ravel's order [{}] is not FROM's fixed order [{}]",
+            order.join(", "),
+            fixed.join(", ")
         ));
     }
     let positions: Vec<usize> = expected
@@ -887,6 +928,20 @@ pub fn load(text: &str) -> Result<Manifest, ManifestError> {
                     "{:?}: divergence {id:?} has no normalisation, so the entry's answer \
                      could not be compared",
                     entry.name
+                ),
+            ));
+        }
+        if entry.divergence.as_deref() == Some("from-columns")
+            && let Some(column) = entry.expected.iter().flat_map(|e| &e.answer.columns).find(|c| {
+                !FROM_COLUMNS.contains(&c.name.as_str())
+            })
+        {
+            return Err(field(
+                entry.line,
+                &format!(
+                    "{:?}: from-columns undoes FROM's fixed column order only, and column \
+                     {:?} is not one FROM gives",
+                    entry.name, column.name
                 ),
             ));
         }
@@ -2205,23 +2260,23 @@ evidence = "a.rs::t"
     fn a_divergent_answer_compares_in_full_once_the_divergence_is_undone() {
         let text = |t: &str| Cell::Text(t.to_owned());
         let release = answer(
-            &[("a", "keyword"), ("b", "long")],
-            vec![
-                vec![text("x"), Cell::Long(1)],
-                vec![text("y"), Cell::Long(2)],
-            ],
-        );
-        let expected = divergent(&release, Order::Exact);
-        let ravel = answer(
-            &[("b", "long"), ("a", "keyword")],
+            &[("dur", "long"), ("message", "keyword")],
             vec![
                 vec![Cell::Long(1), text("x")],
                 vec![Cell::Long(2), text("y")],
             ],
         );
+        let expected = divergent(&release, Order::Exact);
+        let ravel = answer(
+            &[("message", "keyword"), ("dur", "long")],
+            vec![
+                vec![text("x"), Cell::Long(1)],
+                vec![text("y"), Cell::Long(2)],
+            ],
+        );
         assert_eq!(expected.compare_divergent("from-columns", &ravel), Ok(()));
         let mut changed = ravel.clone();
-        changed.rows[1][0] = Cell::Long(3);
+        changed.rows[1][1] = Cell::Long(3);
         let error = expected
             .compare_divergent("from-columns", &changed)
             .expect_err("a changed value");
@@ -2253,18 +2308,19 @@ evidence = "a.rs::t"
             .compare_divergent("from-columns", &release)
             .expect_err("no divergence shown");
         assert!(error.contains("without undoing"), "{error}");
-        let swapped_rows = answer(
-            &[("a", "keyword"), ("b", "long")],
-            vec![
-                vec![text("y"), Cell::Long(2)],
-                vec![text("x"), Cell::Long(1)],
-            ],
+        let sorted = answer(
+            &[("@timestamp", "date_nanos"), ("message", "keyword")],
+            vec![vec![text("t1"), text("x")], vec![text("t2"), text("y")]],
         );
-        let error = expected
+        let swapped_rows = Answer {
+            rows: vec![sorted.rows[1].clone(), sorted.rows[0].clone()],
+            ..sorted.clone()
+        };
+        let error = divergent(&sorted, Order::Exact)
             .compare_divergent("from-columns", &swapped_rows)
             .expect_err("columns already in order");
         assert!(error.contains("already in the release's order"), "{error}");
-        let renamed = answer(&[("c", "long"), ("a", "keyword")], ravel.rows.clone());
+        let renamed = answer(&[("c", "long"), ("message", "keyword")], ravel.rows.clone());
         let error = expected
             .compare_divergent("from-columns", &renamed)
             .expect_err("another column");
@@ -2277,6 +2333,77 @@ evidence = "a.rs::t"
             .compare_divergent("attribute-fallback", &ravel)
             .expect_err("no normalisation");
         assert!(error.contains("has no normalisation"), "{error}");
+    }
+
+    /// from-columns undoes FROM's fixed order and no other: a column FROM
+    /// does not give, such as one EVAL adds, is refused even when the names
+    /// match, and so is a FROM subset in an order that is not the fixed one.
+    #[test]
+    fn from_columns_undoes_only_the_fixed_order() {
+        let long = |n: i64| Cell::Long(n);
+        let release = answer(
+            &[("a", "long"), ("b", "long"), ("d2", "long")],
+            vec![vec![long(1), long(2), long(3)]],
+        );
+        let ravel = answer(
+            &[("d2", "long"), ("b", "long"), ("a", "long")],
+            vec![vec![long(3), long(2), long(1)]],
+        );
+        let error = divergent(&release, Order::Exact)
+            .compare_divergent("from-columns", &ravel)
+            .expect_err("columns FROM does not give");
+        assert_eq!(
+            error,
+            "cannot undo from-columns: column \"a\" is not one FROM gives in a fixed order"
+        );
+
+        let release = answer(
+            &[("dur", "long"), ("flags", "long"), ("message", "keyword")],
+            vec![vec![long(1), long(0), Cell::Text("x".to_owned())]],
+        );
+        let expected = divergent(&release, Order::Exact);
+        let shuffled = answer(
+            &[("flags", "long"), ("message", "keyword"), ("dur", "long")],
+            vec![vec![long(0), Cell::Text("x".to_owned()), long(1)]],
+        );
+        let error = expected
+            .compare_divergent("from-columns", &shuffled)
+            .expect_err("a FROM subset out of the fixed order");
+        assert_eq!(
+            error,
+            "cannot undo from-columns: Ravel's order [flags, message, dur] is not FROM's \
+             fixed order [message, flags, dur]"
+        );
+        let fixed = answer(
+            &[("message", "keyword"), ("flags", "long"), ("dur", "long")],
+            vec![vec![Cell::Text("x".to_owned()), long(0), long(1)]],
+        );
+        assert_eq!(expected.compare_divergent("from-columns", &fixed), Ok(()));
+    }
+
+    /// The loader refuses a from-columns entry whose answer has a column
+    /// FROM does not give, since the normalisation could never apply to it.
+    #[test]
+    fn a_from_columns_entry_needs_columns_from_gives() {
+        let runs = |columns: &str| {
+            RUNS.replacen(
+                "columns = [\"a:integer\", \"b:keyword\"]",
+                &format!("columns = {columns}"),
+                1,
+            )
+            .replace("integer-literal", "from-columns")
+        };
+        let native = runs("[\"dur:integer\", \"message:keyword\"]");
+        assert!(load(&format!("{ENTRY}{native}")).is_ok());
+        let error = load(&format!(
+            "{ENTRY}{}",
+            runs("[\"d2:integer\", \"message:keyword\"]")
+        ))
+        .expect_err("a column FROM does not give");
+        assert!(
+            error.to_string().contains("column \"d2\" is not one FROM gives"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -19,10 +19,10 @@ Each figure counts released entries only; development-only commands are listed b
 | Figure | Score | What counts |
 |---|---|---|
 | Syntax coverage | 84/84 | released entries with a parser rule of their own whose example the parser accepts |
-| Execution compatibility | 24/260 | released entries whose example runs and gives the release's answer, columns, types, rows and warnings; a valid entry Ravel refuses or answers differently is a gap |
+| Execution compatibility | 27/260 | released entries whose example runs and gives the release's answer, columns, types, rows and warnings; a valid entry Ravel refuses or answers differently is a gap |
 | Transport compatibility | 0/13 | options of the Elasticsearch query endpoint that Ravel serves |
 
-Ran and diverged: 27/260, released entries whose example runs and gives an answer that differs from the release's by exactly one known divergence: the answer differs as given, and undoing that divergence in it gives the release's columns, types, rows and warnings.
+Ran and diverged: 24/260, released entries whose example runs and gives an answer that differs from the release's by exactly one known divergence: the answer differs as given, and undoing that divergence in it gives the release's columns, types, rows and warnings.
 
 Ran: 51/260, released entries whose example runs, whether or not the answer matches.
 
@@ -35,9 +35,9 @@ Negative statements: 14, each refused by the parser. They are counted on this li
 | Kind | Entries | Parsed | Ran | Compatible |
 |---|---|---|---|---|
 | source_command | 5 | 5/5 | 2/5 | 0/5 |
-| processing_command | 20 | 20/20 | 8/20 | 2/20 |
+| processing_command | 20 | 20/20 | 8/20 | 4/20 |
 | directive | 1 | 1/1 | 0/1 | 0/1 |
-| syntax | 19 | 19/19 | 8/19 | 5/19 |
+| syntax | 19 | 19/19 | 8/19 | 6/19 |
 | function | 152 | 152/152 | 7/152 | 6/152 |
 | alias | 9 | 9/9 | 0/9 | 0/9 |
 | operator | 26 | 26/26 | 19/26 | 4/26 |
@@ -120,7 +120,7 @@ Valid statements Ravel answers differently from the release, each pinned by a te
 - **10,000-row result cap** (`row-cap`). A final LIMIT above 10,000 is lowered to 10,000. Test: `crates/ravel-sql/tests/esql/limits.rs::a_final_limit_above_the_ceiling_is_lowered_to_it`. No entry shows it: The logs fixture has six records, so no example returns more than 10,000 rows.
 - **Overflow and division by zero give null without a warning** (`overflow-null`). Integer overflow, division by zero and remainder by zero give null, and the response carries no warning for them. Test: `crates/ravel-sql/tests/esql/manifest.rs::an_overflow_gives_null_without_a_warning`. No entry shows it: No example overflows or divides by zero.
 - **An integer literal is a long** (`integer-literal`). An integer literal that fits in 32 bits is typed long, where the release types it integer. Test: `crates/ravel-sql/tests/esql/manifest.rs::an_integer_literal_is_typed_long`. Shown by: `ROW`, `comments`, `+`, `-`, `*`, `/`, `%`, `unary -`.
-- **FROM lists the native columns in a fixed order** (`from-columns`). FROM without KEEP returns the native columns in Ravel's fixed order (@timestamp, observed_ts, severity_num, severity_text, message, trace_id, span_id, flags, dur, region), where the release lists the mapped fields sorted by name. Test: `crates/ravel-sql/tests/esql/manifest.rs::from_lists_the_native_columns_in_a_fixed_order`. Shown by: `FROM`, `WHERE`, `EVAL`, `DROP`, `RENAME`, `SORT`, `LIMIT`, `RENAME with =`, `time duration literal`, `OR`, `AND`, `NOT`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`.
+- **FROM lists the native columns in a fixed order** (`from-columns`). FROM without KEEP returns the native columns in Ravel's fixed order (@timestamp, observed_ts, severity_num, severity_text, message, trace_id, span_id, flags, dur, region), where the release lists the mapped fields sorted by name. Test: `crates/ravel-sql/tests/esql/manifest.rs::from_lists_the_native_columns_in_a_fixed_order`. Shown by: `FROM`, `WHERE`, `DROP`, `SORT`, `LIMIT`, `time duration literal`, `OR`, `AND`, `NOT`, `<`, `<=`, `>`, `>=`, `IS NULL`, `IS NOT NULL`.
 - **NOW() is a date_nanos** (`now-type`). NOW() is typed date_nanos, where the release types it date at millisecond precision. Test: `crates/ravel-sql/tests/esql/manifest.rs::now_is_typed_date_nanos`. Shown by: `NOW`.
 
 ## Transport
@@ -155,10 +155,10 @@ Grammar is `own` for a form the parser has a rule for, and `call`, `cast` or `fi
 | source_command | `TS` |  | yes | own | supported | refused | refused |  | time series data stream | `TS metrics \| STATS r = SUM(RATE(requests))` |
 | source_command | `PROMQL` |  | yes | own | supported | refused | refused |  | time series data stream | `PROMQL (rate(http_requests_total[5m]))` |
 | processing_command | `WHERE` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| WHERE severity_num > 10` |
-| processing_command | `EVAL` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| EVAL d2 = dur * 2` |
+| processing_command | `EVAL` |  |  | own | supported | supported | supported |  |  | `FROM logs \| EVAL d2 = dur * 2 \| KEEP dur, d2` |
 | processing_command | `KEEP` |  |  | own | supported | supported | supported |  |  | `FROM logs \| KEEP @timestamp, message` |
 | processing_command | `DROP` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| DROP trace_id, span_id` |
-| processing_command | `RENAME` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| RENAME message AS msg` |
+| processing_command | `RENAME` |  |  | own | supported | supported | supported |  |  | `FROM logs \| RENAME message AS msg \| KEEP msg` |
 | processing_command | `STATS` |  |  | own | supported | supported | supported |  |  | `FROM logs \| STATS c = COUNT(*)` |
 | processing_command | `SORT` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| SORT severity_num DESC` |
 | processing_command | `LIMIT` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| LIMIT 3` |
@@ -182,7 +182,7 @@ Grammar is `own` for a form the parser has a rule for, and `call`, `cast` or `fi
 | syntax | `FROM subquery` |  | yes | own | supported | refused | refused |  |  | `FROM logs, (FROM logs \| WHERE dur > 5)` |
 | syntax | `STATS BY` |  |  | own | supported | supported | supported |  |  | `FROM logs \| STATS c = COUNT(*) BY region` |
 | syntax | `STATS aggregate WHERE` |  |  | own | supported | supported | supported |  |  | `FROM logs \| STATS c = COUNT(*) WHERE severity_num > 10 BY region` |
-| syntax | `RENAME with =` |  |  | own | supported | supported | supported | `from-columns` |  | `FROM logs \| RENAME msg = message` |
+| syntax | `RENAME with =` |  |  | own | supported | supported | supported |  |  | `FROM logs \| RENAME msg = message \| KEEP msg` |
 | syntax | `SORT NULLS FIRST and LAST` |  |  | own | supported | supported | supported |  |  | `FROM logs \| SORT region DESC NULLS LAST, dur ASC NULLS FIRST \| KEEP message` |
 | syntax | `LIMIT BY` |  | yes | own | supported | refused | refused |  |  | `FROM logs \| LIMIT 1 BY service` |
 | syntax | `DISSECT APPEND_SEPARATOR` |  |  | own | supported | refused | refused |  |  | `FROM logs \| DISSECT message "%{+a} %{+a}" APPEND_SEPARATOR = "-"` |

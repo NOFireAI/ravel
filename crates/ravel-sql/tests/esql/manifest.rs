@@ -522,7 +522,8 @@ fn a_timestamp_renders_with_nine_fraction_digits() {
 }
 
 /// FROM without KEEP lists the native columns in a fixed order, not sorted
-/// by name as the release lists mapped fields.
+/// by name as the release lists mapped fields. That order is
+/// `manifest::FROM_COLUMNS`, the only order from-columns undoes.
 #[tokio::test]
 async fn from_lists_the_native_columns_in_a_fixed_order() {
     let outcome = run(&fixture().await, "FROM logs").await.expect("runs");
@@ -530,21 +531,7 @@ async fn from_lists_the_native_columns_in_a_fixed_order() {
         .into_iter()
         .map(|(name, _)| name)
         .collect();
-    assert_eq!(
-        names,
-        [
-            "@timestamp",
-            "observed_ts",
-            "severity_num",
-            "severity_text",
-            "message",
-            "trace_id",
-            "span_id",
-            "flags",
-            "dur",
-            "region",
-        ]
-    );
+    assert_eq!(names, manifest::FROM_COLUMNS);
     let mut sorted = names.clone();
     sorted.sort();
     assert_ne!(names, sorted);
