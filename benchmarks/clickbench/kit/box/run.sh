@@ -114,6 +114,17 @@ export HOME="$KIT_ROOT"
 
 utc_now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# utc_now_to VAR: utc_now assigned to VAR, through bash 4.2's printf %()T
+# without forking date where bash has it.
+utc_now_to() {
+  if [ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" = 4 ] && [ "${BASH_VERSINFO[1]}" -ge 2 ]; }; then
+    local -x TZ=UTC0
+    printf -v "$1" '%(%Y-%m-%dT%H:%M:%SZ)T' -1
+  else
+    printf -v "$1" '%s' "$(utc_now)"
+  fi
+}
+
 stamp() {
   printf '%s %s\n' "$(utc_now)" "$*" >>"$PROGRESS"
 }
@@ -138,25 +149,46 @@ toml_or() {
   printf '%s\n' "$v"
 }
 
-json_str() {
-  local s
-  s="$(printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037')"
-  s="${s//\\/\\\\}"
-  s="${s//\"/\\\"}"
-  s="${s//$'\n'/\\n}"
-  s="${s//$'\t'/\\t}"
-  s="${s//$'\r'/\\r}"
-  printf '"%s"' "$s"
+# The control characters json_str_to drops: every one below 0x20 but tab, line
+# feed and carriage return, which it escapes. A list, not a range, so the
+# locale's collation order cannot widen it.
+JSON_DROP=$'[\001\002\003\004\005\006\007\010\013\014\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037]'
+
+# json_str_to VAR VALUE: VALUE as a JSON string, assigned to VAR without a
+# subshell, so run_query can build its record line without forking.
+json_str_to() {
+  # A name no caller's VAR uses: printf -v would set this local instead.
+  local __json_s="${2//$JSON_DROP/}"
+  __json_s="${__json_s//\\/\\\\}"
+  __json_s="${__json_s//\"/\\\"}"
+  __json_s="${__json_s//$'\n'/\\n}"
+  __json_s="${__json_s//$'\t'/\\t}"
+  __json_s="${__json_s//$'\r'/\\r}"
+  printf -v "$1" '"%s"' "$__json_s"
 }
 
-# json_num VALUE: VALUE as a JSON number when it is a decimal number, its
-# leading zeros dropped (curl's "000" is 0); null otherwise.
-json_num() {
-  if [[ "$1" =~ ^(-?)0*([0-9]+(\.[0-9]+)?)$ ]]; then
-    printf '%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+json_str() {
+  local s
+  json_str_to s "$1"
+  printf '%s' "$s"
+}
+
+# json_num_to VAR VALUE: VALUE as a JSON number when it is a decimal number,
+# its leading zeros dropped (curl's "000" is 0); null otherwise. Assigned to
+# VAR without a subshell.
+json_num_to() {
+  if [[ "$2" =~ ^(-?)0*([0-9]+(\.[0-9]+)?)$ ]]; then
+    printf -v "$1" '%s%s' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
   else
-    printf 'null'
+    printf -v "$1" 'null'
   fi
+}
+
+# json_num VALUE: json_num_to's value printed.
+json_num() {
+  local n
+  json_num_to n "$1"
+  printf '%s' "$n"
 }
 
 sha256_of() {
@@ -540,12 +572,19 @@ readyz_check() {
 }
 
 # sql_check: upstream ClickBench's ravel/check, a POST of SELECT 1 to the SQL
-# endpoint with curl --fail-with-body and no timeout, its body naming the
-# window every other call names (CHECK_BODY, written by phase_concurrent). It
-# fails on a refusal of SELECT 1 that readyz would not see.
+# endpoint with curl --fail-with-body, its body naming the window every other
+# call names (CHECK_BODY, written by phase_concurrent). It fails on a refusal
+# of SELECT 1 that readyz would not see.
+#
+# The one deliberate difference from upstream, whose check has no timeout:
+# CHECK_MAX_TIME (phase_concurrent sets it to 5 s or the watchdog interval,
+# whichever is smaller) bounds it, so a server that accepts the connection and
+# never answers fails the check and is restarted, instead of blocking the
+# watchdog, and with it the round's end, forever. It is a health probe, not a
+# measured call.
 sql_check() {
-  curl -sS --fail-with-body -o /dev/null -H @"$AUTH_HEADER" -H 'Content-Type: application/json' \
-    --data-binary @"$CHECK_BODY" "$SQL_URL" >/dev/null 2>&1
+  curl -sS --fail-with-body --max-time "${CHECK_MAX_TIME:-5}" -o /dev/null -H @"$AUTH_HEADER" \
+    -H 'Content-Type: application/json' --data-binary @"$CHECK_BODY" "$SQL_URL" >/dev/null 2>&1
 }
 
 stop_server() {
@@ -739,16 +778,22 @@ print(n)' "$dir/count.json" 2>/dev/null)" \
 # responses directory, RQ_MAX_TIME replaces query_timeout_s (empty sets no
 # client timeout), RQ_EXTRA is appended to the record as JSON members
 # (`"round": 1, "connection": 3`), and RQ_STATS=1 records the response's
-# stats object.
+# stats object. RQ_DEFER=1 reads no answer: a call that completed with a
+# status is recorded with a "pending" member naming its response file
+# (relative to the calls file's directory) and EXPECT_ROWS, and kit.py
+# concurrent-answers settles its rows, outcome, class and error later. With
+# RQ_DEFER=1 and no RQ_STATS a call starts no interpreter and forks nothing
+# but curl.
 run_query() {
   local phase="$1" number="$2" statement="$3" try="$4" body="$5" expect="${6:-}"
-  local dir="$OUT/$phase" resp w code=0 parsed err="" stats=""
+  local dir="$OUT/$phase" resp w code=0 parsed err="" stats="" pending=""
   local calls="${RQ_CALLS:-$dir/calls.jsonl}" rdir="${RQ_RESP_DIR:-$dir/responses}"
   local limit="${RQ_MAX_TIME-$QUERY_TIMEOUT_S}" opts=()
+  local j_statement j_arm j_phase j_start j_outcome j_class j_err j_dur j_http j_rows j_try j_resp j_exp
   [ -z "$limit" ] || opts=(--max-time "$limit")
-  mkdir -p "$rdir" || return 1
+  [ -d "$rdir" ] || mkdir -p "$rdir" || return 1
   resp="$rdir/$number-$try.json"
-  RQ_START="$(utc_now)"
+  utc_now_to RQ_START
   w="$(curl -sS -o "$resp" -w '%{http_code} %{time_total}' ${opts[@]+"${opts[@]}"} \
     -H @"$AUTH_HEADER" -H 'Content-Type: application/json' \
     --data-binary @"$body" "$SQL_URL" 2>"$rdir/$number-$try.curl")" || code=$?
@@ -759,7 +804,11 @@ run_query() {
   if [ "$code" -eq 28 ]; then
     RQ_OUTCOME=timeout
     RQ_CLASS=client_timeout
-    err="no answer within ${QUERY_TIMEOUT_S} s"
+    if [ -n "$limit" ]; then
+      err="no answer within $limit s"
+    else
+      err="transfer timed out (curl exit 28) with no client time limit set"
+    fi
   elif [ "${RQ_HTTP:-000}" = 000 ]; then
     RQ_OUTCOME=unreachable
     RQ_CLASS=transport
@@ -768,6 +817,12 @@ run_query() {
     RQ_OUTCOME=error
     RQ_CLASS=transfer
     err="HTTP $RQ_HTTP, then curl exit $code: $(head -c 300 "$rdir/$number-$try.curl" 2>/dev/null)"
+  elif [ "${RQ_DEFER:-}" = 1 ]; then
+    RQ_OUTCOME=error
+    [ "$RQ_HTTP" != 200 ] || RQ_OUTCOME=ok
+    json_str_to j_resp "${resp#"${calls%/*}/"}"
+    json_num_to j_exp "$expect"
+    pending=", \"pending\": {\"response\": $j_resp, \"expect\": $j_exp}"
   elif [ "$RQ_HTTP" = 200 ]; then
     RQ_ROWS="$(python3 -c 'import json, sys
 print(len(json.load(open(sys.argv[1]))["data"]["rows"]))' "$resp" 2>/dev/null)" || RQ_ROWS=""
@@ -798,13 +853,23 @@ print(json.dumps(json.load(open(sys.argv[1])).get("stats")))' "$resp" 2>/dev/nul
     stats=", \"stats\": ${stats:-null}"
   fi
   # Keep the first try's answer and every error; later ok answers repeat it.
-  [ "$RQ_OUTCOME" = ok ] && [ "$try" != 1 ] && rm -f "$resp"
-  printf '{"statement": %s, "number": %s, "arm": %s, "phase": %s, "try": %s, "start": %s, "duration_s": %s, "http_status": %s, "curl_exit": %s, "rows": %s, "outcome": %s, "refusal_class": %s, "error": %s%s%s}\n' \
-    "$(json_str "$statement")" "$(json_num "$((10#$number))")" "$(json_str "$ARM")" \
-    "$(json_str "$phase")" "$(json_num "$try")" "$(json_str "$RQ_START")" \
-    "$(json_num "$RQ_DURATION")" "$(json_num "${RQ_HTTP:-0}")" "$code" "$(json_num "$RQ_ROWS")" \
-    "$(json_str "$RQ_OUTCOME")" "$(json_str "$RQ_CLASS")" "$(json_str "$err")" \
-    "${RQ_EXTRA:+, $RQ_EXTRA}" "$stats" >>"$calls"
+  # A deferred answer stays until concurrent-answers has read it.
+  [ "$RQ_OUTCOME" = ok ] && [ "$try" != 1 ] && [ -z "$pending" ] && rm -f "$resp"
+  json_str_to j_statement "$statement"
+  json_str_to j_arm "$ARM"
+  json_str_to j_phase "$phase"
+  json_str_to j_start "$RQ_START"
+  json_str_to j_outcome "$RQ_OUTCOME"
+  json_str_to j_class "$RQ_CLASS"
+  json_str_to j_err "$err"
+  json_num_to j_try "$try"
+  json_num_to j_dur "$RQ_DURATION"
+  json_num_to j_http "${RQ_HTTP:-0}"
+  json_num_to j_rows "$RQ_ROWS"
+  printf '{"statement": %s, "number": %s, "arm": %s, "phase": %s, "try": %s, "start": %s, "duration_s": %s, "http_status": %s, "curl_exit": %s, "rows": %s, "outcome": %s, "refusal_class": %s, "error": %s%s%s%s}\n' \
+    "$j_statement" "$((10#$number))" "$j_arm" "$j_phase" "$j_try" "$j_start" "$j_dur" "$j_http" \
+    "$code" "$j_rows" "$j_outcome" "$j_class" "$j_err" "${RQ_EXTRA:+, $RQ_EXTRA}" "$stats" \
+    "$pending" >>"$calls"
 }
 
 # --- phases ----------------------------------------------------------------
@@ -874,14 +939,16 @@ phase_requests() {
 # passed, with no client timeout; a call in flight at the deadline completes
 # and is counted. The round's deadline is whole seconds, `date +%s` plus the
 # duration, as upstream computes it. A watchdog restarts a server that fails
-# upstream's check (sql_check, also the pre-round readiness poll) without
-# telling the connections, so calls during the outage are errors.
+# upstream's check (sql_check, also the pre-round readiness poll, bounded by
+# CHECK_MAX_TIME where upstream's has no timeout) without telling the
+# connections, so calls during the outage are errors.
 # kit.py concurrent-summary turns calls.jsonl and rounds.jsonl into the
 # results.json block.
 phase_concurrent() {
   local dir="$OUT/concurrent" r
   phase_requests "$dir" || return 1
   CHECK_BODY="$dir/check.json"
+  CHECK_MAX_TIME="$(awk -v s="$WATCHDOG_INTERVAL" 'BEGIN { print (s < 5 ? s : 5) }')"
   printf '{"query": "SELECT 1", "start": %s, "end": %s}\n' "$WINDOW_START" "$WINDOW_END" >"$CHECK_BODY"
   : >"$dir/calls.jsonl"
   : >"$dir/rounds.jsonl"
@@ -894,11 +961,12 @@ phase_concurrent() {
   kit_py concurrent-summary "$dir" >"$dir/summary.json"
 }
 
-# concurrent_round ROUND: one round into out/concurrent/round-ROUND/, then its
-# calls appended to calls.jsonl in connection order and its line to
-# rounds.jsonl.
+# concurrent_round ROUND: one round into out/concurrent/round-ROUND/, then,
+# after its timed window, its answers read (kit.py concurrent-answers settles
+# each deferred call's rows and wrong_answer), its calls appended to
+# calls.jsonl in connection order and its line to rounds.jsonl.
 concurrent_round() {
-  local r="$1" dir="$OUT/concurrent" rdir n id exp c nq start deadline end last pids="" failed=0
+  local r="$1" dir="$OUT/concurrent" rdir n id exp c nq start deadline end last pids="" failed=0 answers
   local READY_CHECK=sql_check
   local numbers=() ids=() expects=() orders=()
   rdir="$dir/round-$r"
@@ -928,6 +996,8 @@ concurrent_round() {
   for c in $pids; do wait "$c" || failed=1; done
   end="$(now_us)" || return 1
   [ "$failed" = 0 ] || { say "a concurrent connection could not record its calls in round $r"; return 1; }
+  answers="$(kit_py concurrent-answers "$rdir")" || return 1
+  stamp "concurrent answers round=$r: $answers"
   SERVER_PID="$(cat "$KIT/server.pid")"
   last="$(sed -n 's/^.*restart n=\([0-9]*\) .*$/\1/p' "$rdir/watchdog.log" | tail -n 1)"
   [ -z "$last" ] || SERVER_N="$last"
@@ -944,14 +1014,16 @@ concurrent_round() {
 
 # concurrent_worker ROUND CONNECTION DEADLINE ORDER: connection CONNECTION's
 # loop, reading numbers, ids and expects from concurrent_round. It checks the
-# deadline, whole epoch seconds, before each call and never after one.
+# deadline, whole epoch seconds, before each call and never after one. Its
+# calls are deferred (RQ_DEFER=1): no interpreter runs inside the round's
+# timed window, and concurrent_round reads the answers after it.
 concurrent_worker() {
   local r="$1" c="$2" deadline="$3" i=0 try=0 now expect
   # shellcheck disable=SC2206 # ORDER is a space-separated list of indexes
   local order=($4)
   local RQ_CALLS="$OUT/concurrent/round-$r/conn-$c.jsonl"
   local RQ_RESP_DIR="$OUT/concurrent/round-$r/conn-$c"
-  local RQ_MAX_TIME="" RQ_EXTRA="\"round\": $r, \"connection\": $c"
+  local RQ_MAX_TIME="" RQ_DEFER=1 RQ_EXTRA="\"round\": $r, \"connection\": $c"
   local nq="${#order[@]}" k
   while :; do
     now="$(date +%s)" || return 1

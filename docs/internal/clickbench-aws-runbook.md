@@ -597,8 +597,11 @@ naming the key.
   completes and is counted. The deadline is whole seconds, `date +%s` plus
   `concurrent_duration_s`, as upstream computes it. No call has a client
   timeout. Readiness in this phase uses upstream's check, not `/readyz`: a
-  POST of `SELECT 1` to `/api/v1/sql` with `curl --fail-with-body` and no
-  timeout, its body naming the same window as every other call. The server
+  POST of `SELECT 1` to `/api/v1/sql` with `curl --fail-with-body`, its body
+  naming the same window as every other call. Unlike upstream's check, which
+  has no timeout, it gives up after 5 s (or the watchdog interval, if
+  shorter) and counts as failed, so a server that accepts the connection and
+  never answers is restarted instead of stalling the watchdog. The server
   start before each round polls that check, and a watchdog runs it every
   5 s and restarts a server that fails it, polling up to 60 times 1 s apart
   for readiness, without telling the connections, so calls during the outage

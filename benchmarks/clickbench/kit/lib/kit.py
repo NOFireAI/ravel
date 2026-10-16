@@ -30,6 +30,10 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                OUT/<phase>/calls.jsonl as JSON
   permutation SEED CONN NQ     print connection CONN's statement order, as
                                upstream bench_concurrent_qps draws it
+  concurrent-answers DIR       settle the deferred calls in DIR's
+                               conn-*.jsonl from their response files: rows,
+                               outcome, refusal class (wrong_answer among
+                               them) and error, as run_query would have
   concurrent-summary DIR       print the concurrent block from DIR's
                                rounds.jsonl and calls.jsonl as JSON
   q29-summary DIR              print the q29_probe block from DIR/calls.jsonl
@@ -785,6 +789,63 @@ def _ok_2xx(call):
             and call.get("curl_exit") == 0)
 
 
+def _settle_answer(call, resp, expect):
+    """run_query's reading of an answer, for a call it recorded with RQ_DEFER:
+    a 200's row count against EXPECT, else the error body's errorType and
+    error."""
+    if call.get("http_status") == 200:
+        try:
+            rows = json.load(open(resp))["data"]["rows"]
+            n = len(rows) if isinstance(rows, list) else None
+        except (OSError, ValueError, KeyError, TypeError):
+            n = None
+        call["rows"] = n
+        if n is None:
+            call.update(outcome="error", refusal_class="unreadable_answer",
+                        error="HTTP 200 without a readable data.rows array")
+        elif expect is not None and n != expect:
+            call.update(outcome="error", refusal_class="wrong_answer",
+                        error="answer has %d rows, expected %d" % (n, expect))
+        else:
+            call.update(outcome="ok", refusal_class="", error="")
+        return
+    try:
+        d = json.load(open(resp))
+        cls, err = str(d.get("errorType", "")), str(d.get("error", ""))[:300]
+    except (OSError, ValueError, AttributeError):
+        cls, err = "", ""
+    call.update(outcome="error", refusal_class=cls or "unclassified", error=err)
+
+
+def concurrent_answers(d):
+    """Rewrite each DIR/conn-N.jsonl with every call's "pending" member (the
+    response file, relative to DIR, and the expected row count) replaced by
+    its settled rows, outcome, refusal_class and error. A settled ok answer
+    after try 1 is removed, as run_query removes it. Prints the number of
+    calls settled and of wrong answers among them."""
+    settled = wrong = 0
+    for name in sorted(os.listdir(d)):
+        if not re.match(r"^conn-[0-9]+\.jsonl$", name):
+            continue
+        path = os.path.join(d, name)
+        calls = _jsonl(path)
+        for c in calls:
+            p = c.pop("pending", None)
+            if p is None:
+                continue
+            resp = os.path.join(d, p["response"])
+            _settle_answer(c, resp, p.get("expect"))
+            settled += 1
+            wrong += c["refusal_class"] == "wrong_answer"
+            if c["outcome"] == "ok" and c.get("try") != 1 and os.path.exists(resp):
+                os.remove(resp)
+        with open(path + ".tmp", "w") as f:
+            for c in calls:
+                f.write(json.dumps(c) + "\n")
+        os.replace(path + ".tmp", path)
+    print("settled %d calls, %d wrong answers" % (settled, wrong))
+
+
 def concurrent_round(meta, calls):
     duration = meta["duration_s"]
     ok = sum(1 for c in calls if _ok_2xx(c))
@@ -889,8 +950,9 @@ def fold_perf(lines):
 
 
 def _concurrent_errors(tgz):
-    """Each statement's failed (non-2xx) concurrent calls, from the arm's
-    evidence tarball, and the total calls read."""
+    """Each statement's failed concurrent calls (not a 2xx answer with a
+    completed transfer, as _ok_2xx judges), from the arm's evidence tarball,
+    and the total calls read."""
     try:
         with tarfile.open(tgz) as t:
             f = t.extractfile("out/concurrent/calls.jsonl")
@@ -1250,6 +1312,8 @@ def main(argv):
             resolved_run(*args)
         elif cmd == "permutation" and len(args) == 3:
             print(" ".join(str(i) for i in permutation(*args)))
+        elif cmd == "concurrent-answers" and len(args) == 1:
+            concurrent_answers(args[0])
         elif cmd == "concurrent-summary" and len(args) == 1:
             print(json.dumps(concurrent_summary(args[0]), indent=2, sort_keys=True))
         elif cmd == "q29-summary" and len(args) == 1:

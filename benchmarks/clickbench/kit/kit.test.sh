@@ -134,7 +134,11 @@ cat >"$STUBS/curl" <<'STUB'
 # stopped. A readyz call is logged to readyz-calls. A body named check.json is
 # the concurrent phase's SELECT 1 check: it is logged to check-calls and, while
 # the check-refuse file exists, answered 503 (curl exit 22 under
-# --fail-with-body). STUB_SQL_TRUNCATE_N names a statement whose answer
+# --fail-with-body); while the check-hang file exists it is never answered, as
+# a server that accepts the connection and then hangs: curl exits 28 after its
+# --max-time, or never returns without one. STUB_SQL_TIMEOUT_N names a
+# statement whose call times out at once (curl exit 28, status 000).
+# STUB_SQL_TRUNCATE_N names a statement whose answer
 # prints status 200 and then fails the transfer (curl exit 18). A SQL call
 # logs its request body to
 # sql-bodies, writes an answer to -o and prints "<status> <seconds>":
@@ -153,13 +157,15 @@ body=""
 url=""
 wfmt=""
 fwb=""
+maxtime=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out="$2"; shift 2; continue ;;
+    --max-time) maxtime="$2"; shift 2; continue ;;
     --data-binary) body="${2#@}"; shift 2; continue ;;
     -w) wfmt="$2"; shift 2; continue ;;
     --fail-with-body) fwb=1 ;;
-    --max-time|-H|-X) shift 2; continue ;;
+    -H|-X) shift 2; continue ;;
     http*) url="$1" ;;
   esac
   shift
@@ -181,6 +187,12 @@ case "$url" in
     case "$body" in
       */check.json)
         echo check >>"$STUB_DIR/check-calls"
+        if [ -f "$STUB_DIR/check-hang" ]; then
+          [ -n "$maxtime" ] || exec sleep 3600
+          sleep "$maxtime"
+          echo "curl: (28) Operation timed out after $maxtime seconds with 0 bytes received" >&2
+          exit 28
+        fi
         if [ -f "$STUB_DIR/check-refuse" ]; then
           printf '{"status":"error","errorType":"unavailable","error":"memory pressure"}' >"$out"
           [ -z "$fwb" ] || exit 22
@@ -200,7 +212,11 @@ case "$url" in
     try="${out##*-}"
     try="${try%.json}"
     { cat "$body"; echo; } >>"$STUB_DIR/sql-bodies"
-    if [ "$n" = "${STUB_SQL_TRUNCATE_N:-none}" ]; then
+    if [ "$n" = "${STUB_SQL_TIMEOUT_N:-none}" ]; then
+      printf '000 0.3'
+      echo "curl: (28) Operation timed out" >&2
+      exit 28
+    elif [ "$n" = "${STUB_SQL_TRUNCATE_N:-none}" ]; then
       printf '{"status":"success","data":{"col' >"$out"
       printf '200 0.2'
       echo "curl: (18) transfer closed with outstanding read data remaining" >&2
@@ -273,7 +289,7 @@ STUB
 
 # The box's binaries. The server logs its argv, the five settings stamps and
 # the store keys and audit key it was given (the evidence must not carry
-# them), removes the check-refuse file, then after the seconds in the
+# them), removes the check-refuse and check-hang files, then after the seconds in the
 # ready-delay file, else STUB_READY_DELAY (default 0.05), writes the ready
 # file and sleeps until stopped; the CLI logs its argv, and `load` adds 100
 # objects to the store and prints ravel-cli's load summary with
@@ -288,7 +304,7 @@ for kv in fetch_concurrency=32 store_get_concurrency=32 cache_max_bytes=76890777
   printf '2026-10-11T10:00:00.000000Z  INFO ravel_server::config: performance default resolved setting="%s" value=%s source="derived"\n' "${kv%%=*}" "${kv#*=}"
 done
 echo "stub-server: store access_key=${RAVEL_S3_ACCESS_KEY:-} secret_key=${RAVEL_S3_SECRET_KEY:-} audit_key=${RAVEL_AUDIT_TOKEN_KEY:-none}"
-rm -f "$STUB_DIR/check-refuse"
+rm -f "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang"
 sleep "$(cat "$STUB_DIR/ready-delay" 2>/dev/null || echo "${STUB_READY_DELAY:-0.05}")"
 sleep 120 &
 pid=$!
@@ -2300,7 +2316,7 @@ lib_box() {
   local box="$1"
   reset_log
   rm -f "$STUB_DIR/readyz-calls" "$STUB_DIR/check-calls" "$STUB_DIR/ready-delay" \
-    "$STUB_DIR/check-refuse" "$STUB_DIR/server-ready"
+    "$STUB_DIR/check-refuse" "$STUB_DIR/check-hang" "$STUB_DIR/server-ready"
   boot_box A "$box" || return 1
   cat >"$box/lib-setup.sh" <<SETUP
 export KIT_ROOT="$box" KIT_RUN_SH_LIB=1 KIT_READY_TRIES=100 KIT_READY_INTERVAL=0.02
@@ -2418,6 +2434,57 @@ else
   fail "SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-refuse.log")"
 fi
 
+# kill_tree PID: SIGKILL PID and every process below it.
+kill_tree() {
+  local child
+  for child in $(pgrep -P "$1"); do kill_tree "$child"; done
+  kill -KILL "$1" 2>/dev/null
+}
+
+# Catches: a SELECT 1 check with no client time limit. A server that accepts
+# the connection and never answers then blocks the watchdog in the check
+# forever, so it never restarts the server or reaches its deadline, and the
+# round never ends. Here the check starts hanging 0.2 s into a 3 s round; the
+# case gives the round 20 s before calling it hung and killing it.
+BOX_H="$TMP/box-check-hang"
+lib_box "$BOX_H"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  CONC_ROUNDS=1 CONC_CONNECTIONS=1 CONC_DURATION=3
+  WATCHDOG_INTERVAL=0.3 WATCHDOG_READY_TRIES=300
+  (
+    until grep -q 'concurrent round=1' "$PROGRESS" 2>/dev/null; do sleep 0.05; done
+    sleep 0.2
+    touch "$STUB_DIR/check-hang"
+  ) &
+  killer=$!
+  phase_concurrent || exit 1
+  wait "$killer"
+  stop_server
+) >"$TMP/check-hang.log" 2>&1 &
+hang_pid=$!
+waited=0
+while kill -0 "$hang_pid" 2>/dev/null && [ "$waited" -lt 200 ]; do
+  sleep 0.1
+  waited=$((waited + 1))
+done
+if kill -0 "$hang_pid" 2>/dev/null; then
+  kill_tree "$hang_pid"
+  wait "$hang_pid" 2>/dev/null
+  code="hung for 20 s"
+else
+  code=0
+  wait "$hang_pid" || code=$?
+fi
+out="$(conc_outage_check "$BOX_H" 3)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ ! -e "$STUB_DIR/check-hang" ]; then
+  pass "a SELECT 1 check that never answers times out, restarts the server once, and the round ends at its deadline"
+else
+  fail "hung SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-hang.log")"
+fi
+rm -f "$STUB_DIR/check-hang"
+
 # Catches: run_query recording an answer whose status line said 200 but whose
 # transfer then failed as a success, or without its curl exit code.
 BOX_T="$TMP/box-transfer"
@@ -2454,6 +2521,116 @@ if [ "$code" = 0 ] && [ -z "$out" ]; then
   pass "run_query records a 200 with a failed transfer as curl_exit 18, an error in the concurrent figures"
 else
   fail "run_query transfer" "exit $code: $out $(tail -n 3 "$TMP/transfer.log")"
+fi
+
+# Catches: a concurrent connection starting python3 (to count an answer's rows
+# or classify a refusal) inside the round's timed window, where it competes
+# with the server for cores and deflates the QPS, or the deferred reading
+# after the round losing wrong_answer, a refusal's class, or a pending marker.
+# A python3 stub first on PATH logs every invocation made while any
+# connection's loop is running. Statement 01 answers 5 rows where the corpus
+# expects 1 and statement 02 is refused (422). TZ is not UTC, so a call's
+# start stamped in local time is caught too.
+mkdir -p "$TMP/pystub"
+cat >"$TMP/pystub/python3" <<STUB
+#!/usr/bin/env bash
+for f in "\$STUB_DIR"/window-*; do
+  [ ! -e "\$f" ] || { echo "python3 \$*" >>"\$STUB_DIR/py-window"; break; }
+done
+exec "$(command -v python3)" "\$@"
+STUB
+chmod +x "$TMP/pystub/python3"
+BOX_Y="$TMP/box-py-window"
+lib_box "$BOX_Y"
+rm -f "$STUB_DIR"/window-* "$STUB_DIR/py-window"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_Y/lib-setup.sh"
+  export PATH="$TMP/pystub:$PATH" STUB_SQL_ROWS_N=01 STUB_SQL_ROWS=5 STUB_SQL_REFUSE_N=02 STUB_SQL_TIME=0.05 TZ=Asia/Tokyo
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=2
+  eval "orig_$(declare -f concurrent_worker)"
+  concurrent_worker() {
+    local rc=0
+    touch "$STUB_DIR/window-$2"
+    orig_concurrent_worker "$@" || rc=$?
+    rm -f "$STUB_DIR/window-$2"
+    return "$rc"
+  }
+  phase_concurrent || exit 1
+  stop_server
+) >"$TMP/py-window.log" 2>&1
+code=$?
+in_window=0
+[ ! -f "$STUB_DIR/py-window" ] || in_window="$(wc -l <"$STUB_DIR/py-window" | tr -d ' ')"
+out="$(python3 - "$BOX_Y/kit/out/concurrent" <<'PY' 2>&1
+import json, os, sys
+d = sys.argv[1]
+calls = [json.loads(l) for l in open(os.path.join(d, "calls.jsonl"))]
+s = json.load(open(os.path.join(d, "summary.json")))
+wrong = [c for c in calls if c["refusal_class"] == "wrong_answer"]
+if not wrong or any((c["statement"][:3], c["rows"], c["outcome"], c["error"]) !=
+                    ("q01", 5, "error", "answer has 5 rows, expected 1") for c in wrong):
+    print("wrong answers", wrong[:2])
+if s["rounds"][0]["wrong_answer"] != len(wrong):
+    print("summary wrong_answer", s["rounds"][0]["wrong_answer"], "of", len(wrong))
+refused = [c for c in calls if c["http_status"] == 422]
+if not refused or any((c["refusal_class"], c["error"]) != ("resource_exhausted", "query pool exhausted")
+                      for c in refused):
+    print("refusals", refused[:2])
+import calendar, time
+skew = [c["start"] for c in calls
+        if abs(calendar.timegm(time.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")) - time.time()) > 300]
+if skew:
+    print("start not UTC under TZ=Asia/Tokyo", skew[:1])
+if any("pending" in c for c in calls):
+    print("a pending member left in calls.jsonl")
+oks = [c for c in calls if c["outcome"] == "ok"]
+if not oks or any(not isinstance(c["rows"], int) or c["refusal_class"] != "" for c in oks):
+    print("ok calls", oks[:2])
+rdir = os.path.join(d, "round-1")
+for c in calls:
+    f = os.path.join(rdir, "conn-%d" % c["connection"], "%02d-%d.json" % (c["number"], c["try"]))
+    if os.path.exists(f) != (c["outcome"] != "ok" or c["try"] == 1):
+        print("response file", f, "exists" if os.path.exists(f) else "missing", "for", c["outcome"])
+        break
+PY
+)"
+if [ "$code" = 0 ] && [ "$in_window" = 0 ] && [ -z "$out" ]; then
+  pass "a concurrent round starts no python3 in its timed window and still reports wrong answers after it"
+else
+  fail "concurrent harness cost" "exit $code, python3 started $in_window times in the window: $(head -n 2 "$STUB_DIR/py-window" 2>/dev/null) $out $(tail -n 3 "$TMP/py-window.log")"
+fi
+
+# Catches: a client timeout's error naming a limit the call never had: the
+# concurrent phase sets none, so its error says so, and a call with a limit
+# names that limit rather than query_timeout_s.
+BOX_X="$TMP/box-timeout-text"
+lib_box "$BOX_X"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_X/lib-setup.sh"
+  export STUB_SQL_TIMEOUT_N=07
+  phase_requests "$OUT/concurrent" || exit 1
+  start_server || exit 1
+  RQ_MAX_TIME="" run_query concurrent 07 q07 1 "$OUT/concurrent/requests/07.json" || exit 1
+  RQ_MAX_TIME=7 run_query concurrent 07 q07 2 "$OUT/concurrent/requests/07.json" || exit 1
+  stop_server
+) >"$TMP/timeout-text.log" 2>&1
+code=$?
+out="$(python3 - "$BOX_X/kit/out/concurrent/calls.jsonl" <<'PY' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+want = [("timeout", 28, "transfer timed out (curl exit 28) with no client time limit set"),
+        ("timeout", 28, "no answer within 7 s")]
+got = [(c["outcome"], c["curl_exit"], c["error"]) for c in calls]
+if got != want:
+    print("got", got)
+PY
+)"
+if [ "$code" = 0 ] && [ -z "$out" ]; then
+  pass "a client timeout names the call's own limit, or says it had none"
+else
+  fail "timeout error text" "exit $code: $out $(tail -n 3 "$TMP/timeout-text.log")"
 fi
 
 # Catches: a perf phase that fails after perf record and leaves the raw
