@@ -1,0 +1,170 @@
+//! Suite F (MARKER): every `check_marker` case against a real
+//! [`MemoryStore`], plus the read-error-refuses-with-fault-counter case
+//! against a [`FaultStore`]. These integration tests exercise only
+//! `ravel-ipcrypt`'s public surface (`check_marker`, `CheckOutcome`,
+//! `CheckError`, `MarkerError`), unlike the crate-internal unit tests beside
+//! `marker.rs` itself, which also cover `read_marker`/`create_marker`
+//! directly.
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
+use prost::Message;
+use ravel_ipcrypt::fingerprint::EMPTY_POLICY_FINGERPRINT;
+use ravel_ipcrypt::marker::{CheckError, CheckOutcome, MarkerError, check_marker};
+use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+use ravel_object_store::memory::MemoryStore;
+use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
+use ravel_proto::sys::v1 as sysproto;
+
+#[tokio::test]
+async fn no_marker_and_empty_local_proceeds_without_writing() {
+    let store = MemoryStore::new();
+    let outcome = check_marker(&store, EMPTY_POLICY_FINGERPRINT)
+        .await
+        .expect("ok");
+    assert_eq!(outcome, CheckOutcome::ProceededNoMarker);
+
+    // Nothing was written: a second call still sees no marker and still
+    // proceeds, rather than finding something this call should not have
+    // created.
+    let outcome_again = check_marker(&store, EMPTY_POLICY_FINGERPRINT)
+        .await
+        .expect("ok");
+    assert_eq!(outcome_again, CheckOutcome::ProceededNoMarker);
+}
+
+#[tokio::test]
+async fn no_marker_and_nonempty_local_creates_it() {
+    let store = MemoryStore::new();
+    let fp = [11u8; 32];
+    let outcome = check_marker(&store, fp).await.expect("ok");
+    assert_eq!(outcome, CheckOutcome::Created);
+
+    // The marker now exists and a later call with the same fingerprint
+    // matches it rather than creating a second one.
+    let outcome_again = check_marker(&store, fp).await.expect("ok");
+    assert_eq!(outcome_again, CheckOutcome::Matched);
+}
+
+#[tokio::test]
+async fn present_marker_matching_local_fingerprint_matches() {
+    let store = MemoryStore::new();
+    let fp = [22u8; 32];
+    check_marker(&store, fp).await.expect("first call creates");
+    let outcome = check_marker(&store, fp).await.expect("ok");
+    assert_eq!(outcome, CheckOutcome::Matched);
+}
+
+#[tokio::test]
+async fn present_marker_disagreeing_with_local_fingerprint_refuses() {
+    let store = MemoryStore::new();
+    let stored_fp = [33u8; 32];
+    let local_fp = [44u8; 32];
+    check_marker(&store, stored_fp)
+        .await
+        .expect("first call creates");
+
+    let err = check_marker(&store, local_fp).await.unwrap_err();
+    match err {
+        CheckError::Mismatch { stored, local } => {
+            assert_eq!(stored, hex::encode(stored_fp));
+            assert_eq!(local, hex::encode(local_fp));
+        }
+        other => panic!("expected Mismatch, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn empty_local_fingerprint_against_a_present_marker_is_also_a_mismatch() {
+    // The empty-policy sentinel is not special-cased on the "marker already
+    // present" path: a deployment that previously had a non-empty policy and
+    // now has none still needs an explicit re-key of the marker.
+    let store = MemoryStore::new();
+    let stored_fp = [55u8; 32];
+    check_marker(&store, stored_fp)
+        .await
+        .expect("first call creates");
+
+    let err = check_marker(&store, EMPTY_POLICY_FINGERPRINT)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, CheckError::Mismatch { .. }));
+}
+
+#[tokio::test]
+async fn decode_failure_refuses() {
+    let store = MemoryStore::new();
+    store
+        .put(
+            ravel_ipcrypt::marker::IPCRYPT_POLICY_KEY,
+            b"this is not a valid IpcryptPolicyMarker protobuf"
+                .to_vec()
+                .into(),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed a corrupt marker object");
+
+    let err = check_marker(&store, [1u8; 32]).await.unwrap_err();
+    assert!(matches!(err, CheckError::Marker(MarkerError::Decode(_))));
+}
+
+#[tokio::test]
+async fn unknown_format_version_refuses() {
+    let store = MemoryStore::new();
+    let bytes = sysproto::IpcryptPolicyMarker {
+        format_version: 7,
+        fingerprint: vec![9u8; 32],
+    }
+    .encode_to_vec();
+    store
+        .put(
+            ravel_ipcrypt::marker::IPCRYPT_POLICY_KEY,
+            bytes.into(),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed a future-versioned marker object");
+
+    let err = check_marker(&store, [1u8; 32]).await.unwrap_err();
+    assert!(matches!(
+        err,
+        CheckError::Marker(MarkerError::UnknownVersion { got: 7 })
+    ));
+}
+
+#[tokio::test]
+async fn lost_create_race_against_a_matching_winner_proceeds() {
+    // A real race (two processes both seeing no marker and both racing
+    // `CreateIfAbsent`) collapses to the same observable state as this
+    // sequential setup: by the time the "loser" calls `check_marker`, the
+    // marker the "winner" created is already present with the loser's own
+    // fingerprint.
+    let store = MemoryStore::new();
+    let fp = [66u8; 32];
+    check_marker(&store, fp).await.expect("winner creates");
+    let outcome = check_marker(&store, fp)
+        .await
+        .expect("loser re-reads and matches");
+    assert_eq!(outcome, CheckOutcome::Matched);
+}
+
+#[tokio::test]
+async fn read_error_refuses_and_is_distinguishable_from_absent() {
+    // Distinguishing test (suite F): an implementation that treated a
+    // transient store failure the same as "no marker present" would
+    // proceed (or wrongly attempt a create) here instead of refusing. The
+    // fault counter proves the fault actually fired, so this is not a
+    // vacuous pass.
+    let plan = FaultPlan::empty().with_rule(Rule::new(
+        Op::Get,
+        ScriptedFault::Transient("injected failure".to_string()),
+    ));
+    let store = FaultStore::new(MemoryStore::new(), plan);
+
+    let err = check_marker(&store, [1u8; 32]).await.unwrap_err();
+    assert!(matches!(
+        err,
+        CheckError::Marker(MarkerError::Store(StoreError::Transient(_)))
+    ));
+    assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
+}
