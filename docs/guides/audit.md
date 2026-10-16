@@ -132,10 +132,11 @@ to its commit record.
 An ES|QL statement is redacted token by token:
 
 - A string literal becomes a quoted `"tok_<hex>"` token.
-- A number in a value position, such as the `13` in `severity_num >= 13`,
-  becomes a quoted token of its text too.
-- A `LIMIT` count and an interval magnitude, such as the `5` in `5 minutes`,
-  stay readable.
+- Every number other than a `LIMIT` count, such as the `13` in
+  `severity_num >= 13`, becomes a quoted token of its text too. This
+  includes an interval magnitude, such as the `5` in `5 minutes`: the unit
+  word stays readable and the number does not.
+- A `LIMIT` count stays readable.
 - A comment becomes one space.
 - The query of a `PROMQL` command is redacted as a PromQL expression, and
   the value of each of its `name=value` parameters becomes a quoted token.
