@@ -467,8 +467,9 @@ const AUDIT_TOKEN_KEY_CONTEXT: &str = "ravel audit query-text token key v1";
 /// structure-preserving tokenization of a query's text, per query language.
 ///
 /// SQL statements go through `ravel_sql::redact` (sqlparser AST, literal
-/// values tokenized), ES|QL statements through `ravel_esql::lex` (string and
-/// value-position number literals and `PROMQL` parameter values tokenized,
+/// values tokenized), ES|QL statements through `ravel_esql::lex` (string
+/// literals, number literals other than a `LIMIT` count, and `PROMQL`
+/// parameter values tokenized,
 /// see `redact_esql`), and
 /// everything else through
 /// `ravel_promql::redact` (PromQL AST, label-matcher values and string
@@ -478,41 +479,6 @@ const AUDIT_TOKEN_KEY_CONTEXT: &str = "ravel audit query-text token key v1";
 pub struct AuditQueryTextRedactor {
     token_key: Box<[u8; 32]>,
 }
-
-/// The interval units ES|QL accepts (`ravel_esql::ast::Interval::kind`): a
-/// number written before one is an interval's magnitude, not a value.
-#[cfg(feature = "esql")]
-const ESQL_INTERVAL_UNITS: &[&str] = &[
-    "millisecond",
-    "milliseconds",
-    "ms",
-    "second",
-    "seconds",
-    "sec",
-    "s",
-    "minute",
-    "minutes",
-    "min",
-    "hour",
-    "hours",
-    "h",
-    "day",
-    "days",
-    "d",
-    "week",
-    "weeks",
-    "w",
-    "month",
-    "months",
-    "mo",
-    "quarter",
-    "quarters",
-    "q",
-    "year",
-    "years",
-    "yr",
-    "y",
-];
 
 impl AuditQueryTextRedactor {
     /// A redactor tokenizing under `token_key`.
@@ -565,12 +531,13 @@ impl AuditQueryTextRedactor {
     }
 
     /// Redact one ES|QL statement by lexing it: every string literal, every
-    /// number in a value position and every `PROMQL` parameter value becomes
-    /// a quoted token, the query of a `PROMQL` command is redacted as PromQL,
-    /// and every other token keeps its text. A number that shapes the statement rather than naming a
-    /// value, a `LIMIT` count or an interval's magnitude (`5 minutes`), stays
-    /// readable, as SQL's structural numbers do. A comment,
-    /// which may carry anything, becomes one space. Text that does not lex,
+    /// number other than a `LIMIT` count and every `PROMQL` parameter value
+    /// becomes a quoted token, the query of a `PROMQL` command is redacted as
+    /// PromQL, and every other token keeps its text. A `LIMIT` count stays
+    /// readable, as SQL's does. An interval's magnitude (the `5` in
+    /// `5 minutes`) becomes a token too, since a number written before a unit
+    /// word can be a caller's value. A comment, which may carry anything,
+    /// becomes one space. Text that does not lex,
     /// or lexes to a token kind this arm does not know, becomes one token over
     /// the whole text.
     #[cfg(feature = "esql")]
@@ -611,12 +578,7 @@ impl AuditQueryTextRedactor {
                 TokenKind::Integer | TokenKind::Decimal => {
                     let after_limit = word_at(index.checked_sub(1))
                         .is_some_and(|word| word.eq_ignore_ascii_case("LIMIT"));
-                    let before_unit = word_at(index.checked_add(1)).is_some_and(|word| {
-                        ESQL_INTERVAL_UNITS
-                            .iter()
-                            .any(|unit| unit.eq_ignore_ascii_case(word))
-                    });
-                    if after_limit || before_unit {
+                    if after_limit {
                         out.push_str(text);
                     } else {
                         out.push_str(&quoted(text));
@@ -10334,7 +10296,8 @@ mod tests {
 
     /// The `esql` arm keeps the statement's structure and tokenizes its
     /// values: a string literal and a value-position number become quoted
-    /// tokens, a `LIMIT` count and an interval magnitude stay readable, a
+    /// tokens, an interval magnitude becomes a quoted token, a `LIMIT` count
+    /// stays readable, a
     /// comment becomes one space, a `PROMQL` query is redacted as PromQL, and
     /// text that does not lex becomes one token.
     #[cfg(feature = "esql")]
@@ -10362,7 +10325,11 @@ mod tests {
                 "esql",
                 "FROM logs | WHERE @timestamp >= NOW() - 1 hour | STATS c = COUNT(*) BY b = BUCKET(@timestamp, 5 minutes)",
             ),
-            "FROM logs | WHERE @timestamp >= NOW() - 1 hour | STATS c = COUNT(*) BY b = BUCKET(@timestamp, 5 minutes)",
+            format!(
+                "FROM logs | WHERE @timestamp >= NOW() - \"{}\" hour | STATS c = COUNT(*) BY b = BUCKET(@timestamp, \"{}\" minutes)",
+                tok("1"),
+                tok("5"),
+            ),
         );
         assert_eq!(
             redactor.redact("esql", "FROM logs // alice@example.com\n| LIMIT 5"),
@@ -10378,6 +10345,36 @@ mod tests {
         );
         let unterminated = "FROM logs | WHERE body == \"alice";
         assert_eq!(redactor.redact("esql", unterminated), tok(unterminated));
+    }
+
+    /// A number written before an interval unit word can carry caller data:
+    /// `id == 4111111111111111 days` parses and is admitted before binding
+    /// fails. Its digits become a quoted token while the unit word stays
+    /// readable, and a `LIMIT` count in the same statement stays readable.
+    #[cfg(feature = "esql")]
+    #[test]
+    fn esql_redaction_tokenizes_interval_magnitudes() {
+        use ravel_maintain::QueryTextRedactor;
+
+        let key = [1u8; 32];
+        let redactor = AuditQueryTextRedactor::new(key);
+        let tok = |value: &str| ravel_promql::audit_token(&key, value.as_bytes());
+
+        let redacted = redactor.redact("esql", "FROM logs | WHERE id == 4111111111111111 days");
+        assert!(!redacted.contains("4111111111111111"), "{redacted}");
+        assert!(redacted.contains("days"), "{redacted}");
+        assert_eq!(
+            redacted,
+            format!(
+                "FROM logs | WHERE id == \"{}\" days",
+                tok("4111111111111111")
+            ),
+        );
+
+        assert_eq!(
+            redactor.redact("esql", "FROM logs | WHERE id == 42 days | LIMIT 7"),
+            format!("FROM logs | WHERE id == \"{}\" days | LIMIT 7", tok("42")),
+        );
     }
 
     /// A `PROMQL` parameter's value lexes as a source pattern after `=`, and
