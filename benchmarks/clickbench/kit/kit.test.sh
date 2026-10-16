@@ -2456,6 +2456,84 @@ else
   fail "run_query transfer" "exit $code: $out $(tail -n 3 "$TMP/transfer.log")"
 fi
 
+# Catches: a concurrent connection starting python3 (to count an answer's rows
+# or classify a refusal) inside the round's timed window, where it competes
+# with the server for cores and deflates the QPS, or the deferred reading
+# after the round losing wrong_answer, a refusal's class, or a pending marker.
+# A python3 stub first on PATH logs every invocation made while any
+# connection's loop is running. Statement 01 answers 5 rows where the corpus
+# expects 1 and statement 02 is refused (422). TZ is not UTC, so a call's
+# start stamped in local time is caught too.
+mkdir -p "$TMP/pystub"
+cat >"$TMP/pystub/python3" <<STUB
+#!/usr/bin/env bash
+for f in "\$STUB_DIR"/window-*; do
+  [ ! -e "\$f" ] || { echo "python3 \$*" >>"\$STUB_DIR/py-window"; break; }
+done
+exec "$(command -v python3)" "\$@"
+STUB
+chmod +x "$TMP/pystub/python3"
+BOX_Y="$TMP/box-py-window"
+lib_box "$BOX_Y"
+rm -f "$STUB_DIR"/window-* "$STUB_DIR/py-window"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_Y/lib-setup.sh"
+  export PATH="$TMP/pystub:$PATH" STUB_SQL_ROWS_N=01 STUB_SQL_ROWS=5 STUB_SQL_REFUSE_N=02 STUB_SQL_TIME=0.05 TZ=Asia/Tokyo
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=2
+  eval "orig_$(declare -f concurrent_worker)"
+  concurrent_worker() {
+    local rc=0
+    touch "$STUB_DIR/window-$2"
+    orig_concurrent_worker "$@" || rc=$?
+    rm -f "$STUB_DIR/window-$2"
+    return "$rc"
+  }
+  phase_concurrent || exit 1
+  stop_server
+) >"$TMP/py-window.log" 2>&1
+code=$?
+in_window=0
+[ ! -f "$STUB_DIR/py-window" ] || in_window="$(wc -l <"$STUB_DIR/py-window" | tr -d ' ')"
+out="$(python3 - "$BOX_Y/kit/out/concurrent" <<'PY' 2>&1
+import json, os, sys
+d = sys.argv[1]
+calls = [json.loads(l) for l in open(os.path.join(d, "calls.jsonl"))]
+s = json.load(open(os.path.join(d, "summary.json")))
+wrong = [c for c in calls if c["refusal_class"] == "wrong_answer"]
+if not wrong or any((c["statement"][:3], c["rows"], c["outcome"], c["error"]) !=
+                    ("q01", 5, "error", "answer has 5 rows, expected 1") for c in wrong):
+    print("wrong answers", wrong[:2])
+if s["rounds"][0]["wrong_answer"] != len(wrong):
+    print("summary wrong_answer", s["rounds"][0]["wrong_answer"], "of", len(wrong))
+refused = [c for c in calls if c["http_status"] == 422]
+if not refused or any((c["refusal_class"], c["error"]) != ("resource_exhausted", "query pool exhausted")
+                      for c in refused):
+    print("refusals", refused[:2])
+import calendar, time
+skew = [c["start"] for c in calls
+        if abs(calendar.timegm(time.strptime(c["start"], "%Y-%m-%dT%H:%M:%SZ")) - time.time()) > 300]
+if skew:
+    print("start not UTC under TZ=Asia/Tokyo", skew[:1])
+if any("pending" in c for c in calls):
+    print("a pending member left in calls.jsonl")
+oks = [c for c in calls if c["outcome"] == "ok"]
+if not oks or any(not isinstance(c["rows"], int) or c["refusal_class"] != "" for c in oks):
+    print("ok calls", oks[:2])
+rdir = os.path.join(d, "round-1")
+for c in calls:
+    f = os.path.join(rdir, "conn-%d" % c["connection"], "%02d-%d.json" % (c["number"], c["try"]))
+    if os.path.exists(f) != (c["outcome"] != "ok" or c["try"] == 1):
+        print("response file", f, "exists" if os.path.exists(f) else "missing", "for", c["outcome"])
+        break
+PY
+)"
+if [ "$code" = 0 ] && [ "$in_window" = 0 ] && [ -z "$out" ]; then
+  pass "a concurrent round starts no python3 in its timed window and still reports wrong answers after it"
+else
+  fail "concurrent harness cost" "exit $code, python3 started $in_window times in the window: $(head -n 2 "$STUB_DIR/py-window" 2>/dev/null) $out $(tail -n 3 "$TMP/py-window.log")"
+fi
+
 # Catches: a perf phase that fails after perf record and leaves the raw
 # perf.data in out/perf/, which evidence.tgz would then carry.
 BOX_F="$TMP/box-perf-fail"
