@@ -47,7 +47,7 @@ use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
-use ravel_catalog::{SegmentRef, ShardGeneration};
+use ravel_catalog::SegmentRef;
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -426,44 +426,6 @@ impl SpanSegmentFetcher {
     #[must_use]
     pub fn ts_range_relevant(seg_ref: &SegmentRef, ts_min_ns: i64, ts_max_ns: i64) -> bool {
         seg_ref.min_event_ts_ns <= ts_max_ns && ts_min_ns <= seg_ref.max_event_ts_ns
-    }
-
-    /// Per-object shard routing for a trace lookup, from the catalog summary
-    /// alone (ADR-2707 decision 7): false only when no shard count the trace
-    /// could have been routed under in the object's ingest-hour bucket maps
-    /// `trace_id` to the object's shard.
-    ///
-    /// The counts considered for bucket hour `h` are those of every generation
-    /// `g` with `activation_hour(g) <= h < activation_hour(g+1) + slack_hours`,
-    /// the generation set [`ravel_catalog::scan_count`] takes its maximum
-    /// over. An object whose shard cannot be determined that way (an empty
-    /// history, or an hour no generation admits) is kept: routing never
-    /// prunes on a guess.
-    #[must_use]
-    pub fn trace_may_route_to(
-        seg_ref: &SegmentRef,
-        trace_id: &[u8; 16],
-        generations: &[ShardGeneration],
-        slack_hours: u32,
-    ) -> bool {
-        let hour = seg_ref.ingest_hour_bucket;
-        let mut admitted = false;
-        for (idx, g) in generations.iter().enumerate() {
-            if g.activation_hour > hour {
-                continue;
-            }
-            let successor_activation = generations
-                .get(idx + 1)
-                .map_or(u64::MAX, |s| u64::from(s.activation_hour));
-            if u64::from(hour) >= successor_activation.saturating_add(u64::from(slack_hours)) {
-                continue;
-            }
-            admitted = true;
-            if trace_shard(trace_id, g.shard_count) == seg_ref.shard {
-                return true;
-            }
-        }
-        !admitted
     }
 
     /// Fetches, prunes, and scans one segment for spans matching `query` and
@@ -1028,6 +990,8 @@ impl SpanSegmentFetcher {
                     key_index.blocks_pruned = candidates_outside(&candidate_idx, &set);
                     Some(set)
                 }
+                // Unreachable today: `check_parameters` rejects a section
+                // that does not index `trace_id` as Id16 before `locate`.
                 Some(TraceKeyProbe::Declined) => {
                     tracing::warn!(
                         object = %key,
@@ -2268,21 +2232,6 @@ fn from_cache_error(
     }
 }
 
-/// The shard a span with `trace_id` routes to under `shard_count` shards.
-///
-/// Must equal `ravel_ingest::span_router::shard_for_span`, which routes the
-/// write side: blake3 of the trace id, its first 8 bytes as a little-endian
-/// `u64`, modulo the count. ravel-query cannot depend on ravel-ingest, so the
-/// rule is restated here and an equivalence test in ravel-server pins the two
-/// together.
-#[must_use]
-pub fn trace_shard(trace_id: &[u8; 16], shard_count: u32) -> u32 {
-    let hash = blake3::hash(trace_id);
-    let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&hash.as_bytes()[..8]);
-    (u64::from_le_bytes(prefix) % u64::from(shard_count.max(1))) as u32
-}
-
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -2439,99 +2388,6 @@ mod tests {
             segment_format_version: u32::from(ravel_rspan::footer::VERSION),
             declared_column_stats: Default::default(),
         }
-    }
-
-    fn generation(generation: u32, shard_count: u32, activation_hour: u32) -> ShardGeneration {
-        ShardGeneration {
-            generation,
-            shard_count,
-            activation_hour,
-            appended_unix_ns: 0,
-        }
-    }
-
-    fn routed_ref(shard: u32, hour: u32) -> SegmentRef {
-        SegmentRef {
-            data_object_key: "spans/routed.rspan".to_string(),
-            object_size: 0,
-            min_event_ts_ns: 0,
-            max_event_ts_ns: 0,
-            ingest_hour_bucket: hour,
-            sample_count: 1,
-            series_count: 0,
-            shard,
-            content_hash: [0; 32],
-            writer_id: Uuid::from_u128(1),
-            writer_epoch: 1,
-            writer_seq: 1,
-            created_unix_ns: 0,
-            level: SegmentLevel::L0,
-            segment_format_version: u32::from(ravel_rspan::footer::VERSION),
-            declared_column_stats: Default::default(),
-        }
-    }
-
-    /// A trace id whose shard is `want_2` under 2 shards and `want_3` under 3.
-    fn trace_routed(want_2: u32, want_3: u32) -> [u8; 16] {
-        (0u8..=u8::MAX)
-            .map(|n| [n; 16])
-            .find(|t| trace_shard(t, 2) == want_2 && trace_shard(t, 3) == want_3)
-            .expect("some trace id routes to both shards")
-    }
-
-    #[test]
-    fn trace_routing_admits_every_count_in_the_hours_scan_set() {
-        // 2 shards from hour 0, 3 from hour 10; slack 3 keeps the 2-shard
-        // generation in hours 10..13.
-        let gens = [generation(0, 2, 0), generation(1, 3, 10)];
-        let t = trace_routed(1, 2);
-        let may = |shard, hour| {
-            SpanSegmentFetcher::trace_may_route_to(&routed_ref(shard, hour), &t, &gens, 3)
-        };
-
-        // Hour 5: only the 2-shard count applies.
-        assert!(may(1, 5));
-        assert!(!may(0, 5));
-        assert!(!may(2, 5), "shard 2 does not exist under 2 shards");
-        // Hour 11: both counts apply, so both owning shards stay.
-        assert!(may(1, 11));
-        assert!(may(2, 11));
-        assert!(!may(0, 11));
-        // Hour 13: the slack has passed, only the 3-shard count applies.
-        assert!(!may(1, 13));
-        assert!(may(2, 13));
-    }
-
-    #[test]
-    fn trace_routing_keeps_an_object_whose_shard_cannot_be_determined() {
-        let t = trace_routed(1, 2);
-        // No generation history at all.
-        assert!(SpanSegmentFetcher::trace_may_route_to(
-            &routed_ref(0, 5),
-            &t,
-            &[],
-            3
-        ));
-        // A history whose first generation activates after the object's hour.
-        let late = [generation(0, 2, 20)];
-        assert!(SpanSegmentFetcher::trace_may_route_to(
-            &routed_ref(0, 5),
-            &t,
-            &late,
-            3
-        ));
-        assert!(!SpanSegmentFetcher::trace_may_route_to(
-            &routed_ref(0, 25),
-            &t,
-            &late,
-            3
-        ));
-    }
-
-    #[test]
-    fn trace_shard_treats_zero_shards_as_one() {
-        assert_eq!(trace_shard(&[7; 16], 0), 0);
-        assert_eq!(trace_shard(&[7; 16], 1), 0);
     }
 
     fn trace(n: u8) -> [u8; 16] {
@@ -4058,6 +3914,31 @@ mod tests {
         );
     }
 
+    /// A trace id whose sixteen bytes all differ, ordered by `n`: byte `i` is
+    /// `n ^ (i * 0x11)`. A probe that reads the id's bytes in another order
+    /// keys a different `key8`, which a `[n; 16]` id would hide.
+    fn gap_trace(n: u8) -> [u8; 16] {
+        std::array::from_fn(|i| n ^ (i as u8).wrapping_mul(0x11))
+    }
+
+    /// The `(key8, block)` entries of one KEY_IDX bucket frame, decoded from
+    /// the frame layout (u32 LE entry count, u32 crc32c, then the zstd bytes of
+    /// count 12-byte entries, an 8-byte key and a u32 LE block) without the
+    /// probe code under test.
+    fn bucket_entries(frame: &[u8]) -> Vec<([u8; 8], u32)> {
+        let count = u32::from_le_bytes(frame[..4].try_into().expect("count")) as usize;
+        let raw = zstd::bulk::decompress(&frame[8..], count * 12).expect("bucket payload");
+        assert_eq!(raw.len(), count * 12);
+        raw.chunks_exact(12)
+            .map(|e| {
+                (
+                    e[..8].try_into().expect("key8"),
+                    u32::from_le_bytes(e[8..].try_into().expect("block")),
+                )
+            })
+            .collect()
+    }
+
     /// One object of single-span traces 1, 3, 5, 7, 9 and 11 over two-record
     /// blocks, `[t1 t3] [t5 t7] [t9 t11]`, so trace 2 lies inside block 0's
     /// SKIP_IDX trace range and is absent from the object. The fetcher's probe
@@ -4076,6 +3957,19 @@ mod tests {
         }
         fn block(&self, b: usize) -> GetRange {
             GetRange::Range(self.blocks[b].0, self.blocks[b].1)
+        }
+        /// KEY_IDX's `[0, prefix_len)` as an absolute range, from the footer
+        /// entry alone.
+        fn prefix_get(&self) -> GetRange {
+            let footer = open(&self.bytes).expect("footer");
+            let desc = footer.section(kind::KEY_IDX).expect("KEY_IDX");
+            GetRange::Range(desc.offset, desc.offset + u64::from(desc.prefix_len))
+        }
+        fn read(&self, range: &GetRange) -> &[u8] {
+            let GetRange::Range(start, end) = *range else {
+                panic!("expected a bounded range, got {range:?}");
+            };
+            &self.bytes[start as usize..end as usize]
         }
         /// The answer for `trace_id` and the KEY_IDX ranges a probe reads,
         /// taken from the ranged reader over the whole object, independently of
@@ -4112,7 +4006,7 @@ mod tests {
         let memory = MemoryStore::new();
         let records: Vec<SpanRecord> = [1u8, 3, 5, 7, 9, 11]
             .into_iter()
-            .map(|t| bare_span(trace(t), span(t), 100, 150))
+            .map(|t| bare_span(gap_trace(t), span(t), 100, 150))
             .collect();
         let seg = write_object(&memory, 7, &records).await;
         let bytes = memory
@@ -4127,9 +4021,13 @@ mod tests {
         assert_eq!(blocks.len(), 3, "fixture geometry: three blocks");
         let reader = RspanReader::new(&bytes, &RspanConfig::default()).expect("reader");
         assert_eq!(
-            reader
-                .skip_index()
-                .candidate_blocks(Some(&trace(2)), i64::MIN, i64::MAX, None, None),
+            reader.skip_index().candidate_blocks(
+                Some(&gap_trace(2)),
+                i64::MIN,
+                i64::MAX,
+                None,
+                None
+            ),
             vec![0],
             "fixture geometry: SKIP_IDX keeps block 0 for trace 2"
         );
@@ -4152,8 +4050,18 @@ mod tests {
     #[tokio::test]
     async fn an_absent_trace_reads_the_key_index_and_no_block() {
         let mut fx = gap_fixture().await;
-        let (answer, key_reads) = fx.key_reads(&trace(2));
+        let (answer, key_reads) = fx.key_reads(&gap_trace(2));
         assert_eq!(answer, TraceKeyProbe::Absent);
+        assert_eq!(key_reads[0], fx.prefix_get());
+        let key8: [u8; 8] = gap_trace(2)[..8].try_into().expect("key8");
+        if let Some(bucket) = key_reads.get(1) {
+            assert!(
+                bucket_entries(fx.read(bucket))
+                    .iter()
+                    .all(|(k, _)| *k != key8),
+                "an absent trace's bucket holds no entry for its key8"
+            );
+        }
         let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
         let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
         let acct = PhaseAccounting::new();
@@ -4161,7 +4069,7 @@ mod tests {
             .fetch_accounted_in_blocks(
                 &fx.seg,
                 TENANT,
-                &SpanQuery::trace(trace(2), i64::MIN, i64::MAX),
+                &SpanQuery::trace(gap_trace(2), i64::MIN, i64::MAX),
                 None,
                 None,
                 &[],
@@ -4213,9 +4121,15 @@ mod tests {
     #[tokio::test]
     async fn a_present_trace_reads_the_key_index_then_only_its_blocks() {
         let mut fx = gap_fixture().await;
-        let (answer, key_reads) = fx.key_reads(&trace(3));
+        let (answer, key_reads) = fx.key_reads(&gap_trace(3));
         assert_eq!(answer, TraceKeyProbe::Present(vec![0]));
         assert_eq!(key_reads.len(), 2, "a present trace reads its bucket");
+        assert_eq!(key_reads[0], fx.prefix_get());
+        let key8: [u8; 8] = gap_trace(3)[..8].try_into().expect("key8");
+        assert!(
+            bucket_entries(fx.read(&key_reads[1])).contains(&(key8, 0)),
+            "the bucket read holds trace 3's first eight bytes in block 0"
+        );
         let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
         let fetcher = SpanSegmentFetcher::new(log.clone()).with_trace_probe_bytes(fx.probe);
         let acct = PhaseAccounting::new();
@@ -4223,7 +4137,7 @@ mod tests {
             .fetch_accounted_in_blocks(
                 &fx.seg,
                 TENANT,
-                &SpanQuery::trace(trace(3), i64::MIN, i64::MAX),
+                &SpanQuery::trace(gap_trace(3), i64::MIN, i64::MAX),
                 None,
                 None,
                 &[],
@@ -4240,7 +4154,7 @@ mod tests {
         assert_eq!(log.take(&fx.seg.data_object_key), want);
         assert_eq!(log.total(), 0);
         assert_eq!(out.records.len(), 1);
-        assert_eq!(out.records[0].record.trace_id, trace(3));
+        assert_eq!(out.records[0].record.trace_id, gap_trace(3));
         assert_eq!(out.key_index, KeyIndexPruning::default());
         let snap = acct.snapshot();
         assert_eq!(snap.key_index.s3_requests(AccountedOp::Get), 2);
@@ -4269,9 +4183,9 @@ mod tests {
     #[tokio::test]
     async fn a_corrupt_key_index_bucket_falls_back_with_the_same_rows() {
         let mut fx = gap_fixture().await;
-        let (_, key_reads) = fx.key_reads(&trace(3));
+        let (_, key_reads) = fx.key_reads(&gap_trace(3));
         let memory = fx.memory.take().expect("memory");
-        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        let query = SpanQuery::trace(gap_trace(3), i64::MIN, i64::MAX);
         let fetch = |store: Arc<dyn ObjectStoreBackend>| {
             let seg = fx.seg.clone();
             let probe = fx.probe;
@@ -4336,7 +4250,7 @@ mod tests {
         use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule};
 
         let mut fx = gap_fixture().await;
-        let (_, key_reads) = fx.key_reads(&trace(3));
+        let (_, key_reads) = fx.key_reads(&gap_trace(3));
         let plan = FaultPlan::empty().with_rule(
             Rule::new(Op::Get, ScriptedFault::Transient("injected".into()))
                 .with_key_contains(fx.seg.data_object_key.clone())
@@ -4351,7 +4265,7 @@ mod tests {
             .fetch_accounted(
                 &fx.seg,
                 TENANT,
-                &SpanQuery::trace(trace(3), i64::MIN, i64::MAX),
+                &SpanQuery::trace(gap_trace(3), i64::MIN, i64::MAX),
                 None,
                 None,
                 &[],
@@ -4382,6 +4296,135 @@ mod tests {
         );
     }
 
+    /// A KEY_IDX prefix that fails its own checks, in the header or in the
+    /// directory, falls back to SKIP_IDX: no bucket read, the clean object's
+    /// rows, and nothing counted as pruned.
+    ///
+    /// FLIP: the `locate_trace_key` error arm in `probe_key_index` returning
+    /// `Ok(Some(TraceKeyProbe::Absent))` instead of `Ok(None)` loses the row.
+    #[tokio::test]
+    async fn a_corrupt_key_index_prefix_falls_back_with_the_same_rows() {
+        let mut fx = gap_fixture().await;
+        let (_, key_reads) = fx.key_reads(&gap_trace(3));
+        let GetRange::Range(prefix_start, prefix_end) = fx.prefix_get() else {
+            panic!("prefix read is a range");
+        };
+        let memory = fx.memory.take().expect("memory");
+        let query = SpanQuery::trace(gap_trace(3), i64::MIN, i64::MAX);
+        let log = Arc::new(GetLog::new(memory));
+        let fetch = |log: Arc<GetLog>| {
+            let seg = fx.seg.clone();
+            let probe = fx.probe;
+            async move {
+                SpanSegmentFetcher::new(log)
+                    .with_trace_probe_bytes(probe)
+                    .fetch_accounted(
+                        &seg,
+                        TENANT,
+                        &query,
+                        None,
+                        None,
+                        &[],
+                        &QueryAccounting::new(),
+                    )
+                    .await
+                    .expect("fetch")
+                    .expect("relevant")
+            }
+        };
+        let clean = fetch(log.clone()).await;
+        assert_eq!(clean.records.len(), 1);
+        assert_eq!(
+            log.take(&fx.seg.data_object_key),
+            vec![fx.probe_get(), key_reads[0], key_reads[1], fx.block(0)]
+        );
+
+        // The header's first byte, and the directory's last byte (the end of
+        // the prefix).
+        for (at, what) in [(prefix_start, "header"), (prefix_end - 1, "directory")] {
+            let mut damaged = fx.bytes.to_vec();
+            damaged[at as usize] ^= 0xFF;
+            log.put(
+                &fx.seg.data_object_key,
+                Bytes::from(damaged),
+                PutOptions::default(),
+            )
+            .await
+            .expect("overwrite");
+            let fallen = fetch(log.clone()).await;
+            assert_eq!(
+                log.take(&fx.seg.data_object_key),
+                vec![fx.probe_get(), fx.prefix_get(), fx.block(0)],
+                "{what}: the prefix was read, refused, and SKIP_IDX's run read"
+            );
+            assert_eq!(fallen.records, clean.records, "{what}: identical rows");
+            assert_eq!(fallen.stats, clean.stats, "{what}");
+            assert_eq!(
+                fallen.key_index,
+                KeyIndexPruning::default(),
+                "{what}: no pruning"
+            );
+        }
+    }
+
+    /// A store failure on the KEY_IDX bucket GET is a typed store error, not a
+    /// fallback to SKIP_IDX.
+    ///
+    /// FLIP: the bucket's `key_index_read(..).await?` replaced by a match that
+    /// falls back on `Err` returns the row instead of the error.
+    #[tokio::test]
+    async fn a_failed_key_index_bucket_get_is_a_store_error() {
+        use ravel_object_store::fault::ScriptedFault;
+        use ravel_object_store::fault::{FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule};
+
+        let mut fx = gap_fixture().await;
+        let (_, key_reads) = fx.key_reads(&gap_trace(3));
+        assert_eq!(key_reads.len(), 2, "the probe reads a bucket");
+        // GETs in order: the tail probe, the KEY_IDX prefix, the bucket.
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(Op::Get, ScriptedFault::Transient("injected".into()))
+                .with_key_contains(fx.seg.data_object_key.clone())
+                .with_occurrence(Occurrence::Nth(3)),
+        );
+        let fault = Arc::new(FaultStore::new(
+            GetLog::new(fx.memory.take().expect("memory")),
+            plan,
+        ));
+        let fetcher = SpanSegmentFetcher::new(fault.clone()).with_trace_probe_bytes(fx.probe);
+        let err = fetcher
+            .fetch_accounted(
+                &fx.seg,
+                TENANT,
+                &SpanQuery::trace(gap_trace(3), i64::MIN, i64::MAX),
+                None,
+                None,
+                &[],
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect_err("the KEY_IDX bucket GET fails");
+        assert!(
+            matches!(
+                err,
+                SpanFetchError::Store {
+                    source: StoreError::Transient(_),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            fault.fault_count(Op::Get, FaultKind::Transient),
+            1,
+            "the injected fault fired on the KEY_IDX bucket GET"
+        );
+        assert_eq!(
+            fault.inner().take(&fx.seg.data_object_key),
+            vec![fx.probe_get(), key_reads[0]],
+            "the tail probe and the prefix reached the store, no block"
+        );
+    }
+
     /// With the read cache, a repeated lookup serves the KEY_IDX reads from
     /// the cache with no GET, still on the key-index phase.
     ///
@@ -4392,14 +4435,14 @@ mod tests {
         use ravel_cache::{Cache, CacheLimits};
 
         let mut fx = gap_fixture().await;
-        let (_, key_reads) = fx.key_reads(&trace(3));
+        let (_, key_reads) = fx.key_reads(&gap_trace(3));
         let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
         let cache: Arc<Cache<crate::fetcher::CacheFetchError>> =
             Arc::new(Cache::new(CacheLimits::new(1 << 20, 100, 1 << 20)));
         let fetcher = SpanSegmentFetcher::new(log.clone())
             .with_trace_probe_bytes(fx.probe)
             .with_cache(cache);
-        let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+        let query = SpanQuery::trace(gap_trace(3), i64::MIN, i64::MAX);
         let lookup = || {
             let fetcher = fetcher.clone();
             let seg = fx.seg.clone();

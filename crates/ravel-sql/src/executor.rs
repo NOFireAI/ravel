@@ -103,7 +103,7 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, StreamExt};
-use ravel_catalog::{Catalog, ShardGeneration, Snapshot};
+use ravel_catalog::{Catalog, Snapshot};
 use ravel_memory::MemoryBudget;
 use ravel_parquet::ReadLimits;
 use ravel_pqtable::clock::Clock;
@@ -262,10 +262,6 @@ struct Resolved {
     unfolded_segments_resolved: u64,
     target: TargetSignal,
     parquet: Option<ParquetResolution>,
-    /// The shard-generation history this resolve computed its scan set from;
-    /// the spans provider routes a trace lookup by it. Empty for a Parquet
-    /// resolve, which reads no generation history.
-    shard_generations: Vec<ShardGeneration>,
 }
 
 /// The coordinator-side distributed samples scan for one query: the minted
@@ -312,10 +308,6 @@ struct PlanExtras {
     /// The Parquet tables the statement reads, when its resolve already
     /// resolved them.
     parquet: ParquetPlan,
-    /// The shard-generation history the snapshot was resolved under, for the
-    /// spans provider's trace routing. Empty routes nothing out, which is
-    /// what the entry points planning an already-resolved snapshot pass.
-    shard_generations: Vec<ShardGeneration>,
 }
 
 /// One SQL request, fully resolved from its transport.
@@ -428,18 +420,12 @@ pub struct SqlStats {
     pub segments_pruned_by_key_index: u64,
     /// Skip-index candidate blocks of the spans segments such a lookup did
     /// read that KEY_IDX named no entry for, read off the spans scans'
-    /// `blocks_pruned_by_key_index` counter. An object the writer laid out in
-    /// trace order has no such block, so this is zero on every object the
-    /// writer produced; an absent trace's segment is counted in
+    /// `blocks_pruned_by_key_index` counter. It is 0 when the skip index
+    /// already narrows the object to the trace's blocks, which it does on
+    /// every object written in trace order, as `RspanWriter::finish` writes
+    /// every object today. An absent trace's segment is counted in
     /// [`Self::segments_pruned_by_key_index`], not here.
     pub blocks_pruned_by_key_index: u64,
-    /// Spans segments a `trace_id` equality lookup left out of the snapshot
-    /// before any fetch because their shard is not the one the trace routes
-    /// to under any shard count provisioned for their ingest hour (ADR-2707
-    /// decision 7), read off the spans scans' `segments_pruned_by_routing`
-    /// counter. Counted within [`Self::segments`], which is the resolved
-    /// snapshot before routing. Zero for any other query.
-    pub segments_pruned_by_routing: u64,
     /// Blocks of opened segments, and owned segments never opened, that the
     /// successful attempt's logs scans skipped because their minimum `ts` was
     /// above an `ORDER BY ts ... LIMIT k` TopK's threshold (ADR-2677 decision
@@ -699,7 +685,6 @@ struct BlockCounts {
     segments_pruned_by_stats: u64,
     segments_pruned_by_key_index: u64,
     blocks_pruned_by_key_index: u64,
-    segments_pruned_by_routing: u64,
     blocks_skipped_by_threshold: u64,
     segments_skipped_by_threshold: u64,
     int_values_buffers: u64,
@@ -722,8 +707,8 @@ struct BlockCounts {
 /// `LogsScanExec` publishes the first ten names (crate::logs_scan) and only `RsegScanExec` the last
 /// (crate::scan), so each sum is that scan's total however the optimizer
 /// nested it, and a plan carrying neither scan contributes nothing. The
-/// `segments_pruned_by_key_index`, `blocks_pruned_by_key_index` and
-/// `segments_pruned_by_routing` sums come from `SpansScanExec`
+/// `segments_pruned_by_key_index` and `blocks_pruned_by_key_index` sums come
+/// from `SpansScanExec`
 /// (crate::spans_scan) the same way. Reads the counters the scans already
 /// maintain rather than counting a second time.
 fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
@@ -745,7 +730,6 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
         counts.segments_pruned_by_stats += sum("segments_pruned_by_stats");
         counts.segments_pruned_by_key_index += sum("segments_pruned_by_key_index");
         counts.blocks_pruned_by_key_index += sum("blocks_pruned_by_key_index");
-        counts.segments_pruned_by_routing += sum("segments_pruned_by_routing");
         counts.blocks_skipped_by_threshold += sum("blocks_skipped_by_threshold");
         counts.segments_skipped_by_threshold += sum("segments_skipped_by_threshold");
         counts.int_values_buffers += sum("int_values_buffers");
@@ -1614,7 +1598,6 @@ impl SqlExecutor {
             estimate,
             target,
             parquet,
-            shard_generations,
             ..
         } = self
             .resolve_admitted(tenant_hash, statement, req, &phase_accounting)
@@ -1636,7 +1619,6 @@ impl SqlExecutor {
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
-                    shard_generations,
                 },
             )
             .await?;
@@ -1716,7 +1698,6 @@ impl SqlExecutor {
                 unfolded_segments_resolved,
                 target,
                 parquet,
-                shard_generations,
                 ..
             } = self
                 .resolve(tenant_hash, statement, req, &phase_accounting)
@@ -1749,7 +1730,6 @@ impl SqlExecutor {
                     &phase_accounting,
                     &declared,
                     parquet,
-                    shard_generations,
                 )
                 .await;
             stats.batches_emitted += emitted;
@@ -1772,7 +1752,6 @@ impl SqlExecutor {
                     stats.segments_pruned_by_stats = blocks.segments_pruned_by_stats;
                     stats.segments_pruned_by_key_index = blocks.segments_pruned_by_key_index;
                     stats.blocks_pruned_by_key_index = blocks.blocks_pruned_by_key_index;
-                    stats.segments_pruned_by_routing = blocks.segments_pruned_by_routing;
                     stats.blocks_skipped_by_threshold = blocks.blocks_skipped_by_threshold;
                     stats.segments_skipped_by_threshold = blocks.segments_skipped_by_threshold;
                     stats.int_values_buffers = blocks.int_values_buffers;
@@ -1961,7 +1940,6 @@ impl SqlExecutor {
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
                 parquet: inputs.parquet,
-                shard_generations: Vec::new(),
             },
         )
         .await
@@ -2001,7 +1979,6 @@ impl SqlExecutor {
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
                 parquet: inputs.parquet,
-                shard_generations: Vec::new(),
             },
         )
         .await
@@ -2289,8 +2266,7 @@ impl SqlExecutor {
                     self.span_fetcher.clone(),
                     phase_accounting.scan().clone(),
                 )
-                .with_phase_accounting(phase_accounting.clone())
-                .with_shard_generations(extras.shard_generations),
+                .with_phase_accounting(phase_accounting.clone()),
             )),
             // The two RLOG-backed tables (ADR-1101 decision 1) read through the
             // executor's existing `log_fetcher`: an alert and an audit record
@@ -2673,7 +2649,6 @@ impl SqlExecutor {
                 unfolded_segments_resolved: 0,
                 target: TargetSignal::Parquet,
                 parquet: Some(resolution),
-                shard_generations: Vec::new(),
             });
         }
         let target = tables.signal.unwrap_or(TargetSignal::Metrics);
@@ -2710,9 +2685,9 @@ impl SqlExecutor {
         let catalog_requests = self
             .catalog
             .estimated_catalog_requests(req.window, req.now_ns);
-        let (snapshot, origins, shard_generations) = self
+        let (snapshot, origins) = self
             .catalog
-            .resolve_pruned_with_generations(
+            .resolve_pruned_with_admission(
                 &tenant_hash,
                 signal,
                 req.window,
@@ -2798,7 +2773,6 @@ impl SqlExecutor {
             unfolded_segments_resolved,
             target,
             parquet: None,
-            shard_generations,
         })
     }
 
@@ -3466,7 +3440,6 @@ impl SqlExecutor {
         phase_accounting: &PhaseAccounting,
         declared: &[DeclaredColumn],
         parquet: Option<ParquetResolution>,
-        shard_generations: Vec<ShardGeneration>,
     ) -> (
         Result<QueryOutput, SqlError>,
         usize,
@@ -3492,7 +3465,6 @@ impl SqlExecutor {
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
-                    shard_generations,
                 },
             )
             .await

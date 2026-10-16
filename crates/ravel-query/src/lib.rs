@@ -72,5 +72,5 @@ pub use segment_admission::{
     resolved_unsealed_tail,
 };
 pub use span_fetcher::{
-    KeyIndexPruning, SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher, trace_shard,
+    KeyIndexPruning, SpanFetchError, SpanFetchOutput, SpanRow, SpanSegmentFetcher,
 };

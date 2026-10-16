@@ -1,13 +1,13 @@
 //! A spans `trace_id` lookup over `POST /api/v1/sql` probes each object's
-//! KEY_IDX section and routes by shard (ADR-2707 decisions 5 and 7, issue
-//! #2761).
+//! KEY_IDX section (ADR-2707 decision 5, issue #2761) and reads every object
+//! the catalog lists, whatever its shard: spans shard routing is deferred to
+//! issue #3034 (ADR-2707, amendment for issue #2761).
 //!
-//! The fixture tenant is resharded from 2 shards to 3 at ingest hour 1, so
-//! hour 0 is scanned under 2 shards and hour 1 under both counts (the 3-hour
-//! scan slack keeps the retiring count). Every object is folded into a catalog
-//! part before the lookup. The expected reads of each object are computed
-//! from its bytes with `ravel_rspan`'s ranged reader, independently of the
-//! fetcher under test, and compared with what the store actually served.
+//! Each fixture tenant carries a shard-count change, and every object is
+//! folded into a catalog part before the lookup. The expected reads of each
+//! object are computed from its bytes with `ravel_rspan`'s ranged reader,
+//! independently of the fetcher under test, and compared with what the store
+//! actually served.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
@@ -45,6 +45,8 @@ const NS_PER_HOUR: i64 = 3_600 * NS_PER_SEC;
 /// Late enough that a fold seals hours 0 and 1, whose seal margin is the
 /// one-hour flush lifetime plus twenty minutes.
 const NOW_NS: i64 = 4 * NS_PER_HOUR;
+/// Two shards from hour 0, three from hour 1.
+const RESHARD_2_TO_3: &[(u32, u32)] = &[(2, 0), (3, 1)];
 const TENANT: &str = "acme";
 const TOKEN: &str = "acme-token";
 /// Single-span traces per object. Enough blocks that the SKIP_IDX section
@@ -53,10 +55,10 @@ const TOKEN: &str = "acme-token";
 const DECOYS: u64 = 2_400;
 const BLOCK_RECORDS: usize = 4;
 
-struct FixedClock;
+struct FixedClock(i64);
 impl ravel_ingest::Clock for FixedClock {
     fn now_ns(&self) -> i64 {
-        NOW_NS
+        self.0
     }
 }
 
@@ -118,10 +120,10 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// A trace id that routes to shard `want_2` under 2 shards and `want_3` under
-/// 3, by the write side's own rule. Its first byte is low, so it sorts ahead
-/// of every decoy and its block sits far from the object's tail.
-fn trace_routed(want_2: u32, want_3: u32) -> [u8; 16] {
+/// A trace id satisfying `routes`, a condition on the write side's own shard
+/// rule. Its first byte is low, so it sorts ahead of every decoy and its
+/// block sits far from the object's tail.
+fn trace_where(routes: impl Fn(&[u8; 16]) -> bool) -> [u8; 16] {
     (0u8..=u8::MAX)
         .map(|n| {
             let mut t = [0x40; 16];
@@ -129,8 +131,14 @@ fn trace_routed(want_2: u32, want_3: u32) -> [u8; 16] {
             t[1] = n;
             t
         })
-        .find(|t| shard_for_span(t, 2) == want_2 && shard_for_span(t, 3) == want_3)
-        .expect("some trace id routes to both shards")
+        .find(|t| routes(t))
+        .expect("some trace id routes as asked")
+}
+
+/// A trace id that routes to shard `want_2` under 2 shards and `want_3` under
+/// 3.
+fn trace_routed(want_2: u32, want_3: u32) -> [u8; 16] {
+    trace_where(|t| shard_for_span(t, 2) == want_2 && shard_for_span(t, 3) == want_3)
 }
 
 /// `trace` with byte 7 moved by `delta`: a different KEY_IDX key that sorts
@@ -251,6 +259,8 @@ struct ExpectedReads {
     key_index: Vec<GetRange>,
     scan: Vec<GetRange>,
     present: bool,
+    /// The lowest section offset: every block lies before it.
+    blocks_end: u64,
 }
 
 impl ExpectedReads {
@@ -291,6 +301,12 @@ fn expected_reads(bytes: &Bytes, trace: &[u8; 16]) -> ExpectedReads {
     );
     let mut reads = ExpectedReads {
         probe: vec![GetRange::Range(probe_start, size)],
+        blocks_end: footer
+            .sections
+            .iter()
+            .map(|s| s.offset)
+            .min()
+            .expect("sections"),
         ..ExpectedReads::default()
     };
     if skip.offset < probe_start {
@@ -333,28 +349,43 @@ fn expected_reads(bytes: &Bytes, trace: &[u8; 16]) -> ExpectedReads {
     reads
 }
 
-/// Seeds the 2-to-3 reshard, publishes `specs`, folds them all, and serves
-/// the SQL router over the recording store.
-async fn serve(specs: &[ObjectSpec]) -> (Arc<RecordingStore>, Router, Vec<Published>) {
+/// Seeds the spans shard generations `generations`, each a `(shard_count,
+/// activation_hour)`, publishes `specs`, folds them all at `now_ns`, and
+/// serves the SQL router over the recording store with its clock at `now_ns`.
+async fn serve(
+    generations: &[(u32, u32)],
+    now_ns: i64,
+    specs: &[ObjectSpec],
+) -> (Arc<RecordingStore>, Router, Vec<Published>) {
     let recorder = Arc::new(RecordingStore {
         inner: MemoryStore::new(),
         gets: Mutex::new(Vec::new()),
     });
     let store: Arc<dyn ObjectStoreBackend> = recorder.clone();
     let tenant = TenantId::new(TENANT);
+    let (&(first_count, _), later) = generations.split_first().expect("a generation");
     validate_or_adopt(
         store.as_ref(),
         &tenant.hash(),
         Signal::Spans,
-        2,
+        first_count,
         0,
         AbsentPolicy::CreateFromConfig,
     )
     .await
-    .expect("generation 0: 2 shards");
-    append_generation(store.as_ref(), &tenant.hash(), Signal::Spans, 3, 1, 0)
+    .expect("generation 0");
+    for &(count, activation_hour) in later {
+        append_generation(
+            store.as_ref(),
+            &tenant.hash(),
+            Signal::Spans,
+            count,
+            activation_hour,
+            0,
+        )
         .await
-        .expect("generation 1: 3 shards from hour 1");
+        .expect("append generation");
+    }
 
     let mut published = Vec::new();
     for (seq, spec) in specs.iter().enumerate() {
@@ -365,7 +396,7 @@ async fn serve(specs: &[ObjectSpec]) -> (Arc<RecordingStore>, Router, Vec<Publis
     let catalog = || {
         build_catalog(
             Arc::clone(&store),
-            2,
+            first_count,
             true,
             ravel_server::config::DEFAULT_CACHE_MAX_BYTES,
             None,
@@ -382,7 +413,7 @@ async fn serve(specs: &[ObjectSpec]) -> (Arc<RecordingStore>, Router, Vec<Publis
             &tenant.hash(),
             Signal::Spans,
             Uuid::from_u128(1),
-            NOW_NS,
+            now_ns,
             &[],
             None,
         )
@@ -416,12 +447,12 @@ async fn serve(specs: &[ObjectSpec]) -> (Arc<RecordingStore>, Router, Vec<Publis
         Arc::new(ravel_memory::MemoryBudget::unlimited()),
     )
     .expect("sql state");
-    sql_state.clock = Arc::new(FixedClock);
+    sql_state.clock = Arc::new(FixedClock(now_ns));
     recorder.clear();
     (recorder, ravel_server::sql::router(sql_state), published)
 }
 
-async fn lookup(app: &Router, trace: &[u8; 16]) -> Value {
+async fn lookup(app: &Router, now_ns: i64, trace: &[u8; 16]) -> Value {
     let sql = format!(
         "SELECT name FROM spans WHERE trace_id = '{}' ORDER BY name",
         hex(trace)
@@ -429,7 +460,7 @@ async fn lookup(app: &Router, trace: &[u8; 16]) -> Value {
     let payload = serde_json::json!({
         "query": sql,
         "start": 0.0,
-        "end": NOW_NS as f64 / NS_PER_SEC as f64,
+        "end": now_ns as f64 / NS_PER_SEC as f64,
     })
     .to_string();
     let request = Request::builder()
@@ -472,33 +503,41 @@ fn pruning(value: &Value, field: &str) -> u64 {
         .unwrap_or_else(|| panic!("stats.pruning.{field} is a u64 in {value}"))
 }
 
-/// Two shards and two hours of folded objects, the trace in exactly one. The
-/// trace routes to shard 1 under 2 shards and shard 0 under 3, so hour 0
-/// keeps shard 1 only and hour 1, scanned under both counts, keeps shards 0
-/// and 1: hour 0's shard-0 object is routed out and never read, and the two
-/// hour-1 objects are read only as far as KEY_IDX, which says the trace is
-/// absent. A fixed count of 2 would route hour 1's shard-0 object out too,
-/// and a fixed count of 3 would route out the object holding the trace.
+/// Whether every read in `got` lies at or past `blocks_end`, so none of them
+/// touched a block.
+fn reads_no_block(got: &[GetRange], blocks_end: u64) -> bool {
+    got.iter().all(|range| match *range {
+        GetRange::Range(start, _) => start >= blocks_end,
+        _ => false,
+    })
+}
+
+/// The trace's two neighbours: an object holding them keeps a SKIP_IDX block
+/// whose trace range covers the trace, so the lookup probes its KEY_IDX.
+fn bracket(trace: &[u8; 16]) -> Vec<([u8; 16], &'static str)> {
+    vec![
+        (neighbour(trace, -1), "left"),
+        (neighbour(trace, 1), "right"),
+    ]
+}
+
+/// Two shards and two hours of folded objects across a 2-to-3 reshard, the
+/// trace in exactly one. Every object is read as far as KEY_IDX: the three
+/// that do not hold the trace keep a SKIP_IDX block for it and KEY_IDX says
+/// the trace is absent, so they read no block, and only the holder reads the
+/// trace's run.
 ///
-/// FLIP: `trace_shard(trace_id, g.shard_count)` to `trace_shard(trace_id, 2)`
-/// in `SpanSegmentFetcher::trace_may_route_to` (routing by a fixed count)
-/// leaves hour 1's shard-0 object unread; the same with 3 loses the rows;
-/// `if blocks.is_none() && !candidate_idx.is_empty()` to `if false && ...` in
-/// `ranged_trace_scan` (no probe) issues no KEY_IDX reads and reads blocks.
+/// FLIP: `blocks.is_none() && !candidate_idx.is_empty()` to `false` in
+/// `ranged_trace_scan` (no probe) issues no KEY_IDX read and reads a block
+/// run from every object.
 #[tokio::test]
 async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_blocks_only() {
     let trace = trace_routed(1, 0);
-    let bracket = || {
-        vec![
-            (neighbour(&trace, -1), "left"),
-            (neighbour(&trace, 1), "right"),
-        ]
-    };
     let specs = [
         ObjectSpec {
             shard: 0,
             hour: 0,
-            spans: bracket(),
+            spans: bracket(&trace),
         },
         ObjectSpec {
             shard: 1,
@@ -508,55 +547,62 @@ async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_block
         ObjectSpec {
             shard: 0,
             hour: 1,
-            spans: bracket(),
+            spans: bracket(&trace),
         },
         ObjectSpec {
             shard: 1,
             hour: 1,
-            spans: bracket(),
+            spans: bracket(&trace),
         },
     ];
-    let (recorder, app, objects) = serve(&specs).await;
-    let routed_out = &objects[0];
-    let kept: Vec<ExpectedReads> = objects[1..]
+    let (recorder, app, objects) = serve(RESHARD_2_TO_3, NOW_NS, &specs).await;
+    let want: Vec<ExpectedReads> = objects
         .iter()
         .map(|o| expected_reads(&o.bytes, &trace))
         .collect();
     assert_eq!(
-        kept.iter().map(|r| r.present).collect::<Vec<_>>(),
-        vec![true, false, false],
+        want.iter().map(|r| r.present).collect::<Vec<_>>(),
+        vec![false, true, false, false],
         "fixture: KEY_IDX holds the trace in the hour-0 shard-1 object only"
     );
 
-    let value = lookup(&app, &trace).await;
+    let value = lookup(&app, NOW_NS, &trace).await;
     assert_eq!(
         value["data"]["rows"],
         serde_json::json!([["t-0"], ["t-1"], ["t-2"]]),
         "{value}"
     );
 
-    assert!(
-        recorder.take(&routed_out.key).is_empty(),
-        "the object on the other shard is never read"
-    );
-    for (object, want) in objects[1..].iter().zip(&kept) {
+    for (object, want) in objects.iter().zip(&want) {
+        let got = recorder.take(&object.key);
         assert_eq!(
-            recorder.take(&object.key),
+            got,
             want.all(),
             "{}: the tail probe, SKIP_IDX, the KEY_IDX reads, and the trace's run only",
             object.key
         );
+        if !want.present {
+            assert!(
+                !want.key_index.is_empty() && got.iter().any(|r| want.key_index.contains(r)),
+                "{}: KEY_IDX was read",
+                object.key
+            );
+            assert!(
+                reads_no_block(&got, want.blocks_end),
+                "{}: no block was read: {got:?}",
+                object.key
+            );
+        }
     }
 
     assert_eq!(pruning(&value, "segments"), 4, "{value}");
-    assert_eq!(pruning(&value, "segmentsPrunedByRouting"), 1, "{value}");
-    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 2, "{value}");
+    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 3, "{value}");
     // A writer-sorted object's SKIP_IDX already keeps exactly the trace's
     // blocks, so KEY_IDX has none left to prune.
     assert_eq!(pruning(&value, "blocksPrunedByKeyIndex"), 0, "{value}");
 
-    let key_reads: Vec<GetRange> = kept.iter().flat_map(|r| r.key_index.clone()).collect();
-    assert!(key_reads.len() >= 3, "each kept object reads KEY_IDX");
+    let key_reads: Vec<GetRange> = want.iter().flat_map(|r| r.key_index.clone()).collect();
+    assert!(key_reads.len() >= 4, "each object reads KEY_IDX");
     assert_eq!(
         phase(&value, "keyIndex", "s3GetRequests"),
         key_reads.len() as u64,
@@ -567,7 +613,7 @@ async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_block
         key_reads.iter().map(len).sum::<u64>(),
         "{value}"
     );
-    let scan: Vec<GetRange> = kept.iter().flat_map(|r| r.scan.clone()).collect();
+    let scan: Vec<GetRange> = want.iter().flat_map(|r| r.scan.clone()).collect();
     assert_eq!(scan.len(), 1, "one block run, in the trace's object");
     assert_eq!(phase(&value, "scan", "s3GetRequests"), 1, "{value}");
     assert_eq!(
@@ -575,7 +621,7 @@ async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_block
         len(&scan[0]),
         "{value}"
     );
-    let probe: Vec<GetRange> = kept.iter().flat_map(|r| r.probe.clone()).collect();
+    let probe: Vec<GetRange> = want.iter().flat_map(|r| r.probe.clone()).collect();
     assert_eq!(
         phase(&value, "probe", "s3GetRequests"),
         probe.len() as u64,
@@ -589,11 +635,11 @@ async fn trace_lookup_on_a_folded_tenant_reads_index_buckets_and_the_trace_block
 }
 
 /// A trace written under both shard counts, on shard 1 in hour 0 (2 shards)
-/// and shard 2 in hour 1 (3 shards), is returned whole: routing keeps both
-/// generations' objects and drops only the two the trace cannot route to.
+/// and shard 2 in hour 1 (3 shards), is returned whole, and the two objects
+/// that do not hold it are dropped by KEY_IDX after the probe.
 ///
-/// FLIP: routing by a fixed count of 2 or of 3 in
-/// `SpanSegmentFetcher::trace_may_route_to` loses one hour's spans.
+/// FLIP: a lookup that drops each object whose shard the trace does not route
+/// to under one fixed count, 2 or 3, loses one hour's spans.
 #[tokio::test]
 async fn a_trace_straddling_a_shard_count_change_is_fully_returned() {
     let trace = trace_routed(1, 2);
@@ -601,7 +647,7 @@ async fn a_trace_straddling_a_shard_count_change_is_fully_returned() {
         ObjectSpec {
             shard: 0,
             hour: 0,
-            spans: Vec::new(),
+            spans: bracket(&trace),
         },
         ObjectSpec {
             shard: 1,
@@ -611,7 +657,7 @@ async fn a_trace_straddling_a_shard_count_change_is_fully_returned() {
         ObjectSpec {
             shard: 0,
             hour: 1,
-            spans: Vec::new(),
+            spans: bracket(&trace),
         },
         ObjectSpec {
             shard: 2,
@@ -619,47 +665,76 @@ async fn a_trace_straddling_a_shard_count_change_is_fully_returned() {
             spans: vec![(trace, "gen1-a")],
         },
     ];
-    let (recorder, app, objects) = serve(&specs).await;
+    let (recorder, app, objects) = serve(RESHARD_2_TO_3, NOW_NS, &specs).await;
 
-    let value = lookup(&app, &trace).await;
+    let value = lookup(&app, NOW_NS, &trace).await;
     assert_eq!(
         value["data"]["rows"],
         serde_json::json!([["gen0-a"], ["gen0-b"], ["gen1-a"]]),
         "{value}"
     );
-    assert_eq!(pruning(&value, "segmentsPrunedByRouting"), 2, "{value}");
-    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 0, "{value}");
-    for routed_out in [&objects[0], &objects[2]] {
-        assert!(
-            recorder.take(&routed_out.key).is_empty(),
-            "{}",
-            routed_out.key
-        );
-    }
-    for scanned in [&objects[1], &objects[3]] {
+    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 2, "{value}");
+    for object in &objects {
         assert_eq!(
-            recorder.take(&scanned.key),
-            expected_reads(&scanned.bytes, &trace).all(),
-            "{}: both generations' objects are read",
-            scanned.key
+            recorder.take(&object.key),
+            expected_reads(&object.bytes, &trace).all(),
+            "{}: every listed object is probed",
+            object.key
         );
     }
     assert_eq!(phase(&value, "scan", "s3GetRequests"), 2, "{value}");
 }
 
-/// The read side's restatement of the span routing rule matches the write
-/// side's.
-#[test]
-fn trace_shard_matches_the_ingest_span_router() {
-    for seed in 0..500u64 {
-        let trace = decoy(seed);
-        for count in 1..=9 {
-            assert_eq!(
-                ravel_query::trace_shard(&trace, count),
-                shard_for_span(&trace, count),
-                "trace {} over {count} shards",
-                hex(&trace)
-            );
-        }
-    }
+/// An object written in place on a shard below the hour's scan count, under a
+/// shard count that hour's scan set no longer admits, is listed and read.
+/// Generations: 4 shards from hour 0, 3 from hour 100. Hour 103 is past the
+/// retiring count's slack, so it scans 3 shards, and an object on shard 2
+/// holding a trace that the 4-shard rule puts on shard 2 and the 3-shard rule
+/// does not is what ingest's in-place span paths can write there.
+///
+/// FLIP: a lookup that drops an object when no count in its hour's scan set
+/// routes the trace to its shard returns no rows.
+#[tokio::test]
+async fn a_trace_written_in_place_under_a_retired_shard_count_is_returned() {
+    const HOUR: u32 = 103;
+    let generations: &[(u32, u32)] = &[(4, 0), (3, 100)];
+    let history: Vec<ravel_catalog::ShardGeneration> = generations
+        .iter()
+        .enumerate()
+        .map(
+            |(generation, &(shard_count, activation_hour))| ravel_catalog::ShardGeneration {
+                generation: generation as u32,
+                shard_count,
+                activation_hour,
+                appended_unix_ns: 0,
+            },
+        )
+        .collect();
+    assert_eq!(
+        ravel_catalog::scan_count(&history, HOUR, ravel_catalog::DEFAULT_SCAN_SLACK_HOURS),
+        3,
+        "fixture: hour {HOUR} scans 3 shards"
+    );
+    let trace = trace_where(|t| shard_for_span(t, 4) == 2 && shard_for_span(t, 3) != 2);
+    let now_ns = i64::from(HOUR + 3) * NS_PER_HOUR;
+    let specs = [ObjectSpec {
+        shard: 2,
+        hour: HOUR,
+        spans: vec![(trace, "in-place-a"), (trace, "in-place-b")],
+    }];
+    let (recorder, app, objects) = serve(generations, now_ns, &specs).await;
+
+    let value = lookup(&app, now_ns, &trace).await;
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["in-place-a"], ["in-place-b"]]),
+        "{value}"
+    );
+    assert_eq!(pruning(&value, "segments"), 1, "{value}");
+    assert_eq!(pruning(&value, "segmentsPrunedByKeyIndex"), 0, "{value}");
+    assert_eq!(
+        recorder.take(&objects[0].key),
+        expected_reads(&objects[0].bytes, &trace).all(),
+        "the object is probed and its trace run read"
+    );
 }

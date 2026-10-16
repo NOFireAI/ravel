@@ -125,10 +125,6 @@ const METRIC_SEGMENTS_PRUNED_BY_KEY_INDEX: &str = "segments_pruned_by_key_index"
 /// Metric name for the skip-index candidate blocks of an opened segment that
 /// KEY_IDX named no entry for.
 const METRIC_BLOCKS_PRUNED_BY_KEY_INDEX: &str = "blocks_pruned_by_key_index";
-/// Metric name for the segments the provider left out before any fetch
-/// because their shard is not one a `trace_id` lookup routes to (ADR-2707
-/// decision 7).
-const METRIC_SEGMENTS_PRUNED_BY_ROUTING: &str = "segments_pruned_by_routing";
 
 /// The query-shape half of the columnar fast-path eligibility rule (ADR-0110
 /// decision 3), decided once at plan time by the provider and re-derived by the
@@ -328,19 +324,6 @@ impl SpansScanExec {
     #[must_use]
     pub fn with_phase_accounting(mut self, phases: PhaseAccounting) -> Self {
         self.accounting = phases;
-        self
-    }
-
-    /// Record how many segments the provider left out before building this
-    /// scan because a `trace_id` lookup routes to none of their shards (ADR-2707
-    /// decision 7), as the `segments_pruned_by_routing` counter on this scan's
-    /// metric set. Registered at plan time, so a scan that routed nothing out
-    /// reports `0` rather than omitting the counter.
-    #[must_use]
-    pub fn with_segments_pruned_by_routing(self, pruned: usize) -> Self {
-        MetricBuilder::new(&self.metrics)
-            .global_counter(METRIC_SEGMENTS_PRUNED_BY_ROUTING)
-            .add(pruned);
         self
     }
 

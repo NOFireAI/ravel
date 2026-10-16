@@ -123,7 +123,6 @@ pub fn pruning_json(stats: &SqlStats) -> Json {
         "segmentsPrunedByStats": stats.segments_pruned_by_stats,
         "segmentsPrunedByKeyIndex": stats.segments_pruned_by_key_index,
         "blocksPrunedByKeyIndex": stats.blocks_pruned_by_key_index,
-        "segmentsPrunedByRouting": stats.segments_pruned_by_routing,
         "blocksTotal": stats.blocks_total,
         "blocksScanned": stats.blocks_scanned,
         "blocksPrunedByPostings": stats.blocks_pruned_by_postings,
@@ -283,7 +282,6 @@ mod tests {
             segments_pruned_by_stats: 3,
             segments_pruned_by_key_index: 23,
             blocks_pruned_by_key_index: 29,
-            segments_pruned_by_routing: 31,
             blocks_total: 40,
             blocks_scanned: 11,
             blocks_pruned_by_postings: 5,
@@ -375,7 +373,7 @@ mod tests {
         }
     }
 
-    /// `pruning_json`'s key set is exactly the twelve counters below, each
+    /// `pruning_json`'s key set is exactly the eleven counters below, each
     /// carrying its own `SqlStats` field.
     #[test]
     fn pruning_json_names_every_field_exactly_once() {
@@ -385,7 +383,6 @@ mod tests {
             "segmentsPrunedByStats",
             "segmentsPrunedByKeyIndex",
             "blocksPrunedByKeyIndex",
-            "segmentsPrunedByRouting",
             "blocksTotal",
             "blocksScanned",
             "blocksPrunedByPostings",
@@ -402,7 +399,6 @@ mod tests {
             ("segmentsPrunedByStats", 3),
             ("segmentsPrunedByKeyIndex", 23),
             ("blocksPrunedByKeyIndex", 29),
-            ("segmentsPrunedByRouting", 31),
             ("blocksTotal", 40),
             ("blocksScanned", 11),
             ("blocksPrunedByPostings", 5),

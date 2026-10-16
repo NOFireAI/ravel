@@ -26,33 +26,29 @@ The full, normative spec of the on-disk layout is
 
 A `trace_id =` query decodes only the blocks that can hold the trace. The
 skip index drops every block whose `trace_id` range excludes the target.
-Each object the skip index keeps is then probed in its KEY_IDX section, an
-exact index of the trace ids it holds: at most two small ranged reads say
-whether the trace is there, and an object that does not hold it is not read
-further.
+Each object the skip index keeps is then probed in its KEY_IDX section, which
+indexes the first 8 bytes of every trace id the object holds. At most two
+small ranged reads answer the probe. A trace KEY_IDX does not find is absent
+from the object, so the object is not read further. A trace it does find may
+be another trace sharing those 8 bytes; the decoded rows are matched against
+the full trace id, which removes it.
 
 Ingest routes each span to a shard by its `trace_id`. The router hashes the
 `trace_id` with BLAKE3 and picks the shard from the hash. All spans of one
 trace land on the same shard. In the objects of that shard they sort together
 into a contiguous block run.
 
-A `trace_id =` query uses the same routing to skip whole objects. For each
-object's ingest hour it takes every shard count that hour is scanned under:
-the generation active then, and a retiring generation for 3 hours past its
-successor's activation. It keeps the object if the trace
-routes to the object's shard under any of those counts, and keeps an object
-whose shard it cannot determine. Skipped objects are counted in
-`stats.pruning.segmentsPrunedByRouting`, objects KEY_IDX ruled out in
-`segmentsPrunedByKeyIndex`, and the KEY_IDX reads are reported under the
-`keyIndex` entry of `stats.phases`. Routing applies to a statement planned on
-the serving node; a statement fanned out to workers, or planned through Flight
-SQL's two-call resolve, still lists every shard and relies on the KEY_IDX
-probe alone.
+The catalog listing at query time does not use this routing. A `trace_id =`
+query lists and opens the segments of every shard in the matched time window,
+the same as any other query, and probes the KEY_IDX of each one the skip
+index keeps a block in. Objects KEY_IDX ruled out are counted in
+`stats.pruning.segmentsPrunedByKeyIndex`, and the KEY_IDX reads are reported
+under the `keyIndex` entry of `stats.phases`.
 
 Online resharding can move a tenant to a new shard count while spans still
 arrive. A trace whose spans straddle a reshard activation can split across
 two shards. A trace-by-id query still returns every stored span from
-wherever it landed, because both shard counts are in that hour's scan set.
+wherever it landed.
 
 ## Fetching one trace by id
 

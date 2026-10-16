@@ -2389,7 +2389,6 @@ const PRUNING_KEYS: &[&str] = &[
     "segmentsPrunedByStats",
     "segmentsPrunedByKeyIndex",
     "blocksPrunedByKeyIndex",
-    "segmentsPrunedByRouting",
     "blocksTotal",
     "blocksScanned",
     "blocksPrunedByPostings",
@@ -2445,11 +2444,7 @@ async fn sql_response_carries_timings_and_pruning_stats() {
     for key in ["blocksPredicateDropped", "rowsPredicateEvaluated"] {
         assert_eq!(pruning[key], 0, "{key} with no logs scan: {value}");
     }
-    for key in [
-        "segmentsPrunedByKeyIndex",
-        "blocksPrunedByKeyIndex",
-        "segmentsPrunedByRouting",
-    ] {
+    for key in ["segmentsPrunedByKeyIndex", "blocksPrunedByKeyIndex"] {
         assert_eq!(pruning[key], 0, "{key} with no trace lookup: {value}");
     }
 

@@ -99,7 +99,7 @@ pub struct QueryStatsJson {
     #[serde(rename = "segmentsPruned")]
     pub segments_pruned: u64,
     pub accounting: QueryAccountingJson,
-    /// The same GETs and bytes `accounting` pools, split across the four
+    /// The same GETs and bytes `accounting` pools, split across the five
     /// phases of a query's object-store cost (issue #935, ADR-0927 decision 7;
     /// the split itself is issue #796's `PhaseAccounting`, which until now
     /// reached no reader outside the engine's own unit tests). One entry per
@@ -1053,7 +1053,7 @@ mod tests {
         matched: u64,
     }
 
-    /// A `QueryStats` whose four phase handles carry a distinct, exactly known
+    /// A `QueryStats` whose five phase handles carry a distinct, exactly known
     /// figure in every counter `stats.phases` renders, so a test can name the
     /// expected number per phase per field and a swapped or pooled phase is a
     /// failing assertion rather than a plausible-looking total.

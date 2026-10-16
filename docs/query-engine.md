@@ -3170,13 +3170,12 @@ and block-level reported independently:
 - `segmentsPrunedByKeyIndex`: segments a spans `trace_id =` lookup read no
   blocks of because their KEY_IDX section proved the trace absent
   (ADR-2707 decision 5).
-- `blocksPrunedByKeyIndex`: blocks the skip index kept for that lookup and
-  KEY_IDX ruled out. On a writer-sorted object the skip index already keeps
-  only the trace's blocks, so this is usually 0.
-- `segmentsPrunedByRouting`: segments of the resolved snapshot a spans
-  `trace_id =` lookup never read because the trace cannot route to their
-  shard under any shard count their ingest hour is scanned under (ADR-2707
-  decision 7; see "Bounded trace reads" in `docs/guides/traces.md`).
+- `blocksPrunedByKeyIndex`: blocks the skip index kept, in the segments that
+  lookup did read, that KEY_IDX named no entry for. It is 0 when the skip
+  index already narrows the object to the trace's blocks, which it does on
+  every object written in trace order, as `RspanWriter::finish` writes every
+  object today. An absent trace's segment counts in
+  `segmentsPrunedByKeyIndex`, not here.
 - `blocksTotal`: blocks a logs scan saw in the segments it read.
 - `blocksScanned`: of those, blocks it read.
 - `blocksPrunedByPostings`: blocks POSTINGS ruled out.
@@ -3197,7 +3196,7 @@ and block-level reported independently:
 - `rowsPredicateEvaluated`: rows of the other scanned blocks, which the
   predicate's remaining arms evaluated a block at a time.
 
-The three key-index and routing counts are 0 for a statement with no spans
+The two key-index counts are 0 for a statement with no spans
 `trace_id =` lookup and are sums over every spans scan in the plan. The
 other eight counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
@@ -3208,7 +3207,7 @@ block both scans read counts in `blocksTotal` twice.
 `services/ravel-server/tests/sql_declared_prune_reachability_e2e.rs` drives
 both pruning levels through `POST /api/v1/sql`.
 `services/ravel-server/tests/spans_trace_key_index_routing.rs` drives the
-three key-index and routing counts the same way.
+two key-index counts the same way.
 
 Neither object reaches the Arrow-IPC encoding or Flight SQL, for the reasons
 given above. The MCP `sql_execute` tool's envelope renders neither, and it
@@ -4618,10 +4617,9 @@ prune and is evaluated as a residual only:
   `[min_trace_id, max_trace_id]` range excludes the target: a bounded
   single-trace scan instead of a full window scan.
   Each object the skip index keeps is probed in its KEY_IDX section first, and
-  one that does not hold the trace is not read further; objects whose shard
-  the trace cannot route to under any shard count of their ingest hour are
-  not read at all (ADR-2707 decisions 5 and 7, reported in `stats.pruning`
-  and the `keyIndex` phase above).
+  one that does not hold the trace is not read further (ADR-2707 decision 5,
+  reported in `stats.pruning` and the `keyIndex` phase above). No listed
+  object is skipped by its shard: the lookup does not route by shard.
 - `start_ts` / `end_ts` range comparisons (`>=`, `>`, `<`, `<=`, `=`, and
   `BETWEEN`): both columns fold into one inclusive `[ts_min, ts_max]` window
   the reader prunes blocks against by time-interval overlap. Folding both

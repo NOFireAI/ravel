@@ -995,7 +995,7 @@ fn print_open_shapes(report: &SqlLatencyReport) {
 /// the split per run rather than aggregated over runs (issue #857).
 ///
 /// `get_pooled` is [`RunAccounting::object_store_get_bytes`], the pooled GET
-/// figure the four phase columns reconcile against, printed so the residual can
+/// figure the five phase columns reconcile against, printed so the residual can
 /// be read against the right denominator: `unattr` is defined against the
 /// all-kinds total, which also holds LIST bytes no phase can claim.
 /// [`ravel_bench::sql_latency::reconcile_run_accounting`] has already checked
@@ -1016,16 +1016,17 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "\n  fetch amplification, cold run: scan-phase WIRE bytes per STORED page byte decoded."
     );
     eprintln!(
-        "  Probe, PAGE_DIR, SKIP_IDX and directory bytes are the plan/probe phases, not the numerator."
+        "  Probe, PAGE_DIR, SKIP_IDX, KEY_IDX and directory bytes are the plan/probe/keyIndex phases, not the numerator."
     );
     eprintln!(
         "  Not the same quantity as page_bytes_fetched / page_bytes_decoded, which is stored over stored."
     );
     eprintln!(
-        "  {:<32} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
+        "  {:<32} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13}",
         "id",
         "wire_bytes_scan",
         "wire_bytes_probe",
+        "wire_bytes_key_index",
         "wire_bytes_plan",
         "wire_bytes_resolve",
         "wire_bytes_unattr",
@@ -1034,8 +1035,8 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
         "amplification",
     );
     eprintln!(
-        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
-        "", "", "", "", "", "", "", "", ""
+        "  {:-<32}-+-{:-<16}-+-{:-<16}-+-{:-<20}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<16}-+-{:-<25}-+-{:-<13}",
+        "", "", "", "", "", "", "", "", "", ""
     );
     let phase = |acc: &RunAccounting, name: &str| {
         acc.wire_bytes_by_phase
@@ -1045,10 +1046,11 @@ fn print_fetch_amplification(report: &SqlLatencyReport) {
     };
     for (id, acc) in rows {
         eprintln!(
-            "  {:<32} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
+            "  {:<32} | {:>16} | {:>16} | {:>20} | {:>16} | {:>16} | {:>16} | {:>16} | {:>25} | {:>13.3}",
             id,
             phase(acc, "scan"),
             phase(acc, "probe"),
+            phase(acc, "keyIndex"),
             phase(acc, "plan"),
             phase(acc, "resolve"),
             acc.wire_bytes_unattributed,
