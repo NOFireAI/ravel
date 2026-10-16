@@ -148,7 +148,10 @@ POSTINGS carries one.
   or stored under a type other than the declared one contributes none. For
   logs the indexed value is the one the SQL column reads for the row (the
   merged view, ADR-0049 amendment), so a key held only at resource or scope
-  level indexes every block of that stream.
+  level indexes every block of that stream. What "the value the SQL column
+  reads" means for nested and wrong-typed stream entries, and the `version`
+  2 an RLOG writer now stamps to say its keys follow it, are in the RLOG
+  reader-rule amendment below.
 - **Key types** (`key_type` byte): `Id16` (1; a 16-byte id, `key8` = its
   first 8 bytes), `I64` (2; `key8` = the big-endian bytes of the sign-flipped
   bit pattern `(v as u64) ^ (1 << 63)`, the `NumRange` ordering convention),
@@ -289,6 +292,10 @@ objects uncovered for it, never wrongly covered.
 A `request_id` is a declared `STR` column with `key_index`; a logs
 `trace_id` lookup uses `index_trace_id`; ClickBench `UserID` is a declared
 `I64` column with `key_index`.
+
+An RLOG writer resolves each declared field exactly as the SQL reader does
+and writes its KEY_IDX at `version` 2; a section at `version` 1 from an RLOG
+writer does not prove a key absent (RLOG reader-rule amendment below).
 
 ### 4. Tier 2: one `.kidx` leaf per (snapshot part, field, key slice), built at fold from the sections
 
@@ -1010,3 +1017,70 @@ block read. Issue #3034 derives the routing
 rule from every ingest path that writes spans before routing is wired.
 
 Refs: #2707, #2761, #3034
+
+## Amendment (issue #3039): RLOG declared fields resolve like the reader, and RLOG KEY_IDX is versioned
+
+<!-- amendment-applies: sections="1. One KEY_IDX section grammar, shared by RLOG and RSPAN, with its own version byte|3. RLOG carries KEY_IDX as an optional section, declared per tenant" pointer="RLOG reader-rule amendment" -->
+
+Decision 1 says an RLOG KEY_IDX entry indexes the value the SQL column
+reads for the row. The first writer did not resolve a declared field the
+way the reader does. It took the first resource or scope entry with the
+field's name, nested or not, so a top-level Map or List resource entry
+claimed the name and a scalar scope entry under it was never keyed, while
+the reader skips the nested entry and returns the scope scalar. Under a
+`BYTES` field it keyed that nested entry's canonical bytes, a value the
+reader drops. The probe then said the key was absent from a block whose
+rows SQL returns it for. A
+writer that skipped nested entries but let a later scalar of the declared
+type win over an earlier one of another type would fail the other way: the
+reader returns nothing for that row, so the key names a block no row
+materializes it in. The numeric stats (the SKIP_IDX `NumStat` of every
+`I64`, `F64` and `Bool` attribute column, declared or not) were built from
+the same resolution and miss the same rows.
+
+The rule, for every declared field, is the reader's
+(`find_attr` in `crates/ravel-sql/src/rlog_attrs.rs`, over the merged
+view):
+
+1. a record-level entry with the name wins, whatever its type;
+2. otherwise top-level Map and List resource and scope entries are
+   skipped;
+3. of what remains, the first entry wins, resource before scope;
+4. a winning entry whose type is not the declared one yields no value, and
+   it still shadows every later entry.
+
+The writer keys KEY_IDX and stamps those numeric stats from that one
+resolution. POSTINGS keeps its own projection, unchanged.
+
+An RLOG writer that follows the rule writes its KEY_IDX section at
+`version` 2. Version 2 has the same grammar as version 1 and differs only
+in the version byte and so in the header crc; RSPAN keeps writing 1 and its
+sections are byte-identical to before. The marker is the only way to tell
+the two apart: a version 1 RLOG section and a version 2 one decode to the
+same shape, and only the writer that produced them knows which rule chose
+the keys. Decision 1's version byte is the field the grammar already
+reserves for that, so no footer or trailer field is added.
+`ravel_logseg::key_index::section_resolves_like_the_reader(version)` is
+true only for 2. Every reader accepts both versions. The logs probe
+(`probe_ranged` and `probe_source`) declines on an RLOG section that is not
+marked and reads that object as unindexed for the field, because a version
+1 section does not prove a key absent. No logs query prunes on it yet
+(issue #2762).
+
+The section is Class A. Compaction and the erasure rewrite rebuild KEY_IDX
+from the records they re-encode and write version 2 whatever their inputs
+carried, so retention, rewrite on touch and `maintain migrate` converge a
+bucket to version 2. A binary from before this change refuses a version 2
+section as corrupt: its probe and `rlog inspect` fail on such an object,
+and its compactor and erasure rewrite fail the bucket and retry until they
+are rolled forward. Roll compactors and maintenance before ingest writes
+version 2. The reverse holds on rollback: once ingest writes version 2, a
+compactor or maintenance process rolled back to a binary that refuses
+version 2 fails those buckets, which retry, so roll ingest back first.
+
+Numeric stats already stamped into version 1 objects carry the
+old resolution and stay exposed to any reader that prunes or answers from
+them until those objects are rewritten. The section marker does not cover
+them; issue #3040 tracks that.
+
+Refs: #2707, #3039, #3040, #2961, #2762

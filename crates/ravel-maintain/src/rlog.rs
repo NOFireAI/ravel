@@ -3851,6 +3851,12 @@ pub(crate) mod key_idx_oracle {
         key_index::key_index_fields(&ftr, |r| slice(bytes, r)).expect("KEY_IDX fields")
     }
 
+    /// The object's KEY_IDX header version byte, `None` with no KEY_IDX.
+    pub(crate) fn version(bytes: &[u8]) -> Option<u8> {
+        let ftr = footer::open(bytes).expect("open");
+        key_index::key_index_version(&ftr, |r| slice(bytes, r)).expect("KEY_IDX version")
+    }
+
     /// The object's KEY_IDX answer for `key8` of `field` under `key_type`.
     pub(crate) fn probe(
         bytes: &[u8],
@@ -4062,11 +4068,23 @@ mod tests {
         records: &[LogRecord],
         mut w: RlogWriter,
     ) -> Bytes {
-        let th = tenant_hash();
         for r in records {
             w.push(r.clone()).expect("push");
         }
         let bytes = Bytes::from(w.finish().expect("finish L0"));
+        seed_l0_object(store, writer_id, seq, records, bytes).await
+    }
+
+    /// Seed already-written object bytes holding `records`, plus their commit
+    /// record, exactly as the ingest log shard would.
+    async fn seed_l0_object(
+        store: &dyn ObjectStoreBackend,
+        writer_id: Uuid,
+        seq: u64,
+        records: &[LogRecord],
+        bytes: Bytes,
+    ) -> Bytes {
+        let th = tenant_hash();
         let content_hash: [u8; 32] = *blake3::hash(&bytes).as_bytes();
         let data_key = keys::data_key(
             &th,
@@ -5072,6 +5090,126 @@ mod tests {
             1,
             "C's trace is found though C indexed nothing"
         );
+    }
+
+    /// Issue #3039: compacting an input whose KEY_IDX is version 1, keyed by
+    /// the old first-entry rule (a nested resource entry shadowing a scope
+    /// scalar), writes a version-2 section whose keys follow the reader's
+    /// merged view: the scope scalar behind a nested resource entry is keyed,
+    /// and a scope scalar behind a wrong-type resource scalar is not.
+    #[tokio::test]
+    async fn compacting_version_one_key_index_writes_version_two_keyed_by_the_readers_rule() {
+        use super::key_idx_oracle as oracle;
+        use ravel_logseg::key_index::{RLOG_KEY_IDX_VERSION, key8_str, rewrite_key_index};
+
+        let region = |v: AttrValue| vec![("region".to_string(), v)];
+        let s = |v: &str| AttrValue::Str(v.to_string());
+        // (resource, scope): the reader resolves ap-south-1, us-east-1, NULL.
+        let streams = [
+            (
+                region(AttrValue::List(vec![s("eu-west-1")])),
+                region(s("ap-south-1")),
+            ),
+            (region(s("us-east-1")), vec![]),
+            (region(AttrValue::I64(7)), region(s("eu-central-1"))),
+        ];
+        let records: Vec<LogRecord> = streams
+            .iter()
+            .enumerate()
+            .flat_map(|(n, (resource, scope))| {
+                let scope_name = format!("scope{n}");
+                let stream_id = log_stream_id(resource, &scope_name, "1", scope);
+                let stream_attrs = stream_attrs_bytes(resource, &scope_name, "1", scope);
+                (0..9000i64).map(move |i| {
+                    let mut r = record(0, i * 10 + n as i64, "keyed", vec![]);
+                    r.stream_id = stream_id;
+                    r.stream_attrs = stream_attrs.clone();
+                    r
+                })
+            })
+            .collect();
+        let store = MemoryStore::new();
+        let mut inputs = Vec::new();
+        for (seq, half) in [(1u64, &records[..13_500]), (2, &records[13_500..])] {
+            let writer_id = Uuid::from_u128(u128::from(seq));
+            let identity = ObjectIdentity {
+                tenant_hash: tenant_hash().0,
+                shard: SHARD,
+                writer_id: writer_id.into_bytes(),
+                writer_epoch: EPOCH,
+                writer_seq: seq,
+            };
+            let mut w = RlogWriter::new(RlogConfig::default(), identity)
+                .with_key_index_fields(vec![("region".to_string(), KeyType::Str)]);
+            for r in half {
+                w.push(r.clone()).expect("push");
+            }
+            let current = w.finish().expect("finish");
+            // The old writer let the nested resource entry claim region and
+            // keyed nothing for that stream.
+            let legacy =
+                rewrite_key_index(&current, key_index::KEY_IDX_VERSION_1, |_, _, entries| {
+                    entries
+                        .into_iter()
+                        .filter(|(k, _)| *k != key8_str("ap-south-1"))
+                        .collect()
+                })
+                .expect("rewrite as version 1");
+            let input = seed_l0_object(&store, writer_id, seq, half, Bytes::from(legacy)).await;
+            assert_eq!(oracle::version(&input), Some(key_index::KEY_IDX_VERSION_1));
+            inputs.push(input);
+        }
+        assert!(!key_index::section_resolves_like_the_reader(
+            key_index::KEY_IDX_VERSION_1
+        ));
+        assert_eq!(
+            oracle::probe(&inputs[0], "region", KeyType::Str, &key8_str("ap-south-1")),
+            None,
+            "a version 1 input declines"
+        );
+        let relabelled = rewrite_key_index(&inputs[0], RLOG_KEY_IDX_VERSION, |_, _, e| e)
+            .expect("relabel as version 2");
+        assert_eq!(
+            oracle::probe(&relabelled, "region", KeyType::Str, &key8_str("ap-south-1")),
+            Some(vec![]),
+            "the input is keyed by the old rule"
+        );
+
+        let clock = FixedClock::new(sealed_now_ns());
+        compact_bucket(&store, &clock, &CompactorConfig::default(), &bucket())
+            .await
+            .expect("compact");
+        let (_rec, parts) = read_output(&store).await;
+        assert_eq!(parts.len(), 1);
+        let l1 = &parts[0];
+        assert_eq!(oracle::version(l1), Some(RLOG_KEY_IDX_VERSION));
+        assert!(key_index::section_resolves_like_the_reader(
+            oracle::version(l1).expect("KEY_IDX")
+        ));
+        let stream_of = |n: usize| {
+            let (resource, scope) = &streams[n];
+            log_stream_id(resource, &format!("scope{n}"), "1", scope)
+        };
+        let block_count = footer::open(l1).expect("open l1").block_count;
+        for (value, stream) in [
+            ("ap-south-1", Some(0)),
+            ("us-east-1", Some(1)),
+            ("eu-central-1", None),
+            ("eu-west-1", None),
+        ] {
+            let want = oracle::true_blocks(l1, |r| Some(r.stream_id) == stream.map(stream_of));
+            assert_eq!(
+                want.is_empty(),
+                stream.is_none(),
+                "{value}: {want:?} of {block_count} blocks"
+            );
+            assert!((want.len() as u64) < block_count, "{value}: {want:?}");
+            assert_eq!(
+                oracle::probe(l1, "region", KeyType::Str, &key8_str(value)),
+                Some(want),
+                "region = {value}"
+            );
+        }
     }
 
     /// No input carries KEY_IDX, so the output carries none.

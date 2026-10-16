@@ -23,8 +23,15 @@ use std::ops::Range;
 use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
 
-/// The section's own grammar version, separate from any trailer version.
-pub const KEY_IDX_VERSION: u8 = 1;
+/// The section's first version byte, separate from any trailer version. RSPAN
+/// writes it.
+pub const KEY_IDX_VERSION_1: u8 = 1;
+/// The same grammar as [`KEY_IDX_VERSION_1`], written by the RLOG writer to
+/// mark a section whose declared attribute values were resolved by the SQL
+/// reader's merged-view rule (docs/log-segment-format.md, "KEY_IDX").
+pub const KEY_IDX_VERSION_2: u8 = 2;
+/// Every version byte a reader accepts.
+pub const KEY_IDX_VERSIONS: [u8; 2] = [KEY_IDX_VERSION_1, KEY_IDX_VERSION_2];
 /// The `bucket_bits` every format writer uses.
 pub const KEY_IDX_WRITER_BUCKET_BITS: u8 = 8;
 /// Smallest `bucket_bits` a reader accepts.
@@ -295,13 +302,13 @@ struct FieldParts {
     frames: Vec<Vec<u8>>,
 }
 
-/// Writes a section at [`KEY_IDX_WRITER_BUCKET_BITS`].
+/// Writes a [`KEY_IDX_VERSION_1`] section at [`KEY_IDX_WRITER_BUCKET_BITS`].
 ///
 /// Fields must be 1..=64, ascending by name bytes and unique, with names of
 /// 1..=128 bytes; anything else is a typed error. Entries are deduplicated
 /// and sorted by `(key8, block)` within each bucket.
 pub fn encode_key_idx(fields: &[KeyIdxFieldInput]) -> Result<EncodedKeyIdx, CodecError> {
-    encode_key_idx_with_bucket_bits(fields, KEY_IDX_WRITER_BUCKET_BITS)
+    encode_key_idx_with(fields, KEY_IDX_VERSION_1, KEY_IDX_WRITER_BUCKET_BITS)
 }
 
 /// [`encode_key_idx`] at an explicit `bucket_bits` (1..=16, the range a reader
@@ -311,6 +318,22 @@ pub fn encode_key_idx_with_bucket_bits(
     fields: &[KeyIdxFieldInput],
     bucket_bits: u8,
 ) -> Result<EncodedKeyIdx, CodecError> {
+    encode_key_idx_with(fields, KEY_IDX_VERSION_1, bucket_bits)
+}
+
+/// [`encode_key_idx`] under an explicit `version` byte (one of
+/// [`KEY_IDX_VERSIONS`]) and `bucket_bits`. The version changes the first
+/// byte and `header_crc32c` only; every other byte is the same for both.
+pub fn encode_key_idx_with(
+    fields: &[KeyIdxFieldInput],
+    version: u8,
+    bucket_bits: u8,
+) -> Result<EncodedKeyIdx, CodecError> {
+    if !KEY_IDX_VERSIONS.contains(&version) {
+        return Err(corrupted(format_args!(
+            "writer given version {version}, not one of {KEY_IDX_VERSIONS:?}"
+        )));
+    }
     check_bucket_bits(bucket_bits)?;
     if fields.is_empty() || fields.len() > KEY_IDX_MAX_FIELDS {
         return Err(corrupted(format_args!(
@@ -339,7 +362,7 @@ pub fn encode_key_idx_with_bucket_bits(
         previous = Some(name);
         parts.push(bucket_field(field, bucket_bits)?);
     }
-    assemble(bucket_bits, &parts)
+    assemble(version, bucket_bits, &parts)
 }
 
 /// Buckets, sorts and deduplicates one field's entries and frames each
@@ -403,7 +426,11 @@ fn encode_frame(entries: &[(Key8, u32)]) -> Result<Vec<u8>, CodecError> {
 
 /// Lays out the header, then every directory in field order, then every
 /// bucket area, and serializes them.
-fn assemble(bucket_bits: u8, parts: &[FieldParts]) -> Result<EncodedKeyIdx, CodecError> {
+fn assemble(
+    version: u8,
+    bucket_bits: u8,
+    parts: &[FieldParts],
+) -> Result<EncodedKeyIdx, CodecError> {
     let mut dirs = Vec::with_capacity(parts.len());
     for part in parts {
         let mut ends = Vec::with_capacity(part.frames.len());
@@ -420,7 +447,7 @@ fn assemble(bucket_bits: u8, parts: &[FieldParts]) -> Result<EncodedKeyIdx, Code
     }
     let dir_bytes = dir_len(bucket_bits) as u64;
     let mut header = RawHeader {
-        version: KEY_IDX_VERSION,
+        version,
         bucket_bits,
         reserved: 0,
         prefix_len: 0,
@@ -553,6 +580,7 @@ impl KeyIdxFieldHeader {
 #[derive(Debug)]
 pub struct KeyIdxPrefix<'a> {
     bytes: &'a [u8],
+    version: u8,
     bucket_bits: u8,
     prefix_len: u32,
     fields: Vec<KeyIdxFieldHeader>,
@@ -581,9 +609,9 @@ impl<'a> KeyIdxPrefix<'a> {
         let version = *prefix
             .first()
             .ok_or_else(|| corrupted("header truncated at version"))?;
-        if version != KEY_IDX_VERSION {
+        if !KEY_IDX_VERSIONS.contains(&version) {
             return Err(corrupted(format_args!(
-                "version {version} is not the known version {KEY_IDX_VERSION}"
+                "version {version} is not a known version {KEY_IDX_VERSIONS:?}"
             )));
         }
         let (raw, crc_at) = parse_raw_header(prefix)?;
@@ -666,10 +694,16 @@ impl<'a> KeyIdxPrefix<'a> {
         }
         Ok(KeyIdxPrefix {
             bytes: prefix,
+            version,
             bucket_bits: raw.bucket_bits,
             prefix_len: footer_prefix_len,
             fields,
         })
+    }
+
+    /// The header's `version` byte, one of [`KEY_IDX_VERSIONS`].
+    pub fn version(&self) -> u8 {
+        self.version
     }
 
     pub fn bucket_bits(&self) -> u8 {
@@ -1009,7 +1043,7 @@ fn walk_section(
     section: &[u8],
     footer_prefix_len: u32,
     keep_entries: bool,
-) -> Result<(u8, u32, Vec<WalkedField>), CodecError> {
+) -> Result<(u8, u8, u32, Vec<WalkedField>), CodecError> {
     let section_len = section.len() as u64;
     let prefix_range = key_idx_prefix_range(footer_prefix_len, section_len)?;
     let prefix_end = to_usize(prefix_range.end, "prefix_len")?;
@@ -1056,16 +1090,17 @@ fn walk_section(
             entries: kept,
         });
     }
-    Ok((bits, prefix.prefix_len, fields))
+    Ok((prefix.version, bits, prefix.prefix_len, fields))
 }
 
 /// Verifies a whole section: everything a probe checks, for every field and
 /// every frame, plus that each field's frames tile `[0, buckets_len)` exactly
 /// and their entry counts sum to the field's `entry_count`.
 pub fn verify_key_idx(section: &[u8], footer_prefix_len: u32) -> Result<KeyIdxSummary, CodecError> {
-    let (bucket_bits, prefix_len, fields) = walk_section(section, footer_prefix_len, false)?;
+    let (version, bucket_bits, prefix_len, fields) =
+        walk_section(section, footer_prefix_len, false)?;
     Ok(KeyIdxSummary {
-        version: KEY_IDX_VERSION,
+        version,
         bucket_bits,
         prefix_len,
         fields: fields.into_iter().map(|f| f.summary).collect(),
@@ -1078,7 +1113,7 @@ pub fn decode_key_idx(
     section: &[u8],
     footer_prefix_len: u32,
 ) -> Result<Vec<KeyIdxFieldEntries>, CodecError> {
-    let (_, _, fields) = walk_section(section, footer_prefix_len, true)?;
+    let (_, _, _, fields) = walk_section(section, footer_prefix_len, true)?;
     Ok(fields
         .into_iter()
         .map(|f| KeyIdxFieldEntries {
@@ -1546,6 +1581,97 @@ mod tests {
     }
 
     #[test]
+    fn version_two_differs_from_version_one_in_the_version_byte_and_header_crc_only() {
+        let a = acceptance_section();
+        let v1 = &a.section;
+        let fields = decode_key_idx(&v1.bytes, v1.prefix_len)
+            .expect("decode")
+            .into_iter()
+            .map(|f| KeyIdxFieldInput {
+                name: f.name,
+                key_type: f.key_type,
+                entries: f.entries,
+            })
+            .collect::<Vec<_>>();
+        let v2 = encode_key_idx_with(&fields, KEY_IDX_VERSION_2, KEY_IDX_WRITER_BUCKET_BITS)
+            .expect("encode v2");
+        assert_eq!(v2.prefix_len, v1.prefix_len);
+        assert_eq!(v2.bytes.len(), v1.bytes.len());
+        let (_, crc_at) = parse_raw_header(&v1.bytes).expect("raw");
+        let differing: Vec<usize> = (0..v1.bytes.len())
+            .filter(|&i| v1.bytes[i] != v2.bytes[i])
+            .collect();
+        assert_eq!(differing[0], 0);
+        assert!(
+            differing[1..]
+                .iter()
+                .all(|&i| (crc_at..crc_at + 4).contains(&i))
+        );
+        assert_eq!((v1.bytes[0], v2.bytes[0]), (1, 2));
+        assert_eq!(
+            reseal(&v1.bytes, |h| h.version = KEY_IDX_VERSION_2),
+            v2.bytes
+        );
+
+        let prefix = |s: &EncodedKeyIdx| {
+            KeyIdxPrefix::parse(
+                &s.bytes[..s.prefix_len as usize],
+                s.prefix_len,
+                s.bytes.len() as u64,
+            )
+            .expect("prefix")
+            .version()
+        };
+        assert_eq!((prefix(v1), prefix(&v2)), (1, 2));
+        let (s1, s2) = (
+            verify_key_idx(&v1.bytes, v1.prefix_len).expect("verify v1"),
+            verify_key_idx(&v2.bytes, v2.prefix_len).expect("verify v2"),
+        );
+        assert_eq!((s1.version, s2.version), (1, 2));
+        assert_eq!(s1.fields, s2.fields);
+        for key in [a.key, a.below, a.above, a.absent_same_bucket] {
+            assert_eq!(
+                probe_of(&v2, "user_id", KeyType::I64, &key),
+                probe_of(v1, "user_id", KeyType::I64, &key)
+            );
+        }
+        for i in 0..crc_at + 4 {
+            let mut bytes = v2.bytes.clone();
+            bytes[i] ^= 0x01;
+            corrupted_message(probe_user(&bytes, v2.prefix_len, &a.key));
+            corrupted_message(verify_key_idx(&bytes, v2.prefix_len));
+        }
+        // Each version byte is accepted on its own, so only the header crc
+        // can tell a v1 section claiming v2 (or the reverse) from a real one.
+        for (section, swapped) in [(v1, KEY_IDX_VERSION_2), (&v2, KEY_IDX_VERSION_1)] {
+            let mut bytes = section.bytes.clone();
+            bytes[0] = swapped;
+            assert_corrupted(
+                probe_user(&bytes, section.prefix_len, &a.key),
+                "header_crc32c mismatch",
+            );
+            assert_corrupted(
+                verify_key_idx(&bytes, section.prefix_len),
+                "header_crc32c mismatch",
+            );
+            assert_corrupted(
+                KeyIdxPrefix::parse(
+                    &bytes[..section.prefix_len as usize],
+                    section.prefix_len,
+                    bytes.len() as u64,
+                ),
+                "header_crc32c mismatch",
+            );
+        }
+        for version in [0u8, 3, 255] {
+            assert_corrupted(
+                encode_key_idx_with(&fields, version, KEY_IDX_WRITER_BUCKET_BITS),
+                &format!("writer given version {version}"),
+            );
+        }
+    }
+
+    #[test]
     fn writer_layout_converges_when_offsets_need_longer_varints() {
         let fields: Vec<KeyIdxFieldInput> = (0..KEY_IDX_MAX_FIELDS)
             .map(|i| KeyIdxFieldInput {
@@ -1736,7 +1862,7 @@ mod tests {
         };
         check(reseal(&s.bytes, |h| h.reserved = 1), "reserved field is 1");
         check(reseal(&s.bytes, |h| h.reserved = 0x8000), "reserved field");
-        check(reseal(&s.bytes, |h| h.version = 2), "version 2");
+        check(reseal(&s.bytes, |h| h.version = 3), "version 3");
         check(reseal(&s.bytes, |h| h.version = 0), "version 0");
         check(reseal(&s.bytes, |h| h.bucket_bits = 0), "bucket_bits 0");
         check(reseal(&s.bytes, |h| h.bucket_bits = 17), "bucket_bits 17");
@@ -1890,7 +2016,7 @@ mod tests {
     fn one_frame_section(bucket: u32, frame: Vec<u8>, entry_count: u64) -> EncodedKeyIdx {
         let mut frames = vec![Vec::new(), Vec::new()];
         frames[bucket as usize] = frame;
-        assemble(1, &[part("k", 2, entry_count, frames)]).expect("assemble")
+        assemble(KEY_IDX_VERSION_1, 1, &[part("k", 2, entry_count, frames)]).expect("assemble")
     }
 
     fn raw_frame(count: u32, raw: &[u8]) -> Vec<u8> {
@@ -2050,7 +2176,7 @@ mod tests {
         let (lo, _, _) = keys_by_bucket();
         let empty = || vec![Vec::new(), Vec::new()];
         let check = |parts: Vec<FieldParts>, needle: &str| {
-            let s = assemble(1, &parts).expect("assemble");
+            let s = assemble(KEY_IDX_VERSION_1, 1, &parts).expect("assemble");
             assert_corrupted(
                 probe(&s.bytes, s.prefix_len, "a", KeyType::I64, &lo),
                 needle,
@@ -2077,7 +2203,7 @@ mod tests {
         let ok: Vec<FieldParts> = (0..64)
             .map(|i| part(&format!("f{i:03}"), 2, 0, empty()))
             .collect();
-        let s = assemble(1, &ok).expect("assemble");
+        let s = assemble(KEY_IDX_VERSION_1, 1, &ok).expect("assemble");
         assert_eq!(
             probe(&s.bytes, s.prefix_len, "f063", KeyType::I64, &lo).expect("probe"),
             Some(vec![])
@@ -2142,6 +2268,7 @@ mod tests {
         fn round_trip_names_exactly_the_written_blocks(
             fields in prop::collection::btree_map("[a-z_]{1,10}", typed_entries(), 1..4),
             bucket_bits in prop_oneof![Just(1u8), Just(8u8), Just(16u8)],
+            version in prop_oneof![Just(KEY_IDX_VERSION_1), Just(KEY_IDX_VERSION_2)],
             absent in any::<[u8; 8]>(),
         ) {
             let inputs: Vec<KeyIdxFieldInput> = fields
@@ -2152,8 +2279,9 @@ mod tests {
                     entries: entries.clone(),
                 })
                 .collect();
-            let s = encode_key_idx_with_bucket_bits(&inputs, bucket_bits).expect("encode");
+            let s = encode_key_idx_with(&inputs, version, bucket_bits).expect("encode");
             let summary = verify_key_idx(&s.bytes, s.prefix_len).expect("verify");
+            prop_assert_eq!(summary.version, version);
             prop_assert_eq!(summary.bucket_bits, bucket_bits);
             prop_assert_eq!(summary.fields.len(), inputs.len());
             let decoded = decode_key_idx(&s.bytes, s.prefix_len).expect("decode");
@@ -2172,6 +2300,7 @@ mod tests {
                 s.bytes.len() as u64,
             )
             .expect("prefix");
+            prop_assert_eq!(prefix.version(), version);
             for (input, field) in inputs.iter().zip(&summary.fields) {
                 let mut model: BTreeMap<Key8, BTreeSet<u32>> = BTreeMap::new();
                 for (k, b) in &input.entries {

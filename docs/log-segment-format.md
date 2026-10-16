@@ -1361,6 +1361,30 @@ entry; the indexed value is the one the `logs` SQL column reads for the row
 (the merged attribute view, ADR-0049 amendment), so a key held only at
 resource or scope level indexes every block of that stream.
 
+A declared field resolves exactly as the reader's typed attribute column
+does (`find_attr` in ravel-sql's `rlog_attrs` module, over the merged view;
+ADR-2707, RLOG reader-rule amendment):
+
+1. Resource and scope entries whose value is a `Map` or `List` are dropped;
+   they never claim the name.
+2. Of the remaining stream entries the first wins, resource ahead of scope.
+3. A record-level value replaces it, whatever its type. A record-level `Map`
+   or `List` reads as its canonical bytes under a `BYTES` column and as NULL
+   under the others.
+4. A winner of a type other than the declared one yields no key, and it still
+   shadows every later entry for the name.
+
+The same resolution feeds the SKIP_IDX numeric stat of every `I64`, `F64`
+and `Bool` attribute column, declared or not, so the stat range of a block
+covers every value the reader materializes in it.
+A section at `version` 2 is keyed by this rule. A section at `version` 1 from
+an RLOG writer is not: that writer let a top-level `Map` or `List` resource or
+scope entry claim the name, so a scalar behind it was never keyed, and under a
+`BYTES` field it keyed that nested entry's canonical bytes, a value the reader
+drops. `version` is the only way to tell the two apart, and
+`ravel_logseg::key_index::section_resolves_like_the_reader` is the test a
+consumer applies before it treats an absent key as proof (see "Reading").
+
 `key_type` is the section's own enumeration, not `TypedAttrColumnType`
 (proto/ravel/sys.proto: STR 1, I64 2, BOOL 3, BYTES 4): the writer maps a
 declared `I64` to 2, `STR` to 3, `BYTES` to 4, and the fixed `trace_id`
@@ -1398,7 +1422,9 @@ the reader accepts 1 to 16 and refuses anything else as `Corrupted`.
 
 ```
 key_idx (stored uncompressed; bucket payloads zstd):
-  u8       version            (= 1: this section's own grammar version)
+  u8       version            (1 or 2, same grammar: an RLOG writer writes 2,
+                               its keys resolved as "Entries and keys"
+                               states; RSPAN writes 1; a reader accepts both)
   u8       bucket_bits        (writer 8; reader accepts 1..=16)
   u16 LE   reserved           (= 0; non-zero is Corrupted)
   u32 LE   prefix_len         (bytes from the section start through the last
@@ -1492,13 +1518,30 @@ section by ranged GET to build the per-part `.kidx` leaf
 (docs/catalog-and-mvcc.md, "Per-part key-index leaves"), never rows.
 
 A probe declines (no prune, as for an unindexed field) when the section is
-absent, its header does not name the field, or the header names it under a
+absent, its header is at `version` 1, its header does not name the field, or
+the header names it under a
 `key_type` other than the one the caller derived `key8` under: the stored
 `key_type` decides, not the tenant's current column type. A section whose `version`
-byte is above the one the reader knows, or any violation of the grammar
+byte is neither 1 nor 2, or any violation of the grammar
 above, is a typed `Corrupted` error that disables the probe for the object;
 the object is then read as if it had no KEY_IDX. The result never changes,
 only the cost.
+
+Every reader (verify, summary, the ranged probe, `ravel-cli rlog inspect`,
+compaction and the erasure rewrite) reads both versions, and compaction and
+the erasure rewrite rebuild the section from rows, so their output is always
+`version` 2. The ranged probe (`ravel_logseg::key_index::probe_ranged` and
+`probe_source`) reads a `version` 1 section's prefix and then declines, as for
+an unindexed field: that section's declared-field keys can miss a value the
+reader materializes, so an absent key there proves nothing. No logs query
+prunes on the probe yet.
+A binary older than this version refuses a `version` 2 section as
+`Corrupted`: its probe and `inspect` fail for that object, and its compactor
+and erasure rewrite, which read every input's KEY_IDX header, fail the bucket
+and retry it until they are rolled forward. A mixed-version fleet therefore
+rolls compactors and maintenance forward before ingest writes `version` 2,
+and rolls ingest back before rolling a compactor or maintenance process back
+to a binary that refuses `version` 2.
 
 ## Compaction (L0 → L1)
 
@@ -1789,8 +1832,8 @@ All violations are `Corrupted`, never panics:
   trailing bytes left over once the declared term count is consumed; a
   declared term or posting count the block's remaining bytes cannot
   support.
-- key_idx (ADR-2707): header crc mismatch; `version` above the
-  one the reader knows; `bucket_bits` outside 1 to 16; non-zero reserved
+- key_idx (ADR-2707): header crc mismatch; a `version` other than 1 or 2
+  (0 included); `bucket_bits` outside 1 to 16; non-zero reserved
   bytes; `field_count` zero or over 64; field names not ascending or not
   unique; an unknown `key_type`; a header `prefix_len` not equal to the
   footer `Section` entry's copy, a zero `prefix_len` on a kind-9 entry, or

@@ -352,7 +352,9 @@ Field by field:
   every string attribute column. A word or equality predicate on a column that
   the list omits is never bloom-pruned.
 - `key_idx`: printed only when the object has a KEY_IDX section. The header
-  line gives the section's `version` byte, `bucket_bits` (each field has
+  line gives the section's `version` byte (2 from a current RLOG writer,
+  whose keys follow the reader's resolution of declared fields; 1 on an older
+  RLOG object, whose keys may not), `bucket_bits` (each field has
   `2^bucket_bits` buckets), `prefix_len`, and the field count. Then one line
   per indexed field: its `key_type` (`I64`, `Str`, `Bytes`, or `Id16` for
   `trace_id`), `entries` (distinct key and block pairs), the bucket count,
@@ -361,7 +363,7 @@ Field by field:
 
   ```
     kind=9 name=KEY_IDX offset=214 len=2244 comp=none uncompressed_len=2244 prefix_len=2091
-  key_idx: version=1 bucket_bits=8 prefix_len=2091 fields=2
+  key_idx: version=2 bucket_bits=8 prefix_len=2091 fields=2
     field name=code key_type=I64 entries=4 buckets=256 entries_per_bucket=[min=0 median=0 max=2] empty_buckets=253
     field name=svc key_type=Str entries=2 buckets=256 entries_per_bucket=[min=0 median=0 max=1] empty_buckets=254
   ```

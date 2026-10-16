@@ -8,13 +8,19 @@
 //! object without one reads unchanged. A probe returns the blocks holding
 //! every value whose `key8` equals the probed one, so two values sharing a
 //! `key8` share their answer; the caller's row filter stays authoritative.
+//!
+//! This writer marks its sections [`RLOG_KEY_IDX_VERSION`]: every declared
+//! value was resolved by the SQL reader's merged-view rule. A section an
+//! earlier writer left at version 1 still reads and verifies, but its keys
+//! may disagree with the reader, so [`section_resolves_like_the_reader`] is
+//! false for it and a probe declines on it.
 
 use std::collections::HashMap;
 use std::ops::Range;
 
 use ravel_codec::key_idx::{
-    KEY_IDX_MAX_NAME_LEN, KEY_IDX_WRITER_BUCKET_BITS, KeyIdxFieldInput, KeyIdxPrefix, bucket_index,
-    encode_key_idx, key_idx_prefix_range, verify_key_idx,
+    KEY_IDX_MAX_NAME_LEN, KEY_IDX_VERSION_2, KEY_IDX_WRITER_BUCKET_BITS, KeyIdxFieldInput,
+    KeyIdxPrefix, bucket_index, encode_key_idx_with, key_idx_prefix_range, verify_key_idx,
 };
 
 use crate::error::LogSegError;
@@ -23,9 +29,27 @@ use crate::record::{ColumnValue, FieldType};
 use crate::source::ByteSource;
 
 pub use ravel_codec::key_idx::{
-    EncodedKeyIdx, KEY_IDX_BUCKET_MAX_ENTRIES, KEY_IDX_MAX_FIELDS, Key8, KeyIdxFieldSummary,
-    KeyIdxSummary, KeyType, key8_bytes, key8_i64, key8_id16, key8_str,
+    EncodedKeyIdx, KEY_IDX_BUCKET_MAX_ENTRIES, KEY_IDX_MAX_FIELDS, KEY_IDX_VERSION_1,
+    KEY_IDX_VERSIONS, Key8, KeyIdxFieldSummary, KeyIdxSummary, KeyType, key8_bytes, key8_i64,
+    key8_id16, key8_str,
 };
+
+/// The KEY_IDX version byte the RLOG writer stamps: the section grammar of
+/// [`KEY_IDX_VERSION_1`], with every attribute field's values resolved as the
+/// SQL reader resolves the declared column (docs/log-segment-format.md,
+/// "KEY_IDX", "Entries and keys"). RSPAN keeps writing version 1.
+pub const RLOG_KEY_IDX_VERSION: u8 = KEY_IDX_VERSION_2;
+
+/// Whether an RLOG KEY_IDX section of header `version` was written by the
+/// reader's resolution rule, so a probe miss on it proves no row's declared
+/// column holds the value. False for a version 1 section: an earlier RLOG
+/// writer let a top-level `Map` or `List` resource or scope entry claim a
+/// field's name, so a scalar behind it was never keyed, and under a `Bytes`
+/// field it keyed that nested entry's canonical bytes, a value the reader
+/// drops. [`probe_ranged`] and [`probe_source`] decline on such a section.
+pub fn section_resolves_like_the_reader(version: u8) -> bool {
+    version == RLOG_KEY_IDX_VERSION
+}
 
 /// The fixed `trace_id` column's field name, the only field of key type
 /// [`KeyType::Id16`].
@@ -189,7 +213,11 @@ impl KeyIndexPlan {
         if inputs.is_empty() {
             return Ok(None);
         }
-        Ok(Some(encode_key_idx(&inputs)?))
+        Ok(Some(encode_key_idx_with(
+            &inputs,
+            RLOG_KEY_IDX_VERSION,
+            KEY_IDX_WRITER_BUCKET_BITS,
+        )?))
     }
 }
 
@@ -266,14 +294,34 @@ where
         .collect())
 }
 
+/// The object's KEY_IDX header `version` byte, read through `read` as
+/// [`key_index_fields`] reads it (the section's `[0, prefix_len)`, header and
+/// directory crcs verified). `None` when the object has no KEY_IDX.
+pub fn key_index_version<B, F>(footer: &LogFooter, mut read: F) -> Result<Option<u8>, LogSegError>
+where
+    B: AsRef<[u8]>,
+    F: FnMut(Range<u64>) -> Result<B, LogSegError>,
+{
+    let Some(desc) = key_index_section(footer) else {
+        return Ok(None);
+    };
+    let prefix_range = key_idx_prefix_range(desc.prefix_len, desc.len)?;
+    let prefix_bytes = read(absolute(desc, prefix_range)?)?;
+    let prefix = KeyIdxPrefix::parse(prefix_bytes.as_ref(), desc.prefix_len, desc.len)?;
+    Ok(Some(prefix.version()))
+}
+
 /// Probes the object's KEY_IDX for `key8` of `field` under `key_type`,
 /// through `read`, which returns the object's bytes for an object-absolute
 /// range. Reads the section's `[0, prefix_len)`, then the one bucket the key
 /// mixes to, skipped when that bucket is empty.
 ///
 /// `Ok(None)` declines (no prune): the object has no KEY_IDX, or its header
-/// does not name `field`, or names it under another key type.
-/// `Ok(Some(blocks))` is the ascending level-0 block ordinals holding the
+/// is at a version [`section_resolves_like_the_reader`] rejects (a version 1
+/// RLOG section, read after its prefix only), or does not name `field`, or
+/// names it under another key type. A caller cannot tell a declined version 1
+/// section from a field it does not name, and does not need to: neither
+/// proves a key absent. `Ok(Some(blocks))` is the ascending level-0 block ordinals holding the
 /// key, empty when the key is absent from the object. An ordinal at or past
 /// the footer's `block_count`, or any grammar violation, is
 /// [`LogSegError::Corrupted`].
@@ -294,6 +342,9 @@ where
     let prefix_range = key_idx_prefix_range(desc.prefix_len, desc.len)?;
     let prefix_bytes = read(absolute(desc, prefix_range)?)?;
     let prefix = KeyIdxPrefix::parse(prefix_bytes.as_ref(), desc.prefix_len, desc.len)?;
+    if !section_resolves_like_the_reader(prefix.version()) {
+        return Ok(None);
+    }
     let Some(bucket) = prefix.locate(field, key_type, key8)? else {
         return Ok(None);
     };
@@ -324,6 +375,74 @@ pub fn probe_source<S: ByteSource + ?Sized>(
     probe_ranged(footer, field, key_type, key8, |r| {
         source.read(r.start, r.end.saturating_sub(r.start))
     })
+}
+
+/// Rewrites a whole `.rlog` object's KEY_IDX section under header `version`,
+/// each field's decoded entries passed through `entries`, moves every later
+/// section by the length change, and rewrites the footer and trailer. For
+/// tests that need an object an earlier writer produced: a version 1 section,
+/// or one holding keys the reader's rule would not.
+#[cfg(any(test, feature = "test-support"))]
+pub fn rewrite_key_index<F>(
+    object: &[u8],
+    version: u8,
+    mut entries: F,
+) -> Result<Vec<u8>, LogSegError>
+where
+    F: FnMut(&str, KeyType, Vec<(Key8, u32)>) -> Vec<(Key8, u32)>,
+{
+    use crate::footer::{TRAILER_LEN, open, write_footer_and_trailer};
+    use ravel_codec::key_idx::decode_key_idx;
+
+    let corrupt = |what: &str| LogSegError::Corrupted(format!("rewrite_key_index: {what}"));
+    let mut footer = open(object)?;
+    let desc = *key_index_section(&footer).ok_or_else(|| corrupt("no KEY_IDX section"))?;
+    let start = usize::try_from(desc.offset).map_err(|_| corrupt("offset"))?;
+    let end = usize::try_from(desc.offset + desc.len).map_err(|_| corrupt("len"))?;
+    let section = object
+        .get(start..end)
+        .ok_or_else(|| corrupt("section past object"))?;
+    let inputs: Vec<KeyIdxFieldInput> = decode_key_idx(section, desc.prefix_len)?
+        .into_iter()
+        .map(|f| KeyIdxFieldInput {
+            entries: entries(&f.name, f.key_type, f.entries),
+            name: f.name,
+            key_type: f.key_type,
+        })
+        .collect();
+    let encoded = encode_key_idx_with(&inputs, version, KEY_IDX_WRITER_BUCKET_BITS)?;
+    let trailer_at = object
+        .len()
+        .checked_sub(TRAILER_LEN)
+        .ok_or_else(|| corrupt("object smaller than trailer"))?;
+    let footer_len = object
+        .get(trailer_at..trailer_at + 4)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map(u32::from_le_bytes)
+        .ok_or_else(|| corrupt("trailer"))?;
+    let footer_at = trailer_at
+        .checked_sub(footer_len as usize)
+        .ok_or_else(|| corrupt("footer_len past object"))?;
+    let new_len = encoded.bytes.len() as u64;
+    let mut out = object[..start].to_vec();
+    out.extend_from_slice(&encoded.bytes);
+    out.extend_from_slice(
+        object
+            .get(end..footer_at)
+            .ok_or_else(|| corrupt("sections"))?,
+    );
+    for s in &mut footer.sections {
+        if s.kind == kind::KEY_IDX {
+            s.len = new_len;
+            s.uncomp_len = new_len;
+            s.crc32c = crc32c::crc32c(&encoded.bytes);
+            s.prefix_len = encoded.prefix_len;
+        } else if s.offset > desc.offset {
+            s.offset = s.offset - desc.len + new_len;
+        }
+    }
+    write_footer_and_trailer(&mut out, &footer);
+    Ok(out)
 }
 
 /// Verifies the section crc and every crc and frame of the object's whole
@@ -476,5 +595,244 @@ mod tests {
             .expect("present");
         assert_eq!(summary.fields.len(), 1);
         assert_eq!(summary.fields[0].entry_count, 4);
+    }
+
+    fn section_of<'a>(obj: &'a [u8], footer: &LogFooter) -> &'a [u8] {
+        let desc = key_index_section(footer).expect("KEY_IDX");
+        &obj[desc.offset as usize..(desc.offset + desc.len) as usize]
+    }
+
+    fn whole<'a>(obj: &'a [u8]) -> impl FnMut(Range<u64>) -> Result<&'a [u8], LogSegError> {
+        move |r| Ok(&obj[r.start as usize..r.end as usize])
+    }
+
+    /// The writer stamps [`RLOG_KEY_IDX_VERSION`]; the same entries under
+    /// version 1 read, verify and name their fields the same, the predicate
+    /// tells the two apart, and a probe declines on version 1.
+    #[test]
+    fn both_versions_read_alike_and_only_version_two_resolves_like_the_reader() {
+        let v2 = object();
+        let v1 = rewrite_key_index(&v2, KEY_IDX_VERSION_1, |_, _, e| e).expect("rewrite");
+        assert_eq!(v1.len(), v2.len());
+        let (f1, f2) = (open(&v1).expect("open v1"), open(&v2).expect("open v2"));
+        assert_eq!(
+            key_index_version(&f2, whole(&v2)).expect("v2"),
+            Some(RLOG_KEY_IDX_VERSION)
+        );
+        assert_eq!(key_index_version(&f1, whole(&v1)).expect("v1"), Some(1));
+        assert_eq!(RLOG_KEY_IDX_VERSION, 2);
+        assert!(section_resolves_like_the_reader(RLOG_KEY_IDX_VERSION));
+        assert!(!section_resolves_like_the_reader(KEY_IDX_VERSION_1));
+        for v in KEY_IDX_VERSIONS {
+            assert_eq!(section_resolves_like_the_reader(v), v == 2, "version {v}");
+        }
+
+        let s1 = summarize(&f1, section_of(&v1, &f1))
+            .expect("v1")
+            .expect("present");
+        let s2 = summarize(&f2, section_of(&v2, &f2))
+            .expect("v2")
+            .expect("present");
+        assert_eq!((s1.version, s2.version), (1, 2));
+        assert_eq!(s1.fields, s2.fields);
+        assert_eq!(
+            key_index_fields(&f1, whole(&v1)).expect("v1"),
+            key_index_fields(&f2, whole(&v2)).expect("v2")
+        );
+        let decoded = |obj: &[u8], footer: &LogFooter| {
+            ravel_codec::key_idx::decode_key_idx(
+                section_of(obj, footer),
+                key_index_section(footer).expect("KEY_IDX").prefix_len,
+            )
+            .expect("decode")
+        };
+        assert_eq!(decoded(&v1, &f1), decoded(&v2, &f2));
+        // Version 1 holds every key version 2 does, and still declines after
+        // reading its prefix alone; version 2 answers.
+        let user_entries = &decoded(&v1, &f1)[0].entries;
+        for v in 0..5 {
+            assert_eq!(
+                user_entries.contains(&(key8_i64(v), v as u32)),
+                v < 4,
+                "value {v}"
+            );
+            let mut reads = Vec::new();
+            let declined = probe_ranged(&f1, "user_id", KeyType::I64, &key8_i64(v), |r| {
+                reads.push(r.clone());
+                Ok::<_, LogSegError>(&v1[r.start as usize..r.end as usize])
+            })
+            .expect("probe v1");
+            assert_eq!(declined, None, "version 1, value {v}");
+            assert_eq!(reads.len(), 1, "version 1 reads the prefix only");
+            assert_eq!(
+                probe_source(&f1, &v1[..], "user_id", KeyType::I64, &key8_i64(v)).expect("v1"),
+                None
+            );
+            let want = if v < 4 { vec![v as u32] } else { Vec::new() };
+            assert_eq!(
+                probe_source(&f2, &v2[..], "user_id", KeyType::I64, &key8_i64(v)).expect("v2"),
+                Some(want),
+                "version 2, value {v}"
+            );
+        }
+        // Everything outside the section's version byte, header crc and footer
+        // section crc is unchanged.
+        let desc = *key_index_section(&f2).expect("KEY_IDX");
+        assert_eq!(v1[..desc.offset as usize], v2[..desc.offset as usize]);
+        assert_eq!(v1[desc.offset as usize], 1);
+        assert_eq!(v2[desc.offset as usize], 2);
+        let mut f1_as_v2 = f1.clone();
+        if let Some(d) = f1_as_v2
+            .sections
+            .iter_mut()
+            .find(|d| d.kind == kind::KEY_IDX)
+        {
+            d.crc32c = desc.crc32c;
+        }
+        assert_eq!(f1_as_v2, f2);
+    }
+
+    /// One block per record, each a resolution case for field `k` declared
+    /// under `key_type`: `scalar(n)` builds a value of that type, `wrong` a
+    /// scalar of another type. Returns the object and, per block, the value
+    /// the reader's merged view resolves `k` to (`None`: no key).
+    fn resolution_object(
+        key_type: KeyType,
+        scalar: impl Fn(i64) -> AttrValue,
+        wrong: AttrValue,
+    ) -> (Vec<u8>, Vec<Option<AttrValue>>) {
+        let nested_list = AttrValue::List(vec![scalar(90)]);
+        let nested_map = AttrValue::Map(vec![("k".into(), scalar(91))]);
+        let k = |v: AttrValue| vec![("k".to_string(), v)];
+        // (resource, scope, record, resolved)
+        let cases: Vec<(Vec<_>, Vec<_>, Vec<_>, Option<AttrValue>)> = vec![
+            // nested resource entry, then a scope scalar: the scalar.
+            (
+                k(nested_list.clone()),
+                k(scalar(1)),
+                vec![],
+                Some(scalar(1)),
+            ),
+            // resource scalar, then a nested scope entry: the scalar.
+            (k(scalar(2)), k(nested_map.clone()), vec![], Some(scalar(2))),
+            // nested only: no key.
+            (k(nested_map.clone()), k(nested_list.clone()), vec![], None),
+            // scalar only.
+            (vec![], k(scalar(4)), vec![], Some(scalar(4))),
+            // record-level value over a nested and a scalar stream entry.
+            (
+                k(nested_list.clone()),
+                k(scalar(5)),
+                k(scalar(55)),
+                Some(scalar(55)),
+            ),
+            // a wrong-type scalar first: no key, and the later scalar shadowed.
+            (k(wrong.clone()), k(scalar(6)), vec![], None),
+            // nested, then a wrong-type scalar, then nothing of the type.
+            (k(nested_list.clone()), k(wrong.clone()), vec![], None),
+            // record-level value over a stream layer holding only nested.
+            (k(nested_map.clone()), vec![], k(scalar(8)), Some(scalar(8))),
+        ];
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [1; 16],
+            shard: 0,
+            writer_id: [2; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut w =
+            RlogWriter::new(cfg, identity).with_key_index_fields(vec![("k".into(), key_type)]);
+        let mut resolved = Vec::new();
+        for (i, (resource, scope, attrs, want)) in cases.into_iter().enumerate() {
+            let scope_name = format!("s{i}");
+            w.push(LogRecord {
+                stream_id: ravel_types::logstream::log_stream_id(
+                    &resource,
+                    &scope_name,
+                    "1",
+                    &scope,
+                ),
+                stream_attrs: crate::record::stream_attrs_bytes(
+                    &resource,
+                    &scope_name,
+                    "1",
+                    &scope,
+                ),
+                ts_ns: i as i64,
+                observed_ts_ns: i as i64,
+                severity_num: 9,
+                severity_text: "INFO".into(),
+                body: "b".into(),
+                trace_id: None,
+                span_id: None,
+                flags: 0,
+                attrs,
+            })
+            .expect("push");
+            resolved.push(want);
+        }
+        (w.finish().expect("finish"), resolved)
+    }
+
+    /// The writer's keys for a declared field are exactly the values the
+    /// reader's merged view resolves: nested resource and scope entries are
+    /// skipped, the first remaining entry wins with resource before scope, a
+    /// record-level value wins over both, and a wrong-type scalar first yields
+    /// no key and shadows later entries. Pinned for I64, Str and Bytes fields.
+    #[test]
+    fn declared_keys_follow_the_readers_merged_view() {
+        use ravel_codec::key_idx::decode_key_idx;
+        let i64_case = (
+            KeyType::I64,
+            Box::new(AttrValue::I64) as Box<dyn Fn(i64) -> AttrValue>,
+            AttrValue::Str("7".into()),
+        );
+        let str_case = (
+            KeyType::Str,
+            Box::new(|n: i64| AttrValue::Str(format!("v{n}"))) as Box<dyn Fn(i64) -> AttrValue>,
+            AttrValue::I64(7),
+        );
+        let bytes_case = (
+            KeyType::Bytes,
+            Box::new(|n: i64| AttrValue::Bytes(n.to_le_bytes().to_vec()))
+                as Box<dyn Fn(i64) -> AttrValue>,
+            AttrValue::Str("7".into()),
+        );
+        for (key_type, scalar, wrong) in [i64_case, str_case, bytes_case] {
+            let (obj, resolved) = resolution_object(key_type, &scalar, wrong);
+            let footer = open(&obj).expect("open");
+            assert_eq!(footer.block_count, resolved.len() as u64);
+            let desc = key_index_section(&footer).expect("KEY_IDX");
+            let got: Vec<(Key8, u32)> = decode_key_idx(section_of(&obj, &footer), desc.prefix_len)
+                .expect("decode")
+                .remove(0)
+                .entries;
+            // Blocks are laid out in stream order, not push order, and every
+            // resolved value is distinct, so the keys name the cases.
+            let mut want: Vec<Key8> = resolved
+                .iter()
+                .flatten()
+                .map(|v| match v {
+                    AttrValue::I64(x) => key8_i64(*x),
+                    AttrValue::Str(s) => key8_str(s),
+                    AttrValue::Bytes(b) => key8_bytes(b),
+                    other => panic!("unexpected resolved value {other:?}"),
+                })
+                .collect();
+            want.sort_unstable();
+            let mut keys: Vec<Key8> = got.iter().map(|(k, _)| *k).collect();
+            keys.sort_unstable();
+            assert_eq!(keys, want, "{key_type:?}");
+            let blocks: std::collections::BTreeSet<u32> = got.iter().map(|(_, b)| *b).collect();
+            assert_eq!(blocks.len(), got.len(), "one key per block, {key_type:?}");
+            assert_eq!(
+                key_index_version(&footer, whole(&obj)).expect("version"),
+                Some(RLOG_KEY_IDX_VERSION)
+            );
+        }
     }
 }

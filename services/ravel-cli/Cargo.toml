@@ -187,6 +187,10 @@ zstd = { workspace = true }
 # exercise `--deployment-key-file`, not an in-memory key). Already a
 # workspace pin; adds no new external crate.
 tempfile = { workspace = true }
+# `key_index::rewrite_key_index`, to write the version-1 KEY_IDX object an
+# older RLOG writer left for the `rlog inspect` tests. Already a normal
+# dependency; the dev edge only adds `test-support`.
+ravel-logseg = { workspace = true, features = ["test-support"] }
 
 [lints]
 workspace = true
