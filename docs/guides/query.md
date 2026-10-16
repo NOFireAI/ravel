@@ -987,6 +987,10 @@ What runs today:
 - Column types: `keyword`, `long`, `double`, `boolean`, `date_nanos` and
   `null`.
 
+The [ES|QL conformance report](../esql-conformance.md) lists every form in
+Ravel's inventory of the language, whether the parser, the binder and the
+executor accept it, and the syntax, execution and transport figures.
+
 `FROM` accepts `logs` only. Another source, a pattern such as `logs*`, a
 second source, a remote source and `METADATA` are each refused.
 

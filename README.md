@@ -158,7 +158,9 @@ same `--features` list to cargo.
   is refused with a 400, and one the planner cannot plan, or whose time window
   is wider than the catalog serves, with a 422. None is answered
   approximately. See
-  [ES|QL queries](docs/guides/query.md#esql-queries).
+  [ES|QL queries](docs/guides/query.md#esql-queries), and the
+  [ES|QL conformance report](docs/esql-conformance.md) for which forms of the
+  language each layer accepts and the execution figures.
 
   ```esql
   FROM logs
