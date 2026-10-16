@@ -55,8 +55,14 @@
 //! same segment, and the other partitions own no matching row. Partition 3
 //! reaches its twelfth matching row at its fifteenth block (six late, two
 //! early, six late, one early), and until then nothing can publish a
-//! threshold; in lockstep every partition has decoded fifteen blocks by then,
-//! 60 in all.
+//! threshold. The drive polls partitions 0..3 in order each round and
+//! publishes the threshold right after partition 3's batch fills the heap, so
+//! partitions 0-2 only see it on their next poll, and whatever blocks were
+//! already in flight for them before the skip takes hold are decoded too: the
+//! lockstep drive decodes 67 blocks in all, confirmed by running this fixture
+//! with `global_deal` disabled. No committed test pins that number (it would
+//! need a production hook back to segment order), so it is not asserted here,
+//! only explained.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -113,13 +119,11 @@ const LATE_BASE: i64 = 1000;
 const BLOCKS_PER_SEGMENT: usize = (LATE_RECORDS + EARLY_RECORDS) / RECORDS_PER_BLOCK;
 const TOTAL_BLOCKS: usize = SEGMENTS * BLOCKS_PER_SEGMENT;
 
-/// Blocks the lockstep drive decodes at most under the global deal: each
-/// partition's two early groups (see the module doc).
-const GLOBAL_BOUND: usize = PARTITIONS * 2 * GROUP_BLOCKS;
-/// Blocks the lockstep drive decodes under segment order before any
-/// threshold exists (see the module doc).
-const SEGMENT_ORDER_LOCKSTEP: usize = PARTITIONS * 15;
-/// The early first blocks: every block whose minimum is at or under `T*`.
+/// The early first blocks: every block whose minimum is at or under `T*`,
+/// which every plan must read (see the module doc). The lockstep drive is
+/// deterministic, and under the global deal it decodes exactly this many
+/// and no more: a full heap of ten publishes a threshold before any
+/// partition reaches a second early block or a late one.
 const FLOOR_BLOCKS: usize = SEGMENTS;
 
 /// The bound inside every segment's last block: that block starts at
@@ -680,16 +684,10 @@ async fn logs_topk_global_block_order() {
         run.blocks_total, TOTAL_BLOCKS,
         "the plan counts every block"
     );
-    assert!(
-        run.blocks_scanned <= GLOBAL_BOUND,
-        "each partition decodes at most its two early groups: {} blocks, bound {GLOBAL_BOUND}; \
-         segment order decodes at least {SEGMENT_ORDER_LOCKSTEP}",
-        run.blocks_scanned
-    );
-    assert!(
-        run.blocks_scanned >= FLOOR_BLOCKS,
-        "every block at or under the tenth ts is decoded: {}",
-        run.blocks_scanned
+    assert_eq!(
+        run.blocks_scanned, FLOOR_BLOCKS,
+        "the global deal's lockstep drive decodes exactly the early first \
+         blocks, no more and no fewer"
     );
     // Every segment's directories are reserved from the end of the plan
     // phase, so the first batch already sees all of them.

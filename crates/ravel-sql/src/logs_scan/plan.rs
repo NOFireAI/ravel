@@ -1226,6 +1226,54 @@ mod owned_work_tests {
         );
     }
 
+    /// A partition's consecutive units of one segment share a [`DealtRun`]
+    /// only when their group positions ascend: the open path drains a
+    /// segment's blocks in ascending order and binary-searches
+    /// [`OwnedSeg::indices`] on that assumption
+    /// (`ravel-query/src/log_fetcher.rs`), so a run built from descending
+    /// positions would silently drop candidate blocks there. One segment
+    /// with group keys `[5, 1]` sorts group 1 (key 1) ahead of group 0 (key
+    /// 5), so the two units land in the same partition's queue but as two
+    /// separate runs, never merged into one `groups: [1, 0]`.
+    ///
+    /// Fails against merging consecutive units of one segment on `run.seg
+    /// == seg` alone (dropping the ascending check), which produces one run
+    /// `groups: [1, 0]` instead of the two runs asserted here.
+    #[test]
+    fn descending_group_positions_start_a_new_run() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let segs = vec![planned_seg((0..8).collect(), Some(vec![5, 1]), &budget, 0)];
+        let refs = vec![seg_ref_at("a", 0)];
+        let unplanned = vec![false];
+        let deal = global_deal(&segs, &unplanned, &refs, 1);
+        let run = |seg: usize, groups: &[usize]| DealtRun {
+            seg,
+            groups: groups.to_vec(),
+        };
+        assert_eq!(
+            deal,
+            vec![vec![run(0, &[1]), run(0, &[0])]],
+            "group 1 (key 1) sorts ahead of group 0 (key 5); the descending \
+             position starts a new run instead of extending the previous one"
+        );
+
+        let counts = PlanCounts::dealt(segs, unplanned, 1, 0, &refs, true, true);
+        assert_eq!(
+            deal_owners(counts.global.as_ref().expect("global deal"), 1),
+            vec![2],
+            "two runs of segment 0 means two owners"
+        );
+        let work: Vec<Vec<usize>> = owned_work(&counts, &refs, &[0], 0, 1, true)
+            .into_iter()
+            .map(|w| w.indices)
+            .collect();
+        assert_eq!(
+            work,
+            vec![vec![4, 5, 6, 7], vec![0, 1, 2, 3]],
+            "each OwnedSeg's own indices are ascending"
+        );
+    }
+
     /// Owner counting under an interleaved deal, over two partitions. Keys:
     /// segment 0 at 0, 2, 4; segment 1 at 1, 10, 11; segment 2 at 20, 22;
     /// segment 3 at 21. Sorted and dealt `i % 2`, partition 0 gets segment

@@ -3150,7 +3150,9 @@ struct LogScanStream {
     prefetch_share: usize,
     /// [`LogsScanExec::active_topk`]: the confirmed TopK threshold this
     /// partition reads before opening each owned segment and before decoding
-    /// each block, and that orders the planned path's segments.
+    /// each block, and whose presence selects [`global_deal`] over
+    /// segment-then-group order on the striped path (`visit_order`
+    /// elsewhere, by whole segment, when no read cache is wired).
     topk: Option<TopKThreshold>,
     /// The statement's prefetch pool, shared with the exec and every other
     /// partition's stream. This partition's issued opens of the owned
@@ -3232,18 +3234,22 @@ struct LogScanStream {
     /// footer it first used. `None` on the whole-segment fast path.
     current_footer: Option<LogFooter>,
     /// The plan fallback's whole-object bytes for [`Self::current_seg`]
-    /// (issue #835), consumed exactly once per stream by the FIRST open of
-    /// this segment (`Option::take` at the `NextSegment` state, before
-    /// `open_segment_subset`). `None` whenever the plan phase did not carry
-    /// whole-object bytes forward for this segment, always `None` on the
-    /// whole-segment fast path, and `None` here after that first take even
-    /// though the carry existed -- a later `ReopenRows`/`attrs_raw`-overflow
-    /// reopen of the SAME segment therefore takes the normal fetch/cache path
-    /// rather than reusing these bytes a second time.
+    /// (issue #835), consumed once per [`OwnedSeg`] open of this segment by
+    /// the FIRST open of each (`Option::take` at the `NextSegment` state,
+    /// before `open_segment_subset`): under [`global_deal`] a stream can hold
+    /// several `OwnedSeg`s of one segment, each its own `NextSegment`
+    /// transition and each taking its own carry. `None` whenever the plan
+    /// phase did not carry whole-object bytes forward for this segment,
+    /// always `None` on the whole-segment fast path, and `None` here after
+    /// that open's take even though the carry existed -- a later
+    /// `ReopenRows`/`attrs_raw`-overflow reopen of the SAME `OwnedSeg`
+    /// therefore takes the normal fetch/cache path rather than reusing these
+    /// bytes a second time.
     ///
-    /// Once per stream, not once per buffer: under block striping a segment's
-    /// survivors can be owned by several partitions, each of which clones the
-    /// carry and charges the object's length to
+    /// Once per `OwnedSeg` open, not once per buffer: under block striping a
+    /// segment's survivors can be owned by several partitions, and under
+    /// [`global_deal`] by several `OwnedSeg`s of one partition, each of which
+    /// clones the carry and charges the object's length to
     /// `QueryAccounting::add_bytes_reused`. That matches what the figure
     /// counts, one avoided store call per open, and is the same convention
     /// those opens were charged under as cache hits before this carry existed.

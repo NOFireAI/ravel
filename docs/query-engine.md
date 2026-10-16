@@ -577,18 +577,25 @@ partition:
   intersection (`an_open_that_prunes_differently_from_the_plan_fails_closed`),
   and a share naming a block that is not among the survivors fails the same way
   (`a_raw_subset_refuses_on_survivor_mismatch`).
-- **Row groups are dealt whole.** With a read cache wired, `owned_work` numbers
-  every surviving row group in segment-then-group order across the whole scan,
-  where a row group is the PAGE_DIR group (`group_target_blocks` consecutive
-  blocks, the unit the format stores column-major) and a pruned block stays
-  with its group, and gives group `i` to partition `i % n`. Every block of a
-  group is on one partition (`owned_work_tests`), so the partition that owns a
-  group decodes each of its dictionary pages once, as the reader's dictionary
-  cache does for any scan over a whole group, where partitions splitting the
-  group would each decode them. Group counts differ by at most one across
-  partitions. When the scan has fewer row groups in total than partitions, some
-  partitions own nothing. Without a read cache the assignment stays one whole
-  segment per partition.
+- **Row groups are dealt whole.** With a read cache wired, `owned_work` deals
+  every surviving row group, where a row group is the PAGE_DIR group
+  (`group_target_blocks` consecutive blocks, the unit the format stores
+  column-major) and a pruned block stays with its group. Behind a confirmed
+  ascending `ORDER BY ts LIMIT k` (`LogsScanExec::active_topk().is_some()`),
+  `global_deal` sorts every segment's groups by `(group_key, segment index,
+  group position)`, where `group_key` is a group's least stored minimum `ts`
+  (`i64::MIN` for a group with no bound), and deals group `i` of that global
+  order to partition `i % n`, so every partition reads its earliest-`ts`
+  groups first and the TopK's threshold skip can cut off the rest. Otherwise
+  `owned_work` numbers groups in segment-then-group order across the whole
+  scan and gives group `i` of that order to partition `i % n`. Either way,
+  every block of a group is on one partition (`owned_work_tests`), so the
+  partition that owns a group decodes each of its dictionary pages once, as
+  the reader's dictionary cache does for any scan over a whole group, where
+  partitions splitting the group would each decode them. Group counts differ
+  by at most one across partitions. When the scan has fewer row groups in
+  total than partitions, some partitions own nothing. Without a read cache the
+  assignment stays one whole segment per partition.
 - **The ranged plan covers the partition's own blocks.** A subset open
   intersects the ts and numeric candidate blocks with the blocks it owns before
   the projected page extents and the coverage crossover are computed, so a
@@ -4338,10 +4345,14 @@ of the TopK's, nothing is confirmed and nothing is skipped. A confirmed scan
 shows `topk_threshold=ts` in a `ravel-cli sql explain` plan. The scan only
 reads `t` off the confirmed filter's current expression and uses it twice:
 
-- Segments are dealt to partitions in ascending `min_event_ts_ns` (ties by
-  snapshot index) instead of snapshot order, and a partition does not open
-  an owned segment whose `min_event_ts_ns` is strictly above `t`. A row
-  ref's segment ordinal is still the snapshot index.
+- Without a read cache wired, segments are dealt to partitions in ascending
+  `min_event_ts_ns` (ties by snapshot index) instead of snapshot order, and a
+  partition does not open an owned segment whose `min_event_ts_ns` is
+  strictly above `t`. A row ref's segment ordinal is still the snapshot
+  index. With a read cache wired, dealing moves to row-group granularity
+  instead: `global_deal` orders every segment's groups by `(group_key,
+  segment index, group position)` and deals that global order round-robin,
+  as described under "Row groups are dealt whole" above.
 - Before decoding each block, the scan skips every block at the cursor
   whose skip-index minimum `ts` is strictly above `t`. No column of a
   skipped block is fetched for decode or decoded. Each candidate is
