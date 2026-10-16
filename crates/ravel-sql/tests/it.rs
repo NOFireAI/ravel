@@ -94,6 +94,8 @@ mod logs_stats_load;
 mod logs_str_dict_charge;
 #[path = "logs_striped_directory_accounting.rs"]
 mod logs_striped_directory_accounting;
+#[path = "logs_topk_global_block_order.rs"]
+mod logs_topk_global_block_order;
 #[path = "logs_topk_late_materialization.rs"]
 mod logs_topk_late_materialization;
 #[path = "logs_topk_threshold_skip.rs"]
