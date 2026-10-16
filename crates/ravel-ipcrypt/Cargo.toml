@@ -1,0 +1,25 @@
+[package]
+name = "ravel-ipcrypt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ravel-types = { workspace = true }
+ravel-proto = { workspace = true }
+ravel-object-store = { workspace = true }
+ipcrypt-rs = { workspace = true }
+blake3 = { workspace = true }
+prost = { workspace = true }
+toml = "1"
+serde = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

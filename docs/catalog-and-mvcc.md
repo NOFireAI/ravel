@@ -35,6 +35,7 @@ sys/qualification                                                       store qu
 sys/qualify/<run-id>/...                                                store qualification scratch objects (transient)
 sys/pq-probe/<random>                                                   Ravel-bucket probe object, written and deleted by the probe (transient; ADR-2040 D1)
 sys/tenancy                                                             tenant-hash scheme marker (write-once, additive; ADR-0050 §3)
+sys/ipcrypt/policy                                                      IPCrypt policy fingerprint marker (CreateIfAbsent, then CAS whole-record replace on set-policy, additive; ADR-2993 §9)
 sys/auth                                                                deployment-wide keyed-token-hash -> tenant map (CAS whole-record replace, additive; ADR-0066 §6)
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
