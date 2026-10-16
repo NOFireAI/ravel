@@ -609,7 +609,13 @@ naming the key.
   restarts the server even while `/readyz` answers. Unlike upstream, the
   watchdog's last sleep ends at the deadline and no check runs after it.
   Every call is a line of `out/concurrent/calls.jsonl` with the benchmark's
-  fields plus `round` and `connection`. Every phase's call lines carry
+  fields plus `round` and `connection`. In every phase a failed call's curl
+  stderr file is removed once its line is written (the line's `error`
+  quotes its first 300 bytes for a transport or transfer failure), and
+  `evidence.tgz` leaves out the per-connection answer directories
+  (`out/concurrent/round-*/conn-*`), so an outage that makes hundreds of
+  thousands of fast-failing calls leaves no file per call for the evidence
+  step to copy and redact. Every phase's call lines carry
   `curl_exit`, and `http_status` is 0 when nothing answered. The figures
   follow upstream: a call succeeds when it gets a 2xx answer and its
   transfer completed

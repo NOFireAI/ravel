@@ -847,6 +847,9 @@ print("%s\t%s" % (d.get("errorType", ""), str(d.get("error", ""))[:300]))' "$res
     err="${parsed#*$'\t'}"
     [ -n "$RQ_CLASS" ] || RQ_CLASS=unclassified
   fi
+  # A failed call's curl stderr is in err now; a call that exited 0 printed
+  # none, and concurrent_round removes its empty file after the round.
+  [ "$code" = 0 ] || rm -f "$rdir/$number-$try.curl"
   if [ "${RQ_STATS:-}" = 1 ]; then
     stats="$(python3 -c 'import json, sys
 print(json.dumps(json.load(open(sys.argv[1])).get("stats")))' "$resp" 2>/dev/null)" || stats=""
@@ -1261,7 +1264,9 @@ write_evidence() {
   mkdir -p "$stage" || return 1
   # shellcheck disable=SC2086 # items is a space-separated list of names
   (cd "$KIT" && cp -R $items "$stage/") || return 1
-  rm -rf "$stage"/out/*/requests "$stage"/verify/requests
+  # Per-call response files: the call lines already carry what they hold, and a
+  # long outage leaves enough of them that scrubbing each one outlasts the box.
+  rm -rf "$stage"/out/*/requests "$stage"/verify/requests "$stage"/out/concurrent/round-*/conn-*
   while IFS= read -r f; do
     scrub "$f" || return 1
   done < <(find "$stage" -type f)

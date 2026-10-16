@@ -138,6 +138,8 @@ cat >"$STUBS/curl" <<'STUB'
 # a server that accepts the connection and then hangs: curl exits 28 after its
 # --max-time, or never returns without one. STUB_SQL_TIMEOUT_N names a
 # statement whose call times out at once (curl exit 28, status 000).
+# STUB_SQL_DEAD refuses every measured call as a server that is not
+# listening does, while the SELECT 1 check still answers.
 # STUB_SQL_TRUNCATE_N names a statement whose answer
 # prints status 200 and then fails the transfer (curl exit 18). A SQL call
 # logs its request body to
@@ -207,6 +209,11 @@ case "$url" in
         printf '200 0.1'
         exit 0 ;;
     esac
+    if [ -n "${STUB_SQL_DEAD:-}" ]; then
+      printf '000 0.000412'
+      echo "curl: (7) Failed to connect to 127.0.0.1 port 4318" >&2
+      exit 7
+    fi
     echo "sql $(basename "$body")" >>"$STUB_DIR/curl-sql"
     n="$(basename "$body" .json)"
     try="${out##*-}"
@@ -2508,6 +2515,36 @@ else
   fail "hung SELECT 1 check" "exit $code: $out $(tail -n 3 "$TMP/check-hang.log")"
 fi
 rm -f "$STUB_DIR/check-hang"
+
+# Catches: a failed concurrent call leaving its curl stderr file behind. A
+# connection to a dead endpoint fails fast and loops, so one outage leaves a
+# file per call under out/concurrent, and write_evidence copies and scrubs
+# them one by one, too slowly for evidence.tgz to be written before the box
+# shuts down. Also catches evidence carrying the per-connection response
+# directories at all. Every measured call here is refused at once.
+BOX_D="$TMP/box-dead-endpoint"
+lib_box "$BOX_D"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_D/lib-setup.sh"
+  export STUB_SQL_DEAD=1
+  CONC_ROUNDS=1 CONC_CONNECTIONS=2 CONC_DURATION=2
+  phase_concurrent || exit 1
+  stop_server
+  write_evidence || exit 1
+) >"$TMP/dead-endpoint.log" 2>&1
+code=$?
+dcalls="$(wc -l <"$BOX_D/kit/out/concurrent/calls.jsonl" 2>/dev/null | tr -d ' ')"
+dfailed="$(grep -c '"curl_exit": 7' "$BOX_D/kit/out/concurrent/calls.jsonl" 2>/dev/null)"
+left="$(find "$BOX_D/kit/out/concurrent" -type f \( -name '*.curl' -o -path '*/conn-*/*' \) | head -n 3)"
+tar -tzf "$BOX_D/kit/evidence.tgz" >"$TMP/dead-endpoint.tar" 2>&1 || echo "no evidence.tgz" >>"$TMP/dead-endpoint.tar"
+in_tar="$(grep -E '\.curl$|/conn-[0-9]+/|no evidence' "$TMP/dead-endpoint.tar" | head -n 3)"
+if [ "$code" = 0 ] && [ "${dcalls:-0}" -ge 50 ] && [ "$dfailed" = "$dcalls" ] && [ -z "$left" ] \
+  && grep -q '^out/concurrent/calls.jsonl$' "$TMP/dead-endpoint.tar" && [ -z "$in_tar" ]; then
+  pass "a dead endpoint's failed concurrent calls leave no per-call file, and evidence.tgz is written without them"
+else
+  fail "dead endpoint cleanup" "exit $code, $dfailed of $dcalls calls failed; left: $left; in evidence: $in_tar; $(tail -n 3 "$TMP/dead-endpoint.log")"
+fi
 
 # Catches: run_query recording an answer whose status line said 200 but whose
 # transfer then failed as a success, or without its curl exit code.
