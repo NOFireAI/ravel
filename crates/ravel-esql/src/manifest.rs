@@ -5,8 +5,9 @@
 //! The manifest is `manifest/esql-9.5.toml` in this crate. [`load`] reads it
 //! and validates it: every name is unique within its kind, every alias
 //! resolves to exactly one entry that lists it back, every state is
-//! `supported`, `refused` or `absent`, and no layer claims more than the one
-//! before it. [`Manifest::render_report`] produces `docs/esql-conformance.md`.
+//! `supported`, `refused` or `absent`, no layer claims more than the one
+//! before it, and no expected answer names a column twice.
+//! [`Manifest::render_report`] produces `docs/esql-conformance.md`.
 //!
 //! Nothing at runtime reads the manifest yet. Its only readers are the tests
 //! that prove each entry's states against the parser, the binder and the
@@ -1147,6 +1148,17 @@ fn read_expected(table: &mut RawTable, name: &str) -> Result<Option<Expected>, M
             if columns.is_empty() {
                 return Err(wrong("columns is empty"));
             }
+            if let Some((i, column)) = columns
+                .iter()
+                .enumerate()
+                .find(|(i, c)| columns[..*i].iter().any(|d| d.name == c.name))
+            {
+                return Err(wrong(&format!(
+                    "column {:?} at position {} repeats an earlier column's name",
+                    column.name,
+                    i + 1
+                )));
+            }
             let rows = rows
                 .iter()
                 .map(|text| {
@@ -2227,6 +2239,18 @@ evidence = "a.rs::t"
         assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
         let text = format!("{ENTRY}{RUNS}").replacen("order = \"exact\"", "order = \"key c\"", 1);
         assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
+    }
+
+    /// An expected answer naming one column twice does not load, whatever
+    /// the types: comparison and from-columns both find a column by name.
+    #[test]
+    fn an_answer_with_a_repeated_column_name_is_refused() {
+        let text = format!("{ENTRY}{RUNS}").replacen("\"b:keyword\"", "\"a:keyword\"", 1);
+        let error = load(&text).expect_err("a repeated column name");
+        assert_eq!(
+            error.to_string(),
+            "line 32: \"ROW\": column \"a\" at position 2 repeats an earlier column's name"
+        );
     }
 
     #[test]
