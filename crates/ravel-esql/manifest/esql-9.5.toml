@@ -89,9 +89,10 @@
 #           an entry whose answer matches without the undo. from-columns
 #           reorders Ravel's columns by name into the release's order, the
 #           cells moving with them, and applies only to an answer whose
-#           columns are all among the ten FROM gives and arrive in FROM's
-#           fixed order; an entry naming it with any other column does not
-#           load. integer-literal reads a long column as
+#           columns are all among the ten FROM gives, arrive in FROM's
+#           fixed order, and are sorted by name in the release's answer; an
+#           entry naming it with any other column does not load.
+#           integer-literal reads a long column as
 #           integer where the release's column is integer; now-type reads a
 #           date_nanos column as date where the release's column is date,
 #           rendered to the millisecond. No other divergence can be named.

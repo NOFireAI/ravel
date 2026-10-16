@@ -416,11 +416,11 @@ fn holds_own_node(kind: Kind, name: &str, example: &str, query: &Query) -> Optio
         }),
         (Kind::Syntax, "triple-quoted string") => expr(&|e| {
             matches!(e, Expr::Literal(l) if matches!(l.value, LiteralValue::String(_))
-                && l.span.slice(example).is_some_and(|written| {
-                    written
-                        .trim_start_matches(|c: char| c == '(' || c.is_whitespace())
-                        .starts_with("\"\"\"")
-                }))
+            && l.span.slice(example).is_some_and(|written| {
+                written
+                    .trim_start_matches(|c: char| c == '(' || c.is_whitespace())
+                    .starts_with("\"\"\"")
+            }))
         }),
         (Kind::Syntax, "comments") => {
             let comment = example.find("/*").or_else(|| example.find("//"));

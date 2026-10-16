@@ -475,8 +475,9 @@ pub const FROM_COLUMNS: [&str; 10] = [
 
 /// Ravel's columns reordered by name into the release's order, each row's
 /// cells moving with their column. The names must be the release's, every
-/// one of them in [`FROM_COLUMNS`], and Ravel's order must be that fixed
-/// order limited to the names present, so no other reordering is undone.
+/// one of them in [`FROM_COLUMNS`], the release's order must be sorted by
+/// name, and Ravel's order must be that fixed order limited to the names
+/// present, so no other reordering is undone.
 fn undo_from_columns(expected: &Answer, actual: &Answer) -> Result<Answer, String> {
     if let Some(column) = expected
         .columns
@@ -499,6 +500,13 @@ fn undo_from_columns(expected: &Answer, actual: &Answer) -> Result<Answer, Strin
             "columns {} are not the release's {} in another order",
             show_columns(&actual.columns),
             show_columns(&expected.columns)
+        ));
+    }
+    let release: Vec<String> = expected.columns.iter().map(|c| c.name.clone()).collect();
+    if release != names(&expected.columns) {
+        return Err(format!(
+            "the release's order [{}] is not sorted by name",
+            release.join(", ")
         ));
     }
     let fixed: Vec<&str> = FROM_COLUMNS
@@ -933,9 +941,11 @@ pub fn load(text: &str) -> Result<Manifest, ManifestError> {
             ));
         }
         if entry.divergence.as_deref() == Some("from-columns")
-            && let Some(column) = entry.expected.iter().flat_map(|e| &e.answer.columns).find(|c| {
-                !FROM_COLUMNS.contains(&c.name.as_str())
-            })
+            && let Some(column) = entry
+                .expected
+                .iter()
+                .flat_map(|e| &e.answer.columns)
+                .find(|c| !FROM_COLUMNS.contains(&c.name.as_str()))
         {
             return Err(field(
                 entry.line,
@@ -2241,8 +2251,9 @@ evidence = "a.rs::t"
         assert!(matches!(load(&text), Err(ManifestError::Field { .. })));
     }
 
-    /// An expected answer naming one column twice does not load, whatever
-    /// the types: comparison and from-columns both find a column by name.
+    /// An expected answer naming one column twice does not load, even with
+    /// a different type each time: from-columns finds a column by name, and
+    /// a repeated name would leave it two to choose from.
     #[test]
     fn an_answer_with_a_repeated_column_name_is_refused() {
         let text = format!("{ENTRY}{RUNS}").replacen("\"b:keyword\"", "\"a:keyword\"", 1);
@@ -2361,7 +2372,8 @@ evidence = "a.rs::t"
 
     /// from-columns undoes FROM's fixed order and no other: a column FROM
     /// does not give, such as one EVAL adds, is refused even when the names
-    /// match, and so is a FROM subset in an order that is not the fixed one.
+    /// match, and so is a FROM subset in an order that is not the fixed one,
+    /// or a release answer whose columns are not sorted by name.
     #[test]
     fn from_columns_undoes_only_the_fixed_order() {
         let long = |n: i64| Cell::Long(n);
@@ -2403,6 +2415,19 @@ evidence = "a.rs::t"
             vec![vec![Cell::Text("x".to_owned()), long(0), long(1)]],
         );
         assert_eq!(expected.compare_divergent("from-columns", &fixed), Ok(()));
+
+        let unsorted = answer(
+            &[("flags", "long"), ("dur", "long"), ("message", "keyword")],
+            vec![vec![long(0), long(1), Cell::Text("x".to_owned())]],
+        );
+        let error = divergent(&unsorted, Order::Exact)
+            .compare_divergent("from-columns", &fixed)
+            .expect_err("a release order not sorted by name");
+        assert_eq!(
+            error,
+            "cannot undo from-columns: the release's order [flags, dur, message] is not \
+             sorted by name"
+        );
     }
 
     /// The loader refuses a from-columns entry whose answer has a column
@@ -2425,7 +2450,9 @@ evidence = "a.rs::t"
         ))
         .expect_err("a column FROM does not give");
         assert!(
-            error.to_string().contains("column \"d2\" is not one FROM gives"),
+            error
+                .to_string()
+                .contains("column \"d2\" is not one FROM gives"),
             "{error}"
         );
     }

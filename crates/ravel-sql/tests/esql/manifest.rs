@@ -677,7 +677,9 @@ async fn a_refused_left_operand_does_not_name_the_infix_form() {
 
 /// The IN subquery entry's own example is refused as "this expression" at
 /// the IN expression's start, and an IN subquery whose refusal falls
-/// elsewhere, or whose example holds two, does not satisfy it.
+/// elsewhere, or whose example holds two, does not satisfy it. Nor does the
+/// refusal of an IN subquery satisfy the parenthesised AND that is its
+/// operand and starts where it starts.
 #[tokio::test]
 async fn an_in_subquery_refusal_is_placed_at_the_in_expression() {
     let fixture = fixture().await;
@@ -702,6 +704,18 @@ async fn an_in_subquery_refusal_is_placed_at_the_in_expression() {
         refuses_own_expression("IN subquery", own, 1, 20),
         Err(
             "the refusal is at 1:20, not at 1:19 where the IN subquery expression starts"
+                .to_string()
+        )
+    );
+    assert_eq!(
+        refuses_own_expression(
+            "AND",
+            "FROM logs | WHERE (dur > 1 AND dur < 5) IN (FROM logs | KEEP dur)",
+            1,
+            19
+        ),
+        Err(
+            "the refusal at 1:19 stays with the AND expression replaced by null, so it refuses an expression enclosing it"
                 .to_string()
         )
     );
