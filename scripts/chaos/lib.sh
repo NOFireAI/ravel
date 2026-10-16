@@ -283,10 +283,11 @@ chaos_have_command() {
 }
 
 # The aws binary chaos_aws runs on the host, or nothing when it falls back to
-# the pinned container image: CHAOS_AWS when set, else `aws` on PATH.
+# the pinned container image: CHAOS_AWS when set, else `aws` on PATH. Returns 1
+# for the container fallback and 2 when CHAOS_AWS names nothing executable.
 chaos_aws_host_binary() {
   if [[ -n "${CHAOS_AWS:-}" ]]; then
-    printf '%s\n' "${CHAOS_AWS}"
+    command -v "${CHAOS_AWS}" || return 2
   elif chaos_have_command aws; then
     command -v aws
   else
@@ -370,13 +371,15 @@ check_dependencies() {
     fi
   done
 
-  if chaos_s3_client_available; then
-    local host_aws
-    if host_aws="$(chaos_aws_host_binary)"; then
-      echo "  OK    aws CLI: host (${host_aws})"
-    else
-      echo "  OK    aws CLI: container ${CHAOS_AWS_CLI_IMAGE}"
-    fi
+  local host_aws aws_rc=0
+  host_aws="$(chaos_aws_host_binary)" || aws_rc=$?
+  if [[ "$aws_rc" -eq 2 ]]; then
+    echo "  WARN  aws CLI: CHAOS_AWS=${CHAOS_AWS} is not an executable"
+    warnings=$(( warnings + 1 ))
+  elif [[ "$aws_rc" -eq 0 ]]; then
+    echo "  OK    aws CLI: host (${host_aws})"
+  elif chaos_s3_client_available; then
+    echo "  OK    aws CLI: container ${CHAOS_AWS_CLI_IMAGE}"
   else
     echo "  WARN  no S3 client (aws) and no docker: a real run cannot manage the store"
     warnings=$(( warnings + 1 ))
@@ -422,15 +425,24 @@ chaos_rustfs_healthy() {
 # image. Arguments are the aws subcommand and its flags.
 chaos_aws() {
   # Credentials are exported in a subshell and passed by name, so the secret
-  # never reaches an argv (the same rule as dr_aws).
+  # never reaches an argv (the same rule as dr_aws). The caller's own session
+  # token, profile and region are dropped first: the container path never saw
+  # them, and on the host path a stale AWS_SESSION_TOKEN gets signed alongside
+  # the chaos key and RustFS answers 403.
   (
+    unset AWS_SESSION_TOKEN AWS_SECURITY_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE AWS_REGION
     export AWS_ACCESS_KEY_ID="${RAVEL_S3_ACCESS_KEY}"
     export AWS_SECRET_ACCESS_KEY="${RAVEL_S3_SECRET_KEY}"
     export AWS_DEFAULT_REGION="${RAVEL_S3_REGION}"
     export AWS_EC2_METADATA_DISABLED=true
-    local host_aws
-    if host_aws="$(chaos_aws_host_binary)"; then
+    local host_aws aws_rc=0
+    host_aws="$(chaos_aws_host_binary)" || aws_rc=$?
+    if [[ "$aws_rc" -eq 0 ]]; then
       exec "$host_aws" --endpoint-url "$CHAOS_RUSTFS_ENDPOINT" "$@"
+    fi
+    if [[ "$aws_rc" -eq 2 ]]; then
+      echo "chaos_aws: CHAOS_AWS=${CHAOS_AWS} is not an executable" >&2
+      exit 127
     fi
     exec docker run --rm --network host \
       -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_DEFAULT_REGION \

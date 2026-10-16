@@ -1335,6 +1335,24 @@ CHAOS_AWS="${AWS_SEL_DIR}/override/my-aws" sel_run "${AWS_SEL_DIR}/docker-fail" 
 check "chaos_aws: CHAOS_AWS works with no aws on PATH" \
   "--endpoint-url ${CHAOS_RUSTFS_ENDPOINT} s3 ls" "$(rec_lines "${REC_DIR}/my-aws.argv")"
 
+# A CHAOS_AWS that names nothing executable fails the call with 127 rather
+# than falling back to the container, and --check warns about it.
+check "chaos_aws: an unresolvable CHAOS_AWS exits 127" "127" \
+  "$(REC="$(mktemp -d "${SCRATCH}/rec.XXXXXX")" CHAOS_AWS="${AWS_SEL_DIR}/override/no-such-aws" PATH="${AWS_SEL_DIR}/docker-ok" "${BASH}" -c 'source "$1"; chaos_aws s3 ls; echo $?' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null)"
+CHAOS_AWS="${AWS_SEL_DIR}/override/no-such-aws" sel_run "${AWS_SEL_DIR}/docker-ok" -- s3 ls
+check "chaos_aws: an unresolvable CHAOS_AWS leaves docker uninvoked" "none" "$(rec_lines "${REC_DIR}/docker.argv")"
+
+# The caller's own session token, profile and region do not reach the host
+# aws: a stale AWS_SESSION_TOKEN signed with the chaos key makes RustFS 403.
+mkdir -p "${AWS_SEL_DIR}/host-ambient"
+printf '#!%s\nprintf "%%s\\n" "TOKEN=${AWS_SESSION_TOKEN-unset}" "PROFILE=${AWS_PROFILE-unset}" "REGION=${AWS_REGION-unset}" >>"${REC}/aws.ambient"\n' \
+  "${BASH}" >"${AWS_SEL_DIR}/host-ambient/aws"
+chmod +x "${AWS_SEL_DIR}/host-ambient/aws"
+AWS_SESSION_TOKEN=stale-token AWS_PROFILE=someone AWS_REGION=eu-west-9 \
+  sel_run "${AWS_SEL_DIR}/host-ambient" -- s3 ls
+check "chaos_aws: the caller's session token, profile and region do not reach the host aws" \
+  "TOKEN=unset PROFILE=unset REGION=unset" "$(rec_lines "${REC_DIR}/aws.ambient")"
+
 # No aws anywhere: the pinned image under docker, credentials by name only.
 sel_run "${AWS_SEL_DIR}/docker-ok" -- s3api create-bucket --bucket b
 check "chaos_aws: with no aws, docker runs the pinned image then --endpoint-url and the arguments" \
@@ -1355,6 +1373,9 @@ check "check_dependencies: names the host aws when one is on PATH" \
   "aws CLI: host (${AWS_SEL_DIR}/host/aws)" "$(dep_line "${AWS_SEL_DIR}/host")"
 check "check_dependencies: names the container image when only docker is" \
   "aws CLI: container ${CHAOS_AWS_CLI_IMAGE}" "$(dep_line "${AWS_SEL_DIR}/docker-ok")"
+check "check_dependencies: warns when CHAOS_AWS names nothing executable" \
+  "  WARN  aws CLI: CHAOS_AWS=${AWS_SEL_DIR}/override/no-such-aws is not an executable" \
+  "$(CHAOS_AWS="${AWS_SEL_DIR}/override/no-such-aws" dep_line "${AWS_SEL_DIR}/docker-ok")"
 
 # rustfs_up names the rustfs service, so compose does not start createbucket
 # (which pulls the AWS CLI image from ECR Public). The stubbed docker records
