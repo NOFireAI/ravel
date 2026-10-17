@@ -25,13 +25,14 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{CommitToken, Sample, Signal, TenantHash, TenantId, TimeRange};
 use uuid::Uuid;
 
+use crate::MinCommitToken;
 use crate::SqlConfig;
 use crate::error::{ErrorClass, MSG_UNSATISFIABLE, SqlError};
 use crate::executor::tests::{
     empty_store, executor_over, executor_with, log_record, publish_log_records,
-    publish_log_records_in_hour, publish_metric_samples, publish_spans, sql_request, wrap_fixture_store,
+    publish_log_records_in_hour, publish_metric_samples, publish_spans, sql_request,
+    wrap_fixture_store,
 };
-use crate::MinCommitToken;
 use crate::executor::{LiveAccounting, ParquetPlan, PinnedPlanInputs, SqlExecutor, SqlRequest};
 use crate::output::QueryOutput;
 
@@ -838,7 +839,10 @@ async fn http_entry_errors(
     request: &SqlRequest,
 ) -> Vec<(&'static str, Option<SqlError>)> {
     vec![
-        ("execute", executor.execute(tenant_hash, request).await.err()),
+        (
+            "execute",
+            executor.execute(tenant_hash, request).await.err(),
+        ),
         (
             "execute_accounted",
             executor
@@ -846,7 +850,10 @@ async fn http_entry_errors(
                 .await
                 .err(),
         ),
-        ("explain", executor.explain(tenant_hash, request).await.err()),
+        (
+            "explain",
+            executor.explain(tenant_hash, request).await.err(),
+        ),
         (
             "explain_accounted",
             executor
@@ -966,10 +973,14 @@ async fn qualified_token_bounds_only_its_signal() {
         .execute(tenant_hash, &short(JOIN, Vec::new()))
         .await
         .expect("the join runs without a token");
-    assert_eq!(rows(&unbounded.output, "ts", "value"), Vec::<(i64, f64)>::new());
+    assert_eq!(
+        rows(&unbounded.output, "ts", "value"),
+        Vec::<(i64, f64)>::new()
+    );
 
-    let logs_commit = ravel_commit::keys::commit_key_for_token(&tenant_hash, Signal::Logs, &logs_token)
-        .expect("logs commit key");
+    let logs_commit =
+        ravel_commit::keys::commit_key_for_token(&tenant_hash, Signal::Logs, &logs_token)
+            .expect("logs commit key");
     let samples_commit =
         ravel_commit::keys::commit_key_for_token(&tenant_hash, Signal::Metrics, &logs_token)
             .expect("samples commit key");
@@ -977,7 +988,10 @@ async fn qualified_token_bounds_only_its_signal() {
     let bounded = executor
         .execute(
             tenant_hash,
-            &short(JOIN, vec![MinCommitToken::qualified("logs", logs_token.clone())]),
+            &short(
+                JOIN,
+                vec![MinCommitToken::qualified("logs", logs_token.clone())],
+            ),
         )
         .await
         .expect("logs:T bounds the logs resolve");
@@ -991,7 +1005,9 @@ async fn qualified_token_bounds_only_its_signal() {
         "the logs resolve consulted T: {issued:#?}"
     );
     assert!(
-        !issued.iter().any(|request| request.ends_with(&samples_commit)),
+        !issued
+            .iter()
+            .any(|request| request.ends_with(&samples_commit)),
         "the samples resolve did not consult T: {issued:#?}"
     );
 
@@ -1018,7 +1034,12 @@ async fn a_qualifier_the_statement_does_not_read_is_refused_before_any_listing()
     let long = format!("a{}", "\u{e9}".repeat(40));
     let cut = format!("a{}...", "\u{e9}".repeat(31));
     let cases = [
-        ("SELECT ts FROM samples", "logs", "logs".to_owned(), "samples"),
+        (
+            "SELECT ts FROM samples",
+            "logs",
+            "logs".to_owned(),
+            "samples",
+        ),
         (
             "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
             "spans",
@@ -1044,7 +1065,9 @@ async fn a_qualifier_the_statement_does_not_read_is_refused_before_any_listing()
                     assert_eq!(got, &quoted, "{entry}");
                     assert_eq!(read, tables, "{entry}");
                 }
-                other => panic!("{entry} must refuse with CommitTokenQualifierNotRead, got {other:?}"),
+                other => {
+                    panic!("{entry} must refuse with CommitTokenQualifierNotRead, got {other:?}")
+                }
             }
             assert_eq!(err.class(), ErrorClass::BadRequest, "{entry}");
             assert!(

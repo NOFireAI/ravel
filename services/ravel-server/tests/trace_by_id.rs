@@ -408,8 +408,13 @@ async fn a_lookup_token_is_unqualified_or_qualified_with_spans() {
     let base = format!("http://{}", running.http_addr);
 
     for sent in [token.clone(), format!("spans:{token}")] {
-        let (status, body) =
-            get_trace(&base, TOKEN, TRACE_HEX, &[("min_commit_token", sent.clone())]).await;
+        let (status, body) = get_trace(
+            &base,
+            TOKEN,
+            TRACE_HEX,
+            &[("min_commit_token", sent.clone())],
+        )
+        .await;
         assert_eq!(status, 200, "{sent}: {body}");
         assert_eq!(span_ids(&body["data"]), want(&EVERY_SPAN), "{sent}: {body}");
     }
@@ -424,10 +429,9 @@ async fn a_lookup_token_is_unqualified_or_qualified_with_spans() {
     assert_eq!(status, 400, "{body}");
     assert_eq!(body["errorType"], "bad_data", "{body}");
     assert!(
-        body["error"]
-            .as_str()
-            .is_some_and(|e| e.contains("min_commit_token qualifier \"logs\"")
-                && e.contains("(spans)")),
+        body["error"].as_str().is_some_and(
+            |e| e.contains("min_commit_token qualifier \"logs\"") && e.contains("(spans)")
+        ),
         "{body}"
     );
 

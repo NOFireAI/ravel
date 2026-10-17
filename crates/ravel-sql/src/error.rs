@@ -2031,10 +2031,7 @@ mod tests {
         };
         assert_eq!(err.class(), ErrorClass::BadRequest);
         assert_eq!(err.client_message(), err.to_string());
-        assert!(
-            err.client_message().contains("qualifier \"log\""),
-            "{err}"
-        );
+        assert!(err.client_message().contains("qualifier \"log\""), "{err}");
         assert!(err.client_message().contains("(samples, logs)"), "{err}");
         assert_redacted(&err.client_message());
     }

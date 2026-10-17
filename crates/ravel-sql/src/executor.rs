@@ -342,9 +342,10 @@ pub(crate) fn admit_http_tokens(
     for min_token in min_tokens {
         let lane = match min_token.table.as_deref() {
             Some(qualifier) => {
-                let named = tables.signals.iter().copied().find(|signal| {
-                    crate::statement::signal_table_name(*signal) == Some(qualifier)
-                });
+                let named =
+                    tables.signals.iter().copied().find(|signal| {
+                        crate::statement::signal_table_name(*signal) == Some(qualifier)
+                    });
                 match named {
                     Some(signal) => signal,
                     None => {
@@ -1782,7 +1783,12 @@ impl SqlExecutor {
         let sql_req = SqlRequest {
             sql: String::new(),
             window: req.window,
-            min_tokens: req.min_tokens.iter().cloned().map(MinCommitToken::from).collect(),
+            min_tokens: req
+                .min_tokens
+                .iter()
+                .cloned()
+                .map(MinCommitToken::from)
+                .collect(),
             now_ns: req.now_ns,
             deadline: req.deadline,
             row_window: req.row_window,
@@ -2135,7 +2141,8 @@ impl SqlExecutor {
         refuse_cross_signal(&tables)?;
         // A ticket's tokens are plain (no table qualifier), and the one table
         // it reads is the one they bound.
-        let tokens = LaneTokens::one_lane(tables.first_lane(), unqualified_tokens(&req.min_tokens)?);
+        let tokens =
+            LaneTokens::one_lane(tables.first_lane(), unqualified_tokens(&req.min_tokens)?);
         let resolved = self
             .resolve(
                 tenant_hash,
@@ -8544,7 +8551,9 @@ pub(crate) mod tests {
         new_record: NewCommitRecord,
         bytes: bytes::Bytes,
     ) -> String {
-        put_and_publish_with_token(memory, new_record, bytes).await.0
+        put_and_publish_with_token(memory, new_record, bytes)
+            .await
+            .0
     }
 
     /// [`put_and_publish`], also returning the published record's commit

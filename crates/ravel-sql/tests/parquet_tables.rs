@@ -887,7 +887,10 @@ async fn a_commit_token_on_a_parquet_only_statement_is_refused() {
         let before = reads(&lake);
         let err = lake
             .executor
-            .execute(acme, &with_tokens("SELECT count(*) FROM hits", tokens.clone()))
+            .execute(
+                acme,
+                &with_tokens("SELECT count(*) FROM hits", tokens.clone()),
+            )
             .await
             .expect_err("a token on a Parquet-only statement");
         assert!(
