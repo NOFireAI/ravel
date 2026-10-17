@@ -45,6 +45,9 @@ REPO_ROOT="$(cd "${CHAOS_DIR}/../.." && pwd)"
 source "${CHAOS_DIR}/lib.sh"
 # The cases below pin the default; an operator's exported value must not flip them.
 unset CHAOS_KEEP_LOGS
+# chaos_aws/rustfs_up cases below pin the no-host-binary and host-binary paths
+# explicitly; an operator's exported CHAOS_AWS must not flip which path runs.
+unset CHAOS_AWS
 # The conservation oracle waits up to the takeover bound for a survivor
 # publish; every case reads the log once unless it sets its own wait.
 CHAOS_CONSERVATION_WAIT_SECONDS=0
@@ -572,13 +575,18 @@ AWS_MODE=absent records "${BUCKET_Y}" >/dev/null
 check "records: the LIST is of <bucket>l1. in the chaos bucket" "yes" \
   "$(grep -qxF -- "${BUCKET_Y}l1." "${AWS_ARGS_FILE}" && grep -qxF -- "${RAVEL_S3_BUCKET}" "${AWS_ARGS_FILE}" && grep -qxF list-objects-v2 "${AWS_ARGS_FILE}" && echo yes || echo no)"
 
-# The scenario-2 trigger scrapes BOTH workers each round and SIGKILLs
-# whichever first reads ravel_maintain_compactions_in_flight>=1
-# (wait_for_compaction_in_flight_any): a trigger that only ever watched one
-# worker would kill it having never compacted, on a night where the other
-# worker owned all the data-bearing units (nightly run 38674293885, issue
-# #2666). ab_reset loads a sequence per worker; wait_for_compaction_in_flight_any
-# steps one entry per scrape, holding the last entry once a sequence runs out.
+# The scenario-2 trigger scrapes BOTH workers every round and SIGKILLs the
+# PREFERRED worker as soon as its own
+# ravel_maintain_compactions_in_flight>=1, falling back to the sibling only
+# once the full deadline passes with the preferred worker's own gauge never
+# firing (wait_for_compaction_in_flight_preferred). The old race -- whichever
+# gauge fired first, with no preference -- picked worker A about 15 nights out
+# of 16, since A starts its first merge 7-11s before B in every run since
+# #3019 (issue #3037); a kill that only ever watched one worker is the
+# earlier, more severe form of the same bug (nightly run 38674293885, issue
+# #2666), where the unwatched worker owned every data-bearing unit. ab_reset
+# loads a sequence per worker; wait_for_compaction_in_flight_preferred steps
+# one entry per scrape, holding the last entry once a sequence runs out.
 ab_reset() { # infl_a units_a infl_b units_b -- each a space-separated sequence
   read -r -a AB_INFLIGHT_A <<<"$1"
   read -r -a AB_UNITS_A <<<"$2"
@@ -587,67 +595,74 @@ ab_reset() { # infl_a units_a infl_b units_b -- each a space-separated sequence
   printf '0' >"${AB_IDX_FILE_A}"
   printf '0' >"${AB_IDX_FILE_B}"
 }
-ab_run() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 wait_for_compaction_in_flight_any http://stub-a http://stub-b "$1" >/dev/null 2>&1; }
-ab_wait() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 rc_of wait_for_compaction_in_flight_any http://stub-a http://stub-b "$1"; }
+ab_run() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 wait_for_compaction_in_flight_preferred "$1" http://stub-a http://stub-b "$2" >/dev/null 2>&1; }
+ab_wait() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 rc_of wait_for_compaction_in_flight_preferred "$1" http://stub-a http://stub-b "$2"; }
 
-check "symmetric trigger: A fires first returns 0" "0" \
-  "$(ab_reset "1" "2" "0" "3"; ab_wait 1)"
-check "symmetric trigger: A fires first picks victim a" "a" \
-  "$(ab_reset "1" "2" "0" "3"; ab_run 1; echo "${CHAOS_VICTIM}")"
-check "symmetric trigger: B fires on a later round while A stays at 0 picks victim b (the 10-15 night)" "b" \
-  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_run 2; echo "${CHAOS_VICTIM}")"
-check "symmetric trigger: B fires on a later round while A stays at 0 returns 0" "0" \
-  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_wait 2)"
-check "symmetric trigger: neither fires within budget returns nonzero" "1" \
-  "$(ab_reset "0" "1" "0" "4"; ab_wait 0)"
-check "symmetric trigger: neither fires within budget leaves victim at the budget-fallback a" "a" \
-  "$(ab_reset "0" "1" "0" "4"; ab_run 0; echo "${CHAOS_VICTIM}")"
-check "symmetric trigger: does not fire on an unreachable pair" "1" \
-  "$(CURL_MODE=unreachable rc_of wait_for_compaction_in_flight_any http://stub-a http://stub-b 0)"
-check "symmetric trigger: per-worker peak units_owned is kept separately for A" "2" \
-  "$(ab_reset "0 1" "2 2" "0 0" "5 5"; ab_run 2; echo "${CHAOS_A_MAX_UNITS_OWNED}")"
-check "symmetric trigger: per-worker peak units_owned is kept separately for B" "5" \
-  "$(ab_reset "0 1" "2 2" "0 0" "5 5"; ab_run 2; echo "${CHAOS_B_MAX_UNITS_OWNED}")"
-check "symmetric trigger: total scrape count sums both workers' polls" "yes" \
-  "$(ab_reset "0 0" "1 1" "0 0" "1 1"; ab_run 0; [[ "${CHAOS_COMPACTION_POLLS}" -ge 2 ]] && echo yes || echo no)"
+check "preferred trigger: preferred=a, A fires first, returns 0" "0" \
+  "$(ab_reset "1" "2" "0" "3"; ab_wait a 1)"
+check "preferred trigger: preferred=a, A fires first, picks victim a, reason preferred" "a preferred" \
+  "$(ab_reset "1" "2" "0" "3"; ab_run a 1; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
+check "preferred trigger: preferred=b, B fires first, picks victim b, reason preferred" "b preferred" \
+  "$(ab_reset "0" "3" "1" "2"; ab_run b 1; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
 
-# DISTINGUISHING(a): a helper that only ever scrapes worker A (dropping the
-# second curl/metric read for worker B inside wait_for_compaction_in_flight_any)
-# would never see B's gauge fire, so this exact case -- B firing on a later
-# round while A stays at 0 -- would time out and leave CHAOS_VICTIM at its
-# "a" fallback instead of "b". Pinned again here under the mutant's name for
-# traceability; it is the same assertion as the "10-15 night" case above.
-check "DISTINGUISHING(a) scrape-only-A would report victim a here; the real victim is b" "b" \
-  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_run 2; echo "${CHAOS_VICTIM}")"
+# The 10-15 night (nightly run 38674293885, issue #2666): B owns every
+# data-bearing unit and fires on a later round while A's gauge never fires.
+# preferred=a must fall back to b, and only once the deadline passes.
+check "preferred trigger: preferred=a, A never fires, B fires later, falls back to b (the 10-15 night)" "b fallback-no-data-shard" \
+  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_run a 2; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
+check "preferred trigger: preferred=a, A never fires, B fires later, returns 0" "0" \
+  "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_wait a 2)"
+check "preferred trigger: preferred=b, B never fires, A fires later, falls back to a" "a fallback-no-data-shard" \
+  "$(ab_reset "0 1 1" "4 4 4" "0 0 0" "1 1 1"; ab_run b 2; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
 
-# assert_takeover_observable_or_unmeasured: the two takeover oracles
-# (sibling-takeover-within-3H-plus-tick, no-orphaned-lease) only discriminate
-# when the survivor did not already own the expected total before the kill
-# (scenario 2's other bug: a 4-unit EXPECTED_TOTAL_UNITS default against a
-# survivor that already owned 6 of the tenant's 12 units pre-kill made both
-# oracles pass vacuously).
-check "takeover precondition: survivor peak below the expected total is observable" "0" \
-  "$(rc_of assert_takeover_observable_or_unmeasured 6 12)"
-check "takeover precondition: survivor peak equal to the expected total is could-not-measure" "${CHAOS_UNMEASURED_EXIT}" \
-  "$(rc_of assert_takeover_observable_or_unmeasured 12 12)"
-check "takeover precondition: survivor peak above the expected total is could-not-measure" "${CHAOS_UNMEASURED_EXIT}" \
-  "$(rc_of assert_takeover_observable_or_unmeasured 13 12)"
-check "takeover precondition records both takeover oracles as unmeasured, never as a pass" "yes" \
-  "$(ORACLE_UNMEASURED=(); assert_takeover_observable_or_unmeasured 12 12 >/dev/null 2>&1 || true
-     [[ "${#ORACLE_UNMEASURED[@]}" -eq 2 && \
-        "${ORACLE_UNMEASURED[0]}" == sibling-takeover-within-3H-plus-tick:* && \
-        "${ORACLE_UNMEASURED[1]}" == no-orphaned-lease:* ]] && echo yes || echo no)"
-# DISTINGUISHING(c), part 1: the real call site in kill-maintain-worker.sh
-# must pass the derived $EXPECTED_TOTAL_UNITS to this precondition, not a
-# literal: a script that substituted a bare 4 back in (scenario 2's old
-# default) would call a survivor peak of 6 could-not-measure, since 6 >= 4,
-# even though the real derived total is 12 and 6 is genuinely below it. The
-# library-level check above (line 629) cannot tell a call site passing a
-# derived variable from one passing a literal that happens to equal it, so
-# this is checked against the script's own source text instead.
-takeover_call_text="$(grep -F 'assert_takeover_observable_or_unmeasured "$SURVIVOR_PEAK_UNITS_OWNED"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
-check "DISTINGUISHING(c) the takeover precondition call site passes \$EXPECTED_TOTAL_UNITS, not a literal" "yes" \
-  "$([[ "${takeover_call_text}" == *'"$EXPECTED_TOTAL_UNITS"'* ]] && echo yes || echo no)"
+check "preferred trigger: neither fires within budget returns nonzero" "1" \
+  "$(ab_reset "0" "1" "0" "4"; ab_wait a 0)"
+check "preferred trigger: neither fires within budget leaves victim at preferred a, reason preferred" "a preferred" \
+  "$(ab_reset "0" "1" "0" "4"; ab_run a 0; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
+check "preferred trigger: neither fires within budget leaves victim at preferred b, reason preferred" "b preferred" \
+  "$(ab_reset "0" "1" "0" "4"; ab_run b 0; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
+check "preferred trigger: does not fire on an unreachable pair" "1" \
+  "$(CURL_MODE=unreachable rc_of wait_for_compaction_in_flight_preferred a http://stub-a http://stub-b 0)"
+
+# DISTINGUISHING(a): a mutant that restores the old "first gauge wins" race
+# (no preference) would pick whichever worker's gauge fires chronologically
+# first. Here B fires on round 0 and A (the preferred worker) only fires on
+# round 2; a first-gauge-wins race reports victim b, but the real, preferred-
+# respecting victim is a, reason preferred -- CHAOS_PREFERRED_VICTIM is never
+# overridden by a sibling firing earlier.
+check "DISTINGUISHING(a) preferred worker wins even when the sibling fired first chronologically (no eager fallback)" "a preferred" \
+  "$(ab_reset "0 0 1" "2 2 2" "1 1 1" "5 5 5"; ab_run a 2; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
+
+check "preferred trigger: per-worker peak units_owned is kept separately for A" "2" \
+  "$(ab_reset "0 1" "2 2" "0 0" "5 5"; ab_run a 2; echo "${CHAOS_A_MAX_UNITS_OWNED}")"
+check "preferred trigger: per-worker peak units_owned is kept separately for B" "5" \
+  "$(ab_reset "0 1" "2 2" "0 0" "5 5"; ab_run a 2; echo "${CHAOS_B_MAX_UNITS_OWNED}")"
+check "preferred trigger: total scrape count sums both workers' polls in the one round before a zero-second deadline breaks" "2" \
+  "$(ab_reset "0 0" "1 1" "0 0" "1 1"; ab_run a 0; echo "${CHAOS_COMPACTION_POLLS}")"
+
+# Nit (#3037): the trigger must scrape both workers before returning, not
+# return as soon as the preferred worker's own gauge fires. A fires on round
+# 0 and the loop returns that same round; B's distinctive units_owned value
+# (7) can only land in CHAOS_B_MAX_UNITS_OWNED if B was scraped during that
+# same round, not skipped.
+check "preferred trigger: B is scraped in the very round A's gauge fires, not skipped (nit: scrape both before returning)" "7" \
+  "$(ab_reset "1" "2" "0" "7"; ab_run a 1; echo "${CHAOS_B_MAX_UNITS_OWNED}")"
+
+# chaos_default_preferred_victim: alternates by GITHUB_RUN_NUMBER parity so
+# successive nightly runs exercise both workers (issue #3037), defaulting to
+# "a" with no run number or a non-numeric one.
+check "chaos_default_preferred_victim: no GITHUB_RUN_NUMBER defaults to a" "a" \
+  "$(unset GITHUB_RUN_NUMBER; chaos_default_preferred_victim)"
+check "chaos_default_preferred_victim: even GITHUB_RUN_NUMBER picks a" "a" \
+  "$(GITHUB_RUN_NUMBER=38770264 chaos_default_preferred_victim)"
+check "chaos_default_preferred_victim: odd GITHUB_RUN_NUMBER picks b" "b" \
+  "$(GITHUB_RUN_NUMBER=38770265 chaos_default_preferred_victim)"
+check "chaos_default_preferred_victim: non-numeric GITHUB_RUN_NUMBER defaults to a" "a" \
+  "$(GITHUB_RUN_NUMBER=not-a-number chaos_default_preferred_victim)"
+check "chaos_default_preferred_victim: alternates across successive run numbers" "a b a b" \
+  "$(out=""
+     for n in 10 11 12 13; do out+="$(GITHUB_RUN_NUMBER=$n chaos_default_preferred_victim) "; done
+     echo "${out% }")"
 
 # Args: A's log, B's log, aborts baseline, CHAOS_KILL_ON_GAUGE. B's line
 # count at the kill is 1, and the wait is 0 (one read). The store LIST reads
@@ -818,7 +833,7 @@ check "scenario 2 goes on after a partly rejected load and stops only below the 
 
 scenario2_body="$(cat "${CHAOS_DIR}/kill-maintain-worker.sh")"
 universe_line="$(scenario2_line 'assert_single_tenant_universe || true')"
-inflight_wait_line="$(scenario2_line 'if wait_for_compaction_in_flight_any')"
+inflight_wait_line="$(scenario2_line 'if wait_for_compaction_in_flight_preferred')"
 first_kill_line="$(grep -n -F 'sigkill_pid "${!VICTIM_PID_VAR}"' "${CHAOS_DIR}/kill-maintain-worker.sh" | head -1 | cut -d: -f1)"
 check "scenario 2 checks the universe before the wait, and kills right after it" "yes" \
   "$([[ -n "${universe_line}" && "${universe_line}" -lt "${inflight_wait_line:-0}" && "${first_kill_line:-0}" -gt "${inflight_wait_line:-0}" && "$(only_bookkeeping_between "${CHAOS_DIR}/kill-maintain-worker.sh" "${inflight_wait_line}" "${first_kill_line}")" == 0 ]] && echo yes || echo no)"
@@ -829,8 +844,44 @@ check "scenario 2 counts the survivor's log after the last kill and passes it to
   "$([[ -n "${survivor_count_line}" && -n "${cons_call_line}" && "${survivor_count_line}" -gt "${last_kill_line:-999999}" && "${survivor_count_line}" -lt "${cons_call_line}" ]] && echo yes || echo no)"
 check "scenario 2 headers make no 'provably' claim" "no" \
   "$([[ "${scenario2_body}" == *provabl* ]] && echo yes || echo no)"
-check "scenario 2 triggers on either worker's gauge, not on a fixed worker A" "yes" \
-  "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight_any "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
+check "scenario 2 triggers on the preferred worker's gauge (or its sibling's on fallback), not on a fixed worker A" "yes" \
+  "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight_preferred "$CHAOS_PREFERRED_VICTIM" "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
+check "scenario 2 prints the exact VICTIM line, via echo and not log (log prepends '[chaos] ')" "yes" \
+  "$([[ "${scenario2_body}" == *'echo "VICTIM preferred=${CHAOS_PREFERRED_VICTIM} chosen=${CHAOS_VICTIM} reason=${CHAOS_VICTIM_REASON}"'* ]] && echo yes || echo no)"
+check "scenario 2 prints the VICTIM line exactly once" "1" \
+  "$(grep -cF 'echo "VICTIM preferred=${CHAOS_PREFERRED_VICTIM} chosen=${CHAOS_VICTIM} reason=${CHAOS_VICTIM_REASON}"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "scenario 2 runs both takeover oracles unconditionally (no takeover-observable-or-unmeasured gate)" "yes" \
+  "$([[ "${scenario2_body}" != *'assert_takeover_observable_or_unmeasured'* ]] && echo yes || echo no)"
+check "scenario 2 passes --shards \$CHAOS_SHARD_COUNT to both server launch sites" "2" \
+  "$(grep -cF -- '--shards "$CHAOS_SHARD_COUNT")' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "scenario 2 validates an invalid CHAOS_PREFERRED_VICTIM" "64" \
+  "$(CHAOS_PREFERRED_VICTIM=c rc_of bash "${CHAOS_DIR}/kill-maintain-worker.sh" --check)"
+check "scenario 2 --check runs with a valid CHAOS_PREFERRED_VICTIM=a" "0" \
+  "$(CHAOS_PREFERRED_VICTIM=a rc_of bash "${CHAOS_DIR}/kill-maintain-worker.sh" --check)"
+check "scenario 2 --check runs with a valid CHAOS_PREFERRED_VICTIM=b" "0" \
+  "$(CHAOS_PREFERRED_VICTIM=b rc_of bash "${CHAOS_DIR}/kill-maintain-worker.sh" --check)"
+check_output_file="${SCRATCH}/scenario2-check-output"
+CHAOS_PREFERRED_VICTIM=a bash "${CHAOS_DIR}/kill-maintain-worker.sh" --check >"${check_output_file}" 2>&1
+check "--check names the CHAOS_PREFERRED_VICTIM entry point" "yes" \
+  "$(grep -qF 'CHAOS_PREFERRED_VICTIM' "${check_output_file}" && echo yes || echo no)"
+check "--check names the CHAOS_SHARD_COUNT entry point" "yes" \
+  "$(grep -qF 'CHAOS_SHARD_COUNT' "${check_output_file}" && echo yes || echo no)"
+
+# Nit (#3037): CHAOS_MAINTAINED_SIGNALS' literal default must track the
+# maintain loop's own MAINTAINED_SIGNALS array length; a chaos-lane total that
+# silently drifts from the real signal count reintroduces exactly the
+# vacuous-pass bug deliverable 2 removed (a wrong EXPECTED_TOTAL_UNITS).
+maintain_signals_decl="$(grep -oE 'const MAINTAINED_SIGNALS: \[Signal; [0-9]+\]' \
+  "${REPO_ROOT}/services/ravel-server/src/maintain.rs")"
+maintain_signals_rust_count="$(grep -oE '[0-9]+' <<<"${maintain_signals_decl}")"
+chaos_maintained_signals_default="$(grep -oE 'CHAOS_MAINTAINED_SIGNALS:-[0-9]+' \
+  "${CHAOS_DIR}/kill-maintain-worker.sh" | grep -oE '[0-9]+')"
+check "MAINTAINED_SIGNALS extraction from maintain.rs found a count" "yes" \
+  "$([[ -n "${maintain_signals_rust_count}" ]] && echo yes || echo no)"
+check "CHAOS_MAINTAINED_SIGNALS default extraction found a count" "yes" \
+  "$([[ -n "${chaos_maintained_signals_default}" ]] && echo yes || echo no)"
+check "CHAOS_MAINTAINED_SIGNALS default matches maintain.rs's MAINTAINED_SIGNALS length" "yes" \
+  "$([[ "${chaos_maintained_signals_default}" == "${maintain_signals_rust_count}" ]] && echo yes || echo no)"
 
 # DISTINGUISHING(b): a script that picks victim b (CHAOS_VICTIM=b) but still
 # hands the takeover and leak oracles worker B's URL/log, unconditionally,
@@ -1339,6 +1390,11 @@ check "chaos_aws: CHAOS_AWS works with no aws on PATH" \
 # than falling back to the container, and --check warns about it.
 check "chaos_aws: an unresolvable CHAOS_AWS exits 127" "127" \
   "$(REC="$(mktemp -d "${SCRATCH}/rec.XXXXXX")" CHAOS_AWS="${AWS_SEL_DIR}/override/no-such-aws" PATH="${AWS_SEL_DIR}/docker-ok" "${BASH}" -c 'source "$1"; chaos_aws s3 ls; echo $?' _ "${CHAOS_DIR}/lib.sh" 2>/dev/null)"
+# Nit (#3037): the 127 case must say why, on stderr, naming the unresolvable
+# path, not merely exit with a bare code a caller has to look up.
+check "chaos_aws: an unresolvable CHAOS_AWS prints which path on stderr" \
+  "chaos_aws: CHAOS_AWS=${AWS_SEL_DIR}/override/no-such-aws is not an executable" \
+  "$(CHAOS_AWS="${AWS_SEL_DIR}/override/no-such-aws" "${BASH}" -c 'source "$1"; chaos_aws s3 ls' _ "${CHAOS_DIR}/lib.sh" 2>&1 >/dev/null)"
 CHAOS_AWS="${AWS_SEL_DIR}/override/no-such-aws" sel_run "${AWS_SEL_DIR}/docker-ok" -- s3 ls
 check "chaos_aws: an unresolvable CHAOS_AWS leaves docker uninvoked" "none" "$(rec_lines "${REC_DIR}/docker.argv")"
 
@@ -1393,6 +1449,33 @@ check "rustfs_up: compose is told to start only the rustfs service" \
   "compose -f ${CHAOS_RUSTFS_COMPOSE} up -d rustfs" "$(rec_lines "${RUSTFS_UP_REC}/docker.argv")"
 check "rustfs_up: the compose file names a rustfs service" "1" \
   "$(grep -c '^  rustfs:$' "${REPO_ROOT}/${CHAOS_RUSTFS_COMPOSE}")"
+
+# Nit (#3037): the container aws is pinned to CHAOS_AWS_CLI_IMAGE, but a host
+# aws is whatever version happens to be on the runner; rustfs_up logs it once
+# so a version-specific aws behavior is diagnosable from the run's own log.
+RUSTFS_UP_VERSION_REC="$(mktemp -d "${SCRATCH}/rec.XXXXXX")"
+REC="${RUSTFS_UP_VERSION_REC}" PATH="${AWS_SEL_DIR}/host:${AWS_SEL_DIR}/docker-ok" "${BASH}" -c '
+  source "$1"
+  log() { printf "%s\n" "$*" >>"${REC}/log.txt"; }
+  run_capture() { :; }
+  chaos_aws() { :; }
+  probes=0
+  chaos_rustfs_healthy() { probes=$((probes + 1)); [[ "${probes}" -gt 1 ]]; }
+  rustfs_up' _ "${CHAOS_DIR}/lib.sh" >/dev/null 2>&1
+check "rustfs_up: logs the host aws CLI version exactly once when a host aws is resolvable" "1" \
+  "$(grep -c 'host aws CLI version' "${RUSTFS_UP_VERSION_REC}/log.txt")"
+
+RUSTFS_UP_NOHOST_REC="$(mktemp -d "${SCRATCH}/rec.XXXXXX")"
+REC="${RUSTFS_UP_NOHOST_REC}" PATH="${AWS_SEL_DIR}/docker-ok" "${BASH}" -c '
+  source "$1"
+  log() { printf "%s\n" "$*" >>"${REC}/log.txt"; }
+  run_capture() { :; }
+  chaos_aws() { :; }
+  probes=0
+  chaos_rustfs_healthy() { probes=$((probes + 1)); [[ "${probes}" -gt 1 ]]; }
+  rustfs_up' _ "${CHAOS_DIR}/lib.sh" >/dev/null 2>&1
+check "rustfs_up: logs no host aws CLI version when no host aws resolves (container fallback)" "0" \
+  "$(grep -c 'host aws CLI version' "${RUSTFS_UP_NOHOST_REC}/log.txt")"
 
 printf '\n%d passed, %d failed\n' "${PASSED}" "${FAILED}"
 [[ "${FAILED}" -eq 0 ]]
