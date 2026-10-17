@@ -89,6 +89,7 @@ mod logs_udf;
 mod map_field_planner;
 mod memory;
 mod metadata_agg;
+mod min_commit_token;
 mod minmax;
 mod output;
 mod page_plan;
@@ -189,6 +190,7 @@ pub use memory::{
     sql_memory_held_bytes,
 };
 pub use metadata_agg::{METADATA_ONLY_AGGREGATE_RULE, MetadataOnlyAggregate, MetadataOnlyExec};
+pub use min_commit_token::{MinCommitToken, MinCommitTokenParseError};
 pub use output::QueryOutput;
 pub use page_plan::{
     NotTotalOrder, OrderTerm, PAGE_ALIAS, PagePlan, PagePlanError, ResumePosition, ResumeValue,

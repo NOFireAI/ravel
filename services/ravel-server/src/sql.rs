@@ -45,6 +45,11 @@
 //! still re-applied above the scan. `timeout` can only *lower* the server
 //! deadline, never raise it.
 //!
+//! Each `min_commit_token` is `<token>` or `<table>:<token>`. On a statement
+//! that reads two or more of the signal tables every token must name its
+//! table (`["samples:...", "logs:..."]`); the qualifier must be one of the
+//! tables the statement reads, spelled exactly as its lower-case name.
+//!
 //! The response encoding follows `Accept`:
 //! `application/vnd.apache.arrow.stream` yields an Arrow IPC stream, which is
 //! bit-exact for every float; anything else yields JSON.
@@ -107,9 +112,9 @@ use ravel_maintain::{QueryAuditSink, QueryStatus};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::QueryAdmissionController;
 use ravel_query::http::TenantResolver;
-use ravel_sql::{DdlCost, DdlOutcome, SqlExecutor, SqlRequest};
+use ravel_sql::{DdlCost, DdlOutcome, MinCommitToken, SqlExecutor, SqlRequest};
 use ravel_tenant_resolve::Principal;
-use ravel_types::{CommitToken, TenantHash, TimeRange};
+use ravel_types::{TenantHash, TimeRange};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -642,13 +647,16 @@ fn build_request(
     })
 }
 
-/// Decode `min_commit_token` values; a malformed one is 400.
+/// Decode `min_commit_token` values, each `<token>` or `<table>:<token>`
+/// ([`MinCommitToken::parse`]); a malformed one, or an empty qualifier, is
+/// 400. Whether a qualifier names a table the statement reads is the
+/// executor's check, made before any catalog request.
 pub(crate) fn decode_min_tokens<'a>(
     raw: impl IntoIterator<Item = &'a str>,
-) -> Result<Vec<CommitToken>, ApiError> {
+) -> Result<Vec<MinCommitToken>, ApiError> {
     raw.into_iter()
         .map(|raw| {
-            CommitToken::decode(raw).map_err(|_| {
+            MinCommitToken::parse(raw).map_err(|_| {
                 // The token is the caller's own input, so quoting it back is
                 // safe and is what makes the error actionable.
                 ApiError::bad_request(format!("invalid min_commit_token: {raw:?}"))

@@ -597,7 +597,12 @@ impl ServiceBackend {
             request.window.start_ns,
             request.window.end_ns,
         );
-        d4::min_tokens(&mut envelope, &request.min_tokens);
+        // In the wire form the caller sent, table qualifier included.
+        envelope.visibility.min_commit_tokens_applied = request
+            .min_tokens
+            .iter()
+            .map(ravel_sql::MinCommitToken::encode)
+            .collect();
         envelope
     }
 }
