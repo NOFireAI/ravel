@@ -2593,6 +2593,7 @@ mod tests {
             &tenant(),
             request(vec![]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.points.is_empty());
@@ -2626,7 +2627,7 @@ mod tests {
             )],
         )]);
         memo_stats::reset();
-        let out = normalize_metrics(&tenant, grouped, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant, grouped, &limits, &TenantRules::none(), 1_000_000);
         assert_eq!(out.points.len(), P);
         let (hits, misses) = memo_stats::snapshot();
         // One miss to seed the single series, then a hit for every later point.
@@ -2653,7 +2654,7 @@ mod tests {
             )],
         )]);
         memo_stats::reset();
-        let out = normalize_metrics(&tenant, interleaved, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant, interleaved, &limits, &TenantRules::none(), 1_000_000);
         assert_eq!(out.points.len(), P);
         let (hits, misses) = memo_stats::snapshot();
         assert_eq!(hits, 0, "interleaved: one-entry memo must never hit");
@@ -2679,6 +2680,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2702,6 +2704,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2725,6 +2728,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points[0].labels.get("job"), None);
@@ -2756,6 +2760,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         // `some.other.attr` is outside the allowlist and not a job/instance
@@ -2794,7 +2799,7 @@ mod tests {
             )],
         );
         let out_resource =
-            normalize_metrics(&tenant(), request(vec![via_resource]), &limits, 1_000);
+            normalize_metrics(&tenant(), request(vec![via_resource]), &limits, &TenantRules::none(), 1_000);
         assert!(
             out_resource.rejected.is_empty(),
             "{:?}",
@@ -2819,7 +2824,7 @@ mod tests {
                 )],
             )],
         );
-        let out_attr = normalize_metrics(&tenant(), request(vec![via_attr]), &limits, 1_000);
+        let out_attr = normalize_metrics(&tenant(), request(vec![via_attr]), &limits, &TenantRules::none(), 1_000);
         assert!(out_attr.rejected.is_empty(), "{:?}", out_attr.rejected);
         assert_eq!(out_attr.points[0].labels.get("_bad_key_name"), Some("v"));
 
@@ -2853,6 +2858,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2883,6 +2889,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(
@@ -2916,6 +2923,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2941,6 +2949,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3078,7 +3087,7 @@ mod tests {
             )],
         );
 
-        let out = normalize_metrics(&tenant(), request(vec![rm1, rm2]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm1, rm2]), &limits, &TenantRules::none(), 1_000);
 
         // Accepted scalar points, in emission order.
         assert_eq!(out.points.len(), 5, "unexpected accepted points");
@@ -3197,6 +3206,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3220,6 +3230,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3251,6 +3262,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         // Admitted: the sample is stored as the nearest f64.
@@ -3283,6 +3295,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 1);
@@ -3309,6 +3322,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 1);
@@ -3329,6 +3343,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3348,6 +3363,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3373,7 +3389,7 @@ mod tests {
                 ],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(out.rejected.len(), 1);
         assert_eq!(
@@ -3399,7 +3415,7 @@ mod tests {
                 )],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3427,7 +3443,7 @@ mod tests {
                 )],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3452,7 +3468,7 @@ mod tests {
                 )],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3476,7 +3492,7 @@ mod tests {
                 ],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3501,7 +3517,7 @@ mod tests {
                 vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3522,6 +3538,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3545,6 +3562,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3570,6 +3588,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3597,6 +3616,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3627,6 +3647,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3660,6 +3681,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3692,7 +3714,7 @@ mod tests {
                 vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3722,7 +3744,7 @@ mod tests {
                 vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3750,6 +3772,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3782,12 +3805,14 @@ mod tests {
             &tenant(),
             request(vec![rm_digit]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         let out_underscore = normalize_metrics(
             &tenant(),
             request(vec![rm_underscore]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out_digit.rejected.is_empty());
@@ -3840,6 +3865,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3883,6 +3909,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3931,6 +3958,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3960,6 +3988,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.histogram_points.is_empty());
@@ -3987,6 +4016,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         )
     }
@@ -4066,6 +4096,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.histogram_points.is_empty());
@@ -4099,6 +4130,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.histogram_points.is_empty());
@@ -4136,6 +4168,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.histogram_points.len(), 1);
@@ -4168,6 +4201,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4192,6 +4226,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4211,6 +4246,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(!out.points[0].is_monotonic_sum);
@@ -4231,6 +4267,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4255,7 +4292,7 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), ingest_ts);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 1);
     }
@@ -4275,7 +4312,7 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), ingest_ts);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4301,7 +4338,7 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), ingest_ts);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 1);
     }
@@ -4321,7 +4358,7 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), ingest_ts);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4362,12 +4399,14 @@ mod tests {
             &tenant(),
             request(vec![rm_a]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         let out_b = normalize_metrics(
             &tenant(),
             request(vec![rm_b]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out_a.rejected.is_empty());
@@ -4396,12 +4435,14 @@ mod tests {
             &tenant(),
             request(vec![rm1.clone(), rm2.clone()]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         let out_reversed = normalize_metrics(
             &tenant(),
             request(vec![rm2, rm1]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out_forward.rejected.is_empty());
@@ -4450,6 +4491,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             base_ts + 1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4500,6 +4542,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             base_ts + 1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4580,6 +4623,7 @@ mod tests {
             &tenant_fixture,
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_700_000_000_000_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4664,6 +4708,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4697,6 +4742,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4727,6 +4773,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4761,6 +4808,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4788,6 +4836,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4820,7 +4869,7 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4848,7 +4897,7 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert_eq!(out.rejected, vec![]);
         assert_eq!(out.points.len(), 163);
         assert_eq!(out.points.len(), limits.max_histogram_buckets + 3);
@@ -4871,7 +4920,7 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4904,7 +4953,7 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, &TenantRules::none(), 1_000);
         assert_eq!(out.rejected, vec![]);
         assert_eq!(out.points.len(), 230);
     }
@@ -4928,13 +4977,15 @@ mod tests {
             metric_name: "latency",
             resource_labels: &[],
             limits: &limits,
+            rules: &TenantRules::none(),
             ingest_ts_ns: 1_000,
         };
         let mut memo = SeriesIdMemo::new();
         let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
         let mut exemplars = Vec::new();
+        let mut tally = IpcryptTally::new();
 
-        let err = explode_histogram(&ctx, &mut dp, &mut memo, &mut cap, &mut exemplars)
+        let err = explode_histogram(&ctx, &mut dp, &mut memo, &mut cap, &mut exemplars, &mut tally)
             .expect_err("a bound list over the cap must be rejected");
 
         assert_eq!(
@@ -4969,6 +5020,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4992,6 +5044,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 3);
@@ -5027,6 +5080,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 3);
@@ -5099,6 +5153,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5134,6 +5189,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
 
@@ -5171,6 +5227,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &limits,
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5209,6 +5266,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5265,6 +5323,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5296,6 +5355,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5330,6 +5390,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5358,6 +5419,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5388,6 +5450,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5418,6 +5481,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5451,6 +5515,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5479,6 +5544,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5540,6 +5606,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5565,6 +5632,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5580,6 +5648,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5608,6 +5677,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5628,6 +5698,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5651,6 +5722,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5669,6 +5741,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5715,6 +5788,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut c,
         );
@@ -5944,6 +6018,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut c,
         );
@@ -5965,6 +6040,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut c,
         );
@@ -6090,6 +6166,7 @@ mod tests {
                 )],
             )]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             MEMO_TS,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6138,6 +6215,7 @@ mod tests {
                 vec![gauge_metric("cpu", points)],
             )]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             MEMO_TS,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6211,8 +6289,8 @@ mod tests {
                 .collect();
             let split = request(vec![resource_metrics(Vec::new(), split_metrics)]);
 
-            let memoised = normalize_metrics(&tenant, grouped, &limits, MEMO_TS);
-            let unmemoised = normalize_metrics(&tenant, split, &limits, MEMO_TS);
+            let memoised = normalize_metrics(&tenant, grouped, &limits, &TenantRules::none(), MEMO_TS);
+            let unmemoised = normalize_metrics(&tenant, split, &limits, &TenantRules::none(), MEMO_TS);
             proptest::prop_assert_eq!(memoised, unmemoised);
         }
     }
@@ -6287,11 +6365,11 @@ mod tests {
         const P: usize = 100;
         let req = wide_gauge_request(P, 1_000, true);
         // `__name__="g"` is 73 bytes, `k=<1000 bytes>` 1065, per point.
-        let projected = crate::project_resolved_label_bytes(&req, &IngestLimits::default()).get();
+        let projected = crate::project_resolved_label_bytes(&req, &IngestLimits::default(), &TenantRules::none()).get();
         assert_eq!(projected, P * (73 + 1_065));
 
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits_with_label_bytes(10_000), 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits_with_label_bytes(10_000), &TenantRules::none(), 1_000_000);
         let (hits, misses) = memo_stats::snapshot();
         assert_eq!((hits, misses), (0, 0), "no label set may be built");
         assert!(out.points.is_empty());
@@ -6310,6 +6388,7 @@ mod tests {
             &tenant(),
             wide_gauge_request(P, 1_000, true),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6321,13 +6400,14 @@ mod tests {
         const P: usize = 100;
         let limits = limits_with_label_bytes(10_000);
         let req = wide_gauge_request(P, 1_000, true);
-        assert!(crate::project_resolved_label_bytes(&req, &limits).get() > 10_000);
+        assert!(crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() > 10_000);
 
         let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
         let (result, _) = normalize_metrics_with_metadata_projected(
             &tenant(),
             req,
             &limits,
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
             ProjectedLabelBytes::for_test(0),
@@ -6345,13 +6425,14 @@ mod tests {
         const MAX: usize = 10_000;
         let limits = limits_with_label_bytes(MAX);
         let req = wide_gauge_request(1, 1, false);
-        assert!(crate::project_resolved_label_bytes(&req, &limits).get() <= MAX);
+        assert!(crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() <= MAX);
 
         let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
         let (result, _) = normalize_metrics_with_metadata_projected(
             &tenant(),
             req,
             &limits,
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
             ProjectedLabelBytes::for_test(MAX + 1),
@@ -6375,18 +6456,18 @@ mod tests {
         for n in [1, 2, 100] {
             let req = wide_gauge_request(n, 1, false);
             assert_eq!(
-                crate::project_resolved_label_bytes(&req, &limits).get(),
+                crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get(),
                 139,
                 "{n}"
             );
         }
         // Two alternating values never share a set: every point counts.
         assert_eq!(
-            crate::project_resolved_label_bytes(&wide_gauge_request(2, 1, true), &limits).get(),
+            crate::project_resolved_label_bytes(&wide_gauge_request(2, 1, true), &limits, &TenantRules::none()).get(),
             278
         );
         assert_eq!(
-            crate::project_resolved_label_bytes(&wide_gauge_request(100, 1, true), &limits).get(),
+            crate::project_resolved_label_bytes(&wide_gauge_request(100, 1, true), &limits, &TenantRules::none()).get(),
             100 * 139
         );
 
@@ -6396,6 +6477,7 @@ mod tests {
             &tenant(),
             wide_gauge_request(100, 1, false),
             &limits_with_label_bytes(139),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6404,6 +6486,7 @@ mod tests {
             &tenant(),
             wide_gauge_request(100, 1, false),
             &limits_with_label_bytes(138),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.points.is_empty());
@@ -6435,7 +6518,7 @@ mod tests {
             )],
         )]);
         assert_eq!(
-            crate::project_resolved_label_bytes(&small, &limits).get(),
+            crate::project_resolved_label_bytes(&small, &limits, &TenantRules::none()).get(),
             1_064
         );
 
@@ -6452,12 +6535,12 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         )]);
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected = crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         assert!(projected >= 163 * 4_065, "{projected}");
 
         let bounded = limits_with_label_bytes(100_000);
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), req.clone(), &bounded, 1_000_000);
+        let out = normalize_metrics(&tenant(), req.clone(), &bounded, &TenantRules::none(), 1_000_000);
         assert_eq!(memo_stats::snapshot(), (0, 0));
         assert!(out.points.is_empty());
         assert_eq!(
@@ -6470,7 +6553,7 @@ mod tests {
         );
 
         // Under the default bound it explodes as before.
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), limits.max_histogram_buckets + 3);
     }
@@ -6498,7 +6581,7 @@ mod tests {
 
         let over = limits.max_summary_quantiles + 1;
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), summary_with(over), &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), summary_with(over), &limits, &TenantRules::none(), 1_000_000);
         assert_eq!(memo_stats::snapshot(), (0, 0));
         assert!(out.points.is_empty());
         assert_eq!(
@@ -6510,7 +6593,7 @@ mod tests {
         );
 
         let at = limits.max_summary_quantiles;
-        let out = normalize_metrics(&tenant(), summary_with(at), &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), summary_with(at), &limits, &TenantRules::none(), 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), at + 2);
     }
@@ -6676,9 +6759,9 @@ mod tests {
                     resource.clone(),
                     vec![metric.clone()],
                 )]);
-                let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+                let projected = crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
                 label_capacity_stats::reset();
-                let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+                let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
                 assert!(out.rejected.is_empty(), "{:?}", out.rejected);
                 let built = built_label_bytes(&out);
                 assert!(
@@ -6695,9 +6778,9 @@ mod tests {
                 .map(|(resource, metrics)| resource_metrics(resource, metrics))
                 .collect(),
         );
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected = crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         label_capacity_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 12 + 6 + 3 * 6 + 3 + 2 * 4 + 3 + 4);
         assert_eq!(out.histogram_points.len(), 4);
@@ -6731,9 +6814,9 @@ mod tests {
                 summary_metric("s", vec![summary_point(vec![], 1_000, 1, 1.0, vec![])]),
             ],
         )]);
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected = crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         label_capacity_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 3 + 2);
         let built = built_label_bytes(&out);
@@ -6812,9 +6895,9 @@ mod tests {
         for metric in every_metric_path(attributes, bounds, quantiles) {
             let name = metric.name.clone();
             let req = request(vec![resource_metrics(resource.to_vec(), vec![metric])]);
-            let projected = crate::project_resolved_label_bytes(&req, limits).get();
+            let projected = crate::project_resolved_label_bytes(&req, limits, &TenantRules::none()).get();
             label_capacity_stats::reset();
-            let out = normalize_metrics(&tenant(), req, limits, 1_000_000);
+            let out = normalize_metrics(&tenant(), req, limits, &TenantRules::none(), 1_000_000);
             let sets = out
                 .points
                 .iter()
@@ -6986,12 +7069,12 @@ mod tests {
             + allowlist.iter().map(|key| label(key.len())).sum::<usize>();
         // Every point builds its own set: the prefix, `__name__="g"` (73) and
         // `k` (66), with nothing shared between alternating neighbours.
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected = crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         assert_eq!(projected, prefix + POINTS * (prefix + 73 + 66));
         assert!(projected > limits.max_resolved_label_bytes_per_request);
 
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert_eq!(memo_stats::snapshot(), (0, 0), "no label set may be built");
         assert!(out.points.is_empty());
         assert!(out.histogram_points.is_empty());

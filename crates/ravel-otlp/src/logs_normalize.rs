@@ -1068,7 +1068,7 @@ mod tests {
     }
 
     fn normalize(req: ExportLogsServiceRequest) -> LogNormalizeOutput {
-        normalize_logs(req, &LogIngestLimits::default(), 5_000)
+        normalize_logs(req, &LogIngestLimits::default(), &TenantRules::none(), 5_000)
     }
 
     #[test]
@@ -1422,6 +1422,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -1748,6 +1749,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2278,7 +2280,7 @@ mod tests {
             vec![attr_kv("wide", wide_array(ENTRY_CAP))],
             vec![scope_logs("lib", "1", vec![record(body("a"), vec![], 1)])],
         );
-        let out = normalize_logs(request(vec![at]), &entry_cap_limits(), 5_000);
+        let out = normalize_logs(request(vec![at]), &entry_cap_limits(), &TenantRules::none(), 5_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 1);
         let decoded = ravel_logseg::record::decode_stream_attrs(&out.records[0].stream_attrs)
@@ -2378,6 +2380,7 @@ mod tests {
                 )],
             )]),
             &entry_cap_limits(),
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2751,6 +2754,7 @@ mod tests {
                 vec![scope_logs("lib", "1", recs)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2822,6 +2826,7 @@ mod tests {
                 vec![scope_logs("lib", "1", recs)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2858,6 +2863,7 @@ mod tests {
                 vec![scope_logs("lib-a", "1", vec![rec()]), bad_scope],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert_eq!(out.records.len(), 1);
@@ -2932,6 +2938,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2961,6 +2968,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2997,7 +3005,7 @@ mod tests {
     fn rejects_future_skewed_record() {
         let limits = LogIngestLimits::default();
         let ts = INGEST_TS + limits.max_future_skew_ns + 1;
-        let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+        let out = normalize_logs(one_record_at(ts as u64), &limits, &TenantRules::none(), INGEST_TS);
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -3013,7 +3021,7 @@ mod tests {
     fn rejects_record_older_than_max_ingest_lag() {
         let limits = LogIngestLimits::default();
         let ts = INGEST_TS - limits.max_ingest_lag_ns - 1;
-        let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+        let out = normalize_logs(one_record_at(ts as u64), &limits, &TenantRules::none(), INGEST_TS);
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -3031,7 +3039,7 @@ mod tests {
             INGEST_TS + limits.max_future_skew_ns,
             INGEST_TS - limits.max_ingest_lag_ns,
         ] {
-            let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+            let out = normalize_logs(one_record_at(ts as u64), &limits, &TenantRules::none(), INGEST_TS);
             assert!(out.rejected.is_empty(), "{:?}", out.rejected);
             assert_eq!(out.records.len(), 1);
             assert_eq!(out.records[0].ts_ns, ts);
@@ -3056,6 +3064,7 @@ mod tests {
                 vec![scope_logs("lib", "1", vec![rec])],
             )]),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.records.is_empty());
@@ -3075,6 +3084,7 @@ mod tests {
         let out = normalize_logs(
             one_record_at(u64::MAX),
             &LogIngestLimits::default(),
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.records.is_empty());
@@ -3097,7 +3107,7 @@ mod tests {
         ) {
             let limits = LogIngestLimits::default();
             let ingest_ts = INGEST_TS + offset_ns;
-            let out = normalize_logs(one_record_at(ts_ns), &limits, ingest_ts);
+            let out = normalize_logs(one_record_at(ts_ns), &limits, &TenantRules::none(), ingest_ts);
             let resolved = i64::try_from(ts_ns).unwrap_or(i64::MAX);
             let in_bounds = resolved >= ingest_ts - limits.max_ingest_lag_ns
                 && resolved <= ingest_ts + limits.max_future_skew_ns;
@@ -3238,14 +3248,14 @@ mod tests {
         // copied once per record.
         let req = wide_stream_request(N, 1_000);
         let projected =
-            crate::project_log_resolved_label_bytes(&req, &LogIngestLimits::default()).get();
+            crate::project_log_resolved_label_bytes(&req, &LogIngestLimits::default(), &TenantRules::none()).get();
         assert_eq!(projected, 1_067 + 1_015 * (N + 1));
 
         let limits = LogIngestLimits {
             max_resolved_label_bytes_per_request: 10_000,
             ..LogIngestLimits::default()
         };
-        let out = normalize_logs(req, &limits, 5_000);
+        let out = normalize_logs(req, &limits, &TenantRules::none(), 5_000);
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -3274,9 +3284,9 @@ mod tests {
             ..LogIngestLimits::default()
         };
         let req = wide_stream_request(N, 1_000);
-        assert!(crate::project_log_resolved_label_bytes(&req, &limits).get() > 10_000);
+        assert!(crate::project_log_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() > 10_000);
 
-        let out = normalize_logs_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(0));
+        let out = normalize_logs_projected(req, &limits, &TenantRules::none(), 5_000, ProjectedLabelBytes::for_test(0));
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), N);
     }
@@ -3289,10 +3299,10 @@ mod tests {
             ..LogIngestLimits::default()
         };
         let req = wide_stream_request(1, 1);
-        assert!(crate::project_log_resolved_label_bytes(&req, &limits).get() <= MAX);
+        assert!(crate::project_log_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() <= MAX);
 
         let out =
-            normalize_logs_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(MAX + 1));
+            normalize_logs_projected(req, &limits, &TenantRules::none(), 5_000, ProjectedLabelBytes::for_test(MAX + 1));
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -3376,8 +3386,8 @@ mod tests {
             resource_logs(vec![], vec![scope_logs("other", "", records(3_000))]),
         ]);
         let limits = LogIngestLimits::default();
-        let projected = crate::project_log_resolved_label_bytes(&req, &limits).get();
-        let out = normalize_logs(req, &limits, 5_000);
+        let projected = crate::project_log_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
+        let out = normalize_logs(req, &limits, &TenantRules::none(), 5_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 15);
         // What each record actually allocated: its stream-attribute copy, its
@@ -3440,9 +3450,9 @@ mod tests {
                 )],
             )])
         };
-        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits).get()
-            - crate::project_log_resolved_label_bytes(&req(1), &limits).get();
-        let out = normalize_logs(req(1), &limits, 5_000);
+        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits, &TenantRules::none()).get()
+            - crate::project_log_resolved_label_bytes(&req(1), &limits, &TenantRules::none()).get();
+        let out = normalize_logs(req(1), &limits, &TenantRules::none(), 5_000);
         for r in &out.records {
             for (k, v) in &r.attrs {
                 proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);

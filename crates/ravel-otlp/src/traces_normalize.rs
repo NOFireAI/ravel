@@ -741,7 +741,7 @@ mod tests {
     }
 
     fn normalize(req: ExportTraceServiceRequest) -> SpanNormalizeOutput {
-        normalize_traces(req, &SpanIngestLimits::default(), 5_000)
+        normalize_traces(req, &SpanIngestLimits::default(), &TenantRules::none(), 5_000)
     }
 
     fn lookup<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -926,6 +926,7 @@ mod tests {
         let out = normalize_traces(
             one_span_over(INGEST_TS as u64, end as u64),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.spans.is_empty());
@@ -956,6 +957,7 @@ mod tests {
         let out = normalize_traces(
             one_span_over(start as u64, INGEST_TS as u64),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -973,7 +975,7 @@ mod tests {
         // Start earlier still, so the interval is well-ordered; only the end's
         // lag matters now.
         let start = end - 1_000;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, &TenantRules::none(), INGEST_TS);
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -991,7 +993,7 @@ mod tests {
         let limits = SpanIngestLimits::default();
         let start = INGEST_TS - limits.max_ingest_lag_ns;
         let end = INGEST_TS + limits.max_future_skew_ns;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, &TenantRules::none(), INGEST_TS);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].start_ts_ns, start);
@@ -1005,7 +1007,7 @@ mod tests {
         let limits = SpanIngestLimits::default();
         let end = INGEST_TS - limits.max_ingest_lag_ns;
         let start = end - 5_000;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, &TenantRules::none(), INGEST_TS);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), 1);
     }
@@ -1017,7 +1019,7 @@ mod tests {
     fn future_skewed_start_with_zero_end_is_rejected_through_the_fallback() {
         let limits = SpanIngestLimits::default();
         let start = INGEST_TS + limits.max_future_skew_ns + 1;
-        let out = normalize_traces(one_span_over(start as u64, 0), &limits, INGEST_TS);
+        let out = normalize_traces(one_span_over(start as u64, 0), &limits, &TenantRules::none(), INGEST_TS);
         assert!(out.spans.is_empty());
         assert!(
             matches!(out.rejected.as_slice(), [SpanRejection::FutureSkew { .. }]),
@@ -1035,6 +1037,7 @@ mod tests {
         let out = normalize_traces(
             one_span_over(start as u64, (start - 1) as u64),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.spans.is_empty());
@@ -1062,7 +1065,7 @@ mod tests {
         ) {
             let limits = SpanIngestLimits::default();
             let ingest_ts = INGEST_TS + offset_ns;
-            let out = normalize_traces(one_span_over(start_ns, end_ns), &limits, ingest_ts);
+            let out = normalize_traces(one_span_over(start_ns, end_ns), &limits, &TenantRules::none(), ingest_ts);
             let start = i64::try_from(start_ns).unwrap_or(i64::MAX);
             let end = i64::try_from(end_ns).unwrap_or(i64::MAX);
             if end < start {
@@ -1167,6 +1170,7 @@ mod tests {
                 vec![scope_spans("lib", "1", vec![s])],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert_eq!(out.spans.len(), 1, "the span itself is still admitted");
@@ -1443,6 +1447,7 @@ mod tests {
                 vec![scope_spans("lib", "1", spans)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1474,6 +1479,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1495,6 +1501,7 @@ mod tests {
                 vec![scope_spans("lib", "1", vec![span("toolong", 1, 2, vec![])])],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1521,6 +1528,7 @@ mod tests {
                 vec![scope_spans("lib", "1", vec![s])],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1543,6 +1551,7 @@ mod tests {
                 vec![scope_spans("lib", "1", spans)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1579,6 +1588,7 @@ mod tests {
                 ],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert_eq!(out.spans.len(), 1);
@@ -1626,14 +1636,14 @@ mod tests {
         // `otel.scope.version="1"` 83. Each span inherits 1232.
         let req = wide_resource_request(N, 1_000);
         let projected =
-            crate::project_span_resolved_label_bytes(&req, &SpanIngestLimits::default()).get();
+            crate::project_span_resolved_label_bytes(&req, &SpanIngestLimits::default(), &TenantRules::none()).get();
         assert_eq!(projected, 1_067 + 165 + 1_232 * N);
 
         let limits = SpanIngestLimits {
             max_resolved_label_bytes_per_request: 10_000,
             ..SpanIngestLimits::default()
         };
-        let out = normalize_traces(req, &limits, 5_000);
+        let out = normalize_traces(req, &limits, &TenantRules::none(), 5_000);
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -1659,9 +1669,9 @@ mod tests {
             ..SpanIngestLimits::default()
         };
         let req = wide_resource_request(N, 1_000);
-        assert!(crate::project_span_resolved_label_bytes(&req, &limits).get() > 10_000);
+        assert!(crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() > 10_000);
 
-        let out = normalize_traces_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(0));
+        let out = normalize_traces_projected(req, &limits, &TenantRules::none(), 5_000, ProjectedLabelBytes::for_test(0));
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), N);
     }
@@ -1674,10 +1684,10 @@ mod tests {
             ..SpanIngestLimits::default()
         };
         let req = wide_resource_request(1, 1);
-        assert!(crate::project_span_resolved_label_bytes(&req, &limits).get() <= MAX);
+        assert!(crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() <= MAX);
 
         let out =
-            normalize_traces_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(MAX + 1));
+            normalize_traces_projected(req, &limits, &TenantRules::none(), 5_000, ProjectedLabelBytes::for_test(MAX + 1));
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -1752,8 +1762,8 @@ mod tests {
             resource_spans(vec![], vec![scope_spans("other", "", spans(3_000))]),
         ]);
         let limits = SpanIngestLimits::default();
-        let projected = crate::project_span_resolved_label_bytes(&req, &limits).get();
-        let out = normalize_traces(req, &limits, 5_000);
+        let projected = crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
+        let out = normalize_traces(req, &limits, &TenantRules::none(), 5_000);
         // Array and kvlist values are dropped with a notice, not the span.
         assert!(
             out.rejected
@@ -1802,9 +1812,9 @@ mod tests {
                 )],
             )])
         };
-        let per_span = crate::project_span_resolved_label_bytes(&req(2), &limits).get()
-            - crate::project_span_resolved_label_bytes(&req(1), &limits).get();
-        let out = normalize_traces(req(1), &limits, 5_000);
+        let per_span = crate::project_span_resolved_label_bytes(&req(2), &limits, &TenantRules::none()).get()
+            - crate::project_span_resolved_label_bytes(&req(1), &limits, &TenantRules::none()).get();
+        let out = normalize_traces(req(1), &limits, &TenantRules::none(), 5_000);
         for s in &out.spans {
             for (k, v) in &s.attrs {
                 proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);
