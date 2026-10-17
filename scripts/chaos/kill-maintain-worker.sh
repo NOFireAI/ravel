@@ -36,20 +36,22 @@
 # almost never ran. Preferring a worker explicitly fixes that without
 # reintroducing the failure mode a fixed worker-A-only wait had (a night
 # where A owned no data-bearing units never exercised a kill during an actual
-# compaction): once the preferred worker's grace period (one maintenance tick
-# plus 120 s) passes with no compaction seen from it, the sibling is killed
-# on its next live reading >= 1, within one more maintenance tick. A sibling
-# reading from inside the grace period is not acted on, since that merge may
-# have finished by then.
+# compaction): the sibling's first reading >= 1 opens a decision window of
+# CHAOS_FALLBACK_DECIDE_SECONDS (30 s), and if the preferred worker shows no
+# compaction by its end, the sibling is killed on its next live reading >= 1.
+# The decision is made while the sibling merges because a sibling doing all
+# of the tenant's merging can finish within about a minute, after which no
+# later pass has anything to merge. A sibling reading from before an idle
+# gap is not acted on, since that merge has finished.
 # Each worker is scraped every CHAOS_COMPACTION_POLL_SECONDS (0.05 s) plus the
 # scrape itself; the run logs the scrapes it made and the seconds it waited,
 # and exactly one line of the form
 # `VICTIM preferred=<a|b> chosen=<a|b> reason=<preferred|fallback-no-data-shard>`,
 # where fallback-no-data-shard means no compaction was seen from the
-# preferred worker within its grace period. If no live reading >= 1 arrives
-# by the end of the extra wait, the kill still happens against the preferred
-# worker (the budget-fallback default), with a warning, and
-# CHAOS_KILL_ON_GAUGE is 0.
+# preferred worker within the decision window. If no live reading >= 1 that
+# can end the wait arrives within one maintenance tick plus 120 s, the kill
+# still happens against the preferred worker (the budget-fallback default),
+# with a warning, and CHAOS_KILL_ON_GAUGE is 0.
 #
 # CONSERVATION: after the kill, the victim's log names every bucket it was
 # merging: each "compaction merge started" line with no "compaction merge
@@ -170,6 +172,10 @@ if [[ -n "${CHAOS_PREFERRED_VICTIM:-}" ]]; then
 else
   CHAOS_PREFERRED_VICTIM="$(chaos_default_preferred_victim)"
 fi
+if [[ ! "${CHAOS_FALLBACK_DECIDE_SECONDS}" =~ ^[0-9]+$ ]]; then
+  echo "kill-maintain-worker.sh: CHAOS_FALLBACK_DECIDE_SECONDS must be a whole number of seconds, got '${CHAOS_FALLBACK_DECIDE_SECONDS}'" >&2
+  exit 64
+fi
 
 usage() {
   cat <<'EOF'
@@ -206,7 +212,7 @@ if [[ "$MODE" == "check" ]]; then
   echo "liveness bound: 3*H + one tick = $(chaos_takeover_bound_seconds)s" \
     "(H=${CHAOS_H_SECONDS}s, tick=${CHAOS_MAINTAIN_TICK_SECONDS}s)"
   echo "mid-compaction trigger: the preferred worker is killed as soon as its own ravel_maintain_compactions_in_flight reads >=1, both scraped every ${CHAOS_COMPACTION_POLL_SECONDS}s plus the scrape, the preferred worker last"
-  echo "victim preference: CHAOS_PREFERRED_VICTIM=${CHAOS_PREFERRED_VICTIM} (killed on its own reading; once its $(( CHAOS_MAINTAIN_TICK_SECONDS + 120 ))s grace period passes with no compaction seen from it, its sibling is killed on its next live reading >=1 within ${CHAOS_MAINTAIN_TICK_SECONDS}s more), override with CHAOS_PREFERRED_VICTIM=a|b, default the parity of GITHUB_RUN_NUMBER"
+  echo "victim preference: CHAOS_PREFERRED_VICTIM=${CHAOS_PREFERRED_VICTIM} (killed on its own reading; when it shows no compaction within CHAOS_FALLBACK_DECIDE_SECONDS=${CHAOS_FALLBACK_DECIDE_SECONDS}s of its sibling's first reading >=1, the sibling is killed on its next live reading >=1; all within $(( CHAOS_MAINTAIN_TICK_SECONDS + 120 ))s), override with CHAOS_PREFERRED_VICTIM=a|b, default the parity of GITHUB_RUN_NUMBER"
   echo "shard count: CHAOS_SHARD_COUNT=${CHAOS_SHARD_COUNT} passed to both workers' --shards, and multiplied into the expected total below"
   echo "conservation wait: up to ${CHAOS_CONSERVATION_WAIT_SECONDS:-$(chaos_conservation_wait_seconds)}s after the kill (takeover bound + one tick + ${CHAOS_CONSERVATION_MERGE_ALLOWANCE_SECONDS}s merge allowance, ended early by a survivor '${CHAOS_COMPACTION_PUBLISH_MARKER}'), then a store LIST of <bucket>l1. for a compaction record of every bucket an unended '${CHAOS_COMPACTION_START_MARKER}' in the victim's log names"
   echo "unreferenced-part horizon: ${CHAOS_PROTECTION_HORIZON_SECONDS}s (24h protection_horizon)"
@@ -400,18 +406,12 @@ assert_single_tenant_universe || true
 
 # Timestamp the kill so the takeover oracle can measure wall-clock against the
 # 3*H + tick bound. `date +%s` is the real clock ADR-0077 section 4 requires.
-# The preferred worker's grace period is one maintenance tick plus two
-# minutes, so each worker runs at least one pass after its startup pass
-# inside it.
+# The whole wait is one maintenance tick plus two minutes, so each worker runs
+# at least one pass after its startup pass inside it.
 INFLIGHT_BUDGET_SECONDS=$(( CHAOS_MAINTAIN_TICK_SECONDS + 120 ))
-# After the grace period, the sibling is killed only on a live reading, for at
-# most one more tick: a worker starts a pass every tick, so a sibling with a
-# merge left starts it within that, and the load stopped and sealed before
-# the workers started, so a later pass has nothing new to merge.
-FALLBACK_LIVE_WAIT_SECONDS="$CHAOS_MAINTAIN_TICK_SECONDS"
-log "waiting for the preferred worker (worker-${CHAOS_PREFERRED_VICTIM}) to be mid-compaction for ${INFLIGHT_BUDGET_SECONDS}s, then for either worker's next live reading for ${FALLBACK_LIVE_WAIT_SECONDS}s"
+log "waiting up to ${INFLIGHT_BUDGET_SECONDS}s for the preferred worker (worker-${CHAOS_PREFERRED_VICTIM}) to be mid-compaction, or for its sibling's live reading once ${CHAOS_FALLBACK_DECIDE_SECONDS}s have passed since the sibling's first"
 INFLIGHT_WAIT_START="$(date +%s)"
-if wait_for_compaction_in_flight_preferred "$CHAOS_PREFERRED_VICTIM" "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS" "$FALLBACK_LIVE_WAIT_SECONDS"; then
+if wait_for_compaction_in_flight_preferred "$CHAOS_PREFERRED_VICTIM" "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS" "$CHAOS_FALLBACK_DECIDE_SECONDS"; then
   KILL_EPOCH="$(date +%s)"
   VICTIM_PID_VAR="WORKER_${CHAOS_VICTIM^^}_PID"
   sigkill_pid "${!VICTIM_PID_VAR}"
@@ -426,8 +426,8 @@ echo "VICTIM preferred=${CHAOS_PREFERRED_VICTIM} chosen=${CHAOS_VICTIM} reason=$
 if [[ "$CHAOS_KILL_ON_GAUGE" -eq 1 ]]; then
   log "victim: worker-${CHAOS_VICTIM} (gauge, ${CHAOS_VICTIM_REASON})"
 else
-  if [[ "${CHAOS_SIBLING_SEEN_IN_GRACE:-0}" -eq 1 ]]; then
-    log "the preferred worker's sibling was compacting during the ${INFLIGHT_BUDGET_SECONDS}s grace period but gave no live reading >= 1 in the ${FALLBACK_LIVE_WAIT_SECONDS}s after it; not killing on that stale reading"
+  if [[ -n "${CHAOS_SIBLING_FIRST_LIVE_S:-}" ]]; then
+    log "the preferred worker's sibling first read >= 1 at ${CHAOS_SIBLING_FIRST_LIVE_S}s but gave no live reading >= 1 after the ${CHAOS_FALLBACK_DECIDE_SECONDS}s decision window, up to ${INFLIGHT_BUDGET_SECONDS}s; not killing on that stale reading"
   fi
   log "victim: worker-${CHAOS_VICTIM} (budget fallback, no live gauge reading at the kill)"
   echo "::warning::chaos scenario 2 killed worker-${CHAOS_VICTIM} without a live mid-compaction reading from either worker; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
