@@ -77,9 +77,10 @@
 # KIT_HEALTH_BASE_4319 (the /healthz sampler's two listeners, default
 # http://127.0.0.1:4318 and http://127.0.0.1:4319).
 #
-# During the benchmark phase and each concurrent round, one kit.py
-# healthz-sampler process GETs /healthz on both listeners and /metrics on 4318
-# (the health listener answers 404 there) every 250 ms with a 2 s timeout, into
+# During the benchmark phase and each concurrent round (each phase run.toml's
+# healthz_phases names, default both), one kit.py healthz-sampler process GETs
+# /healthz on both listeners every 250 ms and /metrics on 4318 (the health
+# listener answers 404 there) every 1 s, each with a 2 s timeout, into
 # out/<phase>/healthz/ or out/concurrent/round-N/healthz/. It runs beside the
 # statements, never inside them: run.sh only writes its gate file with a
 # builtin, so no statement's timed window forks for it. Its HEALTHZ and
@@ -126,6 +127,8 @@ SERVER_N=0
 SERVER_PID=""
 SAMPLER_PIDS=""
 HEALTHZ_PID=""
+HEALTHZ_ON=0
+HEALTHZ_PHASES=""
 HEALTHZ_GEN=0
 DATASET_PID=""
 BANDS_VERDICT="none"
@@ -167,6 +170,20 @@ toml_or() {
   v="$(kit_py get "$RUN_TOML" "$1" 2>/dev/null)" || v=""
   [ -n "$v" ] || v="$2"
   printf '%s\n' "$v"
+}
+
+# toml_get_opt KEY FILE: KEY's items into FILE, one per line, or FILE empty
+# and exit 3 when run.toml lacks KEY. Any other failure to read it is reported
+# and returned, never taken for an absent key.
+toml_get_opt() {
+  local code=0
+  kit_py get "$RUN_TOML" "$1" >"$2" 2>"$2.err" || code=$?
+  case "$code" in
+    0 | 3) rm -f "$2.err"; return "$code" ;;
+  esac
+  say "cannot read $1 from $RUN_TOML (kit.py get exit $code): $(head -c 300 "$2.err")"
+  rm -f "$2.err"
+  return "$code"
 }
 
 # The control characters json_str_to drops: every one below 0x20 but tab, line
@@ -270,6 +287,14 @@ load_config() {
   BAND_SECTIONS="$(toml_or band_sections "$(printf 'relative\nabsolute')" | tr '\n' ' ')"
   PHASES="$(toml phases | tr '\n' ' ')" || return 1
   LANES="$(toml lanes | tr '\n' ' ')" || return 1
+  local code=0
+  toml_get_opt healthz_phases "$KIT/healthz-phases" || code=$?
+  case "$code" in
+    0) HEALTHZ_PHASES="$(tr '\n' ' ' <"$KIT/healthz-phases")" ;;
+    3) HEALTHZ_PHASES="benchmark concurrent" ;;
+    *) return 1 ;;
+  esac
+  rm -f "$KIT/healthz-phases"
   CORPUS="$SRC/corpus.json"
   MAPPING="$RAVEL_DIR/benchmarks/clickbench/hits.mapping.toml"
 }
@@ -543,7 +568,7 @@ resolve_arm_env() {
     stamp "arm.env kept"
     return 0
   fi
-  local preload="" flags extra=() key f
+  local preload="" flags extra=() key f code=0
   preload="$(ls /usr/lib64/libtcmalloc.so.4 /usr/lib64/libtcmalloc.so 2>/dev/null | head -n 1)"
   flags=(--store s3 --shards "$SHARDS" --tenant-hash-unkeyed
     --tenant-token-file "$TOKEN_FILE"
@@ -553,9 +578,12 @@ resolve_arm_env() {
     flags+=(--audit-text "$AUDIT_TEXT")
   fi
   case "$ARM" in A) key=server_flags_a ;; *) key=server_flags_b ;; esac
-  if kit_py get "$RUN_TOML" "$key" >"$KIT/extra-flags" 2>/dev/null; then
-    while IFS= read -r f; do extra+=("$f"); done <"$KIT/extra-flags"
-  fi
+  toml_get_opt "$key" "$KIT/extra-flags" || code=$?
+  case "$code" in
+    0) while IFS= read -r f; do extra+=("$f"); done <"$KIT/extra-flags" ;;
+    3) ;;
+    *) rm -f "$KIT/extra-flags"; return 1 ;;
+  esac
   rm -f "$KIT/extra-flags"
   {
     printf 'SERVER_BIN=%q\n' "$BIN_DIR/ravel-server-$SHA"
@@ -686,16 +714,24 @@ stop_samplers() {
   SAMPLER_PIDS=""
 }
 
-# healthz_start DIR: the /healthz sampler (kit.py healthz-sampler) into DIR,
-# its gate down, so nothing it samples counts until healthz_up.
+# healthz_start KIND DIR: the /healthz sampler (kit.py healthz-sampler) into
+# DIR, its gate down, so nothing it samples counts until healthz_up. KIND is
+# benchmark or concurrent; a KIND run.toml's healthz_phases leaves out starts
+# nothing, and the other healthz_* calls are then no-ops. python3 is started
+# directly, not through kit_py, so $! is the sampler itself: a function run in
+# the background is a subshell, and killing that leaves python3 running.
 healthz_start() {
-  HEALTHZ_DIR="$1"
+  HEALTHZ_ON=0
+  HEALTHZ_PID=""
+  case " $HEALTHZ_PHASES " in *" $1 "*) ;; *) return 0 ;; esac
+  HEALTHZ_DIR="$2"
   mkdir -p "$HEALTHZ_DIR" || return 1
   rm -f "$HEALTHZ_DIR/ack"
   printf 'down %s\n' "$HEALTHZ_GEN" >"$HEALTHZ_DIR/gate"
-  kit_py healthz-sampler "$HEALTHZ_DIR" "$HEALTHZ_DIR/gate" "$HEALTHZ_DIR/ack" \
+  python3 "$PY_KIT" healthz-sampler "$HEALTHZ_DIR" "$HEALTHZ_DIR/gate" "$HEALTHZ_DIR/ack" \
     "$HEALTH_BASE_4318" "$HEALTH_BASE_4319" >"$HEALTHZ_DIR/sampler.log" 2>&1 &
   HEALTHZ_PID=$!
+  HEALTHZ_ON=1
 }
 
 # healthz_up: the gate opened on a new generation, then a wait until the
@@ -705,6 +741,7 @@ healthz_start() {
 # sleep.
 healthz_up() {
   local i a=""
+  [ "$HEALTHZ_ON" = 1 ] || return 0
   HEALTHZ_GEN=$((HEALTHZ_GEN + 1))
   printf 'up %s\n' "$HEALTHZ_GEN" >"$HEALTHZ_DIR/gate"
   for ((i = 0; i < 750; i++)); do
@@ -726,9 +763,20 @@ healthz_down() {
   [ -z "$HEALTHZ_PID" ] || printf 'down %s\n' "$HEALTHZ_GEN" >"$HEALTHZ_DIR/gate"
 }
 
+# healthz_stop: SIGTERM to the sampler, then up to 5 s for it to exit before
+# a logged SIGKILL, so no sampler outlives its phase or the run.
 healthz_stop() {
+  local i
   [ -n "$HEALTHZ_PID" ] || return 0
   kill "$HEALTHZ_PID" 2>/dev/null || true
+  for ((i = 0; i < 250; i++)); do
+    kill -0 "$HEALTHZ_PID" 2>/dev/null || break
+    sleep 0.02
+  done
+  if kill -0 "$HEALTHZ_PID" 2>/dev/null; then
+    say "healthz sampler $HEALTHZ_PID still running 5 s after SIGTERM; sending SIGKILL"
+    kill -KILL "$HEALTHZ_PID" 2>/dev/null || true
+  fi
   wait "$HEALTHZ_PID" 2>/dev/null || true
   HEALTHZ_PID=""
 }
@@ -737,6 +785,7 @@ healthz_stop() {
 # HEARTBEAT lines appended to out/healthz.txt and printed to run.log.
 healthz_finish() {
   local lines
+  [ "$HEALTHZ_ON" = 1 ] || return 0
   healthz_down
   healthz_stop
   lines="$(kit_py healthz-summary "$1" "$HEALTHZ_DIR")" || return 1
@@ -745,15 +794,23 @@ healthz_finish() {
 }
 
 # do_healthz_check: out/healthz.txt must hold each sampled phase's lines
-# exactly once; kit.py healthz-check refuses a missing or a repeated one.
+# exactly once; kit.py healthz-check refuses a missing or a repeated one. A run
+# that sampled no phase must have an empty healthz.txt, and its results.json
+# healthz block is null.
 do_healthz_check() {
   local phases=() phase r
   for phase in $PHASES; do
+    case " $HEALTHZ_PHASES " in *" $phase "*) ;; *) continue ;; esac
     case "$phase" in
       benchmark) phases+=(benchmark) ;;
       concurrent) for ((r = 1; r <= CONC_ROUNDS; r++)); do phases+=("concurrent-$r"); done ;;
     esac
   done
+  if [ "${#phases[@]}" = 0 ]; then
+    [ ! -s "$OUT/healthz.txt" ] || { say "$OUT/healthz.txt holds lines, but no phase was sampled"; return 1; }
+    echo null >"$KIT/healthz.json"
+    return 0
+  fi
   kit_py healthz-check "$OUT/healthz.txt" "${phases[@]}" >"$KIT/healthz.json"
 }
 
@@ -1032,7 +1089,7 @@ phase_benchmark() {
     || { say "corpus holds $count statements, run.toml expects $EXPECTED_STATEMENTS"; return 1; }
   : >"$dir/calls.jsonl"
   start_samplers benchmark
-  healthz_start "$dir/healthz" || { stop_samplers; return 1; }
+  healthz_start benchmark "$dir/healthz" || { stop_samplers; return 1; }
   BENCHMARK_SERVER_LOGS=""
   while IFS=$'\t' read -r n id exp; do
     healthz_down
@@ -1137,7 +1194,7 @@ concurrent_round() {
   done
   stop_server
   drop_caches || return 1
-  healthz_start "$rdir/healthz" || return 1
+  healthz_start concurrent "$rdir/healthz" || return 1
   start_server || { healthz_stop; return 1; }
   healthz_up || { healthz_stop; return 1; }
   stamp "concurrent round=$r connections=$CONC_CONNECTIONS duration_s=$CONC_DURATION"
