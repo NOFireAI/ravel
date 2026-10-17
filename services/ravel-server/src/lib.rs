@@ -1154,6 +1154,10 @@ pub struct Running {
     /// the two listeners authenticate against different resolvers; everything
     /// else the controls need is shared between them.
     pub mtls_query_service: Option<service::QueryService>,
+    /// The alert state this process's evaluators publish and its
+    /// `/api/v1/alerts` and `/api/v1/rules` routes serve.
+    /// [`alerting::PublishedAlerts::none`] in a mode with no query surface.
+    pub published_alerts: alerting::PublishedAlerts,
     log_ingest_router: Option<Arc<LogIngestRouter>>,
     span_ingest_router: Option<Arc<SpanIngestRouter>>,
     fold_tasks: fold::FoldTasks,
@@ -3155,6 +3159,7 @@ pub async fn start_with_heartbeat(
     // rather than constructing a second `QueryEngine`/`SqlExecutor` over the
     // same store.
     let mut alert_tasks = alerting::AlertEvalTasks::none();
+    let mut published_alerts = alerting::PublishedAlerts::none();
 
     if config.mode.installs_query_audit_pipeline() {
         // ADR-0062 decision 2b: one AuditPipeline for the process, shared by
@@ -3490,21 +3495,24 @@ pub async fn start_with_heartbeat(
             }
         }
 
-        // GET /api/v1/rules (issue #1711): the alert rules this process
-        // loaded, for the caller's tenant, in the Prometheus rules-API shape.
-        // Mounted here, beside the on-demand fold above, so it is scoped by
+        // GET /api/v1/rules and GET /api/v1/alerts (issues #1711, #2665): the
+        // alert rules this process loaded and the state its evaluators last
+        // published, for the caller's tenant, in the Prometheus API shapes.
+        // Mounted here, beside the on-demand fold above, so they are scoped by
         // the same listener resolver every other `/api/v1` route on this
         // router is: the primary listener's `config.tenant_resolver`, and the
-        // mTLS listener's own. It serves `config.alerting.rules`, the very map
-        // `alerting::spawn` below builds its evaluator tasks from, so the
-        // rules an operator reads back are the rules this process evaluates.
-        // Mounting it inside the query-surface block matches where the
-        // evaluator itself runs (`all` and `query` modes); a gateway or
-        // maintain process has no evaluator and serves no rules route.
+        // mTLS listener's own. They serve `config.alerting.rules`, the very map
+        // `alerting::spawn` below builds its evaluator tasks from, and
+        // `published_alerts`, the handle those tasks publish into. Mounting
+        // them inside the query-surface block matches where the evaluator
+        // itself runs (`all` and `query` modes); a gateway or maintain process
+        // has no evaluator and serves neither route.
+        published_alerts = alerting::PublishedAlerts::for_config(&config.alerting);
         let alert_rules_state = alerts_api::AlertRulesState {
             rules: config.alerting.rules.clone(),
             tenant_resolver: config.tenant_resolver.clone(),
             eval_interval: config.alerting.interval,
+            published: published_alerts.clone(),
         };
         http_router = http_router.merge(alerts_api::router(alert_rules_state));
         if let Some(mtls) = &config.mtls_listener {
@@ -3512,6 +3520,7 @@ pub async fn start_with_heartbeat(
                 rules: config.alerting.rules.clone(),
                 tenant_resolver: mtls.resolver.clone(),
                 eval_interval: config.alerting.interval,
+                published: published_alerts.clone(),
             };
             mtls_router = mtls_router.merge(alerts_api::router(mtls_alert_rules_state));
         }
@@ -3642,6 +3651,7 @@ pub async fn start_with_heartbeat(
             },
             Arc::new(SystemClock),
             config.alerting.clone(),
+            published_alerts.clone(),
         )?;
 
         if let Some(mtls) = &config.mtls_listener {
@@ -4440,6 +4450,7 @@ pub async fn start_with_heartbeat(
         query_accounting,
         query_service: query_service_handle,
         mtls_query_service: mtls_query_service_handle,
+        published_alerts,
         log_ingest_router,
         span_ingest_router,
         fold_tasks,
