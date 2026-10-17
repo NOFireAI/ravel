@@ -618,8 +618,9 @@ flowchart LR
   ADR adds a consequence to losing it.
 - **Deployment-key rotation is out of scope.** The epoch mechanism
   rotates per-rule keys under one deployment key (keys are per tenant,
-  variant and epoch; see the 2026-10-17 correction below). A new deployment key
-  changes every derived key at once, for every tenant and epoch, and
+  variant and epoch; see the 2026-10-17 correction below). A new
+  deployment key changes every derived key at once, for every tenant
+  and epoch, and
   needs its own ADR.
 - **Persistent formats: one new `sys/` object, no changed format.**
   Ciphertext is an ordinary attribute value. `sys/ipcrypt/policy` is a
@@ -645,13 +646,14 @@ flowchart LR
 
 This corrects two statements of fact. No decision changes.
 
-- **`rand` (decision 5).** Turning off `ipcrypt-rs`'s default features
-  keeps `rand` out of `ipcrypt-rs`'s own dependencies. The marker of
-  decision 9 needs an object-store client, so `ravel-ipcrypt` puts it
-  behind a `marker` cargo feature that is off by default. With the
-  default features, `ravel-ipcrypt` has no `rand` in its dependency
-  graph. With `marker` on, which `ravel-server` and `ravel-cli` enable,
-  `rand` arrives through `ravel-object-store`. The offered variants
+- **`rand` (decision 5).** Disabling the `random` feature (one of
+  `ipcrypt-rs`'s default features) keeps `rand` out of `ipcrypt-rs`'s
+  own dependencies. The marker of decision 9 needs an object-store
+  client, so `ravel-ipcrypt` puts it behind a `marker` cargo feature
+  that is off by default (#3052). With the default features,
+  `ravel-ipcrypt` has no `rand` in its dependency graph. With `marker`
+  on, which the ingesting server (#3048) and `ravel-cli` (#3049) turn
+  on, `rand` arrives through `ravel-object-store`. The offered variants
   still need no randomness, and no key is ever generated.
 - **Key scope (Consequences, rotation).** Decision 2 derives a key from
   the tenant, the variant and the epoch. The attribute key a rule names
