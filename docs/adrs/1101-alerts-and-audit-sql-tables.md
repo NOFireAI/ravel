@@ -241,5 +241,6 @@ ADR-2904 replaces that rule: a statement may name `alerts` or `audit`
 together with other signal tables and Parquet tables, with one snapshot
 resolved per named signal. Access is unchanged: a tenant reads its own
 records, and a join reaches nothing its two sides could not already read
-separately. Until epic #2904's code lands, the executor still rejects such a
-statement.
+separately. The HTTP SQL endpoint runs such a statement since issue #2910;
+Flight SQL still rejects it with `SqlError::CrossSignalQuery` until its
+ticket carries one segment group per signal (ADR-2904 decision 10).

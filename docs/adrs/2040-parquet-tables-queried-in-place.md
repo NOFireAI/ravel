@@ -1482,11 +1482,13 @@ counted and warned about until an operator removes it by hand.
 
 <!-- amendment-applies: sections="D6. Session settings for Parquet tables follow the measurement" pointer="ADR-2904" -->
 
-D6 made a Parquet table beside a signal table a `CrossSignalQuery` error.
-ADR-2904 decision 11 allows it: the session carries the tenant's Parquet
+D6 made a Parquet table beside a signal table an error, `CrossSignalQuery`
+when D6 landed. ADR-2904 decision 11 allows it: the session carries the tenant's Parquet
 store registry and read limits, and registers the named signal tables beside
 the Parquet tables. In such a statement the request row window applies to
 the signal scans and not to the Parquet scan, and commit tokens apply to
 signal tables only. A statement over Parquet tables alone that carries a row
-window stays a 400. The session settings D6 chose for Parquet plans are unchanged. Until
-epic #2904's code lands, the executor still rejects such a statement.
+window stays a 400. The session settings D6 chose for Parquet plans are
+unchanged. Until ticket T7 of epic #2904 (#2914) lands, the executor refuses
+such a statement with `SqlError::SignalBesideParquet`, a 400 that says it is
+not supported yet, before any signal catalog listing.
