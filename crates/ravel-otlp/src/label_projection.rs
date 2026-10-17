@@ -185,7 +185,11 @@ pub fn project_resolved_label_bytes(
     )
 }
 
-fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits, rules: &TenantRules) -> usize {
+fn project_resource_metrics(
+    rm: &ResourceMetrics,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+) -> usize {
     let attrs = resource_attr_pairs(rm.resource.as_ref());
     if attrs.len() > limits.max_resource_attributes {
         return 0;
@@ -326,7 +330,12 @@ fn is_cumulative(temporality: i32) -> bool {
     )
 }
 
-fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits, rules: &TenantRules) -> usize {
+fn project_metric(
+    metric: &Metric,
+    prefix: usize,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+) -> usize {
     let Some(data) = metric.data.as_ref() else {
         return 0;
     };
@@ -582,8 +591,11 @@ fn encoded_attrs_len(attributes: &[KeyValue], rules: &TenantRules) -> usize {
         .iter()
         .map(|kv| {
             let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
-            encoded_bytes_len(kv.key.len())
-                .saturating_add(encoded_value_len(kv.value.as_ref(), 1, matched))
+            encoded_bytes_len(kv.key.len()).saturating_add(encoded_value_len(
+                kv.value.as_ref(),
+                1,
+                matched,
+            ))
         })
         .fold(uvarint_len(attributes.len() as u64), usize::saturating_add)
 }
@@ -621,8 +633,11 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize, matched: bool) -> u
             .values
             .iter()
             .map(|kv| {
-                encoded_bytes_len(kv.key.len())
-                    .saturating_add(encoded_value_len(kv.value.as_ref(), depth + 1, false))
+                encoded_bytes_len(kv.key.len()).saturating_add(encoded_value_len(
+                    kv.value.as_ref(),
+                    depth + 1,
+                    false,
+                ))
             })
             .fold(
                 1 + uvarint_len(kvlist.values.len() as u64),
@@ -638,7 +653,10 @@ fn log_attrs_bytes(attributes: &[KeyValue], rules: &TenantRules) -> usize {
         .iter()
         .map(|kv| {
             let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
-            label_bytes(kv.key.len(), log_value_payload(kv.value.as_ref(), 1, matched))
+            label_bytes(
+                kv.key.len(),
+                log_value_payload(kv.value.as_ref(), 1, matched),
+            )
         })
         .fold(0usize, usize::saturating_add)
 }

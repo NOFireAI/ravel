@@ -198,7 +198,15 @@ pub fn normalize_traces_projected(
     let mut rejected = Vec::new();
     let mut tally = IpcryptTally::new();
     for rs in &req.resource_spans {
-        normalize_resource(rs, limits, rules, ingest_ts_ns, &mut spans, &mut rejected, &mut tally);
+        normalize_resource(
+            rs,
+            limits,
+            rules,
+            ingest_ts_ns,
+            &mut spans,
+            &mut rejected,
+            &mut tally,
+        );
     }
 
     SpanNormalizeOutput {
@@ -249,7 +257,16 @@ fn normalize_resource(
     let resource_attrs = convert_attrs_lossy(resource_attributes, limits, rules, tally, rejected);
 
     for ss in &rs.scope_spans {
-        normalize_scope(ss, &resource_attrs, limits, rules, ingest_ts_ns, spans, rejected, tally);
+        normalize_scope(
+            ss,
+            &resource_attrs,
+            limits,
+            rules,
+            ingest_ts_ns,
+            spans,
+            rejected,
+            tally,
+        );
     }
 }
 
@@ -300,7 +317,15 @@ fn normalize_scope(
     scope_attrs.shrink_to_fit();
 
     for span in &ss.spans {
-        match normalize_span(span, resource_attrs, &scope_attrs, limits, rules, ingest_ts_ns, tally) {
+        match normalize_span(
+            span,
+            resource_attrs,
+            &scope_attrs,
+            limits,
+            rules,
+            ingest_ts_ns,
+            tally,
+        ) {
             Ok((normalized, dropped)) => {
                 spans.push(normalized);
                 rejected.extend(dropped);
@@ -605,7 +630,12 @@ fn convert_attrs_lossy(
 /// decision 1: traces match attributes as sent, unlike metrics' sanitized
 /// label names). Runs before the value-length check in [`convert_attr`] so
 /// limits see the stored (possibly encrypted) length, per decision 3.
-fn apply_ipcrypt(rules: &TenantRules, tally: &mut IpcryptTally, key: &str, value: String) -> String {
+fn apply_ipcrypt(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    key: &str,
+    value: String,
+) -> String {
     if value.is_empty() {
         return value;
     }
@@ -741,7 +771,12 @@ mod tests {
     }
 
     fn normalize(req: ExportTraceServiceRequest) -> SpanNormalizeOutput {
-        normalize_traces(req, &SpanIngestLimits::default(), &TenantRules::none(), 5_000)
+        normalize_traces(
+            req,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+            5_000,
+        )
     }
 
     fn lookup<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -975,7 +1010,12 @@ mod tests {
         // Start earlier still, so the interval is well-ordered; only the end's
         // lag matters now.
         let start = end - 1_000;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, &TenantRules::none(), INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, end as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -993,7 +1033,12 @@ mod tests {
         let limits = SpanIngestLimits::default();
         let start = INGEST_TS - limits.max_ingest_lag_ns;
         let end = INGEST_TS + limits.max_future_skew_ns;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, &TenantRules::none(), INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, end as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].start_ts_ns, start);
@@ -1007,7 +1052,12 @@ mod tests {
         let limits = SpanIngestLimits::default();
         let end = INGEST_TS - limits.max_ingest_lag_ns;
         let start = end - 5_000;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, &TenantRules::none(), INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, end as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), 1);
     }
@@ -1019,7 +1069,12 @@ mod tests {
     fn future_skewed_start_with_zero_end_is_rejected_through_the_fallback() {
         let limits = SpanIngestLimits::default();
         let start = INGEST_TS + limits.max_future_skew_ns + 1;
-        let out = normalize_traces(one_span_over(start as u64, 0), &limits, &TenantRules::none(), INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, 0),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.spans.is_empty());
         assert!(
             matches!(out.rejected.as_slice(), [SpanRejection::FutureSkew { .. }]),
@@ -1635,8 +1690,12 @@ mod tests {
         // `svc=<1000 bytes>` is 1067; `otel.scope.name="lib"` 82 and
         // `otel.scope.version="1"` 83. Each span inherits 1232.
         let req = wide_resource_request(N, 1_000);
-        let projected =
-            crate::project_span_resolved_label_bytes(&req, &SpanIngestLimits::default(), &TenantRules::none()).get();
+        let projected = crate::project_span_resolved_label_bytes(
+            &req,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+        )
+        .get();
         assert_eq!(projected, 1_067 + 165 + 1_232 * N);
 
         let limits = SpanIngestLimits {
@@ -1669,9 +1728,18 @@ mod tests {
             ..SpanIngestLimits::default()
         };
         let req = wide_resource_request(N, 1_000);
-        assert!(crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() > 10_000);
+        assert!(
+            crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get()
+                > 10_000
+        );
 
-        let out = normalize_traces_projected(req, &limits, &TenantRules::none(), 5_000, ProjectedLabelBytes::for_test(0));
+        let out = normalize_traces_projected(
+            req,
+            &limits,
+            &TenantRules::none(),
+            5_000,
+            ProjectedLabelBytes::for_test(0),
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), N);
     }
@@ -1684,10 +1752,18 @@ mod tests {
             ..SpanIngestLimits::default()
         };
         let req = wide_resource_request(1, 1);
-        assert!(crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() <= MAX);
+        assert!(
+            crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get()
+                <= MAX
+        );
 
-        let out =
-            normalize_traces_projected(req, &limits, &TenantRules::none(), 5_000, ProjectedLabelBytes::for_test(MAX + 1));
+        let out = normalize_traces_projected(
+            req,
+            &limits,
+            &TenantRules::none(),
+            5_000,
+            ProjectedLabelBytes::for_test(MAX + 1),
+        );
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -1762,7 +1838,8 @@ mod tests {
             resource_spans(vec![], vec![scope_spans("other", "", spans(3_000))]),
         ]);
         let limits = SpanIngestLimits::default();
-        let projected = crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
+        let projected =
+            crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         let out = normalize_traces(req, &limits, &TenantRules::none(), 5_000);
         // Array and kvlist values are dropped with a notice, not the span.
         assert!(
@@ -1812,8 +1889,10 @@ mod tests {
                 )],
             )])
         };
-        let per_span = crate::project_span_resolved_label_bytes(&req(2), &limits, &TenantRules::none()).get()
-            - crate::project_span_resolved_label_bytes(&req(1), &limits, &TenantRules::none()).get();
+        let per_span =
+            crate::project_span_resolved_label_bytes(&req(2), &limits, &TenantRules::none()).get()
+                - crate::project_span_resolved_label_bytes(&req(1), &limits, &TenantRules::none())
+                    .get();
         let out = normalize_traces(req(1), &limits, &TenantRules::none(), 5_000);
         for s in &out.spans {
             for (k, v) in &s.attrs {

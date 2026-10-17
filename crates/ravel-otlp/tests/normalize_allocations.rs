@@ -39,8 +39,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use ravel_otlp::{IngestLimits, normalize_metrics};
 use ravel_ipcrypt::rules::TenantRules;
+use ravel_otlp::{IngestLimits, normalize_metrics};
 use ravel_types::TenantId;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
 
