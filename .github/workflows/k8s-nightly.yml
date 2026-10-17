@@ -210,7 +210,9 @@ jobs:
     #           each of a 20-export run would take 24.6, an extrapolation
     #   + 142   seal wait after ingest exits: up to 60 to the end of the
     #           hour, + 80 seal margin + 2 safety
-    #   + 7     in-flight wait: one maintenance tick + 120 s
+    #   + 7     in-flight wait: one maintenance tick + 120 s, the whole wait;
+    #           the 30 s fallback decision window runs inside it, and the
+    #           last round can overrun it by one poll and two 5 s scrapes
     #   + 18    conservation wait from the kill: 3 * H + one tick (the
     #           takeover bound, 8) + one tick (5) + 300 s merge allowance (5)
     #   = 222 minutes, plus the verification after the conservation wait

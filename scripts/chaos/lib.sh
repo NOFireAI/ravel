@@ -969,6 +969,14 @@ CHAOS_FLUSH_POLLS_PER_SECOND="${CHAOS_FLUSH_POLLS_PER_SECOND:-5}"
 # the scrapes it made and how long it waited, so a run shows the period it
 # reached.
 CHAOS_COMPACTION_POLL_SECONDS="${CHAOS_COMPACTION_POLL_SECONDS:-0.05}"
+# Seconds the preferred worker has, from its sibling's first merge reading,
+# to show a merge of its own before the sibling becomes the victim
+# (wait_for_compaction_in_flight_preferred). The two workers' first merges
+# have started 7-11 s apart, so a preferred worker that owns data shows one
+# well inside 30 s. A sibling doing all of the tenant's merging has kept at
+# it for about 70 s (four merges of about 15 s each), so the window closes
+# while it is still merging and the kill lands on a live reading.
+CHAOS_FALLBACK_DECIDE_SECONDS="${CHAOS_FALLBACK_DECIDE_SECONDS:-30}"
 CHAOS_COMPACTION_START_MARKER="compaction merge started"
 CHAOS_COMPACTION_END_MARKER="compaction merge ended"
 CHAOS_COMPACTION_PUBLISH_MARKER="compaction record published"
@@ -1318,43 +1326,45 @@ chaos_scrape_maintain_worker() {
 # from `preferred` instead of from a race between the two gauges (issue
 # #3037). The rendezvous-hash split across (tenant, signal, shard) is not
 # guaranteed to spread data-bearing units evenly between the two workers, so
-# on some runs the preferred worker owns nothing to compact. Once its grace
-# period (grace_seconds) has passed without its gauge firing, the sibling
-# becomes a victim too, but only on a live reading: the sibling is killed on
-# its next scrape reading >= 1 within extra_seconds after the grace period. A
-# sibling reading seen during the grace period is never acted on later, since
-# by then that merge may have finished and the kill would not follow the
-# detection.
+# on some runs the preferred worker owns nothing to compact, and then the
+# sibling does all of the tenant's merging, which can be over within about a
+# minute. So the decision is made while the sibling merges: its first reading
+# >= 1 opens a decision window of decide_seconds, and if the preferred worker
+# has not read >= 1 by the end of it, the sibling is killed on its next live
+# reading >= 1. A sibling that goes idle before the window ends is never
+# killed on that earlier reading, only on a later live one.
 #
-# Each round scrapes the worker whose reading cannot end the wait first and
-# the one whose reading can end it last, and returns straight after the
-# detecting read, so nothing but bookkeeping sits between detection and the
-# kill (ADR-0077): within the grace period the sibling first and the
-# preferred worker last; after it, the sibling's reading also ends the wait
-# and returns before the preferred worker is scraped that round.
+# Each round scrapes the sibling first and the preferred worker last, and
+# returns straight after the detecting read, so nothing but bookkeeping sits
+# between detection and the kill (ADR-0077). Within the window both are
+# scraped and the preferred worker wins a round where both read >= 1; once
+# the window has passed, the sibling's reading ends the round before the
+# preferred worker is scraped.
 #
-# Args: preferred ("a" or "b"), url_a, url_b, grace_seconds, extra_seconds
-# (default 0). Returns 0 on a live reading >= 1 (the preferred worker's at any
-# point, or the sibling's after the grace period), 1 when grace_seconds plus
-# extra_seconds pass without one. The chosen victim is reported via the
-# global CHAOS_VICTIM ("a" or "b") and the reason via CHAOS_VICTIM_REASON:
-# "preferred", or "fallback-no-data-shard", which means only that no
-# compaction was seen from the preferred worker within its grace period (the
-# preferred worker's shard ownership is inferred, not checked). Never on
-# stdout: a caller that captures stdout via $(...) runs this in a subshell,
-# and a subshell's assignments do not reach the caller. On a 1 return
-# CHAOS_VICTIM stays `preferred` with reason "preferred", for the caller's
-# no-gauge kill. CHAOS_SIBLING_SEEN_IN_GRACE is 1 when the sibling read >= 1
-# during the grace period. Also keeps per-worker units_owned peaks and latest
-# readings (chaos_scrape_maintain_worker) and the total scrape count, both
-# workers summed, in CHAOS_COMPACTION_POLLS. Time comes from
+# Args: preferred ("a" or "b"), url_a, url_b, budget_seconds, decide_seconds
+# (default CHAOS_FALLBACK_DECIDE_SECONDS). Returns 0 on a live reading >= 1
+# (the preferred worker's at any point, or the sibling's once the window has
+# passed), 1 when budget_seconds pass without one. The chosen victim is
+# reported via the global CHAOS_VICTIM ("a" or "b") and the reason via
+# CHAOS_VICTIM_REASON: "preferred", or "fallback-no-data-shard", which means
+# only that no compaction was seen from the preferred worker within
+# decide_seconds of the sibling's first (the preferred worker's shard
+# ownership is inferred, not checked). Never on stdout: a caller that
+# captures stdout via $(...) runs this in a subshell, and a subshell's
+# assignments do not reach the caller. On a 1 return CHAOS_VICTIM stays
+# `preferred` with reason "preferred", for the caller's no-gauge kill.
+# CHAOS_SIBLING_FIRST_LIVE_S is the elapsed second of the sibling's first
+# reading >= 1 ("" when it never read one), and CHAOS_WAIT_ELAPSED_S the
+# elapsed second of the last round. Also keeps per-worker units_owned peaks
+# and latest readings (chaos_scrape_maintain_worker) and the total scrape
+# count, both workers summed, in CHAOS_COMPACTION_POLLS. Time comes from
 # chaos_now_unix_s, which tests replace.
 wait_for_compaction_in_flight_preferred() {
   local preferred="$1"
   local url_a="$2"
   local url_b="$3"
-  local grace_seconds="$4"
-  local extra_seconds="${5:-0}"
+  local budget_seconds="$4"
+  local decide_seconds="${5:-$CHAOS_FALLBACK_DECIDE_SECONDS}"
   local sibling preferred_url sibling_url start elapsed
   if [[ "$preferred" == "a" ]]; then
     sibling="b"; preferred_url="$url_a"; sibling_url="$url_b"
@@ -1364,20 +1374,22 @@ wait_for_compaction_in_flight_preferred() {
   CHAOS_COMPACTION_POLLS=0
   CHAOS_VICTIM="$preferred"
   CHAOS_VICTIM_REASON="preferred"
-  CHAOS_SIBLING_SEEN_IN_GRACE=0
+  CHAOS_SIBLING_FIRST_LIVE_S=""
+  CHAOS_WAIT_ELAPSED_S=0
   CHAOS_A_LAST_UNITS_OWNED=""
   CHAOS_B_LAST_UNITS_OWNED=""
   start="$(chaos_now_unix_s)"
   while :; do
     elapsed=$(( $(chaos_now_unix_s) - start ))
+    CHAOS_WAIT_ELAPSED_S="$elapsed"
 
     chaos_scrape_maintain_worker "$sibling" "$sibling_url"
     if [[ "$CHAOS_SCRAPED_INFLIGHT" -ge 1 ]]; then
-      if (( elapsed >= grace_seconds )); then
+      [[ -n "$CHAOS_SIBLING_FIRST_LIVE_S" ]] || CHAOS_SIBLING_FIRST_LIVE_S="$elapsed"
+      if (( elapsed - CHAOS_SIBLING_FIRST_LIVE_S >= decide_seconds )); then
         CHAOS_VICTIM="$sibling"; CHAOS_VICTIM_REASON="fallback-no-data-shard"
         return 0
       fi
-      CHAOS_SIBLING_SEEN_IN_GRACE=1
     fi
 
     chaos_scrape_maintain_worker "$preferred" "$preferred_url"
@@ -1386,7 +1398,7 @@ wait_for_compaction_in_flight_preferred() {
       return 0
     fi
 
-    (( elapsed < grace_seconds + extra_seconds )) || break
+    (( elapsed < budget_seconds )) || break
     sleep "$CHAOS_COMPACTION_POLL_SECONDS"
   done
   return 1
