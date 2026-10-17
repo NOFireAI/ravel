@@ -13,6 +13,9 @@ ravel-segment = { workspace = true }
 ravel-commit = { workspace = true }
 ravel-catalog = { workspace = true }
 ravel-otlp = { workspace = true }
+# TenantRules::none() for the normalizer entry points under test (ADR-2993
+# decision 3, issue #3047).
+ravel-ipcrypt = { workspace = true }
 ravel-ingest = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-query = { workspace = true }

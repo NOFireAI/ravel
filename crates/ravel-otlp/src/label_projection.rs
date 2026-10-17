@@ -40,17 +40,33 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use prost::Message;
 use ravel_types::METRIC_NAME_LABEL;
 
+use ravel_ipcrypt::rules::TenantRules;
+
 use crate::limits::IngestLimits;
 use crate::logs_limits::LogIngestLimits;
 use crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH;
 use crate::normalize::{
     ResourceAttrValue, metric_kind_of, prometheus_family_name, resource_attr_pairs,
-    sanitize_metric_name,
+    sanitize_label_name, sanitize_metric_name,
 };
 use crate::traces_limits::SpanIngestLimits;
 use crate::traces_normalize::{
     ATTR_EVENTS_RAW, ATTR_LINKS_RAW, ATTR_SPAN_FLAGS, ATTR_SPAN_KIND, ATTR_TRACE_STATE,
 };
+
+/// The length a value of `raw_len` bytes is charged at for the label/attribute
+/// `name` would be stored as: unchanged when no rule in `rules` matches it,
+/// [`TenantRules::max_stored_len`] when one does (ADR-2993 decision 3). `name`
+/// must be the same key the normalizer matches a rule against: sanitized
+/// label name for metrics ([`TenantRules::lookup_label`]), raw attribute key
+/// for logs and traces ([`TenantRules::lookup_raw`]).
+fn charged_len(matched: bool, raw_len: usize) -> usize {
+    if matched {
+        TenantRules::max_stored_len(raw_len)
+    } else {
+        raw_len
+    }
+}
 
 /// Bytes charged per resolved label or attribute on top of its name and
 /// value: at least the inline size of the element holding it on a 64-bit
@@ -159,27 +175,28 @@ pub(crate) fn exact_capacity(mut s: String) -> String {
 pub fn project_resolved_label_bytes(
     req: &ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> ProjectedLabelBytes {
     ProjectedLabelBytes(
         req.resource_metrics
             .iter()
-            .map(|rm| project_resource_metrics(rm, limits))
+            .map(|rm| project_resource_metrics(rm, limits, rules))
             .fold(0usize, usize::saturating_add),
     )
 }
 
-fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits) -> usize {
+fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits, rules: &TenantRules) -> usize {
     let attrs = resource_attr_pairs(rm.resource.as_ref());
     if attrs.len() > limits.max_resource_attributes {
         return 0;
     }
-    let Some(prefix) = resource_prefix_bytes(&attrs, limits) else {
+    let Some(prefix) = resource_prefix_bytes(&attrs, limits, rules) else {
         return 0;
     };
     let mut total = prefix;
     for sm in &rm.scope_metrics {
         for metric in &sm.metrics {
-            total = total.saturating_add(project_metric(metric, prefix, limits));
+            total = total.saturating_add(project_metric(metric, prefix, limits, rules));
         }
     }
     total
@@ -189,9 +206,13 @@ fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits) -> usiz
 /// builds from `attrs`, or `None` when a value it reads has no label form,
 /// which rejects every point under the resource before any point label is
 /// built. Shared by every wire format's projection, as the builder is.
+/// `job` and `instance` are matched against `rules` under those literal
+/// names, like `push_checked` matches them, not under their source resource
+/// attribute keys (ADR-2993 decision 3).
 pub fn resource_prefix_bytes(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> Option<usize> {
     let mut total = 0usize;
 
@@ -203,6 +224,7 @@ pub fn resource_prefix_bytes(
             name_len
         };
         if job_len > 0 {
+            let job_len = charged_len(rules.lookup_label("job").is_some(), job_len);
             total = total.saturating_add(label_bytes("job".len(), job_len));
         }
     } else {
@@ -215,6 +237,7 @@ pub fn resource_prefix_bytes(
     if let Some(len) = first_attr_label_len(attrs, "service.instance.id")?
         && len > 0
     {
+        let len = charged_len(rules.lookup_label("instance").is_some(), len);
         total = total.saturating_add(label_bytes("instance".len(), len));
     }
 
@@ -230,6 +253,8 @@ pub fn resource_prefix_bytes(
         if let Some(len) = first_attr_label_len(attrs, key)?
             && len > 0
         {
+            let sanitized = sanitize_label_name(key.clone());
+            let len = charged_len(rules.lookup_label(&sanitized).is_some(), len);
             total = total.saturating_add(label_bytes(key.len(), len));
         }
     }
@@ -272,11 +297,20 @@ fn label_value_len(value: Option<&AnyValue>) -> Option<usize> {
 /// drops it, but where the set's `Vec` was sized before the drops
 /// (`reserved_slots`) its slot stays allocated in the kept set and is charged
 /// [`RESOLVED_LABEL_OVERHEAD_BYTES`].
-fn point_attribute_bytes(attributes: &[KeyValue], reserved_slots: bool) -> Option<usize> {
+fn point_attribute_bytes(
+    attributes: &[KeyValue],
+    reserved_slots: bool,
+    rules: &TenantRules,
+) -> Option<usize> {
     let mut total = 0usize;
     for kv in attributes {
         let len = label_value_len(kv.value.as_ref())?;
         if len > 0 {
+            let matched = !rules.is_empty()
+                && rules
+                    .lookup_label(&sanitize_label_name(kv.key.clone()))
+                    .is_some();
+            let len = charged_len(matched, len);
             total = total.saturating_add(label_bytes(kv.key.len(), len));
         } else if reserved_slots {
             total = total.saturating_add(RESOLVED_LABEL_OVERHEAD_BYTES);
@@ -292,7 +326,7 @@ fn is_cumulative(temporality: i32) -> bool {
     )
 }
 
-fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usize {
+fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits, rules: &TenantRules) -> usize {
     let Some(data) = metric.data.as_ref() else {
         return 0;
     };
@@ -314,6 +348,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
             g.data_points.iter().map(|dp| dp.attributes.as_slice()),
             prefix.saturating_add(name_label),
             max_attrs,
+            rules,
         ),
         MetricData::Sum(s) => {
             if !is_cumulative(s.aggregation_temporality) {
@@ -323,6 +358,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 s.data_points.iter().map(|dp| dp.attributes.as_slice()),
                 prefix.saturating_add(name_label),
                 max_attrs,
+                rules,
             )
         }
         MetricData::ExponentialHistogram(h) => {
@@ -333,6 +369,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 h.data_points.iter().map(|dp| dp.attributes.as_slice()),
                 prefix.saturating_add(name_label),
                 max_attrs,
+                rules,
             )
         }
         MetricData::Histogram(h) => {
@@ -346,7 +383,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 {
                     continue;
                 }
-                let Some(attrs) = point_attribute_bytes(&dp.attributes, false) else {
+                let Some(attrs) = point_attribute_bytes(&dp.attributes, false, rules) else {
                     continue;
                 };
                 let per_series = prefix
@@ -365,7 +402,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 {
                     continue;
                 }
-                let Some(attrs) = point_attribute_bytes(&dp.attributes, false) else {
+                let Some(attrs) = point_attribute_bytes(&dp.attributes, false, rules) else {
                     continue;
                 };
                 let per_series = prefix
@@ -441,6 +478,7 @@ fn project_memo_run<'a>(
     points: impl Iterator<Item = &'a [KeyValue]>,
     base: usize,
     max_attrs: usize,
+    rules: &TenantRules,
 ) -> usize {
     let mut total = 0usize;
     let mut previous: Option<&[KeyValue]> = None;
@@ -452,7 +490,7 @@ fn project_memo_run<'a>(
             continue;
         }
         previous = Some(attributes);
-        if let Some(attrs) = point_attribute_bytes(attributes, true) {
+        if let Some(attrs) = point_attribute_bytes(attributes, true, rules) {
             total = total.saturating_add(base.saturating_add(attrs));
         }
     }
@@ -475,6 +513,7 @@ fn project_memo_run<'a>(
 pub fn project_log_resolved_label_bytes(
     req: &ExportLogsServiceRequest,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
 ) -> ProjectedLabelBytes {
     let mut total = 0usize;
     for rl in &req.resource_logs {
@@ -486,8 +525,8 @@ pub fn project_log_resolved_label_bytes(
         if resource_attributes.len() > limits.max_resource_attributes {
             continue;
         }
-        total = total.saturating_add(log_attrs_bytes(resource_attributes));
-        let resource_encoded = encoded_attrs_len(resource_attributes);
+        total = total.saturating_add(log_attrs_bytes(resource_attributes, rules));
+        let resource_encoded = encoded_attrs_len(resource_attributes, rules);
         for sl in &rl.scope_logs {
             let scope = sl.scope.as_ref();
             let scope_attributes = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
@@ -499,9 +538,9 @@ pub fn project_log_resolved_label_bytes(
             let stream_encoded = resource_encoded
                 .saturating_add(encoded_bytes_len(scope_name))
                 .saturating_add(encoded_bytes_len(scope_version))
-                .saturating_add(encoded_attrs_len(scope_attributes));
+                .saturating_add(encoded_attrs_len(scope_attributes, rules));
             total = total
-                .saturating_add(log_attrs_bytes(scope_attributes))
+                .saturating_add(log_attrs_bytes(scope_attributes, rules))
                 .saturating_add(stream_encoded);
             for record in &sl.log_records {
                 if record.attributes.len() > limits.max_attributes_per_record {
@@ -509,7 +548,7 @@ pub fn project_log_resolved_label_bytes(
                 }
                 total = total
                     .saturating_add(stream_encoded)
-                    .saturating_add(log_attrs_bytes(&record.attributes));
+                    .saturating_add(log_attrs_bytes(&record.attributes, rules));
             }
         }
     }
@@ -530,23 +569,39 @@ fn encoded_bytes_len(len: usize) -> usize {
 /// Length of `ravel_types::logstream::canonical_attr_bytes` over the
 /// converted `attributes`: an entry count, then per entry the length-prefixed
 /// key and the encoded value. An attribute whose value the converter rejects
-/// rejects the whole set, so counting it as encoded can only overcount.
-fn encoded_attrs_len(attributes: &[KeyValue]) -> usize {
+/// rejects the whole set, so counting it as encoded can only overcount. Logs
+/// match a rule by raw attribute key
+/// ([`TenantRules::lookup_raw`](ravel_ipcrypt::rules::TenantRules::lookup_raw)),
+/// and a matched non-empty string value is charged at
+/// [`TenantRules::max_stored_len`] (ADR-2993 decision 3): the stream preimage
+/// is built from attribute values after encryption, so a stream identity
+/// derived from an inflated-length ciphertext must be projected at that
+/// inflated length too.
+fn encoded_attrs_len(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
         .map(|kv| {
-            encoded_bytes_len(kv.key.len()).saturating_add(encoded_value_len(kv.value.as_ref(), 1))
+            let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+            encoded_bytes_len(kv.key.len())
+                .saturating_add(encoded_value_len(kv.value.as_ref(), 1, matched))
         })
         .fold(uvarint_len(attributes.len() as u64), usize::saturating_add)
 }
 
-fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
+fn encoded_value_len(value: Option<&AnyValue>, depth: usize, matched: bool) -> usize {
     if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
         return 0;
     }
     match value.and_then(|v| v.value.as_ref()) {
         None | Some(AnyValueVariant::StringValueStrindex(_)) => 0,
-        Some(AnyValueVariant::StringValue(s)) => 1usize.saturating_add(encoded_bytes_len(s.len())),
+        Some(AnyValueVariant::StringValue(s)) => {
+            let len = if matched && !s.is_empty() {
+                charged_len(true, s.len())
+            } else {
+                s.len()
+            };
+            1usize.saturating_add(encoded_bytes_len(len))
+        }
         Some(AnyValueVariant::BytesValue(b)) => 1usize.saturating_add(encoded_bytes_len(b.len())),
         Some(AnyValueVariant::IntValue(i)) => {
             let zigzag = ((*i << 1) ^ (*i >> 63)) as u64;
@@ -557,7 +612,7 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
         Some(AnyValueVariant::ArrayValue(array)) => array
             .values
             .iter()
-            .map(|v| encoded_value_len(Some(v), depth + 1))
+            .map(|v| encoded_value_len(Some(v), depth + 1, false))
             .fold(
                 1 + uvarint_len(array.values.len() as u64),
                 usize::saturating_add,
@@ -567,7 +622,7 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
             .iter()
             .map(|kv| {
                 encoded_bytes_len(kv.key.len())
-                    .saturating_add(encoded_value_len(kv.value.as_ref(), depth + 1))
+                    .saturating_add(encoded_value_len(kv.value.as_ref(), depth + 1, false))
             })
             .fold(
                 1 + uvarint_len(kvlist.values.len() as u64),
@@ -576,10 +631,15 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
     }
 }
 
-fn log_attrs_bytes(attributes: &[KeyValue]) -> usize {
+/// Matches [`encoded_attrs_len`]'s raw-key rule lookup for the stored
+/// (non-preimage) copy of the same attributes.
+fn log_attrs_bytes(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
-        .map(|kv| label_bytes(kv.key.len(), log_value_payload(kv.value.as_ref(), 1)))
+        .map(|kv| {
+            let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+            label_bytes(kv.key.len(), log_value_payload(kv.value.as_ref(), 1, matched))
+        })
         .fold(0usize, usize::saturating_add)
 }
 
@@ -588,8 +648,10 @@ fn log_attrs_bytes(attributes: &[KeyValue]) -> usize {
 /// every list element or map entry one more overhead plus its own payload
 /// (and, for a map entry, its key). A value nested past
 /// [`MAX_ATTRIBUTE_NESTING_DEPTH`] is rejected by the converter, so the walk
-/// stops there.
-fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
+/// stops there. `matched` charges a non-empty top-level string value at
+/// [`TenantRules::max_stored_len`]; nested values are never independently
+/// rule-matched.
+fn log_value_payload(value: Option<&AnyValue>, depth: usize, matched: bool) -> usize {
     if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
         return 0;
     }
@@ -599,12 +661,18 @@ fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
         | Some(AnyValueVariant::IntValue(_))
         | Some(AnyValueVariant::DoubleValue(_))
         | Some(AnyValueVariant::StringValueStrindex(_)) => 0,
-        Some(AnyValueVariant::StringValue(s)) => s.len(),
+        Some(AnyValueVariant::StringValue(s)) => {
+            if matched && !s.is_empty() {
+                charged_len(true, s.len())
+            } else {
+                s.len()
+            }
+        }
         Some(AnyValueVariant::BytesValue(b)) => b.len(),
         Some(AnyValueVariant::ArrayValue(array)) => array
             .values
             .iter()
-            .map(|v| label_bytes(0, log_value_payload(Some(v), depth + 1)))
+            .map(|v| label_bytes(0, log_value_payload(Some(v), depth + 1, false)))
             .fold(0usize, usize::saturating_add),
         Some(AnyValueVariant::KvlistValue(kvlist)) => kvlist
             .values
@@ -612,7 +680,7 @@ fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
             .map(|kv| {
                 label_bytes(
                     kv.key.len(),
-                    log_value_payload(kv.value.as_ref(), depth + 1),
+                    log_value_payload(kv.value.as_ref(), depth + 1, false),
                 )
             })
             .fold(0usize, usize::saturating_add),
@@ -633,6 +701,7 @@ fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
 pub fn project_span_resolved_label_bytes(
     req: &ExportTraceServiceRequest,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
 ) -> ProjectedLabelBytes {
     let mut total = 0usize;
     for rs in &req.resource_spans {
@@ -644,7 +713,7 @@ pub fn project_span_resolved_label_bytes(
         if resource_attributes.len() > limits.max_resource_attributes {
             continue;
         }
-        let resource_part = span_attrs_bytes(resource_attributes);
+        let resource_part = span_attrs_bytes(resource_attributes, rules);
         total = total.saturating_add(resource_part);
         for ss in &rs.scope_spans {
             let scope = ss.scope.as_ref();
@@ -652,7 +721,7 @@ pub fn project_span_resolved_label_bytes(
             if scope_attributes.len() > limits.max_scope_attributes {
                 continue;
             }
-            let mut scope_part = span_attrs_bytes(scope_attributes);
+            let mut scope_part = span_attrs_bytes(scope_attributes, rules);
             if let Some(scope) = scope {
                 if !scope.name.is_empty() {
                     scope_part = scope_part
@@ -673,7 +742,7 @@ pub fn project_span_resolved_label_bytes(
                 }
                 total = total
                     .saturating_add(inherited)
-                    .saturating_add(span_attrs_bytes(&span.attributes))
+                    .saturating_add(span_attrs_bytes(&span.attributes, rules))
                     .saturating_add(reserved_attrs_bytes(span, limits));
             }
         }
@@ -681,10 +750,18 @@ pub fn project_span_resolved_label_bytes(
     ProjectedLabelBytes(total)
 }
 
-fn span_attrs_bytes(attributes: &[KeyValue]) -> usize {
+/// Spans match a rule by raw attribute key
+/// ([`TenantRules::lookup_raw`](ravel_ipcrypt::rules::TenantRules::lookup_raw)),
+/// same as logs. A matched non-empty converted value is charged at
+/// [`TenantRules::max_stored_len`] (ADR-2993 decision 3).
+fn span_attrs_bytes(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
-        .map(|kv| label_bytes(kv.key.len(), span_value_len(kv.value.as_ref())))
+        .map(|kv| {
+            let len = span_value_len(kv.value.as_ref());
+            let matched = len > 0 && !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+            label_bytes(kv.key.len(), charged_len(matched, len))
+        })
         .fold(0usize, usize::saturating_add)
 }
 
@@ -832,11 +909,15 @@ mod tests {
                 AttrValue::Map(vec![("k".to_string(), AttrValue::Str("v".into()))]),
             ),
         ];
+        let rules = TenantRules::none();
         assert_eq!(
-            encoded_attrs_len(&attributes),
+            encoded_attrs_len(&attributes, &rules),
             canonical_attr_bytes(&converted).len()
         );
-        assert_eq!(encoded_attrs_len(&[]), canonical_attr_bytes(&[]).len());
+        assert_eq!(
+            encoded_attrs_len(&[], &rules),
+            canonical_attr_bytes(&[]).len()
+        );
         for v in [0u64, 127, 128, 16_383, 16_384, u64::MAX] {
             let mut n = v;
             let mut expected = 1;

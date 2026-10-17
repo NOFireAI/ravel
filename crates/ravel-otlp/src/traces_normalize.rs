@@ -44,12 +44,22 @@
 //!
 //! Nothing here panics for malformed or oversized input: every problem becomes
 //! a [`SpanRejection`] so the caller can build an OTLP partial-success response.
+//!
+//! Every entry point takes a [`TenantRules`](ravel_ipcrypt::rules::TenantRules)
+//! (ADR-2993 decision 3), matched by the raw attribute key as sent, same
+//! convention as [`crate::logs_normalize`]. A matching resource, scope, or
+//! span attribute is encrypted in [`convert_attr`] before the value-length
+//! check; spans have no stream identity, so there is no identity computation
+//! for it to precede. A tenant with no matching rule, or
+//! [`TenantRules::none()`], leaves every value unchanged.
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
+use ravel_ipcrypt::rules::TenantRules;
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_rspan::{StatusCode, merge_attrs};
 
 use crate::label_projection::{ProjectedLabelBytes, exact_capacity};
@@ -119,6 +129,10 @@ pub struct NormalizedSpan {
 pub struct SpanNormalizeOutput {
     pub spans: Vec<NormalizedSpan>,
     pub rejected: Vec<SpanRejection>,
+    /// Per-variant, per-outcome counts of every IPCrypt encryption this
+    /// request's attributes went through (ADR-2993 decision 3). Empty when
+    /// `rules` matched nothing, including [`TenantRules::none()`].
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Decode and normalize spans from `req`.
@@ -133,20 +147,22 @@ pub struct SpanNormalizeOutput {
 pub fn normalize_traces(
     req: ExportTraceServiceRequest,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> SpanNormalizeOutput {
-    let projected = crate::label_projection::project_span_resolved_label_bytes(&req, limits);
-    normalize_traces_projected(req, limits, ingest_ts_ns, projected)
+    let projected = crate::label_projection::project_span_resolved_label_bytes(&req, limits, rules);
+    normalize_traces_projected(req, limits, rules, ingest_ts_ns, projected)
 }
 
 /// [`normalize_traces`] for a caller that already projected `req` with
-/// [`crate::project_span_resolved_label_bytes`] under the same `limits`, so
-/// the request is walked once. `projected` is checked against
+/// [`crate::project_span_resolved_label_bytes`] under the same `limits` and
+/// `rules`, so the request is walked once. `projected` is checked against
 /// `max_resolved_label_bytes_per_request` exactly as the plain entry point
 /// checks its own projection.
 pub fn normalize_traces_projected(
     req: ExportTraceServiceRequest,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     projected: ProjectedLabelBytes,
 ) -> SpanNormalizeOutput {
@@ -158,6 +174,7 @@ pub fn normalize_traces_projected(
                 count: total_spans,
                 max: limits.max_spans_per_request,
             }],
+            ipcrypt_tally: IpcryptTally::new(),
         };
     }
 
@@ -173,28 +190,37 @@ pub fn normalize_traces_projected(
                 max: limits.max_resolved_label_bytes_per_request,
                 count: total_spans,
             }],
+            ipcrypt_tally: IpcryptTally::new(),
         };
     }
 
     let mut spans = Vec::new();
     let mut rejected = Vec::new();
+    let mut tally = IpcryptTally::new();
     for rs in &req.resource_spans {
-        normalize_resource(rs, limits, ingest_ts_ns, &mut spans, &mut rejected);
+        normalize_resource(rs, limits, rules, ingest_ts_ns, &mut spans, &mut rejected, &mut tally);
     }
 
-    SpanNormalizeOutput { spans, rejected }
+    SpanNormalizeOutput {
+        spans,
+        rejected,
+        ipcrypt_tally: tally,
+    }
 }
 
 fn resource_span_count(rs: &ResourceSpans) -> usize {
     rs.scope_spans.iter().map(|ss| ss.spans.len()).sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_resource(
     rs: &ResourceSpans,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     spans: &mut Vec<NormalizedSpan>,
     rejected: &mut Vec<SpanRejection>,
+    tally: &mut IpcryptTally,
 ) {
     let resource_span_count = resource_span_count(rs);
     if resource_span_count == 0 {
@@ -220,20 +246,23 @@ fn normalize_resource(
     // Converted once per resource and reported once, not once per span under
     // it: see the module docs on why an unconvertible resource attribute does
     // not reject the spans the way the logs path does.
-    let resource_attrs = convert_attrs_lossy(resource_attributes, limits, rejected);
+    let resource_attrs = convert_attrs_lossy(resource_attributes, limits, rules, tally, rejected);
 
     for ss in &rs.scope_spans {
-        normalize_scope(ss, &resource_attrs, limits, ingest_ts_ns, spans, rejected);
+        normalize_scope(ss, &resource_attrs, limits, rules, ingest_ts_ns, spans, rejected, tally);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_scope(
     ss: &ScopeSpans,
     resource_attrs: &[(String, String)],
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     spans: &mut Vec<NormalizedSpan>,
     rejected: &mut Vec<SpanRejection>,
+    tally: &mut IpcryptTally,
 ) {
     let scope_span_count = ss.spans.len();
     if scope_span_count == 0 {
@@ -253,7 +282,7 @@ fn normalize_scope(
         return;
     }
 
-    let mut scope_attrs = convert_attrs_lossy(scope_attributes, limits, rejected);
+    let mut scope_attrs = convert_attrs_lossy(scope_attributes, limits, rules, tally, rejected);
     // The instrumentation scope's own name and version are attributes here
     // rather than part of an identity blob (spans have no stream identity), so
     // they follow OTel's own `otel.scope.*` convention. Empty values are not
@@ -271,7 +300,7 @@ fn normalize_scope(
     scope_attrs.shrink_to_fit();
 
     for span in &ss.spans {
-        match normalize_span(span, resource_attrs, &scope_attrs, limits, ingest_ts_ns) {
+        match normalize_span(span, resource_attrs, &scope_attrs, limits, rules, ingest_ts_ns, tally) {
             Ok((normalized, dropped)) => {
                 spans.push(normalized);
                 rejected.extend(dropped);
@@ -284,12 +313,15 @@ fn normalize_scope(
 /// Normalize one span. `Err` drops the whole span; `Ok`'s second element
 /// carries rejections for attributes (or blobs) dropped from an otherwise
 /// admitted span.
+#[allow(clippy::too_many_arguments)]
 fn normalize_span(
     span: &Span,
     resource_attrs: &[(String, String)],
     scope_attrs: &[(String, String)],
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
+    tally: &mut IpcryptTally,
 ) -> Result<(NormalizedSpan, Vec<SpanRejection>), SpanRejection> {
     if span.attributes.len() > limits.max_attributes_per_span {
         return Err(SpanRejection::TooManyAttributes {
@@ -367,7 +399,7 @@ fn normalize_span(
         }
     };
 
-    let span_attrs = convert_attrs_lossy(&span.attributes, limits, &mut dropped);
+    let span_attrs = convert_attrs_lossy(&span.attributes, limits, rules, tally, &mut dropped);
     let mut merged = merge_attrs(resource_attrs, scope_attrs, &span_attrs);
     // A sender's own attribute under one of the reserved keys must never
     // survive, whether or not the span's real field is present: leaving it
@@ -555,11 +587,13 @@ fn checked_span_interval(
 fn convert_attrs_lossy(
     attributes: &[KeyValue],
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     rejected: &mut Vec<SpanRejection>,
 ) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(attributes.len());
     for kv in attributes {
-        match convert_attr(kv, limits) {
+        match convert_attr(kv, limits, rules, tally) {
             Ok(attr) => out.push(attr),
             Err(reason) => rejected.push(reason),
         }
@@ -567,9 +601,29 @@ fn convert_attrs_lossy(
     out
 }
 
+/// Encrypt `value` in place when `rules` matches `key` by raw key (ADR-2993
+/// decision 1: traces match attributes as sent, unlike metrics' sanitized
+/// label names). Runs before the value-length check in [`convert_attr`] so
+/// limits see the stored (possibly encrypted) length, per decision 3.
+fn apply_ipcrypt(rules: &TenantRules, tally: &mut IpcryptTally, key: &str, value: String) -> String {
+    if value.is_empty() {
+        return value;
+    }
+    let Some(info) = rules.lookup_raw(key) else {
+        return value;
+    };
+    let Some((rendered, outcome)) = rules.apply(info.raw_key, &value) else {
+        return value;
+    };
+    tally.record(info.variant, outcome);
+    rendered
+}
+
 fn convert_attr(
     kv: &KeyValue,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(String, String), SpanRejection> {
     if kv.key.len() > limits.max_attribute_key_len {
         return Err(SpanRejection::AttributeKeyTooLong {
@@ -578,6 +632,7 @@ fn convert_attr(
         });
     }
     let value = convert_value(&kv.key, kv.value.as_ref())?;
+    let value = apply_ipcrypt(rules, tally, &kv.key, value);
     if value.len() > limits.max_attribute_value_len {
         return Err(SpanRejection::AttributeValueTooLong {
             len: value.len(),

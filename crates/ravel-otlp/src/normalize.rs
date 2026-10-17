@@ -55,6 +55,18 @@
 //! This matches the letter of the OTel-to-Prometheus convention and is
 //! intentional, not an oversight; callers who need collision-free names
 //! for adversarial input should pre-validate before calling in.
+//!
+//! Every entry point takes the tenant's resolved [`TenantRules`] as a
+//! required parameter (ADR-2993 decision 3, issue #3047): a value is
+//! encrypted, when a rule matches the label it will be stored under, before
+//! that label is pushed, which is before `LabelSet::new`/`SeriesId::compute`
+//! run on it, before the label's length is checked against
+//! `IngestLimits`, and before an exemplar's filtered attributes are stored.
+//! Matching is by sanitized label name (`TenantRules::lookup_label`), not by
+//! the raw OTLP key: `job` and `instance` are matched under those literal
+//! names, not under `service.name`/`service.instance.id`. A tenant with no
+//! configured rules ([`TenantRules::none`]) produces byte-identical output to
+//! before this parameter existed.
 
 use std::sync::Arc;
 
@@ -70,6 +82,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
     SummaryDataPoint, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use ravel_ipcrypt::rules::TenantRules;
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_segment::{HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::{
     Exemplar, ExemplarCap, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId,
@@ -164,6 +178,10 @@ pub struct NormalizedExemplar {
 pub struct MetricsNormalizeResult {
     pub output: NormalizeOutput,
     pub exemplars: Vec<NormalizedExemplar>,
+    /// Per-(variant, outcome) counts of every value a rule in the caller's
+    /// `TenantRules` matched during this call (ADR-2993 decision 3). Empty
+    /// when the rule set is empty or matched nothing.
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Decode and normalize gauge and sum data points from `req`, discarding any
@@ -184,10 +202,12 @@ pub fn normalize_metrics(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> NormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    let result = normalize_metrics_with_exemplars(tenant, req, limits, ingest_ts_ns, &mut cap);
+    let result =
+        normalize_metrics_with_exemplars(tenant, req, limits, rules, ingest_ts_ns, &mut cap);
     let mut output = result.output;
     // The cap admitted these, but this entry point has nowhere to store them and
     // discards them. A discarded admission is still a dropped exemplar and must
@@ -217,14 +237,16 @@ pub fn normalize_metrics_with_exemplars(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
-    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits, rules);
     normalize_impl(
         tenant,
         req,
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         projected,
@@ -250,14 +272,16 @@ pub fn normalize_metrics_with_metadata(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
-    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits, rules);
     normalize_metrics_with_metadata_projected(
         tenant,
         req,
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         projected,
@@ -273,6 +297,7 @@ pub fn normalize_metrics_with_metadata_projected(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     projected: ProjectedLabelBytes,
@@ -282,6 +307,7 @@ pub fn normalize_metrics_with_metadata_projected(
         tenant,
         req,
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         projected,
@@ -299,6 +325,7 @@ fn normalize_impl(
     tenant: &TenantId,
     mut req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     projected: ProjectedLabelBytes,
@@ -356,18 +383,21 @@ fn normalize_impl(
     let mut histogram_points = Vec::new();
     let mut rejected = Vec::new();
     let mut exemplars = Vec::new();
+    let mut tally = IpcryptTally::new();
 
     for rm in &mut req.resource_metrics {
         normalize_resource(
             tenant,
             rm,
             limits,
+            rules,
             ingest_ts_ns,
             exemplar_cap,
             &mut points,
             &mut histogram_points,
             &mut exemplars,
             &mut rejected,
+            &mut tally,
             metadata_out.as_deref_mut(),
         );
     }
@@ -379,6 +409,7 @@ fn normalize_impl(
             rejected,
         },
         exemplars,
+        ipcrypt_tally: tally,
     }
 }
 
@@ -408,6 +439,7 @@ fn whole_request_rejection(
             rejected,
         },
         exemplars: Vec::new(),
+        ipcrypt_tally: IpcryptTally::new(),
     }
 }
 
@@ -508,18 +540,20 @@ fn normalize_resource(
     tenant: &TenantId,
     rm: &mut ResourceMetrics,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
     exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
+    tally: &mut IpcryptTally,
     mut metadata_out: Option<&mut MetadataCollector>,
 ) {
     let resource_point_count = resource_metrics_point_count(rm);
     let attrs = resource_attr_pairs(rm.resource.as_ref());
     let Some(resource_labels) =
-        admit_resource_labels(&attrs, resource_point_count, limits, rejected)
+        admit_resource_labels(&attrs, resource_point_count, limits, rejected, rules, tally)
     else {
         return;
     };
@@ -534,12 +568,14 @@ fn normalize_resource(
                 metric,
                 &resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
                 exemplar_cap,
                 points,
                 histogram_points,
                 exemplars,
                 rejected,
+                tally,
                 metadata_out.as_deref_mut(),
             );
         }
@@ -552,12 +588,14 @@ fn normalize_metric(
     metric: &mut Metric,
     resource_labels: &[Label],
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
     exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
+    tally: &mut IpcryptTally,
     metadata_out: Option<&mut MetadataCollector>,
 ) {
     let point_count = metric_data_point_count(metric);
@@ -598,13 +636,14 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
                 is_sum: false,
                 is_monotonic: false,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut gauge.data_points {
-                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars, tally) {
                     Ok((p, info)) => {
                         points.push(p);
                         rejected.extend(info);
@@ -627,13 +666,14 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
                 is_sum: true,
                 is_monotonic: sum.is_monotonic,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut sum.data_points {
-                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars, tally) {
                     Ok((p, info)) => {
                         points.push(p);
                         rejected.extend(info);
@@ -656,11 +696,12 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut h.data_points {
-                match explode_histogram(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match explode_histogram(&ctx, dp, &mut memo, exemplar_cap, exemplars, tally) {
                     Ok((mut new_points, informational)) => {
                         points.append(&mut new_points);
                         rejected.extend(informational);
@@ -683,11 +724,13 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut h.data_points {
-                match build_native_histogram_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match build_native_histogram_point(&ctx, dp, &mut memo, exemplar_cap, exemplars, tally)
+                {
                     Ok((p, informational)) => {
                         histogram_points.push(p);
                         rejected.extend(informational);
@@ -702,11 +745,12 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut s.data_points {
-                match explode_summary(&ctx, dp, &mut memo) {
+                match explode_summary(&ctx, dp, &mut memo, tally) {
                     Ok(mut new_points) => points.append(&mut new_points),
                     Err(r) => rejected.push(r),
                 }
@@ -738,6 +782,7 @@ struct ExplodeContext<'a> {
     metric_name: &'a str,
     resource_labels: &'a [Label],
     limits: &'a IngestLimits,
+    rules: &'a TenantRules,
     ingest_ts_ns: i64,
 }
 
@@ -748,6 +793,7 @@ struct PointContext<'a> {
     metric_name: &'a str,
     resource_labels: &'a [Label],
     limits: &'a IngestLimits,
+    rules: &'a TenantRules,
     ingest_ts_ns: i64,
     is_sum: bool,
     is_monotonic: bool,
@@ -761,6 +807,7 @@ struct NativeHistogramContext<'a> {
     metric_name: &'a str,
     resource_labels: &'a [Label],
     limits: &'a IngestLimits,
+    rules: &'a TenantRules,
     ingest_ts_ns: i64,
 }
 
@@ -1005,6 +1052,7 @@ fn int_survives_f64(v: i64) -> bool {
 /// one series' window, whichever series that turns out to be) this is what
 /// makes "keep the newest" hold even when a single data point carries
 /// several exemplars for the same window.
+#[allow(clippy::too_many_arguments)]
 fn admit_exemplars<F>(
     dp_exemplars: Vec<OtlpExemplar>,
     limits: &IngestLimits,
@@ -1012,6 +1060,8 @@ fn admit_exemplars<F>(
     series_id_for: F,
     exemplars_out: &mut Vec<NormalizedExemplar>,
     informational: &mut Vec<Rejection>,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) where
     F: Fn(&Exemplar) -> SeriesId,
 {
@@ -1023,7 +1073,7 @@ fn admit_exemplars<F>(
     let mut candidates = Vec::with_capacity(capacity);
     let mut dropped = 0usize;
     for ex in dp_exemplars {
-        match decode_exemplar(ex, limits) {
+        match decode_exemplar(ex, limits, rules, tally) {
             Some(e) => candidates.push(e),
             None => dropped += 1,
         }
@@ -1060,7 +1110,12 @@ fn admit_exemplars<F>(
 /// exemplar (see [`parse_id`]), and an unparsable filtered-attribute value is
 /// skipped rather than failing the exemplar, since filtered attributes are
 /// informational context, not part of series identity.
-fn decode_exemplar(ex: OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar> {
+fn decode_exemplar(
+    ex: OtlpExemplar,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+) -> Option<Exemplar> {
     let value_bits = match ex.value {
         Some(OtlpExemplarValue::AsDouble(v)) => v.to_bits(),
         Some(OtlpExemplarValue::AsInt(v)) => (v as f64).to_bits(),
@@ -1082,6 +1137,7 @@ fn decode_exemplar(ex: OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar> 
     {
         let value = any_value_to_label_value(attr.value.as_ref()).unwrap_or_default();
         let name = sanitize_label_name(attr.key);
+        let value = apply_ipcrypt(rules, tally, &name, value);
         filtered_attributes.push(Label { name, value });
     }
 
@@ -1111,12 +1167,14 @@ fn parse_id<const N: usize>(bytes: &[u8]) -> [u8; N] {
 /// that were malformed or lost the per-series admission cap. The point is
 /// admitted either way; the rounding is unavoidable given `f64`-only storage,
 /// so it is surfaced, not rejected.
+#[allow(clippy::too_many_arguments)]
 fn build_point(
     ctx: &PointContext,
     dp: &mut NumberDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
+    tally: &mut IpcryptTally,
 ) -> Result<(NormalizedPoint, Vec<Rejection>), Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -1166,7 +1224,7 @@ fn build_point(
                 METRIC_NAME_LABEL.to_string(),
                 ctx.metric_name.to_string(),
             ));
-            push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            push_attribute_labels(&mut labels, attributes, ctx.limits, ctx.rules, tally)?;
             #[cfg(test)]
             label_capacity_stats::record(&labels, labels.capacity());
             LabelSet::new(labels).map_err(|err| match err {
@@ -1187,6 +1245,8 @@ fn build_point(
         |_| series_id,
         exemplars_out,
         &mut informational,
+        ctx.rules,
+        tally,
     );
 
     Ok((
@@ -1210,12 +1270,14 @@ fn build_point(
 /// deliberately out of scope, unlike exemplars, which this function does
 /// carry, admitted through the same per-series cap as every other point
 /// type).
+#[allow(clippy::too_many_arguments)]
 fn build_native_histogram_point(
     ctx: &NativeHistogramContext,
     dp: &mut ExponentialHistogramDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
+    tally: &mut IpcryptTally,
 ) -> Result<(NormalizedHistogramPoint, Vec<Rejection>), Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -1240,7 +1302,7 @@ fn build_native_histogram_point(
                 METRIC_NAME_LABEL.to_string(),
                 ctx.metric_name.to_string(),
             ));
-            push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            push_attribute_labels(&mut labels, attributes, ctx.limits, ctx.rules, tally)?;
             #[cfg(test)]
             label_capacity_stats::record(&labels, labels.capacity());
             LabelSet::new(labels).map_err(|err| match err {
@@ -1261,6 +1323,8 @@ fn build_native_histogram_point(
         |_| series_id,
         exemplars_out,
         &mut informational,
+        ctx.rules,
+        tally,
     );
 
     Ok((
@@ -1436,17 +1500,38 @@ fn checked_event_ts(
     Ok(event_ts_ns)
 }
 
+/// Encrypt `value` under `rules`' matching rule for the label it is about to
+/// be stored as, recording the outcome in `tally` (ADR-2993 decision 3).
+/// `name` must already be the label's final stored name: metrics match a
+/// rule by sanitized label name
+/// ([`TenantRules::lookup_label`](ravel_ipcrypt::rules::TenantRules::lookup_label)),
+/// not by the raw OTLP attribute key, so `job` and `instance` are matched
+/// under those literal names. A tenant with no matching rule, or no rules at
+/// all, returns `value` unchanged.
+fn apply_ipcrypt(rules: &TenantRules, tally: &mut IpcryptTally, name: &str, value: String) -> String {
+    let Some(info) = rules.lookup_label(name) else {
+        return value;
+    };
+    let Some((rendered, outcome)) = rules.apply(info.raw_key, &value) else {
+        return value;
+    };
+    tally.record(info.variant, outcome);
+    rendered
+}
+
 /// Sanitize and push each attribute as a label, checking the same
 /// name/value length limits applied to every other label.
 fn push_attribute_labels(
     labels: &mut Vec<Label>,
     attributes: Vec<KeyValue>,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(), Rejection> {
     for attr in attributes {
         let value = any_value_to_label_value(attr.value.as_ref())?;
         let name = sanitize_label_name(attr.key);
-        push_checked(labels, name, value, limits)?;
+        push_checked(labels, name, value, limits, rules, tally)?;
     }
     Ok(())
 }
@@ -1458,6 +1543,7 @@ fn push_attribute_labels(
 fn build_explode_base_labels(
     ctx: &ExplodeContext,
     attributes: Vec<KeyValue>,
+    tally: &mut IpcryptTally,
 ) -> Result<Vec<Label>, Rejection> {
     if attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -1467,13 +1553,14 @@ fn build_explode_base_labels(
     }
     let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len());
     labels.extend_from_slice(ctx.resource_labels);
-    push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+    push_attribute_labels(&mut labels, attributes, ctx.limits, ctx.rules, tally)?;
     Ok(labels)
 }
 
 /// Finish one exploded series: attach `__name__` and an optional `le`/
 /// `quantile` label to the shared base labels, then build the label set and
 /// resolve its series id exactly like [`build_point`] does for gauge/sum.
+#[allow(clippy::too_many_arguments)]
 fn finish_point(
     ctx: &ExplodeContext,
     memo: &mut SeriesIdMemo,
@@ -1482,6 +1569,7 @@ fn finish_point(
     extra_label: Option<(&'static str, String)>,
     ts_ns: i64,
     value: f64,
+    tally: &mut IpcryptTally,
 ) -> Result<NormalizedPoint, Rejection> {
     let mut labels = Vec::with_capacity(base_labels.len() + 2);
     labels.extend_from_slice(base_labels);
@@ -1490,7 +1578,7 @@ fn finish_point(
         metric_name.to_string(),
     ));
     if let Some((name, value)) = extra_label {
-        push_checked(&mut labels, name.to_string(), value, ctx.limits)?;
+        push_checked(&mut labels, name.to_string(), value, ctx.limits, ctx.rules, tally)?;
     }
 
     #[cfg(test)]
@@ -1531,12 +1619,14 @@ fn finish_point(
 /// smallest one at or above the exemplar's value (falling back to `+Inf`),
 /// matching Prometheus's own bucket-exemplar convention, then is admitted
 /// through the same per-series cap as every other point type.
+#[allow(clippy::too_many_arguments)]
 fn explode_histogram(
     ctx: &ExplodeContext,
     dp: &mut HistogramDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
+    tally: &mut IpcryptTally,
 ) -> Result<(Vec<NormalizedPoint>, Vec<Rejection>), Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
@@ -1564,7 +1654,7 @@ fn explode_histogram(
         });
     }
 
-    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
+    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes), tally)?;
     let stale = has_no_recorded_value(dp.flags);
     let bucket_name = format!("{}_bucket", ctx.metric_name);
 
@@ -1587,6 +1677,7 @@ fn explode_histogram(
             Some(("le", format_float(*bound))),
             event_ts_ns,
             value,
+            tally,
         )?);
     }
 
@@ -1601,6 +1692,7 @@ fn explode_histogram(
         Some(("le", "+Inf".to_string())),
         event_ts_ns,
         count_value,
+        tally,
     )?);
 
     if let Some(sum) = dp.sum {
@@ -1614,6 +1706,7 @@ fn explode_histogram(
             None,
             event_ts_ns,
             sum_value,
+            tally,
         )?);
     }
 
@@ -1626,6 +1719,7 @@ fn explode_histogram(
         None,
         event_ts_ns,
         count_value,
+        tally,
     )?);
 
     let mut informational = Vec::new();
@@ -1650,6 +1744,8 @@ fn explode_histogram(
         },
         exemplars_out,
         &mut informational,
+        ctx.rules,
+        tally,
     );
 
     Ok((series, informational))
@@ -1675,6 +1771,7 @@ fn explode_summary(
     ctx: &ExplodeContext,
     dp: &mut SummaryDataPoint,
     memo: &mut SeriesIdMemo,
+    tally: &mut IpcryptTally,
 ) -> Result<Vec<NormalizedPoint>, Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
@@ -1696,7 +1793,7 @@ fn explode_summary(
         });
     }
 
-    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
+    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes), tally)?;
     let stale = has_no_recorded_value(dp.flags);
 
     let mut series = Vec::with_capacity(dp.quantile_values.len() + 2);
@@ -1710,6 +1807,7 @@ fn explode_summary(
             Some(("quantile", format_float(qv.quantile))),
             event_ts_ns,
             value,
+            tally,
         )?);
     }
 
@@ -1723,6 +1821,7 @@ fn explode_summary(
         None,
         event_ts_ns,
         sum_value,
+        tally,
     )?);
 
     let count_value = if stale { stale_nan() } else { dp.count as f64 };
@@ -1735,6 +1834,7 @@ fn explode_summary(
         None,
         event_ts_ns,
         count_value,
+        tally,
     )?);
 
     Ok(series)
@@ -1821,11 +1921,14 @@ pub(crate) fn resource_attr_pairs(
 /// [`Rejection::ResourceAttributesDropped`]). Returns the label prefix, or
 /// `None` when every point under the resource is rejected. A resource with no
 /// points is skipped without a rejection.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_resource_labels(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     point_count: usize,
     limits: &IngestLimits,
     rejected: &mut Vec<Rejection>,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Option<Vec<Label>> {
     if point_count == 0 {
         return None;
@@ -1837,7 +1940,7 @@ pub fn admit_resource_labels(
         });
         return None;
     }
-    match build_resource_labels_from(attrs, limits) {
+    match build_resource_labels_from(attrs, limits, rules, tally) {
         Ok((labels, dropped)) => {
             if dropped > 0 {
                 rejected.push(Rejection::ResourceAttributesDropped { count: dropped });
@@ -1877,6 +1980,8 @@ pub fn admit_resource_labels(
 pub fn build_resource_labels_from(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(Vec<Label>, usize), Rejection> {
     let mut labels = Vec::new();
 
@@ -1888,11 +1993,11 @@ pub fn build_resource_labels_from(
             Some(ns) if !ns.is_empty() => format!("{ns}/{name}"),
             _ => name,
         };
-        push_checked(&mut labels, "job".to_string(), job, limits)?;
+        push_checked(&mut labels, "job".to_string(), job, limits, rules, tally)?;
     }
 
     if let Some(instance) = find_attr_value(attrs, "service.instance.id")? {
-        push_checked(&mut labels, "instance".to_string(), instance, limits)?;
+        push_checked(&mut labels, "instance".to_string(), instance, limits, rules, tally)?;
     }
 
     for key in &limits.resource_attribute_allowlist {
@@ -1906,7 +2011,14 @@ pub fn build_resource_labels_from(
             // `key` is borrowed from the long-lived allowlist config, so it
             // cannot be moved; clone it to feed the by-value sanitiser. This is
             // once per resource attribute, not per data point.
-            push_checked(&mut labels, sanitize_label_name(key.clone()), value, limits)?;
+            push_checked(
+                &mut labels,
+                sanitize_label_name(key.clone()),
+                value,
+                limits,
+                rules,
+                tally,
+            )?;
         }
     }
 
@@ -1941,11 +2053,14 @@ pub fn build_resource_labels_from(
 /// influenced (`service.namespace`/`service.name` are free-form strings) and
 /// its value is a `format!` join, so it must be checked after joining, not
 /// before: two under-limit halves can still produce an over-limit label.
+#[allow(clippy::too_many_arguments)]
 fn push_checked(
     labels: &mut Vec<Label>,
     name: String,
     value: String,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(), Rejection> {
     // ADR-0038: a label with an empty value is treated as absent from the
     // series, matching Prometheus convention and what ravel-remote-write
@@ -1962,6 +2077,9 @@ fn push_checked(
             max: limits.max_label_name_len,
         });
     }
+    // ADR-2993 decision 3: encrypt before the value-length check, so the
+    // limit sees the length of the bytes actually stored.
+    let value = apply_ipcrypt(rules, tally, &name, value);
     if value.len() > limits.max_label_value_len {
         return Err(Rejection::LabelValueTooLong {
             len: value.len(),

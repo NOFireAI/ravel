@@ -10,6 +10,9 @@ description = "Prometheus Remote Write ingest: RW1 protobuf decode, snappy block
 ravel-types = { workspace = true }
 ravel-otlp = { workspace = true }
 ravel-segment = { workspace = true }
+# Per-tenant IPCrypt rule set applied inside normalization (ADR-2993 decision
+# 3, issue #3047).
+ravel-ipcrypt = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 hex = { workspace = true }
