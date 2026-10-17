@@ -238,3 +238,34 @@
   binds: []
   status: not-implemented
   note: "services/ravel-cli/src/sql_explain.rs builds its SqlExecutor without with_parquet_sources, and SqlExecutor::resolve_parquet_target returns Ok(None) when no sources are installed. The capability would arrive as a call site, not a new definition, so there is no symbol to bind."
+
+# --- ADR-2904 interim refusals (issue #2910) --------------------------------
+
+- id: query-engine-cross-signal-interim-refusals
+  doc: docs/query-engine.md
+  quote: "saying they are not supported yet"
+  kind: negative
+  binds:
+    - crates/ravel-sql/src/cross_signal_tests.rs::a_token_on_a_two_signal_statement_is_refused_before_listing
+    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_table_beside_parquet_is_refused_before_listing
+  status: verified
+  note: "SqlError::CommitTokenAcrossSignals and SqlError::SignalBesideParquet are the two refusals; enum variants are not definitions under the BIND resolver, so the entry binds the tests that pin each refusal before any signal catalog listing. Tickets T4 (#2911) and T7 (#2914) lift them."
+
+- id: guide-query-token-across-signals-refused
+  doc: docs/guides/query.md
+  quote: "that names two or more of the five is not supported yet and gets an HTTP 400"
+  kind: negative
+  binds:
+    - services/ravel-server/tests/sql_endpoint.rs::a_min_commit_token_on_a_two_signal_statement_is_a_bad_request
+    - crates/ravel-sql/src/cross_signal_tests.rs::a_token_on_a_two_signal_statement_is_refused_before_listing
+  status: verified
+  note: "The HTTP test pins the 400 and its message; the crate test pins that every HTTP entry point refuses before any catalog request. Ticket T4 (#2911) adds the table-qualified token."
+
+- id: guide-query-signal-beside-parquet-refused
+  doc: docs/guides/query.md
+  quote: "five beside a Parquet table is not supported yet either"
+  kind: negative
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_table_beside_parquet_is_refused_before_listing
+  status: verified
+  note: "The test pins SqlError::SignalBesideParquet after the Parquet manifest reads and before any signal catalog listing. Ticket T7 (#2914) lifts it."

@@ -368,8 +368,8 @@ gain.
   rejection, are enumerated and scored in the SQL conformance table
   ([docs/sql-conformance.md](../sql-conformance.md), ADR-0035) alongside the
   aggregate allowlist and the read-only write rejections. ADR-2904 removes
-  the cross-signal rejection; the conformance row changes when epic #2904
-  lands it.
+  the cross-signal rejection; the conformance row scores the join as
+  supported on the HTTP path.
 
 ## Amendment (2026-10-11, ADR-2904): a statement may name several signal tables
 
@@ -385,6 +385,10 @@ table references before any catalog listing, CTE names excluded, and a
 session that registers nothing the statement does not name. Rejected
 alternative C's single `telemetry` table stays rejected.
 
-Until epic #2904's code lands, the executor still returns
-`SqlError::CrossSignalQuery` for such a statement. The decision has moved;
-the behaviour follows it.
+The HTTP SQL endpoint runs such a statement since issue #2910. Flight SQL
+and ES|QL still return `SqlError::CrossSignalQuery` for it, Flight SQL until
+its ticket carries one segment group per signal (ADR-2904 decision 10). A
+`min_commit_token` on a statement naming two or more signal tables, and a
+signal table beside a Parquet table, are refused over HTTP as not supported
+yet; the reference is the "Statements over several signal tables" section of
+[docs/query-engine.md](../query-engine.md).

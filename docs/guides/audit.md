@@ -317,8 +317,10 @@ shard.
 
 `audit` is one of the five tables that the SQL surface serves (`samples`,
 `logs`, `spans`, `alerts`, `audit`), on `POST /api/v1/sql` and on Flight SQL.
-A query must name one table only. Ravel rejects a query that names two with a
-400, before any listing.
+`POST /api/v1/sql` can join `audit` with the other four tables; Flight SQL
+rejects a query that names two of them with `invalid_argument`, before any
+listing. See
+the [query guide](query.md) for the terms of a join.
 
 The table has no kind-specific column. Everything specific to a kind is in the
 `attrs` map.

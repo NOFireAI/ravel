@@ -109,6 +109,9 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         (Category::Clause, "LIMIT") => Some(Expect::Rows(1)),
         (Category::TableDispatch, "samples -> Signal::Metrics") => Some(Expect::Rows(count)),
         (Category::TableDispatch, "logs -> Signal::Logs") => Some(Expect::Rows(LOG_RECORD_COUNT)),
+        // Log records sit at ts 1000..=1002 and samples at ts 1, 1, 2, 3, so
+        // the join on `samples.ts + 999` pairs each sample with one record.
+        (Category::TableDispatch, "both tables (cross-signal)") => Some(Expect::Rows(count)),
         // ADR-0090 decision 8: analytical clause/operator shapes over the
         // metrics dataset. Every expected value is re-derived directly from the
         // four fixture samples (1, 2, -1, 3), not from any implementation path.
@@ -505,21 +508,7 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
             },
         },
         Classification::IntentionallyRejected { typed_error } => {
-            if typed_error == "SqlError::CrossSignalQuery" {
-                match fixture
-                    .executor
-                    .execute(tenant.hash(), &request(&construct.example))
-                    .await
-                {
-                    Err(SqlError::CrossSignalQuery) => Verdict::Confirmed,
-                    Err(e) => Verdict::Broken {
-                        observed: format!("wrong error: {e}"),
-                    },
-                    Ok(_) => Verdict::Broken {
-                        observed: "cross-signal query was accepted".to_string(),
-                    },
-                }
-            } else if construct.category == Category::WindowFrame {
+            if construct.category == Category::WindowFrame {
                 // Moving-frame `avg` is not refused by `validate_query` (`avg` is
                 // admitted) nor by a registry gate: it fails closed inside
                 // DataFusion's sliding-window planner, so it must be executed to
@@ -642,8 +631,8 @@ async fn supported_constructs_execute() {
 }
 
 /// Every construct declared intentionally rejected returns its declared typed
-/// error: each excluded aggregate, each write statement, and the cross-signal
-/// query. This is the acceptance test proving the state-2 rows fail cleanly
+/// error: each excluded aggregate, each excluded scalar and window, each write
+/// statement, and moving-frame `avg`. This is the acceptance test proving the state-2 rows fail cleanly
 /// (ADR-0035 Consequences: "the real value of this work is proving state-2 rows
 /// fail cleanly").
 #[tokio::test]

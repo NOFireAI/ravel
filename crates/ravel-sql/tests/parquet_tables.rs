@@ -814,10 +814,14 @@ async fn another_tenants_table_is_an_unknown_table() {
     );
 }
 
-/// A Parquet table beside a signal table is a cross-signal statement, in
-/// either order, and it is refused before any file is read.
+/// A Parquet table beside a signal table is [`SqlError::SignalBesideParquet`]
+/// (not supported yet, ADR-2904 decision 11), in either order. The only reads
+/// are the LIST of the table's manifest versions and the GET of its newest
+/// manifest, which tell a live table from an unknown name: no signal catalog
+/// is listed and no file is read. A statement over the Parquet table alone
+/// still runs.
 #[tokio::test]
-async fn a_parquet_table_joined_with_logs_is_cross_signal() {
+async fn a_signal_table_beside_parquet_is_refused_before_listing() {
     let lake = Lake::configured();
     let acme = tenant("acme");
     lake.hits_for(&acme).await;
@@ -825,10 +829,29 @@ async fn a_parquet_table_joined_with_logs_is_cross_signal() {
         "SELECT count(*) FROM hits JOIN logs ON true",
         "SELECT count(*) FROM logs WHERE body IN (SELECT name FROM hits)",
     ] {
-        let err = lake.execute(&acme, sql).await.expect_err("cross signal");
-        assert!(matches!(err, SqlError::CrossSignalQuery), "{sql}: {err}");
+        let before = reads(&lake);
+        let err = lake
+            .execute(&acme, sql)
+            .await
+            .expect_err("signal beside Parquet");
+        assert!(matches!(err, SqlError::SignalBesideParquet), "{sql}: {err}");
+        let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
+        assert_eq!(
+            (
+                ravel_lists - before.1,
+                ravel_gets - before.0,
+                lake_gets - before.2
+            ),
+            (1, 1, 0),
+            "{sql}: hits's versions LIST and newest manifest GET, nothing else"
+        );
     }
-    assert_eq!(Lake::gets(&lake.lake), 0);
+
+    let outcome = lake
+        .execute(&acme, "SELECT count(*) FROM hits")
+        .await
+        .expect("a Parquet-only statement runs");
+    assert_eq!(rows(&outcome), vec!["6".to_string()]);
 }
 
 /// Grants are checked when a query resolves the table: after the grant a
@@ -1327,12 +1350,12 @@ async fn a_forged_parquet_version_above_the_bound_is_ignored_and_the_older_one_s
     unknown_table_error(&lake, &acme, sql).await;
 }
 
-/// A dropped table beside a signal table is an unknown table, not a
-/// cross-signal statement: the early-exit resolve reads the name's newest
+/// A dropped table beside a signal table is an unknown table, not a signal
+/// table beside a Parquet table: the early-exit resolve reads the name's newest
 /// manifest, finds a drop, and goes on.
 ///
 /// FLIP: deciding from the LIST alone (a name with versions is found) makes
-/// this `CrossSignalQuery`.
+/// this `SignalBesideParquet`.
 #[tokio::test]
 async fn a_dropped_table_beside_samples_is_an_unknown_table() {
     let lake = Lake::configured();
@@ -1484,7 +1507,7 @@ async fn a_statement_naming_the_cap_is_an_unknown_table_after_one_list_each() {
 }
 
 /// With a signal table present, the first name that is a live table decides
-/// `CrossSignalQuery`: the unknown names after it are never listed.
+/// `SignalBesideParquet`: the unknown names after it are never listed.
 #[tokio::test]
 async fn samples_beside_a_parquet_table_stops_at_the_first_found_name() {
     let lake = Lake::configured();
@@ -1494,8 +1517,11 @@ async fn samples_beside_a_parquet_table_stops_at_the_first_found_name() {
 
     let names = unknown_names(MAX_STATEMENT_TABLE_NAMES - 1);
     let sql = format!("SELECT 1 FROM samples, hits, {}", names.join(", "));
-    let err = lake.execute(&acme, &sql).await.expect_err("cross signal");
-    assert!(matches!(err, SqlError::CrossSignalQuery), "{err}");
+    let err = lake
+        .execute(&acme, &sql)
+        .await
+        .expect_err("signal beside Parquet");
+    assert!(matches!(err, SqlError::SignalBesideParquet), "{err}");
     let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
     assert_eq!(ravel_lists - before.1, 1, "one LIST, of hits's versions");
     assert_eq!(

@@ -1,7 +1,7 @@
 //! A statement over two or more signal tables, run through the per-signal
-//! resolve and plan with the public cross-signal refusal switched off
-//! ([`SqlExecutor::allow_cross_signal_for_test`]) (issue #2910, part A), and
-//! the refusal itself at every public entry point with it on.
+//! resolve and plan of the HTTP statement path (issue #2910), the
+//! `min_commit_token` refusal on that path, and the one-table refusal the
+//! Flight SQL entry points keep.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -22,7 +22,7 @@ use ravel_object_store::{
 use ravel_query::{RequestBudgets, RequestLimit};
 use ravel_rspan::{SpanRecord, StatusCode};
 use ravel_types::accounting::QueryAccounting;
-use ravel_types::{Sample, Signal, TenantHash, TenantId, TimeRange};
+use ravel_types::{CommitToken, Sample, Signal, TenantHash, TenantId, TimeRange};
 use uuid::Uuid;
 
 use crate::SqlConfig;
@@ -156,14 +156,13 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for RecordingStore<S> {
 
 type FixtureStore = Arc<InstrumentedStore<FaultStore<MemoryStore>>>;
 
-/// `store` under a [`RecordingStore`], and an executor over it with the
-/// cross-signal refusal off.
+/// `store` under a [`RecordingStore`], and an executor over it.
 fn recorded(
     store: FixtureStore,
     config: SqlConfig,
 ) -> (Arc<RecordingStore<FixtureStore>>, SqlExecutor) {
     let recording = Arc::new(RecordingStore::new(store));
-    let executor = executor_with(recording.clone(), config).allow_cross_signal_for_test();
+    let executor = executor_with(recording.clone(), config);
     (recording, executor)
 }
 
@@ -563,7 +562,7 @@ async fn summed_max_segments_refuses_across_signals() {
     let with_max = |max_segments: usize| {
         let mut config = SqlConfig::default();
         config.engine.max_segments = max_segments;
-        executor_with(store.clone(), config).allow_cross_signal_for_test()
+        executor_with(store.clone(), config)
     };
 
     let err = with_max(3)
@@ -582,7 +581,7 @@ async fn summed_max_segments_refuses_across_signals() {
     assert_eq!(outcome.stats.segments, 4);
     assert_eq!(i64_column(&outcome.output, "ts"), vec![0, 100]);
 
-    let executor = executor_over(empty_store()).allow_cross_signal_for_test();
+    let executor = executor_over(empty_store());
     let mut request = sql_request(
         "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
         WINDOW,
@@ -693,18 +692,67 @@ fn empty_snapshot() -> Snapshot {
     }
 }
 
-/// With the refusal on, as it is for every executor outside this module,
-/// every public entry point refuses a statement over two signal tables with
-/// [`SqlError::CrossSignalQuery`] before it issues any store request.
+/// The HTTP statement path (`execute`, `execute_accounted`, `explain`,
+/// `explain_accounted`) runs a statement over two signal tables, and
+/// `execute` returns its exact rows. Every Flight SQL entry point refuses the
+/// same statement with [`SqlError::CrossSignalQuery`] before it issues any
+/// store request.
 #[tokio::test]
-async fn the_public_entry_points_still_refuse_two_signal_tables() {
-    const SQL: &str = "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts";
-    let tenant_hash = TenantHash([3u8; 16]);
-    let store = empty_store();
-    let recording = Arc::new(RecordingStore::new(store.clone()));
-    let executor = executor_with(recording.clone(), SqlConfig::default());
+async fn the_http_path_runs_two_signal_tables_and_flight_still_refuses() {
+    const SQL: &str = "SELECT s.ts, s.value FROM samples s JOIN logs l ON s.ts = l.ts \
+                       ORDER BY s.ts";
+    let tenant = TenantId::new("cross-signal-entry-points".to_string());
+    let tenant_hash = tenant.hash();
+    let memory = MemoryStore::new();
+    publish_metric_samples(
+        &memory,
+        &tenant,
+        1,
+        "m",
+        samples(&[(0, 1.0), (100, 2.0), (200, 3.0)]),
+    )
+    .await;
+    publish_log_records(
+        &memory,
+        tenant_hash,
+        Signal::Logs,
+        2,
+        &logs_at(&[100, 200, 300]),
+    )
+    .await;
+    let store = wrap_fixture_store(memory);
     let request: SqlRequest = sql_request(SQL, WINDOW);
     let accounting = QueryAccounting::new();
+
+    let (http_log, http) = recorded(store.clone(), SqlConfig::default());
+    let outcome = http
+        .execute(tenant_hash, &request)
+        .await
+        .expect("execute runs a samples JOIN logs statement");
+    // ts 0 has no log record and ts 300 no sample; 100 and 200 join once each.
+    assert_eq!(
+        rows(&outcome.output, "ts", "value"),
+        vec![(100, 2.0), (200, 3.0)]
+    );
+    assert_eq!(outcome.stats.segments, 2, "one segment per signal");
+    http.execute_accounted(tenant_hash, &request, &LiveAccounting::new())
+        .await
+        .expect("execute_accounted runs it");
+    let report = http
+        .explain(tenant_hash, &request)
+        .await
+        .expect("explain plans it");
+    assert_eq!(report.segments_resolved, 2);
+    http.explain_accounted(tenant_hash, &request, &accounting)
+        .await
+        .expect("explain_accounted plans it");
+    assert_eq!(
+        data_gets(&http_log.requests(), "/l/").len(),
+        1,
+        "the HTTP path read the logs object"
+    );
+
+    let (recording, executor) = recorded(store, SqlConfig::default());
     let inputs = || PinnedPlanInputs {
         declared: Vec::new(),
         parquet: ParquetPlan::Unresolved,
@@ -715,28 +763,6 @@ async fn the_public_entry_points_still_refuse_two_signal_tables() {
     let mut take = |entry: &'static str, err: Option<SqlError>| {
         refused.push((entry, err.unwrap_or_else(|| panic!("{entry} must refuse"))));
     };
-    take(
-        "execute",
-        executor.execute(tenant_hash, &request).await.err(),
-    );
-    take(
-        "execute_accounted",
-        executor
-            .execute_accounted(tenant_hash, &request, &LiveAccounting::new())
-            .await
-            .err(),
-    );
-    take(
-        "explain",
-        executor.explain(tenant_hash, &request).await.err(),
-    );
-    take(
-        "explain_accounted",
-        executor
-            .explain_accounted(tenant_hash, &request, &accounting)
-            .await
-            .err(),
-    );
     take(
         "resolve_snapshot",
         executor
@@ -789,12 +815,78 @@ async fn the_public_entry_points_still_refuse_two_signal_tables() {
     }
     assert_eq!(
         refused.len(),
-        if cfg!(feature = "flight-sql") { 9 } else { 8 }
+        if cfg!(feature = "flight-sql") { 5 } else { 4 }
     );
     assert_eq!(recording.requests(), Vec::<String>::new());
-    let metrics = store.metrics().snapshot();
-    assert_eq!(
-        (metrics.list.calls, metrics.get.calls, metrics.head.calls),
-        (0, 0, 0)
+}
+
+fn token() -> CommitToken {
+    CommitToken {
+        shard: 0,
+        writer_id: Uuid::from_u128(7),
+        epoch: 1,
+        seq: 1,
+        ingest_hour_bucket: 0,
+    }
+}
+
+/// A `min_commit_token` on a statement over two signal tables is
+/// [`SqlError::CommitTokenAcrossSignals`] at every HTTP entry point, before
+/// any store request. The same token on a statement over one signal table is
+/// admitted and reaches the catalog.
+#[tokio::test]
+async fn a_token_on_a_two_signal_statement_is_refused_before_listing() {
+    let tenant_hash = TenantHash([4u8; 16]);
+    let recording = Arc::new(RecordingStore::new(empty_store()));
+    let executor = executor_with(recording.clone(), SqlConfig::default());
+    let mut request = sql_request(
+        "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
+        WINDOW,
+    );
+    request.min_tokens = vec![token()];
+    let accounting = QueryAccounting::new();
+
+    let refused = [
+        (
+            "execute",
+            executor.execute(tenant_hash, &request).await.err(),
+        ),
+        (
+            "execute_accounted",
+            executor
+                .execute_accounted(tenant_hash, &request, &LiveAccounting::new())
+                .await
+                .err(),
+        ),
+        (
+            "explain",
+            executor.explain(tenant_hash, &request).await.err(),
+        ),
+        (
+            "explain_accounted",
+            executor
+                .explain_accounted(tenant_hash, &request, &accounting)
+                .await
+                .err(),
+        ),
+    ];
+    for (entry, err) in refused {
+        assert!(
+            matches!(err, Some(SqlError::CommitTokenAcrossSignals)),
+            "{entry} must refuse with CommitTokenAcrossSignals, got {err:?}"
+        );
+    }
+    assert_eq!(recording.requests(), Vec::<String>::new());
+
+    let mut single = sql_request("SELECT ts FROM samples", WINDOW);
+    single.min_tokens = vec![token()];
+    let outcome = executor.execute(tenant_hash, &single).await;
+    assert!(
+        !matches!(outcome, Err(SqlError::CommitTokenAcrossSignals)),
+        "a token on a one-signal statement is admitted, got {outcome:?}"
+    );
+    assert!(
+        !recording.requests().is_empty(),
+        "the one-signal statement reached the catalog"
     );
 }
