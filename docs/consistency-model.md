@@ -220,6 +220,11 @@ partial-success message with rejected point counts and reasons.
   determines its commit-record key; the catalog GETs those keys directly
   and includes the segments, or fails with `unsatisfiable token` rather
   than silently serving stale data.
+- A SQL statement over several signal tables takes each token qualified
+  with the table it bounds (`logs:<token>`, ADR-2904 decision 3), and each
+  signal's snapshot waits only for its own tokens. An unqualified token on
+  such a statement is refused before any catalog request rather than
+  applied to a signal the caller did not choose.
 - Without a token, queries see some recent consistent snapshot; freshness is
   bounded by listing behavior, not guaranteed.
 

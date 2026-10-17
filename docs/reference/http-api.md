@@ -98,9 +98,9 @@ string, and on POST, the body. `/api/v1/sql`, `/api/v1/esql` and
 | GET | `/api/v1/metadata` | `metric`, `limit` | Prometheus metric-metadata JSON; an empty object when no tenant resolves | 200 | Optional | `all`, `query` | none |
 | GET, POST | `/api/v1/query_exemplars` | `query`, `start`, `end` | Prometheus exemplars JSON envelope | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
 | POST | `/api/v1/analytics` | JSON: `query`, `start`, `end`, `step`, `op`, optional `timeout`, `min_commit_token`, `allow_partial` | JSON analytics envelope, one entry per series | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | none |
-| POST | `/api/v1/sql` | JSON: `query`, `start`, `end`, optional `timeout`, `min_commit_token` | Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
+| POST | `/api/v1/sql` | JSON: `query`, `start`, `end`, optional `timeout`, `min_commit_token` (each `<token>` or `<table>:<token>`; qualified is required on a statement reading two or more signal tables) | Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
 | POST | `/api/v1/esql` | JSON: `query`, optional `start`, `end`, `timeout` | JSON: typed columns, rows, `stats`, and `warnings` when there are any | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `esql` |
-| GET | `/api/traces/{trace_id}` | path `trace_id`, plus optional `start`, `end`, `timeout`, `min_commit_token` | The `/api/v1/sql` response for every span of the trace: Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
+| GET | `/api/traces/{trace_id}` | path `trace_id`, plus optional `start`, `end`, `timeout`, `min_commit_token` (`<token>` or `spans:<token>`) | The `/api/v1/sql` response for every span of the trace: Arrow IPC stream or JSON, per `Accept` | 200, 400, 401, 422, 500, 503, 504 | Yes | `all`, `query` | `sql` |
 | POST | `/mcp` | One MCP JSON-RPC message (revision `2026-07-28` or `2025-11-25`) | JSON or `text/event-stream`, per revision; a tool result carries the result envelope | 200, 400, 401, 403, 405, 413, 500 | Yes | `all`, `query` | `mcp` |
 
 ### `/api/v1/status/buildinfo` and `/api/v1/metadata`
@@ -149,6 +149,23 @@ Request limits:
 - The gate applies to Flight SQL too, where it surfaces as `InvalidArgument`.
 
 See docs/query-engine.md, "SQL statement complexity gate".
+
+`min_commit_token` is a list. Each entry is a commit token, or a token
+qualified with the table it bounds, `<table>:<token>` (split once at the first
+colon). Each qualified token bounds only that table's snapshot. Each of these
+is 400 `bad_data` before any catalog or object-store request:
+
+- An unqualified token on a statement that reads two or more of `samples`,
+  `logs`, `spans`, `alerts` and `audit`. The message names those tables in
+  that order: `qualify min_commit_token with one of samples, logs, ...`.
+- A qualifier that is not, exactly and in lower case, the name of a signal
+  table the statement reads. The message quotes the qualifier, cut to 64
+  bytes.
+- Any token on a statement that reads only Parquet tables.
+- An empty qualifier, or a part after the colon that is not a token
+  (`invalid min_commit_token`).
+
+See [qualifying a token by table](../guides/query.md#qualifying-a-token-by-table-sql).
 
 The JSON response envelope has one array per row under `data.rows`:
 
@@ -302,6 +319,9 @@ authentication, limits, deadline and query audit record.
   the current time.
 - `start` and `end` choose which objects are read and do not filter rows, so
   a span that starts outside them can still be returned.
+- `min_commit_token` may repeat. Each value is a token, or a token qualified
+  `spans:<token>`, the one table the lookup reads. Any other qualifier is 400
+  `bad_data` before any object-store read.
 
 See [fetching one trace by id](../guides/traces.md#fetching-one-trace-by-id).
 
@@ -326,6 +346,10 @@ before the JSON-RPC message is parsed.
 For the query routes, the status codes come from one shared error mapping.
 
 - 400 `bad_data`: a malformed query, a bad time range, or a non-positive step.
+  On `/api/v1/sql` it also covers a `min_commit_token` the statement cannot
+  take: unqualified on a statement that reads two or more signal tables,
+  qualified with a table the statement does not read, or on a statement that
+  reads only Parquet tables (see [`/api/v1/sql`](#apiv1sql)).
 - 401 `unauthorized`: no resolvable credential.
 - 422 `execution`: one of these.
   - A resource-budget refusal: too many segments, series, samples, or
@@ -366,7 +390,8 @@ For the query routes, the status codes come from one shared error mapping.
     this build reads.
   - A Parquet table's manifest or grants record written in a format version
     above the highest that this build reads.
-  - An unsatisfiable `min_commit_token`.
+  - An unsatisfiable `min_commit_token`, qualified or not. The message is
+    fixed and names no table.
 - 504 `timeout`: the query passed its deadline.
 
 These faults answer 500, not 503:
