@@ -24,24 +24,38 @@
 #                       the statements both arms answered
 #   each statement      a statement A answered and B did not is a miss,
 #                       named by id
+#   healthz p99         per phase and port (4318, 4319), at most
+#                       relative.healthz_p99_max_ratio_<port> x A's; only
+#                       when the band file sets that key to a number
 #
 # A band that cannot be judged (a concurrent or q29_probe band on a run where
 # that phase did not run on both arms, a statement arm A failed) is printed
 # INCONCLUSIVE and is not a miss.
 #
+# Before the tables it refuses two arms that are not comparable (kit.py
+# comparable): the same dataset, mapping and corpus digests, CPU model, RustFS
+# version, audit mode, query window length, band sections and kit-set server
+# flags. The run's own in/run.toml decides the one difference it accepts: when
+# it sets server_flags_a or server_flags_b, the arms' stamped extra flags must
+# be exactly those two lists, and the difference is printed once as a
+# `comparable:` line, with any resolved server setting that differs beside
+# them; any other difference in flags is refused.
+#
 # After the tables it prints each arm's concurrent rounds (QPS and error
 # ratio per round) beside its pooled figures, and, for an arm that missed a
 # concurrent error band, that arm's concurrent errors by statement as
 # "count / total", read from out/concurrent/calls.jsonl in its evidence.tgz.
+# When that evidence is missing or unreadable it warns and the verdict stands:
+# the band already missed, so the exit is still 1.
 #
 # Written for bash 3.2 (macOS /bin/bash).
 #
 # Exit codes:
 #   0   both arms DONE and every band passed or was inconclusive
 #   1   a band missed, absolute on either arm or relative
-#   2   an arm wrote FAILED (its content is printed), a results.json is
-#       missing or malformed, or an arm that missed a concurrent error band
-#       has no out/concurrent/calls.jsonl in its evidence.tgz
+#   2   an arm wrote FAILED (its content is printed), a results.json or
+#       in/run.toml is missing, a results.json is malformed, or the arms are
+#       not comparable
 #   3   --timeout elapsed before both arms wrote a marker
 #   4   S3 unreachable: --unreachable-tries consecutive polls failed (default
 #       3), or a download failed with an error other than a missing key
@@ -226,6 +240,12 @@ download in/kit.tgz "$OUT_DIR/kit.tgz" || code=$?
 [ "$code" -eq 0 ] || exit 2
 rm -rf "$OUT_DIR/kit"
 tar -xzf "$OUT_DIR/kit.tgz" -C "$OUT_DIR" || { echo "fetch: in/kit.tgz does not unpack" >&2; exit 2; }
+code=0
+download in/run.toml "$OUT_DIR/run.toml" || code=$?
+[ "$code" -ne 4 ] || exit 4
+[ "$code" -eq 0 ] || exit 2
+
+kit_py comparable "$OUT_DIR/run.toml" "$OUT_DIR/A/results.json" "$OUT_DIR/B/results.json" || exit 2
 
 miss=0
 echo "VERDICT      ARM      BAND                                           VALUE          BOUND"
@@ -241,7 +261,8 @@ done
 for band in "$OUT_DIR"/kit/bands/*.toml; do
   [ -f "$band" ] || continue
   code=0
-  kit_py relative "$band" "$OUT_DIR/A/results.json" "$OUT_DIR/B/results.json" || code=$?
+  kit_py relative "$band" "$OUT_DIR/A/results.json" "$OUT_DIR/B/results.json" "$OUT_DIR/run.toml" \
+    || code=$?
   case "$code" in
     0) ;;
     1) miss=1 ;;
@@ -249,7 +270,8 @@ for band in "$OUT_DIR"/kit/bands/*.toml; do
   esac
 done
 kit_py concurrent-detail "$OUT_DIR/kit/bands" "$OUT_DIR/A/results.json" "$OUT_DIR/A/evidence.tgz" \
-  "$OUT_DIR/B/results.json" "$OUT_DIR/B/evidence.tgz" || exit 2
+  "$OUT_DIR/B/results.json" "$OUT_DIR/B/evidence.tgz" "$OUT_DIR/run.toml" \
+  || echo "fetch: warning: could not print the concurrent errors by statement (see above); the band verdict stands" >&2
 if [ "$miss" = 1 ]; then
   echo "fetch: at least one band MISSED; results under $OUT_DIR" >&2
   exit 1
