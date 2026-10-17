@@ -5,11 +5,15 @@
 //!
 //! This crate replaces an IP-valued attribute's text with a ciphertext that
 //! decodes back to a valid address, under a key derived from the deployment
-//! key and the tenant's identity. It is pseudonymization, not anonymization:
-//! the deterministic variant ([`policy::Variant::Deterministic`]) always
-//! maps the same plaintext address to the same ciphertext within one
-//! (tenant, rule, epoch), by design, so two occurrences of the same real
-//! address are still linkable to each other through their shared ciphertext
+//! key, the tenant's identity, the variant, and the epoch -- not from the
+//! rule's attribute key, so two rules sharing a (tenant, variant, epoch)
+//! share a key. It is pseudonymization, not anonymization: the deterministic
+//! variant ([`policy::Variant::Deterministic`]) always maps the same
+//! plaintext address to the same ciphertext within one (tenant, variant,
+//! epoch), by design, so two occurrences of the same real address, whether
+//! under the same rule or under two different rules that share a (tenant,
+//! variant, epoch), are still linkable to each other through their shared
+//! ciphertext
 //! ([`render::RenderOutcome`] does not distinguish "a new address" from "an
 //! address seen before"). The prefix variant preserves the subnet
 //! structure of the original address: it hides a single host while leaving

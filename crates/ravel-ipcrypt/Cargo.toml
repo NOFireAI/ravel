@@ -27,11 +27,16 @@ hex = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true }
 serde_json = { workspace = true }
+# Turns the `marker` feature on for test builds only (dev-dependencies never
+# apply to a normal `cargo build`), so `cargo test -p ravel-ipcrypt` with no
+# `--features` flag still compiles and runs the marker unit tests and
+# tests/marker.rs under the required gates and CI jobs that invoke it without
+# selecting features (issue #3046).
+ravel-ipcrypt = { path = ".", features = ["marker"] }
 
 [[test]]
 name = "marker"
 path = "tests/marker.rs"
-required-features = ["marker"]
 
 [lints]
 workspace = true

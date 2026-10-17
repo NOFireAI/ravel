@@ -13,8 +13,9 @@
 //! applies this per-key overlay when resolving a tenant's effective rule
 //! set.
 //!
-//! Duplicate key, empty key, zero epoch, and a retired epoch equal to the
-//! current epoch are each scoped to ONE table at a time ([defaults] on its
+//! Duplicate key, empty key, zero epoch, a retired epoch equal to the
+//! current epoch, and a retired epoch listed more than once are each scoped
+//! to ONE table at a time ([defaults] on its
 //! own, then each `[tenants.<id>]` on its own), not to the merged effective
 //! set: a duplicate inside `[defaults]` is refused even if no tenant ever
 //! references it, and two tenant tables may each reuse a key name the other

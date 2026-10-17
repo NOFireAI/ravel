@@ -1,4 +1,7 @@
-//! Per-tenant, per-rule key derivation (ADR-2993 decision 2).
+//! Per-tenant, per-variant, per-epoch key derivation (ADR-2993 decision 2).
+//! The rule's attribute key plays no part in the derived material: two rules
+//! sharing a (tenant, variant, epoch) share a key (see the crate-level
+//! threat-model note).
 //!
 //! `key = blake3::derive_key("ravel ipcrypt v1 " + variant, deployment_key
 //! || tenant_hash || epoch_as_u64_le)`. Deterministic truncates the 32-byte
