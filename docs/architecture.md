@@ -210,6 +210,47 @@ heartbeat that a task on the main runtime refreshes once per second:
 
 The copies on the main HTTP listener keep the behavior described above.
 
+### Thread placement
+
+ADR-1702 decides where work runs. Decision 1 covers the runtime workers and
+the blocking pool, and decision 8 covers the probes:
+
+- A kernel wait (a local disk read or write) runs on tokio's blocking pool
+  through `spawn_blocking`, not on a runtime worker. The disk cache's age
+  sweep and the tiered cache's async get and insert paths in `ravel-cache`
+  are examples.
+- Codec work (decompress, decode, encode) at a gated call site runs through
+  `CpuGate::run` in `ravel-cpu-gate`. The job takes a permit from the read
+  or the write gate, then runs on the blocking pool. A job below its floor
+  runs inline on the worker: 256 KiB of uncompressed bytes for a codec job
+  (`DEFAULT_INLINE_FLOOR_BYTES`), and 100,000 samples for a PromQL
+  evaluation, which otherwise runs on the read gate's `promql_eval` site
+  (`DEFAULT_EVAL_FLOOR_SAMPLES`). The call sites are the `ReadSite` and
+  `WriteSite` variants in `crates/ravel-cpu-gate/src/site.rs`; the
+  observability guide lists the metric families every site renders.
+- The probes get their own listener and thread. With `--listen-health`
+  set, `HealthListener::bind` in `ravel-server` builds a single-threaded
+  runtime on its own OS thread, so a node whose workers are all busy still
+  answers `/healthz` and `/readyz`.
+
+Not every codec runs on a gate. Decision 12 leaves DataFusion's operators
+(sort, aggregate, join) and tonic's gzip codec on the workers. Two of its
+amendments keep more decodes inline on the awaiting task whatever their
+size:
+
+- The inline open-decode amendment: the RLOG plan-phase directory decode,
+  RSPAN open, exemplar reads, RSEG page decodes, and the alert evaluator's
+  alert-state fold.
+- The amendment that puts the write path and maintenance on the gates:
+  `Catalog::fold`'s own decodes and encodes, RLOG compaction's block
+  decode, RLOG and RSPAN compaction's input directory decodes, RSEG footer
+  probes, scrub's footer reads, postings decode and segment-name fetch,
+  and the on-demand fold route's HEAD decodes.
+
+`--sql-scan-decode-inline` (the scan-decode opt-out amendment) also runs
+the SQL `logs` and `spans` scans' block decode inline instead of on the
+read gate. ADR-1702 gives the reason for each exception.
+
 ## How ingest, query, and maintenance interact
 
 ![Write path: clients through gateway, router, and shard actors to object storage, then acknowledgement](diagrams/architecture-write-path.svg)

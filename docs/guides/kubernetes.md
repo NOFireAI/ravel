@@ -905,7 +905,9 @@ nothing anywhere else:
   failure threshold are unchanged. The answers on 4316 also track a heartbeat
   from the main runtime: `/healthz` there returns 503 once that heartbeat is
   older than 60s, and `/readyz` once it is older than 30s. A wedged main
-  runtime therefore fails its probes.
+  runtime therefore fails its probes. The same heartbeat age is the gauge
+  `ravel_health_heartbeat_age_seconds` on 4318's `/metrics`, rendered
+  whether or not `--listen-health` is set; 4316 serves no `/metrics`.
 - `terminationGracePeriodSeconds` goes from 45 to 51. On SIGTERM the server
   also stops the health listener, between the drain and the trace flush. That
   stop takes up to 6s and raises the shutdown budget from 32.5s to 38.5s. The
@@ -926,6 +928,16 @@ later. The field requires a `ravel-server` image that has `--listen-health`,
 meaning this release or newer. An older server rejects the unknown flag at
 startup, so the pod restart-loops. Check `spec.image` before you set the
 field, and before you take the release whose notes carry the flipped default.
+
+Decode work at the gated call sites, the kind that can starve the probes
+above, is capped by two CPU gates. `--cpu-gate-read-permits` sizes the read
+gate (query, catalog and maintenance decode; default `max(1, cores - 1)`),
+and `--cpu-gate-write-permits` sizes the write gate (flush encode and ingest
+payload decode; default `max(1, cores / 2)`). Each sample on the per-site
+gate families carries both a `gate` label (`read` or `write`) and a `site`
+label naming the call site; see [CPU gates and
+runtime](observability.md#cpu-gates-and-runtime) in the observability guide
+for the full metric and site list.
 
 ## Production notes
 
