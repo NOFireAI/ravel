@@ -232,6 +232,9 @@ under that run id, each with the instance profile, a 500 GB gp3 root volume,
 `--instance-initiated-shutdown-behavior terminate` and a user-data that arms
 `shutdown -h +600`. It prints the run id, both instance ids and the `out/`
 prefix; `--dry-run` prints every command and both user-data scripts instead.
+`run.example.toml` names the instance profile
+`ravel-clickbench-instance-profile`; a profile created by section 4 above is
+named `ravel-clickbench-box`, so set `instance_profile` to that one instead.
 
 ## 6. Bootstrap the box
 
@@ -299,6 +302,11 @@ uploads `FAILED` to the arm's `out/` prefix and shuts the box down before
 the arm's SHA and frame-pointer build itself, then the section 7 load,
 compact, fold and declare against a loopback RustFS store on the gp3 root
 volume whose keys it generates on the box, so no SSM parameter is read. The
+RustFS release is `run.toml`'s `rustfs_url`, checked against `rustfs_sha256`;
+the example pins the musl build, since the gnu build needs glibc 2.38 and the
+default Amazon Linux 2023 AMI carries 2.34. The box runs `rustfs --version`
+right after unpacking it, and a binary that cannot run fails the box at step
+`rustfs`, with `FAILED` quoting that output, before the store is started. The
 kit uses that store rather than this runbook's S3 bucket for three reasons:
 each arm's data is private to its own box, so the two arms cannot read or
 overwrite each other's tenant; the instance role needs no access beyond the
@@ -446,6 +454,13 @@ fold defaulting to the wrong signal on a logs-only tenant succeeds and seals
 nothing. `seal_through_hour` names the hour the fold sealed through, and
 `entry_count` should be at least 0.8 of the number of objects the load wrote.
 If the fold covered under 80% of them, the shard count or signal is wrong.
+
+**With the kit.** The fold step checks this itself: `entry_count` must be at
+least `fold_min_entry_ratio` (default 0.8) of the `objects written` figure in
+the load's report, or the box fails at step `fold`. That figure counts data
+objects only; the keys the load adds to the store also hold its commit
+records, so their count is not the denominator. A load report without
+`objects written` fails the box at step `load`.
 
 ### Declare the typed columns
 
@@ -617,8 +632,12 @@ naming the key.
   outage.
   Every call is a line of `out/concurrent/calls.jsonl` with the benchmark's
   fields plus `round` and `connection`. In every phase a failed call's curl
-  stderr file is removed once its line is written (the line's `error`
-  quotes its first 300 bytes for a transport or transfer failure), and
+  stderr file is removed once it has been read: the line's `error` quotes
+  its first 300 bytes for a transport or transfer failure, not for a
+  timeout. A concurrent call reads neither its answer nor its stderr inside
+  the round, so it forks nothing but curl; `kit.py concurrent-answers` reads
+  both after the round, checks the row count of any 2xx answer (a 203 is
+  read as a 200 is), and removes each stderr file. Also,
   `evidence.tgz` leaves out the per-connection answer directories
   (`out/concurrent/round-*/conn-*`), so an outage that makes hundreds of
   thousands of fast-failing calls leaves no file per call for the evidence
@@ -676,7 +695,53 @@ not run on both arms is inconclusive, never a pass. `fetch.sh` prints each
 arm's per-round QPS and error ratio beside its pooled figures, and on a
 missed concurrent error band it prints that arm's errors by statement as
 `count / total`, read from `out/concurrent/calls.jsonl` in its
-`evidence.tgz`.
+`evidence.tgz`. When that file is missing from the tarball or holds a line
+that is not JSON (one cut short, named by file and line), `fetch.sh` prints
+why, then `fetch: warning: could not print the concurrent errors by statement
+(see above); the band verdict stands`, and keeps the exit code the bands gave.
+
+`box/run.sh` samples the server's health during the `benchmark` phase and
+each `concurrent` round. One `kit.py healthz-sampler` process per phase or
+round runs three threads, each every 250 ms: a `GET /healthz` on port 4318
+(the query listener) and on port 4319 (the health listener), each with a 2 s
+timeout, and a `GET /metrics` on port 4318 that reads
+`ravel_health_heartbeat_age_seconds`. A timeout or a non-200 counts as a
+2000 ms sample and as a failure. The sampler is
+started before the phase and talks to `run.sh` through a gate file that
+`run.sh` writes with shell builtins only, so it forks nothing inside a
+statement's timed window; the gate is closed while the server is stopped on
+purpose (each cold restart, each round's restart), and a sample counts only
+when the gate was open on the same generation before and after it. Before a
+timed window opens `run.sh` waits until all three threads hold a counted
+sample of the current generation. The raw samples are kept in
+`out/<phase>/healthz/` (`out/concurrent/round-<N>/healthz/` for a round),
+which `evidence.tgz` carries. After each phase `out/healthz.txt` gains
+
+```
+HEALTHZ phase=<phase> port=<4318|4319> n=<samples> p50_ms=<ms> p99_ms=<ms> max_ms=<ms> failures=<n>
+HEARTBEAT phase=<phase> max_s=<seconds>
+```
+
+with `<phase>` `benchmark` or `concurrent-<N>`, and `run.log` carries the
+same lines. Step `healthz` then requires each phase's three lines exactly
+once in `out/healthz.txt`: a line missing or repeated fails the box at that
+step. `results.json`'s `healthz` block holds the same figures. The band file
+may set `healthz_p99_max_ratio_4318` and `healthz_p99_max_ratio_4319` (arm
+B's p99 per phase at most that times arm A's) and `healthz_p99_ms_max_4318`
+and `healthz_p99_ms_max_4319` (each phase's p99 at most that many
+milliseconds). They are optional: left out or left a placeholder, the band
+is skipped.
+
+`run.toml` may give one arm extra server flags: `server_flags_a` and
+`server_flags_b`, each an array of strings, appended after the flags the kit
+sets and stamped in that arm's `provenance.server_flags.extra_flags`.
+`check-run` refuses an entry that repeats a flag the kit sets, naming it.
+`fetch.sh` compares the arms' kit-set flags (all but the tenant token file's
+path, which is a location on the box) and accepts arms whose extra flags
+are exactly the two declared lists, printing that difference once, with
+any resolved server setting that moved with it. Every other field must
+still match; extra flags that differ from the declared lists, or any extra
+flag with none declared, are refused with exit 2.
 
 ## 9. Check the report before reading the headline
 
@@ -1149,9 +1214,12 @@ exits 0 on a pass, 1 on a miss, 2 on `FAILED` or a malformed `results.json`,
 3 on timeout and 4 when S3 is unreachable or a download fails with anything
 but a missing key (a 403 and a missing bucket included). Two arms whose
 dataset, mapping or corpus digest, `hardware.cpu`, RustFS version, audit mode, query window length
-(`window_hours`) or resolved server settings differ, or that were judged by
-different band sections, are not compared and exit 2, naming the field; each
-arm's binary is not compared, since that is what differs by design. Arm B's
+(`window_hours`), kit-set server flags, extra server flags or resolved server
+settings differ, or that were judged by different band sections, are not
+compared and exit 2, naming the field; extra flags that are exactly
+`run.toml`'s `server_flags_a` and `server_flags_b`, and the settings that
+moved with them, are the one exception (section 8). Each arm's binary is not
+compared, since that is what differs by design. Arm B's
 relative bands also miss when fewer statements than the band file's
 `min_both_answered` were answered by both arms, when either arm answered none,
 and when a statement both answered returned a different row count on B than

@@ -1280,6 +1280,8 @@ grep -q '^RAVEL_AUDIT_TOKEN_KEY=[0-9a-f]\{64\}$' "$BOX_A/kit/secrets.env" \
 if [ "$audit_off_ok" = 1 ] && [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TMP/evidence-a/object-counts/before-load.txt" ] \
   && [ -f "$TMP/evidence-a/object-counts/after-load.txt" ] && [ -f "$TMP/evidence-a/out/benchmark/samplers/server-rss.log" ] \
   && [ -f "$TMP/evidence-a/arm.env" ] && [ -n "$token" ] && [ -n "$secret" ] && [ -n "$access" ] \
+  && [ -s "$TMP/evidence-a/out/benchmark/healthz/4318.jsonl" ] && [ -s "$TMP/evidence-a/out/benchmark/healthz/4319.jsonl" ] \
+  && [ -s "$TMP/evidence-a/out/benchmark/healthz/metrics.jsonl" ] && [ -s "$TMP/evidence-a/out/healthz.txt" ] \
   && grep -qF "$secret" "$BOX_A/kit/rustfs.log" && grep -qF "$secret" "$BOX_A/kit/run.log" \
   && grep -qF "secret_key=$secret" "$BOX_A/kit/server-1.log" \
   && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/rustfs.log" \
@@ -1287,7 +1289,7 @@ if [ "$audit_off_ok" = 1 ] && [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TM
   && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/server-1.log" \
   && ! grep -rqF -e "$token" -e "$secret" -e "$access" "$TMP/evidence-a" "$OUT_A" \
   && [ ! -e "$TMP/evidence-a/secrets.env" ] && [ ! -e "$TMP/evidence-a/auth.header" ]; then
-  pass "evidence.tgz holds server logs, samplers and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
+  pass "evidence.tgz holds server logs, samplers, raw healthz samples and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
 else
   fail "evidence" "audit key kept from an audit_mode off server: $audit_off_ok; $(tar -tzf "$OUT_A/evidence.tgz" | head -n 20 | tr '\n' ' ')"
 fi
