@@ -78,7 +78,7 @@ use bytes::Bytes;
 use ravel_alerting::{
     AlertError, AlertId, AlertInstance, AlertRecord, AlertState, DEFAULT_REPEAT_INTERVAL,
     QueryResultSummary, Rule, RuleCondition, RuleQuery, StateTransition, ThresholdOp,
-    alert_instances, evaluate_transition, write_alert_record,
+    alert_instances, evaluate_transition, matching_series, merged_alert_labels, write_alert_record,
 };
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -343,6 +343,155 @@ impl AlertEvalTasks {
     }
 }
 
+/// The alert state each tenant's evaluator publishes at the end of every tick,
+/// shared with the `/api/v1/alerts` and `/api/v1/rules` routes
+/// ([`crate::alerts_api`]).
+///
+/// One slot per tenant that has rules, built once from the config and never
+/// resized, so a reader finds its own tenant's slot without any map-wide lock.
+/// A slot is a `parking_lot::RwLock` around an `Arc` snapshot: a tick builds
+/// the whole snapshot first and holds the write lock only to swap the pointer,
+/// and a reader holds the read lock only to clone the `Arc`.
+///
+/// Process-local and not durable. A process serves what its own evaluators
+/// published, never another process's; a restarted process reads
+/// [`PublishedRead::NotYetEvaluated`] until its first tick.
+#[derive(Clone, Default)]
+pub struct PublishedAlerts {
+    slots: Option<Arc<HashMap<TenantHash, PublishedSlot>>>,
+}
+
+type PublishedSlot = parking_lot::RwLock<Option<Arc<TenantAlertSnapshot>>>;
+
+/// What a tenant's published slot held when a route read it.
+#[derive(Debug, Clone)]
+pub enum PublishedRead {
+    /// No evaluator runs in this process: alerting is disabled, or no tenant
+    /// has rules.
+    NotEvaluating,
+    /// Evaluators run in this process, but none for this tenant, which has no
+    /// rules.
+    NoRules,
+    /// The tenant's evaluator has not finished a tick yet.
+    NotYetEvaluated,
+    /// The snapshot the tenant's last tick published.
+    Published(Arc<TenantAlertSnapshot>),
+}
+
+impl PublishedAlerts {
+    /// The handle of a process that runs no evaluator.
+    pub fn none() -> PublishedAlerts {
+        PublishedAlerts { slots: None }
+    }
+
+    /// One empty slot per tenant [`spawn`] starts an evaluator for under
+    /// `config`, or [`PublishedAlerts::none`] when it starts none.
+    pub fn for_config(config: &AlertEvalConfig) -> PublishedAlerts {
+        if !config.enabled || config.rules.is_empty() {
+            return PublishedAlerts::none();
+        }
+        let slots = config
+            .rules
+            .keys()
+            .map(|tenant| (*tenant, parking_lot::RwLock::new(None)))
+            .collect();
+        PublishedAlerts {
+            slots: Some(Arc::new(slots)),
+        }
+    }
+
+    /// The current state of `tenant`'s slot.
+    pub fn read(&self, tenant: &TenantHash) -> PublishedRead {
+        let Some(slots) = &self.slots else {
+            return PublishedRead::NotEvaluating;
+        };
+        let Some(slot) = slots.get(tenant) else {
+            return PublishedRead::NoRules;
+        };
+        let snapshot = slot.read().clone();
+        match snapshot {
+            Some(snapshot) => PublishedRead::Published(snapshot),
+            None => PublishedRead::NotYetEvaluated,
+        }
+    }
+
+    fn slot(&self, tenant: &TenantHash) -> Option<&PublishedSlot> {
+        self.slots.as_ref().and_then(|slots| slots.get(tenant))
+    }
+
+    /// Replace `tenant`'s snapshot. A tenant with no slot is ignored.
+    fn publish(&self, tenant: &TenantHash, snapshot: TenantAlertSnapshot) {
+        let Some(slot) = self.slot(tenant) else {
+            return;
+        };
+        let snapshot = Some(Arc::new(snapshot));
+        // The guard is a temporary of this statement, so the replaced snapshot
+        // is dropped after the lock is released.
+        let replaced = std::mem::replace(&mut *slot.write(), snapshot);
+        drop(replaced);
+    }
+}
+
+/// What one tick of a tenant's evaluator observed, as served by
+/// [`crate::alerts_api`].
+#[derive(Debug, Clone)]
+pub struct TenantAlertSnapshot {
+    /// The clock reading the tick ran at.
+    pub evaluated_at_ns: i64,
+    /// Health of every configured rule, keyed by rule id.
+    pub rule_health: HashMap<String, RuleHealth>,
+    /// The pending and firing alerts of the configured rules, from the tick's
+    /// folded alert history, sorted by rule id then labels. Suppressed and
+    /// resolved alerts are left out. `None` when no tick of this process has
+    /// read the history yet.
+    pub alerts: Option<Vec<PublishedAlert>>,
+}
+
+/// One rule's health as of a tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuleHealth {
+    /// This replica did not evaluate the rule, because a peer held the
+    /// tenant's lease.
+    Unknown,
+    /// The rule's query ran and its transitions were written.
+    Ok,
+    /// The rule was not evaluated: its query, its condition or its write
+    /// failed, or the tick could not read history or take the lease.
+    Err(String),
+}
+
+/// One pending or firing alert in a [`TenantAlertSnapshot`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PublishedAlert {
+    pub rule_id: String,
+    pub alert_id: AlertId,
+    /// The record's merged label set, sorted by `(name, value)`.
+    pub labels: Vec<(String, String)>,
+    pub annotations: Vec<(String, String)>,
+    /// [`AlertState::Pending`] or [`AlertState::Firing`].
+    pub state: AlertState,
+    /// The `ts_ns` of the record that moved the alert into `state`.
+    pub active_at_ns: i64,
+    /// The sample value the alert's series matched with, from this tick's
+    /// query, else from the last snapshot that had one. `None` when no tick
+    /// of this process has run the rule's query while the alert was active.
+    pub value: Option<f64>,
+}
+
+/// What a tick reports to [`AlertEvaluator::publish_tick`] beyond its
+/// [`AlertEvalReport`].
+#[derive(Default)]
+struct TickObservation {
+    /// Why the tick evaluated no rule: the history read or lease error.
+    tick_error: Option<String>,
+    /// Rule id to error, for each rule that failed on a lease-holding tick.
+    rule_errors: HashMap<String, String>,
+    /// Matched sample value per alert, for every rule whose query ran.
+    values: HashMap<AlertId, f64>,
+    /// The folded pending and firing alerts, once history was read.
+    alerts: Option<Vec<PublishedAlert>>,
+}
+
 /// Spawn one evaluator loop per tenant that has rules. Returns immediately;
 /// tasks run until [`AlertEvalTasks::shutdown`].
 ///
@@ -350,11 +499,15 @@ impl AlertEvalTasks {
 /// [`SpawnError::ZeroEvalInterval`] for an enabled config with a zero
 /// `interval`: both are startup misconfigurations rather than runtime
 /// conditions.
+///
+/// Every evaluator publishes into `published` after each tick; build it with
+/// [`PublishedAlerts::for_config`] over the same `config`.
 pub fn spawn(
     store: Arc<dyn ObjectStoreBackend>,
     engines: AlertQueryEngines,
     clock: Arc<dyn Clock>,
     config: AlertEvalConfig,
+    published: PublishedAlerts,
 ) -> anyhow::Result<AlertEvalTasks> {
     config.check_spawnable()?;
     if !config.enabled || config.rules.is_empty() {
@@ -379,7 +532,8 @@ pub fn spawn(
             tenant,
             rules.clone(),
             &config,
-        )?;
+        )?
+        .with_published(published.clone());
         // Warn once per rule whose repeat cadence is finer than the tick can
         // deliver: the effective cadence is `repeat_interval` rounded up to the
         // next tick, so a sub-tick interval is silently coarsened to the tick
@@ -852,6 +1006,10 @@ pub struct AlertEvaluator {
     /// handle by default; a test swaps in its own with
     /// [`AlertEvaluator::with_metrics`] so it can assert exact counter values.
     metrics: Arc<AlertMetrics>,
+    /// Where every tick's [`TenantAlertSnapshot`] is published.
+    /// [`PublishedAlerts::none`] unless [`AlertEvaluator::with_published`]
+    /// set it.
+    published: PublishedAlerts,
 }
 
 impl AlertEvaluator {
@@ -891,7 +1049,15 @@ impl AlertEvaluator {
             // runs alerting, and therefore what makes `/metrics` render the
             // family at all.
             metrics: global_alert_metrics(),
+            published: PublishedAlerts::none(),
         })
+    }
+
+    /// Publish every tick's snapshot of this tenant into `published`, which
+    /// the alert routes read. [`spawn`] sets it on every evaluator it starts.
+    pub fn with_published(mut self, published: PublishedAlerts) -> AlertEvaluator {
+        self.published = published;
+        self
     }
 
     /// The tenant this evaluator was built for.
@@ -967,19 +1133,110 @@ impl AlertEvaluator {
     /// failure still records what it observed. Splitting the body out is what
     /// makes that structural rather than a rule to remember at each early
     /// return.
+    ///
+    /// The tick's [`TenantAlertSnapshot`] is published here too, after the
+    /// tick body, whichever way the body ended.
     pub async fn run_tick(&mut self) -> AlertEvalReport {
         let now_ns = self.clock.now_ns();
-        let report = self.evaluate_tick(now_ns).await;
+        let mut observed = TickObservation::default();
+        let report = self.evaluate_tick(now_ns, &mut observed).await;
         self.metrics.record_tick(&report, now_ns);
         let current = self.undelivered.len() as u64;
         self.metrics
             .move_undelivered(self.undelivered_reported, current);
         self.undelivered_reported = current;
+        self.publish_tick(now_ns, &report, observed);
         report
     }
 
+    /// Build this tick's snapshot from what it observed and publish it.
+    ///
+    /// A tick that could not read history keeps the alerts the previous
+    /// snapshot held, since it learned nothing new about them. A value this
+    /// tick's queries did not produce is carried from the previous snapshot.
+    fn publish_tick(&self, now_ns: i64, report: &AlertEvalReport, observed: TickObservation) {
+        let Some(slot) = self.published.slot(&self.tenant) else {
+            return;
+        };
+        let previous = slot.read().clone();
+        let outcome = report.outcome();
+        let tick_error = observed.tick_error.unwrap_or_default();
+        let rule_health = self
+            .rules
+            .iter()
+            .map(|rule| {
+                let health = match outcome {
+                    AlertTickOutcome::Evaluated => match observed.rule_errors.get(&rule.rule_id) {
+                        Some(err) => RuleHealth::Err(err.clone()),
+                        None => RuleHealth::Ok,
+                    },
+                    AlertTickOutcome::LeaseNotHeld => RuleHealth::Unknown,
+                    AlertTickOutcome::LeaseUnavailable | AlertTickOutcome::HistoryUnavailable => {
+                        RuleHealth::Err(tick_error.clone())
+                    }
+                };
+                (rule.rule_id.clone(), health)
+            })
+            .collect();
+        let previous_alerts = previous.as_ref().and_then(|p| p.alerts.as_ref());
+        let alerts = match observed.alerts {
+            Some(mut alerts) => {
+                let previous_values: HashMap<AlertId, f64> = previous_alerts
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|a| a.value.map(|v| (a.alert_id, v)))
+                    .collect();
+                for alert in &mut alerts {
+                    alert.value = observed
+                        .values
+                        .get(&alert.alert_id)
+                        .or_else(|| previous_values.get(&alert.alert_id))
+                        .copied();
+                }
+                Some(alerts)
+            }
+            None => previous_alerts.cloned(),
+        };
+        self.published.publish(
+            &self.tenant,
+            TenantAlertSnapshot {
+                evaluated_at_ns: now_ns,
+                rule_health,
+                alerts,
+            },
+        );
+    }
+
+    /// The pending and firing alerts in `latest` that belong to one of this
+    /// evaluator's rules, sorted by rule id then labels.
+    fn active_alerts(&self, latest: &HashMap<AlertId, AlertRecord>) -> Vec<PublishedAlert> {
+        let configured: HashSet<&str> = self.rules.iter().map(|r| r.rule_id.as_str()).collect();
+        let mut alerts: Vec<PublishedAlert> = latest
+            .values()
+            .filter(|r| {
+                matches!(r.state, AlertState::Pending | AlertState::Firing)
+                    && configured.contains(r.rule_id.as_str())
+            })
+            .map(|r| PublishedAlert {
+                rule_id: r.rule_id.clone(),
+                alert_id: r.alert_id,
+                labels: r.labels.clone(),
+                annotations: r.annotations.clone(),
+                state: r.state,
+                active_at_ns: r.ts_ns,
+                value: None,
+            })
+            .collect();
+        alerts.sort_unstable_by(|a, b| (&a.rule_id, &a.labels).cmp(&(&b.rule_id, &b.labels)));
+        alerts
+    }
+
     /// The tick body, at the clock reading [`Self::run_tick`] took.
-    async fn evaluate_tick(&mut self, now_ns: i64) -> AlertEvalReport {
+    async fn evaluate_tick(
+        &mut self,
+        now_ns: i64,
+        observed: &mut TickObservation,
+    ) -> AlertEvalReport {
         let mut report = AlertEvalReport::default();
 
         // Read the derived state memo first, before the lease and unguarded: it
@@ -1009,6 +1266,7 @@ impl AlertEvaluator {
                     "alert evaluation: could not read alert history; skipping tick"
                 );
                 report.history_unavailable = true;
+                observed.tick_error = Some(format!("alert history unreadable: {err:#}"));
                 // Still attempt delivery: a notification stuck from an earlier
                 // tick does not depend on this tick's history read.
                 self.flush_sinks(now_ns, &mut report).await;
@@ -1040,6 +1298,7 @@ impl AlertEvaluator {
                      evaluation this tick"
                 );
                 report.lease_unavailable = true;
+                observed.tick_error = Some(format!("alert lease unavailable: {err:#}"));
                 false
             }
         };
@@ -1051,13 +1310,22 @@ impl AlertEvaluator {
             for rule in &rules {
                 let mut written = 0;
                 let result = self
-                    .evaluate_rule(rule, &mut latest, now_ns, &mut written)
+                    .evaluate_rule(
+                        rule,
+                        &mut latest,
+                        now_ns,
+                        &mut written,
+                        &mut observed.values,
+                    )
                     .await;
                 report.records_written += written;
                 match result {
                     Ok(()) => report.rules_evaluated += 1,
                     Err(err) => {
                         report.rules_failed += 1;
+                        observed
+                            .rule_errors
+                            .insert(rule.rule_id.clone(), format!("{err:#}"));
                         if let Some(AlertError::TooManyAlerts { count, limit, .. }) =
                             err.downcast_ref::<AlertError>()
                         {
@@ -1142,6 +1410,7 @@ impl AlertEvaluator {
                  evaluation this tick"
             );
         }
+        observed.alerts = Some(self.active_alerts(&latest));
 
         self.flush_sinks(now_ns, &mut report).await;
         report
@@ -1425,15 +1694,24 @@ impl AlertEvaluator {
     /// A rule that matches more than [`ravel_alerting::MAX_ALERTS_PER_RULE`]
     /// series, or two series that merge to one label set, fails before
     /// anything is written, leaving its prior state untouched.
+    ///
+    /// `values` receives each matched alert's sample value, for the published
+    /// snapshot.
     async fn evaluate_rule(
         &mut self,
         rule: &Rule,
         latest: &mut HashMap<AlertId, AlertRecord>,
         now_ns: i64,
         written: &mut u32,
+        values: &mut HashMap<AlertId, f64>,
     ) -> anyhow::Result<()> {
         let summary = self.run_query(rule, now_ns).await?;
         let matched = alert_instances(rule, &summary)?;
+        for (series, value) in matching_series(&rule.condition, &summary)? {
+            let instance =
+                AlertInstance::new(&rule.rule_id, merged_alert_labels(&rule.labels, &series));
+            values.insert(instance.alert_id, value);
+        }
         let matched_ids: HashSet<AlertId> = matched.iter().map(|m| m.alert_id).collect();
 
         let mut absent: Vec<AlertInstance> = latest
@@ -3705,7 +3983,13 @@ mod tick_tests {
 
         let mut latest = HashMap::new();
         let err = evaluator
-            .evaluate_rule(&threshold_rule(), &mut latest, NOW_NS, &mut 0)
+            .evaluate_rule(
+                &threshold_rule(),
+                &mut latest,
+                NOW_NS,
+                &mut 0,
+                &mut HashMap::new(),
+            )
             .await
             .expect_err("1001 matched series is over the cap");
         match err.downcast_ref::<AlertError>() {
@@ -3896,7 +4180,13 @@ mod tick_tests {
 
         let mut latest = evaluator.load_latest_records().await.expect("fold");
         let err = evaluator
-            .evaluate_rule(&threshold_rule(), &mut latest, NOW_NS, &mut 0)
+            .evaluate_rule(
+                &threshold_rule(),
+                &mut latest,
+                NOW_NS,
+                &mut 0,
+                &mut HashMap::new(),
+            )
             .await
             .expect_err("1001 matched series is over the cap");
         assert!(matches!(
@@ -5761,9 +6051,15 @@ mod tick_tests {
 
         // Only now does A's in-flight tick reach its write.
         let mut a_written = 0;
-        a.evaluate_rule(&rule, &mut a_latest, NOW_NS, &mut a_written)
-            .await
-            .expect("A publishes its transition");
+        a.evaluate_rule(
+            &rule,
+            &mut a_latest,
+            NOW_NS,
+            &mut a_written,
+            &mut HashMap::new(),
+        )
+        .await
+        .expect("A publishes its transition");
         assert_eq!(
             a_written, 1,
             "A writes the onset transition its tick decided at NOW"
@@ -7666,9 +7962,15 @@ mod tick_tests {
             interval: Duration::ZERO,
             ..AlertEvalConfig::default()
         };
-        let err = spawn(store, engines, TestClock::at(NOW_NS), config)
-            .err()
-            .expect("a zero eval interval must be refused at spawn");
+        let err = spawn(
+            store,
+            engines,
+            TestClock::at(NOW_NS),
+            config,
+            PublishedAlerts::none(),
+        )
+        .err()
+        .expect("a zero eval interval must be refused at spawn");
         assert!(
             matches!(
                 err.downcast_ref::<SpawnError>(),

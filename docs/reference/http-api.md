@@ -416,7 +416,7 @@ The call returns 200 with one of four named outcomes:
 A 503 on this route means that the outcome is unknown. Retry the call. A 503
 never means that nothing was written.
 
-## Alert rules route
+## Alert rules and alerts routes
 
 Served in `all` and `query` modes: the modes that build a query engine, and
 therefore the modes that an alert evaluator runs in. A `gateway` or
@@ -425,12 +425,17 @@ therefore the modes that an alert evaluator runs in. A `gateway` or
 | Method | Path | Request | Response | Status codes | Credential | Modes | Feature |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | GET | `/api/v1/rules` | none | Prometheus rules JSON envelope: `data.groups` | 200, 401 | Yes | `all`, `query` | none |
+| GET | `/api/v1/alerts` | none | Prometheus alerts JSON envelope: `data.alerts` | 200, 401, 503 | Yes | `all`, `query` | none |
+
+Both routes read a snapshot that the alert evaluator in the same process
+publishes at the end of each tick. They issue no object-store request and run
+no query. They serve current state, not history, and there is no
+cross-process read: a process that runs no evaluator does not ask one that
+does. Past transitions are in the `alerts` SQL table.
 
 `/api/v1/rules` returns the alert rules that this process loaded, for the
 authenticated tenant, in the shape that Prometheus's rules API uses.
 
-- It is a read of configuration. It issues no object-store request and runs
-  no query.
 - Its two status codes are the whole set: 200 for a resolved credential and
   401 for one that does not resolve.
 - There is no request parameter. The tenant comes from the credential and
@@ -446,7 +451,9 @@ is the evaluation interval (`--alert-eval-interval-secs`) in seconds.
 
 Each rule carries `type` (always `alerting`), `name` (the `rule_id`), `query`,
 `duration` (the `for` delay in seconds, `0` when unset), `labels`,
-`annotations`, `health`, and `state`.
+`annotations`, `health`, and `state`. After a tick it also carries
+`lastEvaluation` and an `alerts` array, and `lastError` when `health` is
+`err`.
 
 `query` is the rule's whole firing expression:
 
@@ -455,17 +462,40 @@ Each rule carries `type` (always `alerting`), `name` (the `rule_id`), `query`,
 - For a SQL detection rule, it is the statement alone. Its condition is that
   the statement returned a row, and there is nothing to append.
 
-`health` and `state` are both `unknown` for every rule. The endpoint serves
-the loaded rule set and does not read evaluation outcomes. So it reports
-neither a health nor a firing state.
+`health` and `state` come from the last tick of this process's evaluator for
+the tenant:
 
-- `unknown` is Prometheus's own value for `health`.
-- For `state`, `unknown` is outside Prometheus's three values (`inactive`,
-  `pending`, `firing`). `inactive` asserts that a rule is not firing, and
-  this route never checks that.
-- A rule carries no `alerts` array of currently-active alerts.
+- `health` is `ok` when the tick ran the rule, and `err` with `lastError`
+  when the rule's query, condition or write failed, or when the tick could
+  not read alert history or take the tenant's lease. `lastEvaluation` is the
+  tick's clock reading, in RFC 3339.
+- `state` is `firing` when any of the rule's alerts is firing, else
+  `pending` when any is pending, else `inactive`. The `alerts` array lists
+  those alerts in the `/api/v1/alerts` shape.
+- Before a tick of this process has read the tenant's alert history, and in
+  a process that runs no evaluator, `health` and `state` are `unknown` and
+  there is no `alerts` array. On a replica whose peer held the tenant's
+  lease on the last tick, `health` is `unknown`.
+- `unknown` is Prometheus's own value for `health`. For `state`, `unknown` is
+  outside Prometheus's three values (`inactive`, `pending`, `firing`).
+  `inactive` asserts that a rule is not firing, and nothing has checked.
 
-Alert state is queryable today through the `alerts` SQL table.
+`/api/v1/alerts` returns the authenticated tenant's `pending` and `firing`
+alerts as of the last tick, in the shape that Prometheus's alerts API uses.
+Suppressed and resolved alerts are not listed. Each alert carries `labels`
+(with `alertname` set as the Alertmanager sink sets it), `annotations`,
+`state`, `activeAt` (the transition into the current state, RFC 3339), and
+`value` (a string, omitted when this process has not run the alert's query
+while it was active).
+
+- 200 with the tenant's alerts. A tenant with no loaded rules gets
+  `{"status": "success", "data": {"alerts": []}}`, never the alerts of
+  another tenant.
+- 401 for a credential that does not resolve.
+- 503 with `errorType` `unavailable` when this process runs no evaluator
+  (evaluation disabled, or no tenant has rules), and before a tick of this
+  process has read the tenant's alert history. An empty list would assert
+  that nothing is firing.
 
 ## Health and metrics routes
 
@@ -545,6 +575,3 @@ per-tenant labels on the admission and query families are opt-in
   published image builds the feature, and the flag is still required.
 - OTLP ingest for metrics, logs, and traces is also available over gRPC on
   the gRPC listener.
-- `/api/v1/alerts`, Prometheus's list of currently-active alerts, is not served.
-  A request for it gets a 404 from the HTTP framework, in every mode. Only
-  `/api/v1/rules` is served today. Query the `alerts` table for alert state.

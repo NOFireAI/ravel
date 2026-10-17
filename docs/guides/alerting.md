@@ -353,12 +353,26 @@ never trip. Until that is wired, write rules against the other four tables.
   own `WHERE` still applies above the scan. A PromQL rule evaluates as an
   instant query and does not use this window.
 
-## Reading back the loaded rules
+## Reading back rules and active alerts
 
-`GET /api/v1/rules` returns the rules that the process loaded for the calling
-tenant, in the shape that Prometheus's rules API uses. It reads
-configuration, not data. Use it to confirm that the process parsed the rules
-file that you started it with:
+Two routes show what the evaluator is doing now, in the shapes that
+Prometheus's rules and alerts APIs use:
+
+- `GET /api/v1/rules` returns the rules that the process loaded for the
+  calling tenant, with each rule's health and state from the last tick.
+- `GET /api/v1/alerts` returns the calling tenant's pending and firing alerts
+  as of the last tick.
+
+Both read a snapshot that the evaluator in the same process publishes at the
+end of each tick. They read no object storage and run no query. They show
+current state only. For past transitions, and for the state of an alert
+across replicas or restarts, query the `alerts` table. See
+[Querying alert history](#querying-alert-history).
+
+### `GET /api/v1/rules`
+
+Use it to confirm that the process parsed the rules file that you started it
+with, and to see how each rule did on the last tick:
 
 ```sh
 curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
@@ -382,8 +396,18 @@ curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
             "duration": 300.0,
             "labels": {"severity": "page"},
             "annotations": {"summary": "CPU over 90% for five minutes"},
-            "health": "unknown",
-            "state": "unknown"
+            "health": "ok",
+            "lastEvaluation": "2026-10-17T09:30:00.000000000Z",
+            "state": "firing",
+            "alerts": [
+              {
+                "labels": {"alertname": "cpu-hot", "instance": "db-1", "severity": "page"},
+                "annotations": {"summary": "CPU over 90% for five minutes"},
+                "state": "firing",
+                "activeAt": "2026-10-17T09:25:00.000000000Z",
+                "value": "0.97"
+              }
+            ]
           }
         ]
       }
@@ -402,11 +426,61 @@ How to read the response:
 - The `query` of a rule is its whole firing expression. A PromQL rule shows
   its threshold comparison appended to the query text. A SQL detection rule
   shows its statement alone.
-- `health` and `state` are `unknown`, and a rule carries no `alerts` array.
-  The endpoint serves the loaded rule set and reads no evaluation outcome.
-  For what the rules did, query the `alerts` table. See
-  [Querying alert history](#querying-alert-history).
-- Prometheus's companion `/api/v1/alerts` endpoint is not served.
+- `health` is `ok` when the last tick ran the rule. It is `err`, with the
+  error in `lastError`, when the rule's query failed, or when the tick could
+  not read alert history or take the tenant's lease. `lastEvaluation` is the
+  time of that tick.
+- `state` is `firing` when any alert of the rule is firing, else `pending`
+  when any is pending, else `inactive`. The `alerts` array lists those
+  alerts, in the same shape as `/api/v1/alerts`. A suppressed alert counts as
+  neither.
+- Before the first tick of this process has read the tenant's alert history,
+  `health` and `state` are `unknown` and a rule carries no `alerts` array.
+  The same holds when this process runs no evaluator. On a replica whose
+  peer held the tenant's lease on the last tick, `health` is `unknown`.
+
+### `GET /api/v1/alerts`
+
+```sh
+curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
+  http://localhost:4318/api/v1/alerts
+```
+
+```json
+{
+  "status": "success",
+  "data": {
+    "alerts": [
+      {
+        "labels": {"alertname": "cpu-hot", "instance": "db-1", "severity": "page"},
+        "annotations": {"summary": "CPU over 90% for five minutes"},
+        "state": "firing",
+        "activeAt": "2026-10-17T09:25:00.000000000Z",
+        "value": "0.97"
+      }
+    ]
+  }
+}
+```
+
+- Only `pending` and `firing` alerts are listed. Suppressed and resolved
+  alerts are not.
+- `labels.alertname` is set the way the Alertmanager sink sets it. See
+  [Notification sinks](#notification-sinks).
+- `activeAt` is the time of the transition into the alert's current state.
+  `value` is the sample that the alert's series matched with on the last
+  tick that ran its query. It is omitted when this process has not run
+  that query while the alert was active.
+- When this process runs no evaluator (evaluation is disabled, or no tenant
+  has rules), the route answers `503` with `errorType` `unavailable`. It
+  answers the same before the first tick has read the tenant's alert
+  history. It does not answer an empty list in either case, because an
+  empty list would say that nothing is firing. A tenant with no rules gets an
+  empty list.
+- A process serves only what its own evaluator published, and a process
+  that runs no evaluator does not ask one that does. A replica whose peer
+  holds the tenant's lease still ticks: it lists the alerts its tick read
+  from alert history, which the lease holder wrote.
 
 ## Notification sinks
 

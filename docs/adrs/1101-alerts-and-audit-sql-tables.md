@@ -165,7 +165,9 @@ flowchart LR
   `FROM` clause so that no new signal needs a new protocol, and ADR-0043
   decision 7 already committed alert history to that surface. A second
   endpoint would duplicate auth, window handling, admission, accounting,
-  and audit for one table, and would leave Flight SQL without it.
+  and audit for one table, and would leave Flight SQL without it. The path
+  now serves current alert state, not history (see the #2665 amendment
+  below); this rejection of a history endpoint stands.
 - **Exposing alert history through PromQL** (an `ALERTS` series in the
   Prometheus style). Rejected: alert records carry a free-text body, an
   arbitrary label map, and annotations, and are fold-to-latest by
@@ -244,3 +246,24 @@ records, and a join reaches nothing its two sides could not already read
 separately. The HTTP SQL endpoint runs such a statement since issue #2910;
 Flight SQL still rejects it with `SqlError::CrossSignalQuery` until its
 ticket carries one segment group per signal (ADR-2904 decision 10).
+
+## Amendment (2026-10-17, issue #2665): `/api/v1/alerts` serves current state
+
+<!-- amendment-applies: sections="Rejected alternatives" pointer="#2665 amendment" -->
+
+`GET /api/v1/alerts` and the health and state fields of `GET /api/v1/rules`
+are served, in the Prometheus shape, from a snapshot the alert evaluator
+publishes in its own process after each tick: the tenant's pending and
+firing alerts and each rule's health. A request reads that snapshot for its
+own tenant and nothing else. It reads no object, runs no query, and takes no
+time window, so it has none of the auth, window, admission, accounting, or
+audit machinery the rejected history endpoint would have duplicated. A
+process that runs no evaluator answers 503 on `/api/v1/alerts`; there is no
+cross-process read.
+
+This does not reopen the rejected alternative. That endpoint was for alert
+history, every transition over a window, and history stays on the `alerts`
+SQL table. What a Prometheus-compatible client asks `/api/v1/alerts` for is
+the set of alerts active now, with the value that met each condition and
+each rule's last query error. Neither of those is a field of `AlertRecord`,
+so the `alerts` table cannot answer it. Suppressed alerts are left out.
