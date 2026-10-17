@@ -173,8 +173,10 @@ A tenant can also query Parquet tables. These are Parquet files read in place,
 in an S3, GCS or Azure location that an operator granted the tenant with
 `ravel-cli tenant parquet-grant add`. The read goes through a credential
 profile from the file that `ravel-server --parquet-profiles` names. A
-statement reads only Parquet tables or one of the five tables above, never
-both. A table reads only the file versions it was defined over. A caller with
+statement reads Parquet tables or the five tables above, not both yet. On
+`POST /api/v1/sql` a statement may join the five tables above, each read
+from its own snapshot (see the [query guide](docs/guides/query.md)). A table
+reads only the file versions it was defined over. A caller with
 the `ddl` capability, which is absent by default, creates a table with
 `CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION '...'` and removes it
 with `DROP TABLE` (see the [query guide](docs/guides/query.md)). Such a table

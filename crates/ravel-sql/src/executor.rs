@@ -3067,8 +3067,9 @@ impl SqlExecutor {
     ///   before anything is read: such a statement can only succeed as a
     ///   Parquet query, and a Parquet table has no event-time column.
     /// - A signal table beside a live Parquet table is
-    ///   [`SqlError::SignalBesideParquet`] (ADR-2904 decision 11, not
-    ///   implemented yet), before the caller resolves any signal catalog.
+    ///   [`SqlError::SignalBesideParquet`], before the caller resolves any
+    ///   signal catalog; ADR-2904 decision 11, which admits the pair, is not
+    ///   built yet.
     /// - With no credential profiles configured, a live Parquet table is
     ///   [`ParquetQueryError::NotConfigured`].
     /// - In both cases above the names are listed in order and the first live

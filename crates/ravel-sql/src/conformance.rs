@@ -949,8 +949,8 @@ neither -- scored over the surface Ravel actually claims, not over all of
 DataFusion SQL (ADR-0035 Rejected Alternative A).
 
 Ravel's SQL surface is a deliberately narrow allowlist, not general-purpose
-SQL: a six-aggregate set, read-only `SELECT` only, and a single signal table
-per query ([ADR-0033](adrs/0033-sql-query-over-logs.md),
+SQL: a six-aggregate set and read-only `SELECT` only
+([ADR-0033](adrs/0033-sql-query-over-logs.md),
 [ADR-0022](adrs/0022-floating-aggregate-exactness.md)). Scoring against all of
 DataFusion SQL would be meaningless (a tiny fixed percentage that never moves);
 scoring against only the declared surface would read ~100% by construction. The
