@@ -811,14 +811,12 @@ async fn sql_behaviour_is_unchanged() {
         owned(&[&["DEBUG", "delta"], &["INFO", "foxtrot"], &["WARN", "echo"]])
     );
 
-    let err = run_sql(
-        &fixture,
-        &tenant,
-        &request("SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts"),
-    )
-    .await
-    .expect_err("a cross-signal statement is rejected");
-    assert!(matches!(err, SqlError::CrossSignalQuery), "got {err:?}");
+    // A statement over two signal tables runs (ADR-2904); the fixture holds no
+    // samples, so the join is empty.
+    assert_eq!(
+        ok("SELECT l.body FROM logs l JOIN samples s ON l.ts = s.ts").await,
+        owned(&[])
+    );
 
     let err = run_sql(&fixture, &tenant, &request("SELECT uuid() FROM logs"))
         .await
