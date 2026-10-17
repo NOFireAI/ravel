@@ -210,6 +210,28 @@ heartbeat that a task on the main runtime refreshes once per second:
 
 The copies on the main HTTP listener keep the behavior described above.
 
+### Thread placement
+
+ADR-1702 decision 1 fixes where three kinds of work run:
+
+- A kernel wait (disk read or write) runs on tokio's blocking pool via
+  `spawn_blocking`, for example the disk cache's age sweep and the tiered
+  cache's reads and writes in the `ravel-cache` crate.
+- CPU-bound codec work (decompress, decode, encode, hash) at or above the
+  inline floor runs through `CpuGate::run` in the `ravel-cpu-gate` crate,
+  which acquires a semaphore permit and then runs the job on the blocking
+  pool; this also covers PromQL expression evaluation, which runs on the
+  read gate's `promql_eval` site rather than staying on a worker thread.
+- Liveness and readiness get their own listener and thread: `--listen-
+  health` serves `/healthz` and `/readyz` from `HealthListener::bind` in
+  `ravel-server`, which builds a dedicated `current_thread` runtime and
+  runs it on its own OS thread, so a node whose workers are all busy still
+  answers.
+
+ADR-1702 decision 12 leaves DataFusion's own operators (sort, aggregate,
+join) and tonic's gzip codec on the worker pool outside these gates; only
+the sites named above are metered.
+
 ## How ingest, query, and maintenance interact
 
 ![Write path: clients through gateway, router, and shard actors to object storage, then acknowledgement](diagrams/architecture-write-path.svg)
