@@ -621,14 +621,14 @@ Such a query reads one snapshot per signal, with no ordering between them: it
 may see a span whose log lines are not visible yet, or the reverse. The join
 runs on the server that received the query. `min_commit_token` on a query
 that names two or more of the five is not supported yet and gets an HTTP 400
-before any catalog listing. Flight SQL and ES|QL still read one of the five per query. The request
-body, auth, window (`start`/`end`), and `min_commit_token` handling are
-otherwise the same for all five tables.
+before any catalog listing. Flight SQL and ES|QL still read one of the five
+per query. The request body, auth, window (`start`/`end`), and
+`min_commit_token` handling are otherwise the same for all five tables.
 
 The same endpoint also serves the Parquet tables of the tenant. A query can
 join Parquet tables with each other but not with any of the five. One of the
 five beside a Parquet table is not supported yet either: an HTTP 400 that
-Ravel returns after one listing per other name finds that the name is a
+Ravel returns after the Parquet manifest reads that find a name is a live
 Parquet table, and before any signal catalog listing.
 
 ### `DISTINCT ON`
