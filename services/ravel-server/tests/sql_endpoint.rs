@@ -81,14 +81,15 @@ fn labels_for(metric: &str) -> LabelSet {
     .expect("valid labels")
 }
 
-/// Publish one real segment plus its commit record for `tenant`.
+/// Publish one real segment plus its commit record for `tenant`, returning
+/// the commit token the write acknowledges.
 async fn publish_segment(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     index: usize,
     metric: &str,
     samples: &[(i64, f64)],
-) {
+) -> CommitToken {
     let tenant_hash = tenant.hash();
     let label_set = labels_for(metric);
     let series = vec![SeriesInput {
@@ -150,6 +151,7 @@ async fn publish_segment(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish");
+    record::token_for(&rec).expect("commit token")
 }
 
 /// One native-histogram value: two populated positive buckets, integer
@@ -301,13 +303,14 @@ fn log_record(service: &str, ts: i64, body: &str) -> LogRecord {
 /// count as `series_count`, record count as `sample_count`, event-time bounds
 /// from the records, and a blake3 content hash over the object bytes. The
 /// object lands at the reconstructed data key, so `Catalog::resolve` finds it.
+/// Returns the commit token the write acknowledges.
 async fn publish_log_segment(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     index: usize,
     records: &[LogRecord],
-) {
-    publish_log_segment_rewritten(store, tenant, index, records, |_| {}).await;
+) -> CommitToken {
+    publish_log_segment_rewritten(store, tenant, index, records, |_| {}).await
 }
 
 /// [`publish_log_segment`], with `rewrite` applied to the object bytes before
@@ -319,7 +322,7 @@ async fn publish_log_segment_rewritten(
     index: usize,
     records: &[LogRecord],
     rewrite: impl FnOnce(&mut Vec<u8>),
-) {
+) -> CommitToken {
     let tenant_hash = tenant.hash();
 
     let mut min_event_ts_ns = i64::MAX;
@@ -379,6 +382,7 @@ async fn publish_log_segment_rewritten(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish log commit");
+    record::token_for(&rec).expect("commit token")
 }
 
 /// One span on `service` with an explicit duration and status. `service.name`
@@ -3416,60 +3420,94 @@ async fn a_samples_logs_join_returns_exact_rows_over_http() {
     );
 }
 
-/// A `min_commit_token` on a statement naming two signal tables is a 400 that
-/// says it is not supported yet; the same token on a one-table statement is
-/// not refused for that reason.
+/// `min_commit_token` qualified by table over HTTP (ADR-2904 decision 3, issue
+/// #2911). A samples write and a logs write each acknowledge their own token.
+/// On a statement joining the two, `samples:<s>` and `logs:<l>` bound each
+/// table by its own write and answer the exact joined rows; the crossed pair
+/// names commits neither table has, so it is the fixed unsatisfiable 503; two
+/// unqualified tokens are a 400 naming both tables; a qualifier that is not a
+/// table the statement reads (`log`) is a 400 naming it. On a one-table
+/// statement an unqualified token still bounds that table.
 #[tokio::test]
-async fn a_min_commit_token_on_a_two_signal_statement_is_a_bad_request() {
-    let app = one_tenant_app("m", &[(100, 1.0)]).await;
-    let token = CommitToken {
-        shard: 0,
-        writer_id: Uuid::from_u128(2_000),
-        epoch: 1,
-        seq: 1,
-        ingest_hour_bucket: 0,
-    }
-    .encode();
-    let payload = |query: &str| {
-        serde_json::json!({
-            "query": query,
-            "start": 0.0,
-            "end": NOW_NS as f64 / 1_000_000_000.0,
-            "min_commit_token": [token],
-        })
-        .to_string()
-    };
-
-    let (status, bytes) = post(
-        &app,
-        Some("acme-token"),
-        None,
-        payload("SELECT samples.ts FROM samples JOIN logs ON samples.ts = logs.ts"),
+async fn qualified_min_commit_token_over_http() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let samples_token = publish_segment(
+        store.as_ref(),
+        &tenant,
+        0,
+        "m",
+        &[(100, 1.0), (150, 2.0), (300, 3.0)],
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    let value: Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(value["status"], "error");
-    let message = value["error"].as_str().expect("message");
-    assert!(
-        message.contains("min_commit_token") && message.contains("not supported yet"),
+    let records = [
+        log_record("api", 100, "hello world"),
+        log_record("api", 150, "connection timeout"),
+        log_record("worker", 200, "shutdown ok"),
+    ];
+    let logs_token = publish_log_segment(store.as_ref(), &tenant, 1, &records).await;
+    assert_ne!(samples_token, logs_token, "the two writes' tokens differ");
+    let (s, l) = (samples_token.encode(), logs_token.encode());
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    const JOIN: &str = "SELECT samples.ts, samples.value, logs.body FROM samples \
+                        JOIN logs ON samples.ts = logs.ts ORDER BY samples.ts";
+    let send = |query: &'static str, min_commit_token: Vec<String>| {
+        let app = app.clone();
+        async move {
+            let payload = serde_json::json!({
+                "query": query,
+                "start": 0.0,
+                "end": NOW_NS as f64 / 1_000_000_000.0,
+                "min_commit_token": min_commit_token,
+            })
+            .to_string();
+            let (status, bytes) = post(&app, Some("acme-token"), None, payload).await;
+            let value: Value = serde_json::from_slice(&bytes).expect("json");
+            (status, value)
+        }
+    };
+
+    let (status, value) = send(JOIN, vec![format!("samples:{s}"), format!("logs:{l}")]).await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success", "{value}");
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([[100, 1.0, "hello world"], [150, 2.0, "connection timeout"]]),
         "{value}"
     );
 
-    // The token names the commit the fixture published (writer 2000, epoch
-    // 1, seq 1), so the one-table statement takes it to the catalog, finds
-    // it satisfied, and answers its one row.
-    let (status, bytes) = post(
-        &app,
-        Some("acme-token"),
-        None,
-        payload("SELECT ts FROM samples"),
-    )
-    .await;
-    let value: Value = serde_json::from_slice(&bytes).expect("json");
+    let (status, value) = send(JOIN, vec![format!("samples:{l}"), format!("logs:{s}")]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["errorType"], "unavailable", "{value}");
+    assert_eq!(value["error"], ravel_sql::MSG_UNSATISFIABLE, "{value}");
+
+    let (status, value) = send(JOIN, vec![s.clone(), l.clone()]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["errorType"], "bad_data", "{value}");
+    let message = value["error"].as_str().expect("message");
+    assert!(
+        message.contains("qualify min_commit_token with one of samples, logs"),
+        "{value}"
+    );
+
+    let (status, value) = send(JOIN, vec![format!("log:{l}")]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["errorType"], "bad_data", "{value}");
+    let message = value["error"].as_str().expect("message");
+    assert!(
+        message.contains("min_commit_token qualifier \"log\"")
+            && message.contains("(samples, logs)"),
+        "{value}"
+    );
+
+    let (status, value) = send("SELECT ts FROM samples ORDER BY ts", vec![s.clone()]).await;
     assert_eq!(status, StatusCode::OK, "{value}");
-    assert_eq!(value["status"], "success", "{value}");
-    assert_eq!(value["data"]["rows"], serde_json::json!([[100]]), "{value}");
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([[100], [150], [300]]),
+        "{value}"
+    );
 }
 
 // ---------------------------------------------------------------------------

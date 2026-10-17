@@ -153,7 +153,7 @@ async fn publish_spans(
     writer_id: Uuid,
     ts_ns: i64,
     spans: &[([u8; 16], [u8; 8], i64)],
-) {
+) -> ravel_types::CommitToken {
     let tenant = TenantId::new(tenant);
     let mut writer = ravel_rspan::RspanWriter::new(
         ravel_rspan::RspanConfig::default(),
@@ -209,6 +209,7 @@ async fn publish_spans(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish commit");
+    record::token_for(&rec).expect("commit token")
 }
 
 /// The two-hour fixture. Returns the store and the `now_ns` it was built
@@ -384,6 +385,51 @@ async fn get_trace_by_id_without_a_window_returns_every_span() {
     let (status, listed) = get_trace(&base, TOKEN, TRACE_HEX, &between_old_spans(now)).await;
     assert_eq!(status, 200, "{listed}");
     assert_eq!(span_ids(&listed["data"]), want(&EVERY_SPAN), "{listed}");
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// A lookup reads only `spans`, so its `min_commit_token` may be unqualified
+/// or qualified `spans:`, and both bound the lookup by the write; any other
+/// qualifier is a 400 naming it (issue #2911).
+#[tokio::test]
+async fn a_lookup_token_is_unqualified_or_qualified_with_spans() {
+    let (store, now) = seeded().await;
+    let token = publish_spans(
+        store.as_ref(),
+        TENANT,
+        Uuid::from_u128(4),
+        now - 60 * NS_PER_SEC,
+        &[([0x22; 16], [4; 8], now - 60 * NS_PER_SEC)],
+    )
+    .await
+    .encode();
+    let running = start(store, false).await;
+    let base = format!("http://{}", running.http_addr);
+
+    for sent in [token.clone(), format!("spans:{token}")] {
+        let (status, body) =
+            get_trace(&base, TOKEN, TRACE_HEX, &[("min_commit_token", sent.clone())]).await;
+        assert_eq!(status, 200, "{sent}: {body}");
+        assert_eq!(span_ids(&body["data"]), want(&EVERY_SPAN), "{sent}: {body}");
+    }
+
+    let (status, body) = get_trace(
+        &base,
+        TOKEN,
+        TRACE_HEX,
+        &[("min_commit_token", format!("logs:{token}"))],
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["errorType"], "bad_data", "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("min_commit_token qualifier \"logs\"")
+                && e.contains("(spans)")),
+        "{body}"
+    );
 
     running.shutdown().await.expect("graceful shutdown");
 }
