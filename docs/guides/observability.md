@@ -2554,12 +2554,12 @@ stays at 0. PromQL and LogQL reads of the same objects still count there.
 
 | Metric | Meaning |
 |---|---|
-| `ravel_cpu_gate_permits` | Gauge. Jobs the gate can run at once. |
-| `ravel_cpu_gate_running` | Gauge. Jobs holding a permit right now, including a job whose caller stopped waiting. |
-| `ravel_cpu_gate_queued` | Gauge. Callers waiting for a permit right now. |
-| `ravel_cpu_gate_wait_seconds_sum`, `ravel_cpu_gate_wait_seconds_count` | Summary with no quantiles. Time callers waited for a permit, and the number of waits, counting only waits that got a permit. |
-| `ravel_cpu_gate_run_seconds_sum`, `ravel_cpu_gate_run_seconds_count` | Summary with no quantiles. Time jobs ran on the blocking pool, and the number of jobs. |
-| `ravel_cpu_gate_abandoned_total` | Counter. Jobs that ran to completion after their caller stopped waiting, so their result was discarded. A started decode cannot be interrupted, so a cancelled query can leave one such job per permit it held. |
+| `ravel_cpu_gate_permits{gate}` | Gauge. Jobs the gate can run at once. |
+| `ravel_cpu_gate_running{gate}` | Gauge. Jobs holding a permit right now, including a job whose caller stopped waiting. |
+| `ravel_cpu_gate_queued{gate}` | Gauge. Callers waiting for a permit right now. |
+| `ravel_cpu_gate_wait_seconds_sum{gate}`, `ravel_cpu_gate_wait_seconds_count{gate}` | Summary with no quantiles. Time callers waited for a permit, and the number of waits, counting only waits that got a permit. |
+| `ravel_cpu_gate_run_seconds_sum{gate}`, `ravel_cpu_gate_run_seconds_count{gate}` | Summary with no quantiles. Time jobs ran on the blocking pool, and the number of jobs. |
+| `ravel_cpu_gate_abandoned_total{gate}` | Counter. Jobs that ran to completion after their caller stopped waiting, so their result was discarded. A started decode cannot be interrupted, so a cancelled query can leave one such job per permit it held. |
 | `ravel_cpu_gate_jobs_total{gate,site}` | Counter. Jobs a call site ran through a permit. |
 | `ravel_cpu_gate_inline_total{gate,site}` | Counter. Jobs a call site ran inline, below the inline floor. |
 | `ravel_cpu_gate_handoff_seconds_sum{gate,site}`, `ravel_cpu_gate_handoff_seconds_count{gate,site}` | Summary with no quantiles. Time from handing a job that holds a permit to the blocking pool to the job's first instruction there, and the number of jobs that started. A mean that grows while the wait stays flat means jobs are slow to start once they hold a permit: either the blocking pool is slow to pick them up, or the host is oversubscribed, with more runnable threads than cores, so the blocking thread waits for a core. |

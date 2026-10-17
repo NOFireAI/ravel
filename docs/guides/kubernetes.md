@@ -929,15 +929,14 @@ meaning this release or newer. An older server rejects the unknown flag at
 startup, so the pod restart-loops. Check `spec.image` before you set the
 field, and before you take the release whose notes carry the flipped default.
 
-Decode work at the gated call sites, the kind that can starve the probes
-above, is capped by two CPU gates. `--cpu-gate-read-permits` sizes the read
-gate (query, catalog and maintenance decode; default `max(1, cores - 1)`),
-and `--cpu-gate-write-permits` sizes the write gate (flush encode and ingest
-payload decode; default `max(1, cores / 2)`). Each sample on the per-site
-gate families carries both a `gate` label (`read` or `write`) and a `site`
-label naming the call site; see [CPU gates and
-runtime](observability.md#cpu-gates-and-runtime) in the observability guide
-for the full metric and site list.
+Codec work that used to run on the main runtime's workers now runs behind
+two CPU gates on the blocking pool, and each gate's permit count bounds how
+much CPU that work takes from the workers. The operator does not set the
+permit counts, so every pod runs each gate's default, which is derived from
+the cores the pod sees. Each sample on the per-site gate families carries
+both a `gate` label (`read` or `write`) and a `site` label naming the call
+site; see [CPU gates and runtime](observability.md#cpu-gates-and-runtime)
+in the observability guide for the full metric and site list.
 
 ## Production notes
 
