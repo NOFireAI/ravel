@@ -126,10 +126,10 @@ and `end`.
 
 `POST /api/v1/sql` serves five tables from one endpoint: `samples`
 (metrics), `logs`, `spans`, `alerts` (alert state transitions), and `audit`
-(the audit trail). Each query targets one table. Ravel decides the target
-from the `FROM` clause of the query before planning. It rejects a query that
-names two real tables. The `samples` and `logs` tables follow the same
-one-signal-per-query rule.
+(the audit trail). Ravel decides which tables a query reads from its `FROM`
+clause before planning. `POST /api/v1/sql` can join `spans` with the other
+four tables, reading one snapshot per signal; Flight SQL rejects a query that
+names two of them. The [query guide](query.md) gives the terms of a join.
 
 The `spans` table has these columns:
 

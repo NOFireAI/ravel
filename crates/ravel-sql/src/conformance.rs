@@ -21,10 +21,9 @@
 //!    ([`crate::validate::EXCLUDED_AGGREGATES`], ADR-0022 decision 2), the
 //!    nondeterministic scalars ([`crate::session::EXCLUDED_SCALARS`]) and the
 //!    excluded window functions ([`crate::session::EXCLUDED_WINDOWS`], ADR-0097
-//!    decisions 4 and 6), every write/DDL statement (the read-only
-//!    single-statement gate, [`crate::validate`]), and a query spanning both
-//!    signal tables ([`crate::error::SqlError::CrossSignalQuery`], ADR-0033
-//!    decision C).
+//!    decisions 4 and 6), and every write/DDL statement (the read-only
+//!    single-statement gate, [`crate::validate`]). A query joining signal
+//!    tables is supported on the HTTP path this table describes (ADR-2904).
 //! 3. [`Classification::Unclassified`]: implemented but untested, or
 //!    claimed-supported but actually wrong. This module declares no construct
 //!    into this state; it is the state a construct *falls into* when its
@@ -207,7 +206,6 @@ const E_EXCLUDED_SCALAR: &str = "ValidationError::ExcludedScalar";
 const E_EXCLUDED_WINDOW: &str = "ValidationError::ExcludedWindow";
 const E_NOT_READ_ONLY: &str = "ValidationError::NotReadOnly";
 const E_WRITE_IN_QUERY: &str = "ValidationError::WriteInQuery";
-const E_CROSS_SIGNAL: &str = "SqlError::CrossSignalQuery";
 /// The typed error a moving-frame `avg` surfaces (ADR-0097 decision 5): a
 /// DataFusion "retract_batch is not implemented" refusal, mapped to
 /// [`crate::error::SqlError::Execution`]. Unlike the other rejected constructs,
@@ -832,11 +830,11 @@ pub fn registry() -> Vec<Construct> {
     out.push(Construct {
         category: Category::TableDispatch,
         name: "both tables (cross-signal)".to_string(),
-        example: "SELECT * FROM samples JOIN logs ON samples.ts = logs.ts".to_string(),
-        classification: Classification::IntentionallyRejected {
-            typed_error: E_CROSS_SIGNAL,
-        },
-        rationale: "one signal per query in v1 (ADR-0033 decision C)",
+        example: "SELECT samples.value, logs.body FROM samples JOIN logs \
+                  ON CAST(logs.ts AS BIGINT) = CAST(samples.ts AS BIGINT) + 999"
+            .to_string(),
+        classification: Classification::SupportedAndCovered { test: T_DISPATCH },
+        rationale: "one snapshot per signal, joined on the coordinator (ADR-2904)",
     });
 
     out

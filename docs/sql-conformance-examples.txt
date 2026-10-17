@@ -136,6 +136,6 @@ Write / DDL statement	SET	SET datafusion.execution.batch_size = 1
 Write / DDL statement	Transaction control	BEGIN TRANSACTION
 Write / DDL statement	UPDATE	UPDATE samples SET value = 1
 Write / DDL statement	Write nested in a query body	WITH c AS (SELECT 1) INSERT INTO samples VALUES (1, 2.0)
-Table dispatch	both tables (cross-signal)	SELECT * FROM samples JOIN logs ON samples.ts = logs.ts
+Table dispatch	both tables (cross-signal)	SELECT samples.value, logs.body FROM samples JOIN logs ON CAST(logs.ts AS BIGINT) = CAST(samples.ts AS BIGINT) + 999
 Table dispatch	logs -> Signal::Logs	SELECT ts, body FROM logs
 Table dispatch	samples -> Signal::Metrics	SELECT ts, value FROM samples

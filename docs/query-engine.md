@@ -3163,7 +3163,8 @@ discarded attempt's time is in no field either.
 `stats.pruning` holds the successful attempt's pruning counts, object-level
 and block-level reported independently:
 
-- `segments`: segments in the resolved snapshot.
+- `segments`: segments in the resolved snapshots, summed over every signal
+  table the statement names.
 - `segmentsPrunedByStats`: segments a logs scan skipped before any fetch
   because a typed attribute column's stamped statistics excluded a
   pushed-down predicate (ADR-2121 D1).
@@ -3200,10 +3201,11 @@ The two key-index counts are 0 for a statement with no spans
 `trace_id =` lookup and are sums over every spans scan in the plan. The
 other eight counts after `segments` are 0 for a statement with no logs scan.
 They are sums over every logs scan in the plan (`stats.timings.scans`),
-while `segments` counts the one snapshot all of them read. With one scan,
-`segmentsPrunedByStats` is a subset of `segments`; with two, each scan
-prunes the same snapshot on its own, so the sum can exceed `segments`, and a
-block both scans read counts in `blocksTotal` twice.
+while `segments` counts every segment of every resolved snapshot. With one
+scan, `segmentsPrunedByStats` is a subset of `segments`; with two, each scan
+prunes the same logs snapshot on its own, so the sum can exceed the logs
+snapshot's segments, and a block both scans read counts in `blocksTotal`
+twice.
 `services/ravel-server/tests/sql_declared_prune_reachability_e2e.rs` drives
 both pruning levels through `POST /api/v1/sql`.
 `services/ravel-server/tests/spans_trace_key_index_routing.rs` drives the
@@ -3861,19 +3863,69 @@ marker with its reason.
 
 `POST /api/v1/sql` serves five tables from one endpoint, of which this section
 covers two: `samples` (`Signal::Metrics`) and `logs` (`Signal::Logs`). There is
-no separate logs endpoint and no protocol change. DataFusion does not choose between two
-registered tables: `SqlExecutor` decides which single table a query targets by
+no separate logs endpoint and no protocol change. DataFusion does not choose
+which signals to read: `SqlExecutor` decides which tables a query names by
 parsing its `FROM` clause *before* planning (through the same parser the
-read-only gate uses, never a raw-text scan), resolves a snapshot for that one
-signal, and registers exactly that one table in the per-query `SessionContext`
--- `Signal::Logs` when the query references `logs`, `Signal::Metrics`
-otherwise. A `WITH <name> AS (...)` CTE that happens to be named `logs` or
-`samples` is a query-local name, not a base-table reference, and does not
-change the target (`WITH logs AS (SELECT value FROM samples) SELECT count(*)
-FROM logs` is a metrics-only query). A query naming two real tables, these two
-or any other pair of the five, is rejected before any catalog listing (HTTP
-400): v1 admits one signal per query, and no query needs to scan or join two
-signals together.
+read-only gate uses, never a raw-text scan), resolves one snapshot for each
+signal it names, and registers exactly those tables in the per-query
+`SessionContext`: `Signal::Logs` when the query references `logs`,
+`Signal::Metrics` when it references `samples` or no table at all. A
+`WITH <name> AS (...)` CTE that happens to be named `logs` or `samples` is a
+query-local name, not a base-table reference, and does not change the target
+(`WITH logs AS (SELECT value FROM samples) SELECT count(*) FROM logs` is a
+metrics-only query). A query naming several of the five signal tables runs on
+the HTTP endpoint; the next subsection gives its terms.
+
+### Statements over several signal tables (ADR-2904)
+
+`POST /api/v1/sql` runs a statement that names two or more of `samples`,
+`logs`, `spans`, `alerts` and `audit`, for example a join of `samples` and
+`logs` on their timestamps:
+
+```sql
+SELECT samples.ts, samples.value, logs.body
+FROM samples JOIN logs ON samples.ts = logs.ts
+ORDER BY samples.ts
+```
+
+- **One snapshot per signal, no order between them.** The statement resolves
+  one snapshot for each signal it names, all at the request's one clock
+  reading and window and all before anything is planned. Each table's rows
+  come from one immutable snapshot of its signal. There is no atomicity and
+  no ordering across the snapshots: a statement may see a span whose log
+  lines are not yet visible, or the reverse. A retry resolves every signal
+  again; it never pairs one attempt's snapshot of one signal with another
+  attempt's snapshot of a different one.
+- **Joins run on the coordinator, in one memory pool.** A statement over
+  several tables never fans out to query workers: the distributed samples
+  scan stays a single-table path. The join runs in the coordinator's
+  per-query session under the statement's one memory pool. The memory
+  ceiling is best-effort for join operators (ADR-0013 amendment "memory
+  ceilings are best-effort for joins"): they reach the pool
+  through DataFusion's infallible grow path, which is not checked against the
+  limit, so an over-budget join is not guaranteed to fail with the typed
+  memory error.
+- **Admission is per statement.** `max_segments` is checked against the sum of
+  the segments admitted across every snapshot. Only the `samples` provider
+  enforces a caller's lowered byte and store-request budgets at scan time
+  (ADR-2904 decision 6); a statement inherits that gap for every
+  other signal table it names.
+- **Interim refusals.** Two shapes are refused with HTTP 400 and a message
+  saying they are not supported yet, both before any signal catalog listing:
+  a `min_commit_token` on a statement naming two or more signal tables
+  (`SqlError::CommitTokenAcrossSignals`; the table-qualified token form of
+  ADR-2904 decision 3 is not built), and a signal table beside a Parquet
+  table (`SqlError::SignalBesideParquet`). The Parquet refusal comes after the
+  Parquet manifest reads that tell a live table from an unknown or dropped
+  name: one manifest LIST per other table name, in name order, up to and
+  including the first live table, and a GET for each of those names that has
+  a manifest version.
+- **Surfaces that keep the one-table rule.** Flight SQL refuses a statement
+  naming two or more signal tables with `SqlError::CrossSignalQuery` before any
+  catalog listing, until its ticket can carry one segment group per signal
+  (ADR-2904 decision 10). ES|QL reads one table per
+  query and keeps the same refusal. Paging (`page_plan`) refuses such a
+  statement with `PagePlanError::CrossSignal`.
 
 Schema (fixed columns plus one map):
 
@@ -4554,12 +4606,13 @@ oversights.
 
 `POST /api/v1/sql` serves `spans` (`Signal::Spans`) alongside `samples` and
 `logs`, and alongside the `alerts` and `audit` tables the next section covers.
-It follows the same one-signal-per-query rule the
-logs table established. `SqlExecutor` decides the target table from the `FROM`
-clause before planning, resolves a snapshot for that one signal, and registers
-exactly the one table in the per-query `SessionContext`. A query naming two real
-tables is rejected before any catalog listing (HTTP 400). A CTE named `spans` is
-a query-local name, not a base-table reference.
+It follows the same table dispatch the logs table established. `SqlExecutor`
+decides the tables from the `FROM` clause before planning, resolves one
+snapshot for each signal named, and registers exactly those tables in the
+per-query `SessionContext`. A query that also names another signal table runs
+on the HTTP endpoint on the terms of
+[Statements over several signal tables](#statements-over-several-signal-tables-adr-2904).
+A CTE named `spans` is a query-local name, not a base-table reference.
 
 The operator-facing walkthrough, with worked queries, is
 [docs/guides/traces.md](guides/traces.md). This section is the reference: the
@@ -4704,15 +4757,17 @@ carries far more bytes than a fixed-width one.
 
 `POST /api/v1/sql` and Flight SQL serve `alerts` (`Signal::Alerts`) and `audit`
 (`Signal::Audit`) as the fourth and fifth tables, on the same terms as the three
-above. `SqlExecutor` reads the target from the `FROM` clause before planning,
-counts five names, and rejects a query that names two of them with
-`CrossSignalQuery` before any catalog listing (HTTP 400). It then resolves a
-snapshot for that one signal and registers exactly one table in the per-query
-`SessionContext`, as it does for every other target; a CTE named `alerts` or
-`audit` is a query-local name and does not change the target. Flight SQL's
-`CommandGetTables` lists all five tables with their public schemas: that is
-static catalog metadata built from the five schema functions, independent of the
-per-query session, which still registers one table.
+above. `SqlExecutor` reads the tables from the `FROM` clause before planning,
+resolves one snapshot for each signal named and registers exactly those tables
+in the per-query `SessionContext`, as it does for every other table; a CTE
+named `alerts` or `audit` is a query-local name and does not change the target.
+A query naming two of the five runs over HTTP on the terms of
+[Statements over several signal tables](#statements-over-several-signal-tables-adr-2904);
+Flight SQL rejects it with `CrossSignalQuery` before any catalog listing.
+Flight SQL's `CommandGetTables` lists all five tables with their public
+schemas: that is static catalog metadata built from the five schema functions,
+independent of the per-query session, which registers only the tables a
+statement names.
 
 Both tables are built on the logs table's machinery. An alert record and an
 audit record are RLOG records (ADR-0040), so both providers scan through the

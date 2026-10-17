@@ -49,7 +49,7 @@ use ravel_sql::{
 };
 use ravel_tenant_resolve::Principal;
 use ravel_types::logstream::log_stream_id;
-use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
+use ravel_types::{CommitToken, Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 use serde_json::Value;
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -3330,21 +3330,146 @@ async fn sql_query_against_spans_table_returns_rows() {
     assert_eq!(rows[1][1], serde_json::json!(700_000_000));
 }
 
-/// A cross-signal query naming `spans` and `samples` is rejected as a 400 with
-/// the shared `CrossSignalQuery` message, over the real HTTP handler and before
-/// any catalog listing (ADR-0033 decision C extended to the third table by
-/// ADR-0045 decision 5).
+/// A statement joining `spans` and `samples` runs over the real HTTP handler
+/// (ADR-2904 decision 1): each table reads its own signal's snapshot and the
+/// join pairs the span starting at 100 ns with the sample at 100 ns only.
 #[tokio::test]
-async fn a_spans_plus_samples_query_is_rejected_over_http() {
-    let app = one_tenant_app("m", &[(100, 1.0)]).await;
+async fn a_spans_plus_samples_query_runs_over_http() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(store.as_ref(), &tenant, 0, "m", &[(100, 1.0), (250, 2.0)]).await;
+    let spans = [
+        span_record(
+            [1u8; 16],
+            1,
+            "checkout",
+            "POST /checkout",
+            100,
+            1_000,
+            ravel_rspan::StatusCode::Ok,
+        ),
+        span_record(
+            [1u8; 16],
+            2,
+            "checkout",
+            "GET /cart",
+            200,
+            1_000,
+            ravel_rspan::StatusCode::Ok,
+        ),
+    ];
+    publish_span_segment(store.as_ref(), &tenant, 1, &spans).await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
     let (status, value) = post_json(
         &app,
         "acme-token",
-        "SELECT * FROM spans JOIN samples ON spans.start_ts = samples.ts",
+        "SELECT spans.name, samples.value FROM spans \
+         JOIN samples ON spans.start_ts = samples.ts",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["POST /checkout", 1.0]]),
+        "{value}"
+    );
+}
+
+/// A statement joining `samples` and `logs` over HTTP returns exactly the
+/// joined rows: the samples at 100 ns and 150 ns each meet one log record, the
+/// sample at 300 ns and the record at 200 ns meet nothing.
+#[tokio::test]
+async fn a_samples_logs_join_returns_exact_rows_over_http() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(
+        store.as_ref(),
+        &tenant,
+        0,
+        "m",
+        &[(100, 1.0), (150, 2.0), (300, 3.0)],
+    )
+    .await;
+    let records = [
+        log_record("api", 100, "hello world"),
+        log_record("api", 150, "connection timeout"),
+        log_record("worker", 200, "shutdown ok"),
+    ];
+    publish_log_segment(store.as_ref(), &tenant, 1, &records).await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT samples.ts, samples.value, logs.body FROM samples \
+         JOIN logs ON samples.ts = logs.ts ORDER BY samples.ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([[100, 1.0, "hello world"], [150, 2.0, "connection timeout"]]),
+        "{value}"
+    );
+}
+
+/// A `min_commit_token` on a statement naming two signal tables is a 400 that
+/// says it is not supported yet; the same token on a one-table statement is
+/// not refused for that reason.
+#[tokio::test]
+async fn a_min_commit_token_on_a_two_signal_statement_is_a_bad_request() {
+    let app = one_tenant_app("m", &[(100, 1.0)]).await;
+    let token = CommitToken {
+        shard: 0,
+        writer_id: Uuid::from_u128(2_000),
+        epoch: 1,
+        seq: 1,
+        ingest_hour_bucket: 0,
+    }
+    .encode();
+    let payload = |query: &str| {
+        serde_json::json!({
+            "query": query,
+            "start": 0.0,
+            "end": NOW_NS as f64 / 1_000_000_000.0,
+            "min_commit_token": [token],
+        })
+        .to_string()
+    };
+
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        None,
+        payload("SELECT samples.ts FROM samples JOIN logs ON samples.ts = logs.ts"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let value: Value = serde_json::from_slice(&bytes).expect("json");
     assert_eq!(value["status"], "error");
+    let message = value["error"].as_str().expect("message");
+    assert!(
+        message.contains("min_commit_token") && message.contains("not supported yet"),
+        "{value}"
+    );
+
+    // The one-table statement takes the token to the catalog, which has
+    // never seen writer 2000, so it answers the stable unsatisfiable-token
+    // 503 rather than the cross-signal 400.
+    let (status, bytes) = post(
+        &app,
+        Some("acme-token"),
+        None,
+        payload("SELECT ts FROM samples"),
+    )
+    .await;
+    let value: Value = serde_json::from_slice(&bytes).expect("json");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
+    assert_eq!(value["errorType"], "unavailable", "{value}");
+    assert_eq!(value["error"], ravel_sql::MSG_UNSATISFIABLE, "{value}");
 }
 
 // ---------------------------------------------------------------------------
@@ -3537,12 +3662,11 @@ async fn sql_query_against_audit_table_returns_the_previous_querys_audit_record(
     );
 }
 
-/// A cross-signal query naming `alerts` and `logs` is rejected as a 400, the
-/// same way `spans` + `samples` is: ADR-1101 decision 1 extends the
-/// one-signal-per-query rule from three names to five, and the rejection
-/// happens in `target_signal` before any catalog listing.
+/// A statement joining `alerts` and `logs` runs over HTTP the same way
+/// `spans` + `samples` does (ADR-2904 decision 1); with neither signal written
+/// it answers with the joined columns and no rows.
 #[tokio::test]
-async fn an_alerts_plus_logs_query_is_rejected_over_http() {
+async fn an_alerts_plus_logs_query_runs_over_http() {
     let app = one_tenant_app("m", &[(100, 1.0)]).await;
     let (status, value) = post_json(
         &app,
@@ -3550,8 +3674,9 @@ async fn an_alerts_plus_logs_query_is_rejected_over_http() {
         "SELECT * FROM alerts JOIN logs ON alerts.ts_ns = logs.ts",
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
-    assert_eq!(value["status"], "error");
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success");
+    assert_eq!(value["data"]["rows"], serde_json::json!([]), "{value}");
 }
 
 /// A planning failure on a `logs` query returns the shared, redacted planning

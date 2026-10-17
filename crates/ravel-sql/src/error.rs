@@ -150,20 +150,42 @@ pub enum SqlError {
     #[error(transparent)]
     Validation(#[from] ValidationError),
 
-    /// The query references two or more of the registered tables (`samples`,
-    /// `logs`, `spans`, `alerts`, `audit`), or one of them and a Parquet table
-    /// of the caller's tenant (ADR-2040 decision D6). ADR-0033 decision C
-    /// admits exactly one signal per query in v1, and ADR-0045 decision 5 and
-    /// ADR-1101 decision 1 extend that rule to the third, fourth and fifth
-    /// tables, so this is rejected before any catalog resolve. Its text names
-    /// only the fixed table names -- no server state -- so it is safe to
-    /// return verbatim, like a validation error, and maps to HTTP 400.
+    /// The statement names two or more of the signal tables (`samples`,
+    /// `logs`, `spans`, `alerts`, `audit`) on a surface that keeps the
+    /// one-table rule: Flight SQL and ES|QL (ADR-2904 decisions 1 and 9). The
+    /// HTTP SQL statement path runs such a statement instead. Refused from the
+    /// statement text before any catalog resolve. Its text names only the
+    /// fixed table names -- no server state -- so it is safe to return
+    /// verbatim, like a validation error, and maps to HTTP 400.
     #[error(
-        "a SQL query may reference exactly one of the samples, logs, spans, \
-         alerts and audit tables, or only Parquet tables; two signals, or a \
-         signal and a Parquet table, cannot be scanned or joined together in v1"
+        "this query surface reads at most one of the samples, logs, spans, \
+         alerts and audit tables per statement; send a statement that joins \
+         two of them to the HTTP SQL endpoint"
     )]
     CrossSignalQuery,
+
+    /// A `min_commit_token` on a statement that names two or more signal
+    /// tables. A token does not yet say which table it applies to (ADR-2904
+    /// decision 3), so this is refused from the request alone, before any
+    /// catalog resolve. The text names no server state; HTTP 400.
+    #[error(
+        "min_commit_token on a statement that names more than one of the samples, \
+         logs, spans, alerts and audit tables is not supported yet; send the \
+         statement without min_commit_token, or one statement per table"
+    )]
+    CommitTokenAcrossSignals,
+
+    /// A statement that names a signal table beside a live Parquet table of
+    /// the caller's tenant (ADR-2904 decision 11 allows it; not implemented
+    /// yet). Refused after the Parquet manifest listing that tells a Parquet
+    /// name apart from an unknown one, and before any catalog resolve. The
+    /// text names no server state; HTTP 400.
+    #[error(
+        "a statement that names one of the samples, logs, spans, alerts and \
+         audit tables beside a Parquet table is not supported yet; query them in \
+         separate statements"
+    )]
+    SignalBesideParquet,
 
     /// The query names more than [`crate::MAX_STATEMENT_TABLE_NAMES`]
     /// distinct base tables besides the five signal tables. Each could be a
@@ -505,6 +527,8 @@ impl SqlError {
             SqlError::PlanNotAdmitted(_) => ErrorClass::Internal,
             SqlError::Validation(_)
             | SqlError::CrossSignalQuery
+            | SqlError::CommitTokenAcrossSignals
+            | SqlError::SignalBesideParquet
             | SqlError::TooManyTables { .. } => ErrorClass::BadRequest,
             // An over-wide window refused before any LIST is a
             // resource-budget rejection, the same class as the segment/sample
@@ -576,7 +600,9 @@ impl SqlError {
         match self {
             SqlError::Validation(e) => e.to_string(),
             // Safe to echo: the text names only the fixed table names.
-            SqlError::CrossSignalQuery => self.to_string(),
+            SqlError::CrossSignalQuery
+            | SqlError::CommitTokenAcrossSignals
+            | SqlError::SignalBesideParquet => self.to_string(),
             // Safe to echo: the text carries only the two counts.
             SqlError::TooManyTables { .. } => self.to_string(),
             // Safe to echo: `WindowTooWide` carries only the estimate and the
@@ -1916,6 +1942,22 @@ mod tests {
         }
         // It carries no server state to redact.
         assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn the_interim_cross_signal_refusals_are_bad_requests_that_keep_their_text() {
+        for (err, names) in [
+            (SqlError::CommitTokenAcrossSignals, "min_commit_token"),
+            (SqlError::SignalBesideParquet, "Parquet"),
+        ] {
+            assert_eq!(err.class(), ErrorClass::BadRequest, "{err}");
+            assert_eq!(err.client_message(), err.to_string());
+            // The text says what is missing, so a client can tell an interim
+            // limit from a malformed statement.
+            assert!(err.client_message().contains("not supported yet"), "{err}");
+            assert!(err.client_message().contains(names), "{err}");
+            assert_redacted(&err.client_message());
+        }
     }
 
     #[test]

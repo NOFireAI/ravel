@@ -15,11 +15,14 @@
 //!    ADR-1101 decision 1): `Signal::Metrics` for `samples`, `Signal::Logs`
 //!    for `logs`, `Signal::Spans` for `spans`, `Signal::Alerts` for `alerts`,
 //!    `Signal::Audit` for `audit`, in that order, and `Signal::Metrics` alone
-//!    for a statement naming none. Every public entry point still rejects a
-//!    query referencing two of the five tables with
-//!    [`SqlError::CrossSignalQuery`] before any catalog request, because v1
-//!    admits one signal per query (decision C); the per-signal resolve is
-//!    reachable only from a test executor. `name_filter` is the equality
+//!    for a statement naming none. The HTTP statement path
+//!    ([`SqlExecutor::execute_accounted`], [`SqlExecutor::explain_accounted`])
+//!    runs a statement naming several of the five tables, one lane each
+//!    (ADR-2904 decision 1), and refuses one that also carries a
+//!    `min_commit_token` with [`SqlError::CommitTokenAcrossSignals`] before
+//!    any catalog request. The Flight SQL entry points and ES|QL keep the
+//!    one-table rule and refuse it with [`SqlError::CrossSignalQuery`] before
+//!    any catalog request. `name_filter` is the equality
 //!    `__name__` value derived from the `samples` scans' pushed-down
 //!    predicates ([`SqlExecutor::pushed_down_name_filter`]) and is passed to
 //!    the metrics resolve alone, so a metrics query naming one metric prunes
@@ -31,7 +34,8 @@
 //!    (ADR-2040) resolves no catalog: [`SqlExecutor::resolve_parquet_target`]
 //!    reads each table's newest live manifest and the tenant's current grants
 //!    instead, and refuses a file outside every grant. A Parquet table beside
-//!    a signal table is [`SqlError::CrossSignalQuery`].
+//!    a signal table is [`SqlError::SignalBesideParquet`], refused after the
+//!    Parquet manifest listing and before any catalog resolve.
 //! 3. Build the fresh single-tenant `SessionContext` around the owned
 //!    snapshots, registering one table per resolved signal, or the query's
 //!    Parquet tables (security invariant 2, crate::session).
@@ -252,11 +256,24 @@ impl StatementTables {
     }
 }
 
-/// Refuse a statement naming two or more signal tables. Every public entry
-/// point that takes statement text calls this before any catalog request.
+/// The one-table rule of Flight SQL and ES|QL (ADR-2904 decision 9): refuse a
+/// statement naming two or more signal tables. Their entry points call this
+/// before any catalog request.
 pub(crate) fn refuse_cross_signal(tables: &StatementTables) -> Result<(), SqlError> {
     if tables.signals.len() > 1 {
         return Err(SqlError::CrossSignalQuery);
+    }
+    Ok(())
+}
+
+/// The HTTP SQL statement path's table rule (ADR-2904 decision 1): any number
+/// of signal tables, but a `min_commit_token` only on a statement naming at
+/// most one, because a token cannot yet name the table it applies to.
+/// [`SqlExecutor::execute_accounted`] and [`SqlExecutor::explain_accounted`]
+/// call this before any catalog request.
+fn admit_http_tables(tables: &StatementTables, min_tokens: &[CommitToken]) -> Result<(), SqlError> {
+    if tables.signals.len() > 1 && !min_tokens.is_empty() {
+        return Err(SqlError::CommitTokenAcrossSignals);
     }
     Ok(())
 }
@@ -1027,8 +1044,8 @@ fn apply_row_window(
 pub struct ExplainReport {
     /// The signal the validated statement targets, chosen from its `FROM`
     /// clause the same way execution chooses it: for a statement naming
-    /// several signal tables, which only a test executor admits, the first it
-    /// names in the order `samples`, `logs`, `spans`, `alerts`, `audit`.
+    /// several signal tables, the first it names in the order `samples`,
+    /// `logs`, `spans`, `alerts`, `audit`.
     pub target: TargetSignal,
     /// The effective result schema, declared typed columns (ADR-0090)
     /// included.
@@ -1325,10 +1342,6 @@ pub struct SqlExecutor {
     /// How many times [`Self::executed_plan`] built a plan to execute.
     #[cfg(test)]
     executed_plan_builds: std::sync::atomic::AtomicUsize,
-    /// Skip [`refuse_cross_signal`] at the entry points, so a test can run a
-    /// statement naming several signal tables (ADR-2904, part A).
-    #[cfg(test)]
-    allow_cross_signal: bool,
 }
 
 /// One tenant's memory accountant plus the last-touch stamp idle-tenant
@@ -1375,8 +1388,6 @@ impl SqlExecutor {
             spill_fallbacks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             executed_plan_builds: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            allow_cross_signal: false,
         }
     }
 
@@ -1596,7 +1607,7 @@ impl SqlExecutor {
     ) -> Result<SqlOutcome, SqlError> {
         // Step 1: the security gate runs before any catalog or plan work.
         validate_query(&req.sql)?;
-        self.admit_statement_tables(Statement::Sql(&req.sql))?;
+        admit_http_tables(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
@@ -1636,7 +1647,7 @@ impl SqlExecutor {
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
         let statement = Statement::Lowered(statement);
-        self.admit_statement_tables(statement)?;
+        refuse_cross_signal(&statement.tables()?)?;
         let sql_req = SqlRequest {
             sql: String::new(),
             window: req.window,
@@ -1704,7 +1715,7 @@ impl SqlExecutor {
         // statement costs no catalog LIST here either, and it runs outside the
         // timeout because a rejection is not a thing that can time out.
         validate_query(&req.sql)?;
-        self.admit_statement_tables(Statement::Sql(&req.sql))?;
+        admit_http_tables(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
@@ -1734,7 +1745,6 @@ impl SqlExecutor {
         // `resolve_admitted`/`plan_pinned_with` now take.
         let phase_accounting = PhaseAccounting::pooled_over(accounting);
         let statement = Statement::Sql(&req.sql);
-        statement.tables()?;
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         // `resolve_admitted` itself checks the effective `max_s3_requests`
         // right after resolve returns, so `explain` gets that enforcement
@@ -1813,13 +1823,6 @@ impl SqlExecutor {
         // resolve window, so the declared schema and the snapshot are pinned to
         // one instant together.
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
-
-        // Checked from the statement text alone, before the loop, so a
-        // statement naming too many tables fails here rather than after a
-        // snapshot resolve has already been paid for. Which target it reads is
-        // each attempt's resolve's answer: whether a name is a Parquet table
-        // is a fact about the store, not the text.
-        statement.tables()?;
 
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
@@ -1991,8 +1994,8 @@ impl SqlExecutor {
         // handle's counters across all five phases, so the resolve's cost
         // still lands on `accounting` exactly as before.
         //
-        // A Flight ticket pins one snapshot, so this path refuses a statement
-        // over several signal tables whatever the executor allows.
+        // A Flight ticket pins one snapshot, so this path keeps the one-table
+        // rule (ADR-2904 decision 10 lifts it with a new ticket layout).
         refuse_cross_signal(&Statement::Sql(&req.sql).tables()?)?;
         let resolved = self
             .resolve(
@@ -2142,8 +2145,8 @@ impl SqlExecutor {
     }
 
     /// The one lane a Flight-pinned `snapshot` plans `sql` over: a ticket pins
-    /// one snapshot, so a statement naming several signal tables is refused
-    /// here whatever the executor allows.
+    /// one snapshot, so a statement naming several signal tables is
+    /// [`SqlError::CrossSignalQuery`] here, before anything is read.
     fn pinned_lane(
         sql: &str,
         snapshot: Snapshot,
@@ -2386,132 +2389,134 @@ impl SqlExecutor {
                 tables,
             )));
         }
-        for (signal, snapshot) in lanes {
-            if target == TargetSignal::Parquet {
-                break;
-            }
-            let table = match signal {
-                TargetSignal::Metrics => {
-                    #[cfg_attr(not(feature = "flight-sql"), allow(unused_mut))]
-                    let mut provider = RavelTableProvider::new(
-                        snapshot,
-                        tenant_hash,
-                        self.fetcher.clone(),
-                        config.clone(),
-                        phase_accounting.clone(),
-                    );
-                    // Install the distributed samples scan for this query only,
-                    // when the coordinator decided to fan out. `None`/feature-off
-                    // leaves the provider byte-identical to the local path.
-                    #[cfg(feature = "flight-sql")]
-                    if let Some((endpoints, client)) = distributed.take() {
-                        provider = provider.with_distributed_scan(endpoints, client);
+        // A Parquet statement built its tables above and reads no lane.
+        if target != TargetSignal::Parquet {
+            for (signal, snapshot) in lanes {
+                let table = match signal {
+                    TargetSignal::Metrics => {
+                        #[cfg_attr(not(feature = "flight-sql"), allow(unused_mut))]
+                        let mut provider = RavelTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.fetcher.clone(),
+                            config.clone(),
+                            phase_accounting.clone(),
+                        );
+                        // Install the distributed samples scan for this query only,
+                        // when the coordinator decided to fan out. `None`/feature-off
+                        // leaves the provider byte-identical to the local path.
+                        #[cfg(feature = "flight-sql")]
+                        if let Some((endpoints, client)) = distributed.take() {
+                            provider = provider.with_distributed_scan(endpoints, client);
+                        }
+                        SessionTable::Metrics(Arc::new(provider))
                     }
-                    SessionTable::Metrics(Arc::new(provider))
-                }
-                // The declared typed attribute columns (ADR-0090) resolved once per
-                // plan are installed on the logs provider here; they widen the
-                // table's schema and are consumed only by this provider. Every
-                // other table leaves `extras.declared` unused.
-                TargetSignal::Logs => {
-                    // ADR-0850: resolved once per plan from the current folded
-                    // catalog HEAD, independently of `snapshot` (a different
-                    // object, not versioned against the pinned snapshot). `None`
-                    // -- nothing folded yet, no configured typed columns, or the
-                    // last fold's build/PUT failed -- reproduces the
-                    // pre-ADR-0850 provider exactly; every metadata-only path
-                    // keyed off it degrades to scanning on a `None`.
-                    let column_stats = if extras.declared.is_empty() {
-                        // No configured typed columns: no metadata-only column path
-                        // can ever apply, so skip the HEAD GET load_column_stats
-                        // would issue. This keeps a predicate-free COUNT(*) on a
-                        // tenant with no declared columns reading zero objects, and
-                        // reproduces the pre-ADR-0850 provider exactly.
-                        None
-                    } else if !self.logs_column_stats_eligible(
-                        &snapshot,
-                        analyzed.as_ref(),
-                        &extras.declared,
-                        several_tables,
-                    ) {
-                        // Issue #888: no metadata-only column path can fire for this
-                        // plan (decided from the plan and the resolved snapshot
-                        // alone, ahead of the load), so skip the two GETs
-                        // load_column_stats would issue. A `None` here reproduces
-                        // the pre-ADR-0850 provider exactly, the same as an absent
-                        // stats object would, so every failing-open behavior is
-                        // preserved.
-                        None
-                    } else {
-                        self.catalog
-                            .load_column_stats(
-                                &tenant_hash,
-                                Signal::Logs,
-                                extras.column_stats_window,
-                                extras.column_stats_now_ns,
-                                phase_accounting.plan(),
+                    // The declared typed attribute columns (ADR-0090) resolved once per
+                    // plan are installed on the logs provider here; they widen the
+                    // table's schema and are consumed only by this provider. Every
+                    // other table leaves `extras.declared` unused.
+                    TargetSignal::Logs => {
+                        // ADR-0850: resolved once per plan from the current folded
+                        // catalog HEAD, independently of `snapshot` (a different
+                        // object, not versioned against the pinned snapshot). `None`
+                        // -- nothing folded yet, no configured typed columns, or the
+                        // last fold's build/PUT failed -- reproduces the
+                        // pre-ADR-0850 provider exactly; every metadata-only path
+                        // keyed off it degrades to scanning on a `None`.
+                        let column_stats = if extras.declared.is_empty() {
+                            // No configured typed columns: no metadata-only column path
+                            // can ever apply, so skip the HEAD GET load_column_stats
+                            // would issue. This keeps a predicate-free COUNT(*) on a
+                            // tenant with no declared columns reading zero objects, and
+                            // reproduces the pre-ADR-0850 provider exactly.
+                            None
+                        } else if !self.logs_column_stats_eligible(
+                            &snapshot,
+                            analyzed.as_ref(),
+                            &extras.declared,
+                            several_tables,
+                        ) {
+                            // Issue #888: no metadata-only column path can fire for this
+                            // plan (decided from the plan and the resolved snapshot
+                            // alone, ahead of the load), so skip the two GETs
+                            // load_column_stats would issue. A `None` here reproduces
+                            // the pre-ADR-0850 provider exactly, the same as an absent
+                            // stats object would, so every failing-open behavior is
+                            // preserved.
+                            None
+                        } else {
+                            self.catalog
+                                .load_column_stats(
+                                    &tenant_hash,
+                                    Signal::Logs,
+                                    extras.column_stats_window,
+                                    extras.column_stats_now_ns,
+                                    phase_accounting.plan(),
+                                )
+                                .await?
+                        };
+                        SessionTable::Logs(Arc::new(
+                            LogsTableProvider::new(
+                                snapshot,
+                                tenant_hash,
+                                self.log_fetcher.clone(),
+                                phase_accounting.clone(),
                             )
-                            .await?
-                    };
-                    SessionTable::Logs(Arc::new(
-                        LogsTableProvider::new(
+                            .with_declared_columns(extras.declared.clone())
+                            .with_column_stats(column_stats)
+                            .with_segment_timing(config.segment_timing),
+                        ))
+                    }
+                    // The alerts and audit providers are not yet threaded onto the
+                    // per-phase seam (issue #1367 scoped its phase split to the
+                    // `samples`/`logs` tables): each still takes one pooled
+                    // `QueryAccounting`, fed here by extracting the Scan-phase handle,
+                    // matching where every other pooled reader in this crate now
+                    // lands (`RowFetchSource`, `distributed_samples_plan`). Every
+                    // alert or audit GET is still recorded, just not split by phase.
+                    //
+                    // The spans provider takes the per-phase handles (issue #2754): a
+                    // trace lookup's footer and section reads land on the plan phase
+                    // and its block runs on the scan phase; a whole-object span read
+                    // lands on the scan phase. Every fetch is tenant-checked (fails
+                    // closed on a footer tenant_hash mismatch).
+                    TargetSignal::Spans => SessionTable::Spans(Arc::new(
+                        SpansTableProvider::new(
+                            snapshot,
+                            tenant_hash,
+                            self.span_fetcher.clone(),
+                            phase_accounting.scan().clone(),
+                        )
+                        .with_phase_accounting(phase_accounting.clone()),
+                    )),
+                    // The two RLOG-backed tables (ADR-1101 decision 1) read through the
+                    // executor's existing `log_fetcher`: an alert and an audit record
+                    // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
+                    // tenant-checked fetch funnel and its caches. No declared columns
+                    // and no column statistics apply to either.
+                    TargetSignal::Alerts => {
+                        SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
                             snapshot,
                             tenant_hash,
                             self.log_fetcher.clone(),
-                            phase_accounting.clone(),
-                        )
-                        .with_declared_columns(extras.declared.clone())
-                        .with_column_stats(column_stats)
-                        .with_segment_timing(config.segment_timing),
-                    ))
-                }
-                // The alerts and audit providers are not yet threaded onto the
-                // per-phase seam (issue #1367 scoped its phase split to the
-                // `samples`/`logs` tables): each still takes one pooled
-                // `QueryAccounting`, fed here by extracting the Scan-phase handle,
-                // matching where every other pooled reader in this crate now
-                // lands (`RowFetchSource`, `distributed_samples_plan`). Every
-                // alert or audit GET is still recorded, just not split by phase.
-                //
-                // The spans provider takes the per-phase handles (issue #2754): a
-                // trace lookup's footer and section reads land on the plan phase
-                // and its block runs on the scan phase; a whole-object span read
-                // lands on the scan phase. Every fetch is tenant-checked (fails
-                // closed on a footer tenant_hash mismatch).
-                TargetSignal::Spans => SessionTable::Spans(Arc::new(
-                    SpansTableProvider::new(
+                            phase_accounting.scan().clone(),
+                        )))
+                    }
+                    TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
                         snapshot,
                         tenant_hash,
-                        self.span_fetcher.clone(),
+                        self.log_fetcher.clone(),
                         phase_accounting.scan().clone(),
-                    )
-                    .with_phase_accounting(phase_accounting.clone()),
-                )),
-                // The two RLOG-backed tables (ADR-1101 decision 1) read through the
-                // executor's existing `log_fetcher`: an alert and an audit record
-                // ride RLOG v1 verbatim, so they share the `logs` table's accounted,
-                // tenant-checked fetch funnel and its caches. No declared columns
-                // and no column statistics apply to either.
-                TargetSignal::Alerts => SessionTable::Alerts(Arc::new(AlertsTableProvider::new(
-                    snapshot,
-                    tenant_hash,
-                    self.log_fetcher.clone(),
-                    phase_accounting.scan().clone(),
-                ))),
-                TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
-                    snapshot,
-                    tenant_hash,
-                    self.log_fetcher.clone(),
-                    phase_accounting.scan().clone(),
-                ))),
-                // A Parquet statement built its tables above and reads no lane.
-                TargetSignal::Parquet => {
-                    return Err(SqlError::Internal(
-                        "the Parquet target was chosen without its tables".to_string(),
-                    ));
-                }
-            };
-            session_tables.push(table);
+                    ))),
+                    // A lane is a signal table, never Parquet.
+                    TargetSignal::Parquet => {
+                        return Err(SqlError::Internal(
+                            "the Parquet target was chosen without its tables".to_string(),
+                        ));
+                    }
+                };
+                session_tables.push(table);
+            }
         }
 
         let decision = match &scratch {
@@ -3062,7 +3067,8 @@ impl SqlExecutor {
     ///   before anything is read: such a statement can only succeed as a
     ///   Parquet query, and a Parquet table has no event-time column.
     /// - A signal table beside a live Parquet table is
-    ///   [`SqlError::CrossSignalQuery`].
+    ///   [`SqlError::SignalBesideParquet`] (ADR-2904 decision 11, not
+    ///   implemented yet), before the caller resolves any signal catalog.
     /// - With no credential profiles configured, a live Parquet table is
     ///   [`ParquetQueryError::NotConfigured`].
     /// - In both cases above the names are listed in order and the first live
@@ -3106,7 +3112,7 @@ impl SqlExecutor {
                 parquet::first_live_table(sources, &tenant_hash, &tables.others, accounting)
                     .await?;
             return match named {
-                Some(_) if !tables.signals.is_empty() => Err(SqlError::CrossSignalQuery),
+                Some(_) if !tables.signals.is_empty() => Err(SqlError::SignalBesideParquet),
                 Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
                 None => Ok(None),
             };
@@ -3696,8 +3702,8 @@ impl SqlExecutor {
     /// - references `samples` only, or references no real table ->
     ///   [`TargetSignal::Metrics`].
     /// - references two or more of {`samples`, `logs`, `spans`, `alerts`,
-    ///   `audit`} -> [`SqlError::CrossSignalQuery`], rejected before the
-    ///   catalog LIST (decision C: v1 admits one signal per query).
+    ///   `audit`} -> [`SqlError::CrossSignalQuery`], the one-table rule
+    ///   ([`refuse_cross_signal`]) the Flight SQL and ES|QL surfaces apply.
     ///
     /// The "no real table" case (a constant query such as `SELECT 1`, or one
     /// whose only source is a CTE with no base table) defaults to `Metrics`: it
@@ -3723,7 +3729,8 @@ impl SqlExecutor {
     /// [`MAX_STATEMENT_TABLE_NAMES`] other names are
     /// [`SqlError::TooManyTables`], so the Parquet resolve's one LIST per
     /// name is bounded before it starts. Two signal tables are not refused
-    /// here; [`refuse_cross_signal`] does that at the entry points.
+    /// here: each entry point applies its own rule ([`refuse_cross_signal`]
+    /// on Flight SQL and ES|QL, [`admit_http_tables`] on HTTP).
     pub(crate) fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
         let mut tables = referenced_base_tables(sql)?;
         let signals: Vec<TargetSignal> = SIGNAL_LANE_ORDER
@@ -3742,26 +3749,6 @@ impl SqlExecutor {
             signals,
             others: tables,
         })
-    }
-
-    /// The cross-signal refusal every public entry point applies before any
-    /// catalog request: `statement`'s tables, refused when they name two or
-    /// more signal tables. A test executor may switch the refusal off
-    /// ([`Self::allow_cross_signal_for_test`]); nothing else can.
-    fn admit_statement_tables(&self, statement: Statement<'_>) -> Result<(), SqlError> {
-        let tables = statement.tables()?;
-        #[cfg(test)]
-        if self.allow_cross_signal {
-            return Ok(());
-        }
-        refuse_cross_signal(&tables)
-    }
-
-    /// Let this executor run statements naming several signal tables.
-    #[cfg(test)]
-    pub(crate) fn allow_cross_signal_for_test(mut self) -> Self {
-        self.allow_cross_signal = true;
-        self
     }
 
     /// Build a session over each lane's snapshot, plan, and drain the stream.
@@ -6682,12 +6669,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// ADR-0045 decision 5 / ADR-0033 decision C: a cross-signal query is
-    /// rejected before any catalog work, so it costs zero store requests. Runs
-    /// a `spans` + `samples` join through `execute` against an
-    /// `InstrumentedStore` and asserts both that the error is `CrossSignalQuery`
-    /// and that the store saw no LIST/GET/HEAD at all -- proving the rejection
-    /// lands in `target_signal` ahead of `resolve`'s catalog LIST, not after it.
+    /// ADR-2904 decision 9: the Flight SQL resolve keeps the one-table rule and
+    /// refuses a cross-signal query before any catalog work, so it costs zero
+    /// store requests. Runs a `spans` + `samples` join through
+    /// `resolve_snapshot` against an `InstrumentedStore` and asserts both that
+    /// the error is `CrossSignalQuery` and that the store saw no LIST/GET/HEAD
+    /// at all.
     #[tokio::test]
     async fn cross_signal_query_rejected_before_any_catalog_listing() {
         use ravel_catalog::CatalogConfig;
@@ -6722,7 +6709,7 @@ pub(crate) mod tests {
 
         let before = store.metrics().snapshot();
         let err = executor
-            .execute(TenantHash([7u8; 16]), &request)
+            .resolve_snapshot(TenantHash([7u8; 16]), &request, &QueryAccounting::new())
             .await
             .expect_err("a spans+samples cross-signal query is rejected");
         let after = store.metrics().snapshot();

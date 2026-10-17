@@ -608,16 +608,28 @@ Ravel checks the catalog-list budget before it makes any object-store request:
 - `audit` (audit records)
 
 The server parses the `FROM` clause of the query before it plans, and
-registers only that one table for the query. One query can reference only one
-of the five. A query that names two or more of them crosses signals. Ravel
-rejects it with an HTTP 400 before any catalog listing. The request body,
-auth, window (`start`/`end`), and `min_commit_token` handling are the same for
-all five tables.
+registers only the tables the query names. A query can join two or more of
+the five, for example `samples` and `logs` on their timestamps:
+
+```sql
+SELECT samples.ts, samples.value, logs.body
+FROM samples JOIN logs ON samples.ts = logs.ts
+ORDER BY samples.ts
+```
+
+Such a query reads one snapshot per signal, with no ordering between them: it
+may see a span whose log lines are not visible yet, or the reverse. The join
+runs on the server that received the query. `min_commit_token` on a query
+that names two or more of the five is not supported yet and gets an HTTP 400
+before any catalog listing. Flight SQL and ES|QL still read one of the five per query. The request
+body, auth, window (`start`/`end`), and `min_commit_token` handling are
+otherwise the same for all five tables.
 
 The same endpoint also serves the Parquet tables of the tenant. A query can
 join Parquet tables with each other but not with any of the five. One of the
-five beside a Parquet table is the same HTTP 400. Ravel returns it after one
-listing per other name finds that the name is a Parquet table.
+five beside a Parquet table is not supported yet either: an HTTP 400 that
+Ravel returns after one listing per other name finds that the name is a
+Parquet table, and before any signal catalog listing.
 
 ### `DISTINCT ON`
 

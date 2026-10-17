@@ -333,8 +333,8 @@ rule labels only. Four things change for an existing rules file on upgrade:
 ## SQL detection rules
 
 A SQL detection rule reads the same tables that the `POST /api/v1/sql`
-endpoint serves (`samples`, `logs`, `spans`, `audit`), under the same
-one-signal-per-query rule. See the [query guide](query.md) for the query
+endpoint serves (`samples`, `logs`, `spans`, `audit`), under the same table
+rules as that endpoint. See the [query guide](query.md) for the query
 languages.
 
 A rule that reads `alerts`, so that an alert fires on other alerts, is not
@@ -483,8 +483,9 @@ dead-loop rule and a notifications-failing-to-every-sink rule.
 Every transition that an evaluator writes is a row in the `alerts` table.
 `POST /api/v1/sql` and Flight SQL serve the table. It is one of the five
 tables that the SQL surface exposes (`samples`, `logs`, `spans`, `alerts`,
-`audit`). The one-signal-per-query rule applies: a query names one table. A
-query that names two is rejected with a 400 before any listing.
+`audit`). `POST /api/v1/sql` can join it with the other four; Flight SQL
+rejects a query that names two of them with `invalid_argument` before any
+listing.
 
 The table has these columns:
 
