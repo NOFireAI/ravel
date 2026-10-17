@@ -187,6 +187,7 @@ AB_INFLIGHT_A=(0); AB_UNITS_A=(0)
 AB_INFLIGHT_B=(0); AB_UNITS_B=(0)
 AB_IDX_FILE_A="${SCRATCH}/ab-idx-a"
 AB_IDX_FILE_B="${SCRATCH}/ab-idx-b"
+AB_ORDER_FILE="${SCRATCH}/ab-order"
 ab_body() { # which(a|b) idx_file
   local which="$1" idx_file="$2"
   local i infl units len
@@ -211,6 +212,7 @@ curl() {
   case "${CURL_MODE}" in
     serve-metrics) printf '%s\n' "${METRICS_SAMPLE}" ;;
     serve-metrics-ab)
+      printf '%s\n' "${@: -1}" >>"${AB_ORDER_FILE}"
       case "${@: -1}" in
         *stub-a*) ab_body a "${AB_IDX_FILE_A}" ;;
         *stub-b*) ab_body b "${AB_IDX_FILE_B}" ;;
@@ -578,8 +580,9 @@ check "records: the LIST is of <bucket>l1. in the chaos bucket" "yes" \
 # The scenario-2 trigger scrapes BOTH workers every round and SIGKILLs the
 # PREFERRED worker as soon as its own
 # ravel_maintain_compactions_in_flight>=1, falling back to the sibling only
-# once the full deadline passes with the preferred worker's own gauge never
-# firing (wait_for_compaction_in_flight_preferred). The old race -- whichever
+# on a live reading taken after the preferred worker's grace period has
+# passed with its own gauge never firing
+# (wait_for_compaction_in_flight_preferred). The old race -- whichever
 # gauge fired first, with no preference -- picked worker A about 15 nights out
 # of 16, since A starts its first merge 7-11s before B in every run since
 # #3019 (issue #3037); a kill that only ever watched one worker is the
@@ -594,6 +597,7 @@ ab_reset() { # infl_a units_a infl_b units_b -- each a space-separated sequence
   read -r -a AB_UNITS_B <<<"$4"
   printf '0' >"${AB_IDX_FILE_A}"
   printf '0' >"${AB_IDX_FILE_B}"
+  : >"${AB_ORDER_FILE}"
 }
 ab_run() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 wait_for_compaction_in_flight_preferred "$1" http://stub-a http://stub-b "$2" >/dev/null 2>&1; }
 ab_wait() { CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0.01 rc_of wait_for_compaction_in_flight_preferred "$1" http://stub-a http://stub-b "$2"; }
@@ -607,7 +611,7 @@ check "preferred trigger: preferred=b, B fires first, picks victim b, reason pre
 
 # The 10-15 night (nightly run 38674293885, issue #2666): B owns every
 # data-bearing unit and fires on a later round while A's gauge never fires.
-# preferred=a must fall back to b, and only once the deadline passes.
+# preferred=a must fall back to b, and only once the grace period passes.
 check "preferred trigger: preferred=a, A never fires, B fires later, falls back to b (the 10-15 night)" "b fallback-no-data-shard" \
   "$(ab_reset "0 0 0" "1 1 1" "0 1 1" "4 4 4"; ab_run a 2; echo "${CHAOS_VICTIM} ${CHAOS_VICTIM_REASON}")"
 check "preferred trigger: preferred=a, A never fires, B fires later, returns 0" "0" \
@@ -640,13 +644,58 @@ check "preferred trigger: per-worker peak units_owned is kept separately for B" 
 check "preferred trigger: total scrape count sums both workers' polls in the one round before a zero-second deadline breaks" "2" \
   "$(ab_reset "0 0" "1 1" "0 0" "1 1"; ab_run a 0; echo "${CHAOS_COMPACTION_POLLS}")"
 
-# Nit (#3037): the trigger must scrape both workers before returning, not
-# return as soon as the preferred worker's own gauge fires. A fires on round
-# 0 and the loop returns that same round; B's distinctive units_owned value
-# (7) can only land in CHAOS_B_MAX_UNITS_OWNED if B was scraped during that
-# same round, not skipped.
+# Nit (#3037): the round in which the preferred worker's gauge fires still
+# scrapes its sibling, before the preferred worker. A fires on round 0 and the
+# loop returns that same round; B's distinctive units_owned value (7) can
+# only land in CHAOS_B_MAX_UNITS_OWNED if B was scraped during that round.
 check "preferred trigger: B is scraped in the very round A's gauge fires, not skipped (nit: scrape both before returning)" "7" \
   "$(ab_reset "1" "2" "0" "7"; ab_run a 1; echo "${CHAOS_B_MAX_UNITS_OWNED}")"
+check "preferred trigger: the survivor's last units_owned reading before the return is kept" "6" \
+  "$(ab_reset "0 1" "2 2" "0 0" "5 6"; ab_run a 2; echo "${CHAOS_B_LAST_UNITS_OWNED}")"
+
+# Detection to kill (ADR-0077: nothing but bookkeeping between them): every
+# round scrapes the sibling first and the preferred worker last, so the
+# preferred worker's detecting read is the last scrape before the return and
+# no HTTP scrape of the sibling sits between it and the kill.
+ab_order() { local o; o="$(tr '\n' ' ' <"${AB_ORDER_FILE}")"; echo "${o% }"; }
+check "detection order: preferred=a scrapes B then A each round and returns on A's detecting read" \
+  "http://stub-b/metrics http://stub-a/metrics http://stub-b/metrics http://stub-a/metrics" \
+  "$(ab_reset "0 1" "2 2" "0" "3"; ab_run a 5; ab_order)"
+check "detection order: preferred=b scrapes A then B each round and returns on B's detecting read" \
+  "http://stub-a/metrics http://stub-b/metrics http://stub-a/metrics http://stub-b/metrics" \
+  "$(ab_reset "0" "3" "0 1" "2 2"; ab_run b 5; ab_order)"
+
+# The fallback acts only on a live sibling reading taken after the grace
+# period. The clock is replaced by one that advances one second per read, so
+# round r of the wait reads elapsed r + 1 however fast the stub answers: with
+# grace 3 and extra 2, rounds 0-1 fall inside the grace period, rounds 2-4
+# after it, and the wait ends after round 4 (10 scrapes).
+ab_tick() { # preferred grace extra
+  local rc=0
+  printf '1000\n' >"${SCRATCH}/ab-clock"
+  chaos_now_unix_s() {
+    local t
+    t="$(cat "${SCRATCH}/ab-clock")"
+    printf '%s\n' "$(( t + 1 ))" >"${SCRATCH}/ab-clock"
+    echo "${t}"
+  }
+  CURL_MODE=serve-metrics-ab CHAOS_COMPACTION_POLL_SECONDS=0 \
+    wait_for_compaction_in_flight_preferred "$1" http://stub-a http://stub-b "$2" "$3" >/dev/null 2>&1 || rc=$?
+  echo "rc=${rc} victim=${CHAOS_VICTIM} reason=${CHAOS_VICTIM_REASON} seen_in_grace=${CHAOS_SIBLING_SEEN_IN_GRACE} polls=${CHAOS_COMPACTION_POLLS}"
+}
+ab_last_scrape() { tail -n 1 "${AB_ORDER_FILE}"; }
+check "fallback: a sibling that fired in the grace period and is idle after it is not killed on the stale reading" \
+  "rc=1 victim=a reason=preferred seen_in_grace=1 polls=10" \
+  "$(ab_reset "0" "1" "1 0" "4 4"; ab_tick a 3 2)"
+check "fallback: a sibling that fires again after the grace period is killed on that live reading" \
+  "rc=0 victim=b reason=fallback-no-data-shard seen_in_grace=1 polls=7 last=http://stub-b/metrics" \
+  "$(ab_reset "0" "1" "1 0 0 1" "4 4 4 4"; echo "$(ab_tick a 3 2) last=$(ab_last_scrape)")"
+check "fallback: preferred=b, a sibling that fires again after the grace period is killed on that live reading" \
+  "rc=0 victim=a reason=fallback-no-data-shard seen_in_grace=1 polls=7 last=http://stub-a/metrics" \
+  "$(ab_reset "1 0 0 1" "4 4 4 4" "0" "1"; echo "$(ab_tick b 3 2) last=$(ab_last_scrape)")"
+check "fallback: the preferred worker firing during the extra wait is still killed as preferred" \
+  "rc=0 victim=a reason=preferred seen_in_grace=0 polls=8 last=http://stub-a/metrics" \
+  "$(ab_reset "0 0 0 1" "1 1 1 1" "0" "4"; echo "$(ab_tick a 3 2) last=$(ab_last_scrape)")"
 
 # chaos_default_preferred_victim: alternates by GITHUB_RUN_NUMBER parity so
 # successive nightly runs exercise both workers (issue #3037), defaulting to
@@ -845,7 +894,13 @@ check "scenario 2 counts the survivor's log after the last kill and passes it to
 check "scenario 2 headers make no 'provably' claim" "no" \
   "$([[ "${scenario2_body}" == *provabl* ]] && echo yes || echo no)"
 check "scenario 2 triggers on the preferred worker's gauge (or its sibling's on fallback), not on a fixed worker A" "yes" \
-  "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight_preferred "$CHAOS_PREFERRED_VICTIM" "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS"'* ]] && echo yes || echo no)"
+  "$([[ "${scenario2_body}" == *'wait_for_compaction_in_flight_preferred "$CHAOS_PREFERRED_VICTIM" "$WORKER_A_URL" "$WORKER_B_URL" "$INFLIGHT_BUDGET_SECONDS" "$FALLBACK_LIVE_WAIT_SECONDS"; then'* ]] && echo yes || echo no)"
+check "scenario 2 bounds the live-reading wait after the grace period at one maintenance tick" "yes" \
+  "$([[ "${scenario2_body}" == *$'\nFALLBACK_LIVE_WAIT_SECONDS="$CHAOS_MAINTAIN_TICK_SECONDS"\n'* ]] && echo yes || echo no)"
+check "scenario 2 says so when it does not kill on a stale sibling reading" "yes" \
+  "$([[ "${scenario2_body}" == *'if [[ "${CHAOS_SIBLING_SEEN_IN_GRACE:-0}" -eq 1 ]]; then'* && "${scenario2_body}" == *'not killing on that stale reading'* ]] && echo yes || echo no)"
+check "scenario 2 logs the survivor's last units_owned before the kill against the expected total" "yes" \
+  "$([[ "${scenario2_body}" == *'${SURVIVOR_LAST_UNITS_OWNED} of ${EXPECTED_TOTAL_UNITS}'* ]] && echo yes || echo no)"
 check "scenario 2 prints the exact VICTIM line, via echo and not log (log prepends '[chaos] ')" "yes" \
   "$([[ "${scenario2_body}" == *'echo "VICTIM preferred=${CHAOS_PREFERRED_VICTIM} chosen=${CHAOS_VICTIM} reason=${CHAOS_VICTIM_REASON}"'* ]] && echo yes || echo no)"
 check "scenario 2 prints the VICTIM line exactly once" "1" \
@@ -925,6 +980,14 @@ check "chaos_select_survivor a: survivor is worker-b with B's URL/log/peak/basel
 check "chaos_select_survivor b: survivor is worker-a with A's URL/log/peak/baselines, B's pid cleared" \
   "VICTIM_LABEL=worker-b VICTIM_LOG=log-b SURVIVOR_LABEL=worker-a SURVIVOR_URL=http://a SURVIVOR_LOG=log-a SURVIVOR_PEAK_UNITS_OWNED=3 CONS_BASELINE=1 BREAKER_BASELINE=5 WORKER_A_PID=111 WORKER_B_PID=" \
   "$(select_survivor_case b)"
+check "chaos_select_survivor: the survivor's last units_owned comes from the other worker" "a:8 b:4" \
+  "$(select_survivor_case a >/dev/null
+     CHAOS_A_LAST_UNITS_OWNED=4; CHAOS_B_LAST_UNITS_OWNED=8
+     chaos_select_survivor a; o="a:${SURVIVOR_LAST_UNITS_OWNED}"
+     chaos_select_survivor b; echo "${o} b:${SURVIVOR_LAST_UNITS_OWNED}")"
+check "chaos_select_survivor: an unread last units_owned is unknown" "unknown" \
+  "$(select_survivor_case a >/dev/null; unset CHAOS_B_LAST_UNITS_OWNED
+     chaos_select_survivor a; echo "${SURVIVOR_LAST_UNITS_OWNED}")"
 
 # DISTINGUISHING(c), part 2: a script that substitutes a bare literal 4 back
 # in for the derived signals x shards total, or for CHAOS_SHARD_COUNT in the
