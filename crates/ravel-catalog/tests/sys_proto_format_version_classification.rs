@@ -51,6 +51,10 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // Written once with CreateIfAbsent, then immutable.
         ("TenancyMarker", Immutable(&[1])),
         ("TenantRecoveryManifest", Immutable(&[1])),
+        // Created with CreateIfAbsent; `set-policy` replaces it under CAS with a
+        // body built from the operator's local policy file, never from a
+        // decoded view of the stored bytes, so no writer can strip a field.
+        ("IpcryptPolicyMarker", Immutable(&[1])),
         // Sole-writer PutMode::Overwrite snapshots: each write is a fresh dump of
         // the owning process's live state, never a read-modify-write of prior
         // bytes, so a lagging binary cannot strip a sibling's additive field.
