@@ -262,8 +262,8 @@ the counter's outcome type. The crate's tests pin every
 machine-readable `test_vectors.json`, and the vector file is checked
 in. The new `Cargo.lock` entries are `ipcrypt-rs`, `aes` and their
 RustCrypto dependencies. Disabling the `random` feature keeps `rand` out
-of `ravel-ipcrypt`'s dependency graph, since the offered variants need
-no randomness.
+of `ravel-ipcrypt`'s dependency graph (the 2026-10-17 correction
+below narrows this), since the offered variants need no randomness.
 
 **6. A SQL function encrypts with the tenant's key. It takes no key
 argument and needs the `ipcrypt` capability.** It comes in two forms:
@@ -617,7 +617,8 @@ flowchart LR
   deployment key is already a recovery requirement (ADR-0050); this
   ADR adds a consequence to losing it.
 - **Deployment-key rotation is out of scope.** The epoch mechanism
-  rotates per-rule keys under one deployment key. A new deployment key
+  rotates per-rule keys under one deployment key (keys are per tenant,
+  variant and epoch; see the 2026-10-17 correction below). A new deployment key
   changes every derived key at once, for every tenant and epoch, and
   needs its own ADR.
 - **Persistent formats: one new `sys/` object, no changed format.**
@@ -635,3 +636,29 @@ flowchart LR
   shipped entry points of both binaries.
 - **Supply chain.** `ipcrypt-rs`, `aes` and its RustCrypto dependencies
   join `Cargo.lock` and pass `cargo deny`.
+
+## Correction (2026-10-17): `rand` reachability and the key scope
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="2026-10-17 correction" -->
+<!-- amendment-supersedes: phrase="keeps `rand` out" pointer="2026-10-17 correction" -->
+<!-- amendment-supersedes: phrase="per-rule keys" pointer="2026-10-17 correction" -->
+
+This corrects two statements of fact. No decision changes.
+
+- **`rand` (decision 5).** Turning off `ipcrypt-rs`'s default features
+  keeps `rand` out of `ipcrypt-rs`'s own dependencies. The marker of
+  decision 9 needs an object-store client, so `ravel-ipcrypt` puts it
+  behind a `marker` cargo feature that is off by default. With the
+  default features, `ravel-ipcrypt` has no `rand` in its dependency
+  graph. With `marker` on, which `ravel-server` and `ravel-cli` enable,
+  `rand` arrives through `ravel-object-store`. The offered variants
+  still need no randomness, and no key is ever generated.
+- **Key scope (Consequences, rotation).** Decision 2 derives a key from
+  the tenant, the variant and the epoch. The attribute key a rule names
+  is not an input. Rules that share a tenant, variant and epoch
+  therefore share a key, and their ciphertexts of one address are
+  byte-identical: under `deterministic`, a value stored under
+  `client.address` can be joined to the same value stored under
+  `source.address`. That is the same correlation equal addresses
+  already allow within one key. An operator who wants two keys
+  unjoinable gives their rules different epochs or variants.
