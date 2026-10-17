@@ -1504,6 +1504,26 @@ for edit in "dup|HEALTHZ phase=benchmark port=4318 2 times" "drop|HEARTBEAT phas
   rm -rf "$OUT_A"
 done
 
+# Catches: healthz-check passing a line for a phase that was not sampled.
+printf '%s\n' \
+  'HEALTHZ phase=benchmark port=4318 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
+  'HEALTHZ phase=benchmark port=4319 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
+  'HEARTBEAT phase=benchmark max_s=0.500' >"$TMP/healthz-extra.txt"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
+  >/dev/null 2>"$TMP/healthz-extra.err" || code=$?
+[ "$code" = 0 ] || fail "healthz extra line control" "exit $code: $(head -c 300 "$TMP/healthz-extra.err")"
+echo 'HEARTBEAT phase=concurrent-1 max_s=0.500' >>"$TMP/healthz-extra.txt"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
+  >/dev/null 2>"$TMP/healthz-extra.err" || code=$?
+if [ "$code" = 2 ] \
+  && grep -qF "healthz-extra.txt:4 is not an expected line: 'HEARTBEAT phase=concurrent-1 max_s=0.500'" "$TMP/healthz-extra.err"; then
+  pass "healthz-check refuses a line for a phase it was not asked for, naming file and line"
+else
+  fail "healthz extra line" "exit $code: $(head -c 300 "$TMP/healthz-extra.err")"
+fi
+
 # Catches: a fold field read from the first of several matches: a fold.out
 # carrying entry_count twice is not a figure the kit can stamp.
 code=0
@@ -2684,6 +2704,18 @@ else
   fail "share table" "exit $code: $out $(tail -n 3 "$TMP/fetch-share.err")"
 fi
 
+# Catches: fetch comparing the arms without the run's own run.toml, whose
+# declared extra flags decide what it accepts.
+fixture run-notoml "$TMP/fixture-share-a" "$TMP/fixture-share-b"
+rm "$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-notoml/in/run.toml"
+fetch notoml run-notoml --timeout 30
+if [ "$code" = 2 ] && grep -q '^fetch: .*/runs/run-notoml/in/run.toml is not there$' "$TMP/fetch-notoml.err" \
+  && ! grep -q 'B vs A' "$TMP/fetch-notoml.out"; then
+  pass "fetch exits 2 when the run's in/run.toml is missing, before comparing the arms"
+else
+  fail "fetch without in/run.toml" "exit $code: $(tail -n 2 "$TMP/fetch-notoml.err")"
+fi
+
 # trunc_evidence SRC DST EDIT: a copy of arm SRC whose evidence.tgz has
 # out/concurrent/calls.jsonl replaced: EDIT "truncate" cuts its third line
 # short, "drop" leaves the file out.
@@ -2944,10 +2976,15 @@ for conn in sorted(set(c["connection"] for c in calls)):
         print("connection", conn, "saw no outage, or no success after it")
 PY2
 )"
-if [ "$code" = 0 ] && [ -z "$out" ] && [ "$starts" = 2 ] && [ -z "$ok_after" ]; then
-  pass "a restart slower than 60 polls is waited for, not stopped while it boots, and calls succeed once it is up"
+# The healthz gate stays open across the watchdog's restart, so the outage
+# shows as failed samples on both listeners.
+hz_fail="$(sed -n 's/^HEALTHZ phase=concurrent-1 port=43\(18\|19\) .* failures=\([0-9]*\)$/\2/p' \
+  "$BOX_S/kit/out/healthz.txt" 2>/dev/null | tr '\n' ' ')"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ "$starts" = 2 ] && [ -z "$ok_after" ] \
+  && [[ "$hz_fail" =~ ^[1-9][0-9]*\ [1-9][0-9]*\ $ ]]; then
+  pass "a restart slower than 60 polls is waited for, not stopped while it boots, calls succeed once it is up, and healthz counts the outage as failures"
 else
-  fail "slow watchdog restart" "exit $code, $starts server starts: $out $ok_after $(grep -c restart "$BOX_S/kit/out/concurrent/round-1/watchdog.log") restarts; $(tail -n 3 "$TMP/slow-restart.log")"
+  fail "slow watchdog restart" "exit $code, $starts server starts, healthz failures '$hz_fail': $out $ok_after $(grep -c restart "$BOX_S/kit/out/concurrent/round-1/watchdog.log") restarts; $(tail -n 3 "$TMP/slow-restart.log")"
 fi
 
 # Catches: a failed concurrent call leaving its curl stderr file behind. A
