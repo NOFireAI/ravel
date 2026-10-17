@@ -3456,9 +3456,9 @@ async fn a_min_commit_token_on_a_two_signal_statement_is_a_bad_request() {
         "{value}"
     );
 
-    // The one-table statement takes the token to the catalog, which has
-    // never seen writer 2000, so it answers the stable unsatisfiable-token
-    // 503 rather than the cross-signal 400.
+    // The token names the commit the fixture published (writer 2000, epoch
+    // 1, seq 1), so the one-table statement takes it to the catalog, finds
+    // it satisfied, and answers its one row.
     let (status, bytes) = post(
         &app,
         Some("acme-token"),
@@ -3467,9 +3467,9 @@ async fn a_min_commit_token_on_a_two_signal_statement_is_a_bad_request() {
     )
     .await;
     let value: Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{value}");
-    assert_eq!(value["errorType"], "unavailable", "{value}");
-    assert_eq!(value["error"], ravel_sql::MSG_UNSATISFIABLE, "{value}");
+    assert_eq!(status, StatusCode::OK, "{value}");
+    assert_eq!(value["status"], "success", "{value}");
+    assert_eq!(value["data"]["rows"], serde_json::json!([[100]]), "{value}");
 }
 
 // ---------------------------------------------------------------------------
