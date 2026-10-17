@@ -95,6 +95,15 @@ audit_mode = "off"
 # whose flags differ by exactly these two lists, printing the difference once.
 # server_flags_a = []
 # server_flags_b = ["--fetch-concurrency", "64"]
+# A resolved server setting (server_settings) may differ between the arms only
+# when a flag that sets it differs between these lists; any other difference
+# is refused, naming the setting.
+
+# Optional: the phases the /healthz sampler runs in, from "benchmark" and
+# "concurrent" (default both). It adds /healthz at 4 Hz per listener and
+# /metrics at 1 Hz beside the statements; leave "benchmark" out to compare
+# against bands taken before the sampler existed.
+# healthz_phases = ["benchmark", "concurrent"]
 
 # Optional phase keys, each shown at its default. launch.sh writes any left out
 # into the run.toml it uploads, at its default, and check-run refuses a value

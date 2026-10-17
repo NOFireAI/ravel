@@ -154,10 +154,14 @@ EOF
 aws iam put-role-policy --role-name ravel-clickbench-box \
   --policy-name ssm-read --policy-document file:///tmp/ssm-read.json
 
-aws iam create-instance-profile --instance-profile-name ravel-clickbench-box
+aws iam create-instance-profile --instance-profile-name ravel-clickbench-instance-profile
 aws iam add-role-to-instance-profile \
-  --instance-profile-name ravel-clickbench-box --role-name ravel-clickbench-box
+  --instance-profile-name ravel-clickbench-instance-profile --role-name ravel-clickbench-box
 ```
+
+The profile's name, `ravel-clickbench-instance-profile`, is the one
+`benchmarks/clickbench/kit/run.example.toml` gives `instance_profile`; the
+role inside it is `ravel-clickbench-box`.
 
 Add `AmazonSSMManagedInstanceCore` as well if you want Session Manager shell
 access instead of SSH:
@@ -177,7 +181,7 @@ AMI=$(aws ssm get-parameter \
 aws ec2 run-instances \
   --image-id "$AMI" \
   --instance-type c6a.4xlarge \
-  --iam-instance-profile Name=ravel-clickbench-box \
+  --iam-instance-profile Name=ravel-clickbench-instance-profile \
   --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=300,VolumeType=gp3}' \
   --key-name <your-key-pair> \
   --instance-initiated-shutdown-behavior terminate \
@@ -232,9 +236,8 @@ under that run id, each with the instance profile, a 500 GB gp3 root volume,
 `--instance-initiated-shutdown-behavior terminate` and a user-data that arms
 `shutdown -h +600`. It prints the run id, both instance ids and the `out/`
 prefix; `--dry-run` prints every command and both user-data scripts instead.
-`run.example.toml` names the instance profile
-`ravel-clickbench-instance-profile`; a profile created by section 4 above is
-named `ravel-clickbench-box`, so set `instance_profile` to that one instead.
+`run.example.toml` names the instance profile section 4 creates,
+`ravel-clickbench-instance-profile`.
 
 ## 6. Bootstrap the box
 
@@ -702,11 +705,14 @@ why, then `fetch: warning: could not print the concurrent errors by statement
 
 `box/run.sh` samples the server's health during the `benchmark` phase and
 each `concurrent` round. One `kit.py healthz-sampler` process per phase or
-round runs three threads, each every 250 ms: a `GET /healthz` on port 4318
-(the query listener) and on port 4319 (the health listener), each with a 2 s
-timeout, and a `GET /metrics` on port 4318 that reads
-`ravel_health_heartbeat_age_seconds`. A timeout or a non-200 counts as a
-2000 ms sample and as a failure. The sampler is
+round runs three threads: a `GET /healthz` on port 4318 (the query listener)
+and on port 4319 (the health listener), each every 250 ms, and a
+`GET /metrics` on port 4318 every 1 s that reads
+`ravel_health_heartbeat_age_seconds`, each with a 2 s timeout. A `/healthz`
+timeout or non-200 counts as a 2000 ms sample and as a failure; a `/metrics`
+scrape that fails or carries no heartbeat age counts as a 2 s age and as a
+failure, since a stalled runtime is exactly when the scrape fails. The
+sampler is
 started before the phase and talks to `run.sh` through a gate file that
 `run.sh` writes with shell builtins only, so it forks nothing inside a
 statement's timed window; the gate is closed while the server is stopped on
@@ -719,13 +725,24 @@ which `evidence.tgz` carries. After each phase `out/healthz.txt` gains
 
 ```
 HEALTHZ phase=<phase> port=<4318|4319> n=<samples> p50_ms=<ms> p99_ms=<ms> max_ms=<ms> failures=<n>
-HEARTBEAT phase=<phase> max_s=<seconds>
+HEARTBEAT phase=<phase> n=<scrapes> failures=<n> max_s=<seconds>
 ```
 
 with `<phase>` `benchmark` or `concurrent-<N>`, and `run.log` carries the
 same lines. Step `healthz` then requires each phase's three lines exactly
-once in `out/healthz.txt`: a line missing or repeated fails the box at that
-step. `results.json`'s `healthz` block holds the same figures. The band file
+once in `out/healthz.txt`, each counting at least one sample and no more
+failures than samples: a line missing, repeated or empty fails the box at
+that step. `results.json`'s `healthz` block holds the same figures
+(`heartbeat_n`, `heartbeat_failures` and `heartbeat_max_s` for the HEARTBEAT
+line). `run.toml`'s optional `healthz_phases` (default
+`["benchmark", "concurrent"]`, the only two values it takes) names the
+phases the sampler runs in, so a run can leave the `benchmark` phase
+unsampled; a run that samples no phase has an empty `out/healthz.txt` and a
+null `healthz` block. The sampler adds load beside the statements (`/healthz`
+at 4 Hz on each listener, `/metrics` at 1 Hz) that runs before it did not
+have: absolute bands and baselines set before the sampler existed were taken
+without it, so compare against them only with `healthz_phases` leaving the
+phase in question out, or re-take them with the sampler running. The band file
 may set `healthz_p99_max_ratio_4318` and `healthz_p99_max_ratio_4319` (arm
 B's p99 per phase at most that times arm A's) and `healthz_p99_ms_max_4318`
 and `healthz_p99_ms_max_4319` (each phase's p99 at most that many
@@ -738,10 +755,20 @@ sets and stamped in that arm's `provenance.server_flags.extra_flags`.
 `check-run` refuses an entry that repeats a flag the kit sets, naming it.
 `fetch.sh` compares the arms' kit-set flags (all but the tenant token file's
 path, which is a location on the box) and accepts arms whose extra flags
-are exactly the two declared lists, printing that difference once, with
-any resolved server setting that moved with it. Every other field must
-still match; extra flags that differ from the declared lists, or any extra
-flag with none declared, are refused with exit 2.
+are exactly the two declared lists, printing that difference once. A
+resolved server setting may differ between them only when a flag that sets
+it is set differently by the two declared lists; `kit.py` keeps that mapping
+as `SETTING_FLAGS` (`cache_max_bytes` by `--cache-max-bytes`,
+`catalog_cache_max_bytes` by `--catalog-cache-max-bytes`, `fetch_concurrency`
+by `--fetch-concurrency`, and `sql_max_query_bytes` and
+`sql_tenant_max_bytes` each by `--sql-max-query-bytes` or
+`--sql-tenant-max-bytes`, which can clamp or raise one another), because the
+server logs a setting's source but not the flag's name. Each accepted setting
+difference is printed beside the flags line. Any other setting that differs
+is refused with exit 2, naming it and both values: a declared
+`--sql-scan-decode-inline` sets none of them, so beside it every setting must
+match. Every other field must still match; extra flags that differ from the
+declared lists, or any extra flag with none declared, are refused with exit 2.
 
 ## 9. Check the report before reading the headline
 
@@ -1217,8 +1244,9 @@ dataset, mapping or corpus digest, `hardware.cpu`, RustFS version, audit mode, q
 (`window_hours`), kit-set server flags, extra server flags or resolved server
 settings differ, or that were judged by different band sections, are not
 compared and exit 2, naming the field; extra flags that are exactly
-`run.toml`'s `server_flags_a` and `server_flags_b`, and the settings that
-moved with them, are the one exception (section 8). Each arm's binary is not
+`run.toml`'s `server_flags_a` and `server_flags_b`, and the resolved settings
+that a flag those lists set differently drives, are the one exception
+(section 8). Each arm's binary is not
 compared, since that is what differs by design. Arm B's
 relative bands also miss when fewer statements than the band file's
 `min_both_answered` were answered by both arms, when either arm answered none,
@@ -1298,8 +1326,8 @@ B=$(aws ssm get-parameter --name /ravel-clickbench/bucket \
   --query Parameter.Value --output text)
 
 aws iam remove-role-from-instance-profile \
-  --instance-profile-name ravel-clickbench-box --role-name ravel-clickbench-box
-aws iam delete-instance-profile --instance-profile-name ravel-clickbench-box
+  --instance-profile-name ravel-clickbench-instance-profile --role-name ravel-clickbench-box
+aws iam delete-instance-profile --instance-profile-name ravel-clickbench-instance-profile
 aws iam delete-role-policy --role-name ravel-clickbench-box --policy-name ssm-read
 aws iam delete-role --role-name ravel-clickbench-box
 

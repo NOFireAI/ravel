@@ -60,7 +60,8 @@ hot_sum_max_ratio = 1.05
 cold_sum_max_ratio = 1.05
 # Optional: GET /healthz latency on port 4318 (the query listener) and 4319
 # (the health listener), sampled every 250 ms with a 2 s client timeout during
-# the benchmark phase and each concurrent round; a timeout or a non-200 counts
+# the benchmark phase and each concurrent round (those run.toml's
+# healthz_phases names, default both); a timeout or a non-200 counts
 # as a 2000 ms sample. Arm B's p99 per phase at most this times arm A's, over
 # the phases both arms ran. A placeholder or a missing key skips the band.
 healthz_p99_max_ratio_4318 = "FILL-IN-ON-REFERENCE-MACHINE"
