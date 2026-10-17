@@ -35,8 +35,9 @@ The command starts five things, all from published images:
   `demo-token` mapped to tenant `demo-tenant`. To override the image pin, set
   the `RAVEL_IMAGE` environment variable.
 - An OpenTelemetry Collector that scrapes the CPU, load, memory, and network
-  metrics of your host. It exports them to Ravel over the OpenTelemetry
-  Protocol (OTLP) and authenticates with the demo bearer token.
+  metrics of your host. It exports them, and its own internal logs, to Ravel
+  over the OpenTelemetry Protocol (OTLP) and authenticates with the demo
+  bearer token.
 - Grafana on `127.0.0.1:3000` (`admin` / `admin`) with the Ravel datasource
   already provisioned.
 
@@ -96,7 +97,7 @@ A SQL query answers with a described-schema envelope. This is the `data`
 object of a `SELECT ts, value FROM samples LIMIT 1`:
 
 ```json
-{"columns":[{"name":"ts","type":"Timestamp(Nanosecond, None)"},{"name":"value","type":"Float64"}],"rows":[[1751402400000000000,0.42]]}
+{"columns":[{"name":"ts","type":"Timestamp(ns)"},{"name":"value","type":"Float64"}],"rows":[[1751402400000000000,0.42]]}
 ```
 
 - Each entry of `columns` is an object with a `name` and an Arrow `type`, in
@@ -127,9 +128,11 @@ broken. Examine these causes in order:
   `/api/v1/label/__name__/values` to see the names that Ravel holds. The
   [query guide](query.md) covers the naming rules.
 - **The table is empty on this stack.** The quickstart Collector sends host
-  metrics only, so `SELECT * FROM logs LIMIT 5` and
-  `SELECT * FROM spans LIMIT 5` return zero rows on a fresh stack. Logs and
-  traces need a Collector pipeline or an exporter that sends them.
+  metrics and its own internal logs, but no traces. So
+  `SELECT * FROM spans LIMIT 5` returns zero rows on a fresh stack, and
+  `SELECT * FROM logs LIMIT 5` returns only the log records of the Collector
+  itself, with `service.name` set to `otelcol-contrib`. Traces, and logs from
+  your own services, need a Collector pipeline or an exporter that sends them.
 - **The data was rejected at ingest for being too old.** Ravel refuses data
   points outside its event-time skew bound, so a replay of the fixture from
   yesterday stores nothing. See
