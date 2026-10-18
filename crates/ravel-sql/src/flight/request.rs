@@ -49,6 +49,7 @@ use tonic::{Status, metadata::MetadataMap};
 
 use crate::error::{ErrorClass, SqlError};
 use crate::executor::SqlRequest;
+use crate::min_commit_token::MinCommitToken;
 
 /// Window start, Unix float seconds. Defaults to one window-length before
 /// `end`.
@@ -102,7 +103,8 @@ pub(super) fn sql_request(
     Ok(SqlRequest {
         sql,
         window: TimeRange { start_ns, end_ns },
-        min_tokens,
+        // Flight metadata carries plain tokens only; each is unqualified.
+        min_tokens: min_tokens.into_iter().map(MinCommitToken::from).collect(),
         now_ns,
         deadline,
         row_window: false,

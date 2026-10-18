@@ -1,7 +1,7 @@
 //! A statement over two or more signal tables, run through the per-signal
 //! resolve and plan of the HTTP statement path (issue #2910), the
-//! `min_commit_token` refusal on that path, and the one-table refusal the
-//! Flight SQL entry points keep.
+//! table-qualified `min_commit_token` on that path (issue #2911), and the
+//! one-table refusal the Flight SQL entry points keep.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -25,11 +25,13 @@ use ravel_types::accounting::QueryAccounting;
 use ravel_types::{CommitToken, Sample, Signal, TenantHash, TenantId, TimeRange};
 use uuid::Uuid;
 
+use crate::MinCommitToken;
 use crate::SqlConfig;
-use crate::error::SqlError;
+use crate::error::{ErrorClass, MSG_UNSATISFIABLE, SqlError};
 use crate::executor::tests::{
     empty_store, executor_over, executor_with, log_record, publish_log_records,
-    publish_metric_samples, publish_spans, sql_request, wrap_fixture_store,
+    publish_log_records_in_hour, publish_metric_samples, publish_spans, sql_request,
+    wrap_fixture_store,
 };
 use crate::executor::{LiveAccounting, ParquetPlan, PinnedPlanInputs, SqlExecutor, SqlRequest};
 use crate::output::QueryOutput;
@@ -830,63 +832,251 @@ fn token() -> CommitToken {
     }
 }
 
-/// A `min_commit_token` on a statement over two signal tables is
-/// [`SqlError::CommitTokenAcrossSignals`] at every HTTP entry point, before
-/// any store request. The same token on a statement over one signal table is
-/// admitted and reaches the catalog.
-#[tokio::test]
-async fn a_token_on_a_two_signal_statement_is_refused_before_listing() {
-    let tenant_hash = TenantHash([4u8; 16]);
-    let recording = Arc::new(RecordingStore::new(empty_store()));
-    let executor = executor_with(recording.clone(), SqlConfig::default());
-    let mut request = sql_request(
-        "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
-        WINDOW,
-    );
-    request.min_tokens = vec![token()];
-    let accounting = QueryAccounting::new();
-
-    let refused = [
+/// The four HTTP entry points' errors for `request`, each labelled.
+async fn http_entry_errors(
+    executor: &SqlExecutor,
+    tenant_hash: TenantHash,
+    request: &SqlRequest,
+) -> Vec<(&'static str, Option<SqlError>)> {
+    vec![
         (
             "execute",
-            executor.execute(tenant_hash, &request).await.err(),
+            executor.execute(tenant_hash, request).await.err(),
         ),
         (
             "execute_accounted",
             executor
-                .execute_accounted(tenant_hash, &request, &LiveAccounting::new())
+                .execute_accounted(tenant_hash, request, &LiveAccounting::new())
                 .await
                 .err(),
         ),
         (
             "explain",
-            executor.explain(tenant_hash, &request).await.err(),
+            executor.explain(tenant_hash, request).await.err(),
         ),
         (
             "explain_accounted",
             executor
-                .explain_accounted(tenant_hash, &request, &accounting)
+                .explain_accounted(tenant_hash, request, &QueryAccounting::new())
                 .await
                 .err(),
         ),
-    ];
+    ]
+}
+
+/// An unqualified `min_commit_token` on a statement over two signal tables is
+/// [`SqlError::CommitTokenNeedsQualifier`] at every HTTP entry point, naming
+/// both tables in lane order, before any store request. The same token on a
+/// statement over one signal table is admitted and reaches the catalog.
+#[tokio::test]
+async fn unqualified_token_on_two_signals_is_refused_before_any_listing() {
+    let tenant_hash = TenantHash([4u8; 16]);
+    let recording = Arc::new(RecordingStore::new(empty_store()));
+    let executor = executor_with(recording.clone(), SqlConfig::default());
+    // `logs` first in the text: the message still lists `samples` first.
+    let mut request = sql_request(
+        "SELECT s.ts FROM logs l JOIN samples s ON s.ts = l.ts",
+        WINDOW,
+    );
+    request.min_tokens = vec![MinCommitToken::unqualified(token())];
+
+    let refused = http_entry_errors(&executor, tenant_hash, &request).await;
+    assert_eq!(refused.len(), 4);
     for (entry, err) in refused {
+        let Some(err) = err else {
+            panic!("{entry} must refuse the unqualified token");
+        };
         assert!(
-            matches!(err, Some(SqlError::CommitTokenAcrossSignals)),
-            "{entry} must refuse with CommitTokenAcrossSignals, got {err:?}"
+            matches!(err, SqlError::CommitTokenNeedsQualifier { .. }),
+            "{entry} must refuse with CommitTokenNeedsQualifier, got {err:?}"
+        );
+        assert_eq!(err.class(), ErrorClass::BadRequest, "{entry}");
+        assert!(
+            err.client_message()
+                .contains("qualify min_commit_token with one of samples, logs"),
+            "{entry}: {}",
+            err.client_message()
         );
     }
     assert_eq!(recording.requests(), Vec::<String>::new());
 
     let mut single = sql_request("SELECT ts FROM samples", WINDOW);
-    single.min_tokens = vec![token()];
+    single.min_tokens = vec![MinCommitToken::unqualified(token())];
     let outcome = executor.execute(tenant_hash, &single).await;
     assert!(
-        !matches!(outcome, Err(SqlError::CommitTokenAcrossSignals)),
+        !matches!(outcome, Err(SqlError::CommitTokenNeedsQualifier { .. })),
         "a token on a one-signal statement is admitted, got {outcome:?}"
     );
     assert!(
         !recording.requests().is_empty(),
         "the one-signal statement reached the catalog"
     );
+}
+
+/// The ingest hour the token-only logs commit is published into: far past
+/// the listing window of a request at `now_ns` 2,000, so its rows reach a
+/// result only through a token that names it.
+const TOKEN_ONLY_HOUR: u32 = 5;
+
+/// A qualified token bounds its own table's resolve and no other. `T` names a
+/// logs commit, published in an ingest hour the listing never reaches, and
+/// no samples commit: `logs:T` on `samples JOIN logs` returns the joined rows
+/// and the logs resolve GETs `T`'s commit record, while `samples:T` waits on
+/// a samples commit that does not exist and is the unsatisfiable-token 503.
+#[tokio::test]
+async fn qualified_token_bounds_only_its_signal() {
+    let tenant = TenantId::new("cross-signal-qualified-token".to_string());
+    let tenant_hash = tenant.hash();
+    let memory = MemoryStore::new();
+    publish_metric_samples(&memory, &tenant, 1, "x", samples(&[(0, 1.0), (100, 2.0)])).await;
+    let (_, logs_token) = publish_log_records_in_hour(
+        &memory,
+        tenant_hash,
+        Signal::Logs,
+        2,
+        TOKEN_ONLY_HOUR,
+        &logs_at(&[0, 100]),
+    )
+    .await;
+    assert_eq!(logs_token.ingest_hour_bucket, TOKEN_ONLY_HOUR);
+    // The samples commit is seq 1 in hour 0: no samples commit carries T.
+    assert_ne!(logs_token.seq, 1);
+    let (recording, executor) = recorded(wrap_fixture_store(memory), SqlConfig::default());
+    let short = |sql: &str, tokens: Vec<MinCommitToken>| {
+        let mut request = sql_request(sql, WINDOW);
+        request.min_tokens = tokens;
+        request.deadline = std::time::Duration::from_secs(5);
+        request
+    };
+    let unsatisfiable = |err: &SqlError| {
+        err.class() == ErrorClass::Unavailable && err.client_message() == MSG_UNSATISFIABLE
+    };
+
+    // Precondition: T bounds no samples commit, so on samples alone it is the
+    // 503, and the outcome below is about where T is routed.
+    let err = executor
+        .execute(
+            tenant_hash,
+            &short(
+                "SELECT ts FROM samples",
+                vec![MinCommitToken::unqualified(logs_token.clone())],
+            ),
+        )
+        .await
+        .expect_err("T names no samples commit");
+    assert!(unsatisfiable(&err), "{err:?}");
+
+    const JOIN: &str = "SELECT s.ts, s.value FROM samples s JOIN logs l ON s.ts = l.ts \
+                        ORDER BY s.ts";
+    // Control: without the token the listing never reaches the logs commit.
+    let unbounded = executor
+        .execute(tenant_hash, &short(JOIN, Vec::new()))
+        .await
+        .expect("the join runs without a token");
+    assert_eq!(
+        rows(&unbounded.output, "ts", "value"),
+        Vec::<(i64, f64)>::new()
+    );
+
+    let logs_commit =
+        ravel_commit::keys::commit_key_for_token(&tenant_hash, Signal::Logs, &logs_token)
+            .expect("logs commit key");
+    let samples_commit =
+        ravel_commit::keys::commit_key_for_token(&tenant_hash, Signal::Metrics, &logs_token)
+            .expect("samples commit key");
+    let before = recording.requests().len();
+    let bounded = executor
+        .execute(
+            tenant_hash,
+            &short(
+                JOIN,
+                vec![MinCommitToken::qualified("logs", logs_token.clone())],
+            ),
+        )
+        .await
+        .expect("logs:T bounds the logs resolve");
+    assert_eq!(
+        rows(&bounded.output, "ts", "value"),
+        vec![(0, 1.0), (100, 2.0)]
+    );
+    let issued = recording.requests().split_off(before);
+    assert!(
+        issued.contains(&format!("GET {logs_commit}")),
+        "the logs resolve consulted T: {issued:#?}"
+    );
+    assert!(
+        !issued
+            .iter()
+            .any(|request| request.ends_with(&samples_commit)),
+        "the samples resolve did not consult T: {issued:#?}"
+    );
+
+    let err = executor
+        .execute(
+            tenant_hash,
+            &short(JOIN, vec![MinCommitToken::qualified("samples", logs_token)]),
+        )
+        .await
+        .expect_err("samples:T names no samples commit");
+    assert!(unsatisfiable(&err), "{err:?}");
+    assert_eq!(err.client_message(), MSG_UNSATISFIABLE);
+}
+
+/// A qualifier naming a table the statement does not read is
+/// [`SqlError::CommitTokenQualifierNotRead`] at every HTTP entry point,
+/// before any store request, and the message quotes the qualifier. A long
+/// qualifier is quoted cut to 64 bytes on a char boundary.
+#[tokio::test]
+async fn a_qualifier_the_statement_does_not_read_is_refused_before_any_listing() {
+    let tenant_hash = TenantHash([5u8; 16]);
+    let recording = Arc::new(RecordingStore::new(empty_store()));
+    let executor = executor_with(recording.clone(), SqlConfig::default());
+    let long = format!("a{}", "\u{e9}".repeat(40));
+    let cut = format!("a{}...", "\u{e9}".repeat(31));
+    let cases = [
+        (
+            "SELECT ts FROM samples",
+            "logs",
+            "logs".to_owned(),
+            "samples",
+        ),
+        (
+            "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
+            "spans",
+            "spans".to_owned(),
+            "samples, logs",
+        ),
+        // Exact match: the table name in another case is not the table.
+        ("SELECT ts FROM logs", "Logs", "Logs".to_owned(), "logs"),
+        ("SELECT ts FROM logs", long.as_str(), cut, "logs"),
+    ];
+    for (sql, qualifier, quoted, tables) in cases {
+        let mut request = sql_request(sql, WINDOW);
+        request.min_tokens = vec![MinCommitToken::qualified(qualifier, token())];
+        for (entry, err) in http_entry_errors(&executor, tenant_hash, &request).await {
+            let Some(err) = err else {
+                panic!("{entry} must refuse {qualifier:?} on {sql}");
+            };
+            match &err {
+                SqlError::CommitTokenQualifierNotRead {
+                    qualifier: got,
+                    tables: read,
+                } => {
+                    assert_eq!(got, &quoted, "{entry}");
+                    assert_eq!(read, tables, "{entry}");
+                }
+                other => {
+                    panic!("{entry} must refuse with CommitTokenQualifierNotRead, got {other:?}")
+                }
+            }
+            assert_eq!(err.class(), ErrorClass::BadRequest, "{entry}");
+            assert!(
+                err.client_message()
+                    .contains(&format!("qualifier {quoted:?}")),
+                "{entry}: {}",
+                err.client_message()
+            );
+        }
+    }
+    assert_eq!(recording.requests(), Vec::<String>::new());
 }

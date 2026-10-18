@@ -91,7 +91,11 @@ async fn logs_query_rows(
             start_ns: CLOCK_NS - NS_PER_HOUR,
             end_ns: CLOCK_NS + NS_PER_HOUR,
         },
-        min_tokens: min_tokens.to_vec(),
+        min_tokens: min_tokens
+            .iter()
+            .cloned()
+            .map(ravel_sql::MinCommitToken::from)
+            .collect(),
         now_ns: CLOCK_NS + 1_000,
         deadline: Duration::from_secs(30),
         row_window: false,

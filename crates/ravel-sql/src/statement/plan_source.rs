@@ -279,7 +279,11 @@ pub(crate) fn statement_request() -> StatementRequest {
     let req = request("");
     StatementRequest {
         window: req.window,
-        min_tokens: req.min_tokens,
+        min_tokens: req
+            .min_tokens
+            .into_iter()
+            .map(|token| token.token)
+            .collect(),
         now_ns: req.now_ns,
         deadline: req.deadline,
         row_window: req.row_window,

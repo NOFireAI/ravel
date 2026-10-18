@@ -70,7 +70,9 @@ The query string takes the same optional parameters as `POST /api/v1/sql`:
 
 - `start` and `end` are Unix seconds as floats, parsed the same way.
 - `timeout` is in seconds, and can only lower the server's deadline.
-- `min_commit_token` can repeat.
+- `min_commit_token` can repeat. Each value is a token, or a token qualified
+  with the one table the lookup reads, `spans:<token>`. Any other qualifier is
+  a 400.
 
 The route runs `SELECT * FROM spans WHERE trace_id = X'<trace_id>' ORDER BY
 start_ts, span_id` through the SQL endpoint's own handler path. It uses the

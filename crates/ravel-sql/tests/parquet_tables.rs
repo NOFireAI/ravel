@@ -854,6 +854,90 @@ async fn a_signal_table_beside_parquet_is_refused_before_listing() {
     assert_eq!(rows(&outcome), vec!["6".to_string()]);
 }
 
+/// A Parquet table has no commit tokens, so a `min_commit_token` on a
+/// statement that reads only Parquet tables is
+/// [`SqlError::CommitTokenOnParquetStatement`], unqualified or qualified with
+/// the Parquet table's name, refused from the statement text before either
+/// store is read. A Parquet-qualified token on a statement that also names a
+/// signal table is [`SqlError::CommitTokenQualifierNotRead`]: token admission
+/// runs before the Parquet table is resolved, so it fires ahead of
+/// [`SqlError::SignalBesideParquet`].
+#[tokio::test]
+async fn a_commit_token_on_a_parquet_only_statement_is_refused() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+    let token = ravel_types::CommitToken {
+        shard: 0,
+        writer_id: uuid::Uuid::from_u128(11),
+        epoch: 1,
+        seq: 1,
+        ingest_hour_bucket: 0,
+    };
+    let with_tokens = |sql: &str, tokens: Vec<ravel_sql::MinCommitToken>| {
+        let mut req = request(sql);
+        req.min_tokens = tokens;
+        req
+    };
+
+    for tokens in [
+        vec![ravel_sql::MinCommitToken::unqualified(token.clone())],
+        vec![ravel_sql::MinCommitToken::qualified("hits", token.clone())],
+    ] {
+        let before = reads(&lake);
+        let err = lake
+            .executor
+            .execute(
+                acme,
+                &with_tokens("SELECT count(*) FROM hits", tokens.clone()),
+            )
+            .await
+            .expect_err("a token on a Parquet-only statement");
+        assert!(
+            matches!(err, SqlError::CommitTokenOnParquetStatement),
+            "{tokens:?}: {err}"
+        );
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert!(
+            err.client_message().contains("min_commit_token"),
+            "{}",
+            err.client_message()
+        );
+        assert_eq!(reads(&lake), before, "{tokens:?}: nothing is read");
+    }
+
+    let outcome = lake
+        .execute(&acme, "SELECT count(*) FROM hits")
+        .await
+        .expect("the same statement without a token runs");
+    assert_eq!(rows(&outcome), vec!["6".to_string()]);
+
+    let before = reads(&lake);
+    let err = lake
+        .executor
+        .execute(
+            acme,
+            &with_tokens(
+                "SELECT count(*) FROM hits JOIN logs ON true",
+                vec![ravel_sql::MinCommitToken::qualified("hits", token)],
+            ),
+        )
+        .await
+        .expect_err("a Parquet qualifier beside a signal table");
+    match &err {
+        SqlError::CommitTokenQualifierNotRead { qualifier, tables } => {
+            assert_eq!((qualifier.as_str(), tables.as_str()), ("hits", "logs"));
+        }
+        other => panic!("expected CommitTokenQualifierNotRead, got {other}"),
+    }
+    assert_eq!(err.class(), ErrorClass::BadRequest);
+    assert_eq!(
+        reads(&lake),
+        before,
+        "refused before the Parquet table is resolved"
+    );
+}
+
 /// Grants are checked when a query resolves the table: after the grant a
 /// table was created under is removed, the table's files lie outside every
 /// grant and the query fails typed, reading none of them.

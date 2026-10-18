@@ -175,7 +175,9 @@ in an S3, GCS or Azure location that an operator granted the tenant with
 profile from the file that `ravel-server --parquet-profiles` names. A
 statement reads Parquet tables or the five tables above, not both yet. On
 `POST /api/v1/sql` a statement may join the five tables above, each read
-from its own snapshot (see the [query guide](docs/guides/query.md)). A table
+from its own snapshot, and bound each table by its own write with a
+table-qualified `min_commit_token` such as `logs:<token>` (see the
+[query guide](docs/guides/query.md)). A table
 reads only the file versions it was defined over. A caller with
 the `ddl` capability, which is absent by default, creates a table with
 `CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION '...'` and removes it
