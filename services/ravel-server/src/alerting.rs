@@ -523,7 +523,7 @@ pub enum RuleHealth {
     /// The rule was not evaluated: its query, its condition or its write
     /// failed, or the tick could not read history or take the lease. The text
     /// is served to the tenant as `lastError`, so it never carries an object
-    /// key, a tenant hash or backend error text; see [`rule_last_error`].
+    /// key, a tenant hash or backend error text; see `rule_last_error`.
     Err(String),
 }
 
@@ -564,13 +564,14 @@ impl std::fmt::Display for RecordWriteFailed {
 ///
 /// A query error renders as the query listeners render it: a PromQL error
 /// through [`QueryErrorResponse::from_query_error`], a SQL error through
-/// [`ravel_sql::SqlError::client_message`]. Both keep text that is the
-/// caller's own (a parse or plan error on the rule's expression, a budget's
+/// `ravel_sql::SqlError::client_message`. Both keep text that is the
+/// caller's own (a PromQL parse error on the rule's expression, a budget's
 /// figures) and replace a storage-layer fault with its fixed class message.
 /// An alerting error from the rule's own result or configuration, and a
-/// [`RuleRefusal`], keep their text. Anything else, including every record
-/// write failure, renders a fixed message: its text can name an object key.
-/// The caller logs the full chain.
+/// [`RuleRefusal`], keep their text. Any other error from writing the
+/// transition record renders [`MSG_RECORD_WRITE_FAILED`], and anything else
+/// [`MSG_RULE_FAILED`], since their text can name an object key. The caller
+/// logs the full chain.
 fn rule_last_error(err: anyhow::Error) -> String {
     let err = match err.downcast::<ravel_query::QueryError>() {
         Ok(query) => return QueryErrorResponse::from_query_error(query).message,
@@ -8363,9 +8364,9 @@ mod tick_tests {
         );
     }
 
-    /// A rule whose query fails on a tick renders `err` with that error, and
-    /// its still-firing alert is served without a value: the tick produced
-    /// none, and the previous tick's is not carried forward.
+    /// A rule whose query fails on a tick renders `err` with that refusal's
+    /// own text, and its still-firing alert is served without a value: the
+    /// tick produced none, and the previous tick's is not carried forward.
     #[tokio::test]
     async fn a_failing_rule_serves_its_alert_without_a_value() {
         let store = seeded_store().await;
@@ -8398,15 +8399,17 @@ mod tick_tests {
             (AlertState::Firing, None)
         );
         let rule = served_rule(&view).await;
-        assert!(!served_error(&rule).is_empty());
+        assert_eq!(
+            served_error(&rule),
+            "a PromQL alert rule must evaluate to an instant vector or a scalar, got range vector"
+        );
         assert_eq!(rule["state"], "firing");
         assert!(rule["alerts"][0].get("value").is_none(), "{rule}");
     }
 
     /// Backend text an injected store fault carries, shaped like an S3 error
     /// that names its bucket and endpoint.
-    const BACKEND_TEXT: &str =
-        "SlowDown: Please reduce your request rate (bucket ravel-prod-bucket at \
+    const BACKEND_TEXT: &str = "SlowDown: Please reduce your request rate (bucket ravel-prod-bucket at \
          https://s3.internal.example:9000)";
 
     /// A transient fault whose text names `key` and [`BACKEND_TEXT`], as a
@@ -8426,7 +8429,10 @@ mod tick_tests {
             "ravel-prod-bucket",
             "s3.internal.example",
         ] {
-            assert!(!text.contains(needle), "{needle:?} reached the body: {text}");
+            assert!(
+                !text.contains(needle),
+                "{needle:?} reached the body: {text}"
+            );
         }
     }
 
