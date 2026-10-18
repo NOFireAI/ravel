@@ -1831,6 +1831,61 @@ mod tests {
         }
     }
 
+    /// The IPCrypt functions are keyed per session: one statement planned for
+    /// two tenants folds each tenant's own ciphertext into its plan, and
+    /// tenant A's ciphertext appears nowhere in tenant B's plan.
+    #[tokio::test]
+    async fn ipcrypt_ciphertext_stays_in_its_tenants_plan() {
+        use ravel_ipcrypt::policy::Variant;
+        use ravel_ipcrypt::rules::EpochKey;
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let sql = "SELECT body FROM logs WHERE body = ipcrypt_encrypt('192.0.2.1', 1) \
+                   OR body = ipcrypt_prefix_encrypt('192.0.2.1', 1)";
+        let mut plans = Vec::new();
+        let mut ciphertexts = Vec::new();
+        for tenant in [1u8, 2u8] {
+            let ipcrypt = granted_ipcrypt(tenant);
+            let ctx = build_session_with_tables(
+                &SqlConfig::default(),
+                test_pool(),
+                vec![logs_table(&store)],
+                false,
+                SpillDecision::Disabled,
+                &ipcrypt,
+            )
+            .expect("session builds");
+            let state = ctx.state();
+            let plan = state.create_logical_plan(sql).await.expect("plans");
+            let optimized = state.optimize(&plan).expect("optimizes");
+            plans.push(optimized.display_indent().to_string());
+            let hash = ravel_types::TenantHash([tenant; 16]);
+            ciphertexts.push(
+                [Variant::Deterministic, Variant::Prefix].map(|variant| {
+                    EpochKey::new(&[9u8; 32], &hash, variant, 1)
+                        .expect("key")
+                        .encrypt("192.0.2.1")
+                        .0
+                }),
+            );
+        }
+        for (own, other) in [(0, 1), (1, 0)] {
+            for (variant, ciphertext) in ciphertexts[own].iter().enumerate() {
+                assert!(
+                    plans[own].contains(ciphertext.as_str()),
+                    "tenant {own}'s plan must fold its own ciphertext (variant {variant}):\n{}",
+                    plans[own]
+                );
+                assert!(
+                    !plans[other].contains(ciphertext.as_str()),
+                    "tenant {own}'s ciphertext (variant {variant}) leaked into tenant \
+                     {other}'s plan:\n{}",
+                    plans[other]
+                );
+            }
+        }
+    }
+
     /// Ravel's per-table UDFs survive the scalar gate: a logs session keeps
     /// `has_word`, a metrics session keeps `label`/`label_match`.
     ///

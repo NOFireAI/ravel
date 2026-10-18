@@ -67,6 +67,37 @@ const SAMPLE_VALUES: [f64; 4] = [1.0, 2.0, -1.0, 3.0];
 /// How many log records [`publish_logs`] writes.
 const LOG_RECORD_COUNT: usize = 3;
 
+/// The fixture's deployment key, from which the IPCrypt rows' keys derive.
+const CONFORMANCE_IPCRYPT_KEY: [u8; 32] = [0x5a; 32];
+
+/// What `ipcrypt_encrypt('192.0.2.1', 1)` returns for the fixture's tenant
+/// and key; [`ipcrypt_expectations_are_the_ingest_ciphertext`] derives it.
+const IPCRYPT_ENCRYPT_EXPECTED: &str = "ce74:7ae6:4899:22af:9540:be54:f9d2:b0dd";
+
+/// What `ipcrypt_prefix_encrypt('192.0.2.1', 1)` returns, derived the same
+/// way.
+const IPCRYPT_PREFIX_ENCRYPT_EXPECTED: &str = "94.217.87.52";
+
+/// The fixture principal's capabilities: it holds `ipcrypt`, so the IPCrypt
+/// rows' functions are registered in its sessions.
+const FIXTURE_GRANTS: ravel_sql::SqlGrants = ravel_sql::SqlGrants { ipcrypt: true };
+
+/// Run `sql` as the fixture's principal.
+async fn run_as_fixture_principal(
+    fixture: &Fixture,
+    sql: &str,
+) -> Result<ravel_sql::SqlOutcome, SqlError> {
+    fixture
+        .executor
+        .execute_accounted_as(
+            tenant_id("conformance").hash(),
+            FIXTURE_GRANTS,
+            &request(sql),
+            &ravel_sql::LiveAccounting::new(),
+        )
+        .await
+}
+
 /// What a supported construct's result must look like. Every supported registry
 /// row needs one: "the query returned `Ok`" is not evidence, because an empty
 /// result set is a perfectly successful answer to a query that found nothing.
@@ -200,6 +231,12 @@ fn expectation(construct: &Construct) -> Option<Expect> {
         // Of the three log bodies ("conformance record 0/1/2"), only the second
         // tokenizes to contain the word "1".
         (Category::Scalar, "has_word") => Some(Expect::Scalar(1.0)),
+        // The ciphertext the ingest policy writes for 192.0.2.1 under the
+        // fixture's tenant, key and epoch 1, for each variant.
+        (Category::Scalar, "ipcrypt_encrypt") => Some(Expect::Str(IPCRYPT_ENCRYPT_EXPECTED)),
+        (Category::Scalar, "ipcrypt_prefix_encrypt") => {
+            Some(Expect::Str(IPCRYPT_PREFIX_ENCRYPT_EXPECTED))
+        }
 
         // ADR-0097 decision 8: the eight admitted window functions, each result
         // re-derived from the four fixture samples (values -1, 1, 2, 3; all
@@ -461,12 +498,11 @@ async fn conformance_fixture() -> Fixture {
         executor,
         data_keys,
     } = fixture;
-    let executor = executor.with_declared_column_source(Arc::new(
-        ravel_sql::StaticDeclaredColumns::new(vec![ravel_sql::DeclaredColumn::new(
-            "dur",
-            ravel_sql::DeclaredType::I64,
-        )]),
-    ));
+    let executor = executor
+        .with_declared_column_source(Arc::new(ravel_sql::StaticDeclaredColumns::new(vec![
+            ravel_sql::DeclaredColumn::new("dur", ravel_sql::DeclaredType::I64),
+        ])))
+        .with_ipcrypt(Some(Arc::new(CONFORMANCE_IPCRYPT_KEY)), false);
     Fixture {
         store,
         catalog,
@@ -479,12 +515,7 @@ async fn conformance_fixture() -> Fixture {
 /// Runs one supported construct's example and checks the result against a
 /// declared expectation, rather than against `Ok(_)` alone.
 async fn verify_supported(example: &str, expect: Expect, fixture: &Fixture) -> Verdict {
-    let tenant = tenant_id("conformance");
-    match fixture
-        .executor
-        .execute(tenant.hash(), &request(example))
-        .await
-    {
+    match run_as_fixture_principal(fixture, example).await {
         Ok(outcome) => match check_output(expect, &outcome.output) {
             Ok(()) => Verdict::Confirmed,
             Err(observed) => Verdict::Broken { observed },
@@ -594,7 +625,6 @@ fn example_manifest_path() -> PathBuf {
 /// every state-1 row, so this function keeps that name.
 #[tokio::test]
 async fn supported_constructs_execute() {
-    let tenant = tenant_id("conformance");
     let fixture = conformance_fixture().await;
 
     let mut checked = 0usize;
@@ -606,10 +636,7 @@ async fn supported_constructs_execute() {
                     construct.name
                 )
             });
-            let outcome = fixture
-                .executor
-                .execute(tenant.hash(), &request(&construct.example))
-                .await;
+            let outcome = run_as_fixture_principal(&fixture, &construct.example).await;
             let output = outcome
                 .unwrap_or_else(|e| {
                     panic!("supported construct `{}` must execute: {e}", construct.name)
@@ -966,4 +993,26 @@ async fn limit_caps_rows_of_a_plain_projection() {
         }
     }
     assert!(misses.is_empty(), "{}", misses.join("\n"));
+}
+
+/// The IPCrypt rows' expected values are what the ingest policy's
+/// `EpochKey` writes for the fixture's key and tenant at epoch 1, so the
+/// conformance rows pin the SQL functions to the stored ciphertext.
+#[test]
+fn ipcrypt_expectations_are_the_ingest_ciphertext() {
+    use ravel_ipcrypt::policy::Variant;
+    use ravel_ipcrypt::render::RenderOutcome;
+    use ravel_ipcrypt::rules::EpochKey;
+
+    let tenant = tenant_id("conformance").hash();
+    for (variant, expected) in [
+        (Variant::Deterministic, IPCRYPT_ENCRYPT_EXPECTED),
+        (Variant::Prefix, IPCRYPT_PREFIX_ENCRYPT_EXPECTED),
+    ] {
+        let key = EpochKey::new(&CONFORMANCE_IPCRYPT_KEY, &tenant, variant, 1).expect("key");
+        let (ciphertext, outcome) = key.encrypt("192.0.2.1");
+        assert_eq!(outcome, RenderOutcome::Encrypted);
+        assert_eq!(ciphertext, expected, "{variant:?}");
+        assert_ne!(ciphertext, "192.0.2.1");
+    }
 }
