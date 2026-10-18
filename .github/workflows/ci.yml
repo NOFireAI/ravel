@@ -1453,8 +1453,10 @@ jobs:
         # `--otap` is absent for that reason. Under `--features otap` the
         # binary grows `--otap` and that test fails by construction, on any
         # tree. `--all-targets` on the clippy step above still compiles it.
+        # `tests/ipcrypt_store_scan_e2e.rs` is named on its own: its OTAP
+        # cases exist only under this feature.
       - name: Test ravel-server --features otap
-        run: cargo test --locked --profile ci -p ravel-server --features otap --lib
+        run: cargo test --locked --profile ci -p ravel-server --features otap --lib --test ipcrypt_store_scan_e2e
       - name: Report the lowest free space the job reached
         if: always()
         uses: ./.github/actions/disk-usage
