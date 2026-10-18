@@ -24,6 +24,20 @@
 //! snapshot from the ticket. There is no second `Catalog::resolve` anywhere on
 //! the redemption path.
 //!
+//! A statement naming two or more signal tables (`samples JOIN logs`,
+//! ADR-2904 decision 10) resolves one snapshot per table, as the HTTP
+//! endpoint does, and its ticket pins each one as its own segment group
+//! (ticket version 10), so `DoGet` rebuilds every table's snapshot and still
+//! resolves nothing. `DoGet` checks the ticket against its statement before
+//! any store request: a one-snapshot ticket whose statement names two signal
+//! tables is refused as `TicketPinsOneSignal`, and groups that are not the
+//! statement's signal tables as `PinnedSignalsMismatch`, both
+//! `INVALID_ARGUMENT`. Such a statement always runs on one endpoint, never
+//! the distributed slice path. Flight metadata carries a commit token with no
+//! signal qualifier, so a `min_commit_token` on such a statement is refused at
+//! `GetFlightInfo` as `CommitTokenNeedsQualifier`; the same statement without
+//! a token runs.
+//!
 //! A Parquet table (ADR-2040) has no segment set, so its pin is the table's
 //! name and the version of the manifest object `GetFlightInfo` resolved. A
 //! statement's Parquet tables are resolved once per RPC: `GetFlightInfo` plans

@@ -201,6 +201,84 @@ pub async fn publish_segment(
     (token, data_key)
 }
 
+/// Write one real RLOG object holding one `INFO` record per entry of `ts_ns`
+/// (all in one stream, service `web`) and publish its logs commit record.
+/// `index` keeps writer identity and content hash distinct per object.
+pub async fn publish_logs(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+    ts_ns: &[i64],
+) -> (CommitToken, String) {
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("web".to_string()),
+    )];
+    let records: Vec<LogRecord> = ts_ns
+        .iter()
+        .map(|ts| LogRecord {
+            stream_id: ravel_types::logstream::log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: *ts,
+            observed_ts_ns: *ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("line {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .collect();
+    let writer_id = Uuid::from_u128(0x7000 + index as u128);
+    let identity = ObjectIdentity {
+        tenant_hash: tenant.hash().0,
+        shard: 0,
+        writer_id: *writer_id.as_bytes(),
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for r in &records {
+        writer.push(r.clone()).expect("push log record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+    let min = records.iter().map(|r| r.ts_ns).min().expect("nonempty");
+    let max = records.iter().map(|r| r.ts_ns).max().expect("nonempty");
+    let new_record = NewCommitRecord {
+        tenant_hash: tenant.hash(),
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+        object_size: bytes.len() as u64,
+        content_hash: [index as u8; 32],
+        sample_count: records.len() as u64,
+        series_count: 1,
+        min_event_ts_ns: min,
+        max_event_ts_ns: max,
+        min_ingest_ts_ns: min,
+        max_ingest_ts_ns: max,
+        segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+        created_unix_ns: 10 + index as i64,
+        ingest_hour_bucket: 0,
+    };
+    let rec = record::build(new_record).expect("valid logs commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("logs data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put rlog object");
+    let token = publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish logs commit record");
+    (token, data_key)
+}
+
 /// A running stack: store, catalog, fetcher, and executor.
 pub struct Fixture {
     pub store: Arc<dyn ObjectStoreBackend>,

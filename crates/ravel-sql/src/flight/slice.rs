@@ -199,6 +199,7 @@ mod tests {
             declared_columns: Vec::new(),
             parquet_tables: Vec::new(),
             budgets: None,
+            signal_groups: Vec::new(),
         }
     }
 
@@ -273,12 +274,12 @@ mod tests {
             .encode(&slice_ticket(), TicketSurface::Slice)
             .expect("encode");
         let mut body = encoded[..encoded.len() - 32].to_vec();
-        body[4] = crate::flight_ticket::VERSION_PUSHDOWN + 1;
+        body[4] = crate::flight_ticket::VERSION_GROUPS + 1;
         let tag = blake3::keyed_hash(keys.mint_key(TicketSurface::Slice), &body);
         body.extend_from_slice(tag.as_bytes());
         assert_eq!(
             keys.decode(&body, TicketSurface::Slice),
-            Err(FlightTicketError::UnsupportedVersion(10))
+            Err(FlightTicketError::UnsupportedVersion(11))
         );
         assert_eq!(
             verify_slice(&keys, &body, NOW_NS),
@@ -288,5 +289,41 @@ mod tests {
         let last = body.len() - 1;
         body[last] ^= 0x01;
         assert_eq!(verify_slice(&keys, &body, NOW_NS), Err(SliceReject::BadMac));
+    }
+
+    /// A slice ticket is never version 10. One carrying signal groups, signed
+    /// directly under the slice mint key past the surface's own encode check,
+    /// is refused on its version as the wrong surface, never decoded into a
+    /// slice.
+    #[test]
+    fn a_v10_ticket_on_the_slice_surface_is_wrong_surface() {
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        let grouped = FlightTicket {
+            statement: "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts".to_owned(),
+            signal_groups: [
+                crate::executor::TargetSignal::Metrics,
+                crate::executor::TargetSignal::Logs,
+            ]
+            .into_iter()
+            .map(|signal| crate::flight_ticket::SignalGroup {
+                signal,
+                segments: Vec::new(),
+                pending_erasure: Vec::new(),
+            })
+            .collect(),
+            ..slice_ticket()
+        };
+        let bytes = grouped
+            .encode(keys.mint_key(TicketSurface::Slice))
+            .expect("encode");
+        assert_eq!(bytes[4], 10);
+        assert_eq!(
+            keys.decode(&bytes, TicketSurface::Slice),
+            Err(FlightTicketError::UnsupportedVersion(10))
+        );
+        assert_eq!(
+            verify_slice(&keys, &bytes, NOW_NS),
+            Err(SliceReject::WrongSurface)
+        );
     }
 }

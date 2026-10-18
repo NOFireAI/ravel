@@ -22,10 +22,14 @@
 //!    catalog request ([`admit_http_tokens`], ADR-2904 decision 3): each one
 //!    is assigned to exactly one lane, by its table qualifier or, on a
 //!    statement naming at most one signal table, unqualified, and
-//!    `lane_tokens` is that lane's share alone. The Flight SQL entry points
-//!    and ES|QL keep the
-//!    one-table rule and refuse it with [`SqlError::CrossSignalQuery`] before
-//!    any catalog request. `name_filter` is the equality
+//!    `lane_tokens` is that lane's share alone. Flight SQL runs it too,
+//!    through the multi-lane pinned entry points
+//!    ([`SqlExecutor::resolve_pinned_lanes`], [`SqlExecutor::plan_pinned_lanes`])
+//!    and a ticket carrying one segment group per signal (ADR-2904 decision
+//!    10). The single-snapshot entry points, and ES|QL under its own one-table
+//!    rule (ADR-2887, unchanged by ADR-2904), refuse it with
+//!    [`SqlError::CrossSignalQuery`] before any catalog request. `name_filter`
+//!    is the equality
 //!    `__name__` value derived from the `samples` scans' pushed-down
 //!    predicates ([`SqlExecutor::pushed_down_name_filter`]) and is passed to
 //!    the metrics resolve alone, so a metrics query naming one metric prunes
@@ -262,14 +266,42 @@ impl StatementTables {
     }
 }
 
-/// The one-table rule of Flight SQL and ES|QL (ADR-2904 decision 9): refuse a
-/// statement naming two or more signal tables. Their entry points call this
-/// before any catalog request.
+/// The one-table rule of the entry points that read one snapshot: refuse a
+/// statement naming two or more signal tables, before any catalog request.
+/// ES|QL keeps it as its own rule (ADR-2887), which ADR-2904 leaves unchanged;
+/// the single-snapshot pinned entry points ([`SqlExecutor::resolve_pinned`],
+/// [`SqlExecutor::plan_pinned`] and their siblings) keep it because one
+/// snapshot cannot hold two signals' pins. Flight SQL runs such a statement
+/// through the multi-lane pinned entry points (ADR-2904 decision 10).
 pub(crate) fn refuse_cross_signal(tables: &StatementTables) -> Result<(), SqlError> {
     if tables.signals.len() > 1 {
         return Err(SqlError::CrossSignalQuery);
     }
     Ok(())
+}
+
+/// [`SqlError::PinnedSignalsMismatch`] naming the pinned lanes and the
+/// statement's signal tables.
+pub(crate) fn pinned_signals_mismatch(
+    pinned: &[TargetSignal],
+    tables: &[TargetSignal],
+) -> SqlError {
+    SqlError::PinnedSignalsMismatch {
+        pinned: lane_names(pinned),
+        tables: lane_names(tables),
+    }
+}
+
+/// `signals`' table names, comma-separated, or `none`.
+fn lane_names(signals: &[TargetSignal]) -> String {
+    if signals.is_empty() {
+        return "none".to_owned();
+    }
+    signals
+        .iter()
+        .map(|signal| crate::statement::signal_table_name(*signal).unwrap_or("parquet"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// The `min_commit_token`s each lane's catalog resolve waits for. Assigned
@@ -281,8 +313,8 @@ pub(crate) struct LaneTokens {
 }
 
 impl LaneTokens {
-    /// Every token on one lane: the surfaces that keep the one-table rule and
-    /// carry plain tokens (Flight SQL, ES|QL).
+    /// Every token on one lane: the plain tokens of a pinned (Flight SQL) or
+    /// ES|QL statement over at most one signal table.
     pub(crate) fn one_lane(lane: TargetSignal, tokens: Vec<CommitToken>) -> Self {
         let mut out = LaneTokens::default();
         for token in tokens {
@@ -445,6 +477,20 @@ pub struct PinnedPlanInputs {
     pub budgets: Option<RequestBudgets>,
 }
 
+/// What [`SqlExecutor::resolve_pinned_lanes`] produced: one snapshot to pin
+/// per signal table the statement names, in [`SIGNAL_LANE_ORDER`] (the one
+/// `samples` lane for a statement naming none, one empty Parquet lane for a
+/// Parquet statement), the statement's summed cost estimate, and the Parquet
+/// tables the resolve read.
+#[derive(Debug, Clone)]
+pub struct PinnedLanes {
+    pub lanes: Vec<(TargetSignal, Snapshot)>,
+    pub estimate: CostEstimate,
+    /// The live Parquet tables the statement names, resolved once here so the
+    /// plan that follows reads no manifest again; `None` when it names none.
+    pub parquet: Option<ParquetResolution>,
+}
+
 /// What [`SqlExecutor::resolve_pinned`] produced: the snapshot to pin, the
 /// statement's cost estimate, and the Parquet tables the resolve read.
 #[derive(Debug, Clone)]
@@ -562,7 +608,7 @@ struct PlanExtras {
     budgets: Option<RequestBudgets>,
     /// The window `Catalog::load_column_stats` bounds its per-part reads
     /// against (ADR-1413): the request's own window where one exists
-    /// (`explain_inner`, `attempt`), or [`snapshot_covering_window`]'s
+    /// (`explain_inner`, `attempt`), or [`lanes_covering_window`]'s
     /// derived cover for the two entry points planning an already-resolved
     /// snapshot with no request window attached.
     column_stats_window: TimeRange,
@@ -1054,9 +1100,10 @@ fn ts_literal(ns: i64) -> Expr {
     lit(ScalarValue::TimestampNanosecond(Some(ns), None))
 }
 
-/// A `(range, now_ns)` pair covering every segment already in `snapshot`, for
-/// [`Executor::plan_pinned`] and [`Executor::plan_pinned_distributed`]: both
-/// take an already-resolved snapshot with no request window attached, so
+/// A `(range, now_ns)` pair covering every segment already in `lanes`'
+/// snapshots, for [`Executor::plan_pinned`], [`Executor::plan_pinned_lanes`]
+/// and their distributed forms: each takes already-resolved snapshots with no
+/// request window attached, so
 /// `Catalog::load_column_stats` (which needs a window to bound which parts it
 /// loads) is given the widest window that still reproduces the snapshot's own
 /// resolve rather than a request window these entry points were never handed.
@@ -1081,20 +1128,16 @@ fn ts_literal(ns: i64) -> Expr {
 /// intersects and the loader still pays its HEAD read plus one whole-object
 /// GET. It is harmless, because an empty snapshot has no segment to join the
 /// loaded statistics against.
-fn snapshot_covering_window(snapshot: &Snapshot) -> (TimeRange, i64) {
+fn lanes_covering_window(lanes: &[(TargetSignal, Snapshot)]) -> (TimeRange, i64) {
     const NS_PER_HOUR: i64 = 3_600_000_000_000;
-    let min_hour = snapshot
-        .segments
-        .iter()
-        .map(|seg| seg.ingest_hour_bucket)
-        .min()
-        .unwrap_or(0);
-    let max_hour = snapshot
-        .segments
-        .iter()
-        .map(|seg| seg.ingest_hour_bucket)
-        .max()
-        .unwrap_or(0);
+    let hours = || {
+        lanes
+            .iter()
+            .flat_map(|(_, snapshot)| snapshot.segments.iter())
+            .map(|seg| seg.ingest_hour_bucket)
+    };
+    let min_hour = hours().min().unwrap_or(0);
+    let max_hour = hours().max().unwrap_or(0);
     // Saturating, not plain multiplication: `ingest_hour_bucket` is a u32 read
     // from a catalog object, and anything at or above hour 2_562_048 overflows
     // i64 nanoseconds. Under dev and ci, where overflow checks are on, that
@@ -2216,20 +2259,71 @@ impl SqlExecutor {
         req: &SqlRequest,
         accounting: &QueryAccounting,
     ) -> Result<PinnedResolve, SqlError> {
-        // Kept on the pooled `&QueryAccounting` signature (this is the public
-        // Flight SQL `GetFlightInfo`-side resolve, and its caller has no
-        // phase-split handle to hand in): `pooled_over` shares this same
-        // handle's counters across all five phases, so the resolve's cost
-        // still lands on `accounting` exactly as before.
-        //
-        // A Flight ticket pins one snapshot, so this path keeps the one-table
-        // rule (ADR-2904 decision 10 lifts it with a new ticket layout).
+        // One snapshot pins one signal table, so this path keeps the one-table
+        // rule; [`Self::resolve_pinned_lanes`] is the multi-lane form.
         let tables = Statement::Sql(&req.sql).tables()?;
         refuse_cross_signal(&tables)?;
-        // A ticket's tokens are plain (no table qualifier), and the one table
-        // it reads is the one they bound.
-        let tokens =
-            LaneTokens::one_lane(tables.first_lane(), unqualified_tokens(&req.min_tokens)?);
+        let PinnedLanes {
+            lanes,
+            estimate,
+            parquet,
+        } = self
+            .resolve_pinned_tables(tenant_hash, req, &tables, accounting)
+            .await?;
+        let Some((_, snapshot)) = lanes.into_iter().next() else {
+            return Err(SqlError::Internal(
+                "a resolve returned no snapshot".to_string(),
+            ));
+        };
+        Ok(PinnedResolve {
+            snapshot,
+            estimate,
+            parquet,
+        })
+    }
+
+    /// [`Self::resolve_pinned`] for a statement over any number of signal
+    /// tables: one snapshot per signal table the statement names, in
+    /// [`SIGNAL_LANE_ORDER`], all from one resolve with the HTTP path's
+    /// admission, lane checks, summed segment budget and summed estimate
+    /// (ADR-2904 decision 10). A statement naming at most one signal table
+    /// resolves exactly as [`Self::resolve_pinned`] does and returns its one
+    /// lane.
+    ///
+    /// Tokens are plain, as on a Flight ticket: a qualified one is
+    /// [`SqlError::QualifiedCommitTokenUnsupported`], and any token on a
+    /// statement naming two or more signal tables is
+    /// [`SqlError::CommitTokenNeedsQualifier`], because a plain token does not
+    /// say which table it bounds. Both are refused before any catalog request.
+    pub async fn resolve_pinned_lanes(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedLanes, SqlError> {
+        let tables = Statement::Sql(&req.sql).tables()?;
+        self.resolve_pinned_tables(tenant_hash, req, &tables, accounting)
+            .await
+    }
+
+    async fn resolve_pinned_tables(
+        &self,
+        tenant_hash: TenantHash,
+        req: &SqlRequest,
+        tables: &StatementTables,
+        accounting: &QueryAccounting,
+    ) -> Result<PinnedLanes, SqlError> {
+        let plain = unqualified_tokens(&req.min_tokens)?;
+        let tokens = if tables.signals.len() > 1 {
+            admit_http_tokens(tables, &req.min_tokens)?
+        } else {
+            // The one table the statement reads is the one plain tokens bound.
+            LaneTokens::one_lane(tables.first_lane(), plain)
+        };
+        // Kept on the pooled `&QueryAccounting` signature (the public Flight
+        // SQL `GetFlightInfo`-side resolve, whose caller has no phase-split
+        // handle to hand in): `pooled_over` shares this same handle's counters
+        // across all five phases and every lane.
         let resolved = self
             .resolve(
                 tenant_hash,
@@ -2241,13 +2335,13 @@ impl SqlExecutor {
             .await?;
         let estimate = resolved.estimate;
         let (lanes, parquet) = resolved.into_snapshots();
-        let Some((_, snapshot)) = lanes.into_iter().next() else {
+        if lanes.is_empty() {
             return Err(SqlError::Internal(
                 "a resolve returned no snapshot".to_string(),
             ));
-        };
-        Ok(PinnedResolve {
-            snapshot,
+        }
+        Ok(PinnedLanes {
+            lanes,
             estimate,
             parquet,
         })
@@ -2269,8 +2363,9 @@ impl SqlExecutor {
     /// `accounting` is this query's [`QueryAccounting`] handle: it is cloned
     /// into the query's memory pool (peak intermediate bytes) and into
     /// the one table provider built over `snapshot` (every store fetch the
-    /// scan issues). A ticket pins one snapshot, so a statement naming two
-    /// signal tables is [`SqlError::CrossSignalQuery`] here.
+    /// scan issues). One snapshot pins one signal table, so a statement naming
+    /// two signal tables is [`SqlError::CrossSignalQuery`] here;
+    /// [`Self::plan_pinned_lanes`] is the multi-lane form.
     pub async fn plan_pinned(
         &self,
         tenant_hash: TenantHash,
@@ -2310,30 +2405,46 @@ impl SqlExecutor {
         accounting: &QueryAccounting,
         inputs: PinnedPlanInputs,
     ) -> Result<PinnedQuery, SqlError> {
-        let (window, now_ns) = snapshot_covering_window(&snapshot);
         let lanes = Self::pinned_lane(sql, snapshot)?;
-        // Public two-RPC Flight SQL surface: the caller holds a pooled
-        // `&QueryAccounting`, so `pooled_over` bridges it to the phase-split
-        // API `plan_pinned_with` now takes without changing where the cost
-        // lands.
-        self.plan_pinned_with(
+        self.plan_checked_lanes(
             tenant_hash,
             lanes,
-            Statement::Sql(sql),
-            &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
-            PlanExtras {
-                declared: inputs.declared,
-                // Explicit per-field so this compiles clean whether or not the
-                // `flight-sql` feature adds `distributed`; a `..default()` would
-                // be a needless update on the single-field local build.
-                #[cfg(feature = "flight-sql")]
-                distributed: None,
-                row_window: None,
-                budgets: inputs.budgets,
-                column_stats_window: window,
-                column_stats_now_ns: now_ns,
-                parquet: inputs.parquet,
-            },
+            sql,
+            accounting,
+            #[cfg(feature = "flight-sql")]
+            None,
+            inputs,
+        )
+        .await
+    }
+
+    /// [`Self::plan_pinned_with_inputs`] over one pinned snapshot per signal
+    /// table: `lanes` is what [`Self::resolve_pinned_lanes`] returned, or what
+    /// a Flight ticket's segment groups rebuild (ADR-2904 decision 10). Each
+    /// table's provider reads only its own lane's snapshot and applies that
+    /// snapshot's pending erasure.
+    ///
+    /// For a statement naming two or more signal tables, the lanes' signals
+    /// must be exactly the statement's signal tables in [`SIGNAL_LANE_ORDER`];
+    /// otherwise, exactly one lane. Anything else is
+    /// [`SqlError::PinnedSignalsMismatch`], refused before any store request.
+    pub async fn plan_pinned_lanes(
+        &self,
+        tenant_hash: TenantHash,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        sql: &str,
+        accounting: &QueryAccounting,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let lanes = Self::checked_lanes(sql, lanes)?;
+        self.plan_checked_lanes(
+            tenant_hash,
+            lanes,
+            sql,
+            accounting,
+            #[cfg(feature = "flight-sql")]
+            None,
+            inputs,
         )
         .await
     }
@@ -2358,8 +2469,79 @@ impl SqlExecutor {
         distributed: Option<DistributedScan>,
         inputs: PinnedPlanInputs,
     ) -> Result<PinnedQuery, SqlError> {
-        let (window, now_ns) = snapshot_covering_window(&snapshot);
         let lanes = Self::pinned_lane(sql, snapshot)?;
+        self.plan_checked_lanes(tenant_hash, lanes, sql, accounting, distributed, inputs)
+            .await
+    }
+
+    /// [`Self::plan_pinned_lanes`] with [`Self::plan_pinned_distributed`]'s
+    /// optional coordinator-side distributed scan. `DoGet` installs one only
+    /// for a single-lane ticket.
+    #[cfg(feature = "flight-sql")]
+    pub async fn plan_pinned_lanes_distributed(
+        &self,
+        tenant_hash: TenantHash,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        sql: &str,
+        accounting: &QueryAccounting,
+        distributed: Option<DistributedScan>,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let lanes = Self::checked_lanes(sql, lanes)?;
+        self.plan_checked_lanes(tenant_hash, lanes, sql, accounting, distributed, inputs)
+            .await
+    }
+
+    /// The one lane a single pinned `snapshot` plans `sql` over: one snapshot
+    /// pins one signal table, so a statement naming several signal tables is
+    /// [`SqlError::CrossSignalQuery`] here, before anything is read.
+    fn pinned_lane(
+        sql: &str,
+        snapshot: Snapshot,
+    ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
+        let tables = Statement::Sql(sql).tables()?;
+        refuse_cross_signal(&tables)?;
+        Ok(vec![(tables.first_lane(), snapshot)])
+    }
+
+    /// `lanes` checked against the signal tables `sql` names, before anything
+    /// is read: every signal table's lane, in [`SIGNAL_LANE_ORDER`], for a
+    /// statement naming two or more; otherwise exactly one lane, which plans
+    /// as the statement's one table the way [`Self::pinned_lane`] plans it.
+    fn checked_lanes(
+        sql: &str,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+    ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
+        let tables = Statement::Sql(sql).tables()?;
+        let pinned: Vec<TargetSignal> = lanes.iter().map(|(signal, _)| *signal).collect();
+        if tables.signals.len() > 1 {
+            if pinned != tables.signals {
+                return Err(pinned_signals_mismatch(&pinned, &tables.signals));
+            }
+            return Ok(lanes);
+        }
+        let mut lanes = lanes.into_iter();
+        match (lanes.next(), lanes.next()) {
+            (Some((_, snapshot)), None) => Ok(vec![(tables.first_lane(), snapshot)]),
+            _ => Err(pinned_signals_mismatch(&pinned, &tables.signals)),
+        }
+    }
+
+    /// The shared body of the pinned plan entry points, over lanes already
+    /// checked against the statement. Public two-RPC surface: the caller holds
+    /// a pooled `&QueryAccounting`, so `pooled_over` bridges it to the
+    /// phase-split API `plan_pinned_with` takes without changing where the
+    /// cost lands.
+    async fn plan_checked_lanes(
+        &self,
+        tenant_hash: TenantHash,
+        lanes: Vec<(TargetSignal, Snapshot)>,
+        sql: &str,
+        accounting: &QueryAccounting,
+        #[cfg(feature = "flight-sql")] distributed: Option<DistributedScan>,
+        inputs: PinnedPlanInputs,
+    ) -> Result<PinnedQuery, SqlError> {
+        let (window, now_ns) = lanes_covering_window(&lanes);
         self.plan_pinned_with(
             tenant_hash,
             lanes,
@@ -2367,6 +2549,7 @@ impl SqlExecutor {
             &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
             PlanExtras {
                 declared: inputs.declared,
+                #[cfg(feature = "flight-sql")]
                 distributed,
                 row_window: None,
                 budgets: inputs.budgets,
@@ -2376,18 +2559,6 @@ impl SqlExecutor {
             },
         )
         .await
-    }
-
-    /// The one lane a Flight-pinned `snapshot` plans `sql` over: a ticket pins
-    /// one snapshot, so a statement naming several signal tables is
-    /// [`SqlError::CrossSignalQuery`] here, before anything is read.
-    fn pinned_lane(
-        sql: &str,
-        snapshot: Snapshot,
-    ) -> Result<Vec<(TargetSignal, Snapshot)>, SqlError> {
-        let tables = Statement::Sql(sql).tables()?;
-        refuse_cross_signal(&tables)?;
-        Ok(vec![(tables.first_lane(), snapshot)])
     }
 
     /// The one body behind [`Self::plan_pinned_with_inputs`] and
@@ -3947,7 +4118,8 @@ impl SqlExecutor {
     ///   [`TargetSignal::Metrics`].
     /// - references two or more of {`samples`, `logs`, `spans`, `alerts`,
     ///   `audit`} -> [`SqlError::CrossSignalQuery`], the one-table rule
-    ///   ([`refuse_cross_signal`]) the Flight SQL and ES|QL surfaces apply.
+    ///   ([`refuse_cross_signal`]) the single-snapshot entry points and ES|QL
+    ///   apply.
     ///
     /// The "no real table" case (a constant query such as `SELECT 1`, or one
     /// whose only source is a CTE with no base table) defaults to `Metrics`: it
@@ -3974,7 +4146,8 @@ impl SqlExecutor {
     /// [`SqlError::TooManyTables`], so the Parquet resolve's one LIST per
     /// name is bounded before it starts. Two signal tables are not refused
     /// here: each entry point applies its own rule ([`refuse_cross_signal`]
-    /// on Flight SQL and ES|QL, [`admit_http_tokens`] on HTTP).
+    /// on ES|QL and on the entry points that pin one snapshot,
+    /// [`admit_http_tokens`] on HTTP and Flight SQL).
     pub(crate) fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
         let mut tables = referenced_base_tables(sql)?;
         let signals: Vec<TargetSignal> = SIGNAL_LANE_ORDER
@@ -6913,9 +7086,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// ADR-2904 decision 9: the Flight SQL resolve keeps the one-table rule and
-    /// refuses a cross-signal query before any catalog work, so it costs zero
-    /// store requests. Runs a `spans` + `samples` join through
+    /// The single-snapshot resolve keeps the one-table rule (Flight SQL takes
+    /// the multi-lane resolve instead, ADR-2904 decision 10) and refuses a
+    /// cross-signal query before any catalog work, so it costs zero store
+    /// requests. Runs a `spans` + `samples` join through
     /// `resolve_snapshot` against an `InstrumentedStore` and asserts both that
     /// the error is `CrossSignalQuery` and that the store saw no LIST/GET/HEAD
     /// at all.

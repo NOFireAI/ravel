@@ -224,6 +224,6 @@ Decision 5 registered `spans` under the one-signal-per-query rule of
 ADR-0033. ADR-2904 replaces that rule: a statement may name `spans` together
 with other signal tables and Parquet tables, with one snapshot resolved per
 named signal. The `spans` table, its pushdown, and its widen-only rule are
-unchanged. The HTTP SQL endpoint runs such a statement since issue #2910;
-Flight SQL still rejects it with `SqlError::CrossSignalQuery` until its
-ticket carries one segment group per signal (ADR-2904 decision 10).
+unchanged. The HTTP SQL endpoint runs such a statement since issue #2910,
+and Flight SQL since issue #2913, whose version 10 ticket carries one
+segment group per signal (ADR-2904 decision 10).

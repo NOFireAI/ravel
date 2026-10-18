@@ -385,9 +385,10 @@ table references before any catalog listing, CTE names excluded, and a
 session that registers nothing the statement does not name. Rejected
 alternative C's single `telemetry` table stays rejected.
 
-The HTTP SQL endpoint runs such a statement since issue #2910. Flight SQL
-and ES|QL still return `SqlError::CrossSignalQuery` for it, Flight SQL until
-its ticket carries one segment group per signal (ADR-2904 decision 10). A
+The HTTP SQL endpoint runs such a statement since issue #2910, and Flight
+SQL since issue #2913, whose version 10 ticket carries one segment group per
+signal (ADR-2904 decision 10). ES|QL still returns
+`SqlError::CrossSignalQuery` for it. A
 `min_commit_token` on a statement naming two or more signal tables, and a
 signal table beside a Parquet table, are refused over HTTP as not supported
 yet; the reference is the "Statements over several signal tables" section of

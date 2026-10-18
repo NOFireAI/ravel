@@ -10,8 +10,8 @@
 //! the same retry against the same pin:
 //!
 //! - A store `NotFound` **before the first batch has been emitted** rebuilds
-//!   the session over the *same* pinned snapshot and re-executes once. A
-//!   second `NotFound` fails [`SqlError::SnapshotInvalidated`]: the segment is
+//!   the session over the *same* pinned snapshots (one per signal lane of a
+//!   version 10 ticket) and re-executes once. A second `NotFound` fails [`SqlError::SnapshotInvalidated`]: the segment is
 //!   genuinely gone, and no other snapshot may be substituted for it.
 //! - A store `NotFound` **after** any batch has been sent fails
 //!   `SnapshotInvalidated` immediately, with zero retries. Rows are already on
@@ -73,7 +73,7 @@ use tonic::Status;
 use crate::error::SqlError;
 use crate::executor::{
     DistributedScan, ParquetPlan, PinnedPlanInputs, PinnedStream, RetryDecision, SqlExecutor,
-    retry_decision,
+    TargetSignal, retry_decision,
 };
 use crate::flight::ClockRef;
 use crate::flight::FlightSqlConfig;
@@ -99,6 +99,7 @@ pub(super) async fn statement_stream(
     clock: ClockRef,
     tenant: TenantHash,
     ticket: FlightTicket,
+    lanes: Vec<(TargetSignal, Snapshot)>,
     config: &FlightSqlConfig,
     recorder: Arc<dyn QueryCostRecorder>,
     span: tracing::Span,
@@ -125,14 +126,13 @@ pub(super) async fn statement_stream(
     }
     let budget = remaining(now_ns, deadline_ns);
 
-    let snapshot = ticket.snapshot();
     let started = tokio::time::timeout(
         budget,
         // The declared typed attribute columns (ADR-0090) and the Parquet
         // manifest versions pinned into the ticket at `get_flight_info`:
         // `DoGet` plans against exactly these, never a re-resolution that a
         // concurrent cache refresh or a replaced table could have changed.
-        start_pinned(executor, tenant, &snapshot, &ticket, distributed),
+        start_pinned(executor, tenant, &lanes, &ticket, distributed),
     )
     .await
     .unwrap_or_else(|_| {
@@ -263,7 +263,10 @@ pub(super) async fn fragment_stream(
     }
     let budget = remaining(now_ns, deadline_ns);
 
-    let snapshot = ticket.snapshot();
+    // A slice ticket is never version 10, so it always has one snapshot.
+    let snapshot = ticket
+        .snapshot()
+        .map_err(|err| status_from_sql(&SqlError::Internal(err.to_string()), tenant))?;
     // A fresh accounting handle, folded into the coordinator's aggregator when
     // this slice's stream ends, exactly as the statement path folds its own
     //. The executing fragment holds clones of it, so its counters
@@ -662,7 +665,7 @@ fn remaining(now_ns: i64, deadline_ns: i64) -> Duration {
 async fn start_pinned(
     executor: &SqlExecutor,
     tenant: TenantHash,
-    snapshot: &Snapshot,
+    lanes: &[(TargetSignal, Snapshot)],
     ticket: &FlightTicket,
     distributed: Option<DistributedScan>,
 ) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
@@ -671,7 +674,7 @@ async fn start_pinned(
     // cheaply (a slice `Vec` and an `Arc` client), so a retry re-plans over
     // the same fan-out rather than silently falling back to local.
     for attempt in 0..2u32 {
-        match first_batch(executor, tenant, snapshot, ticket, distributed.clone()).await {
+        match first_batch(executor, tenant, lanes, ticket, distributed.clone()).await {
             Ok(started) => return Ok(started),
             Err(err) => match retry_decision(err.is_segment_not_found(), 0, attempt) {
                 RetryDecision::RetryOnce => continue,
@@ -694,7 +697,7 @@ async fn start_pinned(
 async fn first_batch(
     executor: &SqlExecutor,
     tenant: TenantHash,
-    snapshot: &Snapshot,
+    lanes: &[(TargetSignal, Snapshot)],
     ticket: &FlightTicket,
     distributed: Option<DistributedScan>,
 ) -> Result<(Option<RecordBatch>, PinnedStream, QueryAccounting), SqlError> {
@@ -705,9 +708,9 @@ async fn first_batch(
     // execution stream, so its counters keep rising as batches are pulled.
     let accounting = QueryAccounting::new();
     let planned = executor
-        .plan_pinned_distributed(
+        .plan_pinned_lanes_distributed(
             tenant,
-            snapshot.clone(),
+            lanes.to_vec(),
             &ticket.statement,
             &accounting,
             distributed,

@@ -151,18 +151,51 @@ pub enum SqlError {
     Validation(#[from] ValidationError),
 
     /// The statement names two or more of the signal tables (`samples`,
-    /// `logs`, `spans`, `alerts`, `audit`) on a surface that keeps the
-    /// one-table rule: Flight SQL and ES|QL (ADR-2904 decisions 1 and 9). The
-    /// HTTP SQL statement path runs such a statement instead. Refused from the
-    /// statement text before any catalog resolve. Its text names only the
-    /// fixed table names -- no server state -- so it is safe to return
-    /// verbatim, like a validation error, and maps to HTTP 400.
+    /// `logs`, `spans`, `alerts`, `audit`) on an entry point that plans
+    /// against one snapshot: the single-snapshot pinned entries, and ES|QL,
+    /// whose one-table rule is its own (ADR-2887) and unchanged by ADR-2904.
+    /// The HTTP SQL statement path (ADR-2904 decision 1) and Flight SQL, which
+    /// pins one segment group per signal (decision 10), run such a statement
+    /// instead. Refused from the statement text before any catalog resolve.
+    /// Its text names only the fixed table names and the two surfaces -- no
+    /// server state -- so it is safe to return verbatim, like a validation
+    /// error, and maps to HTTP 400.
     #[error(
         "this query surface reads at most one of the samples, logs, spans, \
          alerts and audit tables per statement; send a statement that joins \
-         two of them to the HTTP SQL endpoint"
+         two of them to POST /api/v1/sql or Flight SQL"
     )]
     CrossSignalQuery,
+
+    /// A Flight SQL ticket that pins one snapshot (version 8 or 9) carries a
+    /// statement naming two or more signal tables. GetFlightInfo mints such a
+    /// statement as version 10, one segment group per signal (ADR-2904
+    /// decision 10), so this ticket was not minted by this server's
+    /// GetFlightInfo for that statement. Refused at DoGet before any store
+    /// request; the text names no server state; INVALID_ARGUMENT.
+    #[error(
+        "this Flight SQL ticket pins one signal table's snapshot but its \
+         statement reads more than one of the samples, logs, spans, alerts and \
+         audit tables; call GetFlightInfo again for a fresh ticket"
+    )]
+    TicketPinsOneSignal,
+
+    /// A version 10 Flight SQL ticket whose segment groups name a different
+    /// set of signal tables than its statement reads. Refused at DoGet, or at
+    /// a multi-lane pinned entry whose lanes do not match the statement,
+    /// before any store request; the text names only the fixed table names;
+    /// INVALID_ARGUMENT.
+    #[error(
+        "the pinned signal tables ({pinned}) are not the signal tables this \
+         statement reads ({tables}); call GetFlightInfo again for a fresh \
+         ticket"
+    )]
+    PinnedSignalsMismatch {
+        /// The pinned signal table names, comma-separated.
+        pinned: String,
+        /// The statement's signal table names, comma-separated.
+        tables: String,
+    },
 
     /// An unqualified `min_commit_token` on a statement that names two or
     /// more signal tables: the token does not say which table it bounds
@@ -571,6 +604,8 @@ impl SqlError {
             SqlError::PlanNotAdmitted(_) => ErrorClass::Internal,
             SqlError::Validation(_)
             | SqlError::CrossSignalQuery
+            | SqlError::TicketPinsOneSignal
+            | SqlError::PinnedSignalsMismatch { .. }
             | SqlError::CommitTokenNeedsQualifier { .. }
             | SqlError::CommitTokenQualifierNotRead { .. }
             | SqlError::CommitTokenOnParquetStatement
@@ -648,6 +683,8 @@ impl SqlError {
             SqlError::Validation(e) => e.to_string(),
             // Safe to echo: the text names only the fixed table names.
             SqlError::CrossSignalQuery
+            | SqlError::TicketPinsOneSignal
+            | SqlError::PinnedSignalsMismatch { .. }
             | SqlError::CommitTokenNeedsQualifier { .. }
             | SqlError::CommitTokenOnParquetStatement
             | SqlError::QualifiedCommitTokenUnsupported
@@ -1992,8 +2029,44 @@ mod tests {
                 "the cross-signal message must name {table}"
             );
         }
+        // It names both surfaces that run such a statement, not one of them.
+        assert!(
+            err.client_message()
+                .contains("POST /api/v1/sql or Flight SQL"),
+            "{err}"
+        );
+        assert!(!err.client_message().contains("HTTP SQL endpoint"), "{err}");
         // It carries no server state to redact.
         assert_redacted(&err.client_message());
+    }
+
+    /// Both DoGet refusals of a ticket whose pins disagree with its statement
+    /// are INVALID_ARGUMENT, returned verbatim: their text names only fixed
+    /// table names and tells the client to mint a fresh ticket.
+    #[test]
+    fn ticket_pin_mismatches_are_bad_requests_that_keep_their_text() {
+        for err in [
+            SqlError::TicketPinsOneSignal,
+            SqlError::PinnedSignalsMismatch {
+                pinned: "samples, logs".to_owned(),
+                tables: "samples, spans".to_owned(),
+            },
+        ] {
+            assert_eq!(err.class(), ErrorClass::BadRequest, "{err}");
+            assert_eq!(err.client_message(), err.to_string());
+            assert!(err.client_message().contains("GetFlightInfo"), "{err}");
+            assert_redacted(&err.client_message());
+        }
+        assert!(
+            SqlError::PinnedSignalsMismatch {
+                pinned: "samples, logs".to_owned(),
+                tables: "samples, spans".to_owned(),
+            }
+            .client_message()
+            .contains(
+                "(samples, logs) are not the signal tables this statement reads (samples, spans)"
+            )
+        );
     }
 
     #[test]

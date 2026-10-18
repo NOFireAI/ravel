@@ -595,9 +595,9 @@ dead-loop rule and a notifications-failing-to-every-sink rule.
 Every transition that an evaluator writes is a row in the `alerts` table.
 `POST /api/v1/sql` and Flight SQL serve the table. It is one of the five
 tables that the SQL surface exposes (`samples`, `logs`, `spans`, `alerts`,
-`audit`). `POST /api/v1/sql` can join it with the other four; Flight SQL
-rejects a query that names two of them with `invalid_argument` before any
-listing.
+`audit`). `POST /api/v1/sql` and Flight SQL can join it with the other four,
+each table read from its own snapshot. Over Flight SQL such a join takes no
+`min_commit_token`.
 
 The table has these columns:
 
