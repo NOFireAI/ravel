@@ -496,14 +496,15 @@ curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
   not serve an earlier tick's list, which may no longer be current.
 - The route also answers `503` with `errorType` `unavailable` when the
   tenant's last snapshot is more than three evaluation intervals old,
-  measured from the time of the tick that published it. Only the evaluator
-  writes the snapshot, so if its task stops or hangs, the route would
-  otherwise keep serving that snapshot. The `error` starts with `this
-  tenant's alert evaluator in this process has stopped publishing its state`
-  and gives the snapshot's age and the bound. An evaluator whose ticks take
-  less than about half an interval replaces its snapshot inside the bound, so
-  this answer means the evaluator has stopped or fallen far behind. It clears
-  when the evaluator publishes again.
+  measured from when the evaluator published it at the end of its tick, not
+  from when that tick started. Only the evaluator writes the snapshot, so if
+  its task stops or hangs, the route would otherwise keep serving that
+  snapshot. The `error` starts with `this tenant's alert evaluator in this
+  process has stopped publishing its state` and gives the snapshot's age and
+  the bound. An evaluator whose ticks each take less than 1.9 intervals
+  replaces its snapshot inside the bound, and a slow tick publishes a fresh
+  snapshot however long it ran, so this answer means the evaluator has
+  stopped or fallen far behind. It clears when the evaluator publishes again.
 - A process serves only what its own evaluator published, and a process
   that runs no evaluator does not ask one that does. A replica whose peer
   holds the tenant's lease still ticks: it lists the alerts its tick read

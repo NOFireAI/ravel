@@ -514,8 +514,9 @@ Status codes:
   would assert that nothing is firing, and an earlier tick's list may no
   longer be current.
 - The same 503 when the tenant's last snapshot is stale: older than three
-  evaluation intervals, measured from the clock reading of the tick that
-  published it. The evaluator is the only writer of the snapshot, so a
+  evaluation intervals, measured from the evaluator's clock reading when it
+  published the snapshot at the end of its tick, so a slow tick still
+  publishes a snapshot that is served. The evaluator is the only writer of the snapshot, so a
   stopped or stuck evaluator would otherwise leave it served unchanged. The
   `error` starts with `this tenant's alert evaluator in this process has
   stopped publishing its state` and names the snapshot's age and the bound.
