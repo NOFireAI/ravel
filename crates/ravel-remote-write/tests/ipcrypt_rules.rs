@@ -1,6 +1,7 @@
 //! IPCrypt rule sets applied inside Remote Write normalization (ADR-2993
 //! decision 3, issue #3047): sample and exemplar labels store the ciphertext
-//! of every value a rule matches, matched by the label name as received,
+//! of every value a rule matches, matched by the label name sanitized the
+//! way OTLP sanitizes an attribute key and stored under the name as sent,
 //! series identity is computed over the stored labels, and
 //! `TenantRules::none()` behaves exactly like a resolved empty rule set.
 #![allow(clippy::expect_used)]
@@ -160,20 +161,81 @@ fn remote_write_stores_ciphertext_for_sample_and_exemplar_labels() {
     );
 }
 
-/// Remote Write never sanitizes a label name: a sender's `client.ip` label
-/// is not the sanitized `client_ip` the rule is looked up under, so it is
-/// stored as sent.
-#[test]
-fn remote_write_matches_the_label_name_as_received() {
-    let mut s = series("192.0.2.1", None);
-    s.labels[1] = label("client.ip", "192.0.2.1");
-    let result = normalize(request(vec![s]), &IngestLimits::default(), &rules());
+/// One deterministic rule on `client.address`.
+fn address_rules() -> TenantRules {
+    let policy = parse_policy_file(
+        "[defaults]\nrules = [{ key = \"client.address\", variant = \"deterministic\" }]\n",
+        sanitize,
+    )
+    .expect("policy parses");
+    TenantRules::resolve(&policy, "acme", &TENANT_HASH, &DEPLOYMENT_KEY, sanitize)
+        .expect("rules resolve")
+}
+
+/// A series and exemplar both labelled `name = ip`, normalized under
+/// [`address_rules`]; asserts the label is stored under `name` unchanged
+/// with the ciphertext of `ip`, on the sample and on the exemplar.
+fn assert_address_label_encrypted_as_sent(name: &str) {
+    let ip = "192.0.2.1";
+    let mut s = series(ip, Some(ip));
+    s.labels[1] = label(name, ip);
+    s.exemplars[0].labels = vec![label(name, ip)];
+    let result = normalize(request(vec![s]), &IngestLimits::default(), &address_rules());
     assert!(result.output.rejected.is_empty());
     assert_eq!(
-        result.output.points[0].labels.get("client.ip"),
-        Some("192.0.2.1")
+        result.output.points[0].labels.get(name),
+        Some(expected(ip).as_str())
     );
-    assert!(result.output.ipcrypt_tally.is_empty());
+    assert_eq!(
+        result.exemplars[0].exemplar.filtered_attributes,
+        vec![label(name, &expected(ip))]
+    );
+    assert_eq!(
+        result
+            .output
+            .ipcrypt_tally
+            .count(Variant::Deterministic, RenderOutcome::Encrypted),
+        2
+    );
+}
+
+/// A sender's dotted `client.address` label matches the rule on
+/// `client.address` through its sanitized form, the way an OTLP attribute
+/// would, and is stored under `client.address` as sent.
+#[test]
+fn remote_write_matches_a_dotted_label_name_and_stores_it_as_sent() {
+    assert_address_label_encrypted_as_sent("client.address");
+}
+
+#[test]
+fn remote_write_matches_the_sanitized_label_name() {
+    assert_address_label_encrypted_as_sent("client_address");
+}
+
+/// A rejected series stores nothing, so its ruled value is not counted,
+/// though it was encrypted before a later label rejected the series.
+#[test]
+fn remote_write_tally_skips_a_rejected_series() {
+    let mut rejected = series("192.0.2.2", None);
+    rejected.labels.push(label("zone", &"z".repeat(100)));
+    let limits = IngestLimits {
+        max_label_value_len: 99,
+        ..IngestLimits::default()
+    };
+    let result = normalize(
+        request(vec![series("192.0.2.1", None), rejected]),
+        &limits,
+        &rules(),
+    );
+    assert_eq!(result.output.points.len(), 1);
+    assert_eq!(result.output.rejected.len(), 1);
+    assert_eq!(
+        result
+            .output
+            .ipcrypt_tally
+            .count(Variant::Deterministic, RenderOutcome::Encrypted),
+        1
+    );
 }
 
 #[test]

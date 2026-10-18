@@ -14,9 +14,15 @@
 //! value-length limit is checked and before [`SeriesId::compute`] runs, so
 //! series identity, size limits, and encoding all see the stored
 //! (possibly-encrypted) bytes. An exemplar's kept labels are encrypted the
-//! same way in [`build_exemplar`]. Matching is by the label name exactly as
-//! received (`TenantRules::lookup_label`), since this surface never sanitizes
-//! a label name; an empty configured rule set
+//! same way in [`build_exemplar`]. A rule is matched by the label name
+//! sanitized with the OTLP label sanitizer
+//! (`ravel_otlp::normalize::apply_ipcrypt_as_sent`), the same form every
+//! other surface matches under, so a sender writing `client.address` and one
+//! writing `client_address` are both covered by a rule on `client.address`.
+//! The sanitized name exists only for that lookup, built on the stack for a
+//! name of up to 256 characters (a longer one allocates a copy): the
+//! stored label keeps the name as received, so this is still validation, not
+//! mutation. An empty configured rule set
 //! ([`TenantRules::none`](ravel_ipcrypt::rules::TenantRules::none)) produces
 //! byte-identical output to the pre-ADR-2993 code path.
 //!
@@ -54,7 +60,7 @@ use std::sync::Arc;
 use ravel_ipcrypt::rules::TenantRules;
 use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_otlp::normalize::{
-    NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint, apply_ipcrypt,
+    NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint, apply_ipcrypt_as_sent,
     zero_threshold_is_admissible,
 };
 use ravel_otlp::{IngestLimits, Rejection};
@@ -608,8 +614,9 @@ fn admit_exemplars(
 /// The value is carried as a bit pattern, so a NaN payload or a negative zero
 /// round-trips exactly rather than being normalized by an `f64` comparison.
 ///
-/// A kept filtered attribute is encrypted under `rules`, matched by its label
-/// name as received, exactly like a series label. The `trace_id`/`span_id`
+/// A kept filtered attribute is encrypted under `rules`, matched by its
+/// sanitized label name and stored under the name as sent, exactly like a
+/// series label. The `trace_id`/`span_id`
 /// labels consumed into the fixed-size ids are not stored as labels and are
 /// not matched.
 fn build_exemplar(
@@ -648,7 +655,7 @@ fn build_exemplar(
         if filtered_attributes.len() < limits.max_attributes_per_point {
             filtered_attributes.push(Label {
                 name: label.name.clone(),
-                value: apply_ipcrypt(rules, tally, &label.name, label.value.clone()),
+                value: apply_ipcrypt_as_sent(rules, tally, &label.name, label.value.clone()),
             });
         }
     }
@@ -738,10 +745,9 @@ fn resolve_series_identity(
             }));
         }
         // ADR-2993 decision 3: encrypt before the value-length check, so the
-        // limit sees the length of the bytes actually stored. Remote Write
-        // never sanitizes a label name, so the rule match is against `l.name`
-        // exactly as received.
-        let value = apply_ipcrypt(rules, tally, &l.name, l.value.clone());
+        // limit sees the length of the bytes actually stored. The rule is
+        // matched on `l.name` sanitized; the label keeps `l.name` as sent.
+        let value = apply_ipcrypt_as_sent(rules, tally, &l.name, l.value.clone());
         if value.len() > limits.max_label_value_len {
             return Err(otlp(Rejection::LabelValueTooLong {
                 len: value.len(),
