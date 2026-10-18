@@ -13,6 +13,7 @@ use ravel_ingest::{
     IngestPoint, IngestRouter, MetadataSink, RequestRejection, WriteError, WriteMode,
     plausible_ingest_clock,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::normalize::normalize_metrics_with_metadata_projected;
 use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
@@ -227,7 +228,9 @@ pub async fn handle_export_releasing(
     // tenant x lifetime series cardinality (the same growth vector
     // `shard.rs`'s per-flush cap comment already rejected building one layer
     // lower).
-    let projected = ravel_otlp::project_resolved_label_bytes(&request, &state.limits);
+    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
+    let rules = TenantRules::none();
+    let projected = ravel_otlp::project_resolved_label_bytes(&request, &state.limits, &rules);
     let label_charge = charge_projected_labels(
         &state.budget,
         projected.get(),
@@ -239,6 +242,7 @@ pub async fn handle_export_releasing(
         &tenant,
         request,
         &state.limits,
+        &rules,
         ingest_ts_ns,
         &mut cap,
         projected,
@@ -1659,8 +1663,12 @@ mod tests {
                 point.time_unix_nano = too_old as u64;
             }
         }
-        let projected =
-            ravel_otlp::project_resolved_label_bytes(&request, &IngestLimits::default()).get();
+        let projected = ravel_otlp::project_resolved_label_bytes(
+            &request,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+        )
+        .get();
         assert!(projected > 0, "the fixture projects some label bytes");
         let budget = IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Bounded(
             projected as u64 - 1,
@@ -1740,7 +1748,8 @@ mod tests {
             label_bytes as usize,
             ravel_otlp::project_resolved_label_bytes(
                 &labelled_gauge_request(),
-                &IngestLimits::default()
+                &IngestLimits::default(),
+                &TenantRules::none(),
             )
             .get(),
             "the label charge is exactly the projection"

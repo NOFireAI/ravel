@@ -39,6 +39,10 @@ prost = { workspace = true }
 # is a workspace path crate already linked by ravel-server; a new dependency
 # EDGE from ravel-bench, not a new external crate to the workspace.
 ravel-remote-write = { workspace = true }
+# Per-tenant IPCrypt rule set, a required positional parameter of
+# ravel-remote-write's normalizers as of ADR-2993 decision 3 (issue #3047);
+# `pending_ack_shed.rs` passes `TenantRules::none()`.
+ravel-ipcrypt = { workspace = true }
 # The RW1.0 body is snappy block format (not framed): `snap::raw::Encoder`
 # compresses the prost-encoded `WriteRequest`. Already the workspace pin
 # `ravel-remote-write` itself decompresses with, so no second copy resolves.

@@ -14,6 +14,7 @@ use ravel_ingest::{
     MarkerLookupError, RequestRejection, WriteMode, plausible_ingest_clock, read_marker,
     write_marker,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs_projected};
@@ -393,7 +394,9 @@ pub async fn handle_export_logs_releasing(
         }
     }
 
-    let projected = ravel_otlp::project_log_resolved_label_bytes(&request, &state.limits);
+    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
+    let rules = TenantRules::none();
+    let projected = ravel_otlp::project_log_resolved_label_bytes(&request, &state.limits, &rules);
     let label_charge = crate::ingest::charge_projected_labels(
         &state.budget,
         projected.get(),
@@ -402,7 +405,8 @@ pub async fn handle_export_logs_releasing(
     .map_err(|ravel_ingest::IngestByteShed| {
         LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)
     })?;
-    let normalized = normalize_logs_projected(request, &state.limits, ingest_ts_ns, projected);
+    let normalized =
+        normalize_logs_projected(request, &state.limits, &rules, ingest_ts_ns, projected);
     let mut rejected_count: usize = normalized.rejected.iter().map(|r| r.rejected_count()).sum();
     // Layer 3's rejections, counted where they are observed. The body
     // conversions alongside them are not rejections: those records passed
@@ -1055,8 +1059,12 @@ mod tests {
             rec.observed_time_unix_nano = too_old as u64;
             request(vec![rec.clone(), rec])
         };
-        let projected =
-            ravel_otlp::project_log_resolved_label_bytes(&stale_request(), &state().limits).get();
+        let projected = ravel_otlp::project_log_resolved_label_bytes(
+            &stale_request(),
+            &state().limits,
+            &TenantRules::none(),
+        )
+        .get();
         assert!(projected > 0, "the fixture projects some label bytes");
 
         let mut state = state();

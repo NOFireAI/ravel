@@ -42,8 +42,8 @@ pub use logs_normalize::{
 pub use metadata::{MetricKind, MetricMetadata};
 pub use normalize::{
     MetricsNormalizeResult, NormalizeOutput, NormalizedHistogramPoint, NormalizedPoint,
-    ResourceAttrValue, admit_resource_labels, build_resource_labels_from, normalize_metrics,
-    normalize_metrics_with_exemplars, normalize_metrics_with_metadata,
+    ResourceAttrValue, admit_resource_labels, apply_ipcrypt, build_resource_labels_from,
+    normalize_metrics, normalize_metrics_with_exemplars, normalize_metrics_with_metadata,
     normalize_metrics_with_metadata_projected,
 };
 pub use traces_limits::{SpanIngestLimits, SpanRejection};

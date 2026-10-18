@@ -82,6 +82,21 @@
 //! (ADR-0017 is a separate, later ticket), and the exemplars they carry are
 //! counted as dropped by [`push_exp_histogram_exemplar_drops`], which also
 //! records the attachment rule waiting for them.
+//!
+//! Every entry point, [`prepare_batch`] and [`project_resolved_label_bytes`]
+//! included, takes the tenant's resolved [`TenantRules`] as a required
+//! parameter (ADR-2993 decision 3). A value is encrypted in [`push_checked`],
+//! matched by its sanitized label name (`TenantRules::lookup_label`, with
+//! `ravel_otlp`'s own sanitizer), before its value-length check and before
+//! the label set reaches `LabelSet::new`/`SeriesId::compute`, the
+//! [`GroupCache`] or the exploded series' [`SeriesIdMemo`]; resource labels
+//! are encrypted the same way inside [`admit_resource_labels`], and exemplar
+//! filtered attributes as they are decoded. The cache and memo are keyed on
+//! raw attributes but hold the encrypted sets. The raw-length checks that
+//! run before anything is built ([`check_resource_labels`],
+//! [`check_flat_attrs_in_input_order`]) and the projection charge a ruled
+//! value at [`TenantRules::max_stored_len`]. [`TenantRules::none()`] leaves
+//! every value unchanged.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -92,13 +107,16 @@ use arrow::array::{
     UInt8Array, UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::datatypes::{UInt8Type, UInt16Type};
+use ravel_ipcrypt::rules::TenantRules;
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_otlp::label_projection::{
     RESOLVED_LABEL_OVERHEAD_BYTES, explode_name_label_bytes, histogram_point_bytes, label_bytes,
     name_label_bytes, resource_value_label_len, summary_point_bytes,
 };
 use ravel_otlp::metadata::{MetricKind as PromMetricKind, MetricMetadata};
 use ravel_otlp::normalize::{
-    MetricsNormalizeResult, NormalizedExemplar, metadata_unit_word, prometheus_family_name,
+    MetricsNormalizeResult, NormalizedExemplar, apply_ipcrypt, metadata_unit_word,
+    prometheus_family_name,
 };
 use ravel_otlp::promcompat::format_float;
 use ravel_otlp::{
@@ -658,10 +676,12 @@ pub fn normalize_decoded(
     tenant: &TenantId,
     batch: &DecodedBatch,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> NormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    let result = normalize_decoded_with_exemplars(tenant, batch, limits, ingest_ts_ns, &mut cap);
+    let result =
+        normalize_decoded_with_exemplars(tenant, batch, limits, rules, ingest_ts_ns, &mut cap);
     let mut output = result.output;
     // The cap admitted these, but this entry point drops them (nothing stores
     // exemplars on the OTAP path yet). A discarded admission is still a dropped
@@ -689,13 +709,15 @@ pub fn normalize_decoded_with_exemplars(
     tenant: &TenantId,
     batch: &DecodedBatch,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
     normalize_impl(
         tenant,
-        prepare_batch(batch, limits),
+        prepare_batch(batch, limits, rules),
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         false,
@@ -733,13 +755,15 @@ pub fn normalize_decoded_with_metadata(
     tenant: &TenantId,
     batch: &DecodedBatch,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     normalize_impl(
         tenant,
-        prepare_batch(batch, limits),
+        prepare_batch(batch, limits, rules),
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         true,
@@ -749,15 +773,27 @@ pub fn normalize_decoded_with_metadata(
 /// [`normalize_decoded_with_metadata`] for a batch already prepared by
 /// [`prepare_batch`], for a caller that charged its
 /// [`PreparedBatch::projected_label_bytes`] to a budget before normalizing
-/// (ADR-2708 D2): the batch is flattened and resolved once for both.
+/// (ADR-2708 D2): the batch is flattened and resolved once for both. `rules`
+/// must be the same rule set `prepared` was built with: it decides the
+/// charged length [`PreparedBatch::projected_label_bytes`] already reports,
+/// and the actual encryption the build applies must agree with it.
 pub fn normalize_prepared_with_metadata(
     tenant: &TenantId,
     prepared: PreparedBatch<'_>,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
-    normalize_impl(tenant, prepared, limits, ingest_ts_ns, exemplar_cap, true)
+    normalize_impl(
+        tenant,
+        prepared,
+        limits,
+        rules,
+        ingest_ts_ns,
+        exemplar_cap,
+        true,
+    )
 }
 
 /// One batch flattened, resolved and projected, with no label built yet.
@@ -808,7 +844,11 @@ impl PreparedBatch<'_> {
 /// Flatten `batch`, check its two point bounds, resolve every metric and its
 /// resource, and project the label bytes the normalize would build. Allocates
 /// no label: resource prefixes are only planned here.
-pub fn prepare_batch<'b>(batch: &'b DecodedBatch, limits: &IngestLimits) -> PreparedBatch<'b> {
+pub fn prepare_batch<'b>(
+    batch: &'b DecodedBatch,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+) -> PreparedBatch<'b> {
     let total_points = count_total_points(batch);
     if total_points > limits.max_data_points_per_request {
         return PreparedBatch {
@@ -858,13 +898,13 @@ pub fn prepare_batch<'b>(batch: &'b DecodedBatch, limits: &IngestLimits) -> Prep
         };
     }
 
-    let tables = resolve_metrics(batch, &flat, limits, &mut rejected);
+    let tables = resolve_metrics(batch, &flat, limits, rules, &mut rejected);
     let orders = AttrOrders {
         number: sort_attrs_by_parent(&flat.attrs),
         hist: sort_attrs_by_parent(&flat.hist_attrs),
         summary: sort_attrs_by_parent(&flat.summary_attrs),
     };
-    let projected = project_flat(&flat, &tables, &orders, limits);
+    let projected = project_flat(&flat, &tables, &orders, limits, rules);
     PreparedBatch {
         batch,
         stage: Stage::Resolved(Box::new(Resolved {
@@ -886,10 +926,12 @@ fn normalize_impl(
     tenant: &TenantId,
     prepared: PreparedBatch<'_>,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     collect_metadata: bool,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
+    let mut tally = IpcryptTally::new();
     let PreparedBatch { batch, stage } = prepared;
     let resolved = match stage {
         Stage::Rejected(reason) => {
@@ -920,7 +962,9 @@ fn normalize_impl(
             dropped_exemplar_rows(batch),
         );
     }
-    tables.resources.build(limits, &mut rejected);
+    tables
+        .resources
+        .build(limits, &mut rejected, rules, &mut tally);
 
     let FlatPoints {
         dp: flat_dp,
@@ -1038,7 +1082,7 @@ fn normalize_impl(
         // this pre-check is the only place attribute order is observable, and
         // it must line up with the OTLP oracle or the two paths class the same
         // input differently (ADR-0011).
-        if let Err(rejection) = check_flat_attrs_in_input_order(range, flat_attrs, limits) {
+        if let Err(rejection) = check_flat_attrs_in_input_order(range, flat_attrs, limits, rules) {
             rejected.push(rejection);
             continue;
         }
@@ -1046,7 +1090,15 @@ fn normalize_impl(
         // One metric id belongs to exactly one resource (its root row's
         // `resource.id`), so a per-metric cache is already per resource.
         let outcome = group_cache.resolve(dp.parent_id, range, flat_attrs, |key| {
-            build_group(key, &decision.name, prefix, tenant, limits)
+            build_group(
+                key,
+                &decision.name,
+                prefix,
+                tenant,
+                limits,
+                rules,
+                &mut tally,
+            )
         });
 
         match outcome {
@@ -1072,7 +1124,14 @@ fn normalize_impl(
                 // This is the same rule `ravel_otlp::build_point`
                 // applies to a gauge or sum exemplar, which is what keeps the
                 // two paths' exemplar decisions identical (ADR-0011).
-                number_exemplar_admission.admit(dp.id, limits, |_| series_id, &mut rejected);
+                number_exemplar_admission.admit(
+                    dp.id,
+                    limits,
+                    rules,
+                    &mut tally,
+                    |_| series_id,
+                    &mut rejected,
+                );
             }
             Err(rejection) => rejected.push(rejection.clone()),
         }
@@ -1116,6 +1175,8 @@ fn normalize_impl(
             range,
             flat_hist_attrs,
             limits,
+            rules,
+            &mut tally,
             ingest_ts_ns,
             &mut exemplar_admission,
             memo,
@@ -1159,6 +1220,8 @@ fn normalize_impl(
             range,
             flat_summary_attrs,
             limits,
+            rules,
+            &mut tally,
             ingest_ts_ns,
             memo,
         ) {
@@ -1199,6 +1262,7 @@ fn normalize_impl(
                 // return above).
                 histogram_points: Vec::new(),
                 rejected,
+                ipcrypt_tally: tally,
             },
             exemplars,
         },
@@ -1223,8 +1287,9 @@ fn normalize_impl(
 pub fn project_resolved_label_bytes(
     batch: &DecodedBatch,
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> ProjectedLabelBytes {
-    prepare_batch(batch, limits).projected_label_bytes()
+    prepare_batch(batch, limits, rules).projected_label_bytes()
 }
 
 /// The flattened data-point and attribute rows of one batch, decoded once and
@@ -1281,6 +1346,7 @@ fn resolve_metrics<'b>(
     batch: &'b DecodedBatch,
     flat: &FlatPoints<'_>,
     limits: &IngestLimits,
+    rules: &TenantRules,
     rejected: &mut Vec<Rejection>,
 ) -> MetricTables<'b> {
     let root_batches = payloads_of(batch, ArrowPayloadType::UnivariateMetrics);
@@ -1297,7 +1363,7 @@ fn resolve_metrics<'b>(
 
     let resource_attrs =
         flatten_resource_attrs(&payloads_of(batch, ArrowPayloadType::ResourceAttrs));
-    let resources = plan_resources(&root, resource_attrs, flat, limits, rejected);
+    let resources = plan_resources(&root, resource_attrs, flat, limits, rules, rejected);
     let blocked = &resources.blocked;
 
     let (metric_decision, unknown_number_count) =
@@ -1379,13 +1445,21 @@ impl<'b> ResourcePrefixes<'b> {
     /// Build every planned prefix with [`admit_resource_labels`], the function
     /// OTLP calls per `ResourceMetrics`, placing its rejections where the plan
     /// recorded them so the rejection order is the eager build's.
-    fn build(&mut self, limits: &IngestLimits, rejected: &mut Vec<Rejection>) {
+    fn build(
+        &mut self,
+        limits: &IngestLimits,
+        rejected: &mut Vec<Rejection>,
+        rules: &TenantRules,
+        tally: &mut IpcryptTally,
+    ) {
         let mut prefixes = HashMap::with_capacity(self.planned.len());
         let mut inserts: Vec<(usize, Vec<Rejection>)> = Vec::new();
         for (&resource_id, plan) in &self.planned {
             let pairs = resource_pairs(&self.attrs, &self.order, resource_id);
             let mut scratch = Vec::new();
-            if let Some(labels) = admit_resource_labels(&pairs, plan.points, limits, &mut scratch) {
+            if let Some(labels) =
+                admit_resource_labels(&pairs, plan.points, limits, &mut scratch, rules, tally)
+            {
                 prefixes.insert(resource_id, labels);
             }
             if !scratch.is_empty() {
@@ -1437,10 +1511,13 @@ fn resource_pairs<'b>(
 /// `attrs`, decided from value lengths without building a label: the same
 /// reads in the same order (`service.name`, `service.namespace`, the joined
 /// `job`, `service.instance.id`, then the allowlist), each checked as its
-/// `push_checked` checks it.
+/// `push_checked` checks it. A value whose label name matches `rules` is
+/// checked at [`TenantRules::max_stored_len`] of its raw length (see
+/// [`ruled_value_len`]).
 fn check_resource_labels(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> Result<(), Rejection> {
     let first_len = |key: &str| -> Result<Option<usize>, Rejection> {
         match attrs.iter().find(|(k, _)| *k == key) {
@@ -1457,10 +1534,14 @@ fn check_resource_labels(
             Some(ns) if ns > 0 => ns.saturating_add(1).saturating_add(name),
             _ => name,
         };
-        check_label_len("job".len(), job, limits)?;
+        check_label_len("job".len(), ruled_value_len(rules, "job", job), limits)?;
     }
     if let Some(instance) = first_len("service.instance.id")? {
-        check_label_len("instance".len(), instance, limits)?;
+        check_label_len(
+            "instance".len(),
+            ruled_value_len(rules, "instance", instance),
+            limits,
+        )?;
     }
     for key in &limits.resource_attribute_allowlist {
         if matches!(
@@ -1470,10 +1551,24 @@ fn check_resource_labels(
             continue;
         }
         if let Some(len) = first_len(key)? {
+            let len = ruled_value_len(rules, &sanitize_label_name(key), len);
             check_label_len(sanitized_label_name_len(key), len, limits)?;
         }
     }
     Ok(())
+}
+
+/// The value length a raw-length check charges for the label `name`:
+/// [`TenantRules::max_stored_len`] of `raw_len` when a rule matches `name` and
+/// the value is non-empty, `raw_len` otherwise. The check runs before the
+/// value is encrypted, so it cannot see the ciphertext's real length; charging
+/// the most a matched value can be stored as over-counts, which is the
+/// intended, safe direction: a check that passes here also passes on the
+/// stored bytes in [`push_checked`]. An empty value stays 0, since
+/// [`push_checked`] drops it unencrypted.
+fn ruled_value_len(rules: &TenantRules, name: &str, raw_len: usize) -> usize {
+    let matched = raw_len > 0 && !rules.is_empty() && rules.lookup_label(name).is_some();
+    charged_len(matched, raw_len)
 }
 
 /// The length checks [`push_checked`] applies to a label of these lengths.
@@ -1524,6 +1619,7 @@ fn plan_resources<'b>(
     resource_attrs: Result<Vec<FlatAttr<'b>>, &'static str>,
     flat: &FlatPoints<'_>,
     limits: &IngestLimits,
+    rules: &TenantRules,
     rejected: &mut Vec<Rejection>,
 ) -> ResourcePrefixes<'b> {
     let mut metric_points = vec![0usize; root.len()];
@@ -1609,7 +1705,7 @@ fn plan_resources<'b>(
                 max: limits.max_resource_attributes,
             });
             rejected_resources.insert(resource_id);
-        } else if let Err(reason) = check_resource_labels(&pairs, limits) {
+        } else if let Err(reason) = check_resource_labels(&pairs, limits, rules) {
             rejected.push(Rejection::Grouped {
                 reason: Box::new(reason),
                 count: points,
@@ -1620,7 +1716,7 @@ fn plan_resources<'b>(
                 resource_id,
                 PlannedResource {
                     points,
-                    bytes: resource_prefix_bytes(&pairs, limits).unwrap_or(0),
+                    bytes: resource_prefix_bytes(&pairs, limits, rules).unwrap_or(0),
                     rejection_at: rejected.len(),
                 },
             );
@@ -1654,19 +1750,38 @@ fn resource_attr_value<'b>(a: &FlatAttr<'b>) -> ResourceAttrValue<'b> {
     }
 }
 
+/// The length a value's label is charged at: inflated to
+/// [`TenantRules::max_stored_len`] when its name matches `rules`, since the
+/// stored length after encryption is what the build will actually keep
+/// (ADR-2993 decision 3), unchanged otherwise. Mirrors
+/// `ravel_otlp::label_projection::charged_len`, which is private there.
+fn charged_len(matched: bool, raw_len: usize) -> usize {
+    if matched {
+        TenantRules::max_stored_len(raw_len)
+    } else {
+        raw_len
+    }
+}
+
 /// The bytes one point's attribute labels take, as `(kept, reserved)`: `kept`
 /// for the labels a set holds, `reserved` adding the slot an empty value leaves
 /// allocated in a set whose `Vec` was sized before the drop ([`build_group`]).
 /// `None` when an attribute has no label form, which rejects the point before
 /// any set is kept.
-fn flat_attr_bytes(range: &[u32], attrs: &[FlatAttr<'_>]) -> Option<(usize, usize)> {
+fn flat_attr_bytes(
+    range: &[u32],
+    attrs: &[FlatAttr<'_>],
+    rules: &TenantRules,
+) -> Option<(usize, usize)> {
     let mut kept = 0usize;
     let mut reserved = 0usize;
     for &i in range {
         let a = &attrs[i as usize];
         let len = resource_value_label_len(resource_attr_value(a))?;
         if len > 0 {
-            let bytes = label_bytes(a.key.len(), len);
+            let matched =
+                !rules.is_empty() && rules.lookup_label(&sanitize_label_name(a.key)).is_some();
+            let bytes = label_bytes(a.key.len(), charged_len(matched, len));
             kept = kept.saturating_add(bytes);
             reserved = reserved.saturating_add(bytes);
         } else {
@@ -1756,6 +1871,7 @@ fn project_flat(
     tables: &MetricTables,
     orders: &AttrOrders,
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> usize {
     let MetricTables {
         root,
@@ -1784,7 +1900,7 @@ fn project_flat(
         if range.len() > max_attrs {
             continue;
         }
-        let Some((kept, reserved)) = flat_attr_bytes(range, &flat.attrs) else {
+        let Some((kept, reserved)) = flat_attr_bytes(range, &flat.attrs, rules) else {
             continue;
         };
         let base = resources
@@ -1816,7 +1932,7 @@ fn project_flat(
         if dp.explicit_bounds.len() > limits.max_histogram_buckets || range.len() > max_attrs {
             continue;
         }
-        let Some((kept, _)) = flat_attr_bytes(range, &flat.hist_attrs) else {
+        let Some((kept, _)) = flat_attr_bytes(range, &flat.hist_attrs, rules) else {
             continue;
         };
         let per_series = resources
@@ -1847,7 +1963,7 @@ fn project_flat(
         if dp.quantiles.len() > limits.max_summary_quantiles || range.len() > max_attrs {
             continue;
         }
-        let Some((kept, _)) = flat_attr_bytes(range, &flat.summary_attrs) else {
+        let Some((kept, _)) = flat_attr_bytes(range, &flat.summary_attrs, rules) else {
             continue;
         };
         let per_series = resources
@@ -2053,6 +2169,7 @@ fn whole_request_rejection(
                 points: Vec::new(),
                 histogram_points: Vec::new(),
                 rejected,
+                ipcrypt_tally: IpcryptTally::new(),
             },
             exemplars: Vec::new(),
         },
@@ -2921,11 +3038,14 @@ fn raw_cell_value(cell: &RawCell) -> Result<String, Rejection> {
 /// order, the sorted build only ever surfaces the order-independent
 /// `DuplicateLabelName` / `OversizedSeriesComponent` rejections.
 ///
-/// Decided from lengths, so a point it rejects allocates nothing.
+/// Decided from lengths, so a point it rejects allocates nothing. A value
+/// whose sanitized name matches `rules` is checked at
+/// [`TenantRules::max_stored_len`] of its raw length ([`ruled_value_len`]).
 fn check_flat_attrs_in_input_order(
     range: &[u32],
     attrs: &[FlatAttr<'_>],
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> Result<(), Rejection> {
     for &i in range {
         let a = &attrs[i as usize];
@@ -2936,6 +3056,11 @@ fn check_flat_attrs_in_input_order(
         // pass must skip it too, or an empty-valued label with an over-long
         // name would reject here while the canonical build silently drops it,
         // breaking the ADR-0011 identical-rejection-class contract.
+        let value_len = if rules.is_empty() {
+            value_len
+        } else {
+            ruled_value_len(rules, &sanitize_label_name(a.key), value_len)
+        };
         check_label_len(sanitized_label_name_len(a.key), value_len, limits)?;
     }
     Ok(())
@@ -2950,6 +3075,8 @@ fn build_group(
     prefix: &[Label],
     tenant: &TenantId,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(LabelSet, SeriesId), Rejection> {
     let mut labels = Vec::with_capacity(prefix.len() + raw.len() + 1);
     labels.extend_from_slice(prefix);
@@ -2960,7 +3087,7 @@ fn build_group(
     for (raw_key, cell) in raw {
         let name = sanitize_label_name(raw_key);
         let value = raw_cell_value(cell)?;
-        push_checked(&mut labels, name, value, limits)?;
+        push_checked(&mut labels, name, value, limits, rules, tally)?;
     }
     let label_set = LabelSet::new(labels).map_err(|err| match err {
         TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
@@ -2980,6 +3107,8 @@ fn push_checked(
     name: String,
     value: String,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(), Rejection> {
     // ADR-0038: an empty-valued label is treated as absent (Prometheus
     // convention, matching ravel-remote-write and ravel-otlp). Drop it before
@@ -2994,6 +3123,10 @@ fn push_checked(
             max: limits.max_label_name_len,
         });
     }
+    // ADR-2993 decision 3: a configured attribute's IP value is encrypted
+    // here, before the value-length check below, so the check sees the
+    // length actually stored.
+    let value = apply_ipcrypt(rules, tally, &name, value);
     if value.len() > limits.max_label_value_len {
         return Err(Rejection::LabelValueTooLong {
             len: value.len(),
@@ -3018,8 +3151,12 @@ fn sanitize_metric_name(name: &str) -> String {
     sanitize(name, is_metric_name_start, is_metric_name_continue)
 }
 
+/// `ravel_otlp`'s label-name sanitizer itself, not a copy: `TenantRules`
+/// matches a metric rule by sanitized label name, so OTLP and OTAP must
+/// produce the same name for one attribute key or a rule would match on one
+/// surface and miss on the other.
 fn sanitize_label_name(name: &str) -> String {
-    sanitize(name, is_label_name_start, is_label_name_continue)
+    ravel_otlp::normalize::sanitize_label_name(name.to_string())
 }
 
 fn sanitize(input: &str, is_start: fn(char) -> bool, is_continue: fn(char) -> bool) -> String {
@@ -3039,14 +3176,6 @@ fn is_metric_name_start(c: char) -> bool {
 
 fn is_metric_name_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == ':'
-}
-
-fn is_label_name_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-fn is_label_name_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
 }
 
 // --- Histogram/summary explosion (ADR-0016 phase B2). Mirrors
@@ -3512,6 +3641,8 @@ fn build_base_labels(
     range: &[u32],
     attrs: &[FlatAttr],
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<Vec<Label>, Rejection> {
     if range.len() > limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -3525,7 +3656,7 @@ fn build_base_labels(
         let a = &attrs[i as usize];
         let name = sanitize_label_name(a.key);
         let value = raw_cell_value(&raw_cell(a))?;
-        push_checked(&mut labels, name, value, limits)?;
+        push_checked(&mut labels, name, value, limits, rules, tally)?;
     }
     Ok(labels)
 }
@@ -3544,6 +3675,8 @@ fn finish_exploded_point(
     ts_ns: i64,
     value: f64,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<NormalizedPoint, Rejection> {
     let mut labels = Vec::with_capacity(base_labels.len() + 2);
     labels.extend_from_slice(base_labels);
@@ -3552,7 +3685,7 @@ fn finish_exploded_point(
         metric_name.to_string(),
     ));
     if let Some((name, value)) = extra_label {
-        push_checked(&mut labels, name.to_string(), value, limits)?;
+        push_checked(&mut labels, name.to_string(), value, limits, rules, tally)?;
     }
 
     let label_set = LabelSet::new(labels).map_err(|err| match err {
@@ -3595,6 +3728,8 @@ fn explode_histogram_point(
     range: &[u32],
     attrs: &[FlatAttr],
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     ingest_ts_ns: i64,
     exemplars: &mut ExemplarAdmission<'_, '_>,
     memo: &mut SeriesIdMemo,
@@ -3626,7 +3761,7 @@ fn explode_histogram_point(
         });
     }
 
-    let base_labels = build_base_labels(prefix, range, attrs, limits)?;
+    let base_labels = build_base_labels(prefix, range, attrs, limits, rules, tally)?;
     let stale = has_no_recorded_value(dp.flags);
     let bucket_name = format!("{metric_name}_bucket");
 
@@ -3650,6 +3785,8 @@ fn explode_histogram_point(
             event_ts_ns,
             value,
             limits,
+            rules,
+            tally,
         )?);
     }
 
@@ -3666,6 +3803,8 @@ fn explode_histogram_point(
         event_ts_ns,
         count_value,
         limits,
+        rules,
+        tally,
     )?);
 
     if let Some(sum) = dp.sum {
@@ -3680,6 +3819,8 @@ fn explode_histogram_point(
             event_ts_ns,
             sum_value,
             limits,
+            rules,
+            tally,
         )?);
     }
 
@@ -3693,6 +3834,8 @@ fn explode_histogram_point(
         event_ts_ns,
         count_value,
         limits,
+        rules,
+        tally,
     )?);
 
     let mut informational = Vec::new();
@@ -3707,6 +3850,8 @@ fn explode_histogram_point(
     exemplars.admit(
         dp.id,
         limits,
+        rules,
+        tally,
         |value| {
             let idx = exemplar_bucket_index(&dp.explicit_bounds, value);
             bucket_series[idx].series_id
@@ -3773,6 +3918,8 @@ impl ExemplarAdmission<'_, '_> {
         &mut self,
         dp_id: u32,
         limits: &IngestLimits,
+        rules: &TenantRules,
+        tally: &mut IpcryptTally,
         series_id_for: F,
         informational: &mut Vec<Rejection>,
     ) where
@@ -3788,7 +3935,7 @@ impl ExemplarAdmission<'_, '_> {
         let mut candidates = Vec::with_capacity(rows.len());
         let mut dropped = 0usize;
         for row in rows {
-            match self.build_exemplar(row, limits) {
+            match self.build_exemplar(row, limits, rules, tally) {
                 Some(candidate) => candidates.push(candidate),
                 None => dropped += 1,
             }
@@ -3862,7 +4009,13 @@ impl ExemplarAdmission<'_, '_> {
     /// `ravel_otlp::normalize`'s `decode_exemplar` does with an unparsable
     /// filtered-attribute value: filtered attributes are informational context,
     /// never series identity.
-    fn build_exemplar(&self, row: &FlatExemplar, limits: &IngestLimits) -> Option<Exemplar> {
+    fn build_exemplar(
+        &self,
+        row: &FlatExemplar,
+        limits: &IngestLimits,
+        rules: &TenantRules,
+        tally: &mut IpcryptTally,
+    ) -> Option<Exemplar> {
         let ts_ns = row.ts_ns?;
         let value = row.value?;
 
@@ -3870,17 +4023,15 @@ impl ExemplarAdmission<'_, '_> {
             .id
             .map(|id| attr_range_for(self.attrs, self.attr_order, id))
             .unwrap_or(&[]);
-        let filtered_attributes = attr_range
-            .iter()
-            .take(limits.max_attributes_per_point)
-            .map(|&i| {
-                let attr = &self.attrs[i as usize];
-                Label {
-                    name: sanitize_label_name(attr.key),
-                    value: raw_cell_value(&raw_cell(attr)).unwrap_or_default(),
-                }
-            })
-            .collect();
+        let mut filtered_attributes =
+            Vec::with_capacity(attr_range.len().min(limits.max_attributes_per_point));
+        for &i in attr_range.iter().take(limits.max_attributes_per_point) {
+            let attr = &self.attrs[i as usize];
+            let name = sanitize_label_name(attr.key);
+            let value = raw_cell_value(&raw_cell(attr)).unwrap_or_default();
+            let value = apply_ipcrypt(rules, tally, &name, value);
+            filtered_attributes.push(Label { name, value });
+        }
 
         Some(Exemplar {
             ts_ns,
@@ -3908,6 +4059,8 @@ fn explode_summary_point(
     range: &[u32],
     attrs: &[FlatAttr],
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     ingest_ts_ns: i64,
     memo: &mut SeriesIdMemo,
 ) -> Result<Vec<NormalizedPoint>, Rejection> {
@@ -3932,7 +4085,7 @@ fn explode_summary_point(
         });
     }
 
-    let base_labels = build_base_labels(prefix, range, attrs, limits)?;
+    let base_labels = build_base_labels(prefix, range, attrs, limits, rules, tally)?;
     let stale = has_no_recorded_value(dp.flags);
 
     let mut series = Vec::with_capacity(dp.quantiles.len() + 2);
@@ -3947,6 +4100,8 @@ fn explode_summary_point(
             event_ts_ns,
             v,
             limits,
+            rules,
+            tally,
         )?);
     }
 
@@ -3961,6 +4116,8 @@ fn explode_summary_point(
         event_ts_ns,
         sum_value,
         limits,
+        rules,
+        tally,
     )?);
 
     let count_value = if stale { stale_nan() } else { dp.count as f64 };
@@ -3974,6 +4131,8 @@ fn explode_summary_point(
         event_ts_ns,
         count_value,
         limits,
+        rules,
+        tally,
     )?);
 
     Ok(series)
@@ -4206,7 +4365,13 @@ mod tests {
     }
 
     fn run(batch: &DecodedBatch, limits: &IngestLimits) -> NormalizeOutput {
-        normalize_decoded(&TenantId::new("acme"), batch, limits, TS)
+        normalize_decoded(
+            &TenantId::new("acme"),
+            batch,
+            limits,
+            &TenantRules::none(),
+            TS,
+        )
     }
 
     /// Each point's labels as sorted `(name, value)` pairs, keyed by `__name__`.
@@ -4571,7 +4736,9 @@ mod tests {
                 &[Some(0), Some(0)],
             ))
             .expect("decode");
-        let projected = project_resolved_label_bytes(&batch, &IngestLimits::default()).get();
+        let projected =
+            project_resolved_label_bytes(&batch, &IngestLimits::default(), &TenantRules::none())
+                .get();
 
         let tight = IngestLimits {
             max_resolved_label_bytes_per_request: projected - 1,
@@ -5174,7 +5341,8 @@ mod tests {
             };
             let batch = encode_shapes(&resources, &shapes);
 
-            let projected = project_resolved_label_bytes(&batch, &limits).get();
+            let projected =
+                project_resolved_label_bytes(&batch, &limits, &TenantRules::none()).get();
             held::take();
             let out = run(&batch, &limits);
             let held = held::take();
@@ -5224,8 +5392,16 @@ mod tests {
                 })
                 .collect();
             let mut built = Vec::new();
-            let labels = admit_resource_labels(&pairs, 3, &limits, &mut built);
-            match check_resource_labels(&pairs, &limits) {
+            let mut tally = IpcryptTally::new();
+            let labels = admit_resource_labels(
+                &pairs,
+                3,
+                &limits,
+                &mut built,
+                &TenantRules::none(),
+                &mut tally,
+            );
+            match check_resource_labels(&pairs, &limits, &TenantRules::none()) {
                 Err(reason) => {
                     prop_assert!(labels.is_none());
                     prop_assert_eq!(
@@ -5239,7 +5415,8 @@ mod tests {
                         .iter()
                         .map(|l| label_bytes(l.name.len(), l.value.len()))
                         .sum();
-                    let planned = resource_prefix_bytes(&pairs, &limits).unwrap_or(0);
+                    let planned =
+                        resource_prefix_bytes(&pairs, &limits, &TenantRules::none()).unwrap_or(0);
                     prop_assert!(planned >= actual, "planned {} < built {}", planned, actual);
                 }
             }

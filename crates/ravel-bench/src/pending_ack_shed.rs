@@ -286,8 +286,13 @@ impl Body {
     /// this body for `tenant` under `limits` at the ingest clock reading
     /// `now_ns`.
     pub fn normalize(&self, tenant: &TenantId, limits: &IngestLimits, now_ns: i64) -> Normalized {
-        let out =
-            ravel_remote_write::normalize_resolved(tenant, self.resolved.clone(), limits, now_ns);
+        let out = ravel_remote_write::normalize_resolved(
+            tenant,
+            self.resolved.clone(),
+            limits,
+            &ravel_ipcrypt::rules::TenantRules::none(),
+            now_ns,
+        );
         Normalized {
             points: out.points.len() + out.histogram_points.len(),
             rejections: out.rejected.iter().map(|r| r.to_string()).collect(),

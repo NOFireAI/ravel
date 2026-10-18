@@ -36,6 +36,7 @@ use ravel_ingest::{
     IngestRouter, LogIngestRouter, LogWriteError, PendingAckBudget, SpanIngestRouter,
     SpanWriteError, SystemClock, WriteError, WriteMode,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_otlp::{IngestLimits, LogIngestLimits, SpanIngestLimits};
@@ -254,10 +255,12 @@ async fn a_shed_projection_allocates_nothing_near_the_label_bytes() {
 
     // Metrics.
     let limits = IngestLimits::default();
-    let projected = ravel_otlp::project_resolved_label_bytes(&wide_gauge_request(), &limits).get();
+    let rules = TenantRules::none();
+    let projected =
+        ravel_otlp::project_resolved_label_bytes(&wide_gauge_request(), &limits, &rules).get();
     let request = wide_gauge_request();
     let region = Region::new(&INSTRUMENTED_SYSTEM);
-    let output = ravel_otlp::normalize_metrics(&tenant, request, &limits, INGEST_TS_NS);
+    let output = ravel_otlp::normalize_metrics(&tenant, request, &limits, &rules, INGEST_TS_NS);
     let normalized = region.change().bytes_allocated;
     assert_eq!(output.points.len(), UNITS);
     drop(output);
@@ -284,10 +287,11 @@ async fn a_shed_projection_allocates_nothing_near_the_label_bytes() {
     // Logs.
     let limits = LogIngestLimits::default();
     let projected =
-        ravel_otlp::project_log_resolved_label_bytes(&wide_stream_log_request(), &limits).get();
+        ravel_otlp::project_log_resolved_label_bytes(&wide_stream_log_request(), &limits, &rules)
+            .get();
     let request = wide_stream_log_request();
     let region = Region::new(&INSTRUMENTED_SYSTEM);
-    let output = ravel_otlp::normalize_logs(request, &limits, INGEST_TS_NS);
+    let output = ravel_otlp::normalize_logs(request, &limits, &rules, INGEST_TS_NS);
     let normalized = region.change().bytes_allocated;
     assert_eq!(output.records.len(), UNITS);
     drop(output);
@@ -316,11 +320,15 @@ async fn a_shed_projection_allocates_nothing_near_the_label_bytes() {
 
     // Traces.
     let limits = SpanIngestLimits::default();
-    let projected =
-        ravel_otlp::project_span_resolved_label_bytes(&wide_resource_span_request(), &limits).get();
+    let projected = ravel_otlp::project_span_resolved_label_bytes(
+        &wide_resource_span_request(),
+        &limits,
+        &rules,
+    )
+    .get();
     let request = wide_resource_span_request();
     let region = Region::new(&INSTRUMENTED_SYSTEM);
-    let output = ravel_otlp::normalize_traces(request, &limits, INGEST_TS_NS);
+    let output = ravel_otlp::normalize_traces(request, &limits, &rules, INGEST_TS_NS);
     let normalized = region.change().bytes_allocated;
     assert_eq!(output.spans.len(), UNITS);
     drop(output);

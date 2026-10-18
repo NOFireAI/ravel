@@ -47,6 +47,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::{IngestLimits, normalize_metrics};
 use ravel_types::TenantId;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
@@ -193,13 +194,13 @@ fn measure_alloc(cfg: &Cfg, tenant: &TenantId) -> (usize, usize, usize) {
     // Warmup on a separate fixture, same thread: grows the compute scratch so
     // its one-time growth is not charged to the measured region.
     let (warm, _) = build_request(cfg);
-    let warm_out = normalize_metrics(tenant, warm, &limits, INGEST_TS_NS);
+    let warm_out = normalize_metrics(tenant, warm, &limits, &TenantRules::none(), INGEST_TS_NS);
     std::hint::black_box(&warm_out);
     drop(warm_out);
 
     let (req, total_points) = build_request(cfg);
     let region = Region::new(&INSTRUMENTED_SYSTEM);
-    let out = normalize_metrics(tenant, req, &limits, INGEST_TS_NS);
+    let out = normalize_metrics(tenant, req, &limits, &TenantRules::none(), INGEST_TS_NS);
     let change = region.change();
     assert_eq!(out.points.len(), total_points, "unexpected point count");
     (total_points, change.allocations, change.bytes_allocated)
@@ -296,7 +297,7 @@ fn report_memo_stats(tenant: &TenantId, cfg: &Cfg, name: &str) {
     let limits = limits_for(cfg);
     let (req, _) = build_request(cfg);
     memo_stats::reset();
-    let out = normalize_metrics(tenant, req, &limits, INGEST_TS_NS);
+    let out = normalize_metrics(tenant, req, &limits, &TenantRules::none(), INGEST_TS_NS);
     std::hint::black_box(&out);
     let (hits, misses) = memo_stats::snapshot();
     let total = hits + misses;
@@ -365,7 +366,13 @@ fn bench_normalize(c: &mut Criterion) {
             b.iter_batched(
                 || req.clone(),
                 |owned| {
-                    let out = normalize_metrics(&tenant, owned, &limits, INGEST_TS_NS);
+                    let out = normalize_metrics(
+                        &tenant,
+                        owned,
+                        &limits,
+                        &TenantRules::none(),
+                        INGEST_TS_NS,
+                    );
                     std::hint::black_box(out.points.len())
                 },
                 criterion::BatchSize::SmallInput,

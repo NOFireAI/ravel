@@ -39,6 +39,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::{IngestLimits, normalize_metrics};
 use ravel_types::TenantId;
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, StatsAlloc};
@@ -130,13 +131,13 @@ fn allocations(tenant: &TenantId, scopes: usize, points_per_scope: usize) -> usi
     let limits = limits();
 
     let (warm, _) = build_request(scopes, points_per_scope);
-    let warm_out = normalize_metrics(tenant, warm, &limits, INGEST_TS_NS);
+    let warm_out = normalize_metrics(tenant, warm, &limits, &TenantRules::none(), INGEST_TS_NS);
     std::hint::black_box(&warm_out);
     drop(warm_out);
 
     let (req, total_points) = build_request(scopes, points_per_scope);
     let region = Region::new(&INSTRUMENTED_SYSTEM);
-    let out = normalize_metrics(tenant, req, &limits, INGEST_TS_NS);
+    let out = normalize_metrics(tenant, req, &limits, &TenantRules::none(), INGEST_TS_NS);
     let change = region.change();
     assert_eq!(out.points.len(), total_points, "unexpected point count");
     assert!(

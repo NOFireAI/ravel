@@ -6,6 +6,7 @@
 #![allow(clippy::expect_used)]
 
 use prost::Message;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::IngestLimits;
 use ravel_remote_write::decode_write_request;
 use ravel_remote_write::normalize::normalize_resolved;
@@ -74,6 +75,7 @@ fn decodes_and_normalizes_a_realistic_write_request() {
         &tenant,
         resolved,
         &IngestLimits::default(),
+        &TenantRules::none(),
         1_700_000_020_000_000_000,
     );
 

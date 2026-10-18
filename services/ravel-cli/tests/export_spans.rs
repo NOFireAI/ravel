@@ -733,6 +733,7 @@ async fn ingest_otlp(store: &Arc<dyn ObjectStoreBackend>, tenant: &str, spans: V
             }],
         },
         &SpanIngestLimits::default(),
+        &ravel_ipcrypt::rules::TenantRules::none(),
         LOAD_NS,
     );
     assert!(out.rejected.is_empty(), "rejected: {:?}", out.rejected);

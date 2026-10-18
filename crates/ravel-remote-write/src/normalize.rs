@@ -7,6 +7,19 @@
 //! the sender believes it wrote. Every check here is validation, not
 //! mutation.
 //!
+//! Every entry point takes the tenant's resolved
+//! [`TenantRules`](ravel_ipcrypt::rules::TenantRules) as a required parameter
+//! (ADR-2993 decision 3). [`resolve_series_identity`] encrypts a label's value
+//! in place, in [`resolve_series_identity`]'s label-building loop, before the
+//! value-length limit is checked and before [`SeriesId::compute`] runs, so
+//! series identity, size limits, and encoding all see the stored
+//! (possibly-encrypted) bytes. An exemplar's kept labels are encrypted the
+//! same way in [`build_exemplar`]. Matching is by the label name exactly as
+//! received (`TenantRules::lookup_label`), since this surface never sanitizes
+//! a label name; an empty configured rule set
+//! ([`TenantRules::none`](ravel_ipcrypt::rules::TenantRules::none)) produces
+//! byte-identical output to the pre-ADR-2993 code path.
+//!
 //! Per RW convention, a label with an empty value is treated as absent and
 //! dropped before duplicate-name and length checks run; this is expected
 //! Prometheus behavior (used by classic senders to signal "no value"), not
@@ -38,8 +51,11 @@
 
 use std::sync::Arc;
 
+use ravel_ipcrypt::rules::TenantRules;
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_otlp::normalize::{
-    NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint, zero_threshold_is_admissible,
+    NormalizedExemplar, NormalizedHistogramPoint, NormalizedPoint, apply_ipcrypt,
+    zero_threshold_is_admissible,
 };
 use ravel_otlp::{IngestLimits, Rejection};
 use ravel_segment::{
@@ -251,6 +267,11 @@ pub struct RwNormalizeOutput {
     /// `Sample.start_timestamp` and `Histogram.start_timestamp` populate
     /// [`ResolvedRequest::created_timestamps_count`], which this mirrors.
     pub created_timestamps_dropped: usize,
+    /// Per-(variant, outcome) counts of every value a rule in the caller's
+    /// `TenantRules` matched during this call (ADR-2993 decision 3), sample
+    /// and exemplar labels alike. Empty when the rule set is empty or matched
+    /// nothing.
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Result of normalizing one resolved Remote Write request, including the
@@ -296,10 +317,11 @@ pub fn normalize_resolved(
     tenant: &TenantId,
     resolved: ResolvedRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> RwNormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    let result = normalize_with_exemplars(tenant, resolved, limits, ingest_ts_ns, &mut cap);
+    let result = normalize_with_exemplars(tenant, resolved, limits, rules, ingest_ts_ns, &mut cap);
     let mut output = result.output;
     // The cap admitted these, but this entry point discards them (nothing
     // stores exemplars on the RW path yet). A discarded admission is still a
@@ -324,6 +346,7 @@ pub fn normalize_with_exemplars(
     tenant: &TenantId,
     resolved: ResolvedRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> RwMetricsNormalizeResult {
@@ -360,6 +383,7 @@ pub fn normalize_with_exemplars(
                 exemplars_dropped,
                 metadata_dropped: resolved.metadata.len(),
                 created_timestamps_dropped: resolved.created_timestamps_count,
+                ipcrypt_tally: IpcryptTally::new(),
             },
             exemplars: Vec::new(),
         };
@@ -373,12 +397,14 @@ pub fn normalize_with_exemplars(
     // Exemplars dropped at decode time (RW2 budget overflow) are already
     // counted; the per-series admission pass below adds to this.
     let mut exemplars_dropped = resolved.exemplars_dropped;
+    let mut tally = IpcryptTally::new();
 
     for series in &resolved.series {
         normalize_series(
             tenant,
             series,
             limits,
+            rules,
             ingest_ts_ns,
             exemplar_cap,
             &mut points,
@@ -387,6 +413,7 @@ pub fn normalize_with_exemplars(
             &mut exemplars_dropped,
             &mut rejected,
             &mut counts,
+            &mut tally,
         );
     }
 
@@ -400,6 +427,7 @@ pub fn normalize_with_exemplars(
             exemplars_dropped,
             metadata_dropped: resolved.metadata.len(),
             created_timestamps_dropped: resolved.created_timestamps_count,
+            ipcrypt_tally: tally,
         },
         exemplars,
     }
@@ -417,6 +445,7 @@ fn normalize_series(
     tenant: &TenantId,
     series: &ResolvedSeries,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
@@ -425,17 +454,19 @@ fn normalize_series(
     exemplars_dropped: &mut usize,
     rejected: &mut Vec<RwRejection>,
     counts: &mut HistogramTallies,
+    tally: &mut IpcryptTally,
 ) {
     let point_count = series.samples.len() + series.histograms.len();
 
-    let (metric_name, label_set) = match resolve_series_identity(series, limits, point_count) {
-        Ok(v) => v,
-        Err(rejection) => {
-            *exemplars_dropped += series.exemplars.len();
-            rejected.push(rejection);
-            return;
-        }
-    };
+    let (metric_name, label_set) =
+        match resolve_series_identity(series, limits, rules, tally, point_count) {
+            Ok(v) => v,
+            Err(rejection) => {
+                *exemplars_dropped += series.exemplars.len();
+                rejected.push(rejection);
+                return;
+            }
+        };
 
     let series_id = match SeriesId::compute(tenant, &metric_name, &label_set) {
         Ok(id) => id,
@@ -457,6 +488,8 @@ fn normalize_series(
         series,
         series_id,
         limits,
+        rules,
+        tally,
         ingest_ts_ns,
         exemplar_cap,
         exemplars_out,
@@ -513,10 +546,13 @@ fn normalize_series(
 /// retracts an admission it already handed back: that ordering is what makes
 /// decision 2's "keep the newest within each window" hold when one series
 /// carries several exemplars inside one window.
+#[allow(clippy::too_many_arguments)]
 fn admit_exemplars(
     series: &ResolvedSeries,
     series_id: SeriesId,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     ingest_ts_ns: i64,
     cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
@@ -528,7 +564,7 @@ fn admit_exemplars(
 
     let mut candidates = Vec::with_capacity(series.exemplars.len());
     for exemplar in &series.exemplars {
-        match build_exemplar(exemplar, ingest_ts_ns, limits) {
+        match build_exemplar(exemplar, ingest_ts_ns, limits, rules, tally) {
             Some(candidate) => candidates.push(candidate),
             None => *exemplars_dropped += 1,
         }
@@ -559,10 +595,17 @@ fn admit_exemplars(
 ///
 /// The value is carried as a bit pattern, so a NaN payload or a negative zero
 /// round-trips exactly rather than being normalized by an `f64` comparison.
+///
+/// A kept filtered attribute is encrypted under `rules`, matched by its label
+/// name as received, exactly like a series label. The `trace_id`/`span_id`
+/// labels consumed into the fixed-size ids are not stored as labels and are
+/// not matched.
 fn build_exemplar(
     exemplar: &ResolvedExemplar,
     ingest_ts_ns: i64,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Option<Exemplar> {
     let ts_ns = checked_event_ts(exemplar.ts_ms, ingest_ts_ns, limits).ok()?;
 
@@ -591,7 +634,10 @@ fn build_exemplar(
             continue;
         }
         if filtered_attributes.len() < limits.max_attributes_per_point {
-            filtered_attributes.push(label.clone());
+            filtered_attributes.push(Label {
+                name: label.name.clone(),
+                value: apply_ipcrypt(rules, tally, &label.name, label.value.clone()),
+            });
         }
     }
 
@@ -631,6 +677,8 @@ fn decode_hex_id<const N: usize>(value: &str) -> Option<[u8; N]> {
 fn resolve_series_identity(
     series: &ResolvedSeries,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     point_count: usize,
 ) -> Result<(String, LabelSet), RwRejection> {
     let otlp = |reason| RwRejection::Otlp {
@@ -677,13 +725,21 @@ fn resolve_series_identity(
                 max: limits.max_label_name_len,
             }));
         }
-        if l.value.len() > limits.max_label_value_len {
+        // ADR-2993 decision 3: encrypt before the value-length check, so the
+        // limit sees the length of the bytes actually stored. Remote Write
+        // never sanitizes a label name, so the rule match is against `l.name`
+        // exactly as received.
+        let value = apply_ipcrypt(rules, tally, &l.name, l.value.clone());
+        if value.len() > limits.max_label_value_len {
             return Err(otlp(Rejection::LabelValueTooLong {
-                len: l.value.len(),
+                len: value.len(),
                 max: limits.max_label_value_len,
             }));
         }
-        labels.push(l.clone());
+        labels.push(Label {
+            name: l.name.clone(),
+            value,
+        });
     }
     if labels.len() > limits.max_attributes_per_point {
         return Err(otlp(Rejection::TooManyAttributes {
@@ -1206,6 +1262,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         )
     }
@@ -1249,6 +1306,7 @@ mod tests {
             &tenant(),
             req,
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_700_000_001_000_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -1283,6 +1341,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_700_000_001_000_000_000,
         );
         // The sample is admitted whole.
@@ -1301,7 +1360,13 @@ mod tests {
             vec![label("__name__", "up"), label("weird.name", "v")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points[0].labels.get("weird.name"), Some("v"));
     }
@@ -1314,7 +1379,13 @@ mod tests {
             vec![label("__name__", "up"), label("optional", "")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points[0].labels.get("optional"), None);
     }
@@ -1327,7 +1398,13 @@ mod tests {
             vec![label("job", "svc")],
             vec![sample(1_000, 1.0), sample(2_000, 2.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1344,7 +1421,13 @@ mod tests {
             vec![label("__name__", "")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1361,7 +1444,13 @@ mod tests {
             vec![label("__name__", "up"), label("__name__", "down")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1382,7 +1471,7 @@ mod tests {
             vec![label("__name__", "toolong")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1409,7 +1498,13 @@ mod tests {
             ],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1430,7 +1525,13 @@ mod tests {
             vec![label("__name__", "up"), label("", "surprise")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(out.rejected, vec![RwRejection::EmptyLabelName { count: 1 }]);
     }
@@ -1443,7 +1544,13 @@ mod tests {
             vec![label("__name__", "up"), label("", "")],
             vec![sample(1_000, 1.0), sample(2_000, 2.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(out.rejected, vec![RwRejection::EmptyLabelName { count: 2 }]);
     }
@@ -1458,7 +1565,7 @@ mod tests {
             vec![label("__name__", "up"), label("a", "1"), label("b", "2")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1482,7 +1589,7 @@ mod tests {
             vec![label("__name__", "up"), label("toolong", "v")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1503,7 +1610,7 @@ mod tests {
             vec![label("__name__", "up"), label("k", "toolong")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1522,7 +1629,13 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(0, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -1539,7 +1652,13 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(i64::MAX, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(out.rejected, vec![RwRejection::TimestampOverflow]);
     }
@@ -1556,7 +1675,7 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(event_ts_ns / 1_000_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, ingest_ts);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), ingest_ts);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
     }
 
@@ -1571,7 +1690,7 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(ingest_ts / 1_000_000 + 1, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, ingest_ts);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), ingest_ts);
         assert!(out.points.is_empty());
         assert!(matches!(
             out.rejected[0],
@@ -1593,7 +1712,7 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(ingest_ts / 1_000_000 - 1, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, ingest_ts);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), ingest_ts);
         assert!(out.points.is_empty());
         assert!(matches!(
             out.rejected[0],
@@ -1614,7 +1733,13 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(1_000, stale)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points[0].sample.value.to_bits(), STALE_NAN_BITS);
     }
@@ -1625,7 +1750,13 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(1_000, -0.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points[0].sample.value.to_bits(), (-0.0f64).to_bits());
     }
@@ -2288,6 +2419,7 @@ mod tests {
                     }],
                 },
                 &IngestLimits::default(),
+                &TenantRules::none(),
                 1_000,
             );
             assert!(otlp.histogram_points.is_empty(), "{dp:?}");
@@ -2466,6 +2598,7 @@ mod tests {
                 }],
             },
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(
@@ -2550,7 +2683,13 @@ mod tests {
         // Far enough in the future to exceed max_future_skew_ns at an
         // ingest clock of 0.
         s.histograms = vec![histogram(i64::from(i32::MAX))];
-        let out = normalize_resolved(&tenant(), request(vec![s]), &limits, 0);
+        let out = normalize_resolved(
+            &tenant(),
+            request(vec![s]),
+            &limits,
+            &TenantRules::none(),
+            0,
+        );
         assert!(out.histogram_points.is_empty());
         assert_eq!(out.histograms_written, 0);
         assert_eq!(out.histograms_dropped, 1);
@@ -2579,6 +2718,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         assert_eq!(out.points.len(), 1, "the scalar sample");
@@ -2603,6 +2743,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         assert_eq!(out.points.len(), 1);
@@ -2620,7 +2761,13 @@ mod tests {
         };
         let mut s = series(vec![label("__name__", "h")], vec![sample(1_000, 1.0)]);
         s.histograms = vec![histogram(1_000), histogram(2_000)];
-        let out = normalize_resolved(&tenant(), request(vec![s]), &limits, 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            request(vec![s]),
+            &limits,
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert!(out.histogram_points.is_empty());
         assert_eq!(
@@ -2643,6 +2790,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.points.is_empty());
@@ -2697,6 +2845,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2728,6 +2877,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2776,6 +2926,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2804,6 +2955,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2833,6 +2985,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2868,6 +3021,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2896,6 +3050,7 @@ mod tests {
             &tenant(),
             request(vec![first, second]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2917,6 +3072,7 @@ mod tests {
                 vec![],
             )])]),
             &limits,
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2931,6 +3087,7 @@ mod tests {
                 vec![],
             )])]),
             &limits,
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2948,6 +3105,7 @@ mod tests {
             &tenant(),
             request(vec![s]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -2975,6 +3133,7 @@ mod tests {
             &tenant(),
             request(vec![admitted, rejected_series]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         // The admitted series' two same-window exemplars: one loses the cap and
@@ -3002,6 +3161,7 @@ mod tests {
             &tenant(),
             request(vec![with_two_points]),
             &limits,
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
         );
@@ -3029,7 +3189,13 @@ mod tests {
                 unit: String::new(),
             })
             .collect();
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert_eq!(out.metadata_dropped, 5);
     }
 
@@ -3039,7 +3205,13 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(1_000, 1.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert_eq!(out.created_timestamps_dropped, 0);
     }
 
@@ -3050,7 +3222,13 @@ mod tests {
             vec![sample(1_000, 1.0)],
         )]);
         req.created_timestamps_count = 3;
-        let out = normalize_resolved(&tenant(), req, &IngestLimits::default(), 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert_eq!(out.created_timestamps_dropped, 3);
     }
 
@@ -3066,7 +3244,7 @@ mod tests {
             vec![label("__name__", "up")],
             vec![sample(1_000, 1.0), sample(2_000, 2.0), sample(3_000, 3.0)],
         )]);
-        let out = normalize_resolved(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_resolved(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3089,7 +3267,13 @@ mod tests {
         };
         let mut s = series(vec![label("__name__", "h")], vec![]);
         s.histograms = vec![histogram(1_000), histogram(2_000), histogram(3_000)];
-        let out = normalize_resolved(&tenant(), request(vec![s]), &limits, 1_000_000);
+        let out = normalize_resolved(
+            &tenant(),
+            request(vec![s]),
+            &limits,
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3138,6 +3322,7 @@ mod tests {
             &tenant,
             request(series_list),
             &IngestLimits::default(),
+            &TenantRules::none(),
             ts_ms * 1_000_000 + 1,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3207,9 +3392,9 @@ mod tests {
                 &tenant(),
                 request(vec![series_with_exemplars(exemplars)]),
                 &IngestLimits::default(),
+                &TenantRules::none(),
                 1_000_000,
-                &mut cap,
-            );
+                &mut cap);
             proptest::prop_assert_eq!(
                 result.exemplars.len() + result.output.exemplars_dropped,
                 total

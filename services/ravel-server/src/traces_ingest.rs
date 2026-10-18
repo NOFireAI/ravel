@@ -11,6 +11,7 @@ use ravel_ingest::{
     AdmissionController, IdempotencyReceipt, LookupOutcome, SpanIngestRouter, SpanWriteError,
     WriteMode, plausible_ingest_clock, write_marker,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::{
     NormalizeRejectCounts, SpanIngestLimits, SpanRejection, normalize_traces_projected,
@@ -252,7 +253,9 @@ pub async fn handle_export_traces_releasing(
         }
     }
 
-    let projected = ravel_otlp::project_span_resolved_label_bytes(&request, &state.limits);
+    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
+    let rules = TenantRules::none();
+    let projected = ravel_otlp::project_span_resolved_label_bytes(&request, &state.limits, &rules);
     let label_charge = crate::ingest::charge_projected_labels(
         &state.budget,
         projected.get(),
@@ -261,7 +264,8 @@ pub async fn handle_export_traces_releasing(
     .map_err(|ravel_ingest::IngestByteShed| {
         SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)
     })?;
-    let normalized = normalize_traces_projected(request, &state.limits, ingest_ts_ns, projected);
+    let normalized =
+        normalize_traces_projected(request, &state.limits, &rules, ingest_ts_ns, projected);
     // `rejected_spans` counts only spans that never reached storage. An
     // attribute-level rejection (one oversized/malformed attribute, an
     // over-long events/links blob, a bad parent_span_id) drops a single field
@@ -731,8 +735,12 @@ mod tests {
             stale.end_time_unix_nano = too_old as u64;
             request(vec![stale.clone(), stale])
         };
-        let projected =
-            ravel_otlp::project_span_resolved_label_bytes(&stale_request(), &state().limits).get();
+        let projected = ravel_otlp::project_span_resolved_label_bytes(
+            &stale_request(),
+            &state().limits,
+            &TenantRules::none(),
+        )
+        .get();
         assert!(projected > 0, "the fixture projects some label bytes");
 
         let mut state = state();
