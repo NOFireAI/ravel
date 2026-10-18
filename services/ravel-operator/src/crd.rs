@@ -652,7 +652,7 @@ pub struct FoldSpec {
 ///
 /// The ingest-router Deployment is out of scope here: it runs a different
 /// binary that does no decode, and its probes stay on its own HTTP port.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ProbesSpec {
     /// Probe the dedicated health listener instead of the main HTTP port.
@@ -664,13 +664,24 @@ pub struct ProbesSpec {
     /// main runtime cannot make the kubelet time a probe out and restart the
     /// pod.
     ///
-    /// Defaults to false in this release (ADR-1702 decision 10): the flag
-    /// requires a `ravel-server` image that has `--listen-health`, and an
-    /// older image rejects the unknown flag and restart-loops the pod. The
-    /// default flips to true one release later, with the image requirement in
-    /// its release notes.
-    #[serde(default)]
+    /// Defaults to true (ADR-1702 follow-up task 12): the flag requires a
+    /// `ravel-server` image that has `--listen-health`, from this release or
+    /// newer. An older image rejects the unknown flag and restart-loops the
+    /// pod. Set this to `false` to keep the pre-flip render.
+    #[serde(default = "default_dedicated_health_port")]
     pub dedicated_health_port: bool,
+}
+
+impl Default for ProbesSpec {
+    fn default() -> Self {
+        Self {
+            dedicated_health_port: default_dedicated_health_port(),
+        }
+    }
+}
+
+fn default_dedicated_health_port() -> bool {
+    true
 }
 
 /// Query tier: replicas and resources.

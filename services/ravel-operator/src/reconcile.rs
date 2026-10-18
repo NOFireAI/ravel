@@ -4781,9 +4781,12 @@ mod tests {
             ]
         };
 
-        // Disabled (this release's default): the render is what it is today,
-        // whole object for whole object.
-        assert_eq!(render(&off), render(&without));
+        // Explicit false: byte-identical to the pre-flip default, whole
+        // object for whole object (ADR-1702 follow-up task 12).
+        //
+        // Field-absent: byte-identical to the explicit-true render, since
+        // `without` and `on` already compared equal as specs above.
+        assert_eq!(render(&on), render(&without));
         for dep in render(&off) {
             let container = container_of(&dep);
             assert!(
