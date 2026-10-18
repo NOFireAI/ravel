@@ -141,7 +141,9 @@ pub use ddl::{DEFAULT_MIN_GRACE_MS, DdlErrorClass, DdlExecuteError, DdlOutcome};
 pub use ddl_cost::{
     DDL_COST_BYTES, DDL_PHASE_COUNT, DdlCost, DdlExecution, DdlPhase, DdlPhaseCost,
 };
-pub use declared::{DeclaredColumn, DeclaredColumnSource, DeclaredType, StaticDeclaredColumns};
+pub use declared::{
+    DeclaredColumn, DeclaredColumnSource, DeclaredType, KeyIndexDeclaration, StaticDeclaredColumns,
+};
 #[cfg(feature = "flight-sql")]
 pub use distributed::{
     DistributedFlightConfig, DistributedScanExec, FlightWorkerSliceClient, SliceTlsDialCounter,

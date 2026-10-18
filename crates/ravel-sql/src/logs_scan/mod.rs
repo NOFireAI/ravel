@@ -374,8 +374,8 @@ use ravel_proto::catalog::v1::column_value::Kind as ColumnValueKind;
 use ravel_proto::catalog::v1::{ColumnStat, ColumnStatsSegment, ColumnValue};
 use ravel_query::erasure::ErasurePredicate;
 use ravel_query::{
-    CarriedWholeObject, ColumnarBlockOutcome, LogFetchError, LogQuery, LogSegmentFetcher,
-    LogSegmentScan, PhaseAccounting,
+    CarriedWholeObject, ColumnarBlockOutcome, KeyEquals, KeyIndexPruning, LogFetchError, LogQuery,
+    LogSegmentFetcher, LogSegmentScan, PhaseAccounting,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -1120,6 +1120,11 @@ pub struct LogsScanExec {
     /// and are never evaluated per row, so they cannot change which records the
     /// fetch returns for a block it reads, only which blocks it reads.
     prune: Arc<Vec<Predicate>>,
+    /// Exact-key equalities handed to the fetch as `LogQuery::key_equals`, for
+    /// the plan's tier-1 KEY_IDX probe (ADR-2707 decision 5). Like `prune`,
+    /// they narrow which blocks are read and never which rows a read block
+    /// returns. Set by [`Self::with_key_equals`].
+    key_equals: Arc<Vec<KeyEquals>>,
     /// Pending selective-erasure predicates from the resolved snapshot
     /// (ADR-0064 decision 2). Fed to [`LogQuery::with_erasure`] so
     /// `LogSegmentFetcher::fetch`'s existing post-fetch, post-cache filter
@@ -1343,6 +1348,12 @@ struct BlockMetrics {
     /// Published once by partition 0, so a report can tell a fully-skip-planned
     /// query from one still paying the plan-phase read.
     plan_full_reads: Count,
+    /// Planned segments a declared-column or `trace_id` equality read no
+    /// block of because the object's KEY_IDX section says the key is absent,
+    /// and skip-index survivors of the other planned segments KEY_IDX named
+    /// no entry for (ADR-2707 decision 5). Published once by partition 0.
+    segments_pruned_by_key_index: Count,
+    blocks_pruned_by_key_index: Count,
     /// Whole-segment fast-path segments this partition opened with one
     /// whole-object GET, and the ones it opened by column chunk instead (issue
     /// #862). Which way the request-cost model routed a statement is otherwise
@@ -1476,6 +1487,10 @@ impl BlockMetrics {
             columnar_batches: MetricBuilder::new(metrics).counter("columnar_batches", partition),
             rowpath_batches: MetricBuilder::new(metrics).counter("rowpath_batches", partition),
             plan_full_reads: MetricBuilder::new(metrics).counter("plan_full_reads", partition),
+            segments_pruned_by_key_index: MetricBuilder::new(metrics)
+                .counter("segments_pruned_by_key_index", partition),
+            blocks_pruned_by_key_index: MetricBuilder::new(metrics)
+                .counter("blocks_pruned_by_key_index", partition),
             fast_path_whole_object_segments: MetricBuilder::new(metrics)
                 .counter("fast_path_whole_object_segments", partition),
             fast_path_ranged_segments: MetricBuilder::new(metrics)
@@ -1660,6 +1675,7 @@ impl LogsScanExec {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
+                .with_key_equals(Arc::clone(&self.key_equals))
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
         })
@@ -1703,6 +1719,7 @@ impl LogsScanExec {
             scan.with_column_stats(self.column_stats.clone())
                 .with_segment_timing(self.segment_timing)
                 .with_segments_pruned_by_stats(self.segments_pruned_by_stats)
+                .with_key_equals(Arc::clone(&self.key_equals))
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
         })
@@ -1743,6 +1760,13 @@ impl LogsScanExec {
         MetricBuilder::new(&self.metrics)
             .global_counter("segments_pruned_by_stats")
             .add(pruned);
+        self
+    }
+
+    /// Install the exact-key equalities the plan's KEY_IDX probe answers
+    /// (ADR-2707 decision 5), from [`crate::logs_pushdown::LogsPushdown::key_equals`].
+    pub(crate) fn with_key_equals(mut self, key_equals: Arc<Vec<KeyEquals>>) -> Self {
+        self.key_equals = key_equals;
         self
     }
 
@@ -1823,6 +1847,7 @@ impl LogsScanExec {
             ts_max: self.ts_max,
             content: Arc::clone(&self.content),
             prune: Arc::clone(&self.prune),
+            key_equals: Arc::clone(&self.key_equals),
             erasure: Arc::clone(&self.erasure),
             projection: Arc::clone(&self.projection),
             columns: self.columns.clone(),
@@ -1968,6 +1993,7 @@ impl LogsScanExec {
             ts_max,
             content,
             prune,
+            key_equals: Arc::new(Vec::new()),
             erasure,
             projection: Arc::new(projection),
             columns,
@@ -2022,17 +2048,21 @@ impl LogsScanExec {
     ///   is block-only and widen-safe, so it never changes the row count, but a
     ///   present prune means a predicate was pushed, so treat it as not-exact
     ///   too and only claim the count for a truly predicate-free query;
+    /// - no exact-key equality (`LogsPushdown::key_equals`): the KEY_IDX probe
+    ///   drops whole blocks and objects, so the scan emits fewer rows than the
+    ///   committed counts hold;
     /// - no pending selective erasure (ADR-0064 decision 2): a pending erasure
     ///   predicate removes rows the committed counts still include, so the sum
     ///   overstates the answer. Fail closed.
     ///
     /// The projection is irrelevant to the count, so it is not consulted.
-    /// `LogsPushdown` has exactly these four fields (`ts_lo`, `ts_hi`,
-    /// `content`, `prune`); each is covered here, and `erasure` comes from the
+    /// `LogsPushdown` has exactly these five fields (`ts_lo`, `ts_hi`,
+    /// `content`, `prune`, `key_equals`); each is covered here, and `erasure` comes from the
     /// resolved snapshot rather than the pushdown.
     fn stats_are_exact(&self) -> bool {
         self.content.is_empty()
             && self.prune.is_empty()
+            && self.key_equals.is_empty()
             && self.erasure.is_empty()
             && self
                 .segments
@@ -2368,7 +2398,7 @@ impl LogsScanExec {
     /// - the snapshot carries no pending selective erasure, and the query
     ///   carries no block-level predicate
     ///   ([`LogQuery::is_block_predicate_free`]: no content, prune-only,
-    ///   stream-attribute, or pending-erasure arm), and
+    ///   stream-attribute, pending-erasure, or exact-key arm), and
     /// - every relevant segment has a well-formed span (`min <= max`) and is
     ///   fully CONTAINED in the window
     ///   (`ts_min <= seg.min && seg.max <= ts_max`). Containment is
@@ -2940,6 +2970,9 @@ impl ExecutionPlan for LogsScanExec {
         // residual must keep.
         for p in self.prune.iter() {
             query = query.with_prune(p.clone());
+        }
+        for k in self.key_equals.iter() {
+            query = query.with_key_equals(k.clone());
         }
 
         let reservation = MemoryConsumer::new(format!("LogsScanExec[{partition}]"))

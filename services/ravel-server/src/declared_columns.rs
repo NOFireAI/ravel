@@ -70,11 +70,12 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ravel_catalog::{
-    DeclaredColumnType, DeclaredTypedColumn, read_config_values, validate_typed_attr_columns,
+    DeclaredColumnType, DeclaredTypedColumn, TenantConfig, read_config_values,
+    validate_typed_attr_columns,
 };
 use ravel_ingest::DEFAULT_LIFECYCLE_REFRESH_INTERVAL_NS;
 use ravel_object_store::ObjectStoreBackend;
-use ravel_sql::{DeclaredColumn, DeclaredColumnSource, DeclaredType};
+use ravel_sql::{DeclaredColumn, DeclaredColumnSource, DeclaredType, KeyIndexDeclaration};
 use ravel_types::TenantHash;
 
 use crate::typed_attr_config::TypedAttrColumnConfig;
@@ -124,7 +125,7 @@ const NEVER: i64 = i64::MIN;
 ///   so eviction cannot key off that without reaping live entries).
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    columns: Vec<DeclaredColumn>,
+    resolved: Resolved,
     refreshed_at_ns: i64,
     attempted_at_ns: i64,
     last_touched_ns: i64,
@@ -138,20 +139,43 @@ struct Inner {
     cache: HashMap<TenantHash, CacheEntry>,
 }
 
+/// One tenant's resolved declaration: the declared columns, and the fields its
+/// writers index in KEY_IDX. Both come from the same `TenantConfig` read, so
+/// they are cached, refreshed and served on failure together.
+#[derive(Debug, Clone, Default)]
+struct Resolved {
+    columns: Vec<DeclaredColumn>,
+    key_index: KeyIndexDeclaration,
+}
+
+/// The KEY_IDX fields `config` declares, resolved the way the logs flush
+/// resolves them (`ravel_ingest`'s `key_index_fields`): the key-index columns
+/// when they validate against the config's own typed columns, none otherwise,
+/// plus `trace_id` when `index_trace_id` is set.
+fn key_index_of(config: &TenantConfig) -> KeyIndexDeclaration {
+    KeyIndexDeclaration {
+        columns: config
+            .key_index_columns()
+            .map(|columns| columns.into_iter().map(|c| c.key).collect())
+            .unwrap_or_default(),
+        trace_id: config.index_trace_id(),
+    }
+}
+
 /// How a resolution was reached: from a fresh durable read (or a genuine
 /// absence, itself a valid state), or from a stale/backoff/failed-read/
 /// validation-failure fallback. The stale-fallback metric counts exactly the
 /// [`RefreshOutcome::Fallback`] arm, mirroring how `run_flush` counts
 /// `IndexedFieldsOverlay`'s.
 enum RefreshOutcome {
-    Fresh(Vec<DeclaredColumn>),
-    Fallback(Vec<DeclaredColumn>),
+    Fresh(Resolved),
+    Fallback(Resolved),
 }
 
 impl RefreshOutcome {
-    fn into_columns(self) -> Vec<DeclaredColumn> {
+    fn into_resolved(self) -> Resolved {
         match self {
-            RefreshOutcome::Fresh(columns) | RefreshOutcome::Fallback(columns) => columns,
+            RefreshOutcome::Fresh(resolved) | RefreshOutcome::Fallback(resolved) => resolved,
         }
     }
 
@@ -265,12 +289,12 @@ impl TenantConfigDeclaredColumns {
     /// `last_touched_ns` so idle eviction never reaps an entry still serving
     /// queries. `now_ns` is the query's injected timestamp; this type reads no
     /// clock.
-    fn columns_cached(&self, tenant: &TenantHash, now_ns: i64) -> Option<Vec<DeclaredColumn>> {
+    fn resolved_cached(&self, tenant: &TenantHash, now_ns: i64) -> Option<Resolved> {
         let mut inner = self.lock();
         let entry = inner.cache.get_mut(tenant)?;
         if now_ns.saturating_sub(entry.refreshed_at_ns) <= self.horizon_ns {
             entry.last_touched_ns = now_ns;
-            Some(entry.columns.clone())
+            Some(entry.resolved.clone())
         } else {
             None
         }
@@ -300,26 +324,36 @@ impl TenantConfigDeclaredColumns {
                 && now_ns.saturating_sub(entry.attempted_at_ns) < self.backoff_ns
             {
                 entry.last_touched_ns = now_ns;
-                return RefreshOutcome::Fallback(entry.columns.clone());
+                return RefreshOutcome::Fallback(entry.resolved.clone());
             }
         }
 
         match read_config_values(self.store.as_ref(), tenant).await {
-            Ok(config) => match config.and_then(|c| c.typed_attr_columns) {
-                // A present durable declaration: validate on the same rules the
-                // CLI flags and any durable write are held to. A malformed
-                // record is treated exactly like a failed read.
-                Some(list) if validate_typed_attr_columns(&list).is_err() => {
-                    self.serve_on_failure(tenant, now_ns)
+            Ok(config) => {
+                let key_index = config.as_ref().map(key_index_of).unwrap_or_default();
+                match config.and_then(|c| c.typed_attr_columns) {
+                    // A present durable declaration: validate on the same rules
+                    // the CLI flags and any durable write are held to. A
+                    // malformed record is treated exactly like a failed read.
+                    Some(list) if validate_typed_attr_columns(&list).is_err() => {
+                        self.serve_on_failure(tenant, now_ns)
+                    }
+                    Some(list) => self.install_fresh(
+                        tenant,
+                        Resolved {
+                            columns: to_query_columns(&list),
+                            key_index,
+                        },
+                        now_ns,
+                    ),
+                    // No override: the base's own tenant-override-or-default
+                    // resolution stands unchanged.
+                    None => {
+                        let columns = self.base_columns(tenant);
+                        self.install_fresh(tenant, Resolved { columns, key_index }, now_ns)
+                    }
                 }
-                Some(list) => self.install_fresh(tenant, to_query_columns(&list), now_ns),
-                // No override: the base's own tenant-override-or-default
-                // resolution stands unchanged.
-                None => {
-                    let base = self.base_columns(tenant);
-                    self.install_fresh(tenant, base, now_ns)
-                }
-            },
+            }
             Err(_) => self.serve_on_failure(tenant, now_ns),
         }
     }
@@ -329,20 +363,20 @@ impl TenantConfigDeclaredColumns {
     fn install_fresh(
         &self,
         tenant: &TenantHash,
-        columns: Vec<DeclaredColumn>,
+        resolved: Resolved,
         now_ns: i64,
     ) -> RefreshOutcome {
         let mut inner = self.lock();
         inner.cache.insert(
             *tenant,
             CacheEntry {
-                columns: columns.clone(),
+                resolved: resolved.clone(),
                 refreshed_at_ns: now_ns,
                 attempted_at_ns: NEVER,
                 last_touched_ns: now_ns,
             },
         );
-        RefreshOutcome::Fresh(columns)
+        RefreshOutcome::Fresh(resolved)
     }
 
     /// The failed-read/validation-failure path: serve the last successfully
@@ -359,13 +393,16 @@ impl TenantConfigDeclaredColumns {
         {
             entry.attempted_at_ns = now_ns;
             entry.last_touched_ns = now_ns;
-            return RefreshOutcome::Fallback(entry.columns.clone());
+            return RefreshOutcome::Fallback(entry.resolved.clone());
         }
-        let base = self.base_columns(tenant);
+        let base = Resolved {
+            columns: self.base_columns(tenant),
+            key_index: KeyIndexDeclaration::default(),
+        };
         inner.cache.insert(
             *tenant,
             CacheEntry {
-                columns: base.clone(),
+                resolved: base.clone(),
                 refreshed_at_ns: NEVER,
                 attempted_at_ns: now_ns,
                 last_touched_ns: now_ns,
@@ -414,8 +451,8 @@ impl DeclaredColumnSource for TenantConfigDeclaredColumns {
     /// permanently unreadable override shows up on `/metrics` instead of
     /// silently pinning a tenant to the CLI base.
     async fn declared_columns(&self, tenant: TenantHash, now_ns: i64) -> Vec<DeclaredColumn> {
-        if let Some(columns) = self.columns_cached(&tenant, now_ns) {
-            return columns;
+        if let Some(resolved) = self.resolved_cached(&tenant, now_ns) {
+            return resolved.columns;
         }
         let outcome = self.refresh(&tenant, now_ns).await;
         if outcome.is_fallback() {
@@ -423,7 +460,21 @@ impl DeclaredColumnSource for TenantConfigDeclaredColumns {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             crate::typed_attr_metrics::record_stale_fallback();
         }
-        outcome.into_columns()
+        outcome.into_resolved().columns
+    }
+
+    /// The KEY_IDX declaration from the same cached entry, refreshed on the
+    /// same terms. A fallback is not counted here: the plan's
+    /// `declared_columns` call already counted it, and the two read one entry.
+    /// No record, or a read that has never succeeded, indexes nothing.
+    async fn key_index(&self, tenant: TenantHash, now_ns: i64) -> KeyIndexDeclaration {
+        if let Some(resolved) = self.resolved_cached(&tenant, now_ns) {
+            return resolved.key_index;
+        }
+        self.refresh(&tenant, now_ns)
+            .await
+            .into_resolved()
+            .key_index
     }
 }
 
@@ -498,6 +549,75 @@ mod tests {
 
     fn keys(columns: &[DeclaredColumn]) -> Vec<&str> {
         columns.iter().map(|c| c.key.as_str()).collect()
+    }
+
+    /// The KEY_IDX declaration comes from the same record as the declared
+    /// columns: its validated key-index columns plus `trace_id` when
+    /// `index_trace_id` is on. No record indexes nothing, and a failed first
+    /// read indexes nothing either.
+    #[tokio::test]
+    async fn key_index_follows_the_durable_record() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let overlay = overlay_over(base_declaring("base.col"), store.clone());
+
+        let tenant = TenantId::new("keyed").hash();
+        let mut config = TenantConfig {
+            typed_attr_columns: Some(vec![
+                col("status_code", DeclaredColumnType::I64),
+                col("region", DeclaredColumnType::Str),
+            ]),
+            ..TenantConfig::new(TenantLifecycleState::Active)
+        };
+        config
+            .set_key_index_columns(
+                vec!["region".to_owned()],
+                ravel_catalog::StorageLayoutWrite::ReadersRolledOut,
+            )
+            .expect("region is a declared str column");
+        config
+            .set_index_trace_id(true, ravel_catalog::StorageLayoutWrite::ReadersRolledOut)
+            .expect("trace_id opt-in");
+        set_tenant_config(store.as_ref(), &tenant, &config, 1)
+            .await
+            .expect("write tenant config");
+        assert_eq!(
+            overlay.key_index(tenant, 10_000).await,
+            KeyIndexDeclaration {
+                columns: vec!["region".to_owned()],
+                trace_id: true,
+            }
+        );
+        assert_eq!(
+            keys(&overlay.declared_columns(tenant, 10_000).await),
+            ["status_code", "region"]
+        );
+
+        let absent = TenantId::new("absent").hash();
+        assert_eq!(
+            overlay.key_index(absent, 10_000).await,
+            KeyIndexDeclaration::default()
+        );
+
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("simulated config-store outage".into()),
+            )
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(MemoryStore::new(), plan));
+        let failing: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let degraded = overlay_over(base_declaring("base.col"), failing);
+        assert_eq!(
+            degraded.key_index(tenant, 10_000).await,
+            KeyIndexDeclaration::default()
+        );
+        assert_eq!(fault.fault_count(Op::Get, FaultKind::Transient), 1);
+        assert_eq!(
+            degraded.stale_fallbacks(),
+            0,
+            "key_index leaves the fallback count to declared_columns"
+        );
     }
 
     /// A present durable override replaces the CLI base, and the fast path then
