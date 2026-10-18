@@ -207,16 +207,26 @@ jobs:
     #           2 s timeout
     #   + 25    load: stopped at CHAOS_MAINTAIN_LOAD_MAX_SECONDS (1500 s)
     #           whatever count it has reached; 650 exports at the 2.27 s
-    #           each of a 20-export run would take 24.6, an extrapolation
+    #           each of a 20-export run would take 24.6, an extrapolation.
+    #           On 8 shards each flush writes 8 L0 objects instead of 4; a
+    #           slower flush shortens the load, not the job
+    #   + 1     shard-coverage LIST after the load: one list-objects-v2 over
+    #           t/, about 650 * 8 L0 objects and as many commit records,
+    #           11 pages of 1000 keys
     #   + 142   seal wait after ingest exits: up to 60 to the end of the
     #           hour, + 80 seal margin + 2 safety
-    #   + 7     in-flight wait: one maintenance tick + 120 s
+    #   + 7     in-flight wait: one maintenance tick + 120 s, the whole wait,
+    #           whose last round can overrun it by one poll and two 5 s
+    #           scrapes
     #   + 18    conservation wait from the kill: 3 * H + one tick (the
-    #           takeover bound, 8) + one tick (5) + 300 s merge allowance (5)
-    #   = 222 minutes, plus the verification after the conservation wait
+    #           takeover bound, 8) + one tick (5) + 300 s merge allowance (5).
+    #           A fixed cap: 8 shards mean 24 units and twice the bucket
+    #           merges, each over half the data, all inside the same cap
+    #   = 223 minutes, plus the verification after the conservation wait
     #     (its store LIST per interrupted bucket, verify-custody, catalog
-    #     verify), which has not been measured at the 650-export scale: 18
-    #     minutes are left for it inside 240.
+    #     verify), which has not been measured at the 650-export scale and
+    #     reads about twice the objects on 8 shards as on 4: 17 minutes are
+    #     left for it inside 240.
     timeout-minutes: 240
     env:
       RUSTC_WRAPPER: sccache
@@ -290,6 +300,11 @@ jobs:
         env:
           CHAOS_TENANT_NAME: chaos-maintain-worker
           CHAOS_TENANT_TOKEN: chaos-token-maintain-worker
+          # 8 shards, the script's default, so each maintain worker almost
+          # always owns a metrics shard holding data (the script exits 3
+          # when the load leaves any of the 8 empty). The job's time budget
+          # above assumes 8.
+          CHAOS_SHARD_COUNT: "8"
         run: |
           code=0
           scripts/chaos/kill-maintain-worker.sh || code=$?
