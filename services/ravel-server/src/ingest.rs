@@ -304,9 +304,6 @@ pub async fn handle_export_releasing(
         ravel_types::Signal::Metrics,
         ravel_otlp::resource_attrs_dropped_from_rejections(&normalized.rejected),
     );
-    state
-        .normalize_metrics
-        .record_ipcrypt(ravel_types::Signal::Metrics, &normalized.ipcrypt_tally);
     normalized
         .rejected
         .retain(|r| !matches!(r, Rejection::ResourceAttributesDropped { .. }));
@@ -380,6 +377,14 @@ pub async fn handle_export_releasing(
         .map_err(classify)?;
     permit.release();
     let receipt = submitted.acks().await.map_err(classify)?;
+    // Counted only once the write is acknowledged, and only when the
+    // active-series cap dropped nothing: the tally is per request, not per
+    // series, so a partly admitted request counts nothing.
+    if series_cap_rejected == 0 {
+        state
+            .normalize_metrics
+            .record_ipcrypt(ravel_types::Signal::Metrics, &normalized.ipcrypt_tally);
+    }
 
     // Gate on whether anything was rejected at all, never on the unit count: a
     // zero-count rejection still has to reach the sender. The rule and the

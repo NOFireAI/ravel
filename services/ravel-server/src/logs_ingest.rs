@@ -436,9 +436,6 @@ pub async fn handle_export_logs_releasing(
         ravel_types::Signal::Logs,
         normalized.body_conversions,
     );
-    state
-        .normalize_metrics
-        .record_ipcrypt(ravel_types::Signal::Logs, &normalized.ipcrypt_tally);
     let mut records = normalized.records;
 
     // Layer 4 (ADR-0051 section 1): stream-creation-rate is a whole-request
@@ -502,6 +499,14 @@ pub async fn handle_export_logs_releasing(
         .map_err(classify)?;
     permit.release();
     let receipt = submitted.acks().await.map_err(classify)?;
+    // Counted only once the write is acknowledged, and only when the
+    // active-stream cap dropped nothing: the tally is per request, not per
+    // stream, so a partly admitted request counts nothing.
+    if stream_cap_rejected == 0 {
+        state
+            .normalize_metrics
+            .record_ipcrypt(ravel_types::Signal::Logs, &normalized.ipcrypt_tally);
+    }
 
     // Gate on whether anything was rejected at all, never on the unit count: a
     // zero-count rejection still has to reach the sender. The rule and the

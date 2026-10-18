@@ -476,9 +476,6 @@ async fn remote_write(
         }
     };
     let normalized = normalize_resolved(&tenant, resolved, &state.limits, &rules, now_ns);
-    state
-        .normalize_metrics
-        .record_ipcrypt(Signal::Metrics, &normalized.ipcrypt_tally);
     let mut points_dropped = compute_points_dropped(&normalized);
     let metadata_dropped = normalized.metadata_dropped as u64;
     let created_timestamps_dropped = normalized.created_timestamps_dropped as u64;
@@ -508,7 +505,8 @@ async fn remote_write(
         return admission_rejection_response(rejection);
     }
     let admission = state.admission.admit_series(&tenant, candidate_series, now);
-    if !admission.rejected.is_empty() {
+    let fully_admitted = admission.rejected.is_empty();
+    if !fully_admitted {
         let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();
         ingest_points.retain(|p| admitted.contains(&p.series_id));
         points_dropped += admission.rejected.len() as u64;
@@ -576,6 +574,14 @@ async fn remote_write(
             return write_error_response(err);
         }
     };
+    // Counted only once the write is acknowledged, and only when the
+    // active-series cap dropped nothing: the tally is per request, not per
+    // series, so a partly admitted request counts nothing.
+    if fully_admitted {
+        state
+            .normalize_metrics
+            .record_ipcrypt(Signal::Metrics, &normalized.ipcrypt_tally);
+    }
 
     state.metrics.record_request_accepted(
         points_accepted,

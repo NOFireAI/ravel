@@ -160,8 +160,10 @@ impl NormalizeRejectMetrics {
         row.resource_attrs_dropped = row.resource_attrs_dropped.saturating_add(count as u64);
     }
 
-    /// Adds one normalizer call's IPCrypt tally to `signal`'s rows. The tally
-    /// counts only values that call stores, so this is a stored-value count.
+    /// Adds one normalizer call's IPCrypt tally to `signal`'s rows. Callers
+    /// record only after the write is acknowledged, only for a batch the
+    /// admission layer admitted whole, and only the tally of what that write
+    /// carries (never that of discarded exemplars).
     pub fn record_ipcrypt(&self, signal: Signal, tally: &IpcryptTally) {
         if tally.is_empty() {
             return;

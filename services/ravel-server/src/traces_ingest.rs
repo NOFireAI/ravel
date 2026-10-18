@@ -292,10 +292,6 @@ pub async fn handle_export_traces_releasing(
         ravel_types::Signal::Spans,
         NormalizeRejectCounts::from_span_rejections(&normalized.rejected),
     );
-    state
-        .normalize_metrics
-        .record_ipcrypt(ravel_types::Signal::Spans, &normalized.ipcrypt_tally);
-
     // Spans this request actually writes, captured before `spans` is moved.
     let written_count = normalized.spans.len() as u64;
 
@@ -336,6 +332,10 @@ pub async fn handle_export_traces_releasing(
         .map_err(classify)?;
     permit.release();
     let receipt = submitted.acks().await.map_err(classify)?;
+    // Counted only once the write is acknowledged.
+    state
+        .normalize_metrics
+        .record_ipcrypt(ravel_types::Signal::Spans, &normalized.ipcrypt_tally);
 
     // Gate on whether anything was rejected at all, never on the unit count: a
     // zero-count rejection still has to reach the sender. The rule and the

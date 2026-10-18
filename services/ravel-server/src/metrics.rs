@@ -3102,7 +3102,7 @@ fn render_ipcrypt_values_family(
     write_header(
         out,
         NAME,
-        "IPCrypt-ruled attribute and label values, one per ruled value stored, by signal, variant and outcome: encrypted, or unparsed (not an address, so stored as sent). Counted at normalization, before admission and the write.",
+        "IPCrypt-ruled attribute and label values, one per ruled value stored, by signal, variant and outcome: encrypted, or unparsed (not an address, so stored as sent). Counted after the write is acknowledged; a batch the admission layer refuses in whole or in part counts nothing.",
         "counter",
     );
     for signal in IPCRYPT_SIGNALS {

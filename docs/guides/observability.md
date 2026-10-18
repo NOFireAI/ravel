@@ -2321,9 +2321,14 @@ describes the policy.
   parse as an address and was stored as sent.
 - Every combination renders from process start, zeros included.
 - It carries no `tenant_hash`. The counter is process-wide.
-- It is counted at normalization, before the series cap and the write, so
-  it is an upper bound on what was stored. A batch refused after
-  normalization still counts.
+- It is counted after the write is acknowledged. A batch refused after
+  normalization counts nothing: a series-creation-rate or stream-creation-rate
+  refusal, a failed write, and a batch the active-series or active-stream cap
+  admitted only in part. Exemplars that Remote Write and OTAP discard are not
+  counted.
+- One gap remains: an OTLP metrics exemplar that the ingest shard's
+  per-series exemplar cap drops at flush, after the acknowledgement, still
+  counts.
 - Alert on a nonzero `outcome="unparsed"` rate. It means a ruled key carries
   values that are not the addresses its rule assumed. The counter does not
   say which key; `signal` and `variant` narrow the search.

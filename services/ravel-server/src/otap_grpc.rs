@@ -28,7 +28,8 @@ use futures::Stream;
 use ravel_ingest::{
     IngestByteShed, IngestPoint, Submitted, WriteError, WriteMode, plausible_ingest_clock,
 };
-use ravel_otap::normalize::{normalize_prepared_with_metadata, prepare_batch};
+use ravel_ipcrypt::tally::IpcryptTally;
+use ravel_otap::normalize::{normalize_prepared_points_tally, prepare_batch};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
 use ravel_otap::stream::{DecodeError, DecodedBatch, StreamConfig, StreamError, StreamState};
@@ -38,6 +39,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use crate::ingest::{IngestRequestError, IngestState};
 use crate::ingest_mode::resolve_write_mode;
+use crate::normalize_reject_metrics::NormalizeRejectMetrics;
 use crate::otlp_grpc::metadata_to_headers;
 use crate::otlp_http::{GatewayState, now_ns};
 use crate::wire_byte_count::{WireByteCounter, wire_byte_counter};
@@ -438,7 +440,9 @@ async fn submit_batch<'a>(
     )
     .map_err(|IngestByteShed| IngestRequestError::Write(WriteError::BufferBudgetExceeded))?;
     let mut cap = ExemplarCap::new(ingest.limits.exemplar_cap_window_ns);
-    let (result, metadata) = normalize_prepared_with_metadata(
+    // The exemplars' IPCrypt tally is dropped with the exemplars: the counter
+    // counts stored values only.
+    let (result, _discarded_exemplar_tally, metadata) = normalize_prepared_points_tally(
         tenant,
         prepared,
         &ingest.limits,
@@ -464,9 +468,7 @@ async fn submit_batch<'a>(
         ravel_types::Signal::Metrics,
         ravel_otlp::resource_attrs_dropped_from_rejections(&normalized.rejected),
     );
-    ingest
-        .normalize_metrics
-        .record_ipcrypt(ravel_types::Signal::Metrics, &normalized.ipcrypt_tally);
+    let ipcrypt_tally = normalized.ipcrypt_tally;
     // Synchronous, no I/O, off the acknowledgement path: see the twin call in
     // `crate::ingest::handle_export`.
     if let Some(sink) = &ingest.metadata_sink {
@@ -509,6 +511,8 @@ async fn submit_batch<'a>(
     Ok(PendingBatch {
         submitted,
         dropped_points,
+        ipcrypt_tally,
+        normalize_metrics: &ingest.normalize_metrics,
     })
 }
 
@@ -516,6 +520,11 @@ async fn submit_batch<'a>(
 struct PendingBatch<'a> {
     submitted: Submitted<'a>,
     dropped_points: usize,
+    /// The batch's IPCrypt tally, recorded once the write is acknowledged
+    /// and only when the active-series cap dropped nothing: the tally is per
+    /// batch, not per series, so a partly dropped batch counts nothing.
+    ipcrypt_tally: IpcryptTally,
+    normalize_metrics: &'a NormalizeRejectMetrics,
 }
 
 impl PendingBatch<'_> {
@@ -535,6 +544,10 @@ impl PendingBatch<'_> {
             }
             IngestRequestError::Write(err)
         })?;
+        if self.dropped_points == 0 {
+            self.normalize_metrics
+                .record_ipcrypt(ravel_types::Signal::Metrics, &self.ipcrypt_tally);
+        }
         Ok(WriteOutcome {
             tokens: receipt.tokens,
             dropped_points: self.dropped_points,
