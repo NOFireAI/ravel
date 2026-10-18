@@ -9,10 +9,11 @@
 //! the listener's resolver over a real socket, and that they are mounted where
 //! the alert evaluator runs (`all`/`query`) rather than in every mode.
 //!
-//! The server's own evaluator loop never ticks here ([`EVAL_INTERVAL`]). Each
-//! tick is driven by an `AlertEvaluator` the test builds over the server's
-//! store and points at the server's handle, on a frozen clock, so what the
-//! routes serve is exactly what that one tick observed.
+//! Outside one paused-time test that lets the server's own evaluator loop tick
+//! on a short interval, that loop never ticks here ([`EVAL_INTERVAL`]). Each
+//! other tick is driven by an `AlertEvaluator` the test builds over the
+//! server's store and points at the server's handle, on a frozen clock, so
+//! what the routes serve is exactly what that one tick observed.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -586,6 +587,73 @@ async fn rules_route_is_served_on_the_http_listener() {
     assert_eq!(
         body,
         json!({"status": "error", "errorType": "unavailable", "error": NOT_YET_EVALUATED})
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// One acme rule that fires on its first tick, with no ingested data.
+const FIRING_RULE: &str = r#"{
+  "rules": [
+    {
+      "tenant": "acme",
+      "rule_id": "fires",
+      "promql": "vector(2)",
+      "condition": {"type": "threshold", "op": "gt", "value": 1},
+      "labels": {"severity": "page"},
+      "annotations": {"summary": "fires on the first tick"}
+    }
+  ]
+}"#;
+
+/// The evaluator `ravel_server::start` spawns publishes into the handle the
+/// routes read: once its own loop has ticked, `/api/v1/alerts` serves the
+/// alert that tick fired. Time is paused, so the short interval elapses on
+/// tokio's clock with no real sleep. The tick reads the system clock, so
+/// `activeAt` is checked for shape only.
+#[tokio::test(start_paused = true)]
+async fn the_servers_own_evaluator_publishes_what_the_alerts_route_serves() {
+    let interval = Duration::from_secs(60);
+    let config = AlertEvalConfig {
+        interval,
+        ..alerting_config(FIRING_RULE, true)
+    };
+    let (running, _store) = start_test_server(Mode::All, config).await;
+    let base = format!("http://{}", running.http_addr);
+
+    let mut intervals = 0;
+    let mut body = loop {
+        let (status, body) = get(&base, "/api/v1/alerts", Some(ACME_TOKEN)).await;
+        if status == 200 {
+            break body;
+        }
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error"], NOT_YET_EVALUATED);
+        assert!(
+            intervals < 5,
+            "the server's evaluator published nothing the route reads after {intervals} intervals"
+        );
+        tokio::time::sleep(interval).await;
+        intervals += 1;
+    };
+
+    let alert = &mut body["data"]["alerts"][0];
+    assert!(alert["activeAt"].is_string(), "{alert}");
+    alert
+        .as_object_mut()
+        .expect("alert object")
+        .remove("activeAt");
+    assert_eq!(
+        body,
+        json!({
+            "status": "success",
+            "data": {"alerts": [{
+                "labels": {"alertname": "fires", "severity": "page"},
+                "annotations": {"summary": "fires on the first tick"},
+                "state": "firing",
+                "value": "2"
+            }]}
+        })
     );
 
     running.shutdown().await.expect("graceful shutdown");

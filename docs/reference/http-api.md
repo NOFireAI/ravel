@@ -452,8 +452,8 @@ is the evaluation interval (`--alert-eval-interval-secs`) in seconds.
 Each rule carries `type` (always `alerting`), `name` (the `rule_id`), `query`,
 `duration` (the `for` delay in seconds, `0` when unset), `labels`,
 `annotations`, `health`, and `state`. After a tick it also carries
-`lastEvaluation` and an `alerts` array, and `lastError` when `health` is
-`err`.
+`lastEvaluation` when `health` is `ok` or `err`, `lastError` when `health` is
+`err`, and an `alerts` array when the tick read the tenant's alert history.
 
 `query` is the rule's whole firing expression:
 
@@ -472,10 +472,15 @@ the tenant:
 - `state` is `firing` when any of the rule's alerts is firing, else
   `pending` when any is pending, else `inactive`. The `alerts` array lists
   those alerts in the `/api/v1/alerts` shape.
-- Before a tick of this process has read the tenant's alert history, and in
-  a process that runs no evaluator, `health` and `state` are `unknown` and
-  there is no `alerts` array. On a replica whose peer held the tenant's
-  lease on the last tick, `health` is `unknown`.
+- When the last tick could not read the tenant's alert history, the first
+  tick included, `state` is `unknown` and there is no `alerts` array, while
+  `health` is `err` with that error.
+- Before this process has finished a tick for the tenant, and in a process
+  that runs no evaluator, `health` and `state` are both `unknown`, with no
+  `lastEvaluation` and no `alerts` array.
+- On a replica whose peer held the tenant's lease on the last tick, `health`
+  is `unknown` with no `lastEvaluation`, and `state` and `alerts` come from
+  the alert history that tick read.
 - `unknown` is Prometheus's own value for `health`. For `state`, `unknown` is
   outside Prometheus's three values (`inactive`, `pending`, `firing`).
   `inactive` asserts that a rule is not firing, and nothing has checked.
@@ -484,18 +489,29 @@ the tenant:
 alerts as of the last tick, in the shape that Prometheus's alerts API uses.
 Suppressed and resolved alerts are not listed. Each alert carries `labels`
 (with `alertname` set as the Alertmanager sink sets it), `annotations`,
-`state`, `activeAt` (the transition into the current state, RFC 3339), and
-`value` (a string, omitted when this process has not run the alert's query
-while it was active).
+`state`, `activeAt` and `value`.
+
+- `activeAt` is the transition into the current state, in RFC 3339. For a
+  firing alert that was pending first, it is when the alert fired, where
+  Prometheus keeps the time it went pending.
+- `value` is a string: the sample the alert's series matched with on the
+  last tick, or for a SQL detection rule the number of rows its statement
+  returned. It is present only when this process held the tenant's lease on
+  that tick and ran the alert's rule without error.
+
+Status codes:
 
 - 200 with the tenant's alerts. A tenant with no loaded rules gets
   `{"status": "success", "data": {"alerts": []}}`, never the alerts of
-  another tenant.
+  another tenant, from a process where some tenant has rules and an
+  evaluator runs. In any other process it gets the 503 below.
 - 401 for a credential that does not resolve.
 - 503 with `errorType` `unavailable` when this process runs no evaluator
-  (evaluation disabled, or no tenant has rules), and before a tick of this
-  process has read the tenant's alert history. An empty list would assert
-  that nothing is firing.
+  (evaluation disabled, or no tenant has rules), before this process has
+  finished a tick for the tenant, and whenever the last tick could not read
+  the tenant's alert history, until a later tick reads it. An empty list
+  would assert that nothing is firing, and an earlier tick's list may no
+  longer be current.
 
 ## Health and metrics routes
 

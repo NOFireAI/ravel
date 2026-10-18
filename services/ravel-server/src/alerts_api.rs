@@ -31,9 +31,12 @@
 //! When no evaluator runs in this process (alerting disabled, or no tenant
 //! has rules), `/api/v1/alerts` answers 503 with `errorType` `unavailable`
 //! rather than an empty list, which would assert that nothing is firing. A
-//! tenant with rules whose evaluator has not yet read alert history gets the
-//! same 503. A tenant with no rules in a process that evaluates gets an empty
-//! list: it has no alerts to raise.
+//! tenant with rules gets the same 503 before its evaluator has finished a
+//! tick ([`NOT_YET_EVALUATED`]), and whenever its last tick could not read
+//! alert history ([`HISTORY_UNREADABLE`]): an earlier tick's list is not
+//! served in place of the one that tick could not read. A tenant with no
+//! rules gets an empty list, but only from a process where some tenant has
+//! rules and an evaluator runs; otherwise it gets the first 503.
 //!
 //! # Groups
 //!
@@ -50,19 +53,23 @@
 //! A rule's `health` is `ok` when the last tick ran its query and wrote its
 //! transitions, and `err`, with `lastError`, when its query, condition or
 //! write failed or the tick could not read history or take the tenant's
-//! lease. `lastEvaluation` is that tick's clock reading. A replica whose peer
-//! held the lease on the last tick did not evaluate, and reports
-//! [`HEALTH_UNKNOWN`].
+//! lease. `lastEvaluation` is that tick's clock reading, present whenever
+//! `health` is `ok` or `err`. A replica whose peer held the lease on the last
+//! tick did not evaluate, and reports [`HEALTH_UNKNOWN`] with no
+//! `lastEvaluation`.
 //!
 //! A rule's `state` is `firing` when any of its alerts is firing, else
 //! `pending` when any is pending, else `inactive`, read from the tenant's
 //! folded alert history as of the last tick; its `alerts` array lists them.
-//! Before a tick of this process has read that history, or when no evaluator
-//! runs here, `health` and `state` are [`HEALTH_UNKNOWN`] and
-//! [`STATE_UNKNOWN`] and `alerts` is omitted. `unknown` is Prometheus's own
-//! value for an unevaluated rule's health. For `state` it is a Ravel value
-//! outside Prometheus's three, chosen over reporting `inactive`, which would
-//! assert that a rule is not firing when nothing has looked.
+//! When the last tick could not read that history, `state` is
+//! [`STATE_UNKNOWN`] and `alerts` is omitted, while `health` is `err` as
+//! above. Before the tenant's evaluator in this process has finished a tick,
+//! or when no evaluator runs here, `health` and `state` are both
+//! [`HEALTH_UNKNOWN`] and [`STATE_UNKNOWN`], with no `lastEvaluation` and no
+//! `alerts`. `unknown` is Prometheus's own value for an unevaluated rule's
+//! health. For `state` it is a Ravel value outside Prometheus's three, chosen
+//! over reporting `inactive`, which would assert that a rule is not firing
+//! when nothing has looked.
 //!
 //! # Alerts
 //!
@@ -71,9 +78,12 @@
 //! or `firing`), `activeAt` and `value`. Suppressed and resolved alerts are
 //! not listed. `activeAt` is the time of the transition into the alert's
 //! current state, so a firing alert that was pending first reports when it
-//! fired, not when it went pending. `value` is the sample the alert's series
-//! matched with on the last tick whose query produced one, and is omitted
-//! when this process has not run that query while the alert was active.
+//! fired, not when it went pending, where Prometheus keeps the time it went
+//! pending. `value` is the sample the alert's series matched with on the last
+//! tick, or the row count for a SQL rule. It is present only when this
+//! process held the tenant's lease on that tick and evaluated the alert's
+//! rule without error; a replica that did not evaluate the rule omits it
+//! rather than serving a value from an earlier tick.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,10 +127,16 @@ pub const STATE_UNKNOWN: &str = "unknown";
 /// this process.
 pub const NOT_EVALUATING: &str = "alert evaluation is not running in this process";
 
-/// The `error` of the 503 `/api/v1/alerts` answers before this process has
-/// read the tenant's alert history.
+/// The `error` of the 503 `/api/v1/alerts` answers before the tenant's
+/// evaluator in this process has finished a tick.
 pub const NOT_YET_EVALUATED: &str =
     "no alert evaluation tick in this process has read this tenant's alert history yet";
+
+/// The `error` of the 503 `/api/v1/alerts` answers when the tenant's last
+/// tick in this process could not read its alert history, until a tick reads
+/// it again.
+pub const HISTORY_UNREADABLE: &str =
+    "the last alert evaluation tick in this process could not read this tenant's alert history";
 
 /// Shared state for both routes: the loaded rule set, the published alert
 /// state, and the listener's tenant resolver.
@@ -179,7 +195,7 @@ async fn handle_alerts(State(state): State<AlertRulesState>, headers: HeaderMap)
         PublishedRead::NotYetEvaluated => return unavailable(NOT_YET_EVALUATED),
         PublishedRead::NoRules => Vec::new(),
         PublishedRead::Published(snapshot) => match &snapshot.alerts {
-            None => return unavailable(NOT_YET_EVALUATED),
+            None => return unavailable(HISTORY_UNREADABLE),
             Some(alerts) => {
                 let rules = state.rules.get(&tenant).map_or(&[][..], Vec::as_slice);
                 alerts

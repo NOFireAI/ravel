@@ -215,7 +215,8 @@ counterpart in Ravel to measure:
 - `keep_firing_for:`;
 - rule-group evaluation order, interval and staleness between groups;
 - `ALERTS` / `ALERTS_FOR_STATE` synthetic series;
-- `/api/v1/alerts`, which does not exist; and recording rules on
+- `/api/v1/alerts`, which does not exist (since #2665 it is served, from the
+  alert evaluator's in-process state); and recording rules on
   `/api/v1/rules`, which serves alerting rules only.
 
 A corpus entry that needs any of those is not written, rather than written and
