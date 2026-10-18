@@ -152,6 +152,11 @@ pub struct NormalizeOutput {
     pub points: Vec<NormalizedPoint>,
     pub histogram_points: Vec<NormalizedHistogramPoint>,
     pub rejected: Vec<Rejection>,
+    /// Per-(variant, outcome) counts of every value a rule in the caller's
+    /// `TenantRules` matched during this call (ADR-2993 decision 3), point
+    /// and exemplar labels alike. Empty when the rule set is empty or matched
+    /// nothing.
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// One exemplar admitted through the per-series cap (ADR-0047 decisions 1
@@ -178,10 +183,6 @@ pub struct NormalizedExemplar {
 pub struct MetricsNormalizeResult {
     pub output: NormalizeOutput,
     pub exemplars: Vec<NormalizedExemplar>,
-    /// Per-(variant, outcome) counts of every value a rule in the caller's
-    /// `TenantRules` matched during this call (ADR-2993 decision 3). Empty
-    /// when the rule set is empty or matched nothing.
-    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Decode and normalize gauge and sum data points from `req`, discarding any
@@ -407,9 +408,9 @@ fn normalize_impl(
             points,
             histogram_points,
             rejected,
+            ipcrypt_tally: tally,
         },
         exemplars,
-        ipcrypt_tally: tally,
     }
 }
 
@@ -437,9 +438,9 @@ fn whole_request_rejection(
             points: Vec::new(),
             histogram_points: Vec::new(),
             rejected,
+            ipcrypt_tally: IpcryptTally::new(),
         },
         exemplars: Vec::new(),
-        ipcrypt_tally: IpcryptTally::new(),
     }
 }
 

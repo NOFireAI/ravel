@@ -627,6 +627,7 @@ async fn loaded_spans_match_normalize_traces_field_for_field() {
     let out = normalize_traces(
         fixture_request(&fixtures),
         &SpanIngestLimits::default(),
+        &ravel_ipcrypt::rules::TenantRules::none(),
         load_ns,
     );
     assert!(

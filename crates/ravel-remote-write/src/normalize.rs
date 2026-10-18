@@ -266,6 +266,11 @@ pub struct RwNormalizeOutput {
     /// `Sample.start_timestamp` and `Histogram.start_timestamp` populate
     /// [`ResolvedRequest::created_timestamps_count`], which this mirrors.
     pub created_timestamps_dropped: usize,
+    /// Per-(variant, outcome) counts of every value a rule in the caller's
+    /// `TenantRules` matched during this call (ADR-2993 decision 3), sample
+    /// and exemplar labels alike. Empty when the rule set is empty or matched
+    /// nothing.
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Result of normalizing one resolved Remote Write request, including the
@@ -284,10 +289,6 @@ pub struct RwNormalizeOutput {
 pub struct RwMetricsNormalizeResult {
     pub output: RwNormalizeOutput,
     pub exemplars: Vec<NormalizedExemplar>,
-    /// Per-(variant, outcome) counts of every value a rule in the caller's
-    /// `TenantRules` matched during this call (ADR-2993 decision 3). Empty
-    /// when the rule set is empty or matched nothing.
-    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Normalize a resolved Remote Write request into Ravel canonical points,
@@ -381,9 +382,9 @@ pub fn normalize_with_exemplars(
                 exemplars_dropped,
                 metadata_dropped: resolved.metadata.len(),
                 created_timestamps_dropped: resolved.created_timestamps_count,
+                ipcrypt_tally: IpcryptTally::new(),
             },
             exemplars: Vec::new(),
-            ipcrypt_tally: IpcryptTally::new(),
         };
     }
 
@@ -425,9 +426,9 @@ pub fn normalize_with_exemplars(
             exemplars_dropped,
             metadata_dropped: resolved.metadata.len(),
             created_timestamps_dropped: resolved.created_timestamps_count,
+            ipcrypt_tally: tally,
         },
         exemplars,
-        ipcrypt_tally: tally,
     }
 }
 

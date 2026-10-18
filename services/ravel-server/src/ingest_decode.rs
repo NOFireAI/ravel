@@ -1097,8 +1097,13 @@ mod tests {
             "the inflate charge is still held after decode"
         );
 
-        let normalized =
-            normalize_resolved(&tenant, resolved, &IngestLimits::default(), FIXTURE_NOW_NS);
+        let normalized = normalize_resolved(
+            &tenant,
+            resolved,
+            &IngestLimits::default(),
+            &ravel_ipcrypt::rules::TenantRules::none(),
+            FIXTURE_NOW_NS,
+        );
         assert!(
             !normalized.points.is_empty(),
             "the fixture normalizes to real points, so normalization did run"

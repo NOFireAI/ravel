@@ -1247,9 +1247,9 @@ fn normalize_impl(
                 // return above).
                 histogram_points: Vec::new(),
                 rejected,
+                ipcrypt_tally: tally,
             },
             exemplars,
-            ipcrypt_tally: tally,
         },
         metadata,
     )
@@ -2133,9 +2133,9 @@ fn whole_request_rejection(
                 points: Vec::new(),
                 histogram_points: Vec::new(),
                 rejected,
+                ipcrypt_tally: IpcryptTally::new(),
             },
             exemplars: Vec::new(),
-            ipcrypt_tally: IpcryptTally::new(),
         },
         Vec::new(),
     )
