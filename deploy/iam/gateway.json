@@ -19,7 +19,7 @@
       "Resource": "arn:aws:s3:::my-ravel-bucket",
       "Condition": {
         "StringEquals": {
-          "s3:prefix": ["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth"]
+          "s3:prefix": ["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth", "sys/ipcrypt/policy"]
         }
       }
     },
@@ -49,6 +49,7 @@
         "arn:aws:s3:::my-ravel-bucket/sys/qualification",
         "arn:aws:s3:::my-ravel-bucket/sys/gc",
         "arn:aws:s3:::my-ravel-bucket/sys/auth",
+        "arn:aws:s3:::my-ravel-bucket/sys/ipcrypt/policy",
         "arn:aws:s3:::my-ravel-bucket/t/*/config",
         "arn:aws:s3:::my-ravel-bucket/t/*/enc",
         "arn:aws:s3:::my-ravel-bucket/t/*/m/meta"
@@ -80,6 +81,17 @@
         "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/l/prov",
         "arn:aws:s3:::my-ravel-bucket/t/????????????????????????????????/s/prov"
       ],
+      "Condition": {
+        "StringEquals": {
+          "s3:if-none-match": "*"
+        }
+      }
+    },
+    {
+      "Sid": "GatewayIpcryptMarkerCreate",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::my-ravel-bucket/sys/ipcrypt/policy",
       "Condition": {
         "StringEquals": {
           "s3:if-none-match": "*"
