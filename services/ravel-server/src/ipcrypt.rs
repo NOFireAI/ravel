@@ -214,13 +214,15 @@ fn rule_key_of(err: &ResolveError) -> String {
 /// empty policy writes nothing; no marker and a non-empty policy creates it.
 /// A mismatch or any failure to read the marker refuses to start: a read
 /// failure is never taken for an absent marker. `query` and `maintain` store
-/// nothing a policy governs and do not read the marker (`Ok(None)`).
+/// nothing a policy governs and do not read the marker (`Ok(None)`). The
+/// modes that read it are the ones that build the ingest routers,
+/// [`Mode::holds_ingest_buffer`].
 pub async fn check_startup_marker(
     store: &dyn ObjectStoreBackend,
     mode: Mode,
     policy: &IpcryptPolicy,
 ) -> anyhow::Result<Option<CheckOutcome>> {
-    if !matches!(mode, Mode::All | Mode::Gateway) {
+    if !mode.holds_ingest_buffer() {
         return Ok(None);
     }
     let local = hex::encode(policy.fingerprint());
