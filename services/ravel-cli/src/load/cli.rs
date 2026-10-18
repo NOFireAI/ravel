@@ -417,7 +417,7 @@ pub(crate) async fn run_fold_warning_to(
 
     // Every load reads the marker, with or without --ipcrypt-config, before
     // its first write; the tenant's rules are built once for the whole run.
-    let _rules = ipcrypt
+    let rules = ipcrypt
         .checked_rules(store.as_ref(), tenant, "load", warnings)
         .await?;
 
@@ -440,6 +440,7 @@ pub(crate) async fn run_fold_warning_to(
                 load_memory,
                 now_ns,
                 Arc::clone(&clock),
+                rules,
                 warnings,
             )
             .await;
@@ -462,6 +463,7 @@ pub(crate) async fn run_fold_warning_to(
                 load_memory,
                 now_ns,
                 Arc::clone(&clock),
+                rules,
                 warnings,
             )
             .await;
@@ -499,6 +501,7 @@ pub(crate) async fn run_fold_warning_to(
             zstd_level,
             Some(memory_options),
             fold_after_load,
+            rules,
         )
     })
     .await;
@@ -637,6 +640,7 @@ async fn run_metrics(
     load_memory: LoadMemoryRequest,
     now_ns: i64,
     clock: Arc<dyn Clock>,
+    rules: Arc<TenantRules>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -665,6 +669,7 @@ async fn run_metrics(
             max_flush_delay,
             now_ns,
             clock,
+            rules,
         )
     })
     .await;
@@ -729,6 +734,7 @@ async fn run_spans(
     load_memory: LoadMemoryRequest,
     now_ns: i64,
     clock: Arc<dyn Clock>,
+    rules: Arc<TenantRules>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -763,6 +769,7 @@ async fn run_spans(
             max_flush_delay,
             now_ns,
             clock,
+            rules,
         )
     })
     .await;

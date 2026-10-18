@@ -417,6 +417,7 @@ pub(super) fn row_records(batch: &RecordBatch, mapping: &Mapping) -> Vec<Normali
                 &cols,
                 mapping,
                 &LogIngestLimits::default(),
+                &TenantRules::none(),
                 NOW_NS,
                 r,
             )
@@ -510,7 +511,13 @@ pub(super) fn columnar_object(batch: ColumnarLogBatch) -> Vec<u8> {
 
 pub(super) fn build_columnar_or_panic(batch: &RecordBatch, mapping: &Mapping) -> ColumnarLogBatch {
     let spans = vec![(batch.clone(), 0u64)];
-    match build_columnar_batch(&spans, mapping, &LogIngestLimits::default(), NOW_NS) {
+    match build_columnar_batch(
+        &spans,
+        mapping,
+        &LogIngestLimits::default(),
+        &TenantRules::none(),
+        NOW_NS,
+    ) {
         Ok(b) => b,
         Err(ColBuildError::Batch(reason)) => panic!("columnar batch failed: {reason}"),
         Err(ColBuildError::Row { row, reason }) => {

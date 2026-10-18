@@ -36,6 +36,7 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use ravel_catalog::{AbsentPolicy, validate_or_adopt};
+use ravel_ipcrypt::rules::TenantRules;
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
