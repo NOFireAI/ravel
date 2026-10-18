@@ -99,8 +99,10 @@ use ravel_query::http::TenantResolver;
 use ravel_types::TenantHash;
 use serde_json::{Map, Value, json};
 
+use crate::alert_sink::alertmanager_label_set;
 use crate::alerting::{
-    PublishedAlert, PublishedAlerts, PublishedRead, RuleHealth, TenantAlertSnapshot,
+    PublishedAlert, PublishedAlerts, PublishedRead, RuleHealth, STALE_AFTER_INTERVALS,
+    TenantAlertSnapshot,
 };
 
 /// The rules route. Named here so the wiring, the tests, and the reference
@@ -138,6 +140,13 @@ pub const NOT_YET_EVALUATED: &str =
 pub const HISTORY_UNREADABLE: &str =
     "the last alert evaluation tick in this process could not read this tenant's alert history";
 
+/// The start of the `error` of the 503 `/api/v1/alerts` answers when the
+/// tenant's last snapshot is older than [`STALE_AFTER_INTERVALS`] evaluation
+/// intervals, until its evaluator publishes again. The rest of the message
+/// names the snapshot's age and the bound.
+pub const SNAPSHOT_STALE: &str =
+    "this tenant's alert evaluator in this process has stopped publishing its state";
+
 /// Shared state for both routes: the loaded rule set, the published alert
 /// state, and the listener's tenant resolver.
 #[derive(Clone)]
@@ -173,9 +182,10 @@ async fn handle_rules(State(state): State<AlertRulesState>, headers: HeaderMap) 
     };
     let snapshot = match state.published.read(&tenant) {
         PublishedRead::Published(snapshot) => Some(snapshot),
-        PublishedRead::NotEvaluating | PublishedRead::NoRules | PublishedRead::NotYetEvaluated => {
-            None
-        }
+        PublishedRead::NotEvaluating
+        | PublishedRead::NoRules
+        | PublishedRead::NotYetEvaluated
+        | PublishedRead::Stale { .. } => None,
     };
     let rules = state.rules.get(&tenant);
     axum::Json(json!({
@@ -193,6 +203,7 @@ async fn handle_alerts(State(state): State<AlertRulesState>, headers: HeaderMap)
     let alerts = match state.published.read(&tenant) {
         PublishedRead::NotEvaluating => return unavailable(NOT_EVALUATING),
         PublishedRead::NotYetEvaluated => return unavailable(NOT_YET_EVALUATED),
+        PublishedRead::Stale { age, bound } => return unavailable(&snapshot_stale(age, bound)),
         PublishedRead::NoRules => Vec::new(),
         PublishedRead::Published(snapshot) => match &snapshot.alerts {
             None => return unavailable(HISTORY_UNREADABLE),
@@ -234,8 +245,19 @@ fn unauthorized(err: &dyn std::fmt::Display, route: &'static str) -> Response {
         .into_response()
 }
 
+/// The `error` of a [`PublishedRead::Stale`] snapshot: [`SNAPSHOT_STALE`],
+/// then the snapshot's age and the bound it exceeds.
+fn snapshot_stale(age: Duration, bound: Duration) -> String {
+    format!(
+        "{SNAPSHOT_STALE}: the last snapshot is {} old, over {STALE_AFTER_INTERVALS} \
+         evaluation intervals ({})",
+        humantime::format_duration(age),
+        humantime::format_duration(bound),
+    )
+}
+
 /// The 503 `/api/v1/alerts` answers when it has no published state to serve.
-fn unavailable(error: &'static str) -> Response {
+fn unavailable(error: &str) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
         axum::Json(json!({
@@ -341,36 +363,10 @@ fn rule_labels<'a>(rules: &'a [Rule], rule_id: &str) -> &'a [(String, String)] {
         .map_or(&[][..], |rule| rule.labels.as_slice())
 }
 
-/// One alert in the Prometheus alerts-API shape.
-///
-/// `alertname` follows [`crate::alert_sink::alertmanager_payload`]: the rule's
-/// own `alertname` label when it has one, else the rule id, with a series
-/// label of that name moved to the first free `exported_alertname`,
-/// `exported_exported_alertname`, ... name.
+/// One alert in the Prometheus alerts-API shape, with the label set the
+/// Alertmanager sink sends ([`alertmanager_label_set`]).
 fn render_alert(alert: &PublishedAlert, rule_labels: &[(String, String)]) -> Value {
-    let rule_alertname = rule_labels
-        .iter()
-        .find(|(name, _)| name == "alertname")
-        .map(|(_, value)| value.clone());
-    let mut labels: Map<String, Value> = alert
-        .labels
-        .iter()
-        .map(|(name, value)| (name.clone(), Value::String(value.clone())))
-        .collect();
-    if rule_alertname.is_none()
-        && let Some(series_alertname) = labels.remove("alertname")
-    {
-        let mut exported = "exported_alertname".to_string();
-        while labels.contains_key(&exported) {
-            exported.insert_str(0, "exported_");
-        }
-        labels.insert(exported, series_alertname);
-    }
-    labels.insert(
-        "alertname".to_string(),
-        Value::String(rule_alertname.unwrap_or_else(|| alert.rule_id.clone())),
-    );
-
+    let labels = alertmanager_label_set(&alert.labels, &alert.rule_id, rule_labels);
     let mut out = Map::new();
     out.insert("labels".into(), Value::Object(labels));
     out.insert("annotations".into(), pairs_to_object(&alert.annotations));
