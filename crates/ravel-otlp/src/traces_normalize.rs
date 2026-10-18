@@ -49,15 +49,21 @@
 //! (ADR-2993 decision 3), matched by the raw attribute key as sent, same
 //! convention as [`crate::logs_normalize`]. A matching resource, scope, or
 //! span attribute is encrypted in [`convert_attr`] before the value-length
-//! check; spans have no stream identity, so there is no identity computation
-//! for it to precede. A tenant with no matching rule, or
-//! [`TenantRules::none()`], leaves every value unchanged.
+//! check; a matching string-valued event or link attribute is encrypted in
+//! [`with_encrypted_attrs`] before its blob is encoded and its length checked.
+//! Spans have no stream identity, so there is no identity computation for
+//! either to precede. The rule set is a required argument with no default;
+//! a tenant with no matching rule, or [`TenantRules::none()`], leaves every
+//! value unchanged.
+
+use std::borrow::Cow;
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
+use ravel_ipcrypt::render::RenderOutcome;
 use ravel_ipcrypt::rules::TenantRules;
 use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_rspan::{StatusCode, merge_attrs};
@@ -432,7 +438,7 @@ fn normalize_span(
     // RSPAN objects are immutable, so the provenance is unrecoverable once
     // stored. Strip unconditionally before applying the real reserved values.
     merged.retain(|(k, _)| !is_reserved_key(k));
-    let reserved = reserved_attrs(span, limits, &mut dropped);
+    let reserved = reserved_attrs(span, limits, rules, tally, &mut dropped);
     // Reserved keys are applied as the highest-precedence set, so a sender's
     // own `_kind` cannot shadow the span's real kind.
     let attrs = if reserved.is_empty() {
@@ -459,10 +465,13 @@ fn normalize_span(
 
 /// The attributes carrying span fields RSPAN v1 has no column for (see the
 /// module docs). Only non-default values are stored, so an ordinary span pays
-/// nothing for fields it never set.
+/// nothing for fields it never set. Event and link attributes are encrypted
+/// under `rules` before their blob is encoded and its length checked.
 fn reserved_attrs(
     span: &Span,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     dropped: &mut Vec<SpanRejection>,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -476,7 +485,8 @@ fn reserved_attrs(
         out.push((ATTR_SPAN_FLAGS.to_string(), span.flags.to_string()));
     }
     if !span.events.is_empty() {
-        match encode_blob(&span.events, limits.max_raw_blob_len) {
+        let events = with_encrypted_attrs(&span.events, rules, tally, |e| &mut e.attributes);
+        match encode_blob(&events, limits.max_raw_blob_len) {
             Ok(hex) => out.push((ATTR_EVENTS_RAW.to_string(), hex)),
             Err(len) => dropped.push(SpanRejection::EventsBlobTooLong {
                 len,
@@ -485,7 +495,8 @@ fn reserved_attrs(
         }
     }
     if !span.links.is_empty() {
-        match encode_blob(&span.links, limits.max_raw_blob_len) {
+        let links = with_encrypted_attrs(&span.links, rules, tally, |l| &mut l.attributes);
+        match encode_blob(&links, limits.max_raw_blob_len) {
             Ok(hex) => out.push((ATTR_LINKS_RAW.to_string(), hex)),
             Err(len) => dropped.push(SpanRejection::LinksBlobTooLong {
                 len,
@@ -494,6 +505,44 @@ fn reserved_attrs(
         }
     }
     out
+}
+
+/// `items` with every attribute `rules` matches by raw key encrypted, borrowed
+/// unchanged when the rule set is empty. Event and link attributes stay
+/// `AnyValue`s inside the blob, so only a non-empty string value is
+/// encrypted; any other value under a rule is left unchanged and counted as
+/// [`RenderOutcome::Unparsed`], as the logs path does.
+fn with_encrypted_attrs<'a, T: Clone>(
+    items: &'a [T],
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    attributes: fn(&mut T) -> &mut Vec<KeyValue>,
+) -> Cow<'a, [T]> {
+    if rules.is_empty() {
+        return Cow::Borrowed(items);
+    }
+    let mut owned = items.to_vec();
+    for item in &mut owned {
+        for kv in attributes(item).iter_mut() {
+            let Some(info) = rules.lookup_raw(&kv.key) else {
+                continue;
+            };
+            match kv.value.as_mut().and_then(|v| v.value.as_mut()) {
+                None => {}
+                Some(AnyValueVariant::StringValue(s)) => {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if let Some((rendered, outcome)) = rules.apply(info.raw_key, s) {
+                        tally.record(info.variant, outcome);
+                        *s = rendered;
+                    }
+                }
+                Some(_) => tally.record(info.variant, RenderOutcome::Unparsed),
+            }
+        }
+    }
+    Cow::Owned(owned)
 }
 
 /// Serialize `items` as concatenated length-delimited protobuf messages and

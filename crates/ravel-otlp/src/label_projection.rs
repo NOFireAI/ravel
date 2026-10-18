@@ -60,6 +60,12 @@ use crate::traces_normalize::{
 /// must be the same key the normalizer matches a rule against: sanitized
 /// label name for metrics ([`TenantRules::lookup_label`]), raw attribute key
 /// for logs and traces ([`TenantRules::lookup_raw`]).
+///
+/// A matched value is charged at `max(47, raw)` whether or not it parses as
+/// an address, and an unparsed value is stored unchanged at `raw`, so this
+/// over-counts. That is the intended direction: the projection is an upper
+/// bound checked before anything is built, and under-counting would admit a
+/// request whose stored bytes exceed the bound.
 fn charged_len(matched: bool, raw_len: usize) -> usize {
     if matched {
         TenantRules::max_stored_len(raw_len)
@@ -761,7 +767,7 @@ pub fn project_span_resolved_label_bytes(
                 total = total
                     .saturating_add(inherited)
                     .saturating_add(span_attrs_bytes(&span.attributes, rules))
-                    .saturating_add(reserved_attrs_bytes(span, limits));
+                    .saturating_add(reserved_attrs_bytes(span, limits, rules));
             }
         }
     }
@@ -809,6 +815,7 @@ fn span_value_len(value: Option<&AnyValue>) -> usize {
 fn reserved_attrs_bytes(
     span: &opentelemetry_proto::tonic::trace::v1::Span,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
 ) -> usize {
     let mut total = 0usize;
     if span.kind != 0 {
@@ -826,28 +833,84 @@ fn reserved_attrs_bytes(
         total = total.saturating_add(label_bytes(ATTR_SPAN_FLAGS.len(), display_len(span.flags)));
     }
     if !span.events.is_empty() {
-        total = total.saturating_add(blob_bytes(ATTR_EVENTS_RAW, &span.events, limits));
+        total = total.saturating_add(blob_bytes(
+            ATTR_EVENTS_RAW,
+            &span.events,
+            limits,
+            rules,
+            |e| &mut e.attributes,
+        ));
     }
     if !span.links.is_empty() {
-        total = total.saturating_add(blob_bytes(ATTR_LINKS_RAW, &span.links, limits));
+        total = total.saturating_add(blob_bytes(
+            ATTR_LINKS_RAW,
+            &span.links,
+            limits,
+            rules,
+            |l| &mut l.attributes,
+        ));
     }
     total
 }
 
-/// The hex blob `encode_blob` would store for `items`, or nothing when its
-/// raw length is over `max_raw_blob_len` and the blob is dropped.
-fn blob_bytes<T: Message>(key: &str, items: &[T], limits: &SpanIngestLimits) -> usize {
-    let raw = items
+/// Concatenated length-delimited encoding length of `items`.
+fn blob_raw_len<T: Message>(items: &[T]) -> usize {
+    items
         .iter()
         .map(|item| {
             let len = item.encoded_len();
             prost::length_delimiter_len(len).saturating_add(len)
         })
-        .fold(0usize, usize::saturating_add);
-    if raw > limits.max_raw_blob_len {
-        return 0;
+        .fold(0usize, usize::saturating_add)
+}
+
+/// The hex blob `encode_blob` would store for `items`, or nothing when its
+/// raw length is over `max_raw_blob_len` and the blob is dropped.
+///
+/// When `rules` matches an event or link attribute by raw key, its non-empty
+/// string value is charged at [`TenantRules::max_stored_len`] by measuring a
+/// copy with that value padded to that length: protobuf length is monotone
+/// in a string's length, so the padded blob is never shorter than the
+/// encrypted one. The padded length can cross `max_raw_blob_len` while the
+/// encrypted blob does not, so such a blob is charged at the cap instead of
+/// nothing. Both choices can only over-count, which is the safe direction:
+/// a projection under the stored bytes would admit a request over the bound.
+fn blob_bytes<T: Message + Clone>(
+    key: &str,
+    items: &[T],
+    limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    attributes: fn(&mut T) -> &mut Vec<KeyValue>,
+) -> usize {
+    let raw = blob_raw_len(items);
+    let mut padded = None;
+    if !rules.is_empty() {
+        let mut copy = items.to_vec();
+        let mut matched = false;
+        for item in &mut copy {
+            for kv in attributes(item).iter_mut() {
+                if rules.lookup_raw(&kv.key).is_none() {
+                    continue;
+                }
+                if let Some(AnyValueVariant::StringValue(s)) =
+                    kv.value.as_mut().and_then(|v| v.value.as_mut())
+                    && !s.is_empty()
+                {
+                    *s = "0".repeat(charged_len(true, s.len()));
+                    matched = true;
+                }
+            }
+        }
+        if matched {
+            padded = Some(blob_raw_len(&copy));
+        }
     }
-    label_bytes(key.len(), raw.saturating_mul(2))
+    let charged = match padded {
+        None if raw > limits.max_raw_blob_len => return 0,
+        None => raw,
+        Some(padded) => padded.min(limits.max_raw_blob_len),
+    };
+    label_bytes(key.len(), charged.saturating_mul(2))
 }
 
 #[cfg(test)]

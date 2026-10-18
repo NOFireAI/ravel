@@ -52,6 +52,7 @@ use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use ravel_ipcrypt::render::RenderOutcome;
 use ravel_ipcrypt::rules::TenantRules;
 use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_logseg::{MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes};
@@ -788,9 +789,11 @@ fn convert_attrs(
 }
 
 /// Encrypt a string-valued attribute in place under `rules`' rule for `key`
-/// (raw key, not sanitized), recording the outcome in `tally`. Non-string
-/// values and a key with no matching rule are left unchanged; so is an empty
-/// string, which carries nothing to encrypt. ADR-2993 decision 3: this runs
+/// (raw key, not sanitized), recording the outcome in `tally`. A non-string
+/// value under a rule is left unchanged and counted as
+/// [`RenderOutcome::Unparsed`]: only a string can hold an address. A key with
+/// no matching rule is left unchanged and uncounted; so is an empty string,
+/// which carries nothing to encrypt. ADR-2993 decision 3: this runs
 /// inside [`convert_attr`], before the storage-shape check, the
 /// value-length check, and, for a resource or scope attribute, before the
 /// stream identity and preimage that attribute feeds into are computed.
@@ -800,15 +803,16 @@ fn apply_ipcrypt_attr(
     key: &str,
     value: &mut AttrValue,
 ) {
+    let Some(info) = rules.lookup_raw(key) else {
+        return;
+    };
     let AttrValue::Str(s) = value else {
+        tally.record(info.variant, RenderOutcome::Unparsed);
         return;
     };
     if s.is_empty() {
         return;
     }
-    let Some(info) = rules.lookup_raw(key) else {
-        return;
-    };
     let Some((rendered, outcome)) = rules.apply(info.raw_key, s) else {
         return;
     };

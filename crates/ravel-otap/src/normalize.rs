@@ -82,6 +82,21 @@
 //! (ADR-0017 is a separate, later ticket), and the exemplars they carry are
 //! counted as dropped by [`push_exp_histogram_exemplar_drops`], which also
 //! records the attachment rule waiting for them.
+//!
+//! Every entry point, [`prepare_batch`] and [`project_resolved_label_bytes`]
+//! included, takes the tenant's resolved [`TenantRules`] as a required
+//! parameter (ADR-2993 decision 3). A value is encrypted in [`push_checked`],
+//! matched by its sanitized label name (`TenantRules::lookup_label`, with
+//! `ravel_otlp`'s own sanitizer), before its value-length check and before
+//! the label set reaches `LabelSet::new`/`SeriesId::compute`, the
+//! [`GroupCache`] or the exploded series' [`SeriesIdMemo`]; resource labels
+//! are encrypted the same way inside [`admit_resource_labels`], and exemplar
+//! filtered attributes as they are decoded. The cache and memo are keyed on
+//! raw attributes but hold the encrypted sets. The raw-length checks that
+//! run before anything is built ([`check_resource_labels`],
+//! [`check_flat_attrs_in_input_order`]) and the projection charge a ruled
+//! value at [`TenantRules::max_stored_len`]. [`TenantRules::none()`] leaves
+//! every value unchanged.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -1067,7 +1082,8 @@ fn normalize_impl(
         // this pre-check is the only place attribute order is observable, and
         // it must line up with the OTLP oracle or the two paths class the same
         // input differently (ADR-0011).
-        if let Err(rejection) = check_flat_attrs_in_input_order(range, flat_attrs, limits) {
+        if let Err(rejection) = check_flat_attrs_in_input_order(range, flat_attrs, limits, rules)
+        {
             rejected.push(rejection);
             continue;
         }
@@ -1496,10 +1512,13 @@ fn resource_pairs<'b>(
 /// `attrs`, decided from value lengths without building a label: the same
 /// reads in the same order (`service.name`, `service.namespace`, the joined
 /// `job`, `service.instance.id`, then the allowlist), each checked as its
-/// `push_checked` checks it.
+/// `push_checked` checks it. A value whose label name matches `rules` is
+/// checked at [`TenantRules::max_stored_len`] of its raw length (see
+/// [`ruled_value_len`]).
 fn check_resource_labels(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> Result<(), Rejection> {
     let first_len = |key: &str| -> Result<Option<usize>, Rejection> {
         match attrs.iter().find(|(k, _)| *k == key) {
@@ -1516,10 +1535,14 @@ fn check_resource_labels(
             Some(ns) if ns > 0 => ns.saturating_add(1).saturating_add(name),
             _ => name,
         };
-        check_label_len("job".len(), job, limits)?;
+        check_label_len("job".len(), ruled_value_len(rules, "job", job), limits)?;
     }
     if let Some(instance) = first_len("service.instance.id")? {
-        check_label_len("instance".len(), instance, limits)?;
+        check_label_len(
+            "instance".len(),
+            ruled_value_len(rules, "instance", instance),
+            limits,
+        )?;
     }
     for key in &limits.resource_attribute_allowlist {
         if matches!(
@@ -1529,10 +1552,24 @@ fn check_resource_labels(
             continue;
         }
         if let Some(len) = first_len(key)? {
+            let len = ruled_value_len(rules, &sanitize_label_name(key), len);
             check_label_len(sanitized_label_name_len(key), len, limits)?;
         }
     }
     Ok(())
+}
+
+/// The value length a raw-length check charges for the label `name`:
+/// [`TenantRules::max_stored_len`] of `raw_len` when a rule matches `name` and
+/// the value is non-empty, `raw_len` otherwise. The check runs before the
+/// value is encrypted, so it cannot see the ciphertext's real length; charging
+/// the most a matched value can be stored as over-counts, which is the
+/// intended, safe direction: a check that passes here also passes on the
+/// stored bytes in [`push_checked`]. An empty value stays 0, since
+/// [`push_checked`] drops it unencrypted.
+fn ruled_value_len(rules: &TenantRules, name: &str, raw_len: usize) -> usize {
+    let matched = raw_len > 0 && !rules.is_empty() && rules.lookup_label(name).is_some();
+    charged_len(matched, raw_len)
 }
 
 /// The length checks [`push_checked`] applies to a label of these lengths.
@@ -1669,7 +1706,7 @@ fn plan_resources<'b>(
                 max: limits.max_resource_attributes,
             });
             rejected_resources.insert(resource_id);
-        } else if let Err(reason) = check_resource_labels(&pairs, limits) {
+        } else if let Err(reason) = check_resource_labels(&pairs, limits, rules) {
             rejected.push(Rejection::Grouped {
                 reason: Box::new(reason),
                 count: points,
@@ -3002,11 +3039,14 @@ fn raw_cell_value(cell: &RawCell) -> Result<String, Rejection> {
 /// order, the sorted build only ever surfaces the order-independent
 /// `DuplicateLabelName` / `OversizedSeriesComponent` rejections.
 ///
-/// Decided from lengths, so a point it rejects allocates nothing.
+/// Decided from lengths, so a point it rejects allocates nothing. A value
+/// whose sanitized name matches `rules` is checked at
+/// [`TenantRules::max_stored_len`] of its raw length ([`ruled_value_len`]).
 fn check_flat_attrs_in_input_order(
     range: &[u32],
     attrs: &[FlatAttr<'_>],
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> Result<(), Rejection> {
     for &i in range {
         let a = &attrs[i as usize];
@@ -3017,6 +3057,11 @@ fn check_flat_attrs_in_input_order(
         // pass must skip it too, or an empty-valued label with an over-long
         // name would reject here while the canonical build silently drops it,
         // breaking the ADR-0011 identical-rejection-class contract.
+        let value_len = if rules.is_empty() {
+            value_len
+        } else {
+            ruled_value_len(rules, &sanitize_label_name(a.key), value_len)
+        };
         check_label_len(sanitized_label_name_len(a.key), value_len, limits)?;
     }
     Ok(())
@@ -3107,8 +3152,12 @@ fn sanitize_metric_name(name: &str) -> String {
     sanitize(name, is_metric_name_start, is_metric_name_continue)
 }
 
+/// `ravel_otlp`'s label-name sanitizer itself, not a copy: `TenantRules`
+/// matches a metric rule by sanitized label name, so OTLP and OTAP must
+/// produce the same name for one attribute key or a rule would match on one
+/// surface and miss on the other.
 fn sanitize_label_name(name: &str) -> String {
-    sanitize(name, is_label_name_start, is_label_name_continue)
+    ravel_otlp::normalize::sanitize_label_name(name.to_string())
 }
 
 fn sanitize(input: &str, is_start: fn(char) -> bool, is_continue: fn(char) -> bool) -> String {
@@ -3128,14 +3177,6 @@ fn is_metric_name_start(c: char) -> bool {
 
 fn is_metric_name_continue(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == ':'
-}
-
-fn is_label_name_start(c: char) -> bool {
-    c.is_ascii_alphabetic() || c == '_'
-}
-
-fn is_label_name_continue(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
 }
 
 // --- Histogram/summary explosion (ADR-0016 phase B2). Mirrors
@@ -5361,7 +5402,7 @@ mod tests {
                 &TenantRules::none(),
                 &mut tally,
             );
-            match check_resource_labels(&pairs, &limits) {
+            match check_resource_labels(&pairs, &limits, &TenantRules::none()) {
                 Err(reason) => {
                     prop_assert!(labels.is_none());
                     prop_assert_eq!(

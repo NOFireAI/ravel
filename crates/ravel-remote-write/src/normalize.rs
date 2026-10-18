@@ -13,7 +13,8 @@
 //! in place, in [`resolve_series_identity`]'s label-building loop, before the
 //! value-length limit is checked and before [`SeriesId::compute`] runs, so
 //! series identity, size limits, and encoding all see the stored
-//! (possibly-encrypted) bytes. Matching is by the label name exactly as
+//! (possibly-encrypted) bytes. An exemplar's kept labels are encrypted the
+//! same way in [`build_exemplar`]. Matching is by the label name exactly as
 //! received (`TenantRules::lookup_label`), since this surface never sanitizes
 //! a label name; an empty configured rule set
 //! ([`TenantRules::none`](ravel_ipcrypt::rules::TenantRules::none)) produces
@@ -487,6 +488,8 @@ fn normalize_series(
         series,
         series_id,
         limits,
+        rules,
+        tally,
         ingest_ts_ns,
         exemplar_cap,
         exemplars_out,
@@ -543,10 +546,13 @@ fn normalize_series(
 /// retracts an admission it already handed back: that ordering is what makes
 /// decision 2's "keep the newest within each window" hold when one series
 /// carries several exemplars inside one window.
+#[allow(clippy::too_many_arguments)]
 fn admit_exemplars(
     series: &ResolvedSeries,
     series_id: SeriesId,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     ingest_ts_ns: i64,
     cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
@@ -558,7 +564,7 @@ fn admit_exemplars(
 
     let mut candidates = Vec::with_capacity(series.exemplars.len());
     for exemplar in &series.exemplars {
-        match build_exemplar(exemplar, ingest_ts_ns, limits) {
+        match build_exemplar(exemplar, ingest_ts_ns, limits, rules, tally) {
             Some(candidate) => candidates.push(candidate),
             None => *exemplars_dropped += 1,
         }
@@ -589,10 +595,17 @@ fn admit_exemplars(
 ///
 /// The value is carried as a bit pattern, so a NaN payload or a negative zero
 /// round-trips exactly rather than being normalized by an `f64` comparison.
+///
+/// A kept filtered attribute is encrypted under `rules`, matched by its label
+/// name as received, exactly like a series label. The `trace_id`/`span_id`
+/// labels consumed into the fixed-size ids are not stored as labels and are
+/// not matched.
 fn build_exemplar(
     exemplar: &ResolvedExemplar,
     ingest_ts_ns: i64,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Option<Exemplar> {
     let ts_ns = checked_event_ts(exemplar.ts_ms, ingest_ts_ns, limits).ok()?;
 
@@ -621,7 +634,10 @@ fn build_exemplar(
             continue;
         }
         if filtered_attributes.len() < limits.max_attributes_per_point {
-            filtered_attributes.push(label.clone());
+            filtered_attributes.push(Label {
+                name: label.name.clone(),
+                value: apply_ipcrypt(rules, tally, &label.name, label.value.clone()),
+            });
         }
     }
 

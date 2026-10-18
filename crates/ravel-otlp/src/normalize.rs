@@ -60,7 +60,10 @@
 //! required parameter (ADR-2993 decision 3, issue #3047): a value is
 //! encrypted, when a rule matches the label it will be stored under, before
 //! that label is pushed, which is before `LabelSet::new`/`SeriesId::compute`
-//! run on it, before the label's length is checked against
+//! run on it and before the `SeriesIdMemo` caches the built set (the memo is
+//! keyed on raw attributes but stores the encrypted labels, so a hit reuses
+//! ciphertext and never re-encrypts), before the label's length is checked
+//! against
 //! `IngestLimits`, and before an exemplar's filtered attributes are stored.
 //! Matching is by sanitized label name (`TenantRules::lookup_label`), not by
 //! the raw OTLP key: `job` and `instance` are matched under those literal
@@ -1514,13 +1517,17 @@ fn checked_event_ts(
 /// ([`TenantRules::lookup_label`](ravel_ipcrypt::rules::TenantRules::lookup_label)),
 /// not by the raw OTLP attribute key, so `job` and `instance` are matched
 /// under those literal names. A tenant with no matching rule, or no rules at
-/// all, returns `value` unchanged.
+/// all, returns `value` unchanged, and so does an empty value, which carries
+/// nothing to encrypt and is not counted.
 pub fn apply_ipcrypt(
     rules: &TenantRules,
     tally: &mut IpcryptTally,
     name: &str,
     value: String,
 ) -> String {
+    if value.is_empty() {
+        return value;
+    }
     let Some(info) = rules.lookup_label(name) else {
         return value;
     };
