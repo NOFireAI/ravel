@@ -361,7 +361,8 @@ matcher's value under the rule before it submits the erasure request.
   the same conditions as decision 9: a fingerprint mismatch (a missing
   or stale file included) or a failed read. A missing file would
   otherwise submit the raw address, match nothing, and report a
-  successful erasure of zero records.
+  successful erasure of zero records. (The erasure amendment of
+  2026-10-19 below adds that erase submit never creates the marker.)
 - **Rule lookup.** The matcher key is looked up the way decision 1
   matches rules for the request's `--signal`. For the metric signals the
   key is sanitized first, so `client_address` finds the rule written as
@@ -393,7 +394,8 @@ matcher's value under the rule before it submits the erasure request.
   unchanged, matching how ingest stored it.
 
 The request records the encrypted value, never the raw one: the
-erasure log is itself retained data.
+erasure log is itself retained data (except for a plaintext matcher the
+operator names explicitly; see the erasure amendment of 2026-10-19 below).
 
 Erasure stays exact-match, as ADR-0064 defines it. A stored `ip:port`
 value is matched only by a matcher carrying the same port, and an
@@ -634,7 +636,8 @@ flowchart LR
   (decision 9), added to the key layout in `docs/catalog-and-mvcc.md`.
   Data written before a rule was added stays as it was:
   the policy is not retroactive, and the docs say to use erasure or
-  retention for older data.
+  retention for older data (erasure of that data needs the plaintext
+  matcher of the erasure amendment of 2026-10-19 below).
 - **Reachability.** The decision 3 rule set is a required parameter of
   every normalizer entry point, which covers every server ingest path at
   compile time. `ravel-cli load`, which has its own label-building
@@ -711,3 +714,37 @@ the raw address would be stored.
 The code change lands with #3047's pull request, which adds the
 `ravel-remote-write` lookup and a test that a dotted label name is
 encrypted.
+
+## Amendment (2026-10-19): erasure of data written before a rule
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="erasure amendment of 2026-10-19" -->
+
+Two gaps in decision 8 surfaced when `ravel-cli erase submit` was built
+(#3049).
+
+- **Data written before a rule.** A rule is not retroactive, so data
+  written before it took effect still holds raw addresses. With the
+  policy set, `erase submit` encrypts every matcher whose key has a
+  rule, so it cannot reach that data. `erase submit` therefore takes a
+  repeatable `--plaintext-matcher KEY=VALUE`. A plaintext matcher is
+  submitted exactly as written, with no encryption and no epoch fan-out
+  of its own, alongside the other matchers. Every request carrying one
+  records the raw value in the erasure log, which is retained data, so
+  the command prints a warning naming the keys whose values will be
+  stored in the clear. A plaintext matcher on a key with no rule is
+  refused, because an ordinary matcher already does that. An operator
+  who wants both the older raw data and the newer encrypted data erased
+  submits one command with the plaintext matcher and one without. This
+  is the one exception to the rule that an erasure request never records
+  the raw value.
+- **erase submit never creates the marker.** Unlike a data writer,
+  `erase submit` does not create `sys/ipcrypt/policy` when it is absent.
+  An absent marker with a non-empty local policy means no process has
+  written data under that policy, so every encrypted matcher would match
+  nothing and the command would report a successful erasure of zero
+  records. Creating the marker would also make every ingesting process
+  without the policy refuse at its next start. erase submit refuses
+  instead, and its message says that the bucket's data was written
+  without the policy, so the erasure should be submitted without
+  `--ipcrypt-config`, or with plaintext matchers. An absent marker with
+  an empty local policy proceeds as before.
