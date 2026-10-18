@@ -427,17 +427,27 @@ How to read the response:
 - The `query` of a rule is its whole firing expression. A PromQL rule shows
   its threshold comparison appended to the query text. A SQL detection rule
   shows its statement alone.
-- `health` is `ok` when the last tick ran the rule. It is `err`, with the
-  error in `lastError`, when the rule's query failed, or when the tick could
-  not read alert history or take the tenant's lease. `lastEvaluation` is the
-  time of that tick, and is present whenever `health` is `ok` or `err`.
+- `health` is `ok` when the last tick ran the rule. It is `err`, with a
+  message in `lastError`, when the rule's query, condition or record write
+  failed, or when the tick could not read alert history or take the tenant's
+  lease. `lastEvaluation` is the time of that tick, and is present whenever
+  `health` is `ok` or `err`.
+- `lastError` for a failed query reads as the PromQL or SQL query endpoint
+  answers the same failure. A PromQL parse error keeps its own text, and a
+  storage fault reads as a fixed message such as `upstream storage
+  temporarily unavailable`. A history read failure reads `alert history
+  unreadable`, a lease failure `alert lease unavailable`, and a failed record
+  write `alert record write failed`. `lastError` never carries an object
+  key, the tenant hash or the storage backend's own error text; the server
+  log has the full error.
 - `state` is `firing` when any alert of the rule is firing, else `pending`
   when any is pending, else `inactive`. The `alerts` array lists those
   alerts, in the same shape as `/api/v1/alerts`. A suppressed alert counts as
   neither.
 - When the last tick could not read the tenant's alert history, `state` is
   `unknown` and a rule carries no `alerts` array, while `health` is `err`
-  with that error. This holds for the first tick too.
+  with `lastError` `alert history unreadable`. This holds for the first tick
+  too.
 - Before this process has finished a tick for the tenant, `health` and
   `state` are both `unknown`, with no `lastEvaluation` and no `alerts`. The
   same holds when this process runs no evaluator, and when the tenant's last

@@ -65,7 +65,10 @@
 //! A rule's `health` is `ok` when the last tick ran its query and wrote its
 //! transitions, and `err`, with `lastError`, when its query, condition or
 //! write failed or the tick could not read history or take the tenant's
-//! lease. `lastEvaluation` is that tick's clock reading, present whenever
+//! lease. The evaluator classifies the error before it publishes it
+//! ([`crate::alerting::RuleHealth::Err`]), so `lastError` never carries an
+//! object key, a tenant hash or backend error text, and this module renders
+//! it as is. `lastEvaluation` is that tick's clock reading, present whenever
 //! `health` is `ok` or `err`. A replica whose peer held the lease on the last
 //! tick did not evaluate, and reports [`HEALTH_UNKNOWN`] with no
 //! `lastEvaluation`.

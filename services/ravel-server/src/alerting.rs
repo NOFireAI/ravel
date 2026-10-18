@@ -90,6 +90,7 @@ use ravel_object_store::{
     GetRange, ObjectMeta, ObjectStoreBackend, PageToken, PutMode, PutOptions, StoreError,
 };
 use ravel_promql::Value as PromqlValue;
+use ravel_query::http::QueryErrorResponse;
 use ravel_query::{Coverage, QueryEngine};
 use ravel_types::{Signal, TenantHash, TenantId};
 use serde::{Deserialize, Serialize};
@@ -520,8 +521,84 @@ pub enum RuleHealth {
     /// The rule's query ran and its transitions were written.
     Ok,
     /// The rule was not evaluated: its query, its condition or its write
-    /// failed, or the tick could not read history or take the lease.
+    /// failed, or the tick could not read history or take the lease. The text
+    /// is served to the tenant as `lastError`, so it never carries an object
+    /// key, a tenant hash or backend error text; see `rule_last_error`.
     Err(String),
+}
+
+/// The `lastError` of every rule on a tick that could not read the tenant's
+/// alert history. A store error names the tenant-hashed key and the backend's
+/// own text, which stay in the server log (ADR-0009).
+const MSG_HISTORY_UNREADABLE: &str = "alert history unreadable";
+
+/// The `lastError` of every rule on a tick that could not take the tenant's
+/// alert lease, for the same reason as [`MSG_HISTORY_UNREADABLE`].
+const MSG_LEASE_UNAVAILABLE: &str = "alert lease unavailable";
+
+/// The `lastError` of a rule whose query ran but whose transition record
+/// could not be written.
+const MSG_RECORD_WRITE_FAILED: &str = "alert record write failed";
+
+/// The `lastError` of a rule that failed in a way [`rule_last_error`] does
+/// not classify.
+const MSG_RULE_FAILED: &str = "alert rule evaluation failed";
+
+/// A rule refusal whose message is built only from the rule's own
+/// configuration and the shape of its query result, so `lastError` shows it.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct RuleRefusal(String);
+
+/// Context on an error from writing a rule's transition record.
+#[derive(Debug)]
+struct RecordWriteFailed;
+
+impl std::fmt::Display for RecordWriteFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(MSG_RECORD_WRITE_FAILED)
+    }
+}
+
+/// The `lastError` a failed rule evaluation serves to the tenant.
+///
+/// A query error renders as the query listeners render it: a PromQL error
+/// through [`QueryErrorResponse::from_query_error`], a SQL error through
+/// `ravel_sql::SqlError::client_message`. Both keep text that is the
+/// caller's own (a PromQL parse error on the rule's expression, a budget's
+/// figures) and replace a storage-layer fault with its fixed class message.
+/// An alerting error from the rule's own result or configuration, and a
+/// [`RuleRefusal`], keep their text. Any other error from writing the
+/// transition record renders [`MSG_RECORD_WRITE_FAILED`], and anything else
+/// [`MSG_RULE_FAILED`], since their text can name an object key. The caller
+/// logs the full chain.
+fn rule_last_error(err: anyhow::Error) -> String {
+    let err = match err.downcast::<ravel_query::QueryError>() {
+        Ok(query) => return QueryErrorResponse::from_query_error(query).message,
+        Err(err) => err,
+    };
+    #[cfg(feature = "sql")]
+    if let Some(sql) = err.downcast_ref::<ravel_sql::SqlError>() {
+        return sql.client_message();
+    }
+    if let Some(
+        alert @ (AlertError::GenerationExceeded { .. }
+        | AlertError::ResultShapeMismatch { .. }
+        | AlertError::InvalidRule { .. }
+        | AlertError::TooManyAlerts { .. }
+        | AlertError::DuplicateAlertIdentity { .. }),
+    ) = err.downcast_ref::<AlertError>()
+    {
+        return alert.to_string();
+    }
+    if let Some(refusal) = err.downcast_ref::<RuleRefusal>() {
+        return refusal.to_string();
+    }
+    if err.downcast_ref::<RecordWriteFailed>().is_some() {
+        MSG_RECORD_WRITE_FAILED.to_string()
+    } else {
+        MSG_RULE_FAILED.to_string()
+    }
 }
 
 /// One pending or firing alert in a [`TenantAlertSnapshot`].
@@ -1318,11 +1395,11 @@ impl AlertEvaluator {
             Err(err) => {
                 tracing::warn!(
                     tenant = %self.tenant.to_hex(),
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "alert evaluation: could not read alert history; skipping tick"
                 );
                 report.history_unavailable = true;
-                observed.tick_error = Some(format!("alert history unreadable: {err:#}"));
+                observed.tick_error = Some(MSG_HISTORY_UNREADABLE.to_string());
                 // Still attempt delivery: a notification stuck from an earlier
                 // tick does not depend on this tick's history read.
                 self.flush_sinks(now_ns, &mut report).await;
@@ -1349,12 +1426,12 @@ impl AlertEvaluator {
             Err(err) => {
                 tracing::warn!(
                     tenant = %self.tenant.to_hex(),
-                    error = %err,
+                    error = %format_args!("{err:#}"),
                     "alert evaluation: could not acquire the tenant lease; skipping rule \
                      evaluation this tick"
                 );
                 report.lease_unavailable = true;
-                observed.tick_error = Some(format!("alert lease unavailable: {err:#}"));
+                observed.tick_error = Some(MSG_LEASE_UNAVAILABLE.to_string());
                 false
             }
         };
@@ -1379,9 +1456,6 @@ impl AlertEvaluator {
                     Ok(()) => report.rules_evaluated += 1,
                     Err(err) => {
                         report.rules_failed += 1;
-                        observed
-                            .rule_errors
-                            .insert(rule.rule_id.clone(), format!("{err:#}"));
                         if let Some(AlertError::TooManyAlerts { count, limit, .. }) =
                             err.downcast_ref::<AlertError>()
                         {
@@ -1399,10 +1473,13 @@ impl AlertEvaluator {
                             tracing::warn!(
                                 tenant = %self.tenant.to_hex(),
                                 rule_id = %rule.rule_id,
-                                error = %err,
+                                error = %format_args!("{err:#}"),
                                 "alert evaluation: rule failed; retried next tick"
                             );
                         }
+                        observed
+                            .rule_errors
+                            .insert(rule.rule_id.clone(), rule_last_error(err));
                     }
                 }
             }
@@ -1790,7 +1867,8 @@ impl AlertEvaluator {
             let transition = evaluate_transition(rule, prior.as_ref(), met, now_ns);
             if self
                 .write_transition(rule, instance, &transition, prior, latest)
-                .await?
+                .await
+                .map_err(|err| err.context(RecordWriteFailed))?
             {
                 *written += 1;
             }
@@ -1948,11 +2026,12 @@ impl AlertEvaluator {
                     )
                     .await?;
                 if let Coverage::Partial { skipped } = coverage {
-                    anyhow::bail!(
+                    return Err(RuleRefusal(format!(
                         "alert rule query ran over partial federated coverage (degraded \
                          clusters: {}); refusing to evaluate the rule on an incomplete result",
                         skipped.join(", ")
-                    );
+                    ))
+                    .into());
                 }
                 promql_summary(value)
             }
@@ -1963,7 +2042,10 @@ impl AlertEvaluator {
     #[cfg(feature = "sql")]
     async fn run_sql(&self, text: &str, now_ns: i64) -> anyhow::Result<QueryResultSummary> {
         let Some(executor) = self.engines.sql.as_ref() else {
-            anyhow::bail!("SQL alert rule needs a SQL executor, and this process mounts none");
+            return Err(RuleRefusal(
+                "SQL alert rule needs a SQL executor, and this process mounts none".to_string(),
+            )
+            .into());
         };
         let lookback_ns = i64::try_from(self.sql_lookback.as_nanos()).unwrap_or(i64::MAX);
         let request = ravel_sql::SqlRequest {
@@ -1992,9 +2074,11 @@ impl AlertEvaluator {
 
     #[cfg(not(feature = "sql"))]
     async fn run_sql(&self, _text: &str, _now_ns: i64) -> anyhow::Result<QueryResultSummary> {
-        anyhow::bail!(
+        Err(RuleRefusal(
             "SQL alert rules require the `sql` feature; this build of ravel-server has it disabled"
+                .to_string(),
         )
+        .into())
     }
 
     /// PUT the RLOG object and publish its commit record, the same two-step any
@@ -2673,10 +2757,11 @@ fn promql_summary(value: PromqlValue) -> anyhow::Result<QueryResultSummary> {
             ravel_types::LabelSet::default(),
             v,
         )])),
-        other => anyhow::bail!(
+        other => Err(RuleRefusal(format!(
             "a PromQL alert rule must evaluate to an instant vector or a scalar, got {}",
             other.type_name()
-        ),
+        ))
+        .into()),
     }
 }
 
@@ -8279,9 +8364,9 @@ mod tick_tests {
         );
     }
 
-    /// A rule whose query fails on a tick renders `err` with that error, and
-    /// its still-firing alert is served without a value: the tick produced
-    /// none, and the previous tick's is not carried forward.
+    /// A rule whose query fails on a tick renders `err` with that refusal's
+    /// own text, and its still-firing alert is served without a value: the
+    /// tick produced none, and the previous tick's is not carried forward.
     #[tokio::test]
     async fn a_failing_rule_serves_its_alert_without_a_value() {
         let store = seeded_store().await;
@@ -8314,29 +8399,61 @@ mod tick_tests {
             (AlertState::Firing, None)
         );
         let rule = served_rule(&view).await;
-        assert!(!served_error(&rule).is_empty());
+        assert_eq!(
+            served_error(&rule),
+            "a PromQL alert rule must evaluate to an instant vector or a scalar, got range vector"
+        );
         assert_eq!(rule["state"], "firing");
         assert!(rule["alerts"][0].get("value").is_none(), "{rule}");
     }
 
+    /// Backend text an injected store fault carries, shaped like an S3 error
+    /// that names its bucket and endpoint.
+    const BACKEND_TEXT: &str = "SlowDown: Please reduce your request rate (bucket ravel-prod-bucket at \
+         https://s3.internal.example:9000)";
+
+    /// A transient fault whose text names `key` and [`BACKEND_TEXT`], as a
+    /// real backend error does.
+    fn store_fault_naming(key: &str) -> ScriptedFault {
+        ScriptedFault::Transient(format!("{BACKEND_TEXT} for {key}"))
+    }
+
+    /// Asserts that no part of a [`store_fault_naming`] fault on `key`, and
+    /// not the tenant hash either, appears anywhere in `body`.
+    fn assert_no_store_detail(body: &serde_json::Value, key: &str) {
+        let text = body.to_string();
+        for needle in [
+            key,
+            TenantId::new(TENANT).hash().to_hex().as_str(),
+            "SlowDown",
+            "ravel-prod-bucket",
+            "s3.internal.example",
+        ] {
+            assert!(
+                !text.contains(needle),
+                "{needle:?} reached the body: {text}"
+            );
+        }
+    }
+
     /// A fault plan failing every LIST of `tenant`'s alert commit prefix, which
-    /// is the read every tick's history fold starts with.
+    /// is the read every tick's history fold starts with. The fault's text
+    /// names the prefix, so a test can check it never reaches a client.
     fn history_list_fault(tenant: &TenantHash) -> FaultPlan {
         let prefix =
             keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
         FaultPlan::empty().with_rule(
-            FaultRule::new(
-                Op::List,
-                ScriptedFault::Transient("alert history listing unavailable".into()),
-            )
-            .with_key_contains(prefix)
-            .with_occurrence(Occurrence::Always),
+            FaultRule::new(Op::List, store_fault_naming(&prefix))
+                .with_key_contains(prefix)
+                .with_occurrence(Occurrence::Always),
         )
     }
 
     /// A first tick that cannot read history publishes a snapshot: `health`
-    /// is `err`, with the history error and `lastEvaluation`, while `state`
-    /// is `unknown` with no `alerts`, and `/api/v1/alerts` answers 503.
+    /// is `err`, with the fixed history message and `lastEvaluation`, while
+    /// `state` is `unknown` with no `alerts`, and `/api/v1/alerts` answers 503.
+    /// Neither route's body carries the store fault's key, the tenant hash or
+    /// the backend text.
     #[tokio::test]
     async fn a_first_tick_that_cannot_read_history_renders_err_health_and_unknown_state() {
         let tenant = TenantId::new(TENANT).hash();
@@ -8356,20 +8473,24 @@ mod tick_tests {
 
         let published = snapshot(&view);
         assert!(published.alerts.is_none());
-        assert!(
-            matches!(health_of(&published), RuleHealth::Err(err)
-                if err.starts_with("alert history unreadable:")),
-            "{:?}",
-            published.rule_health
+        assert_eq!(
+            health_of(&published),
+            &RuleHealth::Err("alert history unreadable".to_string())
         );
 
+        let prefix =
+            keys::commit_shard_prefix(&tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        let (status, rules_body) = serve(&view, crate::alerts_api::RULES_ROUTE).await;
+        assert_eq!(status, 200);
+        assert_no_store_detail(&rules_body, &prefix);
         let rule = served_rule(&view).await;
-        assert!(served_error(&rule).starts_with("alert history unreadable:"));
+        assert_eq!(served_error(&rule), "alert history unreadable");
         assert_eq!(rule["lastEvaluation"], NOW_RFC3339);
         assert_eq!(rule["state"], crate::alerts_api::STATE_UNKNOWN);
         assert!(rule.get("alerts").is_none(), "{rule}");
 
         let (status, body) = serve(&view, crate::alerts_api::ALERTS_ROUTE).await;
+        assert_no_store_detail(&body, &prefix);
         assert_eq!(status, 503);
         assert_eq!(
             body,
@@ -8413,7 +8534,7 @@ mod tick_tests {
         assert_eq!(status, 503, "{body}");
         assert_eq!(body["error"], crate::alerts_api::HISTORY_UNREADABLE);
         let rule = served_rule(&view).await;
-        assert!(served_error(&rule).starts_with("alert history unreadable:"));
+        assert_eq!(served_error(&rule), "alert history unreadable");
         assert_eq!(rule["state"], crate::alerts_api::STATE_UNKNOWN);
 
         ev.store = Arc::clone(&store);
@@ -8607,8 +8728,9 @@ mod tick_tests {
     }
 
     /// A tick that read history but could not take the lease renders `err`
-    /// with the lease error, and serves the alerts it read, without a value
-    /// since it evaluated nothing.
+    /// with the fixed lease message, and serves the alerts it read, without a
+    /// value since it evaluated nothing. The body carries neither the lease
+    /// key, the tenant hash nor the backend text of the store fault.
     #[tokio::test]
     async fn a_lease_unavailable_tick_renders_err_health_over_the_history_it_read() {
         let store = seeded_store().await;
@@ -8618,13 +8740,11 @@ mod tick_tests {
         let mut ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_published(view.clone());
         assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
 
+        let lease_key = alert_lease_key(&tenant);
         let plan = FaultPlan::empty().with_rule(
-            FaultRule::new(
-                Op::Put,
-                ScriptedFault::Transient("alert lease write unavailable".into()),
-            )
-            .with_key_contains(alert_lease_key(&tenant))
-            .with_occurrence(Occurrence::Always),
+            FaultRule::new(Op::Put, store_fault_naming(&lease_key))
+                .with_key_contains(lease_key.clone())
+                .with_occurrence(Occurrence::Always),
         );
         let fault = Arc::new(FaultStore::new(Arc::clone(&store), plan));
         ev.store = fault.clone();
@@ -8636,11 +8756,9 @@ mod tick_tests {
         assert!(fault.fault_count(Op::Put, FaultKind::Transient) >= 1);
 
         let published = snapshot(&view);
-        assert!(
-            matches!(health_of(&published), RuleHealth::Err(err)
-                if err.starts_with("alert lease unavailable:")),
-            "{:?}",
-            published.rule_health
+        assert_eq!(
+            health_of(&published),
+            &RuleHealth::Err("alert lease unavailable".to_string())
         );
         let alerts = published.alerts.clone().expect("history read");
         assert_eq!(alerts.len(), 1);
@@ -8649,12 +8767,75 @@ mod tick_tests {
             (AlertState::Firing, NOW_NS, None)
         );
 
+        let (status, rules_body) = serve(&view, crate::alerts_api::RULES_ROUTE).await;
+        assert_eq!(status, 200);
+        assert_no_store_detail(&rules_body, &lease_key);
         let rule = served_rule(&view).await;
-        assert!(served_error(&rule).starts_with("alert lease unavailable:"));
+        assert_eq!(served_error(&rule), "alert lease unavailable");
         assert_eq!(rule["state"], "firing");
         let (status, body) = serve(&view, crate::alerts_api::ALERTS_ROUTE).await;
+        assert_no_store_detail(&body, &lease_key);
         assert_eq!(status, 200, "{body}");
         assert!(body["data"]["alerts"][0].get("value").is_none(), "{body}");
+    }
+
+    /// A rule whose PromQL query fails on a store fault renders the query
+    /// listener's redacted class message, not the fault's key or backend text.
+    #[tokio::test]
+    async fn a_rule_query_store_fault_renders_the_redacted_query_message() {
+        let tenant = TenantId::new(TENANT).hash();
+        let data_prefix = format!("t/{}/{}/l0/", tenant.to_hex(), Signal::Metrics.key_prefix());
+        let fault = Arc::new(FaultStore::new(
+            seeded_store().await,
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Get, store_fault_naming(&data_prefix))
+                    .with_key_contains(data_prefix.clone())
+                    .with_occurrence(Occurrence::Always),
+            ),
+        ));
+        let view = tenant_published();
+        let mut ev = evaluator(fault.clone(), TestClock::at(NOW_NS)).with_published(view.clone());
+
+        let report = ev.run_tick().await;
+        assert_eq!(report.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(report.rules_failed, 1);
+        assert!(fault.fault_count(Op::Get, FaultKind::Transient) >= 1);
+
+        let (status, body) = serve(&view, crate::alerts_api::RULES_ROUTE).await;
+        assert_eq!(status, 200);
+        assert_no_store_detail(&body, &data_prefix);
+        let rule = served_rule(&view).await;
+        assert_eq!(served_error(&rule), ravel_query::http::MSG_UNAVAILABLE);
+    }
+
+    /// A rule whose transition record cannot be written renders a fixed
+    /// message, not the data object's key or the backend text.
+    #[tokio::test]
+    async fn a_rule_record_write_fault_renders_a_fixed_message() {
+        let tenant = TenantId::new(TENANT).hash();
+        let alert_data_prefix =
+            format!("t/{}/{}/l0/", tenant.to_hex(), Signal::Alerts.key_prefix());
+        let fault = Arc::new(FaultStore::new(
+            seeded_store().await,
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Put, store_fault_naming(&alert_data_prefix))
+                    .with_key_contains(alert_data_prefix.clone())
+                    .with_occurrence(Occurrence::Always),
+            ),
+        ));
+        let view = tenant_published();
+        let mut ev = evaluator(fault.clone(), TestClock::at(NOW_NS)).with_published(view.clone());
+
+        let report = ev.run_tick().await;
+        assert_eq!(report.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(report.rules_failed, 1);
+        assert!(fault.fault_count(Op::Put, FaultKind::Transient) >= 1);
+
+        let (status, body) = serve(&view, crate::alerts_api::RULES_ROUTE).await;
+        assert_eq!(status, 200);
+        assert_no_store_detail(&body, &alert_data_prefix);
+        let rule = served_rule(&view).await;
+        assert_eq!(served_error(&rule), "alert record write failed");
     }
 
     /// The evaluator task [`spawn`] starts publishes into the handle it was
