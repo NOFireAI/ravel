@@ -168,6 +168,280 @@ pub async fn submit(
     }
 }
 
+/// The most erasure requests one `erase submit` fans out to under an IPCrypt
+/// policy (ADR-2993 decision 8).
+pub const MAX_IPCRYPT_REQUESTS: usize = 16;
+
+/// One matcher whose key has an IPCrypt rule for the request's signal, and
+/// the epoch its value was encrypted under in one planned request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedMatcher {
+    /// The matcher's key, as written on the command line.
+    pub key: String,
+    /// The rule's key, as written in the policy.
+    pub rule_key: String,
+    pub epoch: u32,
+}
+
+/// One erasure request `erase submit` will write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedRequest {
+    pub request_id: Uuid,
+    /// The full matcher set, encrypted values in place.
+    pub matchers: Vec<(String, String)>,
+    /// The encrypted matchers, in matcher order.
+    pub epochs: Vec<EncryptedMatcher>,
+}
+
+/// One matcher's candidate values: the value unchanged, or one ciphertext
+/// per epoch of its rule.
+enum MatcherValues {
+    Plain(String),
+    Encrypted {
+        rule_key: String,
+        values: Vec<(u32, String)>,
+    },
+}
+
+/// The request id of one request in a multi-request fan-out: a UUID-shaped
+/// blake3 hash of the base id and the request's epochs, so retrying the
+/// command with the same base id re-submits the same requests.
+pub fn derived_request_id(base: Uuid, epochs: &[EncryptedMatcher]) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ravel-cli erase submit ipcrypt epoch request v1\0");
+    hasher.update(base.as_bytes());
+    for matcher in epochs {
+        hasher.update(&(matcher.key.len() as u64).to_le_bytes());
+        hasher.update(matcher.key.as_bytes());
+        hasher.update(&matcher.epoch.to_le_bytes());
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    uuid::Builder::from_random_bytes(bytes).into_uuid()
+}
+
+/// Plan the requests `matchers` become under `tenant`'s IPCrypt `rules`
+/// (ADR-2993 decision 8). A matcher whose key has a rule for `signal` (looked
+/// up by its sanitized form for metrics, by its raw key otherwise) carries
+/// that rule's ciphertext, and the plan holds one request per combination of
+/// the encrypted matchers' epochs (the rule's `epoch`, then each of its
+/// `retired_epochs`). The matcher key stays as written. A value that is not
+/// an address, and an empty value, stay unchanged. More than
+/// [`MAX_IPCRYPT_REQUESTS`] requests is refused, naming the rules. With one
+/// request it carries `base_id`; with several, each carries
+/// [`derived_request_id`].
+pub fn plan_requests(
+    policy: &crate::ipcrypt::IpcryptPolicy,
+    rules: &ravel_ipcrypt::rules::TenantRules,
+    tenant: &str,
+    signal: SignalArg,
+    matchers: Vec<(String, String)>,
+    base_id: Uuid,
+) -> anyhow::Result<Vec<PlannedRequest>> {
+    let mut candidates = Vec::with_capacity(matchers.len());
+    for (key, value) in &matchers {
+        let info = if value.is_empty() {
+            None
+        } else if signal == SignalArg::Metrics {
+            rules.lookup_label(&crate::ipcrypt::sanitize_rule_key(key))
+        } else {
+            rules.lookup_raw(key)
+        };
+        let Some(info) = info else {
+            candidates.push(MatcherValues::Plain(value.clone()));
+            continue;
+        };
+        let mut values = Vec::with_capacity(1 + info.retired_epochs.len());
+        for epoch in std::iter::once(info.epoch).chain(info.retired_epochs.iter().copied()) {
+            let Some(epoch_key) = policy.epoch_key(tenant, info.variant, epoch)? else {
+                anyhow::bail!(crate::ipcrypt::NO_DEPLOYMENT_KEY);
+            };
+            match epoch_key.encrypt(value) {
+                (encrypted, ravel_ipcrypt::render::RenderOutcome::Encrypted) => {
+                    values.push((epoch, encrypted));
+                }
+                (_, ravel_ipcrypt::render::RenderOutcome::Unparsed) => {
+                    values.clear();
+                    break;
+                }
+            }
+        }
+        if values.is_empty() {
+            candidates.push(MatcherValues::Plain(value.clone()));
+        } else {
+            candidates.push(MatcherValues::Encrypted {
+                rule_key: info.raw_key.to_string(),
+                values,
+            });
+        }
+    }
+
+    let total = candidates.iter().try_fold(1usize, |acc, c| match c {
+        MatcherValues::Plain(_) => Some(acc),
+        MatcherValues::Encrypted { values, .. } => acc.checked_mul(values.len()),
+    });
+    if total.is_none_or(|n| n > MAX_IPCRYPT_REQUESTS) {
+        let multiplying: Vec<String> = matchers
+            .iter()
+            .zip(&candidates)
+            .filter_map(|((key, _), c)| match c {
+                MatcherValues::Encrypted { rule_key, values } if values.len() > 1 => {
+                    let epochs: Vec<String> = values.iter().map(|(e, _)| e.to_string()).collect();
+                    Some(format!(
+                        "rule {rule_key:?} (matcher {key:?}) has epochs [{}]",
+                        epochs.join(", ")
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        let count = total.map_or_else(|| "too many".to_string(), |n| n.to_string());
+        anyhow::bail!(
+            "refusing to submit: the IPCrypt-encrypted matchers need one erasure request per \
+             combination of their rules' epochs, {count} requests, more than \
+             {MAX_IPCRYPT_REQUESTS}: {}. Drop retired_epochs whose data has aged out of \
+             retention, or submit fewer encrypted matchers per command. Nothing was submitted",
+            multiplying.join("; ")
+        );
+    }
+
+    let mut plans: Vec<(Vec<(String, String)>, Vec<EncryptedMatcher>)> =
+        vec![(Vec::with_capacity(matchers.len()), Vec::new())];
+    for ((key, _), candidate) in matchers.iter().zip(candidates) {
+        match candidate {
+            MatcherValues::Plain(value) => {
+                for (set, _) in &mut plans {
+                    set.push((key.clone(), value.clone()));
+                }
+            }
+            MatcherValues::Encrypted { rule_key, values } => {
+                let mut next = Vec::with_capacity(plans.len() * values.len());
+                for (set, epochs) in &plans {
+                    for (epoch, encrypted) in &values {
+                        let mut set = set.clone();
+                        set.push((key.clone(), encrypted.clone()));
+                        let mut epochs = epochs.clone();
+                        epochs.push(EncryptedMatcher {
+                            key: key.clone(),
+                            rule_key: rule_key.clone(),
+                            epoch: *epoch,
+                        });
+                        next.push((set, epochs));
+                    }
+                }
+                plans = next;
+            }
+        }
+    }
+    let single = plans.len() == 1;
+    Ok(plans
+        .into_iter()
+        .map(|(matchers, epochs)| PlannedRequest {
+            request_id: if single {
+                base_id
+            } else {
+                derived_request_id(base_id, &epochs)
+            },
+            matchers,
+            epochs,
+        })
+        .collect())
+}
+
+/// What [`submit_with_ipcrypt`] submitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcryptSubmitReport {
+    pub base_id: Uuid,
+    pub requests: Vec<(PlannedRequest, SubmitOutcome)>,
+    pub created: usize,
+    pub already_present: usize,
+}
+
+/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8): the
+/// `sys/ipcrypt/policy` marker check, then [`plan_requests`], then one
+/// [`submit`] per planned request. A failure part-way names the base id, so
+/// rerunning with it as `--request-id` finishes the requests left out.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_with_ipcrypt(
+    store: Arc<dyn ObjectStoreBackend>,
+    policy: &crate::ipcrypt::IpcryptPolicy,
+    tenant: &str,
+    signal: SignalArg,
+    matchers: Vec<(String, String)>,
+    window_start_ns: i64,
+    window_end_ns: i64,
+    reason: String,
+    base_id: Uuid,
+    now_ns: i64,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<IpcryptSubmitReport> {
+    let rules = policy
+        .checked_rules(store.as_ref(), tenant, "erase submit", out)
+        .await?;
+    let plans = plan_requests(policy, &rules, tenant, signal, matchers, base_id)?;
+    let total = plans.len();
+    if total > 1 {
+        writeln!(
+            out,
+            "erasure base request id {base_id}: submitting {total} requests, one per IPCrypt \
+             epoch combination"
+        )?;
+    }
+    let mut report = IpcryptSubmitReport {
+        base_id,
+        requests: Vec::with_capacity(total),
+        created: 0,
+        already_present: 0,
+    };
+    for (done, plan) in plans.into_iter().enumerate() {
+        let outcome = submit(
+            store.clone(),
+            tenant,
+            signal,
+            plan.matchers.clone(),
+            window_start_ns,
+            window_end_ns,
+            reason.clone(),
+            plan.request_id,
+            now_ns,
+        )
+        .await
+        .map_err(|err| {
+            if total > 1 {
+                err.context(format!(
+                    "erasure request {} failed after {done} of {total} were submitted; rerun \
+                     with --request-id {base_id} to finish",
+                    plan.request_id
+                ))
+            } else {
+                err
+            }
+        })?;
+        match outcome {
+            SubmitOutcome::Created => report.created += 1,
+            SubmitOutcome::AlreadyPresent => report.already_present += 1,
+        }
+        report.requests.push((plan, outcome));
+    }
+    if total > 1 {
+        writeln!(out, "erasure base request id {base_id}:")?;
+        for (plan, _) in &report.requests {
+            let epochs: Vec<String> = plan
+                .epochs
+                .iter()
+                .map(|m| format!("{} epoch {}", m.key, m.epoch))
+                .collect();
+            writeln!(out, "  {} ({})", plan.request_id, epochs.join(", "))?;
+        }
+        writeln!(
+            out,
+            "{total} erasure requests: {} created, {} already present",
+            report.created, report.already_present
+        )?;
+    }
+    Ok(report)
+}
+
 /// Whether two erasure requests define the *same* erasure: they agree on every
 /// field that determines which records get dropped. That is the predicate
 /// matchers (compared as an unordered multiset, since matcher order is not

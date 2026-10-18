@@ -12,11 +12,13 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use clap::ValueEnum;
 use ravel_ipcrypt::fingerprint::{EMPTY_POLICY_FINGERPRINT, policy_fingerprint};
-use ravel_ipcrypt::marker::{CheckOutcome, check_marker};
-use ravel_ipcrypt::policy::{PolicyFile, parse_policy_file};
-use ravel_ipcrypt::rules::TenantRules;
-use ravel_object_store::ObjectStoreBackend;
+use ravel_ipcrypt::marker::{CheckOutcome, check_marker, read_marker, replace_marker};
+use ravel_ipcrypt::policy::{PolicyFile, Variant, parse_policy_file};
+use ravel_ipcrypt::render::RenderOutcome;
+use ravel_ipcrypt::rules::{EpochKey, TenantRules};
+use ravel_object_store::{ObjectStoreBackend, StoreError};
 use ravel_types::{ConfiguredScheme, TenantId};
 
 /// The metric label sanitizer rule keys are matched through on metric
@@ -117,6 +119,20 @@ impl IpcryptPolicy {
         self.fingerprint == EMPTY_POLICY_FINGERPRINT
     }
 
+    /// The key for `tenant`, `variant` and `epoch`, independent of any rule.
+    /// `None` without a deployment key.
+    pub fn epoch_key(
+        &self,
+        tenant: &str,
+        variant: Variant,
+        epoch: u32,
+    ) -> anyhow::Result<Option<EpochKey>> {
+        let Some(deployment_key) = self.deployment_key.as_deref() else {
+            return Ok(None);
+        };
+        epoch_key(deployment_key, tenant, variant, epoch).map(Some)
+    }
+
     /// Compare this policy's fingerprint with the bucket's
     /// `sys/ipcrypt/policy` marker (ADR-2993 decision 9), whether or not
     /// `--ipcrypt-config` was given. No marker and an empty policy writes
@@ -186,4 +202,200 @@ impl IpcryptPolicy {
         }
         Ok(Arc::new(self.rules_for(tenant)?))
     }
+}
+
+/// The `--variant` of `ravel-cli ipcrypt encrypt|decrypt`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum VariantArg {
+    Deterministic,
+    Prefix,
+}
+
+impl From<VariantArg> for Variant {
+    fn from(arg: VariantArg) -> Self {
+        match arg {
+            VariantArg::Deterministic => Variant::Deterministic,
+            VariantArg::Prefix => Variant::Prefix,
+        }
+    }
+}
+
+/// Which way `ravel-cli ipcrypt encrypt|decrypt` transforms each value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Encrypt,
+    Decrypt,
+}
+
+impl Direction {
+    fn command(self) -> &'static str {
+        match self {
+            Direction::Encrypt => "ipcrypt encrypt",
+            Direction::Decrypt => "ipcrypt decrypt",
+        }
+    }
+}
+
+/// `tenant`'s key for `variant` and `epoch` (ADR-2993 decision 2).
+pub fn epoch_key(
+    deployment_key: &[u8; 32],
+    tenant: &str,
+    variant: Variant,
+    epoch: u32,
+) -> anyhow::Result<EpochKey> {
+    let tenant_hash = TenantId::new(tenant).hash();
+    EpochKey::new(deployment_key, &tenant_hash, variant, epoch).map_err(|err| {
+        anyhow::anyhow!(
+            "could not derive the IPCrypt key for tenant hash {}, epoch {epoch}: {err}",
+            tenant_hash.to_hex()
+        )
+    })
+}
+
+/// Encrypt or decrypt each value under `tenant`'s key for `variant` and
+/// `epoch`. A value that is not an address (or, decrypting, not an address
+/// rendering) comes back unchanged with [`RenderOutcome::Unparsed`].
+pub fn transform_values(
+    deployment_key: &[u8; 32],
+    tenant: &str,
+    variant: Variant,
+    epoch: u32,
+    direction: Direction,
+    values: &[String],
+) -> anyhow::Result<Vec<(String, RenderOutcome)>> {
+    let key = epoch_key(deployment_key, tenant, variant, epoch)?;
+    Ok(values
+        .iter()
+        .map(|value| match direction {
+            Direction::Encrypt => key.encrypt(value),
+            Direction::Decrypt => key.decrypt(value),
+        })
+        .collect())
+}
+
+/// `ravel-cli ipcrypt encrypt|decrypt`: one result per line on `out`, in
+/// input order, and a note on `err` for each value printed unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn run_transform(
+    deployment_key: Option<&[u8; 32]>,
+    tenant: &str,
+    variant: VariantArg,
+    epoch: u32,
+    direction: Direction,
+    values: &[String],
+    out: &mut dyn std::io::Write,
+    err: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
+    let Some(deployment_key) = deployment_key else {
+        anyhow::bail!(
+            "ravel-cli {} needs the deployment key the tenant keys derive from: pass \
+             --tenant-hash-key-file",
+            direction.command()
+        );
+    };
+    let results = transform_values(
+        deployment_key,
+        tenant,
+        variant.into(),
+        epoch,
+        direction,
+        values,
+    )?;
+    for (value, outcome) in results {
+        writeln!(out, "{value}")?;
+        if outcome == RenderOutcome::Unparsed {
+            let what = match direction {
+                Direction::Encrypt => "an IP address",
+                Direction::Decrypt => "an IPCrypt address rendering",
+            };
+            writeln!(err, "note: {value:?} is not {what}; printed unchanged")?;
+        }
+    }
+    Ok(())
+}
+
+/// What `ravel-cli ipcrypt set-policy` did to `sys/ipcrypt/policy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetPolicyOutcome {
+    /// The marker already carried this policy's fingerprint.
+    Unchanged,
+    /// The marker carried `previous` and now carries this policy's
+    /// fingerprint.
+    Replaced { previous: [u8; 32] },
+    /// No marker existed; it now carries this policy's fingerprint.
+    Created,
+    /// No marker existed and the policy is empty: nothing was written.
+    NothingToWrite,
+}
+
+/// `ravel-cli ipcrypt set-policy`: read the marker, then replace it with a
+/// CAS on the version just read, or create it when absent.
+pub async fn set_policy(
+    store: &dyn ObjectStoreBackend,
+    policy: &IpcryptPolicy,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<SetPolicyOutcome> {
+    let current = read_marker(store).await.map_err(|err| {
+        anyhow::anyhow!("refusing to set the IPCrypt policy: nothing was written: {err}")
+    })?;
+    set_policy_over(store, policy, current, out).await
+}
+
+/// The write half of [`set_policy`], given the marker state it read. A
+/// marker replaced since that read fails the CAS and writes nothing.
+pub async fn set_policy_over(
+    store: &dyn ObjectStoreBackend,
+    policy: &IpcryptPolicy,
+    current: Option<(ravel_ipcrypt::marker::StoredMarker, ravel_object_store::Version)>,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<SetPolicyOutcome> {
+    let local = hex::encode(policy.fingerprint);
+    let outcome = match current {
+        Some((stored, _)) if stored.fingerprint == policy.fingerprint => {
+            SetPolicyOutcome::Unchanged
+        }
+        Some((stored, version)) => {
+            replace_marker(store, policy.fingerprint, version)
+                .await
+                .map_err(|err| match err {
+                    StoreError::PreconditionFailed => anyhow::anyhow!(
+                        "refusing to set the IPCrypt policy: sys/ipcrypt/policy changed after \
+                         it was read (it carried policy fingerprint {}); nothing was written. \
+                         Read the new marker and rerun set-policy",
+                        hex::encode(stored.fingerprint)
+                    ),
+                    err => anyhow::anyhow!(
+                        "could not replace sys/ipcrypt/policy; nothing was written: {err}"
+                    ),
+                })?;
+            SetPolicyOutcome::Replaced {
+                previous: stored.fingerprint,
+            }
+        }
+        None => match policy.check_marker(store, "set the IPCrypt policy").await? {
+            CheckOutcome::Created => SetPolicyOutcome::Created,
+            CheckOutcome::Matched => SetPolicyOutcome::Unchanged,
+            CheckOutcome::ProceededNoMarker => SetPolicyOutcome::NothingToWrite,
+        },
+    };
+    match outcome {
+        SetPolicyOutcome::Unchanged => writeln!(
+            out,
+            "sys/ipcrypt/policy already carries policy fingerprint {local}; left unchanged"
+        )?,
+        SetPolicyOutcome::Replaced { previous } => writeln!(
+            out,
+            "replaced sys/ipcrypt/policy: policy fingerprint {} -> {local}",
+            hex::encode(previous)
+        )?,
+        SetPolicyOutcome::Created => writeln!(
+            out,
+            "created sys/ipcrypt/policy with policy fingerprint {local}"
+        )?,
+        SetPolicyOutcome::NothingToWrite => writeln!(
+            out,
+            "no sys/ipcrypt/policy marker and the policy is empty; nothing written"
+        )?,
+    }
+    Ok(outcome)
 }
