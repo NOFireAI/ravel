@@ -184,15 +184,14 @@ impl IpcryptPolicy {
         })
     }
 
-    /// The marker check, then `tenant`'s rules, built once for the run. The
-    /// marker line goes to `log` when this run created the marker.
-    pub async fn checked_rules(
+    /// [`Self::check_marker`], with a line on `log` when this run created the
+    /// marker.
+    pub async fn check_marker_logged(
         &self,
         store: &dyn ObjectStoreBackend,
-        tenant: &str,
         command: &str,
         log: &mut dyn std::io::Write,
-    ) -> anyhow::Result<Arc<TenantRules>> {
+    ) -> anyhow::Result<()> {
         if self.check_marker(store, command).await? == CheckOutcome::Created {
             let _ = writeln!(
                 log,
@@ -200,6 +199,18 @@ impl IpcryptPolicy {
                 hex::encode(self.fingerprint)
             );
         }
+        Ok(())
+    }
+
+    /// The marker check, then `tenant`'s rules, built once for the run.
+    pub async fn checked_rules(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        tenant: &str,
+        command: &str,
+        log: &mut dyn std::io::Write,
+    ) -> anyhow::Result<Arc<TenantRules>> {
+        self.check_marker_logged(store, command, log).await?;
         Ok(Arc::new(self.rules_for(tenant)?))
     }
 }
@@ -398,4 +409,264 @@ pub async fn set_policy_over(
         )?,
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use ravel_object_store::memory::MemoryStore;
+
+    const DEPLOYMENT_KEY: [u8; 32] = [0x5a; 32];
+    const DETERMINISTIC: &str = "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n";
+    const PREFIX: &str = "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"prefix\"\n";
+    const ROTATED: &str =
+        "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\nepoch = 2\n";
+
+    fn policy(text: &str) -> IpcryptPolicy {
+        let file = parse_policy_file(text, sanitize_rule_key).expect("policy parses");
+        IpcryptPolicy::new(file, Some(&DEPLOYMENT_KEY)).expect("policy loads")
+    }
+
+    fn values(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    async fn stored_fingerprint(store: &dyn ObjectStoreBackend) -> Option<[u8; 32]> {
+        read_marker(store)
+            .await
+            .expect("read marker")
+            .map(|(marker, _)| marker.fingerprint)
+    }
+
+    #[test]
+    fn encrypt_then_decrypt_round_trips_for_both_variants() {
+        let addresses = values(&["198.51.100.7", "2001:db8::1"]);
+        for variant in [VariantArg::Deterministic, VariantArg::Prefix] {
+            let mut encrypted = Vec::new();
+            run_transform(
+                Some(&DEPLOYMENT_KEY),
+                "acme",
+                variant,
+                3,
+                Direction::Encrypt,
+                &addresses,
+                &mut encrypted,
+                &mut Vec::new(),
+            )
+            .expect("encrypt");
+            let ciphertexts: Vec<String> = String::from_utf8(encrypted)
+                .expect("utf-8")
+                .lines()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(ciphertexts.len(), 2, "{variant:?}");
+            for (ciphertext, address) in ciphertexts.iter().zip(&addresses) {
+                assert_ne!(ciphertext, address, "{variant:?}");
+            }
+
+            let mut decrypted = Vec::new();
+            run_transform(
+                Some(&DEPLOYMENT_KEY),
+                "acme",
+                variant,
+                3,
+                Direction::Decrypt,
+                &ciphertexts,
+                &mut decrypted,
+                &mut Vec::new(),
+            )
+            .expect("decrypt");
+            assert_eq!(
+                String::from_utf8(decrypted).expect("utf-8"),
+                "198.51.100.7\n2001:db8::1\n",
+                "{variant:?}"
+            );
+        }
+    }
+
+    /// The key is the tenant's and the epoch's: another tenant or epoch gives
+    /// another ciphertext for the same address.
+    #[test]
+    fn the_key_depends_on_tenant_and_epoch() {
+        let one = |tenant: &str, epoch: u32| {
+            transform_values(
+                &DEPLOYMENT_KEY,
+                tenant,
+                Variant::Deterministic,
+                epoch,
+                Direction::Encrypt,
+                &values(&["198.51.100.7"]),
+            )
+            .expect("encrypt")
+            .remove(0)
+            .0
+        };
+        assert_ne!(one("acme", 1), one("globex", 1));
+        assert_ne!(one("acme", 1), one("acme", 2));
+        assert_eq!(one("acme", 1), one("acme", 1));
+    }
+
+    #[test]
+    fn a_value_that_is_not_an_address_prints_unchanged_with_a_note() {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        run_transform(
+            Some(&DEPLOYMENT_KEY),
+            "acme",
+            VariantArg::Deterministic,
+            1,
+            Direction::Encrypt,
+            &values(&["unknown", "198.51.100.7"]),
+            &mut out,
+            &mut err,
+        )
+        .expect("encrypt");
+        let out = String::from_utf8(out).expect("utf-8");
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], "unknown");
+        assert_ne!(lines[1], "198.51.100.7");
+        assert_eq!(
+            String::from_utf8(err).expect("utf-8"),
+            "note: \"unknown\" is not an IP address; printed unchanged\n"
+        );
+    }
+
+    #[test]
+    fn transform_without_a_deployment_key_is_refused() {
+        let err = run_transform(
+            None,
+            "acme",
+            VariantArg::Prefix,
+            1,
+            Direction::Decrypt,
+            &values(&["198.51.100.7"]),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        )
+        .expect_err("no key");
+        assert!(
+            err.to_string().contains("--tenant-hash-key-file"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_policy_with_rules_and_no_deployment_key_is_refused() {
+        let file = parse_policy_file(DETERMINISTIC, sanitize_rule_key).expect("parses");
+        let err = IpcryptPolicy::new(file, None).expect_err("rules need a key");
+        assert_eq!(err.to_string(), NO_DEPLOYMENT_KEY);
+        assert!(IpcryptPolicy::new(PolicyFile::default(), None).is_ok());
+    }
+
+    #[test]
+    fn a_policy_file_that_does_not_parse_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("policy.toml");
+        std::fs::write(&path, "[[defaults.rules]]\nkey = \"client.ip\"\nepoch = 0\n")
+            .expect("write policy");
+        let err = read_policy_file(Some(&path)).expect_err("epoch 0 is refused");
+        assert!(err.to_string().contains("invalid --ipcrypt-config"), "{err}");
+        let err = read_policy_file(Some(&dir.path().join("absent.toml")))
+            .expect_err("a missing file is refused");
+        assert!(err.to_string().contains("could not read --ipcrypt-config"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn set_policy_creates_then_replaces_the_marker() {
+        let store = MemoryStore::new();
+        let first = policy(DETERMINISTIC);
+        let second = policy(PREFIX);
+        assert_ne!(first.fingerprint(), second.fingerprint());
+
+        let mut out = Vec::new();
+        assert_eq!(
+            set_policy(&store, &first, &mut out).await.expect("create"),
+            SetPolicyOutcome::Created
+        );
+        assert_eq!(stored_fingerprint(&store).await, Some(first.fingerprint()));
+        assert_eq!(
+            set_policy(&store, &first, &mut out).await.expect("same"),
+            SetPolicyOutcome::Unchanged
+        );
+        assert_eq!(
+            set_policy(&store, &second, &mut out).await.expect("replace"),
+            SetPolicyOutcome::Replaced {
+                previous: first.fingerprint()
+            }
+        );
+        assert_eq!(stored_fingerprint(&store).await, Some(second.fingerprint()));
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains(&format!(
+                "replaced sys/ipcrypt/policy: policy fingerprint {} -> {}",
+                hex::encode(first.fingerprint()),
+                hex::encode(second.fingerprint())
+            )),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_policy_with_an_empty_policy_on_an_unmarked_bucket_writes_nothing() {
+        let store = MemoryStore::new();
+        assert_eq!(
+            set_policy(&store, &IpcryptPolicy::empty(), &mut Vec::new())
+                .await
+                .expect("set"),
+            SetPolicyOutcome::NothingToWrite
+        );
+        assert_eq!(stored_fingerprint(&store).await, None);
+    }
+
+    /// The replace is a CAS on the version read: a marker replaced since that
+    /// read fails it, and the newer marker stands.
+    #[tokio::test]
+    async fn set_policy_over_a_stale_read_fails_and_writes_nothing() {
+        let store = MemoryStore::new();
+        let first = policy(DETERMINISTIC);
+        let second = policy(PREFIX);
+        let third = policy(ROTATED);
+        set_policy(&store, &first, &mut Vec::new())
+            .await
+            .expect("create");
+        let stale = read_marker(&store).await.expect("read marker");
+        assert!(stale.is_some());
+        set_policy(&store, &second, &mut Vec::new())
+            .await
+            .expect("replace");
+
+        let err = set_policy_over(&store, &third, stale, &mut Vec::new())
+            .await
+            .expect_err("a stale version must fail the CAS");
+        assert!(
+            err.to_string()
+                .contains("sys/ipcrypt/policy changed after it was read"),
+            "{err}"
+        );
+        assert_eq!(stored_fingerprint(&store).await, Some(second.fingerprint()));
+    }
+
+    #[tokio::test]
+    async fn set_policy_refuses_when_the_marker_cannot_be_read() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
+        use ravel_ipcrypt::marker::IPCRYPT_POLICY_KEY;
+        let store = FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                Rule::new(Op::Get, ScriptedFault::Transient("marker read".into()))
+                    .with_key_contains(IPCRYPT_POLICY_KEY),
+            ),
+        );
+        let err = set_policy(&store, &policy(DETERMINISTIC), &mut Vec::new())
+            .await
+            .expect_err("a failed read refuses");
+        assert!(
+            err.to_string()
+                .contains("refusing to set the IPCrypt policy: nothing was written"),
+            "{err}"
+        );
+        assert_eq!(stored_fingerprint(store.inner()).await, None);
+    }
 }

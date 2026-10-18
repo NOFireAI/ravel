@@ -357,8 +357,8 @@ pub struct IpcryptSubmitReport {
     pub already_present: usize,
 }
 
-/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8): the
-/// `sys/ipcrypt/policy` marker check, then [`plan_requests`], then one
+/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8):
+/// [`plan_requests`], then the `sys/ipcrypt/policy` marker check, then one
 /// [`submit`] per planned request. A failure part-way names the base id, so
 /// rerunning with it as `--request-id` finishes the requests left out.
 #[allow(clippy::too_many_arguments)]
@@ -375,10 +375,13 @@ pub async fn submit_with_ipcrypt(
     now_ns: i64,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<IpcryptSubmitReport> {
-    let rules = policy
-        .checked_rules(store.as_ref(), tenant, "erase submit", out)
-        .await?;
+    // Plan before the marker check, so a refused plan writes nothing at all,
+    // not even the marker a first policy run would create.
+    let rules = policy.rules_for(tenant)?;
     let plans = plan_requests(policy, &rules, tenant, signal, matchers, base_id)?;
+    policy
+        .check_marker_logged(store.as_ref(), "erase submit", out)
+        .await?;
     let total = plans.len();
     if total > 1 {
         writeln!(
@@ -995,5 +998,387 @@ mod tests {
         );
         assert!(parse_matcher("=novalue").is_err(), "empty key rejected");
         assert!(parse_matcher("nokey").is_err(), "missing '=' rejected");
+    }
+}
+
+/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8).
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod ipcrypt_tests {
+    use super::*;
+    use crate::ipcrypt::{IpcryptPolicy, sanitize_rule_key};
+    use ravel_ipcrypt::marker::{IPCRYPT_POLICY_KEY, check_marker};
+    use ravel_ipcrypt::policy::{Variant, parse_policy_file};
+    use ravel_ipcrypt::render::RenderOutcome;
+    use ravel_ipcrypt::rules::EpochKey;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Op, Rule as FaultRule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    const TENANT: &str = "acme";
+    const DEPLOYMENT_KEY: [u8; 32] = [0x5a; 32];
+    const NOW_NS: i64 = 1_700_000_000_000_000_000;
+    const CLIENT: &str = "198.51.100.101";
+    const HOST: &str = "198.51.100.102";
+
+    /// `client.ip` at epoch 2 with epoch 1 retired, `host.ip` at epoch 3 with
+    /// epoch 1 retired.
+    const TWO_EPOCH_POLICY: &str = r#"
+[[defaults.rules]]
+key = "client.ip"
+variant = "deterministic"
+epoch = 2
+retired_epochs = [1]
+
+[[defaults.rules]]
+key = "host.ip"
+variant = "prefix"
+epoch = 3
+retired_epochs = [1]
+"#;
+
+    /// Five epochs on each of two rules: 25 requests for both matchers.
+    const FIVE_EPOCH_POLICY: &str = r#"
+[[defaults.rules]]
+key = "client.ip"
+variant = "deterministic"
+epoch = 5
+retired_epochs = [1, 2, 3, 4]
+
+[[defaults.rules]]
+key = "host.ip"
+variant = "prefix"
+epoch = 5
+retired_epochs = [1, 2, 3, 4]
+"#;
+
+    fn policy(text: &str) -> IpcryptPolicy {
+        let file = parse_policy_file(text, sanitize_rule_key).expect("policy parses");
+        IpcryptPolicy::new(file, Some(&DEPLOYMENT_KEY)).expect("policy loads")
+    }
+
+    /// `value` under `variant` and `epoch`, derived from the deployment key
+    /// directly rather than through the rules the submit resolved.
+    fn ciphertext(variant: Variant, epoch: u32, value: &str) -> String {
+        let key = EpochKey::new(
+            &DEPLOYMENT_KEY,
+            &TenantId::new(TENANT).hash(),
+            variant,
+            epoch,
+        )
+        .expect("key derives");
+        let (encrypted, outcome) = key.encrypt(value);
+        assert_eq!(outcome, RenderOutcome::Encrypted);
+        encrypted
+    }
+
+    fn matcher(key: &str, value: &str) -> (String, String) {
+        (key.to_string(), value.to_string())
+    }
+
+    async fn submit_logs(
+        store: &Arc<dyn ObjectStoreBackend>,
+        policy: &IpcryptPolicy,
+        matchers: Vec<(String, String)>,
+        base: Uuid,
+    ) -> anyhow::Result<IpcryptSubmitReport> {
+        submit_with_ipcrypt(
+            Arc::clone(store),
+            policy,
+            TENANT,
+            SignalArg::Logs,
+            matchers,
+            0,
+            0,
+            "dsar-1".to_string(),
+            base,
+            NOW_NS,
+            &mut Vec::new(),
+        )
+        .await
+    }
+
+    /// The stored `.dreq` for `id`, decoded.
+    async fn stored_request(
+        store: &Arc<dyn ObjectStoreBackend>,
+        signal: Signal,
+        id: Uuid,
+    ) -> ErasureRequest {
+        let key = keys::erasure_request_key(&TenantId::new(TENANT).hash(), signal, id)
+            .expect("request key");
+        let got = store.get(&key, GetRange::Full).await.expect(".dreq stored");
+        erasure::decode_request(&got.data).expect("well-formed .dreq")
+    }
+
+    fn predicate(request: &ErasureRequest) -> Vec<(String, String)> {
+        request
+            .predicate
+            .iter()
+            .map(|m| (m.key.clone(), m.value.clone()))
+            .collect()
+    }
+
+    async fn request_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+        list_all(store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| k.contains("/del/"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_request_per_epoch_with_derived_ids_and_each_epochs_ciphertext() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(7);
+        let report = submit_logs(&store, &policy, vec![matcher("client.ip", CLIENT)], base)
+            .await
+            .expect("submit");
+
+        assert_eq!(report.base_id, base);
+        assert_eq!(report.requests.len(), 2);
+        assert_eq!((report.created, report.already_present), (2, 0));
+        for ((plan, outcome), epoch) in report.requests.iter().zip([2u32, 1]) {
+            assert_eq!(*outcome, SubmitOutcome::Created);
+            let expected_epochs = vec![EncryptedMatcher {
+                key: "client.ip".to_string(),
+                rule_key: "client.ip".to_string(),
+                epoch,
+            }];
+            assert_eq!(plan.epochs, expected_epochs);
+            assert_eq!(
+                plan.request_id,
+                derived_request_id(base, &expected_epochs)
+            );
+            assert_ne!(plan.request_id, base);
+            let stored = stored_request(&store, Signal::Logs, plan.request_id).await;
+            assert_eq!(
+                predicate(&stored),
+                vec![matcher(
+                    "client.ip",
+                    &ciphertext(Variant::Deterministic, epoch, CLIENT)
+                )],
+                "epoch {epoch}"
+            );
+        }
+        assert_ne!(
+            report.requests[0].0.request_id,
+            report.requests[1].0.request_id
+        );
+        assert_eq!(request_keys(store.as_ref()).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn two_encrypted_matchers_with_two_epochs_each_give_four_requests() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(8);
+        let report = submit_logs(
+            &store,
+            &policy,
+            vec![
+                matcher("client.ip", CLIENT),
+                matcher("service.name", "api"),
+                matcher("host.ip", HOST),
+            ],
+            base,
+        )
+        .await
+        .expect("submit");
+
+        assert_eq!(report.requests.len(), 4);
+        assert_eq!(report.created, 4);
+        let mut seen = HashSet::new();
+        for (client_epoch, host_epoch) in [(2u32, 3u32), (2, 1), (1, 3), (1, 1)] {
+            let want = vec![
+                matcher(
+                    "client.ip",
+                    &ciphertext(Variant::Deterministic, client_epoch, CLIENT),
+                ),
+                matcher("service.name", "api"),
+                matcher("host.ip", &ciphertext(Variant::Prefix, host_epoch, HOST)),
+            ];
+            let (plan, _) = report
+                .requests
+                .iter()
+                .find(|(plan, _)| plan.matchers == want)
+                .unwrap_or_else(|| panic!("no request for epochs {client_epoch}/{host_epoch}"));
+            let stored = stored_request(&store, Signal::Logs, plan.request_id).await;
+            assert_eq!(predicate(&stored), want);
+            assert!(seen.insert(plan.request_id));
+        }
+        assert_eq!(request_keys(store.as_ref()).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn more_than_sixteen_requests_is_refused_before_any_write() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(FIVE_EPOCH_POLICY);
+        let err = submit_logs(
+            &store,
+            &policy,
+            vec![matcher("client.ip", CLIENT), matcher("host.ip", HOST)],
+            Uuid::from_u128(9),
+        )
+        .await
+        .expect_err("25 requests must be refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("25 requests, more than 16"), "{message}");
+        assert!(
+            message.contains("rule \"client.ip\" (matcher \"client.ip\") has epochs [5, 1, 2, 3, 4]"),
+            "{message}"
+        );
+        assert!(message.contains("rule \"host.ip\""), "{message}");
+        let all = list_all(store.as_ref(), "").await.expect("list");
+        assert!(
+            all.is_empty(),
+            "a refused plan writes nothing: {:?}",
+            all.iter().map(|o| o.key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_with_the_same_base_id_resubmits_the_same_requests() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(10);
+        let matchers = vec![matcher("client.ip", CLIENT), matcher("host.ip", HOST)];
+        let first = submit_logs(&store, &policy, matchers.clone(), base)
+            .await
+            .expect("first submit");
+        let retry = submit_logs(&store, &policy, matchers, base)
+            .await
+            .expect("a retry is not a conflict");
+        let ids = |report: &IpcryptSubmitReport| -> Vec<Uuid> {
+            report.requests.iter().map(|(p, _)| p.request_id).collect()
+        };
+        assert_eq!(ids(&first), ids(&retry));
+        assert_eq!((retry.created, retry.already_present), (0, 4));
+        assert_eq!(request_keys(store.as_ref()).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn a_single_request_keeps_the_base_id() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(
+            "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n",
+        );
+        let base = Uuid::from_u128(11);
+        let report = submit_logs(&store, &policy, vec![matcher("client.ip", CLIENT)], base)
+            .await
+            .expect("submit");
+        assert_eq!(report.requests.len(), 1);
+        assert_eq!(report.requests[0].0.request_id, base);
+        let stored = stored_request(&store, Signal::Logs, base).await;
+        assert_eq!(
+            predicate(&stored),
+            vec![matcher(
+                "client.ip",
+                &ciphertext(Variant::Deterministic, 1, CLIENT)
+            )]
+        );
+    }
+
+    /// A metric matcher names the label as stored; the rule is found through
+    /// the sanitized key and the key itself is submitted as written.
+    #[tokio::test]
+    async fn a_metric_matcher_is_ruled_through_its_sanitized_label_name() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(
+            "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n",
+        );
+        let base = Uuid::from_u128(12);
+        submit_with_ipcrypt(
+            Arc::clone(&store),
+            &policy,
+            TENANT,
+            SignalArg::Metrics,
+            vec![matcher("client_ip", CLIENT)],
+            0,
+            0,
+            String::new(),
+            base,
+            NOW_NS,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("submit");
+        let stored = stored_request(&store, Signal::Metrics, base).await;
+        assert_eq!(
+            predicate(&stored),
+            vec![matcher(
+                "client_ip",
+                &ciphertext(Variant::Deterministic, 1, CLIENT)
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_that_is_not_an_address_is_submitted_unchanged() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(13);
+        let report = submit_logs(&store, &policy, vec![matcher("client.ip", "unknown")], base)
+            .await
+            .expect("submit");
+        assert_eq!(report.requests.len(), 1);
+        assert!(report.requests[0].0.epochs.is_empty());
+        let stored = stored_request(&store, Signal::Logs, base).await;
+        assert_eq!(predicate(&stored), vec![matcher("client.ip", "unknown")]);
+    }
+
+    #[tokio::test]
+    async fn a_marker_mismatch_refuses_and_writes_no_request() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let other = [7u8; 32];
+        check_marker(store.as_ref(), other).await.expect("seed marker");
+        let policy = policy(TWO_EPOCH_POLICY);
+        let err = submit_logs(
+            &store,
+            &policy,
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(14),
+        )
+        .await
+        .expect_err("a different policy must be refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("refusing to erase submit"), "{message}");
+        assert!(message.contains(&hex::encode(other)), "{message}");
+        assert!(
+            message.contains(&hex::encode(policy.fingerprint())),
+            "{message}"
+        );
+        assert!(request_keys(store.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_marker_read_failure_refuses_and_writes_nothing() {
+        let faulty = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Get, ScriptedFault::Transient("marker read".into()))
+                    .with_key_contains(IPCRYPT_POLICY_KEY),
+            ),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let policy = policy(TWO_EPOCH_POLICY);
+        let err = submit_logs(
+            &store,
+            &policy,
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(15),
+        )
+        .await
+        .expect_err("a failed marker read must refuse");
+        assert!(
+            format!("{err:#}").contains("refusing to erase submit"),
+            "{err:#}"
+        );
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Transient), 1);
+        let keys = list_all(faulty.inner(), "").await.expect("list");
+        assert!(keys.is_empty(), "{keys:?}");
     }
 }
