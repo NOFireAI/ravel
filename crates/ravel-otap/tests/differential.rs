@@ -31,6 +31,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use proptest::prelude::*;
 
+use ravel_ipcrypt::policy::{Variant, parse_policy_file};
+use ravel_ipcrypt::render::RenderOutcome;
 use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, ExemplarRow, ExemplarValue, HistogramMetricRow,
@@ -45,9 +47,9 @@ use ravel_otap::normalize::{
 };
 use ravel_otap::proto::experimental::arrow::v1::{ArrowPayloadType, BatchArrowRecords};
 use ravel_otap::stream::{DecodedBatch, StreamConfig, StreamState};
-use ravel_otlp::normalize::normalize_metrics_with_exemplars;
+use ravel_otlp::normalize::{normalize_metrics_with_exemplars, sanitize_label_name};
 use ravel_otlp::{IngestLimits, NormalizeOutput, Rejection, normalize_metrics};
-use ravel_types::{ExemplarCap, SeriesId, TenantId};
+use ravel_types::{ExemplarCap, SeriesId, TenantHash, TenantId};
 
 const INGEST_TS_NS: i64 = 1_700_000_000_000_000_000;
 
@@ -357,9 +359,13 @@ fn rejection_multiset(rejected: &[Rejection]) -> BTreeMap<String, usize> {
     m
 }
 
-/// Run `workload` through both paths and assert they agree.
+/// Run `workload` through the OTLP path and the OTAP path under `rules`,
+/// returning `(otlp, otap)`.
 #[allow(clippy::expect_used)]
-fn assert_paths_agree(workload: &[WorkloadMetric]) {
+fn normalize_both(
+    workload: &[WorkloadMetric],
+    rules: &TenantRules,
+) -> (NormalizeOutput, NormalizeOutput) {
     let tenant = TenantId::new("acme");
     let limits = IngestLimits::default();
 
@@ -367,7 +373,7 @@ fn assert_paths_agree(workload: &[WorkloadMetric]) {
         &tenant,
         build_otlp_request(workload),
         &limits,
-        &TenantRules::none(),
+        rules,
         INGEST_TS_NS,
     );
 
@@ -375,13 +381,13 @@ fn assert_paths_agree(workload: &[WorkloadMetric]) {
     let raw_batch = build_otap_batch(workload, &mut encoder, 0);
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode otap batch");
-    let otap_out = normalize_decoded(
-        &tenant,
-        &decoded,
-        &limits,
-        &TenantRules::none(),
-        INGEST_TS_NS,
-    );
+    let otap_out = normalize_decoded(&tenant, &decoded, &limits, rules, INGEST_TS_NS);
+    (otlp_out, otap_out)
+}
+
+/// Run `workload` through both paths and assert they agree.
+fn assert_paths_agree(workload: &[WorkloadMetric]) {
+    let (otlp_out, otap_out) = normalize_both(workload, &TenantRules::none());
 
     assert_eq!(
         series_ids(&otlp_out),
@@ -481,6 +487,103 @@ fn duplicate_label_names_after_sanitization_agree() {
         kind: WorkloadKind::Gauge,
         points: vec![point],
     }]);
+}
+
+/// The two paths store the same labels and count the same IPCrypt tally
+/// under a non-empty rule set: an address (encrypted), a hostname and an
+/// integer (both unparsed, kept as sent), a repeat of the address point
+/// (served from the memo on OTLP and from the group cache on OTAP), and a
+/// point rejected by a sanitized-name collision after its ruled value was
+/// rendered.
+#[test]
+fn ipcrypt_rules_store_the_same_labels_and_tally_on_both_paths() {
+    let sanitize = |key: &str| sanitize_label_name(key.to_string());
+    let policy = parse_policy_file(
+        "[defaults]\nrules = [{ key = \"client.ip\", variant = \"deterministic\" }]\n",
+        sanitize,
+    )
+    .expect("policy parses");
+    let rules = TenantRules::resolve(
+        &policy,
+        "acme",
+        &TenantHash([9u8; 16]),
+        &[7u8; 32],
+        sanitize,
+    )
+    .expect("rules resolve");
+
+    let ruled = |value: WorkloadValue| WorkloadAttr {
+        key: "client.ip".to_string(),
+        value,
+    };
+    let point = |ts_offset_ns: i64, attrs: Vec<WorkloadAttr>| WorkloadPoint {
+        ts_offset_ns,
+        value: 1.0,
+        flags: 0,
+        attrs,
+    };
+    let address = || ruled(WorkloadValue::Str("192.0.2.1".to_string()));
+    let collision = WorkloadAttr {
+        key: "client_ip".to_string(),
+        value: WorkloadValue::Str("192.0.2.9".to_string()),
+    };
+    let workload = [WorkloadMetric {
+        name: "requests".to_string(),
+        unit: String::new(),
+        kind: WorkloadKind::Gauge,
+        points: vec![
+            point(0, vec![address()]),
+            point(1, vec![address()]),
+            point(
+                0,
+                vec![ruled(WorkloadValue::Str("db.example.internal".to_string()))],
+            ),
+            point(0, vec![ruled(WorkloadValue::Int(42))]),
+            point(0, vec![address(), collision]),
+        ],
+    }];
+
+    let (otlp_out, otap_out) = normalize_both(&workload, &rules);
+    let stored = |out: &NormalizeOutput| -> BTreeSet<(SeriesId, Vec<(String, String)>)> {
+        out.points
+            .iter()
+            .map(|p| {
+                let labels = p
+                    .labels
+                    .iter()
+                    .map(|l| (l.name.clone(), l.value.clone()))
+                    .collect();
+                (p.series_id, labels)
+            })
+            .collect()
+    };
+    assert_eq!(otlp_out.points.len(), 4);
+    assert_eq!(stored(&otlp_out), stored(&otap_out), "stored labels differ");
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
+    );
+    let stored_values: BTreeSet<String> = otlp_out
+        .points
+        .iter()
+        .filter_map(|p| p.labels.get("client_ip").map(str::to_string))
+        .collect();
+    assert!(!stored_values.contains("192.0.2.1"), "{stored_values:?}");
+    assert!(stored_values.contains("db.example.internal"));
+    assert!(stored_values.contains("42"));
+
+    assert_eq!(otlp_out.ipcrypt_tally, otap_out.ipcrypt_tally);
+    let tally = &otlp_out.ipcrypt_tally;
+    assert_eq!(
+        tally.count(Variant::Deterministic, RenderOutcome::Encrypted),
+        2
+    );
+    assert_eq!(
+        tally.count(Variant::Deterministic, RenderOutcome::Unparsed),
+        2
+    );
 }
 
 /// A gauge point flagged `NoRecordedValue` is stored as the Prometheus stale
