@@ -5,7 +5,8 @@
 # The kit's lib/kit.py reads this file and refuses a missing key, a key it does
 # not know and a removed key, each named. run.toml's band_sections selects which
 # sections a run is judged by; a placeholder value is refused only in a selected
-# section.
+# section. The healthz_* keys are the exception: each may be left out or left a
+# placeholder in any section, and the band is then skipped, so they are opt-in.
 #
 # Hot is a statement's best of its second and third tries (min_ms) and cold
 # its first try (cold_ms), the figures the runbook's analyse.py sums.
@@ -57,6 +58,14 @@ hot_statement_floor_s = 0.2
 # own, named.
 hot_sum_max_ratio = 1.05
 cold_sum_max_ratio = 1.05
+# Optional: GET /healthz latency on port 4318 (the query listener) and 4319
+# (the health listener), sampled every 250 ms with a 2 s client timeout during
+# the benchmark phase and each concurrent round (those run.toml's
+# healthz_phases names, default both); a timeout or a non-200 counts
+# as a 2000 ms sample. Arm B's p99 per phase at most this times arm A's, over
+# the phases both arms ran. A placeholder or a missing key skips the band.
+healthz_p99_max_ratio_4318 = "FILL-IN-ON-REFERENCE-MACHINE"
+healthz_p99_max_ratio_4319 = "FILL-IN-ON-REFERENCE-MACHINE"
 
 # One arm judged on its own by the box itself. Fill these in on the reference
 # machine, then select "absolute" in run.toml's band_sections.
@@ -75,6 +84,11 @@ error_pooled_max = "FILL-IN-ON-REFERENCE-MACHINE"
 concurrent_qps_min = "FILL-IN-ON-REFERENCE-MACHINE"
 concurrent_error_pooled_max = "FILL-IN-ON-REFERENCE-MACHINE"
 q29_probe_s_max = "FILL-IN-ON-REFERENCE-MACHINE"
+# Optional: each phase's /healthz p99 in milliseconds on port 4318 and 4319 at
+# most this, sampled as the relative healthz bands above say. A placeholder or
+# a missing key skips the band, even with "absolute" selected.
+healthz_p99_ms_max_4318 = "FILL-IN-ON-REFERENCE-MACHINE"
+healthz_p99_ms_max_4319 = "FILL-IN-ON-REFERENCE-MACHINE"
 
 # Each statement's hot time in seconds, keyed by its id's qNN prefix. A
 # statement that did not answer misses its band.

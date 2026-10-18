@@ -39,7 +39,7 @@ prefix = "clickbench-kit"
 # ec2:TerminateInstances, ec2:DescribeVolumes and cloudwatch:GetMetricStatistics
 # as well, a box terminates itself through the API and stamps the root
 # volume's type; without them it shuts itself down, which terminates it too.
-instance_profile = "ravel-clickbench-box"
+instance_profile = "ravel-clickbench-instance-profile"
 
 # Optional: ami (default: the latest Amazon Linux 2023 from SSM), subnet,
 # security_group, key_name (only for logging in to watch).
@@ -55,18 +55,22 @@ shards = 8
 # run the same statements whatever their own checkout holds.
 corpus = "benchmarks/clickbench/hits.corpus.json"
 dataset_url = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
-# The dataset's sha256. A box whose download has another digest fails, and
-# fetch.sh refuses two arms that did not load the same dataset.
-dataset_sha256 = "FILL-IN-DATASET-SHA256"
+# The dataset's sha256 (hits_compatible/hits.parquet, 14,779,976,446 bytes). A
+# box whose download has another digest fails, and fetch.sh refuses two arms
+# that did not load the same dataset.
+dataset_sha256 = "a390f6cb782f6aaef278c72fc1dd86c4f30bc843ebab3c159e9bd4d45ddb079f"
 # The rows the dataset holds: hits.parquet has 99,997,497. The load must report
 # exactly this many rows_written, and SELECT COUNT(*) FROM logs (the corpus's
 # q01, sent once before the benchmark through the same endpoint and window)
 # must answer it, or the box fails at step load or step verify.
 rows_expected = 99997497
 
-# The loopback RustFS release the store runs on, pinned by digest.
-rustfs_url = "FILL-IN-RUSTFS-RELEASE-URL"
-rustfs_sha256 = "FILL-IN-RUSTFS-RELEASE-SHA256"
+# The loopback RustFS release the store runs on, pinned by digest. The musl
+# build: the gnu asset needs glibc 2.38 and the default AMI carries 2.34. The
+# box runs `rustfs --version` right after unpacking it, and a binary that cannot
+# run fails the box at step rustfs, quoting its output.
+rustfs_url = "https://github.com/rustfs/rustfs/releases/download/1.0.0/rustfs-linux-x86_64-musl-v1.0.0.zip"
+rustfs_sha256 = "c30a95b76546f25122c9ca387090ddb30c391ca5605621b0d7c881703c0f21c8"
 
 # Pinned the same on both arms so the budget is not the variable that differs
 # (clickbench-aws-runbook.md section 8).
@@ -78,7 +82,28 @@ audit_mode = "off"
 # 0.8), query_timeout_s (default 900), window_hours (default 200000). Every
 # statement is sent with an explicit start and end window_hours apart, ending
 # when the verify step starts, as sql_latency_bench --window-hours does;
-# without one the server reads only the last hour.
+# without one the server reads only the last hour. fold_min_entry_ratio is the
+# fold's entry_count over the load report's "objects written" (data objects
+# only; the bucket's key count also holds one commit record per object), and a
+# load report without that figure fails the box at step load.
+
+# Optional: extra ravel-server flags for one arm, appended after the flags the
+# kit sets and stamped in that arm's server_flags. An entry repeating a
+# kit-set flag (--store, --shards, --listen-http, --listen-health,
+# --memory-budget-bytes, --audit-mode, --audit-text, --tenant-token-file,
+# --tenant-hash-unkeyed) is refused, naming the flag. fetch.sh accepts arms
+# whose flags differ by exactly these two lists, printing the difference once.
+# server_flags_a = []
+# server_flags_b = ["--fetch-concurrency", "64"]
+# A resolved server setting (server_settings) may differ between the arms only
+# when a flag that sets it differs between these lists; any other difference
+# is refused, naming the setting.
+
+# Optional: the phases the /healthz sampler runs in, from "benchmark" and
+# "concurrent" (default both). It adds /healthz at 4 Hz per listener and
+# /metrics at 1 Hz beside the statements; leave "benchmark" out to compare
+# against bands taken before the sampler existed.
+# healthz_phases = ["benchmark", "concurrent"]
 
 # Optional phase keys, each shown at its default. launch.sh writes any left out
 # into the run.toml it uploads, at its default, and check-run refuses a value

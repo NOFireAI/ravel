@@ -12,17 +12,21 @@
 #               ravel-server (feature sql) copied to /root/bin/<name>-<sha>,
 #               RustFS from run.toml's rustfs_url checked against
 #               rustfs_sha256, and hits.parquet downloaded during the build
+#   rustfs      the RustFS binary unpacked, then `rustfs --version`, whose
+#               failure fails this step quoting its output; then
 #   store       RustFS on 127.0.0.1:9000 with keys generated on the box, a
 #               bucket, and `store qualify`
-#   arm-env     /root/kit/arm.env: the binaries and every server flag, written
-#               once; every server start sources it, so a restart runs the
-#               same flags
+#   arm-env     /root/kit/arm.env: the binaries and every server flag (the
+#               kit's own, then run.toml's server_flags_a or server_flags_b
+#               for this arm), written once; every server start sources it,
+#               so a restart runs the same flags
 #   load        runbook section 7: load, compact, fold with --writers-stopped
 #               and declare, with store object counts before and after the
 #               load; the load must report rows_written equal to run.toml's
-#               rows_expected, the fold must report seal_through_hour and an
-#               entry_count of at least fold_min_entry_ratio (default 0.8) of
-#               the objects the load wrote, and its figures are stamped
+#               rows_expected and an "objects written" figure, the fold must
+#               report seal_through_hour and an entry_count of at least
+#               fold_min_entry_ratio (default 0.8) of that figure, and its
+#               figures are stamped
 #   verify      the corpus's q01, SELECT COUNT(*) FROM logs, once through the
 #               benchmark's endpoint and window; its one cell must equal
 #               rows_expected, and the three counts are stamped as row_count
@@ -32,6 +36,8 @@
 #               (upstream ClickBench's bench_concurrent_qps, concurrent_rounds
 #               times), q29_probe (q29 alone, warmed up, then timed) and perf
 #               (folded perf stacks of one hot call per statement)
+#   healthz     healthz.txt checked to hold each sampled phase's HEALTHZ and
+#               HEARTBEAT lines exactly once, into /root/kit/healthz.json
 #   results     /root/kit/results.json (SqlLatencyReport's entries and failed
 #               rows, which the runbook's analyse.py reads, plus the
 #               provenance stamps and the absolute bands when run.toml's
@@ -66,8 +72,20 @@
 # KIT_WATCHDOG_INTERVAL (the concurrent phase's SELECT 1 check interval,
 # default 5 s),
 # KIT_PERF_SETTLE (seconds perf record gets before the profiled call, default
-# 1) and KIT_CPUINFO and KIT_MEMINFO (the hardware stamp's sources, default
-# /proc/cpuinfo and /proc/meminfo).
+# 1), KIT_CPUINFO and KIT_MEMINFO (the hardware stamp's sources, default
+# /proc/cpuinfo and /proc/meminfo) and KIT_HEALTH_BASE_4318 and
+# KIT_HEALTH_BASE_4319 (the /healthz sampler's two listeners, default
+# http://127.0.0.1:4318 and http://127.0.0.1:4319).
+#
+# During the benchmark phase and each concurrent round (each phase run.toml's
+# healthz_phases names, default both), one kit.py healthz-sampler process GETs
+# /healthz on both listeners every 250 ms and /metrics on 4318 (the health
+# listener answers 404 there) every 1 s, each with a 2 s timeout, into
+# out/<phase>/healthz/ or out/concurrent/round-N/healthz/. It runs beside the
+# statements, never inside them: run.sh only writes its gate file with a
+# builtin, so no statement's timed window forks for it. Its HEALTHZ and
+# HEARTBEAT lines go to /root/kit/out/healthz.txt, which must hold each
+# exactly once per phase and port, or the box fails at step healthz.
 
 set -uo pipefail
 
@@ -100,12 +118,18 @@ RUSTFS_ENDPOINT="http://127.0.0.1:9000"
 STORE_BUCKET="ravel-kit"
 SQL_URL="http://127.0.0.1:4318/api/v1/sql"
 READY_URL="http://127.0.0.1:4319/readyz"
+HEALTH_BASE_4318="${KIT_HEALTH_BASE_4318:-http://127.0.0.1:4318}"
+HEALTH_BASE_4319="${KIT_HEALTH_BASE_4319:-http://127.0.0.1:4319}"
 
 CURRENT_STEP=""
 FINISHED=0
 SERVER_N=0
 SERVER_PID=""
 SAMPLER_PIDS=""
+HEALTHZ_PID=""
+HEALTHZ_ON=0
+HEALTHZ_PHASES=""
+HEALTHZ_GEN=0
 DATASET_PID=""
 BANDS_VERDICT="none"
 
@@ -146,6 +170,20 @@ toml_or() {
   v="$(kit_py get "$RUN_TOML" "$1" 2>/dev/null)" || v=""
   [ -n "$v" ] || v="$2"
   printf '%s\n' "$v"
+}
+
+# toml_get_opt KEY FILE: KEY's items into FILE, one per line, or FILE empty
+# and exit 3 when run.toml lacks KEY. Any other failure to read it is reported
+# and returned, never taken for an absent key.
+toml_get_opt() {
+  local code=0
+  kit_py get "$RUN_TOML" "$1" >"$2" 2>"$2.err" || code=$?
+  case "$code" in
+    0 | 3) rm -f "$2.err"; return "$code" ;;
+  esac
+  say "cannot read $1 from $RUN_TOML (kit.py get exit $code): $(head -c 300 "$2.err")"
+  rm -f "$2.err"
+  return "$code"
 }
 
 # The control characters json_str_to drops: every one below 0x20 but tab, line
@@ -249,6 +287,14 @@ load_config() {
   BAND_SECTIONS="$(toml_or band_sections "$(printf 'relative\nabsolute')" | tr '\n' ' ')"
   PHASES="$(toml phases | tr '\n' ' ')" || return 1
   LANES="$(toml lanes | tr '\n' ' ')" || return 1
+  local code=0
+  toml_get_opt healthz_phases "$KIT/healthz-phases" || code=$?
+  case "$code" in
+    0) HEALTHZ_PHASES="$(tr '\n' ' ' <"$KIT/healthz-phases")" ;;
+    3) HEALTHZ_PHASES="benchmark concurrent" ;;
+    *) return 1 ;;
+  esac
+  rm -f "$KIT/healthz-phases"
   CORPUS="$SRC/corpus.json"
   MAPPING="$RAVEL_DIR/benchmarks/clickbench/hits.mapping.toml"
 }
@@ -307,6 +353,7 @@ fail_run() {
   arm_shutdown
   FINISHED=1
   stop_samplers
+  healthz_stop
   stop_server
   printf 'FAILED step=%s at=%s\n' "$name" "$(utc_now)" >"$KIT/FAILED"
   if tail -n 20 "$KIT/run.log" >"$tail_file" 2>/dev/null; then
@@ -479,6 +526,9 @@ bootstrap_rustfs() {
       install -m 0755 "$bin" "$BIN_DIR/rustfs" || return 1 ;;
     *) install -m 0755 "$dl" "$BIN_DIR/rustfs" || return 1 ;;
   esac
+  # A binary built for another libc unpacks and installs fine, then cannot run.
+  "$BIN_DIR/rustfs" --version >"$KIT/rustfs.version" 2>&1 \
+    || { say "rustfs --version failed: $(head -c 500 "$KIT/rustfs.version")"; return 1; }
   mkdir -p "$RUSTFS_DATA"
   RUSTFS_ACCESS_KEY="$RUSTFS_ACCESS_KEY" RUSTFS_SECRET_KEY="$RUSTFS_SECRET_KEY" \
     nohup "$BIN_DIR/rustfs" --address 127.0.0.1:9000 "$RUSTFS_DATA" >"$KIT/rustfs.log" 2>&1 &
@@ -490,7 +540,6 @@ bootstrap_rustfs() {
   rustfs_aws s3api head-bucket --bucket "$STORE_BUCKET" >/dev/null 2>&1 \
     || rustfs_aws s3api create-bucket --bucket "$STORE_BUCKET" --object-lock-enabled-for-bucket >/dev/null \
     || return 1
-  "$BIN_DIR/rustfs" --version >"$KIT/rustfs.version" 2>&1 || true
 }
 
 store_qualify() {
@@ -511,12 +560,15 @@ count_objects() {
 
 # resolve_arm_env: the binaries and server flags, written once. A restarted
 # run.sh keeps the file it finds, so every server start uses the same flags.
+# SERVER_FLAGS is the kit's own flags (SERVER_BASE_FLAGS) followed by the
+# arm's run.toml server_flags_a or server_flags_b (SERVER_EXTRA_FLAGS), which
+# check-run has already refused if one repeats a kit-set flag.
 resolve_arm_env() {
   if [ -s "$ARM_ENV" ]; then
     stamp "arm.env kept"
     return 0
   fi
-  local preload="" flags
+  local preload="" flags extra=() key f code=0
   preload="$(ls /usr/lib64/libtcmalloc.so.4 /usr/lib64/libtcmalloc.so 2>/dev/null | head -n 1)"
   flags=(--store s3 --shards "$SHARDS" --tenant-hash-unkeyed
     --tenant-token-file "$TOKEN_FILE"
@@ -525,13 +577,25 @@ resolve_arm_env() {
   if [ "$AUDIT_MODE" = required ]; then
     flags+=(--audit-text "$AUDIT_TEXT")
   fi
+  case "$ARM" in A) key=server_flags_a ;; *) key=server_flags_b ;; esac
+  toml_get_opt "$key" "$KIT/extra-flags" || code=$?
+  case "$code" in
+    0) while IFS= read -r f; do extra+=("$f"); done <"$KIT/extra-flags" ;;
+    3) ;;
+    *) rm -f "$KIT/extra-flags"; return 1 ;;
+  esac
+  rm -f "$KIT/extra-flags"
   {
     printf 'SERVER_BIN=%q\n' "$BIN_DIR/ravel-server-$SHA"
     printf 'CLI_BIN=%q\n' "$BIN_DIR/ravel-cli-$SHA"
     printf 'SERVER_PRELOAD=%q\n' "$preload"
-    printf 'SERVER_FLAGS=('
+    printf 'SERVER_BASE_FLAGS=('
     printf ' %q' "${flags[@]}"
     printf ' )\n'
+    printf 'SERVER_EXTRA_FLAGS=('
+    [ "${#extra[@]}" = 0 ] || printf ' %q' ${extra[@]+"${extra[@]}"}
+    printf ' )\n'
+    printf 'SERVER_FLAGS=("${SERVER_BASE_FLAGS[@]}" ${SERVER_EXTRA_FLAGS[@]+"${SERVER_EXTRA_FLAGS[@]}"})\n'
   } >"$ARM_ENV.tmp" && mv "$ARM_ENV.tmp" "$ARM_ENV"
 }
 
@@ -650,6 +714,106 @@ stop_samplers() {
   SAMPLER_PIDS=""
 }
 
+# healthz_start KIND DIR: the /healthz sampler (kit.py healthz-sampler) into
+# DIR, its gate down, so nothing it samples counts until healthz_up. KIND is
+# benchmark or concurrent; a KIND run.toml's healthz_phases leaves out starts
+# nothing, and the other healthz_* calls are then no-ops. python3 is started
+# directly, not through kit_py, so $! is the sampler itself: a function run in
+# the background is a subshell, and killing that leaves python3 running.
+healthz_start() {
+  HEALTHZ_ON=0
+  HEALTHZ_PID=""
+  case " $HEALTHZ_PHASES " in *" $1 "*) ;; *) return 0 ;; esac
+  HEALTHZ_DIR="$2"
+  mkdir -p "$HEALTHZ_DIR" || return 1
+  rm -f "$HEALTHZ_DIR/ack"
+  printf 'down %s\n' "$HEALTHZ_GEN" >"$HEALTHZ_DIR/gate"
+  python3 "$PY_KIT" healthz-sampler "$HEALTHZ_DIR" "$HEALTHZ_DIR/gate" "$HEALTHZ_DIR/ack" \
+    "$HEALTH_BASE_4318" "$HEALTH_BASE_4319" >"$HEALTHZ_DIR/sampler.log" 2>&1 &
+  HEALTHZ_PID=$!
+  HEALTHZ_ON=1
+}
+
+# healthz_up: the gate opened on a new generation, then a wait until the
+# sampler has a gated sample of it on both listeners and /metrics, so a
+# phase's samples begin with its server up. Called with a server ready and
+# before a timed window opens; the wait polls the ack file with builtins and
+# sleep.
+healthz_up() {
+  local i a=""
+  [ "$HEALTHZ_ON" = 1 ] || return 0
+  HEALTHZ_GEN=$((HEALTHZ_GEN + 1))
+  printf 'up %s\n' "$HEALTHZ_GEN" >"$HEALTHZ_DIR/gate"
+  for ((i = 0; i < 750; i++)); do
+    if [ -f "$HEALTHZ_DIR/ack" ]; then
+      read -r a <"$HEALTHZ_DIR/ack" || a=""
+      [ "$a" != "$HEALTHZ_GEN" ] || return 0
+    fi
+    kill -0 "$HEALTHZ_PID" 2>/dev/null \
+      || { say "healthz sampler exited; see $HEALTHZ_DIR/sampler.log"; return 1; }
+    sleep 0.02
+  done
+  say "healthz sampler took no sample of generation $HEALTHZ_GEN in 15 s"
+  return 1
+}
+
+# healthz_down: the gate closed, before the server stops on purpose. A builtin
+# write, so it costs a statement's window nothing.
+healthz_down() {
+  [ -z "$HEALTHZ_PID" ] || printf 'down %s\n' "$HEALTHZ_GEN" >"$HEALTHZ_DIR/gate"
+}
+
+# healthz_stop: SIGTERM to the sampler, then up to 5 s for it to exit before
+# a logged SIGKILL, so no sampler outlives its phase or the run.
+healthz_stop() {
+  local i
+  [ -n "$HEALTHZ_PID" ] || return 0
+  kill "$HEALTHZ_PID" 2>/dev/null || true
+  for ((i = 0; i < 250; i++)); do
+    kill -0 "$HEALTHZ_PID" 2>/dev/null || break
+    sleep 0.02
+  done
+  if kill -0 "$HEALTHZ_PID" 2>/dev/null; then
+    say "healthz sampler $HEALTHZ_PID still running 5 s after SIGTERM; sending SIGKILL"
+    kill -KILL "$HEALTHZ_PID" 2>/dev/null || true
+  fi
+  wait "$HEALTHZ_PID" 2>/dev/null || true
+  HEALTHZ_PID=""
+}
+
+# healthz_finish PHASE: the sampler stopped, then PHASE's HEALTHZ and
+# HEARTBEAT lines appended to out/healthz.txt and printed to run.log.
+healthz_finish() {
+  local lines
+  [ "$HEALTHZ_ON" = 1 ] || return 0
+  healthz_down
+  healthz_stop
+  lines="$(kit_py healthz-summary "$1" "$HEALTHZ_DIR")" || return 1
+  printf '%s\n' "$lines" >>"$OUT/healthz.txt"
+  printf '%s\n' "$lines" >&2
+}
+
+# do_healthz_check: out/healthz.txt must hold each sampled phase's lines
+# exactly once; kit.py healthz-check refuses a missing or a repeated one. A run
+# that sampled no phase must have an empty healthz.txt, and its results.json
+# healthz block is null.
+do_healthz_check() {
+  local phases=() phase r
+  for phase in $PHASES; do
+    case " $HEALTHZ_PHASES " in *" $phase "*) ;; *) continue ;; esac
+    case "$phase" in
+      benchmark) phases+=(benchmark) ;;
+      concurrent) for ((r = 1; r <= CONC_ROUNDS; r++)); do phases+=("concurrent-$r"); done ;;
+    esac
+  done
+  if [ "${#phases[@]}" = 0 ]; then
+    [ ! -s "$OUT/healthz.txt" ] || { say "$OUT/healthz.txt holds lines, but no phase was sampled"; return 1; }
+    echo null >"$KIT/healthz.json"
+    return 0
+  fi
+  kit_py healthz-check "$OUT/healthz.txt" "${phases[@]}" >"$KIT/healthz.json"
+}
+
 # --- load, compact, fold, declare (runbook section 7) ----------------------
 
 # timed FILE FORMAT CMD...: CMD under /usr/bin/time, its figures in FILE.
@@ -669,9 +833,10 @@ out_field() {
 }
 
 # do_load: the load, then its row count: rows_written must be run.toml's
-# rows_expected, or every later figure measures other data.
+# rows_expected, or every later figure measures other data. Its "objects
+# written" figure is the fold check's denominator and must be present.
 do_load() {
-  local rows
+  local rows objects
   timed "$KIT/load.time" 'wall=%e rss_kb=%M user=%U sys=%S' \
     "$CLI_BIN" --store s3 --tenant-hash-unkeyed load \
     --parquet "$DATASET" \
@@ -683,6 +848,9 @@ do_load() {
   rows="$(out_field "$KIT/load.out" rows_written)" || return 1
   [ "$rows" = "$ROWS_EXPECTED" ] \
     || { say "load wrote $rows rows, run.toml rows_expected is $ROWS_EXPECTED"; return 1; }
+  objects="$(out_field "$KIT/load.out" "objects written")" || return 1
+  [[ "$objects" =~ ^[0-9]+$ ]] \
+    || { say "load report's objects written is not a whole number: '$objects'"; return 1; }
 }
 
 do_compact() {
@@ -696,29 +864,34 @@ fold_field() {
 }
 
 # do_fold: the fold, then its precondition: a sealed hour, and entry_count at
-# least FOLD_MIN_RATIO of the objects the load wrote.
+# least FOLD_MIN_RATIO of the objects the load wrote, the load report's
+# "objects written". The bucket's key delta is not that figure: it also
+# counts a commit record per object, so it is stamped beside it only.
 do_fold() {
   "$CLI_BIN" --store s3 --tenant-hash-unkeyed catalog fold \
     --tenant "$TENANT" --shards "$SHARDS" --signal logs --writers-stopped \
     >"$KIT/fold.out" 2>&1 || return 1
-  local seal entries watermark buckets part before after written ok
+  local seal entries watermark buckets part before after written keys ok
   seal="$(fold_field seal_through_hour)" || return 1
   watermark="$(fold_field watermark_hour)" || return 1
   entries="$(fold_field entry_count)" || return 1
   buckets="$(fold_field buckets_folded)" || return 1
   part="$(fold_field part_bytes)" || return 1
+  written="$(out_field "$KIT/load.out" "objects written")" || return 1
+  [[ "$written" =~ ^[0-9]+$ ]] \
+    || { say "load report's objects written is not a whole number: '$written'"; return 1; }
   before="$(cat "$KIT/object-counts/before-load")"
   after="$(cat "$KIT/object-counts/after-load")"
-  written=$((after - before))
+  keys=$((after - before))
   [[ "$seal" =~ ^Some\(([0-9]+)\)$ ]] || { say "fold sealed nothing: seal_through_hour=$seal"; return 1; }
   [[ "$entries" =~ ^[0-9]+$ ]] || { say "fold printed no entry_count"; return 1; }
   ok="$(python3 -c 'import sys; print(int(int(sys.argv[1]) >= float(sys.argv[3]) * int(sys.argv[2])))' \
     "$entries" "$written" "$FOLD_MIN_RATIO")" || return 1
   mkdir -p "$STAMPS"
-  printf '{"verified_at": %s, "seal_through_hour": %s, "watermark_hour": %s, "entry_count": %s, "buckets_folded": %s, "part_bytes": %s, "objects_written_by_load": %s, "min_entry_ratio": %s, "precondition": %s}\n' \
+  printf '{"verified_at": %s, "seal_through_hour": %s, "watermark_hour": %s, "entry_count": %s, "buckets_folded": %s, "part_bytes": %s, "objects_written_by_load": %s, "store_keys_added_by_load": %s, "min_entry_ratio": %s, "precondition": %s}\n' \
     "$(json_str "$(utc_now)")" "$(json_str "$seal")" "$(json_str "$watermark")" \
     "$(json_num "$entries")" "$(json_num "$buckets")" "$(json_num "$part")" \
-    "$(json_num "$written")" "$(json_num "$FOLD_MIN_RATIO")" \
+    "$(json_num "$written")" "$(json_num "$keys")" "$(json_num "$FOLD_MIN_RATIO")" \
     "$([ "$ok" = 1 ] && echo '"met"' || echo '"failed"')" >"$STAMPS/fold"
   [ "$ok" = 1 ] || { say "fold entry_count $entries is under $FOLD_MIN_RATIO of the $written objects the load wrote"; return 1; }
 }
@@ -794,9 +967,11 @@ print(n)' "$dir/count.json" 2>/dev/null)" \
 # stats object. RQ_DEFER=1 reads no answer: a call that completed with a
 # status is recorded with a "pending" member naming its response file
 # (relative to the calls file's directory) and EXPECT_ROWS, and kit.py
-# concurrent-answers settles its rows, outcome, class and error later. With
-# RQ_DEFER=1 and no RQ_STATS a call starts no interpreter and forks nothing
-# but curl.
+# concurrent-answers settles its rows, outcome, class and error later; any
+# 2xx is ok there. A deferred call whose curl failed names its curl stderr
+# file the same way, for concurrent-answers to quote. With RQ_DEFER=1 and no
+# RQ_STATS a call starts no interpreter and forks nothing but curl, on every
+# branch.
 run_query() {
   local phase="$1" number="$2" statement="$3" try="$4" body="$5" expect="${6:-}"
   local dir="$OUT/$phase" resp w code=0 parsed err="" stats="" pending=""
@@ -825,14 +1000,14 @@ run_query() {
   elif [ "${RQ_HTTP:-000}" = 000 ]; then
     RQ_OUTCOME=unreachable
     RQ_CLASS=transport
-    err="curl exit $code: $(head -c 300 "$rdir/$number-$try.curl" 2>/dev/null)"
+    err="curl exit $code"
   elif [ "$code" -ne 0 ]; then
     RQ_OUTCOME=error
     RQ_CLASS=transfer
-    err="HTTP $RQ_HTTP, then curl exit $code: $(head -c 300 "$rdir/$number-$try.curl" 2>/dev/null)"
+    err="HTTP $RQ_HTTP, then curl exit $code"
   elif [ "${RQ_DEFER:-}" = 1 ]; then
     RQ_OUTCOME=error
-    [ "$RQ_HTTP" != 200 ] || RQ_OUTCOME=ok
+    [[ ! "$RQ_HTTP" =~ ^2[0-9][0-9]$ ]] || RQ_OUTCOME=ok
     json_str_to j_resp "${resp#"${calls%/*}/"}"
     json_num_to j_exp "$expect"
     pending=", \"pending\": {\"response\": $j_resp, \"expect\": $j_exp}"
@@ -860,9 +1035,19 @@ print("%s\t%s" % (d.get("errorType", ""), str(d.get("error", ""))[:300]))' "$res
     err="${parsed#*$'\t'}"
     [ -n "$RQ_CLASS" ] || RQ_CLASS=unclassified
   fi
-  # A failed call's curl stderr is in err now; a call that exited 0 printed
-  # none, and concurrent_round removes its empty file after the round.
-  [ "$code" = 0 ] || rm -f "$rdir/$number-$try.curl"
+  # A failed call's error quotes its curl stderr's first 300 bytes (a timeout's
+  # error says enough without it), and the file goes once quoted. A deferred
+  # call that failed, a timeout included, names the file in its pending member
+  # instead, for concurrent-answers to quote and remove after the round. A
+  # call that exited 0 printed none, and concurrent_round removes its empty
+  # file after the round.
+  if [ "$code" != 0 ] && [ "${RQ_DEFER:-}" = 1 ]; then
+    json_str_to j_resp "${rdir#"${calls%/*}/"}/$number-$try.curl"
+    pending=", \"pending\": {\"stderr\": $j_resp}"
+  elif [ "$code" != 0 ] && [ "$code" != 28 ]; then
+    err="$err: $(head -c 300 "$rdir/$number-$try.curl" 2>/dev/null)"
+  fi
+  [ "$code" = 0 ] || [ -n "$pending" ] || rm -f "$rdir/$number-$try.curl"
   if [ "${RQ_STATS:-}" = 1 ]; then
     stats="$(python3 -c 'import json, sys
 print(json.dumps(json.load(open(sys.argv[1])).get("stats")))' "$resp" 2>/dev/null)" || stats=""
@@ -893,7 +1078,9 @@ print(json.dumps(json.load(open(sys.argv[1])).get("stats")))' "$resp" 2>/dev/nul
 # phase_benchmark: every corpus statement three times. Try 1 is cold (server
 # restarted and the page cache dropped first) and tries 2 and 3 are hot; the
 # report's hot figure is the best of tries 2 and 3. Tries 2 and 3 must return
-# try 1's row count when the corpus states none.
+# try 1's row count when the corpus states none. The /healthz sampler runs
+# throughout; its gate is closed across each restart and opened, with a
+# sample taken, before try 1.
 phase_benchmark() {
   local dir="$OUT/benchmark" count n id exp expect try
   [ -n "${WINDOW_END:-}" ] || set_query_window
@@ -902,22 +1089,27 @@ phase_benchmark() {
     || { say "corpus holds $count statements, run.toml expects $EXPECTED_STATEMENTS"; return 1; }
   : >"$dir/calls.jsonl"
   start_samplers benchmark
+  healthz_start benchmark "$dir/healthz" || { stop_samplers; return 1; }
   BENCHMARK_SERVER_LOGS=""
   while IFS=$'\t' read -r n id exp; do
+    healthz_down
     stop_server
-    drop_caches || { stop_samplers; return 1; }
-    start_server || { stop_samplers; return 1; }
+    drop_caches || { healthz_stop; stop_samplers; return 1; }
+    start_server || { healthz_stop; stop_samplers; return 1; }
+    healthz_up || { healthz_stop; stop_samplers; return 1; }
     BENCHMARK_SERVER_LOGS="${BENCHMARK_SERVER_LOGS:+$BENCHMARK_SERVER_LOGS,}$SERVER_LOG"
     expect=""
     [ "$exp" = - ] || expect="$exp"
     for try in 1 2 3; do
       run_query benchmark "$n" "$id" "$try" "$dir/requests/$n.json" "$expect" \
-        || { stop_samplers; return 1; }
+        || { healthz_stop; stop_samplers; return 1; }
       [ -n "$expect" ] || expect="$RQ_ROWS"
     done
   done <"$dir/requests/index.tsv"
+  healthz_down
   stop_server
   stop_samplers
+  healthz_finish benchmark || return 1
   [ "$(wc -l <"$dir/calls.jsonl" | tr -d ' ')" = "$((count * 3))" ] \
     || { say "benchmark recorded $(wc -l <"$dir/calls.jsonl") calls, expected $((count * 3))"; return 1; }
 }
@@ -980,7 +1172,10 @@ phase_concurrent() {
 # concurrent_round ROUND: one round into out/concurrent/round-ROUND/, then,
 # after its timed window, its answers read (kit.py concurrent-answers settles
 # each deferred call's rows and wrong_answer), its calls appended to
-# calls.jsonl in connection order and its line to rounds.jsonl.
+# calls.jsonl in connection order and its line to rounds.jsonl. The /healthz
+# sampler starts before the round's server and has a sample of it before the
+# timed window opens; its gate stays open across a watchdog restart, so an
+# outage reads as failed samples, and it is summarised after the window ends.
 concurrent_round() {
   local r="$1" dir="$OUT/concurrent" rdir n id exp c nq start deadline end last pids="" failed=0 answers
   local READY_CHECK=sql_check
@@ -999,9 +1194,11 @@ concurrent_round() {
   done
   stop_server
   drop_caches || return 1
-  start_server || return 1
+  healthz_start concurrent "$rdir/healthz" || return 1
+  start_server || { healthz_stop; return 1; }
+  healthz_up || { healthz_stop; return 1; }
   stamp "concurrent round=$r connections=$CONC_CONNECTIONS duration_s=$CONC_DURATION"
-  start="$(now_us)" || return 1
+  start="$(now_us)" || { healthz_stop; return 1; }
   deadline=$(($(date +%s) + CONC_DURATION))
   for ((c = 1; c <= CONC_CONNECTIONS; c++)); do
     concurrent_worker "$r" "$c" "$deadline" "${orders[c]}" &
@@ -1010,7 +1207,8 @@ concurrent_round() {
   concurrent_watchdog "$deadline" >"$rdir/watchdog.log" 2>&1 &
   pids="$pids $!"
   for c in $pids; do wait "$c" || failed=1; done
-  end="$(now_us)" || return 1
+  end="$(now_us)" || { healthz_stop; return 1; }
+  healthz_finish "concurrent-$r" || return 1
   [ "$failed" = 0 ] || { say "a concurrent connection could not record its calls in round $r"; return 1; }
   answers="$(kit_py concurrent-answers "$rdir")" || return 1
   stamp "concurrent answers round=$r: $answers"
@@ -1169,6 +1367,7 @@ perf_statement() {
 
 run_phases() {
   local phase
+  : >"$OUT/healthz.txt"
   for phase in $PHASES; do
     declare -F "phase_$phase" >/dev/null || { say "no phase_$phase in run.sh"; fail_run "phase-$phase"; }
     mkdir -p "$OUT/$phase"
@@ -1179,7 +1378,7 @@ run_phases() {
 # --- results ---------------------------------------------------------------
 
 write_stamps() {
-  local cores mem cpu itype lane lanes_json="" tool flags
+  local cores mem cpu itype lane lanes_json="" tool flags f base_json="" extra_json=""
   mkdir -p "$STAMPS"
   printf '%s\n' "$ARM" >"$STAMPS/kit_arm"
   printf '%s\n' "$RUN_ID" >"$STAMPS/run_id"
@@ -1205,8 +1404,15 @@ write_stamps() {
     "$(json_num "$EXPECTED_STATEMENTS")" >"$STAMPS/corpus_digest"
   load_arm_env || return 1
   flags="$(printf '%q ' "${SERVER_FLAGS[@]}")"
-  printf '{"binary": %s, "flags": %s, "ld_preload": %s}\n' "$(json_str "$SERVER_BIN")" \
-    "$(json_str "${flags% }")" "$(json_str "$SERVER_PRELOAD")" >"$STAMPS/server_flags"
+  for f in ${SERVER_BASE_FLAGS[@]+"${SERVER_BASE_FLAGS[@]}"}; do
+    base_json="${base_json:+$base_json, }$(json_str "$f")"
+  done
+  for f in ${SERVER_EXTRA_FLAGS[@]+"${SERVER_EXTRA_FLAGS[@]}"}; do
+    extra_json="${extra_json:+$extra_json, }$(json_str "$f")"
+  done
+  printf '{"binary": %s, "flags": %s, "base_flags": [%s], "extra_flags": [%s], "ld_preload": %s}\n' \
+    "$(json_str "$SERVER_BIN")" "$(json_str "${flags% }")" "$base_json" "$extra_json" \
+    "$(json_str "$SERVER_PRELOAD")" >"$STAMPS/server_flags"
   if [ "$AUDIT_MODE" = required ]; then
     printf '%s\n' "required, audit text $AUDIT_TEXT" >"$STAMPS/audit_mode"
   else
@@ -1235,7 +1441,8 @@ write_results() {
   kit_py assemble out="$KIT/results.json" calls="$OUT/benchmark/calls.jsonl" \
     index="$OUT/benchmark/requests/index.tsv" server_logs="$BENCHMARK_SERVER_LOGS" \
     bands="$bands" sections="${sections%,}" provenance="$STAMPS" arm="$ARM" sha="$SHA" \
-    binary="$SERVER_BIN" tenant="$TENANT" phases_json="$KIT/phases.json" ${extra[@]+"${extra[@]}"} || return 1
+    binary="$SERVER_BIN" tenant="$TENANT" phases_json="$KIT/phases.json" healthz="$KIT/healthz.json" \
+    ${extra[@]+"${extra[@]}"} || return 1
   kit_py absolute "$ARM" "$KIT/results.json" >/dev/null || code=$?
   case "$code" in
     0) BANDS_VERDICT=pass ;;
@@ -1333,6 +1540,7 @@ main() {
   step declare do_declare
   step verify do_verify
   run_phases
+  step healthz do_healthz_check
   step burst-end record_burst end
   step results write_results
   step evidence write_evidence

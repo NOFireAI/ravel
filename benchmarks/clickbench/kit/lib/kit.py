@@ -9,7 +9,8 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
 64 on bad usage):
 
   get FILE KEY                 print one run.toml value; an array prints one
-                               item per line; a dotted key reads a table
+                               item per line; a dotted key reads a table;
+                               exits 3 when FILE parses and lacks KEY
   check-run FILE               refuse a run.toml missing a required key,
                                holding a key or table it does not know
                                (named), or holding a malformed SHA, lane,
@@ -39,19 +40,40 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
   q29-summary DIR              print the q29_probe block from DIR/calls.jsonl
   fold-perf                    fold `perf script` output on stdin into one
                                `stack count` line per distinct stack
-  concurrent-detail BANDS_DIR A.json A.tgz B.json B.tgz
+  concurrent-detail BANDS_DIR A.json A.tgz B.json B.tgz [RUN_TOML]
                                print each arm's per-round and pooled concurrent
                                figures and, on a missed concurrent error band,
                                that arm's errors by statement from its
                                evidence tarball
+  healthz-sampler DIR GATE ACK BASE_4318 BASE_4319
+                               sample /healthz on both listeners every
+                               250 ms and the heartbeat age from
+                               BASE_4318/metrics every 1 s into DIR, until
+                               killed
+  healthz-summary PHASE DIR    print PHASE's HEALTHZ line per port and its
+                               HEARTBEAT line (scrapes, unanswered scrapes,
+                               answered but unusable scrapes, max age) from
+                               DIR's gated samples
+  healthz-check FILE PHASE...  refuse FILE unless it holds each PHASE's
+                               HEALTHZ and HEARTBEAT lines exactly once, else
+                               print the results.json healthz block
   assemble ARGS...             write results.json from the box's phase output
   validate FILE                refuse a results.json missing a field the
                                shape below requires
   absolute LABEL FILE          print a results.json's absolute band table,
                                exit 1 on a miss
-  relative BANDS A.json B.json refuse two arms that are not comparable, else
+  comparable RUN_TOML A.json B.json
+                               refuse two arms that are not comparable, with
+                               RUN_TOML's server_flags_a and server_flags_b
+                               as the only extra flags allowed to differ and
+                               a resolved server setting allowed to differ
+                               only when one of those flags sets it; print
+                               each accepted difference
+  relative BANDS A.json B.json [RUN_TOML]
+                               refuse two arms that are not comparable, else
                                evaluate the lane's relative bands, print the
-                               table, exit 1 on a miss
+                               table, exit 1 on a miss; without RUN_TOML the
+                               arms' extra server flags must be equal
 
 results.json carries SqlLatencyReport's statement shape
 (crates/ravel-bench/src/sql_latency.rs), so the runbook's analyse.py
@@ -66,7 +88,8 @@ max_ms run over all three tries. The report says so in its own
 timing_definition string, because SqlLatencyReport's min_ms runs over all
 three. The kit's own blocks sit beside them: provenance, totals, error_pooled
 (the benchmark phase's calls only), concurrent and q29_probe
-(null when the phase did not run), phases and bands.
+(null when the phase did not run), healthz (each sampled phase's /healthz
+latency per port and heartbeat age; optional), phases and bands.
 """
 
 import hashlib
@@ -78,6 +101,7 @@ import re
 import statistics
 import sys
 import tarfile
+import time
 import traceback
 
 PLACEHOLDER_PREFIX = "FILL-IN"
@@ -112,6 +136,18 @@ LANE_BANDS = {
         "absolute.hot_s_max": STATEMENT_KEYS,
     },
 }
+# Keys a lane's band file may leave out, or leave a placeholder in a selected
+# section: either way that band is skipped and adds no row.
+OPTIONAL_LANE_BANDS = {
+    "rlog": {
+        "relative": ("healthz_p99_max_ratio_4318", "healthz_p99_max_ratio_4319"),
+        "absolute": ("healthz_p99_ms_max_4318", "healthz_p99_ms_max_4319"),
+    },
+}
+HEALTHZ_PORTS = ("4318", "4319")
+# The phases run.toml's healthz_phases may name for the /healthz sampler; the
+# default samples both.
+HEALTHZ_PHASES = ("benchmark", "concurrent")
 # Keys a band file may no longer carry, refused by name (parse_prereg in
 # crates/ravel-bench/src/clickbench_parquet/report.rs refuses the same).
 REMOVED_BAND_KEYS = ("concurrency_error_ratio_ceiling",)
@@ -131,14 +167,39 @@ RUN_DEFAULTS = (
     ("concurrent_seed", "clickbench"), ("q29_probe_warmup", 1), ("q29_probe_runs", 3),
     ("perf_record", False),
 )
-# Read by box/run.sh (band_sections through query_timeout_s, and the
-# RUN_DEFAULTS keys) or launch.sh (band_sections, ami through key_name) when
-# present.
+# Read by box/run.sh (band_sections through query_timeout_s, server_flags_a,
+# server_flags_b, healthz_phases and the RUN_DEFAULTS keys) or launch.sh
+# (band_sections, ami through key_name) when present.
 RUN_OPTIONAL = (
     "band_sections", "window_hours", "audit_text", "expected_statements",
     "fold_min_entry_ratio", "query_timeout_s", "ami", "subnet",
-    "security_group", "key_name",
+    "security_group", "key_name", "server_flags_a", "server_flags_b",
+    "healthz_phases",
 ) + tuple(k for k, _ in RUN_DEFAULTS)
+# Extra ravel-server flags per arm, appended by box/run.sh after the flags
+# KIT_SET_FLAGS names; an entry repeating one of those is refused.
+ARM_FLAG_KEYS = {"A": "server_flags_a", "B": "server_flags_b"}
+KIT_SET_FLAGS = (
+    "--store", "--shards", "--listen-http", "--listen-health", "--memory-budget-bytes",
+    "--audit-mode", "--audit-text", "--tenant-token-file", "--tenant-hash-unkeyed",
+)
+# For each STAMPED_SETTINGS value, the flag that sets it directly and, for the
+# two SQL pools, the flag on the other pool that resolve_performance_defaults
+# in services/ravel-server/src/config.rs reconciles it against. The server
+# logs each value's source but not the flag's name, so the mapping lives here.
+# It is not every flag that can move a value: --memory-budget-bytes (which the
+# kit sets, so base_flags pins it), --cache-max-bytes,
+# --catalog-cache-max-bytes, --disable-cache and --mode gateway also move the
+# derived pools through the memory remainder. The check fails closed for
+# those: a value they move differs with no entry here to explain it, or not as
+# an entry here would move it, and is refused.
+SETTING_FLAGS = {
+    "cache_max_bytes": ("--cache-max-bytes",),
+    "catalog_cache_max_bytes": ("--catalog-cache-max-bytes",),
+    "fetch_concurrency": ("--fetch-concurrency",),
+    "sql_max_query_bytes": ("--sql-max-query-bytes", "--sql-tenant-max-bytes"),
+    "sql_tenant_max_bytes": ("--sql-tenant-max-bytes", "--sql-max-query-bytes"),
+}
 # run.toml's only table.
 RUN_TABLES = ("bands",)
 DEFAULT_WINDOW_HOURS = 200000
@@ -188,8 +249,13 @@ STAMPED_SETTINGS = (
 # Two arms whose provenance differs on one of these did not measure the same
 # thing, so no relative band between them stands. server_settings is compared
 # whole: it holds only the resolved STAMPED_SETTINGS, and each arm's binary
-# path and SHA live in provenance.binary, git_sha and server_flags, which are
-# not compared because they are what differs between the arms by design.
+# path and SHA live in provenance.binary, git_sha and server_flags.binary,
+# which are not compared because they are what differs between the arms by
+# design. check_comparable compares server_flags' base_flags and extra_flags
+# itself. For arms whose declared extra flags differ, a server_settings key may
+# differ only when SETTING_FLAGS names a flag for it that the two arms'
+# declared lists set differently, and then only to the value that flag
+# resolves it to; every other difference is refused.
 COMPARABLE = (
     "corpus_digest.dataset_sha256",
     "corpus_digest.mapping_sha256",
@@ -396,7 +462,139 @@ def check_run(path):
     if data.get("audit_text") == "plaintext" and data["audit_mode"] != "required":
         raise Refusal("run.toml %s: audit_text plaintext needs audit_mode required "
                       "(the server refuses it otherwise)" % path)
+    for key in sorted(ARM_FLAG_KEYS.values()):
+        flags = data.get(key, [])
+        if not isinstance(flags, list) or not all(isinstance(f, str) and f for f in flags):
+            raise Refusal("run.toml %s: %s must be an array of non-empty strings, got %r"
+                          % (path, key, flags))
+        for f in flags:
+            for kit_flag in KIT_SET_FLAGS:
+                if f == kit_flag or f.startswith(kit_flag + "="):
+                    raise Refusal("run.toml %s: %s repeats %s, which the kit sets itself"
+                                  % (path, key, kit_flag))
+    sampled = healthz_phases(data)
+    if (not isinstance(sampled, list) or len(set(map(str, sampled))) != len(sampled)
+            or any(p not in HEALTHZ_PHASES for p in sampled)):
+        raise Refusal("run.toml %s: healthz_phases must be an array of distinct phases from "
+                      "%s, got %r" % (path, ", ".join(HEALTHZ_PHASES), sampled))
     return data
+
+
+def arm_extra_flags(data, arm):
+    return list(data.get(ARM_FLAG_KEYS[arm], []))
+
+
+def healthz_phases(data):
+    return data.get("healthz_phases", list(HEALTHZ_PHASES))
+
+
+def _flag_values(flags):
+    """Each --flag in FLAGS mapped to the values given to it, in order: the
+    part after "=", or the entries up to the next --flag."""
+    out, cur = {}, None
+    for f in flags:
+        if f.startswith("--"):
+            name, eq, val = f.partition("=")
+            cur = out.setdefault(name, [])
+            cur.append([val] if eq else [])
+        elif cur is not None:
+            cur[-1].append(f)
+        else:
+            out.setdefault("", [[]])[0].append(f)
+    return out
+
+
+def _setting_flag_value(flags, flag, arm):
+    """The whole number ARM's parsed extra FLAGS give FLAG, None when they do
+    not give it."""
+    given = flags.get(flag)
+    if given is None:
+        return None
+    if len(given) != 1 or len(given[0]) != 1 or not re.match(r"^[0-9]+$", given[0][0]):
+        raise Refusal("arms are not comparable: %s's declared extra flags give %s %r, not one "
+                      "whole number, so the kit cannot tell what it sets"
+                      % (arm, flag, [" ".join(v) for v in given]))
+    return int(given[0][0])
+
+
+def _setting_rule(k, flags, arm):
+    """How ARM's parsed extra FLAGS resolve server setting K, as
+    resolve_performance_defaults does, against U, the value K holds with
+    neither of its SETTING_FLAGS set (the same on both arms): ("exact", v) is
+    v whatever U is, ("unflagged", None) is U, ("raise", v) is max(U, v) and
+    ("clamp", v) is min(U, v). The third element says why, for a refusal."""
+    names = SETTING_FLAGS[k]
+    d = _setting_flag_value(flags, names[0], arm)
+    o = _setting_flag_value(flags, names[1], arm) if len(names) > 1 else None
+    if d is not None:
+        if k == "sql_max_query_bytes" and o is not None and d > o:
+            return ("exact", o, "%s's %s %d is clamped to its %s %d"
+                    % (arm, names[0], d, names[1], o))
+        return ("exact", d, "%s's %s %d sets it to %d" % (arm, names[0], d, d))
+    if o is None:
+        return ("unflagged", None, "%s sets no %s, so it holds the unflagged value"
+                % (arm, " or ".join(names)))
+    if k == "sql_tenant_max_bytes":
+        return ("raise", o, "%s's %s %d raises it to %d only from an unflagged value below %d"
+                % (arm, names[1], o, o, o))
+    return ("clamp", o, "%s's %s %d clamps it to %d only from an unflagged value above %d"
+            % (arm, names[1], o, o, o))
+
+
+def _check_setting(k, a_val, b_val, fa, fb):
+    """Refuse server setting K unless some unflagged value, shared by both
+    arms, resolves to A_VAL under arm A's parsed extra flags FA and to B_VAL
+    under arm B's FB."""
+    lo, hi, ok, why = 0, None, True, []
+    for arm, v, flags in (("A", a_val, fa), ("B", b_val, fb)):
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise Refusal("arms are not comparable: provenance.server_settings.%s is %r on %s, "
+                          "not a whole number" % (k, v, arm))
+        kind, f, reason = _setting_rule(k, flags, arm)
+        why.append(reason)
+        if kind == "exact":
+            ok = ok and v == f
+        elif kind != "unflagged" and v == f:
+            # The unflagged value may sit anywhere on the far side of f.
+            if kind == "raise":
+                hi = f if hi is None else min(hi, f)
+            else:
+                lo = max(lo, f)
+        elif (kind == "raise" and v < f) or (kind == "clamp" and v > f):
+            ok = False
+        else:
+            lo, hi = max(lo, v), v if hi is None else min(hi, v)
+    if not ok or (hi is not None and lo > hi):
+        raise Refusal("arms are not comparable: provenance.server_settings.%s is A %r, B %r, "
+                      "which the declared extra flags do not resolve it to: %s"
+                      % (k, a_val, b_val, "; ".join(why)))
+
+
+def _setting_differences(va, vb, extra_a, extra_b):
+    """The accepted server_settings differences between two arms, one
+    "KEY A x B y" string each. A key whose SETTING_FLAGS the arms' extra flags
+    set differently must hold, on each arm, exactly the value those flags
+    resolve it to; any other key may not differ."""
+    fa, fb = _flag_values(extra_a), _flag_values(extra_b)
+    moved = set(f for f in set(fa) | set(fb) if fa.get(f) != fb.get(f))
+    out = []
+    for k in sorted(set(va) | set(vb)):
+        a_val, b_val = va.get(k), vb.get(k)
+        touched = k in SETTING_FLAGS and moved.intersection(SETTING_FLAGS[k])
+        if a_val == b_val and not touched:
+            continue
+        if k not in SETTING_FLAGS:
+            raise Refusal("arms are not comparable: provenance.server_settings.%s differs "
+                          "(A %r, B %r), and the kit knows no flag that sets it"
+                          % (k, a_val, b_val))
+        if not touched:
+            raise Refusal("arms are not comparable: provenance.server_settings.%s differs "
+                          "(A %r, B %r), and the declared extra flags do not set %s differently"
+                          % (k, a_val, b_val, " or ".join(SETTING_FLAGS[k])))
+        _check_setting(k, a_val, b_val, fa, fb)
+        if a_val != b_val:
+            out.append("%s A %r B %r" % (k, a_val, b_val))
+    return out
 
 
 # --- band files ------------------------------------------------------------
@@ -422,6 +620,7 @@ def check_bands(lane, path, sections=None):
         raise Refusal("band file %s: lane %r is not one the kit runs (%s)"
                       % (path, lane, ", ".join(sorted(LANE_BANDS))))
     schema = LANE_BANDS[lane]
+    optional = OPTIONAL_LANE_BANDS.get(lane, {})
     sections = list(BAND_SECTIONS) if sections is None else sections
     data = parse_toml(path)
     removed, unknown = [], []
@@ -433,7 +632,7 @@ def check_bands(lane, path, sections=None):
             name = "%s.%s" % (table, key)
             if key in REMOVED_BAND_KEYS:
                 removed.append(name)
-            elif table not in schema or key not in schema[table]:
+            elif key not in schema.get(table, ()) and key not in optional.get(table, ()):
                 unknown.append(name)
     if removed:
         raise Refusal("band file %s: removed key(s) %s; delete them"
@@ -454,6 +653,11 @@ def check_bands(lane, path, sections=None):
                     placeholders.append(name)
             elif not _num(v) or v < 0:
                 malformed.append(name)
+    for table in sorted(optional):
+        for key in optional[table]:
+            v = data.get(table, {}).get(key)
+            if v is not None and not _placeholder(v) and (not _num(v) or v < 0):
+                malformed.append("%s.%s" % (table, key))
     if malformed:
         raise Refusal("band file %s: %s must be a number of at least 0"
                       % (path, ", ".join(malformed)))
@@ -564,6 +768,7 @@ def absolute_bands(lane, path, sections, report):
     else:
         out.append(_row("absolute", label, probe["min_s"], bound,
                         "pass" if probe["min_s"] <= bound else "miss"))
+    out += healthz_absolute(ab, report)
     answered = {e["id"]: e for e in report["entries"]}
     for sid in sorted(set(answered) | set(f["id"] for f in report["failed"])):
         q = sid.split("_", 1)[0]
@@ -579,31 +784,97 @@ def absolute_bands(lane, path, sections, report):
     return out
 
 
-def check_comparable(a, b):
+def _differs(field, va, vb):
+    return Refusal("arms are not comparable: provenance.%s differs (A %r, B %r)" % (field, va, vb))
+
+
+def _base_flags_setting(flags):
+    """Base flags as settings: the token file's path is where the box keeps
+    the file under its root, not a setting, so it is not compared."""
+    return [f if i == 0 or flags[i - 1] != "--tenant-token-file" else "<token file>"
+            for i, f in enumerate(flags)]
+
+
+def check_comparable(a, b, declared=None):
+    """Refuse two arms whose provenance differs on a COMPARABLE field, their
+    kit-set server flags (server_flags.base_flags, all but the token file's
+    path) or their band sections.
+    Their extra flags (server_flags.extra_flags) must be equal, or, with
+    DECLARED (run.toml's server_flags_a and server_flags_b), must be exactly
+    those lists. For arms whose extra flags differ that way, a server_settings
+    key may differ only when one of its SETTING_FLAGS is set differently by
+    those lists, and such a key must hold on each arm exactly the value that
+    arm's list resolves it to. Returns one line per accepted difference, empty
+    when there is none."""
     pa, pb = a["provenance"], b["provenance"]
+    flags = {}
+    for part in ("base_flags", "extra_flags"):
+        field = "server_flags." + part
+        va, vb = lookup(pa, field), lookup(pb, field)
+        for arm, v in (("A", va), ("B", vb)):
+            if not isinstance(v, list):
+                raise Refusal("arms are not comparable: provenance.%s is missing on %s"
+                              % (field, arm))
+        flags[part] = (va, vb)
+    base_a, base_b = (_base_flags_setting(f) for f in flags["base_flags"])
+    if base_a != base_b:
+        raise _differs("server_flags.base_flags", base_a, base_b)
+    extra_a, extra_b = flags["extra_flags"]
+    if declared is not None and [extra_a, extra_b] != list(declared):
+        raise Refusal("arms are not comparable: provenance.server_flags.extra_flags is A %r, "
+                      "B %r, and run.toml's server_flags_a and server_flags_b are A %r, B %r"
+                      % (extra_a, extra_b, declared[0], declared[1]))
+    if declared is None and extra_a != extra_b:
+        raise _differs("server_flags.extra_flags", extra_a, extra_b)
+    notes = []
     for field in COMPARABLE:
         va, vb = lookup(pa, field), lookup(pb, field)
         if va in (None, "") or vb in (None, ""):
             raise Refusal("arms are not comparable: provenance.%s is missing on %s"
                           % (field, "A" if va in (None, "") else "B"))
-        if va != vb:
-            raise Refusal("arms are not comparable: provenance.%s differs (A %r, B %r)"
-                          % (field, va, vb))
+        if field == "server_settings" and extra_a != extra_b and isinstance(va, dict) \
+                and isinstance(vb, dict):
+            moved = _setting_differences(va, vb, extra_a, extra_b)
+            if moved:
+                notes.append("server_settings differs with them: %s" % ", ".join(moved))
+            continue
+        if va == vb:
+            continue
+        raise _differs(field, va, vb)
     if pa["band_sections"] != pb["band_sections"]:
-        raise Refusal("arms are not comparable: provenance.band_sections differs (A %r, B %r)"
-                      % (pa["band_sections"], pb["band_sections"]))
+        raise _differs("band_sections", pa["band_sections"], pb["band_sections"])
+    if extra_a != extra_b:
+        notes.insert(0, "arms differ by their declared extra server flags only: A %r, B %r"
+                     % (extra_a, extra_b))
+    return notes
+
+
+def comparable(run_toml, a_json, b_json):
+    """fetch.sh's comparability check, once per run: check_comparable against
+    run.toml's declared extra flags, printing each accepted difference."""
+    data = check_run(run_toml)
+    declared = (arm_extra_flags(data, "A"), arm_extra_flags(data, "B"))
+    for note in check_comparable(validate(a_json), validate(b_json), declared):
+        print("comparable: %s" % note)
+
+
+def declared_flags(run_toml):
+    if run_toml is None:
+        return None
+    data = check_run(run_toml)
+    return (arm_extra_flags(data, "A"), arm_extra_flags(data, "B"))
 
 
 def _qs(ids):
     return " ".join(sid.split("_", 1)[0] for sid in sorted(ids))
 
 
-def relative_bands(path, a, b):
+def relative_bands(path, a, b, declared=None):
     """Arm B judged against arm A, over the statements both arms answered. A
     statement A answered and B did not is a miss of its own, and so is a
     both-answered set smaller than min_both_answered, an arm that answered
     nothing, or a statement whose row count differs between the arms."""
-    check_comparable(a, b)
+    check_comparable(a, b, declared)
     sections = a["provenance"]["band_sections"]
     if "relative" not in sections:
         return []
@@ -660,6 +931,7 @@ def relative_bands(path, a, b):
         bound = r * pa["min_s"]
         add(label, pb["min_s"], bound, "pass" if pb["min_s"] <= bound else "miss")
 
+    out += healthz_relative(rel, a, b)
     ea = {e["id"]: e for e in a["entries"]}
     eb = {e["id"]: e for e in b["entries"]}
     both = sorted(set(ea) & set(eb))
@@ -791,9 +1063,9 @@ def _ok_2xx(call):
 
 def _settle_answer(call, resp, expect):
     """run_query's reading of an answer, for a call it recorded with RQ_DEFER:
-    a 200's row count against EXPECT, else the error body's errorType and
-    error."""
-    if call.get("http_status") == 200:
+    a 2xx answer's row count against EXPECT, else the error body's errorType
+    and error."""
+    if _ok_2xx(call):
         try:
             rows = json.load(open(resp))["data"]["rows"]
             n = len(rows) if isinstance(rows, list) else None
@@ -802,7 +1074,7 @@ def _settle_answer(call, resp, expect):
         call["rows"] = n
         if n is None:
             call.update(outcome="error", refusal_class="unreadable_answer",
-                        error="HTTP 200 without a readable data.rows array")
+                        error="HTTP %d without a readable data.rows array" % call["http_status"])
         elif expect is not None and n != expect:
             call.update(outcome="error", refusal_class="wrong_answer",
                         error="answer has %d rows, expected %d" % (n, expect))
@@ -821,8 +1093,11 @@ def concurrent_answers(d):
     """Rewrite each DIR/conn-N.jsonl with every call's "pending" member (the
     response file, relative to DIR, and the expected row count) replaced by
     its settled rows, outcome, refusal_class and error. A settled ok answer
-    after try 1 is removed, as run_query removes it. Prints the number of
-    calls settled and of wrong answers among them."""
+    after try 1 is removed, as run_query removes it. A failed transfer's
+    pending member names its curl stderr file instead: its first 300 bytes
+    are appended to the call's error unless curl timed out (exit 28), as
+    run_query quotes them outside a deferred call, and the file is removed. Prints the number of calls
+    settled and of wrong answers among them."""
     settled = wrong = 0
     for name in sorted(os.listdir(d)):
         if not re.match(r"^conn-[0-9]+\.jsonl$", name):
@@ -832,6 +1107,17 @@ def concurrent_answers(d):
         for c in calls:
             p = c.pop("pending", None)
             if p is None:
+                continue
+            if "stderr" in p:
+                stderr = os.path.join(d, p["stderr"])
+                try:
+                    with open(stderr, "rb") as f:
+                        text = f.read(300).decode("utf-8", "replace").rstrip("\n")
+                    os.remove(stderr)
+                except OSError:
+                    text = ""
+                if c.get("curl_exit") != 28:
+                    c["error"] = "%s: %s" % (c.get("error", ""), text)
                 continue
             resp = os.path.join(d, p["response"])
             _settle_answer(c, resp, p.get("expect"))
@@ -933,6 +1219,289 @@ def q29_summary(d):
     }
 
 
+# --- /healthz sampler --------------------------------------------------------
+
+HEALTHZ_INTERVAL_S = 0.25
+METRICS_INTERVAL_S = 1.0
+HEALTHZ_TIMEOUT_S = 2.0
+HEARTBEAT_METRIC = "ravel_health_heartbeat_age_seconds"
+HEALTHZ_LINE_RE = re.compile(
+    r"^HEALTHZ phase=(\S+) port=(\S+) n=([0-9]+) p50_ms=([0-9.]+) p99_ms=([0-9.]+) "
+    r"max_ms=([0-9.]+) failures=([0-9]+)$")
+HEARTBEAT_LINE_RE = re.compile(
+    r"^HEARTBEAT phase=(\S+) n=([0-9]+) failures=([0-9]+) bad=([0-9]+) max_s=([0-9.]+)$")
+
+
+def _gate(path):
+    """The generation an "up G" gate file names, else None: down, missing,
+    or caught mid-write."""
+    try:
+        with open(path) as f:
+            parts = f.read().split()
+    except OSError:
+        return None
+    if len(parts) == 2 and parts[0] == "up" and parts[1].isdigit():
+        return int(parts[1])
+    return None
+
+
+def _heartbeat(body):
+    ages = []
+    for line in body.splitlines():
+        if line.startswith(HEARTBEAT_METRIC + "{") or line.startswith(HEARTBEAT_METRIC + " "):
+            try:
+                ages.append(float(line.rsplit(None, 1)[1]))
+            except (IndexError, ValueError):
+                pass
+    return max(ages) if ages else None
+
+
+def _probe(opener, url, metrics):
+    """One GET with HEALTHZ_TIMEOUT_S as the client timeout. A non-200, a
+    transport error or an answer slower than the timeout is not ok; answered
+    is whether any HTTP status came back within the timeout."""
+    import urllib.error
+    rec = {"status": 0, "ok": False, "error": ""}
+    t0 = time.monotonic()
+    body = b""
+    try:
+        with opener.open(url, timeout=HEALTHZ_TIMEOUT_S) as r:
+            rec["status"] = r.status
+            body = r.read()
+    except urllib.error.HTTPError as e:
+        rec["status"] = e.code
+        rec["error"] = "HTTP %d" % e.code
+    except Exception as e:  # every transport failure is a failed sample
+        rec["error"] = "%s: %s" % (type(e).__name__, e)
+    ms = (time.monotonic() - t0) * 1000.0
+    rec["answered"] = rec["status"] != 0 and ms <= HEALTHZ_TIMEOUT_S * 1000.0
+    if rec["status"] == 200 and not rec["error"]:
+        if ms > HEALTHZ_TIMEOUT_S * 1000.0:
+            rec["error"] = "answered after %.0f ms, past the %.0f ms timeout" % (
+                ms, HEALTHZ_TIMEOUT_S * 1000.0)
+        elif metrics:
+            age = _heartbeat(body.decode("utf-8", "replace"))
+            if age is None:
+                rec["error"] = "no %s in /metrics" % HEARTBEAT_METRIC
+            rec["heartbeat_s"] = age
+        rec["ok"] = not rec["error"]
+    if not metrics:
+        rec["ms"] = round(ms, 3)
+    return rec
+
+
+def healthz_sampler(d, gate, ack, base_4318, base_4319):
+    """Sample GET /healthz on both listeners every HEALTHZ_INTERVAL_S and the
+    heartbeat age from /metrics on 4318 every METRICS_INTERVAL_S, each on its
+    own thread, into DIR/4318.jsonl, DIR/4319.jsonl and DIR/metrics.jsonl,
+    until killed. Each record is one write to an O_APPEND file, so a kill
+    never leaves half a line. A sample is gated (counted by healthz-summary) only when GATE read
+    "up G" with the same G before and after it. A new generation is sampled
+    at once; once every thread holds a gated sample of it, G is written to
+    ACK, which run.sh waits for before its timed window opens."""
+    import threading
+    import urllib.request
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    targets = (("4318", base_4318.rstrip("/") + "/healthz", False, HEALTHZ_INTERVAL_S),
+               ("4319", base_4319.rstrip("/") + "/healthz", False, HEALTHZ_INTERVAL_S),
+               ("metrics", base_4318.rstrip("/") + "/metrics", True, METRICS_INTERVAL_S))
+    os.makedirs(d, exist_ok=True)
+    lock = threading.Lock()
+    done = {}
+    acked = [None]
+
+    def note(name, gen):
+        with lock:
+            done[name] = gen
+            if acked[0] != gen and all(done.get(t[0]) == gen for t in targets):
+                with open(ack + ".tmp", "w") as f:
+                    f.write("%d\n" % gen)
+                os.replace(ack + ".tmp", ack)
+                acked[0] = gen
+
+    def loop(name, url, metrics, interval):
+        fd = os.open(os.path.join(d, name + ".jsonl"), os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                     0o644)
+        sampled = None
+        while True:
+            g0 = _gate(gate)
+            t0 = time.monotonic()
+            wall = time.time()
+            rec = _probe(opener, url, metrics)
+            g1 = _gate(gate)
+            gated = g0 is not None and g0 == g1
+            rec.update(t=round(wall, 3), mono=round(t0, 3), gen=g0 if gated else None,
+                       gated=gated)
+            os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8"))
+            if gated:
+                sampled = g0
+                note(name, g0)
+            while time.monotonic() - t0 < interval:
+                g = _gate(gate)
+                if g is not None and g != sampled:
+                    break
+                time.sleep(0.01)
+
+    for t in targets:
+        th = threading.Thread(target=loop, args=t)
+        th.daemon = True
+        th.start()
+    while True:
+        time.sleep(3600)
+
+
+def _gated(path):
+    if not os.path.exists(path):
+        raise Refusal("healthz-summary: no %s" % path)
+    return [r for r in _jsonl(path) if r.get("gated") is True]
+
+
+def _nearest_rank(sorted_ms, q):
+    return sorted_ms[max(0, int(math.ceil(q * len(sorted_ms))) - 1)]
+
+
+def healthz_summary(phase, d):
+    """The HEALTHZ line per port and the HEARTBEAT line for one phase, from
+    the gated samples under DIR. A failed sample (a timeout, a non-200 or a
+    transport error) counts as HEALTHZ_TIMEOUT_S and as a failure. A /metrics
+    scrape that got no answer within the timeout counts as HEALTHZ_TIMEOUT_S
+    of heartbeat age and as a failure: a stalled runtime is when the scrape
+    fails, so it must not vanish from max_s. A scrape answered with a non-200
+    or without a heartbeat age says nothing about a stall; it is counted as
+    bad and kept out of max_s, and a phase in which every answered scrape was
+    bad is refused, since its endpoint is misconfigured."""
+    lines = []
+    for port in HEALTHZ_PORTS:
+        recs = _gated(os.path.join(d, port + ".jsonl"))
+        if not recs:
+            raise Refusal("healthz-summary: %s/%s.jsonl holds no gated sample for phase %s"
+                          % (d, port, phase))
+        ms = sorted(float(r["ms"]) if r.get("ok") else HEALTHZ_TIMEOUT_S * 1000.0 for r in recs)
+        lines.append("HEALTHZ phase=%s port=%s n=%d p50_ms=%.3f p99_ms=%.3f max_ms=%.3f failures=%d"
+                     % (phase, port, len(ms), _nearest_rank(ms, 0.50), _nearest_rank(ms, 0.99),
+                        ms[-1], sum(1 for r in recs if not r.get("ok"))))
+    scrapes = _gated(os.path.join(d, "metrics.jsonl"))
+    if not scrapes:
+        raise Refusal("healthz-summary: %s/metrics.jsonl holds no gated scrape for phase %s"
+                      % (d, phase))
+    ages, failures, bad = [], 0, []
+    for r in scrapes:
+        if r.get("ok") and _num(r.get("heartbeat_s")):
+            ages.append(float(r["heartbeat_s"]))
+        elif r.get("answered") is True:
+            bad.append(r.get("error") or "HTTP %s" % r.get("status"))
+        else:
+            failures += 1
+            ages.append(HEALTHZ_TIMEOUT_S)
+    if bad and len(ages) == failures:
+        raise Refusal("healthz-summary: every answered /metrics scrape for phase %s in %s was "
+                      "unusable (%s), so the heartbeat age was never read"
+                      % (phase, d, "; ".join(sorted(set(bad)))))
+    lines.append("HEARTBEAT phase=%s n=%d failures=%d bad=%d max_s=%.3f"
+                 % (phase, len(scrapes), failures, len(bad), max(ages)))
+    return lines
+
+
+def healthz_check(path, phases):
+    """The results.json healthz block from run.sh's healthz.txt, which must
+    hold each phase's HEALTHZ line per port and its HEARTBEAT line exactly
+    once, and nothing else."""
+    want = {}
+    for phase in phases:
+        for port in HEALTHZ_PORTS:
+            want[("HEALTHZ", phase, port)] = 0
+        want[("HEARTBEAT", phase, None)] = 0
+    block = dict((p, {"ports": {}, "heartbeat_max_s": None, "heartbeat_n": None,
+                      "heartbeat_failures": None, "heartbeat_bad": None}) for p in phases)
+    try:
+        lines = open(path).read().splitlines()
+    except OSError as e:
+        raise Refusal("healthz-check: cannot read %s: %s" % (path, e))
+    for n, line in enumerate(lines, 1):
+        m, h = HEALTHZ_LINE_RE.match(line), HEARTBEAT_LINE_RE.match(line)
+        key = ("HEALTHZ", m.group(1), m.group(2)) if m else (
+            ("HEARTBEAT", h.group(1), None) if h else None)
+        if key not in want:
+            raise Refusal("healthz-check: %s:%d is not an expected line: %r" % (path, n, line))
+        count, failures = (int(m.group(3)), int(m.group(7))) if m else (
+            int(h.group(2)), int(h.group(3)))
+        if count < 1 or failures > count:
+            raise Refusal("healthz-check: %s:%d counts %d samples and %d failures; it needs at "
+                          "least one sample and no more failures than samples"
+                          % (path, n, count, failures))
+        bad = int(h.group(4)) if h else 0
+        if failures + bad > count:
+            raise Refusal("healthz-check: %s:%d counts %d scrapes, %d failures and %d bad; it "
+                          "needs no more failures and bad scrapes together than scrapes"
+                          % (path, n, count, failures, bad))
+        if bad and failures + bad == count:
+            raise Refusal("healthz-check: %s:%d counts %d bad scrapes and no usable one; every "
+                          "answered scrape was unusable, so the heartbeat age was never read"
+                          % (path, n, bad))
+        want[key] += 1
+        if m:
+            block[key[1]]["ports"][key[2]] = {
+                "n": count, "p50_ms": float(m.group(4)), "p99_ms": float(m.group(5)),
+                "max_ms": float(m.group(6)), "failures": failures}
+        else:
+            block[key[1]].update(heartbeat_n=count, heartbeat_failures=failures,
+                                 heartbeat_bad=bad, heartbeat_max_s=float(h.group(5)))
+    wrong = ["%s phase=%s%s %d times" % (k[0], k[1], " port=%s" % k[2] if k[2] else "", c)
+             for k, c in sorted(want.items(), key=lambda kv: str(kv[0])) if c != 1]
+    if wrong:
+        raise Refusal("healthz-check: %s must hold each line exactly once; it holds %s"
+                      % (path, "; ".join(wrong)))
+    return {"interval_ms": HEALTHZ_INTERVAL_S * 1000.0,
+            "metrics_interval_ms": METRICS_INTERVAL_S * 1000.0,
+            "timeout_ms": HEALTHZ_TIMEOUT_S * 1000.0, "phases": block}
+
+
+def _phase_order(phase):
+    m = re.match(r"^concurrent-([0-9]+)$", phase)
+    return (1, int(m.group(1)), phase) if m else (0, 0, phase)
+
+
+def healthz_absolute(ab, report):
+    out = []
+    hz = report.get("healthz")
+    for port in HEALTHZ_PORTS:
+        bound = ab.get("healthz_p99_ms_max_" + port)
+        if bound is None or _placeholder(bound):
+            continue
+        label = "healthz %s p99_ms <= healthz_p99_ms_max_%s" % ("%s", port)
+        if not hz:
+            out.append(_row("absolute", label % "(no phase)", None, bound, "inconclusive",
+                            "no healthz samples"))
+            continue
+        for phase in sorted(hz["phases"], key=_phase_order):
+            v = hz["phases"][phase]["ports"][port]["p99_ms"]
+            out.append(_row("absolute", label % phase, v, bound, "pass" if v <= bound else "miss"))
+    return out
+
+
+def healthz_relative(rel, a, b):
+    out = []
+    ha, hb = a.get("healthz"), b.get("healthz")
+    for port in HEALTHZ_PORTS:
+        r = rel.get("healthz_p99_max_ratio_" + port)
+        if r is None or _placeholder(r):
+            continue
+        label = "healthz %s port %s p99_ms <= %g x A" % ("%s", port, r)
+        both = sorted(set(ha["phases"]) & set(hb["phases"]), key=_phase_order) \
+            if ha and hb else []
+        if not both:
+            out.append(_row("relative", label % "(no phase)", None, None, "inconclusive",
+                            "no phase sampled on both arms"))
+            continue
+        for phase in both:
+            va = ha["phases"][phase]["ports"][port]["p99_ms"]
+            vb = hb["phases"][phase]["ports"][port]["p99_ms"]
+            bound = r * va
+            out.append(_row("relative", label % phase, vb, bound,
+                            "pass" if vb <= bound else "miss"))
+    return out
+
+
 def fold_perf(lines):
     """`perf script` output folded to one `comm;outer;...;leaf count` line per
     distinct stack, the form flamegraph.pl and inferno read."""
@@ -975,8 +1544,13 @@ def _concurrent_errors(tgz):
     if lines is None:
         raise Refusal("%s holds no out/concurrent/calls.jsonl" % tgz)
     errors = {}
-    for line in lines:
-        c = json.loads(line)
+    for n, line in enumerate(lines, 1):
+        try:
+            c = json.loads(line)
+        except ValueError as e:
+            raise Refusal("%s:out/concurrent/calls.jsonl:%d is not a JSON line: %s" % (tgz, n, e))
+        if not isinstance(c, dict) or "statement" not in c:
+            raise Refusal("%s:out/concurrent/calls.jsonl:%d is not a call record" % (tgz, n))
         if not _ok_2xx(c):
             errors[c["statement"]] = errors.get(c["statement"], 0) + 1
     return errors, len(lines)
@@ -986,9 +1560,10 @@ def _fmt(v):
     return "null" if v is None else ("%.3f" % v if isinstance(v, float) else str(v))
 
 
-def concurrent_detail(bands_dir, a_json, a_tgz, b_json, b_tgz):
+def concurrent_detail(bands_dir, a_json, a_tgz, b_json, b_tgz, run_toml=None):
     """Each arm's per-round QPS and error ratio beside its pooled figures, and
     on a missed concurrent error band, the missing arm's errors by statement."""
+    declared = declared_flags(run_toml)
     arms = (("A", validate(a_json), a_tgz), ("B", validate(b_json), b_tgz))
     for arm, r, _ in arms:
         conc = r["concurrent"]
@@ -1021,7 +1596,7 @@ def concurrent_detail(bands_dir, a_json, a_tgz, b_json, b_tgz):
     for name in sorted(os.listdir(bands_dir)):
         if not name.endswith(".toml"):
             continue
-        rows = relative_bands(os.path.join(bands_dir, name), a, b)
+        rows = relative_bands(os.path.join(bands_dir, name), a, b, declared)
         if any(row["verdict"] == "miss" and row["band"].startswith("concurrent error")
                for row in rows):
             missed.add("B")
@@ -1119,7 +1694,8 @@ def assemble(args):
     (lane:path[,lane:path]), sections (comma-separated band sections),
     provenance (a directory of stamp files, one per provenance key), arm, sha,
     binary, tenant, phases_json. Optional: concurrent and q29_probe, each the
-    phase's summary.json, when that phase ran."""
+    phase's summary.json, when that phase ran, and healthz, healthz-check's
+    block."""
     kv = dict(a.split("=", 1) for a in args)
     for key in ("out", "calls", "index", "server_logs", "bands", "sections", "provenance",
                 "arm", "sha", "binary", "tenant", "phases_json"):
@@ -1175,7 +1751,7 @@ def assemble(args):
     phases = json.load(open(kv["phases_json"]))
     calls, errors = pooled_errors(phases)
     blocks = {}
-    for key in ("concurrent", "q29_probe"):
+    for key in ("concurrent", "q29_probe", "healthz"):
         blocks[key] = json.load(open(kv[key])) if kv.get(key) else None
     report = {
         "provenance": provenance,
@@ -1189,6 +1765,7 @@ def assemble(args):
                          "phases": list(POOLED_PHASES)},
         "concurrent": blocks["concurrent"],
         "q29_probe": blocks["q29_probe"],
+        "healthz": blocks["healthz"],
         "phases": phases,
     }
     report["bands"] = []
@@ -1301,6 +1878,15 @@ def validate(path):
         miss = [k for k in Q29_PROBE_FIELDS if k not in (probe if isinstance(probe, dict) else {})]
         if miss:
             raise Refusal("%s: q29_probe missing %s" % (path, ", ".join(miss)))
+    hz = r.get("healthz")
+    if hz is not None:
+        phases = hz.get("phases") if isinstance(hz, dict) else None
+        if not isinstance(phases, dict) or not all(
+                isinstance(p, dict) and all(_num(((p.get("ports") or {}).get(port) or {})
+                                                 .get("p99_ms")) for port in HEALTHZ_PORTS)
+                for p in phases.values()):
+            raise Refusal("%s: healthz is neither null nor a block with each phase's p99_ms "
+                          "on ports %s" % (path, " and ".join(HEALTHZ_PORTS)))
     for b in r["bands"]:
         if b.get("verdict") not in ("pass", "miss", "inconclusive"):
             raise Refusal("%s: band %r has verdict %r" % (path, b.get("band"), b.get("verdict")))
@@ -1316,7 +1902,8 @@ def main(argv):
         if cmd == "get" and len(args) == 2:
             v = lookup(parse_toml(args[0]), args[1])
             if v is None:
-                raise Refusal("%s: no key %s" % (args[0], args[1]))
+                print("kit: %s: no key %s" % (args[0], args[1]), file=sys.stderr)
+                return 3
             for item in (v if isinstance(v, list) else [v]):
                 print(item if not isinstance(item, bool) else str(item).lower())
         elif cmd == "check-run" and len(args) == 1:
@@ -1340,8 +1927,17 @@ def main(argv):
         elif cmd == "fold-perf" and not args:
             for line in fold_perf(sys.stdin):
                 print(line)
-        elif cmd == "concurrent-detail" and len(args) == 5:
+        elif cmd == "concurrent-detail" and len(args) in (5, 6):
             concurrent_detail(*args)
+        elif cmd == "comparable" and len(args) == 3:
+            comparable(*args)
+        elif cmd == "healthz-sampler" and len(args) == 5:
+            healthz_sampler(*args)
+        elif cmd == "healthz-summary" and len(args) == 2:
+            for line in healthz_summary(*args):
+                print(line)
+        elif cmd == "healthz-check" and len(args) >= 2:
+            print(json.dumps(healthz_check(args[0], args[1:]), indent=2, sort_keys=True))
         elif cmd == "assemble":
             assemble(args)
         elif cmd == "validate" and len(args) == 1:
@@ -1350,9 +1946,9 @@ def main(argv):
             rows = validate(args[1])["bands"]
             print_table(rows, args[0])
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
-        elif cmd == "relative" and len(args) == 3:
+        elif cmd == "relative" and len(args) in (3, 4):
             a, b = validate(args[1]), validate(args[2])
-            rows = relative_bands(args[0], a, b)
+            rows = relative_bands(args[0], a, b, declared_flags(args[3] if len(args) == 4 else None))
             print_table(rows, "B vs A")
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
         else:

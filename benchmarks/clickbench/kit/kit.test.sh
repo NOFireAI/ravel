@@ -127,7 +127,8 @@ STUB
 
 cat >"$STUBS/curl" <<'STUB'
 #!/usr/bin/env bash
-# IMDS answers at once. Readiness and SQL answer only while the stub server's
+# IMDS answers at once, and a rustfs.invalid download is the rustfs-asset file.
+# Readiness and SQL answer only while the stub server's
 # ready file exists, as a server that is not listening refuses (curl exit 7,
 # printing "000 <seconds>" for a -w format as curl does); the stub server
 # writes it only after logging its argv and settings, and removes it when
@@ -151,7 +152,8 @@ cat >"$STUBS/curl" <<'STUB'
 # STUB_SQL_REFUSE_N. An answer holds the statement's expected row count from
 # the index.tsv beside its body (3 rows where the corpus states none), or
 # STUB_SQL_ROWS rows for statement STUB_SQL_ROWS_N (only on try
-# STUB_SQL_ROWS_TRY when that is set). The try is read from the -o name,
+# STUB_SQL_ROWS_TRY when that is set), with status STUB_SQL_STATUS (default
+# 200). The try is read from the -o name,
 # <number>-<try>.json. A body under a verify/ directory is the box's row-count
 # check: it is logged to verify-bodies and answered with one cell,
 # STUB_COUNT_STAR (default the hits row count).
@@ -177,6 +179,7 @@ case "$url" in
   */latest/api/token) echo stub-imds-token ;;
   */meta-data/instance-id) echo i-0b0x00000000000001 ;;
   */meta-data/instance-type) echo c6a.4xlarge ;;
+  https://rustfs.invalid/*) cp "$STUB_DIR/rustfs-asset" "$out" ;;
   */readyz)
     echo readyz >>"$STUB_DIR/readyz-calls"
     [ -f "$STUB_DIR/server-ready" ] || { echo "curl: (7) Failed to connect" >&2; exit 7; }
@@ -248,7 +251,7 @@ case "$url" in
       case "$out" in
         */q29_probe/*) [ -z "${STUB_PROBE_TIMES:-}" ] || seconds="$(printf '%s\n' $STUB_PROBE_TIMES | sed -n "${try}p")" ;;
       esac
-      printf '200 %s' "$seconds"
+      printf '%s %s' "${STUB_SQL_STATUS:-200}" "$seconds"
     fi
     ;;
   *) echo "unexpected curl: $url" >&2; exit 7 ;;
@@ -301,9 +304,11 @@ STUB
 # ready-delay file, else STUB_READY_DELAY (default 0.05), and while the
 # ready-after-checks file exists until that many more SELECT 1 checks have
 # been logged, writes the ready file and sleeps until stopped; the CLI logs
-# its argv, and `load` adds 100
-# objects to the store and prints ravel-cli's load summary with
-# STUB_LOAD_ROWS rows written (default the hits row count). STUB_FOLD=unsealed
+# its argv, and `load` adds 200 keys
+# to the store (100 data objects and their 100 commit records) and prints
+# ravel-cli's load summary with STUB_LOAD_ROWS rows written (default the hits
+# row count) and STUB_LOAD_OBJECTS objects written (default 100; "none"
+# leaves the line out). STUB_FOLD=unsealed
 # makes the fold seal nothing, STUB_FOLD=twice prints entry_count twice, and
 # STUB_FOLD_ENTRIES sets the entry_count it prints (default 100).
 cat >"$BINSTUBS/ravel-server" <<'STUB'
@@ -334,9 +339,10 @@ cat >"$BINSTUBS/ravel-cli" <<'STUB'
 echo "cli $*" >>"$STUB_DIR/cli-argv"
 case " $* " in
   *" load "*)
-    echo 110 >"$STUB_DIR/objects"
-    printf 'bulk load complete\n  rows_skipped     : 0\n  rows_written     : %s\n  rows/sec         : 1000\n  objects written  : 100\n' \
-      "${STUB_LOAD_ROWS:-99997497}" ;;
+    echo 210 >"$STUB_DIR/objects"
+    printf 'bulk load complete\n  rows_skipped     : 0\n  rows_written     : %s\n  rows/sec         : 1000\n' \
+      "${STUB_LOAD_ROWS:-99997497}"
+    [ "${STUB_LOAD_OBJECTS:-100}" = none ] || printf '  objects written  : %s\n' "${STUB_LOAD_OBJECTS:-100}" ;;
   *" catalog fold "*)
     if [ "${STUB_FOLD:-}" = unsealed ]; then echo "seal_through_hour: None"; else echo "seal_through_hour: Some(491234)"; fi
     printf 'previous_watermark_hour: Some(491200)\nwatermark_hour: Some(491235)\nentry_count: %s\nbuckets_folded: 5\npart_bytes: 12345\n' "${STUB_FOLD_ENTRIES:-100}"
@@ -346,6 +352,82 @@ exit 0
 STUB
 chmod +x "$STUBS"/* "$BINSTUBS"/*
 export PATH="$STUBS:$PATH"
+# macOS assesses a newly written executable on its first exec, which took
+# about 0.25 s here, longer than the 0.05 s a case gives perf record before
+# it is sent SIGTERM; a stub killed before its first line records nothing.
+# One exec now pays that outside every case.
+perf warm >/dev/null 2>&1
+rm -f "$STUB_DIR/perf-argv"
+
+# The server's two listeners as the healthz sampler sees them: one HTTP server
+# per role (4318 the query listener, 4319 the health listener) on an ephemeral
+# port, exported as KIT_HEALTH_BASE_4318 and KIT_HEALTH_BASE_4319. GET /healthz
+# answers 200 while the stub server's ready file exists and 503 otherwise;
+# while health-hang-<role> exists it answers only after 3 s, past the
+# sampler's 2 s timeout, and while health-500-<role> exists it answers 500.
+# GET /metrics on the 4318 role carries ravel_health_heartbeat_age_seconds
+# (the value in the heartbeat file, default 0.5) unless heartbeat-absent
+# exists, and answers only after 3 s while metrics-hang exists; on the 4319
+# role it is a 404.
+cat >"$TMP/health-stub.py" <<'PY'
+import http.server, os, socketserver, sys, threading, time
+state = sys.argv[1]
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    def handle_error(self, request, client_address):
+        pass  # a hung answer's client has timed out and gone
+
+def handler(role):
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+        def answer(self, code, body):
+            data = body.encode()
+            self.send_response(code)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        def do_GET(self):
+            f = lambda name: os.path.join(state, name)
+            if self.path == "/healthz":
+                if os.path.exists(f("health-hang-" + role)):
+                    time.sleep(3)
+                if os.path.exists(f("health-500-" + role)):
+                    return self.answer(500, "stub failure\n")
+                ready = os.path.exists(f("server-ready"))
+                return self.answer(200 if ready else 503, "ok\n" if ready else "starting\n")
+            if self.path == "/metrics" and role == "4318":
+                if os.path.exists(f("metrics-hang")):
+                    time.sleep(3)
+                body = "# TYPE x gauge\n"
+                if not os.path.exists(f("heartbeat-absent")):
+                    try:
+                        age = open(f("heartbeat")).read().strip()
+                    except OSError:
+                        age = "0.5"
+                    body += 'ravel_health_heartbeat_age_seconds{mode="x"} %s\n' % age
+                return self.answer(200, body)
+            return self.answer(404, "no such path\n")
+    return H
+
+ports = []
+for role in ("4318", "4319"):
+    s = Server(("127.0.0.1", 0), handler(role))
+    ports.append(str(s.server_address[1]))
+    threading.Thread(target=s.serve_forever, daemon=True).start()
+with open(sys.argv[2] + ".tmp", "w") as out:
+    out.write(" ".join(ports) + "\n")
+os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+while True:
+    time.sleep(3600)
+PY
+python3 "$TMP/health-stub.py" "$STUB_DIR" "$TMP/health-ports" &
+HEALTH_STUB_PID=$!
+trap 'kill "$HEALTH_STUB_PID" 2>/dev/null; pkill -KILL -f "healthz-sampler $TMP/" 2>/dev/null; rm -rf "$TMP"' EXIT
+for _ in $(seq 1 500); do [ -s "$TMP/health-ports" ] && break; sleep 0.01; done
+read -r hp_4318 hp_4319 <"$TMP/health-ports" || { echo "FAIL health stub: no ports"; exit 1; }
+export KIT_HEALTH_BASE_4318="http://127.0.0.1:$hp_4318" KIT_HEALTH_BASE_4319="http://127.0.0.1:$hp_4319"
 
 # The hardware the box stamps, so no case reads this machine's /proc.
 printf 'processor\t: 0\nmodel name\t: Stub CPU 9000 @ 2.00GHz\n' >"$TMP/cpuinfo"
@@ -382,7 +464,7 @@ instance_type = "c6a.4xlarge"
 region = "us-east-1"
 bucket = "kit-test-bucket"
 prefix = "clickbench-kit"
-instance_profile = "ravel-clickbench-box"
+instance_profile = "ravel-clickbench-instance-profile"
 repo_url = "https://example.invalid/ravel.git"
 tenant = "clickbench-v4"
 shards = 8
@@ -429,7 +511,7 @@ flags_ok=1
 while IFS= read -r line; do
   # printf %q escapes the braces and commas of the block device mapping.
   line="${line//\\/}"
-  for want in '--instance-initiated-shutdown-behavior terminate' '--iam-instance-profile Name=ravel-clickbench-box' \
+  for want in '--instance-initiated-shutdown-behavior terminate' '--iam-instance-profile Name=ravel-clickbench-instance-profile' \
     'VolumeSize=500,VolumeType=gp3' '--metadata-options HttpTokens=required'; do
     case "$line" in *"$want"*) ;; *) flags_ok=0; echo "  run-instances lacks: $want" ;; esac
   done
@@ -570,6 +652,48 @@ run_case "a zero q29_probe_runs" 's/^shards = /q29_probe_runs = 0\n&/' \
 run_case "a string perf_record" 's/^shards = /perf_record = "true"\n&/' \
   "perf_record must be true or false, got 'true'"
 
+# Catches: an arm's extra server flags overriding a flag the kit sets, so the
+# arms differ by a setting nobody declared, in either spelling of the flag.
+run_case "a server_flags_b repeating --shards" 's/^shards = /server_flags_b = ["--fetch-concurrency", "64", "--shards", "4"]\n&/' \
+  'server_flags_b repeats --shards, which the kit sets itself'
+run_case "a server_flags_a repeating --memory-budget-bytes=" 's/^shards = /server_flags_a = ["--memory-budget-bytes=1"]\n&/' \
+  'server_flags_a repeats --memory-budget-bytes, which the kit sets itself'
+run_case "a string server_flags_a" 's/^shards = /server_flags_a = "--fetch-concurrency 64"\n&/' \
+  "server_flags_a must be an array of non-empty strings, got '--fetch-concurrency 64'"
+# Catches: a flag the kit does not set refused, or read back as anything but
+# its entries one per line.
+code=0
+sed 's/^shards = /server_flags_a = []\nserver_flags_b = ["--fetch-concurrency", "64"]\n&/' "$RUN_TOML" >"$TMP/run-newflag.toml"
+python3 "$KIT_SRC/lib/kit.py" check-run "$TMP/run-newflag.toml" >/dev/null 2>"$TMP/run-newflag.err" || code=$?
+got_b="$(python3 "$KIT_SRC/lib/kit.py" get "$TMP/run-newflag.toml" server_flags_b 2>&1 | tr '\n' ' ')"
+got_a="$(python3 "$KIT_SRC/lib/kit.py" get "$TMP/run-newflag.toml" server_flags_a 2>&1)"
+if [ "$code" = 0 ] && [ "$got_b" = "--fetch-concurrency 64 " ] && [ -z "$got_a" ]; then
+  pass "check-run accepts an extra server flag the kit does not set"
+else
+  fail "check-run new flag" "exit $code, b '$got_b', a '$got_a': $(head -c 300 "$TMP/run-newflag.err")"
+fi
+
+# Catches: an absent optional key and an unreadable run.toml giving the same
+# answer from kit.py get, so run.sh would take a failed read for "no extra
+# flags": absent is exit 3, a file that cannot be read is exit 2.
+absent=0 unreadable=0
+python3 "$KIT_SRC/lib/kit.py" get "$RUN_TOML" server_flags_b >/dev/null 2>&1 || absent=$?
+python3 "$KIT_SRC/lib/kit.py" get "$TMP/no-such-run.toml" server_flags_b >/dev/null 2>&1 || unreadable=$?
+if [ "$absent" = 3 ] && [ "$unreadable" = 2 ]; then
+  pass "kit.py get exits 3 for an absent key and 2 for a file it cannot read"
+else
+  fail "get exit codes" "absent $absent, unreadable $unreadable"
+fi
+
+# Catches: healthz_phases naming a phase the sampler does not cover, naming
+# one twice, or not being an array.
+run_case "a healthz_phases naming q29_probe" 's/^shards = /healthz_phases = ["benchmark", "q29_probe"]\n&/' \
+  "healthz_phases must be an array of distinct phases from benchmark, concurrent, got ['benchmark', 'q29_probe']"
+run_case "a healthz_phases naming a phase twice" 's/^shards = /healthz_phases = ["concurrent", "concurrent"]\n&/' \
+  "healthz_phases must be an array of distinct phases from benchmark, concurrent, got ['concurrent', 'concurrent']"
+run_case "a string healthz_phases" 's/^shards = /healthz_phases = "benchmark"\n&/' \
+  "healthz_phases must be an array of distinct phases from benchmark, concurrent, got 'benchmark'"
+
 # Catches: a stamped server setting that a start logged zero times or twice
 # being stamped as a list, which two arms then compare equal on.
 settings_case() {
@@ -609,7 +733,7 @@ settings_case "a setting logged twice" "" cache_max_bytes 'carries cache_max_byt
 reset_log
 code=0
 STUB_DENY_ACTION=s3:PutObject bash "$KIT_SRC/launch.sh" "$RUN_TOML" >/dev/null 2>"$TMP/deny.err" || code=$?
-if [ "$code" = 65 ] && grep -q 'role arn:aws:iam::123456789012:role/kit-test-role (instance profile ravel-clickbench-box) lacks s3:PutObject' "$TMP/deny.err" \
+if [ "$code" = 65 ] && grep -q 'role arn:aws:iam::123456789012:role/kit-test-role (instance profile ravel-clickbench-instance-profile) lacks s3:PutObject' "$TMP/deny.err" \
   && ! grep -q 'aws s3 cp' "$STUB_LOG" && ! grep -q 'run-instances' "$STUB_LOG"; then
   pass "a role without s3:PutObject is refused by name before any upload"
 else
@@ -636,7 +760,7 @@ fi
 reset_log
 code=0
 STUB_NO_PROFILE=1 bash "$KIT_SRC/launch.sh" "$RUN_TOML" >/dev/null 2>"$TMP/noprofile.err" || code=$?
-if [ "$code" = 65 ] && grep -q 'cannot read instance profile ravel-clickbench-box' "$TMP/noprofile.err" \
+if [ "$code" = 65 ] && grep -q 'cannot read instance profile ravel-clickbench-instance-profile' "$TMP/noprofile.err" \
   && ! grep -q 'aws s3 cp' "$STUB_LOG" && ! grep -q 'run-instances' "$STUB_LOG"; then
   pass "a missing instance profile exits 65 before any upload"
 else
@@ -812,12 +936,28 @@ bootstrap_build() {
 }
 wait_dataset() { echo 1111111111111111111111111111111111111111111111111111111111111111 >"$KIT/dataset.sha256"; }
 # RustFS logging its own keys, into its log and into run.log, neither of
-# which the evidence or FAILED may carry.
-bootstrap_rustfs() {
-  make_secrets && echo 'rustfs 1.0.0-stub' >"$KIT/rustfs.version" && . "$SECRETS_ENV" \
-    && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >"$KIT/rustfs.log" \
-    && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >&2
-}
+# which the evidence or FAILED may carry. DRIVER_REAL_RUSTFS=1 keeps run.sh's
+# own bootstrap_rustfs, for a case that never gets past its version check.
+if [ -z "${DRIVER_REAL_RUSTFS:-}" ]; then
+  bootstrap_rustfs() {
+    make_secrets && echo 'rustfs 1.0.0-stub' >"$KIT/rustfs.version" && . "$SECRETS_ENV" \
+      && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >"$KIT/rustfs.log" \
+      && echo "rustfs: starting with access_key=$RUSTFS_ACCESS_KEY secret_key=$RUSTFS_SECRET_KEY" >&2
+  }
+fi
+# DRIVER_HEALTHZ_EDIT=dup repeats healthz.txt's first line after the phases
+# ran, and =drop deletes its HEARTBEAT line.
+if [ -n "${DRIVER_HEALTHZ_EDIT:-}" ]; then
+  eval "real_run_phases() $(declare -f run_phases | tail -n +2)"
+  run_phases() {
+    real_run_phases || return 1
+    case "$DRIVER_HEALTHZ_EDIT" in
+      dup) head -n 1 "$OUT/healthz.txt" >>"$OUT/healthz.txt" ;;
+      drop) grep -v '^HEARTBEAT ' "$OUT/healthz.txt" >"$OUT/healthz.txt.new" \
+        && mv "$OUT/healthz.txt.new" "$OUT/healthz.txt" ;;
+    esac
+  }
+fi
 drop_caches() {
   echo drop >>"$STUB_DIR/sequence"
   sync
@@ -918,13 +1058,24 @@ w = p.get("query_window", {})
 want(w.get("window_hours") == 200000 and w.get("end", 0) - w.get("start", 0) == 720000000, "query_window")
 want(p.get("corpus_digest", {}).get("dataset_sha256") == sys.argv[4], "dataset_sha256")
 want(p.get("fold", {}).get("precondition") == "met" and p["fold"].get("seal_through_hour") == "Some(491234)"
-     and p["fold"].get("objects_written_by_load") == 100 and p["fold"].get("entry_count") == 100, "fold stamp")
-want(p.get("object_counts") == {"before_load": 10, "after_load": 110}, "object_counts")
+     and p["fold"].get("objects_written_by_load") == 100 and p["fold"].get("entry_count") == 100
+     and p["fold"].get("store_keys_added_by_load") == 200, "fold stamp %r" % p.get("fold"))
+want(p.get("object_counts") == {"before_load": 10, "after_load": 210}, "object_counts")
 for side in ("start", "end"):
     b = (p.get("burst_balance") or {}).get(side) or {}
     want(b.get("volume_type") == "gp3" and b.get("value") is None and "gp3" in b.get("reason", ""),
          "burst_balance." + side)
-want("--memory-budget-bytes 25769803776" in p.get("server_flags", {}).get("flags", ""), "server_flags")
+sf = p.get("server_flags", {})
+want("--memory-budget-bytes 25769803776" in sf.get("flags", "") and sf.get("extra_flags") == []
+     and sf.get("base_flags", [])[-2:] == ["--audit-mode", "off"]
+     and " ".join(sf.get("base_flags", [])) == sf.get("flags"), "server_flags %r" % sf)
+hz = r.get("healthz") or {}
+bench = (hz.get("phases") or {}).get("benchmark") or {}
+want(hz.get("interval_ms") == 250.0 and hz.get("timeout_ms") == 2000.0
+     and list(hz.get("phases", {})) == ["benchmark"] and bench.get("heartbeat_max_s") == 0.5
+     and sorted(bench.get("ports", {})) == ["4318", "4319"]
+     and all(v["n"] >= 43 and v["failures"] == 0 and 0 < v["p99_ms"] < 2000.0
+             for v in bench["ports"].values()), "healthz %r" % hz)
 want(p.get("audit_mode") == "off", "audit_mode")
 want(p.get("hardware", {}).get("instance_type") == "c6a.4xlarge"
      and p["hardware"].get("cpu") == "Stub CPU 9000 @ 2.00GHz"
@@ -969,6 +1120,147 @@ if [ -z "$check" ] && python3 "$KIT_SRC/lib/kit.py" validate "$OUT_A/results.jso
   pass "results.json is SqlLatencyReport-shaped with the answer checks, the provenance stamps and the bands"
 else
   fail "results.json" "missing or wrong: $check"
+fi
+
+# Catches: the healthz sampler counting samples taken while the server was
+# down between statements, its raw samples left out of the evidence, or its
+# lines not printed once each. Each statement's server start opens one gate
+# generation, and a gated sample is one taken with the server up.
+rm -rf "$TMP/evidence-a"
+mkdir -p "$TMP/evidence-a"
+tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-a" 2>/dev/null
+check="$(python3 - "$TMP/evidence-a/out" <<'PY' 2>&1
+import json, os, sys
+d = sys.argv[1]
+for name in ("4318", "4319", "metrics"):
+    recs = [json.loads(l) for l in open(os.path.join(d, "benchmark", "healthz", name + ".jsonl"))]
+    gated = [r for r in recs if r["gated"]]
+    if sorted(set(r["gen"] for r in gated)) != list(range(1, 44)):
+        print(name, "gated generations", sorted(set(r["gen"] for r in gated))[:5])
+    if any(not r["ok"] or r["status"] != 200 for r in gated):
+        print(name, "a gated sample not a 200", [r for r in gated if not r["ok"]][:1])
+    if name != "metrics" and any(not isinstance(r.get("ms"), float) for r in recs):
+        print(name, "a sample without ms")
+lines = open(os.path.join(d, "healthz.txt")).read().splitlines()
+if [l.split(" n=")[0] for l in lines] != ["HEALTHZ phase=benchmark port=4318", "HEALTHZ phase=benchmark port=4319",
+                                          "HEARTBEAT phase=benchmark"]:
+    print("healthz.txt", lines)
+scrapes = [json.loads(l) for l in open(os.path.join(d, "benchmark", "healthz", "metrics.jsonl"))]
+n_gated = sum(1 for r in scrapes if r["gated"])
+if lines[-1:] != ["HEARTBEAT phase=benchmark n=%d failures=0 bad=0 max_s=0.500" % n_gated] or n_gated < 43:
+    print("HEARTBEAT", lines[-1:], "gated scrapes", n_gated)
+PY
+)"
+if [ -z "$check" ] && [ "$(grep -c '^HEALTHZ phase=benchmark port=4318 ' "$BOX_A/kit/run.log")" = 1 ] \
+  && [ "$(grep -c '^HEARTBEAT phase=benchmark ' "$BOX_A/kit/run.log")" = 1 ]; then
+  pass "the healthz sampler counts only samples with the server up, keeps every raw sample in the evidence and prints each line once"
+else
+  fail "healthz sampler" "$check"
+fi
+
+# Catches: a /healthz timeout or a non-200 dropped from the figures or counted
+# at its own latency: 4319 hangs past the 2 s client timeout and 4318 answers
+# 500, so every sample on both is a failure counted as 2000 ms. /metrics
+# hangs past the timeout too, so every scrape is a stall: HEARTBEAT must count
+# each as a failure and report max_s 2.000 rather than refuse the phase, drop
+# them or call them bad.
+hz="$TMP/healthz-fail"
+rm -rf "$hz"
+mkdir -p "$hz"
+touch "$STUB_DIR/server-ready" "$STUB_DIR/health-hang-4319" "$STUB_DIR/health-500-4318" \
+  "$STUB_DIR/metrics-hang"
+printf 'up 1\n' >"$hz/gate"
+python3 "$KIT_SRC/lib/kit.py" healthz-sampler "$hz" "$hz/gate" "$hz/ack" \
+  "$KIT_HEALTH_BASE_4318" "$KIT_HEALTH_BASE_4319" 2>"$hz/sampler.log" &
+hz_pid=$!
+for _ in $(seq 1 1000); do [ -s "$hz/ack" ] && break; sleep 0.01; done
+sleep 2.5
+printf 'down 1\n' >"$hz/gate"
+kill "$hz_pid" 2>/dev/null
+wait "$hz_pid" 2>/dev/null
+rm -f "$STUB_DIR/server-ready" "$STUB_DIR/health-hang-4319" "$STUB_DIR/health-500-4318" \
+  "$STUB_DIR/metrics-hang"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$hz" >"$hz/summary" 2>&1 || code=$?
+n_hb="$(sed -n 's/^HEARTBEAT phase=benchmark n=\([0-9]*\) failures=\([0-9]*\) bad=0 max_s=2.000$/\1 \2/p' "$hz/summary")"
+n_4318="$(sed -n 's/^HEALTHZ phase=benchmark port=4318 n=\([0-9]*\) p50_ms=2000.000 p99_ms=2000.000 max_ms=2000.000 failures=\([0-9]*\)$/\1 \2/p' "$hz/summary")"
+n_4319="$(sed -n 's/^HEALTHZ phase=benchmark port=4319 n=\([0-9]*\) p50_ms=2000.000 p99_ms=2000.000 max_ms=2000.000 failures=\([0-9]*\)$/\1 \2/p' "$hz/summary")"
+raw_4319="$(python3 -c 'import json, sys; r = [json.loads(l) for l in open(sys.argv[1])]; print(min(x["ms"] for x in r) >= 1900, all(x["error"].startswith("timeout") or "timed out" in x["error"] for x in r))' "$hz/4319.jsonl" 2>&1)"
+if [ "$code" = 0 ] && [ -s "$hz/ack" ] && [ -n "$n_4318" ] && [ "${n_4318% *}" = "${n_4318#* }" ] && [ "${n_4318% *}" -ge 4 ] \
+  && [ -n "$n_4319" ] && [ "${n_4319% *}" = "${n_4319#* }" ] && [ "${n_4319% *}" -ge 1 ] \
+  && [ "$raw_4319" = "True True" ] \
+  && [ -n "$n_hb" ] && [ "${n_hb% *}" = "${n_hb#* }" ] && [ "${n_hb% *}" -ge 1 ]; then
+  pass "a /healthz timeout or non-200 counts as a 2000 ms sample and a failure, and an unanswered /metrics scrape as a 2 s heartbeat age and a failure"
+else
+  fail "healthz timeout" "exit $code, 4318 '$n_4318', 4319 '$n_4319', raw '$raw_4319', heartbeat '$n_hb': $(cat "$hz/summary") $(head -c 300 "$hz/sampler.log")"
+fi
+
+# Catches: a /metrics endpoint that answers fast but unusably read as a 2 s
+# stall on every scrape, so a misconfigured endpoint passes every phase with
+# max_s 2.000: /metrics answers 200 without the heartbeat age, and the phase
+# is refused, naming the reason. The same raw scrapes pin the 1 s cadence:
+# consecutive scrapes of one generation sit at least 0.95 s apart on the
+# monotonic clock (load only widens the gap), not at /healthz's 250 ms.
+hz="$TMP/healthz-unusable"
+rm -rf "$hz"
+mkdir -p "$hz"
+touch "$STUB_DIR/server-ready" "$STUB_DIR/heartbeat-absent"
+printf 'up 1\n' >"$hz/gate"
+python3 "$KIT_SRC/lib/kit.py" healthz-sampler "$hz" "$hz/gate" "$hz/ack" \
+  "$KIT_HEALTH_BASE_4318" "$KIT_HEALTH_BASE_4319" 2>"$hz/sampler.log" &
+hz_pid=$!
+for _ in $(seq 1 1000); do [ -s "$hz/ack" ] && break; sleep 0.01; done
+sleep 2.5
+printf 'down 1\n' >"$hz/gate"
+kill "$hz_pid" 2>/dev/null
+wait "$hz_pid" 2>/dev/null
+rm -f "$STUB_DIR/server-ready" "$STUB_DIR/heartbeat-absent"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$hz" >"$hz/summary" 2>"$hz/summary.err" || code=$?
+gaps="$(python3 -c 'import json, sys
+t = [r["mono"] for r in map(json.loads, open(sys.argv[1])) if r["gen"] == 1]
+g = [b - a for a, b in zip(t, t[1:])]
+print(len(g) >= 1 and min(g) >= 0.95, [round(x, 3) for x in g])' "$hz/metrics.jsonl" 2>&1)"
+if [ "$code" = 2 ] && [ ! -s "$hz/summary" ] \
+  && grep -qF "every answered /metrics scrape for phase benchmark in $hz was unusable (no ravel_health_heartbeat_age_seconds in /metrics)" "$hz/summary.err" \
+  && [ "${gaps%% *}" = True ]; then
+  pass "a phase whose every answered /metrics scrape lacks the heartbeat age is refused, naming why, and /metrics is scraped every 1 s on the monotonic clock"
+else
+  fail "healthz unusable metrics" "exit $code, metrics gaps '$gaps': $(cat "$hz/summary" "$hz/summary.err") $(head -c 300 "$hz/sampler.log")"
+fi
+
+# Catches: an answered but unusable scrape (a 404, a 401, a 200 without the
+# metric) counted as a stall or left out of the HEARTBEAT line, or a phase
+# whose answered scrapes were all unusable passing beside a stall.
+hz_synthetic() {
+  local d="$TMP/healthz-syn-$1"
+  shift
+  rm -rf "$d"
+  mkdir -p "$d"
+  for port in 4318 4319; do
+    echo '{"gated": true, "ok": true, "ms": 1.0}' >"$d/$port.jsonl"
+  done
+  printf '%s\n' "$@" >"$d/metrics.jsonl"
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$d" >"$d/summary" 2>"$d/summary.err" || code=$?
+}
+s_ok='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.7}'
+s_ok2='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.4}'
+s_404='{"gated": true, "ok": false, "answered": true, "status": 404, "error": "HTTP 404"}'
+s_401='{"gated": true, "ok": false, "answered": true, "status": 401, "error": "HTTP 401"}'
+s_stall='{"gated": true, "ok": false, "answered": false, "status": 0, "error": "TimeoutError: timed out"}'
+hz_synthetic mixed "$s_ok" "$s_401" "$s_stall"
+mixed="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-mixed/summary")"
+hz_synthetic usable "$s_ok" "$s_ok2" "$s_404"
+usable="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-usable/summary")"
+hz_synthetic allbad "$s_404" "$s_401" "$s_stall"
+allbad="$code $(cat "$TMP/healthz-syn-allbad/summary.err")"
+if [ "$mixed" = "0 HEARTBEAT phase=benchmark n=3 failures=1 bad=1 max_s=2.000" ] \
+  && [ "$usable" = "0 HEARTBEAT phase=benchmark n=3 failures=0 bad=1 max_s=0.700" ] \
+  && [ "$allbad" = "2 kit: healthz-summary: every answered /metrics scrape for phase benchmark in $TMP/healthz-syn-allbad was unusable (HTTP 401; HTTP 404), so the heartbeat age was never read" ]; then
+  pass "an answered but unusable /metrics scrape counts as bad, not as a stall, and a phase with no usable scrape among its answers is refused"
+else
+  fail "healthz bad scrapes" "mixed '$mixed', usable '$usable', allbad '$allbad'"
 fi
 
 # Catches: a request body without an explicit window (the server's default is
@@ -1069,7 +1361,7 @@ fi
 order="$(sed -n 's/^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9:]*Z step=\([a-z-]*\) state=done$/\1/p' "$OUT_A/progress.log" | tr '\n' ' ')"
 unstamped="$(grep -vc '^[0-9]\{4\}-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]Z ' "$OUT_A/progress.log")"
 case "$order" in
-  *"objects-before-load load objects-after-load compact fold declare verify phase-benchmark burst-end results evidence "*)
+  *"objects-before-load load objects-after-load compact fold declare verify phase-benchmark healthz burst-end results evidence "*)
     if [ "$unstamped" = 0 ]; then
       pass "progress.log stamps every step in UTC, fold and the row-count check before the phases"
     else
@@ -1097,6 +1389,8 @@ grep -q '^RAVEL_AUDIT_TOKEN_KEY=[0-9a-f]\{64\}$' "$BOX_A/kit/secrets.env" \
 if [ "$audit_off_ok" = 1 ] && [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TMP/evidence-a/object-counts/before-load.txt" ] \
   && [ -f "$TMP/evidence-a/object-counts/after-load.txt" ] && [ -f "$TMP/evidence-a/out/benchmark/samplers/server-rss.log" ] \
   && [ -f "$TMP/evidence-a/arm.env" ] && [ -n "$token" ] && [ -n "$secret" ] && [ -n "$access" ] \
+  && [ -s "$TMP/evidence-a/out/benchmark/healthz/4318.jsonl" ] && [ -s "$TMP/evidence-a/out/benchmark/healthz/4319.jsonl" ] \
+  && [ -s "$TMP/evidence-a/out/benchmark/healthz/metrics.jsonl" ] && [ -s "$TMP/evidence-a/out/healthz.txt" ] \
   && grep -qF "$secret" "$BOX_A/kit/rustfs.log" && grep -qF "$secret" "$BOX_A/kit/run.log" \
   && grep -qF "secret_key=$secret" "$BOX_A/kit/server-1.log" \
   && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/rustfs.log" \
@@ -1104,7 +1398,7 @@ if [ "$audit_off_ok" = 1 ] && [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TM
   && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/server-1.log" \
   && ! grep -rqF -e "$token" -e "$secret" -e "$access" "$TMP/evidence-a" "$OUT_A" \
   && [ ! -e "$TMP/evidence-a/secrets.env" ] && [ ! -e "$TMP/evidence-a/auth.header" ]; then
-  pass "evidence.tgz holds server logs, samplers and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
+  pass "evidence.tgz holds server logs, samplers, raw healthz samples and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
 else
   fail "evidence" "audit key kept from an audit_mode off server: $audit_off_ok; $(tar -tzf "$OUT_A/evidence.tgz" | head -n 20 | tr '\n' ' ')"
 fi
@@ -1246,6 +1540,137 @@ else
   fail "fold entry ratio" "exit $code, stamp '$fold_stamp', FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
 fi
 rm -rf "$OUT_A"
+
+# Catches: the fold judged against the bucket's key delta, which also counts
+# one commit record per data object: arm A's load added 200 keys for its 100
+# objects written, and a fold of 100 entries covers all of them.
+fold_stamp="$(python3 -c 'import json, sys; f = json.load(open(sys.argv[1])); print(f["precondition"], f["entry_count"], f["objects_written_by_load"], f["store_keys_added_by_load"])' \
+  "$BOX_A/kit/stamps/fold" 2>/dev/null)"
+if [ "$fold_stamp" = "met 100 100 200" ]; then
+  pass "a fold covering the load's objects written is met though the bucket gained twice as many keys"
+else
+  fail "fold against objects written" "stamp '$fold_stamp', run.log: $(grep -h 'fold entry_count' "$BOX_A/kit/run.log" | head -n 1)"
+fi
+
+# Catches: a load report without its "objects written" figure passing, so
+# the fold check has no denominator.
+code=0
+run_box A box-noobjects STUB_LOAD_OBJECTS=none || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=load ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+  && grep -q 'load.out carries objects written 0 times, not once' "$OUT_A/FAILED" \
+  && [ ! -e "$TMP/box-noobjects/kit/stamps/fold" ]; then
+  pass "a load report without objects written fails as FAILED step=load, before the fold"
+else
+  fail "no objects written" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a RustFS binary that unpacks and installs but cannot run (the gnu
+# build on an older glibc) left to fail later as a store that never answers.
+printf '#!/bin/sh\necho "rustfs: /lib64/libc.so.6: version GLIBC_2.38 not found (required by rustfs)" >&2\nexit 1\n' \
+  >"$STUB_DIR/rustfs-asset"
+asset_sha="$(sha256sum "$STUB_DIR/rustfs-asset" | cut -d' ' -f1)"
+code=0
+BOX_TOML_SED="s|^rustfs_url = .*|rustfs_url = \"https://rustfs.invalid/rustfs\"|;s|^rustfs_sha256 = .*|rustfs_sha256 = \"$asset_sha\"|" \
+  run_box A box-rustfsver DRIVER_REAL_RUSTFS=1 || code=$?
+if [ "$code" = 1 ] && grep -q '^FAILED step=rustfs ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+  && grep -qF 'rustfs --version failed: rustfs: /lib64/libc.so.6: version GLIBC_2.38 not found (required by rustfs)' "$OUT_A/FAILED" \
+  && ! grep -q '^nohup .*/rustfs ' "$STUB_LOG"; then
+  pass "a rustfs binary whose --version fails fails as FAILED step=rustfs, quoting its output"
+else
+  fail "rustfs --version" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null); $(grep '^nohup' "$STUB_LOG")"
+fi
+rm -rf "$OUT_A"
+
+# Catches: an arm's server_flags_a not reaching every server start after the
+# kit's own flags, or not stamped apart from them.
+code=0
+BOX_TOML_SED='s/^shards = /server_flags_a = ["--fetch-concurrency", "64"]\n&/' \
+  run_box A box-flags || code=$?
+starts="$(wc -l <"$STUB_DIR/server-argv" | tr -d ' ')"
+tail_ok="$(grep -c -- '--audit-mode off --fetch-concurrency 64$' "$STUB_DIR/server-argv")"
+sf="$(python3 -c 'import json, sys; f = json.load(open(sys.argv[1]))["provenance"]["server_flags"]; print(f["extra_flags"], f["base_flags"][-2:], f["flags"].endswith("--audit-mode off --fetch-concurrency 64"))' \
+  "$OUT_A/results.json" 2>/dev/null)"
+if [ "$code" = 0 ] && [ "$starts" -ge 43 ] && [ "$tail_ok" = "$starts" ] \
+  && [ "$sf" = "['--fetch-concurrency', '64'] ['--audit-mode', 'off'] True" ]; then
+  pass "server_flags_a follows the kit's flags on every server start and is stamped as extra_flags"
+else
+  fail "server_flags_a" "exit $code, $tail_ok of $starts starts, stamp '$sf': $(tail -n 1 "$STUB_DIR/server-argv" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: a healthz.txt with a phase's line twice or missing taken as the
+# phase's figures: each must fail the box at step healthz, naming the line.
+for edit in "dup|HEALTHZ phase=benchmark port=4318 2 times" "drop|HEARTBEAT phase=benchmark 0 times"; do
+  code=0
+  run_box A "box-healthz-${edit%%|*}" DRIVER_HEALTHZ_EDIT="${edit%%|*}" || code=$?
+  if [ "$code" = 1 ] && grep -q '^FAILED step=healthz ' "$OUT_A/FAILED" 2>/dev/null && [ ! -e "$OUT_A/DONE" ] \
+    && grep -qF "must hold each line exactly once; it holds ${edit#*|}" "$OUT_A/FAILED"; then
+    pass "healthz.txt edited (${edit%%|*}) fails as FAILED step=healthz, naming the line"
+  else
+    fail "healthz ${edit%%|*}" "exit $code, FAILED: $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+  fi
+  rm -rf "$OUT_A"
+done
+
+# Catches: healthz_phases ignored, so a run that leaves the benchmark phase
+# unsampled still runs the sampler beside its statements. Nothing is sampled,
+# healthz.txt stays empty and results.json's healthz block is null.
+code=0
+BOX_TOML_SED='s/^shards = /healthz_phases = ["concurrent"]\n&/' \
+  run_box A box-healthz-off || code=$?
+hz_off="$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["healthz"])' "$OUT_A/results.json" 2>&1)"
+if [ "$code" = 0 ] && grep -q '^DONE ' "$OUT_A/DONE" 2>/dev/null && [ "$hz_off" = None ] \
+  && [ ! -e "$TMP/box-healthz-off/kit/out/benchmark/healthz" ] && [ ! -s "$TMP/box-healthz-off/kit/out/healthz.txt" ] \
+  && ! grep -q '^HEALTHZ ' "$TMP/box-healthz-off/kit/run.log"; then
+  pass "healthz_phases without benchmark leaves the benchmark phase unsampled and the healthz block null"
+else
+  fail "healthz_phases" "exit $code, healthz '$hz_off': $(head -n 3 "$OUT_A/FAILED" 2>/dev/null)"
+fi
+rm -rf "$OUT_A"
+
+# Catches: healthz-check passing a line for a phase that was not sampled.
+printf '%s\n' \
+  'HEALTHZ phase=benchmark port=4318 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
+  'HEALTHZ phase=benchmark port=4319 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
+  'HEARTBEAT phase=benchmark n=4 failures=1 bad=2 max_s=2.000' >"$TMP/healthz-extra.txt"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
+  >"$TMP/healthz-extra.json" 2>"$TMP/healthz-extra.err" || code=$?
+hb="$(python3 -c 'import json, sys; b = json.load(open(sys.argv[1]))["phases"]["benchmark"]; print(b["heartbeat_n"], b["heartbeat_failures"], b["heartbeat_bad"], b["heartbeat_max_s"])' "$TMP/healthz-extra.json" 2>&1)"
+[ "$code" = 0 ] && [ "$hb" = "4 1 2 2.0" ] \
+  || fail "healthz extra line control" "exit $code, heartbeat '$hb': $(head -c 300 "$TMP/healthz-extra.err")"
+echo 'HEARTBEAT phase=concurrent-1 n=4 failures=0 bad=0 max_s=0.500' >>"$TMP/healthz-extra.txt"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
+  >/dev/null 2>"$TMP/healthz-extra.err" || code=$?
+if [ "$code" = 2 ] \
+  && grep -qF "healthz-extra.txt:4 is not an expected line: 'HEARTBEAT phase=concurrent-1 n=4 failures=0 bad=0 max_s=0.500'" "$TMP/healthz-extra.err"; then
+  pass "healthz-check refuses a line for a phase it was not asked for, naming file and line"
+else
+  fail "healthz extra line" "exit $code: $(head -c 300 "$TMP/healthz-extra.err")"
+fi
+
+# Catches: a HEARTBEAT line with no scrape behind it, more failed and bad
+# scrapes than scrapes, no usable scrape beside bad ones, or one in an older
+# form (max only, or without bad=), taken as the phase's heartbeat figure.
+for bad in 'HEARTBEAT phase=benchmark n=0 failures=0 bad=0 max_s=0.000|counts 0 samples and 0 failures' \
+  'HEARTBEAT phase=benchmark n=2 failures=3 bad=0 max_s=2.000|counts 2 samples and 3 failures' \
+  'HEARTBEAT phase=benchmark n=4 failures=2 bad=3 max_s=2.000|counts 4 scrapes, 2 failures and 3 bad' \
+  'HEARTBEAT phase=benchmark n=4 failures=1 bad=3 max_s=2.000|counts 3 bad scrapes and no usable one' \
+  "HEARTBEAT phase=benchmark n=4 failures=1 max_s=2.000|is not an expected line: 'HEARTBEAT phase=benchmark n=4 failures=1 max_s=2.000'" \
+  "HEARTBEAT phase=benchmark max_s=0.500|is not an expected line: 'HEARTBEAT phase=benchmark max_s=0.500'"; do
+  head -n 2 "$TMP/healthz-extra.txt" >"$TMP/healthz-hb.txt"
+  echo "${bad%%|*}" >>"$TMP/healthz-hb.txt"
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-hb.txt" benchmark \
+    >/dev/null 2>"$TMP/healthz-hb.err" || code=$?
+  if [ "$code" = 2 ] && grep -qF -- "${bad#*|}" "$TMP/healthz-hb.err"; then
+    pass "healthz-check refuses '${bad%%|*}'"
+  else
+    fail "healthz heartbeat '${bad%%|*}'" "exit $code: $(head -c 300 "$TMP/healthz-hb.err")"
+  fi
+done
 
 # Catches: a fold field read from the first of several matches: a fold.out
 # carrying entry_count twice is not a figure the kit can stamp.
@@ -1760,7 +2185,9 @@ for edit in 'corpus_digest.dataset_sha256|p["corpus_digest"]["dataset_sha256"] =
   'backend.version|p["backend"]["version"] = "rustfs 9.9.9"' \
   'audit_mode|p["audit_mode"] = "required, audit text redacted"' \
   'query_window.window_hours|p["query_window"]["window_hours"] = 100000' \
-  'server_settings|p["server_settings"]["fetch_concurrency"] += 1'; do
+  'server_settings|p["server_settings"]["fetch_concurrency"] += 1' \
+  'server_flags.base_flags|p["server_flags"]["base_flags"][3] = "4"' \
+  'server_flags.extra_flags|p["server_flags"]["extra_flags"] = ["--fetch-concurrency", "64"]'; do
   field="${edit%%|*}"
   as_arm_b "$TMP/fixture-pass" "$TMP/fixture-cmp-b" "p = r[\"provenance\"]
 ${edit#*|}"
@@ -1797,6 +2224,225 @@ if [ "$code" = 2 ] && grep -q 'provenance.hardware.cpu differs' "$TMP/fetch-cmp.
   pass "fetch exits 2 on arms that are not comparable"
 else
   fail "fetch comparable" "exit $code: $(tail -n 2 "$TMP/fetch-cmp.err")"
+fi
+
+# flags_fixture RUN A_DIR B_DIR SED: fixture, with the run's uploaded
+# in/run.toml edited by SED (fetch reads the declared extra flags from it).
+flags_fixture() {
+  local d="$FAKE_S3/kit-test-bucket/clickbench-kit/runs/$1"
+  fixture "$1" "$2" "$3"
+  sed "$4" "$d/in/run.toml" >"$d/in/run.toml.new" && mv "$d/in/run.toml.new" "$d/in/run.toml"
+}
+declare_b='s/^shards = /server_flags_b = ["--fetch-concurrency", "64"]\n&/'
+# Arm B ran with --fetch-concurrency 64, which moved its resolved setting.
+flags_b_edit='r["provenance"]["server_flags"]["extra_flags"] = ["--fetch-concurrency", "64"]
+r["provenance"]["server_settings"]["fetch_concurrency"] = 64'
+
+# Catches: arms whose only difference is the extra flags run.toml declared for
+# them refused, or the difference not printed, or printed more than once.
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-flags-b" "$flags_b_edit"
+flags_fixture run-flags "$TMP/fixture-pass" "$TMP/fixture-flags-b" "$declare_b"
+fetch flags run-flags --timeout 30
+if [ "$code" = 0 ] \
+  && [ "$(grep -c '^comparable: ' "$TMP/fetch-flags.out")" = 2 ] \
+  && [ "$(grep -cF "comparable: arms differ by their declared extra server flags only: A [], B ['--fetch-concurrency', '64']" "$TMP/fetch-flags.out")" = 1 ] \
+  && [ "$(grep -cF "comparable: server_settings differs with them: fetch_concurrency A 32 B 64" "$TMP/fetch-flags.out")" = 1 ] \
+  && grep -q '^PASS  *B vs A  *hot_sum_s <= 1.05 x A (43 both answered)' "$TMP/fetch-flags.out"; then
+  pass "fetch accepts arms that differ by exactly the declared server_flags_a/b, printing the difference once"
+else
+  fail "fetch declared flags" "exit $code: $(grep '^comparable' "$TMP/fetch-flags.out") $(tail -n 2 "$TMP/fetch-flags.err")"
+fi
+
+# Catches: the declared-flags exception widened past the declared lists: B's
+# extra flags other than run.toml declares, extra flags with nothing
+# declared, and a kit-set flag that differs alongside declared extras.
+flags_refusal() {
+  local name="$1" edit="$2" sed_toml="$3" want="$4" id
+  id="$(printf '%s' "$name" | tr ' ' '-')"
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-flags-$id-b" "$edit"
+  flags_fixture "run-flags-$id" "$TMP/fixture-pass" "$TMP/fixture-flags-$id-b" "$sed_toml"
+  fetch "flags-$id" "run-flags-$id" --timeout 30
+  if [ "$code" = 2 ] && grep -qF -- "$want" "$TMP/fetch-flags-$id.err" \
+    && ! grep -q 'B vs A' "$TMP/fetch-flags-$id.out" && ! grep -q '^comparable: ' "$TMP/fetch-flags-$id.out"; then
+    pass "fetch refuses $name with exit 2"
+  else
+    fail "fetch flags $name" "exit $code: $(tail -n 2 "$TMP/fetch-flags-$id.err")"
+  fi
+}
+flags_refusal "extra flags other than declared" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--fetch-concurrency", "32"]' "$declare_b" \
+  "provenance.server_flags.extra_flags is A [], B ['--fetch-concurrency', '32'], and run.toml's server_flags_a and server_flags_b are A [], B ['--fetch-concurrency', '64']"
+flags_refusal "undeclared extra flags" "$flags_b_edit" 's/^shards = /&/' \
+  "provenance.server_flags.extra_flags is A [], B ['--fetch-concurrency', '64'], and run.toml's server_flags_a and server_flags_b are A [], B []"
+flags_refusal "a kit-set flag differing beside declared extras" "$flags_b_edit
+r[\"provenance\"][\"server_flags\"][\"base_flags\"][3] = \"4\"" "$declare_b" \
+  'arms are not comparable: provenance.server_flags.base_flags differs'
+flags_refusal "another field differing beside declared extras" "$flags_b_edit
+r[\"provenance\"][\"hardware\"][\"cpu\"] = \"Some Other CPU\"" "$declare_b" \
+  'arms are not comparable: provenance.hardware.cpu differs'
+
+# Catches: declared extra flags waving through every resolved server setting
+# that differs. A setting may differ only when a flag that sets it is set
+# differently by the declared lists: #2980's --sql-scan-decode-inline sets
+# none of them, and --fetch-concurrency sets only fetch_concurrency.
+declare_inline='s/^shards = /server_flags_b = ["--sql-scan-decode-inline"]\n&/'
+inline_edit='r["provenance"]["server_flags"]["extra_flags"] = ["--sql-scan-decode-inline"]'
+flags_refusal "an unrelated setting differing beside a declared flag that sets none" "$inline_edit
+r[\"provenance\"][\"server_settings\"][\"cache_max_bytes\"] = 1" "$declare_inline" \
+  "provenance.server_settings.cache_max_bytes differs (A 7689077760, B 1), and the declared extra flags do not set --cache-max-bytes differently"
+flags_refusal "a setting the declared flag does not set differing beside one it does" "$flags_b_edit
+r[\"provenance\"][\"server_settings\"][\"sql_tenant_max_bytes\"] = 1" "$declare_b" \
+  "provenance.server_settings.sql_tenant_max_bytes differs (A 32903794688, B 1), and the declared extra flags do not set --sql-tenant-max-bytes or --sql-max-query-bytes differently"
+flags_refusal "a setting no known flag sets differing beside declared extras" "$flags_b_edit
+r[\"provenance\"][\"server_settings\"][\"unmapped_setting\"] = 1" "$declare_b" \
+  "provenance.server_settings.unmapped_setting differs (A None, B 1), and the kit knows no flag that sets it"
+
+# Catches: the setting check refusing what a declared flag does move, or
+# printing a difference that is not there. B declares --sql-scan-decode-inline
+# with every setting equal (one comparable line), then --sql-tenant-max-bytes,
+# which moves both SQL pools (the per-query pool is clamped to it), then
+# --sql-max-query-bytes above the tenant pool, which raises the tenant pool to
+# it.
+flags_accepted() {
+  local name="$1" edit="$2" sed_toml="$3"
+  shift 3
+  as_arm_b "$TMP/fixture-pass" "$TMP/fixture-flags-$name-b" "$edit"
+  flags_fixture "run-flags-$name" "$TMP/fixture-pass" "$TMP/fixture-flags-$name-b" "$sed_toml"
+  fetch "flags-$name" "run-flags-$name" --timeout 30
+  local want ok=1
+  [ "$code" = 0 ] && [ "$(grep -c '^comparable: ' "$TMP/fetch-flags-$name.out")" = "$#" ] || ok=0
+  for want in "$@"; do
+    [ "$(grep -cxF "comparable: $want" "$TMP/fetch-flags-$name.out")" = 1 ] || ok=0
+  done
+  if [ "$ok" = 1 ]; then
+    pass "fetch accepts declared flags ($name), printing exactly the accepted differences"
+  else
+    fail "fetch flags $name" "exit $code: $(grep '^comparable' "$TMP/fetch-flags-$name.out") $(tail -n 2 "$TMP/fetch-flags-$name.err")"
+  fi
+}
+flags_accepted inline "$inline_edit" "$declare_inline" \
+  "arms differ by their declared extra server flags only: A [], B ['--sql-scan-decode-inline']"
+flags_accepted tenant 'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-tenant-max-bytes", "1000"]
+r["provenance"]["server_settings"].update(sql_tenant_max_bytes=1000, sql_max_query_bytes=1000)' \
+  's/^shards = /server_flags_b = ["--sql-tenant-max-bytes", "1000"]\n&/' \
+  "arms differ by their declared extra server flags only: A [], B ['--sql-tenant-max-bytes', '1000']" \
+  "server_settings differs with them: sql_max_query_bytes A 16451897344 B 1000, sql_tenant_max_bytes A 32903794688 B 1000"
+flags_accepted raise 'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-max-query-bytes", "40000000000"]
+r["provenance"]["server_settings"].update(sql_tenant_max_bytes=40000000000, sql_max_query_bytes=40000000000)' \
+  's/^shards = /server_flags_b = ["--sql-max-query-bytes", "40000000000"]\n&/' \
+  "arms differ by their declared extra server flags only: A [], B ['--sql-max-query-bytes', '40000000000']" \
+  "server_settings differs with them: sql_max_query_bytes A 16451897344 B 40000000000, sql_tenant_max_bytes A 32903794688 B 40000000000"
+
+# Catches: a declared flag on one SQL pool letting either pool, or the key it
+# sets directly, resolve to any value. B's --sql-max-query-bytes 50 can raise
+# the tenant pool only up to 50 and only from below, so 32903794688 moving to
+# 7 is refused; B's --sql-tenant-max-bytes above the per-query pool clamps
+# nothing, so that pool moving to 3 is refused; and --fetch-concurrency 64
+# sets fetch_concurrency to 64, not 17.
+flags_refusal "the tenant pool moved past what --sql-max-query-bytes raises it to" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-max-query-bytes", "50"]
+r["provenance"]["server_settings"].update(sql_max_query_bytes=50, sql_tenant_max_bytes=7)' \
+  's/^shards = /server_flags_b = ["--sql-max-query-bytes", "50"]\n&/' \
+  "provenance.server_settings.sql_tenant_max_bytes is A 32903794688, B 7, which the declared extra flags do not resolve it to: A sets no --sql-tenant-max-bytes or --sql-max-query-bytes, so it holds the unflagged value; B's --sql-max-query-bytes 50 raises it to 50 only from an unflagged value below 50"
+flags_refusal "the query pool moved past what --sql-tenant-max-bytes clamps it to" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-tenant-max-bytes", "40000000000"]
+r["provenance"]["server_settings"].update(sql_max_query_bytes=3, sql_tenant_max_bytes=40000000000)' \
+  's/^shards = /server_flags_b = ["--sql-tenant-max-bytes", "40000000000"]\n&/' \
+  "provenance.server_settings.sql_max_query_bytes is A 16451897344, B 3, which the declared extra flags do not resolve it to: A sets no --sql-max-query-bytes or --sql-tenant-max-bytes, so it holds the unflagged value; B's --sql-tenant-max-bytes 40000000000 clamps it to 40000000000 only from an unflagged value above 40000000000"
+flags_refusal "fetch_concurrency resolved to other than --fetch-concurrency sets" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--fetch-concurrency", "64"]
+r["provenance"]["server_settings"]["fetch_concurrency"] = 17' "$declare_b" \
+  "provenance.server_settings.fetch_concurrency is A 32, B 17, which the declared extra flags do not resolve it to: A sets no --fetch-concurrency, so it holds the unflagged value; B's --fetch-concurrency 64 sets it to 64"
+
+# Catches: the setting check accepting a move resolve_performance_defaults in
+# services/ravel-server/src/config.rs does not make, or refusing one it does.
+# Arm A holds the unflagged pools (query 100, tenant 200) unless a case gives
+# it flags of its own.
+settings="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+Q, T, F = "sql_max_query_bytes", "sql_tenant_max_bytes", "fetch_concurrency"
+base = {Q: 100, T: 200, F: 32}
+def s(**kw):
+    out = dict(base)
+    out.update({{"q": Q, "t": T, "f": F}[k]: v for k, v in kw.items()})
+    return out
+cases = [
+    # name, A settings, B settings, A flags, B flags, accepted
+    ("raise above the tenant pool", base, s(q=500, t=500), [], ["--sql-max-query-bytes", "500"], True),
+    ("query flag below the tenant pool raises nothing", base, s(q=150), [],
+     ["--sql-max-query-bytes", "150"], True),
+    ("tenant pool raised from above", base, s(q=150, t=150), [],
+     ["--sql-max-query-bytes", "150"], False),
+    ("tenant pool left below the query flag", base, s(q=500), [],
+     ["--sql-max-query-bytes", "500"], False),
+    ("clamp below the query pool", base, s(q=60, t=60), [], ["--sql-tenant-max-bytes", "60"], True),
+    ("query pool clamped although below the tenant flag", base, s(q=60, t=150), [],
+     ["--sql-tenant-max-bytes", "150"], False),
+    ("query pool left above the tenant flag", base, s(t=60), [],
+     ["--sql-tenant-max-bytes", "60"], False),
+    ("both pool flags, the query one clamped", base, s(q=80, t=80), [],
+     ["--sql-max-query-bytes", "90", "--sql-tenant-max-bytes", "80"], True),
+    ("both pool flags, the query one not clamped", base, s(q=90, t=80), [],
+     ["--sql-max-query-bytes", "90", "--sql-tenant-max-bytes", "80"], False),
+    ("query flags on both arms, each raise consistent", s(q=50, t=60), s(q=80, t=80),
+     ["--sql-max-query-bytes", "50"], ["--sql-max-query-bytes", "80"], True),
+    ("query flags on both arms, the raise inconsistent", s(q=50, t=70), s(q=80, t=90),
+     ["--sql-max-query-bytes", "50"], ["--sql-max-query-bytes", "80"], False),
+    ("fetch flag honoured", base, s(f=64), [], ["--fetch-concurrency", "64"], True),
+    ("fetch flags on both arms, equal stamps neither sets", base, base,
+     ["--fetch-concurrency", "64"], ["--fetch-concurrency", "17"], False),
+    ("a setting flag given twice", base, s(f=64), [],
+     ["--fetch-concurrency", "64", "--fetch-concurrency=64"], False),
+    ("a setting flag with no number", base, s(f=64), [], ["--fetch-concurrency", "lots"], False),
+]
+bad = []
+for name, va, vb, ea, eb, want in cases:
+    try:
+        kit._setting_differences(va, vb, ea, eb)
+        got = True
+    except kit.Refusal:
+        got = False
+    if got != want:
+        bad.append("%s %s" % (name, "refused" if want else "accepted"))
+print("; ".join(bad))
+PY
+)"
+if [ -z "$settings" ]; then
+  pass "a declared SQL pool or fetch flag accepts exactly the values config.rs resolves the settings to"
+else
+  fail "setting resolution" "$settings"
+fi
+
+# Catches: a stamped setting the comparability check has no flag entry for,
+# which would then refuse every declared flag that moves it.
+unmapped="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import kit
+print(" ".join(sorted(set(kit.STAMPED_SETTINGS) ^ set(kit.SETTING_FLAGS))))' "$KIT_SRC/lib" 2>&1)"
+if [ -z "$unmapped" ]; then
+  pass "every stamped server setting has an entry in SETTING_FLAGS, and nothing else does"
+else
+  fail "setting flags" "$unmapped"
+fi
+
+# Catches: a healthz p99 band set to a number and never judged, or a
+# placeholder one judged: 4318's ratio is set and B's benchmark p99 is three
+# times A's, while 4319's stays a placeholder and yields no row.
+mkdir -p "$TMP/bands-healthz"
+sed 's/^healthz_p99_max_ratio_4318 = .*/healthz_p99_max_ratio_4318 = 1.5/' "$BANDS" >"$TMP/bands-healthz/rlog.toml"
+as_arm_b "$TMP/fixture-pass" "$TMP/fixture-hz-b" 'p = r["healthz"]["phases"]["benchmark"]["ports"]["4318"]
+p["p99_ms"] *= 3'
+relative healthz "$TMP/fixture-pass" "$TMP/fixture-hz-b" "$TMP/bands-healthz/rlog.toml"
+abs_hz="$(python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import kit
+r = json.load(open(sys.argv[2]))
+rows = kit.healthz_absolute({"healthz_p99_ms_max_4318": 0.001, "healthz_p99_ms_max_4319": "FILL-IN-ON-REFERENCE-MACHINE"}, r)
+print(" ".join("%s:%s" % (x["band"], x["verdict"]) for x in rows))' "$KIT_SRC/lib" "$TMP/fixture-pass/results.json" 2>&1)"
+if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *healthz benchmark port 4318 p99_ms <= 1.5 x A ' "$TMP/rel-healthz.out" \
+  && ! grep -q 'port 4319' "$TMP/rel-healthz.out" \
+  && [ "$abs_hz" = "healthz benchmark p99_ms <= healthz_p99_ms_max_4318:miss" ]; then
+  pass "a numeric healthz p99 band is judged per phase and port, and a placeholder one is skipped"
+else
+  fail "healthz bands" "exit $code, absolute '$abs_hz': $(grep healthz "$TMP/rel-healthz.out") $(head -c 200 "$TMP/rel-healthz.err")"
 fi
 
 # Catches: a report with a null sum judged (or crashing into exit 1, which
@@ -2350,6 +2996,62 @@ else
   fail "share table" "exit $code: $out $(tail -n 3 "$TMP/fetch-share.err")"
 fi
 
+# Catches: fetch comparing the arms without the run's own run.toml, whose
+# declared extra flags decide what it accepts.
+fixture run-notoml "$TMP/fixture-share-a" "$TMP/fixture-share-b"
+rm "$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-notoml/in/run.toml"
+fetch notoml run-notoml --timeout 30
+if [ "$code" = 2 ] && grep -q '^fetch: .*/runs/run-notoml/in/run.toml is not there$' "$TMP/fetch-notoml.err" \
+  && ! grep -q 'B vs A' "$TMP/fetch-notoml.out"; then
+  pass "fetch exits 2 when the run's in/run.toml is missing, before comparing the arms"
+else
+  fail "fetch without in/run.toml" "exit $code: $(tail -n 2 "$TMP/fetch-notoml.err")"
+fi
+
+# trunc_evidence SRC DST EDIT: a copy of arm SRC whose evidence.tgz has
+# out/concurrent/calls.jsonl replaced: EDIT "truncate" cuts its third line
+# short, "drop" leaves the file out.
+trunc_evidence() {
+  local src="$1" dst="$2" edit="$3"
+  rm -rf "$dst" "$TMP/trunc-x"
+  cp -R "$src" "$dst"
+  mkdir -p "$TMP/trunc-x"
+  tar -xzf "$src/evidence.tgz" -C "$TMP/trunc-x"
+  if [ "$edit" = truncate ]; then
+    awk 'NR == 3 { print substr($0, 1, 40); next } { print }' "$TMP/trunc-x/out/concurrent/calls.jsonl" \
+      >"$TMP/trunc-x/calls.jsonl"
+    mv "$TMP/trunc-x/calls.jsonl" "$TMP/trunc-x/out/concurrent/calls.jsonl"
+  else
+    rm "$TMP/trunc-x/out/concurrent/calls.jsonl"
+  fi
+  # shellcheck disable=SC2046
+  tar -czf "$dst/evidence.tgz" -C "$TMP/trunc-x" $(ls "$TMP/trunc-x")
+}
+
+# Catches: a truncated calls.jsonl line read as something other than a
+# refusal naming its file and line, and fetch letting a concurrent-detail
+# failure (the line above, or calls.jsonl missing from the evidence) change
+# its exit code or pass without a warning. The run misses on B's concurrent
+# errors as the share table case does, so fetch must still exit 1.
+for edit in truncate drop; do
+  trunc_evidence "$TMP/fixture-share-b" "$TMP/fixture-$edit-b" "$edit"
+  fixture "run-$edit" "$TMP/fixture-share-a" "$TMP/fixture-$edit-b"
+  cp "$SHARE_RUN/in/kit.tgz" "$FAKE_S3/kit-test-bucket/clickbench-kit/runs/run-$edit/in/kit.tgz"
+  fetch "$edit" "run-$edit" --timeout 30
+  case "$edit" in
+    truncate) want='B/evidence.tgz:out/concurrent/calls.jsonl:3 is not a JSON line: ' ;;
+    drop) want="cannot read out/concurrent/calls.jsonl from $TMP/fetch-drop/B/evidence.tgz: " ;;
+  esac
+  if [ "$code" = 1 ] && grep -qF "$want" "$TMP/fetch-$edit.err" \
+    && [ "$(grep -cxF 'fetch: warning: could not print the concurrent errors by statement (see above); the band verdict stands' "$TMP/fetch-$edit.err")" = 1 ] \
+    && grep -Eq '^MISS +B vs A +concurrent error_ratio_weighted <= A \+ 0 ' "$TMP/fetch-$edit.out" \
+    && grep -q '^fetch: at least one band MISSED' "$TMP/fetch-$edit.err"; then
+    pass "fetch with B's evidence calls.jsonl edited ($edit) warns once, names the cause and keeps exit 1"
+  else
+    fail "fetch $edit calls.jsonl" "exit $code: $(tail -n 4 "$TMP/fetch-$edit.err")"
+  fi
+done
+
 # lib_box BOX: boot an arm A box in BOX and write BOX/lib-setup.sh, which a
 # case's subshell sources: run.sh in library mode with its config loaded, the
 # stub server installed, arm.env written and the query window set.
@@ -2566,10 +3268,15 @@ for conn in sorted(set(c["connection"] for c in calls)):
         print("connection", conn, "saw no outage, or no success after it")
 PY2
 )"
-if [ "$code" = 0 ] && [ -z "$out" ] && [ "$starts" = 2 ] && [ -z "$ok_after" ]; then
-  pass "a restart slower than 60 polls is waited for, not stopped while it boots, and calls succeed once it is up"
+# The healthz gate stays open across the watchdog's restart, so the outage
+# shows as failed samples on both listeners.
+hz_fail="$(sed -En 's/^HEALTHZ phase=concurrent-1 port=43(18|19) .* failures=([0-9]+)$/\2/p' \
+  "$BOX_S/kit/out/healthz.txt" 2>/dev/null | tr '\n' ' ')"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ "$starts" = 2 ] && [ -z "$ok_after" ] \
+  && [[ "$hz_fail" =~ ^[1-9][0-9]*\ [1-9][0-9]*\ $ ]]; then
+  pass "a restart slower than 60 polls is waited for, not stopped while it boots, calls succeed once it is up, and healthz counts the outage as failures"
 else
-  fail "slow watchdog restart" "exit $code, $starts server starts: $out $ok_after $(grep -c restart "$BOX_S/kit/out/concurrent/round-1/watchdog.log") restarts; $(tail -n 3 "$TMP/slow-restart.log")"
+  fail "slow watchdog restart" "exit $code, $starts server starts, healthz failures '$hz_fail': $out $ok_after $(grep -c restart "$BOX_S/kit/out/concurrent/round-1/watchdog.log") restarts; $(tail -n 3 "$TMP/slow-restart.log")"
 fi
 
 # Catches: a failed concurrent call leaving its curl stderr file behind. A
@@ -2577,7 +3284,9 @@ fi
 # file per call under out/concurrent, and write_evidence copies and scrubs
 # them one by one, too slowly for evidence.tgz to be written before the box
 # shuts down. Also catches evidence carrying the per-connection response
-# directories at all. Every measured call here is refused at once.
+# directories at all, and a deferred call's error losing the curl stderr
+# concurrent-answers quotes after the round. Every measured call here is
+# refused at once.
 BOX_D="$TMP/box-dead-endpoint"
 lib_box "$BOX_D"
 (
@@ -2591,13 +3300,14 @@ lib_box "$BOX_D"
 ) >"$TMP/dead-endpoint.log" 2>&1
 code=$?
 dcalls="$(wc -l <"$BOX_D/kit/out/concurrent/calls.jsonl" 2>/dev/null | tr -d ' ')"
-dfailed="$(grep -c '"curl_exit": 7' "$BOX_D/kit/out/concurrent/calls.jsonl" 2>/dev/null)"
+dfailed="$(grep -c '"curl_exit": 7, .*"error": "curl exit 7: curl: (7) Failed to connect to 127.0.0.1 port 4318"' \
+  "$BOX_D/kit/out/concurrent/calls.jsonl" 2>/dev/null)"
 left="$(find "$BOX_D/kit/out/concurrent" -type f \( -name '*.curl' -o -path '*/conn-*/*' \) | head -n 3)"
 tar -tzf "$BOX_D/kit/evidence.tgz" >"$TMP/dead-endpoint.tar" 2>&1 || echo "no evidence.tgz" >>"$TMP/dead-endpoint.tar"
 in_tar="$(grep -E '\.curl$|/conn-[0-9]+/|no evidence' "$TMP/dead-endpoint.tar" | head -n 3)"
 if [ "$code" = 0 ] && [ "${dcalls:-0}" -ge 50 ] && [ "$dfailed" = "$dcalls" ] && [ -z "$left" ] \
   && grep -q '^out/concurrent/calls.jsonl$' "$TMP/dead-endpoint.tar" && [ -z "$in_tar" ]; then
-  pass "a dead endpoint's failed concurrent calls leave no per-call file, and evidence.tgz is written without them"
+  pass "a dead endpoint's failed concurrent calls each quote their curl stderr, leave no per-call file, and evidence.tgz is written without them"
 else
   fail "dead endpoint cleanup" "exit $code, $dfailed of $dcalls calls failed; left: $left; in evidence: $in_tar; $(tail -n 3 "$TMP/dead-endpoint.log")"
 fi
@@ -2712,10 +3422,12 @@ for c in calls:
         break
 PY
 )"
-if [ "$code" = 0 ] && [ "$in_window" = 0 ] && [ -z "$out" ]; then
-  pass "a concurrent round starts no python3 in its timed window and still reports wrong answers after it"
+hz_n="$(sed -n 's/^HEALTHZ phase=concurrent-1 port=4319 n=\([0-9]*\) .*/\1/p' "$BOX_Y/kit/out/healthz.txt" 2>/dev/null)"
+if [ "$code" = 0 ] && [ "$in_window" = 0 ] && [ -z "$out" ] && [ "${hz_n:-0}" -ge 4 ] \
+  && grep -Eq '^HEARTBEAT phase=concurrent-1 n=[1-9][0-9]* failures=0 bad=0 max_s=0.500$' "$BOX_Y/kit/out/healthz.txt"; then
+  pass "a concurrent round starts no python3 in its timed window, with the healthz sampler running through it, and still reports wrong answers after it"
 else
-  fail "concurrent harness cost" "exit $code, python3 started $in_window times in the window: $(head -n 2 "$STUB_DIR/py-window" 2>/dev/null) $out $(tail -n 3 "$TMP/py-window.log")"
+  fail "concurrent harness cost" "exit $code, python3 started $in_window times in the window, healthz n '$hz_n': $(head -n 2 "$STUB_DIR/py-window" 2>/dev/null) $out $(tail -n 3 "$TMP/py-window.log")"
 fi
 
 # Catches: a client timeout's error naming a limit the call never had: the
@@ -2750,6 +3462,46 @@ else
   fail "timeout error text" "exit $code: $out $(tail -n 3 "$TMP/timeout-text.log")"
 fi
 
+# Catches: a deferred call reading a 2xx other than 200 as an error, a
+# deferred timeout forking rm inside the round or quoting its curl stderr
+# when run_query would not, and concurrent-answers leaving a quoted stderr
+# file behind. Statement 06 answers 203, statement 07 times out, both under
+# RQ_DEFER=1, then concurrent-answers settles the connection's file.
+BOX_V="$TMP/box-defer-2xx"
+lib_box "$BOX_V"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_V/lib-setup.sh"
+  export STUB_SQL_TIMEOUT_N=07 STUB_SQL_STATUS=203
+  phase_requests "$OUT/concurrent" || exit 1
+  start_server || exit 1
+  d="$OUT/concurrent/round-1"
+  for n in 06 07; do
+    RQ_DEFER=1 RQ_MAX_TIME="" RQ_CALLS="$d/conn-1.jsonl" RQ_RESP_DIR="$d/conn-1" \
+      run_query concurrent "$n" "q$n" 1 "$OUT/concurrent/requests/$n.json" || exit 1
+  done
+  [ -s "$d/conn-1/07-1.curl" ] || { echo "the deferred timeout's stderr file is gone before the round ends"; exit 1; }
+  kit_py concurrent-answers "$d" || exit 1
+  stop_server
+) >"$TMP/defer-2xx.log" 2>&1
+code=$?
+out="$(python3 - "$BOX_V/kit/out/concurrent/round-1/conn-1.jsonl" <<'PY' 2>&1
+import json, sys
+calls = [json.loads(l) for l in open(sys.argv[1])]
+got = [(c["http_status"], c["curl_exit"], c["outcome"], c["error"], "pending" in c) for c in calls]
+want = [(203, 0, "ok", "", False),
+        (0, 28, "timeout", "transfer timed out (curl exit 28) with no client time limit set", False)]
+if got != want:
+    print("got", got)
+PY
+)"
+left="$(find "$BOX_V/kit/out/concurrent/round-1" -name '*.curl' -size +0 | head -n 2)"
+if [ "$code" = 0 ] && [ -z "$out" ] && [ -z "$left" ]; then
+  pass "a deferred 203 answer is ok, and a deferred timeout keeps run_query's error and leaves no stderr file"
+else
+  fail "deferred 2xx and timeout" "exit $code: $out left: $left $(tail -n 3 "$TMP/defer-2xx.log")"
+fi
+
 # Catches: a perf phase that fails after perf record and leaves the raw
 # perf.data in out/perf/, which evidence.tgz would then carry.
 BOX_F="$TMP/box-perf-fail"
@@ -2770,6 +3522,88 @@ if [ "$code" = 0 ] && [ -f "$BOX_F/kit/out/perf/01.record.log" ] \
   pass "a failed perf script leaves no perf.data behind"
 else
   fail "perf cleanup" "exit $code; left: $(ls "$BOX_F/kit/out/perf" 2>&1 | tr '\n' ' ')"
+fi
+
+# Catches: a healthz sampler outliving its phase. healthz_stop must stop the
+# python3 process itself, not a subshell wrapping it, so after healthz_finish,
+# and after fail_run with a sampler running, no process whose argv holds that
+# phase's HEALTHZ_DIR may remain. One that ignores SIGTERM is SIGKILLed after
+# the bounded wait, and run.log says so.
+BOX_H="$TMP/box-hz-stop"
+lib_box "$BOX_H"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  touch "$STUB_DIR/server-ready"
+  : >"$OUT/healthz.txt"
+  healthz_start benchmark "$OUT/hz-finish" || exit 1
+  healthz_up || exit 1
+  healthz_finish benchmark || exit 1
+  pgrep -f "$OUT/hz-finish" >"$BOX_H/left-finish"
+  exit 0
+) >"$TMP/hz-finish.log" 2>&1
+finish_code=$?
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  touch "$STUB_DIR/server-ready"
+  healthz_start benchmark "$OUT/hz-failrun" || exit 3
+  healthz_up || exit 3
+  fail_run healthz-unit
+) >"$TMP/hz-failrun.log" 2>&1
+failrun_code=$?
+rm -f "$STUB_DIR/server-ready"
+left_failrun="$(pgrep -f "$BOX_H/kit/out/hz-failrun")"
+cat >"$TMP/stubborn-kit.py" <<'PY'
+import os, signal, sys, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open(os.path.join(sys.argv[2], "ignoring"), "w").close()
+time.sleep(60)
+PY
+(
+  # shellcheck source=/dev/null
+  . "$BOX_H/lib-setup.sh"
+  # shellcheck disable=SC2034 # read by healthz_start
+  PY_KIT="$TMP/stubborn-kit.py"
+  healthz_start benchmark "$OUT/hz-stubborn" || exit 1
+  for _ in $(seq 1 500); do [ -e "$OUT/hz-stubborn/ignoring" ] && break; sleep 0.01; done
+  [ -e "$OUT/hz-stubborn/ignoring" ] || exit 1
+  healthz_stop
+  pgrep -f "$OUT/hz-stubborn" >"$BOX_H/left-stubborn"
+  exit 0
+) >"$TMP/hz-stubborn.log" 2>&1
+stubborn_code=$?
+if [ "$finish_code" = 0 ] && [ -f "$BOX_H/left-finish" ] && [ ! -s "$BOX_H/left-finish" ] \
+  && grep -q '^HEARTBEAT phase=benchmark n=' "$BOX_H/kit/out/healthz.txt" \
+  && [ "$failrun_code" = 1 ] && grep -q '^FAILED step=healthz-unit ' "$BOX_H/kit/FAILED" 2>/dev/null \
+  && [ -z "$left_failrun" ] \
+  && [ "$stubborn_code" = 0 ] && [ -f "$BOX_H/left-stubborn" ] && [ ! -s "$BOX_H/left-stubborn" ] \
+  && grep -q 'still running 5 s after SIGTERM; sending SIGKILL' "$TMP/hz-stubborn.log"; then
+  pass "no healthz sampler outlives healthz_finish or fail_run, and one ignoring SIGTERM is SIGKILLed and logged"
+else
+  fail "healthz sampler lifetime" "finish exit $finish_code left '$(tr '\n' ' ' <"$BOX_H/left-finish" 2>/dev/null)', fail_run exit $failrun_code left '$left_failrun', stubborn exit $stubborn_code left '$(tr '\n' ' ' <"$BOX_H/left-stubborn" 2>/dev/null)': $(tail -n 3 "$TMP/hz-finish.log") $(tail -n 3 "$TMP/hz-failrun.log") $(tail -n 2 "$TMP/hz-stubborn.log")"
+fi
+pkill -f "$BOX_H/kit/out/hz-" 2>/dev/null
+
+# Catches: a failed read of server_flags_a or server_flags_b taken for "no
+# extra flags", so the arm runs without the flags run.toml declared for it.
+BOX_E="$TMP/box-flags-read"
+lib_box "$BOX_E"
+printf 'this is = = not toml\n' >"$TMP/broken-run.toml"
+(
+  # shellcheck source=/dev/null
+  . "$BOX_E/lib-setup.sh"
+  rm -f "$ARM_ENV"
+  RUN_TOML="$TMP/broken-run.toml"
+  resolve_arm_env && exit 1
+  [ ! -e "$ARM_ENV" ] || exit 1
+  exit 0
+) >"$TMP/flags-read.log" 2>&1
+code=$?
+if [ "$code" = 0 ] && grep -q "cannot read server_flags_a from $TMP/broken-run.toml (kit.py get exit 2)" "$TMP/flags-read.log"; then
+  pass "a run.toml that cannot be read fails resolve_arm_env instead of reading as no extra flags"
+else
+  fail "extra flags read" "exit $code: $(tail -n 3 "$TMP/flags-read.log")"
 fi
 
 # Catches: now_us failing where bash has no EPOCHREALTIME (macOS's bash 3.2),
@@ -2797,6 +3631,15 @@ if [ -z "$out" ] && [ -z "$unguarded" ]; then
   pass "now_us works without EPOCHREALTIME and empty arrays expand guarded"
 else
   fail "bash 3.2" "$out $unguarded"
+fi
+
+# Catches: any case or box run leaving a healthz sampler behind; every one
+# started under this suite's TMP must be gone by now.
+left="$(pgrep -f "healthz-sampler $TMP/" 2>/dev/null | tr '\n' ' ')"
+if [ -z "$left" ]; then
+  pass "the suite leaves no healthz sampler running"
+else
+  fail "leftover samplers" "pids $left"
 fi
 
 # --- syntax -----------------------------------------------------------------
