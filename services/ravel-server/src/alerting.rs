@@ -8454,11 +8454,6 @@ mod tick_tests {
         assert_eq!(served_rule(&view).await["health"], "ok");
 
         clock.advance(NS_PER_SEC);
-        assert!(matches!(
-            view.read(&tenant),
-            PublishedRead::Stale { age, bound: read_bound }
-                if age == bound + Duration::from_secs(1) && read_bound == bound
-        ));
         let (status, body) = serve(&view, alerts_route).await;
         assert_eq!(status, 503, "{body}");
         assert_eq!(
@@ -8477,6 +8472,11 @@ mod tick_tests {
         assert_eq!(rule["state"], crate::alerts_api::STATE_UNKNOWN, "{rule}");
         assert!(rule.get("lastEvaluation").is_none(), "{rule}");
         assert!(rule.get("alerts").is_none(), "{rule}");
+        assert!(matches!(
+            view.read(&tenant),
+            PublishedRead::Stale { age, bound: read_bound }
+                if age == bound + Duration::from_secs(1) && read_bound == bound
+        ));
 
         assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
         let (status, body) = serve(&view, alerts_route).await;

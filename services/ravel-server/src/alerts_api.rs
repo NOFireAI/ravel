@@ -38,6 +38,14 @@
 //! rules gets an empty list, but only from a process where some tenant has
 //! rules and an evaluator runs; otherwise it gets the first 503.
 //!
+//! A tenant's evaluator is the only writer of its snapshot, so one that has
+//! panicked or wedged leaves its last snapshot in place. Once that snapshot is
+//! older than [`STALE_AFTER_INTERVALS`] evaluation intervals, on the clock of
+//! the evaluator that published it, `/api/v1/alerts` answers the same 503 with
+//! [`SNAPSHOT_STALE`] and the snapshot's age, and `/api/v1/rules` renders the
+//! tenant's rules as before the first tick, until the evaluator publishes
+//! again.
+//!
 //! # Groups
 //!
 //! Prometheus organizes rules into named groups, one per group block in a
@@ -64,7 +72,8 @@
 //! When the last tick could not read that history, `state` is
 //! [`STATE_UNKNOWN`] and `alerts` is omitted, while `health` is `err` as
 //! above. Before the tenant's evaluator in this process has finished a tick,
-//! or when no evaluator runs here, `health` and `state` are both
+//! when its last snapshot is stale, or when no evaluator runs here, `health`
+//! and `state` are both
 //! [`HEALTH_UNKNOWN`] and [`STATE_UNKNOWN`], with no `lastEvaluation` and no
 //! `alerts`. `unknown` is Prometheus's own value for an unevaluated rule's
 //! health. For `state` it is a Ravel value outside Prometheus's three, chosen
