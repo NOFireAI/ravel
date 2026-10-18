@@ -508,8 +508,13 @@ fn reserved_attrs(
     // A blob's values count only if the blob is kept.
     if !span.events.is_empty() {
         let mut blob_tally = IpcryptTally::new();
-        let events =
-            with_encrypted_attrs(&span.events, rules, &mut blob_tally, |e| &mut e.attributes);
+        let events = with_encrypted_attrs(
+            &span.events,
+            rules,
+            &mut blob_tally,
+            |e| &e.attributes,
+            |e| &mut e.attributes,
+        );
         match encode_blob(&events, limits.max_raw_blob_len) {
             Ok(hex) => {
                 tally.merge(&blob_tally);
@@ -523,8 +528,13 @@ fn reserved_attrs(
     }
     if !span.links.is_empty() {
         let mut blob_tally = IpcryptTally::new();
-        let links =
-            with_encrypted_attrs(&span.links, rules, &mut blob_tally, |l| &mut l.attributes);
+        let links = with_encrypted_attrs(
+            &span.links,
+            rules,
+            &mut blob_tally,
+            |l| &l.attributes,
+            |l| &mut l.attributes,
+        );
         match encode_blob(&links, limits.max_raw_blob_len) {
             Ok(hex) => {
                 tally.merge(&blob_tally);
@@ -540,22 +550,28 @@ fn reserved_attrs(
 }
 
 /// `items` with every attribute `rules` matches by raw key encrypted, borrowed
-/// unchanged when the rule set is empty. Event and link attributes stay
-/// `AnyValue`s inside the blob, so only a non-empty string value is
-/// encrypted; any other value under a rule is left unchanged and counted as
-/// [`RenderOutcome::Unparsed`], as the logs path does.
+/// unchanged when no attribute key of any item has a rule. Event and link
+/// attributes stay `AnyValue`s inside the blob, so only a non-empty string
+/// value is encrypted; any other value under a rule is left unchanged and
+/// counted as [`RenderOutcome::Unparsed`], as the logs path does.
 fn with_encrypted_attrs<'a, T: Clone>(
     items: &'a [T],
     rules: &TenantRules,
     tally: &mut IpcryptTally,
-    attributes: fn(&mut T) -> &mut Vec<KeyValue>,
+    attributes: fn(&T) -> &[KeyValue],
+    attributes_mut: fn(&mut T) -> &mut Vec<KeyValue>,
 ) -> Cow<'a, [T]> {
-    if rules.is_empty() {
+    let any_ruled = items.iter().any(|item| {
+        attributes(item)
+            .iter()
+            .any(|kv| rules.lookup_raw(&kv.key).is_some())
+    });
+    if !any_ruled {
         return Cow::Borrowed(items);
     }
     let mut owned = items.to_vec();
     for item in &mut owned {
-        for kv in attributes(item).iter_mut() {
+        for kv in attributes_mut(item).iter_mut() {
             let Some(info) = rules.lookup_raw(&kv.key) else {
                 continue;
             };
@@ -2007,6 +2023,68 @@ mod tests {
         ) {
             check_span_capacity(&resource, &attributes)?;
         }
+    }
+
+    fn event_with(attributes: Vec<KeyValue>) -> Event {
+        Event {
+            name: "e".to_string(),
+            attributes,
+            ..Default::default()
+        }
+    }
+
+    fn encrypt_events<'a>(
+        events: &'a [Event],
+        rules: &TenantRules,
+    ) -> (Cow<'a, [Event]>, IpcryptTally) {
+        let mut tally = IpcryptTally::new();
+        let out = with_encrypted_attrs(
+            events,
+            rules,
+            &mut tally,
+            |e| &e.attributes,
+            |e| &mut e.attributes,
+        );
+        (out, tally)
+    }
+
+    #[test]
+    fn blob_attributes_with_no_ruled_key_stay_borrowed() {
+        // A non-empty rule set that matches none of the keys must not copy
+        // the events: the copy is the cost the pre-scan exists to avoid.
+        let rules = crate::label_projection::capacity_cases::rules_on(&["client.ip"]);
+        let events = vec![event_with(vec![string_kv("server.ip", "198.51.100.7")])];
+        let (out, tally) = encrypt_events(&events, &rules);
+        assert!(matches!(out, Cow::Borrowed(_)), "copied with no ruled key");
+        assert!(tally.is_empty());
+        assert_eq!(out.as_ref(), events.as_slice());
+    }
+
+    #[test]
+    fn blob_attributes_with_a_ruled_key_are_copied_and_encrypted() {
+        let rules = crate::label_projection::capacity_cases::rules_on(&["client.ip"]);
+        let events = vec![
+            event_with(vec![string_kv("server.ip", "198.51.100.7")]),
+            event_with(vec![string_kv("client.ip", "198.51.100.8")]),
+        ];
+        let (out, tally) = encrypt_events(&events, &rules);
+        assert!(matches!(out, Cow::Owned(_)));
+        assert_eq!(out[0], events[0], "an unruled key is left as sent");
+        let Some(AnyValueVariant::StringValue(rendered)) = out[1].attributes[0]
+            .value
+            .as_ref()
+            .and_then(|v| v.value.as_ref())
+        else {
+            panic!("string value expected: {:?}", out[1]);
+        };
+        assert_ne!(rendered, "198.51.100.8");
+        assert_eq!(
+            tally.count(
+                ravel_ipcrypt::policy::Variant::Deterministic,
+                RenderOutcome::Encrypted
+            ),
+            1
+        );
     }
 
     #[test]
