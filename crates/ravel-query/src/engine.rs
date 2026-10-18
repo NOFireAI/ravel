@@ -5574,6 +5574,46 @@ mod merge_tests {
             .collect()
     }
 
+    /// An equal-timestamp run sitting on either bound comes back whole.
+    #[test]
+    fn query_keeps_equal_timestamp_runs_whole_at_both_bounds() {
+        let samples: Vec<Sample> = [
+            (1, 1.0),
+            (2, 2.0),
+            (2, 3.0),
+            (3, 4.0),
+            (4, 5.0),
+            (4, 6.0),
+            (5, 7.0),
+        ]
+        .into_iter()
+        .map(|(ts_ns, value)| Sample { ts_ns, value })
+        .collect();
+        let source = MergedSource {
+            series: vec![SeriesData {
+                labels: labels(1),
+                samples,
+            }],
+            histogram_series: Vec::new(),
+            log_series: Vec::new(),
+            precomputed_count: None,
+        };
+        let got = source
+            .query(
+                &[],
+                TimeRange {
+                    start_ns: 2,
+                    end_ns: 4,
+                },
+            )
+            .expect("query");
+        let want: Vec<(i64, u64)> = [(2, 2.0), (2, 3.0), (3, 4.0), (4, 5.0), (4, 6.0)]
+            .into_iter()
+            .map(|(ts, v): (i64, f64)| (ts, v.to_bits()))
+            .collect();
+        assert_eq!(sample_bits(&got[0].samples), want);
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
