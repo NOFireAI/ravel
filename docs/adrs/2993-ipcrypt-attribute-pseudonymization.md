@@ -84,7 +84,8 @@ Facts in this tree that constrain the design:
   sent.
 - **Metric label names are sanitized.** `client.address` is stored as
   `client_address` on every metric surface, and Remote Write carries
-  only the sanitized form. Log and span attribute keys are stored as
+  only the sanitized form (wrong for Remote Write; see the Remote Write
+  label-name amendment below). Log and span attribute keys are stored as
   sent.
 - **Span events and links are stored as encoded protobuf blobs** inside
   reserved span attributes, so their attributes never pass through the
@@ -135,7 +136,8 @@ installed, as `--tenant-kms-config` entries are. Each entry lists rules:
   `client.address`. On the metric surfaces (OTLP metrics, OTAP and
   Remote Write) the rule matches the sanitized label name that key is
   stored under (`client_address`), derived with the same sanitizing
-  function the normalizers use. On logs and traces it matches the key
+  function the normalizers use (the Remote Write label-name amendment
+  below says how this applies to Remote Write). On logs and traces it matches the key
   as sent. Two rule keys that sanitize to the same label name are
   refused;
 - `variant`: `deterministic` or `prefix` (ipcrypt-pfx);
@@ -664,3 +666,35 @@ This corrects two statements of fact. No decision changes.
   `source.address`. That is the same correlation equal addresses
   already allow within one key. An operator who wants two keys
   unjoinable gives their rules different epochs or variants.
+
+## Amendment (2026-10-18): Remote Write label names
+
+<!-- amendment-applies: sections="Context|Decision" pointer="Remote Write label-name amendment" -->
+
+The Context said Remote Write carries only sanitized label names. It
+does not. Remote Write stores label names as sent (ADR-0015's
+no-sanitization rule), and a Prometheus 3 sender using UTF-8 names, or
+an OpenTelemetry exporter that does not translate names, sends
+`client.address` with its dots. Matching such a label as sent would
+miss a rule written for `client.address` on the metric surfaces, and
+the raw address would be stored.
+
+- **Matching.** On Remote Write, a label name is sanitized with the
+  same function the OTLP normalizers use, for rule lookup only, and
+  the sanitized name is matched as decision 1 says for the metric
+  surfaces. So `client.address` and `client_address` both match the
+  rule written as `client.address`. The stored label name is unchanged
+  (still as sent). Decision 1 already refuses two rule keys that
+  sanitize to the same name, so one label cannot match two rules.
+- **The `instance` label.** OTLP metrics carry `job` and `instance`
+  labels derived from the `service.name` and `service.instance.id`
+  resource attributes, and a rule matches them by those label names.
+  A rule on `service.instance.id` therefore covers that attribute on
+  logs and traces but not the metric `instance` label, and a rule on
+  `instance` covers the metric label but not logs and traces. An
+  operator who wants both writes both rules, and the pseudonymization
+  section #3048 adds to `docs/ingest.md` says so.
+
+The code change lands with #3047's pull request, which adds the
+`ravel-remote-write` lookup and a test that a dotted label name is
+encrypted.
