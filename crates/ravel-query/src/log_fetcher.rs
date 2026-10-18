@@ -13247,9 +13247,8 @@ mod read_gate_tests {
     /// decompressed bytes equal the ungated plan's.
     ///
     /// FLIP: reading the gate as `None` in `prune_on_gate` reads
-    /// `left: (0, 0), right: (1, 0)` on the `LogPostings` assertion; running
-    /// the job under `ReadSite::LogSection` reads the same on it and
-    /// `left: (1, 0), right: (0, 0)` on the `LogSection` one.
+    /// `left: (0, 0), right: (1, 0)` on the `LogPostings` assertion, and so
+    /// does running the job under `ReadSite::LogSection`.
     #[tokio::test]
     async fn the_keyed_plan_runs_its_prune_on_the_postings_gate() {
         let (fetcher, seg_ref) = keyed_fixture().await;
