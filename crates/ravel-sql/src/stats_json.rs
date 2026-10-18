@@ -27,7 +27,7 @@ use ravel_query::{PhaseAccountingSnapshot, QueryPhase};
 use ravel_types::accounting::AccountedOp;
 use serde_json::{Value as Json, json};
 
-use crate::SqlStats;
+use crate::{SignalStats, SqlStats};
 
 /// One entry per [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase
 /// exactly once: a phase added to the enum cannot be silently dropped from
@@ -133,6 +133,24 @@ pub fn pruning_json(stats: &SqlStats) -> Json {
     })
 }
 
+/// One entry per signal table the statement read, in the order given
+/// (ADR-2904 decision 7), rendered under `stats.signals`. Each entry's
+/// `phases` has the shape of `stats.phases`, so for every phase and field the
+/// entries plus the Parquet tables' share sum to `stats.phases`.
+pub fn signals_json(signals: &[SignalStats]) -> Vec<Json> {
+    signals
+        .iter()
+        .map(|signal| {
+            json!({
+                "table": signal.table,
+                "segments": signal.segments,
+                "segmentsPruned": signal.segments_pruned,
+                "phases": phase_costs_json(&signal.phases),
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -227,6 +245,52 @@ mod tests {
                 object.keys().map(String::as_str).collect();
             assert_eq!(keys, expected);
         }
+    }
+
+    /// `signals_json` renders one entry per record, in the given order, each
+    /// with exactly the four keys below, and its `phases` exactly as
+    /// `phase_costs_json` renders the same snapshot.
+    #[test]
+    fn signals_json_names_every_field_exactly_once() {
+        let samples = PhaseAccounting::new();
+        samples.resolve().record_s3_request(AccountedOp::List);
+        let logs = PhaseAccounting::new();
+        logs.scan().record_s3_request(AccountedOp::Get);
+        let signals = [
+            SignalStats {
+                table: "samples",
+                segments: 3,
+                segments_pruned: 2,
+                phases: samples.snapshot(),
+            },
+            SignalStats {
+                table: "logs",
+                segments: 1,
+                segments_pruned: 0,
+                phases: logs.snapshot(),
+            },
+        ];
+        let entries = signals_json(&signals);
+        let expected: std::collections::BTreeSet<&str> =
+            ["table", "segments", "segmentsPruned", "phases"]
+                .into_iter()
+                .collect();
+        assert_eq!(entries.len(), 2);
+        for (entry, signal) in entries.iter().zip(&signals) {
+            let object = entry.as_object().expect("signal entry renders an object");
+            let keys: std::collections::BTreeSet<&str> =
+                object.keys().map(String::as_str).collect();
+            assert_eq!(keys, expected);
+            assert_eq!(entry["table"], signal.table);
+            assert_eq!(entry["segments"], signal.segments);
+            assert_eq!(entry["segmentsPruned"], signal.segments_pruned);
+            assert_eq!(
+                entry["phases"],
+                Json::Array(phase_costs_json(&signal.phases))
+            );
+        }
+        assert_eq!(entries[0]["phases"][0]["s3ListRequests"], 1);
+        assert_eq!(entries[1]["phases"][3]["s3GetRequests"], 1);
     }
 
     /// `io_shape_json`'s key set is exactly the six fields below, no more and

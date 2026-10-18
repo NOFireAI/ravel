@@ -568,6 +568,19 @@ Three gaps limit what the per-query cost family can show:
   cost-per-query ratio on the Flight path can therefore mean early client
   disconnects, not cheap queries.
 
+### Cost per table of one statement
+
+A `POST /api/v1/sql` statement that joins signal tables reports each
+table's share of its cost in `stats.signals`: one entry per signal table,
+in the order `samples`, `logs`, `spans`, `alerts`, `audit`, each with the
+table's segment count and the same per-phase figures as `stats.phases`.
+For every phase and every figure the entries sum to `stats.phases`, plus
+whatever the statement spent on Parquet tables, which have no entry. Use the
+entries to find which table of a join drove its request count. Budgets and
+the exported family still count the whole statement. The
+[query engine reference](../query-engine.md#json-response-shape) lists the
+fields and the rules.
+
 ## Limits of a modeled cost
 
 Every dollar figure in this guide is computed from counted requests and counted

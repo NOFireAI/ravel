@@ -301,7 +301,8 @@ pub(crate) fn record_postings(outcome: &ravel_sql::SqlOutcome) {
 }
 
 /// The JSON `stats` object of an executed statement: its cost accounting and
-/// estimate, per-phase costs, I/O shape, timings and pruning counters.
+/// estimate, per-phase costs, per-signal-table costs, I/O shape, timings and
+/// pruning counters.
 pub(crate) fn stats_json(
     outcome: &ravel_sql::SqlOutcome,
     audit_elapsed: Duration,
@@ -313,6 +314,10 @@ pub(crate) fn stats_json(
             serde_json::Value::Array(ravel_sql::stats_json::phase_costs_json(
                 &outcome.phase_accounting,
             )),
+        );
+        map.insert(
+            "signals".to_string(),
+            serde_json::Value::Array(ravel_sql::stats_json::signals_json(&outcome.signals)),
         );
         map.insert(
             "io".to_string(),
