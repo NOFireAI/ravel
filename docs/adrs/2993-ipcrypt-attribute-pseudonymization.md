@@ -84,10 +84,10 @@ Facts in this tree that constrain the design:
   sent.
 - **Metric label names are sanitized** (except on Remote Write, which
   stores them as sent; see the Remote Write label-name amendment below).
-  `client.address` is stored as
-  `client_address` on every metric surface, and Remote Write carries
-  only the sanitized form. Log and span attribute keys are stored as
-  sent.
+  `client.address` is stored as `client_address` on every metric
+  surface, and Remote Write carries only the sanitized form (both
+  false for Remote Write: see the Remote Write label-name amendment
+  below). Log and span attribute keys are stored as sent.
 - **Span events and links are stored as encoded protobuf blobs** inside
   reserved span attributes, so their attributes never pass through the
   span attribute conversion.
@@ -671,6 +671,7 @@ This corrects two statements of fact. No decision changes.
 ## Amendment (2026-10-18): Remote Write label names
 
 <!-- amendment-applies: sections="Context|Decision" pointer="Remote Write label-name amendment" -->
+<!-- amendment-supersedes: phrase="Remote Write carries only the sanitized form" pointer="Remote Write label-name amendment" -->
 
 The Context said Remote Write carries only sanitized label names. It
 does not. Remote Write stores label names as sent (ADR-0015's
@@ -703,7 +704,7 @@ the raw address would be stored.
   A series received over Remote Write as `client.address` is matched
   by `client.address`, not `client_address`. A tenant that receives
   both spellings submits one erasure request per spelling, and the
-  erasure guide says so.
+  erasure note #3049 adds to `docs/deletion-and-gc.md` says so.
 
 The code change lands with #3047's pull request, which adds the
 `ravel-remote-write` lookup and a test that a dotted label name is
