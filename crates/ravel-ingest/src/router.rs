@@ -28,7 +28,7 @@ use crate::shard::{ShardActor, ShardMsg};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{MetricStage, MetricStageTimings};
 use crate::value::{IngestExemplar, IngestPoint};
-use crate::write_gate::WriteGateSlot;
+use crate::write_gate::{FlushInputBytes, WriteGateSlot};
 use ravel_cpu_gate::WriteGate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,6 +516,28 @@ impl IngestRouter {
     #[must_use]
     pub fn with_write_gate(self, gate: Arc<WriteGate>) -> Self {
         self.write_gate.set(gate);
+        self
+    }
+
+    /// With `on`, every flush computes its data object's CRC32C upload
+    /// checksum inside its encode job, after the segment is written, and the
+    /// PUT sends that value; otherwise the PUT computes it on the flush task,
+    /// as it does by default (issue #2818). The stored bytes and the checksum
+    /// sent are the same either way. Reaches every actor, as
+    /// [`Self::with_write_gate`] does.
+    #[must_use]
+    pub fn with_flush_checksum_in_job(self, on: bool) -> Self {
+        self.write_gate.set_checksum_in_job(on);
+        self
+    }
+
+    /// Records the input bytes of every flush encode from here on into
+    /// `recorder`, the same figure the write gate's inline floor is compared
+    /// with (issue #2818). Measurement instrumentation for benches; a router
+    /// without it records nothing.
+    #[must_use]
+    pub fn with_flush_input_bytes(self, recorder: FlushInputBytes) -> Self {
+        self.write_gate.set_input_recorder(recorder);
         self
     }
 
@@ -1432,6 +1454,76 @@ mod tests {
                 .await
                 .expect("the shard survives and the next write commits");
             assert_eq!(router.metrics().snapshot().flush_gate_faults, 1);
+        }
+    }
+
+    /// Issue #2818: with the switch on, each committed flush computes its
+    /// upload checksum inside the encode job, gated or not; off, the default,
+    /// no flush does. The stored-bytes and PUT-checksum identity across the
+    /// switch is `tests/flush_checksum_in_job.rs`.
+    #[tokio::test]
+    async fn flush_checksum_in_job_switch_moves_the_checksum_into_the_job() {
+        for (gated, on, expected) in [
+            (false, false, 0),
+            (true, false, 0),
+            (false, true, 2),
+            (true, true, 2),
+        ] {
+            let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+            let router = IngestRouter::new(
+                IngestConfig {
+                    shard_count: 1,
+                    target_bytes: 1,
+                    ..IngestConfig::default()
+                },
+                Arc::clone(&store),
+                Signal::Metrics,
+                Arc::new(crate::clock::SystemClock),
+                Arc::new(PendingAckBudget::new(0)),
+            );
+            let router = if gated {
+                router.with_write_gate(Arc::new(WriteGate::new(
+                    ravel_cpu_gate::CpuGateConfig {
+                        inline_floor_bytes: 0,
+                        ..ravel_cpu_gate::CpuGateConfig::with_permits(1)
+                    },
+                    Arc::new(ravel_cpu_gate::InstantClock::new()),
+                )))
+            } else {
+                router
+            };
+            let router = router.with_flush_checksum_in_job(on);
+            assert!(
+                !IngestRouter::new(
+                    IngestConfig::default(),
+                    Arc::clone(&store),
+                    Signal::Metrics,
+                    Arc::new(crate::clock::SystemClock),
+                    Arc::new(PendingAckBudget::new(0)),
+                )
+                .write_gate
+                .checksum_in_job()
+            );
+            let tenant = TenantId::new("acme");
+            for ts in [1_000, 2_000] {
+                router
+                    .write(
+                        tenant.clone(),
+                        vec![test_point(&tenant, "cpu", ts, 1.0)],
+                        WriteMode::Strict,
+                        Duration::from_secs(30),
+                    )
+                    .await
+                    .expect("the strict write commits");
+            }
+            assert_eq!(
+                router
+                    .write_gate
+                    .checksums_in_job
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                expected,
+                "gated {gated}, switch {on}"
+            );
         }
     }
 }

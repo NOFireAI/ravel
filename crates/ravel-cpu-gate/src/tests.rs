@@ -357,6 +357,24 @@ fn job_below_the_floor_runs_inline_and_counts_as_inline() {
     );
 }
 
+/// The gate reports the byte floor it was built with, and `with_permits`
+/// builds it with the stock 256 KiB floor.
+#[test]
+fn gate_reports_its_inline_floor() {
+    let clock: Arc<dyn MonotonicClock> = Arc::new(InstantClock::new());
+    let stock = CpuGate::<WriteSite>::new(CpuGateConfig::with_permits(1), Arc::clone(&clock));
+    assert_eq!(stock.inline_floor_bytes(), 256 * 1024);
+    assert_eq!(stock.inline_floor_bytes(), DEFAULT_INLINE_FLOOR_BYTES);
+    let raised = CpuGate::<WriteSite>::new(
+        CpuGateConfig {
+            inline_floor_bytes: 1 << 20,
+            ..CpuGateConfig::with_permits(1)
+        },
+        clock,
+    );
+    assert_eq!(raised.inline_floor_bytes(), 1 << 20);
+}
+
 /// A panicking job is an error for its caller, and its permit comes back.
 #[test]
 fn panicking_job_is_an_error_and_releases_its_permit() {

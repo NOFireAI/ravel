@@ -6,7 +6,8 @@
 //! and reads it once per flush; a later generation's actors read the same
 //! slot.
 
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 
 use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
 
@@ -28,16 +29,53 @@ use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
 pub(crate) const GATE_DEADLINE_MESSAGE: &str =
     "flush lifetime elapsed before its write gate encode returned";
 
+/// The input bytes of every flush encode a router ran, in completion order
+/// across its shards: the figure each encode was sized by against the write
+/// gate's inline floor. Attached with
+/// [`crate::IngestRouter::with_flush_input_bytes`] by a bench; clones share
+/// one list, which grows by one entry per flush until [`Self::take`] empties
+/// it.
+#[derive(Clone, Default)]
+pub struct FlushInputBytes {
+    sizes: Arc<Mutex<Vec<u64>>>,
+}
+
+impl FlushInputBytes {
+    fn record(&self, input_bytes: u64) {
+        self.sizes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(input_bytes);
+    }
+
+    /// Every size recorded since the last call, emptying the list.
+    pub fn take(&self) -> Vec<u64> {
+        std::mem::take(
+            &mut *self
+                .sizes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+}
+
 /// The write gate a router's flushes encode on, or none.
 #[derive(Clone, Default)]
 pub(crate) struct WriteGateSlot {
     gate: Arc<RwLock<Option<Arc<WriteGate>>>>,
+    /// Whether a flush computes its upload checksum inside the encode job.
+    checksum_in_job: Arc<AtomicBool>,
+    input_recorder: Arc<RwLock<Option<FlushInputBytes>>>,
     /// Makes the next gated encode fail with this error, so a test can reach
     /// the flush's gate-error arm: `Panicked` panics inside the job on the
     /// gate, anything else is returned without running the job, as the gate
     /// does for a job the runtime cancelled.
     #[cfg(test)]
     fail_next: Arc<std::sync::Mutex<Option<CpuGateError>>>,
+    /// Counts upload checksums computed inside an encode job, so a test can
+    /// tell the switch took effect.
+    #[cfg(test)]
+    pub(crate) checksums_in_job: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WriteGateSlot {
@@ -53,6 +91,32 @@ impl WriteGateSlot {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub(crate) fn set_checksum_in_job(&self, on: bool) {
+        self.checksum_in_job.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn checksum_in_job(&self) -> bool {
+        self.checksum_in_job.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_input_recorder(&self, recorder: FlushInputBytes) {
+        *self
+            .input_recorder
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(recorder);
+    }
+
+    fn record_input(&self, input_bytes: u64) {
+        if let Some(recorder) = self
+            .input_recorder
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            recorder.record(input_bytes);
+        }
     }
 
     #[cfg(test)]
@@ -82,6 +146,7 @@ impl WriteGateSlot {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        self.record_input(input_bytes);
         let Some(gate) = self.get() else {
             return Ok(job());
         };

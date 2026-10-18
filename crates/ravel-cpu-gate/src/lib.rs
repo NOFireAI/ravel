@@ -176,6 +176,11 @@ impl<S: GateSite> CpuGate<S> {
         self.permits
     }
 
+    /// The inline floor for [`JobSize::Bytes`] jobs the gate was built with.
+    pub fn inline_floor_bytes(&self) -> u64 {
+        self.config.inline_floor_bytes
+    }
+
     /// Jobs holding a permit right now, including a job whose waiter is gone.
     pub fn running(&self) -> u64 {
         self.counters.running.load(Ordering::Acquire)

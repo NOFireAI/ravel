@@ -159,7 +159,35 @@ pub async fn put_data_object(
     key: &str,
     bytes: Bytes,
 ) -> Result<(), PublishError> {
-    let checksum = UploadChecksum::Crc32c(crc32c::crc32c(&bytes));
+    let checksum = data_object_checksum(&bytes);
+    put_data_object_checked(store, key, bytes, checksum).await
+}
+
+/// The upload checksum [`put_data_object`] sends for `bytes`.
+pub fn data_object_checksum(bytes: &[u8]) -> UploadChecksum {
+    UploadChecksum::Crc32c(crc32c::crc32c(bytes))
+}
+
+/// [`put_data_object`] with the upload checksum computed by the caller, so a
+/// caller can compute it off the async runtime. `checksum` must be
+/// [`data_object_checksum`] of `bytes`; a store that verifies upload checksums
+/// rejects a mismatch.
+#[tracing::instrument(skip(store, bytes, checksum), fields(key = %key, len = bytes.len()))]
+pub async fn put_data_object_with_checksum(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    bytes: Bytes,
+    checksum: UploadChecksum,
+) -> Result<(), PublishError> {
+    put_data_object_checked(store, key, bytes, checksum).await
+}
+
+async fn put_data_object_checked(
+    store: &dyn ObjectStoreBackend,
+    key: &str,
+    bytes: Bytes,
+    checksum: UploadChecksum,
+) -> Result<(), PublishError> {
     match store
         .put(
             key,
@@ -375,5 +403,46 @@ mod tests {
             .expect("second put is idempotent");
         let got = store.get(key, GetRange::Full).await.expect("get");
         assert_eq!(&got.data[..], b"payload");
+    }
+
+    /// A caller-computed `data_object_checksum` PUTs the same bytes with the
+    /// same checksum as `put_data_object`, and a verifying store rejects a
+    /// checksum that does not match the bytes.
+    #[tokio::test]
+    async fn caller_checksum_put_matches_put_data_object() {
+        use ravel_object_store::fault::{FaultPlan, FaultStore};
+
+        let bytes = Bytes::from_static(b"payload");
+        let mut runs = Vec::new();
+        for caller_computed in [false, true] {
+            let store = FaultStore::new(MemoryStore::new(), FaultPlan::empty());
+            let key = "t/deadbeef/m/l0/0000/w.1.1.hash.rseg";
+            if caller_computed {
+                let checksum = data_object_checksum(&bytes);
+                put_data_object_with_checksum(&store, key, bytes.clone(), checksum)
+                    .await
+                    .expect("put");
+            } else {
+                put_data_object(&store, key, bytes.clone())
+                    .await
+                    .expect("put");
+            }
+            let stored = store.get(key, GetRange::Full).await.expect("get").data;
+            runs.push((stored, store.put_checksums()));
+        }
+        assert_eq!(runs[0], runs[1]);
+        assert_eq!(
+            runs[0].1,
+            vec![(
+                "t/deadbeef/m/l0/0000/w.1.1.hash.rseg".to_owned(),
+                Some(UploadChecksum::Crc32c(crc32c::crc32c(b"payload")))
+            )]
+        );
+
+        let store = MemoryStore::new();
+        let wrong = data_object_checksum(b"other");
+        put_data_object_with_checksum(&store, "t/k", bytes, wrong)
+            .await
+            .expect_err("a verifying store rejects a mismatched checksum");
     }
 }

@@ -17,8 +17,9 @@ pub struct CpuGates {
 }
 
 impl CpuGates {
-    /// Both gates with the resolved permit counts and the default inline
-    /// floors, measuring with one monotonic clock.
+    /// Both gates with the resolved permit counts, the read gate at the
+    /// default inline floors and the write gate at the resolved byte floor,
+    /// measuring with one monotonic clock.
     pub fn new(permits: CpuGatePermits) -> Self {
         let clock: Arc<dyn MonotonicClock> = Arc::new(InstantClock::new());
         CpuGates {
@@ -27,9 +28,35 @@ impl CpuGates {
                 Arc::clone(&clock),
             )),
             write: Arc::new(WriteGate::new(
-                CpuGateConfig::with_permits(permits.write),
+                CpuGateConfig {
+                    inline_floor_bytes: permits.write_inline_floor_bytes,
+                    ..CpuGateConfig::with_permits(permits.write)
+                },
                 clock,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_floor_reaches_only_the_write_gate() {
+        let stock = CpuGates::new(CpuGatePermits::default());
+        assert_eq!(
+            stock.write.inline_floor_bytes(),
+            ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES
+        );
+        let raised = CpuGates::new(CpuGatePermits {
+            write_inline_floor_bytes: 1 << 20,
+            ..CpuGatePermits::default()
+        });
+        assert_eq!(raised.write.inline_floor_bytes(), 1 << 20);
+        assert_eq!(
+            raised.read.inline_floor_bytes(),
+            ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES
+        );
     }
 }

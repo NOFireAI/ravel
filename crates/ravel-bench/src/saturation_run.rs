@@ -270,11 +270,43 @@ pub async fn start_server(
     cores: usize,
     tenants: usize,
 ) -> anyhow::Result<StartedServer> {
+    start_server_with(store, tenants, ServerOptions::query(cores)).await
+}
+
+/// What [`start_server_with`] sets on the server [`start_server`] describes.
+pub struct ServerOptions {
+    pub mode: Mode,
+    pub strict_flush_policy: ravel_server::config::StrictFlushPolicy,
+    pub shard_count: u32,
+    pub cpu_gate_permits: ravel_server::config::CpuGatePermits,
+    pub limits: ravel_server::LimitsConfig,
+}
+
+impl ServerOptions {
+    /// [`start_server`]'s query-mode server.
+    pub fn query(cores: usize) -> Self {
+        ServerOptions {
+            mode: Mode::Query,
+            strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+            shard_count: 1,
+            cpu_gate_permits: ravel_server::config::CpuGatePermits::derive(cores),
+            limits: ravel_server::LimitsConfig::default(),
+        }
+    }
+}
+
+/// [`start_server`] with `options` in place of its mode, strict flush policy,
+/// shard count, CPU gate permits and admission limits.
+pub async fn start_server_with(
+    store: Arc<MemoryStore>,
+    tenants: usize,
+    options: ServerOptions,
+) -> anyhow::Result<StartedServer> {
     let tokens: HashMap<String, TenantId> = (0..tenants).map(|i| (token(i), tenant(i))).collect();
     let tenant_resolver = ravel_server::tenant::build_resolver(tokens, false);
     let loopback: SocketAddr = "127.0.0.1:0".parse()?;
     let config = ServerConfig {
-        strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
+        strict_flush_policy: options.strict_flush_policy,
         // The query audit is off (#2791): no audit PUT and no flush await per
         // query. The ADR-1702 task 11 bands in `saturation` were published
         // against an audited server; see the note there.
@@ -289,10 +321,10 @@ pub async fn start_server(
         max_flush_delay_idle: Duration::from_secs(40),
         min_flush_bytes: 256 * 1024,
         idle_flush_byte_floor: 0,
-        mode: Mode::Query,
+        mode: options.mode,
         listen_http: loopback,
         listen_grpc: loopback,
-        shard_count: 1,
+        shard_count: options.shard_count,
         tenant_resolver,
         mtls_listener: None,
         fold_tenants: Vec::new(),
@@ -305,7 +337,7 @@ pub async fn start_server(
         oidc_refresh: None,
         otap: false,
         metrics_tenant_labels: false,
-        limits: ravel_server::LimitsConfig::default(),
+        limits: options.limits,
         max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         deployment_key: None,
         gc: ravel_maintain::GcConfigValues::maintain_defaults(),
@@ -325,10 +357,7 @@ pub async fn start_server(
         process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
-        cpu_gate_permits: ravel_server::config::CpuGatePermits {
-            read: ravel_cpu_gate::default_read_permits(cores),
-            write: ravel_cpu_gate::default_write_permits(cores),
-        },
+        cpu_gate_permits: options.cpu_gate_permits,
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),

@@ -546,10 +546,7 @@ pub async fn start_ingest_server(
         process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
-        cpu_gate_permits: ravel_server::config::CpuGatePermits {
-            read: ravel_cpu_gate::default_read_permits(cores),
-            write: ravel_cpu_gate::default_write_permits(cores),
-        },
+        cpu_gate_permits: ravel_server::config::CpuGatePermits::derive(cores),
         max_pending_strict_acks: arm.max_pending_strict_acks(),
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: Duration::from_secs(3600),

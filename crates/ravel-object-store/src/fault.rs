@@ -64,7 +64,7 @@ use tokio::sync::{Notify, oneshot};
 
 use crate::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, MultipartUpload, ObjectMeta,
-    ObjectStoreBackend, PageToken, PutMode, PutOptions, PutOutcome, StoreError,
+    ObjectStoreBackend, PageToken, PutMode, PutOptions, PutOutcome, StoreError, UploadChecksum,
 };
 
 /// Operation kind used to match [`Rule`]s. `List` matches both `list()` and
@@ -606,6 +606,9 @@ pub struct FaultStore<S> {
     /// not carried in the [`FaultPlan`], and control completion ordering rather
     /// than per-call outcomes.
     gates: Arc<GateRegistry>,
+    /// The key and `PutOptions::checksum` of every `put` call, in call order,
+    /// recorded before any fault applies.
+    put_checksums: Mutex<Vec<(String, Option<UploadChecksum>)>>,
 }
 
 impl<S: ObjectStoreBackend> FaultStore<S> {
@@ -637,7 +640,14 @@ impl<S: ObjectStoreBackend> FaultStore<S> {
             random,
             counters: RwLock::new(HashMap::new()),
             gates: Arc::new(GateRegistry::default()),
+            put_checksums: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The key and upload checksum of every `put` call so far, in call order,
+    /// including calls a fault then failed.
+    pub fn put_checksums(&self) -> Vec<(String, Option<UploadChecksum>)> {
+        self.put_checksums.lock().clone()
     }
 
     /// Borrow the wrapped backend, e.g. to assert on its state directly in
@@ -851,6 +861,9 @@ impl<S: ObjectStoreBackend> ObjectStoreBackend for FaultStore<S> {
         data: Bytes,
         opts: PutOptions,
     ) -> Result<PutOutcome, StoreError> {
+        self.put_checksums
+            .lock()
+            .push((key.to_owned(), opts.checksum));
         self.gate_hold(Op::Put, key).await;
         match self.resolve(Op::Put, key) {
             None => self.inner.put(key, data, opts).await,

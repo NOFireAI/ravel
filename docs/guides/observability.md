@@ -2563,7 +2563,8 @@ returns.
 
 A job below the gate's inline floor runs on the calling thread and takes no
 permit. The floor is 256 KiB of uncompressed bytes, or 100,000 samples for a
-PromQL evaluation.
+PromQL evaluation. `--cpu-gate-write-inline-floor-bytes`, a trial setting,
+moves the write gate's floor; the read gate's has no flag.
 
 Every site except one has a production call site. On the read gate those are
 `catalog_part`, `catalog_postings`, `catalog_column_stats`, `metrics_meta`,

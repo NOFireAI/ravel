@@ -2497,6 +2497,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             )
             .with_budget(ingest_buffer_budget.clone())
             .with_write_gate(cpu_gates.write.clone())
+            .with_flush_checksum_in_job(config.cpu_gate_permits.flush_checksum_in_job)
             .with_format_floor_policy(format_floor_policy.clone()),
         ))
     } else {

@@ -9463,8 +9463,11 @@ mod tests {
     /// `{mode, gate}` (plus `site`, or `worker` for the runtime busy counter).
     #[test]
     fn cpu_gate_and_runtime_families_render_each_name_once() {
-        let gates =
-            crate::cpu_gates::CpuGates::new(crate::config::CpuGatePermits { read: 7, write: 3 });
+        let gates = crate::cpu_gates::CpuGates::new(crate::config::CpuGatePermits {
+            read: 7,
+            write: 3,
+            ..Default::default()
+        });
         let mut snapshot = CpuGatesSnapshot::from_gates(&gates);
         snapshot.read.running = 5;
         snapshot.read.queued = 2;
