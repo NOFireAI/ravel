@@ -16875,6 +16875,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),

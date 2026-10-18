@@ -1820,6 +1820,7 @@ fn gateway_state(
     write_gate: &Arc<ravel_cpu_gate::WriteGate>,
     max_ingest_lag_ns: i64,
     strict_flush_policy: config::StrictFlushPolicy,
+    ipcrypt: &Arc<ipcrypt::IpcryptPolicy>,
 ) -> Arc<otlp_http::GatewayState> {
     Arc::new(otlp_http::GatewayState {
         tenant_resolver,
@@ -1836,6 +1837,7 @@ fn gateway_state(
             metadata_sink: metadata_sink.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
             budget: ingest_buffer_budget.clone(),
+            ipcrypt: ipcrypt.clone(),
         },
         logs_ingest: logs_ingest::LogIngestState {
             router: log_ingest_router.clone(),
@@ -1850,6 +1852,7 @@ fn gateway_state(
             provisioning: provisioning.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
             budget: ingest_buffer_budget.clone(),
+            ipcrypt: ipcrypt.clone(),
         },
         traces_ingest: traces_ingest::SpanIngestState {
             router: span_ingest_router.clone(),
@@ -1864,6 +1867,7 @@ fn gateway_state(
             provisioning: provisioning.clone(),
             normalize_metrics: normalize_reject_metrics.clone(),
             budget: ingest_buffer_budget.clone(),
+            ipcrypt: ipcrypt.clone(),
         },
         admission: admission.clone(),
         budget: ingest_buffer_budget.clone(),
@@ -1887,6 +1891,8 @@ fn remote_write_state(
     write_gate: &Arc<ravel_cpu_gate::WriteGate>,
     max_ingest_lag_ns: i64,
     strict_flush_policy: config::StrictFlushPolicy,
+    normalize_reject_metrics: &Arc<normalize_reject_metrics::NormalizeRejectMetrics>,
+    ipcrypt: &Arc<ipcrypt::IpcryptPolicy>,
 ) -> Arc<remote_write::RemoteWriteState> {
     Arc::new(remote_write::RemoteWriteState {
         tenant_resolver,
@@ -1906,6 +1912,8 @@ fn remote_write_state(
         budget: ingest_buffer_budget.clone(),
         write_gate: Some(write_gate.clone()),
         strict_flush_policy,
+        ipcrypt: ipcrypt.clone(),
+        normalize_metrics: normalize_reject_metrics.clone(),
     })
 }
 
@@ -2840,6 +2848,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             &cpu_gates.write,
             ingest_lag.admission_lag_ns,
             config.strict_flush_policy,
+            &ipcrypt,
         );
         http_router = http_router.merge(otlp_http::router(state));
         let rw_state = remote_write_state(
@@ -2854,6 +2863,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             &cpu_gates.write,
             ingest_lag.admission_lag_ns,
             config.strict_flush_policy,
+            &normalize_reject_metrics,
+            &ipcrypt,
         );
         http_router = http_router.merge(remote_write::router(rw_state));
 
@@ -2875,6 +2886,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 &cpu_gates.write,
                 ingest_lag.admission_lag_ns,
                 config.strict_flush_policy,
+                &ipcrypt,
             );
             let mtls_rw_state = remote_write_state(
                 router,
@@ -2888,6 +2900,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 &cpu_gates.write,
                 ingest_lag.admission_lag_ns,
                 config.strict_flush_policy,
+                &normalize_reject_metrics,
+                &ipcrypt,
             );
             mtls_router = mtls_router
                 .merge(otlp_http::router(mtls_state))
@@ -3880,6 +3894,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             &cpu_gates.write,
             ingest_lag.admission_lag_ns,
             config.strict_flush_policy,
+            &ipcrypt,
         )),
         _ => None,
     };

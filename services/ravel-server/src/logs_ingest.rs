@@ -14,7 +14,6 @@ use ravel_ingest::{
     MarkerLookupError, RequestRejection, WriteMode, plausible_ingest_clock, read_marker,
     write_marker,
 };
-use ravel_ipcrypt::rules::TenantRules;
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs_projected};
@@ -54,6 +53,8 @@ pub struct LogIngestState {
     /// projected resolved-label bytes for the duration of normalization, as
     /// [`crate::ingest::IngestState::budget`] is.
     pub budget: Arc<ravel_ingest::IngestByteBudget>,
+    /// The process's IPCrypt policy, as [`crate::ingest::IngestState::ipcrypt`].
+    pub ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
 }
 
 #[derive(Debug)]
@@ -101,6 +102,9 @@ pub enum LogIngestRequestError {
     /// durable provisioning record (ADR-0050 section 5). Operator
     /// misconfiguration, not client fault; the request fails.
     Provisioning(String),
+    /// The tenant's IPCrypt rule set could not be resolved, as
+    /// [`crate::ingest::IngestRequestError::IpcryptRules`].
+    IpcryptRules,
     Write(LogWriteError),
 }
 
@@ -114,6 +118,9 @@ impl std::fmt::Display for LogIngestRequestError {
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
             ),
             LogIngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
+            LogIngestRequestError::IpcryptRules => {
+                f.write_str(crate::ipcrypt::TENANT_RULES_UNAVAILABLE)
+            }
             LogIngestRequestError::Write(err) => write!(f, "{err}"),
         }
     }
@@ -134,6 +141,7 @@ impl LogIngestRequestError {
             LogIngestRequestError::InvalidIdempotencyKey { .. } => false,
             // An operator misconfiguration, not transient.
             LogIngestRequestError::Provisioning(_) => false,
+            LogIngestRequestError::IpcryptRules => false,
             LogIngestRequestError::Write(err) => err.is_retryable(),
         }
     }
@@ -394,8 +402,12 @@ pub async fn handle_export_logs_releasing(
         }
     }
 
-    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
-    let rules = TenantRules::none();
+    // The tenant's IPCrypt rules (ADR-2993), the same set for projection and
+    // normalization.
+    let rules = state
+        .ipcrypt
+        .rules_for(&tenant)
+        .map_err(|_| LogIngestRequestError::IpcryptRules)?;
     let projected = ravel_otlp::project_log_resolved_label_bytes(&request, &state.limits, &rules);
     let label_charge = crate::ingest::charge_projected_labels(
         &state.budget,
@@ -424,6 +436,9 @@ pub async fn handle_export_logs_releasing(
         ravel_types::Signal::Logs,
         normalized.body_conversions,
     );
+    state
+        .normalize_metrics
+        .record_ipcrypt(ravel_types::Signal::Logs, &normalized.ipcrypt_tally);
     let mut records = normalized.records;
 
     // Layer 4 (ADR-0051 section 1): stream-creation-rate is a whole-request
@@ -623,6 +638,7 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+    use ravel_ipcrypt::rules::TenantRules;
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use ravel_ingest::{
         AdmissionController, AdmissionLimits, IngestConfig, PendingAckBudget, SystemClock,
@@ -668,6 +684,7 @@ mod tests {
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),
@@ -1336,6 +1353,7 @@ mod tests {
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),

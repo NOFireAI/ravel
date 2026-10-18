@@ -92,22 +92,29 @@ impl IpcryptPolicy {
         if fingerprint != EMPTY_POLICY_FINGERPRINT && deployment_key.is_none() {
             return Err(IpcryptConfigError::NoDeploymentKey);
         }
-        Ok(Self {
+        Ok(Self::from_parts(
             policy,
             fingerprint,
-            deployment_key: deployment_key.map(|key| Box::new(*key)),
-            cache: RwLock::new(HashMap::new()),
-            none: Arc::new(TenantRules::none()),
-            builds: AtomicU64::new(0),
-        })
+            deployment_key.map(|key| Box::new(*key)),
+        ))
     }
 
     /// The empty policy: every tenant gets the shared no-rules set.
     pub fn empty() -> Self {
+        Self::from_parts(PolicyFile::default(), EMPTY_POLICY_FINGERPRINT, None)
+    }
+
+    /// The one place a production [`TenantRules::none`] is built: the set
+    /// every tenant without rules shares.
+    fn from_parts(
+        policy: PolicyFile,
+        fingerprint: [u8; 32],
+        deployment_key: Option<Box<[u8; 32]>>,
+    ) -> Self {
         Self {
-            policy: PolicyFile::default(),
-            fingerprint: EMPTY_POLICY_FINGERPRINT,
-            deployment_key: None,
+            policy,
+            fingerprint,
+            deployment_key,
             cache: RwLock::new(HashMap::new()),
             none: Arc::new(TenantRules::none()),
             builds: AtomicU64::new(0),
@@ -478,5 +485,89 @@ mod tests {
                 "{mode:?} issued a GET on {IPCRYPT_POLICY_KEY}"
             );
         }
+    }
+
+    /// Every `.rs` file under `dir`, recursively.
+    fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rust_sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// The lines of `source` outside `#[cfg(test)]` items, numbered from 1.
+    /// A gated item ending in `{` is skipped through the `}` at its own
+    /// indent; one ending in `;` is skipped as that one line.
+    fn production_lines(source: &str) -> Vec<(usize, &str)> {
+        let lines: Vec<&str> = source.lines().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < lines.len() {
+            let line = lines[i];
+            if line.trim() != "#[cfg(test)]" {
+                out.push((i + 1, line));
+                i += 1;
+                continue;
+            }
+            let indent = &line[..line.len() - line.trim_start().len()];
+            let mut item = i + 1;
+            while item < lines.len() && lines[item].trim_start().starts_with("#[") {
+                item += 1;
+            }
+            let Some(head) = lines.get(item) else { break };
+            if head.trim_end().ends_with('{') {
+                let close = format!("{indent}}}");
+                let mut end = item + 1;
+                while end < lines.len() && lines[end].trim_end() != close {
+                    end += 1;
+                }
+                i = end + 1;
+            } else {
+                i = item + 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_production_code_builds_its_own_empty_rule_set() {
+        let needle = concat!("TenantRules", "::none()");
+        let allowed = concat!("none: Arc::new(TenantRules", "::none()),");
+        let root = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src"));
+        let mut files = Vec::new();
+        rust_sources(root, &mut files);
+        assert!(files.len() > 20, "scanned only {} files", files.len());
+
+        let mut shared = 0;
+        let mut offenders = Vec::new();
+        for file in &files {
+            let source = std::fs::read_to_string(file).expect("read source");
+            for (number, line) in production_lines(&source) {
+                if !line.contains(needle) {
+                    continue;
+                }
+                if file.ends_with("ipcrypt.rs") && line.trim() == allowed {
+                    shared += 1;
+                } else {
+                    offenders.push(format!("{}:{number}: {}", file.display(), line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "production code must take its rules from IpcryptPolicy::rules_for: {offenders:#?}"
+        );
+        assert_eq!(shared, 1, "the shared no-rules constructor is the one site");
+    }
+
+    #[test]
+    fn production_lines_skips_gated_items_only() {
+        let source = "fn a() {}\n#[cfg(test)]\nfn b() {\n    x();\n}\n#[cfg(test)]\nuse c;\nfn d() {}\n#[cfg(test)]\n#[allow(dead_code)]\nmod tests {\n    fn e() {\n    }\n}\nfn f() {}\n";
+        let kept: Vec<usize> = production_lines(source).iter().map(|(n, _)| *n).collect();
+        assert_eq!(kept, vec![1, 8, 15]);
     }
 }

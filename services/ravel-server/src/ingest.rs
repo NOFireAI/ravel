@@ -13,7 +13,6 @@ use ravel_ingest::{
     IngestPoint, IngestRouter, MetadataSink, RequestRejection, WriteError, WriteMode,
     plausible_ingest_clock,
 };
-use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::normalize::normalize_metrics_with_metadata_projected;
 use ravel_otlp::{IngestLimits, NormalizeRejectCounts, Rejection};
 use ravel_types::{CommitToken, ExemplarCap, SeriesId, TenantId};
@@ -55,6 +54,10 @@ pub struct IngestState {
     /// resolved-label bytes to it for the duration of normalization (ADR-2708
     /// D2).
     pub budget: Arc<IngestByteBudget>,
+    /// The process's IPCrypt policy (ADR-2993), shared by every ingest
+    /// surface. `handle_export` resolves the tenant's rule set from it and
+    /// hands that to projection and normalization.
+    pub ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
 }
 
 pub struct IngestOutcome {
@@ -80,6 +83,11 @@ pub enum IngestRequestError {
     /// rather than writing into a shard topology that hides the tenant's
     /// existing data; an operator must reconcile config with the record.
     Provisioning(String),
+    /// The tenant's IPCrypt rule set could not be resolved from the policy
+    /// (ADR-2993). Nothing is stored: writing the configured values in the
+    /// clear is the one outcome the policy exists to prevent. The detail
+    /// (tenant hash, rule key) is in the server log, not in this error.
+    IpcryptRules,
     Write(WriteError),
 }
 
@@ -89,6 +97,9 @@ impl std::fmt::Display for IngestRequestError {
             IngestRequestError::Admission(rejection) => write!(f, "{}", rejection.reason),
             IngestRequestError::ClockImplausible(msg) => write!(f, "{msg}"),
             IngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
+            IngestRequestError::IpcryptRules => {
+                f.write_str(crate::ipcrypt::TENANT_RULES_UNAVAILABLE)
+            }
             IngestRequestError::Write(err) => write!(f, "{err}"),
         }
     }
@@ -108,6 +119,9 @@ impl IngestRequestError {
             // The bad clock is the replica's; a retry against a healthy one works.
             IngestRequestError::ClockImplausible(_) => true,
             IngestRequestError::Provisioning(_) => false,
+            // A policy the operator must fix; the cache retries each write,
+            // but a client retry against the same policy fails the same way.
+            IngestRequestError::IpcryptRules => false,
             IngestRequestError::Write(err) => err.is_retryable(),
         }
     }
@@ -228,8 +242,13 @@ pub async fn handle_export_releasing(
     // tenant x lifetime series cardinality (the same growth vector
     // `shard.rs`'s per-flush cap comment already rejected building one layer
     // lower).
-    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
-    let rules = TenantRules::none();
+    // The tenant's IPCrypt rules (ADR-2993): projection and normalization must
+    // see the same set, since a ruled value's stored width differs from its
+    // raw width.
+    let rules = state
+        .ipcrypt
+        .rules_for(&tenant)
+        .map_err(|_| IngestRequestError::IpcryptRules)?;
     let projected = ravel_otlp::project_resolved_label_bytes(&request, &state.limits, &rules);
     let label_charge = charge_projected_labels(
         &state.budget,
@@ -285,6 +304,9 @@ pub async fn handle_export_releasing(
         ravel_types::Signal::Metrics,
         ravel_otlp::resource_attrs_dropped_from_rejections(&normalized.rejected),
     );
+    state
+        .normalize_metrics
+        .record_ipcrypt(ravel_types::Signal::Metrics, &normalized.ipcrypt_tally);
     normalized
         .rejected
         .retain(|r| !matches!(r, Rejection::ResourceAttributesDropped { .. }));
@@ -497,6 +519,7 @@ fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> St
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+    use ravel_ipcrypt::rules::TenantRules;
     use ravel_ingest::{AdmissionLimits, CountLimit, IngestConfig, PendingAckBudget, SystemClock};
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
@@ -535,6 +558,7 @@ mod tests {
             provisioning: None,
             metadata_sink: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
         }
     }
@@ -568,6 +592,7 @@ mod tests {
             provisioning: None,
             metadata_sink: Some(sink.clone()),
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
         };
         (state, store, sink)
@@ -1491,6 +1516,7 @@ mod tests {
             provisioning: None,
             metadata_sink: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: IngestByteBudget::shared(ravel_ingest::IngestByteBudgetLimit::Unlimited),
         };
 
