@@ -2099,8 +2099,13 @@ reservations release exactly as they do at a normal end of stream.
 schema (declared typed columns included), runs the cost estimator, and
 renders the physical plan, without opening a single data object. It reports
 the target table, that schema, the resolved/admitted/recent-exempt segment
-counts, the `CostEstimate`, the row-window predicate it would apply, and the
-plan text. Where the estimator cannot bound a component for the target it
+counts, the `CostEstimate`, the row-window predicate it would apply, the
+plan text, and `signals`: one `SignalStats` per signal table, the
+`stats.signals` entry described under "JSON response shape", measured on
+accounting handles of its own. `explain_accounted` merges their sum into the
+caller's `QueryAccounting` when explain returns, fails or is dropped, so the
+caller's total is the statement total and its figures arrive at the end
+rather than as each read lands. Where the estimator cannot bound a component for the target it
 names that component in `unbounded_components` rather than reporting a
 structural zero a caller would read as a real estimate of zero:
 `estimated_decompressed_bytes` is unbounded for the RLOG- and RSPAN-backed
@@ -3090,6 +3095,56 @@ public `phase_accounting`/`io_shape` types rather than reusing this crate's
 `SqlOutcome` and has no stats envelope to extend, so neither surface renders
 `stats.phases`/`stats.io`.
 
+**`stats.signals`** (ADR-2904 decision 7) splits that cost by
+table. It is an array with one entry per signal table the statement reads,
+in the fixed order `samples`, `logs`, `spans`, `alerts`, `audit`
+(`SIGNAL_LANE_ORDER`), whatever order the statement names them in. A
+statement that names no table resolves `samples` and reports its entry.
+Each entry has exactly four fields, rendered by `stats_json::signals_json`:
+
+- `table`: the table name.
+- `segments`: segments in that table's resolved snapshot. The entries'
+  `segments` sum to `stats.pruning.segments`.
+- `segmentsPruned`: segments that table's catalog resolve pruned
+  (`Snapshot.segments_pruned`). It is reported per table only; `stats` has
+  no statement total of it.
+- `phases`: the table's own cost in the same per-phase shape as
+  `stats.phases`: the same five phases in the same order, the same fields,
+  rendered by the same `phase_costs_json`. ADR-2904 decision 7 lists four
+  phases; the entry carries `keyIndex` too because the same decision asks
+  for the same per-phase shape.
+
+Every table's reads record into an accounting handle of its own, Parquet
+tables share one more, and a statement handle takes the charge that belongs
+to no table (the memory pool's peak report, which only
+`peakIntermediateBytes` carries and `phases` does not render).
+`stats.phases` and `stats.accounting` are the sum of those handles, so for
+every phase and every rendered field the entries plus the Parquet share
+equal `stats.phases`. A Parquet table has no entry: a Parquet-only
+statement has `"signals": []`, and the Parquet share is `stats.phases`
+less the entries. That share also holds the lookups a statement naming a
+signal table makes for any other name it names. A statement reading a
+signal table beside a live Parquet table is refused
+(`SqlError::SignalBesideParquet`), so the share's arithmetic is pinned by
+a unit test on the view (`statement_accounting.rs`) rather than end to
+end. The `alerts` and `audit` scans take one handle for every read after
+resolve, so their entries charge plan and probe reads to `scan`.
+
+The resolve-time request budget, the `samples` scan's byte and request
+checkpoint, the live cost reading and `stats.io` read the statement total,
+not one table's entry: a request budget above the `samples` table's own cost
+and below the statement's refuses a `samples JOIN logs` statement. The one
+exception is the Parquet read budget (`parquet::build_tables`), which reads
+the Parquet handle. That equals the statement total today, because a signal
+table beside a live Parquet table is refused and the statement handle
+records only the memory pool's peak. `cross_signal_tests.rs` pins the sum per
+phase and per field, each entry's GET and LIST counts against the requests
+recorded under that signal's keys, and the budget;
+`services/ravel-server/tests/sql_endpoint.rs` pins the rendered entries.
+Flight SQL and the Arrow-IPC encoding carry no `stats` object, so neither
+renders `stats.signals`. The ES|QL route's catalog `stats` carries the other
+sections but not `signals`.
+
 `/api/v1/sql`'s JSON response also carries two objects PromQL has no
 counterpart for (ADR-2677 decision 4), rendered by
 `crates/ravel-sql/src/stats_json.rs`'s `timings_json` and `pruning_json`.
@@ -3164,7 +3219,8 @@ discarded attempt's time is in no field either.
 and block-level reported independently:
 
 - `segments`: segments in the resolved snapshots, summed over every signal
-  table the statement names.
+  table the statement names. Each table's own count is its
+  `stats.signals` entry's `segments`.
 - `segmentsPrunedByStats`: segments a logs scan skipped before any fetch
   because a typed attribute column's stamped statistics excluded a
   pushed-down predicate (ADR-2121 D1).

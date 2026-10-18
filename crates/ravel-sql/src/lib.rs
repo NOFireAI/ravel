@@ -108,6 +108,7 @@ mod spans_scan;
 mod spans_schema;
 pub mod spill;
 mod statement;
+mod statement_accounting;
 pub mod stats_json;
 mod trace_id_planner;
 mod udf;
@@ -160,7 +161,7 @@ pub use error::{
 pub use executor::{
     AnalyzedRun, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting, ParquetPlan,
     PhaseWallTiming, PinnedPlanInputs, PinnedQuery, PinnedResolve, PinnedStream, ScanTiming,
-    SegmentTiming, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
+    SegmentTiming, SignalStats, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{

@@ -430,6 +430,23 @@ async fn a_parquet_table_answers_a_filtered_select_with_its_reads_split_by_phase
     );
 }
 
+/// A Parquet table has no `stats.signals` entry, so a Parquet-only statement
+/// reports none while its statement total still holds every read.
+#[tokio::test]
+async fn a_parquet_only_statement_has_no_signals_entry() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    lake.hits_for(&acme).await;
+
+    let outcome = lake
+        .execute(&acme, "SELECT count(*) FROM hits")
+        .await
+        .expect("query");
+    assert_eq!(outcome.target, TargetSignal::Parquet);
+    assert!(outcome.signals.is_empty(), "{:?}", outcome.signals);
+    assert!(outcome.accounting.total_s3_requests() > 0);
+}
+
 /// `LIMIT n` caps a plain projection over a three-file Parquet table of six
 /// rows, the shape that over-returned on `logs` (issue #2616).
 #[tokio::test]

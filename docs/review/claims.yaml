@@ -288,3 +288,13 @@
     - crates/ravel-sql/tests/parquet_tables.rs::a_signal_table_beside_parquet_is_refused_before_listing
   status: verified
   note: "The test pins SqlError::SignalBesideParquet after the Parquet manifest reads and before any signal catalog listing. Ticket T7 (#2914) lifts it."
+
+- id: query-engine-stats-signals-sum-to-phases
+  doc: docs/query-engine.md
+  quote: "for every phase and every rendered field the entries plus the Parquet share equal `stats.phases`."
+  kind: positive
+  binds:
+    - crates/ravel-sql/src/cross_signal_tests.rs::stats_signals_sum_to_totals_per_phase
+    - crates/ravel-sql/src/statement_accounting.rs::tests::lanes_parquet_and_statement_sum_to_the_total
+  status: verified
+  note: "The first test sums the samples and logs entries of a join to stats.phases per phase and per rendered field; the second pins the Parquet share as the total less the entries on the view, since a signal table beside a live Parquet table is refused (#2914)."

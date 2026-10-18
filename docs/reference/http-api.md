@@ -175,6 +175,17 @@ The JSON response envelope has one array per row under `data.rows`:
  "stats": {}}
 ```
 
+`stats` holds `accounting`, `estimate`, `phases`, `signals`, `io`,
+`timings` and `pruning`. `signals` has one entry per signal table the
+statement reads, in the order `samples`, `logs`, `spans`, `alerts`,
+`audit`, each with exactly `table`, `segments`, `segmentsPruned` and
+`phases` (the table's own cost, in the shape of `stats.phases`). Summed
+over the entries, each figure of `phases` equals the statement's
+`stats.phases` figure, less what Parquet tables cost; a Parquet table has no
+entry. The
+[query engine reference](../query-engine.md#json-response-shape) defines
+every section.
+
 JSON encoding per column type:
 
 - A non-finite float is a string: `NaN`, `+Inf`, and `-Inf`.

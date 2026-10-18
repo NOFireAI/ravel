@@ -178,7 +178,7 @@ fn respond(
         EsqlRun::Catalog(sql) => {
             crate::sql::record_postings(sql);
             warnings.extend(sql.warnings());
-            crate::sql::stats_json(sql, audit_elapsed)
+            crate::sql::esql_stats_json(sql, audit_elapsed)
         }
         EsqlRun::Row(_) => crate::query::accounting_stats_json(&accounting, &estimate),
     };
