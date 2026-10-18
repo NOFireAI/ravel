@@ -367,7 +367,8 @@ rm -f "$STUB_DIR/perf-argv"
 # sampler's 2 s timeout, and while health-500-<role> exists it answers 500.
 # GET /metrics on the 4318 role carries ravel_health_heartbeat_age_seconds
 # (the value in the heartbeat file, default 0.5) unless heartbeat-absent
-# exists; on the 4319 role it is a 404.
+# exists, and answers only after 3 s while metrics-hang exists; on the 4319
+# role it is a 404.
 cat >"$TMP/health-stub.py" <<'PY'
 import http.server, os, socketserver, sys, threading, time
 state = sys.argv[1]
@@ -397,6 +398,8 @@ def handler(role):
                 ready = os.path.exists(f("server-ready"))
                 return self.answer(200 if ready else 503, "ok\n" if ready else "starting\n")
             if self.path == "/metrics" and role == "4318":
+                if os.path.exists(f("metrics-hang")):
+                    time.sleep(3)
                 body = "# TYPE x gauge\n"
                 if not os.path.exists(f("heartbeat-absent")):
                     try:
@@ -1144,7 +1147,7 @@ if [l.split(" n=")[0] for l in lines] != ["HEALTHZ phase=benchmark port=4318", "
     print("healthz.txt", lines)
 scrapes = [json.loads(l) for l in open(os.path.join(d, "benchmark", "healthz", "metrics.jsonl"))]
 n_gated = sum(1 for r in scrapes if r["gated"])
-if lines[-1:] != ["HEARTBEAT phase=benchmark n=%d failures=0 max_s=0.500" % n_gated] or n_gated < 43:
+if lines[-1:] != ["HEARTBEAT phase=benchmark n=%d failures=0 bad=0 max_s=0.500" % n_gated] or n_gated < 43:
     print("HEARTBEAT", lines[-1:], "gated scrapes", n_gated)
 PY
 )"
@@ -1158,13 +1161,14 @@ fi
 # Catches: a /healthz timeout or a non-200 dropped from the figures or counted
 # at its own latency: 4319 hangs past the 2 s client timeout and 4318 answers
 # 500, so every sample on both is a failure counted as 2000 ms. /metrics
-# carries no heartbeat age, so every scrape is a failure too: HEARTBEAT must
-# count them and report max_s 2.000 rather than refuse the phase or drop them.
+# hangs past the timeout too, so every scrape is a stall: HEARTBEAT must count
+# each as a failure and report max_s 2.000 rather than refuse the phase, drop
+# them or call them bad.
 hz="$TMP/healthz-fail"
 rm -rf "$hz"
 mkdir -p "$hz"
 touch "$STUB_DIR/server-ready" "$STUB_DIR/health-hang-4319" "$STUB_DIR/health-500-4318" \
-  "$STUB_DIR/heartbeat-absent"
+  "$STUB_DIR/metrics-hang"
 printf 'up 1\n' >"$hz/gate"
 python3 "$KIT_SRC/lib/kit.py" healthz-sampler "$hz" "$hz/gate" "$hz/ack" \
   "$KIT_HEALTH_BASE_4318" "$KIT_HEALTH_BASE_4319" 2>"$hz/sampler.log" &
@@ -1175,27 +1179,88 @@ printf 'down 1\n' >"$hz/gate"
 kill "$hz_pid" 2>/dev/null
 wait "$hz_pid" 2>/dev/null
 rm -f "$STUB_DIR/server-ready" "$STUB_DIR/health-hang-4319" "$STUB_DIR/health-500-4318" \
-  "$STUB_DIR/heartbeat-absent"
+  "$STUB_DIR/metrics-hang"
 code=0
 python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$hz" >"$hz/summary" 2>&1 || code=$?
-n_hb="$(sed -n 's/^HEARTBEAT phase=benchmark n=\([0-9]*\) failures=\([0-9]*\) max_s=2.000$/\1 \2/p' "$hz/summary")"
-# /metrics is scraped every 1 s, not at /healthz's 250 ms: consecutive scrapes
-# of one generation sit at least 0.95 s apart (load only widens the gap).
-gaps="$(python3 -c 'import json, sys
-t = [r["t"] for r in map(json.loads, open(sys.argv[1])) if r["gen"] == 1]
-g = [b - a for a, b in zip(t, t[1:])]
-print(len(g) >= 1 and min(g) >= 0.95, [round(x, 3) for x in g])' "$hz/metrics.jsonl" 2>&1)"
+n_hb="$(sed -n 's/^HEARTBEAT phase=benchmark n=\([0-9]*\) failures=\([0-9]*\) bad=0 max_s=2.000$/\1 \2/p' "$hz/summary")"
 n_4318="$(sed -n 's/^HEALTHZ phase=benchmark port=4318 n=\([0-9]*\) p50_ms=2000.000 p99_ms=2000.000 max_ms=2000.000 failures=\([0-9]*\)$/\1 \2/p' "$hz/summary")"
 n_4319="$(sed -n 's/^HEALTHZ phase=benchmark port=4319 n=\([0-9]*\) p50_ms=2000.000 p99_ms=2000.000 max_ms=2000.000 failures=\([0-9]*\)$/\1 \2/p' "$hz/summary")"
 raw_4319="$(python3 -c 'import json, sys; r = [json.loads(l) for l in open(sys.argv[1])]; print(min(x["ms"] for x in r) >= 1900, all(x["error"].startswith("timeout") or "timed out" in x["error"] for x in r))' "$hz/4319.jsonl" 2>&1)"
 if [ "$code" = 0 ] && [ -s "$hz/ack" ] && [ -n "$n_4318" ] && [ "${n_4318% *}" = "${n_4318#* }" ] && [ "${n_4318% *}" -ge 4 ] \
   && [ -n "$n_4319" ] && [ "${n_4319% *}" = "${n_4319#* }" ] && [ "${n_4319% *}" -ge 1 ] \
   && [ "$raw_4319" = "True True" ] \
-  && [ -n "$n_hb" ] && [ "${n_hb% *}" = "${n_hb#* }" ] && [ "${n_hb% *}" -ge 1 ] \
-  && [ "${gaps%% *}" = True ]; then
-  pass "a /healthz timeout or non-200 counts as a 2000 ms sample and a failure, a failed /metrics scrape as a 2 s heartbeat age and a failure, and /metrics is scraped every 1 s"
+  && [ -n "$n_hb" ] && [ "${n_hb% *}" = "${n_hb#* }" ] && [ "${n_hb% *}" -ge 1 ]; then
+  pass "a /healthz timeout or non-200 counts as a 2000 ms sample and a failure, and an unanswered /metrics scrape as a 2 s heartbeat age and a failure"
 else
-  fail "healthz timeout" "exit $code, 4318 '$n_4318', 4319 '$n_4319', raw '$raw_4319', heartbeat '$n_hb', metrics gaps '$gaps': $(cat "$hz/summary") $(head -c 300 "$hz/sampler.log")"
+  fail "healthz timeout" "exit $code, 4318 '$n_4318', 4319 '$n_4319', raw '$raw_4319', heartbeat '$n_hb': $(cat "$hz/summary") $(head -c 300 "$hz/sampler.log")"
+fi
+
+# Catches: a /metrics endpoint that answers fast but unusably read as a 2 s
+# stall on every scrape, so a misconfigured endpoint passes every phase with
+# max_s 2.000: /metrics answers 200 without the heartbeat age, and the phase
+# is refused, naming the reason. The same raw scrapes pin the 1 s cadence:
+# consecutive scrapes of one generation sit at least 0.95 s apart on the
+# monotonic clock (load only widens the gap), not at /healthz's 250 ms.
+hz="$TMP/healthz-unusable"
+rm -rf "$hz"
+mkdir -p "$hz"
+touch "$STUB_DIR/server-ready" "$STUB_DIR/heartbeat-absent"
+printf 'up 1\n' >"$hz/gate"
+python3 "$KIT_SRC/lib/kit.py" healthz-sampler "$hz" "$hz/gate" "$hz/ack" \
+  "$KIT_HEALTH_BASE_4318" "$KIT_HEALTH_BASE_4319" 2>"$hz/sampler.log" &
+hz_pid=$!
+for _ in $(seq 1 1000); do [ -s "$hz/ack" ] && break; sleep 0.01; done
+sleep 2.5
+printf 'down 1\n' >"$hz/gate"
+kill "$hz_pid" 2>/dev/null
+wait "$hz_pid" 2>/dev/null
+rm -f "$STUB_DIR/server-ready" "$STUB_DIR/heartbeat-absent"
+code=0
+python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$hz" >"$hz/summary" 2>"$hz/summary.err" || code=$?
+gaps="$(python3 -c 'import json, sys
+t = [r["mono"] for r in map(json.loads, open(sys.argv[1])) if r["gen"] == 1]
+g = [b - a for a, b in zip(t, t[1:])]
+print(len(g) >= 1 and min(g) >= 0.95, [round(x, 3) for x in g])' "$hz/metrics.jsonl" 2>&1)"
+if [ "$code" = 2 ] && [ ! -s "$hz/summary" ] \
+  && grep -qF "every answered /metrics scrape for phase benchmark in $hz was unusable (no ravel_health_heartbeat_age_seconds in /metrics)" "$hz/summary.err" \
+  && [ "${gaps%% *}" = True ]; then
+  pass "a phase whose every answered /metrics scrape lacks the heartbeat age is refused, naming why, and /metrics is scraped every 1 s on the monotonic clock"
+else
+  fail "healthz unusable metrics" "exit $code, metrics gaps '$gaps': $(cat "$hz/summary" "$hz/summary.err") $(head -c 300 "$hz/sampler.log")"
+fi
+
+# Catches: an answered but unusable scrape (a 404, a 401, a 200 without the
+# metric) counted as a stall or left out of the HEARTBEAT line, or a phase
+# whose answered scrapes were all unusable passing beside a stall.
+hz_synthetic() {
+  local d="$TMP/healthz-syn-$1"
+  shift
+  rm -rf "$d"
+  mkdir -p "$d"
+  for port in 4318 4319; do
+    echo '{"gated": true, "ok": true, "ms": 1.0}' >"$d/$port.jsonl"
+  done
+  printf '%s\n' "$@" >"$d/metrics.jsonl"
+  code=0
+  python3 "$KIT_SRC/lib/kit.py" healthz-summary benchmark "$d" >"$d/summary" 2>"$d/summary.err" || code=$?
+}
+s_ok='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.7}'
+s_ok2='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.4}'
+s_404='{"gated": true, "ok": false, "answered": true, "status": 404, "error": "HTTP 404"}'
+s_401='{"gated": true, "ok": false, "answered": true, "status": 401, "error": "HTTP 401"}'
+s_stall='{"gated": true, "ok": false, "answered": false, "status": 0, "error": "TimeoutError: timed out"}'
+hz_synthetic mixed "$s_ok" "$s_401" "$s_stall"
+mixed="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-mixed/summary")"
+hz_synthetic usable "$s_ok" "$s_ok2" "$s_404"
+usable="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-usable/summary")"
+hz_synthetic allbad "$s_404" "$s_401" "$s_stall"
+allbad="$code $(cat "$TMP/healthz-syn-allbad/summary.err")"
+if [ "$mixed" = "0 HEARTBEAT phase=benchmark n=3 failures=1 bad=1 max_s=2.000" ] \
+  && [ "$usable" = "0 HEARTBEAT phase=benchmark n=3 failures=0 bad=1 max_s=0.700" ] \
+  && [ "$allbad" = "2 kit: healthz-summary: every answered /metrics scrape for phase benchmark in $TMP/healthz-syn-allbad was unusable (HTTP 401; HTTP 404), so the heartbeat age was never read" ]; then
+  pass "an answered but unusable /metrics scrape counts as bad, not as a stall, and a phase with no usable scrape among its answers is refused"
+else
+  fail "healthz bad scrapes" "mixed '$mixed', usable '$usable', allbad '$allbad'"
 fi
 
 # Catches: a request body without an explicit window (the server's default is
@@ -1568,28 +1633,32 @@ rm -rf "$OUT_A"
 printf '%s\n' \
   'HEALTHZ phase=benchmark port=4318 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
   'HEALTHZ phase=benchmark port=4319 n=8 p50_ms=1.0 p99_ms=2.0 max_ms=2.0 failures=0' \
-  'HEARTBEAT phase=benchmark n=4 failures=1 max_s=2.000' >"$TMP/healthz-extra.txt"
+  'HEARTBEAT phase=benchmark n=4 failures=1 bad=2 max_s=2.000' >"$TMP/healthz-extra.txt"
 code=0
 python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
   >"$TMP/healthz-extra.json" 2>"$TMP/healthz-extra.err" || code=$?
-hb="$(python3 -c 'import json, sys; b = json.load(open(sys.argv[1]))["phases"]["benchmark"]; print(b["heartbeat_n"], b["heartbeat_failures"], b["heartbeat_max_s"])' "$TMP/healthz-extra.json" 2>&1)"
-[ "$code" = 0 ] && [ "$hb" = "4 1 2.0" ] \
+hb="$(python3 -c 'import json, sys; b = json.load(open(sys.argv[1]))["phases"]["benchmark"]; print(b["heartbeat_n"], b["heartbeat_failures"], b["heartbeat_bad"], b["heartbeat_max_s"])' "$TMP/healthz-extra.json" 2>&1)"
+[ "$code" = 0 ] && [ "$hb" = "4 1 2 2.0" ] \
   || fail "healthz extra line control" "exit $code, heartbeat '$hb': $(head -c 300 "$TMP/healthz-extra.err")"
-echo 'HEARTBEAT phase=concurrent-1 n=4 failures=0 max_s=0.500' >>"$TMP/healthz-extra.txt"
+echo 'HEARTBEAT phase=concurrent-1 n=4 failures=0 bad=0 max_s=0.500' >>"$TMP/healthz-extra.txt"
 code=0
 python3 "$KIT_SRC/lib/kit.py" healthz-check "$TMP/healthz-extra.txt" benchmark \
   >/dev/null 2>"$TMP/healthz-extra.err" || code=$?
 if [ "$code" = 2 ] \
-  && grep -qF "healthz-extra.txt:4 is not an expected line: 'HEARTBEAT phase=concurrent-1 n=4 failures=0 max_s=0.500'" "$TMP/healthz-extra.err"; then
+  && grep -qF "healthz-extra.txt:4 is not an expected line: 'HEARTBEAT phase=concurrent-1 n=4 failures=0 bad=0 max_s=0.500'" "$TMP/healthz-extra.err"; then
   pass "healthz-check refuses a line for a phase it was not asked for, naming file and line"
 else
   fail "healthz extra line" "exit $code: $(head -c 300 "$TMP/healthz-extra.err")"
 fi
 
-# Catches: a HEARTBEAT line with no scrape behind it, or one in the old
-# max-only form, taken as the phase's heartbeat figure.
-for bad in 'HEARTBEAT phase=benchmark n=0 failures=0 max_s=0.000|counts 0 samples and 0 failures' \
-  'HEARTBEAT phase=benchmark n=2 failures=3 max_s=2.000|counts 2 samples and 3 failures' \
+# Catches: a HEARTBEAT line with no scrape behind it, more failed and bad
+# scrapes than scrapes, no usable scrape beside bad ones, or one in an older
+# form (max only, or without bad=), taken as the phase's heartbeat figure.
+for bad in 'HEARTBEAT phase=benchmark n=0 failures=0 bad=0 max_s=0.000|counts 0 samples and 0 failures' \
+  'HEARTBEAT phase=benchmark n=2 failures=3 bad=0 max_s=2.000|counts 2 samples and 3 failures' \
+  'HEARTBEAT phase=benchmark n=4 failures=2 bad=3 max_s=2.000|counts 4 scrapes, 2 failures and 3 bad' \
+  'HEARTBEAT phase=benchmark n=4 failures=1 bad=3 max_s=2.000|counts 3 bad scrapes and no usable one' \
+  "HEARTBEAT phase=benchmark n=4 failures=1 max_s=2.000|is not an expected line: 'HEARTBEAT phase=benchmark n=4 failures=1 max_s=2.000'" \
   "HEARTBEAT phase=benchmark max_s=0.500|is not an expected line: 'HEARTBEAT phase=benchmark max_s=0.500'"; do
   head -n 2 "$TMP/healthz-extra.txt" >"$TMP/healthz-hb.txt"
   echo "${bad%%|*}" >>"$TMP/healthz-hb.txt"
@@ -2231,7 +2300,9 @@ r[\"provenance\"][\"server_settings\"][\"unmapped_setting\"] = 1" "$declare_b" \
 # Catches: the setting check refusing what a declared flag does move, or
 # printing a difference that is not there. B declares --sql-scan-decode-inline
 # with every setting equal (one comparable line), then --sql-tenant-max-bytes,
-# which moves both SQL pools (the per-query pool is clamped to it).
+# which moves both SQL pools (the per-query pool is clamped to it), then
+# --sql-max-query-bytes above the tenant pool, which raises the tenant pool to
+# it.
 flags_accepted() {
   local name="$1" edit="$2" sed_toml="$3"
   shift 3
@@ -2256,6 +2327,93 @@ r["provenance"]["server_settings"].update(sql_tenant_max_bytes=1000, sql_max_que
   's/^shards = /server_flags_b = ["--sql-tenant-max-bytes", "1000"]\n&/' \
   "arms differ by their declared extra server flags only: A [], B ['--sql-tenant-max-bytes', '1000']" \
   "server_settings differs with them: sql_max_query_bytes A 16451897344 B 1000, sql_tenant_max_bytes A 32903794688 B 1000"
+flags_accepted raise 'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-max-query-bytes", "40000000000"]
+r["provenance"]["server_settings"].update(sql_tenant_max_bytes=40000000000, sql_max_query_bytes=40000000000)' \
+  's/^shards = /server_flags_b = ["--sql-max-query-bytes", "40000000000"]\n&/' \
+  "arms differ by their declared extra server flags only: A [], B ['--sql-max-query-bytes', '40000000000']" \
+  "server_settings differs with them: sql_max_query_bytes A 16451897344 B 40000000000, sql_tenant_max_bytes A 32903794688 B 40000000000"
+
+# Catches: a declared flag on one SQL pool letting either pool, or the key it
+# sets directly, resolve to any value. B's --sql-max-query-bytes 50 can raise
+# the tenant pool only up to 50 and only from below, so 32903794688 moving to
+# 7 is refused; B's --sql-tenant-max-bytes above the per-query pool clamps
+# nothing, so that pool moving to 3 is refused; and --fetch-concurrency 64
+# sets fetch_concurrency to 64, not 17.
+flags_refusal "the tenant pool moved past what --sql-max-query-bytes raises it to" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-max-query-bytes", "50"]
+r["provenance"]["server_settings"].update(sql_max_query_bytes=50, sql_tenant_max_bytes=7)' \
+  's/^shards = /server_flags_b = ["--sql-max-query-bytes", "50"]\n&/' \
+  "provenance.server_settings.sql_tenant_max_bytes is A 32903794688, B 7, which the declared extra flags do not resolve it to: A sets no --sql-tenant-max-bytes or --sql-max-query-bytes, so it holds the unflagged value; B's --sql-max-query-bytes 50 raises it to 50 only from an unflagged value below 50"
+flags_refusal "the query pool moved past what --sql-tenant-max-bytes clamps it to" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--sql-tenant-max-bytes", "40000000000"]
+r["provenance"]["server_settings"].update(sql_max_query_bytes=3, sql_tenant_max_bytes=40000000000)' \
+  's/^shards = /server_flags_b = ["--sql-tenant-max-bytes", "40000000000"]\n&/' \
+  "provenance.server_settings.sql_max_query_bytes is A 16451897344, B 3, which the declared extra flags do not resolve it to: A sets no --sql-max-query-bytes or --sql-tenant-max-bytes, so it holds the unflagged value; B's --sql-tenant-max-bytes 40000000000 clamps it to 40000000000 only from an unflagged value above 40000000000"
+flags_refusal "fetch_concurrency resolved to other than --fetch-concurrency sets" \
+  'r["provenance"]["server_flags"]["extra_flags"] = ["--fetch-concurrency", "64"]
+r["provenance"]["server_settings"]["fetch_concurrency"] = 17' "$declare_b" \
+  "provenance.server_settings.fetch_concurrency is A 32, B 17, which the declared extra flags do not resolve it to: A sets no --fetch-concurrency, so it holds the unflagged value; B's --fetch-concurrency 64 sets it to 64"
+
+# Catches: the setting check accepting a move resolve_performance_defaults in
+# services/ravel-server/src/config.rs does not make, or refusing one it does.
+# Arm A holds the unflagged pools (query 100, tenant 200) unless a case gives
+# it flags of its own.
+settings="$(python3 - "$KIT_SRC/lib" <<'PY' 2>&1
+import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+Q, T, F = "sql_max_query_bytes", "sql_tenant_max_bytes", "fetch_concurrency"
+base = {Q: 100, T: 200, F: 32}
+def s(**kw):
+    out = dict(base)
+    out.update({{"q": Q, "t": T, "f": F}[k]: v for k, v in kw.items()})
+    return out
+cases = [
+    # name, A settings, B settings, A flags, B flags, accepted
+    ("raise above the tenant pool", base, s(q=500, t=500), [], ["--sql-max-query-bytes", "500"], True),
+    ("query flag below the tenant pool raises nothing", base, s(q=150), [],
+     ["--sql-max-query-bytes", "150"], True),
+    ("tenant pool raised from above", base, s(q=150, t=150), [],
+     ["--sql-max-query-bytes", "150"], False),
+    ("tenant pool left below the query flag", base, s(q=500), [],
+     ["--sql-max-query-bytes", "500"], False),
+    ("clamp below the query pool", base, s(q=60, t=60), [], ["--sql-tenant-max-bytes", "60"], True),
+    ("query pool clamped although below the tenant flag", base, s(q=60, t=150), [],
+     ["--sql-tenant-max-bytes", "150"], False),
+    ("query pool left above the tenant flag", base, s(t=60), [],
+     ["--sql-tenant-max-bytes", "60"], False),
+    ("both pool flags, the query one clamped", base, s(q=80, t=80), [],
+     ["--sql-max-query-bytes", "90", "--sql-tenant-max-bytes", "80"], True),
+    ("both pool flags, the query one not clamped", base, s(q=90, t=80), [],
+     ["--sql-max-query-bytes", "90", "--sql-tenant-max-bytes", "80"], False),
+    ("query flags on both arms, each raise consistent", s(q=50, t=60), s(q=80, t=80),
+     ["--sql-max-query-bytes", "50"], ["--sql-max-query-bytes", "80"], True),
+    ("query flags on both arms, the raise inconsistent", s(q=50, t=70), s(q=80, t=90),
+     ["--sql-max-query-bytes", "50"], ["--sql-max-query-bytes", "80"], False),
+    ("fetch flag honoured", base, s(f=64), [], ["--fetch-concurrency", "64"], True),
+    ("fetch flags on both arms, equal stamps neither sets", base, base,
+     ["--fetch-concurrency", "64"], ["--fetch-concurrency", "17"], False),
+    ("a setting flag given twice", base, s(f=64), [],
+     ["--fetch-concurrency", "64", "--fetch-concurrency=64"], False),
+    ("a setting flag with no number", base, s(f=64), [], ["--fetch-concurrency", "lots"], False),
+]
+bad = []
+for name, va, vb, ea, eb, want in cases:
+    try:
+        kit._setting_differences(va, vb, ea, eb)
+        got = True
+    except kit.Refusal:
+        got = False
+    if got != want:
+        bad.append("%s %s" % (name, "refused" if want else "accepted"))
+print("; ".join(bad))
+PY
+)"
+if [ -z "$settings" ]; then
+  pass "a declared SQL pool or fetch flag accepts exactly the values config.rs resolves the settings to"
+else
+  fail "setting resolution" "$settings"
+fi
 
 # Catches: a stamped setting the comparability check has no flag entry for,
 # which would then refuse every declared flag that moves it.
@@ -3266,7 +3424,7 @@ PY
 )"
 hz_n="$(sed -n 's/^HEALTHZ phase=concurrent-1 port=4319 n=\([0-9]*\) .*/\1/p' "$BOX_Y/kit/out/healthz.txt" 2>/dev/null)"
 if [ "$code" = 0 ] && [ "$in_window" = 0 ] && [ -z "$out" ] && [ "${hz_n:-0}" -ge 4 ] \
-  && grep -Eq '^HEARTBEAT phase=concurrent-1 n=[1-9][0-9]* failures=0 max_s=0.500$' "$BOX_Y/kit/out/healthz.txt"; then
+  && grep -Eq '^HEARTBEAT phase=concurrent-1 n=[1-9][0-9]* failures=0 bad=0 max_s=0.500$' "$BOX_Y/kit/out/healthz.txt"; then
   pass "a concurrent round starts no python3 in its timed window, with the healthz sampler running through it, and still reports wrong answers after it"
 else
   fail "concurrent harness cost" "exit $code, python3 started $in_window times in the window, healthz n '$hz_n': $(head -n 2 "$STUB_DIR/py-window" 2>/dev/null) $out $(tail -n 3 "$TMP/py-window.log")"

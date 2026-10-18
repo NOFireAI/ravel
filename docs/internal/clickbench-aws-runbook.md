@@ -112,7 +112,7 @@ cat > /tmp/trust.json <<'EOF'
 }
 EOF
 
-aws iam create-role --role-name ravel-clickbench-box \
+aws iam create-role --role-name ravel-clickbench-instance-role \
   --assume-role-policy-document file:///tmp/trust.json
 
 ACCT=$(aws sts get-caller-identity --query Account --output text)
@@ -151,23 +151,24 @@ cat > /tmp/ssm-read.json <<EOF
 }
 EOF
 
-aws iam put-role-policy --role-name ravel-clickbench-box \
+aws iam put-role-policy --role-name ravel-clickbench-instance-role \
   --policy-name ssm-read --policy-document file:///tmp/ssm-read.json
 
 aws iam create-instance-profile --instance-profile-name ravel-clickbench-instance-profile
 aws iam add-role-to-instance-profile \
-  --instance-profile-name ravel-clickbench-instance-profile --role-name ravel-clickbench-box
+  --instance-profile-name ravel-clickbench-instance-profile \
+  --role-name ravel-clickbench-instance-role
 ```
 
 The profile's name, `ravel-clickbench-instance-profile`, is the one
 `benchmarks/clickbench/kit/run.example.toml` gives `instance_profile`; the
-role inside it is `ravel-clickbench-box`.
+role inside it is `ravel-clickbench-instance-role`.
 
 Add `AmazonSSMManagedInstanceCore` as well if you want Session Manager shell
 access instead of SSH:
 
 ```sh
-aws iam attach-role-policy --role-name ravel-clickbench-box \
+aws iam attach-role-policy --role-name ravel-clickbench-instance-role \
   --policy-arn arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
 ```
 
@@ -710,10 +711,13 @@ and on port 4319 (the health listener), each every 250 ms, and a
 `GET /metrics` on port 4318 every 1 s that reads
 `ravel_health_heartbeat_age_seconds`, each with a 2 s timeout. A `/healthz`
 timeout or non-200 counts as a 2000 ms sample and as a failure; a `/metrics`
-scrape that fails or carries no heartbeat age counts as a 2 s age and as a
-failure, since a stalled runtime is exactly when the scrape fails. The
-sampler is
-started before the phase and talks to `run.sh` through a gate file that
+scrape that times out or hits a transport error counts as a 2 s age and as a
+failure, since a stalled runtime is exactly when the scrape fails. A scrape
+that answered with a non-200 or without the heartbeat age is a bad scrape:
+it is counted separately and adds no age, and a phase whose every answered
+scrape was bad is refused, since its heartbeat age was never read. Each raw
+sample carries a monotonic `mono` timestamp beside the wall-clock `t`. The
+sampler is started before the phase and talks to `run.sh` through a gate file that
 `run.sh` writes with shell builtins only, so it forks nothing inside a
 statement's timed window; the gate is closed while the server is stopped on
 purpose (each cold restart, each round's restart), and a sample counts only
@@ -725,16 +729,18 @@ which `evidence.tgz` carries. After each phase `out/healthz.txt` gains
 
 ```
 HEALTHZ phase=<phase> port=<4318|4319> n=<samples> p50_ms=<ms> p99_ms=<ms> max_ms=<ms> failures=<n>
-HEARTBEAT phase=<phase> n=<scrapes> failures=<n> max_s=<seconds>
+HEARTBEAT phase=<phase> n=<scrapes> failures=<n> bad=<n> max_s=<seconds>
 ```
 
 with `<phase>` `benchmark` or `concurrent-<N>`, and `run.log` carries the
 same lines. Step `healthz` then requires each phase's three lines exactly
 once in `out/healthz.txt`, each counting at least one sample and no more
-failures than samples: a line missing, repeated or empty fails the box at
-that step. `results.json`'s `healthz` block holds the same figures
-(`heartbeat_n`, `heartbeat_failures` and `heartbeat_max_s` for the HEARTBEAT
-line). `run.toml`'s optional `healthz_phases` (default
+failures than samples (for HEARTBEAT, no more failures and bad scrapes
+together than scrapes, and at least one usable scrape when any was bad): a
+line missing, repeated or empty fails the box at that step.
+`results.json`'s `healthz` block holds the same figures (`heartbeat_n`,
+`heartbeat_failures`, `heartbeat_bad` and `heartbeat_max_s` for the
+HEARTBEAT line). `run.toml`'s optional `healthz_phases` (default
 `["benchmark", "concurrent"]`, the only two values it takes) names the
 phases the sampler runs in, so a run can leave the `benchmark` phase
 unsampled; a run that samples no phase has an empty `out/healthz.txt` and a
@@ -1326,10 +1332,12 @@ B=$(aws ssm get-parameter --name /ravel-clickbench/bucket \
   --query Parameter.Value --output text)
 
 aws iam remove-role-from-instance-profile \
-  --instance-profile-name ravel-clickbench-instance-profile --role-name ravel-clickbench-box
+  --instance-profile-name ravel-clickbench-instance-profile \
+  --role-name ravel-clickbench-instance-role
 aws iam delete-instance-profile --instance-profile-name ravel-clickbench-instance-profile
-aws iam delete-role-policy --role-name ravel-clickbench-box --policy-name ssm-read
-aws iam delete-role --role-name ravel-clickbench-box
+aws iam delete-role-policy --role-name ravel-clickbench-instance-role \
+  --policy-name ssm-read
+aws iam delete-role --role-name ravel-clickbench-instance-role
 
 aws iam delete-user-policy --user-name ravel-clickbench --policy-name ravel-clickbench-s3
 aws iam list-access-keys --user-name ravel-clickbench \

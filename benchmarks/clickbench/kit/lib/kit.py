@@ -51,8 +51,9 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                BASE_4318/metrics every 1 s into DIR, until
                                killed
   healthz-summary PHASE DIR    print PHASE's HEALTHZ line per port and its
-                               HEARTBEAT line (scrapes, failed scrapes, max
-                               age) from DIR's gated samples
+                               HEARTBEAT line (scrapes, unanswered scrapes,
+                               answered but unusable scrapes, max age) from
+                               DIR's gated samples
   healthz-check FILE PHASE...  refuse FILE unless it holds each PHASE's
                                HEALTHZ and HEARTBEAT lines exactly once, else
                                print the results.json healthz block
@@ -182,12 +183,16 @@ KIT_SET_FLAGS = (
     "--store", "--shards", "--listen-http", "--listen-health", "--memory-budget-bytes",
     "--audit-mode", "--audit-text", "--tenant-token-file", "--tenant-hash-unkeyed",
 )
-# The ravel-server flags that can move each STAMPED_SETTINGS value, from
-# resolve_performance_defaults in services/ravel-server/src/config.rs. The
-# server logs each value's source but not the flag's name, so the mapping
-# lives here. --memory-budget-bytes moves the cache ceilings too, but the kit
-# sets it, so base_flags already pins it. A setting missing here never
-# differs between comparable arms.
+# For each STAMPED_SETTINGS value, the flag that sets it directly and, for the
+# two SQL pools, the flag on the other pool that resolve_performance_defaults
+# in services/ravel-server/src/config.rs reconciles it against. The server
+# logs each value's source but not the flag's name, so the mapping lives here.
+# It is not every flag that can move a value: --memory-budget-bytes (which the
+# kit sets, so base_flags pins it), --cache-max-bytes,
+# --catalog-cache-max-bytes, --disable-cache and --mode gateway also move the
+# derived pools through the memory remainder. The check fails closed for
+# those: a value they move differs with no entry here to explain it, or not as
+# an entry here would move it, and is refused.
 SETTING_FLAGS = {
     "cache_max_bytes": ("--cache-max-bytes",),
     "catalog_cache_max_bytes": ("--catalog-cache-max-bytes",),
@@ -249,7 +254,8 @@ STAMPED_SETTINGS = (
 # design. check_comparable compares server_flags' base_flags and extra_flags
 # itself. For arms whose declared extra flags differ, a server_settings key may
 # differ only when SETTING_FLAGS names a flag for it that the two arms'
-# declared lists set differently; every other difference is refused.
+# declared lists set differently, and then only to the value that flag
+# resolves it to; every other difference is refused.
 COMPARABLE = (
     "corpus_digest.dataset_sha256",
     "corpus_digest.mapping_sha256",
@@ -498,26 +504,96 @@ def _flag_values(flags):
     return out
 
 
+def _setting_flag_value(flags, flag, arm):
+    """The whole number ARM's parsed extra FLAGS give FLAG, None when they do
+    not give it."""
+    given = flags.get(flag)
+    if given is None:
+        return None
+    if len(given) != 1 or len(given[0]) != 1 or not re.match(r"^[0-9]+$", given[0][0]):
+        raise Refusal("arms are not comparable: %s's declared extra flags give %s %r, not one "
+                      "whole number, so the kit cannot tell what it sets"
+                      % (arm, flag, [" ".join(v) for v in given]))
+    return int(given[0][0])
+
+
+def _setting_rule(k, flags, arm):
+    """How ARM's parsed extra FLAGS resolve server setting K, as
+    resolve_performance_defaults does, against U, the value K holds with
+    neither of its SETTING_FLAGS set (the same on both arms): ("exact", v) is
+    v whatever U is, ("unflagged", None) is U, ("raise", v) is max(U, v) and
+    ("clamp", v) is min(U, v). The third element says why, for a refusal."""
+    names = SETTING_FLAGS[k]
+    d = _setting_flag_value(flags, names[0], arm)
+    o = _setting_flag_value(flags, names[1], arm) if len(names) > 1 else None
+    if d is not None:
+        if k == "sql_max_query_bytes" and o is not None and d > o:
+            return ("exact", o, "%s's %s %d is clamped to its %s %d"
+                    % (arm, names[0], d, names[1], o))
+        return ("exact", d, "%s's %s %d sets it to %d" % (arm, names[0], d, d))
+    if o is None:
+        return ("unflagged", None, "%s sets no %s, so it holds the unflagged value"
+                % (arm, " or ".join(names)))
+    if k == "sql_tenant_max_bytes":
+        return ("raise", o, "%s's %s %d raises it to %d only from an unflagged value below %d"
+                % (arm, names[1], o, o, o))
+    return ("clamp", o, "%s's %s %d clamps it to %d only from an unflagged value above %d"
+            % (arm, names[1], o, o, o))
+
+
+def _check_setting(k, a_val, b_val, fa, fb):
+    """Refuse server setting K unless some unflagged value, shared by both
+    arms, resolves to A_VAL under arm A's parsed extra flags FA and to B_VAL
+    under arm B's FB."""
+    lo, hi, ok, why = 0, None, True, []
+    for arm, v, flags in (("A", a_val, fa), ("B", b_val, fb)):
+        if not isinstance(v, int) or isinstance(v, bool):
+            raise Refusal("arms are not comparable: provenance.server_settings.%s is %r on %s, "
+                          "not a whole number" % (k, v, arm))
+        kind, f, reason = _setting_rule(k, flags, arm)
+        why.append(reason)
+        if kind == "exact":
+            ok = ok and v == f
+        elif kind != "unflagged" and v == f:
+            # The unflagged value may sit anywhere on the far side of f.
+            if kind == "raise":
+                hi = f if hi is None else min(hi, f)
+            else:
+                lo = max(lo, f)
+        elif (kind == "raise" and v < f) or (kind == "clamp" and v > f):
+            ok = False
+        else:
+            lo, hi = max(lo, v), v if hi is None else min(hi, v)
+    if not ok or (hi is not None and lo > hi):
+        raise Refusal("arms are not comparable: provenance.server_settings.%s is A %r, B %r, "
+                      "which the declared extra flags do not resolve it to: %s"
+                      % (k, a_val, b_val, "; ".join(why)))
+
+
 def _setting_differences(va, vb, extra_a, extra_b):
     """The accepted server_settings differences between two arms, one
-    "KEY A x B y" string each. A key may differ only when a flag SETTING_FLAGS
-    names for it is set differently by the arms' extra flags."""
+    "KEY A x B y" string each. A key whose SETTING_FLAGS the arms' extra flags
+    set differently must hold, on each arm, exactly the value those flags
+    resolve it to; any other key may not differ."""
     fa, fb = _flag_values(extra_a), _flag_values(extra_b)
     moved = set(f for f in set(fa) | set(fb) if fa.get(f) != fb.get(f))
     out = []
     for k in sorted(set(va) | set(vb)):
         a_val, b_val = va.get(k), vb.get(k)
-        if a_val == b_val:
+        touched = k in SETTING_FLAGS and moved.intersection(SETTING_FLAGS[k])
+        if a_val == b_val and not touched:
             continue
         if k not in SETTING_FLAGS:
             raise Refusal("arms are not comparable: provenance.server_settings.%s differs "
                           "(A %r, B %r), and the kit knows no flag that sets it"
                           % (k, a_val, b_val))
-        if not moved.intersection(SETTING_FLAGS[k]):
+        if not touched:
             raise Refusal("arms are not comparable: provenance.server_settings.%s differs "
                           "(A %r, B %r), and the declared extra flags do not set %s differently"
                           % (k, a_val, b_val, " or ".join(SETTING_FLAGS[k])))
-        out.append("%s A %r B %r" % (k, a_val, b_val))
+        _check_setting(k, a_val, b_val, fa, fb)
+        if a_val != b_val:
+            out.append("%s A %r B %r" % (k, a_val, b_val))
     return out
 
 
@@ -727,8 +803,9 @@ def check_comparable(a, b, declared=None):
     DECLARED (run.toml's server_flags_a and server_flags_b), must be exactly
     those lists. For arms whose extra flags differ that way, a server_settings
     key may differ only when one of its SETTING_FLAGS is set differently by
-    those lists. Returns one line per accepted difference, empty when there is
-    none."""
+    those lists, and such a key must hold on each arm exactly the value that
+    arm's list resolves it to. Returns one line per accepted difference, empty
+    when there is none."""
     pa, pb = a["provenance"], b["provenance"]
     flags = {}
     for part in ("base_flags", "extra_flags"):
@@ -755,12 +832,13 @@ def check_comparable(a, b, declared=None):
         if va in (None, "") or vb in (None, ""):
             raise Refusal("arms are not comparable: provenance.%s is missing on %s"
                           % (field, "A" if va in (None, "") else "B"))
-        if va == vb:
-            continue
         if field == "server_settings" and extra_a != extra_b and isinstance(va, dict) \
                 and isinstance(vb, dict):
-            notes.append("server_settings differs with them: %s"
-                         % ", ".join(_setting_differences(va, vb, extra_a, extra_b)))
+            moved = _setting_differences(va, vb, extra_a, extra_b)
+            if moved:
+                notes.append("server_settings differs with them: %s" % ", ".join(moved))
+            continue
+        if va == vb:
             continue
         raise _differs(field, va, vb)
     if pa["band_sections"] != pb["band_sections"]:
@@ -1151,7 +1229,7 @@ HEALTHZ_LINE_RE = re.compile(
     r"^HEALTHZ phase=(\S+) port=(\S+) n=([0-9]+) p50_ms=([0-9.]+) p99_ms=([0-9.]+) "
     r"max_ms=([0-9.]+) failures=([0-9]+)$")
 HEARTBEAT_LINE_RE = re.compile(
-    r"^HEARTBEAT phase=(\S+) n=([0-9]+) failures=([0-9]+) max_s=([0-9.]+)$")
+    r"^HEARTBEAT phase=(\S+) n=([0-9]+) failures=([0-9]+) bad=([0-9]+) max_s=([0-9.]+)$")
 
 
 def _gate(path):
@@ -1180,7 +1258,8 @@ def _heartbeat(body):
 
 def _probe(opener, url, metrics):
     """One GET with HEALTHZ_TIMEOUT_S as the client timeout. A non-200, a
-    transport error or an answer slower than the timeout is not ok."""
+    transport error or an answer slower than the timeout is not ok; answered
+    is whether any HTTP status came back within the timeout."""
     import urllib.error
     rec = {"status": 0, "ok": False, "error": ""}
     t0 = time.monotonic()
@@ -1195,6 +1274,7 @@ def _probe(opener, url, metrics):
     except Exception as e:  # every transport failure is a failed sample
         rec["error"] = "%s: %s" % (type(e).__name__, e)
     ms = (time.monotonic() - t0) * 1000.0
+    rec["answered"] = rec["status"] != 0 and ms <= HEALTHZ_TIMEOUT_S * 1000.0
     if rec["status"] == 200 and not rec["error"]:
         if ms > HEALTHZ_TIMEOUT_S * 1000.0:
             rec["error"] = "answered after %.0f ms, past the %.0f ms timeout" % (
@@ -1250,7 +1330,8 @@ def healthz_sampler(d, gate, ack, base_4318, base_4319):
             rec = _probe(opener, url, metrics)
             g1 = _gate(gate)
             gated = g0 is not None and g0 == g1
-            rec.update(t=round(wall, 3), gen=g0 if gated else None, gated=gated)
+            rec.update(t=round(wall, 3), mono=round(t0, 3), gen=g0 if gated else None,
+                       gated=gated)
             os.write(fd, (json.dumps(rec, sort_keys=True) + "\n").encode("utf-8"))
             if gated:
                 sampled = g0
@@ -1282,9 +1363,13 @@ def _nearest_rank(sorted_ms, q):
 def healthz_summary(phase, d):
     """The HEALTHZ line per port and the HEARTBEAT line for one phase, from
     the gated samples under DIR. A failed sample (a timeout, a non-200 or a
-    transport error) counts as HEALTHZ_TIMEOUT_S and as a failure, and so
-    does a /metrics scrape that fails or carries no heartbeat age: a stalled
-    runtime is when the scrape fails, so it must not vanish from max_s."""
+    transport error) counts as HEALTHZ_TIMEOUT_S and as a failure. A /metrics
+    scrape that got no answer within the timeout counts as HEALTHZ_TIMEOUT_S
+    of heartbeat age and as a failure: a stalled runtime is when the scrape
+    fails, so it must not vanish from max_s. A scrape answered with a non-200
+    or without a heartbeat age says nothing about a stall; it is counted as
+    bad and kept out of max_s, and a phase in which every answered scrape was
+    bad is refused, since its endpoint is misconfigured."""
     lines = []
     for port in HEALTHZ_PORTS:
         recs = _gated(os.path.join(d, port + ".jsonl"))
@@ -1299,12 +1384,21 @@ def healthz_summary(phase, d):
     if not scrapes:
         raise Refusal("healthz-summary: %s/metrics.jsonl holds no gated scrape for phase %s"
                       % (d, phase))
-    ages = [float(r["heartbeat_s"]) if r.get("ok") and _num(r.get("heartbeat_s"))
-            else None for r in scrapes]
-    failures = sum(1 for a in ages if a is None)
-    lines.append("HEARTBEAT phase=%s n=%d failures=%d max_s=%.3f"
-                 % (phase, len(ages), failures,
-                    max(HEALTHZ_TIMEOUT_S if a is None else a for a in ages)))
+    ages, failures, bad = [], 0, []
+    for r in scrapes:
+        if r.get("ok") and _num(r.get("heartbeat_s")):
+            ages.append(float(r["heartbeat_s"]))
+        elif r.get("answered") is True:
+            bad.append(r.get("error") or "HTTP %s" % r.get("status"))
+        else:
+            failures += 1
+            ages.append(HEALTHZ_TIMEOUT_S)
+    if bad and len(ages) == failures:
+        raise Refusal("healthz-summary: every answered /metrics scrape for phase %s in %s was "
+                      "unusable (%s), so the heartbeat age was never read"
+                      % (phase, d, "; ".join(sorted(set(bad)))))
+    lines.append("HEARTBEAT phase=%s n=%d failures=%d bad=%d max_s=%.3f"
+                 % (phase, len(scrapes), failures, len(bad), max(ages)))
     return lines
 
 
@@ -1318,7 +1412,7 @@ def healthz_check(path, phases):
             want[("HEALTHZ", phase, port)] = 0
         want[("HEARTBEAT", phase, None)] = 0
     block = dict((p, {"ports": {}, "heartbeat_max_s": None, "heartbeat_n": None,
-                      "heartbeat_failures": None}) for p in phases)
+                      "heartbeat_failures": None, "heartbeat_bad": None}) for p in phases)
     try:
         lines = open(path).read().splitlines()
     except OSError as e:
@@ -1335,6 +1429,15 @@ def healthz_check(path, phases):
             raise Refusal("healthz-check: %s:%d counts %d samples and %d failures; it needs at "
                           "least one sample and no more failures than samples"
                           % (path, n, count, failures))
+        bad = int(h.group(4)) if h else 0
+        if failures + bad > count:
+            raise Refusal("healthz-check: %s:%d counts %d scrapes, %d failures and %d bad; it "
+                          "needs no more failures and bad scrapes together than scrapes"
+                          % (path, n, count, failures, bad))
+        if bad and failures + bad == count:
+            raise Refusal("healthz-check: %s:%d counts %d bad scrapes and no usable one; every "
+                          "answered scrape was unusable, so the heartbeat age was never read"
+                          % (path, n, bad))
         want[key] += 1
         if m:
             block[key[1]]["ports"][key[2]] = {
@@ -1342,7 +1445,7 @@ def healthz_check(path, phases):
                 "max_ms": float(m.group(6)), "failures": failures}
         else:
             block[key[1]].update(heartbeat_n=count, heartbeat_failures=failures,
-                                 heartbeat_max_s=float(h.group(4)))
+                                 heartbeat_bad=bad, heartbeat_max_s=float(h.group(5)))
     wrong = ["%s phase=%s%s %d times" % (k[0], k[1], " port=%s" % k[2] if k[2] else "", c)
              for k, c in sorted(want.items(), key=lambda kv: str(kv[0])) if c != 1]
     if wrong:
