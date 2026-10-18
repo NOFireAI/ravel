@@ -2312,8 +2312,8 @@ alone:
 #### IPCrypt values (`ravel_ingest_ipcrypt_values_total`)
 
 `ravel_ingest_ipcrypt_values_total{mode, signal, variant, outcome}` counts
-the values an `--ipcrypt-config` rule applied to (ADR-2993 decision 3), one
-per ruled value stored. [Pseudonymization (IPCrypt)](../ingest.md#pseudonymization-ipcrypt)
+the values an `--ipcrypt-config` rule applied to, one per ruled value
+stored. [Pseudonymization (IPCrypt)](../ingest.md#pseudonymization-ipcrypt)
 describes the policy.
 
 - `signal` is `metrics`, `logs` or `spans`. `variant` is `deterministic` or
