@@ -1086,7 +1086,145 @@ mod tests {
         label_bytes(key.len(), charged * 2)
     }
 
-    use opentelemetry_proto::tonic::trace::v1::span::Event;
+    fn client_ip(value: &str) -> KeyValue {
+        KeyValue {
+            key: "client.ip".to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyValueVariant::StringValue(value.to_string())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn span_with(events: Vec<Event>, links: Vec<Link>) -> Span {
+        Span {
+            trace_id: vec![0xab; 16],
+            span_id: vec![0xcd; 8],
+            name: "op".to_string(),
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            events,
+            links,
+            ..Default::default()
+        }
+    }
+
+    /// The stored attributes of `span` normalized alone under `rules`.
+    fn stored_attrs(
+        span: Span,
+        limits: &SpanIngestLimits,
+        rules: &TenantRules,
+    ) -> Vec<(String, String)> {
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let out = crate::normalize_traces(req, limits, rules, 5_000);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.spans.len(), 1);
+        out.spans.into_iter().flat_map(|s| s.attrs).collect()
+    }
+
+    fn stored_len(attrs: &[(String, String)], key: &str) -> Option<usize> {
+        attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.len())
+    }
+
+    /// A 9-byte address under `client.ip` in an event and in a link. The
+    /// event is that one attribute: a 24-byte `KeyValue`, 26 bytes as a
+    /// field, 27 with the event's own length prefix. The link adds its
+    /// 16-byte trace id and 8-byte span id (28 bytes as fields), 55 in all.
+    /// Padding the value from 9 to 47 bytes grows the string, the `AnyValue`
+    /// and the `KeyValue` fields by 38 each with no prefix crossing a varint
+    /// boundary, so each blob is charged 38 bytes more: 65 and 93 bytes, hex
+    /// doubled. The stored blobs, holding the ciphertext, fit the charge.
+    #[test]
+    fn blob_bytes_charges_ruled_event_and_link_attributes_exactly() {
+        let rules = rules_on(&["client.ip"]);
+        let limits = SpanIngestLimits::default();
+        let event = Event {
+            attributes: vec![client_ip("192.0.2.1")],
+            ..Default::default()
+        };
+        let link = Link {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            attributes: vec![client_ip("192.0.2.2")],
+            ..Default::default()
+        };
+        let span = span_with(vec![event], vec![link]);
+
+        let unruled = TenantRules::none();
+        assert_eq!(
+            reserved_attrs_bytes(&span, &limits, &unruled),
+            label_bytes(ATTR_EVENTS_RAW.len(), 2 * 27) + label_bytes(ATTR_LINKS_RAW.len(), 2 * 55)
+        );
+        let events_charge = label_bytes(ATTR_EVENTS_RAW.len(), 2 * 65);
+        let links_charge = label_bytes(ATTR_LINKS_RAW.len(), 2 * 93);
+        assert_eq!(
+            blob_bytes(ATTR_EVENTS_RAW, &span.events, &limits, &rules, |e| &e
+                .attributes),
+            events_charge
+        );
+        assert_eq!(
+            blob_bytes(ATTR_LINKS_RAW, &span.links, &limits, &rules, |l| &l
+                .attributes),
+            links_charge
+        );
+        assert_eq!(
+            reserved_attrs_bytes(&span, &limits, &rules),
+            events_charge + links_charge
+        );
+
+        let attrs = stored_attrs(span, &limits, &rules);
+        let events_len = stored_len(&attrs, ATTR_EVENTS_RAW).expect("events blob kept");
+        let links_len = stored_len(&attrs, ATTR_LINKS_RAW).expect("links blob kept");
+        assert!(events_len <= 2 * 65, "{events_len}");
+        assert!(links_len <= 2 * 93, "{links_len}");
+    }
+
+    /// A 19-byte hostname under `client.ip` in an event: 37 bytes stored
+    /// unchanged (it does not parse as an address), 65 once padded to 47.
+    /// Under a 50-byte cap the normalizer keeps the 37-byte blob, and the
+    /// projection, which cannot tell a hostname from an address, charges the
+    /// cap rather than nothing.
+    #[test]
+    fn blob_bytes_charges_the_cap_when_padding_crosses_it() {
+        let rules = rules_on(&["client.ip"]);
+        let limits = SpanIngestLimits {
+            max_raw_blob_len: 50,
+            ..SpanIngestLimits::default()
+        };
+        let event = Event {
+            attributes: vec![client_ip("db.example.internal")],
+            ..Default::default()
+        };
+        let events = vec![event];
+        assert_eq!(
+            blob_bytes(
+                ATTR_EVENTS_RAW,
+                &events,
+                &limits,
+                &TenantRules::none(),
+                |e| { &e.attributes }
+            ),
+            label_bytes(ATTR_EVENTS_RAW.len(), 2 * 37)
+        );
+        assert_eq!(
+            blob_bytes(ATTR_EVENTS_RAW, &events, &limits, &rules, |e| &e.attributes),
+            label_bytes(ATTR_EVENTS_RAW.len(), 2 * 50)
+        );
+
+        let attrs = stored_attrs(span_with(events, vec![]), &limits, &rules);
+        assert_eq!(stored_len(&attrs, ATTR_EVENTS_RAW), Some(2 * 37));
+    }
+
+    use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use proptest::prelude::*;
 
     const RULED: [&str; 2] = ["client.ip", "peer"];
