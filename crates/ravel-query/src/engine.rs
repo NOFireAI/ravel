@@ -4880,6 +4880,21 @@ impl MergedSource {
     }
 }
 
+/// Index range of the samples inside the inclusive `window`, found by two
+/// binary searches. `samples` must be ascending by timestamp (the
+/// `SeriesSource` contract); equal timestamps stay together because both
+/// searches compare against the bound value. An inverted window yields an
+/// empty range.
+fn window_slice<T>(
+    samples: &[T],
+    ts_ns: impl Fn(&T) -> i64,
+    window: TimeRange,
+) -> std::ops::Range<usize> {
+    let lo = samples.partition_point(|sm| ts_ns(sm) < window.start_ns);
+    let hi = samples.partition_point(|sm| ts_ns(sm) <= window.end_ns);
+    lo..hi.max(lo)
+}
+
 impl SeriesSource for MergedSource {
     fn query(
         &self,
@@ -4911,12 +4926,7 @@ impl SeriesSource for MergedSource {
             .filter(|s| label_matchers.iter().all(|m| m.is_match(&s.labels)))
             .map(|s| SeriesData {
                 labels: s.labels.clone(),
-                samples: s
-                    .samples
-                    .iter()
-                    .filter(|sm| sm.ts_ns >= window.start_ns && sm.ts_ns <= window.end_ns)
-                    .copied()
-                    .collect(),
+                samples: s.samples[window_slice(&s.samples, |sm| sm.ts_ns, window)].to_vec(),
             })
             .collect())
     }
@@ -4936,12 +4946,7 @@ impl SeriesSource for MergedSource {
             .filter(|s| matches_series(matchers, &s.labels))
             .map(|s| HistogramSeriesData {
                 labels: s.labels.clone(),
-                samples: s
-                    .samples
-                    .iter()
-                    .filter(|sm| sm.ts_ns >= window.start_ns && sm.ts_ns <= window.end_ns)
-                    .cloned()
-                    .collect(),
+                samples: s.samples[window_slice(&s.samples, |sm| sm.ts_ns, window)].to_vec(),
             })
             .collect())
     }
@@ -5475,6 +5480,203 @@ mod merge_tests {
                 .collect();
             let want = values.iter().map(|v| v.to_bits()).max().expect("non-empty");
             prop_assert_eq!(winner_bits(segments), want);
+        }
+    }
+
+    // --- Window clip (ADR-3072 decision 1a) ---
+    //
+    // `MergedSource::query` and `query_histograms` clip each series by binary
+    // search; these compare that clip against the inclusive linear filter it
+    // replaced, kept here as the reference.
+
+    /// The reference clip: every sample with `start <= ts <= end`, in order.
+    fn linear_clip<T: Clone>(samples: &[T], ts_ns: impl Fn(&T) -> i64, w: TimeRange) -> Vec<T> {
+        samples
+            .iter()
+            .filter(|sm| ts_ns(sm) >= w.start_ns && ts_ns(sm) <= w.end_ns)
+            .cloned()
+            .collect()
+    }
+
+    fn clip_value_strategy() -> impl Strategy<Value = f64> {
+        prop_oneof![
+            6 => value_strategy(),
+            1 => Just(f64::from_bits(0x7ff8_0000_0000_0001)),
+        ]
+    }
+
+    /// Ascending samples with runs of equal timestamps (a zero gap repeats
+    /// the previous timestamp, as a log-derived series may).
+    fn sorted_samples_strategy() -> impl Strategy<Value = Vec<Sample>> {
+        (
+            -5i64..5,
+            prop::collection::vec((0i64..3, clip_value_strategy()), 0..=200),
+        )
+            .prop_map(|(base, steps)| {
+                let mut ts = base;
+                steps
+                    .into_iter()
+                    .map(|(gap, value)| {
+                        ts += gap;
+                        Sample { ts_ns: ts, value }
+                    })
+                    .collect()
+            })
+    }
+
+    /// Windows before, inside, on, and after the samples, including a
+    /// single-instant window, an inverted one, and the `i64` extremes.
+    fn clip_window_strategy() -> impl Strategy<Value = TimeRange> {
+        let bound = || {
+            prop_oneof![
+                10 => -12i64..420,
+                1 => Just(i64::MIN),
+                1 => Just(i64::MAX),
+            ]
+        };
+        prop_oneof![
+            3 => (bound(), bound()).prop_map(|(a, b)| TimeRange {
+                start_ns: a.min(b),
+                end_ns: a.max(b),
+            }),
+            1 => bound().prop_map(|t| TimeRange { start_ns: t, end_ns: t }),
+            1 => (bound(), bound()).prop_map(|(a, b)| TimeRange { start_ns: a, end_ns: b }),
+        ]
+    }
+
+    fn sample_bits(samples: &[Sample]) -> Vec<(i64, u64)> {
+        samples
+            .iter()
+            .map(|s| (s.ts_ns, s.value.to_bits()))
+            .collect()
+    }
+
+    fn histogram_with_sum(sum: f64) -> FloatHistogram {
+        FloatHistogram {
+            counter_reset_hint: ravel_promql::ResetHint::Unknown,
+            scale: 0,
+            zero_threshold: 0.0,
+            zero_count: 0.0,
+            count: 1.0,
+            sum,
+            positive_spans: Vec::new(),
+            negative_spans: Vec::new(),
+            positive_buckets: Vec::new(),
+            negative_buckets: Vec::new(),
+            custom_values: Vec::new(),
+        }
+    }
+
+    fn histogram_bits(samples: &[ravel_promql::HistogramSample]) -> Vec<(i64, u64)> {
+        samples
+            .iter()
+            .map(|s| (s.ts_ns, s.value.sum.to_bits()))
+            .collect()
+    }
+
+    /// An equal-timestamp run sitting on either bound comes back whole.
+    #[test]
+    fn query_keeps_equal_timestamp_runs_whole_at_both_bounds() {
+        let samples: Vec<Sample> = [
+            (1, 1.0),
+            (2, 2.0),
+            (2, 3.0),
+            (3, 4.0),
+            (4, 5.0),
+            (4, 6.0),
+            (5, 7.0),
+        ]
+        .into_iter()
+        .map(|(ts_ns, value)| Sample { ts_ns, value })
+        .collect();
+        let source = MergedSource {
+            series: vec![SeriesData {
+                labels: labels(1),
+                samples,
+            }],
+            histogram_series: Vec::new(),
+            log_series: Vec::new(),
+            precomputed_count: None,
+        };
+        let got = source
+            .query(
+                &[],
+                TimeRange {
+                    start_ns: 2,
+                    end_ns: 4,
+                },
+            )
+            .expect("query");
+        let want: Vec<(i64, u64)> = [(2, 2.0), (2, 3.0), (3, 4.0), (4, 5.0), (4, 6.0)]
+            .into_iter()
+            .map(|(ts, v): (i64, f64)| (ts, v.to_bits()))
+            .collect();
+        assert_eq!(sample_bits(&got[0].samples), want);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// Two series in the pool, every one matched: each comes back in pool
+        /// order with exactly the samples the linear filter keeps, bit for bit.
+        #[test]
+        fn query_clips_by_binary_search_like_the_linear_filter(
+            a in sorted_samples_strategy(),
+            b in sorted_samples_strategy(),
+            window in clip_window_strategy(),
+        ) {
+            let source = MergedSource {
+                series: vec![
+                    SeriesData { labels: labels(1), samples: a.clone() },
+                    SeriesData { labels: labels(2), samples: b.clone() },
+                ],
+                histogram_series: Vec::new(),
+                log_series: Vec::new(),
+                precomputed_count: None,
+            };
+            let got = source.query(&[], window).expect("query");
+            prop_assert_eq!(got.len(), 2);
+            for (out, (want_labels, input)) in got.iter().zip([(labels(1), &a), (labels(2), &b)]) {
+                prop_assert_eq!(&out.labels, &want_labels);
+                prop_assert_eq!(
+                    sample_bits(&out.samples),
+                    sample_bits(&linear_clip(input, |s| s.ts_ns, window))
+                );
+            }
+        }
+
+        /// The histogram channel clips through the same bounds.
+        #[test]
+        fn query_histograms_clips_the_same_way(
+            a in sorted_samples_strategy(),
+            b in sorted_samples_strategy(),
+            window in clip_window_strategy(),
+        ) {
+            let to_histograms = |samples: &[Sample]| -> Vec<ravel_promql::HistogramSample> {
+                samples
+                    .iter()
+                    .map(|s| ravel_promql::HistogramSample { ts_ns: s.ts_ns, value: histogram_with_sum(s.value) })
+                    .collect()
+            };
+            let (ha, hb) = (to_histograms(&a), to_histograms(&b));
+            let source = MergedSource {
+                series: Vec::new(),
+                histogram_series: vec![
+                    HistogramSeriesData { labels: labels(1), samples: ha.clone() },
+                    HistogramSeriesData { labels: labels(2), samples: hb.clone() },
+                ],
+                log_series: Vec::new(),
+                precomputed_count: None,
+            };
+            let got = source.query_histograms(&[], window).expect("query");
+            prop_assert_eq!(got.len(), 2);
+            for (out, (want_labels, input)) in got.iter().zip([(labels(1), &ha), (labels(2), &hb)]) {
+                prop_assert_eq!(&out.labels, &want_labels);
+                prop_assert_eq!(
+                    histogram_bits(&out.samples),
+                    histogram_bits(&linear_clip(input, |s| s.ts_ns, window))
+                );
+            }
         }
     }
 }
