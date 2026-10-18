@@ -222,6 +222,7 @@ pub async fn run(
     zstd_level: RlogZstdLevel,
     load_memory_bytes: Option<u64>,
     fold_after_load: bool,
+    ipcrypt: &IpcryptPolicy,
     now_ns: i64,
 ) -> anyhow::Result<()> {
     run_fold_warning_to(
@@ -242,6 +243,7 @@ pub async fn run(
         zstd_level,
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
+        ipcrypt,
         now_ns,
         Arc::new(SystemClock),
         &mut std::io::stderr(),
@@ -343,6 +345,7 @@ pub(crate) async fn run_memory_warning_to(
         zstd_level,
         load_memory,
         false,
+        &IpcryptPolicy::empty(),
         now_ns,
         Arc::new(SystemClock),
         warnings,
@@ -372,6 +375,7 @@ pub(crate) async fn run_fold_warning_to(
     zstd_level: RlogZstdLevel,
     load_memory: LoadMemoryRequest,
     fold_after_load: bool,
+    ipcrypt: &IpcryptPolicy,
     now_ns: i64,
     clock: Arc<dyn Clock>,
     warnings: &mut dyn std::io::Write,
@@ -409,7 +413,15 @@ pub(crate) async fn run_fold_warning_to(
     let mapping_text = std::fs::read_to_string(mapping_path)
         .map_err(|e| anyhow::anyhow!("failed to read --mapping {}: {e}", mapping_path.display()))?;
 
-    let mapping = match parse_mapping_document(&mapping_text, signal)? {
+    let section = parse_mapping_document(&mapping_text, signal)?;
+
+    // Every load reads the marker, with or without --ipcrypt-config, before
+    // its first write; the tenant's rules are built once for the whole run.
+    let rules = ipcrypt
+        .checked_rules(store.as_ref(), tenant, "load", warnings)
+        .await?;
+
+    let mapping = match section {
         MappingSection::Metrics(metrics) => {
             return run_metrics(
                 store,
@@ -428,6 +440,7 @@ pub(crate) async fn run_fold_warning_to(
                 load_memory,
                 now_ns,
                 Arc::clone(&clock),
+                rules,
                 warnings,
             )
             .await;
@@ -450,6 +463,7 @@ pub(crate) async fn run_fold_warning_to(
                 load_memory,
                 now_ns,
                 Arc::clone(&clock),
+                rules,
                 warnings,
             )
             .await;
@@ -487,6 +501,7 @@ pub(crate) async fn run_fold_warning_to(
             zstd_level,
             Some(memory_options),
             fold_after_load,
+            rules,
         )
     })
     .await;
@@ -625,6 +640,7 @@ async fn run_metrics(
     load_memory: LoadMemoryRequest,
     now_ns: i64,
     clock: Arc<dyn Clock>,
+    rules: Arc<TenantRules>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -653,6 +669,7 @@ async fn run_metrics(
             max_flush_delay,
             now_ns,
             clock,
+            rules,
         )
     })
     .await;
@@ -717,6 +734,7 @@ async fn run_spans(
     load_memory: LoadMemoryRequest,
     now_ns: i64,
     clock: Arc<dyn Clock>,
+    rules: Arc<TenantRules>,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<()> {
     check_sequential_levers(
@@ -751,6 +769,7 @@ async fn run_spans(
             max_flush_delay,
             now_ns,
             clock,
+            rules,
         )
     })
     .await;

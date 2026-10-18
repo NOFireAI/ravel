@@ -453,6 +453,7 @@ async fn decode_object_hashes(
         state,
         Arc::new(mapping.clone()),
         LogIngestLimits::default(),
+        Arc::new(TenantRules::none()),
         NOW_NS,
         batch_rows,
         LoadPath::Columnar,
@@ -1817,6 +1818,7 @@ async fn load_with_default_geometry_on(
         RlogZstdLevel::default(),
         Some(LoadMemoryOptions::new(load_memory)),
         false,
+        Arc::new(TenantRules::none()),
     )
     .await
     .expect("load succeeds")
@@ -2082,6 +2084,7 @@ async fn an_explicit_target_turns_the_depth_flush_off() {
             host_total_bytes: Some(GEOMETRY_HOST_BYTES),
         })),
         false,
+        Arc::new(TenantRules::none()),
     );
 
     let parks = GEOMETRY_BATCHES / DEPTH;
@@ -3009,6 +3012,7 @@ async fn a_tail_below_target_is_published_by_the_end_of_input_flush() {
         UNREACHED_REFLUSH_PERIOD,
         None,
         false,
+        Arc::new(TenantRules::none()),
     );
 
     let driver = async {

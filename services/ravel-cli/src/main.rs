@@ -116,6 +116,9 @@ fn command_hashes_tenant(command: &Command) -> bool {
         | Command::ClusteringKey { .. }
         | Command::BloomScope { .. }
         | Command::Load { .. }
+        // `encrypt`/`decrypt` derive the tenant's key from its hash, and
+        // `set-policy`'s fingerprint keys each `[tenants.<id>]` table by it.
+        | Command::Ipcrypt { .. }
         // `export` resolves the catalog under `t/<tenant_hash>/logs/...` from
         // its `--tenant`, exactly as `catalog list` does.
         | Command::Export { .. }
@@ -209,6 +212,9 @@ fn command_is_write(command: &Command) -> bool {
             matches!(command, HoldCommand::Set { .. } | HoldCommand::Clear { .. })
         }
         Command::Erase { command } => matches!(command, EraseCommand::Submit { .. }),
+        // `set-policy` creates or replaces `sys/ipcrypt/policy`; `encrypt`
+        // and `decrypt` only print.
+        Command::Ipcrypt { command } => matches!(command, IpcryptCommand::SetPolicy { .. }),
         // sys/gc is a bucket-root object (see `command_hashes_tenant`), but
         // `gc-config set` still clears this same write gate: see
         // `gc_config_set_refuses_on_marker_less_bucket` and the final report
@@ -368,6 +374,14 @@ enum Command {
     Erase {
         #[command(subcommand)]
         command: EraseCommand,
+    },
+    /// IPCrypt pseudonymization (ADR-2993): encrypt or decrypt addresses
+    /// under a tenant's key, and set the bucket's `sys/ipcrypt/policy`
+    /// marker. Every subcommand reads the deployment key from the global
+    /// `--tenant-hash-key-file`.
+    Ipcrypt {
+        #[command(subcommand)]
+        command: IpcryptCommand,
     },
     /// Inspect an idempotency marker object (ADR-0051 section 5).
     Idem {
@@ -831,6 +845,17 @@ enum Command {
         /// fold's. A load that wrote nothing runs no fold and no check.
         #[arg(long)]
         fold_after_load: bool,
+        /// IPCrypt policy TOML (ADR-2993), the same file the server takes as
+        /// `--ipcrypt-config`. Each ruled address is encrypted before series
+        /// identity, the length caps and encoding: metric labels are matched
+        /// by their sanitized name, log and span attributes by their raw key.
+        /// A policy with rules needs `--tenant-hash-key-file`. Every load,
+        /// with or without this flag, first compares the policy's fingerprint
+        /// with the bucket's `sys/ipcrypt/policy` marker and refuses on a
+        /// mismatch or when the marker cannot be read; with no marker, a
+        /// policy with rules creates it.
+        #[arg(long, value_name = "TOML")]
+        ipcrypt_config: Option<std::path::PathBuf>,
     },
     /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
@@ -1542,9 +1567,23 @@ enum EraseCommand {
         #[arg(long, default_value = "")]
         reason: String,
         /// Reuse an explicit request id (UUID) instead of generating one, to
-        /// retry a prior submit idempotently under CreateIfAbsent.
+        /// retry a prior submit idempotently under CreateIfAbsent. When the
+        /// IPCrypt policy fans the submit out to several requests, this is
+        /// the base id each request's id is derived from.
         #[arg(long)]
         request_id: Option<String>,
+        /// IPCrypt policy TOML (ADR-2993), the file ingest ran with. A
+        /// matcher whose key has a rule for `--signal` (metric keys matched
+        /// by their sanitized form) carries the ciphertext instead of the
+        /// address, one request per rule epoch (the current one and each
+        /// retired one); several encrypted matchers submit one request per
+        /// combination of epochs, at most 16. The matcher key is submitted as
+        /// written. Every submit, with or without this flag, first compares
+        /// the policy's fingerprint with the bucket's `sys/ipcrypt/policy`
+        /// marker and refuses on a mismatch or when the marker cannot be
+        /// read.
+        #[arg(long, value_name = "TOML")]
+        ipcrypt_config: Option<std::path::PathBuf>,
     },
     /// Report an erasure request's state: pending (a `.dreq`, no `.done`),
     /// completed (a `.done`, with per-bucket dropped counts and any deferral
@@ -1557,6 +1596,46 @@ enum EraseCommand {
         signal: SignalArg,
         #[arg(long)]
         request_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum IpcryptCommand {
+    /// Encrypt addresses under a tenant's key for one variant and epoch,
+    /// printing one result per line. A value that is not an address prints
+    /// unchanged, with a note on stderr.
+    Encrypt {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        variant: ravel_cli::ipcrypt::VariantArg,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        epoch: u32,
+        /// The addresses, bare or in their `ip:port` forms.
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Decrypt ciphertext renderings back to addresses under a tenant's key
+    /// for one variant and epoch, printing one result per line. A value that
+    /// is not an address rendering prints unchanged, with a note on stderr.
+    Decrypt {
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum)]
+        variant: ravel_cli::ipcrypt::VariantArg,
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+        epoch: u32,
+        #[arg(required = true)]
+        values: Vec<String>,
+    },
+    /// Make the bucket's `sys/ipcrypt/policy` marker carry this policy's
+    /// fingerprint: replace it with a CAS on the version just read, or create
+    /// it when absent. A marker replaced between the read and the write
+    /// fails the CAS and nothing is written. Restart every ingesting process
+    /// with the new file afterwards.
+    SetPolicy {
+        #[arg(long, value_name = "TOML")]
+        ipcrypt_config: std::path::PathBuf,
     },
 }
 
@@ -2225,6 +2304,32 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     run_logged(cli, &mut std::io::stderr()).await
 }
 
+/// `ravel-cli ipcrypt encrypt|decrypt`, with the deployment key the global
+/// tenant-hash flags name.
+fn run_ipcrypt_transform(
+    tenancy: &TenancyArgs,
+    tenant: &str,
+    variant: ravel_cli::ipcrypt::VariantArg,
+    epoch: u32,
+    direction: ravel_cli::ipcrypt::Direction,
+    values: &[String],
+) -> anyhow::Result<()> {
+    let key = ravel_cli::ipcrypt::deployment_key_from_flags(
+        tenancy.tenant_hash_key_file.as_deref(),
+        tenancy.tenant_hash_unkeyed,
+    )?;
+    ravel_cli::ipcrypt::run_transform(
+        key.as_ref(),
+        tenant,
+        variant,
+        epoch,
+        direction,
+        values,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    )
+}
+
 /// [`run`], writing the `--tenant-kms-config` routing line to `log` rather
 /// than stderr.
 async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::Result<()> {
@@ -2738,6 +2843,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     window_end_ns,
                     reason,
                     request_id,
+                    ipcrypt_config,
                 },
         } => {
             let matchers = matchers
@@ -2749,8 +2855,14 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     .map_err(|_| anyhow::anyhow!("--request-id {s:?} is not a valid UUID"))?,
                 None => uuid::Uuid::new_v4(),
             };
-            ravel_cli::erase::submit(
+            let ipcrypt = ravel_cli::ipcrypt::IpcryptPolicy::from_flags(
+                ipcrypt_config.as_deref(),
+                cli.tenancy.tenant_hash_key_file.as_deref(),
+                cli.tenancy.tenant_hash_unkeyed,
+            )?;
+            ravel_cli::erase::submit_with_ipcrypt(
                 store::build_store(&cli.store)?,
+                &ipcrypt,
                 &tenant,
                 signal,
                 matchers,
@@ -2759,10 +2871,53 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 reason,
                 request_id,
                 now_ns()?,
+                &mut std::io::stdout(),
             )
             .await
             .map(|_| ())
         }
+        Command::Ipcrypt { command } => match command {
+            IpcryptCommand::Encrypt {
+                tenant,
+                variant,
+                epoch,
+                values,
+            } => run_ipcrypt_transform(
+                &cli.tenancy,
+                &tenant,
+                variant,
+                epoch,
+                ravel_cli::ipcrypt::Direction::Encrypt,
+                &values,
+            ),
+            IpcryptCommand::Decrypt {
+                tenant,
+                variant,
+                epoch,
+                values,
+            } => run_ipcrypt_transform(
+                &cli.tenancy,
+                &tenant,
+                variant,
+                epoch,
+                ravel_cli::ipcrypt::Direction::Decrypt,
+                &values,
+            ),
+            IpcryptCommand::SetPolicy { ipcrypt_config } => {
+                let policy = ravel_cli::ipcrypt::IpcryptPolicy::from_flags(
+                    Some(ipcrypt_config.as_path()),
+                    cli.tenancy.tenant_hash_key_file.as_deref(),
+                    cli.tenancy.tenant_hash_unkeyed,
+                )?;
+                ravel_cli::ipcrypt::set_policy(
+                    store::build_store(&cli.store)?.as_ref(),
+                    &policy,
+                    &mut std::io::stdout(),
+                )
+                .await
+                .map(|_| ())
+            }
+        },
         Command::Erase {
             command:
                 EraseCommand::Status {
@@ -3133,7 +3288,13 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             zstd_level,
             load_memory_bytes,
             fold_after_load,
+            ipcrypt_config,
         } => {
+            let ipcrypt = ravel_cli::ipcrypt::IpcryptPolicy::from_flags(
+                ipcrypt_config.as_deref(),
+                cli.tenancy.tenant_hash_key_file.as_deref(),
+                cli.tenancy.tenant_hash_unkeyed,
+            )?;
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
                 store::build_store(&cli.store)?,
@@ -3153,6 +3314,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 zstd_level,
                 load_memory_bytes,
                 fold_after_load,
+                &ipcrypt,
                 now_ns()?,
             )
             .await;
@@ -4834,6 +4996,44 @@ mod tests {
             (
                 &[
                     "ravel",
+                    "ipcrypt",
+                    "set-policy",
+                    "--ipcrypt-config",
+                    "p.toml",
+                ],
+                true,
+            ),
+            (
+                &[
+                    "ravel",
+                    "ipcrypt",
+                    "encrypt",
+                    "--tenant",
+                    "t",
+                    "--variant",
+                    "deterministic",
+                    "192.0.2.1",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
+                    "ipcrypt",
+                    "decrypt",
+                    "--tenant",
+                    "t",
+                    "--variant",
+                    "prefix",
+                    "--epoch",
+                    "2",
+                    "192.0.2.1",
+                ],
+                false,
+            ),
+            (
+                &[
+                    "ravel",
                     "provision",
                     "adopt",
                     "--tenant",
@@ -5227,6 +5427,61 @@ mod tests {
     /// command_is_write(&cli.command)` arm in `main`), since the invariant
     /// is "does the server accept this bucket", not "does this command hash
     /// a tenant".
+    /// Every `ipcrypt` subcommand hashes a tenant: `encrypt`/`decrypt`
+    /// derive the key from the tenant hash, and `set-policy`'s fingerprint
+    /// keys each tenant table by it, so each needs the scheme installed.
+    #[test]
+    fn ipcrypt_subcommands_hash_a_tenant() {
+        for args in [
+            &[
+                "ravel",
+                "ipcrypt",
+                "encrypt",
+                "--tenant",
+                "t",
+                "--variant",
+                "prefix",
+                "192.0.2.1",
+            ][..],
+            &[
+                "ravel",
+                "ipcrypt",
+                "decrypt",
+                "--tenant",
+                "t",
+                "--variant",
+                "deterministic",
+                "192.0.2.1",
+            ][..],
+            &[
+                "ravel",
+                "ipcrypt",
+                "set-policy",
+                "--ipcrypt-config",
+                "p.toml",
+            ][..],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("ipcrypt subcommand parses");
+            assert!(super::command_hashes_tenant(&cli.command), "{args:?}");
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ravel",
+                "ipcrypt",
+                "encrypt",
+                "--tenant",
+                "t",
+                "--variant",
+                "prefix",
+                "--epoch",
+                "0",
+                "192.0.2.1",
+            ])
+            .is_err(),
+            "epoch 0 is refused, as the policy file refuses it"
+        );
+    }
+
     #[tokio::test]
     async fn gc_config_set_refuses_on_marker_less_bucket() {
         use ravel_object_store::ObjectStoreBackend;

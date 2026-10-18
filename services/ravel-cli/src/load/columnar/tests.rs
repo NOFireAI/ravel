@@ -909,7 +909,13 @@ fn the_reference_build_refuses_a_negative_timestamp_like_production() {
         Err(ColBuildError::Batch(r)) => panic!("expected a row rejection, got batch: {r}"),
         Ok(_) => panic!("expected a row rejection, got a batch"),
     };
-    let got = refusal(build_columnar_batch(&spans, &mapping, &limits, NOW_NS));
+    let got = refusal(build_columnar_batch(
+        &spans,
+        &mapping,
+        &limits,
+        &TenantRules::none(),
+        NOW_NS,
+    ));
     let want = refusal(build_columnar_batch_reference(
         &spans, &mapping, &limits, NOW_NS,
     ));
@@ -938,7 +944,7 @@ fn assert_same_batch(
     let cols = gen_cols(n_cols, seed, key_span);
     let (spans, mapping) = gen_spans_and_mapping(rows, n_spans, &cols, seed, null_pct);
     let limits = LogIngestLimits::default();
-    let got = match build_columnar_batch(&spans, &mapping, &limits, NOW_NS) {
+    let got = match build_columnar_batch(&spans, &mapping, &limits, &TenantRules::none(), NOW_NS) {
         Ok(b) => b,
         Err(ColBuildError::Batch(r)) => panic!("slot-table build failed the batch: {r}"),
         Err(ColBuildError::Row { row, reason }) => {
@@ -1040,7 +1046,13 @@ fn slot_table_build_drops_all_null_columns() {
     assert_same_batch(64, 1, 48, 20, 100, 0x5EED_0000_0000_0002);
     let cols = gen_cols(48, 0x5EED_0000_0000_0002, 20);
     let (spans, mapping) = gen_spans_and_mapping(64, 1, &cols, 0x5EED_0000_0000_0002, 100);
-    let batch = match build_columnar_batch(&spans, &mapping, &LogIngestLimits::default(), NOW_NS) {
+    let batch = match build_columnar_batch(
+        &spans,
+        &mapping,
+        &LogIngestLimits::default(),
+        &TenantRules::none(),
+        NOW_NS,
+    ) {
         Ok(b) => b,
         Err(_) => panic!("all-null attribute columns are not a rejection"),
     };
@@ -1077,7 +1089,7 @@ fn many_streams_out_of_order_match_reference() {
         }
     };
     let got = unwrap_batch(
-        build_columnar_batch(&spans, &mapping, &limits, NOW_NS),
+        build_columnar_batch(&spans, &mapping, &limits, &TenantRules::none(), NOW_NS),
         "production",
     );
     let want = unwrap_batch(
@@ -1141,7 +1153,7 @@ fn build_columnar_batch_timing_report() {
     let want = build_columnar_batch_reference(&spans, &mapping, &limits, NOW_NS);
     let map_elapsed = t0.elapsed();
     let t1 = Instant::now();
-    let got = build_columnar_batch(&spans, &mapping, &limits, NOW_NS);
+    let got = build_columnar_batch(&spans, &mapping, &limits, &TenantRules::none(), NOW_NS);
     let slot_elapsed = t1.elapsed();
 
     assert!(want.is_ok(), "the reference build succeeds");

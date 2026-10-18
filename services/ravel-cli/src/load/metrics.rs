@@ -350,6 +350,7 @@ fn build_metric_row(
     cols: &MetricsColumnIndex,
     mapping: &MetricsMapping,
     limits: &IngestLimits,
+    rules: &TenantRules,
     now_ns: i64,
     row: usize,
 ) -> Result<MetricRow, String> {
@@ -398,12 +399,19 @@ fn build_metric_row(
     // A null label cell omits that label, and so does an EMPTY one: OTLP drops
     // an empty attribute value before the label set is built (ADR-0038,
     // `push_checked`), so `{job=""}` and `{}` are one series there and must be
-    // one series here too.
+    // one series here too. A label an IPCrypt rule names (by its sanitized
+    // name, as OTLP matches it) is encrypted here, before the length cap,
+    // series identity and encoding see it.
     let mut labels: Vec<Label> = Vec::with_capacity(cols.labels.len());
     for (name, col_idx) in &cols.labels {
-        if let Some(value) = cols.read(batch, *col_idx, row, read_label_value)? {
+        if let Some(mut value) = cols.read(batch, *col_idx, row, read_label_value)? {
             if value.is_empty() {
                 continue;
+            }
+            if let Some(info) = rules.lookup_label(name)
+                && let Some((encrypted, _)) = rules.apply(info.raw_key, &value)
+            {
+                value = encrypted;
             }
             check_label(name, &value, limits)?;
             labels.push(Label {
@@ -886,6 +894,8 @@ struct MetricsDecodeState {
     /// `--skip-rows`, applied against each span's own file-absolute base, as
     /// [`collect_spans`](super::logs::collect_spans) applies it on the logs path.
     skip_rows: u64,
+    /// The tenant's IPCrypt rules, built once for the run.
+    rules: Arc<TenantRules>,
 }
 
 /// One batch's decode outcome.
@@ -976,6 +986,7 @@ fn decode_metrics_batch(
         tenant,
         mapping,
         limits,
+        &state.rules,
         now_ns,
         is_monotonic_sum,
         state.grouper.as_mut(),
@@ -1003,6 +1014,7 @@ fn build_batch_points(
     tenant: &TenantId,
     mapping: &MetricsMapping,
     limits: &IngestLimits,
+    rules: &TenantRules,
     now_ns: i64,
     is_monotonic_sum: bool,
     mut grouper: Option<&mut HistogramGrouper>,
@@ -1014,7 +1026,7 @@ fn build_batch_points(
     let mut rows: u64 = 0;
     for row in 0..batch.num_rows() {
         let file_row = file_base + row as u64;
-        let decoded = build_metric_row(batch, cols, mapping, limits, now_ns, row)
+        let decoded = build_metric_row(batch, cols, mapping, limits, rules, now_ns, row)
             .map_err(|reason| (file_row, reason))?;
         match grouper.as_deref_mut() {
             Some(grouper) => {
@@ -1095,6 +1107,7 @@ pub async fn load_metrics(
         max_flush_delay,
         now_ns,
         clock,
+        Arc::new(TenantRules::none()),
     )
     .await
 }
@@ -1122,6 +1135,7 @@ pub(super) async fn load_metrics_with(
     max_flush_delay: Option<Duration>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
+    rules: Arc<TenantRules>,
 ) -> Result<MetricsLoadReport, LoadError> {
     // Same operator-facing lever guards as the logs path: a value that cannot
     // express what the flag means is rejected, never silently clamped.
@@ -1215,6 +1229,7 @@ pub(super) async fn load_metrics_with(
             .is_histogram()
             .then(|| HistogramGrouper::new(tenant_id.clone())),
         skip_rows,
+        rules,
     };
     let mapping = Arc::new(mapping.clone());
 

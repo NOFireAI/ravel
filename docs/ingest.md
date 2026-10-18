@@ -1221,8 +1221,10 @@ ADR-2993 keeps client IP addresses out of storage: an attribute value under a
 configured key is replaced by its IPCrypt ciphertext inside normalization,
 before series identity, size limits and encoding, so no data object, index or
 commit record written from what `ravel-server` ingests carries the address as
-sent. `ravel-cli load` does not yet apply the policy: it stores every value as
-sent and does not read the startup marker below.
+sent. `ravel-cli load --ipcrypt-config <file>` applies the same policy to the
+rows it loads, and every load runs the startup marker check below before its
+first write, with or without the flag
+([bulk import under IPCrypt](guides/ingest.md#ipcrypt-on-load)).
 
 ### Policy
 
@@ -1304,12 +1306,14 @@ with the bucket's `sys/ipcrypt/policy` marker before it serves, whether or not
   decoded: the server refuses to start. A read failure is never taken for an
   absent marker.
 
-So every `ravel-server` process ingesting into a bucket runs the same policy;
-`ravel-cli load` is not one of them (see above). `query` and
-`maintain` do not read the marker. Re-keying the marker for a changed policy
-is a `ravel-cli` command that follows in a later release; until then a bucket
-keeps the policy its marker was created with. The IAM templates grant the
-gateway role a create-only write on the marker (`deploy/iam/README.md`).
+So every `ravel-server` process ingesting into a bucket runs the same policy,
+and `ravel-cli load` and `ravel-cli erase submit` check the same marker before
+they write. `query` and `maintain` do not read the marker. A changed policy is
+installed with `ravel-cli ipcrypt set-policy --ipcrypt-config FILE`, which
+replaces the marker under a compare-and-swap; until then a bucket keeps the
+policy its marker was created with. The IAM templates grant the gateway role a
+create-only write on the marker and the admin role the replacing write
+(`deploy/iam/README.md`).
 
 ## Admission control (ADR-0051)
 

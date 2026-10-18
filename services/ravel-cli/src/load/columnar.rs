@@ -65,6 +65,7 @@ pub(super) fn build_columnar_batch(
     spans: &[(RecordBatch, u64)],
     mapping: &Mapping,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
     now_ns: i64,
 ) -> Result<ColumnarLogBatch, ColBuildError> {
     use std::collections::{BTreeMap, HashMap};
@@ -104,6 +105,14 @@ pub(super) fn build_columnar_batch(
         }
         slot_of_attr[mi] = slot_keys.len().saturating_sub(1);
     }
+
+    // Whether an IPCrypt rule names `mapping.attributes[mi]`, looked up once
+    // per batch rather than once per cell.
+    let attr_ruled: Vec<bool> = mapping
+        .attributes
+        .iter()
+        .map(|spec| rules.lookup_raw(&spec.key).is_some())
+        .collect();
 
     let slot_types: Vec<FieldType> = slot_keys
         .iter()
@@ -296,7 +305,8 @@ pub(super) fn build_columnar_batch(
             resource_attrs.clear();
             for (mi, src) in &resource {
                 let spec = &mapping.resource_attributes[*mi];
-                if let Some(v) = src.get(local).map_err(row_err)? {
+                if let Some(mut v) = src.get(local).map_err(row_err)? {
+                    encrypt_attr(rules, &spec.key, &mut v);
                     check_attr(&spec.key, &v, limits).map_err(row_err)?;
                     resource_attrs.push((spec.key.clone(), v));
                 }
@@ -310,6 +320,11 @@ pub(super) fn build_columnar_batch(
             for (mi, slot, src) in &record {
                 let spec = &mapping.attributes[*mi];
                 if let Some(cell) = src.get_ref(local).map_err(row_err)? {
+                    let encrypted = match cell {
+                        CellRef::Str(s) if attr_ruled[*mi] => encrypt_str(rules, &spec.key, s),
+                        _ => None,
+                    };
+                    let cell = encrypted.as_deref().map_or(cell, CellRef::Str);
                     check_attr_len(&spec.key, cell.value_len(), limits).map_err(row_err)?;
                     present_record += 1;
                     if slot_taken_at[*slot] == row_stamp {

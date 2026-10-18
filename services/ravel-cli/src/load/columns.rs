@@ -117,6 +117,7 @@ pub(super) fn build_record(
     cols: &ColumnIndex,
     mapping: &Mapping,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
     now_ns: i64,
     row: usize,
 ) -> Result<NormalizedLogRecord, String> {
@@ -184,9 +185,10 @@ pub(super) fn build_record(
     let mut resource_attrs: Vec<(String, AttrValue)> = Vec::with_capacity(cols.resource.len());
     for (col_idx, map_idx) in &cols.resource {
         let spec = &mapping.resource_attributes[*map_idx];
-        if let Some(value) = cols.read(batch, *col_idx, row, |arr, at| {
+        if let Some(mut value) = cols.read(batch, *col_idx, row, |arr, at| {
             read_attr(arr, at, spec.value_type)
         })? {
+            encrypt_attr(rules, &spec.key, &mut value);
             check_attr(&spec.key, &value, limits)?;
             resource_attrs.push((spec.key.clone(), value));
         }
@@ -196,9 +198,10 @@ pub(super) fn build_record(
     let mut attrs: Vec<(String, AttrValue)> = Vec::with_capacity(cols.record.len());
     for (col_idx, map_idx) in &cols.record {
         let spec = &mapping.attributes[*map_idx];
-        if let Some(value) = cols.read(batch, *col_idx, row, |arr, at| {
+        if let Some(mut value) = cols.read(batch, *col_idx, row, |arr, at| {
             read_attr(arr, at, spec.value_type)
         })? {
+            encrypt_attr(rules, &spec.key, &mut value);
             check_attr(&spec.key, &value, limits)?;
             attrs.push((spec.key.clone(), value));
         }
@@ -234,6 +237,28 @@ pub(super) fn build_record(
         flags: 0,
         attrs,
     })
+}
+
+/// Encrypt a non-empty string attribute in place under `rules`' rule for
+/// `key` (raw key, not sanitized), as ravel-otlp does before the length check
+/// and stream identity. Any other value, or a key with no rule, is unchanged.
+pub(super) fn encrypt_attr(rules: &TenantRules, key: &str, value: &mut AttrValue) {
+    if let AttrValue::Str(s) = value
+        && let Some(encrypted) = encrypt_str(rules, key, s)
+    {
+        *s = encrypted;
+    }
+}
+
+/// The stored form of string value `s` under `rules`' rule for raw key `key`,
+/// or `None` when no rule names the key or `s` is empty. A value that is not
+/// an address comes back unchanged.
+pub(super) fn encrypt_str(rules: &TenantRules, key: &str, s: &str) -> Option<String> {
+    if s.is_empty() {
+        return None;
+    }
+    let info = rules.lookup_raw(key)?;
+    rules.apply(info.raw_key, s).map(|(encrypted, _)| encrypted)
 }
 
 /// Kept length caps for one attribute, re-implemented identically to

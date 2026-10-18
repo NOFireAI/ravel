@@ -15,6 +15,7 @@ fn build_row(
         &cols,
         mapping,
         &LogIngestLimits::default(),
+        &TenantRules::none(),
         NOW_NS,
         row,
     )
@@ -296,7 +297,10 @@ fn the_logs_row_path_reads_dictionary_columns_in_place() {
 
     let limits = LogIngestLimits::default();
     let records: Vec<NormalizedLogRecord> = (0..b.num_rows())
-        .map(|row| build_record(&b, &cols, &m, &limits, NOW_NS, row).expect("the row builds"))
+        .map(|row| {
+            build_record(&b, &cols, &m, &limits, &TenantRules::none(), NOW_NS, row)
+                .expect("the row builds")
+        })
         .collect();
     let str_attr = |key: &str, value: &str| (key.to_string(), AttrValue::Str(value.into()));
     let got: Vec<_> = records
