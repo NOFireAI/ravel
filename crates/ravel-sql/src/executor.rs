@@ -163,6 +163,7 @@ use crate::spill::{
 use crate::statement::{
     LowerError, LoweredStatement, LoweringSite, Statement, session_table_providers,
 };
+use crate::statement_accounting::StatementAccounting;
 use crate::validate::{
     ValidationError, referenced_base_tables, unreadable_table_reference, validate_query,
 };
@@ -498,6 +499,21 @@ impl Resolved {
                 .map(|lane| lane.admission.exempt_count)
                 .sum(),
         }
+    }
+
+    /// Each signal lane's counts, in lane order; a Parquet lane has none.
+    fn lane_counts(&self) -> Vec<LaneCounts> {
+        self.lanes
+            .iter()
+            .filter_map(|lane| {
+                crate::statement::signal_table_name(lane.signal).map(|table| LaneCounts {
+                    signal: lane.signal,
+                    table,
+                    segments: lane.snapshot.segments.len(),
+                    segments_pruned: lane.snapshot.segments_pruned,
+                })
+            })
+            .collect()
     }
 
     /// The `(signal, snapshot)` pairs a plan is built over.
@@ -1197,6 +1213,69 @@ pub struct ExplainReport {
     pub window_predicate: Option<String>,
     /// The physical plan, rendered as DataFusion's indented display.
     pub plan_text: String,
+    /// One entry per signal table the resolve read, in [`SIGNAL_LANE_ORDER`]
+    /// (ADR-2904 decision 7), the same entries [`SqlOutcome::signals`]
+    /// carries.
+    pub signals: Vec<SignalStats>,
+}
+
+/// One signal table's share of a statement's cost (ADR-2904 decision 7,
+/// issue #2912).
+///
+/// Every phase of every entry is that table's own handle, so the entries of
+/// one statement sum to its per-phase total, less the Parquet tables' share
+/// (a Parquet table has no entry) and the charges that belong to no table
+/// (the memory pool's peak report, which no rendered field carries).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignalStats {
+    /// The table name: `samples`, `logs`, `spans`, `alerts` or `audit`.
+    pub table: &'static str,
+    /// Segments this table's resolve returned, of every origin. The entries
+    /// sum to [`SqlStats::segments`].
+    pub segments: usize,
+    /// Segments this table's catalog resolve pruned by postings
+    /// ([`Snapshot::segments_pruned`]). Per table only: the statement has no
+    /// total of it.
+    pub segments_pruned: u64,
+    /// This table's cost, split by phase like [`SqlOutcome::phase_accounting`].
+    pub phases: PhaseAccountingSnapshot,
+}
+
+/// Merges `view`'s statement total into `into` when dropped, so a caller
+/// holding one pooled [`QueryAccounting`] receives exactly the statement's
+/// total on every exit, including a cancelled future.
+struct MergeOnDrop<'a> {
+    into: &'a QueryAccounting,
+    view: StatementAccounting,
+}
+
+impl Drop for MergeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.into.merge_snapshot(&self.view.pooled_snapshot());
+    }
+}
+
+/// One signal lane's resolved counts, captured before its snapshot is handed
+/// to the plan.
+#[derive(Debug, Clone, Copy)]
+struct LaneCounts {
+    signal: TargetSignal,
+    table: &'static str,
+    segments: usize,
+    segments_pruned: u64,
+}
+
+/// The [`SignalStats`] of `lanes`, each read from its own handle in `view`.
+fn signal_stats(lanes: &[LaneCounts], view: &StatementAccounting) -> Vec<SignalStats> {
+    lanes
+        .iter()
+        .map(|lane| SignalStats {
+            table: lane.table,
+            segments: lane.segments,
+            segments_pruned: lane.segments_pruned,
+            phases: view.lane(lane.signal).snapshot(),
+        })
+        .collect()
 }
 
 /// Which [`CostEstimate`] components the estimator cannot bound for `target`.
@@ -1260,6 +1339,11 @@ pub struct SqlOutcome {
     /// `phase_accounting.pooled()`, so the two never disagree on a total,
     /// only on whether resolve/plan/probe/scan can be told apart.
     pub phase_accounting: PhaseAccountingSnapshot,
+    /// One entry per signal table the statement read, in
+    /// [`SIGNAL_LANE_ORDER`] (ADR-2904 decision 7). A statement naming no
+    /// table resolves the `samples` snapshot and reports it here; a Parquet
+    /// table has no entry.
+    pub signals: Vec<SignalStats>,
     /// This query's I/O shape (issue #1214): the structural request-fan-out
     /// figures (dependency depth, list-page depth, service batches) plus the
     /// unfolded-segment and plan-classification figures, computed purely from
@@ -1352,7 +1436,7 @@ impl SqlOutcome {
 /// read, matching how [`SqlOutcome::accounting`] reports only the successful
 /// attempt.
 #[derive(Clone, Default)]
-pub struct LiveAccounting(Arc<Mutex<PhaseAccounting>>);
+pub struct LiveAccounting(Arc<Mutex<StatementAccounting>>);
 
 impl LiveAccounting {
     /// A live view whose counters are all zero until an execution installs the
@@ -1372,17 +1456,17 @@ impl LiveAccounting {
     }
 
     /// Point this view at `phase_accounting` (the attempt about to run).
-    /// Clones the handle, so the two share the same four atomic counter
-    /// blocks and every increment the attempt makes is visible through
-    /// [`Self::snapshot`].
-    fn install(&self, phase_accounting: &PhaseAccounting) {
+    /// Clones every lane's handle, so the two share the same atomic counter
+    /// blocks and every increment the attempt makes, in any lane, is visible
+    /// through [`Self::snapshot`].
+    fn install(&self, phase_accounting: &StatementAccounting) {
         *self.lock() = phase_accounting.clone();
     }
 
     /// Lock the inner slot, recovering a poisoned guard. The slot holds one
     /// cheap-to-clone handle and no torn state, so recovering is safe and
     /// strictly better than failing every later snapshot.
-    fn lock(&self) -> std::sync::MutexGuard<'_, PhaseAccounting> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, StatementAccounting> {
         match self.0.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -1855,9 +1939,16 @@ impl SqlExecutor {
         let tokens = admit_http_tokens(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
+        // Every lane records into its own handle; the caller's `accounting`
+        // receives their sum when this call ends, by any exit: success, an
+        // error, the deadline, or this future being dropped.
+        let view = MergeOnDrop {
+            into: accounting,
+            view: StatementAccounting::new(),
+        };
         tokio::time::timeout(
             req.deadline,
-            self.explain_inner(tenant_hash, req, &tokens, accounting),
+            self.explain_inner(tenant_hash, req, &tokens, &view.view),
         )
         .await
         .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
@@ -1872,16 +1963,8 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         req: &SqlRequest,
         tokens: &LaneTokens,
-        accounting: &QueryAccounting,
+        phase_accounting: &StatementAccounting,
     ) -> Result<ExplainReport, SqlError> {
-        // `explain` keeps the pre-#1367 pooled `&QueryAccounting` signature
-        // (`ExplainReport` carries no phase or I/O-shape breakdown; only
-        // `SqlOutcome`, from `execute`/`run`, does): `pooled_over` wraps it in
-        // a `PhaseAccounting` whose five phases are clones of the same
-        // shared handle, so every store call below still lands on the
-        // caller's own `accounting`, just under the API the shared
-        // `resolve_admitted`/`plan_pinned_with` now take.
-        let phase_accounting = PhaseAccounting::pooled_over(accounting);
         let statement = Statement::Sql(&req.sql);
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
         // `resolve_admitted` itself checks the effective `max_s3_requests`
@@ -1889,9 +1972,10 @@ impl SqlExecutor {
         // for free here without ever reaching the segment-fetch loop in
         // scan.rs (which it never runs: explain fetches no segment).
         let resolved = self
-            .resolve_admitted(tenant_hash, statement, req, tokens, &phase_accounting)
+            .resolve_admitted(tenant_hash, statement, req, tokens, phase_accounting)
             .await?;
         let segments_resolved = resolved.segments_resolved();
+        let lane_counts = resolved.lane_counts();
         let admission = resolved.admission();
         let estimate = resolved.estimate;
         let target = resolved.target;
@@ -1903,7 +1987,7 @@ impl SqlExecutor {
                 tenant_hash,
                 lanes,
                 statement,
-                &phase_accounting,
+                phase_accounting,
                 PlanExtras {
                     declared,
                     #[cfg(feature = "flight-sql")]
@@ -1937,6 +2021,7 @@ impl SqlExecutor {
             unbounded_components,
             window_predicate,
             plan_text,
+            signals: signal_stats(&lane_counts, phase_accounting),
         })
     }
 
@@ -1970,7 +2055,7 @@ impl SqlExecutor {
         // (ADR-0044): a discarded first attempt's counts must never bleed
         // into the retry's.
         for attempt in 0..2u32 {
-            let phase_accounting = PhaseAccounting::new();
+            let phase_accounting = StatementAccounting::new();
             // Re-point the caller's live view at this attempt's handle before
             // any store call, so a snapshot taken from a `Drop` or after a
             // deadline trip reflects exactly this attempt's issued cost and
@@ -1991,6 +2076,7 @@ impl SqlExecutor {
             stats.resolves += 1;
             stats.attempts += 1;
             stats.segments = resolved.segments_resolved();
+            let lane_counts = resolved.lane_counts();
             let estimate = resolved.estimate;
             let target = resolved.target;
             let unfolded_segments_resolved = resolved.unfolded_segments_resolved;
@@ -2062,6 +2148,7 @@ impl SqlExecutor {
                         stats,
                         accounting: phase_snapshot.pooled(),
                         phase_accounting: phase_snapshot,
+                        signals: signal_stats(&lane_counts, &phase_accounting),
                         io_shape,
                         estimate,
                         spill_by_operator,
@@ -2149,7 +2236,7 @@ impl SqlExecutor {
                 Statement::Sql(&req.sql),
                 req,
                 &tokens,
-                &PhaseAccounting::pooled_over(accounting),
+                &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
             )
             .await?;
         let estimate = resolved.estimate;
@@ -2233,7 +2320,7 @@ impl SqlExecutor {
             tenant_hash,
             lanes,
             Statement::Sql(sql),
-            &PhaseAccounting::pooled_over(accounting),
+            &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
             PlanExtras {
                 declared: inputs.declared,
                 // Explicit per-field so this compiles clean whether or not the
@@ -2277,7 +2364,7 @@ impl SqlExecutor {
             tenant_hash,
             lanes,
             Statement::Sql(sql),
-            &PhaseAccounting::pooled_over(accounting),
+            &StatementAccounting::One(PhaseAccounting::pooled_over(accounting)),
             PlanExtras {
                 declared: inputs.declared,
                 distributed,
@@ -2321,7 +2408,7 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         lanes: Vec<(TargetSignal, Snapshot)>,
         statement: Statement<'_>,
-        phase_accounting: &PhaseAccounting,
+        phase_accounting: &StatementAccounting,
         extras: PlanExtras,
     ) -> Result<PinnedQuery, SqlError> {
         // Every read of the executor's configuration below goes through this
@@ -2333,10 +2420,11 @@ impl SqlExecutor {
         // The memory pool's peak-reservation report is execution-time
         // aggregate/sort spend, not a store request, so it has no Resolve/
         // Plan/Probe phase home; it is charged to Scan, matching where the
-        // partitions that grow it run.
+        // partitions that grow it run. The pool serves every table, so it is
+        // the statement's charge and no lane's.
         let (pool, breach) = config.query_pool(
             self.tenant_budget(tenant_hash),
-            phase_accounting.scan().clone(),
+            phase_accounting.statement().scan().clone(),
         );
         // ADR-0094 decision 1/2: classify the query's aggregates and GROUP BY
         // keys before the real session is built, right here at the one call site
@@ -2361,8 +2449,13 @@ impl SqlExecutor {
         let parquet = match extras.parquet {
             ParquetPlan::Resolved(resolution) => resolution,
             ParquetPlan::Pinned(pins) => {
-                self.resolve_pinned_parquet(tenant_hash, statement, &pins, phase_accounting)
-                    .await?
+                self.resolve_pinned_parquet(
+                    tenant_hash,
+                    statement,
+                    &pins,
+                    phase_accounting.parquet(),
+                )
+                .await?
             }
             ParquetPlan::Unresolved => {
                 self.resolve_parquet_target(
@@ -2370,7 +2463,7 @@ impl SqlExecutor {
                     statement,
                     &tables,
                     extras.row_window.is_some(),
-                    phase_accounting,
+                    phase_accounting.parquet(),
                 )
                 .await?
             }
@@ -2398,7 +2491,7 @@ impl SqlExecutor {
                     sources,
                     tenant_hash,
                     &resolution,
-                    phase_accounting,
+                    phase_accounting.parquet(),
                     &limits,
                     false,
                 )
@@ -2547,8 +2640,9 @@ impl SqlExecutor {
                             tenant_hash,
                             self.fetcher.clone(),
                             config.clone(),
-                            phase_accounting.clone(),
-                        );
+                            phase_accounting.lane(signal).clone(),
+                        )
+                        .with_statement_accounting(phase_accounting.clone());
                         // Install the distributed samples scan for this query only,
                         // when the coordinator decided to fan out. `None`/feature-off
                         // leaves the provider byte-identical to the local path.
@@ -2598,7 +2692,7 @@ impl SqlExecutor {
                                     Signal::Logs,
                                     extras.column_stats_window,
                                     extras.column_stats_now_ns,
-                                    phase_accounting.plan(),
+                                    phase_accounting.lane(signal).plan(),
                                 )
                                 .await?
                         };
@@ -2607,7 +2701,7 @@ impl SqlExecutor {
                                 snapshot,
                                 tenant_hash,
                                 self.log_fetcher.clone(),
-                                phase_accounting.clone(),
+                                phase_accounting.lane(signal).clone(),
                             )
                             .with_declared_columns(extras.declared.clone())
                             .with_column_stats(column_stats)
@@ -2632,9 +2726,9 @@ impl SqlExecutor {
                             snapshot,
                             tenant_hash,
                             self.span_fetcher.clone(),
-                            phase_accounting.scan().clone(),
+                            phase_accounting.lane(signal).scan().clone(),
                         )
-                        .with_phase_accounting(phase_accounting.clone()),
+                        .with_phase_accounting(phase_accounting.lane(signal).clone()),
                     )),
                     // The two RLOG-backed tables (ADR-1101 decision 1) read through the
                     // executor's existing `log_fetcher`: an alert and an audit record
@@ -2646,14 +2740,14 @@ impl SqlExecutor {
                             snapshot,
                             tenant_hash,
                             self.log_fetcher.clone(),
-                            phase_accounting.scan().clone(),
+                            phase_accounting.lane(signal).scan().clone(),
                         )))
                     }
                     TargetSignal::Audit => SessionTable::Audit(Arc::new(AuditTableProvider::new(
                         snapshot,
                         tenant_hash,
                         self.log_fetcher.clone(),
-                        phase_accounting.scan().clone(),
+                        phase_accounting.lane(signal).scan().clone(),
                     ))),
                     // A lane is a signal table, never Parquet.
                     TargetSignal::Parquet => {
@@ -2880,7 +2974,7 @@ impl SqlExecutor {
         // Worker fragments keep the pre-#1367 pooled `&QueryAccounting` API
         // (no `SqlOutcome` and thus no phase/I/O-shape breakdown crosses the
         // Flight wire for a worker slice): `pooled_over` bridges it to the
-        // phase-split constructor the same way `explain_inner` does above.
+        // phase-split constructor the same way the Flight resolve does.
         let provider = Arc::new(RavelTableProvider::new(
             snapshot,
             tenant_hash,
@@ -2926,7 +3020,7 @@ impl SqlExecutor {
         statement: Statement<'_>,
         req: &SqlRequest,
         tokens: &LaneTokens,
-        phase_accounting: &PhaseAccounting,
+        phase_accounting: &StatementAccounting,
     ) -> Result<Resolved, SqlError> {
         self.resolve_admitted(tenant_hash, statement, req, tokens, phase_accounting)
             .await
@@ -2957,7 +3051,7 @@ impl SqlExecutor {
         statement: Statement<'_>,
         req: &SqlRequest,
         tokens: &LaneTokens,
-        phase_accounting: &PhaseAccounting,
+        phase_accounting: &StatementAccounting,
     ) -> Result<Resolved, SqlError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2): stamp this
         // tenant's activity with the request's injected clock before resolving.
@@ -2976,7 +3070,7 @@ impl SqlExecutor {
                 statement,
                 &tables,
                 req.row_window,
-                phase_accounting,
+                phase_accounting.parquet(),
             )
             .await?
         {
@@ -2987,7 +3081,7 @@ impl SqlExecutor {
             // the same budget as it is issued.
             let estimate = parquet::estimate_cost(
                 &resolution,
-                phase_accounting.resolve().snapshot().total_s3_requests(),
+                phase_accounting.resolve_snapshot().total_s3_requests(),
             );
             if let Some(QueryError::RequestBudgetExceeded {
                 requests,
@@ -3086,7 +3180,7 @@ impl SqlExecutor {
                     tokens.for_lane(lane),
                     req.now_ns,
                     lane_name_filter,
-                    phase_accounting.resolve(),
+                    phase_accounting.lane(lane).resolve(),
                 )
                 .await?;
             // Exact count of `SegmentOrigin::Recent` entries (issue #1214): the
@@ -3154,7 +3248,7 @@ impl SqlExecutor {
     /// the statement names more than one signal table.
     fn check_lane_request_budget(
         &self,
-        phase_accounting: &PhaseAccounting,
+        phase_accounting: &StatementAccounting,
         snapshot: &Snapshot,
         origins: &SegmentOrigins,
         now_ns: i64,
@@ -3182,7 +3276,7 @@ impl SqlExecutor {
             max,
             fold_lag,
         }) = request_budget_exceeded(
-            phase_accounting.resolve().snapshot().total_s3_requests(),
+            phase_accounting.resolve_snapshot().total_s3_requests(),
             RequestBudget::new(
                 engine_config.max_s3_requests,
                 resolved_fold_lag(
@@ -3336,7 +3430,7 @@ impl SqlExecutor {
     fn sql_io_shape(
         &self,
         lanes: &[(TargetSignal, &Snapshot)],
-        phase_accounting: &PhaseAccounting,
+        phase_accounting: &StatementAccounting,
         unfolded_segments_resolved: u64,
     ) -> QueryIoShape {
         let mut counts = IoShapeCounts::default();
@@ -3372,7 +3466,7 @@ impl SqlExecutor {
         }
         counts.record_dependency_chain(depth);
         counts.record_service_batches(service_batches);
-        let resolve_snapshot = phase_accounting.resolve().snapshot();
+        let resolve_snapshot = phase_accounting.resolve_snapshot();
         let resolve_list_requests = resolve_snapshot.s3_requests(AccountedOp::List);
         counts.record_list_pages(resolve_list_requests.min(u64::from(u32::MAX)) as u32);
         // A metrics query's resolve carries a real pruning signal
@@ -3912,7 +4006,7 @@ impl SqlExecutor {
         statement: Statement<'_>,
         req: &SqlRequest,
         lanes: Vec<(TargetSignal, Snapshot)>,
-        phase_accounting: &PhaseAccounting,
+        phase_accounting: &StatementAccounting,
         declared: &[DeclaredColumn],
         parquet: Option<ParquetResolution>,
     ) -> (
@@ -8089,7 +8183,7 @@ pub(crate) mod tests {
         };
         let shape = exec.sql_io_shape(
             &[(TargetSignal::Logs, &snapshot)],
-            &PhaseAccounting::new(),
+            &StatementAccounting::new(),
             0,
         );
         assert_eq!(shape.dependency_depth, 1);

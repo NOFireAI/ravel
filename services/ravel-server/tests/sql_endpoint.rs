@@ -3420,6 +3420,99 @@ async fn a_samples_logs_join_returns_exact_rows_over_http() {
     );
 }
 
+/// `stats.signals` over HTTP (issue #2912): a `samples JOIN logs` statement
+/// renders one entry per table, `samples` then `logs`, each with exactly
+/// `table`, `segments`, `segmentsPruned` and `phases`; each `phases` list names
+/// the five phases `stats.phases` names, and the two entries sum to
+/// `stats.phases` per phase and per field, and to `stats.pruning.segments`.
+#[tokio::test]
+async fn stats_signals_is_rendered_in_the_json_response() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_segment(
+        store.as_ref(),
+        &tenant,
+        0,
+        "m",
+        &[(100, 1.0), (150, 2.0), (300, 3.0)],
+    )
+    .await;
+    let records = [
+        log_record("api", 100, "hello world"),
+        log_record("worker", 200, "shutdown ok"),
+    ];
+    publish_log_segment(store.as_ref(), &tenant, 1, &records).await;
+    let app = build_router(store, tokens(&[("acme-token", "acme")]));
+
+    let (status, value) = post_json(
+        &app,
+        "acme-token",
+        "SELECT samples.ts, logs.body FROM samples JOIN logs ON samples.ts = logs.ts",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let signals = value["stats"]["signals"].as_array().expect("stats.signals");
+    let tables: Vec<&Value> = signals.iter().map(|entry| &entry["table"]).collect();
+    assert_eq!(tables, [&Value::from("samples"), &Value::from("logs")]);
+
+    let phases = value["stats"]["phases"].as_array().expect("stats.phases");
+    let phase_names: Vec<&Value> = phases.iter().map(|p| &p["phase"]).collect();
+    assert_eq!(phase_names.len(), 5);
+    for entry in signals {
+        let keys: std::collections::BTreeSet<&str> = entry
+            .as_object()
+            .expect("an entry is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            ["phases", "segments", "segmentsPruned", "table"].into(),
+            "{entry}"
+        );
+        let names: Vec<&Value> = entry["phases"]
+            .as_array()
+            .expect("an entry's phases")
+            .iter()
+            .map(|p| &p["phase"])
+            .collect();
+        assert_eq!(names, phase_names, "{entry}");
+        assert!(entry["segmentsPruned"].is_u64(), "{entry}");
+    }
+
+    for (index, total) in phases.iter().enumerate() {
+        let fields = total.as_object().expect("a phase entry");
+        assert_eq!(fields.len(), 11, "the phase name and ten figures");
+        for (key, figure) in fields.iter().filter(|(key, _)| key.as_str() != "phase") {
+            let sum: u64 = signals
+                .iter()
+                .map(|entry| entry["phases"][index][key].as_u64().expect("a figure"))
+                .sum();
+            assert_eq!(
+                Some(sum),
+                figure.as_u64(),
+                "{} {key} in {value}",
+                total["phase"]
+            );
+        }
+    }
+    let segments: Vec<u64> = signals
+        .iter()
+        .map(|entry| entry["segments"].as_u64().expect("segments"))
+        .collect();
+    assert_eq!(segments, [1, 1]);
+    assert_eq!(
+        Some(segments.iter().sum::<u64>()),
+        value["stats"]["pruning"]["segments"].as_u64()
+    );
+    assert!(
+        signals
+            .iter()
+            .all(|entry| entry["phases"][0]["s3ListRequests"].as_u64() > Some(0)),
+        "each table lists its own commits during resolve: {value}"
+    );
+}
+
 /// `min_commit_token` qualified by table over HTTP (ADR-2904 decision 3, issue
 /// #2911). A samples write and a logs write each acknowledge their own token.
 /// On a statement joining the two, `samples:<s>` and `logs:<l>` bound each

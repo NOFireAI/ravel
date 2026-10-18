@@ -175,6 +175,17 @@ The JSON response envelope has one array per row under `data.rows`:
  "stats": {}}
 ```
 
+`stats` holds `accounting`, `estimate`, `phases`, `signals`, `io`,
+`timings` and `pruning`. `signals` has one entry per signal table the
+statement reads, in the order `samples`, `logs`, `spans`, `alerts`,
+`audit`, each with exactly `table`, `segments`, `segmentsPruned` and
+`phases` (the table's own cost, in the shape of `stats.phases`). Summed
+over the entries, each figure of `phases` equals the statement's
+`stats.phases` figure, less what Parquet tables cost; a Parquet table has no
+entry. The
+[query engine reference](../query-engine.md#json-response-shape) defines
+every section.
+
 JSON encoding per column type:
 
 - A non-finite float is a string: `NaN`, `+Inf`, and `-Inf`.
@@ -270,8 +281,8 @@ The response is always JSON. Here, with the row values illustrative and the
 - A `date_nanos` value is an integer count of nanoseconds since the Unix
   epoch.
 - `stats` has the sections `/api/v1/sql` reports for a statement that reads
-  the catalog: `accounting`, `estimate`, `io`, `phases`, `pruning` and
-  `timings`. A `ROW` statement reads no object, and its `stats` holds only
+  the catalog, except `signals`: `accounting`, `estimate`, `io`, `phases`,
+  `pruning` and `timings`. A `ROW` statement reads no object, and its `stats` holds only
   `accounting` and `estimate`, with no request counted.
 - `warnings`, an array of strings, is present only when there is something
   to say. Today that is one case: the statement's own `LIMIT` was above

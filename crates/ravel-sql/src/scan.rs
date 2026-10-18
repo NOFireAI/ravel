@@ -143,6 +143,7 @@ use ravel_types::{LabelSet, TenantHash};
 use crate::error::SqlError;
 use crate::labels::build_labels_dict;
 use crate::schema::{COL_SERIES_ID, COL_TS, COL_VALUE, internal_schema};
+use crate::statement_accounting::StatementAccounting;
 
 /// Rows accumulated into one output batch before it is emitted. Bounds the
 /// per-batch working set and gives the memory reservation a per-batch
@@ -397,6 +398,9 @@ pub struct RsegScanExec {
     /// This query's phase-split accounting handle (ADR-0044, issue #796),
     /// cloned into every partition's `fetch_soa_phase_accounted` call.
     phase_accounting: PhaseAccounting,
+    /// The statement total the byte and request budgets are checked against,
+    /// which counts every table the statement reads, not this scan's alone.
+    budget_accounting: StatementAccounting,
     /// Per-partition batch-path counters (ADR-0099 decision 6), published so
     /// `EXPLAIN ANALYZE` and tests can see which batch-building path ran.
     metrics: ExecutionPlanMetricsSet,
@@ -446,6 +450,7 @@ impl RsegScanExec {
         max_s3_requests: RequestLimit,
         erasure: Arc<Vec<ErasurePredicate>>,
         phase_accounting: PhaseAccounting,
+        budget_accounting: StatementAccounting,
     ) -> DFResult<Self> {
         let n = target_partitions.max(1).min(segments.len().max(1));
         let mut partitions: Vec<Vec<SegmentRef>> = vec![Vec::new(); n];
@@ -467,6 +472,7 @@ impl RsegScanExec {
             schema,
             properties,
             phase_accounting,
+            budget_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
         })
     }
@@ -585,6 +591,7 @@ impl ExecutionPlan for RsegScanExec {
             erasure,
             reservation,
             self.phase_accounting.clone(),
+            self.budget_accounting.clone(),
             MetricBuilder::new(&self.metrics).counter(HISTOGRAM_SERIES_SKIPPED_METRIC, partition),
         ));
         Ok(Box::pin(ScanStream {
@@ -627,6 +634,7 @@ async fn prepare_partition(
     erasure: Arc<Vec<ErasurePredicate>>,
     reservation: MemoryReservation,
     phase_accounting: PhaseAccounting,
+    budget_accounting: StatementAccounting,
     histogram_series_skipped: Count,
 ) -> DFResult<(Prepared, MemoryReservation)> {
     let mut runs: Vec<Run> = Vec::with_capacity(segs.len());
@@ -650,20 +658,20 @@ async fn prepare_partition(
         // empty.
         retain_series_soa(&mut series, &erasure);
         // Per-tenant bytes-scanned budget (ADR-0061 decision 1): this fetch
-        // has just charged its S3 bytes into the shared `phase_accounting`
-        // handle, so check the running pooled total against the tenant's cap
-        // here, once per completed segment fetch, before decoding this
-        // segment or fetching the next one. This loop is genuinely
-        // sequential, so a trip here straightforwardly means the remaining
-        // segments' GETs never happen.
+        // has just charged its S3 bytes into `phase_accounting`, so check the
+        // statement's running pooled total, every table it reads included,
+        // against the tenant's cap here, once per completed segment fetch,
+        // before decoding this segment or fetching the next one. This loop is
+        // genuinely sequential, so a trip here straightforwardly means the
+        // remaining segments' GETs never happen.
         //
-        // `pooled_snapshot()`, not `snapshot().pooled()`: this handle can be
+        // `pooled_snapshot()`, not `snapshot().pooled()`: a handle can be
         // `PhaseAccounting::pooled_over` a single shared `QueryAccounting`
         // (see `executor.rs`'s `plan_pinned`/`plan_pinned_distributed`/
         // `worker_fragment_stream`), whose five phases are clones of one
         // counter. Summing five snapshots of that one counter would report
         // 5x the real total.
-        let scanned = phase_accounting.pooled_snapshot().total_s3_bytes();
+        let scanned = budget_accounting.pooled_snapshot().total_s3_bytes();
         if max_bytes_scanned.is_exceeded_by(scanned) {
             let max = match max_bytes_scanned {
                 ByteLimit::Bounded(max) => max,
@@ -688,7 +696,7 @@ async fn prepare_partition(
             max,
             fold_lag,
         }) = request_budget_exceeded(
-            phase_accounting.pooled_snapshot().total_s3_requests(),
+            budget_accounting.pooled_snapshot().total_s3_requests(),
             max_s3_requests,
         ) {
             return Err(SqlError::RequestBudgetExceeded {

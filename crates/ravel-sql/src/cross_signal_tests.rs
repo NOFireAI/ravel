@@ -314,6 +314,26 @@ async fn join_filter_prunes_only_its_own_signal() {
     let expected = vec![(0, 1.0), (100, 2.0), (100, 2.0)];
     assert_eq!(rows(&pruned.output, "ts", "value"), expected);
     assert_eq!(rows(&unpruned.output, "ts", "value"), expected);
+
+    // `segmentsPruned` is the metrics catalog's prune of y's segment, on the
+    // samples entry alone: it accounts for the segment the samples entry lost
+    // against the unpruned run.
+    let pruned_counts: Vec<(&str, usize, u64)> = pruned
+        .signals
+        .iter()
+        .map(|s| (s.table, s.segments, s.segments_pruned))
+        .collect();
+    assert_eq!(pruned_counts, [("samples", 1, 1), ("logs", 2, 0)]);
+    let unpruned_counts: Vec<(&str, usize, u64)> = unpruned
+        .signals
+        .iter()
+        .map(|s| (s.table, s.segments, s.segments_pruned))
+        .collect();
+    assert_eq!(unpruned_counts, [("samples", 2, 0), ("logs", 2, 0)]);
+    assert_eq!(
+        pruned.signals[0].segments as u64 + pruned.signals[0].segments_pruned,
+        unpruned.signals[0].segments as u64
+    );
 }
 
 /// The row window filters each scan on its own table's event-time column:
@@ -1079,4 +1099,430 @@ async fn a_qualifier_the_statement_does_not_read_is_refused_before_any_listing()
         }
     }
     assert_eq!(recording.requests(), Vec::<String>::new());
+}
+
+/// The `samples JOIN logs` fixture of the per-table cost tests: two metrics
+/// segments and one logs segment, so a swapped segment count shows.
+async fn per_table_cost_fixture(name: &str) -> (FixtureStore, TenantHash) {
+    let tenant = TenantId::new(name.to_string());
+    let tenant_hash = tenant.hash();
+    let memory = MemoryStore::new();
+    publish_metric_samples(&memory, &tenant, 1, "m", samples(&[(0, 1.0), (100, 2.0)])).await;
+    publish_metric_samples(&memory, &tenant, 3, "m", samples(&[(200, 3.0)])).await;
+    publish_log_records(
+        &memory,
+        tenant_hash,
+        Signal::Logs,
+        2,
+        &logs_at(&[100, 200, 300]),
+    )
+    .await;
+    (wrap_fixture_store(memory), tenant_hash)
+}
+
+const PER_TABLE_JOIN: &str = "SELECT s.ts, s.value FROM samples s JOIN logs l ON s.ts = l.ts \
+                              ORDER BY s.ts";
+
+/// Every numeric field of one rendered phase entry, by key.
+fn rendered_fields(entry: &serde_json::Value) -> Vec<(String, u64)> {
+    entry
+        .as_object()
+        .expect("a phase entry is an object")
+        .iter()
+        .filter(|(key, _)| key.as_str() != "phase")
+        .map(|(key, value)| (key.clone(), value.as_u64().expect("a u64 field")))
+        .collect()
+}
+
+/// The signal a recorded request's key belongs to: `/m/` for metrics, `/l/`
+/// for logs.
+fn request_signal(request: &str) -> &'static str {
+    if request.contains("/m/") {
+        "samples"
+    } else if request.contains("/l/") {
+        "logs"
+    } else {
+        panic!("a request outside both signals: {request}")
+    }
+}
+
+/// `stats.signals` of a `samples JOIN logs` statement: one entry per table in
+/// lane order, each the table's own cost, and the two summing to the
+/// statement's per-phase total for every rendered field.
+#[tokio::test]
+async fn stats_signals_sum_to_totals_per_phase() {
+    use ravel_query::QueryPhase;
+    use ravel_types::accounting::AccountedOp;
+
+    use crate::stats_json::phase_costs_json;
+
+    let (store, tenant_hash) = per_table_cost_fixture("cross-signal-per-table-cost").await;
+    let (recording, executor) = recorded(store, SqlConfig::default());
+    let outcome = executor
+        .execute(tenant_hash, &sql_request(PER_TABLE_JOIN, WINDOW))
+        .await
+        .expect("the join runs");
+    assert_eq!(
+        rows(&outcome.output, "ts", "value"),
+        vec![(100, 2.0), (200, 3.0)]
+    );
+
+    // (i) Two entries, in lane order.
+    let tables: Vec<&str> = outcome.signals.iter().map(|s| s.table).collect();
+    assert_eq!(tables, ["samples", "logs"]);
+    let samples_entry = &outcome.signals[0];
+    let logs_entry = &outcome.signals[1];
+
+    // (ii) For every phase and every rendered field, the entries sum to the
+    // statement total.
+    let total = phase_costs_json(&outcome.phase_accounting);
+    let samples_json = phase_costs_json(&samples_entry.phases);
+    let logs_json = phase_costs_json(&logs_entry.phases);
+    for (index, phase) in QueryPhase::ALL.iter().enumerate() {
+        let samples_fields = rendered_fields(&samples_json[index]);
+        let logs_fields = rendered_fields(&logs_json[index]);
+        let total_fields = rendered_fields(&total[index]);
+        assert_eq!(total_fields.len(), 10, "every rendered field is compared");
+        for (((key, samples), (logs_key, logs)), (total_key, total)) in
+            samples_fields.iter().zip(&logs_fields).zip(&total_fields)
+        {
+            assert_eq!((key, logs_key), (total_key, total_key));
+            assert_eq!(
+                samples + logs,
+                *total,
+                "{} {key}: samples {samples} + logs {logs}",
+                phase.name()
+            );
+        }
+    }
+
+    // (iii) Each entry's GET and LIST counts are its own signal's recorded
+    // requests.
+    let requests = recording.requests();
+    let recorded_count = |table: &str, op: &str| {
+        requests
+            .iter()
+            .filter(|r| r.starts_with(&format!("{op} ")) && request_signal(r) == table)
+            .count() as u64
+    };
+    for entry in [samples_entry, logs_entry] {
+        let pooled = entry.phases.pooled();
+        assert_eq!(
+            pooled.s3_requests(AccountedOp::Get),
+            recorded_count(entry.table, "GET"),
+            "{} GETs",
+            entry.table
+        );
+        assert_eq!(
+            pooled.s3_requests(AccountedOp::List),
+            recorded_count(entry.table, "LIST"),
+            "{} LISTs",
+            entry.table
+        );
+        assert_eq!(
+            pooled.s3_requests(AccountedOp::Head),
+            recorded_count(entry.table, "HEAD"),
+            "{} HEADs",
+            entry.table
+        );
+    }
+    assert_eq!(
+        outcome.accounting.total_s3_requests(),
+        requests.len() as u64,
+        "every recorded request belongs to one entry"
+    );
+    let per_phase = |phases: &ravel_query::PhaseAccountingSnapshot| {
+        QueryPhase::ALL.map(|phase| {
+            let s = phases.phase(phase);
+            (
+                s.s3_requests(AccountedOp::Get),
+                s.s3_requests(AccountedOp::List),
+            )
+        })
+    };
+    // (GET, LIST) per phase, resolve/plan/probe/scan/keyIndex. Resolve: the
+    // catalog HEAD, the commit listing, the commit records and the deletion
+    // listing; the metrics data objects are read while planning, the logs one
+    // while scanning.
+    assert_eq!(
+        per_phase(&samples_entry.phases),
+        [(3, 2), (2, 0), (0, 0), (0, 0), (0, 0)]
+    );
+    assert_eq!(
+        per_phase(&logs_entry.phases),
+        [(2, 2), (0, 0), (0, 0), (1, 0), (0, 0)]
+    );
+
+    // (iv) Each entry's segments are its own lane's, and they sum to the
+    // statement's.
+    assert_eq!(samples_entry.segments, 2);
+    assert_eq!(logs_entry.segments, 1);
+    assert_eq!(
+        samples_entry.segments + logs_entry.segments,
+        outcome.stats.segments
+    );
+    assert_eq!(data_gets(&requests, "/m/").len(), samples_entry.segments);
+    assert_eq!(data_gets(&requests, "/l/").len(), logs_entry.segments);
+    assert_eq!(
+        (samples_entry.segments_pruned, logs_entry.segments_pruned),
+        (0, 0),
+        "an unfolded catalog prunes nothing by postings"
+    );
+}
+
+/// A statement over one signal table, or over none, carries one
+/// `stats.signals` entry, named for the table (`samples` when it names none), whose phases render exactly as `stats.phases` and whose
+/// segments are `stats.pruning.segments`.
+#[tokio::test]
+async fn single_signal_statement_has_one_signals_entry() {
+    use crate::stats_json::phase_costs_json;
+
+    let tenant = TenantId::new("cross-signal-one-entry".to_string());
+    let tenant_hash = tenant.hash();
+    let memory = MemoryStore::new();
+    publish_metric_samples(&memory, &tenant, 1, "m", samples(&[(0, 1.0), (100, 2.0)])).await;
+    publish_log_records(&memory, tenant_hash, Signal::Logs, 2, &logs_at(&[0, 100])).await;
+    publish_spans(
+        &memory,
+        tenant_hash,
+        3,
+        &[SpanRecord {
+            trace_id: [1u8; 16],
+            span_id: [1u8; 8],
+            parent_span_id: None,
+            name: "query".to_string(),
+            start_ts_ns: 100,
+            end_ts_ns: 300,
+            status_code: StatusCode::Ok,
+            status_message: None,
+            attrs: Vec::new(),
+        }],
+    )
+    .await;
+    let store = wrap_fixture_store(memory);
+    let executor = executor_with(store, SqlConfig::default());
+
+    for (sql, table, segments) in [
+        ("SELECT ts, value FROM samples", "samples", 1),
+        ("SELECT ts, body FROM logs", "logs", 1),
+        ("SELECT start_ts FROM spans", "spans", 1),
+        ("SELECT COUNT(*) FROM alerts", "alerts", 0),
+        ("SELECT COUNT(*) FROM audit", "audit", 0),
+        // A statement naming no table resolves `samples`.
+        ("SELECT 1 AS one", "samples", 1),
+    ] {
+        let outcome = executor
+            .execute(tenant_hash, &sql_request(sql, WINDOW))
+            .await
+            .unwrap_or_else(|err| panic!("{sql} runs: {err}"));
+        let tables: Vec<&str> = outcome.signals.iter().map(|s| s.table).collect();
+        assert_eq!(tables, [table], "{sql}");
+        let entry = &outcome.signals[0];
+        assert_eq!(
+            phase_costs_json(&entry.phases),
+            phase_costs_json(&outcome.phase_accounting),
+            "{sql}"
+        );
+        assert!(
+            entry.phases.pooled().total_s3_requests() > 0,
+            "{sql}: the entry is charged"
+        );
+        assert_eq!(entry.segments, outcome.stats.segments, "{sql}");
+        assert_eq!(entry.segments, segments, "{sql}");
+    }
+}
+
+/// The byte and request budgets checked during the samples scan count the
+/// whole statement, not the samples table alone: a request budget above the
+/// samples table's own cost and below the statement's refuses the join.
+#[tokio::test]
+async fn a_statement_budget_still_counts_every_lane() {
+    let (store, tenant_hash) = per_table_cost_fixture("cross-signal-statement-budget").await;
+    // Each run gets its own executor, so neither reads the other's caches.
+    let unbudgeted = executor_with(store.clone(), SqlConfig::default())
+        .execute(tenant_hash, &sql_request(PER_TABLE_JOIN, WINDOW))
+        .await
+        .expect("the unbudgeted join runs");
+    let samples_requests = unbudgeted.signals[0].phases.pooled().total_s3_requests();
+    let statement_requests = unbudgeted.accounting.total_s3_requests();
+    // The resolve-time check holds every lane's resolve, so a budget at that
+    // sum passes it and leaves the refusal to the scan.
+    let max = unbudgeted.phase_accounting.resolve.total_s3_requests();
+    assert!(
+        samples_requests < max && max < statement_requests,
+        "the budget sits between the samples table's {samples_requests} requests \
+         and the statement's {statement_requests}: {max}"
+    );
+    // Samples: 5 resolve + 2 data objects; statement: 9 resolve + 3 data
+    // objects.
+    assert_eq!((samples_requests, max, statement_requests), (7, 9, 12));
+
+    let mut request = sql_request(PER_TABLE_JOIN, WINDOW);
+    request.budgets = Some(RequestBudgets {
+        max_store_requests: Some(RequestLimit::Bounded(max)),
+        ..Default::default()
+    });
+    let err = executor_with(store, SqlConfig::default())
+        .execute(tenant_hash, &request)
+        .await
+        .expect_err("the statement exceeds the budget");
+    // The scan's checkpoint refuses with the same message the resolve-time
+    // check uses, and no table suffix: how many requests were in flight when
+    // it fired depends on scheduling, so only the excess is pinned.
+    let message = err.to_string();
+    let issued: u64 = message
+        .strip_prefix("query issued ")
+        .and_then(|rest| rest.strip_suffix(&format!(" S3 requests, exceeding the budget of {max}")))
+        .and_then(|count| count.parse().ok())
+        .unwrap_or_else(|| panic!("an unexpected refusal: {message}"));
+    assert!(issued > max, "{issued} requests against a budget of {max}");
+}
+
+/// `explain` reports one entry per table, measured on a handle of its own,
+/// and the caller's accounting receives exactly their sum.
+#[tokio::test]
+async fn explain_reports_each_signal_table_and_the_caller_keeps_the_total() {
+    use ravel_types::accounting::AccountedOp;
+
+    let (store, tenant_hash) = per_table_cost_fixture("cross-signal-explain-cost").await;
+    let (recording, executor) = recorded(store, SqlConfig::default());
+    let accounting = QueryAccounting::new();
+    let report = executor
+        .explain_accounted(
+            tenant_hash,
+            &sql_request(PER_TABLE_JOIN, WINDOW),
+            &accounting,
+        )
+        .await
+        .expect("explain plans the join");
+    let tables: Vec<&str> = report.signals.iter().map(|s| s.table).collect();
+    assert_eq!(tables, ["samples", "logs"]);
+    let caller = accounting.snapshot();
+    let resolve_requests: u64 = report
+        .signals
+        .iter()
+        .map(|s| s.phases.resolve.total_s3_requests())
+        .sum();
+    let resolve_bytes: u64 = report
+        .signals
+        .iter()
+        .map(|s| s.phases.resolve.total_s3_bytes())
+        .sum();
+    let all_requests: u64 = report
+        .signals
+        .iter()
+        .map(|s| s.phases.pooled().total_s3_requests())
+        .sum();
+    let all_bytes: u64 = report
+        .signals
+        .iter()
+        .map(|s| s.phases.pooled().total_s3_bytes())
+        .sum();
+    // Resolve per table: the catalog HEAD, the commit listing, one GET per
+    // commit record (two for samples, one for logs) and the deletion listing.
+    // Planning reads no data object here: the metrics one is read only once a
+    // scan opens it.
+    assert_eq!(resolve_requests, 9);
+    assert_eq!(all_requests, caller.total_s3_requests());
+    assert_eq!(all_bytes, caller.total_s3_bytes());
+    assert_eq!(
+        caller.total_s3_requests(),
+        recording.requests().len() as u64
+    );
+    assert_eq!(
+        caller.s3_requests(AccountedOp::List),
+        report
+            .signals
+            .iter()
+            .map(|s| s.phases.pooled().s3_requests(AccountedOp::List))
+            .sum::<u64>()
+    );
+    assert!(resolve_bytes > 0);
+    assert_eq!(
+        report
+            .signals
+            .iter()
+            .map(|s| s.segments)
+            .collect::<Vec<_>>(),
+        [2, 1]
+    );
+    assert_eq!(report.segments_resolved, 3);
+}
+
+/// `stats.signals` follows the fixed table order, not the order the statement
+/// names its tables in: the same join written logs first reports samples then
+/// logs, each entry equal to the samples-first statement's.
+#[tokio::test]
+async fn entries_follow_table_order_not_naming_order() {
+    const LOGS_FIRST: &str = "SELECT s.ts, s.value FROM logs l JOIN samples s ON s.ts = l.ts \
+                              ORDER BY s.ts";
+    let (store, tenant_hash) = per_table_cost_fixture("cross-signal-naming-order").await;
+    // Each run gets its own executor, so neither reads the other's caches.
+    let samples_first = executor_with(store.clone(), SqlConfig::default())
+        .execute(tenant_hash, &sql_request(PER_TABLE_JOIN, WINDOW))
+        .await
+        .expect("the samples-first join runs");
+    let logs_first = executor_with(store, SqlConfig::default())
+        .execute(tenant_hash, &sql_request(LOGS_FIRST, WINDOW))
+        .await
+        .expect("the logs-first join runs");
+    assert_eq!(
+        rows(&logs_first.output, "ts", "value"),
+        rows(&samples_first.output, "ts", "value")
+    );
+    let tables: Vec<&str> = logs_first.signals.iter().map(|s| s.table).collect();
+    assert_eq!(tables, ["samples", "logs"]);
+    assert_eq!(logs_first.signals, samples_first.signals);
+}
+
+/// An `explain` that fails partway through still hands the caller the
+/// requests it made before the failure: the logs lane's deletion listing
+/// fails after the samples lane resolved, and the caller's accounting holds
+/// every request the store saw.
+#[tokio::test]
+async fn a_failed_explain_still_merges_its_cost_into_the_caller() {
+    let tenant = TenantId::new("cross-signal-explain-failure".to_string());
+    let tenant_hash = tenant.hash();
+    let memory = MemoryStore::new();
+    publish_metric_samples(&memory, &tenant, 1, "m", samples(&[(0, 1.0), (100, 2.0)])).await;
+    publish_log_records(&memory, tenant_hash, Signal::Logs, 2, &logs_at(&[100])).await;
+    let logs_deletions = format!("t/{}/l/del/", tenant_hash.to_hex());
+    let plan = FaultPlan::empty().with_rule(
+        Rule::new(
+            Op::List,
+            ScriptedFault::Permanent("injected logs deletion listing failure".to_string()),
+        )
+        .with_key_contains(logs_deletions.clone()),
+    );
+    let store: FixtureStore = Arc::new(InstrumentedStore::new(FaultStore::new(memory, plan)));
+    let (recording, executor) = recorded(store.clone(), SqlConfig::default());
+    let accounting = QueryAccounting::new();
+    executor
+        .explain_accounted(
+            tenant_hash,
+            &sql_request(PER_TABLE_JOIN, WINDOW),
+            &accounting,
+        )
+        .await
+        .expect_err("the logs deletion listing fails the explain");
+
+    assert_eq!(
+        store.inner().fault_count(Op::List, FaultKind::Permanent),
+        1,
+        "the injected failure fired"
+    );
+    let requests = recording.requests();
+    let samples_deletions = format!("LIST t/{}/m/del/", tenant_hash.to_hex());
+    assert!(
+        requests.contains(&samples_deletions),
+        "the samples lane resolved before the failure: {requests:?}"
+    );
+    assert_eq!(
+        requests.last(),
+        Some(&format!("LIST {logs_deletions}")),
+        "the failed listing is the last request"
+    );
+    let caller = accounting.snapshot();
+    assert!(caller.total_s3_requests() > 0);
+    assert_eq!(caller.total_s3_requests(), requests.len() as u64);
 }

@@ -300,11 +300,30 @@ pub(crate) fn record_postings(outcome: &ravel_sql::SqlOutcome) {
     );
 }
 
-/// The JSON `stats` object of an executed statement: its cost accounting and
-/// estimate, per-phase costs, I/O shape, timings and pruning counters.
+/// The JSON `stats` object of a statement run through POST /api/v1/sql: its
+/// cost accounting and estimate, per-phase costs, per-signal-table costs, I/O
+/// shape, timings and pruning counters.
 pub(crate) fn stats_json(
     outcome: &ravel_sql::SqlOutcome,
     audit_elapsed: Duration,
+) -> serde_json::Value {
+    build_stats_json(outcome, audit_elapsed, true)
+}
+
+/// The `stats` object of an ES|QL catalog query: the same sections as
+/// [`stats_json`] without `signals`, which the ES|QL response does not carry.
+#[cfg(feature = "esql")]
+pub(crate) fn esql_stats_json(
+    outcome: &ravel_sql::SqlOutcome,
+    audit_elapsed: Duration,
+) -> serde_json::Value {
+    build_stats_json(outcome, audit_elapsed, false)
+}
+
+fn build_stats_json(
+    outcome: &ravel_sql::SqlOutcome,
+    audit_elapsed: Duration,
+    with_signals: bool,
 ) -> serde_json::Value {
     let mut stats = crate::query::accounting_stats_json(&outcome.accounting, &outcome.estimate);
     if let serde_json::Value::Object(ref mut map) = stats {
@@ -314,6 +333,12 @@ pub(crate) fn stats_json(
                 &outcome.phase_accounting,
             )),
         );
+        if with_signals {
+            map.insert(
+                "signals".to_string(),
+                serde_json::Value::Array(ravel_sql::stats_json::signals_json(&outcome.signals)),
+            );
+        }
         map.insert(
             "io".to_string(),
             ravel_sql::stats_json::io_shape_json(&outcome.io_shape),

@@ -48,6 +48,7 @@ use crate::dedup::RsegDedupExec;
 use crate::pushdown::{Pushdown, extract};
 use crate::scan::RsegScanExec;
 use crate::schema::public_schema;
+use crate::statement_accounting::StatementAccounting;
 
 /// A coordinator-side distributed scan context (ADR-0071): the
 /// worker endpoints one query fans out to, and the client that fetches each
@@ -72,6 +73,11 @@ pub struct RavelTableProvider {
     /// fetch the scan issues on this query's behalf is recorded against the
     /// right phase.
     phase_accounting: PhaseAccounting,
+    /// What the scan's byte and request budgets are checked against: the
+    /// statement total across every table it reads. A provider built with
+    /// [`Self::new`] alone checks its own handle, the whole statement when it
+    /// is the only table.
+    budget_accounting: StatementAccounting,
     /// Pending selective-erasure predicates derived once from
     /// `snapshot.pending_erasure` (ADR-0064 decision 2), cloned
     /// into every `RsegScanExec` the provider builds. On the distributed
@@ -110,11 +116,19 @@ impl RavelTableProvider {
             fetcher,
             config: config.into(),
             schema: public_schema(),
+            budget_accounting: StatementAccounting::One(phase_accounting.clone()),
             phase_accounting,
             erasure,
             #[cfg(feature = "flight-sql")]
             distributed: None,
         }
+    }
+
+    /// Check the scan's byte and request budgets against `statement`, the
+    /// statement total, rather than this table's own handle.
+    pub(crate) fn with_statement_accounting(mut self, statement: StatementAccounting) -> Self {
+        self.budget_accounting = statement;
+        self
     }
 
     /// Install a coordinator-side distributed scan context (ADR-0071). With it, [`TableProvider::scan`] fans the samples scan out to the
@@ -194,6 +208,7 @@ impl RavelTableProvider {
             self.config.engine.max_s3_requests,
             Arc::clone(&self.erasure),
             self.phase_accounting.clone(),
+            self.budget_accounting.clone(),
         )?);
         let scan_schema = scan.schema();
 
