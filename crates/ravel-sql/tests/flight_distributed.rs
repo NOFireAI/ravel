@@ -324,6 +324,7 @@ fn endpoints_for(snapshot: &Snapshot) -> Vec<WorkerSlice> {
                 declared_columns: Vec::new(),
                 parquet_tables: Vec::new(),
                 budgets: None,
+                signal_groups: Vec::new(),
             },
         })
         .collect()
@@ -373,7 +374,9 @@ impl WorkerSliceClient for InProcessWorker {
         // fragment over it. Over-fetching is safe: the coordinator re-applies
         // the exact limit above the dedup, so the worker returns the whole
         // slice regardless of the hint.
-        let snapshot = ticket.snapshot();
+        let snapshot = ticket
+            .snapshot()
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let segments = snapshot.segments.clone();
         let provider = RavelTableProvider::new(
             snapshot,
@@ -955,6 +958,7 @@ fn slice_template(tenant: TenantHash, statement: &str, snapshot: &Snapshot) -> F
         declared_columns: Vec::new(),
         parquet_tables: Vec::new(),
         budgets: None,
+        signal_groups: Vec::new(),
     }
 }
 
@@ -2066,6 +2070,7 @@ fn rlog_endpoints_for(snapshot: &Snapshot) -> Vec<WorkerSlice> {
                 declared_columns: Vec::new(),
                 parquet_tables: Vec::new(),
                 budgets: None,
+                signal_groups: Vec::new(),
             },
         })
         .collect()
@@ -2095,7 +2100,9 @@ impl WorkerSliceClient for RlogWorker {
         _limit: Option<usize>,
         _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let snapshot = ticket.snapshot();
+        let snapshot = ticket
+            .snapshot()
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let target_partitions = snapshot.segments.len().max(1);
         let plan = (self.build)(snapshot, self.fetcher.clone(), target_partitions)?;
         execute_stream(plan, Arc::new(TaskContext::default()))
@@ -2335,7 +2342,9 @@ impl WorkerSliceClient for RecordingLogsWorker {
         _limit: Option<usize>,
         _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let snapshot = ticket.snapshot();
+        let snapshot = ticket
+            .snapshot()
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let target_partitions = snapshot.segments.len().max(1);
         let plan = logs_fragment(snapshot, self.fetcher.clone(), target_partitions)?;
         self.ran
@@ -2961,7 +2970,9 @@ impl WorkerSliceClient for SpanWorker {
         _limit: Option<usize>,
         _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let snapshot = ticket.snapshot();
+        let snapshot = ticket
+            .snapshot()
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let target_partitions = snapshot.segments.len().max(1);
         let plan = SpansTableProvider::new(
             snapshot,
@@ -3249,7 +3260,9 @@ impl WorkerSliceClient for PushdownSpanWorker {
         _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let (ticket, pushdown) = over_the_wire(ticket, pushdown)?;
-        let snapshot = ticket.snapshot();
+        let snapshot = ticket
+            .snapshot()
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let target_partitions = snapshot.segments.len().max(1);
         let phases = PhaseAccounting::new();
         let plan = SpansTableProvider::new(
@@ -3306,7 +3319,9 @@ impl WorkerSliceClient for PushdownLogsWorker {
         _context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         let (ticket, pushdown) = over_the_wire(ticket, pushdown)?;
-        let snapshot = ticket.snapshot();
+        let snapshot = ticket
+            .snapshot()
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let target_partitions = snapshot.segments.len().max(1);
         let phases = PhaseAccounting::new();
         let plan = LogsTableProvider::new(snapshot, TENANT, self.fetcher.clone(), phases.clone())

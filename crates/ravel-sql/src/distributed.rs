@@ -333,7 +333,10 @@ impl WorkerSliceClient for CoordinatorSliceReader {
         _limit: Option<usize>,
         context: &Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
-        let snapshot = ticket.snapshot();
+        // A slice ticket is never version 10, so it always has one snapshot.
+        let snapshot = ticket
+            .snapshot()
+            .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         let segments = snapshot.segments.clone();
         let provider = RavelTableProvider::new(
             snapshot,
@@ -1123,6 +1126,7 @@ pub fn plan_distributed_slices(
                     parquet_tables: Vec::new(),
                     // A worker slice runs under the worker's own ceilings.
                     budgets: None,
+                    signal_groups: Vec::new(),
                 };
                 WorkerSlice { location, ticket }
             })

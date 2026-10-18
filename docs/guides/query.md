@@ -470,8 +470,9 @@ write passes each write's token, qualified:
 }
 ```
 
-Flight SQL takes only unqualified tokens, and `POST /api/v1/esql` takes no
-`min_commit_token`. A trace lookup (`GET /api/traces/{trace_id}`) reads only
+Flight SQL takes only unqualified tokens, so a Flight SQL join of two or more
+of the five takes none, and `POST /api/v1/esql` takes no `min_commit_token`.
+A trace lookup (`GET /api/traces/{trace_id}`) reads only
 `spans`, so its token is unqualified or `spans:<token>`.
 
 ## Query budgets
@@ -667,8 +668,12 @@ runs on the server that received the query. `min_commit_token` on a query
 that names two or more of the five must be qualified with the table it bounds,
 `samples:<token>` or `logs:<token>`, and each token waits only for its own
 table; an unqualified one is an HTTP 400 before any catalog listing (see
-[Qualifying a token by table](#qualifying-a-token-by-table-sql)). Flight SQL and
-ES|QL still read one of the five per query. The request body, auth, window (`start`/`end`), and
+[Qualifying a token by table](#qualifying-a-token-by-table-sql)). Flight SQL
+runs such a query too, and its `DoGet` reads exactly the snapshots of every
+table that `GetFlightInfo` resolved. Flight SQL tokens cannot be qualified,
+so over Flight SQL such a query takes no `min_commit_token`: with one it is
+refused with `INVALID_ARGUMENT` at `GetFlightInfo`. ES|QL still reads one of
+the five per query. The request body, auth, window (`start`/`end`), and
 `min_commit_token` handling are otherwise the same for all five tables.
 
 The same endpoint also serves the Parquet tables of the tenant. A query can

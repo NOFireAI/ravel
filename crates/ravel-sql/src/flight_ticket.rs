@@ -71,7 +71,8 @@
 //!
 //! ```text
 //! magic         4   b"RFT1"
-//! version       1   = 8, or 9 for a ticket carrying the pushdown block
+//! version       1   = 8; 9 for a ticket carrying the pushdown block; 10 for
+//!                   a ticket carrying segment groups (see below)
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -79,6 +80,13 @@
 //! slice_count   4   u32   (number of slices; 1 for a whole-snapshot ticket)
 //! token_count   4   u32
 //!   per token:  4 + N   len-prefixed CommitToken::encode() (ASCII)
+//! [pins]            versions 8 and 9: seg_count through erasure_count
+//!                   below, once. Version 10 instead:
+//!   group_count  4   u32   (>= 2, one per signal table the statement reads)
+//!   per group, in lane order samples, logs, spans, alerts, audit:
+//!     signal_tag   1   1 = samples, 2 = logs, 3 = spans, 4 = alerts,
+//!                      5 = audit; no duplicates
+//!     seg_count through erasure_count below, for that table alone
 //! seg_count     4   u32
 //!   per segment:
 //!     writer_epoch       8   u64
@@ -99,6 +107,7 @@
 //!       if L1:
 //!         input_set_hash 32   [u8; 32]
 //!         part_index      4   u32
+//!     segment_format_version 4   u32
 //! erasure_count 4   u32   (pending erasure predicates, ADR-0064 decision 3)
 //!   per predicate:
 //!     matcher_count      4   u32
@@ -162,6 +171,19 @@
 //! so a metrics slice or a coordinator built before the block mints exactly
 //! what it always did. See "Version history" below for why the block needs
 //! the bump.
+//!
+//! Segment groups (ADR-2904 decision 10) are how a statement naming two or
+//! more signal tables, such as `samples JOIN logs`, keeps the two-RPC pin.
+//! `GetFlightInfo` resolves one snapshot per signal table, as the HTTP
+//! endpoint does, and each table's segments and pending erasure become one
+//! group, so `DoGet` rebuilds every table's own snapshot without resolving
+//! again. A flat pin list could not say which segments belong to which
+//! table. [`FlightTicket::signal_groups`] non-empty makes the ticket version
+//! 10, with both flat lists empty; empty keeps a statement over at most one
+//! signal table on version 8 or 9, byte for byte. A version 10 ticket is
+//! client-surface only: the distributed slice path splits one snapshot, so
+//! a slice ticket never carries groups and the slice surface decodes at most
+//! version 9.
 //!
 //! # Integrity: a keyed MAC, not a checksum
 //!
@@ -318,6 +340,10 @@
 //! - 9: the slice pushdown block after the statement (issue #2755). Written
 //!   only when a pushdown is attached; a ticket without one stays 8, and this
 //!   codec decodes both.
+//! - 10: one segment group per signal table in place of the flat pins, for a
+//!   statement naming two or more signal tables (ADR-2904 decision 10).
+//!   Written only then and only on the client surface; every other ticket
+//!   stays 8 or 9.
 //!
 //! Every layout change bumps the byte, even though a ticket is ephemeral,
 //! because the build that mints a ticket and the build that redeems it can
@@ -339,6 +365,8 @@ use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
 use crate::declared::{DeclaredColumn, DeclaredType};
+use crate::error::SqlError;
+use crate::executor::{SIGNAL_LANE_ORDER, SqlExecutor, TargetSignal, pinned_signals_mismatch};
 use crate::logs_pushdown::LogsPushdown;
 use crate::parquet::{MAX_STATEMENT_TABLE_NAMES, ParquetPin};
 use crate::spans_pushdown::SpansPushdown;
@@ -352,9 +380,67 @@ const MAGIC: [u8; 4] = *b"RFT1";
 /// Version of a ticket without the slice pushdown block, and the oldest this
 /// codec decodes.
 const VERSION: u8 = 8;
-/// Version of a ticket carrying the slice pushdown block, and the newest this
-/// codec decodes.
+/// Version of a ticket carrying the slice pushdown block, and the newest the
+/// slice surface decodes.
 pub(crate) const VERSION_PUSHDOWN: u8 = 9;
+/// Version of a ticket carrying one segment group per signal table (ADR-2904
+/// decision 10), and the newest the client surface decodes. A slice ticket is
+/// never this version.
+pub(crate) const VERSION_GROUPS: u8 = 10;
+
+/// Wire tag of each signal table's group in a version 10 ticket. Parquet
+/// tables have no segment set and so no tag.
+const SIGNAL_TAG_SAMPLES: u8 = 1;
+const SIGNAL_TAG_LOGS: u8 = 2;
+const SIGNAL_TAG_SPANS: u8 = 3;
+const SIGNAL_TAG_ALERTS: u8 = 4;
+const SIGNAL_TAG_AUDIT: u8 = 5;
+
+fn signal_tag(signal: TargetSignal) -> Result<u8, FlightTicketError> {
+    match signal {
+        TargetSignal::Metrics => Ok(SIGNAL_TAG_SAMPLES),
+        TargetSignal::Logs => Ok(SIGNAL_TAG_LOGS),
+        TargetSignal::Spans => Ok(SIGNAL_TAG_SPANS),
+        TargetSignal::Alerts => Ok(SIGNAL_TAG_ALERTS),
+        TargetSignal::Audit => Ok(SIGNAL_TAG_AUDIT),
+        TargetSignal::Parquet => Err(FlightTicketError::ParquetSignalGroup),
+    }
+}
+
+fn signal_from_tag(tag: u8) -> Result<TargetSignal, FlightTicketError> {
+    match tag {
+        SIGNAL_TAG_SAMPLES => Ok(TargetSignal::Metrics),
+        SIGNAL_TAG_LOGS => Ok(TargetSignal::Logs),
+        SIGNAL_TAG_SPANS => Ok(TargetSignal::Spans),
+        SIGNAL_TAG_ALERTS => Ok(TargetSignal::Alerts),
+        SIGNAL_TAG_AUDIT => Ok(TargetSignal::Audit),
+        other => Err(FlightTicketError::InvalidSignalTag(other)),
+    }
+}
+
+/// Check a group list against the rules both encode and decode enforce: at
+/// least two groups, no signal twice, and the groups in [`SIGNAL_LANE_ORDER`].
+fn check_signal_order(signals: &[TargetSignal]) -> Result<(), FlightTicketError> {
+    if signals.len() < 2 {
+        return Err(FlightTicketError::TooFewSignalGroups(signals.len()));
+    }
+    let mut last = None;
+    for (index, signal) in signals.iter().enumerate() {
+        let tag = signal_tag(*signal)?;
+        if signals[..index].contains(signal) {
+            return Err(FlightTicketError::DuplicateSignalGroup(tag));
+        }
+        let position = SIGNAL_LANE_ORDER
+            .iter()
+            .position(|lane| lane == signal)
+            .ok_or(FlightTicketError::ParquetSignalGroup)?;
+        if last.is_some_and(|last| position < last) {
+            return Err(FlightTicketError::SignalGroupsOutOfOrder);
+        }
+        last = Some(position);
+    }
+    Ok(())
+}
 
 /// Length in bytes of the trailing keyed-MAC tag ([`mac`]).
 const MAC_LEN: usize = 32;
@@ -518,13 +604,15 @@ impl SqlTicketKeys {
         }
     }
 
-    /// Sign `ticket` for `surface` with its mint key.
+    /// Sign `ticket` for `surface` with its mint key. A ticket carrying signal
+    /// groups is refused on the slice surface
+    /// ([`FlightTicketError::SignalGroupsOnSlice`]).
     pub fn encode(
         &self,
         ticket: &FlightTicket,
         surface: TicketSurface,
     ) -> Result<Vec<u8>, FlightTicketError> {
-        ticket.encode(self.mint_key(surface))
+        self.encode_with_pushdown(ticket, surface, None)
     }
 
     /// [`Self::encode`] with a slice pushdown block
@@ -535,13 +623,17 @@ impl SqlTicketKeys {
         surface: TicketSurface,
         pushdown: Option<&SlicePushdown>,
     ) -> Result<Vec<u8>, FlightTicketError> {
+        if surface == TicketSurface::Slice && !ticket.signal_groups.is_empty() {
+            return Err(FlightTicketError::SignalGroupsOnSlice);
+        }
         ticket.encode_with_pushdown(self.mint_key(surface), pushdown)
     }
 
     /// Decode `bytes` as a `surface` ticket, accepting a MAC under any of that
     /// surface's keys. [`FlightTicketError::MacMismatch`] when none verifies;
     /// any other error is the first key's structural refusal, which does not
-    /// depend on the key.
+    /// depend on the key. The slice surface decodes up to version 9: a
+    /// version 10 ticket there is [`FlightTicketError::UnsupportedVersion`].
     pub fn decode(
         &self,
         bytes: &[u8],
@@ -558,8 +650,12 @@ impl SqlTicketKeys {
         bytes: &[u8],
         surface: TicketSurface,
     ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
+        let max_version = match surface {
+            TicketSurface::Client => VERSION_GROUPS,
+            TicketSurface::Slice => VERSION_PUSHDOWN,
+        };
         for key in self.keys(surface) {
-            match FlightTicket::decode_with_pushdown(bytes, key) {
+            match FlightTicket::decode_up_to(bytes, key, max_version) {
                 Err(FlightTicketError::MacMismatch) => continue,
                 other => return other,
             }
@@ -719,6 +815,51 @@ impl SegmentPin {
     }
 }
 
+/// One signal table's pinned segments and pending erasure inside a version 10
+/// [`FlightTicket`] (ADR-2904 decision 10): what `GetFlightInfo` resolved for
+/// that table, which `DoGet` rebuilds into that table's own snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalGroup {
+    /// The signal table the group pins. Never [`TargetSignal::Parquet`].
+    pub signal: TargetSignal,
+    /// The segments that table's resolve returned, in resolve order.
+    pub segments: Vec<SegmentPin>,
+    /// The pending selective-erasure predicates that table's resolve saw.
+    pub pending_erasure: Vec<ErasurePredicate>,
+}
+
+impl SignalGroup {
+    /// Project one signal's resolved snapshot onto the wire layout.
+    pub fn from_snapshot(signal: TargetSignal, snapshot: &ravel_catalog::Snapshot) -> Self {
+        SignalGroup {
+            signal,
+            segments: snapshot
+                .segments
+                .iter()
+                .map(SegmentPin::from_segment_ref)
+                .collect(),
+            pending_erasure: ravel_query::erasure::snapshot_pending_erasure_predicates(snapshot),
+        }
+    }
+
+    /// Rebuild the snapshot this group pinned, the same way
+    /// [`FlightTicket::snapshot`] rebuilds a single-signal ticket's.
+    pub fn snapshot(&self) -> ravel_catalog::Snapshot {
+        rebuild_snapshot(&self.segments, &self.pending_erasure)
+    }
+}
+
+fn rebuild_snapshot(
+    segments: &[SegmentPin],
+    pending_erasure: &[ErasurePredicate],
+) -> ravel_catalog::Snapshot {
+    ravel_catalog::Snapshot {
+        segments: segments.iter().map(SegmentPin::to_segment_ref).collect(),
+        segments_pruned: 0,
+        pending_erasure: pending_erasure.iter().map(to_erasure_request).collect(),
+    }
+}
+
 /// A self-describing, snapshot-pinning Flight SQL ticket.
 ///
 /// Round-trips bit-for-bit through [`FlightTicket::encode`] /
@@ -777,6 +918,13 @@ pub struct FlightTicket {
     /// lower the executor's ceilings. `None` runs under the executor's own
     /// configuration.
     pub budgets: Option<RequestBudgets>,
+    /// One group per signal table the statement names, in
+    /// [`SIGNAL_LANE_ORDER`], when it names two or more (ADR-2904 decision
+    /// 10). Non-empty makes the ticket version 10, which carries these
+    /// instead of [`Self::segments`] and [`Self::pending_erasure`], both then
+    /// empty. Empty for a statement over at most one signal table, whose
+    /// ticket keeps the version 8 or 9 encoding byte for byte.
+    pub signal_groups: Vec<SignalGroup>,
 }
 
 impl FlightTicket {
@@ -806,9 +954,27 @@ impl FlightTicket {
             });
         }
 
+        let grouped = !self.signal_groups.is_empty();
+        if grouped {
+            if !self.segments.is_empty() || !self.pending_erasure.is_empty() {
+                return Err(FlightTicketError::SignalGroupsBesideFlatPins);
+            }
+            if pushdown.is_some() {
+                return Err(FlightTicketError::SignalGroupsWithPushdown);
+            }
+            let signals: Vec<TargetSignal> = self
+                .signal_groups
+                .iter()
+                .map(|group| group.signal)
+                .collect();
+            check_signal_order(&signals)?;
+        }
+
         let mut buf = Vec::with_capacity(MIN_ENCODED_LEN + self.statement.len());
         buf.extend_from_slice(&MAGIC);
-        buf.push(if pushdown.is_some() {
+        buf.push(if grouped {
+            VERSION_GROUPS
+        } else if pushdown.is_some() {
             VERSION_PUSHDOWN
         } else {
             VERSION
@@ -824,20 +990,14 @@ impl FlightTicket {
             write_len_prefixed(&mut buf, token.encode().as_bytes())?;
         }
 
-        write_u32(&mut buf, u32_len(self.segments.len())?);
-        for seg in &self.segments {
-            write_segment_pin(&mut buf, seg)?;
-        }
-
-        write_u32(&mut buf, u32_len(self.pending_erasure.len())?);
-        for predicate in &self.pending_erasure {
-            write_u32(&mut buf, u32_len(predicate.matchers().len())?);
-            for (key, value) in predicate.matchers() {
-                write_len_prefixed(&mut buf, key.as_bytes())?;
-                write_len_prefixed(&mut buf, value.as_bytes())?;
+        if grouped {
+            write_u32(&mut buf, u32_len(self.signal_groups.len())?);
+            for group in &self.signal_groups {
+                buf.push(signal_tag(group.signal)?);
+                write_pins(&mut buf, &group.segments, &group.pending_erasure)?;
             }
-            buf.extend_from_slice(&predicate.window_start_ns().to_le_bytes());
-            buf.extend_from_slice(&predicate.window_end_ns().to_le_bytes());
+        } else {
+            write_pins(&mut buf, &self.segments, &self.pending_erasure)?;
         }
 
         write_u32(&mut buf, u32_len(self.declared_columns.len())?);
@@ -895,7 +1055,7 @@ impl FlightTicket {
         bytes: &[u8],
         key: &TicketKey,
     ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
-        Self::decode_up_to(bytes, key, VERSION_PUSHDOWN)
+        Self::decode_up_to(bytes, key, VERSION_GROUPS)
     }
 
     /// The decoder for versions [`VERSION`] through `max_version`. Pinned at
@@ -943,33 +1103,33 @@ impl FlightTicket {
             min_commit_tokens.push(token);
         }
 
-        let seg_count = cur.read_u32()?;
-        let mut segments = Vec::new();
-        for _ in 0..seg_count {
-            segments.push(read_segment_pin(&mut cur)?);
-        }
-
-        let erasure_count = cur.read_u32()?;
-        let mut pending_erasure = Vec::new();
-        for _ in 0..erasure_count {
-            let matcher_count = cur.read_u32()?;
-            let mut matchers = Vec::new();
-            for _ in 0..matcher_count {
-                let key = cur.read_len_prefixed()?;
-                let key = std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
-                let value = cur.read_len_prefixed()?;
-                let value =
-                    std::str::from_utf8(value).map_err(|_| FlightTicketError::InvalidUtf8)?;
-                matchers.push((key.to_owned(), value.to_owned()));
+        // A version 10 ticket has no flat segment or erasure list: the group
+        // list stands in their place, so both stay empty.
+        let (segments, pending_erasure, signal_groups) = if version == VERSION_GROUPS {
+            let group_count = cur.read_u32()?;
+            let mut signal_groups = Vec::new();
+            let mut signals = Vec::new();
+            for _ in 0..group_count {
+                let signal = signal_from_tag(cur.read_u8()?)?;
+                signals.push(signal);
+                // Refuse a repeat or an out-of-order group as soon as it is
+                // read, before its pins are parsed.
+                if signals.len() >= 2 {
+                    check_signal_order(&signals)?;
+                }
+                let (segments, pending_erasure) = read_pins(&mut cur)?;
+                signal_groups.push(SignalGroup {
+                    signal,
+                    segments,
+                    pending_erasure,
+                });
             }
-            let window_start_ns = i64::from_le_bytes(cur.read_array::<8>()?);
-            let window_end_ns = i64::from_le_bytes(cur.read_array::<8>()?);
-            pending_erasure.push(ErasurePredicate::new(
-                matchers,
-                window_start_ns,
-                window_end_ns,
-            ));
-        }
+            check_signal_order(&signals)?;
+            (Vec::new(), Vec::new(), signal_groups)
+        } else {
+            let (segments, pending_erasure) = read_pins(&mut cur)?;
+            (segments, pending_erasure, Vec::new())
+        };
 
         let declared_count = cur.read_u32()?;
         let mut declared_columns = Vec::new();
@@ -1040,6 +1200,7 @@ impl FlightTicket {
             declared_columns,
             parquet_tables,
             budgets,
+            signal_groups,
         };
         Ok((ticket, pushdown))
     }
@@ -1067,20 +1228,55 @@ impl FlightTicket {
     /// `RavelTableProvider::new` derives the same predicate set from a
     /// redeemed ticket that `GetFlightInfo`'s resolve saw pending -- never an
     /// empty set regardless of what the resolve actually found.
-    pub fn snapshot(&self) -> ravel_catalog::Snapshot {
-        ravel_catalog::Snapshot {
-            segments: self
-                .segments
-                .iter()
-                .map(SegmentPin::to_segment_ref)
-                .collect(),
-            segments_pruned: 0,
-            pending_erasure: self
-                .pending_erasure
-                .iter()
-                .map(to_erasure_request)
-                .collect(),
+    ///
+    /// A version 10 ticket pins one snapshot per signal table and has no
+    /// single one: [`Self::signal_snapshots`] rebuilds those, and this method
+    /// returns [`FlightTicketError::SignalGroupsHaveNoSingleSnapshot`] for it
+    /// rather than an empty snapshot.
+    pub fn snapshot(&self) -> Result<ravel_catalog::Snapshot, FlightTicketError> {
+        if !self.signal_groups.is_empty() {
+            return Err(FlightTicketError::SignalGroupsHaveNoSingleSnapshot);
         }
+        Ok(rebuild_snapshot(&self.segments, &self.pending_erasure))
+    }
+
+    /// One rebuilt snapshot per signal group, in the groups' lane order:
+    /// what `DoGet` plans a version 10 ticket against. Empty for a version 8
+    /// or 9 ticket.
+    pub fn signal_snapshots(&self) -> Vec<(TargetSignal, ravel_catalog::Snapshot)> {
+        self.signal_groups
+            .iter()
+            .map(|group| (group.signal, group.snapshot()))
+            .collect()
+    }
+
+    /// The snapshots `DoGet` plans this ticket's statement against, one per
+    /// signal lane, checked against the statement before any store request.
+    ///
+    /// A version 8 or 9 ticket pins one snapshot, so its statement must name
+    /// at most one signal table ([`SqlError::TicketPinsOneSignal`]
+    /// otherwise). A version 10 ticket's groups must name exactly the signal
+    /// tables the statement reads ([`SqlError::PinnedSignalsMismatch`]
+    /// otherwise). The statement's tables come from the same parse every plan
+    /// takes ([`SqlExecutor::statement_tables`]).
+    pub(crate) fn redemption_lanes(
+        &self,
+    ) -> Result<Vec<(TargetSignal, ravel_catalog::Snapshot)>, SqlError> {
+        let tables = SqlExecutor::statement_tables(&self.statement)?;
+        if self.signal_groups.is_empty() {
+            if tables.signals.len() > 1 {
+                return Err(SqlError::TicketPinsOneSignal);
+            }
+            return Ok(vec![(
+                tables.first_lane(),
+                rebuild_snapshot(&self.segments, &self.pending_erasure),
+            )]);
+        }
+        let pinned: Vec<TargetSignal> = self.signal_groups.iter().map(|g| g.signal).collect();
+        if pinned != tables.signals {
+            return Err(pinned_signals_mismatch(&pinned, &tables.signals));
+        }
+        Ok(self.signal_snapshots())
     }
 }
 
@@ -1259,6 +1455,38 @@ pub enum FlightTicketError {
     /// Bytes remained after the last field was read.
     #[error("ticket has trailing bytes")]
     TrailingBytes,
+    /// A ticket set both signal groups and the flat segment or erasure list;
+    /// a version 10 ticket carries its pins in the groups alone.
+    #[error("ticket sets both signal groups and a flat segment or erasure list")]
+    SignalGroupsBesideFlatPins,
+    /// A ticket set both signal groups and a slice pushdown block; a version
+    /// 10 ticket carries no pushdown.
+    #[error("ticket sets both signal groups and a slice pushdown block")]
+    SignalGroupsWithPushdown,
+    /// A ticket carrying signal groups was minted for the slice surface,
+    /// which never carries one.
+    #[error("a slice ticket cannot carry signal groups")]
+    SignalGroupsOnSlice,
+    /// A version 10 ticket carried fewer than two signal groups.
+    #[error("ticket carries {0} signal groups; a grouped ticket carries at least two")]
+    TooFewSignalGroups(usize),
+    /// A signal group's tag byte names no signal table.
+    #[error("ticket contains an invalid signal group tag {0}")]
+    InvalidSignalTag(u8),
+    /// A signal group named the Parquet target, which has no segment set.
+    #[error("a signal group cannot pin Parquet tables")]
+    ParquetSignalGroup,
+    /// Two signal groups carried the same signal tag.
+    #[error("ticket carries signal group tag {0} twice")]
+    DuplicateSignalGroup(u8),
+    /// The signal groups were not in the statement lane order (samples, logs,
+    /// spans, alerts, audit).
+    #[error("ticket signal groups are out of lane order")]
+    SignalGroupsOutOfOrder,
+    /// [`FlightTicket::snapshot`] was asked for the single snapshot of a
+    /// version 10 ticket, which pins one per signal group.
+    #[error("a ticket with signal groups pins one snapshot per signal, not one")]
+    SignalGroupsHaveNoSingleSnapshot,
 }
 
 /// Keyed BLAKE3-256 MAC over `bytes`. Deterministic across processes and
@@ -1357,6 +1585,63 @@ fn read_segment_pin(cur: &mut Cursor<'_>) -> Result<SegmentPin, FlightTicketErro
         level,
         segment_format_version,
     })
+}
+
+/// A segment list then an erasure list, each count-prefixed: the flat lists
+/// of a version 8 or 9 ticket and the body of each version 10 group.
+fn write_pins(
+    buf: &mut Vec<u8>,
+    segments: &[SegmentPin],
+    pending_erasure: &[ErasurePredicate],
+) -> Result<(), FlightTicketError> {
+    write_u32(buf, u32_len(segments.len())?);
+    for seg in segments {
+        write_segment_pin(buf, seg)?;
+    }
+    write_u32(buf, u32_len(pending_erasure.len())?);
+    for predicate in pending_erasure {
+        write_u32(buf, u32_len(predicate.matchers().len())?);
+        for (key, value) in predicate.matchers() {
+            write_len_prefixed(buf, key.as_bytes())?;
+            write_len_prefixed(buf, value.as_bytes())?;
+        }
+        buf.extend_from_slice(&predicate.window_start_ns().to_le_bytes());
+        buf.extend_from_slice(&predicate.window_end_ns().to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Inverse of [`write_pins`].
+fn read_pins(
+    cur: &mut Cursor<'_>,
+) -> Result<(Vec<SegmentPin>, Vec<ErasurePredicate>), FlightTicketError> {
+    let seg_count = cur.read_u32()?;
+    // Do not pre-allocate from the untrusted count; push and grow.
+    let mut segments = Vec::new();
+    for _ in 0..seg_count {
+        segments.push(read_segment_pin(cur)?);
+    }
+    let erasure_count = cur.read_u32()?;
+    let mut pending_erasure = Vec::new();
+    for _ in 0..erasure_count {
+        let matcher_count = cur.read_u32()?;
+        let mut matchers = Vec::new();
+        for _ in 0..matcher_count {
+            let key = cur.read_len_prefixed()?;
+            let key = std::str::from_utf8(key).map_err(|_| FlightTicketError::InvalidUtf8)?;
+            let value = cur.read_len_prefixed()?;
+            let value = std::str::from_utf8(value).map_err(|_| FlightTicketError::InvalidUtf8)?;
+            matchers.push((key.to_owned(), value.to_owned()));
+        }
+        let window_start_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+        let window_end_ns = i64::from_le_bytes(cur.read_array::<8>()?);
+        pending_erasure.push(ErasurePredicate::new(
+            matchers,
+            window_start_ns,
+            window_end_ns,
+        ));
+    }
+    Ok((segments, pending_erasure))
 }
 
 /// Per-segment wire encoding of [`SegmentLevel`]: a single tag byte (0 = L0,
@@ -1761,6 +2046,7 @@ mod tests {
             declared_columns: Vec::new(),
             parquet_tables: Vec::new(),
             budgets: None,
+            signal_groups: Vec::new(),
         };
         let encoded = ticket.encode(&a).expect("encode");
         assert!(FlightTicket::decode(&encoded, &b).is_ok());
@@ -1910,6 +2196,7 @@ mod tests {
                 max_store_requests: Some(RequestLimit::Unlimited),
                 max_segments: Some(12),
             }),
+            signal_groups: Vec::new(),
         }
     }
 
@@ -1957,7 +2244,10 @@ mod tests {
             let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
             // Reconstruct the SegmentRef through the full mint/decode/rebuild
             // path, not just the in-memory struct conversion.
-            assert_eq!(decoded.snapshot().segments, vec![seg]);
+            assert_eq!(
+                decoded.snapshot().expect("a one-snapshot ticket").segments,
+                vec![seg]
+            );
         }
     }
 
@@ -2054,7 +2344,7 @@ mod tests {
         let bytes = ticket.encode(&test_key()).expect("encode");
         let decoded = FlightTicket::decode(&bytes, &test_key()).expect("decode");
 
-        let snapshot = decoded.snapshot();
+        let snapshot = decoded.snapshot().expect("a one-snapshot ticket");
         assert_eq!(
             snapshot.segments,
             ticket
@@ -2073,7 +2363,7 @@ mod tests {
         let key = test_key();
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
-        body.push(VERSION_PUSHDOWN.wrapping_add(1));
+        body.push(VERSION_GROUPS.wrapping_add(1));
         body.extend_from_slice(&[0u8; 16]);
         body.extend_from_slice(&0i64.to_le_bytes());
         body.extend_from_slice(&0i64.to_le_bytes());
@@ -2094,6 +2384,31 @@ mod tests {
             Err(FlightTicketError::UnsupportedVersion(_))
         ));
     }
+
+    fn to_hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// A ticket over one signal encodes to exactly the bytes it did before
+    /// signal groups existed: version 8 without a pushdown block, version 9
+    /// with one. Both literals were generated on the tree before version 10,
+    /// so a ticket in flight across an upgrade still verifies and decodes.
+    #[test]
+    fn single_signal_tickets_are_byte_identical_to_before() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let v8 = ticket.encode(&key).expect("encode v8");
+        let v9 = ticket
+            .encode_with_pushdown(&key, Some(&sample_logs_pushdown()))
+            .expect("encode v9");
+        assert_eq!(v8[4], 8);
+        assert_eq!(v9[4], 9);
+        assert_eq!(to_hex(&v8), V8_GOLDEN_HEX);
+        assert_eq!(to_hex(&v9), V9_GOLDEN_HEX);
+    }
+
+    const V8_GOLDEN_HEX: &str = "52465431080707070707070707070707070707070700002a36fe9c971700ac4d32059d97170000000001000000020000003f000000646a49364d546f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441774f57557a4e7a6335596a6b364d6a6f334f6a4540000000646a49364d6a6f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441784d324d325a57597a4e7a49364d7a6f784e446f7902000000c00b000000000000c10b000000000000c20b000000000000b90b000000000000ba0b000000000000bb0b000000000000bd0b000000000000be0b000000000000070000000a0000000303030303030303030303030303030303030303030303030303030303030303000000000000000000000000369d036b23000000742f61612f6d6574726963732f6c312f303030302f772e312e322e6162632e727365670103030303030303030303030303030303030303030303030303030303030303030e0000000f000000481f000000000000491f0000000000004a1f000000000000411f000000000000421f000000000000431f000000000000451f000000000000461f0000000000000c0000000f000000080808080808080808080808080808080808080808080808080808080808080800000000000000000000000091a2b3c823000000742f61612f6d6574726963732f6c302f303030312f772e342e352e6465662e7273656700140000000200000001000000080000005f5f6e616d655f5f0800000065726173655f6d65000000000000000000000000000000000100000006000000726567696f6e0700000075732d656173746400000000000000c8000000000000000400000010000000687474702e7374617475735f636f646502120000006b38732e6e616d6573706163652e6e616d6501020000006f6b03070000007061796c6f6164040200000004000000686974730700000000000000090000005f6f72646572735f32ffffffffffffffff0102000000400000000001020c000000000000002e00000053454c454354202a2046524f4d2073616d706c6573205748455245207473203e3d203120414e44207473203c2032c98d62930dedceb80ed7eebb08d798b38446f1b2e88bae028f7620a50ae0557c";
+    const V9_GOLDEN_HEX: &str = "52465431090707070707070707070707070707070700002a36fe9c971700ac4d32059d97170000000001000000020000003f000000646a49364d546f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441774f57557a4e7a6335596a6b364d6a6f334f6a4540000000646a49364d6a6f774d4441774d4441774d4330774d4441774c5441774d4441744d4441774d4330774d4441784d324d325a57597a4e7a49364d7a6f784e446f7902000000c00b000000000000c10b000000000000c20b000000000000b90b000000000000ba0b000000000000bb0b000000000000bd0b000000000000be0b000000000000070000000a0000000303030303030303030303030303030303030303030303030303030303030303000000000000000000000000369d036b23000000742f61612f6d6574726963732f6c312f303030302f772e312e322e6162632e727365670103030303030303030303030303030303030303030303030303030303030303030e0000000f000000481f000000000000491f0000000000004a1f000000000000411f000000000000421f000000000000431f000000000000451f000000000000461f0000000000000c0000000f000000080808080808080808080808080808080808080808080808080808080808080800000000000000000000000091a2b3c823000000742f61612f6d6574726963732f6c302f303030312f772e342e352e6465662e7273656700140000000200000001000000080000005f5f6e616d655f5f0800000065726173655f6d65000000000000000000000000000000000100000006000000726567696f6e0700000075732d656173746400000000000000c8000000000000000400000010000000687474702e7374617475735f636f646502120000006b38732e6e616d6573706163652e6e616d6501020000006f6b03070000007061796c6f6164040200000004000000686974730700000000000000090000005f6f72646572735f32ffffffffffffffff0102000000400000000001020c000000000000002e00000053454c454354202a2046524f4d2073616d706c6573205748455245207473203e3d203120414e44207473203c2032020001ffffffffffffff7f050000000107000000736572766963650108000000636865636b6f75740104000000626c6f6205030000000001ff020b0000007374617475735f636f64650201fdffffffffffffff00020700000073616d706c6564040101000000000000000101000000000000000205000000726174696f030001000000000000e03f895fac53726f191762670f3474908a66d704122b1993e82dbb260302de63501b";
 
     /// The predecessor envelope version (v3, before ADR-0071 added the slice
     /// pair) is rejected with the existing typed `UnsupportedVersion`, never
@@ -2255,6 +2570,7 @@ mod tests {
             declared_columns: vec![],
             parquet_tables: vec![],
             budgets: None,
+            signal_groups: Vec::new(),
         }
         .encode(&key)
         .expect("encode");
@@ -2549,7 +2865,7 @@ mod tests {
         assert_eq!(decoded.slice_index, 2);
         assert_eq!(decoded.slice_count, 5);
         assert_eq!(
-            decoded.snapshot().segments,
+            decoded.snapshot().expect("a one-snapshot ticket").segments,
             ticket
                 .segments
                 .iter()
@@ -2581,6 +2897,7 @@ mod tests {
             declared_columns: vec![],
             parquet_tables: vec![],
             budgets: None,
+            signal_groups: Vec::new(),
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(bytes.len(), MIN_ENCODED_LEN);
@@ -2643,6 +2960,7 @@ mod tests {
                 })
                 .collect(),
             budgets: None,
+            signal_groups: Vec::new(),
         };
         let bytes = ticket.encode(&test_key()).expect("encode");
         assert_eq!(
@@ -2804,6 +3122,7 @@ mod tests {
             declared_columns: vec![],
             parquet_tables: vec![],
             budgets: None,
+            signal_groups: Vec::new(),
         };
         let mut bytes = ticket.encode(&key).expect("encode");
         // The level tag sits right after the per-segment fixed fields and the
@@ -3298,8 +3617,433 @@ mod tests {
         );
     }
 
+    const TWO_SIGNAL_STATEMENT: &str =
+        "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts WHERE s.ts >= 1 AND s.ts < 2";
+
+    /// [`sample_ticket`] over samples JOIN logs: its flat pins moved into one
+    /// group per signal, each with its own segments and erasure predicates.
+    fn grouped_ticket() -> FlightTicket {
+        FlightTicket {
+            statement: TWO_SIGNAL_STATEMENT.to_owned(),
+            segments: Vec::new(),
+            pending_erasure: Vec::new(),
+            signal_groups: vec![
+                SignalGroup {
+                    signal: TargetSignal::Metrics,
+                    segments: vec![
+                        sample_pin(3, "t/aa/metrics/l1/0000/w.1.2.abc.rseg"),
+                        sample_pin(8, "t/aa/metrics/l0/0001/w.4.5.def.rseg"),
+                    ],
+                    pending_erasure: vec![ErasurePredicate::windowless(vec![(
+                        "__name__".to_owned(),
+                        "erase_me".to_owned(),
+                    )])],
+                },
+                SignalGroup {
+                    signal: TargetSignal::Logs,
+                    segments: vec![sample_pin(5, "t/aa/logs/l1/0002/w.6.7.fed.rlog")],
+                    pending_erasure: vec![ErasurePredicate::new(
+                        vec![("service.name".to_owned(), "checkout".to_owned())],
+                        100,
+                        200,
+                    )],
+                },
+            ],
+            ..sample_ticket()
+        }
+    }
+
+    /// A signed version 10 body with `groups` (tag, segment pins) in the
+    /// given order and no erasure predicates, so a decode refusal is reached
+    /// with a valid MAC.
+    fn signed_v10(key: &TicketKey, groups: &[(u8, Vec<SegmentPin>)]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&MAGIC);
+        body.push(VERSION_GROUPS);
+        body.extend_from_slice(&[7u8; 16]);
+        body.extend_from_slice(&1i64.to_le_bytes());
+        body.extend_from_slice(&2i64.to_le_bytes());
+        write_u32(&mut body, 0); // slice_index
+        write_u32(&mut body, 1); // slice_count
+        write_u32(&mut body, 0); // token_count
+        write_u32(&mut body, groups.len() as u32);
+        for (tag, segments) in groups {
+            body.push(*tag);
+            write_pins(&mut body, segments, &[]).expect("pins");
+        }
+        write_u32(&mut body, 0); // declared_count
+        write_u32(&mut body, 0); // parquet_count
+        write_budgets(&mut body, None);
+        write_len_prefixed(&mut body, TWO_SIGNAL_STATEMENT.as_bytes()).expect("statement");
+        let tag = mac(key, &body);
+        body.extend_from_slice(&tag);
+        body
+    }
+
+    #[test]
+    fn v10_round_trips_two_signal_groups() {
+        let key = test_key();
+        let ticket = grouped_ticket();
+        let bytes = ticket.encode(&key).expect("encode");
+        assert_eq!(bytes[4], VERSION_GROUPS);
+        let decoded = FlightTicket::decode(&bytes, &key).expect("decode");
+        assert_eq!(decoded, ticket);
+        assert!(decoded.segments.is_empty() && decoded.pending_erasure.is_empty());
+
+        let snapshots = decoded.signal_snapshots();
+        assert_eq!(snapshots.len(), 2);
+        for ((signal, snapshot), group) in snapshots.iter().zip(&ticket.signal_groups) {
+            assert_eq!(*signal, group.signal);
+            assert_eq!(
+                snapshot.segments,
+                group
+                    .segments
+                    .iter()
+                    .map(SegmentPin::to_segment_ref)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                ravel_query::erasure::snapshot_pending_erasure_predicates(snapshot),
+                group.pending_erasure
+            );
+        }
+        assert_eq!(
+            decoded.snapshot(),
+            Err(FlightTicketError::SignalGroupsHaveNoSingleSnapshot)
+        );
+
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        let client = keys
+            .encode(&ticket, TicketSurface::Client)
+            .expect("client encode");
+        assert_eq!(keys.decode(&client, TicketSurface::Client), Ok(ticket));
+    }
+
+    #[test]
+    fn encode_refuses_a_grouped_ticket_it_cannot_write() {
+        let key = test_key();
+        let beside_segments = FlightTicket {
+            segments: vec![sample_pin(1, "t/aa/metrics/l0/0000/w.1.1.a.rseg")],
+            ..grouped_ticket()
+        };
+        assert_eq!(
+            beside_segments.encode(&key),
+            Err(FlightTicketError::SignalGroupsBesideFlatPins)
+        );
+        let beside_erasure = FlightTicket {
+            pending_erasure: vec![ErasurePredicate::windowless(vec![(
+                "a".to_owned(),
+                "b".to_owned(),
+            )])],
+            ..grouped_ticket()
+        };
+        assert_eq!(
+            beside_erasure.encode(&key),
+            Err(FlightTicketError::SignalGroupsBesideFlatPins)
+        );
+        assert_eq!(
+            grouped_ticket().encode_with_pushdown(&key, Some(&sample_spans_pushdown())),
+            Err(FlightTicketError::SignalGroupsWithPushdown)
+        );
+
+        let with_groups = |signals: &[TargetSignal]| FlightTicket {
+            signal_groups: signals
+                .iter()
+                .map(|signal| SignalGroup {
+                    signal: *signal,
+                    segments: Vec::new(),
+                    pending_erasure: Vec::new(),
+                })
+                .collect(),
+            ..grouped_ticket()
+        };
+        assert_eq!(
+            with_groups(&[TargetSignal::Logs]).encode(&key),
+            Err(FlightTicketError::TooFewSignalGroups(1))
+        );
+        assert_eq!(
+            with_groups(&[TargetSignal::Logs, TargetSignal::Logs]).encode(&key),
+            Err(FlightTicketError::DuplicateSignalGroup(SIGNAL_TAG_LOGS))
+        );
+        assert_eq!(
+            with_groups(&[TargetSignal::Spans, TargetSignal::Logs]).encode(&key),
+            Err(FlightTicketError::SignalGroupsOutOfOrder)
+        );
+        assert_eq!(
+            with_groups(&[TargetSignal::Metrics, TargetSignal::Parquet]).encode(&key),
+            Err(FlightTicketError::ParquetSignalGroup)
+        );
+
+        let keys = SqlTicketKeys::from_file_key(&[0x42; 32]);
+        assert_eq!(
+            keys.encode(&grouped_ticket(), TicketSurface::Slice),
+            Err(FlightTicketError::SignalGroupsOnSlice)
+        );
+    }
+
+    /// The tags are the wire contract: samples 1, logs 2, spans 3, alerts 4,
+    /// audit 5, in that lane order.
+    #[test]
+    fn signal_tags_are_pinned_in_lane_order() {
+        let tags: Vec<u8> = SIGNAL_LANE_ORDER
+            .iter()
+            .map(|signal| signal_tag(*signal).expect("a signal table"))
+            .collect();
+        assert_eq!(tags, vec![1, 2, 3, 4, 5]);
+        for (tag, signal) in tags.iter().zip(SIGNAL_LANE_ORDER) {
+            assert_eq!(signal_from_tag(*tag), Ok(signal));
+        }
+        assert_eq!(
+            signal_tag(TargetSignal::Parquet),
+            Err(FlightTicketError::ParquetSignalGroup)
+        );
+    }
+
+    #[test]
+    fn a_v10_ticket_with_fewer_than_two_groups_is_refused() {
+        let key = test_key();
+        let one = signed_v10(&key, &[(SIGNAL_TAG_LOGS, Vec::new())]);
+        assert_eq!(
+            FlightTicket::decode(&one, &key),
+            Err(FlightTicketError::TooFewSignalGroups(1))
+        );
+        let none = signed_v10(&key, &[]);
+        assert_eq!(
+            FlightTicket::decode(&none, &key),
+            Err(FlightTicketError::TooFewSignalGroups(0))
+        );
+    }
+
+    #[test]
+    fn a_v10_ticket_with_an_unknown_signal_tag_is_refused() {
+        let key = test_key();
+        for tag in [0u8, 6, 0xff] {
+            let bytes = signed_v10(&key, &[(SIGNAL_TAG_SAMPLES, Vec::new()), (tag, Vec::new())]);
+            assert_eq!(
+                FlightTicket::decode(&bytes, &key),
+                Err(FlightTicketError::InvalidSignalTag(tag)),
+                "tag {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_v10_ticket_naming_a_signal_twice_is_refused() {
+        let key = test_key();
+        let bytes = signed_v10(
+            &key,
+            &[
+                (
+                    SIGNAL_TAG_LOGS,
+                    vec![sample_pin(2, "t/aa/logs/l0/0000/w.1.1.a.rlog")],
+                ),
+                (SIGNAL_TAG_LOGS, Vec::new()),
+            ],
+        );
+        assert_eq!(
+            FlightTicket::decode(&bytes, &key),
+            Err(FlightTicketError::DuplicateSignalGroup(SIGNAL_TAG_LOGS))
+        );
+    }
+
+    #[test]
+    fn a_v10_ticket_with_groups_out_of_lane_order_is_refused() {
+        let key = test_key();
+        let bytes = signed_v10(
+            &key,
+            &[
+                (SIGNAL_TAG_LOGS, Vec::new()),
+                (SIGNAL_TAG_SAMPLES, Vec::new()),
+            ],
+        );
+        assert_eq!(
+            FlightTicket::decode(&bytes, &key),
+            Err(FlightTicketError::SignalGroupsOutOfOrder)
+        );
+    }
+
+    /// Every structural refusal above sits behind the MAC: the same bodies
+    /// signed under another key are a MAC mismatch, never parsed.
+    #[test]
+    fn v10_refusals_are_reached_only_after_the_mac_verifies() {
+        let key = test_key();
+        let other = [0x43u8; TICKET_KEY_LEN];
+        for groups in [
+            vec![(SIGNAL_TAG_LOGS, Vec::new())],
+            vec![(SIGNAL_TAG_SAMPLES, Vec::new()), (6, Vec::new())],
+            vec![(SIGNAL_TAG_LOGS, Vec::new()), (SIGNAL_TAG_LOGS, Vec::new())],
+            vec![
+                (SIGNAL_TAG_LOGS, Vec::new()),
+                (SIGNAL_TAG_SAMPLES, Vec::new()),
+            ],
+        ] {
+            let bytes = signed_v10(&other, &groups);
+            assert_eq!(
+                FlightTicket::decode(&bytes, &key),
+                Err(FlightTicketError::MacMismatch)
+            );
+        }
+    }
+
+    /// A version 8 or 9 ticket pins one snapshot. Its statement naming two
+    /// signal tables decodes, and redemption refuses it before any plan.
+    #[test]
+    fn a_v8_ticket_naming_two_signals_is_refused() {
+        let key = test_key();
+        let ticket = FlightTicket {
+            statement: TWO_SIGNAL_STATEMENT.to_owned(),
+            ..sample_ticket()
+        };
+        let v8 = ticket.encode(&key).expect("encode");
+        assert_eq!(v8[4], VERSION);
+        let decoded = FlightTicket::decode(&v8, &key).expect("decode");
+        assert!(matches!(
+            decoded.redemption_lanes(),
+            Err(SqlError::TicketPinsOneSignal)
+        ));
+
+        let v9 = ticket
+            .encode_with_pushdown(&key, Some(&sample_logs_pushdown()))
+            .expect("encode");
+        assert_eq!(v9[4], VERSION_PUSHDOWN);
+        let decoded = FlightTicket::decode(&v9, &key).expect("decode");
+        assert!(matches!(
+            decoded.redemption_lanes(),
+            Err(SqlError::TicketPinsOneSignal)
+        ));
+    }
+
+    /// A version 10 ticket's groups must be exactly the statement's signal
+    /// tables, in lane order.
+    #[test]
+    fn a_v10_ticket_whose_groups_are_not_the_statements_tables_is_refused() {
+        let key = test_key();
+        let cases = [
+            (
+                "SELECT s.ts FROM samples s JOIN spans t ON s.ts = t.ts",
+                "samples, spans",
+            ),
+            ("SELECT ts FROM samples", "samples"),
+            (
+                "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts \
+                 JOIN spans t ON s.ts = t.ts",
+                "samples, logs, spans",
+            ),
+        ];
+        for (statement, tables) in cases {
+            let ticket = FlightTicket {
+                statement: statement.to_owned(),
+                ..grouped_ticket()
+            };
+            let decoded =
+                FlightTicket::decode(&ticket.encode(&key).expect("encode"), &key).expect("decode");
+            match decoded.redemption_lanes() {
+                Err(SqlError::PinnedSignalsMismatch {
+                    pinned,
+                    tables: got,
+                }) => {
+                    assert_eq!(pinned, "samples, logs", "{statement}");
+                    assert_eq!(got, tables, "{statement}");
+                }
+                other => panic!("{statement}: expected a mismatch, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn redemption_lanes_rebuild_every_pinned_snapshot() {
+        let key = test_key();
+        let ticket = grouped_ticket();
+        let decoded =
+            FlightTicket::decode(&ticket.encode(&key).expect("encode"), &key).expect("decode");
+        let lanes = decoded.redemption_lanes().expect("lanes");
+        assert_eq!(lanes, ticket.signal_snapshots());
+        assert_eq!(
+            lanes.iter().map(|(signal, _)| *signal).collect::<Vec<_>>(),
+            vec![TargetSignal::Metrics, TargetSignal::Logs]
+        );
+
+        let single = sample_ticket();
+        let decoded =
+            FlightTicket::decode(&single.encode(&key).expect("encode"), &key).expect("decode");
+        let lanes = decoded.redemption_lanes().expect("lanes");
+        assert_eq!(
+            lanes,
+            vec![(
+                TargetSignal::Metrics,
+                single.snapshot().expect("a one-snapshot ticket")
+            )]
+        );
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
+
+        // decode(encode(x)) == x for 2 to 5 groups in lane order, each with
+        // its own segments and erasure predicates.
+        #[test]
+        fn prop_v10_round_trip(
+            lanes in prop::sample::subsequence(SIGNAL_LANE_ORDER.to_vec(), 2..=5),
+            groups in prop::collection::vec(
+                (
+                    prop::collection::vec(segment_pin_strategy(), 0..64),
+                    prop::collection::vec(erasure_predicate_strategy(), 0..4),
+                ),
+                5,
+            ),
+            tokens in prop::collection::vec(token_strategy(), 0..8),
+            statement in ".{0,512}",
+            budgets in budgets_strategy(),
+        ) {
+            let signal_groups = lanes
+                .iter()
+                .zip(groups)
+                .map(|(signal, (segments, pending_erasure))| SignalGroup {
+                    signal: *signal,
+                    segments,
+                    pending_erasure,
+                })
+                .collect();
+            let ticket = FlightTicket {
+                statement,
+                min_commit_tokens: tokens,
+                budgets,
+                signal_groups,
+                ..grouped_ticket()
+            };
+            let key = test_key();
+            let bytes = ticket.encode(&key).expect("encode");
+            prop_assert_eq!(bytes[4], VERSION_GROUPS);
+            let decoded = FlightTicket::decode(&bytes, &key).expect("decode");
+            prop_assert_eq!(ticket, decoded);
+        }
+
+        // Arbitrary correctly signed bytes after a version 10 header never
+        // panic: decode returns Ok or a typed Err.
+        #[test]
+        fn prop_signed_v10_bytes_never_panic(
+            tail in prop::collection::vec(any::<u8>(), 0..512),
+        ) {
+            let key = test_key();
+            let mut body = MAGIC.to_vec();
+            body.push(VERSION_GROUPS);
+            body.extend_from_slice(&tail);
+            pad_to_min_encoded_len(&mut body);
+            let tag = mac(&key, &body);
+            body.extend_from_slice(&tag);
+            let _ = FlightTicket::decode(&body, &key);
+        }
+
+        // Any single-byte flip of a valid version 10 ticket is caught.
+        #[test]
+        fn prop_v10_single_flip_detected(idx in any::<prop::sample::Index>()) {
+            let key = test_key();
+            let bytes = grouped_ticket().encode(&key).expect("encode");
+            let i = idx.index(bytes.len());
+            let mut corrupt = bytes;
+            corrupt[i] ^= 0x80;
+            prop_assert!(FlightTicket::decode(&corrupt, &key).is_err());
+        }
 
         // decode(encode(x)) == x bit-for-bit across arbitrary tenants,
         // statements up to a bound, 0..1024 segments, and arbitrary
@@ -3336,6 +4080,7 @@ mod tests {
                 declared_columns,
                 parquet_tables,
                 budgets,
+                signal_groups: Vec::new(),
             };
             let key = test_key();
             let bytes = ticket.encode(&key).expect("encode");

@@ -160,8 +160,9 @@ pub use error::{
 };
 pub use executor::{
     AnalyzedRun, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting, ParquetPlan,
-    PhaseWallTiming, PinnedPlanInputs, PinnedQuery, PinnedResolve, PinnedStream, ScanTiming,
-    SegmentTiming, SignalStats, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
+    PhaseWallTiming, PinnedLanes, PinnedPlanInputs, PinnedQuery, PinnedResolve, PinnedStream,
+    ScanTiming, SegmentTiming, SignalStats, SqlExecutor, SqlOutcome, SqlRequest, SqlStats,
+    TargetSignal,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{
@@ -170,8 +171,8 @@ pub use flight::{
 };
 #[cfg(feature = "pin-codec")]
 pub use flight_ticket::{
-    FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, SlicePushdown, SqlTicketKeys,
-    TICKET_KEY_LEN, TicketKey, TicketSurface, derive_surface_key, derive_ticket_key,
+    FlightTicket, FlightTicketError, MAX_STATEMENT_LEN, SegmentPin, SignalGroup, SlicePushdown,
+    SqlTicketKeys, TICKET_KEY_LEN, TicketKey, TicketSurface, derive_surface_key, derive_ticket_key,
 };
 pub use group_keys::{DICTIONARY_GROUP_KEYS_RULE, DictionaryGroupKeysAsViews};
 pub use late_materialization::{

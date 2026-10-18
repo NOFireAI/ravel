@@ -2422,7 +2422,13 @@ carried only widen a worker's read for the same reason.
 
 A ticket carrying the block is version 9; one without it stays version 8, byte
 for byte, so a metrics slice or a coordinator that attaches nothing mints
-exactly what it did before. The codec decodes both. The version moves because
+exactly what it did before. The codec decodes both. Version 10 is the client
+ticket of a statement over two or more signal tables, carrying one segment
+group per table (see
+[Statements over several signal tables](#statements-over-several-signal-tables-adr-2904)).
+A slice ticket is never version 10: the slice surface decodes at most version
+9, and `verify_slice` refuses a version 10 ticket signed under a slice key as
+`wrong_surface`. The version moves because
 the coordinator that mints a ticket and the worker that redeems it can run
 different builds during a rolling upgrade, and the worker has to be able to
 tell an authentic ticket it cannot read from a forged one.
@@ -3941,9 +3947,9 @@ the HTTP endpoint; the next subsection gives its terms.
 
 ### Statements over several signal tables (ADR-2904)
 
-`POST /api/v1/sql` runs a statement that names two or more of `samples`,
-`logs`, `spans`, `alerts` and `audit`, for example a join of `samples` and
-`logs` on their timestamps:
+`POST /api/v1/sql` and Flight SQL run a statement that names two or more of
+`samples`, `logs`, `spans`, `alerts` and `audit`, for example a join of
+`samples` and `logs` on their timestamps:
 
 ```sql
 SELECT samples.ts, samples.value, logs.body
@@ -3959,6 +3965,20 @@ ORDER BY samples.ts
   lines are not yet visible, or the reverse. A retry resolves every signal
   again; it never pairs one attempt's snapshot of one signal with another
   attempt's snapshot of a different one.
+- **Flight SQL pins one snapshot per signal (ADR-2904 decision 10).**
+  `GetFlightInfo` resolves the snapshots as above and mints a version 10
+  ticket carrying one segment group per signal table, in lane order, each
+  with the segments and pending erasure its own resolve returned
+  (`crates/ravel-sql/src/flight_ticket.rs`, `SignalGroup`). `DoGet` rebuilds
+  every table's snapshot from its group and resolves nothing, so a commit to
+  any of the signals between the two RPCs is not visible; a snapshot retry
+  inside `DoGet` replans against the same groups. Before any store request,
+  `DoGet` refuses a version 8 or 9 ticket whose statement names two or more
+  signal tables with `SqlError::TicketPinsOneSignal`, and a version 10 ticket
+  whose groups are not the statement's signal tables with
+  `SqlError::PinnedSignalsMismatch`, both `INVALID_ARGUMENT`. A statement
+  over one signal table keeps its version 8 or 9 ticket byte for byte. A
+  statement over several signal tables always runs on one endpoint.
 - **Joins run on the coordinator, in one memory pool.** A statement over
   several tables never fans out to query workers: the distributed samples
   scan stays a single-table path. The join runs in the coordinator's
@@ -3990,7 +4010,10 @@ ORDER BY samples.ts
   HTTP 400. An unsatisfiable token stays the fixed 503 that names no table.
   Flight SQL carries only unqualified tokens, and `POST /api/v1/esql` takes no
   `min_commit_token`; a qualified token that reaches a Flight ticket or a
-  pinned Flight resolve is `SqlError::QualifiedCommitTokenUnsupported`.
+  pinned Flight resolve is `SqlError::QualifiedCommitTokenUnsupported`. So a
+  Flight SQL statement naming two or more signal tables cannot wait on a
+  commit token: with one it is refused at `GetFlightInfo` as
+  `CommitTokenNeedsQualifier` (`INVALID_ARGUMENT`), and without one it runs.
 - **Interim refusal.** A signal table beside a Parquet table is refused with
   HTTP 400 and a message saying it is not supported yet, before any signal
   catalog listing (`SqlError::SignalBesideParquet`). A token qualified with
@@ -4000,11 +4023,9 @@ ORDER BY samples.ts
   unknown or dropped name: one manifest LIST per other table name, in name
   order, up to and including the first live table, and a GET for each of
   those names that has a manifest version.
-- **Surfaces that keep the one-table rule.** Flight SQL refuses a statement
-  naming two or more signal tables with `SqlError::CrossSignalQuery` before any
-  catalog listing, until its ticket can carry one segment group per signal
-  (ADR-2904 decision 10). ES|QL reads one table per
-  query and keeps the same refusal. Paging (`page_plan`) refuses such a
+- **Surfaces that keep the one-table rule.** ES|QL reads one table per query
+  and refuses a statement naming two or more signal tables with
+  `SqlError::CrossSignalQuery` before any catalog listing. Paging (`page_plan`) refuses such a
   statement with `PagePlanError::CrossSignal`.
 
 Schema (fixed columns plus one map):
@@ -4845,9 +4866,8 @@ above. `SqlExecutor` reads the tables from the `FROM` clause before planning,
 resolves one snapshot for each signal named and registers exactly those tables
 in the per-query `SessionContext`, as it does for every other table; a CTE
 named `alerts` or `audit` is a query-local name and does not change the target.
-A query naming two of the five runs over HTTP on the terms of
-[Statements over several signal tables](#statements-over-several-signal-tables-adr-2904);
-Flight SQL rejects it with `CrossSignalQuery` before any catalog listing.
+A query naming two of the five runs over HTTP and Flight SQL on the terms of
+[Statements over several signal tables](#statements-over-several-signal-tables-adr-2904).
 Flight SQL's `CommandGetTables` lists all five tables with their public
 schemas: that is static catalog metadata built from the five schema functions,
 independent of the per-query session, which registers only the tables a

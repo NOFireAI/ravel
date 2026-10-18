@@ -10,7 +10,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use arrow::array::{ArrayRef, Int64Array, StringArray};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
 
@@ -209,6 +209,65 @@ async fn analyze_prints_compact_slices_metrics() {
         Some(format!("rows: {HAVING_ROWS}").as_str()),
         "{output}"
     );
+}
+
+/// Load three gauge samples at the same timestamps as the first three log
+/// records, so `samples JOIN logs` on `ts` joins exactly three rows.
+async fn load_samples_into(store: Arc<dyn ObjectStoreBackend>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pq = dir.path().join("samples.parquet");
+    let ts: ArrayRef = Arc::new(Int64Array::from(
+        (0..3).map(|i| CLOCK_NS + i).collect::<Vec<_>>(),
+    ));
+    let value: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
+    let batch = RecordBatch::try_from_iter(vec![("ts", ts), ("value", value)]).expect("batch");
+    write_parquet(&pq, &batch);
+    let mapping = load::parse_metrics_mapping(
+        r#"
+[metrics]
+name = "explain_join_gauge"
+value_column = "value"
+ts_column = "ts"
+ts_unit = "nanos"
+kind = "gauge"
+"#,
+    )
+    .expect("metrics mapping");
+    let report = load::load_metrics(
+        store,
+        &pq,
+        TENANT,
+        &mapping,
+        4,
+        10_000,
+        0,
+        1,
+        1,
+        1,
+        None,
+        CLOCK_NS,
+        Arc::new(FixedClock(CLOCK_NS)),
+    )
+    .await
+    .expect("metrics load succeeds");
+    assert_eq!(report.rows_processed, 3);
+}
+
+/// `--analyze` runs a statement naming two signal tables over one pinned
+/// snapshot per table (ADR-2904): the join reports the three rows it
+/// produced and the trailing line is the exact row count.
+#[tokio::test]
+async fn analyze_runs_a_statement_over_two_signal_tables() {
+    let store = loaded_store().await;
+    load_samples_into(Arc::clone(&store)).await;
+    let sql = "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts";
+    let output = explain(store, &options(sql, true))
+        .await
+        .expect("sql explain --analyze over samples JOIN logs");
+
+    let join = operator_line(&output, "HashJoinExec");
+    assert_eq!(metric(join, "output_rows"), Some(3), "{output}");
+    assert_eq!(output.lines().last(), Some("rows: 3"), "{output}");
 }
 
 /// Without `--analyze` the command prints the plan the executor's `explain`
