@@ -638,11 +638,11 @@ mod tests {
     use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
     use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
-    use ravel_ipcrypt::rules::TenantRules;
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use ravel_ingest::{
         AdmissionController, AdmissionLimits, IngestConfig, PendingAckBudget, SystemClock,
     };
+    use ravel_ipcrypt::rules::TenantRules;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 

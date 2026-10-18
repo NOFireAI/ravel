@@ -108,11 +108,9 @@ fn ruled_attrs() -> Vec<KeyValue> {
 }
 
 fn policy() -> Arc<IpcryptPolicy> {
-    let file = ravel_ipcrypt::policy::parse_policy_file(
-        POLICY,
-        ravel_server::ipcrypt::sanitize_rule_key,
-    )
-    .expect("policy parses");
+    let file =
+        ravel_ipcrypt::policy::parse_policy_file(POLICY, ravel_server::ipcrypt::sanitize_rule_key)
+            .expect("policy parses");
     Arc::new(IpcryptPolicy::new(file, Some(&DEPLOYMENT_KEY)).expect("policy loads"))
 }
 
@@ -510,7 +508,9 @@ impl Stored {
 }
 
 async fn stored_objects(store: &Arc<dyn ObjectStoreBackend>) -> Vec<Stored> {
-    let objects = list_all(store.as_ref(), "").await.expect("list every object");
+    let objects = list_all(store.as_ref(), "")
+        .await
+        .expect("list every object");
     let mut stored = Vec::new();
     for object in objects {
         let data = store

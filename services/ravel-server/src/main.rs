@@ -1005,7 +1005,10 @@ mod tests {
         assert_eq!(SRC.matches(call).count(), 1);
         let call_at = SRC.find(call).expect("call present");
         let start_at = SRC
-            .find(concat!("ravel_server::", "start_with_heartbeat_and_ipcrypt("))
+            .find(concat!(
+                "ravel_server::",
+                "start_with_heartbeat_and_ipcrypt("
+            ))
             .expect("main starts the server");
         assert!(
             call_at < start_at,
@@ -1026,7 +1029,10 @@ mod tests {
         assert_eq!(SRC.matches(stamp).count(), 1);
         assert_eq!(SRC.matches(sampler).count(), 1);
         let start_at = SRC
-            .find(concat!("ravel_server::", "start_with_heartbeat_and_ipcrypt("))
+            .find(concat!(
+                "ravel_server::",
+                "start_with_heartbeat_and_ipcrypt("
+            ))
             .expect("main starts the server");
         assert!(SRC.find(stamp).expect("stamp present") < start_at);
         assert!(SRC.find(sampler).expect("sampler start present") > start_at);

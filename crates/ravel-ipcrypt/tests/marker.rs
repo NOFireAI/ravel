@@ -148,7 +148,11 @@ async fn stored_fingerprint_of_the_wrong_length_refuses() {
     }
     .encode_to_vec();
     store
-        .put(IPCRYPT_POLICY_KEY, bytes.into(), PutOptions::create_if_absent())
+        .put(
+            IPCRYPT_POLICY_KEY,
+            bytes.into(),
+            PutOptions::create_if_absent(),
+        )
         .await
         .expect("seed a short-fingerprint marker object");
 

@@ -451,13 +451,13 @@ mod tests {
     use super::*;
     use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, ArrayValue, KeyValue};
-    use ravel_ipcrypt::rules::TenantRules;
     use opentelemetry_proto::tonic::resource::v1::Resource;
     use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
     use ravel_ingest::{
         AdmissionController, AdmissionLimits, IngestConfig, PendingAckBudget, SystemClock,
         read_marker,
     };
+    use ravel_ipcrypt::rules::TenantRules;
     use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;

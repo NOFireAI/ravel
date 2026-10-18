@@ -46,7 +46,9 @@ pub enum IpcryptConfigError {
 /// A tenant whose rules could not be derived. Names the tenant hash and the
 /// rule key involved, never key bytes.
 #[derive(Debug, thiserror::Error)]
-#[error("ipcrypt rules for tenant hash {tenant_hash} (rule key {rule_key:?}) could not be resolved: {source}")]
+#[error(
+    "ipcrypt rules for tenant hash {tenant_hash} (rule key {rule_key:?}) could not be resolved: {source}"
+)]
 pub struct TenantRulesError {
     pub tenant_hash: String,
     pub rule_key: String,
@@ -334,11 +336,18 @@ mod tests {
         let first = policy.rules_for(&acme).expect("acme resolves");
         let second = policy.rules_for(&acme).expect("acme resolves again");
         assert!(!first.is_empty());
-        assert!(Arc::ptr_eq(&first, &second), "the second call is the cached set");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second call is the cached set"
+        );
         assert_eq!(policy.builds.load(Ordering::Relaxed), 1);
 
-        let other = policy.rules_for(&TenantId::new("globex")).expect("no rules");
-        let third = policy.rules_for(&TenantId::new("initech")).expect("no rules");
+        let other = policy
+            .rules_for(&TenantId::new("globex"))
+            .expect("no rules");
+        let third = policy
+            .rules_for(&TenantId::new("initech"))
+            .expect("no rules");
         assert!(other.is_empty());
         assert!(Arc::ptr_eq(&other, &policy.none));
         assert!(Arc::ptr_eq(&third, &policy.none));
@@ -372,11 +381,8 @@ mod tests {
     fn resolve_error_refuses_naming_tenant_hash_and_rule_key_and_caches_nothing() {
         // Built by hand: `parse_policy_file` refuses this collision, which is
         // what makes it reachable here only through a hand-built policy.
-        let policy = IpcryptPolicy::new(
-            defaults_policy(&["client.ip", "client_ip"]),
-            Some(&KEY),
-        )
-        .expect("keyed");
+        let policy = IpcryptPolicy::new(defaults_policy(&["client.ip", "client_ip"]), Some(&KEY))
+            .expect("keyed");
         let acme = TenantId::new("acme");
         let err = policy.rules_for(&acme).expect_err("collision refuses");
         assert_eq!(err.tenant_hash, acme.hash().to_hex());
@@ -386,7 +392,10 @@ mod tests {
         assert!(text.contains(&err.rule_key), "{text}");
         assert!(!text.contains(&hex::encode(KEY)), "no key bytes: {text}");
         assert!(policy.cache.read().is_empty());
-        assert!(policy.rules_for(&acme).is_err(), "the next write tries again");
+        assert!(
+            policy.rules_for(&acme).is_err(),
+            "the next write tries again"
+        );
     }
 
     fn fingerprint_of(policy: &IpcryptPolicy) -> String {
@@ -423,7 +432,10 @@ mod tests {
             .expect_err("a read failure refuses");
         assert_eq!(store.fault_count(Op::Get, FaultKind::Transient), 1);
         let text = format!("{err:#}");
-        assert!(text.contains(&hex::encode(EMPTY_POLICY_FINGERPRINT)), "{text}");
+        assert!(
+            text.contains(&hex::encode(EMPTY_POLICY_FINGERPRINT)),
+            "{text}"
+        );
         assert!(text.contains(IPCRYPT_POLICY_KEY), "{text}");
     }
 
@@ -434,7 +446,9 @@ mod tests {
             .await
             .expect("starts");
         assert_eq!(outcome, Some(CheckOutcome::ProceededNoMarker));
-        let listed = ravel_object_store::list_all(&store, "").await.expect("list");
+        let listed = ravel_object_store::list_all(&store, "")
+            .await
+            .expect("list");
         assert!(listed.is_empty(), "nothing written: {listed:?}");
     }
 

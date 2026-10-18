@@ -519,8 +519,8 @@ fn build_error_message(rejected: &[Rejection], series_cap_rejected: usize) -> St
 mod tests {
     use super::*;
     use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
-    use ravel_ipcrypt::rules::TenantRules;
     use ravel_ingest::{AdmissionLimits, CountLimit, IngestConfig, PendingAckBudget, SystemClock};
+    use ravel_ipcrypt::rules::TenantRules;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::Signal;

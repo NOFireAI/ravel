@@ -589,11 +589,11 @@ fn nack(batch_id: i64, code: StatusCode, message: String) -> BatchStatus {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ravel_ipcrypt::rules::TenantRules;
     use ravel_ingest::{
         AdmissionController, AdmissionLimits, IngestByteBudget, IngestByteBudgetLimit,
         IngestConfig, IngestRouter, MIN_PLAUSIBLE_INGEST_CLOCK_NS, PendingAckBudget, SystemClock,
     };
+    use ravel_ipcrypt::rules::TenantRules;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_otap::stream::DecodedBatch;

@@ -394,9 +394,7 @@ async fn export_logs(
         }
         Err(
             err @ (LogIngestRequestError::Provisioning(_) | LogIngestRequestError::IpcryptRules),
-        ) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
@@ -486,9 +484,7 @@ async fn export_traces(
         }
         Err(
             err @ (SpanIngestRequestError::Provisioning(_) | SpanIngestRequestError::IpcryptRules),
-        ) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
