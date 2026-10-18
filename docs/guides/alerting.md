@@ -419,7 +419,8 @@ curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
 How to read the response:
 
 - The tenant comes from the credential. A token for a tenant with no rules
-  gets `{"status": "success", "data": {"groups": []}}`.
+  gets `{"status": "success", "data": {"groups": []}}` from every process,
+  including one that runs no evaluator.
 - Every rule in the file for one tenant renders in one group named
   `ravel-alert-rules`. Its `interval` is `--alert-eval-interval-secs`. The
   rules file has no group blocks to take a name or a `file` from.
@@ -481,15 +482,18 @@ curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
   returned. It is present only when this process held the tenant's lease on
   that tick and ran the rule without error. A replica that did not run the
   rule omits it rather than show a value from an earlier tick.
-- When this process runs no evaluator (evaluation is disabled, or no tenant
-  has rules), the route answers `503` with `errorType` `unavailable`. It
+- A tenant with no rules has no alerts, so it always gets
+  `{"status": "success", "data": {"alerts": []}}`, from every process. What
+  other tenants have configured, and whether this process runs an evaluator,
+  make no difference to that answer, so it tells the caller nothing about
+  any other tenant.
+- For a tenant with rules, when this process runs no evaluator (evaluation
+  is disabled), the route answers `503` with `errorType` `unavailable`. It
   answers the same before this process has finished a tick for the tenant,
   and whenever the last tick could not read the tenant's alert history,
   until a later tick reads it. It does not answer an empty list in these
   cases, because an empty list would say that nothing is firing, and it does
-  not serve an earlier tick's list, which may no longer be current. A tenant
-  with no rules gets an empty list, but only from a process where some
-  tenant has rules and an evaluator runs. Otherwise it gets the first `503`.
+  not serve an earlier tick's list, which may no longer be current.
 - The route also answers `503` with `errorType` `unavailable` when the
   tenant's last snapshot is more than three evaluation intervals old,
   measured from the time of the tick that published it. Only the evaluator

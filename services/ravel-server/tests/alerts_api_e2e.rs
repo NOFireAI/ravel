@@ -534,6 +534,111 @@ async fn a_process_running_no_evaluator_serves_no_alert_state() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
+/// What a tenant with no alert rules gets from `/api/v1/alerts` in every
+/// process: no tenant's rules, and no evaluator, can change it.
+fn rule_less_alerts_body() -> Value {
+    json!({"status": "success", "data": {"alerts": []}})
+}
+
+/// A tenant with no rules has no alerts, so a process that runs no evaluator
+/// answers it 200 with an empty list rather than 503: the refusal would tell
+/// the caller whether some other tenant on the server has rules. Both ways a
+/// process runs no evaluator are covered: evaluation off with another tenant's
+/// rules loaded, and evaluation on with no rules for any tenant.
+#[tokio::test]
+async fn a_rule_less_tenant_gets_an_empty_list_from_a_process_with_no_evaluator() {
+    for (case, alerting) in [
+        ("evaluation off", alerting_config(RULES, false)),
+        (
+            "no tenant has rules",
+            alerting_config(r#"{"rules": []}"#, true),
+        ),
+    ] {
+        let (running, _store) = start_test_server(Mode::All, alerting).await;
+        assert!(
+            matches!(
+                running
+                    .published_alerts
+                    .read(&TenantId::new("other").hash()),
+                ravel_server::alerting::PublishedRead::NotEvaluating
+            ),
+            "{case}: the process runs no evaluator"
+        );
+        let base = format!("http://{}", running.http_addr);
+
+        let (status, body) = get(&base, "/api/v1/alerts", Some(OTHER_TOKEN)).await;
+        assert_eq!(status, 200, "{case}: {body}");
+        assert_eq!(body, rule_less_alerts_body(), "{case}");
+
+        let (status, body) = get(&base, "/api/v1/rules", Some(OTHER_TOKEN)).await;
+        assert_eq!(status, 200, "{case}: {body}");
+        assert_eq!(
+            body,
+            json!({"status": "success", "data": {"groups": []}}),
+            "{case}"
+        );
+
+        running.shutdown().await.expect("graceful shutdown");
+    }
+}
+
+/// A rule-less tenant on a process whose evaluator serves another tenant gets
+/// the identical response to the one a process with no evaluator gives it,
+/// both before and after that other tenant's evaluator has published.
+#[tokio::test]
+async fn a_rule_less_tenant_gets_the_same_answer_beside_another_tenants_evaluator() {
+    let config = alerting_config(FIRING_RULE, true);
+    let (running, store) = start_test_server(Mode::All, config.clone()).await;
+    assert!(
+        matches!(
+            running.published_alerts.read(&TenantId::new("acme").hash()),
+            ravel_server::alerting::PublishedRead::NotYetEvaluated
+        ),
+        "the process runs an evaluator for acme"
+    );
+    let base = format!("http://{}", running.http_addr);
+
+    let (status, body) = get(&base, "/api/v1/alerts", Some(OTHER_TOKEN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, rule_less_alerts_body(), "before acme's first tick");
+
+    let report = evaluator(&store, &config, "acme", running.published_alerts.clone())
+        .run_tick()
+        .await;
+    assert_eq!(report.records_written, 1, "acme's rule fired");
+    let (status, body) = get(&base, "/api/v1/alerts", Some(ACME_TOKEN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["alerts"].as_array().map(Vec::len), Some(1));
+
+    let (status, body) = get(&base, "/api/v1/alerts", Some(OTHER_TOKEN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, rule_less_alerts_body(), "after acme's tick published");
+
+    let (status, body) = get(&base, "/api/v1/rules", Some(OTHER_TOKEN)).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, json!({"status": "success", "data": {"groups": []}}));
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
+/// The 503 stays for a tenant that has rules: in a process that runs no
+/// evaluator, nothing has looked at them, so an empty list would claim that
+/// nothing is firing.
+#[tokio::test]
+async fn a_tenant_with_rules_still_gets_503_from_a_process_with_no_evaluator() {
+    let (running, _store) = start_test_server(Mode::All, alerting_config(RULES, false)).await;
+    let base = format!("http://{}", running.http_addr);
+
+    let (status, body) = get(&base, "/api/v1/alerts", Some(ACME_TOKEN)).await;
+    assert_eq!(status, 503, "{body}");
+    assert_eq!(
+        body,
+        json!({"status": "error", "errorType": "unavailable", "error": NOT_EVALUATING})
+    );
+
+    running.shutdown().await.expect("graceful shutdown");
+}
+
 /// The routes are reachable on `--listen-http` and serve the configured rule
 /// set for the caller's tenant only. Before the server's evaluator has ticked,
 /// `/api/v1/alerts` answers 503 rather than an empty list.

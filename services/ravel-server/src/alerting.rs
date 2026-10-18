@@ -398,12 +398,10 @@ struct PublishedEntry {
 /// What a tenant's published slot held when a route read it.
 #[derive(Debug, Clone)]
 pub enum PublishedRead {
-    /// No evaluator runs in this process: alerting is disabled, or no tenant
-    /// has rules.
+    /// No evaluator for this tenant runs in this process: alerting is
+    /// disabled, or the tenant has no rules. The two read alike, so the read
+    /// says nothing about whether any other tenant has an evaluator here.
     NotEvaluating,
-    /// Evaluators run in this process, but none for this tenant, which has no
-    /// rules.
-    NoRules,
     /// The tenant's evaluator has not finished a tick yet.
     NotYetEvaluated,
     /// The snapshot the tenant's last tick published.
@@ -450,11 +448,8 @@ impl PublishedAlerts {
     /// [`PublishedRead::Stale`]; a reading behind the snapshot's own, from a
     /// clock stepped backward, counts as age zero.
     pub fn read(&self, tenant: &TenantHash) -> PublishedRead {
-        let Some(slots) = &self.slots else {
+        let Some(slot) = self.slot(tenant) else {
             return PublishedRead::NotEvaluating;
-        };
-        let Some(slot) = slots.get(tenant) else {
-            return PublishedRead::NoRules;
         };
         let entry = slot.read().clone();
         let Some(entry) = entry else {
