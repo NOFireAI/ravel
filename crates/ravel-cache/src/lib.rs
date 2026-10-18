@@ -90,6 +90,11 @@
 //! single-flight collapses) and [`tiered::TieredCache::disk_metrics`], so a
 //! disk-served hit is visible on the disk tier rather than hidden behind a
 //! RAM-only miss.
+//!
+//! Every read carries an [`AccessIntent`], `Interactive` unless a
+//! `_with_intent` method names another. The RAM tier admits a `BulkScan`
+//! read into a bulk region that serves a stable subset of a repeated scan
+//! larger than the cache, without evicting the main queue (see [`s3fifo`]).
 
 mod cache;
 mod clock;
@@ -107,10 +112,48 @@ pub use cache::Cache;
 pub use clock::{Clock, SystemClock};
 pub use disk::{DiskCache, ReclaimReport, RootEntryKind, classify_root_entry, reclaim_legacy};
 pub use key::{CacheKey, PinnedIdentity};
-pub use limits::{CacheLimits, DEFAULT_MAX_ENTRY_AGE_NS, DEFAULT_SWEEP_INTERVAL_NS};
-pub use metrics::{CacheMetrics, CacheMetricsSnapshot};
+pub use limits::{
+    CacheLimits, DEFAULT_BULK_SHARE, DEFAULT_MAX_ENTRY_AGE_NS, DEFAULT_SWEEP_INTERVAL_NS,
+};
+pub use metrics::{CacheMetrics, CacheMetricsSnapshot, IntentCounters, IntentMetricsSnapshot};
 pub use single_flight::{Role, SingleFlight, SingleFlightError};
 pub use tiered::{ReadOutcome, Source, TieredCache};
+
+/// What a read is for, which decides how the RAM tier admits and promotes
+/// its bytes (ADR-3072 decision 3). It is admission policy only: it never
+/// skips a read and never changes what a hit returns. The `_with_intent`
+/// methods of [`Cache`] and [`TieredCache`] take it; every other method
+/// reads as [`AccessIntent::Interactive`]. The disk tier applies the
+/// interactive policy whatever the intent.
+///
+/// No caller outside this crate passes anything but `Interactive` yet;
+/// issue #3084 is the change that has the SQL executor set `BulkScan`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum AccessIntent {
+    /// A read whose bytes may be read again soon: the S3-FIFO policy as it
+    /// was before intents existed.
+    #[default]
+    Interactive,
+    /// A read of a statement that reads every object of a tenant. A hit does
+    /// not count toward promotion, a ghost hit does not promote, and an
+    /// admission goes to the bulk region, which keeps a stable subset of a
+    /// repeated scan larger than itself and never evicts the main queue.
+    BulkScan,
+    /// A read by a maintenance pass. Admitted to the small queue only and
+    /// never promoted by its own hits or by a ghost hit. Nothing sets it yet.
+    Maintenance,
+}
+
+impl AccessIntent {
+    /// The intent's metric label value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AccessIntent::Interactive => "interactive",
+            AccessIntent::BulkScan => "bulk_scan",
+            AccessIntent::Maintenance => "maintenance",
+        }
+    }
+}
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
@@ -455,6 +498,82 @@ mod tests {
                 "working set collapsed on scan pass {pass}: only {resident}/{working_set_len} resident"
             );
         }
+    }
+
+    /// Hits and bytes served are split by intent and sum to the totals, a bulk
+    /// hit leaves its entry in the bulk region, and the bookkeeping gauge
+    /// matches the cache's own figure.
+    ///
+    /// FLIP: recording `record_hit` instead of `record_hit_with_intent` in
+    /// `Inner::get` leaves every per-intent counter at 0.
+    #[test]
+    fn hits_are_counted_under_their_intent() {
+        let limits = CacheLimits::new(64 * 1024 * 1024, 10_000, 16 * 1024 * 1024);
+        let cache: Cache<&'static str> = Cache::new(limits);
+        let bulk = test_key(1);
+        let interactive = test_key(2);
+        let maintenance = test_key(3);
+        cache.insert_with_intent(bulk, Bytes::from(vec![1u8; 300]), AccessIntent::BulkScan);
+        cache.insert(interactive, Bytes::from(vec![2u8; 200]));
+        cache.insert_with_intent(
+            maintenance,
+            Bytes::from(vec![3u8; 100]),
+            AccessIntent::Maintenance,
+        );
+        assert_eq!(cache.bulk_region_bytes(), 300);
+
+        assert!(
+            cache
+                .get_with_intent(&bulk, AccessIntent::BulkScan)
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_with_intent(&bulk, AccessIntent::BulkScan)
+                .is_some()
+        );
+        assert!(cache.get(&interactive).is_some());
+        assert!(
+            cache
+                .get_with_intent(&maintenance, AccessIntent::Maintenance)
+                .is_some()
+        );
+
+        let intents = cache.metrics().intent_snapshot();
+        assert_eq!(
+            intents.for_intent(AccessIntent::BulkScan),
+            IntentCounters {
+                hits: 2,
+                bytes_served: 600
+            }
+        );
+        assert_eq!(
+            intents.interactive,
+            IntentCounters {
+                hits: 1,
+                bytes_served: 200
+            }
+        );
+        assert_eq!(
+            intents.maintenance,
+            IntentCounters {
+                hits: 1,
+                bytes_served: 100
+            }
+        );
+        let totals = cache.metrics().snapshot();
+        assert_eq!(totals.hits, 4);
+        assert_eq!(totals.bytes_served, 900);
+        assert_eq!(
+            cache.bulk_region_bytes(),
+            300,
+            "a bulk hit stays in the region"
+        );
+        assert!(intents.bulk_bookkeeping_bytes > 0);
+        assert_eq!(
+            intents.bulk_bookkeeping_bytes,
+            cache.bulk_bookkeeping_bytes()
+        );
     }
 
     #[test]
