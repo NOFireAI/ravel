@@ -6,9 +6,8 @@
 //! but jemalloc is linked and its mallctl interface works all the same. The
 //! background thread is process-wide state, so this file holds one test.
 //!
-//! Linux-only: the `background_thread` mallctl this test writes and reads
-//! back does not exist on macOS jemalloc at all (#2966), where the gauge
-//! this test exercises reports the allocator as unavailable instead.
+//! Linux-only: macOS jemalloc has no background-thread support (#2966), so
+//! the thread cannot be enabled there and the gauge reads 0 on every scrape.
 
 #![cfg(all(not(target_env = "msvc"), target_os = "linux"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
