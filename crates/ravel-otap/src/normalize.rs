@@ -964,6 +964,7 @@ pub fn prepare_batch<'b>(
 /// true only for the metadata entry points; the points, exemplars, and
 /// rejections it produces do not depend on it, so the older entry points are
 /// behaviorally unchanged.
+#[allow(clippy::too_many_arguments)]
 fn normalize_impl(
     tenant: &TenantId,
     prepared: PreparedBatch<'_>,
