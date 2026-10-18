@@ -1020,30 +1020,7 @@ mod tests {
         }
     }
 
-    fn sanitize(key: &str) -> String {
-        crate::normalize::sanitize_label_name(key.to_string())
-    }
-
-    /// A rule set over `keys`, one deterministic rule each.
-    fn rules_on(keys: &[&str]) -> TenantRules {
-        let entries: Vec<String> = keys
-            .iter()
-            .map(|k| format!("{{ key = \"{k}\", variant = \"deterministic\" }}"))
-            .collect();
-        let policy = ravel_ipcrypt::policy::parse_policy_file(
-            &format!("[defaults]\nrules = [{}]\n", entries.join(", ")),
-            sanitize,
-        )
-        .expect("policy parses");
-        TenantRules::resolve(
-            &policy,
-            "acme",
-            &ravel_types::TenantHash([9u8; 16]),
-            &[7u8; 32],
-            sanitize,
-        )
-        .expect("rules resolve")
-    }
+    use super::capacity_cases::{rules_on, sanitize};
 
     /// The charge the arithmetic in [`blob_bytes`] must reproduce: pad a copy
     /// of every matched value and measure the copy.
@@ -1315,6 +1292,7 @@ mod tests {
 /// [`label_bytes`]: every kept name and value at exact capacity, and the
 /// projection at or above what normalization allocates.
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) mod capacity_cases {
     use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -1322,6 +1300,36 @@ pub(crate) mod capacity_cases {
 
     /// A 17-byte key that sanitising rewrites (`.` and `-` become `_`).
     pub(crate) const SANITISED_17: &str = "http.request-path";
+
+    pub(crate) fn sanitize(key: &str) -> String {
+        crate::normalize::sanitize_label_name(key.to_string())
+    }
+
+    /// A rule set over `keys`, one rule of `variant` each.
+    pub(crate) fn rules_with(keys: &[&str], variant: &str) -> ravel_ipcrypt::rules::TenantRules {
+        let entries: Vec<String> = keys
+            .iter()
+            .map(|k| format!("{{ key = \"{k}\", variant = \"{variant}\" }}"))
+            .collect();
+        let policy = ravel_ipcrypt::policy::parse_policy_file(
+            &format!("[defaults]\nrules = [{}]\n", entries.join(", ")),
+            sanitize,
+        )
+        .expect("policy parses");
+        ravel_ipcrypt::rules::TenantRules::resolve(
+            &policy,
+            "acme",
+            &ravel_types::TenantHash([9u8; 16]),
+            &[7u8; 32],
+            sanitize,
+        )
+        .expect("rules resolve")
+    }
+
+    /// A rule set over `keys`, one deterministic rule each.
+    pub(crate) fn rules_on(keys: &[&str]) -> ravel_ipcrypt::rules::TenantRules {
+        rules_with(keys, "deterministic")
+    }
 
     pub(crate) fn kv(key: &str, value: Option<AnyValueVariant>) -> KeyValue {
         KeyValue {

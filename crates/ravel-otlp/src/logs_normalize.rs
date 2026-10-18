@@ -3506,14 +3506,15 @@ mod tests {
         }
     }
 
-    /// Normalize one record carrying `attributes` under `resource`, check that
-    /// every kept key and value sits at exact capacity, and that the
-    /// projection's per-record term (two records less one, so the
-    /// once-per-resource and once-per-scope copies give no slack) is at least
-    /// what the record allocated. Returns the number of kept records.
+    /// Normalize one record carrying `attributes` under `resource` and
+    /// `rules`, check that every kept key and value sits at exact capacity,
+    /// and that the projection's per-record term (two records less one, so
+    /// the once-per-resource and once-per-scope copies give no slack) is at
+    /// least what the record allocated. Returns the number of kept records.
     fn check_record_capacity(
         resource: &[KeyValue],
         attributes: &[KeyValue],
+        rules: &TenantRules,
     ) -> Result<usize, proptest::test_runner::TestCaseError> {
         let limits = LogIngestLimits::default();
         let req = |n: u64| {
@@ -3534,11 +3535,9 @@ mod tests {
                 )],
             )])
         };
-        let per_record =
-            crate::project_log_resolved_label_bytes(&req(2), &limits, &TenantRules::none()).get()
-                - crate::project_log_resolved_label_bytes(&req(1), &limits, &TenantRules::none())
-                    .get();
-        let out = normalize_logs(req(1), &limits, &TenantRules::none(), 5_000);
+        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits, rules).get()
+            - crate::project_log_resolved_label_bytes(&req(1), &limits, rules).get();
+        let out = normalize_logs(req(1), &limits, rules, 5_000);
         for r in &out.records {
             for (k, v) in &r.attrs {
                 proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);
@@ -3593,7 +3592,7 @@ mod tests {
             resource in crate::label_projection::capacity_cases::attributes(4),
             attributes in log_attribute_sets(),
         ) {
-            check_record_capacity(&resource, &attributes)?;
+            check_record_capacity(&resource, &attributes, &TenantRules::none())?;
         }
     }
 
@@ -3601,9 +3600,31 @@ mod tests {
     fn kept_attributes_are_exact_and_projected_on_fixed_cases() {
         use crate::label_projection::capacity_cases::{double, int, kv};
         for attribute in [kv("k", int(0)), kv("k", double(1e260))] {
-            let kept = check_record_capacity(&[], std::slice::from_ref(&attribute))
-                .expect("fixed case holds");
+            let kept =
+                check_record_capacity(&[], std::slice::from_ref(&attribute), &TenantRules::none())
+                    .expect("fixed case holds");
             assert_eq!(kept, 1, "{attribute:?}");
+        }
+    }
+
+    /// A ciphertext replaces a ruled value in place, so it is held to the
+    /// same exact capacity and projection bound as any other kept value: an
+    /// IPv4 and an IPv6 address on the record and on the resource, under
+    /// both variants.
+    #[test]
+    fn ruled_attributes_are_exact_and_projected() {
+        use crate::label_projection::capacity_cases::{kv, rules_with};
+        let string = |s: &str| Some(AnyValueVariant::StringValue(s.to_string()));
+        for variant in ["deterministic", "prefix"] {
+            let rules = rules_with(&["client.ip", "host.ip"], variant);
+            let resource = [kv("host.ip", string("2001:db8::1"))];
+            let attributes = [
+                kv("client.ip", string("192.0.2.1")),
+                kv("other", string("192.0.2.2")),
+            ];
+            let kept =
+                check_record_capacity(&resource, &attributes, &rules).expect("ruled case holds");
+            assert_eq!(kept, 1, "{variant}");
         }
     }
 }
