@@ -3417,9 +3417,14 @@ mod tests {
             sanitize,
         )
         .expect("policy parses");
-        let rules =
-            TenantRules::resolve(&policy, "acme", &TenantHash([9u8; 16]), &[7u8; 32], sanitize)
-                .expect("rules resolve");
+        let rules = TenantRules::resolve(
+            &policy,
+            "acme",
+            &TenantHash([9u8; 16]),
+            &[7u8; 32],
+            sanitize,
+        )
+        .expect("rules resolve");
         let ruled_series = || {
             let mut s = series(
                 vec![label("__name__", "up"), label("client_ip", "192.0.2.1")],
@@ -3428,9 +3433,8 @@ mod tests {
             s.exemplars = vec![exemplar(1_000, 0.5, vec![label("client_ip", "192.0.2.2")])];
             s
         };
-        let encrypted = |tally: &IpcryptTally| {
-            tally.count(Variant::Deterministic, RenderOutcome::Encrypted)
-        };
+        let encrypted =
+            |tally: &IpcryptTally| tally.count(Variant::Deterministic, RenderOutcome::Encrypted);
 
         let mut cap = ExemplarCap::default();
         let kept = normalize_with_exemplars(

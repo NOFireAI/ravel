@@ -1158,13 +1158,7 @@ fn normalize_impl(
                 // This is the same rule `ravel_otlp::build_point`
                 // applies to a gauge or sum exemplar, which is what keeps the
                 // two paths' exemplar decisions identical (ADR-0011).
-                number_exemplar_admission.admit(
-                    dp.id,
-                    limits,
-                    rules,
-                    |_| series_id,
-                    &mut rejected,
-                );
+                number_exemplar_admission.admit(dp.id, limits, rules, |_| series_id, &mut rejected);
             }
             Err(rejection) => rejected.push(rejection.clone()),
         }
@@ -5408,9 +5402,14 @@ mod tests {
             sanitize,
         )
         .expect("policy parses");
-        let rules =
-            TenantRules::resolve(&policy, "acme", &TenantHash([9u8; 16]), &[7u8; 32], sanitize)
-                .expect("rules resolve");
+        let rules = TenantRules::resolve(
+            &policy,
+            "acme",
+            &TenantHash([9u8; 16]),
+            &[7u8; 32],
+            sanitize,
+        )
+        .expect("rules resolve");
         let metrics = vec![MetricRow {
             name: "requests".to_string(),
             kind: MetricKind::Gauge,
