@@ -3876,7 +3876,13 @@ mod tests {
                 resources: None,
                 credentials_secret_ref: None,
             },
-            probes: ProbesSpec::default(),
+            // Explicit false: the pre-ADR-1702-task-12 default, kept as the
+            // fixture every unrelated render test here builds on. The
+            // field-absent default is covered on its own in
+            // `probes_render_on_health_port_when_enabled`.
+            probes: ProbesSpec {
+                dedicated_health_port: false,
+            },
             gc: None,
             retention: Some(RetentionSpec {
                 default: Some("30d".to_string()),
@@ -4748,8 +4754,10 @@ mod tests {
         let mut on = base_spec();
         on.probes.dedicated_health_port = true;
 
-        // An existing RavelCluster carries no `probes` block at all. It must
-        // deserialize to the same spec the default gives.
+        // ADR-1702 follow-up task 12: a RavelCluster with no `probes` block
+        // at all (an existing cluster predating the field, or a new one that
+        // never sets it) now deserializes to the dedicated-health-port
+        // default, not to the field's old `false`.
         let mut without = serde_json::to_value(&off).expect("serialize spec");
         without
             .as_object_mut()
@@ -4758,7 +4766,10 @@ mod tests {
             .expect("probes serialized");
         let without: RavelClusterSpec =
             serde_json::from_value(without).expect("deserialize a spec with no probes block");
-        assert_eq!(without, off);
+        assert_eq!(
+            without, on,
+            "a spec with no probes block must default to the dedicated health port"
+        );
 
         let render = |spec: &RavelClusterSpec| {
             vec![
