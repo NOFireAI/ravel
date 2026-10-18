@@ -184,3 +184,25 @@ query: avg_over_time(max_over_time(diff_gauge_walk[50d:1s])[1m:1s])
 kind: instant
 time: +0s
 mode: ravel_error_prom_success
+
+# Subquery arguments under a generic range query (issue #3078, ADR-3072
+# decision 1b): the subquery's inner grid moves with every outer step, and
+# the selector inside it is read through the per-query selector cache, so
+# these pin the cache's reach across both grids against Prometheus,
+# including an `@ start()` selector whose window does not move at all.
+
+name: range_sum_over_a_subquery_argument
+query: sum(max_over_time(diff_gauge_walk[3m:1m]))
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: range_sum_over_a_subquery_of_an_at_start_selector
+query: sum(max_over_time((diff_gauge_walk @ start())[3m:1m]))
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered

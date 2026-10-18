@@ -549,9 +549,10 @@ pub struct QueryWindow {
     annotations: RefCell<Annotations>,
     /// Per-query selector fetch cache (ADR-3072 decision 1b): a selector
     /// evaluated at every step of a grid is fetched once and sliced per step.
-    /// Populated only inside a range grid or a subquery grid; empty until the
-    /// first selector evaluation, so every check that runs before storage is
-    /// touched still runs first.
+    /// Enabled only for a range query, and populated only inside its grid or
+    /// a subquery grid under it; an instant query reads every selector
+    /// straight from the source. Empty until the first selector evaluation,
+    /// so every check that runs before storage is touched still runs first.
     selectors: SelectorCache,
 }
 
@@ -570,7 +571,7 @@ impl QueryWindow {
             budget: Cell::new(u64::MAX),
             deadline: None,
             annotations: RefCell::new(Annotations::default()),
-            selectors: SelectorCache::new(true),
+            selectors: SelectorCache::new(false),
         }
     }
 
@@ -586,7 +587,7 @@ impl QueryWindow {
             budget: Cell::new(u64::MAX),
             deadline: None,
             annotations: RefCell::new(Annotations::default()),
-            selectors: SelectorCache::new(true),
+            selectors: SelectorCache::new(false),
         }
     }
 
@@ -748,14 +749,14 @@ impl Evaluator {
         self
     }
 
-    fn query_window(&self, start_ns: i64, end_ns: i64) -> QueryWindow {
+    fn query_window(&self, start_ns: i64, end_ns: i64, selector_cache: bool) -> QueryWindow {
         QueryWindow {
             start_ns,
             end_ns,
             budget: Cell::new(self.max_total_eval_points),
             deadline: self.deadline,
             annotations: RefCell::new(Annotations::default()),
-            selectors: SelectorCache::new(self.selector_cache),
+            selectors: SelectorCache::new(selector_cache),
         }
     }
 
@@ -785,7 +786,7 @@ impl Evaluator {
     ) -> Result<(Value, Annotations), Error> {
         let expr = crate::complexity_guard::parse_guarded(query)?;
         let t_ns = ms_to_ns(t_ms)?;
-        let ctx = self.query_window(t_ns, t_ns);
+        let ctx = self.query_window(t_ns, t_ns, false);
         let value = self.eval_expr(source, &expr, t_ns, &ctx)?;
         Ok((value, ctx.annotations.into_inner()))
     }
@@ -902,7 +903,7 @@ impl Evaluator {
         }
 
         let expr = crate::complexity_guard::parse_guarded(query)?;
-        let ctx = self.query_window(start_ns, end_ns);
+        let ctx = self.query_window(start_ns, end_ns, self.selector_cache);
 
         // A bare selector and a range function over one fetch once for the
         // whole grid in their own arms. The generic arm evaluates the
@@ -934,9 +935,7 @@ impl Evaluator {
                 let matrix =
                     crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
                         ctx.check_deadline()?;
-                        ctx.at_grid_step(start_ns, end_ns, t, || {
-                            self.eval_expr(source, e, t, &ctx)
-                        })
+                        ctx.at_grid_step(start_ns, end_ns, t, || self.eval_expr(source, e, t, &ctx))
                     })?;
                 RangeValue::Matrix(matrix)
             }
@@ -1205,8 +1204,9 @@ impl Evaluator {
 
         let matrix = crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
-            let value =
-                ctx.at_grid_step(start_ns, end_ns, t, || self.eval_expr(source, &sq.expr, t, ctx))?;
+            let value = ctx.at_grid_step(start_ns, end_ns, t, || {
+                self.eval_expr(source, &sq.expr, t, ctx)
+            })?;
             // Native-histogram series inside a subquery window are not yet
             // supported. The subquery grid reducer keeps only the float value
             // of each instant sample below (`hist_matrix_into_float`), so any
@@ -3431,7 +3431,7 @@ mod tests {
             budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
             deadline: None,
             annotations: RefCell::new(Annotations::default()),
-            selectors: SelectorCache::new(true),
+            selectors: SelectorCache::new(false),
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
@@ -3466,7 +3466,7 @@ mod tests {
             budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
             deadline: None,
             annotations: RefCell::new(Annotations::default()),
-            selectors: SelectorCache::new(true),
+            selectors: SelectorCache::new(false),
         };
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
@@ -3699,8 +3699,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget_after_one_storage_read()
-    {
+    fn repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget_after_one_storage_read() {
         // A range query over `max_over_time(up[5m:1m])` re-evaluates the
         // inner `up[5m:1m]` subquery at every one of its 6 outer grid steps:
         // each step's own inner grid is only 5 points, far under any
@@ -3991,6 +3990,18 @@ mod tests {
         assert_eq!(source.query_count(), 1);
         assert_eq!(source.hist_query_count(), 1);
         assert_eq!(counts, (2, 0));
+    }
+
+    #[test]
+    fn instant_subquery_still_reads_the_source_once_per_inner_step() {
+        // The selector cache is for range queries only: an instant query's
+        // subquery grid `(5m, 10m]` at 1m is 5 inner steps, 5 reads each.
+        let source = one_series_source();
+        Evaluator::new()
+            .instant(&source, "max_over_time(up[5m:1m])", minutes(10))
+            .expect("evaluates");
+        assert_eq!(source.query_count(), 5);
+        assert_eq!(source.hist_query_count(), 5);
     }
 
     #[test]

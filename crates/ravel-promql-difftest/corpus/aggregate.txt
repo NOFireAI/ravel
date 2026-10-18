@@ -176,3 +176,44 @@ mode: unordered
 # stays covered at the unit level by aggregate.rs's own
 # topk_nan_members_sort_last test, which uses a NaN/1.0 dataset with no
 # zero-sign ambiguity.
+
+# Generic range queries over shifted and stale selectors (issue #3078,
+# ADR-3072 decision 1b). An aggregate at the top of a range query is
+# evaluated once per grid step, and its selector is read through the
+# per-query selector cache: fetched once over the grid's window, then
+# sliced per step. Each entry pins one way a step's window moves relative
+# to the grid: a positive offset, a negative offset, an `@ start()` that
+# pins every step to one window, and a stale marker inside the window
+# (diff_stale goes stale at +30s and is live again at +60s).
+
+name: agg_range_sum_over_positive_offset
+query: sum(diff_gauge_walk offset 2m)
+kind: range
+start: +300s
+end: +900s
+step: 30s
+mode: unordered
+
+name: agg_range_sum_over_negative_offset
+query: sum(diff_gauge_walk offset -2m)
+kind: range
+start: +0s
+end: +600s
+step: 30s
+mode: unordered
+
+name: agg_range_sum_at_start
+query: sum(diff_gauge_walk @ start())
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: agg_range_sum_across_a_stale_marker
+query: sum(diff_stale)
+kind: range
+start: +0s
+end: +120s
+step: 15s
+mode: unordered

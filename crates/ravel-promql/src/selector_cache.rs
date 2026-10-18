@@ -1,8 +1,8 @@
 //! Per-query selector fetch cache (ADR-3072 decision 1b).
 //!
-//! A compound range query (an aggregate or binary expression at the top of a
-//! range query, or any expression inside a subquery) is evaluated once per
-//! grid step, and each step reaches its selectors through
+//! A compound range query (an aggregate, binary expression or subquery at
+//! the top of a range query, or any expression inside a subquery under one)
+//! is evaluated once per grid step, and each step reaches its selectors through
 //! `eval_vector_selector`, `eval_matrix_selector` and
 //! `eval_histogram_matrix_selector`. Without this cache every one of those
 //! calls is a fresh `SeriesSource::query` over that step's own window. With
@@ -193,8 +193,9 @@ struct GridReach {
 #[derive(Debug)]
 pub(crate) struct SelectorCache {
     enabled: bool,
-    /// `None` outside every grid: an instant query's own top level reads
-    /// straight from the source, as it did before this cache existed.
+    /// `None` outside every grid, where a read goes straight to the source.
+    /// An instant query's cache is disabled outright, so its subqueries read
+    /// per inner step as they did before this cache existed.
     reach: Cell<Option<GridReach>>,
     entries: RefCell<HashMap<SelectorKey, CachedEntry>>,
     fetches: Cell<u64>,
@@ -302,4 +303,3 @@ impl SelectorCache {
         Ok(entry)
     }
 }
-

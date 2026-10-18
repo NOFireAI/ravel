@@ -3710,7 +3710,7 @@ Run: Ravel only. No Prometheus binary was in the loop, so the states
 below are what Ravel reached and answered, not what Prometheus agreed
 with.
 
-Surface: 132 constructs over 265 corpus entries in 10 corpus files.
+Surface: 132 constructs over 271 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
@@ -3723,14 +3723,14 @@ Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
-| aggregate expression | ast node | supported | `corpus/aggregate.txt`, 20 entries |
+| aggregate expression | ast node | supported | `corpus/aggregate.txt`, 24 entries |
 | binary expression | ast node | supported | `corpus/binop.txt`, 54 entries |
 | function call | ast node | supported | `corpus/transform.txt`, 59 entries |
 | matrix selector | ast node | supported | `corpus/selectors.txt`, 4 entries |
 | number literal | ast node | supported | `corpus/binop.txt`, 29 entries |
 | paren expression | ast node | supported | `corpus/selectors.txt`, 2 entries |
 | string literal | ast node | supported | `corpus/transform.txt`, 6 entries |
-| `subquery` | ast node | supported | `corpus/subquery.txt`, 11 entries |
+| `subquery` | ast node | supported | `corpus/subquery.txt`, 13 entries |
 | unary expression | ast node | supported | no difftest corpus entry; proven by `ravel-promql`'s `unary_minus_negates_value_and_drops_metric_name` |
 | vector selector | ast node | supported | `corpus/selectors.txt`, 31 entries |
 | @ <timestamp> | modifier | supported | `corpus/selectors.txt`, 2 entries |
@@ -3779,7 +3779,7 @@ Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 | `quantile` | aggregation operator | supported | `corpus/aggregate.txt`, 2 entries |
 | `stddev` | aggregation operator | supported | `corpus/aggregate.txt`, 1 entry |
 | `stdvar` | aggregation operator | supported | `corpus/aggregate.txt`, 1 entry |
-| `sum` | aggregation operator | supported | `corpus/aggregate.txt`, 6 entries |
+| `sum` | aggregation operator | supported | `corpus/aggregate.txt`, 10 entries |
 | `topk` | aggregation operator | supported | `corpus/aggregate.txt`, 2 entries |
 | `abs` | function | supported | `corpus/transform.txt`, 1 entry |
 | `absent` | function | supported | `corpus/transform.txt`, 3 entries |
