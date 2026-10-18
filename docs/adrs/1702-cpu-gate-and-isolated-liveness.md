@@ -513,7 +513,8 @@ change, shown by reverting the change under test.
     run inside its 10 s bound; if it has not, the 30 s readiness threshold
     is revisited first, since it binds before the 60 s liveness one. Acceptance test: the default-render test
     from task 3 expects 4316 and the `--listen-health` argument, and the
-    release notes carry the image requirement.
+    release notes carry the image requirement. (Shipped; see the
+    operator-default-flip amendment below.)
 
 ## Amendment (2026-09-28): what the decoded-output charge reserves
 
@@ -876,3 +877,24 @@ The default is unchanged: with the flag unset, decision 7 stands as written.
 The flag exists to measure the gate's cost against its liveness benefit.
 Setting it gives up the isolation decision 7 gives scans: a scan over a large
 part holds a worker for the length of each block's decompress.
+
+## Amendment (2026-10-18): the operator-default-flip amendment (issue #2671)
+
+<!-- amendment-applies: sections="Follow-up tasks, in order" pointer="operator-default-flip amendment" -->
+
+Task 12's two preconditions are met and the operator now defaults
+`spec.probes.dedicatedHealthPort` to `true`. The evidence:
+
+- Task 11 scenario 2 ran on Linux and finished inside its 10 s bound, with a
+  maximum heartbeat age of 1.0 s across three runs (issue #2671, comment
+  6252379466).
+- A paired ClickBench run (issue #2980, comment 6253040379) showed the
+  dedicated health listener's `/healthz` p99 staying within 4 ms of the
+  baseline, with no regression the flip would need to weigh against the
+  liveness benefit.
+
+The same run also measured `--sql-scan-decode-inline` (the scan-decode
+opt-out amendment above) on the current build and found no gain: turning it
+on drove the main router's p99 up by about a factor of ten instead. That flag
+stays opt-in; this amendment changes only the operator's probe default, not
+decision 7.
