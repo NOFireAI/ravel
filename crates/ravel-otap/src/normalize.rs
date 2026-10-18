@@ -98,7 +98,7 @@
 //! value at [`TenantRules::max_stored_len`]. [`TenantRules::none()`] leaves
 //! every value unchanged.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -962,9 +962,7 @@ fn normalize_impl(
             dropped_exemplar_rows(batch),
         );
     }
-    tables
-        .resources
-        .build(limits, &mut rejected, rules, &mut tally);
+    tables.resources.build(limits, &mut rejected, rules);
 
     let FlatPoints {
         dp: flat_dp,
@@ -997,10 +995,9 @@ fn normalize_impl(
         summary_decision,
     } = &tables;
 
-    // Which metric ids actually contributed a point. Read only by the metadata
-    // build below (a family whose every point was rejected describes nothing),
-    // and one bool write per admitted point regardless, so the metadata-free
-    // entry points pay nothing measurable for it.
+    // Which metric ids actually contributed a point. Read by the metadata
+    // build below (a family whose every point was rejected describes nothing)
+    // and by the resource tally merge, one bool write per admitted point.
     let mut produced = vec![false; root.len()];
 
     let mut points = Vec::with_capacity(flat_dp.len());
@@ -1090,20 +1087,13 @@ fn normalize_impl(
         // One metric id belongs to exactly one resource (its root row's
         // `resource.id`), so a per-metric cache is already per resource.
         let outcome = group_cache.resolve(dp.parent_id, range, flat_attrs, |key| {
-            build_group(
-                key,
-                &decision.name,
-                prefix,
-                tenant,
-                limits,
-                rules,
-                &mut tally,
-            )
+            build_group(key, &decision.name, prefix, tenant, limits, rules)
         });
 
         match outcome {
-            Ok((label_set, series_id)) => {
+            Ok((label_set, series_id, group_tally)) => {
                 let series_id = *series_id;
+                tally.merge(group_tally);
                 points.push(NormalizedPoint {
                     series_id,
                     // ADR-0098: ravel-otap keeps its own built-set memo and
@@ -1241,6 +1231,7 @@ fn normalize_impl(
         resources.held_bytes()
             + SeriesIdMemo::held_bytes(hist_memos.values().chain(summary_memos.values())),
     );
+    resources.merge_stored_tallies(root, &produced, &mut tally);
 
     let metadata = if collect_metadata {
         build_metadata(
@@ -1408,6 +1399,9 @@ struct ResourcePrefixes<'b> {
     planned: BTreeMap<u16, PlannedResource>,
     /// Built prefixes, empty until [`Self::build`].
     prefixes: HashMap<u16, Vec<Label>>,
+    /// Each built prefix's rule-matched values, counted by
+    /// [`Self::merge_stored_tallies`] only for a resource with a stored point.
+    tallies: HashMap<u16, IpcryptTally>,
     /// Indexed by metric id: true when the metric's resource was rejected, so
     /// its points are already accounted for and must not be built or counted
     /// again.
@@ -1445,33 +1439,60 @@ impl<'b> ResourcePrefixes<'b> {
     /// Build every planned prefix with [`admit_resource_labels`], the function
     /// OTLP calls per `ResourceMetrics`, placing its rejections where the plan
     /// recorded them so the rejection order is the eager build's.
-    fn build(
-        &mut self,
-        limits: &IngestLimits,
-        rejected: &mut Vec<Rejection>,
-        rules: &TenantRules,
-        tally: &mut IpcryptTally,
-    ) {
+    fn build(&mut self, limits: &IngestLimits, rejected: &mut Vec<Rejection>, rules: &TenantRules) {
         let mut prefixes = HashMap::with_capacity(self.planned.len());
+        let mut tallies = HashMap::new();
         let mut inserts: Vec<(usize, Vec<Rejection>)> = Vec::new();
         for (&resource_id, plan) in &self.planned {
             let pairs = resource_pairs(&self.attrs, &self.order, resource_id);
             let mut scratch = Vec::new();
+            let mut tally = IpcryptTally::new();
             if let Some(labels) =
-                admit_resource_labels(&pairs, plan.points, limits, &mut scratch, rules, tally)
+                admit_resource_labels(&pairs, plan.points, limits, &mut scratch, rules, &mut tally)
             {
                 prefixes.insert(resource_id, labels);
+                if !tally.is_empty() {
+                    tallies.insert(resource_id, tally);
+                }
             }
             if !scratch.is_empty() {
                 inserts.push((plan.rejection_at, scratch));
             }
         }
         self.prefixes = prefixes;
+        self.tallies = tallies;
         // `rejection_at` never decreases in id order, so inserting from the
         // last one leaves every earlier index valid.
         for (at, rejections) in inserts.into_iter().rev() {
             let at = at.min(rejected.len());
             rejected.splice(at..at, rejections);
+        }
+    }
+
+    /// Merge into `tally` the rule-matched values of every resource under
+    /// which a metric in `produced` (indexed by metric id) stored a point,
+    /// once per resource, as OTLP counts a `ResourceMetrics`.
+    fn merge_stored_tallies(
+        &self,
+        root: &[Option<RootEntry>],
+        produced: &[bool],
+        tally: &mut IpcryptTally,
+    ) {
+        if self.tallies.is_empty() {
+            return;
+        }
+        let mut stored = BTreeSet::new();
+        for (metric_id, _) in produced.iter().enumerate().filter(|(_, p)| **p) {
+            if let Ok(metric_id) = u16::try_from(metric_id)
+                && let ResourceRef::Id(id) = resource_of(root, metric_id)
+            {
+                stored.insert(id);
+            }
+        }
+        for id in stored {
+            if let Some(resource_tally) = self.tallies.get(&id) {
+                tally.merge(resource_tally);
+            }
         }
     }
 
@@ -1682,6 +1703,7 @@ fn plan_resources<'b>(
                 order: Vec::new(),
                 planned: BTreeMap::new(),
                 prefixes: HashMap::new(),
+                tallies: HashMap::new(),
                 blocked,
             };
         }
@@ -1736,6 +1758,7 @@ fn plan_resources<'b>(
         order,
         planned,
         prefixes: HashMap::new(),
+        tallies: HashMap::new(),
         blocked,
     }
 }
@@ -2406,12 +2429,15 @@ enum RawCell {
     Complex,
 }
 
-type GroupOutcome = Result<(LabelSet, SeriesId), Rejection>;
+/// A group's label set, series id, and the rule-matched values its attributes
+/// carry, which the caller counts again for every point that resolves to it.
+type GroupOutcome = Result<(LabelSet, SeriesId, IpcryptTally), Rejection>;
 
 /// Memoization cache for the series-grouping step: per metric id, maps a
 /// canonicalized (sorted-by-key) attribute set to its already-computed
-/// `(LabelSet, SeriesId)` or rejection, so BLAKE3 canonicalization runs
-/// once per distinct combination per batch instead of once per point.
+/// `(LabelSet, SeriesId, IpcryptTally)` or rejection, so BLAKE3
+/// canonicalization runs once per distinct combination per batch instead of
+/// once per point.
 ///
 /// A key is built once per run: consecutive points of one metric with equal
 /// attribute rows, as [`project_flat`] counts them. A later point of the run
@@ -2504,7 +2530,7 @@ impl<'a> GroupCache<'a> {
                     .filter(|(_, v)| matches!(v, RawCell::Str(s) if s.is_empty()))
                     .count();
                 let set_bytes = match &self.outcomes[idx] {
-                    Ok((set, _)) => held::labels(set.len() + empties, set.iter()),
+                    Ok((set, _, _)) => held::labels(set.len() + empties, set.iter()),
                     Err(_) => 0,
                 };
                 key_bytes + set_bytes
@@ -3052,8 +3078,9 @@ fn check_flat_attrs_in_input_order(
 }
 
 /// Build the `(LabelSet, SeriesId)` for one distinct attribute-set group
-/// under one metric; called at most once per distinct group thanks to the
-/// caller's memoizing `HashMap` (see module docs).
+/// under one metric, with the rule-matched values its attributes carry;
+/// called at most once per distinct group thanks to the caller's memoizing
+/// `HashMap` (see module docs), which counts that tally once per stored point.
 fn build_group(
     raw: &[(String, RawCell)],
     metric_name: &str,
@@ -3061,18 +3088,18 @@ fn build_group(
     tenant: &TenantId,
     limits: &IngestLimits,
     rules: &TenantRules,
-    tally: &mut IpcryptTally,
-) -> Result<(LabelSet, SeriesId), Rejection> {
+) -> GroupOutcome {
     let mut labels = Vec::with_capacity(prefix.len() + raw.len() + 1);
     labels.extend_from_slice(prefix);
     labels.push(kept_label(
         METRIC_NAME_LABEL.to_string(),
         metric_name.to_string(),
     ));
+    let mut tally = IpcryptTally::new();
     for (raw_key, cell) in raw {
         let name = sanitize_label_name(raw_key);
         let value = raw_cell_value(cell)?;
-        push_checked(&mut labels, name, value, limits, rules, tally)?;
+        push_checked(&mut labels, name, value, limits, rules, &mut tally)?;
     }
     let label_set = LabelSet::new(labels).map_err(|err| match err {
         TypeError::DuplicateLabelName(name) => Rejection::DuplicateLabelName(name),
@@ -3080,7 +3107,7 @@ fn build_group(
     })?;
     let series_id = SeriesId::compute(tenant, metric_name, &label_set)
         .map_err(|_| Rejection::OversizedSeriesComponent)?;
-    Ok((label_set, series_id))
+    Ok((label_set, series_id, tally))
 }
 
 // --- Mirrors of ravel_otlp::normalize's private helpers (see module docs:
@@ -3714,7 +3741,7 @@ fn explode_histogram_point(
     attrs: &[FlatAttr],
     limits: &IngestLimits,
     rules: &TenantRules,
-    tally: &mut IpcryptTally,
+    counted: &mut IpcryptTally,
     ingest_ts_ns: i64,
     exemplars: &mut ExemplarAdmission<'_, '_>,
     memo: &mut SeriesIdMemo,
@@ -3746,6 +3773,8 @@ fn explode_histogram_point(
         });
     }
 
+    // The point's values, counted into `counted` once no series can reject.
+    let tally = &mut IpcryptTally::new();
     let base_labels = build_base_labels(prefix, range, attrs, limits, rules, tally)?;
     let stale = has_no_recorded_value(dp.flags);
     let bucket_name = format!("{metric_name}_bucket");
@@ -3822,6 +3851,7 @@ fn explode_histogram_point(
         rules,
         tally,
     )?);
+    counted.merge(tally);
 
     let mut informational = Vec::new();
     if dp.min.is_some() || dp.max.is_some() {
@@ -3836,7 +3866,7 @@ fn explode_histogram_point(
         dp.id,
         limits,
         rules,
-        tally,
+        counted,
         |value| {
             let idx = exemplar_bucket_index(&dp.explicit_bounds, value);
             bucket_series[idx].series_id
@@ -3920,8 +3950,11 @@ impl ExemplarAdmission<'_, '_> {
         let mut candidates = Vec::with_capacity(rows.len());
         let mut dropped = 0usize;
         for row in rows {
-            match self.build_exemplar(row, limits, rules, tally) {
-                Some(candidate) => candidates.push(candidate),
+            // Each candidate's rule-matched values count only if the cap
+            // admits it.
+            let mut candidate_tally = IpcryptTally::new();
+            match self.build_exemplar(row, limits, rules, &mut candidate_tally) {
+                Some(candidate) => candidates.push((candidate, candidate_tally)),
                 None => dropped += 1,
             }
         }
@@ -3930,11 +3963,12 @@ impl ExemplarAdmission<'_, '_> {
         // is offered to the cap first, making the tie-break deterministic
         // rather than implementation-defined. Descending still holds
         // keep-the-newest.
-        candidates.sort_by_key(|c| std::cmp::Reverse(c.ts_ns));
+        candidates.sort_by_key(|(c, _)| std::cmp::Reverse(c.ts_ns));
 
-        for candidate in candidates {
+        for (candidate, candidate_tally) in candidates {
             let series_id = series_id_for(f64::from_bits(candidate.value_bits));
             if self.cap.admit(series_id, candidate.ts_ns) {
+                tally.merge(&candidate_tally);
                 self.out.push(NormalizedExemplar {
                     series_id,
                     exemplar: candidate,
@@ -4045,7 +4079,7 @@ fn explode_summary_point(
     attrs: &[FlatAttr],
     limits: &IngestLimits,
     rules: &TenantRules,
-    tally: &mut IpcryptTally,
+    counted: &mut IpcryptTally,
     ingest_ts_ns: i64,
     memo: &mut SeriesIdMemo,
 ) -> Result<Vec<NormalizedPoint>, Rejection> {
@@ -4070,6 +4104,8 @@ fn explode_summary_point(
         });
     }
 
+    // The point's values, counted into `counted` once no series can reject.
+    let tally = &mut IpcryptTally::new();
     let base_labels = build_base_labels(prefix, range, attrs, limits, rules, tally)?;
     let stale = has_no_recorded_value(dp.flags);
 
@@ -4119,6 +4155,7 @@ fn explode_summary_point(
         rules,
         tally,
     )?);
+    counted.merge(tally);
 
     Ok(series)
 }

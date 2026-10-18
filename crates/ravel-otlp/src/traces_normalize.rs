@@ -135,9 +135,12 @@ pub struct NormalizedSpan {
 pub struct SpanNormalizeOutput {
     pub spans: Vec<NormalizedSpan>,
     pub rejected: Vec<SpanRejection>,
-    /// Per-variant, per-outcome counts of every IPCrypt encryption this
-    /// request's attributes went through (ADR-2993 decision 3). Empty when
-    /// `rules` matched nothing, including [`TenantRules::none()`].
+    /// Per-variant, per-outcome counts of the rule-matched attribute values
+    /// this call stores (ADR-2993 decision 3): a span's own attributes once
+    /// per admitted span, a resource's or scope's once if any span under it is
+    /// admitted, and an event or link blob's only if the blob is kept. A
+    /// rejected span, a dropped attribute, or a dropped blob counts nothing.
+    /// Empty when `rules` matched nothing, including [`TenantRules::none()`].
     pub ipcrypt_tally: IpcryptTally,
 }
 
@@ -260,8 +263,17 @@ fn normalize_resource(
     // Converted once per resource and reported once, not once per span under
     // it: see the module docs on why an unconvertible resource attribute does
     // not reject the spans the way the logs path does.
-    let resource_attrs = convert_attrs_lossy(resource_attributes, limits, rules, tally, rejected);
+    // Its values count once, and only if a span under it is stored.
+    let mut resource_tally = IpcryptTally::new();
+    let resource_attrs = convert_attrs_lossy(
+        resource_attributes,
+        limits,
+        rules,
+        &mut resource_tally,
+        rejected,
+    );
 
+    let stored_before = spans.len();
     for ss in &rs.scope_spans {
         normalize_scope(
             ss,
@@ -273,6 +285,9 @@ fn normalize_resource(
             rejected,
             tally,
         );
+    }
+    if spans.len() > stored_before {
+        tally.merge(&resource_tally);
     }
 }
 
@@ -305,7 +320,9 @@ fn normalize_scope(
         return;
     }
 
-    let mut scope_attrs = convert_attrs_lossy(scope_attributes, limits, rules, tally, rejected);
+    let mut scope_tally = IpcryptTally::new();
+    let mut scope_attrs =
+        convert_attrs_lossy(scope_attributes, limits, rules, &mut scope_tally, rejected);
     // The instrumentation scope's own name and version are attributes here
     // rather than part of an identity blob (spans have no stream identity), so
     // they follow OTel's own `otel.scope.*` convention. Empty values are not
@@ -322,6 +339,7 @@ fn normalize_scope(
     // at the per-attribute rate, which the pushes above could have outgrown.
     scope_attrs.shrink_to_fit();
 
+    let stored_before = spans.len();
     for span in &ss.spans {
         match normalize_span(
             span,
@@ -338,6 +356,9 @@ fn normalize_scope(
             }
             Err(reason) => rejected.push(reason),
         }
+    }
+    if spans.len() > stored_before {
+        tally.merge(&scope_tally);
     }
 }
 
@@ -484,10 +505,16 @@ fn reserved_attrs(
     if span.flags != 0 {
         out.push((ATTR_SPAN_FLAGS.to_string(), span.flags.to_string()));
     }
+    // A blob's values count only if the blob is kept.
     if !span.events.is_empty() {
-        let events = with_encrypted_attrs(&span.events, rules, tally, |e| &mut e.attributes);
+        let mut blob_tally = IpcryptTally::new();
+        let events =
+            with_encrypted_attrs(&span.events, rules, &mut blob_tally, |e| &mut e.attributes);
         match encode_blob(&events, limits.max_raw_blob_len) {
-            Ok(hex) => out.push((ATTR_EVENTS_RAW.to_string(), hex)),
+            Ok(hex) => {
+                tally.merge(&blob_tally);
+                out.push((ATTR_EVENTS_RAW.to_string(), hex));
+            }
             Err(len) => dropped.push(SpanRejection::EventsBlobTooLong {
                 len,
                 max: limits.max_raw_blob_len,
@@ -495,9 +522,14 @@ fn reserved_attrs(
         }
     }
     if !span.links.is_empty() {
-        let links = with_encrypted_attrs(&span.links, rules, tally, |l| &mut l.attributes);
+        let mut blob_tally = IpcryptTally::new();
+        let links =
+            with_encrypted_attrs(&span.links, rules, &mut blob_tally, |l| &mut l.attributes);
         match encode_blob(&links, limits.max_raw_blob_len) {
-            Ok(hex) => out.push((ATTR_LINKS_RAW.to_string(), hex)),
+            Ok(hex) => {
+                tally.merge(&blob_tally);
+                out.push((ATTR_LINKS_RAW.to_string(), hex));
+            }
             Err(len) => dropped.push(SpanRejection::LinksBlobTooLong {
                 len,
                 max: limits.max_raw_blob_len,
@@ -698,6 +730,8 @@ fn apply_ipcrypt(
     rendered
 }
 
+/// Convert one attribute. `tally` gets its rule-matched value only on `Ok`:
+/// a dropped attribute stores nothing and counts nothing.
 fn convert_attr(
     kv: &KeyValue,
     limits: &SpanIngestLimits,
@@ -711,13 +745,15 @@ fn convert_attr(
         });
     }
     let value = convert_value(&kv.key, kv.value.as_ref())?;
-    let value = apply_ipcrypt(rules, tally, &kv.key, value);
+    let mut attr_tally = IpcryptTally::new();
+    let value = apply_ipcrypt(rules, &mut attr_tally, &kv.key, value);
     if value.len() > limits.max_attribute_value_len {
         return Err(SpanRejection::AttributeValueTooLong {
             len: value.len(),
             max: limits.max_attribute_value_len,
         });
     }
+    tally.merge(&attr_tally);
     Ok((exact_capacity(kv.key.clone()), exact_capacity(value)))
 }
 

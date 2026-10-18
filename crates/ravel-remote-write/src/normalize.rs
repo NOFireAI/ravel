@@ -267,9 +267,11 @@ pub struct RwNormalizeOutput {
     /// `Sample.start_timestamp` and `Histogram.start_timestamp` populate
     /// [`ResolvedRequest::created_timestamps_count`], which this mirrors.
     pub created_timestamps_dropped: usize,
-    /// Per-(variant, outcome) counts of every value a rule in the caller's
-    /// `TenantRules` matched during this call (ADR-2993 decision 3), sample
-    /// and exemplar labels alike. Empty when the rule set is empty or matched
+    /// Per-(variant, outcome) counts of the rule-matched values this call
+    /// stores (ADR-2993 decision 3): each `TimeSeries`' matched label values
+    /// once if any of its samples or histograms is stored, and an exemplar's
+    /// only if the exemplar cap admits it. A rejected series or a dropped
+    /// exemplar counts nothing. Empty when the rule set is empty or matched
     /// nothing.
     pub ipcrypt_tally: IpcryptTally,
 }
@@ -458,8 +460,11 @@ fn normalize_series(
 ) {
     let point_count = series.samples.len() + series.histograms.len();
 
+    // The series' label values count once, and only if a sample or histogram
+    // of it is stored.
+    let mut series_tally = IpcryptTally::new();
     let (metric_name, label_set) =
-        match resolve_series_identity(series, limits, rules, tally, point_count) {
+        match resolve_series_identity(series, limits, rules, &mut series_tally, point_count) {
             Ok(v) => v,
             Err(rejection) => {
                 *exemplars_dropped += series.exemplars.len();
@@ -496,6 +501,7 @@ fn normalize_series(
         exemplars_dropped,
     );
 
+    let stored_before = points.len() + histogram_points.len();
     for histogram in &series.histograms {
         match build_histogram_sample(histogram, ingest_ts_ns, limits) {
             Ok(sample) => {
@@ -528,6 +534,9 @@ fn normalize_series(
             }),
             Err(reason) => rejected.push(reason),
         }
+    }
+    if points.len() + histogram_points.len() > stored_before {
+        tally.merge(&series_tally);
     }
 }
 
@@ -564,8 +573,10 @@ fn admit_exemplars(
 
     let mut candidates = Vec::with_capacity(series.exemplars.len());
     for exemplar in &series.exemplars {
-        match build_exemplar(exemplar, ingest_ts_ns, limits, rules, tally) {
-            Some(candidate) => candidates.push(candidate),
+        // Each candidate's rule-matched values count only if the cap admits it.
+        let mut candidate_tally = IpcryptTally::new();
+        match build_exemplar(exemplar, ingest_ts_ns, limits, rules, &mut candidate_tally) {
+            Some(candidate) => candidates.push((candidate, candidate_tally)),
             None => *exemplars_dropped += 1,
         }
     }
@@ -573,10 +584,11 @@ fn admit_exemplars(
     // sharing one `ts_ns` the first in wire order stays first and is offered to
     // the cap first, making the tie-break deterministic rather than
     // implementation-defined. Descending still holds keep-the-newest.
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.ts_ns));
+    candidates.sort_by_key(|(c, _)| std::cmp::Reverse(c.ts_ns));
 
-    for candidate in candidates {
+    for (candidate, candidate_tally) in candidates {
         if cap.admit(series_id, candidate.ts_ns) {
+            tally.merge(&candidate_tally);
             exemplars_out.push(NormalizedExemplar {
                 series_id,
                 exemplar: candidate,

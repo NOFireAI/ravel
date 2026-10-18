@@ -99,9 +99,12 @@ pub struct LogNormalizeOutput {
     /// records is in `records`: the count is a conversion, never a rejection,
     /// so an operator alerting on rejection reasons sees nothing from it.
     pub body_conversions: usize,
-    /// Per-variant, per-outcome counts of every IPCrypt encryption this
-    /// request's attributes went through (ADR-2993 decision 3). Empty when
-    /// `rules` matched nothing, including [`TenantRules::none()`].
+    /// Per-variant, per-outcome counts of the rule-matched attribute values
+    /// this call stores (ADR-2993 decision 3): a record's own attributes once
+    /// per admitted record, and a resource's or scope's once if any record
+    /// under it is admitted. A rejected record or a dropped attribute counts
+    /// nothing. Empty when `rules` matched nothing, including
+    /// [`TenantRules::none()`].
     pub ipcrypt_tally: IpcryptTally,
 }
 
@@ -232,17 +235,22 @@ fn normalize_resource(
     // that silently differs from the one the sender described. Encryption
     // (ADR-2993 decision 3) runs inside `convert_attr`, before this identity
     // is computed below.
-    let resource_attrs = match convert_attrs(resource_attributes, limits, rules, tally) {
-        Ok(attrs) => attrs,
-        Err(reason) => {
-            rejected.push(LogRejection::Grouped {
-                reason: Box::new(reason),
-                count: resource_record_count,
-            });
-            return;
-        }
-    };
+    // The resource's values count once, and only if a record under it is
+    // stored.
+    let mut resource_tally = IpcryptTally::new();
+    let resource_attrs =
+        match convert_attrs(resource_attributes, limits, rules, &mut resource_tally) {
+            Ok(attrs) => attrs,
+            Err(reason) => {
+                rejected.push(LogRejection::Grouped {
+                    reason: Box::new(reason),
+                    count: resource_record_count,
+                });
+                return;
+            }
+        };
 
+    let stored_before = records.len();
     for sl in &rl.scope_logs {
         normalize_scope(
             sl,
@@ -255,6 +263,9 @@ fn normalize_resource(
             body_conversions,
             tally,
         );
+    }
+    if records.len() > stored_before {
+        tally.merge(&resource_tally);
     }
 }
 
@@ -291,7 +302,8 @@ fn normalize_scope(
         return;
     }
 
-    let scope_attrs = match convert_attrs(scope_attributes, limits, rules, tally) {
+    let mut scope_tally = IpcryptTally::new();
+    let scope_attrs = match convert_attrs(scope_attributes, limits, rules, &mut scope_tally) {
         Ok(attrs) => attrs,
         Err(reason) => {
             rejected.push(LogRejection::Grouped {
@@ -308,6 +320,7 @@ fn normalize_scope(
     let stream_id = log_stream_id(resource_attrs, scope_name, scope_version, &scope_attrs);
     let stream_attrs = stream_attrs_bytes(resource_attrs, scope_name, scope_version, &scope_attrs);
 
+    let stored_before = records.len();
     for record in &sl.log_records {
         match normalize_record(
             record,
@@ -327,6 +340,9 @@ fn normalize_scope(
             }
             Err(reason) => rejected.push(reason),
         }
+    }
+    if records.len() > stored_before {
+        tally.merge(&scope_tally);
     }
 }
 
@@ -817,9 +833,11 @@ fn apply_ipcrypt_attr(
         return;
     };
     tally.record(info.variant, outcome);
-    *s = rendered;
+    *s = exact_capacity(rendered);
 }
 
+/// Convert one attribute. `tally` gets its rule-matched value only on `Ok`:
+/// a dropped attribute stores nothing and counts nothing.
 fn convert_attr(
     kv: &KeyValue,
     limits: &LogIngestLimits,
@@ -833,7 +851,8 @@ fn convert_attr(
         });
     }
     let mut value = convert_value(&kv.key, kv.value.as_ref(), 1)?;
-    apply_ipcrypt_attr(rules, tally, &kv.key, &mut value);
+    let mut attr_tally = IpcryptTally::new();
+    apply_ipcrypt_attr(rules, &mut attr_tally, &kv.key, &mut value);
     if !attr_value_fits_storage(&value) {
         return Err(if has_container_past_entry_cap(&value) {
             LogRejection::AttributeTooManyEntries {
@@ -851,6 +870,7 @@ fn convert_attr(
             max: limits.max_attribute_value_len,
         });
     }
+    tally.merge(&attr_tally);
     Ok((exact_capacity(kv.key.clone()), value))
 }
 

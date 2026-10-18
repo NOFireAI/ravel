@@ -225,6 +225,58 @@ fn otap_series_identity_is_computed_over_the_ciphertext() {
     assert_ne!(points[0].series_id, expected_series_id(a));
 }
 
+/// The tally counts every stored value: two points carrying the same ruled
+/// attribute count twice, though the second one reuses the first one's
+/// group.
+#[test]
+fn otap_tally_counts_each_stored_point_with_identical_attributes() {
+    let ip = "192.0.2.1";
+    let result = normalize(
+        &batch(vec![point(ip, None), point(ip, None)], None),
+        &limits(),
+        &rules(),
+    );
+    assert!(result.output.rejected.is_empty());
+    assert_eq!(result.output.points.len(), 2);
+    assert_eq!(
+        result.output.points[0].series_id,
+        result.output.points[1].series_id
+    );
+    assert_eq!(
+        result
+            .output
+            .ipcrypt_tally
+            .count(Variant::Deterministic, RenderOutcome::Encrypted),
+        2
+    );
+}
+
+/// A rejected point stores nothing, so its ruled values are not counted:
+/// `client.ip` and `client_ip` both sanitize to `client_ip`, which rejects
+/// the second point after its first label was already encrypted.
+#[test]
+fn otap_tally_skips_a_rejected_point() {
+    let mut rejected = point("192.0.2.2", None);
+    rejected.attrs.push(attr(POINT_LABEL, "192.0.2.3"));
+    let result = normalize(
+        &batch(vec![point("192.0.2.1", None), rejected], None),
+        &limits(),
+        &rules(),
+    );
+    assert_eq!(result.output.points.len(), 1);
+    assert_eq!(
+        result.output.rejected,
+        vec![Rejection::DuplicateLabelName(POINT_LABEL.to_string())]
+    );
+    assert_eq!(
+        result
+            .output
+            .ipcrypt_tally
+            .count(Variant::Deterministic, RenderOutcome::Encrypted),
+        1
+    );
+}
+
 /// Direction: a value whose raw length is within `max_label_value_len` is
 /// rejected once a rule matches it, because its stored length can exceed the
 /// limit. OTAP's raw-length check runs before any label is built and charges

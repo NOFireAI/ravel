@@ -155,10 +155,12 @@ pub struct NormalizeOutput {
     pub points: Vec<NormalizedPoint>,
     pub histogram_points: Vec<NormalizedHistogramPoint>,
     pub rejected: Vec<Rejection>,
-    /// Per-(variant, outcome) counts of every value a rule in the caller's
-    /// `TenantRules` matched during this call (ADR-2993 decision 3), point
-    /// and exemplar labels alike. Empty when the rule set is empty or matched
-    /// nothing.
+    /// Per-(variant, outcome) counts of the rule-matched values this call
+    /// stores (ADR-2993 decision 3): each data point's matched attributes
+    /// once per point, a resource's once if any point under it is stored,
+    /// and an exemplar's only if the exemplar cap admits it. A rejected point
+    /// or a dropped exemplar counts nothing. Empty when the rule set is empty
+    /// or matched nothing.
     pub ipcrypt_tally: IpcryptTally,
 }
 
@@ -557,15 +559,23 @@ fn normalize_resource(
 ) {
     let resource_point_count = resource_metrics_point_count(rm);
     let attrs = resource_attr_pairs(rm.resource.as_ref());
-    let Some(resource_labels) =
-        admit_resource_labels(&attrs, resource_point_count, limits, rejected, rules, tally)
-    else {
+    // The resource's values count once, and only if a point under it is stored.
+    let mut resource_tally = IpcryptTally::new();
+    let Some(resource_labels) = admit_resource_labels(
+        &attrs,
+        resource_point_count,
+        limits,
+        rejected,
+        rules,
+        &mut resource_tally,
+    ) else {
         return;
     };
     drop(attrs);
     #[cfg(test)]
     label_capacity_stats::record_prefix(&resource_labels, resource_labels.capacity());
 
+    let stored_before = points.len() + histogram_points.len();
     for sm in &mut rm.scope_metrics {
         for metric in &mut sm.metrics {
             normalize_metric(
@@ -584,6 +594,9 @@ fn normalize_resource(
                 metadata_out.as_deref_mut(),
             );
         }
+    }
+    if points.len() + histogram_points.len() > stored_before {
+        tally.merge(&resource_tally);
     }
 }
 
@@ -875,6 +888,9 @@ struct MemoEntry {
     attr_key: Option<Vec<KeyValue>>,
     labels: Arc<LabelSet>,
     series_id: SeriesId,
+    /// The rule-matched values building `labels` counted, counted again for
+    /// every point that hits this entry; empty on the explode paths.
+    tally: IpcryptTally,
 }
 
 impl SeriesIdMemo {
@@ -888,34 +904,44 @@ impl SeriesIdMemo {
     /// consumes `attributes` to build the set (moving attribute-name strings,
     /// the #367 optimisation), the id is computed, and both are cached along
     /// with a copy of `attributes` as the key.
+    ///
+    /// `tally` gets the rule-matched values of this point's labels on success
+    /// only, hit or miss alike: a miss counts what `build_labels` recorded
+    /// into the scratch tally it is handed and caches that count, and a hit
+    /// counts the cached one, so every point counts its own values.
     fn series_id_for_attributes<F>(
         &mut self,
         tenant: &TenantId,
         metric_name: &str,
         attributes: Vec<KeyValue>,
+        tally: &mut IpcryptTally,
         build_labels: F,
     ) -> Result<(SeriesId, Arc<LabelSet>), Rejection>
     where
-        F: FnOnce(Vec<KeyValue>) -> Result<LabelSet, Rejection>,
+        F: FnOnce(Vec<KeyValue>, &mut IpcryptTally) -> Result<LabelSet, Rejection>,
     {
         if let Some(entry) = &self.last
             && entry.attr_key.as_deref() == Some(attributes.as_slice())
         {
             #[cfg(any(test, feature = "memo-stats"))]
             memo_stats::record_hit();
+            tally.merge(&entry.tally);
             return Ok((entry.series_id, Arc::clone(&entry.labels)));
         }
         #[cfg(any(test, feature = "memo-stats"))]
         memo_stats::record_miss();
         let key = attributes.clone();
-        let label_set = build_labels(attributes)?;
+        let mut built = IpcryptTally::new();
+        let label_set = build_labels(attributes, &mut built)?;
         let series_id = SeriesId::compute(tenant, metric_name, &label_set)
             .map_err(|_| Rejection::OversizedSeriesComponent)?;
+        tally.merge(&built);
         let labels = Arc::new(label_set);
         self.last = Some(MemoEntry {
             attr_key: Some(key),
             labels: Arc::clone(&labels),
             series_id,
+            tally: built,
         });
         Ok((series_id, labels))
     }
@@ -947,6 +973,7 @@ impl SeriesIdMemo {
             attr_key: None,
             labels: Arc::clone(&labels),
             series_id,
+            tally: IpcryptTally::new(),
         });
         Ok((series_id, labels))
     }
@@ -1084,8 +1111,10 @@ fn admit_exemplars<F>(
     let mut candidates = Vec::with_capacity(capacity);
     let mut dropped = 0usize;
     for ex in dp_exemplars {
-        match decode_exemplar(ex, limits, rules, tally) {
-            Some(e) => candidates.push(e),
+        // Each candidate's rule-matched values count only if the cap admits it.
+        let mut candidate_tally = IpcryptTally::new();
+        match decode_exemplar(ex, limits, rules, &mut candidate_tally) {
+            Some(e) => candidates.push((e, candidate_tally)),
             None => dropped += 1,
         }
     }
@@ -1094,11 +1123,12 @@ fn admit_exemplars<F>(
     // equal `ts_ns` (ExemplarCap::admit is first-wins). An unstable sort would
     // leave the tie winner implementation-defined rather than a property of the
     // input (ADR-0047 amendment: encoded bytes are a function of input order).
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.ts_ns));
+    candidates.sort_by_key(|(c, _)| std::cmp::Reverse(c.ts_ns));
 
-    for candidate in candidates {
+    for (candidate, candidate_tally) in candidates {
         let series_id = series_id_for(&candidate);
         if cap.admit(series_id, candidate.ts_ns) {
+            tally.merge(&candidate_tally);
             exemplars_out.push(NormalizedExemplar {
                 series_id,
                 exemplar: candidate,
@@ -1228,7 +1258,8 @@ fn build_point(
         ctx.tenant,
         ctx.metric_name,
         std::mem::take(&mut dp.attributes),
-        |attributes| {
+        tally,
+        |attributes, tally| {
             let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
             labels.extend_from_slice(ctx.resource_labels);
             labels.push(kept_label(
@@ -1306,7 +1337,8 @@ fn build_native_histogram_point(
         ctx.tenant,
         ctx.metric_name,
         std::mem::take(&mut dp.attributes),
-        |attributes| {
+        tally,
+        |attributes, tally| {
             let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
             labels.extend_from_slice(ctx.resource_labels);
             labels.push(kept_label(
@@ -1532,6 +1564,36 @@ pub fn apply_ipcrypt(
     let Some(info) = rules.lookup_label(name) else {
         return value;
     };
+    encrypt_under(rules, tally, info, value)
+}
+
+/// [`apply_ipcrypt`] for a label stored under its name as sent, which may not
+/// be a sanitized name (Remote Write never rewrites one): the rule is looked
+/// up by `name` sanitized as this module sanitizes an attribute key
+/// ([`lookup_label_rule`]), so `client.address` and `client_address` both
+/// match the rule for `client.address`. Only the lookup sees the sanitized
+/// form; the caller stores `name` unchanged.
+pub fn apply_ipcrypt_as_sent(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    name: &str,
+    value: String,
+) -> String {
+    if value.is_empty() {
+        return value;
+    }
+    let Some(info) = lookup_label_rule(rules, name) else {
+        return value;
+    };
+    encrypt_under(rules, tally, info, value)
+}
+
+fn encrypt_under(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    info: RuleInfo<'_>,
+    value: String,
+) -> String {
     let Some((rendered, outcome)) = rules.apply(info.raw_key, &value) else {
         return value;
     };
@@ -1653,7 +1715,7 @@ fn explode_histogram(
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
-    tally: &mut IpcryptTally,
+    counted: &mut IpcryptTally,
 ) -> Result<(Vec<NormalizedPoint>, Vec<Rejection>), Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
@@ -1681,6 +1743,8 @@ fn explode_histogram(
         });
     }
 
+    // The point's values, counted into `counted` once no series can reject.
+    let tally = &mut IpcryptTally::new();
     let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes), tally)?;
     let stale = has_no_recorded_value(dp.flags);
     let bucket_name = format!("{}_bucket", ctx.metric_name);
@@ -1749,6 +1813,7 @@ fn explode_histogram(
         tally,
     )?);
 
+    counted.merge(tally);
     let mut informational = Vec::new();
     if dp.min.is_some() || dp.max.is_some() {
         informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
@@ -1772,7 +1837,7 @@ fn explode_histogram(
         exemplars_out,
         &mut informational,
         ctx.rules,
-        tally,
+        counted,
     );
 
     Ok((series, informational))
@@ -1798,7 +1863,7 @@ fn explode_summary(
     ctx: &ExplodeContext,
     dp: &mut SummaryDataPoint,
     memo: &mut SeriesIdMemo,
-    tally: &mut IpcryptTally,
+    counted: &mut IpcryptTally,
 ) -> Result<Vec<NormalizedPoint>, Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
@@ -1820,6 +1885,8 @@ fn explode_summary(
         });
     }
 
+    // The point's values, counted into `counted` once no series can reject.
+    let tally = &mut IpcryptTally::new();
     let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes), tally)?;
     let stale = has_no_recorded_value(dp.flags);
 
@@ -1864,6 +1931,7 @@ fn explode_summary(
         tally,
     )?);
 
+    counted.merge(tally);
     Ok(series)
 }
 
