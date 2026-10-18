@@ -436,7 +436,9 @@ pub(crate) fn eval_range_call(
                     if !hists.is_empty() {
                         return None;
                     }
-                    match scalar_arg(evaluator, source, scalar_expr, reported_ts_ns, ctx) {
+                    match ctx.at_grid_step(start_ns, end_ns, reported_ts_ns, || {
+                        scalar_arg(evaluator, source, scalar_expr, reported_ts_ns, ctx)
+                    }) {
                         Ok(t) => f(
                             samples,
                             RangeWindow {
@@ -520,21 +522,25 @@ pub(crate) fn eval_range_call(
             // unchanged.
             eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
                 ctx.check_deadline()?;
-                let phi = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
-                let vector = vector_arg(evaluator, source, &call.args.args[1], t, ctx)?;
-                Ok(Value::Vector(to_instant_vector(f(phi, vector, ctx), t)))
+                ctx.at_grid_step(start_ns, end_ns, t, || {
+                    let phi = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
+                    let vector = vector_arg(evaluator, source, &call.args.args[1], t, ctx)?;
+                    Ok(Value::Vector(to_instant_vector(f(phi, vector, ctx), t)))
+                })
             })
         }
         FunctionKind::HistogramFraction(f) => {
             eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
                 ctx.check_deadline()?;
-                let lower = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
-                let upper = scalar_arg(evaluator, source, &call.args.args[1], t, ctx)?;
-                let vector = vector_arg(evaluator, source, &call.args.args[2], t, ctx)?;
-                Ok(Value::Vector(to_instant_vector(
-                    f(lower, upper, vector, ctx),
-                    t,
-                )))
+                ctx.at_grid_step(start_ns, end_ns, t, || {
+                    let lower = scalar_arg(evaluator, source, &call.args.args[0], t, ctx)?;
+                    let upper = scalar_arg(evaluator, source, &call.args.args[1], t, ctx)?;
+                    let vector = vector_arg(evaluator, source, &call.args.args[2], t, ctx)?;
+                    Ok(Value::Vector(to_instant_vector(
+                        f(lower, upper, vector, ctx),
+                        t,
+                    )))
+                })
             })
         }
         FunctionKind::ScalarRangeVector(f) => {
@@ -566,7 +572,9 @@ pub(crate) fn eval_range_call(
                     if !hists.is_empty() {
                         return None;
                     }
-                    match scalar_arg(evaluator, source, scalar_expr, reported_ts_ns, ctx) {
+                    match ctx.at_grid_step(start_ns, end_ns, reported_ts_ns, || {
+                        scalar_arg(evaluator, source, scalar_expr, reported_ts_ns, ctx)
+                    }) {
                         Ok(q) => {
                             maybe_warn_invalid_quantile(q, ctx);
                             f(
@@ -611,13 +619,15 @@ pub(crate) fn eval_range_call(
         // rather than emitting them as `0.0` floats.
         FunctionKind::VectorMap(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
-            let v = vector_arg(evaluator, source, &call.args.args[0], t, ctx)?;
+            let v = ctx.at_grid_step(start_ns, end_ns, t, || {
+                vector_arg(evaluator, source, &call.args.args[0], t, ctx)
+            })?;
             Ok(Value::Vector(f(v)))
         })
         .map(|m| float_matrix_into_hist(hist_matrix_into_float(m))),
         FunctionKind::Instant(f) => eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
-            f(evaluator, source, call, t, ctx)
+            ctx.at_grid_step(start_ns, end_ns, t, || f(evaluator, source, call, t, ctx))
         })
         .map(|m| float_matrix_into_hist(hist_matrix_into_float(m))),
     }
@@ -773,9 +783,9 @@ pub(crate) fn eval_instant_over_grid(
 /// forward-only-cursor discipline. A subquery has no single raw sample
 /// stream to cursor over (each grid step's inner expression is its own
 /// recursive evaluation, per [`Evaluator::eval_subquery_matrix`]), so it is
-/// re-evaluated fully at each outer step instead: exactly the "no cross-step
-/// caching" discipline, generalized to the
-/// two-grids-deep case a subquery nested in a range query produces.
+/// re-evaluated fully at each outer step instead. Only its selector reads are
+/// shared across steps, through the per-query selector cache, which each
+/// outer step enters as a grid step of this range query.
 #[allow(clippy::too_many_arguments)]
 fn eval_matrix_arg_range_reduction(
     evaluator: &Evaluator,
@@ -811,7 +821,9 @@ fn eval_matrix_arg_range_reduction(
             let mut t = start_ns;
             while t <= end_ns {
                 ctx.check_deadline()?;
-                let matrix = evaluator.eval_subquery_matrix(source, sq, t, ctx)?;
+                let matrix = ctx.at_grid_step(start_ns, end_ns, t, || {
+                    evaluator.eval_subquery_matrix(source, sq, t, ctx)
+                })?;
                 let sel_ts_ns = resolve_eval_ts(sq.offset.as_ref(), sq.at.as_ref(), t, ctx)?;
                 let window_start_ns = sel_ts_ns.checked_sub(range_ns).ok_or(Error::TimeOverflow)?;
                 for (labels, samples) in matrix {

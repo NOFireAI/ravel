@@ -372,7 +372,9 @@ fn matrix_arg_has_samples(
 /// that helper is built around reducing each matched series' own rows and
 /// has no notion of a synthetic series representing the matrix's
 /// emptiness; for a subquery argument there is no single raw sample stream
-/// to cursor over in the first place.
+/// to cursor over in the first place. Each step reads the argument's
+/// selectors through the per-query selector cache, so the per-step
+/// evaluation slices one fetch rather than querying the source again.
 pub(crate) fn absent_over_time_range(
     evaluator: &Evaluator,
     source: &dyn SeriesSource,
@@ -389,7 +391,9 @@ pub(crate) fn absent_over_time_range(
         // Absence at this step means the window held neither a float nor a
         // native-histogram sample (ADR-0108 decision 7): a histogram-only
         // stream is present, so the step must not report 1.
-        if !matrix_arg_has_samples(evaluator, source, arg, t, ctx)? {
+        if !ctx.at_grid_step(start_ns, end_ns, t, || {
+            matrix_arg_has_samples(evaluator, source, arg, t, ctx)
+        })? {
             out_samples.push(Sample {
                 ts_ns: t,
                 value: 1.0,

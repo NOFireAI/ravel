@@ -27,6 +27,7 @@ pub mod histogram;
 mod matchers;
 mod plan;
 pub mod redact;
+mod selector_cache;
 mod source;
 pub mod testsource;
 
