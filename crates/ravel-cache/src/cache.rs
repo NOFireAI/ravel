@@ -5,6 +5,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
+use crate::AccessIntent;
 use crate::clock::{Clock, SystemClock};
 use crate::key::CacheKey;
 use crate::limits::CacheLimits;
@@ -204,15 +205,24 @@ where
     /// own, so it remains the correct way to resolve a peeked miss; what the
     /// caller must avoid is counting a second miss around it, not the call.
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
-        self.inner.get(key).map(|bytes| self.maybe_corrupt(bytes))
+        self.get_with_intent(key, AccessIntent::Interactive)
+    }
+
+    /// [`get`](Self::get) for a read of the given [`AccessIntent`]: the hit
+    /// counts toward promotion only for an interactive read, and is counted
+    /// under its intent in [`CacheMetrics::intent_snapshot`].
+    pub fn get_with_intent(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
+        self.inner
+            .get(key, intent)
+            .map(|bytes| self.maybe_corrupt(bytes))
     }
 
     /// The resident bytes for `key`, exactly as inserted, recording neither a
     /// hit nor a miss and applying no corruption: for a caller whose earlier
     /// [`get`](Self::get) already accounted this request. Unlike
     /// [`peek_uncounted`](Self::peek_uncounted) it skips the corruption gate.
-    pub(crate) fn get_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
-        self.inner.lookup(key)
+    pub(crate) fn get_uncounted(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
+        self.inner.lookup(key, intent)
     }
 
     /// Look up `key` without fetching and without recording a hit or a miss,
@@ -221,8 +231,18 @@ where
     /// since. Ages entries out like `get` and, in corruption mode, serves a hit
     /// corrupted like any other hit.
     pub fn peek_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+        self.peek_uncounted_with_intent(key, AccessIntent::Interactive)
+    }
+
+    /// [`peek_uncounted`](Self::peek_uncounted) for a read of the given
+    /// [`AccessIntent`].
+    pub fn peek_uncounted_with_intent(
+        &self,
+        key: &CacheKey,
+        intent: AccessIntent,
+    ) -> Option<Bytes> {
         self.inner
-            .lookup(key)
+            .lookup(key, intent)
             .map(|bytes| self.maybe_corrupt(bytes))
     }
 
@@ -239,15 +259,33 @@ where
     /// keeps a clone of `value` makes it shared, so it is always copied; pass
     /// it by value and use [`admit`](Self::admit) to get the stored bytes back.
     pub fn insert(&self, key: CacheKey, value: Bytes) {
-        self.inner.insert(key, value);
+        self.insert_with_intent(key, value, AccessIntent::Interactive);
     }
 
-    /// [`insert`](Self::insert), returning a handle to the bytes the tier now
-    /// stores (or `value` itself if it was over the size limit), so an
-    /// admitting caller that also serves the bytes need not hold a second
-    /// handle to `value` across the admission and force a copy.
-    pub(crate) fn admit(&self, key: CacheKey, value: Bytes) -> Bytes {
-        self.inner.insert(key, value)
+    /// [`insert`](Self::insert) for a read of the given [`AccessIntent`],
+    /// which decides where the entry is admitted. A
+    /// [`AccessIntent::BulkScan`] value outside the bulk region's subset is
+    /// not admitted, which is not an error either.
+    pub fn insert_with_intent(&self, key: CacheKey, value: Bytes, intent: AccessIntent) {
+        self.inner.insert(key, value, intent);
+    }
+
+    /// [`insert_with_intent`](Self::insert_with_intent), returning a handle to
+    /// the bytes the tier now stores (or `value` itself if it was over the
+    /// size limit), so an admitting caller that also serves the bytes need not
+    /// hold a second handle to `value` across the admission and force a copy.
+    pub(crate) fn admit(&self, key: CacheKey, value: Bytes, intent: AccessIntent) -> Bytes {
+        self.inner.insert(key, value, intent)
+    }
+
+    /// Bytes the bulk region's bookkeeping is charged inside `max_bytes`.
+    pub fn bulk_bookkeeping_bytes(&self) -> u64 {
+        self.inner.fifo.lock().bookkeeping_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bulk_region_bytes(&self) -> u64 {
+        self.inner.fifo.lock().region_bytes()
     }
 
     /// Whether this cache is in the ADR-0046 acceptance-gate corruption mode
@@ -296,7 +334,27 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
     {
-        self.get_or_fetch_outcome(key, fetch)
+        self.get_or_fetch_with_intent(key, AccessIntent::Interactive, fetch)
+            .await
+    }
+
+    /// [`get_or_fetch`](Self::get_or_fetch) for a read of the given
+    /// [`AccessIntent`]. The leader's recheck and admission apply the intent
+    /// of the request that became the single-flight leader; a follower's
+    /// intent is not consulted. A [`AccessIntent::BulkScan`] value the bulk
+    /// region declines is not admitted, so, like an over-size one, a caller
+    /// arriving after its flight fetches it again.
+    pub async fn get_or_fetch_with_intent<F, Fut>(
+        &self,
+        key: CacheKey,
+        intent: AccessIntent,
+        fetch: F,
+    ) -> Result<Bytes, SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<Bytes, E>> + Send,
+    {
+        self.get_or_fetch_outcome_with_intent(key, intent, fetch)
             .await
             .map(|(bytes, _)| bytes)
     }
@@ -319,13 +377,32 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: Future<Output = Result<Bytes, E>> + Send,
     {
+        self.get_or_fetch_outcome_with_intent(key, AccessIntent::Interactive, fetch)
+            .await
+    }
+
+    /// [`get_or_fetch_outcome`](Self::get_or_fetch_outcome) for a read of the
+    /// given [`AccessIntent`], applied as
+    /// [`get_or_fetch_with_intent`](Self::get_or_fetch_with_intent) applies
+    /// it: the single-flight leader's intent decides the recheck and the
+    /// admission.
+    pub async fn get_or_fetch_outcome_with_intent<F, Fut>(
+        &self,
+        key: CacheKey,
+        intent: AccessIntent,
+        fetch: F,
+    ) -> Result<(Bytes, ReadOutcome), SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: Future<Output = Result<Bytes, E>> + Send,
+    {
         let (result, role) = self
             .single_flight
             .run(key, move || async move {
-                if let Some(bytes) = self.inner.lookup(&key) {
+                if let Some(bytes) = self.inner.lookup(&key, intent) {
                     return Ok((bytes, true));
                 }
-                let bytes = self.admit(key, fetch().await?);
+                let bytes = self.admit(key, fetch().await?, intent);
                 Ok((bytes, false))
             })
             .await;
@@ -382,10 +459,11 @@ impl Inner {
     /// and reported as an ordinary miss: unlike the disk tier, the RAM tier has
     /// no max-age expiry counter, so an aged-out read moves the same `misses`
     /// counter a cold miss does and nothing else.
-    fn get(&self, key: &CacheKey) -> Option<Bytes> {
-        match self.lookup(key) {
+    fn get(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
+        match self.lookup(key, intent) {
             Some(bytes) => {
-                self.metrics.record_hit(bytes.len() as u64);
+                self.metrics
+                    .record_hit_with_intent(intent, bytes.len() as u64);
                 Some(bytes)
             }
             None => {
@@ -396,27 +474,39 @@ impl Inner {
     }
 
     /// [`Self::get`] without recording a hit or a miss.
-    fn lookup(&self, key: &CacheKey) -> Option<Bytes> {
+    fn lookup(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
         let mut fifo = self.fifo.lock();
-        let entry = fifo.get(key)?;
-        if self.clock.now_ns().saturating_sub(entry.written_at_ns) > self.limits.max_entry_age_ns {
-            // Older than the configured max-age: an erased subject's bytes must
-            // not outlive the sweep in a query node's RAM by more than this
-            // (ADR-0064). Dropped and re-fetched, not served.
-            // `saturating_sub` keeps a clock that jumped backward (a stamp
-            // newer than "now") from wrapping into a huge age: such an entry is
-            // simply treated as not yet expired, mirroring the disk tier.
-            fifo.remove(key);
-            return None;
-        }
-        Some(entry.bytes)
+        // Keys a bulk read's window rotation evicted need no cleanup here:
+        // their bytes drop with the entries.
+        let (entry, _) = fifo.get_with_intent(key, intent, &self.metrics);
+        let served = match entry {
+            Some(entry)
+                if self.clock.now_ns().saturating_sub(entry.written_at_ns)
+                    > self.limits.max_entry_age_ns =>
+            {
+                // Older than the configured max-age: an erased subject's bytes
+                // must not outlive the sweep in a query node's RAM by more than
+                // this (ADR-0064). Dropped and re-fetched, not served.
+                // `saturating_sub` keeps a clock that jumped backward (a stamp
+                // newer than "now") from wrapping into a huge age: such an
+                // entry is simply treated as not yet expired, mirroring the
+                // disk tier.
+                fifo.remove(key);
+                None
+            }
+            Some(entry) => Some(entry.bytes),
+            None => None,
+        };
+        self.metrics
+            .set_bulk_bookkeeping_bytes(fifo.bookkeeping_bytes());
+        served
     }
 
     /// Admits `value` as an allocation the entry owns outright (see
     /// [`owned_exact`]) and returns a handle to what was stored. An over-size
     /// value is declined by the eviction structure, so it is passed through
     /// uncopied.
-    fn insert(&self, key: CacheKey, value: Bytes) -> Bytes {
+    fn insert(&self, key: CacheKey, value: Bytes, intent: AccessIntent) -> Bytes {
         let size = value.len() as u64;
         let value = if size > self.limits.max_entry_bytes {
             value
@@ -427,7 +517,10 @@ impl Inner {
             written_at_ns: self.clock.now_ns(),
             bytes: value.clone(),
         };
-        self.fifo.lock().insert(key, entry, size, &self.metrics);
+        let mut fifo = self.fifo.lock();
+        fifo.insert_with_intent(key, entry, size, intent, &self.metrics);
+        self.metrics
+            .set_bulk_bookkeeping_bytes(fifo.bookkeeping_bytes());
         value
     }
 
@@ -447,6 +540,8 @@ impl Inner {
         // file to unlink, and no metric is exposed for RAM expiry, so dropping
         // them from the eviction accounting is the whole of the work.
         let _ = fifo.drain_where(|entry| now_ns.saturating_sub(entry.written_at_ns) > max_age);
+        self.metrics
+            .set_bulk_bookkeeping_bytes(fifo.bookkeeping_bytes());
     }
 }
 
@@ -800,7 +895,7 @@ mod tests {
     /// closure runs once in total, and nothing is recorded beyond the late
     /// caller's own `get` miss.
     ///
-    /// FLIP: removing the leader's `self.inner.lookup(&key)` recheck in
+    /// FLIP: removing the leader's `self.inner.lookup(&key, intent)` recheck in
     /// `get_or_fetch` makes the late caller lead a second flight, so
     /// `fetches` reads 2.
     #[tokio::test]

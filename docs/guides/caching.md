@@ -161,11 +161,16 @@ reclaiming a pre-namespacing cache directory.
 | `--store-cost-profile <path>` | reference profile (`s3-intra-region-2026`) | TOML file carrying this deployment's object-store prices in integer nanodollars: `name`, `put_class_nanodollars`, `get_class_nanodollars`, `transfer_nanodollars_per_gib`, `retrieval_nanodollars_per_gib`, and optionally `delete_class_nanodollars` and the measured request timings `request_latency_micros` and `per_connection_throughput_bytes_per_s` (both or neither), with `timings_measured` naming where they were measured. Only `--logs-fetch-policy cost-based` reads it, to derive how many transferred bytes one saved request is worth; no price reaches the fetch layer. An unreadable file, invalid TOML, an unknown key, one timing without the other, or a blank `name` fails startup rather than falling back to the reference prices. |
 | `--logs-max-fetch-run-bytes <bytes>` | `67108864` (64 MiB) | The fetch bound: the maximum length of one covering GET on the log path, on every policy. An object at or under it is read in a single request; a larger one is read as sequential block-aligned covering sub-ranges of at most this many bytes each, so one oversized object cannot pull an unbounded response into memory. `0` is refused at startup. |
 
-Both `--cache-max-bytes` and `--catalog-cache-max-bytes` are **LRU caps, not
+Both `--cache-max-bytes` and `--catalog-cache-max-bytes` are **caps, not
 reservations**. Neither cache pre-allocates its ceiling. Each holds only the
-bytes that it admitted and evicts least-recently-used entries once it reaches
-its cap. The ceiling is an upper bound on resident cache bytes, not memory
-claimed at startup.
+bytes that it admitted and, once it reaches its cap, evicts with S3-FIFO, not
+least-recently-used. A new entry starts in a probation queue, an entry read
+again while there moves to a main queue when it leaves probation, and an
+entry read only once is evicted from probation. Probation is a tenth of the
+cap, and while it holds more than that, eviction takes from it first, so a
+long scan of data read once each passes through probation instead of
+evicting the main queue. The ceiling is an upper bound on resident cache
+bytes, not memory claimed at startup.
 
 The **sum of every ceiling can exceed physical RAM**. The two caches are
 independent, and the SQL memory pools (`--sql-max-query-bytes`,
@@ -191,6 +196,29 @@ On a memory-constrained host:
   [the catalog record caches](#the-catalog-record-caches), which are not read
   caches of object bytes and cost about 18 MB per actively-queried tenant
   under it.
+
+### Admission by access intent
+
+Each read of a RAM tier carries an access intent. The intent decides where
+the read's bytes are admitted and never what the read returns:
+
+- `interactive`: the S3-FIFO policy above.
+- `bulk_scan`, for a statement that reads every object of a tenant: a hit
+  does not count toward promotion, and the bytes never enter the main queue.
+  They go to a bulk region, which holds up to half of the cap against
+  interactive admissions and more while the probation and main queues leave
+  bytes unused. When a repeated scan is larger than the region, the region
+  keeps one subset of its objects, chosen by a hash of each cache key, and
+  later passes are served that same subset from memory. A bulk admission
+  never evicts the main queue, and an interactive admission reclaims bulk
+  bytes above half the cap before it evicts anything else. The region's
+  bookkeeping is counted inside the cap and held to 1% of it.
+- `maintenance`: admitted to probation, and never moved to the main queue by
+  its own reads. Nothing sets it yet.
+
+No reader sets `bulk_scan` yet, so every read is `interactive` today; the SQL
+executor is the reader that will set it (see Background). The disk tier
+applies the interactive policy to every read whatever its intent.
 
 ### The max-age sweep
 
@@ -544,4 +572,6 @@ bound on cached bytes comes from the erasure guarantee in
 read shape is
 [ADR-0107](../adrs/0107-pruning-proportional-logs-fetch.md), and the fetch
 policy above it is
-[ADR-0996](../adrs/0996-request-cost-aware-fetching.md).
+[ADR-0996](../adrs/0996-request-cost-aware-fetching.md). Admission by access
+intent is ADR-3072 decision 3; issue #3084 is the change that has the SQL
+executor set `bulk_scan`.

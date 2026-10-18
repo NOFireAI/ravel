@@ -71,6 +71,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
+use crate::AccessIntent;
 use crate::cache::Cache;
 use crate::disk::DiskCache;
 use crate::key::CacheKey;
@@ -283,7 +284,28 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
     {
-        let (bytes, outcome) = self.get_or_fetch_outcome(key, fetch).await?;
+        self.get_or_fetch_with_intent(key, AccessIntent::Interactive, fetch)
+            .await
+    }
+
+    /// [`get_or_fetch`](Self::get_or_fetch) for a read of the given
+    /// [`AccessIntent`]. The RAM tier's lookup and admissions, including the
+    /// re-admission of a disk hit, apply the intent; the disk tier keeps its
+    /// interactive policy. A single-flight leader applies the intent of the
+    /// request that became leader, and a follower's intent is not consulted.
+    pub async fn get_or_fetch_with_intent<F, Fut>(
+        &self,
+        key: CacheKey,
+        intent: AccessIntent,
+        fetch: F,
+    ) -> Result<(Bytes, Source), SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
+        let (bytes, outcome) = self
+            .get_or_fetch_outcome_with_intent(key, intent, fetch)
+            .await?;
         let source = match outcome {
             ReadOutcome::Hit => Source::Cache,
             ReadOutcome::Fetched | ReadOutcome::LateServe => Source::Upstream,
@@ -308,10 +330,28 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
     {
+        self.get_or_fetch_outcome_with_intent(key, AccessIntent::Interactive, fetch)
+            .await
+    }
+
+    /// [`get_or_fetch_outcome`](Self::get_or_fetch_outcome) for a read of the
+    /// given [`AccessIntent`], applied as
+    /// [`get_or_fetch_with_intent`](Self::get_or_fetch_with_intent) applies
+    /// it.
+    pub async fn get_or_fetch_outcome_with_intent<F, Fut>(
+        &self,
+        key: CacheKey,
+        intent: AccessIntent,
+        fetch: F,
+    ) -> Result<(Bytes, ReadOutcome), SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
         // Fast path: a RAM hit needs no cross-tier coordination and never
         // touches disk. `Cache::get` records the hit and, in corruption mode,
         // corrupts the served bytes.
-        if let Some(bytes) = self.ram.get(&key) {
+        if let Some(bytes) = self.ram.get_with_intent(&key, intent) {
             return Ok((bytes, ReadOutcome::Hit));
         }
 
@@ -337,7 +377,7 @@ where
                     // Read-through: repopulate RAM so the next read is a RAM
                     // hit, not another disk consult. Clean bytes are admitted;
                     // corruption, if on, is a serve-time transform below.
-                    let bytes = self.ram.admit(key, bytes);
+                    let bytes = self.ram.admit(key, bytes, intent);
                     return Ok((bytes, Served::Disk));
                 }
                 // Both tiers missed: the caller owns the upstream fetch. On
@@ -345,7 +385,7 @@ where
                 // a later RAM eviction is served from disk. `DiskCache::insert`
                 // silently declines bytes whose length disagrees with
                 // `key.len`, so a well-formed funnel key admits cleanly.
-                let bytes = self.ram.admit(key, fetch().await?);
+                let bytes = self.ram.admit(key, fetch().await?, intent);
                 // Same spawn_blocking treatment for the disk write. A
                 // `JoinError` here drops the disk admission silently: the RAM
                 // tier is already populated, so a lost disk write only costs
@@ -439,6 +479,25 @@ where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
     {
+        self.resolve_peeked_miss_with_intent(key, AccessIntent::Interactive, fetch)
+            .await
+    }
+
+    /// [`resolve_peeked_miss`](Self::resolve_peeked_miss) for a read of the
+    /// given [`AccessIntent`]: the leader's RAM recheck and RAM admission
+    /// apply it, the disk admission keeps the interactive policy, and a
+    /// single-flight leader applies the intent of the request that became
+    /// leader.
+    pub async fn resolve_peeked_miss_with_intent<F, Fut>(
+        &self,
+        key: CacheKey,
+        intent: AccessIntent,
+        fetch: F,
+    ) -> Result<Bytes, SingleFlightError<E>>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<Bytes, E>> + Send,
+    {
         // No counted tier consultation: the caller peeked both tiers with `get`
         // and got a confirmed miss, so a counted re-read here would record a
         // second miss. The leader runs the upstream fetch once and, on success,
@@ -462,10 +521,10 @@ where
                         let _ = hold.await;
                     }
                 }
-                if let Some(bytes) = self.ram.get_uncounted(&key) {
+                if let Some(bytes) = self.ram.get_uncounted(&key, intent) {
                     return Ok((bytes, Served::RamRecheck));
                 }
-                let bytes = self.ram.admit(key, fetch().await?);
+                let bytes = self.ram.admit(key, fetch().await?, intent);
                 // `DiskCache::insert` is std::fs I/O; run it on the blocking
                 // pool rather than the async worker thread (issue #1702). A
                 // `JoinError` drops the disk admission silently: the RAM
@@ -551,10 +610,17 @@ where
     /// [`get_off_worker`](Self::get_off_worker), which is this same read-through
     /// with the disk consult dispatched to the blocking pool (issue #1891).
     pub fn get(&self, key: &CacheKey) -> Option<Bytes> {
+        self.get_with_intent(key, AccessIntent::Interactive)
+    }
+
+    /// [`get`](Self::get) for a read of the given [`AccessIntent`]: the RAM
+    /// lookup and a disk hit's RAM re-admission apply it, and the disk tier
+    /// keeps its interactive policy.
+    pub fn get_with_intent(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
         // Fast path: a RAM hit is served verbatim (already corrupted, in
         // corruption mode, by `Cache::get`) and never consults disk, exactly
         // like `get_or_fetch`'s RAM fast path.
-        if let Some(bytes) = self.ram.get(key) {
+        if let Some(bytes) = self.ram.get_with_intent(key, intent) {
             return Some(bytes);
         }
         // RAM miss: consult disk. A disk hit repopulates RAM read-through with
@@ -562,7 +628,7 @@ where
         // same order `get_or_fetch`'s disk-hit branch uses, so the gate reaches
         // a disk-served hit here identically.
         let bytes = self.disk.get(key)?;
-        Some(self.admit_disk_hit(*key, bytes))
+        Some(self.admit_disk_hit(*key, bytes, intent))
     }
 
     /// [`get`](Self::get) for an async caller: the identical RAM-then-disk
@@ -586,14 +652,26 @@ where
     /// read: `DiskCache::get` has no error variant to begin with, so this adds
     /// no new failure mode the caller must handle.
     pub async fn get_off_worker(&self, key: CacheKey) -> Option<Bytes> {
-        if let Some(bytes) = self.ram.get(&key) {
+        self.get_off_worker_with_intent(key, AccessIntent::Interactive)
+            .await
+    }
+
+    /// [`get_off_worker`](Self::get_off_worker) for a read of the given
+    /// [`AccessIntent`], applied as [`get_with_intent`](Self::get_with_intent)
+    /// applies it.
+    pub async fn get_off_worker_with_intent(
+        &self,
+        key: CacheKey,
+        intent: AccessIntent,
+    ) -> Option<Bytes> {
+        if let Some(bytes) = self.ram.get_with_intent(&key, intent) {
             return Some(bytes);
         }
         let disk = self.disk.clone();
         let bytes = tokio::task::spawn_blocking(move || disk.get(&key))
             .await
             .unwrap_or(None)?;
-        Some(self.admit_disk_hit(key, bytes))
+        Some(self.admit_disk_hit(key, bytes, intent))
     }
 
     /// [`get_off_worker`](Self::get_off_worker) recording neither a hit nor a
@@ -603,14 +681,26 @@ where
     /// non-lead blocks). The same RAM-then-disk order, the same read-through
     /// RAM admission on a disk hit, and the same serve-time corruption.
     pub async fn peek_uncounted_off_worker(&self, key: CacheKey) -> Option<Bytes> {
-        if let Some(bytes) = self.ram.peek_uncounted(&key) {
+        self.peek_uncounted_off_worker_with_intent(key, AccessIntent::Interactive)
+            .await
+    }
+
+    /// [`peek_uncounted_off_worker`](Self::peek_uncounted_off_worker) for a
+    /// read of the given [`AccessIntent`], applied as
+    /// [`get_with_intent`](Self::get_with_intent) applies it.
+    pub async fn peek_uncounted_off_worker_with_intent(
+        &self,
+        key: CacheKey,
+        intent: AccessIntent,
+    ) -> Option<Bytes> {
+        if let Some(bytes) = self.ram.peek_uncounted_with_intent(&key, intent) {
             return Some(bytes);
         }
         let disk = self.disk.clone();
         let bytes = tokio::task::spawn_blocking(move || disk.get_uncounted(&key))
             .await
             .unwrap_or(None)?;
-        Some(self.admit_disk_hit(key, bytes))
+        Some(self.admit_disk_hit(key, bytes, intent))
     }
 
     /// Admit `value` under `key` into **both** tiers with no upstream fetch,
@@ -632,7 +722,14 @@ where
     /// caller uses [`insert_off_worker`](Self::insert_off_worker) instead
     /// (issue #1891).
     pub fn insert(&self, key: CacheKey, value: Bytes) {
-        let value = self.ram.admit(key, value);
+        self.insert_with_intent(key, value, AccessIntent::Interactive);
+    }
+
+    /// [`insert`](Self::insert) for a read of the given [`AccessIntent`]: the
+    /// RAM admission applies it, and the disk admission keeps the interactive
+    /// policy.
+    pub fn insert_with_intent(&self, key: CacheKey, value: Bytes, intent: AccessIntent) {
+        let value = self.ram.admit(key, value, intent);
         self.disk.insert(key, &value);
     }
 
@@ -651,7 +748,20 @@ where
     /// tier is already populated, so a lost disk write costs a future disk miss,
     /// never a wrong result.
     pub async fn insert_off_worker(&self, key: CacheKey, value: Bytes) {
-        let value = self.ram.admit(key, value);
+        self.insert_off_worker_with_intent(key, value, AccessIntent::Interactive)
+            .await;
+    }
+
+    /// [`insert_off_worker`](Self::insert_off_worker) for a read of the given
+    /// [`AccessIntent`], applied as
+    /// [`insert_with_intent`](Self::insert_with_intent) applies it.
+    pub async fn insert_off_worker_with_intent(
+        &self,
+        key: CacheKey,
+        value: Bytes,
+        intent: AccessIntent,
+    ) {
+        let value = self.ram.admit(key, value, intent);
         // The blocking closure must own its bytes: `DiskCache::insert` borrows a
         // slice, and a `spawn_blocking` closure has to be `'static`. It takes the
         // handle `admit` returned, which shares the RAM entry's payload.
@@ -711,8 +821,8 @@ where
     /// and [`get_off_worker`](Self::get_off_worker) so the two cannot drift in
     /// admission order or corruption gating; the only difference between them is
     /// which thread ran `DiskCache::get`.
-    fn admit_disk_hit(&self, key: CacheKey, bytes: Bytes) -> Bytes {
-        let bytes = self.ram.admit(key, bytes);
+    fn admit_disk_hit(&self, key: CacheKey, bytes: Bytes, intent: AccessIntent) -> Bytes {
+        let bytes = self.ram.admit(key, bytes, intent);
         self.maybe_corrupt(bytes, true)
     }
 
@@ -2291,5 +2401,48 @@ mod tests {
         assert_eq!(served, clean);
         assert_eq!(tiered.ram.get(&key).as_deref(), Some(clean.as_ref()));
         assert_eq!(tiered.ram_metrics().admission_copies(), 0);
+    }
+
+    /// A disk hit is re-admitted to RAM under the request's intent: a bulk
+    /// read lands in the bulk region and an interactive one in the small
+    /// queue, through `get_with_intent` and `get_or_fetch_with_intent` alike,
+    /// while the disk tier serves both.
+    ///
+    /// FLIP: passing `AccessIntent::Interactive` instead of `intent` to
+    /// `admit_disk_hit` in `get_with_intent` leaves the bulk read's bytes out
+    /// of the region, so `bulk_region_bytes` reads 0.
+    #[tokio::test]
+    async fn disk_hit_readmission_follows_the_request_intent() {
+        let tmp = TempDir::new().unwrap();
+        let disk = DiskCache::new(tmp.path().to_path_buf(), generous_limits());
+        let payload = Bytes::from(vec![0x5Au8; 4096]);
+        let bulk = test_key(1, payload.len() as u64);
+        let fetched_bulk = test_key(2, payload.len() as u64);
+        let interactive = test_key(3, payload.len() as u64);
+        for key in [bulk, fetched_bulk, interactive] {
+            disk.insert(key, &payload);
+        }
+        let ram: Cache<&'static str> = Cache::new(generous_limits());
+        let tiered = TieredCache::new(ram, disk);
+
+        let served = tiered.get_with_intent(&bulk, AccessIntent::BulkScan);
+        assert_eq!(served.as_deref(), Some(payload.as_ref()));
+        assert_eq!(tiered.ram.bulk_region_bytes(), 4096);
+
+        let (served, source) = tiered
+            .get_or_fetch_with_intent(fetched_bulk, AccessIntent::BulkScan, || async {
+                Err::<Bytes, &'static str>("the disk tier holds these bytes")
+            })
+            .await
+            .unwrap();
+        assert_eq!(served, payload);
+        assert_eq!(source, Source::Cache);
+        assert_eq!(tiered.ram.bulk_region_bytes(), 8192);
+
+        let served = tiered.get_with_intent(&interactive, AccessIntent::Interactive);
+        assert_eq!(served.as_deref(), Some(payload.as_ref()));
+        assert_eq!(tiered.ram.bulk_region_bytes(), 8192);
+        assert_eq!(tiered.ram_total_bytes(), 3 * 4096);
+        assert_eq!(tiered.disk_metrics().snapshot().hits, 3);
     }
 }

@@ -8,6 +8,8 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::AccessIntent;
+
 /// Shared counters for one `Cache`, held behind an `Arc` and cloned out
 /// with [`crate::Cache::metrics`] so a scrape path can read them without
 /// touching the cache itself.
@@ -24,12 +26,58 @@ pub struct CacheMetrics {
     disk_entries_expired_max_age: AtomicU64,
     admission_copies: AtomicU64,
     admission_copied_bytes: AtomicU64,
+    /// Indexed by [`intent_index`].
+    intent_hits: [AtomicU64; 3],
+    intent_bytes_served: [AtomicU64; 3],
+    bulk_bookkeeping_bytes: AtomicU64,
+}
+
+fn intent_index(intent: AccessIntent) -> usize {
+    match intent {
+        AccessIntent::Interactive => 0,
+        AccessIntent::BulkScan => 1,
+        AccessIntent::Maintenance => 2,
+    }
 }
 
 impl CacheMetrics {
     pub(crate) fn record_hit(&self, bytes: u64) {
         self.hits.fetch_add(1, Ordering::Relaxed);
         self.bytes_served.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// A RAM-tier hit, counted in [`Self::record_hit`]'s totals and under its
+    /// intent. The disk tier records plain hits and no intent.
+    pub(crate) fn record_hit_with_intent(&self, intent: AccessIntent, bytes: u64) {
+        self.record_hit(bytes);
+        let index = intent_index(intent);
+        self.intent_hits[index].fetch_add(1, Ordering::Relaxed);
+        self.intent_bytes_served[index].fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Publishes the bulk region's current bookkeeping bytes, a gauge.
+    pub(crate) fn set_bulk_bookkeeping_bytes(&self, bytes: u64) {
+        self.bulk_bookkeeping_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Hits and bytes served split by [`AccessIntent`], and the bulk region's
+    /// bookkeeping bytes. Read on its own, like [`Self::admission_copies`],
+    /// because [`CacheMetricsSnapshot`] is built field by field outside this
+    /// crate. A scrape, not a consistent cut, as [`Self::snapshot`] is.
+    pub fn intent_snapshot(&self) -> IntentMetricsSnapshot {
+        let counters = |intent| {
+            let index = intent_index(intent);
+            IntentCounters {
+                hits: self.intent_hits[index].load(Ordering::Relaxed),
+                bytes_served: self.intent_bytes_served[index].load(Ordering::Relaxed),
+            }
+        };
+        IntentMetricsSnapshot {
+            interactive: counters(AccessIntent::Interactive),
+            bulk_scan: counters(AccessIntent::BulkScan),
+            maintenance: counters(AccessIntent::Maintenance),
+            bulk_bookkeeping_bytes: self.bulk_bookkeeping_bytes.load(Ordering::Relaxed),
+        }
     }
 
     pub(crate) fn record_miss(&self) {
@@ -98,7 +146,7 @@ impl CacheMetrics {
     }
 
     /// Point-in-time copy of every counter but the two admission-copy ones
-    /// above. Not atomic across fields:
+    /// and the per-intent ones above. Not atomic across fields:
     /// concurrent calls may land between two loads, so a snapshot can show
     /// `hits` from a hair later than `misses`. It is a scrape, not a
     /// consistent cut, and nothing correctness-bearing reads it.
@@ -132,4 +180,36 @@ pub struct CacheMetricsSnapshot {
     pub single_flight_collapses: u64,
     pub disk_errors_degraded_to_misses: u64,
     pub disk_entries_expired_max_age: u64,
+}
+
+/// Hits and bytes served for one [`AccessIntent`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntentCounters {
+    pub hits: u64,
+    pub bytes_served: u64,
+}
+
+/// Point-in-time copy of [`CacheMetrics`]' per-intent counters, from
+/// [`CacheMetrics::intent_snapshot`]. On a RAM tier the three intents' hits
+/// sum to [`CacheMetricsSnapshot::hits`]; a disk tier records no intent and
+/// reads zero here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IntentMetricsSnapshot {
+    pub interactive: IntentCounters,
+    pub bulk_scan: IntentCounters,
+    pub maintenance: IntentCounters,
+    /// The bulk region's bookkeeping bytes, charged inside `max_bytes`; a
+    /// gauge, not a counter.
+    pub bulk_bookkeeping_bytes: u64,
+}
+
+impl IntentMetricsSnapshot {
+    /// The counters for `intent`.
+    pub fn for_intent(&self, intent: AccessIntent) -> IntentCounters {
+        match intent {
+            AccessIntent::Interactive => self.interactive,
+            AccessIntent::BulkScan => self.bulk_scan,
+            AccessIntent::Maintenance => self.maintenance,
+        }
+    }
 }

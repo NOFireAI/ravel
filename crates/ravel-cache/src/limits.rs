@@ -26,6 +26,10 @@ pub const DEFAULT_MAX_ENTRY_AGE_NS: u64 = 23 * 60 * 60 * 1_000_000_000;
 /// tiers for the same reason the max-age is.
 pub const DEFAULT_SWEEP_INTERVAL_NS: u64 = 60 * 60 * 1_000_000_000;
 
+/// Default share of `max_bytes` the bulk region holds against interactive
+/// admissions (ADR-3072 decision 3b).
+pub const DEFAULT_BULK_SHARE: f64 = 0.5;
+
 /// Bounds on a cache tier. The first three are enforced independently by both
 /// tiers: an entry that would only blow `max_entry_bytes` is rejected even if
 /// `max_bytes` has room left, and an insert that fits `max_entry_bytes` can
@@ -39,6 +43,9 @@ pub const DEFAULT_SWEEP_INTERVAL_NS: u64 = 60 * 60 * 1_000_000_000;
 /// that drops over-age idle entries. Together they bound how long raw bytes of
 /// an erased subject persist on a query node -- on local disk (ADR-0064)
 /// and in RAM alike.
+///
+/// `bulk_share` applies to the RAM tier only, since only
+/// [`crate::Cache`] admits [`crate::AccessIntent::BulkScan`] reads.
 #[derive(Debug, Clone, Copy)]
 pub struct CacheLimits {
     /// Total bytes across every resident entry.
@@ -61,6 +68,14 @@ pub struct CacheLimits {
     /// entry ages out within at most this interval past `max_entry_age_ns`.
     /// Defaults to [`DEFAULT_SWEEP_INTERVAL_NS`] (1 h).
     pub sweep_interval_ns: u64,
+    /// The share of `max_bytes`, from 0.0 to 1.0, that
+    /// [`crate::AccessIntent::BulkScan`] admissions hold against interactive
+    /// ones: interactive admissions reclaim bulk bytes above it first, and
+    /// bulk admissions evict small-queue entries only while below it. Bulk
+    /// entries may also fill bytes the interactive queues leave unused.
+    /// Values outside the range are clamped to it. Defaults to
+    /// [`DEFAULT_BULK_SHARE`].
+    pub bulk_share: f64,
 }
 
 impl CacheLimits {
@@ -74,6 +89,7 @@ impl CacheLimits {
             max_entry_bytes,
             max_entry_age_ns: DEFAULT_MAX_ENTRY_AGE_NS,
             sweep_interval_ns: DEFAULT_SWEEP_INTERVAL_NS,
+            bulk_share: DEFAULT_BULK_SHARE,
         }
     }
 
@@ -91,6 +107,13 @@ impl CacheLimits {
     /// only a caller (or a test) that needs a different cadence names it.
     pub fn with_sweep_interval_ns(mut self, sweep_interval_ns: u64) -> Self {
         self.sweep_interval_ns = sweep_interval_ns;
+        self
+    }
+
+    /// Overrides the bulk region's share of `max_bytes`. Builder-style, like
+    /// [`CacheLimits::with_max_entry_age_ns`].
+    pub fn with_bulk_share(mut self, bulk_share: f64) -> Self {
+        self.bulk_share = bulk_share;
         self
     }
 }
