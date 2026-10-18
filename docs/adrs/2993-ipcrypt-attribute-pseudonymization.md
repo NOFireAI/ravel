@@ -82,10 +82,11 @@ Facts in this tree that constrain the design:
   label-byte bound (`ravel-otlp`'s `label_projection`, which must never
   undercount) and OTAP's raw-length checks both measure the values as
   sent.
-- **Metric label names are sanitized.** `client.address` is stored as
+- **Metric label names are sanitized** (except on Remote Write, which
+  stores them as sent; see the Remote Write label-name amendment below).
+  `client.address` is stored as
   `client_address` on every metric surface, and Remote Write carries
-  only the sanitized form (wrong for Remote Write; see the Remote Write
-  label-name amendment below). Log and span attribute keys are stored as
+  only the sanitized form. Log and span attribute keys are stored as
   sent.
 - **Span events and links are stored as encoded protobuf blobs** inside
   reserved span attributes, so their attributes never pass through the
@@ -675,8 +676,9 @@ The Context said Remote Write carries only sanitized label names. It
 does not. Remote Write stores label names as sent (ADR-0015's
 no-sanitization rule), and a Prometheus 3 sender using UTF-8 names, or
 an OpenTelemetry exporter that does not translate names, sends
-`client.address` with its dots. Matching such a label as sent would
-miss a rule written for `client.address` on the metric surfaces, and
+`client.address` with its dots. Decision 1 looks rules up on the
+metric surfaces by the sanitized rule key, here `client_address`, so
+looking up such a label by its name as sent would miss the rule, and
 the raw address would be stored.
 
 - **Matching.** On Remote Write, a label name is sanitized with the
@@ -694,6 +696,14 @@ the raw address would be stored.
   `instance` covers the metric label but not logs and traces. An
   operator who wants both writes both rules, and the pseudonymization
   section #3048 adds to `docs/ingest.md` says so.
+- **Erasure.** Decision 8 is otherwise unchanged. Its rule lookup
+  already sanitizes the matcher key for the metric signals, so the
+  value is encrypted correctly. But ADR-0064 matches metric series
+  labels exactly, so an erase matcher must name the label as stored.
+  A series received over Remote Write as `client.address` is matched
+  by `client.address`, not `client_address`. A tenant that receives
+  both spellings submits one erasure request per spelling, and the
+  erasure guide says so.
 
 The code change lands with #3047's pull request, which adds the
 `ravel-remote-write` lookup and a test that a dotted label name is
