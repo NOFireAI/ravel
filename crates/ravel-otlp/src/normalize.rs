@@ -325,6 +325,7 @@ pub fn normalize_metrics_with_metadata_projected(
 /// [`normalize_metrics_with_metadata`]; when `None`, the suffix pass still
 /// runs (names are unconditional) but no metadata is collected, so the older
 /// entry points stay behaviorally identical apart from the names.
+#[allow(clippy::too_many_arguments)]
 fn normalize_impl(
     tenant: &TenantId,
     mut req: ExportMetricsServiceRequest,

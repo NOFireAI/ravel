@@ -313,14 +313,13 @@ fn metrics_none_matches_a_resolved_empty_rule_set() {
 #[test]
 fn rule_lookup_uses_the_metrics_label_sanitizer() {
     let rules = rules();
-    for (raw, label) in [("client.ip", "client_ip")] {
-        assert_eq!(sanitize_label_name(raw.to_string()), label);
-        assert_eq!(
-            rules.lookup_label(label).map(|info| info.raw_key),
-            Some(raw)
-        );
-        assert_eq!(rules.lookup_raw(raw).map(|info| info.raw_key), Some(raw));
-    }
+    let (raw, label) = ("client.ip", "client_ip");
+    assert_eq!(sanitize_label_name(raw.to_string()), label);
+    assert_eq!(
+        rules.lookup_label(label).map(|info| info.raw_key),
+        Some(raw)
+    );
+    assert_eq!(rules.lookup_raw(raw).map(|info| info.raw_key), Some(raw));
     assert!(rules.lookup_label("client.ip").is_none());
 }
 
