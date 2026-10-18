@@ -1012,7 +1012,7 @@ mod ipcrypt_tests {
     use ravel_ipcrypt::render::RenderOutcome;
     use ravel_ipcrypt::rules::EpochKey;
     use ravel_object_store::fault::{
-        FaultKind, FaultPlan, FaultStore, Op, Rule as FaultRule, ScriptedFault,
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule as FaultRule, ScriptedFault,
     };
     use ravel_object_store::memory::MemoryStore;
 
@@ -1169,6 +1169,11 @@ retired_epochs = [1, 2, 3, 4]
             report.requests[1].0.request_id
         );
         assert_eq!(request_keys(store.as_ref()).await.len(), 2);
+        let marker = ravel_ipcrypt::marker::read_marker(store.as_ref())
+            .await
+            .expect("read marker")
+            .map(|(marker, _)| marker.fingerprint);
+        assert_eq!(marker, Some(policy.fingerprint()), "the submit created the marker");
     }
 
     #[tokio::test]
@@ -1249,15 +1254,41 @@ retired_epochs = [1, 2, 3, 4]
         let first = submit_logs(&store, &policy, matchers.clone(), base)
             .await
             .expect("first submit");
-        let retry = submit_logs(&store, &policy, matchers, base)
-            .await
-            .expect("a retry is not a conflict");
+        let mut out = Vec::new();
+        let retry = submit_with_ipcrypt(
+            Arc::clone(&store),
+            &policy,
+            TENANT,
+            SignalArg::Logs,
+            matchers,
+            0,
+            0,
+            "dsar-1".to_string(),
+            base,
+            NOW_NS,
+            &mut out,
+        )
+        .await
+        .expect("a retry is not a conflict");
         let ids = |report: &IpcryptSubmitReport| -> Vec<Uuid> {
             report.requests.iter().map(|(p, _)| p.request_id).collect()
         };
         assert_eq!(ids(&first), ids(&retry));
         assert_eq!((retry.created, retry.already_present), (0, 4));
         assert_eq!(request_keys(store.as_ref()).await.len(), 4);
+
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains(&format!("erasure base request id {base}:\n")),
+            "{out}"
+        );
+        for id in ids(&retry) {
+            assert!(out.contains(&format!("  {id} (client.ip epoch ")), "{out}");
+        }
+        assert!(
+            out.ends_with("4 erasure requests: 0 created, 4 already present\n"),
+            "{out}"
+        );
     }
 
     #[tokio::test]
@@ -1311,6 +1342,33 @@ retired_epochs = [1, 2, 3, 4]
             predicate(&stored),
             vec![matcher(
                 "client_ip",
+                &ciphertext(Variant::Deterministic, 1, CLIENT)
+            )]
+        );
+
+        // A label stored as sent over Remote Write keeps its dotted name in
+        // the matcher, and the same rule encrypts its value.
+        let dotted = Uuid::from_u128(14);
+        submit_with_ipcrypt(
+            Arc::clone(&store),
+            &policy,
+            TENANT,
+            SignalArg::Metrics,
+            vec![matcher("client.ip", CLIENT)],
+            0,
+            0,
+            String::new(),
+            dotted,
+            NOW_NS,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("submit");
+        let stored = stored_request(&store, Signal::Metrics, dotted).await;
+        assert_eq!(
+            predicate(&stored),
+            vec![matcher(
+                "client.ip",
                 &ciphertext(Variant::Deterministic, 1, CLIENT)
             )]
         );
@@ -1380,5 +1438,41 @@ retired_epochs = [1, 2, 3, 4]
         assert_eq!(faulty.fault_count(Op::Get, FaultKind::Transient), 1);
         let keys = list_all(faulty.inner(), "").await.expect("list");
         assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    /// A write failing part-way names the base id, and rerunning with it
+    /// submits only the requests left out.
+    #[tokio::test]
+    async fn a_failure_part_way_names_the_base_id_and_a_rerun_finishes() {
+        let faulty = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Put, ScriptedFault::Transient("second request".into()))
+                    .with_key_contains("/del/")
+                    .with_occurrence(Occurrence::Nth(2)),
+            ),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(16);
+        let matchers = vec![matcher("client.ip", CLIENT), matcher("host.ip", HOST)];
+        let err = submit_logs(&store, &policy, matchers.clone(), base)
+            .await
+            .expect_err("the second write fails");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!(
+                "failed after 1 of 4 were submitted; rerun with --request-id {base} to finish"
+            )),
+            "{message}"
+        );
+        assert_eq!(faulty.fault_count(Op::Put, FaultKind::Transient), 1);
+        assert_eq!(request_keys(faulty.inner()).await.len(), 1);
+
+        let rerun = submit_logs(&store, &policy, matchers, base)
+            .await
+            .expect("rerun");
+        assert_eq!((rerun.created, rerun.already_present), (3, 1));
+        assert_eq!(request_keys(faulty.inner()).await.len(), 4);
     }
 }

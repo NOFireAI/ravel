@@ -441,9 +441,15 @@ mod tests {
 
     #[test]
     fn encrypt_then_decrypt_round_trips_for_both_variants() {
-        let addresses = values(&["198.51.100.7", "2001:db8::1"]);
+        let addresses = values(&[
+            "198.51.100.7",
+            "2001:db8::1",
+            "198.51.100.7:8080",
+            "[2001:db8::1]:443",
+        ]);
         for variant in [VariantArg::Deterministic, VariantArg::Prefix] {
             let mut encrypted = Vec::new();
+            let mut notes = Vec::new();
             run_transform(
                 Some(&DEPLOYMENT_KEY),
                 "acme",
@@ -452,18 +458,24 @@ mod tests {
                 Direction::Encrypt,
                 &addresses,
                 &mut encrypted,
-                &mut Vec::new(),
+                &mut notes,
             )
             .expect("encrypt");
+            assert!(notes.is_empty(), "{variant:?}");
             let ciphertexts: Vec<String> = String::from_utf8(encrypted)
                 .expect("utf-8")
                 .lines()
                 .map(str::to_string)
                 .collect();
-            assert_eq!(ciphertexts.len(), 2, "{variant:?}");
+            assert_eq!(ciphertexts.len(), 4, "{variant:?}");
             for (ciphertext, address) in ciphertexts.iter().zip(&addresses) {
                 assert_ne!(ciphertext, address, "{variant:?}");
             }
+            assert!(ciphertexts[2].ends_with(":8080"), "{variant:?}");
+            assert!(
+                ciphertexts[3].starts_with('[') && ciphertexts[3].ends_with("]:443"),
+                "{variant:?}"
+            );
 
             let mut decrypted = Vec::new();
             run_transform(
@@ -479,7 +491,7 @@ mod tests {
             .expect("decrypt");
             assert_eq!(
                 String::from_utf8(decrypted).expect("utf-8"),
-                "198.51.100.7\n2001:db8::1\n",
+                "198.51.100.7\n2001:db8::1\n198.51.100.7:8080\n[2001:db8::1]:443\n",
                 "{variant:?}"
             );
         }
@@ -643,6 +655,11 @@ mod tests {
         assert!(
             err.to_string()
                 .contains("sys/ipcrypt/policy changed after it was read"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains(&hex::encode(first.fingerprint())),
             "{err}"
         );
         assert_eq!(stored_fingerprint(&store).await, Some(second.fingerprint()));

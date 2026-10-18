@@ -1221,8 +1221,10 @@ ADR-2993 keeps client IP addresses out of storage: an attribute value under a
 configured key is replaced by its IPCrypt ciphertext inside normalization,
 before series identity, size limits and encoding, so no data object, index or
 commit record written from what `ravel-server` ingests carries the address as
-sent. `ravel-cli load` does not yet apply the policy: it stores every value as
-sent and does not read the startup marker below.
+sent. `ravel-cli load --ipcrypt-config <file>` applies the same policy to the
+rows it loads, and every load runs the startup marker check below before its
+first write, with or without the flag
+([bulk import under IPCrypt](guides/ingest.md#ipcrypt-on-load)).
 
 ### Policy
 
