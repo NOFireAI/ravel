@@ -145,7 +145,8 @@ pub enum AccessIntent {
 }
 
 impl AccessIntent {
-    /// The intent's metric label value.
+    /// The intent's metric label value. Nothing reads it yet: no exporter
+    /// labels a metric by intent until #3084 wires one.
     pub fn as_str(self) -> &'static str {
         match self {
             AccessIntent::Interactive => "interactive",

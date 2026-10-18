@@ -45,7 +45,9 @@
 //!
 //! - [`AccessIntent::Maintenance`]: a hit leaves `freq` alone and an
 //!   admission goes to the small queue even when the key is in the ghost
-//!   queue, so a maintenance read never moves an entry into main.
+//!   queue, so a maintenance read never moves an entry into main. Every
+//!   admission that stores a key, whatever its intent, drops it from the
+//!   ghost queue.
 //! - [`AccessIntent::BulkScan`]: a hit leaves `freq` alone and an admission
 //!   goes to a bulk region outside the small and main queues, never to main,
 //!   ghost or not. A loop larger than the cache cannot be served by recency
@@ -300,8 +302,7 @@ impl<V: Clone> S3Fifo<V> {
             .checked_div(limits.max_entry_bytes.max(1))
             .unwrap_or(0) as usize;
         let ghost_capacity = capacity_from_bytes.min(limits.max_entries).max(1);
-        let region_share_bytes =
-            (limits.max_bytes as f64 * limits.bulk_share.clamp(0.0, 1.0)) as u64;
+        let region_share_bytes = (limits.max_bytes as f64 * limits.effective_bulk_share()) as u64;
         S3Fifo {
             entries: HashMap::new(),
             small: VecDeque::new(),
@@ -431,6 +432,21 @@ impl<V: Clone> S3Fifo<V> {
         intent: AccessIntent,
         metrics: &CacheMetrics,
     ) -> (bool, Vec<CacheKey>) {
+        self.insert_with_intent_lazy(key, size, intent, metrics, || value)
+    }
+
+    /// [`Self::insert_with_intent`] with the value built by `make`, which
+    /// runs only once the entry is stored: never for a decline, and never
+    /// for a key already resident. The RAM tier makes its owned copy of the
+    /// payload here so a declined admission copies nothing.
+    pub(crate) fn insert_with_intent_lazy(
+        &mut self,
+        key: CacheKey,
+        size: u64,
+        intent: AccessIntent,
+        metrics: &CacheMetrics,
+        make: impl FnOnce() -> V,
+    ) -> (bool, Vec<CacheKey>) {
         if size > self.limits.max_entry_bytes {
             metrics.record_rejected_size();
             return (false, Vec::new());
@@ -441,15 +457,12 @@ impl<V: Clone> S3Fifo<V> {
             return (true, Vec::new());
         }
         if intent == AccessIntent::BulkScan {
-            return self.insert_bulk(key, value, size, metrics);
+            return self.insert_bulk(key, size, metrics, make);
         }
 
-        let promote_to_main = intent == AccessIntent::Interactive && self.ghost_set.remove(&key);
-        if promote_to_main && let Some(pos) = self.ghost.iter().position(|k| *k == key) {
-            self.ghost.remove(pos);
-        }
+        let promote_to_main = self.forget_ghost(&key) && intent == AccessIntent::Interactive;
 
-        self.entries.insert(key, Entry::interactive(value, size));
+        self.entries.insert(key, Entry::interactive(make(), size));
         if promote_to_main {
             self.main.push_back(key);
             self.main_bytes += size;
@@ -463,12 +476,25 @@ impl<V: Clone> S3Fifo<V> {
         (true, evicted)
     }
 
+    /// Drops `key` from the ghost queue, returning whether it was there. Run
+    /// by every admission that stores the key, so a resident key is never
+    /// also a ghost; only an interactive admission promotes on the result.
+    fn forget_ghost(&mut self, key: &CacheKey) -> bool {
+        if !self.ghost_set.remove(key) {
+            return false;
+        }
+        if let Some(pos) = self.ghost.iter().position(|k| k == key) {
+            self.ghost.remove(pos);
+        }
+        true
+    }
+
     fn insert_bulk(
         &mut self,
         key: CacheKey,
-        value: V,
         size: u64,
         metrics: &CacheMetrics,
+        make: impl FnOnce() -> V,
     ) -> (bool, Vec<CacheKey>) {
         let mut evicted = Vec::new();
         let rank = rank_of(&key);
@@ -504,10 +530,11 @@ impl<V: Clone> S3Fifo<V> {
             .tenants
             .get(&key.tenant_hash)
             .map_or(0, |pass| pass.window);
+        self.forget_ghost(&key);
         self.entries.insert(
             key,
             Entry {
-                value,
+                value: make(),
                 size,
                 freq: 0,
                 bulk: true,
@@ -638,7 +665,9 @@ impl<V: Clone> S3Fifo<V> {
                 }
                 let step = if !self.region.by_rank.is_empty() {
                     self.evict_bulk_top(metrics)
-                } else if TENANT_BOOKKEEPING_BYTES <= self.region_share_bytes {
+                } else if TENANT_BOOKKEEPING_BYTES <= self.region_share_bytes
+                    && !self.small.is_empty()
+                {
                     self.evict_from_small(metrics)
                 } else {
                     Step::Empty
@@ -905,6 +934,12 @@ impl<V: Clone> S3Fifo<V> {
     pub(crate) fn region_bytes(&self) -> u64 {
         self.region.bytes
     }
+
+    /// `key`'s rank and the current exclusive rank bound on bulk admissions.
+    #[cfg(test)]
+    pub(crate) fn rank_and_bound(&self, key: &CacheKey) -> (u64, u128) {
+        (rank_of(key), self.bulk_rank_bound())
+    }
 }
 
 #[cfg(test)]
@@ -936,7 +971,7 @@ mod tests {
     }
 
     /// Every bound the cache promises, checked after each step of a test.
-    fn assert_within_bounds(fifo: &S3Fifo<()>) {
+    fn assert_within_bounds<V: Clone>(fifo: &S3Fifo<V>) {
         let limits = fifo.limits;
         assert!(
             fifo.total_bytes() + fifo.bookkeeping_bytes() <= limits.max_bytes,
@@ -1563,5 +1598,180 @@ mod tests {
             "the read entry was promoted, not evicted"
         );
         assert_eq!(fifo.main_bytes(), ENTRY);
+    }
+
+    /// The lazy admission builds its value exactly when it stores a new
+    /// entry: over a sweep of keys, sizes and intents that crosses every
+    /// decline (over size, already resident, rank bound, no room), `make`
+    /// runs on precisely the admissions after which the key is newly
+    /// resident.
+    ///
+    /// FLIP: calling `make()` at the top of `insert_bulk` (a copy before the
+    /// decision) runs it for the bulk keys the rank bound declines, and the
+    /// first such admission fails the equality.
+    #[test]
+    fn a_lazy_admission_builds_its_value_only_when_it_stores_one() {
+        const ENTRY: u64 = 16 * 1024;
+        let limits = CacheLimits::new(64 * ENTRY, 1_000_000, 4 * ENTRY);
+        let metrics = CacheMetrics::default();
+        let mut fifo = S3Fifo::<u64>::new(limits);
+        let intents = [
+            AccessIntent::BulkScan,
+            AccessIntent::Interactive,
+            AccessIntent::BulkScan,
+            AccessIntent::Maintenance,
+        ];
+        let (mut built, mut declined) = (0u32, 0u32);
+        for pass in 0..3u64 {
+            for n in 0..600u64 {
+                let size = [ENTRY, 2 * ENTRY, 5 * ENTRY][(n % 3) as usize];
+                let k = key(1 + (n % 2) as u8, n, size);
+                let intent = intents[((n + pass) % 4) as usize];
+                let resident_before = fifo.contains(&k);
+                let mut made = false;
+                fifo.insert_with_intent_lazy(k, size, intent, &metrics, || {
+                    made = true;
+                    n
+                });
+                let stored = !resident_before && fifo.contains(&k);
+                assert_eq!(
+                    made, stored,
+                    "pass {pass} key {n} size {size} intent {intent:?}"
+                );
+                if made {
+                    built += 1;
+                } else {
+                    declined += 1;
+                }
+                assert_within_bounds(&fifo);
+            }
+        }
+        assert!(
+            built > 0 && declined > 0,
+            "{built} built, {declined} declined"
+        );
+    }
+
+    /// An admission of a ghosted key under any intent drops it from the ghost
+    /// queue, so a key is never resident and a ghost at once. A maintenance
+    /// admission that left the ghost entry behind put the key in the ghost
+    /// queue twice at its next eviction; trimming the older copy then cleared
+    /// the set while the newer copy stayed, and an interactive re-admission
+    /// within the ghost window was not promoted.
+    ///
+    /// FLIP: removing the `forget_ghost` call from `insert_bulk` fails the
+    /// bulk assertion; reverting the interactive path to
+    /// `intent == AccessIntent::Interactive && self.ghost_set.remove(&key)`
+    /// (the ghost entry kept for maintenance) fails the maintenance one and
+    /// leaves the re-admitted key out of main.
+    #[test]
+    fn a_maintenance_or_bulk_admission_clears_the_ghost_entry() {
+        const ENTRY: u64 = 64 * 1024;
+        // Ghost window max_bytes / max_entry_bytes = 20 keys.
+        let limits = CacheLimits::new(100 * ENTRY, 1_000, 5 * ENTRY);
+        let metrics = CacheMetrics::default();
+
+        for intent in [AccessIntent::Maintenance, AccessIntent::BulkScan] {
+            let mut fifo = S3Fifo::<()>::new(limits);
+            assert_eq!(fifo.ghost_capacity, 20);
+            for n in 0..90 {
+                fifo.insert(key(1, n, ENTRY), (), ENTRY, &metrics);
+                assert!(fifo.get(&key(1, n, ENTRY)).is_some());
+            }
+            let mut filler = 1_000;
+            let mut insert_filler = |fifo: &mut S3Fifo<()>| {
+                filler += 1;
+                fifo.insert(key(1, filler, ENTRY), (), ENTRY, &metrics).1
+            };
+            for _ in 0..20 {
+                insert_filler(&mut fifo);
+            }
+            assert_eq!(fifo.main_bytes(), 90 * ENTRY, "a stable main queue");
+
+            let ghosted = key(2, 1, ENTRY);
+            fifo.insert(ghosted, (), ENTRY, &metrics);
+            while !insert_filler(&mut fifo).contains(&ghosted) {}
+            assert!(fifo.ghost_set.contains(&ghosted));
+
+            let (stored, _) = fifo.insert_with_intent(ghosted, (), ENTRY, intent, &metrics);
+            assert!(stored && fifo.contains(&ghosted), "{intent:?} admitted it");
+            assert_eq!(fifo.main_bytes(), 90 * ENTRY, "{intent:?} never promotes");
+            assert!(
+                !fifo.ghost_set.contains(&ghosted) && !fifo.ghost.contains(&ghosted),
+                "{intent:?} admission left the key in the ghost queue"
+            );
+            if intent != AccessIntent::Maintenance {
+                continue;
+            }
+
+            // Evict it again, then re-admit it interactively inside the ghost
+            // window, after the older ghost copy would have been trimmed.
+            while !insert_filler(&mut fifo).contains(&ghosted) {}
+            assert_eq!(fifo.ghost.iter().filter(|k| **k == ghosted).count(), 1);
+            for _ in 0..fifo.ghost_capacity - 2 {
+                insert_filler(&mut fifo);
+            }
+            fifo.insert(ghosted, (), ENTRY, &metrics);
+            assert!(
+                fifo.main.contains(&ghosted),
+                "a ghost hit inside the window promotes to main"
+            );
+        }
+    }
+
+    /// A region entry no read touches lives one to two pass windows of its
+    /// tenant's bulk reads, and a window is at most sixteen times
+    /// `max_bytes`: a loop of twelve times `max_bytes` is re-read within
+    /// that life and served, one of forty times is served nothing.
+    ///
+    /// FLIP: raising `WINDOW_CEILING_MULTIPLE` to 64 serves the forty-times
+    /// loop on its third pass.
+    #[test]
+    fn a_bulk_loop_past_32_times_the_cap_is_served_nothing() {
+        const C: u64 = 100;
+        const ENTRY: u64 = 64 * 1024;
+        let limits = CacheLimits::new(C * ENTRY, 1_000_000, 64 * 1024 * 1024);
+        let metrics = CacheMetrics::default();
+        let served_on_last_pass = |multiple: u64| {
+            let mut fifo = S3Fifo::<()>::new(limits);
+            let mut served = 0;
+            for pass in 0..3 {
+                served = 0;
+                for n in 0..multiple * C {
+                    if touch(
+                        &mut fifo,
+                        key(1, n, ENTRY),
+                        AccessIntent::BulkScan,
+                        &metrics,
+                    ) {
+                        served += 1;
+                    }
+                }
+                if pass == 0 {
+                    assert_eq!(served, 0);
+                }
+            }
+            served
+        };
+        assert!(served_on_last_pass(12) > 0, "a loop of 12x is served");
+        assert_eq!(served_on_last_pass(40), 0, "a loop of 40x is not");
+    }
+
+    /// `f64::clamp` passes NaN through, and NaN as `u64` is 0, so a NaN
+    /// share would have left no region at all; it reads as the default.
+    ///
+    /// FLIP: dropping the `is_nan` arm of `effective_bulk_share` gives a
+    /// region share of 0.
+    #[test]
+    fn a_nan_bulk_share_is_not_a_zero_region() {
+        let limits = CacheLimits::new(1_000_000, 1_000, 1_000);
+        let nan = S3Fifo::<()>::new(limits.with_bulk_share(f64::NAN));
+        let default = S3Fifo::<()>::new(limits);
+        assert_eq!(nan.region_share_bytes, 500_000);
+        assert_eq!(nan.region_share_bytes, default.region_share_bytes);
+        let clamped = S3Fifo::<()>::new(limits.with_bulk_share(7.0));
+        assert_eq!(clamped.region_share_bytes, 1_000_000);
+        let clamped = S3Fifo::<()>::new(limits.with_bulk_share(-1.0));
+        assert_eq!(clamped.region_share_bytes, 0);
     }
 }

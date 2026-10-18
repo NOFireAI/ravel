@@ -73,8 +73,8 @@ pub struct CacheLimits {
     /// ones: interactive admissions reclaim bulk bytes above it first, and
     /// bulk admissions evict small-queue entries only while below it. Bulk
     /// entries may also fill bytes the interactive queues leave unused.
-    /// Values outside the range are clamped to it. Defaults to
-    /// [`DEFAULT_BULK_SHARE`].
+    /// Values outside the range are clamped to it, and NaN reads as
+    /// [`DEFAULT_BULK_SHARE`], the default.
     pub bulk_share: f64,
 }
 
@@ -115,5 +115,16 @@ impl CacheLimits {
     pub fn with_bulk_share(mut self, bulk_share: f64) -> Self {
         self.bulk_share = bulk_share;
         self
+    }
+
+    /// `bulk_share` as the bulk region applies it: clamped to 0.0..=1.0,
+    /// and [`DEFAULT_BULK_SHARE`] for NaN, which `f64::clamp` passes
+    /// through.
+    pub(crate) fn effective_bulk_share(&self) -> f64 {
+        if self.bulk_share.is_nan() {
+            DEFAULT_BULK_SHARE
+        } else {
+            self.bulk_share.clamp(0.0, 1.0)
+        }
     }
 }
