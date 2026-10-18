@@ -477,7 +477,8 @@ the tenant:
   `health` is `err` with that error.
 - Before this process has finished a tick for the tenant, and in a process
   that runs no evaluator, `health` and `state` are both `unknown`, with no
-  `lastEvaluation` and no `alerts` array.
+  `lastEvaluation` and no `alerts` array. The same holds when the tenant's
+  last snapshot is stale (see the `/api/v1/alerts` status codes below).
 - On a replica whose peer held the tenant's lease on the last tick, `health`
   is `unknown` with no `lastEvaluation`, and `state` and `alerts` come from
   the alert history that tick read.
@@ -512,6 +513,13 @@ Status codes:
   the tenant's alert history, until a later tick reads it. An empty list
   would assert that nothing is firing, and an earlier tick's list may no
   longer be current.
+- The same 503 when the tenant's last snapshot is stale: older than three
+  evaluation intervals, measured from the clock reading of the tick that
+  published it. The evaluator is the only writer of the snapshot, so a
+  stopped or stuck evaluator would otherwise leave it served unchanged. The
+  `error` starts with `this tenant's alert evaluator in this process has
+  stopped publishing its state` and names the snapshot's age and the bound.
+  Serving resumes when the evaluator publishes again.
 
 ## Health and metrics routes
 
