@@ -1316,7 +1316,7 @@ calls="$BOX_A/kit/out/benchmark/calls.jsonl"
 fields_ok="$(python3 - "$calls" <<'PY'
 import json, sys
 need = ("statement", "number", "arm", "phase", "try", "start", "duration_s", "http_status", "rows",
-        "outcome", "refusal_class", "error")
+        "outcome", "refusal_class", "error", "stats")
 rows = [json.loads(l) for l in open(sys.argv[1])]
 ok = len(rows) == 129 and all(all(k in r for k in need) and r["arm"] == "A" and r["phase"] == "benchmark"
                               and r["outcome"] == "ok" and r["http_status"] == 200 for r in rows)
