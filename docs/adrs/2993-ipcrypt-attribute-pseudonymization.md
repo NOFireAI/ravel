@@ -137,8 +137,9 @@ installed, as `--tenant-kms-config` entries are. Each entry lists rules:
   `client.address`. On the metric surfaces (OTLP metrics, OTAP and
   Remote Write) the rule matches the sanitized label name that key is
   stored under (`client_address`), derived with the same sanitizing
-  function the normalizers use (the Remote Write label-name amendment
-  below says how this applies to Remote Write). On logs and traces it matches the key
+  function the normalizers use (on Remote Write the name is stored as
+  sent and only the lookup sanitizes it: see the Remote Write
+  label-name amendment below). On logs and traces it matches the key
   as sent. Two rule keys that sanitize to the same label name are
   refused;
 - `variant`: `deterministic` or `prefix` (ipcrypt-pfx);
@@ -364,7 +365,8 @@ matcher's value under the rule before it submits the erasure request.
 - **Rule lookup.** The matcher key is looked up the way decision 1
   matches rules for the request's `--signal`. For the metric signals the
   key is sanitized first, so `client_address` finds the rule written as
-  `client.address`.
+  `client.address` (the Remote Write label-name amendment below adds
+  that the matcher must still spell the label as it is stored).
 - **One request per epoch.** Matchers in one request are a conjunction,
   so two ciphertexts of one address in the same request would match no
   record. `ravel-cli` therefore submits one request per configured
