@@ -28,6 +28,7 @@ use futures::Stream;
 use ravel_ingest::{
     IngestByteShed, IngestPoint, Submitted, WriteError, WriteMode, plausible_ingest_clock,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::normalize::{normalize_prepared_with_metadata, prepare_batch};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
@@ -418,7 +419,9 @@ async fn submit_batch<'a>(
     // (ADR-2708 D2): see `crate::ingest::charge_projected_labels`. The batch
     // is flattened and resolved once; no label exists until the normalize
     // below has passed the bound.
-    let prepared = prepare_batch(decoded.borrow(), &ingest.limits);
+    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
+    let rules = TenantRules::none();
+    let prepared = prepare_batch(decoded.borrow(), &ingest.limits, &rules);
     let label_charge = crate::ingest::charge_projected_labels(
         &ingest.budget,
         prepared.projected_label_bytes().get(),
@@ -426,8 +429,14 @@ async fn submit_batch<'a>(
     )
     .map_err(|IngestByteShed| IngestRequestError::Write(WriteError::BufferBudgetExceeded))?;
     let mut cap = ExemplarCap::new(ingest.limits.exemplar_cap_window_ns);
-    let (result, metadata) =
-        normalize_prepared_with_metadata(tenant, prepared, &ingest.limits, ingest_ts_ns, &mut cap);
+    let (result, metadata) = normalize_prepared_with_metadata(
+        tenant,
+        prepared,
+        &ingest.limits,
+        &rules,
+        ingest_ts_ns,
+        &mut cap,
+    );
     let normalized = result.output;
     drop(decoded);
     // Layer 3's rejections, counted exactly as the OTLP path counts them
@@ -865,9 +874,13 @@ mod tests {
     async fn a_budget_short_of_the_label_projection_sheds_the_batch() {
         let too_old = BASE_TS_NS - ravel_otlp::IngestLimits::default().max_ingest_lag_ns - 1;
         let decoded = labelled_gauge_batch(too_old);
-        let projected = prepare_batch(&decoded, &ravel_otlp::IngestLimits::default())
-            .projected_label_bytes()
-            .get();
+        let projected = prepare_batch(
+            &decoded,
+            &ravel_otlp::IngestLimits::default(),
+            &TenantRules::none(),
+        )
+        .projected_label_bytes()
+        .get();
         assert!(projected > 0, "the fixture projects some label bytes");
         let tenant = TenantId::new("acme");
 
@@ -927,9 +940,13 @@ mod tests {
         let router_bytes = router_only.peak_bytes();
         assert_eq!(
             label_bytes as usize,
-            prepare_batch(&decoded, &ravel_otlp::IngestLimits::default())
-                .projected_label_bytes()
-                .get(),
+            prepare_batch(
+                &decoded,
+                &ravel_otlp::IngestLimits::default(),
+                &TenantRules::none(),
+            )
+            .projected_label_bytes()
+            .get(),
             "the label charge is exactly the projection"
         );
         assert!(label_bytes > 0, "the projection charged the labels");

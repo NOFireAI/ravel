@@ -40,17 +40,39 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use prost::Message;
 use ravel_types::METRIC_NAME_LABEL;
 
+use ravel_ipcrypt::rules::TenantRules;
+
 use crate::limits::IngestLimits;
 use crate::logs_limits::LogIngestLimits;
 use crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH;
 use crate::normalize::{
-    ResourceAttrValue, metric_kind_of, prometheus_family_name, resource_attr_pairs,
-    sanitize_metric_name,
+    ResourceAttrValue, lookup_label_rule, metric_kind_of, prometheus_family_name,
+    resource_attr_pairs, sanitize_metric_name,
 };
 use crate::traces_limits::SpanIngestLimits;
 use crate::traces_normalize::{
     ATTR_EVENTS_RAW, ATTR_LINKS_RAW, ATTR_SPAN_FLAGS, ATTR_SPAN_KIND, ATTR_TRACE_STATE,
 };
+
+/// The length a value of `raw_len` bytes is charged at for the label/attribute
+/// `name` would be stored as: unchanged when no rule in `rules` matches it,
+/// [`TenantRules::max_stored_len`] when one does (ADR-2993 decision 3). `name`
+/// must be the same key the normalizer matches a rule against: sanitized
+/// label name for metrics ([`TenantRules::lookup_label`]), raw attribute key
+/// for logs and traces ([`TenantRules::lookup_raw`]).
+///
+/// A matched value is charged at `max(47, raw)` whether or not it parses as
+/// an address, and an unparsed value is stored unchanged at `raw`, so this
+/// over-counts. That is the intended direction: the projection is an upper
+/// bound checked before anything is built, and under-counting would admit a
+/// request whose stored bytes exceed the bound.
+pub fn charged_len(matched: bool, raw_len: usize) -> usize {
+    if matched {
+        TenantRules::max_stored_len(raw_len)
+    } else {
+        raw_len
+    }
+}
 
 /// Bytes charged per resolved label or attribute on top of its name and
 /// value: at least the inline size of the element holding it on a 64-bit
@@ -159,27 +181,32 @@ pub(crate) fn exact_capacity(mut s: String) -> String {
 pub fn project_resolved_label_bytes(
     req: &ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> ProjectedLabelBytes {
     ProjectedLabelBytes(
         req.resource_metrics
             .iter()
-            .map(|rm| project_resource_metrics(rm, limits))
+            .map(|rm| project_resource_metrics(rm, limits, rules))
             .fold(0usize, usize::saturating_add),
     )
 }
 
-fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits) -> usize {
+fn project_resource_metrics(
+    rm: &ResourceMetrics,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+) -> usize {
     let attrs = resource_attr_pairs(rm.resource.as_ref());
     if attrs.len() > limits.max_resource_attributes {
         return 0;
     }
-    let Some(prefix) = resource_prefix_bytes(&attrs, limits) else {
+    let Some(prefix) = resource_prefix_bytes(&attrs, limits, rules) else {
         return 0;
     };
     let mut total = prefix;
     for sm in &rm.scope_metrics {
         for metric in &sm.metrics {
-            total = total.saturating_add(project_metric(metric, prefix, limits));
+            total = total.saturating_add(project_metric(metric, prefix, limits, rules));
         }
     }
     total
@@ -189,9 +216,13 @@ fn project_resource_metrics(rm: &ResourceMetrics, limits: &IngestLimits) -> usiz
 /// builds from `attrs`, or `None` when a value it reads has no label form,
 /// which rejects every point under the resource before any point label is
 /// built. Shared by every wire format's projection, as the builder is.
+/// `job` and `instance` are matched against `rules` under those literal
+/// names, like `push_checked` matches them, not under their source resource
+/// attribute keys (ADR-2993 decision 3).
 pub fn resource_prefix_bytes(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     limits: &IngestLimits,
+    rules: &TenantRules,
 ) -> Option<usize> {
     let mut total = 0usize;
 
@@ -203,6 +234,7 @@ pub fn resource_prefix_bytes(
             name_len
         };
         if job_len > 0 {
+            let job_len = charged_len(rules.lookup_label("job").is_some(), job_len);
             total = total.saturating_add(label_bytes("job".len(), job_len));
         }
     } else {
@@ -215,6 +247,7 @@ pub fn resource_prefix_bytes(
     if let Some(len) = first_attr_label_len(attrs, "service.instance.id")?
         && len > 0
     {
+        let len = charged_len(rules.lookup_label("instance").is_some(), len);
         total = total.saturating_add(label_bytes("instance".len(), len));
     }
 
@@ -230,6 +263,7 @@ pub fn resource_prefix_bytes(
         if let Some(len) = first_attr_label_len(attrs, key)?
             && len > 0
         {
+            let len = charged_len(lookup_label_rule(rules, key).is_some(), len);
             total = total.saturating_add(label_bytes(key.len(), len));
         }
     }
@@ -272,11 +306,16 @@ fn label_value_len(value: Option<&AnyValue>) -> Option<usize> {
 /// drops it, but where the set's `Vec` was sized before the drops
 /// (`reserved_slots`) its slot stays allocated in the kept set and is charged
 /// [`RESOLVED_LABEL_OVERHEAD_BYTES`].
-fn point_attribute_bytes(attributes: &[KeyValue], reserved_slots: bool) -> Option<usize> {
+fn point_attribute_bytes(
+    attributes: &[KeyValue],
+    reserved_slots: bool,
+    rules: &TenantRules,
+) -> Option<usize> {
     let mut total = 0usize;
     for kv in attributes {
         let len = label_value_len(kv.value.as_ref())?;
         if len > 0 {
+            let len = charged_len(lookup_label_rule(rules, &kv.key).is_some(), len);
             total = total.saturating_add(label_bytes(kv.key.len(), len));
         } else if reserved_slots {
             total = total.saturating_add(RESOLVED_LABEL_OVERHEAD_BYTES);
@@ -292,7 +331,12 @@ fn is_cumulative(temporality: i32) -> bool {
     )
 }
 
-fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usize {
+fn project_metric(
+    metric: &Metric,
+    prefix: usize,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+) -> usize {
     let Some(data) = metric.data.as_ref() else {
         return 0;
     };
@@ -314,6 +358,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
             g.data_points.iter().map(|dp| dp.attributes.as_slice()),
             prefix.saturating_add(name_label),
             max_attrs,
+            rules,
         ),
         MetricData::Sum(s) => {
             if !is_cumulative(s.aggregation_temporality) {
@@ -323,6 +368,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 s.data_points.iter().map(|dp| dp.attributes.as_slice()),
                 prefix.saturating_add(name_label),
                 max_attrs,
+                rules,
             )
         }
         MetricData::ExponentialHistogram(h) => {
@@ -333,6 +379,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 h.data_points.iter().map(|dp| dp.attributes.as_slice()),
                 prefix.saturating_add(name_label),
                 max_attrs,
+                rules,
             )
         }
         MetricData::Histogram(h) => {
@@ -346,7 +393,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 {
                     continue;
                 }
-                let Some(attrs) = point_attribute_bytes(&dp.attributes, false) else {
+                let Some(attrs) = point_attribute_bytes(&dp.attributes, false, rules) else {
                     continue;
                 };
                 let per_series = prefix
@@ -365,7 +412,7 @@ fn project_metric(metric: &Metric, prefix: usize, limits: &IngestLimits) -> usiz
                 {
                     continue;
                 }
-                let Some(attrs) = point_attribute_bytes(&dp.attributes, false) else {
+                let Some(attrs) = point_attribute_bytes(&dp.attributes, false, rules) else {
                     continue;
                 };
                 let per_series = prefix
@@ -441,6 +488,7 @@ fn project_memo_run<'a>(
     points: impl Iterator<Item = &'a [KeyValue]>,
     base: usize,
     max_attrs: usize,
+    rules: &TenantRules,
 ) -> usize {
     let mut total = 0usize;
     let mut previous: Option<&[KeyValue]> = None;
@@ -452,7 +500,7 @@ fn project_memo_run<'a>(
             continue;
         }
         previous = Some(attributes);
-        if let Some(attrs) = point_attribute_bytes(attributes, true) {
+        if let Some(attrs) = point_attribute_bytes(attributes, true, rules) {
             total = total.saturating_add(base.saturating_add(attrs));
         }
     }
@@ -475,6 +523,7 @@ fn project_memo_run<'a>(
 pub fn project_log_resolved_label_bytes(
     req: &ExportLogsServiceRequest,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
 ) -> ProjectedLabelBytes {
     let mut total = 0usize;
     for rl in &req.resource_logs {
@@ -486,8 +535,8 @@ pub fn project_log_resolved_label_bytes(
         if resource_attributes.len() > limits.max_resource_attributes {
             continue;
         }
-        total = total.saturating_add(log_attrs_bytes(resource_attributes));
-        let resource_encoded = encoded_attrs_len(resource_attributes);
+        total = total.saturating_add(log_attrs_bytes(resource_attributes, rules));
+        let resource_encoded = encoded_attrs_len(resource_attributes, rules);
         for sl in &rl.scope_logs {
             let scope = sl.scope.as_ref();
             let scope_attributes = scope.map(|s| s.attributes.as_slice()).unwrap_or(&[]);
@@ -499,9 +548,9 @@ pub fn project_log_resolved_label_bytes(
             let stream_encoded = resource_encoded
                 .saturating_add(encoded_bytes_len(scope_name))
                 .saturating_add(encoded_bytes_len(scope_version))
-                .saturating_add(encoded_attrs_len(scope_attributes));
+                .saturating_add(encoded_attrs_len(scope_attributes, rules));
             total = total
-                .saturating_add(log_attrs_bytes(scope_attributes))
+                .saturating_add(log_attrs_bytes(scope_attributes, rules))
                 .saturating_add(stream_encoded);
             for record in &sl.log_records {
                 if record.attributes.len() > limits.max_attributes_per_record {
@@ -509,7 +558,7 @@ pub fn project_log_resolved_label_bytes(
                 }
                 total = total
                     .saturating_add(stream_encoded)
-                    .saturating_add(log_attrs_bytes(&record.attributes));
+                    .saturating_add(log_attrs_bytes(&record.attributes, rules));
             }
         }
     }
@@ -530,23 +579,42 @@ fn encoded_bytes_len(len: usize) -> usize {
 /// Length of `ravel_types::logstream::canonical_attr_bytes` over the
 /// converted `attributes`: an entry count, then per entry the length-prefixed
 /// key and the encoded value. An attribute whose value the converter rejects
-/// rejects the whole set, so counting it as encoded can only overcount.
-fn encoded_attrs_len(attributes: &[KeyValue]) -> usize {
+/// rejects the whole set, so counting it as encoded can only overcount. Logs
+/// match a rule by raw attribute key
+/// ([`TenantRules::lookup_raw`](ravel_ipcrypt::rules::TenantRules::lookup_raw)),
+/// and a matched non-empty string value is charged at
+/// [`TenantRules::max_stored_len`] (ADR-2993 decision 3): the stream preimage
+/// is built from attribute values after encryption, so a stream identity
+/// derived from an inflated-length ciphertext must be projected at that
+/// inflated length too.
+fn encoded_attrs_len(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
         .map(|kv| {
-            encoded_bytes_len(kv.key.len()).saturating_add(encoded_value_len(kv.value.as_ref(), 1))
+            let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+            encoded_bytes_len(kv.key.len()).saturating_add(encoded_value_len(
+                kv.value.as_ref(),
+                1,
+                matched,
+            ))
         })
         .fold(uvarint_len(attributes.len() as u64), usize::saturating_add)
 }
 
-fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
+fn encoded_value_len(value: Option<&AnyValue>, depth: usize, matched: bool) -> usize {
     if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
         return 0;
     }
     match value.and_then(|v| v.value.as_ref()) {
         None | Some(AnyValueVariant::StringValueStrindex(_)) => 0,
-        Some(AnyValueVariant::StringValue(s)) => 1usize.saturating_add(encoded_bytes_len(s.len())),
+        Some(AnyValueVariant::StringValue(s)) => {
+            let len = if matched && !s.is_empty() {
+                charged_len(true, s.len())
+            } else {
+                s.len()
+            };
+            1usize.saturating_add(encoded_bytes_len(len))
+        }
         Some(AnyValueVariant::BytesValue(b)) => 1usize.saturating_add(encoded_bytes_len(b.len())),
         Some(AnyValueVariant::IntValue(i)) => {
             let zigzag = ((*i << 1) ^ (*i >> 63)) as u64;
@@ -557,7 +625,7 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
         Some(AnyValueVariant::ArrayValue(array)) => array
             .values
             .iter()
-            .map(|v| encoded_value_len(Some(v), depth + 1))
+            .map(|v| encoded_value_len(Some(v), depth + 1, false))
             .fold(
                 1 + uvarint_len(array.values.len() as u64),
                 usize::saturating_add,
@@ -566,8 +634,11 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
             .values
             .iter()
             .map(|kv| {
-                encoded_bytes_len(kv.key.len())
-                    .saturating_add(encoded_value_len(kv.value.as_ref(), depth + 1))
+                encoded_bytes_len(kv.key.len()).saturating_add(encoded_value_len(
+                    kv.value.as_ref(),
+                    depth + 1,
+                    false,
+                ))
             })
             .fold(
                 1 + uvarint_len(kvlist.values.len() as u64),
@@ -576,10 +647,18 @@ fn encoded_value_len(value: Option<&AnyValue>, depth: usize) -> usize {
     }
 }
 
-fn log_attrs_bytes(attributes: &[KeyValue]) -> usize {
+/// Matches [`encoded_attrs_len`]'s raw-key rule lookup for the stored
+/// (non-preimage) copy of the same attributes.
+fn log_attrs_bytes(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
-        .map(|kv| label_bytes(kv.key.len(), log_value_payload(kv.value.as_ref(), 1)))
+        .map(|kv| {
+            let matched = !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+            label_bytes(
+                kv.key.len(),
+                log_value_payload(kv.value.as_ref(), 1, matched),
+            )
+        })
         .fold(0usize, usize::saturating_add)
 }
 
@@ -588,8 +667,10 @@ fn log_attrs_bytes(attributes: &[KeyValue]) -> usize {
 /// every list element or map entry one more overhead plus its own payload
 /// (and, for a map entry, its key). A value nested past
 /// [`MAX_ATTRIBUTE_NESTING_DEPTH`] is rejected by the converter, so the walk
-/// stops there.
-fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
+/// stops there. `matched` charges a non-empty top-level string value at
+/// [`TenantRules::max_stored_len`]; nested values are never independently
+/// rule-matched.
+fn log_value_payload(value: Option<&AnyValue>, depth: usize, matched: bool) -> usize {
     if depth > MAX_ATTRIBUTE_NESTING_DEPTH {
         return 0;
     }
@@ -599,12 +680,18 @@ fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
         | Some(AnyValueVariant::IntValue(_))
         | Some(AnyValueVariant::DoubleValue(_))
         | Some(AnyValueVariant::StringValueStrindex(_)) => 0,
-        Some(AnyValueVariant::StringValue(s)) => s.len(),
+        Some(AnyValueVariant::StringValue(s)) => {
+            if matched && !s.is_empty() {
+                charged_len(true, s.len())
+            } else {
+                s.len()
+            }
+        }
         Some(AnyValueVariant::BytesValue(b)) => b.len(),
         Some(AnyValueVariant::ArrayValue(array)) => array
             .values
             .iter()
-            .map(|v| label_bytes(0, log_value_payload(Some(v), depth + 1)))
+            .map(|v| label_bytes(0, log_value_payload(Some(v), depth + 1, false)))
             .fold(0usize, usize::saturating_add),
         Some(AnyValueVariant::KvlistValue(kvlist)) => kvlist
             .values
@@ -612,7 +699,7 @@ fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
             .map(|kv| {
                 label_bytes(
                     kv.key.len(),
-                    log_value_payload(kv.value.as_ref(), depth + 1),
+                    log_value_payload(kv.value.as_ref(), depth + 1, false),
                 )
             })
             .fold(0usize, usize::saturating_add),
@@ -633,6 +720,7 @@ fn log_value_payload(value: Option<&AnyValue>, depth: usize) -> usize {
 pub fn project_span_resolved_label_bytes(
     req: &ExportTraceServiceRequest,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
 ) -> ProjectedLabelBytes {
     let mut total = 0usize;
     for rs in &req.resource_spans {
@@ -644,7 +732,7 @@ pub fn project_span_resolved_label_bytes(
         if resource_attributes.len() > limits.max_resource_attributes {
             continue;
         }
-        let resource_part = span_attrs_bytes(resource_attributes);
+        let resource_part = span_attrs_bytes(resource_attributes, rules);
         total = total.saturating_add(resource_part);
         for ss in &rs.scope_spans {
             let scope = ss.scope.as_ref();
@@ -652,7 +740,7 @@ pub fn project_span_resolved_label_bytes(
             if scope_attributes.len() > limits.max_scope_attributes {
                 continue;
             }
-            let mut scope_part = span_attrs_bytes(scope_attributes);
+            let mut scope_part = span_attrs_bytes(scope_attributes, rules);
             if let Some(scope) = scope {
                 if !scope.name.is_empty() {
                     scope_part = scope_part
@@ -673,18 +761,26 @@ pub fn project_span_resolved_label_bytes(
                 }
                 total = total
                     .saturating_add(inherited)
-                    .saturating_add(span_attrs_bytes(&span.attributes))
-                    .saturating_add(reserved_attrs_bytes(span, limits));
+                    .saturating_add(span_attrs_bytes(&span.attributes, rules))
+                    .saturating_add(reserved_attrs_bytes(span, limits, rules));
             }
         }
     }
     ProjectedLabelBytes(total)
 }
 
-fn span_attrs_bytes(attributes: &[KeyValue]) -> usize {
+/// Spans match a rule by raw attribute key
+/// ([`TenantRules::lookup_raw`](ravel_ipcrypt::rules::TenantRules::lookup_raw)),
+/// same as logs. A matched non-empty converted value is charged at
+/// [`TenantRules::max_stored_len`] (ADR-2993 decision 3).
+fn span_attrs_bytes(attributes: &[KeyValue], rules: &TenantRules) -> usize {
     attributes
         .iter()
-        .map(|kv| label_bytes(kv.key.len(), span_value_len(kv.value.as_ref())))
+        .map(|kv| {
+            let len = span_value_len(kv.value.as_ref());
+            let matched = len > 0 && !rules.is_empty() && rules.lookup_raw(&kv.key).is_some();
+            label_bytes(kv.key.len(), charged_len(matched, len))
+        })
         .fold(0usize, usize::saturating_add)
 }
 
@@ -714,6 +810,7 @@ fn span_value_len(value: Option<&AnyValue>) -> usize {
 fn reserved_attrs_bytes(
     span: &opentelemetry_proto::tonic::trace::v1::Span,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
 ) -> usize {
     let mut total = 0usize;
     if span.kind != 0 {
@@ -731,28 +828,99 @@ fn reserved_attrs_bytes(
         total = total.saturating_add(label_bytes(ATTR_SPAN_FLAGS.len(), display_len(span.flags)));
     }
     if !span.events.is_empty() {
-        total = total.saturating_add(blob_bytes(ATTR_EVENTS_RAW, &span.events, limits));
+        total = total.saturating_add(blob_bytes(
+            ATTR_EVENTS_RAW,
+            &span.events,
+            limits,
+            rules,
+            |e| &e.attributes,
+        ));
     }
     if !span.links.is_empty() {
-        total = total.saturating_add(blob_bytes(ATTR_LINKS_RAW, &span.links, limits));
+        total = total.saturating_add(blob_bytes(
+            ATTR_LINKS_RAW,
+            &span.links,
+            limits,
+            rules,
+            |l| &l.attributes,
+        ));
     }
     total
 }
 
 /// The hex blob `encode_blob` would store for `items`, or nothing when its
 /// raw length is over `max_raw_blob_len` and the blob is dropped.
-fn blob_bytes<T: Message>(key: &str, items: &[T], limits: &SpanIngestLimits) -> usize {
-    let raw = items
-        .iter()
-        .map(|item| {
-            let len = item.encoded_len();
-            prost::length_delimiter_len(len).saturating_add(len)
-        })
-        .fold(0usize, usize::saturating_add);
-    if raw > limits.max_raw_blob_len {
-        return 0;
+///
+/// When `rules` matches an event or link attribute by raw key, its non-empty
+/// string value is charged at [`TenantRules::max_stored_len`]: the blob is
+/// measured as if that value were padded to that length, computed from the
+/// encoded lengths without building the padded copy. Protobuf length is
+/// monotone in a string's length, so the padded blob is never shorter than
+/// the encrypted one. The padded length can cross `max_raw_blob_len` while
+/// the encrypted blob does not, so such a blob is charged at the cap instead
+/// of nothing. Both choices can only over-count, which is the safe direction:
+/// a projection under the stored bytes would admit a request over the bound.
+fn blob_bytes<T: Message>(
+    key: &str,
+    items: &[T],
+    limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    attributes: fn(&T) -> &[KeyValue],
+) -> usize {
+    let mut raw = 0usize;
+    let mut padded = 0usize;
+    let mut matched = false;
+    for item in items {
+        let len = item.encoded_len();
+        raw = raw.saturating_add(delimited_len(len));
+        let mut item_len = len;
+        if !rules.is_empty() {
+            for kv in attributes(item) {
+                let Some(grown) = padded_kv_growth(kv, rules) else {
+                    continue;
+                };
+                item_len = item_len.saturating_add(grown);
+                matched = true;
+            }
+        }
+        padded = padded.saturating_add(delimited_len(item_len));
     }
-    label_bytes(key.len(), raw.saturating_mul(2))
+    let charged = if matched {
+        padded.min(limits.max_raw_blob_len)
+    } else if raw > limits.max_raw_blob_len {
+        return 0;
+    } else {
+        raw
+    };
+    label_bytes(key.len(), charged.saturating_mul(2))
+}
+
+/// A protobuf length-delimited field's payload of `len` bytes plus its length
+/// prefix (the tag excluded, as it never changes here).
+fn delimited_len(len: usize) -> usize {
+    prost::length_delimiter_len(len).saturating_add(len)
+}
+
+/// How many bytes `kv`'s encoding inside its event or link grows by when a
+/// rule matches its raw key and its non-empty string value is padded to
+/// [`TenantRules::max_stored_len`], or `None` when it is not charged so.
+/// Each enclosing length prefix (the string, the `AnyValue`, the `KeyValue`)
+/// is recomputed for its grown payload.
+fn padded_kv_growth(kv: &KeyValue, rules: &TenantRules) -> Option<usize> {
+    rules.lookup_raw(&kv.key)?;
+    let any = kv.value.as_ref()?;
+    let Some(AnyValueVariant::StringValue(s)) = any.value.as_ref() else {
+        return None;
+    };
+    if s.is_empty() {
+        return None;
+    }
+    let grown = |len: usize, by: usize| {
+        delimited_len(len.saturating_add(by)).saturating_sub(delimited_len(len))
+    };
+    let string_growth = grown(s.len(), charged_len(true, s.len()) - s.len());
+    let any_growth = grown(any.encoded_len(), string_growth);
+    Some(grown(kv.encoded_len(), any_growth))
 }
 
 #[cfg(test)]
@@ -832,11 +1000,15 @@ mod tests {
                 AttrValue::Map(vec![("k".to_string(), AttrValue::Str("v".into()))]),
             ),
         ];
+        let rules = TenantRules::none();
         assert_eq!(
-            encoded_attrs_len(&attributes),
+            encoded_attrs_len(&attributes, &rules),
             canonical_attr_bytes(&converted).len()
         );
-        assert_eq!(encoded_attrs_len(&[]), canonical_attr_bytes(&[]).len());
+        assert_eq!(
+            encoded_attrs_len(&[], &rules),
+            canonical_attr_bytes(&[]).len()
+        );
         for v in [0u64, 127, 128, 16_383, 16_384, u64::MAX] {
             let mut n = v;
             let mut expected = 1;
@@ -847,12 +1019,280 @@ mod tests {
             assert_eq!(uvarint_len(v), expected, "{v}");
         }
     }
+
+    use super::capacity_cases::{rules_on, sanitize};
+
+    /// The charge the arithmetic in [`blob_bytes`] must reproduce: pad a copy
+    /// of every matched value and measure the copy.
+    fn blob_bytes_by_padding_a_copy(
+        key: &str,
+        items: &[Event],
+        limits: &SpanIngestLimits,
+        rules: &TenantRules,
+    ) -> usize {
+        let raw_len = |items: &[Event]| {
+            items
+                .iter()
+                .map(|item| delimited_len(item.encoded_len()))
+                .sum::<usize>()
+        };
+        let raw = raw_len(items);
+        let mut copy = items.to_vec();
+        let mut matched = false;
+        for item in &mut copy {
+            for kv in &mut item.attributes {
+                if rules.lookup_raw(&kv.key).is_none() {
+                    continue;
+                }
+                if let Some(AnyValueVariant::StringValue(s)) =
+                    kv.value.as_mut().and_then(|v| v.value.as_mut())
+                    && !s.is_empty()
+                {
+                    *s = "0".repeat(charged_len(true, s.len()));
+                    matched = true;
+                }
+            }
+        }
+        let charged = if matched {
+            raw_len(&copy).min(limits.max_raw_blob_len)
+        } else if raw > limits.max_raw_blob_len {
+            return 0;
+        } else {
+            raw
+        };
+        label_bytes(key.len(), charged * 2)
+    }
+
+    fn client_ip(value: &str) -> KeyValue {
+        KeyValue {
+            key: "client.ip".to_string(),
+            value: Some(AnyValue {
+                value: Some(AnyValueVariant::StringValue(value.to_string())),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn span_with(events: Vec<Event>, links: Vec<Link>) -> Span {
+        Span {
+            trace_id: vec![0xab; 16],
+            span_id: vec![0xcd; 8],
+            name: "op".to_string(),
+            start_time_unix_nano: 1,
+            end_time_unix_nano: 2,
+            events,
+            links,
+            ..Default::default()
+        }
+    }
+
+    /// The stored attributes of `span` normalized alone under `rules`.
+    fn stored_attrs(
+        span: Span,
+        limits: &SpanIngestLimits,
+        rules: &TenantRules,
+    ) -> Vec<(String, String)> {
+        let req = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![span],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+        };
+        let out = crate::normalize_traces(req, limits, rules, 5_000);
+        assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+        assert_eq!(out.spans.len(), 1);
+        out.spans.into_iter().flat_map(|s| s.attrs).collect()
+    }
+
+    fn stored_len(attrs: &[(String, String)], key: &str) -> Option<usize> {
+        attrs.iter().find(|(k, _)| k == key).map(|(_, v)| v.len())
+    }
+
+    /// A 9-byte address under `client.ip` in an event and in a link. The
+    /// event is that one attribute: a 24-byte `KeyValue`, 26 bytes as a
+    /// field, 27 with the event's own length prefix. The link adds its
+    /// 16-byte trace id and 8-byte span id (28 bytes as fields), 55 in all.
+    /// Padding the value from 9 to 47 bytes grows the string, the `AnyValue`
+    /// and the `KeyValue` fields by 38 each with no prefix crossing a varint
+    /// boundary, so each blob is charged 38 bytes more: 65 and 93 bytes, hex
+    /// doubled. The stored blobs, holding the ciphertext, fit the charge.
+    #[test]
+    fn blob_bytes_charges_ruled_event_and_link_attributes_exactly() {
+        let rules = rules_on(&["client.ip"]);
+        let limits = SpanIngestLimits::default();
+        let event = Event {
+            attributes: vec![client_ip("192.0.2.1")],
+            ..Default::default()
+        };
+        let link = Link {
+            trace_id: vec![1; 16],
+            span_id: vec![2; 8],
+            attributes: vec![client_ip("192.0.2.2")],
+            ..Default::default()
+        };
+        let span = span_with(vec![event], vec![link]);
+
+        let unruled = TenantRules::none();
+        assert_eq!(
+            reserved_attrs_bytes(&span, &limits, &unruled),
+            label_bytes(ATTR_EVENTS_RAW.len(), 2 * 27) + label_bytes(ATTR_LINKS_RAW.len(), 2 * 55)
+        );
+        let events_charge = label_bytes(ATTR_EVENTS_RAW.len(), 2 * 65);
+        let links_charge = label_bytes(ATTR_LINKS_RAW.len(), 2 * 93);
+        assert_eq!(
+            blob_bytes(ATTR_EVENTS_RAW, &span.events, &limits, &rules, |e| &e
+                .attributes),
+            events_charge
+        );
+        assert_eq!(
+            blob_bytes(ATTR_LINKS_RAW, &span.links, &limits, &rules, |l| &l
+                .attributes),
+            links_charge
+        );
+        assert_eq!(
+            reserved_attrs_bytes(&span, &limits, &rules),
+            events_charge + links_charge
+        );
+
+        let attrs = stored_attrs(span, &limits, &rules);
+        let events_len = stored_len(&attrs, ATTR_EVENTS_RAW).expect("events blob kept");
+        let links_len = stored_len(&attrs, ATTR_LINKS_RAW).expect("links blob kept");
+        assert!(events_len <= 2 * 65, "{events_len}");
+        assert!(links_len <= 2 * 93, "{links_len}");
+    }
+
+    /// A 19-byte hostname under `client.ip` in an event: 37 bytes stored
+    /// unchanged (it does not parse as an address), 65 once padded to 47.
+    /// Under a 50-byte cap the normalizer keeps the 37-byte blob, and the
+    /// projection, which cannot tell a hostname from an address, charges the
+    /// cap rather than nothing.
+    #[test]
+    fn blob_bytes_charges_the_cap_when_padding_crosses_it() {
+        let rules = rules_on(&["client.ip"]);
+        let limits = SpanIngestLimits {
+            max_raw_blob_len: 50,
+            ..SpanIngestLimits::default()
+        };
+        let event = Event {
+            attributes: vec![client_ip("db.example.internal")],
+            ..Default::default()
+        };
+        let events = vec![event];
+        assert_eq!(
+            blob_bytes(
+                ATTR_EVENTS_RAW,
+                &events,
+                &limits,
+                &TenantRules::none(),
+                |e| { &e.attributes }
+            ),
+            label_bytes(ATTR_EVENTS_RAW.len(), 2 * 37)
+        );
+        assert_eq!(
+            blob_bytes(ATTR_EVENTS_RAW, &events, &limits, &rules, |e| &e.attributes),
+            label_bytes(ATTR_EVENTS_RAW.len(), 2 * 50)
+        );
+
+        let attrs = stored_attrs(span_with(events, vec![]), &limits, &rules);
+        assert_eq!(stored_len(&attrs, ATTR_EVENTS_RAW), Some(2 * 37));
+    }
+
+    use opentelemetry_proto::tonic::trace::v1::span::{Event, Link};
+    use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
+    use proptest::prelude::*;
+
+    const RULED: [&str; 2] = ["client.ip", "peer"];
+
+    fn event_attr() -> impl Strategy<Value = KeyValue> {
+        let key = prop_oneof![
+            prop::sample::select(RULED.to_vec()).prop_map(str::to_string),
+            "[a-z]{1,6}",
+        ];
+        let value = prop_oneof![
+            // Lengths either side of the 47-byte floor and of the one- and
+            // two-byte varint boundaries every enclosing prefix crosses.
+            prop::sample::select(vec![
+                0usize, 1, 46, 47, 48, 80, 100, 120, 127, 128, 200, 16_400
+            ])
+            .prop_map(|n| Some(AnyValueVariant::StringValue("v".repeat(n)))),
+            any::<i64>().prop_map(|i| Some(AnyValueVariant::IntValue(i))),
+            Just(None),
+        ];
+        (key, value).prop_map(|(key, value)| KeyValue {
+            key,
+            value: value.map(|v| AnyValue { value: Some(v) }),
+            ..Default::default()
+        })
+    }
+
+    fn events() -> impl Strategy<Value = Vec<Event>> {
+        prop::collection::vec(
+            (prop::collection::vec(event_attr(), 0..4), "[a-z]{0,90}").prop_map(
+                |(attributes, name)| Event {
+                    time_unix_nano: 1,
+                    name,
+                    attributes,
+                    ..Default::default()
+                },
+            ),
+            0..4,
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn blob_bytes_matches_padding_a_copy(
+            items in events(),
+            cap in prop::sample::select(vec![0usize, 100, 300, 1_000, 65_536]),
+        ) {
+            let rules = rules_on(&RULED);
+            let limits = SpanIngestLimits {
+                max_raw_blob_len: cap,
+                ..SpanIngestLimits::default()
+            };
+            prop_assert_eq!(
+                blob_bytes(ATTR_EVENTS_RAW, &items, &limits, &rules, |e| &e.attributes),
+                blob_bytes_by_padding_a_copy(ATTR_EVENTS_RAW, &items, &limits, &rules)
+            );
+            let none = TenantRules::none();
+            prop_assert_eq!(
+                blob_bytes(ATTR_EVENTS_RAW, &items, &limits, &none, |e| &e.attributes),
+                blob_bytes_by_padding_a_copy(ATTR_EVENTS_RAW, &items, &limits, &none)
+            );
+        }
+
+        #[test]
+        fn lookup_label_rule_matches_sanitizing_then_looking_up(
+            key in prop_oneof![
+                Just(String::new()),
+                Just("client.ip".to_string()),
+                Just("client_ip".to_string()),
+                Just("client-ip".to_string()),
+                Just("clïent.ip".to_string()),
+                Just("1lient.ip".to_string()),
+                Just(format!("{}.ip", "a".repeat(300))),
+                Just(format!("{}_ip", "a".repeat(300))),
+                "[a-z._\\-é0-9]{0,12}",
+            ],
+        ) {
+            let rules = rules_on(&["client.ip", "cl_ent.ip", "_lient.ip", &format!("{}.ip", "a".repeat(300))]);
+            prop_assert_eq!(
+                lookup_label_rule(&rules, &key).map(|info| info.raw_key),
+                rules.lookup_label(&sanitize(&key)).map(|info| info.raw_key)
+            );
+            prop_assert!(lookup_label_rule(&TenantRules::none(), &key).is_none());
+        }
+    }
 }
 
 /// Attribute sets for the property tests that hold each normalizer to
 /// [`label_bytes`]: every kept name and value at exact capacity, and the
 /// projection at or above what normalization allocates.
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 pub(crate) mod capacity_cases {
     use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
     use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
@@ -860,6 +1300,36 @@ pub(crate) mod capacity_cases {
 
     /// A 17-byte key that sanitising rewrites (`.` and `-` become `_`).
     pub(crate) const SANITISED_17: &str = "http.request-path";
+
+    pub(crate) fn sanitize(key: &str) -> String {
+        crate::normalize::sanitize_label_name(key.to_string())
+    }
+
+    /// A rule set over `keys`, one rule of `variant` each.
+    pub(crate) fn rules_with(keys: &[&str], variant: &str) -> ravel_ipcrypt::rules::TenantRules {
+        let entries: Vec<String> = keys
+            .iter()
+            .map(|k| format!("{{ key = \"{k}\", variant = \"{variant}\" }}"))
+            .collect();
+        let policy = ravel_ipcrypt::policy::parse_policy_file(
+            &format!("[defaults]\nrules = [{}]\n", entries.join(", ")),
+            sanitize,
+        )
+        .expect("policy parses");
+        ravel_ipcrypt::rules::TenantRules::resolve(
+            &policy,
+            "acme",
+            &ravel_types::TenantHash([9u8; 16]),
+            &[7u8; 32],
+            sanitize,
+        )
+        .expect("rules resolve")
+    }
+
+    /// A rule set over `keys`, one deterministic rule each.
+    pub(crate) fn rules_on(keys: &[&str]) -> ravel_ipcrypt::rules::TenantRules {
+        rules_with(keys, "deterministic")
+    }
 
     pub(crate) fn kv(key: &str, value: Option<AnyValueVariant>) -> KeyValue {
         KeyValue {

@@ -9,6 +9,11 @@ rust-version.workspace = true
 ravel-types = { workspace = true }
 ravel-segment = { workspace = true }
 ravel-logseg = { workspace = true }
+# Per-tenant IPCrypt rule set applied inside normalization (ADR-2993 decision
+# 3, issue #3047): default features only, so the `marker` feature's
+# ravel-object-store dependency does not enter this crate's graph (verified
+# with `cargo tree -p ravel-otlp -e normal`).
+ravel-ipcrypt = { workspace = true }
 # ravel-rspan (ADR-0041) is new and not yet listed in the workspace
 # [workspace.dependencies]; the root Cargo.toml is out of this task's scope, so
 # this is a version-pinned path dependency (the pin keeps cargo-deny from

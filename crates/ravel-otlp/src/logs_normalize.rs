@@ -36,11 +36,25 @@
 //! or kvlist of more than [`ravel_logseg::MAX_ATTR_ENTRIES`] entries with
 //! [`LogRejection::AttributeTooManyEntries`], so it does not reach a flush
 //! that would refuse it.
+//!
+//! Every entry point takes a [`TenantRules`](ravel_ipcrypt::rules::TenantRules)
+//! (ADR-2993 decision 3). Logs match a rule by the raw attribute key as sent,
+//! never a sanitized name: unlike metric labels, log attribute keys are
+//! stored and matched verbatim. A matching string-valued resource, scope, or
+//! record attribute is encrypted in [`convert_attr`] before the storage-shape
+//! check, the value-length check, and (for resource and scope attributes)
+//! before [`log_stream_id`] and [`stream_attrs_bytes`] compute the stream's
+//! identity and preimage, so identity is derived from the ciphertext actually
+//! stored. A tenant with no matching rule, or [`TenantRules::none()`], leaves
+//! every value unchanged.
 
 use opentelemetry_proto::tonic::collector::logs::v1::ExportLogsServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::logs::v1::{LogRecord, ResourceLogs, ScopeLogs};
+use ravel_ipcrypt::render::RenderOutcome;
+use ravel_ipcrypt::rules::TenantRules;
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_logseg::{MAX_ATTR_DEPTH, MAX_ATTR_ENTRIES, attr_value_fits_storage, stream_attrs_bytes};
 use ravel_types::logstream::{AttrValue, LogStreamId, log_stream_id};
 
@@ -85,6 +99,13 @@ pub struct LogNormalizeOutput {
     /// records is in `records`: the count is a conversion, never a rejection,
     /// so an operator alerting on rejection reasons sees nothing from it.
     pub body_conversions: usize,
+    /// Per-variant, per-outcome counts of the rule-matched attribute values
+    /// this call stores (ADR-2993 decision 3): a record's own attributes once
+    /// per admitted record, and a resource's or scope's once if any record
+    /// under it is admitted. A rejected record or a dropped attribute counts
+    /// nothing. Empty when `rules` matched nothing, including
+    /// [`TenantRules::none()`].
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Decode and normalize log records from `req`.
@@ -98,20 +119,22 @@ pub struct LogNormalizeOutput {
 pub fn normalize_logs(
     req: ExportLogsServiceRequest,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> LogNormalizeOutput {
-    let projected = crate::label_projection::project_log_resolved_label_bytes(&req, limits);
-    normalize_logs_projected(req, limits, ingest_ts_ns, projected)
+    let projected = crate::label_projection::project_log_resolved_label_bytes(&req, limits, rules);
+    normalize_logs_projected(req, limits, rules, ingest_ts_ns, projected)
 }
 
 /// [`normalize_logs`] for a caller that already projected `req` with
-/// [`crate::project_log_resolved_label_bytes`] under the same `limits`, so the
-/// request is walked once. `projected` is checked against
+/// [`crate::project_log_resolved_label_bytes`] under the same `limits` and
+/// `rules`, so the request is walked once. `projected` is checked against
 /// `max_resolved_label_bytes_per_request` exactly as the plain entry point
 /// checks its own projection.
 pub fn normalize_logs_projected(
     req: ExportLogsServiceRequest,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     projected: ProjectedLabelBytes,
 ) -> LogNormalizeOutput {
@@ -124,6 +147,7 @@ pub fn normalize_logs_projected(
                 max: limits.max_records_per_request,
             }],
             body_conversions: 0,
+            ipcrypt_tally: IpcryptTally::new(),
         };
     }
 
@@ -140,20 +164,24 @@ pub fn normalize_logs_projected(
                 count: total_records,
             }],
             body_conversions: 0,
+            ipcrypt_tally: IpcryptTally::new(),
         };
     }
 
     let mut records = Vec::new();
     let mut rejected = Vec::new();
     let mut body_conversions = 0;
+    let mut tally = IpcryptTally::new();
     for rl in &req.resource_logs {
         normalize_resource(
             rl,
             limits,
+            rules,
             ingest_ts_ns,
             &mut records,
             &mut rejected,
             &mut body_conversions,
+            &mut tally,
         );
     }
 
@@ -161,6 +189,7 @@ pub fn normalize_logs_projected(
         records,
         rejected,
         body_conversions,
+        ipcrypt_tally: tally,
     }
 }
 
@@ -168,13 +197,16 @@ fn resource_record_count(rl: &ResourceLogs) -> usize {
     rl.scope_logs.iter().map(|sl| sl.log_records.len()).sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_resource(
     rl: &ResourceLogs,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     records: &mut Vec<NormalizedLogRecord>,
     rejected: &mut Vec<LogRejection>,
     body_conversions: &mut usize,
+    tally: &mut IpcryptTally,
 ) {
     let resource_record_count = resource_record_count(rl);
     if resource_record_count == 0 {
@@ -200,39 +232,54 @@ fn normalize_resource(
     // A resource attribute that cannot be converted rejects every record
     // under the resource: resource attributes are part of stream identity,
     // so admitting the records without it would file them under an identity
-    // that silently differs from the one the sender described.
-    let resource_attrs = match convert_attrs(resource_attributes, limits) {
-        Ok(attrs) => attrs,
-        Err(reason) => {
-            rejected.push(LogRejection::Grouped {
-                reason: Box::new(reason),
-                count: resource_record_count,
-            });
-            return;
-        }
-    };
+    // that silently differs from the one the sender described. Encryption
+    // (ADR-2993 decision 3) runs inside `convert_attr`, before this identity
+    // is computed below.
+    // The resource's values count once, and only if a record under it is
+    // stored.
+    let mut resource_tally = IpcryptTally::new();
+    let resource_attrs =
+        match convert_attrs(resource_attributes, limits, rules, &mut resource_tally) {
+            Ok(attrs) => attrs,
+            Err(reason) => {
+                rejected.push(LogRejection::Grouped {
+                    reason: Box::new(reason),
+                    count: resource_record_count,
+                });
+                return;
+            }
+        };
 
+    let stored_before = records.len();
     for sl in &rl.scope_logs {
         normalize_scope(
             sl,
             &resource_attrs,
             limits,
+            rules,
             ingest_ts_ns,
             records,
             rejected,
             body_conversions,
+            tally,
         );
+    }
+    if records.len() > stored_before {
+        tally.merge(&resource_tally);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_scope(
     sl: &ScopeLogs,
     resource_attrs: &[(String, AttrValue)],
     limits: &LogIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     records: &mut Vec<NormalizedLogRecord>,
     rejected: &mut Vec<LogRejection>,
     body_conversions: &mut usize,
+    tally: &mut IpcryptTally,
 ) {
     let scope_record_count = sl.log_records.len();
     if scope_record_count == 0 {
@@ -255,7 +302,8 @@ fn normalize_scope(
         return;
     }
 
-    let scope_attrs = match convert_attrs(scope_attributes, limits) {
+    let mut scope_tally = IpcryptTally::new();
+    let scope_attrs = match convert_attrs(scope_attributes, limits, rules, &mut scope_tally) {
         Ok(attrs) => attrs,
         Err(reason) => {
             rejected.push(LogRejection::Grouped {
@@ -267,12 +315,22 @@ fn normalize_scope(
     };
 
     // Identity and its preimage are computed once per ScopeLogs, from the
-    // same converted attribute vectors, and reused for every record below.
+    // same converted (and, where matched, encrypted) attribute vectors, and
+    // reused for every record below.
     let stream_id = log_stream_id(resource_attrs, scope_name, scope_version, &scope_attrs);
     let stream_attrs = stream_attrs_bytes(resource_attrs, scope_name, scope_version, &scope_attrs);
 
+    let stored_before = records.len();
     for record in &sl.log_records {
-        match normalize_record(record, stream_id, &stream_attrs, limits, ingest_ts_ns) {
+        match normalize_record(
+            record,
+            stream_id,
+            &stream_attrs,
+            limits,
+            rules,
+            ingest_ts_ns,
+            tally,
+        ) {
             Ok((normalized, dropped_attrs, converted_body)) => {
                 records.push(normalized);
                 rejected.extend(dropped_attrs);
@@ -283,18 +341,24 @@ fn normalize_scope(
             Err(reason) => rejected.push(reason),
         }
     }
+    if records.len() > stored_before {
+        tally.merge(&scope_tally);
+    }
 }
 
 /// Normalize one record. `Err` drops the whole record; `Ok`'s second element
 /// carries per-attribute rejections for attributes dropped from an otherwise
 /// admitted record, and its third says whether a structured body was
 /// converted to canonical JSON to admit it.
+#[allow(clippy::too_many_arguments)]
 fn normalize_record(
     record: &LogRecord,
     stream_id: LogStreamId,
     stream_attrs: &[u8],
     limits: &LogIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
+    tally: &mut IpcryptTally,
 ) -> Result<(NormalizedLogRecord, Vec<LogRejection>, bool), LogRejection> {
     if record.attributes.len() > limits.max_attributes_per_record {
         return Err(LogRejection::TooManyAttributes {
@@ -332,7 +396,7 @@ fn normalize_record(
     let mut attrs = Vec::with_capacity(record.attributes.len());
     let mut dropped = Vec::new();
     for kv in &record.attributes {
-        match convert_attr(kv, limits) {
+        match convert_attr(kv, limits, rules, tally) {
             Ok(attr) => attrs.push(attr),
             Err(reason) => dropped.push(reason),
         }
@@ -727,20 +791,58 @@ fn build_canonical(
 fn convert_attrs(
     attributes: &[KeyValue],
     limits: &LogIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<Vec<(String, AttrValue)>, LogRejection> {
     // Kept for every record in the group and charged once by the projection
     // at the per-attribute rate; collecting through `Result` grows the `Vec`.
     let mut attrs = attributes
         .iter()
-        .map(|kv| convert_attr(kv, limits))
+        .map(|kv| convert_attr(kv, limits, rules, tally))
         .collect::<Result<Vec<_>, _>>()?;
     attrs.shrink_to_fit();
     Ok(attrs)
 }
 
+/// Encrypt a string-valued attribute in place under `rules`' rule for `key`
+/// (raw key, not sanitized), recording the outcome in `tally`. A non-string
+/// value under a rule is left unchanged and counted as
+/// [`RenderOutcome::Unparsed`]: only a string can hold an address. A key with
+/// no matching rule is left unchanged and uncounted; so is an empty string,
+/// which carries nothing to encrypt. ADR-2993 decision 3: this runs
+/// inside [`convert_attr`], before the storage-shape check, the
+/// value-length check, and, for a resource or scope attribute, before the
+/// stream identity and preimage that attribute feeds into are computed.
+fn apply_ipcrypt_attr(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    key: &str,
+    value: &mut AttrValue,
+) {
+    let Some(info) = rules.lookup_raw(key) else {
+        return;
+    };
+    let AttrValue::Str(s) = value else {
+        tally.record(info.variant, RenderOutcome::Unparsed);
+        return;
+    };
+    if s.is_empty() {
+        return;
+    }
+    let Some((rendered, outcome)) = rules.apply(info.raw_key, s) else {
+        return;
+    };
+    tally.record(info.variant, outcome);
+    *s = exact_capacity(rendered);
+}
+
+/// Convert one attribute. `tally` gets its rule-matched value only on `Ok`:
+/// a dropped attribute stores nothing and counts nothing.
 fn convert_attr(
     kv: &KeyValue,
     limits: &LogIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(String, AttrValue), LogRejection> {
     if kv.key.len() > limits.max_attribute_key_len {
         return Err(LogRejection::AttributeKeyTooLong {
@@ -748,7 +850,9 @@ fn convert_attr(
             max: limits.max_attribute_key_len,
         });
     }
-    let value = convert_value(&kv.key, kv.value.as_ref(), 1)?;
+    let mut value = convert_value(&kv.key, kv.value.as_ref(), 1)?;
+    let mut attr_tally = IpcryptTally::new();
+    apply_ipcrypt_attr(rules, &mut attr_tally, &kv.key, &mut value);
     if !attr_value_fits_storage(&value) {
         return Err(if has_container_past_entry_cap(&value) {
             LogRejection::AttributeTooManyEntries {
@@ -766,6 +870,7 @@ fn convert_attr(
             max: limits.max_attribute_value_len,
         });
     }
+    tally.merge(&attr_tally);
     Ok((exact_capacity(kv.key.clone()), value))
 }
 
@@ -1000,7 +1105,12 @@ mod tests {
     }
 
     fn normalize(req: ExportLogsServiceRequest) -> LogNormalizeOutput {
-        normalize_logs(req, &LogIngestLimits::default(), 5_000)
+        normalize_logs(
+            req,
+            &LogIngestLimits::default(),
+            &TenantRules::none(),
+            5_000,
+        )
     }
 
     #[test]
@@ -1354,6 +1464,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -1680,6 +1791,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2210,7 +2322,12 @@ mod tests {
             vec![attr_kv("wide", wide_array(ENTRY_CAP))],
             vec![scope_logs("lib", "1", vec![record(body("a"), vec![], 1)])],
         );
-        let out = normalize_logs(request(vec![at]), &entry_cap_limits(), 5_000);
+        let out = normalize_logs(
+            request(vec![at]),
+            &entry_cap_limits(),
+            &TenantRules::none(),
+            5_000,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 1);
         let decoded = ravel_logseg::record::decode_stream_attrs(&out.records[0].stream_attrs)
@@ -2310,6 +2427,7 @@ mod tests {
                 )],
             )]),
             &entry_cap_limits(),
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2683,6 +2801,7 @@ mod tests {
                 vec![scope_logs("lib", "1", recs)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2754,6 +2873,7 @@ mod tests {
                 vec![scope_logs("lib", "1", recs)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2790,6 +2910,7 @@ mod tests {
                 vec![scope_logs("lib-a", "1", vec![rec()]), bad_scope],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert_eq!(out.records.len(), 1);
@@ -2864,6 +2985,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2893,6 +3015,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.records.is_empty());
@@ -2929,7 +3052,12 @@ mod tests {
     fn rejects_future_skewed_record() {
         let limits = LogIngestLimits::default();
         let ts = INGEST_TS + limits.max_future_skew_ns + 1;
-        let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+        let out = normalize_logs(
+            one_record_at(ts as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -2945,7 +3073,12 @@ mod tests {
     fn rejects_record_older_than_max_ingest_lag() {
         let limits = LogIngestLimits::default();
         let ts = INGEST_TS - limits.max_ingest_lag_ns - 1;
-        let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+        let out = normalize_logs(
+            one_record_at(ts as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -2963,7 +3096,12 @@ mod tests {
             INGEST_TS + limits.max_future_skew_ns,
             INGEST_TS - limits.max_ingest_lag_ns,
         ] {
-            let out = normalize_logs(one_record_at(ts as u64), &limits, INGEST_TS);
+            let out = normalize_logs(
+                one_record_at(ts as u64),
+                &limits,
+                &TenantRules::none(),
+                INGEST_TS,
+            );
             assert!(out.rejected.is_empty(), "{:?}", out.rejected);
             assert_eq!(out.records.len(), 1);
             assert_eq!(out.records[0].ts_ns, ts);
@@ -2988,6 +3126,7 @@ mod tests {
                 vec![scope_logs("lib", "1", vec![rec])],
             )]),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.records.is_empty());
@@ -3007,6 +3146,7 @@ mod tests {
         let out = normalize_logs(
             one_record_at(u64::MAX),
             &LogIngestLimits::default(),
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.records.is_empty());
@@ -3029,7 +3169,7 @@ mod tests {
         ) {
             let limits = LogIngestLimits::default();
             let ingest_ts = INGEST_TS + offset_ns;
-            let out = normalize_logs(one_record_at(ts_ns), &limits, ingest_ts);
+            let out = normalize_logs(one_record_at(ts_ns), &limits, &TenantRules::none(), ingest_ts);
             let resolved = i64::try_from(ts_ns).unwrap_or(i64::MAX);
             let in_bounds = resolved >= ingest_ts - limits.max_ingest_lag_ns
                 && resolved <= ingest_ts + limits.max_future_skew_ns;
@@ -3169,15 +3309,19 @@ mod tests {
         // 1+3, version 1+1, empty scope set 1), built once per scope and
         // copied once per record.
         let req = wide_stream_request(N, 1_000);
-        let projected =
-            crate::project_log_resolved_label_bytes(&req, &LogIngestLimits::default()).get();
+        let projected = crate::project_log_resolved_label_bytes(
+            &req,
+            &LogIngestLimits::default(),
+            &TenantRules::none(),
+        )
+        .get();
         assert_eq!(projected, 1_067 + 1_015 * (N + 1));
 
         let limits = LogIngestLimits {
             max_resolved_label_bytes_per_request: 10_000,
             ..LogIngestLimits::default()
         };
-        let out = normalize_logs(req, &limits, 5_000);
+        let out = normalize_logs(req, &limits, &TenantRules::none(), 5_000);
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -3206,9 +3350,18 @@ mod tests {
             ..LogIngestLimits::default()
         };
         let req = wide_stream_request(N, 1_000);
-        assert!(crate::project_log_resolved_label_bytes(&req, &limits).get() > 10_000);
+        assert!(
+            crate::project_log_resolved_label_bytes(&req, &limits, &TenantRules::none()).get()
+                > 10_000
+        );
 
-        let out = normalize_logs_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(0));
+        let out = normalize_logs_projected(
+            req,
+            &limits,
+            &TenantRules::none(),
+            5_000,
+            ProjectedLabelBytes::for_test(0),
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), N);
     }
@@ -3221,10 +3374,18 @@ mod tests {
             ..LogIngestLimits::default()
         };
         let req = wide_stream_request(1, 1);
-        assert!(crate::project_log_resolved_label_bytes(&req, &limits).get() <= MAX);
+        assert!(
+            crate::project_log_resolved_label_bytes(&req, &limits, &TenantRules::none()).get()
+                <= MAX
+        );
 
-        let out =
-            normalize_logs_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(MAX + 1));
+        let out = normalize_logs_projected(
+            req,
+            &limits,
+            &TenantRules::none(),
+            5_000,
+            ProjectedLabelBytes::for_test(MAX + 1),
+        );
         assert!(out.records.is_empty());
         assert_eq!(
             out.rejected,
@@ -3308,8 +3469,9 @@ mod tests {
             resource_logs(vec![], vec![scope_logs("other", "", records(3_000))]),
         ]);
         let limits = LogIngestLimits::default();
-        let projected = crate::project_log_resolved_label_bytes(&req, &limits).get();
-        let out = normalize_logs(req, &limits, 5_000);
+        let projected =
+            crate::project_log_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
+        let out = normalize_logs(req, &limits, &TenantRules::none(), 5_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.records.len(), 15);
         // What each record actually allocated: its stream-attribute copy, its
@@ -3344,14 +3506,15 @@ mod tests {
         }
     }
 
-    /// Normalize one record carrying `attributes` under `resource`, check that
-    /// every kept key and value sits at exact capacity, and that the
-    /// projection's per-record term (two records less one, so the
-    /// once-per-resource and once-per-scope copies give no slack) is at least
-    /// what the record allocated. Returns the number of kept records.
+    /// Normalize one record carrying `attributes` under `resource` and
+    /// `rules`, check that every kept key and value sits at exact capacity,
+    /// and that the projection's per-record term (two records less one, so
+    /// the once-per-resource and once-per-scope copies give no slack) is at
+    /// least what the record allocated. Returns the number of kept records.
     fn check_record_capacity(
         resource: &[KeyValue],
         attributes: &[KeyValue],
+        rules: &TenantRules,
     ) -> Result<usize, proptest::test_runner::TestCaseError> {
         let limits = LogIngestLimits::default();
         let req = |n: u64| {
@@ -3372,9 +3535,9 @@ mod tests {
                 )],
             )])
         };
-        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits).get()
-            - crate::project_log_resolved_label_bytes(&req(1), &limits).get();
-        let out = normalize_logs(req(1), &limits, 5_000);
+        let per_record = crate::project_log_resolved_label_bytes(&req(2), &limits, rules).get()
+            - crate::project_log_resolved_label_bytes(&req(1), &limits, rules).get();
+        let out = normalize_logs(req(1), &limits, rules, 5_000);
         for r in &out.records {
             for (k, v) in &r.attrs {
                 proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);
@@ -3429,7 +3592,7 @@ mod tests {
             resource in crate::label_projection::capacity_cases::attributes(4),
             attributes in log_attribute_sets(),
         ) {
-            check_record_capacity(&resource, &attributes)?;
+            check_record_capacity(&resource, &attributes, &TenantRules::none())?;
         }
     }
 
@@ -3437,9 +3600,31 @@ mod tests {
     fn kept_attributes_are_exact_and_projected_on_fixed_cases() {
         use crate::label_projection::capacity_cases::{double, int, kv};
         for attribute in [kv("k", int(0)), kv("k", double(1e260))] {
-            let kept = check_record_capacity(&[], std::slice::from_ref(&attribute))
-                .expect("fixed case holds");
+            let kept =
+                check_record_capacity(&[], std::slice::from_ref(&attribute), &TenantRules::none())
+                    .expect("fixed case holds");
             assert_eq!(kept, 1, "{attribute:?}");
+        }
+    }
+
+    /// A ciphertext replaces a ruled value in place, so it is held to the
+    /// same exact capacity and projection bound as any other kept value: an
+    /// IPv4 and an IPv6 address on the record and on the resource, under
+    /// both variants.
+    #[test]
+    fn ruled_attributes_are_exact_and_projected() {
+        use crate::label_projection::capacity_cases::{kv, rules_with};
+        let string = |s: &str| Some(AnyValueVariant::StringValue(s.to_string()));
+        for variant in ["deterministic", "prefix"] {
+            let rules = rules_with(&["client.ip", "host.ip"], variant);
+            let resource = [kv("host.ip", string("2001:db8::1"))];
+            let attributes = [
+                kv("client.ip", string("192.0.2.1")),
+                kv("other", string("192.0.2.2")),
+            ];
+            let kept =
+                check_record_capacity(&resource, &attributes, &rules).expect("ruled case holds");
+            assert_eq!(kept, 1, "{variant}");
         }
     }
 }

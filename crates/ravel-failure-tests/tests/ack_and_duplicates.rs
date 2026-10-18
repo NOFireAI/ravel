@@ -20,6 +20,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_ingest::{IngestConfig, IngestRouter, PendingAckBudget, WriteMode};
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, list_all};
 use ravel_otlp::{IngestLimits, normalize_metrics};
@@ -202,9 +203,9 @@ async fn duplicate_otlp_delivery_normalized_twice_does_not_double_count() {
     let limits = IngestLimits::default();
     let req = gauge_request("otlp_gauge", event_ts, 7.0);
 
-    let first = normalize_metrics(&tid, req.clone(), &limits, BASE_NS);
+    let first = normalize_metrics(&tid, req.clone(), &limits, &TenantRules::none(), BASE_NS);
     assert!(first.rejected.is_empty());
-    let second = normalize_metrics(&tid, req, &limits, BASE_NS);
+    let second = normalize_metrics(&tid, req, &limits, &TenantRules::none(), BASE_NS);
     assert!(second.rejected.is_empty());
 
     router

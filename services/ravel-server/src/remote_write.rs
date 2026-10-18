@@ -27,6 +27,7 @@ use ravel_ingest::{
     AdmissionController, Clock, IngestByteBudget, IngestPoint, IngestRouter, IngestValue,
     RequestRejection, WriteError, plausible_ingest_clock,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
 use ravel_remote_write::{RwNormalizeOutput, normalize_resolved};
@@ -455,7 +456,14 @@ async fn remote_write(
 
     // Strict mode only: a Remote Write 2xx must mean durable, so the
     // buffered-mode header override is never consulted on this surface.
-    let normalized = normalize_resolved(&tenant, resolved, &state.limits, now_ns);
+    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
+    let normalized = normalize_resolved(
+        &tenant,
+        resolved,
+        &state.limits,
+        &TenantRules::none(),
+        now_ns,
+    );
     let mut points_dropped = compute_points_dropped(&normalized);
     let metadata_dropped = normalized.metadata_dropped as u64;
     let created_timestamps_dropped = normalized.created_timestamps_dropped as u64;
@@ -665,6 +673,7 @@ pub(crate) mod tests {
             exemplars_dropped: 1,
             metadata_dropped: 5,
             created_timestamps_dropped: 7,
+            ipcrypt_tally: ravel_ipcrypt::tally::IpcryptTally::new(),
         };
 
         // 3 (one point per histogram rejection) + 2 (otlp rejection) + 1
@@ -684,6 +693,7 @@ pub(crate) mod tests {
             exemplars_dropped: 0,
             metadata_dropped: 4,
             created_timestamps_dropped: 9,
+            ipcrypt_tally: ravel_ipcrypt::tally::IpcryptTally::new(),
         };
 
         assert_eq!(compute_points_dropped(&normalized), 0);

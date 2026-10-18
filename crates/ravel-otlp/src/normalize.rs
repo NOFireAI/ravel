@@ -55,6 +55,21 @@
 //! This matches the letter of the OTel-to-Prometheus convention and is
 //! intentional, not an oversight; callers who need collision-free names
 //! for adversarial input should pre-validate before calling in.
+//!
+//! Every entry point takes the tenant's resolved [`TenantRules`] as a
+//! required parameter (ADR-2993 decision 3, issue #3047): a value is
+//! encrypted, when a rule matches the label it will be stored under, before
+//! that label is pushed, which is before `LabelSet::new`/`SeriesId::compute`
+//! run on it and before the `SeriesIdMemo` caches the built set (the memo is
+//! keyed on raw attributes but stores the encrypted labels, so a hit reuses
+//! ciphertext and never re-encrypts), before the label's length is checked
+//! against
+//! `IngestLimits`, and before an exemplar's filtered attributes are stored.
+//! Matching is by sanitized label name (`TenantRules::lookup_label`), not by
+//! the raw OTLP key: `job` and `instance` are matched under those literal
+//! names, not under `service.name`/`service.instance.id`. A tenant with no
+//! configured rules ([`TenantRules::none`]) produces byte-identical output to
+//! before this parameter existed.
 
 use std::sync::Arc;
 
@@ -70,6 +85,8 @@ use opentelemetry_proto::tonic::metrics::v1::{
     SummaryDataPoint, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
+use ravel_ipcrypt::rules::{RuleInfo, TenantRules};
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_segment::{HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::{
     Exemplar, ExemplarCap, Label, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, TenantId,
@@ -138,6 +155,13 @@ pub struct NormalizeOutput {
     pub points: Vec<NormalizedPoint>,
     pub histogram_points: Vec<NormalizedHistogramPoint>,
     pub rejected: Vec<Rejection>,
+    /// Per-(variant, outcome) counts of the rule-matched values this call
+    /// stores (ADR-2993 decision 3): each data point's matched attributes
+    /// once per point, a resource's once if any point under it is stored,
+    /// and an exemplar's only if the exemplar cap admits it. A rejected point
+    /// or a dropped exemplar counts nothing. Empty when the rule set is empty
+    /// or matched nothing.
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// One exemplar admitted through the per-series cap (ADR-0047 decisions 1
@@ -184,10 +208,12 @@ pub fn normalize_metrics(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> NormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    let result = normalize_metrics_with_exemplars(tenant, req, limits, ingest_ts_ns, &mut cap);
+    let result =
+        normalize_metrics_with_exemplars(tenant, req, limits, rules, ingest_ts_ns, &mut cap);
     let mut output = result.output;
     // The cap admitted these, but this entry point has nowhere to store them and
     // discards them. A discarded admission is still a dropped exemplar and must
@@ -217,14 +243,16 @@ pub fn normalize_metrics_with_exemplars(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
-    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits, rules);
     normalize_impl(
         tenant,
         req,
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         projected,
@@ -250,14 +278,16 @@ pub fn normalize_metrics_with_metadata(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
-    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits);
+    let projected = crate::label_projection::project_resolved_label_bytes(&req, limits, rules);
     normalize_metrics_with_metadata_projected(
         tenant,
         req,
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         projected,
@@ -273,6 +303,7 @@ pub fn normalize_metrics_with_metadata_projected(
     tenant: &TenantId,
     req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     projected: ProjectedLabelBytes,
@@ -282,6 +313,7 @@ pub fn normalize_metrics_with_metadata_projected(
         tenant,
         req,
         limits,
+        rules,
         ingest_ts_ns,
         exemplar_cap,
         projected,
@@ -295,10 +327,12 @@ pub fn normalize_metrics_with_metadata_projected(
 /// [`normalize_metrics_with_metadata`]; when `None`, the suffix pass still
 /// runs (names are unconditional) but no metadata is collected, so the older
 /// entry points stay behaviorally identical apart from the names.
+#[allow(clippy::too_many_arguments)]
 fn normalize_impl(
     tenant: &TenantId,
     mut req: ExportMetricsServiceRequest,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     projected: ProjectedLabelBytes,
@@ -356,18 +390,21 @@ fn normalize_impl(
     let mut histogram_points = Vec::new();
     let mut rejected = Vec::new();
     let mut exemplars = Vec::new();
+    let mut tally = IpcryptTally::new();
 
     for rm in &mut req.resource_metrics {
         normalize_resource(
             tenant,
             rm,
             limits,
+            rules,
             ingest_ts_ns,
             exemplar_cap,
             &mut points,
             &mut histogram_points,
             &mut exemplars,
             &mut rejected,
+            &mut tally,
             metadata_out.as_deref_mut(),
         );
     }
@@ -377,6 +414,7 @@ fn normalize_impl(
             points,
             histogram_points,
             rejected,
+            ipcrypt_tally: tally,
         },
         exemplars,
     }
@@ -406,6 +444,7 @@ fn whole_request_rejection(
             points: Vec::new(),
             histogram_points: Vec::new(),
             rejected,
+            ipcrypt_tally: IpcryptTally::new(),
         },
         exemplars: Vec::new(),
     }
@@ -508,25 +547,35 @@ fn normalize_resource(
     tenant: &TenantId,
     rm: &mut ResourceMetrics,
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
     exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
+    tally: &mut IpcryptTally,
     mut metadata_out: Option<&mut MetadataCollector>,
 ) {
     let resource_point_count = resource_metrics_point_count(rm);
     let attrs = resource_attr_pairs(rm.resource.as_ref());
-    let Some(resource_labels) =
-        admit_resource_labels(&attrs, resource_point_count, limits, rejected)
-    else {
+    // The resource's values count once, and only if a point under it is stored.
+    let mut resource_tally = IpcryptTally::new();
+    let Some(resource_labels) = admit_resource_labels(
+        &attrs,
+        resource_point_count,
+        limits,
+        rejected,
+        rules,
+        &mut resource_tally,
+    ) else {
         return;
     };
     drop(attrs);
     #[cfg(test)]
     label_capacity_stats::record_prefix(&resource_labels, resource_labels.capacity());
 
+    let stored_before = points.len() + histogram_points.len();
     for sm in &mut rm.scope_metrics {
         for metric in &mut sm.metrics {
             normalize_metric(
@@ -534,15 +583,20 @@ fn normalize_resource(
                 metric,
                 &resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
                 exemplar_cap,
                 points,
                 histogram_points,
                 exemplars,
                 rejected,
+                tally,
                 metadata_out.as_deref_mut(),
             );
         }
+    }
+    if points.len() + histogram_points.len() > stored_before {
+        tally.merge(&resource_tally);
     }
 }
 
@@ -552,12 +606,14 @@ fn normalize_metric(
     metric: &mut Metric,
     resource_labels: &[Label],
     limits: &IngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
     points: &mut Vec<NormalizedPoint>,
     histogram_points: &mut Vec<NormalizedHistogramPoint>,
     exemplars: &mut Vec<NormalizedExemplar>,
     rejected: &mut Vec<Rejection>,
+    tally: &mut IpcryptTally,
     metadata_out: Option<&mut MetadataCollector>,
 ) {
     let point_count = metric_data_point_count(metric);
@@ -598,13 +654,14 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
                 is_sum: false,
                 is_monotonic: false,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut gauge.data_points {
-                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars, tally) {
                     Ok((p, info)) => {
                         points.push(p);
                         rejected.extend(info);
@@ -627,13 +684,14 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
                 is_sum: true,
                 is_monotonic: sum.is_monotonic,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut sum.data_points {
-                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match build_point(&ctx, dp, &mut memo, exemplar_cap, exemplars, tally) {
                     Ok((p, info)) => {
                         points.push(p);
                         rejected.extend(info);
@@ -656,11 +714,12 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut h.data_points {
-                match explode_histogram(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match explode_histogram(&ctx, dp, &mut memo, exemplar_cap, exemplars, tally) {
                     Ok((mut new_points, informational)) => {
                         points.append(&mut new_points);
                         rejected.extend(informational);
@@ -683,11 +742,19 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut h.data_points {
-                match build_native_histogram_point(&ctx, dp, &mut memo, exemplar_cap, exemplars) {
+                match build_native_histogram_point(
+                    &ctx,
+                    dp,
+                    &mut memo,
+                    exemplar_cap,
+                    exemplars,
+                    tally,
+                ) {
                     Ok((p, informational)) => {
                         histogram_points.push(p);
                         rejected.extend(informational);
@@ -702,11 +769,12 @@ fn normalize_metric(
                 metric_name: &name,
                 resource_labels,
                 limits,
+                rules,
                 ingest_ts_ns,
             };
             let mut memo = SeriesIdMemo::new();
             for dp in &mut s.data_points {
-                match explode_summary(&ctx, dp, &mut memo) {
+                match explode_summary(&ctx, dp, &mut memo, tally) {
                     Ok(mut new_points) => points.append(&mut new_points),
                     Err(r) => rejected.push(r),
                 }
@@ -738,6 +806,7 @@ struct ExplodeContext<'a> {
     metric_name: &'a str,
     resource_labels: &'a [Label],
     limits: &'a IngestLimits,
+    rules: &'a TenantRules,
     ingest_ts_ns: i64,
 }
 
@@ -748,6 +817,7 @@ struct PointContext<'a> {
     metric_name: &'a str,
     resource_labels: &'a [Label],
     limits: &'a IngestLimits,
+    rules: &'a TenantRules,
     ingest_ts_ns: i64,
     is_sum: bool,
     is_monotonic: bool,
@@ -761,6 +831,7 @@ struct NativeHistogramContext<'a> {
     metric_name: &'a str,
     resource_labels: &'a [Label],
     limits: &'a IngestLimits,
+    rules: &'a TenantRules,
     ingest_ts_ns: i64,
 }
 
@@ -817,6 +888,9 @@ struct MemoEntry {
     attr_key: Option<Vec<KeyValue>>,
     labels: Arc<LabelSet>,
     series_id: SeriesId,
+    /// The rule-matched values building `labels` counted, counted again for
+    /// every point that hits this entry; empty on the explode paths.
+    tally: IpcryptTally,
 }
 
 impl SeriesIdMemo {
@@ -830,34 +904,44 @@ impl SeriesIdMemo {
     /// consumes `attributes` to build the set (moving attribute-name strings,
     /// the #367 optimisation), the id is computed, and both are cached along
     /// with a copy of `attributes` as the key.
+    ///
+    /// `tally` gets the rule-matched values of this point's labels on success
+    /// only, hit or miss alike: a miss counts what `build_labels` recorded
+    /// into the scratch tally it is handed and caches that count, and a hit
+    /// counts the cached one, so every point counts its own values.
     fn series_id_for_attributes<F>(
         &mut self,
         tenant: &TenantId,
         metric_name: &str,
         attributes: Vec<KeyValue>,
+        tally: &mut IpcryptTally,
         build_labels: F,
     ) -> Result<(SeriesId, Arc<LabelSet>), Rejection>
     where
-        F: FnOnce(Vec<KeyValue>) -> Result<LabelSet, Rejection>,
+        F: FnOnce(Vec<KeyValue>, &mut IpcryptTally) -> Result<LabelSet, Rejection>,
     {
         if let Some(entry) = &self.last
             && entry.attr_key.as_deref() == Some(attributes.as_slice())
         {
             #[cfg(any(test, feature = "memo-stats"))]
             memo_stats::record_hit();
+            tally.merge(&entry.tally);
             return Ok((entry.series_id, Arc::clone(&entry.labels)));
         }
         #[cfg(any(test, feature = "memo-stats"))]
         memo_stats::record_miss();
         let key = attributes.clone();
-        let label_set = build_labels(attributes)?;
+        let mut built = IpcryptTally::new();
+        let label_set = build_labels(attributes, &mut built)?;
         let series_id = SeriesId::compute(tenant, metric_name, &label_set)
             .map_err(|_| Rejection::OversizedSeriesComponent)?;
+        tally.merge(&built);
         let labels = Arc::new(label_set);
         self.last = Some(MemoEntry {
             attr_key: Some(key),
             labels: Arc::clone(&labels),
             series_id,
+            tally: built,
         });
         Ok((series_id, labels))
     }
@@ -889,6 +973,7 @@ impl SeriesIdMemo {
             attr_key: None,
             labels: Arc::clone(&labels),
             series_id,
+            tally: IpcryptTally::new(),
         });
         Ok((series_id, labels))
     }
@@ -1005,6 +1090,7 @@ fn int_survives_f64(v: i64) -> bool {
 /// one series' window, whichever series that turns out to be) this is what
 /// makes "keep the newest" hold even when a single data point carries
 /// several exemplars for the same window.
+#[allow(clippy::too_many_arguments)]
 fn admit_exemplars<F>(
     dp_exemplars: Vec<OtlpExemplar>,
     limits: &IngestLimits,
@@ -1012,6 +1098,8 @@ fn admit_exemplars<F>(
     series_id_for: F,
     exemplars_out: &mut Vec<NormalizedExemplar>,
     informational: &mut Vec<Rejection>,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) where
     F: Fn(&Exemplar) -> SeriesId,
 {
@@ -1023,8 +1111,10 @@ fn admit_exemplars<F>(
     let mut candidates = Vec::with_capacity(capacity);
     let mut dropped = 0usize;
     for ex in dp_exemplars {
-        match decode_exemplar(ex, limits) {
-            Some(e) => candidates.push(e),
+        // Each candidate's rule-matched values count only if the cap admits it.
+        let mut candidate_tally = IpcryptTally::new();
+        match decode_exemplar(ex, limits, rules, &mut candidate_tally) {
+            Some(e) => candidates.push((e, candidate_tally)),
             None => dropped += 1,
         }
     }
@@ -1033,11 +1123,12 @@ fn admit_exemplars<F>(
     // equal `ts_ns` (ExemplarCap::admit is first-wins). An unstable sort would
     // leave the tie winner implementation-defined rather than a property of the
     // input (ADR-0047 amendment: encoded bytes are a function of input order).
-    candidates.sort_by_key(|c| std::cmp::Reverse(c.ts_ns));
+    candidates.sort_by_key(|(c, _)| std::cmp::Reverse(c.ts_ns));
 
-    for candidate in candidates {
+    for (candidate, candidate_tally) in candidates {
         let series_id = series_id_for(&candidate);
         if cap.admit(series_id, candidate.ts_ns) {
+            tally.merge(&candidate_tally);
             exemplars_out.push(NormalizedExemplar {
                 series_id,
                 exemplar: candidate,
@@ -1060,7 +1151,12 @@ fn admit_exemplars<F>(
 /// exemplar (see [`parse_id`]), and an unparsable filtered-attribute value is
 /// skipped rather than failing the exemplar, since filtered attributes are
 /// informational context, not part of series identity.
-fn decode_exemplar(ex: OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar> {
+fn decode_exemplar(
+    ex: OtlpExemplar,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+) -> Option<Exemplar> {
     let value_bits = match ex.value {
         Some(OtlpExemplarValue::AsDouble(v)) => v.to_bits(),
         Some(OtlpExemplarValue::AsInt(v)) => (v as f64).to_bits(),
@@ -1082,6 +1178,7 @@ fn decode_exemplar(ex: OtlpExemplar, limits: &IngestLimits) -> Option<Exemplar> 
     {
         let value = any_value_to_label_value(attr.value.as_ref()).unwrap_or_default();
         let name = sanitize_label_name(attr.key);
+        let value = apply_ipcrypt(rules, tally, &name, value);
         filtered_attributes.push(Label { name, value });
     }
 
@@ -1111,12 +1208,14 @@ fn parse_id<const N: usize>(bytes: &[u8]) -> [u8; N] {
 /// that were malformed or lost the per-series admission cap. The point is
 /// admitted either way; the rounding is unavoidable given `f64`-only storage,
 /// so it is surfaced, not rejected.
+#[allow(clippy::too_many_arguments)]
 fn build_point(
     ctx: &PointContext,
     dp: &mut NumberDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
+    tally: &mut IpcryptTally,
 ) -> Result<(NormalizedPoint, Vec<Rejection>), Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -1159,14 +1258,15 @@ fn build_point(
         ctx.tenant,
         ctx.metric_name,
         std::mem::take(&mut dp.attributes),
-        |attributes| {
+        tally,
+        |attributes, tally| {
             let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
             labels.extend_from_slice(ctx.resource_labels);
             labels.push(kept_label(
                 METRIC_NAME_LABEL.to_string(),
                 ctx.metric_name.to_string(),
             ));
-            push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            push_attribute_labels(&mut labels, attributes, ctx.limits, ctx.rules, tally)?;
             #[cfg(test)]
             label_capacity_stats::record(&labels, labels.capacity());
             LabelSet::new(labels).map_err(|err| match err {
@@ -1187,6 +1287,8 @@ fn build_point(
         |_| series_id,
         exemplars_out,
         &mut informational,
+        ctx.rules,
+        tally,
     );
 
     Ok((
@@ -1210,12 +1312,14 @@ fn build_point(
 /// deliberately out of scope, unlike exemplars, which this function does
 /// carry, admitted through the same per-series cap as every other point
 /// type).
+#[allow(clippy::too_many_arguments)]
 fn build_native_histogram_point(
     ctx: &NativeHistogramContext,
     dp: &mut ExponentialHistogramDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
+    tally: &mut IpcryptTally,
 ) -> Result<(NormalizedHistogramPoint, Vec<Rejection>), Rejection> {
     if dp.attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -1233,14 +1337,15 @@ fn build_native_histogram_point(
         ctx.tenant,
         ctx.metric_name,
         std::mem::take(&mut dp.attributes),
-        |attributes| {
+        tally,
+        |attributes, tally| {
             let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len() + 1);
             labels.extend_from_slice(ctx.resource_labels);
             labels.push(kept_label(
                 METRIC_NAME_LABEL.to_string(),
                 ctx.metric_name.to_string(),
             ));
-            push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+            push_attribute_labels(&mut labels, attributes, ctx.limits, ctx.rules, tally)?;
             #[cfg(test)]
             label_capacity_stats::record(&labels, labels.capacity());
             LabelSet::new(labels).map_err(|err| match err {
@@ -1261,6 +1366,8 @@ fn build_native_histogram_point(
         |_| series_id,
         exemplars_out,
         &mut informational,
+        ctx.rules,
+        tally,
     );
 
     Ok((
@@ -1436,17 +1543,77 @@ fn checked_event_ts(
     Ok(event_ts_ns)
 }
 
+/// Encrypt `value` under `rules`' matching rule for the label it is about to
+/// be stored as, recording the outcome in `tally` (ADR-2993 decision 3).
+/// `name` must already be the label's final stored name: metrics match a
+/// rule by sanitized label name
+/// ([`TenantRules::lookup_label`](ravel_ipcrypt::rules::TenantRules::lookup_label)),
+/// not by the raw OTLP attribute key, so `job` and `instance` are matched
+/// under those literal names. A tenant with no matching rule, or no rules at
+/// all, returns `value` unchanged, and so does an empty value, which carries
+/// nothing to encrypt and is not counted.
+pub fn apply_ipcrypt(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    name: &str,
+    value: String,
+) -> String {
+    if value.is_empty() {
+        return value;
+    }
+    let Some(info) = rules.lookup_label(name) else {
+        return value;
+    };
+    encrypt_under(rules, tally, info, value)
+}
+
+/// [`apply_ipcrypt`] for a label stored under its name as sent, which may not
+/// be a sanitized name (Remote Write never rewrites one): the rule is looked
+/// up by `name` sanitized as this module sanitizes an attribute key
+/// ([`lookup_label_rule`]), so `client.address` and `client_address` both
+/// match the rule for `client.address`. Only the lookup sees the sanitized
+/// form; the caller stores `name` unchanged.
+pub fn apply_ipcrypt_as_sent(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    name: &str,
+    value: String,
+) -> String {
+    if value.is_empty() {
+        return value;
+    }
+    let Some(info) = lookup_label_rule(rules, name) else {
+        return value;
+    };
+    encrypt_under(rules, tally, info, value)
+}
+
+fn encrypt_under(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    info: RuleInfo<'_>,
+    value: String,
+) -> String {
+    let Some((rendered, outcome)) = rules.apply(info.raw_key, &value) else {
+        return value;
+    };
+    tally.record(info.variant, outcome);
+    rendered
+}
+
 /// Sanitize and push each attribute as a label, checking the same
 /// name/value length limits applied to every other label.
 fn push_attribute_labels(
     labels: &mut Vec<Label>,
     attributes: Vec<KeyValue>,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(), Rejection> {
     for attr in attributes {
         let value = any_value_to_label_value(attr.value.as_ref())?;
         let name = sanitize_label_name(attr.key);
-        push_checked(labels, name, value, limits)?;
+        push_checked(labels, name, value, limits, rules, tally)?;
     }
     Ok(())
 }
@@ -1458,6 +1625,7 @@ fn push_attribute_labels(
 fn build_explode_base_labels(
     ctx: &ExplodeContext,
     attributes: Vec<KeyValue>,
+    tally: &mut IpcryptTally,
 ) -> Result<Vec<Label>, Rejection> {
     if attributes.len() > ctx.limits.max_attributes_per_point {
         return Err(Rejection::TooManyAttributes {
@@ -1467,13 +1635,14 @@ fn build_explode_base_labels(
     }
     let mut labels = Vec::with_capacity(ctx.resource_labels.len() + attributes.len());
     labels.extend_from_slice(ctx.resource_labels);
-    push_attribute_labels(&mut labels, attributes, ctx.limits)?;
+    push_attribute_labels(&mut labels, attributes, ctx.limits, ctx.rules, tally)?;
     Ok(labels)
 }
 
 /// Finish one exploded series: attach `__name__` and an optional `le`/
 /// `quantile` label to the shared base labels, then build the label set and
 /// resolve its series id exactly like [`build_point`] does for gauge/sum.
+#[allow(clippy::too_many_arguments)]
 fn finish_point(
     ctx: &ExplodeContext,
     memo: &mut SeriesIdMemo,
@@ -1482,6 +1651,7 @@ fn finish_point(
     extra_label: Option<(&'static str, String)>,
     ts_ns: i64,
     value: f64,
+    tally: &mut IpcryptTally,
 ) -> Result<NormalizedPoint, Rejection> {
     let mut labels = Vec::with_capacity(base_labels.len() + 2);
     labels.extend_from_slice(base_labels);
@@ -1490,7 +1660,14 @@ fn finish_point(
         metric_name.to_string(),
     ));
     if let Some((name, value)) = extra_label {
-        push_checked(&mut labels, name.to_string(), value, ctx.limits)?;
+        push_checked(
+            &mut labels,
+            name.to_string(),
+            value,
+            ctx.limits,
+            ctx.rules,
+            tally,
+        )?;
     }
 
     #[cfg(test)]
@@ -1531,12 +1708,14 @@ fn finish_point(
 /// smallest one at or above the exemplar's value (falling back to `+Inf`),
 /// matching Prometheus's own bucket-exemplar convention, then is admitted
 /// through the same per-series cap as every other point type.
+#[allow(clippy::too_many_arguments)]
 fn explode_histogram(
     ctx: &ExplodeContext,
     dp: &mut HistogramDataPoint,
     memo: &mut SeriesIdMemo,
     exemplar_cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
+    counted: &mut IpcryptTally,
 ) -> Result<(Vec<NormalizedPoint>, Vec<Rejection>), Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
@@ -1564,7 +1743,9 @@ fn explode_histogram(
         });
     }
 
-    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
+    // The point's values, counted into `counted` once no series can reject.
+    let tally = &mut IpcryptTally::new();
+    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes), tally)?;
     let stale = has_no_recorded_value(dp.flags);
     let bucket_name = format!("{}_bucket", ctx.metric_name);
 
@@ -1587,6 +1768,7 @@ fn explode_histogram(
             Some(("le", format_float(*bound))),
             event_ts_ns,
             value,
+            tally,
         )?);
     }
 
@@ -1601,6 +1783,7 @@ fn explode_histogram(
         Some(("le", "+Inf".to_string())),
         event_ts_ns,
         count_value,
+        tally,
     )?);
 
     if let Some(sum) = dp.sum {
@@ -1614,6 +1797,7 @@ fn explode_histogram(
             None,
             event_ts_ns,
             sum_value,
+            tally,
         )?);
     }
 
@@ -1626,8 +1810,10 @@ fn explode_histogram(
         None,
         event_ts_ns,
         count_value,
+        tally,
     )?);
 
+    counted.merge(tally);
     let mut informational = Vec::new();
     if dp.min.is_some() || dp.max.is_some() {
         informational.push(Rejection::HistogramMinMaxDropped { count: 1 });
@@ -1650,6 +1836,8 @@ fn explode_histogram(
         },
         exemplars_out,
         &mut informational,
+        ctx.rules,
+        counted,
     );
 
     Ok((series, informational))
@@ -1675,6 +1863,7 @@ fn explode_summary(
     ctx: &ExplodeContext,
     dp: &mut SummaryDataPoint,
     memo: &mut SeriesIdMemo,
+    counted: &mut IpcryptTally,
 ) -> Result<Vec<NormalizedPoint>, Rejection> {
     let event_ts_ns = checked_event_ts(dp.time_unix_nano, ctx.ingest_ts_ns, ctx.limits)?;
 
@@ -1696,7 +1885,9 @@ fn explode_summary(
         });
     }
 
-    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes))?;
+    // The point's values, counted into `counted` once no series can reject.
+    let tally = &mut IpcryptTally::new();
+    let base_labels = build_explode_base_labels(ctx, std::mem::take(&mut dp.attributes), tally)?;
     let stale = has_no_recorded_value(dp.flags);
 
     let mut series = Vec::with_capacity(dp.quantile_values.len() + 2);
@@ -1710,6 +1901,7 @@ fn explode_summary(
             Some(("quantile", format_float(qv.quantile))),
             event_ts_ns,
             value,
+            tally,
         )?);
     }
 
@@ -1723,6 +1915,7 @@ fn explode_summary(
         None,
         event_ts_ns,
         sum_value,
+        tally,
     )?);
 
     let count_value = if stale { stale_nan() } else { dp.count as f64 };
@@ -1735,8 +1928,10 @@ fn explode_summary(
         None,
         event_ts_ns,
         count_value,
+        tally,
     )?);
 
+    counted.merge(tally);
     Ok(series)
 }
 
@@ -1821,11 +2016,14 @@ pub(crate) fn resource_attr_pairs(
 /// [`Rejection::ResourceAttributesDropped`]). Returns the label prefix, or
 /// `None` when every point under the resource is rejected. A resource with no
 /// points is skipped without a rejection.
+#[allow(clippy::too_many_arguments)]
 pub fn admit_resource_labels(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     point_count: usize,
     limits: &IngestLimits,
     rejected: &mut Vec<Rejection>,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Option<Vec<Label>> {
     if point_count == 0 {
         return None;
@@ -1837,7 +2035,7 @@ pub fn admit_resource_labels(
         });
         return None;
     }
-    match build_resource_labels_from(attrs, limits) {
+    match build_resource_labels_from(attrs, limits, rules, tally) {
         Ok((labels, dropped)) => {
             if dropped > 0 {
                 rejected.push(Rejection::ResourceAttributesDropped { count: dropped });
@@ -1877,6 +2075,8 @@ pub fn admit_resource_labels(
 pub fn build_resource_labels_from(
     attrs: &[(&str, ResourceAttrValue<'_>)],
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(Vec<Label>, usize), Rejection> {
     let mut labels = Vec::new();
 
@@ -1888,11 +2088,18 @@ pub fn build_resource_labels_from(
             Some(ns) if !ns.is_empty() => format!("{ns}/{name}"),
             _ => name,
         };
-        push_checked(&mut labels, "job".to_string(), job, limits)?;
+        push_checked(&mut labels, "job".to_string(), job, limits, rules, tally)?;
     }
 
     if let Some(instance) = find_attr_value(attrs, "service.instance.id")? {
-        push_checked(&mut labels, "instance".to_string(), instance, limits)?;
+        push_checked(
+            &mut labels,
+            "instance".to_string(),
+            instance,
+            limits,
+            rules,
+            tally,
+        )?;
     }
 
     for key in &limits.resource_attribute_allowlist {
@@ -1906,7 +2113,14 @@ pub fn build_resource_labels_from(
             // `key` is borrowed from the long-lived allowlist config, so it
             // cannot be moved; clone it to feed the by-value sanitiser. This is
             // once per resource attribute, not per data point.
-            push_checked(&mut labels, sanitize_label_name(key.clone()), value, limits)?;
+            push_checked(
+                &mut labels,
+                sanitize_label_name(key.clone()),
+                value,
+                limits,
+                rules,
+                tally,
+            )?;
         }
     }
 
@@ -1941,11 +2155,14 @@ pub fn build_resource_labels_from(
 /// influenced (`service.namespace`/`service.name` are free-form strings) and
 /// its value is a `format!` join, so it must be checked after joining, not
 /// before: two under-limit halves can still produce an over-limit label.
+#[allow(clippy::too_many_arguments)]
 fn push_checked(
     labels: &mut Vec<Label>,
     name: String,
     value: String,
     limits: &IngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(), Rejection> {
     // ADR-0038: a label with an empty value is treated as absent from the
     // series, matching Prometheus convention and what ravel-remote-write
@@ -1962,6 +2179,9 @@ fn push_checked(
             max: limits.max_label_name_len,
         });
     }
+    // ADR-2993 decision 3: encrypt before the value-length check, so the
+    // limit sees the length of the bytes actually stored.
+    let value = apply_ipcrypt(rules, tally, &name, value);
     if value.len() > limits.max_label_value_len {
         return Err(Rejection::LabelValueTooLong {
             len: value.len(),
@@ -2239,6 +2459,40 @@ pub fn sanitize_label_name(name: String) -> String {
     sanitize(name, is_label_name_start, is_label_name_continue)
 }
 
+/// Keys up to this many characters are sanitized on the stack by
+/// [`lookup_label_rule`].
+const LOOKUP_STACK_LEN: usize = 256;
+
+/// The rule `rules` holds for the label name `key` sanitizes to
+/// ([`sanitize_label_name`], then
+/// [`TenantRules::lookup_label`](ravel_ipcrypt::rules::TenantRules::lookup_label)),
+/// without allocating for a key of up to 256 characters. For a caller that
+/// only needs the match: the projections, and Remote Write, which stores a
+/// label under its name as received but matches it like OTLP does.
+pub fn lookup_label_rule<'r>(rules: &'r TenantRules, key: &str) -> Option<RuleInfo<'r>> {
+    if rules.is_empty() {
+        return None;
+    }
+    // Sanitizing maps every character to one ASCII byte: itself when allowed,
+    // `_` otherwise.
+    let mut buf = [0u8; LOOKUP_STACK_LEN];
+    let mut len = 0;
+    for (i, c) in key.chars().enumerate() {
+        let Some(slot) = buf.get_mut(len) else {
+            return rules.lookup_label(&sanitize_label_name(key.to_owned()));
+        };
+        let allowed = if i == 0 {
+            is_label_name_start(c)
+        } else {
+            is_label_name_continue(c)
+        };
+        *slot = if allowed { c as u8 } else { b'_' };
+        len += 1;
+    }
+    let name = std::str::from_utf8(buf.get(..len)?).ok()?;
+    rules.lookup_label(name)
+}
+
 /// Rewrite every disallowed character to `_`, classifying the first character
 /// with `is_start` and the rest with `is_continue`. Takes the name by value
 /// and returns it unchanged (moved, not reallocated) when every character is
@@ -2475,6 +2729,7 @@ mod tests {
             &tenant(),
             request(vec![]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.points.is_empty());
@@ -2508,7 +2763,7 @@ mod tests {
             )],
         )]);
         memo_stats::reset();
-        let out = normalize_metrics(&tenant, grouped, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant, grouped, &limits, &TenantRules::none(), 1_000_000);
         assert_eq!(out.points.len(), P);
         let (hits, misses) = memo_stats::snapshot();
         // One miss to seed the single series, then a hit for every later point.
@@ -2535,7 +2790,13 @@ mod tests {
             )],
         )]);
         memo_stats::reset();
-        let out = normalize_metrics(&tenant, interleaved, &limits, 1_000_000);
+        let out = normalize_metrics(
+            &tenant,
+            interleaved,
+            &limits,
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert_eq!(out.points.len(), P);
         let (hits, misses) = memo_stats::snapshot();
         assert_eq!(hits, 0, "interleaved: one-entry memo must never hit");
@@ -2561,6 +2822,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2584,6 +2846,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2607,6 +2870,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points[0].labels.get("job"), None);
@@ -2638,6 +2902,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         // `some.other.attr` is outside the allowlist and not a job/instance
@@ -2675,8 +2940,13 @@ mod tests {
                 vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out_resource =
-            normalize_metrics(&tenant(), request(vec![via_resource]), &limits, 1_000);
+        let out_resource = normalize_metrics(
+            &tenant(),
+            request(vec![via_resource]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(
             out_resource.rejected.is_empty(),
             "{:?}",
@@ -2701,7 +2971,13 @@ mod tests {
                 )],
             )],
         );
-        let out_attr = normalize_metrics(&tenant(), request(vec![via_attr]), &limits, 1_000);
+        let out_attr = normalize_metrics(
+            &tenant(),
+            request(vec![via_attr]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out_attr.rejected.is_empty(), "{:?}", out_attr.rejected);
         assert_eq!(out_attr.points[0].labels.get("_bad_key_name"), Some("v"));
 
@@ -2735,6 +3011,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2765,6 +3042,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(
@@ -2798,6 +3076,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -2823,6 +3102,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -2960,7 +3240,13 @@ mod tests {
             )],
         );
 
-        let out = normalize_metrics(&tenant(), request(vec![rm1, rm2]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm1, rm2]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
 
         // Accepted scalar points, in emission order.
         assert_eq!(out.points.len(), 5, "unexpected accepted points");
@@ -3079,6 +3365,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3102,6 +3389,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3133,6 +3421,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         // Admitted: the sample is stored as the nearest f64.
@@ -3165,6 +3454,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 1);
@@ -3191,6 +3481,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 1);
@@ -3211,6 +3502,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3230,6 +3522,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3255,7 +3548,13 @@ mod tests {
                 ],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(out.rejected.len(), 1);
         assert_eq!(
@@ -3281,7 +3580,13 @@ mod tests {
                 )],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3309,7 +3614,13 @@ mod tests {
                 )],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3334,7 +3645,13 @@ mod tests {
                 )],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3358,7 +3675,13 @@ mod tests {
                 ],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3383,7 +3706,13 @@ mod tests {
                 vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3404,6 +3733,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3427,6 +3757,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3452,6 +3783,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3479,6 +3811,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3509,6 +3842,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3542,6 +3876,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3574,7 +3909,13 @@ mod tests {
                 vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3604,7 +3945,13 @@ mod tests {
                 vec![number_point(vec![], 1_000, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -3632,6 +3979,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3664,12 +4012,14 @@ mod tests {
             &tenant(),
             request(vec![rm_digit]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         let out_underscore = normalize_metrics(
             &tenant(),
             request(vec![rm_underscore]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out_digit.rejected.is_empty());
@@ -3722,6 +4072,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3765,6 +4116,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -3813,6 +4165,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -3842,6 +4195,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.histogram_points.is_empty());
@@ -3869,6 +4223,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         )
     }
@@ -3948,6 +4303,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.histogram_points.is_empty());
@@ -3981,6 +4337,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.histogram_points.is_empty());
@@ -4018,6 +4375,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.histogram_points.len(), 1);
@@ -4050,6 +4408,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4074,6 +4433,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4093,6 +4453,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(!out.points[0].is_monotonic_sum);
@@ -4113,6 +4474,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4137,7 +4499,13 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            ingest_ts,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 1);
     }
@@ -4157,7 +4525,13 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            ingest_ts,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4183,7 +4557,13 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            ingest_ts,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 1);
     }
@@ -4203,7 +4583,13 @@ mod tests {
                 vec![number_point(vec![], event_ts, NumberValue::AsDouble(1.0))],
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, ingest_ts);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            ingest_ts,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4244,12 +4630,14 @@ mod tests {
             &tenant(),
             request(vec![rm_a]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         let out_b = normalize_metrics(
             &tenant(),
             request(vec![rm_b]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out_a.rejected.is_empty());
@@ -4278,12 +4666,14 @@ mod tests {
             &tenant(),
             request(vec![rm1.clone(), rm2.clone()]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         let out_reversed = normalize_metrics(
             &tenant(),
             request(vec![rm2, rm1]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out_forward.rejected.is_empty());
@@ -4332,6 +4722,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             base_ts + 1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4382,6 +4773,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             base_ts + 1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4462,6 +4854,7 @@ mod tests {
             &tenant_fixture,
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_700_000_000_000_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4546,6 +4939,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -4579,6 +4973,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4609,6 +5004,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4643,6 +5039,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4670,6 +5067,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4702,7 +5100,13 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4730,7 +5134,13 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert_eq!(out.rejected, vec![]);
         assert_eq!(out.points.len(), 163);
         assert_eq!(out.points.len(), limits.max_histogram_buckets + 3);
@@ -4753,7 +5163,13 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert!(out.points.is_empty());
         assert_eq!(
             out.rejected,
@@ -4786,7 +5202,13 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         );
-        let out = normalize_metrics(&tenant(), request(vec![rm]), &limits, 1_000);
+        let out = normalize_metrics(
+            &tenant(),
+            request(vec![rm]),
+            &limits,
+            &TenantRules::none(),
+            1_000,
+        );
         assert_eq!(out.rejected, vec![]);
         assert_eq!(out.points.len(), 230);
     }
@@ -4810,14 +5232,23 @@ mod tests {
             metric_name: "latency",
             resource_labels: &[],
             limits: &limits,
+            rules: &TenantRules::none(),
             ingest_ts_ns: 1_000,
         };
         let mut memo = SeriesIdMemo::new();
         let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
         let mut exemplars = Vec::new();
+        let mut tally = IpcryptTally::new();
 
-        let err = explode_histogram(&ctx, &mut dp, &mut memo, &mut cap, &mut exemplars)
-            .expect_err("a bound list over the cap must be rejected");
+        let err = explode_histogram(
+            &ctx,
+            &mut dp,
+            &mut memo,
+            &mut cap,
+            &mut exemplars,
+            &mut tally,
+        )
+        .expect_err("a bound list over the cap must be rejected");
 
         assert_eq!(
             err,
@@ -4851,6 +5282,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -4874,6 +5306,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 3);
@@ -4909,6 +5342,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert_eq!(out.points.len(), 3);
@@ -4981,6 +5415,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5016,6 +5451,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
 
@@ -5053,6 +5489,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &limits,
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5091,6 +5528,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5147,6 +5585,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5178,6 +5617,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5212,6 +5652,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5240,6 +5681,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5270,6 +5712,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
             &mut cap,
         );
@@ -5300,6 +5743,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5333,6 +5777,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5361,6 +5806,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5422,6 +5868,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5447,6 +5894,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5462,6 +5910,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5490,6 +5939,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.points.is_empty());
@@ -5510,6 +5960,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5533,6 +5984,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5551,6 +6003,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -5597,6 +6050,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut c,
         );
@@ -5826,6 +6280,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut c,
         );
@@ -5847,6 +6302,7 @@ mod tests {
             &tenant(),
             request(vec![rm]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
             &mut c,
         );
@@ -5972,6 +6428,7 @@ mod tests {
                 )],
             )]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             MEMO_TS,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6020,6 +6477,7 @@ mod tests {
                 vec![gauge_metric("cpu", points)],
             )]),
             &IngestLimits::default(),
+            &TenantRules::none(),
             MEMO_TS,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6093,8 +6551,8 @@ mod tests {
                 .collect();
             let split = request(vec![resource_metrics(Vec::new(), split_metrics)]);
 
-            let memoised = normalize_metrics(&tenant, grouped, &limits, MEMO_TS);
-            let unmemoised = normalize_metrics(&tenant, split, &limits, MEMO_TS);
+            let memoised = normalize_metrics(&tenant, grouped, &limits, &TenantRules::none(), MEMO_TS);
+            let unmemoised = normalize_metrics(&tenant, split, &limits, &TenantRules::none(), MEMO_TS);
             proptest::prop_assert_eq!(memoised, unmemoised);
         }
     }
@@ -6169,11 +6627,22 @@ mod tests {
         const P: usize = 100;
         let req = wide_gauge_request(P, 1_000, true);
         // `__name__="g"` is 73 bytes, `k=<1000 bytes>` 1065, per point.
-        let projected = crate::project_resolved_label_bytes(&req, &IngestLimits::default()).get();
+        let projected = crate::project_resolved_label_bytes(
+            &req,
+            &IngestLimits::default(),
+            &TenantRules::none(),
+        )
+        .get();
         assert_eq!(projected, P * (73 + 1_065));
 
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits_with_label_bytes(10_000), 1_000_000);
+        let out = normalize_metrics(
+            &tenant(),
+            req,
+            &limits_with_label_bytes(10_000),
+            &TenantRules::none(),
+            1_000_000,
+        );
         let (hits, misses) = memo_stats::snapshot();
         assert_eq!((hits, misses), (0, 0), "no label set may be built");
         assert!(out.points.is_empty());
@@ -6192,6 +6661,7 @@ mod tests {
             &tenant(),
             wide_gauge_request(P, 1_000, true),
             &IngestLimits::default(),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6203,13 +6673,16 @@ mod tests {
         const P: usize = 100;
         let limits = limits_with_label_bytes(10_000);
         let req = wide_gauge_request(P, 1_000, true);
-        assert!(crate::project_resolved_label_bytes(&req, &limits).get() > 10_000);
+        assert!(
+            crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() > 10_000
+        );
 
         let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
         let (result, _) = normalize_metrics_with_metadata_projected(
             &tenant(),
             req,
             &limits,
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
             ProjectedLabelBytes::for_test(0),
@@ -6227,13 +6700,16 @@ mod tests {
         const MAX: usize = 10_000;
         let limits = limits_with_label_bytes(MAX);
         let req = wide_gauge_request(1, 1, false);
-        assert!(crate::project_resolved_label_bytes(&req, &limits).get() <= MAX);
+        assert!(
+            crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get() <= MAX
+        );
 
         let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
         let (result, _) = normalize_metrics_with_metadata_projected(
             &tenant(),
             req,
             &limits,
+            &TenantRules::none(),
             1_000_000,
             &mut cap,
             ProjectedLabelBytes::for_test(MAX + 1),
@@ -6257,18 +6733,28 @@ mod tests {
         for n in [1, 2, 100] {
             let req = wide_gauge_request(n, 1, false);
             assert_eq!(
-                crate::project_resolved_label_bytes(&req, &limits).get(),
+                crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get(),
                 139,
                 "{n}"
             );
         }
         // Two alternating values never share a set: every point counts.
         assert_eq!(
-            crate::project_resolved_label_bytes(&wide_gauge_request(2, 1, true), &limits).get(),
+            crate::project_resolved_label_bytes(
+                &wide_gauge_request(2, 1, true),
+                &limits,
+                &TenantRules::none()
+            )
+            .get(),
             278
         );
         assert_eq!(
-            crate::project_resolved_label_bytes(&wide_gauge_request(100, 1, true), &limits).get(),
+            crate::project_resolved_label_bytes(
+                &wide_gauge_request(100, 1, true),
+                &limits,
+                &TenantRules::none()
+            )
+            .get(),
             100 * 139
         );
 
@@ -6278,6 +6764,7 @@ mod tests {
             &tenant(),
             wide_gauge_request(100, 1, false),
             &limits_with_label_bytes(139),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -6286,6 +6773,7 @@ mod tests {
             &tenant(),
             wide_gauge_request(100, 1, false),
             &limits_with_label_bytes(138),
+            &TenantRules::none(),
             1_000_000,
         );
         assert!(out.points.is_empty());
@@ -6317,7 +6805,7 @@ mod tests {
             )],
         )]);
         assert_eq!(
-            crate::project_resolved_label_bytes(&small, &limits).get(),
+            crate::project_resolved_label_bytes(&small, &limits, &TenantRules::none()).get(),
             1_064
         );
 
@@ -6334,12 +6822,19 @@ mod tests {
                 AggregationTemporality::Cumulative,
             )],
         )]);
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected =
+            crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         assert!(projected >= 163 * 4_065, "{projected}");
 
         let bounded = limits_with_label_bytes(100_000);
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), req.clone(), &bounded, 1_000_000);
+        let out = normalize_metrics(
+            &tenant(),
+            req.clone(),
+            &bounded,
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert_eq!(memo_stats::snapshot(), (0, 0));
         assert!(out.points.is_empty());
         assert_eq!(
@@ -6352,7 +6847,7 @@ mod tests {
         );
 
         // Under the default bound it explodes as before.
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), limits.max_histogram_buckets + 3);
     }
@@ -6380,7 +6875,13 @@ mod tests {
 
         let over = limits.max_summary_quantiles + 1;
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), summary_with(over), &limits, 1_000_000);
+        let out = normalize_metrics(
+            &tenant(),
+            summary_with(over),
+            &limits,
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert_eq!(memo_stats::snapshot(), (0, 0));
         assert!(out.points.is_empty());
         assert_eq!(
@@ -6392,7 +6893,13 @@ mod tests {
         );
 
         let at = limits.max_summary_quantiles;
-        let out = normalize_metrics(&tenant(), summary_with(at), &limits, 1_000_000);
+        let out = normalize_metrics(
+            &tenant(),
+            summary_with(at),
+            &limits,
+            &TenantRules::none(),
+            1_000_000,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), at + 2);
     }
@@ -6558,9 +7065,11 @@ mod tests {
                     resource.clone(),
                     vec![metric.clone()],
                 )]);
-                let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+                let projected =
+                    crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
                 label_capacity_stats::reset();
-                let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+                let out =
+                    normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
                 assert!(out.rejected.is_empty(), "{:?}", out.rejected);
                 let built = built_label_bytes(&out);
                 assert!(
@@ -6577,9 +7086,10 @@ mod tests {
                 .map(|(resource, metrics)| resource_metrics(resource, metrics))
                 .collect(),
         );
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected =
+            crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         label_capacity_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 12 + 6 + 3 * 6 + 3 + 2 * 4 + 3 + 4);
         assert_eq!(out.histogram_points.len(), 4);
@@ -6613,9 +7123,10 @@ mod tests {
                 summary_metric("s", vec![summary_point(vec![], 1_000, 1, 1.0, vec![])]),
             ],
         )]);
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected =
+            crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         label_capacity_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.points.len(), 3 + 2);
         let built = built_label_bytes(&out);
@@ -6694,9 +7205,10 @@ mod tests {
         for metric in every_metric_path(attributes, bounds, quantiles) {
             let name = metric.name.clone();
             let req = request(vec![resource_metrics(resource.to_vec(), vec![metric])]);
-            let projected = crate::project_resolved_label_bytes(&req, limits).get();
+            let projected =
+                crate::project_resolved_label_bytes(&req, limits, &TenantRules::none()).get();
             label_capacity_stats::reset();
-            let out = normalize_metrics(&tenant(), req, limits, 1_000_000);
+            let out = normalize_metrics(&tenant(), req, limits, &TenantRules::none(), 1_000_000);
             let sets = out
                 .points
                 .iter()
@@ -6868,12 +7380,13 @@ mod tests {
             + allowlist.iter().map(|key| label(key.len())).sum::<usize>();
         // Every point builds its own set: the prefix, `__name__="g"` (73) and
         // `k` (66), with nothing shared between alternating neighbours.
-        let projected = crate::project_resolved_label_bytes(&req, &limits).get();
+        let projected =
+            crate::project_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
         assert_eq!(projected, prefix + POINTS * (prefix + 73 + 66));
         assert!(projected > limits.max_resolved_label_bytes_per_request);
 
         memo_stats::reset();
-        let out = normalize_metrics(&tenant(), req, &limits, 1_000_000);
+        let out = normalize_metrics(&tenant(), req, &limits, &TenantRules::none(), 1_000_000);
         assert_eq!(memo_stats::snapshot(), (0, 0), "no label set may be built");
         assert!(out.points.is_empty());
         assert!(out.histogram_points.is_empty());

@@ -44,12 +44,28 @@
 //!
 //! Nothing here panics for malformed or oversized input: every problem becomes
 //! a [`SpanRejection`] so the caller can build an OTLP partial-success response.
+//!
+//! Every entry point takes a [`TenantRules`](ravel_ipcrypt::rules::TenantRules)
+//! (ADR-2993 decision 3), matched by the raw attribute key as sent, same
+//! convention as [`crate::logs_normalize`]. A matching resource, scope, or
+//! span attribute is encrypted in [`convert_attr`] before the value-length
+//! check; a matching string-valued event or link attribute is encrypted in
+//! [`with_encrypted_attrs`] before its blob is encoded and its length checked.
+//! Spans have no stream identity, so there is no identity computation for
+//! either to precede. The rule set is a required argument with no default;
+//! a tenant with no matching rule, or [`TenantRules::none()`], leaves every
+//! value unchanged.
+
+use std::borrow::Cow;
 
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::common::v1::any_value::Value as AnyValueVariant;
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue};
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
+use ravel_ipcrypt::render::RenderOutcome;
+use ravel_ipcrypt::rules::TenantRules;
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_rspan::{StatusCode, merge_attrs};
 
 use crate::label_projection::{ProjectedLabelBytes, exact_capacity};
@@ -119,6 +135,13 @@ pub struct NormalizedSpan {
 pub struct SpanNormalizeOutput {
     pub spans: Vec<NormalizedSpan>,
     pub rejected: Vec<SpanRejection>,
+    /// Per-variant, per-outcome counts of the rule-matched attribute values
+    /// this call stores (ADR-2993 decision 3): a span's own attributes once
+    /// per admitted span, a resource's or scope's once if any span under it is
+    /// admitted, and an event or link blob's only if the blob is kept. A
+    /// rejected span, a dropped attribute, or a dropped blob counts nothing.
+    /// Empty when `rules` matched nothing, including [`TenantRules::none()`].
+    pub ipcrypt_tally: IpcryptTally,
 }
 
 /// Decode and normalize spans from `req`.
@@ -133,20 +156,22 @@ pub struct SpanNormalizeOutput {
 pub fn normalize_traces(
     req: ExportTraceServiceRequest,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
 ) -> SpanNormalizeOutput {
-    let projected = crate::label_projection::project_span_resolved_label_bytes(&req, limits);
-    normalize_traces_projected(req, limits, ingest_ts_ns, projected)
+    let projected = crate::label_projection::project_span_resolved_label_bytes(&req, limits, rules);
+    normalize_traces_projected(req, limits, rules, ingest_ts_ns, projected)
 }
 
 /// [`normalize_traces`] for a caller that already projected `req` with
-/// [`crate::project_span_resolved_label_bytes`] under the same `limits`, so
-/// the request is walked once. `projected` is checked against
+/// [`crate::project_span_resolved_label_bytes`] under the same `limits` and
+/// `rules`, so the request is walked once. `projected` is checked against
 /// `max_resolved_label_bytes_per_request` exactly as the plain entry point
 /// checks its own projection.
 pub fn normalize_traces_projected(
     req: ExportTraceServiceRequest,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     projected: ProjectedLabelBytes,
 ) -> SpanNormalizeOutput {
@@ -158,6 +183,7 @@ pub fn normalize_traces_projected(
                 count: total_spans,
                 max: limits.max_spans_per_request,
             }],
+            ipcrypt_tally: IpcryptTally::new(),
         };
     }
 
@@ -173,28 +199,45 @@ pub fn normalize_traces_projected(
                 max: limits.max_resolved_label_bytes_per_request,
                 count: total_spans,
             }],
+            ipcrypt_tally: IpcryptTally::new(),
         };
     }
 
     let mut spans = Vec::new();
     let mut rejected = Vec::new();
+    let mut tally = IpcryptTally::new();
     for rs in &req.resource_spans {
-        normalize_resource(rs, limits, ingest_ts_ns, &mut spans, &mut rejected);
+        normalize_resource(
+            rs,
+            limits,
+            rules,
+            ingest_ts_ns,
+            &mut spans,
+            &mut rejected,
+            &mut tally,
+        );
     }
 
-    SpanNormalizeOutput { spans, rejected }
+    SpanNormalizeOutput {
+        spans,
+        rejected,
+        ipcrypt_tally: tally,
+    }
 }
 
 fn resource_span_count(rs: &ResourceSpans) -> usize {
     rs.scope_spans.iter().map(|ss| ss.spans.len()).sum()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_resource(
     rs: &ResourceSpans,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     spans: &mut Vec<NormalizedSpan>,
     rejected: &mut Vec<SpanRejection>,
+    tally: &mut IpcryptTally,
 ) {
     let resource_span_count = resource_span_count(rs);
     if resource_span_count == 0 {
@@ -220,20 +263,44 @@ fn normalize_resource(
     // Converted once per resource and reported once, not once per span under
     // it: see the module docs on why an unconvertible resource attribute does
     // not reject the spans the way the logs path does.
-    let resource_attrs = convert_attrs_lossy(resource_attributes, limits, rejected);
+    // Its values count once, and only if a span under it is stored.
+    let mut resource_tally = IpcryptTally::new();
+    let resource_attrs = convert_attrs_lossy(
+        resource_attributes,
+        limits,
+        rules,
+        &mut resource_tally,
+        rejected,
+    );
 
+    let stored_before = spans.len();
     for ss in &rs.scope_spans {
-        normalize_scope(ss, &resource_attrs, limits, ingest_ts_ns, spans, rejected);
+        normalize_scope(
+            ss,
+            &resource_attrs,
+            limits,
+            rules,
+            ingest_ts_ns,
+            spans,
+            rejected,
+            tally,
+        );
+    }
+    if spans.len() > stored_before {
+        tally.merge(&resource_tally);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_scope(
     ss: &ScopeSpans,
     resource_attrs: &[(String, String)],
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
     spans: &mut Vec<NormalizedSpan>,
     rejected: &mut Vec<SpanRejection>,
+    tally: &mut IpcryptTally,
 ) {
     let scope_span_count = ss.spans.len();
     if scope_span_count == 0 {
@@ -253,7 +320,9 @@ fn normalize_scope(
         return;
     }
 
-    let mut scope_attrs = convert_attrs_lossy(scope_attributes, limits, rejected);
+    let mut scope_tally = IpcryptTally::new();
+    let mut scope_attrs =
+        convert_attrs_lossy(scope_attributes, limits, rules, &mut scope_tally, rejected);
     // The instrumentation scope's own name and version are attributes here
     // rather than part of an identity blob (spans have no stream identity), so
     // they follow OTel's own `otel.scope.*` convention. Empty values are not
@@ -270,8 +339,17 @@ fn normalize_scope(
     // at the per-attribute rate, which the pushes above could have outgrown.
     scope_attrs.shrink_to_fit();
 
+    let stored_before = spans.len();
     for span in &ss.spans {
-        match normalize_span(span, resource_attrs, &scope_attrs, limits, ingest_ts_ns) {
+        match normalize_span(
+            span,
+            resource_attrs,
+            &scope_attrs,
+            limits,
+            rules,
+            ingest_ts_ns,
+            tally,
+        ) {
             Ok((normalized, dropped)) => {
                 spans.push(normalized);
                 rejected.extend(dropped);
@@ -279,17 +357,23 @@ fn normalize_scope(
             Err(reason) => rejected.push(reason),
         }
     }
+    if spans.len() > stored_before {
+        tally.merge(&scope_tally);
+    }
 }
 
 /// Normalize one span. `Err` drops the whole span; `Ok`'s second element
 /// carries rejections for attributes (or blobs) dropped from an otherwise
 /// admitted span.
+#[allow(clippy::too_many_arguments)]
 fn normalize_span(
     span: &Span,
     resource_attrs: &[(String, String)],
     scope_attrs: &[(String, String)],
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     ingest_ts_ns: i64,
+    tally: &mut IpcryptTally,
 ) -> Result<(NormalizedSpan, Vec<SpanRejection>), SpanRejection> {
     if span.attributes.len() > limits.max_attributes_per_span {
         return Err(SpanRejection::TooManyAttributes {
@@ -367,7 +451,7 @@ fn normalize_span(
         }
     };
 
-    let span_attrs = convert_attrs_lossy(&span.attributes, limits, &mut dropped);
+    let span_attrs = convert_attrs_lossy(&span.attributes, limits, rules, tally, &mut dropped);
     let mut merged = merge_attrs(resource_attrs, scope_attrs, &span_attrs);
     // A sender's own attribute under one of the reserved keys must never
     // survive, whether or not the span's real field is present: leaving it
@@ -375,7 +459,7 @@ fn normalize_span(
     // RSPAN objects are immutable, so the provenance is unrecoverable once
     // stored. Strip unconditionally before applying the real reserved values.
     merged.retain(|(k, _)| !is_reserved_key(k));
-    let reserved = reserved_attrs(span, limits, &mut dropped);
+    let reserved = reserved_attrs(span, limits, rules, tally, &mut dropped);
     // Reserved keys are applied as the highest-precedence set, so a sender's
     // own `_kind` cannot shadow the span's real kind.
     let attrs = if reserved.is_empty() {
@@ -402,10 +486,13 @@ fn normalize_span(
 
 /// The attributes carrying span fields RSPAN v1 has no column for (see the
 /// module docs). Only non-default values are stored, so an ordinary span pays
-/// nothing for fields it never set.
+/// nothing for fields it never set. Event and link attributes are encrypted
+/// under `rules` before their blob is encoded and its length checked.
 fn reserved_attrs(
     span: &Span,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     dropped: &mut Vec<SpanRejection>,
 ) -> Vec<(String, String)> {
     let mut out = Vec::new();
@@ -418,9 +505,16 @@ fn reserved_attrs(
     if span.flags != 0 {
         out.push((ATTR_SPAN_FLAGS.to_string(), span.flags.to_string()));
     }
+    // A blob's values count only if the blob is kept.
     if !span.events.is_empty() {
-        match encode_blob(&span.events, limits.max_raw_blob_len) {
-            Ok(hex) => out.push((ATTR_EVENTS_RAW.to_string(), hex)),
+        let mut blob_tally = IpcryptTally::new();
+        let events =
+            with_encrypted_attrs(&span.events, rules, &mut blob_tally, |e| &mut e.attributes);
+        match encode_blob(&events, limits.max_raw_blob_len) {
+            Ok(hex) => {
+                tally.merge(&blob_tally);
+                out.push((ATTR_EVENTS_RAW.to_string(), hex));
+            }
             Err(len) => dropped.push(SpanRejection::EventsBlobTooLong {
                 len,
                 max: limits.max_raw_blob_len,
@@ -428,8 +522,14 @@ fn reserved_attrs(
         }
     }
     if !span.links.is_empty() {
-        match encode_blob(&span.links, limits.max_raw_blob_len) {
-            Ok(hex) => out.push((ATTR_LINKS_RAW.to_string(), hex)),
+        let mut blob_tally = IpcryptTally::new();
+        let links =
+            with_encrypted_attrs(&span.links, rules, &mut blob_tally, |l| &mut l.attributes);
+        match encode_blob(&links, limits.max_raw_blob_len) {
+            Ok(hex) => {
+                tally.merge(&blob_tally);
+                out.push((ATTR_LINKS_RAW.to_string(), hex));
+            }
             Err(len) => dropped.push(SpanRejection::LinksBlobTooLong {
                 len,
                 max: limits.max_raw_blob_len,
@@ -437,6 +537,44 @@ fn reserved_attrs(
         }
     }
     out
+}
+
+/// `items` with every attribute `rules` matches by raw key encrypted, borrowed
+/// unchanged when the rule set is empty. Event and link attributes stay
+/// `AnyValue`s inside the blob, so only a non-empty string value is
+/// encrypted; any other value under a rule is left unchanged and counted as
+/// [`RenderOutcome::Unparsed`], as the logs path does.
+fn with_encrypted_attrs<'a, T: Clone>(
+    items: &'a [T],
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    attributes: fn(&mut T) -> &mut Vec<KeyValue>,
+) -> Cow<'a, [T]> {
+    if rules.is_empty() {
+        return Cow::Borrowed(items);
+    }
+    let mut owned = items.to_vec();
+    for item in &mut owned {
+        for kv in attributes(item).iter_mut() {
+            let Some(info) = rules.lookup_raw(&kv.key) else {
+                continue;
+            };
+            match kv.value.as_mut().and_then(|v| v.value.as_mut()) {
+                None => {}
+                Some(AnyValueVariant::StringValue(s)) => {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    if let Some((rendered, outcome)) = rules.apply(info.raw_key, s) {
+                        tally.record(info.variant, outcome);
+                        *s = rendered;
+                    }
+                }
+                Some(_) => tally.record(info.variant, RenderOutcome::Unparsed),
+            }
+        }
+    }
+    Cow::Owned(owned)
 }
 
 /// Serialize `items` as concatenated length-delimited protobuf messages and
@@ -555,11 +693,13 @@ fn checked_span_interval(
 fn convert_attrs_lossy(
     attributes: &[KeyValue],
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
     rejected: &mut Vec<SpanRejection>,
 ) -> Vec<(String, String)> {
     let mut out = Vec::with_capacity(attributes.len());
     for kv in attributes {
-        match convert_attr(kv, limits) {
+        match convert_attr(kv, limits, rules, tally) {
             Ok(attr) => out.push(attr),
             Err(reason) => rejected.push(reason),
         }
@@ -567,9 +707,36 @@ fn convert_attrs_lossy(
     out
 }
 
+/// Encrypt `value` in place when `rules` matches `key` by raw key (ADR-2993
+/// decision 1: traces match attributes as sent, unlike metrics' sanitized
+/// label names). Runs before the value-length check in [`convert_attr`] so
+/// limits see the stored (possibly encrypted) length, per decision 3.
+fn apply_ipcrypt(
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
+    key: &str,
+    value: String,
+) -> String {
+    if value.is_empty() {
+        return value;
+    }
+    let Some(info) = rules.lookup_raw(key) else {
+        return value;
+    };
+    let Some((rendered, outcome)) = rules.apply(info.raw_key, &value) else {
+        return value;
+    };
+    tally.record(info.variant, outcome);
+    rendered
+}
+
+/// Convert one attribute. `tally` gets its rule-matched value only on `Ok`:
+/// a dropped attribute stores nothing and counts nothing.
 fn convert_attr(
     kv: &KeyValue,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
+    tally: &mut IpcryptTally,
 ) -> Result<(String, String), SpanRejection> {
     if kv.key.len() > limits.max_attribute_key_len {
         return Err(SpanRejection::AttributeKeyTooLong {
@@ -578,12 +745,15 @@ fn convert_attr(
         });
     }
     let value = convert_value(&kv.key, kv.value.as_ref())?;
+    let mut attr_tally = IpcryptTally::new();
+    let value = apply_ipcrypt(rules, &mut attr_tally, &kv.key, value);
     if value.len() > limits.max_attribute_value_len {
         return Err(SpanRejection::AttributeValueTooLong {
             len: value.len(),
             max: limits.max_attribute_value_len,
         });
     }
+    tally.merge(&attr_tally);
     Ok((exact_capacity(kv.key.clone()), exact_capacity(value)))
 }
 
@@ -686,7 +856,12 @@ mod tests {
     }
 
     fn normalize(req: ExportTraceServiceRequest) -> SpanNormalizeOutput {
-        normalize_traces(req, &SpanIngestLimits::default(), 5_000)
+        normalize_traces(
+            req,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+            5_000,
+        )
     }
 
     fn lookup<'a>(attrs: &'a [(String, String)], key: &str) -> Option<&'a str> {
@@ -871,6 +1046,7 @@ mod tests {
         let out = normalize_traces(
             one_span_over(INGEST_TS as u64, end as u64),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.spans.is_empty());
@@ -901,6 +1077,7 @@ mod tests {
         let out = normalize_traces(
             one_span_over(start as u64, INGEST_TS as u64),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
@@ -918,7 +1095,12 @@ mod tests {
         // Start earlier still, so the interval is well-ordered; only the end's
         // lag matters now.
         let start = end - 1_000;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, end as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -936,7 +1118,12 @@ mod tests {
         let limits = SpanIngestLimits::default();
         let start = INGEST_TS - limits.max_ingest_lag_ns;
         let end = INGEST_TS + limits.max_future_skew_ns;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, end as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), 1);
         assert_eq!(out.spans[0].start_ts_ns, start);
@@ -950,7 +1137,12 @@ mod tests {
         let limits = SpanIngestLimits::default();
         let end = INGEST_TS - limits.max_ingest_lag_ns;
         let start = end - 5_000;
-        let out = normalize_traces(one_span_over(start as u64, end as u64), &limits, INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, end as u64),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), 1);
     }
@@ -962,7 +1154,12 @@ mod tests {
     fn future_skewed_start_with_zero_end_is_rejected_through_the_fallback() {
         let limits = SpanIngestLimits::default();
         let start = INGEST_TS + limits.max_future_skew_ns + 1;
-        let out = normalize_traces(one_span_over(start as u64, 0), &limits, INGEST_TS);
+        let out = normalize_traces(
+            one_span_over(start as u64, 0),
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS,
+        );
         assert!(out.spans.is_empty());
         assert!(
             matches!(out.rejected.as_slice(), [SpanRejection::FutureSkew { .. }]),
@@ -980,6 +1177,7 @@ mod tests {
         let out = normalize_traces(
             one_span_over(start as u64, (start - 1) as u64),
             &limits,
+            &TenantRules::none(),
             INGEST_TS,
         );
         assert!(out.spans.is_empty());
@@ -1007,7 +1205,7 @@ mod tests {
         ) {
             let limits = SpanIngestLimits::default();
             let ingest_ts = INGEST_TS + offset_ns;
-            let out = normalize_traces(one_span_over(start_ns, end_ns), &limits, ingest_ts);
+            let out = normalize_traces(one_span_over(start_ns, end_ns), &limits, &TenantRules::none(), ingest_ts);
             let start = i64::try_from(start_ns).unwrap_or(i64::MAX);
             let end = i64::try_from(end_ns).unwrap_or(i64::MAX);
             if end < start {
@@ -1112,6 +1310,7 @@ mod tests {
                 vec![scope_spans("lib", "1", vec![s])],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert_eq!(out.spans.len(), 1, "the span itself is still admitted");
@@ -1388,6 +1587,7 @@ mod tests {
                 vec![scope_spans("lib", "1", spans)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1419,6 +1619,7 @@ mod tests {
                 )],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1440,6 +1641,7 @@ mod tests {
                 vec![scope_spans("lib", "1", vec![span("toolong", 1, 2, vec![])])],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1466,6 +1668,7 @@ mod tests {
                 vec![scope_spans("lib", "1", vec![s])],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1488,6 +1691,7 @@ mod tests {
                 vec![scope_spans("lib", "1", spans)],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert!(out.spans.is_empty());
@@ -1524,6 +1728,7 @@ mod tests {
                 ],
             )]),
             &limits,
+            &TenantRules::none(),
             5_000,
         );
         assert_eq!(out.spans.len(), 1);
@@ -1570,15 +1775,19 @@ mod tests {
         // `svc=<1000 bytes>` is 1067; `otel.scope.name="lib"` 82 and
         // `otel.scope.version="1"` 83. Each span inherits 1232.
         let req = wide_resource_request(N, 1_000);
-        let projected =
-            crate::project_span_resolved_label_bytes(&req, &SpanIngestLimits::default()).get();
+        let projected = crate::project_span_resolved_label_bytes(
+            &req,
+            &SpanIngestLimits::default(),
+            &TenantRules::none(),
+        )
+        .get();
         assert_eq!(projected, 1_067 + 165 + 1_232 * N);
 
         let limits = SpanIngestLimits {
             max_resolved_label_bytes_per_request: 10_000,
             ..SpanIngestLimits::default()
         };
-        let out = normalize_traces(req, &limits, 5_000);
+        let out = normalize_traces(req, &limits, &TenantRules::none(), 5_000);
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -1604,9 +1813,18 @@ mod tests {
             ..SpanIngestLimits::default()
         };
         let req = wide_resource_request(N, 1_000);
-        assert!(crate::project_span_resolved_label_bytes(&req, &limits).get() > 10_000);
+        assert!(
+            crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get()
+                > 10_000
+        );
 
-        let out = normalize_traces_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(0));
+        let out = normalize_traces_projected(
+            req,
+            &limits,
+            &TenantRules::none(),
+            5_000,
+            ProjectedLabelBytes::for_test(0),
+        );
         assert!(out.rejected.is_empty(), "{:?}", out.rejected);
         assert_eq!(out.spans.len(), N);
     }
@@ -1619,10 +1837,18 @@ mod tests {
             ..SpanIngestLimits::default()
         };
         let req = wide_resource_request(1, 1);
-        assert!(crate::project_span_resolved_label_bytes(&req, &limits).get() <= MAX);
+        assert!(
+            crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get()
+                <= MAX
+        );
 
-        let out =
-            normalize_traces_projected(req, &limits, 5_000, ProjectedLabelBytes::for_test(MAX + 1));
+        let out = normalize_traces_projected(
+            req,
+            &limits,
+            &TenantRules::none(),
+            5_000,
+            ProjectedLabelBytes::for_test(MAX + 1),
+        );
         assert!(out.spans.is_empty());
         assert_eq!(
             out.rejected,
@@ -1697,8 +1923,9 @@ mod tests {
             resource_spans(vec![], vec![scope_spans("other", "", spans(3_000))]),
         ]);
         let limits = SpanIngestLimits::default();
-        let projected = crate::project_span_resolved_label_bytes(&req, &limits).get();
-        let out = normalize_traces(req, &limits, 5_000);
+        let projected =
+            crate::project_span_resolved_label_bytes(&req, &limits, &TenantRules::none()).get();
+        let out = normalize_traces(req, &limits, &TenantRules::none(), 5_000);
         // Array and kvlist values are dropped with a notice, not the span.
         assert!(
             out.rejected
@@ -1747,9 +1974,11 @@ mod tests {
                 )],
             )])
         };
-        let per_span = crate::project_span_resolved_label_bytes(&req(2), &limits).get()
-            - crate::project_span_resolved_label_bytes(&req(1), &limits).get();
-        let out = normalize_traces(req(1), &limits, 5_000);
+        let per_span =
+            crate::project_span_resolved_label_bytes(&req(2), &limits, &TenantRules::none()).get()
+                - crate::project_span_resolved_label_bytes(&req(1), &limits, &TenantRules::none())
+                    .get();
+        let out = normalize_traces(req(1), &limits, &TenantRules::none(), 5_000);
         for s in &out.spans {
             for (k, v) in &s.attrs {
                 proptest::prop_assert_eq!(k.capacity(), k.len(), "{:?}", k);

@@ -141,7 +141,13 @@ mod otlp_series_identity_parity {
     /// asserted empty: a normalize that rejected everything would
     /// otherwise "match" a loader that produced nothing.
     fn otlp_series_ids(data: MetricData) -> Vec<SeriesId> {
-        let out = normalize_metrics(&tenant(), request(data), &IngestLimits::default(), NOW_NS);
+        let out = normalize_metrics(
+            &tenant(),
+            request(data),
+            &IngestLimits::default(),
+            &ravel_ipcrypt::rules::TenantRules::none(),
+            NOW_NS,
+        );
         assert!(
             out.rejected.is_empty(),
             "the OTLP fixture must be admitted whole, got {:?}",

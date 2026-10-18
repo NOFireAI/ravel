@@ -18,6 +18,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use prost::Message;
 
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
 };
@@ -224,7 +225,13 @@ fn measure_otlp(points: &[GenPoint]) -> f64 {
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         let decoded = ExportMetricsServiceRequest::decode(bytes.as_slice()).expect("decode proto");
-        let out = normalize_metrics(&tenant, decoded, &limits, INGEST_TS_NS);
+        let out = normalize_metrics(
+            &tenant,
+            decoded,
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS_NS,
+        );
         std::hint::black_box(&out);
     }
     let elapsed = start.elapsed();
@@ -241,7 +248,13 @@ fn measure_otap(points: &[GenPoint]) -> f64 {
     for _ in 0..ITERATIONS {
         let mut state = StreamState::new(StreamConfig::default());
         let decoded = state.decode(raw_batch.clone()).expect("decode otap batch");
-        let out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+        let out = normalize_decoded(
+            &tenant,
+            &decoded,
+            &limits,
+            &TenantRules::none(),
+            INGEST_TS_NS,
+        );
         std::hint::black_box(&out);
     }
     let elapsed = start.elapsed();

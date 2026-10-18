@@ -27,6 +27,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     metric::Data as MetricData,
 };
 
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
 };
@@ -44,13 +45,13 @@ fn otap_reject(metrics: Vec<MetricRow>) -> NormalizeOutput {
     let batch = enc.encode_batch(0, &metrics).expect("encode");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(batch).expect("decode");
-    normalize_decoded(&tenant, &decoded, &limits, TS)
+    normalize_decoded(&tenant, &decoded, &limits, &TenantRules::none(), TS)
 }
 
 fn otlp_reject(req: ExportMetricsServiceRequest) -> NormalizeOutput {
     let tenant = TenantId::new("acme");
     let limits = IngestLimits::default();
-    normalize_metrics(&tenant, req, &limits, TS)
+    normalize_metrics(&tenant, req, &limits, &TenantRules::none(), TS)
 }
 
 /// A delta Sum with an empty metric name. OTLP checks the name before

@@ -50,6 +50,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric::Data as MetricData,
 };
 use prost::Message;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
 };
@@ -178,7 +179,7 @@ fn build_otap_batch(card: Cardinality) -> BatchArrowRecords {
 /// count (the denominator for per-point figures and a cross-path check).
 fn otlp_wire_to_normalized(bytes: &[u8], tenant: &TenantId, limits: &IngestLimits) -> usize {
     let req = ExportMetricsServiceRequest::decode(bytes).expect("decode OTLP request");
-    let out = normalize_metrics(tenant, req, limits, INGEST_TS_NS);
+    let out = normalize_metrics(tenant, req, limits, &TenantRules::none(), INGEST_TS_NS);
     out.points.len()
 }
 
@@ -188,7 +189,7 @@ fn otap_wire_to_normalized(bytes: &[u8], tenant: &TenantId, limits: &IngestLimit
     let batch = BatchArrowRecords::decode(bytes).expect("decode OTAP envelope");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(batch).expect("Arrow IPC decode");
-    let out = normalize_decoded(tenant, &decoded, limits, INGEST_TS_NS);
+    let out = normalize_decoded(tenant, &decoded, limits, &TenantRules::none(), INGEST_TS_NS);
     out.points.len()
 }
 

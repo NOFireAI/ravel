@@ -23,6 +23,7 @@ use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use proptest::prelude::*;
 
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, ExemplarRow, ExemplarValue, HistogramMetricRow,
     HistogramPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
@@ -105,6 +106,7 @@ fn normalize_ext(
         &tenant(),
         &decoded,
         &IngestLimits::default(),
+        &TenantRules::none(),
         INGEST_TS_NS,
         cap,
     )
@@ -425,7 +427,13 @@ fn the_legacy_entry_point_counts_every_exemplar_it_drops() {
         .expect("encode batch");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw).expect("decode batch");
-    let out = normalize_decoded(&tenant(), &decoded, &IngestLimits::default(), INGEST_TS_NS);
+    let out = normalize_decoded(
+        &tenant(),
+        &decoded,
+        &IngestLimits::default(),
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
 
     // FINDING 3: two same-window exemplars, one turned away by the cap and one
     // admitted-then-discarded (this entry point has nowhere to store it). Both
@@ -452,7 +460,13 @@ fn one_admitted_then_discarded_exemplar_is_counted_as_dropped() {
         .expect("encode batch");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw).expect("decode batch");
-    let out = normalize_decoded(&tenant(), &decoded, &IngestLimits::default(), INGEST_TS_NS);
+    let out = normalize_decoded(
+        &tenant(),
+        &decoded,
+        &IngestLimits::default(),
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
 
     let total: usize = dropped_counts(&out.rejected).iter().sum();
     assert_eq!(total, 1);
@@ -585,6 +599,7 @@ fn normalize_custom(
         &tenant(),
         &decoded,
         &IngestLimits::default(),
+        &TenantRules::none(),
         INGEST_TS_NS,
         cap,
     )
@@ -1129,7 +1144,13 @@ fn the_legacy_entry_point_counts_discarded_number_exemplars() {
         .expect("encode batch");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw).expect("decode batch");
-    let out = normalize_decoded(&tenant(), &decoded, &IngestLimits::default(), INGEST_TS_NS);
+    let out = normalize_decoded(
+        &tenant(),
+        &decoded,
+        &IngestLimits::default(),
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
 
     // One turned away by the cap, one admitted then discarded. Both dropped,
     // both counted.
@@ -1310,8 +1331,14 @@ fn a_whole_request_rejection_counts_exp_histogram_exemplar_rows() {
         ..IngestLimits::default()
     };
 
-    let result =
-        normalize_decoded_with_exemplars(&tenant(), &decoded, &limits, INGEST_TS_NS, &mut cap);
+    let result = normalize_decoded_with_exemplars(
+        &tenant(),
+        &decoded,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+        &mut cap,
+    );
 
     assert!(
         result.output.points.is_empty(),

@@ -9,6 +9,9 @@ description = "OTAP (OpenTelemetry Arrow) ingest: gRPC stream state, Arrow IPC d
 [dependencies]
 ravel-types = { workspace = true }
 ravel-otlp = { workspace = true }
+# Per-tenant IPCrypt rule set applied inside normalization (ADR-2993 decision
+# 3, issue #3047).
+ravel-ipcrypt = { workspace = true }
 # The ADR-1702 write gate a payload's zstd decompression runs on.
 ravel-cpu-gate = { workspace = true }
 arrow = { workspace = true }

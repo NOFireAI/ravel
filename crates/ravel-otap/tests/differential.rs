@@ -31,6 +31,9 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use proptest::prelude::*;
 
+use ravel_ipcrypt::policy::{Variant, parse_policy_file};
+use ravel_ipcrypt::render::RenderOutcome;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, ExemplarRow, ExemplarValue, HistogramMetricRow,
     HistogramPointRow, MetricKind, MetricRow, MetricsStreamEncoder, ResourceAssignment,
@@ -44,9 +47,9 @@ use ravel_otap::normalize::{
 };
 use ravel_otap::proto::experimental::arrow::v1::{ArrowPayloadType, BatchArrowRecords};
 use ravel_otap::stream::{DecodedBatch, StreamConfig, StreamState};
-use ravel_otlp::normalize::normalize_metrics_with_exemplars;
+use ravel_otlp::normalize::{normalize_metrics_with_exemplars, sanitize_label_name};
 use ravel_otlp::{IngestLimits, NormalizeOutput, Rejection, normalize_metrics};
-use ravel_types::{ExemplarCap, SeriesId, TenantId};
+use ravel_types::{ExemplarCap, SeriesId, TenantHash, TenantId};
 
 const INGEST_TS_NS: i64 = 1_700_000_000_000_000_000;
 
@@ -356,19 +359,35 @@ fn rejection_multiset(rejected: &[Rejection]) -> BTreeMap<String, usize> {
     m
 }
 
-/// Run `workload` through both paths and assert they agree.
+/// Run `workload` through the OTLP path and the OTAP path under `rules`,
+/// returning `(otlp, otap)`.
 #[allow(clippy::expect_used)]
-fn assert_paths_agree(workload: &[WorkloadMetric]) {
+fn normalize_both(
+    workload: &[WorkloadMetric],
+    rules: &TenantRules,
+) -> (NormalizeOutput, NormalizeOutput) {
     let tenant = TenantId::new("acme");
     let limits = IngestLimits::default();
 
-    let otlp_out = normalize_metrics(&tenant, build_otlp_request(workload), &limits, INGEST_TS_NS);
+    let otlp_out = normalize_metrics(
+        &tenant,
+        build_otlp_request(workload),
+        &limits,
+        rules,
+        INGEST_TS_NS,
+    );
 
     let mut encoder = MetricsStreamEncoder::new("differential").expect("new encoder");
     let raw_batch = build_otap_batch(workload, &mut encoder, 0);
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode otap batch");
-    let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+    let otap_out = normalize_decoded(&tenant, &decoded, &limits, rules, INGEST_TS_NS);
+    (otlp_out, otap_out)
+}
+
+/// Run `workload` through both paths and assert they agree.
+fn assert_paths_agree(workload: &[WorkloadMetric]) {
+    let (otlp_out, otap_out) = normalize_both(workload, &TenantRules::none());
 
     assert_eq!(
         series_ids(&otlp_out),
@@ -470,6 +489,103 @@ fn duplicate_label_names_after_sanitization_agree() {
     }]);
 }
 
+/// The two paths store the same labels and count the same IPCrypt tally
+/// under a non-empty rule set: an address (encrypted), a hostname and an
+/// integer (both unparsed, kept as sent), a repeat of the address point
+/// (served from the memo on OTLP and from the group cache on OTAP), and a
+/// point rejected by a sanitized-name collision after its ruled value was
+/// rendered.
+#[test]
+fn ipcrypt_rules_store_the_same_labels_and_tally_on_both_paths() {
+    let sanitize = |key: &str| sanitize_label_name(key.to_string());
+    let policy = parse_policy_file(
+        "[defaults]\nrules = [{ key = \"client.ip\", variant = \"deterministic\" }]\n",
+        sanitize,
+    )
+    .expect("policy parses");
+    let rules = TenantRules::resolve(
+        &policy,
+        "acme",
+        &TenantHash([9u8; 16]),
+        &[7u8; 32],
+        sanitize,
+    )
+    .expect("rules resolve");
+
+    let ruled = |value: WorkloadValue| WorkloadAttr {
+        key: "client.ip".to_string(),
+        value,
+    };
+    let point = |ts_offset_ns: i64, attrs: Vec<WorkloadAttr>| WorkloadPoint {
+        ts_offset_ns,
+        value: 1.0,
+        flags: 0,
+        attrs,
+    };
+    let address = || ruled(WorkloadValue::Str("192.0.2.1".to_string()));
+    let collision = WorkloadAttr {
+        key: "client_ip".to_string(),
+        value: WorkloadValue::Str("192.0.2.9".to_string()),
+    };
+    let workload = [WorkloadMetric {
+        name: "requests".to_string(),
+        unit: String::new(),
+        kind: WorkloadKind::Gauge,
+        points: vec![
+            point(0, vec![address()]),
+            point(1, vec![address()]),
+            point(
+                0,
+                vec![ruled(WorkloadValue::Str("db.example.internal".to_string()))],
+            ),
+            point(0, vec![ruled(WorkloadValue::Int(42))]),
+            point(0, vec![address(), collision]),
+        ],
+    }];
+
+    let (otlp_out, otap_out) = normalize_both(&workload, &rules);
+    let stored = |out: &NormalizeOutput| -> BTreeSet<(SeriesId, Vec<(String, String)>)> {
+        out.points
+            .iter()
+            .map(|p| {
+                let labels = p
+                    .labels
+                    .iter()
+                    .map(|l| (l.name.clone(), l.value.clone()))
+                    .collect();
+                (p.series_id, labels)
+            })
+            .collect()
+    };
+    assert_eq!(otlp_out.points.len(), 4);
+    assert_eq!(stored(&otlp_out), stored(&otap_out), "stored labels differ");
+    assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected),
+        "rejection classes differ"
+    );
+    let stored_values: BTreeSet<String> = otlp_out
+        .points
+        .iter()
+        .filter_map(|p| p.labels.get("client_ip").map(str::to_string))
+        .collect();
+    assert!(!stored_values.contains("192.0.2.1"), "{stored_values:?}");
+    assert!(stored_values.contains("db.example.internal"));
+    assert!(stored_values.contains("42"));
+
+    assert_eq!(otlp_out.ipcrypt_tally, otap_out.ipcrypt_tally);
+    let tally = &otlp_out.ipcrypt_tally;
+    assert_eq!(
+        tally.count(Variant::Deterministic, RenderOutcome::Encrypted),
+        2
+    );
+    assert_eq!(
+        tally.count(Variant::Deterministic, RenderOutcome::Unparsed),
+        2
+    );
+}
+
 /// A gauge point flagged `NoRecordedValue` is stored as the Prometheus stale
 /// marker on both paths, matching `histogram_stale_marker_agrees`/
 /// `summary_stale_marker_agrees`: `ravel_otlp::build_point` never consults
@@ -524,7 +640,13 @@ fn complex_attribute_value_rejected_on_both_paths() {
             ..Default::default()
         }],
     };
-    let otlp_out = normalize_metrics(&tenant, otlp_req, &limits, INGEST_TS_NS);
+    let otlp_out = normalize_metrics(
+        &tenant,
+        otlp_req,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
     assert!(otlp_out.points.is_empty());
     assert_eq!(otlp_out.rejected, vec![Rejection::ComplexAttributeValue]);
 
@@ -546,7 +668,13 @@ fn complex_attribute_value_rejected_on_both_paths() {
     let raw_batch = encoder.encode_batch(0, &metrics).expect("encode");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode");
-    let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+    let otap_out = normalize_decoded(
+        &tenant,
+        &decoded,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
     assert!(otap_out.points.is_empty());
     assert_eq!(otap_out.rejected, vec![Rejection::ComplexAttributeValue]);
 }
@@ -593,7 +721,13 @@ fn complex_attribute_type_slots_round_trip_rejected() {
     let raw_batch = encoder.encode_batch(0, &metrics).expect("encode");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode");
-    let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+    let otap_out = normalize_decoded(
+        &tenant,
+        &decoded,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
 
     assert!(otap_out.points.is_empty());
     assert_eq!(
@@ -633,7 +767,13 @@ fn delta_sum_rejected_on_both_paths() {
             ..Default::default()
         }],
     };
-    let otlp_out = normalize_metrics(&tenant, otlp_req, &limits, INGEST_TS_NS);
+    let otlp_out = normalize_metrics(
+        &tenant,
+        otlp_req,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
     assert!(otlp_out.points.is_empty());
     assert_eq!(
         otlp_out.rejected,
@@ -658,7 +798,13 @@ fn delta_sum_rejected_on_both_paths() {
     let raw_batch = encoder.encode_batch(0, &metrics).expect("encode");
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode");
-    let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+    let otap_out = normalize_decoded(
+        &tenant,
+        &decoded,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
     assert!(otap_out.points.is_empty());
     assert_eq!(
         otap_out.rejected,
@@ -1046,6 +1192,7 @@ fn assert_histogram_paths_agree_with_limits(
         &tenant,
         build_otlp_histogram_request(workload),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
 
@@ -1053,7 +1200,13 @@ fn assert_histogram_paths_agree_with_limits(
     let raw_batch = build_otap_histogram_batch(workload, &mut encoder, 0);
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode otap batch");
-    let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+    let otap_out = normalize_decoded(
+        &tenant,
+        &decoded,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
 
     assert_eq!(
         series_ids(&otlp_out),
@@ -1075,6 +1228,7 @@ fn assert_histogram_paths_agree_with_limits(
         &tenant,
         build_otlp_histogram_request(workload),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
         &mut ExemplarCap::new(limits.exemplar_cap_window_ns),
     );
@@ -1082,6 +1236,7 @@ fn assert_histogram_paths_agree_with_limits(
         &tenant,
         &decoded,
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
         &mut ExemplarCap::new(limits.exemplar_cap_window_ns),
     );
@@ -1107,6 +1262,7 @@ fn assert_summary_paths_agree(workload: &[WorkloadSummaryMetric]) {
         &tenant,
         build_otlp_summary_request(workload),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
 
@@ -1114,7 +1270,13 @@ fn assert_summary_paths_agree(workload: &[WorkloadSummaryMetric]) {
     let raw_batch = build_otap_summary_batch(workload, &mut encoder, 0);
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode otap batch");
-    let otap_out = normalize_decoded(&tenant, &decoded, &limits, INGEST_TS_NS);
+    let otap_out = normalize_decoded(
+        &tenant,
+        &decoded,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
 
     assert_eq!(
         series_ids(&otlp_out),
@@ -1344,7 +1506,13 @@ fn otap_histogram_normalize(
     let raw_batch = build_otap_histogram_batch(workload, &mut encoder, 0);
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode otap batch");
-    normalize_decoded(&tenant, &decoded, limits, INGEST_TS_NS)
+    normalize_decoded(
+        &tenant,
+        &decoded,
+        limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    )
 }
 
 /// A single classic histogram whose bound list is one over `max_histogram_buckets`
@@ -1662,6 +1830,7 @@ fn histogram_bucket_shape_identity_vector_agrees() {
         &tenant,
         build_otlp_histogram_request(&workload),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert!(otlp_out.rejected.is_empty());
@@ -1728,6 +1897,7 @@ fn decode_with_custom_number_dp(metric_name: &str, dp_batch: RecordBatch) -> Nor
         &TenantId::new("acme"),
         &decoded,
         &IngestLimits::default(),
+        &TenantRules::none(),
         INGEST_TS_NS,
     )
 }
@@ -1802,6 +1972,7 @@ fn number_data_point_int_value_only_column_decodes() {
             }],
         ),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
@@ -1871,6 +2042,7 @@ fn number_data_point_null_double_value_falls_back_to_int_value() {
             ],
         ),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
@@ -1914,6 +2086,7 @@ fn decode_custom_batch(payloads: Vec<(ArrowPayloadType, RecordBatch)>) -> Normal
         &TenantId::new("acme"),
         &decoded,
         &IngestLimits::default(),
+        &TenantRules::none(),
         INGEST_TS_NS,
     )
 }
@@ -2071,6 +2244,7 @@ fn assert_number_dp_id_and_parent_id_scenario_agrees(
             ],
         ),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
@@ -2133,6 +2307,7 @@ fn assert_univariate_metrics_id_scenario_agrees(root_id_encoding: Option<&str>) 
             ],
         ),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
@@ -2596,6 +2771,7 @@ fn quasi_delta_attrs_alongside_delta_ids_in_one_batch() {
             ],
         ),
         &limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert_eq!(samples(&otlp_out), samples(&otap_out), "samples differ");
@@ -2927,13 +3103,20 @@ fn assert_resource_paths_agree(
         &tenant,
         build_otlp_resource_request(workload),
         limits,
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     let mut encoder = MetricsStreamEncoder::new("differential-resource").expect("new encoder");
     let raw_batch = build_otap_resource_batch(workload, &mut encoder);
     let mut state = StreamState::new(StreamConfig::default());
     let decoded = state.decode(raw_batch).expect("decode otap batch");
-    let otap_out = normalize_decoded(&tenant, &decoded, limits, INGEST_TS_NS);
+    let otap_out = normalize_decoded(
+        &tenant,
+        &decoded,
+        limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+    );
 
     assert_eq!(
         series_ids(&otlp_out),

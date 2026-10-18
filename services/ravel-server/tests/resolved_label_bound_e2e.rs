@@ -36,6 +36,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use opentelemetry_proto::tonic::trace::v1::{ResourceSpans, ScopeSpans, Span};
 use prost::Message;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
 use ravel_server::{FoldTaskConfig, IngestByteBudgetLimit, Mode, ServerConfig};
@@ -420,9 +421,12 @@ async fn stored_data_keys(store: &Arc<dyn ObjectStoreBackend>) -> Vec<String> {
 #[tokio::test]
 async fn metrics_over_the_bound_are_rejected_whole_and_counted() {
     let request = exploding_histogram_request();
-    let projected =
-        ravel_otlp::project_resolved_label_bytes(&request, &ravel_otlp::IngestLimits::default())
-            .get();
+    let projected = ravel_otlp::project_resolved_label_bytes(
+        &request,
+        &ravel_otlp::IngestLimits::default(),
+        &TenantRules::none(),
+    )
+    .get();
     assert!(
         projected > ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
         "fixture must project past the default bound: {projected}"
@@ -460,6 +464,7 @@ async fn logs_over_the_bound_are_rejected_whole_and_counted() {
     let projected = ravel_otlp::project_log_resolved_label_bytes(
         &request,
         &ravel_otlp::LogIngestLimits::default(),
+        &TenantRules::none(),
     )
     .get();
     assert!(
@@ -493,6 +498,7 @@ async fn traces_over_the_bound_are_rejected_whole_and_counted() {
     let projected = ravel_otlp::project_span_resolved_label_bytes(
         &request,
         &ravel_otlp::SpanIngestLimits::default(),
+        &TenantRules::none(),
     )
     .get();
     assert!(
@@ -526,9 +532,12 @@ async fn traces_over_the_bound_are_rejected_whole_and_counted() {
 #[tokio::test]
 async fn the_measured_gauge_shape_is_rejected_at_default_limits() {
     let request = measured_gauge_request();
-    let projected =
-        ravel_otlp::project_resolved_label_bytes(&request, &ravel_otlp::IngestLimits::default())
-            .get();
+    let projected = ravel_otlp::project_resolved_label_bytes(
+        &request,
+        &ravel_otlp::IngestLimits::default(),
+        &TenantRules::none(),
+    )
+    .get();
     assert!(
         projected > ravel_otlp::DEFAULT_MAX_RESOLVED_LABEL_BYTES_PER_REQUEST,
         "fixture must project past the default bound: {projected}"
@@ -664,6 +673,7 @@ async fn a_projection_over_the_byte_budget_is_shed_with_429() {
     let projected = ravel_otlp::project_resolved_label_bytes(
         &stale_gauge_request(),
         &ravel_otlp::IngestLimits::default(),
+        &TenantRules::none(),
     )
     .get();
     assert!(

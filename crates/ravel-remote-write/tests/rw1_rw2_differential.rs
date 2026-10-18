@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use prost::Message;
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::IngestLimits;
 use ravel_remote_write::proto::prometheus::{
     Label as ProtoLabelV1, Sample as ProtoSampleV1, TimeSeries as ProtoTimeSeriesV1, WriteRequest,
@@ -142,8 +143,20 @@ fn diff_normalize(series: &[LogicalSeries]) -> (RwNormalizeOutput, RwNormalizeOu
         decode_write_request(&build_rw1(series), 10_000_000).expect("rw1 decode fixture");
     let resolved2 = decode_request(&build_rw2(series), 10_000_000).expect("rw2 decode fixture");
 
-    let out1 = normalize_resolved(&tenant, resolved1, &limits, ingest_ts_ns);
-    let out2 = normalize_resolved(&tenant, resolved2, &limits, ingest_ts_ns);
+    let out1 = normalize_resolved(
+        &tenant,
+        resolved1,
+        &limits,
+        &TenantRules::none(),
+        ingest_ts_ns,
+    );
+    let out2 = normalize_resolved(
+        &tenant,
+        resolved2,
+        &limits,
+        &TenantRules::none(),
+        ingest_ts_ns,
+    );
     (out1, out2)
 }
 
@@ -222,7 +235,13 @@ fn empty_label_name_rejects_identically_across_decoders() {
 
     // RW1: decode succeeds, normalization rejects the whole series.
     let resolved1 = decode_write_request(&build_rw1(&series), 10_000_000).expect("rw1 decode");
-    let out1 = normalize_resolved(&tenant, resolved1, &limits, ingest_ts_ns);
+    let out1 = normalize_resolved(
+        &tenant,
+        resolved1,
+        &limits,
+        &TenantRules::none(),
+        ingest_ts_ns,
+    );
     assert!(out1.points.is_empty(), "{:?}", out1.points);
     assert!(!out1.rejected.is_empty());
 

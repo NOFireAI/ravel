@@ -17,6 +17,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric::Data as MetricData,
 };
 
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
 };
@@ -58,6 +59,7 @@ fn otlp_series_id(attrs: Vec<KeyValue>) -> SeriesId {
         &TenantId::new(TENANT),
         req,
         &IngestLimits::default(),
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert!(out.rejected.is_empty(), "otlp rejected: {:?}", out.rejected);
@@ -87,6 +89,7 @@ fn otap_series_id(attrs: Vec<AttrRow>) -> SeriesId {
         &TenantId::new(TENANT),
         &decoded,
         &IngestLimits::default(),
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert!(out.rejected.is_empty(), "otap rejected: {:?}", out.rejected);
@@ -119,6 +122,7 @@ fn rw_series_id(mut labels: Vec<Label>) -> SeriesId {
         &TenantId::new(TENANT),
         req,
         &IngestLimits::default(),
+        &TenantRules::none(),
         INGEST_TS_NS,
     );
     assert!(out.rejected.is_empty(), "rw rejected: {:?}", out.rejected);
