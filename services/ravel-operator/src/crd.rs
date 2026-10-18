@@ -111,8 +111,9 @@ pub struct RavelClusterSpec {
     pub maintain: MaintainSpec,
 
     /// Liveness and readiness probe wiring for the rendered `ravel-server`
-    /// pods (ADR-1702 decision 10). Omit the block entirely to keep today's
-    /// render: every field defaults to the pre-ADR-1702 behavior.
+    /// pods (ADR-1702 decision 10). Omitting the block is the same as
+    /// `dedicatedHealthPort: true`: both probes go to the dedicated health
+    /// listener on 4316.
     #[serde(default)]
     pub probes: ProbesSpec,
 
@@ -665,9 +666,11 @@ pub struct ProbesSpec {
     /// pod.
     ///
     /// Defaults to true (ADR-1702 follow-up task 12): the flag requires a
-    /// `ravel-server` image that has `--listen-health`, from this release or
-    /// newer. An older image rejects the unknown flag and restart-loops the
-    /// pod. Set this to `false` to keep the pre-flip render.
+    /// `ravel-server` image that has `--listen-health`, v0.19.0 or newer. An
+    /// older image rejects the unknown flag and restart-loops the pod. The
+    /// API server stores the default on the write that creates or updates
+    /// the object, so a cluster already stored with `false` keeps it. Set
+    /// this to `false` to probe the main HTTP port on 4318 instead.
     #[serde(default = "default_dedicated_health_port")]
     pub dedicated_health_port: bool,
 }

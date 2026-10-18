@@ -882,19 +882,30 @@ part holds a worker for the length of each block's decompress.
 
 <!-- amendment-applies: sections="Follow-up tasks, in order" pointer="operator-default-flip amendment" -->
 
-Task 12's two preconditions are met and the operator now defaults
-`spec.probes.dedicatedHealthPort` to `true`. The evidence:
+Task 12's two preconditions are met, and the CRD now defaults
+`spec.probes.dedicatedHealthPort` to `true`:
 
-- Task 11 scenario 2 ran on Linux and finished inside its 10 s bound, with a
+- One release after task 3: task 3 shipped in v0.19.0, together with the
+  `--listen-health` flag the field renders.
+- Task 11's second scenario ran on Linux inside its 10 s bound, with a
   maximum heartbeat age of 1.0 s across three runs (issue #2671, comment
   6252379466).
-- A paired ClickBench run (issue #2980, comment 6253040379) showed the
-  dedicated health listener's `/healthz` p99 staying within 4 ms of the
-  baseline, with no regression the flip would need to weigh against the
-  liveness benefit.
 
-The same run also measured `--sql-scan-decode-inline` (the scan-decode
-opt-out amendment above) on the current build and found no gain: turning it
-on drove the main router's p99 up by about a factor of ten instead. That flag
-stays opt-in; this amendment changes only the operator's probe default, not
-decision 7.
+Supporting evidence, not a precondition: a paired ClickBench run (issue
+#2980, comment 6253040379) compared `--sql-scan-decode-inline` (the
+scan-decode opt-out amendment above) on and off, with the health listener on
+in both arms. It shows the listener's isolation: with inline decode on, the
+listener's `/healthz` p99 moved by under 4 ms while the main router's p99
+rose, by about 3.4x in the benchmark phase and about 9x to 10x in the
+concurrent phases.
+
+The same run is the evidence that inline decode gains nothing on the current
+build: the hot-run sum differed between the two arms by a factor of 1.009 and
+the read-gate statement set by 1.083. That flag stays opt-in; this amendment
+changes only the operator's probe default, not decision 7.
+
+The default is a CRD schema default, which the API server stores on every
+create and update. The v0.19.0 CRD defaulted the field to `false`, so a
+RavelCluster written since then keeps `false` until its owner sets `true` or
+removes the field; only a new cluster, or one never written since the v0.19.0
+CRD, takes the new default.
