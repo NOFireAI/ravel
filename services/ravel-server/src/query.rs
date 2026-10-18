@@ -603,6 +603,8 @@ pub fn build_sql_state(
         false,
         ravel_sql::DEFAULT_MIN_GRACE_MS,
         &SqlSpillInputs::default(),
+        None,
+        false,
     )
 }
 
@@ -1091,6 +1093,12 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// `scan_decode_inline` (`--sql-scan-decode-inline`, issue #2795) keeps the
 /// gate off the logs and spans fetchers only, so those two scans decode
 /// inline while the `samples` scan's catalog decodes stay on the gate.
+///
+/// `ipcrypt_deployment_key` and `ipcrypt_audit_plaintext` are installed via
+/// `SqlExecutor::with_ipcrypt` (ADR-2993 decision 6): the `--deployment-key`
+/// the ingest policy derives its keys from, and whether the audit pipeline
+/// is on under `--audit-text plaintext`. [`build_sql_state`] installs neither,
+/// so its executor never registers an IPCrypt function.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -1112,6 +1120,8 @@ pub fn build_sql_state_with_parquet(
     spill: &SqlSpillInputs,
     read_gate: Arc<ravel_cpu_gate::ReadGate>,
     scan_decode_inline: bool,
+    ipcrypt_deployment_key: Option<Arc<[u8; 32]>>,
+    ipcrypt_audit_plaintext: bool,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -1151,6 +1161,8 @@ pub fn build_sql_state_with_parquet(
         scan_decode_inline,
         ddl_min_grace_ms,
         spill,
+        ipcrypt_deployment_key,
+        ipcrypt_audit_plaintext,
     )
 }
 
@@ -1175,6 +1187,8 @@ fn build_sql_state_inner(
     scan_decode_inline: bool,
     ddl_min_grace_ms: u64,
     spill: &SqlSpillInputs,
+    ipcrypt_deployment_key: Option<Arc<[u8; 32]>>,
+    ipcrypt_audit_plaintext: bool,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -1321,7 +1335,9 @@ fn build_sql_state_inner(
     // The deployment's `sys/gc`-derived minimum grace, which the manifest
     // writer spends as its resolve-to-put budget; see
     // `WRITER_MIN_USABLE_GRACE_MS` for why it is not query protection.
-    let executor = executor.with_ddl_min_grace_ms(ddl_min_grace_ms);
+    let executor = executor
+        .with_ddl_min_grace_ms(ddl_min_grace_ms)
+        .with_ipcrypt(ipcrypt_deployment_key, ipcrypt_audit_plaintext);
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -2500,6 +2516,8 @@ mod tests {
             &SqlSpillInputs::default(),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
             false,
+            None,
+            false,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
@@ -2554,6 +2572,8 @@ mod tests {
             expected_ms,
             &SqlSpillInputs::default(),
             crate::cpu_gates::CpuGates::new(Default::default()).read,
+            false,
+            None,
             false,
         )
         .expect("sql state builds");
@@ -2684,6 +2704,8 @@ mod tests {
                 ravel_sql::DEFAULT_MIN_GRACE_MS,
                 &SqlSpillInputs::default(),
                 crate::cpu_gates::CpuGates::new(Default::default()).read,
+                false,
+                None,
                 false,
             )
             .expect("sql state builds")
@@ -3403,6 +3425,8 @@ mod tests {
             ravel_sql::DEFAULT_MIN_GRACE_MS,
             inputs,
             crate::cpu_gates::CpuGates::new(Default::default()).read,
+            false,
+            None,
             false,
         )
         .expect("sql state builds");

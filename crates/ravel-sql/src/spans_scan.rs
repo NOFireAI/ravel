@@ -1699,6 +1699,7 @@ mod tests {
             SessionTable::Spans(Arc::new(provider)),
             false,
             crate::session::SpillDecision::Disabled,
+            &crate::SessionIpcrypt::disabled(),
         )
         .expect("spans session builds");
 

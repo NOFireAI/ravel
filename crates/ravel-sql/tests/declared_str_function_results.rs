@@ -296,6 +296,7 @@ fn production_session() -> SessionContext {
         table,
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
     .expect("session builds")
 }

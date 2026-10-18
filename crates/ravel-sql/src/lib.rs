@@ -77,6 +77,7 @@ pub mod flight;
 #[cfg(feature = "pin-codec")]
 mod flight_ticket;
 mod group_keys;
+mod ipcrypt_udf;
 mod labels;
 mod late_materialization;
 mod like_udf;
@@ -161,7 +162,8 @@ pub use error::{
 pub use executor::{
     AnalyzedRun, ExplainReport, HISTOGRAM_EXCLUDED_WARNING, LiveAccounting, ParquetPlan,
     PhaseWallTiming, PinnedPlanInputs, PinnedQuery, PinnedResolve, PinnedStream, ScanTiming,
-    SegmentTiming, SignalStats, SqlExecutor, SqlOutcome, SqlRequest, SqlStats, TargetSignal,
+    SegmentTiming, SignalStats, SqlExecutor, SqlGrants, SqlOutcome, SqlRequest, SqlStats,
+    TargetSignal,
 };
 #[cfg(feature = "flight-sql")]
 pub use flight::{
@@ -174,6 +176,7 @@ pub use flight_ticket::{
     TICKET_KEY_LEN, TicketKey, TicketSurface, derive_surface_key, derive_ticket_key,
 };
 pub use group_keys::{DICTIONARY_GROUP_KEYS_RULE, DictionaryGroupKeysAsViews};
+pub use ipcrypt_udf::{IPCRYPT_ENCRYPT_UDF, IPCRYPT_PREFIX_ENCRYPT_UDF, SessionIpcrypt};
 pub use late_materialization::{
     LogsRowFetchExec, ROW_REF_COLUMN, TOPK_LATE_MATERIALIZATION_RULE, TopKLateMaterialization,
 };

@@ -201,6 +201,7 @@ async fn run_with_pool(
         SessionTable::Metrics(provider),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
     .expect("session");
     let ctx = if rule_on { ctx } else { without_rule(&ctx) };

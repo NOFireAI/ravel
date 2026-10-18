@@ -140,6 +140,7 @@ use crate::config::SqlConfig;
 use crate::cost::{estimate_logs_cost, estimate_metrics_cost, estimate_spans_cost};
 use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_source};
 use crate::error::SqlError;
+use crate::ipcrypt_udf::SessionIpcrypt;
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
@@ -572,6 +573,22 @@ struct PlanExtras {
     /// The Parquet tables the statement reads, when its resolve already
     /// resolved them.
     parquet: ParquetPlan,
+    /// Whether the principal holds the `ipcrypt` capability
+    /// ([`SqlGrants::ipcrypt`]).
+    ipcrypt: bool,
+}
+
+/// The capabilities of the principal a statement runs as that change what
+/// its session registers, beyond the tenant every statement carries.
+///
+/// The `Default` value grants nothing: what a caller passes when it has no
+/// principal, or one whose capabilities it cannot read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SqlGrants {
+    /// The principal holds the `ipcrypt` capability (ADR-2993 decision 6): its
+    /// session may register `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt`,
+    /// subject to [`SqlExecutor::with_ipcrypt`].
+    pub ipcrypt: bool,
 }
 
 /// One SQL request, fully resolved from its transport.
@@ -1544,6 +1561,13 @@ pub struct SqlExecutor {
     /// `spill.max_bytes`, shared by every query this executor serves. `None`
     /// when spill is not configured.
     spill_budget: Option<SpillBudget>,
+    /// The deployment key the IPCrypt SQL functions derive their keys from
+    /// (ADR-2993 decision 6). `None` (the [`SqlExecutor::new`] default)
+    /// registers neither function for any principal.
+    ipcrypt_deployment_key: Option<Arc<[u8; 32]>>,
+    /// Whether the query audit is on and records statement text verbatim.
+    /// When true no session registers the IPCrypt functions.
+    ipcrypt_audit_plaintext: bool,
     /// Replaces the plan a pinned statement executes after the tie-order
     /// rewrite, so a test can make it diverge from the classification plan.
     #[cfg(test)]
@@ -1595,6 +1619,8 @@ impl SqlExecutor {
             parquet: None,
             clock: Arc::new(SystemClock),
             ddl_min_grace_ms: None,
+            ipcrypt_deployment_key: None,
+            ipcrypt_audit_plaintext: false,
             #[cfg(test)]
             executed_plan_tamper: None,
             #[cfg(test)]
@@ -1673,6 +1699,34 @@ impl SqlExecutor {
     pub fn ddl_min_grace_ms(&self) -> u64 {
         self.ddl_min_grace_ms
             .unwrap_or(crate::ddl::DEFAULT_MIN_GRACE_MS)
+    }
+
+    /// Install what the `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt` SQL
+    /// functions need (ADR-2993 decision 6): the deployment key, and whether
+    /// the query audit records statement text verbatim. A statement's session
+    /// registers the functions only when its principal holds the `ipcrypt`
+    /// capability ([`SqlGrants::ipcrypt`]), `deployment_key` is `Some`, and
+    /// `audit_plaintext` is false.
+    pub fn with_ipcrypt(
+        mut self,
+        deployment_key: Option<Arc<[u8; 32]>>,
+        audit_plaintext: bool,
+    ) -> Self {
+        self.ipcrypt_deployment_key = deployment_key;
+        self.ipcrypt_audit_plaintext = audit_plaintext;
+        self
+    }
+
+    /// The [`SessionIpcrypt`] a statement by `tenant_hash` plans under, for a
+    /// principal that does (`principal_ipcrypt`) or does not hold the
+    /// `ipcrypt` capability.
+    fn session_ipcrypt(&self, tenant_hash: TenantHash, principal_ipcrypt: bool) -> SessionIpcrypt {
+        SessionIpcrypt {
+            tenant_hash: Some(tenant_hash),
+            principal_ipcrypt,
+            deployment_key: self.ipcrypt_deployment_key.clone(),
+            audit_plaintext: self.ipcrypt_audit_plaintext,
+        }
     }
 
     /// Install the source of per-tenant declared typed attribute columns for the
@@ -1818,6 +1872,20 @@ impl SqlExecutor {
         req: &SqlRequest,
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
+        self.execute_accounted_as(tenant_hash, SqlGrants::default(), req, live)
+            .await
+    }
+
+    /// [`Self::execute_accounted`] for a principal whose capabilities are
+    /// `grants`: the statement's sessions register what `grants` admits (the
+    /// IPCrypt functions, per [`Self::with_ipcrypt`]).
+    pub async fn execute_accounted_as(
+        &self,
+        tenant_hash: TenantHash,
+        grants: SqlGrants,
+        req: &SqlRequest,
+        live: &LiveAccounting,
+    ) -> Result<SqlOutcome, SqlError> {
         // Step 1: the security gate runs before any catalog or plan work.
         validate_query(&req.sql)?;
         let tokens = admit_http_tokens(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
@@ -1825,7 +1893,14 @@ impl SqlExecutor {
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
             req.deadline,
-            self.run(tenant_hash, Statement::Sql(&req.sql), req, &tokens, live),
+            self.run(
+                tenant_hash,
+                grants,
+                Statement::Sql(&req.sql),
+                req,
+                &tokens,
+                live,
+            ),
         )
         .await
         .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
@@ -1882,7 +1957,15 @@ impl SqlExecutor {
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
             req.deadline,
-            self.run(tenant_hash, statement, &sql_req, &tokens, live),
+            // No principal capability applies: see `crate::esql::run`.
+            self.run(
+                tenant_hash,
+                SqlGrants::default(),
+                statement,
+                &sql_req,
+                &tokens,
+                live,
+            ),
         )
         .await
         .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
@@ -1971,8 +2054,11 @@ impl SqlExecutor {
         // right after resolve returns, so `explain` gets that enforcement
         // for free here without ever reaching the segment-fetch loop in
         // scan.rs (which it never runs: explain fetches no segment).
+        // Explain takes no principal: its one server caller (MCP) has no
+        // capability source, so an IPCrypt function is unknown here.
+        let grants = SqlGrants::default();
         let resolved = self
-            .resolve_admitted(tenant_hash, statement, req, tokens, phase_accounting)
+            .resolve_admitted(tenant_hash, grants, statement, req, tokens, phase_accounting)
             .await?;
         let segments_resolved = resolved.segments_resolved();
         let lane_counts = resolved.lane_counts();
@@ -1997,6 +2083,7 @@ impl SqlExecutor {
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
+                    ipcrypt: grants.ipcrypt,
                 },
             )
             .await?;
@@ -2033,6 +2120,7 @@ impl SqlExecutor {
     async fn run(
         &self,
         tenant_hash: TenantHash,
+        grants: SqlGrants,
         statement: Statement<'_>,
         req: &SqlRequest,
         tokens: &LaneTokens,
@@ -2070,7 +2158,14 @@ impl SqlExecutor {
             // a fresh snapshot of one table with a stale one of another.
             let resolve_started = Instant::now();
             let resolved = self
-                .resolve(tenant_hash, statement, req, tokens, &phase_accounting)
+                .resolve(
+                    tenant_hash,
+                    grants,
+                    statement,
+                    req,
+                    tokens,
+                    &phase_accounting,
+                )
                 .await?;
             let resolve_ns = elapsed_ns(resolve_started);
             stats.resolves += 1;
@@ -2102,6 +2197,7 @@ impl SqlExecutor {
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
                 .attempt(
                     tenant_hash,
+                    grants,
                     statement,
                     req,
                     lanes,
@@ -2230,9 +2326,12 @@ impl SqlExecutor {
         // it reads is the one they bound.
         let tokens =
             LaneTokens::one_lane(tables.first_lane(), unqualified_tokens(&req.min_tokens)?);
+        // Flight SQL authenticates a tenant, not a principal, and grants no
+        // capability (ADR-2993 decision 6).
         let resolved = self
             .resolve(
                 tenant_hash,
+                SqlGrants::default(),
                 Statement::Sql(&req.sql),
                 req,
                 &tokens,
@@ -2333,6 +2432,8 @@ impl SqlExecutor {
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
                 parquet: inputs.parquet,
+                // Flight SQL grants no principal capability.
+                ipcrypt: false,
             },
         )
         .await
@@ -2373,6 +2474,7 @@ impl SqlExecutor {
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
                 parquet: inputs.parquet,
+                ipcrypt: false,
             },
         )
         .await
@@ -2417,6 +2519,9 @@ impl SqlExecutor {
         // borrows the executor's own config and clones nothing.
         let effective = self.effective_config(extras.budgets.as_ref());
         let config: &SqlConfig = &effective;
+        // Every session this statement builds, classification included, gets
+        // the same IPCrypt registration, so a call plans in each or in none.
+        let ipcrypt = self.session_ipcrypt(tenant_hash, extras.ipcrypt);
         // The memory pool's peak-reservation report is execution-time
         // aggregate/sort spend, not a store request, so it has no Resolve/
         // Plan/Probe phase home; it is charged to Scan, matching where the
@@ -2525,6 +2630,7 @@ impl SqlExecutor {
                 &tables,
                 &extras.declared,
                 parquet_schemas.as_deref(),
+                &ipcrypt,
             )
             .await?
         } else {
@@ -2786,6 +2892,7 @@ impl SqlExecutor {
             session_tables,
             exact_typed_aggregates,
             decision,
+            &ipcrypt,
         )
         .map_err(plan_error)?;
         // ADR-0954 (issue #2416): the tiebreak rewrite applied to `analyzed`
@@ -2826,6 +2933,7 @@ impl SqlExecutor {
                 fallback_tables,
                 exact_typed_aggregates,
                 SpillDecision::Disabled,
+                &ipcrypt,
             )
             .map_err(plan_error)?;
             if statement.sql().is_none() {
@@ -2997,6 +3105,9 @@ impl SqlExecutor {
             SessionTable::Metrics(Arc::clone(&provider)),
             false,
             SpillDecision::Disabled,
+            // A worker fragment plans no SQL and the coordinator's slice
+            // request carries no principal.
+            &SessionIpcrypt::disabled(),
         )
         .map_err(plan_error)?;
         let schema = plan.schema();
@@ -3017,13 +3128,21 @@ impl SqlExecutor {
     async fn resolve(
         &self,
         tenant_hash: TenantHash,
+        grants: SqlGrants,
         statement: Statement<'_>,
         req: &SqlRequest,
         tokens: &LaneTokens,
         phase_accounting: &StatementAccounting,
     ) -> Result<Resolved, SqlError> {
-        self.resolve_admitted(tenant_hash, statement, req, tokens, phase_accounting)
-            .await
+        self.resolve_admitted(
+            tenant_hash,
+            grants,
+            statement,
+            req,
+            tokens,
+            phase_accounting,
+        )
+        .await
     }
 
     /// This executor's configuration with `budgets` applied (ADR-1374
@@ -3048,6 +3167,7 @@ impl SqlExecutor {
     async fn resolve_admitted(
         &self,
         tenant_hash: TenantHash,
+        grants: SqlGrants,
         statement: Statement<'_>,
         req: &SqlRequest,
         tokens: &LaneTokens,
@@ -3138,7 +3258,8 @@ impl SqlExecutor {
         // derived from the `samples` scans alone.
         let name_filter = match statement.sql() {
             Some(sql) if lanes.contains(&TargetSignal::Metrics) => {
-                self.pushed_down_name_filter(tenant_hash, sql, &lanes).await
+                self.pushed_down_name_filter(tenant_hash, grants, sql, &lanes)
+                    .await
             }
             _ => None,
         };
@@ -3559,6 +3680,7 @@ impl SqlExecutor {
     async fn pushed_down_name_filter(
         &self,
         tenant_hash: TenantHash,
+        grants: SqlGrants,
         sql: &str,
         lanes: &[TargetSignal],
     ) -> Option<String> {
@@ -3580,12 +3702,15 @@ impl SqlExecutor {
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         // Plan-inspection only: this throwaway session never executes, so it
         // never spills whatever the query's own session was granted.
+        // The statement's own IPCrypt functions are registered too, so a
+        // query calling them still plans here and keeps its prune.
         let ctx = build_session_with_tables(
             &self.config,
             pool,
             tables,
             false,
             crate::session::SpillDecision::Disabled,
+            &self.session_ipcrypt(tenant_hash, grants.ipcrypt),
         )
         .ok()?;
         let plan = ctx.state().create_logical_plan(sql).await.ok()?;
@@ -3668,6 +3793,7 @@ impl SqlExecutor {
             &tables,
             declared,
             parquet,
+            &SessionIpcrypt::disabled(),
         )
         .await
         .ok()
@@ -3693,6 +3819,9 @@ impl SqlExecutor {
     /// table of each schema, so its aggregates and keys classify by the types
     /// the real scan produces. `None` builds the empty table of the signal the
     /// statement names.
+    ///
+    /// `ipcrypt` is the real session's, so a statement calling an IPCrypt
+    /// function classifies as it plans rather than failing closed here.
     async fn analyzed_classification_plan(
         &self,
         tenant_hash: TenantHash,
@@ -3700,6 +3829,7 @@ impl SqlExecutor {
         tables: &StatementTables,
         declared: &[DeclaredColumn],
         parquet: Option<&[(String, SchemaRef)]>,
+        ipcrypt: &SessionIpcrypt,
     ) -> Result<Option<LogicalPlan>, SqlError> {
         let session_tables = match parquet {
             Some(schemas) => vec![SessionTable::Parquet(ParquetSession {
@@ -3736,6 +3866,7 @@ impl SqlExecutor {
             session_tables,
             false,
             crate::session::SpillDecision::Disabled,
+            ipcrypt,
         ) else {
             return Ok(None);
         };
@@ -4003,6 +4134,7 @@ impl SqlExecutor {
     async fn attempt(
         &self,
         tenant_hash: TenantHash,
+        grants: SqlGrants,
         statement: Statement<'_>,
         req: &SqlRequest,
         lanes: Vec<(TargetSignal, Snapshot)>,
@@ -4034,6 +4166,7 @@ impl SqlExecutor {
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
+                    ipcrypt: grants.ipcrypt,
                 },
             )
             .await

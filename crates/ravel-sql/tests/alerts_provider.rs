@@ -795,6 +795,7 @@ async fn limit_caps_rows_of_a_plain_projection() {
         ravel_sql::SessionTable::Alerts(table),
         false,
         ravel_sql::SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
     .expect("session builds");
     for (sql, want) in [

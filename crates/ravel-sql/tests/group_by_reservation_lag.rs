@@ -251,6 +251,7 @@ fn run_once(
             logs,
             true,
             SpillDecision::Disabled,
+            &ravel_sql::SessionIpcrypt::disabled(),
         )
         .expect("session builds")
     };
@@ -447,6 +448,7 @@ fn skip_probe_session(
         logs,
         true,
         SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
     .expect("session builds");
 

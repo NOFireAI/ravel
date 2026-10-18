@@ -65,8 +65,18 @@
 //! unchanged. The DDL path accepts
 //! `CREATE [OR REPLACE] EXTERNAL TABLE ... STORED AS PARQUET LOCATION ...` and
 //! `DROP TABLE` (ADR-2040) and needs the `ddl` capability, which a principal
-//! holds only through a `TOKEN=TENANT;ddl` token or the `--oidc-ddl-claim`
-//! claim. Without it the response is 403 with `errorType` `forbidden`.
+//! holds only through a `TOKEN=TENANT;ddl` token (or `;ddl,ipcrypt`) or the
+//! `--oidc-ddl-claim` claim. Without it the response is 403 with `errorType`
+//! `forbidden`.
+//!
+//! # IPCrypt
+//!
+//! A query from a principal holding the `ipcrypt` capability (a
+//! `TOKEN=TENANT;ipcrypt` token or the `--oidc-ipcrypt-claim` claim) may call
+//! `ipcrypt_encrypt(ip, epoch)` and `ipcrypt_prefix_encrypt(ip, epoch)`
+//! (ADR-2993 decision 6), when the server has a `--deployment-key` and the
+//! query audit is not recording plaintext. Otherwise neither function is
+//! registered and a call is an unknown-function error.
 //!
 //! A DDL success is 200 with
 //! `{"status":"success","data":{"outcome":"created"|"dropped"|"noop","table":...}}`,
@@ -259,9 +269,12 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
 
+    let grants = ravel_sql::SqlGrants {
+        ipcrypt: principal.ipcrypt,
+    };
     let execution = state
         .service()
-        .sql_execute_timed(tenant_hash, &request)
+        .sql_execute_timed(tenant_hash, grants, &request)
         .await?;
     respond(&headers, execution, tenant_hash)
 }

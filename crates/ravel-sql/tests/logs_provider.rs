@@ -600,6 +600,7 @@ fn logs_session(
         ravel_sql::SessionTable::Logs(Arc::new(provider)),
         false,
         ravel_sql::SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
 }
 

@@ -204,7 +204,11 @@ async fn run(
 
     let service = state.service();
     let request = service.trace_request(&lookup)?;
-    let execution = service.sql_execute_timed(tenant_hash, &request).await?;
+    // The lookup's SQL is built here, never from caller text, and calls no
+    // IPCrypt function.
+    let execution = service
+        .sql_execute_timed(tenant_hash, ravel_sql::SqlGrants::default(), &request)
+        .await?;
     crate::sql::respond(&headers, execution, tenant_hash)
 }
 

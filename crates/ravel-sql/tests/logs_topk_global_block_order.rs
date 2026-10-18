@@ -399,6 +399,7 @@ async fn setup(fixture: Fixture, skip: bool) -> Setup {
         SessionTable::Logs(Arc::new(provider)),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
     .expect("session builds");
     {

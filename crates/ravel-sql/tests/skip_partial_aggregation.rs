@@ -412,6 +412,7 @@ async fn run(
         SessionTable::Logs(provider),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
     .expect("session");
 

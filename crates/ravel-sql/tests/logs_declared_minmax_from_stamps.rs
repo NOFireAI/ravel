@@ -407,6 +407,7 @@ fn logs_session(provider: LogsTableProvider) -> datafusion::error::Result<Sessio
         SessionTable::Logs(Arc::new(provider)),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
 }
 

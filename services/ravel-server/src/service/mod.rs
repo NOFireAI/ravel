@@ -571,24 +571,28 @@ impl QueryService {
         }
     }
 
-    /// `POST /api/v1/sql`: one read-only SQL statement.
+    /// One read-only SQL statement, for a caller that holds no principal
+    /// capability (the MCP tools), so no IPCrypt function is registered.
     #[cfg(feature = "sql")]
     pub async fn sql_execute(
         &self,
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
     ) -> Result<ravel_sql::SqlOutcome, ServiceError> {
-        self.sql_execute_timed(tenant_hash, request)
+        self.sql_execute_timed(tenant_hash, ravel_sql::SqlGrants::default(), request)
             .await
             .map(|timed| timed.outcome)
     }
 
-    /// [`Self::sql_execute`], plus the wall time spent awaiting the audit
-    /// submission, which the JSON response reports as `stats.timings.auditMs`.
+    /// [`Self::sql_execute`] for a principal holding `grants`, plus the wall
+    /// time spent awaiting the audit submission, which the JSON response
+    /// reports as `stats.timings.auditMs`. `POST /api/v1/sql` runs through
+    /// here.
     #[cfg(feature = "sql")]
     pub async fn sql_execute_timed(
         &self,
         tenant_hash: TenantHash,
+        grants: ravel_sql::SqlGrants,
         request: &ravel_sql::SqlRequest,
     ) -> Result<SqlExecution, ServiceError> {
         let state = self
@@ -606,7 +610,7 @@ impl QueryService {
         let span = query_span("sql_query", tenant_hash);
         let result = state
             .executor
-            .execute_accounted(tenant_hash, request, &live)
+            .execute_accounted_as(tenant_hash, grants, request, &live)
             .instrument(span.clone())
             .await
             .map_err(|err| ServiceError::from_sql(err, tenant_hash));

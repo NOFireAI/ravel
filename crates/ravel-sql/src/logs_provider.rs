@@ -591,6 +591,7 @@ mod tests {
             SessionTable::Logs(Arc::new(provider)),
             false,
             crate::session::SpillDecision::Disabled,
+            &crate::SessionIpcrypt::disabled(),
         )
     }
 

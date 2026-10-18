@@ -147,6 +147,7 @@ use crate::bounded_topk::BoundedTopKAggregate;
 use crate::compact_slices::CompactSlices;
 use crate::config::SqlConfig;
 use crate::group_keys::DictionaryGroupKeysAsViews;
+use crate::ipcrypt_udf::SessionIpcrypt;
 use crate::late_materialization::TopKLateMaterialization;
 use crate::like_udf::{LikeScope, LikeToUdf};
 use crate::logs_provider::LogsTableProvider;
@@ -245,14 +246,21 @@ pub const REWRITE_ONLY_AGGREGATES: [&str; 1] = ["first_value"];
 /// own UDFs (ADR-0097 decision 2: "one upstream set plus a per-table
 /// addendum").
 ///
+/// `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt` (ADR-2993 decision 6) are
+/// admitted too, but registered only in a session whose [`SessionIpcrypt`]
+/// grants them, so in any other session they are unknown functions.
+///
 /// The complement within the upstream default registrations lives in
 /// [`EXCLUDED_SCALARS`]; the two are kept exhaustive by
 /// `admitted_and_excluded_cover_all_registries_for_every_table` below.
-pub const ADMITTED_SCALARS: [&str; 127] = [
+pub const ADMITTED_SCALARS: [&str; 129] = [
     // Ravel's own per-table scalar UDFs (registered after the loop, per table).
     "label",
     "label_match",
     "has_word",
+    // Ravel's IPCrypt UDFs (registered after the loop, per granted session).
+    "ipcrypt_encrypt",
+    "ipcrypt_prefix_encrypt",
     // The upstream datafusion-functions scalar packs (string, unicode,
     // datetime, math, regex, encoding), minus the eight in EXCLUDED_SCALARS.
     "abs",
@@ -683,8 +691,16 @@ pub fn build_session(
     table: SessionTable,
     exact_typed_aggregates: bool,
     spill: SpillDecision<'_>,
+    ipcrypt: &SessionIpcrypt,
 ) -> DFResult<SessionContext> {
-    build_session_with_tables(config, pool, vec![table], exact_typed_aggregates, spill)
+    build_session_with_tables(
+        config,
+        pool,
+        vec![table],
+        exact_typed_aggregates,
+        spill,
+        ipcrypt,
+    )
 }
 
 /// The name a signal table registers under; `None` for a Parquet entry,
@@ -745,12 +761,17 @@ fn check_table_set(tables: &[SessionTable]) -> DFResult<()> {
 /// two entries for one table name, and a Parquet entry beside any other entry
 /// (epic #2904 ticket T7 lifts that one, per ADR-2904 decision 11). Only a set of
 /// exactly one Parquet entry gets a store registry that answers anything.
+///
+/// `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt` are registered, on every
+/// table set, only when [`SessionIpcrypt::registers`] holds for `ipcrypt`,
+/// with fresh instances keyed for its tenant (ADR-2993 decision 6).
 pub fn build_session_with_tables(
     config: &SqlConfig,
     pool: Arc<dyn MemoryPool>,
     tables: Vec<SessionTable>,
     exact_typed_aggregates: bool,
     spill: SpillDecision<'_>,
+    ipcrypt: &SessionIpcrypt,
 ) -> DFResult<SessionContext> {
     check_table_set(&tables)?;
     let parquet_store = match tables.as_slice() {
@@ -1020,6 +1041,9 @@ pub fn build_session_with_tables(
             }
         }
     }
+    for udf in ipcrypt.udfs() {
+        ctx.register_udf(udf);
+    }
     // After the last scalar registration, so every registered function that
     // returns a dictionary of non-strings for a dictionary-typed string
     // argument is typed by the dictionary's value type. Only those functions
@@ -1112,6 +1136,7 @@ mod tests {
             SessionTable::Spans(Arc::new(provider)),
             false,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("spans session builds");
 
@@ -1404,6 +1429,7 @@ mod tests {
             metrics_table(&store),
             false,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("session builds");
         let sql = format!(
@@ -1636,36 +1662,59 @@ mod tests {
 
         // Every Ravel-added scalar UDF across all tables, and the per-table
         // subset. Non-scalar registries have no per-table addendum.
-        let all_ravel_scalars = set(["label", "label_match", "has_word"].iter());
+        // The IPCrypt UDFs are an addendum on every table, present only in a
+        // session whose `SessionIpcrypt` grants them.
+        let all_ravel_scalars = set([
+            "label",
+            "label_match",
+            "has_word",
+            crate::IPCRYPT_ENCRYPT_UDF,
+            crate::IPCRYPT_PREFIX_ENCRYPT_UDF,
+        ]
+        .iter());
         let empty: BTreeSet<String> = BTreeSet::new();
 
         let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
 
+        let granted = granted_ipcrypt(1);
+        for (ipcrypt_label, ipcrypt) in [
+            ("ungranted", SessionIpcrypt::disabled()),
+            ("granted", granted),
+        ] {
+            let ipcrypt_scalars: &[&str] = if ipcrypt.registers() {
+                &[crate::IPCRYPT_ENCRYPT_UDF, crate::IPCRYPT_PREFIX_ENCRYPT_UDF]
+            } else {
+                &[]
+            };
+            let addendum = |own: &[&str]| set(own.iter().chain(ipcrypt_scalars));
         for (table_label, table, ravel_scalars) in [
             (
                 "metrics",
                 metrics_table(&store),
-                set(["label", "label_match"].iter()),
+                addendum(&["label", "label_match"]),
             ),
-            ("logs", logs_table(&store), set(["has_word"].iter())),
-            ("spans", spans_table(&store), empty.clone()),
+            ("logs", logs_table(&store), addendum(&["has_word"])),
+            ("spans", spans_table(&store), addendum(&[])),
             // ADR-1101 decision 1: neither RLOG-backed table registers a scalar
             // UDF of its own, so a leaked `has_word` (or any other per-table
             // addendum) on one of them fails here.
-            ("alerts", alerts_table(&store), empty.clone()),
-            ("audit", audit_table(&store), empty.clone()),
+            ("alerts", alerts_table(&store), addendum(&[])),
+            ("audit", audit_table(&store), addendum(&[])),
             (
                 "parquet",
                 parquet_table(ravel_types::TenantHash([0u8; 16])),
-                empty.clone(),
+                addendum(&[]),
             ),
         ] {
+            let table_label = format!("{table_label} ({ipcrypt_label})");
+            let table_label = table_label.as_str();
             let ctx = build_session(
                 &SqlConfig::default(),
                 test_pool(),
                 table,
                 false,
                 SpillDecision::Disabled,
+                &ipcrypt,
             )
             .expect("session builds");
             let state = ctx.state();
@@ -1719,6 +1768,67 @@ mod tests {
                 &reg_tables,
             );
         }
+        }
+    }
+
+    /// A `SessionIpcrypt` that registers the IPCrypt UDFs, keyed for a tenant
+    /// whose hash is `tenant` repeated.
+    fn granted_ipcrypt(tenant: u8) -> SessionIpcrypt {
+        SessionIpcrypt {
+            tenant_hash: Some(ravel_types::TenantHash([tenant; 16])),
+            principal_ipcrypt: true,
+            deployment_key: Some(Arc::new([9u8; 32])),
+            audit_plaintext: false,
+        }
+    }
+
+    /// The IPCrypt UDFs are registered on a session whose `SessionIpcrypt`
+    /// grants them, on a multi-table set as on a single table, and on no
+    /// session where any one condition fails.
+    #[test]
+    fn ipcrypt_udfs_register_only_when_every_condition_holds() {
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let has_both = |ipcrypt: &SessionIpcrypt, tables: Vec<SessionTable>| {
+            let ctx = build_session_with_tables(
+                &SqlConfig::default(),
+                test_pool(),
+                tables,
+                false,
+                SpillDecision::Disabled,
+                ipcrypt,
+            )
+            .expect("session builds");
+            let state = ctx.state();
+            let scalars = state.scalar_functions();
+            let found = [
+                crate::IPCRYPT_ENCRYPT_UDF,
+                crate::IPCRYPT_PREFIX_ENCRYPT_UDF,
+            ]
+            .map(|name| scalars.contains_key(name));
+            assert_eq!(found[0], found[1], "both or neither");
+            found[0]
+        };
+        assert!(has_both(&granted_ipcrypt(1), vec![logs_table(&store)]));
+        assert!(has_both(
+            &granted_ipcrypt(1),
+            vec![metrics_table(&store), logs_table(&store)]
+        ));
+        let mut no_capability = granted_ipcrypt(1);
+        no_capability.principal_ipcrypt = false;
+        let mut no_key = granted_ipcrypt(1);
+        no_key.deployment_key = None;
+        let mut audited = granted_ipcrypt(1);
+        audited.audit_plaintext = true;
+        for (label, ipcrypt) in [
+            ("no capability", no_capability),
+            ("no deployment key", no_key),
+            ("audit under plaintext", audited),
+        ] {
+            assert!(
+                !has_both(&ipcrypt, vec![logs_table(&store)]),
+                "{label}: the IPCrypt UDFs must not be registered"
+            );
+        }
     }
 
     /// Ravel's per-table UDFs survive the scalar gate: a logs session keeps
@@ -1731,7 +1841,13 @@ mod tests {
     /// get wrong, which is why the membership is asserted directly below.
     #[test]
     fn per_table_scalar_udfs_survive_the_scalar_gate() {
-        for name in ["label", "label_match", "has_word"] {
+        for name in [
+            "label",
+            "label_match",
+            "has_word",
+            crate::IPCRYPT_ENCRYPT_UDF,
+            crate::IPCRYPT_PREFIX_ENCRYPT_UDF,
+        ] {
             assert!(
                 ADMITTED_SCALARS.contains(&name),
                 "{name} must stay in ADMITTED_SCALARS: the scalar gate spares \
@@ -1749,6 +1865,7 @@ mod tests {
             logs_table(&store),
             false,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("logs session builds");
         assert!(
@@ -1762,6 +1879,7 @@ mod tests {
             metrics_table(&store),
             false,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("metrics session builds");
         let metrics_state = metrics.state();
@@ -1844,6 +1962,7 @@ mod tests {
                 table,
                 false,
                 SpillDecision::Disabled,
+                &SessionIpcrypt::disabled(),
             )
             .expect("session builds");
             let registered: Vec<String> = ctx
@@ -1883,6 +2002,7 @@ mod tests {
                 parquet_table(ravel_types::TenantHash([7u8; 16])),
                 exact,
                 decision,
+                &SessionIpcrypt::disabled(),
             )
             .expect("parquet session");
             let state = ctx.state();
@@ -1900,6 +2020,7 @@ mod tests {
             logs_table(&store),
             true,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("logs session");
         assert!(
@@ -1938,6 +2059,7 @@ mod tests {
             parquet_table(tenant),
             false,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("parquet session");
         let runtime = parquet.runtime_env();
@@ -1968,6 +2090,7 @@ mod tests {
             logs_table(&store),
             false,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("logs session");
         for url in refused.iter().chain([&ravel_parquet::store_url(&tenant)]) {
@@ -1998,6 +2121,7 @@ mod tests {
             tables,
             false,
             SpillDecision::Disabled,
+            &SessionIpcrypt::disabled(),
         )
         .expect("session builds")
     }
@@ -2265,6 +2389,7 @@ mod tests {
                 tables,
                 false,
                 SpillDecision::Disabled,
+                &SessionIpcrypt::disabled(),
             ) {
                 Ok(_) => panic!("the table set must be refused"),
                 Err(DataFusionError::Plan(message)) => message,

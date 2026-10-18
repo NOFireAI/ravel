@@ -151,6 +151,9 @@ async fn run_row_inner(
         }),
         false,
         SpillDecision::Disabled,
+        // The ES|QL binder lowers each of its functions to a fixed SQL scalar
+        // name, none of them an IPCrypt function, so none is registered here.
+        &crate::SessionIpcrypt::disabled(),
     )
     .map_err(|e| SqlError::Plan(e.to_string()))?;
     let tables = StatementTables::one(None);

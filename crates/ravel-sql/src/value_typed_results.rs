@@ -405,6 +405,7 @@ mod tests {
             table,
             false,
             SpillDecision::Disabled,
+            &crate::SessionIpcrypt::disabled(),
         )
         .expect("session builds")
     }

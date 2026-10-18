@@ -409,6 +409,7 @@ fn session_for(fixture: &Fixture, sql: &str) -> datafusion::prelude::SessionCont
         table,
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionIpcrypt::disabled(),
     )
     .expect("session builds")
 }
