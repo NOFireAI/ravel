@@ -4005,6 +4005,27 @@ mod tests {
     }
 
     #[test]
+    fn two_windows_sharing_a_selector_key_refetch_once_not_per_step() {
+        // Both subqueries read `up` with no offset of its own, so they share
+        // one cache key, while the outer `offset 1h` puts their windows an
+        // hour apart, further than the 30m grid reaches. The second shape's
+        // first read misses and refetches; the refetch keeps the first
+        // shape's window, so neither evicts the other on later steps.
+        let source = counting_cache_source();
+        let (_, _, counts) = range_with_fetch_counts(
+            &Evaluator::new(),
+            &source,
+            "max_over_time(up[10m:1m] offset 1h) + max_over_time(up[10m:1m])",
+            0,
+            minutes(30),
+            minutes(1),
+        );
+        assert_eq!(source.query_count(), 2);
+        assert_eq!(source.hist_query_count(), 2);
+        assert_eq!(counts, (4, 2));
+    }
+
+    #[test]
     fn expired_deadline_cancels_a_long_running_nested_subquery_before_any_query() {
         // `max_over_time(up[1000s:1s])` over a 1000-step outer range (1000
         // points, 1s step) re-evaluates its ~1000-point inner subquery from
