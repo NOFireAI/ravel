@@ -12,7 +12,9 @@
 //! The scanned bucket holds data objects, commit records, catalog snapshot
 //! parts and HEADs, name postings, column statistics (the tenant declares
 //! `client.ip` as a typed logs column), an erasure request under `del/`, the
-//! tenancy marker and the tenant's recovery manifest. It holds no key-index
+//! tenancy marker and the tenant's recovery manifest, besides the tenant
+//! config, metric metadata, and each signal's provenance and admission
+//! snapshot. It holds no key-index
 //! leaf, because the fold builds none unless
 //! `CatalogConfig::build_key_index_leaves` is set, and no erasure completion,
 //! because no maintenance pass runs.
@@ -856,6 +858,12 @@ fn class_counts(stored: &[Stored]) -> BTreeMap<&'static str, usize> {
 fn assert_every_class(stored: &[Stored]) -> BTreeMap<&'static str, usize> {
     let counts = class_counts(stored);
     eprintln!("object classes scanned: {counts:?}");
+    let other: Vec<&str> = stored
+        .iter()
+        .filter(|object| object.class() == "other")
+        .map(|object| object.key.as_str())
+        .collect();
+    eprintln!("objects of no named class: {other:?}");
     for class in [
         "data",
         "commit",
@@ -1025,8 +1033,6 @@ async fn no_stored_byte_carries_an_address_under_a_rule() {
 
     assert_every_class(&stored);
     eprintln!("ravel_ingest_ipcrypt_values_total: {counts:?}");
-    let expected: Vec<_> = expected_counts().to_vec();
-    assert_eq!(counts, expected, "IPCrypt values counted, per signal");
 
     for (case, octet) in stored_cases().into_iter().chain(dropped_cases()) {
         for (form, needle) in address_forms(octet) {
@@ -1056,6 +1062,8 @@ async fn no_stored_byte_carries_an_address_under_a_rule() {
             "{case}: the exemplar is dropped, yet its ciphertext is stored in {found:?}"
         );
     }
+    let expected: Vec<_> = expected_counts().to_vec();
+    assert_eq!(counts, expected, "IPCrypt values counted, per signal");
 }
 
 /// The control: with no policy the same pipeline stores each case's raw
