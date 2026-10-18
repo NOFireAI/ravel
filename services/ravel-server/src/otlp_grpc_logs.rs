@@ -98,6 +98,7 @@ impl LogsService for GrpcLogsService {
                 Status::invalid_argument(err.to_string())
             }
             LogIngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),
+            err @ LogIngestRequestError::IpcryptRules => Status::internal(err.to_string()),
             // Buffer-budget shed (ADR-0069): RESOURCE_EXHAUSTED, not the
             // UNAVAILABLE the other retryable write failures take.
             LogIngestRequestError::Write(

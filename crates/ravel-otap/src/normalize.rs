@@ -680,8 +680,19 @@ pub fn normalize_decoded(
     ingest_ts_ns: i64,
 ) -> NormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    let result =
-        normalize_decoded_with_exemplars(tenant, batch, limits, rules, ingest_ts_ns, &mut cap);
+    // The discarded exemplars' rule-matched values are not stored, so they
+    // stay out of `output.ipcrypt_tally`.
+    let mut discarded_exemplar_tally = IpcryptTally::new();
+    let (result, _) = normalize_impl(
+        tenant,
+        prepare_batch(batch, limits, rules),
+        limits,
+        rules,
+        ingest_ts_ns,
+        &mut cap,
+        &mut discarded_exemplar_tally,
+        false,
+    );
     let mut output = result.output;
     // The cap admitted these, but this entry point drops them (nothing stores
     // exemplars on the OTAP path yet). A discarded admission is still a dropped
@@ -713,16 +724,19 @@ pub fn normalize_decoded_with_exemplars(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> MetricsNormalizeResult {
-    normalize_impl(
+    let mut exemplar_tally = IpcryptTally::new();
+    let (mut result, _) = normalize_impl(
         tenant,
         prepare_batch(batch, limits, rules),
         limits,
         rules,
         ingest_ts_ns,
         exemplar_cap,
+        &mut exemplar_tally,
         false,
-    )
-    .0
+    );
+    result.output.ipcrypt_tally.merge(&exemplar_tally);
+    result
 }
 
 /// Normalize exactly like [`normalize_decoded_with_exemplars`], and additionally
@@ -759,14 +773,13 @@ pub fn normalize_decoded_with_metadata(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
-    normalize_impl(
+    normalize_prepared_with_metadata(
         tenant,
         prepare_batch(batch, limits, rules),
         limits,
         rules,
         ingest_ts_ns,
         exemplar_cap,
-        true,
     )
 }
 
@@ -785,15 +798,44 @@ pub fn normalize_prepared_with_metadata(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
-    normalize_impl(
+    let (mut result, exemplar_tally, metadata) = normalize_prepared_points_tally(
         tenant,
         prepared,
         limits,
         rules,
         ingest_ts_ns,
         exemplar_cap,
+    );
+    result.output.ipcrypt_tally.merge(&exemplar_tally);
+    (result, metadata)
+}
+
+/// [`normalize_prepared_with_metadata`] with the admitted exemplars' IPCrypt
+/// tally returned on its own instead of merged into the output's: the
+/// returned `output.ipcrypt_tally` counts the rule-matched values of the
+/// points and resource labels only, and the second element counts those of
+/// `exemplars`. A caller that stores the points and discards the exemplars
+/// counts the first and not the second.
+pub fn normalize_prepared_points_tally(
+    tenant: &TenantId,
+    prepared: PreparedBatch<'_>,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+) -> (MetricsNormalizeResult, IpcryptTally, Vec<MetricMetadata>) {
+    let mut exemplar_tally = IpcryptTally::new();
+    let (result, metadata) = normalize_impl(
+        tenant,
+        prepared,
+        limits,
+        rules,
+        ingest_ts_ns,
+        exemplar_cap,
+        &mut exemplar_tally,
         true,
-    )
+    );
+    (result, exemplar_tally, metadata)
 }
 
 /// One batch flattened, resolved and projected, with no label built yet.
@@ -922,6 +964,7 @@ pub fn prepare_batch<'b>(
 /// true only for the metadata entry points; the points, exemplars, and
 /// rejections it produces do not depend on it, so the older entry points are
 /// behaviorally unchanged.
+#[allow(clippy::too_many_arguments)]
 fn normalize_impl(
     tenant: &TenantId,
     prepared: PreparedBatch<'_>,
@@ -929,6 +972,7 @@ fn normalize_impl(
     rules: &TenantRules,
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
+    exemplar_tally: &mut IpcryptTally,
     collect_metadata: bool,
 ) -> (MetricsNormalizeResult, Vec<MetricMetadata>) {
     let mut tally = IpcryptTally::new();
@@ -1010,6 +1054,7 @@ fn normalize_impl(
         attr_order: &number_exemplar_attr_order,
         cap: exemplar_cap,
         out: &mut exemplars,
+        tally: exemplar_tally,
     };
 
     for dp in flat_dp {
@@ -1114,14 +1159,7 @@ fn normalize_impl(
                 // This is the same rule `ravel_otlp::build_point`
                 // applies to a gauge or sum exemplar, which is what keeps the
                 // two paths' exemplar decisions identical (ADR-0011).
-                number_exemplar_admission.admit(
-                    dp.id,
-                    limits,
-                    rules,
-                    &mut tally,
-                    |_| series_id,
-                    &mut rejected,
-                );
+                number_exemplar_admission.admit(dp.id, limits, rules, |_| series_id, &mut rejected);
             }
             Err(rejection) => rejected.push(rejection.clone()),
         }
@@ -1141,6 +1179,7 @@ fn normalize_impl(
         attr_order: &hist_exemplar_attr_order,
         cap: exemplar_cap,
         out: &mut exemplars,
+        tally: exemplar_tally,
     };
     let mut hist_memos: HashMap<u16, SeriesIdMemo> = HashMap::new();
     for dp in flat_hist_dp {
@@ -3866,7 +3905,6 @@ fn explode_histogram_point(
         dp.id,
         limits,
         rules,
-        counted,
         |value| {
             let idx = exemplar_bucket_index(&dp.explicit_bounds, value);
             bucket_series[idx].series_id
@@ -3893,7 +3931,8 @@ fn exemplar_bucket_index(explicit_bounds: &[f64], value: f64) -> usize {
 
 /// The exemplar side of one normalize pass: the decoded exemplar rows grouped
 /// by data-point id, the attrs table they join to, the caller's admission cap,
-/// and where admitted exemplars go.
+/// where admitted exemplars go, and where their rule-matched values are
+/// counted.
 ///
 /// Bundled into one struct because [`explode_histogram_point`] would otherwise
 /// take five more parameters for one concern, and because the cap and the
@@ -3911,6 +3950,9 @@ struct ExemplarAdmission<'a, 'b> {
     attr_order: &'a [u32],
     cap: &'a mut ExemplarCap,
     out: &'a mut Vec<NormalizedExemplar>,
+    /// Kept apart from the points' tally so a caller that discards the
+    /// exemplars does not count their values as stored.
+    tally: &'a mut IpcryptTally,
 }
 
 impl ExemplarAdmission<'_, '_> {
@@ -3934,7 +3976,6 @@ impl ExemplarAdmission<'_, '_> {
         dp_id: u32,
         limits: &IngestLimits,
         rules: &TenantRules,
-        tally: &mut IpcryptTally,
         series_id_for: F,
         informational: &mut Vec<Rejection>,
     ) where
@@ -3968,7 +4009,7 @@ impl ExemplarAdmission<'_, '_> {
         for (candidate, candidate_tally) in candidates {
             let series_id = series_id_for(f64::from_bits(candidate.value_bits));
             if self.cap.admit(series_id, candidate.ts_ns) {
-                tally.merge(&candidate_tally);
+                self.tally.merge(&candidate_tally);
                 self.out.push(NormalizedExemplar {
                     series_id,
                     exemplar: candidate,
@@ -5343,6 +5384,80 @@ mod tests {
         StreamState::new(StreamConfig::default())
             .decode(records)
             .expect("decode")
+    }
+
+    /// The point tally and the admitted exemplars' tally come back apart:
+    /// `normalize_decoded` and `normalize_prepared_points_tally`'s first tally
+    /// count the point label only, while `normalize_decoded_with_exemplars`,
+    /// which returns the exemplar, counts both.
+    #[test]
+    fn exemplar_tally_is_kept_apart_from_the_point_tally() {
+        use crate::encode::{ExemplarRow, ExemplarValue};
+        use ravel_ipcrypt::policy::{Variant, parse_policy_file};
+        use ravel_ipcrypt::render::RenderOutcome;
+        use ravel_types::TenantHash;
+
+        let sanitize = |key: &str| ravel_otlp::normalize::sanitize_label_name(key.to_string());
+        let policy = parse_policy_file(
+            "[defaults]\nrules = [{ key = \"client.ip\", variant = \"deterministic\" }]\n",
+            sanitize,
+        )
+        .expect("policy parses");
+        let rules = TenantRules::resolve(
+            &policy,
+            "acme",
+            &TenantHash([9u8; 16]),
+            &[7u8; 32],
+            sanitize,
+        )
+        .expect("rules resolve");
+        let metrics = vec![MetricRow {
+            name: "requests".to_string(),
+            kind: MetricKind::Gauge,
+            data_points: vec![DataPointRow {
+                time_unix_nano: TS,
+                value: 1.0,
+                flags: 0,
+                exemplars: vec![ExemplarRow {
+                    time_unix_nano: TS,
+                    value: ExemplarValue::Double(0.5),
+                    trace_id: None,
+                    span_id: None,
+                    attrs: vec![str_attr("client.ip", "192.0.2.2")],
+                }],
+                attrs: vec![str_attr("client.ip", "192.0.2.1")],
+            }],
+        }];
+        let mut encoder = MetricsStreamEncoder::new("tally").expect("encoder");
+        let batch = StreamState::new(StreamConfig::default())
+            .decode(encoder.encode_batch(0, &metrics).expect("encode"))
+            .expect("decode");
+        let tenant = TenantId::new("acme");
+        let limits = IngestLimits::default();
+        let encrypted =
+            |tally: &IpcryptTally| tally.count(Variant::Deterministic, RenderOutcome::Encrypted);
+
+        let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
+        let kept = normalize_decoded_with_exemplars(&tenant, &batch, &limits, &rules, TS, &mut cap);
+        assert_eq!(kept.exemplars.len(), 1);
+        assert_eq!(encrypted(&kept.output.ipcrypt_tally), 2);
+
+        let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
+        let (split, exemplar_tally, _) = normalize_prepared_points_tally(
+            &tenant,
+            prepare_batch(&batch, &limits, &rules),
+            &limits,
+            &rules,
+            TS,
+            &mut cap,
+        );
+        assert_eq!(split.exemplars.len(), 1);
+        assert_eq!(encrypted(&split.output.ipcrypt_tally), 1);
+        assert_eq!(encrypted(&exemplar_tally), 1);
+
+        let discarded = normalize_decoded(&tenant, &batch, &limits, &rules, TS);
+        assert_eq!(discarded.points.len(), 1);
+        assert_eq!(encrypted(&discarded.ipcrypt_tally), 1);
     }
 
     proptest! {

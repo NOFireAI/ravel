@@ -274,11 +274,12 @@ pub struct RwNormalizeOutput {
     /// [`ResolvedRequest::created_timestamps_count`], which this mirrors.
     pub created_timestamps_dropped: usize,
     /// Per-(variant, outcome) counts of the rule-matched values this call
-    /// stores (ADR-2993 decision 3): each `TimeSeries`' matched label values
-    /// once if any of its samples or histograms is stored, and an exemplar's
-    /// only if the exemplar cap admits it. A rejected series or a dropped
-    /// exemplar counts nothing. Empty when the rule set is empty or matched
-    /// nothing.
+    /// returns for storage (ADR-2993 decision 3): each `TimeSeries`' matched
+    /// label values once if any of its samples or histograms is kept, and,
+    /// from [`normalize_with_exemplars`] only, an exemplar's if the exemplar
+    /// cap admits it. [`normalize_resolved`] discards every exemplar, so its
+    /// tally counts none. A rejected series or a dropped exemplar counts
+    /// nothing. Empty when the rule set is empty or matched nothing.
     pub ipcrypt_tally: IpcryptTally,
 }
 
@@ -317,7 +318,9 @@ pub struct RwMetricsNormalizeResult {
 /// [`RwNormalizeOutput::exemplars_dropped`] (ADR-0047 decision 2: an exemplar
 /// that is not stored is dropped and counted, never silently discarded). The
 /// counter therefore reports the cap's rejections plus whatever this wrapper
-/// threw away afterwards. Callers with somewhere to put admitted exemplars
+/// threw away afterwards. For the same reason the returned
+/// [`RwNormalizeOutput::ipcrypt_tally`] counts no exemplar's values. Callers
+/// with somewhere to put admitted exemplars
 /// should call [`normalize_with_exemplars`] with a cap that
 /// outlives one request, which is the only way the per-series window means
 /// anything.
@@ -329,7 +332,8 @@ pub fn normalize_resolved(
     ingest_ts_ns: i64,
 ) -> RwNormalizeOutput {
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
-    let result = normalize_with_exemplars(tenant, resolved, limits, rules, ingest_ts_ns, &mut cap);
+    let (result, _discarded_exemplar_tally) =
+        normalize_split(tenant, resolved, limits, rules, ingest_ts_ns, &mut cap);
     let mut output = result.output;
     // The cap admitted these, but this entry point discards them (nothing
     // stores exemplars on the RW path yet). A discarded admission is still a
@@ -358,6 +362,24 @@ pub fn normalize_with_exemplars(
     ingest_ts_ns: i64,
     exemplar_cap: &mut ExemplarCap,
 ) -> RwMetricsNormalizeResult {
+    let (mut result, exemplar_tally) =
+        normalize_split(tenant, resolved, limits, rules, ingest_ts_ns, exemplar_cap);
+    result.output.ipcrypt_tally.merge(&exemplar_tally);
+    result
+}
+
+/// [`normalize_with_exemplars`] with the admitted exemplars' IPCrypt tally
+/// returned beside the result instead of merged into
+/// [`RwNormalizeOutput::ipcrypt_tally`], so a caller that discards the
+/// exemplars does not count them.
+fn normalize_split(
+    tenant: &TenantId,
+    resolved: ResolvedRequest,
+    limits: &IngestLimits,
+    rules: &TenantRules,
+    ingest_ts_ns: i64,
+    exemplar_cap: &mut ExemplarCap,
+) -> (RwMetricsNormalizeResult, IpcryptTally) {
     // Native histograms count toward the per-request data-point limit now
     // that they are admitted rather than rejected: one histogram sample is
     // one stored data point, the same as one scalar sample.
@@ -375,7 +397,7 @@ pub fn normalize_with_exemplars(
                 .iter()
                 .map(|s| s.exemplars.len())
                 .sum::<usize>();
-        return RwMetricsNormalizeResult {
+        let result = RwMetricsNormalizeResult {
             output: RwNormalizeOutput {
                 points: Vec::new(),
                 histogram_points: Vec::new(),
@@ -395,6 +417,7 @@ pub fn normalize_with_exemplars(
             },
             exemplars: Vec::new(),
         };
+        return (result, IpcryptTally::new());
     }
 
     let mut points = Vec::new();
@@ -406,6 +429,7 @@ pub fn normalize_with_exemplars(
     // counted; the per-series admission pass below adds to this.
     let mut exemplars_dropped = resolved.exemplars_dropped;
     let mut tally = IpcryptTally::new();
+    let mut exemplar_tally = IpcryptTally::new();
 
     for series in &resolved.series {
         normalize_series(
@@ -422,10 +446,11 @@ pub fn normalize_with_exemplars(
             &mut rejected,
             &mut counts,
             &mut tally,
+            &mut exemplar_tally,
         );
     }
 
-    RwMetricsNormalizeResult {
+    let result = RwMetricsNormalizeResult {
         output: RwNormalizeOutput {
             points,
             histogram_points,
@@ -438,7 +463,8 @@ pub fn normalize_with_exemplars(
             ipcrypt_tally: tally,
         },
         exemplars,
-    }
+    };
+    (result, exemplar_tally)
 }
 
 /// Running native-histogram tallies for one request.
@@ -463,6 +489,7 @@ fn normalize_series(
     rejected: &mut Vec<RwRejection>,
     counts: &mut HistogramTallies,
     tally: &mut IpcryptTally,
+    exemplar_tally: &mut IpcryptTally,
 ) {
     let point_count = series.samples.len() + series.histograms.len();
 
@@ -500,7 +527,7 @@ fn normalize_series(
         series_id,
         limits,
         rules,
-        tally,
+        exemplar_tally,
         ingest_ts_ns,
         exemplar_cap,
         exemplars_out,
@@ -567,7 +594,7 @@ fn admit_exemplars(
     series_id: SeriesId,
     limits: &IngestLimits,
     rules: &TenantRules,
-    tally: &mut IpcryptTally,
+    exemplar_tally: &mut IpcryptTally,
     ingest_ts_ns: i64,
     cap: &mut ExemplarCap,
     exemplars_out: &mut Vec<NormalizedExemplar>,
@@ -594,7 +621,7 @@ fn admit_exemplars(
 
     for (candidate, candidate_tally) in candidates {
         if cap.admit(series_id, candidate.ts_ns) {
-            tally.merge(&candidate_tally);
+            exemplar_tally.merge(&candidate_tally);
             exemplars_out.push(NormalizedExemplar {
                 series_id,
                 exemplar: candidate,
@@ -3373,6 +3400,64 @@ mod tests {
         assert_eq!(out.points[4].sample.value, 42.5);
         assert_eq!(out.points[5].series_id, count_id);
         assert_eq!(out.points[5].sample.value, 10.0);
+    }
+
+    /// `normalize_resolved` discards the exemplars the cap admits, so its
+    /// IPCrypt tally counts the sample label and not the exemplar's, while
+    /// `normalize_with_exemplars` returns the exemplar and counts both.
+    #[test]
+    fn normalize_resolved_tally_counts_no_discarded_exemplar() {
+        use ravel_ipcrypt::policy::{Variant, parse_policy_file};
+        use ravel_ipcrypt::render::RenderOutcome;
+        use ravel_types::TenantHash;
+
+        let sanitize = |key: &str| ravel_otlp::normalize::sanitize_label_name(key.to_string());
+        let policy = parse_policy_file(
+            "[defaults]\nrules = [{ key = \"client.ip\", variant = \"deterministic\" }]\n",
+            sanitize,
+        )
+        .expect("policy parses");
+        let rules = TenantRules::resolve(
+            &policy,
+            "acme",
+            &TenantHash([9u8; 16]),
+            &[7u8; 32],
+            sanitize,
+        )
+        .expect("rules resolve");
+        let ruled_series = || {
+            let mut s = series(
+                vec![label("__name__", "up"), label("client_ip", "192.0.2.1")],
+                vec![sample(1_000, 1.0)],
+            );
+            s.exemplars = vec![exemplar(1_000, 0.5, vec![label("client_ip", "192.0.2.2")])];
+            s
+        };
+        let encrypted =
+            |tally: &IpcryptTally| tally.count(Variant::Deterministic, RenderOutcome::Encrypted);
+
+        let mut cap = ExemplarCap::default();
+        let kept = normalize_with_exemplars(
+            &tenant(),
+            request(vec![ruled_series()]),
+            &IngestLimits::default(),
+            &rules,
+            1_000_000,
+            &mut cap,
+        );
+        assert_eq!(kept.exemplars.len(), 1);
+        assert_eq!(encrypted(&kept.output.ipcrypt_tally), 2);
+
+        let discarded = normalize_resolved(
+            &tenant(),
+            request(vec![ruled_series()]),
+            &IngestLimits::default(),
+            &rules,
+            1_000_000,
+        );
+        assert_eq!(discarded.points.len(), 1);
+        assert_eq!(discarded.exemplars_dropped, 1);
+        assert_eq!(encrypted(&discarded.ipcrypt_tally), 1);
     }
 
     proptest::proptest! {

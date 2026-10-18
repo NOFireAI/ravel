@@ -27,7 +27,6 @@ use ravel_ingest::{
     AdmissionController, Clock, IngestByteBudget, IngestPoint, IngestRouter, IngestValue,
     RequestRejection, WriteError, plausible_ingest_clock,
 };
-use ravel_ipcrypt::rules::TenantRules;
 use ravel_otlp::IngestLimits;
 use ravel_query::http::TenantResolver;
 use ravel_remote_write::{RwNormalizeOutput, normalize_resolved};
@@ -227,6 +226,11 @@ pub struct RemoteWriteState {
     /// (see the module doc comment above), so every write resolves through
     /// this value alone.
     pub strict_flush_policy: crate::config::StrictFlushPolicy,
+    /// The process's IPCrypt policy, as [`crate::ingest::IngestState::ipcrypt`].
+    pub ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
+    /// The normalize-layer counters the OTLP and OTAP surfaces share; this
+    /// surface feeds only `ravel_ingest_ipcrypt_values_total` into it.
+    pub normalize_metrics: Arc<crate::normalize_reject_metrics::NormalizeRejectMetrics>,
 }
 
 impl crate::ingest_admission::IngestAdmissionState for RemoteWriteState {
@@ -456,14 +460,22 @@ async fn remote_write(
 
     // Strict mode only: a Remote Write 2xx must mean durable, so the
     // buffered-mode header override is never consulted on this surface.
-    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
-    let normalized = normalize_resolved(
-        &tenant,
-        resolved,
-        &state.limits,
-        &TenantRules::none(),
-        now_ns,
-    );
+    // The tenant's IPCrypt rules (ADR-2993). A resolve failure stores
+    // nothing: writing the ruled labels in the clear is what the policy
+    // exists to prevent, and the cause (logged with the tenant hash and rule
+    // key) is the operator's to fix, so a 500 rather than a retryable 5xx.
+    let rules = match state.ipcrypt.rules_for(&tenant) {
+        Ok(rules) => rules,
+        Err(_) => {
+            state.metrics.record_request_rejected();
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::ipcrypt::TENANT_RULES_UNAVAILABLE,
+            )
+                .into_response();
+        }
+    };
+    let normalized = normalize_resolved(&tenant, resolved, &state.limits, &rules, now_ns);
     let mut points_dropped = compute_points_dropped(&normalized);
     let metadata_dropped = normalized.metadata_dropped as u64;
     let created_timestamps_dropped = normalized.created_timestamps_dropped as u64;
@@ -493,7 +505,8 @@ async fn remote_write(
         return admission_rejection_response(rejection);
     }
     let admission = state.admission.admit_series(&tenant, candidate_series, now);
-    if !admission.rejected.is_empty() {
+    let fully_admitted = admission.rejected.is_empty();
+    if !fully_admitted {
         let admitted: HashSet<SeriesId> = admission.admitted.into_iter().collect();
         ingest_points.retain(|p| admitted.contains(&p.series_id));
         points_dropped += admission.rejected.len() as u64;
@@ -561,6 +574,14 @@ async fn remote_write(
             return write_error_response(err);
         }
     };
+    // Counted only once the write is acknowledged, and only when the
+    // active-series cap dropped nothing: the tally is per request, not per
+    // series, so a partly admitted request counts nothing.
+    if fully_admitted {
+        state
+            .normalize_metrics
+            .record_ipcrypt(Signal::Metrics, &normalized.ipcrypt_tally);
+    }
 
     state.metrics.record_request_accepted(
         points_accepted,
@@ -760,6 +781,10 @@ pub(crate) mod tests {
             ingest_concurrency: IngestConcurrencyController::shared(ceiling),
             clock,
             metadata_sink: None,
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
+            normalize_metrics: Arc::new(
+                crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
+            ),
             budget: IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited),
             write_gate: None,
             strict_flush_policy: crate::config::StrictFlushPolicy::Aged,

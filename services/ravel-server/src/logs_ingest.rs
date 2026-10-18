@@ -14,7 +14,6 @@ use ravel_ingest::{
     MarkerLookupError, RequestRejection, WriteMode, plausible_ingest_clock, read_marker,
     write_marker,
 };
-use ravel_ipcrypt::rules::TenantRules;
 use ravel_maintain::config::DEFAULT_IDEM_DEDUP_WINDOW_HOURS;
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::{LogIngestLimits, LogRejection, NormalizeRejectCounts, normalize_logs_projected};
@@ -54,6 +53,8 @@ pub struct LogIngestState {
     /// projected resolved-label bytes for the duration of normalization, as
     /// [`crate::ingest::IngestState::budget`] is.
     pub budget: Arc<ravel_ingest::IngestByteBudget>,
+    /// The process's IPCrypt policy, as [`crate::ingest::IngestState::ipcrypt`].
+    pub ipcrypt: Arc<crate::ipcrypt::IpcryptPolicy>,
 }
 
 #[derive(Debug)]
@@ -101,6 +102,9 @@ pub enum LogIngestRequestError {
     /// durable provisioning record (ADR-0050 section 5). Operator
     /// misconfiguration, not client fault; the request fails.
     Provisioning(String),
+    /// The tenant's IPCrypt rule set could not be resolved, as
+    /// [`crate::ingest::IngestRequestError::IpcryptRules`].
+    IpcryptRules,
     Write(LogWriteError),
 }
 
@@ -114,6 +118,9 @@ impl std::fmt::Display for LogIngestRequestError {
                 "idempotency key is {len} bytes, exceeds the {MAX_IDEMPOTENCY_KEY_BYTES}-byte limit"
             ),
             LogIngestRequestError::Provisioning(msg) => write!(f, "{msg}"),
+            LogIngestRequestError::IpcryptRules => {
+                f.write_str(crate::ipcrypt::TENANT_RULES_UNAVAILABLE)
+            }
             LogIngestRequestError::Write(err) => write!(f, "{err}"),
         }
     }
@@ -134,6 +141,7 @@ impl LogIngestRequestError {
             LogIngestRequestError::InvalidIdempotencyKey { .. } => false,
             // An operator misconfiguration, not transient.
             LogIngestRequestError::Provisioning(_) => false,
+            LogIngestRequestError::IpcryptRules => false,
             LogIngestRequestError::Write(err) => err.is_retryable(),
         }
     }
@@ -394,8 +402,12 @@ pub async fn handle_export_logs_releasing(
         }
     }
 
-    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
-    let rules = TenantRules::none();
+    // The tenant's IPCrypt rules (ADR-2993), the same set for projection and
+    // normalization.
+    let rules = state
+        .ipcrypt
+        .rules_for(&tenant)
+        .map_err(|_| LogIngestRequestError::IpcryptRules)?;
     let projected = ravel_otlp::project_log_resolved_label_bytes(&request, &state.limits, &rules);
     let label_charge = crate::ingest::charge_projected_labels(
         &state.budget,
@@ -487,6 +499,14 @@ pub async fn handle_export_logs_releasing(
         .map_err(classify)?;
     permit.release();
     let receipt = submitted.acks().await.map_err(classify)?;
+    // Counted only once the write is acknowledged, and only when the
+    // active-stream cap dropped nothing: the tally is per request, not per
+    // stream, so a partly admitted request counts nothing.
+    if stream_cap_rejected == 0 {
+        state
+            .normalize_metrics
+            .record_ipcrypt(ravel_types::Signal::Logs, &normalized.ipcrypt_tally);
+    }
 
     // Gate on whether anything was rejected at all, never on the unit count: a
     // zero-count rejection still has to reach the sender. The rule and the
@@ -627,6 +647,7 @@ mod tests {
     use ravel_ingest::{
         AdmissionController, AdmissionLimits, IngestConfig, PendingAckBudget, SystemClock,
     };
+    use ravel_ipcrypt::rules::TenantRules;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
 
@@ -668,6 +689,7 @@ mod tests {
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),
@@ -1336,6 +1358,7 @@ mod tests {
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),

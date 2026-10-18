@@ -137,6 +137,58 @@ async fn unknown_format_version_refuses() {
     ));
 }
 
+#[tokio::test]
+async fn stored_fingerprint_of_the_wrong_length_refuses() {
+    // A 31-byte fingerprint would otherwise compare unequal to every local
+    // fingerprint and surface as a Mismatch naming a truncated hex string.
+    let store = MemoryStore::new();
+    let bytes = sysproto::IpcryptPolicyMarker {
+        format_version: 1,
+        fingerprint: vec![9u8; 31],
+    }
+    .encode_to_vec();
+    store
+        .put(
+            IPCRYPT_POLICY_KEY,
+            bytes.into(),
+            PutOptions::create_if_absent(),
+        )
+        .await
+        .expect("seed a short-fingerprint marker object");
+
+    let err = check_marker(&store, [1u8; 32]).await.unwrap_err();
+    assert!(
+        matches!(
+            err,
+            CheckError::Marker(MarkerError::BadFingerprintLen { got: 31 })
+        ),
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn create_failure_refuses_as_a_create_error() {
+    // No marker and a non-empty local policy takes the create branch; a
+    // transient put failure there must refuse as `Create`, not fall through
+    // to the lost-race re-read or report the marker as created.
+    let plan = FaultPlan::empty().with_rule(Rule::new(
+        Op::Put,
+        ScriptedFault::Transient("injected put failure".to_string()),
+    ));
+    let store = FaultStore::new(MemoryStore::new(), plan);
+
+    let err = check_marker(&store, [12u8; 32]).await.unwrap_err();
+    assert!(
+        matches!(err, CheckError::Create(StoreError::Transient(_))),
+        "got {err:?}"
+    );
+    assert_eq!(store.fault_count(Op::Put, FaultKind::Transient), 1);
+    assert!(
+        read_marker(store.inner()).await.expect("ok").is_none(),
+        "a failed create must leave no marker behind"
+    );
+}
+
 /// Builds a store where a winner's marker is already present in the inner
 /// [`MemoryStore`], wrapped so the caller's own `check_marker` call actually
 /// takes the lost-create-race branch: its first `get` reports not-found (so

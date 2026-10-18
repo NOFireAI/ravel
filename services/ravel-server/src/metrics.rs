@@ -11,11 +11,11 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly twenty-two label keys, twenty-three in a `sql` build:
+//! renders exactly twenty-three label keys, twenty-four in a `sql` build:
 //! `tenant_hash`, `signal`, `mode`, `op`, `error_kind`, `workload_class`,
 //! `level`, `reason`, `shard`, `cache`, `tier`, `kind`, `outcome`,
 //! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`,
-//! `worker`, and `family`, plus `phase` in a `sql` build (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
+//! `worker`, `family`, and `variant`, plus `phase` in a `sql` build (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
 //! seal-divergence family, `shard` added by ADR-1692 decision 2 as the ninth
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
@@ -33,10 +33,11 @@
 //! ADR-0873 decision 2 to split the declared-statistics drop tally across
 //! its four carriers, and `gate`, `site` and `worker` added by ADR-1702
 //! decision 11 for the CPU gate and tokio runtime families, `family` added by
-//! ADR-1746 for the format-floor families, and `phase` added
+//! ADR-1746 for the format-floor families, `variant` added by ADR-2993
+//! decision 3 for the IPCrypt values counter, and `phase` added
 //! by issue #2374 for the SQL DDL store-cost families). The keys come from
-//! thirty-four `Label` variants, thirty-seven in a `sql` build (`DdlKind`,
-//! `DdlOutcome` and `DdlPhase`) and thirty-eight in a `flight-sql` build,
+//! thirty-eight `Label` variants, forty-one in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and forty-two in a `flight-sql` build,
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
@@ -46,8 +47,8 @@
 //! severity) and `ScrubLevel` (issue #1686, which part of the commit lineage
 //! -- `l0`/`l1`/`rewrite` -- a scrub target came from) both render `level`,
 //! `MergeMemoryKind`, `DeletedObjectKind` and, in a `sql` build, `DdlKind`
-//! render `kind`, `AlertOutcome` and, in a `sql` build, `DdlOutcome` render
-//! `outcome`, and `ReadGateSite`, `WriteGateSite` and `MemoryRefusalSite`
+//! render `kind`, `AlertOutcome`, `IpcryptOutcome` and, in a `sql` build,
+//! `DdlOutcome` render `outcome`, and `ReadGateSite`, `WriteGateSite` and `MemoryRefusalSite`
 //! render `site`. `Label::RuntimeWorker(u32)` is bounded like `Label::Shard`, by its
 //! only constructor.
 //! Every variant's payload is a closed enum
@@ -433,6 +434,12 @@ pub enum Label {
     /// #2926): `unauthenticated`, `over_cap`, `busy` or `timeout`. Shares the
     /// `reason` key with the other reason variants.
     HeadRefusalUndrainedReason(crate::ingest_admission::UndrainedReason),
+    /// Which IPCrypt variant a ruled value was rendered under (ADR-2993
+    /// decision 3): `deterministic` or `prefix`.
+    IpcryptVariant(ravel_ipcrypt::policy::Variant),
+    /// Whether a ruled value was stored `encrypted` or, not parsing as an
+    /// address, `unparsed`. Shares the `outcome` key with `AlertOutcome`.
+    IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome),
 }
 
 /// The closed `site` set of `ravel_memory_gate_refusals_total` and
@@ -643,6 +650,8 @@ impl Label {
             Label::MemoryRefusalSite(_) => "site",
             Label::FormatFamily(_) => "family",
             Label::HeadRefusalUndrainedReason(_) => "reason",
+            Label::IpcryptVariant(_) => "variant",
+            Label::IpcryptOutcome(_) => "outcome",
         }
     }
 
@@ -692,6 +701,8 @@ impl Label {
             Label::MemoryRefusalSite(site) => site.name().to_string(),
             Label::FormatFamily(family) => family.as_str().to_string(),
             Label::HeadRefusalUndrainedReason(reason) => reason.as_str().to_string(),
+            Label::IpcryptVariant(variant) => ipcrypt_variant_name(*variant).to_string(),
+            Label::IpcryptOutcome(outcome) => ipcrypt_outcome_name(*outcome).to_string(),
         }
     }
 
@@ -723,6 +734,22 @@ pub(crate) fn signal_name(signal: Signal) -> &'static str {
         Signal::Profiles => "profiles",
         Signal::Alerts => "alerts",
         Signal::Audit => "audit",
+    }
+}
+
+fn ipcrypt_variant_name(variant: ravel_ipcrypt::policy::Variant) -> &'static str {
+    use ravel_ipcrypt::policy::Variant;
+    match variant {
+        Variant::Deterministic => "deterministic",
+        Variant::Prefix => "prefix",
+    }
+}
+
+fn ipcrypt_outcome_name(outcome: ravel_ipcrypt::render::RenderOutcome) -> &'static str {
+    use ravel_ipcrypt::render::RenderOutcome;
+    match outcome {
+        RenderOutcome::Encrypted => "encrypted",
+        RenderOutcome::Unparsed => "unparsed",
     }
 }
 
@@ -3055,6 +3082,52 @@ fn render_ingest_concurrency_family(out: &mut String, mode: Mode, shed_total: u6
         &[Label::Mode(mode)],
         shed_total,
     );
+}
+
+/// The ingest signals a ruled value can be stored under.
+const IPCRYPT_SIGNALS: [Signal; 3] = [Signal::Metrics, Signal::Logs, Signal::Spans];
+
+/// `ravel_ingest_ipcrypt_values_total` (ADR-2993 decision 3), one sample per
+/// signal, variant and outcome, zeros included, so an alert on `unparsed`
+/// has a series before the first unparsed value. No `tenant_hash`: the
+/// counter is process-wide.
+fn render_ipcrypt_values_family(
+    out: &mut String,
+    mode: Mode,
+    snapshot: &[crate::normalize_reject_metrics::IpcryptValues],
+) {
+    use ravel_ipcrypt::policy::Variant;
+    use ravel_ipcrypt::render::RenderOutcome;
+    const NAME: &str = "ravel_ingest_ipcrypt_values_total";
+    write_header(
+        out,
+        NAME,
+        "IPCrypt-ruled attribute and label values, one per ruled value stored, by signal, variant and outcome: encrypted, or unparsed (not an address, so stored as sent). Counted after the write is acknowledged; a batch the admission layer refuses in whole or in part counts nothing.",
+        "counter",
+    );
+    for signal in IPCRYPT_SIGNALS {
+        for variant in [Variant::Deterministic, Variant::Prefix] {
+            for outcome in [RenderOutcome::Encrypted, RenderOutcome::Unparsed] {
+                let total = snapshot
+                    .iter()
+                    .find(|row| {
+                        row.signal == signal && row.variant == variant && row.outcome == outcome
+                    })
+                    .map_or(0, |row| row.total);
+                write_sample(
+                    out,
+                    NAME,
+                    &[
+                        Label::Mode(mode),
+                        Label::Signal(signal),
+                        Label::IpcryptVariant(variant),
+                        Label::IpcryptOutcome(outcome),
+                    ],
+                    total,
+                );
+            }
+        }
+    }
 }
 
 /// HTTP/1 shed refusals answered with the request body unread (issue #2926),
@@ -8826,6 +8899,11 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         &crate::memory_gate::STATS.snapshot(),
     );
     render_store_control_plane_family(&mut body, state.mode, &state.store_metrics.control_plane());
+    render_ipcrypt_values_family(
+        &mut body,
+        state.mode,
+        &state.normalize_reject_metrics.ipcrypt_snapshot(),
+    );
     render_head_refusal_undrained_family(
         &mut body,
         state.mode,
@@ -9224,6 +9302,8 @@ mod tests {
             Label::HeadRefusalUndrainedReason(
                 crate::ingest_admission::UndrainedReason::Unauthenticated,
             ),
+            Label::IpcryptVariant(ravel_ipcrypt::policy::Variant::Deterministic),
+            Label::IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome::Encrypted),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -9276,6 +9356,8 @@ mod tests {
                 Label::MemoryRefusalSite(_) => "site",
                 Label::FormatFamily(_) => "family",
                 Label::HeadRefusalUndrainedReason(_) => "reason",
+                Label::IpcryptVariant(_) => "variant",
+                Label::IpcryptOutcome(_) => "outcome",
             })
             .collect();
         assert_eq!(
@@ -9348,6 +9430,11 @@ mod tests {
                 // HeadRefusalUndrainedReason (issue #2926) reuses the `reason`
                 // key.
                 "reason",
+                // IpcryptVariant (ADR-2993 decision 3) is the twenty-third key,
+                // for the IPCrypt values counter only.
+                "variant",
+                // IpcryptOutcome reuses the `outcome` key.
+                "outcome",
             ],
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
@@ -9355,19 +9442,19 @@ mod tests {
              label, ADR-0065 decision 4's `kind` (also reused by issue #1729's deleted-objects \
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
              `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, \
-             ADR-1702 decision 11's `gate`/`site`/`worker`, ADR-1746's `family`, and issue \
-             #1686's `level` reuse by `ScrubLevel`"
+             ADR-1702 decision 11's `gate`/`site`/`worker`, ADR-1746's `family`, ADR-2993's \
+             `variant`, and issue #1686's `level` reuse by `ScrubLevel`"
         );
         assert_eq!(
             one_of_each.len(),
-            36,
-            "exactly 36 label variants every build has, 22 distinct keys (sql adds DdlKind, \
+            38,
+            "exactly 38 label variants every build has, 23 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
-            22,
-            "exactly 22 distinct keys"
+            23,
+            "exactly 23 distinct keys"
         );
     }
 
@@ -16875,6 +16962,7 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             recovery: None,
             provisioning: None,
             normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),

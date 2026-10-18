@@ -395,7 +395,7 @@ catalog through `t/*`. Maintain's two deletes are the unreferenced-catalog sweep
 
 ## Control-plane keys outside the data path
 
-Twenty control-plane keys and prefixes are read or written by a server role or
+Twenty-one control-plane keys and prefixes are read or written by a server role or
 by Admin on its normal path. Admin reads all of them through its blanket `t/*`
 and `sys/*` reads, so its column below lists writes and deletes only. Every
 grant names the one key or prefix the calls use:
@@ -408,6 +408,7 @@ grant names the one key or prefix the calls use:
 | `sys/pq-probe/*` | | | | put, delete |
 | `sys/gc` | get | get | get, put | put |
 | `sys/auth` | get | get | | put |
+| `sys/ipcrypt/policy` | get, put (create-only) | | | put |
 | `sys/t/*` | put | | | |
 | `sys/maintain/workers/*` | | | list, get, put, delete | |
 | `sys/maintain/memo/*` | | | list, get, put | |
@@ -433,6 +434,8 @@ the call groups below:
 |---|---|---|---|
 | `DurableAuthState::refresh` reads `sys/auth` (startup, refresh horizon, token miss) | `gateway`, `query`, `all`, keyed bucket | `s3:GetObject` | `GatewayRead` and `QueryRead` `sys/auth` |
 | `ravel-cli tenant token upsert` and `revoke` write `sys/auth` (`CreateIfAbsent`, then `CasVersion`) | Admin | `s3:PutObject` | `AdminWrite` `sys/auth` (the read is `AdminRead` `sys/*`) |
+| `check_startup_marker` (`services/ravel-server/src/ipcrypt.rs`) reads `sys/ipcrypt/policy` at startup whether or not `--ipcrypt-config` is given, and creates it (`CreateIfAbsent`) when it is absent and the local IPCrypt policy is not empty (ADR-2993 decision 9) | `gateway`, `all` | `s3:ListBucket` with `prefix=sys/ipcrypt/policy`, `s3:GetObject`, `s3:PutObject` | `GatewayListBootstrapKeys`; `GatewayRead` `sys/ipcrypt/policy`; `GatewayIpcryptMarkerCreate`, conditioned on `s3:if-none-match: "*"` like `GatewayProvCreate`, so a gateway credential cannot replace the marker |
+| Replacing the IPCrypt policy marker (`ravel-cli ipcrypt set-policy`, issue #3049: a `CasVersion` on the marker it read, or a first create) | Admin | `s3:PutObject` | `AdminWrite` `sys/ipcrypt/policy` (the read is `AdminRead` `sys/*`) |
 | `RecoveryManifestWriter::ensure` writes `sys/t/<tenant_hash>` (`CreateIfAbsent`) on a keyed tenant's first ingest request | `gateway`, `all` | `s3:PutObject` | `GatewayWrite` `sys/t/*` |
 | `read_all_memo_snapshots` lists `sys/maintain/memo/` on a maintain warm start | `maintain` | `s3:ListBucket` with `prefix=sys/maintain/memo/` | `MaintainList` `s3:prefix` `sys/maintain/memo/*` (the GETs and the snapshot PUT fall under `MaintainRead` and `MaintainWrite` `sys/maintain/*`) |
 | `read_config` reads `t/<tenant_hash>/config` (the tenant config record, ADR-0066) | `maintain`, `query`, `gateway` | `s3:GetObject` | `MaintainRead`, `QueryRead` and `GatewayRead` `t/*/config` |
@@ -854,6 +857,7 @@ would admit nothing.
 | `sys/tenancy` | yes | yes | yes | `resolve_and_pin` at startup; absent means no process has pinned the scheme yet, and this one writes the marker |
 | `sys/gc` | yes | yes | yes | `bootstrap_gc_config` at startup; absent means a fresh bucket, and the process tries to create it |
 | `sys/auth` | yes | yes | | `DurableAuthState::refresh` on a keyed bucket; absent is an empty token map |
+| `sys/ipcrypt/policy` | yes | | | `check_startup_marker` at startup in `all` and `gateway` mode; absent means no IPCrypt policy has been recorded, and the process creates the marker when its own policy is not empty |
 | `t/<tenant_hash>/config` | yes | yes | yes | `read_config`; absent means the tenant runs on the deployment defaults |
 | `t/<tenant_hash>/enc` | yes | yes | yes | `bootstrap_tenant_epoch` at startup under `--tenant-kms-config`; absent means no epoch is recorded yet, and the process records the first ones |
 | `t/<tenant_hash>/m/meta` | yes | yes | | the metadata sink (creates it) and the metadata cache (serves nothing) |

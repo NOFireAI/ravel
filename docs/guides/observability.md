@@ -40,14 +40,15 @@ collisions.
 The renderer can attach only these label keys: `tenant_hash`, `signal`,
 `mode`, `op`, `error_kind`, `workload_class`, `level`, `reason`, `cache`,
 `tier`, `kind`, `outcome`, `allocator`, `stat`, `component`, `class`,
-`carrier`, `gate`, `site`, `worker`, `shard`, `family`, and `phase`,
-twenty-three in all. Some keys split more than one family:
+`carrier`, `gate`, `site`, `worker`, `shard`, `family`, `variant`, and
+`phase`, twenty-four in all. Some keys split more than one family:
 
 | Label | What it splits |
 |---|---|
 | `phase` | The [SQL DDL families](#sql-ddl-statements-and-their-store-cost-ravel_sql_ddl_) only. It exists only in a build with the `sql` feature. |
 | `kind` | DDL statements by leading keyword. The maintenance merge-memory gauge into its transient and total high-water marks. |
-| `outcome` | DDL statements by how they ended. The alert-tick counter by how one evaluation tick ended. |
+| `outcome` | DDL statements by how they ended. The alert-tick counter by how one evaluation tick ended. The IPCrypt values counter by `encrypted` or `unparsed`. |
+| `variant` | The IPCrypt values counter only, by `deterministic` or `prefix`. |
 | `reason` | The admission-rejection counter, the scrub counters, the alert retention-skip counter, the superseded-inputs-held counter, the compaction inputs-skipped counter, the ingest rerouted-flushes counter, the fragment capability reject counter, and the SQL slice capability reject counter. |
 | `cache`, `tier` | The read-cache family across its two caches and, when a disk tier is configured, its two tiers. The [caching guide](caching.md) documents both. |
 | `class` | The fragment in-flight gauge and admission-wait counter into their `pinned` and `resolve` fragment admission classes. |
@@ -2307,6 +2308,30 @@ alone:
 |---|---|
 | The ratio holds roughly steady while admitted bytes rise. | The tenant grew its telemetry. |
 | The ratio falls toward 1: admitted bytes stay flat and wire bytes jump. | The tenant turned client-side compression off. |
+
+#### IPCrypt values (`ravel_ingest_ipcrypt_values_total`)
+
+`ravel_ingest_ipcrypt_values_total{mode, signal, variant, outcome}` counts
+the values an `--ipcrypt-config` rule applied to, one per ruled value
+stored. [Pseudonymization (IPCrypt)](../ingest.md#pseudonymization-ipcrypt)
+describes the policy.
+
+- `signal` is `metrics`, `logs` or `spans`. `variant` is `deterministic` or
+  `prefix`. `outcome` is `encrypted`, or `unparsed` for a value that did not
+  parse as an address and was stored as sent.
+- Every combination renders from process start, zeros included.
+- It carries no `tenant_hash`. The counter is process-wide.
+- It is counted after the write is acknowledged. A batch refused after
+  normalization counts nothing: a series-creation-rate or stream-creation-rate
+  refusal, a failed write, and a batch the active-series or active-stream cap
+  admitted only in part. Exemplars that Remote Write and OTAP discard are not
+  counted.
+- One gap remains: an OTLP metrics exemplar that the ingest shard's
+  per-series exemplar cap drops at flush, after the acknowledgement, still
+  counts.
+- Alert on a nonzero `outcome="unparsed"` rate. It means a ruled key carries
+  values that are not the addresses its rule assumed. The counter does not
+  say which key; `signal` and `variant` narrow the search.
 
 ### Per-query cost
 

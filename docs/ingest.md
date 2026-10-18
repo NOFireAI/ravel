@@ -1215,6 +1215,102 @@ store error (or, past its half, the lookup's deadline) go to a WARN log line and
 The full contract is
 [consistency-model.md](consistency-model.md#opt-in-client-idempotency-key-logs-and-spans).
 
+## Pseudonymization (IPCrypt)
+
+ADR-2993 keeps client IP addresses out of storage: an attribute value under a
+configured key is replaced by its IPCrypt ciphertext inside normalization,
+before series identity, size limits and encoding, so no data object, index or
+commit record written from what `ravel-server` ingests carries the address as
+sent. `ravel-cli load` does not yet apply the policy: it stores every value as
+sent and does not read the startup marker below.
+
+### Policy
+
+`ravel-server --ipcrypt-config <file>` names a TOML policy in the
+`--limits-file` shape. `[defaults]` applies to every tenant; a
+`[tenants.<id>]` table replaces the default rule for each key it names and
+inherits the rest:
+
+```toml
+[defaults]
+rules = [
+    { key = "client.address", variant = "deterministic" },
+]
+
+[tenants.acme]
+rules = [
+    { key = "client.address", variant = "prefix", epoch = 2 },
+]
+```
+
+- `key` is the attribute key (see matching below).
+- `variant` is `deterministic` (every address becomes an IPv6 ciphertext) or
+  `prefix` (ipcrypt-pfx: an address keeps its family).
+- `epoch` defaults to 1. `retired_epochs` lists earlier epochs still in
+  retention.
+
+A policy with any rule needs the deployment key (`--tenant-hash-key-file`):
+every rule's key is derived from it, the tenant hash, the variant and the
+epoch, and is never stored. The process refuses to start with rules and no
+deployment key, and refuses a file it cannot parse, a duplicate key, an empty
+key, or an epoch of zero. Without the flag the policy is empty and every value
+is stored as sent. Changing the policy takes a restart.
+
+### Which values a rule matches
+
+- On logs and traces a rule matches the attribute key as sent: resource,
+  scope, record and span attributes, and the attributes of span events and
+  links before their blobs are encoded.
+- On the metric surfaces (OTLP metrics, OTAP and Remote Write) a rule matches
+  the sanitized label name its key is stored under, so a rule on
+  `client.address` matches the `client_address` label. Remote Write keeps
+  label names as sent and sanitizes them only for the lookup, so a label sent
+  as `client.address` and one sent as `client_address` both match that rule,
+  and each is stored under the name it arrived with. Exemplar labels are
+  matched the same way.
+- OTLP metrics store the `service.instance.id` resource attribute as the
+  `instance` label, and a metric rule matches the stored label name. A rule on
+  `service.instance.id` covers that attribute on logs and traces but not the
+  metric `instance` label; a rule on `instance` covers the metric label but
+  not logs and traces. To pseudonymize both, write both rules.
+
+### What is stored
+
+- A value that parses as an IPv4 or IPv6 address is replaced by the
+  ciphertext in canonical text (RFC 5952 for IPv6).
+- `ip:port` and `[ipv6]:port` keep the port; only the address is replaced, and
+  the brackets follow the ciphertext's family, so under `deterministic`
+  `192.0.2.1:8080` is stored as `[<ipv6>]:8080`.
+- Anything else under a rule (a hostname, an address with a zone id, a
+  non-string value) is stored as sent and counted as `unparsed` on
+  `ravel_ingest_ipcrypt_values_total`, described in the
+  [observability guide](guides/observability.md#ipcrypt-values-ravel_ingest_ipcrypt_values_total).
+- One address under one tenant, variant and epoch always yields the same
+  ciphertext, so equality and grouping on the stored values behave as on the
+  raw values. Range predicates and CIDR containment over raw addresses do not
+  work on an encrypted key.
+- The policy is not retroactive. Data written before a rule was added keeps
+  the raw address; use erasure or retention for it.
+
+### Startup marker
+
+In the `all` and `gateway` modes the server compares the policy's fingerprint
+with the bucket's `sys/ipcrypt/policy` marker before it serves, whether or not
+`--ipcrypt-config` is set:
+
+- no marker and an empty policy: nothing is written;
+- no marker and a non-empty policy: the server creates the marker;
+- a marker with a different fingerprint, or a marker that cannot be read or
+  decoded: the server refuses to start. A read failure is never taken for an
+  absent marker.
+
+So every `ravel-server` process ingesting into a bucket runs the same policy;
+`ravel-cli load` is not one of them (see above). `query` and
+`maintain` do not read the marker. Re-keying the marker for a changed policy
+is a `ravel-cli` command that follows in a later release; until then a bucket
+keeps the policy its marker was created with. The IAM templates grant the
+gateway role a create-only write on the marker (`deploy/iam/README.md`).
+
 ## Admission control (ADR-0051)
 
 `ravel-server` builds one `AdmissionController` (`crates/ravel-ingest/src/

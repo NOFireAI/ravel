@@ -202,10 +202,11 @@ fn quarantine_witness_keys() -> Vec<String> {
 /// about `t/**` tenant data and must keep reading `representative_keys` alone).
 /// Every one carries a `/`, so a pattern such as `*/*` still matches all of
 /// them and is still vacuous.
-const NON_TENANT_WITNESS_KEYS: [&str; 5] = [
+const NON_TENANT_WITNESS_KEYS: [&str; 6] = [
     "sys/tenancy",
     "sys/qualification",
     "sys/gc",
+    IPCRYPT_MARKER_KEY,
     "sys/qualify/run-0/probe",
     "admission/query/query-0",
 ];
@@ -2272,6 +2273,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualification",
             "sys/gc",
             "sys/auth",
+            IPCRYPT_MARKER_KEY,
             BOOTSTRAP_CONFIG_PATTERN,
             BOOTSTRAP_ENC_PATTERN,
             BOOTSTRAP_META_PATTERN,
@@ -2293,6 +2295,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualification",
             "sys/gc",
             "sys/auth",
+            IPCRYPT_MARKER_KEY,
             "t/*/config",
             "t/*/enc",
             "t/*/m/meta",
@@ -2312,14 +2315,18 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             PROV_M_PATTERN,
             PROV_L_PATTERN,
             PROV_S_PATTERN,
+            IPCRYPT_MARKER_KEY,
             KEY_EPOCH_PATTERN,
             KEY_EPOCH_PATTERN,
         ],
         // One entry per statement: GatewayWrite, then the create-only
         // GatewayProvCreate (prov_put_grants_carry_exactly_the_expected_conditions),
+        // then the create-only GatewayIpcryptMarkerCreate
+        // (ipcrypt_marker_grants_are_exactly_the_expected_statements),
         // then GatewayEncCreate and GatewayEncCas
         // (key_epoch_put_grants_are_exactly_the_expected_statements).
         put_actions: &[
+            "s3:PutObject",
             "s3:PutObject",
             "s3:PutObject",
             "s3:PutObject",
@@ -2669,6 +2676,7 @@ const EXPECTED_PATTERNS: [ExpectedRolePatterns; 4] = [
             "sys/qualify/*",
             "sys/gc",
             "sys/auth",
+            IPCRYPT_MARKER_KEY,
             "t/*/*/c/*",
             "t/*/u/*",
             "t/*/*/del/*.dreq",
@@ -5221,6 +5229,86 @@ fn every_key_epoch_write_call_site_has_a_grant_of_its_kind() {
         assert_eq!(
             granted, from_calls,
             "{role}: the key-epoch grants' kinds are not the kinds its call sites send"
+        );
+    }
+}
+
+/// The IPCrypt policy marker (ADR-2993 decision 9), `IPCRYPT_POLICY_KEY` in
+/// `crates/ravel-ipcrypt/src/marker.rs`. `ravel-commit` does not depend on
+/// that crate, so the key is spelled here.
+const IPCRYPT_MARKER_KEY: &str = "sys/ipcrypt/policy";
+
+/// Every PutObject Allow statement in `policy` that reaches the marker.
+fn ipcrypt_marker_put_statements(policy: &Policy) -> Vec<serde_json::Value> {
+    policy_statements(policy)
+        .iter()
+        .filter(|stmt| {
+            stmt["Effect"]
+                .as_str()
+                .is_some_and(|e| e.eq_ignore_ascii_case("Allow"))
+                && any_action_grants_any(&statement_actions(stmt), &["s3:PutObject"])
+                && object_key_patterns(policy.role, statement_sid(stmt), &statement_resources(stmt))
+                    .iter()
+                    .any(|p| glob_matches(p, IPCRYPT_MARKER_KEY))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Every ingesting process reads the marker at startup and creates it when
+/// absent, so the gateway role reads it and writes it only through one
+/// create-only statement: a gateway credential cannot replace the policy.
+/// Admin's `AdminWrite` carries the unconditioned put that `ravel-cli ipcrypt
+/// set-policy`'s CAS replace and a first create both need. Query and maintain
+/// never write it.
+#[test]
+fn ipcrypt_marker_grants_are_exactly_the_expected_statements() {
+    let gateway = load_policy("gateway");
+    assert_eq!(
+        ipcrypt_marker_put_statements(&gateway),
+        vec![serde_json::json!({
+            "Sid": "GatewayIpcryptMarkerCreate",
+            "Effect": "Allow",
+            "Action": "s3:PutObject",
+            "Resource": format!("{BUCKET_KEY_PREFIX}{IPCRYPT_MARKER_KEY}"),
+            "Condition": {
+                CREATE_ONLY_CONDITION_OPERATOR: {CREATE_ONLY_CONDITION_KEY: CREATE_ONLY_CONDITION_VALUE}
+            },
+        })],
+        "gateway: the marker is written by exactly one create-only statement"
+    );
+    assert!(
+        !unconditioned_put_patterns(&gateway)
+            .iter()
+            .any(|p| glob_matches(p, IPCRYPT_MARKER_KEY)),
+        "gateway: an unconditioned PutObject reaches the marker"
+    );
+
+    let admin_sids: Vec<(String, Option<PutCondition>)> =
+        ipcrypt_marker_put_statements(&load_policy("admin"))
+            .iter()
+            .map(|stmt| (statement_sid(stmt).to_string(), put_condition_of(stmt)))
+            .collect();
+    assert_eq!(
+        admin_sids,
+        [("AdminWrite".to_string(), None)],
+        "admin: the marker is written by AdminWrite, unconditioned"
+    );
+
+    for role in ["query", "maintain"] {
+        assert_eq!(
+            ipcrypt_marker_put_statements(&load_policy(role)),
+            Vec::<serde_json::Value>::new(),
+            "{role}: a PutObject reaches the marker"
+        );
+    }
+
+    for role in ["gateway", "admin"] {
+        assert!(
+            key_patterns_for(&load_policy(role), &["s3:GetObject"], Some("Allow"))
+                .iter()
+                .any(|p| glob_matches(p, IPCRYPT_MARKER_KEY)),
+            "{role}: no GetObject Allow reaches the marker"
         );
     }
 }
@@ -10683,14 +10771,19 @@ fn shipped_gateway_write_mutated_to_wildcard_action_fails_closed() {
     let statements = json["Statement"]
         .as_array_mut()
         .expect("gateway.json Statement is an array");
-    // GatewayProvCreate, GatewayEncCreate and GatewayEncCas are further
-    // PutObject grants round three would have read; dropping them leaves
-    // GatewayWrite as the only put statement, which is the shape the reviewer
-    // mutated.
+    // GatewayProvCreate, GatewayIpcryptMarkerCreate, GatewayEncCreate and
+    // GatewayEncCas are further PutObject grants round three would have read;
+    // dropping them leaves GatewayWrite as the only put statement, which is the
+    // shape the reviewer mutated.
     statements.retain(|stmt| {
-        !["GatewayProvCreate", "GatewayEncCreate", "GatewayEncCas"]
-            .iter()
-            .any(|sid| stmt["Sid"] == serde_json::json!(sid))
+        ![
+            "GatewayProvCreate",
+            "GatewayIpcryptMarkerCreate",
+            "GatewayEncCreate",
+            "GatewayEncCas",
+        ]
+        .iter()
+        .any(|sid| stmt["Sid"] == serde_json::json!(sid))
     });
     let target = statements
         .iter_mut()
@@ -11363,7 +11456,13 @@ const EXPECTED_BOOTSTRAP_GRANTS: [ExpectedBootstrapGrants; 3] = [
     ExpectedBootstrapGrants {
         role: "gateway",
         fixed_sid: "GatewayListBootstrapKeys",
-        fixed_keys: &["sys/tenancy", "sys/qualification", "sys/gc", "sys/auth"],
+        fixed_keys: &[
+            "sys/tenancy",
+            "sys/qualification",
+            "sys/gc",
+            "sys/auth",
+            IPCRYPT_MARKER_KEY,
+        ],
         tenant_sid: "GatewayListTenantBootstrapKeys",
         tenant_patterns: &[
             BOOTSTRAP_CONFIG_PATTERN,
@@ -11493,6 +11592,13 @@ fn bootstrap_reads() -> Vec<BootstrapRead> {
             tenant_sid,
         );
     }
+    add(
+        "gateway",
+        IPCRYPT_MARKER_KEY.to_string(),
+        "check_marker in ipcrypt::check_startup_marker \
+         (services/ravel-server/src/ipcrypt.rs), startup in all and gateway mode",
+        "GatewayListBootstrapKeys",
+    );
     for role in ["gateway", "query"] {
         let fixed_sid = if role == "gateway" {
             "GatewayListBootstrapKeys"

@@ -26,12 +26,24 @@
 //! rejection: a structured log body that was converted to canonical JSON was
 //! stored, so an operator alerting on rejection reasons must see nothing from
 //! it. It gets its own family.
+//!
+//! The IPCrypt value counter (ADR-2993 decision 3) lives here too, in its own
+//! process-wide map: like a body conversion it counts stored data, not a
+//! rejection, and every ingest surface already holds this one `Arc`. Its
+//! labels carry no tenant (the ADR fixes them as `signal`, `variant`,
+//! `outcome`), so its cardinality is bounded by those enums alone.
 
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
+use ravel_ipcrypt::policy::Variant;
+use ravel_ipcrypt::render::RenderOutcome;
+use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_otlp::NormalizeRejectCounts;
 use ravel_types::{Signal, TenantHash, TenantId};
+
+const IPCRYPT_VARIANTS: [Variant; 2] = [Variant::Deterministic, Variant::Prefix];
+const IPCRYPT_OUTCOMES: [RenderOutcome; 2] = [RenderOutcome::Encrypted, RenderOutcome::Unparsed];
 
 /// Accumulated normalize-layer decisions per `(tenant, signal)`. Keyed by the
 /// tenant hash (not the full id), matching how the admission `/metrics` family
@@ -39,6 +51,17 @@ use ravel_types::{Signal, TenantHash, TenantId};
 #[derive(Default)]
 pub struct NormalizeRejectMetrics {
     rows: Mutex<HashMap<(TenantHash, Signal), Counts>>,
+    ipcrypt: Mutex<HashMap<(Signal, Variant, RenderOutcome), u64>>,
+}
+
+/// One `(signal, variant, outcome)` row of `ravel_ingest_ipcrypt_values_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IpcryptValues {
+    pub signal: Signal,
+    pub variant: Variant,
+    pub outcome: RenderOutcome,
+    /// Rule-matched values stored under this variant with this outcome.
+    pub total: u64,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -137,6 +160,40 @@ impl NormalizeRejectMetrics {
         row.resource_attrs_dropped = row.resource_attrs_dropped.saturating_add(count as u64);
     }
 
+    /// Adds one normalizer call's IPCrypt tally to `signal`'s rows. Callers
+    /// record only after the write is acknowledged, only for a batch the
+    /// admission layer admitted whole, and only the tally of what that write
+    /// carries (never that of discarded exemplars).
+    pub fn record_ipcrypt(&self, signal: Signal, tally: &IpcryptTally) {
+        if tally.is_empty() {
+            return;
+        }
+        let mut rows = self.ipcrypt.lock();
+        for variant in IPCRYPT_VARIANTS {
+            for outcome in IPCRYPT_OUTCOMES {
+                let count = tally.count(variant, outcome);
+                if count > 0 {
+                    let row = rows.entry((signal, variant, outcome)).or_default();
+                    *row = row.saturating_add(count);
+                }
+            }
+        }
+    }
+
+    /// A point-in-time copy of every non-zero IPCrypt row, for `/metrics`.
+    pub fn ipcrypt_snapshot(&self) -> Vec<IpcryptValues> {
+        self.ipcrypt
+            .lock()
+            .iter()
+            .map(|(&(signal, variant, outcome), &total)| IpcryptValues {
+                signal,
+                variant,
+                outcome,
+                total,
+            })
+            .collect()
+    }
+
     /// A point-in-time copy of every accumulated row, for `/metrics` rendering.
     pub fn snapshot(&self) -> Vec<TenantNormalizeRejects> {
         self.rows
@@ -174,7 +231,53 @@ mod tests {
         );
         metrics.record_body_conversions(&tenant("acme"), Signal::Logs, 0);
         metrics.record_resource_attrs_dropped(&tenant("acme"), Signal::Metrics, 0);
+        metrics.record_ipcrypt(Signal::Metrics, &IpcryptTally::new());
         assert!(metrics.snapshot().is_empty());
+        assert!(metrics.ipcrypt_snapshot().is_empty());
+    }
+
+    #[test]
+    fn ipcrypt_tallies_accumulate_per_signal_variant_and_outcome() {
+        let metrics = NormalizeRejectMetrics::new();
+        let mut tally = IpcryptTally::new();
+        tally.record(Variant::Deterministic, RenderOutcome::Encrypted);
+        tally.record(Variant::Deterministic, RenderOutcome::Encrypted);
+        tally.record(Variant::Prefix, RenderOutcome::Unparsed);
+        metrics.record_ipcrypt(Signal::Logs, &tally);
+        metrics.record_ipcrypt(Signal::Logs, &tally);
+        metrics.record_ipcrypt(Signal::Spans, &tally);
+
+        let mut rows = metrics.ipcrypt_snapshot();
+        rows.sort_by_key(|r| (r.signal == Signal::Spans, r.variant == Variant::Prefix));
+        assert_eq!(
+            rows,
+            vec![
+                IpcryptValues {
+                    signal: Signal::Logs,
+                    variant: Variant::Deterministic,
+                    outcome: RenderOutcome::Encrypted,
+                    total: 4,
+                },
+                IpcryptValues {
+                    signal: Signal::Logs,
+                    variant: Variant::Prefix,
+                    outcome: RenderOutcome::Unparsed,
+                    total: 2,
+                },
+                IpcryptValues {
+                    signal: Signal::Spans,
+                    variant: Variant::Deterministic,
+                    outcome: RenderOutcome::Encrypted,
+                    total: 2,
+                },
+                IpcryptValues {
+                    signal: Signal::Spans,
+                    variant: Variant::Prefix,
+                    outcome: RenderOutcome::Unparsed,
+                    total: 1,
+                },
+            ]
+        );
     }
 
     #[test]

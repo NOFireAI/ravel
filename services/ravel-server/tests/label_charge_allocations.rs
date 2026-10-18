@@ -303,6 +303,7 @@ fn metrics_state(budget: Arc<IngestByteBudget>) -> IngestState {
         metadata_sink: None,
         normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         budget,
+        ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
     }
 }
 
@@ -323,6 +324,7 @@ fn logs_state(budget: Arc<IngestByteBudget>) -> LogIngestState {
         provisioning: None,
         normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         budget,
+        ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
     }
 }
 
@@ -343,6 +345,7 @@ fn spans_state(budget: Arc<IngestByteBudget>) -> SpanIngestState {
         provisioning: None,
         normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
         budget,
+        ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
     }
 }
 

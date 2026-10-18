@@ -1070,6 +1070,23 @@ pub struct Cli {
     )]
     pub tenant_kms_config: Option<PathBuf>,
 
+    /// Path to a TOML IPCrypt policy file (ADR-2993 decision 1): a
+    /// `[defaults]` table and optional `[tenants.<name>]` tables, each a list
+    /// of `[[...rules]]` naming an attribute key, a variant (`deterministic`
+    /// or `prefix`) and an epoch. Values stored under a ruled key are
+    /// encrypted at ingest. A policy with any rule needs the bucket's
+    /// deployment key (`--tenant-hash-key-file`); the process refuses to start
+    /// without one. Absent (the default): an empty policy, and every value is
+    /// stored as sent. The `all` and `gateway` modes compare the policy's
+    /// fingerprint with the bucket's `sys/ipcrypt/policy` marker at startup
+    /// whether or not this flag is set.
+    #[arg(
+        long = "ipcrypt-config",
+        env = "RAVEL_IPCRYPT_CONFIG",
+        value_name = "PATH"
+    )]
+    pub ipcrypt_config: Option<PathBuf>,
+
     /// Path to the JSON file of credential profiles Parquet tables are read
     /// through (ADR-2040 decision D1): the same file, and the same loader,
     /// `ravel-cli --parquet-profiles` validates grants against. Each profile
@@ -8254,6 +8271,22 @@ impl Cli {
             .map_err(|e| anyhow::anyhow!("could not read --tenant-kms-config {path:?}: {e}"))?;
         crate::tenant_kms::parse_tenant_kms_config(&text)
             .map_err(|e| anyhow::anyhow!("invalid --tenant-kms-config {}: {e}", path.display()))
+    }
+
+    /// Load and parse `--ipcrypt-config` (ADR-2993 decision 1). Absent flag
+    /// means an empty policy. Metric label keys are matched after the same
+    /// sanitization the OTLP metric normalizer applies, so the parse checks
+    /// that no two rule keys sanitize to one label. The deployment-key
+    /// requirement is checked later, by [`crate::ipcrypt::IpcryptPolicy::new`],
+    /// once the bucket's tenancy marker has been resolved.
+    pub fn parse_ipcrypt_config(&self) -> anyhow::Result<ravel_ipcrypt::policy::PolicyFile> {
+        let Some(path) = self.ipcrypt_config.as_deref() else {
+            return Ok(ravel_ipcrypt::policy::PolicyFile::default());
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("could not read --ipcrypt-config {path:?}: {e}"))?;
+        ravel_ipcrypt::policy::parse_policy_file(&text, crate::ipcrypt::sanitize_rule_key)
+            .map_err(|e| anyhow::anyhow!("invalid --ipcrypt-config {}: {e}", path.display()))
     }
 }
 
