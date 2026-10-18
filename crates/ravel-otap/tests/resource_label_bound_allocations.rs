@@ -16,6 +16,7 @@
 
 use std::alloc::System;
 
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::encode::{
     AttrRow, AttrValue, DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder,
     ResourceAssignment,
@@ -118,22 +119,28 @@ fn measure(value_len: usize) -> [usize; 3] {
     let batch = decoded(value_len);
 
     let region = Region::new(GLOBAL);
-    let projected = project_resolved_label_bytes(&batch, &limits);
+    let projected = project_resolved_label_bytes(&batch, &limits, &TenantRules::none());
     let project = region.change().bytes_allocated;
     assert!(projected.get() > limits.max_resolved_label_bytes_per_request);
 
     let region = Region::new(GLOBAL);
-    let out = normalize_decoded(&tenant, &batch, &limits, INGEST_TS_NS);
+    let out = normalize_decoded(&tenant, &batch, &limits, &TenantRules::none(), INGEST_TS_NS);
     let normalize = region.change().bytes_allocated;
     assert_rejected_whole(&out.rejected);
     drop(out);
 
     let mut cap = ExemplarCap::new(limits.exemplar_cap_window_ns);
     let region = Region::new(GLOBAL);
-    let prepared = prepare_batch(&batch, &limits);
+    let prepared = prepare_batch(&batch, &limits, &TenantRules::none());
     assert!(prepared.projected_label_bytes().get() > limits.max_resolved_label_bytes_per_request);
-    let (result, _) =
-        normalize_prepared_with_metadata(&tenant, prepared, &limits, INGEST_TS_NS, &mut cap);
+    let (result, _) = normalize_prepared_with_metadata(
+        &tenant,
+        prepared,
+        &limits,
+        &TenantRules::none(),
+        INGEST_TS_NS,
+        &mut cap,
+    );
     let prepare = region.change().bytes_allocated;
     assert_rejected_whole(&result.output.rejected);
 
