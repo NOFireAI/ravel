@@ -257,13 +257,17 @@ publishes in its own process after each tick: the tenant's pending and
 firing alerts and each rule's health. A request reads that snapshot for its
 own tenant and nothing else. It reads no object, runs no query, and takes no
 time window, so it has none of the auth, window, admission, accounting, or
-audit machinery the rejected history endpoint would have duplicated. A
-process that runs no evaluator answers 503 on `/api/v1/alerts`; there is no
-cross-process read. A process that does answers the same 503 before its first
-tick for the tenant and whenever its last tick could not read the tenant's
-alert history, rather than serving an earlier tick's list. Nothing in the
-snapshot outlives the tick that produced it: an alert's value is present only
-when that tick evaluated its rule in this process.
+audit machinery the rejected history endpoint would have duplicated. A tenant
+with no loaded rules gets 200 and an empty list from every process, decided
+from the loaded rule set alone. For a tenant with rules, `/api/v1/alerts`
+answers 503 in four cases: the process runs no evaluator, since there is no
+cross-process read; its evaluator has not finished a tick for the tenant;
+the last tick could not read the tenant's alert history, rather than serving
+an earlier tick's list; and the last snapshot is stale, published more than
+three evaluation intervals ago, so a stopped evaluator's snapshot is not
+served unchanged. Nothing in the snapshot outlives the tick that produced it:
+an alert's value is present only when that tick evaluated its rule in this
+process.
 
 This does not reopen the rejected alternative. That endpoint was for alert
 history, every transition over a window, and history stays on the `alerts`

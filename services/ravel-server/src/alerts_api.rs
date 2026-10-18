@@ -43,12 +43,12 @@
 //! served in place of the one that tick could not read.
 //!
 //! A tenant's evaluator is the only writer of its snapshot, so one that has
-//! panicked or wedged leaves its last snapshot in place. Once that snapshot is
-//! older than [`STALE_AFTER_INTERVALS`] evaluation intervals, on the clock of
-//! the evaluator that published it, `/api/v1/alerts` answers the same 503 with
-//! [`SNAPSHOT_STALE`] and the snapshot's age, and `/api/v1/rules` renders the
-//! tenant's rules as before the first tick, until the evaluator publishes
-//! again.
+//! panicked or wedged leaves its last snapshot in place. Once that snapshot was
+//! published more than [`STALE_AFTER_INTERVALS`] evaluation intervals ago, on
+//! the clock of the evaluator that published it, `/api/v1/alerts` answers the
+//! same 503 with [`SNAPSHOT_STALE`] and the snapshot's age, and
+//! `/api/v1/rules` renders the tenant's rules as before the first tick, until
+//! the evaluator publishes again.
 //!
 //! # Groups
 //!

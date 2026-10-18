@@ -181,16 +181,20 @@ const LEASE_TTL_TICKS: u32 = 3;
 /// [`PublishedAlerts::read`] reports it [`PublishedRead::Stale`] and the alert
 /// routes stop serving it.
 ///
-/// A snapshot's age runs from its tick's clock reading, taken when the tick
-/// starts, and a healthy evaluator replaces it when the next tick ends. That
-/// tick starts after a jittered sleep of at most 1.1 intervals, so the oldest
-/// a healthy evaluator's snapshot gets is 1.1 intervals plus two ticks. A tick
-/// whose work before delivery fits in the delivery deadline ends half an
-/// interval after it starts, plus one delivery attempt: with the default 60
-/// second interval and 10 second sink timeout that is about 0.67 intervals,
-/// and the snapshot peaks near 2.4 intervals, under three. Three is also
-/// [`LEASE_TTL_TICKS`], the gap after which a standby may take the lease from
-/// a holder that stopped renewing it.
+/// A snapshot's age runs from its publish, the publishing evaluator's clock
+/// reading when the tick that built it ends, not from that tick's start, so a
+/// tick publishes a fresh snapshot however long it ran. A healthy evaluator
+/// replaces the snapshot when its next tick ends, and that tick starts after a
+/// jittered sleep of at most 1.1 intervals, so the oldest the snapshot gets is
+/// 1.1 intervals plus one tick. Nothing bounds a tick's length (see
+/// [`SINK_DELIVERY_DEADLINE_FRACTION`]). A tick whose work before delivery fits
+/// in the delivery deadline ends half an interval after it starts, plus one
+/// delivery attempt: with the default 60 second interval and 10 second sink
+/// timeout that is about 0.67 intervals, and the snapshot peaks near 1.8
+/// intervals. A tick longer than two intervals, or 1.9 after the longest
+/// jittered sleep, lets the snapshot before it read as stale until that tick
+/// publishes. Three is also [`LEASE_TTL_TICKS`], the gap after which a standby
+/// may take the lease from a holder that stopped renewing it.
 pub const STALE_AFTER_INTERVALS: u32 = 3;
 
 /// Fraction of one evaluation interval that sink delivery may consume in a
@@ -387,12 +391,14 @@ pub struct PublishedAlerts {
 
 type PublishedSlot = parking_lot::RwLock<Option<PublishedEntry>>;
 
-/// A published snapshot and the clock of the evaluator that published it,
-/// which is the clock its age is read on.
+/// A published snapshot, the clock of the evaluator that published it, which
+/// is the clock its age is read on, and that clock's reading at the publish,
+/// which is where its age starts.
 #[derive(Clone)]
 struct PublishedEntry {
     snapshot: Arc<TenantAlertSnapshot>,
     clock: Arc<dyn Clock>,
+    published_at_ns: i64,
 }
 
 /// What a tenant's published slot held when a route read it.
@@ -409,8 +415,8 @@ pub enum PublishedRead {
     /// The tenant's last snapshot is older than [`STALE_AFTER_INTERVALS`]
     /// evaluation intervals: its evaluator has stopped publishing.
     Stale {
-        /// How long ago, on the publishing evaluator's clock, the snapshot's
-        /// tick ran.
+        /// How long ago, on the publishing evaluator's clock, the snapshot was
+        /// published.
         age: Duration,
         /// The age past which a snapshot is stale.
         bound: Duration,
@@ -443,9 +449,9 @@ impl PublishedAlerts {
         }
     }
 
-    /// The current state of `tenant`'s slot. A snapshot whose age exceeds
-    /// [`STALE_AFTER_INTERVALS`] evaluation intervals reads as
-    /// [`PublishedRead::Stale`]; a reading behind the snapshot's own, from a
+    /// The current state of `tenant`'s slot. A snapshot whose age since its
+    /// publish exceeds [`STALE_AFTER_INTERVALS`] evaluation intervals reads as
+    /// [`PublishedRead::Stale`]; a reading behind the publish's own, from a
     /// clock stepped backward, counts as age zero.
     pub fn read(&self, tenant: &TenantHash) -> PublishedRead {
         let Some(slot) = self.slot(tenant) else {
@@ -455,10 +461,7 @@ impl PublishedAlerts {
         let Some(entry) = entry else {
             return PublishedRead::NotYetEvaluated;
         };
-        let age_ns = entry
-            .clock
-            .now_ns()
-            .saturating_sub(entry.snapshot.evaluated_at_ns);
+        let age_ns = entry.clock.now_ns().saturating_sub(entry.published_at_ns);
         let age = Duration::from_nanos(u64::try_from(age_ns).unwrap_or(0));
         if age > self.stale_after {
             return PublishedRead::Stale {
@@ -473,14 +476,15 @@ impl PublishedAlerts {
         self.slots.as_ref().and_then(|slots| slots.get(tenant))
     }
 
-    /// Replace `tenant`'s snapshot, stamped on `clock`. A tenant with no slot
-    /// is ignored.
+    /// Replace `tenant`'s snapshot, stamped with `clock`'s current reading. A
+    /// tenant with no slot is ignored.
     fn publish(&self, tenant: &TenantHash, snapshot: TenantAlertSnapshot, clock: Arc<dyn Clock>) {
         let Some(slot) = self.slot(tenant) else {
             return;
         };
         let snapshot = Some(PublishedEntry {
             snapshot: Arc::new(snapshot),
+            published_at_ns: clock.now_ns(),
             clock,
         });
         // The guard is a temporary of this statement, so the replaced snapshot
@@ -494,7 +498,9 @@ impl PublishedAlerts {
 /// [`crate::alerts_api`].
 #[derive(Debug, Clone)]
 pub struct TenantAlertSnapshot {
-    /// The clock reading the tick ran at.
+    /// The clock reading the tick ran at, taken when it started. The
+    /// snapshot's age for [`STALE_AFTER_INTERVALS`] runs from its publish
+    /// instead.
     pub evaluated_at_ns: i64,
     /// Health of every configured rule, keyed by rule id.
     pub rule_health: HashMap<String, RuleHealth>,
@@ -8480,6 +8486,124 @@ mod tick_tests {
         let rule = served_rule(&view).await;
         assert_eq!(rule["health"], "ok", "{rule}");
         assert_eq!(rule["lastEvaluation"], "1970-01-01T00:33:01.000000000Z");
+    }
+
+    /// A store that moves the injected clock forward by `stall_ns` as the alert
+    /// state memo's PUT completes. The memo write is the tick's last store call
+    /// on the lease holder, so the stall lands between the tick's start and its
+    /// publish.
+    struct SlowMemoPut {
+        inner: Arc<dyn ObjectStoreBackend>,
+        clock: Arc<TestClock>,
+        memo_key: String,
+        stall_ns: i64,
+        memo_puts: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ObjectStoreBackend for SlowMemoPut {
+        async fn put(
+            &self,
+            key: &str,
+            data: Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            let outcome = self.inner.put(key, data, opts).await?;
+            if key == self.memo_key {
+                self.memo_puts.fetch_add(1, Ordering::SeqCst);
+                self.clock.advance(self.stall_ns);
+            }
+            Ok(outcome)
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list(prefix, page).await
+        }
+
+        async fn list_after(
+            &self,
+            prefix: &str,
+            start_after: Option<&str>,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.inner.list_after(prefix, start_after, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// A snapshot's age runs from its publish, not from its tick's start. A
+    /// tick whose work takes longer than [`STALE_AFTER_INTERVALS`] evaluation
+    /// intervals publishes a snapshot that is served, with `lastEvaluation`
+    /// still the tick's start, and that snapshot reads as stale only once it
+    /// has gone unrefreshed for over the bound after that publish.
+    #[tokio::test]
+    async fn a_tick_slower_than_the_staleness_bound_publishes_a_served_snapshot() {
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let bound = DEFAULT_ALERT_EVAL_INTERVAL * STALE_AFTER_INTERVALS;
+        let tick_ns = (DEFAULT_ALERT_EVAL_INTERVAL * 4).as_nanos() as i64;
+        let store = Arc::new(SlowMemoPut {
+            inner: seeded_store().await,
+            clock: Arc::clone(&clock),
+            memo_key: crate::alert_state_memo::alert_state_memo_key(&tenant),
+            stall_ns: tick_ns,
+            memo_puts: AtomicU64::new(0),
+        });
+        let view = tenant_published();
+        let mut ev = evaluator(store.clone(), Arc::clone(&clock)).with_published(view.clone());
+        let alerts_route = crate::alerts_api::ALERTS_ROUTE;
+
+        assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(store.memo_puts.load(Ordering::SeqCst), 1);
+        assert_eq!(clock.now_ns(), NOW_NS + tick_ns);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(
+            status, 200,
+            "a snapshot published just now is served however long its tick ran: {body}"
+        );
+        assert_eq!(body["data"]["alerts"][0]["state"], "firing");
+        let rule = served_rule(&view).await;
+        assert_eq!(rule["health"], "ok", "{rule}");
+        assert_eq!(rule["lastEvaluation"], NOW_RFC3339);
+
+        clock.advance(bound.as_nanos() as i64);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(
+            status, 200,
+            "a snapshot exactly the bound past its publish is served: {body}"
+        );
+
+        clock.advance(NS_PER_SEC);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(status, 503, "{body}");
+        assert!(matches!(
+            view.read(&tenant),
+            PublishedRead::Stale { age, bound: read_bound }
+                if age == bound + Duration::from_secs(1) && read_bound == bound
+        ));
     }
 
     /// A tick that read history but could not take the lease renders `err`
