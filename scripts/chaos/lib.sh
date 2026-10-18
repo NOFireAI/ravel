@@ -1624,6 +1624,16 @@ oracle_strict_ack_implies_durable() {
 #    unit count with no stalled units.
 #
 #    Args: survivor_base_url, expected_total_units, kill_epoch_seconds
+# chaos_takeover_measurable LAST TOTAL: 0 when the survivor's last pre-kill
+# units_owned reading LAST is a whole number below TOTAL, so reaching TOTAL
+# after the kill means it took over the victim's units; 1 otherwise (an
+# unread value, or a survivor that already owned everything).
+chaos_takeover_measurable() {
+  local last="$1" total="$2"
+  [[ "$last" =~ ^[0-9]+$ && "$total" =~ ^[1-9][0-9]*$ ]] || return 1
+  (( last < total ))
+}
+
 oracle_sibling_takeover_within_bound() {
   local survivor_url="$1"
   local expected_units="$2"

@@ -967,8 +967,26 @@ check "scenario 2 prints the exact VICTIM line, via echo and not log (log prepen
   "$([[ "${scenario2_body}" == *'echo "VICTIM preferred=${CHAOS_PREFERRED_VICTIM} chosen=${CHAOS_VICTIM} reason=${CHAOS_VICTIM_REASON}"'* ]] && echo yes || echo no)"
 check "scenario 2 prints the VICTIM line exactly once" "1" \
   "$(grep -cF 'echo "VICTIM preferred=${CHAOS_PREFERRED_VICTIM} chosen=${CHAOS_VICTIM} reason=${CHAOS_VICTIM_REASON}"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
-check "scenario 2 runs both takeover oracles unconditionally (no takeover-observable-or-unmeasured gate)" "yes" \
-  "$([[ "${scenario2_body}" != *'assert_takeover_observable_or_unmeasured'* ]] && echo yes || echo no)"
+check "scenario 2 gates both takeover oracles on chaos_takeover_measurable" "yes" \
+  "$([[ "${scenario2_body}" == *'if chaos_takeover_measurable "$SURVIVOR_LAST_UNITS_OWNED" "$EXPECTED_TOTAL_UNITS"; then'* ]] && echo yes || echo no)"
+check "scenario 2 --check refuses CHAOS_MAINTAINED_SIGNALS=0" "64" \
+  "$(CHAOS_MAINTAINED_SIGNALS=0 rc_of bash "${CHAOS_DIR}/kill-maintain-worker.sh" --check)"
+check "scenario 2 --check refuses a non-integer CHAOS_MAINTAINED_SIGNALS" "64" \
+  "$(CHAOS_MAINTAINED_SIGNALS=x rc_of bash "${CHAOS_DIR}/kill-maintain-worker.sh" --check)"
+check "scenario 2 --check refuses CHAOS_EXPECTED_TOTAL_UNITS=0" "64" \
+  "$(CHAOS_EXPECTED_TOTAL_UNITS=0 rc_of bash "${CHAOS_DIR}/kill-maintain-worker.sh" --check)"
+check "takeover measurable: survivor held 12 of 24 before the kill" "0" \
+  "$(rc_of chaos_takeover_measurable 12 24)"
+check "takeover measurable: survivor held 0 of 24 before the kill" "0" \
+  "$(rc_of chaos_takeover_measurable 0 24)"
+check "takeover not measurable: survivor already held all 24" "1" \
+  "$(rc_of chaos_takeover_measurable 24 24)"
+check "takeover not measurable: survivor held more than the total" "1" \
+  "$(rc_of chaos_takeover_measurable 25 24)"
+check "takeover not measurable: survivor's reading unknown" "1" \
+  "$(rc_of chaos_takeover_measurable unknown 24)"
+check "takeover not measurable: total of 0" "1" \
+  "$(rc_of chaos_takeover_measurable 0 0)"
 check "scenario 2 passes --shards \$CHAOS_SHARD_COUNT to both server launch sites" "2" \
   "$(grep -cF -- '--shards "$CHAOS_SHARD_COUNT")' "${CHAOS_DIR}/kill-maintain-worker.sh")"
 check "scenario 2 validates an invalid CHAOS_PREFERRED_VICTIM" "64" \

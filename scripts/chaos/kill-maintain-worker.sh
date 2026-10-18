@@ -158,7 +158,16 @@ if [[ ! "${CHAOS_SHARD_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
   echo "kill-maintain-worker.sh: CHAOS_SHARD_COUNT must be a positive whole number, got '${CHAOS_SHARD_COUNT}'" >&2
   exit 64
 fi
+if [[ ! "${CHAOS_MAINTAINED_SIGNALS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "kill-maintain-worker.sh: CHAOS_MAINTAINED_SIGNALS must be a positive whole number, got '${CHAOS_MAINTAINED_SIGNALS}'" >&2
+  exit 64
+fi
 EXPECTED_TOTAL_UNITS="${CHAOS_EXPECTED_TOTAL_UNITS:-$(( CHAOS_MAINTAINED_SIGNALS * CHAOS_SHARD_COUNT ))}"
+# A total of 0 would let both takeover oracles pass on their first scrape.
+if [[ ! "${EXPECTED_TOTAL_UNITS}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "kill-maintain-worker.sh: the expected total of units must be a positive whole number, got '${EXPECTED_TOTAL_UNITS}'" >&2
+  exit 64
+fi
 
 # Which worker scenario 2 prefers to kill (issue #3037): explicit
 # CHAOS_PREFERRED_VICTIM, else alternating by GITHUB_RUN_NUMBER parity (see
@@ -455,11 +464,17 @@ log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; ${VICTIM_LABEL}'s interrupted bucket
 # ownable units for this run. oracle_sibling_takeover_within_bound polls the
 # survivor's units_owned after the kill until it reaches that total within
 # the ADR-0065 bound, then requires no stalled unit. A survivor that already
-# owned every unit passes it with no takeover, so it assumes the victim held
-# units at the kill; the survivor's last pre-kill reading, logged above, is
-# the evidence for that.
-oracle_sibling_takeover_within_bound "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
-oracle_no_orphaned_lease "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" || true
+# owned every unit would pass it with no takeover, so both takeover oracles
+# run only when the survivor's last pre-kill reading is a number below the
+# total (chaos_takeover_measurable); otherwise they are recorded as could
+# not measure.
+if chaos_takeover_measurable "$SURVIVOR_LAST_UNITS_OWNED" "$EXPECTED_TOTAL_UNITS"; then
+  oracle_sibling_takeover_within_bound "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
+  oracle_no_orphaned_lease "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" || true
+else
+  ORACLE_UNMEASURED+=("sibling-takeover-within-3H-plus-tick: could not measure: ${SURVIVOR_LABEL} owned ${SURVIVOR_LAST_UNITS_OWNED} of ${EXPECTED_TOTAL_UNITS} units at its last scrape before the kill, so reaching the total would not show a takeover")
+  ORACLE_UNMEASURED+=("no-orphaned-lease: could not measure: ${SURVIVOR_LABEL} owned ${SURVIVOR_LAST_UNITS_OWNED} of ${EXPECTED_TOTAL_UNITS} units before the kill")
+fi
 # The victim is dead, so its log is its state at the kill: every bucket it had
 # open, read from it, must have a compaction record in the store. The oracle
 # also reads CHAOS_KILL_ON_GAUGE, set above.
