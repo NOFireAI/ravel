@@ -945,8 +945,10 @@ mod tests {
     /// Issue #2633: the startup step this binary's `main` runs leaves
     /// jemalloc's background purge thread enabled in the process that links
     /// jemalloc as its global allocator, and the startup stamp names the
-    /// read-back state.
-    #[cfg(not(target_env = "msvc"))]
+    /// read-back state. Linux-only: the `background_thread` mallctl this
+    /// test writes and reads back does not exist on macOS jemalloc at all
+    /// (#2966), where `configure_allocator` instead stamps `"unavailable"`.
+    #[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
     #[test]
     fn startup_enables_and_stamps_the_allocator_background_thread() {
         use tikv_jemalloc_ctl::background_thread;

@@ -5,8 +5,12 @@
 //! This binary links the library, so jemalloc is not its global allocator,
 //! but jemalloc is linked and its mallctl interface works all the same. The
 //! background thread is process-wide state, so this file holds one test.
+//!
+//! Linux-only: the `background_thread` mallctl this test writes and reads
+//! back does not exist on macOS jemalloc at all (#2966), where the gauge
+//! this test exercises reports the allocator as unavailable instead.
 
-#![cfg(not(target_env = "msvc"))]
+#![cfg(all(not(target_env = "msvc"), target_os = "linux"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;

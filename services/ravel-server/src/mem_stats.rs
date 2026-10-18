@@ -7,7 +7,12 @@
 //! and this repo does not target msvc); this module names that fact plainly
 //! rather than silently formatting zeros for an allocator that is not
 //! actually configured. [`configure_background_thread`] is the startup step
-//! that turns on jemalloc's background purge thread (#2633).
+//! that turns on jemalloc's background purge thread (#2633). That mallctl
+//! does not exist at all on macOS (jemalloc there is built without
+//! background-thread support), so on that platform the step reports the
+//! thread as unavailable rather than claiming it enabled or warning as if an
+//! operator-facing write had failed (#2966); CI runs Linux, where the
+//! mallctl exists and this path is exercised for real.
 
 /// The three jemalloc-native figures (`stats.allocated`/`active`/`resident`)
 /// on a build where jemalloc is the global allocator, or an explicit marker
@@ -73,8 +78,9 @@ pub struct BackgroundThread {
     pub enabled: bool,
     /// Who decided the state: `"server"` when the startup step enabled it,
     /// `"malloc_conf"` when the operator's [`MALLOC_CONF_ENV`] names
-    /// `background_thread` and the step left it alone, `"not-jemalloc"` when
-    /// this process does not run under jemalloc.
+    /// `background_thread` and the step left it alone, `"unavailable"` when
+    /// this jemalloc build has no `background_thread` mallctl at all (macOS),
+    /// `"not-jemalloc"` when this process does not run under jemalloc.
     pub source: &'static str,
 }
 
@@ -98,29 +104,101 @@ fn malloc_conf_names_background_thread(malloc_conf: &str) -> bool {
     })
 }
 
+/// Outcome of one `background_thread::write` attempt, classified so
+/// [`configure_background_thread`] can tell "this platform's jemalloc has no
+/// such mallctl" apart from a genuine operator-facing failure.
+#[cfg(not(target_env = "msvc"))]
+enum BackgroundThreadWrite {
+    /// The write succeeded.
+    Enabled,
+    /// ENOENT: the `background_thread` mallctl does not exist on this
+    /// jemalloc build at all (macOS, whose jemalloc is built without
+    /// background-thread support), not a value this process failed to set.
+    Unavailable(tikv_jemalloc_ctl::Error),
+    /// Any other mallctl failure: a real, operator-facing problem.
+    Failed(tikv_jemalloc_ctl::Error),
+}
+
+/// Classifies a `background_thread::write` result. Pure (takes the already-
+/// produced `Result` rather than calling the mallctl itself) so the
+/// `Unavailable` branch can be exercised in a unit test without a Darwin
+/// host: naming any mallctl key that does not exist fails with the same
+/// ENOENT on every platform.
+#[cfg(not(target_env = "msvc"))]
+fn classify_background_thread_write(
+    result: tikv_jemalloc_ctl::Result<()>,
+) -> BackgroundThreadWrite {
+    match result {
+        Ok(()) => BackgroundThreadWrite::Enabled,
+        Err(err) if mallctl_name_is_unknown(&err) => BackgroundThreadWrite::Unavailable(err),
+        Err(err) => BackgroundThreadWrite::Failed(err),
+    }
+}
+
+/// True for jemalloc's ENOENT response ("`name` or `mib` specifies an
+/// unknown/invalid value."), the error `tikv-jemalloc-ctl` returns for a
+/// mallctl name the running jemalloc build does not have at all. The crate
+/// exposes no raw errno, so this matches jemalloc's own stable error text;
+/// any other error (`EPERM`, `EINVAL`, ...) means the mallctl exists but the
+/// write itself failed, a genuine operator-facing problem.
+#[cfg(not(target_env = "msvc"))]
+fn mallctl_name_is_unknown(err: &tikv_jemalloc_ctl::Error) -> bool {
+    err.to_string() == "`name` or `mib` specifies an unknown/invalid value."
+}
+
 /// Enables jemalloc's background thread, which purges freed dirty pages on a
 /// timer. Without it jemalloc purges only on allocator activity, so an idle
 /// process keeps pages it freed resident. `malloc_conf` is the operator's
 /// [`MALLOC_CONF_ENV`] value: when it names `background_thread`, either way,
 /// this writes nothing, because the safe API cannot tell an explicit
 /// `background_thread:false` from jemalloc's default of false. A failed write
-/// is a warning, never a startup failure.
+/// is a warning, never a startup failure, except when the mallctl does not
+/// exist on this platform at all (macOS): that case reports `"unavailable"`
+/// and skips the read-back, which would fail the same way for the same
+/// reason.
 #[cfg(not(target_env = "msvc"))]
 pub fn configure_background_thread(malloc_conf: Option<&str>) -> BackgroundThread {
     use tikv_jemalloc_ctl::background_thread;
 
-    let source = if malloc_conf.is_some_and(malloc_conf_names_background_thread) {
-        "malloc_conf"
-    } else {
-        if let Err(err) = background_thread::write(true) {
+    if malloc_conf.is_some_and(malloc_conf_names_background_thread) {
+        let enabled = match background_thread::read() {
+            Ok(enabled) => enabled,
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "could not read back the jemalloc background purge thread state"
+                );
+                false
+            }
+        };
+        return BackgroundThread {
+            enabled,
+            source: "malloc_conf",
+        };
+    }
+
+    match classify_background_thread_write(background_thread::write(true)) {
+        BackgroundThreadWrite::Enabled => {}
+        BackgroundThreadWrite::Unavailable(err) => {
+            tracing::info!(
+                error = %err,
+                "jemalloc's background purge thread is not available on this platform (its \
+                 mallctl does not exist, as on macOS); freed pages are returned to the \
+                 operating system only on allocator activity"
+            );
+            return BackgroundThread {
+                enabled: false,
+                source: "unavailable",
+            };
+        }
+        BackgroundThreadWrite::Failed(err) => {
             tracing::warn!(
                 error = %err,
                 "could not enable the jemalloc background purge thread; freed pages are \
                  returned to the operating system only on allocator activity"
             );
         }
-        "server"
-    };
+    }
     let enabled = match background_thread::read() {
         Ok(enabled) => enabled,
         Err(err) => {
@@ -131,7 +209,10 @@ pub fn configure_background_thread(malloc_conf: Option<&str>) -> BackgroundThrea
             false
         }
     };
-    BackgroundThread { enabled, source }
+    BackgroundThread {
+        enabled,
+        source: "server",
+    }
 }
 
 /// No jemalloc on msvc, so there is no background thread to enable.
@@ -306,8 +387,12 @@ mod tests {
     /// One test, not two: the background thread is process-wide state, and
     /// two tests toggling it would race. This binary does not install jemalloc
     /// as its global allocator, but jemalloc is linked and its mallctl
-    /// interface works all the same.
-    #[cfg(not(target_env = "msvc"))]
+    /// interface works all the same. Linux-only: the `background_thread`
+    /// mallctl this test writes and reads back does not exist on macOS
+    /// jemalloc at all (#2966), so the assertions below do not hold there;
+    /// `classify_background_thread_write_names_an_unknown_mallctl_as_unavailable`
+    /// below covers the macOS behavior on every platform instead.
+    #[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
     #[test]
     fn configure_respects_an_operator_setting_and_enables_otherwise() {
         use tikv_jemalloc_ctl::background_thread;
@@ -333,5 +418,28 @@ mod tests {
             }
         );
         assert!(background_thread::read().expect("background_thread read must succeed"));
+    }
+
+    /// Exercises the macOS "no such mallctl" case (#2966) on any platform:
+    /// naming an unknown mallctl key fails with the same ENOENT jemalloc
+    /// returns for `background_thread` on a build without background-thread
+    /// support, so this needs no Darwin host.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn classify_background_thread_write_names_an_unknown_mallctl_as_unavailable() {
+        use tikv_jemalloc_ctl::{Access, AsName};
+
+        let unknown: tikv_jemalloc_ctl::Result<bool> = "ravel.no_such_mallctl_key\0".name().read();
+        let err = unknown.expect_err("an unknown mallctl name must fail");
+        assert!(mallctl_name_is_unknown(&err), "got: {err}");
+
+        assert!(matches!(
+            classify_background_thread_write(Err(err)),
+            BackgroundThreadWrite::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_background_thread_write(Ok(())),
+            BackgroundThreadWrite::Enabled
+        ));
     }
 }
