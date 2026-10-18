@@ -169,6 +169,18 @@ async fn main() -> anyhow::Result<()> {
     // into every ingest path.
     let deployment_key = resolved_tenancy.deployment_key;
 
+    // The IPCrypt policy (ADR-2993 decision 1). Parsed and checked against
+    // the deployment key here, after the scheme install, because its
+    // fingerprint keys each `[tenants.<name>]` table by tenant hash. `start`
+    // compares that fingerprint with the bucket's marker before serving.
+    let ipcrypt_policy = std::sync::Arc::new(
+        ravel_server::ipcrypt::IpcryptPolicy::new(
+            cli.parse_ipcrypt_config()?,
+            deployment_key.as_deref(),
+        )
+        .context("failed to load --ipcrypt-config")?,
+    );
+
     // ADR-0062 decision 2e: how a query-audit record carries `query.text`.
     // Resolved here, beside the deployment key its token key can be derived
     // from. Under `redacted` with no key available, this refuses to start
@@ -689,13 +701,14 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    let running = ravel_server::start_with_heartbeat(
+    let running = ravel_server::start_with_heartbeat_and_ipcrypt(
         config,
         store,
         store_background,
         store_metrics,
         cache,
         heartbeat,
+        ipcrypt_policy,
     )
     .await?;
     ravel_server::memory_gate::start_sampler(&memory_gate, running.process_memory_budget())
@@ -992,7 +1005,10 @@ mod tests {
         assert_eq!(SRC.matches(call).count(), 1);
         let call_at = SRC.find(call).expect("call present");
         let start_at = SRC
-            .find(concat!("ravel_server::", "start_with_heartbeat("))
+            .find(concat!(
+                "ravel_server::",
+                "start_with_heartbeat_and_ipcrypt("
+            ))
             .expect("main starts the server");
         assert!(
             call_at < start_at,
@@ -1013,7 +1029,10 @@ mod tests {
         assert_eq!(SRC.matches(stamp).count(), 1);
         assert_eq!(SRC.matches(sampler).count(), 1);
         let start_at = SRC
-            .find(concat!("ravel_server::", "start_with_heartbeat("))
+            .find(concat!(
+                "ravel_server::",
+                "start_with_heartbeat_and_ipcrypt("
+            ))
             .expect("main starts the server");
         assert!(SRC.find(stamp).expect("stamp present") < start_at);
         assert!(SRC.find(sampler).expect("sampler start present") > start_at);

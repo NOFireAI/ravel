@@ -116,6 +116,7 @@ impl MetricsService for GrpcMetricsService {
             // the replica's fault; a retry against a healthy one succeeds.
             err @ IngestRequestError::ClockImplausible(_) => Status::unavailable(err.to_string()),
             IngestRequestError::Provisioning(prov_err) => Status::internal(prov_err.to_string()),
+            err @ IngestRequestError::IpcryptRules => Status::internal(err.to_string()),
             // The buffer-budget shed (ADR-0069) is RESOURCE_EXHAUSTED, the same
             // status the byte-rate and in-flight sheds use, not the UNAVAILABLE
             // the other retryable write failures take.

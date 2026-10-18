@@ -634,6 +634,7 @@ fn gateway_state(
             metadata_sink: None,
             normalize_metrics: normalize_metrics.clone(),
             budget: budget.clone(),
+            ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
         },
         logs_ingest: ravel_server::logs_ingest::LogIngestState {
             router: Arc::new(log_router),
@@ -645,6 +646,7 @@ fn gateway_state(
             provisioning: None,
             normalize_metrics: normalize_metrics.clone(),
             budget: budget.clone(),
+            ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
         },
         traces_ingest: ravel_server::traces_ingest::SpanIngestState {
             router: Arc::new(span_router),
@@ -656,6 +658,7 @@ fn gateway_state(
             provisioning: None,
             normalize_metrics,
             budget: budget.clone(),
+            ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
         },
         admission,
         budget,
@@ -700,6 +703,8 @@ fn remote_write_state(gate: Option<Arc<WriteGate>>) -> (Arc<RemoteWriteState>, A
         metadata_sink: None,
         budget,
         write_gate: gate,
+        ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
+        normalize_metrics: Arc::new(NormalizeRejectMetrics::new()),
     });
     (state, router)
 }

@@ -155,6 +155,7 @@ fn build_process(store: Arc<dyn ObjectStoreBackend>) -> (Arc<AdmissionController
         normalize_metrics: Arc::new(
             ravel_server::normalize_reject_metrics::NormalizeRejectMetrics::new(),
         ),
+        ipcrypt: ravel_server::ipcrypt::IpcryptPolicy::disabled(),
         budget: ravel_ingest::IngestByteBudget::shared(
             ravel_ingest::IngestByteBudgetLimit::Unlimited,
         ),

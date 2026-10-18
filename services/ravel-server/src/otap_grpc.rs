@@ -28,7 +28,6 @@ use futures::Stream;
 use ravel_ingest::{
     IngestByteShed, IngestPoint, Submitted, WriteError, WriteMode, plausible_ingest_clock,
 };
-use ravel_ipcrypt::rules::TenantRules;
 use ravel_otap::normalize::{normalize_prepared_with_metadata, prepare_batch};
 use ravel_otap::proto::experimental::arrow::v1::arrow_metrics_service_server::ArrowMetricsService;
 use ravel_otap::proto::experimental::arrow::v1::{BatchArrowRecords, BatchStatus, StatusCode};
@@ -287,6 +286,12 @@ fn write_reply(
         Err(IngestRequestError::Provisioning(msg)) => {
             (nack(batch_id, StatusCode::Internal, msg), false)
         }
+        // The tenant's IPCrypt rules could not be resolved: nothing was
+        // stored, and the cause is the operator's policy, so the same
+        // internal-fault nack as a provisioning failure.
+        Err(err @ IngestRequestError::IpcryptRules) => {
+            (nack(batch_id, StatusCode::Internal, err.to_string()), false)
+        }
         Err(IngestRequestError::Write(err)) => {
             // Same retry classification the OTLP gRPC path applies: a
             // retryable write is RESOURCE_EXHAUSTED/UNAVAILABLE-shaped
@@ -419,8 +424,12 @@ async fn submit_batch<'a>(
     // (ADR-2708 D2): see `crate::ingest::charge_projected_labels`. The batch
     // is flattened and resolved once; no label exists until the normalize
     // below has passed the bound.
-    // Empty until #3048 wires each tenant's resolved IPCrypt rules.
-    let rules = TenantRules::none();
+    // The tenant's IPCrypt rules (ADR-2993), the same set for the projection
+    // in `prepare_batch` and for normalization.
+    let rules = ingest
+        .ipcrypt
+        .rules_for(tenant)
+        .map_err(|_| IngestRequestError::IpcryptRules)?;
     let prepared = prepare_batch(decoded.borrow(), &ingest.limits, &rules);
     let label_charge = crate::ingest::charge_projected_labels(
         &ingest.budget,
@@ -455,6 +464,9 @@ async fn submit_batch<'a>(
         ravel_types::Signal::Metrics,
         ravel_otlp::resource_attrs_dropped_from_rejections(&normalized.rejected),
     );
+    ingest
+        .normalize_metrics
+        .record_ipcrypt(ravel_types::Signal::Metrics, &normalized.ipcrypt_tally);
     // Synchronous, no I/O, off the acknowledgement path: see the twin call in
     // `crate::ingest::handle_export`.
     if let Some(sink) = &ingest.metadata_sink {
@@ -581,6 +593,7 @@ mod tests {
         AdmissionController, AdmissionLimits, IngestByteBudget, IngestByteBudgetLimit,
         IngestConfig, IngestRouter, MIN_PLAUSIBLE_INGEST_CLOCK_NS, PendingAckBudget, SystemClock,
     };
+    use ravel_ipcrypt::rules::TenantRules;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
     use ravel_otap::stream::DecodedBatch;
@@ -666,6 +679,7 @@ mod tests {
             normalize_metrics: Arc::new(
                 crate::normalize_reject_metrics::NormalizeRejectMetrics::new(),
             ),
+            ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             budget: ravel_ingest::IngestByteBudget::shared(
                 ravel_ingest::IngestByteBudgetLimit::Unlimited,
             ),

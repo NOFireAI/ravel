@@ -28,9 +28,9 @@ ravel-otlp = { workspace = true }
 ravel-remote-write = { workspace = true }
 # Per-tenant IPCrypt rule set, a required positional parameter of every
 # normalizer and label-byte projection entry point (ADR-2993 decision 3,
-# issue #3047). Production call sites pass TenantRules::none() here; #3048
-# wires the real per-tenant rules, the startup marker check and the metric.
-ravel-ipcrypt = { workspace = true }
+# issue #3047). `marker` brings the durable `sys/ipcrypt/policy` check the
+# all and gateway modes run at startup (decision 9).
+ravel-ipcrypt = { workspace = true, features = ["marker"] }
 ravel-query = { workspace = true }
 # Shared tenant-resolution primitives (ADR-0080 decision 3): FallbackResolver is
 # re-exported from `crate::tenant`, and the concrete resolvers reach the wiring
@@ -334,6 +334,10 @@ ravel-logseg = { workspace = true, features = ["test-support"] }
 # dependency that owns the `unsafe impl GlobalAlloc`, at the version ravel-otlp
 # and ravel-sql already use.
 stats_alloc = "0.1.10"
+# Test-only: tests/ipcrypt_store_scan_e2e.rs decompresses every zstd frame in
+# every stored object, so the scan for a raw address reads section bodies,
+# not their compressed form. Already in the lockfile through ravel-segment.
+zstd = { workspace = true }
 
 [lints]
 workspace = true
