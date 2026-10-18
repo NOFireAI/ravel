@@ -1220,7 +1220,9 @@ The full contract is
 ADR-2993 keeps client IP addresses out of storage: an attribute value under a
 configured key is replaced by its IPCrypt ciphertext inside normalization,
 before series identity, size limits and encoding, so no data object, index or
-commit record carries the address as sent.
+commit record written from what `ravel-server` ingests carries the address as
+sent. `ravel-cli load` does not yet apply the policy: it stores every value as
+sent and does not read the startup marker below.
 
 ### Policy
 
@@ -1302,7 +1304,8 @@ with the bucket's `sys/ipcrypt/policy` marker before it serves, whether or not
   decoded: the server refuses to start. A read failure is never taken for an
   absent marker.
 
-So every ingesting process on a bucket runs the same policy. `query` and
+So every `ravel-server` process ingesting into a bucket runs the same policy;
+`ravel-cli load` is not one of them (see above). `query` and
 `maintain` do not read the marker. Re-keying the marker for a changed policy
 is a `ravel-cli` command that follows in a later release; until then a bucket
 keeps the policy its marker was created with. The IAM templates grant the
