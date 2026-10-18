@@ -1428,11 +1428,10 @@ chaos_metrics_shard_coverage() {
 # "" so the cleanup trap does not try to reap a process already SIGKILLed.
 #
 # Args: victim ("a" or "b"). Reads WORKER_A_LOG, WORKER_B_LOG, WORKER_A_URL,
-# WORKER_B_URL, CHAOS_A_MAX_UNITS_OWNED, CHAOS_B_MAX_UNITS_OWNED (default 0),
-# CHAOS_A_LAST_UNITS_OWNED, CHAOS_B_LAST_UNITS_OWNED (default "unknown"),
-# CONS_BASELINE_A, CONS_BASELINE_B, BREAKER_BASELINE_A, BREAKER_BASELINE_B.
-# Sets VICTIM_LABEL, VICTIM_LOG, SURVIVOR_LABEL, SURVIVOR_URL, SURVIVOR_LOG,
-# SURVIVOR_PEAK_UNITS_OWNED, SURVIVOR_LAST_UNITS_OWNED, CONS_BASELINE,
+# WORKER_B_URL, CHAOS_A_LAST_UNITS_OWNED, CHAOS_B_LAST_UNITS_OWNED (default
+# "unknown"), CONS_BASELINE_A, CONS_BASELINE_B, BREAKER_BASELINE_A,
+# BREAKER_BASELINE_B. Sets VICTIM_LABEL, VICTIM_LOG, SURVIVOR_LABEL,
+# SURVIVOR_URL, SURVIVOR_LOG, SURVIVOR_LAST_UNITS_OWNED, CONS_BASELINE,
 # BREAKER_BASELINE, and either WORKER_A_PID or WORKER_B_PID (the victim's)
 # to "".
 chaos_select_survivor() {
@@ -1440,14 +1439,12 @@ chaos_select_survivor() {
   if [[ "$victim" == "a" ]]; then
     VICTIM_LABEL="worker-a"; VICTIM_LOG="$WORKER_A_LOG"
     SURVIVOR_LABEL="worker-b"; SURVIVOR_URL="$WORKER_B_URL"; SURVIVOR_LOG="$WORKER_B_LOG"
-    SURVIVOR_PEAK_UNITS_OWNED="${CHAOS_B_MAX_UNITS_OWNED:-0}"
     SURVIVOR_LAST_UNITS_OWNED="${CHAOS_B_LAST_UNITS_OWNED:-unknown}"
     CONS_BASELINE="$CONS_BASELINE_B"; BREAKER_BASELINE="$BREAKER_BASELINE_B"
     WORKER_A_PID=""
   else
     VICTIM_LABEL="worker-b"; VICTIM_LOG="$WORKER_B_LOG"
     SURVIVOR_LABEL="worker-a"; SURVIVOR_URL="$WORKER_A_URL"; SURVIVOR_LOG="$WORKER_A_LOG"
-    SURVIVOR_PEAK_UNITS_OWNED="${CHAOS_A_MAX_UNITS_OWNED:-0}"
     SURVIVOR_LAST_UNITS_OWNED="${CHAOS_A_LAST_UNITS_OWNED:-unknown}"
     CONS_BASELINE="$CONS_BASELINE_A"; BREAKER_BASELINE="$BREAKER_BASELINE_A"
     WORKER_B_PID=""
@@ -1617,13 +1614,6 @@ oracle_strict_ack_implies_durable() {
   return 0
 }
 
-# 2. sibling-takeover-within-3H-plus-tick.
-#    After one worker is SIGKILLed, the surviving sibling takes over the dead
-#    worker's units within `3 * H` + one maintenance tick. Measured as
-#    wall-clock from the kill to when the survivor owns the expected total
-#    unit count with no stalled units.
-#
-#    Args: survivor_base_url, expected_total_units, kill_epoch_seconds
 # chaos_takeover_measurable LAST TOTAL: 0 when the survivor's last pre-kill
 # units_owned reading LAST is a whole number below TOTAL, so reaching TOTAL
 # after the kill means it took over the victim's units; 1 otherwise (an
@@ -1634,6 +1624,13 @@ chaos_takeover_measurable() {
   (( last < total ))
 }
 
+# 2. sibling-takeover-within-3H-plus-tick.
+#    After one worker is SIGKILLed, the surviving sibling takes over the dead
+#    worker's units within `3 * H` + one maintenance tick. Measured as
+#    wall-clock from the kill to when the survivor owns the expected total
+#    unit count with no stalled units.
+#
+#    Args: survivor_base_url, expected_total_units, kill_epoch_seconds
 oracle_sibling_takeover_within_bound() {
   local survivor_url="$1"
   local expected_units="$2"

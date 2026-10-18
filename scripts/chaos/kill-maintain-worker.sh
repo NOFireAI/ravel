@@ -80,20 +80,18 @@
 # (release-blocking); 3 on a setup error, when the server log carries no
 # parseable `seal_margin_secs=`, when fewer than CHAOS_SHARD_COUNT metrics
 # shards hold data after the load (or the LIST counting them fails), or
-# when conservation could not be measured
-# and no other assertion failed. The two takeover oracles run unconditionally
-# (issue #3037 deliverable 2): an earlier version skipped them when the
-# survivor's peak units_owned during the wait was already at or above
-# EXPECTED_TOTAL_UNITS, guarding against a stale total that could pass
-# vacuously, but EXPECTED_TOTAL_UNITS now derives, by default, from the shard
-# count actually passed to both workers' --shards (CHAOS_SHARD_COUNT, issue
-# #3037 nit), so absent a CHAOS_EXPECTED_TOTAL_UNITS override it equals the
-# true total of ownable units. `oracle_sibling_takeover_within_bound` checks
-# that the survivor's units_owned reaches that total within the ADR-0065
-# bound after the kill with no unit stalled; that shows a takeover only if
-# the victim held units at the kill, which it assumes. The run logs the
-# survivor's last units_owned reading before the kill so a reader can see it
-# was below the total. For conservation,
+# when conservation or the takeover could not be measured
+# and no other assertion failed. `oracle_sibling_takeover_within_bound`
+# checks that the survivor's units_owned reaches EXPECTED_TOTAL_UNITS within
+# the ADR-0065 bound after the kill with no unit stalled, and
+# `oracle_no_orphaned_lease` checks no unit is left unowned. EXPECTED_TOTAL_UNITS
+# derives, by default, from the shard count passed to both workers' --shards
+# (CHAOS_SHARD_COUNT), and the scenario refuses a total that is not a positive
+# whole number (exit 64). Reaching the total shows a takeover only if the
+# victim held units at the kill, so both takeover oracles run only when the
+# survivor's last units_owned reading before the kill is a whole number below
+# the total; otherwise both are recorded as could-not-measure (an unread
+# reading, or a survivor that already owned every unit). For conservation,
 # could-not-measure means the survivor's conservation-abort counter did not
 # rise and either the kill did not fire on the gauge, the victim's log at the
 # kill names no interrupted bucket, or a store LIST of an interrupted
@@ -440,7 +438,7 @@ if [[ "$CHAOS_KILL_ON_GAUGE" -eq 1 ]]; then
   log "victim: worker-${CHAOS_VICTIM} (gauge, ${CHAOS_VICTIM_REASON})"
 else
   log "victim: worker-${CHAOS_VICTIM} (no-gauge, no reading >= 1 from it within ${INFLIGHT_BUDGET_SECONDS}s)"
-  echo "::warning::chaos scenario 2 killed worker-${CHAOS_VICTIM} without a live mid-compaction reading from it; the takeover oracles still run, but this run did not exercise a mid-compaction kill"
+  echo "::warning::chaos scenario 2 killed worker-${CHAOS_VICTIM} without a live mid-compaction reading from it; the takeover oracles run only if the survivor held fewer than the total before the kill, and this run did not exercise a mid-compaction kill"
 fi
 
 # Select victim/survivor identity now that CHAOS_VICTIM is known, and use
@@ -453,21 +451,12 @@ log "$(chaos_worker_activity_line "$VICTIM_LABEL" "$VICTIM_LOG")"
 log "kill on gauge: ${CHAOS_KILL_ON_GAUGE}; ${VICTIM_LABEL}'s interrupted buckets: $(chaos_interrupted_buckets "$VICTIM_LOG" | tr '\n' ' ' || true)"
 
 # ---- Oracle (each pinned assertion independently, survivor = $SURVIVOR_LABEL) ----
-# Run both takeover oracles unconditionally (issue #3037 deliverable 2): a
-# prior version skipped them when the survivor's peak units_owned during the
-# wait was already at or above EXPECTED_TOTAL_UNITS, guarding against a
-# vacuous pass against a stale total (the bug it guarded: a 4-unit default
-# compared against a survivor that already owned 6 of the tenant's real 12
-# units pre-kill). EXPECTED_TOTAL_UNITS now derives, by default, from
-# CHAOS_SHARD_COUNT, the same value passed to both workers' --shards, so
-# absent a CHAOS_EXPECTED_TOTAL_UNITS override it equals the true total of
-# ownable units for this run. oracle_sibling_takeover_within_bound polls the
-# survivor's units_owned after the kill until it reaches that total within
-# the ADR-0065 bound, then requires no stalled unit. A survivor that already
-# owned every unit would pass it with no takeover, so both takeover oracles
-# run only when the survivor's last pre-kill reading is a number below the
-# total (chaos_takeover_measurable); otherwise they are recorded as could
-# not measure.
+# The takeover oracles poll the survivor's units_owned after the kill until
+# it reaches EXPECTED_TOTAL_UNITS within the ADR-0065 bound, then require no
+# stalled unit and no orphaned lease. A survivor that already owned every unit
+# would pass them with no takeover, so they run only when its last pre-kill
+# reading is a number below the total (chaos_takeover_measurable); otherwise
+# both are recorded as could not measure.
 if chaos_takeover_measurable "$SURVIVOR_LAST_UNITS_OWNED" "$EXPECTED_TOTAL_UNITS"; then
   oracle_sibling_takeover_within_bound "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" "$KILL_EPOCH" || true
   oracle_no_orphaned_lease "$SURVIVOR_URL" "$EXPECTED_TOTAL_UNITS" || true

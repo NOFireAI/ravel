@@ -1050,15 +1050,15 @@ select_survivor_case() { # victim(a|b)
   BREAKER_BASELINE_A=5; BREAKER_BASELINE_B=6
   WORKER_A_PID=111; WORKER_B_PID=222
   chaos_select_survivor "$1"
-  printf 'VICTIM_LABEL=%s VICTIM_LOG=%s SURVIVOR_LABEL=%s SURVIVOR_URL=%s SURVIVOR_LOG=%s SURVIVOR_PEAK_UNITS_OWNED=%s CONS_BASELINE=%s BREAKER_BASELINE=%s WORKER_A_PID=%s WORKER_B_PID=%s' \
+  printf 'VICTIM_LABEL=%s VICTIM_LOG=%s SURVIVOR_LABEL=%s SURVIVOR_URL=%s SURVIVOR_LOG=%s CONS_BASELINE=%s BREAKER_BASELINE=%s WORKER_A_PID=%s WORKER_B_PID=%s' \
     "${VICTIM_LABEL}" "${VICTIM_LOG}" "${SURVIVOR_LABEL}" "${SURVIVOR_URL}" "${SURVIVOR_LOG}" \
-    "${SURVIVOR_PEAK_UNITS_OWNED}" "${CONS_BASELINE}" "${BREAKER_BASELINE}" "${WORKER_A_PID}" "${WORKER_B_PID}"
+    "${CONS_BASELINE}" "${BREAKER_BASELINE}" "${WORKER_A_PID}" "${WORKER_B_PID}"
 }
 check "chaos_select_survivor a: survivor is worker-b with B's URL/log/peak/baselines, A's pid cleared" \
-  "VICTIM_LABEL=worker-a VICTIM_LOG=log-a SURVIVOR_LABEL=worker-b SURVIVOR_URL=http://b SURVIVOR_LOG=log-b SURVIVOR_PEAK_UNITS_OWNED=9 CONS_BASELINE=2 BREAKER_BASELINE=6 WORKER_A_PID= WORKER_B_PID=222" \
+  "VICTIM_LABEL=worker-a VICTIM_LOG=log-a SURVIVOR_LABEL=worker-b SURVIVOR_URL=http://b SURVIVOR_LOG=log-b CONS_BASELINE=2 BREAKER_BASELINE=6 WORKER_A_PID= WORKER_B_PID=222" \
   "$(select_survivor_case a)"
 check "chaos_select_survivor b: survivor is worker-a with A's URL/log/peak/baselines, B's pid cleared" \
-  "VICTIM_LABEL=worker-b VICTIM_LOG=log-b SURVIVOR_LABEL=worker-a SURVIVOR_URL=http://a SURVIVOR_LOG=log-a SURVIVOR_PEAK_UNITS_OWNED=3 CONS_BASELINE=1 BREAKER_BASELINE=5 WORKER_A_PID=111 WORKER_B_PID=" \
+  "VICTIM_LABEL=worker-b VICTIM_LOG=log-b SURVIVOR_LABEL=worker-a SURVIVOR_URL=http://a SURVIVOR_LOG=log-a CONS_BASELINE=1 BREAKER_BASELINE=5 WORKER_A_PID=111 WORKER_B_PID=" \
   "$(select_survivor_case b)"
 check "chaos_select_survivor: the survivor's last units_owned comes from the other worker" "a:8 b:4" \
   "$(select_survivor_case a >/dev/null
