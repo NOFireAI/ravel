@@ -111,9 +111,10 @@ pub struct Cli {
 
     // --- Canonical-tenant resolver chain (only used under that key source) ----
     /// Repeatable `token=tenant` pair for the static bearer resolver. The
-    /// tenant may carry a trailing `;ddl` (ADR-2040 decision 4), accepted for
+    /// tenant may carry a trailing capability list (`;ddl`, `;ipcrypt` or
+    /// `;ddl,ipcrypt`; ADR-2040 decision 4, ADR-2993 decision 6), accepted for
     /// parity with `ravel-server`'s `--tenant-token`, but stripped here: this
-    /// router routes by the bare tenant and never grants the DDL capability.
+    /// router routes by the bare tenant and never grants a capability.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
@@ -484,15 +485,16 @@ impl Cli {
                 if token.is_empty() || tenant_raw.is_empty() {
                     anyhow::bail!("--tenant-token TOKEN and TENANT must both be non-empty");
                 }
-                // The server's `;ddl` capability suffix (ADR-2040 decision 4) is
-                // stripped here rather than kept: this router never runs DDL, so
-                // it never needs the capability, only the bare tenant it must
+                // The server's capability suffix (`;ddl`, `;ipcrypt`) is
+                // stripped here rather than kept: this router runs no query, so
+                // it never needs a capability, only the bare tenant it must
                 // route by.
-                let (tenant, _ddl) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
-                    .map_err(|_| {
+                let (tenant, _capabilities) =
+                    ravel_tenant_resolve::split_tenant_suffix(tenant_raw).map_err(|e| {
                         anyhow::anyhow!(
-                            "--tenant-token (position {}) has an invalid tenant, expected \
-                             TENANT or TENANT;ddl",
+                            "--tenant-token (position {}) has an invalid tenant ({e}), expected \
+                             TENANT or TENANT;CAPABILITIES with CAPABILITIES a comma-separated \
+                             list of ddl and ipcrypt",
                             i + 1
                         )
                     })?;
@@ -804,6 +806,39 @@ mod tests {
                 );
             }
             other => panic!("expected canonical key config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_capability_suffix_routes_by_the_bare_tenant() {
+        for suffix in ["ipcrypt", "ddl,ipcrypt", "ipcrypt,ddl"] {
+            let pair = format!("tok=acme;{suffix}");
+            let config = cli(&["--key-source", "canonical-tenant", "--tenant-token", &pair])
+                .into_config()
+                .expect("a capability-suffixed tenant token parses");
+            match config.key {
+                KeyConfig::CanonicalTenant(settings) => {
+                    assert_eq!(
+                        settings.tokens,
+                        vec![("tok".to_string(), "acme".to_string())],
+                        "{suffix}"
+                    );
+                }
+                other => panic!("expected canonical key config, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_duplicate_or_empty_capability_is_refused() {
+        for pair in ["tok=acme;ddl,ddl", "tok=acme;ipcrypt,", "tok=acme;", "tok=;ipcrypt"] {
+            let err = cli(&["--key-source", "canonical-tenant", "--tenant-token", pair])
+                .into_config()
+                .expect_err("a malformed capability suffix must refuse startup");
+            assert!(
+                err.to_string().contains("--tenant-token (position 1)"),
+                "{pair}: {err}"
+            );
         }
     }
 

@@ -778,7 +778,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 4)]
     pub shards: u32,
 
-    /// Repeatable `token=tenant` pair for the static bearer map.
+    /// Repeatable `token=tenant` pair for the static bearer map. The tenant may
+    /// end in `;` and a comma-separated capability list drawn from `ddl`
+    /// (ADR-2040 decision 4) and `ipcrypt` (ADR-2993 decision 6), each at most
+    /// once: `acme;ddl`, `acme;ipcrypt` and `acme;ddl,ipcrypt` all name tenant
+    /// `acme`. Any other suffix fails startup.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
@@ -1429,6 +1433,16 @@ pub struct Cli {
     /// OIDC enabled fails startup rather than silently doing nothing.
     #[arg(long, value_name = "CLAIM")]
     pub oidc_ddl_claim: Option<String>,
+
+    /// Boolean claim that grants the `ipcrypt` capability (ADR-2993 decision
+    /// 6): a verified token carrying this claim as the JSON boolean `true` may
+    /// call the SQL functions `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt`.
+    /// A string, a number, an array, or a missing claim never grants it.
+    /// Unset (the default), the capability is never granted via OIDC. Setting
+    /// it without OIDC enabled fails startup rather than silently doing
+    /// nothing.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_ipcrypt_claim: Option<String>,
 
     /// How often the JWKS document is refetched, in seconds (ADR-0042
     /// decision 6). Only used when OIDC is enabled. Zero is refused at
@@ -5812,9 +5826,11 @@ impl Cli {
     }
 
     /// Same `TOKEN=TENANT` pairs as [`Self::parse_tenant_tokens`], but keeping
-    /// the `ddl` capability a `;ddl` tenant suffix grants (ADR-2040 decision
-    /// 4). Both parse the same shared pairs; [`Self::parse_tenant_tokens`]
-    /// drops the capability for callers that only ever wanted the tenant
+    /// the capabilities a tenant suffix grants: `ddl` (ADR-2040 decision 4) and
+    /// `ipcrypt` (ADR-2993 decision 6), as `;ddl`, `;ipcrypt` or
+    /// `;ddl,ipcrypt`. Both parse the same shared pairs;
+    /// [`Self::parse_tenant_tokens`] drops the capabilities for callers that
+    /// only ever wanted the tenant
     /// (fold-tenant discovery, federation-mapping validation).
     pub fn parse_tenant_principals(&self) -> anyhow::Result<HashMap<String, Principal>> {
         self.parse_tenant_pairs()
@@ -5841,14 +5857,17 @@ impl Cli {
             if token.is_empty() || tenant_raw.is_empty() {
                 anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
             }
-            let (tenant, ddl) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw).map_err(
-                |_: ravel_tenant_resolve::TenantSuffixError| {
-                    anyhow::anyhow!("invalid {ctx}, expected TENANT or TENANT;ddl")
-                },
-            )?;
+            let (tenant, capabilities) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
+                .map_err(|e: ravel_tenant_resolve::TenantSuffixError| {
+                    anyhow::anyhow!(
+                        "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
+                         CAPABILITIES a comma-separated list of ddl and ipcrypt"
+                    )
+                })?;
             let principal = Principal {
                 tenant: TenantId::new(tenant),
-                ddl,
+                ddl: capabilities.ddl,
+                ipcrypt: capabilities.ipcrypt,
             };
             // A token repeated with a different tenant or capability would
             // otherwise resolve by flag or line order. An identical repeat
@@ -5857,7 +5876,7 @@ impl Cli {
                 if *existing != principal {
                     let first = origins.get(token).map(String::as_str).unwrap_or("?");
                     anyhow::bail!(
-                        "conflicting tenant token: the token at {ctx} is also defined at {first} with a different tenant or ddl capability"
+                        "conflicting tenant token: the token at {ctx} is also defined at {first} with a different tenant or capability"
                     );
                 }
                 return Ok(());
@@ -6136,6 +6155,9 @@ impl Cli {
         if self.oidc_ddl_claim.as_deref() == Some("") {
             anyhow::bail!("--oidc-ddl-claim must be non-empty");
         }
+        if self.oidc_ipcrypt_claim.as_deref() == Some("") {
+            anyhow::bail!("--oidc-ipcrypt-claim must be non-empty");
+        }
 
         if oidc.is_none() {
             if self.oidc_tenant_claim.is_some() {
@@ -6147,6 +6169,12 @@ impl Cli {
             if self.oidc_ddl_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-ddl-claim was set but OIDC is not enabled (set --oidc-issuer and \
+                     --oidc-jwks-url)"
+                );
+            }
+            if self.oidc_ipcrypt_claim.is_some() {
+                anyhow::bail!(
+                    "--oidc-ipcrypt-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }

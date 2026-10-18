@@ -34,62 +34,105 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthError> {
 }
 
 /// The tenant side of a `TOKEN=TENANT` pair carried a `;`-suffix
-/// [`split_tenant_suffix`] does not grant: anything other than exactly
-/// `;ddl` after a non-empty tenant.
-#[derive(Debug, thiserror::Error)]
-#[error("expected TENANT or TENANT;ddl")]
-pub struct TenantSuffixError;
+/// [`split_tenant_suffix`] does not grant. No variant carries the refused
+/// text, so a caller can print the error without echoing configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum TenantSuffixError {
+    #[error("the tenant before the ';' is empty")]
+    EmptyTenant,
+    #[error("the capability list after the ';' has an empty entry")]
+    EmptyCapability,
+    #[error("the capability list after the ';' names a capability other than ddl or ipcrypt")]
+    UnknownCapability,
+    #[error("the capability list after the ';' names {0} more than once")]
+    DuplicateCapability(&'static str),
+}
 
-/// Splits the tenant side of a `TOKEN=TENANT` pair on its LAST `;`, granting
-/// the `ddl` capability (ADR-2040 decision 4) when the suffix after it is
-/// exactly `ddl` and the text before it is non-empty. A tenant with no `;` is
-/// returned unchanged with `ddl: false`. Any other suffix (wrong case, a
-/// different word, or none at all after a trailing `;`) or an empty tenant
-/// before the `;` is [`TenantSuffixError`], so a typo refuses startup instead
-/// of silently granting nothing or naming an empty tenant.
+/// The capabilities a `;`-suffix grants. Both are absent unless the suffix
+/// names them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Capabilities {
+    pub ddl: bool,
+    pub ipcrypt: bool,
+}
+
+/// Splits the tenant side of a `TOKEN=TENANT` pair on its LAST `;`. The
+/// suffix after it is a comma-separated capability list drawn from `ddl`
+/// (ADR-2040 decision 4) and `ipcrypt` (ADR-2993 decision 6), each at most
+/// once and the list never empty, so `acme;ddl`, `acme;ipcrypt` and
+/// `acme;ddl,ipcrypt` all name tenant `acme`. A tenant with no `;` is returned
+/// unchanged with no capability. Any other suffix (wrong case, a different
+/// word, a repeat, or an empty entry, including nothing after a trailing `;`)
+/// or an empty tenant before the `;` is a [`TenantSuffixError`], so a typo
+/// refuses startup instead of silently granting nothing or naming an empty
+/// tenant.
 ///
 /// `ravel-server` and `ravel-ingest-router` both call it, so the two accept
-/// and refuse the same spellings. The router discards the `ddl` bool, as it
-/// never routes DDL requests differently.
-pub fn split_tenant_suffix(raw: &str) -> Result<(&str, bool), TenantSuffixError> {
-    match raw.rfind(';') {
-        None => Ok((raw, false)),
-        Some(idx) => {
-            let (tenant, suffix) = (&raw[..idx], &raw[idx + 1..]);
-            if suffix == "ddl" && !tenant.is_empty() {
-                Ok((tenant, true))
-            } else {
-                Err(TenantSuffixError)
-            }
-        }
+/// and refuse the same spellings. The router discards the capabilities, as it
+/// never routes a request differently by them.
+pub fn split_tenant_suffix(raw: &str) -> Result<(&str, Capabilities), TenantSuffixError> {
+    let Some(idx) = raw.rfind(';') else {
+        return Ok((raw, Capabilities::default()));
+    };
+    let (tenant, suffix) = (&raw[..idx], &raw[idx + 1..]);
+    if tenant.is_empty() {
+        return Err(TenantSuffixError::EmptyTenant);
     }
+    let mut caps = Capabilities::default();
+    for entry in suffix.split(',') {
+        let (slot, name) = match entry {
+            "ddl" => (&mut caps.ddl, "ddl"),
+            "ipcrypt" => (&mut caps.ipcrypt, "ipcrypt"),
+            "" => return Err(TenantSuffixError::EmptyCapability),
+            _ => return Err(TenantSuffixError::UnknownCapability),
+        };
+        if *slot {
+            return Err(TenantSuffixError::DuplicateCapability(name));
+        }
+        *slot = true;
+    }
+    Ok((tenant, caps))
 }
 
 /// A resolved caller identity: the tenant a request is attributed to, and
-/// whether it may run tenant-scoped DDL (ADR-2040 decision 4, "Who may run
-/// DDL"). `ddl` is absent unless a resolver's configuration explicitly grants
-/// it. The consumer is `POST /api/v1/sql` in `ravel-server`
-/// (`services/ravel-server/src/sql.rs`), which refuses a `CREATE` or `DROP`
-/// statement with 403 unless `ddl` is set.
+/// the capabilities it holds. Each is absent unless a resolver's
+/// configuration explicitly grants it.
+///
+/// - `ddl` (ADR-2040 decision 4, "Who may run DDL"): `POST /api/v1/sql` in
+///   `ravel-server` (`services/ravel-server/src/sql.rs`) refuses a `CREATE`
+///   or `DROP` statement with 403 unless it is set.
+/// - `ipcrypt` (ADR-2993 decision 6): the SQL functions `ipcrypt_encrypt`
+///   and `ipcrypt_prefix_encrypt` are registered only for a principal that
+///   holds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
     pub tenant: TenantId,
     pub ddl: bool,
+    pub ipcrypt: bool,
+}
+
+impl Principal {
+    /// A principal holding no capability.
+    pub fn tenant_only(tenant: TenantId) -> Self {
+        Principal {
+            tenant,
+            ddl: false,
+            ipcrypt: false,
+        }
+    }
 }
 
 /// Resolves the tenant for an incoming request from its headers.
 pub trait TenantResolver: Send + Sync {
     fn resolve(&self, headers: &HeaderMap) -> Result<TenantId, AuthError>;
 
-    /// Resolves the full [`Principal`], including the `ddl` capability. The
-    /// default forwards to [`resolve`](Self::resolve) and reports no
-    /// capability, so a resolver that does not override this keeps its
-    /// current behavior: `ddl` is opt-in per resolver, never inferred.
+    /// Resolves the full [`Principal`], including the `ddl` and `ipcrypt`
+    /// capabilities. The default forwards to [`resolve`](Self::resolve) and
+    /// reports no capability, so a resolver that does not override this keeps
+    /// its current behavior: each capability is opt-in per resolver, never
+    /// inferred.
     fn resolve_principal(&self, headers: &HeaderMap) -> Result<Principal, AuthError> {
-        Ok(Principal {
-            tenant: self.resolve(headers)?,
-            ddl: false,
-        })
+        Ok(Principal::tenant_only(self.resolve(headers)?))
     }
 }
 
@@ -169,7 +212,7 @@ impl StaticBearerTokenResolver {
         Self::with_principals(
             tokens
                 .into_iter()
-                .map(|(token, tenant)| (token, Principal { tenant, ddl: false }))
+                .map(|(token, tenant)| (token, Principal::tenant_only(tenant)))
                 .collect(),
         )
     }
@@ -454,6 +497,7 @@ pub struct OidcResolver {
     audiences: Vec<String>,
     tenant_claim: String,
     ddl_claim: Option<String>,
+    ipcrypt_claim: Option<String>,
 }
 
 impl OidcResolver {
@@ -462,10 +506,10 @@ impl OidcResolver {
     /// `issuer` is the exact `iss` every token must carry. `audiences`, when
     /// non-empty, is the set of acceptable `aud` values (any match passes);
     /// empty disables audience checking. `tenant_claim` is the string claim the
-    /// tenant identity is read from (e.g. `tenant`). No `ddl` claim is
-    /// configured, so [`resolve_principal`](Self::resolve_principal) always
-    /// reports no `ddl` capability until [`with_ddl_claim`](Self::with_ddl_claim)
-    /// is used.
+    /// tenant identity is read from (e.g. `tenant`). No `ddl` or `ipcrypt`
+    /// claim is configured, so [`resolve_principal`](Self::resolve_principal)
+    /// reports neither capability until [`with_ddl_claim`](Self::with_ddl_claim)
+    /// or [`with_ipcrypt_claim`](Self::with_ipcrypt_claim) is used.
     pub fn new(
         cache: Arc<OidcJwksCache>,
         issuer: impl Into<String>,
@@ -478,6 +522,7 @@ impl OidcResolver {
             audiences,
             tenant_claim: tenant_claim.into(),
             ddl_claim: None,
+            ipcrypt_claim: None,
         }
     }
 
@@ -488,6 +533,15 @@ impl OidcResolver {
     /// (the default), the capability is never granted via OIDC.
     pub fn with_ddl_claim(mut self, ddl_claim: impl Into<String>) -> Self {
         self.ddl_claim = Some(ddl_claim.into());
+        self
+    }
+
+    /// Configure the claim that grants the `ipcrypt` capability (ADR-2993
+    /// decision 6), read exactly as [`with_ddl_claim`](Self::with_ddl_claim)
+    /// reads its claim: only the JSON boolean `true` grants it, and with no
+    /// claim name configured (the default) it is never granted via OIDC.
+    pub fn with_ipcrypt_claim(mut self, ipcrypt_claim: impl Into<String>) -> Self {
+        self.ipcrypt_claim = Some(ipcrypt_claim.into());
         self
     }
 
@@ -554,13 +608,18 @@ impl TenantResolver for OidcResolver {
             Some(tenant) if !tenant.is_empty() => TenantId::new(tenant.to_string()),
             _ => return Err(AuthError),
         };
-        let ddl = self
-            .ddl_claim
-            .as_ref()
-            .and_then(|claim| claims.get(claim))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        Ok(Principal { tenant, ddl })
+        let granted = |claim: &Option<String>| {
+            claim
+                .as_ref()
+                .and_then(|claim| claims.get(claim))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+        };
+        Ok(Principal {
+            tenant,
+            ddl: granted(&self.ddl_claim),
+            ipcrypt: granted(&self.ipcrypt_claim),
+        })
     }
 }
 
@@ -662,34 +721,140 @@ impl TenantResolver for MtlsResolver {
 mod tests {
     use super::*;
 
+    const NONE: Capabilities = Capabilities {
+        ddl: false,
+        ipcrypt: false,
+    };
+
     #[test]
-    fn split_tenant_suffix_no_semicolon_is_unchanged_no_ddl() {
-        assert_eq!(split_tenant_suffix("acme").unwrap(), ("acme", false));
+    fn split_tenant_suffix_no_semicolon_is_unchanged_no_capability() {
+        assert_eq!(split_tenant_suffix("acme").unwrap(), ("acme", NONE));
     }
 
     #[test]
     fn split_tenant_suffix_ddl_grants_capability() {
-        assert_eq!(split_tenant_suffix("acme;ddl").unwrap(), ("acme", true));
+        assert_eq!(
+            split_tenant_suffix("acme;ddl").unwrap(),
+            (
+                "acme",
+                Capabilities {
+                    ddl: true,
+                    ipcrypt: false
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn split_tenant_suffix_ipcrypt_grants_capability() {
+        assert_eq!(
+            split_tenant_suffix("acme;ipcrypt").unwrap(),
+            (
+                "acme",
+                Capabilities {
+                    ddl: false,
+                    ipcrypt: true
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn split_tenant_suffix_lists_grant_both_in_either_order() {
+        let both = Capabilities {
+            ddl: true,
+            ipcrypt: true,
+        };
+        assert_eq!(
+            split_tenant_suffix("acme;ddl,ipcrypt").unwrap(),
+            ("acme", both)
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;ipcrypt,ddl").unwrap(),
+            ("acme", both)
+        );
+    }
+
+    #[test]
+    fn split_tenant_suffix_splits_on_the_last_semicolon() {
+        assert_eq!(
+            split_tenant_suffix("a;b;ipcrypt").unwrap(),
+            (
+                "a;b",
+                Capabilities {
+                    ddl: false,
+                    ipcrypt: true
+                }
+            )
+        );
     }
 
     #[test]
     fn split_tenant_suffix_wrong_case_is_refused() {
-        assert!(split_tenant_suffix("acme;DDL").is_err());
+        assert_eq!(
+            split_tenant_suffix("acme;DDL"),
+            Err(TenantSuffixError::UnknownCapability)
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;IPCRYPT"),
+            Err(TenantSuffixError::UnknownCapability)
+        );
     }
 
     #[test]
     fn split_tenant_suffix_different_word_is_refused() {
-        assert!(split_tenant_suffix("acme;admin").is_err());
+        assert_eq!(
+            split_tenant_suffix("acme;admin"),
+            Err(TenantSuffixError::UnknownCapability)
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;ddl,admin"),
+            Err(TenantSuffixError::UnknownCapability)
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;ddl ,ipcrypt"),
+            Err(TenantSuffixError::UnknownCapability)
+        );
     }
 
     #[test]
-    fn split_tenant_suffix_trailing_semicolon_is_refused() {
-        assert!(split_tenant_suffix("acme;").is_err());
+    fn split_tenant_suffix_duplicate_is_refused() {
+        assert_eq!(
+            split_tenant_suffix("acme;ddl,ddl"),
+            Err(TenantSuffixError::DuplicateCapability("ddl"))
+        );
+        assert_eq!(
+            split_tenant_suffix("acme;ipcrypt,ddl,ipcrypt"),
+            Err(TenantSuffixError::DuplicateCapability("ipcrypt"))
+        );
     }
 
     #[test]
-    fn split_tenant_suffix_empty_tenant_before_ddl_is_refused() {
-        assert!(split_tenant_suffix(";ddl").is_err());
+    fn split_tenant_suffix_empty_entry_is_refused() {
+        for raw in ["acme;", "acme;ddl,", "acme;,ipcrypt", "acme;ddl,,ipcrypt"] {
+            assert_eq!(
+                split_tenant_suffix(raw),
+                Err(TenantSuffixError::EmptyCapability),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_tenant_suffix_empty_tenant_is_refused() {
+        for raw in [";ddl", ";ipcrypt", ";ddl,ipcrypt"] {
+            assert_eq!(
+                split_tenant_suffix(raw),
+                Err(TenantSuffixError::EmptyTenant),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn split_tenant_suffix_error_does_not_echo_the_refused_text() {
+        let err = split_tenant_suffix("acme;s3cr3t").unwrap_err().to_string();
+        assert!(!err.contains("s3cr3t"), "{err}");
     }
 
     use jsonwebtoken::{EncodingKey, Header, encode, get_current_timestamp};
@@ -968,6 +1133,7 @@ v6bMjpirtMaaPWvO2P5A4cSa7KfhIJqC4wghlS4L0XBZRxbg48yAf+JK\n\
             Some(&Principal {
                 tenant: TenantId::new("acme"),
                 ddl: false,
+                ipcrypt: false,
             })
         );
 
@@ -1191,6 +1357,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             Principal {
                 tenant: TenantId::new("acme"),
                 ddl: false,
+                ipcrypt: false,
             }
         );
 
@@ -1201,6 +1368,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             Principal {
                 tenant: TenantId::new("acme"),
                 ddl: true,
+                ipcrypt: false,
             },
         )]));
         assert_eq!(
@@ -1210,6 +1378,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             Principal {
                 tenant: TenantId::new("acme"),
                 ddl: true,
+                ipcrypt: false,
             }
         );
 
@@ -1224,6 +1393,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             Principal {
                 tenant: TenantId::new("acme"),
                 ddl: true,
+                ipcrypt: false,
             }
         );
 
@@ -1309,6 +1479,7 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
             Principal {
                 tenant: TenantId::new("acme"),
                 ddl: true,
+                ipcrypt: false,
             }
         );
     }
@@ -1330,10 +1501,12 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
         let denied = Principal {
             tenant: TenantId::new("acme"),
             ddl: false,
+            ipcrypt: false,
         };
         let granted = Principal {
             tenant: TenantId::new("acme"),
             ddl: true,
+            ipcrypt: true,
         };
         let first_denies = FallbackResolver::new(vec![
             Arc::new(Fixed(denied.clone())),
@@ -1372,5 +1545,69 @@ JGhDLd2EhXX5RDhGuladnj8=\n\
                 .expect("resolves")
                 .ddl
         );
+    }
+
+    /// ADR-2993 decision 6: the configured ipcrypt claim as the JSON boolean
+    /// `true` grants `ipcrypt` and only `ipcrypt`; its absence, a non-boolean
+    /// value, or no configured claim name grants nothing.
+    #[test]
+    fn oidc_ipcrypt_claim_grants_ipcrypt_and_its_absence_does_not() {
+        let principal = |claim_value: Option<serde_json::Value>, configure: bool| {
+            let cache = cache_with(&jwks_with(KID));
+            let mut c = claims(Some("acme"), 3600);
+            if let Some(v) = claim_value {
+                c["can_ipcrypt"] = v;
+            }
+            let token = sign_es256(&c, KID, EC_PRIV_PEM);
+            let mut oidc = resolver(cache).with_ddl_claim("can_ddl");
+            if configure {
+                oidc = oidc.with_ipcrypt_claim("can_ipcrypt");
+            }
+            oidc.resolve_principal(&bearer(&token)).expect("resolves")
+        };
+
+        assert_eq!(
+            principal(Some(serde_json::json!(true)), true),
+            Principal {
+                tenant: TenantId::new("acme"),
+                ddl: false,
+                ipcrypt: true,
+            }
+        );
+        assert!(!principal(None, true).ipcrypt);
+        assert!(!principal(Some(serde_json::json!(false)), true).ipcrypt);
+        assert!(!principal(Some(serde_json::json!("true")), true).ipcrypt);
+        assert!(!principal(Some(serde_json::json!([true])), true).ipcrypt);
+        assert!(!principal(Some(serde_json::json!(true)), false).ipcrypt);
+
+        // The ddl claim does not grant ipcrypt.
+        let cache = cache_with(&jwks_with(KID));
+        let mut c = claims(Some("acme"), 3600);
+        c["can_ddl"] = serde_json::json!(true);
+        let token = sign_es256(&c, KID, EC_PRIV_PEM);
+        let oidc = resolver(cache)
+            .with_ddl_claim("can_ddl")
+            .with_ipcrypt_claim("can_ipcrypt");
+        let p = oidc.resolve_principal(&bearer(&token)).expect("resolves");
+        assert!(p.ddl && !p.ipcrypt);
+    }
+
+    /// Resolvers with no capability source report `ipcrypt: false`.
+    #[test]
+    fn ipcrypt_is_absent_from_resolvers_without_a_capability_source() {
+        let plain = StaticBearerTokenResolver::new(HashMap::from([(
+            "tok".to_string(),
+            TenantId::new("acme"),
+        )]));
+        assert!(
+            !plain
+                .resolve_principal(&static_bearer("tok"))
+                .expect("resolves")
+                .ipcrypt
+        );
+        let dev = DevHeaderTenantResolver::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-ravel-tenant", "acme".parse().expect("header value"));
+        assert!(!dev.resolve_principal(&headers).expect("resolves").ipcrypt);
     }
 }
