@@ -187,10 +187,7 @@ fn otap_stores_ciphertext_for_point_exemplar_and_resource_labels() {
     }
 
     let labels = &result.output.points[0].labels;
-    assert_eq!(
-        labels.get(POINT_LABEL),
-        Some(expected(point_ip).as_str())
-    );
+    assert_eq!(labels.get(POINT_LABEL), Some(expected(point_ip).as_str()));
     assert_eq!(
         labels.get(RESOURCE_LABEL),
         Some(expected(resource_ip).as_str())

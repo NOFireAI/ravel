@@ -26,10 +26,9 @@ use ravel_ipcrypt::rules::{EpochKey, TenantRules};
 use ravel_otlp::normalize::sanitize_label_name;
 use ravel_otlp::traces_normalize::{ATTR_EVENTS_RAW, ATTR_LINKS_RAW};
 use ravel_otlp::{
-    IngestLimits, LogIngestLimits, LogRejection, Rejection, SpanIngestLimits,
-    normalize_logs, normalize_metrics_with_exemplars, normalize_traces,
-    project_log_resolved_label_bytes, project_resolved_label_bytes,
-    project_span_resolved_label_bytes,
+    IngestLimits, LogIngestLimits, LogRejection, Rejection, SpanIngestLimits, normalize_logs,
+    normalize_metrics_with_exemplars, normalize_traces, project_log_resolved_label_bytes,
+    project_resolved_label_bytes, project_span_resolved_label_bytes,
 };
 use ravel_types::logstream::AttrValue;
 use ravel_types::{ExemplarCap, Label, LabelSet, SeriesId, TenantHash, TenantId};
@@ -183,7 +182,10 @@ fn metrics_store_ciphertext_for_point_and_exemplar_labels() {
 
     let debug = format!("{result:?}");
     assert!(!debug.contains(point_ip), "raw point IP leaked: {debug}");
-    assert!(!debug.contains(exemplar_ip), "raw exemplar IP leaked: {debug}");
+    assert!(
+        !debug.contains(exemplar_ip),
+        "raw exemplar IP leaked: {debug}"
+    );
 
     let point = &result.output.points[0];
     let point_label = point.labels.get(RULE_LABEL).expect("label stored");
@@ -313,7 +315,10 @@ fn rule_lookup_uses_the_metrics_label_sanitizer() {
     let rules = rules();
     for (raw, label) in [("client.ip", "client_ip")] {
         assert_eq!(sanitize_label_name(raw.to_string()), label);
-        assert_eq!(rules.lookup_label(label).map(|info| info.raw_key), Some(raw));
+        assert_eq!(
+            rules.lookup_label(label).map(|info| info.raw_key),
+            Some(raw)
+        );
         assert_eq!(rules.lookup_raw(raw).map(|info| info.raw_key), Some(raw));
     }
     assert!(rules.lookup_label("client.ip").is_none());
@@ -471,7 +476,13 @@ const PINNED_LOGS_PROJECTION: usize = 330;
 
 #[test]
 fn logs_none_matches_a_resolved_empty_rule_set() {
-    let req = || logs_request("192.0.2.1", "192.0.2.2", vec![string_kv(RULE_KEY, "192.0.2.3")]);
+    let req = || {
+        logs_request(
+            "192.0.2.1",
+            "192.0.2.2",
+            vec![string_kv(RULE_KEY, "192.0.2.3")],
+        )
+    };
     let limits = LogIngestLimits::default();
     let none = normalize_logs(req(), &limits, &TenantRules::none(), 1_000);
     let empty = normalize_logs(req(), &limits, &resolved_empty_rules(), 1_000);

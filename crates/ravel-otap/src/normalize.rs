@@ -1082,8 +1082,7 @@ fn normalize_impl(
         // this pre-check is the only place attribute order is observable, and
         // it must line up with the OTLP oracle or the two paths class the same
         // input differently (ADR-0011).
-        if let Err(rejection) = check_flat_attrs_in_input_order(range, flat_attrs, limits, rules)
-        {
+        if let Err(rejection) = check_flat_attrs_in_input_order(range, flat_attrs, limits, rules) {
             rejected.push(rejection);
             continue;
         }

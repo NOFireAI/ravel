@@ -134,7 +134,10 @@ fn remote_write_stores_ciphertext_for_sample_and_exemplar_labels() {
 
     let debug = format!("{result:?}");
     assert!(!debug.contains(sample_ip), "raw sample IP leaked: {debug}");
-    assert!(!debug.contains(exemplar_ip), "raw exemplar IP leaked: {debug}");
+    assert!(
+        !debug.contains(exemplar_ip),
+        "raw exemplar IP leaked: {debug}"
+    );
 
     let point = &result.output.points[0];
     assert_eq!(
