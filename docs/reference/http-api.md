@@ -442,7 +442,7 @@ authenticated tenant, in the shape that Prometheus's rules API uses.
   nothing else.
 - A tenant with no loaded rules gets
   `{"status": "success", "data": {"groups": []}}`, never the rules of
-  another tenant.
+  another tenant, from every process, including one that runs no evaluator.
 
 A tenant's rules render as one group named `ravel-alert-rules`. The Ravel
 rules document is one flat `rules` array with no group blocks. So the name is
@@ -502,14 +502,14 @@ Suppressed and resolved alerts are not listed. Each alert carries `labels`
 
 Status codes:
 
-- 200 with the tenant's alerts. A tenant with no loaded rules gets
+- 200 with the tenant's alerts. A tenant with no loaded rules always gets
   `{"status": "success", "data": {"alerts": []}}`, never the alerts of
-  another tenant, from a process where some tenant has rules and an
-  evaluator runs. In any other process it gets the 503 below.
+  another tenant, from every process, whatever other tenants have configured
+  and whether this process runs an evaluator.
 - 401 for a credential that does not resolve.
-- 503 with `errorType` `unavailable` when this process runs no evaluator
-  (evaluation disabled, or no tenant has rules), before this process has
-  finished a tick for the tenant, and whenever the last tick could not read
+- 503 with `errorType` `unavailable`, for a tenant with loaded rules only,
+  when this process runs no evaluator (evaluation disabled), before this
+  process has finished a tick for the tenant, and whenever the last tick could not read
   the tenant's alert history, until a later tick reads it. An empty list
   would assert that nothing is firing, and an earlier tick's list may no
   longer be current.

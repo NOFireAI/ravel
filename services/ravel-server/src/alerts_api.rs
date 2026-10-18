@@ -28,15 +28,19 @@
 //! nothing until its first tick. Neither route is history; past transitions
 //! are in the `alerts` SQL table (ADR-1101).
 //!
-//! When no evaluator runs in this process (alerting disabled, or no tenant
-//! has rules), `/api/v1/alerts` answers 503 with `errorType` `unavailable`
-//! rather than an empty list, which would assert that nothing is firing. A
-//! tenant with rules gets the same 503 before its evaluator has finished a
-//! tick ([`NOT_YET_EVALUATED`]), and whenever its last tick could not read
+//! A tenant with no rules has no alerts, so `/api/v1/alerts` always answers
+//! it 200 with an empty list, in every process, whatever other tenants have
+//! configured and whether this process runs an evaluator. That is decided
+//! from the loaded rule set before the published handle is read, so the
+//! answer says nothing about any other tenant.
+//!
+//! A tenant with rules gets 503 with `errorType` `unavailable` rather than an
+//! empty list, which would assert that nothing is firing, whenever this
+//! process has no current snapshot for it: when no evaluator runs here
+//! (alerting disabled, [`NOT_EVALUATING`]), before its evaluator has finished
+//! a tick ([`NOT_YET_EVALUATED`]), and whenever its last tick could not read
 //! alert history ([`HISTORY_UNREADABLE`]): an earlier tick's list is not
-//! served in place of the one that tick could not read. A tenant with no
-//! rules gets an empty list, but only from a process where some tenant has
-//! rules and an evaluator runs; otherwise it gets the first 503.
+//! served in place of the one that tick could not read.
 //!
 //! A tenant's evaluator is the only writer of its snapshot, so one that has
 //! panicked or wedged leaves its last snapshot in place. Once that snapshot is
@@ -134,8 +138,8 @@ pub const HEALTH_UNKNOWN: &str = "unknown";
 /// module docs: a Ravel value, deliberately not Prometheus's `inactive`.
 pub const STATE_UNKNOWN: &str = "unknown";
 
-/// The `error` of the 503 `/api/v1/alerts` answers when no evaluator runs in
-/// this process.
+/// The `error` of the 503 `/api/v1/alerts` answers a tenant with rules when
+/// no evaluator runs in this process.
 pub const NOT_EVALUATING: &str = "alert evaluation is not running in this process";
 
 /// The `error` of the 503 `/api/v1/alerts` answers before the tenant's
@@ -192,7 +196,6 @@ async fn handle_rules(State(state): State<AlertRulesState>, headers: HeaderMap) 
     let snapshot = match state.published.read(&tenant) {
         PublishedRead::Published(snapshot) => Some(snapshot),
         PublishedRead::NotEvaluating
-        | PublishedRead::NoRules
         | PublishedRead::NotYetEvaluated
         | PublishedRead::Stale { .. } => None,
     };
@@ -209,22 +212,30 @@ async fn handle_alerts(State(state): State<AlertRulesState>, headers: HeaderMap)
         Ok(tenant) => tenant.hash(),
         Err(err) => return unauthorized(&err, ALERTS_ROUTE),
     };
+    // Decided from the loaded rule set alone, before the published handle is
+    // read, so the answer cannot depend on whether this process runs an
+    // evaluator for some other tenant.
+    let rules = match state.rules.get(&tenant) {
+        Some(rules) if !rules.is_empty() => rules,
+        _ => return alerts_response(Vec::new()),
+    };
     let alerts = match state.published.read(&tenant) {
         PublishedRead::NotEvaluating => return unavailable(NOT_EVALUATING),
         PublishedRead::NotYetEvaluated => return unavailable(NOT_YET_EVALUATED),
         PublishedRead::Stale { age, bound } => return unavailable(&snapshot_stale(age, bound)),
-        PublishedRead::NoRules => Vec::new(),
         PublishedRead::Published(snapshot) => match &snapshot.alerts {
             None => return unavailable(HISTORY_UNREADABLE),
-            Some(alerts) => {
-                let rules = state.rules.get(&tenant).map_or(&[][..], Vec::as_slice);
-                alerts
-                    .iter()
-                    .map(|alert| render_alert(alert, rule_labels(rules, &alert.rule_id)))
-                    .collect()
-            }
+            Some(alerts) => alerts
+                .iter()
+                .map(|alert| render_alert(alert, rule_labels(rules, &alert.rule_id)))
+                .collect(),
         },
     };
+    alerts_response(alerts)
+}
+
+/// The 200 `/api/v1/alerts` answers with the tenant's alert list.
+fn alerts_response(alerts: Vec<Value>) -> Response {
     axum::Json(json!({
         "status": "success",
         "data": {"alerts": alerts},
@@ -663,11 +674,13 @@ mod tests {
             "an evaluator for the tenant that has not ticked"
         );
 
-        // A tenant with no rules has no alerts to raise, so an evaluating
-        // process can say so.
-        let (status, body) = get(evaluating_state(), ALERTS_ROUTE, Some(OTHER_TOKEN)).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body, json!({"status": "success", "data": {"alerts": []}}));
+        // A tenant with no rules has no alerts to raise, so every process can
+        // say so, whether or not it runs an evaluator for another tenant.
+        for state in [state(), evaluating_state()] {
+            let (status, body) = get(state, ALERTS_ROUTE, Some(OTHER_TOKEN)).await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body, json!({"status": "success", "data": {"alerts": []}}));
+        }
     }
 
     fn alert(labels: &[(&str, &str)]) -> PublishedAlert {
