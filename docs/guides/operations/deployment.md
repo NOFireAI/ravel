@@ -517,14 +517,18 @@ At the shipped defaults, the worst case from SIGTERM to exit is `32.5s`:
 
 The operator sizes the pod's shutdown lifecycle against that budget:
 
-- `terminationGracePeriodSeconds` is **45s** on every ravel-server pod
+- With `spec.probes.dedicatedHealthPort: false`,
+  `terminationGracePeriodSeconds` is **45s** on every ravel-server pod
   (gateway, query, and maintain). Kubernetes runs the `preStop` hook inside
   the grace period and sends SIGTERM only after the hook returns. The grace
   period therefore covers the `preStop` sleep, the `32.5s` server budget and
   headroom: `10s + 32.5s + 2.5s`, rounded up.
-- With `spec.probes.dedicatedHealthPort` set, stopping the health listener
-  adds up to 6s to the server's budget (38.5s). The operator then sets
-  **51s**: `10s + 38.5s + 2.5s`.
+- With `spec.probes.dedicatedHealthPort: true`, the CRD's default for a new
+  cluster, stopping the health listener adds up to 6s to the server's budget
+  (38.5s). The operator then sets **51s**: `10s + 38.5s + 2.5s`. An existing
+  cluster keeps the value it has stored; the Kubernetes guide's
+  [dedicated health port](../kubernetes.md#the-dedicated-health-port) section
+  explains which clusters hold `false`.
 - Do not set a grace period shorter than the server's budget. SIGKILL then
   lands mid-drain and buffered data is lost, which is irreversible. A longer
   grace period only slows a rolling update's pod turnover by a few seconds, so
@@ -541,9 +545,9 @@ The operator sizes the pod's shutdown lifecycle against that budget:
   every Linux capability dropped.
 
 The operator renders no `--shutdown-timeout` flag, so the server runs at its
-compiled default. `45s` (`51s` with the dedicated health port) is the correct
-grace period today. `--shutdown-timeout` is configurable on the server
-itself. If a future CRD field exposes it, the grace period must stay above
+compiled default. `51s` with the dedicated health port, and `45s` without
+it, is the correct grace period today. `--shutdown-timeout` is configurable
+on the server itself. If a future CRD field exposes it, the grace period must stay above
 the new server budget plus the `preStop` sleep.
 
 ## Durable auth refresh

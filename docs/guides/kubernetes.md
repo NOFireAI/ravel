@@ -325,7 +325,7 @@ A minimal example is in
 | `spec.gc.grace` | string | none | `--gc-grace` on the maintain pods, a duration such as `24h`. It must equal the grace stored in the bucket's `sys/gc`, read with `ravel-cli gc-config show`, or the maintain pods refuse to start. Unset renders no flag and the server's default applies. |
 | `spec.retention.default` | string | none | Duration string, e.g. `30d`. |
 | `spec.retention.tenants` | map | none | Per-tenant overrides, tenant name to duration. |
-| `spec.probes.dedicatedHealthPort` | boolean | `false` | Probe the dedicated health listener on 4316 instead of the main HTTP port. Requires a server image that has `--listen-health`. See "The dedicated health port" below. |
+| `spec.probes.dedicatedHealthPort` | boolean | `true` | Probe the dedicated health listener on 4316 instead of the main HTTP port. Requires a server image of v0.19.0 or newer, which has `--listen-health`. Set `false` to keep probes on the main HTTP port. An existing cluster keeps its stored value; see "The dedicated health port" below. |
 
 `storage.s3` is mandatory. No field selects the memory store, because a
 non-durable per-process store is incoherent across multiple pods. No field
@@ -884,12 +884,15 @@ kubelet kills a node whose workers are all busy in decode for longer than the
 2s probe timeout, three probes running. Its load then moves to its peers,
 and the pattern can repeat.
 
-`spec.probes.dedicatedHealthPort: true` moves the probes off that path:
+`spec.probes.dedicatedHealthPort: true` moves the probes off that path. It is
+the default for a cluster created under the current CRD; an existing cluster
+keeps the value it already has stored, as described below. To keep probes on
+the main HTTP port instead, set it to `false`:
 
 ```yaml
 spec:
   probes:
-    dedicatedHealthPort: true
+    dedicatedHealthPort: false
 ```
 
 It changes four things in every gateway, query, and maintain pod, and
@@ -920,14 +923,35 @@ and anything else already probing the HTTP port keeps working. The
 with no health listener, and keeps its probes on 8080.
 
 If a network policy restricts which pod ports are reachable, allow the
-kubelet to reach 4316 before setting the field. Otherwise both probes fail
-and the rollout stalls with no pod ever becoming Ready.
+kubelet to reach 4316 before creating a cluster or turning the field on.
+Otherwise both probes fail and the rollout stalls with no pod ever becoming
+Ready.
 
-The default is `false` in this release, and it will flip to `true` one release
-later. The field requires a `ravel-server` image that has `--listen-health`,
-meaning this release or newer. An older server rejects the unknown flag at
-startup, so the pod restart-loops. Check `spec.image` before you set the
-field, and before you take the release whose notes carry the flipped default.
+The field requires a `ravel-server` image that has `--listen-health`,
+v0.19.0 or newer: an older server rejects the unknown flag at startup and the
+pod restart-loops. Check `spec.image` before you create a cluster or turn the
+field on.
+
+The `true` default lives in the CRD's schema, not in the operator image, so
+it reaches new clusters once the new `deploy/k8s/operator/crd.yaml` is
+applied; upgrading the operator image alone changes nothing. Existing
+clusters keep their stored setting. The v0.19.0 CRD defaulted the field to
+`false`, and the API server stores schema defaults on every create and
+update, so a cluster written since then holds `false` and keeps probing 4318
+with a 45s grace period. Re-applying a manifest that omits the field leaves
+that stored `false` in place. To move such a cluster to the health port, set
+`dedicatedHealthPort: true`. Removing the field with a JSON-patch `remove`
+also brings the new default back on that write:
+
+```sh
+kubectl patch ravelcluster <name> --type=json \
+  -p '[{"op": "remove", "path": "/spec/probes/dedicatedHealthPort"}]'
+```
+
+A cluster never written since the v0.19.0 CRD was applied has no stored
+value, and reads as `true` once the new CRD is in place. That is rare: the
+operator updates each cluster's status on every reconcile, and those updates
+are writes too.
 
 Codec work that used to run on the main runtime's workers now runs behind
 two CPU gates on the blocking pool, and each gate's permit count bounds how
@@ -1193,3 +1217,6 @@ Two cases need action from you:
   hashing, which is why maintain can run more than one replica, is ADR-0065.
 - The operator's own single-replica topology, health listener and metrics are
   [ADR-1731](../adrs/1731-operator-health-metrics-and-topology.md).
+- The `spec.probes.dedicatedHealthPort` field, its CPU-gate motivation, and
+  why it defaults to `true` are
+  [ADR-1702](../adrs/1702-cpu-gate-and-isolated-liveness.md).

@@ -513,7 +513,8 @@ change, shown by reverting the change under test.
     run inside its 10 s bound; if it has not, the 30 s readiness threshold
     is revisited first, since it binds before the 60 s liveness one. Acceptance test: the default-render test
     from task 3 expects 4316 and the `--listen-health` argument, and the
-    release notes carry the image requirement.
+    release notes carry the image requirement. (Shipped; see the
+    operator-default-flip amendment below.)
 
 ## Amendment (2026-09-28): what the decoded-output charge reserves
 
@@ -876,3 +877,36 @@ The default is unchanged: with the flag unset, decision 7 stands as written.
 The flag exists to measure the gate's cost against its liveness benefit.
 Setting it gives up the isolation decision 7 gives scans: a scan over a large
 part holds a worker for the length of each block's decompress.
+
+## Amendment (2026-10-18): the operator-default-flip amendment (issue #2671)
+
+<!-- amendment-applies: sections="Follow-up tasks, in order" pointer="operator-default-flip amendment" -->
+
+Task 12's two preconditions are met, and the CRD now defaults
+`spec.probes.dedicatedHealthPort` to `true`:
+
+- One release after task 3: task 3 shipped in v0.19.0, together with the
+  `--listen-health` flag the field renders.
+- Task 11's second scenario ran on Linux inside its 10 s bound, with a
+  maximum heartbeat age of 1.0 s across three runs (issue #2671, comment
+  6252379466).
+
+Supporting evidence, not a precondition: a paired ClickBench run (issue
+#2980, comment 6253040379) compared `--sql-scan-decode-inline` (the
+scan-decode opt-out amendment above) on and off, with the health listener on
+in both arms. It shows the listener's isolation: with inline decode on, the
+listener's `/healthz` p99 moved by under 4 ms while the main router's p99
+rose, by about 3.4x in the benchmark phase and about 9x to 11x in the
+concurrent phases.
+
+The same run is the evidence that inline decode gains nothing on the current
+build: the hot-run sum differed between the two arms by a factor of 1.009 and
+the read-gate statement set by 1.083. That flag stays opt-in; this amendment
+changes only the operator's probe default, not decision 7.
+
+The default is a CRD schema default, which the API server stores on every
+create and update. The v0.19.0 CRD defaulted the field to `false`, so a
+RavelCluster written since then keeps `false` until its owner sets `true` or
+removes the field; only a new cluster, or one never written since the v0.19.0
+CRD (rare, since the operator's own status updates are writes), takes the new
+default.

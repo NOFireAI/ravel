@@ -183,10 +183,10 @@ So neither a wedged flush nor an unreachable object store can hold the
 budget. With a trace endpoint set and its collector unreachable, the trace
 flush runs the full 5s.
 
-| Configuration | Worst case from SIGTERM to exit | Pod grace period that the operator sets |
+| Server configuration | Worst case from SIGTERM to exit | Pod grace period that the operator sets |
 |---|---|---|
-| Default | 27.5s + 5s = 32.5s (25s drain + 2.5s heartbeat stop + 5s trace flush) | 45s |
-| `--listen-health` set | 27.5s + 6s + 5s = 38.5s | 51s on the pods of a cluster with `spec.probes.dedicatedHealthPort` set |
+| `--listen-health` unset (the server's own default) | 27.5s + 5s = 32.5s (25s drain + 2.5s heartbeat stop + 5s trace flush) | 45s on the pods of a cluster with `spec.probes.dedicatedHealthPort: false` |
+| `--listen-health` set | 27.5s + 6s + 5s = 38.5s | 51s on the pods of a cluster with `spec.probes.dedicatedHealthPort: true`, the CRD's default for a new cluster |
 
 An operator must size `terminationGracePeriodSeconds` against the worst case.
 The default worst case, 32.5s, is above the 30s Kubernetes default. So an
@@ -199,8 +199,10 @@ that enables the dedicated health port needs a grace period above 38.5s.
 
 `/healthz` and `/readyz` share the application runtime, so a node whose
 workers are all busy cannot answer them. `--listen-health <addr>`, off by
-default, adds a listener served by its own single-threaded runtime on a
-dedicated OS thread (ADR-1702 decisions 8 and 9). It serves only `/healthz`,
+default on the server and rendered by the operator under
+`spec.probes.dedicatedHealthPort: true`, adds a listener served by its own
+single-threaded runtime on a dedicated OS thread (ADR-1702 decisions 8 and
+9). It serves only `/healthz`,
 `/readyz`, `/-/healthy` and `/-/ready`, with no tenant identity. It reads a
 heartbeat that a task on the main runtime refreshes once per second:
 

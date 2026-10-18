@@ -3876,7 +3876,13 @@ mod tests {
                 resources: None,
                 credentials_secret_ref: None,
             },
-            probes: ProbesSpec::default(),
+            // Explicit false: the pre-ADR-1702-task-12 default, kept as the
+            // fixture every unrelated render test here builds on. The
+            // field-absent default is covered on its own in
+            // `probes_render_on_health_port_when_enabled`.
+            probes: ProbesSpec {
+                dedicated_health_port: false,
+            },
             gc: None,
             retention: Some(RetentionSpec {
                 default: Some("30d".to_string()),
@@ -4748,8 +4754,12 @@ mod tests {
         let mut on = base_spec();
         on.probes.dedicated_health_port = true;
 
-        // An existing RavelCluster carries no `probes` block at all. It must
-        // deserialize to the same spec the default gives.
+        // ADR-1702 follow-up task 12: a spec with no `probes` block
+        // deserializes to the dedicated-health-port default. In a cluster
+        // this is a new RavelCluster created after the new CRD is applied,
+        // or one never written since the v0.19.0 CRD: the API server stores
+        // schema defaults on every create and update, so a cluster written
+        // under the v0.19.0 CRD already holds `false` and keeps it.
         let mut without = serde_json::to_value(&off).expect("serialize spec");
         without
             .as_object_mut()
@@ -4758,7 +4768,10 @@ mod tests {
             .expect("probes serialized");
         let without: RavelClusterSpec =
             serde_json::from_value(without).expect("deserialize a spec with no probes block");
-        assert_eq!(without, off);
+        assert_eq!(
+            without, on,
+            "a spec with no probes block must default to the dedicated health port"
+        );
 
         let render = |spec: &RavelClusterSpec| {
             vec![
@@ -4770,9 +4783,11 @@ mod tests {
             ]
         };
 
-        // Disabled (this release's default): the render is what it is today,
-        // whole object for whole object.
-        assert_eq!(render(&off), render(&without));
+        // Field-absent: the explicit-true render, since `without` and `on`
+        // already compared equal as specs above. The explicit-false render
+        // is pinned whole object for whole object in
+        // `explicit_false_probes_render_the_pre_flip_deployments`.
+        assert_eq!(render(&on), render(&without));
         for dep in render(&off) {
             let container = container_of(&dep);
             assert!(
@@ -4872,6 +4887,86 @@ mod tests {
                 .as_ref()
                 .expect("httpGet");
             assert_eq!(get.port, IntOrString::Int(ROUTER_HTTP_PORT));
+        }
+    }
+
+    #[test]
+    fn probes_block_without_the_field_defaults_to_dedicated_health_port() {
+        // ADR-1702 follow-up task 12: an empty `probes: {}` block takes the
+        // field's own default, the same as omitting the block.
+        let probes: ProbesSpec = serde_json::from_value(serde_json::json!({}))
+            .expect("deserialize an empty probes block");
+        assert!(probes.dedicated_health_port);
+
+        let mut spec = serde_json::to_value(base_spec()).expect("serialize spec");
+        spec["probes"] = serde_json::json!({});
+        let spec: RavelClusterSpec =
+            serde_json::from_value(spec).expect("deserialize a spec with an empty probes block");
+        assert!(spec.probes.dedicated_health_port);
+    }
+
+    #[test]
+    fn explicit_false_probes_render_the_pre_flip_deployments() {
+        // ADR-1702 follow-up task 12: `dedicatedHealthPort: false` renders
+        // what a cluster without the field rendered before the flip: probes
+        // on 4318, no `--listen-health`, no health container port, and a 45s
+        // grace period. The expected object is the enabled render with those
+        // four changes undone, so any other difference fails the comparison.
+        let off = base_spec();
+        assert!(!off.probes.dedicated_health_port);
+        let mut on = base_spec();
+        on.probes.dedicated_health_port = true;
+        let render = |spec: &RavelClusterSpec| {
+            vec![
+                desired_gateway_deployment(spec, "prod", &ctx()),
+                desired_query_deployment(spec, "prod", &ctx()),
+                desired_maintain_deployment(spec, "prod", &ctx())
+                    .expect("no gc render error")
+                    .expect("maintain enabled"),
+            ]
+        };
+
+        for (actual, mut expected) in render(&off).into_iter().zip(render(&on)) {
+            let pod = expected
+                .spec
+                .as_mut()
+                .expect("spec")
+                .template
+                .spec
+                .as_mut()
+                .expect("pod spec");
+            assert_eq!(pod.termination_grace_period_seconds, Some(51));
+            pod.termination_grace_period_seconds = Some(45);
+
+            let container = &mut pod.containers[0];
+            let args = container.args.as_mut().expect("args");
+            let flag = args
+                .iter()
+                .position(|arg| arg == "--listen-health")
+                .expect("--listen-health rendered");
+            let removed: Vec<String> = args.drain(flag..flag + 2).collect();
+            assert_eq!(removed, ["--listen-health", "0.0.0.0:4316"]);
+
+            let ports = container.ports.as_mut().expect("container ports");
+            let rendered = ports.len();
+            ports.retain(|port| port.container_port != 4316);
+            assert_eq!(ports.len(), rendered - 1, "exactly one health port");
+
+            for probe in [
+                &mut container.liveness_probe,
+                &mut container.readiness_probe,
+            ] {
+                let get = probe
+                    .as_mut()
+                    .expect("probe")
+                    .http_get
+                    .as_mut()
+                    .expect("httpGet");
+                assert_eq!(get.port, IntOrString::Int(4316));
+                get.port = IntOrString::Int(4318);
+            }
+
+            assert_eq!(actual, expected);
         }
     }
 
