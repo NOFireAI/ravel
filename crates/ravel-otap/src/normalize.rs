@@ -110,13 +110,13 @@ use arrow::datatypes::{UInt8Type, UInt16Type};
 use ravel_ipcrypt::rules::TenantRules;
 use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_otlp::label_projection::{
-    RESOLVED_LABEL_OVERHEAD_BYTES, explode_name_label_bytes, histogram_point_bytes, label_bytes,
-    name_label_bytes, resource_value_label_len, summary_point_bytes,
+    RESOLVED_LABEL_OVERHEAD_BYTES, charged_len, explode_name_label_bytes, histogram_point_bytes,
+    label_bytes, name_label_bytes, resource_value_label_len, summary_point_bytes,
 };
 use ravel_otlp::metadata::{MetricKind as PromMetricKind, MetricMetadata};
 use ravel_otlp::normalize::{
-    MetricsNormalizeResult, NormalizedExemplar, apply_ipcrypt, metadata_unit_word,
-    prometheus_family_name,
+    MetricsNormalizeResult, NormalizedExemplar, apply_ipcrypt, lookup_label_rule,
+    metadata_unit_word, prometheus_family_name,
 };
 use ravel_otlp::promcompat::format_float;
 use ravel_otlp::{
@@ -1551,23 +1551,26 @@ fn check_resource_labels(
             continue;
         }
         if let Some(len) = first_len(key)? {
-            let len = ruled_value_len(rules, &sanitize_label_name(key), len);
+            let len = ruled_value_len(rules, key, len);
             check_label_len(sanitized_label_name_len(key), len, limits)?;
         }
     }
     Ok(())
 }
 
-/// The value length a raw-length check charges for the label `name`:
-/// [`TenantRules::max_stored_len`] of `raw_len` when a rule matches `name` and
-/// the value is non-empty, `raw_len` otherwise. The check runs before the
-/// value is encrypted, so it cannot see the ciphertext's real length; charging
-/// the most a matched value can be stored as over-counts, which is the
-/// intended, safe direction: a check that passes here also passes on the
-/// stored bytes in [`push_checked`]. An empty value stays 0, since
-/// [`push_checked`] drops it unencrypted.
-fn ruled_value_len(rules: &TenantRules, name: &str, raw_len: usize) -> usize {
-    let matched = raw_len > 0 && !rules.is_empty() && rules.lookup_label(name).is_some();
+/// The value length a raw-length check charges for the attribute `key`:
+/// [`TenantRules::max_stored_len`] of `raw_len` when a rule matches the label
+/// name `key` sanitizes to ([`lookup_label_rule`]) and the value is non-empty,
+/// `raw_len` otherwise. The check runs before the value is encrypted, so it
+/// cannot see the ciphertext's real length; charging the most a matched value
+/// can be stored as over-counts, which is the intended, safe direction: a
+/// check that passes here also passes on the stored bytes in
+/// [`push_checked`]. An empty value stays 0, since [`push_checked`] drops it
+/// unencrypted.
+fn ruled_value_len(rules: &TenantRules, key: &str, raw_len: usize) -> usize {
+    let matched = raw_len > 0 && lookup_label_rule(rules, key).is_some();
+    // Charging max(47, raw) refuses a value OTLP accepts only when
+    // `max_label_value_len` is under 47; the limit is fixed at 4096 today.
     charged_len(matched, raw_len)
 }
 
@@ -1750,19 +1753,6 @@ fn resource_attr_value<'b>(a: &FlatAttr<'b>) -> ResourceAttrValue<'b> {
     }
 }
 
-/// The length a value's label is charged at: inflated to
-/// [`TenantRules::max_stored_len`] when its name matches `rules`, since the
-/// stored length after encryption is what the build will actually keep
-/// (ADR-2993 decision 3), unchanged otherwise. Mirrors
-/// `ravel_otlp::label_projection::charged_len`, which is private there.
-fn charged_len(matched: bool, raw_len: usize) -> usize {
-    if matched {
-        TenantRules::max_stored_len(raw_len)
-    } else {
-        raw_len
-    }
-}
-
 /// The bytes one point's attribute labels take, as `(kept, reserved)`: `kept`
 /// for the labels a set holds, `reserved` adding the slot an empty value leaves
 /// allocated in a set whose `Vec` was sized before the drop ([`build_group`]).
@@ -1779,8 +1769,7 @@ fn flat_attr_bytes(
         let a = &attrs[i as usize];
         let len = resource_value_label_len(resource_attr_value(a))?;
         if len > 0 {
-            let matched =
-                !rules.is_empty() && rules.lookup_label(&sanitize_label_name(a.key)).is_some();
+            let matched = lookup_label_rule(rules, a.key).is_some();
             let bytes = label_bytes(a.key.len(), charged_len(matched, len));
             kept = kept.saturating_add(bytes);
             reserved = reserved.saturating_add(bytes);
@@ -3056,11 +3045,7 @@ fn check_flat_attrs_in_input_order(
         // pass must skip it too, or an empty-valued label with an over-long
         // name would reject here while the canonical build silently drops it,
         // breaking the ADR-0011 identical-rejection-class contract.
-        let value_len = if rules.is_empty() {
-            value_len
-        } else {
-            ruled_value_len(rules, &sanitize_label_name(a.key), value_len)
-        };
+        let value_len = ruled_value_len(rules, a.key, value_len);
         check_label_len(sanitized_label_name_len(a.key), value_len, limits)?;
     }
     Ok(())

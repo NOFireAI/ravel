@@ -46,8 +46,8 @@ use crate::limits::IngestLimits;
 use crate::logs_limits::LogIngestLimits;
 use crate::logs_normalize::MAX_ATTRIBUTE_NESTING_DEPTH;
 use crate::normalize::{
-    ResourceAttrValue, metric_kind_of, prometheus_family_name, resource_attr_pairs,
-    sanitize_label_name, sanitize_metric_name,
+    ResourceAttrValue, lookup_label_rule, metric_kind_of, prometheus_family_name,
+    resource_attr_pairs, sanitize_metric_name,
 };
 use crate::traces_limits::SpanIngestLimits;
 use crate::traces_normalize::{
@@ -66,7 +66,7 @@ use crate::traces_normalize::{
 /// over-counts. That is the intended direction: the projection is an upper
 /// bound checked before anything is built, and under-counting would admit a
 /// request whose stored bytes exceed the bound.
-fn charged_len(matched: bool, raw_len: usize) -> usize {
+pub fn charged_len(matched: bool, raw_len: usize) -> usize {
     if matched {
         TenantRules::max_stored_len(raw_len)
     } else {
@@ -263,8 +263,7 @@ pub fn resource_prefix_bytes(
         if let Some(len) = first_attr_label_len(attrs, key)?
             && len > 0
         {
-            let sanitized = sanitize_label_name(key.clone());
-            let len = charged_len(rules.lookup_label(&sanitized).is_some(), len);
+            let len = charged_len(lookup_label_rule(rules, key).is_some(), len);
             total = total.saturating_add(label_bytes(key.len(), len));
         }
     }
@@ -316,11 +315,7 @@ fn point_attribute_bytes(
     for kv in attributes {
         let len = label_value_len(kv.value.as_ref())?;
         if len > 0 {
-            let matched = !rules.is_empty()
-                && rules
-                    .lookup_label(&sanitize_label_name(kv.key.clone()))
-                    .is_some();
-            let len = charged_len(matched, len);
+            let len = charged_len(lookup_label_rule(rules, &kv.key).is_some(), len);
             total = total.saturating_add(label_bytes(kv.key.len(), len));
         } else if reserved_slots {
             total = total.saturating_add(RESOLVED_LABEL_OVERHEAD_BYTES);
@@ -838,7 +833,7 @@ fn reserved_attrs_bytes(
             &span.events,
             limits,
             rules,
-            |e| &mut e.attributes,
+            |e| &e.attributes,
         ));
     }
     if !span.links.is_empty() {
@@ -847,70 +842,85 @@ fn reserved_attrs_bytes(
             &span.links,
             limits,
             rules,
-            |l| &mut l.attributes,
+            |l| &l.attributes,
         ));
     }
     total
-}
-
-/// Concatenated length-delimited encoding length of `items`.
-fn blob_raw_len<T: Message>(items: &[T]) -> usize {
-    items
-        .iter()
-        .map(|item| {
-            let len = item.encoded_len();
-            prost::length_delimiter_len(len).saturating_add(len)
-        })
-        .fold(0usize, usize::saturating_add)
 }
 
 /// The hex blob `encode_blob` would store for `items`, or nothing when its
 /// raw length is over `max_raw_blob_len` and the blob is dropped.
 ///
 /// When `rules` matches an event or link attribute by raw key, its non-empty
-/// string value is charged at [`TenantRules::max_stored_len`] by measuring a
-/// copy with that value padded to that length: protobuf length is monotone
-/// in a string's length, so the padded blob is never shorter than the
-/// encrypted one. The padded length can cross `max_raw_blob_len` while the
-/// encrypted blob does not, so such a blob is charged at the cap instead of
-/// nothing. Both choices can only over-count, which is the safe direction:
+/// string value is charged at [`TenantRules::max_stored_len`]: the blob is
+/// measured as if that value were padded to that length, computed from the
+/// encoded lengths without building the padded copy. Protobuf length is
+/// monotone in a string's length, so the padded blob is never shorter than
+/// the encrypted one. The padded length can cross `max_raw_blob_len` while
+/// the encrypted blob does not, so such a blob is charged at the cap instead
+/// of nothing. Both choices can only over-count, which is the safe direction:
 /// a projection under the stored bytes would admit a request over the bound.
-fn blob_bytes<T: Message + Clone>(
+fn blob_bytes<T: Message>(
     key: &str,
     items: &[T],
     limits: &SpanIngestLimits,
     rules: &TenantRules,
-    attributes: fn(&mut T) -> &mut Vec<KeyValue>,
+    attributes: fn(&T) -> &[KeyValue],
 ) -> usize {
-    let raw = blob_raw_len(items);
-    let mut padded = None;
-    if !rules.is_empty() {
-        let mut copy = items.to_vec();
-        let mut matched = false;
-        for item in &mut copy {
-            for kv in attributes(item).iter_mut() {
-                if rules.lookup_raw(&kv.key).is_none() {
+    let mut raw = 0usize;
+    let mut padded = 0usize;
+    let mut matched = false;
+    for item in items {
+        let len = item.encoded_len();
+        raw = raw.saturating_add(delimited_len(len));
+        let mut item_len = len;
+        if !rules.is_empty() {
+            for kv in attributes(item) {
+                let Some(grown) = padded_kv_growth(kv, rules) else {
                     continue;
-                }
-                if let Some(AnyValueVariant::StringValue(s)) =
-                    kv.value.as_mut().and_then(|v| v.value.as_mut())
-                    && !s.is_empty()
-                {
-                    *s = "0".repeat(charged_len(true, s.len()));
-                    matched = true;
-                }
+                };
+                item_len = item_len.saturating_add(grown);
+                matched = true;
             }
         }
-        if matched {
-            padded = Some(blob_raw_len(&copy));
-        }
+        padded = padded.saturating_add(delimited_len(item_len));
     }
-    let charged = match padded {
-        None if raw > limits.max_raw_blob_len => return 0,
-        None => raw,
-        Some(padded) => padded.min(limits.max_raw_blob_len),
+    let charged = if matched {
+        padded.min(limits.max_raw_blob_len)
+    } else if raw > limits.max_raw_blob_len {
+        return 0;
+    } else {
+        raw
     };
     label_bytes(key.len(), charged.saturating_mul(2))
+}
+
+/// A protobuf length-delimited field's payload of `len` bytes plus its length
+/// prefix (the tag excluded, as it never changes here).
+fn delimited_len(len: usize) -> usize {
+    prost::length_delimiter_len(len).saturating_add(len)
+}
+
+/// How many bytes `kv`'s encoding inside its event or link grows by when a
+/// rule matches its raw key and its non-empty string value is padded to
+/// [`TenantRules::max_stored_len`], or `None` when it is not charged so.
+/// Each enclosing length prefix (the string, the `AnyValue`, the `KeyValue`)
+/// is recomputed for its grown payload.
+fn padded_kv_growth(kv: &KeyValue, rules: &TenantRules) -> Option<usize> {
+    rules.lookup_raw(&kv.key)?;
+    let any = kv.value.as_ref()?;
+    let Some(AnyValueVariant::StringValue(s)) = any.value.as_ref() else {
+        return None;
+    };
+    if s.is_empty() {
+        return None;
+    }
+    let grown = |len: usize, by: usize| {
+        delimited_len(len.saturating_add(by)).saturating_sub(delimited_len(len))
+    };
+    let string_growth = grown(s.len(), charged_len(true, s.len()) - s.len());
+    let any_growth = grown(any.encoded_len(), string_growth);
+    Some(grown(kv.encoded_len(), any_growth))
 }
 
 #[cfg(test)]
@@ -1007,6 +1017,158 @@ mod tests {
                 expected += 1;
             }
             assert_eq!(uvarint_len(v), expected, "{v}");
+        }
+    }
+
+    fn sanitize(key: &str) -> String {
+        crate::normalize::sanitize_label_name(key.to_string())
+    }
+
+    /// A rule set over `keys`, one deterministic rule each.
+    fn rules_on(keys: &[&str]) -> TenantRules {
+        let entries: Vec<String> = keys
+            .iter()
+            .map(|k| format!("{{ key = \"{k}\", variant = \"deterministic\" }}"))
+            .collect();
+        let policy = ravel_ipcrypt::policy::parse_policy_file(
+            &format!("[defaults]\nrules = [{}]\n", entries.join(", ")),
+            sanitize,
+        )
+        .expect("policy parses");
+        TenantRules::resolve(
+            &policy,
+            "acme",
+            &ravel_types::TenantHash([9u8; 16]),
+            &[7u8; 32],
+            sanitize,
+        )
+        .expect("rules resolve")
+    }
+
+    /// The charge the arithmetic in [`blob_bytes`] must reproduce: pad a copy
+    /// of every matched value and measure the copy.
+    fn blob_bytes_by_padding_a_copy(
+        key: &str,
+        items: &[Event],
+        limits: &SpanIngestLimits,
+        rules: &TenantRules,
+    ) -> usize {
+        let raw_len = |items: &[Event]| {
+            items
+                .iter()
+                .map(|item| delimited_len(item.encoded_len()))
+                .sum::<usize>()
+        };
+        let raw = raw_len(items);
+        let mut copy = items.to_vec();
+        let mut matched = false;
+        for item in &mut copy {
+            for kv in &mut item.attributes {
+                if rules.lookup_raw(&kv.key).is_none() {
+                    continue;
+                }
+                if let Some(AnyValueVariant::StringValue(s)) =
+                    kv.value.as_mut().and_then(|v| v.value.as_mut())
+                    && !s.is_empty()
+                {
+                    *s = "0".repeat(charged_len(true, s.len()));
+                    matched = true;
+                }
+            }
+        }
+        let charged = if matched {
+            raw_len(&copy).min(limits.max_raw_blob_len)
+        } else if raw > limits.max_raw_blob_len {
+            return 0;
+        } else {
+            raw
+        };
+        label_bytes(key.len(), charged * 2)
+    }
+
+    use opentelemetry_proto::tonic::trace::v1::span::Event;
+    use proptest::prelude::*;
+
+    const RULED: [&str; 2] = ["client.ip", "peer"];
+
+    fn event_attr() -> impl Strategy<Value = KeyValue> {
+        let key = prop_oneof![
+            prop::sample::select(RULED.to_vec()).prop_map(str::to_string),
+            "[a-z]{1,6}",
+        ];
+        let value = prop_oneof![
+            // Lengths either side of the 47-byte floor and of the one- and
+            // two-byte varint boundaries every enclosing prefix crosses.
+            prop::sample::select(vec![
+                0usize, 1, 46, 47, 48, 80, 100, 120, 127, 128, 200, 16_400
+            ])
+            .prop_map(|n| Some(AnyValueVariant::StringValue("v".repeat(n)))),
+            any::<i64>().prop_map(|i| Some(AnyValueVariant::IntValue(i))),
+            Just(None),
+        ];
+        (key, value).prop_map(|(key, value)| KeyValue {
+            key,
+            value: value.map(|v| AnyValue { value: Some(v) }),
+            ..Default::default()
+        })
+    }
+
+    fn events() -> impl Strategy<Value = Vec<Event>> {
+        prop::collection::vec(
+            (prop::collection::vec(event_attr(), 0..4), "[a-z]{0,90}").prop_map(
+                |(attributes, name)| Event {
+                    time_unix_nano: 1,
+                    name,
+                    attributes,
+                    ..Default::default()
+                },
+            ),
+            0..4,
+        )
+    }
+
+    proptest! {
+        #[test]
+        fn blob_bytes_matches_padding_a_copy(
+            items in events(),
+            cap in prop::sample::select(vec![0usize, 100, 300, 1_000, 65_536]),
+        ) {
+            let rules = rules_on(&RULED);
+            let limits = SpanIngestLimits {
+                max_raw_blob_len: cap,
+                ..SpanIngestLimits::default()
+            };
+            prop_assert_eq!(
+                blob_bytes(ATTR_EVENTS_RAW, &items, &limits, &rules, |e| &e.attributes),
+                blob_bytes_by_padding_a_copy(ATTR_EVENTS_RAW, &items, &limits, &rules)
+            );
+            let none = TenantRules::none();
+            prop_assert_eq!(
+                blob_bytes(ATTR_EVENTS_RAW, &items, &limits, &none, |e| &e.attributes),
+                blob_bytes_by_padding_a_copy(ATTR_EVENTS_RAW, &items, &limits, &none)
+            );
+        }
+
+        #[test]
+        fn lookup_label_rule_matches_sanitizing_then_looking_up(
+            key in prop_oneof![
+                Just(String::new()),
+                Just("client.ip".to_string()),
+                Just("client_ip".to_string()),
+                Just("client-ip".to_string()),
+                Just("clïent.ip".to_string()),
+                Just("1lient.ip".to_string()),
+                Just(format!("{}.ip", "a".repeat(300))),
+                Just(format!("{}_ip", "a".repeat(300))),
+                "[a-z._\\-é0-9]{0,12}",
+            ],
+        ) {
+            let rules = rules_on(&["client.ip", "cl_ent.ip", "_lient.ip", &format!("{}.ip", "a".repeat(300))]);
+            prop_assert_eq!(
+                lookup_label_rule(&rules, &key).map(|info| info.raw_key),
+                rules.lookup_label(&sanitize(&key)).map(|info| info.raw_key)
+            );
+            prop_assert!(lookup_label_rule(&TenantRules::none(), &key).is_none());
         }
     }
 }

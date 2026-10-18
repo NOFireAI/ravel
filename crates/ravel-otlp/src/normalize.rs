@@ -85,7 +85,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
     SummaryDataPoint, metric::Data as MetricData,
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
-use ravel_ipcrypt::rules::TenantRules;
+use ravel_ipcrypt::rules::{RuleInfo, TenantRules};
 use ravel_ipcrypt::tally::IpcryptTally;
 use ravel_segment::{HistogramCounts, HistogramSample, HistogramSpan, HistogramValue, ResetHint};
 use ravel_types::{
@@ -2389,6 +2389,40 @@ pub fn sanitize_metric_name(name: &str) -> String {
 /// names for one logical series.
 pub fn sanitize_label_name(name: String) -> String {
     sanitize(name, is_label_name_start, is_label_name_continue)
+}
+
+/// Keys up to this many characters are sanitized on the stack by
+/// [`lookup_label_rule`].
+const LOOKUP_STACK_LEN: usize = 256;
+
+/// The rule `rules` holds for the label name `key` sanitizes to
+/// ([`sanitize_label_name`], then
+/// [`TenantRules::lookup_label`](ravel_ipcrypt::rules::TenantRules::lookup_label)),
+/// without allocating for a key of up to 256 characters. For a caller that
+/// only needs the match: the projections, and Remote Write, which stores a
+/// label under its name as received but matches it like OTLP does.
+pub fn lookup_label_rule<'r>(rules: &'r TenantRules, key: &str) -> Option<RuleInfo<'r>> {
+    if rules.is_empty() {
+        return None;
+    }
+    // Sanitizing maps every character to one ASCII byte: itself when allowed,
+    // `_` otherwise.
+    let mut buf = [0u8; LOOKUP_STACK_LEN];
+    let mut len = 0;
+    for (i, c) in key.chars().enumerate() {
+        let Some(slot) = buf.get_mut(len) else {
+            return rules.lookup_label(&sanitize_label_name(key.to_owned()));
+        };
+        let allowed = if i == 0 {
+            is_label_name_start(c)
+        } else {
+            is_label_name_continue(c)
+        };
+        *slot = if allowed { c as u8 } else { b'_' };
+        len += 1;
+    }
+    let name = std::str::from_utf8(buf.get(..len)?).ok()?;
+    rules.lookup_label(name)
 }
 
 /// Rewrite every disallowed character to `_`, classifying the first character
