@@ -46,7 +46,7 @@ use ravel_types::TenantHash;
 #[cfg(test)]
 use ravel_types::accounting::QueryAccounting;
 
-use crate::declared::DeclaredColumn;
+use crate::declared::{DeclaredColumn, KeyIndexDeclaration};
 #[cfg(feature = "flight-sql")]
 use crate::distributed::{WorkerSlice, WorkerSliceClient};
 #[cfg(feature = "flight-sql")]
@@ -55,7 +55,7 @@ use crate::distributed_rlog::{
 };
 #[cfg(feature = "flight-sql")]
 use crate::flight_ticket::SlicePushdown;
-use crate::logs_pushdown::{LogsPushdown, extract_logs, filter_is_exact};
+use crate::logs_pushdown::{LogsPushdown, extract_logs_keyed, filter_is_exact};
 use crate::logs_scan::LogsScanExec;
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 use crate::logs_stats_prune::prune_segments_by_stats;
@@ -83,6 +83,10 @@ pub struct LogsTableProvider {
     /// exactly. The provider's advertised [`Self::schema`] and every
     /// `LogsScanExec` it builds are derived from this list.
     declared: Arc<Vec<DeclaredColumn>>,
+    /// The fields the tenant's writers index in KEY_IDX, installed with
+    /// [`LogsTableProvider::with_key_index`]. Only an equality on a field named
+    /// here reaches the KEY_IDX probe; the default names none.
+    key_index: KeyIndexDeclaration,
     /// Exact per-segment column statistics for the tenant's declared columns
     /// (ADR-0850), resolved once per plan by `SqlExecutor` and installed with
     /// [`LogsTableProvider::with_column_stats`]. `None` -- the default -- is
@@ -124,6 +128,7 @@ impl LogsTableProvider {
             phase_accounting,
             erasure,
             declared: Arc::new(Vec::new()),
+            key_index: KeyIndexDeclaration::default(),
             column_stats: None,
             #[cfg(feature = "flight-sql")]
             distributed: None,
@@ -165,8 +170,9 @@ impl LogsTableProvider {
     /// [`Self::worker_fragment`], scanning under the coordinator's pushdown the
     /// slice ticket carried (issue #2755): its time bounds window the read and
     /// its prune comparisons (attribute equalities and declared column
-    /// comparisons) drive segment stats pruning and block pruning, so the
-    /// worker decodes only the blocks they admit. `None`, or a spans pushdown,
+    /// comparisons) drive segment stats pruning and block pruning, and its
+    /// exact-key equalities drive the plan's KEY_IDX probe (ADR-2707 decision
+    /// 5), so the worker decodes only the blocks they admit. `None`, or a spans pushdown,
     /// is the no-pushdown read. The coordinator re-applies every filter above
     /// the merge, so the pushdown only narrows what is decoded.
     #[cfg(feature = "flight-sql")]
@@ -223,6 +229,14 @@ impl LogsTableProvider {
         self
     }
 
+    /// Install the tenant's KEY_IDX declaration, resolved once per plan by
+    /// `SqlExecutor` beside the declared columns. An exact-key equality on a
+    /// field it does not name is not offered to the KEY_IDX probe.
+    pub fn with_key_index(mut self, key_index: KeyIndexDeclaration) -> Self {
+        self.key_index = key_index;
+        self
+    }
+
     /// Install this plan's loaded column statistics (ADR-0850), resolved once
     /// by `SqlExecutor` via `Catalog::load_column_stats` and threaded down. A
     /// builder method for the same reason [`Self::with_declared_columns`] is
@@ -269,7 +283,7 @@ impl LogsTableProvider {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.build_scan(
             target_partitions,
-            &extract_logs(filters, self.declared.as_ref()),
+            &extract_logs_keyed(filters, self.declared.as_ref(), &self.key_index),
             None,
         )
     }
@@ -317,7 +331,8 @@ impl LogsTableProvider {
         )?
         .with_column_stats(self.column_stats.clone())
         .with_segment_timing(self.segment_timing)
-        .with_segments_pruned_by_stats(pruned_by_stats);
+        .with_segments_pruned_by_stats(pruned_by_stats)
+        .with_key_equals(Arc::new(pushdown.key_equals.clone()));
         Ok(Arc::new(scan))
     }
 
@@ -429,7 +444,7 @@ impl TableProvider for LogsTableProvider {
         // ceiling, matching the local path.
         #[cfg(feature = "flight-sql")]
         if let Some(dist) = &self.distributed {
-            let pushdown = extract_logs(filters, self.declared.as_ref());
+            let pushdown = extract_logs_keyed(filters, self.declared.as_ref(), &self.key_index);
             let plan = distributed_logs_plan(
                 dist.endpoints.clone(),
                 Arc::clone(&dist.client),
@@ -443,7 +458,7 @@ impl TableProvider for LogsTableProvider {
         }
 
         let target_partitions = state.config().target_partitions();
-        let pushdown = extract_logs(filters, self.declared.as_ref());
+        let pushdown = extract_logs_keyed(filters, self.declared.as_ref(), &self.key_index);
         // Projection pushdown reaches the reader (ADR-0087 decision 3): the
         // scan's output schema *is* the projection, and the resolved column set
         // stops the RLOG reader decoding the pages of columns nothing reads.

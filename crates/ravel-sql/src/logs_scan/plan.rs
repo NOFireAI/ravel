@@ -32,19 +32,21 @@ pub(super) struct PlanCounts {
     /// `None` otherwise. [`owned_work`] reads a partition's queue from here,
     /// and each segment's owner count was taken from the same deal.
     global: Option<Vec<Vec<DealtRun>>>,
+    /// What the tier-1 KEY_IDX probe pruned over every planned segment
+    /// (ADR-2707 decision 5), published once by partition 0.
+    pub(super) key_index: KeyIndexPruning,
 }
 
 /// What the plan phase learned about a segment with at least one surviving
 /// block (ADR-2414 decision A1).
 struct PlannedBlocks {
     /// Whole-object block indices surviving this query's pruning, ascending:
-    /// the set [`owned_work`] deals, whole row group by whole row group, into
-    /// each partition's share, and the list every per-partition open's own
-    /// pruning must reproduce.
+    /// the list every per-partition open's own pruning must reproduce.
     indices: Arc<Vec<usize>>,
-    /// `indices` grouped into whole row groups ([`row_groups`]), computed
-    /// here so the deal does not need the directories, which the segment's
-    /// last owner may already have released.
+    /// The blocks [`owned_work`] deals, grouped into whole row groups
+    /// ([`row_groups`]): every survivor, or the ones the KEY_IDX probe left
+    /// (ADR-2707 decision 5). Computed here so the deal does not need the
+    /// directories, which the segment's last owner may already have released.
     groups: Vec<Vec<usize>>,
     /// Per entry of `groups`, its [`group_key`]: the order [`global_deal`]
     /// sorts the group in.
@@ -55,15 +57,26 @@ struct PlannedBlocks {
 }
 
 impl PlannedBlocks {
-    /// A segment's plan with no owners counted yet: until
-    /// [`CarriedDirsSlot::set_owners`] runs, the directories stay held for as
-    /// long as the plan counts live.
+    #[cfg(test)]
     fn new(
         indices: Vec<usize>,
         dirs: Arc<SegmentDirectories>,
         reservation: ravel_memory::Reservation,
     ) -> Self {
-        let groups = row_groups(&indices, dirs.page_dir());
+        Self::restricted(indices, None, dirs, reservation)
+    }
+
+    /// A segment's plan with no owners counted yet: until
+    /// [`CarriedDirsSlot::set_owners`] runs, the directories stay held for as
+    /// long as the plan counts live. Only `dealt` (a subsequence of
+    /// `indices`) is dealt to partitions when it is `Some`.
+    fn restricted(
+        indices: Vec<usize>,
+        dealt: Option<&[usize]>,
+        dirs: Arc<SegmentDirectories>,
+        reservation: ravel_memory::Reservation,
+    ) -> Self {
+        let groups = row_groups(dealt.unwrap_or(&indices), dirs.page_dir());
         let l0 = &dirs.skip_index().l0;
         let group_min_ts = groups
             .iter()
@@ -341,11 +354,12 @@ async fn compute_plan_counts(
                 LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns);
             continue;
         }
-        let prune = ctx.fetcher.plan_segment(
+        let prune = ctx.fetcher.plan_segment_keyed(
             seg,
             ctx.tenant_hash,
             &ctx.query,
             ctx.phase_accounting.plan(),
+            ctx.phase_accounting.key_index(),
         );
         prunes.push(async move { (idx, prune.await) });
     }
@@ -363,10 +377,16 @@ async fn compute_plan_counts(
     // `None` before `SegPlan` is built below.
     let mut carried_bytes = 0u64;
     let mut carried_seen = 0usize;
+    let mut key_index = KeyIndexPruning::default();
     while let Some((idx, entry)) = stream.next().await {
-        let entry: PlanSegmentResult = entry.map_err(SqlError::from)?;
+        let keyed = entry.map_err(SqlError::from)?;
+        key_index.segments_pruned += keyed.key_index.segments_pruned;
+        key_index.blocks_pruned += keyed.key_index.blocks_pruned;
+        let entry: PlanSegmentResult = keyed.plan;
         if let Some((indices, dirs, stats, footer, whole_object)) = entry {
-            let survivors = indices.len();
+            // The blocks some partition reads: the KEY_IDX probe's subset of
+            // the survivors when it named one.
+            let survivors = keyed.key_blocks.as_ref().map_or(indices.len(), Vec::len);
             total_blocks += survivors;
             // A relevant segment planned from the skip index carries its
             // footer forward; the whole-object fallback (#761) carries none.
@@ -401,7 +421,12 @@ async fn compute_plan_counts(
                     .fetcher
                     .reserve_carried_directories(&dirs)
                     .map_err(SqlError::from)?;
-                Some(PlannedBlocks::new(indices, dirs, reservation))
+                Some(PlannedBlocks::restricted(
+                    indices,
+                    keyed.key_blocks.as_deref(),
+                    dirs,
+                    reservation,
+                ))
             } else {
                 None
             };
@@ -431,7 +456,7 @@ async fn compute_plan_counts(
     let partitions = plan_concurrency
         .max(1)
         .min((total_blocks + unplanned_count).max(1));
-    Ok(Arc::new(PlanCounts::dealt(
+    let mut counts = PlanCounts::dealt(
         segs,
         unplanned,
         partitions,
@@ -439,7 +464,9 @@ async fn compute_plan_counts(
         segments,
         stripe_blocks,
         by_min_ts,
-    )))
+    );
+    counts.key_index = key_index;
+    Ok(Arc::new(counts))
 }
 
 impl PlanCounts {
@@ -483,6 +510,7 @@ impl PlanCounts {
             partitions,
             full_reads,
             global,
+            key_index: KeyIndexPruning::default(),
         }
     }
 }
@@ -785,7 +813,7 @@ pub(super) fn owned_work(
                 work.push_back(OwnedSeg {
                     seg: segments[seg_idx].clone(),
                     ordinal: seg_idx,
-                    indices: planned.indices.to_vec(),
+                    indices: planned.groups.concat(),
                     survivors: Some(Arc::clone(&planned.indices)),
                     footer: plan.footer.clone(),
                     whole_object: plan.whole_object.clone(),
@@ -976,6 +1004,7 @@ mod owned_work_tests {
                 partitions: segments * BLOCKS,
                 full_reads: 0,
                 global: None,
+                key_index: KeyIndexPruning::default(),
             },
             refs,
         )
@@ -1542,6 +1571,7 @@ mod owned_work_tests {
                     partitions: n,
                     full_reads: 0,
                     global: None,
+                    key_index: KeyIndexPruning::default(),
                 };
                 let owners = |c: &PlanCounts| -> Vec<Option<usize>> {
                     c.segs
@@ -1874,6 +1904,7 @@ mod carried_directory_reservation_tests {
             partitions: 1,
             full_reads: 1,
             global: None,
+            key_index: KeyIndexPruning::default(),
         };
         assert!(exec.counts.set(Arc::new(counts)).is_ok());
         let mut stream = exec

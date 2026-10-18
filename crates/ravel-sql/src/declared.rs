@@ -86,6 +86,19 @@ impl DeclaredColumn {
     }
 }
 
+/// Which `logs` fields a tenant's writers index in KEY_IDX: the declared
+/// columns named in its `key_index` declaration, plus `trace_id` when
+/// `index_trace_id` is on. An exact-key equality is offered to the KEY_IDX probe
+/// only for a field named here, so a column the tenant never asked to index
+/// costs no KEY_IDX read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KeyIndexDeclaration {
+    /// Declared attribute keys named in the tenant's `key_index` declaration.
+    pub columns: Vec<String>,
+    /// Whether the tenant's writers index `trace_id`.
+    pub trace_id: bool,
+}
+
 /// Query-time source of a tenant's declared typed attribute columns (ADR-0090
 /// decision 2).
 ///
@@ -107,6 +120,13 @@ pub trait DeclaredColumnSource: Send + Sync {
     /// `now_ns`. An empty vec means the `logs` table has its zero-declaration
     /// base schema for this tenant.
     async fn declared_columns(&self, tenant: TenantHash, now_ns: i64) -> Vec<DeclaredColumn>;
+
+    /// The fields `tenant`'s writers index in KEY_IDX, resolved as of `now_ns`.
+    /// The default indexes nothing, so a source that does not know the
+    /// declaration offers no key to the probe.
+    async fn key_index(&self, _tenant: TenantHash, _now_ns: i64) -> KeyIndexDeclaration {
+        KeyIndexDeclaration::default()
+    }
 }
 
 /// A fixed declared-column set, ignoring `tenant` and `now_ns` (ADR-0090
@@ -119,21 +139,30 @@ pub trait DeclaredColumnSource: Send + Sync {
 #[derive(Clone, Debug, Default)]
 pub struct StaticDeclaredColumns {
     columns: Vec<DeclaredColumn>,
+    key_index: KeyIndexDeclaration,
 }
 
 impl StaticDeclaredColumns {
     /// A source declaring exactly `columns`.
     pub fn new(columns: Vec<DeclaredColumn>) -> Self {
-        StaticDeclaredColumns { columns }
+        StaticDeclaredColumns {
+            columns,
+            key_index: KeyIndexDeclaration::default(),
+        }
+    }
+
+    /// The same source, also reporting `key_index` as the tenant's KEY_IDX
+    /// declaration.
+    pub fn with_key_index(mut self, key_index: KeyIndexDeclaration) -> Self {
+        self.key_index = key_index;
+        self
     }
 
     /// A source declaring no columns: the `logs` table's zero-declaration base
     /// schema for every tenant. This is the default `SqlExecutor` carries until
     /// a caller installs a real source.
     pub fn empty() -> Self {
-        StaticDeclaredColumns {
-            columns: Vec::new(),
-        }
+        StaticDeclaredColumns::new(Vec::new())
     }
 }
 
@@ -141,6 +170,10 @@ impl StaticDeclaredColumns {
 impl DeclaredColumnSource for StaticDeclaredColumns {
     async fn declared_columns(&self, _tenant: TenantHash, _now_ns: i64) -> Vec<DeclaredColumn> {
         self.columns.clone()
+    }
+
+    async fn key_index(&self, _tenant: TenantHash, _now_ns: i64) -> KeyIndexDeclaration {
+        self.key_index.clone()
     }
 }
 
@@ -180,5 +213,19 @@ mod tests {
                 .await
                 .is_empty()
         );
+        assert_eq!(
+            src.key_index(TenantHash([0u8; 16]), 0).await,
+            KeyIndexDeclaration::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn static_source_reports_its_key_index_declaration() {
+        let decl = KeyIndexDeclaration {
+            columns: vec!["status_code".to_owned()],
+            trace_id: true,
+        };
+        let src = StaticDeclaredColumns::empty().with_key_index(decl.clone());
+        assert_eq!(src.key_index(TenantHash([3u8; 16]), 7).await, decl);
     }
 }
