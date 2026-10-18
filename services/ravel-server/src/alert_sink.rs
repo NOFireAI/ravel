@@ -217,15 +217,10 @@ pub struct AlertNotification {
     /// one transition (pending then firing reports the firing time), which is
     /// all a single-step fold can know without replaying the whole history.
     pub started_at_ns: i64,
-    /// The Alertmanager `alertname`: the rule's own `alertname` label when it
-    /// has one, else the rule id. Decided from the rule rather than from
-    /// `record.labels`, where a series label of that name is indistinguishable
-    /// from a rule label.
-    pub alertname: String,
-    /// Whether `alertname` came from a rule label. When it did not, an
-    /// `alertname` in `record.labels` is a series label and is exported under
-    /// an `exported_` name rather than dropped (see [`alertmanager_payload`]).
-    pub alertname_from_rule: bool,
+    /// The Alertmanager label set, from [`alertmanager_label_set`]. Built when
+    /// the notification is, because it depends on the rule's labels, which
+    /// the notification does not keep.
+    pub alertmanager_labels: JsonMap<String, Json>,
 }
 
 impl AlertNotification {
@@ -242,20 +237,53 @@ impl AlertNotification {
             Some(p) if matches!(p.state, AlertState::Pending | AlertState::Firing) => p.ts_ns,
             _ => record.ts_ns,
         };
-        let rule_alertname = rule_labels
-            .iter()
-            .find(|(name, _)| name == "alertname")
-            .map(|(_, value)| value.clone());
-        let alertname_from_rule = rule_alertname.is_some();
-        let alertname = rule_alertname.unwrap_or_else(|| record.rule_id.clone());
+        let alertmanager_labels =
+            alertmanager_label_set(&record.labels, &record.rule_id, rule_labels);
         AlertNotification {
             record,
             previous_state,
             started_at_ns,
-            alertname,
-            alertname_from_rule,
+            alertmanager_labels,
         }
     }
+}
+
+/// An alert's Alertmanager label set: `labels` (the record's merged label
+/// set) plus `alertname`, which is the rule's own `alertname` label when
+/// `rule_labels` has one, else `rule_id`.
+///
+/// The `alertname` is decided from the rule rather than from `labels`, where a
+/// series label of that name is indistinguishable from a rule label. When the
+/// rule sets none, a series `alertname` moves to the first free name of
+/// `exported_alertname`, `exported_exported_alertname`, ..., Prometheus'
+/// conflict rule, rather than being dropped.
+pub fn alertmanager_label_set(
+    labels: &[(String, String)],
+    rule_id: &str,
+    rule_labels: &[(String, String)],
+) -> JsonMap<String, Json> {
+    let rule_alertname = rule_labels
+        .iter()
+        .find(|(name, _)| name == "alertname")
+        .map(|(_, value)| value.clone());
+    let mut set: JsonMap<String, Json> = labels
+        .iter()
+        .map(|(name, value)| (name.clone(), Json::String(value.clone())))
+        .collect();
+    if rule_alertname.is_none()
+        && let Some(series_alertname) = set.remove("alertname")
+    {
+        let mut exported = "exported_alertname".to_string();
+        while set.contains_key(&exported) {
+            exported.insert_str(0, "exported_");
+        }
+        set.insert(exported, series_alertname);
+    }
+    set.insert(
+        "alertname".to_string(),
+        Json::String(rule_alertname.unwrap_or_else(|| rule_id.to_string())),
+    );
+    set
 }
 
 /// Renders `pairs` as a JSON object. Alert labels and annotations are already
@@ -365,26 +393,11 @@ pub fn alertmanager_payload(notification: &AlertNotification) -> Option<Json> {
         return None;
     }
 
-    let mut labels = JsonMap::new();
-    for (k, v) in &record.labels {
-        labels.insert(k.clone(), Json::String(v.clone()));
-    }
-    if !notification.alertname_from_rule
-        && let Some(series_alertname) = labels.remove("alertname")
-    {
-        let mut exported = "exported_alertname".to_string();
-        while labels.contains_key(&exported) {
-            exported.insert_str(0, "exported_");
-        }
-        labels.insert(exported, series_alertname);
-    }
-    labels.insert(
-        "alertname".to_string(),
-        Json::String(notification.alertname.clone()),
-    );
-
     let mut alert = JsonMap::new();
-    alert.insert("labels".to_string(), Json::Object(labels));
+    alert.insert(
+        "labels".to_string(),
+        Json::Object(notification.alertmanager_labels.clone()),
+    );
     alert.insert(
         "annotations".to_string(),
         pairs_to_object(&record.annotations),
@@ -679,6 +692,48 @@ mod tests {
                 ("exported_exported_alertname", "x"),
                 ("severity", "page"),
             ])
+        );
+    }
+
+    /// The one label-set function both the Alertmanager payload and the
+    /// `/api/v1/alerts` route render through, on a label set whose first two
+    /// `exported_` names are taken.
+    #[test]
+    fn the_alertmanager_label_set_exports_a_series_alertname_past_taken_names() {
+        let labels = pairs(&[
+            ("alertname", "x"),
+            ("exported_alertname", "w"),
+            ("exported_exported_alertname", "v"),
+            ("severity", "page"),
+        ]);
+        assert_eq!(
+            Json::Object(alertmanager_label_set(
+                &labels,
+                "high-cpu",
+                &pairs(&[("severity", "page")])
+            )),
+            json_labels(&[
+                ("alertname", "high-cpu"),
+                ("exported_alertname", "w"),
+                ("exported_exported_alertname", "v"),
+                ("exported_exported_exported_alertname", "x"),
+                ("severity", "page"),
+            ]),
+            "a rule with no alertname: the rule id, with the series value moved"
+        );
+        assert_eq!(
+            Json::Object(alertmanager_label_set(
+                &labels,
+                "high-cpu",
+                &pairs(&[("alertname", "CpuHot")])
+            )),
+            json_labels(&[
+                ("alertname", "CpuHot"),
+                ("exported_alertname", "w"),
+                ("exported_exported_alertname", "v"),
+                ("severity", "page"),
+            ]),
+            "a rule's own alertname replaces the series value and exports nothing"
         );
     }
 

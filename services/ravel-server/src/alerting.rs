@@ -177,6 +177,22 @@ fn alert_publish_lifetime_ns() -> i64 {
 /// how long a genuinely dead holder blocks failover to roughly three intervals.
 const LEASE_TTL_TICKS: u32 = 3;
 
+/// How many evaluation intervals a tenant's published snapshot may age before
+/// [`PublishedAlerts::read`] reports it [`PublishedRead::Stale`] and the alert
+/// routes stop serving it.
+///
+/// A snapshot's age runs from its tick's clock reading, taken when the tick
+/// starts, and a healthy evaluator replaces it when the next tick ends. That
+/// tick starts after a jittered sleep of at most 1.1 intervals, so the oldest
+/// a healthy evaluator's snapshot gets is 1.1 intervals plus two ticks. A tick
+/// whose work before delivery fits in the delivery deadline ends half an
+/// interval after it starts, plus one delivery attempt: with the default 60
+/// second interval and 10 second sink timeout that is about 0.67 intervals,
+/// and the snapshot peaks near 2.4 intervals, under three. Three is also
+/// [`LEASE_TTL_TICKS`], the gap after which a standby may take the lease from
+/// a holder that stopped renewing it.
+pub const STALE_AFTER_INTERVALS: u32 = 3;
+
 /// Fraction of one evaluation interval that sink delivery may consume in a
 /// single tick, as `(numerator, denominator)`. Without it a pass against a slow
 /// or failing sink costs `notifications * sinks * sink_timeout`, which grows
@@ -356,12 +372,28 @@ impl AlertEvalTasks {
 /// Process-local and not durable. A process serves what its own evaluators
 /// published, never another process's; a restarted process reads
 /// [`PublishedRead::NotYetEvaluated`] until its first tick.
+///
+/// Publishing is the only write to a slot, so a tenant whose evaluator task
+/// panicked or wedged keeps its last snapshot. A read therefore checks the
+/// snapshot's age against [`STALE_AFTER_INTERVALS`] evaluation intervals, on
+/// the clock of the evaluator that published it.
 #[derive(Clone, Default)]
 pub struct PublishedAlerts {
     slots: Option<Arc<HashMap<TenantHash, PublishedSlot>>>,
+    /// The age past which a published snapshot reads as
+    /// [`PublishedRead::Stale`].
+    stale_after: Duration,
 }
 
-type PublishedSlot = parking_lot::RwLock<Option<Arc<TenantAlertSnapshot>>>;
+type PublishedSlot = parking_lot::RwLock<Option<PublishedEntry>>;
+
+/// A published snapshot and the clock of the evaluator that published it,
+/// which is the clock its age is read on.
+#[derive(Clone)]
+struct PublishedEntry {
+    snapshot: Arc<TenantAlertSnapshot>,
+    clock: Arc<dyn Clock>,
+}
 
 /// What a tenant's published slot held when a route read it.
 #[derive(Debug, Clone)]
@@ -376,12 +408,24 @@ pub enum PublishedRead {
     NotYetEvaluated,
     /// The snapshot the tenant's last tick published.
     Published(Arc<TenantAlertSnapshot>),
+    /// The tenant's last snapshot is older than [`STALE_AFTER_INTERVALS`]
+    /// evaluation intervals: its evaluator has stopped publishing.
+    Stale {
+        /// How long ago, on the publishing evaluator's clock, the snapshot's
+        /// tick ran.
+        age: Duration,
+        /// The age past which a snapshot is stale.
+        bound: Duration,
+    },
 }
 
 impl PublishedAlerts {
     /// The handle of a process that runs no evaluator.
     pub fn none() -> PublishedAlerts {
-        PublishedAlerts { slots: None }
+        PublishedAlerts {
+            slots: None,
+            stale_after: Duration::ZERO,
+        }
     }
 
     /// One empty slot per tenant [`spawn`] starts an evaluator for under
@@ -397,10 +441,14 @@ impl PublishedAlerts {
             .collect();
         PublishedAlerts {
             slots: Some(Arc::new(slots)),
+            stale_after: config.interval.saturating_mul(STALE_AFTER_INTERVALS),
         }
     }
 
-    /// The current state of `tenant`'s slot.
+    /// The current state of `tenant`'s slot. A snapshot whose age exceeds
+    /// [`STALE_AFTER_INTERVALS`] evaluation intervals reads as
+    /// [`PublishedRead::Stale`]; a reading behind the snapshot's own, from a
+    /// clock stepped backward, counts as age zero.
     pub fn read(&self, tenant: &TenantHash) -> PublishedRead {
         let Some(slots) = &self.slots else {
             return PublishedRead::NotEvaluating;
@@ -408,23 +456,38 @@ impl PublishedAlerts {
         let Some(slot) = slots.get(tenant) else {
             return PublishedRead::NoRules;
         };
-        let snapshot = slot.read().clone();
-        match snapshot {
-            Some(snapshot) => PublishedRead::Published(snapshot),
-            None => PublishedRead::NotYetEvaluated,
+        let entry = slot.read().clone();
+        let Some(entry) = entry else {
+            return PublishedRead::NotYetEvaluated;
+        };
+        let age_ns = entry
+            .clock
+            .now_ns()
+            .saturating_sub(entry.snapshot.evaluated_at_ns);
+        let age = Duration::from_nanos(u64::try_from(age_ns).unwrap_or(0));
+        if age > self.stale_after {
+            return PublishedRead::Stale {
+                age,
+                bound: self.stale_after,
+            };
         }
+        PublishedRead::Published(entry.snapshot)
     }
 
     fn slot(&self, tenant: &TenantHash) -> Option<&PublishedSlot> {
         self.slots.as_ref().and_then(|slots| slots.get(tenant))
     }
 
-    /// Replace `tenant`'s snapshot. A tenant with no slot is ignored.
-    fn publish(&self, tenant: &TenantHash, snapshot: TenantAlertSnapshot) {
+    /// Replace `tenant`'s snapshot, stamped on `clock`. A tenant with no slot
+    /// is ignored.
+    fn publish(&self, tenant: &TenantHash, snapshot: TenantAlertSnapshot, clock: Arc<dyn Clock>) {
         let Some(slot) = self.slot(tenant) else {
             return;
         };
-        let snapshot = Some(Arc::new(snapshot));
+        let snapshot = Some(PublishedEntry {
+            snapshot: Arc::new(snapshot),
+            clock,
+        });
         // The guard is a temporary of this statement, so the replaced snapshot
         // is dropped after the lock is released.
         let replaced = std::mem::replace(&mut *slot.write(), snapshot);
@@ -1195,6 +1258,7 @@ impl AlertEvaluator {
                 rule_health,
                 alerts,
             },
+            Arc::clone(&self.clock),
         );
     }
 
@@ -8361,6 +8425,66 @@ mod tick_tests {
         assert_eq!(alerts[0]["state"], "firing");
         assert_eq!(alerts[0]["activeAt"], NOW_RFC3339);
         assert_eq!(alerts[0]["value"], "1");
+    }
+
+    /// A snapshot is served while it is at most [`STALE_AFTER_INTERVALS`]
+    /// evaluation intervals old on the publishing evaluator's clock. Once it
+    /// is older, as when the evaluator task has panicked or wedged and nothing
+    /// publishes, `/api/v1/alerts` answers 503 naming the snapshot's age and
+    /// `/api/v1/rules` renders `unknown` health and state, until a new
+    /// publish.
+    #[tokio::test]
+    async fn a_snapshot_older_than_the_staleness_bound_is_refused_until_a_new_publish() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let view = tenant_published();
+        let mut ev = evaluator(store, Arc::clone(&clock)).with_published(view.clone());
+        let alerts_route = crate::alerts_api::ALERTS_ROUTE;
+        assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+
+        let bound = DEFAULT_ALERT_EVAL_INTERVAL * STALE_AFTER_INTERVALS;
+        clock.set(NOW_NS + bound.as_nanos() as i64);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(
+            status, 200,
+            "a snapshot exactly at the bound is served: {body}"
+        );
+        assert_eq!(body["data"]["alerts"][0]["state"], "firing");
+        assert_eq!(served_rule(&view).await["health"], "ok");
+
+        clock.advance(NS_PER_SEC);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "status": "error",
+                "errorType": "unavailable",
+                "error": format!(
+                    "{}: the last snapshot is 3m 1s old, over 3 evaluation intervals (3m)",
+                    crate::alerts_api::SNAPSHOT_STALE
+                ),
+            })
+        );
+        let rule = served_rule(&view).await;
+        assert_eq!(rule["health"], crate::alerts_api::HEALTH_UNKNOWN, "{rule}");
+        assert_eq!(rule["state"], crate::alerts_api::STATE_UNKNOWN, "{rule}");
+        assert!(rule.get("lastEvaluation").is_none(), "{rule}");
+        assert!(rule.get("alerts").is_none(), "{rule}");
+        assert!(matches!(
+            view.read(&tenant),
+            PublishedRead::Stale { age, bound: read_bound }
+                if age == bound + Duration::from_secs(1) && read_bound == bound
+        ));
+
+        assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["data"]["alerts"][0]["state"], "firing");
+        let rule = served_rule(&view).await;
+        assert_eq!(rule["health"], "ok", "{rule}");
+        assert_eq!(rule["lastEvaluation"], "1970-01-01T00:33:01.000000000Z");
     }
 
     /// A tick that read history but could not take the lease renders `err`
