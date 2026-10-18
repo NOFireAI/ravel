@@ -21,7 +21,9 @@
 //! - `start` and `end` are Unix float seconds, parsed as the SQL endpoint
 //!   parses its own, and bound which objects are listed.
 //! - `timeout` (seconds) can only lower the server deadline.
-//! - `min_commit_token` may repeat.
+//! - `min_commit_token` may repeat, each unqualified or qualified with the
+//!   one table the lookup reads, `spans:<token>`; any other qualifier is
+//!   400 before any store read.
 //!
 //! An unknown trace is 200 with zero rows.
 //!
@@ -38,8 +40,8 @@ use axum::extract::{Path, Request, State};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use ravel_query::RequestBudgets;
-use ravel_sql::SqlRequest;
-use ravel_types::{CommitToken, TimeRange};
+use ravel_sql::{MinCommitToken, SqlRequest};
+use ravel_types::TimeRange;
 
 use crate::service::{ApiError, QueryService, ServiceError};
 use crate::sql::SqlState;
@@ -60,7 +62,9 @@ pub struct TraceLookup {
     pub start_ns: Option<i64>,
     /// Window end in nanoseconds; `None` when the caller gave none.
     pub end_ns: Option<i64>,
-    pub min_tokens: Vec<CommitToken>,
+    /// Each unqualified, or qualified `spans:`, the one table the lookup
+    /// reads; the SQL statement path's admission refuses any other qualifier.
+    pub min_tokens: Vec<MinCommitToken>,
     pub deadline: Duration,
     /// Apply an explicit window as a row filter on `start_ts` as well as the
     /// listing bound. Ignored when the lookup names no window.

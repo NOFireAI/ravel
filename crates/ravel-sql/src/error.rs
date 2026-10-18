@@ -164,16 +164,60 @@ pub enum SqlError {
     )]
     CrossSignalQuery,
 
-    /// A `min_commit_token` on a statement that names two or more signal
-    /// tables. A token does not yet say which table it applies to (ADR-2904
-    /// decision 3), so this is refused from the request alone, before any
-    /// catalog resolve. The text names no server state; HTTP 400.
+    /// An unqualified `min_commit_token` on a statement that names two or
+    /// more signal tables: the token does not say which table it bounds
+    /// (ADR-2904 decision 3). Refused from the request alone, before any
+    /// catalog resolve. `tables` lists the statement's signal tables in lane
+    /// order; the text names no server state; HTTP 400.
     #[error(
-        "min_commit_token on a statement that names more than one of the samples, \
-         logs, spans, alerts and audit tables is not supported yet; send the \
-         statement without min_commit_token, or one statement per table"
+        "an unqualified min_commit_token is ambiguous on a statement that reads \
+         more than one of the samples, logs, spans, alerts and audit tables; \
+         qualify min_commit_token with one of {tables}, as <table>:<token>"
     )]
-    CommitTokenAcrossSignals,
+    CommitTokenNeedsQualifier {
+        /// The statement's signal table names, comma-separated.
+        tables: String,
+    },
+
+    /// A `min_commit_token` qualified with a name that is not one of the
+    /// signal tables the statement reads: another signal table, a Parquet
+    /// table, or no table at all. The match is exact against the lower-case
+    /// table names. Refused before any catalog resolve. `qualifier` is the
+    /// caller's own text, cut to 64 bytes; HTTP 400.
+    #[error(
+        "min_commit_token qualifier {qualifier:?} is not a signal table this \
+         statement reads ({tables}); a qualifier must equal one of those \
+         lower-case table names exactly"
+    )]
+    CommitTokenQualifierNotRead {
+        /// The caller's qualifier, truncated to 64 bytes on a char boundary.
+        qualifier: String,
+        /// The statement's signal table names, comma-separated, or `none`.
+        tables: String,
+    },
+
+    /// A `min_commit_token` on a statement that names no signal table but
+    /// does name another table (a Parquet table, or a name that turns out to
+    /// be no table). A token bounds a signal table's catalog snapshot, and a
+    /// Parquet table has none, so the token could not be honoured. Refused
+    /// from the statement text, before the lake is read. The text names no
+    /// server state; HTTP 400.
+    #[error(
+        "min_commit_token applies to the samples, logs, spans, alerts and audit \
+         tables, and this statement reads none of them (a Parquet table has no \
+         commit tokens); send it without min_commit_token"
+    )]
+    CommitTokenOnParquetStatement,
+
+    /// A table-qualified `min_commit_token` reached a path that carries plain
+    /// tokens only: a Flight SQL ticket, or a statement surface other than
+    /// the HTTP SQL statement path. Refused before any catalog resolve. The
+    /// text names no server state; HTTP 400.
+    #[error(
+        "a table-qualified min_commit_token is accepted only on the HTTP SQL \
+         statement endpoint; send the token without its table qualifier"
+    )]
+    QualifiedCommitTokenUnsupported,
 
     /// A statement that names a signal table beside a live Parquet table of
     /// the caller's tenant (ADR-2904 decision 11 allows it; not implemented
@@ -527,7 +571,10 @@ impl SqlError {
             SqlError::PlanNotAdmitted(_) => ErrorClass::Internal,
             SqlError::Validation(_)
             | SqlError::CrossSignalQuery
-            | SqlError::CommitTokenAcrossSignals
+            | SqlError::CommitTokenNeedsQualifier { .. }
+            | SqlError::CommitTokenQualifierNotRead { .. }
+            | SqlError::CommitTokenOnParquetStatement
+            | SqlError::QualifiedCommitTokenUnsupported
             | SqlError::SignalBesideParquet
             | SqlError::TooManyTables { .. } => ErrorClass::BadRequest,
             // An over-wide window refused before any LIST is a
@@ -601,8 +648,13 @@ impl SqlError {
             SqlError::Validation(e) => e.to_string(),
             // Safe to echo: the text names only the fixed table names.
             SqlError::CrossSignalQuery
-            | SqlError::CommitTokenAcrossSignals
+            | SqlError::CommitTokenNeedsQualifier { .. }
+            | SqlError::CommitTokenOnParquetStatement
+            | SqlError::QualifiedCommitTokenUnsupported
             | SqlError::SignalBesideParquet => self.to_string(),
+            // Safe to echo: the fixed table names, plus the caller's own
+            // qualifier cut to 64 bytes.
+            SqlError::CommitTokenQualifierNotRead { .. } => self.to_string(),
             // Safe to echo: the text carries only the two counts.
             SqlError::TooManyTables { .. } => self.to_string(),
             // Safe to echo: `WindowTooWide` carries only the estimate and the
@@ -1945,19 +1997,62 @@ mod tests {
     }
 
     #[test]
-    fn the_interim_cross_signal_refusals_are_bad_requests_that_keep_their_text() {
-        for (err, names) in [
-            (SqlError::CommitTokenAcrossSignals, "min_commit_token"),
-            (SqlError::SignalBesideParquet, "Parquet"),
-        ] {
-            assert_eq!(err.class(), ErrorClass::BadRequest, "{err}");
-            assert_eq!(err.client_message(), err.to_string());
-            // The text says what is missing, so a client can tell an interim
-            // limit from a malformed statement.
-            assert!(err.client_message().contains("not supported yet"), "{err}");
-            assert!(err.client_message().contains(names), "{err}");
-            assert_redacted(&err.client_message());
-        }
+    fn the_interim_cross_signal_refusal_is_a_bad_request_that_keeps_its_text() {
+        let err = SqlError::SignalBesideParquet;
+        assert_eq!(err.class(), ErrorClass::BadRequest, "{err}");
+        assert_eq!(err.client_message(), err.to_string());
+        // The text says what is missing, so a client can tell an interim
+        // limit from a malformed statement.
+        assert!(err.client_message().contains("not supported yet"), "{err}");
+        assert!(err.client_message().contains("Parquet"), "{err}");
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn an_unqualified_token_on_two_tables_is_a_bad_request_naming_them() {
+        let err = SqlError::CommitTokenNeedsQualifier {
+            tables: "samples, logs".to_owned(),
+        };
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(
+            err.client_message()
+                .contains("qualify min_commit_token with one of samples, logs"),
+            "{err}"
+        );
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn a_qualifier_the_statement_does_not_read_is_a_bad_request_naming_it() {
+        let err = SqlError::CommitTokenQualifierNotRead {
+            qualifier: "log".to_owned(),
+            tables: "samples, logs".to_owned(),
+        };
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(err.client_message().contains("qualifier \"log\""), "{err}");
+        assert!(err.client_message().contains("(samples, logs)"), "{err}");
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn a_token_on_a_parquet_only_statement_is_a_bad_request() {
+        let err = SqlError::CommitTokenOnParquetStatement;
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(err.client_message().contains("min_commit_token"), "{err}");
+        assert!(err.client_message().contains("reads none of them"), "{err}");
+        assert_redacted(&err.client_message());
+    }
+
+    #[test]
+    fn a_qualified_token_off_the_http_path_is_a_bad_request() {
+        let err = SqlError::QualifiedCommitTokenUnsupported;
+        assert_eq!(err.class(), ErrorClass::BadRequest);
+        assert_eq!(err.client_message(), err.to_string());
+        assert!(err.client_message().contains("table-qualified"), "{err}");
+        assert_redacted(&err.client_message());
     }
 
     #[test]

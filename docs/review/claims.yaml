@@ -243,27 +243,46 @@
 
 - id: query-engine-cross-signal-interim-refusals
   doc: docs/query-engine.md
-  quote: "saying they are not supported yet"
+  quote: "saying it is not supported yet"
   kind: negative
   binds:
-    - crates/ravel-sql/src/cross_signal_tests.rs::a_token_on_a_two_signal_statement_is_refused_before_listing
     - crates/ravel-sql/tests/parquet_tables.rs::a_signal_table_beside_parquet_is_refused_before_listing
   status: verified
-  note: "SqlError::CommitTokenAcrossSignals and SqlError::SignalBesideParquet are the two refusals; enum variants are not definitions under the BIND resolver, so the entry binds the tests that pin each refusal before any signal catalog listing. Tickets T4 (#2911) and T7 (#2914) lift them."
+  note: "SqlError::SignalBesideParquet is the one interim refusal left; enum variants are not definitions under the BIND resolver, so the entry binds the test that pins it before any signal catalog listing. Ticket T7 (#2914) lifts it. The min_commit_token refusal it shared the entry with was replaced by the table-qualified token (#2911)."
 
 - id: guide-query-token-across-signals-refused
   doc: docs/guides/query.md
-  quote: "that names two or more of the five is not supported yet and gets an HTTP 400"
-  kind: negative
+  quote: "an unqualified one is an HTTP 400 before any catalog listing"
+  kind: positive
   binds:
-    - services/ravel-server/tests/sql_endpoint.rs::a_min_commit_token_on_a_two_signal_statement_is_a_bad_request
-    - crates/ravel-sql/src/cross_signal_tests.rs::a_token_on_a_two_signal_statement_is_refused_before_listing
+    - services/ravel-server/tests/sql_endpoint.rs::qualified_min_commit_token_over_http
+    - crates/ravel-sql/src/cross_signal_tests.rs::unqualified_token_on_two_signals_is_refused_before_any_listing
   status: verified
-  note: "The HTTP test pins the 400 and its message; the crate test pins that every HTTP entry point refuses before any catalog request. Ticket T4 (#2911) adds the table-qualified token."
+  note: "The HTTP test pins the 400 naming both tables; the crate test pins that every HTTP entry point refuses with SqlError::CommitTokenNeedsQualifier before any catalog request (#2911)."
+
+- id: guide-query-token-qualified-by-table
+  doc: docs/guides/query.md
+  quote: "Each token then bounds only its own table's snapshot."
+  kind: positive
+  binds:
+    - services/ravel-server/tests/sql_endpoint.rs::qualified_min_commit_token_over_http
+    - crates/ravel-sql/src/cross_signal_tests.rs::qualified_token_bounds_only_its_signal
+    - crates/ravel-sql/src/executor.rs::admit_http_tokens
+  status: verified
+  note: "The HTTP test joins samples and logs with one qualified token each and gets the exact rows, and the crossed pair is the fixed 503; the crate test shows a logs-qualified token never reaches the samples resolve (#2911)."
+
+- id: guide-query-token-on-parquet-refused
+  doc: docs/guides/query.md
+  quote: "so any `min_commit_token` on it, unqualified or qualified with the Parquet table's name, is an HTTP 400."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_commit_token_on_a_parquet_only_statement_is_refused
+  status: verified
+  note: "The test pins SqlError::CommitTokenOnParquetStatement before either store is read, and that the statement runs without the token (#2911)."
 
 - id: guide-query-signal-beside-parquet-refused
   doc: docs/guides/query.md
-  quote: "five beside a Parquet table is not supported yet either"
+  quote: "five beside a Parquet table is not supported yet:"
   kind: negative
   binds:
     - crates/ravel-sql/tests/parquet_tables.rs::a_signal_table_beside_parquet_is_refused_before_listing

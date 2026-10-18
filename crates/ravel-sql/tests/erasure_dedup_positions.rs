@@ -194,7 +194,11 @@ async fn sql_rows(
                     start_ns: 0,
                     end_ns: NOW,
                 },
-                min_tokens: tokens.to_vec(),
+                min_tokens: tokens
+                    .iter()
+                    .cloned()
+                    .map(ravel_sql::MinCommitToken::from)
+                    .collect(),
                 now_ns: NOW,
                 deadline: Duration::from_secs(30),
                 row_window: false,

@@ -3910,16 +3910,33 @@ ORDER BY samples.ts
   enforces a caller's lowered byte and store-request budgets at scan time
   (ADR-2904 decision 6); a statement inherits that gap for every
   other signal table it names.
-- **Interim refusals.** Two shapes are refused with HTTP 400 and a message
-  saying they are not supported yet, both before any signal catalog listing:
-  a `min_commit_token` on a statement naming two or more signal tables
-  (`SqlError::CommitTokenAcrossSignals`; the table-qualified token form of
-  ADR-2904 decision 3 is not built), and a signal table beside a Parquet
-  table (`SqlError::SignalBesideParquet`). The Parquet refusal comes after the
-  Parquet manifest reads that tell a live table from an unknown or dropped
-  name: one manifest LIST per other table name, in name order, up to and
-  including the first live table, and a GET for each of those names that has
-  a manifest version.
+- **`min_commit_token` is qualified by table (ADR-2904 decision 3).** On the
+  HTTP statement path a token is `<token>` or `<table>:<token>`, split once
+  at the first colon (`ravel_sql::MinCommitToken`). `admit_http_tokens` assigns
+  each token to one signal lane from the statement text alone, before any
+  catalog or object-store request, and every resolve attempt of the statement,
+  the snapshot retry included, reuses that assignment: each lane's resolve
+  waits for its own tokens and no other lane's. An unqualified token applies
+  to a statement's one signal table; on a statement naming two or more it is
+  `SqlError::CommitTokenNeedsQualifier`, naming the tables in lane order. A
+  qualifier that is not exactly the lower-case name of a signal table the
+  statement reads (a Parquet table's name included) is
+  `SqlError::CommitTokenQualifierNotRead`, which quotes it cut to 64 bytes on
+  a char boundary. Any token on a statement naming no signal table but some
+  other table is `SqlError::CommitTokenOnParquetStatement`. All three are
+  HTTP 400. An unsatisfiable token stays the fixed 503 that names no table.
+  Flight SQL carries only unqualified tokens, and `POST /api/v1/esql` takes no
+  `min_commit_token`; a qualified token that reaches a Flight ticket or a
+  pinned Flight resolve is `SqlError::QualifiedCommitTokenUnsupported`.
+- **Interim refusal.** A signal table beside a Parquet table is refused with
+  HTTP 400 and a message saying it is not supported yet, before any signal
+  catalog listing (`SqlError::SignalBesideParquet`). A token qualified with
+  the Parquet table's name on such a statement is refused first, by token
+  admission, as `SqlError::CommitTokenQualifierNotRead`. The Parquet refusal
+  comes after the Parquet manifest reads that tell a live table from an
+  unknown or dropped name: one manifest LIST per other table name, in name
+  order, up to and including the first live table, and a GET for each of
+  those names that has a manifest version.
 - **Surfaces that keep the one-table rule.** Flight SQL refuses a statement
   naming two or more signal tables with `SqlError::CrossSignalQuery` before any
   catalog listing, until its ticket can carry one segment group per signal

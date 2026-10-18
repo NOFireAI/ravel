@@ -430,6 +430,50 @@ token, the query fails with `503 unavailable`. It does not return a snapshot
 older than the one you asked for. See
 [docs/guides/ingest.md](ingest.md#commit-tokens-and-read-your-write).
 
+### Qualifying a token by table (SQL)
+
+On `POST /api/v1/sql` a token may carry the table it bounds as a prefix:
+`<table>:<token>`, for example `logs:<token>`. The value is split once, at
+its first colon; a token itself contains no colon. Each token then bounds only
+its own table's snapshot.
+
+- On a statement that reads one of `samples`, `logs`, `spans`, `alerts` and
+  `audit`, a token may be unqualified or qualified with that table's name.
+- On a statement that reads two or more of them, every token must be
+  qualified. An unqualified token is an HTTP 400 that names the tables in the
+  order `samples`, `logs`, `spans`, `alerts`, `audit`:
+  `qualify min_commit_token with one of samples, logs, as <table>:<token>`.
+- The qualifier must equal one of the statement's signal table names exactly,
+  in lower case. `Logs:`, `log:`, or a table the statement does not read is an
+  HTTP 400 that quotes the qualifier (cut to 64 bytes) and lists the tables
+  the statement reads.
+- A statement that reads only Parquet tables takes no token: a Parquet table
+  has no commit tokens, so any `min_commit_token` on it, unqualified or
+  qualified with the Parquet table's name, is an HTTP 400.
+- An empty qualifier (`:<token>`) or a part after the colon that is not a
+  token is an HTTP 400, `invalid min_commit_token`.
+
+All of these are refused before any catalog or object-store request. A
+qualified token whose commit the table cannot see is the same `503
+unavailable` as an unqualified one.
+
+A join of `samples` and `logs` that must see one metrics write and one logs
+write passes each write's token, qualified:
+
+```json
+{
+  "query": "SELECT samples.ts, samples.value, logs.body FROM samples JOIN logs ON samples.ts = logs.ts ORDER BY samples.ts",
+  "min_commit_token": [
+    "samples:<token from the metrics write>",
+    "logs:<token from the logs write>"
+  ]
+}
+```
+
+Flight SQL takes only unqualified tokens, and `POST /api/v1/esql` takes no
+`min_commit_token`. A trace lookup (`GET /api/traces/{trace_id}`) reads only
+`spans`, so its token is unqualified or `spans:<token>`.
+
 ## Query budgets
 
 Every query is bounded. A query that exceeds a bound gets a typed error, never
@@ -620,14 +664,16 @@ ORDER BY samples.ts
 Such a query reads one snapshot per signal, with no ordering between them: it
 may see a span whose log lines are not visible yet, or the reverse. The join
 runs on the server that received the query. `min_commit_token` on a query
-that names two or more of the five is not supported yet and gets an HTTP 400
-before any catalog listing. Flight SQL and ES|QL still read one of the five
-per query. The request body, auth, window (`start`/`end`), and
+that names two or more of the five must be qualified with the table it bounds,
+`samples:<token>` or `logs:<token>`, and each token waits only for its own
+table; an unqualified one is an HTTP 400 before any catalog listing (see
+[Qualifying a token by table](#qualifying-a-token-by-table-sql)). Flight SQL and
+ES|QL still read one of the five per query. The request body, auth, window (`start`/`end`), and
 `min_commit_token` handling are otherwise the same for all five tables.
 
 The same endpoint also serves the Parquet tables of the tenant. A query can
 join Parquet tables with each other but not with any of the five. One of the
-five beside a Parquet table is not supported yet either: an HTTP 400 that
+five beside a Parquet table is not supported yet: an HTTP 400 that
 Ravel returns after the Parquet manifest reads that find a name is a live
 Parquet table, and before any signal catalog listing.
 

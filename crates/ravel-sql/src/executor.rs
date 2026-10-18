@@ -7,7 +7,7 @@
 //!    builds no plan.
 //! 2. Resolve one snapshot per signal table the statement names, each once per
 //!    attempt, through `catalog.resolve_pruned(&tenant_hash, signal, window,
-//!    min_tokens, now_ns, name_filter)`, every lane at the same `now_ns` and
+//!    lane_tokens, now_ns, name_filter)`, every lane at the same `now_ns` and
 //!    window, with `now_ns` threaded in from the caller's injected clock (no
 //!    `SystemTime::now()` in library logic). The signals are read off the
 //!    query's own `FROM` clause ([`SqlExecutor::statement_tables`], ADR-0033,
@@ -18,9 +18,12 @@
 //!    for a statement naming none. The HTTP statement path
 //!    ([`SqlExecutor::execute_accounted`], [`SqlExecutor::explain_accounted`])
 //!    runs a statement naming several of the five tables, one lane each
-//!    (ADR-2904 decision 1), and refuses one that also carries a
-//!    `min_commit_token` with [`SqlError::CommitTokenAcrossSignals`] before
-//!    any catalog request. The Flight SQL entry points and ES|QL keep the
+//!    (ADR-2904 decision 1). Its `min_commit_token`s are admitted before any
+//!    catalog request ([`admit_http_tokens`], ADR-2904 decision 3): each one
+//!    is assigned to exactly one lane, by its table qualifier or, on a
+//!    statement naming at most one signal table, unqualified, and
+//!    `lane_tokens` is that lane's share alone. The Flight SQL entry points
+//!    and ES|QL keep the
 //!    one-table rule and refuse it with [`SqlError::CrossSignalQuery`] before
 //!    any catalog request. `name_filter` is the equality
 //!    `__name__` value derived from the `samples` scans' pushed-down
@@ -49,7 +52,8 @@
 //!
 //! - A store `NotFound` raised **before the first batch has been emitted**
 //!   re-resolves every signal the statement names with the *same* `now_ns`
-//!   and the *same* `min_tokens`, rebuilds the whole session (new pool, new
+//!   and the *same* per-lane tokens, assigned once at admission and not
+//!   re-derived, rebuilds the whole session (new pool, new
 //!   providers, new context), and
 //!   re-executes the query exactly once. A second `NotFound` fails
 //!   [`SqlError::SnapshotInvalidated`].
@@ -139,6 +143,7 @@ use crate::error::SqlError;
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
+use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
 use crate::parquet::{
     self, MAX_STATEMENT_TABLE_NAMES, ParquetPin, ParquetQueryError, ParquetResolution,
@@ -266,16 +271,135 @@ pub(crate) fn refuse_cross_signal(tables: &StatementTables) -> Result<(), SqlErr
     Ok(())
 }
 
-/// The HTTP SQL statement path's table rule (ADR-2904 decision 1): any number
-/// of signal tables, but a `min_commit_token` only on a statement naming at
-/// most one, because a token cannot yet name the table it applies to.
-/// [`SqlExecutor::execute_accounted`] and [`SqlExecutor::explain_accounted`]
-/// call this before any catalog request.
-fn admit_http_tables(tables: &StatementTables, min_tokens: &[CommitToken]) -> Result<(), SqlError> {
-    if tables.signals.len() > 1 && !min_tokens.is_empty() {
-        return Err(SqlError::CommitTokenAcrossSignals);
+/// The `min_commit_token`s each lane's catalog resolve waits for. Assigned
+/// once per statement, before any catalog request, and reused by every
+/// resolve attempt of that statement.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaneTokens {
+    lanes: Vec<(TargetSignal, Vec<CommitToken>)>,
+}
+
+impl LaneTokens {
+    /// Every token on one lane: the surfaces that keep the one-table rule and
+    /// carry plain tokens (Flight SQL, ES|QL).
+    pub(crate) fn one_lane(lane: TargetSignal, tokens: Vec<CommitToken>) -> Self {
+        let mut out = LaneTokens::default();
+        for token in tokens {
+            out.push(lane, token);
+        }
+        out
     }
-    Ok(())
+
+    fn push(&mut self, lane: TargetSignal, token: CommitToken) {
+        match self.lanes.iter_mut().find(|(signal, _)| *signal == lane) {
+            Some((_, tokens)) => tokens.push(token),
+            None => self.lanes.push((lane, vec![token])),
+        }
+    }
+
+    /// The tokens `lane`'s resolve waits for: its own and no other lane's.
+    pub(crate) fn for_lane(&self, lane: TargetSignal) -> &[CommitToken] {
+        self.lanes
+            .iter()
+            .find(|(signal, _)| *signal == lane)
+            .map_or(&[], |(_, tokens)| tokens.as_slice())
+    }
+}
+
+/// The longest qualifier, in bytes, a refusal quotes back.
+const MAX_QUOTED_QUALIFIER_BYTES: usize = 64;
+
+/// The HTTP SQL statement path's token rule (ADR-2904 decision 3), applied
+/// from the statement text and the request alone, before any catalog request:
+///
+/// - a token qualified `<table>:` bounds that table's lane, and the qualifier
+///   must equal, exactly, the lower-case name of a signal table the statement
+///   reads ([`SqlError::CommitTokenQualifierNotRead`] otherwise);
+/// - an unqualified token bounds the statement's one signal table, or the
+///   `samples` lane of a statement naming no table; on a statement naming two
+///   or more it is [`SqlError::CommitTokenNeedsQualifier`];
+/// - a statement naming no signal table but some other table (Parquet, or
+///   unknown) takes no token at all ([`SqlError::CommitTokenOnParquetStatement`]).
+///
+/// [`SqlExecutor::execute_accounted`] and [`SqlExecutor::explain_accounted`]
+/// call this; its result is each lane's share for every resolve attempt.
+pub(crate) fn admit_http_tokens(
+    tables: &StatementTables,
+    min_tokens: &[MinCommitToken],
+) -> Result<LaneTokens, SqlError> {
+    let mut lanes = LaneTokens::default();
+    if min_tokens.is_empty() {
+        return Ok(lanes);
+    }
+    if tables.signals.is_empty() && !tables.others.is_empty() {
+        return Err(SqlError::CommitTokenOnParquetStatement);
+    }
+    let names: Vec<&'static str> = tables
+        .signals
+        .iter()
+        .filter_map(|signal| crate::statement::signal_table_name(*signal))
+        .collect();
+    for min_token in min_tokens {
+        let lane = match min_token.table.as_deref() {
+            Some(qualifier) => {
+                let named =
+                    tables.signals.iter().copied().find(|signal| {
+                        crate::statement::signal_table_name(*signal) == Some(qualifier)
+                    });
+                match named {
+                    Some(signal) => signal,
+                    None => {
+                        return Err(SqlError::CommitTokenQualifierNotRead {
+                            qualifier: quoted_qualifier(qualifier),
+                            tables: if names.is_empty() {
+                                "none".to_owned()
+                            } else {
+                                names.join(", ")
+                            },
+                        });
+                    }
+                }
+            }
+            None => match tables.signals.as_slice() {
+                [] => TargetSignal::Metrics,
+                [only] => *only,
+                _ => {
+                    return Err(SqlError::CommitTokenNeedsQualifier {
+                        tables: names.join(", "),
+                    });
+                }
+            },
+        };
+        lanes.push(lane, min_token.token.clone());
+    }
+    Ok(lanes)
+}
+
+/// `qualifier` cut to [`MAX_QUOTED_QUALIFIER_BYTES`] on a char boundary, with
+/// `...` marking a cut.
+fn quoted_qualifier(qualifier: &str) -> String {
+    if qualifier.len() <= MAX_QUOTED_QUALIFIER_BYTES {
+        return qualifier.to_owned();
+    }
+    let mut end = MAX_QUOTED_QUALIFIER_BYTES;
+    while !qualifier.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &qualifier[..end])
+}
+
+/// Plain tokens for a path that cannot carry a table qualifier: refuse a
+/// qualified one with [`SqlError::QualifiedCommitTokenUnsupported`].
+pub(crate) fn unqualified_tokens(
+    min_tokens: &[MinCommitToken],
+) -> Result<Vec<CommitToken>, SqlError> {
+    min_tokens
+        .iter()
+        .map(|min_token| match min_token.table {
+            None => Ok(min_token.token.clone()),
+            Some(_) => Err(SqlError::QualifiedCommitTokenUnsupported),
+        })
+        .collect()
 }
 
 /// Refuse a statement that names a table function or a URL-shaped table, with
@@ -443,8 +567,13 @@ pub struct SqlRequest {
     /// it from request parameters; the provider re-applies every predicate
     /// above the scan, so this only bounds which segments are listed.
     pub window: TimeRange,
-    /// Read-your-write tokens (docs/catalog-and-mvcc.md step 4).
-    pub min_tokens: Vec<CommitToken>,
+    /// Read-your-write tokens (docs/catalog-and-mvcc.md step 4), each
+    /// optionally qualified by the table it bounds. Only the HTTP statement
+    /// entry points ([`SqlExecutor::execute_accounted`],
+    /// [`SqlExecutor::explain_accounted`]) accept a qualified token; the
+    /// pinned (Flight SQL) surface refuses one with
+    /// [`SqlError::QualifiedCommitTokenUnsupported`].
+    pub min_tokens: Vec<MinCommitToken>,
     /// The injected clock reading that bounds the listing window. The same
     /// value is reused on the retry so both resolves see the same window.
     pub now_ns: i64,
@@ -1607,12 +1736,12 @@ impl SqlExecutor {
     ) -> Result<SqlOutcome, SqlError> {
         // Step 1: the security gate runs before any catalog or plan work.
         validate_query(&req.sql)?;
-        admit_http_tables(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
+        let tokens = admit_http_tokens(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
             req.deadline,
-            self.run(tenant_hash, Statement::Sql(&req.sql), req, live),
+            self.run(tenant_hash, Statement::Sql(&req.sql), req, &tokens, live),
         )
         .await
         .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
@@ -1647,11 +1776,19 @@ impl SqlExecutor {
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
         let statement = Statement::Lowered(statement);
-        refuse_cross_signal(&statement.tables()?)?;
+        let tables = statement.tables()?;
+        refuse_cross_signal(&tables)?;
+        // At most one signal table: every plain token bounds it.
+        let tokens = LaneTokens::one_lane(tables.first_lane(), req.min_tokens.clone());
         let sql_req = SqlRequest {
             sql: String::new(),
             window: req.window,
-            min_tokens: req.min_tokens.clone(),
+            min_tokens: req
+                .min_tokens
+                .iter()
+                .cloned()
+                .map(MinCommitToken::from)
+                .collect(),
             now_ns: req.now_ns,
             deadline: req.deadline,
             row_window: req.row_window,
@@ -1661,7 +1798,7 @@ impl SqlExecutor {
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
             req.deadline,
-            self.run(tenant_hash, statement, &sql_req, live),
+            self.run(tenant_hash, statement, &sql_req, &tokens, live),
         )
         .await
         .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
@@ -1715,12 +1852,12 @@ impl SqlExecutor {
         // statement costs no catalog LIST here either, and it runs outside the
         // timeout because a rejection is not a thing that can time out.
         validate_query(&req.sql)?;
-        admit_http_tables(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
+        let tokens = admit_http_tokens(&Statement::Sql(&req.sql).tables()?, &req.min_tokens)?;
 
         let millis = u64::try_from(req.deadline.as_millis()).unwrap_or(u64::MAX);
         tokio::time::timeout(
             req.deadline,
-            self.explain_inner(tenant_hash, req, accounting),
+            self.explain_inner(tenant_hash, req, &tokens, accounting),
         )
         .await
         .unwrap_or(Err(SqlError::DeadlineExceeded { millis }))
@@ -1734,6 +1871,7 @@ impl SqlExecutor {
         &self,
         tenant_hash: TenantHash,
         req: &SqlRequest,
+        tokens: &LaneTokens,
         accounting: &QueryAccounting,
     ) -> Result<ExplainReport, SqlError> {
         // `explain` keeps the pre-#1367 pooled `&QueryAccounting` signature
@@ -1751,7 +1889,7 @@ impl SqlExecutor {
         // for free here without ever reaching the segment-fetch loop in
         // scan.rs (which it never runs: explain fetches no segment).
         let resolved = self
-            .resolve_admitted(tenant_hash, statement, req, &phase_accounting)
+            .resolve_admitted(tenant_hash, statement, req, tokens, &phase_accounting)
             .await?;
         let segments_resolved = resolved.segments_resolved();
         let admission = resolved.admission();
@@ -1804,12 +1942,15 @@ impl SqlExecutor {
 
     /// The resolve/plan/execute loop, minus validation and the deadline.
     ///
-    /// `statement` is what runs; `req.sql` is not read here or below.
+    /// `statement` is what runs; `req.sql` is not read here or below, and
+    /// neither is `req.min_tokens`: `tokens` is each lane's share, assigned
+    /// once by the caller, and every attempt resolves with that same share.
     async fn run(
         &self,
         tenant_hash: TenantHash,
         statement: Statement<'_>,
         req: &SqlRequest,
+        tokens: &LaneTokens,
         live: &LiveAccounting,
     ) -> Result<SqlOutcome, SqlError> {
         let mut stats = SqlStats::default();
@@ -1844,7 +1985,7 @@ impl SqlExecutor {
             // a fresh snapshot of one table with a stale one of another.
             let resolve_started = Instant::now();
             let resolved = self
-                .resolve(tenant_hash, statement, req, &phase_accounting)
+                .resolve(tenant_hash, statement, req, tokens, &phase_accounting)
                 .await?;
             let resolve_ns = elapsed_ns(resolve_started);
             stats.resolves += 1;
@@ -1996,12 +2137,18 @@ impl SqlExecutor {
         //
         // A Flight ticket pins one snapshot, so this path keeps the one-table
         // rule (ADR-2904 decision 10 lifts it with a new ticket layout).
-        refuse_cross_signal(&Statement::Sql(&req.sql).tables()?)?;
+        let tables = Statement::Sql(&req.sql).tables()?;
+        refuse_cross_signal(&tables)?;
+        // A ticket's tokens are plain (no table qualifier), and the one table
+        // it reads is the one they bound.
+        let tokens =
+            LaneTokens::one_lane(tables.first_lane(), unqualified_tokens(&req.min_tokens)?);
         let resolved = self
             .resolve(
                 tenant_hash,
                 Statement::Sql(&req.sql),
                 req,
+                &tokens,
                 &PhaseAccounting::pooled_over(accounting),
             )
             .await?;
@@ -2778,9 +2925,10 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         statement: Statement<'_>,
         req: &SqlRequest,
+        tokens: &LaneTokens,
         phase_accounting: &PhaseAccounting,
     ) -> Result<Resolved, SqlError> {
-        self.resolve_admitted(tenant_hash, statement, req, phase_accounting)
+        self.resolve_admitted(tenant_hash, statement, req, tokens, phase_accounting)
             .await
     }
 
@@ -2808,6 +2956,7 @@ impl SqlExecutor {
         tenant_hash: TenantHash,
         statement: Statement<'_>,
         req: &SqlRequest,
+        tokens: &LaneTokens,
         phase_accounting: &PhaseAccounting,
     ) -> Result<Resolved, SqlError> {
         // Idle-tenant eviction last-touch (ADR-0069 decision 2): stamp this
@@ -2934,7 +3083,7 @@ impl SqlExecutor {
                     &tenant_hash,
                     signal,
                     req.window,
-                    &req.min_tokens,
+                    tokens.for_lane(lane),
                     req.now_ns,
                     lane_name_filter,
                     phase_accounting.resolve(),
@@ -3731,7 +3880,7 @@ impl SqlExecutor {
     /// [`SqlError::TooManyTables`], so the Parquet resolve's one LIST per
     /// name is bounded before it starts. Two signal tables are not refused
     /// here: each entry point applies its own rule ([`refuse_cross_signal`]
-    /// on Flight SQL and ES|QL, [`admit_http_tables`] on HTTP).
+    /// on Flight SQL and ES|QL, [`admit_http_tokens`] on HTTP).
     pub(crate) fn statement_tables(sql: &str) -> Result<StatementTables, SqlError> {
         let mut tables = referenced_base_tables(sql)?;
         let signals: Vec<TargetSignal> = SIGNAL_LANE_ORDER
@@ -4481,7 +4630,7 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 /// What to do after a failed attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RetryDecision {
-    /// Re-resolve with the same `now_ns` and `min_tokens` and re-execute.
+    /// Re-resolve with the same `now_ns` and per-lane tokens and re-execute.
     RetryOnce,
     /// Fail with [`SqlError::SnapshotInvalidated`].
     FailInvalidated,
@@ -8402,6 +8551,18 @@ pub(crate) mod tests {
         new_record: NewCommitRecord,
         bytes: bytes::Bytes,
     ) -> String {
+        put_and_publish_with_token(memory, new_record, bytes)
+            .await
+            .0
+    }
+
+    /// [`put_and_publish`], also returning the published record's commit
+    /// token.
+    async fn put_and_publish_with_token(
+        memory: &MemoryStore,
+        new_record: NewCommitRecord,
+        bytes: bytes::Bytes,
+    ) -> (String, CommitToken) {
         let rec = record::build(new_record).expect("valid commit record");
         let data_key = keys::reconstruct_data_key(&rec).expect("data key");
         memory
@@ -8411,7 +8572,8 @@ pub(crate) mod tests {
         publish::publish(memory, &rec, &RetryPolicy::default())
             .await
             .expect("publish");
-        data_key
+        let token = record::token_for(&rec).expect("commit token");
+        (data_key, token)
     }
 
     /// One published RSPAN segment holding `count` spans whose `start_ts` is
@@ -8477,9 +8639,11 @@ pub(crate) mod tests {
                 min_event_ts_ns: min,
                 max_event_ts_ns: max,
                 segment_format_version: 1,
+                ingest_hour_bucket: 0,
             },
         )
         .await
+        .0
     }
 
     /// One published RLOG segment on the audit stream holding `count` records
@@ -8527,6 +8691,22 @@ pub(crate) mod tests {
         writer_seq: u64,
         records: &[LogRecord],
     ) -> String {
+        publish_log_records_in_hour(memory, tenant_hash, signal, writer_seq, 0, records)
+            .await
+            .0
+    }
+
+    /// [`publish_log_records`] into ingest hour `ingest_hour_bucket`, created
+    /// 1 ns into that hour. Returns the data object's key and the commit
+    /// token of the published record.
+    pub(crate) async fn publish_log_records_in_hour(
+        memory: &MemoryStore,
+        tenant_hash: TenantHash,
+        signal: Signal,
+        writer_seq: u64,
+        ingest_hour_bucket: u32,
+        records: &[LogRecord],
+    ) -> (String, CommitToken) {
         let identity = LogObjectIdentity {
             tenant_hash: tenant_hash.0,
             shard: 0,
@@ -8553,6 +8733,7 @@ pub(crate) mod tests {
                 min_event_ts_ns: min,
                 max_event_ts_ns: max,
                 segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+                ingest_hour_bucket,
             },
         )
         .await
@@ -8569,11 +8750,17 @@ pub(crate) mod tests {
         min_event_ts_ns: i64,
         max_event_ts_ns: i64,
         segment_format_version: u32,
+        ingest_hour_bucket: u32,
     }
 
-    /// Put `segment` into `memory` and publish its commit record into ingest
-    /// hour 0. Returns the data object's key.
-    async fn publish_encoded(memory: &MemoryStore, segment: EncodedSegment) -> String {
+    /// Put `segment` into `memory` and publish its commit record into its
+    /// ingest hour, created 1 ns into that hour. Returns the data object's key
+    /// and the record's commit token.
+    async fn publish_encoded(
+        memory: &MemoryStore,
+        segment: EncodedSegment,
+    ) -> (String, CommitToken) {
+        const NS_PER_HOUR: i64 = 3_600 * 1_000_000_000;
         let new_record = NewCommitRecord {
             tenant_hash: segment.tenant_hash,
             signal: segment.signal,
@@ -8590,10 +8777,10 @@ pub(crate) mod tests {
             min_ingest_ts_ns: segment.min_event_ts_ns,
             max_ingest_ts_ns: segment.max_event_ts_ns,
             segment_format_version: segment.segment_format_version,
-            created_unix_ns: 1,
-            ingest_hour_bucket: 0,
+            created_unix_ns: i64::from(segment.ingest_hour_bucket) * NS_PER_HOUR + 1,
+            ingest_hour_bucket: segment.ingest_hour_bucket,
         };
-        put_and_publish(memory, new_record, bytes::Bytes::from(segment.bytes)).await
+        put_and_publish_with_token(memory, new_record, bytes::Bytes::from(segment.bytes)).await
     }
 
     /// `memory` under the counting, fault-injecting wrapper every fixture
