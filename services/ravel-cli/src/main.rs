@@ -5453,7 +5453,13 @@ mod tests {
                 "deterministic",
                 "192.0.2.1",
             ][..],
-            &["ravel", "ipcrypt", "set-policy", "--ipcrypt-config", "p.toml"][..],
+            &[
+                "ravel",
+                "ipcrypt",
+                "set-policy",
+                "--ipcrypt-config",
+                "p.toml",
+            ][..],
         ] {
             let cli = Cli::try_parse_from(args).expect("ipcrypt subcommand parses");
             assert!(super::command_hashes_tenant(&cli.command), "{args:?}");

@@ -64,7 +64,11 @@ const CASES: [(&str, &str, u8); 8] = [
         "host.ip",
         octet::COLUMNAR_LOG_RESOURCE,
     ),
-    ("columnar log record", "client.ip", octet::COLUMNAR_LOG_RECORD),
+    (
+        "columnar log record",
+        "client.ip",
+        octet::COLUMNAR_LOG_RECORD,
+    ),
     ("row log resource", "host.ip", octet::ROW_LOG_RESOURCE),
     ("row log record", "client.ip", octet::ROW_LOG_RECORD),
     ("span resource", "host.ip", octet::SPAN_RESOURCE),
@@ -182,15 +186,9 @@ async fn load_every_path(store: &Arc<dyn ObjectStoreBackend>, policy: &IpcryptPo
          ts_unit = \"nanos\"\nkind = \"gauge\"\n\n\
          [[metrics.label]]\nname = \"client_ip\"\ncolumn = \"cip\"\n",
     );
-    cli_load(
-        Arc::clone(store),
-        &pq,
-        &mapping,
-        SignalArg::Metrics,
-        policy,
-    )
-    .await
-    .expect("metrics load");
+    cli_load(Arc::clone(store), &pq, &mapping, SignalArg::Metrics, policy)
+        .await
+        .expect("metrics load");
 
     let pq = write_batch(
         dir.path(),
@@ -252,7 +250,10 @@ async fn load_every_path(store: &Arc<dyn ObjectStoreBackend>, policy: &IpcryptPo
         ("start_ns", i64_col(vec![NOW_NS])),
         ("end_ns", i64_col(vec![NOW_NS])),
         ("svc", str_col(vec!["api"])),
-        ("host_ip", str_col(vec![addr(octet::SPAN_RESOURCE).as_str()])),
+        (
+            "host_ip",
+            str_col(vec![addr(octet::SPAN_RESOURCE).as_str()]),
+        ),
         ("client_ip", str_col(vec![addr(octet::SPAN_ATTR).as_str()])),
         ("attrs", Arc::new(attrs.finish()) as ArrayRef),
     ]);
@@ -522,10 +523,7 @@ async fn a_marker_read_failure_refuses_and_is_not_taken_for_absent() {
         let err = cli_load(Arc::clone(&store), &pq, &mapping, SignalArg::Logs, &policy)
             .await
             .expect_err("a failed marker read must refuse");
-        assert!(
-            format!("{err:#}").contains("refusing to load"),
-            "{err:#}"
-        );
+        assert!(format!("{err:#}").contains("refusing to load"), "{err:#}");
     }
     assert_eq!(faulty.fault_count(Op::Get, FaultKind::Transient), 2);
     let inner = faulty.inner();
@@ -536,7 +534,9 @@ async fn a_marker_read_failure_refuses_and_is_not_taken_for_absent() {
         .map(|o| o.key)
         .collect();
     assert!(
-        !keys.iter().any(|k| k == IPCRYPT_POLICY_KEY || k.contains("/l0/")),
+        !keys
+            .iter()
+            .any(|k| k == IPCRYPT_POLICY_KEY || k.contains("/l0/")),
         "{keys:?}"
     );
 }

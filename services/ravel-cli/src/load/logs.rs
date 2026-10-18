@@ -1988,6 +1988,7 @@ fn decode_and_build_stride(
 /// the batch is charged after its spans are collected and before it is built,
 /// so the decoder waits there, holding only the spans, while the budget is
 /// full.
+#[allow(clippy::too_many_arguments)]
 fn decode_and_build_stride_columnar(
     mut state: StrideCursors,
     mapping: Arc<Mapping>,

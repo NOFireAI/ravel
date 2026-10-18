@@ -339,8 +339,7 @@ async fn rlog_objects_match_the_pre_2613_dealer() {
                 &LogIngestLimits::default(),
                 &TenantRules::none(),
                 NOW_NS,
-            )
-            {
+            ) {
                 Ok(b) => b,
                 Err(_) => panic!("reference batch failed to build"),
             };

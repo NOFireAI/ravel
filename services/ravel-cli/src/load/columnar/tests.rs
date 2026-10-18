@@ -909,7 +909,13 @@ fn the_reference_build_refuses_a_negative_timestamp_like_production() {
         Err(ColBuildError::Batch(r)) => panic!("expected a row rejection, got batch: {r}"),
         Ok(_) => panic!("expected a row rejection, got a batch"),
     };
-    let got = refusal(build_columnar_batch(&spans, &mapping, &limits, &TenantRules::none(), NOW_NS));
+    let got = refusal(build_columnar_batch(
+        &spans,
+        &mapping,
+        &limits,
+        &TenantRules::none(),
+        NOW_NS,
+    ));
     let want = refusal(build_columnar_batch_reference(
         &spans, &mapping, &limits, NOW_NS,
     ));

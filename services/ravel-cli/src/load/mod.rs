@@ -36,7 +36,6 @@ use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
 use ravel_catalog::{AbsentPolicy, validate_or_adopt};
-use ravel_ipcrypt::rules::TenantRules;
 #[cfg(feature = "stage-timing")]
 use ravel_ingest::LogStageSnapshot;
 use ravel_ingest::{
@@ -45,6 +44,7 @@ use ravel_ingest::{
     RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError,
     SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_limits::LogIngestLimits;

@@ -193,6 +193,9 @@ pub struct PlannedRequest {
     pub epochs: Vec<EncryptedMatcher>,
 }
 
+/// A [`PlannedRequest`]'s matchers and epochs, before its id is assigned.
+type PlanDraft = (Vec<(String, String)>, Vec<EncryptedMatcher>);
+
 /// One matcher's candidate values: the value unchanged, or one ciphertext
 /// per epoch of its rule.
 enum MatcherValues {
@@ -305,8 +308,7 @@ pub fn plan_requests(
         );
     }
 
-    let mut plans: Vec<(Vec<(String, String)>, Vec<EncryptedMatcher>)> =
-        vec![(Vec::with_capacity(matchers.len()), Vec::new())];
+    let mut plans: Vec<PlanDraft> = vec![(Vec::with_capacity(matchers.len()), Vec::new())];
     for ((key, _), candidate) in matchers.iter().zip(candidates) {
         match candidate {
             MatcherValues::Plain(value) => {
@@ -1149,10 +1151,7 @@ retired_epochs = [1, 2, 3, 4]
                 epoch,
             }];
             assert_eq!(plan.epochs, expected_epochs);
-            assert_eq!(
-                plan.request_id,
-                derived_request_id(base, &expected_epochs)
-            );
+            assert_eq!(plan.request_id, derived_request_id(base, &expected_epochs));
             assert_ne!(plan.request_id, base);
             let stored = stored_request(&store, Signal::Logs, plan.request_id).await;
             assert_eq!(
@@ -1173,7 +1172,11 @@ retired_epochs = [1, 2, 3, 4]
             .await
             .expect("read marker")
             .map(|(marker, _)| marker.fingerprint);
-        assert_eq!(marker, Some(policy.fingerprint()), "the submit created the marker");
+        assert_eq!(
+            marker,
+            Some(policy.fingerprint()),
+            "the submit created the marker"
+        );
     }
 
     #[tokio::test]
@@ -1233,7 +1236,8 @@ retired_epochs = [1, 2, 3, 4]
         let message = format!("{err:#}");
         assert!(message.contains("25 requests, more than 16"), "{message}");
         assert!(
-            message.contains("rule \"client.ip\" (matcher \"client.ip\") has epochs [5, 1, 2, 3, 4]"),
+            message
+                .contains("rule \"client.ip\" (matcher \"client.ip\") has epochs [5, 1, 2, 3, 4]"),
             "{message}"
         );
         assert!(message.contains("rule \"host.ip\""), "{message}");
@@ -1294,9 +1298,8 @@ retired_epochs = [1, 2, 3, 4]
     #[tokio::test]
     async fn a_single_request_keeps_the_base_id() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let policy = policy(
-            "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n",
-        );
+        let policy =
+            policy("[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n");
         let base = Uuid::from_u128(11);
         let report = submit_logs(&store, &policy, vec![matcher("client.ip", CLIENT)], base)
             .await
@@ -1318,9 +1321,8 @@ retired_epochs = [1, 2, 3, 4]
     #[tokio::test]
     async fn a_metric_matcher_is_ruled_through_its_sanitized_label_name() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let policy = policy(
-            "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n",
-        );
+        let policy =
+            policy("[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n");
         let base = Uuid::from_u128(12);
         submit_with_ipcrypt(
             Arc::clone(&store),
@@ -1392,7 +1394,9 @@ retired_epochs = [1, 2, 3, 4]
     async fn a_marker_mismatch_refuses_and_writes_no_request() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let other = [7u8; 32];
-        check_marker(store.as_ref(), other).await.expect("seed marker");
+        check_marker(store.as_ref(), other)
+            .await
+            .expect("seed marker");
         let policy = policy(TWO_EPOCH_POLICY);
         let err = submit_logs(
             &store,

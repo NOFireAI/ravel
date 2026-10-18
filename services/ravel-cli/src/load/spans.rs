@@ -315,6 +315,7 @@ fn read_status_code(arr: &ArrayRef, row: usize) -> Result<StatusCode, String> {
 /// exactly as `checked_span_interval` does.
 /// `dropped` accumulates this row's over-cap attribute drops; see
 /// [`read_span_attrs`].
+#[allow(clippy::too_many_arguments)]
 fn build_span(
     batch: &RecordBatch,
     cols: &SpansColumnIndex,

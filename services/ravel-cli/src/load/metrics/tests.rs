@@ -48,8 +48,16 @@ fn the_metrics_row_path_reads_dictionary_columns_in_place() {
         let cols = MetricsColumnIndex::resolve(b, &mapping).expect("columns resolve");
         (0..b.num_rows())
             .map(|row| {
-                let r = build_metric_row(b, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row)
-                    .expect("the row builds");
+                let r = build_metric_row(
+                    b,
+                    &cols,
+                    &mapping,
+                    &limits,
+                    &TenantRules::none(),
+                    NOW_NS,
+                    row,
+                )
+                .expect("the row builds");
                 (r.name, r.labels)
             })
             .collect()

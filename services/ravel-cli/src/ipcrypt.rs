@@ -357,7 +357,10 @@ pub async fn set_policy(
 pub async fn set_policy_over(
     store: &dyn ObjectStoreBackend,
     policy: &IpcryptPolicy,
-    current: Option<(ravel_ipcrypt::marker::StoredMarker, ravel_object_store::Version)>,
+    current: Option<(
+        ravel_ipcrypt::marker::StoredMarker,
+        ravel_object_store::Version,
+    )>,
     out: &mut dyn std::io::Write,
 ) -> anyhow::Result<SetPolicyOutcome> {
     let local = hex::encode(policy.fingerprint);
@@ -418,7 +421,8 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
 
     const DEPLOYMENT_KEY: [u8; 32] = [0x5a; 32];
-    const DETERMINISTIC: &str = "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n";
+    const DETERMINISTIC: &str =
+        "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n";
     const PREFIX: &str = "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"prefix\"\n";
     const ROTATED: &str =
         "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\nepoch = 2\n";
@@ -558,10 +562,7 @@ mod tests {
             &mut Vec::new(),
         )
         .expect_err("no key");
-        assert!(
-            err.to_string().contains("--tenant-hash-key-file"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("--tenant-hash-key-file"), "{err}");
     }
 
     #[test]
@@ -576,13 +577,22 @@ mod tests {
     fn a_policy_file_that_does_not_parse_is_refused() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("policy.toml");
-        std::fs::write(&path, "[[defaults.rules]]\nkey = \"client.ip\"\nepoch = 0\n")
-            .expect("write policy");
+        std::fs::write(
+            &path,
+            "[[defaults.rules]]\nkey = \"client.ip\"\nepoch = 0\n",
+        )
+        .expect("write policy");
         let err = read_policy_file(Some(&path)).expect_err("epoch 0 is refused");
-        assert!(err.to_string().contains("invalid --ipcrypt-config"), "{err}");
+        assert!(
+            err.to_string().contains("invalid --ipcrypt-config"),
+            "{err}"
+        );
         let err = read_policy_file(Some(&dir.path().join("absent.toml")))
             .expect_err("a missing file is refused");
-        assert!(err.to_string().contains("could not read --ipcrypt-config"), "{err}");
+        assert!(
+            err.to_string().contains("could not read --ipcrypt-config"),
+            "{err}"
+        );
     }
 
     #[tokio::test]
@@ -603,7 +613,9 @@ mod tests {
             SetPolicyOutcome::Unchanged
         );
         assert_eq!(
-            set_policy(&store, &second, &mut out).await.expect("replace"),
+            set_policy(&store, &second, &mut out)
+                .await
+                .expect("replace"),
             SetPolicyOutcome::Replaced {
                 previous: first.fingerprint()
             }
@@ -658,8 +670,7 @@ mod tests {
             "{err}"
         );
         assert!(
-            err.to_string()
-                .contains(&hex::encode(first.fingerprint())),
+            err.to_string().contains(&hex::encode(first.fingerprint())),
             "{err}"
         );
         assert_eq!(stored_fingerprint(&store).await, Some(second.fingerprint()));
@@ -667,8 +678,8 @@ mod tests {
 
     #[tokio::test]
     async fn set_policy_refuses_when_the_marker_cannot_be_read() {
-        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
         use ravel_ipcrypt::marker::IPCRYPT_POLICY_KEY;
+        use ravel_object_store::fault::{FaultPlan, FaultStore, Op, Rule, ScriptedFault};
         let store = FaultStore::new(
             MemoryStore::new(),
             FaultPlan::empty().with_rule(

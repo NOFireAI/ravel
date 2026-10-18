@@ -216,7 +216,15 @@ fn a_dictionary_encoded_attrs_map_is_read_as_strings() {
     let mut dropped = 0;
     let rows: Vec<Vec<(String, String)>> = (0..2)
         .map(|row| {
-            read_span_attrs_map(&resolved, row, 0, &limits, &TenantRules::none(), &mut dropped).expect("entries read")
+            read_span_attrs_map(
+                &resolved,
+                row,
+                0,
+                &limits,
+                &TenantRules::none(),
+                &mut dropped,
+            )
+            .expect("entries read")
         })
         .collect();
     let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
@@ -334,7 +342,16 @@ fn future_skew_is_kept_and_past_lag_is_relaxed() {
         let mapped_keys = mapping.mapped_keys();
         let cols =
             SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
-        build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, 0, &mut 0)
+        build_span(
+            &batch,
+            &cols,
+            &mapping,
+            &limits,
+            &TenantRules::none(),
+            NOW_NS,
+            0,
+            &mut 0,
+        )
     };
 
     // The start stays well inside the bound in both cases, so only the
@@ -412,8 +429,17 @@ fn dictionary_columns_are_resolved_once_per_batch() {
     );
 
     for row in 0..ROWS {
-        let span = build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut 0)
-            .expect("every row builds");
+        let span = build_span(
+            &batch,
+            &cols,
+            &mapping,
+            &limits,
+            &TenantRules::none(),
+            NOW_NS,
+            row,
+            &mut 0,
+        )
+        .expect("every row builds");
         assert_eq!(span.name, "op", "the resolved column reads the same values");
         assert_eq!(span.trace_id, [1u8; 16]);
         assert_eq!(span.span_id, [2u8; 8]);
@@ -589,7 +615,16 @@ fn attrs_map_dictionaries_are_resolved_once_per_batch() {
         "the map's key and value dictionaries, each once"
     );
     for row in 0..batch.num_rows() {
-        let _ = build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut 0);
+        let _ = build_span(
+            &batch,
+            &cols,
+            &mapping,
+            &limits,
+            &TenantRules::none(),
+            NOW_NS,
+            row,
+            &mut 0,
+        );
     }
     assert_eq!(
         counters.cell_keys(),
@@ -653,8 +688,17 @@ fn a_dictionary_encoded_attrs_map_reads_every_outcome_exactly() {
     let got: Vec<Outcome> = (0..batch.num_rows())
         .map(|row| {
             let mut dropped = 0;
-            build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut dropped)
-                .map(|span| (span.attrs, dropped))
+            build_span(
+                &batch,
+                &cols,
+                &mapping,
+                &limits,
+                &TenantRules::none(),
+                NOW_NS,
+                row,
+                &mut dropped,
+            )
+            .map(|span| (span.attrs, dropped))
         })
         .collect();
 
@@ -728,8 +772,17 @@ fn a_sliced_attrs_map_reads_the_rows_it_kept() {
         (0..batch.num_rows())
             .map(|row| {
                 let mut dropped = 0;
-                build_span(batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut dropped)
-                    .map(|span| (span.attrs, dropped))
+                build_span(
+                    batch,
+                    &cols,
+                    &mapping,
+                    &limits,
+                    &TenantRules::none(),
+                    NOW_NS,
+                    row,
+                    &mut dropped,
+                )
+                .map(|span| (span.attrs, dropped))
             })
             .collect()
     };
@@ -775,7 +828,17 @@ fn an_attrs_map_key_a_resource_attribute_names_is_refused() {
     let cols = SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
     let got: Vec<Result<Vec<(String, String)>, String>> = (0..2)
         .map(|row| {
-            build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut 0).map(|span| span.attrs)
+            build_span(
+                &batch,
+                &cols,
+                &mapping,
+                &limits,
+                &TenantRules::none(),
+                NOW_NS,
+                row,
+                &mut 0,
+            )
+            .map(|span| span.attrs)
         })
         .collect();
     let pair = |key: &str, value: &str| (key.to_string(), value.to_string());
@@ -854,8 +917,17 @@ fn an_attrs_map_child_with_an_empty_dictionary_is_answered_per_row() {
             SpansColumnIndex::resolve(batch, &mapping, &mapped_keys).expect("columns resolve");
         (0..ROWS)
             .map(|row| {
-                build_span(batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut 0)
-                    .map(|span| span.attrs)
+                build_span(
+                    batch,
+                    &cols,
+                    &mapping,
+                    &limits,
+                    &TenantRules::none(),
+                    NOW_NS,
+                    row,
+                    &mut 0,
+                )
+                .map(|span| span.attrs)
             })
             .collect()
     };
@@ -1117,7 +1189,18 @@ fn mapped_dictionary_columns_are_read_in_place() {
         );
     }
 
-    let span = |row: usize| build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut 0);
+    let span = |row: usize| {
+        build_span(
+            &batch,
+            &cols,
+            &mapping,
+            &limits,
+            &TenantRules::none(),
+            NOW_NS,
+            row,
+            &mut 0,
+        )
+    };
     let pair = |k: &str, v: &str| (k.to_string(), v.to_string());
     let first = span(0).expect("row 0 builds");
     assert_eq!(
@@ -1174,7 +1257,18 @@ fn a_sliced_batch_reads_the_dictionary_rows_it_kept() {
         let cols =
             SpansColumnIndex::resolve(batch, &mapping, &mapped_keys).expect("columns resolve");
         (0..batch.num_rows())
-            .map(|row| build_span(batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, row, &mut 0))
+            .map(|row| {
+                build_span(
+                    batch,
+                    &cols,
+                    &mapping,
+                    &limits,
+                    &TenantRules::none(),
+                    NOW_NS,
+                    row,
+                    &mut 0,
+                )
+            })
             .collect()
     };
     let whole = outcomes(&batch);
@@ -1374,8 +1468,17 @@ fn an_end_before_its_start_is_rejected() {
     ]);
     let mapped_keys = mapping.mapped_keys();
     let cols = SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
-    let err = build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, 0, &mut 0)
-        .expect_err("end before start");
+    let err = build_span(
+        &batch,
+        &cols,
+        &mapping,
+        &limits,
+        &TenantRules::none(),
+        NOW_NS,
+        0,
+        &mut 0,
+    )
+    .expect_err("end before start");
     assert_eq!(
         err,
         format!(
@@ -1469,7 +1572,16 @@ fn build_one_into(row: Row, dropped: &mut u64) -> Result<NormalizedSpan, String>
     ]);
     let mapped_keys = mapping.mapped_keys();
     let cols = SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
-    build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, 0, dropped)
+    build_span(
+        &batch,
+        &cols,
+        &mapping,
+        &limits,
+        &TenantRules::none(),
+        NOW_NS,
+        0,
+        dropped,
+    )
 }
 
 /// [`build_one_counting`] for the tests that do not care how many
@@ -2002,8 +2114,17 @@ fn a_bytes_attribute_is_measured_as_its_hex_form() {
         let cols =
             SpansColumnIndex::resolve(&batch, &mapping, &mapped_keys).expect("columns resolve");
         let mut dropped = 0u64;
-        let span = build_span(&batch, &cols, &mapping, &limits, &TenantRules::none(), NOW_NS, 0, &mut dropped)
-            .expect("an over-cap attribute value does not reject the span");
+        let span = build_span(
+            &batch,
+            &cols,
+            &mapping,
+            &limits,
+            &TenantRules::none(),
+            NOW_NS,
+            0,
+            &mut dropped,
+        )
+        .expect("an over-cap attribute value does not reject the span");
         (span, dropped)
     };
 
