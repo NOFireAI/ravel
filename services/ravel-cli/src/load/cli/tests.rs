@@ -602,6 +602,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
     let clock = TestClock::new(NOW_NS);
     let sink = SharedSink::default();
     let mut warnings = sink.clone();
+    let no_policy = IpcryptPolicy::empty();
     let load = run_fold_warning_to(
         Arc::clone(&store),
         &pq,
@@ -622,6 +623,7 @@ async fn an_unset_max_flush_delay_reaches_the_router_as_sixty_seconds() {
             host_total_bytes: Some(64 << 30),
         },
         false,
+        &no_policy,
         NOW_NS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         &mut warnings,
@@ -713,6 +715,7 @@ async fn a_failed_default_load_flushes_before_it_reports() {
             host_total_bytes: Some(64 << 30),
         },
         false,
+        &IpcryptPolicy::empty(),
         NOW_NS,
         Arc::clone(&clock) as Arc<dyn Clock>,
         &mut warnings,

@@ -831,6 +831,17 @@ enum Command {
         /// fold's. A load that wrote nothing runs no fold and no check.
         #[arg(long)]
         fold_after_load: bool,
+        /// IPCrypt policy TOML (ADR-2993), the same file the server takes as
+        /// `--ipcrypt-config`. Each ruled address is encrypted before series
+        /// identity, the length caps and encoding: metric labels are matched
+        /// by their sanitized name, log and span attributes by their raw key.
+        /// A policy with rules needs `--tenant-hash-key-file`. Every load,
+        /// with or without this flag, first compares the policy's fingerprint
+        /// with the bucket's `sys/ipcrypt/policy` marker and refuses on a
+        /// mismatch or when the marker cannot be read; with no marker, a
+        /// policy with rules creates it.
+        #[arg(long, value_name = "TOML")]
+        ipcrypt_config: Option<std::path::PathBuf>,
     },
     /// Bulk-export a tenant's stored logs, metrics or spans to a Parquet file (ADR-1751).
     ///
@@ -3133,7 +3144,13 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             zstd_level,
             load_memory_bytes,
             fold_after_load,
+            ipcrypt_config,
         } => {
+            let ipcrypt = ravel_cli::ipcrypt::IpcryptPolicy::from_flags(
+                ipcrypt_config.as_deref(),
+                cli.tenancy.tenant_hash_key_file.as_deref(),
+                cli.tenancy.tenant_hash_unkeyed,
+            )?;
             let profile = ravel_cli::cli_profiling::ProfileSession::from_env("ravel-cli-load");
             let result = ravel_cli::load::run(
                 store::build_store(&cli.store)?,
@@ -3153,6 +3170,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 zstd_level,
                 load_memory_bytes,
                 fold_after_load,
+                &ipcrypt,
                 now_ns()?,
             )
             .await;

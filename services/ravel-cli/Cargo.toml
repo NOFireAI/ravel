@@ -68,6 +68,11 @@ ravel-query = { workspace = true }
 # the first shipping callers of the Parquet-table grants record, manifest
 # resolution and manifest sweep. Workspace pin, no new external crate.
 ravel-pqtable = { workspace = true }
+# `load` and `erase submit` apply the `--ipcrypt-config` policy and check the
+# `sys/ipcrypt/policy` marker (ADR-2993, issue #3049), and `ipcrypt
+# encrypt|decrypt|set-policy` derive epoch keys and replace the marker. Was a
+# dev-dependency here; workspace pin, no new external crate.
+ravel-ipcrypt = { workspace = true, features = ["marker"] }
 prost = { workspace = true }
 blake3 = { workspace = true }
 crc32c = { workspace = true }
@@ -172,9 +177,6 @@ proptest = { workspace = true }
 # normalization helpers instead would assert nothing. Workspace pin, already
 # in the lock through ravel-otlp; test-only here.
 opentelemetry-proto = { workspace = true }
-# TenantRules::none() for the series-identity parity test's
-# ravel_otlp::normalize_metrics call (ADR-2993 decision 3, issue #3047).
-ravel-ipcrypt = { workspace = true }
 # The compaction-claim tests write a foreign process's claim through the same
 # `ravel_fleet::claim::acquire` a supervisor uses. Workspace pin, already a
 # dependency of ravel-maintain; adds no new external crate.

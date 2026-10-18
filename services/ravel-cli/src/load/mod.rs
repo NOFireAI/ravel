@@ -59,6 +59,7 @@ use ravel_types::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::ipcrypt::IpcryptPolicy;
 use crate::maintain::SignalArg;
 
 /// The label the classic-histogram explosion synthesizes per bucket, carrying
