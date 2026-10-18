@@ -678,3 +678,98 @@ fn traces_none_matches_a_resolved_empty_rule_set() {
         project_span_resolved_label_bytes(&req(), &limits, &resolved_empty_rules()).get()
     );
 }
+
+// --- prefix variant ---
+
+/// One prefix-preserving rule on `client.ip`, resolved for tenant `acme`.
+fn prefix_rules() -> TenantRules {
+    let policy = parse_policy_file(
+        "[defaults]\nrules = [{ key = \"client.ip\", variant = \"prefix\" }]\n",
+        sanitize,
+    )
+    .expect("policy parses");
+    TenantRules::resolve(&policy, "acme", &TENANT_HASH, &DEPLOYMENT_KEY, sanitize)
+        .expect("rules resolve")
+}
+
+/// The prefix-preserving ciphertext of the IPv4 address `raw`, derived
+/// independently of any rule. It is itself an IPv4 address.
+fn expected_prefix(raw: &str) -> String {
+    let key = EpochKey::new(&DEPLOYMENT_KEY, &TENANT_HASH, Variant::Prefix, 1)
+        .expect("epoch key derives");
+    let (rendered, outcome) = key.encrypt(raw);
+    assert_eq!(outcome, RenderOutcome::Encrypted);
+    assert_ne!(rendered, raw);
+    assert!(rendered.parse::<std::net::Ipv4Addr>().is_ok(), "{rendered}");
+    rendered
+}
+
+fn assert_prefix_tally(tally: &ravel_ipcrypt::tally::IpcryptTally, encrypted: u64) {
+    assert_eq!(
+        tally.count(Variant::Prefix, RenderOutcome::Encrypted),
+        encrypted
+    );
+    assert_eq!(
+        tally.count(Variant::Deterministic, RenderOutcome::Encrypted),
+        0
+    );
+}
+
+#[test]
+fn metrics_prefix_rule_keeps_the_ipv4_family() {
+    let (point_ip, exemplar_ip) = ("192.0.2.1", "198.51.100.7");
+    let result = normalize_metrics(
+        metrics_request(vec![gauge_point(point_ip, Some(exemplar_ip))]),
+        &IngestLimits::default(),
+        &prefix_rules(),
+    );
+    assert!(result.output.rejected.is_empty());
+    assert_eq!(
+        result.output.points[0].labels.get(RULE_LABEL),
+        Some(expected_prefix(point_ip).as_str())
+    );
+    assert_eq!(
+        result.exemplars[0].exemplar.filtered_attributes,
+        vec![Label {
+            name: RULE_LABEL.to_string(),
+            value: expected_prefix(exemplar_ip),
+        }]
+    );
+    assert_prefix_tally(&result.output.ipcrypt_tally, 2);
+}
+
+#[test]
+fn logs_prefix_rule_keeps_the_ipv4_family() {
+    let record_ip = "192.0.2.3";
+    let out = normalize_logs(
+        logs_request("", "", vec![string_kv(RULE_KEY, record_ip)]),
+        &LogIngestLimits::default(),
+        &prefix_rules(),
+        1_000,
+    );
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(
+        out.records[0].attrs,
+        vec![(
+            RULE_KEY.to_string(),
+            AttrValue::Str(expected_prefix(record_ip))
+        )]
+    );
+    assert_prefix_tally(&out.ipcrypt_tally, 1);
+}
+
+#[test]
+fn traces_prefix_rule_keeps_the_ipv4_family() {
+    let span_ip = "192.0.2.1";
+    let mut req = traces_request(span_ip, "", "");
+    let span = &mut req.resource_spans[0].scope_spans[0].spans[0];
+    span.events.clear();
+    span.links.clear();
+    let out = normalize_traces(req, &SpanIngestLimits::default(), &prefix_rules(), 5_000);
+    assert!(out.rejected.is_empty(), "{:?}", out.rejected);
+    assert_eq!(
+        attr(&out.spans[0].attrs, RULE_KEY),
+        expected_prefix(span_ip)
+    );
+    assert_prefix_tally(&out.ipcrypt_tally, 1);
+}

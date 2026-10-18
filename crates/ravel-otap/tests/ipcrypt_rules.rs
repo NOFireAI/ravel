@@ -367,6 +367,56 @@ fn otap_resource_label_check_charges_max_stored_len() {
     );
 }
 
+/// A prefix-preserving rule stores an IPv4 address as the IPv4 ciphertext
+/// the prefix epoch key gives it, on the point, the exemplar and the
+/// promoted resource label.
+#[test]
+fn otap_prefix_rule_keeps_the_ipv4_family() {
+    let policy = parse_policy_file(
+        "[defaults]\nrules = [\n  { key = \"client.ip\", variant = \"prefix\" },\n  { key = \"host.ip\", variant = \"prefix\" },\n]\n",
+        sanitize,
+    )
+    .expect("policy parses");
+    let rules = TenantRules::resolve(&policy, "acme", &TENANT_HASH, &DEPLOYMENT_KEY, sanitize)
+        .expect("rules resolve");
+    let key = EpochKey::new(&DEPLOYMENT_KEY, &TENANT_HASH, Variant::Prefix, 1)
+        .expect("epoch key derives");
+    let expected_prefix = |raw: &str| {
+        let (rendered, outcome) = key.encrypt(raw);
+        assert_eq!(outcome, RenderOutcome::Encrypted);
+        assert_ne!(rendered, raw);
+        assert!(rendered.parse::<std::net::Ipv4Addr>().is_ok(), "{rendered}");
+        rendered
+    };
+
+    let (point_ip, exemplar_ip, resource_ip) = ("192.0.2.1", "198.51.100.7", "203.0.113.9");
+    let result = normalize(
+        &batch(vec![point(point_ip, Some(exemplar_ip))], Some(resource_ip)),
+        &limits(),
+        &rules,
+    );
+    assert!(result.output.rejected.is_empty());
+    let labels = &result.output.points[0].labels;
+    assert_eq!(
+        labels.get(POINT_LABEL),
+        Some(expected_prefix(point_ip).as_str())
+    );
+    assert_eq!(
+        labels.get(RESOURCE_LABEL),
+        Some(expected_prefix(resource_ip).as_str())
+    );
+    assert_eq!(
+        result.exemplars[0].exemplar.filtered_attributes,
+        vec![label(POINT_LABEL, &expected_prefix(exemplar_ip))]
+    );
+    let tally = &result.output.ipcrypt_tally;
+    assert_eq!(tally.count(Variant::Prefix, RenderOutcome::Encrypted), 3);
+    assert_eq!(
+        tally.count(Variant::Deterministic, RenderOutcome::Encrypted),
+        0
+    );
+}
+
 #[test]
 fn otap_none_matches_a_resolved_empty_rule_set() {
     let decoded = batch(

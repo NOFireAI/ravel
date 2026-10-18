@@ -212,6 +212,50 @@ fn remote_write_matches_the_sanitized_label_name() {
     assert_address_label_encrypted_as_sent("client_address");
 }
 
+/// A prefix-preserving rule stores an IPv4 address as the IPv4 ciphertext
+/// the prefix epoch key gives it, on the sample and the exemplar labels.
+#[test]
+fn remote_write_prefix_rule_keeps_the_ipv4_family() {
+    let policy = parse_policy_file(
+        "[defaults]\nrules = [{ key = \"client.ip\", variant = \"prefix\" }]\n",
+        sanitize,
+    )
+    .expect("policy parses");
+    let rules = TenantRules::resolve(&policy, "acme", &TENANT_HASH, &DEPLOYMENT_KEY, sanitize)
+        .expect("rules resolve");
+    let key = EpochKey::new(&DEPLOYMENT_KEY, &TENANT_HASH, Variant::Prefix, 1)
+        .expect("epoch key derives");
+    let expected_prefix = |raw: &str| {
+        let (rendered, outcome) = key.encrypt(raw);
+        assert_eq!(outcome, RenderOutcome::Encrypted);
+        assert_ne!(rendered, raw);
+        assert!(rendered.parse::<std::net::Ipv4Addr>().is_ok(), "{rendered}");
+        rendered
+    };
+
+    let (sample_ip, exemplar_ip) = ("192.0.2.1", "198.51.100.7");
+    let result = normalize(
+        request(vec![series(sample_ip, Some(exemplar_ip))]),
+        &IngestLimits::default(),
+        &rules,
+    );
+    assert!(result.output.rejected.is_empty());
+    assert_eq!(
+        result.output.points[0].labels.get(RULE_LABEL),
+        Some(expected_prefix(sample_ip).as_str())
+    );
+    assert_eq!(
+        result.exemplars[0].exemplar.filtered_attributes,
+        vec![label(RULE_LABEL, &expected_prefix(exemplar_ip))]
+    );
+    let tally = &result.output.ipcrypt_tally;
+    assert_eq!(tally.count(Variant::Prefix, RenderOutcome::Encrypted), 2);
+    assert_eq!(
+        tally.count(Variant::Deterministic, RenderOutcome::Encrypted),
+        0
+    );
+}
+
 /// A rejected series stores nothing, so its ruled value is not counted,
 /// though it was encrypted before a later label rejected the series.
 #[test]
