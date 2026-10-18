@@ -57,8 +57,8 @@ valid outside subqueries while a binary search is valid everywhere.
 `compute_plan_counts` (`crates/ravel-sql/src/logs_scan/plan.rs:312`)
 plans every relevant segment under `buffer_unordered(plan_concurrency)`
 (`plan.rs:352-353`) and stores the result in a `OnceCell` on the exec
-(`mod.rs:1102`); every partition stream awaits it before draining anything
-(`plan.rs:255-256`, `scan.rs:1485-1517`). Assignment (`owned_work`,
+(`mod.rs:1106`); every partition stream awaits it before draining anything
+(`plan.rs:193-200`, `scan.rs:1485-1517`). Assignment (`owned_work`,
 `plan.rs:682-800`) has three modes, each needing the whole pass first: with a
 read cache and a confirmed TopK, `global_deal` sorts every row group across
 all segments by its blocks' least stored timestamp and deals that interleaved
@@ -87,7 +87,9 @@ block on the accountant. The post-emission branch is already reachable
 today through Flight SQL, which streams batches and fails
 `SnapshotInvalidated` once rows are on the wire
 (`crates/ravel-sql/src/flight/stream.rs:16-28`), through the whole-segment
-fast path, and through unplanned sub-bound opens; no logs test pins it.
+fast path, and through unplanned sub-bound opens; no logs test pins it, and
+`retry_decision`'s own doc (`executor.rs:4738-4745`) still frames the branch
+as unreachable today, which decision 2e corrects.
 
 The predicate-free whole-segment fast path and its ranged prefetch pipeline
 already stream per partition without the barrier (`mod.rs:2410-2437`,
@@ -116,10 +118,11 @@ against do not pass through either cache today.
 
 The query engine has two signals that approximate "this statement reads
 everything", neither of which reaches the cache and neither of which is that
-statement exactly. `PlanClass::ExhaustiveScan` is computed at
-`crates/ravel-sql/src/executor.rs:3487-3496`, inside `into_shape` after the
-drain, as "a single metrics lane whose resolve pruned no segment"
-(`segments_pruned == 0`; `io_shape.rs:197-199`); its inputs are known after
+statement exactly. `PlanClass::ExhaustiveScan` is computed in
+`sql_io_shape` (`crates/ravel-sql/src/executor.rs:3487-3496`) after the
+drain and passed to `into_shape` at `:3497`, as "a single metrics lane whose
+resolve pruned no segment" (`segments_pruned == 0`;
+`crates/ravel-query/src/io_shape.rs:197-199`); its inputs are known after
 resolve, and a one-series dashboard query over a tenant whose segments all
 carry that metric name is `ExhaustiveScan` too. For logs the whole-segment
 fast-path test (`mod.rs:2410-2437`) runs in `execute()`, after the plan reads
@@ -142,9 +145,9 @@ reservation (ADR-1170 constraint 4; `crates/ravel-sql/tests/group_by_reservation
 | Track | Harness | Prediction | Miss | Basis |
 |---|---|---|---|---|
 | P1 | `query_latency_bench`, memory store, compound vs bare, 1 h x 1000, 24 h x 200, 24 h x 1000 series | `MergedSource::query` called once per grid step for the compound arm and once for the bare arm; evaluate share of compound wall at least 70 % at 24 h x 1000; compound wall at least 5x bare | evaluate share under 50 %, or ratio under 2x | measured 2026-10-18: calls 61 / 1441 / 1441 compound and 1 bare (HIT); every series walked whole per step, ratio 1.0000 (HIT); evaluate share 71.6 / 87.0 / 91.7 % (HIT); compound over bare 3.30x / 7.80x / 10.73x (1 h under the 5x target, both 24 h shapes HIT); profile at 24 h x 1000: 77.6 % of samples in `MergedSource::query`'s per-sample timestamp test, rate and aggregation 5.4 %; issue #3072 comment 6253165175 |
-| P2 | ADR-2773 P2 procedure on current main (`sql_latency_bench --generate`) | rp_map_full 19,300 to 20,200 cpu_ms, ov_key_gb 2,400 to 2,580 cpu_ms, within 0.7x to 1.4x | rp_map_full under 0.5x | measured 2026-10-18: overflow arm ov_key_gb 2,830 / 2,610 / 2,700 cpu_ms, 54.3 us per row, 1.11x (HIT), issue #3072 comment 6252814695; arm A at 500,000 records rp_map_full 8.92 / 7.04 / 8.78 us per row, inside the 7 to 14 us band (HIT), and its per-row ratio to rp_key_gb 19.6x to 26.2x under that report's own 30x bar, a scale effect of the fixed per-object open cost at 500,000 rows, issue #3072 comment 6253044527 |
+| P2 | ADR-2773 P2 procedure on current main (`sql_latency_bench --generate`) | rp_map_full 19,300 to 20,200 cpu_ms, ov_key_gb 2,400 to 2,580 cpu_ms, within 0.7x to 1.4x | rp_map_full under 0.5x | measured 2026-10-18: overflow arm ov_key_gb 2,830 / 2,610 / 2,700 cpu_ms, 54.3 us per row, 1.11x (HIT), issue #3072 comment 6252814695. Arm A: the cpu_ms band above assumes the 2,000,000-row dataset of ADR-2773's run; the executor box held 500,000 rows, so the pre-registered band is compared per row: 19,300 to 20,200 cpu_ms over 2,000,000 rows is 9.65 to 10.1 us per row, and the run measured 4,460 / 3,520 / 4,390 cpu_ms over 500,000 rows = 8.92 / 7.04 / 8.78 us per row, 0.70x to 0.92x of the pre-registered figure, inside the 0.7x to 1.4x tolerance (HIT on the per-row comparison; the cpu_ms band as written was not reproducible at this row count). Its per-row ratio to rp_key_gb, 19.6x to 26.2x, is under that report's own 30x bar, a scale effect of the fixed per-object open cost at 500,000 rows; issue #3072 comment 6253044527 |
 | P4 | `sql_latency_bench --generate --inject-get-delay-ms 30`, 25 objects of 20,000 records | cold first batch at or after 0.9x of the plan pass; planning share at least 30 % | first batch well before the plan pass ends | measured 2026-10-18: MISS on this lane, planning share 0.016 %, because 82 KB generated objects sit under the 512 KiB range threshold and the plan pass fetches nothing; the above-bound record is ADR-2707 Stage 0 q20 on real S3, plan 1,133 of 2,359 GETs and 602 MB of 1.48 GB (docs/adrs/2707-exact-key-index-for-spans-and-logs.md:91-92); issue #3072 comment 6252814695 |
-| P5 | same dataset, `--cache-bytes` at half the corpus, 4 runs | runs 2 to 4 serve under 5 % of read bytes from cache | over 30 % | measured 2026-10-18 on the scanning statement: 3.9 %, 3.9 %, 11.9 % (HIT); the count-only statement opens no segment and was inconclusive; issue #3072 comment 6252814695 |
+| P5 | same dataset, `--cache-bytes` at half the corpus, 4 runs | runs 2 to 4 serve under 5 % of read bytes from cache | over 30 % | measured 2026-10-18 on the scanning statement: 3.9 %, 3.9 % (HIT), 11.9 % on run 4 (2.4x the predicted ceiling, under the 30 % miss bar; the rise on the fourth pass is not understood and the per-intent counters of decision 3a are what would explain it); the count-only statement opens no segment and was inconclusive; issue #3072 comment 6252814695 |
 
 ## Decision
 
@@ -171,19 +174,28 @@ slicing each series with `partition_point` and then running today's
 slice (`eval.rs:1007`, `:1025`, `:1067-1073`, `:1197`); a series whose slice
 is empty is dropped as today. A miss, or a request outside the entry's
 window, fetches the union of the request and the request translated across
-the grid (`[req.start - (eval_ts - ctx.start_ns), req.end + (ctx.end_ns -
-eval_ts)]`, clamped to `i64`), replaces the entry, and increments a
-per-query refetch counter exposed through the annotations' debug surface
-for tests. For a selector directly under the top-level grid this is one
-fetch per selector whatever its `offset` or `@`; for a plain or `@`-pinned
-subquery it is one fetch too, since the first outer step's first inner step
-already spans the grid. A subquery whose inner grid runs past `ctx.end_ns`
-(a negative subquery offset, `f(x[1h:1m] offset -1h)`) translates to a window
-that ends at `ctx.end_ns` and refetches once per inner step past it, which is
-today's call count for that shape and never a wrong answer, since the union
-always contains the request; the task passes the enclosing grid's own bounds
-through `ctx` for subquery evaluation so the translation uses the inner grid,
-and the refetch band below covers that shape. The fetch is lazy: it runs at the first selector evaluation, so
+the top-level grid, replaces the entry, and increments a per-query refetch
+counter exposed through the annotations' debug surface for tests. The
+translation uses two new fields on `QueryWindow`, `grid_start_ns` and
+`grid_end_ns`, the range query's own grid bounds, plus the top-level grid
+step `t_outer` that the current evaluation descends from (for an instant
+query all three equal the evaluation instant). They are distinct from
+`start_ns` and `end_ns`, which stay the `@ start()` / `@ end()` anchors
+(`eval.rs:519-526`, read by `resolve_at` at `:1616-1617`) and are never
+rebound. The translated window is `[req.start - (t_outer - grid_start_ns),
+req.end + (grid_end_ns - t_outer)]`, saturating. For a selector directly
+under the top-level grid, `t_outer` is the step itself and this is one fetch
+per selector whatever its `offset` or `@`. Inside a subquery the inner
+instants vary but `t_outer` is the outer step that launched the inner grid,
+so the translation moves the whole inner grid across the outer grid: a
+plain or `@`-pinned subquery fetches once, and a negatively offset subquery
+(`f(x[1h:1m] offset -1h]`, whose inner grid runs past `grid_end_ns`) fetches
+at most twice per selector, once at the first inner step of the first outer
+step and once more when a later inner step of that same outer step reaches
+past the first entry's end, after which every later outer step's inner grid
+is inside the entry. Translating by the inner instant instead would end the
+window at `grid_end_ns` and refetch once per inner step past it, today's call
+count; that is the design the acceptance band below rules out. The fetch is lazy: it runs at the first selector evaluation, so
 every check that today sees zero source queries before a refusal
 (`eval.rs:3472`, `:3562`, `:3645`) still does. The instant path, the
 `Selector` and `Call` arms and `query_precomputed_count` are unchanged; the
@@ -210,8 +222,8 @@ Acceptance (the task's tests, re-run at checkpoint):
 | compound arm wall, 1 h x 1000 | at most 0.65x of the Stage 0 median (96.5 ms, of which prefetch is 32.5 ms and unchanged by this decision, so 0.50x of the wall would need the clip to be 76 % of evaluate at 240 samples per series, where the linear walk is a smaller share than at 24 h) | over 0.75x | predicted; Stage 0 split from issue #3072 comment 6253165175 |
 | bare arm wall, each shape | within 5 % of Stage 0 | over 5 % slower | predicted (audit page 3) |
 | `MergedSource::query` calls, compound arm, 24 h / 60 s | 1 per distinct selector (1 for the Stage 0 query), refetches 0 | any more | predicted |
-| `MergedSource::query` calls for `f(x[1h:1m] offset -1h)` over the 24 h grid, and for a plain subquery | at most 2 per distinct selector | more | predicted (the negative-offset subquery is the shape the grid translation does not cover on its own) |
-| difftest, five new Generic range entries: `offset`, negative `offset`, `@ start()`, a subquery argument, a stale marker inside the window | bit-identical to pinned Prometheus | any difference | predicted; today's corpus has three Generic range entries (`corpus/aggregate.txt:144`, `corpus/binop.txt:171`, `corpus/histogram_native.txt:186`) and none of these shapes |
+| `MergedSource::query` calls for `f(x[1h:1m] offset -1h)` over the 24 h grid, and for a plain subquery | at most 2 per distinct selector and channel | more | predicted from the outer-step translation rule in 1b (the negative-offset subquery is the shape a per-inner-instant translation gets wrong) |
+| difftest, six new Generic range entries: `offset`, negative `offset`, `@ start()`, a subquery argument, `@ start()` on a selector inside a subquery argument, a stale marker inside the window | bit-identical to pinned Prometheus | any difference | predicted; today's corpus has three Generic range entries (`corpus/aggregate.txt:144`, `corpus/binop.txt:171`, `corpus/histogram_native.txt:186`) and none of these shapes; the `@ start()`-inside-a-subquery entry is what pins that the translation fields never rebind the `@` anchors |
 | every existing per-step test (`eval.rs:2044`, `:2198`, `:2231`, `:2532`, `:3301`, `binop.rs:1352`, `functions/mod.rs:1564-1810`) | unchanged | any edit beyond the two count assertions below | predicted |
 | `repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget` (`eval.rs:3600`) | still rejects on the shared budget; its `query_count() == 10` becomes the new exact count with the claim restated in the test name | the budget check moves or weakens | predicted |
 
@@ -295,9 +307,10 @@ take-next ownership over the published units. The same wording lives in
 under "SQL over logs" at :4184-4187, which states the `i % n` deal), in
 `mod.rs:9-16` (block units), `mod.rs:182-186` (the held-until-the-pass
 sentence), `mod.rs:1090-1101` (the `segments` and `target_partitions` field
-docs) and `plan.rs:640-666` (the `owned_work` doc); every one is updated in
-the same commit, and `scripts/guards/check-amendment-integrity.sh` pins the
-retired phrase.
+docs), `plan.rs:640-666` (the `owned_work` doc) and `retry_decision`'s doc
+comment (`executor.rs:4738-4745`, which still calls the post-emission branch
+unreachable); every one is updated in the same commit, and
+`scripts/guards/check-amendment-integrity.sh` pins the retired phrase.
 `logs_selective_scan_amplification.rs::plan_carry_peak_bytes_bounded_by_plan_concurrency`
 is rewritten: re-fetches 0, peak intermediate bytes at most the queue
 capacity.
@@ -332,7 +345,7 @@ flowchart LR
 `QueryAccounting`, which every data-object funnel already receives
 (`fetcher.rs`, the `log_fetcher.rs` whole, extent, front-section, block and
 run paths, `span_fetcher.rs`; Context, P5), and is read at `S3Fifo::insert`
-and `get`. `admit_blocks_from_whole` (`log_fetcher.rs:7553`), an insert-only
+and `get`. `admit_blocks_from_whole` (`log_fetcher.rs:7573`), an insert-only
 path with no accounting, takes the intent of the whole-object read it
 splits. The SQL executor sets the intent once per statement after resolve,
 before any segment read: `BulkScan` when the statement is a single metrics
@@ -470,9 +483,10 @@ for P5.
 
 - P1 adds one owned copy of each distinct selector's samples per range
   query, bounded by the prefetched set; the per-step copies it replaces were
-  each that size. The two tests that pin exact source-call counts move with
-  the claim; everything else that pins per-step semantics is unchanged by
-  construction, since the slice feeds the same helpers.
+  each that size. One test's exact source-call count moves with the claim
+  (`eval.rs:3600`); the other exact-count assertions stay at 1 or 0, and
+  everything else that pins per-step semantics is unchanged by construction,
+  since the slice feeds the same helpers.
 - P4 makes the dealt shape nondeterministic across runs and trades the
   `i % n` tests for property tests. The post-emission `SnapshotInvalidated`
   branch becomes reachable and is pinned. The queue is the retention bound;
