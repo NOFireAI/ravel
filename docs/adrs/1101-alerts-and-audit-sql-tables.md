@@ -259,7 +259,11 @@ own tenant and nothing else. It reads no object, runs no query, and takes no
 time window, so it has none of the auth, window, admission, accounting, or
 audit machinery the rejected history endpoint would have duplicated. A
 process that runs no evaluator answers 503 on `/api/v1/alerts`; there is no
-cross-process read.
+cross-process read. A process that does answers the same 503 before its first
+tick for the tenant and whenever its last tick could not read the tenant's
+alert history, rather than serving an earlier tick's list. Nothing in the
+snapshot outlives the tick that produced it: an alert's value is present only
+when that tick evaluated its rule in this process.
 
 This does not reopen the rejected alternative. That endpoint was for alert
 history, every transition over a window, and history stays on the `alerts`

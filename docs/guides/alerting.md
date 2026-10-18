@@ -429,15 +429,20 @@ How to read the response:
 - `health` is `ok` when the last tick ran the rule. It is `err`, with the
   error in `lastError`, when the rule's query failed, or when the tick could
   not read alert history or take the tenant's lease. `lastEvaluation` is the
-  time of that tick.
+  time of that tick, and is present whenever `health` is `ok` or `err`.
 - `state` is `firing` when any alert of the rule is firing, else `pending`
   when any is pending, else `inactive`. The `alerts` array lists those
   alerts, in the same shape as `/api/v1/alerts`. A suppressed alert counts as
   neither.
-- Before the first tick of this process has read the tenant's alert history,
-  `health` and `state` are `unknown` and a rule carries no `alerts` array.
-  The same holds when this process runs no evaluator. On a replica whose
-  peer held the tenant's lease on the last tick, `health` is `unknown`.
+- When the last tick could not read the tenant's alert history, `state` is
+  `unknown` and a rule carries no `alerts` array, while `health` is `err`
+  with that error. This holds for the first tick too.
+- Before this process has finished a tick for the tenant, `health` and
+  `state` are both `unknown`, with no `lastEvaluation` and no `alerts`. The
+  same holds when this process runs no evaluator.
+- On a replica whose peer held the tenant's lease on the last tick, `health`
+  is `unknown` with no `lastEvaluation`. Its `state` and `alerts` come from
+  the alert history that tick read.
 
 ### `GET /api/v1/alerts`
 
@@ -467,16 +472,23 @@ curl -s -H "Authorization: Bearer $RAVEL_TOKEN" \
   alerts are not.
 - `labels.alertname` is set the way the Alertmanager sink sets it. See
   [Notification sinks](#notification-sinks).
-- `activeAt` is the time of the transition into the alert's current state.
-  `value` is the sample that the alert's series matched with on the last
-  tick that ran its query. It is omitted when this process has not run
-  that query while the alert was active.
+- `activeAt` is the time of the transition into the alert's current state,
+  so a firing alert that was pending first shows when it fired. Prometheus
+  keeps the time the alert went pending instead.
+- `value` is the sample that the alert's series matched with on the last
+  tick. For a SQL detection rule it is the number of rows the statement
+  returned. It is present only when this process held the tenant's lease on
+  that tick and ran the rule without error. A replica that did not run the
+  rule omits it rather than show a value from an earlier tick.
 - When this process runs no evaluator (evaluation is disabled, or no tenant
   has rules), the route answers `503` with `errorType` `unavailable`. It
-  answers the same before the first tick has read the tenant's alert
-  history. It does not answer an empty list in either case, because an
-  empty list would say that nothing is firing. A tenant with no rules gets an
-  empty list.
+  answers the same before this process has finished a tick for the tenant,
+  and whenever the last tick could not read the tenant's alert history,
+  until a later tick reads it. It does not answer an empty list in these
+  cases, because an empty list would say that nothing is firing, and it does
+  not serve an earlier tick's list, which may no longer be current. A tenant
+  with no rules gets an empty list, but only from a process where some
+  tenant has rules and an evaluator runs. Otherwise it gets the first `503`.
 - A process serves only what its own evaluator published, and a process
   that runs no evaluator does not ask one that does. A replica whose peer
   holds the tenant's lease still ticks: it lists the alerts its tick read

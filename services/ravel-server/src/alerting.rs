@@ -442,8 +442,8 @@ pub struct TenantAlertSnapshot {
     pub rule_health: HashMap<String, RuleHealth>,
     /// The pending and firing alerts of the configured rules, from the tick's
     /// folded alert history, sorted by rule id then labels. Suppressed and
-    /// resolved alerts are left out. `None` when no tick of this process has
-    /// read the history yet.
+    /// resolved alerts are left out. `None` when this tick could not read the
+    /// history: an earlier tick's list is not carried forward.
     pub alerts: Option<Vec<PublishedAlert>>,
 }
 
@@ -472,9 +472,10 @@ pub struct PublishedAlert {
     pub state: AlertState,
     /// The `ts_ns` of the record that moved the alert into `state`.
     pub active_at_ns: i64,
-    /// The sample value the alert's series matched with, from this tick's
-    /// query, else from the last snapshot that had one. `None` when no tick
-    /// of this process has run the rule's query while the alert was active.
+    /// The sample value the alert's series matched with on this tick, or the
+    /// row count for a [`RuleCondition::NonEmptyResult`] rule. `None` unless
+    /// this process held the lease on this tick and evaluated the alert's rule
+    /// without error, so a value never outlives the tick that produced it.
     pub value: Option<f64>,
 }
 
@@ -1151,14 +1152,13 @@ impl AlertEvaluator {
 
     /// Build this tick's snapshot from what it observed and publish it.
     ///
-    /// A tick that could not read history keeps the alerts the previous
-    /// snapshot held, since it learned nothing new about them. A value this
-    /// tick's queries did not produce is carried from the previous snapshot.
+    /// Nothing is carried from an earlier snapshot. A tick that could not read
+    /// history publishes no alert list, and an alert carries a value only when
+    /// this tick evaluated its rule without error.
     fn publish_tick(&self, now_ns: i64, report: &AlertEvalReport, observed: TickObservation) {
-        let Some(slot) = self.published.slot(&self.tenant) else {
+        if self.published.slot(&self.tenant).is_none() {
             return;
-        };
-        let previous = slot.read().clone();
+        }
         let outcome = report.outcome();
         let tick_error = observed.tick_error.unwrap_or_default();
         let rule_health = self
@@ -1178,25 +1178,16 @@ impl AlertEvaluator {
                 (rule.rule_id.clone(), health)
             })
             .collect();
-        let previous_alerts = previous.as_ref().and_then(|p| p.alerts.as_ref());
-        let alerts = match observed.alerts {
-            Some(mut alerts) => {
-                let previous_values: HashMap<AlertId, f64> = previous_alerts
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|a| a.value.map(|v| (a.alert_id, v)))
-                    .collect();
-                for alert in &mut alerts {
-                    alert.value = observed
-                        .values
-                        .get(&alert.alert_id)
-                        .or_else(|| previous_values.get(&alert.alert_id))
-                        .copied();
-                }
-                Some(alerts)
+        let alerts = observed.alerts.map(|mut alerts| {
+            for alert in &mut alerts {
+                alert.value = if observed.rule_errors.contains_key(&alert.rule_id) {
+                    None
+                } else {
+                    observed.values.get(&alert.alert_id).copied()
+                };
             }
-            None => previous_alerts.cloned(),
-        };
+            alerts
+        });
         self.published.publish(
             &self.tenant,
             TenantAlertSnapshot {
@@ -7977,6 +7968,508 @@ mod tick_tests {
                 Some(SpawnError::ZeroEvalInterval)
             ),
             "expected ZeroEvalInterval, got: {err:#}"
+        );
+    }
+
+    // --- Published state (issue #2665) ---------------------------------------
+    //
+    // What each tick outcome leaves in the tenant's published snapshot, read
+    // back as the snapshot and through the routes that render it.
+
+    const API_TOKEN: &str = "acme-token";
+    /// `NOW_NS` as the routes render it.
+    const NOW_RFC3339: &str = "1970-01-01T00:30:00.000000000Z";
+
+    /// [`threshold_rule`] for [`TENANT`]: the rule set the routes render.
+    fn route_rules() -> Arc<HashMap<TenantHash, Vec<Rule>>> {
+        Arc::new(HashMap::from([(
+            TenantId::new(TENANT).hash(),
+            vec![threshold_rule()],
+        )]))
+    }
+
+    /// A handle with one empty slot for [`TENANT`], as `spawn`'s caller builds
+    /// it.
+    fn tenant_published() -> PublishedAlerts {
+        PublishedAlerts::for_config(&AlertEvalConfig {
+            enabled: true,
+            rules: route_rules(),
+            ..AlertEvalConfig::default()
+        })
+    }
+
+    /// The snapshot [`TENANT`]'s last tick published into `published`.
+    fn snapshot(published: &PublishedAlerts) -> Arc<TenantAlertSnapshot> {
+        match published.read(&TenantId::new(TENANT).hash()) {
+            PublishedRead::Published(snapshot) => snapshot,
+            other => panic!("expected a published snapshot, got {other:?}"),
+        }
+    }
+
+    /// `route` as the alerts API serves it from `published` to [`TENANT`].
+    async fn serve(published: &PublishedAlerts, route: &str) -> (u16, serde_json::Value) {
+        use tower::ServiceExt;
+
+        let tokens = HashMap::from([(API_TOKEN.to_string(), TenantId::new(TENANT))]);
+        let state = crate::alerts_api::AlertRulesState {
+            rules: route_rules(),
+            tenant_resolver: Arc::new(ravel_query::http::StaticBearerTokenResolver::new(tokens)),
+            eval_interval: DEFAULT_ALERT_EVAL_INTERVAL,
+            published: published.clone(),
+        };
+        let request = axum::http::Request::builder()
+            .uri(route)
+            .header("authorization", format!("Bearer {API_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let response = crate::alerts_api::router(state)
+            .oneshot(request)
+            .await
+            .expect("route the request");
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("read body");
+        (status, serde_json::from_slice(&bytes).expect("JSON body"))
+    }
+
+    /// The one rule `/api/v1/rules` renders from `published`.
+    async fn served_rule(published: &PublishedAlerts) -> serde_json::Value {
+        let (status, body) = serve(published, crate::alerts_api::RULES_ROUTE).await;
+        assert_eq!(status, 200);
+        body["data"]["groups"][0]["rules"][0].clone()
+    }
+
+    /// The `lastError` of `rule`, asserting it is an `err` rule with a
+    /// `lastEvaluation`.
+    fn served_error(rule: &serde_json::Value) -> &str {
+        assert_eq!(rule["health"], "err", "{rule}");
+        assert!(rule["lastEvaluation"].is_string(), "{rule}");
+        rule["lastError"].as_str().expect("lastError")
+    }
+
+    fn health_of(snapshot: &TenantAlertSnapshot) -> &RuleHealth {
+        snapshot
+            .rule_health
+            .get(&threshold_rule().rule_id)
+            .expect("the rule's health")
+    }
+
+    /// The lease holder renders `ok` health with the value it matched; a
+    /// replica whose peer holds the lease renders `unknown` health with no
+    /// `lastEvaluation`, and still serves the alert, read from history, with no
+    /// `value`, since it evaluated nothing.
+    #[tokio::test]
+    async fn a_follower_serves_alerts_from_history_with_unknown_health_and_no_value() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let holder_view = tenant_published();
+        let follower_view = tenant_published();
+        let mut a =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_published(holder_view.clone());
+        let mut b =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_published(follower_view.clone());
+
+        assert_eq!(a.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(b.run_tick().await.outcome(), AlertTickOutcome::LeaseNotHeld);
+
+        let held = snapshot(&holder_view);
+        assert_eq!(health_of(&held), &RuleHealth::Ok);
+        let held_alerts = held.alerts.clone().expect("the holder read history");
+        assert_eq!(held_alerts.len(), 1);
+        assert_eq!(
+            (
+                held_alerts[0].state,
+                held_alerts[0].active_at_ns,
+                held_alerts[0].value
+            ),
+            (AlertState::Firing, NOW_NS, Some(1.0))
+        );
+        let rule = served_rule(&holder_view).await;
+        assert_eq!(rule["health"], "ok");
+        assert_eq!(rule["lastEvaluation"], NOW_RFC3339);
+        assert_eq!(rule["alerts"][0]["value"], "1");
+
+        let followed = snapshot(&follower_view);
+        assert_eq!(health_of(&followed), &RuleHealth::Unknown);
+        assert_eq!(
+            followed.alerts,
+            Some(vec![PublishedAlert {
+                value: None,
+                ..held_alerts[0].clone()
+            }]),
+            "the follower lists the alert it read from history, without a value"
+        );
+
+        let rule = served_rule(&follower_view).await;
+        assert_eq!(rule["health"], "unknown");
+        assert!(rule.get("lastEvaluation").is_none(), "{rule}");
+        assert!(rule.get("lastError").is_none(), "{rule}");
+        assert_eq!(rule["state"], "firing");
+        let alert = rule["alerts"][0].clone();
+        assert_eq!(alert["state"], "firing");
+        assert_eq!(alert["activeAt"], NOW_RFC3339);
+        assert!(alert.get("value").is_none(), "{alert}");
+
+        let (status, body) = serve(&follower_view, crate::alerts_api::ALERTS_ROUTE).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["alerts"], serde_json::json!([alert]));
+    }
+
+    /// Replica `a` evaluates, then `b` takes the lease over once `a`'s expires.
+    /// Returns both, with `a` publishing into the returned handle and the clock
+    /// at the takeover tick.
+    async fn handover() -> (
+        Arc<dyn ObjectStoreBackend>,
+        Arc<TestClock>,
+        AlertEvaluator,
+        AlertEvaluator,
+        PublishedAlerts,
+    ) {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let a_view = tenant_published();
+        let mut a =
+            evaluator(Arc::clone(&store), Arc::clone(&clock)).with_published(a_view.clone());
+        let mut b = evaluator(Arc::clone(&store), Arc::clone(&clock));
+
+        assert_eq!(a.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+        let alerts = snapshot(&a_view).alerts.clone().expect("history read");
+        assert_eq!(
+            alerts[0].value,
+            Some(1.0),
+            "a published the value it matched"
+        );
+
+        clock.set(
+            NOW_NS
+                + i64::from(LEASE_TTL_TICKS) * DEFAULT_ALERT_EVAL_INTERVAL.as_nanos() as i64
+                + NS_PER_SEC,
+        );
+        assert_eq!(
+            b.run_tick().await.outcome(),
+            AlertTickOutcome::Evaluated,
+            "b takes over a's expired lease"
+        );
+        (store, clock, a, b, a_view)
+    }
+
+    /// After a lease handover the former holder's next tick is a follower's:
+    /// its alert loses the value its own earlier tick published, rather than
+    /// carrying a reading from before the handover forward.
+    #[tokio::test]
+    async fn a_former_lease_holder_stops_serving_the_value_it_matched() {
+        let (_store, clock, mut a, _b, a_view) = handover().await;
+
+        clock.advance(NS_PER_SEC);
+        assert_eq!(a.run_tick().await.outcome(), AlertTickOutcome::LeaseNotHeld);
+
+        let published = snapshot(&a_view);
+        assert_eq!(health_of(&published), &RuleHealth::Unknown);
+        let alerts = published.alerts.clone().expect("history read");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            (alerts[0].state, alerts[0].active_at_ns, alerts[0].value),
+            (AlertState::Firing, NOW_NS, None)
+        );
+        let rule = served_rule(&a_view).await;
+        assert!(rule["alerts"][0].get("value").is_none(), "{rule}");
+    }
+
+    /// The new lease holder resolves the alert and fires it again, a new
+    /// episode under the same alert id. The former holder, now a follower,
+    /// serves the new episode's `activeAt` and no value: the value it matched
+    /// in the earlier episode is not this episode's.
+    #[tokio::test]
+    async fn a_follower_serves_a_new_episode_without_the_old_episodes_value() {
+        let (store, clock, mut a, b, a_view) = handover().await;
+        let takeover_ns = clock.now_ns();
+
+        let records = read_alert_records(store.as_ref(), TenantId::new(TENANT).hash()).await;
+        assert_eq!(records.len(), 1, "a's one firing transition");
+        let firing = records[0].clone();
+        assert_eq!(firing.state, AlertState::Firing);
+        let resolved = AlertRecord {
+            state: AlertState::Resolved,
+            ts_ns: takeover_ns + NS_PER_SEC,
+            ..firing.clone()
+        };
+        let refired = AlertRecord {
+            state: AlertState::Firing,
+            ts_ns: takeover_ns + 2 * NS_PER_SEC,
+            generation: firing.generation + 1,
+            ..firing.clone()
+        };
+        seed_alert_history(&b, &[resolved, refired]).await;
+
+        clock.set(takeover_ns + 3 * NS_PER_SEC);
+        assert_eq!(a.run_tick().await.outcome(), AlertTickOutcome::LeaseNotHeld);
+
+        let alerts = snapshot(&a_view).alerts.clone().expect("history read");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].alert_id, firing.alert_id);
+        assert_eq!(
+            (alerts[0].state, alerts[0].active_at_ns, alerts[0].value),
+            (AlertState::Firing, takeover_ns + 2 * NS_PER_SEC, None)
+        );
+    }
+
+    /// A rule whose query fails on a tick renders `err` with that error, and
+    /// its still-firing alert is served without a value: the tick produced
+    /// none, and the previous tick's is not carried forward.
+    #[tokio::test]
+    async fn a_failing_rule_serves_its_alert_without_a_value() {
+        let store = seeded_store().await;
+        let clock = TestClock::at(NOW_NS);
+        let view = tenant_published();
+        let mut ev = evaluator(store, Arc::clone(&clock)).with_published(view.clone());
+        assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+        let alerts = snapshot(&view).alerts.clone().expect("history read");
+        assert_eq!(alerts[0].value, Some(1.0));
+
+        // A range-vector result is refused before the condition runs.
+        ev.rules = vec![Rule {
+            query: RuleQuery::Promql(format!("{METRIC}[5m]")),
+            ..threshold_rule()
+        }];
+        clock.advance(60 * NS_PER_SEC);
+        let report = ev.run_tick().await;
+        assert_eq!(report.outcome(), AlertTickOutcome::Evaluated);
+        assert_eq!(report.rules_failed, 1);
+
+        let published = snapshot(&view);
+        assert!(
+            matches!(health_of(&published), RuleHealth::Err(err) if !err.is_empty()),
+            "{:?}",
+            published.rule_health
+        );
+        let alerts = published.alerts.clone().expect("history read");
+        assert_eq!(
+            (alerts[0].state, alerts[0].value),
+            (AlertState::Firing, None)
+        );
+        let rule = served_rule(&view).await;
+        assert!(!served_error(&rule).is_empty());
+        assert_eq!(rule["state"], "firing");
+        assert!(rule["alerts"][0].get("value").is_none(), "{rule}");
+    }
+
+    /// A fault plan failing every LIST of `tenant`'s alert commit prefix, which
+    /// is the read every tick's history fold starts with.
+    fn history_list_fault(tenant: &TenantHash) -> FaultPlan {
+        let prefix =
+            keys::commit_shard_prefix(tenant, Signal::Alerts, ALERT_SHARD).expect("prefix");
+        FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::List,
+                ScriptedFault::Transient("alert history listing unavailable".into()),
+            )
+            .with_key_contains(prefix)
+            .with_occurrence(Occurrence::Always),
+        )
+    }
+
+    /// A first tick that cannot read history publishes a snapshot: `health`
+    /// is `err`, with the history error and `lastEvaluation`, while `state`
+    /// is `unknown` with no `alerts`, and `/api/v1/alerts` answers 503.
+    #[tokio::test]
+    async fn a_first_tick_that_cannot_read_history_renders_err_health_and_unknown_state() {
+        let tenant = TenantId::new(TENANT).hash();
+        let fault = Arc::new(FaultStore::new(
+            seeded_store().await,
+            history_list_fault(&tenant),
+        ));
+        let broken: Arc<dyn ObjectStoreBackend> = fault.clone();
+        let view = tenant_published();
+        let mut ev = evaluator(broken, TestClock::at(NOW_NS)).with_published(view.clone());
+
+        assert_eq!(
+            ev.run_tick().await.outcome(),
+            AlertTickOutcome::HistoryUnavailable
+        );
+        assert!(fault.fault_count(Op::List, FaultKind::Transient) >= 1);
+
+        let published = snapshot(&view);
+        assert!(published.alerts.is_none());
+        assert!(
+            matches!(health_of(&published), RuleHealth::Err(err)
+                if err.starts_with("alert history unreadable:")),
+            "{:?}",
+            published.rule_health
+        );
+
+        let rule = served_rule(&view).await;
+        assert!(served_error(&rule).starts_with("alert history unreadable:"));
+        assert_eq!(rule["lastEvaluation"], NOW_RFC3339);
+        assert_eq!(rule["state"], crate::alerts_api::STATE_UNKNOWN);
+        assert!(rule.get("alerts").is_none(), "{rule}");
+
+        let (status, body) = serve(&view, crate::alerts_api::ALERTS_ROUTE).await;
+        assert_eq!(status, 503);
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "status": "error",
+                "errorType": "unavailable",
+                "error": crate::alerts_api::HISTORY_UNREADABLE,
+            })
+        );
+    }
+
+    /// After a tick that read history, a tick that cannot withdraws the alert
+    /// list: `/api/v1/alerts` answers 503 rather than serving the earlier
+    /// tick's list, until a later tick reads history again.
+    #[tokio::test]
+    async fn a_history_read_failure_withdraws_the_alert_list_until_a_tick_reads_it() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let view = tenant_published();
+        let mut ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_published(view.clone());
+        let alerts_route = crate::alerts_api::ALERTS_ROUTE;
+
+        assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["alerts"][0]["state"], "firing");
+
+        let fault = Arc::new(FaultStore::new(
+            Arc::clone(&store),
+            history_list_fault(&tenant),
+        ));
+        ev.store = fault.clone();
+        clock.advance(60 * NS_PER_SEC);
+        assert_eq!(
+            ev.run_tick().await.outcome(),
+            AlertTickOutcome::HistoryUnavailable
+        );
+        assert!(fault.fault_count(Op::List, FaultKind::Transient) >= 1);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(status, 503, "{body}");
+        assert_eq!(body["error"], crate::alerts_api::HISTORY_UNREADABLE);
+        let rule = served_rule(&view).await;
+        assert!(served_error(&rule).starts_with("alert history unreadable:"));
+        assert_eq!(rule["state"], crate::alerts_api::STATE_UNKNOWN);
+
+        ev.store = Arc::clone(&store);
+        clock.advance(60 * NS_PER_SEC);
+        assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+        let (status, body) = serve(&view, alerts_route).await;
+        assert_eq!(status, 200, "{body}");
+        let alerts = body["data"]["alerts"].as_array().expect("alerts");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0]["state"], "firing");
+        assert_eq!(alerts[0]["activeAt"], NOW_RFC3339);
+        assert_eq!(alerts[0]["value"], "1");
+    }
+
+    /// A tick that read history but could not take the lease renders `err`
+    /// with the lease error, and serves the alerts it read, without a value
+    /// since it evaluated nothing.
+    #[tokio::test]
+    async fn a_lease_unavailable_tick_renders_err_health_over_the_history_it_read() {
+        let store = seeded_store().await;
+        let tenant = TenantId::new(TENANT).hash();
+        let clock = TestClock::at(NOW_NS);
+        let view = tenant_published();
+        let mut ev = evaluator(Arc::clone(&store), Arc::clone(&clock)).with_published(view.clone());
+        assert_eq!(ev.run_tick().await.outcome(), AlertTickOutcome::Evaluated);
+
+        let plan = FaultPlan::empty().with_rule(
+            FaultRule::new(
+                Op::Put,
+                ScriptedFault::Transient("alert lease write unavailable".into()),
+            )
+            .with_key_contains(alert_lease_key(&tenant))
+            .with_occurrence(Occurrence::Always),
+        );
+        let fault = Arc::new(FaultStore::new(Arc::clone(&store), plan));
+        ev.store = fault.clone();
+        clock.advance(60 * NS_PER_SEC);
+        assert_eq!(
+            ev.run_tick().await.outcome(),
+            AlertTickOutcome::LeaseUnavailable
+        );
+        assert!(fault.fault_count(Op::Put, FaultKind::Transient) >= 1);
+
+        let published = snapshot(&view);
+        assert!(
+            matches!(health_of(&published), RuleHealth::Err(err)
+                if err.starts_with("alert lease unavailable:")),
+            "{:?}",
+            published.rule_health
+        );
+        let alerts = published.alerts.clone().expect("history read");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            (alerts[0].state, alerts[0].active_at_ns, alerts[0].value),
+            (AlertState::Firing, NOW_NS, None)
+        );
+
+        let rule = served_rule(&view).await;
+        assert!(served_error(&rule).starts_with("alert lease unavailable:"));
+        assert_eq!(rule["state"], "firing");
+        let (status, body) = serve(&view, crate::alerts_api::ALERTS_ROUTE).await;
+        assert_eq!(status, 200, "{body}");
+        assert!(body["data"]["alerts"][0].get("value").is_none(), "{body}");
+    }
+
+    /// The evaluator task [`spawn`] starts publishes into the handle it was
+    /// given, which is the handle the routes read. Time is paused, so the
+    /// loop's jittered interval elapses on tokio's clock with no real sleep.
+    #[tokio::test(start_paused = true)]
+    async fn the_spawned_evaluator_publishes_into_the_handle_it_was_given() {
+        let store = seeded_store().await;
+        let catalog =
+            Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+        let engine = QueryEngine::new(catalog, Arc::clone(&store), EngineConfig::default());
+        let engines = AlertQueryEngines {
+            promql: Arc::new(engine),
+            #[cfg(feature = "sql")]
+            sql: None,
+        };
+        let interval = Duration::from_secs(60);
+        let config = AlertEvalConfig {
+            enabled: true,
+            interval,
+            rules: route_rules(),
+            ..AlertEvalConfig::default()
+        };
+        let published = PublishedAlerts::for_config(&config);
+        let tenant = TenantId::new(TENANT).hash();
+        let tasks = spawn(
+            store,
+            engines,
+            TestClock::at(NOW_NS),
+            config,
+            published.clone(),
+        )
+        .expect("spawn");
+        assert!(matches!(
+            published.read(&tenant),
+            PublishedRead::NotYetEvaluated
+        ));
+
+        // The first tick runs after one jittered interval, at most 1.1 of it.
+        let mut intervals = 0;
+        while matches!(published.read(&tenant), PublishedRead::NotYetEvaluated) {
+            assert!(
+                intervals < 5,
+                "no tick published into the handle after {intervals} intervals"
+            );
+            tokio::time::sleep(interval).await;
+            intervals += 1;
+        }
+        tasks.shutdown().await;
+
+        let published = snapshot(&published);
+        assert_eq!(published.evaluated_at_ns, NOW_NS);
+        assert_eq!(health_of(&published), &RuleHealth::Ok);
+        let alerts = published.alerts.clone().expect("history read");
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(
+            (alerts[0].state, alerts[0].value),
+            (AlertState::Firing, Some(1.0))
         );
     }
 
