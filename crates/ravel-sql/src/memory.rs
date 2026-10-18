@@ -41,7 +41,7 @@ use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
-use ravel_memory::{MemoryBudget, MemoryExhausted};
+use ravel_memory::{ExhaustionCause, MemoryBudget, MemoryExhausted};
 use ravel_types::accounting::QueryAccounting;
 
 /// A one-shot per-query abort flag for the best-effort memory ceiling.
@@ -566,15 +566,26 @@ impl TenantDelegatingPool {
                 GrowRefused::Process {
                     exhausted,
                     tenant_held,
-                } => format!(
-                    "process memory budget exhausted: {additional} more bytes on top of {} \
-                     already reserved exceeds process limit {} (tenant reserved {} of \
-                     tenant limit {})",
-                    exhausted.reserved,
-                    exhausted.limit,
-                    tenant_held,
-                    self.tenant.limit()
-                ),
+                } => match exhausted.cause {
+                    ExhaustionCause::Accounted => format!(
+                        "process memory budget exhausted: {additional} more bytes on top of {} \
+                         already reserved exceeds process limit {} (tenant reserved {} of \
+                         tenant limit {})",
+                        exhausted.reserved,
+                        exhausted.limit,
+                        tenant_held,
+                        self.tenant.limit()
+                    ),
+                    // The ledger is usually far from its limit when the gate
+                    // closes, so the accounted figures would misname the cause.
+                    // The wording matches `MemoryExhausted`'s Display.
+                    ExhaustionCause::HostMemory { available, floor } => format!(
+                        "host memory gate refused the reservation: host available memory \
+                         {available} bytes is below the {floor} byte floor (requested \
+                         {additional}; tenant reserved {tenant_held} of tenant limit {})",
+                        self.tenant.limit()
+                    ),
+                },
             };
             return Err(DataFusionError::ResourcesExhausted(message));
         }
@@ -1128,6 +1139,50 @@ mod tests {
             breach,
             QueryAccounting::new(),
         ))
+    }
+
+    /// ADR-3072 decision 3c (#2990): a refusal by the host memory gate names
+    /// the gate and its figures, not the accounted process limit the ledger is
+    /// nowhere near, and rolls back the tenant and query charges exactly as an
+    /// accounted process refusal does.
+    #[test]
+    fn a_host_gate_refusal_names_the_gate_and_its_figures() {
+        let budget = Arc::new(MemoryBudget::new(1 << 20));
+        budget.set_host_memory_gate(false, 1_000, 4_000);
+        let tenant = TenantMemoryAccountant::with_process_budget(600, Arc::clone(&budget));
+        let pool = pool_over(Arc::clone(&tenant), CeilingBreach::new());
+        let res = MemoryConsumer::new("tenant").register(&pool);
+
+        let err = res
+            .try_grow(500)
+            .expect_err("a closed host gate refuses any nonzero reservation");
+        let DataFusionError::ResourcesExhausted(message) = &err else {
+            panic!("a gate refusal must stay a ResourcesExhausted; got {err:?}");
+        };
+        assert_eq!(
+            message,
+            "host memory gate refused the reservation: host available memory 1000 bytes \
+             is below the 4000 byte floor (requested 500; tenant reserved 500 of tenant \
+             limit 600)"
+        );
+        assert!(
+            !message.contains("exceeds process limit"),
+            "the accounted limit is not the reason for a gate refusal: {message}"
+        );
+        assert_eq!(budget.gate_refusals(), 1, "the gate counted the refusal");
+        assert_eq!(budget.accounted_refusals(), 0);
+
+        assert_eq!(
+            tenant.reserved(),
+            0,
+            "the refused tenant charge is rolled back"
+        );
+        assert_eq!(
+            pool.reserved(),
+            0,
+            "the refused query charge is rolled back"
+        );
+        assert_eq!(budget.reserved(), 0, "a gate refusal reserves nothing");
     }
 
     /// ADR-1170 decision 1: two tenants over ONE process budget. B's 50 bytes
