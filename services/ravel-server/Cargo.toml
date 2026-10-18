@@ -334,6 +334,10 @@ ravel-logseg = { workspace = true, features = ["test-support"] }
 # dependency that owns the `unsafe impl GlobalAlloc`, at the version ravel-otlp
 # and ravel-sql already use.
 stats_alloc = "0.1.10"
+# Test-only: tests/ipcrypt_store_scan_e2e.rs decompresses every zstd frame in
+# every stored object, so the scan for a raw address reads section bodies,
+# not their compressed form. Already in the lockfile through ravel-segment.
+zstd = { workspace = true }
 
 [lints]
 workspace = true
