@@ -469,12 +469,20 @@ the tenant:
   when the rule's query, condition or write failed, or when the tick could
   not read alert history or take the tenant's lease. `lastEvaluation` is the
   tick's clock reading, in RFC 3339.
+- `lastError` for a failed query is the message the PromQL or SQL query
+  endpoint returns for the same failure: a PromQL parse error keeps its own
+  text, and a storage fault reads as a fixed message such as `upstream
+  storage temporarily unavailable`. A history read failure reads `alert
+  history unreadable`, a lease failure `alert lease unavailable`, and a
+  failed record write `alert record write failed`. No `lastError` carries an
+  object key, the tenant hash or the storage backend's own error text; the
+  full error goes to the server log.
 - `state` is `firing` when any of the rule's alerts is firing, else
   `pending` when any is pending, else `inactive`. The `alerts` array lists
   those alerts in the `/api/v1/alerts` shape.
 - When the last tick could not read the tenant's alert history, the first
   tick included, `state` is `unknown` and there is no `alerts` array, while
-  `health` is `err` with that error.
+  `health` is `err` with `lastError` `alert history unreadable`.
 - Before this process has finished a tick for the tenant, and in a process
   that runs no evaluator, `health` and `state` are both `unknown`, with no
   `lastEvaluation` and no `alerts` array. The same holds when the tenant's
