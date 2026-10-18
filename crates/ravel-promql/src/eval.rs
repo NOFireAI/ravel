@@ -3503,6 +3503,7 @@ mod tests {
     struct CountingSource {
         inner: TestSource,
         queries: std::sync::atomic::AtomicUsize,
+        hist_queries: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingSource {
@@ -3510,11 +3511,16 @@ mod tests {
             CountingSource {
                 inner,
                 queries: std::sync::atomic::AtomicUsize::new(0),
+                hist_queries: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn query_count(&self) -> usize {
             self.queries.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn hist_query_count(&self) -> usize {
+            self.hist_queries.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -3527,6 +3533,16 @@ mod tests {
             self.queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.query(matchers, window)
+        }
+
+        fn query_histograms(
+            &self,
+            matchers: &[LabelMatcher],
+            window: TimeRange,
+        ) -> Result<Vec<crate::source::HistogramSeriesData>, SourceError> {
+            self.hist_queries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.query_histograms(matchers, window)
         }
     }
 
@@ -3723,6 +3739,258 @@ mod tests {
             "the selector cache must answer all ten charged inner steps from \
              one storage read"
         );
+    }
+
+    /// Run `query` as a range query and return the matrix plus the selector
+    /// cache's `(fetches, refetches)`.
+    fn range_with_fetch_counts(
+        evaluator: &Evaluator,
+        source: &dyn crate::source::SeriesSource,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> (RangeValue, Annotations, (u64, u64)) {
+        let (value, ctx) = evaluator
+            .eval_range_in_window(source, query, start_ms, end_ms, step_ms)
+            .unwrap_or_else(|e| panic!("{query} must evaluate: {e:?}"));
+        let counts = ctx.selector_fetch_counts();
+        (value, ctx.annotations.into_inner(), counts)
+    }
+
+    fn counting_cache_source() -> CountingSource {
+        let mut floats = Vec::new();
+        let mut i = 0_i64;
+        while i <= 25 * 60 {
+            floats.push((minutes(i) * NS_PER_MS, i as f64));
+            i += 1;
+        }
+        CountingSource::new(
+            TestSource::new()
+                .with_series(&[("__name__", "m"), ("a", "x")], &floats)
+                .expect("valid series")
+                .with_series(&[("__name__", "up")], &floats)
+                .expect("valid series")
+                .with_histogram_series(
+                    &[("__name__", "m"), ("a", "h")],
+                    &[(0, nh(1.0, 2.0)), (minutes(600) * NS_PER_MS, nh(5.0, 9.0))],
+                )
+                .expect("valid histogram series"),
+        )
+    }
+
+    #[test]
+    fn generic_range_fetches_each_selector_once_over_the_grid() {
+        let day_ms = minutes(24 * 60);
+        let step_ms = minutes(1);
+        let evaluator = Evaluator::new();
+
+        // Today's per-step evaluation, for the figure the cache replaces:
+        // one float and one histogram read per grid step, 1441 steps.
+        let source = counting_cache_source();
+        let uncached = Evaluator::new().without_selector_cache();
+        let (_, _, counts) = range_with_fetch_counts(
+            &uncached,
+            &source,
+            "sum by (a) (rate(m[5m]))",
+            0,
+            day_ms,
+            step_ms,
+        );
+        assert_eq!(counts, (0, 0));
+        assert_eq!(source.query_count(), 1441);
+        assert_eq!(source.hist_query_count(), 1441);
+
+        for (query, per_channel, refetches) in [
+            ("sum by (a) (rate(m[5m]))", 1, 0),
+            ("up + up offset 5m", 2, 0),
+            ("sum(m @ start())", 1, 0),
+            ("sum(m offset -1h)", 1, 0),
+        ] {
+            let source = counting_cache_source();
+            let (_, _, counts) =
+                range_with_fetch_counts(&evaluator, &source, query, 0, day_ms, step_ms);
+            assert_eq!(
+                (source.query_count(), source.hist_query_count()),
+                (per_channel, per_channel),
+                "{query}: source reads per channel"
+            );
+            assert_eq!(
+                counts,
+                (2 * per_channel as u64, refetches),
+                "{query}: cache (fetches, refetches)"
+            );
+        }
+    }
+
+    /// The exact bits of a range result: series order, labels, timestamps,
+    /// float bit patterns, and every histogram field, floats as bits.
+    fn range_value_bits(value: &RangeValue) -> Vec<String> {
+        fn hist_bits(h: &crate::histogram::FloatHistogram) -> String {
+            let bits = |v: &[f64]| v.iter().map(|f| f.to_bits()).collect::<Vec<_>>();
+            format!(
+                "{:?} {} {} {} {} {} {:?} {:?} {:?} {:?} {:?}",
+                h.counter_reset_hint,
+                h.scale,
+                h.zero_threshold.to_bits(),
+                h.zero_count.to_bits(),
+                h.count.to_bits(),
+                h.sum.to_bits(),
+                h.positive_spans,
+                h.negative_spans,
+                bits(&h.positive_buckets),
+                bits(&h.negative_buckets),
+                bits(&h.custom_values),
+            )
+        }
+        match value {
+            RangeValue::Scalar(v) => vec![format!("scalar {}", v.to_bits())],
+            RangeValue::String(s) => vec![format!("string {s}")],
+            RangeValue::Matrix(m) => m
+                .iter()
+                .map(|(labels, samples)| {
+                    let points: Vec<String> = samples
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{}:{}:{}",
+                                s.ts_ns,
+                                s.value.to_bits(),
+                                s.histogram.as_ref().map(hist_bits).unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    format!("{labels:?} {}", points.join(","))
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn generic_range_results_are_bit_identical_to_per_step_evaluation() {
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let s = |m: i64, sec: i64| (m * 60 + sec) * 1_000 * NS_PER_MS;
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        let mut h = Vec::new();
+        for i in 0..(150 * 2) {
+            let ts = s(0, i * 30);
+            // A counter with a reset at 70m, so rate() sees one.
+            let v = if i < 140 { i as f64 } else { (i - 140) as f64 };
+            x.push((ts, v));
+        }
+        for i in 0..(150 * 60 / 45) {
+            y.push((s(0, i * 45), i as f64 * 1.5));
+        }
+        for i in 0..150 {
+            h.push((s(i, 0), nh(i as f64 + 1.0, 2.0 * i as f64)));
+        }
+        // Stale markers inside the grid, and a run of them.
+        x.push((s(40, 0), stale));
+        x.push((s(40, 15), stale));
+        y.push((s(61, 10), stale));
+        // Two samples at one timestamp, resolved by the bit-pattern
+        // tiebreak.
+        x.push((s(50, 5), 7.0));
+        x.push((s(50, 5), 9.0));
+        // Signed zero and a NaN payload that is not the stale marker.
+        y.push((s(55, 20), -0.0));
+        y.push((s(56, 20), f64::from_bits(0x7ff8_0000_0000_00ab)));
+        let source = TestSource::new()
+            .with_series(&[("__name__", "m"), ("a", "x")], &x)
+            .expect("valid series")
+            .with_series(&[("__name__", "m"), ("a", "y")], &y)
+            .expect("valid series")
+            .with_histogram_series(&[("__name__", "h"), ("a", "x")], &h)
+            .expect("valid histogram series");
+
+        let queries = [
+            "sum by (a) (rate(m[5m]))",
+            "sum(m)",
+            "m + m offset 5m",
+            "m * on(a) group_left m offset -7m",
+            "sum(m offset -10m)",
+            "sum(m @ start())",
+            "sum(m @ end())",
+            "sum(rate(m[5m] @ end()))",
+            "sum(max_over_time(m[10m:1m]))",
+            "sum(max_over_time(m[10m:1m] offset -5m))",
+            "sum(max_over_time((m @ start())[10m:1m]))",
+            "sum by (a) (count_over_time(m[1m]))",
+            "sum(h)",
+            "sum(rate(h[5m]))",
+            "h offset 3m",
+            "histogram_quantile(0.9, sum(rate(h[5m])))",
+            "histogram_count(sum(rate(h[5m])))",
+            "predict_linear(m[10m], scalar(sum(m)))",
+            "clamp_max(m, scalar(max(m offset 1m)))",
+            "absent_over_time(m[1m])",
+            "absent_over_time(nope[1m])",
+            "max_over_time(m[1h:1m] offset -1h)",
+            "max_over_time(sum(m)[10m:1m])",
+            "rate(m[5m])",
+            "m",
+        ];
+        let cached = Evaluator::new();
+        let uncached = Evaluator::new().without_selector_cache();
+        // An aligned grid lands every matrix window start on a sample; the
+        // 37 s grid lands them between samples.
+        for (start, end, step) in [
+            (minutes(30), minutes(90), minutes(1)),
+            (minutes(30), minutes(90), 37_000),
+        ] {
+            for query in queries {
+                let (want, want_annotations, uncached_counts) =
+                    range_with_fetch_counts(&uncached, &source, query, start, end, step);
+                let (got, got_annotations, cached_counts) =
+                    range_with_fetch_counts(&cached, &source, query, start, end, step);
+                assert_eq!(uncached_counts, (0, 0), "{query}: reference is uncached");
+                // The bare selector and the bare range function fetch once
+                // in their own arms; every other shape reads through the
+                // cache.
+                let direct = matches!(query, "m" | "h offset 3m" | "rate(m[5m])");
+                assert_eq!(
+                    cached_counts.0 == 0,
+                    direct,
+                    "{query}: cache fetches {cached_counts:?}"
+                );
+                assert_eq!(
+                    range_value_bits(&want).is_empty(),
+                    query == "absent_over_time(m[1m])",
+                    "{query} step {step}: unexpected empty or non-empty result"
+                );
+                assert_eq!(
+                    range_value_bits(&got),
+                    range_value_bits(&want),
+                    "{query} step {step}: cached result differs from per-step evaluation"
+                );
+                assert_eq!(
+                    got_annotations, want_annotations,
+                    "{query} step {step}: annotations differ"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn negative_offset_subquery_refetches_at_most_once_per_selector() {
+        // ADR-3072 bounds this shape at two fetches per selector and
+        // channel. The cache widens the first read by the reach of both the
+        // outer grid and the inner one, so every later inner window, however
+        // far the outer grid moves it, lies inside that first read: one
+        // fetch per channel, no refetch.
+        let source = counting_cache_source();
+        let (_, _, counts) = range_with_fetch_counts(
+            &Evaluator::new(),
+            &source,
+            "max_over_time(up[1h:1m] offset -1h)",
+            0,
+            minutes(24 * 60),
+            minutes(1),
+        );
+        assert_eq!(source.query_count(), 1);
+        assert_eq!(source.hist_query_count(), 1);
+        assert_eq!(counts, (2, 0));
     }
 
     #[test]
