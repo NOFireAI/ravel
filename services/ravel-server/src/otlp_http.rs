@@ -295,7 +295,7 @@ async fn export_metrics(
         Err(err @ IngestRequestError::ClockImplausible(_)) => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
-        Err(err @ IngestRequestError::Provisioning(_)) => {
+        Err(err @ (IngestRequestError::Provisioning(_) | IngestRequestError::IpcryptRules)) => {
             (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
         }
         // The buffer-budget shed (ADR-0069) is a 429, not the 503 the other
@@ -392,9 +392,9 @@ async fn export_logs(
         Err(err @ LogIngestRequestError::InvalidIdempotencyKey { .. }) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }
-        Err(err @ LogIngestRequestError::Provisioning(_)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        Err(
+            err @ (LogIngestRequestError::Provisioning(_) | LogIngestRequestError::IpcryptRules),
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(LogIngestRequestError::Write(LogWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
@@ -482,9 +482,9 @@ async fn export_traces(
         Err(err @ SpanIngestRequestError::InvalidIdempotencyKey { .. }) => {
             (StatusCode::BAD_REQUEST, err.to_string()).into_response()
         }
-        Err(err @ SpanIngestRequestError::Provisioning(_)) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response()
-        }
+        Err(
+            err @ (SpanIngestRequestError::Provisioning(_) | SpanIngestRequestError::IpcryptRules),
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, err.to_string()).into_response(),
         Err(SpanIngestRequestError::Write(SpanWriteError::BufferBudgetExceeded)) => {
             ingest_buffer_budget_shed_response()
         }
@@ -619,6 +619,7 @@ pub(crate) mod tests {
                 metadata_sink: None,
                 normalize_metrics: normalize_metrics.clone(),
                 budget: budget.clone(),
+                ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             },
             logs_ingest: crate::logs_ingest::LogIngestState {
                 router: log_router,
@@ -630,6 +631,7 @@ pub(crate) mod tests {
                 provisioning: None,
                 normalize_metrics: normalize_metrics.clone(),
                 budget: budget.clone(),
+                ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             },
             traces_ingest: crate::traces_ingest::SpanIngestState {
                 router: span_router,
@@ -641,6 +643,7 @@ pub(crate) mod tests {
                 provisioning: None,
                 normalize_metrics: normalize_metrics.clone(),
                 budget: budget.clone(),
+                ipcrypt: crate::ipcrypt::IpcryptPolicy::disabled(),
             },
             admission,
             budget,
