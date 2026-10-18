@@ -230,7 +230,9 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # The job took 7.5 to 9.5 minutes on main before the ClickBench kit's
+    # sampler cases were added, and the kit suite alone now runs over 5.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
