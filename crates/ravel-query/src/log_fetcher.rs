@@ -1710,6 +1710,7 @@ impl LogSegmentFetcher {
         // the phase taxonomy and `scan_accounted_with_tenant` below for the
         // tenant-aware funnel this untenanted entry point mirrors.
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(caller_accounting.access_intent());
         let accounting = phase.scan();
         let result = async {
             if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
@@ -1823,6 +1824,7 @@ impl LogSegmentFetcher {
         // returns, so buffering into a disposable `PhaseAccounting` and
         // merging once is safe here.
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(caller_accounting.access_intent());
         let accounting = phase.scan();
         // This funnel's decode (`scan_bytes`) reads every column, so the fetch
         // selection is the same: on a version-4 object it brings every column
@@ -2117,6 +2119,7 @@ impl LogSegmentFetcher {
         caller_accounting: &QueryAccounting,
     ) -> Result<SegmentPlan, LogFetchError> {
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(caller_accounting.access_intent());
         let accounting = phase.plan();
         let result = async {
             // Fast path (#693): a query with no block-level predicate whose ts
@@ -2445,6 +2448,7 @@ impl LogSegmentFetcher {
             return unkeyed(None).await;
         }
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(plan_accounting.access_intent());
         let accounting = phase.plan();
         let fetch_span = tracing::debug_span!(
             "page_fetch",
