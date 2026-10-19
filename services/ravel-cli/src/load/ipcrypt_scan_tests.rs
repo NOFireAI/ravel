@@ -630,6 +630,83 @@ async fn a_bytes_column_under_a_ruled_key_warns_at_load_setup() {
     assert!(!warnings.contains("type = \"bytes\""), "{warnings}");
 }
 
+/// A spans column declared `type = "bytes"` under a ruled key is stored as
+/// its lowercase hex, which never parses as an address, so the rule leaves
+/// it unencrypted: the stored objects hold the hex of the raw value and no
+/// form of its ciphertext, and the load warns before writing any data.
+#[tokio::test]
+async fn a_spans_bytes_column_under_a_ruled_key_is_stored_unencrypted_and_warns() {
+    const SPAN_BYTES_ATTR: u8 = 111;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw = addr(SPAN_BYTES_ATTR);
+    let spans = batch(vec![
+        (
+            "trace_id",
+            Arc::new(arrow::array::BinaryArray::from(vec![[1u8; 16].as_slice()])) as ArrayRef,
+        ),
+        (
+            "span_id",
+            Arc::new(arrow::array::BinaryArray::from(vec![[2u8; 8].as_slice()])) as ArrayRef,
+        ),
+        ("name", str_col(vec!["op"])),
+        ("start_ns", i64_col(vec![NOW_NS])),
+        ("end_ns", i64_col(vec![NOW_NS])),
+        (
+            "raw_ip",
+            Arc::new(arrow::array::BinaryArray::from(vec![raw.as_bytes()])) as ArrayRef,
+        ),
+    ]);
+    let pq = write_batch(dir.path(), "spans.parquet", &spans);
+    let mapping = write_mapping(
+        dir.path(),
+        "spans.toml",
+        "[spans]\ntrace_id_column = \"trace_id\"\nspan_id_column = \"span_id\"\n\
+         name_column = \"name\"\nstart_ts_column = \"start_ns\"\nstart_ts_unit = \"nanos\"\n\
+         end_ts_column = \"end_ns\"\nend_ts_unit = \"nanos\"\n\n\
+         [[spans.attribute]]\nkey = \"client.ip\"\ncolumn = \"raw_ip\"\ntype = \"bytes\"\n",
+    );
+
+    let mut warnings = Vec::new();
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    cli_load_warning_to(
+        Arc::clone(&store),
+        &pq,
+        &mapping,
+        SignalArg::Spans,
+        &policy(),
+        &mut warnings,
+    )
+    .await
+    .expect("spans load");
+    let warnings = String::from_utf8(warnings).expect("utf-8");
+    let lines: Vec<&str> = warnings
+        .lines()
+        .filter(|line| line.contains("type = \"bytes\""))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "warning: --mapping column \"raw_ip\" maps key \"client.ip\", which has an IPCrypt \
+             rule, with type = \"bytes\"; IPCrypt encrypts string values only, so these bytes \
+             are stored unencrypted, as their lowercase hex"
+        ],
+        "{warnings}"
+    );
+
+    let stored = stored_objects(&store).await;
+    assert!(
+        !holding(&stored, hex(raw.as_bytes()).as_bytes()).is_empty(),
+        "the raw value's hex is not stored: {:?}",
+        stored.iter().map(|o| o.key.as_str()).collect::<Vec<_>>()
+    );
+    for form in ciphertext_forms(&ciphertext("client.ip", SPAN_BYTES_ATTR)) {
+        assert!(
+            holding(&stored, &form).is_empty(),
+            "a ciphertext was stored"
+        );
+    }
+}
+
 /// A marker read that fails is not an absent marker: the load refuses, and
 /// neither the marker nor any data object is written.
 #[tokio::test]

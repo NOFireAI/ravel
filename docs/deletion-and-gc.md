@@ -774,11 +774,19 @@ encrypts for the caller (ADR-2993 decision 8):
 - With several requests the output lists the base id, then each derived id
   with its epochs (a metric matcher whose key differs from its rule's key
   shows `<key> (rule <rule key>) epoch <n>`) and, under it, the
-  `ravel-cli erase status --tenant <tenant> --signal <signal> --request-id
-  <derived id>` command for that request, then `<n> erasure requests: <c>
-  created, <p> already present`. Add the store flags the submit ran with.
-  Nothing is stored under the base id, so `erase status` takes the derived
-  ids; given the base id it reports `UNKNOWN`.
+  `ravel-cli <flags> erase status --tenant <tenant> --signal <signal>
+  --request-id <derived id>` command for that request, then `<n> erasure
+  requests: <c> created, <p> already present`. Both the store flags and the
+  tenancy flags are top-level and go between `ravel-cli` and `erase`; after
+  `erase` they do not parse. `<flags>` holds the ones the submit ran with:
+  `--store`, under `--store s3` each S3 flag set away from its default
+  other than the inline credentials (`--s3-credentials-file` by its path),
+  and `--tenant-hash-key-file` by its path or `--tenant-hash-unkeyed`.
+  S3 access keys, secret keys and session tokens are never printed; they
+  are left to their `RAVEL_S3_*` environment variables, and one given as a
+  flag with its variable unset prints `<your S3 credential flags>` where
+  those flags go. Nothing is stored under the base id, so `erase status`
+  takes the derived ids; given the base id it reports `UNKNOWN`.
 
 `--plaintext-matcher KEY=VALUE` (repeatable) is for data written before the
 key's rule existed, which holds the raw value:

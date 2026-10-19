@@ -1268,13 +1268,15 @@ also write: write access to a tenant is an encryption oracle, because a token
 that can ingest can write chosen addresses under a ruled key and read the
 ciphertext back with a query. A deployment that needs readers unable to
 encrypt guesses must keep readers' tokens off ingest. Tokens carry no ingest
-or query scope, so only flag-configured tokens (`--tenant-token` or
-`--tenant-token-file`) can draw this line: put readers' tokens on
+or query scope, so the line is drawn by which processes accept a token. Of
+the bearer-token resolvers, only flag-configured tokens (`--tenant-token` or
+`--tenant-token-file`) split by process mode: put readers' tokens on
 `--mode query` processes only and exporters' tokens on `--mode gateway`
-processes only. A token in the durable `sys/auth` map resolves on every
-process that reads the bucket, so it cannot draw this line. An OIDC identity
-resolves on every process configured with its issuer and audience, so OIDC
-draws it only with a separate `--oidc-audience` per process role.
+processes only. Durable `sys/auth` tokens cannot: on a keyed bucket, every
+`--mode all`, `--mode gateway` and `--mode query` process reads the map, so
+a token in it resolves for ingest and query alike. OIDC can only with a
+separate `--oidc-audience` per process role, since an OIDC identity resolves
+on every process configured with its issuer and audience.
 
 ### Production authentication
 

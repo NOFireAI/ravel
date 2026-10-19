@@ -434,7 +434,9 @@ fn shell_word(word: &str) -> String {
 /// `--request-id` finishes the requests left out; a conflicting request is
 /// the exception, since a rerun derives the same id and conflicts again. Past
 /// one request, the output lists each derived id with its `erase status`
-/// command, because nothing is stored under the base id.
+/// command, because nothing is stored under the base id. `cli_flags` are the
+/// top-level store and tenancy flags that command needs, printed between
+/// `ravel-cli` and `erase` since they are not accepted after the subcommand.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_with_ipcrypt(
     store: Arc<dyn ObjectStoreBackend>,
@@ -448,6 +450,7 @@ pub async fn submit_with_ipcrypt(
     reason: String,
     base_id: Uuid,
     now_ns: i64,
+    cli_flags: &[String],
     out: &mut dyn std::io::Write,
     warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<IpcryptSubmitReport> {
@@ -569,7 +572,11 @@ pub async fn submit_with_ipcrypt(
             writeln!(out, "  {} ({})", plan.request_id, epochs.join(", "))?;
             writeln!(
                 out,
-                "    ravel-cli erase status --tenant {} --signal {} --request-id {}",
+                "    ravel-cli {}erase status --tenant {} --signal {} --request-id {}",
+                cli_flags
+                    .iter()
+                    .map(|word| format!("{} ", shell_word(word)))
+                    .collect::<String>(),
                 shell_word(tenant),
                 signal_name(signal),
                 plan.request_id
@@ -1251,6 +1258,7 @@ retired_epochs = [1, 2, 3, 4]
             "dsar-1".to_string(),
             base,
             NOW_NS,
+            &[],
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -1281,6 +1289,7 @@ retired_epochs = [1, 2, 3, 4]
             "dsar-1".to_string(),
             base,
             NOW_NS,
+            &[],
             &mut out,
             &mut warnings,
         )
@@ -1453,6 +1462,7 @@ retired_epochs = [1, 2, 3, 4]
             "dsar-1".to_string(),
             base,
             NOW_NS,
+            &[],
             &mut out,
             &mut Vec::new(),
         )
@@ -1533,6 +1543,7 @@ retired_epochs = [1, 2, 3, 4]
             String::new(),
             base,
             NOW_NS,
+            &[],
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -1562,6 +1573,7 @@ retired_epochs = [1, 2, 3, 4]
             String::new(),
             dotted,
             NOW_NS,
+            &[],
             &mut Vec::new(),
             &mut Vec::new(),
         )
@@ -1910,26 +1922,75 @@ retired_epochs = [1, 2, 3, 4]
     #[tokio::test]
     async fn a_plaintext_matcher_with_an_encrypted_matcher_is_refused_and_writes_nothing() {
         let policy = policy(TWO_EPOCH_POLICY);
-        let store = store_with_marker(&policy).await;
+        for marked in [true, false] {
+            let store = if marked {
+                store_with_marker(&policy).await
+            } else {
+                Arc::new(MemoryStore::new()) as Arc<dyn ObjectStoreBackend>
+            };
+            let (result, out, warnings) = submit_plaintext(
+                &store,
+                &policy,
+                SignalArg::Logs,
+                vec![matcher("host.ip", HOST), matcher("service.name", "api")],
+                vec![matcher("client.ip", CLIENT)],
+                Uuid::from_u128(23),
+            )
+            .await;
+            let err = result.expect_err("a mixed command must be refused");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(
+                    "--plaintext-matcher on \"client.ip\" is combined with --matcher on \
+                     \"host.ip\""
+                ),
+                "marked {marked}: {message}"
+            );
+            assert!(message.contains("conjunction"), "{message}");
+            assert!(message.contains("Nothing was written"), "{message}");
+            let all: Vec<String> = list_all(store.as_ref(), "")
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
+            let expected: Vec<String> = if marked {
+                vec![IPCRYPT_POLICY_KEY.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(all, expected, "marked {marked}");
+            assert_eq!((out.as_str(), warnings.as_str()), ("", ""));
+        }
+    }
+
+    /// Plaintext matchers alone still need the marker to hold the local
+    /// policy: a marker naming a different policy refuses, and nothing is
+    /// written.
+    #[tokio::test]
+    async fn a_plaintext_matcher_alone_against_a_marker_mismatch_is_refused() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let other = [7u8; 32];
+        check_marker(store.as_ref(), other)
+            .await
+            .expect("seed marker");
+        let policy = policy(TWO_EPOCH_POLICY);
         let (result, out, warnings) = submit_plaintext(
             &store,
             &policy,
             SignalArg::Logs,
-            vec![matcher("host.ip", HOST), matcher("service.name", "api")],
+            Vec::new(),
             vec![matcher("client.ip", CLIENT)],
-            Uuid::from_u128(23),
+            Uuid::from_u128(29),
         )
         .await;
-        let err = result.expect_err("a mixed command must be refused");
-        let message = format!("{err:#}");
+        let message = format!("{:#}", result.expect_err("a different policy must refuse"));
+        assert!(message.contains("refusing to erase submit"), "{message}");
+        assert!(message.contains(&hex::encode(other)), "{message}");
         assert!(
-            message.contains(
-                "--plaintext-matcher on \"client.ip\" is combined with --matcher on \"host.ip\""
-            ),
+            message.contains(&hex::encode(policy.fingerprint())),
             "{message}"
         );
-        assert!(message.contains("conjunction"), "{message}");
-        assert!(message.contains("Nothing was written"), "{message}");
         let all: Vec<String> = list_all(store.as_ref(), "")
             .await
             .expect("list")
@@ -1940,6 +2001,39 @@ retired_epochs = [1, 2, 3, 4]
         assert_eq!((out.as_str(), warnings.as_str()), ("", ""));
     }
 
+    /// A marker read that fails is not an absent marker for plaintext
+    /// matchers either: refused, and nothing is written.
+    #[tokio::test]
+    async fn a_plaintext_matcher_alone_with_a_marker_read_failure_is_refused() {
+        let faulty = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Get, ScriptedFault::Transient("marker read".into()))
+                    .with_key_contains(IPCRYPT_POLICY_KEY),
+            ),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let policy = policy(TWO_EPOCH_POLICY);
+        let (result, out, warnings) = submit_plaintext(
+            &store,
+            &policy,
+            SignalArg::Logs,
+            Vec::new(),
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(30),
+        )
+        .await;
+        let message = format!(
+            "{:#}",
+            result.expect_err("a failed marker read must refuse")
+        );
+        assert!(message.contains("refusing to erase submit"), "{message}");
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Transient), 1);
+        let keys = list_all(faulty.inner(), "").await.expect("list");
+        assert!(keys.is_empty(), "{keys:?}");
+        assert_eq!((out.as_str(), warnings.as_str()), ("", ""));
+    }
+
     /// A plaintext matcher on a key with no rule for the signal is refused:
     /// an ordinary matcher already submits it as written.
     #[tokio::test]
@@ -1947,9 +2041,11 @@ retired_epochs = [1, 2, 3, 4]
         let policy = policy(TWO_EPOCH_POLICY);
         let store = store_with_marker(&policy).await;
         // Logs look rules up by the raw key, so the sanitized spelling has none.
+        // Metrics sanitize the key, and `service_name` still names no rule.
         for (signal, key) in [
             (SignalArg::Logs, "service.name"),
             (SignalArg::Logs, "client_ip"),
+            (SignalArg::Metrics, "service_name"),
         ] {
             let (result, out, warnings) = submit_plaintext(
                 &store,
@@ -1963,8 +2059,9 @@ retired_epochs = [1, 2, 3, 4]
             let message = format!("{:#}", result.expect_err("an unruled key must be refused"));
             assert!(
                 message.contains(&format!(
-                    "--plaintext-matcher keys \"{key}\" have no IPCrypt rule for --signal logs, \
-                     so an ordinary --matcher already submits their values as written"
+                    "--plaintext-matcher keys \"{key}\" have no IPCrypt rule for --signal {}, \
+                     so an ordinary --matcher already submits their values as written",
+                    signal_name(signal)
                 )),
                 "{message}"
             );

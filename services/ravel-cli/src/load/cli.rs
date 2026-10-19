@@ -41,20 +41,24 @@ pub const SPANS_ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes dire
 /// not only after.
 const NEAR_CAP_PERCENT: u64 = 90;
 
-/// One warning per logs mapping entry declared `type = "bytes"` under a key
-/// with an IPCrypt rule: the loader encrypts string values only, so those
-/// bytes are stored as written.
-pub fn ruled_bytes_column_warnings(mapping: &Mapping, rules: &TenantRules) -> Vec<String> {
-    mapping
-        .resource_attributes
-        .iter()
-        .chain(&mapping.attributes)
+/// One warning per mapping entry declared `type = "bytes"` under a key with
+/// an IPCrypt rule: the loader encrypts string values only, so those bytes
+/// are stored unencrypted. `stored` says in what form: logs keep the bytes as
+/// written, spans store their lowercase hex, which never parses as an
+/// address.
+pub fn ruled_bytes_column_warnings<'a>(
+    attrs: impl IntoIterator<Item = &'a AttrMap>,
+    rules: &TenantRules,
+    stored: &str,
+) -> Vec<String> {
+    attrs
+        .into_iter()
         .filter(|attr| attr.value_type == ColType::Bytes && rules.lookup_raw(&attr.key).is_some())
         .map(|attr| {
             format!(
                 "warning: --mapping column {:?} maps key {:?}, which has an IPCrypt rule, with \
                  type = \"bytes\"; IPCrypt encrypts string values only, so these bytes are \
-                 stored as written",
+                 {stored}",
                 attr.column, attr.key
             )
         })
@@ -466,6 +470,13 @@ pub(crate) async fn run_fold_warning_to(
             .await;
         }
         MappingSection::Spans(spans) => {
+            for warning in ruled_bytes_column_warnings(
+                spans.resource_attributes.iter().chain(&spans.attributes),
+                &rules,
+                "stored unencrypted, as their lowercase hex",
+            ) {
+                let _ = writeln!(warnings, "{warning}");
+            }
             return run_spans(
                 store,
                 parquet_path,
@@ -490,7 +501,14 @@ pub(crate) async fn run_fold_warning_to(
         }
         MappingSection::Logs(logs) => logs,
     };
-    for warning in ruled_bytes_column_warnings(&mapping, &rules) {
+    for warning in ruled_bytes_column_warnings(
+        mapping
+            .resource_attributes
+            .iter()
+            .chain(&mapping.attributes),
+        &rules,
+        "stored as written",
+    ) {
         let _ = writeln!(warnings, "{warning}");
     }
 
