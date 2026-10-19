@@ -126,17 +126,19 @@ impl CacheMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A RAM-tier admission stored an exact-size copy of the value rather than
-    /// the value itself, because the value did not solely own an allocation of
-    /// exactly its own length (see `Cache::insert`).
+    /// A RAM-tier admission made an exact-size copy of the value to store in
+    /// place of the value itself, because the value did not solely own an
+    /// allocation of exactly its own length (see `Cache::insert`). Recorded
+    /// where the copy is made, whether or not the entry is then stored.
     pub(crate) fn record_admission_copy(&self, bytes: u64) {
         self.admission_copies.fetch_add(1, Ordering::Relaxed);
         self.admission_copied_bytes
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// RAM-tier admissions that stored a copy rather than the value given
-    /// (`ravel_cache_admission_copies_total`). Read on its own rather than
+    /// RAM-tier admissions that copied the value given, whether or not the
+    /// copy was then stored (`ravel_cache_admission_copies_total`). Read on
+    /// its own rather than
     /// through [`Self::snapshot`] because [`CacheMetricsSnapshot`] is built
     /// field by field outside this crate.
     pub fn admission_copies(&self) -> u64 {

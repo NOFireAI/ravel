@@ -39,7 +39,7 @@ pub(crate) fn corrupt_bytes(bytes: &Bytes) -> Bytes {
 /// the number of bytes copied to make it: kept as is (zero copied) when it
 /// already is one, otherwise copied once into a fresh exact-size allocation.
 /// Shared, static, and owner-backed `Bytes` are not unique, so they are
-/// copied. The caller counts the copy once the entry is stored.
+/// copied. The caller counts the copy.
 fn owned_exact(value: Bytes) -> (Bytes, u64) {
     if value.is_empty() {
         return (Bytes::new(), 0);
@@ -252,8 +252,12 @@ where
     ///
     /// The entry is charged `value.len()`, so it must not keep a larger
     /// allocation alive: unless `value` is the only handle to an allocation of
-    /// exactly its length, an exact-size copy is stored instead (counted by
-    /// [`CacheMetrics::admission_copies`]). A slice of a larger buffer, such as
+    /// exactly its length, an exact-size copy is stored instead.
+    /// [`CacheMetrics::admission_copies`] counts every copy an admission
+    /// makes, including one not stored after all: an interactive or
+    /// maintenance admission of a key already resident, or a bulk read the
+    /// region accepted and then, rechecked after the copy, declined. A slice
+    /// of a larger buffer, such as
     /// a response body that is a view into an HTTP read buffer, therefore
     /// stops pinning that buffer once the caller's handles drop. A caller that
     /// keeps a clone of `value` makes it shared, so it is always copied; pass
@@ -264,8 +268,10 @@ where
 
     /// [`insert`](Self::insert) for a read of the given [`AccessIntent`],
     /// which decides where the entry is admitted. A
-    /// [`AccessIntent::BulkScan`] value outside the bulk region's subset is
-    /// neither admitted nor copied, which is not an error either.
+    /// [`AccessIntent::BulkScan`] value the bulk region declines when it
+    /// arrives is neither admitted nor copied, which is not an error either.
+    /// One it accepts is copied with the cache unlocked, so interactive reads
+    /// do not wait on the copy.
     pub fn insert_with_intent(&self, key: CacheKey, value: Bytes, intent: AccessIntent) {
         self.inner.insert(key, value, intent);
     }
@@ -503,45 +509,71 @@ impl Inner {
     }
 
     /// Admits `value` as an allocation the entry owns outright (see
-    /// [`owned_exact`]) and returns a handle to what was stored, or `value`
-    /// when nothing was. A copy is counted only when its entry is stored.
+    /// [`owned_exact`]) and returns a handle to what was stored, or, when
+    /// nothing was, to `value` or the copy made of it. Every copy is made
+    /// with the fifo lock released and counted where it is made, whether or
+    /// not its entry is then stored.
     ///
     /// An interactive or maintenance admission is declined only when over
-    /// size or already resident, so its copy is made before the lock is
-    /// taken, as for an always-admitted value. A bulk admission is declined
-    /// by rank or room, so its copy is made under the lock and only once the
-    /// eviction structure stores it: a declined bulk read copies nothing. An
-    /// over-size value is passed through uncopied whatever the intent.
+    /// size or already resident, so its copy is made up front, as for an
+    /// always-admitted value. A bulk admission is declined by rank or room,
+    /// so [`S3Fifo::would_admit`] decides first under the lock: a bulk read
+    /// it declines is passed to the admission uncopied, which counts the
+    /// read against its tenant and stores nothing. One it accepts is copied
+    /// after the lock is dropped and admitted under the lock again, where
+    /// the admission re-runs every check and may still decline, if the
+    /// region changed in between. An over-size value is passed through
+    /// uncopied whatever the intent.
     fn insert(&self, key: CacheKey, value: Bytes, intent: AccessIntent) -> Bytes {
+        self.insert_checked_then(key, value, intent, || {})
+    }
+
+    /// [`Self::insert`], running `between` after a bulk admission's check
+    /// accepts and before its value is copied, with the lock released.
+    fn insert_checked_then(
+        &self,
+        key: CacheKey,
+        value: Bytes,
+        intent: AccessIntent,
+        between: impl FnOnce(),
+    ) -> Bytes {
         let size = value.len() as u64;
-        let (mut value, copied) =
-            if intent != AccessIntent::BulkScan && size <= self.limits.max_entry_bytes {
-                let (owned, copied) = owned_exact(value);
-                (owned, Some(copied))
-            } else {
-                (value, None)
-            };
-        let written_at_ns = self.clock.now_ns();
-        let mut stored = None;
+        let value = if size > self.limits.max_entry_bytes {
+            value
+        } else if intent == AccessIntent::BulkScan {
+            let mut fifo = self.fifo.lock();
+            if !fifo.would_admit(&key, size, intent) {
+                fifo.insert_with_intent_lazy(key, size, intent, &self.metrics, || None);
+                self.metrics
+                    .set_bulk_bookkeeping_bytes(fifo.bookkeeping_bytes());
+                return value;
+            }
+            drop(fifo);
+            between();
+            self.owned_copy(value)
+        } else {
+            self.owned_copy(value)
+        };
+        let entry = CacheEntry {
+            written_at_ns: self.clock.now_ns(),
+            bytes: value.clone(),
+        };
         let mut fifo = self.fifo.lock();
-        fifo.insert_with_intent_lazy(key, size, intent, &self.metrics, || {
-            let (bytes, copied) = match copied {
-                Some(copied) => (std::mem::take(&mut value), copied),
-                None => owned_exact(std::mem::take(&mut value)),
-            };
-            if copied > 0 {
-                self.metrics.record_admission_copy(copied);
-            }
-            stored = Some(bytes.clone());
-            CacheEntry {
-                written_at_ns,
-                bytes,
-            }
-        });
+        fifo.insert_with_intent_lazy(key, size, intent, &self.metrics, || Some(entry));
         self.metrics
             .set_bulk_bookkeeping_bytes(fifo.bookkeeping_bytes());
-        drop(fifo);
-        stored.unwrap_or(value)
+        value
+    }
+
+    /// [`owned_exact`], counting the copy if one is made.
+    fn owned_copy(&self, value: Bytes) -> Bytes {
+        #[cfg(test)]
+        copy_probe::record(self.fifo.is_locked());
+        let (owned, copied) = owned_exact(value);
+        if copied > 0 {
+            self.metrics.record_admission_copy(copied);
+        }
+        owned
     }
 
     /// Drops every entry whose stamped write time is older than
@@ -592,6 +624,25 @@ fn spawn_sweeper(inner: &Arc<Inner>) -> Option<tokio::task::JoinHandle<()>> {
             }
         }
     }))
+}
+
+/// Records, per thread, whether the fifo lock was held at each admission
+/// copy.
+#[cfg(test)]
+mod copy_probe {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static LOCKED: RefCell<Vec<bool>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(super) fn record(locked: bool) {
+        LOCKED.with(|probe| probe.borrow_mut().push(locked));
+    }
+
+    pub(super) fn take() -> Vec<bool> {
+        LOCKED.with(|probe| probe.take())
+    }
 }
 
 #[cfg(test)]
