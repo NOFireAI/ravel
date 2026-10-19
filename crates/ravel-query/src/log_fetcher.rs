@@ -6098,6 +6098,11 @@ impl BlockRangeFetcher {
     /// `candidate_blocks` for a skip-decidable shape, otherwise
     /// [`RlogReader::scan_blocks`] over a sparse object holding the tail
     /// sections (BLOOM and POSTINGS included), with no BLOCKS byte read.
+    ///
+    /// That `scan_blocks` prune runs on the read gate as one `log_postings`
+    /// job (ADR-1702 decision 4), as the scan open of the unkeyed route does,
+    /// and inline when the fetcher has no gate. The skip-decidable prune reads
+    /// only the decoded directories, decompresses nothing, and runs inline.
     pub(crate) async fn fetch_keyed_plan(
         &self,
         seg_ref: &SegmentRef,
@@ -6198,12 +6203,11 @@ impl BlockRangeFetcher {
                 Some(matching_streams_in(dirs.stream_dir(), &query.stream_attrs))
             };
             let pred = combined_predicate_with_streams(query, stream_ids);
-            let scan = RlogReader::from_decoded(&sparse, &dirs)
-                .scan_blocks(&pred, &query.prune, &ColumnSelection::all())
-                .map_err(|source| corrupt(key, source))?;
-            let plan_stats = scan.stats();
+            let (survivors, plan_stats) = self
+                .prune_on_gate(key, sparse, &dirs, pred, &query.prune)
+                .await?;
             accounting.add_decompressed_bytes(plan_stats.decompressed_bytes);
-            (scan.survivor_block_indices(), plan_stats)
+            (survivors, plan_stats)
         };
         Ok(KeyedPlanRead::Planned {
             footer: Box::new(footer),
@@ -6213,6 +6217,44 @@ impl BlockRangeFetcher {
             fetch: stats,
             key_blocks,
         })
+    }
+
+    /// The reader's block prune over already-decoded directories (the POSTINGS
+    /// probe and the per-block bloom check), with its survivors and stats. On
+    /// the read gate as one `log_postings` job sized by [`open_job_len`] over
+    /// `sparse` when a gate is set, inline otherwise.
+    async fn prune_on_gate(
+        &self,
+        key: &str,
+        sparse: SparseObject,
+        dirs: &Arc<SegmentDirectories>,
+        pred: Predicate,
+        prune: &[Predicate],
+    ) -> Result<(Vec<usize>, ScanStats), LogFetchError> {
+        fn prune_blocks(
+            sparse: &SparseObject,
+            dirs: &SegmentDirectories,
+            pred: &Predicate,
+            prune: &[Predicate],
+        ) -> Result<(Vec<usize>, ScanStats), LogSegError> {
+            RlogReader::from_decoded(sparse, dirs)
+                .scan_blocks(pred, prune, &ColumnSelection::all())
+                .map(|scan| (scan.survivor_block_indices(), scan.stats()))
+        }
+        let Some(gate) = &self.read_gate else {
+            return prune_blocks(&sparse, dirs, &pred, prune)
+                .map_err(|source| corrupt(key, source));
+        };
+        let size = JobSize::Bytes(open_job_len(&sparse, false));
+        let dirs = Arc::clone(dirs);
+        let prune = prune.to_vec();
+        let span = tracing::Span::current();
+        gate.run(ReadSite::LogPostings, size, move || {
+            span.in_scope(|| prune_blocks(&sparse, &dirs, &pred, &prune))
+        })
+        .await
+        .map_err(|err| log_gate_failed(key, err))?
+        .map_err(|source| corrupt(key, source))
     }
 
     /// The tier-1 KEY_IDX probe of one object for every arm in `keys`: the
@@ -12755,7 +12797,7 @@ mod read_gate_tests {
     use ravel_catalog::SegmentLevel;
     use ravel_cpu_gate::{CpuGateConfig, InstantClock};
     use ravel_logseg::writer::ObjectIdentity;
-    use ravel_logseg::{FieldSel, RlogWriter, stream_attrs_bytes};
+    use ravel_logseg::{FieldSel, FieldType, RlogWriter, stream_attrs_bytes};
     use ravel_object_store::PutOptions;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::logstream::log_stream_id;
@@ -12784,6 +12826,13 @@ mod read_gate_tests {
 
     /// One block per record, so the object carries exactly [`BLOCKS`] blocks.
     async fn fixture() -> (Arc<MemoryStore>, SegmentRef) {
+        fixture_with_key_index(Vec::new()).await
+    }
+
+    /// [`fixture`] with a KEY_IDX section over `key_fields`.
+    async fn fixture_with_key_index(
+        key_fields: Vec<(String, KeyType)>,
+    ) -> (Arc<MemoryStore>, SegmentRef) {
         let cfg = RlogConfig {
             block_target_records: 1,
             ..RlogConfig::default()
@@ -12796,8 +12845,9 @@ mod read_gate_tests {
             writer_seq: 1,
         };
         // POSTINGS indexes `request.id`, so an equality on it is probed.
-        let mut writer =
-            RlogWriter::new(cfg, identity).with_indexed_fields(vec!["request.id".to_string()]);
+        let mut writer = RlogWriter::new(cfg, identity)
+            .with_indexed_fields(vec!["request.id".to_string()])
+            .with_key_index_fields(key_fields);
         for ts in 0..BLOCKS as i64 {
             writer.push(record(ts)).expect("push");
         }
@@ -13131,6 +13181,169 @@ mod read_gate_tests {
         assert_eq!(site_counts(&gate, ReadSite::LogPostings), (1, 0));
         assert_eq!(site_counts(&gate, ReadSite::LogBlock), (BLOCKS as u64, 0));
         assert_eq!(total_inline(&gate), 0);
+    }
+
+    /// What [`LogSegmentFetcher::plan_segment_keyed`] planned for one object:
+    /// the reader's survivors, its prune stats, the blocks KEY_IDX kept, and
+    /// the plan phase's decompressed bytes.
+    #[derive(Debug, PartialEq)]
+    struct KeyedPlanned {
+        survivors: Vec<usize>,
+        stats: ScanStats,
+        key_blocks: Option<Vec<usize>>,
+        decompressed_bytes: u64,
+    }
+
+    /// The object of [`fixture`] with `request.id` in KEY_IDX, and a fetcher
+    /// over it whose whole-object bound is 0, so every keyed query probes it.
+    async fn keyed_fixture() -> (LogSegmentFetcher, SegmentRef) {
+        let (store, seg_ref) =
+            fixture_with_key_index(vec![("request.id".to_string(), KeyType::Str)]).await;
+        let backend: Arc<dyn ObjectStoreBackend> = store;
+        let fetcher = LogSegmentFetcher::new(backend).with_block_range_threshold(0);
+        assert!(seg_ref.object_size > fetcher.plan_whole_object_bound());
+        (fetcher, seg_ref)
+    }
+
+    /// `query` keyed on `request.id = "r2"`, the value only block 2 holds.
+    fn keyed_on_r2(query: LogQuery) -> LogQuery {
+        query.with_key_equals(KeyEquals::new(
+            "request.id",
+            KeyType::Str,
+            ravel_logseg::key_index::key8_str("r2"),
+        ))
+    }
+
+    async fn keyed_plan(
+        fetcher: &LogSegmentFetcher,
+        seg_ref: &SegmentRef,
+        query: &LogQuery,
+    ) -> KeyedPlanned {
+        let plan_accounting = QueryAccounting::new();
+        let keyed = fetcher
+            .plan_segment_keyed(
+                seg_ref,
+                TENANT,
+                query,
+                &plan_accounting,
+                &QueryAccounting::new(),
+            )
+            .await
+            .expect("keyed plan");
+        let (survivors, _, stats, footer, _) = keyed.plan.expect("the object holds r2");
+        assert!(footer.is_some(), "the keyed route planned the object");
+        KeyedPlanned {
+            survivors,
+            stats,
+            key_blocks: keyed.key_blocks,
+            decompressed_bytes: plan_accounting.snapshot().decompressed_bytes,
+        }
+    }
+
+    /// The keyed plan of a declared str equality (a `Predicate::Equals` prune
+    /// arm beside its `KeyEquals`, so not skip-decidable) runs the reader's
+    /// prune as exactly one `LogPostings` job; the directories it decodes
+    /// first register no `LogSection` job, and the survivors, stats and
+    /// decompressed bytes equal the ungated plan's.
+    ///
+    /// FLIP: reading the gate as `None` in `prune_on_gate` reads
+    /// `left: (0, 0), right: (1, 0)` on the `LogPostings` assertion, and so
+    /// does running the job under `ReadSite::LogSection`.
+    #[tokio::test]
+    async fn the_keyed_plan_runs_its_prune_on_the_postings_gate() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let query = keyed_on_r2(
+            LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::Equals {
+                field: FieldSel::Attr("request.id".to_string()),
+                value: AttrValue::Str("r2".to_string()),
+            }),
+        );
+        let inline = keyed_plan(&fetcher, &seg_ref, &query).await;
+        assert_eq!(inline.survivors, vec![2], "POSTINGS pruned to block 2");
+        assert_eq!(inline.key_blocks, Some(vec![2]));
+        assert_eq!(inline.stats.blocks_after_postings, 1, "{:?}", inline.stats);
+        assert!(inline.decompressed_bytes > 0);
+
+        let gate = floor_zero_gate();
+        let gated = keyed_plan(
+            &fetcher.clone().with_read_gate(gate.clone()),
+            &seg_ref,
+            &query,
+        )
+        .await;
+        assert_eq!(gated, inline);
+        assert_eq!(site_counts(&gate, ReadSite::LogPostings), (1, 0));
+        assert_eq!(site_counts(&gate, ReadSite::LogSection), (0, 0));
+        assert_eq!(site_counts(&gate, ReadSite::LogBlock), (0, 0));
+        assert_eq!(total_inline(&gate), 0);
+    }
+
+    /// A keyed query whose only prune arm is a `NumRange` is skip-decidable:
+    /// its prune reads the decoded directories, decompresses nothing, and
+    /// submits no `LogPostings` job.
+    ///
+    /// FLIP: replacing the skip-decidable branch's condition in
+    /// `fetch_keyed_plan` with `false` sends this plan through
+    /// `prune_on_gate` and reads `left: (1, 0), right: (0, 0)`.
+    #[tokio::test]
+    async fn the_keyed_plan_with_only_numeric_prune_arms_stays_inline() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let query = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX).with_prune(
+            Predicate::NumRange {
+                field: FieldSel::Attr("request.id".to_string()),
+                ty: FieldType::I64,
+                min: Some(0),
+                max: None,
+            },
+        ));
+        let inline = keyed_plan(&fetcher, &seg_ref, &query).await;
+        assert_eq!(inline.survivors, (0..BLOCKS).collect::<Vec<_>>());
+        assert_eq!(inline.key_blocks, Some(vec![2]));
+
+        let gate = floor_zero_gate();
+        let gated = keyed_plan(
+            &fetcher.clone().with_read_gate(gate.clone()),
+            &seg_ref,
+            &query,
+        )
+        .await;
+        assert_eq!(gated, inline);
+        assert_eq!(site_counts(&gate, ReadSite::LogPostings), (0, 0));
+        assert_eq!(total_inline(&gate), 0);
+    }
+
+    /// With no read gate the keyed plan prunes inline, to the survivors the
+    /// reader's own `scan_blocks` names over the whole object.
+    ///
+    /// FLIP: dropping the `prune` arms from the inline call in
+    /// `prune_on_gate` leaves all four blocks and reads
+    /// `left: [0, 1, 2, 3], right: [2]`.
+    #[tokio::test]
+    async fn a_fetcher_without_a_gate_plans_the_keyed_route_inline() {
+        let (fetcher, seg_ref) = keyed_fixture().await;
+        let prune = Predicate::Equals {
+            field: FieldSel::Attr("request.id".to_string()),
+            value: AttrValue::Str("r2".to_string()),
+        };
+        let query = keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX).with_prune(prune.clone()));
+        let planned = keyed_plan(&fetcher, &seg_ref, &query).await;
+
+        let backend = fetcher.store.clone();
+        let object = backend
+            .get(&seg_ref.data_object_key, GetRange::Full)
+            .await
+            .expect("get")
+            .data;
+        let whole = RlogReader::new(&object[..], &RlogConfig::default())
+            .expect("open")
+            .scan_blocks(
+                &combined_predicate_with_streams(&query, None),
+                &[prune],
+                &ColumnSelection::all(),
+            )
+            .expect("scan");
+        assert_eq!(planned.survivors, whole.survivor_block_indices());
+        assert_eq!(planned.survivors, vec![2]);
     }
 
     /// A gated RLOG decode that panicked is the log fetcher's decode error, and
