@@ -24,10 +24,10 @@ use std::time::Duration;
 
 use ravel_query::io_shape::QueryIoShape;
 use ravel_query::{PhaseAccountingSnapshot, QueryPhase};
-use ravel_types::accounting::AccountedOp;
+use ravel_types::accounting::{AccessIntent, AccountedOp};
 use serde_json::{Value as Json, json};
 
-use crate::{SignalStats, SqlStats};
+use crate::{IntentCacheCounts, SignalStats, SqlStats, StatementCacheStats};
 
 /// One entry per [`QueryPhase`], in [`QueryPhase::ALL`] order, each phase
 /// exactly once: a phase added to the enum cannot be silently dropped from
@@ -151,6 +151,39 @@ pub fn signals_json(signals: &[SignalStats]) -> Vec<Json> {
         .collect()
 }
 
+/// The segment cache's movement over the statement's run, rendered under
+/// `stats.cache`: the intent the statement read under, hits and served bytes
+/// per intent, and cache-wide misses and admitted bytes. Every figure is the
+/// difference of the process-global RAM-tier counters before and after the
+/// statement, so statements running at the same time move each other's
+/// figures (see [`StatementCacheStats`]).
+pub fn cache_json(cache: &StatementCacheStats) -> Json {
+    let counts = |counts: &IntentCacheCounts| {
+        json!({
+            "hits": counts.hits,
+            "servedBytes": counts.served_bytes,
+        })
+    };
+    json!({
+        "intent": intent_name(cache.intent),
+        "interactive": counts(&cache.interactive),
+        "bulkScan": counts(&cache.bulk_scan),
+        "maintenance": counts(&cache.maintenance),
+        "misses": cache.misses,
+        "admittedBytes": cache.admitted_bytes,
+    })
+}
+
+/// An [`AccessIntent`]'s name in `stats.cache`, the same spelling as its
+/// per-intent key there.
+fn intent_name(intent: AccessIntent) -> &'static str {
+    match intent {
+        AccessIntent::Interactive => "interactive",
+        AccessIntent::BulkScan => "bulkScan",
+        AccessIntent::Maintenance => "maintenance",
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -210,6 +243,63 @@ mod tests {
         assert_eq!(total_requests, 5, "one GET recorded per phase");
         assert_eq!(total_bytes, snapshot.pooled().total_s3_bytes());
         assert_eq!(total_requests, snapshot.pooled().total_s3_requests());
+    }
+
+    /// `cache_json`'s key set is exactly the six keys below, each per-intent
+    /// object exactly `hits` and `servedBytes`, and every figure lands under
+    /// its own key: exact set equality, so an added or dropped key fails.
+    #[test]
+    fn cache_json_names_every_field_exactly_once() {
+        let cache = StatementCacheStats {
+            intent: AccessIntent::BulkScan,
+            interactive: IntentCacheCounts {
+                hits: 1,
+                served_bytes: 2,
+            },
+            bulk_scan: IntentCacheCounts {
+                hits: 3,
+                served_bytes: 4,
+            },
+            maintenance: IntentCacheCounts {
+                hits: 5,
+                served_bytes: 6,
+            },
+            misses: 7,
+            admitted_bytes: 8,
+        };
+        let rendered = cache_json(&cache);
+        let object = rendered.as_object().expect("cache renders an object");
+        let keys: std::collections::BTreeSet<&str> = object.keys().map(String::as_str).collect();
+        let expected: std::collections::BTreeSet<&str> = [
+            "intent",
+            "interactive",
+            "bulkScan",
+            "maintenance",
+            "misses",
+            "admittedBytes",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(keys, expected);
+        for (key, hits, served) in [
+            ("interactive", 1, 2),
+            ("bulkScan", 3, 4),
+            ("maintenance", 5, 6),
+        ] {
+            let counts = rendered[key].as_object().expect("per-intent object");
+            let counts_keys: std::collections::BTreeSet<&str> =
+                counts.keys().map(String::as_str).collect();
+            assert_eq!(
+                counts_keys,
+                ["hits", "servedBytes"].into_iter().collect(),
+                "{key}"
+            );
+            assert_eq!(rendered[key]["hits"], hits, "{key}");
+            assert_eq!(rendered[key]["servedBytes"], served, "{key}");
+        }
+        assert_eq!(rendered["intent"], "bulkScan");
+        assert_eq!(rendered["misses"], 7);
+        assert_eq!(rendered["admittedBytes"], 8);
     }
 
     /// `phase_costs_json`'s per-phase key set is exactly the eleven fields

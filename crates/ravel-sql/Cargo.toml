@@ -27,6 +27,10 @@ ravel-cpu-gate = { workspace = true }
 # class. ravel-commit does not depend on ravel-sql, and ravel-catalog already
 # depends on it, so this adds no cycle and no new crate to the build graph.
 ravel-commit = { workspace = true }
+# The read cache's per-intent counters, read before and after a statement for
+# its `stats.cache` object. ravel-query already depends on it, so this adds no
+# crate to the build graph.
+ravel-cache = { workspace = true }
 ravel-query = { workspace = true }
 ravel-promql = { workspace = true }
 ravel-object-store = { workspace = true }
@@ -239,11 +243,6 @@ ravel-test-support = { workspace = true }
 # type) is caught here rather than only discovered once both are wired
 # together at runtime.
 ravel-alerting = { workspace = true }
-# Dev-only: the metric-scan cache-warm test wires a real ADR-0046 read cache
-# into `SegmentFetcher` to prove exclusion still fires on cache-served bytes.
-# Already a workspace pin used elsewhere (ravel-query depends on it);
-# ravel-sql's non-test code has no need for it.
-ravel-cache = { workspace = true }
 # Dev-only: the batch-building benches (benches/samples_scan.rs and
 # benches/logs_scan.rs, ADR-0099 decision 7).
 criterion = { workspace = true }
