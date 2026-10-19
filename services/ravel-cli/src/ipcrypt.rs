@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use clap::ValueEnum;
 use ravel_ipcrypt::fingerprint::{EMPTY_POLICY_FINGERPRINT, policy_fingerprint};
-use ravel_ipcrypt::marker::{CheckOutcome, check_marker, read_marker, replace_marker};
+use ravel_ipcrypt::marker::{
+    CheckError, CheckOutcome, IPCRYPT_POLICY_KEY, check_marker, read_marker, replace_marker,
+};
 use ravel_ipcrypt::policy::{PolicyFile, Variant, parse_policy_file};
 use ravel_ipcrypt::render::RenderOutcome;
 use ravel_ipcrypt::rules::{EpochKey, TenantRules};
@@ -151,6 +153,45 @@ impl IpcryptPolicy {
                  fingerprint {local}): {err}"
             )
         })
+    }
+
+    /// The marker check `erase submit` runs (ADR-2993 decision 9, erasure
+    /// amendment), which never writes the marker. A present marker must carry
+    /// this policy's fingerprint, and a marker that cannot be read refuses.
+    /// With no marker, the bucket's data was written without this policy, so
+    /// a non-empty policy refuses when `encrypted_keys` (the matcher keys the
+    /// request would encrypt) is not empty, and proceeds otherwise.
+    pub async fn check_marker_for_erasure(
+        &self,
+        store: &dyn ObjectStoreBackend,
+        encrypted_keys: &[&str],
+    ) -> anyhow::Result<()> {
+        let local = hex::encode(self.fingerprint);
+        let refused = |err: &dyn std::fmt::Display| {
+            anyhow::anyhow!(
+                "refusing to erase submit: the IPCrypt policy marker check failed (local policy \
+                 fingerprint {local}): {err}"
+            )
+        };
+        match read_marker(store).await.map_err(|err| refused(&err))? {
+            Some((stored, _)) if stored.fingerprint == self.fingerprint => Ok(()),
+            Some((stored, _)) => Err(refused(&CheckError::Mismatch {
+                stored: hex::encode(stored.fingerprint),
+                local: local.clone(),
+            })),
+            None if self.is_empty() || encrypted_keys.is_empty() => Ok(()),
+            None => {
+                let keys: Vec<String> = encrypted_keys.iter().map(|k| format!("{k:?}")).collect();
+                anyhow::bail!(
+                    "refusing to erase submit: the bucket has no {IPCRYPT_POLICY_KEY} marker, so \
+                     its data was written without the IPCrypt policy (local policy fingerprint \
+                     {local}) and the encrypted matchers on {} would match nothing. Submit the \
+                     request without --ipcrypt-config so its matchers stay plaintext. Nothing \
+                     was written",
+                    keys.join(", ")
+                )
+            }
+        }
     }
 
     /// `tenant`'s effective rules. A policy with no rule for the tenant, or
