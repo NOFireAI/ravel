@@ -478,10 +478,10 @@ impl SelectorCache {
     /// Record that `key` falls back for `reason`, keeping the first reason a
     /// key gets and the first budget refusal the query gets.
     fn fall_back(&self, key: SelectorKey, reason: FallbackReason) {
-        if let FallbackReason::Budget(refusal) = reason {
-            if self.first_refusal.get().is_none() {
-                self.first_refusal.set(Some(refusal));
-            }
+        if let FallbackReason::Budget(refusal) = reason
+            && self.first_refusal.get().is_none()
+        {
+            self.first_refusal.set(Some(refusal));
         }
         self.fallen_back.borrow_mut().entry(key).or_insert(reason);
     }

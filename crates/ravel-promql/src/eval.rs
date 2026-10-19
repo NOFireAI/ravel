@@ -4482,7 +4482,7 @@ mod tests {
             );
             let (_, annotations) = result.expect("query evaluates");
             assert_eq!(budget.accounted_refusals(), 4);
-            assert_eq!(annotations.infos(), [expected.clone()]);
+            assert_eq!(annotations.infos(), std::slice::from_ref(&expected));
         }
     }
 
