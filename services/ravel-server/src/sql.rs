@@ -305,12 +305,20 @@ pub(crate) fn record_postings(outcome: &ravel_sql::SqlOutcome) {
 
 /// The JSON `stats` object of a statement run through POST /api/v1/sql: its
 /// cost accounting and estimate, per-phase costs, per-signal-table costs, I/O
-/// shape, timings and pruning counters.
+/// shape, timings and pruning counters, plus the read cache's per-intent
+/// counters (`cache`) when the server runs a fetcher cache.
 pub(crate) fn stats_json(
     outcome: &ravel_sql::SqlOutcome,
     audit_elapsed: Duration,
 ) -> serde_json::Value {
-    build_stats_json(outcome, audit_elapsed, true)
+    let mut stats = build_stats_json(outcome, audit_elapsed, true);
+    if let (serde_json::Value::Object(map), Some(cache)) = (&mut stats, &outcome.stats.cache) {
+        map.insert(
+            "cache".to_string(),
+            ravel_sql::stats_json::cache_json(cache),
+        );
+    }
+    stats
 }
 
 /// The `stats` object of an ES|QL catalog query: the same sections as

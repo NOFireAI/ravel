@@ -11,9 +11,9 @@
 //! # Label allowlist
 //!
 //! [`Label`] is the only way to attach a label to a rendered sample, and it
-//! renders exactly twenty-three label keys, twenty-four in a `sql` build:
+//! renders exactly twenty-four label keys, twenty-five in a `sql` build:
 //! `tenant_hash`, `signal`, `mode`, `op`, `error_kind`, `workload_class`,
-//! `level`, `reason`, `shard`, `cache`, `tier`, `kind`, `outcome`,
+//! `level`, `reason`, `shard`, `cache`, `tier`, `intent`, `kind`, `outcome`,
 //! `allocator`, `stat`, `component`, `class`, `carrier`, `gate`, `site`,
 //! `worker`, `family`, and `variant`, plus `phase` in a `sql` build (ADR-0044 section 4; `reason` added by ADR-0051 section 6 for the
 //! admission-rejection family and reused by ADR-0059 section 2 for the scrub
@@ -21,7 +21,9 @@
 //! key for the per-shard ingest-skew family, `cache` to split the read-cache
 //! family into the fetcher and catalog byte caches, `tier` added by #97 to
 //! split each of those into its RAM and local-disk tiers when a disk tier is
-//! configured, `kind` added by ADR-0065 decision 4 to split the maintenance
+//! configured, `intent` to split the fetcher cache's RAM-tier hits and
+//! served bytes by the access intent the lookup carried (ADR-3072 decision
+//! 3a), `kind` added by ADR-0065 decision 4 to split the maintenance
 //! merge-memory gauge into its transient and total high-water marks,
 //! `outcome` added by #532 to split the alert-tick family by how one
 //! evaluation tick ended, `allocator`/`stat` added by #1170 for the process
@@ -36,8 +38,8 @@
 //! ADR-1746 for the format-floor families, `variant` added by ADR-2993
 //! decision 3 for the IPCrypt values counter, and `phase` added
 //! by issue #2374 for the SQL DDL store-cost families). The keys come from
-//! thirty-eight `Label` variants, forty-one in a `sql` build (`DdlKind`,
-//! `DdlOutcome` and `DdlPhase`) and forty-two in a `flight-sql` build,
+//! thirty-nine `Label` variants, forty-two in a `sql` build (`DdlKind`,
+//! `DdlOutcome` and `DdlPhase`) and forty-three in a `flight-sql` build,
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
@@ -328,6 +330,9 @@ pub enum Label {
     HandBackReason(HandBackReason),
     Cache(CacheFamily),
     CacheTier(CacheTier),
+    /// Which access intent a read-cache lookup carried: `interactive`,
+    /// `bulk_scan` or `maintenance`. A closed enum owned by `ravel_cache`.
+    CacheIntent(ravel_cache::AccessIntent),
     MergeMemoryKind(MergeMemoryKind),
     DeletedObjectKind(DeletedObjectKind),
     /// Which catalog object kind the unreferenced-catalog-object sweep deleted:
@@ -624,6 +629,7 @@ impl Label {
             Label::HandBackReason(_) => "reason",
             Label::Cache(_) => "cache",
             Label::CacheTier(_) => "tier",
+            Label::CacheIntent(_) => "intent",
             Label::MergeMemoryKind(_) => "kind",
             Label::DeletedObjectKind(_) => "kind",
             Label::CatalogObjectKind(_) => "kind",
@@ -675,6 +681,7 @@ impl Label {
             Label::HandBackReason(reason) => reason.label().to_string(),
             Label::Cache(family) => family.name().to_string(),
             Label::CacheTier(tier) => tier.name().to_string(),
+            Label::CacheIntent(intent) => cache_intent_name(*intent).to_string(),
             Label::MergeMemoryKind(kind) => kind.name().to_string(),
             Label::DeletedObjectKind(kind) => kind.name().to_string(),
             Label::CatalogObjectKind(kind) => kind.name().to_string(),
@@ -756,6 +763,16 @@ fn ipcrypt_outcome_name(outcome: ravel_ipcrypt::render::RenderOutcome) -> &'stat
 /// Exhaustive: adding an [`crate::alerting::AlertTickOutcome`] variant breaks
 /// this compile until it is handled here, so a new tick outcome cannot reach
 /// `/metrics` without a spelling.
+/// Exhaustive: adding a [`ravel_cache::AccessIntent`] variant breaks the build
+/// here rather than rendering an unnamed `intent` value.
+fn cache_intent_name(intent: ravel_cache::AccessIntent) -> &'static str {
+    match intent {
+        ravel_cache::AccessIntent::Interactive => "interactive",
+        ravel_cache::AccessIntent::BulkScan => "bulk_scan",
+        ravel_cache::AccessIntent::Maintenance => "maintenance",
+    }
+}
+
 fn alert_outcome_name(outcome: crate::alerting::AlertTickOutcome) -> &'static str {
     use crate::alerting::AlertTickOutcome;
     match outcome {
@@ -6111,6 +6128,52 @@ fn render_cache_family(
     );
 }
 
+/// The fetcher cache's RAM-tier hits and served bytes split by the access
+/// intent each lookup carried (ADR-3072 decision 3a), as two families of their
+/// own so [`render_cache_family`]'s label sets stay as they are. One sample per
+/// intent, all three always rendered; the three `hits` samples sum to that
+/// tier's `ravel_cache_hits_total`. The cache counts misses and admitted bytes
+/// cache-wide, not per intent, so neither has an intent family. Skipped when
+/// the fetcher cache is off.
+fn render_cache_intent_family(
+    out: &mut String,
+    mode: Mode,
+    intents: Option<&ravel_cache::IntentMetricsSnapshot>,
+) {
+    let Some(intents) = intents else {
+        return;
+    };
+    let mut emit = |name: &str, help: &str, field: fn(&ravel_cache::IntentCounters) -> u64| {
+        write_header(out, name, help, "counter");
+        for intent in [
+            ravel_cache::AccessIntent::Interactive,
+            ravel_cache::AccessIntent::BulkScan,
+            ravel_cache::AccessIntent::Maintenance,
+        ] {
+            write_sample(
+                out,
+                name,
+                &[
+                    Label::Mode(mode),
+                    Label::Cache(CacheFamily::Fetch),
+                    Label::CacheIntent(intent),
+                ],
+                field(&intents.for_intent(intent)),
+            );
+        }
+    };
+    emit(
+        "ravel_cache_intent_hits_total",
+        "Fetcher RAM-cache lookups served from the cache, by the access intent of the read.",
+        |c| c.hits,
+    );
+    emit(
+        "ravel_cache_intent_bytes_served_total",
+        "Bytes the fetcher RAM cache served on a hit, by the access intent of the read.",
+        |c| c.bytes_served,
+    );
+}
+
 /// Live (not cumulative) resident bytes and entry count for both ADR-0046
 /// read caches' tiers -- the query fetchers' RAM cache (`fetch`) and the
 /// catalog's content-addressed byte cache (`catalog`) -- plus each cache's
@@ -8891,6 +8954,15 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
     if let Some(runtime) = RuntimeSnapshot::current() {
         render_runtime_family(&mut body, state.mode, &runtime);
     }
+    render_cache_intent_family(
+        &mut body,
+        state.mode,
+        state
+            .cache_metrics
+            .as_ref()
+            .map(|metrics| metrics.intent_snapshot())
+            .as_ref(),
+    );
     render_heartbeat_age_family(&mut body, state.mode, state.heartbeat.age());
     render_memory_gate_family(
         &mut body,
@@ -9280,6 +9352,7 @@ mod tests {
             Label::HandBackReason(HandBackReason::RetiredIndex),
             Label::Cache(CacheFamily::Fetch),
             Label::CacheTier(CacheTier::Ram),
+            Label::CacheIntent(ravel_cache::AccessIntent::BulkScan),
             Label::MergeMemoryKind(MergeMemoryKind::Transient),
             Label::DeletedObjectKind(DeletedObjectKind::QuarantineReaped),
             Label::CatalogObjectKind(CatalogObjectKind::Kidx),
@@ -9326,6 +9399,7 @@ mod tests {
                 Label::HandBackReason(_) => "reason",
                 Label::Cache(_) => "cache",
                 Label::CacheTier(_) => "tier",
+                Label::CacheIntent(_) => "intent",
                 Label::MergeMemoryKind(_) => "kind",
                 Label::DeletedObjectKind(_) => "kind",
                 Label::CatalogObjectKind(_) => "kind",
@@ -9398,6 +9472,9 @@ mod tests {
                 "reason",
                 "cache",
                 "tier",
+                // CacheIntent (ADR-3072 decision 3a) is a new key, for the
+                // fetcher cache's per-intent hit families only.
+                "intent",
                 "kind",
                 // DeletedObjectKind (issue #1729) reuses the `kind` key, so the
                 // allowlist of distinct keys is unchanged; two variants map to
@@ -9439,7 +9516,8 @@ mod tests {
             "ADR-0044 section 4's allowlist plus ADR-0051 section 6's `reason` (also reused by \
              ADR-0059 section 2's scrub seal-divergence family), ADR-1692 decision 2's `shard` \
              for the per-shard ingest skew family, the `cache` label, #97's `tier` \
-             label, ADR-0065 decision 4's `kind` (also reused by issue #1729's deleted-objects \
+             label, ADR-3072 decision 3a's `intent`, ADR-0065 decision 4's `kind` (also \
+             reused by issue #1729's deleted-objects \
              family), #532's `outcome`, #1170's `allocator`/`stat`, ADR-1170 decision 4's \
              `component`, ADR-0071's `class` (issue #1722), ADR-0873 decision 2's `carrier`, \
              ADR-1702 decision 11's `gate`/`site`/`worker`, ADR-1746's `family`, ADR-2993's \
@@ -9447,14 +9525,14 @@ mod tests {
         );
         assert_eq!(
             one_of_each.len(),
-            38,
-            "exactly 38 label variants every build has, 23 distinct keys (sql adds DdlKind, \
+            39,
+            "exactly 39 label variants every build has, 24 distinct keys (sql adds DdlKind, \
              DdlOutcome and DdlPhase and the phase key; flight-sql adds SliceRejectReason)"
         );
         assert_eq!(
             keys.iter().collect::<HashSet<_>>().len(),
-            23,
-            "exactly 23 distinct keys"
+            24,
+            "exactly 24 distinct keys"
         );
     }
 
@@ -14893,6 +14971,48 @@ mod tests {
             "fleet-wide single-flight collapse rate must never be \
              emitted on /metrics, found in:\n{body}"
         );
+    }
+
+    /// The per-intent families render one sample per intent under their own
+    /// names, `mode`/`cache`/`intent` and nothing else, and nothing at all
+    /// without a fetcher cache.
+    #[test]
+    fn cache_intent_family_renders_one_sample_per_intent_byte_for_byte() {
+        let intents = ravel_cache::IntentMetricsSnapshot {
+            interactive: ravel_cache::IntentCounters {
+                hits: 5,
+                bytes_served: 500,
+            },
+            bulk_scan: ravel_cache::IntentCounters {
+                hits: 2,
+                bytes_served: 4096,
+            },
+            maintenance: ravel_cache::IntentCounters {
+                hits: 1,
+                bytes_served: 9,
+            },
+            bulk_bookkeeping_bytes: 77,
+        };
+        let mut out = String::new();
+        render_cache_intent_family(&mut out, Mode::Query, Some(&intents));
+        assert_eq!(
+            out,
+            "# HELP ravel_cache_intent_hits_total Fetcher RAM-cache lookups served from the \
+             cache, by the access intent of the read.\n\
+             # TYPE ravel_cache_intent_hits_total counter\n\
+             ravel_cache_intent_hits_total{mode=\"query\",cache=\"fetch\",intent=\"interactive\"} 5\n\
+             ravel_cache_intent_hits_total{mode=\"query\",cache=\"fetch\",intent=\"bulk_scan\"} 2\n\
+             ravel_cache_intent_hits_total{mode=\"query\",cache=\"fetch\",intent=\"maintenance\"} 1\n\
+             # HELP ravel_cache_intent_bytes_served_total Bytes the fetcher RAM cache served on \
+             a hit, by the access intent of the read.\n\
+             # TYPE ravel_cache_intent_bytes_served_total counter\n\
+             ravel_cache_intent_bytes_served_total{mode=\"query\",cache=\"fetch\",intent=\"interactive\"} 500\n\
+             ravel_cache_intent_bytes_served_total{mode=\"query\",cache=\"fetch\",intent=\"bulk_scan\"} 4096\n\
+             ravel_cache_intent_bytes_served_total{mode=\"query\",cache=\"fetch\",intent=\"maintenance\"} 9\n"
+        );
+        let mut none = String::new();
+        render_cache_intent_family(&mut none, Mode::Query, None);
+        assert_eq!(none, "");
     }
 
     /// #97: with NO disk tier configured for either cache, the `ravel_cache_*`
