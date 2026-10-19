@@ -2426,9 +2426,16 @@ exactly what it did before. The codec decodes both. Version 10 is the client
 ticket of a statement over two or more signal tables, carrying one segment
 group per table (see
 [Statements over several signal tables](#statements-over-several-signal-tables-adr-2904)).
-A slice ticket is never version 10: the slice surface decodes at most version
-9, and `verify_slice` refuses a version 10 ticket signed under a slice key as
-`wrong_surface`. The version moves because
+A slice ticket is never version 10: `verify_slice` refuses a version 10 ticket
+signed under a slice key as `wrong_surface`. Version 11 is the slice ticket
+whose logs block also carries the exact-key equalities the worker probes
+KEY_IDX with (see the exact-key probe below); it is version 9's layout plus
+that key section, so it is a slice-surface version and never a client one. A
+slice ticket whose block carries no key stays version 9. Each surface decodes
+its own set: the client surface versions 8, 9 and 10, the slice surface 8, 9
+and 11. A version 11 ticket on the client surface is refused as an
+unsupported version, as a version 10 ticket is on the slice surface. The
+version moves because
 the coordinator that mints a ticket and the worker that redeems it can run
 different builds during a rolling upgrade, and the worker has to be able to
 tell an authentic ticket it cannot read from a forged one.
@@ -4205,8 +4212,9 @@ does not pin it: it only decides which equalities reach the probe, which
 narrows the blocks read, not the rows returned. An equality on a typed
 attribute column the declaration does not name issues no KEY_IDX read, even on
 an object whose section indexes it. A distributed logs slice does not resolve it again: the
-coordinator's kept keys travel in the slice ticket (version 10), and a version
-10 ticket carrying a spans block is refused.
+coordinator's kept keys travel in the slice ticket (version 11; version 10 is
+the grouped client ticket of ADR-2904), and a version 11 ticket carrying a
+spans block is refused.
 
 Each object the catalog keeps and the plan opens reads the section's prefix
 (header, field directory and bucket directory) once, then at most one bucket

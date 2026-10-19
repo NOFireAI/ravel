@@ -1109,7 +1109,9 @@ where `plan_segment_keyed` and `fetch_keyed_plan` in
 `crates/ravel-query/src/log_fetcher.rs` probe each object's section during
 its plan and hand the surviving block set to the existing planned-block
 path. The distributed logs slice ticket carries the keys as ticket version
-10; versions 8 and 9 are byte-identical to before.
+11, a slice-surface version: version 10 is the multi-signal client ticket of
+ADR-2904, which the slice surface refuses, and the client surface refuses
+version 11 in turn. Versions 8, 9 and 10 are byte-identical to before.
 
 What is probed. An object at or under `plan_whole_object_bound()` (512 KiB)
 is read whole and not probed, so decision 5's "every uncovered candidate"
