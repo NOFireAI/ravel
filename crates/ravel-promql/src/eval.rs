@@ -50,6 +50,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Instant;
 
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
@@ -543,9 +544,11 @@ pub struct QueryWindow {
     /// `None` outside every subquery. This and `t_outer` are maintained only
     /// when `selector_cache` is `Some`, the one reader of both.
     inner_grid_pad: Cell<Option<(i64, i64)>>,
-    /// Per-query selector reads (ADR-3072 decision 1b). `None` for an
+    /// Per-query selector reads (ADR-3072 decision 1b), each entry charged to
+    /// the query's memory budget and byte cap (issue #3105). `None` for an
     /// instant query and for [`Self::bare`], whose evaluation reads every
-    /// selector directly.
+    /// selector directly. Dropped with this context, which releases every
+    /// entry's reservation.
     selector_cache: Option<SelectorCache>,
     /// Shared cross-level evaluation-grid-point budget, charged
     /// down by [`Self::charge_budget`] on every subquery-grid evaluation
@@ -629,9 +632,12 @@ impl QueryWindow {
     /// selector cache, a cached read whose window covers `request` answers
     /// it; otherwise `fetch` runs over [`crate::selector_cache::fetch_window`]
     /// joined with any existing entry's window
-    /// ([`SelectorCache::miss_window`]), and its result replaces the entry.
-    /// Without a cache, `fetch` runs over `request` itself. Either way the
-    /// caller slices the result to `request` with [`CachedSelector::slices`].
+    /// ([`SelectorCache::miss_window`]), and its result replaces the entry
+    /// when [`SelectorCache::insert`] admits it; a read it does not admit
+    /// still answers this request. Once a key has fallen back, a request its
+    /// entry (if any) does not cover is read over `request` itself, as
+    /// without a cache. Either way the caller slices the result to `request`
+    /// with [`CachedSelector::slices`].
     fn selector_read<S: CachedSeries>(
         &self,
         matchers: &[LabelMatcher],
@@ -655,6 +661,13 @@ impl QueryWindow {
         if let Some(cached) = cache.lookup::<S>(&key, request) {
             return Ok(cached);
         }
+        if cache.fell_back(&key) {
+            cache.note_uncached_read();
+            return Ok(Rc::new(CachedSelector {
+                window: request,
+                series: fetch(request)?,
+            }));
+        }
         let (t_outer, inner_pad) = match self.inner_grid_pad.get() {
             Some(pad) => (self.t_outer.get(), pad),
             None => (eval_ts_ns, (0, 0)),
@@ -676,6 +689,33 @@ impl QueryWindow {
         });
         cache.insert(key, Rc::clone(&cached));
         Ok(cached)
+    }
+
+    /// The one info a range query carries when any selector's cache entry did
+    /// not fit, naming how many fell back and why; `None` when none did.
+    fn selector_cache_fallback_info(&self) -> Option<String> {
+        let cache = self.selector_cache.as_ref()?;
+        let (cap, budget, refusal) = cache.fallbacks();
+        let total = cap.saturating_add(budget);
+        if total == 0 {
+            return None;
+        }
+        let mut reasons = Vec::with_capacity(2);
+        if cap > 0 {
+            reasons.push(format!(
+                "{cap} over the per-query selector cache cap of {} bytes",
+                cache.max_bytes()
+            ));
+        }
+        if let Some(refusal) = refusal {
+            reasons.push(format!(
+                "{budget} refused by the query memory budget ({refusal})"
+            ));
+        }
+        Some(format!(
+            "{total} selector(s) read at every step instead of once per query: {}",
+            reasons.join("; ")
+        ))
     }
 
     /// Record an evaluation warning (see [`Annotations`]).
@@ -717,9 +757,20 @@ impl QueryWindow {
     }
 }
 
+/// The default per-query selector cache cap `ravel-query` derives from its
+/// prefetched pool's `max_samples`: two pool-sized float copies,
+/// `2 * max_samples * size_of::<Sample>()` bytes, saturating.
+pub fn selector_cache_cap_for_pool(max_samples: usize) -> u64 {
+    u64::try_from(max_samples)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .saturating_mul(u64::try_from(std::mem::size_of::<Sample>()).unwrap_or(u64::MAX))
+}
+
 /// PromQL evaluator. Stateless besides its lookback and resolution
-/// configuration; safe to share across queries.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// configuration and the memory budget it charges selector-cache entries to;
+/// safe to share across queries.
+#[derive(Debug, Clone)]
 pub struct Evaluator {
     lookback_delta_ns: i64,
     max_range_points: usize,
@@ -730,6 +781,12 @@ pub struct Evaluator {
     /// [`SelectorCache`]. Always on outside tests; the cache-free mode is the
     /// reference the cached evaluation is compared against.
     selector_cache: bool,
+    /// The most bytes a range query's selector cache may hold at once
+    /// (`u64::MAX`, the default, is uncapped).
+    max_selector_cache_bytes: u64,
+    /// The budget each selector-cache entry is reserved against; `None`, the
+    /// default, charges entries only to the cap.
+    memory_budget: Option<Arc<ravel_memory::MemoryBudget>>,
 }
 
 impl Default for Evaluator {
@@ -741,6 +798,8 @@ impl Default for Evaluator {
             max_total_eval_points: DEFAULT_MAX_TOTAL_EVAL_POINTS,
             deadline: None,
             selector_cache: true,
+            max_selector_cache_bytes: u64::MAX,
+            memory_budget: None,
         }
     }
 }
@@ -815,6 +874,24 @@ impl Evaluator {
     /// self-cancels.
     pub fn with_deadline(mut self, deadline: Instant) -> Self {
         self.deadline = Some(deadline);
+        self
+    }
+
+    /// Cap the bytes a range query's selector cache holds at once, summed over
+    /// its entries. A selector whose entry would take the total over the cap
+    /// is read at every step instead, and the query carries an info naming
+    /// it. `u64::MAX` (the default) is uncapped.
+    pub fn with_max_selector_cache_bytes(mut self, max_bytes: u64) -> Self {
+        self.max_selector_cache_bytes = max_bytes;
+        self
+    }
+
+    /// Reserve each of a range query's selector-cache entries against
+    /// `budget`, held until the entry is replaced or the query ends. A refused
+    /// reservation does not fail the query: that selector is read at every
+    /// step instead, and the query carries an info naming the refusal.
+    pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
+        self.memory_budget = Some(budget);
         self
     }
 
@@ -966,7 +1043,9 @@ impl Evaluator {
             end_ns,
             self.max_total_eval_points,
             self.deadline,
-            self.selector_cache.then(SelectorCache::default),
+            self.selector_cache.then(|| {
+                SelectorCache::new(self.max_selector_cache_bytes, self.memory_budget.clone())
+            }),
         );
 
         // The `Selector` arm, and a range function over a matrix selector,
@@ -1005,6 +1084,9 @@ impl Evaluator {
                 RangeValue::Matrix(matrix)
             }
         };
+        if let Some(info) = ctx.selector_cache_fallback_info() {
+            ctx.info(info);
+        }
         Ok((value, ctx))
     }
 
@@ -3960,6 +4042,246 @@ mod tests {
                 "{query}"
             );
         }
+    }
+
+    /// `m{a="x"}` at every minute from 0 to 2h.
+    fn two_hour_source() -> CountingSource {
+        let samples: Vec<(i64, f64)> = (0..=120).map(|k| (minute_ns(k), k as f64)).collect();
+        CountingSource::new(
+            TestSource::new()
+                .with_series(&[("__name__", "m"), ("a", "x")], &samples)
+                .expect("valid series"),
+        )
+    }
+
+    /// 30m to 90m at a 60 s step.
+    const HOUR_GRID: (i64, i64, i64) = (30 * 60_000, 90 * 60_000, 60_000);
+    const HOUR_GRID_STEPS: usize = 61;
+
+    /// The bytes the cache charges for `m`'s float entry over [`HOUR_GRID`],
+    /// read through a single-selector query of the same key. The histogram
+    /// entry beside it matches no series and holds 0 bytes.
+    fn hour_grid_entry_bytes() -> u64 {
+        let source = two_hour_source();
+        let (result, stats) =
+            range_with_cache_stats(Evaluator::new(), &source, "sum(m)", HOUR_GRID);
+        result.expect("query evaluates");
+        let stats = stats.expect("a range query runs with the selector cache");
+        assert_eq!(stats.fetches, 2, "one read per channel");
+        assert!(stats.bytes > 0);
+        stats.bytes
+    }
+
+    /// The float reads `source` saw, counted per selector offset in whole
+    /// seconds. Every read of `m offset Ns` ends N seconds before a minute,
+    /// on the grid or translated across it.
+    fn float_reads_by_offset_s(source: &CountingSource) -> Vec<(i64, usize)> {
+        let mut counts = std::collections::BTreeMap::new();
+        for w in source.windows() {
+            let offset_s = (-w.end_ns).rem_euclid(minute_ns(1)) / 1_000_000_000;
+            *counts.entry(offset_s).or_insert(0usize) += 1;
+        }
+        counts.into_iter().collect()
+    }
+
+    fn without_annotations(result: Result<(RangeValue, Annotations), Error>) -> String {
+        range_result_bits(&result.map(|(value, _)| (value, Annotations::default())))
+    }
+
+    #[test]
+    fn selector_cache_total_stays_within_the_cap_and_the_rest_read_per_step() {
+        // Four distinct keys whose entries are each about `entry` bytes, under
+        // a cap that holds one and not two: the first key is cached, the other
+        // three fall back to a read at every step.
+        let entry = hour_grid_entry_bytes();
+        let cap = entry + entry / 2;
+        let query = "m + m offset 1s + m offset 2s + m offset 3s";
+        let source = two_hour_source();
+        let (cached, stats) = range_with_cache_stats(
+            Evaluator::new().with_max_selector_cache_bytes(cap),
+            &source,
+            query,
+            HOUR_GRID,
+        );
+        let (value, annotations) = cached.expect("query evaluates");
+        let stats = stats.expect("a range query runs with the selector cache");
+        assert!(
+            stats.peak_bytes <= cap,
+            "peak {} over cap {cap}",
+            stats.peak_bytes
+        );
+        assert_eq!(stats.peak_bytes, entry, "only the first key is stored");
+        assert_eq!(stats.bytes, entry);
+        assert_eq!(stats.fallback_keys, 3);
+        let steps = HOUR_GRID_STEPS;
+        assert_eq!(
+            float_reads_by_offset_s(&source),
+            vec![(0, 1), (1, steps), (2, steps), (3, steps)]
+        );
+        assert_eq!(source.query_count(), 1 + 3 * steps);
+        // The histogram entries match nothing, hold 0 bytes and fit.
+        assert_eq!(source.histogram_query_count(), 4);
+        assert_eq!(stats.fetches, (1 + 3 * steps + 4) as u64);
+        assert!(annotations.warnings().is_empty());
+        assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
+        let info = &annotations.infos()[0];
+        assert!(
+            info.starts_with("3 selector(s) read at every step"),
+            "{info}"
+        );
+        assert!(info.contains(&format!("cap of {cap} bytes")), "{info}");
+        assert!(!info.contains("budget"), "{info}");
+
+        let reference_source = two_hour_source();
+        let (reference, _) = range_with_cache_stats(
+            Evaluator::new().without_selector_cache(),
+            &reference_source,
+            query,
+            HOUR_GRID,
+        );
+        let RangeValue::Matrix(ref matrix) = value else {
+            panic!("expected a matrix");
+        };
+        assert_eq!(matrix.len(), 1);
+        assert_eq!(matrix[0].1.len(), steps);
+        assert_eq!(
+            without_annotations(Ok((value, annotations))),
+            without_annotations(reference)
+        );
+    }
+
+    #[test]
+    fn a_refused_reservation_falls_back_and_every_reservation_is_released() {
+        // A budget that admits the first key's entry and not a second one.
+        let entry = hour_grid_entry_bytes();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(entry + entry / 2));
+        let query = "m + m offset 1s";
+        let evaluator = Evaluator::new().with_memory_budget(Arc::clone(&budget));
+        let source = two_hour_source();
+        let (start, end, step) = HOUR_GRID;
+        let (value, ctx) = evaluator
+            .eval_range_in_window(&source, query, start, end, step)
+            .expect("a refused reservation does not fail the query");
+        let stats = ctx
+            .selector_cache_stats()
+            .expect("a range query runs with the selector cache");
+        assert_eq!(stats.fallback_keys, 1);
+        assert_eq!(stats.bytes, entry, "the first key stays cached");
+        assert_eq!(budget.reserved(), entry, "held while the query runs");
+        assert_eq!(budget.accounted_refusals(), 1);
+        assert_eq!(
+            float_reads_by_offset_s(&source),
+            vec![(0, 1), (1, HOUR_GRID_STEPS)]
+        );
+        let annotations = ctx.annotations.borrow().clone();
+        assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
+        let info = &annotations.infos()[0];
+        assert!(
+            info.starts_with("1 selector(s) read at every step"),
+            "{info}"
+        );
+        assert!(
+            info.contains("1 refused by the query memory budget (memory exhausted:"),
+            "{info}"
+        );
+        assert!(!info.contains("cap of"), "{info}");
+        drop(ctx);
+        assert_eq!(budget.reserved(), 0, "the query's end releases every entry");
+
+        // The public entry point releases the same way, and the answer is the
+        // cache-off one.
+        let (cached, _) = range_with_cache_stats(evaluator, &two_hour_source(), query, HOUR_GRID);
+        assert_eq!(budget.reserved(), 0);
+        let reference_source = two_hour_source();
+        let (reference, _) = range_with_cache_stats(
+            Evaluator::new().without_selector_cache(),
+            &reference_source,
+            query,
+            HOUR_GRID,
+        );
+        let reference = without_annotations(reference);
+        assert_eq!(
+            without_annotations(Ok((value, Annotations::default()))),
+            reference
+        );
+        assert_eq!(without_annotations(cached), reference);
+    }
+
+    /// Every sample [`day_source`] holds: four series of 1561 points.
+    const DAY_POOL_SAMPLES: usize = 4 * 1561;
+
+    #[test]
+    fn single_selector_shapes_read_once_per_channel_under_the_pool_cap() {
+        // The cap a pool of exactly `day_source`'s samples gets, the tightest
+        // the engine derives for it.
+        let cap = selector_cache_cap_for_pool(DAY_POOL_SAMPLES);
+        assert_eq!(cap, 2 * 6244 * std::mem::size_of::<Sample>() as u64);
+        let cases = [
+            ("sum by (a) (rate(m[5m]))", 1, 1),
+            ("up + up offset 5m", 2, 2),
+            ("sum(m @ start())", 1, 1),
+            ("sum(m offset -1h)", 1, 1),
+            ("sum(m) - sum(m offset 1d)", 2, 2),
+        ];
+        for (query, float_reads, histogram_reads) in cases {
+            let source = day_source();
+            let (cached, stats) = range_with_cache_stats(
+                Evaluator::new().with_max_selector_cache_bytes(cap),
+                &source,
+                query,
+                DAY_GRID,
+            );
+            let (_, annotations) = cached.expect("query evaluates");
+            let stats = stats.expect("a range query runs with the selector cache");
+            assert_eq!(source.query_count(), float_reads, "{query}: float reads");
+            assert_eq!(
+                source.histogram_query_count(),
+                histogram_reads,
+                "{query}: histogram reads"
+            );
+            assert_eq!(stats.fallback_keys, 0, "{query}");
+            assert!(stats.peak_bytes <= cap, "{query}: {}", stats.peak_bytes);
+            assert!(
+                !annotations
+                    .infos()
+                    .iter()
+                    .any(|info| info.contains("read at every step")),
+                "{query}: {:?}",
+                annotations.infos()
+            );
+        }
+    }
+
+    #[test]
+    fn a_histogram_entry_is_charged_its_buckets_and_can_exceed_the_float_cap() {
+        // The pool cap counts float points, so a histogram selector over most
+        // of a histogram pool does not fit it and reads at every step.
+        let cap = selector_cache_cap_for_pool(DAY_POOL_SAMPLES);
+        let query = "sum by (a) (rate(hm[5m]))";
+        let source = day_source();
+        let (cached, stats) = range_with_cache_stats(
+            Evaluator::new().with_max_selector_cache_bytes(cap),
+            &source,
+            query,
+            DAY_GRID,
+        );
+        let (value, annotations) = cached.expect("query evaluates");
+        let stats = stats.expect("a range query runs with the selector cache");
+        assert_eq!(stats.fallback_keys, 1);
+        assert_eq!(source.query_count(), 1, "the empty float entry fits");
+        assert_eq!(source.histogram_query_count(), 1441);
+        assert_eq!(annotations.infos().len(), 1);
+
+        let uncapped_source = day_source();
+        let (uncapped, uncapped_stats) =
+            range_with_cache_stats(Evaluator::new(), &uncapped_source, query, DAY_GRID);
+        let uncapped_stats = uncapped_stats.expect("a range query runs with the selector cache");
+        assert!(uncapped_stats.bytes > cap, "{}", uncapped_stats.bytes);
+        assert_eq!(uncapped_source.histogram_query_count(), 1);
+        assert_eq!(
+            without_annotations(Ok((value, annotations))),
+            without_annotations(uncapped)
+        );
     }
 
     #[test]

@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 ravel-types = { workspace = true }
+# The query memory budget a range query's selector cache charges its entries
+# to (issue #3105), the same ledger ravel-query's fetchers reserve against.
+ravel-memory = { workspace = true }
 promql-parser = { workspace = true }
 thiserror = { workspace = true }
 # promql-parser depends on regex itself (for its own compiled
