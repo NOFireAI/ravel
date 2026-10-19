@@ -853,6 +853,26 @@ mod tests {
     }
 
     #[test]
+    fn a_capability_inside_the_tenant_is_refused() {
+        for raw in ["tok=acme;ddl;ipcrypt", "tok=acme;ipcrypt;ddl"] {
+            let err = cli(&["--key-source", "canonical-tenant", "--tenant-token", raw])
+                .into_config()
+                .expect_err(raw);
+            let message = err.to_string();
+            assert!(
+                message.contains("--tenant-token (position 1)"),
+                "{raw}: {err}"
+            );
+            assert!(
+                message.contains(
+                    &ravel_tenant_resolve::TenantSuffixError::CapabilityInTenant.to_string()
+                ),
+                "{raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn an_unknown_suffix_is_refused() {
         let err = cli(&[
             "--key-source",

@@ -484,8 +484,8 @@ async fn conformance_fixture() -> Fixture {
             ravel_sql::DeclaredColumn::new("dur", ravel_sql::DeclaredType::I64),
         ])))
         // A test deployment key with no query audit, so the IPCrypt rows
-        // register their functions for the ipcrypt-capable principal every
-        // example runs as (ADR-2993 decision 6).
+        // register their functions for the ipcrypt-capable principal those
+        // rows run as (ADR-2993 decision 6).
         .with_ipcrypt_deployment(ravel_sql::IpcryptDeployment::new(
             Some(Arc::new(FIXTURE_DEPLOYMENT_KEY)),
             false,
@@ -499,18 +499,32 @@ async fn conformance_fixture() -> Fixture {
     }
 }
 
-/// Runs `sql` as a principal holding the `ipcrypt` capability, so the IPCrypt
-/// rows' functions are registered; no other row reads the capability.
-async fn execute_as_ipcrypt_principal(
+/// The scalar rows whose functions exist only for a principal holding the
+/// `ipcrypt` capability.
+const IPCRYPT_ROWS: [&str; 2] = ["ipcrypt_encrypt", "ipcrypt_prefix_encrypt"];
+
+/// The capabilities `construct`'s example runs with: `ipcrypt` for the
+/// [`IPCRYPT_ROWS`], none for every other row, so the default principal's
+/// path stays the one the rest of the registry covers.
+fn capabilities_for(construct: &Construct) -> ravel_sql::SqlCapabilities {
+    ravel_sql::SqlCapabilities {
+        ipcrypt: construct.category == Category::Scalar
+            && IPCRYPT_ROWS.contains(&construct.name.as_str()),
+    }
+}
+
+/// Runs `sql` as a principal holding `capabilities`.
+async fn execute_as(
     fixture: &Fixture,
     tenant_hash: ravel_types::TenantHash,
+    capabilities: ravel_sql::SqlCapabilities,
     sql: &str,
 ) -> Result<ravel_sql::SqlOutcome, SqlError> {
     fixture
         .executor
         .execute_accounted_with(
             tenant_hash,
-            ravel_sql::SqlCapabilities { ipcrypt: true },
+            capabilities,
             &request(sql),
             &ravel_sql::LiveAccounting::new(),
         )
@@ -519,9 +533,14 @@ async fn execute_as_ipcrypt_principal(
 
 /// Runs one supported construct's example and checks the result against a
 /// declared expectation, rather than against `Ok(_)` alone.
-async fn verify_supported(example: &str, expect: Expect, fixture: &Fixture) -> Verdict {
+async fn verify_supported(
+    example: &str,
+    capabilities: ravel_sql::SqlCapabilities,
+    expect: Expect,
+    fixture: &Fixture,
+) -> Verdict {
     let tenant = tenant_id("conformance");
-    match execute_as_ipcrypt_principal(fixture, tenant.hash(), example).await {
+    match execute_as(fixture, tenant.hash(), capabilities, example).await {
         Ok(outcome) => match check_output(expect, &outcome.output) {
             Ok(()) => Verdict::Confirmed,
             Err(observed) => Verdict::Broken { observed },
@@ -537,7 +556,15 @@ async fn verify(construct: &Construct, fixture: &Fixture) -> Verdict {
     let tenant = tenant_id("conformance");
     match construct.classification {
         Classification::SupportedAndCovered { .. } => match expectation(construct) {
-            Some(expect) => verify_supported(&construct.example, expect, fixture).await,
+            Some(expect) => {
+                verify_supported(
+                    &construct.example,
+                    capabilities_for(construct),
+                    expect,
+                    fixture,
+                )
+                .await
+            }
             // A supported row with no declared result is unverifiable: `Ok(_)`
             // alone would let an empty answer publish as covered.
             None => Verdict::Broken {
@@ -643,8 +670,13 @@ async fn supported_constructs_execute() {
                     construct.name
                 )
             });
-            let outcome =
-                execute_as_ipcrypt_principal(&fixture, tenant.hash(), &construct.example).await;
+            let outcome = execute_as(
+                &fixture,
+                tenant.hash(),
+                capabilities_for(&construct),
+                &construct.example,
+            )
+            .await;
             let output = outcome
                 .unwrap_or_else(|e| {
                     panic!("supported construct `{}` must execute: {e}", construct.name)
@@ -756,6 +788,7 @@ async fn an_empty_but_successful_result_is_not_coverage() {
 
     let verdict = verify_supported(
         "SELECT ts, value FROM samples WHERE value > 1000 ORDER BY ts",
+        ravel_sql::SqlCapabilities::default(),
         Expect::Rows(SAMPLE_VALUES.len()),
         &fixture,
     )
@@ -769,6 +802,7 @@ async fn an_empty_but_successful_result_is_not_coverage() {
     assert_eq!(
         verify_supported(
             "SELECT ts, value FROM samples WHERE value > 0 ORDER BY ts",
+            ravel_sql::SqlCapabilities::default(),
             Expect::Rows(SAMPLE_VALUES.len() - 1),
             &fixture,
         )
@@ -780,6 +814,7 @@ async fn an_empty_but_successful_result_is_not_coverage() {
     // way: `sum` over this dataset is 5, not 4.
     match verify_supported(
         "SELECT sum(value) FROM samples",
+        ravel_sql::SqlCapabilities::default(),
         Expect::Scalar(4.0),
         &fixture,
     )
@@ -1028,7 +1063,7 @@ fn ipcrypt_expectations_match_the_epoch_key_derivation() {
 async fn ipcrypt_rows_need_the_capability() {
     let fixture = conformance_fixture().await;
     let tenant = tenant_id("conformance");
-    for name in ["ipcrypt_encrypt", "ipcrypt_prefix_encrypt"] {
+    for name in IPCRYPT_ROWS {
         let construct = registry()
             .into_iter()
             .find(|c| c.category == Category::Scalar && c.name == name)

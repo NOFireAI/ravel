@@ -1047,8 +1047,12 @@ tenant, so a query can still find the rows for a known address:
 Neither takes a key. Each derives the key from the deployment key and the
 tenant of the query, so the same address gives each tenant a different value.
 
-The server registers both functions for a query only when all three hold:
+The server registers both functions for a query only when all four hold:
 
+- the query is a `POST /api/v1/sql` request. No other query surface registers
+  them for any caller: Flight SQL, explain (including the MCP `sql_explain`
+  tool and `ravel-cli sql-explain`), ES|QL, alert rules and the MCP tools
+  carry no capability;
 - the caller holds the `ipcrypt` capability: a token whose tenant is written
   `TENANT;ipcrypt` or `TENANT;ddl,ipcrypt`, or an OIDC token whose
   `--oidc-ipcrypt-claim` claim is `true`
@@ -1059,7 +1063,8 @@ The server registers both functions for a query only when all three hold:
   the address in the call would be written to the audit table as typed.
 
 Otherwise a call is refused exactly as a call to a function that does not
-exist: HTTP 422 with the same planning error.
+exist: on `POST /api/v1/sql`, HTTP 422 with the same planning error, and on
+every other surface, the unknown-function error that surface returns.
 
 Take the variant and the epoch from the rule in the policy file. A query
 server does not read that file, so the epoch has no default: pass the rule's

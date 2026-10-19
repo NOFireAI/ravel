@@ -142,11 +142,14 @@ struct Fixture {
 
 impl Fixture {
     /// A server whose query audit is `audit_pipeline`, recording statement
-    /// text under the default `Plaintext` policy.
-    async fn start(audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>) -> Self {
+    /// text under `audit_text`.
+    async fn start(
+        audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
+        audit_text: ravel_maintain::AuditTextPolicy,
+    ) -> Self {
         let store = keyed_bucket().await;
         let running = ravel_server::start_with_ipcrypt(
-            server_config(audit_pipeline),
+            server_config(audit_pipeline, audit_text),
             store.clone(),
             store,
             Arc::new(ravel_object_store::StoreMetrics::default()),
@@ -257,11 +260,14 @@ impl Fixture {
     }
 }
 
-fn server_config(audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>) -> ServerConfig {
+fn server_config(
+    audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>,
+    audit_text: ravel_maintain::AuditTextPolicy,
+) -> ServerConfig {
     ServerConfig {
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
         audit_pipeline,
-        audit_text: ravel_maintain::AuditTextPolicy::Plaintext,
+        audit_text,
         query_budgets: Default::default(),
         max_inflight_flushes: 1,
         max_inflight_flushes_per_tenant: None,
@@ -332,7 +338,7 @@ fn server_config(audit_pipeline: Option<ravel_maintain::AuditPipelineConfig>) ->
 /// lets the plain token run the call, and the refusal assertion fails.
 #[tokio::test]
 async fn an_ipcrypt_token_matches_the_ingested_ciphertext() {
-    let fx = Fixture::start(None).await;
+    let fx = Fixture::start(None, ravel_maintain::AuditTextPolicy::Plaintext).await;
     fx.ingest(ACME_IPCRYPT_TOKEN, "acme-hit").await;
     fx.ingest(GLOBEX_IPCRYPT_TOKEN, "globex-hit").await;
     let policy = policy();
@@ -420,16 +426,67 @@ async fn an_ipcrypt_token_matches_the_ingested_ciphertext() {
 /// call run, and the refusal assertion fails.
 #[tokio::test]
 async fn a_plaintext_query_audit_unregisters_the_functions() {
-    let fx = Fixture::start(Some(ravel_maintain::AuditPipelineConfig {
-        audit_mode: ravel_maintain::AuditMode::Required,
-        ..Default::default()
-    }))
+    let fx = Fixture::start(
+        Some(ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        }),
+        ravel_maintain::AuditTextPolicy::Plaintext,
+    )
     .await;
     fx.ingest(ACME_IPCRYPT_TOKEN, "acme-hit").await;
 
     for query in [MATCH_DETERMINISTIC, MATCH_PREFIX] {
         fx.assert_refused_like_unknown(ACME_IPCRYPT_TOKEN, query)
             .await;
+    }
+
+    fx.running.shutdown().await.expect("graceful shutdown");
+}
+
+/// With the query audit on but recording redacted statement text, both
+/// functions stay registered: an ipcrypt token's call runs and returns the
+/// ciphertext the ingest rule stored.
+///
+/// Flipped: withholding the functions whenever the audit is on, whatever its
+/// text policy, refuses the call and the row assertions fail.
+#[tokio::test]
+async fn a_redacted_query_audit_keeps_the_functions() {
+    let audit_text = ravel_server::config::resolve_audit_text_policy(
+        ravel_server::config::AuditTextArg::Redacted,
+        None,
+        Some(&DEPLOYMENT_KEY),
+    )
+    .expect("a deployment key yields a redacting policy");
+    assert!(matches!(
+        audit_text,
+        ravel_maintain::AuditTextPolicy::Redacted(_)
+    ));
+    let fx = Fixture::start(
+        Some(ravel_maintain::AuditPipelineConfig {
+            audit_mode: ravel_maintain::AuditMode::Required,
+            ..Default::default()
+        }),
+        audit_text,
+    )
+    .await;
+    fx.ingest(ACME_IPCRYPT_TOKEN, "acme-hit").await;
+    let policy = policy();
+
+    assert_eq!(
+        fx.scalar(
+            ACME_IPCRYPT_TOKEN,
+            "SELECT ipcrypt_encrypt('198.51.100.7', 1) FROM logs"
+        )
+        .await,
+        stored(&policy, ACME, "client.ip")
+    );
+    for query in [MATCH_DETERMINISTIC, MATCH_PREFIX] {
+        assert_eq!(
+            fx.rows(ACME_IPCRYPT_TOKEN, query).await,
+            vec![serde_json::json!(["acme-hit"])],
+            "{query}"
+        );
     }
 
     fx.running.shutdown().await.expect("graceful shutdown");

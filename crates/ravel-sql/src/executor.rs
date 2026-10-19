@@ -2092,6 +2092,8 @@ impl SqlExecutor {
         let resolved = self
             .resolve_admitted(
                 tenant_hash,
+                // A deliberate narrowing: explain does not carry a principal's
+                // capabilities, so it plans without the ipcrypt UDFs.
                 SqlCapabilities::default(),
                 statement,
                 req,
@@ -2123,8 +2125,9 @@ impl SqlExecutor {
                     column_stats_window: req.window,
                     column_stats_now_ns: req.now_ns,
                     parquet: ParquetPlan::Resolved(parquet),
-                    // Explain has no capability-carrying entry point; no
-                    // caller of it authenticates one.
+                    // A deliberate narrowing: explain does not carry a
+                    // principal's capabilities; no caller of it authenticates
+                    // one.
                     capabilities: SqlCapabilities::default(),
                 },
             )
@@ -2429,6 +2432,8 @@ impl SqlExecutor {
         let resolved = self
             .resolve(
                 tenant_hash,
+                // A deliberate narrowing: Flight SQL does not carry a
+                // principal's capabilities, so it resolves without them.
                 SqlCapabilities::default(),
                 Statement::Sql(&req.sql),
                 req,
@@ -2659,7 +2664,8 @@ impl SqlExecutor {
                 column_stats_window: window,
                 column_stats_now_ns: now_ns,
                 parquet: inputs.parquet,
-                // Flight SQL authenticates a tenant, never a capability.
+                // A deliberate narrowing: Flight SQL does not carry a
+                // principal's capabilities; it authenticates a tenant only.
                 capabilities: SqlCapabilities::default(),
             },
         )

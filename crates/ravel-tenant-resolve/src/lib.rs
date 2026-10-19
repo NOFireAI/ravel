@@ -45,6 +45,8 @@ pub enum TenantSuffixError {
     UnknownCapability,
     #[error("a capability after ';' is named more than once")]
     DuplicateCapability,
+    #[error("the tenant before the capability list itself ends in a ';' capability list")]
+    CapabilityInTenant,
 }
 
 /// The capabilities a static token's `;`-suffix grants.
@@ -64,7 +66,9 @@ pub struct TokenCapabilities {
 /// unchanged with no capability. An unknown word (matching is case-sensitive),
 /// a repeated one, an empty list or entry, or an empty tenant before the `;`
 /// is a [`TenantSuffixError`], so a typo refuses startup instead of silently
-/// granting nothing or naming an empty tenant.
+/// granting nothing or naming an empty tenant. So is a tenant whose own last
+/// `;` segment names a capability (`acme;ddl;ipcrypt`), which would otherwise
+/// name tenant `acme;ddl` rather than `acme`.
 ///
 /// `ravel-server` and `ravel-ingest-router` both call it, so the two accept
 /// and refuse the same spellings. The router discards the capabilities, as it
@@ -76,6 +80,13 @@ pub fn split_tenant_suffix(raw: &str) -> Result<(&str, TokenCapabilities), Tenan
     let (tenant, suffix) = (&raw[..idx], &raw[idx + 1..]);
     if tenant.is_empty() {
         return Err(TenantSuffixError::EmptyTenant);
+    }
+    if let Some(tenant_idx) = tenant.rfind(';')
+        && tenant[tenant_idx + 1..]
+            .split(',')
+            .any(|word| matches!(word, "ddl" | "ipcrypt"))
+    {
+        return Err(TenantSuffixError::CapabilityInTenant);
     }
     let mut caps = TokenCapabilities::default();
     for word in suffix.split(',') {
@@ -775,6 +786,23 @@ mod tests {
             split_tenant_suffix("ac;me;ipcrypt").unwrap(),
             ("ac;me", IPCRYPT)
         );
+    }
+
+    #[test]
+    fn split_tenant_suffix_capability_in_the_tenant_is_refused() {
+        for raw in [
+            "acme;ddl;ipcrypt",
+            "acme;ipcrypt;ddl",
+            "acme;ddl;ddl",
+            "acme;ddl,ipcrypt;ddl",
+            "ac;me;ipcrypt,x;ddl",
+        ] {
+            assert_eq!(
+                split_tenant_suffix(raw),
+                Err(TenantSuffixError::CapabilityInTenant),
+                "{raw}"
+            );
+        }
     }
 
     #[test]
