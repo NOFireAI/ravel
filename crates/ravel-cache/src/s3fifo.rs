@@ -1911,4 +1911,109 @@ mod tests {
         let clamped = S3Fifo::<()>::new(limits.with_bulk_share(-1.0));
         assert_eq!(clamped.region_share_bytes, 0);
     }
+
+    /// `would_admit` changes nothing: called twice in a row with no
+    /// admission between, it gives the same answer and leaves the region's
+    /// clock, bytes, bookkeeping, rank map and every tenant's pass as they
+    /// were, for keys it accepts and keys it declines, of a tracked tenant
+    /// and of an untracked one.
+    #[test]
+    fn would_admit_never_mutates() {
+        const ENTRY: u64 = 16 * 1024;
+        let limits = CacheLimits::new(64 * ENTRY, 1_000_000, 4 * ENTRY);
+        let metrics = CacheMetrics::default();
+        let mut fifo = S3Fifo::<()>::new(limits);
+        for n in 0..300 {
+            touch(&mut fifo, key(1, n, ENTRY), AccessIntent::BulkScan, &metrics);
+        }
+        for n in 0..20 {
+            touch(&mut fifo, key(2, n, ENTRY), AccessIntent::Interactive, &metrics);
+        }
+        let (mut accepted, mut declined) = (0, 0);
+        for n in 300..400 {
+            let k = key(1 + 2 * (n % 2) as u8, n, ENTRY);
+            let before = fifo.bulk_state();
+            let bookkeeping = fifo.bookkeeping_bytes();
+            let (total, len) = (fifo.total_bytes(), fifo.len());
+            let first = fifo.would_admit(&k, ENTRY, AccessIntent::BulkScan);
+            let second = fifo.would_admit(&k, ENTRY, AccessIntent::BulkScan);
+            assert_eq!(first, second, "key {n}");
+            assert_eq!(fifo.bulk_state(), before, "key {n}");
+            assert_eq!(fifo.bookkeeping_bytes(), bookkeeping);
+            assert_eq!((fifo.total_bytes(), fifo.len()), (total, len));
+            if first {
+                accepted += 1;
+            } else {
+                declined += 1;
+            }
+        }
+        assert!(
+            accepted > 0 && declined > 0,
+            "{accepted} accepted, {declined} declined"
+        );
+    }
+
+    /// `would_admit` predicts the bulk admission it runs ahead of: over a
+    /// sweep of bulk reads of two tenants mixed with interactive reads, which
+    /// crosses rank, room and small-queue evictions and rank-bound declines,
+    /// it is never false where the admission stores, and wherever the read
+    /// neither starts tracking its tenant nor closes its tenant's window it
+    /// gives exactly the admission's answer.
+    ///
+    /// FLIP: dropping the small-queue step from `bulk_room` makes it false
+    /// where the admission evicts from the small queue and stores; using the
+    /// unreplaced `bulk_rank_bound` in `would_admit` makes it true where the
+    /// admission's bound, which counts this read, declines.
+    #[test]
+    fn would_admit_predicts_the_bulk_admission() {
+        const ENTRY: u64 = 16 * 1024;
+        let limits = CacheLimits::new(64 * ENTRY, 1_000_000, 4 * ENTRY);
+        let metrics = CacheMetrics::default();
+        let mut fifo = S3Fifo::<()>::new(limits);
+        let (mut exact, mut stored, mut declined) = (0u32, 0u32, 0u32);
+        for pass in 0..4u64 {
+            for n in 0..400u64 {
+                if n % 3 == 0 {
+                    let hot = key(9, pass * 1_000 + n, ENTRY);
+                    touch(&mut fifo, hot, AccessIntent::Interactive, &metrics);
+                    if n % 2 == 0 {
+                        touch(&mut fifo, hot, AccessIntent::Interactive, &metrics);
+                    }
+                }
+                let size = [ENTRY, 2 * ENTRY, 3 * ENTRY][(n % 3) as usize];
+                let k = key(1 + (n % 2) as u8, n, size);
+                if fifo
+                    .get_with_intent(&k, AccessIntent::BulkScan, &metrics)
+                    .0
+                    .is_some()
+                {
+                    continue;
+                }
+                let window = fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window);
+                let predicted = fifo.would_admit(&k, size, AccessIntent::BulkScan);
+                let mut made = false;
+                fifo.insert_with_intent_lazy(k, size, AccessIntent::BulkScan, &metrics, || {
+                    made = true;
+                    Some(())
+                });
+                let at = format!("pass {pass} key {n} size {size}");
+                assert!(predicted || !made, "a false decline at {at}");
+                let after = fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window);
+                if window.is_some() && window == after {
+                    assert_eq!(predicted, made, "at {at}");
+                    exact += 1;
+                }
+                if made {
+                    stored += 1;
+                } else {
+                    declined += 1;
+                }
+                assert_within_bounds(&fifo);
+            }
+        }
+        assert!(
+            exact > 1_000 && stored > 50 && declined > 50,
+            "{exact} exact, {stored} stored, {declined} declined"
+        );
+    }
 }
