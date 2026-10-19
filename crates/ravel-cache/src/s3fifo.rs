@@ -63,10 +63,11 @@
 //! The region holds up to `bulk_share` of `max_bytes` against interactive
 //! admissions, and more while the small and main queues leave bytes unused.
 //! A bulk admission frees room by evicting higher-ranked region entries and,
-//! only while the region is below its share, small-queue entries; it never
-//! evicts from main. An interactive admission reclaims region bytes above
-//! the share before it evicts anything interactive. An interactive hit on a
-//! region entry moves it to the small queue with the hit counted.
+//! only while the region is below its share and its bookkeeping has room for
+//! one more entry, small-queue entries; it never evicts from main. An
+//! interactive admission reclaims region bytes above the share before it
+//! evicts anything interactive. An interactive hit on a region entry moves it
+//! to the small queue with the hit counted.
 //!
 //! A tenant's pass bytes are estimated per window from a bottom-k sketch of
 //! the distinct ranks its bulk reads touched. A window closes once its
@@ -532,6 +533,28 @@ impl<V: Clone> S3Fifo<V> {
             && self.bulk_room(rank, size)
     }
 
+    /// Declines a bulk read [`Self::would_admit`] declined: counts it against
+    /// its tenant's pass if the tenant is tracked, as the admission would
+    /// before declining, and makes none of the admission's evictions. An
+    /// over-size or resident key, or a key of an untracked tenant, changes
+    /// nothing. Returns the keys a window rotation evicted, as
+    /// [`Self::get_with_intent`] does.
+    pub(crate) fn decline_bulk(
+        &mut self,
+        key: &CacheKey,
+        size: u64,
+        metrics: &CacheMetrics,
+    ) -> Vec<CacheKey> {
+        let mut evicted = Vec::new();
+        if size <= self.limits.max_entry_bytes
+            && !self.entries.contains_key(key)
+            && self.region.tenants.contains_key(&key.tenant_hash)
+        {
+            self.observe_bulk(key, rank_of(key), size, metrics, &mut evicted);
+        }
+        evicted
+    }
+
     /// Drops `key` from the ghost queue, returning whether it was there. Run
     /// by every admission that stores the key, so a resident key is never
     /// also a ghost; only an interactive admission promotes on the result.
@@ -572,6 +595,11 @@ impl<V: Clone> S3Fifo<V> {
                 self.evict_bulk(top_rank, top_key, metrics);
                 evicted.push(top_key);
                 continue;
+            }
+            // Only a region eviction lowers the bookkeeping, so with no
+            // higher-ranked entry left the small queue cannot make it fit.
+            if self.bookkeeping_bytes() + REGION_ENTRY_BOOKKEEPING_BYTES > self.bookkeeping_budget {
+                return (false, evicted);
             }
             if self.region.bytes + size <= self.region_share_bytes && !self.small.is_empty() {
                 if let Step::Evicted(key) = self.evict_from_small(metrics) {
@@ -649,6 +677,9 @@ impl<V: Clone> S3Fifo<V> {
                     entries -= 1;
                 }
                 continue;
+            }
+            if bookkeeping + REGION_ENTRY_BOOKKEEPING_BYTES > self.bookkeeping_budget {
+                return false;
             }
             if region.saturating_add(size) <= self.region_share_bytes
                 && let Some(key) = small.next()
@@ -2073,5 +2104,109 @@ mod tests {
         }
         assert_within_bounds(fifo);
         (exact, made)
+    }
+
+    const CAP_ENTRY: u64 = 4 * 1024;
+
+    /// A region held at its bookkeeping cap by [`CAP_ENTRY`] entries while
+    /// its bytes are far below the share, one tracked tenant whose pass fits
+    /// the region so the rank bound is the whole rank space, and a small
+    /// queue of 20 once-read interactive entries.
+    fn region_at_bookkeeping_cap(metrics: &CacheMetrics) -> S3Fifo<()> {
+        let limits = CacheLimits::new(4 * 1024 * 1024, 1_000_000, 64 * 1024);
+        let mut fifo = S3Fifo::<()>::new(limits);
+        for n in 0..300 {
+            let k = key(1, n, CAP_ENTRY);
+            fifo.insert_with_intent(k, (), CAP_ENTRY, AccessIntent::BulkScan, metrics);
+        }
+        for n in 0..20 {
+            fifo.insert(key(2, n, CAP_ENTRY), (), CAP_ENTRY, metrics);
+        }
+        let bookkeeping = fifo.bookkeeping_bytes() + REGION_ENTRY_BOOKKEEPING_BYTES;
+        assert!(
+            bookkeeping > fifo.bookkeeping_budget,
+            "at the bookkeeping cap"
+        );
+        assert!(
+            fifo.total_bytes() + CAP_ENTRY + bookkeeping <= limits.max_bytes
+                && fifo.len() < limits.max_entries,
+            "only the bookkeeping term of bulk_fits fails"
+        );
+        assert!(fifo.region.bytes + CAP_ENTRY <= fifo.region_share_bytes);
+        assert_eq!(fifo.region.tenants.len(), 1);
+        assert_eq!(fifo.rank_and_bound(&key(1, 0, CAP_ENTRY)).1, 1u128 << 64);
+        assert_eq!(fifo.small.len(), 20);
+        assert!(fifo.small.iter().all(|k| fifo.entries[k].freq == 0));
+        fifo
+    }
+
+    /// A bulk read ranked above every region entry, arriving while the
+    /// region is at its bookkeeping cap and below its byte share, is declined
+    /// with the small queue untouched: only a region eviction lowers the
+    /// bookkeeping, and no region entry ranks above the read. `would_admit`
+    /// predicts the decline.
+    ///
+    /// FLIP: without the bookkeeping check before the small-queue step in
+    /// `insert_bulk` (the PR head) the loop evicts all 20 small-queue entries
+    /// and then declines; moving that check after one small-queue eviction
+    /// leaves 19. Either fails the population assertion.
+    #[test]
+    fn a_bulk_read_at_the_bookkeeping_cap_leaves_the_small_queue_alone() {
+        let metrics = CacheMetrics::default();
+        let mut fifo = region_at_bookkeeping_cap(&metrics);
+        let (&top, _) = fifo.region.by_rank.last_key_value().unwrap();
+        let k = (1_000..)
+            .map(|n| key(1, n, CAP_ENTRY))
+            .find(|k| rank_of(k) > top)
+            .unwrap();
+        let small: Vec<CacheKey> = fifo.small.iter().copied().collect();
+        let region = fifo.region.by_rank.clone();
+        let evictions = metrics.snapshot().evictions;
+
+        assert!(!fifo.would_admit(&k, CAP_ENTRY, AccessIntent::BulkScan));
+        let (admitted, evicted) =
+            fifo.insert_with_intent(k, (), CAP_ENTRY, AccessIntent::BulkScan, &metrics);
+
+        assert_eq!(fifo.small.len(), small.len(), "small-queue population");
+        assert_eq!(fifo.small.iter().copied().collect::<Vec<_>>(), small);
+        assert!(small.iter().all(|k| fifo.contains(k)));
+        assert!(!admitted && !fifo.contains(&k));
+        assert_eq!(evicted, Vec::<CacheKey>::new());
+        assert_eq!(metrics.snapshot().evictions, evictions);
+        assert_eq!(fifo.region.by_rank, region);
+        assert_within_bounds(&fifo);
+    }
+
+    /// At the same bookkeeping cap a bulk read ranked below the region's top
+    /// entry is admitted: evicting that entry lowers the bookkeeping, and the
+    /// small queue is untouched.
+    ///
+    /// FLIP: placing the bookkeeping check in `insert_bulk` before the
+    /// higher-ranked region step, so it declines whenever the cap is reached,
+    /// declines this read with the top entry still resident.
+    #[test]
+    fn a_bulk_read_at_the_bookkeeping_cap_evicts_a_higher_ranked_entry() {
+        let metrics = CacheMetrics::default();
+        let mut fifo = region_at_bookkeeping_cap(&metrics);
+        let (&top, &top_key) = fifo.region.by_rank.last_key_value().unwrap();
+        let k = (1_000..)
+            .map(|n| key(1, n, CAP_ENTRY))
+            .find(|k| rank_of(k) < top && !fifo.region.by_rank.contains_key(&rank_of(k)))
+            .unwrap();
+        let small: Vec<CacheKey> = fifo.small.iter().copied().collect();
+        let region_len = fifo.region.by_rank.len();
+        let evictions = metrics.snapshot().evictions;
+
+        assert!(fifo.would_admit(&k, CAP_ENTRY, AccessIntent::BulkScan));
+        let (admitted, evicted) =
+            fifo.insert_with_intent(k, (), CAP_ENTRY, AccessIntent::BulkScan, &metrics);
+
+        assert!(admitted && fifo.contains(&k));
+        assert_eq!(evicted, vec![top_key]);
+        assert!(!fifo.contains(&top_key));
+        assert_eq!(fifo.region.by_rank.len(), region_len);
+        assert_eq!(metrics.snapshot().evictions, evictions + 1);
+        assert_eq!(fifo.small.iter().copied().collect::<Vec<_>>(), small);
+        assert_within_bounds(&fifo);
     }
 }
