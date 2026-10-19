@@ -1077,6 +1077,11 @@ fn build_batch_points(
 /// today's ingest hour and is reached by every later query's listing window,
 /// whose upper bound is `now` (ADR-1751 Context, ADR-0089's discoverability
 /// argument).
+///
+/// Loads under no IPCrypt rules and skips the `sys/ipcrypt/policy` marker
+/// check, so it is for tests and benchmarks: production loads go through
+/// [`run`](super::run), which checks the marker and applies the tenant's
+/// rules.
 #[allow(clippy::too_many_arguments)]
 pub async fn load_metrics(
     store: Arc<dyn ObjectStoreBackend>,

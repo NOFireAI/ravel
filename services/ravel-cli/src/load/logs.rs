@@ -40,6 +40,11 @@ const NS_PER_HOUR: i64 = 3_600_000_000_000;
 /// the failing batch's ack round did not resolve (a timeout, or a shard dying
 /// at send time), where a commit can land with no observable ack (see the
 /// variant's doc).
+///
+/// Loads under no IPCrypt rules and skips the `sys/ipcrypt/policy` marker
+/// check, so it is for tests and benchmarks: production loads go through
+/// [`run`](super::run), which checks the marker and applies the tenant's
+/// rules.
 #[allow(clippy::too_many_arguments)]
 pub async fn load(
     store: Arc<dyn ObjectStoreBackend>,
@@ -83,6 +88,9 @@ pub async fn load(
 /// in [`LoadReport::fold`] and its time is inside [`LoadReport::elapsed`].
 /// A fold that fails fails the load with [`LoadError::Fold`]; the loaded
 /// objects are durable either way.
+///
+/// Like [`load`], it loads under no IPCrypt rules and skips the marker
+/// check; production loads go through [`run`](super::run).
 #[allow(clippy::too_many_arguments)]
 pub async fn load_with_fold_after_load(
     store: Arc<dyn ObjectStoreBackend>,
@@ -127,6 +135,9 @@ pub async fn load_with_fold_after_load(
 /// flush target (`--target-bytes`), the age trigger (`--max-flush-delay`,
 /// `None` = the default) and the memory budget's inputs (see
 /// [`LoadMemory::resolve`]).
+///
+/// Like [`load`], it loads under no IPCrypt rules and skips the marker
+/// check; production loads go through [`run`](super::run).
 #[allow(clippy::too_many_arguments)]
 pub async fn load_with_memory(
     store: Arc<dyn ObjectStoreBackend>,

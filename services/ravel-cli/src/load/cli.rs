@@ -41,6 +41,26 @@ pub const SPANS_ADMISSION_BYPASS_WARNING: &str = "warning: bulk load writes dire
 /// not only after.
 const NEAR_CAP_PERCENT: u64 = 90;
 
+/// One warning per logs mapping entry declared `type = "bytes"` under a key
+/// with an IPCrypt rule: the loader encrypts string values only, so those
+/// bytes are stored as written.
+pub fn ruled_bytes_column_warnings(mapping: &Mapping, rules: &TenantRules) -> Vec<String> {
+    mapping
+        .resource_attributes
+        .iter()
+        .chain(&mapping.attributes)
+        .filter(|attr| attr.value_type == ColType::Bytes && rules.lookup_raw(&attr.key).is_some())
+        .map(|attr| {
+            format!(
+                "warning: --mapping column {:?} maps key {:?}, which has an IPCrypt rule, with \
+                 type = \"bytes\"; IPCrypt encrypts string values only, so these bytes are \
+                 stored as written",
+                attr.column, attr.key
+            )
+        })
+        .collect()
+}
+
 /// Warnings to print to stderr after a load, derived from the router's
 /// cumulative dynamic-column counters (ADR-0100 decision 1). Returns at most one
 /// message:
@@ -470,6 +490,9 @@ pub(crate) async fn run_fold_warning_to(
         }
         MappingSection::Logs(logs) => logs,
     };
+    for warning in ruled_bytes_column_warnings(&mapping, &rules) {
+        let _ = writeln!(warnings, "{warning}");
+    }
 
     let mut memory_options = LoadMemoryOptions::new(load_memory);
     let one_batch_warning = Arc::clone(&memory_options.one_batch_warning);
