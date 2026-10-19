@@ -122,7 +122,8 @@ A caller who can encrypt chosen addresses under the tenant's key can
 recover addresses in bulk. IPv4 has only 2^32 of them, so sweeping a
 range and joining against the stored values works. That makes
 encryption a privileged operation, like decryption. Decisions 6 and 7
-gate it accordingly.
+gate it accordingly (write access is a second route to the same
+oracle; see the write-access note of 2026-10-19 below).
 
 The deployment key holder, the operator, is trusted: it can derive
 every tenant's key.
@@ -764,3 +765,27 @@ Two gaps in decision 8 surfaced when `ravel-cli erase submit` was built
 
 The `erase submit` merged with #3049 still creates the marker and has no
 plaintext matcher; the code change for both bullets lands with #3108.
+
+## Amendment (2026-10-19): write access is an encryption oracle
+
+<!-- amendment-applies: sections="Decision" pointer="write-access note of 2026-10-19" -->
+
+Decision 0 names readers without the `ipcrypt` capability among the
+parties the policy protects against, and gates encryption behind that
+capability. It does not consider write access. A caller who can ingest
+into a tenant can send records carrying addresses it chooses under a
+configured key, then read the stored ciphertext back with any query
+credential for the same tenant. That encrypts chosen addresses without
+the capability, at the cost of one ingested record per guess: a /16 is
+about 65,000 records. A static token usually grants both ingest and
+query for its tenant, so its holder has this oracle.
+
+This is accepted, not closed. Closing it would mean refusing one
+credential both ingest and query whenever a tenant has rules, which
+breaks every single-token deployment for a property most deployments do
+not need. The protection decision 0 describes therefore holds against a
+reader who cannot write to the tenant. Tokens carry no ingest or query
+scope of their own, so a deployment that needs the boundary splits it by
+process: readers get a token configured only on `query`-mode processes,
+and exporters get one configured only on `gateway`-mode processes. #3108 adds a sentence saying so
+beside the `ipcrypt` capability in the configuration guide.
