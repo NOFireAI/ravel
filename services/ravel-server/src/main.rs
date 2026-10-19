@@ -938,9 +938,11 @@ mod tests {
     }
 
     /// A `tracing` writer appending every emitted byte to a shared buffer.
+    #[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
     #[derive(Clone)]
     struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
+    #[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
     impl std::io::Write for CapturedLog {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             self.0
@@ -958,8 +960,10 @@ mod tests {
     /// Issue #2633: the startup step this binary's `main` runs leaves
     /// jemalloc's background purge thread enabled in the process that links
     /// jemalloc as its global allocator, and the startup stamp names the
-    /// read-back state.
-    #[cfg(not(target_env = "msvc"))]
+    /// read-back state. Linux-only: macOS jemalloc has no background-thread
+    /// support (#2966), and there `configure_allocator` stamps
+    /// `"unavailable"` instead.
+    #[cfg(all(not(target_env = "msvc"), target_os = "linux"))]
     #[test]
     fn startup_enables_and_stamps_the_allocator_background_thread() {
         use tikv_jemalloc_ctl::background_thread;

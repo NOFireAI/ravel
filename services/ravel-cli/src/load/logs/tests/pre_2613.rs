@@ -333,8 +333,13 @@ async fn rlog_objects_match_the_pre_2613_dealer() {
                 SpanOutcome::Failed(reason) => panic!("reference: {reason}"),
                 SpanOutcome::Spans(spans) => spans,
             };
-            let built = match build_columnar_batch(&spans, &m, &LogIngestLimits::default(), NOW_NS)
-            {
+            let built = match build_columnar_batch(
+                &spans,
+                &m,
+                &LogIngestLimits::default(),
+                &TenantRules::none(),
+                NOW_NS,
+            ) {
                 Ok(b) => b,
                 Err(_) => panic!("reference batch failed to build"),
             };

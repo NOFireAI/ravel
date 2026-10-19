@@ -1101,7 +1101,7 @@ phase_benchmark() {
     expect=""
     [ "$exp" = - ] || expect="$exp"
     for try in 1 2 3; do
-      run_query benchmark "$n" "$id" "$try" "$dir/requests/$n.json" "$expect" \
+      RQ_STATS=1 run_query benchmark "$n" "$id" "$try" "$dir/requests/$n.json" "$expect" \
         || { healthz_stop; stop_samplers; return 1; }
       [ -n "$expect" ] || expect="$RQ_ROWS"
     done

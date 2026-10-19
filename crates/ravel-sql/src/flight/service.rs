@@ -54,7 +54,7 @@ use crate::distributed::{
     DistributedFlightConfig, FlightWorkerSliceClient, SliceTlsDialCounter, WorkerSliceClient,
 };
 use crate::executor::{
-    ParquetPlan, PinnedPlanInputs, PinnedResolve, SqlExecutor, unqualified_tokens,
+    ParquetPlan, PinnedLanes, PinnedPlanInputs, SqlExecutor, unqualified_tokens,
 };
 use crate::flight::request::{sql_request, status_from_sql};
 use crate::flight::slice::{
@@ -62,7 +62,9 @@ use crate::flight::slice::{
 };
 use crate::flight::stream::{DoGetStream, audited_stream, fragment_stream, statement_stream};
 use crate::flight::{ClockRef, FlightAuth, FlightClock, FlightSqlConfig, metadata};
-use crate::flight_ticket::{FlightTicket, SegmentPin, SqlTicketKeys, TicketKey, TicketSurface};
+use crate::flight_ticket::{
+    FlightTicket, SegmentPin, SignalGroup, SqlTicketKeys, TicketKey, TicketSurface,
+};
 use crate::parquet::ParquetResolution;
 use crate::validate::validate_query;
 
@@ -470,49 +472,63 @@ impl FlightSqlService for RavelFlightSqlService {
         // DoGet records its actual with a zero estimate so the two folds sum to
         // one whole-query estimate beside the summed whole-query actual.
         let accounting = QueryAccounting::new();
-        let PinnedResolve {
-            snapshot,
+        let PinnedLanes {
+            lanes,
             estimate,
             parquet,
         } = self
             .executor
-            .resolve_pinned(tenant, &req, &accounting)
+            .resolve_pinned_lanes(tenant, &req, &accounting)
             .await
             .map_err(|err| status_from_sql(&err, tenant))?;
-        let segments: Vec<SegmentPin> = snapshot
-            .segments
-            .iter()
-            .map(SegmentPin::from_segment_ref)
-            .collect();
+        // A statement over one signal table (or none) pins its one snapshot in
+        // the ticket's flat lists, a version 8 or 9 ticket. A statement over
+        // two or more pins one segment group per signal table, a version 10
+        // ticket (ADR-2904 decision 10). Each carries the erasure its resolve
+        // saw pending, so `DoGet` excludes exactly that (ADR-0064 decision 3).
+        let (segments, pending_erasure, signal_groups) = match lanes.as_slice() {
+            [(_, snapshot)] => (
+                snapshot
+                    .segments
+                    .iter()
+                    .map(SegmentPin::from_segment_ref)
+                    .collect::<Vec<_>>(),
+                ravel_query::erasure::snapshot_pending_erasure_predicates(snapshot),
+                Vec::new(),
+            ),
+            _ => (
+                Vec::new(),
+                Vec::new(),
+                lanes
+                    .iter()
+                    .map(|(signal, snapshot)| SignalGroup::from_snapshot(*signal, snapshot))
+                    .collect(),
+            ),
+        };
         // Resolve the tenant's declared typed attribute columns once, here at
         // the plan entry point (ADR-0090 decision 2), with the same `now_ns`
         // that bounded the resolve above. The resolved list is both threaded
-        // into `plan_pinned` (so the advertised FlightInfo schema carries the
+        // into the plan (so the advertised FlightInfo schema carries the
         // declared columns) and pinned into the ticket below, so the paired
         // `DoGet` plans against exactly this schema even if a concurrent cache
         // refresh changes what a re-resolution would return.
         let declared = self.executor.resolve_declared_columns(tenant, now_ns).await;
-        // Carried into the ticket below so `DoGet` excludes exactly what this
-        // resolve saw pending (ADR-0064 decision 3): `snapshot` is
-        // moved into `plan_pinned` just below, so this must be derived first.
-        let pending_erasure = ravel_query::erasure::snapshot_pending_erasure_predicates(&snapshot);
         // The manifest versions this resolve read, for the same reason:
-        // `parquet` is moved into `plan_pinned_with_inputs` just below.
+        // `parquet` is moved into `plan_pinned_lanes` just below.
         let parquet_tables = parquet
             .as_ref()
             .map(ParquetResolution::pins)
             .unwrap_or_default();
 
-        // Step 3: plan against the pinned snapshot so the FlightInfo can
-        // carry the real result schema and so an unplannable query is
-        // rejected now rather than at DoGet. Planning is logical only: the
-        // provider's `scan` runs at physical planning time, so this reads no
-        // segments.
+        // Step 3: plan against the pinned lanes so the FlightInfo can carry
+        // the real result schema and so an unplannable query is rejected now
+        // rather than at DoGet. Planning is logical only: the providers'
+        // `scan` runs at physical planning time, so this reads no segments.
         let planned = self
             .executor
-            .plan_pinned_with_inputs(
+            .plan_pinned_lanes(
                 tenant,
-                snapshot,
+                lanes,
                 &query.query,
                 &accounting,
                 PinnedPlanInputs {
@@ -576,6 +592,7 @@ impl FlightSqlService for RavelFlightSqlService {
             declared_columns: declared,
             parquet_tables,
             budgets: req.budgets,
+            signal_groups,
         };
         let info = info.with_endpoint(
             FlightEndpoint::new().with_ticket(self.encode_statement_ticket(tenant, ticket)?),
@@ -647,6 +664,14 @@ impl FlightSqlService for RavelFlightSqlService {
             ));
         }
 
+        // The snapshots the statement plans against, one per signal lane,
+        // checked against the statement's own signal tables before any store
+        // request: a one-snapshot ticket over two signal tables, or segment
+        // groups that are not the statement's signal tables, read nothing.
+        let lanes = decoded
+            .redemption_lanes()
+            .map_err(|err| status_from_sql(&err, tenant))?;
+
         // Fleet-global concurrency admission for the execution phase (ADR-0061
         // decision 2). `get_flight_info_statement`'s permit released when that RPC
         // returned, so without this gate the actual scan-and-stream work below --
@@ -703,11 +728,19 @@ impl FlightSqlService for RavelFlightSqlService {
         // signs each slice ticket with this coordinator's slice key and sends
         // nothing else: this request's credential stays here (ADR-1689
         // decision 2).
+        //
+        // A version 10 ticket (one segment group per signal table) never takes
+        // this path: it runs whole-set on this coordinator.
         let distributed = self.distributed.as_ref().and_then(|config| {
-            let snapshot = decoded.snapshot();
+            let [(_, snapshot)] = lanes.as_slice() else {
+                return None;
+            };
+            if !decoded.signal_groups.is_empty() {
+                return None;
+            }
             self.executor
                 .plan_distributed_slices_for(
-                    &snapshot,
+                    snapshot,
                     &decoded.statement,
                     config.as_ref(),
                     &decoded,
@@ -764,6 +797,7 @@ impl FlightSqlService for RavelFlightSqlService {
             Arc::clone(&self.clock),
             tenant,
             decoded,
+            lanes,
             &self.config,
             Arc::clone(&self.recorder),
             span.clone(),

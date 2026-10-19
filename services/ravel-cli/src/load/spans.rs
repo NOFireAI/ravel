@@ -315,11 +315,13 @@ fn read_status_code(arr: &ArrayRef, row: usize) -> Result<StatusCode, String> {
 /// exactly as `checked_span_interval` does.
 /// `dropped` accumulates this row's over-cap attribute drops; see
 /// [`read_span_attrs`].
+#[allow(clippy::too_many_arguments)]
 fn build_span(
     batch: &RecordBatch,
     cols: &SpansColumnIndex,
     mapping: &SpansMapping,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     now_ns: i64,
     row: usize,
     dropped: &mut u64,
@@ -476,6 +478,7 @@ fn build_span(
         &cols.resource_attributes,
         &mapping.resource_attributes,
         limits,
+        rules,
         row,
         dropped,
     )?;
@@ -485,11 +488,12 @@ fn build_span(
         &cols.attributes,
         &mapping.attributes,
         limits,
+        rules,
         row,
         dropped,
     )?;
     if let Some(map) = &cols.attrs_map {
-        let entries = read_span_attrs_map(map, row, span_attrs.len(), limits, dropped)?;
+        let entries = read_span_attrs_map(map, row, span_attrs.len(), limits, rules, dropped)?;
         span_attrs.extend(entries);
     }
     // The same merge the OTLP path runs, with an empty scope set: this loader
@@ -526,6 +530,7 @@ fn read_span_attrs(
     indices: &[usize],
     maps: &[AttrMap],
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     row: usize,
     dropped: &mut u64,
 ) -> Result<Vec<(String, String)>, String> {
@@ -541,7 +546,12 @@ fn read_span_attrs(
         else {
             continue;
         };
-        let value = span_attr_string(&map.key, &value)?;
+        let mut value = span_attr_string(&map.key, &value)?;
+        // An IPCrypt rule applies to the stored string form, before the cap
+        // sees its length, as OTLP's `convert_attr` orders it.
+        if let Some(encrypted) = encrypt_str(rules, &map.key, &value) {
+            value = encrypted;
+        }
         // An over-cap value drops THAT attribute and keeps the span, which is
         // `convert_attrs_lossy`'s rule on the OTLP path: no span attribute
         // feeds an identity here, so one unstorable value never has to reject
@@ -745,6 +755,7 @@ fn read_span_attrs_map(
     row: usize,
     span_attributes: usize,
     limits: &SpanIngestLimits,
+    rules: &TenantRules,
     dropped: &mut u64,
 ) -> Result<Vec<(String, String)>, String> {
     if map.map.is_null(row) {
@@ -791,6 +802,8 @@ fn read_span_attrs_map(
                  record."
             ));
         }
+        let encrypted = encrypt_str(rules, key, value);
+        let value = encrypted.as_deref().unwrap_or(value);
         if key.len() > limits.max_attribute_key_len || value.len() > limits.max_attribute_value_len
         {
             *dropped += 1;
@@ -818,6 +831,8 @@ fn read_span_attrs_map(
 struct SpansDecodeState {
     cursor: CursorState,
     skip_rows: u64,
+    /// The tenant's IPCrypt rules, built once for the run.
+    rules: Arc<TenantRules>,
 }
 
 /// One batch's decode outcome.
@@ -903,6 +918,7 @@ fn decode_spans_batch(
             &cols,
             mapping,
             limits,
+            &state.rules,
             now_ns,
             row,
             &mut row_dropped,
@@ -975,6 +991,7 @@ pub async fn load_spans(
         max_flush_delay,
         now_ns,
         clock,
+        Arc::new(TenantRules::none()),
     )
     .await?;
     Ok(report)
@@ -1006,6 +1023,7 @@ pub(super) async fn load_spans_into(
     max_flush_delay: Option<Duration>,
     now_ns: i64,
     clock: Arc<dyn Clock>,
+    rules: Arc<TenantRules>,
 ) -> Result<(), LoadError> {
     // Same operator-facing lever guards as the other paths: a value that
     // cannot express what the flag means is rejected, never silently clamped.
@@ -1091,7 +1109,11 @@ pub(super) async fn load_spans_into(
     report.skip_rows_requested = skip_rows;
     report.file_total_rows = total_rows;
 
-    let mut state = SpansDecodeState { cursor, skip_rows };
+    let mut state = SpansDecodeState {
+        cursor,
+        skip_rows,
+        rules,
+    };
     let mapping = Arc::new(mapping.clone());
     let mapped_keys = Arc::new(mapping.mapped_keys());
 

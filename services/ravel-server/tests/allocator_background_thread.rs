@@ -5,8 +5,11 @@
 //! This binary links the library, so jemalloc is not its global allocator,
 //! but jemalloc is linked and its mallctl interface works all the same. The
 //! background thread is process-wide state, so this file holds one test.
+//!
+//! Linux-only: macOS jemalloc has no background-thread support (#2966), so
+//! the thread cannot be enabled there and the gauge reads 0 on every scrape.
 
-#![cfg(not(target_env = "msvc"))]
+#![cfg(all(not(target_env = "msvc"), target_os = "linux"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;

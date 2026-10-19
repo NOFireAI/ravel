@@ -20,7 +20,7 @@ use ravel_catalog::{Catalog, CatalogConfig, DeclaredColumnType, read_config_valu
 use ravel_object_store::ObjectStoreBackend;
 use ravel_query::{LogSegmentFetcher, SegmentFetcher};
 use ravel_sql::{
-    DeclaredColumn, DeclaredType, ParquetPlan, PinnedPlanInputs, PinnedResolve, SpanSegmentFetcher,
+    DeclaredColumn, DeclaredType, ParquetPlan, PinnedLanes, PinnedPlanInputs, SpanSegmentFetcher,
     SqlConfig, SqlError, SqlExecutor, SqlRequest, StaticDeclaredColumns, validate_query,
 };
 use ravel_types::accounting::QueryAccounting;
@@ -131,25 +131,24 @@ pub async fn run(
 }
 
 /// Resolve, plan and run `req` through the pinned path, the same resolve and
-/// plan a Flight SQL query takes, keeping the executed plan.
+/// plan a Flight SQL query takes, keeping the executed plan. A statement over
+/// several signal tables pins one snapshot per table, as Flight SQL does.
 async fn analyze(
     executor: &SqlExecutor,
     tenant_hash: TenantHash,
     req: &SqlRequest,
 ) -> Result<ravel_sql::AnalyzedRun, SqlError> {
     let accounting = QueryAccounting::new();
-    let PinnedResolve {
-        snapshot, parquet, ..
-    } = executor
-        .resolve_pinned(tenant_hash, req, &accounting)
+    let PinnedLanes { lanes, parquet, .. } = executor
+        .resolve_pinned_lanes(tenant_hash, req, &accounting)
         .await?;
     let declared = executor
         .resolve_declared_columns(tenant_hash, req.now_ns)
         .await;
     executor
-        .plan_pinned_with_inputs(
+        .plan_pinned_lanes(
             tenant_hash,
-            snapshot,
+            lanes,
             &req.sql,
             &accounting,
             PinnedPlanInputs {

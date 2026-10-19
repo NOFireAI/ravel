@@ -3111,6 +3111,7 @@ mod sql_slices {
             declared_columns: Vec::new(),
             parquet_tables: Vec::new(),
             budgets: None,
+            signal_groups: Vec::new(),
         };
         SqlTicketKeys::from_file_key(&SQL_TICKET_KEY)
             .encode(&ticket, TicketSurface::Slice)

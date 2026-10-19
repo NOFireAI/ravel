@@ -235,8 +235,9 @@ partial-success message with rejected point counts and reasons.
   compactions, and deletions that land mid-query do not affect them.
 - A SQL statement that reads several signals (ADR-2904) gets no atomicity
   and no ordering across their snapshots: it may see a span whose log lines
-  are not yet visible, or the reverse. A retry resolves every signal again
-  and never pairs one attempt's snapshot of a signal with another attempt's
+  are not yet visible, or the reverse. A retry either resolves every signal
+  again or, for a Flight SQL `DoGet`, replans against every pinned snapshot
+  of the ticket; it never pairs one attempt's snapshot of a signal with another attempt's
   snapshot of a different signal.
 - Compaction publishes its outputs beside its inputs. A snapshot resolved
   before the record is listed holds the inputs alone or, transiently, both

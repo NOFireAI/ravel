@@ -177,7 +177,9 @@ statement reads Parquet tables or the five tables above, not both yet. On
 `POST /api/v1/sql` a statement may join the five tables above, each read
 from its own snapshot, and bound each table by its own write with a
 table-qualified `min_commit_token` such as `logs:<token>` (see the
-[query guide](docs/guides/query.md)). A table
+[query guide](docs/guides/query.md)). Flight SQL runs the same joins, each
+table pinned to its own snapshot between `GetFlightInfo` and `DoGet`, but
+takes no `min_commit_token` on them. A table
 reads only the file versions it was defined over. A caller with
 the `ddl` capability, which is absent by default, creates a table with
 `CREATE EXTERNAL TABLE ... STORED AS PARQUET LOCATION '...'` and removes it

@@ -50,6 +50,8 @@ mod expr_planner_surface;
 mod extract_field;
 #[path = "flight.rs"]
 mod flight;
+#[path = "flight_cross_signal.rs"]
+mod flight_cross_signal;
 #[path = "flight_differential.rs"]
 mod flight_differential;
 #[path = "flight_distributed.rs"]

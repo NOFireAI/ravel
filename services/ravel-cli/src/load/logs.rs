@@ -118,6 +118,7 @@ pub async fn load_with_fold_after_load(
         RlogZstdLevel::DEFAULT,
         None,
         true,
+        Arc::new(TenantRules::none()),
     )
     .await
 }
@@ -164,6 +165,7 @@ pub async fn load_with_memory(
         RlogZstdLevel::DEFAULT,
         Some(load_memory),
         false,
+        Arc::new(TenantRules::none()),
     )
     .await
 }
@@ -248,6 +250,7 @@ pub(super) async fn load_instrumented(
         RlogZstdLevel::DEFAULT,
         None,
         false,
+        Arc::new(TenantRules::none()),
     )
     .await
 }
@@ -260,7 +263,8 @@ pub(super) async fn load_instrumented(
 /// the `--fold-after-load` flag ([`load_with_fold_after_load`]).
 /// `pipeline_depth` and `target_bytes` left `None` are derived from the first
 /// built batch by [`resolve_geometry`], and a derived depth is bounded by the
-/// resolved memory budget.
+/// resolved memory budget. `rules` are the tenant's IPCrypt rules, applied to
+/// every resource and record attribute before the record is built.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn load_instrumented_at(
     store: Arc<dyn ObjectStoreBackend>,
@@ -284,6 +288,7 @@ pub(super) async fn load_instrumented_at(
     zstd_level: RlogZstdLevel,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
+    rules: Arc<TenantRules>,
 ) -> Result<LoadReport, LoadError> {
     load_with_drain_reflush_period(
         store,
@@ -308,6 +313,7 @@ pub(super) async fn load_instrumented_at(
         DRAIN_REFLUSH_PERIOD,
         load_memory,
         fold_after_load,
+        rules,
     )
     .await
 }
@@ -343,6 +349,7 @@ pub(super) async fn load_with_drain_reflush_period(
     drain_reflush_period: Duration,
     load_memory: Option<LoadMemoryOptions>,
     fold_after_load: bool,
+    rules: Arc<TenantRules>,
 ) -> Result<LoadReport, LoadError> {
     // Reject a zero batch size with a typed error rather than silently clamping
     // it to 1: `batch_rows` is the operator-facing `--batch-rows` lever, and a
@@ -573,6 +580,7 @@ pub(super) async fn load_with_drain_reflush_period(
         state,
         Arc::clone(&mapping),
         limits.clone(),
+        rules,
         now_ns,
         batch_rows,
         path,
@@ -1426,6 +1434,7 @@ fn spawn_decode_pipeline(
     mut state: StrideCursors,
     mapping: Arc<Mapping>,
     limits: LogIngestLimits,
+    rules: Arc<TenantRules>,
     now_ns: i64,
     batch_rows: usize,
     path: LoadPath,
@@ -1445,6 +1454,7 @@ fn spawn_decode_pipeline(
                     state,
                     Arc::clone(&mapping),
                     limits.clone(),
+                    &rules,
                     now_ns,
                     batch_rows,
                     on_build_start.as_ref(),
@@ -1453,6 +1463,7 @@ fn spawn_decode_pipeline(
                     state,
                     Arc::clone(&mapping),
                     limits.clone(),
+                    &rules,
                     now_ns,
                     batch_rows,
                     on_build_start.as_ref(),
@@ -1931,6 +1942,7 @@ fn decode_and_build_stride(
     mut state: StrideCursors,
     mapping: Arc<Mapping>,
     limits: LogIngestLimits,
+    rules: &TenantRules,
     now_ns: i64,
     batch_rows: usize,
     on_build_start: Option<&BuildStartHook>,
@@ -1952,7 +1964,7 @@ fn decode_and_build_stride(
             Err(reason) => return (state, Prefetched::BatchFailed { reason }),
         };
         for row in 0..batch.num_rows() {
-            match build_record(batch, &cols, &mapping, &limits, now_ns, row) {
+            match build_record(batch, &cols, &mapping, &limits, rules, now_ns, row) {
                 Ok(record) => records.push(record),
                 Err(reason) => {
                     return (
@@ -1976,10 +1988,12 @@ fn decode_and_build_stride(
 /// the batch is charged after its spans are collected and before it is built,
 /// so the decoder waits there, holding only the spans, while the budget is
 /// full.
+#[allow(clippy::too_many_arguments)]
 fn decode_and_build_stride_columnar(
     mut state: StrideCursors,
     mapping: Arc<Mapping>,
     limits: LogIngestLimits,
+    rules: &TenantRules,
     now_ns: i64,
     batch_rows: usize,
     on_build_start: Option<&BuildStartHook>,
@@ -1993,7 +2007,7 @@ fn decode_and_build_stride_columnar(
 
     let rows: usize = spans.iter().map(|(b, _)| b.num_rows()).sum();
     let charge = charger.as_deref().map(|c| c.charge_before_build(rows));
-    match build_columnar_batch(&spans, &mapping, &limits, now_ns) {
+    match build_columnar_batch(&spans, &mapping, &limits, rules, now_ns) {
         Ok(batch) => {
             let charge = match (charger, charge) {
                 (Some(charger), Some(charge)) => Some(charger.settle(charge, &batch)),

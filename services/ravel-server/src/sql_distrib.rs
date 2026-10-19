@@ -365,6 +365,7 @@ mod tests {
             declared_columns: Vec::new(),
             parquet_tables: Vec::new(),
             budgets: None,
+            signal_groups: Vec::new(),
         }
     }
 

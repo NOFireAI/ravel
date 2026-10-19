@@ -15,6 +15,7 @@ mod fake_s3;
 pub mod gc_config;
 pub mod hold;
 pub mod idem;
+pub mod ipcrypt;
 pub mod load;
 pub mod maintain;
 pub mod parquet;

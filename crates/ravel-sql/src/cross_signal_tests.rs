@@ -1,7 +1,9 @@
 //! A statement over two or more signal tables, run through the per-signal
 //! resolve and plan of the HTTP statement path (issue #2910), the
-//! table-qualified `min_commit_token` on that path (issue #2911), and the
-//! one-table refusal the Flight SQL entry points keep.
+//! table-qualified `min_commit_token` on that path (issue #2911), the
+//! multi-lane pinned entry points Flight SQL plans such a statement through
+//! (issue #2913), and the one-table refusal the single-snapshot pinned entry
+//! points keep.
 
 #![allow(clippy::expect_used, clippy::panic)]
 
@@ -33,7 +35,9 @@ use crate::executor::tests::{
     publish_log_records_in_hour, publish_metric_samples, publish_spans, sql_request,
     wrap_fixture_store,
 };
-use crate::executor::{LiveAccounting, ParquetPlan, PinnedPlanInputs, SqlExecutor, SqlRequest};
+use crate::executor::{
+    LiveAccounting, ParquetPlan, PinnedPlanInputs, SqlExecutor, SqlRequest, TargetSignal,
+};
 use crate::output::QueryOutput;
 
 /// A store that forwards every call to `inner` and records each request it
@@ -690,6 +694,7 @@ async fn a_two_table_statement_never_distributes() {
         declared_columns: Vec::new(),
         parquet_tables: Vec::new(),
         budgets: None,
+        signal_groups: Vec::new(),
     };
 
     let one_table = "SELECT ts, value FROM samples";
@@ -714,13 +719,32 @@ fn empty_snapshot() -> Snapshot {
     }
 }
 
-/// The HTTP statement path (`execute`, `execute_accounted`, `explain`,
-/// `explain_accounted`) runs a statement over two signal tables, and
-/// `execute` returns its exact rows. Every Flight SQL entry point refuses the
-/// same statement with [`SqlError::CrossSignalQuery`] before it issues any
-/// store request.
+/// `planned`'s rows, executed and collected.
+async fn collect_pinned(planned: crate::executor::PinnedQuery) -> QueryOutput {
+    use futures::StreamExt as _;
+    let stream = planned.execute().await.expect("execute the pinned plan");
+    let schema = stream.schema();
+    let batches: Vec<_> = stream
+        .map(|batch| batch.expect("a pinned batch"))
+        .collect()
+        .await;
+    QueryOutput::new(schema, batches)
+}
+
+/// Which entry points run a statement over two signal tables and which refuse
+/// it. The HTTP statement path (`execute`, `execute_accounted`, `explain`,
+/// `explain_accounted`) and the multi-lane pinned entry points
+/// (`resolve_pinned_lanes`, `plan_pinned_lanes`, and
+/// `plan_pinned_lanes_distributed` with `flight-sql`) run it, and both return
+/// the same exact rows. The single-snapshot pinned entry points
+/// (`resolve_snapshot`, `resolve_pinned`, `plan_pinned`,
+/// `plan_pinned_with_inputs`, and `plan_pinned_distributed` with
+/// `flight-sql`) refuse it with [`SqlError::CrossSignalQuery`] before they
+/// issue any store request, because one snapshot cannot hold two signals'
+/// pins.
 #[tokio::test]
-async fn the_http_path_runs_two_signal_tables_and_flight_still_refuses() {
+async fn http_and_multi_lane_pinned_entries_run_two_signal_tables_and_single_snapshot_entries_refuse()
+ {
     const SQL: &str = "SELECT s.ts, s.value FROM samples s JOIN logs l ON s.ts = l.ts \
                        ORDER BY s.ts";
     let tenant = TenantId::new("cross-signal-entry-points".to_string());
@@ -745,17 +769,15 @@ async fn the_http_path_runs_two_signal_tables_and_flight_still_refuses() {
     let store = wrap_fixture_store(memory);
     let request: SqlRequest = sql_request(SQL, WINDOW);
     let accounting = QueryAccounting::new();
+    // ts 0 has no log record and ts 300 no sample; 100 and 200 join once each.
+    let joined = vec![(100, 2.0), (200, 3.0)];
 
     let (http_log, http) = recorded(store.clone(), SqlConfig::default());
     let outcome = http
         .execute(tenant_hash, &request)
         .await
         .expect("execute runs a samples JOIN logs statement");
-    // ts 0 has no log record and ts 300 no sample; 100 and 200 join once each.
-    assert_eq!(
-        rows(&outcome.output, "ts", "value"),
-        vec![(100, 2.0), (200, 3.0)]
-    );
+    assert_eq!(rows(&outcome.output, "ts", "value"), joined);
     assert_eq!(outcome.stats.segments, 2, "one segment per signal");
     http.execute_accounted(tenant_hash, &request, &LiveAccounting::new())
         .await
@@ -774,13 +796,66 @@ async fn the_http_path_runs_two_signal_tables_and_flight_still_refuses() {
         "the HTTP path read the logs object"
     );
 
-    let (recording, executor) = recorded(store, SqlConfig::default());
     let inputs = || PinnedPlanInputs {
         declared: Vec::new(),
         parquet: ParquetPlan::Unresolved,
         budgets: None,
     };
 
+    // The multi-lane pinned entry points: one snapshot per signal table.
+    let (lanes_log, lanes_executor) = recorded(store.clone(), SqlConfig::default());
+    let pinned = lanes_executor
+        .resolve_pinned_lanes(tenant_hash, &request, &accounting)
+        .await
+        .expect("resolve_pinned_lanes resolves both signals");
+    assert_eq!(
+        pinned
+            .lanes
+            .iter()
+            .map(|(signal, snapshot)| (*signal, snapshot.segments.len()))
+            .collect::<Vec<_>>(),
+        vec![(TargetSignal::Metrics, 1), (TargetSignal::Logs, 1)],
+        "one lane per signal table, in lane order, each with its own segment"
+    );
+    let planned = lanes_executor
+        .plan_pinned_lanes(
+            tenant_hash,
+            pinned.lanes.clone(),
+            SQL,
+            &accounting,
+            inputs(),
+        )
+        .await
+        .expect("plan_pinned_lanes plans it");
+    assert_eq!(rows(&collect_pinned(planned).await, "ts", "value"), joined);
+    #[cfg(feature = "flight-sql")]
+    {
+        let planned = lanes_executor
+            .plan_pinned_lanes_distributed(
+                tenant_hash,
+                pinned.lanes.clone(),
+                SQL,
+                &accounting,
+                None,
+                inputs(),
+            )
+            .await
+            .expect("plan_pinned_lanes_distributed plans it");
+        assert_eq!(rows(&collect_pinned(planned).await, "ts", "value"), joined);
+    }
+    assert_eq!(
+        data_gets(&lanes_log.requests(), "/l/").len(),
+        1,
+        "the multi-lane pinned path read the logs object"
+    );
+    assert_eq!(
+        data_gets(&lanes_log.requests(), "/m/").len(),
+        1,
+        "the multi-lane pinned path read the metrics object"
+    );
+
+    // The single-snapshot pinned entry points refuse before any request.
+    let (recording, executor) = recorded(store, SqlConfig::default());
     let mut refused: Vec<(&str, SqlError)> = Vec::new();
     let mut take = |entry: &'static str, err: Option<SqlError>| {
         refused.push((entry, err.unwrap_or_else(|| panic!("{entry} must refuse"))));
@@ -839,6 +914,105 @@ async fn the_http_path_runs_two_signal_tables_and_flight_still_refuses() {
         refused.len(),
         if cfg!(feature = "flight-sql") { 5 } else { 4 }
     );
+    assert_eq!(recording.requests(), Vec::<String>::new());
+}
+
+/// `plan_pinned_lanes` refuses lanes that are not the statement's signal
+/// tables, before any store request: a missing lane, an extra lane, lanes out
+/// of lane order, and two lanes for a one-table statement.
+#[tokio::test]
+async fn plan_pinned_lanes_refuses_lanes_that_are_not_the_statements_tables() {
+    let (recording, executor) =
+        recorded(wrap_fixture_store(MemoryStore::new()), SqlConfig::default());
+    let tenant_hash = TenantId::new("pinned-lanes-mismatch".to_string()).hash();
+    let two = "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts";
+    let one = "SELECT ts FROM logs";
+    let lane = |signal| (signal, empty_snapshot());
+    let cases = [
+        (
+            two,
+            vec![lane(TargetSignal::Metrics)],
+            "samples",
+            "samples, logs",
+        ),
+        (
+            two,
+            vec![
+                lane(TargetSignal::Metrics),
+                lane(TargetSignal::Logs),
+                lane(TargetSignal::Spans),
+            ],
+            "samples, logs, spans",
+            "samples, logs",
+        ),
+        (
+            two,
+            vec![lane(TargetSignal::Logs), lane(TargetSignal::Metrics)],
+            "logs, samples",
+            "samples, logs",
+        ),
+        (
+            one,
+            vec![lane(TargetSignal::Logs), lane(TargetSignal::Spans)],
+            "logs, spans",
+            "logs",
+        ),
+        (one, Vec::new(), "none", "logs"),
+    ];
+    for (sql, lanes, want_pinned, want_tables) in cases {
+        let err = executor
+            .plan_pinned_lanes(
+                tenant_hash,
+                lanes,
+                sql,
+                &QueryAccounting::new(),
+                PinnedPlanInputs {
+                    declared: Vec::new(),
+                    parquet: ParquetPlan::Unresolved,
+                    budgets: None,
+                },
+            )
+            .await
+            .err();
+        match err {
+            Some(SqlError::PinnedSignalsMismatch { pinned, tables }) => {
+                assert_eq!(
+                    (pinned.as_str(), tables.as_str()),
+                    (want_pinned, want_tables)
+                );
+            }
+            other => panic!("{sql}: expected PinnedSignalsMismatch, got {other:?}"),
+        }
+    }
+    assert_eq!(recording.requests(), Vec::<String>::new());
+}
+
+/// A plain token on a two-table statement through the multi-lane pinned
+/// resolve is [`SqlError::CommitTokenNeedsQualifier`], the HTTP path's error,
+/// before any store request.
+#[tokio::test]
+async fn resolve_pinned_lanes_refuses_a_plain_token_on_two_signal_tables() {
+    let (recording, executor) =
+        recorded(wrap_fixture_store(MemoryStore::new()), SqlConfig::default());
+    let tenant_hash = TenantId::new("pinned-lanes-token".to_string()).hash();
+    let mut request = sql_request(
+        "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts",
+        WINDOW,
+    );
+    request.min_tokens = vec![MinCommitToken {
+        table: None,
+        token: token(),
+    }];
+    let err = executor
+        .resolve_pinned_lanes(tenant_hash, &request, &QueryAccounting::new())
+        .await
+        .err();
+    match err {
+        Some(SqlError::CommitTokenNeedsQualifier { tables }) => {
+            assert_eq!(tables, "samples, logs");
+        }
+        other => panic!("expected CommitTokenNeedsQualifier, got {other:?}"),
+    }
     assert_eq!(recording.requests(), Vec::<String>::new());
 }
 

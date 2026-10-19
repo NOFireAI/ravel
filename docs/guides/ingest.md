@@ -1208,6 +1208,78 @@ unsorted input costs every later query the fetch of the bulk objects.
   limits of the admission controller were exercised. The CLI prints this
   warning before every run.
 
+### IPCrypt on load
+
+`--ipcrypt-config <file>` takes the same policy file as `ravel-server
+--ipcrypt-config` ([Pseudonymization (IPCrypt)](../ingest.md#pseudonymization-ipcrypt)).
+The loader encrypts each address under a rule before series identity, the
+length caps and encoding, so the loaded objects hold the ciphertext and not
+the address:
+
+- metric labels are matched by their sanitized name, so a rule written as
+  `client.address` covers the `client_address` label;
+- log and span attributes are matched by their raw key, on the resource, on
+  the record or span, and in a loaded attributes map.
+
+A policy with rules needs the deployment key the tenant keys derive from.
+Pass it as the top-level `--tenant-hash-key-file`, before the subcommand:
+
+```sh
+ravel-cli --tenant-hash-key-file deploy.key load --parquet events.parquet \
+  --tenant acme --mapping map.toml --shards 4 --ipcrypt-config ipcrypt.toml
+```
+
+Every load, with or without `--ipcrypt-config`, runs the server's
+[startup marker check](../ingest.md#startup-marker) before its first write:
+
+- no `sys/ipcrypt/policy` marker and no policy: the load writes no marker;
+- no marker and a policy with rules: the load creates the marker and prints
+  `created sys/ipcrypt/policy with policy fingerprint <hex>`;
+- a marker with a different fingerprint: the load refuses and names both
+  fingerprints. A load without `--ipcrypt-config` into a bucket whose
+  ingest runs a policy is refused this way, rather than storing addresses
+  in the clear;
+- a marker that cannot be read: the load refuses. A read failure is never
+  taken for an absent marker.
+
+#### The `ipcrypt` subcommands
+
+`ravel-cli ipcrypt encrypt` and `ravel-cli ipcrypt decrypt` turn addresses
+into a tenant's ciphertext and back, for one variant and epoch. Use them to
+find an address in stored data, or to read one you found:
+
+```sh
+ravel-cli --tenant-hash-key-file deploy.key ipcrypt encrypt \
+  --tenant acme --variant deterministic --epoch 2 198.51.100.7 '[2001:db8::1]:443'
+```
+
+- `--variant` is `deterministic` or `prefix`, and `--epoch` defaults to 1. It
+  must match the rule the value was stored under: the same address
+  encrypts differently under each tenant, variant and epoch.
+- Each value prints on its own line, in input order. Bare addresses and their
+  `ip:port` forms are accepted.
+- A value that is not an address (or, for `decrypt`, not a ciphertext
+  rendering) prints unchanged, with a note on stderr.
+- Without `--tenant-hash-key-file` both commands refuse.
+
+`ravel-cli ipcrypt set-policy --ipcrypt-config <file>` points the bucket's
+marker at a changed policy:
+
+- it reads the marker, then replaces it with a compare-and-swap on the
+  version it read, or creates it when there is none;
+- an empty policy on a bucket with no marker writes nothing;
+- a marker that another process replaced between the read and the write
+  fails the swap. Nothing is written, and the error names the fingerprint
+  the marker carried when it was read;
+- a marker that cannot be read refuses, with nothing written;
+- a policy with rules and no `--tenant-hash-key-file` is refused.
+
+After `set-policy`, restart every ingesting process with the new file:
+a running server checked the marker only at startup.
+
+Erasing data stored under a policy is covered in
+[erasure under IPCrypt](../deletion-and-gc.md#erasure-under-ipcrypt).
+
 ### `--batch-rows` and object count
 
 `load` writes each batch as one Strict write, and each shard merges the

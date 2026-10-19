@@ -367,9 +367,10 @@ Submit an immutable erasure request: a conjunction of exact-match label/attribut
 
 | Flag | Environment variable | Default | Help |
 | --- | --- | --- | --- |
+| `--ipcrypt-config` |  |  | IPCrypt policy TOML (ADR-2993), the file ingest ran with. A matcher whose key has a rule for `--signal` (metric keys matched by their sanitized form) carries the ciphertext instead of the address, one request per rule epoch (the current one and each retired one); several encrypted matchers submit one request per combination of epochs, at most 16. The matcher key is submitted as written. Every submit, with or without this flag, first compares the policy's fingerprint with the bucket's `sys/ipcrypt/policy` marker and refuses on a mismatch or when the marker cannot be read |
 | `--matcher` |  |  | Exact-match predicate matcher `key=value`, repeatable; the request matches a record only when every matcher holds (logical AND). At least one is required |
 | `--reason` |  |  | Optional free-text operator reason |
-| `--request-id` |  |  | Reuse an explicit request id (UUID) instead of generating one, to retry a prior submit idempotently under CreateIfAbsent |
+| `--request-id` |  |  | Reuse an explicit request id (UUID) instead of generating one, to retry a prior submit idempotently under CreateIfAbsent. When the IPCrypt policy fans the submit out to several requests, this is the base id each request's id is derived from |
 | `--signal` |  |  |  |
 | `--tenant` |  |  |  |
 | `--window-end-ns` |  | `0` | Optional exclusive event-time window end (unix ns) |
@@ -384,6 +385,42 @@ Report an erasure request's state: pending (a `.dreq`, no `.done`), completed (a
 | `--request-id` |  |  |  |
 | `--signal` |  |  |  |
 | `--tenant` |  |  |  |
+
+## ipcrypt
+
+IPCrypt pseudonymization (ADR-2993): encrypt or decrypt addresses under a tenant's key, and set the bucket's `sys/ipcrypt/policy` marker. Every subcommand reads the deployment key from the global `--tenant-hash-key-file`
+
+_No flags._
+
+### ipcrypt encrypt
+
+Encrypt addresses under a tenant's key for one variant and epoch, printing one result per line. A value that is not an address prints unchanged, with a note on stderr
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--epoch` |  | `1` |  |
+| `--tenant` |  |  |  |
+| `--variant` |  |  |  |
+| `<VALUES>` |  |  | The addresses, bare or in their `ip:port` forms |
+
+### ipcrypt decrypt
+
+Decrypt ciphertext renderings back to addresses under a tenant's key for one variant and epoch, printing one result per line. A value that is not an address rendering prints unchanged, with a note on stderr
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--epoch` |  | `1` |  |
+| `--tenant` |  |  |  |
+| `--variant` |  |  |  |
+| `<VALUES>` |  |  |  |
+
+### ipcrypt set-policy
+
+Make the bucket's `sys/ipcrypt/policy` marker carry this policy's fingerprint: replace it with a CAS on the version just read, or create it when absent. A marker replaced between the read and the write fails the CAS and nothing is written. Restart every ingesting process with the new file afterwards
+
+| Flag | Environment variable | Default | Help |
+| --- | --- | --- | --- |
+| `--ipcrypt-config` |  |  |  |
 
 ## idem
 
@@ -693,6 +730,7 @@ Bulk-import a Parquet file into the signal named by `--signal` (ADR-0089, widene
 | `--batch-rows` |  | `10000` | Rows the loader decodes and builds into one batch, and writes as one Strict write. It is the unit of decode, build and write. What the loader holds in built batches is bounded by `--load-memory-bytes`, but memory outside that budget still scales with this value: the read cursors' decode holds about one batch of rows in total, and each flush's working set scales with the per-shard slice. The budget's estimated floor for those was measured at 500,000-row batches (issue #2613). With `--target-bytes` unset it does not set the object size, which is `DEFAULT_OBJECT_ROWS` (250,000) rows per shard object, but it does set the derived `--pipeline-depth` (`ceil(250,000 x --shards / --batch-rows)`). With `--target-bytes 1` each batch flushes as its own object per involved shard, so there this sets the object size. Must be at least 1; 0 is rejected. Defaults to `DEFAULT_BATCH_ROWS` (10000) |
 | `--decode-queue-batches` |  | `2` | Number of decoded batches allowed to sit queued between the Parquet decode/build stage and the shard writers (issue #680). A bounded channel decouples the two: the reader decodes batch N+1 (and, with `--read-cursors > 1`, stride-reads several row-group regions in parallel) while the encoders write batch N, so decode and encode overlap instead of running in lockstep. The reader blocks when the channel is full, so the queue holds at most this many built batches; the extra memory is roughly this count times one batch's built size, on top of `--pipeline-depth`'s in-flight-write working set, and both are charged to `--load-memory-bytes`. Defaults to 2. Must be at least 1; 0 is rejected |
 | `--fold-after-load` |  |  | Fold the loaded tenant's logs catalog once the load succeeds (ADR-2677 decision 1), so the next query resolves the loaded hours from the snapshot instead of listing them. UNSAFE under a live writer: the loader asserts that it is the tenant's only writer and seals through the latest ingest hour it wrote. Later folds keep those hours open to late commits only until the seal margin passes each one, so a commit another writer publishes into a sealed hour after that, or with no fold running before then, stays invisible to queries without a commit token until the HEAD is rebuilt. Logs only: a metrics or spans load with this flag is refused before any row is read or written |
+| `--ipcrypt-config` |  |  | IPCrypt policy TOML (ADR-2993), the same file the server takes as `--ipcrypt-config`. Each ruled address is encrypted before series identity, the length caps and encoding: metric labels are matched by their sanitized name, log and span attributes by their raw key. A policy with rules needs `--tenant-hash-key-file`. Every load, with or without this flag, first compares the policy's fingerprint with the bucket's `sys/ipcrypt/policy` marker and refuses on a mismatch or when the marker cannot be read; with no marker, a policy with rules creates it |
 | `--load-memory-bytes` |  |  | The bytes of built batches a logs load may hold at once (issue #2626). Every batch is charged before it is built, at an estimate from the previous batch's bytes per row (zero for the first batch), and corrected to its measured in-memory size once built, so the first batch and any batch wider than its estimate are built partly uncharged. A batch stays charged through the decode queue, the write window, the shard buffers and its flush; when the budget is full the decoder waits for room. With this flag set, a batch larger than the whole budget fails the load: the first one is refused at start, before anything is written, naming the budget and the batch; a later one once the writes in flight have resolved |
 | `--mapping` |  |  | Path to the `--mapping` TOML (source columns to record fields) |
 | `--max-flush-delay` |  |  | How long a shard buffer may age before the router flushes it, regardless of `--target-bytes` (issue #801). A humantime duration (`2s`, `10m`, `1h5m`). Unset, it is `DEFAULT_MAX_FLUSH_DELAY` (60s) on every signal (issue #2753), long enough that the size trigger and the depth flush, not the age trigger, close a bulk load's objects |

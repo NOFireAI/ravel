@@ -51,11 +51,17 @@ impl StatementAccounting {
     /// handle.
     pub(crate) fn lane(&self, signal: TargetSignal) -> &PhaseAccounting {
         match self {
-            StatementAccounting::Split { lanes, parquet, .. } => SIGNAL_LANE_ORDER
-                .iter()
-                .position(|candidate| *candidate == signal)
-                .and_then(|index| lanes.get(index))
-                .unwrap_or(parquet),
+            StatementAccounting::Split { lanes, parquet, .. } => {
+                let [metrics, logs, spans, alerts, audit] = &**lanes;
+                match signal {
+                    TargetSignal::Metrics => metrics,
+                    TargetSignal::Logs => logs,
+                    TargetSignal::Spans => spans,
+                    TargetSignal::Alerts => alerts,
+                    TargetSignal::Audit => audit,
+                    TargetSignal::Parquet => parquet,
+                }
+            }
             StatementAccounting::One(handle) => handle,
         }
     }
@@ -182,6 +188,25 @@ mod tests {
         assert_eq!(view.pooled_snapshot().total_s3_bytes(), 117);
         assert_eq!(view.resolve_snapshot().total_s3_requests(), 2);
         assert_eq!(view.pooled_snapshot().peak_intermediate_bytes, 64);
+    }
+
+    /// Each signal lane records into its own handle, distinct from every
+    /// other lane's and from the Parquet handle.
+    #[test]
+    fn every_signal_has_its_own_lane_handle() {
+        let view = StatementAccounting::new();
+        for (index, signal) in SIGNAL_LANE_ORDER.iter().enumerate() {
+            charge(view.lane(*signal).scan(), AccountedOp::Get, 1 << index);
+        }
+        for (index, signal) in SIGNAL_LANE_ORDER.iter().enumerate() {
+            assert_eq!(
+                view.lane(*signal).pooled_snapshot().total_s3_bytes(),
+                1 << index,
+                "{signal:?}"
+            );
+        }
+        assert_eq!(view.parquet().pooled_snapshot().total_s3_requests(), 0);
+        assert_eq!(view.pooled_snapshot().total_s3_bytes(), 0b11111);
     }
 
     #[test]

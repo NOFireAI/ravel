@@ -168,6 +168,285 @@ pub async fn submit(
     }
 }
 
+/// The most erasure requests one `erase submit` fans out to under an IPCrypt
+/// policy (ADR-2993 decision 8).
+pub const MAX_IPCRYPT_REQUESTS: usize = 16;
+
+/// One matcher whose key has an IPCrypt rule for the request's signal, and
+/// the epoch its value was encrypted under in one planned request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptedMatcher {
+    /// The matcher's key, as written on the command line.
+    pub key: String,
+    /// The rule's key, as written in the policy.
+    pub rule_key: String,
+    pub epoch: u32,
+}
+
+/// One erasure request `erase submit` will write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedRequest {
+    pub request_id: Uuid,
+    /// The full matcher set, encrypted values in place.
+    pub matchers: Vec<(String, String)>,
+    /// The encrypted matchers, in matcher order.
+    pub epochs: Vec<EncryptedMatcher>,
+}
+
+/// A [`PlannedRequest`]'s matchers and epochs, before its id is assigned.
+type PlanDraft = (Vec<(String, String)>, Vec<EncryptedMatcher>);
+
+/// One matcher's candidate values: the value unchanged, or one ciphertext
+/// per epoch of its rule.
+enum MatcherValues {
+    Plain(String),
+    Encrypted {
+        rule_key: String,
+        values: Vec<(u32, String)>,
+    },
+}
+
+/// The request id of one request in a multi-request fan-out: a UUID-shaped
+/// blake3 hash of the base id and the request's epochs, so retrying the
+/// command with the same base id re-submits the same requests.
+pub fn derived_request_id(base: Uuid, epochs: &[EncryptedMatcher]) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ravel-cli erase submit ipcrypt epoch request v1\0");
+    hasher.update(base.as_bytes());
+    for matcher in epochs {
+        hasher.update(&(matcher.key.len() as u64).to_le_bytes());
+        hasher.update(matcher.key.as_bytes());
+        hasher.update(&matcher.epoch.to_le_bytes());
+    }
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    uuid::Builder::from_random_bytes(bytes).into_uuid()
+}
+
+/// Plan the requests `matchers` become under `tenant`'s IPCrypt `rules`
+/// (ADR-2993 decision 8). A matcher whose key has a rule for `signal` (looked
+/// up by its sanitized form for metrics, by its raw key otherwise) carries
+/// that rule's ciphertext, and the plan holds one request per combination of
+/// the encrypted matchers' epochs (the rule's `epoch`, then each of its
+/// `retired_epochs`). The matcher key stays as written. A value that is not
+/// an address, and an empty value, stay unchanged. More than
+/// [`MAX_IPCRYPT_REQUESTS`] requests is refused, naming the rules. With one
+/// request it carries `base_id`; with several, each carries
+/// [`derived_request_id`].
+pub fn plan_requests(
+    policy: &crate::ipcrypt::IpcryptPolicy,
+    rules: &ravel_ipcrypt::rules::TenantRules,
+    tenant: &str,
+    signal: SignalArg,
+    matchers: Vec<(String, String)>,
+    base_id: Uuid,
+) -> anyhow::Result<Vec<PlannedRequest>> {
+    let mut candidates = Vec::with_capacity(matchers.len());
+    for (key, value) in &matchers {
+        let info = if value.is_empty() {
+            None
+        } else if signal == SignalArg::Metrics {
+            rules.lookup_label(&crate::ipcrypt::sanitize_rule_key(key))
+        } else {
+            rules.lookup_raw(key)
+        };
+        let Some(info) = info else {
+            candidates.push(MatcherValues::Plain(value.clone()));
+            continue;
+        };
+        let mut values = Vec::with_capacity(1 + info.retired_epochs.len());
+        for epoch in std::iter::once(info.epoch).chain(info.retired_epochs.iter().copied()) {
+            let Some(epoch_key) = policy.epoch_key(tenant, info.variant, epoch)? else {
+                anyhow::bail!(crate::ipcrypt::NO_DEPLOYMENT_KEY);
+            };
+            match epoch_key.encrypt(value) {
+                (encrypted, ravel_ipcrypt::render::RenderOutcome::Encrypted) => {
+                    values.push((epoch, encrypted));
+                }
+                (_, ravel_ipcrypt::render::RenderOutcome::Unparsed) => {
+                    values.clear();
+                    break;
+                }
+            }
+        }
+        if values.is_empty() {
+            candidates.push(MatcherValues::Plain(value.clone()));
+        } else {
+            candidates.push(MatcherValues::Encrypted {
+                rule_key: info.raw_key.to_string(),
+                values,
+            });
+        }
+    }
+
+    let total = candidates.iter().try_fold(1usize, |acc, c| match c {
+        MatcherValues::Plain(_) => Some(acc),
+        MatcherValues::Encrypted { values, .. } => acc.checked_mul(values.len()),
+    });
+    if total.is_none_or(|n| n > MAX_IPCRYPT_REQUESTS) {
+        let multiplying: Vec<String> = matchers
+            .iter()
+            .zip(&candidates)
+            .filter_map(|((key, _), c)| match c {
+                MatcherValues::Encrypted { rule_key, values } if values.len() > 1 => {
+                    let epochs: Vec<String> = values.iter().map(|(e, _)| e.to_string()).collect();
+                    Some(format!(
+                        "rule {rule_key:?} (matcher {key:?}) has epochs [{}]",
+                        epochs.join(", ")
+                    ))
+                }
+                _ => None,
+            })
+            .collect();
+        let count = total.map_or_else(|| "too many".to_string(), |n| n.to_string());
+        anyhow::bail!(
+            "refusing to submit: the IPCrypt-encrypted matchers need one erasure request per \
+             combination of their rules' epochs, {count} requests, more than \
+             {MAX_IPCRYPT_REQUESTS}: {}. Drop retired_epochs whose data has aged out of \
+             retention, or submit fewer encrypted matchers per command. Nothing was submitted",
+            multiplying.join("; ")
+        );
+    }
+
+    let mut plans: Vec<PlanDraft> = vec![(Vec::with_capacity(matchers.len()), Vec::new())];
+    for ((key, _), candidate) in matchers.iter().zip(candidates) {
+        match candidate {
+            MatcherValues::Plain(value) => {
+                for (set, _) in &mut plans {
+                    set.push((key.clone(), value.clone()));
+                }
+            }
+            MatcherValues::Encrypted { rule_key, values } => {
+                let mut next = Vec::with_capacity(plans.len() * values.len());
+                for (set, epochs) in &plans {
+                    for (epoch, encrypted) in &values {
+                        let mut set = set.clone();
+                        set.push((key.clone(), encrypted.clone()));
+                        let mut epochs = epochs.clone();
+                        epochs.push(EncryptedMatcher {
+                            key: key.clone(),
+                            rule_key: rule_key.clone(),
+                            epoch: *epoch,
+                        });
+                        next.push((set, epochs));
+                    }
+                }
+                plans = next;
+            }
+        }
+    }
+    let single = plans.len() == 1;
+    Ok(plans
+        .into_iter()
+        .map(|(matchers, epochs)| PlannedRequest {
+            request_id: if single {
+                base_id
+            } else {
+                derived_request_id(base_id, &epochs)
+            },
+            matchers,
+            epochs,
+        })
+        .collect())
+}
+
+/// What [`submit_with_ipcrypt`] submitted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcryptSubmitReport {
+    pub base_id: Uuid,
+    pub requests: Vec<(PlannedRequest, SubmitOutcome)>,
+    pub created: usize,
+    pub already_present: usize,
+}
+
+/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8):
+/// [`plan_requests`], then the `sys/ipcrypt/policy` marker check, then one
+/// [`submit`] per planned request. A failure part-way names the base id, so
+/// rerunning with it as `--request-id` finishes the requests left out.
+#[allow(clippy::too_many_arguments)]
+pub async fn submit_with_ipcrypt(
+    store: Arc<dyn ObjectStoreBackend>,
+    policy: &crate::ipcrypt::IpcryptPolicy,
+    tenant: &str,
+    signal: SignalArg,
+    matchers: Vec<(String, String)>,
+    window_start_ns: i64,
+    window_end_ns: i64,
+    reason: String,
+    base_id: Uuid,
+    now_ns: i64,
+    out: &mut dyn std::io::Write,
+) -> anyhow::Result<IpcryptSubmitReport> {
+    // Plan before the marker check, so a refused plan writes nothing at all,
+    // not even the marker a first policy run would create.
+    let rules = policy.rules_for(tenant)?;
+    let plans = plan_requests(policy, &rules, tenant, signal, matchers, base_id)?;
+    policy
+        .check_marker_logged(store.as_ref(), "erase submit", out)
+        .await?;
+    let total = plans.len();
+    if total > 1 {
+        writeln!(
+            out,
+            "erasure base request id {base_id}: submitting {total} requests, one per IPCrypt \
+             epoch combination"
+        )?;
+    }
+    let mut report = IpcryptSubmitReport {
+        base_id,
+        requests: Vec::with_capacity(total),
+        created: 0,
+        already_present: 0,
+    };
+    for (done, plan) in plans.into_iter().enumerate() {
+        let outcome = submit(
+            store.clone(),
+            tenant,
+            signal,
+            plan.matchers.clone(),
+            window_start_ns,
+            window_end_ns,
+            reason.clone(),
+            plan.request_id,
+            now_ns,
+        )
+        .await
+        .map_err(|err| {
+            if total > 1 {
+                err.context(format!(
+                    "erasure request {} failed after {done} of {total} were submitted; rerun \
+                     with --request-id {base_id} to finish",
+                    plan.request_id
+                ))
+            } else {
+                err
+            }
+        })?;
+        match outcome {
+            SubmitOutcome::Created => report.created += 1,
+            SubmitOutcome::AlreadyPresent => report.already_present += 1,
+        }
+        report.requests.push((plan, outcome));
+    }
+    if total > 1 {
+        writeln!(out, "erasure base request id {base_id}:")?;
+        for (plan, _) in &report.requests {
+            let epochs: Vec<String> = plan
+                .epochs
+                .iter()
+                .map(|m| format!("{} epoch {}", m.key, m.epoch))
+                .collect();
+            writeln!(out, "  {} ({})", plan.request_id, epochs.join(", "))?;
+        }
+        writeln!(
+            out,
+            "{total} erasure requests: {} created, {} already present",
+            report.created, report.already_present
+        )?;
+    }
+    Ok(report)
+}
+
 /// Whether two erasure requests define the *same* erasure: they agree on every
 /// field that determines which records get dropped. That is the predicate
 /// matchers (compared as an unordered multiset, since matcher order is not
@@ -721,5 +1000,483 @@ mod tests {
         );
         assert!(parse_matcher("=novalue").is_err(), "empty key rejected");
         assert!(parse_matcher("nokey").is_err(), "missing '=' rejected");
+    }
+}
+
+/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8).
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod ipcrypt_tests {
+    use super::*;
+    use crate::ipcrypt::{IpcryptPolicy, sanitize_rule_key};
+    use ravel_ipcrypt::marker::{IPCRYPT_POLICY_KEY, check_marker};
+    use ravel_ipcrypt::policy::{Variant, parse_policy_file};
+    use ravel_ipcrypt::render::RenderOutcome;
+    use ravel_ipcrypt::rules::EpochKey;
+    use ravel_object_store::fault::{
+        FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule as FaultRule, ScriptedFault,
+    };
+    use ravel_object_store::memory::MemoryStore;
+
+    const TENANT: &str = "acme";
+    const DEPLOYMENT_KEY: [u8; 32] = [0x5a; 32];
+    const NOW_NS: i64 = 1_700_000_000_000_000_000;
+    const CLIENT: &str = "198.51.100.101";
+    const HOST: &str = "198.51.100.102";
+
+    /// `client.ip` at epoch 2 with epoch 1 retired, `host.ip` at epoch 3 with
+    /// epoch 1 retired.
+    const TWO_EPOCH_POLICY: &str = r#"
+[[defaults.rules]]
+key = "client.ip"
+variant = "deterministic"
+epoch = 2
+retired_epochs = [1]
+
+[[defaults.rules]]
+key = "host.ip"
+variant = "prefix"
+epoch = 3
+retired_epochs = [1]
+"#;
+
+    /// Five epochs on each of two rules: 25 requests for both matchers.
+    const FIVE_EPOCH_POLICY: &str = r#"
+[[defaults.rules]]
+key = "client.ip"
+variant = "deterministic"
+epoch = 5
+retired_epochs = [1, 2, 3, 4]
+
+[[defaults.rules]]
+key = "host.ip"
+variant = "prefix"
+epoch = 5
+retired_epochs = [1, 2, 3, 4]
+"#;
+
+    fn policy(text: &str) -> IpcryptPolicy {
+        let file = parse_policy_file(text, sanitize_rule_key).expect("policy parses");
+        IpcryptPolicy::new(file, Some(&DEPLOYMENT_KEY)).expect("policy loads")
+    }
+
+    /// `value` under `variant` and `epoch`, derived from the deployment key
+    /// directly rather than through the rules the submit resolved.
+    fn ciphertext(variant: Variant, epoch: u32, value: &str) -> String {
+        let key = EpochKey::new(
+            &DEPLOYMENT_KEY,
+            &TenantId::new(TENANT).hash(),
+            variant,
+            epoch,
+        )
+        .expect("key derives");
+        let (encrypted, outcome) = key.encrypt(value);
+        assert_eq!(outcome, RenderOutcome::Encrypted);
+        encrypted
+    }
+
+    fn matcher(key: &str, value: &str) -> (String, String) {
+        (key.to_string(), value.to_string())
+    }
+
+    async fn submit_logs(
+        store: &Arc<dyn ObjectStoreBackend>,
+        policy: &IpcryptPolicy,
+        matchers: Vec<(String, String)>,
+        base: Uuid,
+    ) -> anyhow::Result<IpcryptSubmitReport> {
+        submit_with_ipcrypt(
+            Arc::clone(store),
+            policy,
+            TENANT,
+            SignalArg::Logs,
+            matchers,
+            0,
+            0,
+            "dsar-1".to_string(),
+            base,
+            NOW_NS,
+            &mut Vec::new(),
+        )
+        .await
+    }
+
+    /// The stored `.dreq` for `id`, decoded.
+    async fn stored_request(
+        store: &Arc<dyn ObjectStoreBackend>,
+        signal: Signal,
+        id: Uuid,
+    ) -> ErasureRequest {
+        let key = keys::erasure_request_key(&TenantId::new(TENANT).hash(), signal, id)
+            .expect("request key");
+        let got = store.get(&key, GetRange::Full).await.expect(".dreq stored");
+        erasure::decode_request(&got.data).expect("well-formed .dreq")
+    }
+
+    fn predicate(request: &ErasureRequest) -> Vec<(String, String)> {
+        request
+            .predicate
+            .iter()
+            .map(|m| (m.key.clone(), m.value.clone()))
+            .collect()
+    }
+
+    async fn request_keys(store: &dyn ObjectStoreBackend) -> Vec<String> {
+        list_all(store, "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|o| o.key)
+            .filter(|k| k.contains("/del/"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn one_request_per_epoch_with_derived_ids_and_each_epochs_ciphertext() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(7);
+        let report = submit_logs(&store, &policy, vec![matcher("client.ip", CLIENT)], base)
+            .await
+            .expect("submit");
+
+        assert_eq!(report.base_id, base);
+        assert_eq!(report.requests.len(), 2);
+        assert_eq!((report.created, report.already_present), (2, 0));
+        for ((plan, outcome), epoch) in report.requests.iter().zip([2u32, 1]) {
+            assert_eq!(*outcome, SubmitOutcome::Created);
+            let expected_epochs = vec![EncryptedMatcher {
+                key: "client.ip".to_string(),
+                rule_key: "client.ip".to_string(),
+                epoch,
+            }];
+            assert_eq!(plan.epochs, expected_epochs);
+            assert_eq!(plan.request_id, derived_request_id(base, &expected_epochs));
+            assert_ne!(plan.request_id, base);
+            let stored = stored_request(&store, Signal::Logs, plan.request_id).await;
+            assert_eq!(
+                predicate(&stored),
+                vec![matcher(
+                    "client.ip",
+                    &ciphertext(Variant::Deterministic, epoch, CLIENT)
+                )],
+                "epoch {epoch}"
+            );
+        }
+        assert_ne!(
+            report.requests[0].0.request_id,
+            report.requests[1].0.request_id
+        );
+        assert_eq!(request_keys(store.as_ref()).await.len(), 2);
+        let marker = ravel_ipcrypt::marker::read_marker(store.as_ref())
+            .await
+            .expect("read marker")
+            .map(|(marker, _)| marker.fingerprint);
+        assert_eq!(
+            marker,
+            Some(policy.fingerprint()),
+            "the submit created the marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_encrypted_matchers_with_two_epochs_each_give_four_requests() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(8);
+        let report = submit_logs(
+            &store,
+            &policy,
+            vec![
+                matcher("client.ip", CLIENT),
+                matcher("service.name", "api"),
+                matcher("host.ip", HOST),
+            ],
+            base,
+        )
+        .await
+        .expect("submit");
+
+        assert_eq!(report.requests.len(), 4);
+        assert_eq!(report.created, 4);
+        let mut seen = HashSet::new();
+        for (client_epoch, host_epoch) in [(2u32, 3u32), (2, 1), (1, 3), (1, 1)] {
+            let want = vec![
+                matcher(
+                    "client.ip",
+                    &ciphertext(Variant::Deterministic, client_epoch, CLIENT),
+                ),
+                matcher("service.name", "api"),
+                matcher("host.ip", &ciphertext(Variant::Prefix, host_epoch, HOST)),
+            ];
+            let (plan, _) = report
+                .requests
+                .iter()
+                .find(|(plan, _)| plan.matchers == want)
+                .unwrap_or_else(|| panic!("no request for epochs {client_epoch}/{host_epoch}"));
+            let stored = stored_request(&store, Signal::Logs, plan.request_id).await;
+            assert_eq!(predicate(&stored), want);
+            assert!(seen.insert(plan.request_id));
+        }
+        assert_eq!(request_keys(store.as_ref()).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn more_than_sixteen_requests_is_refused_before_any_write() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(FIVE_EPOCH_POLICY);
+        let err = submit_logs(
+            &store,
+            &policy,
+            vec![matcher("client.ip", CLIENT), matcher("host.ip", HOST)],
+            Uuid::from_u128(9),
+        )
+        .await
+        .expect_err("25 requests must be refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("25 requests, more than 16"), "{message}");
+        assert!(
+            message
+                .contains("rule \"client.ip\" (matcher \"client.ip\") has epochs [5, 1, 2, 3, 4]"),
+            "{message}"
+        );
+        assert!(message.contains("rule \"host.ip\""), "{message}");
+        let all = list_all(store.as_ref(), "").await.expect("list");
+        assert!(
+            all.is_empty(),
+            "a refused plan writes nothing: {:?}",
+            all.iter().map(|o| o.key.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retry_with_the_same_base_id_resubmits_the_same_requests() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(10);
+        let matchers = vec![matcher("client.ip", CLIENT), matcher("host.ip", HOST)];
+        let first = submit_logs(&store, &policy, matchers.clone(), base)
+            .await
+            .expect("first submit");
+        let mut out = Vec::new();
+        let retry = submit_with_ipcrypt(
+            Arc::clone(&store),
+            &policy,
+            TENANT,
+            SignalArg::Logs,
+            matchers,
+            0,
+            0,
+            "dsar-1".to_string(),
+            base,
+            NOW_NS,
+            &mut out,
+        )
+        .await
+        .expect("a retry is not a conflict");
+        let ids = |report: &IpcryptSubmitReport| -> Vec<Uuid> {
+            report.requests.iter().map(|(p, _)| p.request_id).collect()
+        };
+        assert_eq!(ids(&first), ids(&retry));
+        assert_eq!((retry.created, retry.already_present), (0, 4));
+        assert_eq!(request_keys(store.as_ref()).await.len(), 4);
+
+        let out = String::from_utf8(out).expect("utf-8");
+        assert!(
+            out.contains(&format!("erasure base request id {base}:\n")),
+            "{out}"
+        );
+        for id in ids(&retry) {
+            assert!(out.contains(&format!("  {id} (client.ip epoch ")), "{out}");
+        }
+        assert!(
+            out.ends_with("4 erasure requests: 0 created, 4 already present\n"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_request_keeps_the_base_id() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy =
+            policy("[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n");
+        let base = Uuid::from_u128(11);
+        let report = submit_logs(&store, &policy, vec![matcher("client.ip", CLIENT)], base)
+            .await
+            .expect("submit");
+        assert_eq!(report.requests.len(), 1);
+        assert_eq!(report.requests[0].0.request_id, base);
+        let stored = stored_request(&store, Signal::Logs, base).await;
+        assert_eq!(
+            predicate(&stored),
+            vec![matcher(
+                "client.ip",
+                &ciphertext(Variant::Deterministic, 1, CLIENT)
+            )]
+        );
+    }
+
+    /// A metric matcher names the label as stored; the rule is found through
+    /// the sanitized key and the key itself is submitted as written.
+    #[tokio::test]
+    async fn a_metric_matcher_is_ruled_through_its_sanitized_label_name() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy =
+            policy("[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\n");
+        let base = Uuid::from_u128(12);
+        submit_with_ipcrypt(
+            Arc::clone(&store),
+            &policy,
+            TENANT,
+            SignalArg::Metrics,
+            vec![matcher("client_ip", CLIENT)],
+            0,
+            0,
+            String::new(),
+            base,
+            NOW_NS,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("submit");
+        let stored = stored_request(&store, Signal::Metrics, base).await;
+        assert_eq!(
+            predicate(&stored),
+            vec![matcher(
+                "client_ip",
+                &ciphertext(Variant::Deterministic, 1, CLIENT)
+            )]
+        );
+
+        // A label stored as sent over Remote Write keeps its dotted name in
+        // the matcher, and the same rule encrypts its value.
+        let dotted = Uuid::from_u128(14);
+        submit_with_ipcrypt(
+            Arc::clone(&store),
+            &policy,
+            TENANT,
+            SignalArg::Metrics,
+            vec![matcher("client.ip", CLIENT)],
+            0,
+            0,
+            String::new(),
+            dotted,
+            NOW_NS,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("submit");
+        let stored = stored_request(&store, Signal::Metrics, dotted).await;
+        assert_eq!(
+            predicate(&stored),
+            vec![matcher(
+                "client.ip",
+                &ciphertext(Variant::Deterministic, 1, CLIENT)
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_value_that_is_not_an_address_is_submitted_unchanged() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(13);
+        let report = submit_logs(&store, &policy, vec![matcher("client.ip", "unknown")], base)
+            .await
+            .expect("submit");
+        assert_eq!(report.requests.len(), 1);
+        assert!(report.requests[0].0.epochs.is_empty());
+        let stored = stored_request(&store, Signal::Logs, base).await;
+        assert_eq!(predicate(&stored), vec![matcher("client.ip", "unknown")]);
+    }
+
+    #[tokio::test]
+    async fn a_marker_mismatch_refuses_and_writes_no_request() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let other = [7u8; 32];
+        check_marker(store.as_ref(), other)
+            .await
+            .expect("seed marker");
+        let policy = policy(TWO_EPOCH_POLICY);
+        let err = submit_logs(
+            &store,
+            &policy,
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(14),
+        )
+        .await
+        .expect_err("a different policy must be refused");
+        let message = format!("{err:#}");
+        assert!(message.contains("refusing to erase submit"), "{message}");
+        assert!(message.contains(&hex::encode(other)), "{message}");
+        assert!(
+            message.contains(&hex::encode(policy.fingerprint())),
+            "{message}"
+        );
+        assert!(request_keys(store.as_ref()).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_marker_read_failure_refuses_and_writes_nothing() {
+        let faulty = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Get, ScriptedFault::Transient("marker read".into()))
+                    .with_key_contains(IPCRYPT_POLICY_KEY),
+            ),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let policy = policy(TWO_EPOCH_POLICY);
+        let err = submit_logs(
+            &store,
+            &policy,
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(15),
+        )
+        .await
+        .expect_err("a failed marker read must refuse");
+        assert!(
+            format!("{err:#}").contains("refusing to erase submit"),
+            "{err:#}"
+        );
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Transient), 1);
+        let keys = list_all(faulty.inner(), "").await.expect("list");
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+
+    /// A write failing part-way names the base id, and rerunning with it
+    /// submits only the requests left out.
+    #[tokio::test]
+    async fn a_failure_part_way_names_the_base_id_and_a_rerun_finishes() {
+        let faulty = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Put, ScriptedFault::Transient("second request".into()))
+                    .with_key_contains("/del/")
+                    .with_occurrence(Occurrence::Nth(2)),
+            ),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(16);
+        let matchers = vec![matcher("client.ip", CLIENT), matcher("host.ip", HOST)];
+        let err = submit_logs(&store, &policy, matchers.clone(), base)
+            .await
+            .expect_err("the second write fails");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains(&format!(
+                "failed after 1 of 4 were submitted; rerun with --request-id {base} to finish"
+            )),
+            "{message}"
+        );
+        assert_eq!(faulty.fault_count(Op::Put, FaultKind::Transient), 1);
+        assert_eq!(request_keys(faulty.inner()).await.len(), 1);
+
+        let rerun = submit_logs(&store, &policy, matchers, base)
+            .await
+            .expect("rerun");
+        assert_eq!((rerun.created, rerun.already_present), (3, 1));
+        assert_eq!(request_keys(faulty.inner()).await.len(), 4);
     }
 }

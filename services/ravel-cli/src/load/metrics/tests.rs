@@ -48,8 +48,16 @@ fn the_metrics_row_path_reads_dictionary_columns_in_place() {
         let cols = MetricsColumnIndex::resolve(b, &mapping).expect("columns resolve");
         (0..b.num_rows())
             .map(|row| {
-                let r = build_metric_row(b, &cols, &mapping, &limits, NOW_NS, row)
-                    .expect("the row builds");
+                let r = build_metric_row(
+                    b,
+                    &cols,
+                    &mapping,
+                    &limits,
+                    &TenantRules::none(),
+                    NOW_NS,
+                    row,
+                )
+                .expect("the row builds");
                 (r.name, r.labels)
             })
             .collect()
@@ -179,6 +187,7 @@ mod otlp_series_identity_parity {
             &tenant(),
             mapping,
             &limits,
+            &TenantRules::none(),
             NOW_NS,
             is_monotonic_sum,
             grouper.as_mut(),
@@ -521,6 +530,7 @@ mod metrics_pipeline_review {
             &TenantId::new("acme"),
             mapping,
             &IngestLimits::default(),
+            &TenantRules::none(),
             NOW_NS,
             false,
             None,
@@ -1100,6 +1110,7 @@ mod default_geometry {
             Some(DEFAULT_MAX_FLUSH_DELAY),
             NOW_NS,
             clock,
+            Arc::new(TenantRules::none()),
         )
         .await
     }
@@ -1377,6 +1388,7 @@ mod default_geometry {
             &tenant,
             &mapping,
             &IngestLimits::default(),
+            &TenantRules::none(),
             NOW_NS,
             false,
             Some(&mut grouper),
@@ -1414,6 +1426,7 @@ mod default_geometry {
             Some(DEFAULT_MAX_FLUSH_DELAY),
             NOW_NS,
             Arc::new(FixedClock(NOW_NS)),
+            Arc::new(TenantRules::none()),
         )
         .await
         .expect("load succeeds");

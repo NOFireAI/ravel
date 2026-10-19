@@ -741,6 +741,43 @@ optional event-time range; v1 predicates are equality-only (exact semantics by
 default). The `CreateIfAbsent` ack timestamp is `t = 0`, the point from which
 every bound is measured.
 
+### Erasure under IPCrypt
+
+Under an IPCrypt policy ([ingest.md](ingest.md#pseudonymization-ipcrypt)) the
+stored value is the address's ciphertext, so a matcher that names the address
+would match nothing. `ravel-cli erase submit --ipcrypt-config <file>` takes the
+file ingest ran with, plus the top-level `--tenant-hash-key-file`, and
+encrypts for the caller (ADR-2993 decision 8):
+
+- A matcher whose key has a rule for `--signal` carries that rule's ciphertext
+  of its value. The matcher key is submitted as written. A value that is not
+  an address is submitted unchanged.
+- On the metric signals the rule lookup sanitizes the matcher key, but series
+  labels are matched exactly (ADR-0064), so a metric matcher must name the
+  label as stored. A series received over Remote Write as `client.address` is
+  matched by `client.address`, not `client_address`, and both spellings are
+  encrypted under the rule written as `client.address`. A tenant that receives
+  both spellings submits one erasure request per spelling.
+- Data encrypted under a retired epoch holds a different ciphertext, so the
+  command submits one request per epoch of the rule: its `epoch`, then each of
+  its `retired_epochs`. Several encrypted matchers submit one request per
+  combination of their epochs. More than 16 requests is refused before
+  anything is written, naming each rule and its epochs.
+- A single request carries `--request-id` (or a generated id). Several
+  requests each carry an id derived from that base id and the request's
+  matcher keys and epochs, so rerunning with the same `--request-id`
+  re-submits the same requests and finds them already present. A failure
+  part-way names the base id to rerun with.
+- With several requests the output lists the base id, then each derived id
+  with its epochs, then `<n> erasure requests: <c> created, <p> already
+  present`.
+
+Every submit, with or without `--ipcrypt-config`, first runs the startup
+marker check ([ingest.md](ingest.md#startup-marker)), after planning the
+requests and before writing any of them: it refuses on a fingerprint mismatch
+or a marker that cannot be read, and creates the marker when there is none and
+the policy has rules.
+
 ### The stages in detail
 
 - **Query exclusion is immediate and cache-tight.** Snapshot resolution lists

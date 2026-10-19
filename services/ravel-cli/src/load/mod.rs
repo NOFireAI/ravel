@@ -44,6 +44,7 @@ use ravel_ingest::{
     RlogZstdLevel, STRICT_VISIBILITY_RESERVE_NS, SpanIngestRouter, SpanWriteError,
     SpanWriteReceipt, SystemClock, WriteError, WriteMode, WriteReceipt,
 };
+use ravel_ipcrypt::rules::TenantRules;
 use ravel_logseg::{Bitmap, ColumnarLogBatch, DynCells, DynColumn, FieldType, stream_attrs_bytes};
 use ravel_object_store::ObjectStoreBackend;
 use ravel_otlp::logs_limits::LogIngestLimits;
@@ -59,6 +60,7 @@ use ravel_types::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::ipcrypt::IpcryptPolicy;
 use crate::maintain::SignalArg;
 
 /// The label the classic-histogram explosion synthesizes per bucket, carrying
@@ -705,3 +707,7 @@ mod test_support;
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests;
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod ipcrypt_scan_tests;

@@ -349,6 +349,7 @@ async fn distributed_slice_do_get_excludes_what_the_resolve_saw_pending() {
         declared_columns: Vec::new(),
         parquet_tables: Vec::new(),
         budgets: None,
+        signal_groups: Vec::new(),
     };
     let config = DistributedFlightConfig {
         workers: Arc::new(ravel_sql::StaticWorkerEndpoints::new([
