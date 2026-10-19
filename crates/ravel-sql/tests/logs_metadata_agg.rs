@@ -270,6 +270,7 @@ fn logs_session_with(
         SessionTable::Logs(Arc::new(provider)),
         exact_typed_aggregates,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
 }
 

@@ -259,9 +259,12 @@ async fn run(state: &SqlState, req: Request<Body>) -> Result<Response, ServiceEr
     let now_ns = state.clock.now_ns();
     let request = build_request(&body, now_ns, state.max_deadline)?;
 
+    let capabilities = ravel_sql::SqlCapabilities {
+        ipcrypt: principal.ipcrypt,
+    };
     let execution = state
         .service()
-        .sql_execute_timed(tenant_hash, &request)
+        .sql_execute_timed_with(tenant_hash, capabilities, &request)
         .await?;
     respond(&headers, execution, tenant_hash)
 }
