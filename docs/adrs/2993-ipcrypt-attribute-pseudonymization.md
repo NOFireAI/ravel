@@ -395,9 +395,9 @@ matcher's value under the rule before it submits the erasure request.
   unchanged, matching how ingest stored it.
 
 The request records the encrypted value, never the raw one: the
-erasure log is itself retained data (this holds for every matcher whose
-key has a rule, except a plaintext matcher the operator names
-explicitly; see the erasure amendment of 2026-10-19 below).
+erasure log is itself retained data (this holds for every address
+value under a key that has a rule, except a plaintext matcher the
+operator names explicitly; see the erasure amendment of 2026-10-19 below).
 
 Erasure stays exact-match, as ADR-0064 defines it. A stored `ip:port`
 value is matched only by a matcher carrying the same port, and an
@@ -743,11 +743,12 @@ Two gaps in decision 8 surfaced when `ravel-cli erase submit` was built
   data written after holds ciphertext for both, so no record could
   match. An operator who wants both the older raw data and the newer
   encrypted data erased submits one command with plaintext matchers and
-  one without. For a value whose key has a rule, this is the one way a
-  raw value reaches the erasure log; matchers on keys with no rule, and
-  values that are not addresses, are recorded as written, as before.
+  one without. For an address value under a key that has a rule, this
+  is the one way a raw value reaches the erasure log; matchers on keys
+  with no rule, and values that are not addresses, are recorded as
+  written, as before.
 - **erase submit never creates the marker.** Unlike a data writer,
-  `erase submit` does not create `sys/ipcrypt/policy` when it is absent.
+  `erase submit` must not create `sys/ipcrypt/policy` when it is absent.
   An absent marker with a non-empty local policy means no process has
   written data under that policy, so every encrypted matcher would match
   nothing and the command would report a successful erasure of zero
@@ -760,3 +761,6 @@ Two gaps in decision 8 surfaced when `ravel-cli erase submit` was built
   plaintext matchers or keys with no rule proceeds, with the policy
   loaded and no marker written. An absent marker with an empty local
   policy proceeds as before.
+
+The `erase submit` merged with #3049 still creates the marker and has no
+plaintext matcher; the code change for both bullets lands with #3108.
