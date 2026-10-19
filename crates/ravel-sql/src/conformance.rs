@@ -295,21 +295,42 @@ const NAMED_ADMITTED_SCALARS: [ScalarFamily; 1] = [ScalarFamily {
 /// member of [`ADMITTED_SCALARS`]; the drift test asserts that. Each carries a
 /// real expectation over the conformance fixture in `tests/conformance.rs`:
 /// `label`/`label_match` read the fixture's `__name__` label, `has_word` reads
-/// the fixture's log bodies.
-const RAVEL_SCALAR_UDFS: [(&str, &str); 3] = [
+/// the fixture's log bodies, and the two IPCrypt functions answer the
+/// ciphertext the fixture's test deployment key derives for its tenant.
+const RAVEL_SCALAR_UDFS: [(&str, &str, &str); 5] = [
     (
         "label",
         "SELECT label(labels, '__name__') FROM samples WHERE value = 3.0",
+        RAVEL_UDF_RATIONALE,
     ),
     (
         "label_match",
         "SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')",
+        RAVEL_UDF_RATIONALE,
     ),
     (
         "has_word",
         "SELECT count(*) FROM logs WHERE has_word(body, '1')",
+        RAVEL_UDF_RATIONALE,
+    ),
+    (
+        "ipcrypt_encrypt",
+        "SELECT ipcrypt_encrypt('192.0.2.7', 1) FROM samples LIMIT 1",
+        IPCRYPT_UDF_RATIONALE,
+    ),
+    (
+        "ipcrypt_prefix_encrypt",
+        "SELECT ipcrypt_prefix_encrypt('192.0.2.7', 1) FROM samples LIMIT 1",
+        IPCRYPT_UDF_RATIONALE,
     ),
 ];
+
+const RAVEL_UDF_RATIONALE: &str =
+    "Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8)";
+
+const IPCRYPT_UDF_RATIONALE: &str = "Ravel per-session scalar UDF, registered only for a principal \
+     holding the ipcrypt capability on a deployment with a key and no plaintext query audit \
+     (ADR-2993 decision 6); individually attested (ADR-0097 decision 8)";
 
 /// The number of admitted-scalar conformance rows the registry is expected to
 /// emit: one per admitted family, plus each individually-named admitted
@@ -321,7 +342,7 @@ const RAVEL_SCALAR_UDFS: [(&str, &str); 3] = [
 /// (#408). A deliberate change to the family/UDF set updates this literal in the
 /// same edit.
 #[cfg(test)]
-const EXPECTED_ADMITTED_SCALAR_ROW_COUNT: usize = 10;
+const EXPECTED_ADMITTED_SCALAR_ROW_COUNT: usize = 12;
 
 /// The eight admitted native window functions (ADR-0097 decision 6), each with
 /// an `OVER` example whose aggregated result is re-derived from the four
@@ -654,7 +675,7 @@ pub fn registry() -> Vec<Construct> {
     // of each family stay admitted (they survive build_session's scalar gate,
     // held exhaustive against the upstream registrations by the drift test in
     // crate::session) but are covered by the family row and that drift test,
-    // NOT individually attested here: 127 rows would mostly test upstream
+    // NOT individually attested here: 129 rows would mostly test upstream
     // DataFusion rather than Ravel (ADR-0097 decision 8).
     for fam in &ADMITTED_SCALAR_FAMILIES {
         out.push(Construct {
@@ -680,13 +701,13 @@ pub fn registry() -> Vec<Construct> {
     }
     // Ravel's own scalar UDFs, individually attested: each is Ravel code, not
     // upstream DataFusion.
-    for (name, example) in RAVEL_SCALAR_UDFS {
+    for (name, example, rationale) in RAVEL_SCALAR_UDFS {
         out.push(Construct {
             category: Category::Scalar,
             name: name.to_string(),
             example: example.to_string(),
             classification: Classification::SupportedAndCovered { test: T_SUPPORTED },
-            rationale: "Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8)",
+            rationale,
         });
     }
     // The excluded nondeterministic/environment-reading scalars: refused before
@@ -1239,7 +1260,7 @@ mod tests {
                 named.name
             );
         }
-        for (udf, _) in RAVEL_SCALAR_UDFS {
+        for (udf, _, _) in RAVEL_SCALAR_UDFS {
             assert!(
                 admitted_scalar_rows.contains(udf),
                 "Ravel UDF `{udf}` has no row"

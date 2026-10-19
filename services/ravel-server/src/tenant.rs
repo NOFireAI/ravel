@@ -99,8 +99,8 @@ impl OidcRefreshParams {
 /// (tenant and `ddl`) wins and later ones are never consulted. The static
 /// bearer map is a cheap `HashMap` lookup, so it goes first to fail fast for a
 /// dev/local token; the more expensive JWT verification is last. Delegates to
-/// [`build_auth_resolver_with_principals`] with every token carrying
-/// `ddl: false` and no OIDC ddl claim, so one code path builds the chain.
+/// [`build_auth_resolver_with_principals`] with every token carrying no
+/// capability and no OIDC capability claim, so one code path builds the chain.
 pub fn build_auth_resolver(
     tokens: HashMap<String, TenantId>,
     dev_header: bool,
@@ -108,34 +108,55 @@ pub fn build_auth_resolver(
 ) -> anyhow::Result<ResolverBundle> {
     let principals = tokens
         .into_iter()
-        .map(|(token, tenant)| (token, Principal { tenant, ddl: false }))
+        .map(|(token, tenant)| (token, Principal::tenant_only(tenant)))
         .collect();
-    build_auth_resolver_with_principals(principals, dev_header, auth, None)
+    build_auth_resolver_with_principals(
+        principals,
+        dev_header,
+        auth,
+        OidcCapabilityClaims::default(),
+    )
+}
+
+/// The boolean OIDC claims that grant a capability, each `None` (never granted
+/// via OIDC) by default.
+#[derive(Debug, Clone, Default)]
+pub struct OidcCapabilityClaims {
+    /// `--oidc-ddl-claim` (ADR-2040 decision 4).
+    pub ddl: Option<String>,
+    /// `--oidc-ipcrypt-claim` (ADR-2993 decision 6).
+    pub ipcrypt: Option<String>,
 }
 
 /// Same as [`build_auth_resolver`], but the static bearer map carries a
-/// [`Principal`] (tenant plus the `ddl` capability, ADR-2040 decision 4) per
-/// token instead of a bare [`TenantId`], and `oidc_ddl_claim` (from
-/// `--oidc-ddl-claim`, `None` by default) names the boolean OIDC claim that
-/// grants the capability when OIDC is configured. This is a parameter rather
-/// than a field on [`crate::config::OidcSettings`] so that struct's existing
-/// exhaustive constructors (in and out of this crate) keep compiling
+/// [`Principal`] (tenant plus the `ddl` and `ipcrypt` capabilities) per token
+/// instead of a bare [`TenantId`], and `claims` names the boolean OIDC claims
+/// that grant each capability when OIDC is configured. This is a parameter
+/// rather than a field on [`crate::config::OidcSettings`] so that struct's
+/// existing exhaustive constructors (in and out of this crate) keep compiling
 /// unchanged.
 ///
-/// `oidc_ddl_claim` set while `auth.oidc` is `None` is an error: no OIDC
-/// resolver would exist to read the claim, so the operator's `ddl` grant would
-/// silently never apply.
+/// A claim set while `auth.oidc` is `None` is an error: no OIDC resolver would
+/// exist to read the claim, so the operator's grant would silently never
+/// apply.
 pub fn build_auth_resolver_with_principals(
     tokens: HashMap<String, Principal>,
     dev_header: bool,
     auth: AuthResolverSettings,
-    oidc_ddl_claim: Option<String>,
+    claims: OidcCapabilityClaims,
 ) -> anyhow::Result<ResolverBundle> {
-    if oidc_ddl_claim.is_some() && auth.oidc.is_none() {
-        anyhow::bail!(
-            "--oidc-ddl-claim was set but OIDC is not enabled (set --oidc-issuer and \
-             --oidc-jwks-url)"
-        );
+    if auth.oidc.is_none() {
+        for (claim, flag) in [
+            (&claims.ddl, "--oidc-ddl-claim"),
+            (&claims.ipcrypt, "--oidc-ipcrypt-claim"),
+        ] {
+            if claim.is_some() {
+                anyhow::bail!(
+                    "{flag} was set but OIDC is not enabled (set --oidc-issuer and \
+                     --oidc-jwks-url)"
+                );
+            }
+        }
     }
     let mut resolvers: Vec<Arc<dyn TenantResolver>> =
         vec![Arc::new(StaticBearerTokenResolver::with_principals(tokens))];
@@ -159,8 +180,11 @@ pub fn build_auth_resolver_with_principals(
             oidc.audiences,
             oidc.tenant_claim,
         );
-        if let Some(ddl_claim) = oidc_ddl_claim {
+        if let Some(ddl_claim) = claims.ddl {
             oidc_resolver = oidc_resolver.with_ddl_claim(ddl_claim);
+        }
+        if let Some(ipcrypt_claim) = claims.ipcrypt {
+            oidc_resolver = oidc_resolver.with_ipcrypt_claim(ipcrypt_claim);
         }
         resolvers.push(Arc::new(oidc_resolver));
         oidc_refresh = Some(OidcRefreshParams {
@@ -316,11 +340,34 @@ mod tests {
             HashMap::new(),
             false,
             AuthResolverSettings::default(),
-            Some("ravel_ddl".to_string()),
+            OidcCapabilityClaims {
+                ddl: Some("ravel_ddl".to_string()),
+                ipcrypt: None,
+            },
         );
         let err = result.err().expect("a ddl claim with no OIDC must fail");
         assert!(
             err.to_string().contains("--oidc-ddl-claim"),
+            "the error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn an_oidc_ipcrypt_claim_without_oidc_is_an_error() {
+        let result = build_auth_resolver_with_principals(
+            HashMap::new(),
+            false,
+            AuthResolverSettings::default(),
+            OidcCapabilityClaims {
+                ddl: None,
+                ipcrypt: Some("ravel_ipcrypt".to_string()),
+            },
+        );
+        let err = result
+            .err()
+            .expect("an ipcrypt claim with no OIDC must fail");
+        assert!(
+            err.to_string().contains("--oidc-ipcrypt-claim"),
             "the error names the flag: {err}"
         );
     }
@@ -334,9 +381,12 @@ mod tests {
                 oidc: Some(oidc_settings()),
                 mtls_header: None,
             },
-            Some("ravel_ddl".to_string()),
+            OidcCapabilityClaims {
+                ddl: Some("ravel_ddl".to_string()),
+                ipcrypt: Some("ravel_ipcrypt".to_string()),
+            },
         )
-        .expect("a ddl claim with OIDC configured builds");
+        .expect("capability claims with OIDC configured build");
         assert!(bundle.oidc_refresh.is_some());
     }
 
@@ -346,7 +396,7 @@ mod tests {
             HashMap::new(),
             false,
             AuthResolverSettings::default(),
-            None,
+            OidcCapabilityClaims::default(),
         )
         .expect("no claim and no OIDC is the default shape");
         assert!(bundle.oidc_refresh.is_none());

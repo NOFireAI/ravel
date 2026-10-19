@@ -296,6 +296,7 @@ fn production_session() -> SessionContext {
         table,
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session builds")
 }
