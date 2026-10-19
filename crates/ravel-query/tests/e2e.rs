@@ -1139,6 +1139,78 @@ async fn warm_cache_query_records_zero_store_bytes_on_fetch_spans() {
     );
 }
 
+/// The PromQL engine reads as interactive: the accounting it reports carries
+/// `AccessIntent::Interactive`, and the warm run's cache hits land in the
+/// cache's interactive counters, none in the bulk-scan or maintenance ones.
+#[tokio::test]
+async fn promql_reads_are_tagged_interactive_in_accounting_and_cache() {
+    let store = Arc::new(MemoryStore::new());
+    let tid = tenant("tenant-promql-interactive-intent");
+    let th = tid.hash();
+    let now = now_ns();
+    let hour_bucket = u32::try_from(now / NS_PER_HOUR).expect("hour bucket");
+    let series = vec![series_input(
+        &tid,
+        "http_requests_total",
+        &[("method", "get")],
+        &[(now - NS_PER_MIN, 42.0)],
+    )];
+    publish_segment(
+        &store,
+        th,
+        0,
+        Uuid::new_v4(),
+        1,
+        1,
+        1,
+        hour_bucket,
+        now,
+        series,
+    )
+    .await;
+
+    let recorder = Arc::new(CapturingRecorder::default());
+    let cache = Arc::new(ravel_cache::Cache::new(ravel_cache::CacheLimits::new(
+        64 * 1024 * 1024,
+        1024,
+        16 * 1024 * 1024,
+    )));
+    let metrics = cache.metrics();
+    let app = one_tenant_app_with_recorder_and_cache(
+        store,
+        EngineConfig::default(),
+        &tid,
+        "secret-intent",
+        Arc::clone(&recorder),
+        cache,
+    );
+    let query = encode_query_param("http_requests_total");
+    let uri = format!(
+        "/api/v1/query?query={query}&time={}",
+        (now - NS_PER_MIN) / NS_PER_SEC
+    );
+    for run in ["cold", "warm"] {
+        let (status, body) = call(&app, &uri, Some("secret-intent")).await;
+        assert_eq!(status, StatusCode::OK, "{run} query failed: {body}");
+    }
+
+    let calls = recorder.calls.lock().expect("recorder mutex");
+    assert_eq!(calls.len(), 2, "two queries recorded");
+    for (accounting, ..) in calls.iter() {
+        assert_eq!(
+            accounting.access_intent,
+            ravel_types::accounting::AccessIntent::Interactive
+        );
+    }
+    let by_intent = metrics.intent_snapshot();
+    assert!(
+        by_intent.interactive.hits > 0,
+        "the warm run's hits are recorded as interactive: {by_intent:?}"
+    );
+    assert_eq!(by_intent.bulk_scan.hits, 0, "{by_intent:?}");
+    assert_eq!(by_intent.maintenance.hits, 0, "{by_intent:?}");
+}
+
 /// Copy of [`DEFAULT_WHOLE_OBJECT_THRESHOLD`] (`fetcher.rs`, 512 KiB), which
 /// `ravel-query` does not re-export. A segment strictly larger than this takes
 /// `open_segment`'s footer tail-range path instead of the whole-object `Full`
