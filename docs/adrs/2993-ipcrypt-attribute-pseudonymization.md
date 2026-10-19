@@ -362,7 +362,8 @@ matcher's value under the rule before it submits the erasure request.
   or stale file included) or a failed read. A missing file would
   otherwise submit the raw address, match nothing, and report a
   successful erasure of zero records. (The erasure amendment of
-  2026-10-19 below adds that erase submit never creates the marker.)
+  2026-10-19 below adds that an absent marker with a non-empty policy
+  is refused rather than created.)
 - **Rule lookup.** The matcher key is looked up the way decision 1
   matches rules for the request's `--signal`. For the metric signals the
   key is sanitized first, so `client_address` finds the rule written as
@@ -417,7 +418,8 @@ does not refuses to write.**
   `docs/catalog-and-mvcc.md` in the same commit as the code that writes
   it.
 - **First write.** A process whose local policy is non-empty and that
-  finds no marker creates it with `CreateIfAbsent`. A process that loses
+  finds no marker creates it with `CreateIfAbsent` (the erasure amendment of 2026-10-19
+  below excepts `erase submit`, which refuses instead). A process that loses
   that race re-reads the marker and compares, as below.
 - **Startup check, unconditional for every writer.** Every `ravel-server`
   start in a mode that ingests (`all` and `gateway`), and every
@@ -718,6 +720,7 @@ encrypted.
 ## Amendment (2026-10-19): erasure of data written before a rule
 
 <!-- amendment-applies: sections="Decision|Consequences" pointer="erasure amendment of 2026-10-19" -->
+<!-- amendment-supersedes: phrase="finds no marker creates it with" pointer="erasure amendment of 2026-10-19" -->
 
 Two gaps in decision 8 surfaced when `ravel-cli erase submit` was built
 (#3049).
@@ -728,15 +731,20 @@ Two gaps in decision 8 surfaced when `ravel-cli erase submit` was built
   rule, so it cannot reach that data. `erase submit` therefore takes a
   repeatable `--plaintext-matcher KEY=VALUE`. A plaintext matcher is
   submitted exactly as written, with no encryption and no epoch fan-out
-  of its own, alongside the other matchers. Every request carrying one
+  of its own. Every request carrying one
   records the raw value in the erasure log, which is retained data, so
   the command prints a warning naming the keys whose values will be
   stored in the clear. A plaintext matcher on a key with no rule is
-  refused, because an ordinary matcher already does that. An operator
-  who wants both the older raw data and the newer encrypted data erased
-  submits one command with the plaintext matcher and one without. This
-  is the one exception to the rule that an erasure request never records
-  the raw value.
+  refused, because an ordinary matcher already does that. A command
+  that carries a plaintext matcher together with a matcher that would
+  be encrypted is refused: matchers in one request are a conjunction,
+  and data written before the rules holds raw values for both keys while
+  data written after holds ciphertext for both, so no record could
+  match. An operator who wants both the older raw data and the newer
+  encrypted data erased submits one command with plaintext matchers and
+  one without. For a value whose key has a rule, this is the one way a
+  raw value reaches the erasure log; matchers on keys with no rule, and
+  values that are not addresses, are recorded as written, as before.
 - **erase submit never creates the marker.** Unlike a data writer,
   `erase submit` does not create `sys/ipcrypt/policy` when it is absent.
   An absent marker with a non-empty local policy means no process has
