@@ -16,7 +16,11 @@
 //!   `max_bytes_scanned` and refuses the request that would cross either,
 //!   before it is issued. The totals compared are the query's pooled
 //!   accounting, so the manifest and grant reads of the resolve phase count
-//!   toward the same budgets. Bytes are wire bytes of GET response bodies as
+//!   toward the same budgets. A query whose cost is recorded on more handles
+//!   than the Parquet one (a signal table beside a Parquet table) sets a
+//!   [`BudgetView`] with [`ReadLimits::with_budget_view`], and its totals are
+//!   compared instead; the request and its bytes are still recorded on the
+//!   Parquet handle. Bytes are wire bytes of GET response bodies as
 //!   the accounting records them: a cache hit issues no request and adds none,
 //!   and a retry the store performs inside one `get_pinned` call is neither
 //!   requested nor recorded a second time. A cache hit is not free of cost,
@@ -32,7 +36,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use bytes::Bytes;
 use ravel_memory::{MemoryBudget, Reservation};
 use ravel_query::{ByteLimit, PhaseAccounting, QueryPhase, RequestLimit};
-use ravel_types::accounting::AccountedOp;
+use ravel_types::accounting::{AccountedOp, QueryAccountingSnapshot};
 
 use crate::error::ParquetReadError;
 
@@ -44,6 +48,11 @@ struct InFlight {
     bytes: u64,
 }
 
+/// The query totals a Parquet read is budgeted against, read once per check.
+/// It must include what the Parquet handle records, since an admitted request
+/// is recorded there and nowhere else.
+pub type BudgetView = Arc<dyn Fn() -> QueryAccountingSnapshot + Send + Sync>;
+
 /// The budgets one query's Parquet reads are admitted against.
 #[derive(Clone)]
 pub struct ReadLimits {
@@ -51,6 +60,7 @@ pub struct ReadLimits {
     max_bytes: ByteLimit,
     max_requests: RequestLimit,
     in_flight: Arc<Mutex<InFlight>>,
+    budget_view: Option<BudgetView>,
 }
 
 impl ReadLimits {
@@ -64,7 +74,16 @@ impl ReadLimits {
             max_bytes,
             max_requests,
             in_flight: Arc::new(Mutex::new(InFlight::default())),
+            budget_view: None,
         }
+    }
+
+    /// Compare the request and byte budgets against `view`'s totals rather
+    /// than the Parquet handle's. Without it the Parquet handle's pooled
+    /// totals are the ones compared.
+    pub fn with_budget_view(mut self, view: BudgetView) -> Self {
+        self.budget_view = Some(view);
+        self
     }
 
     /// No memory, byte or request limit: reads are counted and never refused.
@@ -95,15 +114,18 @@ impl ReadLimits {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The refusal a request of `len` bytes would meet against `accounting`'s
-    /// totals plus what is in flight, if any.
+    /// The refusal a request of `len` bytes would meet against the budget
+    /// view's totals, else `accounting`'s, plus what is in flight, if any.
     fn refusal(
         &self,
         in_flight: &InFlight,
         accounting: &PhaseAccounting,
         len: u64,
     ) -> Option<ParquetReadError> {
-        let pooled = accounting.pooled_snapshot();
+        let pooled = match &self.budget_view {
+            Some(view) => view(),
+            None => accounting.pooled_snapshot(),
+        };
         let requests = pooled.total_s3_requests().saturating_add(1);
         if self.max_requests.is_exceeded_by(requests) {
             let max = match self.max_requests {
@@ -172,6 +194,7 @@ impl fmt::Debug for ReadLimits {
             .field("memory_limit", &self.memory.limit())
             .field("max_bytes", &self.max_bytes)
             .field("max_requests", &self.max_requests)
+            .field("budget_view", &self.budget_view.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -335,6 +358,66 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_budget_view_is_compared_while_the_parquet_handle_is_charged() {
+        let parquet = PhaseAccounting::new();
+        let other = PhaseAccounting::new();
+        other
+            .phase(QueryPhase::Scan)
+            .record_s3_request(AccountedOp::Get);
+        other
+            .phase(QueryPhase::Scan)
+            .record_s3_request(AccountedOp::Get);
+        let view: BudgetView = {
+            let parquet = parquet.clone();
+            let other = other.clone();
+            Arc::new(move || {
+                parquet
+                    .pooled_snapshot()
+                    .saturating_add(&other.pooled_snapshot())
+            })
+        };
+        let limits = ReadLimits::new(
+            Arc::new(MemoryBudget::unlimited()),
+            ByteLimit::Unlimited,
+            RequestLimit::Bounded(3),
+        );
+        let unviewed = limits.clone();
+        let limits = limits.with_budget_view(view);
+
+        let first = limits
+            .admit(&parquet, QueryPhase::Scan, 10)
+            .expect("two other requests plus this one is the budget");
+        first.complete(&parquet, QueryPhase::Scan, 10);
+        assert_eq!(parquet.pooled_snapshot().total_s3_requests(), 1);
+        assert_eq!(parquet.pooled_snapshot().total_s3_bytes(), 10);
+        assert_eq!(
+            other.pooled_snapshot().total_s3_requests(),
+            2,
+            "the admitted request is charged to the Parquet handle only"
+        );
+
+        let err = limits
+            .admit(&parquet, QueryPhase::Scan, 10)
+            .err()
+            .expect("the view's total of three is the budget");
+        assert!(
+            matches!(
+                err,
+                ParquetReadError::RequestBudgetExceeded {
+                    requests: 4,
+                    max: 3
+                }
+            ),
+            "{err:?}"
+        );
+        // A clone taken before the view was set still reads the Parquet
+        // handle, which holds one request.
+        unviewed
+            .admit(&parquet, QueryPhase::Scan, 10)
+            .expect("without the view only the Parquet handle's one request counts");
     }
 
     #[test]

@@ -173,7 +173,9 @@ A tenant can also query Parquet tables. These are Parquet files read in place,
 in an S3, GCS or Azure location that an operator granted the tenant with
 `ravel-cli tenant parquet-grant add`. The read goes through a credential
 profile from the file that `ravel-server --parquet-profiles` names. A
-statement reads Parquet tables or the five tables above, not both yet. On
+statement may join Parquet tables with the five tables above, over
+`POST /api/v1/sql` and Flight SQL, and a `min_commit_token` on it bounds
+only the five. On
 `POST /api/v1/sql` a statement may join the five tables above, each read
 from its own snapshot, and bound each table by its own write with a
 table-qualified `min_commit_token` such as `logs:<token>` (see the

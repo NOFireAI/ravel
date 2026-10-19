@@ -2064,7 +2064,11 @@ column: `ts` for `samples` and `logs`, `start_ts` for `spans`, `ts_ns` for
 `alerts` and `audit`. The rewrite happens before optimization, where the
 scan carries no projection, so the column is always in scope, and `Filter`
 preserves the schema, so the result schema is unchanged. The rewrite runs
-inside the attempt, so it survives the snapshot retry.
+inside the attempt, so it survives the snapshot retry. A Parquet table has no
+event-time column, so beside a signal table (ADR-2904 decision 11) its scans
+get no filter and contribute every row they read, while the signal scans are
+filtered as above. A statement naming only Parquet tables with `row_window`
+set is `ParquetQueryError::RowWindowUnsupported`, before anything is read.
 
 The two bounds the one `window` drives are deliberately different.
 `ravel_types::TimeRange` is **closed**, `[start_ns, end_ns]`, and that is the
@@ -2078,8 +2082,8 @@ segments covering that instant and, under `row_window`, returns zero rows.
 
 The traversal that plants the filter descends into subqueries embedded in
 expressions (`Expr::ScalarSubquery`, `Expr::InSubquery`, `Expr::Exists`) as
-well as into plan children, so every `TableScan` in the statement is
-filtered, including the scans of CTEs, set operations, self-joins, and a
+well as into plan children, so every signal table's `TableScan` in the statement
+is filtered, including the scans of CTEs, set operations, self-joins, and a
 `WHERE` clause's own `SELECT`. Filtering only the outer scan would answer
 `SELECT ... WHERE value > (SELECT avg(value) FROM samples)` from an average
 over rows the caller excluded.
@@ -3145,23 +3149,38 @@ every phase and every rendered field the entries plus the Parquet share
 equal `stats.phases`. A Parquet table has no entry: a Parquet-only
 statement has `"signals": []`, and the Parquet share is `stats.phases`
 less the entries. That share also holds the lookups a statement naming a
-signal table makes for any other name it names. A statement reading a
-signal table beside a live Parquet table is refused
-(`SqlError::SignalBesideParquet`), so the share's arithmetic is pinned by
-a unit test on the view (`statement_accounting.rs`) rather than end to
-end. The `alerts` and `audit` scans take one handle for every read after
+signal table makes for any other name it names. The share's arithmetic is
+pinned by a unit test on the view (`statement_accounting.rs`) and end to end
+on a statement reading `logs` beside a Parquet table
+(`a_mixed_statements_signals_and_parquet_share_sum_to_its_phases` in
+`crates/ravel-sql/tests/parquet_tables.rs`): for every phase and operation,
+the `logs` entry plus what the Parquet table costs alone equal
+`stats.phases`. The `alerts` and `audit` scans take one handle for every read after
 resolve, so their entries charge plan and probe reads to `scan`.
 
 The resolve-time request budget, the `samples` scan's byte and request
 checkpoint, the live cost reading and `stats.io` read the statement total,
 not one table's entry: a request budget above the `samples` table's own cost
-and below the statement's refuses a `samples JOIN logs` statement. The one
-exception is the Parquet read budget (`parquet::build_tables`), which reads
-the Parquet handle. That equals the statement total today, because a signal
-table beside a live Parquet table is refused and the statement handle
-records only the memory pool's peak. `cross_signal_tests.rs` pins the sum per
-phase and per field, each entry's GET and LIST counts against the requests
-recorded under that signal's keys, and the budget;
+and below the statement's refuses a `samples JOIN logs` statement. The
+Parquet read budget (`parquet::build_tables`) reads the statement total too:
+beside a signal table it is given a view of the statement's pooled totals
+(`ravel_parquet::ReadLimits::with_budget_view`), checks each request and its
+bytes against that view before the request is sent, and records the request
+on the Parquet handle. Alone, it reads the Parquet handle, which is then the
+statement total, since the statement handle records only the memory pool's
+peak. `a_mixed_statement_is_held_to_one_request_budget` in
+`crates/ravel-sql/tests/parquet_tables.rs` pins it on a statement that joins
+a `logs` aggregate with a Parquet table: the `logs` reads come before the
+Parquet table's last file GET, a `max_s3_requests` one below the
+statement's unbudgeted request count refuses exactly that GET, unsent, and
+the Parquet share alone is under that budget.
+`a_mixed_statement_is_held_to_one_byte_budget` pins the byte half on the
+same statement: a `max_bytes_scanned` one below the statement's unbudgeted
+wire bytes refuses that same GET, unsent, as
+`SqlError::TooManyBytesScanned`, and the Parquet bytes alone are under that
+budget. `cross_signal_tests.rs` pins the sum per phase and per field, each
+entry's GET and LIST counts against the requests recorded under that
+signal's keys, and the budget;
 `services/ravel-server/tests/sql_endpoint.rs` pins the rendered entries.
 Flight SQL and the Arrow-IPC encoding carry no `stats` object, so neither
 renders `stats.signals`. The ES|QL route's catalog `stats` carries the other
@@ -3474,7 +3493,10 @@ leftover request, so the model is one round too many. The same sliding
   `ravel_query::io_shape::PlanClass::Unclassified`'s own doc comment for the
   full rationale). Only a `Metrics` target's resolve carries a real
   name-postings filter, so only `Metrics` distinguishes `selective_indexed`
-  from `exhaustive_scan` on the SQL side.
+  from `exhaustive_scan` on the SQL side. A statement that names a Parquet
+  table beside `samples` resolves the `samples` lane without that filter
+  (see "Statements over several signal tables"), so its postings prune
+  nothing there.
   This does not yet cover SQL's metadata-only fast paths (a predicate-free
   `SELECT COUNT(*)` answered from partition statistics, or a declared-column
   min/max/count answered from ingest stamps, both with no scan node in the
@@ -4025,19 +4047,47 @@ ORDER BY samples.ts
   Flight SQL statement naming two or more signal tables cannot wait on a
   commit token: with one it is refused at `GetFlightInfo` as
   `CommitTokenNeedsQualifier` (`INVALID_ARGUMENT`), and without one it runs.
-- **Interim refusal.** A signal table beside a Parquet table is refused with
-  HTTP 400 and a message saying it is not supported yet, before any signal
-  catalog listing (`SqlError::SignalBesideParquet`). A token qualified with
-  the Parquet table's name on such a statement is refused first, by token
-  admission, as `SqlError::CommitTokenQualifierNotRead`. The Parquet refusal
-  comes after the Parquet manifest reads that tell a live table from an
-  unknown or dropped name: one manifest LIST per other table name, in name
-  order, up to and including the first live table, and a GET for each of
-  those names that has a manifest version.
+- **Parquet tables beside signal tables (ADR-2904 decision 11).** A statement may name Parquet tables of the caller's tenant
+  beside one or more signal tables, over HTTP and Flight SQL. Its Parquet
+  tables resolve first, exactly as a Parquet-only statement's do (each
+  name's newest live manifest, then the tenant's grants), and its signal
+  lanes then resolve as above, so every lane's resolve-time budget check
+  sees the Parquet reads
+  (`a_lanes_resolve_budget_check_counts_the_parquet_resolve_reads`). The
+  estimate is the sum of the Parquet estimate and the lanes'
+  (`a_mixed_estimate_is_the_parquet_estimate_plus_the_lanes`). The checks
+  that compare the statement total against its budgets are that
+  resolve-time request check, the Parquet reader's request and byte check
+  before each Parquet read, and the `samples` scan's checkpoint; the
+  `logs`, `spans`, `alerts` and `audit` scans make no scan-time request
+  check and no byte check (see "Admission is per statement" above and
+  "Per-request budgets"). The session registers every signal table the statement
+  names beside its Parquet tables, carries the Parquet store registry and
+  takes `parquet_session_config`; a signal-only session keeps the registry
+  that answers nothing, and a Parquet-only session registers no signal
+  table. Those settings leave the signal scans' physical plans as they are
+  in the same statement without its Parquet tables. The `samples` lane
+  resolves without the `__name__` pushdown (`pushed_down_name_filter`),
+  because the throwaway session that derives it cannot plan a Parquet table
+  before its footers are read, so its postings do not prune beside a
+  Parquet table: there a `samples` filter on `__name__` reads every segment
+  in the window, where alone it reads only the segments whose postings name
+  the metric. The rows are the same. A token bounds the signal tables only:
+  an unqualified one applies to the one signal table, and one qualified with
+  the Parquet table's name is `SqlError::CommitTokenQualifierNotRead`,
+  refused by token admission before any store request. Flight SQL refuses
+  any token on a statement naming only Parquet tables at `GetFlightInfo` as
+  `SqlError::CommitTokenOnParquetStatement` (`INVALID_ARGUMENT`), as HTTP
+  does. A Flight ticket pins the Parquet tables' manifest versions beside
+  the signal snapshots in the existing ticket layouts, so `DoGet` reads
+  neither a newer manifest nor a newer commit; a distributed slice ticket
+  still carries no Parquet table. A row window filters the signal scans
+  only (see "The agent query knobs on `SqlRequest`").
 - **Surfaces that keep the one-table rule.** ES|QL reads one table per query
   and refuses a statement naming two or more signal tables with
   `SqlError::CrossSignalQuery` before any catalog listing. Paging (`page_plan`) refuses such a
-  statement with `PagePlanError::CrossSignal`.
+  statement, and one naming a signal table beside any other table, with
+  `PagePlanError::CrossSignal`.
 
 Schema (fixed columns plus one map):
 

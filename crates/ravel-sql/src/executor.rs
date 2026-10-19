@@ -37,15 +37,17 @@
 //!    no such predicate, resolves unpruned, identical to the former plain
 //!    `resolve`.
 //!
-//!    A statement whose only tables are Parquet tables of the caller's tenant
-//!    (ADR-2040) resolves no catalog: [`SqlExecutor::resolve_parquet_target`]
-//!    reads each table's newest live manifest and the tenant's current grants
-//!    instead, and refuses a file outside every grant. A Parquet table beside
-//!    a signal table is [`SqlError::SignalBesideParquet`], refused after the
-//!    Parquet manifest listing and before any catalog resolve.
+//!    The Parquet tables of the caller's tenant (ADR-2040) a statement names
+//!    resolve first: [`SqlExecutor::resolve_parquet_target`] reads each
+//!    table's newest live manifest and the tenant's current grants, and
+//!    refuses a file outside every grant. A statement whose only tables are
+//!    Parquet tables resolves no catalog. One that also names signal tables
+//!    (ADR-2904 decision 11) then resolves its signal lanes as above, with
+//!    the Parquet reads already in the resolve total each lane's request
+//!    budget check reads.
 //! 3. Build the fresh single-tenant `SessionContext` around the owned
-//!    snapshots, registering one table per resolved signal, or the query's
-//!    Parquet tables (security invariant 2, crate::session).
+//!    snapshots, registering one table per resolved signal and each of the
+//!    query's Parquet tables (security invariant 2, crate::session).
 //! 4. Plan, then execute, draining the stream under the wall deadline.
 //!
 //! # Snapshot retry contract
@@ -506,9 +508,10 @@ pub struct PinnedResolve {
 struct Resolved {
     /// One entry per named signal table, in [`SIGNAL_LANE_ORDER`], all
     /// resolved by the same attempt; a statement naming none has the one
-    /// `samples` lane, and a Parquet statement one empty Parquet lane.
+    /// `samples` lane, and a statement naming only Parquet tables one empty
+    /// Parquet lane.
     lanes: Vec<ResolvedLane>,
-    /// The sum of the lanes' estimates.
+    /// The sum of the lanes' estimates and the Parquet tables' estimate.
     estimate: CostEstimate,
     unfolded_segments_resolved: u64,
     target: TargetSignal,
@@ -1352,14 +1355,18 @@ fn unbounded_estimate_components(target: TargetSignal) -> Vec<&'static str> {
     }
 }
 
-/// [`unbounded_estimate_components`] over every lane of a statement, each
-/// component named once, in the order the lanes first name it. A summed
-/// estimate is unbounded wherever one of its terms is.
-fn unbounded_lane_components(lanes: &[ResolvedLane]) -> Vec<&'static str> {
+/// [`unbounded_estimate_components`] over every lane of a statement, and over
+/// its Parquet tables when `parquet` is set, each component named once, in the
+/// order the lanes first name it. A summed estimate is unbounded wherever one
+/// of its terms is.
+fn unbounded_lane_components(lanes: &[ResolvedLane], parquet: bool) -> Vec<&'static str> {
     let mut components = Vec::new();
+    let parquet = parquet.then_some(TargetSignal::Parquet);
     for component in lanes
         .iter()
-        .flat_map(|lane| unbounded_estimate_components(lane.signal))
+        .map(|lane| lane.signal)
+        .chain(parquet)
+        .flat_map(unbounded_estimate_components)
     {
         if !components.contains(&component) {
             components.push(component);
@@ -2023,7 +2030,8 @@ impl SqlExecutor {
         let admission = resolved.admission();
         let estimate = resolved.estimate;
         let target = resolved.target;
-        let unbounded_components = unbounded_lane_components(&resolved.lanes);
+        let unbounded_components =
+            unbounded_lane_components(&resolved.lanes, resolved.parquet.is_some());
         let (lanes, parquet) = resolved.into_snapshots();
 
         let planned = self
@@ -2295,7 +2303,9 @@ impl SqlExecutor {
     /// [`SqlError::QualifiedCommitTokenUnsupported`], and any token on a
     /// statement naming two or more signal tables is
     /// [`SqlError::CommitTokenNeedsQualifier`], because a plain token does not
-    /// say which table it bounds. Both are refused before any catalog request.
+    /// say which table it bounds, and any token on a statement naming no
+    /// signal table is [`SqlError::CommitTokenOnParquetStatement`]. Each is
+    /// refused before any store request.
     pub async fn resolve_pinned_lanes(
         &self,
         tenant_hash: TenantHash,
@@ -2315,6 +2325,11 @@ impl SqlExecutor {
         accounting: &QueryAccounting,
     ) -> Result<PinnedLanes, SqlError> {
         let plain = unqualified_tokens(&req.min_tokens)?;
+        // A token bounds a signal table's catalog, and a statement naming
+        // none has nothing for it to bound, as on HTTP (`admit_http_tokens`).
+        if !plain.is_empty() && tables.signals.is_empty() && !tables.others.is_empty() {
+            return Err(SqlError::CommitTokenOnParquetStatement);
+        }
         let tokens = if tables.signals.len() > 1 {
             admit_http_tokens(tables, &req.min_tokens)?
         } else {
@@ -2640,25 +2655,38 @@ impl SqlExecutor {
                 .await?
             }
         };
-        let target = if parquet.is_some() {
-            TargetSignal::Parquet
-        } else {
+        // A statement that names no signal table reads no lane, whatever lane
+        // its caller carried: the HTTP resolve hands an empty Parquet lane and
+        // a Flight ticket an empty `samples` one. A statement that names a
+        // signal table beside its Parquet tables reads both (ADR-2904
+        // decision 11).
+        let reads_lanes = parquet.is_none() || !tables.signals.is_empty();
+        let target = if reads_lanes {
             lanes
                 .first()
                 .map_or(TargetSignal::Metrics, |(signal, _)| *signal)
+        } else {
+            TargetSignal::Parquet
         };
-        let several_tables = parquet.is_none() && lanes.len() > 1;
+        let several_tables = lanes.len() > 1 || (parquet.is_some() && reads_lanes);
         let parquet_tables = match (parquet, &self.parquet) {
             (Some(resolution), Some(sources)) => {
                 // One ledger per query, shared by every reader it opens, over
                 // the executor's process memory budget and the effective
                 // config's byte and request limits, which already carry a
-                // request's clamped budgets.
-                let limits = ReadLimits::new(
+                // request's clamped budgets. Beside a signal table the reads
+                // are budgeted against the statement total, which the signal
+                // scans also charge; alone, the Parquet handle is that total.
+                let mut limits = ReadLimits::new(
                     Arc::clone(&self.process_memory_budget),
                     config.engine.max_bytes_scanned,
                     config.engine.max_s3_requests,
                 );
+                if reads_lanes {
+                    let statement_total = phase_accounting.clone();
+                    limits = limits
+                        .with_budget_view(Arc::new(move || statement_total.pooled_snapshot()));
+                }
                 let tables = parquet::build_tables(
                     sources,
                     tenant_hash,
@@ -2680,7 +2708,7 @@ impl SqlExecutor {
         let parquet_schemas = parquet_tables
             .as_ref()
             .map(|(_, tables)| parquet::schemas(tables));
-        let wants_stats_gate = parquet_tables.is_none()
+        let wants_stats_gate = reads_lanes
             && lanes
                 .iter()
                 .any(|(signal, _)| matches!(signal, TargetSignal::Logs))
@@ -2801,8 +2829,9 @@ impl SqlExecutor {
                 tables,
             )));
         }
-        // A Parquet statement built its tables above and reads no lane.
-        if target != TargetSignal::Parquet {
+        // A statement naming only Parquet tables built them above and reads
+        // no lane.
+        if reads_lanes {
             for (signal, snapshot) in lanes {
                 let table = match signal {
                     TargetSignal::Metrics => {
@@ -2929,10 +2958,11 @@ impl SqlExecutor {
                         self.log_fetcher.clone(),
                         phase_accounting.lane(signal).scan().clone(),
                     ))),
-                    // A lane is a signal table, never Parquet.
+                    // A lane read beside Parquet tables is a signal table.
                     TargetSignal::Parquet => {
                         return Err(SqlError::Internal(
-                            "the Parquet target was chosen without its tables".to_string(),
+                            "a Parquet lane reached a statement that reads signal lanes"
+                                .to_string(),
                         ));
                     }
                 };
@@ -3027,9 +3057,11 @@ impl SqlExecutor {
         // schema).
         let window_predicate = match extras.row_window {
             Some(window) => {
-                // A Parquet target with a row window was refused at resolve
-                // (`resolve_parquet_target`); this is the type's fallback.
-                if window_ts_column(target).is_none() {
+                // A statement naming only Parquet tables with a row window was
+                // refused at resolve (`resolve_parquet_target`); this is the
+                // type's fallback. Beside a signal table the window filters
+                // the signal scans only (`apply_row_window`).
+                if !reads_lanes || window_ts_column(target).is_none() {
                     return Err(ParquetQueryError::RowWindowUnsupported.into());
                 }
                 let (plan, predicate) = apply_row_window(frame.logical_plan().clone(), window)?;
@@ -3240,11 +3272,12 @@ impl SqlExecutor {
         // is kept out of the idle sweep.
         self.touch_tenant(tenant_hash, req.now_ns);
         let tables = statement.tables()?;
-        // ADR-2040: a statement whose only tables are Parquet tables resolves
-        // their manifests here instead of a signal's catalog. A Parquet table
-        // has no segments, so there is nothing to admit against
-        // `max_segments`.
-        if let Some(resolution) = self
+        // ADR-2040: the Parquet tables a statement names resolve their
+        // manifests first, so a statement that also names signal tables
+        // (ADR-2904 decision 11) has those reads in its resolve total before
+        // any lane's budget check below. A Parquet table has no segments, so
+        // there is nothing to admit against `max_segments`.
+        let parquet = self
             .resolve_parquet_target(
                 tenant_hash,
                 statement,
@@ -3252,15 +3285,16 @@ impl SqlExecutor {
                 req.row_window,
                 phase_accounting.parquet(),
             )
-            .await?
-        {
+            .await?;
+        let mut estimate = CostEstimate::new(0, 0, 0, 0, 0);
+        if let Some(resolution) = &parquet {
             // The request budget is checked here, as it is for a signal
             // statement, on what the query is already known to cost: the
             // manifest and grant reads this resolve made, plus one GET for
             // each file it will open. Every read past that is admitted against
             // the same budget as it is issued.
-            let estimate = parquet::estimate_cost(
-                &resolution,
+            estimate = parquet::estimate_cost(
+                resolution,
                 phase_accounting.resolve_snapshot().total_s3_requests(),
             );
             if let Some(QueryError::RequestBudgetExceeded {
@@ -3280,24 +3314,27 @@ impl SqlExecutor {
                     table: None,
                 });
             }
-            return Ok(Resolved {
-                lanes: vec![ResolvedLane {
-                    signal: TargetSignal::Parquet,
-                    snapshot: Snapshot {
-                        segments: Vec::new(),
-                        segments_pruned: 0,
-                        pending_erasure: Vec::new(),
-                    },
-                    admission: SegmentAdmission {
-                        sealed_count: 0,
-                        exempt_count: 0,
-                    },
-                }],
-                estimate,
-                unfolded_segments_resolved: 0,
-                target: TargetSignal::Parquet,
-                parquet: Some(resolution),
-            });
+            // A statement that names no signal table resolves no catalog.
+            if tables.signals.is_empty() {
+                return Ok(Resolved {
+                    lanes: vec![ResolvedLane {
+                        signal: TargetSignal::Parquet,
+                        snapshot: Snapshot {
+                            segments: Vec::new(),
+                            segments_pruned: 0,
+                            pending_erasure: Vec::new(),
+                        },
+                        admission: SegmentAdmission {
+                            sealed_count: 0,
+                            exempt_count: 0,
+                        },
+                    }],
+                    estimate,
+                    unfolded_segments_resolved: 0,
+                    target: TargetSignal::Parquet,
+                    parquet,
+                });
+            }
         }
         let lanes = tables.lanes();
         let several = lanes.len() > 1;
@@ -3315,7 +3352,10 @@ impl SqlExecutor {
         // A statement with no SQL text derives no filter and is not pruned.
         // Only the metrics snapshot has a `__name__` postings index, so only
         // the `samples` lane is resolved with the filter, and the filter is
-        // derived from the `samples` scans alone.
+        // derived from the `samples` scans alone. A statement that also names
+        // a Parquet table derives none: a table's schema is known only once
+        // its footers are read at plan time, so the throwaway session cannot
+        // plan it here, and the `samples` lane resolves unpruned.
         let name_filter = match statement.sql() {
             Some(sql) if lanes.contains(&TargetSignal::Metrics) => {
                 self.pushed_down_name_filter(tenant_hash, sql, &lanes).await
@@ -3331,7 +3371,6 @@ impl SqlExecutor {
             ..engine_config
         };
         let mut resolved = Vec::with_capacity(lanes.len());
-        let mut estimate = CostEstimate::new(0, 0, 0, 0, 0);
         let mut unfolded_segments_resolved = 0_u64;
         let mut sealed_total = 0_u64;
         // Every lane resolves at the request's one `now_ns` and window, in
@@ -3418,7 +3457,7 @@ impl SqlExecutor {
             estimate,
             unfolded_segments_resolved,
             target,
-            parquet: None,
+            parquet,
         })
     }
 
@@ -3489,21 +3528,17 @@ impl SqlExecutor {
     ///   and carries a row window is [`ParquetQueryError::RowWindowUnsupported`],
     ///   before anything is read: such a statement can only succeed as a
     ///   Parquet query, and a Parquet table has no event-time column.
-    /// - A signal table beside a live Parquet table is
-    ///   [`SqlError::SignalBesideParquet`], before the caller resolves any
-    ///   signal catalog; ADR-2904 decision 11, which admits the pair, is not
-    ///   built yet.
     /// - With no credential profiles configured, a live Parquet table is
-    ///   [`ParquetQueryError::NotConfigured`].
-    /// - In both cases above the names are listed in order and the first live
-    ///   table decides: one LIST per name up to it, and one GET of the newest
-    ///   manifest for each name that has versions, which is how a dropped
-    ///   table is told from a live one. No file is read.
+    ///   [`ParquetQueryError::NotConfigured`]. The names are listed in order
+    ///   and the first live table decides: one LIST per name up to it, and one
+    ///   GET of the newest manifest for each name that has versions, which is
+    ///   how a dropped table is told from a live one. No file is read.
     /// - Otherwise each name's newest live manifest, checked against the
-    ///   tenant's current grants. A dropped table is no table on any of these
-    ///   paths: `None` when no name is a live Parquet table, so the statement
-    ///   then plans, and fails, as a statement naming an unknown table always
-    ///   has.
+    ///   tenant's current grants, whether or not the statement also names a
+    ///   signal table (ADR-2904 decision 11). A dropped table is no table on
+    ///   any of these paths: `None` when no name is a live Parquet table, so
+    ///   the statement then plans, and fails, as a statement naming an unknown
+    ///   table always has.
     ///
     /// Every read here is charged to the Resolve phase.
     async fn resolve_parquet_target(
@@ -3529,14 +3564,13 @@ impl SqlExecutor {
             return Err(ParquetQueryError::RowWindowUnsupported.into());
         }
         let accounting = phase_accounting.resolve();
-        if !tables.signals.is_empty() || !sources.is_configured() {
+        if !sources.is_configured() {
             // The first live table decides the outcome, so the resolve stops
             // there rather than listing every name.
             let named =
                 parquet::first_live_table(sources, &tenant_hash, &tables.others, accounting)
                     .await?;
             return match named {
-                Some(_) if !tables.signals.is_empty() => Err(SqlError::SignalBesideParquet),
                 Some(table) => Err(ParquetQueryError::NotConfigured { table }.into()),
                 None => Ok(None),
             };
@@ -3871,8 +3905,8 @@ impl SqlExecutor {
     /// `parquet` carries the resolved Parquet tables' names and schemas for a
     /// statement over them (ADR-2040 D6): the plan is then built over an empty
     /// table of each schema, so its aggregates and keys classify by the types
-    /// the real scan produces. `None` builds the empty table of the signal the
-    /// statement names.
+    /// the real scan produces, beside an empty table of each signal the
+    /// statement names. `None` builds the empty tables of the signals alone.
     async fn analyzed_classification_plan(
         &self,
         tenant_hash: TenantHash,
@@ -3881,8 +3915,9 @@ impl SqlExecutor {
         declared: &[DeclaredColumn],
         parquet: Option<&[(String, SchemaRef)]>,
     ) -> Result<Option<LogicalPlan>, SqlError> {
-        let session_tables = match parquet {
-            Some(schemas) => vec![SessionTable::Parquet(ParquetSession {
+        let mut session_tables = Vec::new();
+        if let Some(schemas) = parquet {
+            session_tables.push(SessionTable::Parquet(ParquetSession {
                 tables: schemas
                     .iter()
                     .map(|(name, schema)| {
@@ -3892,13 +3927,16 @@ impl SqlExecutor {
                     })
                     .collect(),
                 store: Arc::new(ravel_parquet::TenantParquetStore::new(tenant_hash)),
-            })],
-            None => tables
-                .lanes()
-                .into_iter()
-                .map(|lane| self.empty_snapshot_table(lane, tenant_hash, declared))
-                .collect(),
-        };
+            }));
+        }
+        if parquet.is_none() || !tables.signals.is_empty() {
+            session_tables.extend(
+                tables
+                    .lanes()
+                    .into_iter()
+                    .map(|lane| self.empty_snapshot_table(lane, tenant_hash, declared)),
+            );
+        }
         // A private, unbounded pool: this session never executes, so nothing is
         // ever reserved against it and it never touches the tenant accountant.
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
@@ -3953,9 +3991,9 @@ impl SqlExecutor {
     /// those necessary conditions; anything they cannot prove is left to
     /// decline downstream and still loads here.
     ///
-    /// `several_tables` is whether the statement names more than one signal
-    /// table; the pushdown checks then read only the `logs` scans' own
-    /// conjuncts.
+    /// `several_tables` is whether the statement names more than one table,
+    /// two signal tables or a signal table beside a Parquet table; the
+    /// pushdown checks then read only the `logs` scans' own conjuncts.
     fn logs_column_stats_eligible(
         &self,
         snapshot: &Snapshot,
@@ -4376,6 +4414,31 @@ impl PinnedQuery {
     /// `None` when the request did not ask for one.
     pub fn window_predicate(&self) -> Option<&str> {
         self.window_predicate.as_deref()
+    }
+
+    /// Every table this query's session registered, sorted: one provider per
+    /// signal table the statement reads, and the Parquet tables it names.
+    pub fn registered_tables(&self) -> Vec<String> {
+        let mut tables = Vec::new();
+        for catalog_name in self.ctx.catalog_names() {
+            let Some(catalog) = self.ctx.catalog(&catalog_name) else {
+                continue;
+            };
+            for schema_name in catalog.schema_names() {
+                if let Some(schema) = catalog.schema(&schema_name) {
+                    tables.extend(schema.table_names());
+                }
+            }
+        }
+        tables.sort();
+        tables
+    }
+
+    /// Whether this query's session resolves `tenant`'s Parquet store URL,
+    /// which only a session built with the Parquet store registry does.
+    pub fn reaches_parquet_store(&self, tenant: &TenantHash) -> bool {
+        datafusion::execution::object_store::ObjectStoreUrl::parse(ravel_parquet::store_url(tenant))
+            .is_ok_and(|url| self.ctx.runtime_env().object_store(&url).is_ok())
     }
 
     /// Build the physical plan for this query without consuming it or starting
