@@ -1489,6 +1489,38 @@ the Parquet tables. In such a statement the request row window applies to
 the signal scans and not to the Parquet scan, and commit tokens apply to
 signal tables only. A statement over Parquet tables alone that carries a row
 window stays a 400. The session settings D6 chose for Parquet plans are
-unchanged. Until ticket T7 of epic #2904 (#2914) lands, the executor refuses
-such a statement with `SqlError::SignalBesideParquet`, a 400 that says it is
-not supported yet, before any signal catalog listing.
+unchanged. Until ticket T7 of epic #2904 (#2914) lands (it has; see the
+interim refusal amendment below), the executor refuses such a statement
+with `SqlError::SignalBesideParquet`, a 400 that says it is not supported
+yet, before any signal catalog listing.
+
+## Amendment (2026-10-19, issue #2914): the interim refusal beside a signal table is lifted
+
+<!-- amendment-applies: sections="Amendment (2026-10-11, ADR-2904): a Parquet table may be named beside a signal table" pointer="interim refusal amendment" -->
+<!-- amendment-supersedes: phrase="Until ticket T7 of epic #2904 (#2914) lands" pointer="interim refusal amendment" -->
+
+Issue #2914 built ADR-2904 decision 11, and `SqlError::SignalBesideParquet`
+is gone. A statement naming Parquet tables beside signal tables runs on
+`POST /api/v1/sql` and on Flight SQL. Its Parquet tables resolve first, as a
+Parquet-only statement's do, and its signal lanes then resolve on top of
+those reads, so each lane's resolve-time request budget check counts them;
+the cost estimate is the Parquet estimate plus each lane's. The session
+carries the tenant's Parquet store registry, read limits and the D6 session
+settings beside the named signal tables. Those settings do not reach the
+signal scans, which read through their own providers. The `samples` lane
+does plan differently in one respect: it resolves without the `__name__`
+postings pruning (`pushed_down_name_filter`), because the throwaway session
+that derives the filter cannot plan a Parquet table before its footers are
+read, so a `samples` filter on `__name__` beside a Parquet table reads every
+segment in the window, with the same rows. The Parquet reader checks each
+read against the statement's total requests and bytes, not the Parquet
+tables' share alone. Three checks see that statement total: each lane's
+resolve-time request budget check, which includes the Parquet resolve
+reads; the Parquet reader's request and byte budget check; and the
+`samples` scan's request and byte checkpoint. The `logs`, `spans`, `alerts`
+and `audit` scans make no scan-time request check and no byte check, as
+for a statement without a Parquet table. A Flight ticket
+pins the Parquet manifest versions beside the signal snapshots in its
+existing layout. The row window and commit token rules of the ADR-2904
+amendment above hold as written. The reference is the "Statements over
+several signal tables" section of `docs/query-engine.md`.

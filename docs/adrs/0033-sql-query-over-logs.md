@@ -388,8 +388,7 @@ alternative C's single `telemetry` table stays rejected.
 The HTTP SQL endpoint runs such a statement since issue #2910, and Flight
 SQL since issue #2913, whose version 10 ticket carries one segment group per
 signal (ADR-2904 decision 10). ES|QL still returns
-`SqlError::CrossSignalQuery` for it. A
-`min_commit_token` on a statement naming two or more signal tables, and a
-signal table beside a Parquet table, are refused over HTTP as not supported
-yet; the reference is the "Statements over several signal tables" section of
+`SqlError::CrossSignalQuery` for it. The HTTP SQL endpoint and Flight SQL
+run a signal table beside a Parquet table since issue #2914 (ADR-2904 decision 11); the
+reference is the "Statements over several signal tables" section of
 [docs/query-engine.md](../query-engine.md).

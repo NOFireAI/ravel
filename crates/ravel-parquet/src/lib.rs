@@ -45,7 +45,7 @@ mod store;
 mod test_support;
 
 pub use error::{ParquetReadError, ParquetTableError};
-pub use limits::ReadLimits;
+pub use limits::{BudgetView, ReadLimits};
 pub use metadata_cache::{MetadataCache, MetadataKey};
 pub use provider::{Cast, ParquetTableProvider, TableOptions};
 pub use reader::{PinnedFile, PinnedParquetReader, PinnedReaderFactory, ReadServices};

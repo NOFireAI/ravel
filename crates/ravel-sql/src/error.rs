@@ -252,18 +252,6 @@ pub enum SqlError {
     )]
     QualifiedCommitTokenUnsupported,
 
-    /// A statement that names a signal table beside a live Parquet table of
-    /// the caller's tenant (ADR-2904 decision 11 allows it; not implemented
-    /// yet). Refused after the Parquet manifest listing that tells a Parquet
-    /// name apart from an unknown one, and before any catalog resolve. The
-    /// text names no server state; HTTP 400.
-    #[error(
-        "a statement that names one of the samples, logs, spans, alerts and \
-         audit tables beside a Parquet table is not supported yet; query them in \
-         separate statements"
-    )]
-    SignalBesideParquet,
-
     /// The query names more than [`crate::MAX_STATEMENT_TABLE_NAMES`]
     /// distinct base tables besides the five signal tables. Each could be a
     /// Parquet table, which only a LIST of its manifest prefix tells, so this
@@ -610,7 +598,6 @@ impl SqlError {
             | SqlError::CommitTokenQualifierNotRead { .. }
             | SqlError::CommitTokenOnParquetStatement
             | SqlError::QualifiedCommitTokenUnsupported
-            | SqlError::SignalBesideParquet
             | SqlError::TooManyTables { .. } => ErrorClass::BadRequest,
             // An over-wide window refused before any LIST is a
             // resource-budget rejection, the same class as the segment/sample
@@ -687,8 +674,7 @@ impl SqlError {
             | SqlError::PinnedSignalsMismatch { .. }
             | SqlError::CommitTokenNeedsQualifier { .. }
             | SqlError::CommitTokenOnParquetStatement
-            | SqlError::QualifiedCommitTokenUnsupported
-            | SqlError::SignalBesideParquet => self.to_string(),
+            | SqlError::QualifiedCommitTokenUnsupported => self.to_string(),
             // Safe to echo: the fixed table names, plus the caller's own
             // qualifier cut to 64 bytes.
             SqlError::CommitTokenQualifierNotRead { .. } => self.to_string(),
@@ -2067,18 +2053,6 @@ mod tests {
                 "(samples, logs) are not the signal tables this statement reads (samples, spans)"
             )
         );
-    }
-
-    #[test]
-    fn the_interim_cross_signal_refusal_is_a_bad_request_that_keeps_its_text() {
-        let err = SqlError::SignalBesideParquet;
-        assert_eq!(err.class(), ErrorClass::BadRequest, "{err}");
-        assert_eq!(err.client_message(), err.to_string());
-        // The text says what is missing, so a client can tell an interim
-        // limit from a malformed statement.
-        assert!(err.client_message().contains("not supported yet"), "{err}");
-        assert!(err.client_message().contains("Parquet"), "{err}");
-        assert_redacted(&err.client_message());
     }
 
     #[test]
