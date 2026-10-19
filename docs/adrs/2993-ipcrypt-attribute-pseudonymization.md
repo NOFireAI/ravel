@@ -363,7 +363,7 @@ matcher's value under the rule before it submits the erasure request.
   otherwise submit the raw address, match nothing, and report a
   successful erasure of zero records. (The erasure amendment of
   2026-10-19 below adds that an absent marker with a non-empty policy
-  is refused rather than created.)
+  is never created, and refuses a request that would encrypt a matcher.)
 - **Rule lookup.** The matcher key is looked up the way decision 1
   matches rules for the request's `--signal`. For the metric signals the
   key is sanitized first, so `client_address` finds the rule written as
@@ -395,8 +395,9 @@ matcher's value under the rule before it submits the erasure request.
   unchanged, matching how ingest stored it.
 
 The request records the encrypted value, never the raw one: the
-erasure log is itself retained data (except for a plaintext matcher the
-operator names explicitly; see the erasure amendment of 2026-10-19 below).
+erasure log is itself retained data (this holds for every matcher whose
+key has a rule, except a plaintext matcher the operator names
+explicitly; see the erasure amendment of 2026-10-19 below).
 
 Erasure stays exact-match, as ADR-0064 defines it. A stored `ip:port`
 value is matched only by a matcher carrying the same port, and an
@@ -751,8 +752,11 @@ Two gaps in decision 8 surfaced when `ravel-cli erase submit` was built
   written data under that policy, so every encrypted matcher would match
   nothing and the command would report a successful erasure of zero
   records. Creating the marker would also make every ingesting process
-  without the policy refuse at its next start. erase submit refuses
-  instead, and its message says that the bucket's data was written
-  without the policy, so the erasure should be submitted without
-  `--ipcrypt-config`, or with plaintext matchers. An absent marker with
-  an empty local policy proceeds as before.
+  without the policy refuse at its next start. So when the marker is
+  absent and the local policy is non-empty, a request that carries at
+  least one matcher that would be encrypted is refused, and the message
+  says the bucket's data was written without the policy, so the erasure
+  should use plaintext matchers. A request whose matchers are all
+  plaintext matchers or keys with no rule proceeds, with the policy
+  loaded and no marker written. An absent marker with an empty local
+  policy proceeds as before.
