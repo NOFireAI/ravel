@@ -1307,8 +1307,10 @@ with the bucket's `sys/ipcrypt/policy` marker before it serves, whether or not
   absent marker.
 
 So every `ravel-server` process ingesting into a bucket runs the same policy,
-and `ravel-cli load` and `ravel-cli erase submit` check the same marker before
-they write. `query` and `maintain` do not read the marker. A changed policy is
+and `ravel-cli load` checks the same marker before it writes, creating it the
+way the server does. `ravel-cli erase submit` checks the marker but never
+creates it (see `docs/deletion-and-gc.md`). `query` and `maintain` do not read
+the marker. A changed policy is
 installed with `ravel-cli ipcrypt set-policy --ipcrypt-config FILE`, which
 replaces the marker under a compare-and-swap; until then a bucket keeps the
 policy its marker was created with. The IAM templates grant the gateway role a
