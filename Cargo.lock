@@ -5026,6 +5026,7 @@ dependencies = [
  "blake3",
  "promql-parser",
  "proptest",
+ "ravel-memory",
  "ravel-types",
  "regex",
  "thiserror",

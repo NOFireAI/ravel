@@ -16,7 +16,9 @@
 //! subquery wherever it accepts a matrix selector. A range query keeps each
 //! selector read in a per-query cache and answers later grid and subquery
 //! steps by slicing it, reading again only when a step asks for a window
-//! outside the cached one (ADR-3072 decision 1b). [`plan_selectors`] reports
+//! outside the cached one (ADR-3072 decision 1b); each entry is charged to a
+//! per-query byte cap and the query's memory budget, and a selector whose
+//! entry does not fit is read at every step instead (issue #3105). [`plan_selectors`] reports
 //! every selector reachable through them, for prefetch. The evaluator
 //! consumes a storage-agnostic series stream trait.
 
@@ -37,6 +39,7 @@ pub use eval::{
     Annotations, DEFAULT_LOOKBACK_NS, DEFAULT_MAX_RANGE_POINTS, DEFAULT_MAX_TOTAL_EVAL_POINTS,
     DEFAULT_SUBQUERY_STEP_NS, Error, Evaluator, HistogramAwareMatrix, InstantSample, InstantVector,
     QueryWindow, RangeMatrix, RangeSample, RangeValue, Value, ms_to_ns, ns_to_ms_floor,
+    selector_cache_cap_for_pool,
 };
 // ADR-0103 aggregation pushdown: the coordinator (`ravel-query`) derives a
 // count_over_time reduction window on the distributed path and asserts it

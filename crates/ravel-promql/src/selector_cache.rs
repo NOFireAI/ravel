@@ -30,13 +30,25 @@
 //! step sees. A step can see a series whose slice is empty where a fetch over
 //! `R` would return no series at all; every consumer drops an empty series,
 //! so the output is the same.
+//!
+//! Every entry is charged, before it is stored, against two bounds: a
+//! per-query byte cap on the cache's running total, and the query's
+//! [`MemoryBudget`], one [`Reservation`] per entry, released when the entry
+//! is replaced or the cache is dropped with its query (issue #3105). An entry
+//! that does not fit is not stored, and its key falls back: every later step
+//! reads that selector over its own request window, as evaluation without the
+//! cache does. A fallback changes how many reads a query makes, not which
+//! samples a step sees.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
-use ravel_types::{LabelSet, Sample, TimeRange};
+use ravel_memory::{MemoryBudget, MemoryExhausted, Reservation};
+use ravel_types::{Label, LabelSet, Sample, TimeRange};
 
+use crate::histogram::{FloatHistogram, Span};
 use crate::source::{HistogramSample, HistogramSeriesData, LabelMatcher, MatchOp, SeriesData};
 
 /// Which of the two `SeriesSource` reads an entry came from. A series is
@@ -116,6 +128,9 @@ pub(crate) trait CachedSeries: Sized {
     const CHANNEL: SelectorChannel;
     fn labels(&self) -> &LabelSet;
     fn points(&self) -> &[Self::Point];
+    /// The heap bytes this series holds outside its own struct: its labels
+    /// and its points, by allocated capacity.
+    fn heap_bytes(&self) -> u64;
     fn ts_ns(point: &Self::Point) -> i64;
     fn into_entry(cached: Rc<CachedSelector<Self>>) -> CacheEntry;
     fn from_entry(entry: &CacheEntry) -> Option<&Rc<CachedSelector<Self>>>;
@@ -129,6 +144,9 @@ impl CachedSeries for SeriesData {
     }
     fn points(&self) -> &[Sample] {
         &self.samples
+    }
+    fn heap_bytes(&self) -> u64 {
+        label_bytes(&self.labels).saturating_add(vec_bytes(&self.samples))
     }
     fn ts_ns(point: &Sample) -> i64 {
         point.ts_ns
@@ -153,6 +171,14 @@ impl CachedSeries for HistogramSeriesData {
     fn points(&self) -> &[HistogramSample] {
         &self.samples
     }
+    fn heap_bytes(&self) -> u64 {
+        self.samples
+            .iter()
+            .fold(label_bytes(&self.labels), |sum, point| {
+                sum.saturating_add(histogram_heap_bytes(&point.value))
+            })
+            .saturating_add(vec_bytes(&self.samples))
+    }
     fn ts_ns(point: &HistogramSample) -> i64 {
         point.ts_ns
     }
@@ -167,6 +193,38 @@ impl CachedSeries for HistogramSeriesData {
     }
 }
 
+/// `capacity` elements of `T`, saturating.
+fn capacity_bytes<T>(capacity: usize) -> u64 {
+    u64::try_from(capacity)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(u64::try_from(std::mem::size_of::<T>()).unwrap_or(u64::MAX))
+}
+
+fn vec_bytes<T>(v: &Vec<T>) -> u64 {
+    capacity_bytes::<T>(v.capacity())
+}
+
+/// A label set's heap bytes: one [`Label`] per label (the set's own vector is
+/// private, so its length stands in for its capacity) plus each name's and
+/// value's allocated capacity.
+fn label_bytes(labels: &LabelSet) -> u64 {
+    labels
+        .iter()
+        .fold(capacity_bytes::<Label>(labels.len()), |sum, label| {
+            sum.saturating_add(capacity_bytes::<u8>(label.name.capacity()))
+                .saturating_add(capacity_bytes::<u8>(label.value.capacity()))
+        })
+}
+
+/// A native histogram's span and bucket vectors, by allocated capacity.
+fn histogram_heap_bytes(h: &FloatHistogram) -> u64 {
+    capacity_bytes::<Span>(h.positive_spans.capacity())
+        .saturating_add(capacity_bytes::<Span>(h.negative_spans.capacity()))
+        .saturating_add(vec_bytes(&h.positive_buckets))
+        .saturating_add(vec_bytes(&h.negative_buckets))
+        .saturating_add(vec_bytes(&h.custom_values))
+}
+
 /// The series one selector read returned, in source order, and the window
 /// that read covered.
 #[derive(Debug)]
@@ -176,6 +234,14 @@ pub(crate) struct CachedSelector<S> {
 }
 
 impl<S: CachedSeries> CachedSelector<S> {
+    /// The bytes this read holds: its series vector by capacity, plus each
+    /// series' [`CachedSeries::heap_bytes`]. This is what an entry is charged.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.series.iter().fold(vec_bytes(&self.series), |sum, s| {
+            sum.saturating_add(s.heap_bytes())
+        })
+    }
+
     /// Every series' points inside `request`, inclusive on both ends like
     /// `TimeRange`, so equal timestamps at either bound are kept. Series
     /// order is the source's. `request` must lie inside [`Self::window`]. A
@@ -214,25 +280,78 @@ impl CacheEntry {
     }
 }
 
-/// Source reads the cache issued over one query.
+/// A stored entry with the bytes it was charged and the budget reservation
+/// that holds them; dropping the slot releases the reservation.
+struct Slot {
+    entry: CacheEntry,
+    bytes: u64,
+    _reservation: Option<Reservation>,
+}
+
+/// Why a key's entry was not stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackReason {
+    /// The entry would have taken the cache's running total over its cap.
+    Cap,
+    /// The query's memory budget refused the entry's reservation.
+    Budget(MemoryExhausted),
+}
+
+/// Source reads the cache issued over one query, and the bytes it held.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SelectorCacheStats {
-    /// Every `SeriesSource` read, either channel.
+    /// Every `SeriesSource` read, either channel, including the per-step
+    /// reads of a key that fell back.
     pub(crate) fetches: u64,
     /// The reads that replaced an existing entry because a request fell
     /// outside its window.
     pub(crate) refetches: u64,
+    /// The bytes the stored entries hold now.
+    pub(crate) bytes: u64,
+    /// The largest value `bytes` reached over the query.
+    pub(crate) peak_bytes: u64,
+    /// The keys whose entry did not fit, for either reason.
+    pub(crate) fallback_keys: u64,
 }
 
-#[derive(Default)]
 pub(crate) struct SelectorCache {
-    entries: RefCell<HashMap<SelectorKey, CacheEntry>>,
+    entries: RefCell<HashMap<SelectorKey, Slot>>,
+    /// Keys whose entry did not fit, with the first reason. A key here is not
+    /// offered to [`Self::insert`] again; an entry it already had stays and
+    /// keeps answering the requests inside its window.
+    fallen_back: RefCell<HashMap<SelectorKey, FallbackReason>>,
+    max_bytes: u64,
+    budget: Option<Arc<MemoryBudget>>,
+    bytes: Cell<u64>,
+    peak_bytes: Cell<u64>,
     fetches: Cell<u64>,
     refetches: Cell<u64>,
 }
 
+impl Default for SelectorCache {
+    fn default() -> Self {
+        SelectorCache::new(u64::MAX, None)
+    }
+}
+
 impl SelectorCache {
+    /// A cache whose stored entries may hold at most `max_bytes` in total
+    /// (`u64::MAX` is uncapped), each also reserved against `budget` when one
+    /// is given.
+    pub(crate) fn new(max_bytes: u64, budget: Option<Arc<MemoryBudget>>) -> Self {
+        SelectorCache {
+            entries: RefCell::default(),
+            fallen_back: RefCell::default(),
+            max_bytes,
+            budget,
+            bytes: Cell::new(0),
+            peak_bytes: Cell::new(0),
+            fetches: Cell::new(0),
+            refetches: Cell::new(0),
+        }
+    }
+
     /// The entry for `key` when its window covers `request`.
     pub(crate) fn lookup<S: CachedSeries>(
         &self,
@@ -240,9 +359,48 @@ impl SelectorCache {
         request: TimeRange,
     ) -> Option<Rc<CachedSelector<S>>> {
         let entries = self.entries.borrow();
-        let cached = S::from_entry(entries.get(key)?)?;
+        let cached = S::from_entry(&entries.get(key)?.entry)?;
         (cached.window.start_ns <= request.start_ns && request.end_ns <= cached.window.end_ns)
             .then(|| Rc::clone(cached))
+    }
+
+    /// Whether `key`'s entry did not fit earlier in this query, so a request
+    /// [`Self::lookup`] does not answer is read over the request alone.
+    pub(crate) fn fell_back(&self, key: &SelectorKey) -> bool {
+        self.fallen_back.borrow().contains_key(key)
+    }
+
+    /// Count a read made outside the cache for a key that fell back.
+    pub(crate) fn note_uncached_read(&self) {
+        self.fetches.set(self.fetches.get().saturating_add(1));
+    }
+
+    /// The bytes the stored entries hold.
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes.get()
+    }
+
+    /// How many keys fell back for each reason, `(cap, budget)`, and the
+    /// first budget refusal.
+    pub(crate) fn fallbacks(&self) -> (u64, u64, Option<MemoryExhausted>) {
+        let mut cap = 0u64;
+        let mut budget = 0u64;
+        let mut first_refusal = None;
+        for reason in self.fallen_back.borrow().values() {
+            match reason {
+                FallbackReason::Cap => cap = cap.saturating_add(1),
+                FallbackReason::Budget(refusal) => {
+                    budget = budget.saturating_add(1);
+                    first_refusal.get_or_insert(*refusal);
+                }
+            }
+        }
+        (cap, budget, first_refusal)
+    }
+
+    /// The per-query cap this cache was built with.
+    pub(crate) fn max_bytes(&self) -> u64 {
+        self.max_bytes
     }
 
     /// The window a miss on `key` fetches: `computed` when `key` has no
@@ -251,8 +409,8 @@ impl SelectorCache {
     /// every request the entry did.
     pub(crate) fn miss_window(&self, key: &SelectorKey, computed: TimeRange) -> TimeRange {
         match self.entries.borrow().get(key) {
-            Some(entry) => {
-                let old = entry.window();
+            Some(slot) => {
+                let old = slot.entry.window();
                 TimeRange {
                     start_ns: old.start_ns.min(computed.start_ns),
                     end_ns: old.end_ns.max(computed.end_ns),
@@ -262,19 +420,52 @@ impl SelectorCache {
         }
     }
 
-    /// Store a fresh read under `key`, replacing any previous entry. A miss
-    /// reads over [`Self::miss_window`], so a replacement covers the window
-    /// of the entry it replaces.
+    /// Count a fresh read of `key` and store it, replacing any previous
+    /// entry, when it fits: the running total with this entry in place of the
+    /// one it replaces must stay within the cap, and the query's budget must
+    /// admit a reservation of the entry's bytes. Otherwise nothing is stored,
+    /// any previous entry stays, and `key` falls back. A miss reads over
+    /// [`Self::miss_window`], so a replacement covers the window of the entry
+    /// it replaces. This is the only way an entry enters the cache.
     pub(crate) fn insert<S: CachedSeries>(&self, key: SelectorKey, cached: Rc<CachedSelector<S>>) {
         self.fetches.set(self.fetches.get().saturating_add(1));
-        if self
-            .entries
-            .borrow_mut()
-            .insert(key, S::into_entry(cached))
-            .is_some()
-        {
+        let bytes = cached.bytes();
+        let mut entries = self.entries.borrow_mut();
+        let replaced_bytes = entries.get(&key).map_or(0, |slot| slot.bytes);
+        let total = self
+            .bytes()
+            .saturating_sub(replaced_bytes)
+            .saturating_add(bytes);
+        if total > self.max_bytes {
+            self.fallen_back
+                .borrow_mut()
+                .entry(key)
+                .or_insert(FallbackReason::Cap);
+            return;
+        }
+        let reservation = match &self.budget {
+            Some(budget) => match budget.reserve(bytes) {
+                Ok(reservation) => Some(reservation),
+                Err(refusal) => {
+                    self.fallen_back
+                        .borrow_mut()
+                        .entry(key)
+                        .or_insert(FallbackReason::Budget(refusal));
+                    return;
+                }
+            },
+            None => None,
+        };
+        let slot = Slot {
+            entry: S::into_entry(cached),
+            bytes,
+            _reservation: reservation,
+        };
+        if entries.insert(key, slot).is_some() {
             self.refetches.set(self.refetches.get().saturating_add(1));
         }
+        self.bytes.set(total);
+        self.peak_bytes.set(self.peak_bytes.get().max(total));
     }
 
     #[cfg(test)]
@@ -282,6 +473,9 @@ impl SelectorCache {
         SelectorCacheStats {
             fetches: self.fetches.get(),
             refetches: self.refetches.get(),
+            bytes: self.bytes(),
+            peak_bytes: self.peak_bytes.get(),
+            fallback_keys: u64::try_from(self.fallen_back.borrow().len()).unwrap_or(u64::MAX),
         }
     }
 }
@@ -332,6 +526,70 @@ mod tests {
                 value: ts_ns as f64,
             })
             .collect()
+    }
+
+    fn float_entry(points: usize) -> CachedSelector<SeriesData> {
+        let ts: Vec<i64> = (0..points as i64).collect();
+        CachedSelector {
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: points as i64,
+            },
+            series: vec![SeriesData {
+                labels: LabelSet::default(),
+                samples: samples(&ts),
+            }],
+        }
+    }
+
+    #[test]
+    fn entry_bytes_cover_every_point_and_grow_with_the_sample_count() {
+        let point = std::mem::size_of::<Sample>() as u64;
+        let small = float_entry(1_000).bytes();
+        let large = float_entry(4_000).bytes();
+        assert!(small >= 1_000 * point, "{small}");
+        assert!(large >= 4_000 * point, "{large}");
+        // Everything beyond the points is per-series overhead, which the two
+        // entries share.
+        assert_eq!(large - small, 3_000 * point);
+
+        let histogram = |points: usize| CachedSelector {
+            window: TimeRange {
+                start_ns: 0,
+                end_ns: points as i64,
+            },
+            series: vec![HistogramSeriesData {
+                labels: LabelSet::default(),
+                samples: (0..points as i64)
+                    .map(|ts_ns| HistogramSample {
+                        ts_ns,
+                        value: FloatHistogram {
+                            counter_reset_hint: crate::histogram::ResetHint::Unknown,
+                            scale: 0,
+                            zero_threshold: 0.0,
+                            zero_count: 0.0,
+                            count: 1.0,
+                            sum: 1.0,
+                            positive_spans: vec![Span {
+                                offset: 0,
+                                length: 2,
+                            }],
+                            negative_spans: Vec::new(),
+                            positive_buckets: vec![0.5, 0.5],
+                            negative_buckets: Vec::new(),
+                            custom_values: Vec::new(),
+                        },
+                    })
+                    .collect(),
+            }],
+        };
+        let per_histogram_point = std::mem::size_of::<HistogramSample>() as u64
+            + std::mem::size_of::<Span>() as u64
+            + 2 * std::mem::size_of::<f64>() as u64;
+        let small = histogram(100).bytes();
+        let large = histogram(400).bytes();
+        assert!(small >= 100 * per_histogram_point, "{small}");
+        assert_eq!(large - small, 300 * per_histogram_point);
     }
 
     #[test]
@@ -511,12 +769,10 @@ mod tests {
             None,
         );
         assert_eq!(cache.miss_window(&hist_key, second), second);
-        assert_eq!(
-            cache.stats(),
-            SelectorCacheStats {
-                fetches: 2,
-                refetches: 1
-            }
-        );
+        let stats = cache.stats();
+        assert_eq!((stats.fetches, stats.refetches), (2, 1));
+        // The replacement's bytes stand in for the replaced entry's.
+        assert_eq!(stats.bytes, one_series_read(union).bytes());
+        assert_eq!(stats.fallback_keys, 0);
     }
 }

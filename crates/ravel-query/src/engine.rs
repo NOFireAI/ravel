@@ -545,6 +545,21 @@ impl QueryEngine {
         self
     }
 
+    /// The PromQL evaluator for one query: this engine's default subquery
+    /// step and the query's deadline, with a range query's selector-cache
+    /// entries reserved against the same memory budget the fetchers draw from
+    /// and capped at two pool-sized float copies of `max_samples` (issue
+    /// #3105).
+    fn evaluator(&self, query_deadline: QueryDeadline) -> Result<Evaluator, QueryError> {
+        Ok(Evaluator::new()
+            .with_default_step(self.config.default_evaluation_interval)?
+            .with_deadline(query_deadline.instant)
+            .with_memory_budget(Arc::clone(&self.memory_budget))
+            .with_max_selector_cache_bytes(ravel_promql::selector_cache_cap_for_pool(
+                self.config.max_samples,
+            )))
+    }
+
     /// Evaluates over `source` with `eval`: on the read gate when one is set,
     /// sized by the samples `source` holds, and inline otherwise.
     async fn evaluate<R, F>(
@@ -856,9 +871,7 @@ impl QueryEngine {
                 query_deadline,
             )
             .await?;
-        let evaluator = Evaluator::new()
-            .with_default_step(self.config.default_evaluation_interval)?
-            .with_deadline(query_deadline.instant);
+        let evaluator = self.evaluator(query_deadline)?;
         let span = tracing::debug_span!("evaluate", eval_kind = "instant");
         let (value, annotations) = self
             .evaluate(source, query, move |source, query| {
@@ -1082,9 +1095,7 @@ impl QueryEngine {
                 query_deadline,
             )
             .await?;
-        let evaluator = Evaluator::new()
-            .with_default_step(self.config.default_evaluation_interval)?
-            .with_deadline(query_deadline.instant);
+        let evaluator = self.evaluator(query_deadline)?;
         let span = tracing::debug_span!("evaluate", eval_kind = "range");
         let (value, annotations) = self
             .evaluate(source, query, move |source, query| {
@@ -7501,6 +7512,124 @@ mod prefetch_tests {
             vec![BASE_NS + 5 * NS_PER_SEC, BASE_NS + 5 * NS_PER_SEC],
             "one slice per query, each carrying entry plus the 5 s request deadline"
         );
+    }
+
+    /// Every 15 s from an hour before `BASE_NS` to `BASE_NS`: 241 points.
+    fn quarter_minute_samples() -> Vec<Sample> {
+        (0..=240)
+            .map(|k| Sample {
+                ts_ns: BASE_NS - 3_600 * NS_PER_SEC + k * 15 * NS_PER_SEC,
+                value: k as f64,
+            })
+            .collect()
+    }
+
+    const EIGHT_OFFSETS: &str = "m + m offset 1s + m offset 2s + m offset 3s \
+                                 + m offset 4s + m offset 5s + m offset 6s + m offset 7s";
+
+    async fn eight_offsets_range(
+        config: EngineConfig,
+        budget: Arc<ravel_memory::MemoryBudget>,
+    ) -> Result<(RangeValue, Annotations, QueryStats), QueryError> {
+        let store = Arc::new(MemoryStore::new());
+        let tenant_hash = TenantId::new("acme").hash();
+        let hour_bucket = u32::try_from(BASE_NS / (3_600 * NS_PER_SEC)).expect("hour bucket");
+        publish_metric_segment(
+            &store,
+            tenant_hash,
+            1,
+            "m",
+            quarter_minute_samples(),
+            hour_bucket,
+            BASE_NS,
+        )
+        .await;
+        let eng = engine_with_config(store, config).with_memory_budget(budget);
+        eng.range_hist_with_stats_annotated(
+            tenant_hash,
+            EIGHT_OFFSETS,
+            BASE_MS - 30 * 60_000,
+            BASE_MS,
+            15_000,
+            &[],
+            BASE_NS,
+            Duration::from_secs(60),
+        )
+        .await
+    }
+
+    /// Issue #3105: a range query's selector-cache entries are charged to the
+    /// engine's memory budget. Eight keys of about 2.5 KB each against a
+    /// 4096-byte budget: the first is cached, the other seven are read at
+    /// every step, the response carries one info naming them, the answer is
+    /// the unconstrained one, and the budget is back to zero afterwards.
+    #[tokio::test]
+    async fn a_range_query_over_its_memory_budget_reads_per_step_and_says_so() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(4096));
+        let (value, annotations, _) =
+            eight_offsets_range(EngineConfig::default(), Arc::clone(&budget))
+                .await
+                .expect("a selector the budget refuses does not fail the query");
+        assert_eq!(
+            budget.reserved(),
+            0,
+            "every entry is released with the query"
+        );
+        assert_eq!(budget.accounted_refusals(), 7);
+        assert!(annotations.warnings().is_empty());
+        assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
+        let info = &annotations.infos()[0];
+        assert!(
+            info.starts_with(
+                "7 selector(s) read at every step instead of once per query: \
+                 7 refused by the query memory budget (memory exhausted:"
+            ),
+            "{info}"
+        );
+
+        let unconstrained = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (reference, reference_annotations, _) =
+            eight_offsets_range(EngineConfig::default(), unconstrained)
+                .await
+                .expect("query evaluates");
+        assert!(reference_annotations.infos().is_empty());
+        let RangeValue::Matrix(ref matrix) = reference else {
+            panic!("expected a matrix");
+        };
+        assert_eq!(matrix.len(), 1);
+        assert_eq!(format!("{value:?}"), format!("{reference:?}"));
+    }
+
+    /// Issue #3105: the engine caps a range query's selector cache at two float
+    /// copies of its `max_samples` pool. With `max_samples` at the pool's own
+    /// 241 points the cap is 7712 bytes: three of the eight 2.5 KB keys fit
+    /// and five are read at every step, refused by the cap, not the budget.
+    #[tokio::test]
+    async fn a_range_query_over_its_selector_cache_cap_reads_per_step_and_says_so() {
+        let config = EngineConfig {
+            max_samples: 241,
+            ..EngineConfig::default()
+        };
+        let cap = ravel_promql::selector_cache_cap_for_pool(241);
+        assert_eq!(cap, 7712);
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let (value, annotations, _) = eight_offsets_range(config, Arc::clone(&budget))
+            .await
+            .expect("a selector over the cap does not fail the query");
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
+        assert_eq!(
+            annotations.infos()[0],
+            "5 selector(s) read at every step instead of once per query: \
+             5 over the per-query selector cache cap of 7712 bytes"
+        );
+        let (reference, _, _) = eight_offsets_range(
+            EngineConfig::default(),
+            Arc::new(ravel_memory::MemoryBudget::unlimited()),
+        )
+        .await
+        .expect("query evaluates");
+        assert_eq!(format!("{value:?}"), format!("{reference:?}"));
     }
 
     /// Issue #2385: every federated Resolve request carries the query's own

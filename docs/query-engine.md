@@ -52,8 +52,16 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      the pooled fetch, so a multi-selector (or federated) query cannot hold
      N times the cap at fetch time. Evaluating a compound range query then
      keeps one owned copy of the matched pool per distinct selector key
-     (matchers, channel, `offset`, `@`) for the whole query, bounded per key
-     by the pool and charged to no budget (#3105). Pooling is loss-free: two
+     (matchers, channel, `offset`, `@`) for the whole query. Each copy is
+     charged to the query's memory budget and to a per-query cap on the
+     copies' total of two float pool copies
+     (`2 * max_samples * size_of::<Sample>()` bytes), both released when the
+     query ends; the cap follows `max_samples`, so the server has no flag
+     for it. It counts float points, so a histogram selector reaches it with
+     fewer points. A selector whose copy does not fit is read at every grid
+     step instead, with the same result, and the response carries one info
+     annotation naming how many selectors fell back and whether the budget
+     or the cap refused them (#3105). Pooling is loss-free: two
      selectors sharing a series id decode byte-identical raw runs (the
      decode is a pure function of
      segment bytes + series id, with no per-selector window trim), so
