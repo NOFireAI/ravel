@@ -78,7 +78,8 @@
 //! The sketches and the region's rank map are charged inside `max_bytes` and
 //! capped at one percent of it ([`S3Fifo::bookkeeping_bytes`]).
 
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque, btree_map, vec_deque};
+use std::iter::{Peekable, Rev};
 
 use crate::AccessIntent;
 use crate::key::CacheKey;
@@ -149,6 +150,7 @@ enum Step {
 /// touched in the current window, each with its entry size: a bottom-k
 /// sketch that estimates the window's distinct bytes without remembering
 /// every key.
+#[derive(Clone)]
 struct DistinctBytes {
     smallest: Vec<(u64, u64)>,
 }
@@ -196,6 +198,7 @@ impl DistinctBytes {
 }
 
 /// One bulk tenant's pass accounting.
+#[derive(Clone)]
 struct TenantPass {
     sketch: DistinctBytes,
     /// The distinct-bytes estimate of the window before this one.
@@ -220,6 +223,264 @@ impl TenantPass {
     fn pass_bytes(&self) -> u64 {
         self.previous_bytes.max(self.sketch.estimate())
     }
+
+    /// Counts one bulk read of `size` bytes at `rank` and region clock
+    /// `clock`, closing the window once its traffic reaches twice the pass
+    /// bytes held to `[floor, ceiling]`. Returns the window the read was
+    /// counted in and whether it closed.
+    fn observe(
+        &mut self,
+        rank: u64,
+        size: u64,
+        clock: u64,
+        floor: u64,
+        ceiling: u64,
+    ) -> (u32, bool) {
+        self.last_read = clock;
+        self.window_traffic = self.window_traffic.saturating_add(size);
+        self.sketch.observe(rank, size);
+        let window = self.window;
+        let rotate =
+            self.window_traffic >= self.pass_bytes().saturating_mul(2).clamp(floor, ceiling);
+        if rotate {
+            self.previous_bytes = self.sketch.estimate();
+            self.sketch.clear();
+            self.window = self.window.wrapping_add(1);
+            self.window_traffic = 0;
+        }
+        (window, rotate)
+    }
+}
+
+/// Whether one more region entry of `size` bytes fits every bound with its
+/// bookkeeping charged, given the payload bytes, the bookkeeping bytes and
+/// the entry count it would join.
+fn region_entry_fits(
+    limits: &CacheLimits,
+    budget: u64,
+    total: u64,
+    bookkeeping: u64,
+    entries: usize,
+    size: u64,
+) -> bool {
+    let bookkeeping = bookkeeping + REGION_ENTRY_BOOKKEEPING_BYTES;
+    bookkeeping <= budget
+        && total.saturating_add(size).saturating_add(bookkeeping) <= limits.max_bytes
+        && entries < limits.max_entries
+}
+
+/// The bytes the region can hold given the small and main queues' bytes and
+/// the bookkeeping charged; see [`S3Fifo::region_capacity`].
+fn region_capacity_of(max_bytes: u64, share: u64, small: u64, main: u64, bookkeeping: u64) -> u64 {
+    let unused = max_bytes.saturating_sub(small + main + bookkeeping);
+    let share = share.min(max_bytes.saturating_sub(main + bookkeeping));
+    unused.max(share)
+}
+
+/// Whether one more bulk tenant exceeds the tenant cap or the bookkeeping
+/// budget.
+fn tenants_full(tenants: usize, bookkeeping: u64, budget: u64) -> bool {
+    tenants >= MAX_BULK_TENANTS || bookkeeping + TENANT_BOOKKEEPING_BYTES > budget
+}
+
+/// A bulk admission's tenant tracking and evictions as
+/// [`S3Fifo::would_admit`] counts them: what they would free and add,
+/// applied to the bounds without being made. Each step mirrors the one
+/// [`S3Fifo::insert_bulk`] takes and reads the same bound helpers.
+struct DryRun<'a, V> {
+    fifo: &'a S3Fifo<V>,
+    freed_bytes: u64,
+    freed_region_bytes: u64,
+    freed_small_bytes: u64,
+    promoted_bytes: u64,
+    freed_entries: usize,
+    freed_ranks: HashSet<u64>,
+    retired: Vec<[u8; 16]>,
+    added_tenants: u64,
+    /// The region from its highest rank down, as rank eviction takes it.
+    tops: Peekable<Rev<btree_map::Iter<'a, u64, CacheKey>>>,
+    small: vec_deque::Iter<'a, CacheKey>,
+}
+
+impl<'a, V: Clone> DryRun<'a, V> {
+    fn new(fifo: &'a S3Fifo<V>) -> Self {
+        DryRun {
+            fifo,
+            freed_bytes: 0,
+            freed_region_bytes: 0,
+            freed_small_bytes: 0,
+            promoted_bytes: 0,
+            freed_entries: 0,
+            freed_ranks: HashSet::new(),
+            retired: Vec::new(),
+            added_tenants: 0,
+            tops: fifo.region.by_rank.iter().rev().peekable(),
+            small: fifo.small.iter(),
+        }
+    }
+
+    fn bookkeeping(&self) -> u64 {
+        (self.fifo.bookkeeping_bytes() + self.added_tenants * TENANT_BOOKKEEPING_BYTES)
+            .saturating_sub(
+                self.retired.len() as u64 * TENANT_BOOKKEEPING_BYTES
+                    + self.freed_ranks.len() as u64 * REGION_ENTRY_BOOKKEEPING_BYTES,
+            )
+    }
+
+    fn total(&self) -> u64 {
+        self.fifo.total_bytes().saturating_sub(self.freed_bytes)
+    }
+
+    fn region_bytes(&self) -> u64 {
+        self.fifo
+            .region
+            .bytes
+            .saturating_sub(self.freed_region_bytes)
+    }
+
+    /// [`S3Fifo::bulk_fits`].
+    fn fits(&self, size: u64) -> bool {
+        region_entry_fits(
+            &self.fifo.limits,
+            self.fifo.bookkeeping_budget,
+            self.total(),
+            self.bookkeeping(),
+            self.fifo.entries.len().saturating_sub(self.freed_entries),
+            size,
+        )
+    }
+
+    /// [`S3Fifo::region_capacity`].
+    fn capacity(&self) -> u64 {
+        region_capacity_of(
+            self.fifo.limits.max_bytes,
+            self.fifo.region_share_bytes,
+            self.fifo
+                .small_bytes
+                .saturating_sub(self.freed_small_bytes + self.promoted_bytes),
+            self.fifo.main_bytes + self.promoted_bytes,
+            self.bookkeeping(),
+        )
+    }
+
+    /// The tracked tenants' summed pass bytes, with `tenant`'s pass read as
+    /// `pass`.
+    fn pass_bytes(&self, tenant: &[u8; 16], pass: &TenantPass) -> u64 {
+        self.fifo
+            .region
+            .tenants
+            .iter()
+            .filter(|(other, _)| *other != tenant && !self.retired.contains(other))
+            .fold(pass.pass_bytes(), |sum, (_, other)| {
+                sum.saturating_add(other.pass_bytes())
+            })
+    }
+
+    /// [`S3Fifo::evict_bulk`].
+    fn free_region(&mut self, rank: u64, key: &CacheKey) {
+        if !self.freed_ranks.insert(rank) {
+            return;
+        }
+        if let Some(entry) = self.fifo.entries.get(key) {
+            self.freed_bytes += entry.size;
+            self.freed_region_bytes += entry.size;
+            self.freed_entries += 1;
+        }
+    }
+
+    /// Frees the highest-ranked region entry left if its rank is above
+    /// `above`, or whatever its rank for `None`. False when there is none.
+    fn evict_top(&mut self, above: Option<u64>) -> bool {
+        while let Some(&(&rank, key)) = self.tops.peek() {
+            if self.freed_ranks.contains(&rank) {
+                self.tops.next();
+                continue;
+            }
+            if above.is_some_and(|floor| rank <= floor) {
+                return false;
+            }
+            self.tops.next();
+            self.free_region(rank, key);
+            return true;
+        }
+        false
+    }
+
+    /// [`S3Fifo::evict_from_small`]. False when the small queue is empty.
+    fn evict_small(&mut self) -> bool {
+        let Some(key) = self.small.next() else {
+            return false;
+        };
+        if let Some(entry) = self.fifo.entries.get(key) {
+            if entry.freq > 0 {
+                self.promoted_bytes += entry.size;
+            } else {
+                self.freed_bytes += entry.size;
+                self.freed_small_bytes += entry.size;
+                self.freed_entries += 1;
+            }
+        }
+        true
+    }
+
+    /// [`S3Fifo::retire_tenant`].
+    fn retire(&mut self, tenant: [u8; 16]) {
+        self.retired.push(tenant);
+        for (&rank, key) in &self.fifo.region.by_rank {
+            if key.tenant_hash == tenant {
+                self.free_region(rank, key);
+            }
+        }
+    }
+
+    /// [`S3Fifo::track_tenant`].
+    fn track(&mut self) -> bool {
+        loop {
+            let tracked = self.fifo.region.tenants.len() - self.retired.len();
+            if !tenants_full(tracked, self.bookkeeping(), self.fifo.bookkeeping_budget) {
+                if self.total() + self.bookkeeping() + TENANT_BOOKKEEPING_BYTES
+                    <= self.fifo.limits.max_bytes
+                {
+                    self.added_tenants = 1;
+                    return true;
+                }
+                let region_left = self.fifo.region.by_rank.len() > self.freed_ranks.len();
+                let stepped = if region_left {
+                    self.evict_top(None)
+                } else {
+                    TENANT_BOOKKEEPING_BYTES <= self.fifo.region_share_bytes && self.evict_small()
+                };
+                if !stepped {
+                    return false;
+                }
+                continue;
+            }
+            let Some(oldest) = self
+                .fifo
+                .region
+                .tenants
+                .iter()
+                .filter(|(tenant, _)| !self.retired.contains(tenant))
+                .min_by_key(|(_, pass)| pass.last_read)
+                .map(|(tenant, _)| *tenant)
+            else {
+                return false;
+            };
+            self.retire(oldest);
+        }
+    }
+}
+
+/// Exclusive upper bound on a bulk admission's rank given the region's
+/// `capacity` and the tracked tenants' summed `pass_bytes`; see
+/// [`S3Fifo::bulk_rank_bound`].
+fn rank_bound(capacity: u64, pass_bytes: u64) -> u128 {
+    let full = 1u128 << 64;
+    if pass_bytes <= capacity {
+        return full;
+    }
+    let fraction = capacity as f64 * 1.25 / pass_bytes as f64;
+    ((fraction * full as f64) as u128).min(full)
 }
 
 #[derive(Default)]
@@ -437,8 +698,8 @@ impl<V: Clone> S3Fifo<V> {
 
     /// [`Self::insert_with_intent`] with the value built by `make`, which
     /// runs only once the entry is stored: never for a decline, and never
-    /// for a key already resident. The RAM tier makes its owned copy of the
-    /// payload here so a declined admission copies nothing.
+    /// for a key already resident. [`Self::would_admit`] asks the same
+    /// question without admitting.
     pub(crate) fn insert_with_intent_lazy(
         &mut self,
         key: CacheKey,
@@ -474,6 +735,58 @@ impl<V: Clone> S3Fifo<V> {
 
         let evicted = self.evict_to_bounds(metrics);
         (true, evicted)
+    }
+
+    /// Whether [`Self::insert_with_intent`] of `key` (of `size` bytes) for a
+    /// read of `intent` would store it if it ran now, decided without changing
+    /// anything. For a [`AccessIntent::BulkScan`] key it runs
+    /// [`Self::insert_bulk`]'s steps through [`DryRun`]: tracking a new
+    /// tenant, with the retirements and evictions that takes, counting the
+    /// read, a rank collision, the rank bound, and room after the evictions
+    /// it would make. Where the read would close the tenant's pass window,
+    /// whose evictions it does not model, it answers true and leaves the
+    /// decision to the admission. So false means an admission on the same
+    /// state declines, and true is exact unless the read closes a window.
+    pub(crate) fn would_admit(&self, key: &CacheKey, size: u64, intent: AccessIntent) -> bool {
+        if size > self.limits.max_entry_bytes || self.entries.contains_key(key) {
+            return false;
+        }
+        if intent != AccessIntent::BulkScan {
+            return true;
+        }
+        let rank = rank_of(key);
+        let mut run = DryRun::new(self);
+        let mut pass = match self.region.tenants.get(&key.tenant_hash) {
+            Some(pass) => pass.clone(),
+            None => {
+                if !run.track() {
+                    return false;
+                }
+                TenantPass::new(self.region.clock)
+            }
+        };
+        let (floor, ceiling) = self.window_bounds();
+        let clock = self.region.clock.saturating_add(size);
+        if pass.observe(rank, size, clock, floor, ceiling).1 {
+            return true;
+        }
+        if self.region.by_rank.contains_key(&rank) && !run.freed_ranks.contains(&rank) {
+            return false;
+        }
+        let pass_bytes = run.pass_bytes(&key.tenant_hash, &pass);
+        if u128::from(rank) >= rank_bound(run.capacity(), pass_bytes) {
+            return false;
+        }
+        while !run.fits(size) {
+            if run.evict_top(Some(rank)) {
+                continue;
+            }
+            if run.region_bytes() + size <= self.region_share_bytes && run.evict_small() {
+                continue;
+            }
+            return false;
+        }
+        true
     }
 
     /// Drops `key` from the ghost queue, returning whether it was there. Run
@@ -550,31 +863,27 @@ impl<V: Clone> S3Fifo<V> {
     /// Whether one more region entry of `size` bytes fits every bound with
     /// its bookkeeping charged.
     fn bulk_fits(&self, size: u64) -> bool {
-        let bookkeeping = self.bookkeeping_bytes() + REGION_ENTRY_BOOKKEEPING_BYTES;
-        bookkeeping <= self.bookkeeping_budget
-            && self
-                .total_bytes()
-                .saturating_add(size)
-                .saturating_add(bookkeeping)
-                <= self.limits.max_bytes
-            && self.entries.len() < self.limits.max_entries
+        region_entry_fits(
+            &self.limits,
+            self.bookkeeping_budget,
+            self.total_bytes(),
+            self.bookkeeping_bytes(),
+            self.entries.len(),
+            size,
+        )
     }
 
     /// The bytes the region can hold now: whatever the small and main queues
     /// leave unused, or its share where only the small queue stands in the
     /// way of it.
     fn region_capacity(&self) -> u64 {
-        let bookkeeping = self.bookkeeping_bytes();
-        let unused = self
-            .limits
-            .max_bytes
-            .saturating_sub(self.small_bytes + self.main_bytes + bookkeeping);
-        let share = self.region_share_bytes.min(
-            self.limits
-                .max_bytes
-                .saturating_sub(self.main_bytes + bookkeeping),
-        );
-        unused.max(share)
+        region_capacity_of(
+            self.limits.max_bytes,
+            self.region_share_bytes,
+            self.small_bytes,
+            self.main_bytes,
+            self.bookkeeping_bytes(),
+        )
     }
 
     /// Exclusive upper bound on the rank a bulk admission may have, over the
@@ -583,18 +892,22 @@ impl<V: Clone> S3Fifo<V> {
     /// of slack. The slack keeps an overestimated pass from leaving the
     /// region short; rank eviction trims what an underestimate lets in.
     fn bulk_rank_bound(&self) -> u128 {
-        let full = 1u128 << 64;
-        let capacity = self.region_capacity();
         let pass_bytes = self
             .region
             .tenants
             .values()
             .fold(0u64, |sum, pass| sum.saturating_add(pass.pass_bytes()));
-        if pass_bytes <= capacity {
-            return full;
-        }
-        let fraction = capacity as f64 * 1.25 / pass_bytes as f64;
-        ((fraction * full as f64) as u128).min(full)
+        rank_bound(self.region_capacity(), pass_bytes)
+    }
+
+    /// The `(floor, ceiling)` a tenant's window-closing traffic is held to.
+    fn window_bounds(&self) -> (u64, u64) {
+        (
+            self.limits.max_bytes.saturating_mul(WINDOW_FLOOR_MULTIPLE),
+            self.limits
+                .max_bytes
+                .saturating_mul(WINDOW_CEILING_MULTIPLE),
+        )
     }
 
     /// Counts one bulk read of `key` against its tracked tenant: the window's
@@ -612,26 +925,11 @@ impl<V: Clone> S3Fifo<V> {
     ) {
         self.region.clock = self.region.clock.saturating_add(size);
         let clock = self.region.clock;
-        let floor = self.limits.max_bytes.saturating_mul(WINDOW_FLOOR_MULTIPLE);
-        let ceiling = self
-            .limits
-            .max_bytes
-            .saturating_mul(WINDOW_CEILING_MULTIPLE);
+        let (floor, ceiling) = self.window_bounds();
         let Some(pass) = self.region.tenants.get_mut(&key.tenant_hash) else {
             return;
         };
-        pass.last_read = clock;
-        pass.window_traffic = pass.window_traffic.saturating_add(size);
-        pass.sketch.observe(rank, size);
-        let window = pass.window;
-        let rotate =
-            pass.window_traffic >= pass.pass_bytes().saturating_mul(2).clamp(floor, ceiling);
-        if rotate {
-            pass.previous_bytes = pass.sketch.estimate();
-            pass.sketch.clear();
-            pass.window = pass.window.wrapping_add(1);
-            pass.window_traffic = 0;
-        }
+        let (window, rotate) = pass.observe(rank, size, clock, floor, ceiling);
         if let Some(entry) = self.entries.get_mut(key)
             && entry.bulk
         {
@@ -654,8 +952,11 @@ impl<V: Clone> S3Fifo<V> {
         evicted: &mut Vec<CacheKey>,
     ) -> bool {
         loop {
-            let full = self.region.tenants.len() >= MAX_BULK_TENANTS
-                || self.bookkeeping_bytes() + TENANT_BOOKKEEPING_BYTES > self.bookkeeping_budget;
+            let full = tenants_full(
+                self.region.tenants.len(),
+                self.bookkeeping_bytes(),
+                self.bookkeeping_budget,
+            );
             if !full {
                 if self.charged_bytes() + TENANT_BOOKKEEPING_BYTES <= self.limits.max_bytes {
                     self.region
@@ -939,6 +1240,46 @@ impl<V: Clone> S3Fifo<V> {
     #[cfg(test)]
     pub(crate) fn rank_and_bound(&self, key: &CacheKey) -> (u64, u128) {
         (rank_of(key), self.bulk_rank_bound())
+    }
+
+    /// The bulk region's state a bulk admission reads or changes, for tests
+    /// that compare it across calls: the byte totals, the read clock, the rank
+    /// map, and every tenant's pass, in tenant order.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    fn bulk_state(
+        &self,
+    ) -> (
+        [u64; 4],
+        Vec<(u64, CacheKey)>,
+        Vec<([u8; 16], u32, u64, u64, u64, Vec<(u64, u64)>)>,
+    ) {
+        let mut tenants: Vec<_> = self
+            .region
+            .tenants
+            .iter()
+            .map(|(tenant, pass)| {
+                (
+                    *tenant,
+                    pass.window,
+                    pass.window_traffic,
+                    pass.last_read,
+                    pass.previous_bytes,
+                    pass.sketch.smallest.clone(),
+                )
+            })
+            .collect();
+        tenants.sort_by_key(|tenant| tenant.0);
+        (
+            [
+                self.total_bytes(),
+                self.bookkeeping_bytes(),
+                self.region.bytes,
+                self.region.clock,
+            ],
+            self.region.by_rank.iter().map(|(r, k)| (*r, *k)).collect(),
+            tenants,
+        )
     }
 }
 
@@ -1755,6 +2096,153 @@ mod tests {
         };
         assert!(served_on_last_pass(12) > 0, "a loop of 12x is served");
         assert_eq!(served_on_last_pass(40), 0, "a loop of 40x is not");
+    }
+
+    /// `would_admit` answering false means the admission declines: over a
+    /// sweep that crosses every decline (over size, already resident, rank
+    /// bound, rank collision aside, no room), closes pass windows, and asks
+    /// about more bulk tenants than the bookkeeping budget tracks, so that
+    /// tracking a new one retires another, no admission `would_admit`
+    /// declined stores its key. The answer is exact for every read that does
+    /// not close its tenant's pass window, and true for every read of a key
+    /// not resident that does.
+    ///
+    /// FLIP: dropping the `observe` call from `would_admit` answers false for
+    /// a read that closes its window, and answering true for an untracked
+    /// tenant whose tracking would retire another, instead of running
+    /// `DryRun::track`, leaves admissions it predicted declined.
+    #[test]
+    fn a_bulk_read_would_admit_declines_is_declined() {
+        const ENTRY: u64 = 16 * 1024;
+        let limits = CacheLimits::new(64 * ENTRY, 1_000_000, 4 * ENTRY);
+        let metrics = CacheMetrics::default();
+        let mut fifo = S3Fifo::<u64>::new(limits);
+        let intents = [
+            AccessIntent::BulkScan,
+            AccessIntent::BulkScan,
+            AccessIntent::Interactive,
+            AccessIntent::BulkScan,
+            AccessIntent::Maintenance,
+        ];
+        // Bulk reads that stored, that were declined, that tracked a tenant by
+        // retiring another, and that closed a window.
+        let [mut stored, mut declined, mut retiring, mut rotated] = [0u32; 4];
+        // Eight tenants retire one another before any reads enough to close a
+        // window, so the last two passes read as one tenant.
+        for pass in 0..6u64 {
+            for n in 0..1200u64 {
+                let size = [ENTRY, 2 * ENTRY, 5 * ENTRY, 3 * ENTRY][(n / 8 % 4) as usize];
+                let tenant = if pass < 4 { 1 + (n % 8) as u8 } else { 1 };
+                let k = key(tenant, n, size);
+                let intent = intents[((n + pass) % 5) as usize];
+                let predicted = fifo.would_admit(&k, size, intent);
+                let window = fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window);
+                let tenants = fifo.region.tenants.len();
+                let resident = fifo.contains(&k);
+                let mut made = false;
+                fifo.insert_with_intent_lazy(k, size, intent, &metrics, || {
+                    made = true;
+                    n
+                });
+                assert!(
+                    predicted || !made,
+                    "declined by would_admit, stored: pass {pass} key {n} tenant {tenant} size {size} intent {intent:?}"
+                );
+                let closed = window.is_some_and(|window| {
+                    fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window) != Some(window)
+                });
+                if !closed {
+                    assert_eq!(
+                        predicted, made,
+                        "pass {pass} key {n} tenant {tenant} size {size} intent {intent:?}"
+                    );
+                } else if !resident && size <= limits.max_entry_bytes {
+                    assert!(predicted, "a read closing its window: pass {pass} key {n}");
+                }
+                if intent == AccessIntent::BulkScan {
+                    stored += u32::from(made);
+                    declined += u32::from(!made);
+                    retiring += u32::from(
+                        window.is_none()
+                            && fifo.region.tenants.contains_key(&k.tenant_hash)
+                            && fifo.region.tenants.len() <= tenants,
+                    );
+                    rotated += u32::from(closed);
+                }
+                assert_within_bounds(&fifo);
+            }
+        }
+        let counts = [stored, declined, retiring, rotated];
+        assert!(
+            counts.iter().all(|&count| count > 0),
+            "every class crossed: {counts:?}"
+        );
+    }
+
+    /// `would_admit` changes nothing: asked twice about each key of a sweep
+    /// (tracked tenants and a new one, keys it admits, keys it declines by
+    /// rank or room, resident keys, every intent), it gives the same answer
+    /// both times, and the byte totals, the read clock, the rank map and
+    /// every tenant's pass, its window included, are as they were.
+    ///
+    /// FLIP: having `would_admit` take `&mut self` and advance the region's
+    /// read clock by a bulk read's size, as `observe_bulk` does, fails the
+    /// state comparison.
+    #[test]
+    fn would_admit_never_mutates() {
+        const ENTRY: u64 = 16 * 1024;
+        let limits = CacheLimits::new(64 * ENTRY, 1_000_000, 4 * ENTRY);
+        let metrics = CacheMetrics::default();
+        let mut fifo = S3Fifo::<()>::new(limits);
+        for n in 0..8 {
+            fifo.insert(key(9, n, ENTRY), (), ENTRY, &metrics);
+        }
+        for n in 0..300 {
+            fifo.insert_with_intent(
+                key(1, n, ENTRY),
+                (),
+                ENTRY,
+                AccessIntent::BulkScan,
+                &metrics,
+            );
+            if n % 3 == 0 {
+                fifo.insert_with_intent(
+                    key(2, n, 2 * ENTRY),
+                    (),
+                    2 * ENTRY,
+                    AccessIntent::BulkScan,
+                    &metrics,
+                );
+            }
+        }
+        let before = fifo.bulk_state();
+        assert!(
+            !before.1.is_empty() && before.2.len() == 2,
+            "precondition: a populated region"
+        );
+        let mut answers = [0u32; 2];
+        for n in 0..400 {
+            for (k, size, intent) in [
+                (key(1, n, ENTRY), ENTRY, AccessIntent::BulkScan),
+                (key(2, n, 2 * ENTRY), 2 * ENTRY, AccessIntent::BulkScan),
+                (key(3, n, ENTRY), ENTRY, AccessIntent::BulkScan),
+                (key(9, n, ENTRY), ENTRY, AccessIntent::Interactive),
+                (key(1, n, ENTRY), ENTRY, AccessIntent::Maintenance),
+            ] {
+                let first = fifo.would_admit(&k, size, intent);
+                let second = fifo.would_admit(&k, size, intent);
+                assert_eq!(first, second, "key {n} intent {intent:?}");
+                answers[usize::from(first)] += 1;
+            }
+        }
+        assert!(
+            fifo.bulk_state() == before,
+            "would_admit changed the bulk state"
+        );
+        assert!(
+            answers[0] > 0 && answers[1] > 0,
+            "both answers seen: {answers:?}"
+        );
     }
 
     /// `f64::clamp` passes NaN through, and NaN as `u64` is 0, so a NaN

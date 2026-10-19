@@ -39,7 +39,7 @@ pub(crate) fn corrupt_bytes(bytes: &Bytes) -> Bytes {
 /// the number of bytes copied to make it: kept as is (zero copied) when it
 /// already is one, otherwise copied once into a fresh exact-size allocation.
 /// Shared, static, and owner-backed `Bytes` are not unique, so they are
-/// copied. The caller counts the copy once the entry is stored.
+/// copied. [`Inner::own`] counts the copy.
 fn owned_exact(value: Bytes) -> (Bytes, u64) {
     if value.is_empty() {
         return (Bytes::new(), 0);
@@ -91,6 +91,13 @@ struct Inner {
     /// `limits.max_entry_age_ns` (ADR-0064). Injected so tests
     /// drive ageing deterministically instead of sleeping.
     clock: Arc<dyn Clock>,
+    /// Copies [`Inner::own`] made while `fifo` was locked.
+    #[cfg(test)]
+    copies_under_lock: std::sync::atomic::AtomicUsize,
+    /// Run once by the next bulk admission between its copy and its
+    /// admission, with the fifo lock released.
+    #[cfg(test)]
+    after_bulk_copy: Mutex<Option<Box<dyn FnOnce(&Inner) + Send>>>,
 }
 
 /// The RAM tier of ADR-0046's read cache: a bounded, content-addressed,
@@ -140,6 +147,10 @@ where
             metrics: Arc::new(CacheMetrics::default()),
             limits,
             clock,
+            #[cfg(test)]
+            copies_under_lock: Default::default(),
+            #[cfg(test)]
+            after_bulk_copy: Mutex::new(None),
         });
         let sweeper = spawn_sweeper(&inner);
         Cache {
@@ -252,8 +263,11 @@ where
     ///
     /// The entry is charged `value.len()`, so it must not keep a larger
     /// allocation alive: unless `value` is the only handle to an allocation of
-    /// exactly its length, an exact-size copy is stored instead (counted by
-    /// [`CacheMetrics::admission_copies`]). A slice of a larger buffer, such as
+    /// exactly its length, an exact-size copy is stored instead.
+    /// [`CacheMetrics::admission_copies`] counts every copy made, including
+    /// one made for a key that was already resident, which stores nothing.
+    /// The copy is made with the cache's lock released, so a concurrent read
+    /// does not wait on it. A slice of a larger buffer, such as
     /// a response body that is a view into an HTTP read buffer, therefore
     /// stops pinning that buffer once the caller's handles drop. A caller that
     /// keeps a clone of `value` makes it shared, so it is always copied; pass
@@ -264,8 +278,10 @@ where
 
     /// [`insert`](Self::insert) for a read of the given [`AccessIntent`],
     /// which decides where the entry is admitted. A
-    /// [`AccessIntent::BulkScan`] value outside the bulk region's subset is
-    /// neither admitted nor copied, which is not an error either.
+    /// [`AccessIntent::BulkScan`] value the bulk region declines when the
+    /// admission is first checked is neither admitted nor copied, which is not
+    /// an error either. One that stops fitting between that check and the
+    /// admission is copied, counted, and then declined.
     pub fn insert_with_intent(&self, key: CacheKey, value: Bytes, intent: AccessIntent) {
         self.inner.insert(key, value, intent);
     }
@@ -503,35 +519,56 @@ impl Inner {
     }
 
     /// Admits `value` as an allocation the entry owns outright (see
-    /// [`owned_exact`]) and returns a handle to what was stored, or `value`
-    /// when nothing was. A copy is counted only when its entry is stored.
+    /// [`owned_exact`]) and returns a handle to what was stored, or to the
+    /// value, as given or as copied, when nothing was.
     ///
-    /// An interactive or maintenance admission is declined only when over
-    /// size or already resident, so its copy is made before the lock is
-    /// taken, as for an always-admitted value. A bulk admission is declined
-    /// by rank or room, so its copy is made under the lock and only once the
-    /// eviction structure stores it: a declined bulk read copies nothing. An
-    /// over-size value is passed through uncopied whatever the intent.
+    /// Copies are made with the fifo lock released, so a read never waits on
+    /// one. An interactive or maintenance admission is declined only when
+    /// over size or already resident, so its value is copied before the lock
+    /// is taken. A bulk admission is declined by rank or room: it is checked
+    /// under the lock with [`S3Fifo::would_admit`] and copied only if that
+    /// check passes, then admitted under the lock again, which re-runs the
+    /// checks and declines a key that stopped fitting in between. A bulk read
+    /// the first check declines is admitted, and so declined, in that same
+    /// lock hold, uncopied. An over-size value is passed through uncopied
+    /// whatever the intent.
     fn insert(&self, key: CacheKey, value: Bytes, intent: AccessIntent) -> Bytes {
         let size = value.len() as u64;
-        let (mut value, copied) =
-            if intent != AccessIntent::BulkScan && size <= self.limits.max_entry_bytes {
-                let (owned, copied) = owned_exact(value);
-                (owned, Some(copied))
+        let in_size = size <= self.limits.max_entry_bytes;
+        let mut value = value;
+        let mut owned = false;
+        let mut fifo = if in_size && intent != AccessIntent::BulkScan {
+            value = self.own(value);
+            owned = true;
+            self.fifo.lock()
+        } else {
+            let fifo = self.fifo.lock();
+            if in_size && fifo.would_admit(&key, size, intent) {
+                drop(fifo);
+                value = self.own(value);
+                owned = true;
+                #[cfg(test)]
+                {
+                    let hook = self.after_bulk_copy.lock().take();
+                    if let Some(hook) = hook {
+                        hook(self);
+                    }
+                }
+                self.fifo.lock()
             } else {
-                (value, None)
-            };
+                fifo
+            }
+        };
         let written_at_ns = self.clock.now_ns();
         let mut stored = None;
-        let mut fifo = self.fifo.lock();
         fifo.insert_with_intent_lazy(key, size, intent, &self.metrics, || {
-            let (bytes, copied) = match copied {
-                Some(copied) => (std::mem::take(&mut value), copied),
-                None => owned_exact(std::mem::take(&mut value)),
+            // Unowned here only if `would_admit` declined a key the same lock
+            // hold then stored, which its contract rules out.
+            let bytes = if owned {
+                std::mem::take(&mut value)
+            } else {
+                self.own(std::mem::take(&mut value))
             };
-            if copied > 0 {
-                self.metrics.record_admission_copy(copied);
-            }
             stored = Some(bytes.clone());
             CacheEntry {
                 written_at_ns,
@@ -542,6 +579,20 @@ impl Inner {
             .set_bulk_bookkeeping_bytes(fifo.bookkeeping_bytes());
         drop(fifo);
         stored.unwrap_or(value)
+    }
+
+    /// [`owned_exact`], counting the copy if it made one.
+    fn own(&self, value: Bytes) -> Bytes {
+        let (bytes, copied) = owned_exact(value);
+        if copied > 0 {
+            #[cfg(test)]
+            if self.fifo.is_locked() {
+                self.copies_under_lock
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.metrics.record_admission_copy(copied);
+        }
+        bytes
     }
 
     /// Drops every entry whose stamped write time is older than
@@ -1344,6 +1395,130 @@ mod tests {
         assert!(cache.inner.fifo.lock().contains(&low), "stored");
         assert_eq!(metrics.admission_copies(), 1);
         assert_eq!(metrics.admission_copied_bytes(), ENTRY);
+        drop(keep);
+    }
+
+    /// A bulk value the region admits is copied with the fifo lock released:
+    /// no copy is counted while the lock is held, and between the copy and
+    /// the admission another caller can take the lock.
+    ///
+    /// FLIP (non-vacuity): in `Inner::insert`, skip the `would_admit` check
+    /// (`if false && ...`) so the value is copied inside the admission's
+    /// closure, under the lock. `copies_under_lock` then reads 1 and the hook
+    /// never runs.
+    #[test]
+    fn a_stored_bulk_value_is_copied_outside_the_fifo_lock() {
+        let cache: Cache<&'static str> = Cache::new(generous_limits());
+        let key = test_key_with_len(1, SLICE as u64);
+        let lock_free = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&lock_free);
+        *cache.inner.after_bulk_copy.lock() = Some(Box::new(move |inner: &Inner| {
+            if inner.fifo.try_lock().is_some() {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+        }));
+
+        let big = big_buffer();
+        let returned = cache.admit(key, big.slice(0..SLICE), AccessIntent::BulkScan);
+
+        assert!(cache.inner.fifo.lock().contains(&key), "stored");
+        assert_eq!(returned.as_ref(), &big[..SLICE]);
+        assert_eq!(
+            lock_free.load(Ordering::Relaxed),
+            1,
+            "lock free after the copy"
+        );
+        let metrics = cache.metrics();
+        assert_eq!(metrics.admission_copies(), 1);
+        assert_eq!(metrics.admission_copied_bytes(), SLICE as u64);
+        assert_eq!(cache.inner.copies_under_lock.load(Ordering::Relaxed), 0);
+    }
+
+    /// A bulk admission whose check passed, but which stopped fitting while
+    /// its value was copied, is declined like any other: the key is not
+    /// stored, the region keeps within its bounds, the caller gets its bytes
+    /// back, and the copy it made is counted.
+    ///
+    /// FLIP (non-vacuity): in `S3Fifo::insert_bulk`, `break` out of the room
+    /// loop instead of declining, so the admission stores without re-checking
+    /// room. The key is then resident.
+    #[test]
+    fn a_bulk_admission_declined_on_recheck_is_an_ordinary_decline() {
+        const ENTRY: u64 = 64 * 1024;
+        let limits = CacheLimits::new(16 * ENTRY, 10_000, ENTRY);
+        let cache: Cache<&'static str> = Cache::new(limits);
+        let mut keys: Vec<CacheKey> = (0..64).map(|n| test_key_with_len(n, ENTRY)).collect();
+        keys.sort_by_key(|key| cache.inner.fifo.lock().rank_and_bound(key).0);
+        let unique = |fill: u8| Bytes::from(vec![fill; ENTRY as usize]);
+        for key in &keys[..14] {
+            cache.insert_with_intent(*key, unique(1), AccessIntent::BulkScan);
+        }
+        let (late, first) = (keys[14], keys[63]);
+        assert_eq!(
+            cache.bulk_region_bytes(),
+            14 * ENTRY,
+            "precondition: 14 stored"
+        );
+        assert!(
+            cache
+                .inner
+                .fifo
+                .lock()
+                .would_admit(&first, ENTRY, AccessIntent::BulkScan),
+            "precondition: room for one more"
+        );
+
+        *cache.inner.after_bulk_copy.lock() = Some(Box::new(move |inner: &Inner| {
+            inner.insert(late, unique(2), AccessIntent::BulkScan);
+        }));
+        let shared = unique(3);
+        let keep = shared.clone();
+        let returned = cache.admit(first, shared, AccessIntent::BulkScan);
+
+        let fifo = cache.inner.fifo.lock();
+        assert!(!fifo.contains(&first), "declined on recheck");
+        assert!(fifo.contains(&late), "the admission that took the room");
+        assert_eq!(fifo.region_bytes(), 15 * ENTRY);
+        assert!(fifo.total_bytes() + fifo.bookkeeping_bytes() <= limits.max_bytes);
+        drop(fifo);
+        assert_eq!(returned.as_ref(), keep.as_ref());
+        let metrics = cache.metrics();
+        assert_eq!(metrics.admission_copies(), 1, "the copy made is counted");
+        assert_eq!(metrics.admission_copied_bytes(), ENTRY);
+        assert_eq!(cache.inner.copies_under_lock.load(Ordering::Relaxed), 0);
+    }
+
+    /// `admission_copies` counts copies made, stored or not: a second
+    /// interactive insert of a resident key with a shared value copies it
+    /// and counts the copy, and the resident entry is left as it was.
+    ///
+    /// FLIP (non-vacuity): in `Inner::insert`, copy an interactive value with
+    /// `owned_exact(value).0` instead of `self.own(value)`; the count then
+    /// stays 0.
+    #[test]
+    fn the_admission_copy_counter_matches_its_doc() {
+        let cache: Cache<&'static str> = Cache::new(generous_limits());
+        let metrics = cache.metrics();
+        let key = test_key_with_len(1, SLICE as u64);
+        let first = Bytes::from(vec![5u8; SLICE]);
+        let ptr = first.as_ptr();
+        cache.insert(key, first);
+        assert_eq!(
+            metrics.admission_copies(),
+            0,
+            "precondition: stored uncopied"
+        );
+
+        let shared = Bytes::from(vec![6u8; SLICE]);
+        let keep = shared.clone();
+        cache.insert(key, shared);
+        assert_eq!(metrics.admission_copies(), 1, "the resident key's copy");
+        assert_eq!(metrics.admission_copied_bytes(), SLICE as u64);
+        assert_eq!(
+            cache.get(&key).unwrap().as_ptr(),
+            ptr,
+            "the entry is unchanged"
+        );
         drop(keep);
     }
 }
