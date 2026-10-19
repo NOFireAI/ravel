@@ -461,7 +461,7 @@ path = "src/bin/heartbeat_under_query_load.rs"
 required-features = ["saturation"]
 bench = false
 
-# Issue #2818 trial: query latency under Remote Write load, four write gate arms.
+# Issue #2818 trial: query latency under Remote Write load, three write gate arms.
 [[bin]]
 name = "ingest_query_latency_trial"
 path = "src/bin/ingest_query_latency_trial.rs"

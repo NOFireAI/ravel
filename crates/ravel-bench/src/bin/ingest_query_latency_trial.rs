@@ -13,9 +13,8 @@
 //! uses, with `--strict-flush-policy arrival` so every Remote Write request
 //! pays a flush, `--shards` shard actors, and admission limits off so the
 //! load is never refused. The arm sets `--cpu-gate-write-inline-floor-bytes`
-//! (`u64::MAX` for the ungated arm, which runs every write job inline) and
-//! `--flush-checksum-in-job`; every other gate setting is the default for
-//! this host.
+//! (`u64::MAX` for the ungated arm, which runs every write job inline);
+//! every other gate setting is the default for this host.
 //!
 //! The query tenants hold a fixture as `heartbeat_under_query_load` builds
 //! it (`--segments` segments of `--series-per-segment` series, a sample a
@@ -46,8 +45,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use clap::Parser;
 use ravel_bench::ingest_query_trial::{
-    ARMS, BODY_TARGET_BYTES, CLIENTS, RwBodies, STOCK_INLINE_FLOOR_BYTES, TrialArm, TrialFigures,
-    expected_figures, figure_name, rw_snappy_bodies,
+    ARMS, BODY_TARGET_BYTES, CLIENTS, CODEC_INLINE_FLOOR_BYTES, RwBodies, TrialArm, TrialFigures,
+    WRITE_INLINE_FLOOR_BYTES, expected_figures, figure_name, rw_snappy_bodies,
 };
 use ravel_bench::saturation::HostStamp;
 use ravel_bench::saturation_run::{self as run, NS_PER_HOUR, ServerOptions, labels, series};
@@ -101,8 +100,10 @@ struct Measured {
 
 fn run_trial() -> anyhow::Result<ExitCode> {
     let args = Args::parse();
-    if STOCK_INLINE_FLOOR_BYTES != ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES {
-        anyhow::bail!("the trial's stock floor no longer matches the shipped one");
+    if CODEC_INLINE_FLOOR_BYTES != ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES
+        || WRITE_INLINE_FLOOR_BYTES != ravel_cpu_gate::DEFAULT_WRITE_INLINE_FLOOR_BYTES
+    {
+        anyhow::bail!("the trial's floors no longer match the shipped ones");
     }
     run::configure_allocator();
     let host = HostStamp::detect();
@@ -221,7 +222,6 @@ fn build_fixture(
 fn options(host: &HostStamp, arm: TrialArm, shards: u32) -> ServerOptions {
     let mut cpu_gate_permits = CpuGatePermits::derive(host.cores);
     cpu_gate_permits.write_inline_floor_bytes = arm.write_inline_floor_bytes;
-    cpu_gate_permits.flush_checksum_in_job = arm.flush_checksum_in_job;
     ServerOptions {
         mode: Mode::All,
         strict_flush_policy: StrictFlushPolicy::Arrival,
@@ -291,10 +291,9 @@ fn measure(
     let http = server.http_addr();
     let client = reqwest::Client::builder().build()?;
     println!(
-        "{} c{clients}: floor {} B, checksum in job {}, {} shards; body {} series, {} B snappy",
+        "{} c{clients}: floor {} B, {} shards; body {} series, {} B snappy",
         arm.name,
         arm.write_inline_floor_bytes,
-        arm.flush_checksum_in_job,
         args.shards,
         bodies.series_per_body,
         bodies.compressed_bytes

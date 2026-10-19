@@ -2,9 +2,10 @@
 //! an OTLP-HTTP gzip inflate, a Remote Write snappy decode and the metrics
 //! shard flush encode on its write CPU gate.
 //!
-//! The server keeps the gate's default 256 KiB inline floor, so each request
-//! body is built from pseudo-random sample values that neither gzip nor snappy
-//! can shrink below the floor, and the test asserts that premise before it
+//! The server pins the write gate's inline floor at 256 KiB rather than the
+//! 1 MiB default, so request bodies under the OTLP per-request point cap can
+//! clear it. Each body is built from pseudo-random sample values that neither
+//! gzip nor snappy can shrink below that floor, and the test asserts that premise before it
 //! reads anything. Both requests are strict, so each returns only after the
 //! flush of its own points has published, and the flush buffers are far over
 //! the floor. The write gate's per-site counters on `/metrics` are read once,
@@ -179,7 +180,7 @@ async fn start_ingest_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server
         cpu_gate_permits: ravel_server::config::CpuGatePermits {
             read: 2,
             write: 2,
-            ..Default::default()
+            write_inline_floor_bytes: DEFAULT_INLINE_FLOOR_BYTES,
         },
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
@@ -256,7 +257,7 @@ fn write_gate_site_trip_counts(body: &str, site: &str) -> (u64, u64) {
 /// One gzip export and one Remote Write request are each one gated decode job
 /// at their own site, and the two strict writes flush in two flushes, each one
 /// gated `metrics_flush` job. Nothing at these sites runs inline: every unit is
-/// over the default floor.
+/// over the server's 256 KiB floor.
 ///
 /// Each of those jobs also lands once in its site's
 /// `ravel_cpu_gate_handoff_seconds` and `ravel_cpu_gate_return_seconds`

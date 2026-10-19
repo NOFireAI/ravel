@@ -30,8 +30,7 @@
 //! `RAVEL_BENCH_WRITE_PERMITS` and `RAVEL_BENCH_WRITE_INLINE_FLOOR_BYTES`
 //! set the gate's permits and inline floor as the server's
 //! `--cpu-gate-write-permits` and `--cpu-gate-write-inline-floor-bytes` do;
-//! `RAVEL_BENCH_FLUSH_CHECKSUM_IN_JOB=1` does what `--flush-checksum-in-job`
-//! does, in both modes; `RAVEL_BENCH_TABLE_RUNS`, `RAVEL_BENCH_HTTP_RUN_MS`
+//! `RAVEL_BENCH_TABLE_RUNS`, `RAVEL_BENCH_HTTP_RUN_MS`
 //! and `RAVEL_BENCH_FLUSH_RUN_MS` shorten the table pass. A criterion filter
 //! that matches nothing (`-- table-only`) skips the criterion pass and keeps
 //! the table.
@@ -145,13 +144,6 @@ fn production_write_gate() -> Arc<WriteGate> {
         permits.write_inline_floor_bytes = floor;
     }
     CpuGates::new(permits).write
-}
-
-/// `RAVEL_BENCH_FLUSH_CHECKSUM_IN_JOB=1` turns on what
-/// `--flush-checksum-in-job` does, on every router of both modes, so the
-/// gated/ungated ratio compares two routers that differ only in the gate.
-fn flush_checksum_in_job() -> bool {
-    std::env::var("RAVEL_BENCH_FLUSH_CHECKSUM_IN_JOB").is_ok_and(|v| v == "1")
 }
 
 /// `RAVEL_BENCH_TABLE_RUNS`, `RAVEL_BENCH_HTTP_RUN_MS` and
@@ -626,17 +618,13 @@ fn flush_points(tenant: &TenantId) -> (Vec<IngestPoint>, usize) {
 // Server state, built as the otlp_http and remote_write tests build it
 // ---------------------------------------------------------------------------
 
-/// The issue #2818 settings on a metrics router: the checksum switch when
-/// `RAVEL_BENCH_FLUSH_CHECKSUM_IN_JOB` asks for it, and the flush input size
-/// recorder the table pass reads.
-fn trial_settings(mut router: IngestRouter, recorder: Option<FlushInputBytes>) -> IngestRouter {
-    if flush_checksum_in_job() {
-        router = router.with_flush_checksum_in_job(true);
+/// A metrics router with the flush input size recorder the table pass reads
+/// (issue #2818), when there is one.
+fn record_flush_inputs(router: IngestRouter, recorder: Option<FlushInputBytes>) -> IngestRouter {
+    match recorder {
+        Some(recorder) => router.with_flush_input_bytes(recorder),
+        None => router,
     }
-    if let Some(recorder) = recorder {
-        router = router.with_flush_input_bytes(recorder);
-    }
-    router
 }
 
 fn gateway_state(
@@ -676,7 +664,7 @@ fn gateway_state(
         log_router = log_router.with_write_gate(gate.clone());
         span_router = span_router.with_write_gate(gate.clone());
     }
-    let metrics_router = Arc::new(trial_settings(metrics_router, recorder));
+    let metrics_router = Arc::new(record_flush_inputs(metrics_router, recorder));
     let admission = unlimited_admission();
     let normalize_metrics = Arc::new(NormalizeRejectMetrics::new());
     let state = Arc::new(GatewayState {
@@ -748,7 +736,7 @@ fn remote_write_state(
     if let Some(gate) = &gate {
         router = router.with_write_gate(gate.clone());
     }
-    let router = Arc::new(trial_settings(router, recorder));
+    let router = Arc::new(record_flush_inputs(router, recorder));
     let state = Arc::new(RemoteWriteState {
         tenant_resolver: Arc::new(FixedTenant),
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
@@ -790,7 +778,7 @@ fn flush_router(
     if let Some(gate) = gate {
         router = router.with_write_gate(gate);
     }
-    Arc::new(trial_settings(router, recorder))
+    Arc::new(record_flush_inputs(router, recorder))
 }
 
 // ---------------------------------------------------------------------------
@@ -1261,13 +1249,11 @@ fn report_table(_c: &mut Criterion) {
     println!("== ingest_write_gate_overhead table (issue #2669) ==");
     println!(
         "host: {} cores (available_parallelism); write gate permits {}, inline floor {} B; \
-         flush checksum in job {}; \
          {table_runs} runs per configuration, gated/ungated interleaved; \
          run length {} ms (HTTP) / {} ms (flush)",
         cores(),
         gate.permits(),
         gate.inline_floor_bytes(),
-        if flush_checksum_in_job() { "on" } else { "off" },
         run_length(Path::OtlpGzip).as_millis(),
         run_length(Path::FlushEncode).as_millis()
     );

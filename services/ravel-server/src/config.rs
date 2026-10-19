@@ -2499,26 +2499,19 @@ pub struct Cli {
     pub cpu_gate_write_permits: Option<usize>,
 
     /// The write CPU gate's inline floor, in input bytes (ADR-1702 decision
-    /// 4): a flush encode or ingest payload decode sized below it runs inline
-    /// on the async task instead of on a blocking-pool thread holding a
-    /// write permit. A trial setting for issue #2818. `0` is accepted and
+    /// 4, amended by issue #2818): a flush encode or ingest payload decode
+    /// sized below it runs inline on the request's worker instead of on a
+    /// blocking-pool thread holding a write permit. Default 1 MiB; the read
+    /// gate keeps its 256 KiB floor, which has no flag. `0` is accepted and
     /// sends every write job through the gate; a value larger than any job
     /// runs every write job inline, which is the write gate's permits and
     /// queue left out of the path.
     #[arg(
         long = "cpu-gate-write-inline-floor-bytes",
         value_name = "BYTES",
-        default_value_t = ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES
+        default_value_t = ravel_cpu_gate::DEFAULT_WRITE_INLINE_FLOOR_BYTES
     )]
     pub cpu_gate_write_inline_floor_bytes: u64,
-
-    /// Computes a metrics flush's CRC32C upload checksum inside its encode
-    /// job, on the write gate, instead of on the async runtime before the
-    /// data-object PUT. The PUT sends the same checksum over the same bytes
-    /// either way. A trial setting for issue #2818; off by default. Log and
-    /// span flushes are unaffected.
-    #[arg(long = "flush-checksum-in-job")]
-    pub flush_checksum_in_job: bool,
 
     /// Disables every ADR-0046 read cache in the process entirely: the query
     /// fetcher cache (`store::build_cache`) and the catalog's byte cache
@@ -3821,10 +3814,10 @@ pub fn derive_catalog_resolve_concurrency(q: usize) -> usize {
 }
 
 /// The resolved permit counts of the two ADR-1702 CPU gates, from
-/// [`Cli::resolve_cpu_gate_permits`], with the write gate's two trial
-/// settings (issue #2818). `Default` is the one-core derivation, one permit
-/// each, the stock inline floor and the checksum switch off, which is what a
-/// test that builds a `ServerConfig` by hand gets.
+/// [`Cli::resolve_cpu_gate_permits`], with the write gate's inline floor.
+/// `Default` is the one-core derivation, one permit each, and the 1 MiB
+/// write floor, which is what a test that builds a `ServerConfig` by hand
+/// gets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CpuGatePermits {
     /// `--cpu-gate-read-permits`, or `max(1, cores - 1)`.
@@ -3832,11 +3825,8 @@ pub struct CpuGatePermits {
     /// `--cpu-gate-write-permits`, or `max(1, cores / 2)`.
     pub write: usize,
     /// `--cpu-gate-write-inline-floor-bytes`, or
-    /// [`ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES`].
+    /// [`ravel_cpu_gate::DEFAULT_WRITE_INLINE_FLOOR_BYTES`].
     pub write_inline_floor_bytes: u64,
-    /// `--flush-checksum-in-job`: compute a metrics flush's upload checksum
-    /// inside its encode job rather than on the runtime before the PUT.
-    pub flush_checksum_in_job: bool,
 }
 
 impl CpuGatePermits {
@@ -3845,8 +3835,7 @@ impl CpuGatePermits {
         CpuGatePermits {
             read: ravel_cpu_gate::default_read_permits(cores),
             write: ravel_cpu_gate::default_write_permits(cores),
-            write_inline_floor_bytes: ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES,
-            flush_checksum_in_job: false,
+            write_inline_floor_bytes: ravel_cpu_gate::DEFAULT_WRITE_INLINE_FLOOR_BYTES,
         }
     }
 }
@@ -6533,7 +6522,6 @@ impl Cli {
             read: self.cpu_gate_read_permits.unwrap_or(derived.read),
             write: self.cpu_gate_write_permits.unwrap_or(derived.write),
             write_inline_floor_bytes: self.cpu_gate_write_inline_floor_bytes,
-            flush_checksum_in_job: self.flush_checksum_in_job,
         }
     }
 
@@ -14382,8 +14370,7 @@ mod tests {
         let stock = |read, write| CpuGatePermits {
             read,
             write,
-            write_inline_floor_bytes: ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES,
-            flush_checksum_in_job: false,
+            write_inline_floor_bytes: ravel_cpu_gate::DEFAULT_WRITE_INLINE_FLOOR_BYTES,
         };
         assert_eq!(unset.resolve_cpu_gate_permits(host), stock(7, 4));
         assert_eq!(
@@ -14398,27 +14385,27 @@ mod tests {
         assert_eq!(write_only.resolve_cpu_gate_permits(host), stock(7, 9));
     }
 
-    /// Issue #2818: unset, the write gate's inline floor is the stock 256 KiB
-    /// and the flush checksum switch is off, both in the resolved permits and
-    /// in `CpuGatePermits::default()`. The floor flag takes any `u64`,
-    /// `0` included, passes `validate`, and reaches the resolved permits; a
-    /// negative or non-numeric value is a parse error.
+    /// Issue #2818: unset, the write gate's inline floor is 1 MiB (1048576
+    /// bytes), in the resolved permits and in `CpuGatePermits::default()`,
+    /// while the read gate's floor stays 256 KiB. The floor flag takes any
+    /// `u64`, `0` and the old 256 KiB included, passes `validate`, and
+    /// overrides the default in the resolved permits; a negative or
+    /// non-numeric value is a parse error.
     #[test]
-    fn write_gate_trial_flags_default_to_stock_and_reach_the_permits() {
+    fn write_gate_inline_floor_defaults_to_1_mib_and_the_flag_overrides_it() {
         let host = HostProfile::new(8, None, None, None, None, None);
         let unset = Cli::try_parse_from(["ravel-server"]).expect("parses");
         let resolved = unset.resolve_cpu_gate_permits(host);
-        assert_eq!(resolved.write_inline_floor_bytes, 256 * 1024);
-        assert!(!resolved.flush_checksum_in_job);
+        assert_eq!(resolved.write_inline_floor_bytes, 1_048_576);
         assert_eq!(
             CpuGatePermits::default().write_inline_floor_bytes,
-            256 * 1024
+            1_048_576
         );
-        assert!(!CpuGatePermits::default().flush_checksum_in_job);
+        assert_eq!(ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES, 256 * 1024);
 
         for (value, expected) in [
             ("0", 0),
-            ("1048576", 1 << 20),
+            ("262144", 256 * 1024),
             ("18446744073709551615", u64::MAX),
         ] {
             let cli =
@@ -14428,7 +14415,6 @@ mod tests {
             let permits = cli.resolve_cpu_gate_permits(host);
             assert_eq!(permits.write_inline_floor_bytes, expected);
             assert_eq!((permits.read, permits.write), (7, 4));
-            assert!(!permits.flush_checksum_in_job);
         }
         for bad in ["-1", "1MiB", "18446744073709551616"] {
             assert!(
@@ -14437,13 +14423,6 @@ mod tests {
                 "{bad} must not parse as a byte floor"
             );
         }
-
-        let switched =
-            Cli::try_parse_from(["ravel-server", "--flush-checksum-in-job"]).expect("parses");
-        switched.validate().expect("the switch validates");
-        let permits = switched.resolve_cpu_gate_permits(host);
-        assert!(permits.flush_checksum_in_job);
-        assert_eq!(permits.write_inline_floor_bytes, 256 * 1024);
     }
 
     /// Issue #2795: `--sql-scan-decode-inline` is off unless set, reads

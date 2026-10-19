@@ -26,38 +26,35 @@ pub struct TrialArm {
     /// `--cpu-gate-write-inline-floor-bytes`. `u64::MAX` runs every write job
     /// inline, which is the ungated arm: no write job reaches the gate.
     pub write_inline_floor_bytes: u64,
-    /// `--flush-checksum-in-job`.
-    pub flush_checksum_in_job: bool,
 }
 
-/// The four arms issue #2818 names, in report order.
-pub const ARMS: [TrialArm; 4] = [
+/// The arms in report order: ungated, the write gate at the 256 KiB floor it
+/// shipped with before issue #2818, and at the 1 MiB floor that is now its
+/// default.
+pub const ARMS: [TrialArm; 3] = [
     TrialArm {
         name: "ungated",
         write_inline_floor_bytes: u64::MAX,
-        flush_checksum_in_job: false,
     },
     TrialArm {
-        name: "gated_stock",
-        write_inline_floor_bytes: STOCK_INLINE_FLOOR_BYTES,
-        flush_checksum_in_job: false,
+        name: "gated_floor_256kib",
+        write_inline_floor_bytes: CODEC_INLINE_FLOOR_BYTES,
     },
     TrialArm {
         name: "gated_floor_1mib",
-        write_inline_floor_bytes: 1024 * 1024,
-        flush_checksum_in_job: false,
-    },
-    TrialArm {
-        name: "gated_checksum_in_job",
-        write_inline_floor_bytes: STOCK_INLINE_FLOOR_BYTES,
-        flush_checksum_in_job: true,
+        write_inline_floor_bytes: WRITE_INLINE_FLOOR_BYTES,
     },
 ];
 
-/// The shipped write gate inline floor, restated because the standard build
-/// of this crate does not link ravel-cpu-gate; a test pins it to
+/// The 256 KiB codec floor the read gate keeps and the write gate had before
+/// issue #2818, restated because the standard build of this crate does not
+/// link ravel-cpu-gate; a test pins it to
 /// `ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES`.
-pub const STOCK_INLINE_FLOOR_BYTES: u64 = 256 * 1024;
+pub const CODEC_INLINE_FLOOR_BYTES: u64 = 256 * 1024;
+
+/// The write gate's shipped 1 MiB inline floor, restated for the same reason;
+/// a test pins it to `ravel_cpu_gate::DEFAULT_WRITE_INLINE_FLOOR_BYTES`.
+pub const WRITE_INLINE_FLOOR_BYTES: u64 = 1024 * 1024;
 
 /// Concurrent Remote Write clients per arm.
 pub const CLIENTS: [usize; 2] = [1, 16];
@@ -313,7 +310,7 @@ mod tests {
     #[test]
     fn every_expected_figure_is_named_once() {
         let names = expected_figures(&ARMS);
-        assert_eq!(names.len(), 4 * 2 * 11);
+        assert_eq!(names.len(), 3 * 2 * 11);
         let mut unique = names.clone();
         unique.sort();
         unique.dedup();
@@ -321,7 +318,7 @@ mod tests {
         assert_eq!(names[0], "ungated/c1/promql_p50_ms");
         assert_eq!(
             names.last().map(String::as_str),
-            Some("gated_checksum_in_job/c16/ingest_failed")
+            Some("gated_floor_1mib/c16/ingest_failed")
         );
     }
 
@@ -341,7 +338,7 @@ mod tests {
         let mut figs = TrialFigures::new();
         for name in expected
             .iter()
-            .filter(|n| n.as_str() != "gated_stock/c16/sql_p99_ms")
+            .filter(|n| n.as_str() != "gated_floor_256kib/c16/sql_p99_ms")
         {
             figs.record(name.clone(), 1.0);
         }
@@ -349,12 +346,13 @@ mod tests {
         assert_eq!(
             errors,
             vec![TrialFigureError::Absent(
-                "gated_stock/c16/sql_p99_ms".to_owned()
+                "gated_floor_256kib/c16/sql_p99_ms".to_owned()
             )]
         );
         assert_eq!(lines.len(), expected.len());
         assert!(lines.contains(
-            &"gated_stock/c16/sql_p99_ms ERROR figure gated_stock/c16/sql_p99_ms absent".to_owned()
+            &"gated_floor_256kib/c16/sql_p99_ms ERROR figure gated_floor_256kib/c16/sql_p99_ms absent"
+                .to_owned()
         ));
     }
 
@@ -394,26 +392,20 @@ mod tests {
     }
 
     #[test]
-    fn arms_are_the_four_the_issue_names() {
+    fn arms_are_ungated_and_the_two_floors() {
         let names: Vec<_> = ARMS.iter().map(|a| a.name).collect();
-        assert_eq!(
-            names,
-            [
-                "ungated",
-                "gated_stock",
-                "gated_floor_1mib",
-                "gated_checksum_in_job"
-            ]
-        );
+        assert_eq!(names, ["ungated", "gated_floor_256kib", "gated_floor_1mib"]);
         assert_eq!(ARMS[0].write_inline_floor_bytes, u64::MAX);
         assert_eq!(
-            STOCK_INLINE_FLOOR_BYTES,
+            CODEC_INLINE_FLOOR_BYTES,
             ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES
         );
-        assert_eq!(ARMS[1].write_inline_floor_bytes, STOCK_INLINE_FLOOR_BYTES);
-        assert_eq!(ARMS[2].write_inline_floor_bytes, 1024 * 1024);
-        assert!(ARMS[3].flush_checksum_in_job);
-        assert_eq!(ARMS.iter().filter(|a| a.flush_checksum_in_job).count(), 1);
+        assert_eq!(
+            WRITE_INLINE_FLOOR_BYTES,
+            ravel_cpu_gate::DEFAULT_WRITE_INLINE_FLOOR_BYTES
+        );
+        assert_eq!(ARMS[1].write_inline_floor_bytes, 256 * 1024);
+        assert_eq!(ARMS[2].write_inline_floor_bytes, 1_048_576);
     }
 
     #[test]

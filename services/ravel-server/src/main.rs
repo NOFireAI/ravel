@@ -78,13 +78,12 @@ async fn main() -> anyhow::Result<()> {
     memory_gate.emit();
     // ADR-1702 decision 3: the read and write CPU gates' permits, derived from
     // the same host profile unless a flag sets them, with the write gate's
-    // issue #2818 trial settings.
+    // inline floor (issue #2818).
     let cpu_gate_permits = cli.resolve_cpu_gate_permits(host);
     tracing::info!(
         read_permits = cpu_gate_permits.read,
         write_permits = cpu_gate_permits.write,
         write_inline_floor_bytes = cpu_gate_permits.write_inline_floor_bytes,
-        flush_checksum_in_job = cpu_gate_permits.flush_checksum_in_job,
         "CPU gate permits resolved"
     );
 

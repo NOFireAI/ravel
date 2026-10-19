@@ -6,7 +6,6 @@
 //! and reads it once per flush; a later generation's actors read the same
 //! slot.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
@@ -63,8 +62,6 @@ impl FlushInputBytes {
 #[derive(Clone, Default)]
 pub(crate) struct WriteGateSlot {
     gate: Arc<RwLock<Option<Arc<WriteGate>>>>,
-    /// Whether a flush computes its upload checksum inside the encode job.
-    checksum_in_job: Arc<AtomicBool>,
     input_recorder: Arc<RwLock<Option<FlushInputBytes>>>,
     /// Makes the next gated encode fail with this error, so a test can reach
     /// the flush's gate-error arm: `Panicked` panics inside the job on the
@@ -72,10 +69,6 @@ pub(crate) struct WriteGateSlot {
     /// does for a job the runtime cancelled.
     #[cfg(test)]
     fail_next: Arc<std::sync::Mutex<Option<CpuGateError>>>,
-    /// Counts upload checksums computed inside an encode job, so a test can
-    /// tell the switch took effect.
-    #[cfg(test)]
-    pub(crate) checksums_in_job: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WriteGateSlot {
@@ -91,14 +84,6 @@ impl WriteGateSlot {
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
-    }
-
-    pub(crate) fn set_checksum_in_job(&self, on: bool) {
-        self.checksum_in_job.store(on, Ordering::Relaxed);
-    }
-
-    pub(crate) fn checksum_in_job(&self) -> bool {
-        self.checksum_in_job.load(Ordering::Relaxed)
     }
 
     pub(crate) fn set_input_recorder(&self, recorder: FlushInputBytes) {

@@ -42,20 +42,20 @@ impl CpuGates {
 mod tests {
     use super::*;
 
+    /// Issue #2818: the default write gate takes the 1 MiB floor and the
+    /// read gate keeps 256 KiB; a set write floor reaches only the write gate.
     #[test]
     fn write_floor_reaches_only_the_write_gate() {
         let stock = CpuGates::new(CpuGatePermits::default());
-        assert_eq!(
-            stock.write.inline_floor_bytes(),
-            ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES
-        );
-        let raised = CpuGates::new(CpuGatePermits {
-            write_inline_floor_bytes: 1 << 20,
+        assert_eq!(stock.write.inline_floor_bytes(), 1_048_576);
+        assert_eq!(stock.read.inline_floor_bytes(), 256 * 1024);
+        let lowered = CpuGates::new(CpuGatePermits {
+            write_inline_floor_bytes: 0,
             ..CpuGatePermits::default()
         });
-        assert_eq!(raised.write.inline_floor_bytes(), 1 << 20);
+        assert_eq!(lowered.write.inline_floor_bytes(), 0);
         assert_eq!(
-            raised.read.inline_floor_bytes(),
+            lowered.read.inline_floor_bytes(),
             ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES
         );
     }

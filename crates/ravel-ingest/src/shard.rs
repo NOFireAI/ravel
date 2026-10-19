@@ -31,7 +31,7 @@ use ravel_commit::keys;
 use ravel_commit::publish::{self, PublishError, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
 use ravel_commit::rng::RngSource;
-use ravel_object_store::{ObjectStoreBackend, UploadChecksum};
+use ravel_object_store::ObjectStoreBackend;
 use ravel_proto::commit::v1::CommitRecord;
 use ravel_segment::{
     ExemplarInput, HistogramSample, IngestBounds, SegmentIdentity, SegmentWriter, SeriesInputV3,
@@ -537,9 +537,6 @@ struct FlushCtx {
 /// the byte charges the job held while it waited and ran.
 struct EncodedFlush {
     written: Result<ravel_segment::WrittenSegment, ravel_segment::WriteError>,
-    /// The segment's upload checksum, computed in the job only when the
-    /// router's flush-checksum-in-job switch is on.
-    checksum: Option<UploadChecksum>,
     charges: Vec<Arc<IngestByteCharge>>,
     #[cfg(feature = "stage-timing")]
     encode_elapsed: std::time::Duration,
@@ -608,9 +605,6 @@ impl FlushCtx {
         // `into_series_values` and the writer picks the VAL/HIST page per
         // series.
         let segment_version = SEGMENT_FORMAT_VERSION;
-        let checksum_in_job = self.write_gate.checksum_in_job();
-        #[cfg(test)]
-        let checksums_in_job = Arc::clone(&self.write_gate.checksums_in_job);
         // The encode runs on the write gate when one is attached (ADR-1702).
         // The job takes the byte charges with the buffer and returns them with
         // the segment, so they stay held through the permit wait and the encode
@@ -646,24 +640,11 @@ impl FlushCtx {
                     ingest_bounds,
                     exemplar_inputs,
                 );
-                #[cfg(feature = "stage-timing")]
-                let encode_elapsed = encode_start.elapsed();
-                // Outside the `Encode` stage: the checksum is the PUT's input,
-                // moved here so it runs on the gate instead of the runtime.
-                let checksum = match &written {
-                    Ok(segment) if checksum_in_job => {
-                        #[cfg(test)]
-                        checksums_in_job.fetch_add(1, Ordering::Relaxed);
-                        Some(publish::data_object_checksum(&segment.bytes))
-                    }
-                    _ => None,
-                };
                 EncodedFlush {
                     written,
-                    checksum,
                     charges,
                     #[cfg(feature = "stage-timing")]
-                    encode_elapsed,
+                    encode_elapsed: encode_start.elapsed(),
                 }
             });
         let encoded = match self.bound_to_deadline(deadline_ns, encode).await {
@@ -723,12 +704,7 @@ impl FlushCtx {
         };
 
         if !self
-            .put_data_object_with_retry(
-                &data_key,
-                written.bytes.clone(),
-                encoded.checksum,
-                deadline_ns,
-            )
+            .put_data_object_with_retry(&data_key, written.bytes.clone(), deadline_ns)
             .await
         {
             self.metrics.record_abandoned_retry_exhausted();
@@ -932,27 +908,11 @@ impl FlushCtx {
     /// feeds its wall time into `self.rtt`, the observed-RTT input to the
     /// adaptive-delay ceiling (ADR-0067 decision 3); an attempt that never
     /// completes before `deadline_ns` teaches nothing about RTT and is not
-    /// recorded. A `checksum` computed in the encode job is sent on every
-    /// attempt; with none, `put_data_object` computes it per attempt.
-    async fn put_data_object_with_retry(
-        &self,
-        key: &str,
-        bytes: Bytes,
-        checksum: Option<UploadChecksum>,
-        deadline_ns: i64,
-    ) -> bool {
+    /// recorded.
+    async fn put_data_object_with_retry(&self, key: &str, bytes: Bytes, deadline_ns: i64) -> bool {
         let mut attempt: u32 = 0;
         loop {
-            let store = self.store.as_ref();
-            let call = async {
-                match checksum {
-                    Some(checksum) => {
-                        publish::put_data_object_with_checksum(store, key, bytes.clone(), checksum)
-                            .await
-                    }
-                    None => publish::put_data_object(store, key, bytes.clone()).await,
-                }
-            };
+            let call = publish::put_data_object(self.store.as_ref(), key, bytes.clone());
             let started_ns = self.clock.now_ns();
             let outcome = self.bound_to_deadline(deadline_ns, call).await;
             if outcome.is_some() {
