@@ -223,6 +223,20 @@ pub fn derived_request_id(base: Uuid, epochs: &[EncryptedMatcher]) -> Uuid {
     uuid::Builder::from_random_bytes(bytes).into_uuid()
 }
 
+/// The rule `rules` hold for matcher key `key` on `signal`: looked up by the
+/// key's sanitized form for metrics, by the raw key otherwise.
+fn rule_for<'a>(
+    rules: &'a ravel_ipcrypt::rules::TenantRules,
+    signal: SignalArg,
+    key: &str,
+) -> Option<ravel_ipcrypt::rules::RuleInfo<'a>> {
+    if signal == SignalArg::Metrics {
+        rules.lookup_label(&crate::ipcrypt::sanitize_rule_key(key))
+    } else {
+        rules.lookup_raw(key)
+    }
+}
+
 /// Plan the requests `matchers` become under `tenant`'s IPCrypt `rules`
 /// (ADR-2993 decision 8). A matcher whose key has a rule for `signal` (looked
 /// up by its sanitized form for metrics, by its raw key otherwise) carries
@@ -245,10 +259,8 @@ pub fn plan_requests(
     for (key, value) in &matchers {
         let info = if value.is_empty() {
             None
-        } else if signal == SignalArg::Metrics {
-            rules.lookup_label(&crate::ipcrypt::sanitize_rule_key(key))
         } else {
-            rules.lookup_raw(key)
+            rule_for(rules, signal, key)
         };
         let Some(info) = info else {
             candidates.push(MatcherValues::Plain(value.clone()));
@@ -359,11 +371,72 @@ pub struct IpcryptSubmitReport {
     pub already_present: usize,
 }
 
-/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8):
-/// [`plan_requests`], then the `sys/ipcrypt/policy` marker check
+/// Refuse a plaintext matcher whose key has no rule for `signal`: an
+/// ordinary matcher already submits that value as written.
+fn check_plaintext_matchers(
+    rules: &ravel_ipcrypt::rules::TenantRules,
+    signal: SignalArg,
+    plaintext: &[(String, String)],
+) -> anyhow::Result<()> {
+    let unruled: Vec<String> = plaintext
+        .iter()
+        .filter(|(key, _)| rule_for(rules, signal, key).is_none())
+        .map(|(key, _)| format!("{key:?}"))
+        .collect();
+    if !unruled.is_empty() {
+        anyhow::bail!(
+            "refusing to erase submit: --plaintext-matcher keys {} have no IPCrypt rule for \
+             --signal {}, so an ordinary --matcher already submits their values as written. \
+             Nothing was written",
+            unruled.join(", "),
+            signal_name(signal)
+        );
+    }
+    Ok(())
+}
+
+/// `signal` as `--signal` spells it.
+fn signal_name(signal: SignalArg) -> String {
+    use clap::ValueEnum;
+    signal
+        .to_possible_value()
+        .map(|value| value.get_name().to_string())
+        .unwrap_or_default()
+}
+
+/// `word` as one shell word: unchanged when it holds only characters a shell
+/// leaves alone, single-quoted otherwise.
+fn shell_word(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:/@%+=,".contains(c));
+    if plain {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
+}
+
+/// `erase submit` under an IPCrypt policy (ADR-2993 decision 8 and its
+/// erasure amendment): [`plan_requests`] over `matchers`, then the
+/// `sys/ipcrypt/policy` marker check
 /// ([`crate::ipcrypt::IpcryptPolicy::check_marker_for_erasure`], which never
-/// writes the marker), then one [`submit`] per planned request. A failure part-way names the base id, so
-/// rerunning with it as `--request-id` finishes the requests left out.
+/// writes the marker), then one [`submit`] per planned request.
+///
+/// `plaintext` matchers are added to every request exactly as written, with
+/// no encryption and no epoch fan-out of their own. Each must name a key that
+/// has a rule for `signal`, and none may be combined with a matcher the plan
+/// encrypts; both refusals come before anything is written. A warning naming
+/// their keys goes to `warnings` before the first request is submitted.
+///
+/// A failure part-way names the base id, so rerunning with it as
+/// `--request-id` finishes the requests left out; a conflicting request is
+/// the exception, since a rerun derives the same id and conflicts again. Past
+/// one request, the output lists each derived id with its `erase status`
+/// command, because nothing is stored under the base id. `cli_flags` are the
+/// top-level store and tenancy flags that command needs, printed between
+/// `ravel-cli` and `erase` since they are not accepted after the subcommand.
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_with_ipcrypt(
     store: Arc<dyn ObjectStoreBackend>,
@@ -371,23 +444,62 @@ pub async fn submit_with_ipcrypt(
     tenant: &str,
     signal: SignalArg,
     matchers: Vec<(String, String)>,
+    plaintext: Vec<(String, String)>,
     window_start_ns: i64,
     window_end_ns: i64,
     reason: String,
     base_id: Uuid,
     now_ns: i64,
+    cli_flags: &[String],
     out: &mut dyn std::io::Write,
+    warnings: &mut dyn std::io::Write,
 ) -> anyhow::Result<IpcryptSubmitReport> {
     let rules = policy.rules_for(tenant)?;
-    let plans = plan_requests(policy, &rules, tenant, signal, matchers, base_id)?;
+    check_plaintext_matchers(&rules, signal, &plaintext)?;
+    let mut plans = plan_requests(policy, &rules, tenant, signal, matchers, base_id)?;
     // Every plan encrypts the same matchers; only their epochs differ.
-    let encrypted_keys: Vec<&str> = plans
+    let encrypted_keys: Vec<String> = plans
         .first()
-        .map(|plan| plan.epochs.iter().map(|m| m.key.as_str()).collect())
+        .map(|plan| plan.epochs.iter().map(|m| m.key.clone()).collect())
         .unwrap_or_default();
+    if !plaintext.is_empty() && !encrypted_keys.is_empty() {
+        let quote = |keys: Vec<&String>| -> String {
+            keys.iter()
+                .map(|k| format!("{k:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        anyhow::bail!(
+            "refusing to erase submit: --plaintext-matcher on {} is combined with --matcher on \
+             {}, which the IPCrypt policy encrypts. Matchers in one request are a conjunction: \
+             data written before the rules holds raw values for both keys and data written \
+             after holds ciphertext for both, so no record could match. Submit one command \
+             with plaintext matchers and one without. Nothing was written",
+            quote(plaintext.iter().map(|(k, _)| k).collect()),
+            quote(encrypted_keys.iter().collect())
+        );
+    }
+    for plan in &mut plans {
+        plan.matchers.extend(plaintext.iter().cloned());
+    }
+    let encrypted_keys: Vec<&str> = encrypted_keys.iter().map(String::as_str).collect();
     policy
         .check_marker_for_erasure(store.as_ref(), &encrypted_keys)
         .await?;
+    if !plaintext.is_empty() {
+        let mut seen = HashSet::new();
+        let keys: Vec<String> = plaintext
+            .iter()
+            .filter(|(k, _)| seen.insert(k.as_str()))
+            .map(|(k, _)| format!("{k:?}"))
+            .collect();
+        writeln!(
+            warnings,
+            "warning: --plaintext-matcher values for {} are submitted unencrypted, so the \
+             erasure log will store them in the clear",
+            keys.join(", ")
+        )?;
+    }
     let total = plans.len();
     if total > 1 {
         writeln!(
@@ -416,14 +528,21 @@ pub async fn submit_with_ipcrypt(
         )
         .await
         .map_err(|err| {
-            if total > 1 {
+            if total == 1 {
+                err
+            } else if err.downcast_ref::<SubmitError>().is_some() {
+                // A conflicting request is not finished by a rerun, which
+                // would derive the same id and conflict again.
+                err.context(format!(
+                    "erasure request {} failed after {done} of {total} were submitted",
+                    plan.request_id
+                ))
+            } else {
                 err.context(format!(
                     "erasure request {} failed after {done} of {total} were submitted; rerun \
                      with --request-id {base_id} to finish",
                     plan.request_id
                 ))
-            } else {
-                err
             }
         })?;
         match outcome {
@@ -433,14 +552,35 @@ pub async fn submit_with_ipcrypt(
         report.requests.push((plan, outcome));
     }
     if total > 1 {
-        writeln!(out, "erasure base request id {base_id}:")?;
+        writeln!(
+            out,
+            "erasure base request id {base_id} (nothing is stored under it; erase status takes \
+             each id below):"
+        )?;
         for (plan, _) in &report.requests {
             let epochs: Vec<String> = plan
                 .epochs
                 .iter()
-                .map(|m| format!("{} epoch {}", m.key, m.epoch))
+                .map(|m| {
+                    if m.rule_key == m.key {
+                        format!("{} epoch {}", m.key, m.epoch)
+                    } else {
+                        format!("{} (rule {}) epoch {}", m.key, m.rule_key, m.epoch)
+                    }
+                })
                 .collect();
             writeln!(out, "  {} ({})", plan.request_id, epochs.join(", "))?;
+            writeln!(
+                out,
+                "    ravel-cli {}erase status --tenant {} --signal {} --request-id {}",
+                cli_flags
+                    .iter()
+                    .map(|word| format!("{} ", shell_word(word)))
+                    .collect::<String>(),
+                shell_word(tenant),
+                signal_name(signal),
+                plan.request_id
+            )?;
         }
         writeln!(
             out,
@@ -1112,14 +1252,53 @@ retired_epochs = [1, 2, 3, 4]
             TENANT,
             SignalArg::Logs,
             matchers,
+            Vec::new(),
             0,
             0,
             "dsar-1".to_string(),
             base,
             NOW_NS,
+            &[],
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .await
+    }
+
+    /// A submit with plaintext matchers, returning the result with what was
+    /// written to the output and to the warnings.
+    async fn submit_plaintext(
+        store: &Arc<dyn ObjectStoreBackend>,
+        policy: &IpcryptPolicy,
+        signal: SignalArg,
+        matchers: Vec<(String, String)>,
+        plaintext: Vec<(String, String)>,
+        base: Uuid,
+    ) -> (anyhow::Result<IpcryptSubmitReport>, String, String) {
+        let mut out = Vec::new();
+        let mut warnings = Vec::new();
+        let result = submit_with_ipcrypt(
+            Arc::clone(store),
+            policy,
+            TENANT,
+            signal,
+            matchers,
+            plaintext,
+            0,
+            0,
+            "dsar-1".to_string(),
+            base,
+            NOW_NS,
+            &[],
+            &mut out,
+            &mut warnings,
+        )
+        .await;
+        (
+            result,
+            String::from_utf8(out).expect("utf-8"),
+            String::from_utf8(warnings).expect("utf-8"),
+        )
     }
 
     /// The stored `.dreq` for `id`, decoded.
@@ -1277,12 +1456,15 @@ retired_epochs = [1, 2, 3, 4]
             TENANT,
             SignalArg::Logs,
             matchers,
+            Vec::new(),
             0,
             0,
             "dsar-1".to_string(),
             base,
             NOW_NS,
+            &[],
             &mut out,
+            &mut Vec::new(),
         )
         .await
         .expect("a retry is not a conflict");
@@ -1295,12 +1477,25 @@ retired_epochs = [1, 2, 3, 4]
 
         let out = String::from_utf8(out).expect("utf-8");
         assert!(
-            out.contains(&format!("erasure base request id {base}:\n")),
+            out.contains(&format!(
+                "erasure base request id {base} (nothing is stored under it; erase status \
+                 takes each id below):\n"
+            )),
             "{out}"
         );
         for id in ids(&retry) {
             assert!(out.contains(&format!("  {id} (client.ip epoch ")), "{out}");
+            assert!(
+                out.contains(&format!(
+                    "    ravel-cli erase status --tenant acme --signal logs --request-id {id}\n"
+                )),
+                "{out}"
+            );
         }
+        assert!(
+            !out.contains(&format!("--request-id {base}\n")),
+            "the base id has no status: {out}"
+        );
         assert!(
             out.ends_with("4 erasure requests: 0 created, 4 already present\n"),
             "{out}"
@@ -1342,11 +1537,14 @@ retired_epochs = [1, 2, 3, 4]
             TENANT,
             SignalArg::Metrics,
             vec![matcher("client_ip", CLIENT)],
+            Vec::new(),
             0,
             0,
             String::new(),
             base,
             NOW_NS,
+            &[],
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .await
@@ -1369,11 +1567,14 @@ retired_epochs = [1, 2, 3, 4]
             TENANT,
             SignalArg::Metrics,
             vec![matcher("client.ip", CLIENT)],
+            Vec::new(),
             0,
             0,
             String::new(),
             dotted,
             NOW_NS,
+            &[],
+            &mut Vec::new(),
             &mut Vec::new(),
         )
         .await
@@ -1475,7 +1676,10 @@ retired_epochs = [1, 2, 3, 4]
             message.contains("written without the IPCrypt policy"),
             "{message}"
         );
-        assert!(message.contains("without --ipcrypt-config"), "{message}");
+        assert!(
+            message.contains("--plaintext-matcher KEY=VALUE instead of --matcher"),
+            "{message}"
+        );
         assert!(message.contains("\"client.ip\""), "{message}");
         assert!(!message.contains("\"service.name\""), "{message}");
     }
@@ -1535,7 +1739,8 @@ retired_epochs = [1, 2, 3, 4]
     }
 
     /// A write failing part-way names the base id, and rerunning with it
-    /// submits only the requests left out.
+    /// submits only the requests left out: the rerun derives the same ids, so
+    /// the stored requests are exactly the four epoch combinations.
     #[tokio::test]
     async fn a_failure_part_way_names_the_base_id_and_a_rerun_finishes() {
         let faulty = Arc::new(FaultStore::new(
@@ -1570,6 +1775,395 @@ retired_epochs = [1, 2, 3, 4]
             .await
             .expect("rerun");
         assert_eq!((rerun.created, rerun.already_present), (3, 1));
-        assert_eq!(request_keys(faulty.inner()).await.len(), 4);
+        assert_eq!(faulty.fault_count(Op::Put, FaultKind::Transient), 1);
+
+        let mut expected_keys = Vec::new();
+        for (client_epoch, host_epoch) in [(2u32, 3u32), (2, 1), (1, 3), (1, 1)] {
+            let epochs = vec![
+                EncryptedMatcher {
+                    key: "client.ip".to_string(),
+                    rule_key: "client.ip".to_string(),
+                    epoch: client_epoch,
+                },
+                EncryptedMatcher {
+                    key: "host.ip".to_string(),
+                    rule_key: "host.ip".to_string(),
+                    epoch: host_epoch,
+                },
+            ];
+            let id = derived_request_id(base, &epochs);
+            let stored = stored_request(&store, Signal::Logs, id).await;
+            assert_eq!(
+                predicate(&stored),
+                vec![
+                    matcher(
+                        "client.ip",
+                        &ciphertext(Variant::Deterministic, client_epoch, CLIENT)
+                    ),
+                    matcher("host.ip", &ciphertext(Variant::Prefix, host_epoch, HOST)),
+                ],
+                "epochs {client_epoch}/{host_epoch}"
+            );
+            expected_keys.push(
+                keys::erasure_request_key(&TenantId::new(TENANT).hash(), Signal::Logs, id)
+                    .expect("request key"),
+            );
+        }
+        let mut stored_keys = request_keys(faulty.inner()).await;
+        stored_keys.sort();
+        expected_keys.sort();
+        assert_eq!(stored_keys, expected_keys);
+    }
+
+    /// A conflicting request fails the same way on every rerun, so the error
+    /// for it carries no rerun hint.
+    #[tokio::test]
+    async fn a_conflicting_request_in_a_fan_out_gives_no_rerun_hint() {
+        let policy = policy(TWO_EPOCH_POLICY);
+        let store = store_with_marker(&policy).await;
+        let base = Uuid::from_u128(20);
+        let first = vec![EncryptedMatcher {
+            key: "client.ip".to_string(),
+            rule_key: "client.ip".to_string(),
+            epoch: 2,
+        }];
+        submit(
+            Arc::clone(&store),
+            TENANT,
+            SignalArg::Logs,
+            vec![matcher("client.ip", "something else")],
+            0,
+            0,
+            String::new(),
+            derived_request_id(base, &first),
+            NOW_NS,
+        )
+        .await
+        .expect("seed a different request under the first derived id");
+        let err = submit_logs(&store, &policy, vec![matcher("client.ip", CLIENT)], base)
+            .await
+            .expect_err("a conflicting request must fail");
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("failed after 0 of 2 were submitted"),
+            "{message}"
+        );
+        assert!(
+            message.contains("a conflicting erasure request already exists"),
+            "{message}"
+        );
+        assert!(!message.contains("rerun"), "{message}");
+    }
+
+    /// A plaintext matcher is submitted as written beside the ordinary
+    /// matchers, a warning names its key, and with no marker the request
+    /// proceeds and writes none.
+    #[tokio::test]
+    async fn a_plaintext_matcher_submits_the_raw_value_and_warns() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let policy = policy(TWO_EPOCH_POLICY);
+        let base = Uuid::from_u128(21);
+        let (result, out, warnings) = submit_plaintext(
+            &store,
+            &policy,
+            SignalArg::Logs,
+            vec![matcher("service.name", "api")],
+            vec![matcher("client.ip", CLIENT), matcher("host.ip", HOST)],
+            base,
+        )
+        .await;
+        let report = result.expect("plaintext matchers proceed without a marker");
+        assert_eq!(report.requests.len(), 1);
+        assert_eq!(report.requests[0].0.request_id, base);
+        let stored = stored_request(&store, Signal::Logs, base).await;
+        assert_eq!(
+            predicate(&stored),
+            vec![
+                matcher("service.name", "api"),
+                matcher("client.ip", CLIENT),
+                matcher("host.ip", HOST),
+            ]
+        );
+        assert_eq!(stored_marker(store.as_ref()).await, None);
+        assert_eq!(request_keys(store.as_ref()).await.len(), 1);
+        assert_eq!(
+            warnings,
+            "warning: --plaintext-matcher values for \"client.ip\", \"host.ip\" are submitted \
+             unencrypted, so the erasure log will store them in the clear\n"
+        );
+        assert_eq!(out, "");
+    }
+
+    /// Plaintext matchers alone also proceed on a bucket whose marker
+    /// carries the policy: they match data written before the rules.
+    #[tokio::test]
+    async fn a_plaintext_matcher_proceeds_under_a_matching_marker() {
+        let policy = policy(TWO_EPOCH_POLICY);
+        let store = store_with_marker(&policy).await;
+        let base = Uuid::from_u128(22);
+        let (result, _, warnings) = submit_plaintext(
+            &store,
+            &policy,
+            SignalArg::Logs,
+            Vec::new(),
+            vec![matcher("client.ip", CLIENT)],
+            base,
+        )
+        .await;
+        result.expect("submit");
+        let stored = stored_request(&store, Signal::Logs, base).await;
+        assert_eq!(predicate(&stored), vec![matcher("client.ip", CLIENT)]);
+        assert!(warnings.contains("\"client.ip\""), "{warnings}");
+    }
+
+    /// A plaintext matcher combined with a matcher the policy encrypts can
+    /// match no record, so the command is refused before anything is
+    /// written, marker or no marker.
+    #[tokio::test]
+    async fn a_plaintext_matcher_with_an_encrypted_matcher_is_refused_and_writes_nothing() {
+        let policy = policy(TWO_EPOCH_POLICY);
+        for marked in [true, false] {
+            let store = if marked {
+                store_with_marker(&policy).await
+            } else {
+                Arc::new(MemoryStore::new()) as Arc<dyn ObjectStoreBackend>
+            };
+            let (result, out, warnings) = submit_plaintext(
+                &store,
+                &policy,
+                SignalArg::Logs,
+                vec![matcher("host.ip", HOST), matcher("service.name", "api")],
+                vec![matcher("client.ip", CLIENT)],
+                Uuid::from_u128(23),
+            )
+            .await;
+            let err = result.expect_err("a mixed command must be refused");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains(
+                    "--plaintext-matcher on \"client.ip\" is combined with --matcher on \
+                     \"host.ip\""
+                ),
+                "marked {marked}: {message}"
+            );
+            assert!(message.contains("conjunction"), "{message}");
+            assert!(message.contains("Nothing was written"), "{message}");
+            let all: Vec<String> = list_all(store.as_ref(), "")
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|o| o.key)
+                .collect();
+            let expected: Vec<String> = if marked {
+                vec![IPCRYPT_POLICY_KEY.to_string()]
+            } else {
+                Vec::new()
+            };
+            assert_eq!(all, expected, "marked {marked}");
+            assert_eq!((out.as_str(), warnings.as_str()), ("", ""));
+        }
+    }
+
+    /// Plaintext matchers alone still need the marker to hold the local
+    /// policy: a marker naming a different policy refuses, and nothing is
+    /// written.
+    #[tokio::test]
+    async fn a_plaintext_matcher_alone_against_a_marker_mismatch_is_refused() {
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let other = [7u8; 32];
+        check_marker(store.as_ref(), other)
+            .await
+            .expect("seed marker");
+        let policy = policy(TWO_EPOCH_POLICY);
+        let (result, out, warnings) = submit_plaintext(
+            &store,
+            &policy,
+            SignalArg::Logs,
+            Vec::new(),
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(29),
+        )
+        .await;
+        let message = format!("{:#}", result.expect_err("a different policy must refuse"));
+        assert!(message.contains("refusing to erase submit"), "{message}");
+        assert!(message.contains(&hex::encode(other)), "{message}");
+        assert!(
+            message.contains(&hex::encode(policy.fingerprint())),
+            "{message}"
+        );
+        let all: Vec<String> = list_all(store.as_ref(), "")
+            .await
+            .expect("list")
+            .into_iter()
+            .map(|o| o.key)
+            .collect();
+        assert_eq!(all, vec![IPCRYPT_POLICY_KEY.to_string()]);
+        assert_eq!((out.as_str(), warnings.as_str()), ("", ""));
+    }
+
+    /// A marker read that fails is not an absent marker for plaintext
+    /// matchers either: refused, and nothing is written.
+    #[tokio::test]
+    async fn a_plaintext_matcher_alone_with_a_marker_read_failure_is_refused() {
+        let faulty = Arc::new(FaultStore::new(
+            MemoryStore::new(),
+            FaultPlan::empty().with_rule(
+                FaultRule::new(Op::Get, ScriptedFault::Transient("marker read".into()))
+                    .with_key_contains(IPCRYPT_POLICY_KEY),
+            ),
+        ));
+        let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
+        let policy = policy(TWO_EPOCH_POLICY);
+        let (result, out, warnings) = submit_plaintext(
+            &store,
+            &policy,
+            SignalArg::Logs,
+            Vec::new(),
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(30),
+        )
+        .await;
+        let message = format!(
+            "{:#}",
+            result.expect_err("a failed marker read must refuse")
+        );
+        assert!(message.contains("refusing to erase submit"), "{message}");
+        assert_eq!(faulty.fault_count(Op::Get, FaultKind::Transient), 1);
+        let keys = list_all(faulty.inner(), "").await.expect("list");
+        assert!(keys.is_empty(), "{keys:?}");
+        assert_eq!((out.as_str(), warnings.as_str()), ("", ""));
+    }
+
+    /// A plaintext matcher on a key with no rule for the signal is refused:
+    /// an ordinary matcher already submits it as written.
+    #[tokio::test]
+    async fn a_plaintext_matcher_on_a_key_with_no_rule_is_refused() {
+        let policy = policy(TWO_EPOCH_POLICY);
+        let store = store_with_marker(&policy).await;
+        // Logs look rules up by the raw key, so the sanitized spelling has none.
+        // Metrics sanitize the key, and `service_name` still names no rule.
+        for (signal, key) in [
+            (SignalArg::Logs, "service.name"),
+            (SignalArg::Logs, "client_ip"),
+            (SignalArg::Metrics, "service_name"),
+        ] {
+            let (result, out, warnings) = submit_plaintext(
+                &store,
+                &policy,
+                signal,
+                Vec::new(),
+                vec![matcher(key, CLIENT)],
+                Uuid::from_u128(24),
+            )
+            .await;
+            let message = format!("{:#}", result.expect_err("an unruled key must be refused"));
+            assert!(
+                message.contains(&format!(
+                    "--plaintext-matcher keys \"{key}\" have no IPCrypt rule for --signal {}, \
+                     so an ordinary --matcher already submits their values as written",
+                    signal_name(signal)
+                )),
+                "{message}"
+            );
+            assert_eq!((out.as_str(), warnings.as_str()), ("", ""));
+        }
+        let (result, _, _) = submit_plaintext(
+            &store,
+            &IpcryptPolicy::empty(),
+            SignalArg::Logs,
+            Vec::new(),
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(25),
+        )
+        .await;
+        let message = format!("{:#}", result.expect_err("no policy, no rule"));
+        assert!(message.contains("have no IPCrypt rule"), "{message}");
+        assert!(request_keys(store.as_ref()).await.is_empty());
+    }
+
+    /// Metric signals look a plaintext matcher's key up by its sanitized
+    /// form, so the stored label name `client_ip` finds the `client.ip` rule.
+    #[tokio::test]
+    async fn a_metric_plaintext_matcher_is_ruled_through_its_sanitized_label_name() {
+        let policy = policy(TWO_EPOCH_POLICY);
+        let store = store_with_marker(&policy).await;
+        let base = Uuid::from_u128(26);
+        let (result, _, _) = submit_plaintext(
+            &store,
+            &policy,
+            SignalArg::Metrics,
+            Vec::new(),
+            vec![matcher("client_ip", CLIENT)],
+            base,
+        )
+        .await;
+        result.expect("submit");
+        let stored = stored_request(&store, Signal::Metrics, base).await;
+        assert_eq!(predicate(&stored), vec![matcher("client_ip", CLIENT)]);
+    }
+
+    /// A metric matcher's fan-out line names the rule when the label name
+    /// differs from it.
+    #[tokio::test]
+    async fn a_metric_fan_out_line_names_the_rule_key() {
+        let policy = policy(TWO_EPOCH_POLICY);
+        let store = store_with_marker(&policy).await;
+        let (result, out, _) = submit_plaintext(
+            &store,
+            &policy,
+            SignalArg::Metrics,
+            vec![matcher("client_ip", CLIENT)],
+            Vec::new(),
+            Uuid::from_u128(27),
+        )
+        .await;
+        let report = result.expect("submit");
+        for ((plan, _), epoch) in report.requests.iter().zip([2u32, 1]) {
+            assert!(
+                out.contains(&format!(
+                    "  {} (client_ip (rule client.ip) epoch {epoch})\n    ravel-cli erase status \
+                     --tenant acme --signal metrics --request-id {}\n",
+                    plan.request_id, plan.request_id
+                )),
+                "{out}"
+            );
+        }
+    }
+
+    /// A marker holding a non-empty policy's fingerprint refuses a submit
+    /// made with an empty local policy, which would leave the address in the
+    /// clear while the stored data holds ciphertext.
+    #[tokio::test]
+    async fn an_empty_local_policy_against_a_policy_marker_is_refused() {
+        let store = store_with_marker(&policy(TWO_EPOCH_POLICY)).await;
+        let empty = IpcryptPolicy::empty();
+        let err = submit_logs(
+            &store,
+            &empty,
+            vec![matcher("client.ip", CLIENT)],
+            Uuid::from_u128(28),
+        )
+        .await
+        .expect_err("an empty local policy must not match a policy marker");
+        let message = format!("{err:#}");
+        assert!(message.contains("refusing to erase submit"), "{message}");
+        assert!(
+            message.contains(&hex::encode(policy(TWO_EPOCH_POLICY).fingerprint())),
+            "{message}"
+        );
+        assert!(
+            message.contains(&hex::encode(empty.fingerprint())),
+            "{message}"
+        );
+        assert!(request_keys(store.as_ref()).await.is_empty());
+    }
+
+    #[test]
+    fn shell_word_quotes_only_what_a_shell_would_split() {
+        assert_eq!(shell_word("acme"), "acme");
+        assert_eq!(shell_word("team-a.prod"), "team-a.prod");
+        assert_eq!(shell_word("a b"), "'a b'");
+        assert_eq!(shell_word("it's"), r"'it'\''s'");
+        assert_eq!(shell_word(""), "''");
     }
 }

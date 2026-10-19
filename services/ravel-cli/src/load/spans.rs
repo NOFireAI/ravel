@@ -959,6 +959,11 @@ fn decode_spans_batch(
 /// Bucketing is by the router's own clock (load-time wall clock), so an old
 /// span lands in today's ingest hour and is reached by every later query's
 /// listing window, whose upper bound is `now`.
+///
+/// Loads under no IPCrypt rules and skips the `sys/ipcrypt/policy` marker
+/// check, so it is for tests and benchmarks: production loads go through
+/// [`run`](super::run), which checks the marker and applies the tenant's
+/// rules.
 #[allow(clippy::too_many_arguments)]
 pub async fn load_spans(
     store: Arc<dyn ObjectStoreBackend>,

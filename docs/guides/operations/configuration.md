@@ -1263,6 +1263,21 @@ through `--tenant-token`, `--tenant-token-file` or `--oidc-ddl-claim`, and
 `ipcrypt` only through `--tenant-token`, `--tenant-token-file` or
 `--oidc-ipcrypt-claim`. Flight SQL grants neither.
 
+Withholding `ipcrypt` does not stop a caller encrypting guesses if it can
+also write: write access to a tenant is an encryption oracle, because a token
+that can ingest can write chosen addresses under a ruled key and read the
+ciphertext back with a query. A deployment that needs readers unable to
+encrypt guesses must keep readers' tokens off ingest. Tokens carry no ingest
+or query scope, so the line is drawn by which processes accept a token. Of
+the bearer-token resolvers, only flag-configured tokens (`--tenant-token` or
+`--tenant-token-file`) split by process mode: put readers' tokens on
+`--mode query` processes only and exporters' tokens on `--mode gateway`
+processes only. Durable `sys/auth` tokens cannot: on a keyed bucket, every
+`--mode all`, `--mode gateway` and `--mode query` process reads the map, so
+a token in it resolves for ingest and query alike. OIDC can only with a
+separate `--oidc-audience` per process role, since an OIDC identity resolves
+on every process configured with its issuer and audience.
+
 ### Production authentication
 
 Two additive resolvers join the same first-success chain. They do not disable

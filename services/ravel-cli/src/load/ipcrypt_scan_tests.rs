@@ -1,7 +1,8 @@
 //! ADR-2993 acceptance for `ravel-cli load`: distinct addresses loaded under
-//! an IPCrypt policy through every label-building point (a metric label, log
-//! resource and record attributes on both the columnar and the row path, and
-//! a span's resource attribute, attribute and attributes-map entry) never
+//! an IPCrypt policy through every label-building point (a metric label, a
+//! classic histogram's labels including one written with a dot, log resource
+//! and record attributes on both the columnar and the row path, and a span's
+//! resource attribute, attribute and attributes-map entry) never
 //! reach the bucket in any form, and each one's ciphertext does. A control
 //! run with no policy finds every raw address, so the scan can see them.
 //!
@@ -54,10 +55,18 @@ mod octet {
     pub const SPAN_RESOURCE: u8 = 106;
     pub const SPAN_ATTR: u8 = 107;
     pub const SPAN_ATTRS_MAP: u8 = 108;
+    pub const HISTOGRAM_DOTTED_LABEL: u8 = 109;
+    pub const HISTOGRAM_LABEL: u8 = 110;
 }
 
 /// Every case: its name, the rule key that covers it, and its octet.
-const CASES: [(&str, &str, u8); 8] = [
+const CASES: [(&str, &str, u8); 10] = [
+    (
+        "classic histogram label written client.ip",
+        "client.ip",
+        octet::HISTOGRAM_DOTTED_LABEL,
+    ),
+    ("classic histogram label", "host.ip", octet::HISTOGRAM_LABEL),
     ("metric label", "client.ip", octet::METRIC_LABEL),
     (
         "columnar log resource",
@@ -141,6 +150,18 @@ async fn cli_load(
     signal: SignalArg,
     policy: &IpcryptPolicy,
 ) -> anyhow::Result<()> {
+    cli_load_warning_to(store, pq, mapping, signal, policy, &mut Vec::new()).await
+}
+
+/// [`cli_load`] with its warnings written to `warnings`.
+async fn cli_load_warning_to(
+    store: Arc<dyn ObjectStoreBackend>,
+    pq: &Path,
+    mapping: &Path,
+    signal: SignalArg,
+    policy: &IpcryptPolicy,
+    warnings: &mut dyn std::io::Write,
+) -> anyhow::Result<()> {
     run_fold_warning_to(
         store,
         pq,
@@ -162,7 +183,7 @@ async fn cli_load(
         policy,
         NOW_NS,
         Arc::new(FixedClock(NOW_NS)),
-        &mut Vec::new(),
+        warnings,
     )
     .await
 }
@@ -189,6 +210,43 @@ async fn load_every_path(store: &Arc<dyn ObjectStoreBackend>, policy: &IpcryptPo
     cli_load(Arc::clone(store), &pq, &mapping, SignalArg::Metrics, policy)
         .await
         .expect("metrics load");
+
+    // One classic-histogram data point of two buckets: every row carries the
+    // labels, which reach both the exploded points and the bucket grouping.
+    // The label written `client.ip` finds its rule through the sanitizer.
+    let dotted = addr(octet::HISTOGRAM_DOTTED_LABEL);
+    let host = addr(octet::HISTOGRAM_LABEL);
+    let histogram = batch(vec![
+        ("ts", i64_col(vec![NOW_NS, NOW_NS])),
+        (
+            "le",
+            Arc::new(Float64Array::from(vec![0.1, 1.0])) as ArrayRef,
+        ),
+        (
+            "bucket_count",
+            Arc::new(Float64Array::from(vec![2.0, 3.0])) as ArrayRef,
+        ),
+        (
+            "sum",
+            Arc::new(Float64Array::from(vec![12.5, 12.5])) as ArrayRef,
+        ),
+        ("count", i64_col(vec![7, 7])),
+        ("cip", str_col(vec![dotted.as_str(), dotted.as_str()])),
+        ("hip", str_col(vec![host.as_str(), host.as_str()])),
+    ]);
+    let pq = write_batch(dir.path(), "histogram.parquet", &histogram);
+    let mapping = write_mapping(
+        dir.path(),
+        "histogram.toml",
+        "[metrics]\nname = \"latency\"\nvalue_column = \"bucket_count\"\nts_column = \"ts\"\n\
+         ts_unit = \"nanos\"\n\n\
+         [[metrics.label]]\nname = \"client.ip\"\ncolumn = \"cip\"\n\n\
+         [[metrics.label]]\nname = \"host_ip\"\ncolumn = \"hip\"\n\n\
+         [metrics.histogram]\nle_column = \"le\"\nsum_column = \"sum\"\ncount_column = \"count\"\n",
+    );
+    cli_load(Arc::clone(store), &pq, &mapping, SignalArg::Metrics, policy)
+        .await
+        .expect("histogram load");
 
     let pq = write_batch(
         dir.path(),
@@ -504,6 +562,149 @@ async fn no_flag_on_a_bucket_with_a_policy_marker_refuses() {
     let message = format!("{err:#}");
     assert!(message.contains(&hex(&policy.fingerprint())), "{message}");
     assert!(list_data_objects(store.as_ref()).await.is_empty());
+}
+
+/// A logs column declared `type = "bytes"` under a ruled key is stored as
+/// written, so the load says so at setup; a bytes column under a key with no
+/// rule, and the same mapping with no policy, warn nothing.
+#[tokio::test]
+async fn a_bytes_column_under_a_ruled_key_warns_at_load_setup() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw = addr(octet::COLUMNAR_LOG_RECORD);
+    let logs = batch(vec![
+        ("ts", i64_col(vec![NOW_NS])),
+        ("body", str_col(vec!["request served"])),
+        (
+            "raw_ip",
+            Arc::new(arrow::array::BinaryArray::from(vec![raw.as_bytes()])) as ArrayRef,
+        ),
+        (
+            "blob",
+            Arc::new(arrow::array::BinaryArray::from(vec![b"opaque".as_slice()])) as ArrayRef,
+        ),
+    ]);
+    let pq = write_batch(dir.path(), "bytes.parquet", &logs);
+    let mapping = write_mapping(
+        dir.path(),
+        "bytes.toml",
+        "ts_column = \"ts\"\nts_unit = \"nanos\"\nbody_column = \"body\"\n\n\
+         [[attribute]]\nkey = \"client.ip\"\ncolumn = \"raw_ip\"\ntype = \"bytes\"\n\n\
+         [[attribute]]\nkey = \"payload\"\ncolumn = \"blob\"\ntype = \"bytes\"\n",
+    );
+    let expected = "warning: --mapping column \"raw_ip\" maps key \"client.ip\", which has an \
+                    IPCrypt rule, with type = \"bytes\"; IPCrypt encrypts string values only, \
+                    so these bytes are stored as written";
+
+    let mut warnings = Vec::new();
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    cli_load_warning_to(
+        Arc::clone(&store),
+        &pq,
+        &mapping,
+        SignalArg::Logs,
+        &policy(),
+        &mut warnings,
+    )
+    .await
+    .expect("load");
+    let warnings = String::from_utf8(warnings).expect("utf-8");
+    let lines: Vec<&str> = warnings
+        .lines()
+        .filter(|line| line.contains("type = \"bytes\""))
+        .collect();
+    assert_eq!(lines, vec![expected], "{warnings}");
+
+    let mut warnings = Vec::new();
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    cli_load_warning_to(
+        store,
+        &pq,
+        &mapping,
+        SignalArg::Logs,
+        &IpcryptPolicy::empty(),
+        &mut warnings,
+    )
+    .await
+    .expect("load");
+    let warnings = String::from_utf8(warnings).expect("utf-8");
+    assert!(!warnings.contains("type = \"bytes\""), "{warnings}");
+}
+
+/// A spans column declared `type = "bytes"` under a ruled key is stored as
+/// its lowercase hex, which never parses as an address, so the rule leaves
+/// it unencrypted: the stored objects hold the hex of the raw value and no
+/// form of its ciphertext, and the load warns before writing any data.
+#[tokio::test]
+async fn a_spans_bytes_column_under_a_ruled_key_is_stored_unencrypted_and_warns() {
+    const SPAN_BYTES_ATTR: u8 = 111;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let raw = addr(SPAN_BYTES_ATTR);
+    let spans = batch(vec![
+        (
+            "trace_id",
+            Arc::new(arrow::array::BinaryArray::from(vec![[1u8; 16].as_slice()])) as ArrayRef,
+        ),
+        (
+            "span_id",
+            Arc::new(arrow::array::BinaryArray::from(vec![[2u8; 8].as_slice()])) as ArrayRef,
+        ),
+        ("name", str_col(vec!["op"])),
+        ("start_ns", i64_col(vec![NOW_NS])),
+        ("end_ns", i64_col(vec![NOW_NS])),
+        (
+            "raw_ip",
+            Arc::new(arrow::array::BinaryArray::from(vec![raw.as_bytes()])) as ArrayRef,
+        ),
+    ]);
+    let pq = write_batch(dir.path(), "spans.parquet", &spans);
+    let mapping = write_mapping(
+        dir.path(),
+        "spans.toml",
+        "[spans]\ntrace_id_column = \"trace_id\"\nspan_id_column = \"span_id\"\n\
+         name_column = \"name\"\nstart_ts_column = \"start_ns\"\nstart_ts_unit = \"nanos\"\n\
+         end_ts_column = \"end_ns\"\nend_ts_unit = \"nanos\"\n\n\
+         [[spans.attribute]]\nkey = \"client.ip\"\ncolumn = \"raw_ip\"\ntype = \"bytes\"\n",
+    );
+
+    let mut warnings = Vec::new();
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    cli_load_warning_to(
+        Arc::clone(&store),
+        &pq,
+        &mapping,
+        SignalArg::Spans,
+        &policy(),
+        &mut warnings,
+    )
+    .await
+    .expect("spans load");
+    let warnings = String::from_utf8(warnings).expect("utf-8");
+    let lines: Vec<&str> = warnings
+        .lines()
+        .filter(|line| line.contains("type = \"bytes\""))
+        .collect();
+    assert_eq!(
+        lines,
+        vec![
+            "warning: --mapping column \"raw_ip\" maps key \"client.ip\", which has an IPCrypt \
+             rule, with type = \"bytes\"; IPCrypt encrypts string values only, so these bytes \
+             are stored unencrypted, as their lowercase hex"
+        ],
+        "{warnings}"
+    );
+
+    let stored = stored_objects(&store).await;
+    assert!(
+        !holding(&stored, hex(raw.as_bytes()).as_bytes()).is_empty(),
+        "the raw value's hex is not stored: {:?}",
+        stored.iter().map(|o| o.key.as_str()).collect::<Vec<_>>()
+    );
+    for form in ciphertext_forms(&ciphertext("client.ip", SPAN_BYTES_ATTR)) {
+        assert!(
+            holding(&stored, &form).is_empty(),
+            "a ciphertext was stored"
+        );
+    }
 }
 
 /// A marker read that fails is not an absent marker: the load refuses, and

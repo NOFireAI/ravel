@@ -185,9 +185,9 @@ impl IpcryptPolicy {
                 anyhow::bail!(
                     "refusing to erase submit: the bucket has no {IPCRYPT_POLICY_KEY} marker, so \
                      its data was written without the IPCrypt policy (local policy fingerprint \
-                     {local}) and the encrypted matchers on {} would match nothing. Submit the \
-                     request without --ipcrypt-config so its matchers stay plaintext. Nothing \
-                     was written",
+                     {local}) and the encrypted matchers on {} would match nothing. Data \
+                     written without the policy holds raw values: pass them with \
+                     --plaintext-matcher KEY=VALUE instead of --matcher. Nothing was written",
                     keys.join(", ")
                 )
             }

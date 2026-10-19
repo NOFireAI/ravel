@@ -198,6 +198,14 @@ impl S3Auth {
             S3Auth::InstanceRole => S3AuthMode::InstanceRole,
         }
     }
+
+    /// The `--s3-auth` spelling of this value.
+    pub const fn flag_value(self) -> &'static str {
+        match self {
+            S3Auth::Static => "static",
+            S3Auth::InstanceRole => "instance-role",
+        }
+    }
 }
 
 /// Which server-verified checksum `--store s3` attaches to every PUT. The
@@ -375,6 +383,67 @@ impl StoreArgs {
                 self.s3_endpoint.as_deref(),
             ),
         }
+    }
+
+    /// The store flags that select this same store, as command-line words, for
+    /// a follow-up command a report prints. Credentials are never echoed: the
+    /// access key, secret key and session token are left to their `RAVEL_S3_*`
+    /// environment variables. One that was set while its variable is unset
+    /// came from a flag, so `env_is_set` reporting that adds the placeholder
+    /// word `<your S3 credential flags>` where those flags go.
+    pub fn echo_flags(&self, env_is_set: &dyn Fn(&str) -> bool) -> Vec<String> {
+        let Some(kind) = self.store else {
+            return Vec::new();
+        };
+        let mut words = vec!["--store".to_string(), kind.flag_value().to_string()];
+        if kind != StoreKind::S3 {
+            return words;
+        }
+        let mut push = |flag: &str, value: Option<String>| {
+            if let Some(value) = value {
+                words.push(flag.to_string());
+                words.push(value);
+            }
+        };
+        push("--s3-endpoint", self.s3_endpoint.clone());
+        push("--s3-bucket", self.s3_bucket.clone());
+        push("--s3-region", self.s3_region.clone());
+        push(
+            "--s3-auth",
+            (self.s3_auth != S3Auth::default()).then(|| self.s3_auth.flag_value().to_string()),
+        );
+        push(
+            "--s3-credentials-file",
+            self.s3_credentials_file
+                .as_ref()
+                .map(|path| path.display().to_string()),
+        );
+        push(
+            "--s3-instance-metadata-endpoint",
+            self.s3_instance_metadata_endpoint.clone(),
+        );
+        push(
+            "--s3-upload-integrity",
+            (self.s3_upload_integrity != S3UploadIntegrity::default())
+                .then(|| self.s3_upload_integrity.flag_value().to_string()),
+        );
+        if self.s3_allow_http {
+            words.push("--s3-allow-http".to_string());
+        }
+        if !self.s3_request_stored_checksum {
+            words.push("--s3-request-stored-checksum=false".to_string());
+        }
+        let credential_flag_given = [
+            (self.s3_access_key.is_some(), "RAVEL_S3_ACCESS_KEY"),
+            (self.s3_secret_key.is_some(), "RAVEL_S3_SECRET_KEY"),
+            (self.s3_session_token.is_some(), "RAVEL_S3_SESSION_TOKEN"),
+        ]
+        .into_iter()
+        .any(|(set, var)| set && !env_is_set(var));
+        if credential_flag_given {
+            words.push("<your S3 credential flags>".to_string());
+        }
+        words
     }
 
     /// The HTTP client configuration `--store s3` builds its store with: the

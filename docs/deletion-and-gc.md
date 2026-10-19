@@ -767,10 +767,44 @@ encrypts for the caller (ADR-2993 decision 8):
   requests each carry an id derived from that base id and the request's
   matcher keys and epochs, so rerunning with the same `--request-id`
   re-submits the same requests and finds them already present. A failure
-  part-way names the base id to rerun with.
+  part-way names the base id to rerun with, except when a request conflicts
+  with a different request already stored under its derived id: a rerun
+  derives the same id and conflicts again, so that error carries no rerun
+  hint.
 - With several requests the output lists the base id, then each derived id
-  with its epochs, then `<n> erasure requests: <c> created, <p> already
-  present`.
+  with its epochs (a metric matcher whose key differs from its rule's key
+  shows `<key> (rule <rule key>) epoch <n>`) and, under it, the
+  `ravel-cli <flags> erase status --tenant <tenant> --signal <signal>
+  --request-id <derived id>` command for that request, then `<n> erasure
+  requests: <c> created, <p> already present`. Both the store flags and the
+  tenancy flags are top-level and go between `ravel-cli` and `erase`; after
+  `erase` they do not parse. `<flags>` holds the ones the submit ran with:
+  `--store`, under `--store s3` each S3 flag set away from its default
+  other than the inline credentials (`--s3-credentials-file` by its path),
+  and `--tenant-hash-key-file` by its path or `--tenant-hash-unkeyed`.
+  S3 access keys, secret keys and session tokens are never printed; they
+  are left to their `RAVEL_S3_*` environment variables, and one given as a
+  flag with its variable unset prints `<your S3 credential flags>` where
+  those flags go. Nothing is stored under the base id, so `erase status`
+  takes the derived ids; given the base id it reports `UNKNOWN`.
+
+`--plaintext-matcher KEY=VALUE` (repeatable) is for data written before the
+key's rule existed, which holds the raw value:
+
+- The value is submitted exactly as written: no encryption and no epoch
+  fan-out of its own. It is added to every request the command submits.
+- The erasure log stores the value in the clear. Before submitting, the
+  command prints a warning to stderr naming the keys concerned.
+- The key must have a rule for `--signal` in `--ipcrypt-config`, looked up
+  by its sanitized form on the metric signals. A key with no rule is
+  refused, since an ordinary `--matcher` already submits its value as
+  written.
+- A command that combines a plaintext matcher with an ordinary matcher the
+  policy would encrypt is refused before anything is written. Matchers in
+  one request are a conjunction: data written before the rules holds raw
+  values for both keys, and data written after holds ciphertext for both,
+  so no record could match. To erase a subject across both periods, submit
+  one command with `--plaintext-matcher` and one with `--matcher`.
 
 Every submit, with or without `--ipcrypt-config`, reads the
 `sys/ipcrypt/policy` marker ([ingest.md](ingest.md#startup-marker)) after
@@ -784,10 +818,11 @@ marker (ADR-2993, erasure amendment):
 - No marker and a policy with rules means the bucket's data was written
   without the policy, so an encrypted matcher would match nothing. A request
   with at least one matcher the policy would encrypt is refused, naming
-  those matchers, and nothing is written; submit it without
-  `--ipcrypt-config` so its matchers stay plaintext. A request with no
-  encrypted matcher (every key has no rule for `--signal`, or every ruled
-  value is not an address) is submitted as written.
+  those matchers, and nothing is written; pass those values with
+  `--plaintext-matcher` instead of `--matcher`. A request with no encrypted
+  matcher (every matcher is a plaintext matcher, its key has no rule for
+  `--signal`, or its ruled value is not an address) is submitted as written,
+  and no marker is written.
 
 ### The stages in detail
 

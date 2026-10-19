@@ -98,6 +98,26 @@ struct TenancyArgs {
     tenant_hash_unkeyed: bool,
 }
 
+/// The store and tenancy flags this invocation ran with, as the words a
+/// printed follow-up command puts before its subcommand. The deployment key
+/// is named by its file path, never by its bytes; credentials follow
+/// [`store::StoreArgs::echo_flags`].
+fn top_level_flags(
+    store: &store::StoreArgs,
+    tenancy: &TenancyArgs,
+    env_is_set: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut words = store.echo_flags(env_is_set);
+    if let Some(path) = &tenancy.tenant_hash_key_file {
+        words.push("--tenant-hash-key-file".to_string());
+        words.push(path.display().to_string());
+    }
+    if tenancy.tenant_hash_unkeyed {
+        words.push("--tenant-hash-unkeyed".to_string());
+    }
+    words
+}
+
 /// Whether a subcommand computes a `t/<tenant_hash>/` prefix and therefore
 /// needs the bucket's scheme resolved and installed first. The
 /// inspection commands that take an explicit object key or a local file, and
@@ -1553,9 +1573,23 @@ enum EraseCommand {
         signal: SignalArg,
         /// Exact-match predicate matcher `key=value`, repeatable; the request
         /// matches a record only when every matcher holds (logical AND). At
-        /// least one is required.
-        #[arg(long = "matcher", value_name = "KEY=VALUE", required = true)]
+        /// least one `--matcher` or `--plaintext-matcher` is required.
+        #[arg(
+            long = "matcher",
+            value_name = "KEY=VALUE",
+            required_unless_present = "plaintext_matchers"
+        )]
         matchers: Vec<String>,
+        /// Matcher `key=value` for data written before the key's IPCrypt
+        /// rule, repeatable: the value is submitted exactly as written, with
+        /// no encryption and no epoch fan-out, and the erasure log stores it
+        /// in the clear (a warning naming the keys goes to stderr). The key
+        /// must have a rule in `--ipcrypt-config` for `--signal` (metric keys
+        /// by their sanitized form), and the command is refused when an
+        /// ordinary `--matcher` would be encrypted, since no record holds
+        /// both a raw value and a ciphertext.
+        #[arg(long = "plaintext-matcher", value_name = "KEY=VALUE")]
+        plaintext_matchers: Vec<String>,
         /// Optional inclusive event-time window start (unix ns). Both bounds
         /// zero (the default) means no event-time restriction.
         #[arg(long, default_value_t = 0)]
@@ -2839,6 +2873,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant,
                     signal,
                     matchers,
+                    plaintext_matchers,
                     window_start_ns,
                     window_end_ns,
                     reason,
@@ -2847,6 +2882,10 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 },
         } => {
             let matchers = matchers
+                .iter()
+                .map(|m| ravel_cli::erase::parse_matcher(m))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let plaintext = plaintext_matchers
                 .iter()
                 .map(|m| ravel_cli::erase::parse_matcher(m))
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -2866,12 +2905,17 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 &tenant,
                 signal,
                 matchers,
+                plaintext,
                 window_start_ns,
                 window_end_ns,
                 reason,
                 request_id,
                 now_ns()?,
+                &top_level_flags(&cli.store, &cli.tenancy, &|var| {
+                    std::env::var_os(var).is_some()
+                }),
                 &mut std::io::stdout(),
+                &mut std::io::stderr(),
             )
             .await
             .map(|_| ())
@@ -5421,12 +5465,263 @@ mod tests {
             .expect("a read-only command must keep working on a fresh, marker-less bucket");
     }
 
-    /// `gc-config set` writes `sys/gc`, a bucket-root object with no tenant
-    /// prefix, so it never reaches the tenant-hashing gate above; it still
-    /// must clear the write gate on its own (the `else if
-    /// command_is_write(&cli.command)` arm in `main`), since the invariant
-    /// is "does the server accept this bucket", not "does this command hash
-    /// a tenant".
+    /// `erase submit` takes `--plaintext-matcher` in place of `--matcher`,
+    /// and needs at least one of the two.
+    #[test]
+    fn erase_submit_needs_a_matcher_or_a_plaintext_matcher() {
+        let base = [
+            "ravel", "erase", "submit", "--tenant", "t", "--signal", "logs",
+        ];
+        let parsed = Cli::try_parse_from(base.iter().chain(&[
+            "--plaintext-matcher",
+            "client.ip=192.0.2.1",
+            "--plaintext-matcher",
+            "host.ip=192.0.2.2",
+        ]))
+        .expect("plaintext matchers alone parse");
+        let Command::Erase {
+            command:
+                crate::EraseCommand::Submit {
+                    matchers,
+                    plaintext_matchers,
+                    ..
+                },
+        } = parsed.command
+        else {
+            panic!("expected erase submit");
+        };
+        assert!(matchers.is_empty());
+        assert_eq!(
+            plaintext_matchers,
+            vec!["client.ip=192.0.2.1", "host.ip=192.0.2.2"]
+        );
+        assert!(
+            Cli::try_parse_from(base).is_err(),
+            "a submit with no matcher of either kind must not parse"
+        );
+    }
+
+    /// Splits one printed command line into words the way a shell does for
+    /// the quoting `erase submit` emits: whitespace outside single quotes,
+    /// and `'\''` for a quote inside a quoted word.
+    fn shell_split(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word = String::new();
+        let mut in_word = false;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\'' => {
+                    in_word = true;
+                    for q in chars.by_ref() {
+                        if q == '\'' {
+                            break;
+                        }
+                        word.push(q);
+                    }
+                }
+                '\\' => {
+                    in_word = true;
+                    word.extend(chars.next());
+                }
+                c if c.is_whitespace() => {
+                    if in_word {
+                        words.push(std::mem::take(&mut word));
+                        in_word = false;
+                    }
+                }
+                c => {
+                    in_word = true;
+                    word.push(c);
+                }
+            }
+        }
+        if in_word {
+            words.push(word);
+        }
+        words
+    }
+
+    /// Each `erase status` command a fan-out prints carries the store and
+    /// tenancy flags the submit ran with, before `erase`, so pasted as
+    /// printed it parses to an `erase status` against the same store with
+    /// the same deployment key file.
+    #[tokio::test]
+    async fn erase_submit_prints_status_commands_with_the_submit_flags() {
+        use ravel_object_store::ObjectStoreBackend;
+        use ravel_object_store::memory::MemoryStore;
+        use std::sync::Arc;
+
+        let submit = Cli::try_parse_from([
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+            "--s3-bucket",
+            "ravel data",
+            "--s3-region",
+            "eu-west-1",
+            "--s3-credentials-file",
+            "/run/ravel/creds.json",
+            "--tenant-hash-key-file",
+            "/etc/ravel/deploy key.hex",
+            "erase",
+            "submit",
+            "--tenant",
+            "acme corp",
+            "--signal",
+            "logs",
+            "--matcher",
+            "client.ip=198.51.100.7",
+        ])
+        .expect("submit parses");
+        let Command::Erase {
+            command:
+                crate::EraseCommand::Submit {
+                    tenant,
+                    signal,
+                    matchers,
+                    ..
+                },
+        } = &submit.command
+        else {
+            panic!("expected erase submit");
+        };
+        let matchers = matchers
+            .iter()
+            .map(|m| ravel_cli::erase::parse_matcher(m))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("matchers parse");
+
+        let file = ravel_ipcrypt::policy::parse_policy_file(
+            "[[defaults.rules]]\nkey = \"client.ip\"\nvariant = \"deterministic\"\nepoch = 2\n\
+             retired_epochs = [1]\n",
+            ravel_cli::ipcrypt::sanitize_rule_key,
+        )
+        .expect("policy parses");
+        let policy =
+            ravel_cli::ipcrypt::IpcryptPolicy::new(file, Some(&[0x5a; 32])).expect("policy loads");
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        ravel_ipcrypt::marker::check_marker(store.as_ref(), policy.fingerprint())
+            .await
+            .expect("seed marker");
+        let mut out = Vec::new();
+        let report = ravel_cli::erase::submit_with_ipcrypt(
+            store,
+            &policy,
+            tenant,
+            *signal,
+            matchers,
+            Vec::new(),
+            0,
+            0,
+            String::new(),
+            uuid::Uuid::from_u128(1),
+            1_700_000_000_000_000_000,
+            &super::top_level_flags(&submit.store, &submit.tenancy, &|_| false),
+            &mut out,
+            &mut Vec::new(),
+        )
+        .await
+        .expect("submit");
+        assert_eq!(report.requests.len(), 2, "one request per epoch");
+
+        let out = String::from_utf8(out).expect("utf-8");
+        let lines: Vec<&str> = out
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| line.starts_with("ravel-cli "))
+            .collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        for ((plan, _), line) in report.requests.iter().zip(&lines) {
+            assert!(
+                line.contains("--tenant-hash-key-file '/etc/ravel/deploy key.hex' erase status"),
+                "{line}"
+            );
+            let status = Cli::try_parse_from(shell_split(line))
+                .unwrap_or_else(|err| panic!("{line} does not parse: {err}"));
+            let Command::Erase {
+                command:
+                    crate::EraseCommand::Status {
+                        tenant: status_tenant,
+                        signal: status_signal,
+                        request_id,
+                    },
+            } = &status.command
+            else {
+                panic!("{line} is not erase status");
+            };
+            assert_eq!(status_tenant, tenant);
+            assert_eq!(status_signal, signal);
+            assert_eq!(
+                request_id.as_deref(),
+                Some(plan.request_id.to_string().as_str())
+            );
+            assert_eq!(status.store.store, Some(ravel_cli::store::StoreKind::S3));
+            assert_eq!(status.store.s3_endpoint, submit.store.s3_endpoint);
+            assert_eq!(status.store.s3_bucket, submit.store.s3_bucket);
+            assert_eq!(status.store.s3_region, submit.store.s3_region);
+            assert_eq!(
+                status.store.s3_credentials_file,
+                submit.store.s3_credentials_file
+            );
+            assert_eq!(
+                status.tenancy.tenant_hash_key_file,
+                submit.tenancy.tenant_hash_key_file
+            );
+            assert_eq!(
+                status.tenancy.tenant_hash_unkeyed,
+                submit.tenancy.tenant_hash_unkeyed
+            );
+        }
+    }
+
+    /// Inline S3 credentials are never echoed. One given as a flag, its
+    /// environment variable unset, leaves a placeholder where the flags go;
+    /// one the environment supplies needs nothing.
+    #[test]
+    fn top_level_flags_never_echo_credentials() {
+        let cli = Cli::try_parse_from([
+            "ravel-cli",
+            "--store",
+            "s3",
+            "--s3-bucket",
+            "b",
+            "--s3-access-key",
+            "AKIDEXAMPLE",
+            "--s3-secret-key",
+            "wJalrXUtnFEMI",
+            "--s3-session-token",
+            "FwoGZXIvYXdzE",
+            "--tenant-hash-unkeyed",
+            "erase",
+            "status",
+            "--tenant",
+            "t",
+            "--signal",
+            "logs",
+        ])
+        .expect("parses");
+        let from_flags = super::top_level_flags(&cli.store, &cli.tenancy, &|_| false);
+        assert_eq!(
+            from_flags,
+            [
+                "--store",
+                "s3",
+                "--s3-bucket",
+                "b",
+                "<your S3 credential flags>",
+                "--tenant-hash-unkeyed"
+            ]
+        );
+        let from_env = super::top_level_flags(&cli.store, &cli.tenancy, &|_| true);
+        assert_eq!(
+            from_env,
+            ["--store", "s3", "--s3-bucket", "b", "--tenant-hash-unkeyed"]
+        );
+    }
+
     /// Every `ipcrypt` subcommand hashes a tenant: `encrypt`/`decrypt`
     /// derive the key from the tenant hash, and `set-policy`'s fingerprint
     /// keys each tenant table by it, so each needs the scheme installed.
@@ -5482,6 +5777,12 @@ mod tests {
         );
     }
 
+    /// `gc-config set` writes `sys/gc`, a bucket-root object with no tenant
+    /// prefix, so it never reaches the tenant-hashing gate above; it still
+    /// must clear the write gate on its own (the `else if
+    /// command_is_write(&cli.command)` arm in `main`), since the invariant
+    /// is "does the server accept this bucket", not "does this command hash
+    /// a tenant".
     #[tokio::test]
     async fn gc_config_set_refuses_on_marker_less_bucket() {
         use ravel_object_store::ObjectStoreBackend;

@@ -1218,8 +1218,16 @@ the address:
 
 - metric labels are matched by their sanitized name, so a rule written as
   `client.address` covers the `client_address` label;
-- log and span attributes are matched by their raw key, on the resource, on
-  the record or span, and in a loaded attributes map.
+- log and span attributes are matched by their raw key, on the resource and
+  on the record or span. Only spans load an attributes map
+  (`attrs_map_column`), and its entries are matched the same way. The logs
+  `attrs_map_column` is export only, so load never reads a logs map.
+
+IPCrypt encrypts string values only. A logs or spans mapping column
+declared `type = "bytes"` under a key that has a rule is stored
+unencrypted: logs store the bytes as written, and spans store their
+lowercase hex, which never parses as an address. The load prints a warning
+naming the column and the key before any data is written.
 
 A policy with rules needs the deployment key the tenant keys derive from.
 Pass it as the top-level `--tenant-hash-key-file`, before the subcommand:
