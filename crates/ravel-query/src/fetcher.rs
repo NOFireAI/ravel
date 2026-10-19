@@ -1145,6 +1145,12 @@ impl SegmentFetcher {
         self.whole_object_threshold
     }
 
+    /// The read cache's RAM-tier counters ([`ReadCache::ram_metrics`]), or
+    /// `None` when this fetcher reads uncached.
+    pub fn cache_ram_metrics(&self) -> Option<std::sync::Arc<ravel_cache::CacheMetrics>> {
+        self.cache.as_ref().map(ReadCache::ram_metrics)
+    }
+
     /// Sets the in-flight byte-range GET bound by building a new private
     /// limiter. Shared across this fetcher's clones; not shared with any
     /// other fetcher unless [`Self::with_get_limiter`] is used instead.
