@@ -160,7 +160,7 @@ protocol or byte layout, or when you are changing the code.
   start without, and the bucket configuration the durability argument
   assumes.
 - [ingest.md](ingest.md): the ingest pipeline's internal structure and
-  sizing.
+  sizing, including IPCrypt pseudonymization of configured IP attributes.
 - [query-engine.md](query-engine.md): the query engine's internal
   structure, budgets, and the distributed read protocol.
 - [analytics.md](analytics.md): the analytics stage behind
