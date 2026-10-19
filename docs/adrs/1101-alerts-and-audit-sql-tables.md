@@ -243,9 +243,11 @@ ADR-2904 replaces that rule: a statement may name `alerts` or `audit`
 together with other signal tables and Parquet tables, with one snapshot
 resolved per named signal. Access is unchanged: a tenant reads its own
 records, and a join reaches nothing its two sides could not already read
-separately. The HTTP SQL endpoint runs such a statement since issue #2910,
-and Flight SQL since issue #2913, whose version 10 ticket carries one
-segment group per signal (ADR-2904 decision 10).
+separately. The HTTP SQL endpoint runs one naming `alerts` or `audit`
+beside other signal tables since issue #2910, and Flight SQL since issue
+#2913, whose version 10 ticket carries one segment group per signal
+(ADR-2904 decision 10). Both run one naming either beside a Parquet table
+since issue #2914 (ADR-2904 decision 11).
 
 ## Amendment (2026-10-17, issue #2665): `/api/v1/alerts` serves current state
 
