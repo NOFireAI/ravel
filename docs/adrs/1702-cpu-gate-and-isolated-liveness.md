@@ -711,10 +711,10 @@ to no more than the floor.
 - `otlp_http_gzip`: the compressed length times 1032, deflate's maximum
   expansion as zlib's technical notes give it, capped at 64 MiB. Gzip records
   a member's inflated length, modulo 2^32, only in the trailer after that
-  member's deflate data, so there is nothing to trust beforehand. At the
-  default floor a body of 254 compressed bytes or fewer runs inline. (At the
-  write gate's 1 MiB floor, 1016 or fewer: see the write inline floor
-  amendment below.)
+  member's deflate data, so there is nothing to trust beforehand. This is a
+  write gate site, so at its default 1 MiB floor a body of 1016 compressed
+  bytes or fewer runs inline (see the write inline floor amendment below).
+  Before that amendment the floor was 256 KiB and the boundary 254 bytes.
 - `otap_decode`: the sum of the content sizes the payload's zstd frames
   declare, when every frame declares one; the decompression stops one byte
   past that total, so a frame that understates its size cannot inflate past

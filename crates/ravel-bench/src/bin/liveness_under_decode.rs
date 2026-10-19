@@ -55,12 +55,14 @@
 //! `decode_unit_size` (the decode unit is at least its target) and
 //! `queries_failed` (0).
 //!
-//! The server takes the gate's default inline floors (256 KiB, 100,000
-//! samples): `ServerConfig` has no setting for them. The fixture sizes both
-//! gated units the queries produce above those floors: the catalog decode at
-//! the decode unit size (checked by `decode_unit_size`), and the selected
-//! series at 120,000 samples for the PromQL evaluation. Neither runs inline
-//! because of the floor, so `inline_jobs` reads as it would at a floor of 0.
+//! The server takes the read gate's default inline floors (256 KiB, 100,000
+//! samples): `ServerConfig` has no setting for them. Only the write gate's
+//! byte floor is configurable, and this bin runs no write job. The fixture
+//! sizes both gated units the queries produce above those floors: the
+//! catalog decode at the decode unit size (checked by `decode_unit_size`),
+//! and the selected series at 120,000 samples for the PromQL evaluation.
+//! Neither runs inline because of the floor, so `inline_jobs` reads as it
+//! would at a floor of 0.
 //!
 //! Every band prints exactly once with its value. The exit code is 0 when
 //! every band holds, 1 naming the first band missed, and 2 when the run could
