@@ -49,12 +49,14 @@
 //! case and turn anything else into [`Error::WrongType`].
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::Instant;
 
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
 
 use crate::histogram::TimedHistogram;
 use crate::matchers;
+use crate::selector_cache::{CachedSelector, CachedSeries, SelectorCache, SelectorKey};
 use crate::source::{LabelMatcher, MatchOp, SeriesSource, SourceError};
 
 /// Nanoseconds per millisecond.
@@ -523,6 +525,28 @@ const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 pub struct QueryWindow {
     start_ns: i64,
     end_ns: i64,
+    /// The range query's own grid bounds, used only to size a selector-cache
+    /// fetch ([`crate::selector_cache::fetch_window`]). Distinct from
+    /// `start_ns`/`end_ns`, which stay the `@ start()`/`@ end()` anchors; for
+    /// an instant query both equal the evaluation instant.
+    grid_start_ns: i64,
+    grid_end_ns: i64,
+    /// The top-level grid step the current subquery evaluation descends
+    /// from: set by the outermost [`Evaluator::eval_subquery_matrix`] to the
+    /// instant that launched it, and left alone by nested ones, so it stays
+    /// fixed while the inner instants vary. Read only while `inner_grid_pad`
+    /// is `Some`; outside a subquery a selector's ambient instant is itself
+    /// the top-level step. Starts at `grid_start_ns`.
+    t_outer: Cell<i64>,
+    /// Inside a subquery, how far the enclosing subquery grids reach before
+    /// and after the current inner instant, summed over nesting levels;
+    /// `None` outside every subquery. This and `t_outer` are maintained only
+    /// when `selector_cache` is `Some`, the one reader of both.
+    inner_grid_pad: Cell<Option<(i64, i64)>>,
+    /// Per-query selector reads (ADR-3072 decision 1b). `None` for an
+    /// instant query and for [`Self::bare`], whose evaluation reads every
+    /// selector directly.
+    selector_cache: Option<SelectorCache>,
     /// Shared cross-level evaluation-grid-point budget, charged
     /// down by [`Self::charge_budget`] on every subquery-grid evaluation
     /// ([`Evaluator::eval_subquery_matrix`]) regardless of nesting depth or
@@ -553,17 +577,12 @@ impl QueryWindow {
     /// window-resolution helper such as [`crate::functions::range_window`]
     /// directly: the query's `[start_ns, end_ns]` parameters (consulted only to
     /// resolve `@ start()`/`@ end()`), an effectively unbounded evaluation
-    /// budget, no deadline, and an empty annotation sink. Exposed so a
-    /// distributed-pushdown coordinator can assert its independently-derived
-    /// reduction bounds against the evaluator's own `range_window`.
+    /// budget, no deadline, an empty annotation sink, and no selector cache.
+    /// Exposed so a distributed-pushdown coordinator can assert its
+    /// independently-derived reduction bounds against the evaluator's own
+    /// `range_window`.
     pub fn bare(start_ns: i64, end_ns: i64) -> Self {
-        QueryWindow {
-            start_ns,
-            end_ns,
-            budget: Cell::new(u64::MAX),
-            deadline: None,
-            annotations: RefCell::new(Annotations::default()),
-        }
+        QueryWindow::new(start_ns, end_ns, u64::MAX, None, None)
     }
 
     /// Test-only bare context: instant window at time zero, effectively
@@ -572,13 +591,86 @@ impl QueryWindow {
     /// going through [`Evaluator::eval_instant`]/[`Evaluator::eval_range`].
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
+        QueryWindow::new(0, 0, u64::MAX, None, None)
+    }
+
+    /// A context whose `@ start()`/`@ end()` anchors and grid bounds are both
+    /// `[start_ns, end_ns]`, with `t_outer` at the grid start and no
+    /// enclosing subquery.
+    fn new(
+        start_ns: i64,
+        end_ns: i64,
+        budget: u64,
+        deadline: Option<Instant>,
+        selector_cache: Option<SelectorCache>,
+    ) -> Self {
         QueryWindow {
-            start_ns: 0,
-            end_ns: 0,
-            budget: Cell::new(u64::MAX),
-            deadline: None,
+            start_ns,
+            end_ns,
+            grid_start_ns: start_ns,
+            grid_end_ns: end_ns,
+            t_outer: Cell::new(start_ns),
+            inner_grid_pad: Cell::new(None),
+            selector_cache,
+            budget: Cell::new(budget),
+            deadline,
             annotations: RefCell::new(Annotations::default()),
         }
+    }
+
+    /// The selector cache's read counts for this query, or `None` when the
+    /// query ran without one.
+    #[cfg(test)]
+    pub(crate) fn selector_cache_stats(&self) -> Option<crate::selector_cache::SelectorCacheStats> {
+        self.selector_cache.as_ref().map(SelectorCache::stats)
+    }
+
+    /// The series one selector read returns inside `request`. With a
+    /// selector cache, a cached read whose window covers `request` answers
+    /// it; otherwise `fetch` runs over [`crate::selector_cache::fetch_window`]
+    /// and its result replaces the entry. Without a cache, `fetch` runs over
+    /// `request` itself. Either way the caller slices the result to
+    /// `request` with [`CachedSelector::slices`].
+    fn selector_read<S: CachedSeries>(
+        &self,
+        matchers: &[LabelMatcher],
+        vs: &promql_parser::parser::VectorSelector,
+        request: TimeRange,
+        eval_ts_ns: i64,
+        fetch: impl FnOnce(TimeRange) -> Result<Vec<S>, SourceError>,
+    ) -> Result<Rc<CachedSelector<S>>, Error> {
+        let Some(cache) = &self.selector_cache else {
+            return Ok(Rc::new(CachedSelector {
+                window: request,
+                series: fetch(request)?,
+            }));
+        };
+        let key = SelectorKey::new(
+            matchers,
+            S::CHANNEL,
+            signed_offset_ns(vs.offset.as_ref())?,
+            resolve_at(vs.at.as_ref(), self.start_ns, self.end_ns)?,
+        );
+        if let Some(cached) = cache.lookup::<S>(&key, request) {
+            return Ok(cached);
+        }
+        let (t_outer, inner_pad) = match self.inner_grid_pad.get() {
+            Some(pad) => (self.t_outer.get(), pad),
+            None => (eval_ts_ns, (0, 0)),
+        };
+        let window = crate::selector_cache::fetch_window(
+            request,
+            self.grid_start_ns,
+            self.grid_end_ns,
+            t_outer,
+            inner_pad,
+        );
+        let cached = Rc::new(CachedSelector {
+            window,
+            series: fetch(window)?,
+        });
+        cache.insert(key, Rc::clone(&cached));
+        Ok(cached)
     }
 
     /// Record an evaluation warning (see [`Annotations`]).
@@ -629,6 +721,10 @@ pub struct Evaluator {
     default_step_ns: i64,
     max_total_eval_points: u64,
     deadline: Option<Instant>,
+    /// Whether a range query reads its selectors through a per-query
+    /// [`SelectorCache`]. Always on outside tests; the cache-free mode is the
+    /// reference the cached evaluation is compared against.
+    selector_cache: bool,
 }
 
 impl Default for Evaluator {
@@ -639,6 +735,7 @@ impl Default for Evaluator {
             default_step_ns: DEFAULT_SUBQUERY_STEP_NS,
             max_total_eval_points: DEFAULT_MAX_TOTAL_EVAL_POINTS,
             deadline: None,
+            selector_cache: true,
         }
     }
 }
@@ -646,6 +743,14 @@ impl Default for Evaluator {
 impl Evaluator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test-only: evaluate range queries reading every selector directly at
+    /// every step, as before the selector cache existed.
+    #[cfg(test)]
+    pub(crate) fn without_selector_cache(mut self) -> Self {
+        self.selector_cache = false;
+        self
     }
 
     /// Override the default 5-minute lookback.
@@ -734,13 +839,7 @@ impl Evaluator {
     ) -> Result<(Value, Annotations), Error> {
         let expr = crate::complexity_guard::parse_guarded(query)?;
         let t_ns = ms_to_ns(t_ms)?;
-        let ctx = QueryWindow {
-            start_ns: t_ns,
-            end_ns: t_ns,
-            budget: Cell::new(self.max_total_eval_points),
-            deadline: self.deadline,
-            annotations: RefCell::new(Annotations::default()),
-        };
+        let ctx = QueryWindow::new(t_ns, t_ns, self.max_total_eval_points, self.deadline, None);
         let value = self.eval_expr(source, &expr, t_ns, &ctx)?;
         Ok((value, ctx.annotations.into_inner()))
     }
@@ -819,6 +918,20 @@ impl Evaluator {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<(RangeValue, Annotations), Error> {
+        let (value, ctx) = self.eval_range_in_window(source, query, start_ms, end_ms, step_ms)?;
+        Ok((value, ctx.annotations.into_inner()))
+    }
+
+    /// [`Self::eval_range_hist_annotated`]'s body, returning the whole query
+    /// context so a test can read the selector cache's counts as well.
+    fn eval_range_in_window(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> Result<(RangeValue, QueryWindow), Error> {
         if step_ms <= 0 {
             return Err(Error::NonPositiveStep { step_ms });
         }
@@ -843,23 +956,20 @@ impl Evaluator {
         }
 
         let expr = crate::complexity_guard::parse_guarded(query)?;
-        let ctx = QueryWindow {
+        let ctx = QueryWindow::new(
             start_ns,
             end_ns,
-            budget: Cell::new(self.max_total_eval_points),
-            deadline: self.deadline,
-            annotations: RefCell::new(Annotations::default()),
-        };
+            self.max_total_eval_points,
+            self.deadline,
+            self.selector_cache.then(SelectorCache::default),
+        );
 
-        // The supported grammar (paren, unary minus, literals, one
-        // selector) can contain at most one selector, so unlike a general
-        // multi-selector tree there is no risk of re-querying storage once
-        // per node: the grid below still issues exactly one `source.query`
-        // call for the whole range, same as before this phase. A future
-        // phase that adds binary/call/aggregate expressions (and therefore
-        // multiple selectors, or the same selector's value needed at
-        // multiple sub-evaluations) is the point at which per-selector
-        // cursoring (ADR-0021 §1) becomes necessary; it is not needed yet.
+        // The `Selector` arm, and a range function over a matrix selector,
+        // read storage once for the whole grid themselves. Every other shape
+        // evaluates per step through `eval_expr`, whose selector helpers read
+        // through `ctx`'s selector cache: a selector is read on its first
+        // step and again only when a later step asks for a window outside
+        // that read, not once per step (ADR-3072 decision 1b).
         let (core, negate) = resolve_range_core(&expr)?;
         let value = match core {
             RangeCore::Scalar(v) => RangeValue::Scalar(if negate { -v } else { v }),
@@ -890,7 +1000,7 @@ impl Evaluator {
                 RangeValue::Matrix(matrix)
             }
         };
-        Ok((value, ctx.annotations.into_inner()))
+        Ok((value, ctx))
     }
 
     /// Evaluate `query` as a range matrix over `start_ms..=end_ms` stepping
@@ -1000,14 +1110,16 @@ impl Evaluator {
             end_ns: sel_ts_ns,
         };
 
-        let series = source.query(&selector_matchers, window)?;
-        let mut out = Vec::with_capacity(series.len());
-        for s in series {
+        let series = ctx.selector_read(&selector_matchers, vs, window, eval_ts_ns, |w| {
+            source.query(&selector_matchers, w)
+        })?;
+        let mut out = Vec::with_capacity(series.series.len());
+        for (labels, samples) in series.slices(window) {
             if let Some((value, orig_sample_ts_ns)) =
-                pick_sample(&s.samples, sel_ts_ns, self.lookback_delta_ns)
+                pick_sample(samples, sel_ts_ns, self.lookback_delta_ns)
             {
                 out.push(InstantSample::scalar(
-                    s.labels,
+                    labels.clone(),
                     eval_ts_ns,
                     orig_sample_ts_ns,
                     value,
@@ -1019,13 +1131,15 @@ impl Evaluator {
         // is either float or histogram in storage, so these never collide with
         // the float results above; the lookback pick is the same left-open
         // `(sel_ts - lookback, sel_ts]` rule.
-        let hist_series = source.query_histograms(&selector_matchers, window)?;
-        for s in hist_series {
+        let hist_series = ctx.selector_read(&selector_matchers, vs, window, eval_ts_ns, |w| {
+            source.query_histograms(&selector_matchers, w)
+        })?;
+        for (labels, samples) in hist_series.slices(window) {
             if let Some((value, orig_sample_ts_ns)) =
-                pick_histogram(&s.samples, sel_ts_ns, self.lookback_delta_ns)
+                pick_histogram(samples, sel_ts_ns, self.lookback_delta_ns)
             {
                 out.push(InstantSample::histogram(
-                    s.labels,
+                    labels.clone(),
                     eval_ts_ns,
                     orig_sample_ts_ns,
                     value,
@@ -1057,22 +1171,23 @@ impl Evaluator {
             end_ns: sel_ts_ns,
         };
 
-        let series = source.query(&selector_matchers, window)?;
-        let mut out = Vec::with_capacity(series.len());
-        for s in series {
+        let series = ctx.selector_read(&selector_matchers, &ms.vs, window, eval_ts_ns, |w| {
+            source.query(&selector_matchers, w)
+        })?;
+        let mut out = Vec::with_capacity(series.series.len());
+        for (labels, samples) in series.slices(window) {
             // The window fetched from storage is inclusive on both ends
             // (`TimeRange`'s own contract); a matrix selector's window is
             // left-open like the instant lookback window, so the exclusive
             // lower bound is enforced here.
-            let samples: Vec<Sample> = s
-                .samples
+            let samples: Vec<Sample> = samples
                 .iter()
                 .filter(|sample| sample.ts_ns > window_start)
                 .filter(|sample| sample.value.to_bits() != STALE_NAN_BITS)
                 .copied()
                 .collect();
             if !samples.is_empty() {
-                out.push((s.labels, samples));
+                out.push((labels.clone(), samples));
             }
         }
         Ok(out)
@@ -1099,10 +1214,10 @@ impl Evaluator {
     /// another subquery re-derives this same check at every enclosing grid
     /// step, so an inner grid that is itself over budget is rejected on the
     /// very first attempt to build it rather than after the outer grid has
-    /// multiplied it out (no cross-step caching beyond cursors, so this
-    /// check, like every other
-    /// part of subquery evaluation, is deliberately redone from scratch at
-    /// each enclosing step rather than memoized).
+    /// multiplied it out (this check, like every other part of subquery
+    /// evaluation, is deliberately redone from scratch at each enclosing
+    /// step rather than memoized; in a range query, only the selector reads
+    /// underneath are shared across steps, through its selector cache).
     pub(crate) fn eval_subquery_matrix(
         &self,
         source: &dyn SeriesSource,
@@ -1137,9 +1252,28 @@ impl Evaluator {
         }
         ctx.charge_budget(points, self.max_total_eval_points)?;
 
+        // Selector-cache translation state for the inner evaluations: the
+        // outermost subquery records the top-level step that launched it, and
+        // every level adds its own grid's reach around the current inner
+        // instant, restored once the inner evaluation returns. Without a
+        // cache nothing reads this state, and none is kept.
+        let track = ctx.selector_cache.is_some();
+        let enclosing_pad = ctx.inner_grid_pad.get();
+        if track && enclosing_pad.is_none() {
+            ctx.t_outer.set(eval_ts_ns);
+        }
+        let (pad_before, pad_after) = enclosing_pad.unwrap_or((0, 0));
         let matrix = crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
-            let value = self.eval_expr(source, &sq.expr, t, ctx)?;
+            if track {
+                ctx.inner_grid_pad.set(Some((
+                    pad_before.saturating_add(t.saturating_sub(start_ns)),
+                    pad_after.saturating_add(end_ns.saturating_sub(t)),
+                )));
+            }
+            let value = self.eval_expr(source, &sq.expr, t, ctx);
+            ctx.inner_grid_pad.set(enclosing_pad);
+            let value = value?;
             // Native-histogram series inside a subquery window are not yet
             // supported. The subquery grid reducer keeps only the float value
             // of each instant sample below (`hist_matrix_into_float`), so any
@@ -1188,20 +1322,21 @@ impl Evaluator {
             end_ns: sel_ts_ns,
         };
 
-        let series = source.query_histograms(&selector_matchers, window)?;
-        let mut out = Vec::with_capacity(series.len());
-        for s in series {
-            let samples: Vec<crate::histogram::TimedHistogram> = s
-                .samples
-                .into_iter()
+        let series = ctx.selector_read(&selector_matchers, &ms.vs, window, eval_ts_ns, |w| {
+            source.query_histograms(&selector_matchers, w)
+        })?;
+        let mut out = Vec::with_capacity(series.series.len());
+        for (labels, samples) in series.slices(window) {
+            let samples: Vec<crate::histogram::TimedHistogram> = samples
+                .iter()
                 .filter(|sample| sample.ts_ns > window_start)
-                .map(|sample| (sample.ts_ns, sample.value))
+                .map(|sample| (sample.ts_ns, sample.value.clone()))
                 .collect();
             if !samples.is_empty() {
                 let labels = if keep_metric_name {
-                    s.labels
+                    labels.clone()
                 } else {
-                    drop_metric_name(s.labels)
+                    drop_metric_name(labels.clone())
                 };
                 out.push((labels, samples));
             }
@@ -1478,18 +1613,17 @@ impl Evaluator {
 }
 
 /// A range query's top-level construct, after stripping any enclosing
-/// `Paren`/`Unary` wrappers (the grammar allows at most one selector, so
-/// this identifies it directly rather than routing through the general
-/// per-instant `eval_expr`, which would re-query storage once per grid
-/// step).
+/// `Paren`/`Unary` wrappers, so a single selector or call is evaluated over
+/// the whole grid directly rather than through the general per-instant
+/// `eval_expr`.
 enum RangeCore<'a> {
     Scalar(f64),
     Str(&'a str),
     Selector(&'a promql_parser::parser::VectorSelector),
     Call(&'a promql_parser::parser::Call),
-    /// A binary expression: re-evaluated per grid step through the general
-    /// `eval_expr` (not a single selector, so unlike the other arms it
-    /// cannot be range-fetched in one storage call). Holds the outermost
+    /// A binary or aggregate expression: re-evaluated per grid step through
+    /// the general `eval_expr`, whose selector helpers answer each step from
+    /// the query's selector cache rather than reading storage again. Holds the outermost
     /// `expr` passed to `resolve_range_core`, not the `Paren`/`Unary`-
     /// peeled `cur`, so any enclosing negation or parens are re-applied by
     /// `eval_expr` itself at each step rather than needing a second
@@ -3341,13 +3475,13 @@ mod tests {
         let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
             panic!("expected matrix selector");
         };
-        let ctx = QueryWindow {
-            start_ns: sel_ts_ns,
-            end_ns: sel_ts_ns,
-            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
-            deadline: None,
-            annotations: RefCell::new(Annotations::default()),
-        };
+        let ctx = QueryWindow::new(
+            sel_ts_ns,
+            sel_ts_ns,
+            DEFAULT_MAX_TOTAL_EVAL_POINTS,
+            None,
+            None,
+        );
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
             .expect("evaluates");
@@ -3375,13 +3509,13 @@ mod tests {
         let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
             panic!("expected matrix selector");
         };
-        let ctx = QueryWindow {
-            start_ns: sel_ts_ns,
-            end_ns: sel_ts_ns,
-            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
-            deadline: None,
-            annotations: RefCell::new(Annotations::default()),
-        };
+        let ctx = QueryWindow::new(
+            sel_ts_ns,
+            sel_ts_ns,
+            DEFAULT_MAX_TOTAL_EVAL_POINTS,
+            None,
+            None,
+        );
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
             .expect("evaluates");
@@ -3417,6 +3551,7 @@ mod tests {
     struct CountingSource {
         inner: TestSource,
         queries: std::sync::atomic::AtomicUsize,
+        histogram_queries: std::sync::atomic::AtomicUsize,
     }
 
     impl CountingSource {
@@ -3424,11 +3559,17 @@ mod tests {
             CountingSource {
                 inner,
                 queries: std::sync::atomic::AtomicUsize::new(0),
+                histogram_queries: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
         fn query_count(&self) -> usize {
             self.queries.load(std::sync::atomic::Ordering::Relaxed)
+        }
+
+        fn histogram_query_count(&self) -> usize {
+            self.histogram_queries
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -3441,6 +3582,16 @@ mod tests {
             self.queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.query(matchers, window)
+        }
+
+        fn query_histograms(
+            &self,
+            matchers: &[LabelMatcher],
+            window: TimeRange,
+        ) -> Result<Vec<crate::source::HistogramSeriesData>, SourceError> {
+            self.histogram_queries
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.query_histograms(matchers, window)
         }
     }
 
@@ -3597,48 +3748,43 @@ mod tests {
     }
 
     #[test]
-    fn repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget() {
+    fn repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget_after_one_selector_read()
+    {
         // A range query over `max_over_time(up[5m:1m])` re-evaluates the
         // inner `up[5m:1m]` subquery from scratch at every one of its 6
         // outer grid steps: each step's own inner grid is only
-        // 5 points (one `source.query` call apiece, since the inner
-        // expression is the bare selector `up`), far under any per-node
-        // `max_range_points` cap, so `TooManyPoints` never fires no matter
-        // how many outer steps run. Left uncapped, the full query would
-        // touch 6 * 5 = 30 evaluation points and issue 30 storage queries.
-        // The shared cross-level budget must still catch the multiplied
-        // cost: with a budget of 10, exactly the first two outer steps'
-        // worth of points (10) are charged before the third step's charge
-        // (which would bring the running total to 15) is rejected.
-        let source = one_series_source();
-        let err = Evaluator::new()
-            .with_max_total_eval_points(10)
-            .range(
-                &source,
-                "max_over_time(up[5m:1m])",
-                minutes(5),
-                minutes(10),
-                minutes(1),
-            )
-            .expect_err("shared cross-level budget must be exhausted");
-        let Error::EvalBudgetExhausted { touched, max } = err else {
-            panic!("expected EvalBudgetExhausted, got {err:?}");
-        };
-        assert_eq!(max, 10);
-        assert_eq!(touched, 15);
-        assert_eq!(
-            source.query_count(),
-            10,
-            "only the first two outer steps' worth of points may reach storage \
-             before the shared budget rejects the third"
-        );
-        assert!(
-            source.query_count() < 30,
-            "rejection must happen well before the outer grid's full 30-point \
-             cost (6 outer steps * 5 inner points each) is reached; got {} \
-             storage queries",
-            source.query_count()
-        );
+        // 5 points, far under any per-node `max_range_points` cap, so
+        // `TooManyPoints` never fires no matter how many outer steps run.
+        // Left uncapped, the full query would touch 6 * 5 = 30 evaluation
+        // points. The shared cross-level budget must still catch the
+        // multiplied cost: with a budget of 10, exactly the first two outer
+        // steps' worth of points (10) are charged before the third step's
+        // charge (which would bring the running total to 15) is rejected.
+        // The budget counts evaluation points, not storage reads: the
+        // selector cache reads `up` once for the whole query (one read per
+        // inner point, 10, without it), and the rejection is the same.
+        let query = "max_over_time(up[5m:1m])";
+        for (evaluator, reads) in [
+            (Evaluator::new(), 1),
+            (Evaluator::new().without_selector_cache(), 10),
+        ] {
+            let source = one_series_source();
+            let err = evaluator
+                .with_max_total_eval_points(10)
+                .range(&source, query, minutes(5), minutes(10), minutes(1))
+                .expect_err("shared cross-level budget must be exhausted");
+            let Error::EvalBudgetExhausted { touched, max } = err else {
+                panic!("expected EvalBudgetExhausted, got {err:?}");
+            };
+            assert_eq!(max, 10);
+            assert_eq!(touched, 15);
+            assert_eq!(
+                source.query_count(),
+                reads,
+                "the first two outer steps' inner points read `up` before the \
+                 shared budget rejects the third"
+            );
+        }
     }
 
     #[test]
@@ -3648,10 +3794,7 @@ mod tests {
         // scratch at every outer step: ~1,000,000 total evaluation points,
         // comfortably under both the per-node `max_range_points` cap and the
         // shared `max_total_eval_points` budget, so without a deadline this
-        // runs to completion, issuing one storage query per inner grid point
-        // (the same one-query-per-inner-point accounting
-        // `repeated_nested_subquery_reevaluation_is_rejected_by_shared_budget`
-        // pins at 30 queries for its 6x5 grid).
+        // runs to completion.
         //
         // `check_deadline` runs at the top of both the outer and the inner
         // grid step, so with a deadline that is already in the past the
@@ -3659,7 +3802,8 @@ mod tests {
         // rules out is an evaluator whose only deadline check is an outer
         // wrapper: it would still return `DeadlineExceeded`, but only after
         // running the full ~1,000,000-point computation, so `query_count`
-        // would read 1,000,000 rather than 0.
+        // would read at least 1 (the selector cache's first read) rather
+        // than 0.
         //
         // The measure is work done, counted exactly, not wall clock. This
         // test used to set a 20 ms deadline and assert `elapsed < 500 ms`
@@ -3687,6 +3831,451 @@ mod tests {
              any storage query, not after the full 1,000,000-point \
              computation with only an outer wrapper reporting the timeout"
         );
+    }
+
+    fn minute_ns(m: i64) -> i64 {
+        m * 60 * 1_000_000_000
+    }
+
+    /// Evaluate a range query and return its result, annotations and the
+    /// selector cache's read counts (`None` when the cache is off).
+    fn range_with_cache_stats(
+        evaluator: Evaluator,
+        source: &dyn SeriesSource,
+        query: &str,
+        (start_ms, end_ms, step_ms): (i64, i64, i64),
+    ) -> (
+        Result<(RangeValue, Annotations), Error>,
+        Option<crate::selector_cache::SelectorCacheStats>,
+    ) {
+        match evaluator.eval_range_in_window(source, query, start_ms, end_ms, step_ms) {
+            Ok((value, ctx)) => {
+                let stats = ctx.selector_cache_stats();
+                (Ok((value, ctx.annotations.into_inner())), stats)
+            }
+            Err(e) => (Err(e), None),
+        }
+    }
+
+    /// A 26-hour source, one sample per minute: float `m{a="x"}`,
+    /// `m{a="y"}` and `up`, and a native-histogram `hm{a="h"}`.
+    fn day_source() -> CountingSource {
+        let minutes_of_data = 26 * 60;
+        let mut source = TestSource::new();
+        for a in ["x", "y"] {
+            let samples: Vec<(i64, f64)> = (0..=minutes_of_data)
+                .map(|k| (minute_ns(k), k as f64))
+                .collect();
+            source = source
+                .with_series(&[("__name__", "m"), ("a", a)], &samples)
+                .expect("valid series");
+        }
+        let up: Vec<(i64, f64)> = (0..=minutes_of_data).map(|k| (minute_ns(k), 1.0)).collect();
+        source = source
+            .with_series(&[("__name__", "up")], &up)
+            .expect("valid series");
+        let hist: Vec<(i64, crate::histogram::FloatHistogram)> = (0..=minutes_of_data)
+            .map(|k| (minute_ns(k), nh(k as f64, 2.0 * k as f64)))
+            .collect();
+        source = source
+            .with_histogram_series(&[("__name__", "hm"), ("a", "h")], &hist)
+            .expect("valid histogram series");
+        CountingSource::new(source)
+    }
+
+    /// 1h to 25h at a 60 s step: 1441 grid steps.
+    const DAY_GRID: (i64, i64, i64) = (60 * 60_000, 25 * 60 * 60_000, 60_000);
+
+    #[test]
+    fn generic_range_fetches_each_selector_once_over_the_grid() {
+        // (query, float reads, histogram reads): one read per channel per
+        // distinct selector, whatever its offset or `@`.
+        let cases = [
+            ("sum by (a) (rate(m[5m]))", 1, 1),
+            ("sum by (a) (rate(hm[5m]))", 1, 1),
+            ("up + up offset 5m", 2, 2),
+            ("sum(m @ start())", 1, 1),
+            ("sum(m offset -1h)", 1, 1),
+            ("sum(m) - sum(m offset 1d)", 2, 2),
+        ];
+        for (query, float_reads, histogram_reads) in cases {
+            let source = day_source();
+            let (cached, stats) =
+                range_with_cache_stats(Evaluator::new(), &source, query, DAY_GRID);
+            let cached = cached.expect("query evaluates");
+            assert_eq!(source.query_count(), float_reads, "{query}: float reads");
+            assert_eq!(
+                source.histogram_query_count(),
+                histogram_reads,
+                "{query}: histogram reads"
+            );
+            let stats = stats.expect("a range query runs with the selector cache");
+            assert_eq!(
+                stats.fetches,
+                (float_reads + histogram_reads) as u64,
+                "{query}"
+            );
+            assert_eq!(stats.refetches, 0, "{query}: no entry is read twice");
+
+            // The same query without the cache reads every selector at every
+            // one of the 1441 steps, and returns the same answer.
+            let reference_source = day_source();
+            let (reference, _) = range_with_cache_stats(
+                Evaluator::new().without_selector_cache(),
+                &reference_source,
+                query,
+                DAY_GRID,
+            );
+            let reference = reference.expect("query evaluates");
+            assert_eq!(
+                reference_source.query_count(),
+                1441 * float_reads,
+                "{query}"
+            );
+            assert_eq!(
+                range_result_bits(&Ok(cached)),
+                range_result_bits(&Ok(reference)),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn selector_cache_rereads_once_when_a_wider_window_shares_the_key() {
+        // `m[5m]` is read first, over the 5m-padded grid; `m[1h]` shares its
+        // key (same matchers, no shift) and asks for an hour before the first
+        // step, outside that entry, so it is read once more, over the wider
+        // window, and every later step of both is answered from it.
+        let source = day_source();
+        let query = "sum(rate(m[5m])) / sum(rate(m[1h]))";
+        let (result, stats) = range_with_cache_stats(Evaluator::new(), &source, query, DAY_GRID);
+        result.expect("query evaluates");
+        assert_eq!(source.query_count(), 2);
+        assert_eq!(source.histogram_query_count(), 2);
+        let stats = stats.expect("a range query runs with the selector cache");
+        assert_eq!(stats.fetches, 4);
+        assert_eq!(stats.refetches, 2, "one reread per channel");
+    }
+
+    #[test]
+    fn negative_offset_subquery_fetches_at_most_twice_per_selector() {
+        // ADR-3072 decision 1b band: at most 2 reads per selector and channel
+        // for a negatively offset subquery over the 24 h grid, whose inner
+        // grid runs past the range query's end; a plain subquery reads once.
+        // Both measure 1 here, because the fetch window also spans the whole
+        // inner grid around the inner instant that missed.
+        let cases = [
+            ("max_over_time(m[1h:1m] offset -1h)", 1),
+            ("sum(max_over_time(m[1h:1m] offset -1h))", 1),
+            ("max_over_time(m[1h:1m])", 1),
+            ("sum(max_over_time(m[1h:1m]))", 1),
+        ];
+        for (query, reads) in cases {
+            let source = day_source();
+            let (result, stats) =
+                range_with_cache_stats(Evaluator::new(), &source, query, DAY_GRID);
+            let (value, _) = result.expect("query evaluates");
+            let RangeValue::Matrix(matrix) = value else {
+                panic!("{query}: expected a matrix");
+            };
+            assert!(!matrix.is_empty(), "{query}: the subquery saw samples");
+            assert_eq!(source.query_count(), reads, "{query}: float reads");
+            assert_eq!(
+                source.histogram_query_count(),
+                reads,
+                "{query}: histogram reads"
+            );
+            assert!(source.query_count() <= 2 && source.histogram_query_count() <= 2);
+            let stats = stats.expect("a range query runs with the selector cache");
+            assert_eq!(stats.refetches, 0, "{query}");
+        }
+    }
+
+    #[test]
+    fn at_start_inside_a_subquery_resolves_against_the_range_query_start() {
+        // `g` is a gauge whose value is its own minute index. Inside the
+        // subquery, `@ start()` and `@ end()` must keep resolving to the
+        // range query's own start (120 min) and end (240 min) at every outer
+        // step, not to the inner grid, `t_outer` or the cache's grid bounds.
+        let samples: Vec<(i64, f64)> = (0..=300).map(|k| (minute_ns(k), k as f64)).collect();
+        let grid = (minutes(120), minutes(240), minutes(1));
+        for (query, expected) in [
+            ("max_over_time((g @ start())[1h:1m])", 120.0),
+            ("sum(max_over_time((g @ start())[1h:1m]))", 120.0),
+            ("sum(max_over_time((g @ end())[1h:1m]))", 240.0),
+            ("sum(max_over_time((g @ start())[1h:1m] offset -1h))", 120.0),
+        ] {
+            for evaluator in [Evaluator::new(), Evaluator::new().without_selector_cache()] {
+                let source = TestSource::new()
+                    .with_series(&[("__name__", "g")], &samples)
+                    .expect("valid series");
+                let (result, _) = range_with_cache_stats(evaluator, &source, query, grid);
+                let (value, _) = result.expect("query evaluates");
+                let RangeValue::Matrix(matrix) = value else {
+                    panic!("{query}: expected a matrix");
+                };
+                assert_eq!(matrix.len(), 1, "{query}");
+                let values: Vec<(i64, u64)> = matrix[0]
+                    .1
+                    .iter()
+                    .map(|s| (s.ts_ns, s.value.to_bits()))
+                    .collect();
+                let want: Vec<(i64, u64)> = (120..=240)
+                    .map(|m| (minute_ns(m), f64::to_bits(expected)))
+                    .collect();
+                assert_eq!(values, want, "{query}");
+            }
+        }
+    }
+
+    #[test]
+    fn generic_range_over_a_stale_marker_is_absent_until_the_next_sample() {
+        // The difftest corpus's `diff_stale` shape: 5 at +0s, a stale marker
+        // at +30s, 6 at +60s. `sum` has nothing to aggregate at the +30s and
+        // +45s steps, whose latest sample is the marker.
+        let s = 1_000_000_000_i64;
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "diff_stale")],
+                &[
+                    (0, 5.0),
+                    (30 * s, f64::from_bits(STALE_NAN_BITS)),
+                    (60 * s, 6.0),
+                ],
+            )
+            .expect("valid series");
+        let (result, _) = range_with_cache_stats(
+            Evaluator::new(),
+            &source,
+            "sum(diff_stale)",
+            (0, 120_000, 15_000),
+        );
+        let (value, _) = result.expect("query evaluates");
+        let RangeValue::Matrix(matrix) = value else {
+            panic!("expected a matrix");
+        };
+        assert_eq!(matrix.len(), 1);
+        let got: Vec<(i64, f64)> = matrix[0].1.iter().map(|e| (e.ts_ns / s, e.value)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 5.0),
+                (15, 5.0),
+                (60, 6.0),
+                (75, 6.0),
+                (90, 6.0),
+                (105, 6.0),
+                (120, 6.0)
+            ]
+        );
+    }
+
+    /// Every element of a range result rendered bit-exactly: float values and
+    /// histogram fields by `to_bits`, labels and series in result order.
+    fn range_result_bits(result: &Result<(RangeValue, Annotations), Error>) -> String {
+        use std::fmt::Write as _;
+        let (value, annotations) = match result {
+            Ok(ok) => ok,
+            Err(e) => return format!("error: {e}"),
+        };
+        let mut out = format!(
+            "warnings {:?}\ninfos {:?}\n",
+            annotations.warnings(),
+            annotations.infos()
+        );
+        let bits = |xs: &[f64]| xs.iter().map(|x| x.to_bits()).collect::<Vec<u64>>();
+        match value {
+            RangeValue::Scalar(x) => {
+                let _ = writeln!(out, "scalar {:#x}", x.to_bits());
+            }
+            RangeValue::String(s) => {
+                let _ = writeln!(out, "string {s:?}");
+            }
+            RangeValue::Matrix(matrix) => {
+                for (labels, samples) in matrix {
+                    let _ = writeln!(out, "{labels:?}");
+                    for s in samples {
+                        let _ = write!(out, "  {} {:#x}", s.ts_ns, s.value.to_bits());
+                        if let Some(h) = &s.histogram {
+                            let _ = write!(
+                                out,
+                                " h {:?} {} {:#x} {:#x} {:#x} {:#x} {:?} {:?} {:?} {:?} {:?}",
+                                h.counter_reset_hint,
+                                h.scale,
+                                h.zero_threshold.to_bits(),
+                                h.zero_count.to_bits(),
+                                h.count.to_bits(),
+                                h.sum.to_bits(),
+                                h.positive_spans,
+                                h.negative_spans,
+                                bits(&h.positive_buckets),
+                                bits(&h.negative_buckets),
+                                bits(&h.custom_values),
+                            );
+                        }
+                        out.push('\n');
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Float and native-histogram series covering 0 to 7 h with uneven
+    /// spacing, stale markers inside lookback and matrix windows, runs of
+    /// equal timestamps, a counter reset, and NaN payloads and -0.0 that only
+    /// a bitwise comparison tells apart.
+    fn cache_corpus_source() -> TestSource {
+        let s = 1_000_000_000_i64;
+        let end = 7 * 60 * 60 * s;
+        let stale = f64::from_bits(STALE_NAN_BITS);
+        let mut x1 = Vec::new();
+        let mut ts = 0;
+        let mut k = 0_i64;
+        while ts <= end {
+            // A counter that resets once.
+            let v = if k < 400 { 3 * k } else { k - 400 };
+            x1.push((ts, v as f64));
+            ts += 30 * s;
+            k += 1;
+        }
+        let x2: Vec<(i64, f64)> = (0..)
+            .map(|k: i64| (7 * s + k * 45 * s, (k % 13) as f64 - 6.0))
+            .take_while(|(ts, _)| *ts <= end)
+            .collect();
+        // Stale markers: every 25th sample, plus a run where the marker is
+        // the last sample before a 20-minute gap.
+        let y1: Vec<(i64, f64)> = (0..)
+            .map(|k: i64| {
+                let ts = 3 * s + k * 20 * s;
+                (ts, if k % 25 == 24 { stale } else { k as f64 * 0.25 })
+            })
+            .take_while(|(ts, _)| *ts <= end)
+            .filter(|(ts, _)| !(150 * 60 * s..170 * 60 * s).contains(ts))
+            .collect();
+        // Equal timestamps: each minute carries two samples.
+        let y2: Vec<(i64, f64)> = (0..)
+            .flat_map(|k: i64| {
+                let ts = k * 60 * s;
+                [(ts, k as f64), (ts, k as f64 + 0.5)]
+            })
+            .take_while(|(ts, _)| *ts <= end)
+            .collect();
+        let z: Vec<(i64, f64)> = (0..)
+            .map(|k: i64| {
+                let v = match k % 4 {
+                    0 => -0.0,
+                    1 => f64::from_bits(0x7ff8_0000_0000_0001),
+                    2 => 0.0,
+                    _ => k as f64,
+                };
+                (11 * s + k * 90 * s, v)
+            })
+            .take_while(|(ts, _)| *ts <= end)
+            .collect();
+        let h1: Vec<(i64, crate::histogram::FloatHistogram)> = (0..)
+            .map(|k: i64| (k * 60 * s, nh(k as f64, 1.5 * k as f64)))
+            .take_while(|(ts, _)| *ts <= end)
+            .collect();
+        let h2: Vec<(i64, crate::histogram::FloatHistogram)> = (0..)
+            .map(|k: i64| (5 * s + k * 50 * s, nh((k % 40) as f64, k as f64)))
+            .take_while(|(ts, _)| *ts <= end)
+            .collect();
+        TestSource::new()
+            .with_series(&[("__name__", "m"), ("a", "x"), ("b", "1")], &x1)
+            .and_then(|t| t.with_series(&[("__name__", "m"), ("a", "x"), ("b", "2")], &x2))
+            .and_then(|t| t.with_series(&[("__name__", "m"), ("a", "y"), ("b", "1")], &y1))
+            .and_then(|t| t.with_series(&[("__name__", "m"), ("a", "y"), ("b", "2")], &y2))
+            .and_then(|t| t.with_series(&[("__name__", "m"), ("a", "z")], &z))
+            .and_then(|t| t.with_histogram_series(&[("__name__", "h"), ("a", "x")], &h1))
+            .and_then(|t| t.with_histogram_series(&[("__name__", "h"), ("a", "y")], &h2))
+            .expect("valid corpus series")
+    }
+
+    #[test]
+    fn generic_range_results_are_bit_identical_to_per_step_evaluation() {
+        let shapes = [
+            // Aggregates and binary operators over plain selectors.
+            "sum by (a) (rate(m[5m]))",
+            "sum by (a) (m)",
+            "m * 2",
+            "m + m offset 5m",
+            "-sum(m)",
+            "rate(m[5m]) > 0.5",
+            "sum by (a) (count_over_time(m[10m]))",
+            "sum by (a) (last_over_time(m[3m]))",
+            "sum(timestamp(m))",
+            "sum(rate(m[5m])) / sum(rate(m[1h]))",
+            "sum(m) - sum(m offset 1h)",
+            // offset, negative offset, @ start(), @ end().
+            "sum by (a) (m offset 10m)",
+            "sum by (a) (m offset -10m)",
+            "sum by (a) (rate(m[5m] offset -30m))",
+            "sum(m @ start())",
+            "sum by (a) (m @ end())",
+            "sum(rate(m[10m] @ start())) + sum(m)",
+            // Subquery arguments.
+            "sum by (a) (max_over_time(m[30m:1m]))",
+            "sum(max_over_time((m @ start())[30m:1m]))",
+            "sum(max_over_time(m[30m:1m] offset -20m))",
+            "sum(avg_over_time(rate(m[5m])[20m:2m] @ end()))",
+            "sum(max_over_time(max_over_time(m[10m:1m])[20m:2m]))",
+            "sum(max_over_time(m[30m:1m])) - sum(max_over_time(m[30m:1m] offset 1h))",
+            // Native histograms.
+            "sum(h)",
+            "sum by (a) (rate(h[5m]))",
+            "h * 2",
+            "count(h offset -5m)",
+            "sum(h) + sum(h @ start())",
+            "sum(max_over_time(h[30m:1m]))",
+            // The `Call` arm's per-step paths reach the same helpers.
+            "abs(m)",
+            "max_over_time(m[30m:1m])",
+            "histogram_quantile(0.9, h)",
+            "quantile_over_time(scalar(count(m)) / 10, m[5m])",
+            "absent_over_time(m{a=\"none\"}[5m])",
+            "absent(m{a=\"none\"})",
+        ];
+        let s = 1_000_000_000_i64 / NS_PER_MS;
+        let grids = [
+            (minutes(120), minutes(300), minutes(1)),
+            (minutes(120) + 13 * s, minutes(240), 37 * s),
+        ];
+        let source = cache_corpus_source();
+        for query in shapes {
+            for grid in grids {
+                let (cached, stats) =
+                    range_with_cache_stats(Evaluator::new(), &source, query, grid);
+                let (reference, _) = range_with_cache_stats(
+                    Evaluator::new().without_selector_cache(),
+                    &source,
+                    query,
+                    grid,
+                );
+                assert_eq!(
+                    range_result_bits(&cached),
+                    range_result_bits(&reference),
+                    "{query} over {grid:?}"
+                );
+                // Only the histogram subquery refuses; every other shape
+                // returns series, so the comparison above is not between two
+                // empty results.
+                match &cached {
+                    Err(Error::Unsupported { construct })
+                        if query == "sum(max_over_time(h[30m:1m]))" =>
+                    {
+                        assert_eq!(construct, "subquery over native histograms");
+                    }
+                    Ok((RangeValue::Matrix(matrix), _)) if !matrix.is_empty() => {
+                        assert!(
+                            stats.is_some_and(|s| s.fetches > 0),
+                            "{query}: evaluated through the cache"
+                        );
+                    }
+                    other => panic!("{query}: unexpected result {other:?}"),
+                }
+            }
+        }
     }
 
     #[test]

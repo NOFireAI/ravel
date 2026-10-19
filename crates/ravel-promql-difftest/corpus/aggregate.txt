@@ -176,3 +176,64 @@ mode: unordered
 # stays covered at the unit level by aggregate.rs's own
 # topk_nan_members_sort_last test, which uses a NaN/1.0 dataset with no
 # zero-sign ambiguity.
+
+# Range queries whose top level is an aggregate are evaluated once per grid
+# step, with each selector read once per query and sliced per step
+# (ADR-3072 decision 1b, #3078). Each entry below moves a step's window
+# differently relative to the grid: a backward and a forward `offset`,
+# `@ start()` pinning every step to one instant, a subquery argument whose
+# inner grid restarts at every outer step, `@ start()` on a selector inside
+# that subquery (the anchor stays the range query's own start), and a stale
+# marker inside the lookback window. `diff_counter_total` carries one series
+# per `shape`, so each `sum by (shape)` group holds one series and its value
+# is the selected sample itself.
+
+name: agg_range_sum_by_shape_offset
+query: sum by (shape) (diff_counter_total offset 2m)
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: agg_range_sum_by_shape_negative_offset
+query: sum by (shape) (diff_counter_total offset -2m)
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: agg_range_sum_by_shape_at_start
+query: sum by (shape) (diff_counter_total @ start())
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: agg_range_sum_by_shape_max_over_subquery
+query: sum by (shape) (max_over_time(diff_counter_total[5m:1m]))
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+name: agg_range_sum_by_shape_max_over_subquery_of_at_start
+query: sum by (shape) (max_over_time((diff_counter_total @ start())[5m:1m]))
+kind: range
+start: +300s
+end: +900s
+step: 60s
+mode: unordered
+
+# `diff_stale` is 5 at +0s, a stale marker at +30s and 6 at +60s: the series
+# is absent at the +30s and +45s steps and present at every other one.
+name: agg_range_sum_stale_marker_in_lookback
+query: sum(diff_stale)
+kind: range
+start: +0s
+end: +120s
+step: 15s
+mode: unordered

@@ -49,8 +49,11 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      docs/catalog-and-mvcc.md, not by arrival order. max_series/max_samples
      are enforced ONCE over this pooled union -- a query-wide bound, not a
      per-selector budget: the caps guard the coordinator's peak memory for
-     the whole query, so a multi-selector (or federated) query cannot hold
-     N times the cap. Pooling is loss-free: two selectors sharing a series
+     the pooled fetch, so a multi-selector (or federated) query cannot hold
+     N times the cap at fetch time. Evaluating a compound range query then
+     keeps one owned copy of the matched pool per distinct selector key
+     (matchers, channel, `offset`, `@`) for the whole query, bounded per key
+     by the pool and charged to no budget (#3105). Pooling is loss-free: two selectors sharing a series
      id decode byte-identical raw runs (the decode is a pure function of
      segment bytes + series id, with no per-selector window trim), so
      merging them once yields exactly what merging each alone would, and
@@ -3727,7 +3730,7 @@ Run: Ravel only. No Prometheus binary was in the loop, so the states
 below are what Ravel reached and answered, not what Prometheus agreed
 with.
 
-Surface: 132 constructs over 265 corpus entries in 10 corpus files.
+Surface: 132 constructs over 271 corpus entries in 10 corpus files.
 
 | State | Constructs |
 | --- | --- |
@@ -3740,7 +3743,7 @@ Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 
 | Construct | Category | State | Evidence |
 | --- | --- | --- | --- |
-| aggregate expression | ast node | supported | `corpus/aggregate.txt`, 20 entries |
+| aggregate expression | ast node | supported | `corpus/aggregate.txt`, 26 entries |
 | binary expression | ast node | supported | `corpus/binop.txt`, 54 entries |
 | function call | ast node | supported | `corpus/transform.txt`, 59 entries |
 | matrix selector | ast node | supported | `corpus/selectors.txt`, 4 entries |
@@ -3754,7 +3757,7 @@ Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 | @ end() | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | @ start() | modifier | supported | `corpus/selectors.txt`, 1 entry |
 | `bool` | modifier | supported | `corpus/binop.txt`, 10 entries |
-| `by` | modifier | supported | `corpus/aggregate.txt`, 11 entries |
+| `by` | modifier | supported | `corpus/aggregate.txt`, 16 entries |
 | `group_left` | modifier | supported | `corpus/binop.txt`, 2 entries |
 | `group_right` | modifier | supported | `corpus/binop.txt`, 1 entry |
 | `ignoring` | modifier | supported | `corpus/binop.txt`, 1 entry |
@@ -3796,7 +3799,7 @@ Surface: 132 constructs over 265 corpus entries in 10 corpus files.
 | `quantile` | aggregation operator | supported | `corpus/aggregate.txt`, 2 entries |
 | `stddev` | aggregation operator | supported | `corpus/aggregate.txt`, 1 entry |
 | `stdvar` | aggregation operator | supported | `corpus/aggregate.txt`, 1 entry |
-| `sum` | aggregation operator | supported | `corpus/aggregate.txt`, 6 entries |
+| `sum` | aggregation operator | supported | `corpus/aggregate.txt`, 12 entries |
 | `topk` | aggregation operator | supported | `corpus/aggregate.txt`, 2 entries |
 | `abs` | function | supported | `corpus/transform.txt`, 1 entry |
 | `absent` | function | supported | `corpus/transform.txt`, 3 entries |

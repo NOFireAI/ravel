@@ -773,9 +773,8 @@ pub(crate) fn eval_instant_over_grid(
 /// forward-only-cursor discipline. A subquery has no single raw sample
 /// stream to cursor over (each grid step's inner expression is its own
 /// recursive evaluation, per [`Evaluator::eval_subquery_matrix`]), so it is
-/// re-evaluated fully at each outer step instead: exactly the "no cross-step
-/// caching" discipline, generalized to the
-/// two-grids-deep case a subquery nested in a range query produces.
+/// re-evaluated fully at each outer step instead, with only its selector
+/// reads shared across steps through the query's selector cache.
 #[allow(clippy::too_many_arguments)]
 fn eval_matrix_arg_range_reduction(
     evaluator: &Evaluator,
