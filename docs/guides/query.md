@@ -677,10 +677,14 @@ the five per query. The request body, auth, window (`start`/`end`), and
 `min_commit_token` handling are otherwise the same for all five tables.
 
 The same endpoint also serves the Parquet tables of the tenant. A query can
-join Parquet tables with each other but not with any of the five. One of the
-five beside a Parquet table is not supported yet: an HTTP 400 that
-Ravel returns after the Parquet manifest reads that find a name is a live
-Parquet table, and before any signal catalog listing.
+join Parquet tables with each other and with any of the five, over this
+endpoint and Flight SQL. Ravel reads the Parquet manifests first, then one
+snapshot of each of the five the query names, and holds the whole statement
+to one `max_s3_requests` and `max_bytes_scanned`. A `min_commit_token` bounds
+the five only: qualified with a Parquet table's name it is an HTTP 400, and
+on a query that names only Parquet tables any token is a 400 over HTTP and
+`INVALID_ARGUMENT` over Flight SQL. A row window filters the rows of the five
+and leaves the Parquet rows whole.
 
 ### `DISTINCT ON`
 

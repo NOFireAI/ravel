@@ -25,15 +25,16 @@
 //!
 //! - `information_schema` is disabled, so there is no metadata surface to
 //!   enumerate even within a single-tenant session.
-//! - A signal-table session's `RuntimeEnv` carries
+//! - A session with no Parquet table has a `RuntimeEnv` that carries
 //!   [`EmptyObjectStoreRegistry`], which holds no stores and refuses every
 //!   lookup. DataFusion's default registry auto-registers a local filesystem
 //!   store for `file://`; that default is replaced here, so a
 //!   `CREATE EXTERNAL TABLE`/`COPY` that somehow slipped the parse gate has
 //!   nothing to bind to. `RsegScanExec` does its own I/O through
 //!   `SegmentFetcher` and never consults this registry.
-//! - A Parquet session's `RuntimeEnv` carries a [`SingleStoreRegistry`]
-//!   instead (ADR-2040 decision D4). It answers exactly the requesting
+//! - A session with Parquet tables, alone or beside signal tables, has a
+//!   `RuntimeEnv` that carries a [`SingleStoreRegistry`] instead (ADR-2040
+//!   decision D4). It answers exactly the requesting
 //!   tenant's `ravel-pq://<tenant_hash>/` URL, with a store that serves the
 //!   sizes of the files of the manifests this query resolved and refuses every
 //!   read, write and list; every other URL is an error, and `register_store`
@@ -701,18 +702,19 @@ fn signal_table_name(table: &SessionTable) -> Option<&'static str> {
 }
 
 /// Refuse a table set [`build_session_with_tables`] does not build: an empty
-/// set, two entries for one table name, or a Parquet entry beside any other
-/// entry.
+/// set, two entries for one table name, or two Parquet entries (one entry
+/// carries every Parquet table of the statement and the store they share).
 fn check_table_set(tables: &[SessionTable]) -> DFResult<()> {
     if tables.is_empty() {
         return plan_err!("a SQL session needs at least one table");
     }
-    if tables.len() > 1
-        && tables
-            .iter()
-            .any(|table| matches!(table, SessionTable::Parquet(_)))
+    if tables
+        .iter()
+        .filter(|table| matches!(table, SessionTable::Parquet(_)))
+        .count()
+        > 1
     {
-        return plan_err!("a Parquet table cannot be queried beside another table");
+        return plan_err!("a SQL session takes its Parquet tables in one entry");
     }
     let mut names = BTreeSet::new();
     for name in tables.iter().filter_map(signal_table_name) {
@@ -742,9 +744,11 @@ fn check_table_set(tables: &[SessionTable]) -> DFResult<()> {
 /// beside another table is [`LikeScope::LogsColumnsOnly`].
 ///
 /// Refused with a plan error before anything is registered: an empty set,
-/// two entries for one table name, and a Parquet entry beside any other entry
-/// (epic #2904 ticket T7 lifts that one, per ADR-2904 decision 11). Only a set of
-/// exactly one Parquet entry gets a store registry that answers anything.
+/// two entries for one table name, and two Parquet entries. A Parquet entry
+/// may sit beside signal tables (ADR-2904 decision 11). Only a set with a
+/// Parquet entry gets a store registry that answers anything, and its session
+/// takes the Parquet reader's settings ([`parquet_session_config`]); the
+/// signal scans read through their own providers, which neither touches.
 pub fn build_session_with_tables(
     config: &SqlConfig,
     pool: Arc<dyn MemoryPool>,
@@ -753,13 +757,13 @@ pub fn build_session_with_tables(
     spill: SpillDecision<'_>,
 ) -> DFResult<SessionContext> {
     check_table_set(&tables)?;
-    let parquet_store = match tables.as_slice() {
-        [SessionTable::Parquet(session)] => Some(Arc::clone(&session.store)),
+    let parquet_store = tables.iter().find_map(|table| match table {
+        SessionTable::Parquet(session) => Some(Arc::clone(&session.store)),
         _ => None,
-    };
-    // ADR-2040 D4: only a Parquet session can resolve a store, and only its
-    // own tenant's `ravel-pq://<tenant_hash>/`; every other session keeps the
-    // registry that answers nothing.
+    });
+    // ADR-2040 D4: only a session with Parquet tables can resolve a store, and
+    // only its own tenant's `ravel-pq://<tenant_hash>/`; every other session
+    // keeps the registry that answers nothing.
     let registry: Arc<dyn ObjectStoreRegistry> = match &parquet_store {
         Some(store) => Arc::new(SingleStoreRegistry::new(Arc::clone(store))),
         None => Arc::new(EmptyObjectStoreRegistry),
@@ -2255,7 +2259,7 @@ mod tests {
     }
 
     #[test]
-    fn build_session_with_tables_refuses_empty_duplicate_and_mixed_parquet() {
+    fn build_session_with_tables_refuses_empty_duplicate_and_two_parquet_entries() {
         let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let tenant = ravel_types::TenantHash([0u8; 16]);
         let refusal = |tables: Vec<SessionTable>| -> String {
@@ -2280,12 +2284,71 @@ mod tests {
             "table logs is named twice in one SQL session"
         );
         assert_eq!(
-            refusal(vec![parquet_table(tenant), metrics_table(&store)]),
-            "a Parquet table cannot be queried beside another table"
+            refusal(vec![parquet_table(tenant), parquet_table(tenant)]),
+            "a SQL session takes its Parquet tables in one entry"
         );
         assert_eq!(
-            refusal(vec![parquet_table(tenant), parquet_table(tenant)]),
-            "a Parquet table cannot be queried beside another table"
+            refusal(vec![
+                parquet_table(tenant),
+                logs_table(&store),
+                parquet_table(tenant)
+            ]),
+            "a SQL session takes its Parquet tables in one entry"
+        );
+    }
+
+    /// ADR-2904 decision 11: a Parquet entry beside signal tables builds, and
+    /// registers every table of both. The session resolves the tenant's
+    /// `ravel-pq://` URL whichever position the Parquet entry holds, a
+    /// signal-only session resolves none, and the Parquet reader's settings
+    /// apply exactly when a Parquet entry is present.
+    #[test]
+    fn a_parquet_entry_beside_signal_tables_builds_with_the_parquet_registry() {
+        use datafusion::execution::object_store::ObjectStoreUrl;
+
+        let store: Arc<dyn ravel_object_store::ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let tenant = ravel_types::TenantHash([0u8; 16]);
+        let own = ObjectStoreUrl::parse(ravel_parquet::store_url(&tenant)).expect("url");
+        let build = |tables: Vec<SessionTable>| {
+            build_session_with_tables(
+                &SqlConfig::default(),
+                test_pool(),
+                tables,
+                false,
+                SpillDecision::Disabled,
+            )
+            .expect("the table set builds")
+        };
+        for (tables, signal) in [
+            (
+                vec![parquet_table(tenant), metrics_table(&store)],
+                SAMPLES_TABLE,
+            ),
+            (vec![logs_table(&store), parquet_table(tenant)], LOGS_TABLE),
+        ] {
+            let ctx = build(tables);
+            assert!(ctx.runtime_env().object_store(&own).is_ok(), "{signal}");
+            assert!(
+                ctx.state()
+                    .config()
+                    .options()
+                    .execution
+                    .parquet
+                    .pushdown_filters,
+                "{signal}"
+            );
+            assert!(ctx.table_exist("hits").expect("lookup"), "{signal}");
+            assert!(ctx.table_exist(signal).expect("lookup"), "{signal}");
+        }
+        let ctx = build(vec![metrics_table(&store), logs_table(&store)]);
+        assert!(ctx.runtime_env().object_store(&own).is_err());
+        assert!(
+            !ctx.state()
+                .config()
+                .options()
+                .execution
+                .parquet
+                .pushdown_filters
         );
     }
 }

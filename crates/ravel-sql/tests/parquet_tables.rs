@@ -11,21 +11,26 @@
 use crate::util;
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::arrow::array::{
     Array, ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray,
 };
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::util::display::array_value_to_string;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_memory::MemoryBudget;
 use ravel_object_store::instrument::{InstrumentedStore, StoreOp};
 use ravel_object_store::memory::MemoryStore;
-use ravel_object_store::{ObjectStoreBackend, PutOptions};
+use ravel_object_store::{
+    Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
+    PageToken, Pin, PinnedRead, PutOptions, PutOutcome, StoreError,
+};
 use ravel_parquet::ParquetReadError;
 use ravel_pqtable::clock::FixedClock;
 use ravel_pqtable::grants;
@@ -39,11 +44,11 @@ use ravel_query::{
 };
 use ravel_sql::{
     DEFAULT_PARQUET_METADATA_CACHE_BYTES, ErrorClass, ExternalStoreMap, MAX_STATEMENT_TABLE_NAMES,
-    MSG_PLAN, ParquetQueryError, ParquetSources, SpanSegmentFetcher, SqlConfig, SqlError,
-    SqlExecutor, SqlOutcome, TargetSignal,
+    MSG_PLAN, ParquetPlan, ParquetQueryError, ParquetSources, PinnedPlanInputs, PinnedQuery,
+    SpanSegmentFetcher, SqlConfig, SqlError, SqlExecutor, SqlOutcome, TargetSignal,
 };
 use ravel_types::accounting::AccountedOp;
-use ravel_types::{TenantHash, TenantId};
+use ravel_types::{Signal, TenantHash, TenantId};
 
 use util::request;
 
@@ -210,6 +215,50 @@ impl Lake {
     ) -> Self {
         let ravel = Arc::new(InstrumentedStore::new(MemoryStore::new()));
         let store: Arc<dyn ObjectStoreBackend> = ravel.clone();
+        Lake::assemble(ravel, store, lake, external, config, budget)
+    }
+
+    /// A configured executor over `config` whose every request to either
+    /// store is also written to the returned log, in issue order.
+    fn recorded(config: SqlConfig) -> (Self, RequestLog) {
+        let log = RequestLog::default();
+        let lake = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let ravel = Arc::new(InstrumentedStore::new(MemoryStore::new()));
+        let lake_seen = Arc::new(Recorded {
+            name: "lake",
+            inner: Arc::clone(&lake) as Arc<dyn ObjectStoreBackend>,
+            log: Arc::clone(&log),
+        }) as Arc<dyn ObjectStoreBackend>;
+        let ravel_seen = Arc::new(Recorded {
+            name: "ravel",
+            inner: Arc::clone(&ravel) as Arc<dyn ObjectStoreBackend>,
+            log: Arc::clone(&log),
+        }) as Arc<dyn ObjectStoreBackend>;
+        let external = Arc::new(ExternalStoreMap::new(HashMap::from([(
+            PROFILE.to_string(),
+            lake_seen,
+        )]))) as Arc<dyn ravel_sql::ExternalStores>;
+        let lake = Lake::assemble(
+            ravel,
+            ravel_seen,
+            lake,
+            Some(external),
+            config,
+            Arc::new(MemoryBudget::unlimited()),
+        );
+        (lake, log)
+    }
+
+    /// An executor reading Ravel's store through `store`, which reaches
+    /// `ravel`.
+    fn assemble(
+        ravel: Arc<InstrumentedStore<MemoryStore>>,
+        store: Arc<dyn ObjectStoreBackend>,
+        lake: Arc<InstrumentedStore<MemoryStore>>,
+        external: Option<Arc<dyn ravel_sql::ExternalStores>>,
+        config: SqlConfig,
+        budget: Arc<MemoryBudget>,
+    ) -> Self {
         let catalog =
             Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
         let sources = ParquetSources::new(
@@ -361,6 +410,87 @@ impl Lake {
     }
 }
 
+/// Every request an executor sent to a [`Recorded`] store, in issue order,
+/// each as `<store> <op> <key>`.
+type RequestLog = Arc<Mutex<Vec<String>>>;
+
+/// A store that writes each read it forwards to a shared [`RequestLog`].
+/// Writes are not recorded: the fixture stages through the inner stores.
+struct Recorded {
+    name: &'static str,
+    inner: Arc<dyn ObjectStoreBackend>,
+    log: RequestLog,
+}
+
+impl Recorded {
+    fn note(&self, op: &str, key: &str) {
+        self.log
+            .lock()
+            .expect("request log")
+            .push(format!("{} {op} {key}", self.name));
+    }
+}
+
+#[async_trait]
+impl ObjectStoreBackend for Recorded {
+    async fn put(
+        &self,
+        key: &str,
+        data: Bytes,
+        opts: PutOptions,
+    ) -> Result<PutOutcome, StoreError> {
+        self.inner.put(key, data, opts).await
+    }
+    async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+        self.note("GET", key);
+        self.inner.get(key, range).await
+    }
+    async fn get_pinned(
+        &self,
+        key: &str,
+        range: GetRange,
+        pin: &Pin,
+    ) -> Result<PinnedRead, StoreError> {
+        self.note("GET", key);
+        self.inner.get_pinned(key, range, pin).await
+    }
+    async fn get_with_pin(&self, key: &str, range: GetRange) -> Result<PinnedRead, StoreError> {
+        self.note("GET", key);
+        self.inner.get_with_pin(key, range).await
+    }
+    async fn pin_of(&self, key: &str) -> Result<(ObjectMeta, Pin), StoreError> {
+        self.note("HEAD", key);
+        self.inner.pin_of(key).await
+    }
+    async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+        self.note("HEAD", key);
+        self.inner.head(key).await
+    }
+    async fn list(&self, prefix: &str, page: Option<PageToken>) -> Result<ListPage, StoreError> {
+        self.note("LIST", prefix);
+        self.inner.list(prefix, page).await
+    }
+    async fn list_after(
+        &self,
+        prefix: &str,
+        start_after: Option<&str>,
+        page: Option<PageToken>,
+    ) -> Result<ListPage, StoreError> {
+        self.note("LIST", prefix);
+        self.inner.list_after(prefix, start_after, page).await
+    }
+    async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+        self.note("LIST", prefix);
+        self.inner.list_delimited(prefix).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), StoreError> {
+        self.inner.delete(key).await
+    }
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+}
+
 /// The Parquet refusal `err` carries, if it is one.
 fn parquet_error(err: &SqlError) -> Option<&ParquetQueryError> {
     match err {
@@ -371,8 +501,13 @@ fn parquet_error(err: &SqlError) -> Option<&ParquetQueryError> {
 
 /// Every row of `outcome`, each rendered as `v|v|...`, in result order.
 fn rows(outcome: &SqlOutcome) -> Vec<String> {
+    batch_rows(outcome.output.batches())
+}
+
+/// [`rows`] of a stream's batches.
+fn batch_rows(batches: &[RecordBatch]) -> Vec<String> {
     let mut out = Vec::new();
-    for batch in outcome.output.batches() {
+    for batch in batches {
         for row in 0..batch.num_rows() {
             let cells: Vec<String> = (0..batch.num_columns())
                 .map(|column| array_value_to_string(batch.column(column), row).expect("cell"))
@@ -831,44 +966,84 @@ async fn another_tenants_table_is_an_unknown_table() {
     );
 }
 
-/// A Parquet table beside a signal table is [`SqlError::SignalBesideParquet`]
-/// (not supported yet, ADR-2904 decision 11), in either order. The only reads
-/// are the LIST of the table's manifest versions and the GET of its newest
-/// manifest, which tell a live table from an unknown name: no signal catalog
-/// is listed and no file is read. A statement over the Parquet table alone
-/// still runs.
-#[tokio::test]
-async fn a_signal_table_beside_parquet_is_refused_before_listing() {
+/// The event times of the logs [`hits_and_logs`] publishes: one record per
+/// `hits` id from 1 to 4, each with the body `line <ts>`.
+const LOG_TS: [i64; 4] = [1, 2, 3, 4];
+
+/// `hits` joined to the logs record whose body names its id.
+const HITS_JOIN_LOGS: &str = "SELECT h.id, l.body FROM hits h JOIN logs l \
+     ON l.body = concat('line ', CAST(h.id AS VARCHAR)) ORDER BY h.id";
+
+/// `hits` for `acme`, and one logs object for `acme` holding a record at each
+/// of [`LOG_TS`]. Returns that object's commit token and data key.
+async fn hits_and_logs(lake: &Lake) -> (ravel_types::CommitToken, String) {
+    let acme = util::tenant_id("acme");
+    lake.hits_for(&acme.hash()).await;
+    util::publish_logs(lake.ravel.as_ref(), &acme, 0, &LOG_TS).await
+}
+
+/// The (Ravel GET, Ravel LIST, lake GET) counts `sql` adds on a fresh
+/// [`hits_and_logs`] lake, and its outcome.
+async fn fresh_reads(sql: &str) -> ((u64, u64, u64), SqlOutcome) {
     let lake = Lake::configured();
-    let acme = tenant("acme");
-    lake.hits_for(&acme).await;
-    for sql in [
-        "SELECT count(*) FROM hits JOIN logs ON true",
-        "SELECT count(*) FROM logs WHERE body IN (SELECT name FROM hits)",
-    ] {
-        let before = reads(&lake);
-        let err = lake
-            .execute(&acme, sql)
-            .await
-            .expect_err("signal beside Parquet");
-        assert!(matches!(err, SqlError::SignalBesideParquet), "{sql}: {err}");
-        let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
+    hits_and_logs(&lake).await;
+    let before = reads(&lake);
+    let outcome = lake.execute(&tenant("acme"), sql).await.expect(sql);
+    let after = reads(&lake);
+    (
+        (after.0 - before.0, after.1 - before.1, after.2 - before.2),
+        outcome,
+    )
+}
+
+/// A Parquet table and a signal table in one statement (ADR-2904 decision 11)
+/// return the exact rows, with the Parquet table on either side. Each
+/// statement's reads are exactly the Parquet table's alone plus the logs
+/// lane's alone, each measured from a fresh store: the mixed resolve reads
+/// both and nothing more. The statement reports one `stats.signals` entry,
+/// for `logs`.
+///
+/// FLIP: a mixed resolve that skips the signal lanes gives `logs` an empty
+/// snapshot, so the join returns no row and the counts lose the logs lane's
+/// LIST and GETs.
+#[tokio::test]
+async fn a_parquet_table_joined_with_logs_returns_exact_rows() {
+    let cases = [
+        (
+            HITS_JOIN_LOGS,
+            vec!["1|line 1", "2|line 2", "3|line 3", "4|line 4"],
+            "SELECT id FROM hits",
+        ),
+        (
+            "SELECT body FROM logs WHERE body IN \
+             (SELECT concat('line ', CAST(id AS VARCHAR)) FROM hits WHERE name = 'a') \
+             ORDER BY body",
+            vec!["line 1", "line 4"],
+            "SELECT id FROM hits WHERE name = 'a'",
+        ),
+    ];
+    let (logs, _) = fresh_reads("SELECT body FROM logs").await;
+    for (sql, expected, parquet_alone) in cases {
+        let (mixed, outcome) = fresh_reads(sql).await;
+        assert_eq!(rows(&outcome), expected, "{sql}");
+        assert_eq!(outcome.target, TargetSignal::Logs, "{sql}");
         assert_eq!(
-            (
-                ravel_lists - before.1,
-                ravel_gets - before.0,
-                lake_gets - before.2
-            ),
-            (1, 1, 0),
-            "{sql}: hits's versions LIST and newest manifest GET, nothing else"
+            outcome
+                .signals
+                .iter()
+                .map(|signal| signal.table)
+                .collect::<Vec<_>>(),
+            vec!["logs"],
+            "{sql}"
+        );
+        let (parquet, _) = fresh_reads(parquet_alone).await;
+        assert_eq!(
+            mixed,
+            (parquet.0 + logs.0, parquet.1 + logs.1, parquet.2 + logs.2),
+            "{sql}: (Ravel GET, Ravel LIST, lake GET) of {parquet_alone:?} {parquet:?} \
+             plus the logs lane's {logs:?}"
         );
     }
-
-    let outcome = lake
-        .execute(&acme, "SELECT count(*) FROM hits")
-        .await
-        .expect("a Parquet-only statement runs");
-    assert_eq!(rows(&outcome), vec!["6".to_string()]);
 }
 
 /// A Parquet table has no commit tokens, so a `min_commit_token` on a
@@ -876,9 +1051,8 @@ async fn a_signal_table_beside_parquet_is_refused_before_listing() {
 /// [`SqlError::CommitTokenOnParquetStatement`], unqualified or qualified with
 /// the Parquet table's name, refused from the statement text before either
 /// store is read. A Parquet-qualified token on a statement that also names a
-/// signal table is [`SqlError::CommitTokenQualifierNotRead`]: token admission
-/// runs before the Parquet table is resolved, so it fires ahead of
-/// [`SqlError::SignalBesideParquet`].
+/// signal table is [`SqlError::CommitTokenQualifierNotRead`], refused before
+/// the Parquet table is resolved.
 #[tokio::test]
 async fn a_commit_token_on_a_parquet_only_statement_is_refused() {
     let lake = Lake::configured();
@@ -953,6 +1127,56 @@ async fn a_commit_token_on_a_parquet_only_statement_is_refused() {
         before,
         "refused before the Parquet table is resolved"
     );
+}
+
+/// A statement naming one signal table beside a Parquet table takes a plain
+/// token, which bounds its one signal table, and a token qualified with that
+/// table's name; a token qualified with the Parquet table's name is
+/// [`SqlError::CommitTokenQualifierNotRead`], refused before either store is
+/// read.
+#[tokio::test]
+async fn a_mixed_statement_takes_a_token_for_its_signal_table_only() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    let (token, _) = hits_and_logs(&lake).await;
+    let with_tokens = |tokens: Vec<ravel_sql::MinCommitToken>| {
+        let mut req = request(HITS_JOIN_LOGS);
+        req.min_tokens = tokens;
+        req
+    };
+
+    for tokens in [
+        vec![ravel_sql::MinCommitToken::unqualified(token.clone())],
+        vec![ravel_sql::MinCommitToken::qualified("logs", token.clone())],
+    ] {
+        let outcome = lake
+            .executor
+            .execute(acme, &with_tokens(tokens.clone()))
+            .await
+            .unwrap_or_else(|err| panic!("{tokens:?}: {err}"));
+        assert_eq!(
+            rows(&outcome),
+            vec!["1|line 1", "2|line 2", "3|line 3", "4|line 4"],
+            "{tokens:?}"
+        );
+    }
+
+    let before = reads(&lake);
+    let err = lake
+        .executor
+        .execute(
+            acme,
+            &with_tokens(vec![ravel_sql::MinCommitToken::qualified("hits", token)]),
+        )
+        .await
+        .expect_err("a token qualified with the Parquet table");
+    match &err {
+        SqlError::CommitTokenQualifierNotRead { qualifier, tables } => {
+            assert_eq!((qualifier.as_str(), tables.as_str()), ("hits", "logs"));
+        }
+        other => panic!("expected CommitTokenQualifierNotRead, got {other}"),
+    }
+    assert_eq!(reads(&lake), before, "refused before either store is read");
 }
 
 /// Grants are checked when a query resolves the table: after the grant a
@@ -1451,12 +1675,13 @@ async fn a_forged_parquet_version_above_the_bound_is_ignored_and_the_older_one_s
     unknown_table_error(&lake, &acme, sql).await;
 }
 
-/// A dropped table beside a signal table is an unknown table, not a signal
-/// table beside a Parquet table: the early-exit resolve reads the name's newest
-/// manifest, finds a drop, and goes on.
+/// A dropped table beside a signal table is an unknown table, not a Parquet
+/// table to plan beside it: the resolve reads the name's newest manifest,
+/// finds a drop, and goes on, the same failure as a name nobody created.
 ///
-/// FLIP: deciding from the LIST alone (a name with versions is found) makes
-/// this `SignalBesideParquet`.
+/// FLIP: deciding from the LIST alone (a name with versions is found) takes
+/// the dropped name for a live table, and the statement no longer fails as
+/// an unknown table.
 #[tokio::test]
 async fn a_dropped_table_beside_samples_is_an_unknown_table() {
     let lake = Lake::configured();
@@ -1607,28 +1832,93 @@ async fn a_statement_naming_the_cap_is_an_unknown_table_after_one_list_each() {
     );
 }
 
-/// With a signal table present, the first name that is a live table decides
-/// `SignalBesideParquet`: the unknown names after it are never listed.
+/// `hits` for `acme` beside two folded `samples` segments in ingest hour 0:
+/// `cpu` at the values 1, 2 and 5, and `mem` at 3.
+async fn hits_and_samples(lake: &Lake) {
+    let acme = util::tenant_id("acme");
+    lake.hits_for(&acme.hash()).await;
+    let minute = 60_000_000_000;
+    let segments = [
+        util::SegSpec::new(
+            1,
+            1,
+            1,
+            vec![util::SeriesSpec::new(
+                "cpu",
+                vec![(minute, 1.0), (2 * minute, 2.0), (3 * minute, 5.0)],
+            )],
+        ),
+        util::SegSpec::new(
+            2,
+            1,
+            2,
+            vec![util::SeriesSpec::new("mem", vec![(minute, 3.0)])],
+        ),
+    ];
+    for (index, spec) in segments.iter().enumerate() {
+        util::publish_segment(lake.ravel.as_ref(), &acme, index, spec).await;
+    }
+    // Fold so the name postings `pushed_down_name_filter` prunes with exist.
+    // Hour 0 is sealed at NOW_NS (4h).
+    let report = Catalog::new(
+        Arc::clone(&lake.ravel) as Arc<dyn ObjectStoreBackend>,
+        CatalogConfig::default(),
+    )
+    .expect("catalog")
+    .fold(
+        &acme.hash(),
+        Signal::Metrics,
+        uuid::Uuid::new_v4(),
+        util::NOW_NS,
+        &[],
+        None,
+    )
+    .await
+    .expect("fold");
+    assert!(report.watermark_hour.is_some(), "hour 0 is sealed");
+    assert!(report.postings_built);
+}
+
+/// `samples` joined with a Parquet table returns the exact rows. The derived
+/// `__name__` filter that prunes a `samples`-only statement by postings
+/// (`pushed_down_name_filter`) is not applied beside a Parquet table: the
+/// mixed statement resolves both segments and the filter runs above the scan,
+/// so the rows are still exact. This pins today's behaviour; pruning a mixed
+/// statement is a separate change.
+///
+/// FLIP: dropping the filter above the scan joins `mem`'s 3 to `hits` id 3.
 #[tokio::test]
-async fn samples_beside_a_parquet_table_stops_at_the_first_found_name() {
+async fn samples_joined_with_a_parquet_table_returns_exact_rows() {
     let lake = Lake::configured();
     let acme = tenant("acme");
-    lake.hits_for(&acme).await;
-    let before = reads(&lake);
+    hits_and_samples(&lake).await;
+    let filter = "label(s.labels, '__name__') = 'cpu'";
 
-    let names = unknown_names(MAX_STATEMENT_TABLE_NAMES - 1);
-    let sql = format!("SELECT 1 FROM samples, hits, {}", names.join(", "));
-    let err = lake
-        .execute(&acme, &sql)
+    let alone = lake
+        .execute(
+            &acme,
+            &format!("SELECT s.value FROM samples s WHERE {filter} ORDER BY s.value"),
+        )
         .await
-        .expect_err("signal beside Parquet");
-    assert!(matches!(err, SqlError::SignalBesideParquet), "{err}");
-    let (ravel_gets, ravel_lists, lake_gets) = reads(&lake);
-    assert_eq!(ravel_lists - before.1, 1, "one LIST, of hits's versions");
+        .expect("samples alone");
+    assert_eq!(rows(&alone), vec!["1.0", "2.0", "5.0"]);
+    assert_eq!(alone.stats.segments, 1, "postings pruned the mem segment");
+
+    let mixed = lake
+        .execute(
+            &acme,
+            &format!(
+                "SELECT h.id, s.value FROM samples s JOIN hits h \
+                 ON CAST(s.value AS BIGINT) = h.id WHERE {filter} ORDER BY h.id"
+            ),
+        )
+        .await
+        .expect("samples beside hits");
+    assert_eq!(rows(&mixed), vec!["1|1.0", "2|2.0", "5|5.0"]);
+    assert_eq!(mixed.target, TargetSignal::Metrics);
     assert_eq!(
-        (ravel_gets - before.0, lake_gets - before.2),
-        (1, 0),
-        "hits's newest manifest, and no file"
+        mixed.stats.segments, 2,
+        "no postings pruning beside a Parquet table"
     );
 }
 
@@ -1694,6 +1984,339 @@ async fn a_row_window_is_refused_on_a_parquet_table() {
     );
 }
 
+/// Beside a signal table the row window applies to the signal scans only:
+/// every `hits` row survives a `LEFT JOIN`, and only the logs records inside
+/// the half-open window `[0, 3)` join to one.
+///
+/// FLIP: refusing the row window whenever the statement names a Parquet table
+/// fails this statement with `RowWindowUnsupported`.
+#[tokio::test]
+async fn a_row_window_bounds_only_the_signal_scans_beside_a_parquet_table() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    hits_and_logs(&lake).await;
+    let mut req = request(
+        "SELECT h.id, l.body FROM hits h LEFT JOIN logs l \
+         ON l.body = concat('line ', CAST(h.id AS VARCHAR)) ORDER BY h.id",
+    );
+    req.window = ravel_types::TimeRange {
+        start_ns: 0,
+        end_ns: 3,
+    };
+    req.row_window = true;
+    let outcome = lake
+        .executor
+        .execute(acme, &req)
+        .await
+        .expect("row window beside Parquet");
+    assert_eq!(
+        rows(&outcome),
+        vec!["1|line 1", "2|line 2", "3|", "4|", "5|", "6|"]
+    );
+    assert!(outcome.stats.window_predicate.is_some());
+
+    // Non-vacuity: without the row window the same listing window joins all
+    // four records.
+    req.row_window = false;
+    let outcome = lake.executor.execute(acme, &req).await.expect("no window");
+    assert_eq!(
+        rows(&outcome),
+        vec!["1|line 1", "2|line 2", "3|line 3", "4|line 4", "5|", "6|"]
+    );
+}
+
+/// `sql` for `acme` planned through the pinned lanes surface, the pair the
+/// Flight SQL service runs, handing the plan the Parquet tables the resolve
+/// read.
+async fn pinned_lanes_plan(lake: &Lake, sql: &str) -> PinnedQuery {
+    let acme = tenant("acme");
+    let accounting = ravel_types::accounting::QueryAccounting::new();
+    let lanes = lake
+        .executor
+        .resolve_pinned_lanes(acme, &request(sql), &accounting)
+        .await
+        .expect("resolve lanes");
+    lake.executor
+        .plan_pinned_lanes(
+            acme,
+            lanes.lanes,
+            sql,
+            &accounting,
+            PinnedPlanInputs {
+                declared: Vec::new(),
+                parquet: ParquetPlan::Resolved(lanes.parquet),
+                budgets: None,
+            },
+        )
+        .await
+        .expect("plan lanes")
+}
+
+/// [`pinned_lanes_plan`] through the one-snapshot pinned surface.
+async fn pinned_plan(lake: &Lake, sql: &str) -> PinnedQuery {
+    let acme = tenant("acme");
+    let accounting = ravel_types::accounting::QueryAccounting::new();
+    let resolved = lake
+        .executor
+        .resolve_pinned(acme, &request(sql), &accounting)
+        .await
+        .expect("resolve");
+    lake.executor
+        .plan_pinned_with_inputs(
+            acme,
+            resolved.snapshot,
+            sql,
+            &accounting,
+            PinnedPlanInputs {
+                declared: Vec::new(),
+                parquet: ParquetPlan::Resolved(resolved.parquet),
+                budgets: None,
+            },
+        )
+        .await
+        .expect("plan")
+}
+
+/// A statement naming no Parquet table plans in a session without the Parquet
+/// store registry, on both pinned surfaces, while a mixed statement's session
+/// has the registry and both tables.
+///
+/// FLIP: building every session with the registry makes the signal-only
+/// session reach the tenant's Parquet store URL.
+#[tokio::test]
+async fn a_signal_only_statement_gets_no_parquet_store_registry() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    hits_and_logs(&lake).await;
+    let signal_only = "SELECT body FROM logs";
+    for plan in [
+        pinned_lanes_plan(&lake, signal_only).await,
+        pinned_plan(&lake, signal_only).await,
+    ] {
+        assert!(!plan.reaches_parquet_store(&acme));
+        assert_eq!(plan.registered_tables(), vec!["logs"]);
+    }
+    for plan in [
+        pinned_lanes_plan(&lake, HITS_JOIN_LOGS).await,
+        pinned_plan(&lake, HITS_JOIN_LOGS).await,
+    ] {
+        assert!(plan.reaches_parquet_store(&acme));
+        assert_eq!(plan.registered_tables(), vec!["hits", "logs"]);
+    }
+}
+
+/// A statement naming only Parquet tables registers no signal table, on both
+/// pinned surfaces; the pinned lanes pair is the one the Flight SQL service
+/// runs. On HTTP it reports no `stats.signals` entry and returns the rows.
+///
+/// FLIP: registering the empty `samples` provider a Parquet-only statement's
+/// lane used to carry adds `samples` to the session.
+#[tokio::test]
+async fn a_parquet_only_statement_registers_no_signal_table() {
+    let lake = Lake::configured();
+    let acme = tenant("acme");
+    hits_and_logs(&lake).await;
+    let sql = "SELECT count(*) FROM hits";
+    for plan in [
+        pinned_lanes_plan(&lake, sql).await,
+        pinned_plan(&lake, sql).await,
+    ] {
+        assert!(plan.reaches_parquet_store(&acme));
+        assert_eq!(plan.registered_tables(), vec!["hits"]);
+    }
+    let outcome = lake.execute(&acme, sql).await.expect("HTTP");
+    assert_eq!(rows(&outcome), vec!["6"]);
+    assert!(outcome.signals.is_empty(), "{:?}", outcome.signals);
+}
+
+/// Each node named `name` in `plan`'s physical plan, as its one-line display
+/// and its output partition count.
+async fn scan_nodes(plan: &PinnedQuery, name: &str) -> Vec<(String, usize)> {
+    fn walk(plan: &Arc<dyn ExecutionPlan>, name: &str, out: &mut Vec<(String, usize)>) {
+        if plan.name() == name {
+            out.push((
+                displayable(plan.as_ref()).one_line().to_string(),
+                plan.properties().partitioning.partition_count(),
+            ));
+        }
+        for child in plan.children() {
+            walk(child, name, out);
+        }
+    }
+    let physical = plan.create_physical_plan().await.expect("physical plan");
+    let mut out = Vec::new();
+    walk(&physical, name, &mut out);
+    out
+}
+
+/// A signal scan beside a Parquet table is the scan the same signal statement
+/// plans alone: the Parquet session settings a mixed session takes
+/// (`parquet_session_config`) leave the logs and samples scans' display and
+/// partitioning unchanged.
+#[tokio::test]
+async fn a_signal_scan_plans_the_same_beside_a_parquet_table() {
+    let lake = Lake::configured();
+    hits_and_logs(&lake).await;
+    util::publish_segment(
+        lake.ravel.as_ref(),
+        &util::tenant_id("acme"),
+        0,
+        &util::SegSpec::new(
+            1,
+            1,
+            1,
+            vec![util::SeriesSpec::new("cpu", vec![(1, 1.0), (2, 2.0)])],
+        ),
+    )
+    .await;
+    for (alone, beside, node) in [
+        (
+            "SELECT body FROM logs WHERE severity_num = 9",
+            "SELECT body FROM logs WHERE severity_num = 9 UNION ALL SELECT name FROM hits",
+            "LogsScanExec",
+        ),
+        (
+            "SELECT value FROM samples WHERE value > 1",
+            "SELECT value FROM samples WHERE value > 1 UNION ALL SELECT score FROM hits",
+            "RsegScanExec",
+        ),
+    ] {
+        let alone_nodes = scan_nodes(&pinned_lanes_plan(&lake, alone).await, node).await;
+        let beside_nodes = scan_nodes(&pinned_lanes_plan(&lake, beside).await, node).await;
+        assert_eq!(alone_nodes.len(), 1, "{alone}: {alone_nodes:?}");
+        assert_eq!(beside_nodes, alone_nodes, "{beside}");
+    }
+}
+
+/// A mixed statement's `stats.signals` holds one entry per signal table and
+/// none for the Parquet table, and the entries plus the Parquet table's share
+/// equal `stats.phases`, phase by phase: the share is what the same Parquet
+/// read costs alone, measured from a fresh store.
+#[tokio::test]
+async fn a_mixed_statements_signals_and_parquet_share_sum_to_its_phases() {
+    let sql = "SELECT body FROM logs UNION ALL SELECT name FROM hits";
+    let (mixed_reads, mixed) = fresh_reads(sql).await;
+    assert_eq!(rows(&mixed).len(), LOG_TS.len() + 6);
+    assert_eq!(
+        mixed
+            .signals
+            .iter()
+            .map(|signal| signal.table)
+            .collect::<Vec<_>>(),
+        vec!["logs"]
+    );
+    let (parquet_reads, parquet) = fresh_reads("SELECT name FROM hits").await;
+    assert!(parquet.signals.is_empty());
+    let logs = &mixed.signals[0].phases;
+    for phase in QueryPhase::ALL {
+        let (signal, share, total) = (
+            logs.phase(phase),
+            parquet.phase_accounting.phase(phase),
+            mixed.phase_accounting.phase(phase),
+        );
+        for op in AccountedOp::ALL {
+            assert_eq!(
+                signal.s3_requests(op) + share.s3_requests(op),
+                total.s3_requests(op),
+                "{phase:?} {op:?} requests"
+            );
+        }
+        assert_eq!(
+            signal.total_s3_bytes() + share.total_s3_bytes(),
+            total.total_s3_bytes(),
+            "{phase:?} bytes"
+        );
+    }
+    assert!(
+        parquet.accounting.total_s3_requests() > 0 && logs.pooled().total_s3_requests() > 0,
+        "both sides read"
+    );
+    assert_eq!(
+        mixed_reads.2, parquet_reads.2,
+        "every lake GET is the Parquet table's"
+    );
+}
+
+/// A mixed statement is held to one `max_s3_requests`: the Parquet reader
+/// checks each request against the statement's total, the logs lane's reads
+/// included, not against its own. The statement aggregates `logs` into the
+/// build side of a nested loop join, through a filter so the aggregate reads
+/// the logs object rather than its commit record's count, so the logs reads
+/// are charged before the Parquet reader's data GETs, and a budget of one less
+/// than the statement's unbudgeted cost refuses its last request, a lake GET,
+/// before it is sent. The Parquet share alone is under that budget.
+///
+/// FLIP: checking the Parquet reader's own handle sees only the Parquet share,
+/// which is under the budget, and the statement runs to its end.
+#[tokio::test]
+async fn a_mixed_statement_is_held_to_one_request_budget() {
+    let sql = "SELECT h.id FROM \
+               (SELECT count(*) AS n FROM logs WHERE body LIKE 'line%') c, hits h \
+               WHERE h.id > c.n ORDER BY h.id";
+    let acme = tenant("acme");
+
+    let (lake, log) = Lake::recorded(SqlConfig::default());
+    let (_, logs_key) = hits_and_logs(&lake).await;
+    log.lock().expect("request log").clear();
+    let outcome = lake.execute(&acme, sql).await.expect("unbudgeted");
+    assert_eq!(rows(&outcome), vec!["5", "6"]);
+    let order = log.lock().expect("request log").clone();
+    let total = outcome.accounting.total_s3_requests();
+    assert_eq!(order.len() as u64, total, "every charged request is logged");
+    let logs_share = outcome.signals[0].phases.pooled().total_s3_requests();
+    let parquet_share = total - logs_share;
+    let logs_read = order
+        .iter()
+        .position(|request| request == &format!("ravel GET {logs_key}"))
+        .expect("the logs object is read");
+    assert!(
+        order
+            .last()
+            .is_some_and(|request| request.starts_with("lake GET")),
+        "the last request is a lake GET"
+    );
+    assert!(
+        logs_read < order.len() - 1,
+        "the logs object is read before the last lake GET"
+    );
+    let unbudgeted_lake = Lake::gets(&lake.lake);
+    let max = total - 1;
+    assert!(
+        parquet_share < max,
+        "the Parquet share {parquet_share} alone is under the budget {max}"
+    );
+
+    let (lake, log) = Lake::recorded(budgeted_config(
+        ByteLimit::Unlimited,
+        RequestLimit::Bounded(max),
+    ));
+    hits_and_logs(&lake).await;
+    log.lock().expect("request log").clear();
+    let err = lake
+        .execute(&acme, sql)
+        .await
+        .expect_err("one request over");
+    assert!(
+        matches!(
+            err,
+            SqlError::RequestBudgetExceeded { requests, max: limit, .. }
+                if requests == total && limit == max
+        ),
+        "{err:?}"
+    );
+    let budgeted = log.lock().expect("request log").clone();
+    assert_eq!(
+        budgeted,
+        order[..order.len() - 1],
+        "every request but the unbudgeted run's last, in the same order"
+    );
+    assert_eq!(
+        Lake::gets(&lake.lake),
+        unbudgeted_lake - 1,
+        "the refused request is the last lake GET"
+    );
+}
+
 /// The pinned pair the Flight SQL transport uses, `resolve_snapshot` then
 /// `plan_pinned`, reaches the same Parquet tables and rows as `execute`.
 #[tokio::test]
@@ -1741,15 +2364,27 @@ fn flight_ticket_keys() -> ravel_sql::SqlTicketKeys {
 /// the token `acme`.
 #[cfg(feature = "flight-sql")]
 fn flight_harness(lake: &Lake, tenant: &TenantId) -> util::flight_harness::Harness {
+    flight_harness_with(
+        lake,
+        util::flight_harness::TestAuth::new(&[("acme", tenant)]),
+    )
+}
+
+/// [`flight_harness`] authenticating through `auth`.
+#[cfg(feature = "flight-sql")]
+fn flight_harness_with(
+    lake: &Lake,
+    auth: Arc<dyn ravel_sql::FlightAuth>,
+) -> util::flight_harness::Harness {
     use std::time::Duration;
 
     use ravel_sql::{FlightClock, FlightSqlConfig, RavelFlightSqlService};
-    use util::flight_harness::{Harness, TestAuth, TestClock};
+    use util::flight_harness::{Harness, TestClock};
 
     let clock = TestClock::at(util::NOW_NS);
     let service = RavelFlightSqlService::new(
         Arc::clone(&lake.executor),
-        TestAuth::new(&[("acme", tenant)]),
+        auth,
         Arc::clone(&clock) as Arc<dyn FlightClock>,
         FlightSqlConfig {
             max_deadline: Duration::from_secs(30),
@@ -2710,4 +3345,146 @@ async fn do_get_applies_the_budgets_its_ticket_carries() {
     // Control: the ticket as the service minted it streams the sum.
     let streamed = harness.do_get("acme", &ticket).await.expect("do get");
     assert_eq!(merged(&streamed).num_rows(), 1);
+}
+
+/// Flight SQL runs a Parquet table joined with a signal table and returns the
+/// rows `execute` returns.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn flight_sql_joins_a_parquet_table_with_logs() {
+    use util::flight_harness::merged;
+
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    hits_and_logs(&lake).await;
+    let harness = flight_harness(&lake, &acme);
+    let ticket = harness
+        .get_flight_info("acme", HITS_JOIN_LOGS)
+        .await
+        .expect("flight info");
+    let flight = harness.do_get("acme", &ticket).await.expect("do get");
+    let http = lake
+        .execute(&acme.hash(), HITS_JOIN_LOGS)
+        .await
+        .expect("execute");
+    assert_eq!(
+        rows(&http),
+        vec!["1|line 1", "2|line 2", "3|line 3", "4|line 4"]
+    );
+    assert_eq!(merged(&flight), merged(http.output.batches()));
+}
+
+/// A mixed statement's ticket pins both sides: a `hits` replacement and a new
+/// logs commit between `GetFlightInfo` and `DoGet` are both invisible to
+/// `DoGet`, and a statement planned after them sees both.
+///
+/// FLIP: a `DoGet` that resolves the Parquet table's newest manifest streams
+/// only ids 2 and 6; one that resolves the logs catalog again joins `line 6`.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn a_flight_mixed_statement_pins_the_parquet_table_and_the_signal_lane() {
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    hits_and_logs(&lake).await;
+    let harness = flight_harness(&lake, &acme);
+    let ticket = harness
+        .get_flight_info("acme", HITS_JOIN_LOGS)
+        .await
+        .expect("flight info");
+
+    let replacement = lake
+        .put_file(
+            "t/hits/replacement.parquet",
+            parquet_bytes(&[2, 6], &["b", "c"], &[1.5, 5.5]),
+        )
+        .await;
+    lake.replace(&acme.hash(), "hits", vec![replacement]).await;
+    util::publish_logs(lake.ravel.as_ref(), &acme, 1, &[5, 6]).await;
+
+    let streamed = harness.do_get("acme", &ticket).await.expect("do get");
+    assert_eq!(
+        batch_rows(&streamed),
+        vec!["1|line 1", "2|line 2", "3|line 3", "4|line 4"],
+        "the table and the logs the ticket pinned"
+    );
+
+    // Non-vacuity: both changes are live for a statement planned now.
+    let later = harness
+        .get_flight_info("acme", HITS_JOIN_LOGS)
+        .await
+        .expect("flight info after the changes");
+    let streamed = harness.do_get("acme", &later).await.expect("do get");
+    assert_eq!(batch_rows(&streamed), vec!["2|line 2", "6|line 6"]);
+}
+
+/// A tenant resolver handing every request one plain commit token, as a
+/// deployment's Flight metadata does.
+#[cfg(feature = "flight-sql")]
+struct TokenAuth {
+    tenant: TenantHash,
+    token: ravel_types::CommitToken,
+}
+
+#[cfg(feature = "flight-sql")]
+impl ravel_sql::FlightAuth for TokenAuth {
+    fn tenant(&self, metadata: &tonic::metadata::MetadataMap) -> Result<TenantHash, tonic::Status> {
+        match metadata
+            .get(util::flight_harness::TOKEN_KEY)
+            .and_then(|value| value.to_str().ok())
+        {
+            Some("acme") => Ok(self.tenant),
+            _ => Err(tonic::Status::unauthenticated(
+                "invalid or missing tenant credentials",
+            )),
+        }
+    }
+
+    fn min_commit_tokens(
+        &self,
+        _metadata: &tonic::metadata::MetadataMap,
+    ) -> Result<Vec<ravel_types::CommitToken>, tonic::Status> {
+        Ok(vec![self.token.clone()])
+    }
+}
+
+/// A plain commit token on a Flight statement that reads only Parquet tables
+/// is `CommitTokenOnParquetStatement`, INVALID_ARGUMENT at `GetFlightInfo`
+/// before either store is read; the same token on a statement naming one
+/// signal table beside the Parquet table bounds that table and runs.
+///
+/// FLIP: dropping the check in `resolve_pinned_lanes` lets the Parquet-only
+/// statement mint a ticket.
+#[cfg(feature = "flight-sql")]
+#[tokio::test]
+async fn a_commit_token_on_a_parquet_only_flight_statement_is_refused() {
+    let lake = Lake::configured();
+    let acme = TenantId::new("acme");
+    let (token, _) = hits_and_logs(&lake).await;
+    let harness = flight_harness_with(
+        &lake,
+        Arc::new(TokenAuth {
+            tenant: acme.hash(),
+            token,
+        }),
+    );
+
+    let before = reads(&lake);
+    let status = harness
+        .get_flight_info("acme", "SELECT count(*) FROM hits")
+        .await
+        .expect_err("a token on a Parquet-only statement");
+    assert_eq!(status.code(), tonic::Code::InvalidArgument, "{status}");
+    assert!(
+        status.message().contains("min_commit_token"),
+        "{}",
+        status.message()
+    );
+    assert_eq!(reads(&lake), before, "nothing is read");
+
+    let ticket = harness
+        .get_flight_info("acme", HITS_JOIN_LOGS)
+        .await
+        .expect("the token bounds logs");
+    let streamed = harness.do_get("acme", &ticket).await.expect("do get");
+    assert_eq!(batch_rows(&streamed).len(), LOG_TS.len());
 }

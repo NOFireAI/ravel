@@ -6,9 +6,12 @@
 //! to no table (the memory pool's peak report). [`StatementAccounting`] sums
 //! them: the signal scans' request and byte budgets, the live cost and io_shape
 //! read the statement total through it, never one lane's handle. The Parquet
-//! read budget reads the Parquet handle, which equals the total while a signal
-//! table beside a Parquet table is refused and the statement handle holds only
-//! the pool peak.
+//! read budget reads the statement total too when the statement also names a
+//! signal table, through a `ravel_parquet::BudgetView` over
+//! [`StatementAccounting::pooled_snapshot`], while each admitted read is still
+//! recorded on the Parquet handle. A statement naming only Parquet tables reads
+//! the Parquet handle, which equals the total there: the statement handle
+//! holds only the pool peak.
 
 use ravel_query::{PhaseAccounting, PhaseAccountingSnapshot};
 use ravel_types::accounting::QueryAccountingSnapshot;
