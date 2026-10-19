@@ -321,7 +321,7 @@ Acceptance:
 |---|---|---|---|
 | the planning cohort on the reference host: every suite statement whose cold `stats.timings.planInitMs` is at least 30 % of its wall in the current-main rebaseline (decision 4), objects above the 512 KiB range threshold (this cohort definition is replaced by the real-S3 cohort amendment below) | first batch at most 0.5x of the plan pass wall; cold wall at most 0.75x of the rebaseline, per statement | first batch over 0.9x, or wall over 0.85x | predicted (audit page 6); the generated memory-store lane cannot carry this check, its objects sit under the threshold (Stage 0 P4) |
 | segment re-fetches on the fallback branch (one probe GET plus the ranged block GETs per dropped carry), `SEGMENTS = 8`, `BUDGET = 2` | 0 | any | predicted; today `SEGMENTS - BUDGET` segments re-fetch (`tests/logs_selective_scan_amplification.rs:1564-1580`) |
-| TopK statements of the planning cohort (ordered `LIMIT` over above-bound objects), cold | at most 1.05x of the rebaseline per statement | over 1.10x | predicted; the per-segment publication order gives up `global_deal`'s cross-segment interleaving (decision 2b) |
+| TopK statements of the planning cohort (ordered `LIMIT` over above-bound objects), cold (cohort and baseline per the real-S3 cohort amendment below) | at most 1.05x of the rebaseline per statement | over 1.10x | predicted; the per-segment publication order gives up `global_deal`'s cross-segment interleaving (decision 2b) |
 | peak intermediate bytes | at most `plan_concurrency` x object size (unchanged contract) | over it | predicted (ADR-0107 #835 amendment) |
 | peak RSS on the Stage 0 P4 shapes | at most 1.10x of Stage 0 | over 1.10x | predicted (audit page 6) |
 | result rows, every corpus statement | identical to main | any difference | predicted |
@@ -447,7 +447,9 @@ interleaved, five rounds, the load average beside every figure. The suite
 lane is ClickBench on the reference host (c6a.4xlarge, loopback RustFS and
 same-region S3 as separate lanes), current main rebaselined first and the
 candidate measured against that rebaseline, all 43 statements reported, the
-hot total compared only after the rebaseline exists. The program claims the
+hot total compared only after the rebaseline exists. Of the two suite
+lanes, only the same-region S3 lane decides decision 2's cohort and
+baseline (the real-S3 cohort amendment below). The program claims the
 per-track targets above; it does not claim a 2x of the hot total, which the
 audit's own arithmetic (page 2: a 30 % component made 2x faster moves the
 query 1.18x) says the five tracks cannot deliver on their own. The
@@ -513,7 +515,7 @@ for P5.
 
 ## Amendment (issue #3072, 2026-10-19): decision 2's cohort is measured on the real-S3 lane, after #2762
 
-<!-- amendment-applies: sections="2. The logs scan plans and scans in one bounded pipeline|Consequences" pointer="real-S3 cohort amendment" -->
+<!-- amendment-applies: sections="2. The logs scan plans and scans in one bounded pipeline|4. One measurement contract for the program|Consequences" pointer="real-S3 cohort amendment" -->
 <!-- amendment-supersedes: phrase="whose cold `stats.timings.planInitMs` is at least 30 % of its wall in the current-main rebaseline" pointer="real-S3 cohort amendment" -->
 
 Decision 2's acceptance named its cohort as every suite statement whose
@@ -529,17 +531,23 @@ on the lane it ran on, for three reasons.
    cold sum is 4.4x the entry's (1,622 s against 367 s) while hot is equal
    (#3087). The eight statements the definition selects on it (q20, q37 to
    q43) each spend a near-constant 24,766 to 24,829 ms in the plan pass,
-   about 560 ms per plan GET times 1,421 objects, regardless of the
-   statement. On the real-S3 pair lane the same q37 to q43 cost 0.7 to
-   1.2 s cold in total (#3087 comment 6254534336). The cohort is a lane
-   artifact: it confirms the barrier's shape (first batch waits for the
-   whole plan pass, `firstBatchMs` within 0.2 to 1.0 s of `planInitMs` on
-   all eight) and says nothing about its cost on the lane the audit's
-   figures come from.
+   and `stats.phases` shows why: every one of them issues the same 3,964
+   plan GETs moving 307 MB (about 2.8 GETs per object over 1,421 objects,
+   the shape of ADR-2707's 1,133 plan GETs over about 410), so the pass
+   runs at about 160 plan GETs per second from loopback RustFS whatever
+   the statement asks. On the real-S3 pair lane the same q37 to q43 cost
+   0.7 to 1.2 s cold in total (#3087 comment 6254534336): a third as many
+   plan GETs at several times the rate, and the two terms multiply into
+   the 21x to 37x per-statement gap. The plan pass is per-object latency,
+   not statement work. The cohort is a lane artifact: it confirms the
+   barrier's shape (first batch waits for the whole plan pass,
+   `firstBatchMs` within 0.2 to 1.0 s of `planInitMs` on all eight) and
+   says nothing about its cost on the lane the audit's figures come from.
 2. Seven of the eight are plan-dominated, not barrier-dominated. q37 to q43
-   finish 0.5 to 1.5 s after their plan pass, so planning is 94 to 98 % of
-   their wall and overlapping planning with scanning can recover at most
-   that scan share. Only q20 (plan 74 % of 33.3 s) has a scan worth
+   finish 0.5 to 1.5 s after their plan pass (q37: `streamMaxMs` 25,473 ms
+   against `planInitMs` 24,789 ms, 80 scan GETs against 3,964 plan GETs),
+   so planning is 94 to 98 % of their wall and overlapping planning with
+   scanning can recover at most that scan share. Only q20 (plan 74 % of 33.3 s) has a scan worth
    overlapping on the kit lane. Decision 2's cold-wall band (at most
    0.75x) can only hold where the scan is comparable to the plan pass; for
    a plan-dominated statement the lever is the plan pass itself (fewer or
@@ -560,13 +568,16 @@ follows; the other acceptance rows of decision 2 stand.
 
 | check | target | miss | basis |
 |---|---|---|---|
-| the planning cohort: after #2762 (T11) is on `main`, one cold measurement on the reference lane (c6a.4xlarge, same-region S3, the entry's object count, release build, decision 4) of q20 and every other exact-key or selective statement, each with `planInitMs`, `firstBatchMs` and the plan and scan GET and byte splits; a statement whose plan holds no logs scan or more than one is listed as unmeasured | cohort = statements whose `planInitMs` is at least 30 % of cold wall AND whose scan wall (cold wall less `planInitMs`) is at least 0.5x the plan pass; T2a (#3080) dispatches only when the cohort has at least three statements | fewer than three: decision 2 is narrowed by a further amendment to first-batch latency only (one task, the barrier removed, no cold-wall band) or dropped; no P4 task is dispatched on the kit-lane cohort | measured 2026-10-18 on the kit lane: 8 statements by the old definition, 7 plan-dominated, lane artifact; issue #3072 comment 6253867738, comment 6254536290; #3087 comment 6254534336 |
-| cold wall, cohort statements only | at most 0.75x of the rebaseline, per statement | over 0.85x | predicted (audit page 6); the band applies to the measured cohort, not to plan-dominated statements |
-| first batch, every measured statement with `planInitMs` at least 30 % of cold wall, plan-dominated ones included | at most 0.5x of the plan pass wall | over 0.9x | predicted (audit page 6); on the kit lane every one of the eight waited for the whole plan pass, issue #3072 comment 6253867738 |
+| the planning cohort: after #2762 (T11) is on `main`, one cold measurement of current `main` on the reference lane (c6a.4xlarge, same-region S3, the entry's object count, release build, decision 4) of q20 and every other exact-key or selective statement, each with `planInitMs`, `firstBatchMinMs`, `streamMaxMs` and the plan and scan GET and byte splits; this measurement is decision 2's rebaseline, and the kit rebaseline is not a baseline for any row here; a statement whose plan holds no logs scan or more than one is listed as unmeasured | cohort = statements whose `planInitMs` is at least 30 % of `streamMaxMs` AND whose scan wall, `streamMaxMs` less `planInitMs` (both scan-origin figures rendered under the same single-scan condition, so resolve, SQL planning, start and drain are not counted as scan), is at least 0.5x `planInitMs`; T2a (#3080) dispatches only when the cohort has at least three statements | fewer than three: decision 2 is narrowed by a further amendment to first-batch latency only (one task, the barrier removed, no cold-wall band) or dropped; no P4 task is dispatched on the kit-lane cohort | measured 2026-10-18 on the kit lane: 8 statements by the old definition, 7 plan-dominated, lane artifact; issue #3072 comment 6253867738, comment 6254536290; #3087 comment 6254534336 |
+| cold wall, cohort statements only | at most 0.75x of the post-#2762 reference-lane measurement above, per statement | over 0.85x | predicted (audit page 6); the band applies to the measured cohort, not to plan-dominated statements |
+| first batch, every measured statement with `planInitMs` at least 30 % of `streamMaxMs`, plan-dominated ones included | `firstBatchMinMs` at most 0.5x of `planInitMs` in the post-#2762 reference-lane measurement | over 0.9x | predicted (audit page 6); on the kit lane every one of the eight waited for the whole plan pass, issue #3072 comment 6253867738 |
+| TopK statements of the cohort (ordered `LIMIT`), cold | at most 1.05x of the post-#2762 reference-lane measurement, per statement | over 1.10x | predicted; the per-segment publication order gives up `global_deal`'s cross-segment interleaving (decision 2b) |
 
-The sub-issue bodies of #3080 and #3081 carry this gate in place of
-"a non-empty planning cohort". ADR-2707's real-S3 q20 record (plan 602 MB
-and 1,133 GETs against scan 877 MB and 1,225 GETs) remains the only
-production-lane evidence that a barrier-dominated statement exists, and it
-is the statement #2762 changes first, so the measurement above is taken
-after #2762 and not before.
+The sub-issue bodies of #3080 and #3081 are updated to carry this gate in
+place of "a non-empty planning cohort" when this amendment merges.
+ADR-2707's real-S3 q20 record (plan 602 MB and 1,133 GETs against scan
+877 MB and 1,225 GETs) is a GET and byte split with no wall timing: it is
+the proxy saying a barrier-dominated statement exists on the reference
+lane, and the measurement above supplies the wall timings the cohort is
+defined on. q20 is also the statement #2762 changes first, so the
+measurement is taken after #2762 and not before.
