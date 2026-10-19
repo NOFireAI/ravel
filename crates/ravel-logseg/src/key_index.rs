@@ -19,8 +19,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 
 use ravel_codec::key_idx::{
-    KEY_IDX_MAX_NAME_LEN, KEY_IDX_VERSION_2, KEY_IDX_WRITER_BUCKET_BITS, KeyIdxFieldInput,
-    KeyIdxPrefix, bucket_index, encode_key_idx_with, key_idx_prefix_range, verify_key_idx,
+    KEY_IDX_MAX_NAME_LEN, KEY_IDX_VERSION_2, KEY_IDX_WRITER_BUCKET_BITS, KeyIdxBucket,
+    KeyIdxFieldInput, KeyIdxPrefix, bucket_index, encode_key_idx_with, key_idx_prefix_range,
+    verify_key_idx,
 };
 
 use crate::error::LogSegError;
@@ -311,6 +312,16 @@ where
     Ok(Some(prefix.version()))
 }
 
+/// Parses a probe's prefix bytes, `None` (the probe declines) when the
+/// section's version is one [`section_resolves_like_the_reader`] rejects.
+fn probe_prefix<'a>(
+    desc: &SectionDesc,
+    prefix_bytes: &'a [u8],
+) -> Result<Option<KeyIdxPrefix<'a>>, LogSegError> {
+    let prefix = KeyIdxPrefix::parse(prefix_bytes, desc.prefix_len, desc.len)?;
+    Ok(section_resolves_like_the_reader(prefix.version()).then_some(prefix))
+}
+
 /// Probes the object's KEY_IDX for `key8` of `field` under `key_type`,
 /// through `read`, which returns the object's bytes for an object-absolute
 /// range. Reads the section's `[0, prefix_len)`, then the one bucket the key
@@ -341,10 +352,9 @@ where
     };
     let prefix_range = key_idx_prefix_range(desc.prefix_len, desc.len)?;
     let prefix_bytes = read(absolute(desc, prefix_range)?)?;
-    let prefix = KeyIdxPrefix::parse(prefix_bytes.as_ref(), desc.prefix_len, desc.len)?;
-    if !section_resolves_like_the_reader(prefix.version()) {
+    let Some(prefix) = probe_prefix(desc, prefix_bytes.as_ref())? else {
         return Ok(None);
-    }
+    };
     let Some(bucket) = prefix.locate(field, key_type, key8)? else {
         return Ok(None);
     };
@@ -360,6 +370,118 @@ where
         )));
     }
     Ok(Some(blocks))
+}
+
+/// What a KEY_IDX probe for one key says about one object (ADR-2707 decision
+/// 5, tier 1). The three arms are opposite pruning decisions, so a caller
+/// matches on all three.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KeyProbe {
+    /// No entry of the field has the key's `key8`: no block of the object
+    /// holds the value under the declared type, and the caller drops the
+    /// object without a block read.
+    Absent,
+    /// The ascending, non-empty level-0 block ordinals holding every value
+    /// whose `key8` equals the probed one. Only these blocks can hold the
+    /// value; a `key8` collision can add a block that does not.
+    Present(Vec<u32>),
+    /// The object has no KEY_IDX, or its header is at a version
+    /// [`section_resolves_like_the_reader`] rejects, or does not name the
+    /// field, or names it under another key type: the section says nothing
+    /// and every block stays a candidate.
+    Declined,
+}
+
+/// The first step of a ranged probe: the object-absolute range of the
+/// section's `[0, prefix_len)`, `None` when the object has no KEY_IDX (the
+/// probe declines with no read).
+pub fn key_probe_prefix_range(footer: &LogFooter) -> Result<Option<Range<u64>>, LogSegError> {
+    let Some(desc) = key_index_section(footer) else {
+        return Ok(None);
+    };
+    let prefix_range = key_idx_prefix_range(desc.prefix_len, desc.len)?;
+    Ok(Some(absolute(desc, prefix_range)?))
+}
+
+/// The second step of a ranged probe, over the bytes of
+/// [`key_probe_prefix_range`]: either the answer, or the one bucket left to
+/// read.
+#[derive(Debug, Clone)]
+pub enum KeyProbeStep {
+    Done(KeyProbe),
+    Bucket(KeyProbeBucket),
+}
+
+/// The one bucket a ranged probe still has to read.
+#[derive(Debug, Clone)]
+pub struct KeyProbeBucket {
+    bucket: KeyIdxBucket,
+    range: Range<u64>,
+    block_count: u64,
+}
+
+impl KeyProbeBucket {
+    /// The bucket's object-absolute byte range: the probe's second read.
+    pub fn range(&self) -> Range<u64> {
+        self.range.clone()
+    }
+
+    /// The third step: verifies and decodes the bucket's bytes (exactly
+    /// [`KeyProbeBucket::range`]) and answers for the probed key. An entry of
+    /// the bucket naming a block at or past the object's level-0 block count,
+    /// whichever key it belongs to, is [`LogSegError::Corrupted`].
+    pub fn finish(&self, frame: &[u8]) -> Result<KeyProbe, LogSegError> {
+        let entries = self.bucket.entries(frame)?;
+        if let Some(&(_, past)) = entries
+            .iter()
+            .find(|(_, b)| u64::from(*b) >= self.block_count)
+        {
+            return Err(LogSegError::Corrupted(format!(
+                "KEY_IDX bucket {} names block {past}, object has {} blocks",
+                self.bucket.bucket(),
+                self.block_count
+            )));
+        }
+        let blocks = self.bucket.matching(&entries);
+        Ok(if blocks.is_empty() {
+            KeyProbe::Absent
+        } else {
+            KeyProbe::Present(blocks)
+        })
+    }
+}
+
+/// Parses the prefix bytes [`key_probe_prefix_range`] named and locates the
+/// bucket `key8` of `field` under `key_type` mixes to. It declines where
+/// [`probe_ranged`] does: on a header at a version
+/// [`section_resolves_like_the_reader`] rejects, or one that does not name the
+/// field under that key type. An empty bucket is [`KeyProbe::Absent`] with no
+/// second read.
+pub fn locate_key(
+    footer: &LogFooter,
+    field: &str,
+    key_type: KeyType,
+    key8: &Key8,
+    prefix_bytes: &[u8],
+) -> Result<KeyProbeStep, LogSegError> {
+    let Some(desc) = key_index_section(footer) else {
+        return Ok(KeyProbeStep::Done(KeyProbe::Declined));
+    };
+    let Some(prefix) = probe_prefix(desc, prefix_bytes)? else {
+        return Ok(KeyProbeStep::Done(KeyProbe::Declined));
+    };
+    let Some(bucket) = prefix.locate(field, key_type, key8)? else {
+        return Ok(KeyProbeStep::Done(KeyProbe::Declined));
+    };
+    if bucket.is_empty() {
+        return Ok(KeyProbeStep::Done(KeyProbe::Absent));
+    }
+    let range = absolute(desc, bucket.range())?;
+    Ok(KeyProbeStep::Bucket(KeyProbeBucket {
+        bucket,
+        range,
+        block_count: footer.block_count,
+    }))
 }
 
 /// [`probe_ranged`] over a [`ByteSource`]: the whole object, or a
@@ -834,5 +956,53 @@ mod tests {
                 Some(RLOG_KEY_IDX_VERSION)
             );
         }
+    }
+
+    /// The step API reads the prefix, then at most one bucket, and answers
+    /// each of the three cases the way `probe_ranged` does.
+    #[test]
+    fn the_step_api_matches_probe_ranged() {
+        let obj = object();
+        let footer = open(&obj).expect("open");
+        let read = |r: Range<u64>| &obj[r.start as usize..r.end as usize];
+        let prefix = key_probe_prefix_range(&footer)
+            .expect("range")
+            .expect("KEY_IDX");
+        let step = |field: &str, key_type: KeyType, key8: &Key8| match locate_key(
+            &footer,
+            field,
+            key_type,
+            key8,
+            read(prefix.clone()),
+        )
+        .expect("locate")
+        {
+            KeyProbeStep::Done(answer) => (answer, 1),
+            KeyProbeStep::Bucket(bucket) => {
+                (bucket.finish(read(bucket.range())).expect("finish"), 2)
+            }
+        };
+        for v in 0..4 {
+            assert_eq!(
+                step("user_id", KeyType::I64, &key8_i64(v)),
+                (KeyProbe::Present(vec![v as u32]), 2)
+            );
+        }
+        let (absent, _) = step("user_id", KeyType::I64, &key8_i64(99));
+        assert_eq!(absent, KeyProbe::Absent);
+        assert_eq!(
+            probe_source(&footer, &obj[..], "user_id", KeyType::I64, &key8_i64(99)).expect("probe"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            step("other", KeyType::I64, &key8_i64(1)),
+            (KeyProbe::Declined, 1)
+        );
+        assert_eq!(
+            step("user_id", KeyType::Str, &key8_str("1")),
+            (KeyProbe::Declined, 1)
+        );
+        // `key8_str` is `key8_bytes` of the UTF-8 bytes.
+        assert_eq!(key8_str("abc"), key8_bytes(b"abc"));
     }
 }

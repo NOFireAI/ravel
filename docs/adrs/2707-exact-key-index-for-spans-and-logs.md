@@ -540,7 +540,9 @@ flowchart LR
   sequential round trips ADR-0849 states; a no-range lookup over `p` parts
   costs `1 + ceil(2p / parallelism)` rounds at the probe concurrency the
   implementing task sets and measures. Leaf and section probes are their own
-  cost phase (decision 7).
+  cost phase (decision 7). On logs, the tier-1 probe skips objects at or
+  under the whole-object bound and declines rather than prunes on any
+  section it cannot read as its own: see the logs probe amendment below.
 
 ### 6. Erasure, compaction and resharding
 
@@ -599,6 +601,8 @@ flowchart LR
   `crates/ravel-sql/src/logs_provider.rs`; block sets flow into
   `LogsScanExec` and `crates/ravel-query/src/log_fetcher.rs` as the block
   list `projected_page_ranges` already takes. Every arm stays `Inexact`.
+  T11 landed this wiring inside the fetcher's plan rather than in
+  `logs_provider.rs`: see the logs probe amendment below.
 - **Statistics.** `stats.pruning` gains `segmentsPrunedByKeyIndex` and
   `blocksPrunedByKeyIndex` beside the #2680 fields; `stats.phases` gains a
   `keyIndex` phase whose requests and wire bytes (as transferred, ranged
@@ -1065,7 +1069,8 @@ true only for 2. Every reader accepts both versions. The logs probe
 (`probe_ranged` and `probe_source`) declines on an RLOG section that is not
 marked and reads that object as unindexed for the field, because a version
 1 section does not prove a key absent. No logs query prunes on it yet
-(issue #2762).
+(issue #2762; retired by the logs probe amendment below, which landed the
+probe).
 
 The section is Class A. Compaction and the erasure rewrite rebuild KEY_IDX
 from the records they re-encode and write version 2 whatever their inputs
@@ -1084,3 +1089,45 @@ them until those objects are rewritten. The section marker does not cover
 them; issue #3040 tracks that.
 
 Refs: #2707, #3039, #3040, #2961, #2762
+
+## Amendment (issue #2762): the logs probe runs inside the fetcher's plan
+
+<!-- amendment-applies: sections="5. Lookup: route, probe tier 2, probe tier 1, read blocks; exact by the safety lemma|7. Read-path wiring and statistics" pointer="logs probe amendment" -->
+<!-- amendment-supersedes: phrase="No logs query prunes on it yet" pointer="logs probe amendment" -->
+
+T11 (#2762) landed the logs tier-1 probe, and three things differ from the
+wording of decisions 5 and 7.
+
+Where it runs. The probe is not a `KeyEquals` arm of
+`declared_comparison_predicate` and there is no `prune_segments_by_key_index`
+in `crates/ravel-sql/src/logs_provider.rs`. `crates/ravel-sql/src/logs_pushdown.rs`
+extracts a `KeyEquals` per equality through its own `key_equality`
+function, gated on the tenant's key-index declaration (a declared but
+unindexed column, or `trace_id` without `index_trace_id`, gets no arm and
+pays no prefix read), and the keys ride on `LogQuery` into the fetcher,
+where `plan_segment_keyed` and `fetch_keyed_plan` in
+`crates/ravel-query/src/log_fetcher.rs` probe each object's section during
+its plan and hand the surviving block set to the existing planned-block
+path. The distributed logs slice ticket carries the keys as ticket version
+10; versions 8 and 9 are byte-identical to before.
+
+What is probed. An object at or under `plan_whole_object_bound()` (512 KiB)
+is read whole and not probed, so decision 5's "every uncovered candidate"
+reads "every uncovered candidate above the whole-object bound" for logs.
+
+What never prunes. A key declines, and a declined key prunes nothing in any
+`AND` order, when the object has no KEY_IDX section, carries a version 1
+section (the #3039 amendment above), does not carry the field, or carries
+it under another key type; a corrupt prefix or bucket sends the object to
+the unkeyed route; an empty `AND` intersection prunes the object and counts
+under `segmentsPrunedByKeyIndex`. Every keyed leaf stays `Inexact`, so the
+residual predicate re-checks the original value on every route. The
+read-count rule is one prefix read plus at most one bucket per key, stopping
+at the first absent key.
+
+One route change is a cost, not a correctness, consequence: a `trace_id`-only
+query on a tenant that indexes `trace_id` no longer takes the scan-level
+whole-segment fast path, so objects written before the index pay one footer
+probe each above the bound; #3090 tracks it, and T12 (#2763) measures it.
+
+Refs: #2762, #3090, #2961, #3072

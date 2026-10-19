@@ -727,19 +727,20 @@ pub struct SqlStats {
     /// prunes the same snapshot again, so the sum can exceed it. Zero for a
     /// metrics query and for a logs plan with no scan node.
     pub segments_pruned_by_stats: u64,
-    /// Spans segments a `trace_id` equality lookup opened and then read no
-    /// block of, because the object's KEY_IDX section says the trace is absent
-    /// (ADR-2707 decision 5), read off the spans scans'
-    /// `segments_pruned_by_key_index` counter. Counted within
+    /// Segments an exact-key lookup opened and then read no block of, because
+    /// the object's KEY_IDX section says the key is absent (ADR-2707
+    /// decision 5): a spans `trace_id` equality, or a logs equality on an
+    /// indexed declared column or on `trace_id`. Read off the spans and logs
+    /// scans' `segments_pruned_by_key_index` counters. Counted within
     /// [`Self::segments`]. Zero for any other query.
     pub segments_pruned_by_key_index: u64,
-    /// Skip-index candidate blocks of the spans segments such a lookup did
-    /// read that KEY_IDX named no entry for, read off the spans scans'
-    /// `blocks_pruned_by_key_index` counter. It is 0 when the skip index
-    /// already narrows the object to the trace's blocks, which it does on
-    /// every object written in trace order, as `RspanWriter::finish` writes
-    /// every object today. An absent trace's segment is counted in
-    /// [`Self::segments_pruned_by_key_index`], not here.
+    /// Blocks of the segments such a lookup did read that the plan's other
+    /// pruning kept and KEY_IDX named no entry for, read off the spans and
+    /// logs scans' `blocks_pruned_by_key_index` counters. On spans it is 0
+    /// when the skip index already narrows the object to the trace's blocks,
+    /// which it does on every object written in trace order, as
+    /// `RspanWriter::finish` writes every object today. An absent key's
+    /// segment is counted in [`Self::segments_pruned_by_key_index`], not here.
     pub blocks_pruned_by_key_index: u64,
     /// Blocks of opened segments, and owned segments never opened, that the
     /// successful attempt's logs scans skipped because their minimum `ts` was
@@ -1023,8 +1024,8 @@ struct BlockCounts {
 /// (crate::scan), so each sum is that scan's total however the optimizer
 /// nested it, and a plan carrying neither scan contributes nothing. The
 /// `segments_pruned_by_key_index` and `blocks_pruned_by_key_index` sums come
-/// from `SpansScanExec`
-/// (crate::spans_scan) the same way. Reads the counters the scans already
+/// from both `SpansScanExec` (crate::spans_scan) and `LogsScanExec` the same
+/// way. Reads the counters the scans already
 /// maintain rather than counting a second time.
 fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCounts) {
     // One walk, one `metrics()` call per node: that call clones the node's
@@ -2867,6 +2868,13 @@ impl SqlExecutor {
                                 )
                                 .await?
                         };
+                        // Resolved per plan, not pinned: it only decides which
+                        // equalities reach the KEY_IDX probe, which narrows the
+                        // blocks read and never the rows returned.
+                        let key_index = self
+                            .declared_source
+                            .key_index(tenant_hash, extras.column_stats_now_ns)
+                            .await;
                         SessionTable::Logs(Arc::new(
                             LogsTableProvider::new(
                                 snapshot,
@@ -2875,6 +2883,7 @@ impl SqlExecutor {
                                 phase_accounting.lane(signal).clone(),
                             )
                             .with_declared_columns(extras.declared.clone())
+                            .with_key_index(key_index)
                             .with_column_stats(column_stats)
                             .with_segment_timing(config.segment_timing),
                         ))

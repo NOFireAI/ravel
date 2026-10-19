@@ -46,7 +46,10 @@ query lists and opens the segments of every shard in the matched time window,
 the same as any other query, and probes the KEY_IDX of each one the skip
 index keeps a block in. Objects KEY_IDX ruled out are counted in
 `stats.pruning.segmentsPrunedByKeyIndex`, and the KEY_IDX reads are reported
-under the `keyIndex` entry of `stats.phases`.
+under the `keyIndex` entry of `stats.phases`. A `trace_id =` filter on the
+`logs` table probes log objects the same way when the tenant indexes
+`trace_id` (see
+[exact-key index fields](operations/configuration.md#exact-key-index-fields)).
 
 Online resharding can move a tenant to a new shard count while spans still
 arrive. A trace whose spans straddle a reshard activation can split across

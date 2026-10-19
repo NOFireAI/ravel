@@ -899,6 +899,22 @@ no slower than the equivalent `attrs['k']` filter:
   blocks through the RLOG skip index (`status_code > 500`, `is_active = true`,
   `status_code IN (200, 404)`).
 - A `str`/`bytes` equality prunes through POSTINGS, like `attrs['k'] = 'v'`.
+- An `i64`, `str` or `bytes` equality against a literal of the column's type
+  (`status_code = 500`, `region = 'ap-south-1'`), and `trace_id = '<32 hex
+  digits>'`, also probe the exact-key index of each object when the tenant
+  indexes the field (see
+  [exact-key index fields](operations/configuration.md#exact-key-index-fields)).
+  The probe reads the index's prefix once and at most one small bucket per
+  key. An object that does not hold the value is dropped after those reads,
+  and an object that does reads only the blocks holding it. This reads fewer
+  bytes, but possibly more requests: every probed object pays those index
+  reads whether or not it holds the value. Equalities joined by `AND` narrow
+  together; an `OR`, a negation, and a column inside an expression
+  (`status_code + 0 = 500`) do not probe. An equality on a column the tenant
+  does not index issues no index read. The response reports the dropped
+  objects in `stats.pruning.segmentsPrunedByKeyIndex`, the dropped blocks in
+  `stats.pruning.blocksPrunedByKeyIndex`, and the index reads under the
+  `keyIndex` entry of `stats.phases`.
 
 Pruning is always widen-only, because Ravel applies the original predicate
 again above the scan. The coarser range of the `IN` envelope and any

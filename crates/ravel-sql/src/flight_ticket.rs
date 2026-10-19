@@ -72,7 +72,9 @@
 //! ```text
 //! magic         4   b"RFT1"
 //! version       1   = 8; 9 for a ticket carrying the pushdown block; 10 for
-//!                   a ticket carrying segment groups (see below)
+//!                   a ticket carrying segment groups (see below); 11 when
+//!                   the pushdown block is a logs block with exact-key
+//!                   equalities
 //! tenant       16   TenantHash bytes
 //! now_ns        8   i64
 //! deadline_ns   8   i64
@@ -80,7 +82,7 @@
 //! slice_count   4   u32   (number of slices; 1 for a whole-snapshot ticket)
 //! token_count   4   u32
 //!   per token:  4 + N   len-prefixed CommitToken::encode() (ASCII)
-//! [pins]            versions 8 and 9: seg_count through erasure_count
+//! [pins]            versions 8, 9 and 11: seg_count through erasure_count
 //!                   below, once. Version 10 instead:
 //!   group_count  4   u32   (>= 2, one per signal table the statement reads)
 //!   per group, in lane order samples, logs, spans, alerts, audit:
@@ -136,7 +138,7 @@
 //!         limit      8   u64
 //! stmt_len      4   u32   (<= MAX_STATEMENT_LEN)
 //! stmt          N   statement text (UTF-8)
-//! [pushdown]        version 9 only: the slice pushdown block a
+//! [pushdown]        versions 9 and 11 only: the slice pushdown block a
 //!                   coordinator attached (see below)
 //!   kind         1   1 = spans, 2 = logs
 //!   ts_lo        1 (+8)  flag 0 = absent, 1 = present, then i64
@@ -158,6 +160,14 @@
 //!         if range:
 //!           min    1 (+8)  flag, then the NumStat bit pattern
 //!           max    1 (+8)  same
+//!     version 11 only:
+//!     key_count    4  u32 (>= 1)
+//!       per exact-key equality (ravel_query::KeyEquals):
+//!         field_len 4  u32
+//!         field     N  field name (UTF-8)
+//!         key_type  1  KEY_IDX key type byte: 1 = Id16, 2 = I64, 3 = Str,
+//!                      4 = Bytes
+//!         key8      8  the compared literal's key8
 //! mac          32   keyed BLAKE3-256 over every preceding byte
 //! ```
 //!
@@ -182,8 +192,9 @@
 //! 10, with both flat lists empty; empty keeps a statement over at most one
 //! signal table on version 8 or 9, byte for byte. A version 10 ticket is
 //! client-surface only: the distributed slice path splits one snapshot, so
-//! a slice ticket never carries groups and the slice surface decodes at most
-//! version 9.
+//! a slice ticket never carries groups and the slice surface refuses version
+//! 10. The slice surface's own newer version is 11, the pushdown block with
+//! a logs key section; the client surface refuses it in turn.
 //!
 //! # Integrity: a keyed MAC, not a checksum
 //!
@@ -344,23 +355,32 @@
 //!   statement naming two or more signal tables (ADR-2904 decision 10).
 //!   Written only then and only on the client surface; every other ticket
 //!   stays 8 or 9.
+//! - 11: a logs pushdown block ends with the exact-key equalities the
+//!   worker's plan probes KEY_IDX with (ADR-2707 decision 5, issue #2762).
+//!   Written only when the block carries at least one; every other slice
+//!   ticket keeps version 8 or 9. Version 11 is a slice-surface version: it
+//!   follows 9's layout, not 10's, so the slice surface decodes 8, 9 and 11
+//!   and the client surface 8, 9 and 10. A version 9 worker refuses a
+//!   version 11 ticket on its version byte.
 //!
 //! Every layout change bumps the byte, even though a ticket is ephemeral,
 //! because the build that mints a ticket and the build that redeems it can
 //! differ: a slice ticket is minted by a coordinator and redeemed by a worker
 //! in another process, and during a rolling upgrade the two run different
-//! releases. A decoder that meets a version above its own returns
+//! releases. A decoder that meets a version its surface does not accept,
+//! including one above its own, returns
 //! [`FlightTicketError::UnsupportedVersion`] after the MAC verifies, so skew
 //! reads as skew. Without the bump a version-8 decoder parses up to the
 //! statement and refuses the block as [`FlightTicketError::TrailingBytes`],
 //! which the slice surface could not tell apart from a forged ticket.
 
 use ravel_catalog::{SegmentLevel, SegmentRef};
+use ravel_logseg::key_index::KeyType;
 use ravel_logseg::{AttrValue, FieldSel, FieldType, Predicate};
 use ravel_pqtable::names::validate_table;
 use ravel_proto::commit::v1::{ErasurePredicateMatcher, ErasureRequest};
 use ravel_query::erasure::ErasurePredicate;
-use ravel_query::{ByteLimit, RequestBudgets, RequestLimit};
+use ravel_query::{ByteLimit, KeyEquals, RequestBudgets, RequestLimit};
 use ravel_types::{CommitToken, TenantHash};
 use uuid::Uuid;
 
@@ -380,13 +400,30 @@ const MAGIC: [u8; 4] = *b"RFT1";
 /// Version of a ticket without the slice pushdown block, and the oldest this
 /// codec decodes.
 const VERSION: u8 = 8;
-/// Version of a ticket carrying the slice pushdown block, and the newest the
-/// slice surface decodes.
+/// Version of a ticket carrying the slice pushdown block with no exact-key
+/// equality.
 pub(crate) const VERSION_PUSHDOWN: u8 = 9;
 /// Version of a ticket carrying one segment group per signal table (ADR-2904
 /// decision 10), and the newest the client surface decodes. A slice ticket is
 /// never this version.
 pub(crate) const VERSION_GROUPS: u8 = 10;
+/// Version of a ticket whose logs pushdown block carries exact-key
+/// equalities (ADR-2707 decision 5), and the newest the slice surface
+/// decodes. Its layout is version 9's plus the key section, so a client
+/// ticket is never this version.
+pub(crate) const VERSION_KEY_EQUALS: u8 = 11;
+
+/// The versions the client surface decodes.
+const CLIENT_VERSIONS: &[u8] = &[VERSION, VERSION_PUSHDOWN, VERSION_GROUPS];
+/// The versions the slice surface decodes. Version 10 is a client ticket.
+const SLICE_VERSIONS: &[u8] = &[VERSION, VERSION_PUSHDOWN, VERSION_KEY_EQUALS];
+/// Every version this codec decodes when no surface is named.
+const ALL_VERSIONS: &[u8] = &[
+    VERSION,
+    VERSION_PUSHDOWN,
+    VERSION_GROUPS,
+    VERSION_KEY_EQUALS,
+];
 
 /// Wire tag of each signal table's group in a version 10 ticket. Parquet
 /// tables have no segment set and so no tag.
@@ -632,8 +669,10 @@ impl SqlTicketKeys {
     /// Decode `bytes` as a `surface` ticket, accepting a MAC under any of that
     /// surface's keys. [`FlightTicketError::MacMismatch`] when none verifies;
     /// any other error is the first key's structural refusal, which does not
-    /// depend on the key. The slice surface decodes up to version 9: a
-    /// version 10 ticket there is [`FlightTicketError::UnsupportedVersion`].
+    /// depend on the key. The client surface decodes versions 8, 9 and 10,
+    /// the slice surface 8, 9 and 11: a version 10 ticket on the slice
+    /// surface, or a version 11 ticket on the client surface, is
+    /// [`FlightTicketError::UnsupportedVersion`].
     pub fn decode(
         &self,
         bytes: &[u8],
@@ -650,12 +689,12 @@ impl SqlTicketKeys {
         bytes: &[u8],
         surface: TicketSurface,
     ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
-        let max_version = match surface {
-            TicketSurface::Client => VERSION_GROUPS,
-            TicketSurface::Slice => VERSION_PUSHDOWN,
+        let accepted = match surface {
+            TicketSurface::Client => CLIENT_VERSIONS,
+            TicketSurface::Slice => SLICE_VERSIONS,
         };
         for key in self.keys(surface) {
-            match FlightTicket::decode_up_to(bytes, key, max_version) {
+            match FlightTicket::decode_accepting(bytes, key, accepted) {
                 Err(FlightTicketError::MacMismatch) => continue,
                 other => return other,
             }
@@ -972,12 +1011,11 @@ impl FlightTicket {
 
         let mut buf = Vec::with_capacity(MIN_ENCODED_LEN + self.statement.len());
         buf.extend_from_slice(&MAGIC);
-        buf.push(if grouped {
-            VERSION_GROUPS
-        } else if pushdown.is_some() {
-            VERSION_PUSHDOWN
-        } else {
-            VERSION
+        buf.push(match pushdown {
+            _ if grouped => VERSION_GROUPS,
+            Some(p) if p.carries_key_equals() => VERSION_KEY_EQUALS,
+            Some(_) => VERSION_PUSHDOWN,
+            None => VERSION,
         });
         buf.extend_from_slice(&self.tenant.0);
         buf.extend_from_slice(&self.now_ns.to_le_bytes());
@@ -1055,16 +1093,17 @@ impl FlightTicket {
         bytes: &[u8],
         key: &TicketKey,
     ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
-        Self::decode_up_to(bytes, key, VERSION_GROUPS)
+        Self::decode_accepting(bytes, key, ALL_VERSIONS)
     }
 
-    /// The decoder for versions [`VERSION`] through `max_version`. Pinned at
-    /// [`VERSION`] it is the decoder from before the pushdown block, which is
-    /// how the tests reproduce an older worker.
-    fn decode_up_to(
+    /// The decoder for the versions in `accepted`; any other version is
+    /// [`FlightTicketError::UnsupportedVersion`]. Pinned at `[VERSION]` it is
+    /// the decoder from before the pushdown block, which is how the tests
+    /// reproduce an older worker.
+    fn decode_accepting(
         bytes: &[u8],
         key: &TicketKey,
-        max_version: u8,
+        accepted: &[u8],
     ) -> Result<(FlightTicket, Option<SlicePushdown>), FlightTicketError> {
         if bytes.len() < MIN_ENCODED_LEN {
             return Err(FlightTicketError::Truncated);
@@ -1083,7 +1122,7 @@ impl FlightTicket {
             return Err(FlightTicketError::BadMagic);
         }
         let version = cur.read_u8()?;
-        if !(VERSION..=max_version).contains(&version) {
+        if !accepted.contains(&version) {
             return Err(FlightTicketError::UnsupportedVersion(version));
         }
         let tenant = TenantHash(cur.read_array::<16>()?);
@@ -1177,8 +1216,9 @@ impl FlightTicket {
         let statement =
             std::str::from_utf8(stmt_bytes).map_err(|_| FlightTicketError::InvalidUtf8)?;
 
-        let pushdown = if version == VERSION_PUSHDOWN {
-            Some(read_pushdown(&mut cur)?)
+        // Version 10 carries groups and no pushdown block.
+        let pushdown = if version == VERSION_PUSHDOWN || version == VERSION_KEY_EQUALS {
+            Some(read_pushdown(&mut cur, version)?)
         } else {
             None
         };
@@ -1316,10 +1356,10 @@ impl SlicePushdown {
         }))
     }
 
-    /// The logs subset of `pushdown`: `ts_lo`, `ts_hi` and the prune
-    /// predicates the layout can carry. A prune predicate outside the
-    /// layout is dropped, which only widens what the worker reads; the
-    /// content channel is not carried.
+    /// The logs subset of `pushdown`: `ts_lo`, `ts_hi`, the prune
+    /// predicates the layout can carry, and the exact-key equalities. A prune
+    /// predicate outside the layout is dropped, which only widens what the
+    /// worker reads; the content channel is not carried.
     pub fn logs(pushdown: &LogsPushdown) -> Self {
         SlicePushdown(SlicePushdownKind::Logs(LogsPushdown {
             ts_lo: pushdown.ts_lo,
@@ -1331,7 +1371,14 @@ impl SlicePushdown {
                 .filter(|p| prune_is_carried(p))
                 .cloned()
                 .collect(),
+            key_equals: pushdown.key_equals.clone(),
         }))
+    }
+
+    /// Whether this is a logs block carrying exact-key equalities, which only
+    /// a version [`VERSION_KEY_EQUALS`] ticket can hold.
+    fn carries_key_equals(&self) -> bool {
+        matches!(&self.0, SlicePushdownKind::Logs(p) if !p.key_equals.is_empty())
     }
 
     /// The spans pushdown this block carries, or `None` for a logs block.
@@ -1835,13 +1882,26 @@ fn write_pushdown(buf: &mut Vec<u8>, pushdown: &SlicePushdown) -> Result<(), Fli
                     _ => return Err(FlightTicketError::UncarriedPushdown),
                 }
             }
+            if !p.key_equals.is_empty() {
+                write_u32(buf, u32_len(p.key_equals.len())?);
+                for k in &p.key_equals {
+                    write_len_prefixed(buf, k.field.as_bytes())?;
+                    buf.push(k.key_type.as_u8());
+                    buf.extend_from_slice(&k.key8);
+                }
+            }
         }
     }
     Ok(())
 }
 
-fn read_pushdown(cur: &mut Cursor<'_>) -> Result<SlicePushdown, FlightTicketError> {
+fn read_pushdown(cur: &mut Cursor<'_>, version: u8) -> Result<SlicePushdown, FlightTicketError> {
     match cur.read_u8()? {
+        // Version 11 exists only for a logs block's key section; the encoder
+        // never writes a spans block under it.
+        PUSHDOWN_SPANS if version == VERSION_KEY_EQUALS => {
+            Err(FlightTicketError::InvalidPushdownTag(PUSHDOWN_SPANS))
+        }
         PUSHDOWN_SPANS => {
             let ts_lo = read_opt_u64(cur)?.map(|v| v as i64);
             let ts_hi = read_opt_u64(cur)?.map(|v| v as i64);
@@ -1901,11 +1961,29 @@ fn read_pushdown(cur: &mut Cursor<'_>) -> Result<SlicePushdown, FlightTicketErro
                 };
                 prune.push(predicate);
             }
+            let mut key_equals = Vec::new();
+            if version == VERSION_KEY_EQUALS {
+                let count = cur.read_u32()?;
+                if count == 0 {
+                    return Err(FlightTicketError::InvalidPushdownTag(0));
+                }
+                for _ in 0..count {
+                    let field = cur.read_len_prefixed()?;
+                    let field = std::str::from_utf8(field)
+                        .map_err(|_| FlightTicketError::InvalidUtf8)?
+                        .to_owned();
+                    let ty_byte = cur.read_u8()?;
+                    let key_type = KeyType::from_u8(ty_byte)
+                        .map_err(|_| FlightTicketError::InvalidPushdownTag(ty_byte))?;
+                    key_equals.push(KeyEquals::new(field, key_type, cur.read_array::<8>()?));
+                }
+            }
             Ok(SlicePushdown(SlicePushdownKind::Logs(LogsPushdown {
                 ts_lo,
                 ts_hi,
                 content: Vec::new(),
                 prune,
+                key_equals,
             })))
         }
         other => Err(FlightTicketError::InvalidPushdownTag(other)),
@@ -2000,6 +2078,7 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use ravel_logseg::key_index::{TRACE_ID_FIELD, key8_bytes, key8_i64, key8_id16, key8_str};
     use uuid::Uuid;
 
     /// A fixed key for tests that don't care about key material itself, only
@@ -2363,7 +2442,7 @@ mod tests {
         let key = test_key();
         let mut body = Vec::new();
         body.extend_from_slice(&MAGIC);
-        body.push(VERSION_GROUPS.wrapping_add(1));
+        body.push(VERSION_KEY_EQUALS.wrapping_add(1));
         body.extend_from_slice(&[0u8; 16]);
         body.extend_from_slice(&0i64.to_le_bytes());
         body.extend_from_slice(&0i64.to_le_bytes());
@@ -3336,7 +3415,107 @@ mod tests {
                     max: Some(0.5f64.to_bits()),
                 },
             ],
+            key_equals: Vec::new(),
         })
+    }
+
+    fn sample_key_equals() -> Vec<KeyEquals> {
+        vec![
+            KeyEquals::new("status_code", KeyType::I64, key8_i64(-3)),
+            KeyEquals::new("service", KeyType::Str, key8_str("checkout")),
+            KeyEquals::new("blob", KeyType::Bytes, key8_bytes(&[0, 1, 0xff])),
+            KeyEquals::new(TRACE_ID_FIELD, KeyType::Id16, key8_id16(&[0xab; 16])),
+        ]
+    }
+
+    /// A logs block carrying exact-key equalities (ADR-2707 decision 5) is
+    /// version 11 and survives the codec in order, beside the prune
+    /// predicates; a version 9 decoder refuses it on its version byte.
+    #[test]
+    fn logs_key_equals_round_trip_as_version_11() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let mut logs = sample_logs_pushdown().as_logs().expect("logs").clone();
+        logs.key_equals = sample_key_equals();
+        let pushdown = SlicePushdown::logs(&logs);
+        let bytes = ticket
+            .encode_with_pushdown(&key, Some(&pushdown))
+            .expect("encode");
+        assert_eq!(bytes[4], VERSION_KEY_EQUALS);
+        let (decoded, carried) = FlightTicket::decode_with_pushdown(&bytes, &key).expect("decode");
+        assert_eq!(decoded, ticket);
+        let carried = carried.expect("pushdown");
+        assert_eq!(carried, pushdown);
+        assert_eq!(
+            carried.as_logs().map(|p| p.key_equals.clone()),
+            Some(sample_key_equals())
+        );
+        assert_eq!(bytes[4], 11);
+        assert_eq!(
+            FlightTicket::decode_accepting(&bytes, &key, &[VERSION, VERSION_PUSHDOWN]),
+            Err(FlightTicketError::UnsupportedVersion(VERSION_KEY_EQUALS))
+        );
+    }
+
+    /// The key section is present exactly when the version is 11: a signed
+    /// version 11 ticket that ends at the prune list is truncated, one with
+    /// an empty key list is refused, and an unknown key type is refused.
+    #[test]
+    fn the_key_section_is_present_exactly_when_the_version_is_11() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let resign = |mut body: Vec<u8>| {
+            let tag = mac(&key, &body);
+            body.extend_from_slice(&tag);
+            body
+        };
+        let v9 = ticket
+            .encode_with_pushdown(&key, Some(&sample_logs_pushdown()))
+            .expect("encode");
+        assert_eq!(v9[4], VERSION_PUSHDOWN);
+        let mut no_section = v9[..v9.len() - MAC_LEN].to_vec();
+        no_section[4] = VERSION_KEY_EQUALS;
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(no_section.clone()), &key),
+            Err(FlightTicketError::Truncated)
+        );
+        let mut empty = no_section.clone();
+        write_u32(&mut empty, 0);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(empty), &key),
+            Err(FlightTicketError::InvalidPushdownTag(0))
+        );
+        let mut bad_type = no_section;
+        write_u32(&mut bad_type, 1);
+        write_len_prefixed(&mut bad_type, b"k").expect("field");
+        bad_type.push(9);
+        bad_type.extend_from_slice(&[0u8; 8]);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&resign(bad_type), &key),
+            Err(FlightTicketError::InvalidPushdownTag(9))
+        );
+    }
+
+    /// A signed version 11 ticket carrying a spans block is refused: the
+    /// encoder writes a spans block only under version 9, so the version byte
+    /// and the block kind disagree.
+    #[test]
+    fn a_version_11_ticket_with_a_spans_block_is_refused() {
+        let key = test_key();
+        let ticket = sample_ticket();
+        let spans = ticket
+            .encode_with_pushdown(&key, Some(&sample_spans_pushdown()))
+            .expect("encode");
+        assert_eq!(spans[4], VERSION_PUSHDOWN);
+        assert!(FlightTicket::decode_with_pushdown(&spans, &key).is_ok());
+        let mut body = spans[..spans.len() - MAC_LEN].to_vec();
+        body[4] = VERSION_KEY_EQUALS;
+        let tag = mac(&key, &body);
+        body.extend_from_slice(&tag);
+        assert_eq!(
+            FlightTicket::decode_with_pushdown(&body, &key),
+            Err(FlightTicketError::InvalidPushdownTag(PUSHDOWN_SPANS))
+        );
     }
 
     /// The spans pushdown (time bounds and trace id) survives the ticket
@@ -3412,10 +3591,12 @@ mod tests {
                     value: AttrValue::Str("v".to_owned()),
                 },
             ],
+            key_equals: sample_key_equals(),
         });
         let carried = logs.as_logs().expect("logs block");
         assert!(carried.content.is_empty());
         assert_eq!(carried.prune.len(), 1);
+        assert_eq!(carried.key_equals, sample_key_equals());
         assert_eq!(carried.ts_lo, Some(1));
         FlightTicket::encode_with_pushdown(&sample_ticket(), &test_key(), Some(&logs))
             .expect("a constructed pushdown always encodes");
@@ -3452,7 +3633,7 @@ mod tests {
                 .expect("encode");
             assert_eq!(bytes[4], 9);
             assert_eq!(
-                FlightTicket::decode_up_to(&bytes, &key, VERSION),
+                FlightTicket::decode_accepting(&bytes, &key, &[VERSION]),
                 Err(FlightTicketError::UnsupportedVersion(9))
             );
         }
@@ -3460,7 +3641,7 @@ mod tests {
         let plain = ticket.encode(&key).expect("encode");
         assert_eq!(plain[4], 8);
         assert_eq!(
-            FlightTicket::decode_up_to(&plain, &key, VERSION),
+            FlightTicket::decode_accepting(&plain, &key, &[VERSION]),
             Ok((ticket, None))
         );
     }
@@ -3589,6 +3770,7 @@ mod tests {
                 field: FieldSel::Attr("k".to_owned()),
                 value: AttrValue::I64(4),
             }],
+            key_equals: Vec::new(),
         }));
         assert!(matches!(
             sample_ticket().encode_with_pushdown(&test_key(), Some(&pushdown)),
@@ -3614,6 +3796,34 @@ mod tests {
         assert!(
             keys.decode_with_pushdown(&bytes, TicketSurface::Client)
                 .is_err()
+        );
+    }
+
+    /// Version 11 is a slice-surface version. A key-equals ticket signed
+    /// under the client key, so the MAC verifies, is refused on the client
+    /// surface by its version byte, never read under version 10's grouped
+    /// layout; the same ticket signed for the slice surface decodes there.
+    #[test]
+    fn a_version_11_ticket_on_the_client_surface_is_wrong_surface() {
+        let keys = SqlTicketKeys::from_file_keys([b"file-key".as_slice()]).expect("one key");
+        let ticket = sample_ticket();
+        let mut logs = sample_logs_pushdown().as_logs().expect("logs").clone();
+        logs.key_equals = sample_key_equals();
+        let pushdown = SlicePushdown::logs(&logs);
+        let client = keys
+            .encode_with_pushdown(&ticket, TicketSurface::Client, Some(&pushdown))
+            .expect("encode");
+        assert_eq!(client[4], 11);
+        assert_eq!(
+            keys.decode_with_pushdown(&client, TicketSurface::Client),
+            Err(FlightTicketError::UnsupportedVersion(11))
+        );
+        let slice = keys
+            .encode_with_pushdown(&ticket, TicketSurface::Slice, Some(&pushdown))
+            .expect("encode");
+        assert_eq!(
+            keys.decode_with_pushdown(&slice, TicketSurface::Slice),
+            Ok((ticket, Some(pushdown)))
         );
     }
 
@@ -4122,6 +4332,7 @@ mod tests {
                 ),
                 0..6,
             ),
+            keys in prop::collection::vec(("[a-z_.]{0,12}", 1u8..=4, any::<[u8; 8]>()), 0..4),
         ) {
             let pushdown = if spans {
                 SlicePushdown::spans(&SpansPushdown {
@@ -4147,7 +4358,20 @@ mod tests {
                         }
                     })
                     .collect();
-                SlicePushdown::logs(&LogsPushdown { ts_lo, ts_hi, content: Vec::new(), prune })
+                let key_equals = keys
+                    .into_iter()
+                    .map(|(field, ty, key8)| {
+                        let key_type = KeyType::from_u8(ty).expect("1..=4 is a key type");
+                        KeyEquals::new(field, key_type, key8)
+                    })
+                    .collect();
+                SlicePushdown::logs(&LogsPushdown {
+                    ts_lo,
+                    ts_hi,
+                    content: Vec::new(),
+                    prune,
+                    key_equals,
+                })
             };
             let key = test_key();
             let ticket = sample_ticket();
@@ -4159,19 +4383,21 @@ mod tests {
         }
 
         // Arbitrary correctly signed bytes in the pushdown position never
-        // panic: decode returns Ok or a typed Err.
+        // panic: a slice-surface decode returns Ok or a typed Err for every
+        // version that surface accepts.
         #[test]
         fn prop_signed_pushdown_tail_never_panics(
             tail in prop::collection::vec(any::<u8>(), 1..96),
+            version in prop::sample::select(SLICE_VERSIONS.to_vec()),
         ) {
             let key = test_key();
             let plain = sample_ticket().encode(&key).expect("encode");
             let mut body = plain[..plain.len() - MAC_LEN].to_vec();
-            body[4] = VERSION_PUSHDOWN;
+            body[4] = version;
             body.extend_from_slice(&tail);
             let tag = mac(&key, &body);
             body.extend_from_slice(&tag);
-            let _ = FlightTicket::decode_with_pushdown(&body, &key);
+            let _ = FlightTicket::decode_accepting(&body, &key, SLICE_VERSIONS);
         }
     }
 }
