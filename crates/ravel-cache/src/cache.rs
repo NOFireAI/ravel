@@ -1403,9 +1403,10 @@ mod tests {
     /// starts tracking its tenant and for a later one alike. An interactive
     /// copy is made unlocked too.
     ///
-    /// FLIP (non-vacuity): building the bulk copy inside the
-    /// `insert_with_intent_lazy` closure, as the previous round did, records
-    /// it as made under the lock and fails the probe assertion.
+    /// FLIP (non-vacuity): making the bulk copy before the check's lock is
+    /// dropped, the same hold the previous round's copy inside the
+    /// `insert_with_intent_lazy` closure had, records it as made under the
+    /// lock and fails the probe assertion.
     #[test]
     fn a_stored_bulk_value_is_copied_outside_the_fifo_lock() {
         const LEN: u64 = 4096;

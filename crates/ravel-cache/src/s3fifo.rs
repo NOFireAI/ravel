@@ -697,13 +697,17 @@ impl<V: Clone> S3Fifo<V> {
     fn bulk_rank_bound_with(&self, replaced: Option<(&[u8; 16], u64)>) -> u128 {
         let full = 1u128 << 64;
         let capacity = self.region_capacity();
-        let pass_bytes = self.region.tenants.iter().fold(0u64, |sum, (tenant, pass)| {
-            let bytes = match replaced {
-                Some((replaced, bytes)) if replaced == tenant => bytes,
-                _ => pass.pass_bytes(),
-            };
-            sum.saturating_add(bytes)
-        });
+        let pass_bytes = self
+            .region
+            .tenants
+            .iter()
+            .fold(0u64, |sum, (tenant, pass)| {
+                let bytes = match replaced {
+                    Some((replaced, bytes)) if replaced == tenant => bytes,
+                    _ => pass.pass_bytes(),
+                };
+                sum.saturating_add(bytes)
+            });
         if pass_bytes <= capacity {
             return full;
         }
@@ -1924,10 +1928,20 @@ mod tests {
         let metrics = CacheMetrics::default();
         let mut fifo = S3Fifo::<()>::new(limits);
         for n in 0..300 {
-            touch(&mut fifo, key(1, n, ENTRY), AccessIntent::BulkScan, &metrics);
+            touch(
+                &mut fifo,
+                key(1, n, ENTRY),
+                AccessIntent::BulkScan,
+                &metrics,
+            );
         }
         for n in 0..20 {
-            touch(&mut fifo, key(2, n, ENTRY), AccessIntent::Interactive, &metrics);
+            touch(
+                &mut fifo,
+                key(2, n, ENTRY),
+                AccessIntent::Interactive,
+                &metrics,
+            );
         }
         let (mut accepted, mut declined) = (0, 0);
         for n in 300..400 {
@@ -1989,31 +2003,75 @@ mod tests {
                 {
                     continue;
                 }
-                let window = fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window);
-                let predicted = fifo.would_admit(&k, size, AccessIntent::BulkScan);
-                let mut made = false;
-                fifo.insert_with_intent_lazy(k, size, AccessIntent::BulkScan, &metrics, || {
-                    made = true;
-                    Some(())
-                });
                 let at = format!("pass {pass} key {n} size {size}");
-                assert!(predicted || !made, "a false decline at {at}");
-                let after = fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window);
-                if window.is_some() && window == after {
-                    assert_eq!(predicted, made, "at {at}");
-                    exact += 1;
-                }
+                let (was_exact, made) = admit_as_predicted(&mut fifo, k, size, &metrics, &at);
+                exact += u32::from(was_exact);
                 if made {
                     stored += 1;
                 } else {
                     declined += 1;
                 }
-                assert_within_bounds(&fifo);
             }
         }
         assert!(
             exact > 1_000 && stored > 50 && declined > 50,
             "{exact} exact, {stored} stored, {declined} declined"
         );
+
+        // Fresh tenants reading distinct keys of an eighth of the cache each:
+        // every read grows the pass estimate, so the bound this read leaves
+        // is below the one before it. Emptying the region after twelve reads
+        // leaves room for the last three, so the bound alone decides them.
+        let entry = limits.max_bytes / 8;
+        let (mut exact, mut bound_declines) = (0u32, 0u32);
+        for tenant in 0..32u8 {
+            let mut fifo = S3Fifo::<()>::new(CacheLimits::new(limits.max_bytes, 1_000, entry));
+            for n in 0..15u64 {
+                if n == 12 {
+                    let resident: Vec<CacheKey> = fifo.region.by_rank.values().copied().collect();
+                    for k in resident {
+                        fifo.remove(&k);
+                    }
+                }
+                let k = key(tenant, n, entry);
+                let at = format!("tenant {tenant} key {n}");
+                let (was_exact, made) = admit_as_predicted(&mut fifo, k, entry, &metrics, &at);
+                exact += u32::from(was_exact);
+                let (rank, bound) = fifo.rank_and_bound(&k);
+                bound_declines += u32::from(!made && u128::from(rank) >= bound);
+            }
+        }
+        assert!(
+            exact > 300 && bound_declines > 20,
+            "{exact} exact, {bound_declines} declined by the bound"
+        );
+    }
+
+    /// One bulk admission of `k` run after `would_admit`, asserting the
+    /// prediction never declines a key the admission stores and, when the
+    /// tenant was tracked and its window did not close, equals the outcome.
+    /// Returns whether the exact case applied and whether `k` was stored.
+    fn admit_as_predicted(
+        fifo: &mut S3Fifo<()>,
+        k: CacheKey,
+        size: u64,
+        metrics: &CacheMetrics,
+        at: &str,
+    ) -> (bool, bool) {
+        let window = fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window);
+        let predicted = fifo.would_admit(&k, size, AccessIntent::BulkScan);
+        let mut made = false;
+        fifo.insert_with_intent_lazy(k, size, AccessIntent::BulkScan, metrics, || {
+            made = true;
+            Some(())
+        });
+        assert!(predicted || !made, "a false decline at {at}");
+        let after = fifo.region.tenants.get(&k.tenant_hash).map(|p| p.window);
+        let exact = window.is_some() && window == after;
+        if exact {
+            assert_eq!(predicted, made, "at {at}");
+        }
+        assert_within_bounds(fifo);
+        (exact, made)
     }
 }
