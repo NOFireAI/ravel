@@ -177,7 +177,8 @@
 //! [`SlicePushdown`]. A ticket without it is the no-pushdown query, and
 //! [`FlightTicket::encode`] never writes it. Only the slice surface carries
 //! it. It sits under the MAC like every other field. A ticket that carries
-//! the block is version 9; one without it is still version 8, byte for byte,
+//! the block is version 9, or 11 when it is a logs block with exact-key
+//! equalities; one without it is still version 8, byte for byte,
 //! so a metrics slice or a coordinator built before the block mints exactly
 //! what it always did. See "Version history" below for why the block needs
 //! the bump.
