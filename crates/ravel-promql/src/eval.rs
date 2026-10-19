@@ -628,9 +628,10 @@ impl QueryWindow {
     /// The series one selector read returns inside `request`. With a
     /// selector cache, a cached read whose window covers `request` answers
     /// it; otherwise `fetch` runs over [`crate::selector_cache::fetch_window`]
-    /// and its result replaces the entry. Without a cache, `fetch` runs over
-    /// `request` itself. Either way the caller slices the result to
-    /// `request` with [`CachedSelector::slices`].
+    /// joined with any existing entry's window
+    /// ([`SelectorCache::miss_window`]), and its result replaces the entry.
+    /// Without a cache, `fetch` runs over `request` itself. Either way the
+    /// caller slices the result to `request` with [`CachedSelector::slices`].
     fn selector_read<S: CachedSeries>(
         &self,
         matchers: &[LabelMatcher],
@@ -658,12 +659,16 @@ impl QueryWindow {
             Some(pad) => (self.t_outer.get(), pad),
             None => (eval_ts_ns, (0, 0)),
         };
-        let window = crate::selector_cache::fetch_window(
-            request,
-            self.grid_start_ns,
-            self.grid_end_ns,
-            t_outer,
-            inner_pad,
+        let window = cache.miss_window(
+            &key,
+            crate::selector_cache::fetch_window(
+                request,
+                self.grid_start_ns,
+                self.grid_end_ns,
+                t_outer,
+                inner_pad,
+                key.pinned(),
+            ),
         );
         let cached = Rc::new(CachedSelector {
             window,
@@ -3546,12 +3551,14 @@ mod tests {
     /// Wraps a [`TestSource`] and counts `query` calls, so a test can prove a
     /// request was rejected before any storage work (and, since the grid is
     /// built after the budget check and before `query`, before any grid
-    /// allocation).
+    /// allocation). Also records the window each call asked for.
     #[derive(Debug, Default)]
     struct CountingSource {
         inner: TestSource,
         queries: std::sync::atomic::AtomicUsize,
         histogram_queries: std::sync::atomic::AtomicUsize,
+        windows: std::sync::Mutex<Vec<TimeRange>>,
+        histogram_windows: std::sync::Mutex<Vec<TimeRange>>,
     }
 
     impl CountingSource {
@@ -3560,7 +3567,17 @@ mod tests {
                 inner,
                 queries: std::sync::atomic::AtomicUsize::new(0),
                 histogram_queries: std::sync::atomic::AtomicUsize::new(0),
+                windows: std::sync::Mutex::default(),
+                histogram_windows: std::sync::Mutex::default(),
             }
+        }
+
+        fn windows(&self) -> Vec<TimeRange> {
+            self.windows.lock().expect("unpoisoned").clone()
+        }
+
+        fn histogram_windows(&self) -> Vec<TimeRange> {
+            self.histogram_windows.lock().expect("unpoisoned").clone()
         }
 
         fn query_count(&self) -> usize {
@@ -3581,6 +3598,7 @@ mod tests {
         ) -> Result<Vec<crate::source::SeriesData>, SourceError> {
             self.queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.windows.lock().expect("unpoisoned").push(window);
             self.inner.query(matchers, window)
         }
 
@@ -3591,6 +3609,10 @@ mod tests {
         ) -> Result<Vec<crate::source::HistogramSeriesData>, SourceError> {
             self.histogram_queries
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.histogram_windows
+                .lock()
+                .expect("unpoisoned")
+                .push(window);
             self.inner.query_histograms(matchers, window)
         }
     }
@@ -3955,6 +3977,122 @@ mod tests {
         let stats = stats.expect("a range query runs with the selector cache");
         assert_eq!(stats.fetches, 4);
         assert_eq!(stats.refetches, 2, "one reread per channel");
+    }
+
+    #[test]
+    fn subqueries_sharing_a_key_with_disjoint_windows_read_twice_per_channel() {
+        // Both subqueries reach `m` with no selector offset, so they share a
+        // key. A subquery's range is left-open, so its first inner instant is
+        // 9m before the step. The first read covers `[G - 9m - lookback, G +
+        // 24h]`, the offset one's `[G - 24h - 9m - lookback, G]`; neither
+        // contains the other. The second read covers their union, and every
+        // later step of both is answered from it.
+        let query = "sum(max_over_time(m[10m:1m])) / sum(max_over_time(m[10m:1m] offset 1d))";
+        let source = day_source();
+        let (cached, stats) = range_with_cache_stats(Evaluator::new(), &source, query, DAY_GRID);
+        let (value, annotations) = cached.expect("query evaluates");
+        let RangeValue::Matrix(ref matrix) = value else {
+            panic!("expected a matrix");
+        };
+        assert!(!matrix.is_empty(), "the offset side reaches data");
+        assert_eq!(source.query_count(), 2, "float reads");
+        assert_eq!(source.histogram_query_count(), 2, "histogram reads");
+        let g = minute_ns(60);
+        let lookback = DEFAULT_LOOKBACK_NS;
+        let first = TimeRange {
+            start_ns: g - minute_ns(9) - lookback,
+            end_ns: g + minute_ns(24 * 60),
+        };
+        let union = TimeRange {
+            start_ns: g - minute_ns(24 * 60 + 9) - lookback,
+            end_ns: g + minute_ns(24 * 60),
+        };
+        assert_eq!(source.windows(), vec![first, union]);
+        assert_eq!(source.histogram_windows(), vec![first, union]);
+        let stats = stats.expect("a range query runs with the selector cache");
+        assert_eq!(stats.fetches, 4);
+        assert_eq!(stats.refetches, 2, "one union reread per channel");
+
+        let reference_source = day_source();
+        let (reference, _) = range_with_cache_stats(
+            Evaluator::new().without_selector_cache(),
+            &reference_source,
+            query,
+            DAY_GRID,
+        );
+        assert_eq!(
+            range_result_bits(&Ok((value, annotations))),
+            range_result_bits(&reference)
+        );
+    }
+
+    #[test]
+    fn at_pinned_selectors_read_only_their_own_window() {
+        // An `@` selector asks for the same window at every step, so its one
+        // read is that window: not translated across the grid, and widened
+        // only by an enclosing subquery's reach.
+        let (start, end, _) = DAY_GRID;
+        let (start, end) = (start * NS_PER_MS, end * NS_PER_MS);
+        let lookback = DEFAULT_LOOKBACK_NS;
+        let cases = [
+            (
+                "sum(m @ start())",
+                TimeRange {
+                    start_ns: start - lookback,
+                    end_ns: start,
+                },
+            ),
+            (
+                "sum(m @ end())",
+                TimeRange {
+                    start_ns: end - lookback,
+                    end_ns: end,
+                },
+            ),
+            (
+                "sum(m @ start() offset 5m)",
+                TimeRange {
+                    start_ns: start - minute_ns(5) - lookback,
+                    end_ns: start - minute_ns(5),
+                },
+            ),
+            // The first inner instant of the first step's left-open 30m
+            // subquery misses; the inner grid reaches 29m after it.
+            (
+                "sum(max_over_time((m @ start())[30m:1m]))",
+                TimeRange {
+                    start_ns: start - lookback,
+                    end_ns: start + minute_ns(29),
+                },
+            ),
+        ];
+        for (query, window) in cases {
+            let source = day_source();
+            let (cached, stats) =
+                range_with_cache_stats(Evaluator::new(), &source, query, DAY_GRID);
+            let (value, annotations) = cached.expect("query evaluates");
+            assert_eq!(source.windows(), vec![window], "{query}: float reads");
+            assert_eq!(
+                source.histogram_windows(),
+                vec![window],
+                "{query}: histogram reads"
+            );
+            let stats = stats.expect("a range query runs with the selector cache");
+            assert_eq!(stats.refetches, 0, "{query}");
+
+            let reference_source = day_source();
+            let (reference, _) = range_with_cache_stats(
+                Evaluator::new().without_selector_cache(),
+                &reference_source,
+                query,
+                DAY_GRID,
+            );
+            assert_eq!(
+                range_result_bits(&Ok((value, annotations))),
+                range_result_bits(&reference),
+                "{query}"
+            );
+        }
     }
 
     #[test]
