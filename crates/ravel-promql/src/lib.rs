@@ -12,11 +12,13 @@
 //! `group`, `stddev`, `stdvar`, `topk`, `bottomk`, `quantile`,
 //! `count_values`) are evaluated via `aggregate`. Subqueries (`expr[5m:1m]`,
 //! nested, with their own offset/`@`) are evaluated recursively over an
-//! epoch-aligned step grid, with no cross-step caching; every range/matrix
-//! function argument accepts a subquery wherever it accepts a matrix
-//! selector. [`plan_selectors`] reports every selector reachable through
-//! them, for prefetch. The evaluator consumes a storage-agnostic series
-//! stream trait.
+//! epoch-aligned step grid; every range/matrix function argument accepts a
+//! subquery wherever it accepts a matrix selector. A range query keeps each
+//! selector read in a per-query cache and answers later grid and subquery
+//! steps by slicing it, reading again only when a step asks for a window
+//! outside the cached one (ADR-3072 decision 1b). [`plan_selectors`] reports
+//! every selector reachable through them, for prefetch. The evaluator
+//! consumes a storage-agnostic series stream trait.
 
 mod aggregate;
 mod binop;
@@ -27,6 +29,7 @@ pub mod histogram;
 mod matchers;
 mod plan;
 pub mod redact;
+mod selector_cache;
 mod source;
 pub mod testsource;
 

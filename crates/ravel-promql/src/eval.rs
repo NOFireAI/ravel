@@ -49,12 +49,14 @@
 //! case and turn anything else into [`Error::WrongType`].
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::Instant;
 
 use ravel_types::{Label, LabelSet, METRIC_NAME_LABEL, Sample, TimeRange};
 
 use crate::histogram::TimedHistogram;
 use crate::matchers;
+use crate::selector_cache::{CachedSelector, CachedSeries, SelectorCache, SelectorKey};
 use crate::source::{LabelMatcher, MatchOp, SeriesSource, SourceError};
 
 /// Nanoseconds per millisecond.
@@ -523,6 +525,26 @@ const STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
 pub struct QueryWindow {
     start_ns: i64,
     end_ns: i64,
+    /// The range query's own grid bounds, used only to size a selector-cache
+    /// fetch ([`crate::selector_cache::fetch_window`]). Distinct from
+    /// `start_ns`/`end_ns`, which stay the `@ start()`/`@ end()` anchors; for
+    /// an instant query both equal the evaluation instant.
+    grid_start_ns: i64,
+    grid_end_ns: i64,
+    /// The top-level grid step the current subquery evaluation descends
+    /// from: set by the outermost [`Evaluator::eval_subquery_matrix`] to the
+    /// instant that launched it, and left alone by nested ones, so it stays
+    /// fixed while the inner instants vary. Read only while `inner_grid_pad`
+    /// is `Some`; outside a subquery a selector's ambient instant is itself
+    /// the top-level step. Starts at `grid_start_ns`.
+    t_outer: Cell<i64>,
+    /// Inside a subquery, how far the enclosing subquery grids reach before
+    /// and after the current inner instant, summed over nesting levels;
+    /// `None` outside every subquery.
+    inner_grid_pad: Cell<Option<(i64, i64)>>,
+    /// Per-query selector reads (ADR-3072 decision 1b). `None` for an
+    /// instant query, whose evaluation reads every selector directly.
+    selector_cache: Option<SelectorCache>,
     /// Shared cross-level evaluation-grid-point budget, charged
     /// down by [`Self::charge_budget`] on every subquery-grid evaluation
     /// ([`Evaluator::eval_subquery_matrix`]) regardless of nesting depth or
@@ -553,17 +575,12 @@ impl QueryWindow {
     /// window-resolution helper such as [`crate::functions::range_window`]
     /// directly: the query's `[start_ns, end_ns]` parameters (consulted only to
     /// resolve `@ start()`/`@ end()`), an effectively unbounded evaluation
-    /// budget, no deadline, and an empty annotation sink. Exposed so a
-    /// distributed-pushdown coordinator can assert its independently-derived
-    /// reduction bounds against the evaluator's own `range_window`.
+    /// budget, no deadline, an empty annotation sink, and no selector cache.
+    /// Exposed so a distributed-pushdown coordinator can assert its
+    /// independently-derived reduction bounds against the evaluator's own
+    /// `range_window`.
     pub fn bare(start_ns: i64, end_ns: i64) -> Self {
-        QueryWindow {
-            start_ns,
-            end_ns,
-            budget: Cell::new(u64::MAX),
-            deadline: None,
-            annotations: RefCell::new(Annotations::default()),
-        }
+        QueryWindow::new(start_ns, end_ns, u64::MAX, None, None)
     }
 
     /// Test-only bare context: instant window at time zero, effectively
@@ -572,13 +589,88 @@ impl QueryWindow {
     /// going through [`Evaluator::eval_instant`]/[`Evaluator::eval_range`].
     #[cfg(test)]
     pub(crate) fn for_test() -> Self {
+        QueryWindow::new(0, 0, u64::MAX, None, None)
+    }
+
+    /// A context whose `@ start()`/`@ end()` anchors and grid bounds are both
+    /// `[start_ns, end_ns]`, with `t_outer` at the grid start and no
+    /// enclosing subquery.
+    fn new(
+        start_ns: i64,
+        end_ns: i64,
+        budget: u64,
+        deadline: Option<Instant>,
+        selector_cache: Option<SelectorCache>,
+    ) -> Self {
         QueryWindow {
-            start_ns: 0,
-            end_ns: 0,
-            budget: Cell::new(u64::MAX),
-            deadline: None,
+            start_ns,
+            end_ns,
+            grid_start_ns: start_ns,
+            grid_end_ns: end_ns,
+            t_outer: Cell::new(start_ns),
+            inner_grid_pad: Cell::new(None),
+            selector_cache,
+            budget: Cell::new(budget),
+            deadline,
             annotations: RefCell::new(Annotations::default()),
         }
+    }
+
+    /// The selector cache's read counts for this query, or `None` when the
+    /// query ran without one.
+    #[cfg(test)]
+    pub(crate) fn selector_cache_stats(
+        &self,
+    ) -> Option<crate::selector_cache::SelectorCacheStats> {
+        self.selector_cache.as_ref().map(SelectorCache::stats)
+    }
+
+    /// The series one selector read returns inside `request`. With a
+    /// selector cache, a cached read whose window covers `request` answers
+    /// it; otherwise `fetch` runs over [`crate::selector_cache::fetch_window`]
+    /// and its result replaces the entry. Without a cache, `fetch` runs over
+    /// `request` itself. Either way the caller slices the result to
+    /// `request` with [`CachedSelector::slices`].
+    fn selector_read<S: CachedSeries>(
+        &self,
+        matchers: &[LabelMatcher],
+        vs: &promql_parser::parser::VectorSelector,
+        request: TimeRange,
+        eval_ts_ns: i64,
+        fetch: impl FnOnce(TimeRange) -> Result<Vec<S>, SourceError>,
+    ) -> Result<Rc<CachedSelector<S>>, Error> {
+        let Some(cache) = &self.selector_cache else {
+            return Ok(Rc::new(CachedSelector {
+                window: request,
+                series: fetch(request)?,
+            }));
+        };
+        let key = SelectorKey::new(
+            matchers,
+            S::CHANNEL,
+            signed_offset_ns(vs.offset.as_ref())?,
+            resolve_at(vs.at.as_ref(), self.start_ns, self.end_ns)?,
+        );
+        if let Some(cached) = cache.lookup::<S>(&key, request) {
+            return Ok(cached);
+        }
+        let (t_outer, inner_pad) = match self.inner_grid_pad.get() {
+            Some(pad) => (self.t_outer.get(), pad),
+            None => (eval_ts_ns, (0, 0)),
+        };
+        let window = crate::selector_cache::fetch_window(
+            request,
+            self.grid_start_ns,
+            self.grid_end_ns,
+            t_outer,
+            inner_pad,
+        );
+        let cached = Rc::new(CachedSelector {
+            window,
+            series: fetch(window)?,
+        });
+        cache.insert(key, Rc::clone(&cached));
+        Ok(cached)
     }
 
     /// Record an evaluation warning (see [`Annotations`]).
@@ -629,6 +721,10 @@ pub struct Evaluator {
     default_step_ns: i64,
     max_total_eval_points: u64,
     deadline: Option<Instant>,
+    /// Whether a range query reads its selectors through a per-query
+    /// [`SelectorCache`]. Always on outside tests; the cache-free mode is the
+    /// reference the cached evaluation is compared against.
+    selector_cache: bool,
 }
 
 impl Default for Evaluator {
@@ -639,6 +735,7 @@ impl Default for Evaluator {
             default_step_ns: DEFAULT_SUBQUERY_STEP_NS,
             max_total_eval_points: DEFAULT_MAX_TOTAL_EVAL_POINTS,
             deadline: None,
+            selector_cache: true,
         }
     }
 }
@@ -646,6 +743,14 @@ impl Default for Evaluator {
 impl Evaluator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Test-only: evaluate range queries reading every selector directly at
+    /// every step, as before the selector cache existed.
+    #[cfg(test)]
+    pub(crate) fn without_selector_cache(mut self) -> Self {
+        self.selector_cache = false;
+        self
     }
 
     /// Override the default 5-minute lookback.
@@ -734,13 +839,7 @@ impl Evaluator {
     ) -> Result<(Value, Annotations), Error> {
         let expr = crate::complexity_guard::parse_guarded(query)?;
         let t_ns = ms_to_ns(t_ms)?;
-        let ctx = QueryWindow {
-            start_ns: t_ns,
-            end_ns: t_ns,
-            budget: Cell::new(self.max_total_eval_points),
-            deadline: self.deadline,
-            annotations: RefCell::new(Annotations::default()),
-        };
+        let ctx = QueryWindow::new(t_ns, t_ns, self.max_total_eval_points, self.deadline, None);
         let value = self.eval_expr(source, &expr, t_ns, &ctx)?;
         Ok((value, ctx.annotations.into_inner()))
     }
@@ -819,6 +918,20 @@ impl Evaluator {
         end_ms: i64,
         step_ms: i64,
     ) -> Result<(RangeValue, Annotations), Error> {
+        let (value, ctx) = self.eval_range_in_window(source, query, start_ms, end_ms, step_ms)?;
+        Ok((value, ctx.annotations.into_inner()))
+    }
+
+    /// [`Self::eval_range_hist_annotated`]'s body, returning the whole query
+    /// context so a test can read the selector cache's counts as well.
+    fn eval_range_in_window(
+        &self,
+        source: &dyn SeriesSource,
+        query: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> Result<(RangeValue, QueryWindow), Error> {
         if step_ms <= 0 {
             return Err(Error::NonPositiveStep { step_ms });
         }
@@ -843,23 +956,19 @@ impl Evaluator {
         }
 
         let expr = crate::complexity_guard::parse_guarded(query)?;
-        let ctx = QueryWindow {
+        let ctx = QueryWindow::new(
             start_ns,
             end_ns,
-            budget: Cell::new(self.max_total_eval_points),
-            deadline: self.deadline,
-            annotations: RefCell::new(Annotations::default()),
-        };
+            self.max_total_eval_points,
+            self.deadline,
+            self.selector_cache.then(SelectorCache::default),
+        );
 
-        // The supported grammar (paren, unary minus, literals, one
-        // selector) can contain at most one selector, so unlike a general
-        // multi-selector tree there is no risk of re-querying storage once
-        // per node: the grid below still issues exactly one `source.query`
-        // call for the whole range, same as before this phase. A future
-        // phase that adds binary/call/aggregate expressions (and therefore
-        // multiple selectors, or the same selector's value needed at
-        // multiple sub-evaluations) is the point at which per-selector
-        // cursoring (ADR-0021 §1) becomes necessary; it is not needed yet.
+        // The `Selector` arm and a `Call` over a matrix selector read storage
+        // once for the whole grid themselves. Every other shape evaluates
+        // per step through `eval_expr`, whose selector helpers read through
+        // `ctx`'s selector cache, so a selector is still read once per query
+        // rather than once per step (ADR-3072 decision 1b).
         let (core, negate) = resolve_range_core(&expr)?;
         let value = match core {
             RangeCore::Scalar(v) => RangeValue::Scalar(if negate { -v } else { v }),
@@ -890,7 +999,7 @@ impl Evaluator {
                 RangeValue::Matrix(matrix)
             }
         };
-        Ok((value, ctx.annotations.into_inner()))
+        Ok((value, ctx))
     }
 
     /// Evaluate `query` as a range matrix over `start_ms..=end_ms` stepping
@@ -1000,14 +1109,16 @@ impl Evaluator {
             end_ns: sel_ts_ns,
         };
 
-        let series = source.query(&selector_matchers, window)?;
-        let mut out = Vec::with_capacity(series.len());
-        for s in series {
+        let series = ctx.selector_read(&selector_matchers, vs, window, eval_ts_ns, |w| {
+            source.query(&selector_matchers, w)
+        })?;
+        let mut out = Vec::with_capacity(series.series.len());
+        for (labels, samples) in series.slices(window) {
             if let Some((value, orig_sample_ts_ns)) =
-                pick_sample(&s.samples, sel_ts_ns, self.lookback_delta_ns)
+                pick_sample(samples, sel_ts_ns, self.lookback_delta_ns)
             {
                 out.push(InstantSample::scalar(
-                    s.labels,
+                    labels.clone(),
                     eval_ts_ns,
                     orig_sample_ts_ns,
                     value,
@@ -1019,13 +1130,15 @@ impl Evaluator {
         // is either float or histogram in storage, so these never collide with
         // the float results above; the lookback pick is the same left-open
         // `(sel_ts - lookback, sel_ts]` rule.
-        let hist_series = source.query_histograms(&selector_matchers, window)?;
-        for s in hist_series {
+        let hist_series = ctx.selector_read(&selector_matchers, vs, window, eval_ts_ns, |w| {
+            source.query_histograms(&selector_matchers, w)
+        })?;
+        for (labels, samples) in hist_series.slices(window) {
             if let Some((value, orig_sample_ts_ns)) =
-                pick_histogram(&s.samples, sel_ts_ns, self.lookback_delta_ns)
+                pick_histogram(samples, sel_ts_ns, self.lookback_delta_ns)
             {
                 out.push(InstantSample::histogram(
-                    s.labels,
+                    labels.clone(),
                     eval_ts_ns,
                     orig_sample_ts_ns,
                     value,
@@ -1057,22 +1170,23 @@ impl Evaluator {
             end_ns: sel_ts_ns,
         };
 
-        let series = source.query(&selector_matchers, window)?;
-        let mut out = Vec::with_capacity(series.len());
-        for s in series {
+        let series = ctx.selector_read(&selector_matchers, &ms.vs, window, eval_ts_ns, |w| {
+            source.query(&selector_matchers, w)
+        })?;
+        let mut out = Vec::with_capacity(series.series.len());
+        for (labels, samples) in series.slices(window) {
             // The window fetched from storage is inclusive on both ends
             // (`TimeRange`'s own contract); a matrix selector's window is
             // left-open like the instant lookback window, so the exclusive
             // lower bound is enforced here.
-            let samples: Vec<Sample> = s
-                .samples
+            let samples: Vec<Sample> = samples
                 .iter()
                 .filter(|sample| sample.ts_ns > window_start)
                 .filter(|sample| sample.value.to_bits() != STALE_NAN_BITS)
                 .copied()
                 .collect();
             if !samples.is_empty() {
-                out.push((s.labels, samples));
+                out.push((labels.clone(), samples));
             }
         }
         Ok(out)
@@ -1099,10 +1213,10 @@ impl Evaluator {
     /// another subquery re-derives this same check at every enclosing grid
     /// step, so an inner grid that is itself over budget is rejected on the
     /// very first attempt to build it rather than after the outer grid has
-    /// multiplied it out (no cross-step caching beyond cursors, so this
-    /// check, like every other
-    /// part of subquery evaluation, is deliberately redone from scratch at
-    /// each enclosing step rather than memoized).
+    /// multiplied it out (this check, like every other part of subquery
+    /// evaluation, is deliberately redone from scratch at each enclosing
+    /// step rather than memoized; only the selector reads underneath are
+    /// shared across steps, through the query's selector cache).
     pub(crate) fn eval_subquery_matrix(
         &self,
         source: &dyn SeriesSource,
@@ -1137,9 +1251,24 @@ impl Evaluator {
         }
         ctx.charge_budget(points, self.max_total_eval_points)?;
 
+        // Selector-cache translation state for the inner evaluations: the
+        // outermost subquery records the top-level step that launched it, and
+        // every level adds its own grid's reach around the current inner
+        // instant, restored once the inner evaluation returns.
+        let enclosing_pad = ctx.inner_grid_pad.get();
+        if enclosing_pad.is_none() {
+            ctx.t_outer.set(eval_ts_ns);
+        }
+        let (pad_before, pad_after) = enclosing_pad.unwrap_or((0, 0));
         let matrix = crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
-            let value = self.eval_expr(source, &sq.expr, t, ctx)?;
+            ctx.inner_grid_pad.set(Some((
+                pad_before.saturating_add(t.saturating_sub(start_ns)),
+                pad_after.saturating_add(end_ns.saturating_sub(t)),
+            )));
+            let value = self.eval_expr(source, &sq.expr, t, ctx);
+            ctx.inner_grid_pad.set(enclosing_pad);
+            let value = value?;
             // Native-histogram series inside a subquery window are not yet
             // supported. The subquery grid reducer keeps only the float value
             // of each instant sample below (`hist_matrix_into_float`), so any
@@ -1188,20 +1317,21 @@ impl Evaluator {
             end_ns: sel_ts_ns,
         };
 
-        let series = source.query_histograms(&selector_matchers, window)?;
-        let mut out = Vec::with_capacity(series.len());
-        for s in series {
-            let samples: Vec<crate::histogram::TimedHistogram> = s
-                .samples
-                .into_iter()
+        let series = ctx.selector_read(&selector_matchers, &ms.vs, window, eval_ts_ns, |w| {
+            source.query_histograms(&selector_matchers, w)
+        })?;
+        let mut out = Vec::with_capacity(series.series.len());
+        for (labels, samples) in series.slices(window) {
+            let samples: Vec<crate::histogram::TimedHistogram> = samples
+                .iter()
                 .filter(|sample| sample.ts_ns > window_start)
-                .map(|sample| (sample.ts_ns, sample.value))
+                .map(|sample| (sample.ts_ns, sample.value.clone()))
                 .collect();
             if !samples.is_empty() {
                 let labels = if keep_metric_name {
-                    s.labels
+                    labels.clone()
                 } else {
-                    drop_metric_name(s.labels)
+                    drop_metric_name(labels.clone())
                 };
                 out.push((labels, samples));
             }
@@ -3341,13 +3471,13 @@ mod tests {
         let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
             panic!("expected matrix selector");
         };
-        let ctx = QueryWindow {
-            start_ns: sel_ts_ns,
-            end_ns: sel_ts_ns,
-            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
-            deadline: None,
-            annotations: RefCell::new(Annotations::default()),
-        };
+        let ctx = QueryWindow::new(
+            sel_ts_ns,
+            sel_ts_ns,
+            DEFAULT_MAX_TOTAL_EVAL_POINTS,
+            None,
+            None,
+        );
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
             .expect("evaluates");
@@ -3375,13 +3505,13 @@ mod tests {
         let promql_parser::parser::Expr::MatrixSelector(ms) = expr else {
             panic!("expected matrix selector");
         };
-        let ctx = QueryWindow {
-            start_ns: sel_ts_ns,
-            end_ns: sel_ts_ns,
-            budget: Cell::new(DEFAULT_MAX_TOTAL_EVAL_POINTS),
-            deadline: None,
-            annotations: RefCell::new(Annotations::default()),
-        };
+        let ctx = QueryWindow::new(
+            sel_ts_ns,
+            sel_ts_ns,
+            DEFAULT_MAX_TOTAL_EVAL_POINTS,
+            None,
+            None,
+        );
         let matrix = Evaluator::new()
             .eval_matrix_selector(&source, &ms, sel_ts_ns, &ctx)
             .expect("evaluates");
