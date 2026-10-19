@@ -1612,6 +1612,9 @@ pub fn decode_accounting(snap: pb::QueryAccountingSnapshot) -> QueryAccountingSn
         logs_ranged_opens: 0,
         data_objects_touched: snap.data_objects_touched,
         peak_intermediate_bytes: snap.peak_intermediate_bytes,
+        // Not on the wire form: a worker reads under its own handle's intent,
+        // which is interactive, and its report carries no classification.
+        access_intent: ravel_types::accounting::AccessIntent::Interactive,
     }
 }
 
@@ -3162,8 +3165,15 @@ mod tests {
             logs_ranged_opens: 9,
             data_objects_touched: 11,
             peak_intermediate_bytes: 512,
+            // Not on the wire either: a worker's report decodes as interactive.
+            access_intent: ravel_types::accounting::AccessIntent::BulkScan,
         };
         let round = decode_accounting(encode_accounting(&snap));
+        assert_eq!(
+            round.access_intent,
+            ravel_types::accounting::AccessIntent::Interactive,
+            "the access intent is process-local and not on the wire proto"
+        );
         assert_eq!(
             round.page_bytes_fetched, 0,
             "decode-time page bytes are not on the wire proto"
@@ -3191,6 +3201,7 @@ mod tests {
                 logs_whole_object_opens: 0,
                 logs_ranged_opens: 0,
                 commit_record_cache_hits: 0,
+                access_intent: ravel_types::accounting::AccessIntent::Interactive,
                 ..snap
             },
             "every other field round-trips unchanged"

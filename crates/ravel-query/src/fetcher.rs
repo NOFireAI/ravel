@@ -15,7 +15,7 @@ use ravel_segment::{
     decode_catalog_matching_v4, decode_catalog_v4, decode_catalog_v5, decode_catalog_v5_chunked,
     decode_run_histogram_pages, decode_run_pages_soa, open_from_suffix, plan_ranges_v4,
 };
-use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
 
 use crate::phase_accounting::{PhaseAccounting, QueryPhase};
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
@@ -487,6 +487,20 @@ impl From<std::sync::Arc<TieredCache<CacheFetchError>>> for ReadCache {
     }
 }
 
+/// The read cache's [`ravel_cache::AccessIntent`] for a query's
+/// [`AccessIntent`]. A function rather than a `From` impl: neither enum is
+/// local to this crate.
+pub fn cache_intent(intent: AccessIntent) -> ravel_cache::AccessIntent {
+    match intent {
+        AccessIntent::Interactive => ravel_cache::AccessIntent::Interactive,
+        AccessIntent::BulkScan => ravel_cache::AccessIntent::BulkScan,
+        AccessIntent::Maintenance => ravel_cache::AccessIntent::Maintenance,
+    }
+}
+
+/// Every method that reads or admits takes the [`AccessIntent`] of the query
+/// it serves, normally `accounting.access_intent()`, and records the hit and
+/// places the admission under it.
 impl ReadCache {
     /// Peek every tier with no upstream fetch, serving a hit and returning
     /// `None` on a genuine miss (recording its own hit/miss on the cache's
@@ -501,10 +515,11 @@ impl ReadCache {
     /// and is otherwise byte-for-byte [`TieredCache::get`]. The RAM variant has
     /// no disk tier and no I/O to move, so it is served inline and pays nothing
     /// for the `async`.
-    pub(crate) async fn get(&self, key: &CacheKey) -> Option<Bytes> {
+    pub(crate) async fn get(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
+        let intent = cache_intent(intent);
         match self {
-            ReadCache::Ram(ram) => ram.get(key),
-            ReadCache::Tiered(tiered) => tiered.get_off_worker(*key).await,
+            ReadCache::Ram(ram) => ram.get_with_intent(key, intent),
+            ReadCache::Tiered(tiered) => tiered.get_off_worker_with_intent(*key, intent).await,
         }
     }
 
@@ -518,10 +533,15 @@ impl ReadCache {
     /// disk write goes to the blocking pool through
     /// [`TieredCache::insert_off_worker`], while the RAM variant is served
     /// inline.
-    pub(crate) async fn insert(&self, key: CacheKey, value: Bytes) {
+    pub(crate) async fn insert(&self, key: CacheKey, value: Bytes, intent: AccessIntent) {
+        let intent = cache_intent(intent);
         match self {
-            ReadCache::Ram(ram) => ram.insert(key, value),
-            ReadCache::Tiered(tiered) => tiered.insert_off_worker(key, value).await,
+            ReadCache::Ram(ram) => ram.insert_with_intent(key, value, intent),
+            ReadCache::Tiered(tiered) => {
+                tiered
+                    .insert_off_worker_with_intent(key, value, intent)
+                    .await
+            }
         }
     }
 
@@ -550,21 +570,28 @@ impl ReadCache {
     pub(crate) async fn get_or_fetch<F, Fut>(
         &self,
         key: CacheKey,
+        intent: AccessIntent,
         fetch: F,
     ) -> Result<(Bytes, ReadOutcome), SingleFlightError<CacheFetchError>>
     where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<Bytes, CacheFetchError>> + Send,
     {
+        let intent = cache_intent(intent);
         match self {
-            ReadCache::Tiered(tiered) => tiered.get_or_fetch_outcome(key, fetch).await,
+            ReadCache::Tiered(tiered) => {
+                tiered
+                    .get_or_fetch_outcome_with_intent(key, intent, fetch)
+                    .await
+            }
             ReadCache::Ram(ram) => {
-                if let Some(bytes) = ram.get(&key) {
+                if let Some(bytes) = ram.get_with_intent(&key, intent) {
                     return Ok((bytes, ReadOutcome::Hit));
                 }
                 #[cfg(test)]
                 ram_recheck_seam::after_peek_miss(ram, &key);
-                ram.get_or_fetch_outcome(key, fetch).await
+                ram.get_or_fetch_outcome_with_intent(key, intent, fetch)
+                    .await
             }
         }
     }
@@ -574,10 +601,19 @@ impl ReadCache {
     /// and that re-checks because the entry may have been admitted since
     /// (`BlockRangeFetcher::fetch_run`'s re-peek of a run's non-lead blocks). A
     /// hit is served exactly as `get` serves one, corruption mode included.
-    pub(crate) async fn peek_uncounted(&self, key: &CacheKey) -> Option<Bytes> {
+    pub(crate) async fn peek_uncounted(
+        &self,
+        key: &CacheKey,
+        intent: AccessIntent,
+    ) -> Option<Bytes> {
+        let intent = cache_intent(intent);
         match self {
-            ReadCache::Ram(ram) => ram.peek_uncounted(key),
-            ReadCache::Tiered(tiered) => tiered.peek_uncounted_off_worker(*key).await,
+            ReadCache::Ram(ram) => ram.peek_uncounted_with_intent(key, intent),
+            ReadCache::Tiered(tiered) => {
+                tiered
+                    .peek_uncounted_off_worker_with_intent(*key, intent)
+                    .await
+            }
         }
     }
 
@@ -610,15 +646,21 @@ impl ReadCache {
     pub(crate) async fn fetch_peeked<F, Fut>(
         &self,
         key: CacheKey,
+        intent: AccessIntent,
         fetch: F,
     ) -> Result<Bytes, SingleFlightError<CacheFetchError>>
     where
         F: FnOnce() -> Fut + Send,
         Fut: std::future::Future<Output = Result<Bytes, CacheFetchError>> + Send,
     {
+        let intent = cache_intent(intent);
         match self {
-            ReadCache::Ram(ram) => ram.get_or_fetch(key, fetch).await,
-            ReadCache::Tiered(tiered) => tiered.resolve_peeked_miss(key, fetch).await,
+            ReadCache::Ram(ram) => ram.get_or_fetch_with_intent(key, intent, fetch).await,
+            ReadCache::Tiered(tiered) => {
+                tiered
+                    .resolve_peeked_miss_with_intent(key, intent, fetch)
+                    .await
+            }
         }
     }
 
@@ -1474,7 +1516,7 @@ impl SegmentFetcher {
             std::sync::Arc::new(std::sync::Mutex::new(None));
         let etag_capture = leader_etag.clone();
         let (bytes, outcome) = cache
-            .get_or_fetch(cache_key, || async move {
+            .get_or_fetch(cache_key, accounting.access_intent(), || async move {
                 let got = self
                     .store_get(key, range, accounting)
                     .await

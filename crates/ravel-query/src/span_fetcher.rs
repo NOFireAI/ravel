@@ -1411,7 +1411,7 @@ impl SpanSegmentFetcher {
         // single call avoids the peek-then-`get_or_fetch` double-count on the
         // tiered tier (see `ReadCache::get_or_fetch`).
         let (bytes, outcome) = cache
-            .get_or_fetch(cache_key, || async move {
+            .get_or_fetch(cache_key, accounting.access_intent(), || async move {
                 let _permit = self.get_limiter.acquire().await.map_err(|_| {
                     StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
                 })?;
