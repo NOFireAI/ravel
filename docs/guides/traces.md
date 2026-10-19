@@ -27,11 +27,13 @@ The full, normative spec of the on-disk layout is
 A `trace_id =` query decodes only the blocks that can hold the trace. The
 skip index drops every block whose `trace_id` range excludes the target.
 Each object the skip index keeps is then probed in its KEY_IDX section, which
-indexes the first 8 bytes of every trace id the object holds. At most two
-small ranged reads answer the probe. A trace KEY_IDX does not find is absent
+indexes the first 8 bytes of every trace id the object holds. The probe is
+answered by small ranged reads: a 64 KiB first read of the object, then
+the index directory and one bucket, three requests per object. A trace
+KEY_IDX does not find is absent
 from the object, so the object is not read further. The probe trades block
 reads for index reads: a lookup reads fewer bytes, but it can issue more
-requests, since every object the skip index keeps pays up to two reads
+requests, since every object the skip index keeps pays those reads
 whether or not it holds the trace. A trace it does find may
 be another trace sharing those 8 bytes; the decoded rows are matched against
 the full trace id, which removes it.

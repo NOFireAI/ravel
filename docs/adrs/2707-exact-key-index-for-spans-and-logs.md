@@ -458,7 +458,9 @@ flowchart LR
     series rising while HEAD carries no `key_index` refs is the signature
     the operator acts on. The cost of a bad rollout is one rebuild run over
     the affected parts: per part entry, one footer suffix GET and one
-    section range GET, so `2 x entries` ranged GETs in total, at most
+    section range GET, so `2 x entries` ranged GETs in total (plus one per
+    entry whose footer exceeds the 8 KiB suffix, as the T12 acceptance
+    amendment measured and restated), at most
     `2 x max(batch_entries, largest part's entries)` per attempt, which
     is 500,000 at the default while no part exceeds the seal threshold
     and `2 x` the largest part otherwise (about 160,000 on the Stage 0
@@ -980,7 +982,9 @@ the kept reads cover the whole (tenant, signal) at once.
 
 The review's figures, which are estimates from reading the code and have
 not been measured: a fold that advances the watermark issues about `2T`
-ranged GETs (a footer suffix and a section per entry), where `T` is the
+ranged GETs (a footer suffix and a section per entry, plus one per entry
+whose footer exceeds the 8 KiB suffix: the T12 acceptance amendment
+measured exactly `2T` with no such entry), where `T` is the
 tail's entry count and reaches `DEFAULT_SNAPSHOT_PART_MAX_ENTRIES`
 (250,000) before the tail seals, so up to about 500,000 GETs on one fold;
 with the tail averaging half the threshold over its life and one
@@ -1150,30 +1154,33 @@ T12 ran the Stage 1 arms against the pre-registered acceptance table on
 Setup, as stamped: one c6a.4xlarge in us-east-1 against same-region S3;
 main 1b4d29809 built on the box; stock `ravel-server --shards 4`; the
 200 M-span corpus from seed 2707 loaded as 828 objects with
-`index_trace_id` on; ClickBench `hits` at the v0.23 recipe loaded as 398
+`index_trace_id` on; the same corpus loaded a second time as a separate
+tenant at the pre-decision 9 geometry (`--batch-rows 10000 --target-bytes
+1`, 80,000 objects, the same declaration), used only for the resolve row
+above 25,000 records; ClickBench `hits` at the v0.23 recipe loaded as 398
 objects with `UserID` declared as the key-index column; every object of
-both corpora carries KEY_IDX. The reports are results.json, summary.txt and
-calls.jsonl under `s3://ravel-clickbench-5b7101/reports/t12-2763/out/`.
+all three tenants carries KEY_IDX. The reports are results.json, summary.txt
+and calls.jsonl under `s3://ravel-clickbench-5b7101/reports/t12-2763/out/`.
 
 | check | pre-registered band | measured figure | verdict | source |
 |---|---|---|---|---|
 | spans 1 h lookup, cold, folded: time | under 1 s | median 0.73 s, max 1.02 s, over 40 lookups | HIT | #2763 comment 6276877460 |
-| spans 1 h lookup, cold, folded: bytes | about 200 KB, miss over 1 MB | data wire bytes median 2.70 MB, made of a 65,536-byte read per candidate object charged to `probe` (24 objects in the window), 2 `keyIndex` GETs per object (48 GETs, 48 KB) and 1 scan GET (180 KB); resolve 4 GETs; 10 rows on all 40 lookups | MISS: the first read is 64 KiB per object, not the footer's `prefix_len` (#3118) | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
+| spans 1 h lookup, cold, folded: bytes | about 200 KB, miss over 1 MB | data wire bytes median 2.70 MB over 40 lookups whose windows hold 24 to about 40 candidate objects (the median lookup's `keyIndex` GET count is 72, so about 36 objects: 36 x 65,536 B of `probe` reads plus about 72 KB of `keyIndex` buckets plus one 180 KB scan GET, about 2.6 MB); one 24-object lookup, for the per-phase shape: a 65,536-byte read per candidate object charged to `probe` (24 GETs, 1.57 MB), 2 `keyIndex` GETs per object (48 GETs, 48 KB), 1 scan GET (180 KB), resolve 4 GETs; 10 rows on all 40 lookups | MISS: the first read is 64 KiB per object, not the footer's `prefix_len` (#3118) | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
 | spans lookup without a range, this tenant (one ingest hour, one covering part) | 2 ranged GETs per object | `GET /api/traces/<id>` issued 2,429 data GETs: `probe` 828 at 64 KiB each (54.1 MB), `keyIndex` 1,600 (1.6 MB), scan 1; 827 of 828 objects pruned; 10 rows; 2.7 s folded, 4.5 s unfolded | MISS: three requests per object, not two (#3118) | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
 | spans lookup without a range, month-scale tenant (hour-ranged parts) | as pre-registered | not measured: a bulk load puts every span in one ingest hour and one covering part, so hour-ranged parts cannot be produced on this lane | stays predicted | predicted |
 | spans lookup without a range, tenant past `P_max` | as pre-registered | not measured, for the same reason | stays predicted | predicted |
 | spans 1 h lookup, warm | 0 data GETs after the first run | 0 data GETs, 1 resolve GET, 0.07 to 0.08 s | HIT | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
-| q20, cold, unfolded tail only | 2 ranged GETs plus the named block's pages per candidate object; `keyIndex` under 32 KB per probed object | resolve 1 GET; plan 320 GETs (83.4 MB); `keyIndex` 636 GETs (1.05 MB wire; decompressed bytes reported 0, the counter is not wired, #3116); scan 56 GETs (823.1 MB wire, 71.5 MB decompressed); 1,013 GETs in all; wall median 2.2 s (2.06 to 3.46 s over 7 cold passes), hot 0.10 to 0.14 s; 4 rows on every pass; pruning: segments 398, segmentsPrunedByKeyIndex 317, blocksPrunedByKeyIndex 28, blocksScanned 904 | MISS: 81 objects survive the probe for a key that lives in one object and are scanned nearly whole, about 10 MB each (#3117, the named bottleneck); the probe side, 1.6 GETs and 2.6 KB per object, is inside its band | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
-| q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | the unfolded requests apart from resolve (1 GET against the part): 1,013 GETs, 907.5 MB wire, 2.2 s median | MISS: by construction, since no query reads a tier-2 leaf yet (the leaf build switch amendment, #2994), and by #3117 | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
+| q20, cold, unfolded tail only | 2 ranged GETs plus the named block's pages per candidate object; `keyIndex` under 32 KB per probed object | resolve 1 GET; plan 320 GETs (83.4 MB); `keyIndex` 636 GETs (1.05 MB wire; decompressed bytes reported 0, the counter is not wired, #3116); scan 56 GETs (823.1 MB wire, 71.5 MB decompressed); 1,013 GETs in all; wall median 2.2 s (2.06 to 3.46 s over 7 cold passes), hot 0.10 to 0.14 s; 4 rows on every pass; pruning: segments 398, segmentsPrunedByKeyIndex 317, blocksPrunedByKeyIndex 28, blocksScanned 904 | MISS: 81 objects survive the probe for a key that lives in one object and are scanned nearly whole, about 10 MB each (#3117, the named bottleneck); the probe side is not adjudicated: its band is in decompressed bytes per probed object and the counter reads 0 (#3116), so only the wire half is known (1.6 GETs and 2.6 KB of wire per object, which bounds the decompressed figure from below and says nothing about the 32 KB miss line) | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
+| q20, cold, folded | under 40 GETs, under 20 MB wire, under 1 s | the same requests as unfolded, resolve included (1 GET, against the part instead of the records): 1,013 GETs = resolve 1 + plan 320 + `keyIndex` 636 + scan 56, 907.5 MB wire, 2.2 s median | MISS: by construction, since no query reads a tier-2 leaf yet (the leaf build switch amendment, #2994), and by #3117 | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
 | default `ravel-cli load` of the 200 M spans: objects | 600 to 1,200 objects | 828 objects | HIT | #2763 comment 6276877460 |
 | default `ravel-cli load` of the 200 M spans: time | at most 165 s | 283 s wall, peak RSS 774 MB | MISS (#3119) | #2763 comment 6276877460 |
 | default `ravel-cli load` of the 200 M spans: trigger mix | size trigger names the majority | depth 438, size 390, age 0 | MISS: the size trigger does not close the majority (#3119) | #2763 comment 6276877460 |
-| resolve GETs above 25,000 records | records + 3 | 80,003 on every cold lookup of the 80,000-record tenant; 831 on every lookup of the 828-record tenant | HIT | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
+| resolve GETs above 25,000 records | records + 3 | 80,003 on each of the 3 cold lookups of the 80,000-record tenant; 831 on each of the 120 cold lookups of the unfolded 828-record tenant (folded, the resolve reads the part: 4 GETs; warm: 1) | HIT | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
 | tier-1 section size | spans about 6%, logs about 2% of object bytes; miss over 2x either | spans 4.24%, logs 2.26% | HIT | #2763 comment 6276877460 |
 | fold section reads | `2 x entries` ranged GETs; bytes within 2x of the tier-1 figure | spans fold 1,656 ranged GETs = 2 x 828 entries, 200.8 MB = 4.40% of re-encoded part bytes; logs fold 796 = 2 x 398, 217.1 MB = 2.06%; no entry's footer exceeded 8 KiB on either corpus, so the carry-over term below was 0 | HIT | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
 | HEAD bytes added by field 8 | at most 256 B per (part, field, slice) | spans 194 B, logs 192 B, one slice each | HIT | #2763 comment 6276877460 |
 | rows | exact on every lookup | 10 on every spans lookup (480 calls), 4 on every q20 pass | HIT | #2763 comment 6276877460; s3://ravel-clickbench-5b7101/reports/t12-2763/out/ calls.jsonl |
-| every other statement | no regression over 5% | 43 of 43 answered; cold sum 158.6 s against the 2026-10-14 real-S3 pair candidate's 188.7 s; one pass | reported, not adjudicated | #2763 comment 6276877460 |
+| every other statement and load | no regression over 5% | 43 of 43 answered; cold sum 158.6 s against the 2026-10-14 real-S3 pair candidate's 188.7 s, one pass on one build, which cannot decide a per-statement 5% band in either direction; the load half is adjudicated in its own rows above (time and trigger mix MISS, #3119) | statements not adjudicated: it needs a paired run of this build against v0.24.0 on one box with a per-statement split, the ADR-3072 decision 4 rebaseline, tracked on #3072; the epic does not close on this row until that run or an explicit waiver | #2763 comment 6276877460 |
 
 Three bands were mis-specified, and this amendment restates them. The q20
 bands are not restated: both q20 rows stay a MISS, with #3117 as the
@@ -1191,9 +1198,9 @@ bottleneck.
 - **Spans 1 h lookup bytes.** "About 200 KB" assumed the first read was
   the prefix. The restated band is the per-object first read times the
   candidate object count, plus the buckets and the blocks read; the first
-  read is 64 KiB per object today (24 candidate objects in the measured
-  window), and `prefix_len` once #3118 lands. The "under 1 s" half
-  stands, measured as a HIT.
+  read is 64 KiB per object today (24 to about 40 candidate objects in
+  the measured 1 h windows), and `prefix_len` once #3118 lands. The
+  "under 1 s" half stands, measured as a HIT.
 - **Fold section reads.** The row's `2 x entries` omitted the second
   footer GET that `read_entry_key_index` issues for an entry whose footer
   is longer than the 8 KiB suffix (`KEY_INDEX_FOOTER_SUFFIX_LEN`,
