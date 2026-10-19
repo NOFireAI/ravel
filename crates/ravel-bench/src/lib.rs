@@ -36,6 +36,7 @@ pub mod get_latency;
 pub mod groupby_scaling;
 pub mod harness;
 pub mod ingest;
+pub mod ingest_query_trial;
 pub mod logbody_report;
 #[cfg(feature = "sql-latency")]
 pub mod logs_scan_scaling;

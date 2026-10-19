@@ -461,6 +461,13 @@ path = "src/bin/heartbeat_under_query_load.rs"
 required-features = ["saturation"]
 bench = false
 
+# Issue #2818 trial: query latency under Remote Write load, three write gate arms.
+[[bin]]
+name = "ingest_query_latency_trial"
+path = "src/bin/ingest_query_latency_trial.rs"
+required-features = ["saturation"]
+bench = false
+
 # ADR-2793 decision 4: the server CPU one post-decode pending-ack refusal costs
 # over one head refusal (issue #2902).
 [[bin]]

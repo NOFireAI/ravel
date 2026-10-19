@@ -2562,8 +2562,13 @@ returns.
 | Write | Flush encode and ingest payload decode. | `--cpu-gate-write-permits` (default `max(1, cores / 2)`) |
 
 A job below the gate's inline floor runs on the calling thread and takes no
-permit. The floor is 256 KiB of uncompressed bytes, or 100,000 samples for a
-PromQL evaluation.
+permit. On the write gate the floor is 1 MiB: an ingest payload decode sized
+under 1 MiB (its uncompressed size, or an upper bound on it for gzip and OTAP
+bodies) runs inline on the request's worker, and a flush encode under 1 MiB
+on whichever worker polls the flush.
+`--cpu-gate-write-inline-floor-bytes` moves it. On the read gate the floor is
+256 KiB of uncompressed bytes, or 100,000 samples for a PromQL evaluation,
+and has no flag.
 
 Every site except one has a production call site. On the read gate those are
 `catalog_part`, `catalog_postings`, `catalog_column_stats`, `metrics_meta`,

@@ -118,7 +118,8 @@ rule on thread placement.
    tokio blocking pool, as the cache does today. Codec work (decompress,
    decode, encode, hash) on a unit at or above the gate's inline floor
    goes through a CPU gate. Neither runs on a runtime worker. The floor
-   defaults to 256 KiB of uncompressed bytes (decision 4). The rule also
+   defaults to 256 KiB of uncompressed bytes (decision 4; the write gate's
+   default is 1 MiB since the write inline floor amendment). The rule also
    covers PromQL evaluation, which is synchronous and never yields: an
    evaluation whose sample count, which the engine knows before it
    evaluates (`crates/ravel-query/src/engine.rs:781-788`), is at or above an
@@ -149,7 +150,8 @@ rule on thread placement.
    a whole block with all its pages, or a whole part. It never wraps a
    single page, since 4096 dispatches per block cost more than they save.
    A unit whose uncompressed length is below the floor runs inline. The
-   floor is a gate setting, 256 KiB by default, and tests set it to 0. An
+   floor is a gate setting, 256 KiB by default (1 MiB on the write gate
+   since the write inline floor amendment below), and tests set it to 0. An
    inline run still counts in `ravel_cpu_gate_inline_total{gate,site}`, not
    in `ravel_cpu_gate_jobs_total`, so a test can tell the two apart. The codec
    crates (`ravel-segment`, `ravel-logseg`, `ravel-rspan`,
@@ -377,7 +379,9 @@ flowchart LR
   Per-query latency on an idle node should drop, and CPU per node under
   load stays capped at the permit count plus the workers.
 - Each offloaded unit pays one `spawn_blocking` dispatch and one semaphore
-  acquire. The 256 KiB inline floor keeps that cost off small units.
+  acquire. The 256 KiB inline floor keeps that cost off small units (on
+  the write gate the floor is 1 MiB; see the write inline floor amendment
+  below).
 - Runnable threads can reach the worker count plus both gates' permits,
   about 2.5 times the core count with the defaults. The OS time-slices
   them. Workers mostly wait on I/O once decode leaves them, so the health
@@ -708,7 +712,9 @@ to no more than the floor.
   expansion as zlib's technical notes give it, capped at 64 MiB. Gzip records
   a member's inflated length, modulo 2^32, only in the trailer after that
   member's deflate data, so there is nothing to trust beforehand. At the
-  default floor a body of 254 compressed bytes or fewer runs inline.
+  default floor a body of 254 compressed bytes or fewer runs inline. (At the
+  write gate's 1 MiB floor, 1016 or fewer: see the write inline floor
+  amendment below.)
 - `otap_decode`: the sum of the content sizes the payload's zstd frames
   declare, when every frame declares one; the decompression stops one byte
   past that total, so a frame that understates its size cannot inflate past
@@ -910,3 +916,45 @@ RavelCluster written since then keeps `false` until its owner sets `true` or
 removes the field; only a new cluster, or one never written since the v0.19.0
 CRD (rare, since the operator's own status updates are writes), takes the new
 default.
+
+## Amendment (2026-10-19): the write inline floor amendment (issue #2818)
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="write inline floor amendment" -->
+
+Decision 4's byte floor now differs per gate. The write gate's default is
+1 MiB of input bytes (`DEFAULT_WRITE_INLINE_FLOOR_BYTES` in
+`ravel-cpu-gate`), so a flush encode or an ingest payload decode under 1 MiB
+runs inline on the async worker that reaches it. The read gate keeps 256 KiB
+(`DEFAULT_INLINE_FLOOR_BYTES`, which `CpuGateConfig::with_permits` still
+sets), and the 100,000-sample evaluation floor is unchanged.
+`--cpu-gate-write-inline-floor-bytes` moves the write floor; the read floor
+has no flag.
+
+The evidence is a pre-registered trial on a fresh c6a.4xlarge (issue #2818,
+comment 6261117172), in two parts.
+
+- The `ingest_write_gate_overhead` table pass, with no query load: 64 KiB
+  snappy Remote Write at 16 clients reached 0.879 of ungated throughput at
+  the 256 KiB floor and 1.001 at 1 MiB, and the median metrics flush input
+  was 382,987 B, above 256 KiB and under 1 MiB, so every flush and decode of
+  that body now runs inline.
+- The `ingest_query_latency_trial` runs, with queries under a fixed ingest
+  load: at 16 clients, query p99 at the 1 MiB floor stayed within 10% of the
+  256 KiB floor in both runs, PromQL at x1.007 and x1.006 and SQL at x1.050
+  and x1.044; at one client every arm was within 4%. The 1 MiB floor lands
+  where the ungated arm does, so it gives back the roughly 5% of SQL p99 and
+  p50 that the 256 KiB gate bought at 16 clients.
+
+The table pass also ran an arm that computed the metrics flush's CRC32C
+upload checksum inside the encode job at the 256 KiB floor. It reached 0.873
+of ungated throughput against that floor's 0.879, no gain, and the S3 store
+recomputes CRC32C inside its put anyway. The setting and its code were
+removed rather than kept as a flag.
+
+Liveness is not this floor's job. Decision 8's health listener is the
+isolated probe target, and #2980 measured it unmoved under load on the main
+runtime. The main router's `/healthz` shares the workers with ingest and
+query, more so now that decodes and flushes under 1 MiB run there; a
+cluster whose probes still point at it (`dedicatedHealthPort: false`, the
+value every RavelCluster written since v0.19.0 holds unless changed) should
+move them to the health listener. The trial measured neither probe.

@@ -873,7 +873,7 @@ mod tests {
     }
 
     /// A gzip inflate is sized by deflate's expansion bound on its compressed
-    /// length, capped: a body that compresses below the gate's default floor
+    /// length, capped: a body that compresses below a 256 KiB floor
     /// but can inflate above it runs on the gate, and only a body too small to
     /// reach the floor at 1032:1 runs inline.
     #[tokio::test]

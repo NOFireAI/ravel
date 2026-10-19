@@ -36,6 +36,12 @@ pub use crate::site::{GateKind, GateSite, ReadSite, WriteSite};
 /// Units below this many uncompressed bytes run inline (decision 4).
 pub const DEFAULT_INLINE_FLOOR_BYTES: u64 = 256 * 1024;
 
+/// The write gate's inline floor: flush encodes and ingest payload decodes
+/// below this many input bytes run inline (decision 4, as amended for issue
+/// #2818). [`CpuGateConfig::with_permits`] keeps [`DEFAULT_INLINE_FLOOR_BYTES`];
+/// the server builds its write gate with this one.
+pub const DEFAULT_WRITE_INLINE_FLOOR_BYTES: u64 = 1024 * 1024;
+
 /// PromQL evaluations below this many samples run inline (decision 1).
 pub const DEFAULT_EVAL_FLOOR_SAMPLES: u64 = 100_000;
 
@@ -174,6 +180,11 @@ impl<S: GateSite> CpuGate<S> {
     /// The permit count the gate was built with.
     pub fn permits(&self) -> usize {
         self.permits
+    }
+
+    /// The inline floor for [`JobSize::Bytes`] jobs the gate was built with.
+    pub fn inline_floor_bytes(&self) -> u64 {
+        self.config.inline_floor_bytes
     }
 
     /// Jobs holding a permit right now, including a job whose waiter is gone.

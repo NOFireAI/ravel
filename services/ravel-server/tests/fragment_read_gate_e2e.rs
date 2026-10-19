@@ -201,7 +201,11 @@ async fn start_server(store: Arc<dyn ObjectStoreBackend>) -> ravel_server::Runni
         process_memory_budget_is_fallback: false,
         cache_dir: None,
         catalog_resolve_concurrency: None,
-        cpu_gate_permits: ravel_server::config::CpuGatePermits { read: 2, write: 1 },
+        cpu_gate_permits: ravel_server::config::CpuGatePermits {
+            read: 2,
+            write: 1,
+            ..Default::default()
+        },
         max_pending_strict_acks: 8_192,
         ingest_buffer_budget_limit: ravel_server::IngestByteBudgetLimit::Unlimited,
         idle_tenant_state_ttl: std::time::Duration::from_secs(3600),

@@ -28,7 +28,7 @@ use crate::shard::{ShardActor, ShardMsg};
 #[cfg(feature = "stage-timing")]
 use crate::stage_timing::{MetricStage, MetricStageTimings};
 use crate::value::{IngestExemplar, IngestPoint};
-use crate::write_gate::WriteGateSlot;
+use crate::write_gate::{FlushInputBytes, WriteGateSlot};
 use ravel_cpu_gate::WriteGate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,6 +516,16 @@ impl IngestRouter {
     #[must_use]
     pub fn with_write_gate(self, gate: Arc<WriteGate>) -> Self {
         self.write_gate.set(gate);
+        self
+    }
+
+    /// Records the input bytes of every flush encode from here on into
+    /// `recorder`, the same figure the write gate's inline floor is compared
+    /// with (issue #2818). Measurement instrumentation for benches; a router
+    /// without it records nothing.
+    #[must_use]
+    pub fn with_flush_input_bytes(self, recorder: FlushInputBytes) -> Self {
+        self.write_gate.set_input_recorder(recorder);
         self
     }
 

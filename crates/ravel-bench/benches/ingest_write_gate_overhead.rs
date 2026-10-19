@@ -24,6 +24,17 @@
 //! counts, since the inline floor decides whether a body went through the
 //! gate at all. The table pass runs only under `cargo bench`.
 //!
+//! Each table row also prints the min/median/max input bytes of the metrics
+//! flush encodes its runs started (issue #2818), the figure the inline floor
+//! is compared against. Environment parameters, all unset by default:
+//! `RAVEL_BENCH_WRITE_PERMITS` and `RAVEL_BENCH_WRITE_INLINE_FLOOR_BYTES`
+//! set the gate's permits and inline floor as the server's
+//! `--cpu-gate-write-permits` and `--cpu-gate-write-inline-floor-bytes` do;
+//! `RAVEL_BENCH_TABLE_RUNS`, `RAVEL_BENCH_HTTP_RUN_MS`
+//! and `RAVEL_BENCH_FLUSH_RUN_MS` shorten the table pass. A criterion filter
+//! that matches nothing (`-- table-only`) skips the criterion pass and keeps
+//! the table.
+//!
 //! The binary runs under jemalloc with its background thread configured, as
 //! the shipped server does: a gated job allocates on a blocking-pool thread
 //! and its result is freed on a worker, so the allocator is part of the cost.
@@ -48,11 +59,12 @@ use opentelemetry_proto::tonic::metrics::v1::{
 };
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
+use ravel_bench::ingest_query_trial::format_flush_input_bytes;
 use ravel_cpu_gate::{GateSite as _, WriteGate, WriteSite};
 use ravel_ingest::{
-    AdmissionController, AdmissionLimits, CountLimit, IngestByteBudget, IngestByteBudgetLimit,
-    IngestConfig, IngestPoint, IngestRouter, IngestValue, LogIngestRouter, PendingAckBudget,
-    RateLimit, SpanIngestRouter, SystemClock, WriteMode,
+    AdmissionController, AdmissionLimits, CountLimit, FlushInputBytes, IngestByteBudget,
+    IngestByteBudgetLimit, IngestConfig, IngestPoint, IngestRouter, IngestValue, LogIngestRouter,
+    PendingAckBudget, RateLimit, SpanIngestRouter, SystemClock, WriteMode,
 };
 use ravel_object_store::ObjectStoreBackend;
 use ravel_object_store::memory::MemoryStore;
@@ -113,20 +125,44 @@ fn cores() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
+fn env_parse<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok().and_then(|v| v.parse::<T>().ok())
+}
+
 /// The write gate `ravel_server::start` builds for this host.
 /// `RAVEL_BENCH_WRITE_PERMITS` overrides its permits, as the server's
 /// `--cpu-gate-write-permits` does, so the decision-3 default can be
 /// compared against more permits on the same host.
+/// `RAVEL_BENCH_WRITE_INLINE_FLOOR_BYTES` overrides its inline floor, as
+/// `--cpu-gate-write-inline-floor-bytes` does (issue #2818).
 fn production_write_gate() -> Arc<WriteGate> {
     let mut permits = CpuGatePermits::derive(cores());
-    if let Some(n) = std::env::var("RAVEL_BENCH_WRITE_PERMITS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-    {
+    if let Some(n) = env_parse::<usize>("RAVEL_BENCH_WRITE_PERMITS").filter(|n| *n > 0) {
         permits.write = n;
     }
+    if let Some(floor) = env_parse::<u64>("RAVEL_BENCH_WRITE_INLINE_FLOOR_BYTES") {
+        permits.write_inline_floor_bytes = floor;
+    }
     CpuGates::new(permits).write
+}
+
+/// `RAVEL_BENCH_TABLE_RUNS`, `RAVEL_BENCH_HTTP_RUN_MS` and
+/// `RAVEL_BENCH_FLUSH_RUN_MS` shorten the table pass for a quick read.
+fn table_runs() -> usize {
+    env_parse::<usize>("RAVEL_BENCH_TABLE_RUNS")
+        .filter(|n| *n > 0)
+        .unwrap_or(TABLE_RUNS)
+}
+
+fn run_length(path: Path) -> Duration {
+    let (name, default) = if path == Path::FlushEncode {
+        ("RAVEL_BENCH_FLUSH_RUN_MS", FLUSH_RUN)
+    } else {
+        ("RAVEL_BENCH_HTTP_RUN_MS", HTTP_RUN)
+    };
+    env_parse::<u64>(name)
+        .filter(|ms| *ms > 0)
+        .map_or(default, Duration::from_millis)
 }
 
 /// Admission that never refuses: the bench measures the gate, not the
@@ -582,8 +618,18 @@ fn flush_points(tenant: &TenantId) -> (Vec<IngestPoint>, usize) {
 // Server state, built as the otlp_http and remote_write tests build it
 // ---------------------------------------------------------------------------
 
+/// A metrics router with the flush input size recorder the table pass reads
+/// (issue #2818), when there is one.
+fn record_flush_inputs(router: IngestRouter, recorder: Option<FlushInputBytes>) -> IngestRouter {
+    match recorder {
+        Some(recorder) => router.with_flush_input_bytes(recorder),
+        None => router,
+    }
+}
+
 fn gateway_state(
     gate: Option<Arc<WriteGate>>,
+    recorder: Option<FlushInputBytes>,
 ) -> (
     Arc<GatewayState>,
     Arc<IngestRouter>,
@@ -618,7 +664,7 @@ fn gateway_state(
         log_router = log_router.with_write_gate(gate.clone());
         span_router = span_router.with_write_gate(gate.clone());
     }
-    let metrics_router = Arc::new(metrics_router);
+    let metrics_router = Arc::new(record_flush_inputs(metrics_router, recorder));
     let admission = unlimited_admission();
     let normalize_metrics = Arc::new(NormalizeRejectMetrics::new());
     let state = Arc::new(GatewayState {
@@ -669,7 +715,10 @@ fn gateway_state(
     (state, metrics_router, store)
 }
 
-fn remote_write_state(gate: Option<Arc<WriteGate>>) -> (Arc<RemoteWriteState>, Arc<IngestRouter>) {
+fn remote_write_state(
+    gate: Option<Arc<WriteGate>>,
+    recorder: Option<FlushInputBytes>,
+) -> (Arc<RemoteWriteState>, Arc<IngestRouter>) {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let budget = IngestByteBudget::shared(IngestByteBudgetLimit::Unlimited);
     let config = IngestConfig {
@@ -687,7 +736,7 @@ fn remote_write_state(gate: Option<Arc<WriteGate>>) -> (Arc<RemoteWriteState>, A
     if let Some(gate) = &gate {
         router = router.with_write_gate(gate.clone());
     }
-    let router = Arc::new(router);
+    let router = Arc::new(record_flush_inputs(router, recorder));
     let state = Arc::new(RemoteWriteState {
         tenant_resolver: Arc::new(FixedTenant),
         strict_flush_policy: ravel_server::config::StrictFlushPolicy::Aged,
@@ -709,7 +758,10 @@ fn remote_write_state(gate: Option<Arc<WriteGate>>) -> (Arc<RemoteWriteState>, A
     (state, router)
 }
 
-fn flush_router(gate: Option<Arc<WriteGate>>) -> Arc<IngestRouter> {
+fn flush_router(
+    gate: Option<Arc<WriteGate>>,
+    recorder: Option<FlushInputBytes>,
+) -> Arc<IngestRouter> {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let config = IngestConfig {
         shard_count: 1,
@@ -726,7 +778,7 @@ fn flush_router(gate: Option<Arc<WriteGate>>) -> Arc<IngestRouter> {
     if let Some(gate) = gate {
         router = router.with_write_gate(gate);
     }
-    Arc::new(router)
+    Arc::new(record_flush_inputs(router, recorder))
 }
 
 // ---------------------------------------------------------------------------
@@ -782,10 +834,15 @@ enum Target {
 }
 
 impl Target {
-    fn build(path: Path, payload: &Payload, gate: Option<Arc<WriteGate>>) -> Self {
+    fn build(
+        path: Path,
+        payload: &Payload,
+        gate: Option<Arc<WriteGate>>,
+        recorder: Option<FlushInputBytes>,
+    ) -> Self {
         match (path, payload) {
             (Path::OtlpGzip, Payload::Http(bodies)) => {
-                let (state, router, store) = gateway_state(gate);
+                let (state, router, store) = gateway_state(gate, recorder);
                 Target::Http {
                     app: ravel_server::otlp_http::router(state),
                     router,
@@ -795,7 +852,7 @@ impl Target {
                 }
             }
             (Path::RwSnappy, Payload::Http(bodies)) => {
-                let (state, router) = remote_write_state(gate);
+                let (state, router) = remote_write_state(gate, recorder);
                 Target::Http {
                     app: ravel_server::remote_write::router(state),
                     router,
@@ -805,7 +862,7 @@ impl Target {
                 }
             }
             (Path::FlushEncode, Payload::Flush(points)) => Target::Flush {
-                router: flush_router(gate),
+                router: flush_router(gate, recorder),
                 points: points.clone(),
             },
             _ => panic!("payload does not match path"),
@@ -1031,7 +1088,7 @@ fn bench_criterion(c: &mut Criterion) {
         for clients in CONCURRENCIES {
             for gated in [false, true] {
                 let gate = gated.then(production_write_gate);
-                let target = Arc::new(Target::build(w.path, &w.payload, gate));
+                let target = Arc::new(Target::build(w.path, &w.payload, gate, None));
                 group.throughput(Throughput::Bytes(target.request_bytes(0)));
                 let id = format!(
                     "{}/c{clients}/{}",
@@ -1067,6 +1124,9 @@ struct RunResult {
     flush_jobs: u64,
     flush_inline: u64,
     flushes: u64,
+    /// The input bytes of every flush encode the run started, its closing
+    /// drain included.
+    flush_input_bytes: Vec<u64>,
 }
 
 fn percentile(sorted: &[Duration], q: f64) -> Duration {
@@ -1087,15 +1147,18 @@ fn site_counts(gate: &WriteGate, site: WriteSite) -> (u64, u64) {
 
 fn one_run(rt: &tokio::runtime::Runtime, w: &Workload, clients: usize, gated: bool) -> RunResult {
     let gate = gated.then(production_write_gate);
-    let target = Arc::new(Target::build(w.path, &w.payload, gate.clone()));
-    let run_for = if w.path == Path::FlushEncode {
-        FLUSH_RUN
-    } else {
-        HTTP_RUN
-    };
+    let recorder = FlushInputBytes::default();
+    let target = Arc::new(Target::build(
+        w.path,
+        &w.payload,
+        gate.clone(),
+        Some(recorder.clone()),
+    ));
+    let run_for = run_length(w.path);
     // Warm the router (shard actors, first-series paths) before counting.
     rt.block_on(drive(target.clone(), clients, None, Some(clients as u64)));
     rt.block_on(target.drain());
+    recorder.take();
     let flushes_before = flush_count(target.ingest_router());
     let site_before = gate
         .as_ref()
@@ -1112,6 +1175,7 @@ fn one_run(rt: &tokio::runtime::Runtime, w: &Workload, clients: usize, gated: bo
         .map_or((0, 0), |g| site_counts(g, WriteSite::MetricsFlush));
     let flushes = flush_count(target.ingest_router()) - flushes_before;
     rt.block_on(target.drain());
+    let flush_input_bytes = recorder.take();
     latencies.sort_unstable();
     let requests = latencies.len();
     let bytes: u64 = (0..requests).map(|i| target.request_bytes(i)).sum();
@@ -1127,6 +1191,7 @@ fn one_run(rt: &tokio::runtime::Runtime, w: &Workload, clients: usize, gated: bo
         flush_jobs: flush_after.0 - flush_before.0,
         flush_inline: flush_after.1 - flush_before.1,
         flushes,
+        flush_input_bytes,
     }
 }
 
@@ -1179,17 +1244,18 @@ fn report_table(_c: &mut Criterion) {
     let _runtime = rt.enter();
     let workloads = workloads();
     let gate = production_write_gate();
+    let table_runs = table_runs();
     println!();
     println!("== ingest_write_gate_overhead table (issue #2669) ==");
     println!(
         "host: {} cores (available_parallelism); write gate permits {}, inline floor {} B; \
-         {TABLE_RUNS} runs per configuration, gated/ungated interleaved; \
+         {table_runs} runs per configuration, gated/ungated interleaved; \
          run length {} ms (HTTP) / {} ms (flush)",
         cores(),
         gate.permits(),
-        ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES,
-        HTTP_RUN.as_millis(),
-        FLUSH_RUN.as_millis()
+        gate.inline_floor_bytes(),
+        run_length(Path::OtlpGzip).as_millis(),
+        run_length(Path::FlushEncode).as_millis()
     );
     drop(gate);
     let alloc = allocator();
@@ -1219,9 +1285,9 @@ fn report_table(_c: &mut Criterion) {
                 w.size,
                 loadavg()
             );
-            let mut ungated = Vec::with_capacity(TABLE_RUNS);
-            let mut gated = Vec::with_capacity(TABLE_RUNS);
-            for run in 0..TABLE_RUNS {
+            let mut ungated = Vec::with_capacity(table_runs);
+            let mut gated = Vec::with_capacity(table_runs);
+            for run in 0..table_runs {
                 if run % 2 == 0 {
                     ungated.push(one_run(&rt, w, clients, false));
                     gated.push(one_run(&rt, w, clients, true));
@@ -1252,13 +1318,18 @@ fn report_table(_c: &mut Criterion) {
             let label = format!("{} {} c{clients}", w.path.name(), w.size);
             for (mode, runs) in [("ungated", &ungated), ("gated", &gated)] {
                 let requests: usize = runs.iter().map(|r| r.requests).sum();
+                let flush_input: Vec<u64> = runs
+                    .iter()
+                    .flat_map(|r| r.flush_input_bytes.iter().copied())
+                    .collect();
                 println!(
                     "{label:<24} {mode:<8} req/s {:<28} MiB/s {:<28} p50 {:<28} p99 {:<28} \
-                     requests {requests}",
+                     requests {requests}; flush input min/median/max {}",
                     spread(runs, |r| r.throughput, 1.0),
                     spread(runs, |r| r.bytes_per_sec, 1.0 / (1024.0 * 1024.0)),
                     spread(runs, |r| ms(r.p50), 1.0),
                     spread(runs, |r| ms(r.p99), 1.0),
+                    format_flush_input_bytes(&flush_input),
                 );
             }
             let sum = |f: fn(&RunResult) -> u64| gated.iter().map(f).sum::<u64>();

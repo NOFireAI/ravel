@@ -224,10 +224,12 @@ the blocking pool, and decision 8 covers the probes:
 - Codec work (decompress, decode, encode) at a gated call site runs through
   `CpuGate::run` in `ravel-cpu-gate`. The job takes a permit from the read
   or the write gate, then runs on the blocking pool. A job below its floor
-  runs inline on the worker: 256 KiB of uncompressed bytes for a codec job
-  (`DEFAULT_INLINE_FLOOR_BYTES`), and 100,000 samples for a PromQL
-  evaluation, which otherwise runs on the read gate's `promql_eval` site
-  (`DEFAULT_EVAL_FLOOR_SAMPLES`). The call sites are the `ReadSite` and
+  runs inline on the worker: 1 MiB of input bytes for a write gate codec job
+  (`DEFAULT_WRITE_INLINE_FLOOR_BYTES`, moved by
+  `--cpu-gate-write-inline-floor-bytes`), 256 KiB of uncompressed bytes for
+  a read gate codec job (`DEFAULT_INLINE_FLOOR_BYTES`), and 100,000 samples
+  for a PromQL evaluation, which otherwise runs on the read gate's
+  `promql_eval` site (`DEFAULT_EVAL_FLOOR_SAMPLES`). The call sites are the `ReadSite` and
   `WriteSite` variants in `crates/ravel-cpu-gate/src/site.rs`; the
   observability guide lists the metric families every site renders.
 - The probes get their own listener and thread. With `--listen-health`
