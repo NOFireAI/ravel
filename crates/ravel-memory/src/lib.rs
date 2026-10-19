@@ -199,9 +199,10 @@ impl MemoryBudget {
 
     /// Bytes currently reserved through [`reserve`] (the RAII `Reservation`
     /// API, whose callers include `SegmentFetcher`, `LogSegmentFetcher`,
-    /// `SpanSegmentFetcher`, and the DDL footer reads `ravel-parquet`'s
-    /// `snapshot_location` makes for `CREATE EXTERNAL TABLE`), a subset of
-    /// `reserved()`. `try_reserve` and `reserve_unchecked` (the raw counter
+    /// `SpanSegmentFetcher`, the DDL footer reads `ravel-parquet`'s
+    /// `snapshot_location` makes for `CREATE EXTERNAL TABLE`, and
+    /// `ravel-promql`'s range-query selector cache, one reservation per
+    /// cached selector read), a subset of `reserved()`. `try_reserve` and `reserve_unchecked` (the raw counter
     /// API SQL's `TenantMemoryAccountant` uses exclusively) never touch this
     /// counter, so it never counts SQL execution's share.
     ///
@@ -434,8 +435,10 @@ impl MemoryBudget {
     /// Takes `self` as `&Arc<Self>` so the returned [`Reservation`] owns
     /// its own `Arc` clone and can travel with the buffer it accounts for
     /// across threads and tasks, rather than being tied to a borrow scope.
-    /// Also grows `fetch_reserved()` by `n`, since this RAII path is the
-    /// fetch layer's alone (see [`fetch_reserved`]'s doc comment).
+    /// Also grows `fetch_reserved()` by `n`: every caller of this RAII path
+    /// is counted as the fetch share, which besides the fetchers includes
+    /// `ravel-promql`'s range-query selector cache (see [`fetch_reserved`]'s
+    /// doc comment for the full list).
     ///
     /// [`fetch_reserved`]: MemoryBudget::fetch_reserved
     pub fn reserve(self: &Arc<Self>, n: u64) -> Result<Reservation, MemoryExhausted> {

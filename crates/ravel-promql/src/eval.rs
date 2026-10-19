@@ -692,7 +692,8 @@ impl QueryWindow {
     }
 
     /// The one info a range query carries when any selector's cache entry did
-    /// not fit, naming how many fell back and why; `None` when none did.
+    /// not fit, naming how many fell back and why, with the figures of the
+    /// first budget refusal the query met; `None` when none did.
     fn selector_cache_fallback_info(&self) -> Option<String> {
         let cache = self.selector_cache.as_ref()?;
         let (cap, budget, refusal) = cache.fallbacks();
@@ -709,7 +710,7 @@ impl QueryWindow {
         }
         if let Some(refusal) = refusal {
             reasons.push(format!(
-                "{budget} refused by the query memory budget ({refusal})"
+                "{budget} refused by the query memory budget (first refusal: {refusal})"
             ));
         }
         Some(format!(
@@ -887,9 +888,12 @@ impl Evaluator {
     }
 
     /// Reserve each of a range query's selector-cache entries against
-    /// `budget`, held until the entry is replaced or the query ends. A refused
+    /// `budget`, held until the entry is replaced or the query ends. The
+    /// reservations go through `MemoryBudget::reserve`, so they count toward
+    /// the budget's `fetch_reserved()` (the server's
+    /// `ravel_memory_reserved_bytes{component="fetch"}`). A refused
     /// reservation does not fail the query: that selector is read at every
-    /// step instead, and the query carries an info naming the refusal.
+    /// step instead, and the query carries an info naming the first refusal.
     pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
         self.memory_budget = Some(budget);
         self
@@ -4181,7 +4185,7 @@ mod tests {
             "{info}"
         );
         assert!(
-            info.contains("1 refused by the query memory budget (memory exhausted:"),
+            info.contains("1 refused by the query memory budget (first refusal: memory exhausted:"),
             "{info}"
         );
         assert!(!info.contains("cap of"), "{info}");
@@ -4416,7 +4420,7 @@ mod tests {
             fallback_infos,
             [&format!(
                 "1 selector(s) read at every step instead of once per query: \
-                 1 refused by the query memory budget (memory exhausted: \
+                 1 refused by the query memory budget (first refusal: memory exhausted: \
                  requested {union} bytes, 0 of {limit} byte limit already reserved)"
             )]
         );
@@ -4461,7 +4465,7 @@ mod tests {
         assert!(refused.iter().all(|&b| cached + b > limit), "{refused:?}");
         let expected = format!(
             "4 selector(s) read at every step instead of once per query: \
-             4 refused by the query memory budget (memory exhausted: \
+             4 refused by the query memory budget (first refusal: memory exhausted: \
              requested {} bytes, {cached} of {limit} byte limit already reserved)",
             refused[0]
         );
