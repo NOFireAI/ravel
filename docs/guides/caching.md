@@ -217,8 +217,13 @@ the read's bytes are admitted and never what the read returns:
   reads, a window being twice the tenant's pass bytes, held between 2 and
   16 times the cap. For a loop over 8 times the cap an entry therefore
   lives for 16 to 32 times the cap of reads, and a loop larger than about
-  32 times the cap is served nothing. A bulk read the region declines is
-  not copied. A bulk admission never evicts the main queue, and an
+  32 times the cap is served nothing. A bulk read the region declines when
+  it arrives is not copied and evicts nothing. One it accepts is copied, if
+  its bytes need an exact-size copy, before the admission rechecks the room.
+  If another admission took the room in between, the recheck declines it,
+  and the copy already made is still counted: the admission copy counters
+  (`admission_copies`, `admission_copied_bytes`) count copies made, not
+  entries stored. A bulk admission never evicts the main queue, and an
   interactive admission reclaims bulk bytes above half the cap before it
   evicts anything else. The region's bookkeeping is counted inside the cap
   and held to 1% of it.

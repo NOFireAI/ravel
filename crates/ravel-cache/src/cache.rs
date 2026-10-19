@@ -518,8 +518,8 @@ impl Inner {
     /// size or already resident, so its copy is made up front, as for an
     /// always-admitted value. A bulk admission is declined by rank or room,
     /// so [`S3Fifo::would_admit`] decides first under the lock: a bulk read
-    /// it declines is passed to the admission uncopied, which counts the
-    /// read against its tenant and stores nothing. One it accepts is copied
+    /// it declines is counted against its tenant by [`S3Fifo::decline_bulk`],
+    /// uncopied, and evicts and stores nothing. One it accepts is copied
     /// after the lock is dropped and admitted under the lock again, where
     /// the admission re-runs every check and may still decline, if the
     /// region changed in between. An over-size value is passed through
@@ -543,7 +543,9 @@ impl Inner {
         } else if intent == AccessIntent::BulkScan {
             let mut fifo = self.fifo.lock();
             if !fifo.would_admit(&key, size, intent) {
-                fifo.insert_with_intent_lazy(key, size, intent, &self.metrics, || None);
+                // Keys a window rotation evicted need no cleanup here: their
+                // bytes drop with the entries.
+                let _ = fifo.decline_bulk(&key, size, &self.metrics);
                 self.metrics
                     .set_bulk_bookkeeping_bytes(fifo.bookkeeping_bytes());
                 return value;
@@ -1515,5 +1517,127 @@ mod tests {
         assert_eq!(cache.len(), 1, "nothing new stored");
         assert_eq!(metrics.admission_copies(), 2, "the second copy counted");
         assert_eq!(metrics.admission_copied_bytes(), 2 * LEN);
+    }
+
+    /// The highest rank among `keys` that are resident.
+    fn top_resident_rank(cache: &Cache<&'static str>, keys: &[CacheKey]) -> u64 {
+        let fifo = cache.inner.fifo.lock();
+        keys.iter()
+            .filter(|key| fifo.contains(key))
+            .map(|key| fifo.rank_and_bound(key).0)
+            .max()
+            .unwrap()
+    }
+
+    /// A bulk read `would_admit` declines on a region at its bookkeeping cap,
+    /// ranked above every region entry, with 20 once-read interactive entries
+    /// in the small queue: the check declines it, nothing is copied, nothing
+    /// is evicted, and every resident entry stays.
+    ///
+    /// FLIP: against the PR head, whose decline path runs the admission
+    /// through `insert_with_intent_lazy` and whose admission loop has no
+    /// bookkeeping check, the loop evicts the 20 interactive entries and
+    /// `len` drops by 20.
+    #[test]
+    fn a_bulk_read_declined_at_the_bookkeeping_cap_copies_and_evicts_nothing() {
+        const MAX_BYTES: u64 = 4 * 1024 * 1024;
+        const LEN: u64 = 4 * 1024;
+        let cache: Cache<&'static str> =
+            Cache::new(CacheLimits::new(MAX_BYTES, 1_000_000, 64 * 1024));
+        let metrics = cache.metrics();
+        let bulk: Vec<CacheKey> = (0..300).map(|n| test_key_with_len(n, LEN)).collect();
+        for &key in &bulk {
+            let value = Bytes::from(vec![1u8; LEN as usize]);
+            cache.insert_with_intent(key, value, AccessIntent::BulkScan);
+        }
+        let interactive: Vec<CacheKey> = (100_000..100_020)
+            .map(|n| test_key_with_len(n, LEN))
+            .collect();
+        for &key in &interactive {
+            cache.insert(key, Bytes::from(vec![2u8; LEN as usize]));
+        }
+        let bookkeeping = cache.inner.fifo.lock().bookkeeping_bytes();
+        assert!(
+            bookkeeping + crate::s3fifo::REGION_ENTRY_BOOKKEEPING_BYTES > MAX_BYTES / 100,
+            "precondition: at the bookkeeping cap"
+        );
+        let top = top_resident_rank(&cache, &bulk);
+        let rank = |key: &CacheKey| cache.inner.fifo.lock().rank_and_bound(key).0;
+        let arriving = (200_000..)
+            .map(|n| test_key_with_len(n, LEN))
+            .find(|key| rank(key) > top)
+            .unwrap();
+        let len = cache.len();
+        let evictions = metrics.snapshot().evictions;
+        assert_eq!(metrics.admission_copies(), 0, "precondition: no copy yet");
+
+        let shared = Bytes::from(vec![3u8; LEN as usize]);
+        let keep = shared.clone();
+        let mut ran_between = false;
+        let returned =
+            cache
+                .inner
+                .insert_checked_then(arriving, shared, AccessIntent::BulkScan, || {
+                    ran_between = true;
+                });
+
+        assert!(!ran_between, "would_admit declined");
+        assert_eq!(cache.len(), len, "resident population");
+        let fifo = cache.inner.fifo.lock();
+        assert!(interactive.iter().all(|key| fifo.contains(key)));
+        assert!(!fifo.contains(&arriving));
+        drop(fifo);
+        assert_eq!(metrics.snapshot().evictions, evictions);
+        assert_eq!(metrics.admission_copies(), 0);
+        assert_eq!(returned.as_ptr(), keep.as_ptr(), "the value itself");
+    }
+
+    /// A bulk read `would_admit` declines runs none of the admission's
+    /// evictions, including the region eviction the admission's loop makes
+    /// before it finds the room still short: 31 region entries of 32 KiB
+    /// fill a 1 MiB cache, and a 64 KiB read ranked below only the top one
+    /// would free 32 KiB of the 64 KiB it needs, with the region above its
+    /// share so the small-queue step is closed.
+    ///
+    /// FLIP: running the admission on the decline path, as the PR head did
+    /// (`insert_with_intent_lazy` with a value-less closure in place of
+    /// `decline_bulk`), evicts the top region entry and `len` drops to 30.
+    #[test]
+    fn a_declined_bulk_read_evicts_no_region_entry() {
+        const ENTRY: u64 = 32 * 1024;
+        let max_bytes = 32 * ENTRY;
+        let cache: Cache<&'static str> = Cache::new(CacheLimits::new(max_bytes, 1_000, 2 * ENTRY));
+        let metrics = cache.metrics();
+        let bulk: Vec<CacheKey> = (0..31).map(|n| test_key_with_len(n, ENTRY)).collect();
+        for &key in &bulk {
+            let value = Bytes::from(vec![1u8; ENTRY as usize]);
+            cache.insert_with_intent(key, value, AccessIntent::BulkScan);
+        }
+        assert_eq!(cache.len(), 31, "precondition: every bulk read stored");
+
+        let rank = |key: &CacheKey| cache.inner.fifo.lock().rank_and_bound(key).0;
+        let mut ranks: Vec<u64> = bulk.iter().map(rank).collect();
+        ranks.sort_unstable();
+        let (second, top) = (ranks[29], ranks[30]);
+        let arriving = (1_000..)
+            .map(|n| test_key_with_len(n, 2 * ENTRY))
+            .find(|key| (second..top).contains(&rank(key)))
+            .unwrap();
+        let evictions = metrics.snapshot().evictions;
+
+        let returned = cache.admit(
+            arriving,
+            Bytes::from(vec![2u8; 2 * ENTRY as usize]),
+            AccessIntent::BulkScan,
+        );
+
+        assert_eq!(cache.len(), 31, "no region entry evicted");
+        let fifo = cache.inner.fifo.lock();
+        assert!(bulk.iter().all(|key| fifo.contains(key)));
+        assert!(!fifo.contains(&arriving));
+        drop(fifo);
+        assert_eq!(metrics.snapshot().evictions, evictions);
+        assert_eq!(metrics.admission_copies(), 0);
+        assert_eq!(returned.len() as u64, 2 * ENTRY);
     }
 }
