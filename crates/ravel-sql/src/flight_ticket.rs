@@ -4168,6 +4168,36 @@ mod tests {
         }
     }
 
+    /// A statement joining two signal tables with a Parquet table pins both
+    /// in one version 10 ticket: the signal groups and the Parquet pins
+    /// round-trip together, and redemption rebuilds the signal lanes only
+    /// (ADR-2904 decision 11).
+    #[test]
+    fn a_v10_ticket_with_parquet_pins_round_trips() {
+        let key = test_key();
+        let ticket = FlightTicket {
+            statement: "SELECT s.ts FROM samples s JOIN logs l ON s.ts = l.ts \
+                        JOIN hits h ON s.ts = h.ts"
+                .to_owned(),
+            parquet_tables: vec![ParquetPin {
+                table: "hits".to_owned(),
+                version: 4,
+            }],
+            ..grouped_ticket()
+        };
+        let bytes = ticket.encode(&key).expect("encode");
+        assert_eq!(bytes[4], VERSION_GROUPS);
+        let decoded = FlightTicket::decode(&bytes, &key).expect("decode");
+        assert_eq!(decoded, ticket);
+        assert_eq!(decoded.parquet_tables, ticket.parquet_tables);
+        assert_eq!(decoded.signal_groups, ticket.signal_groups);
+        let lanes = decoded.redemption_lanes().expect("lanes");
+        assert_eq!(
+            lanes.iter().map(|(signal, _)| *signal).collect::<Vec<_>>(),
+            vec![TargetSignal::Metrics, TargetSignal::Logs]
+        );
+    }
+
     #[test]
     fn redemption_lanes_rebuild_every_pinned_snapshot() {
         let key = test_key();

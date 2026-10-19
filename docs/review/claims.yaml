@@ -239,16 +239,88 @@
   status: not-implemented
   note: "services/ravel-cli/src/sql_explain.rs builds its SqlExecutor without with_parquet_sources, and SqlExecutor::resolve_parquet_target returns Ok(None) when no sources are installed. The capability would arrive as a call site, not a new definition, so there is no symbol to bind."
 
-# --- ADR-2904 interim refusals (issue #2910) --------------------------------
+# --- ADR-2904 statements over several tables (issues #2910, #2911, #2914) ---
 
-- id: query-engine-cross-signal-interim-refusals
+- id: query-engine-parquet-beside-signal-runs
   doc: docs/query-engine.md
-  quote: "saying it is not supported yet"
-  kind: negative
+  quote: "A statement may name Parquet tables of the caller's tenant beside one or more signal tables, over HTTP and Flight SQL."
+  kind: positive
   binds:
-    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_table_beside_parquet_is_refused_before_listing
+    - crates/ravel-sql/tests/parquet_tables.rs::a_parquet_table_joined_with_logs_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::samples_joined_with_a_parquet_table_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::flight_sql_joins_a_parquet_table_with_logs
+    - crates/ravel-sql/tests/parquet_tables.rs::a_flight_mixed_statement_pins_the_parquet_table_and_the_signal_lane
   status: verified
-  note: "SqlError::SignalBesideParquet is the one interim refusal left; enum variants are not definitions under the BIND resolver, so the entry binds the test that pins it before any signal catalog listing. Ticket T7 (#2914) lifts it. The min_commit_token refusal it shared the entry with was replaced by the table-qualified token (#2911)."
+  note: "Replaces the interim refusal entry: SqlError::SignalBesideParquet is removed (#2914). The HTTP tests join hits with logs and with samples and assert the exact rows; the Flight tests assert the merged Flight rows equal the HTTP rows, and that DoGet reads the pinned Parquet manifest and logs snapshot after both changed between the two calls."
+
+- id: query-engine-parquet-beside-signal-session
+  doc: docs/query-engine.md
+  quote: "Those settings leave the signal scans' physical plans as they are in the same statement without its Parquet tables."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_scan_plans_the_same_beside_a_parquet_table
+    - crates/ravel-sql/src/session.rs::tests::a_parquet_entry_beside_signal_tables_builds_with_the_parquet_registry
+  status: verified
+  note: "The integration test compares the one-line display and partition count of the LogsScanExec and RsegScanExec nodes of a signal statement alone and beside a Parquet table; the unit test pins that a mixed session takes parquet_session_config and the Parquet store registry (#2914)."
+
+- id: query-engine-parquet-beside-signal-registry
+  doc: docs/query-engine.md
+  quote: "a signal-only session keeps the registry that answers nothing, and a Parquet-only session registers no signal table."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_only_statement_gets_no_parquet_store_registry
+    - crates/ravel-sql/tests/parquet_tables.rs::a_parquet_only_statement_registers_no_signal_table
+  status: verified
+  note: "Both tests read the planned session's registered tables and whether it resolves the tenant's ravel-pq:// URL, on the pinned single-lane and multi-lane surfaces (#2914)."
+
+- id: query-engine-parquet-beside-signal-no-name-pushdown
+  doc: docs/query-engine.md
+  quote: "so its postings do not prune beside a Parquet table: there a `samples` filter on `__name__` reads every segment in the window"
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::samples_joined_with_a_parquet_table_returns_exact_rows
+  status: verified
+  note: "The test reads two segments for the mixed join and one for the same samples filter alone, where the __name__ postings prune (#2914)."
+
+- id: query-engine-parquet-beside-signal-tokens
+  doc: docs/query-engine.md
+  quote: "one qualified with the Parquet table's name is `SqlError::CommitTokenQualifierNotRead`, refused by token admission before any store request."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_takes_a_token_for_its_signal_table_only
+    - crates/ravel-sql/tests/parquet_tables.rs::a_commit_token_on_a_parquet_only_flight_statement_is_refused
+  status: verified
+  note: "The first test runs a mixed statement with an unqualified and a logs-qualified token and refuses a hits-qualified one with both stores' read counts unchanged; the second refuses a token on a Parquet-only Flight statement at GetFlightInfo (#2914)."
+
+- id: query-engine-parquet-beside-signal-row-window
+  doc: docs/query-engine.md
+  quote: "A Parquet table has no event-time column, so beside a signal table (ADR-2904 decision 11) its scans get no filter and contribute every row they read, while the signal scans are filtered as above."
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_row_window_bounds_only_the_signal_scans_beside_a_parquet_table
+  status: verified
+  note: "A LEFT JOIN from hits to logs under a row window returns all six hits rows and joins only the log lines inside the window (#2914)."
+
+- id: query-engine-parquet-read-budget-statement-total
+  doc: docs/query-engine.md
+  quote: "checks each request and its bytes against that view before the request is sent"
+  kind: positive
+  binds:
+    - crates/ravel-parquet/src/limits.rs::tests::a_budget_view_is_compared_while_the_parquet_handle_is_charged
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_request_budget
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_byte_budget
+  status: verified
+  note: "The unit test pins the view compared and the Parquet handle charged; the integration tests record every request of a logs aggregate joined with a Parquet table and refuse the last lake GET, unsent, under a request budget and under a byte budget each one below the statement's total (#2914)."
+
+- id: query-engine-paging-refuses-signal-beside-other-table
+  doc: docs/query-engine.md
+  quote: "Paging (`page_plan`) refuses such a statement, and one naming a signal table beside any other table, with `PagePlanError::CrossSignal`."
+  kind: positive
+  binds:
+    - crates/ravel-sql/src/page_plan.rs::tests::a_signal_table_beside_a_parquet_table_is_not_paged
+    - crates/ravel-sql/src/page_plan.rs::tests::a_parquet_only_join_still_reports_no_table
+  status: verified
+  note: "Before #2914 a signal table beside a Parquet table paged as the signal table alone; one signal row can join many Parquet rows, so the cursor would skip or repeat rows."
 
 - id: guide-query-token-across-signals-refused
   doc: docs/guides/query.md
@@ -280,14 +352,36 @@
   status: verified
   note: "The test pins SqlError::CommitTokenOnParquetStatement before either store is read, and that the statement runs without the token (#2911)."
 
-- id: guide-query-signal-beside-parquet-refused
+- id: guide-query-signal-beside-parquet-runs
   doc: docs/guides/query.md
-  quote: "five beside a Parquet table is not supported yet:"
-  kind: negative
+  quote: "A query can join Parquet tables with each other and with any of the five, over this endpoint and Flight SQL."
+  kind: positive
   binds:
-    - crates/ravel-sql/tests/parquet_tables.rs::a_signal_table_beside_parquet_is_refused_before_listing
+    - crates/ravel-sql/tests/parquet_tables.rs::a_parquet_table_joined_with_logs_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::samples_joined_with_a_parquet_table_returns_exact_rows
+    - crates/ravel-sql/tests/parquet_tables.rs::flight_sql_joins_a_parquet_table_with_logs
   status: verified
-  note: "The test pins SqlError::SignalBesideParquet after the Parquet manifest reads and before any signal catalog listing. Ticket T7 (#2914) lifts it."
+  note: "Replaces the entry for the interim 400, which #2914 removed. The tests assert the exact joined rows over HTTP and that Flight returns the same rows."
+
+- id: guide-query-signal-beside-parquet-one-budget
+  doc: docs/guides/query.md
+  quote: "the Parquet reader's `max_s3_requests` and `max_bytes_scanned` check before each Parquet read"
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_request_budget
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statement_is_held_to_one_byte_budget
+    - crates/ravel-parquet/src/limits.rs::tests::a_budget_view_is_compared_while_the_parquet_handle_is_charged
+  status: verified
+  note: "The integration tests refuse the last Parquet GET of a logs aggregate joined with a Parquet table under a request budget and under a byte budget one below the statement total, logs reads included; the unit test pins that the view's totals are what the Parquet reader compares (#2914)."
+
+- id: guide-query-signal-beside-parquet-resolve-check
+  doc: docs/guides/query.md
+  quote: "the `max_s3_requests` check made as each of the five resolves, which counts the Parquet manifest reads"
+  kind: positive
+  binds:
+    - crates/ravel-sql/tests/parquet_tables.rs::a_lanes_resolve_budget_check_counts_the_parquet_resolve_reads
+  status: verified
+  note: "Under a budget one below the Parquet and logs resolve reads together, the logs lane's resolve check refuses with the sum before any lake or logs data GET (#2914)."
 
 - id: query-engine-stats-signals-sum-to-phases
   doc: docs/query-engine.md
@@ -296,5 +390,6 @@
   binds:
     - crates/ravel-sql/src/cross_signal_tests.rs::stats_signals_sum_to_totals_per_phase
     - crates/ravel-sql/src/statement_accounting.rs::tests::lanes_parquet_and_statement_sum_to_the_total
+    - crates/ravel-sql/tests/parquet_tables.rs::a_mixed_statements_signals_and_parquet_share_sum_to_its_phases
   status: verified
-  note: "The first test sums the samples and logs entries of a join to stats.phases per phase and per rendered field; the second pins the Parquet share as the total less the entries on the view, since a signal table beside a live Parquet table is refused (#2914)."
+  note: "The first test sums the samples and logs entries of a join to stats.phases per phase and per rendered field; the second pins the Parquet share as the total less the entries on the view; the third sums a logs entry and the Parquet table's cost alone to stats.phases per phase and operation on a statement over both (#2914)."

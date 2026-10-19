@@ -353,9 +353,14 @@ pub enum PagePlanError {
     #[error("{0}")]
     Invalid(#[from] ValidationError),
 
-    /// The statement names two or more of the five tables. One snapshot per
-    /// query admits one signal, so there is no page to plan.
-    #[error("a statement naming two signals cannot be paged")]
+    /// The statement names two or more of the five signal tables, or one
+    /// beside any other table. A page cursor pins one signal snapshot and one
+    /// commit token, and one signal row can join many rows of another table,
+    /// so there is no page to plan.
+    #[error(
+        "a statement naming two signals, or a signal table beside another \
+         table, cannot be paged"
+    )]
     CrossSignal,
 
     /// The statement carries its own `LIMIT`, `OFFSET`, `FETCH`, or `TOP`. The
@@ -928,8 +933,10 @@ fn page_target(sql: &str) -> Result<PageTarget, PagePlanError> {
     .map(|(_, target)| target)
     .collect();
     match named.as_slice() {
+        // A statement naming only Parquet tables has no signal snapshot to
+        // page over.
         [] => Ok(PageTarget::NoTable),
-        [one] => Ok(*one),
+        [one] if tables.len() == 1 => Ok(*one),
         _ => Err(PagePlanError::CrossSignal),
     }
 }
@@ -2602,6 +2609,39 @@ mod tests {
         for (sql, expected) in cases {
             let err = plan_page(sql, None).expect_err("refused");
             assert_eq!(err, expected, "unexpected refusal for {sql:?}");
+        }
+    }
+
+    /// One signal table beside a Parquet table is not paged, in either order
+    /// and however the other table is reached (ADR-2904 decision 11): the
+    /// cursor pins one signal snapshot, and one signal row can join many
+    /// Parquet rows.
+    #[test]
+    fn a_signal_table_beside_a_parquet_table_is_not_paged() {
+        for sql in [
+            "SELECT s.ts, s.series_id FROM samples s JOIN hits h ON s.ts = h.ts \
+             ORDER BY s.ts, s.series_id",
+            "SELECT h.id, l.ts FROM hits h JOIN logs l ON h.ts = l.ts ORDER BY l.ts",
+            "SELECT ts FROM logs WHERE body IN (SELECT name FROM hits) ORDER BY ts",
+        ] {
+            assert_eq!(page_target(sql), Err(PagePlanError::CrossSignal), "{sql}");
+            assert_eq!(
+                plan_page(sql, None).expect_err("refused"),
+                PagePlanError::CrossSignal,
+                "{sql}"
+            );
+        }
+    }
+
+    /// A statement naming only Parquet tables, one or a join of two, has no
+    /// signal snapshot to page and keeps reporting no table.
+    #[test]
+    fn a_parquet_only_join_still_reports_no_table() {
+        for sql in [
+            "SELECT id FROM hits ORDER BY id",
+            "SELECT h.id FROM hits h JOIN visits v ON h.id = v.id ORDER BY h.id",
+        ] {
+            assert_eq!(page_target(sql), Ok(PageTarget::NoTable), "{sql}");
         }
     }
 
