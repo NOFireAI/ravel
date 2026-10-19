@@ -619,9 +619,7 @@ impl QueryWindow {
     /// The selector cache's read counts for this query, or `None` when the
     /// query ran without one.
     #[cfg(test)]
-    pub(crate) fn selector_cache_stats(
-        &self,
-    ) -> Option<crate::selector_cache::SelectorCacheStats> {
+    pub(crate) fn selector_cache_stats(&self) -> Option<crate::selector_cache::SelectorCacheStats> {
         self.selector_cache.as_ref().map(SelectorCache::stats)
     }
 
@@ -1612,18 +1610,17 @@ impl Evaluator {
 }
 
 /// A range query's top-level construct, after stripping any enclosing
-/// `Paren`/`Unary` wrappers (the grammar allows at most one selector, so
-/// this identifies it directly rather than routing through the general
-/// per-instant `eval_expr`, which would re-query storage once per grid
-/// step).
+/// `Paren`/`Unary` wrappers, so a single selector or call is evaluated over
+/// the whole grid directly rather than through the general per-instant
+/// `eval_expr`.
 enum RangeCore<'a> {
     Scalar(f64),
     Str(&'a str),
     Selector(&'a promql_parser::parser::VectorSelector),
     Call(&'a promql_parser::parser::Call),
-    /// A binary expression: re-evaluated per grid step through the general
-    /// `eval_expr` (not a single selector, so unlike the other arms it
-    /// cannot be range-fetched in one storage call). Holds the outermost
+    /// A binary or aggregate expression: re-evaluated per grid step through
+    /// the general `eval_expr`, whose selector helpers answer each step from
+    /// the query's selector cache rather than reading storage again. Holds the outermost
     /// `expr` passed to `resolve_range_core`, not the `Paren`/`Unary`-
     /// peeled `cur`, so any enclosing negation or parens are re-applied by
     /// `eval_expr` itself at each step rather than needing a second
@@ -4026,6 +4023,48 @@ mod tests {
                 assert_eq!(values, want, "{query}");
             }
         }
+    }
+
+    #[test]
+    fn generic_range_over_a_stale_marker_is_absent_until_the_next_sample() {
+        // The difftest corpus's `diff_stale` shape: 5 at +0s, a stale marker
+        // at +30s, 6 at +60s. `sum` has nothing to aggregate at the +30s and
+        // +45s steps, whose latest sample is the marker.
+        let s = 1_000_000_000_i64;
+        let source = TestSource::new()
+            .with_series(
+                &[("__name__", "diff_stale")],
+                &[
+                    (0, 5.0),
+                    (30 * s, f64::from_bits(STALE_NAN_BITS)),
+                    (60 * s, 6.0),
+                ],
+            )
+            .expect("valid series");
+        let (result, _) = range_with_cache_stats(
+            Evaluator::new(),
+            &source,
+            "sum(diff_stale)",
+            (0, 120_000, 15_000),
+        );
+        let (value, _) = result.expect("query evaluates");
+        let RangeValue::Matrix(matrix) = value else {
+            panic!("expected a matrix");
+        };
+        assert_eq!(matrix.len(), 1);
+        let got: Vec<(i64, f64)> = matrix[0].1.iter().map(|e| (e.ts_ns / s, e.value)).collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, 5.0),
+                (15, 5.0),
+                (60, 6.0),
+                (75, 6.0),
+                (90, 6.0),
+                (105, 6.0),
+                (120, 6.0)
+            ]
+        );
     }
 
     /// Every element of a range result rendered bit-exactly: float values and
