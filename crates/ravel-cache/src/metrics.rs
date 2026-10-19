@@ -55,9 +55,13 @@ impl CacheMetrics {
         self.intent_bytes_served[index].fetch_add(bytes, Ordering::Relaxed);
     }
 
-    /// Publishes the bulk region's current bookkeeping bytes, a gauge.
+    /// Publishes the bulk region's current bookkeeping bytes, a gauge. Stores
+    /// only when the value changed, so a lookup on a cache with no bulk
+    /// region writes nothing.
     pub(crate) fn set_bulk_bookkeeping_bytes(&self, bytes: u64) {
-        self.bulk_bookkeeping_bytes.store(bytes, Ordering::Relaxed);
+        if self.bulk_bookkeeping_bytes.load(Ordering::Relaxed) != bytes {
+            self.bulk_bookkeeping_bytes.store(bytes, Ordering::Relaxed);
+        }
     }
 
     /// Hits and bytes served split by [`AccessIntent`], and the bulk region's

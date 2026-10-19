@@ -204,15 +204,24 @@ the read's bytes are admitted and never what the read returns:
 
 - `interactive`: the S3-FIFO policy above.
 - `bulk_scan`, for a statement that reads every object of a tenant: a hit
-  does not count toward promotion, and the bytes never enter the main queue.
-  They go to a bulk region, which holds up to half of the cap against
-  interactive admissions and more while the probation and main queues leave
-  bytes unused. When a repeated scan is larger than the region, the region
-  keeps one subset of its objects, chosen by a hash of each cache key, and
-  later passes are served that same subset from memory. A bulk admission
-  never evicts the main queue, and an interactive admission reclaims bulk
-  bytes above half the cap before it evicts anything else. The region's
-  bookkeeping is counted inside the cap and held to 1% of it.
+  does not count toward promotion, and a bulk read never moves bytes into
+  the main queue. The bytes go to a bulk region, which holds up to half of
+  the cap against interactive admissions and more while the probation and
+  main queues leave bytes unused. An `interactive` read of a region entry
+  moves it to probation, from where it can reach the main queue like any
+  entry read twice. When a repeated scan is larger than the region, the
+  region keeps one subset of its objects, chosen by a hash of each cache
+  key, and later passes are served that same subset from memory. That holds
+  while each object is re-read within the region entry's life. An entry no
+  read touches is evicted after one to two windows of its tenant's bulk
+  reads, a window being twice the tenant's pass bytes, held between 2 and
+  16 times the cap. For a loop over 8 times the cap an entry therefore
+  lives for 16 to 32 times the cap of reads, and a loop larger than about
+  32 times the cap is served nothing. A bulk read the region declines is
+  not copied. A bulk admission never evicts the main queue, and an
+  interactive admission reclaims bulk bytes above half the cap before it
+  evicts anything else. The region's bookkeeping is counted inside the cap
+  and held to 1% of it.
 - `maintenance`: admitted to probation, and never moved to the main queue by
   its own reads. Nothing sets it yet.
 
