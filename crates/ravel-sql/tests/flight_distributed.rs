@@ -2439,6 +2439,7 @@ async fn distributed_logs_order_by_ts_limit_skips_nothing() {
         ))),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(TENANT),
     )
     .expect("local session builds");
     let local_plan = local_ctx

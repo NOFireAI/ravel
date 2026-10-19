@@ -251,6 +251,7 @@ fn run_once(
             logs,
             true,
             SpillDecision::Disabled,
+            &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
         )
         .expect("session builds")
     };
@@ -447,6 +448,7 @@ fn skip_probe_session(
         logs,
         true,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session builds");
 

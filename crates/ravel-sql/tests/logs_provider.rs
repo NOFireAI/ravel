@@ -600,6 +600,7 @@ fn logs_session(
         ravel_sql::SessionTable::Logs(Arc::new(provider)),
         false,
         ravel_sql::SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
 }
 

@@ -3432,6 +3432,17 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                 // `--sql-scan-decode-inline` keeps it off those two scans.
                 cpu_gates.read.clone(),
                 scan_decode_inline,
+                // ADR-2993 decision 6: the IPCrypt SQL functions derive their
+                // keys from the deployment key, and are withheld while a
+                // plaintext query audit would record the address argument.
+                ravel_sql::IpcryptDeployment::new(
+                    config.deployment_key.as_ref().map(|key| Arc::new(**key)),
+                    config.audit_pipeline.is_some()
+                        && matches!(
+                            config.audit_text,
+                            ravel_maintain::AuditTextPolicy::Plaintext
+                        ),
+                ),
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).

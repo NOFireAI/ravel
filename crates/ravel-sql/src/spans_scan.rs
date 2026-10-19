@@ -1699,6 +1699,7 @@ mod tests {
             SessionTable::Spans(Arc::new(provider)),
             false,
             crate::session::SpillDecision::Disabled,
+            &crate::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
         )
         .expect("spans session builds");
 
