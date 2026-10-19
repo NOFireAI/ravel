@@ -1033,6 +1033,64 @@ selects them. Inside an object, pruning works as follows:
 - `has_word` prunes through the token bloom filter.
 - Ravel applies any other attribute predicate to the decoded records.
 
+### Matching pseudonymized addresses
+
+An attribute under an `--ipcrypt-config` rule stores the IPCrypt ciphertext of
+the address, not the address
+([Pseudonymization (IPCrypt)](../ingest.md#pseudonymization-ipcrypt)). Two SQL
+functions turn an address into the value a rule stores for it under your
+tenant, so a query can still find the rows for a known address:
+
+- `ipcrypt_encrypt(ip, epoch)` matches a `variant = "deterministic"` rule.
+- `ipcrypt_prefix_encrypt(ip, epoch)` matches a `variant = "prefix"` rule.
+
+Neither takes a key. Each derives the key from the deployment key and the
+tenant of the query, so the same address gives each tenant a different value.
+
+The server registers both functions for a query only when all four hold:
+
+- the query is a `POST /api/v1/sql` request. No other query surface registers
+  them for any caller: Flight SQL, explain (including the MCP `sql_explain`
+  tool and `ravel-cli sql-explain`), ES|QL, alert rules and the MCP tools
+  carry no capability;
+- the caller holds the `ipcrypt` capability: a token whose tenant is written
+  `TENANT;ipcrypt` or `TENANT;ddl,ipcrypt`, or an OIDC token whose
+  `--oidc-ipcrypt-claim` claim is `true`
+  ([capabilities](operations/configuration.md#the-ddl-and-ipcrypt-capabilities));
+- the server has a deployment key (`--tenant-hash-key-file`);
+- the query audit does not record query text in plaintext: `--audit-mode off`
+  (the default), or `--audit-text redacted`. Under `--audit-text plaintext`
+  the address in the call would be written to the audit table as typed.
+
+Otherwise a call is refused exactly as a call to a function that does not
+exist: on `POST /api/v1/sql`, HTTP 422 with the same planning error, and on
+every other surface, the unknown-function error that surface returns.
+
+Take the variant and the epoch from the rule in the policy file. A query
+server does not read that file, so the epoch has no default: pass the rule's
+`epoch`, which is 1 when the rule does not set one. A wrong variant or a wrong
+epoch matches nothing, with no error. After a rotation, rows written before
+it carry the old epoch's value, so OR one comparison per epoch, the current
+one and each one in `retired_epochs`:
+
+```sh
+curl -X POST http://127.0.0.1:4318/api/v1/sql \
+  -H "Authorization: Bearer devtoken" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "SELECT ts, body FROM logs WHERE attrs['\''client.ip'\''] = ipcrypt_encrypt('\''203.0.113.7'\'', 2) OR attrs['\''client.ip'\''] = ipcrypt_encrypt('\''203.0.113.7'\'', 1) ORDER BY ts"}'
+```
+
+- `ip:port` and `[ipv6]:port` are accepted, and the port is kept, so the
+  result matches what ingest stored for the same form. Under
+  `deterministic` an IPv4 address comes back as IPv6 text, so
+  `192.0.2.1:8080` comes back as `[<ipv6>]:8080`.
+- A string that is not an address, and a NULL argument, give NULL, which
+  matches nothing.
+- An epoch of 0 or less, or above 4294967295, is an error.
+- Range predicates and CIDR containment over raw addresses do not work on an
+  encrypted key. Under `prefix`, IPv6 addresses in one /64 need not share a
+  text prefix.
+
 ### At-least-once rows
 
 Log rows are at-least-once, and a `SELECT` (or `COUNT(*)`) reflects that. A

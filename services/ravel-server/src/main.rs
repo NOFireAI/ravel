@@ -361,7 +361,10 @@ async fn main() -> anyhow::Result<()> {
         tenant_principals,
         cli.dev_insecure_tenant_header,
         auth,
-        cli.oidc_ddl_claim.clone(),
+        ravel_server::tenant::OidcCapabilityClaims {
+            ddl: cli.oidc_ddl_claim.clone(),
+            ipcrypt: cli.oidc_ipcrypt_claim.clone(),
+        },
     )?;
     // Retention windows are validated at startup against the ADR-0019 floor
     // (with the ingest lag resolved below, see resolve_ingest_lag); a window

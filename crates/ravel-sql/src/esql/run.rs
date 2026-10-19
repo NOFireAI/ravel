@@ -151,6 +151,8 @@ async fn run_row_inner(
         }),
         false,
         SpillDecision::Disabled,
+        // ES|QL has its own function set; the SQL ipcrypt UDFs never apply.
+        &crate::SessionPrincipal::without_capabilities(tenant),
     )
     .map_err(|e| SqlError::Plan(e.to_string()))?;
     let tables = StatementTables::one(None);

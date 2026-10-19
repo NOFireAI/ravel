@@ -1232,27 +1232,36 @@ then widen to every tenant that storage discovers, and startup does not
 refuse. A Secret mount that failed to populate produces this state, with no
 error at startup.
 
-### The ddl capability
+### The ddl and ipcrypt capabilities
 
-A `TENANT` that ends in `;ddl` grants that token the `ddl` capability. The
-tenant is the text before the LAST `;`. The capability is absent by default.
-Only `CREATE EXTERNAL TABLE` and `DROP TABLE` over `POST /api/v1/sql` read
-it.
+A `TENANT` may end in `;` and a comma-separated capability list. The tenant
+is the text before the LAST `;`. Each capability is absent by default.
 
-- Any other suffix, or an empty tenant before the `;`, refuses startup. The
-  error names the flag position or the line number in the token file, never
-  the text of the pair.
-- A tenant with no `;` is unchanged and never carries the capability.
-- [Background](#background) links the decision behind this.
+- `ddl`: `CREATE EXTERNAL TABLE` and `DROP TABLE` over `POST /api/v1/sql`.
+- `ipcrypt`: the `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt` SQL functions
+  over `POST /api/v1/sql`. The [query guide](../query.md#matching-pseudonymized-addresses) says when the
+  server registers them.
+
+`acme;ddl`, `acme;ipcrypt`, `acme;ddl,ipcrypt` and `acme;ipcrypt,ddl` all name
+tenant `acme`, each granting the capabilities it lists.
+
+- A name other than `ddl` or `ipcrypt`, a name listed twice, an empty list
+  or list entry, or an empty tenant before the `;` refuses startup. The error
+  names the flag position or the line number in the token file, never the
+  text of the pair.
+- A tenant with no `;` is unchanged and carries no capability.
+- [Background](#background) links the decisions behind this.
 
 `ravel-ingest-router` accepts the same `--tenant-token` spelling and strips
-the `;ddl` suffix, so it routes `acme;ddl` by the tenant `acme`. It never
-grants the capability.
+the capability list, so it routes `acme;ddl,ipcrypt` by the tenant `acme`. It
+never grants a capability.
 
-Tokens in the durable `sys/auth` map cannot carry `ddl`. The map is read
-without suffix parsing, so an entry written as `acme;ddl` names a tenant
-literally called `acme;ddl`, with no capability and no error. Grant `ddl`
-only through `--tenant-token`, `--tenant-token-file` or `--oidc-ddl-claim`.
+Tokens in the durable `sys/auth` map cannot carry a capability. The map is
+read without suffix parsing, so an entry written as `acme;ddl` names a tenant
+literally called `acme;ddl`, with no capability and no error. Grant `ddl` only
+through `--tenant-token`, `--tenant-token-file` or `--oidc-ddl-claim`, and
+`ipcrypt` only through `--tenant-token`, `--tenant-token-file` or
+`--oidc-ipcrypt-claim`. Flight SQL grants neither.
 
 ### Production authentication
 
@@ -1280,6 +1289,9 @@ the bearer resolver, which stays the local and development path.
   present only when the verified token carries that claim as the JSON boolean
   `true`. A string, a number, an array, or a missing claim never grants it.
   Unset (the default), OIDC never grants the capability.
+- `--oidc-ipcrypt-claim <CLAIM>` grants the `ipcrypt` capability the same
+  way: only a verified token carrying that claim as the JSON boolean `true`
+  holds it. Unset (the default), OIDC never grants it.
 - The key set is cached in memory and refreshed on
   `--oidc-jwks-refresh-interval-secs`, so the request path never makes a
   network call. A timeout bounds the fetch, so a stalled host cannot block
@@ -1329,8 +1341,8 @@ because a trusted hop set it, and anyone can forge it if that hop is absent.
 
 Dependent flags fail fast. Each of these combinations refuses to start:
 
-- `--oidc-tenant-claim`, `--oidc-ddl-claim`, or `--oidc-audience` without
-  OIDC enabled
+- `--oidc-tenant-claim`, `--oidc-ddl-claim`, `--oidc-ipcrypt-claim`, or
+  `--oidc-audience` without OIDC enabled
 - `--mtls-header` or `--mtls-listener` without `--mtls-enabled`
 - `--mtls-enabled` without `--mtls-listener`
 - `--mtls-trust-forwarded-header` without `--mtls-listener`
@@ -2147,4 +2159,5 @@ Decision records behind the choices on this page:
 [typed attribute columns](../../adrs/0090-typed-attribute-columns-logs-sql.md),
 [wide-schema load](../../adrs/0100-wide-schema-load-and-sql-latency.md),
 [operator-configurable query budgets](../../adrs/0088-operator-configurable-query-budgets.md),
-and [who may run DDL](../../adrs/2040-parquet-tables-queried-in-place.md).
+[who may run DDL](../../adrs/2040-parquet-tables-queried-in-place.md),
+and [who may call the IPCrypt SQL functions](../../adrs/2993-ipcrypt-attribute-pseudonymization.md).

@@ -405,6 +405,7 @@ mod tests {
             table,
             false,
             SpillDecision::Disabled,
+            &crate::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
         )
         .expect("session builds")
     }

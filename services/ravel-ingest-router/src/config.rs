@@ -111,9 +111,10 @@ pub struct Cli {
 
     // --- Canonical-tenant resolver chain (only used under that key source) ----
     /// Repeatable `token=tenant` pair for the static bearer resolver. The
-    /// tenant may carry a trailing `;ddl` (ADR-2040 decision 4), accepted for
+    /// tenant may carry a trailing capability list (`;ddl`, `;ipcrypt` or
+    /// `;ddl,ipcrypt`; ADR-2040 decision 4, ADR-2993 decision 6), accepted for
     /// parity with `ravel-server`'s `--tenant-token`, but stripped here: this
-    /// router routes by the bare tenant and never grants the DDL capability.
+    /// router routes by the bare tenant and never grants a capability.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
@@ -484,15 +485,16 @@ impl Cli {
                 if token.is_empty() || tenant_raw.is_empty() {
                     anyhow::bail!("--tenant-token TOKEN and TENANT must both be non-empty");
                 }
-                // The server's `;ddl` capability suffix (ADR-2040 decision 4) is
-                // stripped here rather than kept: this router never runs DDL, so
-                // it never needs the capability, only the bare tenant it must
-                // route by.
-                let (tenant, _ddl) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
-                    .map_err(|_| {
+                // The server's capability suffix (ADR-2040 decision 4, ADR-2993
+                // decision 6) is stripped here rather than kept: this router
+                // runs no SQL, so it never needs a capability, only the bare
+                // tenant it must route by.
+                let (tenant, _capabilities) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
+                    .map_err(|e| {
                         anyhow::anyhow!(
-                            "--tenant-token (position {}) has an invalid tenant, expected \
-                             TENANT or TENANT;ddl",
+                            "--tenant-token (position {}) has an invalid tenant ({e}), expected \
+                             TENANT or TENANT;CAPABILITIES with CAPABILITIES a comma-separated \
+                             list of ddl and ipcrypt",
                             i + 1
                         )
                     })?;
@@ -804,6 +806,69 @@ mod tests {
                 );
             }
             other => panic!("expected canonical key config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_capability_suffix_routes_by_the_bare_tenant() {
+        for raw in [
+            "tok=acme;ipcrypt",
+            "tok=acme;ddl,ipcrypt",
+            "tok=acme;ipcrypt,ddl",
+        ] {
+            let config = cli(&["--key-source", "canonical-tenant", "--tenant-token", raw])
+                .into_config()
+                .unwrap_or_else(|e| panic!("{raw} parses: {e}"));
+            match config.key {
+                KeyConfig::CanonicalTenant(settings) => {
+                    assert_eq!(
+                        settings.tokens,
+                        vec![("tok".to_string(), "acme".to_string())],
+                        "{raw}"
+                    );
+                }
+                other => panic!("expected canonical key config, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_duplicate_empty_or_unknown_capability_is_refused() {
+        for raw in [
+            "tok=acme;ddl,ddl",
+            "tok=acme;ipcrypt,ipcrypt",
+            "tok=acme;",
+            "tok=acme;ddl,",
+            "tok=acme;ddl,admin",
+            "tok=;ipcrypt",
+        ] {
+            let err = cli(&["--key-source", "canonical-tenant", "--tenant-token", raw])
+                .into_config()
+                .expect_err(raw);
+            assert!(
+                err.to_string().contains("--tenant-token (position 1)"),
+                "{raw}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_capability_inside_the_tenant_is_refused() {
+        for raw in ["tok=acme;ddl;ipcrypt", "tok=acme;ipcrypt;ddl"] {
+            let err = cli(&["--key-source", "canonical-tenant", "--tenant-token", raw])
+                .into_config()
+                .expect_err(raw);
+            let message = err.to_string();
+            assert!(
+                message.contains("--tenant-token (position 1)"),
+                "{raw}: {err}"
+            );
+            assert!(
+                message.contains(
+                    &ravel_tenant_resolve::TenantSuffixError::CapabilityInTenant.to_string()
+                ),
+                "{raw}: {err}"
+            );
         }
     }
 

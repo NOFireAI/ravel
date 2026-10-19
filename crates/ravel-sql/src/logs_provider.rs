@@ -606,6 +606,7 @@ mod tests {
             SessionTable::Logs(Arc::new(provider)),
             false,
             crate::session::SpillDecision::Disabled,
+            &crate::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
         )
     }
 

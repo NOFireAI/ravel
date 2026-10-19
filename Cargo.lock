@@ -5293,6 +5293,7 @@ dependencies = [
  "ravel-commit",
  "ravel-cpu-gate",
  "ravel-esql",
+ "ravel-ipcrypt",
  "ravel-logseg",
  "ravel-maintain",
  "ravel-memory",

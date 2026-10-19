@@ -591,6 +591,20 @@ impl QueryService {
         tenant_hash: TenantHash,
         request: &ravel_sql::SqlRequest,
     ) -> Result<SqlExecution, ServiceError> {
+        self.sql_execute_timed_with(tenant_hash, ravel_sql::SqlCapabilities::default(), request)
+            .await
+    }
+
+    /// [`Self::sql_execute_timed`] for a principal holding `capabilities`,
+    /// which decide the functions its session registers (ADR-2993 decision 6:
+    /// `ipcrypt` registers the IPCrypt functions).
+    #[cfg(feature = "sql")]
+    pub async fn sql_execute_timed_with(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: ravel_sql::SqlCapabilities,
+        request: &ravel_sql::SqlRequest,
+    ) -> Result<SqlExecution, ServiceError> {
         let state = self
             .sql
             .as_ref()
@@ -606,7 +620,7 @@ impl QueryService {
         let span = query_span("sql_query", tenant_hash);
         let result = state
             .executor
-            .execute_accounted(tenant_hash, request, &live)
+            .execute_accounted_with(tenant_hash, capabilities, request, &live)
             .instrument(span.clone())
             .await
             .map_err(|err| ServiceError::from_sql(err, tenant_hash));

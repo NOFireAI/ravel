@@ -216,6 +216,7 @@ fn logs_session(provider: LogsTableProvider) -> SessionContext {
         SessionTable::Logs(Arc::new(provider)),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("build session")
 }

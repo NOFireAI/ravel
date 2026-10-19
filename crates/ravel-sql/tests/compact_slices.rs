@@ -201,6 +201,7 @@ async fn run_with_pool(
         SessionTable::Metrics(provider),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session");
     let ctx = if rule_on { ctx } else { without_rule(&ctx) };

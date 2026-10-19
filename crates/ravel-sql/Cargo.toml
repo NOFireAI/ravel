@@ -67,6 +67,10 @@ ravel-parquet = { workspace = true }
 # syntax tree, and the `esql` module binds and lowers that tree onto a session
 # the executor builds. A workspace crate whose only dependency is thiserror.
 ravel-esql = { workspace = true }
+# The `ipcrypt_encrypt`/`ipcrypt_prefix_encrypt` UDFs (ADR-2993 decision 6)
+# derive their per-epoch keys with `ravel_ipcrypt::rules::EpochKey`. Default
+# features only: the marker feature's object-store client is not needed here.
+ravel-ipcrypt = { workspace = true }
 
 # DataFusion pulls its own matching arrow (accessed via `datafusion::arrow`),
 # so this crate never depends on the workspace `arrow` pin directly. See the

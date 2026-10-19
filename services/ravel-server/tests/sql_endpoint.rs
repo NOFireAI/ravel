@@ -622,7 +622,16 @@ fn build_router_full(
 ) -> Router {
     let principals = tokens
         .into_iter()
-        .map(|(token, tenant)| (token, Principal { tenant, ddl: false }))
+        .map(|(token, tenant)| {
+            (
+                token,
+                Principal {
+                    tenant,
+                    ddl: false,
+                    ipcrypt: false,
+                },
+            )
+        })
         .collect();
     build_router_principals(store, principals, audit_sink, parquet)
 }
@@ -1159,6 +1168,7 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
                 Principal {
                     tenant: tenant.clone(),
                     ddl: false,
+                    ipcrypt: false,
                 },
             ),
             (
@@ -1166,6 +1176,7 @@ async fn create_external_table_needs_the_ddl_capability_and_a_grant_over_its_loc
                 Principal {
                     tenant: tenant.clone(),
                     ddl: true,
+                    ipcrypt: false,
                 },
             ),
         ]),
@@ -1422,7 +1433,14 @@ async fn a_ddl_statement_records_attempted_before_it_runs_and_its_outcome_after(
     let sink = Arc::new(OrderingAuditSink::new(store.clone()));
     let app = build_router_principals(
         ravel_store,
-        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant,
+                ddl: true,
+                ipcrypt: false,
+            },
+        )]),
         sink.clone(),
         Some(sources),
     );
@@ -1627,9 +1645,17 @@ async fn ddl_statements_move_the_ddl_families_by_their_exact_cost_and_no_query_f
                 Principal {
                     tenant: tenant.clone(),
                     ddl: true,
+                    ipcrypt: false,
                 },
             ),
-            ("read-token".to_string(), Principal { tenant, ddl: false }),
+            (
+                "read-token".to_string(),
+                Principal {
+                    tenant,
+                    ddl: false,
+                    ipcrypt: false,
+                },
+            ),
         ]),
         Arc::new(ravel_maintain::NoopQueryAuditSink),
         Some(sources),
@@ -1789,7 +1815,14 @@ async fn a_failed_attempted_record_refuses_before_any_store_call() {
     let sink = Arc::new(FailingAuditSink::new(1));
     let app = build_router_principals(
         ravel_store,
-        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant,
+                ddl: true,
+                ipcrypt: false,
+            },
+        )]),
         sink.clone(),
         Some(sources),
     );
@@ -1888,6 +1921,7 @@ async fn a_failed_attempted_record_counts_one_ddl_error_and_no_query() {
             Principal {
                 tenant: tenant.clone(),
                 ddl: true,
+                ipcrypt: false,
             },
         )]),
         sink.clone(),
@@ -1896,7 +1930,14 @@ async fn a_failed_attempted_record_counts_one_ddl_error_and_no_query() {
     );
     let read_app = build_router_accounted(
         store,
-        HashMap::from([("read-token".to_string(), Principal { tenant, ddl: false })]),
+        HashMap::from([(
+            "read-token".to_string(),
+            Principal {
+                tenant,
+                ddl: false,
+                ipcrypt: false,
+            },
+        )]),
         Arc::new(ravel_maintain::NoopQueryAuditSink),
         None,
         Arc::clone(&query_accounting),
@@ -1929,6 +1970,7 @@ async fn an_admission_refusal_counts_one_ddl_error_and_no_query() {
             Principal {
                 tenant: tenant.clone(),
                 ddl: true,
+                ipcrypt: false,
             },
         )]),
         sink.clone(),
@@ -1938,7 +1980,14 @@ async fn an_admission_refusal_counts_one_ddl_error_and_no_query() {
     );
     let read_app = build_router_accounted(
         store,
-        HashMap::from([("read-token".to_string(), Principal { tenant, ddl: false })]),
+        HashMap::from([(
+            "read-token".to_string(),
+            Principal {
+                tenant,
+                ddl: false,
+                ipcrypt: false,
+            },
+        )]),
         Arc::new(ravel_maintain::NoopQueryAuditSink),
         None,
         Arc::clone(&query_accounting),
@@ -1988,6 +2037,7 @@ async fn a_failed_outcome_record_does_not_fail_an_applied_statement() {
             Principal {
                 tenant: tenant.clone(),
                 ddl: true,
+                ipcrypt: false,
             },
         )]),
         sink.clone(),
@@ -2055,7 +2105,14 @@ async fn a_client_disconnect_does_not_cancel_a_ddl_in_flight() {
     let sink = Arc::new(RecordingAuditSink::default());
     let app = build_router_principals(
         store.clone(),
-        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant,
+                ddl: true,
+                ipcrypt: false,
+            },
+        )]),
         sink.clone(),
         Some(sources),
     );
@@ -2164,7 +2221,14 @@ async fn ddl_conflict_not_found_and_noop_have_their_own_statuses() {
     );
     let app = build_router_principals(
         store,
-        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant,
+                ddl: true,
+                ipcrypt: false,
+            },
+        )]),
         Arc::new(ravel_maintain::NoopQueryAuditSink),
         Some(sources),
     );
@@ -2211,6 +2275,7 @@ async fn a_ddl_outcome_is_json_even_when_arrow_is_accepted() {
             Principal {
                 tenant: TenantId::new("acme".to_string()),
                 ddl: true,
+                ipcrypt: false,
             },
         )]),
         Arc::new(ravel_maintain::NoopQueryAuditSink),
@@ -2260,9 +2325,17 @@ async fn a_select_is_the_same_with_and_without_the_ddl_capability() {
                 Principal {
                     tenant: tenant.clone(),
                     ddl: false,
+                    ipcrypt: false,
                 },
             ),
-            ("ddl-token".to_string(), Principal { tenant, ddl: true }),
+            (
+                "ddl-token".to_string(),
+                Principal {
+                    tenant,
+                    ddl: true,
+                    ipcrypt: false,
+                },
+            ),
         ]),
         Arc::new(ravel_maintain::NoopQueryAuditSink),
         None,
@@ -2724,6 +2797,7 @@ async fn a_malformed_timeout_on_ddl_is_refused_before_any_audit_record() {
                 Principal {
                     tenant: TenantId::new("acme".to_string()),
                     ddl: false,
+                    ipcrypt: false,
                 },
             ),
             (
@@ -2731,6 +2805,7 @@ async fn a_malformed_timeout_on_ddl_is_refused_before_any_audit_record() {
                 Principal {
                     tenant: TenantId::new("acme".to_string()),
                     ddl: true,
+                    ipcrypt: false,
                 },
             ),
         ]),
@@ -2761,7 +2836,14 @@ async fn a_ddl_token_still_gets_400_for_an_unsupported_ddl_form() {
     let sink = Arc::new(RecordingAuditSink::default());
     let app = build_router_principals(
         store,
-        HashMap::from([("ddl-token".to_string(), Principal { tenant, ddl: true })]),
+        HashMap::from([(
+            "ddl-token".to_string(),
+            Principal {
+                tenant,
+                ddl: true,
+                ipcrypt: false,
+            },
+        )]),
         sink.clone(),
         None,
     );

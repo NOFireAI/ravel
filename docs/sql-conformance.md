@@ -77,10 +77,10 @@ and stays conformant.
 
 ## Score
 
-- Supported and covered: 59
+- Supported and covered: 61
 - Intentionally rejected: 70
 - Unclassified / broken: 0
-- **Conformance: 129 / 129 = 100.0%**
+- **Conformance: 131 / 131 = 100.0%**
 
 ## Conformance table
 
@@ -172,6 +172,8 @@ and stays conformant.
 | Scalar function | `file_row_index` | `SELECT file_row_index() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
 | Scalar function | `has_word` | `SELECT count(*) FROM logs WHERE has_word(body, '1')` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
 | Scalar function | `input_file_name` | `SELECT input_file_name() FROM samples` | Intentionally rejected | `ValidationError::ExcludedScalar` | nondeterministic or environment-reading; unattestable by the differential oracle (ADR-0097 decision 4) |
+| Scalar function | `ipcrypt_encrypt` | `SELECT ipcrypt_encrypt('192.0.2.7', 1) FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-session scalar UDF, registered only for a principal holding the ipcrypt capability on a deployment with a key and no plaintext query audit (ADR-2993 decision 6); individually attested (ADR-0097 decision 8) |
+| Scalar function | `ipcrypt_prefix_encrypt` | `SELECT ipcrypt_prefix_encrypt('192.0.2.7', 1) FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-session scalar UDF, registered only for a principal holding the ipcrypt capability on a deployment with a key and no plaintext query audit (ADR-2993 decision 6); individually attested (ADR-0097 decision 8) |
 | Scalar function | `label` | `SELECT label(labels, '__name__') FROM samples WHERE value = 3.0` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
 | Scalar function | `label_match` | `SELECT count(*) FROM samples WHERE label_match(labels, '__name__', 'b')` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | Ravel per-table scalar UDF, individually attested (ADR-0097 decision 8) |
 | Scalar function | `length` | `SELECT length('résumé') FROM samples LIMIT 1` | Supported and covered | `tests/conformance.rs::supported_constructs_execute` | character count, not byte count: 'résumé' is 6 characters but 7 bytes (the 'é's are two-byte UTF-8) |

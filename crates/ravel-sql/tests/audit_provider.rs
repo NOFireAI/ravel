@@ -470,6 +470,7 @@ async fn limit_caps_rows_of_a_plain_projection() {
         ravel_sql::SessionTable::Audit(table),
         false,
         ravel_sql::SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session builds");
     for (sql, want) in [

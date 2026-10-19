@@ -152,6 +152,10 @@ same `--features` list to cargo.
 - OTAP ingest is registered only when the process starts with `--otap`
   ([docs/otap-ingest.md](docs/otap-ingest.md)).
 - SQL is the only way to query traces, alerts, and audit records.
+- `ipcrypt_encrypt(ip, epoch)` and `ipcrypt_prefix_encrypt(ip, epoch)` turn
+  an address into the value an IPCrypt ingest rule stores for it under the
+  caller's tenant, for a token holding the `ipcrypt` capability
+  ([matching pseudonymized addresses](docs/guides/query.md#matching-pseudonymized-addresses)).
 - `POST /api/v1/esql` runs one ES|QL statement over logs. The route is
   compiled in only with `--features esql`, which turns on `sql` too; the
   published image does not carry it. A statement outside the supported subset

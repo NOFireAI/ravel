@@ -424,6 +424,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         SessionTable::Metrics(Arc::new(provider)),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("metrics session builds");
 

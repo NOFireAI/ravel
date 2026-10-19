@@ -778,7 +778,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 4)]
     pub shards: u32,
 
-    /// Repeatable `token=tenant` pair for the static bearer map.
+    /// Repeatable `token=tenant` pair for the static bearer map. The tenant
+    /// may end in `;` and a comma-separated capability list drawn from `ddl`
+    /// (tenant-scoped DDL) and `ipcrypt` (the IPCrypt SQL functions), each at
+    /// most once: `acme;ddl`, `acme;ipcrypt` and `acme;ddl,ipcrypt` all name
+    /// tenant `acme`. Any other suffix fails startup.
     #[arg(long = "tenant-token", value_name = "TOKEN=TENANT")]
     pub tenant_tokens: Vec<String>,
 
@@ -1429,6 +1433,16 @@ pub struct Cli {
     /// OIDC enabled fails startup rather than silently doing nothing.
     #[arg(long, value_name = "CLAIM")]
     pub oidc_ddl_claim: Option<String>,
+
+    /// Boolean claim that grants the `ipcrypt` capability (ADR-2993 decision
+    /// 6): a verified token carrying this claim as the JSON boolean `true`
+    /// may call the `ipcrypt_encrypt` and `ipcrypt_prefix_encrypt` SQL
+    /// functions. A string, a number, an array, or a missing claim never
+    /// grants it. Unset (the default), the capability is never granted via
+    /// OIDC. Setting it without OIDC enabled fails startup rather than
+    /// silently doing nothing.
+    #[arg(long, value_name = "CLAIM")]
+    pub oidc_ipcrypt_claim: Option<String>,
 
     /// How often the JWKS document is refetched, in seconds (ADR-0042
     /// decision 6). Only used when OIDC is enabled. Zero is refused at
@@ -5841,14 +5855,17 @@ impl Cli {
             if token.is_empty() || tenant_raw.is_empty() {
                 anyhow::bail!("invalid {ctx}, expected TOKEN=TENANT");
             }
-            let (tenant, ddl) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw).map_err(
-                |_: ravel_tenant_resolve::TenantSuffixError| {
-                    anyhow::anyhow!("invalid {ctx}, expected TENANT or TENANT;ddl")
-                },
-            )?;
+            let (tenant, capabilities) = ravel_tenant_resolve::split_tenant_suffix(tenant_raw)
+                .map_err(|e: ravel_tenant_resolve::TenantSuffixError| {
+                    anyhow::anyhow!(
+                        "invalid {ctx} ({e}), expected TENANT or TENANT;CAPABILITIES with \
+                         CAPABILITIES a comma-separated list of ddl and ipcrypt"
+                    )
+                })?;
             let principal = Principal {
                 tenant: TenantId::new(tenant),
-                ddl,
+                ddl: capabilities.ddl,
+                ipcrypt: capabilities.ipcrypt,
             };
             // A token repeated with a different tenant or capability would
             // otherwise resolve by flag or line order. An identical repeat
@@ -5857,7 +5874,7 @@ impl Cli {
                 if *existing != principal {
                     let first = origins.get(token).map(String::as_str).unwrap_or("?");
                     anyhow::bail!(
-                        "conflicting tenant token: the token at {ctx} is also defined at {first} with a different tenant or ddl capability"
+                        "conflicting tenant token: the token at {ctx} is also defined at {first} with a different tenant or capability"
                     );
                 }
                 return Ok(());
@@ -6136,6 +6153,9 @@ impl Cli {
         if self.oidc_ddl_claim.as_deref() == Some("") {
             anyhow::bail!("--oidc-ddl-claim must be non-empty");
         }
+        if self.oidc_ipcrypt_claim.as_deref() == Some("") {
+            anyhow::bail!("--oidc-ipcrypt-claim must be non-empty");
+        }
 
         if oidc.is_none() {
             if self.oidc_tenant_claim.is_some() {
@@ -6147,6 +6167,12 @@ impl Cli {
             if self.oidc_ddl_claim.is_some() {
                 anyhow::bail!(
                     "--oidc-ddl-claim was set but OIDC is not enabled (set --oidc-issuer and \
+                     --oidc-jwks-url)"
+                );
+            }
+            if self.oidc_ipcrypt_claim.is_some() {
+                anyhow::bail!(
+                    "--oidc-ipcrypt-claim was set but OIDC is not enabled (set --oidc-issuer and \
                      --oidc-jwks-url)"
                 );
             }
@@ -17748,6 +17774,59 @@ mod tests {
         );
     }
 
+    /// Every capability-list form grants exactly the capabilities it names
+    /// (ADR-2993 decision 6), from both `--tenant-token` and
+    /// `--tenant-token-file`, and the `ddl` suffix alone still grants no
+    /// `ipcrypt`.
+    #[test]
+    fn tenant_token_capability_list_grants_exactly_what_it_names() {
+        let file = tempfile::NamedTempFile::new().expect("temp token file");
+        std::fs::write(
+            file.path(),
+            "f1=acme;ipcrypt\nf2=acme;ddl,ipcrypt\nf3=acme;ipcrypt,ddl\nf4=acme;ddl\nf5=acme\n",
+        )
+        .expect("write tenant token file");
+        let from_file = cli(&[
+            "--tenant-token-file",
+            file.path().to_str().expect("utf8 path"),
+        ])
+        .parse_tenant_principals()
+        .expect("capability lists parse from file");
+        let from_flags = cli(&[
+            "--tenant-token",
+            "f1=acme;ipcrypt",
+            "--tenant-token",
+            "f2=acme;ddl,ipcrypt",
+            "--tenant-token",
+            "f3=acme;ipcrypt,ddl",
+            "--tenant-token",
+            "f4=acme;ddl",
+            "--tenant-token",
+            "f5=acme",
+        ])
+        .parse_tenant_principals()
+        .expect("capability lists parse from flags");
+        for map in [&from_file, &from_flags] {
+            for (token, ddl, ipcrypt) in [
+                ("f1", false, true),
+                ("f2", true, true),
+                ("f3", true, true),
+                ("f4", true, false),
+                ("f5", false, false),
+            ] {
+                assert_eq!(
+                    map.get(token),
+                    Some(&Principal {
+                        tenant: TenantId::new("acme"),
+                        ddl,
+                        ipcrypt,
+                    }),
+                    "{token}"
+                );
+            }
+        }
+    }
+
     /// `parse_tenant_tokens` (the plain `TenantId`-only path fold-tenant
     /// discovery and federation-mapping validation use) must strip the `;ddl`
     /// suffix down to the bare tenant, not leave it embedded in the
@@ -17773,7 +17852,11 @@ mod tests {
             format!("{TOKEN}={TENANT};DDL"),
             format!("{TOKEN}={TENANT};admin"),
             format!("{TOKEN}={TENANT};"),
+            format!("{TOKEN}={TENANT};ddl,ddl"),
+            format!("{TOKEN}={TENANT};ipcrypt,"),
+            format!("{TOKEN}={TENANT};ipcrypt,admin"),
             format!("{TOKEN}=;ddl"),
+            format!("{TOKEN}=;ipcrypt"),
             format!("{TOKEN}=;"),
             format!("{TOKEN}="),
             format!("{TOKEN}{TENANT}"),
@@ -17821,6 +17904,10 @@ mod tests {
             (format!("{TOKEN}={TENANT}"), format!("{TOKEN}=other")),
             (format!("{TOKEN}={TENANT}"), format!("{TOKEN}={TENANT};ddl")),
             (format!("{TOKEN}={TENANT};ddl"), format!("{TOKEN}={TENANT}")),
+            (
+                format!("{TOKEN}={TENANT};ddl"),
+                format!("{TOKEN}={TENANT};ddl,ipcrypt"),
+            ),
         ] {
             let err = match cli(&["--tenant-token", &first, "--tenant-token", &second])
                 .parse_tenant_principals()
@@ -17942,6 +18029,37 @@ mod tests {
             .expect_err("--oidc-ddl-claim with no OIDC fails startup");
         assert!(
             err.to_string().contains("--oidc-ddl-claim"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn oidc_ipcrypt_claim_empty_fails_startup() {
+        let err = cli(&[
+            "--oidc-issuer",
+            "https://issuer.example",
+            "--oidc-jwks-url",
+            "https://issuer.example/jwks",
+            "--oidc-audience",
+            "ravel",
+            "--oidc-ipcrypt-claim",
+            "",
+        ])
+        .parse_auth_resolvers()
+        .expect_err("an empty --oidc-ipcrypt-claim fails startup");
+        assert!(
+            err.to_string().contains("--oidc-ipcrypt-claim"),
+            "error names the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn oidc_ipcrypt_claim_without_oidc_fails_startup() {
+        let err = cli(&["--oidc-ipcrypt-claim", "can_ipcrypt"])
+            .parse_auth_resolvers()
+            .expect_err("--oidc-ipcrypt-claim with no OIDC fails startup");
+        assert!(
+            err.to_string().contains("--oidc-ipcrypt-claim"),
             "error names the flag: {err}"
         );
     }

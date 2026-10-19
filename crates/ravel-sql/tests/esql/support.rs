@@ -490,6 +490,7 @@ pub fn session(store: &Arc<dyn ObjectStoreBackend>) -> SessionContext {
         SessionTable::Logs(Arc::new(provider)),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session builds")
 }

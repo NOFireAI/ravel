@@ -81,6 +81,7 @@ async fn drain(
         SessionTable::Metrics(provider),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session");
 
@@ -258,6 +259,7 @@ async fn held_during_group_by(spill: SpillDecision<'_>) -> (usize, usize, usize)
         SessionTable::Metrics(provider),
         false,
         spill,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session");
     let mut stream = ctx
@@ -398,6 +400,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         SessionTable::Metrics(provider),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session");
     let mut stream = ctx
@@ -600,6 +603,7 @@ async fn drain_logs(
         SessionTable::Logs(provider),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session");
 

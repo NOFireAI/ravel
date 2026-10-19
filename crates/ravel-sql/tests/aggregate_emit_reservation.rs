@@ -104,6 +104,7 @@ async fn read_while_first_batch_is_held(sql: &str, config: SqlConfig) -> FirstBa
         SessionTable::Metrics(provider),
         false,
         SpillDecision::Disabled,
+        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
     )
     .expect("session");
     let batch_size = ctx.state().config().batch_size();
