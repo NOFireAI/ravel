@@ -1553,9 +1553,23 @@ enum EraseCommand {
         signal: SignalArg,
         /// Exact-match predicate matcher `key=value`, repeatable; the request
         /// matches a record only when every matcher holds (logical AND). At
-        /// least one is required.
-        #[arg(long = "matcher", value_name = "KEY=VALUE", required = true)]
+        /// least one `--matcher` or `--plaintext-matcher` is required.
+        #[arg(
+            long = "matcher",
+            value_name = "KEY=VALUE",
+            required_unless_present = "plaintext_matchers"
+        )]
         matchers: Vec<String>,
+        /// Matcher `key=value` for data written before the key's IPCrypt
+        /// rule, repeatable: the value is submitted exactly as written, with
+        /// no encryption and no epoch fan-out, and the erasure log stores it
+        /// in the clear (a warning naming the keys goes to stderr). The key
+        /// must have a rule in `--ipcrypt-config` for `--signal` (metric keys
+        /// by their sanitized form), and the command is refused when an
+        /// ordinary `--matcher` would be encrypted, since no record holds
+        /// both a raw value and a ciphertext.
+        #[arg(long = "plaintext-matcher", value_name = "KEY=VALUE")]
+        plaintext_matchers: Vec<String>,
         /// Optional inclusive event-time window start (unix ns). Both bounds
         /// zero (the default) means no event-time restriction.
         #[arg(long, default_value_t = 0)]
@@ -2839,6 +2853,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                     tenant,
                     signal,
                     matchers,
+                    plaintext_matchers,
                     window_start_ns,
                     window_end_ns,
                     reason,
@@ -2847,6 +2862,10 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 },
         } => {
             let matchers = matchers
+                .iter()
+                .map(|m| ravel_cli::erase::parse_matcher(m))
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let plaintext = plaintext_matchers
                 .iter()
                 .map(|m| ravel_cli::erase::parse_matcher(m))
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -2866,12 +2885,14 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 &tenant,
                 signal,
                 matchers,
+                plaintext,
                 window_start_ns,
                 window_end_ns,
                 reason,
                 request_id,
                 now_ns()?,
                 &mut std::io::stdout(),
+                &mut std::io::stderr(),
             )
             .await
             .map(|_| ())
@@ -5421,12 +5442,42 @@ mod tests {
             .expect("a read-only command must keep working on a fresh, marker-less bucket");
     }
 
-    /// `gc-config set` writes `sys/gc`, a bucket-root object with no tenant
-    /// prefix, so it never reaches the tenant-hashing gate above; it still
-    /// must clear the write gate on its own (the `else if
-    /// command_is_write(&cli.command)` arm in `main`), since the invariant
-    /// is "does the server accept this bucket", not "does this command hash
-    /// a tenant".
+    /// `erase submit` takes `--plaintext-matcher` in place of `--matcher`,
+    /// and needs at least one of the two.
+    #[test]
+    fn erase_submit_needs_a_matcher_or_a_plaintext_matcher() {
+        let base = [
+            "ravel", "erase", "submit", "--tenant", "t", "--signal", "logs",
+        ];
+        let parsed = Cli::try_parse_from(base.iter().chain(&[
+            "--plaintext-matcher",
+            "client.ip=192.0.2.1",
+            "--plaintext-matcher",
+            "host.ip=192.0.2.2",
+        ]))
+        .expect("plaintext matchers alone parse");
+        let Command::Erase {
+            command:
+                crate::EraseCommand::Submit {
+                    matchers,
+                    plaintext_matchers,
+                    ..
+                },
+        } = parsed.command
+        else {
+            panic!("expected erase submit");
+        };
+        assert!(matchers.is_empty());
+        assert_eq!(
+            plaintext_matchers,
+            vec!["client.ip=192.0.2.1", "host.ip=192.0.2.2"]
+        );
+        assert!(
+            Cli::try_parse_from(base).is_err(),
+            "a submit with no matcher of either kind must not parse"
+        );
+    }
+
     /// Every `ipcrypt` subcommand hashes a tenant: `encrypt`/`decrypt`
     /// derive the key from the tenant hash, and `set-policy`'s fingerprint
     /// keys each tenant table by it, so each needs the scheme installed.
@@ -5482,6 +5533,12 @@ mod tests {
         );
     }
 
+    /// `gc-config set` writes `sys/gc`, a bucket-root object with no tenant
+    /// prefix, so it never reaches the tenant-hashing gate above; it still
+    /// must clear the write gate on its own (the `else if
+    /// command_is_write(&cli.command)` arm in `main`), since the invariant
+    /// is "does the server accept this bucket", not "does this command hash
+    /// a tenant".
     #[tokio::test]
     async fn gc_config_set_refuses_on_marker_less_bucket() {
         use ravel_object_store::ObjectStoreBackend;
