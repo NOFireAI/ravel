@@ -540,10 +540,12 @@ pub struct QueryWindow {
     t_outer: Cell<i64>,
     /// Inside a subquery, how far the enclosing subquery grids reach before
     /// and after the current inner instant, summed over nesting levels;
-    /// `None` outside every subquery.
+    /// `None` outside every subquery. This and `t_outer` are maintained only
+    /// when `selector_cache` is `Some`, the one reader of both.
     inner_grid_pad: Cell<Option<(i64, i64)>>,
     /// Per-query selector reads (ADR-3072 decision 1b). `None` for an
-    /// instant query, whose evaluation reads every selector directly.
+    /// instant query and for [`Self::bare`], whose evaluation reads every
+    /// selector directly.
     selector_cache: Option<SelectorCache>,
     /// Shared cross-level evaluation-grid-point budget, charged
     /// down by [`Self::charge_budget`] on every subquery-grid evaluation
@@ -962,11 +964,12 @@ impl Evaluator {
             self.selector_cache.then(SelectorCache::default),
         );
 
-        // The `Selector` arm and a `Call` over a matrix selector read storage
-        // once for the whole grid themselves. Every other shape evaluates
-        // per step through `eval_expr`, whose selector helpers read through
-        // `ctx`'s selector cache, so a selector is still read once per query
-        // rather than once per step (ADR-3072 decision 1b).
+        // The `Selector` arm, and a range function over a matrix selector,
+        // read storage once for the whole grid themselves. Every other shape
+        // evaluates per step through `eval_expr`, whose selector helpers read
+        // through `ctx`'s selector cache: a selector is read on its first
+        // step and again only when a later step asks for a window outside
+        // that read, not once per step (ADR-3072 decision 1b).
         let (core, negate) = resolve_range_core(&expr)?;
         let value = match core {
             RangeCore::Scalar(v) => RangeValue::Scalar(if negate { -v } else { v }),
@@ -1213,8 +1216,8 @@ impl Evaluator {
     /// very first attempt to build it rather than after the outer grid has
     /// multiplied it out (this check, like every other part of subquery
     /// evaluation, is deliberately redone from scratch at each enclosing
-    /// step rather than memoized; only the selector reads underneath are
-    /// shared across steps, through the query's selector cache).
+    /// step rather than memoized; in a range query, only the selector reads
+    /// underneath are shared across steps, through its selector cache).
     pub(crate) fn eval_subquery_matrix(
         &self,
         source: &dyn SeriesSource,

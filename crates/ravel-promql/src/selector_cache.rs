@@ -1,8 +1,10 @@
 //! Per-query selector cache for range-query evaluation (ADR-3072 decision 1b).
 //!
-//! A range query whose top-level expression is not a single selector or call
-//! is evaluated once per grid step, and so is every subquery's inner
-//! expression. Without this cache each of those evaluations reads every
+//! A range query whose top-level expression is an aggregate or a binary
+//! expression is evaluated once per grid step, as are the per-step function
+//! shapes (`abs(m)`, `histogram_quantile`, a range function over a subquery)
+//! and every subquery's inner expression. Without this cache each of those
+//! evaluations reads every
 //! selector it reaches from the [`SeriesSource`](crate::source::SeriesSource)
 //! again. With it, the first read of a selector fetches a window wide enough
 //! to answer the selector at every later step, and each step is answered by
@@ -48,9 +50,9 @@ enum MatcherKind {
 /// matcher order in the query does not matter), the channel, and the
 /// selector's own time shift (signed `offset` and resolved `@` instant).
 ///
-/// The shift is part of the key so that `m - m offset 1w` keeps two entries
-/// that each slide forward with the grid, instead of one entry that each
-/// selector evicts in turn at every step.
+/// The shift is part of the key so that `m - m offset 1d` keeps two entries,
+/// each covering its own selector's whole grid, instead of one entry the two
+/// selectors keep replacing.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct SelectorKey {
     matchers: Vec<(String, MatcherKind, String, String)>,
