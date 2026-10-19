@@ -157,13 +157,19 @@ pub(crate) struct CachedSelector<S> {
 impl<S: CachedSeries> CachedSelector<S> {
     /// Every series' points inside `request`, inclusive on both ends like
     /// `TimeRange`, so equal timestamps at either bound are kept. Series
-    /// order is the source's. `request` must lie inside [`Self::window`].
+    /// order is the source's. `request` must lie inside [`Self::window`]. A
+    /// read over exactly `request` is returned whole, since the source
+    /// already clipped it.
     pub(crate) fn slices(
         &self,
         request: TimeRange,
     ) -> impl Iterator<Item = (&LabelSet, &[S::Point])> + '_ {
+        let whole = request == self.window;
         self.series.iter().map(move |s| {
             let points = s.points();
+            if whole {
+                return (s.labels(), points);
+            }
             let lo = points.partition_point(|p| S::ts_ns(p) < request.start_ns);
             let hi = points
                 .partition_point(|p| S::ts_ns(p) <= request.end_ns)

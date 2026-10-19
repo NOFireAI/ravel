@@ -1254,18 +1254,22 @@ impl Evaluator {
         // Selector-cache translation state for the inner evaluations: the
         // outermost subquery records the top-level step that launched it, and
         // every level adds its own grid's reach around the current inner
-        // instant, restored once the inner evaluation returns.
+        // instant, restored once the inner evaluation returns. Without a
+        // cache nothing reads this state, and none is kept.
+        let track = ctx.selector_cache.is_some();
         let enclosing_pad = ctx.inner_grid_pad.get();
-        if enclosing_pad.is_none() {
+        if track && enclosing_pad.is_none() {
             ctx.t_outer.set(eval_ts_ns);
         }
         let (pad_before, pad_after) = enclosing_pad.unwrap_or((0, 0));
         let matrix = crate::functions::eval_instant_over_grid(start_ns, end_ns, step_ns, |t| {
             ctx.check_deadline()?;
-            ctx.inner_grid_pad.set(Some((
-                pad_before.saturating_add(t.saturating_sub(start_ns)),
-                pad_after.saturating_add(end_ns.saturating_sub(t)),
-            )));
+            if track {
+                ctx.inner_grid_pad.set(Some((
+                    pad_before.saturating_add(t.saturating_sub(start_ns)),
+                    pad_after.saturating_add(end_ns.saturating_sub(t)),
+                )));
+            }
             let value = self.eval_expr(source, &sq.expr, t, ctx);
             ctx.inner_grid_pad.set(enclosing_pad);
             let value = value?;
