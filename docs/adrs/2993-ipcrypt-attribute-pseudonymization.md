@@ -311,7 +311,9 @@ Behaviour:
   holding a new `ipcrypt` capability, the way `ddl` gates DDL (ADR-2040
   decision 4). Without it, the call is refused like any unknown function.
   Per decision 0, this is what stops an ordinary reader from reversing
-  the pseudonymization by encrypting guesses. The capability is granted
+  the pseudonymization by encrypting guesses (a reader who can also
+  write has a second route; see the write-access note of 2026-10-19
+  below). The capability is granted
   in two ways:
   - **Static token.** The suffix after the last `;` becomes a
     comma-separated capability list drawn from `ddl` and `ipcrypt`, each
@@ -785,7 +787,13 @@ credential both ingest and query whenever a tenant has rules, which
 breaks every single-token deployment for a property most deployments do
 not need. The protection decision 0 describes therefore holds against a
 reader who cannot write to the tenant. Tokens carry no ingest or query
-scope of their own, so a deployment that needs the boundary splits it by
-process: readers get a token configured only on `query`-mode processes,
-and exporters get one configured only on `gateway`-mode processes. #3108 adds a sentence saying so
-beside the `ipcrypt` capability in the configuration guide.
+scope of their own, so the boundary can only be drawn by process, and
+only for flag-configured tokens: readers get a `--tenant-token` (or
+`--tenant-token-file`) entry on `query`-mode processes only, and
+exporters get one on `gateway`-mode processes only. A token in the
+durable `sys/auth` map resolves on every process that reads the bucket,
+`query` and `gateway` alike, so it cannot express this boundary. An
+OIDC identity resolves on every process configured with its issuer and
+audience, so an OIDC deployment needs a separate audience per process
+role to express it. A sentence saying so is added beside the `ipcrypt`
+capability in the configuration guide (#3108).
