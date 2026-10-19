@@ -2500,7 +2500,7 @@ pub struct Cli {
 
     /// The write CPU gate's inline floor, in input bytes (ADR-1702 decision
     /// 4, amended by issue #2818): a flush encode or ingest payload decode
-    /// sized below it runs inline on the request's worker instead of on a
+    /// sized below it runs inline on the calling async worker instead of on a
     /// blocking-pool thread holding a write permit. Default 1 MiB; the read
     /// gate keeps its 256 KiB floor, which has no flag. `0` is accepted and
     /// sends every write job through the gate; a value larger than any job

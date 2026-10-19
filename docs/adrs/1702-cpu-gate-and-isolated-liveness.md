@@ -149,7 +149,8 @@ rule on thread placement.
    a whole block with all its pages, or a whole part. It never wraps a
    single page, since 4096 dispatches per block cost more than they save.
    A unit whose uncompressed length is below the floor runs inline. The
-   floor is a gate setting, 256 KiB by default, and tests set it to 0. An
+   floor is a gate setting, 256 KiB by default (1 MiB on the write gate
+   since the write inline floor amendment below), and tests set it to 0. An
    inline run still counts in `ravel_cpu_gate_inline_total{gate,site}`, not
    in `ravel_cpu_gate_jobs_total`, so a test can tell the two apart. The codec
    crates (`ravel-segment`, `ravel-logseg`, `ravel-rspan`,
@@ -377,7 +378,9 @@ flowchart LR
   Per-query latency on an idle node should drop, and CPU per node under
   load stays capped at the permit count plus the workers.
 - Each offloaded unit pays one `spawn_blocking` dispatch and one semaphore
-  acquire. The 256 KiB inline floor keeps that cost off small units.
+  acquire. The 256 KiB inline floor keeps that cost off small units (on
+  the write gate the floor is 1 MiB; see the write inline floor amendment
+  below).
 - Runnable threads can reach the worker count plus both gates' permits,
   about 2.5 times the core count with the defaults. The OS time-slices
   them. Workers mostly wait on I/O once decode leaves them, so the health
@@ -708,7 +711,9 @@ to no more than the floor.
   expansion as zlib's technical notes give it, capped at 64 MiB. Gzip records
   a member's inflated length, modulo 2^32, only in the trailer after that
   member's deflate data, so there is nothing to trust beforehand. At the
-  default floor a body of 254 compressed bytes or fewer runs inline.
+  default floor a body of 254 compressed bytes or fewer runs inline. (At the
+  write gate's 1 MiB floor, 1016 or fewer: see the write inline floor
+  amendment below.)
 - `otap_decode`: the sum of the content sizes the payload's zstd frames
   declare, when every frame declares one; the decompression stops one byte
   past that total, so a frame that understates its size cannot inflate past
@@ -910,3 +915,33 @@ RavelCluster written since then keeps `false` until its owner sets `true` or
 removes the field; only a new cluster, or one never written since the v0.19.0
 CRD (rare, since the operator's own status updates are writes), takes the new
 default.
+
+## Amendment (2026-10-19): the write inline floor amendment (issue #2818)
+
+<!-- amendment-applies: sections="Decision|Consequences" pointer="write inline floor amendment" -->
+
+Decision 4's byte floor now differs per gate. The write gate's default is
+1 MiB of input bytes (`DEFAULT_WRITE_INLINE_FLOOR_BYTES` in
+`ravel-cpu-gate`), so a flush encode or an ingest payload decode under 1 MiB
+runs inline on the async worker that reaches it. The read gate keeps 256 KiB
+(`DEFAULT_INLINE_FLOOR_BYTES`, which `CpuGateConfig::with_permits` still
+sets), and the 100,000-sample evaluation floor is unchanged.
+`--cpu-gate-write-inline-floor-bytes` moves the write floor; the read floor
+has no flag.
+
+The evidence is the `ingest_query_latency_trial` run on a fresh c6a.4xlarge
+(issue #2818, comment 6261117172):
+
+- 64 KiB snappy Remote Write at 16 clients reached 0.879 of ungated
+  throughput at the 256 KiB floor and 1.001 at 1 MiB.
+- The median metrics flush input was 382,987 B: above 256 KiB, so at that
+  floor the typical flush paid a gate dispatch, and under 1 MiB, so it now
+  runs inline.
+- Query p99 at the 1 MiB floor stayed within 10% of the 256 KiB floor at
+  both client counts: PromQL at x1.007 and x1.006, SQL at x1.050 and x1.044.
+
+The same trial ran a fourth arm that computed the metrics flush's CRC32C
+upload checksum inside the encode job, on the write gate, at the 256 KiB
+floor. It reached 0.873 of ungated throughput against that floor's 0.879, no
+gain, and the S3 store recomputes CRC32C inside its put anyway. The setting
+and its code were removed rather than kept as a flag.
