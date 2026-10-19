@@ -62,7 +62,8 @@ pub fn build_cache(cli: &Cli, cache_max_bytes: u64) -> Option<ravel_query::ReadC
     if cli.disable_cache || cache_max_bytes == 0 {
         return None;
     }
-    let ram_limits = CacheLimits::new(cache_max_bytes, CACHE_MAX_ENTRIES, CACHE_MAX_ENTRY_BYTES);
+    let ram_limits = CacheLimits::new(cache_max_bytes, CACHE_MAX_ENTRIES, CACHE_MAX_ENTRY_BYTES)
+        .with_bulk_share(cli.cache_bulk_share);
     match &cli.cache_dir {
         None => Some(ravel_query::ReadCache::Ram(Arc::new(Cache::new(
             ram_limits,
