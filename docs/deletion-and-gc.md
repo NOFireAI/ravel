@@ -772,11 +772,22 @@ encrypts for the caller (ADR-2993 decision 8):
   with its epochs, then `<n> erasure requests: <c> created, <p> already
   present`.
 
-Every submit, with or without `--ipcrypt-config`, first runs the startup
-marker check ([ingest.md](ingest.md#startup-marker)), after planning the
-requests and before writing any of them: it refuses on a fingerprint mismatch
-or a marker that cannot be read, and creates the marker when there is none and
-the policy has rules.
+Every submit, with or without `--ipcrypt-config`, reads the
+`sys/ipcrypt/policy` marker ([ingest.md](ingest.md#startup-marker)) after
+planning the requests and before writing any of them, and never writes the
+marker (ADR-2993, erasure amendment):
+
+- A marker whose fingerprint differs from the local policy's refuses, and so
+  does a marker that cannot be read; a read failure is never taken for an
+  absent marker.
+- No marker and an empty policy proceeds.
+- No marker and a policy with rules means the bucket's data was written
+  without the policy, so an encrypted matcher would match nothing. A request
+  with at least one matcher the policy would encrypt is refused, naming
+  those matchers, and nothing is written; submit it without
+  `--ipcrypt-config` so its matchers stay plaintext. A request with no
+  encrypted matcher (every key has no rule for `--signal`, or every ruled
+  value is not an address) is submitted as written.
 
 ### The stages in detail
 
