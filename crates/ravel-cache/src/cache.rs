@@ -97,8 +97,11 @@ struct Inner {
     /// Run once by the next bulk admission between its copy and its
     /// admission, with the fifo lock released.
     #[cfg(test)]
-    after_bulk_copy: Mutex<Option<Box<dyn FnOnce(&Inner) + Send>>>,
+    after_bulk_copy: Mutex<Option<InnerHook>>,
 }
+
+#[cfg(test)]
+type InnerHook = Box<dyn FnOnce(&Inner) + Send>;
 
 /// The RAM tier of ADR-0046's read cache: a bounded, content-addressed,
 /// single-flighted `CacheKey -> Bytes` map. `E` is the caller's upstream
