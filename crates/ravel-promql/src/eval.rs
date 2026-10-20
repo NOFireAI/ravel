@@ -692,7 +692,8 @@ impl QueryWindow {
     }
 
     /// The one info a range query carries when any selector's cache entry did
-    /// not fit, naming how many fell back and why; `None` when none did.
+    /// not fit, naming how many fell back and why, with the figures of the
+    /// first budget refusal the query met; `None` when none did.
     fn selector_cache_fallback_info(&self) -> Option<String> {
         let cache = self.selector_cache.as_ref()?;
         let (cap, budget, refusal) = cache.fallbacks();
@@ -709,7 +710,7 @@ impl QueryWindow {
         }
         if let Some(refusal) = refusal {
             reasons.push(format!(
-                "{budget} refused by the query memory budget ({refusal})"
+                "{budget} refused by the query memory budget (first refusal: {refusal})"
             ));
         }
         Some(format!(
@@ -887,9 +888,12 @@ impl Evaluator {
     }
 
     /// Reserve each of a range query's selector-cache entries against
-    /// `budget`, held until the entry is replaced or the query ends. A refused
+    /// `budget`, held until the entry is replaced or the query ends. The
+    /// reservations go through `MemoryBudget::reserve`, so they count toward
+    /// the budget's `fetch_reserved()` (the server's
+    /// `ravel_memory_reserved_bytes{component="fetch"}`). A refused
     /// reservation does not fail the query: that selector is read at every
-    /// step instead, and the query carries an info naming the refusal.
+    /// step instead, and the query carries an info naming the first refusal.
     pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
         self.memory_budget = Some(budget);
         self
@@ -4181,7 +4185,7 @@ mod tests {
             "{info}"
         );
         assert!(
-            info.contains("1 refused by the query memory budget (memory exhausted:"),
+            info.contains("1 refused by the query memory budget (first refusal: memory exhausted:"),
             "{info}"
         );
         assert!(!info.contains("cap of"), "{info}");
@@ -4299,6 +4303,187 @@ mod tests {
         let stats = stats.expect("a range query runs with the selector cache");
         assert_eq!(stats.fetches, 4);
         assert_eq!(stats.refetches, 2, "one reread per channel");
+    }
+
+    /// The bytes `query`'s selector cache holds after an unbudgeted, uncapped
+    /// run over `grid`.
+    fn cache_bytes_after(source: CountingSource, query: &str, grid: (i64, i64, i64)) -> u64 {
+        let (result, stats) = range_with_cache_stats(Evaluator::new(), &source, query, grid);
+        result.expect("query evaluates");
+        stats
+            .expect("a range query runs with the selector cache")
+            .bytes
+    }
+
+    /// The reread shape of
+    /// `selector_cache_rereads_once_when_a_wider_window_shares_the_key`, over
+    /// [`two_hour_source`] and [`REREAD_GRID`]: `m[5m]` is read first,
+    /// then `m[1h]` asks for an hour before the first step and is read again
+    /// over the union window.
+    const REREAD_QUERY: &str = "sum(rate(m[5m])) / sum(rate(m[1h]))";
+    /// 60m to 90m at a 60 s step: 31 grid steps. The first read holds 36
+    /// samples and the union read 91, so their sample vectors (charged by
+    /// capacity) differ in size.
+    const REREAD_GRID: (i64, i64, i64) = (60 * 60_000, 90 * 60_000, 60_000);
+    const REREAD_GRID_STEPS: usize = 31;
+
+    /// `m`'s float entry after the first read and after the union read of
+    /// [`REREAD_QUERY`], as `(first, union)`. The histogram entries match
+    /// nothing and hold 0 bytes.
+    fn reread_entry_bytes() -> (u64, u64) {
+        let first = cache_bytes_after(two_hour_source(), "sum(rate(m[5m]))", REREAD_GRID);
+        let union = cache_bytes_after(two_hour_source(), REREAD_QUERY, REREAD_GRID);
+        assert!(0 < first && first < union, "{first} {union}");
+        (first, union)
+    }
+
+    #[test]
+    fn a_replacement_is_reserved_in_place_of_the_entry_it_replaces() {
+        // Room for the union entry alone, not for it beside the first one: the
+        // replacement fits once the first entry's reservation is released.
+        let (first, union) = reread_entry_bytes();
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(union + first / 2));
+        let source = two_hour_source();
+        let (start, end, step) = REREAD_GRID;
+        let (value, ctx) = Evaluator::new()
+            .with_memory_budget(Arc::clone(&budget))
+            .eval_range_in_window(&source, REREAD_QUERY, start, end, step)
+            .expect("query evaluates");
+        let stats = ctx
+            .selector_cache_stats()
+            .expect("a range query runs with the selector cache");
+        assert_eq!(stats.fallback_keys, 0);
+        assert_eq!(stats.refetches, 2, "one reread per channel");
+        assert_eq!(stats.bytes, union);
+        assert_eq!(budget.reserved(), union, "only the replacement is held");
+        assert_eq!(budget.accounted_refusals(), 0);
+        assert_eq!(source.query_count(), 2);
+        assert_eq!(source.histogram_query_count(), 2);
+        assert!(
+            !ctx.annotations
+                .borrow()
+                .infos()
+                .iter()
+                .any(|info| info.contains("read at every step")),
+            "{:?}",
+            ctx.annotations.borrow().infos()
+        );
+        drop(ctx);
+        assert_eq!(budget.reserved(), 0, "the query's end releases the entry");
+
+        let (reference, _) = range_with_cache_stats(
+            Evaluator::new().without_selector_cache(),
+            &two_hour_source(),
+            REREAD_QUERY,
+            REREAD_GRID,
+        );
+        assert_eq!(
+            without_annotations(Ok((value, Annotations::default()))),
+            without_annotations(reference)
+        );
+    }
+
+    #[test]
+    fn a_refused_replacement_leaves_no_stale_entry_reserved() {
+        // Room for the first entry and not for the union entry even alone: the
+        // first entry is released before the replacement is refused, so
+        // nothing stays reserved and the key reads at every later step.
+        let (first, union) = reread_entry_bytes();
+        let limit = first + (union - first) / 2;
+        assert!(first < limit && limit < union);
+        let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+        let source = two_hour_source();
+        let (start, end, step) = REREAD_GRID;
+        let (value, ctx) = Evaluator::new()
+            .with_memory_budget(Arc::clone(&budget))
+            .eval_range_in_window(&source, REREAD_QUERY, start, end, step)
+            .expect("a refused reservation does not fail the query");
+        let stats = ctx
+            .selector_cache_stats()
+            .expect("a range query runs with the selector cache");
+        assert_eq!(stats.fallback_keys, 1);
+        assert_eq!(stats.bytes, 0, "the replaced entry is gone");
+        assert_eq!(budget.reserved(), 0, "no stale entry holds a reservation");
+        assert_eq!(budget.accounted_refusals(), 1);
+        // The first step reads the first window and the union window; every
+        // later step reads both selectors over their own windows.
+        assert_eq!(source.query_count(), 2 + 2 * (REREAD_GRID_STEPS - 1));
+        assert_eq!(source.histogram_query_count(), 2);
+        // `rate` over `m` also notes that `m` might not be a counter.
+        let annotations = ctx.annotations.borrow().clone();
+        let fallback_infos: Vec<&String> = annotations
+            .infos()
+            .iter()
+            .filter(|info| info.contains("read at every step"))
+            .collect();
+        assert_eq!(
+            fallback_infos,
+            [&format!(
+                "1 selector(s) read at every step instead of once per query: \
+                 1 refused by the query memory budget (first refusal: memory exhausted: \
+                 requested {union} bytes, 0 of {limit} byte limit already reserved)"
+            )]
+        );
+        drop(ctx);
+        assert_eq!(budget.reserved(), 0);
+
+        let (reference, _) = range_with_cache_stats(
+            Evaluator::new().without_selector_cache(),
+            &two_hour_source(),
+            REREAD_QUERY,
+            REREAD_GRID,
+        );
+        assert_eq!(
+            without_annotations(Ok((value, Annotations::default()))),
+            without_annotations(reference)
+        );
+    }
+
+    #[test]
+    fn the_fallback_info_reports_the_first_budget_refusal() {
+        // `m` is cached; the four offset keys after it are each refused, and
+        // each asks for a different size (61, 31, 16 and 7 samples, held in
+        // vectors of different capacity), since the offset moves its window
+        // past the start of the data. `m offset 75m` is refused first, and it
+        // is neither the largest nor the smallest of the four.
+        let query = "m + m offset 75m + m offset 30m + m offset 84m + m offset 60m";
+        let cached = hour_grid_entry_bytes();
+        let refused: Vec<u64> = [75, 30, 84, 60]
+            .map(|minutes| {
+                cache_bytes_after(
+                    two_hour_source(),
+                    &format!("sum(m offset {minutes}m)"),
+                    HOUR_GRID,
+                )
+            })
+            .to_vec();
+        let limit = cached + 1;
+        let mut distinct = refused.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 4, "{refused:?}");
+        assert!(refused.iter().all(|&b| cached + b > limit), "{refused:?}");
+        let expected = format!(
+            "4 selector(s) read at every step instead of once per query: \
+             4 refused by the query memory budget (first refusal: memory exhausted: \
+             requested {} bytes, {cached} of {limit} byte limit already reserved)",
+            refused[0]
+        );
+        // The keys that fell back sit in a map whose iteration order differs
+        // between maps, so several runs in one process would disagree if the
+        // figures were read from it.
+        for _ in 0..8 {
+            let budget = Arc::new(ravel_memory::MemoryBudget::new(limit));
+            let (result, _) = range_with_cache_stats(
+                Evaluator::new().with_memory_budget(Arc::clone(&budget)),
+                &two_hour_source(),
+                query,
+                HOUR_GRID,
+            );
+            let (_, annotations) = result.expect("query evaluates");
+            assert_eq!(budget.accounted_refusals(), 4);
+            assert_eq!(annotations.infos(), std::slice::from_ref(&expected));
+        }
     }
 
     #[test]

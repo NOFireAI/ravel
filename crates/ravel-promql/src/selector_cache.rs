@@ -34,8 +34,9 @@
 //! Every entry is charged, before it is stored, against two bounds: a
 //! per-query byte cap on the cache's running total, and the query's
 //! [`MemoryBudget`], one [`Reservation`] per entry, released when the entry
-//! is replaced or the cache is dropped with its query (issue #3105). An entry
-//! that does not fit is not stored, and its key falls back: every later step
+//! is replaced or the cache is dropped with its query (issue #3105). A
+//! replacement is charged its own bytes in place of the old entry's on both
+//! bounds, not the two together. An entry that does not fit is not stored, and its key falls back: every later step
 //! reads that selector over its own request window, as evaluation without the
 //! cache does. A fallback changes how many reads a query makes, not which
 //! samples a step sees.
@@ -318,9 +319,13 @@ pub(crate) struct SelectorCacheStats {
 pub(crate) struct SelectorCache {
     entries: RefCell<HashMap<SelectorKey, Slot>>,
     /// Keys whose entry did not fit, with the first reason. A key here is not
-    /// offered to [`Self::insert`] again; an entry it already had stays and
-    /// keeps answering the requests inside its window.
+    /// offered to [`Self::insert`] again. An entry it already had stays and
+    /// keeps answering the requests inside its window when the cap refused
+    /// the replacement; the budget refuses only after that entry was dropped.
     fallen_back: RefCell<HashMap<SelectorKey, FallbackReason>>,
+    /// The first budget refusal of the query, in the order [`Self::insert`]
+    /// met them.
+    first_refusal: Cell<Option<MemoryExhausted>>,
     max_bytes: u64,
     budget: Option<Arc<MemoryBudget>>,
     bytes: Cell<u64>,
@@ -343,6 +348,7 @@ impl SelectorCache {
         SelectorCache {
             entries: RefCell::default(),
             fallen_back: RefCell::default(),
+            first_refusal: Cell::new(None),
             max_bytes,
             budget,
             bytes: Cell::new(0),
@@ -381,21 +387,17 @@ impl SelectorCache {
     }
 
     /// How many keys fell back for each reason, `(cap, budget)`, and the
-    /// first budget refusal.
+    /// first budget refusal the query met.
     pub(crate) fn fallbacks(&self) -> (u64, u64, Option<MemoryExhausted>) {
         let mut cap = 0u64;
         let mut budget = 0u64;
-        let mut first_refusal = None;
         for reason in self.fallen_back.borrow().values() {
             match reason {
                 FallbackReason::Cap => cap = cap.saturating_add(1),
-                FallbackReason::Budget(refusal) => {
-                    budget = budget.saturating_add(1);
-                    first_refusal.get_or_insert(*refusal);
-                }
+                FallbackReason::Budget(_) => budget = budget.saturating_add(1),
             }
         }
-        (cap, budget, first_refusal)
+        (cap, budget, self.first_refusal.get())
     }
 
     /// The per-query cap this cache was built with.
@@ -423,10 +425,15 @@ impl SelectorCache {
     /// Count a fresh read of `key` and store it, replacing any previous
     /// entry, when it fits: the running total with this entry in place of the
     /// one it replaces must stay within the cap, and the query's budget must
-    /// admit a reservation of the entry's bytes. Otherwise nothing is stored,
-    /// any previous entry stays, and `key` falls back. A miss reads over
-    /// [`Self::miss_window`], so a replacement covers the window of the entry
-    /// it replaces. This is the only way an entry enters the cache.
+    /// admit a reservation of the entry's bytes. A replacement costs each bound
+    /// the new entry's bytes in place of the old entry's, never both: the cap
+    /// check subtracts the old entry's bytes, and the old entry, with its
+    /// reservation, is dropped before the new one is reserved. When the cap
+    /// refuses, nothing changes and any previous entry stays; when the budget
+    /// refuses, the previous entry is already gone. Either way `key` falls
+    /// back. A miss reads over [`Self::miss_window`], so a replacement covers
+    /// the window of the entry it replaces. This is the only way an entry
+    /// enters the cache.
     pub(crate) fn insert<S: CachedSeries>(&self, key: SelectorKey, cached: Rc<CachedSelector<S>>) {
         self.fetches.set(self.fetches.get().saturating_add(1));
         let bytes = cached.bytes();
@@ -437,20 +444,19 @@ impl SelectorCache {
             .saturating_sub(replaced_bytes)
             .saturating_add(bytes);
         if total > self.max_bytes {
-            self.fallen_back
-                .borrow_mut()
-                .entry(key)
-                .or_insert(FallbackReason::Cap);
+            self.fall_back(key, FallbackReason::Cap);
             return;
+        }
+        let replaced = entries.remove(&key).is_some();
+        if replaced {
+            self.bytes
+                .set(self.bytes.get().saturating_sub(replaced_bytes));
         }
         let reservation = match &self.budget {
             Some(budget) => match budget.reserve(bytes) {
                 Ok(reservation) => Some(reservation),
                 Err(refusal) => {
-                    self.fallen_back
-                        .borrow_mut()
-                        .entry(key)
-                        .or_insert(FallbackReason::Budget(refusal));
+                    self.fall_back(key, FallbackReason::Budget(refusal));
                     return;
                 }
             },
@@ -461,11 +467,23 @@ impl SelectorCache {
             bytes,
             _reservation: reservation,
         };
-        if entries.insert(key, slot).is_some() {
+        entries.insert(key, slot);
+        if replaced {
             self.refetches.set(self.refetches.get().saturating_add(1));
         }
         self.bytes.set(total);
         self.peak_bytes.set(self.peak_bytes.get().max(total));
+    }
+
+    /// Record that `key` falls back for `reason`, keeping the first reason a
+    /// key gets and the first budget refusal the query gets.
+    fn fall_back(&self, key: SelectorKey, reason: FallbackReason) {
+        if let FallbackReason::Budget(refusal) = reason
+            && self.first_refusal.get().is_none()
+        {
+            self.first_refusal.set(Some(refusal));
+        }
+        self.fallen_back.borrow_mut().entry(key).or_insert(reason);
     }
 
     #[cfg(test)]

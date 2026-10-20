@@ -7578,13 +7578,13 @@ mod prefetch_tests {
         assert_eq!(budget.accounted_refusals(), 7);
         assert!(annotations.warnings().is_empty());
         assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
-        let info = &annotations.infos()[0];
-        assert!(
-            info.starts_with(
-                "7 selector(s) read at every step instead of once per query: \
-                 7 refused by the query memory budget (memory exhausted:"
-            ),
-            "{info}"
+        // The first refusal is `m offset 1s`, against `m`'s cached entry: `m`
+        // reads 141 points and each offset key 140, one 16-byte `Sample` less.
+        assert_eq!(
+            annotations.infos()[0],
+            "7 selector(s) read at every step instead of once per query: \
+             7 refused by the query memory budget (first refusal: memory exhausted: \
+             requested 2489 bytes, 2505 of 4096 byte limit already reserved)"
         );
 
         let unconstrained = Arc::new(ravel_memory::MemoryBudget::unlimited());
