@@ -99,10 +99,11 @@ impl ObjectStoreBackend for RecordingStore {
         self.inner.put(key, data, opts).await
     }
     async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
-        self.gets
-            .lock()
-            .expect("get log")
-            .push((key.to_string(), range, get_latency::current_phase()));
+        self.gets.lock().expect("get log").push((
+            key.to_string(),
+            range,
+            get_latency::current_phase(),
+        ));
         self.inner.get(key, range).await
     }
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -645,7 +646,11 @@ async fn keyed_objects_the_scan_skips_are_probed_not_planned() {
     // whole-object GET.
     assert_eq!(o.response["stats"]["io"]["dependencyDepth"], 6);
     for (n, object) in o.objects.iter().enumerate() {
-        assert_eq!(object.key_idx_gets(), object.expected_key_reads(), "object {n}");
+        assert_eq!(
+            object.key_idx_gets(),
+            object.expected_key_reads(),
+            "object {n}"
+        );
         if n == HOLDER {
             continue;
         }
@@ -695,7 +700,11 @@ async fn unindexed_objects_the_scan_skips_are_read_whole_once() {
         .collect();
     assert_eq!(whole_reads, [1; OBJECTS]);
     for (n, object) in o.objects.iter().enumerate() {
-        assert_eq!(object.gets, [GetRange::Suffix(1024), GetRange::Full], "object {n}");
+        assert_eq!(
+            object.gets,
+            [GetRange::Suffix(1024), GetRange::Full],
+            "object {n}"
+        );
         assert_eq!(object.whole_read_phases(), [GetPhase::Scan], "object {n}");
     }
 }

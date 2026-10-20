@@ -2244,10 +2244,18 @@ impl SqlExecutor {
             // Whether a logs scan probes KEY_IDX is known only once the plan
             // has pushed its filters down, so both shapes are taken here and
             // the attempt's plan picks one.
-            let io_shape =
-                self.sql_io_shape(&lane_refs, &phase_accounting, unfolded_segments_resolved, false);
-            let keyed_io_shape =
-                self.sql_io_shape(&lane_refs, &phase_accounting, unfolded_segments_resolved, true);
+            let io_shape = self.sql_io_shape(
+                &lane_refs,
+                &phase_accounting,
+                unfolded_segments_resolved,
+                false,
+            );
+            let keyed_io_shape = self.sql_io_shape(
+                &lane_refs,
+                &phase_accounting,
+                unfolded_segments_resolved,
+                true,
+            );
 
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
                 .attempt(

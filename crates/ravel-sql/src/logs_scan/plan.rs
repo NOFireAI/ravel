@@ -302,7 +302,7 @@ fn may_skip_plan(ctx: &PartitionCtx, seg: &SegmentRef) -> bool {
 /// One plan-pass read: the plan of a planned segment, or the KEY_IDX probe of
 /// a keyed segment the scan opens unplanned.
 enum PlanPassRead {
-    Planned(ravel_query::KeyedSegmentPlan),
+    Planned(Box<ravel_query::KeyedSegmentPlan>),
     Probed(KeyIndexPruning),
 }
 
@@ -385,7 +385,10 @@ async fn compute_plan_counts(
             }
         }
         prunes.push(async move {
-            let (plan, key_index) = (ctx.phase_accounting.plan(), ctx.phase_accounting.key_index());
+            let (plan, key_index) = (
+                ctx.phase_accounting.plan(),
+                ctx.phase_accounting.key_index(),
+            );
             let read = if probe_only {
                 ctx.fetcher
                     .probe_segment_keyed(seg, ctx.tenant_hash, &ctx.query, plan, key_index)
@@ -395,7 +398,7 @@ async fn compute_plan_counts(
                 ctx.fetcher
                     .plan_segment_keyed(seg, ctx.tenant_hash, &ctx.query, plan, key_index)
                     .await
-                    .map(PlanPassRead::Planned)
+                    .map(|plan| PlanPassRead::Planned(Box::new(plan)))
             };
             (idx, read)
         });
@@ -417,7 +420,7 @@ async fn compute_plan_counts(
     let mut key_index = KeyIndexPruning::default();
     while let Some((idx, entry)) = stream.next().await {
         let keyed = match entry.map_err(SqlError::from)? {
-            PlanPassRead::Planned(keyed) => keyed,
+            PlanPassRead::Planned(keyed) => *keyed,
             PlanPassRead::Probed(probe) => {
                 key_index.segments_pruned += probe.segments_pruned;
                 unplanned[idx] = probe.segments_pruned == 0;
