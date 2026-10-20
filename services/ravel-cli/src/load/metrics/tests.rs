@@ -1140,20 +1140,23 @@ mod default_geometry {
         stored
     }
 
-    /// Issue #2753: one series across every batch makes the first batch
-    /// over-estimate the rest, since a buffer charges a series' bytes only at
-    /// its first sighting there. 25 batches then estimate below the derived
+    /// Issue #2753: the first batch puts every point on a series of its own
+    /// and every later batch repeats one of them, so the first batch
+    /// over-estimates the rest, since a buffer charges a series' bytes only
+    /// at its first sighting there. 32 batches then estimate below the derived
     /// target (25 first batches' worth), the size trigger never fires, and
-    /// the depth flush closes each window of 25: `51 / 25` depth flushes and
-    /// one end-of-input flush for the 1-batch remainder.
+    /// the depth flush closes each window of 32: `51 / 32` depth flushes and
+    /// one end-of-input flush for the remainder.
     ///
     /// Prove-the-test: never call `window.submitted` in the metrics loader
-    /// and nothing answers the write the loop waits on at the 25th submit;
+    /// and nothing answers the write the loop waits on at the 32nd submit;
     /// the pinned clock never fires the age trigger, so the load fails on the
     /// Strict ack deadline and `load`'s `expect("load succeeds")` panics.
     #[tokio::test]
     async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
-        let (_dir, pq) = hosted_fixture(BATCH_ROWS, BATCHES, |_| "b000".to_string());
+        let (_dir, pq) = row_hosted_fixture(BATCH_ROWS, BATCHES, |g, r| {
+            format!("b{:05}", if g == 0 { r } else { 0 })
+        });
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
         let report = load(
             Arc::clone(&store),
@@ -1171,7 +1174,7 @@ mod default_geometry {
         let geometry = layout.geometry.expect("geometry resolved");
         assert_eq!(geometry.target_source, TargetSource::Derived);
         let depth = geometry.pipeline_depth;
-        assert_eq!(depth, 25);
+        assert_eq!(depth, 32);
         let depth_flushes = (BATCHES / depth) as u64;
         let manual = u64::from(!BATCHES.is_multiple_of(depth));
         assert_eq!(
@@ -1196,9 +1199,9 @@ mod default_geometry {
     /// objects: every 25th batch reaches the derived target (250,000 times
     /// the first batch's estimate per row) and closes an object on size, and
     /// the end-of-input drain publishes the 10,000-point tail. The derived
-    /// depth is ceil(250,000 / 10,000) = 25; the size flushes at batches 25
-    /// and 50 each restart the depth window, so the depth flush never comes
-    /// due.
+    /// depth is ceil(250,000 / 10,000) = 25 plus a quarter, 32; the size
+    /// flushes at batches 25 and 50 each restart the depth window, so the
+    /// depth flush never comes due.
     ///
     /// The clock is pinned, so the age trigger cannot fire. Per-batch
     /// flushing writes 51 objects; a target the size trigger never reaches
@@ -1242,7 +1245,7 @@ mod default_geometry {
             "the derived target is 250,000 rows of the first batch's estimate: {geometry:?}"
         );
         assert_eq!(geometry.rows_depth, 25);
-        assert_eq!(geometry.pipeline_depth, 25);
+        assert_eq!(geometry.pipeline_depth, 32);
         assert_eq!(geometry.depth_bound, DepthBound::Rows);
         assert_eq!(
             layout.flush_mix.totals,
@@ -1545,7 +1548,7 @@ mod default_geometry {
         let summary = render_layout_summary(&report.layout_report());
         assert!(
             summary.contains(
-                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"
+                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 25% = 32)"
             ),
             "{summary}"
         );
