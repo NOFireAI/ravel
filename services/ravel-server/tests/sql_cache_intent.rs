@@ -293,10 +293,11 @@ const HOT_STATEMENTS_PER_ROUND: usize = 8;
 /// Statements are interleaved one at a time, so each statement's
 /// `stats.cache` delta, `misses` included, is its own.
 ///
-/// FLIP: tagging the statement's accounting handles
-/// `AccessIntent::Interactive` in `SqlExecutor` while still reporting the
-/// classified intent (so the full-tenant scan's reads go through small and
-/// main like any other) drops the hot-set hit rate to 124 of 128.
+/// FLIP: making every `ReadCache` method in `crates/ravel-query/src/fetcher.rs`
+/// read and admit as `ravel_cache::AccessIntent::Interactive` whatever intent
+/// it is passed (the classification still reported, so the full-tenant
+/// scan's reads go through the small and main queues like any other) drops
+/// the hot-set hit rate to 124 of 128.
 #[tokio::test]
 async fn an_interactive_statement_keeps_its_hot_set_under_a_concurrent_bulk_loop() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -472,9 +473,10 @@ fn sample(scrape: &str, series: &str) -> u64 {
     values[0]
 }
 
-/// FLIP: removing the `render_cache_intent_family` call from
-/// `metrics_handler` (`services/ravel-server/src/metrics.rs`) leaves no
-/// `intent` sample in the scrape, and `sample` fails on the first series.
+/// FLIP: dropping `Label::CacheIntent(intent)` from the sample labels in
+/// `render_cache_intent_family` (`services/ravel-server/src/metrics.rs`)
+/// leaves no `intent` sample in the scrape, and `sample` fails on the first
+/// series.
 #[tokio::test]
 async fn a_bulk_statement_moves_the_bulk_scan_intent_sample_on_a_real_scrape() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
