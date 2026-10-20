@@ -15755,7 +15755,8 @@ mod block_funnel_intent_tests {
 
     /// FLIP: passing `AccessIntent::Interactive` in place of `intent` to the
     /// `cache.insert` of the run's non-lead blocks in `fetch_run` leaves two
-    /// of the bulk read's three blocks outside the region.
+    /// of the bulk read's three blocks outside the region; passing it to the
+    /// lead block's `fetch_peeked` leaves the lead block outside.
     #[tokio::test]
     async fn fetch_run_admits_its_blocks_under_the_callers_intent() {
         for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
