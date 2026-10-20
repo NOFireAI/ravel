@@ -46,17 +46,17 @@ use crate::reconcile::{
     AUDIT_TOKEN_KEY_MISSING_MESSAGE, AUDIT_TOKEN_KEY_MISSING_REASON, AUDIT_TOKEN_KEY_SECRET_KEY,
     DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, DesiredObjects, GC_BOOTSTRAP_STALL_AFTER,
     GC_BOOTSTRAP_STALLED_REASON, GC_BOOTSTRAP_UNAVAILABLE_MESSAGE, GC_BOOTSTRAP_UNAVAILABLE_REASON,
-    GcBootstrapGate, MIN_KUBERNETES_MINOR_VERSION, QUALIFY_COMPONENT, QUALIFY_SPEC_HASH_ANNOTATION,
-    QualificationDecision, QualifyJobAction, QualifyJobObservation, QualifyStoreReason, RenderCtx,
-    RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY, STORE_QUALIFIED_FAILED_REASON,
-    STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON, STORE_QUALIFIED_SUCCEEDED_REASON,
-    STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_REASON,
-    audit_token_key_missing, deployment_rollout_complete, desired_objects, desired_qualify_job,
-    distributed_query_secret_refs, grpcroute_api_resource, httproute_api_resource,
-    plan_qualify_gate, possible_gateway_route_names, possible_ingest_ingress_names,
-    possible_network_policy_names, possible_pod_disruption_budget_names,
-    possible_router_object_names, qualification_decision, qualify_job_input_hash,
-    qualify_job_phase, query_fragment_policy_hold_while_disabling,
+    GcBootstrapGate, HEALTH_PORT, HTTP_PORT, MIN_KUBERNETES_MINOR_VERSION, QUALIFY_COMPONENT,
+    QUALIFY_SPEC_HASH_ANNOTATION, QualificationDecision, QualifyJobAction, QualifyJobObservation,
+    QualifyStoreReason, RenderCtx, RenderError, S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY,
+    STORE_QUALIFIED_FAILED_REASON, STORE_QUALIFIED_MESSAGE, STORE_QUALIFIED_PENDING_REASON,
+    STORE_QUALIFIED_SUCCEEDED_REASON, STORE_QUALIFYING_MESSAGE, WAITING_FOR_GC_BOOTSTRAP_MESSAGE,
+    WAITING_FOR_GC_BOOTSTRAP_REASON, audit_token_key_missing, deployment_rollout_complete,
+    desired_objects, desired_qualify_job, distributed_query_secret_refs, grpcroute_api_resource,
+    httproute_api_resource, plan_qualify_gate, possible_gateway_route_names,
+    possible_ingest_ingress_names, possible_network_policy_names,
+    possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
+    qualify_job_input_hash, qualify_job_phase, query_fragment_policy_hold_while_disabling,
     query_network_policy_during_rollout, s3_allow_http,
 };
 
@@ -2527,33 +2527,84 @@ fn preserve_transition_times(
 /// Conditions derived from the spec alone, independent of whether this pass
 /// succeeds or fails (ADR-0080 decision 1).
 ///
-/// Today that is exactly one: `IngestAffinityBackendDeprecated`, set while
-/// ingest affinity is enabled on the legacy ingress-nginx backend, whether that
-/// backend was chosen explicitly or came from the schema default. Absent,
-/// disabled, or `ravelNative` affinity produces no condition at all, so the
-/// deprecation notice disappears the moment a cluster migrates.
+/// `IngestAffinityBackendDeprecated` is set while ingest affinity is enabled
+/// on the legacy ingress-nginx backend, whether that backend was chosen
+/// explicitly or came from the schema default. Absent, disabled, or
+/// `ravelNative` affinity produces no condition at all, so the deprecation
+/// notice disappears the moment a cluster migrates.
+///
+/// `HealthProbeOnMainRouter` (issue #3112) is set while the resolved
+/// `spec.probes.dedicatedHealthPort` is `false`: a cluster whose stored spec
+/// predates the ADR-1702 follow-up task 12 default flip (or that explicitly
+/// opted out) still probes the main router instead of the dedicated health
+/// listener. See [`health_probe_on_main_router_condition`].
 ///
 /// The reconcile pass hands the result to whichever status writer runs; there
 /// is deliberately no read-modify-write against live status, which would race
 /// a concurrent writer.
 fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) -> Vec<Condition> {
+    let mut conditions = Vec::new();
+
     let legacy_backend = spec
         .gateway
         .ingest_affinity
         .as_ref()
         .is_some_and(|a| a.enabled && matches!(a.backend, AffinityBackend::IngressNginx));
-    if !legacy_backend {
-        return Vec::new();
+    if legacy_backend {
+        conditions.push(condition(
+            "IngestAffinityBackendDeprecated",
+            true,
+            observed_generation,
+            "IngressNginxRetired",
+            "ingestAffinity is using the ingress-nginx backend, which is \
+             retired upstream; migrate to backend: ravelNative or an \
+             equivalent Gateway API exposure (see docs/guides/ingest-affinity.md)",
+        ));
     }
-    vec![condition(
-        "IngestAffinityBackendDeprecated",
+
+    if let Some(cond) = health_probe_on_main_router_condition(spec, observed_generation) {
+        conditions.push(cond);
+    }
+
+    conditions
+}
+
+/// The `HealthProbeOnMainRouter` condition (issue #3112) for a cluster whose
+/// resolved `spec.probes.dedicatedHealthPort` is `false`, or `None` when it
+/// resolves `true` (explicitly, or because the field is absent and the
+/// schema default applies -- `ProbesSpec`'s `#[serde(default)]` fills it in
+/// before this function ever sees the spec, so there is no separate "absent"
+/// state to branch on here).
+///
+/// Since v0.19.0 the CRD defaulted the field to `false`, and the API server
+/// stores schema defaults on every write, so a cluster written since then
+/// holds `false` until it is set to `true` or removed (ADR-1702 follow-up
+/// task 12, operator-default-flip amendment); its probes keep hitting the
+/// main HTTP port's `/healthz` on
+/// [`HTTP_PORT`], which shares its runtime with ingest and query decode
+/// (ADR-1702 decision 8), instead of the dedicated listener on
+/// [`HEALTH_PORT`].
+fn health_probe_on_main_router_condition(
+    spec: &RavelClusterSpec,
+    observed_generation: Option<i64>,
+) -> Option<Condition> {
+    if spec.probes.dedicated_health_port {
+        return None;
+    }
+    Some(condition(
+        "HealthProbeOnMainRouter",
         true,
         observed_generation,
-        "IngressNginxRetired",
-        "ingestAffinity is using the ingress-nginx backend, which is \
-         retired upstream; migrate to backend: ravelNative or an \
-         equivalent Gateway API exposure (see docs/guides/ingest-affinity.md)",
-    )]
+        "DedicatedHealthPortDisabled",
+        &format!(
+            "probes resolve to the main HTTP port {HTTP_PORT}, which \
+             shares its runtime with ingest and query work, instead of the \
+             dedicated health listener on {HEALTH_PORT}; set \
+             spec.probes.dedicatedHealthPort: true to move probes to the \
+             dedicated listener (see \"The dedicated health port\" in \
+             docs/guides/kubernetes.md)"
+        ),
+    ))
 }
 
 /// Take a string's leading ASCII digits and parse them, or `None` when there
@@ -3974,6 +4025,117 @@ mod tests {
             vec!["KubernetesVersionUnsupported"]
         );
         assert_eq!(find(&extra, "KubernetesVersionUnsupported").status, "True");
+    }
+
+    /// `dedicatedHealthPort: false` (explicit) sets `HealthProbeOnMainRouter`
+    /// with the reason, and a message naming both ports from
+    /// [`HTTP_PORT`]/[`HEALTH_PORT`] rather than literals typed twice (issue
+    /// #3112).
+    #[test]
+    fn dedicated_health_port_false_sets_health_probe_on_main_router() {
+        let mut spec = spec_with_affinity(None);
+        spec.probes.dedicated_health_port = false;
+
+        let extra = spec_conditions(&spec, Some(7));
+
+        assert_eq!(condition_types(&extra), vec!["HealthProbeOnMainRouter"]);
+        let cond = find(&extra, "HealthProbeOnMainRouter");
+        assert_eq!(cond.status, "True");
+        assert_eq!(cond.reason, "DedicatedHealthPortDisabled");
+        assert_eq!(cond.observed_generation, Some(7));
+        assert!(
+            cond.message.contains(&HTTP_PORT.to_string())
+                && cond.message.contains(&HEALTH_PORT.to_string()),
+            "message names both ports: {}",
+            cond.message
+        );
+    }
+
+    /// A cluster whose probes resolve to the dedicated port carries no
+    /// `HealthProbeOnMainRouter` condition at all (absent, not status
+    /// `False`), matching how `KubernetesVersionUnsupported` behaves. Two
+    /// cases: `dedicatedHealthPort: true` set explicitly, and the whole
+    /// `probes` block left out of the stored object entirely.
+    ///
+    /// The absent case is built by deserializing a minimal JSON spec with no
+    /// `probes` key at all, not by constructing a `RavelClusterSpec` literal
+    /// with `probes: ProbesSpec::default()` by hand: `RavelClusterSpec`'s
+    /// `probes` field has no `Option` of its own
+    /// (`#[serde(default)] pub probes: ProbesSpec`), so the only place an
+    /// "absent" state exists is on the wire, before `serde` resolves it to a
+    /// concrete `bool` via `default_dedicated_health_port`, so the test
+    /// asserts that resolution first and then the condition. The
+    /// explicit-`true` case fails against an implementation that emits the
+    /// condition with status `"False"` instead of omitting it.
+    #[test]
+    fn dedicated_health_port_true_or_absent_sets_no_condition() {
+        let mut explicit_true = spec_with_affinity(None);
+        explicit_true.probes.dedicated_health_port = true;
+        assert_eq!(
+            condition_types(&spec_conditions(&explicit_true, Some(7))),
+            Vec::<&str>::new()
+        );
+
+        let absent_json = serde_json::json!({
+            "image": "registry.example/ravel:v1",
+            "shards": 4,
+            "storage": {
+                "s3": {
+                    "bucket": "ravel-data",
+                    "credentialsSecretRef": {"name": "ravel-s3"},
+                },
+            },
+        });
+        let absent: RavelClusterSpec =
+            serde_json::from_value(absent_json).expect("minimal spec deserializes");
+        assert!(
+            absent.probes.dedicated_health_port,
+            "ProbesSpec's #[serde(default)] must resolve an absent block to true"
+        );
+        assert_eq!(
+            condition_types(&spec_conditions(&absent, Some(7))),
+            Vec::<&str>::new()
+        );
+    }
+
+    /// The condition reaches the status the cluster actually gets on both
+    /// status writers (issue #3112): `pass_conditions`'s output flows into
+    /// `build_status` on the success path and into `degraded_extra_conditions`
+    /// -> `build_degraded_status` on the degraded path, exactly like
+    /// `KubernetesVersionUnsupported` does above.
+    #[test]
+    fn health_probe_on_main_router_reaches_both_status_writers() {
+        let mut spec = spec_with_affinity(None);
+        spec.probes.dedicated_health_port = false;
+        let extra = pass_conditions(&spec, Some(7), None);
+        assert_eq!(condition_types(&extra), vec!["HealthProbeOnMainRouter"]);
+
+        let ok = build_status(
+            Some(7),
+            Some(1),
+            Some(1),
+            Some(1),
+            None,
+            PersistedStatus::default(),
+            extra.clone(),
+        );
+        assert_eq!(
+            find(&ok.conditions, "HealthProbeOnMainRouter").status,
+            "True"
+        );
+
+        let degraded_extra = degraded_extra_conditions(extra, None);
+        let degraded = build_degraded_status(
+            Some(7),
+            "SecretNotFound",
+            "no such Secret",
+            PersistedStatus::default(),
+            degraded_extra,
+        );
+        assert_eq!(
+            find(&degraded.conditions, "HealthProbeOnMainRouter").status,
+            "True"
+        );
     }
 
     /// A reconcile error during a bootstrap hold must not restart the stall

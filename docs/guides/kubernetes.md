@@ -787,6 +787,12 @@ The conditions are:
   also carries `KubernetesVersionUnsupported=True`. The condition names the
   floor and the detected version. It appears alongside
   `Available`/`Degraded` and does not replace them.
+- `HealthProbeOnMainRouter`. Present with status `True` only while the
+  resolved `spec.probes.dedicatedHealthPort` is `false`, most commonly a
+  cluster still holding the `false` that the CRDs from v0.19.0 stored on
+  every write until the default flipped to `true` (see "The
+  dedicated health port" below). Absent once probes resolve to the dedicated
+  listener, whether from an explicit `true` or the current schema default.
 
 The operator emits no `Progressing` condition, so do not wait on one.
 
@@ -952,6 +958,20 @@ A cluster never written since the v0.19.0 CRD was applied has no stored
 value, and reads as `true` once the new CRD is in place. That is rare: the
 operator updates each cluster's status on every reconcile, and those updates
 are writes too.
+
+The operator reports a `HealthProbeOnMainRouter` condition on any
+`RavelCluster` whose resolved `dedicatedHealthPort` is `false`, including one
+still holding the `false` an earlier CRD stored, so the exposure is visible
+on the object instead of only in this doc. Check it with:
+
+```sh
+kubectl get ravelcluster <name> \
+  -o jsonpath='{.status.conditions[?(@.type=="HealthProbeOnMainRouter")]}'
+```
+
+or look for it in `kubectl describe ravelcluster <name>`. No condition means
+probes already resolve to the dedicated listener; see the condition list
+under [Status](#status) above for the full set.
 
 Codec work that used to run on the main runtime's workers now runs behind
 two CPU gates on the blocking pool, and each gate's permit count bounds how
