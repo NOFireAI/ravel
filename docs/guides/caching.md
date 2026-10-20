@@ -236,9 +236,10 @@ The region's share is a reservation, not only a ceiling. An interactive
 admission reclaims bulk bytes above the share before it evicts anything
 else, but the region's bytes up to the share are evicted only once the
 probation and main queues are empty. After bulk reads stop, those bytes stay
-resident: no interactive admission rotates them out, and they leave only
-through later bulk reads, an interactive read that moves an entry to
-probation, or the max-age sweep below. A cache that served one whole-tenant
+resident: no interactive admission rotates them out while the probation or
+main queue holds anything, and they leave only through later bulk reads,
+an interactive read that moves an entry to probation, or the max-age sweep
+below. A cache that served one whole-tenant
 scan and then only dashboards therefore runs its interactive working set in
 the cap less the bytes the scan left behind, up to the share. Lower
 `--cache-bulk-share` if that matters more than repeated scans.
@@ -270,8 +271,8 @@ table, and one of these holds:
   whose metric name or label prunes any segment.
 - `logs`: the statement carries no `WHERE` or `HAVING` clause anywhere,
   subqueries included, no erasure is pending on the resolved segments, and
-  every resolved segment lies inside the window. This is the same test that has the logs scan read every block
-  of every segment.
+  every resolved segment lies inside the window. This is the same test
+  that has the logs scan read every block of every segment.
 
 Everything else reads as `interactive`:
 
@@ -280,11 +281,13 @@ Everything else reads as `interactive`:
 - an ES|QL query, whose logs rule needs SQL text the executor does not have
   for it;
 - PromQL, the startup warmup, Flight SQL statements, and the fragments a
-  distributed worker runs, which read under the interactive
-  intent whatever the coordinator decided.
+  distributed worker runs, which read under the interactive intent
+  whatever the coordinator decided.
 
 The intent changes only where the bytes are admitted. A statement returns
-the same rows under either intent.
+the same rows under either intent. Reads of one object that arrive together
+share one fetch, whose bytes are admitted under the intent of the read that
+started it.
 
 ### Per-statement cache counters
 
