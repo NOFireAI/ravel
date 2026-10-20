@@ -1549,7 +1549,7 @@ mod default_geometry {
         let summary = render_layout_summary(&report.layout_report());
         assert!(
             summary.contains(
-                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 25% = 32)"
+                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 7 = 32)"
             ),
             "{summary}"
         );
