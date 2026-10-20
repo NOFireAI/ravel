@@ -36,6 +36,7 @@ use ravel_logseg::footer::kind;
 use ravel_logseg::key_index::{KeyType, key8_i64, probe_ranged};
 use ravel_logseg::writer::ObjectIdentity;
 use ravel_logseg::{AttrValue, LogRecord, LogSegError, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_object_store::get_latency::{self, GetPhase};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -81,9 +82,10 @@ impl Clock for FixedClock {
     }
 }
 
+/// Records each GET with the phase the fetcher attributed it to.
 struct RecordingStore {
     inner: Arc<dyn ObjectStoreBackend>,
-    gets: Mutex<Vec<(String, GetRange)>>,
+    gets: Mutex<Vec<(String, GetRange, GetPhase)>>,
 }
 
 #[async_trait::async_trait]
@@ -100,7 +102,7 @@ impl ObjectStoreBackend for RecordingStore {
         self.gets
             .lock()
             .expect("get log")
-            .push((key.to_string(), range));
+            .push((key.to_string(), range, get_latency::current_phase()));
         self.inner.get(key, range).await
     }
     async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
@@ -177,11 +179,16 @@ struct Config {
     /// `with_projection_break_even_bytes`, which moves
     /// `plan_whole_object_bound` above the threshold.
     break_even: u64,
+    /// Whether the writer builds a KEY_IDX section on `user_id`. The query's
+    /// equality is pushed down either way, from the declared key index.
+    key_indexed: bool,
 }
 
 struct Object {
     bytes: Bytes,
     gets: Vec<GetRange>,
+    /// The phase of each of `gets`, in the same order.
+    phases: Vec<GetPhase>,
 }
 
 impl Object {
@@ -224,6 +231,16 @@ impl Object {
 
     fn read_whole(&self) -> bool {
         self.gets.iter().any(|g| matches!(g, GetRange::Full))
+    }
+
+    /// The phase of each whole-object GET this object served.
+    fn whole_read_phases(&self) -> Vec<GetPhase> {
+        self.gets
+            .iter()
+            .zip(&self.phases)
+            .filter(|(g, _)| matches!(g, GetRange::Full))
+            .map(|(_, p)| *p)
+            .collect()
     }
 }
 
@@ -276,7 +293,7 @@ async fn run(cfg: &Config) -> Outcome {
     let mut published: Vec<(String, Bytes)> = Vec::new();
     for (seq, pad) in cfg.pads.iter().enumerate() {
         let writer_id = Uuid::from_u128(3_117_000 + seq as u128);
-        let mut writer = RlogWriter::new(
+        let writer = RlogWriter::new(
             RlogConfig {
                 block_target_records: RECORDS_PER_BLOCK,
                 ..RlogConfig::default()
@@ -288,8 +305,12 @@ async fn run(cfg: &Config) -> Outcome {
                 writer_epoch: 1,
                 writer_seq: seq as u64 + 1,
             },
-        )
-        .with_key_index_fields(vec![("user_id".to_string(), KeyType::I64)]);
+        );
+        let mut writer = if cfg.key_indexed {
+            writer.with_key_index_fields(vec![("user_id".to_string(), KeyType::I64)])
+        } else {
+            writer
+        };
         let records: Vec<LogRecord> = (0..RECORDS).map(|i| record_of(seq, i, *pad)).collect();
         let min = records.iter().map(|r| r.ts_ns).min().expect("records");
         let max = records.iter().map(|r| r.ts_ns).max().expect("records");
@@ -406,13 +427,17 @@ async fn run(cfg: &Config) -> Outcome {
     let gets = recorder.gets.lock().expect("log").clone();
     let objects = published
         .into_iter()
-        .map(|(key, bytes)| Object {
-            gets: gets
+        .map(|(key, bytes)| {
+            let (gets, phases) = gets
                 .iter()
-                .filter(|(k, _)| *k == key)
-                .map(|(_, r)| *r)
-                .collect(),
-            bytes,
+                .filter(|(k, _, _)| *k == key)
+                .map(|(_, r, p)| (*r, *p))
+                .unzip();
+            Object {
+                gets,
+                phases,
+                bytes,
+            }
         })
         .collect();
     Outcome { response, objects }
@@ -454,6 +479,7 @@ async fn sub_break_even_objects_left_unplanned_are_probed() {
         target_partitions: 4,
         threshold: 256 * KIB,
         break_even: 512 * KIB,
+        key_indexed: true,
     })
     .await;
     for (n, object) in o.objects.iter().enumerate() {
@@ -481,6 +507,7 @@ async fn sub_break_even_objects_the_scan_plans_are_probed() {
         target_partitions: 32,
         threshold: 256 * KIB,
         break_even: 512 * KIB,
+        key_indexed: true,
     })
     .await;
     assert_every_object_probed(&o);
@@ -497,6 +524,7 @@ async fn every_object_under_a_larger_break_even_is_probed() {
         target_partitions: 4,
         threshold: 256 * KIB,
         break_even: 2048 * KIB,
+        key_indexed: true,
     })
     .await;
     for object in &o.objects {
@@ -508,7 +536,8 @@ async fn every_object_under_a_larger_break_even_is_probed() {
 
 /// At or under the block-range threshold an object is read whole, in one
 /// GET, and never probed: one small GET is cheaper than the probe. The big
-/// objects above it, under the break-even, are still probed. Both scan
+/// objects above it, under the break-even, are still probed, and the 7 without
+/// the key are pruned without a whole-object read. Both scan
 /// routes: `target_partitions` 4 opens the 16 small objects unplanned, 32
 /// plans them.
 ///
@@ -523,6 +552,7 @@ async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
             target_partitions,
             threshold: 512 * KIB,
             break_even: 2048 * KIB,
+            key_indexed: true,
         })
         .await;
         assert_eq!(o.ids(), ["o0r050"], "tp {target_partitions}");
@@ -538,6 +568,13 @@ async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
                 );
             } else {
                 assert!(object.size() > 512 * KIB, "object {n}");
+                if n != HOLDER {
+                    assert!(
+                        !object.read_whole(),
+                        "tp {target_partitions} object {n}: {:?}",
+                        object.gets
+                    );
+                }
                 let want = object.expected_key_reads();
                 assert_eq!(
                     object.key_idx_gets(),
@@ -553,4 +590,65 @@ async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
         assert_eq!(per_object.iter().filter(|&&r| r == 2).count(), 6, "tp {tp}");
         assert_eq!(o.key_index_gets(), 8 + 6, "tp {tp}");
     }
+}
+
+/// 24 keyed objects between a 256 KiB threshold and a 2 MiB bound, more than
+/// `target_partitions` 4, so the scan skips sub-bound plans (ADR-2677
+/// decision 2). The plan pass probes each one's KEY_IDX and plans none: the 23
+/// without the key are pruned with no read past the tail probe and KEY_IDX,
+/// and the holder is read whole once, by the scan.
+#[tokio::test]
+async fn keyed_objects_the_scan_skips_are_probed_not_planned() {
+    let o = run(&Config {
+        pads: vec![BIG; OBJECTS],
+        target_partitions: 4,
+        threshold: 256 * KIB,
+        break_even: 2048 * KIB,
+        key_indexed: true,
+    })
+    .await;
+    assert_eq!(o.ids(), ["o0r050"]);
+    assert_eq!(o.pruned(), (OBJECTS - 1) as u64, "{}", o.response);
+    assert_eq!(o.key_index_gets(), ALL_OBJECTS_KEY_READS);
+    let plan_whole_reads = o
+        .objects
+        .iter()
+        .flat_map(Object::whole_read_phases)
+        .filter(|p| *p == GetPhase::Plan)
+        .count();
+    assert_eq!(plan_whole_reads, 0);
+    assert_eq!(o.objects[HOLDER].whole_read_phases(), [GetPhase::Scan]);
+    for (n, object) in o.objects.iter().enumerate() {
+        assert_eq!(object.key_idx_gets(), object.expected_key_reads(), "object {n}");
+        if n == HOLDER {
+            continue;
+        }
+        let key_idx = object.key_idx_gets();
+        for get in &object.gets {
+            assert!(
+                *get == GetRange::Suffix(1024) || key_idx.contains(get),
+                "object {n}: {get:?} in {:?}",
+                object.gets
+            );
+        }
+    }
+}
+
+/// The same 24 objects written without a KEY_IDX section, under the same
+/// declared key index: the probe finds no section and drops nothing, so every
+/// object is left to the scan, which reads each one whole exactly once.
+#[tokio::test]
+async fn unindexed_objects_the_scan_skips_are_read_whole_once() {
+    let o = run(&Config {
+        pads: vec![BIG; OBJECTS],
+        target_partitions: 4,
+        threshold: 256 * KIB,
+        break_even: 2048 * KIB,
+        key_indexed: false,
+    })
+    .await;
+    assert_eq!(o.ids(), ["o0r050"]);
+    assert_eq!(o.pruned(), 0, "{}", o.response);
+    let phases: Vec<Vec<GetPhase>> = o.objects.iter().map(Object::whole_read_phases).collect();
+    assert_eq!(phases, vec![vec![GetPhase::Scan]; OBJECTS]);
 }
