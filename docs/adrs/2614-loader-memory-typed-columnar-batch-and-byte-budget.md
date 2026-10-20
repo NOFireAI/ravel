@@ -617,8 +617,8 @@ unchanged" on every signal:
   x est_bytes_per_row`, with the estimate taken from the shard buffer's own
   size-trigger ruler so the trigger fires at about 250,000 rows;
 - `--pipeline-depth` defaults to `ceil(DEFAULT_OBJECT_ROWS x shards /
-  batch_rows)`, so the size trigger fires as the last in-flight batch lands,
-  bounded above by `--load-memory-bytes / (batch_rows x est_bytes_per_row)`;
+  batch_rows)`, so the size trigger fires as the last in-flight batch lands
+  (superseded: see the depth margin amendment below), bounded above by `--load-memory-bytes / (batch_rows x est_bytes_per_row)`;
   when the memory bound binds, objects close smaller and the report says so;
 - the default `--max-flush-delay` is 60 s;
 - the flush-trigger mix and the no-effect warning go on every signal's
@@ -632,3 +632,23 @@ rule that the target counts uncompressed content stands and is what the
 derived target is measured against. The ClickBench entry's recipe (the
 acceptance amendment's R5) is unaffected: an explicit `--target-bytes` wins
 over the derived default.
+
+## Amendment (2026-10-20): the derived depth runs a quarter past the rows bound (issue #3119)
+
+<!-- amendment-applies: sections="Amendment (2026-10-10): the default object size changes for every signal (ADR-2707 decision 9)" pointer="depth margin amendment" -->
+<!-- amendment-supersedes: phrase="so the size trigger fires as the last in-flight batch lands" pointer="depth margin amendment" -->
+
+The amendment above restates ADR-2707 decision 9's depth as
+`ceil(DEFAULT_OBJECT_ROWS x shards / batch_rows)`. A window of exactly
+that many batches holds one target per shard on average, so every shard
+that drew less than its share was still short of the target when the
+depth flush closed it, and the size trigger did not fire as that
+sentence said on about half the shards. ADR-2707's depth margin
+amendment (issue #3119) replaces it: while the depth flush runs (a
+derived target), the derived depth is that rows bound plus a quarter of
+it, rounded up, still lowered to the memory bound and capped at 1,024;
+with an explicit `--target-bytes` the depth flush is off and the derived
+depth stays the plain rows bound. ADR-2707's amendment carries the
+measurements and the object sizes the margin gives.
+
+Refs: #3119

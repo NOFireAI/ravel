@@ -591,14 +591,16 @@ enum Command {
         /// submitting the next, so that round-trip latency is serial. Raising
         /// the depth lets up to this many writes overlap. Unset, the depth is
         /// derived once the first batch is decoded (issue #2753): the rows
-        /// bound `ceil(250,000 x --shards / --batch-rows)` plus a quarter of
-        /// it, rounded up (issue #3119), lowered to the memory bound
+        /// bound `ceil(250,000 x --shards / --batch-rows)`, plus a quarter of
+        /// it, rounded up, while the depth flush below runs (issue #3119),
+        /// lowered to the memory bound
         /// `--load-memory-bytes` divided by the estimated object bytes of one
         /// batch when that is smaller, never below 1, and capped at 1,024. With `--target-bytes` unset the loader also flushes every
         /// shard once the oldest batch pending on any shard is this many
         /// submitted batches old (a size flush restarts only its own shard's
-        /// window); an explicit `--target-bytes` turns that depth flush off.
-        /// The durable-token list a failed load reports
+        /// window); an explicit `--target-bytes` turns that depth flush off,
+        /// and with it the quarter, so the derived depth is the plain rows
+        /// bound. The durable-token list a failed load reports
         /// is exactly what landed at any depth. `0` is rejected.
         ///
         /// At the defaults (4 shards, 10,000-row batches) the rows bound is
@@ -688,9 +690,10 @@ enum Command {
         /// #801). Unset, the target is derived once the first batch is
         /// decoded (issue #2753): `DEFAULT_OBJECT_ROWS` (250,000) times that
         /// batch's estimated bytes per row, so the size trigger fires at
-        /// about 250,000 rows on every signal, and the depth flush closes a
-        /// shard whose rows came out narrower once its oldest pending batch
-        /// is `--pipeline-depth` batches old. An explicit value is used as given and turns the depth
+        /// about 250,000 rows on every signal, and the depth flush closes
+        /// every shard once the oldest batch pending on any shard is
+        /// `--pipeline-depth` batches old, which closes a shard whose rows
+        /// came out narrower than the first batch's. An explicit value is used as given and turns the depth
         /// flush off. Stored objects come out much smaller than the target.
         /// `0` is rejected.
         ///

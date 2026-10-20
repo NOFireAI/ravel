@@ -2312,6 +2312,9 @@ mod default_geometry {
 
     const BATCH_ROWS: usize = 10_000;
     const BATCHES: usize = 51;
+    /// Batches in the over-estimate test: two full windows of the derived
+    /// depth 32 and a remainder, so the window restarts after a depth flush.
+    const OVER_ESTIMATE_BATCHES: usize = 70;
     const HOST_BYTES: u64 = 64 << 30;
 
     /// `batches` row groups of `batch_rows` spans with fixed-width ids and
@@ -2753,8 +2756,9 @@ mod default_geometry {
     /// the later batches, whose names are 2 bytes, so the derived target
     /// (250,000 first-batch spans) is never reached: the largest window, the
     /// first batch plus 31 small ones, estimates below 25 first batches. The
-    /// depth flush closes each window of 32 batches: `51 / 32` depth flushes
-    /// and one end-of-input flush for the remainder.
+    /// depth flush closes each window of 32 batches: with 70 batches, two
+    /// depth flushes (batches 1-32 and 33-64) and one end-of-input flush for
+    /// the remaining 6.
     ///
     /// Prove-the-test: never call `window.submitted` in the spans loader
     /// (the `if window.submitted(observed)` in `load_spans_into`) and nothing
@@ -2764,7 +2768,7 @@ mod default_geometry {
     #[tokio::test]
     async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
         let fat = "x".repeat(400);
-        let (_dir, pq) = row_fixture(BATCH_ROWS, BATCHES, |g, r| {
+        let (_dir, pq) = row_fixture(BATCH_ROWS, OVER_ESTIMATE_BATCHES, |g, r| {
             let name = if g == 0 {
                 fat.clone()
             } else {
@@ -2784,26 +2788,23 @@ mod default_geometry {
         )
         .await;
 
-        assert_eq!(report.rows_processed, (BATCH_ROWS * BATCHES) as u64);
+        assert_eq!(
+            report.rows_processed,
+            (BATCH_ROWS * OVER_ESTIMATE_BATCHES) as u64
+        );
         let layout = report.layout_report();
         let geometry = layout.geometry.expect("geometry resolved");
         assert_eq!(geometry.target_source, TargetSource::Derived);
-        let depth = geometry.pipeline_depth;
-        assert_eq!(depth, 32);
-        let depth_flushes = (BATCHES / depth) as u64;
-        let manual = u64::from(!BATCHES.is_multiple_of(depth));
-        assert_eq!(
-            span_objects(store.as_ref()).await as u64,
-            depth_flushes + manual
-        );
+        assert_eq!(geometry.pipeline_depth, 32);
+        assert_eq!(span_objects(store.as_ref()).await, 3);
         assert_eq!(
             layout.flush_mix.totals,
             FlushMixCounts {
                 size: 0,
                 age: 0,
                 arrival: 0,
-                depth: depth_flushes,
-                manual,
+                depth: 2,
+                manual: 1,
             },
             "no size flush is reachable, so the depth flush closes every full window"
         );
