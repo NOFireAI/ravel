@@ -107,9 +107,8 @@ impl PartitionCtx {
     /// statement takes the same route and exactly one of the two recorders can
     /// fire for a given object.
     ///
-    /// On the planned route a segment at or under
-    /// [`LogSegmentFetcher::plan_whole_object_bound`] in a scan that
-    /// [`skips_sub_bound_plans`] is not planned (ADR-2677 decision 2):
+    /// On the planned route a segment [`may_skip_plan`] accepts in a scan
+    /// that [`skips_sub_bound_plans`] is not planned (ADR-2677 decision 2):
     /// [`compute_plan_counts`] never calls `plan_segment` for it,
     /// so the fetch-layer recorder cannot fire, and [`owned_work`] gives it to
     /// exactly one partition, whose open records the touch here instead.

@@ -1,10 +1,25 @@
-//! Issue #3117 diagnosis repro (temporary, not for commit): which logs objects
-//! a declared-i64 equality reaches without the KEY_IDX probe.
+//! A logs equality on a key-indexed declared column, served over
+//! `POST /api/v1/sql`, probes the KEY_IDX section of every object above the
+//! fetcher's block-range threshold, whatever the projection break-even
+//! (ADR-2707 decision 5, issue #3117). Under the break-even the object would
+//! otherwise be read whole with no probe, either opened unplanned (ADR-2677
+//! decision 2, when the scan holds at least `target_partitions` such
+//! objects) or planned without its key. An object at or under the threshold
+//! is still read whole and not probed.
+//!
+//! The fixture is 24 RLOG objects of eight 16-record blocks, every record
+//! carrying a distinct `user_id`; only record 50 of object 0 holds the target.
+//! Object size is set by a random pad in each body: about 274 KB for a small
+//! object and about 900 KB for a big one. The expected KEY_IDX reads of each
+//! object are computed from its bytes with
+//! `ravel_logseg::key_index::probe_ranged`, independently of the fetcher, and
+//! compared with what the store served.
 
 #![cfg(feature = "sql")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,9 +32,10 @@ use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
-use ravel_logseg::key_index::KeyType;
+use ravel_logseg::footer::kind;
+use ravel_logseg::key_index::{KeyType, key8_i64, probe_ranged};
 use ravel_logseg::writer::ObjectIdentity;
-use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
+use ravel_logseg::{AttrValue, LogRecord, LogSegError, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
     Capabilities, DelimitedList, GetOutcome, GetRange, ListPage, ObjectMeta, ObjectStoreBackend,
@@ -44,8 +60,19 @@ const TOKEN: &str = "acme-token";
 const RECORDS_PER_BLOCK: usize = 16;
 const BLOCKS: usize = 8;
 const RECORDS: usize = RECORDS_PER_BLOCK * BLOCKS;
+const OBJECTS: usize = 24;
 const TARGET: i64 = 435_090_932_899_640_449;
 const HOLDER: usize = 0;
+/// Pad bytes per record of a big object (about 900 KB) and a small one
+/// (about 274 KB), hex-encoded into the body at twice the length.
+const BIG: usize = 6 * 1024;
+const SMALL: usize = 2 * 1024;
+const KIB: u64 = 1024;
+const SQL: &str = "SELECT substr(body, 1, 6) AS id FROM logs WHERE user_id = 435090932899640449";
+/// The KEY_IDX reads of probing all 24 objects for `TARGET`: one prefix read
+/// per object, plus one bucket read for each of the 13 objects whose bucket
+/// for `TARGET` is not empty (the KEY_IDX content is the same at either pad).
+const ALL_OBJECTS_KEY_READS: u64 = 24 + 13;
 
 struct FixedClock;
 impl Clock for FixedClock {
@@ -133,28 +160,110 @@ fn record_of(object: usize, i: usize, pad_bytes: usize) -> LogRecord {
     }
 }
 
+/// Pads with object 0 (the holder) big, objects `1..=small` small, the rest
+/// big.
+fn mixed(small: usize) -> Vec<usize> {
+    (0..OBJECTS)
+        .map(|i| if (1..=small).contains(&i) { SMALL } else { BIG })
+        .collect()
+}
+
 struct Config {
-    label: &'static str,
-    /// Per object, the random pad per record (object size knob).
+    /// Per object, the random pad per record (the object size knob).
     pads: Vec<usize>,
     target_partitions: usize,
-    /// `with_projection_break_even_bytes` (moves `plan_whole_object_bound`).
-    break_even: Option<u64>,
+    /// `with_block_range_threshold`.
+    threshold: u64,
+    /// `with_projection_break_even_bytes`, which moves
+    /// `plan_whole_object_bound` above the threshold.
+    break_even: u64,
+}
+
+struct Object {
+    bytes: Bytes,
+    gets: Vec<GetRange>,
+}
+
+impl Object {
+    fn size(&self) -> u64 {
+        self.bytes.len() as u64
+    }
+
+    /// The GETs this object served that lie inside its KEY_IDX section.
+    fn key_idx_gets(&self) -> Vec<GetRange> {
+        let footer = ravel_logseg::footer::open(&self.bytes).expect("footer");
+        let desc = footer.section(kind::KEY_IDX).expect("KEY_IDX");
+        self.gets
+            .iter()
+            .filter(|g| {
+                let r = span(g, self.size());
+                desc.offset <= r.start && r.end <= desc.offset + desc.len
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The KEY_IDX reads a probe for `TARGET` issues on this object,
+    /// recomputed from the format crate.
+    fn expected_key_reads(&self) -> Vec<GetRange> {
+        let footer = ravel_logseg::footer::open(&self.bytes).expect("footer");
+        let mut reads = Vec::new();
+        probe_ranged(
+            &footer,
+            "user_id",
+            KeyType::I64,
+            &key8_i64(TARGET),
+            |r: Range<u64>| {
+                reads.push(GetRange::Range(r.start, r.end));
+                Ok::<_, LogSegError>(self.bytes.slice(r.start as usize..r.end as usize))
+            },
+        )
+        .expect("probe");
+        reads
+    }
+
+    fn read_whole(&self) -> bool {
+        self.gets.iter().any(|g| matches!(g, GetRange::Full))
+    }
+}
+
+fn span(get: &GetRange, size: u64) -> Range<u64> {
+    match *get {
+        GetRange::Full => 0..size,
+        GetRange::Range(start, end) => start..end,
+        GetRange::Suffix(n) => size.saturating_sub(n)..size,
+    }
 }
 
 struct Outcome {
-    sizes: Vec<u64>,
-    bound: u64,
-    rows: usize,
-    pruned: u64,
-    key_gets: u64,
-    plan_gets: u64,
-    scan_gets: u64,
-    scan_wire: u64,
-    blocks_scanned: u64,
-    probed_objects: usize,
-    whole_read_objects: usize,
-    pruning: Value,
+    response: Value,
+    objects: Vec<Object>,
+}
+
+impl Outcome {
+    fn ids(&self) -> Vec<String> {
+        self.response["data"]["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no rows in {}", self.response))
+            .iter()
+            .map(|row| row[0].as_str().expect("string cell").to_string())
+            .collect()
+    }
+
+    fn pruned(&self) -> u64 {
+        self.response["stats"]["pruning"]["segmentsPrunedByKeyIndex"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no segmentsPrunedByKeyIndex in {}", self.response))
+    }
+
+    fn key_index_gets(&self) -> u64 {
+        self.response["stats"]["phases"]
+            .as_array()
+            .expect("phases")
+            .iter()
+            .find(|p| p["phase"] == "keyIndex")
+            .map_or(0, |p| p["s3GetRequests"].as_u64().expect("u64"))
+    }
 }
 
 async fn run(cfg: &Config) -> Outcome {
@@ -164,8 +273,7 @@ async fn run(cfg: &Config) -> Outcome {
     });
     let store: Arc<dyn ObjectStoreBackend> = recorder.clone();
     let tenant_hash = tenant().hash();
-    let mut sizes = Vec::new();
-    let mut objs: Vec<(String, u64, Option<std::ops::Range<u64>>)> = Vec::new();
+    let mut published: Vec<(String, Bytes)> = Vec::new();
     for (seq, pad) in cfg.pads.iter().enumerate() {
         let writer_id = Uuid::from_u128(3_117_000 + seq as u128);
         let mut writer = RlogWriter::new(
@@ -188,7 +296,7 @@ async fn run(cfg: &Config) -> Outcome {
         for r in records {
             writer.push(r).expect("push");
         }
-        let bytes = writer.finish().expect("finish");
+        let bytes = Bytes::from(writer.finish().expect("finish"));
         let rec = record::build(NewCommitRecord {
             tenant_hash,
             signal: Signal::Logs,
@@ -210,29 +318,29 @@ async fn run(cfg: &Config) -> Outcome {
         })
         .expect("record");
         let key = keys::reconstruct_data_key(&rec).expect("key");
-        let footer = ravel_logseg::footer::open(&bytes).expect("footer");
-        let key_idx = footer
-            .section(ravel_logseg::footer::kind::KEY_IDX)
-            .map(|d| d.offset..d.offset + d.len);
-        sizes.push(bytes.len() as u64);
-        objs.push((key.clone(), bytes.len() as u64, key_idx));
         recorder
-            .put(&key, Bytes::from(bytes), PutOptions::default())
+            .put(&key, bytes.clone(), PutOptions::default())
             .await
             .expect("put");
         publish::publish(recorder.as_ref(), &rec, &RetryPolicy::default())
             .await
             .expect("publish");
+        published.push((key, bytes));
     }
 
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
+    // A 1 KiB tail probe (KEY_IDX, right after BLOCKS, is never inside it) and
+    // a request cost low enough that every wanted extent is its own GET.
     let logs = LogSegmentFetcher::new(store.clone())
         .with_suffix_len(1024)
         .with_request_cost_bytes(1)
-        .with_block_range_threshold(0)
-        .with_projection_break_even_bytes(cfg.break_even);
-    let bound = logs.plan_whole_object_bound();
+        .with_block_range_threshold(cfg.threshold)
+        .with_projection_break_even_bytes(Some(cfg.break_even));
+    assert_eq!(
+        logs.plan_whole_object_bound(),
+        cfg.break_even.max(cfg.threshold)
+    );
     let sql_config = SqlConfig {
         engine: EngineConfig {
             sql_partition_count: Some(cfg.target_partitions),
@@ -273,9 +381,8 @@ async fn run(cfg: &Config) -> Outcome {
     });
 
     recorder.gets.lock().expect("log").clear();
-    let sql = format!("SELECT user_id FROM logs WHERE user_id = {TARGET}");
     let payload = serde_json::json!({
-        "query": sql,
+        "query": SQL,
         "start": 0.0,
         "end": NOW_NS as f64 / 1_000_000_000.0,
         "timeout": 60.0,
@@ -293,167 +400,157 @@ async fn run(cfg: &Config) -> Outcome {
     let body = axum::body::to_bytes(response.into_body(), usize::MAX)
         .await
         .expect("body");
-    let v: Value = serde_json::from_slice(&body).expect("json");
-    assert_eq!(v["status"], "success", "{v}");
+    let response: Value = serde_json::from_slice(&body).expect("json");
+    assert_eq!(response["status"], "success", "{response}");
 
-    // An object counts as probed when any GET it served overlaps KEY_IDX.
     let gets = recorder.gets.lock().expect("log").clone();
-    let probed_objects = objs
-        .iter()
-        .filter(|(key, size, key_idx)| {
-            let Some(k) = key_idx else { return false };
-            gets.iter().filter(|(g, _)| g == key).any(|(_, r)| {
-                let (s, e) = match *r {
-                    GetRange::Full => (0, *size),
-                    GetRange::Range(s, e) => (s, e),
-                    GetRange::Suffix(n) => (size.saturating_sub(n), *size),
-                };
-                // A whole-object read covers KEY_IDX without probing it.
-                !matches!(r, GetRange::Full) && s < k.end && k.start < e && e - s < *size
-            })
+    let objects = published
+        .into_iter()
+        .map(|(key, bytes)| Object {
+            gets: gets
+                .iter()
+                .filter(|(k, _)| *k == key)
+                .map(|(_, r)| *r)
+                .collect(),
+            bytes,
         })
-        .count();
-    let whole_read_objects = objs
-        .iter()
-        .filter(|(key, _, _)| {
-            gets.iter()
-                .any(|(g, r)| g == key && matches!(r, GetRange::Full))
-        })
-        .count();
-    let phase = |name: &str, field: &str| -> u64 {
-        v["stats"]["phases"]
-            .as_array()
-            .expect("phases")
-            .iter()
-            .find(|p| p["phase"] == name)
-            .map_or(0, |p| p[field].as_u64().unwrap_or(0))
-    };
-    let pruning = v["stats"]["pruning"].clone();
-    Outcome {
-        sizes,
-        bound,
-        rows: v["data"]["rows"].as_array().map_or(0, Vec::len),
-        pruned: pruning["segmentsPrunedByKeyIndex"].as_u64().unwrap_or(0),
-        key_gets: phase("keyIndex", "s3GetRequests"),
-        plan_gets: phase("plan", "s3GetRequests"),
-        scan_gets: phase("scan", "s3GetRequests"),
-        scan_wire: phase("scan", "s3GetWireBytes"),
-        blocks_scanned: pruning["blocksScanned"].as_u64().unwrap_or(0),
-        probed_objects,
-        whole_read_objects,
-        pruning,
-    }
+        .collect();
+    Outcome { response, objects }
 }
 
-const BIG: usize = 6 * 1024;
-const SMALL: usize = 2 * 1024;
-
-#[tokio::test]
-async fn t3117_which_objects_skip_the_key_probe() {
-    let n = 24usize;
-    let mixed = |small: usize| -> Vec<usize> {
-        // The holder (object 0) is always big; `small` of the rest are small.
-        (0..n)
-            .map(|i| if i >= 1 && i <= small { SMALL } else { BIG })
-            .collect()
-    };
-    let configs = vec![
-        Config {
-            label: "A all-big tp4",
-            pads: vec![BIG; n],
-            target_partitions: 4,
-            break_even: None,
-        },
-        Config {
-            label: "B all-big tp16",
-            pads: vec![BIG; n],
-            target_partitions: 16,
-            break_even: None,
-        },
-        Config {
-            label: "C mixed16small tp4",
-            pads: mixed(16),
-            target_partitions: 4,
-            break_even: Some(512 << 10),
-        },
-        Config {
-            label: "D mixed16small tp16",
-            pads: mixed(16),
-            target_partitions: 16,
-            break_even: Some(512 << 10),
-        },
-        Config {
-            label: "E mixed16small tp32",
-            pads: mixed(16),
-            target_partitions: 32,
-            break_even: Some(512 << 10),
-        },
-        Config {
-            label: "F mixed5small tp16",
-            pads: mixed(5),
-            target_partitions: 16,
-            break_even: Some(512 << 10),
-        },
-        Config {
-            label: "G all-big bound2MB tp4",
-            pads: vec![BIG; n],
-            target_partitions: 4,
-            break_even: Some(2 << 20),
-        },
-        Config {
-            label: "H all-big bound2MB tp32",
-            pads: vec![BIG; n],
-            target_partitions: 32,
-            break_even: Some(2 << 20),
-        },
-        Config {
-            label: "I mixed16small tp2",
-            pads: mixed(16),
-            target_partitions: 2,
-            break_even: Some(512 << 10),
-        },
-        Config {
-            label: "J mixed16small b0 tp4",
-            pads: mixed(16),
-            target_partitions: 4,
-            break_even: Some(0),
-        },
-    ];
-    let mut failures = Vec::new();
-    for cfg in &configs {
-        let o = run(cfg).await;
-        let above = o.sizes.iter().filter(|&&s| s > o.bound).count();
-        println!(
-            "{:<26} objects={} bound={} above_bound={} min_size={} max_size={} rows={} \
-             probed={} segmentsPrunedByKeyIndex={} unprobed={} keyIndexGETs={} planGETs={} \
-             scanGETs={} scanWire={} blocksScanned={} wholeReadObjects={}",
-            cfg.label,
-            o.sizes.len(),
-            o.bound,
-            above,
-            o.sizes.iter().min().unwrap(),
-            o.sizes.iter().max().unwrap(),
-            o.rows,
-            o.probed_objects,
-            o.pruned,
-            o.sizes.len() - o.probed_objects,
-            o.key_gets,
-            o.plan_gets,
-            o.scan_gets,
-            o.scan_wire,
-            o.blocks_scanned,
-            o.whole_read_objects,
-        );
-        println!("    pruning={}", o.pruning);
-        assert_eq!(o.rows, 1, "{}", cfg.label);
-        if o.pruned != (o.sizes.len() - 1) as u64 {
-            failures.push(format!(
-                "{}: segmentsPrunedByKeyIndex {} != objects - 1 = {}",
-                cfg.label,
-                o.pruned,
-                o.sizes.len() - 1
-            ));
+/// Every object's KEY_IDX is probed: the holder's row is returned, every
+/// other object is pruned by the probe, each object's KEY_IDX reads are the
+/// format's, no object but the holder is read whole, and the keyIndex phase
+/// counts exactly the probe reads of all 24 objects.
+fn assert_every_object_probed(o: &Outcome) {
+    assert_eq!(o.ids(), ["o0r050"]);
+    assert_eq!(o.pruned(), (OBJECTS - 1) as u64, "{}", o.response);
+    let mut per_object = Vec::new();
+    for (n, object) in o.objects.iter().enumerate() {
+        let want = object.expected_key_reads();
+        assert_eq!(object.key_idx_gets(), want, "object {n}");
+        per_object.push(want.len() as u64);
+        if n != HOLDER {
+            assert!(!object.read_whole(), "object {n}: {:?}", object.gets);
         }
     }
-    assert!(failures.is_empty(), "{failures:#?}");
+    assert_eq!(per_object.iter().filter(|&&r| r >= 1).count(), 24);
+    assert_eq!(per_object.iter().filter(|&&r| r == 2).count(), 13);
+    assert_eq!(per_object.iter().sum::<u64>(), ALL_OBJECTS_KEY_READS);
+    assert_eq!(o.key_index_gets(), ALL_OBJECTS_KEY_READS);
+}
+
+/// 16 small objects sit between a 256 KiB threshold and a 512 KiB
+/// break-even, at least `target_partitions` of them, so the scan would open
+/// them unplanned (ADR-2677 decision 2). They are probed and pruned.
+///
+/// FLIP: with only `plan_segment_keyed`'s gate fixed (`may_skip_plan`
+/// reduced to `!ctx.fetcher.plans_segment(seg)`) the pruned count reads
+/// `left: 7, right: 23`.
+#[tokio::test]
+async fn sub_break_even_objects_left_unplanned_are_probed() {
+    let o = run(&Config {
+        pads: mixed(16),
+        target_partitions: 4,
+        threshold: 256 * KIB,
+        break_even: 512 * KIB,
+    })
+    .await;
+    for (n, object) in o.objects.iter().enumerate() {
+        let small = (1..=16).contains(&n);
+        assert_eq!(
+            256 * KIB < object.size() && object.size() <= 512 * KIB,
+            small,
+            "object {n}: {} bytes",
+            object.size()
+        );
+    }
+    assert_every_object_probed(&o);
+}
+
+/// The same objects with more partitions than small objects: the scan plans
+/// every one, and the plan of a sub-break-even object probes it rather than
+/// reading it whole without its key.
+///
+/// FLIP: with only `may_skip_plan` fixed (`plan_segment_keyed` gating on
+/// `plan_whole_object_bound()`) the pruned count reads `left: 7, right: 23`.
+#[tokio::test]
+async fn sub_break_even_objects_the_scan_plans_are_probed() {
+    let o = run(&Config {
+        pads: mixed(16),
+        target_partitions: 32,
+        threshold: 256 * KIB,
+        break_even: 512 * KIB,
+    })
+    .await;
+    assert_every_object_probed(&o);
+}
+
+/// Every object under a 2 MiB break-even, including the holder: all are
+/// probed, and only the holder, where the key is present, is read whole.
+///
+/// FLIP: against the dispatch ref the pruned count reads `left: 0, right: 23`.
+#[tokio::test]
+async fn every_object_under_a_larger_break_even_is_probed() {
+    let o = run(&Config {
+        pads: vec![BIG; OBJECTS],
+        target_partitions: 4,
+        threshold: 256 * KIB,
+        break_even: 2048 * KIB,
+    })
+    .await;
+    for object in &o.objects {
+        assert!(512 * KIB < object.size() && object.size() <= 2048 * KIB);
+    }
+    assert_every_object_probed(&o);
+    assert!(o.objects[HOLDER].read_whole());
+}
+
+/// At or under the block-range threshold an object is read whole, in one
+/// GET, and never probed: one small GET is cheaper than the probe. The big
+/// objects above it, under the break-even, are still probed. Both scan
+/// routes: `target_partitions` 4 opens the 16 small objects unplanned, 32
+/// plans them.
+///
+/// FLIP: dropping the size gate (`plan_segment_keyed` probing whatever the
+/// size, and `may_skip_plan` refusing every keyed segment) reads
+/// `left: 23, right: 7` on the pruned count.
+#[tokio::test]
+async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
+    for target_partitions in [4, 32] {
+        let o = run(&Config {
+            pads: mixed(16),
+            target_partitions,
+            threshold: 512 * KIB,
+            break_even: 2048 * KIB,
+        })
+        .await;
+        assert_eq!(o.ids(), ["o0r050"], "tp {target_partitions}");
+        assert_eq!(o.pruned(), 7, "tp {target_partitions}: {}", o.response);
+        let mut per_object = Vec::new();
+        for (n, object) in o.objects.iter().enumerate() {
+            if (1..=16).contains(&n) {
+                assert!(object.size() <= 512 * KIB, "object {n}");
+                assert_eq!(
+                    object.gets,
+                    [GetRange::Full],
+                    "tp {target_partitions} object {n}"
+                );
+            } else {
+                assert!(object.size() > 512 * KIB, "object {n}");
+                let want = object.expected_key_reads();
+                assert_eq!(
+                    object.key_idx_gets(),
+                    want,
+                    "tp {target_partitions} object {n}"
+                );
+                per_object.push(want.len() as u64);
+            }
+        }
+        // The 8 big objects: one prefix read each, and a bucket read on 6.
+        let tp = target_partitions;
+        assert_eq!(per_object.iter().filter(|&&r| r >= 1).count(), 8, "tp {tp}");
+        assert_eq!(per_object.iter().filter(|&&r| r == 2).count(), 6, "tp {tp}");
+        assert_eq!(o.key_index_gets(), 8 + 6, "tp {tp}");
+    }
 }
