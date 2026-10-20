@@ -43,13 +43,15 @@
 //! planned when the scan holds at least `target_partitions` such segments
 //! relevant to the query window (ADR-2677 decision 2,
 //! [`LogSegmentFetcher::plans_segment`], [`skips_sub_bound_plans`]): the plan
-//! pass issues no read for it, [`owned_work`] gives it whole to one partition,
-//! and that partition opens it with one whole-object read and prunes blocks
-//! from the directory that read already holds. With fewer such segments, every
-//! segment takes the plan-then-stripe route described here. For a query with
-//! KEY_IDX equalities (ADR-2707) "such segments" are only those also at or
-//! under the block-range threshold ([`may_skip_plan`]): every larger one is
-//! planned, so its KEY_IDX is probed whatever the projection break-even.
+//! pass issues no read for it beyond the KEY_IDX probe below, [`owned_work`]
+//! gives it whole to one partition, and that partition opens it with one
+//! whole-object read and prunes blocks from the directory that read already
+//! holds. With fewer such segments, every segment takes the plan-then-stripe
+//! route described here. For a query with KEY_IDX equalities (ADR-2707) the
+//! plan pass probes the KEY_IDX of each such segment above the block-range
+//! threshold ([`LogSegmentFetcher::probe_segment_keyed`]), whatever the
+//! projection break-even: an absent key drops it with no block read, and any
+//! other answer leaves it to that one whole-object read.
 //!
 //! # Object-store request count, and the cache gate
 //!
@@ -1771,6 +1773,12 @@ impl LogsScanExec {
     pub(crate) fn with_key_equals(mut self, key_equals: Arc<Vec<KeyEquals>>) -> Self {
         self.key_equals = key_equals;
         self
+    }
+
+    /// Whether this scan carries exact-key equalities, so its plan pass probes
+    /// KEY_IDX ([`Self::with_key_equals`]).
+    pub(crate) fn has_key_equals(&self) -> bool {
+        !self.key_equals.is_empty()
     }
 
     /// Carry a pushed `fetch` (issue #362) across a rebuild that otherwise
