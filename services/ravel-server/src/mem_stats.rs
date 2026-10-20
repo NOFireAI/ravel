@@ -13,6 +13,9 @@
 //! `"unavailable"` with an info line rather than stamping `"server"` and
 //! warning as if a write had failed (#2966).
 
+#[cfg(not(target_env = "msvc"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// The three jemalloc-native figures (`stats.allocated`/`active`/`resident`)
 /// on a build where jemalloc is the global allocator, or an explicit marker
 /// naming whichever allocator this process actually uses instead. There is
@@ -38,10 +41,23 @@ pub enum AllocatorStats {
 /// `#[global_allocator]` to jemalloc, so this is a real mallctl read of the
 /// process's own allocator at call time, not a cached or startup-time
 /// snapshot: `epoch::advance` refreshes jemalloc's cached stats immediately
-/// before each read.
+/// before each read. `background_thread` is `false` whatever jemalloc reports
+/// once [`configure_background_thread`] has failed to start the thread.
 #[cfg(not(target_env = "msvc"))]
 pub fn read() -> AllocatorStats {
-    use tikv_jemalloc_ctl::{background_thread, epoch, stats};
+    read_with(
+        &BACKGROUND_THREAD_START_FAILED,
+        tikv_jemalloc_ctl::background_thread::read,
+    )
+}
+
+/// [`read`] over an injected start-failed flag and `background_thread` read.
+#[cfg(not(target_env = "msvc"))]
+fn read_with(
+    start_failed: &AtomicBool,
+    background_thread: impl FnOnce() -> tikv_jemalloc_ctl::Result<bool>,
+) -> AllocatorStats {
+    use tikv_jemalloc_ctl::{epoch, stats};
 
     // A refresh or read failure here is a diagnostic-path degradation, not a
     // correctness path: fall back to 0 for that one figure rather than
@@ -53,9 +69,20 @@ pub fn read() -> AllocatorStats {
         allocated: stats::allocated::read().unwrap_or(0) as u64,
         active: stats::active::read().unwrap_or(0) as u64,
         resident: stats::resident::read().unwrap_or(0) as u64,
-        background_thread: background_thread::read().unwrap_or(false),
+        background_thread: !start_failed.load(Ordering::Relaxed)
+            && background_thread().unwrap_or(false),
     }
 }
+
+/// Set by the startup step when its write to start the background thread
+/// failed. jemalloc's own enabled flag stays set in that case although no
+/// thread runs, so [`read`] reports this instead.
+#[cfg(not(target_env = "msvc"))]
+static BACKGROUND_THREAD_START_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// The [`BackgroundThread::source`] of a failed start.
+#[cfg(not(target_env = "msvc"))]
+const START_FAILED: &str = "start-failed";
 
 /// msvc has no jemalloc global allocator (`tikv-jemallocator`'s own
 /// documented unsupported target, `main.rs`'s `#[global_allocator]` is
@@ -73,13 +100,16 @@ pub const MALLOC_CONF_ENV: &str = "_RJEM_MALLOC_CONF";
 /// The state of jemalloc's background purge thread after the startup step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackgroundThread {
-    /// Read back from the allocator after the step, not the value written.
+    /// Read back from the allocator after the step, not the value written,
+    /// except after a failed start, which is always `false`.
     pub enabled: bool,
     /// Who decided the state: `"server"` when the startup step enabled it,
     /// `"malloc_conf"` when the operator's [`MALLOC_CONF_ENV`] names
     /// `background_thread` and the step left it alone, `"unavailable"` when
     /// this jemalloc build has no background-thread support (macOS),
-    /// `"not-jemalloc"` when this process does not run under jemalloc.
+    /// `"start-failed"` when the step's write to start the thread failed
+    /// (usually because the host refused to create it), `"not-jemalloc"` when
+    /// this process does not run under jemalloc.
     pub source: &'static str,
 }
 
@@ -143,23 +173,46 @@ fn mallctl_name_is_unknown(err: tikv_jemalloc_ctl::Error) -> bool {
 /// [`MALLOC_CONF_ENV`] value: when it names `background_thread`, either way,
 /// this writes nothing, because the safe API cannot tell an explicit
 /// `background_thread:false` from jemalloc's default of false. A failed write
-/// is a warning, never a startup failure. A jemalloc build without
-/// background-thread support (macOS) is not a failure: it stamps
-/// `"unavailable"` with an info line.
+/// is a warning, never a startup failure: it stamps `"start-failed"` and
+/// makes [`read`] report the thread as not running for the rest of the
+/// process. A jemalloc build without background-thread support (macOS) is
+/// not a failure: it stamps `"unavailable"` with an info line.
 #[cfg(not(target_env = "msvc"))]
 pub fn configure_background_thread(malloc_conf: Option<&str>) -> BackgroundThread {
     use tikv_jemalloc_ctl::background_thread;
 
-    resolve_background_thread(
+    configure_with(
+        &BACKGROUND_THREAD_START_FAILED,
         malloc_conf.is_some_and(malloc_conf_names_background_thread),
         || background_thread::write(true),
         background_thread::read,
     )
 }
 
+/// [`configure_background_thread`] over an injected start-failed flag, which
+/// it sets when the start failed.
+#[cfg(not(target_env = "msvc"))]
+fn configure_with(
+    start_failed: &AtomicBool,
+    operator_set: bool,
+    write: impl FnOnce() -> tikv_jemalloc_ctl::Result<()>,
+    read: impl FnOnce() -> tikv_jemalloc_ctl::Result<bool>,
+) -> BackgroundThread {
+    let state = resolve_background_thread(operator_set, write, read);
+    if state.source == START_FAILED {
+        start_failed.store(true, Ordering::Relaxed);
+    }
+    state
+}
+
 /// The startup step's decision over injected `write` and `read` mallctl
 /// calls. `operator_set` skips the write. An unavailable write returns
-/// without calling `read`, which would answer the same way.
+/// without calling `read`, which would answer the same way. Any failed write,
+/// not only EFAULT, returns `"start-failed"` without calling `read`: in the
+/// vendored jemalloc 5.3.1, `background_thread_ctl` sets the enabled flag
+/// before it creates the thread and returns EFAULT with the flag still set
+/// when creation fails, and its other failures (EAGAIN from initialisation,
+/// EINVAL for a wrong value size) return before any thread is created.
 #[cfg(not(target_env = "msvc"))]
 fn resolve_background_thread(
     operator_set: bool,
@@ -175,9 +228,14 @@ fn resolve_background_thread(
             Mallctl::Failed(err) => {
                 tracing::warn!(
                     error = %err,
-                    "could not enable the jemalloc background purge thread; freed pages are \
-                     returned to the operating system only on allocator activity"
+                    "could not start the jemalloc background purge thread; reporting it as not \
+                     running, and freed pages are returned to the operating system only on \
+                     allocator activity"
                 );
+                return BackgroundThread {
+                    enabled: false,
+                    source: START_FAILED,
+                };
             }
         }
         "server"
@@ -439,6 +497,26 @@ mod tests {
             .expect_err("config.debug is read-only")
     }
 
+    /// The EFAULT `background_thread::write(true)` returns when jemalloc
+    /// cannot create the thread. `arena.<narenas>.extent_hooks` names the
+    /// index one past the last arena, which the name lookup accepts and the
+    /// mallctl itself answers with EFAULT.
+    #[cfg(not(target_env = "msvc"))]
+    fn efault() -> tikv_jemalloc_ctl::Error {
+        use tikv_jemalloc_ctl::{Access, AsName, arenas};
+
+        let narenas = arenas::narenas::read().expect("arenas.narenas read must succeed");
+        let key = format!("arena.{narenas}.extent_hooks\0");
+        let past_the_end: tikv_jemalloc_ctl::Result<usize> = key.as_str().name().read();
+        let err = past_the_end.expect_err("an arena index past the last arena must fail");
+        assert!(
+            err.to_string()
+                .starts_with("An interface with side effects failed"),
+            "expected EFAULT, got: {err}"
+        );
+        err
+    }
+
     /// Runs `f` under a subscriber that captures every INFO-and-above line.
     #[cfg(not(target_env = "msvc"))]
     fn with_captured_log(f: impl FnOnce() -> BackgroundThread) -> (BackgroundThread, String) {
@@ -507,18 +585,92 @@ mod tests {
 
     #[cfg(not(target_env = "msvc"))]
     #[test]
-    fn resolve_warns_on_a_refused_write_and_stamps_the_read_back() {
-        let (state, logged) =
-            with_captured_log(|| resolve_background_thread(false, || Err(eperm()), || Ok(false)));
+    fn resolve_warns_on_a_refused_write_and_stamps_a_failed_start() {
+        let (state, logged) = with_captured_log(|| {
+            resolve_background_thread(
+                false,
+                || Err(eperm()),
+                || panic!("no read-back after a failed write"),
+            )
+        });
         assert_eq!(
             state,
             BackgroundThread {
                 enabled: false,
-                source: "server",
+                source: "start-failed",
             }
         );
         assert_eq!(logged.lines().count(), 1, "got: {logged:?}");
         assert_eq!(logged.matches(" WARN ").count(), 1, "got: {logged:?}");
+    }
+
+    /// Issue #3096: jemalloc sets its enabled flag before it creates the
+    /// thread and leaves it set when creation fails, so the read-back says
+    /// `true` with no thread running. The stamp must not report it.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn resolve_stamps_a_failed_start_as_not_running_despite_the_read_back() {
+        let (state, logged) = with_captured_log(|| {
+            let state = resolve_background_thread(false, || Err(efault()), || Ok(true));
+            state.emit();
+            state
+        });
+        assert_eq!(
+            state,
+            BackgroundThread {
+                enabled: false,
+                source: "start-failed",
+            }
+        );
+        assert_eq!(logged.lines().count(), 2, "got: {logged:?}");
+        assert_eq!(logged.matches(" WARN ").count(), 1, "got: {logged:?}");
+        assert_eq!(
+            logged
+                .matches("allocator_background_thread=false source=\"start-failed\"")
+                .count(),
+            1,
+            "the startup stamp must name the failed start, got: {logged:?}"
+        );
+    }
+
+    /// Issue #3096: after a failed start the scrape's read reports the
+    /// thread as not running although jemalloc's flag reads `true`, and a
+    /// successful start leaves the read on jemalloc's answer.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn a_failed_start_makes_the_read_report_the_thread_as_not_running() {
+        let background_thread_of = |stats| match stats {
+            AllocatorStats::Jemalloc {
+                background_thread, ..
+            } => background_thread,
+            AllocatorStats::Other { name } => panic!("expected Jemalloc, got Other({name})"),
+        };
+
+        let started = AtomicBool::new(false);
+        let (state, _) =
+            with_captured_log(|| configure_with(&started, false, || Ok(()), || Ok(true)));
+        assert_eq!(
+            state,
+            BackgroundThread {
+                enabled: true,
+                source: "server",
+            }
+        );
+        assert!(!started.load(Ordering::Relaxed));
+        assert!(background_thread_of(read_with(&started, || Ok(true))));
+
+        let failed = AtomicBool::new(false);
+        let (state, _) =
+            with_captured_log(|| configure_with(&failed, false, || Err(efault()), || Ok(true)));
+        assert_eq!(state.source, "start-failed");
+        assert!(
+            failed.load(Ordering::Relaxed),
+            "the startup step must record a failed start"
+        );
+        assert!(
+            !background_thread_of(read_with(&failed, || Ok(true))),
+            "a failed start must read as not running whatever jemalloc's flag says"
+        );
     }
 
     /// An operator's `background_thread` setting on a build without

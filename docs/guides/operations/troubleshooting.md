@@ -1508,16 +1508,20 @@ INFO allocator background purge thread resolved allocator_background_thread=true
   `background_thread`, and the server left that setting as it was.
 - `/metrics` reports the same state, read at scrape time, as
   `ravel_process_allocator_background_thread{allocator="jemalloc"}`: `1` when
-  the thread is enabled, `0` when it is not.
+  the thread is enabled, `0` when it is not. After a failed start (below) it
+  reports `0` for the life of the process.
 - `source="unavailable"` means that this host's jemalloc has no
   background-thread support (macOS), so there is no thread to enable. The
   server logs one info line, stamps `false`, and starts. This is expected on
   such a host and is not a failure.
-- If the server cannot enable the thread on a host that supports it, it logs
-  a warning, stamps whatever the allocator reports back with
-  `source="server"`, and starts anyway. That report can read `true` when the
-  thread failed to start, because the allocator sets its enabled flag before
-  it creates the thread.
+- `source="start-failed"` means that the server tried to start the thread on
+  a host that supports it and the attempt failed, usually because the host
+  refused to create the thread. The server logs a warning, stamps `false`,
+  and starts anyway. The allocator's own enabled flag can read `true` in this
+  case, because the allocator sets it before it creates the thread, so the
+  server does not use it. Check the process's thread limit (`ulimit -u`, a
+  container `pids` limit) and the warning's error. Until the next restart,
+  freed pages return to the operating system only on allocator activity.
 - To turn the thread off, start the server with
   `_RJEM_MALLOC_CONF=background_thread:false`. To combine it with the
   profiling options below, separate the options with commas.
