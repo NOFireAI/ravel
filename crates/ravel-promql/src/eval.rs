@@ -889,11 +889,12 @@ impl Evaluator {
 
     /// Reserve each of a range query's selector-cache entries against
     /// `budget`, held until the entry is replaced or the query ends. The
-    /// reservations go through `MemoryBudget::reserve`, so they count toward
-    /// the budget's `fetch_reserved()` (the server's
-    /// `ravel_memory_reserved_bytes{component="fetch"}`). A refused
-    /// reservation does not fail the query: that selector is read at every
-    /// step instead, and the query carries an info naming the first refusal.
+    /// reservations go through `MemoryBudget::reserve_best_effort`, so they
+    /// count toward the budget's `fetch_reserved()` (the server's
+    /// `ravel_memory_reserved_bytes{component="fetch"}`), and a refusal moves
+    /// neither of the budget's refusal counters. A refused reservation does
+    /// not fail the query: that selector is read at every step instead, and
+    /// the query carries an info naming the first refusal.
     pub fn with_memory_budget(mut self, budget: Arc<ravel_memory::MemoryBudget>) -> Self {
         self.memory_budget = Some(budget);
         self
