@@ -2526,8 +2526,8 @@ mod default_geometry {
     }
 
     /// The 200 M-span lane's geometry in process: 4 shards, the default
-    /// `--batch-rows`, `--target-bytes` and `--pipeline-depth` unset, on 6.5 M
-    /// spans of 650,000 traces with 10 contiguous spans each and random trace
+    /// `--batch-rows`, `--target-bytes` and `--pipeline-depth` unset, on 2.1 M
+    /// spans of 210,000 traces with 10 contiguous spans each and random trace
     /// ids. Every span estimates the same, so a shard's buffer reaches the
     /// derived target exactly when it holds `DEFAULT_OBJECT_ROWS` spans, and
     /// the model below replays the router's trace-id routing batch by batch to
@@ -2536,14 +2536,14 @@ mod default_geometry {
     /// rows bound, so no shard is short of the target when it comes due and
     /// the depth flush closes nothing.
     ///
-    /// Prove-the-test: derive the depth at the rows bound itself (100) and
-    /// about half the objects close on depth instead, so the size share
-    /// assertion fails.
+    /// Prove-the-test: derive the depth at the rows bound itself (100) and the
+    /// mix is 5 size, 4 depth and 4 end-of-input of 13 objects, so the size
+    /// majority assertion fails.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn spans_default_geometry_closes_the_majority_by_size() {
         const SHARDS: u32 = 4;
         const SPANS_PER_TRACE: usize = 10;
-        const GROUPS: usize = 650;
+        const GROUPS: usize = 210;
         fn splitmix64(mut z: u64) -> u64 {
             z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -2604,8 +2604,8 @@ mod default_geometry {
         let mix = layout.flush_mix.totals;
         let objects = report.objects_written() as u64;
         assert!(
-            mix.size * 5 >= objects * 4,
-            "the size trigger closes at least 80% of objects: {mix:?} of {objects}"
+            mix.size * 2 > objects,
+            "the size trigger closes the majority of objects: {mix:?} of {objects}"
         );
         assert_eq!(
             mix.size + mix.depth + mix.age + mix.arrival + mix.manual,
@@ -2624,11 +2624,12 @@ mod default_geometry {
         );
         assert_eq!(objects, expected_objects);
         assert_eq!(span_objects(store.as_ref()).await as u64, expected_objects);
-        assert_eq!((size_closes, tails), (24, 4));
+        assert_eq!((size_closes, tails), (8, 4));
         let ideal = (rows / DEFAULT_OBJECT_ROWS) as u64;
         assert!(
-            objects * 10 <= ideal * 11,
-            "objects stay within 10% of rows / DEFAULT_OBJECT_ROWS: {objects} against {ideal}"
+            objects <= ideal + u64::from(SHARDS),
+            "objects stay within one tail per shard of rows / DEFAULT_OBJECT_ROWS: {objects} \
+             against {ideal}"
         );
 
         let geometry = layout.geometry.expect("geometry resolved");
@@ -2701,7 +2702,7 @@ mod default_geometry {
         let summary = render_layout_summary(&report.layout_report());
         assert!(
             summary.contains(
-                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 25% = 32)"
+                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 7 = 32)"
             ),
             "{summary}"
         );

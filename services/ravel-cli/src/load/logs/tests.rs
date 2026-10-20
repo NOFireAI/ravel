@@ -1994,7 +1994,7 @@ async fn a_small_memory_budget_decides_the_derived_depth() {
     let summary = render_layout_summary(&layout);
     assert!(
         summary.contains(
-            "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 25% = 32)"
+            "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 7 = 32)"
         ),
         "{summary}"
     );
@@ -2379,7 +2379,7 @@ async fn four_shards_at_the_default_geometry_close_on_depth() {
     let summary = render_layout_summary(&layout);
     assert!(
         summary.contains(
-            "pipeline depth   : 25 (rows bound decided it: rows bound 20 + 25% = 25, memory"
+            "pipeline depth   : 25 (rows bound decided it: rows bound 20 + 5 = 25, memory"
         ),
         "{summary}"
     );
@@ -2445,7 +2445,7 @@ async fn a_derived_depth_above_the_cap_is_capped() {
     let summary = render_layout_summary(&layout);
     assert!(
         summary.contains(
-            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000 + 25% = \
+            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000 + 250000 = \
              1250000, memory bound "
         ),
         "{summary}"
@@ -2495,7 +2495,7 @@ async fn a_memory_bound_above_the_cap_leaves_the_cap_deciding() {
     let summary = render_layout_summary(&layout);
     assert!(
         summary.contains(
-            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000 + 25% = \
+            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000 + 250000 = \
              1250000, memory bound 2000)"
         ),
         "{summary}"
