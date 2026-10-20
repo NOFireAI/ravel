@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Proofs for issue #1192: check-tla.sh must enforce its TLC wall-clock
-# budget via GNU timeout(1), never report a timed-out run as a pass, refuse
-# outright when no GNU timeout is available or when one accepts the banner
-# check but rejects --kill-after, and never require Java for the
-# traceability lane. Run:
+# budget via timeout(1) --kill-after, never report a timed-out run as a pass,
+# refuse outright when no timeout whose --kill-after works is available
+# (none on PATH, one that rejects the flag, one that silently drops it),
+# accept one that is not GNU coreutils but kills as asked, and never require
+# Java for the traceability lane. Run:
 #   bash scripts/check-tla.test.sh
 set -uo pipefail
 
@@ -132,7 +133,7 @@ out="$(env -i PATH="$bdir" HOME="$HOME" RAVEL_TLA_JAVA="$javashim" "$SCRIPT" smo
 code=$?
 
 if [ "$code" -eq 2 ]; then ok; else bad "b: expected exit 2, got $code"; fi
-if printf '%s' "$out" | grep -qF 'GNU timeout(1) not found'; then
+if printf '%s' "$out" | grep -qF 'timeout(1) with a working --kill-after not found'; then
     ok
 else
     bad "b: refusal line not printed; got: $out"
@@ -185,7 +186,7 @@ out="$(env -i PATH="$ddir" HOME="$HOME" RAVEL_TLA_JAVA="$javashim_d" "$SCRIPT" s
 code=$?
 
 if [ "$code" -eq 2 ]; then ok; else bad "d: expected exit 2, got $code"; fi
-if printf '%s' "$out" | grep -qF 'GNU timeout(1) not found'; then
+if printf '%s' "$out" | grep -qF 'timeout(1) with a working --kill-after not found'; then
     ok
 else
     bad "d: refusal line not printed; got: $out"
@@ -196,6 +197,60 @@ else
     ok
 fi
 rm -rf "$ddir"
+
+# --- (d2)/(d3) the check is behavioural, not a banner match ---------------
+# Ubuntu 26.04 ships the uutils timeout, whose --version banner does not say
+# GNU coreutils but whose --kill-after kills. A shim with a non-GNU banner
+# that execs the real timeout must be accepted (d2); a shim with the GNU
+# banner that drops --kill-after before running the real timeout must be
+# refused (d3), because a TERM-ignoring command then outlives its budget.
+real_timeout="$(command -v timeout 2>/dev/null || command -v gtimeout 2>/dev/null)"
+echo "--- (d2) non-GNU banner, --kill-after works: expect accepted"
+d2dir="$(mktemp -d)"
+cat > "$d2dir/timeout" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+    --version) echo 'timeout (uutils coreutils) 0.2.2'; exit 0 ;;
+esac
+exec "$real_timeout" "\$@"
+EOF
+chmod +x "$d2dir/timeout"
+d2out="$( (PATH="$d2dir:$PATH"; TIMEOUT_BIN=""; resolve_timeout; printf 'BIN=%s\n' "$TIMEOUT_BIN") 2>&1)"
+d2code=$?
+if [ "$d2code" -eq 0 ] && printf '%s' "$d2out" | grep -qx 'BIN=timeout'; then
+    ok
+else
+    bad "d2: expected the non-GNU shim accepted as 'timeout'; exit=$d2code output: $d2out"
+fi
+rm -rf "$d2dir"
+
+echo "--- (d3) GNU banner, --kill-after silently dropped: expect refused"
+d3dir="$(mktemp -d)"
+cat > "$d3dir/timeout" <<EOF
+#!/usr/bin/env bash
+case "\$1" in
+    --version) echo 'timeout (GNU coreutils) 9.4'; exit 0 ;;
+esac
+args=()
+for a in "\$@"; do
+    case "\$a" in
+        --kill-after*) ;;
+        *) args+=("\$a") ;;
+    esac
+done
+exec "$real_timeout" "\${args[@]}"
+EOF
+chmod +x "$d3dir/timeout"
+d3start=$(date +%s)
+d3out="$( (PATH="$d3dir:$PATH"; kill_after_works timeout && echo ACCEPTED || echo REFUSED) 2>&1)"
+d3end=$(date +%s)
+if printf '%s' "$d3out" | grep -qx 'REFUSED'; then
+    ok
+else
+    bad "d3: expected the --kill-after-dropping shim refused; got: $d3out"
+fi
+if [ $((d3end - d3start)) -le 8 ]; then ok; else bad "d3: the probe took $((d3end - d3start))s, expected at most ~5s"; fi
+rm -rf "$d3dir"
 
 # --- (e) traceability needs no Java -----------------------------------------
 # main used to call resolve_java before dispatching on the subcommand, so

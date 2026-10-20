@@ -27,7 +27,7 @@
 # check-tla usage: end
 #
 # Exit codes: 0 pass; 1 a check failed; 2 toolchain missing (no usable Java
-# or no GNU timeout(1)).
+# or no timeout(1) whose --kill-after works).
 #
 # The TLC jar is resolved once and checksum-pinned. Set RAVEL_TLA_TOOLS_JAR to
 # an operator-supplied jar (verified against the pin, never downloaded); else it
@@ -120,27 +120,44 @@ resolve_tla_resources() {
     note "resources: workers=$TLA_WORKERS xmx=$TLA_XMX"
 }
 
-# resolve_timeout: pick GNU timeout(1) once, before any lane launches
+# resolve_timeout: pick a timeout(1) once, before any lane launches
 # anything, so a run that would otherwise start unbounded refuses instead.
-# Only GNU coreutils' timeout supports --kill-after, which is the mechanism
-# every budget in this script relies on; BSD/macOS ship no `timeout` at all,
-# so the coreutils one arrives as `gtimeout` there (Homebrew). A `timeout`
-# on PATH that isn't GNU coreutils (some minimal containers ship a look-alike)
-# is rejected the same as no binary at all: it silently drops --kill-after
-# and turns a hang into an unbounded run instead of a report.
+# Every budget in this script relies on --kill-after, so a candidate is
+# accepted only when kill_after_works shows it killing a command that ignores
+# TERM. GNU coreutils' timeout and the uutils one (Ubuntu 26.04's default)
+# both pass; BSD/macOS ship no `timeout` at all, so the coreutils one arrives
+# as `gtimeout` there (Homebrew). A look-alike that rejects or silently drops
+# --kill-after is refused the same as no binary at all, since it would turn
+# a hang into an unbounded run instead of a report.
 resolve_timeout() {
     local candidate
     for candidate in timeout gtimeout; do
         if command -v "$candidate" >/dev/null 2>&1 \
-            && "$candidate" --version 2>/dev/null | grep -qi 'GNU coreutils' \
-            && "$candidate" --kill-after=1 1 true >/dev/null 2>&1; then
+            && kill_after_works "$candidate"; then
             TIMEOUT_BIN="$candidate"
-            note "timeout: $candidate (GNU coreutils)"
+            note "timeout: $candidate (--kill-after verified)"
             return 0
         fi
     done
-    note "GNU timeout(1) not found; on macOS run: brew install coreutils"
+    note "timeout(1) with a working --kill-after not found; on macOS run: brew install coreutils"
     exit 2
+}
+
+# kill_after_works <bin>: run a 1 s budget with a 1 s --kill-after over a
+# command that ignores TERM and sleeps 5 s. A working --kill-after ends it
+# with KILL (status 137) about 2 s in; a candidate that rejects the flag
+# exits at once with another status, and one that drops it lets the sleep
+# finish and reports 124 or 0.
+kill_after_works() {
+    local bin="$1" code start end
+    start=$(date +%s)
+    # GNU timeout kills its own process group, so bash prints a "Killed" job
+    # notice for it. The subshell (kept from exec'ing the command by its
+    # second statement) takes that notice on its redirected stderr.
+    ("$bin" --kill-after=1 1 sh -c 'trap "" TERM; exec sleep 5'; exit $?) >/dev/null 2>&1
+    code=$?
+    end=$(date +%s)
+    [ "$code" -eq 137 ] && [ $((end - start)) -le 4 ]
 }
 
 # sha256 of a file: coreutils sha256sum where present, else the shasum that
