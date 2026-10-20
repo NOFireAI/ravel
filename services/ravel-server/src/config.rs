@@ -396,7 +396,8 @@ pub enum FormatWindowCheck {
     Refuse,
 }
 
-/// Parses `--format-window-check-timeout`: a non-zero humantime duration.
+/// Parses `--cache-bulk-share`: a fraction strictly between 0 and 1, which
+/// refuses `NaN` too, since every comparison with it is false.
 fn parse_cache_bulk_share(value: &str) -> Result<f64, String> {
     let share: f64 = value.parse().map_err(|err| format!("{err}"))?;
     if share > 0.0 && share < 1.0 {
@@ -406,6 +407,7 @@ fn parse_cache_bulk_share(value: &str) -> Result<f64, String> {
     }
 }
 
+/// Parses `--format-window-check-timeout`: a non-zero humantime duration.
 fn parse_format_window_check_timeout(value: &str) -> Result<Duration, String> {
     let duration = humantime::parse_duration(value).map_err(|err| err.to_string())?;
     if duration.is_zero() {

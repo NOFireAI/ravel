@@ -760,9 +760,6 @@ fn ipcrypt_outcome_name(outcome: ravel_ipcrypt::render::RenderOutcome) -> &'stat
     }
 }
 
-/// Exhaustive: adding an [`crate::alerting::AlertTickOutcome`] variant breaks
-/// this compile until it is handled here, so a new tick outcome cannot reach
-/// `/metrics` without a spelling.
 /// Exhaustive: adding a [`ravel_cache::AccessIntent`] variant breaks the build
 /// here rather than rendering an unnamed `intent` value.
 fn cache_intent_name(intent: ravel_cache::AccessIntent) -> &'static str {
@@ -773,6 +770,9 @@ fn cache_intent_name(intent: ravel_cache::AccessIntent) -> &'static str {
     }
 }
 
+/// Exhaustive: adding an [`crate::alerting::AlertTickOutcome`] variant breaks
+/// this compile until it is handled here, so a new tick outcome cannot reach
+/// `/metrics` without a spelling.
 fn alert_outcome_name(outcome: crate::alerting::AlertTickOutcome) -> &'static str {
     use crate::alerting::AlertTickOutcome;
     match outcome {
