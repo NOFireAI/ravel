@@ -45,6 +45,7 @@ use ravel_object_store::{
 use ravel_segment::{IngestBounds, SegmentIdentity, SegmentWriter, SeriesInput};
 use ravel_server::config::{Cli, DistribSettings};
 use ravel_server::{FoldTaskConfig, Mode, ServerConfig};
+use ravel_sql::SliceReject;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 use tonic::Request;
 
@@ -639,35 +640,63 @@ async fn sql_ticket_key_file_rotation_verifies_tickets_minted_under_the_old_key(
     );
 }
 
-/// How long the negative control keeps querying once both heartbeat records
-/// are in the store. The two positive cases above succeed well inside it.
-const NEGATIVE_WINDOW: Duration = Duration::from_secs(5);
+/// Attempts the negative control counts once the worker has refused its first
+/// slice ticket.
+const NEGATIVE_ATTEMPTS: usize = 5;
+
+/// One cross-process query that must fail; returns its error.
+async fn failed_attempt(pair: &Pair) -> String {
+    match run_query(pair.coordinator_grpc, pair.start_ns, pair.end_ns).await {
+        Ok(batch) => panic!(
+            "a worker without the coordinator's minting key served the query: {:?}",
+            rows(&batch)
+        ),
+        Err(err) => err,
+    }
+}
 
 /// Negative control for the harness: a worker holding only `[new]` never
 /// verifies the slice tickets of a coordinator minting under `[old]`, so with
 /// the coordinator's own data reads refused the cross-process query fails on
 /// every attempt and the worker reads nothing.
+///
+/// An attempt made before the coordinator's roster lists the worker fails
+/// without reaching it, which says nothing about the key. The attempts that
+/// count start once the worker has refused a slice ticket as `bad_mac`, the
+/// signal that the coordinator dialed it; each of the [`NEGATIVE_ATTEMPTS`]
+/// after that must fail, and the worker's `bad_mac` count must rise during
+/// each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_without_the_minting_key_fails_the_cross_process_query() {
     let pair = start_pair(&[OLD_KEY], &[NEW_KEY]).await;
-    let deadline = Instant::now() + NEGATIVE_WINDOW;
-    let mut attempts = 0;
-    let mut last = String::new();
-    while Instant::now() < deadline {
-        match run_query(pair.coordinator_grpc, pair.start_ns, pair.end_ns).await {
-            Ok(batch) => panic!(
-                "a worker without the coordinator's minting key served the query: {:?}",
-                rows(&batch)
-            ),
-            Err(err) => last = err,
+    let rejects = pair
+        .worker
+        .sql_slice_rejects
+        .clone()
+        .expect("Flight SQL served");
+
+    let deadline = Instant::now() + ROSTER_DEADLINE;
+    loop {
+        let last = failed_attempt(&pair).await;
+        if rejects.get(SliceReject::BadMac) > 0 {
+            break;
         }
-        attempts += 1;
+        assert!(
+            Instant::now() < deadline,
+            "the worker refused no slice ticket within {ROSTER_DEADLINE:?}; last error: {last}"
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(
-        attempts >= 5,
-        "the window ran only {attempts} attempts; last error: {last}"
-    );
+
+    for attempt in 1..=NEGATIVE_ATTEMPTS {
+        let before = rejects.get(SliceReject::BadMac);
+        let err = failed_attempt(&pair).await;
+        assert!(
+            rejects.get(SliceReject::BadMac) > before,
+            "attempt {attempt} of {NEGATIVE_ATTEMPTS} failed without the worker refusing a \
+             slice ticket as bad_mac: {err}"
+        );
+    }
     assert_eq!(
         pair.worker_store.data_gets.load(Ordering::SeqCst),
         0,

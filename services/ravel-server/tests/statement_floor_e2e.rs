@@ -538,43 +538,63 @@ async fn sql_missing_catalog_head_is_read_once_through_http() {
     drop(fx.running);
 }
 
-/// Decision 2 and ADR-0062's idle-flush amendment: with `max_age` at 10 s, a
-/// statement that finds the audit pipeline idle returns well inside 5 s, after
-/// exactly one audit data-object PUT and one audit commit-record PUT.
+/// The audit `max_age` of [`sql_idle_audit_event_flushes_without_waiting_max_age`].
+/// Long enough that no load stall reaches it, so only a loop that waits out the
+/// window can take this long.
+const AUDIT_MAX_AGE: Duration = Duration::from_secs(3_600);
+
+/// How long the idle statement may take before the test fails instead of
+/// waiting out [`AUDIT_MAX_AGE`]. It is a fail-fast for a loop that waits the
+/// window, set 30 times below it and far above the seconds one statement takes
+/// on a loaded box.
+const IDLE_FAIL_FAST: Duration = Duration::from_secs(120);
+
+/// How long the control's second statement must stay pending.
+const CONTROL_PENDING: Duration = Duration::from_secs(5);
+
+/// Decision 2 and ADR-0062's idle-flush amendment: with `max_age` at one hour,
+/// a statement that finds the audit pipeline idle returns after exactly one
+/// audit data-object PUT and one audit commit-record PUT. A loop that waited
+/// `max_age` for it would hold it for the hour; [`IDLE_FAIL_FAST`] turns that
+/// into a failure in minutes rather than a hang.
 ///
-/// The second half is the control. On a fresh server, a second statement that
-/// follows the first within `max_age` is not idle: the loop opens a full
-/// `max_age` window for it, so it is still pending 5 s after the first
-/// returned. The test does not order the second statement's audit submission
-/// against the first one's held flush, so which idle condition refuses it is
-/// not pinned here: at least the previous-event gap does, since the first
-/// event was received less than `max_age` earlier. The in-flight-flush
-/// condition has its own test in `ravel-maintain`. A loop that always waited
-/// `max_age` would make the first statement look like the second.
+/// The second half is the control, in the same configuration (`max_batch` 2
+/// in both halves). On a fresh server, a second statement that follows the
+/// first within `max_age` is not idle: the loop opens a `max_age` window for
+/// it, so it is still pending [`CONTROL_PENDING`] after the first returned,
+/// and it returns only once a third statement's event fills the batch, the two
+/// sharing one PUT pair. A loop that flushed the second event at once fails
+/// the still-pending check before that. The test does not order the
+/// second statement's audit submission against the first one's held flush, so
+/// which idle condition refuses it is not pinned here: at least the
+/// previous-event gap does, since the first event was received less than
+/// `max_age` earlier. The in-flight-flush condition has its own test in
+/// `ravel-maintain`. A loop that always waited `max_age` would make the first
+/// statement look like the second.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_idle_audit_event_flushes_without_waiting_max_age() {
-    let max_age = Duration::from_secs(10);
-    let bound = Duration::from_secs(5);
+    let max_age = AUDIT_MAX_AGE;
     let audit = Some(ravel_maintain::AuditPipelineConfig {
         max_age,
+        max_batch: 2,
         audit_mode: ravel_maintain::AuditMode::Required,
         ..Default::default()
     });
 
     let fx = start_fixture(audit.clone()).await;
     assert_eq!(fx.log.audit_puts(), (0, 0), "no audit write before a query");
-    // hygiene-allow: wall-clock -- the server runs on real time and takes no
-    // injected clock; the assertion is an upper bound two times below the
-    // max_age deadline it distinguishes from, not a timing band.
-    let started = std::time::Instant::now();
-    let (status, value) = run_statement(&fx).await;
-    let took = started.elapsed();
+    // hygiene-allow: wall-clock -- a fail-fast, not a timing band: the server
+    // takes no injected clock, and the bound sits 30 times below the max_age a
+    // waiting loop would hold the statement for.
+    let (status, value) = tokio::time::timeout(IDLE_FAIL_FAST, run_statement(&fx))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the idle statement did not return within {IDLE_FAIL_FAST:?}; an idle \
+                 audit event must flush at once, not wait max_age ({max_age:?})"
+            )
+        });
     assert_counts_every_record(status, &value);
-    // hygiene-allow: wall-clock -- upper bound at half of max_age; see above.
-    assert!(
-        took < bound,
-        "an idle audit event must not wait max_age ({max_age:?}): took {took:?}"
-    );
     assert_eq!(
         fx.log.audit_puts(),
         (1, 1),
@@ -603,22 +623,44 @@ async fn sql_idle_audit_event_flushes_without_waiting_max_age() {
     assert_counts_every_record(status, &value);
 
     let mut second = second;
-    // hygiene-allow: wall-clock -- a lower bound: the second event's max_age
-    // window opens when the loop receives it, after the held flush returns, and
-    // tokio timers never fire early. A stall of `bound` or more between the
-    // release above and this timeout would make it a false red.
-    let pending = tokio::time::timeout(bound, &mut second).await;
+    // hygiene-allow: wall-clock -- a lower bound, and tokio timers never fire
+    // early: the second statement can return only once its batch fills or its
+    // max_age window closes, so a false red needs a stall of nearly max_age.
+    let pending = tokio::time::timeout(CONTROL_PENDING, &mut second).await;
     assert!(
         pending.is_err(),
         "a statement that follows another within max_age ({max_age:?}) is not \
-         idle and must wait its window, but it returned within {bound:?}"
+         idle and must wait its window, but it returned within {CONTROL_PENDING:?}"
     );
-    let (status, value) = second.await.expect("second statement task");
-    assert_counts_every_record(status, &value);
+    assert_eq!(
+        fx.log.audit_puts(),
+        (1, 1),
+        "the pending second statement has written no audit object yet"
+    );
+
+    // A third event fills the second one's batch, so both flush in one pair.
+    let third = spawn_statement(&fx);
+    // hygiene-allow: wall-clock -- a fail-fast, as for the idle statement.
+    let (second, third) = tokio::time::timeout(IDLE_FAIL_FAST, async {
+        (
+            second.await.expect("second statement task"),
+            third.await.expect("third statement task"),
+        )
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the second and third statements did not return within \
+             {IDLE_FAIL_FAST:?}; the third event must fill the batch"
+        )
+    });
+    assert_counts_every_record(second.0, &second.1);
+    assert_counts_every_record(third.0, &third.1);
     assert_eq!(
         fx.log.audit_puts(),
         (2, 2),
-        "the two statements flush separately, one PUT pair each"
+        "the first statement flushes alone and the second waits to share one \
+         PUT pair with the third"
     );
     drop(fx.running);
 }
