@@ -1011,7 +1011,10 @@ jobs:
     # The now-removed "Clippy (sql feature)" step moved to the `lint` job (D3).
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # The `esql` step runs the whole ravel-server suite again (esql implies
+    # sql), so the job now finishes in 22-25 minutes; 35 keeps it off the
+    # edge until #3131 removes the duplicate run.
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
