@@ -16,7 +16,17 @@ rust-version.workspace = true
 # block-write loop report bloom-construction nanoseconds and block count
 # through `WriteStats::bloom_total_ns` and `WriteStats::bloom_blocks` for
 # the `LogStage::Bloom` boundary below to fold in (issue #1516).
-stage-timing = ["ravel-logseg/stage-timing"]
+#
+# Also turns on `flush-input-bytes` below, so the lane that builds and tests
+# this feature runs `tests/flush_input_bytes.rs` too (issue #3124).
+stage-timing = ["ravel-logseg/stage-timing", "flush-input-bytes"]
+# Flush input recorder (issue #3124). Off by default, and no shipping build
+# enables it: `stage-timing` above turns it on, and ravel-bench's
+# dev-dependency on this crate does, for the `ingest_write_gate_overhead`
+# bench. On, it compiles in `FlushInputBytes`,
+# `IngestRouter::with_flush_input_bytes`, and the recorder lookup each flush
+# encode makes; off, the flush path has no recorder field, lock, or call.
+flush-input-bytes = []
 
 [dependencies]
 ravel-types = { workspace = true }
