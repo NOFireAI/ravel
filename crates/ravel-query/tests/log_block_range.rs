@@ -1047,9 +1047,13 @@ async fn ranged_fetcher() -> (
     let (records, bytes) = subset_object();
     let (_, _, tail_len) = layout(&bytes);
     let mem = Arc::new(MemoryStore::new());
-    mem.put("logs/intent.rlog", bytes.clone().into(), PutOptions::default())
-        .await
-        .expect("put");
+    mem.put(
+        "logs/intent.rlog",
+        bytes.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
     let seg = seg_ref("logs/intent.rlog", bytes.len() as u64, &records);
     let limits = CacheLimits::new(16 << 20, 1024, 16 << 20);
     let cache = Arc::new(Cache::new(limits));

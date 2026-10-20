@@ -8609,13 +8609,7 @@ pub(crate) mod tests {
             for sql in narrowed {
                 assert!(
                     !exec
-                        .plans_predicate_free(
-                            t,
-                            SqlCapabilities::default(),
-                            signal,
-                            sql,
-                            &declared
-                        )
+                        .plans_predicate_free(t, SqlCapabilities::default(), signal, sql, &declared)
                         .await,
                     "{table}: {sql} is not predicate-free"
                 );

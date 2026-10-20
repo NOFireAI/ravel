@@ -287,12 +287,7 @@ mod tests {
     fn a_pruned_metrics_lane_is_interactive() {
         let snap = snapshot(two_hours().segments, 1);
         assert_eq!(
-            classify_signal_lanes(
-                &[(TargetSignal::Metrics, &snap)],
-                whole_tenant(),
-                NOW,
-                true
-            ),
+            classify_signal_lanes(&[(TargetSignal::Metrics, &snap)], whole_tenant(), NOW, true),
             AccessIntent::Interactive
         );
     }

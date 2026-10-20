@@ -3888,8 +3888,7 @@ mod tests {
         for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
             let mut fx = trace_fixture().await;
             let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
-            let cache: Arc<Cache<crate::fetcher::CacheFetchError>> =
-                Arc::new(Cache::new(limits));
+            let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(limits));
             let fetcher = SpanSegmentFetcher::new(log.clone())
                 .with_trace_probe_bytes(fx.probe)
                 .with_cache(Arc::clone(&cache));

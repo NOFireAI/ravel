@@ -15791,7 +15791,8 @@ mod block_funnel_intent_tests {
         for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
             let (fetcher, cache) = fetcher().await;
             let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, BLOCK * BLOCKS);
-            asm.place(KEY, 0, object()).expect("place the probe's bytes");
+            asm.place(KEY, 0, object())
+                .expect("place the probe's bytes");
             let mut stats = BlockRangeStats::default();
             fetcher
                 .fetch_blocks(
