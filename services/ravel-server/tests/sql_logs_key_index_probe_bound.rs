@@ -131,8 +131,8 @@ fn decoy(object: usize, i: usize) -> i64 {
     1_000_000 + (object * RECORDS + i) as i64
 }
 
-fn record_of(object: usize, i: usize, pad_bytes: usize) -> LogRecord {
-    let user = if object == HOLDER && i == 50 {
+fn record_of(object: usize, i: usize, pad_bytes: usize, holds: bool) -> LogRecord {
+    let user = if holds && i == 50 {
         TARGET
     } else {
         decoy(object, i)
@@ -182,6 +182,9 @@ struct Config {
     /// Whether the writer builds a KEY_IDX section on `user_id`. The query's
     /// equality is pushed down either way, from the declared key index.
     key_indexed: bool,
+    /// Whether record 50 of every object holds `TARGET`, not only the
+    /// holder's.
+    every_object_holds: bool,
 }
 
 struct Object {
@@ -311,7 +314,10 @@ async fn run(cfg: &Config) -> Outcome {
         } else {
             writer
         };
-        let records: Vec<LogRecord> = (0..RECORDS).map(|i| record_of(seq, i, *pad)).collect();
+        let holds = seq == HOLDER || cfg.every_object_holds;
+        let records: Vec<LogRecord> = (0..RECORDS)
+            .map(|i| record_of(seq, i, *pad, holds))
+            .collect();
         let min = records.iter().map(|r| r.ts_ns).min().expect("records");
         let max = records.iter().map(|r| r.ts_ns).max().expect("records");
         for r in records {
@@ -469,9 +475,8 @@ fn assert_every_object_probed(o: &Outcome) {
 /// break-even, at least `target_partitions` of them, so the scan would open
 /// them unplanned (ADR-2677 decision 2). They are probed and pruned.
 ///
-/// FLIP: with only `plan_segment_keyed`'s gate fixed (`may_skip_plan`
-/// reduced to `!ctx.fetcher.plans_segment(seg)`) the pruned count reads
-/// `left: 7, right: 23`.
+/// FLIP: with `compute_plan_counts` leaving every `may_skip_plan` object
+/// unplanned unprobed the pruned count reads `left: 7, right: 23`.
 #[tokio::test]
 async fn sub_break_even_objects_left_unplanned_are_probed() {
     let o = run(&Config {
@@ -480,6 +485,7 @@ async fn sub_break_even_objects_left_unplanned_are_probed() {
         threshold: 256 * KIB,
         break_even: 512 * KIB,
         key_indexed: true,
+        every_object_holds: false,
     })
     .await;
     for (n, object) in o.objects.iter().enumerate() {
@@ -508,6 +514,7 @@ async fn sub_break_even_objects_the_scan_plans_are_probed() {
         threshold: 256 * KIB,
         break_even: 512 * KIB,
         key_indexed: true,
+        every_object_holds: false,
     })
     .await;
     assert_every_object_probed(&o);
@@ -525,6 +532,7 @@ async fn every_object_under_a_larger_break_even_is_probed() {
         threshold: 256 * KIB,
         break_even: 2048 * KIB,
         key_indexed: true,
+        every_object_holds: false,
     })
     .await;
     for object in &o.objects {
@@ -553,6 +561,7 @@ async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
             threshold: 512 * KIB,
             break_even: 2048 * KIB,
             key_indexed: true,
+            every_object_holds: false,
         })
         .await;
         assert_eq!(o.ids(), ["o0r050"], "tp {target_partitions}");
@@ -597,6 +606,10 @@ async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
 /// decision 2). The plan pass probes each one's KEY_IDX and plans none: the 23
 /// without the key are pruned with no read past the tail probe and KEY_IDX,
 /// and the holder is read whole once, by the scan.
+///
+/// FLIP: against the dispatch ref (`may_skip_plan` refusing every keyed
+/// object above the threshold) the plan pass plans the holder and reads it
+/// whole: `plan_whole_reads` reads `left: 1, right: 0`.
 #[tokio::test]
 async fn keyed_objects_the_scan_skips_are_probed_not_planned() {
     let o = run(&Config {
@@ -605,6 +618,7 @@ async fn keyed_objects_the_scan_skips_are_probed_not_planned() {
         threshold: 256 * KIB,
         break_even: 2048 * KIB,
         key_indexed: true,
+        every_object_holds: false,
     })
     .await;
     assert_eq!(o.ids(), ["o0r050"]);
@@ -635,8 +649,13 @@ async fn keyed_objects_the_scan_skips_are_probed_not_planned() {
 }
 
 /// The same 24 objects written without a KEY_IDX section, under the same
-/// declared key index: the probe finds no section and drops nothing, so every
-/// object is left to the scan, which reads each one whole exactly once.
+/// declared key index, each holding the key so the scan keeps every one: the
+/// probe finds no section and drops nothing, so every object is left to the
+/// scan, which reads each one whole exactly once.
+///
+/// FLIP: against the dispatch ref the plan pass plans and reads all 24 whole,
+/// carries 4 to the scan, and the scan reads the other 20 whole again:
+/// `whole_reads` reads `left: [1, 1, 1, 1, 2, 2, ...]`.
 #[tokio::test]
 async fn unindexed_objects_the_scan_skips_are_read_whole_once() {
     let o = run(&Config {
@@ -645,10 +664,25 @@ async fn unindexed_objects_the_scan_skips_are_read_whole_once() {
         threshold: 256 * KIB,
         break_even: 2048 * KIB,
         key_indexed: false,
+        every_object_holds: true,
     })
     .await;
-    assert_eq!(o.ids(), ["o0r050"]);
+    let mut ids = o.ids();
+    ids.sort();
+    // `substr(body, 1, 6)`: two-digit objects lose the record number's last digit.
+    let mut want: Vec<String> = (0..OBJECTS)
+        .map(|n| format!("o{n}r050")[..6].to_string())
+        .collect();
+    want.sort();
+    assert_eq!(ids, want);
     assert_eq!(o.pruned(), 0, "{}", o.response);
-    let phases: Vec<Vec<GetPhase>> = o.objects.iter().map(Object::whole_read_phases).collect();
-    assert_eq!(phases, vec![vec![GetPhase::Scan]; OBJECTS]);
+    let whole_reads: Vec<usize> = o
+        .objects
+        .iter()
+        .map(|object| object.whole_read_phases().len())
+        .collect();
+    assert_eq!(whole_reads, [1; OBJECTS]);
+    for (n, object) in o.objects.iter().enumerate() {
+        assert_eq!(object.whole_read_phases(), [GetPhase::Scan], "object {n}");
+    }
 }
