@@ -305,15 +305,8 @@ async fn an_interactive_statement_keeps_its_hot_set_under_a_concurrent_bulk_loop
     let bulk = TenantId::new("bulk".to_string());
     let mut hot_bytes = 0;
     for i in 0..HOT_SEGMENTS {
-        let size = publish_segment(
-            store.as_ref(),
-            &hot,
-            i,
-            3,
-            &format!("hot{i}"),
-            HOT_SAMPLES,
-        )
-        .await;
+        let size =
+            publish_segment(store.as_ref(), &hot, i, 3, &format!("hot{i}"), HOT_SAMPLES).await;
         assert!(
             (12 * 1024..=20 * 1024).contains(&size),
             "hot segment {i} is {size} bytes, not about 16 KiB"
@@ -489,7 +482,8 @@ async fn a_bulk_statement_moves_the_bulk_scan_intent_sample_on_a_real_scrape() {
     let app = sql_app(Arc::clone(&store), &cache, &["acme"]);
     let metrics = metrics_app(store, &cache);
 
-    const BULK_HITS: &str = r#"ravel_cache_intent_hits_total{mode="all",cache="fetch",intent="bulk_scan"}"#;
+    const BULK_HITS: &str =
+        r#"ravel_cache_intent_hits_total{mode="all",cache="fetch",intent="bulk_scan"}"#;
     const BULK_SERVED: &str =
         r#"ravel_cache_intent_bytes_served_total{mode="all",cache="fetch",intent="bulk_scan"}"#;
     const INTERACTIVE_HITS: &str =

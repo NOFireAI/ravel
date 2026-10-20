@@ -1121,7 +1121,10 @@ async fn whole_object_funnel_reads_under_the_callers_access_intent() {
     read(AccessIntent::Interactive).await;
     let after_interactive = metrics.intent_snapshot();
     assert_eq!(after_interactive.bulk_scan.hits, 1, "{after_interactive:?}");
-    assert_eq!(after_interactive.interactive.hits, 1, "{after_interactive:?}");
+    assert_eq!(
+        after_interactive.interactive.hits, 1,
+        "{after_interactive:?}"
+    );
 }
 
 // --- columnar pass-through (ADR-0099 decision 1) ----------------------------

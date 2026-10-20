@@ -364,10 +364,18 @@ mod tests {
 
     #[test]
     fn a_cache_mark_reports_only_what_moved_after_it_per_intent() {
-        let cache = ravel_cache::Cache::<String>::new(ravel_cache::CacheLimits::new(1 << 20, 1024, 1 << 16));
+        let cache = ravel_cache::Cache::<String>::new(ravel_cache::CacheLimits::new(
+            1 << 20,
+            1024,
+            1 << 16,
+        ));
         let key = |n: u64| ravel_cache::CacheKey::new([0u8; 16], [1u8; 32], n * 100, 100);
         let value = bytes::Bytes::from(vec![7u8; 100]);
-        cache.insert_with_intent(key(0), value.clone(), ravel_cache::AccessIntent::Interactive);
+        cache.insert_with_intent(
+            key(0),
+            value.clone(),
+            ravel_cache::AccessIntent::Interactive,
+        );
         // Moved before the mark: not in the delta.
         assert!(
             cache
