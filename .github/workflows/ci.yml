@@ -42,6 +42,9 @@ concurrency:
   group: ${{ github.ref == 'refs/heads/main' && format('ci-main-{0}', github.sha) || format('ci-{0}', github.ref) }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
+# Every job is pinned to ubuntu-24.04. ubuntu-latest moved to 26.04, whose
+# uutils `timeout` does not identify as GNU coreutils, and
+# scripts/check-tla.sh refuses any other timeout(1) (#3146).
 jobs:
   # Lets a docs-only change (README, ADRs, guides, diagrams) skip
   # the whole cargo-loop straight to green instead of waiting on six
@@ -50,7 +53,7 @@ jobs:
   # during an open PR don't get pulled into the changed-file list. Any file
   # outside `*.md` / `*.svg` flips this back to the normal full run.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       # docs_only skips every compiling job (ADR-0053 pre-D4 behaviour). The
@@ -229,7 +232,7 @@ jobs:
     # The guard only reads the checkout; nothing here needs write scope.
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The job took 7.5 to 9.5 minutes on main before the ClickBench kit's
     # sampler cases were added, and the kit suite alone now runs over 5.
     timeout-minutes: 20
@@ -565,7 +568,7 @@ jobs:
   tla-models:
     needs: changes
     if: needs.changes.outputs.formal_area == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 30m per area, not the serial job's 45m for all six. maintenance is the
     # long pole at about 8.6m warm; the headroom is for a cold JVM on a slow
     # runner. Deliberately not tight: a timeout-minutes breach reports as
@@ -631,7 +634,7 @@ jobs:
   tla:
     needs: [changes, tla-models]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
@@ -759,7 +762,7 @@ jobs:
   # ADR names, so both binaries are installed here at pinned, checksum-verified
   # versions.
   actionlint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       # Pinned versions and their published sha256 sums (exact-version pinning,
@@ -837,7 +840,7 @@ jobs:
   lint:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -876,7 +879,7 @@ jobs:
   check-shard:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 45m. A cold cache means building every dependency optimised, which
     # measured 18m34s to 28m14s per leg (run 37201668562), before about 4m of
     # tests. A warm leg is about 10m.
@@ -952,7 +955,7 @@ jobs:
   check:
     needs: [changes, check-shard]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Decide the workspace test run
@@ -1010,7 +1013,7 @@ jobs:
     # changed.
     # The now-removed "Clippy (sql feature)" step moved to the `lint` job (D3).
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The `esql` step runs the whole ravel-server suite again (esql implies
     # sql), so the job now finishes in 22-25 minutes; 35 keeps it off the
     # edge until #3131 removes the duplicate run.
@@ -1082,7 +1085,7 @@ jobs:
   flight-sql:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1175,7 +1178,7 @@ jobs:
   features-lane:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 30m per leg. The whole job measured 28m35s to 38m on a cold cache when
     # it was one job, and no leg carries more than about a third of it.
     timeout-minutes: 30
@@ -1348,7 +1351,7 @@ jobs:
   features:
     needs: [changes, features-lane]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Decide the features lanes
@@ -1414,7 +1417,7 @@ jobs:
   features-otap:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 25m (provisional): this lane compiles, lints (--all-targets), and
     # lib-tests a single ravel-server feature, the same shape and crate as the
     # `sql` job, which carries a 25m budget, and is used as a starting point
@@ -1490,7 +1493,7 @@ jobs:
   all-features:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 45m, the `features` job's measured budget: this is one compile of the
     # union of the configurations `features` builds one by one, plus the rest
     # of the workspace, so `lint`'s 20m (default features, warm cache) is too
@@ -1540,7 +1543,7 @@ jobs:
   supply-chain:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 15, matching supply-chain-nightly.yml's timeout: the eight cold
     # `cargo tree` invocations below (issue #1718) resolve the full
     # dependency graph with no warm cache, and this job's own pin-count
@@ -1579,7 +1582,7 @@ jobs:
   fuzz:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 20 rather than 15 as headroom for a cold compile of ravel-logseg and
     # ravel-rspan plus their test binaries, which this job did not build
     # before. Observed 4m21s on a cache hit (rust-cache) for the run on
@@ -1657,7 +1660,7 @@ jobs:
     # object_store_area (ADR-0053 D4): only when object-store, bench, commit,
     # catalog, ingest, or workspace-level paths changed.
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 25, not 15: the job also builds ravel-cli for the verify-protection
     # cases after the contract suite.
     timeout-minutes: 25
@@ -1864,7 +1867,7 @@ jobs:
     # bench-harness smoke test lives in ravel-bench and exercises the same
     # object-store request path.
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.object_store_area == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -1972,7 +1975,7 @@ jobs:
     # promql_area (ADR-0053 D4): only when ravel-promql, ravel-promql-difftest,
     # ravel-query, or workspace-level paths changed.
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.promql_area == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 15 until the conformance-table run joined this job: it links a second
     # test binary against the same (datafusion-carrying) dependency graph.
     timeout-minutes: 20
@@ -2107,7 +2110,7 @@ jobs:
       needs.changes.outputs.server_or_operator == 'true' &&
       github.event_name == 'pull_request' &&
       contains(github.event.pull_request.labels.*.name, 'run-k8s')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 55m: the original single job's 60m covered the release build plus the
     # kind half; this half is build + docker save + artifact upload only, but
     # a cold release build alone has been observed near 45m, and the
@@ -2198,7 +2201,7 @@ jobs:
       needs.changes.outputs.server_or_operator == 'true' &&
       github.event_name == 'pull_request' &&
       contains(github.event.pull_request.labels.*.name, 'run-k8s')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # Same tags k8s-build wrote; used to `docker load` the artifact and, via
@@ -2387,7 +2390,7 @@ jobs:
   docker-build:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 60m, not the ~10m the no-op path suggests: when Dockerfile/.dockerignore
     # actually change this job runs a full workspace compile inside Docker at
     # CARGO_BUILD_JOBS=2 with no access to this workflow's cache (~57m
@@ -2461,7 +2464,7 @@ jobs:
     if: >-
       github.event_name == 'push' && github.ref == 'refs/heads/main'
       && needs.changes.outputs.docs_only != 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     # id-token:write is the Codecov upload's tokenless-OIDC grant (public
     # repo, no CODECOV_TOKEN secret); contents:read matches the job's only
