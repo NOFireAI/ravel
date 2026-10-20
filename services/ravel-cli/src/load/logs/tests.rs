@@ -1703,6 +1703,10 @@ const GEOMETRY_BATCHES: usize = 51;
 /// depth in the default-geometry tests.
 const GEOMETRY_HOST_BYTES: u64 = 64 << 30;
 
+/// Batches in the over-estimate test: two full windows of the derived depth
+/// 32 and a remainder, so the window restarts after a depth flush.
+const OVER_ESTIMATE_BATCHES: usize = 70;
+
 /// `batches` row groups of `batch_rows` identical rows on one stream, so
 /// every batch has the same estimated footprint and `--batch-rows
 /// <batch_rows>` reads one row group per batch.
@@ -2227,9 +2231,9 @@ async fn a_size_flush_restarts_the_depth_window() {
 
 /// Issue #2753: a first batch that over-estimates the rest (a much longer
 /// body) derives a target no 32 later batches reach, so the size trigger
-/// never fires and the depth flush closes every object. At depth 32, 51
-/// batches make `51 / 32` depth flushes and one end-of-input flush for the
-/// remainder.
+/// never fires and the depth flush closes every object. At depth 32, 70
+/// batches make two depth flushes (batches 1-32 and 33-64) and one
+/// end-of-input flush for the remaining 6.
 ///
 /// Prove-the-test: never call `window.submitted` in the logs loader and no
 /// flush answers the oldest write the loop waits on at the 32nd submit; the
@@ -2243,7 +2247,7 @@ async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
     let wide_body = format!("{UNIFORM_BODY}{}", "x".repeat(200));
     let (_dir, pq, m) = bodied_rows_fixture(
         GEOMETRY_BATCH_ROWS,
-        GEOMETRY_BATCHES,
+        OVER_ESTIMATE_BATCHES,
         &wide_body,
         UNIFORM_BODY,
     );
@@ -2264,22 +2268,16 @@ async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
     let layout = report.layout_report();
     let geometry = layout.geometry.expect("geometry resolved");
     assert_eq!(geometry.target_source, TargetSource::Derived);
-    let depth = geometry.pipeline_depth;
-    assert_eq!(depth, 32);
-    let depth_flushes = (GEOMETRY_BATCHES / depth) as u64;
-    let manual = u64::from(!GEOMETRY_BATCHES.is_multiple_of(depth));
-    assert_eq!(
-        list_data_objects(store.as_ref()).await.len() as u64,
-        depth_flushes + manual
-    );
+    assert_eq!(geometry.pipeline_depth, 32);
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), 3);
     assert_eq!(
         layout.flush_mix.totals,
         FlushMixCounts {
             size: 0,
             age: 0,
             arrival: 0,
-            depth: depth_flushes,
-            manual,
+            depth: 2,
+            manual: 1,
         },
         "no size flush is reachable, so the depth flush closes every full window"
     );
