@@ -7,9 +7,9 @@ use super::*;
 /// once and reused by every partition.
 pub(super) struct PlanCounts {
     pub(super) segs: Vec<Option<SegPlan>>,
-    /// Per segment, in snapshot order: relevant and at or under
-    /// [`LogSegmentFetcher::plan_whole_object_bound`] in a scan that
-    /// [`skips_sub_bound_plans`], so not planned (ADR-2677 decision 2). All
+    /// Per segment, in snapshot order: relevant and accepted by
+    /// [`may_skip_plan`] in a scan that [`skips_sub_bound_plans`], so not
+    /// planned (ADR-2677 decision 2). All
     /// false otherwise. Its owner opens it whole, once, and prunes its
     /// blocks from that read ([`open_segment_whole`]); its `segs` entry is
     /// `None`.
@@ -259,7 +259,9 @@ type PlanSegmentResult = Option<(
 /// Whether this scan opens its segments at or under
 /// [`LogSegmentFetcher::plan_whole_object_bound`] unplanned (ADR-2677
 /// decision 2): true when the scan holds at least `target_partitions` of them
-/// that are relevant to the query window. Counted over the whole segment list
+/// that are relevant to the query window and [`may_skip_plan`] accepts (a
+/// keyed query plans every segment above the block-range threshold, so its
+/// KEY_IDX is probed). Counted over the whole segment list
 /// once, inside the shared plan pass, so every partition routes every segment
 /// the same way.
 ///
@@ -275,7 +277,7 @@ fn skips_sub_bound_plans(
     let sub_bound = segments
         .iter()
         .filter(|seg| {
-            !ctx.fetcher.plans_segment(seg)
+            may_skip_plan(ctx, seg)
                 && LogSegmentFetcher::ts_range_relevant(
                     seg,
                     ctx.query.ts_min_ns,
@@ -284,6 +286,18 @@ fn skips_sub_bound_plans(
         })
         .count();
     sub_bound >= target_partitions.max(1)
+}
+
+/// Whether `seg` is one [`skips_sub_bound_plans`] may open unplanned: at or
+/// under [`LogSegmentFetcher::plan_whole_object_bound`], and, for a query
+/// with KEY_IDX equalities, also at or under
+/// [`LogSegmentFetcher::block_range_threshold`]. Above the threshold the
+/// keyed plan probes KEY_IDX and drops the object when a key is absent,
+/// which the unplanned whole open would read in full.
+fn may_skip_plan(ctx: &PartitionCtx, seg: &SegmentRef) -> bool {
+    !ctx.fetcher.plans_segment(seg)
+        && (ctx.query.key_equals.is_empty()
+            || seg.object_size <= ctx.fetcher.block_range_threshold())
 }
 
 /// Prune every segment once (no block decode) to build the shared block plan.
@@ -349,7 +363,7 @@ async fn compute_plan_counts(
         // object whole only to count its survivors, so the scan reads it once
         // instead, when the scan has enough such segments to fill its
         // partitions (see `skips_sub_bound_plans`).
-        if skip_sub_bound && !ctx.fetcher.plans_segment(seg) {
+        if skip_sub_bound && may_skip_plan(ctx, seg) {
             unplanned[idx] =
                 LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns);
             continue;
