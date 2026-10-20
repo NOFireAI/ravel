@@ -437,7 +437,8 @@ Refs: #800
 
 Issue #2753 (epic #2707) removes the fixed `--pipeline-depth` default. With
 the flag unset, `ravel-cli load` derives the depth once the first batch is
-decoded, as `ceil(250,000 x shards / batch_rows)`, lowered to the memory bound
+decoded, as `ceil(250,000 x shards / batch_rows)` (superseded: see the depth
+margin amendment below), lowered to the memory bound
 when that is smaller and capped at 1,024, so that about 250,000 rows reach each
 shard before its buffer is flushed (`services/ravel-cli/src/load/geometry.rs`,
 `resolve_geometry`). The constant amended decision 3 named,
@@ -459,3 +460,23 @@ of 4, and for the size-trigger path: an explicit `--target-bytes` turns the
 depth flush off, and at `--target-bytes 1` every write flushes as its own
 object, the layout decision 3 measured. The ingest guide (`docs/guides/ingest.md`, "Object geometry") states the
 derivation and its three bounds.
+
+## Amendment (issue #3119): the derived depth runs a quarter past the rows bound
+
+<!-- amendment-applies: sections="Amendment (issue #2753): the pipeline depth is derived, so decision 3 covers `--max-inflight-flushes` only" pointer="depth margin amendment" -->
+<!-- amendment-supersedes: phrase="as `ceil(250,000 x shards / batch_rows)`, lowered" pointer="depth margin amendment" -->
+
+The amendment above gives the derived `--pipeline-depth` as
+`ceil(250,000 x shards / batch_rows)`. ADR-2707's depth margin amendment
+(issue #3119) changes it: while the depth flush runs (a derived target),
+the derived depth is that rows bound plus a quarter of it, rounded up,
+still lowered to the memory bound and capped at 1,024
+(`services/ravel-cli/src/load/geometry.rs`, `resolve_geometry` and
+`rows_bound_depth`); with an explicit `--target-bytes` the depth flush is
+off and the derived depth stays the plain rows bound. A window of exactly
+the rows bound left about half the shards short of the target when the
+depth flush closed them; the quarter lets the size trigger close them
+first. Decision 3's `--max-inflight-flushes` default of 4 and the
+`--pipeline-depth 4` recipe are unaffected.
+
+Refs: #3119
