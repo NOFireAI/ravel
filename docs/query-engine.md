@@ -4316,8 +4316,9 @@ object at or under the whole-object bound then takes one whole read, with no
 second read. When the scan opens such objects unplanned (ADR-2677 decision
 2), the plan pass probes each one through `probe_segment_keyed`, which reads
 nothing past the tail and KEY_IDX and plans nothing, and the scan reads each
-object the probe keeps whole once. When the scan plans them, the plan's own
-whole read is that one read.
+object the probe keeps whole once. When the scan plans them, the unkeyed plan
+takes that one read, or leaves it to the scan when the skip index alone
+decides the survivor count (#761).
 
 A key counts as a block predicate (`LogQuery::is_block_predicate_free`), so a
 `trace_id`-only query on a tenant that indexes `trace_id` no longer takes the

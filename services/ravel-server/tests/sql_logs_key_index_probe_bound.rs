@@ -579,14 +579,14 @@ async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
             } else {
                 assert!(object.size() > 512 * KIB, "object {n}");
                 if n == HOLDER {
-                    // Read whole once: by the plan when the scan plans every
-                    // object, by the scan when it opens the holder unplanned.
-                    let by = if target_partitions == 4 {
-                        GetPhase::Scan
-                    } else {
-                        GetPhase::Plan
-                    };
-                    assert_eq!(object.whole_read_phases(), [by], "tp {target_partitions}");
+                    // Read whole once, by the scan, on both routes: planned,
+                    // the equality is skip-decidable, so the plan counts the
+                    // holder's survivors from its skip index without a block.
+                    assert_eq!(
+                        object.whole_read_phases(),
+                        [GetPhase::Scan],
+                        "tp {target_partitions}"
+                    );
                 } else {
                     assert!(
                         !object.read_whole(),

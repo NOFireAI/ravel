@@ -1250,9 +1250,9 @@ is exact: one probe per keyed object above the threshold (its tail read, the
 KEY_IDX prefix, and at most one bucket per key). An object the probe proves
 the key absent from is dropped with no other read. An object between the
 threshold and the whole-object bound that holds the key, or whose keys all
-decline, is then read whole once: by the plan on the planned route, as the
-unkeyed plan reads it, and by the scan on the unplanned route, with no
-second read. Only above the bound does a present key restrict the read to
+decline, is then read whole once, with no second read: on the planned route
+where the unkeyed plan reads it (by the scan when the skip index alone decides
+the survivor count, #761), and by the scan on the unplanned route. Only above the bound does a present key restrict the read to
 the KEY_IDX block set. An object at or under the threshold is read whole and
 not probed. `services/ravel-server/tests/sql_logs_key_index_probe_bound.rs`
 pins both routes, the single whole read, and the threshold.
