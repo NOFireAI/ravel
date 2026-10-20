@@ -478,8 +478,8 @@ impl MemoryBudget {
     /// itself. It admits and refuses exactly as [`reserve`] does (the same
     /// gate rule, ledger limit and overflow rule, the same `MemoryExhausted`)
     /// and grows `fetch_reserved()` the same way, but a refusal moves neither
-    /// [`accounted_refusals`] nor [`gate_refusals`], so those stay a count of
-    /// reservations whose refusal failed the work that asked.
+    /// [`accounted_refusals`] nor [`gate_refusals`]: a fallback that fails
+    /// nothing does not read as a failure in those counters.
     ///
     /// [`reserve`]: MemoryBudget::reserve
     /// [`accounted_refusals`]: MemoryBudget::accounted_refusals

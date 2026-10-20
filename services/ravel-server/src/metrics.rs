@@ -366,12 +366,8 @@ pub enum Label {
     /// `ravel_memory_reserved_bytes` sample is: `Sql` is
     /// `MemoryBudget::sql_reserved()` (the raw-counter API
     /// `TenantMemoryAccountant` uses), `Fetch` is
-    /// `MemoryBudget::fetch_reserved()` (the RAII `Reservation` API
-    /// `ravel-query`'s fetchers use, and that the Parquet footer reads
-    /// `ravel-parquet`'s `snapshot_location` makes for
-    /// `CREATE EXTERNAL TABLE` and `ravel-promql`'s range-query selector
-    /// cache use too, so a PromQL range query's cached selector reads show
-    /// up under `component="fetch"`). The two counters are disjoint by
+    /// `MemoryBudget::fetch_reserved()` (bytes held by a live `Reservation`;
+    /// that method's doc lists who holds them). The two counters are disjoint by
     /// construction (`ravel_memory::MemoryBudget` tracks fetch reservations
     /// separately from the total, so `sql_reserved` is the total minus
     /// `fetch_reserved`, never the total itself), so summing both samples
@@ -582,13 +578,8 @@ impl AllocatorStat {
 /// `Sql` is the `SqlExecutor`'s per-tenant accountants
 /// (`ravel_memory::TenantMemoryAccountant`), all sharing the one process
 /// `MemoryBudget` through its raw `try_reserve`/`reserve_unchecked`/`release`
-/// counter API; `Fetch` is the fetch layer's own reservation against that
-/// same budget (the PromQL, fragment and cache-warm `SegmentFetcher` and
-/// `LogSegmentFetcher` instances, and the three fetchers `build_sql_state`
-/// constructs, RSPAN included, the Parquet footer reads `ravel-parquet`'s
-/// `snapshot_location` makes for `CREATE EXTERNAL TABLE`, and `ravel-promql`'s
-/// range-query selector cache, all through the RAII `reserve`/`Reservation`
-/// API).
+/// counter API; `Fetch` is every live `Reservation` against that same budget,
+/// `MemoryBudget::fetch_reserved()` (that method's doc lists who holds them).
 /// `ravel_memory::MemoryBudget` tracks the fetch share in its own counter, so
 /// the two never double-count (see [`Label::MemoryComponent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3288,11 +3279,8 @@ fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
 ///
 /// `ravel_memory_reserved_bytes{component="fetch"}` is
 /// `MemoryBudget::fetch_reserved()`: bytes currently held by a live
-/// `ravel_memory::Reservation` (`ravel-query`'s fetchers, the Parquet
-/// footer reads `ravel-parquet`'s `snapshot_location` makes for
-/// `CREATE EXTERNAL TABLE`, and `ravel-promql`'s range-query selector cache,
-/// whose entries are evaluator memory rather than fetch buffers but are
-/// counted here). `component="sql"`
+/// `ravel_memory::Reservation` (that method's doc lists who holds them).
+/// `component="sql"`
 /// is `MemoryBudget::sql_reserved()`, the total minus the fetch share, i.e.
 /// `TenantMemoryAccountant`'s raw-counter reservations -- never the whole
 /// budget total, so the two samples never double-count each other. Both
@@ -3332,7 +3320,7 @@ fn render_memory_budget_family(out: &mut String, mode: Mode, budget: MemoryBudge
     write_header(
         out,
         "ravel_memory_reserved_bytes",
-        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is TenantMemoryAccountant's raw-counter share, component=\"fetch\" is bytes held by a live Reservation (ravel-query fetchers, Parquet footer reads, and the PromQL range-query selector cache); the two are disjoint. They sum to the budget's reserved total when no reservation is changing; while fetch reservations change during a scrape, each figure can be off by the summed sizes of the reservations that changed.",
+        "Bytes currently reserved against the ADR-1170 process memory budget, by component. component=\"sql\" is TenantMemoryAccountant's raw-counter share, component=\"fetch\" is bytes held by a live Reservation (the fetchers among others; see MemoryBudget::fetch_reserved in ravel-memory for the list); the two are disjoint. They sum to the budget's reserved total when no reservation is changing; while fetch reservations change during a scrape, each figure can be off by the summed sizes of the reservations that changed.",
         "gauge",
     );
     write_sample(
@@ -6369,13 +6357,15 @@ fn render_memory_gate_family(
         (
             "ravel_memory_gate_refusals_total",
             "Memory reservations refused because the memory gate was closed on host available \
-             memory, by check site.",
+             memory, by check site. Not counted: a refused PromQL range-query selector-cache \
+             entry, which fails nothing and is reported in the query's info annotation.",
             gate_sites,
         ),
         (
             "ravel_memory_budget_refusals_total",
             "Memory reservations refused because the process memory budget's ledger was full, by \
-             check site.",
+             check site. Not counted: a refused PromQL range-query selector-cache entry, which \
+             fails nothing and is reported in the query's info annotation.",
             budget_sites,
         ),
     ];
