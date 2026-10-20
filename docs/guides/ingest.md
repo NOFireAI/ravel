@@ -1296,8 +1296,8 @@ the loader derives the flush target from the first decoded batch: 250,000
 rows times that batch's estimated bytes per row. While one shard's slice
 of a batch (`--batch-rows` / `--shards` rows) is at most 250,000 rows and
 the memory bound (below) does not lower the pipeline depth below the rows
-bound, each shard's objects close on size, on logs, metrics and spans
-alike. The size trigger is checked once per batch, so an object holds
+bound plus its quarter, each shard's objects close on size, on logs, metrics
+and spans alike. The size trigger is checked once per batch, so an object holds
 250,000 rows plus up to one slice: about 250,000 rows while the slice is
 small against the target (below 252,500 at the defaults on four
 shards), and up to two slices, just under 500,000 rows, when a slice is
