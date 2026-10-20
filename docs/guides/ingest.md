@@ -1317,8 +1317,10 @@ When the memory bound is lower than the rows bound plus its quarter, it
 decides the depth. If it is also lower than the rows bound itself, the
 depth flush closes each shard's buffer every `--pipeline-depth` batches,
 so objects hold about depth x `--batch-rows` / `--shards` rows, below
-250,000; between the rows bound and its quarter a window still holds one
-target per shard, and evenly spread rows still close on size.
+250,000. A depth between the rows bound and the full quarter closes most
+objects on size, but a window of it leaves the shards that drew less than
+their share of its rows to the depth flush, short of the target; that
+share falls as the depth approaches the quarter.
 When `--batch-rows` / `--shards` is below about 305 the rows bound plus
 its quarter is above the 1,024 cap, so the cap decides the depth. Below
 245 the rows bound itself is above the cap, and the depth flush
@@ -1404,7 +1406,7 @@ is decoded, on every signal, as the lowest of three bounds:
   flight.
 
 The summary names the cap when it decided the depth (`cap decided it:
-cap 1024, rows bound <N> + 25% = <N>, memory bound <N>`), including when
+cap 1024, rows bound <N> + <N> = <N>, memory bound <N>`), including when
 the memory bound is above the cap. With an explicit `--target-bytes` the
 rows bound prints without the quarter (`rows bound <N>`).
 
@@ -1470,7 +1472,7 @@ mix that produced its objects, on logs, metrics and spans alike:
 
 ```text
   flush target     : <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row)
-  pipeline depth   : <N> (rows bound decided it: rows bound <N> + 25% = <N>, memory bound <N>)
+  pipeline depth   : <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>)
   depth realign    : per shard on size flushes
   flush triggers   : size <N>, age <N>, arrival <N>, depth <N>, manual <N> (total <N>)
     shard   0      : size <N>, age <N>, arrival <N>, depth <N>, manual <N> (total <N>)
@@ -1483,7 +1485,7 @@ one line on stderr, so a long load shows what it resolved without waiting
 for the summary:
 
 ```text
-load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N> + 25% = <N>, memory bound <N>)
+load geometry: logs: flush target <BYTES> bytes (derived: 250000 rows x <N> estimated bytes per row), pipeline depth <N> (rows bound decided it: rows bound <N> + <N> = <N>, memory bound <N>)
 ```
 
 The flush target names `--target-bytes` when the flag set it. The depth
