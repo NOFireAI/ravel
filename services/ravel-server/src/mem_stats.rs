@@ -27,8 +27,9 @@ pub enum AllocatorStats {
         allocated: u64,
         active: u64,
         resident: u64,
-        /// Whether jemalloc's background purge thread is running, read back
-        /// from the allocator at the same time as the byte figures.
+        /// Whether jemalloc's background purge thread is enabled, read from
+        /// the allocator at the same time as the byte figures, or `false`
+        /// once [`configure_background_thread`] has failed to start it.
         background_thread: bool,
     },
     Other {
@@ -75,8 +76,9 @@ fn read_with(
 }
 
 /// Set by the startup step when its write to start the background thread
-/// failed. jemalloc's own enabled flag stays set in that case although no
-/// thread runs, so [`read`] reports this instead.
+/// failed. jemalloc's own enabled flag stays set with no thread running
+/// unless the step's write turning it back off succeeds, so [`read`] reports
+/// this instead.
 #[cfg(not(target_env = "msvc"))]
 static BACKGROUND_THREAD_START_FAILED: AtomicBool = AtomicBool::new(false);
 
@@ -100,8 +102,9 @@ pub const MALLOC_CONF_ENV: &str = "_RJEM_MALLOC_CONF";
 /// The state of jemalloc's background purge thread after the startup step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BackgroundThread {
-    /// Read back from the allocator after the step, not the value written,
-    /// except after a failed start, which is always `false`.
+    /// Read back from the allocator after the step, not the value written.
+    /// `false` without a read-back when the source is `"start-failed"` or
+    /// `"unavailable"`.
     pub enabled: bool,
     /// Who decided the state: `"server"` when the startup step enabled it,
     /// `"malloc_conf"` when the operator's [`MALLOC_CONF_ENV`] names
@@ -114,7 +117,8 @@ pub struct BackgroundThread {
 }
 
 impl BackgroundThread {
-    /// The startup stamp: one INFO line naming the read-back state.
+    /// The startup stamp: one INFO line naming [`Self::enabled`] and
+    /// [`Self::source`].
     pub fn emit(&self) {
         tracing::info!(
             allocator_background_thread = self.enabled,
@@ -173,10 +177,11 @@ fn mallctl_name_is_unknown(err: tikv_jemalloc_ctl::Error) -> bool {
 /// [`MALLOC_CONF_ENV`] value: when it names `background_thread`, either way,
 /// this writes nothing, because the safe API cannot tell an explicit
 /// `background_thread:false` from jemalloc's default of false. A failed write
-/// is a warning, never a startup failure: it stamps `"start-failed"` and
-/// makes [`read`] report the thread as not running for the rest of the
-/// process. A jemalloc build without background-thread support (macOS) is
-/// not a failure: it stamps `"unavailable"` with an info line.
+/// is a warning, never a startup failure: it stamps `"start-failed"`, writes
+/// the thread back off (see [`resolve_background_thread`]), and makes
+/// [`read`] report the thread as not running for the rest of the process. A
+/// jemalloc build without background-thread support (macOS) is not a
+/// failure: it stamps `"unavailable"` with an info line.
 #[cfg(not(target_env = "msvc"))]
 pub fn configure_background_thread(malloc_conf: Option<&str>) -> BackgroundThread {
     use tikv_jemalloc_ctl::background_thread;
@@ -184,7 +189,7 @@ pub fn configure_background_thread(malloc_conf: Option<&str>) -> BackgroundThrea
     configure_with(
         &BACKGROUND_THREAD_START_FAILED,
         malloc_conf.is_some_and(malloc_conf_names_background_thread),
-        || background_thread::write(true),
+        background_thread::write,
         background_thread::read,
     )
 }
@@ -195,7 +200,7 @@ pub fn configure_background_thread(malloc_conf: Option<&str>) -> BackgroundThrea
 fn configure_with(
     start_failed: &AtomicBool,
     operator_set: bool,
-    write: impl FnOnce() -> tikv_jemalloc_ctl::Result<()>,
+    write: impl FnMut(bool) -> tikv_jemalloc_ctl::Result<()>,
     read: impl FnOnce() -> tikv_jemalloc_ctl::Result<bool>,
 ) -> BackgroundThread {
     let state = resolve_background_thread(operator_set, write, read);
@@ -205,38 +210,40 @@ fn configure_with(
     state
 }
 
-/// The startup step's decision over injected `write` and `read` mallctl
-/// calls. `operator_set` skips the write. An unavailable write returns
-/// without calling `read`, which would answer the same way. Any failed write,
-/// not only EFAULT, returns `"start-failed"` without calling `read`: in the
-/// vendored jemalloc 5.3.1, `background_thread_ctl` sets the enabled flag
-/// before it creates the thread and returns EFAULT with the flag still set
-/// when creation fails, and its other failures (EAGAIN from initialisation,
-/// EINVAL for a wrong value size) return before any thread is created.
+/// The startup step's decision over injected `background_thread` mallctl
+/// `write` and `read` calls. `operator_set` skips the write. An unavailable
+/// write returns without calling `read`, which would answer the same way.
+///
+/// Any failed write of `true`, not only EFAULT, returns `"start-failed"`
+/// without calling `read`, because none of them leaves a thread running. In
+/// the vendored jemalloc 5.3.1, `background_thread_ctl` sets the enabled flag
+/// before it creates thread 0 and returns EFAULT with the flag still set when
+/// creation fails. EAGAIN comes from mallctl's own setup (`malloc_init`,
+/// `ctl_init`) before the handler runs, and the handler's EINVAL is
+/// unreachable through a typed `bool` write.
+///
+/// With the flag set and no thread, application threads never decay-purge,
+/// so a failed start is followed by a write of `false`. That clears the flag
+/// and succeeds although thread 0 never started, because the disable path
+/// joins only a started thread, and purging on allocator activity resumes as
+/// under `background_thread:false`. The slots jemalloc marked for other arenas
+/// stay marked started with no thread, which trips an assert only in a debug
+/// build of jemalloc. If that write fails as well, nothing decay-purges until
+/// restart and freed pages return only through forced purges
+/// ([`purge_arenas`]).
 #[cfg(not(target_env = "msvc"))]
 fn resolve_background_thread(
     operator_set: bool,
-    write: impl FnOnce() -> tikv_jemalloc_ctl::Result<()>,
+    mut write: impl FnMut(bool) -> tikv_jemalloc_ctl::Result<()>,
     read: impl FnOnce() -> tikv_jemalloc_ctl::Result<bool>,
 ) -> BackgroundThread {
     let source = if operator_set {
         "malloc_conf"
     } else {
-        match classify_mallctl(write()) {
+        match classify_mallctl(write(true)) {
             Mallctl::Done(()) => {}
             Mallctl::Unavailable(err) => return unavailable(err),
-            Mallctl::Failed(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "could not start the jemalloc background purge thread; reporting it as not \
-                     running, and freed pages are returned to the operating system only on \
-                     allocator activity"
-                );
-                return BackgroundThread {
-                    enabled: false,
-                    source: START_FAILED,
-                };
-            }
+            Mallctl::Failed(err) => return start_failed(err, write(false)),
         }
         "server"
     };
@@ -253,6 +260,39 @@ fn resolve_background_thread(
                 source,
             }
         }
+    }
+}
+
+/// The stamp and warnings for a failed start, given the result of the write
+/// that turned the thread back off.
+#[cfg(not(target_env = "msvc"))]
+fn start_failed(
+    err: tikv_jemalloc_ctl::Error,
+    turned_off: tikv_jemalloc_ctl::Result<()>,
+) -> BackgroundThread {
+    match turned_off {
+        Ok(()) => tracing::warn!(
+            error = %err,
+            "could not start the jemalloc background purge thread; turned it back off and \
+             reporting it as not running, so freed pages are returned to the operating system \
+             only on allocator activity"
+        ),
+        Err(off_err) => {
+            tracing::warn!(
+                error = %err,
+                "could not start the jemalloc background purge thread; reporting it as not running"
+            );
+            tracing::warn!(
+                error = %off_err,
+                "could not turn the jemalloc background purge thread back off after its failed \
+                 start; decay purging is off until restart, and freed pages are returned to the \
+                 operating system only through forced purges"
+            );
+        }
+    }
+    BackgroundThread {
+        enabled: false,
+        source: START_FAILED,
     }
 }
 
@@ -517,6 +557,19 @@ mod tests {
         err
     }
 
+    /// A `background_thread` write that answers `true` with `result` and
+    /// panics on `false`, for the paths that must not turn the thread off.
+    #[cfg(not(target_env = "msvc"))]
+    fn write_true_only(
+        result: impl FnOnce() -> tikv_jemalloc_ctl::Result<()>,
+    ) -> impl FnMut(bool) -> tikv_jemalloc_ctl::Result<()> {
+        let mut result = Some(result);
+        move |value| {
+            assert!(value, "no write of false on this path");
+            (result.take().expect("one write of true"))()
+        }
+    }
+
     /// Runs `f` under a subscriber that captures every INFO-and-above line.
     #[cfg(not(target_env = "msvc"))]
     fn with_captured_log(f: impl FnOnce() -> BackgroundThread) -> (BackgroundThread, String) {
@@ -565,11 +618,9 @@ mod tests {
     #[test]
     fn resolve_stamps_an_unavailable_write_without_a_read_back_or_warning() {
         let (state, logged) = with_captured_log(|| {
-            resolve_background_thread(
-                false,
-                || Err(enoent()),
-                || panic!("no read-back after an unavailable write"),
-            )
+            resolve_background_thread(false, write_true_only(|| Err(enoent())), || {
+                panic!("no read-back after an unavailable write")
+            })
         });
         assert_eq!(
             state,
@@ -589,7 +640,7 @@ mod tests {
         let (state, logged) = with_captured_log(|| {
             resolve_background_thread(
                 false,
-                || Err(eperm()),
+                |value| if value { Err(eperm()) } else { Ok(()) },
                 || panic!("no read-back after a failed write"),
             )
         });
@@ -611,7 +662,11 @@ mod tests {
     #[test]
     fn resolve_stamps_a_failed_start_as_not_running_despite_the_read_back() {
         let (state, logged) = with_captured_log(|| {
-            let state = resolve_background_thread(false, || Err(efault()), || Ok(true));
+            let state = resolve_background_thread(
+                false,
+                |value| if value { Err(efault()) } else { Ok(()) },
+                || Ok(true),
+            );
             state.emit();
             state
         });
@@ -647,8 +702,9 @@ mod tests {
         };
 
         let started = AtomicBool::new(false);
-        let (state, _) =
-            with_captured_log(|| configure_with(&started, false, || Ok(()), || Ok(true)));
+        let (state, _) = with_captured_log(|| {
+            configure_with(&started, false, write_true_only(|| Ok(())), || Ok(true))
+        });
         assert_eq!(
             state,
             BackgroundThread {
@@ -660,8 +716,14 @@ mod tests {
         assert!(background_thread_of(read_with(&started, || Ok(true))));
 
         let failed = AtomicBool::new(false);
-        let (state, _) =
-            with_captured_log(|| configure_with(&failed, false, || Err(efault()), || Ok(true)));
+        let (state, _) = with_captured_log(|| {
+            configure_with(
+                &failed,
+                false,
+                |value| if value { Err(efault()) } else { Err(eperm()) },
+                || Ok(true),
+            )
+        });
         assert_eq!(state.source, "start-failed");
         assert!(
             failed.load(Ordering::Relaxed),
@@ -673,6 +735,107 @@ mod tests {
         );
     }
 
+    /// Issue #3096: with jemalloc's enabled flag left set and no thread, no
+    /// application thread decay-purges, so a failed start writes the thread
+    /// back off, once, and the stamp still names the failed start.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn a_failed_start_turns_the_thread_back_off() {
+        let failed = AtomicBool::new(false);
+        let mut written = Vec::new();
+        let (state, logged) = with_captured_log(|| {
+            configure_with(
+                &failed,
+                false,
+                |value| {
+                    written.push(value);
+                    if value { Err(efault()) } else { Ok(()) }
+                },
+                || panic!("no read-back after a failed write"),
+            )
+        });
+        assert_eq!(written, [true, false]);
+        assert_eq!(
+            state,
+            BackgroundThread {
+                enabled: false,
+                source: "start-failed",
+            }
+        );
+        assert!(failed.load(Ordering::Relaxed));
+        assert_eq!(logged.lines().count(), 1, "got: {logged:?}");
+        assert_eq!(logged.matches(" WARN ").count(), 1, "got: {logged:?}");
+        assert_eq!(
+            logged
+                .matches("turned it back off and reporting it as not running")
+                .count(),
+            1,
+            "got: {logged:?}"
+        );
+        assert!(!logged.contains("decay purging is off"), "got: {logged:?}");
+    }
+
+    /// Issue #3096: when the write turning the thread back off fails too,
+    /// the flag stays set and nothing decay-purges until restart, which the
+    /// step warns about on top of the failed start.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn a_failed_turn_off_after_a_failed_start_warns_that_decay_purging_is_off() {
+        let failed = AtomicBool::new(false);
+        let mut written = Vec::new();
+        let (state, logged) = with_captured_log(|| {
+            configure_with(
+                &failed,
+                false,
+                |value| {
+                    written.push(value);
+                    if value { Err(efault()) } else { Err(eperm()) }
+                },
+                || panic!("no read-back after a failed write"),
+            )
+        });
+        assert_eq!(written, [true, false]);
+        assert_eq!(
+            state,
+            BackgroundThread {
+                enabled: false,
+                source: "start-failed",
+            }
+        );
+        assert!(failed.load(Ordering::Relaxed));
+        assert_eq!(logged.lines().count(), 2, "got: {logged:?}");
+        assert_eq!(logged.matches(" WARN ").count(), 2, "got: {logged:?}");
+        assert_eq!(
+            logged
+                .matches(
+                    "could not turn the jemalloc background purge thread back off after its \
+                     failed start; decay purging is off until restart, and freed pages are \
+                     returned to the operating system only through forced purges"
+                )
+                .count(),
+            1,
+            "got: {logged:?}"
+        );
+        assert!(!logged.contains("turned it back off"), "got: {logged:?}");
+    }
+
+    /// A successful start is left running and read back.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn resolve_leaves_a_started_thread_on() {
+        let (state, logged) = with_captured_log(|| {
+            resolve_background_thread(false, write_true_only(|| Ok(())), || Ok(true))
+        });
+        assert_eq!(
+            state,
+            BackgroundThread {
+                enabled: true,
+                source: "server",
+            }
+        );
+        assert!(logged.is_empty(), "got: {logged:?}");
+    }
+
     /// An operator's `background_thread` setting on a build without
     /// background-thread support: the read-back is unavailable, not a
     /// failure.
@@ -682,7 +845,7 @@ mod tests {
         let (state, logged) = with_captured_log(|| {
             resolve_background_thread(
                 true,
-                || panic!("no write when the operator set the thread"),
+                |_| panic!("no write when the operator set the thread"),
                 || Err(enoent()),
             )
         });
