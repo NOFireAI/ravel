@@ -4172,7 +4172,11 @@ mod tests {
         assert_eq!(stats.fallback_keys, 1);
         assert_eq!(stats.bytes, entry, "the first key stays cached");
         assert_eq!(budget.reserved(), entry, "held while the query runs");
-        assert_eq!(budget.accounted_refusals(), 1);
+        assert_eq!(
+            (budget.accounted_refusals(), budget.gate_refusals()),
+            (0, 0),
+            "a fallback is not a refusal the budget counts"
+        );
         assert_eq!(
             float_reads_by_offset_s(&source),
             vec![(0, 1), (1, HOUR_GRID_STEPS)]
@@ -4209,6 +4213,59 @@ mod tests {
             reference
         );
         assert_eq!(without_annotations(cached), reference);
+    }
+
+    /// A closed memory gate refuses every entry's reservation, on a budget
+    /// whose ledger has room, without counting a gate refusal: both keys fall
+    /// back with the host-memory cause and the answer is the cache-off one.
+    ///
+    /// FLIP: a best-effort path that skips the gate check caches both keys,
+    /// so `fallback_keys` reads 0; one that counts its refusals leaves
+    /// `gate_refusals()` at 2.
+    #[test]
+    fn a_closed_memory_gate_refuses_every_entry_and_counts_nothing() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        budget.set_host_memory_gate(false, 4, 5);
+        let query = "m + m offset 1s";
+        let evaluator = Evaluator::new().with_memory_budget(Arc::clone(&budget));
+        let source = two_hour_source();
+        let (start, end, step) = HOUR_GRID;
+        let (value, ctx) = evaluator
+            .eval_range_in_window(&source, query, start, end, step)
+            .expect("a closed gate does not fail the query through the cache");
+        let stats = ctx
+            .selector_cache_stats()
+            .expect("a range query runs with the selector cache");
+        assert_eq!(stats.fallback_keys, 2);
+        assert_eq!(stats.bytes, 0);
+        assert_eq!(
+            (budget.accounted_refusals(), budget.gate_refusals()),
+            (0, 0)
+        );
+        let annotations = ctx.annotations.borrow().clone();
+        assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
+        let info = &annotations.infos()[0];
+        assert!(
+            info.contains(
+                "2 refused by the query memory budget (first refusal: memory exhausted: \
+                 host available memory 4 bytes is below the 5 byte floor"
+            ),
+            "{info}"
+        );
+        drop(ctx);
+        assert_eq!(budget.reserved(), 0);
+
+        let reference_source = two_hour_source();
+        let (reference, _) = range_with_cache_stats(
+            Evaluator::new().without_selector_cache(),
+            &reference_source,
+            query,
+            HOUR_GRID,
+        );
+        assert_eq!(
+            without_annotations(Ok((value, Annotations::default()))),
+            without_annotations(reference)
+        );
     }
 
     /// Every sample [`day_source`] holds: four series of 1561 points.
@@ -4404,7 +4461,7 @@ mod tests {
         assert_eq!(stats.fallback_keys, 1);
         assert_eq!(stats.bytes, 0, "the replaced entry is gone");
         assert_eq!(budget.reserved(), 0, "no stale entry holds a reservation");
-        assert_eq!(budget.accounted_refusals(), 1);
+        assert_eq!(budget.accounted_refusals(), 0, "a fallback is not counted");
         // The first step reads the first window and the union window; every
         // later step reads both selectors over their own windows.
         assert_eq!(source.query_count(), 2 + 2 * (REREAD_GRID_STEPS - 1));
@@ -4481,7 +4538,7 @@ mod tests {
                 HOUR_GRID,
             );
             let (_, annotations) = result.expect("query evaluates");
-            assert_eq!(budget.accounted_refusals(), 4);
+            assert_eq!(budget.accounted_refusals(), 0, "a fallback is not counted");
             assert_eq!(annotations.infos(), std::slice::from_ref(&expected));
         }
     }

@@ -7562,7 +7562,10 @@ mod prefetch_tests {
     /// engine's memory budget. Eight keys of about 2.5 KB each against a
     /// 4096-byte budget: the first is cached, the other seven are read at
     /// every step, the response carries one info naming them, the answer is
-    /// the unconstrained one, and the budget is back to zero afterwards.
+    /// the unconstrained one, and the budget is back to zero afterwards. The
+    /// seven fallbacks are not refusals the budget counts: the query
+    /// succeeded, so `ravel_memory_budget_refusals_total` and
+    /// `ravel_memory_gate_refusals_total` must not move.
     #[tokio::test]
     async fn a_range_query_over_its_memory_budget_reads_per_step_and_says_so() {
         let budget = Arc::new(ravel_memory::MemoryBudget::new(4096));
@@ -7575,7 +7578,12 @@ mod prefetch_tests {
             0,
             "every entry is released with the query"
         );
-        assert_eq!(budget.accounted_refusals(), 7);
+        assert_eq!(
+            budget.accounted_refusals(),
+            0,
+            "a selector-cache fallback is not a counted refusal"
+        );
+        assert_eq!(budget.gate_refusals(), 0);
         assert!(annotations.warnings().is_empty());
         assert_eq!(annotations.infos().len(), 1, "{:?}", annotations.infos());
         // The first refusal is `m offset 1s`, against `m`'s cached entry: `m`
