@@ -148,18 +148,22 @@ impl MemoryBudget {
 
     /// `try_reserve` calls (including those made by [`reserve`]) refused
     /// because the ledger would exceed `limit`: the
-    /// [`ExhaustionCause::Accounted`] refusals.
+    /// [`ExhaustionCause::Accounted`] refusals. A [`reserve_best_effort`]
+    /// refusal is not counted here.
     ///
     /// [`reserve`]: MemoryBudget::reserve
+    /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
     pub fn accounted_refusals(&self) -> u64 {
         self.refusals.accounted.load(Ordering::Relaxed)
     }
 
     /// `try_reserve` calls (including those made by [`reserve`]) refused
     /// because the memory gate was closed: the
-    /// [`ExhaustionCause::HostMemory`] refusals.
+    /// [`ExhaustionCause::HostMemory`] refusals. A [`reserve_best_effort`]
+    /// refusal is not counted here.
     ///
     /// [`reserve`]: MemoryBudget::reserve
+    /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
     pub fn gate_refusals(&self) -> u64 {
         self.refusals.gate.load(Ordering::Relaxed)
     }
@@ -197,16 +201,23 @@ impl MemoryBudget {
         self.handoff_overlap.load(Ordering::Acquire)
     }
 
-    /// Bytes currently reserved through [`reserve`] (the RAII `Reservation`
-    /// API, whose callers include `SegmentFetcher`, `LogSegmentFetcher`,
-    /// `SpanSegmentFetcher`, the DDL footer reads `ravel-parquet`'s
-    /// `snapshot_location` makes for `CREATE EXTERNAL TABLE`, and
-    /// `ravel-promql`'s range-query selector cache, one reservation per
-    /// cached selector read), a subset of `reserved()`. `try_reserve` and `reserve_unchecked` (the raw counter
-    /// API SQL's `TenantMemoryAccountant` uses exclusively) never touch this
-    /// counter, so it never counts SQL execution's share.
+    /// Bytes currently held by a live [`Reservation`], a subset of
+    /// `reserved()`. This is the one list of who holds them:
+    ///
+    /// - `SegmentFetcher`, `LogSegmentFetcher` and `SpanSegmentFetcher`, through
+    ///   [`reserve`];
+    /// - the DDL footer reads `ravel-parquet`'s `snapshot_location` makes for
+    ///   `CREATE EXTERNAL TABLE`, through [`reserve`];
+    /// - `ravel-promql`'s range-query selector cache, one reservation per
+    ///   cached selector read, through [`reserve_best_effort`]. Its entries are
+    ///   evaluator memory rather than fetch buffers, but are counted here.
+    ///
+    /// `try_reserve` and `reserve_unchecked` (the raw counter API SQL's
+    /// `TenantMemoryAccountant` uses exclusively) never touch this counter, so
+    /// it never counts SQL execution's share.
     ///
     /// [`reserve`]: MemoryBudget::reserve
+    /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
     pub fn fetch_reserved(&self) -> u64 {
         self.fetch_reserved.load(Ordering::Acquire)
     }
@@ -249,6 +260,15 @@ impl MemoryBudget {
     /// [`accounted_refusals`]: MemoryBudget::accounted_refusals
     /// [`gate_refusals`]: MemoryBudget::gate_refusals
     pub fn try_reserve(&self, n: u64) -> Result<(), MemoryExhausted> {
+        self.admit(n)
+            .inspect_err(|refusal| self.count_refusal(refusal))
+    }
+
+    /// `try_reserve`'s gate and ledger checks, counting nothing: the one
+    /// admission rule `try_reserve` and [`reserve_best_effort`] share.
+    ///
+    /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
+    fn admit(&self, n: u64) -> Result<(), MemoryExhausted> {
         if n > 0
             && !self.gate_open()
             && let Some(refusal) = self.refuse_host_memory(n)
@@ -260,7 +280,6 @@ impl MemoryBudget {
             let next = match current.checked_add(n) {
                 Some(next) if next <= self.limit => next,
                 _ => {
-                    self.refusals.accounted.fetch_add(1, Ordering::Relaxed);
                     return Err(MemoryExhausted {
                         requested: n,
                         reserved: current,
@@ -281,10 +300,19 @@ impl MemoryBudget {
         }
     }
 
-    /// The gate refusal of an `n`-byte `try_reserve`, out of line so the
+    /// Moves the refusal counter of `refusal`'s cause by one.
+    fn count_refusal(&self, refusal: &MemoryExhausted) {
+        let counter = match refusal.cause {
+            ExhaustionCause::Accounted => &self.refusals.accounted,
+            ExhaustionCause::HostMemory { .. } => &self.refusals.gate,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The gate refusal of an `n`-byte admission, out of line so the
     /// open-gate path carries none of it. `None` when the figures read here
     /// show the gate reopened after the caller saw it closed: the caller
-    /// then goes on to the ledger, and no refusal is counted.
+    /// then goes on to the ledger.
     #[cold]
     #[inline(never)]
     fn refuse_host_memory(&self, n: u64) -> Option<MemoryExhausted> {
@@ -297,7 +325,6 @@ impl MemoryBudget {
         if available >= floor {
             return None;
         }
-        self.refusals.gate.fetch_add(1, Ordering::Relaxed);
         Some(MemoryExhausted {
             requested: n,
             reserved: self.reserved.load(Ordering::Relaxed),
@@ -392,11 +419,13 @@ impl MemoryBudget {
     }
 
     /// Grows `fetch_reserved` by `n`. Saturating add, mirroring
-    /// `reserve_unchecked`: called only from [`reserve`] right after
-    /// `try_reserve` already admitted `n` against `limit`, so saturation
-    /// here is unreachable in practice, not a silent-miscount path.
+    /// `reserve_unchecked`: called only from [`reserve`] and
+    /// [`reserve_best_effort`] right after `n` was admitted against `limit`,
+    /// so saturation here is unreachable in practice, not a silent-miscount
+    /// path.
     ///
     /// [`reserve`]: MemoryBudget::reserve
+    /// [`reserve_best_effort`]: MemoryBudget::reserve_best_effort
     fn note_fetch_reserved(&self, n: u64) {
         let mut current = self.fetch_reserved.load(Ordering::Acquire);
         loop {
@@ -435,20 +464,40 @@ impl MemoryBudget {
     /// Takes `self` as `&Arc<Self>` so the returned [`Reservation`] owns
     /// its own `Arc` clone and can travel with the buffer it accounts for
     /// across threads and tasks, rather than being tied to a borrow scope.
-    /// Also grows `fetch_reserved()` by `n`: every caller of this RAII path
-    /// is counted as the fetch share, which besides the fetchers includes
-    /// `ravel-promql`'s range-query selector cache (see [`fetch_reserved`]'s
-    /// doc comment for the full list).
+    /// Also grows `fetch_reserved()` by `n` (see [`fetch_reserved`] for who
+    /// holds these reservations).
     ///
     /// [`fetch_reserved`]: MemoryBudget::fetch_reserved
     pub fn reserve(self: &Arc<Self>, n: u64) -> Result<Reservation, MemoryExhausted> {
         self.try_reserve(n)?;
+        Ok(self.fetch_reservation(n))
+    }
+
+    /// [`reserve`] for a caller whose refusal is not a failure: one that
+    /// falls back to a path holding less memory and reports the fallback
+    /// itself. It admits and refuses exactly as [`reserve`] does (the same
+    /// gate rule, ledger limit and overflow rule, the same `MemoryExhausted`)
+    /// and grows `fetch_reserved()` the same way, but a refusal moves neither
+    /// [`accounted_refusals`] nor [`gate_refusals`]: a fallback that fails
+    /// nothing does not read as a failure in those counters.
+    ///
+    /// [`reserve`]: MemoryBudget::reserve
+    /// [`accounted_refusals`]: MemoryBudget::accounted_refusals
+    /// [`gate_refusals`]: MemoryBudget::gate_refusals
+    pub fn reserve_best_effort(self: &Arc<Self>, n: u64) -> Result<Reservation, MemoryExhausted> {
+        self.admit(n)?;
+        Ok(self.fetch_reservation(n))
+    }
+
+    /// A guard over `n` bytes already admitted to the ledger, counted in
+    /// `fetch_reserved()`.
+    fn fetch_reservation(self: &Arc<Self>, n: u64) -> Reservation {
         self.note_fetch_reserved(n);
-        Ok(Reservation {
+        Reservation {
             budget: Arc::clone(self),
             size: n,
             handed_off: false,
-        })
+        }
     }
 }
 
@@ -493,7 +542,7 @@ impl Drop for Reservation {
     }
 }
 
-/// A `try_reserve` or `reserve` call was refused, for the reason `cause`
+/// A `try_reserve`, `reserve` or `reserve_best_effort` call was refused, for the reason `cause`
 /// names. Carries no strings, keys, or tenant values by construction: only
 /// figures.
 ///
@@ -856,8 +905,8 @@ mod tests {
 
     /// Each refusal kind moves its own counter by exactly one.
     ///
-    /// FLIP: count both causes in one counter (increment
-    /// `refusals.accounted` in `refuse_host_memory`) and the first
+    /// FLIP: count both causes in one counter (`refusals.accounted` for the
+    /// `HostMemory` arm of `count_refusal`) and the first
     /// `gate_refusals()` assertion reads 0, the `accounted_refusals()` one 1.
     #[test]
     fn each_refusal_kind_moves_only_its_own_counter() {
@@ -900,6 +949,71 @@ mod tests {
             (budget.accounted_refusals(), budget.gate_refusals()),
             (2, 1)
         );
+    }
+
+    /// `reserve_best_effort` refuses exactly where `try_reserve` does (ledger
+    /// full, gate closed, overflow at `u64::MAX`), with the same error, and
+    /// counts none of its refusals; `try_reserve` on the same state still
+    /// counts. On success it grows `fetch_reserved()` like `reserve`.
+    ///
+    /// FLIP: call `try_reserve` instead of `admit` in `reserve_best_effort`
+    /// and the first `(accounted_refusals(), gate_refusals())` assertion
+    /// reads `(1, 0)`. Skip the gate check in it and the closed-gate
+    /// `expect_err` is admitted.
+    #[test]
+    fn best_effort_refuses_where_try_reserve_does_and_counts_nothing() {
+        let counters =
+            |budget: &MemoryBudget| (budget.accounted_refusals(), budget.gate_refusals());
+
+        let budget = Arc::new(MemoryBudget::new(100));
+        let held = budget.reserve_best_effort(60).expect("60 of 100 fits");
+        assert_eq!(budget.reserved(), 60);
+        assert_eq!(budget.fetch_reserved(), 60, "grows the fetch share");
+        let full = budget.reserve_best_effort(41).expect_err("101 of 100");
+        assert_eq!(counters(&budget), (0, 0), "a full ledger counts nothing");
+        assert_eq!(budget.reserved(), 60);
+        assert_eq!(budget.try_reserve(41).expect_err("101 of 100"), full);
+        assert_eq!(counters(&budget), (1, 0), "try_reserve still counts");
+        let fits = budget.reserve_best_effort(40).expect("100 of 100 fits");
+        assert_eq!(budget.fetch_reserved(), 100);
+        drop((held, fits));
+        assert_eq!((budget.reserved(), budget.fetch_reserved()), (0, 0));
+
+        budget.set_host_memory_gate(false, 4, 5);
+        let closed = budget
+            .reserve_best_effort(1)
+            .expect_err("a closed gate refuses the best-effort path too");
+        assert_eq!(
+            closed.cause,
+            ExhaustionCause::HostMemory {
+                available: 4,
+                floor: 5
+            }
+        );
+        assert_eq!(counters(&budget), (1, 0), "a closed gate counts nothing");
+        assert_eq!(budget.try_reserve(1).expect_err("closed"), closed);
+        assert_eq!(counters(&budget), (1, 1), "try_reserve still counts");
+        drop(
+            budget
+                .reserve_best_effort(0)
+                .expect("zero bytes pass the gate"),
+        );
+
+        let unlimited = Arc::new(MemoryBudget::unlimited());
+        unlimited.try_reserve(u64::MAX - 1).expect("fits");
+        let overflow = unlimited
+            .reserve_best_effort(2)
+            .expect_err("u64::MAX - 1 + 2 overflows u64");
+        assert_eq!(overflow.cause, ExhaustionCause::Accounted);
+        assert_eq!(counters(&unlimited), (0, 0), "an overflow counts nothing");
+        assert_eq!(unlimited.try_reserve(2).expect_err("overflows"), overflow);
+        assert_eq!(counters(&unlimited), (1, 0), "try_reserve still counts");
+        let last = unlimited
+            .reserve_best_effort(1)
+            .expect("u64::MAX fits exactly");
+        assert_eq!(unlimited.reserved(), u64::MAX);
+        assert_eq!(unlimited.fetch_reserved(), 1);
+        drop(last);
     }
 
     /// A caller that loaded the flag closed while the setter was reopening

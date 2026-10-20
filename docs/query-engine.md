@@ -61,7 +61,12 @@ HTTP /api/v1/query, /query_range, /labels, /label/{name}/values, /series
      fewer points. A selector whose copy does not fit is read at every grid
      step instead, with the same result, and the response carries one info
      annotation naming how many selectors fell back and whether the budget
-     or the cap refused them (#3105). Pooling is loss-free: two
+     or the cap refused them (#3105). The budget charge is a best-effort
+     reservation (`MemoryBudget::reserve_best_effort`): the same gate and
+     ledger checks as any reservation, but its refusals do not move
+     `ravel_memory_budget_refusals_total` or
+     `ravel_memory_gate_refusals_total`, since the query still succeeds and
+     the info annotation is the signal. Pooling is loss-free: two
      selectors sharing a series id decode byte-identical raw runs (the
      decode is a pure function of
      segment bytes + series id, with no per-selector window trim), so

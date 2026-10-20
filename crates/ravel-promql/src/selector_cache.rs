@@ -39,7 +39,9 @@
 //! bounds, not the two together. An entry that does not fit is not stored, and its key falls back: every later step
 //! reads that selector over its own request window, as evaluation without the
 //! cache does. A fallback changes how many reads a query makes, not which
-//! samples a step sees.
+//! samples a step sees. The reservation is taken with
+//! [`MemoryBudget::reserve_best_effort`], so a budget refusal here moves none
+//! of the budget's refusal counters; the query's info annotation reports it.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -295,7 +297,7 @@ pub(crate) enum FallbackReason {
     /// The entry would have taken the cache's running total over its cap.
     Cap,
     /// The query's memory budget refused the entry's reservation.
-    Budget(MemoryExhausted),
+    Budget,
 }
 
 /// Source reads the cache issued over one query, and the bytes it held.
@@ -318,8 +320,9 @@ pub(crate) struct SelectorCacheStats {
 
 pub(crate) struct SelectorCache {
     entries: RefCell<HashMap<SelectorKey, Slot>>,
-    /// Keys whose entry did not fit, with the first reason. A key here is not
-    /// offered to [`Self::insert`] again. An entry it already had stays and
+    /// Keys whose entry did not fit, with which bound refused it; the refusal
+    /// itself is kept only for the query's first, in `first_refusal`. A key
+    /// here is not offered to [`Self::insert`] again. An entry it already had stays and
     /// keeps answering the requests inside its window when the cap refused
     /// the replacement; the budget refuses only after that entry was dropped.
     fallen_back: RefCell<HashMap<SelectorKey, FallbackReason>>,
@@ -394,7 +397,7 @@ impl SelectorCache {
         for reason in self.fallen_back.borrow().values() {
             match reason {
                 FallbackReason::Cap => cap = cap.saturating_add(1),
-                FallbackReason::Budget(_) => budget = budget.saturating_add(1),
+                FallbackReason::Budget => budget = budget.saturating_add(1),
             }
         }
         (cap, budget, self.first_refusal.get())
@@ -453,10 +456,12 @@ impl SelectorCache {
                 .set(self.bytes.get().saturating_sub(replaced_bytes));
         }
         let reservation = match &self.budget {
-            Some(budget) => match budget.reserve(bytes) {
+            Some(budget) => match budget.reserve_best_effort(bytes) {
                 Ok(reservation) => Some(reservation),
                 Err(refusal) => {
-                    self.fall_back(key, FallbackReason::Budget(refusal));
+                    self.first_refusal
+                        .set(self.first_refusal.get().or(Some(refusal)));
+                    self.fall_back(key, FallbackReason::Budget);
                     return;
                 }
             },
@@ -476,13 +481,8 @@ impl SelectorCache {
     }
 
     /// Record that `key` falls back for `reason`, keeping the first reason a
-    /// key gets and the first budget refusal the query gets.
+    /// key gets.
     fn fall_back(&self, key: SelectorKey, reason: FallbackReason) {
-        if let FallbackReason::Budget(refusal) = reason
-            && self.first_refusal.get().is_none()
-        {
-            self.first_refusal.set(Some(refusal));
-        }
         self.fallen_back.borrow_mut().entry(key).or_insert(reason);
     }
 
