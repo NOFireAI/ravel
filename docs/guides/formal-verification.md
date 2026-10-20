@@ -140,9 +140,10 @@ both properties false. That result is by design and is not a defect.
 ## Run the suite
 
 Install a Java 17 or later runtime before you run the smoke, negative, or
-exhaustive lane. Install GNU timeout before you run those lanes. On macOS,
-run `brew install coreutils` to get it. The traceability lane runs without
-Java or GNU timeout.
+exhaustive lane. Those lanes also need a `timeout` command whose
+`--kill-after` option works: Linux ships one (GNU coreutils or uutils), and
+on macOS `brew install coreutils` provides it. The traceability lane runs
+without Java or `timeout`.
 
 Each lane is one command:
 
@@ -174,11 +175,11 @@ Each command exits with one of these codes:
 
 - 0 on a pass.
 - 1 when a check fails.
-- 2 when no usable Java or GNU timeout exists. The harness prints the
-  reason.
+- 2 when no usable Java or no `timeout` with a working `--kill-after`
+  exists. The harness prints the reason.
 
 A single TLC run reports exit 12 for a safety violation and exit 13 for a
-liveness violation. GNU timeout kills a run past its budget and reports exit
+liveness violation. `timeout` kills a run past its budget and reports exit
 124.
 
 ## Read the results

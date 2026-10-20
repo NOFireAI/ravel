@@ -59,16 +59,19 @@ is usable. It needs network access on first run only to fetch the TLC jar,
 unless you supply one with `RAVEL_TLA_TOOLS_JAR` (see below). The
 traceability lane runs no TLC and needs no Java at all.
 
-The per-model wall-clock ceiling requires GNU `timeout(1)`. Linux ships it as
-`timeout`; on macOS install it with `brew install coreutils`, which provides
-it as `gtimeout`. The harness resolves the binary once at startup, before
-any model runs, and exits 2 with a one-line refusal if neither is GNU
-coreutils' `timeout` (a look-alike that doesn't support `--kill-after` is
-rejected the same as no binary at all). Every TLC invocation runs under
+The per-model wall-clock ceiling requires a `timeout(1)` whose
+`--kill-after` works. Linux ships one as `timeout` (GNU coreutils, or uutils
+on Ubuntu 26.04); on macOS install it with `brew install coreutils`, which
+provides it as `gtimeout`. The harness resolves the binary once at startup,
+before any model runs, by running a two-second probe: a command that ignores
+TERM under a 1 s budget and a 1 s `--kill-after` must end killed. It exits 2
+with a one-line refusal if neither `timeout` nor `gtimeout` passes, so a
+look-alike that rejects or ignores `--kill-after` is refused the same as no
+binary at all. Every TLC invocation runs under
 `timeout --kill-after=30 <budget>`: TERM at the budget, KILL 30 seconds
 later if TERM was ignored. Either way the run is reported as a timeout, not
-left running and not read as a pass. CI runs on Ubuntu, which ships GNU
-`timeout`, so it needs no extra setup.
+left running and not read as a pass. CI runs on Ubuntu, which ships a
+`timeout` that passes the probe, so it needs no extra setup.
 
 TLC's worker count and JVM heap cap default to small, laptop-safe values
 rather than `-workers auto` (which claims every core on the host) or an
@@ -97,8 +100,8 @@ scripts/check-tla.sh smoke -a common  # scope any subcommand to one area
 
 `ci` and `all` record every model under a single run id, so `last-run.tsv` is
 one coherent run rather than a config's rows overwriting the previous config's.
-Exit codes: `0` pass, `1` a check failed, `2` no usable Java, GNU timeout(1)
-unavailable, or an invalid `RAVEL_TLA_WORKERS`/`RAVEL_TLA_XMX` value. A
+Exit codes: `0` pass, `1` a check failed, `2` no usable Java, no timeout(1)
+with a working `--kill-after`, or an invalid `RAVEL_TLA_WORKERS`/`RAVEL_TLA_XMX` value. A
 subcommand or `-a` area that does not exist, and `-a` with no value, fail
 immediately.
 

@@ -131,6 +131,7 @@ resolve_tla_resources() {
 # a hang into an unbounded run instead of a report.
 resolve_timeout() {
     local candidate
+    [ -n "${TIMEOUT_BIN:-}" ] && return 0
     for candidate in timeout gtimeout; do
         if command -v "$candidate" >/dev/null 2>&1 \
             && kill_after_works "$candidate"; then
@@ -274,7 +275,7 @@ record_row() {
 # CHECK_DEADLOCK FALSE in a cfg means the model has intentional stutter/terminal
 # states, so pass -deadlock (TLC's flag that DISABLES the deadlock check).
 #
-# The wall-clock ceiling is GNU timeout(1), resolved once into $TIMEOUT_BIN
+# The wall-clock ceiling is timeout(1), resolved once into $TIMEOUT_BIN
 # by resolve_timeout before any area runs. `--kill-after=$TIMEOUT_KILL_AFTER`
 # sends TERM at the budget and, if the JVM ignores it, KILL after the grace
 # period: that turns "ignores TERM" from an unbounded hang into a bounded
@@ -801,11 +802,10 @@ main() {
     esac
 
     # resolve_timeout runs before resolve_java: resolve_java's -version probe
-    # spawns java, so on a host without GNU timeout(1) that probe must never
-    # happen. Resolved once, before any lane launches anything, and even for
-    # a lane that discovers zero configs to run: a developer without GNU
-    # coreutils must hear about it on the first invocation, not on the first
-    # slow run. traceability enforces no budget and needs no timeout binary
+    # spawns java, so on a host without a working timeout(1) that probe must
+    # never happen. Resolved once, before any lane launches anything, and even
+    # for a lane that discovers zero configs to run: a developer without one
+    # must hear about it on the first invocation, not on the first slow run. traceability enforces no budget and needs no timeout binary
     # at all.
     case "$cmd" in
         traceability) : ;;
