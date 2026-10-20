@@ -749,7 +749,11 @@ only of them the scan phase issues no second GET
 mixes them with larger segments whose plan also reads whole shares that budget. The count is
 taken over the whole scan, not one partition's share, so every partition
 routes a segment the same way and none is read twice
-(`sub_break_even_segments_are_read_once`). `plan_segment` itself still
+(`sub_break_even_segments_are_read_once`). For a query with exact-key
+equalities (the KEY_IDX probe below) such a segment is one also at or under
+the block-range threshold (`may_skip_plan`): every larger segment is planned,
+however many sub-bound segments the scan holds, so its KEY_IDX is probed.
+`plan_segment` itself still
 reads an object under the bound whole for a direct caller
 (`the_planned_route_reads_an_object_under_the_break_even_whole`). Above the
 bound the planned route probes before the scan's coverage crossover decides,
@@ -4302,7 +4306,8 @@ coordinator's kept keys travel in the slice ticket (version 11; version 10 is
 the grouped client ticket of ADR-2904), and a version 11 ticket carrying a
 spans block is refused.
 
-Each object the catalog keeps and the plan opens reads the section's prefix
+Each object above the block-range threshold that the catalog keeps reads the
+section's prefix
 (header, field directory and bucket directory) once, then at most one bucket
 per key, as range GETs on the `keyIndex` phase; the keys are probed in order
 and the first one found absent ends the probe. A range already resident from
@@ -4319,8 +4324,10 @@ of four:
   is indexed there under the old type and declines the same way.
 - The key is absent: the object is dropped before any directory past its tail
   probe is read (`segmentsPrunedByKeyIndex`).
-- The key is present: the plan reads only the named blocks among those
-  SKIP_IDX kept (`blocksPrunedByKeyIndex` counts the rest).
+- The key is present: above the plan's whole-object bound the plan reads
+  only the named blocks among those SKIP_IDX kept (`blocksPrunedByKeyIndex`
+  counts the rest). At or under the bound the object is read whole, as the
+  unkeyed plan reads it there, after the probe's reads.
 - The section fails to decode: the probe warns, naming the object, and the
   object is planned as if it had no KEY_IDX. A store error on a KEY_IDX read
   fails the query with the store's typed error.
@@ -4329,19 +4336,25 @@ Several equalities joined by `AND` intersect: an object any one key is absent
 from is dropped, and the blocks read are those every key names. A key that
 declines takes no part in the intersection. An empty intersection drops the
 object the same way an absent key does, and counts in
-`segmentsPrunedByKeyIndex`. An object at or under the plan's whole-object
-bound is read whole and not probed.
+`segmentsPrunedByKeyIndex`. The probe runs for every object above the
+block-range threshold (`LogSegmentFetcher::block_range_threshold`), whatever
+the projection break-even, so an object between the threshold and the
+whole-object bound is dropped when a key is absent rather than read whole. An
+object at or under the threshold is read whole and not probed.
 
 A key counts as a block predicate (`LogQuery::is_block_predicate_free`), so a
 `trace_id`-only query on a tenant that indexes `trace_id` no longer takes the
 scan-level whole-segment fast path. It plans each object above the
-whole-object bound through the probe instead; an object whose every key
+block-range threshold through the probe instead; an object whose every key
 declines (no KEY_IDX section, a version 1 section, a field the section does
 not carry) is handed back to `plan_segment_primed` with its keys cleared, so
 the contained-segment plan still applies there. The cost of that route change
 on objects written before the tenant indexed `trace_id` is one footer probe
-per object above the bound. An equality on a typed attribute
-column already carried a prune predicate, so its route is unchanged. The
+per object above the threshold, which on an object at or under the
+whole-object bound comes on top of its whole read. An equality on a typed
+attribute column already carried a prune predicate, so its route changes only
+for an object between the threshold and the whole-object bound, which is now
+planned and probed instead of read whole. The
 ranged logs scan also stops fetching an object's KEY_IDX section as part of
 its tail sections on every route: the reader never reads it, so the bytes
 were a pure cost.

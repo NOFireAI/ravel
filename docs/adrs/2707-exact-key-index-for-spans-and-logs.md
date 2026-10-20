@@ -546,8 +546,9 @@ flowchart LR
   costs `1 + ceil(2p / parallelism)` rounds at the probe concurrency the
   implementing task sets and measures. Leaf and section probes are their own
   cost phase (decision 7). On logs, the tier-1 probe skips objects at or
-  under the whole-object bound and declines rather than prunes on any
-  section it cannot read as its own: see the logs probe amendment below.
+  under the whole-object bound (at or under the block-range threshold, per
+  the probe threshold amendment below) and declines rather than prunes on
+  any section it cannot read as its own: see the logs probe amendment below.
 
 ### 6. Erasure, compaction and resharding
 
@@ -1122,7 +1123,9 @@ version 11 in turn. Versions 8, 9 and 10 are byte-identical to before.
 
 What is probed. An object at or under `plan_whole_object_bound()` (512 KiB)
 is read whole and not probed, so decision 5's "every uncovered candidate"
-reads "every uncovered candidate above the whole-object bound" for logs.
+reads "every uncovered candidate above the whole-object bound" for logs
+(the probe threshold amendment below moves that gate to the block-range
+threshold).
 
 What never prunes. A key declines, and a declined key prunes nothing in any
 `AND` order, when the object has no KEY_IDX section, carries a version 1
@@ -1137,7 +1140,8 @@ at the first absent key.
 One route change is a cost, not a correctness, consequence: a `trace_id`-only
 query on a tenant that indexes `trace_id` no longer takes the scan-level
 whole-segment fast path, so objects written before the index pay one footer
-probe each above the bound; #3090 tracks it, and T12 (#2763) measures it.
+probe each above the bound (the block-range threshold, per the probe
+threshold amendment below); #3090 tracks it, and T12 (#2763) measures it.
 
 Refs: #2762, #3090, #2961, #3072
 
@@ -1218,3 +1222,34 @@ tree applies the ceiling. They are measured when the leaf read lands, on a
 lane that produces hour-ranged parts.
 
 Refs: #2763, #2961, #3072, #3116, #3117, #3118, #3119, #2994
+
+## Amendment (issue #3117): the logs probe gates on the block-range threshold
+
+<!-- amendment-applies: sections="5. Lookup: route, probe tier 2, probe tier 1, read blocks; exact by the safety lemma|Amendment (issue #2762): the logs probe runs inside the fetcher's plan" pointer="probe threshold amendment" -->
+<!-- amendment-supersedes: phrase="every uncovered candidate above the whole-object bound" pointer="probe threshold amendment" -->
+<!-- amendment-supersedes: phrase="skips objects at or under the whole-object bound" pointer="probe threshold amendment" -->
+
+The logs probe amendment above gated the tier-1 probe on
+`plan_whole_object_bound()`, the larger of the block-range threshold and the
+projection break-even. Under `cost-based` the break-even is three request
+costs, so every object between the threshold and the break-even was read
+whole without a probe, on two routes: `plan_segment_keyed` returned the
+unkeyed plan for it, and when the scan held at least as many such segments
+as target partitions (ADR-2677 decision 2) the scan opened them unplanned.
+This is #3117, the q20 bottleneck the T12 acceptance amendment names.
+
+For logs, decision 5's "every uncovered candidate" now reads "every
+uncovered candidate above the block-range threshold", whatever the
+break-even. `plan_segment_keyed` in `crates/ravel-query/src/log_fetcher.rs`
+gates the probe on `block_range_threshold`, and `may_skip_plan` in
+`crates/ravel-sql/src/logs_scan/plan.rs` keeps every segment above the
+threshold out of the unplanned set for a query with key equalities. An
+object the probe proves the key absent from is dropped. An object between
+the threshold and the whole-object bound that holds the key, or whose keys
+all decline, is read whole after the probe's reads, as the unkeyed plan
+reads it; only above the bound does a present key restrict the read to the
+KEY_IDX block set. An object at or under the threshold is read whole and not
+probed. `services/ravel-server/tests/sql_logs_key_index_probe_bound.rs` pins
+both routes and the threshold.
+
+Refs: #3117, #2961, #2762

@@ -46,7 +46,10 @@
 //! pass issues no read for it, [`owned_work`] gives it whole to one partition,
 //! and that partition opens it with one whole-object read and prunes blocks
 //! from the directory that read already holds. With fewer such segments, every
-//! segment takes the plan-then-stripe route described here.
+//! segment takes the plan-then-stripe route described here. For a query with
+//! KEY_IDX equalities (ADR-2707) "such segments" are only those also at or
+//! under the block-range threshold ([`may_skip_plan`]): every larger one is
+//! planned, so its KEY_IDX is probed whatever the projection break-even.
 //!
 //! # Object-store request count, and the cache gate
 //!

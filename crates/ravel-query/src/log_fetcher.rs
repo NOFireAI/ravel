@@ -196,9 +196,10 @@ pub struct LogQuery {
     /// own fetch funnels.
     pub erasure: Vec<ErasurePredicate>,
     /// Prune-only KEY_IDX equalities, ANDed. Only
-    /// [`LogSegmentFetcher::plan_segment_keyed`] reads them: it probes each
-    /// planned object's KEY_IDX section and restricts the blocks read to the
-    /// intersection of the answers. Every other entry point ignores them, so
+    /// [`LogSegmentFetcher::plan_segment_keyed`] reads them: it probes the
+    /// KEY_IDX section of each planned object above the block-range threshold,
+    /// drops the object when an arm is absent, and above the whole-object
+    /// bound restricts the blocks read to the intersection of the answers. Every other entry point ignores them, so
     /// they never remove a record, only block reads.
     pub key_equals: Vec<KeyEquals>,
 }
@@ -1542,7 +1543,9 @@ impl LogSegmentFetcher {
     /// Every plan-phase read that probes an object gates on this bound:
     /// [`plan_segment`](Self::plan_segment)'s two guards,
     /// [`plan_segment_block_stats`](Self::plan_segment_block_stats), and the
-    /// log-series route's STREAM_DIR read. Public so the SQL executor's I/O
+    /// log-series route's STREAM_DIR read. The KEY_IDX probe of
+    /// [`plan_segment_keyed`](Self::plan_segment_keyed) is the exception: it
+    /// gates on [`Self::block_range_threshold`]. Public so the SQL executor's I/O
     /// shape reports a read's dependency depth against the bound the plan
     /// routes on.
     #[must_use]
@@ -1560,7 +1563,9 @@ impl LogSegmentFetcher {
     /// which prunes blocks from the directories that one read holds. This is
     /// the per-segment size test only: the SQL logs scan skips the plan for
     /// these segments only when it holds at least as many of them as target
-    /// partitions, and plans them otherwise.
+    /// partitions, and plans them otherwise. For a query with [`KeyEquals`]
+    /// arms that scan also plans every segment above
+    /// [`Self::block_range_threshold`], so its KEY_IDX is probed.
     #[must_use]
     pub fn plans_segment(&self, seg_ref: &SegmentRef) -> bool {
         seg_ref.object_size > self.plan_whole_object_bound()
@@ -2400,18 +2405,23 @@ impl LogSegmentFetcher {
     /// (ADR-2707 decision 5) for a query carrying [`KeyEquals`] arms.
     ///
     /// The probe runs on an object above
-    /// [`plan_whole_object_bound`](Self::plan_whole_object_bound) whose span
-    /// overlaps the query window; every other segment, and every query with no
-    /// arm, is planned by `plan_segment` over the query without its arms, with
-    /// nothing restricted. The probe's reads are charged to
-    /// `key_index_accounting`, the rest to `plan_accounting`.
+    /// [`block_range_threshold`](Self::block_range_threshold) whose span
+    /// overlaps the query window, whatever the projection break-even; every
+    /// other segment, and every query with no arm, is planned by
+    /// `plan_segment` over the query without its arms, with nothing
+    /// restricted. The probe's reads are charged to `key_index_accounting`,
+    /// the rest to `plan_accounting`.
     ///
     /// An absent arm returns no plan: no block of the object is read, and
-    /// `key_index.segments_pruned` is 1. A present set leaves the plan's
-    /// survivors as the reader names them and puts the ones the set holds in
-    /// `key_blocks`; `key_index.blocks_pruned` counts the rest. A probe that
-    /// prunes nothing (no KEY_IDX section, every arm declined, or a corrupt
-    /// section) hands its footer probe to `plan_segment`'s route, which then
+    /// `key_index.segments_pruned` is 1. Above
+    /// [`plan_whole_object_bound`](Self::plan_whole_object_bound) a present
+    /// set leaves the plan's survivors as the reader names them and puts the
+    /// ones the set holds in `key_blocks`; `key_index.blocks_pruned` counts
+    /// the rest. At or under that bound a present set restricts nothing: the
+    /// object is still read whole, the cheaper read of an object the key is
+    /// in. A probe that prunes nothing (no KEY_IDX section, every arm
+    /// declined, or a corrupt section), and a present set at or under the
+    /// bound, hand the footer probe to `plan_segment`'s route, which then
     /// issues every read it issues for the query without arms except that
     /// probe.
     pub async fn plan_segment_keyed(
@@ -2441,7 +2451,7 @@ impl LogSegmentFetcher {
             })
         };
         if query.key_equals.is_empty()
-            || seg_ref.object_size <= self.plan_whole_object_bound()
+            || seg_ref.object_size <= self.block_range_threshold
             || seg_ref.min_event_ts_ns > seg_ref.max_event_ts_ns
             || !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
         {
@@ -2459,7 +2469,14 @@ impl LogSegmentFetcher {
         );
         let result = self
             .block_range
-            .fetch_keyed_plan(seg_ref, tenant_hash, query, accounting, phase.key_index())
+            .fetch_keyed_plan(
+                seg_ref,
+                tenant_hash,
+                query,
+                seg_ref.object_size > self.plan_whole_object_bound(),
+                accounting,
+                phase.key_index(),
+            )
             .instrument(fetch_span.clone())
             .await;
         let result = self
@@ -4473,7 +4490,8 @@ pub(crate) enum KeyedPlanRead {
         key_blocks: Vec<u32>,
     },
     /// The probe pruned nothing (no KEY_IDX section, every arm declined, or
-    /// a corrupt section): the footer probe it read, for the unkeyed route to
+    /// a corrupt section), or found a present set on an object the caller
+    /// reads whole: the footer probe it read, for the unkeyed route to
     /// replay.
     Unkeyed { primed: PrimedProbe },
 }
@@ -6094,8 +6112,9 @@ impl BlockRangeFetcher {
     /// charged to `key_accounting` under [`QueryPhase::KeyIndex`]; everything
     /// else is a plan read on `accounting`. An absent arm returns
     /// [`KeyedPlanRead::Absent`] before any directory past the footer is read;
-    /// a probe that prunes nothing returns [`KeyedPlanRead::Unkeyed`] with the
-    /// footer probe's extents, before any directory past the footer is read.
+    /// a probe that prunes nothing, and a present set when `plan_present` is
+    /// false, returns [`KeyedPlanRead::Unkeyed`] with the footer probe's
+    /// extents, before any directory past the footer is read.
     ///
     /// The survivors are the ones the reader's prune names over the same
     /// directories, so a subset open dealt any of them sees the same list:
@@ -6112,6 +6131,7 @@ impl BlockRangeFetcher {
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         query: &LogQuery,
+        plan_present: bool,
         accounting: &QueryAccounting,
         key_accounting: &QueryAccounting,
     ) -> Result<KeyedPlanRead, LogFetchError> {
@@ -6143,8 +6163,8 @@ impl BlockRangeFetcher {
             .await?
         {
             Some(KeyProbe::Absent) => return Ok(KeyedPlanRead::Absent { fetch: stats }),
-            Some(KeyProbe::Present(blocks)) => blocks,
-            Some(KeyProbe::Declined) | None => {
+            Some(KeyProbe::Present(blocks)) if plan_present => blocks,
+            Some(KeyProbe::Present(_) | KeyProbe::Declined) | None => {
                 return Ok(KeyedPlanRead::Unkeyed {
                     primed: PrimedProbe {
                         extents,
