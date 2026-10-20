@@ -15623,3 +15623,249 @@ mod version_refusal_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod block_funnel_intent_tests {
+    //! The per-block funnels of the version-3 block-range read admit and read
+    //! under the caller's access intent: `fetch_run`'s fetched blocks,
+    //! `fetch_blocks`'s probe-resident blocks and cache hits, and
+    //! `admit_blocks_from_whole`'s blocks cut from a covering read.
+
+    use super::*;
+    use crate::fetcher::CacheFetchError;
+    use ravel_cache::{Cache, CacheLimits};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use uuid::Uuid;
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+    const CONTENT_HASH: [u8; 32] = [9u8; 32];
+    const KEY: &str = "t/funnel-intent.rlog";
+    const BLOCK: u64 = 16;
+    const BLOCKS: u64 = 3;
+
+    fn limits() -> CacheLimits {
+        CacheLimits::new(16 << 20, 1024, 16 << 20)
+    }
+
+    fn object() -> Bytes {
+        Bytes::from_static(b"three sixteen-byte blocks the funnels cut and admit")
+            .slice(0..(BLOCK * BLOCKS) as usize)
+    }
+
+    fn extents() -> Vec<BlockExtent> {
+        let object = object();
+        (0..BLOCKS)
+            .map(|i| {
+                let start = i * BLOCK;
+                BlockExtent {
+                    abs_start: start,
+                    len: BLOCK,
+                    crc32c: crc32c::crc32c(&object[start as usize..(start + BLOCK) as usize]),
+                }
+            })
+            .collect()
+    }
+
+    fn keys() -> Vec<CacheKey> {
+        extents()
+            .iter()
+            .map(|e| CacheKey::new(TENANT.0, CONTENT_HASH, e.abs_start, e.len))
+            .collect()
+    }
+
+    fn seg_ref() -> SegmentRef {
+        SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: BLOCK * BLOCKS,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: 0,
+            ingest_hour_bucket: 0,
+            sample_count: 1,
+            series_count: 0,
+            shard: 0,
+            content_hash: CONTENT_HASH,
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(ravel_logseg::footer::VERSION),
+            declared_column_stats: Default::default(),
+        }
+    }
+
+    fn accounting(intent: AccessIntent) -> QueryAccounting {
+        let accounting = QueryAccounting::new();
+        accounting.set_access_intent(intent);
+        accounting
+    }
+
+    async fn fetcher() -> (BlockRangeFetcher, Arc<Cache<CacheFetchError>>) {
+        let store = MemoryStore::new();
+        store
+            .put(KEY, object(), PutOptions::default())
+            .await
+            .expect("put");
+        let cache = Arc::new(Cache::new(limits()));
+        let fetcher = BlockRangeFetcher::new(Arc::new(store)).with_cache(Arc::clone(&cache));
+        (fetcher, cache)
+    }
+
+    /// The bulk-region bookkeeping of a cache holding `entries` region
+    /// entries of one tenant, measured on a scratch cache rather than
+    /// restated from the region's private constants.
+    fn bookkeeping_for(entries: usize) -> u64 {
+        let scratch: Cache<CacheFetchError> = Cache::new(limits());
+        for i in 0..entries {
+            scratch.insert_with_intent(
+                CacheKey::new(TENANT.0, CONTENT_HASH, 1_000 + i as u64, 1),
+                Bytes::from_static(b"x"),
+                ravel_cache::AccessIntent::BulkScan,
+            );
+        }
+        assert_eq!(scratch.len(), entries, "the scratch region declined one");
+        scratch.bulk_bookkeeping_bytes()
+    }
+
+    /// Every block is resident; under BulkScan all of them, and nothing
+    /// else, sit in the bulk region, and under Interactive none does.
+    fn assert_admitted_under(cache: &Cache<CacheFetchError>, intent: AccessIntent, funnel: &str) {
+        for key in keys() {
+            assert!(
+                cache
+                    .peek_uncounted_with_intent(&key, ravel_cache::AccessIntent::BulkScan)
+                    .is_some(),
+                "{funnel} {intent:?}: block at {} is not resident",
+                key.offset
+            );
+        }
+        assert_eq!(cache.len(), BLOCKS as usize, "{funnel} {intent:?}");
+        let expected = match intent {
+            AccessIntent::BulkScan => bookkeeping_for(BLOCKS as usize),
+            _ => 0,
+        };
+        assert_eq!(
+            cache.bulk_bookkeeping_bytes(),
+            expected,
+            "{funnel} {intent:?}: a block was admitted on the wrong side of the bulk region"
+        );
+    }
+
+    /// FLIP: passing `AccessIntent::Interactive` in place of `intent` to the
+    /// `cache.insert` of the run's non-lead blocks in `fetch_run` leaves two
+    /// of the bulk read's three blocks outside the region.
+    #[tokio::test]
+    async fn fetch_run_admits_its_blocks_under_the_callers_intent() {
+        for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
+            let (fetcher, cache) = fetcher().await;
+            let run = BlockExtent {
+                abs_start: 0,
+                len: BLOCK * BLOCKS,
+                crc32c: 0,
+            };
+            let outcome = fetcher
+                .fetch_run(
+                    &seg_ref(),
+                    TENANT,
+                    &EtagPin::default(),
+                    run,
+                    extents(),
+                    QueryPhase::Scan,
+                    &accounting(intent),
+                )
+                .await
+                .expect("fetch run");
+            assert_eq!(outcome.gets, 1, "{intent:?}");
+            assert_admitted_under(&cache, intent, "fetch_run");
+        }
+    }
+
+    /// FLIP: passing `AccessIntent::Interactive` to the `cache.insert` of a
+    /// probe-resident block in `fetch_blocks` leaves the bulk read's blocks
+    /// outside the region.
+    #[tokio::test]
+    async fn fetch_blocks_admits_probe_resident_blocks_under_the_callers_intent() {
+        for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
+            let (fetcher, cache) = fetcher().await;
+            let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, BLOCK * BLOCKS);
+            asm.place(KEY, 0, object()).expect("place the probe's bytes");
+            let mut stats = BlockRangeStats::default();
+            fetcher
+                .fetch_blocks(
+                    &seg_ref(),
+                    TENANT,
+                    &EtagPin::default(),
+                    &extents(),
+                    QueryPhase::Scan,
+                    &mut asm,
+                    &accounting(intent),
+                    &mut stats,
+                )
+                .await
+                .expect("fetch blocks");
+            assert_eq!(stats.block_range_gets, 0, "{intent:?}: {stats:?}");
+            assert_admitted_under(&cache, intent, "fetch_blocks");
+        }
+    }
+
+    /// FLIP: passing `AccessIntent::Interactive` to the `cache.get` of a block
+    /// in `fetch_blocks` counts the bulk read's three hits as interactive.
+    #[tokio::test]
+    async fn fetch_blocks_reads_cached_blocks_under_the_callers_intent() {
+        for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
+            let (fetcher, cache) = fetcher().await;
+            let object = object();
+            for (key, ext) in keys().into_iter().zip(extents()) {
+                let start = ext.abs_start as usize;
+                cache.insert(key, object.slice(start..start + ext.len as usize));
+            }
+            let before = cache.metrics().intent_snapshot();
+            let mut asm = ObjectAssembler::new(&fetcher.assembly_gauge, BLOCK * BLOCKS);
+            let mut stats = BlockRangeStats::default();
+            fetcher
+                .fetch_blocks(
+                    &seg_ref(),
+                    TENANT,
+                    &EtagPin::default(),
+                    &extents(),
+                    QueryPhase::Scan,
+                    &mut asm,
+                    &accounting(intent),
+                    &mut stats,
+                )
+                .await
+                .expect("fetch blocks");
+            assert_eq!(stats.block_cache_hits, BLOCKS, "{intent:?}: {stats:?}");
+            let after = cache.metrics().intent_snapshot();
+            let bulk = after.bulk_scan.hits - before.bulk_scan.hits;
+            let interactive = after.interactive.hits - before.interactive.hits;
+            let expected = match intent {
+                AccessIntent::BulkScan => (BLOCKS, 0),
+                _ => (0, BLOCKS),
+            };
+            assert_eq!((bulk, interactive), expected, "{intent:?}: {after:?}");
+        }
+    }
+
+    /// FLIP: passing `AccessIntent::Interactive` in place of `intent` to the
+    /// `cache.insert` in `admit_blocks_from_whole` leaves the bulk read's
+    /// blocks outside the region.
+    #[tokio::test]
+    async fn admit_blocks_from_whole_admits_under_the_callers_intent() {
+        for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
+            let (fetcher, cache) = fetcher().await;
+            fetcher
+                .admit_blocks_from_whole(
+                    &seg_ref(),
+                    TENANT,
+                    &LogObjectBytes::from(object()),
+                    &extents(),
+                    intent,
+                )
+                .await;
+            assert_admitted_under(&cache, intent, "admit_blocks_from_whole");
+        }
+    }
+}

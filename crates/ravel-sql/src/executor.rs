@@ -8540,9 +8540,8 @@ pub(crate) mod tests {
     /// with no WHERE, HAVING, predicate in a CTE or subquery, JOIN or LIMIT.
     ///
     /// FLIP: removing `LogicalPlan::Join(_) | LogicalPlan::Limit(_)` from
-    /// `plan_is_predicate_free`'s match turns the JOIN and LIMIT rows
-    /// predicate-free, and replacing its body with `true` turns every row of
-    /// the second list.
+    /// `plan_is_predicate_free`'s match fails the logs JOIN row; removing only
+    /// `LogicalPlan::Limit(_)` fails the logs `LIMIT 10` row.
     #[tokio::test]
     async fn a_statement_is_predicate_free_only_without_a_predicate_join_or_limit() {
         let exec = eviction_test_executor();
