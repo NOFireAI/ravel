@@ -1252,7 +1252,10 @@ ideal), varying one knob at a time from the default geometry:
 | target x 0.95 | 100 | 44 | 40 | 0 | 4 |
 
 The depth margin moves the trigger mix and `--batch-rows` moves only the
-write count. Lowering the target also hands the mix to the size trigger,
+write count. A depth between the rows bound and the full quarter closes
+most objects on size but not all of them: at 101 the shards that drew
+less than their share of a window still close on depth, and that share
+falls as the depth approaches the quarter. Lowering the target also hands the mix to the size trigger,
 but it moves every object 5% below 250,000 rows and wrote 10% more
 objects. The load time did not follow the write count: on 20 M spans in
 an optimised build, 10,000-, 100,000- and 1,000,000-row batches took
@@ -1283,8 +1286,8 @@ where the old rule closed them at 250,000. In-process, the margin also took 16% 
 the load time (29.1 and 29.4 s against 24.4 and 24.9 s on 20 M spans),
 because a depth flush blocks the loader until every shard has published.
 `spans_default_geometry_closes_the_majority_by_size` pins the mix on a
-6.5 M-span corpus: 24 size and 4 end-of-input objects, against 12 size,
-13 depth and 4 end-of-input at the old rule.
+2.1 M-span corpus: 8 size and 4 end-of-input objects, against 5 size,
+4 depth and 4 end-of-input at the old rule.
 
 Above the default batch the margin costs object size: when one shard's
 slice is close to the target, a slice that falls just short now waits

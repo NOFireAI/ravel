@@ -375,10 +375,11 @@ pub(super) struct ShardObservation {
 /// Decides when the loader flushes every shard. A shard's buffer is pending
 /// from the first batch that reached it after its last flush; once the oldest
 /// pending batch on any shard is `pipeline_depth` batches old, the loader
-/// flushes every shard. At the rows-bound depth that is one target's worth of
-/// rows per shard, so a buffer the size trigger has not closed by then (the
-/// first batch over-estimated the rest) is closed here rather than by the age
-/// trigger. It also runs no later than the loop's wait on the oldest
+/// flushes every shard. The derived depth is the rows bound plus its quarter
+/// while the depth flush runs, so a window holds a quarter more than one
+/// target's worth of rows per shard on an even spread, and a buffer the size
+/// trigger has not closed by then (the first batch over-estimated the rest)
+/// is closed here rather than by the age trigger. It also runs no later than the loop's wait on the oldest
 /// in-flight write, which is `pipeline_depth` batches back, so that wait never
 /// sits on a buffer nothing will flush.
 ///
@@ -615,9 +616,9 @@ fn depth_bound_text(g: &LoadGeometry) -> String {
         .map_or_else(|| "no budget".to_string(), |d| d.to_string());
     let rows_bound = if g.depth_flush_enabled() {
         format!(
-            "rows bound {} + {}% = {}",
+            "rows bound {} + {} = {}",
             g.rows_depth,
-            100 / DEPTH_MARGIN_DIVISOR,
+            g.rows_bound().saturating_sub(g.rows_depth),
             g.rows_bound()
         )
     } else {
@@ -777,7 +778,7 @@ mod tests {
             render_geometry_line("spans", &g),
             "load geometry: spans: flush target 21750000 bytes (derived: 250000 rows x 87 \
              estimated bytes per row), pipeline depth 125 (rows bound decided it: rows bound \
-             100 + 25% = 125, memory bound 36245)"
+             100 + 25 = 125, memory bound 36245)"
         );
     }
 
@@ -957,7 +958,7 @@ mod tests {
         assert_eq!(g.depth_bound, DepthBound::Cap);
         assert!(
             render_geometry_line("logs", &g).contains(
-                "pipeline depth 1024 (cap decided it: cap 1024, rows bound 1000000 + 25% = \
+                "pipeline depth 1024 (cap decided it: cap 1024, rows bound 1000000 + 250000 = \
                  1250000, memory bound"
             ),
             "{}",
