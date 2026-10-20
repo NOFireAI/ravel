@@ -96,4 +96,5 @@ pub use stage_timing::{
     MetricStageTimings, StageTotals,
 };
 pub use value::{IngestExemplar, IngestPoint, IngestValue, est_points_object_bytes};
+#[cfg(feature = "flush-input-bytes")]
 pub use write_gate::FlushInputBytes;

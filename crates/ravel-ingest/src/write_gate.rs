@@ -6,7 +6,9 @@
 //! and reads it once per flush; a later generation's actors read the same
 //! slot.
 
-use std::sync::{Arc, Mutex, RwLock};
+#[cfg(feature = "flush-input-bytes")]
+use std::sync::Mutex;
+use std::sync::{Arc, RwLock};
 
 use ravel_cpu_gate::{CpuGateError, JobSize, WriteGate, WriteSite};
 
@@ -33,12 +35,14 @@ pub(crate) const GATE_DEADLINE_MESSAGE: &str =
 /// gate's inline floor. Attached with
 /// [`crate::IngestRouter::with_flush_input_bytes`] by a bench; clones share
 /// one list, which grows by one entry per flush until [`Self::take`] empties
-/// it.
+/// it. Compiled only with the `flush-input-bytes` feature.
+#[cfg(feature = "flush-input-bytes")]
 #[derive(Clone, Default)]
 pub struct FlushInputBytes {
     sizes: Arc<Mutex<Vec<u64>>>,
 }
 
+#[cfg(feature = "flush-input-bytes")]
 impl FlushInputBytes {
     fn record(&self, input_bytes: u64) {
         self.sizes
@@ -62,6 +66,7 @@ impl FlushInputBytes {
 #[derive(Clone, Default)]
 pub(crate) struct WriteGateSlot {
     gate: Arc<RwLock<Option<Arc<WriteGate>>>>,
+    #[cfg(feature = "flush-input-bytes")]
     input_recorder: Arc<RwLock<Option<FlushInputBytes>>>,
     /// Makes the next gated encode fail with this error, so a test can reach
     /// the flush's gate-error arm: `Panicked` panics inside the job on the
@@ -86,6 +91,7 @@ impl WriteGateSlot {
             .clone()
     }
 
+    #[cfg(feature = "flush-input-bytes")]
     pub(crate) fn set_input_recorder(&self, recorder: FlushInputBytes) {
         *self
             .input_recorder
@@ -93,6 +99,7 @@ impl WriteGateSlot {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(recorder);
     }
 
+    #[cfg(feature = "flush-input-bytes")]
     fn record_input(&self, input_bytes: u64) {
         if let Some(recorder) = self
             .input_recorder
@@ -131,6 +138,7 @@ impl WriteGateSlot {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(feature = "flush-input-bytes")]
         self.record_input(input_bytes);
         let Some(gate) = self.get() else {
             return Ok(job());

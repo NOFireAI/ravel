@@ -206,7 +206,7 @@ fn run_scenario() -> anyhow::Result<ExitCode> {
         "scale: decode unit {DECODE_UNIT_BYTES} / divisor {divisor} = {target} bytes, {decodes} concurrent decodes"
     );
     println!(
-        "inline floors in effect: {} bytes, {} samples (server defaults; not settable through ServerConfig)",
+        "read gate inline floors in effect: {} bytes, {} samples (server defaults; not settable through ServerConfig)",
         ravel_cpu_gate::DEFAULT_INLINE_FLOOR_BYTES,
         ravel_cpu_gate::DEFAULT_EVAL_FLOOR_SAMPLES
     );

@@ -255,6 +255,11 @@ tempfile = { workspace = true }
 # others are workspace pins ravel-server already links. No new external crate.
 ravel-server = { path = "../../services/ravel-server", version = "0.24.0" }
 ravel-cpu-gate = { workspace = true }
+# The same bench records each flush encode's input bytes through
+# `ravel_ingest::FlushInputBytes`. Enabled on the dev-dependency only, so the
+# bench and test targets get the recorder and the bins and every shipping
+# build do not (issue #3124).
+ravel-ingest = { workspace = true, features = ["flush-input-bytes"] }
 axum = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 flate2 = { workspace = true }

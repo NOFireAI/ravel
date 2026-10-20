@@ -1,6 +1,8 @@
 //! `with_flush_input_bytes` records the figure each flush encode is sized by
 //! (issue #2818): a write gate whose inline floor is that figure dispatches
-//! the encode, and one a byte higher runs it inline.
+//! the encode, and one a byte higher runs it inline. Built only with the
+//! `flush-input-bytes` feature, which `stage-timing` turns on.
+#![cfg(feature = "flush-input-bytes")]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod common;
