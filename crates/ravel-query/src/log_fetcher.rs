@@ -81,7 +81,7 @@ use ravel_logseg::{
 use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{Etag, GetOutcome, GetRange, ObjectStoreBackend, StoreError};
 use ravel_types::TenantHash;
-use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
 use ravel_types::logstream::canonical_attr_bytes;
 use tracing::Instrument;
 
@@ -1710,6 +1710,7 @@ impl LogSegmentFetcher {
         // the phase taxonomy and `scan_accounted_with_tenant` below for the
         // tenant-aware funnel this untenanted entry point mirrors.
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(caller_accounting.access_intent());
         let accounting = phase.scan();
         let result = async {
             if !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns) {
@@ -1823,6 +1824,7 @@ impl LogSegmentFetcher {
         // returns, so buffering into a disposable `PhaseAccounting` and
         // merging once is safe here.
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(caller_accounting.access_intent());
         let accounting = phase.scan();
         // This funnel's decode (`scan_bytes`) reads every column, so the fetch
         // selection is the same: on a version-4 object it brings every column
@@ -2117,6 +2119,7 @@ impl LogSegmentFetcher {
         caller_accounting: &QueryAccounting,
     ) -> Result<SegmentPlan, LogFetchError> {
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(caller_accounting.access_intent());
         let accounting = phase.plan();
         let result = async {
             // Fast path (#693): a query with no block-level predicate whose ts
@@ -2445,6 +2448,7 @@ impl LogSegmentFetcher {
             return unkeyed(None).await;
         }
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(plan_accounting.access_intent());
         let accounting = phase.plan();
         let fetch_span = tracing::debug_span!(
             "page_fetch",
@@ -3350,7 +3354,7 @@ impl LogSegmentFetcher {
         // tiered tier (see [`ReadCache::get_or_fetch`]).
         let (bytes, outcome) = async {
             cache
-                .get_or_fetch(cache_key, || async move {
+                .get_or_fetch(cache_key, accounting.access_intent(), || async move {
                     // Held across the GET only: dropped before this closure
                     // returns the bytes to its caller's decode (ADR-1195).
                     let _permit = self.get_limiter.acquire().await.map_err(|_| {
@@ -5519,7 +5523,7 @@ impl BlockRangeFetcher {
         // single call avoids the peek-then-`get_or_fetch` double-count on the
         // tiered tier (see [`ReadCache::get_or_fetch`]).
         let (bytes, outcome) = cache
-            .get_or_fetch(cache_key, || async move {
+            .get_or_fetch(cache_key, accounting.access_intent(), || async move {
                 let got = self
                     .store_get_pinned(key, range, phase, pin, accounting)
                     .await
@@ -6914,8 +6918,14 @@ impl BlockRangeFetcher {
             stats.whole_object = true;
             // Still admit per-block cache entries so a later partition's fetch of
             // a subset composes with this one (ADR-0107 decision 3).
-            self.admit_blocks_from_whole(seg_ref, tenant_hash, &bytes, &extents)
-                .await;
+            self.admit_blocks_from_whole(
+                seg_ref,
+                tenant_hash,
+                &bytes,
+                &extents,
+                accounting.access_intent(),
+            )
+            .await;
             return Ok((bytes, stats));
         }
 
@@ -7766,7 +7776,7 @@ impl BlockRangeFetcher {
             if let Some(cache) = &self.cache {
                 let cache_key =
                     CacheKey::new(tenant_hash.0, seg_ref.content_hash, desc.offset, desc.len);
-                if let Some(bytes) = cache.get(&cache_key).await {
+                if let Some(bytes) = cache.get(&cache_key, accounting.access_intent()).await {
                     accounting.record_cache_hit();
                     accounting.add_cache_bytes(bytes.len() as u64);
                     let reservation = self.reserve_fetch(bytes.len() as u64)?;
@@ -7816,7 +7826,9 @@ impl BlockRangeFetcher {
                     .ok_or_else(|| corrupt_range(key))?;
                 let cache_key =
                     CacheKey::new(tenant_hash.0, seg_ref.content_hash, desc.offset, desc.len);
-                cache.insert(cache_key, section).await;
+                cache
+                    .insert(cache_key, section, accounting.access_intent())
+                    .await;
             }
         }
         Ok(())
@@ -7955,7 +7967,11 @@ impl BlockRangeFetcher {
                     let cache_key =
                         CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
                     cache
-                        .insert(cache_key, Bytes::copy_from_slice(&block))
+                        .insert(
+                            cache_key,
+                            Bytes::copy_from_slice(&block),
+                            accounting.access_intent(),
+                        )
                         .await;
                 }
                 continue;
@@ -7963,7 +7979,7 @@ impl BlockRangeFetcher {
             let cache_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
             if let Some(cache) = &self.cache
-                && let Some(bytes) = cache.get(&cache_key).await
+                && let Some(bytes) = cache.get(&cache_key, accounting.access_intent()).await
             {
                 // Corrupt-hit gate (ADR-0046 §4 / ADR-0107 decision 3): a cached
                 // block is re-verified against its stored crc before use, exactly
@@ -8078,6 +8094,7 @@ impl BlockRangeFetcher {
         // in-flight GET, or it led the flight and the leader's RAM recheck
         // served the lead block from a flight that finished after the peek.
         let led: std::sync::OnceLock<(Vec<(u64, Bytes)>, u64)> = std::sync::OnceLock::new();
+        let intent = accounting.access_intent();
         // `fetch_peeked`, not `get_or_fetch`: fetch_blocks already peeked every
         // block of this run with `cache.get` (the one accounted miss), so a
         // second read-through here would re-peek and double-count the miss on
@@ -8088,7 +8105,7 @@ impl BlockRangeFetcher {
         // says whether this call's own GET produced the run, not whether it
         // led the flight.
         let lead_bytes = cache
-            .fetch_peeked(lead_key, || async {
+            .fetch_peeked(lead_key, intent, || async {
                 let got = self
                     .store_get_pinned(key, range, phase, pin, accounting)
                     .await
@@ -8111,6 +8128,7 @@ impl BlockRangeFetcher {
                                 bytes.len() as u64,
                             ),
                             bytes.clone(),
+                            intent,
                         )
                         .await;
                 }
@@ -8143,7 +8161,7 @@ impl BlockRangeFetcher {
         for ext in blocks.iter().skip(1) {
             let block_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
-            if let Some(bytes) = cache.peek_uncounted(&block_key).await {
+            if let Some(bytes) = cache.peek_uncounted(&block_key, intent).await {
                 verify_block_crc(key, &bytes, ext)?;
                 out.push((ext.abs_start, bytes));
                 continue;
@@ -8155,7 +8173,7 @@ impl BlockRangeFetcher {
             // recheck) are verified after it returns.
             let fetched_here = std::sync::atomic::AtomicBool::new(false);
             let bytes = cache
-                .fetch_peeked(block_key, || async {
+                .fetch_peeked(block_key, intent, || async {
                     let got = self
                         .store_get_pinned(
                             key,
@@ -8195,12 +8213,16 @@ impl BlockRangeFetcher {
     /// Async because each admission may write a file on the disk tier, and
     /// [`ReadCache::insert`] moves that write to the blocking pool (issue
     /// #1891). Its only caller is already async.
+    ///
+    /// `intent` is the intent of the whole-object read being split, so a bulk
+    /// scan's blocks land in the bulk region with the object they came from.
     async fn admit_blocks_from_whole(
         &self,
         seg_ref: &SegmentRef,
         tenant_hash: TenantHash,
         object: &LogObjectBytes,
         extents: &[BlockExtent],
+        intent: AccessIntent,
     ) {
         let Some(cache) = &self.cache else {
             return;
@@ -8215,7 +8237,7 @@ impl BlockRangeFetcher {
             let cache_key =
                 CacheKey::new(tenant_hash.0, seg_ref.content_hash, ext.abs_start, ext.len);
             let block = Bytes::copy_from_slice(&block);
-            cache.insert(cache_key, block).await;
+            cache.insert(cache_key, block, intent).await;
         }
     }
 }

@@ -297,6 +297,15 @@ fn log_warm_result(
     }
 }
 
+/// A fresh, discarded accounting handle for one warm fetch, tagged
+/// interactive: warming fills the cache with the newest parts so the next
+/// query's reads hit, which is the interactive working set, not a bulk pass.
+fn warm_accounting() -> ravel_types::accounting::QueryAccounting {
+    let accounting = ravel_types::accounting::QueryAccounting::new();
+    accounting.set_access_intent(ravel_types::accounting::AccessIntent::Interactive);
+    accounting
+}
+
 async fn warm_metrics(
     catalog: &Catalog,
     fetcher: &SegmentFetcher,
@@ -318,7 +327,10 @@ async fn warm_metrics(
 
     let mut warmed = 0usize;
     for part in &parts {
-        match fetcher.fetch_series(tenant, part, &[]).await {
+        match fetcher
+            .fetch_series_accounted(tenant, part, &[], &warm_accounting())
+            .await
+        {
             Ok(_) => warmed += 1,
             Err(err) => {
                 tracing::debug!(
@@ -363,12 +375,7 @@ async fn warm_logs(
     for part in &parts {
         let query = LogQuery::new(part.min_event_ts_ns, part.max_event_ts_ns);
         match fetcher
-            .fetch_accounted_with_tenant(
-                part,
-                tenant,
-                &query,
-                &ravel_types::accounting::QueryAccounting::new(),
-            )
+            .fetch_accounted_with_tenant(part, tenant, &query, &warm_accounting())
             .await
         {
             Ok(_) => warmed += 1,

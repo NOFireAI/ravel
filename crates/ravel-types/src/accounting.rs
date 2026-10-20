@@ -29,9 +29,57 @@
 //! query's cost" without needing to subtract anything.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use crate::TenantHash;
+
+/// Why a query reads what it reads, carried on its [`QueryAccounting`] so every
+/// cache lookup and admission the query makes can tell the read cache which
+/// region the bytes belong in.
+///
+/// A mirror of `ravel_cache::AccessIntent`, variant for variant, rather than a
+/// re-export: this crate sits below `ravel-cache` in the dependency graph and
+/// must not depend on it. `ravel-query`, which depends on both, converts one
+/// into the other at the cache boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum AccessIntent {
+    /// A read a person is waiting on, likely to be repeated. The default:
+    /// every query that nothing classifies otherwise reads as interactive.
+    #[default]
+    Interactive,
+    /// A statement that reads the whole tenant once over, so its bytes are
+    /// unlikely to be read again before they age out.
+    BulkScan,
+    /// Background work (compaction, fold, rebuild) reading on no user's behalf.
+    Maintenance,
+}
+
+impl AccessIntent {
+    /// Every variant, in `code()` order.
+    pub const ALL: [AccessIntent; 3] = [
+        AccessIntent::Interactive,
+        AccessIntent::BulkScan,
+        AccessIntent::Maintenance,
+    ];
+
+    /// Stable one-byte code, the inverse of [`Self::from_code`].
+    fn code(self) -> u8 {
+        match self {
+            AccessIntent::Interactive => 0,
+            AccessIntent::BulkScan => 1,
+            AccessIntent::Maintenance => 2,
+        }
+    }
+
+    /// Inverse of [`Self::code`]; an unknown code reads as the default.
+    fn from_code(code: u8) -> Self {
+        match code {
+            1 => AccessIntent::BulkScan,
+            2 => AccessIntent::Maintenance,
+            _ => AccessIntent::Interactive,
+        }
+    }
+}
 
 /// Adds `add` to an atomic counter, saturating at `u64::MAX` instead of
 /// wrapping. A plain `fetch_add` wraps silently even under `overflow-checks`
@@ -149,6 +197,8 @@ struct Inner {
     /// Recorded as a running maximum (compare-and-swap loop), never a sum;
     /// see [`QueryAccounting::observe_intermediate_bytes`].
     peak_intermediate_bytes: AtomicU64,
+    /// [`AccessIntent::code`] of the query's intent; zero is `Interactive`.
+    access_intent: AtomicU8,
 }
 
 /// Cheap-to-clone, `Send + Sync` handle over one query's cost counters.
@@ -165,6 +215,20 @@ impl QueryAccounting {
     /// New handle with every counter at zero, for one query.
     pub fn new() -> Self {
         QueryAccounting::default()
+    }
+
+    /// The intent every cache read and admission on this query's behalf is
+    /// tagged with. [`AccessIntent::Interactive`] until something calls
+    /// [`Self::set_access_intent`].
+    pub fn access_intent(&self) -> AccessIntent {
+        AccessIntent::from_code(self.0.access_intent.load(Ordering::Relaxed))
+    }
+
+    /// Set the intent for this handle and every clone of it. A caller sets it
+    /// once, after deciding what the query is and before its first data read;
+    /// reads already issued keep the intent they were issued under.
+    pub fn set_access_intent(&self, intent: AccessIntent) {
+        self.0.access_intent.store(intent.code(), Ordering::Relaxed);
     }
 
     /// Record one completed store request of kind `op`.
@@ -371,6 +435,9 @@ impl QueryAccounting {
     /// worker reporting a counter near `u64::MAX` pins the aggregate at the
     /// maximum rather than wrapping it (a wrapped low value would silently slip
     /// under a bytes-scanned budget the coordinator re-enforces).
+    ///
+    /// The snapshot's `access_intent` is not merged: the live handle's intent
+    /// is the query's own decision, and a worker's report does not change it.
     pub fn merge_snapshot(&self, other: &QueryAccountingSnapshot) {
         for op in AccountedOp::ALL {
             saturating_fetch_add(&self.0.ops[op.index()].requests, other.s3_requests(op));
@@ -428,6 +495,7 @@ impl QueryAccounting {
             logs_ranged_opens: self.0.logs_ranged_opens.load(Ordering::Relaxed),
             data_objects_touched: self.0.data_objects_touched.load(Ordering::Relaxed),
             peak_intermediate_bytes: self.0.peak_intermediate_bytes.load(Ordering::Relaxed),
+            access_intent: self.access_intent(),
         }
     }
 }
@@ -555,6 +623,10 @@ pub struct QueryAccountingSnapshot {
     /// plan phase, which must pick its single recorder explicitly.
     pub data_objects_touched: u64,
     pub peak_intermediate_bytes: u64,
+    /// The handle's [`AccessIntent`] when the snapshot was taken. Not a
+    /// counter: combining two snapshots keeps the non-interactive intent of
+    /// either (see [`Self::saturating_add`]).
+    pub access_intent: AccessIntent,
 }
 
 impl QueryAccountingSnapshot {
@@ -599,6 +671,10 @@ impl QueryAccountingSnapshot {
     /// high-water mark, so the peak across sub-queries is the larger of their
     /// peaks and never their total (the same rule
     /// [`QueryAccounting::observe_intermediate_bytes`] keeps within one query).
+    /// `access_intent` is not a counter: the result carries `self`'s intent
+    /// unless it is `Interactive`, in which case it carries `other`'s, so a
+    /// combination of one classified snapshot with default ones keeps the
+    /// classification.
     pub fn saturating_add(&self, other: &QueryAccountingSnapshot) -> QueryAccountingSnapshot {
         let mut s3_requests = [0u64; ACCOUNTED_OP_COUNT];
         let mut s3_bytes = [0u64; ACCOUNTED_OP_COUNT];
@@ -640,6 +716,11 @@ impl QueryAccountingSnapshot {
             peak_intermediate_bytes: self
                 .peak_intermediate_bytes
                 .max(other.peak_intermediate_bytes),
+            access_intent: if self.access_intent == AccessIntent::Interactive {
+                other.access_intent
+            } else {
+                self.access_intent
+            },
         }
     }
 
@@ -1280,5 +1361,50 @@ mod tests {
             ..QueryAccountingSnapshot::default()
         });
         assert_eq!(agg.snapshot().data_objects_touched, u64::MAX);
+    }
+
+    #[test]
+    fn access_intent_defaults_to_interactive_and_is_shared_by_clones() {
+        let acc = QueryAccounting::new();
+        assert_eq!(acc.access_intent(), AccessIntent::Interactive);
+        assert_eq!(acc.snapshot().access_intent, AccessIntent::Interactive);
+        let clone = acc.clone();
+        for intent in AccessIntent::ALL {
+            clone.set_access_intent(intent);
+            assert_eq!(acc.access_intent(), intent);
+            assert_eq!(acc.snapshot().access_intent, intent);
+            assert_eq!(AccessIntent::from_code(intent.code()), intent);
+        }
+    }
+
+    #[test]
+    fn combining_snapshots_keeps_the_non_interactive_intent() {
+        let bulk = QueryAccountingSnapshot {
+            access_intent: AccessIntent::BulkScan,
+            ..QueryAccountingSnapshot::default()
+        };
+        let plain = QueryAccountingSnapshot::default();
+        assert_eq!(
+            plain.saturating_add(&bulk).access_intent,
+            AccessIntent::BulkScan
+        );
+        assert_eq!(
+            bulk.saturating_add(&plain).access_intent,
+            AccessIntent::BulkScan
+        );
+        assert_eq!(
+            plain.saturating_merge(&plain).access_intent,
+            AccessIntent::Interactive
+        );
+    }
+
+    #[test]
+    fn merge_snapshot_leaves_the_live_intent_alone() {
+        let acc = QueryAccounting::new();
+        acc.merge_snapshot(&QueryAccountingSnapshot {
+            access_intent: AccessIntent::BulkScan,
+            ..QueryAccountingSnapshot::default()
+        });
+        assert_eq!(acc.access_intent(), AccessIntent::Interactive);
     }
 }

@@ -139,6 +139,10 @@ use ravel_types::accounting::{
 };
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
+use crate::access_intent::{
+    CacheCounterMark, StatementCacheStats, classify_access_intent, plan_is_predicate_free,
+    window_contains_every_segment,
+};
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
 use crate::clock::SystemClock;
@@ -804,6 +808,11 @@ pub struct SqlStats {
     /// existed. False both when no cap was set and when the whole result fit
     /// inside it.
     pub row_cap_hit: bool,
+    /// The intent the successful attempt read the segment cache under and how
+    /// far the cache's counters moved over the statement's run. `None` when
+    /// the executor reads uncached, and on the Flight SQL and distributed
+    /// paths, which do not classify.
+    pub cache: Option<StatementCacheStats>,
     /// The successful attempt's `LogsScanExec` wall-clock timing, read off the
     /// same DataFusion metric set as the block counters. All zero for a plan
     /// with no logs scan.
@@ -2182,6 +2191,7 @@ impl SqlExecutor {
         // resolve window, so the declared schema and the snapshot are pinned to
         // one instant together.
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
+        let cache_mark = self.fetcher.cache_ram_metrics().map(CacheCounterMark::take);
 
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
@@ -2236,6 +2246,16 @@ impl SqlExecutor {
                 .iter()
                 .map(|(signal, snapshot)| (*signal, snapshot))
                 .collect();
+            let logs_predicate_free = self
+                .logs_predicate_free(tenant_hash, capabilities, statement, &lane_refs, req.window)
+                .await;
+            phase_accounting.set_access_intent(classify_access_intent(
+                &lane_refs,
+                parquet.is_some(),
+                req.window,
+                req.now_ns,
+                logs_predicate_free,
+            ));
             let io_shape =
                 self.sql_io_shape(&lane_refs, &phase_accounting, unfolded_segments_resolved);
 
@@ -2283,6 +2303,9 @@ impl SqlExecutor {
                         ..caps.wall
                     };
                     stats.histogram_series_skipped = blocks.histogram_series_skipped;
+                    stats.cache = cache_mark
+                        .as_ref()
+                        .map(|mark| mark.since(phase_accounting.access_intent()));
                     let phase_snapshot = phase_accounting.snapshot();
                     return Ok(SqlOutcome {
                         output,
@@ -3936,6 +3959,48 @@ impl SqlExecutor {
         samples
             .all(|key| key.as_ref() == Some(&first))
             .then_some(first)
+    }
+
+    /// Whether a statement whose one lane is `logs` carries no row predicate
+    /// ([`plan_is_predicate_free`]), for [`classify_access_intent`]. Plans
+    /// only when the rest of the logs whole-segment test already passes on
+    /// the resolved segments, through the same throwaway session
+    /// [`Self::pushed_down_name_filter`] uses (no I/O); every other statement,
+    /// and one that fails to plan here, reads as not predicate-free.
+    async fn logs_predicate_free(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        lanes: &[(TargetSignal, &Snapshot)],
+        window: TimeRange,
+    ) -> bool {
+        let [(TargetSignal::Logs, snapshot)] = lanes else {
+            return false;
+        };
+        let Some(sql) = statement.sql() else {
+            return false;
+        };
+        if !snapshot.pending_erasure.is_empty() || !window_contains_every_segment(snapshot, window)
+        {
+            return false;
+        }
+        let tables = vec![self.empty_snapshot_table(TargetSignal::Logs, tenant_hash, &[])];
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let Ok(ctx) = build_session_with_tables(
+            &self.config,
+            pool,
+            tables,
+            false,
+            crate::session::SpillDecision::Disabled,
+            &self.session_principal(tenant_hash, capabilities),
+        ) else {
+            return false;
+        };
+        match ctx.state().create_logical_plan(sql).await {
+            Ok(plan) => plan_is_predicate_free(&plan),
+            Err(_) => false,
+        }
     }
 
     /// ADR-0094 decision 1: whether every aggregate expression and GROUP BY key

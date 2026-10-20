@@ -21,7 +21,7 @@ use ravel_promql::{
 use ravel_proto::queryfrag::v1 as pb;
 use ravel_segment::ReaderLimits;
 use ravel_types::accounting::{
-    AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
+    AccessIntent, AccountedOp, CostEstimate, QueryAccounting, QueryAccountingSnapshot,
 };
 use ravel_types::{
     CommitToken, LabelSet, METRIC_NAME_LABEL, Sample, SeriesId, Signal, TenantHash, TimeRange,
@@ -1604,7 +1604,7 @@ impl QueryEngine {
         // `SnapshotInvalidated` class of rare failure the metrics lane's own
         // second attempt exists to paper over, not a case worth duplicating
         // that machinery for.
-        let log_accounting = PhaseAccounting::new();
+        let log_accounting = Self::promql_accounting();
         // Before the log lane's own resolve, for the reason the metrics lane
         // installs before its own: this lane spends through a handle of its
         // own, and a caller's future dropped inside the log resolve or the
@@ -2277,6 +2277,16 @@ impl QueryEngine {
         Ok((source, stats))
     }
 
+    /// A fresh accounting handle for one PromQL lane or attempt. Every PromQL
+    /// read is [`AccessIntent::Interactive`]: a range query is a dashboard
+    /// panel that will be asked for again, so its bytes belong in the
+    /// protected region even when it reads a whole tenant.
+    fn promql_accounting() -> PhaseAccounting {
+        let accounting = PhaseAccounting::new();
+        accounting.set_access_intent(AccessIntent::Interactive);
+        accounting
+    }
+
     /// Register this lane's or attempt's accounting handle with the caller's
     /// live view, if it asked for one. The view sums every handle registered
     /// with it, so calling this once per handle is what makes the live figure
@@ -2354,7 +2364,7 @@ impl QueryEngine {
         // `QueryStats` the successful attempt reports. The live view is the
         // other side of that: it sums both attempts, because a caller that
         // cancelled after a retry started owes what both of them issued.
-        let first_accounting = PhaseAccounting::new();
+        let first_accounting = Self::promql_accounting();
         // Before the resolve, not after it: a caller's future dropped during
         // the first catalog LIST must still find this attempt's counters
         // through the live view.
@@ -2412,7 +2422,7 @@ impl QueryEngine {
                 source: StoreError::NotFound,
                 ..
             })) => {
-                let second_accounting = PhaseAccounting::new();
+                let second_accounting = Self::promql_accounting();
                 self.install_live_usage(&second_accounting);
                 let ResolvedBounded {
                     snapshot: second,

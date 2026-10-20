@@ -35,7 +35,7 @@ use ravel_query::{
     StreamAttrEquals,
 };
 use ravel_types::TenantHash;
-use ravel_types::accounting::{AccountedOp, QueryAccounting};
+use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccounting};
 use uuid::Uuid;
 
 /// An [`ObjectStoreBackend`] wrapper that counts `get` calls, so a test can
@@ -1078,6 +1078,52 @@ async fn erasure_runs_after_cache_hit() {
             .iter()
             .all(|(k, v)| !(k == "user_id" && *v == AttrValue::Str("u1".into())))),
         "cache-served bytes of the erased subject must not leak"
+    );
+}
+
+/// The funnel reads under its caller's intent, not the default of the
+/// per-phase handle it builds internally: a bulk caller's warm read is a
+/// bulk-scan hit in the cache's counters, and an interactive caller's is an
+/// interactive one.
+#[tokio::test]
+async fn whole_object_funnel_reads_under_the_callers_access_intent() {
+    let tenant = TenantHash([9u8; 16]);
+    let mem = Arc::new(MemoryStore::new());
+    let seg_ref = write_object(&mem, "logs/intent.rlog", &erasure_records()).await;
+    let cache: Arc<Cache<CacheFetchError>> = Arc::new(Cache::new(CacheLimits::new(
+        16 * 1024 * 1024,
+        100,
+        16 * 1024 * 1024,
+    )));
+    let metrics = cache.metrics();
+    let fetcher = LogSegmentFetcher::new(mem as Arc<dyn ObjectStoreBackend>).with_cache(cache);
+    let read = |intent: AccessIntent| {
+        let accounting = QueryAccounting::new();
+        accounting.set_access_intent(intent);
+        let fetcher = &fetcher;
+        let seg_ref = &seg_ref;
+        async move {
+            fetcher
+                .fetch_accounted_with_tenant(seg_ref, tenant, &LogQuery::new(0, 5000), &accounting)
+                .await
+                .expect("fetch")
+                .expect("in range");
+            accounting.snapshot().access_intent
+        }
+    };
+
+    assert_eq!(read(AccessIntent::BulkScan).await, AccessIntent::BulkScan);
+    assert_eq!(read(AccessIntent::BulkScan).await, AccessIntent::BulkScan);
+    let after_bulk = metrics.intent_snapshot();
+    assert_eq!(after_bulk.bulk_scan.hits, 1, "{after_bulk:?}");
+    assert_eq!(after_bulk.interactive.hits, 0, "{after_bulk:?}");
+
+    read(AccessIntent::Interactive).await;
+    let after_interactive = metrics.intent_snapshot();
+    assert_eq!(after_interactive.bulk_scan.hits, 1, "{after_interactive:?}");
+    assert_eq!(
+        after_interactive.interactive.hits, 1,
+        "{after_interactive:?}"
     );
 }
 

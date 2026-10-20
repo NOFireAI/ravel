@@ -176,7 +176,9 @@ The JSON response envelope has one array per row under `data.rows`:
 ```
 
 `stats` holds `accounting`, `estimate`, `phases`, `signals`, `io`,
-`timings` and `pruning`. `signals` has one entry per signal table the
+`timings` and `pruning`, and `cache` when the fetcher cache is on (see
+[per-statement cache counters](../guides/caching.md#per-statement-cache-counters)).
+`signals` has one entry per signal table the
 statement reads, in the order `samples`, `logs`, `spans`, `alerts`,
 `audit`, each with exactly `table`, `segments`, `segmentsPruned` and
 `phases` (the table's own cost, in the shape of `stats.phases`). Summed
@@ -281,7 +283,7 @@ The response is always JSON. Here, with the row values illustrative and the
 - A `date_nanos` value is an integer count of nanoseconds since the Unix
   epoch.
 - `stats` has the sections `/api/v1/sql` reports for a statement that reads
-  the catalog, except `signals`: `accounting`, `estimate`, `io`, `phases`,
+  the catalog, except `signals` and `cache`: `accounting`, `estimate`, `io`, `phases`,
   `pruning` and `timings`. A `ROW` statement reads no object, and its `stats` holds only
   `accounting` and `estimate`, with no request counted.
 - `warnings`, an array of strings, is present only when there is something
