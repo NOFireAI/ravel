@@ -22,6 +22,8 @@ use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
 use ravel_ingest::Clock;
+use ravel_logseg::writer::ObjectIdentity as LogObjectIdentity;
+use ravel_logseg::{AttrValue, LogRecord, RlogConfig, RlogWriter, stream_attrs_bytes};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::http::StaticBearerTokenResolver;
@@ -31,6 +33,7 @@ use ravel_server::Cli;
 use ravel_server::sql::{SqlState, router};
 use ravel_server::store::build_cache;
 use ravel_sql::{SqlConfig, SqlExecutor};
+use ravel_types::logstream::log_stream_id;
 use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantId};
 use serde_json::Value;
 use tower::ServiceExt;
@@ -145,6 +148,83 @@ async fn publish_segment(
     size
 }
 
+/// Publish one RLOG object for `tenant` holding `count` records spread over
+/// `hour`, committed in that ingest hour.
+async fn publish_log_segment(
+    store: &dyn ObjectStoreBackend,
+    tenant: &TenantId,
+    index: usize,
+    hour: i64,
+    count: usize,
+) {
+    let tenant_hash = tenant.hash();
+    let resource = vec![(
+        "service.name".to_string(),
+        AttrValue::Str("api".to_string()),
+    )];
+    let base = hour * NS_PER_HOUR;
+    let step = NS_PER_HOUR / count as i64;
+    let records: Vec<LogRecord> = (0..count)
+        .map(|i| LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: base + i as i64 * step,
+            observed_ts_ns: base + i as i64 * step,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("request {i}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: Vec::new(),
+        })
+        .collect();
+    let min_event_ts_ns = records.first().expect("records").ts_ns;
+    let max_event_ts_ns = records.last().expect("records").ts_ns;
+
+    let writer_id = Uuid::from_u128(9_000 + index as u128);
+    let identity = LogObjectIdentity {
+        tenant_hash: tenant_hash.0,
+        shard: 0,
+        writer_id: writer_id.into_bytes(),
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+    };
+    let mut writer = RlogWriter::new(RlogConfig::default(), identity);
+    for rec in &records {
+        writer.push(rec.clone()).expect("push log record");
+    }
+    let bytes = writer.finish().expect("finish rlog object");
+    let rec = record::build(NewCommitRecord {
+        tenant_hash,
+        signal: Signal::Logs,
+        shard: 0,
+        writer_id,
+        writer_epoch: 1,
+        writer_seq: index as u64 + 1,
+        object_size: bytes.len() as u64,
+        content_hash: *blake3::hash(&bytes).as_bytes(),
+        sample_count: records.len() as u64,
+        series_count: 1,
+        min_event_ts_ns,
+        max_event_ts_ns,
+        min_ingest_ts_ns: min_event_ts_ns,
+        max_ingest_ts_ns: max_event_ts_ns,
+        segment_format_version: u32::from(ravel_ingest::LOG_SEGMENT_FORMAT_VERSION),
+        created_unix_ns: base + 10 + index as i64,
+        ingest_hour_bucket: u32::try_from(hour).expect("small hour"),
+    })
+    .expect("valid log commit record");
+    let data_key = keys::reconstruct_data_key(&rec).expect("data key");
+    store
+        .put(&data_key, bytes::Bytes::from(bytes), PutOptions::default())
+        .await
+        .expect("put log data object");
+    publish::publish(store, &rec, &RetryPolicy::default())
+        .await
+        .expect("publish log commit");
+}
+
 /// The fetcher cache the server builds for `--cache-max-bytes max_bytes`
 /// with the default `--cache-bulk-share`.
 fn server_cache(max_bytes: u64) -> ReadCache {
@@ -225,17 +305,16 @@ fn count(cache: &Value, path: &[&str]) -> u64 {
 
 const FULL_SCAN: &str = "SELECT count(*) AS n FROM samples";
 
-/// FLIPs, in `crates/ravel-sql/src/access_intent.rs`
-/// `classify_access_intent`, the `TargetSignal::Metrics` arm:
+/// FLIPs, in `crates/ravel-sql/src/access_intent.rs` `reads_whole_lane`:
 ///
-/// - reducing it to `snapshot.segments_pruned == 0` (the rule the doc
-///   comment says is not the rule) classifies both the one-series statement
-///   and the partial-window one as bulkScan, because an unfolded catalog
-///   prunes nothing;
-/// - dropping its `window_covers_all_history(window, now_ns)` conjunct
-///   classifies both as bulkScan too: resolve never returns a segment whose
-///   events sit wholly outside the window, so every segment it does return
-///   lies inside it and the containment conjunct alone passes.
+/// - reducing the `TargetSignal::Metrics` lane to
+///   `snapshot.segments_pruned == 0` and nothing else classifies both the
+///   one-series statement and the partial-window one as bulkScan, because an
+///   unfolded catalog prunes nothing;
+/// - dropping the `window_covers_all_history(window, now_ns)` conjunct
+///   classifies the partial-window one as bulkScan: resolve never returns a
+///   segment whose events sit wholly outside the window, so every segment it
+///   does return lies inside it and the containment conjunct alone passes.
 #[tokio::test]
 async fn a_full_tenant_scan_is_admitted_as_bulk_and_a_one_series_statement_as_interactive() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -278,6 +357,55 @@ async fn a_full_tenant_scan_is_admitted_as_bulk_and_a_one_series_statement_as_in
     );
 }
 
+/// FLIP: dropping the `window_covers_all_history(window, now_ns)` conjunct
+/// from `reads_whole_lane` in `crates/ravel-sql/src/access_intent.rs` (the
+/// logs rule before it carried one) classifies the one-hour statement as
+/// bulkScan, because the window still contains the tenant's only segment.
+#[tokio::test]
+async fn a_predicate_free_logs_statement_is_bulk_only_over_an_epoch_to_now_window() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    publish_log_segment(store.as_ref(), &tenant, 0, 3, 64).await;
+    let cache = server_cache(8 * 1024 * 1024);
+    let app = sql_app(store, &cache, &["acme"]);
+    let statement = "SELECT severity_text, count(*) AS n FROM logs GROUP BY severity_text";
+
+    let last_hour = statement_cache(&app, "acme", statement, 3 * NS_PER_HOUR).await;
+    assert_eq!(last_hour["intent"], "interactive", "{last_hour}");
+    assert!(count(&last_hour, &["misses"]) > 0, "{last_hour}");
+
+    let all_history = statement_cache(&app, "acme", statement, 0).await;
+    assert_eq!(all_history["intent"], "bulkScan", "{all_history}");
+}
+
+/// FLIP: dropping `&& predicate_free` from `classify_signal_lanes` in
+/// `crates/ravel-sql/src/access_intent.rs` (the samples rule before it
+/// carried no plan conjunct) classifies the `WHERE ts > ...` statement as
+/// bulkScan: an unfolded catalog prunes nothing and every segment lies inside
+/// the epoch-to-now window.
+#[tokio::test]
+async fn a_samples_statement_with_a_predicate_is_interactive_over_an_epoch_to_now_window() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    for hour in 0..4 {
+        let metric = format!("m{hour}");
+        publish_segment(store.as_ref(), &tenant, hour as usize, hour, &metric, 64).await;
+    }
+    let cache = server_cache(8 * 1024 * 1024);
+    let app = sql_app(store, &cache, &["acme"]);
+
+    let narrowed = statement_cache(
+        &app,
+        "acme",
+        "SELECT count(*) AS n FROM samples WHERE ts > TIMESTAMP '1970-01-01 03:00:00'",
+        0,
+    )
+    .await;
+    assert_eq!(narrowed["intent"], "interactive", "{narrowed}");
+    let whole = statement_cache(&app, "acme", FULL_SCAN, 0).await;
+    assert_eq!(whole["intent"], "bulkScan", "{whole}");
+}
+
 /// Cache geometry for the hot-set test, scaled down from the ravel-cache
 /// server-geometry hot-set tests: a 512 KiB cache, a hot set of four ~16 KiB
 /// segments read by interactive statements, and a bulk loop three times the
@@ -297,9 +425,9 @@ const HOT_STATEMENTS_PER_ROUND: usize = 8;
 /// read and admit as `ravel_cache::AccessIntent::Interactive` whatever intent
 /// it is passed (the classification still reported, so the full-tenant
 /// scan's reads go through the small and main queues like any other) drops
-/// the hot-set hit rate to 124 of 128.
+/// the hot-set hits to 124 of 128.
 #[tokio::test]
-async fn an_interactive_statement_keeps_its_hot_set_under_a_concurrent_bulk_loop() {
+async fn an_interactive_statement_keeps_its_hot_set_between_rounds_of_a_bulk_loop() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let hot = TenantId::new("hot".to_string());
     let bulk = TenantId::new("bulk".to_string());
@@ -360,10 +488,10 @@ async fn an_interactive_statement_keeps_its_hot_set_under_a_concurrent_bulk_loop
         (ROUNDS * HOT_STATEMENTS_PER_ROUND * HOT_SEGMENTS) as u64,
         "one lookup per hot segment per statement"
     );
-    let rate = hot_hits as f64 / lookups as f64;
-    assert!(
-        rate >= 0.99,
-        "hot-set hit rate {rate:.4} ({hot_hits} of {lookups}) is under 0.99"
+    assert_eq!(
+        (hot_hits, hot_misses),
+        (128, 0),
+        "every hot-set lookup after the warm read is an interactive hit"
     );
     // The loop must have been cached beside the hot set, or the hot set
     // held only because nothing bulk was ever admitted.
