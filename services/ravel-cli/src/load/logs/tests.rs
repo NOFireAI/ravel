@@ -1703,6 +1703,10 @@ const GEOMETRY_BATCHES: usize = 51;
 /// depth in the default-geometry tests.
 const GEOMETRY_HOST_BYTES: u64 = 64 << 30;
 
+/// Batches in the over-estimate test: two full windows of the derived depth
+/// 32 and a remainder, so the window restarts after a depth flush.
+const OVER_ESTIMATE_BATCHES: usize = 70;
+
 /// `batches` row groups of `batch_rows` identical rows on one stream, so
 /// every batch has the same estimated footprint and `--batch-rows
 /// <batch_rows>` reads one row group per batch.
@@ -1832,9 +1836,9 @@ async fn load_with_default_geometry_on(
 /// is 250,000 times the first batch's estimate per row), and a 10,000-row
 /// tail the end-of-input drain publishes.
 ///
-/// The derived depth is ceil(250,000 x 1 / 10,000) = 25. The size flushes
-/// at batches 25 and 50 each restart the depth window, so the depth flush
-/// never comes due and counts nothing.
+/// The derived depth is ceil(250,000 x 1 / 10,000) = 25 plus a quarter, 32.
+/// The size flushes at batches 25 and 50 each restart the depth window, so
+/// the depth flush never comes due and counts nothing.
 ///
 /// Per-batch flushing (a target of 1) writes 51 objects. A target compared
 /// against a figure the buffer never reaches (stored bytes instead of the
@@ -1884,7 +1888,7 @@ async fn default_load_merges_batches_into_target_sized_objects() {
         "the derived target is 250,000 rows of the first batch's estimate: {geometry:?}"
     );
     assert_eq!(geometry.rows_depth, 25);
-    assert_eq!(geometry.pipeline_depth, 25);
+    assert_eq!(geometry.pipeline_depth, 32);
     assert_eq!(geometry.depth_bound, DepthBound::Rows);
     assert_eq!(
         layout.flush_mix.totals,
@@ -1990,7 +1994,7 @@ async fn a_small_memory_budget_decides_the_derived_depth() {
     let summary = render_layout_summary(&layout);
     assert!(
         summary.contains(
-            "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"
+            "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 7 = 32)"
         ),
         "{summary}"
     );
@@ -2154,14 +2158,13 @@ fn size_closes(first: u64, later: u64, target: u64, batches: usize) -> Vec<usize
 /// Every batch after the first is 5% wider per row (a longer body), so the
 /// buffer reaches the derived target (25 first batches' worth) after 24
 /// batches: the size trigger closes batches 1-24 and 25-48, and the
-/// end-of-input flush publishes 49-51. At the derived depth of 25 the window
+/// end-of-input flush publishes 49-51. At the derived depth of 32 the window
 /// restarted at batches 25 and 49 never comes due: 3 objects, depth 0.
 ///
 /// Prove-the-test: drop the `oldest_pending.remove(&shard)` in the per-shard
 /// arm of `DepthWindow::realign_to`, which restores the window that only a
-/// depth flush restarts. It comes due at batches 25 and 50, each time on a
-/// buffer the size trigger has just emptied, and the load writes 5 objects
-/// with depth 2.
+/// depth flush restarts. It comes due at batch 32 and closes batches 25-32,
+/// so the size trigger fires once and the mix reads size 1, depth 1.
 #[tokio::test]
 async fn a_size_flush_restarts_the_depth_window() {
     use ravel_object_store::memory::MemoryStore;
@@ -2201,7 +2204,7 @@ async fn a_size_flush_restarts_the_depth_window() {
     let geometry = layout.geometry.expect("geometry resolved");
     assert_eq!(geometry.est_bytes_per_row, first_per_row);
     assert_eq!(geometry.target_bytes, probe.target_bytes);
-    assert_eq!(geometry.pipeline_depth, 25);
+    assert_eq!(geometry.pipeline_depth, 32);
     let batch_rows = GEOMETRY_BATCH_ROWS as u64;
     assert_eq!(
         size_closes(
@@ -2227,13 +2230,13 @@ async fn a_size_flush_restarts_the_depth_window() {
 }
 
 /// Issue #2753: a first batch that over-estimates the rest (a much longer
-/// body) derives a target no 25 later batches reach, so the size trigger
-/// never fires and the depth flush closes every object. At depth 25, 51
-/// batches make `51 / 25` depth flushes and one end-of-input flush for the
-/// 1-batch remainder.
+/// body) derives a target no 32 later batches reach, so the size trigger
+/// never fires and the depth flush closes every object. At depth 32, 70
+/// batches make two depth flushes (batches 1-32 and 33-64) and one
+/// end-of-input flush for the remaining 6.
 ///
 /// Prove-the-test: never call `window.submitted` in the logs loader and no
-/// flush answers the oldest write the loop waits on at the 25th submit; the
+/// flush answers the oldest write the loop waits on at the 32nd submit; the
 /// frozen clock never fires the age trigger, so the load fails on the
 /// Strict ack deadline and `load_with_default_geometry`'s `expect("load
 /// succeeds")` panics.
@@ -2244,7 +2247,7 @@ async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
     let wide_body = format!("{UNIFORM_BODY}{}", "x".repeat(200));
     let (_dir, pq, m) = bodied_rows_fixture(
         GEOMETRY_BATCH_ROWS,
-        GEOMETRY_BATCHES,
+        OVER_ESTIMATE_BATCHES,
         &wide_body,
         UNIFORM_BODY,
     );
@@ -2265,22 +2268,16 @@ async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
     let layout = report.layout_report();
     let geometry = layout.geometry.expect("geometry resolved");
     assert_eq!(geometry.target_source, TargetSource::Derived);
-    let depth = geometry.pipeline_depth;
-    assert_eq!(depth, 25);
-    let depth_flushes = (GEOMETRY_BATCHES / depth) as u64;
-    let manual = u64::from(!GEOMETRY_BATCHES.is_multiple_of(depth));
-    assert_eq!(
-        list_data_objects(store.as_ref()).await.len() as u64,
-        depth_flushes + manual
-    );
+    assert_eq!(geometry.pipeline_depth, 32);
+    assert_eq!(list_data_objects(store.as_ref()).await.len(), 3);
     assert_eq!(
         layout.flush_mix.totals,
         FlushMixCounts {
             size: 0,
             age: 0,
             arrival: 0,
-            depth: depth_flushes,
-            manual,
+            depth: 2,
+            manual: 1,
         },
         "no size flush is reachable, so the depth flush closes every full window"
     );
@@ -2335,11 +2332,11 @@ fn spread_rows_fixture(
 }
 
 /// Issue #2753: on 4 shards the derived depth is ceil(250,000 x 4 /
-/// `--batch-rows`), one target's worth of rows per shard, and the summary
-/// shows it. Every batch reaches all 4 shards, and the first over-estimates
-/// the rest, so no shard reaches the target: after 20 batches the depth
-/// flush closes one object per shard, and the end-of-input flush closes the
-/// 21st batch's 4 slices.
+/// `--batch-rows`), one target's worth of rows per shard, plus a quarter
+/// (issue #3119), and the summary shows it. Every batch reaches all 4
+/// shards, and the first over-estimates the rest, so no shard reaches the
+/// target: after 25 batches the depth flush closes one object per shard, and
+/// the end-of-input flush closes the 26th batch's 4 slices.
 ///
 /// Prove-the-test: never call `window.submitted` in the logs loader and the
 /// load fails on the Strict ack deadline instead (`expect("load succeeds")`
@@ -2351,8 +2348,10 @@ async fn four_shards_at_the_default_geometry_close_on_depth() {
 
     const SHARDS: u32 = 4;
     const BATCH_ROWS: usize = 50_000;
-    let depth = (DEFAULT_OBJECT_ROWS * SHARDS as usize).div_ceil(BATCH_ROWS);
-    assert_eq!(depth, 20);
+    let rows_depth = (DEFAULT_OBJECT_ROWS * SHARDS as usize).div_ceil(BATCH_ROWS);
+    assert_eq!(rows_depth, 20);
+    let depth = rows_bound_depth(rows_depth);
+    assert_eq!(depth, 25);
     let batches = depth + 1;
     let wide_body = format!("{UNIFORM_BODY}{}", "x".repeat(200));
     let (_dir, pq, m) = spread_rows_fixture(SHARDS, BATCH_ROWS, batches, &wide_body, UNIFORM_BODY);
@@ -2374,12 +2373,14 @@ async fn four_shards_at_the_default_geometry_close_on_depth() {
     assert_eq!(report.rows_processed, (BATCH_ROWS * batches) as u64);
     let layout = report.layout_report();
     let geometry = layout.geometry.expect("geometry resolved");
-    assert_eq!(geometry.rows_depth, depth);
+    assert_eq!(geometry.rows_depth, rows_depth);
     assert_eq!(geometry.pipeline_depth, depth);
     assert_eq!(geometry.depth_bound, DepthBound::Rows);
     let summary = render_layout_summary(&layout);
     assert!(
-        summary.contains("pipeline depth   : 20 (rows bound decided it: rows bound 20, memory"),
+        summary.contains(
+            "pipeline depth   : 25 (rows bound decided it: rows bound 20 + 5 = 25, memory"
+        ),
         "{summary}"
     );
     let shards = u64::from(SHARDS);
@@ -2444,7 +2445,8 @@ async fn a_derived_depth_above_the_cap_is_capped() {
     let summary = render_layout_summary(&layout);
     assert!(
         summary.contains(
-            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000, memory bound "
+            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000 + 250000 = \
+             1250000, memory bound "
         ),
         "{summary}"
     );
@@ -2493,8 +2495,8 @@ async fn a_memory_bound_above_the_cap_leaves_the_cap_deciding() {
     let summary = render_layout_summary(&layout);
     assert!(
         summary.contains(
-            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000, memory bound \
-             2000)"
+            "pipeline depth   : 1024 (cap decided it: cap 1024, rows bound 1000000 + 250000 = \
+             1250000, memory bound 2000)"
         ),
         "{summary}"
     );
