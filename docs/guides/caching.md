@@ -155,6 +155,7 @@ reclaiming a pre-namespacing cache directory.
 | `--cache-max-bytes <n>` | derived: 25% of the process memory budget, or 24% against a loopback `--s3-endpoint` (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the fetcher cache's RAM tier holds. Bounds the fetcher cache only; the catalog byte cache has its own `--catalog-cache-max-bytes` below and this flag never reaches it. **Unset**, it derives from the process memory budget (effective, cgroup-capped memory minus an overhead reserve, not raw host memory -- fixed at 2 GiB from 8 GiB of memory up and scaled down below it at the default ingest ceiling, and raised above 2 GiB in `--mode all` by an ingest ceiling above 1.75 GiB, see the [configuration guide](operations/configuration.md)): 25% (`7516192768` on the 30 GiB reference host) normally, or 24% (`7215545057` there) when the store is `s3` against a loopback endpoint. The loopback share comes from a ClickBench measurement on a RustFS loopback store: a cache of about 7 GB in place of the earlier 40% carve cut the concurrent error ratio from 0.099 to 0.029 at the same hot time, because the cache is carved from the budget that queries and fetches share. That gain has a cost: with the smaller carve alone, concurrent throughput was 11% lower (0.512 QPS against 0.574), while the smaller carve together with the loopback `latency-first` default raised it to 0.678 QPS. Set `--cache-max-bytes` to keep a larger cache. Startup refuses to start, rather than silently clamping, if an explicit value here together with the catalog byte cache's ceiling brings their sum to or above the process memory budget (not under `--disable-cache`, which builds neither cache, so neither cap claims anything, and not in `--mode gateway`, which serves no query and derives no memory budget). Read once at startup; there is no live resize. |
 | `--catalog-cache-max-bytes <n>` | derived: 5% of the process memory budget (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the catalog byte cache's RAM tier holds. A separate ceiling from `--cache-max-bytes` above; unset, it derives its own 5% share of the process memory budget (`1503238553` on the 30 GiB reference host) regardless of `--cache-max-bytes` or the loopback share it may have taken. Counted in the same startup refusal as `--cache-max-bytes`. Read once at startup. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by its resolved `--cache-max-bytes`, the catalog byte cache's by its resolved `--catalog-cache-max-bytes`. There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted, and on Unix Ravel keeps what it writes here readable by its own user only (see "Two tiers" above for both). |
+| `--cache-bulk-share <fraction>` | `0.5` | Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that `bulk_scan` reads hold against interactive admissions, strictly between 0 and 1. See [admission by access intent](#admission-by-access-intent) for what the region does with it and [which statements read as bulk](#which-statements-read-as-bulk) for what reaches it. It applies to the RAM tier only: the disk tier admits every read under its own policy whatever its intent. `0`, `1`, a value outside that range, and `NaN` are refused at startup. Ignored when the fetcher cache is off. Read once at startup. |
 | `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. It covers the caches of object bytes only: the catalog's two per-tenant record caches stay on, held at their 10,000-entry floor rather than the derived capacity, about 18 MB per actively-queried tenant. See [the catalog record caches](#the-catalog-record-caches). Because neither cache exists, neither ceiling is charged against the process memory budget: the whole budget goes to the shared SQL/fetch accountant, and the startup refusal above cannot fire, whatever `--cache-max-bytes` says. |
 | `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free and which records no request timings) this flag is **overridden**, and startup logs a WARN naming the value it overrode. Under `cost-based` with a rate derived from the profile, the shipped default, it is kept, and a narrow projection is read ranged only where it skips more than the projection break-even, the larger of this threshold and three request costs. |
 | `--logs-fetch-policy <policy>` | `latency-first` against a loopback `--s3-endpoint`, `cost-based` otherwise | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed or network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`, as the larger of its price term and its time term; at the shipped reference profile (intra-region, transfer free) the rate is the time term, 6,300,000 bytes per request, so **a deployment on default flags against a remote store reads a log object whole unless the bytes a narrow projection skips exceed the 18,900,000-byte projection break-even**, which no object of that size or less can. `latency-first` resolves the same byte quantities as `byte-minimal`; it is the unset default against a loopback `--s3-endpoint`, where it measured faster cold than `cost-based` at the default concurrency, and elsewhere an intent for deployments where cold wall-clock matters more than the request bill, which on real S3 pays off only once GET concurrency is also raised explicitly (it sets no concurrency default of its own), which carries a memory caveat -- see the operations guide before turning it on. An explicit flag wins, on a loopback endpoint too: `--logs-fetch-policy cost-based` keeps the remote default there. Read once at startup; the running process never changes its own policy. The resolved policy, its source (`flag`, `default` or `default-loopback`), the profile, and the byte quantities are logged at startup on the `logs fetch policy resolved` line. |
@@ -203,11 +204,14 @@ Each read of a RAM tier carries an access intent. The intent decides where
 the read's bytes are admitted and never what the read returns:
 
 - `interactive`: the S3-FIFO policy above.
-- `bulk_scan`, for a statement that reads every object of a tenant: a hit
+- `bulk_scan`, for a predicate-free SQL statement over one signal table
+  whose window runs from the epoch to now (the full rule is under
+  [which statements read as bulk](#which-statements-read-as-bulk)): a hit
   does not count toward promotion, and a bulk read never moves bytes into
-  the main queue. The bytes go to a bulk region, which holds up to half of
-  the cap against interactive admissions and more while the probation and
-  main queues leave bytes unused. An `interactive` read of a region entry
+  the main queue. The bytes go to a bulk region, which holds up to its share
+  of the cap (`--cache-bulk-share`, half by default) against interactive
+  admissions and more while the probation and main queues leave bytes
+  unused. An `interactive` read of a region entry
   moves it to probation, from where it can reach the main queue like any
   entry read twice. When a repeated scan is larger than the region, the
   region keeps one subset of its objects, chosen by a hash of each cache
@@ -223,16 +227,92 @@ the read's bytes are admitted and never what the read returns:
   If another admission took the room in between, the recheck declines it,
   and the copy already made is still counted: the admission copy counters
   (`admission_copies`, `admission_copied_bytes`) count copies made, not
-  entries stored. A bulk admission never evicts the main queue, and an
-  interactive admission reclaims bulk bytes above half the cap before it
-  evicts anything else. The region's bookkeeping is counted inside the cap
-  and held to 1% of it.
+  entries stored. A bulk admission evicts region entries of a higher hash
+  rank than its own, and probation entries only while the region is below
+  its share; a probation entry read again moves to the main queue instead of
+  being evicted. It never evicts the main queue.
 - `maintenance`: admitted to probation, and never moved to the main queue by
   its own reads. Nothing sets it yet.
 
-No reader sets `bulk_scan` yet, so every read is `interactive` today; the SQL
-executor is the reader that will set it (see Background). The disk tier
-applies the interactive policy to every read whatever its intent.
+The region's share is a reservation, not only a ceiling. An interactive
+admission reclaims bulk bytes above the share before it evicts anything
+else, but the region's bytes up to the share are evicted only once the
+probation and main queues are empty. After bulk reads stop, those bytes stay
+resident: no interactive admission rotates them out while the probation or
+main queue holds anything, and they leave only through later bulk reads,
+an interactive read that moves an entry to probation, or the max-age sweep
+below. A cache that served one whole-tenant
+scan and then only dashboards therefore runs its interactive working set in
+the cap less the bytes the scan left behind, up to the share. Lower
+`--cache-bulk-share` if that matters more than repeated scans.
+
+The region's bookkeeping is counted inside the cap and held to 1% of it: 192
+bytes per region entry and 2048 bytes per tenant whose bulk reads it tracks.
+The region therefore holds at most about `cap / 19200` entries, fewer for
+each tenant it tracks. For objects smaller than about the share times 19200
+bytes (9.6 KB at the default share) that entry count fills before the byte
+share does, and the region holds fewer bytes than its share. A bulk read
+that arrives with the bookkeeping full is declined unless it can replace a
+region entry of a higher rank.
+
+The disk tier applies the interactive policy to every read whatever its
+intent. A disk hit is copied back into RAM under the intent of the read that
+found it.
+
+### Which statements read as bulk
+
+Only the SQL executor sets `bulk_scan`, once per statement attempt, after it
+resolves which segments to read and before it reads any of them. A statement
+reads as `bulk_scan` only when all of these hold:
+
+- it names exactly one signal table, `samples` or `logs`, and no Parquet
+  table;
+- its plan is predicate-free: no `WHERE` or `HAVING` clause anywhere,
+  subqueries and CTEs included, no join and no `LIMIT`;
+- its window reaches from the Unix epoch to at least now;
+- for `samples`, the resolve pruned no segment and every segment lies
+  inside the window;
+- for `logs`, no erasure is pending and every resolved segment lies inside
+  the window.
+
+A window that starts after the tenant's first data reads as `interactive`
+even when it holds most of the tenant, and so does a query whose metric
+name or label prunes any segment.
+
+Everything else reads as `interactive`:
+
+- a statement over two or more signal tables, or over a Parquet table;
+- a statement over `spans`, `alerts` or `audit`;
+- an ES|QL query, whose logs rule needs SQL text the executor does not have
+  for it;
+- PromQL, the startup warmup, Flight SQL statements, and the fragments a
+  distributed worker runs, which read under the interactive intent
+  whatever the coordinator decided.
+
+The intent changes only where the bytes are admitted. A statement returns
+the same rows under either intent. Reads of one object that arrive together
+share one fetch, whose bytes are admitted under the intent of the read that
+started it.
+
+### Per-statement cache counters
+
+When the fetcher cache is on, the `stats` object of an `/api/v1/sql`
+response carries a `cache` object:
+
+| Key | Meaning |
+|---|---|
+| `intent` | The intent the statement read under: `interactive`, `bulkScan` or `maintenance`. |
+| `interactive`, `bulkScan`, `maintenance` | Each an object of `hits` and `servedBytes`: RAM-tier hits, and bytes served from them, under that intent. |
+| `misses` | RAM-tier misses under any intent. |
+| `admittedBytes` | Bytes admitted to the RAM tier under any intent. |
+
+The figures are the movement of the process-wide RAM-tier counters between
+the start of the statement and its end, across a retried attempt too. They
+are exact for a statement that ran alone. Statements that run at the same
+time move the same counters, so under concurrency each statement's figures
+include the others' reads, including reads under an intent it did not use.
+`misses` and `admittedBytes` are not split by intent because the cache does
+not count them per intent. With the fetcher cache off, `cache` is absent.
 
 ### The max-age sweep
 
@@ -377,6 +457,21 @@ The counters are:
 
   It is nonzero only when a disk tier is configured (`--cache-dir`). A process
   with no disk tier never emits it.
+
+Two more counters split the fetcher cache's RAM-tier hits by access intent.
+They carry `mode`, `cache="fetch"` and an `intent` label of `interactive`,
+`bulk_scan` or `maintenance`, and never a `tier=` label:
+
+- `ravel_cache_intent_hits_total`: RAM-tier hits under that intent.
+- `ravel_cache_intent_bytes_served_total`: bytes those hits served.
+
+They are separate families so that the label set of every counter above
+stays as it was. At rest, summed over `intent`, they equal the
+`cache="fetch"` RAM samples of `ravel_cache_hits_total` and
+`ravel_cache_bytes_served_total`; a scrape taken while reads are in flight
+can read the two families out of step.
+Misses and admitted bytes have no per-intent family, because the cache does
+not count them per intent.
 
 The RAM tier applies the same max-age but has no counter for it. An over-age
 RAM entry is reported as an ordinary miss. A workload whose entries routinely
@@ -586,6 +681,4 @@ bound on cached bytes comes from the erasure guarantee in
 read shape is
 [ADR-0107](../adrs/0107-pruning-proportional-logs-fetch.md), and the fetch
 policy above it is
-[ADR-0996](../adrs/0996-request-cost-aware-fetching.md). Admission by access
-intent is ADR-3072 decision 3; issue #3084 is the change that has the SQL
-executor set `bulk_scan`.
+[ADR-0996](../adrs/0996-request-cost-aware-fetching.md).

@@ -42,7 +42,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ravel_object_store::get_latency::GetPhase;
-use ravel_types::accounting::{QueryAccounting, QueryAccountingSnapshot};
+use ravel_types::accounting::{AccessIntent, QueryAccounting, QueryAccountingSnapshot};
 
 /// The phases a query's object-store cost is split across (issue #796). See
 /// the [module docs](self) for what each phase covers.
@@ -322,6 +322,27 @@ impl PhaseAccounting {
             key_index: accounting.clone(),
             shared: true,
         }
+    }
+
+    /// Set the [`AccessIntent`] on all five phase handles, so every cache read
+    /// the query makes in any phase carries it.
+    pub fn set_access_intent(&self, intent: AccessIntent) {
+        for phase in [
+            &self.resolve,
+            &self.plan,
+            &self.probe,
+            &self.scan,
+            &self.key_index,
+        ] {
+            phase.set_access_intent(intent);
+        }
+    }
+
+    /// The intent the scan phase reads under, which is the one
+    /// [`Self::set_access_intent`] set on every phase.
+    #[must_use]
+    pub fn access_intent(&self) -> AccessIntent {
+        self.scan.access_intent()
     }
 
     /// The resolve phase's handle.

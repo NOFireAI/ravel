@@ -396,6 +396,17 @@ pub enum FormatWindowCheck {
     Refuse,
 }
 
+/// Parses `--cache-bulk-share`: a fraction strictly between 0 and 1, which
+/// refuses `NaN` too, since every comparison with it is false.
+fn parse_cache_bulk_share(value: &str) -> Result<f64, String> {
+    let share: f64 = value.parse().map_err(|err| format!("{err}"))?;
+    if share > 0.0 && share < 1.0 {
+        Ok(share)
+    } else {
+        Err("must be strictly between 0 and 1".to_string())
+    }
+}
+
 /// Parses `--format-window-check-timeout`: a non-zero humantime duration.
 fn parse_format_window_check_timeout(value: &str) -> Result<Duration, String> {
     let duration = humantime::parse_duration(value).map_err(|err| err.to_string())?;
@@ -2443,6 +2454,33 @@ pub struct Cli {
     /// `--cache-max-bytes`, reaches or exceeds `memory_budget_bytes`.
     #[arg(long, value_name = "BYTES")]
     pub catalog_cache_max_bytes: Option<u64>,
+
+    /// Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that bulk-scan reads hold against interactive admissions, strictly between 0 and 1; default 0.5.
+    ///
+    /// A `POST /api/v1/sql` statement is a bulk scan (ADR-3072 decision 3a)
+    /// when it names one signal table and no Parquet table, and either that
+    /// table is `samples`, its window reaches from the Unix epoch to now, its
+    /// resolve pruned no segment and every segment lies inside the window,
+    /// or it is `logs`, it carries no row predicate, no erasure is pending
+    /// and every resolved segment lies inside the window. Every other read is
+    /// interactive. Bulk reads are admitted into a bulk region; a bulk
+    /// admission evicts other bulk entries and, while the region is below
+    /// this share, probation entries, never the main queue. Region
+    /// bytes up to this share are evicted only after the probation and main
+    /// queues are empty, so while they are resident the interactive working
+    /// set has the rest of `max_bytes`, and they stay resident after bulk
+    /// reads stop until later bulk traffic or the max-age sweep removes them;
+    /// the region uses more than the share only while the interactive queues
+    /// leave bytes unused. RAM tier only: the disk tier admits every read
+    /// under its own policy whatever its intent. Read at startup only. Ignored when the fetcher cache is off. `0`, `1`,
+    /// values outside that range and `NaN` are refused at startup.
+    #[arg(
+        long,
+        value_name = "FRACTION",
+        default_value_t = ravel_cache::DEFAULT_BULK_SHARE,
+        value_parser = parse_cache_bulk_share
+    )]
+    pub cache_bulk_share: f64,
 
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
@@ -9346,6 +9384,21 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server", "--max-pending-strict-acks", "0"])
             .expect("0 parses");
         assert_eq!(cli.max_pending_strict_acks, 0);
+    }
+
+    #[test]
+    fn cache_bulk_share_defaults_to_one_half_and_refuses_values_outside_zero_to_one() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(cli.cache_bulk_share.to_bits(), 0.5f64.to_bits());
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-bulk-share", "0.25"])
+            .expect("0.25 parses");
+        assert_eq!(cli.cache_bulk_share.to_bits(), 0.25f64.to_bits());
+        for refused in ["0", "1", "1.5", "-0.1", "NaN", "inf", "half"] {
+            assert!(
+                Cli::try_parse_from(["ravel-server", "--cache-bulk-share", refused]).is_err(),
+                "{refused} must be refused"
+            );
+        }
     }
 
     #[test]

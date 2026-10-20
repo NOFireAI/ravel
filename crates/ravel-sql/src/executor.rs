@@ -139,6 +139,10 @@ use ravel_types::accounting::{
 };
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
+use crate::access_intent::{
+    CacheCounterMark, StatementCacheStats, classify_access_intent, plan_is_predicate_free,
+    reads_whole_lane,
+};
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
 use crate::clock::SystemClock;
@@ -804,6 +808,11 @@ pub struct SqlStats {
     /// existed. False both when no cap was set and when the whole result fit
     /// inside it.
     pub row_cap_hit: bool,
+    /// The intent the successful attempt read the segment cache under and how
+    /// far the cache's counters moved over the statement's run. `None` when
+    /// the executor reads uncached, and on the Flight SQL and distributed
+    /// paths, which do not classify.
+    pub cache: Option<StatementCacheStats>,
     /// The successful attempt's `LogsScanExec` wall-clock timing, read off the
     /// same DataFusion metric set as the block counters. All zero for a plan
     /// with no logs scan.
@@ -2182,6 +2191,7 @@ impl SqlExecutor {
         // resolve window, so the declared schema and the snapshot are pinned to
         // one instant together.
         let declared = self.resolve_declared_columns(tenant_hash, req.now_ns).await;
+        let cache_mark = self.fetcher.cache_ram_metrics().map(CacheCounterMark::take);
 
         // At most two passes: the original and the one retry the
         // consistency model allows. Each pass gets its own QueryAccounting
@@ -2236,6 +2246,24 @@ impl SqlExecutor {
                 .iter()
                 .map(|(signal, snapshot)| (*signal, snapshot))
                 .collect();
+            let predicate_free = self
+                .lane_predicate_free(
+                    tenant_hash,
+                    capabilities,
+                    statement,
+                    &lane_refs,
+                    req.window,
+                    req.now_ns,
+                    &declared,
+                )
+                .await;
+            phase_accounting.set_access_intent(classify_access_intent(
+                &lane_refs,
+                parquet.is_some(),
+                req.window,
+                req.now_ns,
+                predicate_free,
+            ));
             let io_shape =
                 self.sql_io_shape(&lane_refs, &phase_accounting, unfolded_segments_resolved);
 
@@ -2283,6 +2311,9 @@ impl SqlExecutor {
                         ..caps.wall
                     };
                     stats.histogram_series_skipped = blocks.histogram_series_skipped;
+                    stats.cache = cache_mark
+                        .as_ref()
+                        .map(|mark| mark.since(phase_accounting.access_intent()));
                     let phase_snapshot = phase_accounting.snapshot();
                     return Ok(SqlOutcome {
                         output,
@@ -3936,6 +3967,66 @@ impl SqlExecutor {
         samples
             .all(|key| key.as_ref() == Some(&first))
             .then_some(first)
+    }
+
+    /// Whether a statement whose one lane is `samples` or `logs` reads every
+    /// row of it ([`plan_is_predicate_free`]), for [`classify_access_intent`].
+    /// Plans only when the lane's snapshot and window conjuncts
+    /// ([`reads_whole_lane`]) already pass, so a dashboard statement pays no
+    /// extra planning; every other statement, and one that fails to plan,
+    /// reads as not predicate-free.
+    #[allow(clippy::too_many_arguments)]
+    async fn lane_predicate_free(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        statement: Statement<'_>,
+        lanes: &[(TargetSignal, &Snapshot)],
+        window: TimeRange,
+        now_ns: i64,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let [(signal, snapshot)] = lanes else {
+            return false;
+        };
+        let Some(sql) = statement.sql() else {
+            return false;
+        };
+        if !reads_whole_lane(*signal, snapshot, window, now_ns) {
+            return false;
+        }
+        self.plans_predicate_free(tenant_hash, capabilities, *signal, sql, declared)
+            .await
+    }
+
+    /// Whether `sql`, planned over an empty `signal` table carrying the
+    /// tenant's `declared` columns, is predicate-free. Plans through the same
+    /// throwaway session [`Self::pushed_down_name_filter`] uses (no I/O); a
+    /// statement that fails to plan is not predicate-free.
+    async fn plans_predicate_free(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        signal: TargetSignal,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let tables = vec![self.empty_snapshot_table(signal, tenant_hash, declared)];
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let Ok(ctx) = build_session_with_tables(
+            &self.config,
+            pool,
+            tables,
+            false,
+            crate::session::SpillDecision::Disabled,
+            &self.session_principal(tenant_hash, capabilities),
+        ) else {
+            return false;
+        };
+        match ctx.state().create_logical_plan(sql).await {
+            Ok(plan) => plan_is_predicate_free(&plan),
+            Err(_) => false,
+        }
     }
 
     /// ADR-0094 decision 1: whether every aggregate expression and GROUP BY key
@@ -8441,6 +8532,101 @@ pub(crate) mod tests {
         assert!(
             third.scratch.is_some(),
             "the released ceiling is granted again"
+        );
+    }
+
+    /// The classifier's plan test over SQL text, through the same planning
+    /// call `lane_predicate_free` makes: a statement reads every row only
+    /// with no WHERE, HAVING, predicate in a CTE or subquery, JOIN or LIMIT.
+    ///
+    /// FLIP: removing `LogicalPlan::Join(_) | LogicalPlan::Limit(_)` from
+    /// `plan_is_predicate_free`'s match fails the logs JOIN row; removing only
+    /// `LogicalPlan::Limit(_)` fails the logs `LIMIT 10` row.
+    #[tokio::test]
+    async fn a_statement_is_predicate_free_only_without_a_predicate_join_or_limit() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+        let declared = [DeclaredColumn::new("http_status", DeclaredType::I64)];
+        let cases: [(TargetSignal, &str, &[&str], &[&str]); 2] = [
+            (
+                TargetSignal::Logs,
+                "logs",
+                &[
+                    "SELECT * FROM logs",
+                    "SELECT count(*) FROM logs",
+                    "SELECT severity_text, count(*) AS n FROM logs GROUP BY severity_text",
+                    "SELECT * FROM logs ORDER BY ts DESC",
+                    "SELECT http_status, count(*) AS n FROM logs GROUP BY http_status",
+                ],
+                &[
+                    "SELECT * FROM logs WHERE severity_text = 'ERROR'",
+                    "SELECT severity_text, count(*) AS n FROM logs \
+                     GROUP BY severity_text HAVING count(*) > 1",
+                    "WITH e AS (SELECT * FROM logs WHERE severity_text = 'ERROR') \
+                     SELECT count(*) FROM e",
+                    "SELECT count(*) FROM \
+                     (SELECT * FROM logs WHERE severity_text = 'ERROR') AS s",
+                    "SELECT count(*) FROM logs a JOIN logs b ON a.ts = b.ts",
+                    "SELECT * FROM logs LIMIT 10",
+                    "SELECT * FROM logs ORDER BY ts DESC LIMIT 50",
+                ],
+            ),
+            (
+                TargetSignal::Metrics,
+                "samples",
+                &[
+                    "SELECT * FROM samples",
+                    "SELECT count(*) FROM samples",
+                    "SELECT label(labels, '__name__') AS m, count(*) AS n FROM samples GROUP BY m",
+                    "SELECT * FROM samples ORDER BY ts DESC",
+                ],
+                &[
+                    "SELECT * FROM samples WHERE value > 1",
+                    "SELECT label(labels, '__name__') AS m, count(*) AS n FROM samples \
+                     GROUP BY m HAVING count(*) > 1",
+                    "WITH e AS (SELECT * FROM samples WHERE value > 1) SELECT count(*) FROM e",
+                    "SELECT count(*) FROM (SELECT * FROM samples WHERE value > 1) AS s",
+                    "SELECT count(*) FROM samples a JOIN samples b ON a.ts = b.ts",
+                    "SELECT * FROM samples LIMIT 10",
+                    "SELECT * FROM samples ORDER BY ts DESC LIMIT 50",
+                ],
+            ),
+        ];
+        for (signal, table, free, narrowed) in cases {
+            for sql in free {
+                assert!(
+                    exec.plans_predicate_free(
+                        t,
+                        SqlCapabilities::default(),
+                        signal,
+                        sql,
+                        &declared
+                    )
+                    .await,
+                    "{table}: {sql} is predicate-free"
+                );
+            }
+            for sql in narrowed {
+                assert!(
+                    !exec
+                        .plans_predicate_free(t, SqlCapabilities::default(), signal, sql, &declared)
+                        .await,
+                    "{table}: {sql} is not predicate-free"
+                );
+            }
+        }
+        // Without the declared column in scope the statement naming it fails
+        // to plan and reads as not predicate-free.
+        assert!(
+            !exec
+                .plans_predicate_free(
+                    t,
+                    SqlCapabilities::default(),
+                    TargetSignal::Logs,
+                    "SELECT http_status, count(*) AS n FROM logs GROUP BY http_status",
+                    &[]
+                )
+                .await
         );
     }
 

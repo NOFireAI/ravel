@@ -14,7 +14,7 @@
 //! holds only the pool peak.
 
 use ravel_query::{PhaseAccounting, PhaseAccountingSnapshot};
-use ravel_types::accounting::QueryAccountingSnapshot;
+use ravel_types::accounting::{AccessIntent, QueryAccountingSnapshot};
 
 use crate::executor::{SIGNAL_LANE_ORDER, TargetSignal};
 
@@ -120,6 +120,29 @@ impl StatementAccounting {
             StatementAccounting::One(handle) => handle.resolve().snapshot(),
         }
     }
+
+    /// Tags every handle's reads with `intent`, so each cache funnel the
+    /// statement reaches through any lane, Parquet or the statement handle
+    /// reads and admits under it.
+    pub(crate) fn set_access_intent(&self, intent: AccessIntent) {
+        match self {
+            StatementAccounting::Split {
+                lanes,
+                parquet,
+                statement,
+            } => lanes
+                .iter()
+                .chain([parquet, statement])
+                .for_each(|handle| handle.set_access_intent(intent)),
+            StatementAccounting::One(handle) => handle.set_access_intent(intent),
+        }
+    }
+
+    /// The intent [`Self::set_access_intent`] last set: the metrics lane's,
+    /// which every handle carries alike.
+    pub(crate) fn access_intent(&self) -> AccessIntent {
+        self.lane(TargetSignal::Metrics).access_intent()
+    }
 }
 
 /// Field-wise saturating sum of two per-phase snapshots, phase by phase.
@@ -220,5 +243,28 @@ mod tests {
         charge(view.parquet().resolve(), AccountedOp::Get, 3);
         assert_eq!(view.pooled_snapshot(), shared.snapshot());
         assert_eq!(view.resolve_snapshot(), shared.snapshot());
+    }
+
+    #[test]
+    fn an_access_intent_reaches_every_handle_of_every_lane() {
+        let view = StatementAccounting::new();
+        assert_eq!(view.access_intent(), AccessIntent::Interactive);
+        view.set_access_intent(AccessIntent::BulkScan);
+        let handles = SIGNAL_LANE_ORDER
+            .iter()
+            .map(|signal| view.lane(*signal))
+            .chain([view.parquet(), view.statement()]);
+        for handle in handles {
+            for phase in [
+                handle.resolve(),
+                handle.plan(),
+                handle.probe(),
+                handle.scan(),
+                handle.key_index(),
+            ] {
+                assert_eq!(phase.access_intent(), AccessIntent::BulkScan);
+            }
+        }
+        assert_eq!(view.access_intent(), AccessIntent::BulkScan);
     }
 }

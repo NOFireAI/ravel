@@ -1411,7 +1411,7 @@ impl SpanSegmentFetcher {
         // single call avoids the peek-then-`get_or_fetch` double-count on the
         // tiered tier (see `ReadCache::get_or_fetch`).
         let (bytes, outcome) = cache
-            .get_or_fetch(cache_key, || async move {
+            .get_or_fetch(cache_key, accounting.access_intent(), || async move {
                 let _permit = self.get_limiter.acquire().await.map_err(|_| {
                     StoreError::Transient("GetLimiter semaphore closed unexpectedly".to_string())
                 })?;
@@ -3856,6 +3856,87 @@ mod tests {
         assert_eq!(warm.cache_misses, 0);
         let run_len = fx.blocks_a[3].1 - fx.blocks_a[2].0;
         assert_eq!(warm.cache_bytes, 2 * fx.probe + run_len);
+    }
+
+    /// A span read admits its extents under the caller's access intent: a
+    /// bulk lookup puts every extent in the bulk region, an interactive one
+    /// puts none there, and a warm lookup counts its hits under its own
+    /// intent.
+    ///
+    /// FLIP: passing `AccessIntent::Interactive` to `read_extent`'s
+    /// `get_or_fetch` leaves the bulk lookup's bookkeeping at 0 and counts
+    /// its warm hits as interactive.
+    #[tokio::test]
+    async fn a_trace_lookup_admits_and_reads_under_the_callers_access_intent() {
+        use ravel_cache::{Cache, CacheKey, CacheLimits};
+        use ravel_types::accounting::AccessIntent;
+
+        let limits = CacheLimits::new(1 << 20, 100, 1 << 20);
+        let bookkeeping_for = |entries: usize| {
+            let scratch: Cache<crate::fetcher::CacheFetchError> = Cache::new(limits);
+            for i in 0..entries {
+                scratch.insert_with_intent(
+                    CacheKey::new(TENANT.0, [1u8; 32], i as u64, 1),
+                    bytes::Bytes::from_static(b"x"),
+                    ravel_cache::AccessIntent::BulkScan,
+                );
+            }
+            assert_eq!(scratch.len(), entries);
+            scratch.bulk_bookkeeping_bytes()
+        };
+
+        for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
+            let mut fx = trace_fixture().await;
+            let log = Arc::new(GetLog::new(fx.memory.take().expect("memory")));
+            let cache: Arc<Cache<crate::fetcher::CacheFetchError>> = Arc::new(Cache::new(limits));
+            let fetcher = SpanSegmentFetcher::new(log.clone())
+                .with_trace_probe_bytes(fx.probe)
+                .with_cache(Arc::clone(&cache));
+            let query = SpanQuery::trace(trace(3), i64::MIN, i64::MAX);
+            let lookup = || {
+                let acct = QueryAccounting::new();
+                acct.set_access_intent(intent);
+                let fetcher = fetcher.clone();
+                let (a, b) = (fx.a.clone(), fx.b.clone());
+                async move {
+                    for seg in [&a, &b] {
+                        fetcher
+                            .fetch_accounted(seg, TENANT, &query, None, None, &[], &acct)
+                            .await
+                            .expect("fetch")
+                            .expect("relevant");
+                    }
+                    acct.snapshot()
+                }
+            };
+
+            let cold = lookup().await;
+            assert_eq!(cold.cache_misses, 3, "{intent:?}");
+            assert_eq!(cache.len(), 3, "{intent:?}: probe A, run A, probe B");
+            let expected = match intent {
+                AccessIntent::BulkScan => bookkeeping_for(3),
+                _ => 0,
+            };
+            assert_eq!(
+                cache.bulk_bookkeeping_bytes(),
+                expected,
+                "{intent:?}: an extent was admitted on the wrong side of the bulk region"
+            );
+
+            let before = cache.metrics().intent_snapshot();
+            let warm = lookup().await;
+            assert_eq!(warm.cache_hits, 3, "{intent:?}");
+            let after = cache.metrics().intent_snapshot();
+            let hits = (
+                after.bulk_scan.hits - before.bulk_scan.hits,
+                after.interactive.hits - before.interactive.hits,
+            );
+            let expected = match intent {
+                AccessIntent::BulkScan => (3, 0),
+                _ => (0, 3),
+            };
+            assert_eq!(hits, expected, "{intent:?}: {after:?}");
+        }
     }
 
     /// A ranged GET that fails surfaces as a typed store error, and the

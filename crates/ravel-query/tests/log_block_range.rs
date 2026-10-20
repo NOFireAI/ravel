@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use ravel_cache::{Cache, CacheLimits};
+use ravel_cache::{AccessIntent as CacheIntent, Cache, CacheKey, CacheLimits};
 use ravel_catalog::{SegmentLevel, SegmentRef};
 use ravel_logseg::footer::{self, kind};
 use ravel_logseg::skip_index::SkipIndex;
@@ -52,7 +52,7 @@ use ravel_query::{
     AssemblyBufferStats, BlockRangeFetcher, LogFetchError, LogQuery, LogSegmentFetcher,
 };
 use ravel_types::TenantHash;
-use ravel_types::accounting::QueryAccounting;
+use ravel_types::accounting::{AccessIntent, QueryAccounting};
 use uuid::Uuid;
 
 const TENANT: TenantHash = TenantHash([7u8; 16]);
@@ -1012,3 +1012,122 @@ async fn a_trailer_larger_than_the_probe_costs_one_extra_counted_request() {
 }
 
 // ---- One miss, one count: the three-way carried-footer state (#883) --------
+
+// ---- A ranged read admits under the caller's access intent -----------------
+
+/// The bulk-region bookkeeping a cache of `limits` carries when `entries`
+/// entries of one tenant all sit in its bulk region, measured on a scratch
+/// cache rather than restated from the cache's private constants.
+fn bookkeeping_for(limits: CacheLimits, entries: usize) -> u64 {
+    let scratch: Cache<ravel_query::CacheFetchError> = Cache::new(limits);
+    for i in 0..entries {
+        scratch.insert_with_intent(
+            CacheKey::new(TENANT.0, CONTENT_HASH, i as u64, 1),
+            vec![0u8; 1].into(),
+            CacheIntent::BulkScan,
+        );
+    }
+    assert_eq!(
+        scratch.len(),
+        entries,
+        "the scratch region declined an entry"
+    );
+    scratch.bulk_bookkeeping_bytes()
+}
+
+/// A fresh cache, its limits, and the ranged fetcher over [`subset_object`]
+/// with the probe sized to the tail, so the read places its directories and
+/// chunks through the cache one range at a time.
+async fn ranged_fetcher() -> (
+    BlockRangeFetcher,
+    Arc<Cache<ravel_query::CacheFetchError>>,
+    CacheLimits,
+    SegmentRef,
+) {
+    let (records, bytes) = subset_object();
+    let (_, _, tail_len) = layout(&bytes);
+    let mem = Arc::new(MemoryStore::new());
+    mem.put(
+        "logs/intent.rlog",
+        bytes.clone().into(),
+        PutOptions::default(),
+    )
+    .await
+    .expect("put");
+    let seg = seg_ref("logs/intent.rlog", bytes.len() as u64, &records);
+    let limits = CacheLimits::new(16 << 20, 1024, 16 << 20);
+    let cache = Arc::new(Cache::new(limits));
+    let br = BlockRangeFetcher::new(mem as Arc<dyn ObjectStoreBackend>)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len)
+        .with_coverage_threshold(2.0)
+        .with_cache(Arc::clone(&cache));
+    (br, cache, limits, seg)
+}
+
+fn accounting(intent: AccessIntent) -> QueryAccounting {
+    let accounting = QueryAccounting::new();
+    accounting.set_access_intent(intent);
+    accounting
+}
+
+/// Every entry a ranged read admits lands where its caller's intent puts it:
+/// in the bulk region for a BulkScan read, outside it for an Interactive one.
+///
+/// FLIP: passing `AccessIntent::Interactive` to the `get_or_fetch` in
+/// `cached_extent_outcome` (`crates/ravel-query/src/log_fetcher.rs`) admits the
+/// bulk read's extents outside the region, and the bookkeeping assertion
+/// fails.
+#[tokio::test]
+async fn a_ranged_read_admits_under_the_callers_access_intent() {
+    let (br, cache, limits, seg) = ranged_fetcher().await;
+    br.fetch_object(&seg, TENANT, 6, 13, &accounting(AccessIntent::BulkScan))
+        .await
+        .expect("bulk fetch");
+    let admitted = cache.len();
+    assert!(admitted > 0, "the bulk read admitted nothing");
+    assert_eq!(
+        cache.bulk_bookkeeping_bytes(),
+        bookkeeping_for(limits, admitted),
+        "an entry of the bulk read was admitted outside the bulk region"
+    );
+
+    let (br, cache, _, seg) = ranged_fetcher().await;
+    br.fetch_object(&seg, TENANT, 6, 13, &accounting(AccessIntent::Interactive))
+        .await
+        .expect("interactive fetch");
+    assert_eq!(cache.len(), admitted, "both reads admit the same entries");
+    assert_eq!(
+        cache.bulk_bookkeeping_bytes(),
+        0,
+        "an interactive read admitted to the bulk region"
+    );
+}
+
+/// A warm ranged read counts its hits under the caller's intent.
+///
+/// FLIP: the same `cached_extent_outcome` mutation moves the warm bulk read's
+/// hits to the interactive counter.
+#[tokio::test]
+async fn a_warm_ranged_read_counts_its_hits_under_the_callers_access_intent() {
+    for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
+        let (br, cache, _, seg) = ranged_fetcher().await;
+        let metrics = cache.metrics();
+        br.fetch_object(&seg, TENANT, 6, 13, &accounting(intent))
+            .await
+            .expect("cold fetch");
+        let before = metrics.intent_snapshot();
+        br.fetch_object(&seg, TENANT, 6, 13, &accounting(intent))
+            .await
+            .expect("warm fetch");
+        let after = metrics.intent_snapshot();
+        let bulk = after.bulk_scan.hits - before.bulk_scan.hits;
+        let interactive = after.interactive.hits - before.interactive.hits;
+        let (own, other) = match intent {
+            AccessIntent::BulkScan => (bulk, interactive),
+            _ => (interactive, bulk),
+        };
+        assert!(own > 0, "{intent:?}: no warm hit counted: {after:?}");
+        assert_eq!(other, 0, "{intent:?}: a hit counted under another intent");
+    }
+}

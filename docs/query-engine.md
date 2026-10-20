@@ -3318,6 +3318,25 @@ Neither object reaches the Arrow-IPC encoding or Flight SQL, for the reasons
 given above. The MCP `sql_execute` tool's envelope renders neither, and it
 does not render `stats.phases` or `stats.io` either.
 
+`stats.cache` is present only when the server runs a fetcher cache, and
+only on `/api/v1/sql`'s JSON response; the ES|QL route's `stats` does not
+carry it. It is rendered by `stats_json::cache_json` and has exactly six
+keys:
+
+- `intent`: the access intent the statement read under, `interactive`,
+  `bulkScan` or `maintenance` (see "Which statements read as bulk" in
+  [the caching guide](guides/caching.md#which-statements-read-as-bulk)).
+- `interactive`, `bulkScan`, `maintenance`: one object per intent, each with
+  exactly two keys, `hits` (RAM-tier hits under that intent) and
+  `servedBytes` (bytes those hits served).
+- `misses`: RAM-tier misses under any intent.
+- `admittedBytes`: bytes admitted to the RAM tier under any intent.
+
+Every figure is the movement of the process-wide RAM-tier counters between
+the statement's start and its end, so statements that run at the same time
+move each other's figures. `misses` and `admittedBytes` are not split by
+intent because the cache does not count them per intent.
+
 ### I/O dependency shape
 
 `stats.phases` above answers "how many requests and bytes did each phase

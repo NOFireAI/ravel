@@ -42,6 +42,7 @@
 //! (`ravel-mcp`'s cursor and evidence-reference tokens) does not have to link
 //! Flight to reuse it.
 
+mod access_intent;
 mod alerts_provider;
 mod alerts_pushdown;
 mod alerts_scan;
@@ -116,6 +117,7 @@ mod udf;
 mod validate;
 mod value_typed_results;
 
+pub use access_intent::{IntentCacheCounts, StatementCacheStats};
 pub use alerts_provider::AlertsTableProvider;
 pub use alerts_pushdown::{AlertsPushdown, extract_alerts};
 pub use alerts_schema::{

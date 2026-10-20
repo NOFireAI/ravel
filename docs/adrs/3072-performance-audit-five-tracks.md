@@ -368,7 +368,8 @@ workers keep `Interactive` until the fetch proto and Flight ticket carry the
 field, which is a frozen-contract change under the format-change procedure
 and is filed as its own ticket, not folded in here. Intent is admission
 policy only: it never skips a fresh read and never changes what a hit
-returns.
+returns. The executor's `BulkScan` trigger above is narrowed by the bulk
+trigger amendment (issue #3084) at the end of this ADR.
 
 3b. Policy. `Interactive` reads are admitted and promoted exactly as today.
 `BulkScan` reads do not raise `freq` on a hit and are admitted into a
@@ -584,3 +585,30 @@ saying a barrier-dominated statement exists on the reference lane, and
 the measurement above supplies the `planInitMs` and `streamMaxMs` the
 first half is defined on. q20 is also the statement #2762 changes first, so the
 measurement is taken after #2762 and not before.
+
+## Amendment (issue #3084, 2026-10-20): the bulk trigger requires a predicate-free plan over an epoch-to-now window
+
+<!-- amendment-applies: sections="3. The cache admits by access intent; memory refusals name their cause" pointer="bulk trigger amendment" -->
+
+Decision 3a's executor trigger named two arms: a single metrics lane whose
+resolve pruned no segment and whose window covers every segment, or a logs
+statement that would pass the logs scan's whole-segment test. Review of the
+first implementation (#3084) found both arms wider than "reads the whole
+tenant". A metrics statement with a `WHERE` on a column the resolve does
+not prune by, or with a `LIMIT`, read as `BulkScan` while reading a part of
+each segment; a logs statement over a window that started after the
+tenant's first data could read as `BulkScan`, although resolve lists only
+the window's hours and cannot tell such a window from a one-hour dashboard
+query; and a join's `ON` condition, which the optimizer can push into one
+side's scan, was not counted as a predicate.
+
+The trigger is replaced by one conjunction for both lanes. A statement is
+`BulkScan` only when it names exactly one signal table and no Parquet
+table, its plan is predicate-free (no `Filter` node, no filter pushed into
+a `TableScan`, no `Join` and no `Limit`, subqueries and CTEs included), and
+its window runs from the Unix epoch to at least now. A `samples` statement
+also needs the resolve to have pruned no segment and every segment to lie
+inside the window; a `logs` statement also needs no pending erasure and
+every resolved segment inside the window. Every other statement is
+`Interactive`. The rest of decision 3 (the funnels, the policy in 3b, the
+other intents) stands as written.

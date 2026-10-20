@@ -2032,12 +2032,13 @@ first tick starts a fresh rotation.
 
 ### Read cache (`ravel_cache_*`)
 
-Labels: `mode`, `cache`, and `tier`. The whole family is absent under
-`--disable-cache`.
+Labels: `mode`, `cache`, and `tier`, plus `intent` on the two per-intent
+counters. The whole family is absent under `--disable-cache`.
 
 | Label | Values |
 |---|---|
 | `cache` | `fetch` (the query fetchers' RAM cache) or `catalog` (the catalog's content-addressed byte cache). Both caches share one family. |
+| `intent` | On `ravel_cache_intent_hits_total` and `ravel_cache_intent_bytes_served_total` only: `interactive`, `bulk_scan` or `maintenance`, the access intent of the read. |
 | `tier` | Present only when a family has a local-disk tier configured with `--cache-dir`. Its RAM sample then carries `tier="ram"` and its disk sample `tier="disk"`. With no disk tier, a family renders one sample with no `tier` label. |
 
 | Metric | Meaning |
@@ -2052,6 +2053,8 @@ Labels: `mode`, `cache`, and `tier`. The whole family is absent under
 | `ravel_cache_resident_entries` | Gauge. Entries currently held in this cache tier, live rather than cumulative. Rendered for both `cache="fetch"` and `cache="catalog"`. |
 | `ravel_cache_resident_bytes` | Gauge. Payload bytes currently held in this cache tier, live rather than cumulative. Rendered for both `cache="fetch"` and `cache="catalog"`. |
 | `ravel_cache_max_bytes` | Gauge. The resolved startup byte ceiling for this cache, for comparing held-vs-budgeted. Rendered for both `cache="fetch"` and `cache="catalog"`, with no `tier` label even when a disk tier exists. |
+| `ravel_cache_intent_hits_total` | Fetcher-cache RAM-tier hits, by the access intent of the read. Carries `mode`, `cache="fetch"` and an `intent` label of `interactive`, `bulk_scan` or `maintenance`, and never a `tier` label. |
+| `ravel_cache_intent_bytes_served_total` | Bytes served by those hits, with the same labels as `ravel_cache_intent_hits_total`. |
 
 The renderer leaves the ratios for PromQL to compute, per `cache` and per
 `tier`:
