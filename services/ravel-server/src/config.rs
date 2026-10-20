@@ -2455,21 +2455,25 @@ pub struct Cli {
     #[arg(long, value_name = "BYTES")]
     pub catalog_cache_max_bytes: Option<u64>,
 
-    /// Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that reads classified as bulk scans may hold, strictly between 0 and 1; default 0.5.
+    /// Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that bulk-scan reads hold against interactive admissions, strictly between 0 and 1; default 0.5.
     ///
-    /// A SQL statement that reads a whole tenant (one metrics table over every
-    /// segment the tenant has, or a logs statement whose scan takes every
-    /// segment whole) is a bulk scan (ADR-3072 decision 3a); every other read
-    /// is interactive. Bulk reads are admitted into a bulk region of this share
-    /// of `max_bytes` and evict only each other there, so a scan larger than the
-    /// cache cannot flush the interactive working set. Bulk entries up to this
-    /// share are evicted after interactive ones when an interactive admission
-    /// needs room, so while they are resident the interactive working set has
-    /// the rest of `max_bytes`; the region uses more only while the
-    /// interactive queues leave bytes unused. RAM tier only; the disk tier
-    /// admits no bulk read. Read at startup only.
-    /// Ignored when the fetcher cache is off. `0`, `1`, values outside that
-    /// range and `NaN` are refused at startup.
+    /// A `POST /api/v1/sql` statement is a bulk scan (ADR-3072 decision 3a)
+    /// when it names one signal table and no Parquet table, and either that
+    /// table is `samples`, its window reaches from the Unix epoch to now, its
+    /// resolve pruned no segment and every segment lies inside the window,
+    /// or it is `logs`, it carries no row predicate, no erasure is pending
+    /// and every resolved segment lies inside the window. Every other read is
+    /// interactive. Bulk reads are admitted into a bulk region; a bulk
+    /// admission evicts other bulk entries and, while the region is below
+    /// this share, probation entries, never the main queue. Region
+    /// bytes up to this share are evicted only after the probation and main
+    /// queues are empty, so while they are resident the interactive working
+    /// set has the rest of `max_bytes`, and they stay resident after bulk
+    /// reads stop until later bulk traffic or the max-age sweep removes them;
+    /// the region uses more than the share only while the interactive queues
+    /// leave bytes unused. RAM tier only: the disk tier admits every read
+    /// under its own policy whatever its intent. Read at startup only. Ignored when the fetcher cache is off. `0`, `1`,
+    /// values outside that range and `NaN` are refused at startup.
     #[arg(
         long,
         value_name = "FRACTION",
