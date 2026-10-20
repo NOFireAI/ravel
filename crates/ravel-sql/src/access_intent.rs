@@ -3,6 +3,13 @@
 //! before the first segment read, and tags every accounting handle with the
 //! result, so every cache funnel the statement reaches reads and admits under
 //! it.
+//!
+//! A statement is BulkScan only when it names one signal table and no Parquet
+//! table, its plan is predicate-free with no `Join` or `Limit`, and its window
+//! runs from the epoch to now; for `samples` also no segment is pruned and
+//! every segment lies inside the window, and for `logs` also there is no
+//! pending erasure and every resolved segment lies inside the window. Every
+//! other statement is Interactive ([`classify_access_intent`]).
 
 use std::sync::Arc;
 

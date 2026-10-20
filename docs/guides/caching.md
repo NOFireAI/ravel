@@ -204,7 +204,9 @@ Each read of a RAM tier carries an access intent. The intent decides where
 the read's bytes are admitted and never what the read returns:
 
 - `interactive`: the S3-FIFO policy above.
-- `bulk_scan`, for a statement that reads every object of a tenant: a hit
+- `bulk_scan`, for a predicate-free SQL statement over one signal table
+  whose window runs from the epoch to now (the full rule is under
+  [which statements read as bulk](#which-statements-read-as-bulk)): a hit
   does not count toward promotion, and a bulk read never moves bytes into
   the main queue. The bytes go to a bulk region, which holds up to its share
   of the cap (`--cache-bulk-share`, half by default) against interactive
@@ -261,18 +263,21 @@ found it.
 
 Only the SQL executor sets `bulk_scan`, once per statement attempt, after it
 resolves which segments to read and before it reads any of them. A statement
-reads as `bulk_scan` when it names exactly one signal table, names no Parquet
-table, and one of these holds:
+reads as `bulk_scan` only when all of these hold:
 
-- `samples`: the window reaches from the Unix epoch to at least now, the
-  resolve pruned no segment, and every segment resolved lies inside the
-  window. A window that starts after the tenant's first data reads as
-  `interactive` even when it holds most of the tenant, and so does a query
-  whose metric name or label prunes any segment.
-- `logs`: the statement carries no `WHERE` or `HAVING` clause anywhere,
-  subqueries included, no erasure is pending on the resolved segments, and
-  every resolved segment lies inside the window. This is the same test
-  that has the logs scan read every block of every segment.
+- it names exactly one signal table, `samples` or `logs`, and no Parquet
+  table;
+- its plan is predicate-free: no `WHERE` or `HAVING` clause anywhere,
+  subqueries and CTEs included, no join and no `LIMIT`;
+- its window reaches from the Unix epoch to at least now;
+- for `samples`, the resolve pruned no segment and every segment lies
+  inside the window;
+- for `logs`, no erasure is pending and every resolved segment lies inside
+  the window.
+
+A window that starts after the tenant's first data reads as `interactive`
+even when it holds most of the tenant, and so does a query whose metric
+name or label prunes any segment.
 
 Everything else reads as `interactive`:
 
@@ -461,8 +466,10 @@ They carry `mode`, `cache="fetch"` and an `intent` label of `interactive`,
 - `ravel_cache_intent_bytes_served_total`: bytes those hits served.
 
 They are separate families so that the label set of every counter above
-stays as it was. Summed over `intent` they equal the `cache="fetch"` RAM
-samples of `ravel_cache_hits_total` and `ravel_cache_bytes_served_total`.
+stays as it was. At rest, summed over `intent`, they equal the
+`cache="fetch"` RAM samples of `ravel_cache_hits_total` and
+`ravel_cache_bytes_served_total`; a scrape taken while reads are in flight
+can read the two families out of step.
 Misses and admitted bytes have no per-intent family, because the cache does
 not count them per intent.
 
@@ -674,6 +681,4 @@ bound on cached bytes comes from the erasure guarantee in
 read shape is
 [ADR-0107](../adrs/0107-pruning-proportional-logs-fetch.md), and the fetch
 policy above it is
-[ADR-0996](../adrs/0996-request-cost-aware-fetching.md). Admission by access
-intent, the bulk share and the SQL executor's bulk classification are
-ADR-3072 decision 3.
+[ADR-0996](../adrs/0996-request-cost-aware-fetching.md).
