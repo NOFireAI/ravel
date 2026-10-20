@@ -670,7 +670,9 @@ pub struct ProbesSpec {
     /// older image rejects the unknown flag and restart-loops the pod. The
     /// API server stores the default on the write that creates or updates
     /// the object, so a cluster already stored with `false` keeps it. Set
-    /// this to `false` to probe the main HTTP port on 4318 instead.
+    /// this to `false` to probe the main HTTP port on 4318 instead. A
+    /// cluster resolving to `false` gets a `HealthProbeOnMainHttpPort`
+    /// condition on its status.
     #[serde(default = "default_dedicated_health_port")]
     pub dedicated_health_port: bool,
 }
@@ -1053,7 +1055,10 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub qualify_retry_hash: Option<String>,
 
-    /// Standard Kubernetes conditions: `Available`, `Progressing`, `Degraded`.
+    /// Status conditions the operator actually sets: `Available`, `Degraded`,
+    /// `StoreQualified`, `KubernetesVersionUnsupported`,
+    /// `IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`. The
+    /// operator emits no `Progressing` condition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
 }
