@@ -41,6 +41,21 @@ pub const PER_BATCH_TARGET_BYTES: usize = 1;
 /// thousands of them. `--pipeline-depth` is not capped.
 pub const MAX_DERIVED_PIPELINE_DEPTH: usize = 1_024;
 
+/// A derived depth runs a quarter past the rows bound: `rows +
+/// ceil(rows / DEPTH_MARGIN_DIVISOR)`. A window of exactly the rows bound
+/// holds `shards x DEFAULT_OBJECT_ROWS` rows, so any shard that drew less
+/// than its share is still short of the target when the depth flush closes
+/// it, which on a multi-shard load is about half of them. With the margin the
+/// size trigger closes them and the depth flush is the backstop for rows
+/// narrower than the first batch's.
+pub const DEPTH_MARGIN_DIVISOR: usize = 4;
+
+/// The depth the rows bound derives: `rows_depth` plus the
+/// [`DEPTH_MARGIN_DIVISOR`] margin.
+pub fn rows_bound_depth(rows_depth: usize) -> usize {
+    rows_depth.saturating_add(rows_depth.div_ceil(DEPTH_MARGIN_DIVISOR))
+}
+
 /// Called once a load's geometry is resolved, before its first write is
 /// submitted, so a caller can report it while the load runs.
 pub type GeometryHook = Arc<dyn Fn(&LoadGeometry) + Send + Sync>;
@@ -116,11 +131,12 @@ pub enum DepthBound {
     /// `--pipeline-depth` as given.
     #[default]
     Flag,
-    /// `ceil(DEFAULT_OBJECT_ROWS * shards / batch_rows)`: enough batches in
-    /// flight for every shard to fill one target.
+    /// `ceil(DEFAULT_OBJECT_ROWS * shards / batch_rows)`, enough batches in
+    /// flight for every shard to fill one target, plus the
+    /// [`DEPTH_MARGIN_DIVISOR`] margin ([`rows_bound_depth`]).
     Rows,
     /// The memory budget divided by one batch's estimated bytes, which was
-    /// below the rows bound.
+    /// below the rows bound's depth.
     Memory,
     /// [`MAX_DERIVED_PIPELINE_DEPTH`], which was below both bounds.
     Cap,
@@ -136,7 +152,8 @@ pub struct LoadGeometry {
     pub est_bytes_per_row: u64,
     pub pipeline_depth: usize,
     pub depth_bound: DepthBound,
-    /// `ceil(DEFAULT_OBJECT_ROWS * shards / batch_rows)`, at least 1.
+    /// `ceil(DEFAULT_OBJECT_ROWS * shards / batch_rows)`, at least 1, before
+    /// the margin [`rows_bound_depth`] adds.
     pub rows_depth: usize,
     /// `budget / (batch_rows * est_bytes_per_row)`, at least 1. `None` when
     /// the load had no memory budget.
@@ -192,12 +209,13 @@ pub fn resolve_geometry(
             .unwrap_or(usize::MAX)
             .max(1)
     });
+    let rows_bound = rows_bound_depth(rows_depth);
     let (pipeline_depth, depth_bound) = match (pipeline_depth, memory_depth) {
         (Some(d), _) => (d, DepthBound::Flag),
-        (None, Some(m)) if m < rows_depth && m <= MAX_DERIVED_PIPELINE_DEPTH => {
+        (None, Some(m)) if m < rows_bound && m <= MAX_DERIVED_PIPELINE_DEPTH => {
             (m, DepthBound::Memory)
         }
-        (None, _) if rows_depth <= MAX_DERIVED_PIPELINE_DEPTH => (rows_depth, DepthBound::Rows),
+        (None, _) if rows_bound <= MAX_DERIVED_PIPELINE_DEPTH => (rows_bound, DepthBound::Rows),
         (None, _) => (MAX_DERIVED_PIPELINE_DEPTH, DepthBound::Cap),
     };
     LoadGeometry {
@@ -573,20 +591,23 @@ fn depth_bound_text(g: &LoadGeometry) -> String {
     let memory_depth = g
         .memory_depth
         .map_or_else(|| "no budget".to_string(), |d| d.to_string());
+    let rows_bound = format!(
+        "rows bound {} + {}% = {}",
+        g.rows_depth,
+        100 / DEPTH_MARGIN_DIVISOR,
+        rows_bound_depth(g.rows_depth)
+    );
     match g.depth_bound {
         DepthBound::Flag => "--pipeline-depth".to_string(),
-        DepthBound::Rows => format!(
-            "rows bound decided it: rows bound {}, memory bound {memory_depth}",
-            g.rows_depth
-        ),
-        DepthBound::Memory => format!(
-            "memory bound decided it: memory bound {memory_depth}, rows bound {}",
-            g.rows_depth
-        ),
+        DepthBound::Rows => {
+            format!("rows bound decided it: {rows_bound}, memory bound {memory_depth}")
+        }
+        DepthBound::Memory => {
+            format!("memory bound decided it: memory bound {memory_depth}, {rows_bound}")
+        }
         DepthBound::Cap => format!(
-            "cap decided it: cap {MAX_DERIVED_PIPELINE_DEPTH}, rows bound {}, memory bound \
-             {memory_depth}",
-            g.rows_depth
+            "cap decided it: cap {MAX_DERIVED_PIPELINE_DEPTH}, {rows_bound}, memory bound \
+             {memory_depth}"
         ),
     }
 }
@@ -700,30 +721,66 @@ mod tests {
         assert_eq!(g.target_source, TargetSource::Derived);
         assert_eq!(g.est_bytes_per_row, 123);
         assert_eq!(g.rows_depth, 25);
-        assert_eq!(g.pipeline_depth, 25);
+        // 25 + ceil(25 / 4).
+        assert_eq!(g.pipeline_depth, 32);
         assert_eq!(g.depth_bound, DepthBound::Rows);
         assert_eq!(g.memory_depth, None);
+    }
+
+    /// The 200 M-span lane's inputs: the default batch on 4 shards, 87
+    /// estimated bytes per row, and the lane's memory bound of 36,245.
+    #[test]
+    fn the_spans_lane_geometry_runs_a_quarter_past_the_rows_bound() {
+        assert_eq!(DEFAULT_BATCH_ROWS, 10_000);
+        let g = resolve_geometry(
+            None,
+            None,
+            4,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS * 87,
+            Some(36_245 * 870_000),
+        );
+        assert_eq!(g.target_bytes, 21_750_000);
+        assert_eq!(g.est_bytes_per_row, 87);
+        assert_eq!(g.rows_depth, 100);
+        assert_eq!(g.pipeline_depth, 125);
+        assert_eq!(g.depth_bound, DepthBound::Rows);
+        assert_eq!(g.memory_depth, Some(36_245));
+        assert_eq!(
+            render_geometry_line("spans", &g),
+            "load geometry: spans: flush target 21750000 bytes (derived: 250000 rows x 87 \
+             estimated bytes per row), pipeline depth 125 (rows bound decided it: rows bound \
+             100 + 25% = 125, memory bound 36245)"
+        );
     }
 
     #[test]
     fn rows_depth_rounds_up_over_every_shard() {
         let g = resolve_geometry(None, None, 4, 30_000, 30_000, 30_000, None);
-        // ceil(250_000 * 4 / 30_000) = ceil(33.33) = 34.
+        // ceil(250_000 * 4 / 30_000) = ceil(33.33) = 34, and 34 + ceil(34 / 4).
         assert_eq!(g.rows_depth, 34);
+        assert_eq!(g.pipeline_depth, 43);
         let g = resolve_geometry(None, None, 1, 1_000_000, 10, 10, None);
         assert_eq!(g.rows_depth, 1);
+        assert_eq!(g.pipeline_depth, 2);
     }
 
     #[test]
-    fn memory_bound_wins_only_below_the_rows_bound() {
+    fn memory_bound_wins_only_below_the_rows_bound_depth() {
         // One batch is 10_000 rows * 100 bytes = 1_000_000 bytes.
         let g = resolve_geometry(None, None, 1, 10_000, 10_000, 1_000_000, Some(5_500_000));
         assert_eq!(g.memory_depth, Some(5));
         assert_eq!(g.pipeline_depth, 5);
         assert_eq!(g.depth_bound, DepthBound::Memory);
         let g = resolve_geometry(None, None, 1, 10_000, 10_000, 1_000_000, Some(1 << 40));
-        assert_eq!(g.pipeline_depth, 25);
+        assert_eq!(g.pipeline_depth, 32);
         assert_eq!(g.depth_bound, DepthBound::Rows);
+        // Between the rows bound and its margin the memory bound still wins.
+        let g = resolve_geometry(None, None, 1, 10_000, 10_000, 1_000_000, Some(30_000_000));
+        assert_eq!(g.rows_depth, 25);
+        assert_eq!(g.pipeline_depth, 30);
+        assert_eq!(g.depth_bound, DepthBound::Memory);
         let g = resolve_geometry(None, None, 1, 10_000, 10_000, 1_000_000, Some(1));
         assert_eq!(g.memory_depth, Some(1));
         assert_eq!(g.pipeline_depth, 1);
@@ -849,8 +906,8 @@ mod tests {
         assert_eq!(g.depth_bound, DepthBound::Cap);
         assert!(
             render_geometry_line("logs", &g).contains(
-                "pipeline depth 1024 (cap decided it: cap 1024, rows bound 1000000, memory \
-                 bound"
+                "pipeline depth 1024 (cap decided it: cap 1024, rows bound 1000000 + 25% = \
+                 1250000, memory bound"
             ),
             "{}",
             render_geometry_line("logs", &g)
