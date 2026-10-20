@@ -787,7 +787,10 @@ The conditions are:
   also carries `KubernetesVersionUnsupported=True`. The condition names the
   floor and the detected version. It appears alongside
   `Available`/`Degraded` and does not replace them.
-- `HealthProbeOnMainRouter`. Present with status `True` only while the
+- `IngestAffinityBackendDeprecated`. Present with status `True` while
+  `spec.gateway.ingestAffinity` is enabled with `backend: ingressNginx`; see
+  [Ingest affinity](ingest-affinity.md).
+- `HealthProbeOnMainHttpPort`. Present with status `True` only while the
   resolved `spec.probes.dedicatedHealthPort` is `false`, most commonly a
   cluster still holding the `false` that the CRDs from v0.19.0 stored on
   every write until the default flipped to `true` (see "The
@@ -959,14 +962,14 @@ value, and reads as `true` once the new CRD is in place. That is rare: the
 operator updates each cluster's status on every reconcile, and those updates
 are writes too.
 
-The operator reports a `HealthProbeOnMainRouter` condition on any
+The operator reports a `HealthProbeOnMainHttpPort` condition on any
 `RavelCluster` whose resolved `dedicatedHealthPort` is `false`, including one
 still holding the `false` an earlier CRD stored, so the exposure is visible
 on the object instead of only in this doc. Check it with:
 
 ```sh
 kubectl get ravelcluster <name> \
-  -o jsonpath='{.status.conditions[?(@.type=="HealthProbeOnMainRouter")]}'
+  -o jsonpath='{.status.conditions[?(@.type=="HealthProbeOnMainHttpPort")]}'
 ```
 
 or look for it in `kubectl describe ravelcluster <name>`. No condition means

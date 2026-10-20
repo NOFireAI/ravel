@@ -2533,11 +2533,11 @@ fn preserve_transition_times(
 /// `ravelNative` affinity produces no condition at all, so the deprecation
 /// notice disappears the moment a cluster migrates.
 ///
-/// `HealthProbeOnMainRouter` (issue #3112) is set while the resolved
+/// `HealthProbeOnMainHttpPort` (issue #3112) is set while the resolved
 /// `spec.probes.dedicatedHealthPort` is `false`: a cluster whose stored spec
 /// predates the ADR-1702 follow-up task 12 default flip (or that explicitly
-/// opted out) still probes the main router instead of the dedicated health
-/// listener. See [`health_probe_on_main_router_condition`].
+/// opted out) still probes the main HTTP port instead of the dedicated
+/// health listener. See [`health_probe_on_main_http_port_condition`].
 ///
 /// The reconcile pass hands the result to whichever status writer runs; there
 /// is deliberately no read-modify-write against live status, which would race
@@ -2562,14 +2562,14 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
         ));
     }
 
-    if let Some(cond) = health_probe_on_main_router_condition(spec, observed_generation) {
+    if let Some(cond) = health_probe_on_main_http_port_condition(spec, observed_generation) {
         conditions.push(cond);
     }
 
     conditions
 }
 
-/// The `HealthProbeOnMainRouter` condition (issue #3112) for a cluster whose
+/// The `HealthProbeOnMainHttpPort` condition (issue #3112) for a cluster whose
 /// resolved `spec.probes.dedicatedHealthPort` is `false`, or `None` when it
 /// resolves `true` (explicitly, or because the field is absent and the
 /// schema default applies -- `ProbesSpec`'s `#[serde(default)]` fills it in
@@ -2584,7 +2584,7 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
 /// [`HTTP_PORT`], which shares its runtime with ingest and query decode
 /// (ADR-1702 decision 8), instead of the dedicated listener on
 /// [`HEALTH_PORT`].
-fn health_probe_on_main_router_condition(
+fn health_probe_on_main_http_port_condition(
     spec: &RavelClusterSpec,
     observed_generation: Option<i64>,
 ) -> Option<Condition> {
@@ -2592,16 +2592,17 @@ fn health_probe_on_main_router_condition(
         return None;
     }
     Some(condition(
-        "HealthProbeOnMainRouter",
+        "HealthProbeOnMainHttpPort",
         true,
         observed_generation,
         "DedicatedHealthPortDisabled",
         &format!(
             "probes resolve to the main HTTP port {HTTP_PORT}, which \
              shares its runtime with ingest and query work, instead of the \
-             dedicated health listener on {HEALTH_PORT}; set \
-             spec.probes.dedicatedHealthPort: true to move probes to the \
-             dedicated listener (see \"The dedicated health port\" in \
+             dedicated health listener on {HEALTH_PORT}. Before setting \
+             spec.probes.dedicatedHealthPort: true, confirm spec.image is a \
+             ravel-server v0.19.0 or newer and that the kubelet can reach \
+             port {HEALTH_PORT} (see \"The dedicated health port\" in \
              docs/guides/kubernetes.md)"
         ),
     ))
@@ -4027,19 +4028,20 @@ mod tests {
         assert_eq!(find(&extra, "KubernetesVersionUnsupported").status, "True");
     }
 
-    /// `dedicatedHealthPort: false` (explicit) sets `HealthProbeOnMainRouter`
+    /// `dedicatedHealthPort: false` (explicit) sets `HealthProbeOnMainHttpPort`
     /// with the reason, and a message naming both ports from
-    /// [`HTTP_PORT`]/[`HEALTH_PORT`] rather than literals typed twice (issue
-    /// #3112).
+    /// [`HTTP_PORT`]/[`HEALTH_PORT`] rather than literals typed twice, plus
+    /// the two preconditions for flipping the field (a v0.19.0+ server image,
+    /// a kubelet that can reach the health port).
     #[test]
-    fn dedicated_health_port_false_sets_health_probe_on_main_router() {
+    fn dedicated_health_port_false_sets_health_probe_on_main_http_port() {
         let mut spec = spec_with_affinity(None);
         spec.probes.dedicated_health_port = false;
 
         let extra = spec_conditions(&spec, Some(7));
 
-        assert_eq!(condition_types(&extra), vec!["HealthProbeOnMainRouter"]);
-        let cond = find(&extra, "HealthProbeOnMainRouter");
+        assert_eq!(condition_types(&extra), vec!["HealthProbeOnMainHttpPort"]);
+        let cond = find(&extra, "HealthProbeOnMainHttpPort");
         assert_eq!(cond.status, "True");
         assert_eq!(cond.reason, "DedicatedHealthPortDisabled");
         assert_eq!(cond.observed_generation, Some(7));
@@ -4049,10 +4051,20 @@ mod tests {
             "message names both ports: {}",
             cond.message
         );
+        assert!(
+            cond.message.contains("v0.19.0"),
+            "message names the minimum server version precondition: {}",
+            cond.message
+        );
+        assert!(
+            cond.message.contains("kubelet can reach"),
+            "message names the kubelet reachability precondition: {}",
+            cond.message
+        );
     }
 
     /// A cluster whose probes resolve to the dedicated port carries no
-    /// `HealthProbeOnMainRouter` condition at all (absent, not status
+    /// `HealthProbeOnMainHttpPort` condition at all (absent, not status
     /// `False`), matching how `KubernetesVersionUnsupported` behaves. Two
     /// cases: `dedicatedHealthPort: true` set explicitly, and the whole
     /// `probes` block left out of the stored object entirely.
@@ -4104,11 +4116,11 @@ mod tests {
     /// -> `build_degraded_status` on the degraded path, exactly like
     /// `KubernetesVersionUnsupported` does above.
     #[test]
-    fn health_probe_on_main_router_reaches_both_status_writers() {
+    fn health_probe_on_main_http_port_reaches_both_status_writers() {
         let mut spec = spec_with_affinity(None);
         spec.probes.dedicated_health_port = false;
         let extra = pass_conditions(&spec, Some(7), None);
-        assert_eq!(condition_types(&extra), vec!["HealthProbeOnMainRouter"]);
+        assert_eq!(condition_types(&extra), vec!["HealthProbeOnMainHttpPort"]);
 
         let ok = build_status(
             Some(7),
@@ -4120,7 +4132,7 @@ mod tests {
             extra.clone(),
         );
         assert_eq!(
-            find(&ok.conditions, "HealthProbeOnMainRouter").status,
+            find(&ok.conditions, "HealthProbeOnMainHttpPort").status,
             "True"
         );
 
@@ -4133,7 +4145,7 @@ mod tests {
             degraded_extra,
         );
         assert_eq!(
-            find(&degraded.conditions, "HealthProbeOnMainRouter").status,
+            find(&degraded.conditions, "HealthProbeOnMainHttpPort").status,
             "True"
         );
     }
