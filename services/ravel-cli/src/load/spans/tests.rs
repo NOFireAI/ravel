@@ -2459,9 +2459,9 @@ mod default_geometry {
     /// objects: every 25th batch reaches the derived target (250,000 times
     /// the first batch's estimate per span) and closes an object on size,
     /// and the end-of-input drain publishes the 10,000-span tail. The
-    /// derived depth is ceil(250,000 / 10,000) = 25; the size flushes at
-    /// batches 25 and 50 each restart the depth window, so the depth flush
-    /// never comes due.
+    /// derived depth is ceil(250,000 / 10,000) = 25 plus a quarter, 32; the
+    /// size flushes at batches 25 and 50 each restart the depth window, so
+    /// the depth flush never comes due.
     ///
     /// The clock is pinned, so the age trigger cannot fire. Per-batch
     /// flushing writes 51 objects; a target the size trigger never reaches
@@ -2505,7 +2505,7 @@ mod default_geometry {
             "the derived target is 250,000 spans of the first batch's estimate: {geometry:?}"
         );
         assert_eq!(geometry.rows_depth, 25);
-        assert_eq!(geometry.pipeline_depth, 25);
+        assert_eq!(geometry.pipeline_depth, 32);
         assert_eq!(geometry.depth_bound, DepthBound::Rows);
         assert_eq!(
             layout.flush_mix.totals,
@@ -2520,6 +2520,118 @@ mod default_geometry {
         );
         assert_eq!(layout.flush_mix.totals.dominant(), Some("size"));
         assert_eq!(layout.target_bytes_no_effect_warning, None);
+    }
+
+    /// The 200 M-span lane's geometry in process: 4 shards, the default
+    /// `--batch-rows`, `--target-bytes` and `--pipeline-depth` unset, on 6.5 M
+    /// spans of 650,000 traces with 10 contiguous spans each and random trace
+    /// ids. Every span estimates the same, so a shard's buffer reaches the
+    /// derived target exactly when it holds `DEFAULT_OBJECT_ROWS` spans, and
+    /// the model below replays the router's trace-id routing batch by batch to
+    /// count the objects the size trigger closes and the tails the
+    /// end-of-input drain publishes. The depth window runs a quarter past the
+    /// rows bound, so no shard is short of the target when it comes due and
+    /// the depth flush closes nothing.
+    ///
+    /// Prove-the-test: derive the depth at the rows bound itself (100) and
+    /// about half the objects close on depth instead, so the size share
+    /// assertion fails.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn spans_default_geometry_closes_the_majority_by_size() {
+        const SHARDS: u32 = 4;
+        const SPANS_PER_TRACE: usize = 10;
+        const GROUPS: usize = 650;
+        fn splitmix64(mut z: u64) -> u64 {
+            z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn trace(t: u64) -> [u8; 16] {
+            let mut id = [0u8; 16];
+            id[..8].copy_from_slice(&splitmix64(2707 ^ (t << 1)).to_be_bytes());
+            id[8..].copy_from_slice(&splitmix64(2707 ^ ((t << 1) | 1)).to_be_bytes());
+            id
+        }
+        let batch_rows = DEFAULT_BATCH_ROWS;
+        let rows = batch_rows * GROUPS;
+        let (_dir, pq) = row_fixture(batch_rows, GROUPS, |g, r| {
+            let i = g * batch_rows + r;
+            (
+                trace((i / SPANS_PER_TRACE) as u64),
+                format!("op-{}", i % SPANS_PER_TRACE),
+            )
+        });
+
+        let mut buffered = [0usize; SHARDS as usize];
+        let mut size_closes = 0u64;
+        for g in 0..GROUPS {
+            let mut slice = [0usize; SHARDS as usize];
+            let first = (g * batch_rows / SPANS_PER_TRACE) as u64;
+            for t in first..first + (batch_rows / SPANS_PER_TRACE) as u64 {
+                slice[ravel_ingest::shard_for_span(&trace(t), SHARDS) as usize] += SPANS_PER_TRACE;
+            }
+            for (held, add) in buffered.iter_mut().zip(slice) {
+                *held += add;
+                if *held >= DEFAULT_OBJECT_ROWS {
+                    size_closes += 1;
+                    *held = 0;
+                }
+            }
+        }
+        let tails = buffered.iter().filter(|&&held| held > 0).count() as u64;
+        let expected_objects = size_closes + tails;
+
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let report = load_sharded(
+            Arc::clone(&store),
+            &pq,
+            GeometryRequest {
+                target_bytes: None,
+                pipeline_depth: None,
+                load_memory: host_derived(),
+            },
+            SHARDS,
+            batch_rows,
+        )
+        .await;
+
+        assert_eq!(report.rows_processed, rows as u64);
+        let layout = report.layout_report();
+        let mix = layout.flush_mix.totals;
+        let objects = report.objects_written() as u64;
+        assert!(
+            mix.size * 5 >= objects * 4,
+            "the size trigger closes at least 80% of objects: {mix:?} of {objects}"
+        );
+        assert_eq!(
+            mix.size + mix.depth + mix.age + mix.arrival + mix.manual,
+            objects,
+            "every object is counted under one trigger"
+        );
+        assert_eq!(
+            mix,
+            FlushMixCounts {
+                size: size_closes,
+                age: 0,
+                arrival: 0,
+                depth: 0,
+                manual: tails,
+            }
+        );
+        assert_eq!(objects, expected_objects);
+        assert_eq!(span_objects(store.as_ref()).await as u64, expected_objects);
+        assert_eq!((size_closes, tails), (24, 4));
+        let ideal = (rows / DEFAULT_OBJECT_ROWS) as u64;
+        assert!(
+            objects * 10 <= ideal * 11,
+            "objects stay within 10% of rows / DEFAULT_OBJECT_ROWS: {objects} against {ideal}"
+        );
+
+        let geometry = layout.geometry.expect("geometry resolved");
+        assert_eq!(geometry.rows_depth, 100);
+        assert_eq!(geometry.pipeline_depth, 125);
+        assert_eq!(geometry.depth_bound, DepthBound::Rows);
     }
 
     /// `--target-bytes 1 --batch-rows 10000` writes one object per batch on
@@ -2586,7 +2698,7 @@ mod default_geometry {
         let summary = render_layout_summary(&report.layout_report());
         assert!(
             summary.contains(
-                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25)"
+                "pipeline depth   : 3 (memory bound decided it: memory bound 3, rows bound 25 + 25% = 32)"
             ),
             "{summary}"
         );
@@ -2640,13 +2752,13 @@ mod default_geometry {
     /// Issue #2753: a first batch of spans with 400-byte names over-estimates
     /// the later batches, whose names are 2 bytes, so the derived target
     /// (250,000 first-batch spans) is never reached: the largest window, the
-    /// first batch plus 24 small ones, estimates below 25 first batches. The
-    /// depth flush closes each window of 25 batches: `51 / 25` depth flushes
-    /// and one end-of-input flush for the 1-batch remainder.
+    /// first batch plus 31 small ones, estimates below 25 first batches. The
+    /// depth flush closes each window of 32 batches: `51 / 32` depth flushes
+    /// and one end-of-input flush for the remainder.
     ///
     /// Prove-the-test: never call `window.submitted` in the spans loader
     /// (the `if window.submitted(observed)` in `load_spans_into`) and nothing
-    /// answers the write the loop waits on at the 25th submit; the pinned
+    /// answers the write the loop waits on at the 32nd submit; the pinned
     /// clock never fires the age trigger, so the load fails on the Strict ack
     /// deadline and `load`'s `expect("load succeeds")` panics.
     #[tokio::test]
@@ -2677,7 +2789,7 @@ mod default_geometry {
         let geometry = layout.geometry.expect("geometry resolved");
         assert_eq!(geometry.target_source, TargetSource::Derived);
         let depth = geometry.pipeline_depth;
-        assert_eq!(depth, 25);
+        assert_eq!(depth, 32);
         let depth_flushes = (BATCHES / depth) as u64;
         let manual = u64::from(!BATCHES.is_multiple_of(depth));
         assert_eq!(
