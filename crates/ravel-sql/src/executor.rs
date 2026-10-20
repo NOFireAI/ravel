@@ -141,7 +141,7 @@ use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange}
 
 use crate::access_intent::{
     CacheCounterMark, StatementCacheStats, classify_access_intent, plan_is_predicate_free,
-    window_contains_every_segment,
+    reads_whole_lane,
 };
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
@@ -2246,15 +2246,23 @@ impl SqlExecutor {
                 .iter()
                 .map(|(signal, snapshot)| (*signal, snapshot))
                 .collect();
-            let logs_predicate_free = self
-                .logs_predicate_free(tenant_hash, capabilities, statement, &lane_refs, req.window)
+            let predicate_free = self
+                .lane_predicate_free(
+                    tenant_hash,
+                    capabilities,
+                    statement,
+                    &lane_refs,
+                    req.window,
+                    req.now_ns,
+                    &declared,
+                )
                 .await;
             phase_accounting.set_access_intent(classify_access_intent(
                 &lane_refs,
                 parquet.is_some(),
                 req.window,
                 req.now_ns,
-                logs_predicate_free,
+                predicate_free,
             ));
             let io_shape =
                 self.sql_io_shape(&lane_refs, &phase_accounting, unfolded_segments_resolved);
@@ -3961,31 +3969,49 @@ impl SqlExecutor {
             .then_some(first)
     }
 
-    /// Whether a statement whose one lane is `logs` carries no row predicate
-    /// ([`plan_is_predicate_free`]), for [`classify_access_intent`]. Plans
-    /// only when the rest of the logs whole-segment test already passes on
-    /// the resolved segments, through the same throwaway session
-    /// [`Self::pushed_down_name_filter`] uses (no I/O); every other statement,
-    /// and one that fails to plan here, reads as not predicate-free.
-    async fn logs_predicate_free(
+    /// Whether a statement whose one lane is `samples` or `logs` reads every
+    /// row of it ([`plan_is_predicate_free`]), for [`classify_access_intent`].
+    /// Plans only when the lane's snapshot and window conjuncts
+    /// ([`reads_whole_lane`]) already pass, so a dashboard statement pays no
+    /// extra planning; every other statement, and one that fails to plan,
+    /// reads as not predicate-free.
+    #[allow(clippy::too_many_arguments)]
+    async fn lane_predicate_free(
         &self,
         tenant_hash: TenantHash,
         capabilities: SqlCapabilities,
         statement: Statement<'_>,
         lanes: &[(TargetSignal, &Snapshot)],
         window: TimeRange,
+        now_ns: i64,
+        declared: &[DeclaredColumn],
     ) -> bool {
-        let [(TargetSignal::Logs, snapshot)] = lanes else {
+        let [(signal, snapshot)] = lanes else {
             return false;
         };
         let Some(sql) = statement.sql() else {
             return false;
         };
-        if !snapshot.pending_erasure.is_empty() || !window_contains_every_segment(snapshot, window)
-        {
+        if !reads_whole_lane(*signal, snapshot, window, now_ns) {
             return false;
         }
-        let tables = vec![self.empty_snapshot_table(TargetSignal::Logs, tenant_hash, &[])];
+        self.plans_predicate_free(tenant_hash, capabilities, *signal, sql, declared)
+            .await
+    }
+
+    /// Whether `sql`, planned over an empty `signal` table carrying the
+    /// tenant's `declared` columns, is predicate-free. Plans through the same
+    /// throwaway session [`Self::pushed_down_name_filter`] uses (no I/O); a
+    /// statement that fails to plan is not predicate-free.
+    async fn plans_predicate_free(
+        &self,
+        tenant_hash: TenantHash,
+        capabilities: SqlCapabilities,
+        signal: TargetSignal,
+        sql: &str,
+        declared: &[DeclaredColumn],
+    ) -> bool {
+        let tables = vec![self.empty_snapshot_table(signal, tenant_hash, declared)];
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
         let Ok(ctx) = build_session_with_tables(
             &self.config,
@@ -8506,6 +8532,108 @@ pub(crate) mod tests {
         assert!(
             third.scratch.is_some(),
             "the released ceiling is granted again"
+        );
+    }
+
+    /// The classifier's plan test over SQL text, through the same planning
+    /// call `lane_predicate_free` makes: a statement reads every row only
+    /// with no WHERE, HAVING, predicate in a CTE or subquery, JOIN or LIMIT.
+    ///
+    /// FLIP: removing `LogicalPlan::Join(_) | LogicalPlan::Limit(_)` from
+    /// `plan_is_predicate_free`'s match turns the JOIN and LIMIT rows
+    /// predicate-free, and replacing its body with `true` turns every row of
+    /// the second list.
+    #[tokio::test]
+    async fn a_statement_is_predicate_free_only_without_a_predicate_join_or_limit() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+        let declared = [DeclaredColumn::new("http_status", DeclaredType::I64)];
+        let cases: [(TargetSignal, &str, &[&str], &[&str]); 2] = [
+            (
+                TargetSignal::Logs,
+                "logs",
+                &[
+                    "SELECT * FROM logs",
+                    "SELECT count(*) FROM logs",
+                    "SELECT severity_text, count(*) AS n FROM logs GROUP BY severity_text",
+                    "SELECT * FROM logs ORDER BY ts DESC",
+                    "SELECT http_status, count(*) AS n FROM logs GROUP BY http_status",
+                ],
+                &[
+                    "SELECT * FROM logs WHERE severity_text = 'ERROR'",
+                    "SELECT severity_text, count(*) AS n FROM logs \
+                     GROUP BY severity_text HAVING count(*) > 1",
+                    "WITH e AS (SELECT * FROM logs WHERE severity_text = 'ERROR') \
+                     SELECT count(*) FROM e",
+                    "SELECT count(*) FROM \
+                     (SELECT * FROM logs WHERE severity_text = 'ERROR') AS s",
+                    "SELECT count(*) FROM logs a JOIN logs b ON a.ts = b.ts",
+                    "SELECT * FROM logs LIMIT 10",
+                    "SELECT * FROM logs ORDER BY ts DESC LIMIT 50",
+                ],
+            ),
+            (
+                TargetSignal::Metrics,
+                "samples",
+                &[
+                    "SELECT * FROM samples",
+                    "SELECT count(*) FROM samples",
+                    "SELECT label(labels, '__name__') AS m, count(*) AS n FROM samples GROUP BY m",
+                    "SELECT * FROM samples ORDER BY ts DESC",
+                ],
+                &[
+                    "SELECT * FROM samples WHERE value > 1",
+                    "SELECT label(labels, '__name__') AS m, count(*) AS n FROM samples \
+                     GROUP BY m HAVING count(*) > 1",
+                    "WITH e AS (SELECT * FROM samples WHERE value > 1) SELECT count(*) FROM e",
+                    "SELECT count(*) FROM (SELECT * FROM samples WHERE value > 1) AS s",
+                    "SELECT count(*) FROM samples a JOIN samples b ON a.ts = b.ts",
+                    "SELECT * FROM samples LIMIT 10",
+                    "SELECT * FROM samples ORDER BY ts DESC LIMIT 50",
+                ],
+            ),
+        ];
+        for (signal, table, free, narrowed) in cases {
+            for sql in free {
+                assert!(
+                    exec.plans_predicate_free(
+                        t,
+                        SqlCapabilities::default(),
+                        signal,
+                        sql,
+                        &declared
+                    )
+                    .await,
+                    "{table}: {sql} is predicate-free"
+                );
+            }
+            for sql in narrowed {
+                assert!(
+                    !exec
+                        .plans_predicate_free(
+                            t,
+                            SqlCapabilities::default(),
+                            signal,
+                            sql,
+                            &declared
+                        )
+                        .await,
+                    "{table}: {sql} is not predicate-free"
+                );
+            }
+        }
+        // Without the declared column in scope the statement naming it fails
+        // to plan and reads as not predicate-free.
+        assert!(
+            !exec
+                .plans_predicate_free(
+                    t,
+                    SqlCapabilities::default(),
+                    TargetSignal::Logs,
+                    "SELECT http_status, count(*) AS n FROM logs GROUP BY http_status",
+                    &[]
+                )
+                .await
         );
     }
 

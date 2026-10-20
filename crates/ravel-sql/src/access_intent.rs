@@ -17,32 +17,30 @@ use crate::executor::TargetSignal;
 
 /// The intent a resolved statement's reads carry.
 ///
-/// [`AccessIntent::BulkScan`] in exactly two cases, both a single signal lane:
+/// [`AccessIntent::BulkScan`] only when all of these hold:
 ///
-/// - A `samples` lane whose resolve pruned no segment
-///   (`segments_pruned == 0`) AND whose window covers every segment of the
-///   tenant's snapshot. Covering is proved, not assumed: the window must reach
-///   from the Unix epoch to at least `now_ns` ([`window_covers_all_history`]),
-///   so no segment can sit wholly outside it unseen by the resolve, and every
-///   resolved segment must lie inside it ([`window_contains_every_segment`]).
-///   A window that starts after the tenant's first data is Interactive even
-///   when it happens to hold most of the tenant: resolve lists only the
-///   window's hours, so it cannot tell such a window from a one-hour
-///   dashboard query.
-/// - A `logs` lane that would pass the logs scan's whole-segment test on the
-///   resolved segment list: no pending erasure, no predicate
-///   (`logs_predicate_free`, see [`plan_is_predicate_free`]), and every
-///   resolved segment inside the window.
+/// - the statement names exactly one signal table, `samples` or `logs`, and
+///   no Parquet table;
+/// - its plan is predicate-free (`predicate_free`, see
+///   [`plan_is_predicate_free`]): no `WHERE`, no `HAVING`, no predicate in a
+///   CTE or subquery, no `Join` and no `Limit`;
+/// - its window reaches from the Unix epoch to at least `now_ns`
+///   ([`window_covers_all_history`]), so no segment can sit wholly outside it
+///   unseen by the resolve;
+/// - for `samples`, the resolve pruned no segment (`segments_pruned == 0`)
+///   and every segment lies inside the window
+///   ([`window_contains_every_segment`]);
+/// - for `logs`, the snapshot has no pending erasure and every resolved
+///   segment lies inside the window.
 ///
 /// [`AccessIntent::Interactive`] otherwise: several signal tables, a Parquet
-/// table, a `spans`, `alerts` or `audit` lane, any segment a postings
-/// predicate pruned, a window that does not cover the tenant, and the
-/// one-series dashboard query whose metric name prunes nothing. A distributed
-/// fragment never reaches this function and stays Interactive.
-///
-/// `segments_pruned == 0` alone is not the rule: a metric name carried by
-/// every segment prunes nothing, and the statement still reads one series
-/// over one window.
+/// table, a `spans`, `alerts` or `audit` lane, any predicate or row limit, a
+/// window that starts after the epoch or ends before `now_ns`, and a segment
+/// pruned or cut by the window. A window that starts after the tenant's
+/// first data is Interactive even when it happens to hold most of the
+/// tenant: resolve lists only the window's hours, so it cannot tell such a
+/// window from a one-hour dashboard query. A distributed fragment never
+/// reaches this function and stays Interactive.
 ///
 /// `names_parquet` is whether the statement names a Parquet table: those
 /// resolve outside `lanes`, so a `samples` join with one would otherwise
@@ -52,12 +50,12 @@ pub(crate) fn classify_access_intent(
     names_parquet: bool,
     window: TimeRange,
     now_ns: i64,
-    logs_predicate_free: bool,
+    predicate_free: bool,
 ) -> AccessIntent {
     if names_parquet {
         return AccessIntent::Interactive;
     }
-    classify_signal_lanes(lanes, window, now_ns, logs_predicate_free)
+    classify_signal_lanes(lanes, window, now_ns, predicate_free)
 }
 
 /// [`classify_access_intent`] for a statement that names no Parquet table.
@@ -65,32 +63,37 @@ fn classify_signal_lanes(
     lanes: &[(TargetSignal, &Snapshot)],
     window: TimeRange,
     now_ns: i64,
-    logs_predicate_free: bool,
+    predicate_free: bool,
 ) -> AccessIntent {
     let [(signal, snapshot)] = lanes else {
         return AccessIntent::Interactive;
     };
-    let bulk = match signal {
-        TargetSignal::Metrics => {
-            snapshot.segments_pruned == 0
-                && window_covers_all_history(window, now_ns)
-                && window_contains_every_segment(snapshot, window)
-        }
-        TargetSignal::Logs => {
-            logs_predicate_free
-                && snapshot.pending_erasure.is_empty()
-                && window_contains_every_segment(snapshot, window)
-        }
+    if reads_whole_lane(*signal, snapshot, window, now_ns) && predicate_free {
+        AccessIntent::BulkScan
+    } else {
+        AccessIntent::Interactive
+    }
+}
+
+/// The snapshot and window conjuncts of [`classify_access_intent`] for one
+/// `signal` lane, without the plan's: whether a predicate-free statement
+/// over `snapshot` reads every segment of the tenant whole.
+pub(crate) fn reads_whole_lane(
+    signal: TargetSignal,
+    snapshot: &Snapshot,
+    window: TimeRange,
+    now_ns: i64,
+) -> bool {
+    let lane = match signal {
+        TargetSignal::Metrics => snapshot.segments_pruned == 0,
+        TargetSignal::Logs => snapshot.pending_erasure.is_empty(),
         TargetSignal::Spans
         | TargetSignal::Alerts
         | TargetSignal::Audit
         | TargetSignal::Parquet => false,
     };
-    if bulk {
-        AccessIntent::BulkScan
-    } else {
-        AccessIntent::Interactive
-    }
+    lane && window_covers_all_history(window, now_ns)
+        && window_contains_every_segment(snapshot, window)
 }
 
 /// Whether the closed `window` reaches from the Unix epoch to at least
@@ -113,20 +116,21 @@ pub(crate) fn window_contains_every_segment(snapshot: &Snapshot, window: TimeRan
     })
 }
 
-/// Whether `plan` carries no row predicate anywhere, subqueries included: no
-/// `Filter` node and no filter pushed into a `TableScan`. A predicate the logs
-/// scan could prune blocks with lives in one of the two, so a plan with
-/// neither reads every block of every segment its window contains.
+/// Whether `plan` reads every row of its scans, subqueries included: no
+/// `Filter` node, no filter pushed into a `TableScan`, no `Join` and no
+/// `Limit`. A join's `ON` condition can be pushed into one side's scan by the
+/// optimizer, and a limit stops a scan early, so a plan with either reads
+/// less than the whole table even with no `WHERE`.
 pub(crate) fn plan_is_predicate_free(plan: &LogicalPlan) -> bool {
     let mut free = true;
     // Never errors: the closure only inspects and returns a recursion verb.
     let _ = plan.apply_with_subqueries(|node| {
-        let filtered = match node {
-            LogicalPlan::Filter(_) => true,
+        let narrowed = match node {
+            LogicalPlan::Filter(_) | LogicalPlan::Join(_) | LogicalPlan::Limit(_) => true,
             LogicalPlan::TableScan(scan) => !scan.filters.is_empty(),
             _ => false,
         };
-        if filtered {
+        if narrowed {
             free = false;
             return Ok(TreeNodeRecursion::Stop);
         }
@@ -257,16 +261,18 @@ mod tests {
     }
 
     #[test]
-    fn an_unpruned_metrics_lane_over_all_history_is_bulk() {
+    fn an_unpruned_predicate_free_metrics_lane_over_all_history_is_bulk() {
         let snap = two_hours();
+        let metrics = [(TargetSignal::Metrics, &snap)];
         assert_eq!(
-            classify_signal_lanes(
-                &[(TargetSignal::Metrics, &snap)],
-                whole_tenant(),
-                NOW,
-                false
-            ),
+            classify_signal_lanes(&metrics, whole_tenant(), NOW, true),
             AccessIntent::BulkScan
+        );
+        // A predicate over the same window and segments (stats pruning would
+        // then read only the newest ones) is Interactive.
+        assert_eq!(
+            classify_signal_lanes(&metrics, whole_tenant(), NOW, false),
+            AccessIntent::Interactive
         );
     }
 
@@ -278,7 +284,7 @@ mod tests {
                 &[(TargetSignal::Metrics, &snap)],
                 whole_tenant(),
                 NOW,
-                false
+                true
             ),
             AccessIntent::Interactive
         );
@@ -294,7 +300,7 @@ mod tests {
             end_ns: NOW,
         };
         assert_eq!(
-            classify_signal_lanes(&[(TargetSignal::Metrics, &snap)], window, NOW, false),
+            classify_signal_lanes(&[(TargetSignal::Metrics, &snap)], window, NOW, true),
             AccessIntent::Interactive
         );
     }
@@ -307,7 +313,7 @@ mod tests {
             end_ns: NOW - 1,
         };
         assert_eq!(
-            classify_signal_lanes(&[(TargetSignal::Metrics, &snap)], short, NOW, false),
+            classify_signal_lanes(&[(TargetSignal::Metrics, &snap)], short, NOW, true),
             AccessIntent::Interactive
         );
         let future = snapshot(vec![segment(99 * HOUR, NOW + 1)], 0);
@@ -316,7 +322,7 @@ mod tests {
                 &[(TargetSignal::Metrics, &future)],
                 whole_tenant(),
                 NOW,
-                false
+                true
             ),
             AccessIntent::Interactive
         );
@@ -337,27 +343,38 @@ mod tests {
     }
 
     #[test]
-    fn a_logs_lane_follows_the_whole_segment_test() {
+    fn a_logs_lane_is_bulk_only_when_predicate_free_over_all_history() {
         let snap = snapshot(vec![segment(98 * HOUR, 99 * HOUR - 1)], 0);
-        let window = TimeRange {
-            start_ns: 98 * HOUR,
-            end_ns: 99 * HOUR,
-        };
         let logs = [(TargetSignal::Logs, &snap)];
         assert_eq!(
-            classify_signal_lanes(&logs, window, NOW, true),
+            classify_signal_lanes(&logs, whole_tenant(), NOW, true),
             AccessIntent::BulkScan
         );
         assert_eq!(
-            classify_signal_lanes(&logs, window, NOW, false),
+            classify_signal_lanes(&logs, whole_tenant(), NOW, false),
             AccessIntent::Interactive
         );
-        let cut = TimeRange {
-            start_ns: 98 * HOUR + 1,
+        // Every resolved segment inside a window that starts after the epoch:
+        // the one-hour dashboard and alert-rule shape.
+        let hour = TimeRange {
+            start_ns: 98 * HOUR,
+            end_ns: NOW,
+        };
+        assert_eq!(
+            classify_signal_lanes(&logs, hour, NOW, true),
+            AccessIntent::Interactive
+        );
+        let short = TimeRange {
+            start_ns: 0,
             end_ns: 99 * HOUR,
         };
         assert_eq!(
-            classify_signal_lanes(&logs, cut, NOW, true),
+            classify_signal_lanes(&logs, short, NOW, true),
+            AccessIntent::Interactive
+        );
+        let cut = snapshot(vec![segment(98 * HOUR, NOW + 1)], 0);
+        assert_eq!(
+            classify_signal_lanes(&[(TargetSignal::Logs, &cut)], whole_tenant(), NOW, true),
             AccessIntent::Interactive
         );
     }
@@ -433,11 +450,11 @@ mod tests {
         let snap = two_hours();
         let lanes = [(TargetSignal::Metrics, &snap)];
         assert_eq!(
-            classify_access_intent(&lanes, false, whole_tenant(), NOW, false),
+            classify_access_intent(&lanes, false, whole_tenant(), NOW, true),
             AccessIntent::BulkScan
         );
         assert_eq!(
-            classify_access_intent(&lanes, true, whole_tenant(), NOW, false),
+            classify_access_intent(&lanes, true, whole_tenant(), NOW, true),
             AccessIntent::Interactive
         );
     }
