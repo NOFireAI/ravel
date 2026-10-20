@@ -577,7 +577,16 @@ async fn objects_at_or_under_the_threshold_are_read_whole_unprobed() {
                 );
             } else {
                 assert!(object.size() > 512 * KIB, "object {n}");
-                if n != HOLDER {
+                if n == HOLDER {
+                    // Read whole once: by the plan when the scan plans every
+                    // object, by the scan when it opens the holder unplanned.
+                    let by = if target_partitions == 4 {
+                        GetPhase::Scan
+                    } else {
+                        GetPhase::Plan
+                    };
+                    assert_eq!(object.whole_read_phases(), [by], "tp {target_partitions}");
+                } else {
                     assert!(
                         !object.read_whole(),
                         "tp {target_partitions} object {n}: {:?}",
@@ -632,6 +641,9 @@ async fn keyed_objects_the_scan_skips_are_probed_not_planned() {
         .count();
     assert_eq!(plan_whole_reads, 0);
     assert_eq!(o.objects[HOLDER].whole_read_phases(), [GetPhase::Scan]);
+    // The tail probe and its chase, the KEY_IDX prefix and a bucket, then the
+    // whole-object GET.
+    assert_eq!(o.response["stats"]["io"]["dependencyDepth"], 6);
     for (n, object) in o.objects.iter().enumerate() {
         assert_eq!(object.key_idx_gets(), object.expected_key_reads(), "object {n}");
         if n == HOLDER {
@@ -683,6 +695,7 @@ async fn unindexed_objects_the_scan_skips_are_read_whole_once() {
         .collect();
     assert_eq!(whole_reads, [1; OBJECTS]);
     for (n, object) in o.objects.iter().enumerate() {
+        assert_eq!(object.gets, [GetRange::Suffix(1024), GetRange::Full], "object {n}");
         assert_eq!(object.whole_read_phases(), [GetPhase::Scan], "object {n}");
     }
 }
