@@ -1498,7 +1498,9 @@ Freed pages that jemalloc has not yet returned count toward `stat="resident"`.
 At startup the server enables jemalloc's background thread, which returns
 them to the operating system on a timer. Without it, jemalloc returns them
 only during later allocator calls, so an idle server keeps them. The startup
-log stamps the state, as read back from the allocator:
+log stamps the state. For `source="server"` and `source="malloc_conf"` the
+state is read back from the allocator, and a failed read-back stamps `false`
+with a warning:
 
 ```
 INFO allocator background purge thread resolved allocator_background_thread=true source="server"
@@ -1506,10 +1508,10 @@ INFO allocator background purge thread resolved allocator_background_thread=true
 
 - `source="malloc_conf"` means that `_RJEM_MALLOC_CONF` sets
   `background_thread`, and the server left that setting as it was.
-- `/metrics` reports the same state, read at scrape time, as
+- `/metrics` reports the state, read from the allocator at scrape time, as
   `ravel_process_allocator_background_thread{allocator="jemalloc"}`: `1` when
   the thread is enabled, `0` when it is not. After a failed start (below) it
-  reports `0` for the life of the process.
+  reports `0` for the life of the process, whatever the allocator reads.
 - `source="unavailable"` means that this host's jemalloc has no
   background-thread support (macOS), so there is no thread to enable. The
   server logs one info line, stamps `false`, and starts. This is expected on
@@ -1517,11 +1519,19 @@ INFO allocator background purge thread resolved allocator_background_thread=true
 - `source="start-failed"` means that the server tried to start the thread on
   a host that supports it and the attempt failed, usually because the host
   refused to create the thread. The server logs a warning, stamps `false`,
-  and starts anyway. The allocator's own enabled flag can read `true` in this
-  case, because the allocator sets it before it creates the thread, so the
-  server does not use it. Check the process's thread limit (`ulimit -u`, a
-  container `pids` limit) and the warning's error. Until the next restart,
-  freed pages return to the operating system only on allocator activity.
+  and starts anyway. The allocator sets its enabled flag before it creates
+  the thread and leaves it set when creation fails. While that flag is set,
+  application threads leave the timed purge to the thread that never
+  started, so the server then turns the setting back off:
+  - When that succeeds, the server logs an info line, and freed pages return
+    to the operating system during later allocator calls, as with
+    `background_thread:false`.
+  - When that fails too, the server logs a second warning. Until the next
+    restart no timed purge runs, and freed pages return to the operating
+    system only through forced purges, such as the memory gate's purge.
+
+  Check the process's thread limit (`ulimit -u`, a container `pids` limit)
+  and the first warning's error.
 - To turn the thread off, start the server with
   `_RJEM_MALLOC_CONF=background_thread:false`. To combine it with the
   profiling options below, separate the options with commas.

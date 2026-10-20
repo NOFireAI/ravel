@@ -6430,8 +6430,9 @@ fn render_allocator_family(
             write_header(
                 out,
                 "ravel_process_allocator_background_thread",
-                "1 when jemalloc's background purge thread is enabled, 0 when it is not or the \
-                 server failed to start it, read back from the allocator at scrape time.",
+                "1 when jemalloc's background purge thread is enabled, 0 when it is not, read \
+                 from the allocator at scrape time. 0 for the rest of the process after the \
+                 server failed to start it, whatever the allocator reads.",
                 "gauge",
             );
             write_sample(
