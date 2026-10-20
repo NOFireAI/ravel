@@ -2458,12 +2458,12 @@ pub struct Cli {
     /// Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that bulk-scan reads hold against interactive admissions, strictly between 0 and 1; default 0.5.
     ///
     /// A `POST /api/v1/sql` statement is a bulk scan (ADR-3072 decision 3a)
-    /// when it names one signal table and no Parquet table, and either that
-    /// table is `samples`, its window reaches from the Unix epoch to now, its
-    /// resolve pruned no segment and every segment lies inside the window,
-    /// or it is `logs`, it carries no row predicate, no erasure is pending
-    /// and every resolved segment lies inside the window. Every other read is
-    /// interactive. Bulk reads are admitted into a bulk region; a bulk
+    /// when it names one signal table and no Parquet table, its plan has no
+    /// filter, no join and no limit, and its window reaches from the Unix
+    /// epoch to now. A `samples` statement also needs a resolve that pruned no
+    /// segment and every segment inside the window; a `logs` statement also
+    /// needs no pending erasure and every resolved segment inside the window.
+    /// Every other read is interactive. Bulk reads are admitted into a bulk region; a bulk
     /// admission evicts other bulk entries and, while the region is below
     /// this share, probation entries, never the main queue. Region
     /// bytes up to this share are evicted only after the probation and main
