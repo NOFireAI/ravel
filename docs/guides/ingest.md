@@ -1310,9 +1310,11 @@ not the object size. A load of
 by the size trigger, and the 10,000-row tail published at the end of the
 input.
 
-Three cases fall outside that. When `--batch-rows` / `--shards` is above
-250,000 the rows bound is 1 and every slice is over the target on its
-own, so each object holds one slice, `--batch-rows` / `--shards` rows.
+Three cases fall outside that. When `--batch-rows` / `--shards` is
+250,000 or more the rows bound is 1 and the depth is 2. A slice at or over
+the target closes its object on its own, but shards draw unequal shares of
+each batch, so a slice that falls short waits for the next one: an object
+holds one or two slices, `--batch-rows` / `--shards` rows to twice that.
 When the memory bound is lower than the rows bound plus its quarter, it
 decides the depth. If it is also lower than the rows bound itself, the
 depth flush closes each shard's buffer every `--pipeline-depth` batches,
