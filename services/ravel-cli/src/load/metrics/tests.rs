@@ -984,6 +984,9 @@ mod default_geometry {
 
     const BATCH_ROWS: usize = 10_000;
     const BATCHES: usize = 51;
+    /// Batches in the over-estimate test: two full windows of the derived
+    /// depth 32 and a remainder, so the window restarts after a depth flush.
+    const OVER_ESTIMATE_BATCHES: usize = 70;
     const HOST_BYTES: u64 = 64 << 30;
 
     fn mapping() -> MetricsMapping {
@@ -1145,8 +1148,9 @@ mod default_geometry {
     /// over-estimates the rest, since a buffer charges a series' bytes only
     /// at its first sighting there. 32 batches then estimate below the derived
     /// target (25 first batches' worth), the size trigger never fires, and
-    /// the depth flush closes each window of 32: `51 / 32` depth flushes and
-    /// one end-of-input flush for the remainder.
+    /// the depth flush closes each window of 32: with 70 batches, two depth
+    /// flushes (batches 1-32 and 33-64) and one end-of-input flush for the
+    /// remaining 6.
     ///
     /// Prove-the-test: never call `window.submitted` in the metrics loader
     /// and nothing answers the write the loop waits on at the 32nd submit;
@@ -1154,7 +1158,7 @@ mod default_geometry {
     /// Strict ack deadline and `load`'s `expect("load succeeds")` panics.
     #[tokio::test]
     async fn an_over_estimating_first_batch_is_closed_by_the_depth_flush() {
-        let (_dir, pq) = row_hosted_fixture(BATCH_ROWS, BATCHES, |g, r| {
+        let (_dir, pq) = row_hosted_fixture(BATCH_ROWS, OVER_ESTIMATE_BATCHES, |g, r| {
             format!("b{:05}", if g == 0 { r } else { 0 })
         });
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -1169,26 +1173,23 @@ mod default_geometry {
         )
         .await;
 
-        assert_eq!(report.points_written, (BATCH_ROWS * BATCHES) as u64);
+        assert_eq!(
+            report.points_written,
+            (BATCH_ROWS * OVER_ESTIMATE_BATCHES) as u64
+        );
         let layout = report.layout_report();
         let geometry = layout.geometry.expect("geometry resolved");
         assert_eq!(geometry.target_source, TargetSource::Derived);
-        let depth = geometry.pipeline_depth;
-        assert_eq!(depth, 32);
-        let depth_flushes = (BATCHES / depth) as u64;
-        let manual = u64::from(!BATCHES.is_multiple_of(depth));
-        assert_eq!(
-            stored_objects(store.as_ref()).await as u64,
-            depth_flushes + manual
-        );
+        assert_eq!(geometry.pipeline_depth, 32);
+        assert_eq!(stored_objects(store.as_ref()).await, 3);
         assert_eq!(
             layout.flush_mix.totals,
             FlushMixCounts {
                 size: 0,
                 age: 0,
                 arrival: 0,
-                depth: depth_flushes,
-                manual,
+                depth: 2,
+                manual: 1,
             },
             "no size flush is reachable, so the depth flush closes every full window"
         );
