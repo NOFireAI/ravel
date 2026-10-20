@@ -47,13 +47,20 @@ pub const MAX_DERIVED_PIPELINE_DEPTH: usize = 1_024;
 /// than its share is still short of the target when the depth flush closes
 /// it, which on a multi-shard load is about half of them. With the margin the
 /// size trigger closes them and the depth flush is the backstop for rows
-/// narrower than the first batch's.
+/// narrower than the first batch's. With the depth flush off the margin only
+/// adds in-flight memory, so it applies only while the depth flush runs.
 pub const DEPTH_MARGIN_DIVISOR: usize = 4;
 
-/// The depth the rows bound derives: `rows_depth` plus the
-/// [`DEPTH_MARGIN_DIVISOR`] margin.
+/// The depth the rows bound derives when the depth flush runs: `rows_depth`
+/// plus the [`DEPTH_MARGIN_DIVISOR`] margin.
 pub fn rows_bound_depth(rows_depth: usize) -> usize {
     rows_depth.saturating_add(rows_depth.div_ceil(DEPTH_MARGIN_DIVISOR))
+}
+
+/// Whether a load with this target runs the depth flush: only a derived
+/// target above [`PER_BATCH_TARGET_BYTES`] does.
+fn depth_flush_runs(target_source: TargetSource, target_bytes: usize) -> bool {
+    target_source == TargetSource::Derived && target_bytes > PER_BATCH_TARGET_BYTES
 }
 
 /// Called once a load's geometry is resolved, before its first write is
@@ -133,7 +140,8 @@ pub enum DepthBound {
     Flag,
     /// `ceil(DEFAULT_OBJECT_ROWS * shards / batch_rows)`, enough batches in
     /// flight for every shard to fill one target, plus the
-    /// [`DEPTH_MARGIN_DIVISOR`] margin ([`rows_bound_depth`]).
+    /// [`DEPTH_MARGIN_DIVISOR`] margin ([`rows_bound_depth`]) when the depth
+    /// flush runs.
     Rows,
     /// The memory budget divided by one batch's estimated bytes, which was
     /// below the rows bound's depth.
@@ -153,7 +161,7 @@ pub struct LoadGeometry {
     pub pipeline_depth: usize,
     pub depth_bound: DepthBound,
     /// `ceil(DEFAULT_OBJECT_ROWS * shards / batch_rows)`, at least 1, before
-    /// the margin [`rows_bound_depth`] adds.
+    /// the margin [`rows_bound_depth`] adds when the depth flush runs.
     pub rows_depth: usize,
     /// `budget / (batch_rows * est_bytes_per_row)`, at least 1. `None` when
     /// the load had no memory budget.
@@ -166,7 +174,17 @@ impl LoadGeometry {
     /// buffers close on the size and age triggers and the loader's own
     /// flushes alone, whatever `--pipeline-depth` says.
     pub fn depth_flush_enabled(&self) -> bool {
-        self.target_source == TargetSource::Derived && self.target_bytes > PER_BATCH_TARGET_BYTES
+        depth_flush_runs(self.target_source, self.target_bytes)
+    }
+
+    /// The depth the rows bound derives for this load: [`Self::rows_depth`],
+    /// plus the margin only when the depth flush runs.
+    pub fn rows_bound(&self) -> usize {
+        if self.depth_flush_enabled() {
+            rows_bound_depth(self.rows_depth)
+        } else {
+            self.rows_depth
+        }
     }
 }
 
@@ -209,7 +227,11 @@ pub fn resolve_geometry(
             .unwrap_or(usize::MAX)
             .max(1)
     });
-    let rows_bound = rows_bound_depth(rows_depth);
+    let rows_bound = if depth_flush_runs(target_source, target_bytes) {
+        rows_bound_depth(rows_depth)
+    } else {
+        rows_depth
+    };
     let (pipeline_depth, depth_bound) = match (pipeline_depth, memory_depth) {
         (Some(d), _) => (d, DepthBound::Flag),
         (None, Some(m)) if m < rows_bound && m <= MAX_DERIVED_PIPELINE_DEPTH => {
@@ -591,12 +613,16 @@ fn depth_bound_text(g: &LoadGeometry) -> String {
     let memory_depth = g
         .memory_depth
         .map_or_else(|| "no budget".to_string(), |d| d.to_string());
-    let rows_bound = format!(
-        "rows bound {} + {}% = {}",
-        g.rows_depth,
-        100 / DEPTH_MARGIN_DIVISOR,
-        rows_bound_depth(g.rows_depth)
-    );
+    let rows_bound = if g.depth_flush_enabled() {
+        format!(
+            "rows bound {} + {}% = {}",
+            g.rows_depth,
+            100 / DEPTH_MARGIN_DIVISOR,
+            g.rows_bound()
+        )
+    } else {
+        format!("rows bound {}", g.rows_depth)
+    };
     match g.depth_bound {
         DepthBound::Flag => "--pipeline-depth".to_string(),
         DepthBound::Rows => {
@@ -752,6 +778,31 @@ mod tests {
             "load geometry: spans: flush target 21750000 bytes (derived: 250000 rows x 87 \
              estimated bytes per row), pipeline depth 125 (rows bound decided it: rows bound \
              100 + 25% = 125, memory bound 36245)"
+        );
+    }
+
+    /// `--target-bytes 1` turns the depth flush off, so the lane's inputs
+    /// derive the plain rows bound with no margin.
+    #[test]
+    fn a_per_batch_target_derives_the_plain_rows_bound() {
+        let g = resolve_geometry(
+            Some(PER_BATCH_TARGET_BYTES),
+            None,
+            4,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS,
+            DEFAULT_BATCH_ROWS * 87,
+            Some(36_245 * 870_000),
+        );
+        assert!(!g.depth_flush_enabled());
+        assert_eq!(g.rows_depth, 100);
+        assert_eq!(g.rows_bound(), 100);
+        assert_eq!(g.pipeline_depth, 100);
+        assert_eq!(g.depth_bound, DepthBound::Rows);
+        assert_eq!(
+            render_geometry_line("spans", &g),
+            "load geometry: spans: flush target 1 bytes (--target-bytes), pipeline depth 100 \
+             (rows bound decided it: rows bound 100, memory bound 36245)"
         );
     }
 
