@@ -2569,8 +2569,7 @@ mod default_geometry {
             let mut slice = [0usize; SHARDS as usize];
             let first = (g * batch_rows / SPANS_PER_TRACE) as u64;
             for t in first..first + (batch_rows / SPANS_PER_TRACE) as u64 {
-                slice[ravel_ingest::shard_for_span(&trace(t), SHARDS) as usize] +=
-                    SPANS_PER_TRACE;
+                slice[ravel_ingest::shard_for_span(&trace(t), SHARDS) as usize] += SPANS_PER_TRACE;
             }
             for (held, add) in buffered.iter_mut().zip(slice) {
                 *held += add;
