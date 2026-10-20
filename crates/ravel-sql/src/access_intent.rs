@@ -43,7 +43,25 @@ use crate::executor::TargetSignal;
 /// `segments_pruned == 0` alone is not the rule: a metric name carried by
 /// every segment prunes nothing, and the statement still reads one series
 /// over one window.
+///
+/// `names_parquet` is whether the statement names a Parquet table: those
+/// resolve outside `lanes`, so a `samples` join with one would otherwise
+/// read as a single lane.
 pub(crate) fn classify_access_intent(
+    lanes: &[(TargetSignal, &Snapshot)],
+    names_parquet: bool,
+    window: TimeRange,
+    now_ns: i64,
+    logs_predicate_free: bool,
+) -> AccessIntent {
+    if names_parquet {
+        return AccessIntent::Interactive;
+    }
+    classify_signal_lanes(lanes, window, now_ns, logs_predicate_free)
+}
+
+/// [`classify_access_intent`] for a statement that names no Parquet table.
+fn classify_signal_lanes(
     lanes: &[(TargetSignal, &Snapshot)],
     window: TimeRange,
     now_ns: i64,
@@ -242,7 +260,7 @@ mod tests {
     fn an_unpruned_metrics_lane_over_all_history_is_bulk() {
         let snap = two_hours();
         assert_eq!(
-            classify_access_intent(
+            classify_signal_lanes(
                 &[(TargetSignal::Metrics, &snap)],
                 whole_tenant(),
                 NOW,
@@ -256,7 +274,7 @@ mod tests {
     fn a_pruned_metrics_lane_is_interactive() {
         let snap = snapshot(two_hours().segments, 1);
         assert_eq!(
-            classify_access_intent(
+            classify_signal_lanes(
                 &[(TargetSignal::Metrics, &snap)],
                 whole_tenant(),
                 NOW,
@@ -276,7 +294,7 @@ mod tests {
             end_ns: NOW,
         };
         assert_eq!(
-            classify_access_intent(&[(TargetSignal::Metrics, &snap)], window, NOW, false),
+            classify_signal_lanes(&[(TargetSignal::Metrics, &snap)], window, NOW, false),
             AccessIntent::Interactive
         );
     }
@@ -289,12 +307,12 @@ mod tests {
             end_ns: NOW - 1,
         };
         assert_eq!(
-            classify_access_intent(&[(TargetSignal::Metrics, &snap)], short, NOW, false),
+            classify_signal_lanes(&[(TargetSignal::Metrics, &snap)], short, NOW, false),
             AccessIntent::Interactive
         );
         let future = snapshot(vec![segment(99 * HOUR, NOW + 1)], 0);
         assert_eq!(
-            classify_access_intent(
+            classify_signal_lanes(
                 &[(TargetSignal::Metrics, &future)],
                 whole_tenant(),
                 NOW,
@@ -308,7 +326,7 @@ mod tests {
     fn several_lanes_are_interactive() {
         let snap = two_hours();
         assert_eq!(
-            classify_access_intent(
+            classify_signal_lanes(
                 &[(TargetSignal::Metrics, &snap), (TargetSignal::Logs, &snap)],
                 whole_tenant(),
                 NOW,
@@ -327,11 +345,11 @@ mod tests {
         };
         let logs = [(TargetSignal::Logs, &snap)];
         assert_eq!(
-            classify_access_intent(&logs, window, NOW, true),
+            classify_signal_lanes(&logs, window, NOW, true),
             AccessIntent::BulkScan
         );
         assert_eq!(
-            classify_access_intent(&logs, window, NOW, false),
+            classify_signal_lanes(&logs, window, NOW, false),
             AccessIntent::Interactive
         );
         let cut = TimeRange {
@@ -339,7 +357,7 @@ mod tests {
             end_ns: 99 * HOUR,
         };
         assert_eq!(
-            classify_access_intent(&logs, cut, NOW, true),
+            classify_signal_lanes(&logs, cut, NOW, true),
             AccessIntent::Interactive
         );
     }
@@ -395,10 +413,24 @@ mod tests {
             TargetSignal::Parquet,
         ] {
             assert_eq!(
-                classify_access_intent(&[(signal, &snap)], whole_tenant(), NOW, true),
+                classify_signal_lanes(&[(signal, &snap)], whole_tenant(), NOW, true),
                 AccessIntent::Interactive,
                 "{signal:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_statement_naming_a_parquet_table_is_interactive() {
+        let snap = two_hours();
+        let lanes = [(TargetSignal::Metrics, &snap)];
+        assert_eq!(
+            classify_access_intent(&lanes, false, whole_tenant(), NOW, false),
+            AccessIntent::BulkScan
+        );
+        assert_eq!(
+            classify_access_intent(&lanes, true, whole_tenant(), NOW, false),
+            AccessIntent::Interactive
+        );
     }
 }

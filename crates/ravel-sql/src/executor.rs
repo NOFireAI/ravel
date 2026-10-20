@@ -2251,6 +2251,7 @@ impl SqlExecutor {
                 .await;
             phase_accounting.set_access_intent(classify_access_intent(
                 &lane_refs,
+                parquet.is_some(),
                 req.window,
                 req.now_ns,
                 logs_predicate_free,
