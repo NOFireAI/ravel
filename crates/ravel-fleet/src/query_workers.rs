@@ -56,7 +56,7 @@
 //! grants no `s3:DeleteObject`), so no query-side path removes a key. A
 //! graceful drain overwrites the process's own record with
 //! [`DRAINED_STAMP_NS`] instead ([`QueryWorkers::mark_drained`]), which every
-//! reader judges stale at once, and a worker lost to a panic, a kill, an
+//! reader skips at once, and a worker lost to a panic, a kill, an
 //! out-of-memory event or a node loss leaves its last record behind. The two
 //! bounds [`crate::worker_set`] applies to the maintain prefix apply here over
 //! the same shared predicates:
@@ -185,8 +185,9 @@ impl QueryWorkerRecord {
 }
 
 /// The `blake3::derive_key` context the record keys are derived under
-/// (ADR-1918 decision 2). Distinct from every fragment capability and SQL
-/// ticket context, so a record MAC never verifies as either.
+/// (ADR-1918 decision 2). Fragment capabilities are MACed under the raw file
+/// key and SQL tickets under keys derived with their own contexts, so a record
+/// key is never a key either of them uses.
 pub const RECORD_KEY_CONTEXT: &str = "ravel query worker record v1";
 
 /// The largest heartbeat object [`QueryWorkers::live_set`] reads (ADR-1918
@@ -291,8 +292,10 @@ struct SignedRecord {
 
 /// Why [`QueryWorkers::live_set`] skipped a sibling's record (ADR-1918
 /// decision 4). Rendered as the closed `reason` label of
-/// `ravel_query_worker_record_rejects_total`. A record skipped only because
-/// its stamp is stale is not a reject.
+/// `ravel_query_worker_record_rejects_total`. A key that is not a UUID, a
+/// record skipped before the GET because its LIST modification time is outside
+/// the liveness window, and a verified record stamped [`DRAINED_STAMP_NS`], are
+/// not rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordReject {
     /// The object decoded but carried no `mac`.
@@ -304,15 +307,20 @@ pub enum RecordReject {
     /// The object is empty or does not decode, or its `process_id` disagrees
     /// with its key.
     Malformed,
+    /// The record verified, but its stamp is outside the liveness window
+    /// although its modification time is inside it: a replayed older heartbeat
+    /// or a clock skewed past the window.
+    StaleStamp,
 }
 
 impl RecordReject {
     /// Every reason, in the fixed order the counters are indexed by.
-    pub const ALL: [RecordReject; 4] = [
+    pub const ALL: [RecordReject; 5] = [
         RecordReject::MissingMac,
         RecordReject::BadMac,
         RecordReject::Oversize,
         RecordReject::Malformed,
+        RecordReject::StaleStamp,
     ];
 
     /// The stable `reason` metric label value.
@@ -322,6 +330,7 @@ impl RecordReject {
             RecordReject::BadMac => "bad_mac",
             RecordReject::Oversize => "oversize",
             RecordReject::Malformed => "malformed",
+            RecordReject::StaleStamp => "stale_stamp",
         }
     }
 
@@ -331,6 +340,7 @@ impl RecordReject {
             RecordReject::BadMac => 1,
             RecordReject::Oversize => 2,
             RecordReject::Malformed => 3,
+            RecordReject::StaleStamp => 4,
         }
     }
 }
@@ -338,7 +348,7 @@ impl RecordReject {
 /// Cumulative [`RecordReject`] counts of one process's live-set reads.
 #[derive(Debug, Default)]
 pub struct RecordRejectMetrics {
-    rejects: [AtomicU64; 4],
+    rejects: [AtomicU64; RecordReject::ALL.len()],
 }
 
 impl RecordRejectMetrics {
@@ -352,7 +362,7 @@ impl RecordRejectMetrics {
     }
 
     /// Every reason with its count, in [`RecordReject::ALL`] order.
-    pub fn by_reason(&self) -> [(RecordReject, u64); 4] {
+    pub fn by_reason(&self) -> [(RecordReject, u64); RecordReject::ALL.len()] {
         RecordReject::ALL.map(|reason| (reason, self.get(reason)))
     }
 
@@ -536,8 +546,13 @@ impl QueryWorkers {
     /// constant time. The read is a range read of [`MAX_RECORD_BYTES`] plus
     /// one byte, so a longer object is rejected as oversize without being
     /// decoded. Each rejected record is skipped (treated as absent) and counted
-    /// by [`RecordReject`] reason in [`record_rejects`](Self::record_rejects);
-    /// a record skipped only for a stale stamp is not counted. Only a failed
+    /// by [`RecordReject`] reason in [`record_rejects`](Self::record_rejects),
+    /// under the first check it fails. Three skips are not counted: a key that
+    /// is not a UUID, a key whose LIST modification time is outside the
+    /// liveness window (never fetched), and a verified record stamped
+    /// [`DRAINED_STAMP_NS`] (a graceful drain).
+    /// A verified record with any other stamp outside the window is counted as
+    /// [`RecordReject::StaleStamp`]. Only a failed
     /// LIST or GET is an `Err`, which the caller treats fail-open, never
     /// freezing fan-out on a transient read fault.
     ///
@@ -581,7 +596,18 @@ impl QueryWorkers {
                     continue;
                 }
             };
+            if record.started_unix_ns == DRAINED_STAMP_NS {
+                // A graceful drain writes exactly this signed record, so it is
+                // a departure rather than a reject.
+                continue;
+            }
             if is_stale(now_ns, record.started_unix_ns, window) {
+                tracing::debug!(
+                    key = %meta.key,
+                    reason = RecordReject::StaleStamp.reason(),
+                    "query_workers: rejecting a sibling record"
+                );
+                self.rejects.record(RecordReject::StaleStamp);
                 continue;
             }
             live.push(record);
@@ -774,6 +800,16 @@ mod tests {
         keys
     }
 
+    /// Each reason indexes its own counter, at its position in `ALL`, so no
+    /// two reasons share one and the arrays sized from `ALL.len()` cover
+    /// every index.
+    #[test]
+    fn reject_index_is_the_position_in_all() {
+        for (position, reason) in RecordReject::ALL.into_iter().enumerate() {
+            assert_eq!(reason.index(), position, "{reason:?}");
+        }
+    }
+
     /// A record round-trips through its JSON encoding unchanged.
     #[test]
     fn record_json_round_trips() {
@@ -786,6 +822,33 @@ mod tests {
         let bytes = record.encode().expect("encode");
         let decoded = QueryWorkerRecord::decode(&bytes).expect("decode");
         assert_eq!(record, decoded);
+    }
+
+    /// A signed heartbeat object decodes as a plain [`QueryWorkerRecord`],
+    /// the shape a reader from before record MACs reads it as: the `mac`
+    /// field is ignored.
+    #[tokio::test]
+    async fn signed_object_decodes_as_a_plain_record() {
+        let store = MemoryStore::new();
+        let a = worker();
+        a.write_heartbeat(&store, 42).await.expect("beat");
+        let got = store
+            .get(
+                &query_worker_key(&a.process_id().to_string()),
+                GetRange::Full,
+            )
+            .await
+            .expect("get record");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(got.data.as_ref())
+                .expect("json")
+                .get("mac")
+                .is_some()
+        );
+        assert_eq!(
+            QueryWorkerRecord::decode(got.data.as_ref()).expect("decode"),
+            a.record_at(42)
+        );
     }
 
     /// A heartbeat object written before release B (ADR-1689 decision 4)
@@ -874,10 +937,18 @@ mod tests {
         );
         assert_eq!(live.len(), 1, "only self survives");
         assert_eq!(live[0].process_id, a.process_id().to_string());
+        // The store reports no modification time, so the record was fetched
+        // and verified: only its stamp kept it out.
         assert_eq!(
-            a.record_rejects().by_reason().map(|(_, n)| n),
-            [0; 4],
-            "a skip for staleness alone is not a reject"
+            a.record_rejects().by_reason(),
+            [
+                (RecordReject::MissingMac, 0),
+                (RecordReject::BadMac, 0),
+                (RecordReject::Oversize, 0),
+                (RecordReject::Malformed, 0),
+                (RecordReject::StaleStamp, 1),
+            ],
+            "a fetched, verified record with a stale stamp is one stale_stamp"
         );
     }
 
@@ -943,6 +1014,7 @@ mod tests {
                 (RecordReject::BadMac, 0),
                 (RecordReject::Oversize, 0),
                 (RecordReject::Malformed, 1),
+                (RecordReject::StaleStamp, 0),
             ],
             "the mismatch is malformed; the non-UUID key is skipped uncounted"
         );
@@ -983,6 +1055,13 @@ mod tests {
         let live = a.live_set(&store, now).await.expect("live set");
         assert_eq!(live.len(), 1, "only self survives after the sibling drains");
         assert_eq!(live[0].process_id, a.process_id().to_string());
+        // The store reports no modification time, so the drained record was
+        // fetched and verified, and its stamp is past every window.
+        assert_eq!(
+            a.record_rejects().by_reason().map(|(_, n)| n),
+            [0; RecordReject::ALL.len()],
+            "a drained record is a departure, not a reject"
+        );
 
         assert_eq!(
             store.fault_count(Op::Delete, FaultKind::Transient),
@@ -1042,9 +1121,58 @@ mod tests {
         );
         assert_eq!(live.len(), 1, "only self survives");
         assert_eq!(
-            a.record_rejects().by_reason().map(|(_, n)| n),
-            [0; 4],
-            "a fetched, verified record skipped for its stamp is not a reject"
+            a.record_rejects().by_reason(),
+            [
+                (RecordReject::MissingMac, 0),
+                (RecordReject::BadMac, 0),
+                (RecordReject::Oversize, 0),
+                (RecordReject::Malformed, 0),
+                (RecordReject::StaleStamp, 1),
+            ],
+            "a fetched, verified record stamped past the window is one stale_stamp"
+        );
+    }
+
+    /// A key whose LIST modification time is outside the liveness window is
+    /// skipped before the GET and counts no reject, although its stamp is
+    /// stale too and would count `stale_stamp` had it been fetched. The first
+    /// GET under the prefix is scripted to fail, so any fetch fails the read.
+    #[tokio::test]
+    async fn mtime_stale_sibling_is_never_fetched_and_counts_nothing() {
+        let now_ns = 1_000 * H_NS;
+        let now_ms = 1_000 * H_MS;
+        let plan = FaultPlan::empty().with_rule(
+            Rule::new(
+                Op::Get,
+                ScriptedFault::Transient("a query-workers-prefix GET".into()),
+            )
+            .with_key_contains(QUERY_WORKERS_PREFIX)
+            .with_occurrence(Occurrence::Nth(1)),
+        );
+        let store = FaultStore::new(MemoryStore::new(), plan);
+        let me = worker();
+        let dead = worker();
+        beat_with_mtime(
+            store.inner(),
+            &store,
+            &dead,
+            now_ms - 10 * H_MS,
+            now_ms,
+            now_ns - 10 * H_NS,
+        )
+        .await;
+
+        let live = me.live_set(&store, now_ns).await.expect("live set");
+        assert_eq!(
+            store.fault_count(Op::Get, FaultKind::Transient),
+            0,
+            "the mtime-stale key cost no GET"
+        );
+        assert_eq!(live.len(), 1, "only self survives");
+        assert_eq!(
+            me.record_rejects().by_reason().map(|(_, n)| n),
+            [0; RecordReject::ALL.len()],
+            "an mtime-stale skip is not a reject"
         );
     }
 
