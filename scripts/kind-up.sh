@@ -30,8 +30,9 @@
 #   RAVEL_OPERATOR_IMAGE      operator image tag (default ravel-operator:kind-dev)
 #   RAVEL_SKIP_IMAGE_BUILD    1 to skip `docker build` and use the tags as-is.
 #                             For CI (ADR-0034 decision 7), which builds the
-#                             binaries on the host with a warm cargo cache and
-#                             assembles the images itself.
+#                             binaries with scripts/build-prebuilt-binaries.sh
+#                             (the builder image, with the runner's warm cargo
+#                             cache mounted) and assembles the images itself.
 #   RAVEL_FAKE_S3_BACKEND     floci (default) or rustfs (ADR-0034 decision 8)
 #   RAVEL_TENANT_NAME         tenant to provision (default demo-tenant)
 #   RAVEL_TENANT_TOKEN        its bearer token (default demo-token)

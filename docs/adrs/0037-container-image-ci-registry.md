@@ -64,7 +64,9 @@ repo config).
    (Debian 13) and binary set (no `ravel-cli`) documented as CI-lane-only
    in its own header. Publishing from it would ship an image that
    diverges from what `docker-build` gates and would need its own glibc
-   compatibility story for arbitrary pull targets.
+   compatibility story for arbitrary pull targets. (The glibc and binary-set
+   differences no longer hold; see the CI lane base amendment below. The
+   decision stands on the cache-freshness reason.)
 
 3. **Runner: `ubuntu-latest`, matching `docker-build`.** Native amd64,
    no QEMU, so the SIGSEGV above cannot occur in CI. `linux/amd64` is
@@ -671,3 +673,23 @@ heading is cut puts every fragment in the new, empty `[Unreleased]`, and the
 release notes miss them without any error. CI runs
 `scripts/changelog-assemble.sh --check` on every pull request, so a malformed
 fragment is caught where it was written rather than during a release.
+
+## Amendment (2026-10-21): the CI lane base matches the shipping image
+
+<!-- amendment-applies: sections="Decision" pointer="CI lane base amendment" -->
+
+Decision 2's reasons for not publishing from `Dockerfile.prebuilt` included
+that it ships a different glibc (a Debian 13 base) and a different binary
+set (no `ravel-cli`). Neither holds any longer. The binary set was already
+the same: `Dockerfile.prebuilt` copies `ravel-cli` into the server image for
+the kind lane's store-qualification Job. The glibc difference is gone since
+#3146: `scripts/build-prebuilt-binaries.sh` builds the lane's binaries inside
+the root `Dockerfile`'s builder image (`rust:1.97.1-bookworm`, glibc 2.36),
+so `Dockerfile.prebuilt` now uses the same `distroless/cc-debian12` base, by
+digest, as the shipping image. The lane also no longer uses sccache; it
+reuses the runner's rust-cache by mounting `target/` and the cargo caches
+into the container.
+
+Decision 2 stands on its remaining reason: an image assembled from a runner's
+`target/` carries cache-freshness assumptions the published image must not,
+and the root `Dockerfile` is the artifact `docker-build` gates.

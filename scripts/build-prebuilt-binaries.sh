@@ -12,8 +12,9 @@
 # The image is read from the root Dockerfile's `AS builder` stage, so the two
 # cannot drift. The workspace and the host's cargo registry and git caches are
 # mounted, so target/ and the caches the CI job restores are the ones the
-# container builds into. The container runs as root; it hands everything it
-# wrote back to the calling user before it exits.
+# container builds into. The container runs as the calling user, with
+# CARGO_HOME and HOME under /tmp, so nothing it writes is root-owned even if
+# it is killed mid-build; --init forwards Ctrl-C to the build.
 #
 # The builder stage's CARGO_BUILD_JOBS=2 cap is deliberately not inherited:
 # CI builds at cargo's default against a 55-minute budget. On a small host
@@ -33,24 +34,33 @@ if [[ -z "${image}" ]]; then
   exit 2
 fi
 
+# rust-toolchain.toml also lists components (clippy, rustfmt, llvm-tools) the
+# image does not ship; naming the channel directly keeps rustup from trying to
+# install them into the image's root-owned RUSTUP_HOME as a non-root user.
+channel="$(awk -F'"' '/^channel/ { print $2; exit }' rust-toolchain.toml)"
+if [[ -z "${channel}" ]]; then
+  echo "build-prebuilt-binaries: no channel in rust-toolchain.toml" >&2
+  exit 2
+fi
+
 cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
 mkdir -p "${cargo_home}/registry" "${cargo_home}/git" target
 
 echo "build-prebuilt-binaries: building in ${image}"
-docker run --rm \
+docker run --rm --init \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/tmp \
+  -e CARGO_HOME=/tmp/cargo-home \
+  -e RUSTUP_TOOLCHAIN="${channel}" \
   -v "${root}:/work" -w /work \
-  -v "${cargo_home}/registry:/usr/local/cargo/registry" \
-  -v "${cargo_home}/git:/usr/local/cargo/git" \
+  -v "${cargo_home}/registry:/tmp/cargo-home/registry" \
+  -v "${cargo_home}/git:/tmp/cargo-home/git" \
   -e CARGO_INCREMENTAL=0 \
   ${CARGO_BUILD_JOBS:+-e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}"} \
-  -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   "${image}" \
   bash -c '
     set -euo pipefail
-    rc=0
-    cargo build --release --locked -p ravel-server --features sql,flight-sql,otap || rc=$?
-    if [[ "${rc}" == 0 ]]; then cargo build --release --locked -p ravel-cli || rc=$?; fi
-    if [[ "${rc}" == 0 ]]; then cargo build --release --locked -p ravel-operator || rc=$?; fi
-    chown -R "${HOST_UID}:${HOST_GID}" /work/target /usr/local/cargo/registry /usr/local/cargo/git
-    exit "${rc}"
+    cargo build --release --locked -p ravel-server --features sql,flight-sql,otap
+    cargo build --release --locked -p ravel-cli
+    cargo build --release --locked -p ravel-operator
   '
