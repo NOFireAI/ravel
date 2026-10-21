@@ -119,11 +119,8 @@ const REPEATS: usize = 3;
 /// the segment-count bound (`min(target_partitions, segment_count)`, ADR-0102
 /// decision 1), and the shared queue hands each object to one partition whole.
 ///
-/// Four rather than more. [`MAX_TIGHTENED_GROUP_ENTRIES`] grows with the
-/// partition count while each partition's stock table stops at [`DISTINCT`],
-/// so the stock side outgrows that bound only when more than
-/// `2 x SKIP_PARTIAL_AGGREGATION_PROBE_ROWS x OBJECTS / DISTINCT` (2.6 here)
-/// partitions take an object.
+/// How many of those partitions actually take an object depends on the
+/// schedule, so no assertion below depends on it.
 const OBJECTS: usize = 4;
 
 /// The scan's fan-out. Equal to [`OBJECTS`] so the fanned-out side really
@@ -482,12 +479,10 @@ fn check_run_shape(label: &str, observed: &Run) {
 /// Both runs go over one fixture at [`FANNED_OUT_PARTITIONS`], one with the
 /// option on and one with it off, and every assertion is an exact equality or
 /// an exact structural bound over row counts from DataFusion's metrics. Nothing
-/// here depends on wall-clock time or on the memory pool, and assertions 1 and 2
-/// hold however the runtime interleaved the partitions. Assertion 3 needs at
-/// least three of the four partitions to take an object from the shared queue
-/// (see [`OBJECTS`]), so the test pins four runtime workers: the four
-/// partition tasks then run at once instead of one task draining the queue
-/// before the others are scheduled, which a host with fewer cores would allow.
+/// here depends on wall-clock time or on the memory pool. Every assertion holds
+/// however the runtime interleaved the partitions and however many of them
+/// took an object from the shared queue. The test pins four runtime workers so
+/// the four partition tasks can run at once, as they do in the server.
 ///
 /// 1. With the option on, every partition's probe fires and the partial stage
 ///    forwards: its `output_rows` equals its input row count exactly, and the
@@ -499,10 +494,14 @@ fn check_run_shape(label: &str, observed: &Run) {
 ///    fewer than it read. Those emitted rows are the group entries the
 ///    pre-final state held, which is issue #680's multiplier stated in entries
 ///    instead of bytes.
-/// 3. That off-side entry count exceeds the bound assertion 1 holds the on side
-///    to, which is what keeps assertion 1 from being vacuous: the fixture has
-///    to actually reproduce the unbounded multiplier for a bound on it to mean
-///    anything.
+/// 3. That off-side entry count is at least [`DISTINCT`]: a partition that
+///    takes an object builds a full table of every distinct value. One such
+///    table is more than one on-side partition may hold
+///    (`2 x SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`, the per-partition share of
+///    assertion 1's bound), which is what keeps assertion 1 from being vacuous:
+///    the fixture has to actually reproduce a table that follows `DISTINCT`
+///    for a bound on it to mean anything. The comparison is per partition, so
+///    it holds whichever partitions took the objects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -576,13 +575,14 @@ async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables(
     );
 
     assert!(
-        stock.partial.group_entries() > MAX_TIGHTENED_GROUP_ENTRIES,
-        "the stock session held only {} group entries, at or below the \
-         {MAX_TIGHTENED_GROUP_ENTRIES} the tightened session is held to, so that \
-         bound proves nothing. Either DataFusion now bounds the partial stage on \
-         its own, or the fixture stopped giving every partition a full-sized \
-         hash table; both the fixture and the bound need rewriting, not \
-         relaxing.",
+        stock.partial.group_entries() >= DISTINCT,
+        "the stock session held only {} group entries, under one full table of \
+         {DISTINCT}, so no partition built the table that follows DISTINCT and \
+         the per-partition bound of 2 x {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS} \
+         the tightened session is held to proves nothing. Either DataFusion now \
+         bounds the partial stage on its own, or the fixture stopped giving a \
+         partition that takes an object a full-sized hash table; both the \
+         fixture and the bound need rewriting, not relaxing.",
         stock.partial.group_entries()
     );
 }

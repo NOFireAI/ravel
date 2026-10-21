@@ -1041,7 +1041,7 @@ pub(super) fn visit_order(segments: &[SegmentRef], by_min_ts: bool) -> Vec<usize
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod owned_work_tests {
+mod unit_queue_tests {
     //! ADR-0102 decision 1 and ADR-2414 decision A1: [`PlanCounts::publish`]
     //! publishes runs of whole row groups (whole segments without a read
     //! cache) and partitions take them one at a time from a [`UnitQueue`], so
