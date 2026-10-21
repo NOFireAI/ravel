@@ -2929,7 +2929,9 @@ async fn generate_dataset(
             writer_epoch: 1,
             writer_seq,
             object_size: bytes.len() as u64,
-            content_hash: [0u8; 32],
+            // The read cache keys on `(tenant, content_hash, offset, object_size)`,
+            // so each object needs its own hash or equal-size objects share entries.
+            content_hash: *blake3::hash(&bytes).as_bytes(),
             sample_count: chunk.len() as u64,
             series_count: 1,
             min_event_ts_ns: min,
@@ -6907,6 +6909,86 @@ mod tests {
             json.get("load_wall_ms").is_some(),
             "load_wall_ms must be present in JSON when the lane actually loaded: {json}"
         );
+    }
+
+    /// Every object `generate_dataset` writes carries the BLAKE3 of its own
+    /// bytes as its commit record's `content_hash`, and no two share one: the
+    /// read cache keys on that hash plus offset and size, so a shared hash
+    /// serves one equal-size object's bytes for another. Stamping `[0u8; 32]`
+    /// back in the generator fails both assertions.
+    #[tokio::test]
+    async fn generated_objects_carry_their_own_content_hash() {
+        let store = empty_store();
+        let tenant = TenantId::new("content-hash-gen-tenant");
+        let cfg = GenerateConfig {
+            store: Arc::clone(&store),
+            store_backend: "memory".to_string(),
+            region: "n/a".to_string(),
+            endpoint: "n/a".to_string(),
+            entries: Vec::new(),
+            runs: 1,
+            records: 12,
+            records_per_object: 3,
+            extra_attrs: 0,
+            max_query_bytes: DEFAULT_MAX_QUERY_BYTES,
+            cache_bytes: 0,
+            deadline: Duration::from_secs(30),
+            continue_on_error: false,
+            fetch_concurrency: DEFAULT_FETCH_CONCURRENCY,
+            sql_partition_count: None,
+            store_get_concurrency: None,
+            progress_jsonl: None,
+            tenant_max_bytes: DEFAULT_TENANT_MAX_BYTES,
+            parallel_final_aggregation: false,
+            max_segments: DEFAULT_MAX_SEGMENTS,
+            explain_dir: None,
+            warm_catalog: false,
+            logs_suffix_len: None,
+            logs_request_cost_bytes: None,
+            logs_fetch_policy: LogsFetchPolicy::ByteMinimal,
+            logs_block_range_threshold: None,
+            store_cost_profile: StoreCostProfile::reference(),
+        };
+        generate_dataset(&store, &tenant, &cfg)
+            .await
+            .expect("generate dataset");
+
+        let catalog = Catalog::new(
+            Arc::clone(&store),
+            CatalogConfig {
+                shard_count: 1,
+                ..CatalogConfig::default()
+            },
+        )
+        .expect("catalog");
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: NOW_NS,
+        };
+        let snapshot = catalog
+            .resolve(&tenant.hash(), Signal::Logs, window, &[], NOW_NS)
+            .await
+            .expect("resolve generated tenant");
+        assert_eq!(snapshot.segments.len(), 4, "12 records at 3 per object");
+
+        let mut seen = std::collections::HashSet::new();
+        for seg in &snapshot.segments {
+            let got = store
+                .get(&seg.data_object_key, ravel_object_store::GetRange::Full)
+                .await
+                .expect("read generated object");
+            assert_eq!(
+                seg.content_hash,
+                *blake3::hash(&got.data).as_bytes(),
+                "content_hash of {} is not the BLAKE3 of its bytes",
+                seg.data_object_key
+            );
+            assert!(
+                seen.insert(seg.content_hash),
+                "{} shares its content_hash with another segment",
+                seg.data_object_key
+            );
+        }
     }
 
     /// `--inject-get-delay-ms` exists to prove where the scan's timing
