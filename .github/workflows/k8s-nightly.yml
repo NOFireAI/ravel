@@ -52,8 +52,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 55
     env:
-      RUSTC_WRAPPER: sccache
-      SCCACHE_GHA_ENABLED: "true"
       RAVEL_SERVER_IMAGE: ravel-server:kind-ci
       RAVEL_OPERATOR_IMAGE: ravel-operator:kind-ci
     steps:
@@ -63,14 +61,14 @@ jobs:
       - uses: ./.github/actions/free-disk-space
       - name: Install toolchain from rust-toolchain.toml
         run: rustup show
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Build the release binaries on the host
-        run: |
-          cargo build --release --locked -p ravel-server --features sql,flight-sql,otap
-          cargo build --release --locked -p ravel-cli
-          cargo build --release --locked -p ravel-operator
+      # Inside the root Dockerfile's builder image, so the binaries link
+      # against the shipping base's glibc rather than the runner's (#3146).
+      # sccache does not reach into that container, so this job no longer
+      # installs it; rust-cache still restores target/ and the cargo caches
+      # the container builds into.
+      - name: Build the release binaries in the builder image
+        run: scripts/build-prebuilt-binaries.sh
       - name: Assemble both images from the prebuilt binaries
         run: |
           ctx=$(mktemp -d)

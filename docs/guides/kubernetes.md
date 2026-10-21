@@ -149,17 +149,21 @@ is tested.
   of `kind-up.sh`, so there is only one pinned digest. The job fails if the
   cluster it expects is not there, so a name drift cannot silently create a
   second cluster.
-- The runner builds the two release binaries, where the workflow's cargo and
-  sccache caches apply. `Dockerfile.prebuilt` (the runtime stages only) then
-  assembles the images from them under `RAVEL_SKIP_IMAGE_BUILD=1`.
+- `scripts/build-prebuilt-binaries.sh` builds the release binaries inside
+  the root `Dockerfile`'s builder image, against the target and cargo caches
+  the workflow restores on the runner. `Dockerfile.prebuilt` (the runtime
+  stages only) then assembles the images from them under
+  `RAVEL_SKIP_IMAGE_BUILD=1`.
   - The root `Dockerfile`'s builder stage recompiles the workspace inside
     Docker with no cache, which was measured at 57 minutes.
   - The job smoke-runs `--help` in both assembled images before it creates
     the cluster. A binary that cannot exec on the runtime base then fails
     with the dynamic linker's message, and not as a `CrashLoopBackOff`.
-  - Binaries built on the runner need a newer glibc than the shipping image's
-    Debian 12 base has, so the CI images use a Debian 13 distroless base.
-    `Dockerfile.prebuilt` records the measured symbols and the alternatives.
+  - Building in the builder image gives the binaries the shipping build's
+    glibc, so the CI images use the same Debian 12 distroless base as the
+    shipping image. Binaries built on the runner itself would link against
+    the runner's newer glibc and fail to exec there; `Dockerfile.prebuilt`
+    records the measured symbols.
 
 `kind-demo.sh` asserts the round-trip value and exits nonzero on any failure,
 so the job needs no extra proof-of-run check over its output.

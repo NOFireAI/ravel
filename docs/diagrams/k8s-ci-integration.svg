@@ -40,22 +40,22 @@
 
   <rect x="40" y="300" width="280" height="70" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="180" y="322" font-size="12.5" font-weight="bold" text-anchor="middle" fill="#17191c">cargo build --release</text>
-  <text x="180" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">on the runner (host), sccache-warmed;</text>
+  <text x="180" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">in the builder image, cache-warmed;</text>
   <text x="180" y="352" font-size="10.5" text-anchor="middle" fill="#17191c">--features sql,flight-sql,otap, as the shipping build</text>
 
   <line x1="320" y1="335" x2="360" y2="335" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
   <rect x="360" y="300" width="280" height="70" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
   <text x="500" y="322" font-size="12.5" font-weight="bold" text-anchor="middle" fill="#17191c">Dockerfile.prebuilt</text>
-  <text x="500" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">runtime-only stage, COPYs the two host binaries</text>
+  <text x="500" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">runtime-only stage, COPYs the prebuilt binaries</text>
   <text x="500" y="352" font-size="10.5" text-anchor="middle" fill="#17191c">RAVEL_SKIP_IMAGE_BUILD=1 tells kind-up.sh not to rebuild</text>
 
   <line x1="640" y1="335" x2="680" y2="335" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <rect x="680" y="300" width="250" height="70" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2" stroke-dasharray="5,4"/>
-  <text x="805" y="320" font-size="12.5" font-weight="bold" text-anchor="middle" fill="#17191c">distroless/cc-debian13</text>
-  <text x="805" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">host-built binaries need a newer glibc</text>
-  <text x="805" y="352" font-size="10.5" text-anchor="middle" fill="#17191c">than debian12 ships: CI-lane-only base</text>
+  <rect x="680" y="300" width="250" height="70" rx="6" fill="#a9c9e6" stroke="#1f4e79" stroke-width="2"/>
+  <text x="805" y="320" font-size="12.5" font-weight="bold" text-anchor="middle" fill="#17191c">distroless/cc-debian12</text>
+  <text x="805" y="338" font-size="10.5" text-anchor="middle" fill="#17191c">same base as the shipping image:</text>
+  <text x="805" y="352" font-size="10.5" text-anchor="middle" fill="#17191c">binaries share its glibc (2.36)</text>
 
   <line x1="805" y1="370" x2="805" y2="410" stroke="#383e46" stroke-width="2" marker-end="url(#arrow)"/>
 

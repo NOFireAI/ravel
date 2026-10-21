@@ -145,8 +145,10 @@ DOCKERFILE_EXPECTED_IMAGE_COUNT=5
 # when k8s-nightly.yml's `chaos` job gained an upload-artifact step for the
 # scenarios' process logs on failure (issue #2666). Lowered 112->110 when
 # ci.yml's per-PR `quickstart` job was removed (ADR-0081 A6): a checkout and a
-# rust-cache.
-WORKFLOW_EXPECTED_ACTION_COUNT=110
+# rust-cache. Lowered 110->109 when k8s-nightly.yml's `k8s-build` job moved its
+# cargo build into the builder image and dropped its sccache-action step,
+# which no longer reached the build (#3146).
+WORKFLOW_EXPECTED_ACTION_COUNT=109
 
 # Exact number of `image:` lines across the two quickstart compose files:
 # ravel.yml's six (rustfs, createbucket (aws-cli), qualify, ravel-server,
