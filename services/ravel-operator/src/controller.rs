@@ -1605,14 +1605,13 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
                     qualify_failure_count,
                     qualify_next_retry_time,
                     qualify_retry_hash,
-                    // The pass may have applied the accounts, or failed before
-                    // its sweep finished: keep the marker so a later pass
-                    // still sweeps.
-                    pod_identity_service_accounts: pod_identity_service_accounts_marker(
-                        &obj.spec,
-                        pod_identity_service_accounts_recorded(&obj),
-                        false,
-                    ),
+                    // Carry the persisted marker unchanged. The pass may have
+                    // failed before applying any account (an unset sidecar
+                    // image is refused first), so setting it here could make
+                    // a later static pass delete accounts the operator never
+                    // applied; a missed set only orphans them.
+                    pod_identity_service_accounts: pod_identity_service_accounts_recorded(&obj)
+                        .then_some(true),
                 },
                 degraded_conditions,
                 obj.status
