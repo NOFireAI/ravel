@@ -4318,7 +4318,7 @@ second read. When the scan opens such objects unplanned (ADR-2677 decision
 nothing past the tail and KEY_IDX and plans nothing, and the scan reads each
 object the probe keeps whole once. When the scan plans them, the unkeyed plan
 takes that one read, or leaves it to the scan when the skip index alone
-decides the survivor count (#761).
+decides the survivor count.
 
 A key counts as a block predicate (`LogQuery::is_block_predicate_free`), so a
 `trace_id`-only query on a tenant that indexes `trace_id` no longer takes the
