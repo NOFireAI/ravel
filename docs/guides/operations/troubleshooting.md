@@ -1485,14 +1485,22 @@ as [typed column fallback climbs](#typed-column-fallback-climbs).
 **Symptom.** The resident memory of a server runs well above what its ledgers
 account for (`ravel_memory_reserved_bytes` plus `ravel_cache_resident_bytes`).
 
-**Confirm.** First read `ravel_process_allocator_bytes` on `/metrics`. It
-splits the memory of the process three ways:
+**Confirm.** First read `ravel_process_allocator_bytes` on `/metrics`. Its
+`resident`, `active` and `allocated` samples split the resident memory of the
+process three ways:
 
 | Figure | Meaning |
 |---|---|
 | `stat="resident"` minus `stat="active"` | Pages that the allocator holds but has not returned to the operating system. A large figure here is allocator retention, and no buffer is to blame. |
 | `stat="active"` minus `stat="allocated"` | Size-class fragmentation inside live allocations. |
 | `stat="allocated"` | The live allocations. If this is close to resident, live buffers hold the memory, and a heap profile names the allocation sites. |
+
+Two more samples describe address space rather than resident memory:
+`stat="mapped"` is the bytes the allocator has mapped for its active extents,
+an upper bound on how much of the process's memory is allocator mappings, and
+`stat="retained"` is virtual memory the allocator keeps reserved for reuse
+instead of unmapping it. `retained` holds no physical pages, so never subtract
+it from a resident figure.
 
 Freed pages that jemalloc has not yet returned count toward `stat="resident"`.
 At startup the server enables jemalloc's background thread, which returns

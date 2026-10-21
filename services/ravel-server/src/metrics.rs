@@ -15234,10 +15234,12 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         );
     }
 
-    /// Exact figures (#1170), not `> 0`: on a jemalloc build the five stats
-    /// render as five distinct samples under their own `stat=` label, with
-    /// the values passed straight through, and the allocator-name info series
-    /// does not also render.
+    /// Exact figures (#1170), not `> 0`: on a jemalloc build `allocated`,
+    /// `active` and `resident` render as distinct samples under their own
+    /// `stat=` label, with the values passed straight through, and the
+    /// allocator-name info series does not also render. `mapped` and
+    /// `retained` are pinned by
+    /// `allocator_family_renders_each_of_five_stats_exactly_once`.
     #[test]
     fn allocator_family_renders_jemalloc_exact_figures() {
         let mut out = String::new();
