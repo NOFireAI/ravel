@@ -241,24 +241,21 @@ const UNSEATED: (usize, usize) = (usize::MAX, usize::MAX);
 /// predicate of the same shape. When the answer lies at most
 /// [`MAX_CURSOR_WALK`] points ahead of `hint` it is reached by walking;
 /// otherwise (behind `hint`, further ahead, or `hint` past the end) it is
-/// found by binary search over the side of `hint` that holds it. The point
-/// [`MAX_CURSOR_WALK`] ahead of `hint` is tested before any walk, so an answer
-/// past it is searched for without walking to it. The `bool` says whether a
-/// search ran. `pred` must be true on a prefix of `points` and false on the
-/// rest, which ascending `ts_ns` gives both bound predicates.
+/// found by binary search over the side of `hint` that holds it. The `bool`
+/// says whether a search ran. `pred` must be true on a prefix of `points` and
+/// false on the rest, which ascending `ts_ns` gives both bound predicates.
 fn seek<P>(points: &[P], hint: usize, pred: impl Fn(&P) -> bool) -> (usize, bool) {
     if hint > points.len() || (hint > 0 && !pred(&points[hint - 1])) {
         let end = hint.min(points.len());
         return (points[..end].partition_point(pred), true);
     }
-    let far = hint.saturating_add(MAX_CURSOR_WALK);
-    if points.get(far).is_some_and(&pred) {
-        return (far + points[far..].partition_point(pred), true);
-    }
-    let stop = far.min(points.len());
+    let stop = hint.saturating_add(MAX_CURSOR_WALK).min(points.len());
     let mut at = hint;
     while at < stop && pred(&points[at]) {
         at += 1;
+    }
+    if at == stop && at < points.len() && pred(&points[at]) {
+        return (at + points[at..].partition_point(pred), true);
     }
     (at, false)
 }
@@ -1030,29 +1027,6 @@ mod tests {
             2,
             "and the cursors walk on from there"
         );
-    }
-
-    #[test]
-    fn a_jump_past_the_walk_tests_the_far_point_and_searches_without_walking() {
-        let ts: Vec<i64> = (0..10_000).collect();
-        let points = samples(&ts);
-        let hint = 100usize;
-        let far = hint + MAX_CURSOR_WALK;
-        let target = 5_000i64;
-        let visited = RefCell::new(Vec::new());
-        let (at, searched) = seek(&points, hint, |p| {
-            visited.borrow_mut().push(p.ts_ns);
-            p.ts_ns < target
-        });
-        assert_eq!((at, searched), (5_000, true));
-        let visited = visited.into_inner();
-        // The guard on `hint - 1`, then the far-end check, then the search.
-        assert_eq!(&visited[..2], &[hint as i64 - 1, far as i64]);
-        assert!(
-            visited[2..].iter().all(|&ts| ts >= far as i64),
-            "no point between the hint and the far end is tested: {visited:?}"
-        );
-        assert!(visited.len() <= 2 + 15, "{}", visited.len());
     }
 
     #[test]

@@ -628,16 +628,18 @@ cached entry keeps the lower and upper slice bounds of the previous step.
 The cursors are built by the first request narrower than the entry's window,
 so a read only ever sliced over exactly its own window (an uncached read, or
 a per-step read of a fallen-back key) builds none (issue #3150).
-The next step walks forward from them for at most 64 samples. The sample 64
-past the cursor is tested first, so a bound beyond it is searched for without
-the walk (issue #3150). A request that
-starts before the previous one, or that lies past 64 samples, is found
+The next step walks forward from them for at most 64 samples. A request that
+starts before the previous one, or that would walk past 64 samples, is found
 by binary search over the part of the series the cursor rules out, so every
 slice is the exact `partition_point` bound whatever the cursor holds. 1c's
 objection that a cursor is valid only outside subqueries does not apply to a
 cursor kept as a hint: an inner grid that restarts behind the previous outer
 step's last inner step costs one binary search per series, which is what
-every step cost before. A cap-refused replacement now also drops the entry it
+every step cost before. A far-end probe of the sample 64 past the cursor
+before the walk was tried and cost 1.028x at 24 h x 200 and 1.040x at 24 h x
+1000 on the compound arm for 0.994x on a long-step jump shape, measured
+2026-10-21 (issue #3150, medians of 5 rounds alternating with main), so
+`seek` keeps the walk. A cap-refused replacement now also drops the entry it
 would have replaced, with its bytes and memory budget reservation.
 
 Decision 1's bare-arm row is restated one-sided. A two-sided band against
