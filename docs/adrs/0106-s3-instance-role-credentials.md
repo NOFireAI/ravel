@@ -128,7 +128,9 @@ external dependency enters the workspace.
   SSE-KMS routing is enabled.
 - No persistent format, object key layout, proto schema, or commit
   protocol changes. EKS IRSA and ECS task roles are out of scope and
-  fit later as additive enum variants.
+  fit later as additive enum variants. (EKS Pod Identity is served
+  without a new variant, by an operator sidecar writing the
+  credentials file: see the Pod Identity sidecar amendment below.)
 
 ## Structure
 
@@ -180,7 +182,9 @@ logs inside the boundary.
 - Keep ADR-0072's `credentials_file` as the EC2 story (an external
   sidecar rotates a file). Rejected: still places long-lived material
   on disk and adds a moving part per instance, which is exactly what
-  instance roles remove.
+  instance roles remove. This rejection is about EC2; on Kubernetes the
+  Pod Identity sidecar amendment below adopts the sidecar shape for
+  short-lived role credentials on a memory-backed volume.
 
 ## Consequences
 
@@ -212,3 +216,68 @@ logs inside the boundary.
   the mock IMDS and assert the constructed backend serves reads,
   proving the capability is reachable from the shipped binary path,
   not just unit-tested in the crate.
+
+## Amendment (2026-10-21): the Pod Identity sidecar amendment
+
+<!-- amendment-applies: sections="Rejected alternatives|What does not change" pointer="Pod Identity sidecar amendment" -->
+
+`InstanceRole` cannot serve a Kubernetes cluster that wants one role per
+tier. `instance_role.rs` speaks EC2 IMDSv2 only: a PUT for a session token
+and a GET of the role document at 169.254.169.254. On an EKS node that
+document is the node's instance role, which every pod on the node shares.
+It is never a per-pod or per-tier role, so the gateway, query and maintain
+tiers would all hold the same grant, and so would every other workload
+scheduled on the node. That defeats the per-role scoping of ADR-0055.
+
+EKS Pod Identity gives each (namespace, ServiceAccount) pair its own role.
+The Pod Identity webhook injects two variables into a pod whose
+ServiceAccount has an association: `AWS_CONTAINER_CREDENTIALS_FULL_URI`
+(the node-local agent, `http://169.254.170.23/v1/credentials`) and
+`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`. The token file is a
+kubelet-projected ServiceAccount token (audience `pods.eks.amazonaws.com`,
+`expirationSeconds: 86400`). The kubelet rotates it; the agent only
+validates it, calls `AssumeRoleForPodIdentity`, and answers with
+`AccessKeyId`, `SecretAccessKey`, `Token` and an RFC 3339 `Expiration`.
+
+Decision: the operator serves Pod Identity with a credentials sidecar, not
+with a new `S3AuthMode` variant.
+
+- `ravel-operator pod-identity-credentials --output <path>` is a
+  subcommand of the operator binary, shipped in the operator image. It
+  reads the two variables (no defaults), does one GET with the token
+  file's contents as the `Authorization` header, re-reading the token file
+  on every fetch, and writes ADR-0072's credentials file
+  `{access_key_id, secret_access_key, session_token}` atomically. It
+  refreshes before the agent's `Expiration` and keeps the old file when a
+  refresh fails.
+- Under `storage.s3.auth: podIdentity` the operator renders it as a native
+  sidecar in every tier pod and in the qualify Job, writing to a
+  memory-backed `emptyDir`. `ravel-server` and `ravel-cli` run unchanged
+  under `--s3-auth static` with `--s3-credentials-file`, and pick each
+  rewrite up through ADR-0072's mtime re-read.
+- The operator process fetches its own pod's credentials in memory with
+  the same fetch code, for its `sys/auth` and reshard writes. It writes no
+  file.
+
+The sidecar rejection in Rejected alternatives was about EC2, and its
+reasons do not carry over. The material is short-lived (the agent's
+`Expiration`, hours, not a long-lived key), it sits on tmpfs
+(`medium: Memory`) with mode 0600 and never on the node's disk, and the
+moving part ships in the image the operator already runs. It is also the
+only shape that leaves `ravel-object-store` and `ravel-server` untouched,
+which the v0.25 release requires.
+
+The "no credential-chain magic" contract holds: the sidecar is selected
+explicitly by `storage.s3.auth: podIdentity`, it refuses to start without
+both variables, and nothing infers a credential source from absence. Ravel
+still never calls STS; the agent does. IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE`
+and `AssumeRoleWithWebIdentity`) and ECS task roles stay out of scope, as
+What does not change says.
+
+One wart remains. `ravel-server` and `ravel-cli` require
+`RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` under `--s3-auth static`
+even when `--s3-credentials-file` is set, although the store ignores them
+once the file is set. The operator renders the literal
+`unused-credentials-file-wins` for both under `podIdentity`. Making the two
+variables optional when the file is set is a server and CLI change left to
+a follow-up.

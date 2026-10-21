@@ -72,7 +72,9 @@ exists for disk-hungry jobs.
    - `storage.s3`: `bucket`, `region` (default us-east-1), optional
      `endpoint`, `credentialsSecretRef` (keys `accessKeyId`,
      `secretAccessKey`, injected as `RAVEL_S3_ACCESS_KEY` /
-     `RAVEL_S3_SECRET_KEY` via `valueFrom`). The memory store is not
+     `RAVEL_S3_SECRET_KEY` via `valueFrom`; optional since
+     `storage.s3.auth: podIdentity`, see the Pod Identity storage
+     credentials amendment below). The memory store is not
      representable in the CRD: a non-durable per-process store is
      incoherent across multiple pods. This is a deliberate mismatch
      with the CLI, stated here rather than papered over.
@@ -603,3 +605,63 @@ the same ~140 s for scheduling and image pull, is 1185 s per attempt.
 `one_attempt_at_the_default_page_size_issues_the_budgeted_requests` pins the
 request counts, and ravel-operator's `qualify_job_bounds_a_hung_attempt`
 pins the deadline.
+
+## Amendment (2026-10-21): the Pod Identity storage credentials amendment
+
+<!-- amendment-applies: sections="Decision" pointer="Pod Identity storage credentials amendment" -->
+
+Decision 2's `storage.s3` gains `auth: static | podIdentity` (default
+`static`). `static` is the decision as written and renders exactly as
+before. `podIdentity` runs every pod the operator renders, and the
+operator itself, on EKS Pod Identity roles, with no key in any Secret
+(ADR-0106, Pod Identity sidecar amendment).
+
+- **The field.** `storage.s3.credentialsSecretRef` becomes optional. A CEL
+  rule on `storage.s3` requires it under `static`; a second rule on `spec`
+  refuses the per-tier `credentialsSecretRef` overrides (ADR-0055 section
+  5) under `podIdentity`, where each tier's role is chosen by its
+  ServiceAccount instead. Only EKS Pod Identity is supported; IRSA is not.
+- **Owned ServiceAccounts.** Under `podIdentity` the operator creates
+  `<name>-gateway`, `<name>-query`, `<name>-maintain` and `<name>-qualify`,
+  owned by the `RavelCluster`, and sets `serviceAccountName` on the three
+  tier pods and the qualify Job pod. The cluster's Pod Identity
+  associations name these four. They are applied before the qualification
+  gate, because the gate creates the qualify Job and returns, and a Job pod
+  naming a ServiceAccount that does not exist is refused on every creation
+  attempt. They are deleted again when the cluster switches back to
+  `static`. The names are reserved for the operator in both modes.
+- **The native sidecar.** Each of those pods gets an initContainer
+  `pod-identity-credentials` with `restartPolicy: Always` (a native
+  sidecar: on by default since Kubernetes 1.29 and stable in 1.33, so
+  inside the 1.30 floor). It runs
+  `ravel-operator pod-identity-credentials --output
+  /var/run/ravel/aws/credentials.json` on a memory-backed `emptyDir`
+  (`sizeLimit: 1Mi`), and a startup probe execs the same binary with
+  `--probe`, so the server container starts only once the file exists.
+  The server container mounts the volume read-only and gets
+  `--s3-credentials-file`; the Job's `ravel-cli` gets
+  `RAVEL_S3_CREDENTIALS_FILE`. Both images run as the distroless `nonroot`
+  user, so the 0600 file the sidecar writes is readable by the server.
+- **The sidecar image.** The operator cannot read its own pod's image (no
+  downward API field carries it, and its RBAC has no `pods get`), so it
+  takes `--credentials-sidecar-image` (env
+  `RAVEL_CREDENTIALS_SIDECAR_IMAGE`), which must name the operator's own
+  image. A `podIdentity` cluster reconciled without it is `Degraded` with
+  reason `CredentialsSidecarImageUnset`.
+- **The operator's own credentials.** For `sys/auth` and the
+  `shardOverrides` reshard the operator fetches its own pod's Pod Identity
+  credentials in memory, with the sidecar's fetch code, and caches them
+  until the same refresh point. Without the two Pod Identity variables in
+  its environment the cluster is `Degraded` with reason
+  `PodIdentityCredentialsUnavailable`. The `ravel-system/ravel-operator`
+  ServiceAccount therefore needs its own association.
+- **The placeholder env.** `ravel-server` and `ravel-cli` still require
+  `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` under `--s3-auth static`
+  even with a credentials file, which wins over them. Under `podIdentity`
+  the operator sets both to the literal `unused-credentials-file-wins`
+  until those binaries make them optional.
+- **Bootstrap and qualification.** `podIdentity` counts as per-role
+  credentials, so the maintain-first `sys/gc` hold applies. The mode
+  enters the qualified-input hash only under `podIdentity`, so a `static`
+  cluster's hash, and its qualification, do not move on upgrade, while
+  switching modes re-runs qualification.
