@@ -983,9 +983,11 @@ the gate's size undercounts the decode's CPU work. The job's output is the
 compressed IPC bytes; arrow's reader decompresses the buffers inside them
 during the IPC decode, which runs on the stream's task, not on the gate, as
 task 9 already places it. That decompression is bounded in bytes, not moved
-onto the gate: before the IPC decoder runs, the stream reads each compressed
-buffer's declared uncompressed length from the IPC body and refuses a payload
-whose decoded buffers total more than the same per-payload cap, and arrow's
-reader rejects a buffer that does not decompress to exactly its declared
-length. So at most the cap, 16 MiB by default, of IPC body decompression per
-payload runs on the stream's task outside the gate.
+onto the gate: before the IPC decoder runs, the stream refuses a payload
+whose IPC body compression uses any codec other than ZSTD, reads each ZSTD
+buffer's declared uncompressed length from the IPC body, and refuses a payload
+whose decoded buffers total more than the same per-payload cap. For ZSTD,
+arrow's reader rejects a buffer that does not decompress to exactly its
+declared length; its LZ4_FRAME reader does not, which is why that codec is
+refused rather than sized. So at most the cap, 16 MiB by default, of IPC body
+decompression per payload runs on the stream's task outside the gate.
