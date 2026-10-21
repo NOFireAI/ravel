@@ -5,3 +5,5 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f1df126bd872629e94a5c9acf3dc8bdaaca450633bf5abbab0b5f0e51f6afadb # shrinks to shapes = [Planned([0], [0, 0, 0]), NoSurvivor], mins = [0, 0, 0, 0, 0, 0, 0], stripe = false, by_min_ts = false, n = 1, schedule = []
+cc 69ac4faa4fdb8546febdc9e3ccc98044d24aeee09db0daadd70cd597b4dd4490 # shrinks to shapes = [Planned([0, 4], [0, 0, 0])], mins = [0, 0, 0, 0, 0, 0, 0], stripe = true, by_min_ts = false, n = 1, schedule = []
+cc 2cad16c9fd299ce5103b89e779d124370447b0296608b15d29f0fc5fdb7e45da # shrinks to survivors = [{0, 1, 2}], keys = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], mode = 0, n = 1, schedule = []

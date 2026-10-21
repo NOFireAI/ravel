@@ -1509,7 +1509,12 @@ impl LogScanStream {
                         this.queue = this.round.as_ref().map(|round| {
                             round.queue(|| {
                                 let order = visit_order(&this.segments, this.topk.is_some());
-                                counts.publish(&this.segments, &order, this.stripe_blocks)
+                                counts.publish(
+                                    &this.segments,
+                                    &order,
+                                    this.stripe_blocks,
+                                    round.partitions(),
+                                )
                             })
                         });
                         this.state = LogScanState::NextSegment;
@@ -1614,7 +1619,7 @@ impl LogScanStream {
                             this.current_dirs = dirs;
                             // Moved, not cloned: this `OwnedSeg` open consumes its
                             // carried whole object exactly once, by whichever open
-                            // below `take()`s it first. With row-group units a
+                            // below `take()`s it first. With row-group runs a
                             // stream can reach this transition several times for
                             // the same segment, one `OwnedSeg` at a time, each
                             // with its own carry. A later `ReopenRows` reopen of

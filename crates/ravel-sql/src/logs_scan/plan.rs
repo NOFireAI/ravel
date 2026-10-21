@@ -492,14 +492,23 @@ async fn compute_plan_counts(
 }
 
 /// Which of a segment's blocks one published unit carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum UnitBlocks {
     /// An unplanned segment ([`PlanCounts::unplanned`]), opened whole.
     Unplanned,
-    /// One row group: a position into the segment's [`PlannedBlocks::groups`].
-    Group(usize),
+    /// A run of whole row groups, opened once: positions into the segment's
+    /// [`PlannedBlocks::groups`], ascending.
+    Groups(Vec<usize>),
     /// Every block the plan publishes for the segment.
     All,
+}
+
+/// How many row groups one run of a segment with `groups` surviving row
+/// groups holds when the scan has `partitions` partitions: `ceil(groups /
+/// partitions)`, so the segment splits into at most `min(groups, partitions)`
+/// runs and is opened at most that many times.
+fn run_len(groups: usize, partitions: usize) -> usize {
+    groups.div_ceil(partitions.max(1)).max(1)
 }
 
 impl PlanCounts {
@@ -538,28 +547,32 @@ impl PlanCounts {
         self.unplanned.get(seg_idx).copied().unwrap_or(false)
     }
 
-    /// The units this plan publishes, in publication order, as `(snapshot
-    /// segment index, blocks)` (ADR-0102 decision 1):
+    /// The units this plan publishes for `partitions` partitions, in
+    /// publication order, as `(snapshot segment index, blocks)` (ADR-0102
+    /// decision 1). With `stripe_blocks` a planned segment of `G` surviving
+    /// row groups is published as runs of [`run_len`]`(G, partitions)` row
+    /// groups, so it is opened at most `min(G, partitions)` times:
     ///
     /// - Under [`global_order`] (`stripe_blocks` with a confirmed ascending
-    ///   `ts` TopK), one unit per surviving row group and per unplanned
-    ///   segment, in that order.
+    ///   `ts` TopK), a segment's row groups are taken in the order they appear
+    ///   in the global sequence and each consecutive [`run_len`] of them is one
+    ///   run, published where its first row group sits in that sequence. Each
+    ///   unplanned segment is one unit at its own place.
     /// - With `stripe_blocks` otherwise, segments in `order` (see
-    ///   [`visit_order`]), each planned one as one unit per surviving row group
-    ///   in group order, each unplanned one as one unit.
+    ///   [`visit_order`]), each planned one as its runs of consecutive row
+    ///   groups in group order, each unplanned one as one unit.
     /// - Without `stripe_blocks`, one unit per segment in `order` that has a
     ///   surviving block or is unplanned.
     ///
     /// A segment with no surviving block publishes nothing.
-    pub(super) fn units(&self, order: &[usize], stripe_blocks: bool) -> Vec<(usize, UnitBlocks)> {
+    pub(super) fn units(
+        &self,
+        order: &[usize],
+        stripe_blocks: bool,
+        partitions: usize,
+    ) -> Vec<(usize, UnitBlocks)> {
         if let Some(global) = &self.global {
-            return global
-                .iter()
-                .map(|unit| {
-                    let blocks = unit.group.map_or(UnitBlocks::Unplanned, UnitBlocks::Group);
-                    (unit.seg, blocks)
-                })
-                .collect();
+            return global_runs(global, self.segs.len(), partitions);
         }
         let mut units = Vec::new();
         for &seg_idx in order {
@@ -571,8 +584,13 @@ impl PlanCounts {
                 continue;
             };
             if stripe_blocks {
-                units
-                    .extend((0..planned.groups.len()).map(|pos| (seg_idx, UnitBlocks::Group(pos))));
+                let positions: Vec<usize> = (0..planned.groups.len()).collect();
+                let len = run_len(positions.len(), partitions);
+                units.extend(
+                    positions
+                        .chunks(len)
+                        .map(|run| (seg_idx, UnitBlocks::Groups(run.to_vec()))),
+                );
             } else {
                 units.push((seg_idx, UnitBlocks::All));
             }
@@ -590,8 +608,9 @@ impl PlanCounts {
         segments: &[SegmentRef],
         order: &[usize],
         stripe_blocks: bool,
+        partitions: usize,
     ) -> VecDeque<OwnedSeg> {
-        let units = self.units(order, stripe_blocks);
+        let units = self.units(order, stripe_blocks, partitions);
         let mut owners = vec![0usize; self.segs.len()];
         for &(seg_idx, _) in &units {
             if let Some(count) = owners.get_mut(seg_idx) {
@@ -622,7 +641,12 @@ impl PlanCounts {
                 let unit = self.segs.get(seg_idx)?.as_ref()?;
                 let planned = unit.planned.as_ref()?;
                 let indices = match blocks {
-                    UnitBlocks::Group(pos) => planned.groups.get(pos)?.clone(),
+                    UnitBlocks::Groups(run) => run
+                        .iter()
+                        .filter_map(|&pos| planned.groups.get(pos))
+                        .flatten()
+                        .copied()
+                        .collect(),
                     UnitBlocks::Unplanned | UnitBlocks::All => planned.groups.concat(),
                 };
                 let Carry { dirs, whole_object } = planned.carried.take();
@@ -742,6 +766,12 @@ pub(super) struct RoundTicket {
 }
 
 impl RoundTicket {
+    /// The scan's declared partition count, which sizes the runs the round's
+    /// queue publishes ([`PlanCounts::units`]).
+    pub(super) fn partitions(&self) -> usize {
+        self.rounds.members
+    }
+
     /// The round's queue, published by `publish` on the round's first call.
     pub(super) fn queue(&self, publish: impl FnOnce() -> VecDeque<OwnedSeg>) -> Arc<UnitQueue> {
         let mut state = self.rounds.lock();
@@ -841,6 +871,64 @@ pub(super) fn global_order(
         }
     }
     units.sort_unstable();
+    units
+}
+
+/// [`global_order`] coalesced into runs for `partitions` partitions: each
+/// segment's row groups, in the order the global sequence holds them, are cut
+/// into runs of [`run_len`] of them, and a run is published where its first
+/// row group sits. A segment of `G` row groups is then opened at most
+/// `min(G, partitions)` times. A run's positions are sorted ascending so its
+/// block indices ascend, which the subset open relies on. `segments` is the
+/// snapshot's segment count.
+fn global_runs(
+    global: &[GlobalUnit],
+    segments: usize,
+    partitions: usize,
+) -> Vec<(usize, UnitBlocks)> {
+    let mut groups = vec![0usize; segments];
+    for unit in global {
+        if unit.group.is_some()
+            && let Some(count) = groups.get_mut(unit.seg)
+        {
+            *count += 1;
+        }
+    }
+    let mut taken = vec![0usize; segments];
+    // Per segment, the index into `units` of its run still being filled.
+    let mut open_run: Vec<Option<usize>> = vec![None; segments];
+    let mut units: Vec<(usize, UnitBlocks)> = Vec::new();
+    for unit in global {
+        let Some(pos) = unit.group else {
+            units.push((unit.seg, UnitBlocks::Unplanned));
+            continue;
+        };
+        let (Some(count), Some(run), Some(&g)) = (
+            taken.get_mut(unit.seg),
+            open_run.get_mut(unit.seg),
+            groups.get(unit.seg),
+        ) else {
+            continue;
+        };
+        let starts_run = *count % run_len(g, partitions) == 0;
+        *count += 1;
+        match run {
+            Some(at) if !starts_run => {
+                if let Some((_, UnitBlocks::Groups(positions))) = units.get_mut(*at) {
+                    positions.push(pos);
+                }
+            }
+            _ => {
+                *run = Some(units.len());
+                units.push((unit.seg, UnitBlocks::Groups(vec![pos])));
+            }
+        }
+    }
+    for (_, blocks) in &mut units {
+        if let UnitBlocks::Groups(positions) = blocks {
+            positions.sort_unstable();
+        }
+    }
     units
 }
 
@@ -976,9 +1064,9 @@ pub(super) fn visit_order(segments: &[SegmentRef], by_min_ts: bool) -> Vec<usize
 #[allow(clippy::expect_used)]
 mod owned_work_tests {
     //! ADR-0102 decision 1 and ADR-2414 decision A1: [`PlanCounts::publish`]
-    //! publishes whole row groups (whole segments without a read cache) and
-    //! partitions take them one at a time from a [`UnitQueue`], so a row
-    //! group's blocks never split across partitions. Fixtures are
+    //! publishes runs of whole row groups (whole segments without a read
+    //! cache) and partitions take them one at a time from a [`UnitQueue`], so
+    //! a row group's blocks never split across partitions. Fixtures are
     //! writer-produced objects of one block per record, `GROUP_BLOCKS` blocks
     //! per row group.
 
@@ -994,10 +1082,10 @@ mod owned_work_tests {
     const GROUPS: usize = 3;
     const BLOCKS: usize = GROUPS * GROUP_BLOCKS;
 
-    fn object() -> Vec<u8> {
+    fn object(group_blocks: usize) -> Vec<u8> {
         let cfg = RlogConfig {
             block_target_records: 1,
-            group_target_blocks: GROUP_BLOCKS,
+            group_target_blocks: group_blocks,
             ..RlogConfig::default()
         };
         let identity = ObjectIdentity {
@@ -1030,7 +1118,13 @@ mod owned_work_tests {
     }
 
     fn dirs() -> Arc<SegmentDirectories> {
-        let obj = object();
+        dirs_grouped(GROUP_BLOCKS)
+    }
+
+    /// The directories of the fixture object written with `group_blocks`
+    /// blocks per row group.
+    fn dirs_grouped(group_blocks: usize) -> Arc<SegmentDirectories> {
+        let obj = object(group_blocks);
         Arc::new(
             RlogReader::decode_directories(&obj[..], &RlogConfig::default()).expect("directories"),
         )
@@ -1072,8 +1166,19 @@ mod owned_work_tests {
         budget: &Arc<ravel_memory::MemoryBudget>,
         bytes: u64,
     ) -> Option<PlannedUnit> {
+        planned_seg_in(dirs(), indices, keys, budget, bytes)
+    }
+
+    /// [`planned_seg`] over the object whose directories are `dirs`.
+    fn planned_seg_in(
+        dirs: Arc<SegmentDirectories>,
+        indices: Vec<usize>,
+        keys: Option<Vec<i64>>,
+        budget: &Arc<ravel_memory::MemoryBudget>,
+        bytes: u64,
+    ) -> Option<PlannedUnit> {
         let mut planned =
-            PlannedBlocks::new(indices, dirs(), budget.reserve(bytes).expect("reserve"));
+            PlannedBlocks::new(indices, dirs, budget.reserve(bytes).expect("reserve"));
         if let Some(keys) = keys {
             assert_eq!(keys.len(), planned.groups.len());
             planned.group_min_ts = keys;
@@ -1122,15 +1227,16 @@ mod owned_work_tests {
         (owned.ordinal, owned.indices.clone(), owned.unplanned)
     }
 
-    /// The units `counts` publishes, in publication order.
+    /// The units `counts` publishes for `n` partitions, in publication order.
     fn published(
         counts: &PlanCounts,
         refs: &[SegmentRef],
         stripe: bool,
         by_min_ts: bool,
+        n: usize,
     ) -> Vec<Unit> {
         counts
-            .publish(refs, &visit_order(refs, by_min_ts), stripe)
+            .publish(refs, &visit_order(refs, by_min_ts), stripe, n)
             .iter()
             .map(unit)
             .collect()
@@ -1173,10 +1279,11 @@ mod owned_work_tests {
         owned.iter().map(|o| o.indices.clone()).collect()
     }
 
-    /// One object with more blocks (12) than partitions (3), striped: each row
-    /// group is one unit, so three partitions taking in turn own one whole
-    /// group each, and one partition taking every unit owns the three groups
-    /// as three whole units while the other two run empty.
+    /// One object with more blocks (12) than partitions (3), striped: with as
+    /// many partitions as row groups each run is one row group, so three
+    /// partitions taking in turn own one whole group each, and one partition
+    /// taking every unit owns the three groups as three whole units while the
+    /// other two run empty.
     ///
     /// Fails against publishing one unit per block (twelve single-block units,
     /// so partition 0 owns blocks 0, 3, 6 and 9 of three different groups) and
@@ -1186,7 +1293,7 @@ mod owned_work_tests {
     fn a_row_group_stays_with_one_owner() {
         let groups = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7], vec![8, 9, 10, 11]];
         let (counts, refs) = plan(1, true);
-        let queue = UnitQueue::new(counts.publish(&refs, &[0], true));
+        let queue = UnitQueue::new(counts.publish(&refs, &[0], true, 3));
         let (owned, _) = take_all(&queue, 3, &[0, 1, 2]);
         assert_eq!(
             owned.iter().map(|o| blocks(o)).collect::<Vec<_>>(),
@@ -1199,44 +1306,42 @@ mod owned_work_tests {
         );
 
         let (counts, refs) = plan(1, true);
-        let queue = UnitQueue::new(counts.publish(&refs, &[0], true));
+        let queue = UnitQueue::new(counts.publish(&refs, &[0], true, 3));
         let (owned, _) = take_all(&queue, 3, &[0]);
         assert_eq!(blocks(&owned[0]), groups);
         assert!(owned[1].is_empty() && owned[2].is_empty());
     }
 
     /// Without a TopK the striped plan publishes segments in snapshot order,
-    /// each as its row groups in sequence, and two partitions taking in turn
-    /// alternate through that one sequence across the segment boundary.
+    /// each as its runs of consecutive row groups in sequence, and two
+    /// partitions taking in turn alternate through that one sequence across
+    /// the segment boundary. With two partitions a segment's three row groups
+    /// make runs of `ceil(3 / 2) = 2` and 1, so each segment is opened twice,
+    /// not three times.
     ///
     /// Fails against publishing in [`global_order`] without a TopK (segment
-    /// 1's group 0, key 0, would precede segment 0's group 1, key 4) and
-    /// against publishing each segment as one unit.
+    /// 1's first run, key 0, would precede segment 0's second, key 8),
+    /// against one unit per row group (six units), and against publishing
+    /// each segment as one unit.
     #[test]
     fn striped_units_follow_visit_order_with_groups_in_sequence() {
         let (counts, refs) = plan(2, true);
         let order: Vec<Unit> = (0..2)
             .flat_map(|s| {
-                (0..GROUPS).map(move |g| {
-                    let group = (g * GROUP_BLOCKS..(g + 1) * GROUP_BLOCKS).collect();
-                    (s, group, false)
-                })
+                [
+                    (s, (0..2 * GROUP_BLOCKS).collect(), false),
+                    (s, group(2), false),
+                ]
             })
             .collect();
-        assert_eq!(published(&counts, &refs, true, false), order);
+        assert_eq!(published(&counts, &refs, true, false, 2), order);
 
         let (counts, refs) = plan(2, true);
-        let queue = UnitQueue::new(counts.publish(&refs, &[0, 1], true));
+        let queue = UnitQueue::new(counts.publish(&refs, &[0, 1], true, 2));
         let (owned, _) = take_all(&queue, 2, &[]);
         let units = |p: usize| owned[p].iter().map(unit).collect::<Vec<_>>();
-        assert_eq!(
-            units(0),
-            vec![order[0].clone(), order[2].clone(), order[4].clone()]
-        );
-        assert_eq!(
-            units(1),
-            vec![order[1].clone(), order[3].clone(), order[5].clone()]
-        );
+        assert_eq!(units(0), vec![order[0].clone(), order[2].clone()]);
+        assert_eq!(units(1), vec![order[1].clone(), order[3].clone()]);
     }
 
     /// A pruned survivor list is grouped by the object's own row-group
@@ -1281,7 +1386,7 @@ mod owned_work_tests {
     #[test]
     fn the_uncached_units_are_whole_segments() {
         let (counts, refs) = plan(3, false);
-        let queue = UnitQueue::new(counts.publish(&refs, &[0, 1, 2], false));
+        let queue = UnitQueue::new(counts.publish(&refs, &[0, 1, 2], false, 2));
         let (owned, _) = take_all(&queue, 2, &[]);
         let all: Vec<usize> = (0..BLOCKS).collect();
         let units: Vec<Vec<Unit>> = owned.iter().map(|o| o.iter().map(unit).collect()).collect();
@@ -1337,7 +1442,8 @@ mod owned_work_tests {
 
     /// An unplanned segment is one unit keyed by its `min_event_ts_ns`, so it
     /// is published between the groups whose keys bracket it; a group keyed
-    /// `i64::MIN` is published ahead of every other unit.
+    /// `i64::MIN` is published ahead of every other unit. With `GROUPS`
+    /// partitions every run is one row group.
     ///
     /// Fails against keying an unplanned segment by snapshot position (it
     /// would sort first or last) and against keying it at `i64::MIN`.
@@ -1352,7 +1458,7 @@ mod owned_work_tests {
         let refs = vec![seg_ref_at("a", 0), seg_ref_at("u", 5), seg_ref_at("b", 0)];
         let counts = assemble(segs, vec![false, true, false], &refs, true, true);
         assert_eq!(
-            published(&counts, &refs, true, true),
+            published(&counts, &refs, true, true, GROUPS),
             vec![
                 (2, vec![0, 1, 2, 3], false),
                 (0, vec![0, 1, 2, 3], false),
@@ -1369,19 +1475,28 @@ mod owned_work_tests {
     /// segment's blocks in ascending order and binary-searches
     /// [`OwnedSeg::indices`] on that assumption
     /// (`ravel-query/src/log_fetcher.rs`). One segment with group keys `[5,
-    /// 1]` publishes group 1 (key 1) ahead of group 0 (key 5), as two units.
+    /// 1]` publishes, for two partitions (runs of one group), group 1 (key 1)
+    /// ahead of group 0 (key 5) as two units; for one partition (one run of
+    /// both groups) one unit whose indices ascend although the run took group
+    /// 1 first.
     ///
-    /// Fails against publishing a segment's consecutive groups as one unit,
-    /// which gives indices `[4, 5, 6, 7, 0, 1, 2, 3]`.
+    /// Fails against concatenating a run's groups in the order the global
+    /// sequence holds them, which gives indices `[4, 5, 6, 7, 0, 1, 2, 3]`.
     #[test]
     fn descending_group_positions_publish_separate_units() {
         let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
-        let segs = vec![planned_seg((0..8).collect(), Some(vec![5, 1]), &budget, 0)];
+        let counts = |budget: &Arc<ravel_memory::MemoryBudget>| {
+            let segs = vec![planned_seg((0..8).collect(), Some(vec![5, 1]), budget, 0)];
+            assemble(segs, vec![false], &[seg_ref_at("a", 0)], true, true)
+        };
         let refs = vec![seg_ref_at("a", 0)];
-        let counts = assemble(segs, vec![false], &refs, true, true);
         assert_eq!(
-            published(&counts, &refs, true, true),
+            published(&counts(&budget), &refs, true, true, 2),
             vec![(0, vec![4, 5, 6, 7], false), (0, vec![0, 1, 2, 3], false)],
+        );
+        assert_eq!(
+            published(&counts(&budget), &refs, true, true, 1),
+            vec![(0, (0..8).collect(), false)],
         );
     }
 
@@ -1449,14 +1564,36 @@ mod owned_work_tests {
             (3, group(0), false),
             (2, group(1), false),
         ];
-        assert_eq!(published(&counts, &refs, true, true), global);
+        assert_eq!(
+            published(&counts, &refs, true, true, 3),
+            global,
+            "three partitions: every segment has at most three groups, so every run is one group"
+        );
+
+        // Two partitions: segments 0 and 1 (three groups) take runs of two,
+        // each run published where its first group sits in the global order.
+        let pair: Vec<usize> = group(0).into_iter().chain(group(1)).collect();
+        let runs = vec![
+            (5, group(0), false),
+            (0, pair.clone(), false),
+            (1, pair, false),
+            (4, vec![], true),
+            (0, group(2), false),
+            (1, group(2), false),
+            (2, group(0), false),
+            (3, group(0), false),
+            (2, group(1), false),
+        ];
+        let (segs, unplanned, refs) = global_fixture(&budget, [0; 4]);
+        let counts = assemble(segs, unplanned, &refs, true, true);
+        assert_eq!(published(&counts, &refs, true, true, 2), runs);
 
         let (segs, unplanned, refs) = global_fixture(&budget, [0; 4]);
         let counts = assemble(segs, unplanned, &refs, true, true);
-        let queue = UnitQueue::new(counts.publish(&refs, &visit_order(&refs, true), true));
+        let queue = UnitQueue::new(counts.publish(&refs, &visit_order(&refs, true), true, 2));
         let (owned, _) = take_all(&queue, 2, &[]);
         for (p, units) in owned.iter().enumerate() {
-            let expected: Vec<Unit> = global.iter().skip(p).step_by(2).cloned().collect();
+            let expected: Vec<Unit> = runs.iter().skip(p).step_by(2).cloned().collect();
             assert_eq!(units.iter().map(unit).collect::<Vec<_>>(), expected);
         }
 
@@ -1464,7 +1601,7 @@ mod owned_work_tests {
         let counts = assemble(segs, unplanned, &refs, false, true);
         let all = |n: usize| (0..n * GROUP_BLOCKS).collect::<Vec<usize>>();
         assert_eq!(
-            published(&counts, &refs, false, true),
+            published(&counts, &refs, false, true, 2),
             vec![
                 (5, all(1), false),
                 (0, all(3), false),
@@ -1484,9 +1621,27 @@ mod owned_work_tests {
             .chain([(4, vec![], true), (5, group(0), false)])
             .collect();
         assert_eq!(
-            published(&counts, &refs, true, false),
+            published(&counts, &refs, true, false, 3),
             snapshot,
             "no TopK: snapshot order, each segment's groups in sequence"
+        );
+        let (segs, unplanned, refs) = global_fixture(&budget, [0; 4]);
+        let counts = assemble(segs, unplanned, &refs, true, false);
+        let pair: Vec<usize> = (0..2 * GROUP_BLOCKS).collect();
+        assert_eq!(
+            published(&counts, &refs, true, false, 2),
+            vec![
+                (0, pair.clone(), false),
+                (0, group(2), false),
+                (1, pair, false),
+                (1, group(2), false),
+                (2, group(0), false),
+                (2, group(1), false),
+                (3, group(0), false),
+                (4, vec![], true),
+                (5, group(0), false),
+            ],
+            "no TopK, two partitions: runs of ceil(G/2) groups in group order"
         );
     }
 
@@ -1510,7 +1665,7 @@ mod owned_work_tests {
         let counts = assemble(segs, unplanned, &refs, true, true);
         assert_eq!(budget.reserved(), 111_100);
 
-        let queue = UnitQueue::new(counts.publish(&refs, &visit_order(&refs, true), true));
+        let queue = UnitQueue::new(counts.publish(&refs, &visit_order(&refs, true), true, 2));
         for planned in counts
             .segs
             .iter()
@@ -1566,13 +1721,16 @@ mod owned_work_tests {
         ];
         let refs = vec![seg_ref("a"), seg_ref("b")];
         let counts = assemble(segs, vec![false, false], &refs, true, false);
-        let publish = || counts.publish(&refs, &[0, 1], true);
         let rounds = Arc::new(UnitRounds::new(2));
+        let publish = || counts.publish(&refs, &[0, 1], true, 2);
+        let run = GROUPS.div_ceil(2);
 
         let first = rounds.join(0);
+        assert_eq!(first.partitions(), 2);
         let queue = first.queue(publish);
         let taken = queue.take_next().expect("a unit");
-        assert_eq!((taken.ordinal, taken.indices.clone()), (0, group(0)));
+        let first_run: Vec<usize> = (0..run).flat_map(group).collect();
+        assert_eq!((taken.ordinal, taken.indices.clone()), (0, first_run));
         drop(first);
         let second = rounds.join(1);
         let shared = second.queue(|| unreachable!("round 0 is published"));
@@ -1585,7 +1743,11 @@ mod owned_work_tests {
         while fresh.take_next().is_some() {
             reread += 1;
         }
-        assert_eq!(reread, 2 * GROUPS, "the re-execution reads every unit");
+        assert_eq!(
+            reread,
+            2 * 2,
+            "the re-execution reads every run, two per segment"
+        );
 
         assert_eq!(budget.reserved(), 110);
         drop(second);
@@ -1638,7 +1800,7 @@ mod owned_work_tests {
 
     /// Without both halves of the global precondition the plan publishes in
     /// visit order: striped, each planned segment's surviving row groups in
-    /// sequence; unstriped, each planned segment as one unit of its survivors;
+    /// sequence (three partitions, so every run here is one group); unstriped, each planned segment as one unit of its survivors;
     /// an unplanned segment as one unit either way, and nothing for an
     /// irrelevant segment or one with no survivor. Under a TopK without a read
     /// cache the visit order is ascending segment minimum.
@@ -1690,7 +1852,7 @@ mod owned_work_tests {
                 counts.global.is_none(),
                 "stripe {stripe} by_min_ts {by_min_ts}"
             );
-            let units = counts.publish(&refs, &visit_order(&refs, by_min_ts), stripe);
+            let units = counts.publish(&refs, &visit_order(&refs, by_min_ts), stripe, GROUPS);
             assert_eq!(
                 units.iter().map(unit).collect::<Vec<_>>(),
                 expected,
@@ -1725,14 +1887,18 @@ mod owned_work_tests {
         ]
     }
 
-    /// What a plan of `shapes` must publish, derived without [`PlanCounts`]:
-    /// per segment its expected row groups, its group keys, and the units in
-    /// publication order.
+    /// What a plan of `shapes` must publish for `n` partitions, derived
+    /// without [`PlanCounts`]: per segment its expected row groups, and the
+    /// units in publication order. A striped segment of `G` groups is cut into
+    /// runs of `ceil(G / n)` groups, taken in visit order by group position
+    /// and in the global order by key rank, each run published where its
+    /// first group would be.
     fn model(
         shapes: &[Shape],
         mins: &[i64],
         stripe: bool,
         by_min_ts: bool,
+        n: usize,
     ) -> (Vec<Vec<Vec<usize>>>, Vec<Unit>) {
         let groups: Vec<Vec<Vec<usize>>> = shapes
             .iter()
@@ -1750,6 +1916,7 @@ mod owned_work_tests {
             })
             .collect();
         let is_unplanned = |s: usize| matches!(shapes[s], Shape::Unplanned);
+        let run = |s: usize| groups[s].len().div_ceil(n);
         let units = if stripe && by_min_ts {
             let mut sorted: Vec<(i64, usize, Option<usize>)> = Vec::new();
             for (s, shape) in shapes.iter().enumerate() {
@@ -1762,13 +1929,25 @@ mod owned_work_tests {
                 }
             }
             sorted.sort();
-            sorted
-                .into_iter()
-                .map(|(_, s, g)| match g {
-                    None => (s, vec![], true),
-                    Some(g) => (s, groups[s][g].clone(), false),
-                })
-                .collect()
+            let mut units: Vec<Unit> = Vec::new();
+            let mut rank = vec![0usize; shapes.len()];
+            let mut open = vec![0usize; shapes.len()];
+            for (_, s, g) in sorted {
+                let Some(g) = g else {
+                    units.push((s, vec![], true));
+                    continue;
+                };
+                if rank[s].is_multiple_of(run(s)) {
+                    open[s] = units.len();
+                    units.push((s, vec![], false));
+                }
+                rank[s] += 1;
+                units[open[s]].1.extend(&groups[s][g]);
+            }
+            for unit in &mut units {
+                unit.1.sort_unstable();
+            }
+            units
         } else {
             let mut order: Vec<usize> = (0..shapes.len()).collect();
             if by_min_ts {
@@ -1782,7 +1961,10 @@ mod owned_work_tests {
                     } else if groups[s].is_empty() {
                         vec![]
                     } else if stripe {
-                        groups[s].iter().map(|g| (s, g.clone(), false)).collect()
+                        groups[s]
+                            .chunks(run(s))
+                            .map(|chunk| (s, chunk.concat(), false))
+                            .collect()
                     } else {
                         vec![(s, groups[s].concat(), false)]
                     }
@@ -1819,7 +2001,7 @@ mod owned_work_tests {
             schedule in proptest::collection::vec(0usize..6, 0..48),
         ) {
             let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
-            let (groups, expected) = model(&shapes, &mins, stripe, by_min_ts);
+            let (groups, expected) = model(&shapes, &mins, stripe, by_min_ts, n);
             let refs: Vec<SegmentRef> = (0..shapes.len())
                 .map(|s| seg_ref_at(&format!("seg{s}"), mins[s]))
                 .collect();
@@ -1845,7 +2027,7 @@ mod owned_work_tests {
             let counts = assemble(segs, unplanned, &refs, stripe, by_min_ts);
 
             let queue =
-                UnitQueue::new(counts.publish(&refs, &visit_order(&refs, by_min_ts), stripe));
+                UnitQueue::new(counts.publish(&refs, &visit_order(&refs, by_min_ts), stripe, n));
             let (owned, log) = take_all(&queue, n, &schedule);
             let taken: Vec<Unit> = log.iter().map(|(_, u)| u.clone()).collect();
             prop_assert_eq!(&taken, &expected);
@@ -1883,6 +2065,99 @@ mod owned_work_tests {
                 }
             }
             prop_assert!(queue.take_next().is_none());
+            drop(owned);
+            prop_assert_eq!(budget.reserved(), 0);
+            drop(counts);
+        }
+
+        /// Over an object of one-block row groups, so a segment's `G` is its
+        /// survivor count (1 to 12), with a read cache and no TopK, with a
+        /// read cache and the global order, and without a read cache: `n`
+        /// partitions open each segment at most `min(G, n)` times (exactly
+        /// once without a read cache), every surviving row group is read by
+        /// exactly one owner, each partition's units keep publication order,
+        /// and every unit's indices ascend.
+        ///
+        /// Fails against one unit per row group (a segment of `G > n` groups
+        /// opens `G` times), against runs cut to `floor(G / n)` (`n + 1` runs
+        /// when `n` does not divide `G`), and, in the global mode, against
+        /// cutting a run wherever another segment's group interleaves (the
+        /// interleaved case opens a segment once per alternation).
+        #[test]
+        fn runs_open_each_segment_at_most_min_groups_partitions_times(
+            survivors in proptest::collection::vec(
+                proptest::collection::btree_set(0..BLOCKS, 1..=BLOCKS),
+                1..4,
+            ),
+            keys in proptest::collection::vec(proptest::collection::vec(-4i64..16, BLOCKS), 3),
+            mode in 0usize..3,
+            n in 1usize..8,
+            schedule in proptest::collection::vec(0usize..8, 0..48),
+        ) {
+            let (stripe, by_min_ts) = [(true, false), (true, true), (false, false)][mode];
+            let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+            let dirs = dirs_grouped(1);
+            let refs: Vec<SegmentRef> = (0..survivors.len())
+                .map(|s| seg_ref(&format!("seg{s}")))
+                .collect();
+            let segs = survivors
+                .iter()
+                .zip(&keys)
+                .map(|(blocks, keys)| {
+                    planned_seg_in(
+                        dirs.clone(),
+                        blocks.iter().copied().collect(),
+                        Some(keys[..blocks.len()].to_vec()),
+                        &budget,
+                        1,
+                    )
+                })
+                .collect();
+            let counts = assemble(segs, vec![false; survivors.len()], &refs, stripe, by_min_ts);
+            prop_assert_eq!(counts.global.is_some(), stripe && by_min_ts);
+
+            let units = counts.publish(&refs, &visit_order(&refs, by_min_ts), stripe, n);
+            let order: Vec<Unit> = units.iter().map(unit).collect();
+            let queue = UnitQueue::new(units);
+            let (owned, _) = take_all(&queue, n, &schedule);
+
+            for (s, blocks) in survivors.iter().enumerate() {
+                let opens = owned.iter().flatten().filter(|o| o.ordinal == s).count();
+                let bound = if stripe { blocks.len().min(n) } else { 1 };
+                prop_assert!(
+                    (1..=bound).contains(&opens),
+                    "segment {} of {} groups opened {} times by {} partitions",
+                    s,
+                    blocks.len(),
+                    opens,
+                    n
+                );
+                for b in blocks {
+                    let owners = owned
+                        .iter()
+                        .flatten()
+                        .filter(|o| o.ordinal == s && o.indices.contains(b))
+                        .count();
+                    prop_assert_eq!(owners, 1, "segment {} block {}", s, b);
+                }
+            }
+            let read: usize = owned.iter().flatten().map(|o| o.indices.len()).sum();
+            prop_assert_eq!(read, survivors.iter().map(|b| b.len()).sum::<usize>());
+            for (p, units) in owned.iter().enumerate() {
+                let positions: Vec<usize> = units
+                    .iter()
+                    .map(|o| order.iter().position(|e| *e == unit(o)).expect("published"))
+                    .collect();
+                prop_assert!(
+                    positions.windows(2).all(|w| w[0] < w[1]),
+                    "partition {} took {:?}",
+                    p,
+                    positions
+                );
+                for o in units {
+                    prop_assert!(o.indices.windows(2).all(|w| w[0] < w[1]));
+                }
+            }
             drop(owned);
             prop_assert_eq!(budget.reserved(), 0);
             drop(counts);
@@ -2202,7 +2477,9 @@ mod carried_directory_reservation_tests {
             "the directories and the whole object are both reserved: {held}"
         );
 
-        let queue = UnitQueue::new(counts.publish(&segments, &[0], true));
+        // Published for three partitions, so each of the three runs is one
+        // row group and owner A can take a second run of the same segment.
+        let queue = UnitQueue::new(counts.publish(&segments, &[0], true, 3));
         {
             let slot = planned.carried.lock();
             assert!(slot.whole_object.is_none() && slot.dirs.is_none());
@@ -2399,13 +2676,14 @@ mod carried_directory_reservation_tests {
             .sum()
     }
 
-    /// Three segments of three row groups, striped over two partitions. A
-    /// segment's directories stay reserved while any owner is still on one of
-    /// its row groups and are released once every owner has finished it, not
-    /// when the statement ends.
+    /// Three segments of three row groups, striped over two partitions, so
+    /// each segment is two runs: groups 0 and 1, then group 2. A segment's
+    /// directories stay reserved while any owner is still on one of its runs
+    /// and are released once every owner has finished it, not when the
+    /// statement ends.
     ///
-    /// Partition 0 takes segment 0's group 0 and yields a batch; partition 1
-    /// then takes segment 0's group 1 and yields a batch, and stays on it.
+    /// Partition 0 takes segment 0's first run and yields a batch; partition 1
+    /// then takes segment 0's second run and yields a batch, and stays on it.
     /// Partition 0 drains every other unit: segments 1 and 2, which it alone
     /// owned, are released, and segment 0 is still reserved for partition 1,
     /// whose `attrs_raw` row-path reopens of it come after partition 0
@@ -2413,8 +2691,9 @@ mod carried_directory_reservation_tests {
     /// is still alive.
     ///
     /// Fails against releasing on the first owner's finish (segment 0 is gone
-    /// while partition 1 is still on it) and against never releasing (segments
-    /// 1 and 2 are still reserved once their only owner has finished them).
+    /// while partition 1 is still on it), against never releasing (segments
+    /// 1 and 2 are still reserved once their only owner has finished them),
+    /// and against one unit per row group (nine units, 18 reopens).
     #[tokio::test]
     async fn carried_directories_are_released_when_every_owner_finishes_the_segment() {
         use futures::StreamExt;
@@ -2495,8 +2774,8 @@ mod carried_directory_reservation_tests {
 
         let drained: Vec<RecordBatch> =
             first.map(|b| b.expect("partition 0 batch")).collect().await;
-        // Every unit but segment 0's group 1 (four blocks); segment 0's group 0
-        // is short of block 0, as is every segment's.
+        // Every unit but segment 0's second run (group 2, four blocks); every
+        // segment's first run is short of block 0.
         assert_eq!(
             rows(std::slice::from_ref(&head)) + rows(&drained),
             3 * (BLOCKS - 1) - 4
@@ -2520,10 +2799,13 @@ mod carried_directory_reservation_tests {
             "every segment's directories released while the exec is alive: {}",
             budget.reserved()
         );
+        // Every block overflows, so each unit's open falls back twice in a row
+        // and commits the rest of its blocks to the row path: two reopens per
+        // unit, and three segments of two runs each.
         assert_eq!(
             metric_total(&exec, "reopens"),
-            18,
-            "two `attrs_raw` reopens per unit, nine units"
+            12,
+            "two `attrs_raw` reopens per unit, six units"
         );
         drop(exec);
         assert_eq!(budget.reserved(), 0);
@@ -2532,19 +2814,23 @@ mod carried_directory_reservation_tests {
     /// The same release in the global order (issue #2694): a confirmed
     /// ascending `ts` TopK whose filter never publishes, so the scan publishes
     /// row groups in [`global_order`] and skips nothing. Three identical
-    /// segments whose groups key 1, 4 and 8 publish every segment's group 0,
-    /// then every group 1, then every group 2. The read cache admits nothing
-    /// (no entry fits in one byte).
+    /// segments whose groups key 1, 4 and 8 sort every segment's group 0,
+    /// then every group 1, then every group 2; over two partitions each
+    /// segment is two runs, so the queue publishes every segment's groups 0
+    /// and 1, then every segment's group 2. The read cache admits nothing (no
+    /// entry fits in one byte).
     ///
-    /// Partition 0 takes segment 0's group 0 and partition 1 segment 1's;
-    /// partition 0 drains the other seven units. Every slot handed its
+    /// Partition 0 takes segment 0's first run and partition 1 segment 1's;
+    /// partition 0 drains the other four units. Every slot handed its
     /// handles out at publication, so only segment 1, which partition 1 is
     /// still on, stays reserved; once partition 1 drains too, exactly segment
     /// 1's directories are released while the exec is still alive.
     ///
     /// Fails against an owner count above the number of published units (a
-    /// segment stays reserved after both partitions drain) and against
-    /// publishing in visit order (partition 1 would be on segment 0's group 1).
+    /// segment stays reserved after both partitions drain), against
+    /// publishing in visit order (partition 1 would be on segment 0's group
+    /// 2), and against one unit per row group (nine units: 18 reopens and 60
+    /// block decodes).
     #[tokio::test]
     async fn carried_directories_are_released_in_the_global_order() {
         use futures::StreamExt;
@@ -2621,11 +2907,15 @@ mod carried_directory_reservation_tests {
             .expect("a batch")
             .expect("partition 1 batch");
         let counts = exec.counts.get().expect("planned");
-        let groups = |pos: usize| (0..3).map(move |seg| (seg, UnitBlocks::Group(pos)));
+        let runs =
+            |groups: Vec<usize>| (0..3).map(move |seg| (seg, UnitBlocks::Groups(groups.clone())));
         assert_eq!(
-            counts.units(&[], true),
-            (0..3).flat_map(groups).collect::<Vec<_>>(),
-            "every segment's group 0, then every group 1, then every group 2"
+            counts.units(&[], true, 2),
+            [vec![0, 1], vec![2]]
+                .into_iter()
+                .flat_map(runs)
+                .collect::<Vec<_>>(),
+            "every segment's groups 0 and 1, then every segment's group 2"
         );
         let slots: Vec<(bool, bool, usize)> = counts
             .segs
@@ -2649,10 +2939,10 @@ mod carried_directory_reservation_tests {
 
         let drained: Vec<RecordBatch> =
             first.map(|b| b.expect("partition 0 batch")).collect().await;
-        // Every unit but segment 1's group 0, blocks 1..4.
+        // Every unit but segment 1's first run, blocks 1..8.
         assert_eq!(
             rows(std::slice::from_ref(&head)) + rows(&drained),
-            3 * (BLOCKS - 1) - 3
+            3 * (BLOCKS - 1) - 7
         );
         let after_first = budget.reserved();
         assert!(
@@ -2665,13 +2955,106 @@ mod carried_directory_reservation_tests {
             .map(|b| b.expect("partition 1 batch"))
             .collect()
             .await;
-        assert_eq!(rows(std::slice::from_ref(&mid)) + rows(&rest), 3);
+        assert_eq!(rows(std::slice::from_ref(&mid)) + rows(&rest), 7);
         assert!(
             budget.reserved() < slack,
             "segment 1's directories released while the exec is alive: {}",
             budget.reserved()
         );
+        // Every block overflows, so each unit's open goes columnar on its
+        // first block, falls back (reopen, row-path block), goes columnar on
+        // its second block, falls back again (reopen, skipping the first block
+        // and row-pathing the second) and then commits the rest to the row
+        // path: two reopens and three decodes on top of its blocks' own, for
+        // every unit, each of which here has at least two blocks. Each segment
+        // is two runs and decodes its 11 surviving blocks once each, so
+        // reopens are 3 * 2 * 2 = 12 and decodes 3 * (11 + 2 * 3) = 51. One
+        // unit per row group is three units a segment: 18 and 60.
+        assert_eq!(metric_total(&exec, "reopens"), 12);
+        assert_eq!(metric_total(&exec, "blocks_scanned"), 51);
         drop(exec);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A cache-wired scan with one partition under a confirmed ascending `ts`
+    /// TopK builds no global order and publishes each segment as one unit:
+    /// its sole partition opens each of the two segments of three row groups
+    /// once and reads every surviving block.
+    ///
+    /// Fails against selecting the global order on the read cache and the
+    /// TopK alone (the plan carries a global order, and one unit per row group
+    /// opens each segment three times).
+    #[tokio::test]
+    async fn topk_with_one_partition_publishes_whole_segments() {
+        use futures::StreamExt;
+
+        let store = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for seq in 1..=2u64 {
+            let obj = object(seq, 1);
+            let key = format!("t/sole{seq}.rlog");
+            store
+                .put(&key, bytes::Bytes::from(obj.clone()), PutOptions::default())
+                .await
+                .expect("put");
+            segments.push(seg_ref(&key, &obj, 1, seq));
+        }
+        let cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>> = Arc::new(
+            ravel_cache::Cache::new(ravel_cache::CacheLimits::new(64 << 20, 4096, 1)),
+        );
+        let fetcher = LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+            .with_cache(cache)
+            .with_block_range(
+                BlockRangeFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+                    .with_suffix_len(256)
+                    .with_whole_object_threshold(0),
+            )
+            .with_block_range_threshold(0);
+        let schema = crate::logs_schema::logs_schema_with_declared(&[]);
+        let ts: Arc<dyn PhysicalExpr> = Arc::new(Column::new("ts", crate::logs_schema::LOG_COL_TS));
+        let filter = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![ts],
+            datafusion::physical_expr::expressions::lit(true),
+        ));
+        // The window starts after each segment's first block, so no segment is
+        // contained in it and the planned route runs.
+        let exec = LogsScanExec::new(
+            TENANT,
+            fetcher,
+            &segments,
+            1,
+            1,
+            BLOCKS as i64,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Some(&vec![crate::logs_schema::LOG_COL_TS]),
+            PhaseAccounting::new(),
+            schema,
+            Arc::new(Vec::new()),
+        )
+        .expect("scan")
+        .with_topk(Some(TopKThreshold {
+            filter,
+            confirmed: true,
+        }));
+        let batches: Vec<RecordBatch> = exec
+            .execute(0, Arc::new(TaskContext::default()))
+            .expect("execute")
+            .map(|b| b.expect("batch"))
+            .collect()
+            .await;
+        assert_eq!(rows(&batches), 2 * (BLOCKS - 1));
+        let counts = exec.counts.get().expect("planned");
+        assert!(counts.planned(0).is_some() && counts.planned(1).is_some());
+        assert!(
+            counts.global.is_none(),
+            "one partition builds no global order"
+        );
+        assert_eq!(
+            metric_total(&exec, "segments_opened"),
+            2,
+            "each segment opened once"
+        );
     }
 }

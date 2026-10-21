@@ -40,14 +40,17 @@
 //!
 //! # Why the bound holds under the global deal and fails under segment order
 //!
-//! Four partitions. Global deal: the eight early groups have the eight
-//! smallest keys, so partition `p` gets the early groups of segments `p` and
-//! `p + 4` first: sixteen matching rows in four blocks, enough to fill a heap
-//! of ten. Every later unit is a late group whose blocks start at
-//! `LATE_BASE`, above any `ts` a full heap of early rows can publish. With
-//! each batch reaching the TopK before its partition decodes the next block,
-//! and a threshold published by another partition only tightening it, each
-//! partition decodes at most its four early blocks: at most 16.
+//! Four partitions, so each segment's sixteen groups are cut into runs of
+//! `ceil(16 / 4) = 4` and the segment is opened at most four times. Global
+//! deal: the eight early groups have the eight smallest keys, so each
+//! segment's first run is its early group and the three late groups that
+//! follow it in the global sequence (late groups 0, 1 and 2), published at the
+//! early group's place, and these eight runs come first: partition `p` takes
+//! segment `p`'s, then segment `p + 4`'s. Every later run holds only late
+//! groups, whose blocks start at `LATE_BASE`, above any `ts` a full heap of
+//! early rows can publish. A run's blocks are read in block order, so the
+//! early group, last in its segment, comes after the run's six late blocks:
+//! see [`RUN_BLOCKS`] for the exact count this gives.
 //!
 //! Segment order (main before this change): segments by minimum are 0..8,
 //! each has sixteen groups, and group `g` of each goes to partition `g % 4`,
@@ -120,11 +123,21 @@ const BLOCKS_PER_SEGMENT: usize = (LATE_RECORDS + EARLY_RECORDS) / RECORDS_PER_B
 const TOTAL_BLOCKS: usize = SEGMENTS * BLOCKS_PER_SEGMENT;
 
 /// The early first blocks: every block whose minimum is at or under `T*`,
-/// which every plan must read (see the module doc). The lockstep drive is
-/// deterministic, and under the global deal it decodes exactly this many
-/// and no more: a full heap of ten publishes a threshold before any
-/// partition reaches a second early block or a late one.
+/// which every plan must read (see the module doc).
 const FLOOR_BLOCKS: usize = SEGMENTS;
+
+/// What the global deal's lockstep drive decodes, exactly. Each partition
+/// first decodes the six late blocks of its segment's first run with no heap
+/// to publish from, then the early first block: partition 2's fills the heap
+/// of ten and publishes offset 24, so partition 3's early first block (minimum
+/// 3) is read too, and the heap tightens to offset 17. Each partition then
+/// skips its early second block (minimum `32 + s`) and the late blocks of
+/// segment `p + 4`'s first run, and decodes that run's early first block
+/// (minimum `p + 4`, under 17). Every later block starts above the threshold.
+/// One row group per unit decodes only [`FLOOR_BLOCKS`]; runs of whole row
+/// groups read a run's blocks in block order, which is what costs the late
+/// blocks ahead of each segment's early group here.
+const RUN_BLOCKS: usize = PARTITIONS * (3 * GROUP_BLOCKS + 1) + (SEGMENTS - PARTITIONS);
 
 /// The bound inside every segment's last block: that block starts at
 /// `LATE_BASE + 8 * 116 + s`, at most offset 1935, and the segment ends at
@@ -685,11 +698,13 @@ async fn logs_topk_global_block_order() {
         run.blocks_total, TOTAL_BLOCKS,
         "the plan counts every block"
     );
+    assert_eq!(RUN_BLOCKS, 32);
     assert_eq!(
-        run.blocks_scanned, FLOOR_BLOCKS,
-        "the global deal's lockstep drive decodes exactly the early first \
-         blocks, no more and no fewer"
+        run.blocks_scanned, RUN_BLOCKS,
+        "the global deal's lockstep drive decodes each partition's first run \
+         up to its early first block, then one early first block each"
     );
+    assert!(run.blocks_scanned >= FLOOR_BLOCKS);
     // Every segment's directories are reserved from the end of the plan
     // phase, so the first batch already sees all of them.
     let peak = run.reserved.iter().max().copied().unwrap_or(0);

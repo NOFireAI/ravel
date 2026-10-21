@@ -242,10 +242,29 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
             c.scan_partitions
         );
 
-        // Every declared partition owns work on this fixture (32 segments and 192
-        // blocks across at most 64 partitions), on both the whole-segment and the
-        // block-striped assignment -- and in the cached, undersubscribed case
-        // that exceeds the segment count, which is the capability this item adds.
+        // Each record is emitted by exactly one partition. The driver polls the
+        // partitions in turn but cannot make a row group read twice, or not at
+        // all, add up to the fixture's record count.
+        assert_eq!(
+            c.partition_rows.len(),
+            expected,
+            "{label}: one row count per declared partition"
+        );
+        assert_eq!(
+            c.partition_rows.iter().sum::<usize>(),
+            report.config.total_records,
+            "{label}: the partitions' rows {:?} must sum to the record count, each \
+             row group read by exactly one partition",
+            c.partition_rows
+        );
+
+        // Every declared partition owns work on this fixture. The driver gives
+        // each partition its first unit before any takes a second, so this
+        // holds exactly when the scan publishes at least as many units as it
+        // declares partitions: 32 whole segments on the fast path, and on the
+        // cached rows past the segment count each segment's 3 row groups as
+        // `min(3, tp)` runs, 96 units for at most 64 partitions. That is the
+        // capability this item adds.
         assert_eq!(
             c.non_empty_partitions, expected,
             "{label}: every declared partition should decode blocks; got {}",

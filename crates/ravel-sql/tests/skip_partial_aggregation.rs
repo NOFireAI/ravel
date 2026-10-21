@@ -51,7 +51,8 @@
 //! `options.execution.skip_partial_aggregation_probe_{rows,ratio}_threshold`
 //! writes in `session_config` (crates/ravel-sql/src/session.rs). Stop writing
 //! either threshold and the on-side session becomes DataFusion's stock
-//! 0.8-after-100,000 probe, which this fixture never reaches: every partition
+//! 0.8-after-100,000 probe, which no partition of this fixture meets (see
+//! [`MAX_STOCK_PROBE_RATIO`]): every partition
 //! then aggregates, `skipped_aggregation_rows` falls to 0, `output_rows` falls
 //! from the input row count to one row per distinct value per partition, and
 //! the first assertion below fails.
@@ -84,11 +85,12 @@ use uuid::Uuid;
 /// Distinct values of the high-cardinality key.
 ///
 /// Every object writes the same `DISTINCT` values in the same order, [`REPEATS`]
-/// whole rounds of them, and the scan spreads each object's blocks over every
-/// partition, so each partition ends up holding all `DISTINCT` values in its own
-/// hash table. That repetition across partitions is what makes the pre-final
-/// state `partitions x DISTINCT` instead of `DISTINCT`, and it is the shape
-/// issue #680 is about. It also has to stay above
+/// whole rounds of them. With an un-cached fetcher every object is one unit of
+/// the scan's queue, so each partition that takes an object ends up holding all
+/// `DISTINCT` values in its own hash table, and no partition can hold more,
+/// however many objects it takes. That repetition across partitions is what
+/// makes the pre-final state `partitions x DISTINCT` instead of `DISTINCT`, and
+/// it is the shape issue #680 is about. It also has to stay above
 /// `2 x SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`, or one full-sized per-partition
 /// table would fit inside [`MAX_TIGHTENED_GROUP_ENTRIES`] and the bound this
 /// test holds the tightened session to would prove nothing.
@@ -104,29 +106,24 @@ const DISTINCT: usize = 25_000;
 /// stage emits exactly as many rows as it aggregated. That is what makes its
 /// total `output_rows` its input row count exactly, not approximately.
 ///
-/// Three, not two, and the reason is the scan's block-to-partition rule:
-/// partitions take units from one queue as they ask for work (ADR-0102,
-/// `logs_scan` module docs), so partitions running in step take global block
-/// `i` at partition `i % target_partitions`. Two rounds put 8 blocks in an object, a multiple of the four
-/// partitions, so every partition draws the same object-local block offsets from
-/// every object and sees only the slice of the value space those offsets cover;
-/// measured, the pre-final state fell to 41,072 entries instead of
-/// `4 x DISTINCT`. Three rounds put 10 blocks in an object, the offsets rotate
-/// between objects, and each partition covers the whole value space. Beyond
-/// that, more rounds only push [`MAX_ROWS_PER_PARTITION`] towards DataFusion's stock
-/// 100,000-row threshold, which it must stay clear of.
+/// A partition reads a whole object from its first block (an un-cached scan
+/// never splits an object into row-group runs, ADR-0102), so that prefix holds
+/// whatever the object count, the partition count or the order partitions take
+/// objects in. The repeat count only sizes an object: [`ROWS_PER_OBJECT`] rows
+/// in 10 blocks.
 const REPEATS: usize = 3;
 
 /// RLOG objects.
 ///
-/// Also the fan-out the scan reaches: with an un-cached fetcher `LogsScanExec`
-/// keeps the segment-count bound (`min(target_partitions, segment_count)`,
-/// ADR-0102 decision 1).
+/// Also the declared fan-out: with an un-cached fetcher `LogsScanExec` keeps
+/// the segment-count bound (`min(target_partitions, segment_count)`, ADR-0102
+/// decision 1), and the shared queue hands each object to one partition whole.
 ///
 /// Four rather than more. [`MAX_TIGHTENED_GROUP_ENTRIES`] grows with the
-/// partition count while [`MAX_ROWS_PER_PARTITION`] must stay under DataFusion's
-/// stock 100,000-row probe threshold, and past five partitions no fixture size
-/// satisfies both.
+/// partition count while each partition's stock table stops at [`DISTINCT`],
+/// so the stock side outgrows that bound only when more than
+/// `2 x SKIP_PARTIAL_AGGREGATION_PROBE_ROWS x OBJECTS / DISTINCT` (2.6 here)
+/// partitions take an object.
 const OBJECTS: usize = 4;
 
 /// The scan's fan-out. Equal to [`OBJECTS`] so the fanned-out side really
@@ -143,34 +140,35 @@ const TOTAL_ROWS: usize = ROWS_PER_OBJECT * OBJECTS;
 /// [`block_size_matches_the_writer`] holds the two together.
 const BLOCK_RECORDS: usize = 8192;
 
-/// Blocks the scan hands to the busiest partition, which owns every
-/// `FANNED_OUT_PARTITIONS`-th block of the global list (ADR-0102; see the
-/// `logs_scan` module docs).
-const MAX_BLOCKS_PER_PARTITION: usize =
-    (ROWS_PER_OBJECT.div_ceil(BLOCK_RECORDS) * OBJECTS).div_ceil(FANNED_OUT_PARTITIONS);
-
-/// The most rows any one partition of the fanned-out plan can hold.
-///
-/// An upper bound, not an average: an object's last block is short, and which
-/// partitions those short blocks land on depends on the block arithmetic. Every
-/// partition holds at most [`MAX_BLOCKS_PER_PARTITION`] full blocks.
-///
-/// This is the number that has to stay below [`STOCK_PROBE_ROWS_THRESHOLD`],
-/// and it is what makes the option-off side deterministic rather than merely
-/// likely: the stock probe never gets to evaluate a ratio at all, so no
-/// partition skips, whatever the key looks like.
-const MAX_ROWS_PER_PARTITION: usize = MAX_BLOCKS_PER_PARTITION * BLOCK_RECORDS;
-
 /// DataFusion's own default for
 /// `datafusion.execution.skip_partial_aggregation_probe_rows_threshold`, which
 /// is what the option-off session runs with.
 /// [`stock_probe_threshold_matches_datafusion`] holds the two together.
 const STOCK_PROBE_ROWS_THRESHOLD: usize = 100_000;
 
+/// DataFusion's own default for
+/// `datafusion.execution.skip_partial_aggregation_probe_ratio_threshold`, held
+/// to DataFusion by the same test.
+const STOCK_PROBE_RATIO_THRESHOLD: f64 = 0.8;
+
+/// The highest distinct ratio the stock probe can read in any partition.
+///
+/// The probe decides once, on the batch that takes a partition to
+/// [`STOCK_PROBE_ROWS_THRESHOLD`] rows, from the groups its table holds over
+/// the rows it has read. A partition's table never holds more than
+/// [`DISTINCT`] groups, so the ratio there is at most
+/// `DISTINCT / STOCK_PROBE_ROWS_THRESHOLD` (0.25). A partition can reach the
+/// threshold: take-next may hand it two whole objects, 150,000 rows. What
+/// keeps the option-off side deterministic is this ratio staying under
+/// [`STOCK_PROBE_RATIO_THRESHOLD`], not a row count: no partition skips,
+/// whichever objects each partition takes.
+const MAX_STOCK_PROBE_RATIO: f64 = DISTINCT as f64 / STOCK_PROBE_ROWS_THRESHOLD as f64;
+
 const _: () = assert!(
-    MAX_ROWS_PER_PARTITION < STOCK_PROBE_ROWS_THRESHOLD,
-    "a partition must hold fewer rows than the stock probe threshold, or the \
-     option-off session's probe fires too and both sides of this test skip"
+    MAX_STOCK_PROBE_RATIO < STOCK_PROBE_RATIO_THRESHOLD,
+    "a partition reaching the stock probe threshold must read a distinct ratio \
+     under the stock ratio threshold, or the option-off session's probe fires \
+     too and both sides of this test skip"
 );
 const _: () = assert!(
     DISTINCT > 2 * SKIP_PARTIAL_AGGREGATION_PROBE_ROWS,
@@ -484,8 +482,10 @@ fn check_run_shape(label: &str, observed: &Run) {
 /// Both runs go over one fixture at [`FANNED_OUT_PARTITIONS`], one with the
 /// option on and one with it off, and every assertion is an exact equality or
 /// an exact structural bound over row counts from DataFusion's metrics. Nothing
-/// here depends on wall-clock time, on how the runtime interleaved the
-/// partitions, or on the memory pool.
+/// here depends on wall-clock time or on the memory pool, and assertions 1 and 2
+/// hold however the runtime interleaved the partitions. Assertion 3 needs at
+/// least three of the four partitions to take an object from the shared queue
+/// (see [`OBJECTS`]).
 ///
 /// 1. With the option on, every partition's probe fires and the partial stage
 ///    forwards: its `output_rows` equals its input row count exactly, and the
@@ -552,9 +552,11 @@ async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables(
 
     assert_eq!(
         stock.partial.skipped_rows, 0,
-        "the stock session skipped {} rows. Its {STOCK_PROBE_ROWS_THRESHOLD}-row \
-         probe threshold sits above the {MAX_ROWS_PER_PARTITION} rows a partition \
-         can hold here, so it must never fire; if it does, this fixture has \
+        "the stock session skipped {} rows. A partition reaching its \
+         {STOCK_PROBE_ROWS_THRESHOLD}-row probe threshold reads a distinct ratio \
+         of at most {MAX_STOCK_PROBE_RATIO}, under its \
+         {STOCK_PROBE_RATIO_THRESHOLD} ratio threshold, so it must never skip; \
+         if it does, this fixture has \
          stopped reproducing the pre-fix behaviour and both it and the assertions \
          below need rewriting.\n{}",
         stock.partial.skipped_rows, stock.plan_with_metrics
@@ -583,31 +585,36 @@ async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables(
     );
 }
 
-/// [`BLOCK_RECORDS`] is the fixture's block arithmetic, and both
-/// [`MAX_ROWS_PER_PARTITION`] and the all-distinct probe prefix are derived from
-/// it. A change to the writer's default would move both silently.
+/// [`BLOCK_RECORDS`] is the fixture's block arithmetic, and the all-distinct
+/// probe prefix is derived from it. A change to the writer's default would move
+/// it silently.
 #[test]
 fn block_size_matches_the_writer() {
     assert_eq!(
         RlogConfig::default().block_target_records,
         BLOCK_RECORDS,
-        "the RLOG writer's default block size moved; MAX_ROWS_PER_PARTITION and \
-         the probe prefix this test reasons about are both derived from it"
+        "the RLOG writer's default block size moved; the probe prefix this test \
+         reasons about is derived from it"
     );
 }
 
-/// [`STOCK_PROBE_ROWS_THRESHOLD`] is what makes the option-off side of the test
-/// deterministic. If DataFusion lowers its default below
-/// [`MAX_ROWS_PER_PARTITION`], the off side starts skipping too and the fixture
-/// needs resizing, not the assertions relaxing.
+/// [`MAX_STOCK_PROBE_RATIO`] is what makes the option-off side of the test
+/// deterministic. If DataFusion moves either default so that
+/// `DISTINCT / rows threshold` reaches the ratio threshold, the off side starts
+/// skipping too and the fixture needs resizing, not the assertions relaxing.
 #[test]
 fn stock_probe_threshold_matches_datafusion() {
-    let stock = datafusion::prelude::SessionConfig::new()
-        .options()
-        .execution
-        .skip_partial_aggregation_probe_rows_threshold;
+    let config = datafusion::prelude::SessionConfig::new();
+    let execution = &config.options().execution;
     assert_eq!(
-        stock, STOCK_PROBE_ROWS_THRESHOLD,
+        execution.skip_partial_aggregation_probe_rows_threshold, STOCK_PROBE_ROWS_THRESHOLD,
         "DataFusion's default skip_partial_aggregation_probe_rows_threshold moved"
+    );
+    assert_eq!(
+        execution
+            .skip_partial_aggregation_probe_ratio_threshold
+            .to_bits(),
+        STOCK_PROBE_RATIO_THRESHOLD.to_bits(),
+        "DataFusion's default skip_partial_aggregation_probe_ratio_threshold moved"
     );
 }

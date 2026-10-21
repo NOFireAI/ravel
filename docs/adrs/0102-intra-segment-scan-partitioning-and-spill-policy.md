@@ -149,8 +149,8 @@ ranged (per-block) reader that would remove the whole-object-GET tradeoff
 entirely is claimed as ADR-0107, not folded into this decision.
 
 How partitions share the surviving blocks has since changed: they no longer
-stripe them by index but take whole row groups, or whole segments, from one
-shared queue (see the #3080 amendment below).
+stripe them by index but take runs of row groups, or whole segments, from
+one shared queue (see the #3080 amendment below).
 
 ### 2. Accept ADR-0094 in place; measure at production scale before flipping the default
 
@@ -400,7 +400,7 @@ current behavior, not a target state. The diagram below reflects it.
 Current end state: the left half (intra-segment, block-index striping) and
 the aggregation/spill/budget half on the right are both shipped by this
 ADR. The `i % n` stripe the left half draws is the shape decision 1 shipped
-with; partitions now take whole row groups from a shared queue instead (see
+with; partitions now take runs of row groups from a shared queue instead (see
 the #3080 amendment below).
 
 ```mermaid
@@ -769,20 +769,34 @@ unchanged: once the plan resolves, it is published as one queue of units of
 work in a fixed order, and each partition takes the next unit when it
 finishes its current one, until the queue is empty.
 
-- **A unit is a whole row group, or a whole segment.** With a read cache and
-  more than one partition, each surviving row group of a planned segment is
-  one unit, and so is each surviving row group under the TopK order below.
-  Otherwise, without a read cache or with one partition, each segment is one
-  unit, so the one partition that takes it still reads it with one GET. A segment the plan
-  leaves unplanned (above the whole-object bound, or keyed and answered by
-  probe alone) is one unit either way. A segment with no surviving block
-  publishes nothing. A unit has exactly one owner, so no row group is read by
-  two partitions and none is skipped.
+- **A unit is a run of row groups, or a whole segment.** With a read cache and
+  `n > 1` partitions, a planned segment's `G` surviving row groups are cut
+  into runs of `ceil(G / n)` row groups, and each run is one unit. Without
+  the TopK order below a run is consecutive row groups in group order; under
+  it, a run is consecutive row groups of that segment in the global order.
+  Either way a segment yields at most `min(G, n)` runs, so it is opened at
+  most `min(G, n)` times whichever partitions take them. Otherwise, without a
+  read cache or with one partition, each segment is one unit, opened once by
+  the partition that takes it with the read sequence of a whole-segment scan:
+  one whole-object GET at or under the block-range threshold, the ranged
+  reads of ADR-0107 above it. A segment the plan leaves unplanned (at or under
+  `plan_whole_object_bound`, or, under KEY_IDX equalities, probed instead of
+  planned and not dropped) is one unit either way. A segment with no
+  surviving block publishes nothing. A unit has exactly one owner, so no row
+  group is read by two partitions and none is skipped.
 - **Publication order.** Under a confirmed ascending `ts` TopK with a read
-  cache, the units follow the plan's global order, ascending by each row
-  group's least stored minimum `ts`, so the earliest row groups are taken
-  first whichever partition asks. Otherwise segments follow the scan's visit
-  order with each segment's row groups in group order.
+  cache and more than one partition, the units follow the plan's global
+  order, ascending by each row group's least stored minimum `ts`, each run
+  published at the position of its first row group, so the earliest row
+  groups are taken first whichever partition asks. Within a run, blocks are
+  read in block order, so a run whose earliest row group lies after the
+  run's other row groups in the object reads those first:
+  `crates/ravel-sql/tests/logs_topk_global_block_order.rs` pins 32 blocks
+  decoded on a fixture where one unit per row group decodes 8. With one
+  partition the scan publishes whole segments in visit order, TopK or not.
+  Otherwise
+  segments follow the scan's visit order with each segment's runs in group
+  order.
 - **The declared partition count is fixed** at `target_partitions` with a
   read cache and at `target_partitions` capped by the segment count without
   one. The stride that capped how many partitions shared the blocks by the
@@ -790,8 +804,9 @@ finishes its current one, until the queue is empty.
   is done, and its stream is empty.
 - **Carried state is released by its last owner.** The plan's carried
   directories and carried whole object (issue #835) go to every unit of
-  their segment, and the slot holding them lets go when the last unit is
-  published, so the carry is released once the last owner finishes its unit.
+  their segment, the slot holding them counts one owner per run, and it lets
+  go when the last run is published, so the carry is released once the last
+  owner finishes its run.
   The carry budget and the plan-concurrency bound on carried bytes are
   unchanged.
 
@@ -801,7 +816,10 @@ order makes a partition's share depend on timing, so which partition reads a
 unit is no longer a function of the unit's index; the rows a scan returns are
 the same. `crates/ravel-sql/src/logs_scan/plan.rs` pins the rules:
 `every_surviving_row_group_is_consumed_exactly_once_by_one_partition`
-(proptest), `topk_units_are_published_in_global_deal_order`, and
+and `runs_open_each_segment_at_most_min_groups_partitions_times`
+(proptests), `topk_units_are_published_in_global_deal_order`,
+`topk_with_one_partition_publishes_whole_segments`,
+`carried_directories_are_released_in_the_global_order`, and
 `carried_whole_objects_are_released_when_every_owner_finishes_the_segment`.
 The bounded producer that removes the plan barrier is the next step of
 ADR-3072 decision 2 and is not part of this amendment.
