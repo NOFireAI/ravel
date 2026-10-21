@@ -19,7 +19,8 @@
 //! `#[ignore]`d by default because it needs a Docker daemon reachable by the
 //! executing user (in the `docker` group or root, a usable
 //! `/var/run/docker.sock`) and the ability to pull or already have the pinned
-//! RustFS and AWS CLI images. Run explicitly with:
+//! RustFS image, plus the pinned AWS CLI image on a host without an `aws`
+//! binary. Run explicitly with:
 //!
 //! ```text
 //! cargo test -p ravel-server --features flight-sql --test flight_sql_e2e -- --ignored
@@ -170,12 +171,13 @@ impl Rustfs {
         panic!("RustFS did not become ready within 30s");
     }
 
-    /// Create the bucket with a one-shot AWS CLI container. The RustFS container
-    /// this harness starts has no volume, so the bucket never pre-exists.
-    /// Creates the bucket with the host's `aws` binary when there is one
-    /// (GitHub-hosted runners ship it), and otherwise with the pinned
+    /// Creates the bucket, which never pre-exists because the RustFS container
+    /// this harness starts has no volume. Uses the host's `aws` binary when
+    /// there is one (GitHub-hosted runners ship it), and otherwise the pinned
     /// `AWS_CLI_IMAGE`. The host path keeps the lane off public.ecr.aws's
-    /// anonymous pull quota, which runners share and exhaust.
+    /// anonymous pull quota, which runners share and exhaust. A host `aws`
+    /// that runs but fails the call fails the test rather than falling back,
+    /// since the fallback would pull the image on a run already in trouble.
     fn make_bucket(&self) {
         let host_aws = Command::new("aws")
             .arg("--version")
@@ -187,8 +189,13 @@ impl Rustfs {
                 .env("AWS_SECRET_ACCESS_KEY", RUSTFS_PASSWORD)
                 .env("AWS_DEFAULT_REGION", "us-east-1")
                 .env("AWS_EC2_METADATA_DISABLED", "true")
+                // The container path sees only the variables passed to it;
+                // clear the ambient ones the host CLI would otherwise honour.
                 .env_remove("AWS_PROFILE")
+                .env_remove("AWS_DEFAULT_PROFILE")
+                .env_remove("AWS_REGION")
                 .env_remove("AWS_SESSION_TOKEN")
+                .env_remove("AWS_SECURITY_TOKEN")
                 .args([
                     "--endpoint-url",
                     &self.endpoint,
