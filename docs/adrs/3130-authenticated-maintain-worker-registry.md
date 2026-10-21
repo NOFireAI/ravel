@@ -61,14 +61,26 @@ Two constraints differ from ADR-1918:
    `--fragment-key-file`: one 64-hex-character key per line, the first key
    mints and any key verifies, parsed by the same `parse_fragment_keys`.
    `Cli::validate` requires it with `--mode maintain` and refuses it in every
-   other mode, since no other mode reads the registry. Every maintain process
-   in a cluster reads the same file.
+   other mode, since no other mode reads the registry. That includes
+   `--mode all`: it keeps a solo live set for its whole life
+   (`services/ravel-server/src/lib.rs`, the `Mode::All` branch) and spawns
+   neither the maintain heartbeat task nor scrub, so it never writes or reads
+   a registry record. Every maintain process in a cluster reads the same file.
+
+   Rotation is two-phase. A one-step swap to a file holding only the new key
+   splits the live set for the length of the rollout: old-key pods reject
+   new-key MACs and the reverse, and each side owns units the other also owns.
+   So append the new key after the old one everywhere and roll the pods, then
+   move it to the first line (the minting key) and roll again. Remove the old
+   key in a third roll once every pod mints with the new one.
 
 2. **`WorkerHeartbeat` gains `bytes mac = 5`, and `format_version` moves to
    2.** The MAC is `blake3::keyed_hash(record_key, claim)`, where
    `record_key = blake3::derive_key("ravel maintain worker record v1",
-   file_key)`. That context differs from ADR-1918's, so a query record MAC
-   never verifies as a maintain one. `claim` is built from field values, not
+   file_key)`. ADR-1918 (PR #3152) derives its query-worker record key under
+   the context `"ravel query worker record v1"`, so even a deployment that
+   reused one key file for both would never have a query record MAC verify as
+   a maintain one. `claim` is built from field values, not
    encoded protobuf bytes, since protobuf encoding is not canonical:
    `format_version` (u32 BE), `process_id` (u64 BE length prefix, then the
    bytes), `started_unix_ns` (i64 BE), `heartbeat_unix_ns` (i64 BE). Before v1
@@ -76,7 +88,11 @@ Two constraints differ from ADR-1918:
    exactly `{2}`. A version-1 record is rejected as `missing_mac`, not decoded
    through a dual path. Migration class C (an immutable metadata record,
    additive change). The classification table entry becomes `Immutable(&[2])`.
-   `docs/catalog-and-mvcc.md` is amended in the same change.
+   `docs/catalog-and-mvcc.md` and the `WorkerHeartbeat` row of ADR-0066's R1
+   classification table (`docs/adrs/0066-format-migration-machinery.md`,
+   whose read set `{1}` would otherwise contradict this decision) are amended
+   in the implementation commit, the row in place with an ADR-3130 note as the
+   ADR-1746 and ADR-2135 rows there already are.
 
 3. **Keys are required where membership happens, not where identity is
    made.** `WorkerSet::new` keeps building identity in every mode. Writing a
@@ -89,27 +105,37 @@ Two constraints differ from ADR-1918:
    unsigned record.
 
 4. **The reader verifies identity and MAC before admitting.** Both live-set
-   readers admit a sibling only when all of these hold:
-   - the key parses as a UUID;
-   - the body's `process_id` equals the key's UUID;
-   - `format_version == 2`;
-   - the MAC verifies under one of the reader's keys, compared in constant time.
+   readers, the maintain heartbeat task and scrub, run these checks in this
+   order and count a record under the first one it fails, as
+   `ravel_maintain_worker_record_rejects_total{reason}`:
+   - The key is this process's own: skipped, not counted (the reader always
+     includes its own record).
+   - The key does not parse as a UUID: skipped, not counted.
+   - The object's LIST mtime is outside the liveness window: skipped before
+     the GET, not counted. A dead worker leaves such a record in normal
+     operation.
+   - The record GET is a range read of 4096 + 1 bytes. A response longer than
+     4096 bytes is `oversize`, rejected without being decoded.
+   - The body does not decode, or its `process_id` does not equal the key's
+     UUID: `malformed`. A garbage overwrite lands here.
+   - `format_version` is not 2, or the `mac` field is empty: `missing_mac`.
+     A version-1 record from an older process lands here. A MAC that is not
+     32 bytes, or verifies under none of the reader's keys (compared in
+     constant time): `bad_mac`.
+   - The MAC verifies but `heartbeat_unix_ns` is outside the liveness window:
+     `stale_stamp`. The object's mtime was fresh and a live process stamps
+     every write with its current clock, so this is a replayed older record
+     or a clock skewed past the window. The maintain registry has no drained
+     stamp, so nothing is exempt here.
 
-   The record GET becomes a range read of 4096 + 1 bytes; a response longer
-   than 4096 bytes is rejected as `oversize` without being decoded. A rejected
-   record is skipped. A transport error on a GET keeps today's behaviour: the
-   read fails, and the caller keeps its prior membership. Rejects are counted
-   as `ravel_maintain_worker_record_rejects_total{reason}`, with the closed
-   reasons and check order of ADR-1918 decision 4: `oversize`; `malformed` (a
-   body that does not decode, or whose `process_id` does not match its key);
-   `missing_mac` (including a version-1 record) and `bad_mac`; and
-   `stale_stamp` for a verified record whose `heartbeat_unix_ns` is outside
-   the window although its LIST mtime was fresh. A record skipped by the
-   mtime check before its GET is not counted. The maintain registry has no
-   drained stamp, so ADR-1918's drain exception does not apply. The counters
-   live in a handle owned in `ravel-fleet`, snapshotted by the server and
-   rendered from zero on the maintain process's /metrics, and the family is
-   added to `docs/guides/observability.md`.
+   These are the reasons and the order ADR-1918 decision 4 uses for the query
+   registry, restated so this ADR stands on its own. A rejected record is
+   skipped. A transport error on a GET keeps each reader's behaviour today:
+   the heartbeat task fails the read and keeps its last live set, and scrub
+   falls back to the solo live set for that cycle. The counters are
+   per-reason `AtomicU64`s in a handle owned in `ravel-fleet`, snapshotted by
+   the server and rendered from zero on the maintain process's /metrics, and
+   the family is added to `docs/guides/observability.md`.
 
 5. **The operator renders the mount from a required Secret ref.** The
    `RavelCluster` CRD gains `spec.maintain.keySecretRef` (a `LocalSecretRef`
@@ -119,8 +145,8 @@ Two constraints differ from ADR-1918:
    rolls the pods. A cluster with `spec.maintain.enabled` (the default) and no
    `keySecretRef` is refused with a status condition naming the field, rather
    than rendered into pods that fail `Cli::validate`. The operator still
-   generates no Secrets. `deploy/docker-compose` ships a development key file
-   with a comment saying so.
+   generates no Secrets. `deploy/docker-compose` needs no key file: its only
+   ravel-server runs `--mode all`.
 
 6. **Land as one pull request.** The server half makes the flag mandatory, and
    the operator half renders it. Landed apart, either an operator-managed
@@ -197,7 +223,9 @@ flowchart LR
   different record, and it is filed as its own issue (#3155) rather than folded in
   here.
 - Docs updated with the implementation: `docs/catalog-and-mvcc.md` (the
-  heartbeat record), `docs/reference/ravel-server-flags.md` (regenerated),
-  `docs/guides/kubernetes.md`, `docs/guides/operations/deployment.md`, the
-  doc comments in `worker_set.rs` that call the key "self-owned" or "single
-  writer per key", and the ADR index.
+  heartbeat record), the `WorkerHeartbeat` row of ADR-0066's R1 table (read
+  set `{2}`), `docs/reference/ravel-server-flags.md` (regenerated),
+  `docs/guides/kubernetes.md`, `docs/guides/operations/deployment.md` (with
+  the two-phase rotation from decision 1), `docs/guides/observability.md`,
+  the doc comments in `worker_set.rs` that call the key "self-owned" or
+  "single writer per key", and the ADR index.
