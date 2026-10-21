@@ -1095,6 +1095,8 @@ E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion"
 rerun_two_workflows_out="$(e2e "${CLEAN_BODY_JSON}")"
 E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T18:52:55Z"},{"name":"sql","workflowName":"ci","status":"QUEUED","conclusion":null,"startedAt":null}]'
 rerun_queued_out="$(e2e "${CLEAN_BODY_JSON}")"
+E2E_ROLLUP='[{"context":"dco","state":"PENDING"},{"context":"dco","state":"SUCCESS"}]'
+context_pending_first_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_ROLLUP
 
 check_eq "superseded run: an older cancelled run under a newer success counts once, as a pass" \
@@ -1112,6 +1114,9 @@ check_eq "superseded run: same job name in two workflows is two checks" \
 check_eq "superseded run: a queued re-run with no startedAt reads as pending, not as the older pass" \
   "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=0 pass/1 pending/0 fail | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
   "$(printf '%s\n' "${rerun_queued_out}" | sed -n 1p)"
+check_eq "superseded run: a pending status context outranks a settled one listed after it" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=0 pass/1 pending/0 fail | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${context_pending_first_out}" | sed -n 1p)"
 
 # The post-fork shape guard (issue #2811) sits last before the merge line. A
 # hit refuses the merge line outright; a guard that could not answer prints a

@@ -21,11 +21,12 @@
 # rules: an old cancelled run does not hold back a newer success, and a newer
 # failure is not hidden by an older success. A check run is keyed by workflow
 # and job name, so same-named jobs in different workflows stay separate; a
-# status context by its context. A run that has not settled (not completed,
-# or no `startedAt` yet, as a queued re-run reports) is taken as the newest,
-# so a re-run in flight reads as pending rather than letting an older
-# completed run stand. Among settled runs the newest is the latest
-# `startedAt`, with input order breaking ties.
+# status context by its context. A run that has not settled is taken as the
+# newest, so a run in flight reads as pending rather than letting an older
+# completed one stand: a check run that is not completed or has no
+# `startedAt` yet (as a queued re-run reports), or a PENDING or EXPECTED
+# status context. Among settled runs the newest is the latest `startedAt`
+# (status contexts carry none), with input order breaking ties.
 #
 # Shared by scripts/pr-review-status.sh and scripts/guards/assert-green-head.sh
 # so the two can never disagree about whether a pull request is green.
@@ -35,9 +36,8 @@
     _key: (if (.value | has("state")) then "status:" + (.value.context // .value.name // "unknown")
            else "check:" + (.value.workflowName // "") + "/" + (.value.name // "unknown") end),
     _unsettled: (
-      (if (.value | has("state")) then (.value.state == "PENDING" or .value.state == "EXPECTED")
-       else (.value.status != "COMPLETED") end)
-      or (.value.startedAt == null)
+      if (.value | has("state")) then (.value.state == "PENDING" or .value.state == "EXPECTED")
+      else ((.value.status != "COMPLETED") or (.value.startedAt == null)) end
     ),
     _ts: (.value.startedAt // ""),
     _ord: .key
