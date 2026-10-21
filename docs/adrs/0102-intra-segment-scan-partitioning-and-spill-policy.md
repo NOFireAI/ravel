@@ -148,6 +148,10 @@ Outstanding from the original scope, deliberately not resolved here: a
 ranged (per-block) reader that would remove the whole-object-GET tradeoff
 entirely is claimed as ADR-0107, not folded into this decision.
 
+How partitions share the surviving blocks has since changed: they no longer
+stripe them by index but take runs of row groups, or whole segments, from
+one shared queue (see the #3080 amendment below).
+
 ### 2. Accept ADR-0094 in place; measure at production scale before flipping the default
 
 ADR-0094's mechanism is not revisited — ship it as designed. This epic adds
@@ -395,7 +399,9 @@ current behavior, not a target state. The diagram below reflects it.
 
 Current end state: the left half (intra-segment, block-index striping) and
 the aggregation/spill/budget half on the right are both shipped by this
-ADR.
+ADR. The `i % n` stripe the left half draws is the shape decision 1 shipped
+with; partitions now take runs of row groups from a shared queue instead (see
+the #3080 amendment below).
 
 ```mermaid
 flowchart TB
@@ -430,7 +436,10 @@ Intra-segment block striping (decision 1) applies only when the fetcher
 carries ADR-0046's read cache. Without it the scan is segment-granular: each
 segment is assigned whole to one partition (relevant segment `j` in snapshot
 order to partition `j % n`), so it is opened by exactly one partition, and the
-partition count is capped at the segment count.
+partition count is capped at the segment count. Outside the predicate-free
+fast path, the `j % n` deal is now a queue of whole-segment units that
+partitions take in turn (see the #3080 amendment below); each segment is
+still opened by exactly one partition and the cap is unchanged.
 
 The reason is that decision 1's whole premise for striping past segment count
 rests on single-flight coalescing the re-opens: `n` partitions sharing one
@@ -746,3 +755,71 @@ The hold can be removed once Ravel runs a DataFusion release whose
 `execute_typed` no longer falls back to the legacy stream. Upstream tracks
 that removal as apache/datafusion#25902, under the stream-split epic
 apache/datafusion#22710.
+
+## Amendment (2026-10-21, #3080): partitions take whole units from one queue instead of the `i % n` deal
+
+<!-- amendment-applies: sections="1. Intra-segment partitioning — redesigned and shipped|Diagram|Amendment (2026-08-26, #693)" pointer="#3080 amendment" -->
+
+Decision 1 striped a segment's surviving blocks across partitions by index,
+and the #693 amendment dealt whole segments by `j % n` when no read cache is
+wired. Both are replaced, outside the predicate-free fast path of the #693
+part 3 amendment (which keeps its `j % n` deal), by take-next ownership
+(ADR-3072 decision 2, first step). The plan phase and its barrier are
+unchanged: once the plan resolves, it is published as one queue of units of
+work in a fixed order, and each partition takes the next unit when it
+finishes its current one, until the queue is empty.
+
+- **Under a confirmed ascending `ts` TopK with a read cache, the units and
+  their order are the global deal's, unchanged** (ADR-2677 decision 6, issue
+  #2694), at every partition count, one included. Every surviving row group
+  is sorted by its least stored minimum `ts` (an unplanned segment by its
+  minimum), unit `i` of that order is dealt to partition `i % n`, and a
+  partition's consecutive row groups of one segment in ascending position
+  merge into one run. Each run is one unit, published at the position of its
+  first row group, so every partition's runs keep the order it was dealt
+  them and the earliest row groups are taken first whichever partition asks.
+  A segment is opened once per run the deal gives it, exactly as many times
+  as under the per-partition deal; at one partition, time-disjoint segments
+  are one run each and are opened once.
+- **Otherwise a unit is a run of row groups, or a whole segment.** With a
+  read cache and `n > 1` partitions, a planned segment's `G` surviving row
+  groups are cut into runs of `ceil(G / n)` consecutive row groups in group
+  order, and each run is one unit, so a segment is opened at most
+  `min(G, n)` times whichever partitions take its runs. Without a read cache,
+  or with one partition and no TopK, each segment is one unit, opened once
+  by the partition that takes it with the read sequence of a whole-segment
+  scan: one whole-object GET at or under the block-range threshold, the
+  ranged reads of ADR-0107 above it. Segments follow the scan's visit order,
+  each segment's runs in group order. A segment the plan leaves unplanned
+  (at or under `plan_whole_object_bound`, or, under KEY_IDX equalities,
+  probed instead of planned and not dropped) is one unit in every mode. A
+  segment with no surviving block publishes nothing. A unit has exactly one
+  owner, so no row group is read by two partitions and none is skipped.
+- **The declared partition count is fixed** at `target_partitions` with a
+  read cache and at `target_partitions` capped by the segment count without
+  one. The stride that capped how many partitions shared the blocks by the
+  real surviving-block count is gone: a partition that finds the queue empty
+  is done, and its stream is empty.
+- **Carried state is released by its last owner.** The plan's carried
+  directories and carried whole object (issue #835) go to every unit of
+  their segment, the slot holding them counts one owner per unit, and it
+  lets go when the last unit is published, so the carry is released once the
+  last owner finishes its unit.
+  The carry budget and the plan-concurrency bound on carried bytes are
+  unchanged.
+
+Unchanged by this amendment: plan errors, the whole-segment totals partition
+0 records, snapshot retry, and the partition count rule above. The take-next
+order makes a partition's share depend on timing, so which partition reads a
+unit is no longer a function of the unit's index; the rows a scan returns are
+the same. `crates/ravel-sql/src/logs_scan/plan.rs` pins the rules:
+`every_surviving_row_group_is_consumed_exactly_once_by_one_partition`
+and `runs_open_each_segment_at_most_min_groups_partitions_times`
+(proptests), `topk_units_are_published_in_global_deal_order`,
+`topk_units_match_main_global_deal_with_dealt_run_merge`,
+`topk_with_one_partition_follows_the_global_deal`,
+`topk_one_partition_time_disjoint_segments_open_once`,
+`carried_directories_are_released_in_the_global_order`, and
+`carried_whole_objects_are_released_when_every_owner_finishes_the_segment`.
+The bounded producer that removes the plan barrier is the next step of
+ADR-3072 decision 2 and is not part of this amendment.

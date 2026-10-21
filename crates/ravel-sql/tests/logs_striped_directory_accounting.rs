@@ -639,20 +639,18 @@ async fn whole_object_route_decompresses_once_per_segment() {
     );
 }
 
-/// One segment of three row groups scanned by two partitions: the round-robin
-/// deal gives the first partition groups 0 and 2 and the second group 1. With
+/// One segment of three row groups scanned by two partitions: the queue cuts it
+/// into runs of `ceil(3 / 2) = 2` groups, groups 0 and 1 and then group 2. With
 /// the fetcher's default coalesce gap, wider than the hole between groups 0 and
-/// 2, each partition's ranged read must still stay inside its own groups, so
-/// the scan phase issues one GET per owned group and moves exactly each group's
-/// projected span: wire bytes across both partitions are the three spans, within
-/// the object's length, with no span overlapping another.
+/// 2, the first run's ranged read bridges the hole between its own two groups
+/// and the second run's stays inside group 2, so the scan phase issues one GET
+/// per run and moves exactly each run's projected span: wire bytes across both
+/// partitions are the two spans, within the object's length, the two disjoint.
 ///
-/// Fails against a plan that bridges over the whole candidate set's holes: the
-/// first partition's one run then spans group 1 (two GETs in all, one of them
-/// moving group 1's bytes a second time), and against a plan that never bridges
-/// for a partition (one GET per column chunk, not one per group).
+/// Fails against one unit per row group (one GET per group, four in all), and
+/// against a plan that never bridges for a unit (one GET per column chunk).
 #[tokio::test]
-async fn interleaved_groups_move_each_groups_span_once() {
+async fn two_partitions_move_each_runs_span_once() {
     let fx = fixture().await;
     let seg = fx.snapshot.segments[0].clone();
     let obj = fx.objects[0].clone();
@@ -678,7 +676,7 @@ async fn interleaved_groups_move_each_groups_span_once() {
         .with_body()
         .resolve(dirs.field_dir())
         .expect("a narrow projection resolves to a column set");
-    let spans: Vec<u64> = (0..GROUPS)
+    let extents: Vec<(u64, u64)> = (0..GROUPS)
         .map(|g| {
             let chunks: Vec<(u64, u64)> = selected
                 .iter()
@@ -686,9 +684,16 @@ async fn interleaved_groups_move_each_groups_span_once() {
                 .collect();
             let start = chunks.iter().map(|c| c.0).min().expect("a chunk");
             let end = chunks.iter().map(|c| c.0 + c.1).max().expect("a chunk");
-            end - start
+            (start, end)
         })
         .collect();
+    assert_eq!(GROUPS, 3, "the runs below are cut from three groups");
+    let first_run = extents[1].1 - extents[0].0;
+    let second_run = extents[2].1 - extents[2].0;
+    assert!(
+        extents[1].1 <= extents[2].0,
+        "the two runs' spans are disjoint"
+    );
     let get = ravel_types::accounting::AccountedOp::Get.index();
     // Besides the group spans, each partition places BLOOM (the probe is too
     // short to cover it), one range both partitions ask for and the cache
@@ -700,13 +705,13 @@ async fn interleaved_groups_move_each_groups_span_once() {
         .len;
     assert_eq!(
         run.phases.scan.s3_requests[get],
-        GROUPS as u64 + 1,
-        "one GET per owned group, and the shared BLOOM range"
+        2 + 1,
+        "one GET per run, and the shared BLOOM range"
     );
     assert_eq!(
         run.phases.scan.s3_bytes[get],
-        spans.iter().sum::<u64>() + bloom,
-        "each group's projected span is moved once"
+        first_run + second_run + bloom,
+        "each run's projected span is moved once"
     );
     assert!(run.phases.scan.s3_bytes[get] <= obj.len() as u64);
 }

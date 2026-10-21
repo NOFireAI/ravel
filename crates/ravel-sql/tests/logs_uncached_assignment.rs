@@ -2,14 +2,15 @@
 //! partitions instead of striping every segment's blocks across all
 //! partitions, so each segment is opened by exactly one partition.
 //!
-//! ADR-0102 stripes a snapshot's surviving blocks round-robin across
-//! `target_partitions`, which puts every segment's blocks into every partition
-//! and makes each partition open the segment itself. With ADR-0046's read cache
+//! ADR-0102 spreads a segment's surviving row groups across
+//! `target_partitions`, which makes each partition that takes one open the
+//! segment itself. With ADR-0046's read cache
 //! wired, those re-opens single-flight onto one object-store request per extent.
 //! Without a cache nothing coalesces them, so the scan pays one whole-object GET
 //! per partition per segment. The fix (deliverable of #693) makes the un-cached
-//! path segment-granular: relevant segment `j` (snapshot order) goes to
-//! partition `j % n` and drains all of that segment's surviving blocks. That
+//! path segment-granular: each relevant segment is one unit of work, taken
+//! whole by the one partition that asks for it next, which drains all of that
+//! segment's surviving blocks (take-next ownership since #3080). That
 //! #693 fix left one read per phase per segment (a plan read plus a separate
 //! scan read). Every fixture object here is under the fetcher's default plan
 //! bound, so since ADR-2677 decision 2 no segment is planned and each is read
@@ -22,7 +23,7 @@
 //! keep the scan off the predicate-free full-window whole-segment fast path. That
 //! fast path bypasses the assignment rule these tests are about, and since #739
 //! it no longer excludes small objects, so without the predicate a bare
-//! full-window `SELECT` over this fixture would never reach `owned_work`.
+//! full-window `SELECT` over this fixture would never reach the unit queue.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -185,13 +186,13 @@ async fn build_fixture(store: &dyn ObjectStoreBackend) -> (Snapshot, BTreeSet<(i
 /// block-predicate-free, which keeps the scan off the predicate-free full-window
 /// whole-segment fast path.
 ///
-/// These tests pin the ADR-0102/#693 assignment rule (`owned_work`: whole
-/// segments un-cached, block striping cached), and that rule only runs when the
+/// These tests pin the ADR-0102/#693 assignment rule (`PlanCounts::units`: whole
+/// segments un-cached, row-group units cached), and that rule only runs when the
 /// fast path declines. Until #739 the fixture declined it for free, because the
 /// fast path also required every segment to be above the block-range threshold
 /// and these objects are a few KiB. #739 removed that conjunct, so a bare
 /// full-window `SELECT` over this fixture now takes the fast path and never
-/// reaches `owned_work`. This restores the shape under test without perturbing a
+/// reaches `PlanCounts::units`. This restores the shape under test without perturbing a
 /// single row or block.
 fn non_matching_erasure() -> Vec<ravel_proto::commit::v1::ErasureRequest> {
     vec![ravel_proto::commit::v1::ErasureRequest {

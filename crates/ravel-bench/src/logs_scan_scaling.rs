@@ -309,6 +309,11 @@ pub struct ComboResult {
     /// The capability check: this exceeds the segment count in the
     /// undersubscribed case.
     pub non_empty_partitions: usize,
+    /// Observed: rows each scan partition emitted in that same drained
+    /// execution, indexed by partition. Their sum is the number of records the
+    /// scan read, so a row group read by two partitions, or by none, moves it
+    /// off the fixture's record count whatever order the partitions ran in.
+    pub partition_rows: Vec<usize>,
     /// Segments the resolved snapshot scanned.
     pub segments_scanned: usize,
     pub blocks_total: u64,
@@ -389,6 +394,7 @@ impl ComboResult {
             over_threshold,
             scan_partitions,
             non_empty_partitions: 0,
+            partition_rows: Vec::new(),
             segments_scanned: 0,
             blocks_total: 0,
             blocks_scanned: 0,
@@ -807,8 +813,8 @@ async fn run_combo(
     // emit rows -- the capability check (exceeds the segment count when
     // undersubscribed). Driven directly on the scan node so plan-level
     // repartition/coalesce above it cannot mask the scan's real fan-out.
-    let non_empty_partitions = match count_non_empty_scan_partitions(&plan).await {
-        Ok(n) => n,
+    let partition_rows = match scan_partition_rows(&plan).await {
+        Ok(rows) => rows,
         Err(e) => {
             return ComboResult::failed(
                 target_partitions,
@@ -819,6 +825,7 @@ async fn run_combo(
             );
         }
     };
+    let non_empty_partitions = partition_rows.iter().filter(|&&n| n > 0).count();
 
     let mut latencies_ns = Vec::with_capacity(runs.max(1));
     for _ in 0..runs.max(1) {
@@ -876,6 +883,7 @@ async fn run_combo(
         over_threshold,
         scan_partitions,
         non_empty_partitions,
+        partition_rows,
         segments_scanned,
         blocks_total,
         blocks_scanned,
@@ -897,35 +905,46 @@ async fn run_combo(
     }
 }
 
-/// Drive the `LogsScanExec` node's own partitions to exhaustion and count how
-/// many emitted at least one row. Executed directly on the scan node so a
-/// repartition/coalesce above it in the plan cannot mask the scan's fan-out.
-/// Returns 0 if the plan carries no `LogsScanExec`.
-async fn count_non_empty_scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> Result<usize, String> {
+/// Drive the `LogsScanExec` node's own partitions to exhaustion and return the
+/// rows each emitted, indexed by partition. Executed directly on the scan node
+/// so a repartition/coalesce above it in the plan cannot mask the scan's
+/// fan-out. Returns no partitions if the plan carries no `LogsScanExec`.
+///
+/// Partitions take units of work from a shared queue as they ask for it, so a
+/// sequential drain would hand every unit to partition 0. They are polled in
+/// turn, one batch each per pass, as concurrent execution would.
+async fn scan_partition_rows(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<usize>, String> {
     use datafusion::execution::TaskContext;
     use futures::StreamExt;
 
     let Some(scan) = find_logs_scan(plan) else {
-        return Ok(0);
+        return Ok(Vec::new());
     };
     let ctx = Arc::new(TaskContext::default());
     let partitions = scan.output_partitioning().partition_count();
-    let mut non_empty = 0;
+    let mut streams = Vec::with_capacity(partitions);
     for p in 0..partitions {
-        let mut stream = scan
+        let stream = scan
             .execute(p, Arc::clone(&ctx))
             .map_err(|e| format!("execute scan partition {p}: {e}"))?;
-        let mut rows = 0usize;
-        while let Some(next) = stream.next().await {
-            rows += next
-                .map_err(|e| format!("drain scan partition {p}: {e}"))?
-                .num_rows();
-        }
-        if rows > 0 {
-            non_empty += 1;
+        streams.push(Some(stream));
+    }
+    let mut rows = vec![0usize; partitions];
+    while streams.iter().any(Option::is_some) {
+        for (p, slot) in streams.iter_mut().enumerate() {
+            let Some(stream) = slot else { continue };
+            match stream.next().await {
+                Some(next) => {
+                    let batch = next.map_err(|e| format!("drain scan partition {p}: {e}"))?;
+                    if let Some(count) = rows.get_mut(p) {
+                        *count += batch.num_rows();
+                    }
+                }
+                None => *slot = None,
+            }
         }
     }
-    Ok(non_empty)
+    Ok(rows)
 }
 
 /// The single stream this dataset uses; small on purpose so every record shares
@@ -991,8 +1010,8 @@ async fn publish_dataset(
     let tenant_hash = tenant.hash();
     let cfg = RlogConfig {
         block_target_records: config.block_target_records.max(1),
-        // The striped route deals whole row groups to partitions (ADR-2414
-        // decision A1), so the cached fan-out past the segment count this
+        // The striped route hands out runs of whole row groups as units of work
+        // (ADR-2414 decision A1, ADR-0102 as amended), so the cached fan-out past the segment count this
         // sweep measures needs more row groups than partitions: two blocks per
         // group keeps that true at this fixture's block counts.
         group_target_blocks: 2,

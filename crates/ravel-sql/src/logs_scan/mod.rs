@@ -4,29 +4,40 @@
 //! Partitions the snapshot's work across `target_partitions` partitions in one
 //! of two modes, chosen once at construction from whether the fetcher carries
 //! ADR-0046's read cache ([`LogSegmentFetcher::has_cache`], ADR-0102 amended by
-//! #693):
+//! #693). In both, the plan publishes units of work into one shared
+//! [`UnitQueue`] and each partition takes the next unit whenever it finishes
+//! its current one (take-next ownership, ADR-0102 decision 1 as amended by
+//! issue #3080), so every unit has exactly one owner and each partition opens
+//! its units in publication order. A partition that finds the queue empty
+//! runs an empty stream.
 //!
-//! - **Cache-wired: intra-segment block striping.** Every `(segment,
-//!   surviving-block)` unit across all segments is flattened into one ordered
-//!   list (segment order, then block order) and unit `i` is assigned to
-//!   partition `i % n`, where `n = target_partitions.max(1).
-//!   min(total_block_count.max(1))`. This lets a query touching fewer segments
-//!   than `target_partitions` still fan out to `target_partitions` partitions:
-//!   the old segment-granular rule (`min(target_partitions, segment_count)`)
-//!   pinned such a query to at most `segment_count` partitions. Under a
-//!   confirmed ascending `ts` TopK the list is instead every row group sorted
-//!   by its blocks' least minimum `ts` across all segments, an unplanned
-//!   segment by its own minimum ([`global_deal`]), so each partition reads the
-//!   earliest row groups first.
-//! - **Un-cached: segment-granular.** Each segment is assigned whole to one
-//!   partition (relevant segment `j` in snapshot order to partition `j % n`),
-//!   so every segment is opened by exactly one partition. The partition count is
+//! - **Cache-wired: intra-segment block striping.** A segment of `G`
+//!   surviving row groups scanned by `n` partitions is cut into runs of
+//!   `ceil(G / n)` consecutive row groups, each run one unit, published in
+//!   segment order, then group order, and an unplanned segment is one unit in
+//!   the same sequence. A segment is therefore opened at most `min(G, n)`
+//!   times. This lets a query touching fewer segments than
+//!   `target_partitions` still fan out to `target_partitions` partitions: the
+//!   old segment-granular rule (`min(target_partitions, segment_count)`)
+//!   pinned such a query to at most `segment_count` partitions. A scan with
+//!   one partition publishes each segment as one unit, since its sole
+//!   partition owns every row group anyway ([`LogsScanExec::striped`]).
+//!   Under a confirmed ascending `ts` TopK, at any partition count, the row
+//!   groups are instead sorted by their blocks' least minimum `ts` across all
+//!   segments, an unplanned segment by its own minimum ([`global_order`]),
+//!   and dealt as ADR-2677 decision 6 deals them: unit `i` to queue `i % n`,
+//!   a queue's consecutive row groups of one segment in ascending position
+//!   merged into one run, and the runs published in the order of their first
+//!   row group ([`global_runs`]). The earliest row groups are taken first,
+//!   and each run is read in its global order.
+//! - **Un-cached: segment-granular.** Each segment is one unit, so every
+//!   segment is opened by exactly one partition. The partition count is
 //!   capped at the segment count.
 //!
 //! The block-striping fan-out is gated on the cache because without single-
 //! flight to coalesce re-opens it would multiply object-store reads by the
-//! partition count. See [`LogsScanExec::new`], [`owned_work`], and the
-//! request-count paragraph below for why.
+//! partition count. See [`LogsScanExec::new`], [`PlanCounts::publish`], and
+//! the request-count paragraph below for why.
 //!
 //! The per-segment surviving-block counts the assignment needs are determined
 //! once, before draining, by [`LogSegmentFetcher::plan_segment`] (a prune with
@@ -43,8 +54,9 @@
 //! planned when the scan holds at least `target_partitions` such segments
 //! relevant to the query window (ADR-2677 decision 2,
 //! [`LogSegmentFetcher::plans_segment`], [`skips_sub_bound_plans`]): the plan
-//! pass issues no read for it beyond the KEY_IDX probe below, [`owned_work`]
-//! gives it whole to one partition, and that partition opens it with one
+//! pass issues no read for it beyond the KEY_IDX probe below,
+//! [`PlanCounts::publish`] publishes it as one unit, and the partition that
+//! takes that unit opens it with one
 //! whole-object read and prunes blocks from the directory that read already
 //! holds. With fewer such segments, every segment takes the plan-then-stripe
 //! route described here. For a query with KEY_IDX equalities (ADR-2707) the
@@ -55,8 +67,8 @@
 //!
 //! # Object-store request count, and the cache gate
 //!
-//! Every partition that owns blocks in a segment opens that segment itself, so
-//! it issues its own read sequence at that segment's key. The shape of that
+//! Every unit's owner opens that unit's segment itself, so it issues its own
+//! read sequence at that segment's key. The shape of that
 //! sequence depends on the object's size (ADR-0107,
 //! [`LogSegmentFetcher::with_block_range_threshold`], 512 KiB by default): at or
 //! below the threshold it is one whole-object GET; above it, a suffix probe, one
@@ -65,7 +77,7 @@
 //! does how many partitions are planned:
 //!
 //! - **Un-cached fetcher.** The assignment is segment-granular (#693): each
-//!   segment is assigned whole to one partition ([`owned_work`]), so a segment
+//!   segment is one unit ([`PlanCounts::units`]), so a segment
 //!   is opened by exactly one partition and issues exactly one scan read
 //!   sequence, whatever `target_partitions` is. The request count is one plan
 //!   read per relevant segment above the plan bound (`compute_plan_counts`)
@@ -77,7 +89,7 @@
 //!   partitions would multiply object-store reads by the partition count for no
 //!   benefit. `ravel-bench`'s `logs_scan_scaling` report measures both.
 //! - **Cache-wired fetcher.** The partition count is `target_partitions`, so
-//!   several partitions can stripe one segment's blocks. Every GET of either
+//!   several partitions can take row groups of one segment. Every GET of either
 //!   shape is keyed by the extent it fetched and routed through the cache's
 //!   single-flight -- the whole object below the threshold, and the probe, each
 //!   section, and each block above it -- so the partitions striping one segment
@@ -99,7 +111,7 @@
 //!   window fully contains every relevant segment, and there are at least
 //!   `target_partitions` of them, the plan phase is skipped entirely
 //!   ([`LogsScanExec::whole_segment_fast_path`]): whole segments are assigned
-//!   round-robin (the same rule the un-cached path uses), with no plan phase and
+//!   round-robin (relevant segment `j` to partition `j % n`), with no plan phase and
 //!   no suffix probe from it. How each assigned segment is then READ is a
 //!   separate, per-segment decision (#862, [`PartitionCtx::open_by_column_chunk`]):
 //!   a projection wide enough to want most of the object's bytes takes the one
@@ -152,8 +164,10 @@
 //! place. Only a segment above the plan bound is planned, so the carry below
 //! applies only there; a segment at or under it is read once by its owner
 //! without any plan read to carry. Since #835, [`LogSegmentFetcher::plan_segment`]'s fallback branch carries its fetched
-//! bytes forward as a [`ravel_query::CarriedWholeObject`] (`SegPlan::whole_object`,
-//! threaded through [`OwnedSeg::whole_object`] to the subset open), so the
+//! bytes forward as a [`ravel_query::CarriedWholeObject`] (held by the
+//! segment's `CarrySlot` and handed through [`OwnedSeg::whole_object`] to
+//! each unit's subset open, then released when the segment's last owner
+//! finishes its unit), so the
 //! object is read once for the statement, rather than twice, for the first
 //! `plan_concurrency` segments whose plan completes: their subset open issues
 //! neither a store GET nor a cache lookup. Every other relevant segment is re-fetched by the
@@ -172,7 +186,7 @@
 //! objects than are actually in flight at once. The first `plan_concurrency`
 //! segments to COMPLETE with a carried whole object -- arrival order, not
 //! segment order, so which segments those are is scheduling-dependent -- keep
-//! their [`SegPlan::whole_object`]; every later arrival has its
+//! their carried whole object; every later arrival has its
 //! `whole_object` forced to `None` before it is stored, so that segment's
 //! subset open pays a second read during the scan, a wire GET whenever the
 //! cache does not still hold the object, exactly as it would have
@@ -184,15 +198,15 @@
 //! scan performs a real GET for it and that GET's own accounting covers it.
 //!
 //! The barrier itself is unchanged by this bound: no partition drains a block
-//! until every segment's survivor count is known, because the flattened
-//! block-striping assignment (ADR-0102) needs every segment's count to
-//! compute unit `i`'s owning partition, not just the segments before it in
-//! isolation. Only the CARRIED-BYTES retention is now concurrency-bounded;
-//! survivor counts, stats, and footers for every relevant segment are still
-//! held until the pass completes, because `owned_work` indexes all of them by
-//! segment position regardless. Letting a partition start draining before the
-//! whole pass completes would need ADR-0102's partitioning protocol itself to
-//! change, and is not made here.
+//! until every segment is planned, because the units are published only once
+//! the whole pass completes, in an order (the TopK [`global_order`] in
+//! particular) that needs every segment's row groups. Only the CARRIED-BYTES
+//! retention is now concurrency-bounded; survivor counts, stats, and footers
+//! for every relevant segment are still held until the pass completes,
+//! because [`PlanCounts::publish`] indexes all of them by segment position.
+//! Letting a partition start draining before the whole pass completes would
+//! need ADR-0102's partitioning protocol itself to change, and is not made
+//! here.
 //!
 //! # Streaming, and why no ordering is declared (ADR-0087)
 //!
@@ -1092,23 +1106,25 @@ pub(crate) struct DeclaredColumnSum {
 pub struct LogsScanExec {
     tenant_hash: TenantHash,
     fetcher: LogSegmentFetcher,
-    /// Every segment in the snapshot, in snapshot order. Blocks are flattened
-    /// across these (segment order, then block order) and striped across
-    /// partitions; the per-segment block counts the striping needs are
-    /// resolved lazily into [`Self::counts`].
+    /// Every segment in the snapshot, in snapshot order. The plan resolved
+    /// lazily into [`Self::counts`] publishes their units of work (row groups
+    /// with a read cache, whole segments without) into [`Self::units`], and
+    /// partitions take them one at a time.
     segments: Arc<Vec<SegmentRef>>,
-    /// DataFusion partition count this scan declares. Equal to
-    /// `target_partitions.max(1)`; the assignment stride `n` is
-    /// `target_partitions.max(1).min(total_block_count.max(1))`, which only
-    /// differs when there are fewer blocks than partitions, and then the
-    /// partitions past `n` simply run empty streams (DataFusion tolerates
-    /// them), so the observed non-empty partition count is identical either way.
+    /// The SQL partition count the scan was built for. The declared count is
+    /// this with a read cache and this capped at the segment count without
+    /// one. Partitions take units from one shared queue until it is empty,
+    /// so with fewer units than declared partitions the rest run empty
+    /// streams (DataFusion tolerates them).
     target_partitions: usize,
     /// The shared per-segment block plan (surviving-block counts and
     /// whole-segment prune stats), computed once by the first partition to
     /// poll and reused by the rest (ADR-0102). `None` entries are ts-irrelevant
     /// segments that issue no GET.
     counts: Arc<OnceCell<Arc<PlanCounts>>>,
+    /// The queues the planned route's partitions take units from, one per
+    /// execution round ([`UnitRounds`]).
+    units: Arc<UnitRounds>,
     /// The statement's prefetch pool (ADR-2414 decision A2): every
     /// partition's issued, unconsumed fast-path opens, one slot per
     /// partition, so a partition whose current open the fetch memory budget
@@ -1235,10 +1251,14 @@ pub struct LogsScanExec {
     columnar_eligible: bool,
     /// The assignment mode, decided once at construction from
     /// [`LogSegmentFetcher::has_cache`] (ADR-0102, amended by #693). `true` (a
-    /// cache is wired) stripes a segment's surviving blocks across partitions;
-    /// `false` assigns each segment whole to one partition, so an un-cached scan
-    /// opens each segment exactly once. Threaded into the stream and
-    /// [`owned_work`]; the same predicate gates `declared_partitions` above.
+    /// cache is wired) publishes each segment as runs of its surviving row
+    /// groups when the scan has more than one partition ([`Self::striped`]),
+    /// or under a confirmed ascending `ts` TopK at any partition count
+    /// ([`global_order`]), so a segment's row groups spread across
+    /// partitions; `false` publishes each
+    /// segment as one unit, so an un-cached scan opens each segment exactly
+    /// once. Threaded into the stream and [`PlanCounts::publish`]; the same
+    /// predicate gates `declared_partitions` above.
     stripe_blocks: bool,
     properties: Arc<PlanProperties>,
     /// This query's phase-split accounting handle (ADR-0044, issue #796),
@@ -1376,9 +1396,9 @@ struct BlockMetrics {
     /// `Opening` polls that returned `Pending`, the count of times this
     /// partition yielded to the runtime with an open in flight.
     open_pending_polls: Count,
-    /// Owned segments this partition opened (on the striped path, owned
-    /// shares of a segment, several of one segment under [`global_deal`];
-    /// first opens only, the `attrs_raw` reopen counts under
+    /// Units this partition opened (on the striped path one per row-group run
+    /// it took, so possibly several of one segment; first opens only, the
+    /// `attrs_raw` reopen counts under
     /// [`Self::reopens`]).
     segments_opened: Count,
     /// Wall time in `ReopenRows` opens (the `attrs_raw` fallback), kept apart
@@ -1586,9 +1606,10 @@ impl BlockMetrics {
 }
 
 impl LogsScanExec {
-    /// Build a scan over `segments`, striping their blocks round-robin across
-    /// `target_partitions` partitions when `fetcher` carries ADR-0046's read
-    /// cache and across `min(target_partitions, segments.len())` when it does
+    /// Build a scan over `segments`, whose partitions take its units of work
+    /// (row groups or whole segments, see [`PlanCounts::units`]) from one
+    /// shared queue: `target_partitions` partitions when `fetcher` carries
+    /// ADR-0046's read cache and `min(target_partitions, segments.len())` when it does
     /// not (see the `declared_partitions` comment below), with the given ts
     /// bounds, content predicates, and prune-only predicates. Stream-attribute
     /// equalities are deliberately not accepted: they are not pushed into the
@@ -1819,6 +1840,15 @@ impl LogsScanExec {
         self.topk.as_ref().filter(|topk| topk.confirmed)
     }
 
+    /// Whether the planned route without a confirmed TopK publishes row-group
+    /// runs rather than whole segments: a read cache is wired and the scan has
+    /// more than one partition. A sole partition owns every row group of a
+    /// segment, so it reads each segment as one unit. Under a confirmed
+    /// ascending `ts` TopK a read cache alone selects [`global_order`].
+    fn striped(&self) -> bool {
+        self.stripe_blocks && self.target_partitions > 1
+    }
+
     /// This scan with its kept filter confirmed when `ascending` holds the
     /// filter's id, or dropped when it does not; `None` when that changes
     /// nothing (no kept filter, or already confirmed).
@@ -1842,8 +1872,8 @@ impl LogsScanExec {
     /// An exhaustive struct literal rather than a call through [`Self::build`]:
     /// every field of [`LogsScanExec`] is named here explicitly, so a field
     /// added to the struct later without a matching line here is a compile
-    /// error, not a silently-dropped one. `counts`, `prefetch_pool` and
-    /// `metrics` are shared with `self` rather than rebuilt: the optimizer
+    /// error, not a silently-dropped one. `counts`, `units`, `prefetch_pool`
+    /// and `metrics` are shared with `self` rather than rebuilt: the optimizer
     /// replaces `self` with the returned plan, so `self` is never executed and
     /// nothing is double-counted or double-planned.
     fn sibling(&self, fetch: Option<usize>, topk: Option<TopKThreshold>) -> Self {
@@ -1853,6 +1883,7 @@ impl LogsScanExec {
             segments: Arc::clone(&self.segments),
             target_partitions: self.target_partitions,
             counts: Arc::clone(&self.counts),
+            units: Arc::clone(&self.units),
             prefetch_pool: Arc::clone(&self.prefetch_pool),
             ts_min: self.ts_min,
             ts_max: self.ts_max,
@@ -1904,11 +1935,10 @@ impl LogsScanExec {
         // per-segment block counts are not known until a prune runs, which is
         // async and cannot happen in this synchronous constructor. So the
         // declared partition count is a function of `target_partitions` alone
-        // and the block-level assignment (with the stride `n` capped by the real
-        // block count) happens lazily on first poll, shared through `counts`.
-        // When there are fewer blocks than partitions the surplus partitions run
-        // empty, which is equivalent to capping `n` here and DataFusion handles
-        // empty partitions.
+        // and the units of work are published lazily on first poll, shared
+        // through `counts` and `units`. When there are fewer units than
+        // partitions the surplus partitions find the queue empty and run
+        // empty; DataFusion handles empty partitions.
         //
         // Striping past the segment count is gated on the fetcher carrying
         // ADR-0046's read cache, which is the precondition ADR-0102 decision 1
@@ -1924,8 +1954,10 @@ impl LogsScanExec {
         // never plans a partition whose extra GETs nothing absorbs.
         // `stripe_blocks` decides both the partition count and the per-unit
         // assignment, and is computed once from the same `has_cache` predicate:
-        // with the cache a segment's blocks stripe across partitions, without it
-        // each segment is assigned whole to one partition (see `owned_work`).
+        // with the cache and more than one partition, or with the cache under a
+        // confirmed ascending `ts` TopK, each segment is cut into runs of row
+        // groups, otherwise each segment is one unit taken whole by one
+        // partition (see `LogsScanExec::striped`, `PlanCounts::units`).
         let stripe_blocks = fetcher.has_cache();
         let declared_partitions = if stripe_blocks {
             target_partitions.max(1)
@@ -1999,6 +2031,7 @@ impl LogsScanExec {
             segments: Arc::new(segments.to_vec()),
             target_partitions: declared_partitions,
             counts: Arc::new(OnceCell::new()),
+            units: Arc::new(UnitRounds::new(declared_partitions)),
             prefetch_pool: Arc::new(PrefetchPool::new(declared_partitions)),
             ts_min,
             ts_max,
@@ -3007,41 +3040,47 @@ impl ExecutionPlan for LogsScanExec {
         // falls to the plan-then-stripe path below, byte for byte, and records
         // which conjunct sent it there.
         let blocks = BlockMetrics::new(&self.metrics, partition);
-        let (work, fast_whole_segment, state) = match self.whole_segment_fast_path(&ctx.query) {
-            Ok(relevant) => {
-                let n = self.target_partitions.max(1).min(relevant.max(1));
-                let order = visit_order(&self.segments, self.active_topk().is_some());
-                let work = owned_whole_segments(
-                    &self.segments,
-                    &order,
-                    self.ts_min,
-                    self.ts_max,
-                    partition,
-                    n,
-                );
-                (work, true, LogScanState::NextSegment)
-            }
-            Err(reason) => {
-                BlockMetrics::record_fast_path_rejection(&self.metrics, partition, reason);
-                // The block-level assignment needs each segment's surviving-block
-                // count, which a prune must produce (async). The first partition
-                // to poll runs that prune for every segment through the shared
-                // `counts` cell, with as many prunes in flight as the scan has
-                // partitions; the rest await its result. Building the future here
-                // (not awaiting it) keeps `execute` synchronous, as DataFusion
-                // requires.
-                let counts_fut = plan_counts_future(
-                    Arc::clone(&self.counts),
-                    Arc::clone(&ctx),
-                    Arc::clone(&self.segments),
-                    self.target_partitions,
-                    self.stripe_blocks,
-                    self.active_topk().is_some(),
-                    blocks.plan_init_elapsed.clone(),
-                );
-                (VecDeque::new(), false, LogScanState::Planning(counts_fut))
-            }
-        };
+        let (work, round, fast_whole_segment, state) =
+            match self.whole_segment_fast_path(&ctx.query) {
+                Ok(relevant) => {
+                    let n = self.target_partitions.max(1).min(relevant.max(1));
+                    let order = visit_order(&self.segments, self.active_topk().is_some());
+                    let work = owned_whole_segments(
+                        &self.segments,
+                        &order,
+                        self.ts_min,
+                        self.ts_max,
+                        partition,
+                        n,
+                    );
+                    (work, None, true, LogScanState::NextSegment)
+                }
+                Err(reason) => {
+                    BlockMetrics::record_fast_path_rejection(&self.metrics, partition, reason);
+                    // The block-level assignment needs each segment's surviving-block
+                    // count, which a prune must produce (async). The first partition
+                    // to poll runs that prune for every segment through the shared
+                    // `counts` cell, with as many prunes in flight as the scan has
+                    // partitions; the rest await its result. Building the future here
+                    // (not awaiting it) keeps `execute` synchronous, as DataFusion
+                    // requires.
+                    let counts_fut = plan_counts_future(
+                        Arc::clone(&self.counts),
+                        Arc::clone(&ctx),
+                        Arc::clone(&self.segments),
+                        self.target_partitions,
+                        self.stripe_blocks,
+                        self.active_topk().is_some(),
+                        blocks.plan_init_elapsed.clone(),
+                    );
+                    (
+                        VecDeque::new(),
+                        Some(self.units.join(partition)),
+                        false,
+                        LogScanState::Planning(counts_fut),
+                    )
+                }
+            };
         // ADR-2414 decision A2: the fast path pipelines its ranged opens at
         // its share of the GET permits, which `get_limiter_permits` reads off
         // the process-shared limiter the server wires into the fetcher. Not
@@ -3076,7 +3115,7 @@ impl ExecutionPlan for LogsScanExec {
             first_batch_seen: false,
             done_seen: false,
             partition,
-            stripe_blocks: self.stripe_blocks,
+            stripe_blocks: self.striped(),
             fast_whole_segment,
             prefetch_share,
             topk: self.active_topk().cloned(),
@@ -3085,6 +3124,8 @@ impl ExecutionPlan for LogsScanExec {
             retrying: false,
             segments: Arc::clone(&self.segments),
             work,
+            round,
+            queue: None,
             resident: reservation.new_empty(),
             reservation,
             held: 0,
@@ -3155,12 +3196,15 @@ struct LogScanStream {
     /// Reservation bytes covering the live entries of [`Self::str_values`],
     /// charged once per entry rather than once per batch sharing it.
     str_values_charge: usize,
-    /// This stream's DataFusion partition index. Together with the shared
-    /// [`PlanCounts`] it determines which `(segment, block-index-list)` units
-    /// this partition owns (ADR-0102).
+    /// This stream's DataFusion partition index: its round in
+    /// [`LogsScanExec::units`], its prefetch slot, and partition 0 publishes
+    /// the plan's per-segment totals.
     partition: usize,
-    /// The assignment mode (ADR-0102, amended by #693): block striping when a
-    /// cache is wired, segment-granular otherwise. Passed to [`owned_work`].
+    /// The assignment mode (ADR-0102, amended by #693): row-group runs when a
+    /// cache is wired and the scan has more than one partition, segment units
+    /// otherwise, since a sole partition owns every row group of a segment and
+    /// reads them best as one share. Passed to [`PlanCounts::publish`], which
+    /// ignores it when the plan carries [`global_order`].
     stripe_blocks: bool,
     /// The predicate-free full-window whole-segment fast path (#693 part 3,
     /// deliverable 1). When set, `work` was filled by [`owned_whole_segments`]
@@ -3194,7 +3238,7 @@ struct LogScanStream {
     prefetch_share: usize,
     /// [`LogsScanExec::active_topk`]: the confirmed TopK threshold this
     /// partition reads before opening each owned segment and before decoding
-    /// each block, and whose presence selects [`global_deal`] over
+    /// each block, and whose presence selects [`global_order`] over
     /// segment-then-group order on the striped path (`visit_order`
     /// elsewhere, by whole segment, when no read cache is wired).
     topk: Option<TopKThreshold>,
@@ -3208,12 +3252,18 @@ struct LogScanStream {
     /// Whether the open in flight is [`Self::on_open_refused`]'s one retry of
     /// a refused open. Cleared when an open resolves and at the next segment.
     retrying: bool,
-    /// Every segment in the snapshot, snapshot order, shared with the exec. The
-    /// owned-work computation indexes this by segment position.
+    /// Every segment in the snapshot, snapshot order, shared with the exec.
+    /// Publication indexes this by segment position.
     segments: Arc<Vec<SegmentRef>>,
-    /// This partition's owned segments and their block-index lists, filled once
-    /// [`LogScanState::Planning`] resolves. Drained front to back.
+    /// The whole-segment fast path's owned segments ([`owned_whole_segments`]).
+    /// Drained front to back before [`Self::queue`] is asked.
     work: VecDeque<OwnedSeg>,
+    /// The planned route's membership of its execution round; `None` on the
+    /// fast path and once the stream is finished.
+    round: Option<RoundTicket>,
+    /// The round's shared unit queue, set once [`LogScanState::Planning`]
+    /// resolves; this partition takes its next unit from it.
+    queue: Option<Arc<UnitQueue>>,
     reservation: MemoryReservation,
     /// Reservation bytes currently covering `pending`.
     held: usize,
@@ -3280,7 +3330,7 @@ struct LogScanStream {
     /// The plan fallback's whole-object bytes for [`Self::current_seg`]
     /// (issue #835), consumed once per [`OwnedSeg`] open of this segment by
     /// the FIRST open of each (`Option::take` at the `NextSegment` state,
-    /// before `open_segment_subset`): under [`global_deal`] a stream can hold
+    /// before `open_segment_subset`): with row-group runs a stream can take
     /// several `OwnedSeg`s of one segment, each its own `NextSegment`
     /// transition and each taking its own carry. `None` whenever the plan
     /// phase did not carry whole-object bytes forward for this segment,
@@ -3291,8 +3341,8 @@ struct LogScanStream {
     /// bytes a second time.
     ///
     /// Once per `OwnedSeg` open, not once per buffer: under block striping a
-    /// segment's survivors can be owned by several partitions, and under
-    /// [`global_deal`] by several `OwnedSeg`s of one partition, each of which
+    /// segment's row groups can be taken by several partitions, and several
+    /// by one partition, each as its own `OwnedSeg`, each of which
     /// clones the carry and charges the object's length to
     /// `QueryAccounting::add_bytes_reused`. That matches what the figure
     /// counts, one avoided store call per open, and is the same convention
