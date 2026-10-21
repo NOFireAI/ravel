@@ -34,7 +34,8 @@
 //! Every entry is charged, before it is stored, against two bounds: a
 //! per-query byte cap on the cache's running total, and the query's
 //! [`MemoryBudget`], one [`Reservation`] per entry, released when the entry
-//! is replaced or the cache is dropped with its query (issue #3105). A
+//! is replaced, when its key falls back, or when the cache is dropped with
+//! its query (issue #3105). A
 //! replacement is charged its own bytes in place of the old entry's on both
 //! bounds, not the two together. An entry that does not fit is not stored, and its key falls back: every later step
 //! reads that selector over its own request window, as evaluation without the
@@ -228,17 +229,75 @@ fn histogram_heap_bytes(h: &FloatHistogram) -> u64 {
         .saturating_add(vec_bytes(&h.custom_values))
 }
 
+/// How far one bound's cursor walks forward through a series' points before
+/// the move counts as a jump and is found by binary search instead.
+const MAX_CURSOR_WALK: usize = 64;
+
+/// A cursor pair no request has seated yet. Past every series' end, so the
+/// first request searches.
+const UNSEATED: (usize, usize) = (usize::MAX, usize::MAX);
+
+/// `points.partition_point(pred)`, found from `hint`, a previous answer for a
+/// predicate of the same shape. When the answer lies at most
+/// [`MAX_CURSOR_WALK`] points ahead of `hint` it is reached by walking;
+/// otherwise (behind `hint`, further ahead, or `hint` past the end) it is
+/// found by binary search over the side of `hint` that holds it. The `bool`
+/// says whether a search ran. `pred` must be true on a prefix of `points` and
+/// false on the rest, which ascending `ts_ns` gives both bound predicates.
+fn seek<P>(points: &[P], hint: usize, pred: impl Fn(&P) -> bool) -> (usize, bool) {
+    if hint > points.len() || (hint > 0 && !pred(&points[hint - 1])) {
+        let end = hint.min(points.len());
+        return (points[..end].partition_point(pred), true);
+    }
+    let stop = hint.saturating_add(MAX_CURSOR_WALK).min(points.len());
+    let mut at = hint;
+    while at < stop && pred(&points[at]) {
+        at += 1;
+    }
+    if at == stop && at < points.len() && pred(&points[at]) {
+        return (at + points[at..].partition_point(pred), true);
+    }
+    (at, false)
+}
+
 /// The series one selector read returned, in source order, and the window
-/// that read covered.
+/// that read covered, with one lower and upper slice cursor per series.
 #[derive(Debug)]
 pub(crate) struct CachedSelector<S> {
-    pub(crate) window: TimeRange,
-    pub(crate) series: Vec<S>,
+    window: TimeRange,
+    series: Vec<S>,
+    /// Each series' `[lo, hi)` from its last [`Self::slices`] request, the
+    /// starting point for the next one.
+    cursors: Vec<Cell<(usize, usize)>>,
+    /// Series slices whose cursors were re-seated by binary search.
+    #[cfg(test)]
+    reseats: Cell<u64>,
 }
 
 impl<S: CachedSeries> CachedSelector<S> {
+    pub(crate) fn new(window: TimeRange, series: Vec<S>) -> Self {
+        CachedSelector {
+            window,
+            cursors: series.iter().map(|_| Cell::new(UNSEATED)).collect(),
+            series,
+            #[cfg(test)]
+            reseats: Cell::new(0),
+        }
+    }
+
+    /// The window the read covered.
+    pub(crate) fn window(&self) -> TimeRange {
+        self.window
+    }
+
+    /// How many series the read returned.
+    pub(crate) fn len(&self) -> usize {
+        self.series.len()
+    }
+
     /// The bytes this read holds: its series vector by capacity, plus each
-    /// series' [`CachedSeries::heap_bytes`]. This is what an entry is charged.
+    /// series' [`CachedSeries::heap_bytes`]. This is what an entry is
+    /// charged. The cursors, two `usize` per series, are not counted.
     pub(crate) fn bytes(&self) -> u64 {
         self.series.iter().fold(vec_bytes(&self.series), |sum, s| {
             sum.saturating_add(s.heap_bytes())
@@ -250,23 +309,43 @@ impl<S: CachedSeries> CachedSelector<S> {
     /// order is the source's. `request` must lie inside [`Self::window`]. A
     /// read over exactly `request` is returned whole, since the source
     /// already clipped it.
+    ///
+    /// Each bound is found from where the series' previous request left it
+    /// ([`seek`]): a range query's steps move both bounds forward a few
+    /// points at a time, which a short walk answers, and a request that moves
+    /// a bound backwards or far ahead re-seats it by binary search. The slice
+    /// is the same whichever way a bound was found.
     pub(crate) fn slices(
         &self,
         request: TimeRange,
     ) -> impl Iterator<Item = (&LabelSet, &[S::Point])> + '_ {
         let whole = request == self.window;
-        self.series.iter().map(move |s| {
-            let points = s.points();
-            if whole {
-                return (s.labels(), points);
-            }
-            let lo = points.partition_point(|p| S::ts_ns(p) < request.start_ns);
-            let hi = points
-                .partition_point(|p| S::ts_ns(p) <= request.end_ns)
-                .max(lo);
-            (s.labels(), &points[lo..hi])
-        })
+        self.series
+            .iter()
+            .zip(&self.cursors)
+            .map(move |(s, cursor)| {
+                let points = s.points();
+                if whole {
+                    return (s.labels(), points);
+                }
+                let (lo_hint, hi_hint) = cursor.get();
+                let (lo, lo_searched) = seek(points, lo_hint, |p| S::ts_ns(p) < request.start_ns);
+                let (hi, hi_searched) = seek(points, hi_hint, |p| S::ts_ns(p) <= request.end_ns);
+                cursor.set((lo, hi));
+                self.note_reseat(lo_searched || hi_searched);
+                (s.labels(), &points[lo..hi.max(lo)])
+            })
     }
+
+    #[cfg(test)]
+    fn note_reseat(&self, searched: bool) {
+        if searched {
+            self.reseats.set(self.reseats.get() + 1);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn note_reseat(&self, _searched: bool) {}
 }
 
 pub(crate) enum CacheEntry {
@@ -277,8 +356,8 @@ pub(crate) enum CacheEntry {
 impl CacheEntry {
     fn window(&self) -> TimeRange {
         match self {
-            CacheEntry::Float(cached) => cached.window,
-            CacheEntry::Histogram(cached) => cached.window,
+            CacheEntry::Float(cached) => cached.window(),
+            CacheEntry::Histogram(cached) => cached.window(),
         }
     }
 }
@@ -322,9 +401,8 @@ pub(crate) struct SelectorCache {
     entries: RefCell<HashMap<SelectorKey, Slot>>,
     /// Keys whose entry did not fit, with which bound refused it; the refusal
     /// itself is kept only for the query's first, in `first_refusal`. A key
-    /// here is not offered to [`Self::insert`] again. An entry it already had stays and
-    /// keeps answering the requests inside its window when the cap refused
-    /// the replacement; the budget refuses only after that entry was dropped.
+    /// here is not offered to [`Self::insert`] again and has no entry: the
+    /// refused insert dropped any entry it would have replaced.
     fallen_back: RefCell<HashMap<SelectorKey, FallbackReason>>,
     /// The first budget refusal of the query, in the order [`Self::insert`]
     /// met them.
@@ -431,10 +509,10 @@ impl SelectorCache {
     /// admit a reservation of the entry's bytes. A replacement costs each bound
     /// the new entry's bytes in place of the old entry's, never both: the cap
     /// check subtracts the old entry's bytes, and the old entry, with its
-    /// reservation, is dropped before the new one is reserved. When the cap
-    /// refuses, nothing changes and any previous entry stays; when the budget
-    /// refuses, the previous entry is already gone. Either way `key` falls
-    /// back. A miss reads over [`Self::miss_window`], so a replacement covers
+    /// reservation, is dropped before the new one is reserved. A previous
+    /// entry is dropped, with its bytes and reservation, whether or not the new
+    /// one fits: when either bound refuses, `key` falls back and holds
+    /// nothing. A miss reads over [`Self::miss_window`], so a replacement covers
     /// the window of the entry it replaces. This is the only way an entry
     /// enters the cache.
     pub(crate) fn insert<S: CachedSeries>(&self, key: SelectorKey, cached: Rc<CachedSelector<S>>) {
@@ -446,14 +524,14 @@ impl SelectorCache {
             .bytes()
             .saturating_sub(replaced_bytes)
             .saturating_add(bytes);
-        if total > self.max_bytes {
-            self.fall_back(key, FallbackReason::Cap);
-            return;
-        }
         let replaced = entries.remove(&key).is_some();
         if replaced {
             self.bytes
                 .set(self.bytes.get().saturating_sub(replaced_bytes));
+        }
+        if total > self.max_bytes {
+            self.fall_back(key, FallbackReason::Cap);
+            return;
         }
         let reservation = match &self.budget {
             Some(budget) => match budget.reserve_best_effort(bytes) {
@@ -548,16 +626,16 @@ mod tests {
 
     fn float_entry(points: usize) -> CachedSelector<SeriesData> {
         let ts: Vec<i64> = (0..points as i64).collect();
-        CachedSelector {
-            window: TimeRange {
+        CachedSelector::new(
+            TimeRange {
                 start_ns: 0,
                 end_ns: points as i64,
             },
-            series: vec![SeriesData {
+            vec![SeriesData {
                 labels: LabelSet::default(),
                 samples: samples(&ts),
             }],
-        }
+        )
     }
 
     #[test]
@@ -571,35 +649,37 @@ mod tests {
         // entries share.
         assert_eq!(large - small, 3_000 * point);
 
-        let histogram = |points: usize| CachedSelector {
-            window: TimeRange {
-                start_ns: 0,
-                end_ns: points as i64,
-            },
-            series: vec![HistogramSeriesData {
-                labels: LabelSet::default(),
-                samples: (0..points as i64)
-                    .map(|ts_ns| HistogramSample {
-                        ts_ns,
-                        value: FloatHistogram {
-                            counter_reset_hint: crate::histogram::ResetHint::Unknown,
-                            scale: 0,
-                            zero_threshold: 0.0,
-                            zero_count: 0.0,
-                            count: 1.0,
-                            sum: 1.0,
-                            positive_spans: vec![Span {
-                                offset: 0,
-                                length: 2,
-                            }],
-                            negative_spans: Vec::new(),
-                            positive_buckets: vec![0.5, 0.5],
-                            negative_buckets: Vec::new(),
-                            custom_values: Vec::new(),
-                        },
-                    })
-                    .collect(),
-            }],
+        let histogram = |points: usize| {
+            CachedSelector::new(
+                TimeRange {
+                    start_ns: 0,
+                    end_ns: points as i64,
+                },
+                vec![HistogramSeriesData {
+                    labels: LabelSet::default(),
+                    samples: (0..points as i64)
+                        .map(|ts_ns| HistogramSample {
+                            ts_ns,
+                            value: FloatHistogram {
+                                counter_reset_hint: crate::histogram::ResetHint::Unknown,
+                                scale: 0,
+                                zero_threshold: 0.0,
+                                zero_count: 0.0,
+                                count: 1.0,
+                                sum: 1.0,
+                                positive_spans: vec![Span {
+                                    offset: 0,
+                                    length: 2,
+                                }],
+                                negative_spans: Vec::new(),
+                                positive_buckets: vec![0.5, 0.5],
+                                negative_buckets: Vec::new(),
+                                custom_values: Vec::new(),
+                            },
+                        })
+                        .collect(),
+                }],
+            )
         };
         let per_histogram_point = std::mem::size_of::<HistogramSample>() as u64
             + std::mem::size_of::<Span>() as u64
@@ -612,16 +692,16 @@ mod tests {
 
     #[test]
     fn slices_are_inclusive_on_both_ends_and_keep_equal_timestamps() {
-        let cached = CachedSelector {
-            window: TimeRange {
+        let cached = CachedSelector::new(
+            TimeRange {
                 start_ns: 0,
                 end_ns: 100,
             },
-            series: vec![SeriesData {
+            vec![SeriesData {
                 labels: LabelSet::default(),
                 samples: samples(&[5, 10, 10, 20, 30, 30, 40]),
             }],
-        };
+        );
         let got: Vec<Vec<i64>> = cached
             .slices(TimeRange {
                 start_ns: 10,
@@ -729,13 +809,13 @@ mod tests {
     }
 
     fn one_series_read(window: TimeRange) -> Rc<CachedSelector<SeriesData>> {
-        Rc::new(CachedSelector {
+        Rc::new(CachedSelector::new(
             window,
-            series: vec![SeriesData {
+            vec![SeriesData {
                 labels: LabelSet::default(),
                 samples: samples(&[window.start_ns, window.end_ns]),
             }],
-        })
+        ))
     }
 
     #[test]
@@ -792,5 +872,212 @@ mod tests {
         // The replacement's bytes stand in for the replaced entry's.
         assert_eq!(stats.bytes, one_series_read(union).bytes());
         assert_eq!(stats.fallback_keys, 0);
+    }
+
+    /// `cached.slices(request)` as `(ts_ns, value bits)` per series, so NaN
+    /// payloads and -0.0 compare exactly.
+    fn sliced_bits(
+        cached: &CachedSelector<SeriesData>,
+        request: TimeRange,
+        take: usize,
+    ) -> Vec<Vec<(i64, u64)>> {
+        cached
+            .slices(request)
+            .take(take)
+            .map(|(_, points)| {
+                points
+                    .iter()
+                    .map(|p| (p.ts_ns, p.value.to_bits()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The slice by two binary searches, as before the cursors.
+    fn searched_bits(
+        series: &[SeriesData],
+        request: TimeRange,
+        take: usize,
+    ) -> Vec<Vec<(i64, u64)>> {
+        series
+            .iter()
+            .take(take)
+            .map(|s| {
+                let lo = s.samples.partition_point(|p| p.ts_ns < request.start_ns);
+                let hi = s
+                    .samples
+                    .partition_point(|p| p.ts_ns <= request.end_ns)
+                    .max(lo);
+                s.samples[lo..hi]
+                    .iter()
+                    .map(|p| (p.ts_ns, p.value.to_bits()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn series_strategy() -> impl proptest::strategy::Strategy<Value = SeriesData> {
+        use proptest::prelude::*;
+        // Gaps of 0 give equal timestamps; up to 400 points with gaps up to
+        // 3 put a jump past the cursor walk inside the data.
+        (
+            -50i64..50,
+            proptest::collection::vec((0i64..4, any::<u64>()), 0..400),
+        )
+            .prop_map(|(first, points)| {
+                let mut ts = first;
+                SeriesData {
+                    labels: LabelSet::default(),
+                    samples: points
+                        .into_iter()
+                        .map(|(gap, bits)| {
+                            ts += gap;
+                            Sample {
+                                ts_ns: ts,
+                                value: f64::from_bits(bits),
+                            }
+                        })
+                        .collect(),
+                }
+            })
+    }
+
+    fn move_strategy() -> impl proptest::strategy::Strategy<Value = i64> {
+        use proptest::prelude::*;
+        prop_oneof![
+            6 => 0i64..6,   // a grid step
+            2 => Just(0),   // the same window again
+            2 => -120i64..0, // backwards
+            1 => 64i64..1_200, // a jump
+        ]
+    }
+
+    proptest::proptest! {
+        /// Whatever order requests arrive in (monotone, repeated, backwards,
+        /// jumping, empty, outside the data, the whole window, or a request
+        /// whose iterator is dropped part way), every series' slice is the
+        /// two-binary-search slice, bit for bit.
+        #[test]
+        fn cursor_slices_equal_searched_slices_for_any_request_sequence(
+            series in proptest::collection::vec(series_strategy(), 1..4),
+            first_start in -200i64..200,
+            requests in proptest::collection::vec(
+                (move_strategy(), -5i64..80, 0usize..5, 0u8..10),
+                1..80,
+            ),
+        ) {
+            let window = TimeRange { start_ns: -1_000, end_ns: 5_000 };
+            let cached = CachedSelector::new(window, series.clone());
+            let mut start = first_start;
+            for (delta, width, take, whole) in requests {
+                start += delta;
+                let request = if whole == 0 {
+                    window
+                } else {
+                    TimeRange { start_ns: start, end_ns: start + width }
+                };
+                proptest::prop_assert_eq!(
+                    sliced_bits(&cached, request, take),
+                    searched_bits(&series, request, take),
+                    "request {:?}", request
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_monotone_range_searches_once_and_a_backwards_request_reseats_once() {
+        // One series sampled every 15 s, a 5 m window stepped by 60 s.
+        let second = 1_000_000_000i64;
+        let ts: Vec<i64> = (0..2_000).map(|i| i * 15 * second).collect();
+        let series = vec![SeriesData {
+            labels: LabelSet::default(),
+            samples: samples(&ts),
+        }];
+        let cached = CachedSelector::new(
+            TimeRange {
+                start_ns: 0,
+                end_ns: 30_000 * second,
+            },
+            series.clone(),
+        );
+        let request = |t: i64| TimeRange {
+            start_ns: (t - 300) * second,
+            end_ns: t * second,
+        };
+        let check = |t: i64| {
+            assert_eq!(
+                sliced_bits(&cached, request(t), usize::MAX),
+                searched_bits(&series, request(t), usize::MAX)
+            );
+        };
+        check(600);
+        assert_eq!(cached.reseats.get(), 1, "the first step seats the cursors");
+        for step in 1..400 {
+            check(600 + step * 60);
+        }
+        assert_eq!(cached.reseats.get(), 1, "no search after the first step");
+        check(600 + 100 * 60);
+        assert_eq!(cached.reseats.get(), 2, "a backwards request re-seats once");
+        check(600 + 101 * 60);
+        assert_eq!(
+            cached.reseats.get(),
+            2,
+            "and the cursors walk on from there"
+        );
+    }
+
+    #[test]
+    fn a_cap_refused_replacement_releases_the_entry_it_supersedes() {
+        let narrow = float_entry(1_000);
+        let narrow_bytes = narrow.bytes();
+        let union = float_entry(4_000);
+        assert!(union.bytes() > narrow_bytes);
+        // Holds the narrow entry, or the second key's, not two of them and
+        // not the union.
+        let cap = narrow_bytes + narrow_bytes / 2;
+        assert!(union.bytes() > cap);
+        let budget = Arc::new(MemoryBudget::new(u64::MAX));
+        let cache = SelectorCache::new(cap, Some(Arc::clone(&budget)));
+        let key = |name: &str| {
+            SelectorKey::new(
+                &[LabelMatcher::equal("__name__", name)],
+                SelectorChannel::Float,
+                0,
+                None,
+            )
+        };
+
+        cache.insert(key("a"), Rc::new(narrow));
+        assert_eq!(cache.bytes(), narrow_bytes);
+        assert_eq!(budget.reserved(), narrow_bytes);
+
+        cache.insert(key("a"), Rc::new(union));
+        assert!(cache.fell_back(&key("a")));
+        assert_eq!(cache.bytes(), 0, "the superseded entry's bytes are gone");
+        assert_eq!(budget.reserved(), 0, "and so is its reservation");
+        let full = TimeRange {
+            start_ns: 0,
+            end_ns: 1_000,
+        };
+        assert!(cache.lookup::<SeriesData>(&key("a"), full).is_none());
+
+        let second = float_entry(1_000);
+        let second_bytes = second.bytes();
+        assert!(
+            narrow_bytes + second_bytes > cap,
+            "fits only in the freed room"
+        );
+        cache.insert(key("b"), Rc::new(second));
+        assert!(cache.lookup::<SeriesData>(&key("b"), full).is_some());
+        assert_eq!(cache.bytes(), second_bytes);
+        assert_eq!(budget.reserved(), second_bytes);
+
+        let (cap_fallbacks, budget_fallbacks, refusal) = cache.fallbacks();
+        assert_eq!((cap_fallbacks, budget_fallbacks), (1, 0));
+        assert!(refusal.is_none());
+        let stats = cache.stats();
+        assert_eq!((stats.fetches, stats.refetches), (3, 0));
+        assert_eq!(stats.fallback_keys, 1);
     }
 }
