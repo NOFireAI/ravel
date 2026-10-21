@@ -10550,6 +10550,74 @@ mod tests {
         }
     }
 
+    /// The placeholder is safe only because the credentials file overrides
+    /// it: an unreadable or malformed file fails `S3Store::new` at startup, so
+    /// no path falls back to the inline keys. Any container that carries the
+    /// placeholder must therefore also be pointed at the file.
+    #[test]
+    fn every_container_with_the_placeholder_reads_the_credentials_file() {
+        let static_objects = desired_objects(&base_spec(), "prod", "ns", &ctx()).expect("renders");
+        let static_job = desired_qualify_job(&base_spec(), "prod", None, Some(SIDECAR_IMAGE));
+        let static_pods = [
+            static_objects
+                .gateway_deployment
+                .spec
+                .and_then(|s| s.template.spec),
+            static_objects
+                .query_deployment
+                .spec
+                .and_then(|s| s.template.spec),
+            static_objects
+                .maintain_deployment
+                .and_then(|d| d.spec)
+                .and_then(|s| s.template.spec),
+            static_job.spec.and_then(|s| s.template.spec),
+        ]
+        .into_iter()
+        .map(|pod| ("static", pod.expect("pod spec")));
+        let pods: Vec<(&str, PodSpec)> = static_pods
+            .chain(pod_identity_pods(&pod_identity_spec()))
+            .collect();
+
+        let mut carriers = 0;
+        for (component, pod) in pods {
+            let containers = pod
+                .init_containers
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .chain(pod.containers.clone());
+            for container in containers {
+                let env = container.env.clone().unwrap_or_default();
+                if !env
+                    .iter()
+                    .any(|v| v.value.as_deref() == Some(UNUSED_CREDENTIALS_PLACEHOLDER))
+                {
+                    continue;
+                }
+                carriers += 1;
+                let args = container.args.clone().unwrap_or_default();
+                let file_arg = args
+                    .iter()
+                    .position(|arg| arg == "--s3-credentials-file")
+                    .and_then(|at| args.get(at + 1))
+                    .map(String::as_str);
+                let file_env = env
+                    .iter()
+                    .find(|v| v.name == "RAVEL_S3_CREDENTIALS_FILE")
+                    .and_then(|v| v.value.as_deref());
+                assert!(
+                    file_arg == Some(AWS_CREDENTIALS_FILE)
+                        || file_env == Some(AWS_CREDENTIALS_FILE),
+                    "{component}/{}: carries the placeholder without the credentials file",
+                    container.name
+                );
+            }
+        }
+        // Three tiers and the qualify Job under podIdentity.
+        assert_eq!(carriers, 4);
+    }
+
     #[test]
     fn a_static_spec_renders_no_pod_identity_objects() {
         let objects = desired_objects(&base_spec(), "prod", "ns", &ctx()).expect("renders");
