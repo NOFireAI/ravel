@@ -625,8 +625,13 @@ cited on #3127 put 27.9 % of all samples (55.8 % of evaluate) in
 `CachedSelector::slices`, two binary searches per series per step, so #3127
 adds them. Each series in a
 cached entry keeps the lower and upper slice bounds of the previous step.
-The next step walks forward from them for at most 64 samples. A request that
-starts before the previous one, or that would walk past 64 samples, is found
+The cursors are built by the first request narrower than the entry's window,
+so a read only ever sliced over exactly its own window (an uncached read, or
+a per-step read of a fallen-back key) builds none (issue #3150).
+The next step walks forward from them for at most 64 samples. The sample 64
+past the cursor is tested first, so a bound beyond it is searched for without
+the walk (issue #3150). A request that
+starts before the previous one, or that lies past 64 samples, is found
 by binary search over the part of the series the cursor rules out, so every
 slice is the exact `partition_point` bound whatever the cursor holds. 1c's
 objection that a cursor is valid only outside subqueries does not apply to a

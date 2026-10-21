@@ -44,7 +44,7 @@
 //! [`MemoryBudget::reserve_best_effort`], so a budget refusal here moves none
 //! of the budget's refusal counters; the query's info annotation reports it.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -241,34 +241,39 @@ const UNSEATED: (usize, usize) = (usize::MAX, usize::MAX);
 /// predicate of the same shape. When the answer lies at most
 /// [`MAX_CURSOR_WALK`] points ahead of `hint` it is reached by walking;
 /// otherwise (behind `hint`, further ahead, or `hint` past the end) it is
-/// found by binary search over the side of `hint` that holds it. The `bool`
-/// says whether a search ran. `pred` must be true on a prefix of `points` and
-/// false on the rest, which ascending `ts_ns` gives both bound predicates.
+/// found by binary search over the side of `hint` that holds it. The point
+/// [`MAX_CURSOR_WALK`] ahead of `hint` is tested before any walk, so an answer
+/// past it is searched for without walking to it. The `bool` says whether a
+/// search ran. `pred` must be true on a prefix of `points` and false on the
+/// rest, which ascending `ts_ns` gives both bound predicates.
 fn seek<P>(points: &[P], hint: usize, pred: impl Fn(&P) -> bool) -> (usize, bool) {
     if hint > points.len() || (hint > 0 && !pred(&points[hint - 1])) {
         let end = hint.min(points.len());
         return (points[..end].partition_point(pred), true);
     }
-    let stop = hint.saturating_add(MAX_CURSOR_WALK).min(points.len());
+    let far = hint.saturating_add(MAX_CURSOR_WALK);
+    if points.get(far).is_some_and(&pred) {
+        return (far + points[far..].partition_point(pred), true);
+    }
+    let stop = far.min(points.len());
     let mut at = hint;
     while at < stop && pred(&points[at]) {
         at += 1;
-    }
-    if at == stop && at < points.len() && pred(&points[at]) {
-        return (at + points[at..].partition_point(pred), true);
     }
     (at, false)
 }
 
 /// The series one selector read returned, in source order, and the window
-/// that read covered, with one lower and upper slice cursor per series.
+/// that read covered, with one lower and upper slice cursor per series once a
+/// request narrower than the window has been sliced.
 #[derive(Debug)]
 pub(crate) struct CachedSelector<S> {
     window: TimeRange,
     series: Vec<S>,
     /// Each series' `[lo, hi)` from its last [`Self::slices`] request, the
-    /// starting point for the next one.
-    cursors: Vec<Cell<(usize, usize)>>,
+    /// starting point for the next one. Built by the first request that is
+    /// not the whole window, so a read only ever returned whole has none.
+    cursors: OnceCell<Vec<Cell<(usize, usize)>>>,
     /// Series slices whose cursors were re-seated by binary search.
     #[cfg(test)]
     reseats: Cell<u64>,
@@ -278,8 +283,8 @@ impl<S: CachedSeries> CachedSelector<S> {
     pub(crate) fn new(window: TimeRange, series: Vec<S>) -> Self {
         CachedSelector {
             window,
-            cursors: series.iter().map(|_| Cell::new(UNSEATED)).collect(),
             series,
+            cursors: OnceCell::new(),
             #[cfg(test)]
             reseats: Cell::new(0),
         }
@@ -319,22 +324,22 @@ impl<S: CachedSeries> CachedSelector<S> {
         &self,
         request: TimeRange,
     ) -> impl Iterator<Item = (&LabelSet, &[S::Point])> + '_ {
-        let whole = request == self.window;
-        self.series
-            .iter()
-            .zip(&self.cursors)
-            .map(move |(s, cursor)| {
-                let points = s.points();
-                if whole {
-                    return (s.labels(), points);
-                }
-                let (lo_hint, hi_hint) = cursor.get();
-                let (lo, lo_searched) = seek(points, lo_hint, |p| S::ts_ns(p) < request.start_ns);
-                let (hi, hi_searched) = seek(points, hi_hint, |p| S::ts_ns(p) <= request.end_ns);
-                cursor.set((lo, hi));
-                self.note_reseat(lo_searched || hi_searched);
-                (s.labels(), &points[lo..hi.max(lo)])
-            })
+        let cursors = (request != self.window).then(|| {
+            self.cursors
+                .get_or_init(|| self.series.iter().map(|_| Cell::new(UNSEATED)).collect())
+        });
+        self.series.iter().enumerate().map(move |(i, s)| {
+            let points = s.points();
+            let Some(cursor) = cursors.and_then(|c| c.get(i)) else {
+                return (s.labels(), points);
+            };
+            let (lo_hint, hi_hint) = cursor.get();
+            let (lo, lo_searched) = seek(points, lo_hint, |p| S::ts_ns(p) < request.start_ns);
+            let (hi, hi_searched) = seek(points, hi_hint, |p| S::ts_ns(p) <= request.end_ns);
+            cursor.set((lo, hi));
+            self.note_reseat(lo_searched || hi_searched);
+            (s.labels(), &points[lo..hi.max(lo)])
+        })
     }
 
     #[cfg(test)]
@@ -1025,6 +1030,64 @@ mod tests {
             2,
             "and the cursors walk on from there"
         );
+    }
+
+    #[test]
+    fn a_jump_past_the_walk_tests_the_far_point_and_searches_without_walking() {
+        let ts: Vec<i64> = (0..10_000).collect();
+        let points = samples(&ts);
+        let hint = 100usize;
+        let far = hint + MAX_CURSOR_WALK;
+        let target = 5_000i64;
+        let visited = RefCell::new(Vec::new());
+        let (at, searched) = seek(&points, hint, |p| {
+            visited.borrow_mut().push(p.ts_ns);
+            p.ts_ns < target
+        });
+        assert_eq!((at, searched), (5_000, true));
+        let visited = visited.into_inner();
+        // The guard on `hint - 1`, then the far-end check, then the search.
+        assert_eq!(&visited[..2], &[hint as i64 - 1, far as i64]);
+        assert!(
+            visited[2..].iter().all(|&ts| ts >= far as i64),
+            "no point between the hint and the far end is tested: {visited:?}"
+        );
+        assert!(visited.len() <= 2 + 15, "{}", visited.len());
+    }
+
+    #[test]
+    fn a_read_sliced_over_exactly_its_own_window_builds_no_cursor() {
+        let window = TimeRange {
+            start_ns: 0,
+            end_ns: 1_000,
+        };
+        let series: Vec<SeriesData> = (0..3)
+            .map(|_| SeriesData {
+                labels: LabelSet::default(),
+                samples: samples(&(0..1_000).collect::<Vec<_>>()),
+            })
+            .collect();
+        let cached = CachedSelector::new(window, series.clone());
+        assert!(cached.cursors.get().is_none(), "a new read holds no cursor");
+        for _ in 0..3 {
+            assert_eq!(
+                sliced_bits(&cached, window, usize::MAX),
+                searched_bits(&series, window, usize::MAX)
+            );
+        }
+        assert!(
+            cached.cursors.get().is_none(),
+            "whole-window slices build no cursor"
+        );
+        let narrow = TimeRange {
+            start_ns: 10,
+            end_ns: 20,
+        };
+        assert_eq!(
+            sliced_bits(&cached, narrow, usize::MAX),
+            searched_bits(&series, narrow, usize::MAX)
+        );
+        assert_eq!(cached.cursors.get().map(Vec::len), Some(3));
     }
 
     #[test]
