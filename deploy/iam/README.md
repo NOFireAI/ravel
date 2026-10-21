@@ -1002,3 +1002,55 @@ reads are refused, the commands report every bucket condition as unknown, and
 `verify-protection` exits 2. Run them with an identity outside these templates
 that holds those four actions. Whether a shipped role should carry them is
 issue #2230.
+
+## EKS Pod Identity: one role per ServiceAccount
+
+A `RavelCluster` with `spec.storage.s3.auth: podIdentity` holds no access
+key: each pod runs as an operator-owned ServiceAccount, and an EKS Pod
+Identity association gives that account a role (ADR-0034 and ADR-0106, Pod
+Identity amendments; `docs/guides/kubernetes.md`, "Pod Identity"). These
+templates are the roles' permission policies, attached unchanged.
+
+Each role's trust policy names the Pod Identity service principal and allows
+the two actions the agent calls:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": { "Service": "pods.eks.amazonaws.com" },
+      "Action": ["sts:AssumeRole", "sts:TagSession"]
+    }
+  ]
+}
+```
+
+Which template each ServiceAccount's role gets, for a cluster named
+`<name>`:
+
+| ServiceAccount | Runs | Template |
+|---|---|---|
+| `<name>-gateway` | the gateway Deployment | `gateway.json` |
+| `<name>-query` | the query Deployment | `query.json` |
+| `<name>-maintain` | the maintain Deployment | `maintain.json` |
+| `<name>-qualify` | the store-qualification Job | `admin.json` |
+| `ravel-operator` (namespace `ravel-system`) | the operator's own `sys/auth` and reshard writes | `admin.json` |
+
+Admin is broader than either of the last two needs: qualification touches
+only `sys/qualify/<run>/` and `sys/qualification`, and the operator only
+`sys/auth` and the reshard records. No narrower shipped template exists yet,
+so a deployment that wants least privilege trims a copy of `admin.json` to
+those keys.
+
+Every pod also runs a credentials sidecar that fetches the role's
+credentials from the node-local Pod Identity agent at `169.254.170.23:80`
+(`[fd00:ec2::23]:80` on an IPv6 cluster). A NetworkPolicy that denies egress
+by default must allow it.
+
+The sidecar exists because the server's own keyless mode,
+`--s3-auth instance-role` (`crates/ravel-object-store/src/s3/instance_role.rs`),
+speaks EC2 IMDSv2 only. On an EKS node it returns the node's instance role,
+which every pod on the node shares, so it can never give the gateway, query
+and maintain tiers the separate roles above.

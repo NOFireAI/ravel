@@ -158,9 +158,12 @@ pub struct StorageSpec {
 }
 
 /// S3 backend configuration. `bucket`/`region`/`endpoint`/`allowHttp`/
-/// `uploadIntegrity`/`requestStoredChecksum` render as CLI flags;
-/// credentials are injected as env vars from a Secret via `valueFrom`, never
-/// as literal flag values (ADR-0034 decision 2).
+/// `uploadIntegrity`/`requestStoredChecksum` render as CLI flags. Under
+/// `auth: static` credentials are injected as env vars from a Secret via
+/// `valueFrom`, never as literal flag values (ADR-0034 decision 2); under
+/// `auth: podIdentity` no Secret is read and a credentials sidecar writes a
+/// short-lived credentials file instead (ADR-0034, Pod Identity storage
+/// credentials amendment).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct S3Spec {
@@ -219,9 +222,65 @@ pub struct S3Spec {
     #[serde(default = "default_true")]
     pub request_stored_checksum: bool,
 
+    /// Where every pod and the operator get their storage credentials:
+    /// `static` (the default) or `podIdentity`.
+    ///
+    /// `static`: the static key pair in `credentialsSecretRef` (and the
+    /// per-tier `credentialsSecretRef` overrides), injected as env vars.
+    ///
+    /// `podIdentity`: EKS Pod Identity, with no key in any Secret. Only EKS
+    /// Pod Identity is supported; IRSA (web identity) is not. The operator
+    /// creates the ServiceAccounts `<name>-gateway`, `<name>-query`,
+    /// `<name>-maintain` and `<name>-qualify` in this namespace and runs the
+    /// three tiers and the store-qualification Job as them; the cluster's
+    /// Pod Identity associations must name these four, each with the role
+    /// for that tier. The webhook then injects
+    /// `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+    /// `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, and a native sidecar
+    /// (`ravel-operator pod-identity-credentials`, the operator's own image,
+    /// set by its `--credentials-sidecar-image` flag) keeps a credentials
+    /// file on a memory-backed volume at
+    /// `/var/run/ravel/aws/credentials.json`, which the server reads through
+    /// `--s3-credentials-file`. `RAVEL_S3_ACCESS_KEY` and
+    /// `RAVEL_S3_SECRET_KEY` are set to the literal
+    /// `unused-credentials-file-wins`: the binaries still require both under
+    /// `--s3-auth static` and the file overrides them. The operator's own
+    /// ServiceAccount (`ravel-system/ravel-operator` in the shipped
+    /// manifests) needs an association too, for its `sys/auth` and reshard
+    /// writes. The pods need egress to the agent at `169.254.170.23:80`.
+    /// `credentialsSecretRef` is not read and the per-tier overrides are
+    /// refused under this mode, and the maintain-first `sys/gc` bootstrap
+    /// hold applies.
+    /// Switching modes re-runs store qualification.
+    #[serde(default)]
+    pub auth: S3AuthSpec,
+
     /// Secret with keys `accessKeyId` and `secretAccessKey`, injected as the
-    /// `RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars.
-    pub credentials_secret_ref: LocalSecretRef,
+    /// `RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars. Required under
+    /// `auth: static`; not read under `auth: podIdentity`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_secret_ref: Option<LocalSecretRef>,
+}
+
+/// The `storage.s3.auth` values.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum S3AuthSpec {
+    /// A static key pair from `credentialsSecretRef`. The default.
+    #[default]
+    Static,
+    /// EKS Pod Identity through the operator's credentials sidecar.
+    PodIdentity,
+}
+
+impl S3AuthSpec {
+    /// The value as the CRD spells it.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            S3AuthSpec::Static => "static",
+            S3AuthSpec::PodIdentity => "podIdentity",
+        }
+    }
 }
 
 /// The `uploadIntegrity` values, spelled exactly as `ravel-server`'s
@@ -282,6 +341,8 @@ pub struct GatewaySpec {
     /// so an operator can scope the gateway to a narrower IAM credential. Falls
     /// back to the shared credential when unset, so existing single-credential
     /// clusters are unaffected.
+    /// Refused under `storage.s3.auth: podIdentity`, where the tier's role
+    /// comes from its ServiceAccount's Pod Identity association.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_secret_ref: Option<LocalSecretRef>,
 
@@ -712,6 +773,8 @@ pub struct QuerySpec {
     /// so an operator can scope the query tier to a narrower IAM credential. Falls
     /// back to the shared credential when unset, so existing single-credential
     /// clusters are unaffected.
+    /// Refused under `storage.s3.auth: podIdentity`, where the tier's role
+    /// comes from its ServiceAccount's Pod Identity association.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_secret_ref: Option<LocalSecretRef>,
 
@@ -834,6 +897,8 @@ pub struct MaintainSpec {
     /// operator points the delete-capable credential. Falls back to the shared
     /// credential when unset, so existing single-credential clusters are
     /// unaffected.
+    /// Refused under `storage.s3.auth: podIdentity`, where the tier's role
+    /// comes from its ServiceAccount's Pod Identity association.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_secret_ref: Option<LocalSecretRef>,
 }
@@ -1129,6 +1194,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     inject_gateway_exposure_affinity_guard(&mut crd);
     inject_canonical_tenant_backend_guard(&mut crd);
     inject_flush_share_guard(&mut crd);
+    inject_storage_auth_guards(&mut crd);
     crd
 }
 
@@ -1518,6 +1584,79 @@ fn inject_flush_share_guard(crd: &mut CustomResourceDefinition) {
         let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
         rules.push(rule.clone());
         gateway.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced when `storage.s3` names no credential Secret under
+/// `auth: static`.
+const STATIC_AUTH_SECRET_MESSAGE: &str = "credentialsSecretRef is required under auth: static";
+
+/// `storage.s3.credentialsSecretRef` is required unless `auth` is
+/// `podIdentity`. `auth` carries a schema default, so `has()` is a belt for a
+/// manifest evaluated before defaulting.
+const STATIC_AUTH_SECRET_RULE: &str =
+    "(has(self.auth) && self.auth == 'podIdentity') || has(self.credentialsSecretRef)";
+
+/// Message surfaced when a per-tier credential override is set under
+/// `auth: podIdentity`.
+const POD_IDENTITY_TIER_OVERRIDE_MESSAGE: &str = "gateway, query and maintain \
+    credentialsSecretRef overrides are refused under storage.s3.auth: podIdentity; each tier's \
+    role comes from the Pod Identity association on its ServiceAccount (<name>-gateway, \
+    <name>-query, <name>-maintain)";
+
+/// No per-tier `credentialsSecretRef` under `podIdentity`. Each tier block
+/// carries a serde default and may be omitted, so each is `has()`-guarded.
+const POD_IDENTITY_TIER_OVERRIDE_RULE: &str = "!has(self.storage.s3.auth) || \
+    self.storage.s3.auth != 'podIdentity' || \
+    ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+    (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+    (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))";
+
+/// Attach the two `storage.s3.auth` rules (ADR-0034, Pod Identity storage
+/// credentials amendment): on `storage.s3`, the shared Secret is required
+/// under `static`; on `spec`, the per-tier overrides are refused under
+/// `podIdentity`. The second rule reads three sibling blocks, so it sits on
+/// `spec`, their common parent. Injected post-hoc and appended to any rules
+/// already there, like the other injectors.
+fn inject_storage_auth_guards(crd: &mut CustomResourceDefinition) {
+    let static_rule = ValidationRule {
+        rule: STATIC_AUTH_SECRET_RULE.to_string(),
+        message: Some(STATIC_AUTH_SECRET_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    let tier_rule = ValidationRule {
+        rule: POD_IDENTITY_TIER_OVERRIDE_RULE.to_string(),
+        message: Some(POD_IDENTITY_TIER_OVERRIDE_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let mut spec_rules = spec.x_kubernetes_validations.take().unwrap_or_default();
+        spec_rules.push(tier_rule.clone());
+        spec.x_kubernetes_validations = Some(spec_rules);
+        let Some(s3) = spec
+            .properties
+            .as_mut()
+            .and_then(|spec_props| spec_props.get_mut("storage"))
+            .and_then(|storage| storage.properties.as_mut())
+            .and_then(|storage_props| storage_props.get_mut("s3"))
+        else {
+            continue;
+        };
+        let mut s3_rules = s3.x_kubernetes_validations.take().unwrap_or_default();
+        s3_rules.push(static_rule.clone());
+        s3.x_kubernetes_validations = Some(s3_rules);
     }
 }
 
@@ -2727,5 +2866,143 @@ mod tests {
             "deploy/k8s/operator/crd.yaml is stale; regenerate with: \
              cargo run -p ravel-operator -- --print-crd > deploy/k8s/operator/crd.yaml"
         );
+    }
+
+    /// The `storage.s3` and `spec` schema nodes of the generated CRD.
+    fn spec_and_s3_schema() -> (
+        k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps,
+        k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaProps,
+    ) {
+        let crd = ravel_cluster_crd();
+        let spec = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .cloned()
+            .expect("spec prop");
+        let s3 = spec
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("storage"))
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("s3"))
+            .cloned()
+            .expect("storage.s3 prop");
+        (spec, s3)
+    }
+
+    #[test]
+    fn storage_auth_defaults_to_static_and_spells_pod_identity_in_camel_case() {
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "credentialsSecretRef": { "name": "creds" } } }
+        }))
+        .expect("a pre-auth manifest still deserializes");
+        assert_eq!(spec.storage.s3.auth, S3AuthSpec::Static);
+
+        let spec: RavelClusterSpec = serde_json::from_value(serde_json::json!({
+            "image": "ravel:dev",
+            "shards": 4,
+            "storage": { "s3": { "bucket": "b", "auth": "podIdentity" } }
+        }))
+        .expect("a podIdentity manifest needs no Secret");
+        assert_eq!(spec.storage.s3.auth, S3AuthSpec::PodIdentity);
+        assert_eq!(spec.storage.s3.credentials_secret_ref, None);
+        assert_eq!(
+            serde_json::to_value(S3AuthSpec::PodIdentity).expect("serialize"),
+            serde_json::json!("podIdentity")
+        );
+        assert_eq!(S3AuthSpec::PodIdentity.spelling(), "podIdentity");
+        assert_eq!(S3AuthSpec::Static.spelling(), "static");
+
+        let (_, s3) = spec_and_s3_schema();
+        let auth = s3
+            .properties
+            .as_ref()
+            .and_then(|p| p.get("auth"))
+            .expect("auth prop");
+        assert_eq!(
+            auth.default.as_ref().map(|d| d.0.clone()),
+            Some(serde_json::json!("static"))
+        );
+        assert!(
+            !s3.required
+                .clone()
+                .unwrap_or_default()
+                .contains(&"credentialsSecretRef".to_string()),
+            "credentialsSecretRef is optional in the schema; CEL requires it under static"
+        );
+    }
+
+    /// Rust mirror of [`STATIC_AUTH_SECRET_RULE`]: whether `storage.s3` is
+    /// admitted. `auth: None` is a manifest evaluated before defaulting.
+    fn static_auth_cel_admits(auth: Option<&str>, has_secret: bool) -> bool {
+        auth == Some("podIdentity") || has_secret
+    }
+
+    /// Rust mirror of [`POD_IDENTITY_TIER_OVERRIDE_RULE`].
+    fn tier_override_cel_admits(auth: Option<&str>, overrides: [bool; 3]) -> bool {
+        auth != Some("podIdentity") || overrides.iter().all(|set| !set)
+    }
+
+    #[test]
+    fn storage_auth_rules_sit_on_storage_s3_and_spec() {
+        let (spec, s3) = spec_and_s3_schema();
+        let s3_rules = s3
+            .x_kubernetes_validations
+            .expect("storage.s3 carries a CEL rule");
+        let rule = s3_rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "(has(self.auth) && self.auth == 'podIdentity') || \
+                        has(self.credentialsSecretRef)"
+            })
+            .expect("the exact static-secret rule");
+        assert_eq!(
+            rule.message.as_deref(),
+            Some("credentialsSecretRef is required under auth: static")
+        );
+        let spec_rules = spec
+            .x_kubernetes_validations
+            .expect("spec carries a CEL rule");
+        let rule = spec_rules
+            .iter()
+            .find(|r| {
+                r.rule
+                    == "!has(self.storage.s3.auth) || self.storage.s3.auth != 'podIdentity' || \
+                        ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && \
+                        (!has(self.query) || !has(self.query.credentialsSecretRef)) && \
+                        (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
+            })
+            .expect("the exact tier-override rule");
+        assert_eq!(
+            rule.message.as_deref(),
+            Some(POD_IDENTITY_TIER_OVERRIDE_MESSAGE)
+        );
+
+        assert!(static_auth_cel_admits(Some("static"), true));
+        assert!(static_auth_cel_admits(None, true));
+        assert!(!static_auth_cel_admits(Some("static"), false));
+        assert!(!static_auth_cel_admits(None, false));
+        assert!(static_auth_cel_admits(Some("podIdentity"), false));
+        assert!(static_auth_cel_admits(Some("podIdentity"), true));
+
+        assert!(tier_override_cel_admits(Some("static"), [true, true, true]));
+        assert!(tier_override_cel_admits(None, [true, false, false]));
+        assert!(tier_override_cel_admits(
+            Some("podIdentity"),
+            [false, false, false]
+        ));
+        for overrides in [
+            [true, false, false],
+            [false, true, false],
+            [false, false, true],
+        ] {
+            assert!(!tier_override_cel_admits(Some("podIdentity"), overrides));
+        }
     }
 }

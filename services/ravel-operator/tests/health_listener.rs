@@ -276,7 +276,7 @@ async fn one_reconcile_raises_the_ok_counter_by_one_and_healthz_answers_200() {
     let health_addr = health_listener
         .local_addr()
         .expect("health listener address");
-    let operator = tokio::spawn(controller::run_on(health_listener, client, None));
+    let operator = tokio::spawn(controller::run_on(health_listener, client, None, None));
 
     // Before the RavelCluster list is released: alive, not ready, no reconcile.
     assert_eq!(get(health_addr, "/healthz").await.0, 200);

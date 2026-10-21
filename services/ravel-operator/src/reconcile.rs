@@ -16,11 +16,12 @@ use std::time::Duration;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
-    Affinity, Capabilities, Container, ContainerPort, EnvVar, EnvVarSource, HTTPGetAction,
-    KeyToPath, Lifecycle, LifecycleHandler, ObjectFieldSelector, PodAffinityTerm, PodAntiAffinity,
-    PodSecurityContext, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SeccompProfile,
-    SecretKeySelector, SecretVolumeSource, SecurityContext, Service, ServiceAccount, ServicePort,
-    ServiceSpec, SleepAction, Volume, VolumeMount, WeightedPodAffinityTerm,
+    Affinity, Capabilities, Container, ContainerPort, EmptyDirVolumeSource, EnvVar, EnvVarSource,
+    ExecAction, HTTPGetAction, KeyToPath, Lifecycle, LifecycleHandler, ObjectFieldSelector,
+    PodAffinityTerm, PodAntiAffinity, PodSecurityContext, PodSpec, PodTemplateSpec, Probe,
+    ResourceRequirements, SeccompProfile, SecretKeySelector, SecretVolumeSource, SecurityContext,
+    Service, ServiceAccount, ServicePort, ServiceSpec, SleepAction, Volume, VolumeMount,
+    WeightedPodAffinityTerm,
 };
 use k8s_openapi::api::networking::v1::{
     HTTPIngressPath, HTTPIngressRuleValue, Ingress, IngressBackend, IngressRule,
@@ -39,7 +40,8 @@ use crate::crd::{
     AffinityBackend, AffinityKeySource, GATEWAY_DEFAULT_CPU_REQUEST,
     GATEWAY_DEFAULT_MEMORY_REQUEST, GatewayReference, IngestAffinitySpec, LocalSecretRef,
     MAINTAIN_DEFAULT_CPU_REQUEST, MAINTAIN_DEFAULT_MEMORY_REQUEST, QUERY_DEFAULT_CPU_REQUEST,
-    QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec, ResourceRequirementsSpec, S3UploadIntegrity,
+    QUERY_DEFAULT_MEMORY_REQUEST, RavelClusterSpec, ResourceRequirementsSpec, S3AuthSpec,
+    S3UploadIntegrity,
 };
 
 /// A spec that cannot be rendered into a valid object set.
@@ -167,6 +169,40 @@ pub enum RenderError {
     DistributedQuerySecretRefMissing {
         /// The camelCase field names that are unset, in schema order.
         missing: Vec<&'static str>,
+    },
+
+    /// `spec.storage.s3.auth` is `podIdentity` but the operator runs without
+    /// `--credentials-sidecar-image`, so it has no image for the credentials
+    /// sidecar every pod needs. Nothing renders, the qualify Job included:
+    /// a pod without the sidecar has no credentials at all.
+    #[error(
+        "spec.storage.s3.auth is podIdentity but the operator has no credentials sidecar image; \
+         start ravel-operator with --credentials-sidecar-image (env \
+         RAVEL_CREDENTIALS_SIDECAR_IMAGE) set to its own image"
+    )]
+    CredentialsSidecarImageUnset,
+
+    /// `spec.storage.s3.auth` is `static` (the default) but
+    /// `spec.storage.s3.credentialsSecretRef` is unset. The CRD's CEL rule
+    /// refuses this at admission; the render refuses it too, for an object
+    /// admitted before the rule existed.
+    #[error(
+        "spec.storage.s3.credentialsSecretRef is required under spec.storage.s3.auth static; \
+         reference the Secret holding accessKeyId and secretAccessKey, or set auth: podIdentity"
+    )]
+    StaticCredentialsSecretRefMissing,
+
+    /// A per-tier `credentialsSecretRef` is set under `podIdentity`, where
+    /// each tier's role comes from its ServiceAccount. Refused by CEL at
+    /// admission and here, so an override can never be silently ignored.
+    #[error(
+        "spec.{tier}.credentialsSecretRef is set but spec.storage.s3.auth is podIdentity, where \
+         the {tier} role comes from the Pod Identity association on its ServiceAccount; remove \
+         the override"
+    )]
+    PodIdentityTierOverride {
+        /// The tier whose override is set: `gateway`, `query` or `maintain`.
+        tier: &'static str,
     },
 }
 
@@ -329,6 +365,12 @@ pub struct RenderCtx {
     /// startup, so a rotation must roll the query pods; folded only into the
     /// query tier's checksum, since no other tier mounts them.
     pub distributed_query_resource_versions: Vec<String>,
+
+    /// The image of the Pod Identity credentials sidecar (the operator's
+    /// `--credentials-sidecar-image`), rendered only under
+    /// `storage.s3.auth: podIdentity`. `None` under `podIdentity` fails the
+    /// render with [`RenderError::CredentialsSidecarImageUnset`].
+    pub credentials_sidecar_image: Option<String>,
 }
 
 /// Resolve the credential Secret name a tier consumes: its own
@@ -338,13 +380,20 @@ pub struct RenderCtx {
 /// ([`s3_credential_env`]) and the change-detection checksum
 /// ([`tier_secrets_checksum`]) can never disagree about which Secret a tier
 /// actually uses.
+///
+/// `None` under `storage.s3.auth: podIdentity`, where no tier reads a
+/// credential Secret, and for a `static` spec with no shared Secret, which
+/// [`validate_storage_auth`] refuses before anything renders.
 fn tier_credentials_secret_name<'a>(
     spec: &'a RavelClusterSpec,
     tier_override: Option<&'a LocalSecretRef>,
-) -> &'a str {
+) -> Option<&'a str> {
+    if pod_identity(spec) {
+        return None;
+    }
     tier_override
+        .or(spec.storage.s3.credentials_secret_ref.as_ref())
         .map(|r| r.name.as_str())
-        .unwrap_or(&spec.storage.s3.credentials_secret_ref.name)
 }
 
 /// A deterministic change-detection checksum over the Secrets a tier
@@ -437,10 +486,8 @@ fn tier_secrets_checksum(
     audit_key_rv: Option<&str>,
     distributed_query_rvs: &[String],
 ) -> String {
-    let secret_name = tier_credentials_secret_name(spec, tier_override);
-    let credentials_rv = ctx
-        .credential_resource_versions
-        .get(secret_name)
+    let credentials_rv = tier_credentials_secret_name(spec, tier_override)
+        .and_then(|secret_name| ctx.credential_resource_versions.get(secret_name))
         .map(String::as_str);
     let mut fields = secrets_checksum_fields(
         ctx.token_resource_version.as_deref(),
@@ -487,11 +534,30 @@ fn child_name(instance: &str, component: &str) -> String {
 /// section 5): when `Some`, the tier sources its credentials from that Secret;
 /// when `None`, it falls back to the shared `storage.s3.credentialsSecretRef`,
 /// so a spec with no overrides renders exactly as before.
+///
+/// Under `storage.s3.auth: podIdentity` both variables carry the literal
+/// [`UNUSED_CREDENTIALS_PLACEHOLDER`] instead: `ravel-server` and `ravel-cli`
+/// require them under `--s3-auth static` even when `--s3-credentials-file` is
+/// set, and the file overrides them, so no key is ever read from them.
 fn s3_credential_env(
     spec: &RavelClusterSpec,
     tier_override: Option<&LocalSecretRef>,
 ) -> Vec<EnvVar> {
-    let secret = tier_credentials_secret_name(spec, tier_override);
+    if pod_identity(spec) {
+        return ["RAVEL_S3_ACCESS_KEY", "RAVEL_S3_SECRET_KEY"]
+            .into_iter()
+            .map(|name| EnvVar {
+                name: name.to_string(),
+                value: Some(UNUSED_CREDENTIALS_PLACEHOLDER.to_string()),
+                ..Default::default()
+            })
+            .collect();
+    }
+    // A static spec with no Secret at all is refused by
+    // `validate_storage_auth` before any render runs.
+    let Some(secret) = tier_credentials_secret_name(spec, tier_override) else {
+        return Vec::new();
+    };
     vec![
         EnvVar {
             name: "RAVEL_S3_ACCESS_KEY".to_string(),
@@ -504,6 +570,232 @@ fn s3_credential_env(
             ..Default::default()
         },
     ]
+}
+
+/// The memory-backed volume the Pod Identity sidecar writes the credentials
+/// file to.
+pub const AWS_CREDENTIALS_VOLUME_NAME: &str = "aws-credentials";
+
+/// Where [`AWS_CREDENTIALS_VOLUME_NAME`] is mounted, in the sidecar
+/// (read-write) and in the server or `ravel-cli` container (read-only).
+pub const AWS_CREDENTIALS_MOUNT_DIR: &str = "/var/run/ravel/aws";
+
+/// The credentials file the sidecar writes and `--s3-credentials-file` names.
+pub const AWS_CREDENTIALS_FILE: &str = "/var/run/ravel/aws/credentials.json";
+
+/// The volume's `sizeLimit`. The file is a few hundred bytes; on a memory
+/// medium the limit also caps what the volume can charge to the pod.
+pub const AWS_CREDENTIALS_VOLUME_SIZE_LIMIT: &str = "1Mi";
+
+/// The name of the Pod Identity sidecar initContainer.
+pub const POD_IDENTITY_SIDECAR_NAME: &str = "pod-identity-credentials";
+
+/// The value `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` carry under
+/// `podIdentity` (see [`s3_credential_env`]). Spelled to say what it is to
+/// anyone reading a pod spec.
+pub const UNUSED_CREDENTIALS_PLACEHOLDER: &str = "unused-credentials-file-wins";
+
+/// The operator binary inside its image; the sidecar's startup probe execs it
+/// directly because the image is distroless and has no shell.
+const OPERATOR_BINARY_PATH: &str = "/usr/local/bin/ravel-operator";
+
+/// Startup probe period of the sidecar.
+pub const POD_IDENTITY_SIDECAR_PROBE_PERIOD_SECONDS: i32 = 2;
+
+/// Startup probe failure threshold of the sidecar: 60 x 2 s, two minutes for
+/// the first fetch before the kubelet restarts the sidecar.
+pub const POD_IDENTITY_SIDECAR_PROBE_FAILURE_THRESHOLD: i32 = 60;
+
+/// Whether the cluster runs on EKS Pod Identity (`storage.s3.auth:
+/// podIdentity`) rather than a static key Secret.
+pub fn pod_identity(spec: &RavelClusterSpec) -> bool {
+    spec.storage.s3.auth == S3AuthSpec::PodIdentity
+}
+
+/// Refuse a storage-auth configuration that cannot render: `podIdentity`
+/// with no sidecar image, `podIdentity` with a per-tier override, or `static`
+/// with no credential Secret. The CRD's CEL rules refuse the last two at
+/// admission; this covers objects admitted before those rules existed and the
+/// operator flag the CRD cannot see. Called by [`desired_objects`] and, before
+/// the qualification gate, by the controller.
+pub fn validate_storage_auth(
+    spec: &RavelClusterSpec,
+    credentials_sidecar_image: Option<&str>,
+) -> Result<(), RenderError> {
+    match spec.storage.s3.auth {
+        S3AuthSpec::Static => {
+            if spec.storage.s3.credentials_secret_ref.is_none() {
+                return Err(RenderError::StaticCredentialsSecretRefMissing);
+            }
+        }
+        S3AuthSpec::PodIdentity => {
+            for (tier, set) in [
+                ("gateway", spec.gateway.credentials_secret_ref.is_some()),
+                ("query", spec.query.credentials_secret_ref.is_some()),
+                ("maintain", spec.maintain.credentials_secret_ref.is_some()),
+            ] {
+                if set {
+                    return Err(RenderError::PodIdentityTierOverride { tier });
+                }
+            }
+            if credentials_sidecar_image.is_none_or(str::is_empty) {
+                return Err(RenderError::CredentialsSidecarImageUnset);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `aws-credentials` volume: an `emptyDir` on memory (tmpfs), so the
+/// short-lived credential never reaches the node's disk.
+fn aws_credentials_volume() -> Volume {
+    Volume {
+        name: AWS_CREDENTIALS_VOLUME_NAME.to_string(),
+        empty_dir: Some(EmptyDirVolumeSource {
+            medium: Some("Memory".to_string()),
+            size_limit: Some(Quantity(AWS_CREDENTIALS_VOLUME_SIZE_LIMIT.to_string())),
+        }),
+        ..Default::default()
+    }
+}
+
+/// A mount of [`aws_credentials_volume`] at [`AWS_CREDENTIALS_MOUNT_DIR`].
+fn aws_credentials_mount(read_only: bool) -> VolumeMount {
+    VolumeMount {
+        name: AWS_CREDENTIALS_VOLUME_NAME.to_string(),
+        mount_path: AWS_CREDENTIALS_MOUNT_DIR.to_string(),
+        read_only: Some(read_only),
+        ..Default::default()
+    }
+}
+
+/// The Pod Identity credentials sidecar: a native sidecar (an initContainer
+/// with `restartPolicy: Always`: the `SidecarContainers` feature is on by
+/// default since Kubernetes 1.29 and stable in 1.33, so inside the
+/// [`MIN_KUBERNETES_MINOR_VERSION`] floor) running the operator image's
+/// `pod-identity-credentials` subcommand. Its startup probe passes once the
+/// credentials file exists and parses, and the kubelet starts the main
+/// container only after that, so the server never starts without a file.
+///
+/// It carries the server's [`container_security_context`] and sets no user:
+/// both images are distroless `nonroot` (UID 65532), so the 0600 file it
+/// writes is readable by the server container. The Pod Identity webhook
+/// injects the agent URI and token-file variables and the token volume into
+/// the pod's containers, which is where the sidecar reads them.
+fn pod_identity_sidecar(image: &str) -> Container {
+    Container {
+        name: POD_IDENTITY_SIDECAR_NAME.to_string(),
+        image: Some(image.to_string()),
+        // The operator's own Deployment pulls its image IfNotPresent; the
+        // sidecar is that image.
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        args: Some(vec![
+            "pod-identity-credentials".to_string(),
+            "--output".to_string(),
+            AWS_CREDENTIALS_FILE.to_string(),
+        ]),
+        restart_policy: Some("Always".to_string()),
+        startup_probe: Some(Probe {
+            exec: Some(ExecAction {
+                command: Some(vec![
+                    OPERATOR_BINARY_PATH.to_string(),
+                    "pod-identity-credentials".to_string(),
+                    "--probe".to_string(),
+                    AWS_CREDENTIALS_FILE.to_string(),
+                ]),
+            }),
+            period_seconds: Some(POD_IDENTITY_SIDECAR_PROBE_PERIOD_SECONDS),
+            failure_threshold: Some(POD_IDENTITY_SIDECAR_PROBE_FAILURE_THRESHOLD),
+            ..Default::default()
+        }),
+        resources: Some(ResourceRequirements {
+            requests: Some(BTreeMap::from([
+                ("cpu".to_string(), Quantity("10m".to_string())),
+                ("memory".to_string(), Quantity("16Mi".to_string())),
+            ])),
+            limits: Some(BTreeMap::from([(
+                "memory".to_string(),
+                Quantity("32Mi".to_string()),
+            )])),
+            claims: None,
+        }),
+        volume_mounts: Some(vec![aws_credentials_mount(false)]),
+        security_context: Some(container_security_context()),
+        ..Default::default()
+    }
+}
+
+/// The pod-level additions `podIdentity` makes to a tier or Job pod: the
+/// ServiceAccount, the `aws-credentials` volume, the sidecar, and the
+/// server container's read-only mount. A no-op for a `static` spec, which
+/// therefore renders byte-identical to before the field existed.
+fn add_pod_identity(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    component: &str,
+    credentials_sidecar_image: Option<&str>,
+    pod: &mut PodSpec,
+) {
+    if !pod_identity(spec) {
+        return;
+    }
+    pod.service_account_name = Some(child_name(instance, component));
+    pod.volumes
+        .get_or_insert_with(Vec::new)
+        .push(aws_credentials_volume());
+    for container in &mut pod.containers {
+        container
+            .volume_mounts
+            .get_or_insert_with(Vec::new)
+            .push(aws_credentials_mount(true));
+    }
+    // `validate_storage_auth` refuses podIdentity without an image before
+    // any render; a pod without the sidecar would have no credentials.
+    if let Some(image) = credentials_sidecar_image {
+        pod.init_containers
+            .get_or_insert_with(Vec::new)
+            .push(pod_identity_sidecar(image));
+    }
+}
+
+/// The components that run as an operator-owned ServiceAccount under
+/// `podIdentity`, in apply order.
+const POD_IDENTITY_COMPONENTS: [&str; 4] = ["gateway", "query", "maintain", QUALIFY_COMPONENT];
+
+/// The ServiceAccounts the operator owns under `storage.s3.auth:
+/// podIdentity`: `<name>-gateway`, `<name>-query`, `<name>-maintain` and
+/// `<name>-qualify`, the names the cluster's Pod Identity associations
+/// must use. Empty under `static`. The maintain one is rendered even when
+/// `maintain.enabled` is false, so an association never points at a name
+/// that comes and goes with that flag.
+pub fn desired_tier_service_accounts(
+    spec: &RavelClusterSpec,
+    instance: &str,
+) -> Vec<ServiceAccount> {
+    if !pod_identity(spec) {
+        return Vec::new();
+    }
+    POD_IDENTITY_COMPONENTS
+        .iter()
+        .map(|component| ServiceAccount {
+            metadata: ObjectMeta {
+                name: Some(child_name(instance, component)),
+                labels: Some(labels(instance, component)),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .collect()
+}
+
+/// Every ServiceAccount name [`desired_tier_service_accounts`] can produce
+/// for `instance`, whatever the mode, for the controller's sweep after a
+/// switch back to `static`.
+pub fn possible_tier_service_account_names(instance: &str) -> Vec<String> {
+    POD_IDENTITY_COMPONENTS
+        .iter()
+        .map(|component| child_name(instance, component))
+        .collect()
 }
 
 /// An `EnvVarSource` reading `key` from Secret `secret`.
@@ -728,6 +1020,13 @@ fn common_store_args(spec: &RavelClusterSpec) -> Vec<String> {
     }
     if !spec.storage.s3.request_stored_checksum {
         args.push("--s3-request-stored-checksum=false".to_string());
+    }
+    // Under podIdentity the sidecar's file is the credential; `--s3-auth`
+    // stays at its `static` default, under which the file wins over the
+    // placeholder key variables (`s3_credential_env`).
+    if pod_identity(spec) {
+        args.push("--s3-credentials-file".to_string());
+        args.push(AWS_CREDENTIALS_FILE.to_string());
     }
     args
 }
@@ -1179,6 +1478,7 @@ fn deployment(
     strategy_type: &str,
     secrets_checksum: &str,
     extra_volumes: Vec<(Volume, VolumeMount)>,
+    credentials_sidecar_image: Option<&str>,
 ) -> Deployment {
     let labels = labels(instance, component);
     if spec.probes.dedicated_health_port {
@@ -1217,6 +1517,21 @@ fn deployment(
         security_context: Some(container_security_context()),
         ..Default::default()
     };
+    let mut pod = PodSpec {
+        containers: vec![container],
+        volumes: (!volumes.is_empty()).then_some(volumes),
+        termination_grace_period_seconds: Some(termination_grace_period_seconds(spec)),
+        security_context: Some(pod_security_context()),
+        affinity: Some(pod_anti_affinity(instance, component)),
+        ..Default::default()
+    };
+    add_pod_identity(
+        spec,
+        instance,
+        component,
+        credentials_sidecar_image,
+        &mut pod,
+    );
     Deployment {
         metadata: ObjectMeta {
             name: Some(child_name(instance, component)),
@@ -1244,14 +1559,7 @@ fn deployment(
                     )])),
                     ..Default::default()
                 }),
-                spec: Some(PodSpec {
-                    containers: vec![container],
-                    volumes: (!volumes.is_empty()).then_some(volumes),
-                    termination_grace_period_seconds: Some(termination_grace_period_seconds(spec)),
-                    security_context: Some(pod_security_context()),
-                    affinity: Some(pod_anti_affinity(instance, component)),
-                    ..Default::default()
-                }),
+                spec: Some(pod),
             },
             ..Default::default()
         }),
@@ -1321,6 +1629,7 @@ pub fn desired_gateway_deployment(
         "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override, None, &[]),
         Vec::new(),
+        ctx.credentials_sidecar_image.as_deref(),
     )
 }
 
@@ -1411,6 +1720,7 @@ pub fn desired_query_deployment(
             &ctx.distributed_query_resource_versions,
         ),
         extra_volumes,
+        ctx.credentials_sidecar_image.as_deref(),
     )
 }
 
@@ -1531,6 +1841,7 @@ pub fn desired_maintain_deployment(
         "RollingUpdate",
         &tier_secrets_checksum(spec, ctx, tier_override, None, &[]),
         Vec::new(),
+        ctx.credentials_sidecar_image.as_deref(),
     )))
 }
 
@@ -2453,8 +2764,12 @@ impl DeploymentTier {
 /// Maintain and Admin carry `PutObject` on `sys/gc` while Gateway and Query hold
 /// `GetObject` only. One override is enough to put the cluster in that world:
 /// the overriding tier is the one whose grants narrowed.
+///
+/// `storage.s3.auth: podIdentity` is always per-role: each tier runs as its
+/// own ServiceAccount, whose association names that tier's role.
 pub fn per_role_credentials(spec: &RavelClusterSpec) -> bool {
-    spec.gateway.credentials_secret_ref.is_some()
+    pod_identity(spec)
+        || spec.gateway.credentials_secret_ref.is_some()
         || spec.query.credentials_secret_ref.is_some()
         || spec.maintain.credentials_secret_ref.is_some()
 }
@@ -2818,7 +3133,16 @@ pub fn qualify_job_input_hash(
     } else {
         "false"
     };
-    blake3_hex(&[
+    // The credential Secret's name is absent under `podIdentity` (and for an
+    // invalid static spec, which never reaches a Job). A Secret name is never
+    // empty and never holds NUL, so the lone 0x00 cannot collide with one.
+    let credentials_name = spec
+        .storage
+        .s3
+        .credentials_secret_ref
+        .as_ref()
+        .map_or("\u{0}", |secret| secret.name.as_str());
+    let mut fields = vec![
         spec.storage.s3.bucket.as_str(),
         spec.storage.s3.region.as_str(),
         endpoint.as_str(),
@@ -2826,9 +3150,19 @@ pub fn qualify_job_input_hash(
         spec.storage.s3.upload_integrity.flag_value(),
         request_stored_checksum,
         spec.image.as_str(),
-        spec.storage.s3.credentials_secret_ref.name.as_str(),
+        credentials_name,
         credentials_rv.as_str(),
-    ])
+    ];
+    // The auth mode is hashed only away from `static`, the same way the
+    // audit-key field enters `secrets_checksum_fields` only when present: a
+    // `static` cluster hashes exactly the fields it did before the mode
+    // existed, so the upgrade that adds it re-qualifies nothing, while a
+    // switch to or from `podIdentity` is a different input (other
+    // credentials, a different Job) and re-runs qualification.
+    if pod_identity(spec) {
+        fields.push(spec.storage.s3.auth.spelling());
+    }
+    blake3_hex(&fields)
 }
 
 /// The one-shot store-qualification Job for a cluster (issue #36).
@@ -2861,10 +3195,17 @@ pub fn qualify_job_input_hash(
 /// `resourceVersion` (the controller reads it before the gate); it flows into
 /// [`qualify_job_input_hash`] so the recorded annotation matches the gate's
 /// desired hash and a fixed-name credential rotation re-qualifies.
+///
+/// Under `storage.s3.auth: podIdentity` the Job pod runs as `<name>-qualify`
+/// with the same credentials sidecar as the tiers, and `ravel-cli` reads the
+/// sidecar's file through `RAVEL_S3_CREDENTIALS_FILE`.
+/// `credentials_sidecar_image` is the operator's `--credentials-sidecar-image`
+/// and is ignored under `static`.
 pub fn desired_qualify_job(
     spec: &RavelClusterSpec,
     instance: &str,
     credentials_resource_version: Option<&str>,
+    credentials_sidecar_image: Option<&str>,
 ) -> Job {
     let labels = labels(instance, QUALIFY_COMPONENT);
     let mut env = vec![
@@ -2917,7 +3258,16 @@ pub fn desired_qualify_job(
         ..Default::default()
     });
     // Credentials mirror the server Deployment exactly: sourced from the shared
-    // credentials Secret via secretKeyRef, never literal values.
+    // credentials Secret via secretKeyRef, never literal values. Under
+    // podIdentity the file is the credential and the two key variables carry
+    // the placeholder, as on the tiers.
+    if pod_identity(spec) {
+        env.push(EnvVar {
+            name: "RAVEL_S3_CREDENTIALS_FILE".to_string(),
+            value: Some(AWS_CREDENTIALS_FILE.to_string()),
+            ..Default::default()
+        });
+    }
     env.extend(s3_credential_env(spec, None));
 
     let container = Container {
@@ -2935,6 +3285,20 @@ pub fn desired_qualify_job(
         security_context: Some(container_security_context()),
         ..Default::default()
     };
+
+    let mut pod = PodSpec {
+        restart_policy: Some("Never".to_string()),
+        containers: vec![container],
+        security_context: Some(pod_security_context()),
+        ..Default::default()
+    };
+    add_pod_identity(
+        spec,
+        instance,
+        QUALIFY_COMPONENT,
+        credentials_sidecar_image,
+        &mut pod,
+    );
 
     Job {
         metadata: ObjectMeta {
@@ -2955,12 +3319,7 @@ pub fn desired_qualify_job(
                     labels: Some(labels),
                     ..Default::default()
                 }),
-                spec: Some(PodSpec {
-                    restart_policy: Some("Never".to_string()),
-                    containers: vec![container],
-                    security_context: Some(pod_security_context()),
-                    ..Default::default()
-                }),
+                spec: Some(pod),
             },
             ..Default::default()
         }),
@@ -3745,6 +4104,10 @@ pub fn desired_objects(
     // the field name in a status condition instead of in the logs of pods that
     // never become ready.
     s3_allow_http(spec)?;
+    // A storage-auth configuration that cannot render (podIdentity with no
+    // sidecar image or with a per-tier override, static with no Secret)
+    // fails here for the same reason.
+    validate_storage_auth(spec, ctx.credentials_sidecar_image.as_deref())?;
     // Refuse a retired fold block for the same reason, before anything renders
     // (ADR-1693): the gateway tier can no longer carry these flags, so the
     // choice is a status condition naming `spec.maintain.fold` or a silently
@@ -3842,9 +4205,10 @@ mod tests {
                     allow_http: true,
                     upload_integrity: Default::default(),
                     request_stored_checksum: true,
-                    credentials_secret_ref: LocalSecretRef {
+                    auth: Default::default(),
+                    credentials_secret_ref: Some(LocalSecretRef {
                         name: "ravel-s3".to_string(),
-                    },
+                    }),
                 },
             },
             tenant_tokens_secret_ref: Some(LocalSecretRef {
@@ -3906,6 +4270,7 @@ mod tests {
             deployment_key_resource_version: None,
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            credentials_sidecar_image: None,
         }
     }
 
@@ -5601,6 +5966,7 @@ mod tests {
             deployment_key_resource_version: None,
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            credentials_sidecar_image: None,
         };
 
         let g = desired_gateway_deployment(&spec, "prod", &ctx);
@@ -5723,6 +6089,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            credentials_sidecar_image: None,
         };
         // Rotate ONLY the gateway credential Secret.
         let mut after_versions = base_versions.clone();
@@ -5734,6 +6101,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            credentials_sidecar_image: None,
         };
 
         let g_before = desired_gateway_deployment(&over_spec, "prod", &before);
@@ -5775,6 +6143,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            credentials_sidecar_image: None,
         };
         let shared_after = RenderCtx {
             tenant_names: vec!["acme".to_string()],
@@ -5786,6 +6155,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            credentials_sidecar_image: None,
         };
         let gb = desired_gateway_deployment(&shared_spec, "prod", &shared_before);
         let ga = desired_gateway_deployment(&shared_spec, "prod", &shared_after);
@@ -6843,6 +7213,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            credentials_sidecar_image: None,
         };
         let after = RenderCtx {
             deployment_key_resource_version: Some("dk-2".to_string()),
@@ -8389,7 +8760,9 @@ mod tests {
         let mut image = spec.clone();
         image.image = "registry.example/ravel:v2".to_string();
         let mut creds = spec.clone();
-        creds.storage.s3.credentials_secret_ref.name = "other-s3".to_string();
+        creds.storage.s3.credentials_secret_ref = Some(LocalSecretRef {
+            name: "other-s3".to_string(),
+        });
         // `allowHttp` is in the hash (finding 3, issue #1707) even though it
         // does not select a different store: the hash also gates whether the
         // spec is re-checked at all, and flipping this field is the
@@ -8473,7 +8846,7 @@ mod tests {
     #[test]
     fn qualify_job_renders_a_one_shot_store_qualify() {
         let spec = base_spec();
-        let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
+        let job = desired_qualify_job(&spec, "prod", Some("rv-1"), None);
 
         assert_eq!(job.metadata.name.as_deref(), Some("prod-qualify"));
         assert_eq!(
@@ -8576,7 +8949,7 @@ mod tests {
                 .collect()
         };
 
-        let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
+        let job = desired_qualify_job(&spec, "prod", Some("rv-1"), None);
         let names = names_of(&job);
         assert!(
             !names.iter().any(|n| n == "RAVEL_S3_ALLOW_HTTP"),
@@ -8588,7 +8961,7 @@ mod tests {
             spec.storage.s3.allow_http,
             "precondition: the baseline sets allowHttp for its plaintext endpoint"
         );
-        let job = desired_qualify_job(&spec, "prod", Some("rv-1"));
+        let job = desired_qualify_job(&spec, "prod", Some("rv-1"), None);
         let env = job
             .spec
             .as_ref()
@@ -8625,7 +8998,7 @@ mod tests {
     #[test]
     fn qualify_job_carries_and_hashes_the_checksum_settings() {
         let env_of = |spec: &RavelClusterSpec, name: &str| -> Option<String> {
-            desired_qualify_job(spec, "prod", Some("rv-1"))
+            desired_qualify_job(spec, "prod", Some("rv-1"), None)
                 .spec
                 .and_then(|s| s.template.spec)
                 .and_then(|pod| pod.containers[0].env.clone())
@@ -8717,7 +9090,7 @@ mod tests {
     #[test]
     fn qualify_job_bounds_a_hung_attempt() {
         let spec = base_spec();
-        let job = desired_qualify_job(&spec, "prod", None);
+        let job = desired_qualify_job(&spec, "prod", None, None);
         let job_spec = job.spec.as_ref().expect("qualify Job has a spec");
         assert_eq!(
             job_spec.active_deadline_seconds,
@@ -8829,7 +9202,13 @@ mod tests {
             spec.storage.s3.upload_integrity.flag_value(),
             request_stored_checksum,
             spec.image.as_str(),
-            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            spec.storage
+                .s3
+                .credentials_secret_ref
+                .as_ref()
+                .expect("the base spec is static")
+                .name
+                .as_str(),
             credentials_rv.as_str(),
         ]);
 
@@ -9186,7 +9565,13 @@ mod tests {
             spec.storage.s3.upload_integrity.flag_value(),
             request_stored_checksum,
             spec.image.as_str(),
-            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            spec.storage
+                .s3
+                .credentials_secret_ref
+                .as_ref()
+                .expect("the base spec is static")
+                .name
+                .as_str(),
             credentials_rv.as_str(),
         ]);
         assert_eq!(qualify_job_input_hash(&spec, Some("rv")), expected);
@@ -9858,5 +10243,417 @@ mod tests {
             !open.contains(&FRAGMENT_PORT),
             "the fragment port is admitted from the query pods, not from any source"
         );
+    }
+
+    // ---- storage.s3.auth: podIdentity (ADR-0034, Pod Identity storage
+    // credentials amendment) ----
+
+    const SIDECAR_IMAGE: &str = "ghcr.io/nofireai/ravel-operator:0.25.0";
+
+    fn pod_identity_spec() -> RavelClusterSpec {
+        let mut spec = base_spec();
+        spec.storage.s3.auth = S3AuthSpec::PodIdentity;
+        spec.storage.s3.credentials_secret_ref = None;
+        spec
+    }
+
+    fn pod_identity_ctx() -> RenderCtx {
+        RenderCtx {
+            credential_resource_versions: BTreeMap::new(),
+            credentials_sidecar_image: Some(SIDECAR_IMAGE.to_string()),
+            ..ctx()
+        }
+    }
+
+    /// Every pod a podIdentity cluster runs, with its component: the three
+    /// tiers and the qualify Job.
+    fn pod_identity_pods(spec: &RavelClusterSpec) -> Vec<(&'static str, PodSpec)> {
+        let objects = desired_objects(spec, "prod", "ns", &pod_identity_ctx())
+            .expect("a podIdentity spec with a sidecar image renders");
+        let pod = |deployment: &Deployment| {
+            deployment
+                .spec
+                .as_ref()
+                .and_then(|spec| spec.template.spec.clone())
+                .expect("pod spec")
+        };
+        let job = desired_qualify_job(spec, "prod", None, Some(SIDECAR_IMAGE));
+        vec![
+            ("gateway", pod(&objects.gateway_deployment)),
+            ("query", pod(&objects.query_deployment)),
+            (
+                "maintain",
+                pod(objects
+                    .maintain_deployment
+                    .as_ref()
+                    .expect("maintain renders")),
+            ),
+            (
+                "qualify",
+                job.spec
+                    .and_then(|spec| spec.template.spec)
+                    .expect("job pod spec"),
+            ),
+        ]
+    }
+
+    #[test]
+    fn pod_identity_renders_four_owned_service_accounts_and_static_none() {
+        let accounts = desired_tier_service_accounts(&pod_identity_spec(), "prod");
+        let names: Vec<String> = accounts
+            .iter()
+            .map(|sa| sa.metadata.name.clone().expect("name"))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "prod-gateway",
+                "prod-query",
+                "prod-maintain",
+                "prod-qualify"
+            ]
+        );
+        for (sa, component) in accounts
+            .iter()
+            .zip(["gateway", "query", "maintain", "qualify"])
+        {
+            assert_eq!(sa.metadata.labels, Some(labels("prod", component)));
+        }
+        assert_eq!(possible_tier_service_account_names("prod"), names);
+        assert!(desired_tier_service_accounts(&base_spec(), "prod").is_empty());
+
+        // The maintain account stays even with the tier disabled, so an
+        // association never names an account that comes and goes.
+        let mut disabled = pod_identity_spec();
+        disabled.maintain.enabled = false;
+        assert_eq!(desired_tier_service_accounts(&disabled, "prod").len(), 4);
+    }
+
+    #[test]
+    fn pod_identity_pods_run_as_their_account_with_the_native_sidecar() {
+        for (component, pod) in pod_identity_pods(&pod_identity_spec()) {
+            assert_eq!(
+                pod.service_account_name.as_deref(),
+                Some(format!("prod-{component}").as_str()),
+                "{component}"
+            );
+
+            let volumes = pod.volumes.clone().unwrap_or_default();
+            let volume = volumes
+                .iter()
+                .find(|v| v.name == AWS_CREDENTIALS_VOLUME_NAME)
+                .unwrap_or_else(|| panic!("{component}: no aws-credentials volume"));
+            assert_eq!(
+                volume.empty_dir,
+                Some(EmptyDirVolumeSource {
+                    medium: Some("Memory".to_string()),
+                    size_limit: Some(Quantity("1Mi".to_string())),
+                }),
+                "{component}"
+            );
+
+            let init = pod.init_containers.clone().unwrap_or_default();
+            assert_eq!(init.len(), 1, "{component}: exactly the sidecar");
+            let sidecar = &init[0];
+            assert_eq!(sidecar.name, "pod-identity-credentials");
+            assert_eq!(sidecar.image.as_deref(), Some(SIDECAR_IMAGE));
+            assert_eq!(sidecar.restart_policy.as_deref(), Some("Always"));
+            assert_eq!(
+                sidecar.args.as_deref(),
+                Some(
+                    [
+                        "pod-identity-credentials".to_string(),
+                        "--output".to_string(),
+                        "/var/run/ravel/aws/credentials.json".to_string(),
+                    ]
+                    .as_slice()
+                )
+            );
+            let probe = sidecar.startup_probe.as_ref().expect("startup probe");
+            assert_eq!(
+                probe.exec.as_ref().and_then(|exec| exec.command.clone()),
+                Some(vec![
+                    "/usr/local/bin/ravel-operator".to_string(),
+                    "pod-identity-credentials".to_string(),
+                    "--probe".to_string(),
+                    "/var/run/ravel/aws/credentials.json".to_string(),
+                ])
+            );
+            assert_eq!(probe.period_seconds, Some(2));
+            assert_eq!(probe.failure_threshold, Some(60));
+            let resources = sidecar.resources.as_ref().expect("resources");
+            assert_eq!(
+                resources.requests,
+                Some(BTreeMap::from([
+                    ("cpu".to_string(), Quantity("10m".to_string())),
+                    ("memory".to_string(), Quantity("16Mi".to_string())),
+                ]))
+            );
+            assert_eq!(
+                resources.limits,
+                Some(BTreeMap::from([(
+                    "memory".to_string(),
+                    Quantity("32Mi".to_string())
+                )]))
+            );
+            assert_eq!(
+                sidecar.volume_mounts,
+                Some(vec![VolumeMount {
+                    name: AWS_CREDENTIALS_VOLUME_NAME.to_string(),
+                    mount_path: "/var/run/ravel/aws".to_string(),
+                    read_only: Some(false),
+                    ..Default::default()
+                }]),
+                "{component}: the sidecar mounts the volume read-write"
+            );
+
+            assert_eq!(pod.containers.len(), 1, "{component}");
+            let main = &pod.containers[0];
+            let mounts = main.volume_mounts.clone().unwrap_or_default();
+            assert!(
+                mounts.contains(&VolumeMount {
+                    name: AWS_CREDENTIALS_VOLUME_NAME.to_string(),
+                    mount_path: "/var/run/ravel/aws".to_string(),
+                    read_only: Some(true),
+                    ..Default::default()
+                }),
+                "{component}: the main container mounts the volume read-only"
+            );
+
+            // Both containers run as the image's own user under one pod
+            // security context: the same container context, no user set on
+            // either, so the 0600 file the sidecar writes stays readable.
+            assert_eq!(sidecar.security_context, main.security_context);
+            assert_eq!(sidecar.security_context, Some(container_security_context()));
+            assert_eq!(pod.security_context, Some(pod_security_context()));
+            for context in [&sidecar.security_context, &main.security_context] {
+                let context = context.as_ref().expect("security context");
+                assert_eq!(context.run_as_user, None);
+                assert_eq!(context.run_as_group, None);
+            }
+        }
+    }
+
+    #[test]
+    fn pod_identity_reads_the_file_and_never_a_secret_key_ref() {
+        for (component, pod) in pod_identity_pods(&pod_identity_spec()) {
+            let main = &pod.containers[0];
+            let env = main.env.clone().unwrap_or_default();
+            for name in ["RAVEL_S3_ACCESS_KEY", "RAVEL_S3_SECRET_KEY"] {
+                let var = env
+                    .iter()
+                    .find(|v| v.name == name)
+                    .unwrap_or_else(|| panic!("{component}: {name} missing"));
+                assert_eq!(
+                    var.value.as_deref(),
+                    Some("unused-credentials-file-wins"),
+                    "{component}: {name}"
+                );
+                assert_eq!(var.value_from, None, "{component}: {name}");
+            }
+            let secret_refs: Vec<&str> = env
+                .iter()
+                .filter_map(|v| v.value_from.as_ref()?.secret_key_ref.as_ref())
+                .map(|selector| selector.key.as_str())
+                .filter(|key| [S3_ACCESS_KEY_ID_KEY, S3_SECRET_ACCESS_KEY_KEY].contains(key))
+                .collect();
+            assert!(secret_refs.is_empty(), "{component}: {secret_refs:?}");
+
+            let args = main.args.clone().unwrap_or_default();
+            if component == "qualify" {
+                let file = env
+                    .iter()
+                    .find(|v| v.name == "RAVEL_S3_CREDENTIALS_FILE")
+                    .and_then(|v| v.value.as_deref());
+                assert_eq!(file, Some("/var/run/ravel/aws/credentials.json"));
+            } else {
+                let at = args
+                    .iter()
+                    .position(|arg| arg == "--s3-credentials-file")
+                    .unwrap_or_else(|| panic!("{component}: no --s3-credentials-file"));
+                assert_eq!(args[at + 1], "/var/run/ravel/aws/credentials.json");
+                assert!(!args.iter().any(|arg| arg.starts_with("--s3-auth")));
+            }
+        }
+    }
+
+    #[test]
+    fn a_static_spec_renders_no_pod_identity_objects() {
+        let objects = desired_objects(&base_spec(), "prod", "ns", &ctx()).expect("renders");
+        let job = desired_qualify_job(&base_spec(), "prod", Some("rv"), Some(SIDECAR_IMAGE));
+        let pods = [
+            objects
+                .gateway_deployment
+                .spec
+                .and_then(|s| s.template.spec),
+            objects.query_deployment.spec.and_then(|s| s.template.spec),
+            objects
+                .maintain_deployment
+                .and_then(|d| d.spec)
+                .and_then(|s| s.template.spec),
+            job.spec.and_then(|s| s.template.spec),
+        ];
+        for pod in pods {
+            let pod = pod.expect("pod spec");
+            assert_eq!(pod.service_account_name, None);
+            assert_eq!(pod.init_containers, None);
+            assert!(
+                !pod.volumes
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|v| v.name == AWS_CREDENTIALS_VOLUME_NAME)
+            );
+            let main = &pod.containers[0];
+            assert!(
+                !main
+                    .args
+                    .clone()
+                    .unwrap_or_default()
+                    .contains(&"--s3-credentials-file".to_string())
+            );
+            assert!(
+                !main
+                    .env
+                    .clone()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|v| v.value.as_deref() == Some(UNUSED_CREDENTIALS_PLACEHOLDER))
+            );
+        }
+    }
+
+    #[test]
+    fn pod_identity_engages_the_maintain_first_hold() {
+        assert!(per_role_credentials(&pod_identity_spec()));
+        assert_eq!(
+            gc_bootstrap_plan(&pod_identity_spec()).gate,
+            GcBootstrapGate::MaintainFirst
+        );
+        let mut no_maintain = pod_identity_spec();
+        no_maintain.maintain.enabled = false;
+        assert_eq!(
+            gc_bootstrap_plan(&no_maintain).gate,
+            GcBootstrapGate::Unavailable
+        );
+    }
+
+    #[test]
+    fn storage_auth_configurations_that_cannot_render_are_refused() {
+        let spec = pod_identity_spec();
+        let no_image = RenderCtx {
+            credentials_sidecar_image: None,
+            ..pod_identity_ctx()
+        };
+        assert_eq!(
+            desired_objects(&spec, "prod", "ns", &no_image).err(),
+            Some(RenderError::CredentialsSidecarImageUnset)
+        );
+        assert_eq!(
+            validate_storage_auth(&spec, Some("")),
+            Err(RenderError::CredentialsSidecarImageUnset)
+        );
+
+        let mut tier_override = pod_identity_spec();
+        tier_override.query.credentials_secret_ref = Some(LocalSecretRef {
+            name: "query-s3".to_string(),
+        });
+        assert_eq!(
+            validate_storage_auth(&tier_override, Some(SIDECAR_IMAGE)),
+            Err(RenderError::PodIdentityTierOverride { tier: "query" })
+        );
+
+        let mut static_without_secret = base_spec();
+        static_without_secret.storage.s3.credentials_secret_ref = None;
+        assert_eq!(
+            desired_objects(&static_without_secret, "prod", "ns", &ctx()).err(),
+            Some(RenderError::StaticCredentialsSecretRefMissing)
+        );
+
+        // A leftover shared ref under podIdentity is not read and does not
+        // stop the render.
+        let mut leftover = pod_identity_spec();
+        leftover.storage.s3.credentials_secret_ref = Some(LocalSecretRef {
+            name: "ravel-s3".to_string(),
+        });
+        assert!(desired_objects(&leftover, "prod", "ns", &pod_identity_ctx()).is_ok());
+        assert_eq!(validate_storage_auth(&base_spec(), None), Ok(()));
+    }
+
+    #[test]
+    fn the_auth_mode_enters_the_qualify_hash_only_under_pod_identity() {
+        // The static golden (`qualify_job_input_hash_golden_is_stable_by_construction`)
+        // pins that a static cluster's hash did not move.
+        let pod_identity = qualify_job_input_hash(&pod_identity_spec(), None);
+        let mut static_without_secret = base_spec();
+        static_without_secret.storage.s3.credentials_secret_ref = None;
+        assert_ne!(
+            pod_identity,
+            qualify_job_input_hash(&static_without_secret, None),
+            "switching modes re-qualifies even with no Secret on either side"
+        );
+        assert_ne!(
+            pod_identity,
+            qualify_job_input_hash(&base_spec(), Some("rv"))
+        );
+        assert_eq!(
+            pod_identity,
+            qualify_job_input_hash(&pod_identity_spec(), None)
+        );
+        let job = desired_qualify_job(&pod_identity_spec(), "prod", None, Some(SIDECAR_IMAGE));
+        assert_eq!(
+            job.metadata
+                .annotations
+                .and_then(|a| a.get(QUALIFY_SPEC_HASH_ANNOTATION).cloned()),
+            Some(pod_identity)
+        );
+    }
+
+    #[test]
+    fn pod_identity_checksums_tolerate_the_absent_secret() {
+        let spec = pod_identity_spec();
+        let objects = desired_objects(&spec, "prod", "ns", &pod_identity_ctx()).expect("renders");
+        let checksum = |d: &Deployment| {
+            d.spec
+                .as_ref()
+                .and_then(|s| s.template.metadata.as_ref())
+                .and_then(|m| m.annotations.as_ref())
+                .and_then(|a| a.get(SECRETS_CHECKSUM_ANNOTATION).cloned())
+                .expect("checksum annotation")
+        };
+        // The credential field is empty; the token Secret still moves it.
+        let rotated = RenderCtx {
+            token_resource_version: Some("tok-2".to_string()),
+            ..pod_identity_ctx()
+        };
+        let after = desired_objects(&spec, "prod", "ns", &rotated).expect("renders");
+        assert_ne!(
+            checksum(&objects.gateway_deployment),
+            checksum(&after.gateway_deployment)
+        );
+    }
+
+    /// The shipped operator manifest passes its own image as the sidecar
+    /// image: the sidecar is a subcommand of the operator binary, so the two
+    /// must never name different images.
+    #[test]
+    fn shipped_operator_names_its_own_image_as_the_sidecar_image() {
+        let deployment = shipped_operator_deployment();
+        let container = deployment
+            .spec
+            .and_then(|spec| spec.template.spec)
+            .and_then(|pod| {
+                pod.containers
+                    .into_iter()
+                    .find(|c| c.name == "ravel-operator")
+            })
+            .expect("operator.yaml's Deployment has a ravel-operator container");
+        let sidecar_image = container
+            .env
+            .unwrap_or_default()
+            .into_iter()
+            .find(|var| var.name == "RAVEL_CREDENTIALS_SIDECAR_IMAGE")
+            .and_then(|var| var.value)
+            .expect("operator.yaml sets RAVEL_CREDENTIALS_SIDECAR_IMAGE");
+        assert_eq!(Some(sidecar_image), container.image);
     }
 }

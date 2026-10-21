@@ -58,6 +58,13 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            # Image of the Pod Identity credentials sidecar the operator
+            # renders under storage.s3.auth: podIdentity. The sidecar is a
+            # subcommand of this binary, so this must name the same image as
+            # `image:` above; a real cluster pins both to the same tag and
+            # digest. Unused by static clusters.
+            - name: RAVEL_CREDENTIALS_SIDECAR_IMAGE
+              value: ravel-operator:latest
           securityContext:
             runAsNonRoot: true
             allowPrivilegeEscalation: false

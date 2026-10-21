@@ -60,7 +60,7 @@
                     "description": "Gateway (ingest + query API) tier.",
                     "properties": {
                       "credentialsSecretRef": {
-                        "description": "Per-role S3 credential override for the gateway tier (ADR-0055 section 5).\nWhen set, the gateway Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the gateway to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.",
+                        "description": "Per-role S3 credential override for the gateway tier (ADR-0055 section 5).\nWhen set, the gateway Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the gateway to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.\nRefused under `storage.s3.auth: podIdentity`, where the tier's role\ncomes from its ServiceAccount's Pod Identity association.",
                         "nullable": true,
                         "properties": {
                           "name": {
@@ -329,7 +329,7 @@
                     "description": "Background maintenance tier (compaction, retention, GC). Defaults to a\nsingle replica; the bounded multi-worker ownership protocol (ADR-0065)\nmakes `replicas > 1` safe, superseding ADR-0034's single-replica\nguidance.",
                     "properties": {
                       "credentialsSecretRef": {
-                        "description": "Per-role S3 credential override for the maintain tier (ADR-0055 section 5).\nWhen set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.\nMaintain is the only role ADR-0055 grants delete, so this is where an\noperator points the delete-capable credential. Falls back to the shared\ncredential when unset, so existing single-credential clusters are\nunaffected.",
+                        "description": "Per-role S3 credential override for the maintain tier (ADR-0055 section 5).\nWhen set, the maintain Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`.\nMaintain is the only role ADR-0055 grants delete, so this is where an\noperator points the delete-capable credential. Falls back to the shared\ncredential when unset, so existing single-credential clusters are\nunaffected.\nRefused under `storage.s3.auth: podIdentity`, where the tier's role\ncomes from its ServiceAccount's Pod Identity association.",
                         "nullable": true,
                         "properties": {
                           "name": {
@@ -427,7 +427,7 @@
                     "description": "Query tier.",
                     "properties": {
                       "credentialsSecretRef": {
-                        "description": "Per-role S3 credential override for the query tier (ADR-0055 section 5).\nWhen set, the query Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the query tier to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.",
+                        "description": "Per-role S3 credential override for the query tier (ADR-0055 section 5).\nWhen set, the query Deployment sources `RAVEL_S3_ACCESS_KEY` /\n`RAVEL_S3_SECRET_KEY` from this Secret (keys `accessKeyId` /\n`secretAccessKey`) instead of the shared `storage.s3.credentialsSecretRef`,\nso an operator can scope the query tier to a narrower IAM credential. Falls\nback to the shared credential when unset, so existing single-credential\nclusters are unaffected.\nRefused under `storage.s3.auth: podIdentity`, where the tier's role\ncomes from its ServiceAccount's Pod Identity association.",
                         "nullable": true,
                         "properties": {
                           "name": {
@@ -606,12 +606,22 @@
                             "description": "Accept a plaintext `http://` `endpoint` whose host is not loopback\n(`--s3-allow-http`). A pod never reaches its object store over\nloopback, so an in-cluster RustFS or floci addressed by Service name\nneeds this. Without it the operator refuses to render the cluster at\nall: the `RavelCluster` gets a `Degraded` condition with reason\n`PlaintextS3Endpoint` naming this field, and no Deployment, Service, or\nqualification Job is created, rather than moving telemetry and S3\ncredentials across the cluster network in the clear. The same rule\ngoverns the operator's own S3 client (the one that reconciles\n`sys/auth` and applies `shardOverrides`), the rendered server\ncontainers, and the `ravel-cli store qualify` Job, all from one\ndecision. Setting it re-runs store qualification, because it changes\nwhether that check can reach the store. Leave false (the default) for\nany `https://` endpoint and for real AWS S3: there it is inert, since\nan `https://` endpoint never permits a downgrade.",
                             "type": "boolean"
                           },
+                          "auth": {
+                            "default": "static",
+                            "description": "Where every pod and the operator get their storage credentials:\n`static` (the default) or `podIdentity`.\n\n`static`: the static key pair in `credentialsSecretRef` (and the\nper-tier `credentialsSecretRef` overrides), injected as env vars.\n\n`podIdentity`: EKS Pod Identity, with no key in any Secret. Only EKS\nPod Identity is supported; IRSA (web identity) is not. The operator\ncreates the ServiceAccounts `<name>-gateway`, `<name>-query`,\n`<name>-maintain` and `<name>-qualify` in this namespace and runs the\nthree tiers and the store-qualification Job as them; the cluster's\nPod Identity associations must name these four, each with the role\nfor that tier. The webhook then injects\n`AWS_CONTAINER_CREDENTIALS_FULL_URI` and\n`AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE`, and a native sidecar\n(`ravel-operator pod-identity-credentials`, the operator's own image,\nset by its `--credentials-sidecar-image` flag) keeps a credentials\nfile on a memory-backed volume at\n`/var/run/ravel/aws/credentials.json`, which the server reads through\n`--s3-credentials-file`. `RAVEL_S3_ACCESS_KEY` and\n`RAVEL_S3_SECRET_KEY` are set to the literal\n`unused-credentials-file-wins`: the binaries still require both under\n`--s3-auth static` and the file overrides them. The operator's own\nServiceAccount (`ravel-system/ravel-operator` in the shipped\nmanifests) needs an association too, for its `sys/auth` and reshard\nwrites. The pods need egress to the agent at `169.254.170.23:80`.\n`credentialsSecretRef` is not read and the per-tier overrides are\nrefused under this mode, and the maintain-first `sys/gc` bootstrap\nhold applies.\nSwitching modes re-runs store qualification.",
+                            "enum": [
+                              "static",
+                              "podIdentity"
+                            ],
+                            "type": "string"
+                          },
                           "bucket": {
                             "description": "Bucket name (`--s3-bucket`).",
                             "type": "string"
                           },
                           "credentialsSecretRef": {
-                            "description": "Secret with keys `accessKeyId` and `secretAccessKey`, injected as the\n`RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars.",
+                            "description": "Secret with keys `accessKeyId` and `secretAccessKey`, injected as the\n`RAVEL_S3_ACCESS_KEY` / `RAVEL_S3_SECRET_KEY` env vars. Required under\n`auth: static`; not read under `auth: podIdentity`.",
+                            "nullable": true,
                             "properties": {
                               "name": {
                                 "description": "Name of the Secret.",
@@ -650,10 +660,15 @@
                           }
                         },
                         "required": [
-                          "bucket",
-                          "credentialsSecretRef"
+                          "bucket"
                         ],
-                        "type": "object"
+                        "type": "object",
+                        "x-kubernetes-validations": [
+                          {
+                            "message": "credentialsSecretRef is required under auth: static",
+                            "rule": "(has(self.auth) && self.auth == 'podIdentity') || has(self.credentialsSecretRef)"
+                          }
+                        ]
                       }
                     },
                     "required": [
@@ -681,7 +696,13 @@
                   "shards",
                   "storage"
                 ],
-                "type": "object"
+                "type": "object",
+                "x-kubernetes-validations": [
+                  {
+                    "message": "gateway, query and maintain credentialsSecretRef overrides are refused under storage.s3.auth: podIdentity; each tier's role comes from the Pod Identity association on its ServiceAccount (<name>-gateway, <name>-query, <name>-maintain)",
+                    "rule": "!has(self.storage.s3.auth) || self.storage.s3.auth != 'podIdentity' || ((!has(self.gateway) || !has(self.gateway.credentialsSecretRef)) && (!has(self.query) || !has(self.query.credentialsSecretRef)) && (!has(self.maintain) || !has(self.maintain.credentialsSecretRef)))"
+                  }
+                ]
               },
               "status": {
                 "description": "Observed status (ADR-0034 decision 2). Written by the operator on the status\nsubresource.",

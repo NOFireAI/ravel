@@ -187,7 +187,10 @@ Apply the manifests in this order:
 a real cluster, pin the image to a digest
 (`ghcr.io/nofireai/ravel-operator@sha256:<digest>`), not to a moving tag. A
 tag can point at a different image after you have reviewed the manifest. A
-digest cannot.
+digest cannot. Pin `RAVEL_CREDENTIALS_SIDECAR_IMAGE` in the same manifest to
+the same reference: it names the image of the credentials sidecar the
+operator renders under `storage.s3.auth: podIdentity`, which is the operator
+image itself (see [Pod Identity](#pod-identity)).
 
 `crd.yaml` is generated from the Rust spec types. To regenerate it, run
 `cargo run -p ravel-operator -- --print-crd`.
@@ -222,8 +225,9 @@ The operator watches `RavelCluster` cluster-wide. It manages Deployments and
 Services in the namespace of each `RavelCluster`. Its ClusterRole grants:
 
 - the full lifecycle of Deployments, Services, Ingresses,
-  `gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, and the ServiceAccounts,
-  Roles, and RoleBindings it renders for the `ravelNative` ingest router,
+  `gateway.networking.k8s.io` HTTPRoutes/GRPCRoutes, the ServiceAccounts,
+  Roles, and RoleBindings it renders for the `ravelNative` ingest router, and
+  the ServiceAccounts it renders under `storage.s3.auth: podIdentity`,
 - `RavelCluster` and its status subresource,
 - `get` on Secrets,
 - `get`/`list`/`watch` on `endpointslices` (needed to create the router's own
@@ -231,6 +235,16 @@ Services in the namespace of each `RavelCluster`. Its ClusterRole grants:
 - `get` on the non-resource URL `/version`.
 
 The operator never lists, writes, or watches Secrets.
+
+On a cluster that uses EKS Pod Identity, these grants reach AWS too.
+Kubernetes needs no permission on a ServiceAccount to name it in a pod, and
+the Pod Identity agent hands a role's credentials to any pod running as an
+associated ServiceAccount. An operator that can create Deployments and Jobs
+in every namespace could therefore run a pod as any associated account in
+the cluster, not only the ones it owns. Restrict where the operator's
+ServiceAccount may create pods, for example with a
+ValidatingAdmissionPolicy that refuses its pod-creating writes outside the
+namespaces that hold `RavelCluster`s.
 
 ### Minimum Kubernetes version
 
@@ -270,6 +284,13 @@ On a cluster below the floor, the operator raises a
   But `PodLifecycleSleepAction` is off by default on those nodes, so the
   preStop hook is dropped for pods scheduled there.
 
+The floor also covers native sidecars, which a cluster under
+`storage.s3.auth: podIdentity` needs (see [Pod Identity](#pod-identity)).
+The credentials sidecar is an initContainer with `restartPolicy: Always`.
+Kubernetes' `SidecarContainers` feature is on by default since 1.29 and
+stable since 1.33, so every version at or above the 1.30 floor runs it. The
+kubelet skew caveat above applies to it the same way.
+
 ## `RavelCluster` reference
 
 Group `ravel.nofire.ai`, version `v1alpha1`, namespaced, short name `rc`.
@@ -290,7 +311,8 @@ A minimal example is in
 | `spec.storage.s3.allowHttp` | boolean | `false` | Renders `--s3-allow-http` on every server container, and `RAVEL_S3_ALLOW_HTTP=true` on the store-qualification Job that runs `ravel-cli store qualify` before any server pod exists. Required when `endpoint` is a plaintext `http://` URL whose host is not loopback: no pod reaches its object store over loopback, so without it the operator refuses the cluster at render time (`Degraded`, reason `PlaintextS3Endpoint`, message naming this field) and creates no Deployment, Service, or qualify Job, rather than moving telemetry and S3 credentials across the cluster network in the clear. The same rule governs the operator's own S3 client, the one that reconciles `sys/auth` and applies `shardOverrides`. Editing this field re-runs store qualification, since it changes whether that check can reach the store. Leave unset for an `https://` endpoint and for real AWS S3. |
 | `spec.storage.s3.uploadIntegrity` | string | `crc64nvme` | `crc64nvme`, `sha256`, or `off`: the server-verified checksum every PUT carries. Renders `--s3-upload-integrity` on every server container only when it is not `crc64nvme`, which is the server's own default, and sets the same on the operator's own S3 client. Set `off` only for an endpoint that rejects the checksum header; see [Upload and read checksums](operations/configuration.md#upload-and-read-checksums). The store-qualification Job always carries the value as `RAVEL_S3_UPLOAD_INTEGRITY` and PUTs with it, so an endpoint that rejects the header fails qualification, and editing this field re-runs it. |
 | `spec.storage.s3.requestStoredChecksum` | boolean | `true` | Whether requests ask the endpoint for the checksum it stored, so full-object reads are verified. `false` renders `--s3-request-stored-checksum=false` on every server container and applies to the operator's own S3 client; every full-object read is then counted in `ravel_store_get_unverified_total`. The store-qualification Job always carries the value as `RAVEL_S3_REQUEST_STORED_CHECKSUM`, and editing this field re-runs it. |
-| `spec.storage.s3.credentialsSecretRef.name` | string | required | Secret with keys `accessKeyId` and `secretAccessKey`. |
+| `spec.storage.s3.auth` | string | `static` | Where the pods and the operator get their storage credentials. `static`: the key pair in `credentialsSecretRef`. `podIdentity`: EKS Pod Identity roles, with no key in any Secret; see [Pod Identity](#pod-identity). IRSA (web identity) is not supported. Switching modes re-runs store qualification. |
+| `spec.storage.s3.credentialsSecretRef.name` | string | required under `auth: static` | Secret with keys `accessKeyId` and `secretAccessKey`. A CEL rule refuses a `static` cluster without it. Not read under `auth: podIdentity`. |
 | `spec.tenantTokensSecretRef.name` | string | none | Secret whose keys are tenant names and whose values are bearer tokens. |
 | `spec.deploymentKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters or 32 raw bytes): the deployment key. Enables the keyed tenant hash and `sys/auth` bearer-token reconciliation, see "`sys/auth` ownership" below. Omit to leave both off. |
 | `spec.auditTokenKeySecretRef.name` | string | none | Secret with one key, `key` (64 hex characters): the query-audit token key. Omit on a cluster with `deploymentKeySecretRef` set. See "Query-audit token key" below. |
@@ -653,6 +675,7 @@ For a `RavelCluster` named `dev`:
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
 | `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi`, independent of the backend. |
 | `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
+| `dev-gateway`, `dev-query`, `dev-maintain`, `dev-qualify` | ServiceAccount | The accounts the three tiers and the qualify Job run as. Only under `storage.s3.auth: podIdentity`; see [Pod Identity](#pod-identity). The operator deletes them by name after a switch back to `static`, so do not create accounts with these names yourself. |
 
 You can scale `spec.maintain.replicas` above one safely. Maintain renders
 `RollingUpdate`, the same as gateway and query. It defaults to one replica
@@ -708,6 +731,9 @@ wait for `StoreQualified=True` at
 The operator recreates the Job only when its inputs change: the bucket,
 region, endpoint, `allowHttp`, `uploadIntegrity`, `requestStoredChecksum`,
 server image, or the shared credentials Secret's name or `resourceVersion`.
+A switch of `storage.s3.auth` between `static` and `podIdentity` is a change
+of input too. Upgrading the operator does not re-qualify a `static` cluster:
+its inputs hash exactly as before the field existed.
 
 - A rotation of that Secret in place bumps its `resourceVersion`. A rotation
   to credentials that no longer pass qualification therefore re-qualifies
@@ -1130,11 +1156,103 @@ exercise the split in a kind cluster, create the per-mode Secrets yourself
 the same way as above (`kubectl create secret generic ...`) before you apply
 a `RavelCluster` that references them.
 
+### Pod Identity
+
+Under `spec.storage.s3.auth: podIdentity` no AWS key exists anywhere: every
+pod, the qualify Job and the operator itself run on EKS Pod Identity roles.
+Only EKS Pod Identity is supported. IRSA (`AWS_WEB_IDENTITY_TOKEN_FILE` and
+STS `AssumeRoleWithWebIdentity`) is not. The node's instance role
+(`--s3-auth instance-role`) is no substitute: the server reads it from EC2
+IMDSv2, which returns the node role that every pod on the node shares, never
+one role per tier.
+
+```yaml
+spec:
+  storage:
+    s3:
+      bucket: my-ravel-bucket
+      region: us-east-2
+      auth: podIdentity
+```
+
+The operator creates one ServiceAccount per tier and one for the qualify
+Job, and runs each pod as its account:
+
+| ServiceAccount | Pods | Role (template in `deploy/iam/`) |
+|---|---|---|
+| `<name>-gateway` | gateway | Gateway (`gateway.json`) |
+| `<name>-query` | query | Query (`query.json`) |
+| `<name>-maintain` | maintain | Maintain (`maintain.json`) |
+| `<name>-qualify` | the qualify Job | Admin (`admin.json`), or a policy trimmed to the `sys/` keys qualification touches |
+
+Create a Pod Identity association for each of the four, in the
+`RavelCluster`'s namespace, naming that tier's role. The associations can
+exist before the accounts do. The operator applies the accounts before the
+qualify Job, so the first deploy does not wait on them.
+
+The operator also writes `sys/auth` and the `shardOverrides` reshard records
+itself, so its own ServiceAccount needs an association too:
+`ravel-system/ravel-operator` in the shipped manifests, with the Admin role
+until an operator template exists. It fetches its credentials in memory and
+mounts no volume. Without the association the cluster reports `Degraded`
+with reason `PodIdentityCredentialsUnavailable`, naming the two variables
+below, on the first pass that needs the operator's own store (a cluster with
+`deploymentKeySecretRef` or `shardOverrides` set).
+
+How the credentials reach a pod:
+
+- The Pod Identity webhook injects `AWS_CONTAINER_CREDENTIALS_FULL_URI` and
+  `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` into a pod whose ServiceAccount
+  has an association. The token file is a projected ServiceAccount token
+  that the kubelet rotates.
+- Each pod gets a native sidecar, `pod-identity-credentials`: the operator
+  image running `ravel-operator pod-identity-credentials --output
+  /var/run/ravel/aws/credentials.json`. It fetches the role credentials from
+  the node's Pod Identity agent and writes them to a memory-backed volume
+  (`emptyDir`, `medium: Memory`, `sizeLimit: 1Mi`) as a mode-0600 JSON file.
+  It refreshes at the earlier of halfway to the credential's expiry and
+  15 minutes before it, and keeps the old file when a refresh fails.
+- A startup probe on the sidecar holds the server container until the file
+  exists. The server reads it through `--s3-credentials-file` and picks up
+  each rewrite on its next S3 request; the qualify Job's `ravel-cli` reads it
+  through `RAVEL_S3_CREDENTIALS_FILE`.
+- `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` are set to the literal
+  `unused-credentials-file-wins`. `ravel-server` and `ravel-cli` still
+  require both under `--s3-auth static` even with a credentials file, and
+  the file overrides them, so the value is never used as a key.
+
+The operator needs to know its own image to render the sidecar. The shipped
+`operator.yaml` sets `RAVEL_CREDENTIALS_SIDECAR_IMAGE`
+(`--credentials-sidecar-image`) to the same image as the operator container.
+Pin both to the same tag and digest. A `podIdentity` cluster reconciled by
+an operator without it reports `Degraded` with reason
+`CredentialsSidecarImageUnset` and renders nothing, the qualify Job
+included.
+
+What else changes under `podIdentity`:
+
+- The per-tier `credentialsSecretRef` overrides are refused at admission:
+  each tier's role comes from its association. `storage.s3.credentialsSecretRef`
+  is not read.
+- The cluster counts as per-role, so the maintain-first `sys/gc` bootstrap
+  order below applies.
+- Every pod needs egress to the Pod Identity agent at `169.254.170.23:80`
+  (`[fd00:ec2::23]:80` on an IPv6 cluster). A NetworkPolicy that denies
+  egress by default must allow it.
+- A running pod keeps the credential its sidecar last wrote until that
+  credential's expiry, which the agent sets. Removing an association alone
+  does not revoke access: deny the role first, then remove the association
+  and roll the pods.
+- The sidecar logs every failed refresh as a warning with the attempt count
+  and the seconds left on the current file, and an error once that file's
+  credential has expired.
+
 ### The `sys/gc` bootstrap order
 
-A per-mode `credentialsSecretRef` also changes the order in which the
-operator applies the three Deployments. Every `ravel-server` mode creates the
-durable `sys/gc` object if it is absent and then validates itself against it.
+A per-mode `credentialsSecretRef`, or `storage.s3.auth: podIdentity`, also
+changes the order in which the operator applies the three Deployments. Every
+`ravel-server` mode creates the durable `sys/gc` object if it is absent and
+then validates itself against it.
 Under the per-role policies, only Maintain and Admin can write it.
 
 - **Fresh cluster.** The operator applies the maintain Deployment first. It
