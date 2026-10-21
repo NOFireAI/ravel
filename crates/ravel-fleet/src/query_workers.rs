@@ -821,6 +821,33 @@ mod tests {
         assert_eq!(record, decoded);
     }
 
+    /// A signed heartbeat object decodes as a plain [`QueryWorkerRecord`],
+    /// the shape a reader from before record MACs reads it as: the `mac`
+    /// field is ignored.
+    #[tokio::test]
+    async fn signed_object_decodes_as_a_plain_record() {
+        let store = MemoryStore::new();
+        let a = worker();
+        a.write_heartbeat(&store, 42).await.expect("beat");
+        let got = store
+            .get(
+                &query_worker_key(&a.process_id().to_string()),
+                GetRange::Full,
+            )
+            .await
+            .expect("get record");
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(got.data.as_ref())
+                .expect("json")
+                .get("mac")
+                .is_some()
+        );
+        assert_eq!(
+            QueryWorkerRecord::decode(got.data.as_ref()).expect("decode"),
+            a.record_at(42)
+        );
+    }
+
     /// A heartbeat object written before release B (ADR-1689 decision 4)
     /// still carries `flight_sql_endpoint`, the public gRPC address the
     /// removed plaintext SQL lane dialed. A rolling deploy has both shapes
