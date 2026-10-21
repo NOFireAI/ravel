@@ -12,9 +12,10 @@
 # The image is read from the root Dockerfile's `AS builder` stage, so the two
 # cannot drift. The workspace and the host's cargo registry and git caches are
 # mounted, so target/ and the caches the CI job restores are the ones the
-# container builds into. The container runs as the calling user, with
-# CARGO_HOME and HOME under /tmp, so nothing it writes is root-owned even if
-# it is killed mid-build; --init forwards Ctrl-C to the build.
+# container builds into. The container runs as the calling user, with HOME
+# under /tmp and CARGO_HOME on a directory the caller owns, so nothing it
+# writes is root-owned even if it is killed mid-build; --init forwards Ctrl-C
+# to the build.
 #
 # The builder stage's CARGO_BUILD_JOBS=2 cap is deliberately not inherited:
 # CI builds at cargo's default against a 55-minute budget. On a small host
@@ -44,7 +45,13 @@ if [[ -z "${channel}" ]]; then
 fi
 
 cargo_home="${CARGO_HOME:-${HOME}/.cargo}"
-mkdir -p "${cargo_home}/registry" "${cargo_home}/git" target
+# The container's CARGO_HOME must be writable by the calling user: cargo
+# creates its package-cache lock there. A directory the caller creates under
+# target/ is, and the host registry and git caches are mounted inside it. A
+# bind-mount parent the daemon creates itself would be root-owned.
+container_cargo_home="${root}/target/prebuilt-cargo-home"
+mkdir -p "${cargo_home}/registry" "${cargo_home}/git" \
+  "${container_cargo_home}/registry" "${container_cargo_home}/git"
 
 echo "build-prebuilt-binaries: building in ${image}"
 docker run --rm --init \
@@ -53,6 +60,7 @@ docker run --rm --init \
   -e CARGO_HOME=/tmp/cargo-home \
   -e RUSTUP_TOOLCHAIN="${channel}" \
   -v "${root}:/work" -w /work \
+  -v "${container_cargo_home}:/tmp/cargo-home" \
   -v "${cargo_home}/registry:/tmp/cargo-home/registry" \
   -v "${cargo_home}/git:/tmp/cargo-home/git" \
   -e CARGO_INCREMENTAL=0 \
