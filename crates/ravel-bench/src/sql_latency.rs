@@ -63,6 +63,7 @@ use ravel_query::{
     LogSegmentFetcher, LogsFetchPolicy, PhaseWireByteCounter, PhaseWireByteCounts,
     ProbeMissCounter, QueryPhase, ResolvedLogsFetch, SegmentFetcher, resolve_logs_fetch,
 };
+use ravel_sql::stats_json::cache_json;
 use ravel_sql::{
     DEFAULT_MAX_QUERY_BYTES, DeclaredColumn, DeclaredType, ScanTiming, SpanSegmentFetcher,
     SqlConfig, SqlExecutor, SqlRequest, StaticDeclaredColumns,
@@ -431,6 +432,19 @@ pub struct Provenance {
     /// when `None`, keeping the no-null contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_cost_profile_effective: Option<StoreCostProfile>,
+    /// The bulk-scan size trigger the executor ran with
+    /// (`--cache-bulk-scan-min-bytes`, the same flag as `ravel-server`'s), or
+    /// `None` when it was off. Skipped in JSON when `None`, keeping the no-null
+    /// contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_bulk_scan_min_bytes: Option<u64>,
+    /// Whether the read cache was also attached to the samples fetcher, the
+    /// fetcher a run's `read_cache` is read from. True only when a cache was
+    /// attached and `cache_bulk_scan_min_bytes` was set; without the flag the
+    /// samples fetcher reads uncached and `read_cache` is absent. Skipped in
+    /// JSON when `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub samples_fetcher_cache: bool,
 }
 
 /// The profile a report written before the cost stamp existed deserializes to,
@@ -760,6 +774,13 @@ pub struct RunAccounting {
     /// attributable to that run.
     #[serde(default)]
     pub peak_rss_kb: Option<u64>,
+    /// The run's `stats.cache`, in the shape `POST /api/v1/sql` reports it
+    /// (`ravel_sql::stats_json::cache_json`): the intent the statement read
+    /// under and the read cache's per-intent hits and bytes served. `None`
+    /// unless the samples fetcher carried the cache
+    /// (`Provenance::samples_fetcher_cache`). Skipped in JSON when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_cache: Option<serde_json::Value>,
 }
 
 /// The report form of `ravel_sql::ScanTiming`: nanoseconds on the exec's
@@ -1554,7 +1575,8 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 
 /// Build a fresh executor over `store` with `declared` installed, its catalog
 /// configured for `shard_count` shards, and `cache` (when present) attached to
-/// the log fetcher. Fresh per corpus entry so the first run is genuinely cold: a
+/// the log fetcher, and to the samples fetcher too when
+/// [`samples_fetcher_takes_cache`]. Fresh per corpus entry so the first run is genuinely cold: a
 /// shared executor would let one statement warm the next through the catalog and
 /// fetch caches.
 ///
@@ -1624,6 +1646,12 @@ pub struct ExecutorSettings {
     /// [`EngineConfig::logs_fetch_policy`] so the engine config the bench builds
     /// names the same intent the server's would.
     pub logs_fetch_policy: LogsFetchPolicy,
+    /// Resolved bytes at or above which a filtered `logs` statement sent as
+    /// SQL text also reads as a bulk scan (`--cache-bulk-scan-min-bytes`),
+    /// handed to [`SqlExecutor::with_cache_bulk_scan_min_bytes`]. `None`
+    /// leaves the predicate-free rule alone, as an unset server flag does, and
+    /// keeps the read cache off the samples fetcher.
+    pub cache_bulk_scan_min_bytes: Option<u64>,
 }
 
 impl Default for ExecutorSettings {
@@ -1651,6 +1679,7 @@ impl Default for ExecutorSettings {
             logs_request_cost_bytes: resolved.request_cost_bytes,
             logs_projection_break_even_bytes: resolved.projection_break_even_bytes,
             logs_fetch_policy: LogsFetchPolicy::default(),
+            cache_bulk_scan_min_bytes: None,
         }
     }
 }
@@ -1726,6 +1755,14 @@ fn executor_engine_config(settings: &ExecutorSettings) -> Result<EngineConfig, E
     Ok(engine)
 }
 
+/// Whether [`cold_executor`] also attaches the read cache to the samples
+/// fetcher: only when a cache is attached and `--cache-bulk-scan-min-bytes` is
+/// set, so a run without the flag wires the samples fetcher uncached, as every
+/// run did before the flag existed.
+fn samples_fetcher_takes_cache(has_cache: bool, cache_bulk_scan_min_bytes: Option<u64>) -> bool {
+    has_cache && cache_bulk_scan_min_bytes.is_some()
+}
+
 fn cold_executor(
     store: &Arc<dyn ObjectStoreBackend>,
     declared: &[DeclaredColumn],
@@ -1744,6 +1781,7 @@ fn cold_executor(
         logs_suffix_len,
         logs_request_cost_bytes,
         logs_projection_break_even_bytes,
+        cache_bulk_scan_min_bytes,
         ..
     } = settings;
     let catalog = Arc::new(Catalog::new(
@@ -1776,8 +1814,8 @@ fn cold_executor(
     if let Some(n) = logs_suffix_len {
         log_fetcher = log_fetcher.with_suffix_len(n);
     }
-    if let Some(cache) = cache {
-        log_fetcher = log_fetcher.with_cache(cache);
+    if let Some(cache) = &cache {
+        log_fetcher = log_fetcher.with_cache(Arc::clone(cache));
     }
     // Cloned after every builder, because `with_block_range_threshold` and the
     // rest rebuild the inner `BlockRangeFetcher`; the counter itself survives
@@ -1786,9 +1824,18 @@ fn cold_executor(
     let probe_misses = log_fetcher.probe_miss_counter();
     let wire_bytes = log_fetcher.phase_wire_byte_counter();
     let get_limiter_permits = log_fetcher.get_limiter_permits();
+    // `stats.cache` is read off the samples fetcher's cache, so a run that
+    // sets the size trigger puts the same cache there too, as `ravel-server`
+    // wires it; a logs-only corpus reads nothing through that fetcher.
+    let mut fetcher = SegmentFetcher::new(Arc::clone(store));
+    if let Some(cache) = cache
+        && samples_fetcher_takes_cache(true, cache_bulk_scan_min_bytes)
+    {
+        fetcher = fetcher.with_cache(cache);
+    }
     let executor = SqlExecutor::new(
         catalog,
-        SegmentFetcher::new(Arc::clone(store)),
+        fetcher,
         log_fetcher,
         SpanSegmentFetcher::new(Arc::clone(store)),
         SqlConfig {
@@ -1804,7 +1851,8 @@ fn cold_executor(
         },
         tenant_max_bytes.max(1),
     )
-    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.to_vec())));
+    .with_declared_column_source(Arc::new(StaticDeclaredColumns::new(declared.to_vec())))
+    .with_cache_bulk_scan_min_bytes(cache_bulk_scan_min_bytes);
     Ok(ColdExecutor {
         executor,
         probe_misses,
@@ -2077,6 +2125,7 @@ pub async fn measure_corpus(
                 scan_timing: Some(ScanTimingReport::from(&outcome.stats.scan_timing)),
                 cpu_ms,
                 peak_rss_kb: process_peak_rss_kb(),
+                read_cache: outcome.stats.cache.as_ref().map(cache_json),
             });
             // #857: check the split against the pooled figures the moment it is
             // recorded. This is not a statement failure, so `continue_on_error`
@@ -2399,6 +2448,15 @@ fn knob_effective(
 /// ([`executor_engine_config`]) before the dataset is generated: a refused
 /// setting costs no store request.
 pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Error> {
+    run_generated_with_bulk_scan_min_bytes(cfg, None).await
+}
+
+/// [`run_generated`] with the bulk-scan size trigger
+/// (`--cache-bulk-scan-min-bytes`) set to `cache_bulk_scan_min_bytes`.
+pub async fn run_generated_with_bulk_scan_min_bytes(
+    cfg: &GenerateConfig,
+    cache_bulk_scan_min_bytes: Option<u64>,
+) -> Result<SqlLatencyReport, Error> {
     // The generated lane writes shard 0 only by construction (see
     // `generate_dataset`), so a single shard resolves the whole dataset.
     let shard_count = 1;
@@ -2422,6 +2480,7 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
         logs_block_range_threshold: resolved_logs_fetch.block_range_threshold,
         logs_projection_break_even_bytes: resolved_logs_fetch.projection_break_even_bytes,
         logs_fetch_policy: cfg.logs_fetch_policy,
+        cache_bulk_scan_min_bytes,
     };
     executor_engine_config(&settings)?;
 
@@ -2537,6 +2596,11 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
             // Generate is always in process: the requested profile priced the
             // run, so it is also the effective one.
             store_cost_profile_effective: Some(cfg.store_cost_profile.clone()),
+            cache_bulk_scan_min_bytes,
+            samples_fetcher_cache: samples_fetcher_takes_cache(
+                cfg.cache_bytes > 0,
+                cache_bulk_scan_min_bytes,
+            ),
         },
         dataset,
         // Generate is always in process (never Flight).
@@ -2579,6 +2643,7 @@ fn tenant_executor_settings(
         logs_block_range_threshold: resolved_logs_fetch.block_range_threshold,
         logs_projection_break_even_bytes: resolved_logs_fetch.projection_break_even_bytes,
         logs_fetch_policy: cfg.logs_fetch_policy,
+        cache_bulk_scan_min_bytes: None,
     }
 }
 
@@ -2793,6 +2858,8 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 Some(_) => None,
                 None => Some(cfg.store_cost_profile.clone()),
             },
+            cache_bulk_scan_min_bytes: None,
+            samples_fetcher_cache: false,
         },
         dataset,
         // The request term is absent on every lane (no attempt source). The
@@ -5478,6 +5545,15 @@ mod tests {
     /// lanes drive, for two runs. Returns the per-run accounting, the object
     /// bytes written, and the store's GET split across the whole measurement.
     async fn whole_object_fixture_run(cache_bytes: u64) -> (Vec<RunAccounting>, u64, DataSplit) {
+        whole_object_fixture_run_with(cache_bytes, None).await
+    }
+
+    /// [`whole_object_fixture_run`] with `--cache-bulk-scan-min-bytes` set to
+    /// `cache_bulk_scan_min_bytes`.
+    async fn whole_object_fixture_run_with(
+        cache_bytes: u64,
+        cache_bulk_scan_min_bytes: Option<u64>,
+    ) -> (Vec<RunAccounting>, u64, DataSplit) {
         let store = DataSplitStore::new(empty_store());
         let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
         let tenant = TenantId::new("whole-object-wire-tenant");
@@ -5501,6 +5577,7 @@ mod tests {
             None,
             ExecutorSettings {
                 fetch_concurrency: WHOLE_OBJECTS / 2,
+                cache_bulk_scan_min_bytes,
                 ..ExecutorSettings::default()
             },
             false,
@@ -5652,6 +5729,39 @@ mod tests {
             unattributed_bytes, split.other_bytes,
             "the residual is exactly the non-data bytes on both runs"
         );
+    }
+
+    /// A run without `--cache-bulk-scan-min-bytes` keeps the read cache off
+    /// the samples fetcher, as every run did before the flag existed, so no
+    /// run reports `read_cache`; with the flag set the samples fetcher carries
+    /// the cache and every run reports it, the filtered statement under
+    /// `bulkScan`. The provenance stamp follows the same rule.
+    ///
+    /// FLIP: making `samples_fetcher_takes_cache` ignore the flag (attaching
+    /// whenever a cache exists) fails the unset half.
+    #[tokio::test]
+    async fn an_unset_size_trigger_keeps_the_cache_off_the_samples_fetcher() {
+        let (unset, _, _) = whole_object_fixture_run_with(64 << 20, None).await;
+        assert_eq!(unset.len(), 2);
+        for (run, entry) in unset.iter().enumerate() {
+            assert_eq!(
+                entry.read_cache, None,
+                "run {run}: unset, the samples fetcher carries no cache"
+            );
+        }
+        assert!(!samples_fetcher_takes_cache(true, None));
+
+        let (set, _, _) = whole_object_fixture_run_with(64 << 20, Some(1)).await;
+        assert_eq!(set.len(), 2);
+        for (run, entry) in set.iter().enumerate() {
+            let cache = entry
+                .read_cache
+                .as_ref()
+                .expect("set, the samples fetcher carries the cache");
+            assert_eq!(cache["intent"], "bulkScan", "run {run}");
+        }
+        assert!(samples_fetcher_takes_cache(true, Some(1)));
+        assert!(!samples_fetcher_takes_cache(false, Some(1)));
     }
 
     // ---- Phase reconciliation in the bench itself (#857) -------------------
@@ -5987,6 +6097,7 @@ mod tests {
             scan_timing: None,
             cpu_ms: None,
             peak_rss_kb: None,
+            read_cache: None,
         }
     }
 

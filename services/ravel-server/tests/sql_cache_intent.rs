@@ -149,14 +149,14 @@ async fn publish_segment(
 }
 
 /// Publish one RLOG object for `tenant` holding `count` records spread over
-/// `hour`, committed in that ingest hour.
+/// `hour`, committed in that ingest hour. Returns the object's size.
 async fn publish_log_segment(
     store: &dyn ObjectStoreBackend,
     tenant: &TenantId,
     index: usize,
     hour: i64,
     count: usize,
-) {
+) -> u64 {
     let tenant_hash = tenant.hash();
     let resource = vec![(
         "service.name".to_string(),
@@ -195,6 +195,7 @@ async fn publish_log_segment(
         writer.push(rec.clone()).expect("push log record");
     }
     let bytes = writer.finish().expect("finish rlog object");
+    let size = bytes.len() as u64;
     let rec = record::build(NewCommitRecord {
         tenant_hash,
         signal: Signal::Logs,
@@ -223,6 +224,7 @@ async fn publish_log_segment(
     publish::publish(store, &rec, &RetryPolicy::default())
         .await
         .expect("publish log commit");
+    size
 }
 
 /// The fetcher cache the server builds for `--cache-max-bytes max_bytes`
@@ -237,6 +239,17 @@ fn server_cache(max_bytes: u64) -> ReadCache {
 /// The SQL router over `store`, its metrics and logs fetchers sharing
 /// `cache` the way `query::build_sql_executor` attaches it.
 fn sql_app(store: Arc<dyn ObjectStoreBackend>, cache: &ReadCache, tenants: &[&str]) -> Router {
+    sql_app_with_bulk_scan_min_bytes(store, cache, tenants, None)
+}
+
+/// [`sql_app`] with the executor's bulk-scan byte threshold set to
+/// `min_bytes`, as `--cache-bulk-scan-min-bytes` installs it.
+fn sql_app_with_bulk_scan_min_bytes(
+    store: Arc<dyn ObjectStoreBackend>,
+    cache: &ReadCache,
+    tenants: &[&str],
+    min_bytes: Option<u64>,
+) -> Router {
     let catalog =
         Arc::new(Catalog::new(Arc::clone(&store), CatalogConfig::default()).expect("catalog"));
     let executor = SqlExecutor::new(
@@ -246,7 +259,8 @@ fn sql_app(store: Arc<dyn ObjectStoreBackend>, cache: &ReadCache, tenants: &[&st
         ravel_sql::SpanSegmentFetcher::new(store.clone()).with_cache(cache.clone()),
         SqlConfig::default(),
         1 << 30,
-    );
+    )
+    .with_cache_bulk_scan_min_bytes(min_bytes);
     let tokens: HashMap<String, TenantId> = tenants
         .iter()
         .map(|tenant| (format!("{tenant}-token"), TenantId::new(tenant.to_string())))
@@ -376,6 +390,43 @@ async fn a_predicate_free_logs_statement_is_bulk_only_over_an_epoch_to_now_windo
 
     let all_history = statement_cache(&app, "acme", statement, 0).await;
     assert_eq!(all_history["intent"], "bulkScan", "{all_history}");
+}
+
+/// A filtered `logs` scan whose resolved segments reach
+/// `--cache-bulk-scan-min-bytes` reads as bulkScan with the threshold set and
+/// interactive without it, or with the threshold one byte above the resolve.
+///
+/// FLIP: replacing `size_trigger_applies(lanes, names_parquet,
+/// self.cache_bulk_scan_min_bytes)` in `statement_access_intent`
+/// (`crates/ravel-sql/src/executor.rs`) with `false` reports the thresholded
+/// statement as interactive.
+#[tokio::test]
+async fn a_filtered_logs_scan_above_the_bulk_scan_threshold_is_bulk_only_with_the_flag() {
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new("acme".to_string());
+    let mut resolved = 0;
+    for hour in 0..4 {
+        resolved += publish_log_segment(store.as_ref(), &tenant, hour as usize, hour, 64).await;
+    }
+    let cache = server_cache(8 * 1024 * 1024);
+    let statement = "SELECT count(*) AS n FROM logs WHERE severity_text = 'INFO'";
+
+    let with_flag =
+        sql_app_with_bulk_scan_min_bytes(Arc::clone(&store), &cache, &["acme"], Some(resolved));
+    let at_threshold = statement_cache(&with_flag, "acme", statement, 0).await;
+    assert_eq!(at_threshold["intent"], "bulkScan", "{at_threshold}");
+
+    let above =
+        sql_app_with_bulk_scan_min_bytes(Arc::clone(&store), &cache, &["acme"], Some(resolved + 1));
+    let below_threshold = statement_cache(&above, "acme", statement, 0).await;
+    assert_eq!(
+        below_threshold["intent"], "interactive",
+        "{below_threshold}"
+    );
+
+    let without_flag = sql_app(store, &cache, &["acme"]);
+    let unset = statement_cache(&without_flag, "acme", statement, 0).await;
+    assert_eq!(unset["intent"], "interactive", "{unset}");
 }
 
 /// FLIP: dropping `&& predicate_free` from `classify_signal_lanes` in
