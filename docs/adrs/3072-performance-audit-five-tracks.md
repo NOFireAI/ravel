@@ -698,8 +698,12 @@ to at least `BYTES`, counted after resolve and before any segment read; and
 the plan the KEY_IDX probe takes its filters from (the optimized plan,
 subqueries, CTEs and join conditions included) has no equality on a field
 the tenant indexes in KEY_IDX. A one-element `IN` counts as an equality,
-and so does a column renamed through a CTE or a subquery. When the
-executor cannot tell whether a statement is a key lookup, it reads it as
+and so does a column renamed through a CTE or a subquery. Only an equality
+on a key-indexed field is exempt, because only the KEY_IDX probe reliably
+narrows the read; an equality on another declared column can also be pruned
+by block postings, but that pruning can decline (on older sections, or where
+statistics are absent), so such a statement still counts toward the
+threshold. When the executor cannot tell whether a statement is a key lookup, it reads it as
 one. A `samples` statement and a statement with no SQL text (a lowered
 ES|QL query) never read as `BulkScan` through this arm, whether or not the
 tenant indexes any key.
