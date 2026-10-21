@@ -161,6 +161,16 @@
   status: verified
   note: "Describes cluster state while the qualification Job runs, not an absent capability."
 
+- id: kubernetes-pod-identity-irsa-not-supported
+  doc: docs/guides/kubernetes.md
+  quote: "IRSA (web identity) is not supported."
+  kind: negative
+  binds:
+    - services/ravel-operator/src/pod_identity.rs::AgentEndpoint::from_env
+    - services/ravel-operator/src/pod_identity.rs::tests::missing_environment_is_refused_naming_both_variables
+  status: verified
+  note: "from_env reads only the Pod Identity webhook's AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE and refuses to start without them; nothing reads AWS_WEB_IDENTITY_TOKEN_FILE or calls AssumeRoleWithWebIdentity. The bound test pins the refusal."
+
 - id: ingest-affinity-mtls-not-available
   doc: docs/guides/ingest-affinity.md
   quote: "mTLS resolution is not available at any layer"

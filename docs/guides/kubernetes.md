@@ -1229,7 +1229,10 @@ How the credentials reach a pod:
 - `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` are set to the literal
   `unused-credentials-file-wins`. `ravel-server` and `ravel-cli` still
   require both under `--s3-auth static` even with a credentials file, and
-  the file overrides them, so the value is never used as a key.
+  the file overrides them, so the value is never used as a key. There is no
+  fallback to it either: an unreadable or malformed credentials file stops
+  `ravel-server` and `ravel-cli` at startup with an error. The operator sets
+  the placeholder only on a container it also points at the file.
 
 The operator needs to know its own image to render the sidecar. The shipped
 `operator.yaml` sets `RAVEL_CREDENTIALS_SIDECAR_IMAGE`
