@@ -5090,6 +5090,7 @@ dependencies = [
  "protox",
  "ravel-cache",
  "ravel-catalog",
+ "ravel-codec",
  "ravel-commit",
  "ravel-cpu-gate",
  "ravel-logseg",

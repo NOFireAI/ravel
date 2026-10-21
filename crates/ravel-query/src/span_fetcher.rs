@@ -48,6 +48,7 @@ use crate::reserved_bytes::attach_reservation;
 use bytes::Bytes;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::SegmentRef;
+use ravel_codec::key_idx::KEY_IDX_ENTRY_LEN;
 use ravel_cpu_gate::{CpuGateError, JobSize, ReadGate, ReadSite};
 use ravel_object_store::get_latency::InGetPhase;
 use ravel_object_store::{GetRange, ObjectStoreBackend, StoreError};
@@ -120,6 +121,18 @@ pub struct KeyIndexPruning {
     /// SKIP_IDX candidate blocks the probe's block set removed, so they were
     /// neither read nor decoded.
     pub blocks_pruned: u64,
+}
+
+/// The decompressed length a KEY_IDX bucket frame declares: its `entry_count`
+/// (the frame's leading u32 LE) times [`KEY_IDX_ENTRY_LEN`]. Read only after
+/// the frame decoded, which checked the zstd output is exactly this long.
+pub(crate) fn key_idx_frame_decompressed_len(frame: &[u8]) -> u64 {
+    frame
+        .get(..4)
+        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+        .map_or(0, |b| {
+            u64::from(u32::from_le_bytes(b)) * KEY_IDX_ENTRY_LEN as u64
+        })
 }
 
 /// One candidate block resolved to its absolute, bounds-checked
@@ -1103,7 +1116,9 @@ impl SpanSegmentFetcher {
     /// section's `[0, prefix_len)`, then the one bucket the trace mixes to,
     /// skipped when the directory says that bucket is empty. Each read is
     /// sliced from the tail probe when the probe holds it, otherwise one
-    /// ranged GET on `accounting` (the key-index phase).
+    /// ranged GET on `accounting` (the key-index phase). Its decompressed
+    /// bytes, charged there too, are the prefix's length once it parses
+    /// (stored as is) plus the decoded bucket's declared length.
     ///
     /// `None` is a fallback to SKIP_IDX alone: the section's prefix or bucket
     /// is corrupt, which is logged with the object key and prunes nothing. A
@@ -1135,19 +1150,26 @@ impl SpanSegmentFetcher {
         let prefix = self
             .key_index_read(seg_ref, tenant_hash, probe, prefix_span, accounting)
             .await?;
-        let bucket = match reader.locate_trace_key(trace_id, &prefix) {
-            Ok(TraceKeyStep::Done(answer)) => return Ok(Some(answer)),
-            Ok(TraceKeyStep::Bucket(bucket)) => bucket,
+        let step = match reader.locate_trace_key(trace_id, &prefix) {
+            Ok(step) => step,
             Err(err) => {
                 fall_back(err);
                 return Ok(None);
             }
         };
+        accounting.add_decompressed_bytes(prefix.len() as u64);
+        let bucket = match step {
+            TraceKeyStep::Done(answer) => return Ok(Some(answer)),
+            TraceKeyStep::Bucket(bucket) => bucket,
+        };
         let frame = self
             .key_index_read(seg_ref, tenant_hash, probe, bucket.range(), accounting)
             .await?;
         match bucket.finish(&frame) {
-            Ok(answer) => Ok(Some(answer)),
+            Ok(answer) => {
+                accounting.add_decompressed_bytes(key_idx_frame_decompressed_len(&frame));
+                Ok(Some(answer))
+            }
             Err(err) => {
                 fall_back(err);
                 Ok(None)
