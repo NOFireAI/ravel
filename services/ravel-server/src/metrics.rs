@@ -558,15 +558,19 @@ impl CacheTier {
 /// Which jemalloc-reported figure a `ravel_process_allocator_bytes` sample is
 /// (#1170): `allocated` is bytes the application requested, `active` adds
 /// page-rounding and thread-cache slop, `resident` additionally counts pages
-/// jemalloc has not yet returned to the OS. Three separate series, not one
-/// number, because a single process-RSS figure cannot say which of these --
-/// or which subsystem's cache -- grew, the exact ambiguity that forced two
-/// published ClickBench memory claims to be retracted.
+/// jemalloc has not yet returned to the OS, `mapped` is the bytes in active
+/// extents mapped by the allocator, and `retained` is virtual memory jemalloc
+/// keeps mapped-out but reserved for reuse rather than unmapping. Separate
+/// series, not one number, because a single process-RSS figure cannot say
+/// which of these -- or which subsystem's cache -- grew, the exact ambiguity
+/// that forced two published ClickBench memory claims to be retracted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AllocatorStat {
     Allocated,
     Active,
     Resident,
+    Mapped,
+    Retained,
 }
 
 impl AllocatorStat {
@@ -575,6 +579,8 @@ impl AllocatorStat {
             AllocatorStat::Allocated => "allocated",
             AllocatorStat::Active => "active",
             AllocatorStat::Resident => "resident",
+            AllocatorStat::Mapped => "mapped",
+            AllocatorStat::Retained => "retained",
         }
     }
 }
@@ -6461,18 +6467,23 @@ fn render_allocator_family(
             allocated,
             active,
             resident,
+            mapped,
+            retained,
             background_thread,
         } => {
             write_header(
                 out,
                 "ravel_process_allocator_bytes",
-                "This process's jemalloc-reported byte figures, split by stat= (allocated/active/resident).",
+                "This process's jemalloc-reported byte figures, split by stat= \
+                 (allocated/active/resident/mapped/retained).",
                 "gauge",
             );
             for (stat, value) in [
                 (AllocatorStat::Allocated, allocated),
                 (AllocatorStat::Active, active),
                 (AllocatorStat::Resident, resident),
+                (AllocatorStat::Mapped, mapped),
+                (AllocatorStat::Retained, retained),
             ] {
                 write_sample(
                     out,
@@ -15223,8 +15234,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
         );
     }
 
-    /// Exact figures (#1170), not `> 0`: on a jemalloc build the three stats
-    /// render as three distinct samples under their own `stat=` label, with
+    /// Exact figures (#1170), not `> 0`: on a jemalloc build the five stats
+    /// render as five distinct samples under their own `stat=` label, with
     /// the values passed straight through, and the allocator-name info series
     /// does not also render.
     #[test]
@@ -15237,6 +15248,8 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                 allocated: 111,
                 active: 222,
                 resident: 333,
+                mapped: 444,
+                retained: 555,
                 background_thread: true,
             },
         );
@@ -15266,12 +15279,60 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
                 allocated: 111,
                 active: 222,
                 resident: 333,
+                mapped: 444,
+                retained: 555,
                 background_thread: false,
             },
         );
         assert!(out.contains(
             "ravel_process_allocator_background_thread{mode=\"query\",allocator=\"jemalloc\"} 0"
         ));
+    }
+
+    /// All five jemalloc stats render as exactly one sample each, carrying
+    /// its own figure: no stat is missing, duplicated, or given another's
+    /// value.
+    #[test]
+    fn allocator_family_renders_each_of_five_stats_exactly_once() {
+        let mut out = String::new();
+        render_allocator_family(
+            &mut out,
+            Mode::Query,
+            crate::mem_stats::AllocatorStats::Jemalloc {
+                allocated: 101,
+                active: 202,
+                resident: 303,
+                mapped: 404,
+                retained: 505,
+                background_thread: true,
+            },
+        );
+        let samples: Vec<&str> = out
+            .lines()
+            .filter(|line| line.starts_with("ravel_process_allocator_bytes{"))
+            .collect();
+        assert_eq!(samples.len(), 5, "got:\n{out}");
+        for (stat, value) in [
+            ("allocated", 101),
+            ("active", 202),
+            ("resident", 303),
+            ("mapped", 404),
+            ("retained", 505),
+        ] {
+            let prefix = format!(
+                "ravel_process_allocator_bytes{{mode=\"query\",allocator=\"jemalloc\",stat=\"{stat}\"}} "
+            );
+            let matching: Vec<&&str> = samples
+                .iter()
+                .filter(|line| line.starts_with(&prefix))
+                .collect();
+            assert_eq!(matching.len(), 1, "stat={stat} must render once:\n{out}");
+            assert_eq!(
+                matching[0].strip_prefix(&prefix),
+                Some(value.to_string().as_str()),
+                "stat={stat} must carry its own figure:\n{out}"
+            );
+        }
     }
 
     /// On a non-jemalloc build there are no allocated/active/resident figures
