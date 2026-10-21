@@ -439,10 +439,10 @@ pub struct Provenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_bulk_scan_min_bytes: Option<u64>,
     /// Whether the read cache was also attached to the samples fetcher, the
-    /// fetcher a run's `read_cache` is read from. True only when a cache was
-    /// attached and `cache_bulk_scan_min_bytes` was set; without the flag the
-    /// samples fetcher reads uncached and `read_cache` is absent. Skipped in
-    /// JSON when `false`.
+    /// fetcher a run's `read_cache` is read from. True whenever the run had a
+    /// cache (`cache_bytes > 0`), independent of `cache_bulk_scan_min_bytes`;
+    /// without a cache the samples fetcher reads uncached and `read_cache` is
+    /// absent. Skipped in JSON when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub samples_fetcher_cache: bool,
 }
@@ -1575,9 +1575,8 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 
 /// Build a fresh executor over `store` with `declared` installed, its catalog
 /// configured for `shard_count` shards, and `cache` (when present) attached to
-/// the log fetcher, and to the samples fetcher too when
-/// [`samples_fetcher_takes_cache`]. Fresh per corpus entry so the first run is genuinely cold: a
-/// shared executor would let one statement warm the next through the catalog and
+/// the log fetcher and the samples fetcher. Fresh per corpus entry so the first
+/// run is genuinely cold: a shared executor would let one statement warm the next through the catalog and
 /// fetch caches.
 ///
 /// `shard_count` reaches the resolve because these direct-built catalogs run
@@ -1756,11 +1755,11 @@ fn executor_engine_config(settings: &ExecutorSettings) -> Result<EngineConfig, E
 }
 
 /// Whether [`cold_executor`] also attaches the read cache to the samples
-/// fetcher: only when a cache is attached and `--cache-bulk-scan-min-bytes` is
-/// set, so a run without the flag wires the samples fetcher uncached, as every
-/// run did before the flag existed.
-fn samples_fetcher_takes_cache(has_cache: bool, cache_bulk_scan_min_bytes: Option<u64>) -> bool {
-    has_cache && cache_bulk_scan_min_bytes.is_some()
+/// fetcher: whenever `cache_bytes` gives the run a cache, as `ravel-server`
+/// attaches its cache to every fetcher, so `--cache-bulk-scan-min-bytes` only
+/// moves the executor's intent classification.
+fn samples_fetcher_takes_cache(cache_bytes: u64) -> bool {
+    cache_bytes > 0
 }
 
 fn cold_executor(
@@ -1824,13 +1823,11 @@ fn cold_executor(
     let probe_misses = log_fetcher.probe_miss_counter();
     let wire_bytes = log_fetcher.phase_wire_byte_counter();
     let get_limiter_permits = log_fetcher.get_limiter_permits();
-    // `stats.cache` is read off the samples fetcher's cache, so a run that
-    // sets the size trigger puts the same cache there too, as `ravel-server`
-    // wires it; a logs-only corpus reads nothing through that fetcher.
+    // `stats.cache` is read off the samples fetcher's cache, so the same cache
+    // goes there too whenever one exists, as `ravel-server` wires it; a
+    // logs-only corpus reads nothing through that fetcher.
     let mut fetcher = SegmentFetcher::new(Arc::clone(store));
-    if let Some(cache) = cache
-        && samples_fetcher_takes_cache(true, cache_bulk_scan_min_bytes)
-    {
+    if let Some(cache) = cache {
         fetcher = fetcher.with_cache(cache);
     }
     let executor = SqlExecutor::new(
@@ -2597,10 +2594,7 @@ pub async fn run_generated_with_bulk_scan_min_bytes(
             // run, so it is also the effective one.
             store_cost_profile_effective: Some(cfg.store_cost_profile.clone()),
             cache_bulk_scan_min_bytes,
-            samples_fetcher_cache: samples_fetcher_takes_cache(
-                cfg.cache_bytes > 0,
-                cache_bulk_scan_min_bytes,
-            ),
+            samples_fetcher_cache: samples_fetcher_takes_cache(cfg.cache_bytes),
         },
         dataset,
         // Generate is always in process (never Flight).
@@ -5731,37 +5725,36 @@ mod tests {
         );
     }
 
-    /// A run without `--cache-bulk-scan-min-bytes` keeps the read cache off
-    /// the samples fetcher, as every run did before the flag existed, so no
-    /// run reports `read_cache`; with the flag set the samples fetcher carries
-    /// the cache and every run reports it, the filtered statement under
-    /// `bulkScan`. The provenance stamp follows the same rule.
+    /// The samples fetcher carries the read cache whenever the run has one,
+    /// as `ravel-server` attaches its cache to every fetcher, so with a cache
+    /// and `--cache-bulk-scan-min-bytes` unset every run still reports
+    /// `read_cache`, under `interactive`, and the provenance stamp is true.
+    /// Without a cache no run reports it and the stamp is false.
     ///
-    /// FLIP: making `samples_fetcher_takes_cache` ignore the flag (attaching
-    /// whenever a cache exists) fails the unset half.
+    /// FLIP: gating the attachment on the flag as well (a cache and
+    /// `cache_bulk_scan_min_bytes.is_some()`) fails the cached half.
     #[tokio::test]
-    async fn an_unset_size_trigger_keeps_the_cache_off_the_samples_fetcher() {
-        let (unset, _, _) = whole_object_fixture_run_with(64 << 20, None).await;
-        assert_eq!(unset.len(), 2);
-        for (run, entry) in unset.iter().enumerate() {
-            assert_eq!(
-                entry.read_cache, None,
-                "run {run}: unset, the samples fetcher carries no cache"
-            );
-        }
-        assert!(!samples_fetcher_takes_cache(true, None));
-
-        let (set, _, _) = whole_object_fixture_run_with(64 << 20, Some(1)).await;
-        assert_eq!(set.len(), 2);
-        for (run, entry) in set.iter().enumerate() {
+    async fn the_samples_fetcher_takes_the_cache_whenever_one_exists() {
+        let (cached, _, _) = whole_object_fixture_run_with(64 << 20, None).await;
+        assert_eq!(cached.len(), 2);
+        for (run, entry) in cached.iter().enumerate() {
             let cache = entry
                 .read_cache
                 .as_ref()
-                .expect("set, the samples fetcher carries the cache");
-            assert_eq!(cache["intent"], "bulkScan", "run {run}");
+                .expect("a cache exists, so the samples fetcher carries it");
+            assert_eq!(cache["intent"], "interactive", "run {run}");
         }
-        assert!(samples_fetcher_takes_cache(true, Some(1)));
-        assert!(!samples_fetcher_takes_cache(false, Some(1)));
+        assert!(samples_fetcher_takes_cache(64 << 20));
+
+        let (uncached, _, _) = whole_object_fixture_run_with(0, None).await;
+        assert_eq!(uncached.len(), 2);
+        for (run, entry) in uncached.iter().enumerate() {
+            assert_eq!(
+                entry.read_cache, None,
+                "run {run}: no cache, the samples fetcher reads uncached"
+            );
+        }
+        assert!(!samples_fetcher_takes_cache(0));
     }
 
     // ---- Phase reconciliation in the bench itself (#857) -------------------

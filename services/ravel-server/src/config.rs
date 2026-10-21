@@ -407,6 +407,20 @@ fn parse_cache_bulk_share(value: &str) -> Result<f64, String> {
     }
 }
 
+/// Parses `--cache-bulk-scan-min-bytes`: a positive byte count. `0` would read
+/// every filtered `logs` statement as bulk; omitting the flag is how it stays
+/// off.
+fn parse_cache_bulk_scan_min_bytes(value: &str) -> Result<u64, String> {
+    let bytes: u64 = value.parse().map_err(|err| format!("{err}"))?;
+    if bytes == 0 {
+        return Err(
+            "takes a positive byte count; omit --cache-bulk-scan-min-bytes to leave it off"
+                .to_string(),
+        );
+    }
+    Ok(bytes)
+}
+
 /// Parses `--format-window-check-timeout`: a non-zero humantime duration.
 fn parse_format_window_check_timeout(value: &str) -> Result<Duration, String> {
     let duration = humantime::parse_duration(value).map_err(|err| err.to_string())?;
@@ -2483,7 +2497,7 @@ pub struct Cli {
     )]
     pub cache_bulk_share: f64,
 
-    /// Resolved bytes at or above which a filtered `logs` statement sent as SQL text also reads as a bulk scan, unless it is a KEY_IDX key lookup; default unset, which leaves only the predicate-free rule `--cache-bulk-share` describes.
+    /// Resolved bytes, a positive count, at or above which a filtered `logs` statement sent as SQL text also reads as a bulk scan, unless it is a KEY_IDX key lookup; default unset, which leaves only the predicate-free rule `--cache-bulk-share` describes.
     ///
     /// Set, a statement is also a bulk scan (ADR-3072's size trigger
     /// amendment) when it arrives as SQL text, names one `logs` table and no
@@ -2496,8 +2510,9 @@ pub struct Cli {
     /// lowered ES|QL statement never read as bulk through this threshold. The
     /// decision is made after resolve and before the first segment read, and
     /// the statement's `stats.cache.intent` reports the intent. Read at
-    /// startup only. Ignored when the fetcher cache is off.
-    #[arg(long, value_name = "BYTES")]
+    /// startup only. Ignored when the fetcher cache is off. `0` is refused at
+    /// startup; omit the flag to leave the trigger off.
+    #[arg(long, value_name = "BYTES", value_parser = parse_cache_bulk_scan_min_bytes)]
     pub cache_bulk_scan_min_bytes: Option<u64>,
 
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
@@ -9434,7 +9449,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ravel-server", "--cache-bulk-scan-min-bytes", "522460"])
             .expect("a byte count parses");
         assert_eq!(cli.cache_bulk_scan_min_bytes, Some(522_460));
-        for refused in ["-1", "half", ""] {
+        for refused in ["0", "-1", "half", ""] {
             assert!(
                 Cli::try_parse_from(["ravel-server", "--cache-bulk-scan-min-bytes", refused])
                     .is_err(),
