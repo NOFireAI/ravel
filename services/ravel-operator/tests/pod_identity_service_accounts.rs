@@ -196,8 +196,15 @@ async fn serve_fake(listener: TcpListener, fake: Arc<Fake>) {
     }
 }
 
-#[tokio::test]
-async fn service_accounts_are_applied_before_the_qualify_job() {
+fn status_path() -> String {
+    format!(
+        "PATCH /apis/ravel.nofire.ai/v1alpha1/namespaces/{NAMESPACE}/ravelclusters/{INSTANCE}/status"
+    )
+}
+
+/// Run the operator against the fake until its first status write, then
+/// stop it. Returns the fake and every write it recorded.
+async fn one_pass(sidecar_image: Option<String>) -> (Arc<Fake>, Vec<String>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let fake = Arc::new(Fake::default());
@@ -220,12 +227,10 @@ async fn service_accounts_are_applied_before_the_qualify_job() {
         health_listener,
         client,
         None,
-        Some(SIDECAR_IMAGE.to_string()),
+        sidecar_image,
     ));
 
-    let status_write = format!(
-        "PATCH /apis/ravel.nofire.ai/v1alpha1/namespaces/{NAMESPACE}/ravelclusters/{INSTANCE}/status"
-    );
+    let status_write = status_path();
     let mut writes = Vec::new();
     for _ in 0..200 {
         writes = fake.writes.lock().expect("lock").clone();
@@ -235,6 +240,38 @@ async fn service_accounts_are_applied_before_the_qualify_job() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     operator.abort();
+    (fake, writes)
+}
+
+/// A podIdentity pass refused before it applies any ServiceAccount (here,
+/// no sidecar image) must not record them: the marker is what lets a later
+/// static pass delete those names, and the operator never applied them.
+#[tokio::test]
+async fn a_pass_refused_before_the_accounts_does_not_record_them() {
+    let (fake, writes) = one_pass(None).await;
+
+    assert_eq!(
+        writes,
+        vec![status_path()],
+        "only the Degraded status is written"
+    );
+    let status = fake
+        .status
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("the status was patched");
+    assert_ne!(
+        status["status"]["podIdentityServiceAccounts"],
+        json!(true),
+        "a pass that applied no ServiceAccount does not record them"
+    );
+}
+
+#[tokio::test]
+async fn service_accounts_are_applied_before_the_qualify_job() {
+    let (fake, writes) = one_pass(Some(SIDECAR_IMAGE.to_string())).await;
+    let status_write = status_path();
 
     let unexpected = fake.unexpected.lock().expect("lock").clone();
     assert!(
