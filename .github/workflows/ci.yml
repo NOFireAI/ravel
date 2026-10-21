@@ -2466,7 +2466,10 @@ jobs:
       github.event_name == 'push' && github.ref == 'refs/heads/main'
       && needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # A cold run (no rust-cache entry) takes just over 40 minutes, and a run
+    # cut off by its timeout never saves the cache, so the next run starts
+    # cold too. 60 lets a cold run finish and save the cache.
+    timeout-minutes: 60
     # id-token:write is the Codecov upload's tokenless-OIDC grant (public
     # repo, no CODECOV_TOKEN secret); contents:read matches the job's only
     # other need, checking out the tree.
