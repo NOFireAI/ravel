@@ -28,7 +28,7 @@ mod fragment_tls;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::Mutex;
 use ravel_commit::publish::RetryPolicy;
@@ -365,11 +365,13 @@ impl ObjectStoreBackend for CoordinatorStore {
 
 /// Poll `ready` until it holds, failing the test after [`DEADLINE`].
 async fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
-    let start = Instant::now();
-    while !ready() {
-        assert!(start.elapsed() < DEADLINE, "timed out waiting for {what}");
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    tokio::time::timeout(DEADLINE, async {
+        while !ready() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
 fn process_id_of(key: &str) -> Uuid {
@@ -437,7 +439,11 @@ fn record_rejects(metrics: &str, reason: &str) -> f64 {
                 .unwrap_or_else(|| panic!("unparseable sample: {line}"))
         })
         .collect();
-    assert_eq!(samples.len(), 1, "exactly one {label} sample in:\n{metrics}");
+    assert_eq!(
+        samples.len(),
+        1,
+        "exactly one {label} sample in:\n{metrics}"
+    );
     samples[0]
 }
 
@@ -450,17 +456,16 @@ async fn forged_unsigned_registry_record_is_never_dialed() {
     // Worker A: a pass-through view of the shared store. Its first heartbeat
     // writes its signed record at startup.
     let worker = start_server(shared.clone()).await;
-    let started = Instant::now();
-    let a = loop {
-        if let [a] = registry_ids(&shared).await[..] {
-            break a;
+    let a = tokio::time::timeout(DEADLINE, async {
+        loop {
+            if let [a] = registry_ids(&shared).await[..] {
+                break a;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert!(
-            started.elapsed() < DEADLINE,
-            "timed out waiting for the worker's registry record"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    };
+    })
+    .await
+    .expect("timed out waiting for the worker's registry record");
 
     // Coordinator C: its first heartbeat writes its record and then parks on
     // the registry listing until the forged record is in place.
@@ -540,19 +545,20 @@ async fn forged_unsigned_registry_record_is_never_dialed() {
     let (start_s, end_s) = ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC);
     let base = format!("http://{}", coordinator.http_addr);
     for round in 0..2 {
-        let started = Instant::now();
-        let body = loop {
-            match query_range(&base, start_s, end_s).await {
-                Ok(body) => break body,
-                Err(error) => {
-                    assert!(
-                        started.elapsed() < DEADLINE,
-                        "query round {round} never succeeded through worker A: {error}"
-                    );
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut last_error = String::new();
+        let body = tokio::time::timeout(DEADLINE, async {
+            loop {
+                match query_range(&base, start_s, end_s).await {
+                    Ok(body) => break body,
+                    Err(error) => last_error = error,
                 }
+                tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        };
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("query round {round} never succeeded through worker A: {last_error}")
+        });
         let series = body["data"]["result"]
             .as_array()
             .expect("matrix result")
@@ -572,6 +578,9 @@ async fn forged_unsigned_registry_record_is_never_dialed() {
     );
 
     accept_task.abort();
-    coordinator.shutdown().await.expect("coordinator shuts down");
+    coordinator
+        .shutdown()
+        .await
+        .expect("coordinator shuts down");
     worker.shutdown().await.expect("worker shuts down");
 }
