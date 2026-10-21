@@ -2463,7 +2463,8 @@ pub struct Cli {
     /// epoch to now. A `samples` statement also needs a resolve that pruned no
     /// segment and every segment inside the window; a `logs` statement also
     /// needs no pending erasure and every resolved segment inside the window.
-    /// Every other read is interactive. Bulk reads are admitted into a bulk region; a bulk
+    /// With `--cache-bulk-scan-min-bytes` set, a large filtered scan is a bulk
+    /// scan too. Every other read is interactive. Bulk reads are admitted into a bulk region; a bulk
     /// admission evicts other bulk entries and, while the region is below
     /// this share, probation entries, never the main queue. Region
     /// bytes up to this share are evicted only after the probation and main
@@ -2481,6 +2482,21 @@ pub struct Cli {
         value_parser = parse_cache_bulk_share
     )]
     pub cache_bulk_share: f64,
+
+    /// Resolved bytes at or above which a filtered `POST /api/v1/sql` scan also reads as a bulk scan, unless it is a KEY_IDX key lookup; unset (the default), only the predicate-free rule `--cache-bulk-share` describes applies.
+    ///
+    /// Set, a statement is also a bulk scan (ADR-3072's #3084 amendment) when
+    /// it names one `samples` or `logs` table and no Parquet table, the
+    /// segments its resolve returned sum to at least this many bytes of
+    /// `object_size` before any read, and its `WHERE` has no equality on a
+    /// field the tenant indexes in KEY_IDX (a `key_index` declared column, or
+    /// `trace_id` when that is indexed). A key lookup stays interactive
+    /// however much it resolves, since the KEY_IDX probe reads a few blocks
+    /// of each segment. The decision is made after resolve and before the
+    /// first segment read, and the statement's `stats.cache.intent` reports
+    /// it. Read at startup only. Ignored when the fetcher cache is off.
+    #[arg(long, value_name = "BYTES")]
+    pub cache_bulk_scan_min_bytes: Option<u64>,
 
     /// Directory for the ADR-0046 read cache's local-disk tier (#97). Opt-in:
     /// absent, only the RAM tier exists and behavior is exactly today's. Set,
@@ -3203,6 +3219,12 @@ pub struct QueryBudgets {
     /// their blocks inline rather than on the read CPU gate (issue #2795).
     /// Reaches [`crate::query::build_sql_state_with_parquet`]. Default `false`.
     pub sql_scan_decode_inline: bool,
+    /// `--cache-bulk-scan-min-bytes`: the resolved-bytes threshold at or
+    /// above which a filtered single-table SQL scan reads as a bulk scan
+    /// (ADR-3072's #3084 amendment). Reaches
+    /// [`crate::query::build_sql_state_with_parquet`]. Default `None`, the
+    /// predicate-free rule alone.
+    pub sql_cache_bulk_scan_min_bytes: Option<u64>,
     /// The operator's explicit `--logs-block-range-threshold`, or `None` when
     /// the flag was not set (ADR-0107). Feeds the ADR-0996 resolution as both
     /// the configured value (`None` meaning
@@ -3260,6 +3282,7 @@ impl Default for QueryBudgets {
             sql_tenant_max_bytes: DEFAULT_SQL_TENANT_MAX_BYTES,
             sql_parallel_final_aggregation: true,
             sql_scan_decode_inline: false,
+            sql_cache_bulk_scan_min_bytes: None,
             logs_block_range_threshold: None,
             logs_request_cost_bytes: None,
             logs_fetch_policy: ravel_query::LogsFetchPolicy::default(),
@@ -6724,6 +6747,7 @@ impl Cli {
             sql_tenant_max_bytes: resolved.sql_tenant_max_bytes,
             sql_parallel_final_aggregation: self.sql_parallel_final_aggregation,
             sql_scan_decode_inline: self.sql_scan_decode_inline,
+            sql_cache_bulk_scan_min_bytes: self.cache_bulk_scan_min_bytes,
             logs_block_range_threshold: self.logs_block_range_threshold,
             logs_request_cost_bytes: self.logs_request_cost_bytes,
             logs_fetch_policy: logs_fetch_policy.policy(),
@@ -9397,6 +9421,22 @@ mod tests {
             assert!(
                 Cli::try_parse_from(["ravel-server", "--cache-bulk-share", refused]).is_err(),
                 "{refused} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn cache_bulk_scan_min_bytes_is_off_by_default_and_takes_a_byte_count() {
+        let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
+        assert_eq!(cli.cache_bulk_scan_min_bytes, None);
+        let cli = Cli::try_parse_from(["ravel-server", "--cache-bulk-scan-min-bytes", "522460"])
+            .expect("a byte count parses");
+        assert_eq!(cli.cache_bulk_scan_min_bytes, Some(522_460));
+        for refused in ["-1", "half", ""] {
+            assert!(
+                Cli::try_parse_from(["ravel-server", "--cache-bulk-scan-min-bytes", refused])
+                    .is_err(),
+                "{refused:?} must be refused"
             );
         }
     }

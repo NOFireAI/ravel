@@ -3443,6 +3443,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                             ravel_maintain::AuditTextPolicy::Plaintext
                         ),
                 ),
+                // ADR-3072's #3084 amendment: the resolved-bytes threshold at
+                // which a filtered scan also reads as a bulk scan, from
+                // `--cache-bulk-scan-min-bytes`. Unset by default.
+                config.query_budgets.sql_cache_bulk_scan_min_bytes,
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).

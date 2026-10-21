@@ -32,7 +32,7 @@ use ravel_bench::harness::{DelayedGetStore, StoreKind, store_from_env};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
     Compaction, DatasetInfo, FlightTarget, GenerateConfig, Provenance, RunAccounting,
-    SqlLatencyReport, TenantConfigInput, run_generated, run_tenant,
+    SqlLatencyReport, TenantConfigInput, run_generated_with_bulk_scan_min_bytes, run_tenant,
 };
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
@@ -169,6 +169,12 @@ struct Args {
     /// become meaningful.
     #[arg(long, default_value_t = 0)]
     cache_bytes: u64,
+    /// Resolved bytes at or above which a filtered scan also reads as a bulk
+    /// scan, the same flag as `ravel-server --cache-bulk-scan-min-bytes`.
+    /// Unset (the default), only the predicate-free rule applies. Generated
+    /// lane only.
+    #[arg(long, value_name = "BYTES", requires = "generate")]
+    cache_bulk_scan_min_bytes: Option<u64>,
     /// Per-statement wall deadline, in seconds. A statement that exceeds it
     /// fails with `query exceeded its N ms wall deadline`; the default is the
     /// budget every run used before the flag existed.
@@ -560,7 +566,7 @@ async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::
                 // owns the CLI surface that would override it.
                 store_cost_profile: StoreCostProfile::reference(),
             };
-            run_generated(&cfg).await
+            run_generated_with_bulk_scan_min_bytes(&cfg, args.cache_bulk_scan_min_bytes).await
         }
     }
 }
@@ -740,6 +746,11 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
         out.push_str(&format!("  read cache : {} bytes\n", p.cache_bytes));
     } else {
         out.push_str("  read cache : off\n");
+    }
+    if let Some(n) = p.cache_bulk_scan_min_bytes {
+        out.push_str(&format!(
+            "  bulk scan  : filtered scans of >= {n} resolved bytes\n"
+        ));
     }
     match p.logs_suffix_len {
         Some(n) => out.push_str(&format!(
@@ -1155,6 +1166,7 @@ mod tests {
             allocator: ravel_bench::allocator::Allocator::System,
             store_cost_profile_requested: StoreCostProfile::reference(),
             store_cost_profile_effective: Some(StoreCostProfile::reference()),
+            cache_bulk_scan_min_bytes: None,
         }
     }
 

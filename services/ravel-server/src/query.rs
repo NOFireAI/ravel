@@ -604,6 +604,7 @@ pub fn build_sql_state(
         ravel_sql::DEFAULT_MIN_GRACE_MS,
         &SqlSpillInputs::default(),
         ravel_sql::IpcryptDeployment::default(),
+        None,
     )
 }
 
@@ -1097,6 +1098,11 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// and `ipcrypt_prefix_encrypt` SQL functions read (ADR-2993 decision 6),
 /// installed via `SqlExecutor::with_ipcrypt_deployment`. [`build_sql_state`]
 /// installs the default, which holds no key and so registers neither.
+///
+/// `cache_bulk_scan_min_bytes` (`--cache-bulk-scan-min-bytes`, ADR-3072's
+/// #3084 amendment) is installed via
+/// `SqlExecutor::with_cache_bulk_scan_min_bytes`. [`build_sql_state`]
+/// installs `None`, the predicate-free bulk-scan rule alone.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
 pub fn build_sql_state_with_parquet(
@@ -1119,6 +1125,7 @@ pub fn build_sql_state_with_parquet(
     read_gate: Arc<ravel_cpu_gate::ReadGate>,
     scan_decode_inline: bool,
     ipcrypt: ravel_sql::IpcryptDeployment,
+    cache_bulk_scan_min_bytes: Option<u64>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     let external = parquet_profiles.map(|config| {
         let stores = ravel_sql::ProfileStores::new(config.profiles);
@@ -1159,6 +1166,7 @@ pub fn build_sql_state_with_parquet(
         ddl_min_grace_ms,
         spill,
         ipcrypt,
+        cache_bulk_scan_min_bytes,
     )
 }
 
@@ -1184,6 +1192,7 @@ fn build_sql_state_inner(
     ddl_min_grace_ms: u64,
     spill: &SqlSpillInputs,
     ipcrypt: ravel_sql::IpcryptDeployment,
+    cache_bulk_scan_min_bytes: Option<u64>,
 ) -> anyhow::Result<crate::sql::SqlState> {
     use ravel_query::{LogSegmentFetcher, SegmentFetcher};
     use ravel_sql::{SpanSegmentFetcher, SqlConfig, SqlExecutor};
@@ -1332,7 +1341,8 @@ fn build_sql_state_inner(
     // `WRITER_MIN_USABLE_GRACE_MS` for why it is not query protection.
     let executor = executor
         .with_ddl_min_grace_ms(ddl_min_grace_ms)
-        .with_ipcrypt_deployment(ipcrypt);
+        .with_ipcrypt_deployment(ipcrypt)
+        .with_cache_bulk_scan_min_bytes(cache_bulk_scan_min_bytes);
     Ok(crate::sql::SqlState {
         executor: Arc::new(executor),
         tenant_resolver,
@@ -2512,6 +2522,7 @@ mod tests {
             crate::cpu_gates::CpuGates::new(Default::default()).read,
             false,
             ravel_sql::IpcryptDeployment::default(),
+            None,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), 7_000);
@@ -2568,6 +2579,7 @@ mod tests {
             crate::cpu_gates::CpuGates::new(Default::default()).read,
             false,
             ravel_sql::IpcryptDeployment::default(),
+            None,
         )
         .expect("sql state builds");
         assert_eq!(state.executor.ddl_min_grace_ms(), expected_ms);
@@ -2699,6 +2711,7 @@ mod tests {
                 crate::cpu_gates::CpuGates::new(Default::default()).read,
                 false,
                 ravel_sql::IpcryptDeployment::default(),
+                None,
             )
             .expect("sql state builds")
         };
@@ -3419,6 +3432,7 @@ mod tests {
             crate::cpu_gates::CpuGates::new(Default::default()).read,
             false,
             ravel_sql::IpcryptDeployment::default(),
+            None,
         )
         .expect("sql state builds");
         state.executor.config().spill.clone()
