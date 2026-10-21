@@ -1003,7 +1003,8 @@ jobs:
   #    compile it gave is now the `lint` job's `--features sql
   #    --all-targets` clippy. The `flight-sql` job compiles ravel-server
   #    with sql on and esql off in a selection of its own, under the same
-  #    sql_area gate; no test exercises the `not(feature = "esql")` code.
+  #    sql_area gate. No test exercises the esql-off arm of `redact_esql`
+  #    (services/ravel-server/src/config.rs).
   # 2. The layer-2 differential gate
   #    (crates/ravel-sql/tests/differential.rs) is only as strong as the
   #    number of proptest cases it runs. `check` runs it at the in-file
