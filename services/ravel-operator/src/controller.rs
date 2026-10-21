@@ -61,8 +61,8 @@ use crate::reconcile::{
     query_network_policy_during_rollout, s3_allow_http,
 };
 use crate::reconcile::{
-    desired_tier_service_accounts, pod_identity, possible_tier_service_account_names,
-    validate_storage_auth,
+    desired_tier_service_accounts, pod_identity, pod_identity_service_accounts_marker,
+    tier_service_accounts_to_sweep, validate_storage_auth,
 };
 
 /// Server-side-apply field manager name.
@@ -1605,6 +1605,14 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
                     qualify_failure_count,
                     qualify_next_retry_time,
                     qualify_retry_hash,
+                    // The pass may have applied the accounts, or failed before
+                    // its sweep finished: keep the marker so a later pass
+                    // still sweeps.
+                    pod_identity_service_accounts: pod_identity_service_accounts_marker(
+                        &obj.spec,
+                        pod_identity_service_accounts_recorded(&obj),
+                        false,
+                    ),
                 },
                 degraded_conditions,
                 obj.status
@@ -1839,6 +1847,14 @@ async fn reconcile_inner(
                     qualify_failure_count: plan.failure_count,
                     qualify_next_retry_time: plan.next_retry_unix.map(format_rfc3339_utc),
                     qualify_retry_hash: plan.retry_hash.clone(),
+                    // The sweep after a switch back to static runs past this
+                    // gate, so the marker must survive the qualification it
+                    // waits on.
+                    pod_identity_service_accounts: pod_identity_service_accounts_marker(
+                        &obj.spec,
+                        pod_identity_service_accounts_recorded(obj),
+                        false,
+                    ),
                 },
                 extra_conditions,
                 prior.map(|s| s.conditions.as_slice()).unwrap_or_default(),
@@ -2114,19 +2130,17 @@ async fn reconcile_inner(
     }
     // The podIdentity ServiceAccounts were applied before the gate; here,
     // past it, delete the ones the render no longer produces, which after a
-    // switch back to static is all four. The names are reserved for the
-    // operator in both modes (ADR-0034, Pod Identity storage credentials
-    // amendment): the vendored RBAC has no `get` on ServiceAccounts, so the
-    // sweep deletes by name, as the router's does.
-    let desired_tier_sa_names: BTreeSet<String> =
-        desired_tier_service_accounts(&obj.spec, instance)
-            .iter()
-            .map(ResourceExt::name_any)
-            .collect();
-    for name in possible_tier_service_account_names(instance) {
-        if !desired_tier_sa_names.contains(&name) {
-            delete_if_present(&service_accounts, &name).await?;
-        }
+    // switch back to static is all four. The vendored RBAC has no `get` on
+    // ServiceAccounts, so the sweep deletes by name, and only while
+    // `status.podIdentityServiceAccounts` records that this operator applied
+    // them: a static cluster that never ran under podIdentity sends no
+    // ServiceAccount DELETE at all.
+    for name in tier_service_accounts_to_sweep(
+        &obj.spec,
+        instance,
+        pod_identity_service_accounts_recorded(obj),
+    ) {
+        delete_if_present(&service_accounts, &name).await?;
     }
 
     let mut query_svc = desired.query_service;
@@ -2353,6 +2367,11 @@ async fn reconcile_inner(
             qualify_failure_count: None,
             qualify_next_retry_time: None,
             qualify_retry_hash: None,
+            pod_identity_service_accounts: pod_identity_service_accounts_marker(
+                &obj.spec,
+                pod_identity_service_accounts_recorded(obj),
+                true,
+            ),
         },
         extra_conditions,
         obj.status
@@ -2878,6 +2897,18 @@ struct PersistedStatus {
     /// count and next-retry time were recorded against (issue #36, finding 3), or
     /// `None` when not in a retry hold.
     qualify_retry_hash: Option<String>,
+    /// `status.podIdentityServiceAccounts`: `Some(true)` while the operator
+    /// may have podIdentity ServiceAccounts to sweep, `None` otherwise.
+    pod_identity_service_accounts: Option<bool>,
+}
+
+/// Whether `status.podIdentityServiceAccounts` records that the operator
+/// applied the podIdentity ServiceAccounts.
+fn pod_identity_service_accounts_recorded(obj: &RavelCluster) -> bool {
+    obj.status
+        .as_ref()
+        .and_then(|status| status.pod_identity_service_accounts)
+        .unwrap_or(false)
 }
 
 /// Build the success-path status: observed generation, per-mode ready replicas,
@@ -2936,6 +2967,7 @@ fn build_status(
         qualify_failure_count: persisted.qualify_failure_count,
         qualify_next_retry_time: persisted.qualify_next_retry_time,
         qualify_retry_hash: persisted.qualify_retry_hash,
+        pod_identity_service_accounts: persisted.pod_identity_service_accounts,
         conditions,
     }
 }
@@ -2980,6 +3012,7 @@ fn build_degraded_status(
         qualify_failure_count: persisted.qualify_failure_count,
         qualify_next_retry_time: persisted.qualify_next_retry_time,
         qualify_retry_hash: persisted.qualify_retry_hash,
+        pod_identity_service_accounts: persisted.pod_identity_service_accounts,
         conditions,
     }
 }

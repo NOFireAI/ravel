@@ -1120,6 +1120,19 @@ pub struct RavelClusterStatus {
     #[serde(default)]
     pub qualify_retry_hash: Option<String>,
 
+    /// `true` once the operator has applied the `storage.s3.auth: podIdentity`
+    /// ServiceAccounts (`<name>-gateway`, `-query`, `-maintain`, `-qualify`).
+    /// The operator deletes those accounts after a switch back to `static`
+    /// only while this is set, and clears it once they are gone, so a cluster
+    /// that never ran under `podIdentity` never touches ServiceAccounts with
+    /// those names. Recorded here because the operator's RBAC cannot read a
+    /// ServiceAccount to check who owns it.
+    ///
+    /// Serialized even when absent (as explicit `null`) so the status merge
+    /// patch clears it after the sweep.
+    #[serde(default)]
+    pub pod_identity_service_accounts: Option<bool>,
+
     /// Status conditions the operator actually sets: `Available`, `Degraded`,
     /// `StoreQualified`, `KubernetesVersionUnsupported`,
     /// `IngestAffinityBackendDeprecated`, `HealthProbeOnMainHttpPort`. The

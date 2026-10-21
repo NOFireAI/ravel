@@ -789,13 +789,50 @@ pub fn desired_tier_service_accounts(
 }
 
 /// Every ServiceAccount name [`desired_tier_service_accounts`] can produce
-/// for `instance`, whatever the mode, for the controller's sweep after a
-/// switch back to `static`.
+/// for `instance`, whatever the mode.
 pub fn possible_tier_service_account_names(instance: &str) -> Vec<String> {
     POD_IDENTITY_COMPONENTS
         .iter()
         .map(|component| child_name(instance, component))
         .collect()
+}
+
+/// The podIdentity ServiceAccounts the controller deletes this pass: the
+/// ones the render no longer produces, and only when
+/// `status.podIdentityServiceAccounts` (`recorded`) says the operator applied
+/// them. The operator cannot read a ServiceAccount to check its owner, so the
+/// marker is what keeps a cluster that never ran under `podIdentity` from
+/// deleting accounts with these names.
+pub fn tier_service_accounts_to_sweep(
+    spec: &RavelClusterSpec,
+    instance: &str,
+    recorded: bool,
+) -> Vec<String> {
+    if !recorded {
+        return Vec::new();
+    }
+    let desired: Vec<String> = desired_tier_service_accounts(spec, instance)
+        .into_iter()
+        .filter_map(|sa| sa.metadata.name)
+        .collect();
+    possible_tier_service_account_names(instance)
+        .into_iter()
+        .filter(|name| !desired.contains(name))
+        .collect()
+}
+
+/// The `status.podIdentityServiceAccounts` value a status write records:
+/// set while the spec renders the accounts, kept while a sweep is still owed
+/// (`recorded` and not yet `swept` this pass), and cleared after the sweep.
+/// A write that loses the marker can only orphan the accounts, which their
+/// owner reference removes with the cluster; it can never make the operator
+/// delete an account it did not apply.
+pub fn pod_identity_service_accounts_marker(
+    spec: &RavelClusterSpec,
+    recorded: bool,
+    swept: bool,
+) -> Option<bool> {
+    (pod_identity(spec) || (recorded && !swept)).then_some(true)
 }
 
 /// An `EnvVarSource` reading `key` from Secret `secret`.
@@ -10327,6 +10364,42 @@ mod tests {
         let mut disabled = pod_identity_spec();
         disabled.maintain.enabled = false;
         assert_eq!(desired_tier_service_accounts(&disabled, "prod").len(), 4);
+    }
+
+    #[test]
+    fn the_service_account_sweep_runs_only_after_the_operator_applied_them() {
+        let all = possible_tier_service_account_names("prod");
+
+        // A static cluster the operator never ran under podIdentity deletes
+        // nothing, so an account a user created with one of these names stays.
+        assert!(tier_service_accounts_to_sweep(&base_spec(), "prod", false).is_empty());
+        assert_eq!(
+            pod_identity_service_accounts_marker(&base_spec(), false, false),
+            None
+        );
+
+        // A podIdentity pass renders all four, sweeps none and records them.
+        assert!(tier_service_accounts_to_sweep(&pod_identity_spec(), "prod", true).is_empty());
+        assert!(tier_service_accounts_to_sweep(&pod_identity_spec(), "prod", false).is_empty());
+        assert_eq!(
+            pod_identity_service_accounts_marker(&pod_identity_spec(), false, false),
+            Some(true)
+        );
+
+        // After a switch back to static the recorded accounts are swept, the
+        // marker stays until the sweep has run and is cleared after it.
+        assert_eq!(
+            tier_service_accounts_to_sweep(&base_spec(), "prod", true),
+            all
+        );
+        assert_eq!(
+            pod_identity_service_accounts_marker(&base_spec(), true, false),
+            Some(true)
+        );
+        assert_eq!(
+            pod_identity_service_accounts_marker(&base_spec(), true, true),
+            None
+        );
     }
 
     #[test]

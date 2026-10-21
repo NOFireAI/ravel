@@ -629,7 +629,11 @@ operator itself, on EKS Pod Identity roles, with no key in any Secret
   gate, because the gate creates the qualify Job and returns, and a Job pod
   naming a ServiceAccount that does not exist is refused on every creation
   attempt. They are deleted again when the cluster switches back to
-  `static`. The names are reserved for the operator in both modes.
+  `static`. The operator's RBAC cannot read a ServiceAccount to check its
+  owner, so it deletes them by name, and only while
+  `status.podIdentityServiceAccounts` records that it applied them: a
+  cluster that never ran under `podIdentity` sends no ServiceAccount
+  delete.
 - **The native sidecar.** Each of those pods gets an initContainer
   `pod-identity-credentials` with `restartPolicy: Always` (a native
   sidecar: on by default since Kubernetes 1.29 and stable in 1.33, so

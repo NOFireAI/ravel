@@ -64,12 +64,13 @@ fn empty_list(kind: &str, api_version: &str) -> Value {
     })
 }
 
-/// Every write in arrival order (`PATCH <path>`), the applied Job, and every
-/// request the fake did not expect.
+/// Every write in arrival order (`PATCH <path>`), the applied Job, the last
+/// status patch, and every request the fake did not expect.
 #[derive(Default)]
 struct Fake {
     writes: Mutex<Vec<String>>,
     job: Mutex<Option<Value>>,
+    status: Mutex<Option<Value>>,
     unexpected: Mutex<Vec<String>>,
 }
 
@@ -149,6 +150,9 @@ async fn apiserver(
                 .push(format!("PATCH {path}"));
             if p == job {
                 *fake.job.lock().expect("lock") = Some(applied());
+            }
+            if p == status {
+                *fake.status.lock().expect("lock") = Some(applied());
             }
             if p == status {
                 json_response(StatusCode::OK, &cluster())
@@ -266,4 +270,19 @@ async fn service_accounts_are_applied_before_the_qualify_job() {
     assert_eq!(pod["initContainers"][0]["name"], "pod-identity-credentials");
     assert_eq!(pod["initContainers"][0]["image"], SIDECAR_IMAGE);
     assert_eq!(pod["initContainers"][0]["restartPolicy"], "Always");
+
+    // The pass returns at the qualification gate, before the sweep. Its
+    // status write must already record the accounts, or a switch back to
+    // static before the first qualification would never delete them.
+    let status = fake
+        .status
+        .lock()
+        .expect("lock")
+        .clone()
+        .expect("the status was patched");
+    assert_eq!(
+        status["status"]["podIdentityServiceAccounts"],
+        json!(true),
+        "the gate's status write records the applied ServiceAccounts"
+    );
 }
