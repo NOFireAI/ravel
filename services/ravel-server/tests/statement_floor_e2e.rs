@@ -435,19 +435,27 @@ fn assert_counts_every_record(status: reqwest::StatusCode, value: &serde_json::V
     );
 }
 
+/// How long a wait for logs commit LISTs may take before the test fails. It is
+/// a fail-fast for a LIST that is never issued, the same bound as
+/// [`IDLE_FAIL_FAST`] and far above the time a statement takes to reach its
+/// LISTs.
+const LIST_FAIL_FAST: Duration = IDLE_FAIL_FAST;
+
 /// Wait until `issued` holds for the logs commit LISTs issued so far, or fail
-/// after a bound that only a never-issued LIST reaches.
+/// after [`LIST_FAIL_FAST`], which only a never-issued LIST reaches.
 async fn wait_for_commit_lists(log: &RequestLog, issued: impl Fn(&[String]) -> bool, why: &str) {
     let reached = async {
         while !issued(&log.logs_commit_lists()) {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     };
-    if tokio::time::timeout(Duration::from_secs(10), reached)
-        .await
-        .is_err()
-    {
-        panic!("{why}: issued {:?}", log.logs_commit_lists());
+    // hygiene-allow: wall-clock -- a fail-fast, not a timing band: the wait
+    // returns as soon as the LISTs are in the request log.
+    if tokio::time::timeout(LIST_FAIL_FAST, reached).await.is_err() {
+        panic!(
+            "{why}: not issued within {LIST_FAIL_FAST:?}; issued {:?}",
+            log.logs_commit_lists()
+        );
     }
 }
 
@@ -608,7 +616,16 @@ async fn sql_idle_audit_event_flushes_without_waiting_max_age() {
         .fault
         .hold(Op::Put, Some(audit_data_marker()), Occurrence::Nth(1));
     let first = spawn_statement(&fx);
-    gate.wait_until_held(1).await;
+    // hygiene-allow: wall-clock -- a fail-fast, as for the idle statement.
+    tokio::time::timeout(IDLE_FAIL_FAST, gate.wait_until_held(1))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the first statement's audit data PUT was not issued within \
+                 {IDLE_FAIL_FAST:?}; its idle event must flush at once, not wait \
+                 max_age ({max_age:?})"
+            )
+        });
     let second = spawn_statement(&fx);
     wait_for_list_count(
         &fx.log,
@@ -619,7 +636,16 @@ async fn sql_idle_audit_event_flushes_without_waiting_max_age() {
     let held = gate.held();
     assert_eq!(held.len(), 1, "only the first audit data PUT is held");
     assert!(gate.release(held[0]));
-    let (status, value) = first.await.expect("first statement task");
+    // hygiene-allow: wall-clock -- a fail-fast, as for the idle statement.
+    let (status, value) = tokio::time::timeout(IDLE_FAIL_FAST, first)
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "the first statement did not return within {IDLE_FAIL_FAST:?} of its \
+                 audit data PUT's release"
+            )
+        })
+        .expect("first statement task");
     assert_counts_every_record(status, &value);
 
     let mut second = second;

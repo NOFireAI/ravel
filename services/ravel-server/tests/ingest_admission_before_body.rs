@@ -754,10 +754,6 @@ async fn pooled_client_sees_every_shed_refusal_as_a_readable_429() {
     running.shutdown().await.expect("graceful shutdown");
 }
 
-/// Within this the server answered on the head, without waiting out the
-/// one-second drain timeout.
-const PROMPT: Duration = Duration::from_millis(500);
-
 /// Issue #2926, case B: only an authenticated caller's body is drained.
 ///
 /// (i) With the ceiling free, a request with no credential is refused 401 at
@@ -765,12 +761,21 @@ const PROMPT: Duration = Duration::from_millis(500);
 /// (ii) With the ceiling held, the same request is shed 429 at once, with
 /// `Connection: close`, and counted under `unauthenticated`. Neither reads a
 /// byte of the 512 KiB the head declares.
+///
+/// For (ii), "at once" is read off the drain counters, not a clock: no body
+/// byte is ever sent, so a drain can only end at its timeout, and that is
+/// counted under `timeout`. The 401 in (i) never takes the head-refusal path
+/// those counters cover; the all-zero counters and the absent `Connection`
+/// header show it did not, and the exchange's 10 s guard bounds how long it
+/// may take.
 #[tokio::test]
 async fn only_an_authenticated_shed_drains_its_body() {
     let declared = format!("content-length: {}", 512 * 1024);
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let running = start_test_server(store, IngestConcurrencyLimit::Unlimited).await;
+    let base = format!("http://{}", running.http_addr);
+    let client = reqwest::Client::new();
     let head = request_head(running.http_addr, "/v1/metrics", None, &declared);
     let refused = exchange(running.http_addr, &head, &[], Duration::from_secs(10)).await;
     assert_eq!(refused.status_line, "HTTP/1.1 401 Unauthorized");
@@ -779,9 +784,13 @@ async fn only_an_authenticated_shed_drains_its_body() {
         None,
         "the 401 is answered exactly as before"
     );
-    // hygiene-allow: wall-clock -- the claim is that the refusal does not
-    // wait out the 1 s drain timeout; the counters are the exact half.
-    assert!(refused.elapsed < PROMPT, "401 after {:?}", refused.elapsed);
+    for reason in ["unauthenticated", "over_cap", "busy", "timeout"] {
+        assert_eq!(
+            undrained(&client, &base, reason).await,
+            0,
+            "the 401 is not a head refusal, so nothing is counted under {reason}"
+        );
+    }
     running.shutdown().await.expect("graceful shutdown");
 
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -793,8 +802,6 @@ async fn only_an_authenticated_shed_drains_its_body() {
     assert_eq!(shed.status_line, "HTTP/1.1 429 Too Many Requests");
     assert_eq!(shed.header("retry-after"), Some("1"));
     assert_eq!(shed.header("connection"), Some("close"));
-    // hygiene-allow: wall-clock -- as above.
-    assert!(shed.elapsed < PROMPT, "429 after {:?}", shed.elapsed);
     assert_eq!(undrained(&client, &base, "unauthenticated").await, 1);
     assert_eq!(undrained(&client, &base, "timeout").await, 0);
     running.shutdown().await.expect("graceful shutdown");
@@ -802,7 +809,8 @@ async fn only_an_authenticated_shed_drains_its_body() {
 
 /// Issue #2926, case C: an authenticated shed whose `Content-Length` is
 /// above the 1 MiB drain cap is answered at once, without reading, with
-/// `Connection: close`, and counted under `over_cap`.
+/// `Connection: close`, and counted under `over_cap`. "At once" is read off
+/// the drain counters, as in case B.
 #[tokio::test]
 async fn an_authenticated_shed_over_the_cap_is_answered_without_a_drain() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
@@ -821,9 +829,6 @@ async fn an_authenticated_shed_over_the_cap_is_answered_without_a_drain() {
     assert_eq!(shed.status_line, "HTTP/1.1 429 Too Many Requests");
     assert_eq!(shed.header("retry-after"), Some("1"));
     assert_eq!(shed.header("connection"), Some("close"));
-    // hygiene-allow: wall-clock -- the claim is that the refusal does not
-    // wait out the 1 s drain timeout; the counters are the exact half.
-    assert!(shed.elapsed < PROMPT, "429 after {:?}", shed.elapsed);
     assert_eq!(undrained(&client, &base, "over_cap").await, 1);
     assert_eq!(undrained(&client, &base, "timeout").await, 0);
     running.shutdown().await.expect("graceful shutdown");

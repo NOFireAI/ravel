@@ -644,6 +644,13 @@ async fn sql_ticket_key_file_rotation_verifies_tickets_minted_under_the_old_key(
 /// slice ticket.
 const NEGATIVE_ATTEMPTS: usize = 5;
 
+/// Whether a [`run_query`] error came from `DoGet`, the only RPC during which
+/// the coordinator dials the worker. A `connect:` or `get_flight_info:` error
+/// failed before any slice ticket was sent.
+fn reached_the_worker(err: &str) -> bool {
+    err.starts_with("do_get")
+}
+
 /// One cross-process query that must fail; returns its error.
 async fn failed_attempt(pair: &Pair) -> String {
     match run_query(pair.coordinator_grpc, pair.start_ns, pair.end_ns).await {
@@ -664,8 +671,8 @@ async fn failed_attempt(pair: &Pair) -> String {
 /// without reaching it, which says nothing about the key. The attempts that
 /// count start once the worker has refused a slice ticket as `bad_mac`, the
 /// signal that the coordinator dialed it; each of the [`NEGATIVE_ATTEMPTS`]
-/// after that must fail, and the worker's `bad_mac` count must rise during
-/// each.
+/// after that must fail. Across them the worker's `bad_mac` count must rise
+/// by at least the number that reached it ([`reached_the_worker`]).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_without_the_minting_key_fails_the_cross_process_query() {
     let pair = start_pair(&[OLD_KEY], &[NEW_KEY]).await;
@@ -688,15 +695,24 @@ async fn a_worker_without_the_minting_key_fails_the_cross_process_query() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    for attempt in 1..=NEGATIVE_ATTEMPTS {
-        let before = rejects.get(SliceReject::BadMac);
-        let err = failed_attempt(&pair).await;
-        assert!(
-            rejects.get(SliceReject::BadMac) > before,
-            "attempt {attempt} of {NEGATIVE_ATTEMPTS} failed without the worker refusing a \
-             slice ticket as bad_mac: {err}"
-        );
+    let before = rejects.get(SliceReject::BadMac);
+    let mut errors = Vec::with_capacity(NEGATIVE_ATTEMPTS);
+    for _ in 0..NEGATIVE_ATTEMPTS {
+        errors.push(failed_attempt(&pair).await);
     }
+    let refused = rejects.get(SliceReject::BadMac) - before;
+    let reached = errors.iter().filter(|err| reached_the_worker(err)).count();
+    assert!(
+        reached > 0,
+        "none of {NEGATIVE_ATTEMPTS} failed attempts reached DoGet, so none tested the key: \
+         {errors:?}"
+    );
+    assert!(
+        refused >= reached as u64,
+        "{reached} of {NEGATIVE_ATTEMPTS} failed attempts reached DoGet, where the coordinator \
+         dials the worker, but the worker refused only {refused} slice tickets as bad_mac: \
+         {errors:?}"
+    );
     assert_eq!(
         pair.worker_store.data_gets.load(Ordering::SeqCst),
         0,
