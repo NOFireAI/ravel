@@ -197,8 +197,9 @@ pub(crate) fn size_trigger_applies(
 /// Whether `plan`, subqueries included, holds an `=` between a field
 /// `key_index` names (a declared column in its `columns`, or `trace_id` when
 /// its `trace_id` is set) and anything that is not a column, in a `Filter`
-/// predicate, a filter pushed into a `TableScan`, or a `Join`'s filter or
-/// equi-join pairs. This is wider than the KEY_IDX probe's own test (any
+/// predicate, a filter pushed into a `TableScan`, or a `Join`'s filter. A
+/// `Join::on` pair has a column on both sides, so it is never a key equality.
+/// This is wider than the KEY_IDX probe's own test (any
 /// position in the predicate, a cast column, a literal of any type), so a
 /// statement the probe could answer is never read as a bulk scan, provided
 /// `plan` is the optimized plan whose `TableScan` filters the probe reads.
@@ -219,12 +220,7 @@ pub(crate) fn plan_has_key_equality(plan: &LogicalPlan, key_index: &KeyIndexDecl
         let predicates: Vec<Expr> = match node {
             LogicalPlan::Filter(filter) => vec![filter.predicate.clone()],
             LogicalPlan::TableScan(scan) => scan.filters.clone(),
-            LogicalPlan::Join(join) => join
-                .on
-                .iter()
-                .map(|(left, right)| left.clone().eq(right.clone()))
-                .chain(join.filter.clone())
-                .collect(),
+            LogicalPlan::Join(join) => join.filter.iter().cloned().collect(),
             _ => Vec::new(),
         };
         for predicate in &predicates {
