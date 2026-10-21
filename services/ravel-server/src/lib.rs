@@ -4290,10 +4290,27 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     Some(advertise) => advertise.fragment_endpoint(fragment_bound),
                     None => fragment_bound.to_string(),
                 };
-                let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
+                // The record keys sign this process's heartbeat record and
+                // verify every sibling's (ADR-1918), derived from the same
+                // `--fragment-key-file` keys the fragment surface uses.
+                let fragment_keys = config
+                    .distrib
+                    .as_ref()
+                    .map(|s| s.fragment_keys.as_slice())
+                    .unwrap_or_default();
+                let record_keys =
+                    ravel_fleet::query_workers::RecordKeys::from_file_keys(fragment_keys)
+                        .map_err(|e| anyhow::anyhow!("query-worker heartbeat: {e}"))?;
+                let mut workers = ravel_fleet::query_workers::QueryWorkers::with_defaults(
                     fragment_endpoint,
                     ravel_query::distrib::codec::PROTOCOL_VERSION,
-                ));
+                    record_keys,
+                );
+                if let Some(metrics) = distrib_metrics.as_ref() {
+                    workers =
+                        workers.with_record_rejects(metrics.query_worker_record_rejects().clone());
+                }
+                let workers = Arc::new(workers);
                 // Ignore a set() race: `start` sets this exactly once, so the
                 // first (only) write wins and any later call is a no-op.
                 let _ = distrib_self_id.set(workers.process_id());

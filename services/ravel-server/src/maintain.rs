@@ -13179,7 +13179,7 @@ mod query_worker_reap_tests {
 
     use bytes::Bytes;
     use parking_lot::Mutex;
-    use ravel_fleet::query_workers::{QueryWorkers, query_worker_key};
+    use ravel_fleet::query_workers::{QueryWorkers, RecordKeys, query_worker_key};
     use ravel_maintain::owner;
     use ravel_object_store::instrument::InstrumentedStore;
     use ravel_object_store::list_all;
@@ -13195,7 +13195,8 @@ mod query_worker_reap_tests {
     /// Write one query worker's record so the store reports `mtime_ms` as its
     /// modification time, then put the store clock back at `restore_ms`.
     async fn seed(memory: &MemoryStore, mtime_ms: u64, restore_ms: u64, stamp_ns: i64) -> String {
-        let worker = QueryWorkers::with_defaults("10.0.0.1:9443", 1);
+        let keys = RecordKeys::from_file_keys(&[[0x5a; 32]]).expect("record keys");
+        let worker = QueryWorkers::with_defaults("10.0.0.1:9443", 1, keys);
         memory.set_clock_ms(mtime_ms);
         worker
             .write_heartbeat(memory, stamp_ns)

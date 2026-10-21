@@ -395,6 +395,11 @@ pub enum Label {
     /// [`crate::distrib`], which also owns the label spelling. Shares the
     /// `reason` key with the other reason variants.
     CapabilityRejectReason(crate::distrib::CapabilityReject),
+    /// Why the query-worker heartbeat refused a sibling's record (ADR-1918
+    /// decision 4): `missing_mac`, `bad_mac`, or `oversize`. A closed enum
+    /// owned by [`ravel_fleet::query_workers`], which also owns the label
+    /// spelling. Shares the `reason` key with the other reason variants.
+    QueryWorkerRecordRejectReason(ravel_fleet::query_workers::RecordReject),
     /// Why a SQL slice capability was refused (ADR-1689 decision 2):
     /// `missing`, `bad_mac`, `expired`, or `wrong_surface`. A closed enum
     /// owned by `ravel_sql`, which also owns the label spelling. Shares the
@@ -640,6 +645,7 @@ impl Label {
             Label::MemoryComponent(_) => "component",
             Label::AdmissionClass(_) => "class",
             Label::CapabilityRejectReason(_) => "reason",
+            Label::QueryWorkerRecordRejectReason(_) => "reason",
             #[cfg(feature = "flight-sql")]
             Label::SliceRejectReason(_) => "reason",
             Label::StatCarrier(_) => "carrier",
@@ -692,6 +698,7 @@ impl Label {
             Label::MemoryComponent(component) => component.name().to_string(),
             Label::AdmissionClass(class) => admission_class_name(*class).to_string(),
             Label::CapabilityRejectReason(reason) => reason.reason().to_string(),
+            Label::QueryWorkerRecordRejectReason(reason) => reason.reason().to_string(),
             #[cfg(feature = "flight-sql")]
             Label::SliceRejectReason(reason) => reason.reason().to_string(),
             Label::StatCarrier(carrier) => carrier.label().to_string(),
@@ -7749,6 +7756,10 @@ pub struct DistribSnapshot {
     /// Refused `Pinned` fragment capabilities per reason, every reason
     /// present (ADR-0071 amendment, decision 2).
     pub fragment_capability_rejects_by_reason: [(crate::distrib::CapabilityReject, u64); 5],
+    /// Sibling query-worker records the heartbeat's live-set read refused per
+    /// reason, every reason present (ADR-1918 decision 4).
+    pub query_worker_record_rejects_by_reason:
+        [(ravel_fleet::query_workers::RecordReject, u64); 3],
     /// In-flight fragment requests per fragment admission class
     /// (`Pinned`, `Resolve`; issue #1722).
     pub fragment_inflight_by_class: [(crate::distrib::AdmissionClass, u64); 2],
@@ -7789,6 +7800,9 @@ impl DistribSnapshot {
             fragment_requests_total: metrics.fragment_requests_total(),
             fragment_auth_failures_total: metrics.fragment_auth_failures_total(),
             fragment_capability_rejects_by_reason: metrics.capability_rejects_by_reason(),
+            query_worker_record_rejects_by_reason: metrics
+                .query_worker_record_rejects()
+                .by_reason(),
             fragment_inflight_by_class: metrics.fragment_inflight_by_class(),
             fragment_admission_waits_by_class: metrics.fragment_admission_waits_by_class(),
             fragment_deadline_stops_by_class: metrics.fragment_deadline_stops_by_class(),
@@ -7853,6 +7867,24 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
             out,
             "ravel_distrib_fragment_capability_rejects_total",
             &[Label::Mode(mode), Label::CapabilityRejectReason(reason)],
+            count,
+        );
+    }
+
+    write_header(
+        out,
+        "ravel_query_worker_record_rejects_total",
+        "Sibling sys/query/workers/ records the query-worker heartbeat refused before \
+         admitting them to the live set, by reason (ADR-1918 decision 4): missing_mac and \
+         bad_mac records carried no MAC or one that did not verify under any key derived \
+         from --fragment-key-file, oversize records were larger than 4096 bytes.",
+        "counter",
+    );
+    for (reason, count) in snapshot.query_worker_record_rejects_by_reason {
+        write_sample(
+            out,
+            "ravel_query_worker_record_rejects_total",
+            &[Label::Mode(mode), Label::QueryWorkerRecordRejectReason(reason)],
             count,
         );
     }
@@ -9361,6 +9393,9 @@ mod tests {
             Label::MemoryComponent(MemoryComponent::Sql),
             Label::AdmissionClass(crate::distrib::AdmissionClass::Pinned),
             Label::CapabilityRejectReason(crate::distrib::CapabilityReject::Missing),
+            Label::QueryWorkerRecordRejectReason(
+                ravel_fleet::query_workers::RecordReject::MissingMac,
+            ),
             Label::StatCarrier(ravel_commit::declared_stats::StatCarrier::CommitRecord),
             Label::CpuGate(ravel_cpu_gate::GateKind::Read),
             Label::ReadGateSite(ravel_cpu_gate::ReadSite::CatalogPart),
@@ -9414,6 +9449,7 @@ mod tests {
                 Label::MemoryComponent(_) => "component",
                 Label::AdmissionClass(_) => "class",
                 Label::CapabilityRejectReason(_) => "reason",
+                Label::QueryWorkerRecordRejectReason(_) => "reason",
                 // Asserted by `sql_slice_reject_family_renders_each_reason_exactly`,
                 // since `one_of_each` is the default build's set.
                 #[cfg(feature = "flight-sql")]
@@ -9487,6 +9523,9 @@ mod tests {
                 "component",
                 "class",
                 // CapabilityRejectReason (issue #2314) reuses the `reason` key.
+                "reason",
+                // QueryWorkerRecordRejectReason (ADR-1918) reuses the `reason`
+                // key.
                 "reason",
                 "carrier",
                 "gate",
@@ -13087,6 +13126,9 @@ mod tests {
             fragment_auth_failures_total: 2,
             fragment_capability_rejects_by_reason: crate::distrib::FragmentMetrics::new()
                 .capability_rejects_by_reason(),
+            query_worker_record_rejects_by_reason: crate::distrib::FragmentMetrics::new()
+                .query_worker_record_rejects()
+                .by_reason(),
             fragment_inflight_by_class: [
                 (crate::distrib::AdmissionClass::Pinned, 1),
                 (crate::distrib::AdmissionClass::Resolve, 4),
@@ -13190,8 +13232,11 @@ mod tests {
         // fragment in-flight gauge and admission-wait counter, ADR-0071 issue
         // #1722, and `reason` on the capability reject counter alone, issue
         // #2314); no other label leaks in.
+        // The query-worker record reject counter (ADR-1918) renders beside them
+        // under the same rule, with `reason` its only extra label.
         for line in body.lines() {
-            if !line.starts_with("ravel_distrib_") {
+            let record_reject = line.starts_with("ravel_query_worker_record_rejects_total{");
+            if !line.starts_with("ravel_distrib_") && !record_reject {
                 continue;
             }
             let labels = line
@@ -13199,8 +13244,8 @@ mod tests {
                 .and_then(|(_, rest)| rest.split_once('}'))
                 .map(|(labels, _)| labels)
                 .unwrap_or("");
-            let capability_reject =
-                line.starts_with("ravel_distrib_fragment_capability_rejects_total{");
+            let capability_reject = record_reject
+                || line.starts_with("ravel_distrib_fragment_capability_rejects_total{");
             for pair in labels.split(',').filter(|p| !p.is_empty()) {
                 let key = pair.split('=').next().unwrap_or(pair);
                 assert!(
@@ -13251,6 +13296,14 @@ mod tests {
         assert!(
             !off.contains("ravel_distrib_"),
             "the distrib family must be absent without --distributed-query:\n{off}"
+        );
+        assert!(
+            body.contains("ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"missing_mac\"} 0"),
+            "the record reject family renders with the distrib family:\n{body}"
+        );
+        assert!(
+            !off.contains("ravel_query_worker_record_rejects_total"),
+            "the record reject family must be absent without --distributed-query:\n{off}"
         );
     }
 
@@ -13322,6 +13375,94 @@ mod tests {
         assert!(
             !off.contains(family),
             "a process not serving the fragment lane must render no capability reject family:\n{off}"
+        );
+    }
+
+    /// ADR-1918 decision 4: refusals the heartbeat's live-set read records
+    /// through the `FragmentMetrics` handle render as one sample per
+    /// `RecordReject` reason under exactly `{mode, reason}`, each carrying its
+    /// own reason's count, and nothing for a process with no fragment lane.
+    #[tokio::test]
+    async fn query_worker_record_reject_family_renders_each_reason_exactly() {
+        use ravel_fleet::query_workers::{QueryWorkers, RecordKeys, query_worker_key};
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{ObjectStoreBackend, PutMode, PutOptions};
+
+        let metrics = crate::distrib::FragmentMetrics::new();
+        let keys = RecordKeys::from_file_keys(&[[0x5a; 32]]).expect("record keys");
+        let reader = QueryWorkers::with_defaults("127.0.0.1:1", 5, keys)
+            .with_record_rejects(metrics.query_worker_record_rejects().clone());
+        let store = MemoryStore::new();
+        let now = 1_000 * 60 * 1_000_000_000_i64;
+        let record = |pid: &str, mac: Option<&str>| {
+            let mut value = serde_json::json!({
+                "process_id": pid,
+                "fragment_endpoint": "10.6.6.6:9443",
+                "protocol_version": 5,
+                "started_unix_ns": now,
+            });
+            if let Some(mac) = mac {
+                value["mac"] = serde_json::Value::String(mac.to_string());
+            }
+            serde_json::to_vec(&value).expect("encode")
+        };
+        let unsigned = uuid::Uuid::new_v4().to_string();
+        let mut objects = vec![(query_worker_key(&unsigned), record(&unsigned, None))];
+        for _ in 0..2 {
+            let pid = uuid::Uuid::new_v4().to_string();
+            let mac = "0".repeat(64);
+            objects.push((query_worker_key(&pid), record(&pid, Some(&mac))));
+        }
+        for _ in 0..3 {
+            let pid = uuid::Uuid::new_v4().to_string();
+            objects.push((query_worker_key(&pid), vec![b' '; 5000]));
+        }
+        for (key, bytes) in objects {
+            store
+                .put(
+                    &key,
+                    bytes.into(),
+                    PutOptions {
+                        mode: PutMode::Overwrite,
+                        checksum: None,
+                    },
+                )
+                .await
+                .expect("put forged record");
+        }
+        let live = reader.live_set(&store, now).await.expect("live set");
+        assert_eq!(live.len(), 1, "only the reader itself is live");
+
+        let family = "ravel_query_worker_record_rejects_total";
+        let samples_of = |body: &str| -> Vec<String> {
+            body.lines()
+                .filter(|l| l.starts_with(&format!("{family}{{")))
+                .map(str::to_string)
+                .collect()
+        };
+        let body = render_distrib_and_metadata(
+            Mode::Query,
+            Some(&DistribSnapshot::from_metrics(&metrics)),
+            None,
+        );
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter\n")).count(),
+            1,
+            "exactly one counter TYPE header:\n{body}"
+        );
+        assert_eq!(
+            samples_of(&body),
+            vec![
+                "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"missing_mac\"} 1",
+                "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"bad_mac\"} 2",
+                "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"oversize\"} 3",
+            ],
+        );
+
+        let off = render_distrib_and_metadata(Mode::Query, None, None);
+        assert!(
+            !off.contains(family),
+            "a process not serving the fragment lane must render no record reject family:\n{off}"
         );
     }
 
@@ -16438,6 +16579,9 @@ ravel_cache_disk_entries_expired_max_age_total{mode=\"gateway\",cache=\"catalog\
             fragment_auth_failures_total: 0,
             fragment_capability_rejects_by_reason: crate::distrib::FragmentMetrics::new()
                 .capability_rejects_by_reason(),
+            query_worker_record_rejects_by_reason: crate::distrib::FragmentMetrics::new()
+                .query_worker_record_rejects()
+                .by_reason(),
             fragment_inflight_by_class: [
                 (crate::distrib::AdmissionClass::Pinned, 0),
                 (crate::distrib::AdmissionClass::Resolve, 0),

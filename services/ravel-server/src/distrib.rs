@@ -63,7 +63,7 @@ use async_trait::async_trait;
 use futures::{Stream, StreamExt};
 use parking_lot::{Mutex, RwLock};
 use ravel_catalog::Catalog;
-use ravel_fleet::query_workers::{QueryWorkerRecord, QueryWorkers};
+use ravel_fleet::query_workers::{QueryWorkerRecord, QueryWorkers, RecordRejects};
 use ravel_fleet::worker_set;
 use ravel_ingest::Clock;
 use ravel_object_store::ObjectStoreBackend;
@@ -286,6 +286,11 @@ pub struct FragmentMetrics {
     /// Endpoints currently held in the coordinator's quarantine map (gauge).
     /// Kept in step with the map's length after every mark, readmit, and prune.
     quarantine_current: AtomicU64,
+    /// Sibling `sys/query/workers/` records the heartbeat loop's live-set read
+    /// refused (ADR-1918 decision 4), shared with the process's
+    /// [`QueryWorkers`] through [`QueryWorkers::with_record_rejects`].
+    /// Rendered as `ravel_query_worker_record_rejects_total{reason}`.
+    query_worker_record_rejects: Arc<RecordRejects>,
 }
 
 impl Default for FragmentMetrics {
@@ -308,6 +313,7 @@ impl Default for FragmentMetrics {
             quarantine_marks_total: AtomicU64::new(0),
             quarantine_readmits_total: AtomicU64::new(0),
             quarantine_current: AtomicU64::new(0),
+            query_worker_record_rejects: Arc::new(RecordRejects::new()),
         }
     }
 }
@@ -434,6 +440,12 @@ impl FragmentMetrics {
     /// reason under the `reason` label.
     pub fn capability_rejects_by_reason(&self) -> [(CapabilityReject, u64); 5] {
         CapabilityReject::ALL.map(|reason| (reason, self.capability_rejects(reason)))
+    }
+
+    /// The counter handle the heartbeat's [`QueryWorkers`] records refused
+    /// sibling records into (ADR-1918 decision 4).
+    pub fn query_worker_record_rejects(&self) -> &Arc<RecordRejects> {
+        &self.query_worker_record_rejects
     }
 
     pub fn fragment_inflight(&self, class: AdmissionClass) -> u64 {
@@ -2606,6 +2618,12 @@ mod tests {
         Arc::new(vec![TEST_KEY])
     }
 
+    /// Query-worker record keys derived from [`TEST_KEY`], so every
+    /// `QueryWorkers` in a test admits the others' records.
+    fn record_keys() -> ravel_fleet::query_workers::RecordKeys {
+        ravel_fleet::query_workers::RecordKeys::from_file_keys(&[TEST_KEY]).expect("record keys")
+    }
+
     /// Mint a capability for the request's own `(tenant, signal, query_id)` with
     /// `expires` under `key`, exactly as a coordinator does. Used to hand a
     /// worker-side `fetch` a valid or a deliberately-mismatched capability.
@@ -3794,7 +3812,7 @@ mod tests {
     #[tokio::test]
     async fn worker_registration_appears_then_ages_out() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION);
+        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION, record_keys());
         let interval_ns =
             i64::try_from(workers.heartbeat_interval().as_nanos()).expect("interval fits i64");
 
@@ -3815,7 +3833,7 @@ mod tests {
         // Far past the staleness window (3x the interval by default): the record
         // is no longer live. `self` is always included by `live_set`, so read
         // from a different identity to observe the aged-out record's absence.
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
+        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, record_keys());
         let stale_now = 1_000 + interval_ns * 10;
         let live = observer
             .live_set(store.as_ref(), stale_now)
@@ -3857,6 +3875,7 @@ mod tests {
             let dead = QueryWorkers::with_defaults(
                 format!("127.0.0.1:{}", 7200 + port),
                 codec::PROTOCOL_VERSION,
+                record_keys(),
             );
             dead.write_heartbeat(&memory, now_ns - 10 * H_NS)
                 .await
@@ -3878,6 +3897,7 @@ mod tests {
         let workers = Arc::new(QueryWorkers::with_defaults(
             "127.0.0.1:7000",
             codec::PROTOCOL_VERSION,
+            record_keys(),
         ));
         let interval = workers.heartbeat_interval();
         let live_workers = Arc::new(RwLock::new(Arc::new(Vec::new())));
@@ -3894,7 +3914,7 @@ mod tests {
             tokio::time::sleep(interval).await;
         }
 
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
+        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, record_keys());
         let self_id = workers.process_id().to_string();
         let live = observer
             .live_set(store.as_ref(), now_ns)
@@ -4052,6 +4072,7 @@ mod tests {
             codec::PROTOCOL_VERSION,
             Duration::ZERO,
             3,
+            record_keys(),
         ));
         let (_stop, stop_rx) = tokio::sync::oneshot::channel();
         let refused = spawn_heartbeat(
