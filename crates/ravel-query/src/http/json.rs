@@ -298,7 +298,10 @@ pub struct PhaseCostJson {
     /// block decode lands on the `scan` phase. On `keyIndex` it is the KEY_IDX
     /// probe's decoded bytes: each probed object's prefix (stored as is) plus
     /// each decoded bucket frame's declared length (`entry_count x 12`), from
-    /// a GET, the cache or a resident probe alike. Pooled counterpart:
+    /// a GET, the cache or a resident probe alike. Unlike a raw section on the
+    /// other phases, which counts zero, the raw prefix is included here, so
+    /// the figure is the index bytes the probe consulted, the quantity
+    /// ADR-2707's keyIndex bands are stated in. Pooled counterpart:
     /// `accounting.decompressedBytes`.
     #[serde(rename = "decompressedOutputBytes")]
     pub decompressed_output_bytes: u64,
