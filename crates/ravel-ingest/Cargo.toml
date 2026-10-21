@@ -20,8 +20,8 @@ rust-version.workspace = true
 # Also turns on `flush-input-bytes` below, so the lane that builds and tests
 # this feature runs `tests/flush_input_bytes.rs` too (issue #3124). A
 # stage-timing build therefore carries the per-flush recorder lookup that a
-# shipping build does not, so its encode-stage figures include one
-# uncontended lock read per flush.
+# shipping build does not. The lookup runs on the flush path just before the
+# encode stage's timer starts, so the encode figure does not include it.
 stage-timing = ["ravel-logseg/stage-timing", "flush-input-bytes"]
 # Flush input recorder (issue #3124). Off by default, and no shipping build
 # enables it: `stage-timing` above turns it on, and ravel-bench's
