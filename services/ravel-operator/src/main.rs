@@ -2,8 +2,12 @@
 //!
 //! With `--print-crd` it prints the generated `RavelCluster`
 //! CustomResourceDefinition to stdout and exits, which is how
-//! `deploy/k8s/operator/crd.yaml` is regenerated. Otherwise it runs the
-//! reconcile controller against the ambient Kubernetes environment.
+//! `deploy/k8s/operator/crd.yaml` is regenerated. The
+//! `pod-identity-credentials` subcommand runs the EKS Pod Identity
+//! credentials sidecar the operator renders under
+//! `storage.s3.auth: podIdentity` (see [`ravel_operator::pod_identity`]).
+//! Otherwise it runs the reconcile controller against the ambient Kubernetes
+//! environment.
 
 use std::net::SocketAddr;
 use std::process::ExitCode;
@@ -11,6 +15,7 @@ use std::process::ExitCode;
 use clap::Parser;
 use ravel_operator::controller;
 use ravel_operator::health::DEFAULT_HEALTH_ADDR;
+use ravel_operator::pod_identity::{self, PodIdentityArgs};
 use ravel_operator::ravel_cluster_crd;
 use ravel_tracing_export::OtlpExportConfig;
 use tracing_subscriber::EnvFilter;
@@ -46,6 +51,33 @@ struct Cli {
     /// `deploy/k8s/operator/operator.yaml`.
     #[arg(long = "listen-health", value_name = "ADDR", default_value = DEFAULT_HEALTH_ADDR)]
     listen_health: SocketAddr,
+
+    /// The image of the `pod-identity-credentials` sidecar rendered into
+    /// every pod of a `storage.s3.auth: podIdentity` cluster. It must name
+    /// this operator's own image (the sidecar is a subcommand of this
+    /// binary); a pod cannot read its own image, so the manifest passes it.
+    /// Unset, a `podIdentity` cluster is `Degraded` with reason
+    /// `CredentialsSidecarImageUnset`; `static` clusters do not need it.
+    #[arg(
+        long = "credentials-sidecar-image",
+        env = "RAVEL_CREDENTIALS_SIDECAR_IMAGE",
+        value_name = "IMAGE"
+    )]
+    credentials_sidecar_image: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Subcommands. With none, the binary runs the controller.
+#[derive(Debug, clap::Subcommand)]
+enum Command {
+    /// Fetch this pod's EKS Pod Identity credentials from the node-local
+    /// agent and keep ADR-0072's credentials file fresh (`--output`), or
+    /// check that the file exists and parses (`--probe`). Rendered by the
+    /// operator as a native sidecar; Pod Identity only, IRSA is not
+    /// supported.
+    PodIdentityCredentials(PodIdentityArgs),
 }
 
 impl Cli {
@@ -83,6 +115,24 @@ async fn main() -> ExitCode {
 
     let cli = Cli::parse();
 
+    if let Some(Command::PodIdentityCredentials(args)) = cli.command {
+        // The probe runs on every startup-probe period, so it stays silent
+        // and answers with its exit code alone; the sidecar logs through
+        // the same `RUST_LOG`-filtered subscriber as the controller.
+        let _trace_guard = args.probe.is_none().then(|| {
+            let filter =
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+            ravel_tracing_export::init(filter, None)
+        });
+        return match pod_identity::run(args).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("pod-identity-credentials: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     if cli.print_crd {
         return match serde_json::to_string_pretty(&ravel_cluster_crd()) {
             Ok(text) => {
@@ -109,7 +159,7 @@ async fn main() -> ExitCode {
     // than propagating `?`, so there is no early return to route around; a
     // shared flush point after the match runs on both the success and error
     // exits without duplicating it in each arm.
-    let exit_code = match controller::run(cli.listen_health).await {
+    let exit_code = match controller::run(cli.listen_health, cli.credentials_sidecar_image).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("operator exited with error: {error}");
@@ -159,5 +209,77 @@ mod tests {
     fn no_otlp_endpoint_flag_derives_none() {
         let cli = Cli::parse_from(["ravel-operator"]);
         assert!(cli.otlp_export_config().is_none());
+    }
+
+    /// A bare invocation still runs the controller: no subcommand, and the
+    /// sidecar image only when the flag or its env sets it.
+    #[test]
+    fn bare_invocation_runs_the_controller() {
+        let cli = Cli::try_parse_from(["ravel-operator"]).expect("bare invocation parses");
+        assert!(cli.command.is_none());
+        let cli = Cli::try_parse_from([
+            "ravel-operator",
+            "--credentials-sidecar-image",
+            "ghcr.io/nofireai/ravel-operator:0.25.0",
+        ])
+        .expect("the sidecar image flag parses");
+        assert!(cli.command.is_none());
+        assert_eq!(
+            cli.credentials_sidecar_image.as_deref(),
+            Some("ghcr.io/nofireai/ravel-operator:0.25.0")
+        );
+    }
+
+    /// The two shapes the operator renders: the sidecar's args and its
+    /// startup probe's.
+    #[test]
+    fn the_rendered_sidecar_and_probe_argv_parse() {
+        let cli = Cli::try_parse_from([
+            "ravel-operator",
+            "pod-identity-credentials",
+            "--output",
+            "/var/run/ravel/aws/credentials.json",
+        ])
+        .expect("the sidecar argv parses");
+        let Some(Command::PodIdentityCredentials(args)) = cli.command else {
+            panic!("expected the pod-identity-credentials subcommand");
+        };
+        assert_eq!(
+            args.output.as_deref(),
+            Some(std::path::Path::new("/var/run/ravel/aws/credentials.json"))
+        );
+        assert_eq!(args.refresh_margin, pod_identity::DEFAULT_REFRESH_MARGIN);
+
+        let cli = Cli::try_parse_from([
+            "ravel-operator",
+            "pod-identity-credentials",
+            "--probe",
+            "/var/run/ravel/aws/credentials.json",
+        ])
+        .expect("the probe argv parses");
+        assert!(matches!(
+            cli.command,
+            Some(Command::PodIdentityCredentials(PodIdentityArgs {
+                probe: Some(_),
+                ..
+            }))
+        ));
+    }
+
+    /// `--output` and `--probe` are one required choice.
+    #[test]
+    fn output_and_probe_are_exclusive_and_one_is_required() {
+        assert!(Cli::try_parse_from(["ravel-operator", "pod-identity-credentials"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ravel-operator",
+                "pod-identity-credentials",
+                "--output",
+                "/a",
+                "--probe",
+                "/a",
+            ])
+            .is_err()
+        );
     }
 }

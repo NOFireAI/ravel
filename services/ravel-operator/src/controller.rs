@@ -42,6 +42,7 @@ use crate::crd::{
     AffinityBackend, Condition, LocalSecretRef, MIN_RESHARD_LEAD_HOURS, RavelCluster,
     RavelClusterSpec, RavelClusterStatus, ShardOverridesSpec,
 };
+use crate::pod_identity::{AgentEndpoint, OperatorCredentialCache};
 use crate::reconcile::{
     AUDIT_TOKEN_KEY_MISSING_MESSAGE, AUDIT_TOKEN_KEY_MISSING_REASON, AUDIT_TOKEN_KEY_SECRET_KEY,
     DEPLOYMENT_KEY_SECRET_KEY, DeploymentTier, DesiredObjects, GC_BOOTSTRAP_STALL_AFTER,
@@ -58,6 +59,10 @@ use crate::reconcile::{
     possible_pod_disruption_budget_names, possible_router_object_names, qualification_decision,
     qualify_job_input_hash, qualify_job_phase, query_fragment_policy_hold_while_disabling,
     query_network_policy_during_rollout, s3_allow_http,
+};
+use crate::reconcile::{
+    desired_tier_service_accounts, pod_identity, possible_tier_service_account_names,
+    validate_storage_auth,
 };
 
 /// Server-side-apply field manager name.
@@ -160,6 +165,14 @@ pub enum Error {
     #[error("object store error: {0}")]
     Store(#[from] ravel_object_store::StoreError),
 
+    /// Under `storage.s3.auth: podIdentity` the operator could not get its
+    /// own Pod Identity credentials for `sys/auth` or the reshard: the
+    /// webhook variables are absent from its pod (its ServiceAccount has no
+    /// association), or the agent did not answer. Surfaced as `Degraded`
+    /// with reason `PodIdentityCredentialsUnavailable`.
+    #[error("the operator's own Pod Identity credentials are unavailable: {0}")]
+    PodIdentityCredentialsUnavailable(#[from] crate::pod_identity::PodIdentityError),
+
     /// The spec cannot be rendered into a valid object set (ADR-0080 decision
     /// 3): e.g. `backend: ravelNative` with no `routerImage`. Surfaced as a
     /// `Degraded` status condition before the error propagates, so a
@@ -196,6 +209,12 @@ pub struct Context {
     /// Reconcile counters `/metrics` renders (ADR-1731 decision 3), shared
     /// with the health listener through the same `Arc`.
     pub metrics: Arc<ReconcileMetrics>,
+    /// `--credentials-sidecar-image`: the image of the Pod Identity
+    /// credentials sidecar rendered under `storage.s3.auth: podIdentity`.
+    pub credentials_sidecar_image: Option<String>,
+    /// The operator pod's own Pod Identity credentials, fetched on first use
+    /// by a `podIdentity` cluster and cached until their refresh point.
+    pub pod_identity_credentials: OperatorCredentialCache,
 }
 
 impl Context {
@@ -393,9 +412,20 @@ async fn resolve_credential_resource_versions(
     spec: &crate::crd::RavelClusterSpec,
 ) -> Result<std::collections::BTreeMap<String, String>, Error> {
     let mut versions = std::collections::BTreeMap::new();
+    // Under podIdentity no pod reads a credential Secret, so none is read
+    // here either: a leftover `credentialsSecretRef` naming a deleted Secret
+    // must not hold the cluster.
+    if pod_identity(spec) {
+        return Ok(versions);
+    }
     let refs = [
         (
-            spec.storage.s3.credentials_secret_ref.name.as_str(),
+            spec.storage
+                .s3
+                .credentials_secret_ref
+                .as_ref()
+                .map(|r| r.name.as_str())
+                .unwrap_or(""),
             "storage.s3.credentialsSecretRef",
         ),
         (
@@ -446,8 +476,11 @@ fn shared_credentials_rv<'a>(
     spec: &RavelClusterSpec,
     versions: &'a std::collections::BTreeMap<String, String>,
 ) -> Option<&'a str> {
-    versions
-        .get(&spec.storage.s3.credentials_secret_ref.name)
+    spec.storage
+        .s3
+        .credentials_secret_ref
+        .as_ref()
+        .and_then(|secret| versions.get(&secret.name))
         .map(String::as_str)
 }
 
@@ -746,14 +779,36 @@ async fn resolve_s3_credentials(
 /// configured here). A plaintext non-loopback endpoint that
 /// `spec.storage.s3.allowHttp` does not accept is refused rather than
 /// connected to, the same way the rendered server containers refuse it.
+///
+/// Under `storage.s3.auth: podIdentity` no Secret is read: the operator
+/// fetches its own pod's Pod Identity credentials with the sidecar's fetch
+/// code, cached in `credentials` until their refresh point, and builds the
+/// store from them in memory (`auth: Static` with the session token, no
+/// file). Without the webhook variables in the operator's environment this
+/// fails with [`Error::PodIdentityCredentialsUnavailable`] naming them.
 async fn build_auth_store(
     client: &Client,
     namespace: &str,
     spec: &RavelClusterSpec,
+    credentials: &OperatorCredentialCache,
 ) -> Result<S3Store, Error> {
-    let (access_key_id, secret_access_key) =
-        resolve_s3_credentials(client, namespace, &spec.storage.s3.credentials_secret_ref).await?;
-    let config = auth_store_config(spec, access_key_id, secret_access_key)?;
+    let config = if pod_identity(spec) {
+        let endpoint = AgentEndpoint::from_env()?;
+        let role = credentials.get(&endpoint, SystemTime::now()).await?;
+        let mut config = auth_store_config(spec, role.access_key_id, role.secret_access_key)?;
+        config.session_token = Some(role.session_token);
+        config
+    } else {
+        let secret_ref = spec
+            .storage
+            .s3
+            .credentials_secret_ref
+            .as_ref()
+            .ok_or(RenderError::StaticCredentialsSecretRefMissing)?;
+        let (access_key_id, secret_access_key) =
+            resolve_s3_credentials(client, namespace, secret_ref).await?;
+        auth_store_config(spec, access_key_id, secret_access_key)?
+    };
     S3Store::with_http_config(config, auth_store_http_config(spec)).map_err(Error::Store)
 }
 
@@ -1481,7 +1536,7 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
     let mut store_qualified_condition: Option<Condition> = None;
     match reconcile_inner(
         &obj,
-        client,
+        &ctx,
         &namespace,
         &instance,
         extra_conditions.clone(),
@@ -1571,7 +1626,7 @@ async fn reconcile_timed(obj: Arc<RavelCluster>, ctx: Arc<Context>) -> Result<Ac
 /// which records a `Degraded` status first.
 async fn reconcile_inner(
     obj: &RavelCluster,
-    client: &Client,
+    ctx: &Context,
     namespace: &str,
     instance: &str,
     mut extra_conditions: Vec<Condition>,
@@ -1585,7 +1640,12 @@ async fn reconcile_inner(
     // applies this same rule cannot pass, so running it just delays the real
     // cause behind a `StoreQualified=False` with a pod-log message. Failing
     // here puts the field name in the `Degraded` condition on the first pass.
+    let client = &ctx.client;
     s3_allow_http(&obj.spec)?;
+    // The same for a storage-auth configuration that cannot render, above
+    // all `podIdentity` without `--credentials-sidecar-image`: the qualify
+    // Job needs the sidecar as much as the tiers do.
+    validate_storage_auth(&obj.spec, ctx.credentials_sidecar_image.as_deref())?;
     // Read the resourceVersion of every credential Secret the spec references
     // BEFORE the qualification gate (finding 3): the shared storage.s3 credential
     // plus any per-tier override (ADR-0055 section 5). Resolving credentials
@@ -1601,6 +1661,21 @@ async fn reconcile_inner(
     // Deployment(s) that consume it.
     let credential_resource_versions =
         resolve_credential_resource_versions(client, namespace, &obj.spec).await?;
+    // Under podIdentity, apply the operator-owned ServiceAccounts BEFORE the
+    // qualification gate: the gate creates the qualify Job and returns, and
+    // a Job pod naming a ServiceAccount that does not exist is refused at
+    // admission on every creation attempt, so applying them later (with the
+    // router's) would deadlock a first deploy behind its own qualification.
+    // Empty under static; the sweep after a switch back to static runs with
+    // the router's below, past the gate.
+    let tier_service_accounts: Api<ServiceAccount> = Api::namespaced(client.clone(), namespace);
+    let tier_owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
+    for mut sa in desired_tier_service_accounts(&obj.spec, instance) {
+        let name = sa.name_any();
+        sa.metadata.namespace = Some(namespace.to_string());
+        sa.metadata.owner_references = tier_owner.clone();
+        apply(&tier_service_accounts, &name, &sa).await?;
+    }
     // The shared credentials Secret's resourceVersion feeds the qualified-input
     // hash (finding 6): the qualify Job authenticates with this same shared
     // Secret, so a fixed-name rotation of it is a different qualified input and
@@ -1716,7 +1791,12 @@ async fn reconcile_inner(
                     match plan.action {
                         QualifyJobAction::Create => {
                             let owner = obj.controller_owner_ref(&()).map(|owner| vec![owner]);
-                            let mut job = desired_qualify_job(&obj.spec, instance, shared_rv);
+                            let mut job = desired_qualify_job(
+                                &obj.spec,
+                                instance,
+                                shared_rv,
+                                ctx.credentials_sidecar_image.as_deref(),
+                            );
                             job.metadata.namespace = Some(namespace.to_string());
                             job.metadata.owner_references = owner;
                             apply(&jobs, &qualify_name, &job).await.map(|_| ())
@@ -1793,7 +1873,8 @@ async fn reconcile_inner(
     )
     .await?;
     if let Some(deployment_key) = deployment_key_secret.key {
-        let store = build_auth_store(client, namespace, &obj.spec).await?;
+        let store =
+            build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials).await?;
         reconcile_sys_auth_best_effort(
             &deployment_key,
             &token_secret.token_values,
@@ -1810,7 +1891,8 @@ async fn reconcile_inner(
     if let Some(shard_overrides) = obj.spec.shard_overrides.as_ref()
         && !shard_overrides.tenants.is_empty()
     {
-        let store = build_auth_store(client, namespace, &obj.spec).await?;
+        let store =
+            build_auth_store(client, namespace, &obj.spec, &ctx.pod_identity_credentials).await?;
         reconcile_shard_overrides(
             &obj.spec,
             shard_overrides,
@@ -1856,6 +1938,7 @@ async fn reconcile_inner(
         deployment_key_resource_version: deployment_key_secret.resource_version,
         audit_token_key_resource_version,
         distributed_query_resource_versions: Vec::new(),
+        credentials_sidecar_image: ctx.credentials_sidecar_image.clone(),
     };
 
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -2028,6 +2111,22 @@ async fn reconcile_inner(
         delete_if_present(&service_accounts, &name).await?;
         delete_if_present(&roles, &name).await?;
         delete_if_present(&role_bindings, &name).await?;
+    }
+    // The podIdentity ServiceAccounts were applied before the gate; here,
+    // past it, delete the ones the render no longer produces, which after a
+    // switch back to static is all four. The names are reserved for the
+    // operator in both modes (ADR-0034, Pod Identity storage credentials
+    // amendment): the vendored RBAC has no `get` on ServiceAccounts, so the
+    // sweep deletes by name, as the router's does.
+    let desired_tier_sa_names: BTreeSet<String> =
+        desired_tier_service_accounts(&obj.spec, instance)
+            .iter()
+            .map(ResourceExt::name_any)
+            .collect();
+    for name in possible_tier_service_account_names(instance) {
+        if !desired_tier_sa_names.contains(&name) {
+            delete_if_present(&service_accounts, &name).await?;
+        }
     }
 
     let mut query_svc = desired.query_service;
@@ -3018,6 +3117,24 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "DistributedQuerySecretRefMissing".to_string(),
             err.to_string(),
         ),
+        // The remedy is an operator flag, not a CR edit: the message names
+        // `--credentials-sidecar-image` and its env.
+        Error::Render(RenderError::CredentialsSidecarImageUnset) => {
+            ("CredentialsSidecarImageUnset".to_string(), err.to_string())
+        }
+        Error::Render(RenderError::StaticCredentialsSecretRefMissing) => (
+            "StaticCredentialsSecretRefMissing".to_string(),
+            err.to_string(),
+        ),
+        Error::Render(RenderError::PodIdentityTierOverride { .. }) => {
+            ("PodIdentityTierOverride".to_string(), err.to_string())
+        }
+        // The message names the two webhook variables and asks whether the
+        // operator's own ServiceAccount carries an association.
+        Error::PodIdentityCredentialsUnavailable(_) => (
+            "PodIdentityCredentialsUnavailable".to_string(),
+            err.to_string(),
+        ),
         other => ("ReconcileError".to_string(), other.to_string()),
     }
 }
@@ -3260,7 +3377,13 @@ fn error_policy(_obj: Arc<RavelCluster>, error: &Error, _ctx: Arc<Context>) -> A
 /// before any API call, so an occupied or unbindable address fails startup
 /// with [`Error::HealthListenerBind`] instead of leaving a controller running
 /// with no probe surface.
-pub async fn run(listen_addr: SocketAddr) -> Result<(), Error> {
+///
+/// `credentials_sidecar_image` is `--credentials-sidecar-image`, the image of
+/// the Pod Identity sidecar rendered under `storage.s3.auth: podIdentity`.
+pub async fn run(
+    listen_addr: SocketAddr,
+    credentials_sidecar_image: Option<String>,
+) -> Result<(), Error> {
     let listener = health::bind(listen_addr).await?;
     let client = Client::try_default().await?;
 
@@ -3316,7 +3439,13 @@ pub async fn run(listen_addr: SocketAddr) -> Result<(), Error> {
         }
     };
 
-    run_on(listener, client, kubernetes_version).await
+    run_on(
+        listener,
+        client,
+        kubernetes_version,
+        credentials_sidecar_image,
+    )
+    .await
 }
 
 /// The part of [`run`] after the listener is bound and the client and
@@ -3332,6 +3461,7 @@ pub async fn run_on(
     listener: TcpListener,
     client: Client,
     kubernetes_version: Option<Info>,
+    credentials_sidecar_image: Option<String>,
 ) -> Result<(), Error> {
     let listen_addr = listener.local_addr().ok();
     let clusters: Api<RavelCluster> = Api::all(client.clone());
@@ -3343,6 +3473,8 @@ pub async fn run_on(
         client,
         kubernetes_version,
         metrics: Arc::clone(&metrics),
+        credentials_sidecar_image,
+        pod_identity_credentials: OperatorCredentialCache::default(),
     });
 
     // Scope the owned-object watches to this operator's objects only. Without a
@@ -3744,9 +3876,10 @@ mod tests {
                     allow_http: false,
                     upload_integrity: Default::default(),
                     request_stored_checksum: true,
-                    credentials_secret_ref: LocalSecretRef {
+                    auth: Default::default(),
+                    credentials_secret_ref: Some(LocalSecretRef {
                         name: "ravel-s3".to_string(),
-                    },
+                    }),
                 },
             },
             tenant_tokens_secret_ref: None,
@@ -4277,6 +4410,8 @@ mod tests {
             client,
             kubernetes_version: Some(version_info("29", "v1.29.5")),
             metrics: Arc::new(ReconcileMetrics::new()),
+            credentials_sidecar_image: None,
+            pod_identity_credentials: OperatorCredentialCache::default(),
         };
         let spec = spec_with_affinity(None);
 
@@ -6498,9 +6633,10 @@ mod tests {
                         allow_http: false,
                         upload_integrity: Default::default(),
                         request_stored_checksum: true,
-                        credentials_secret_ref: LocalSecretRef {
+                        auth: Default::default(),
+                        credentials_secret_ref: Some(LocalSecretRef {
                             name: "creds".to_string(),
-                        },
+                        }),
                     },
                 },
                 tenant_tokens_secret_ref: None,
@@ -6765,5 +6901,123 @@ mod tests {
                 "the retried attempt must have succeeded"
             );
         }
+    }
+
+    // ---- storage.s3.auth: podIdentity ----
+
+    fn pod_identity_cluster_spec() -> RavelClusterSpec {
+        let mut spec = spec_with_affinity(None);
+        spec.storage.s3.auth = crate::crd::S3AuthSpec::PodIdentity;
+        spec.storage.s3.credentials_secret_ref = None;
+        spec
+    }
+
+    /// A `Client` pointed at a port nothing serves: building it makes no
+    /// call, and a test that awaits an RPC on it fails loudly.
+    fn unreachable_client() -> Client {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        Client::try_from(Config::new(
+            "http://127.0.0.1:1".parse().expect("valid loopback URI"),
+        ))
+        .expect("Client builds from a bare Config without contacting anything")
+    }
+
+    #[test]
+    fn degraded_reason_names_the_pod_identity_failures() {
+        let (reason, message) =
+            degraded_reason(&Error::Render(RenderError::CredentialsSidecarImageUnset));
+        assert_eq!(reason, "CredentialsSidecarImageUnset");
+        assert!(message.contains("--credentials-sidecar-image"), "{message}");
+        assert!(
+            message.contains("RAVEL_CREDENTIALS_SIDECAR_IMAGE"),
+            "{message}"
+        );
+
+        let missing = crate::pod_identity::AgentEndpoint::resolve(None, None)
+            .expect_err("no webhook variables");
+        let (reason, message) = degraded_reason(&Error::from(missing));
+        assert_eq!(reason, "PodIdentityCredentialsUnavailable");
+        assert!(
+            message.contains("AWS_CONTAINER_CREDENTIALS_FULL_URI")
+                && message.contains("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"),
+            "{message}"
+        );
+
+        let (reason, _) = degraded_reason(&Error::Render(
+            RenderError::StaticCredentialsSecretRefMissing,
+        ));
+        assert_eq!(reason, "StaticCredentialsSecretRefMissing");
+        let (reason, message) =
+            degraded_reason(&Error::Render(RenderError::PodIdentityTierOverride {
+                tier: "maintain",
+            }));
+        assert_eq!(reason, "PodIdentityTierOverride");
+        assert!(
+            message.contains("spec.maintain.credentialsSecretRef"),
+            "{message}"
+        );
+    }
+
+    /// The operator's own store under podIdentity reads no Secret and, with
+    /// the webhook variables absent from its environment, fails naming them.
+    /// The client is unreachable, so any Secret read would fail differently.
+    #[tokio::test]
+    async fn the_operator_store_without_pod_identity_env_is_unavailable() {
+        if std::env::var_os(crate::pod_identity::ENV_CREDENTIALS_URI).is_some()
+            || std::env::var_os(crate::pod_identity::ENV_AUTHORIZATION_TOKEN_FILE).is_some()
+        {
+            // Running inside a Pod Identity pod: the precondition does not hold.
+            return;
+        }
+        let Err(err) = build_auth_store(
+            &unreachable_client(),
+            "ns",
+            &pod_identity_cluster_spec(),
+            &OperatorCredentialCache::default(),
+        )
+        .await
+        else {
+            panic!("no Pod Identity environment, yet the store built");
+        };
+        assert!(
+            matches!(
+                err,
+                Error::PodIdentityCredentialsUnavailable(
+                    crate::pod_identity::PodIdentityError::MissingEnvironment { .. }
+                )
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Under podIdentity no credential Secret is read, a leftover shared ref
+    /// included: the unreachable client would fail any read.
+    #[tokio::test]
+    async fn pod_identity_reads_no_credential_secret() {
+        let mut spec = pod_identity_cluster_spec();
+        spec.storage.s3.credentials_secret_ref = Some(LocalSecretRef {
+            name: "deleted-long-ago".to_string(),
+        });
+        let versions = resolve_credential_resource_versions(&unreachable_client(), "ns", &spec)
+            .await
+            .expect("no read is attempted");
+        assert!(versions.is_empty());
+        assert_eq!(shared_credentials_rv(&spec, &versions), None);
+    }
+
+    /// The operator's store config under podIdentity: inline keys plus the
+    /// session token, no file, static auth.
+    #[test]
+    fn the_operator_store_config_carries_the_session_token_in_memory() {
+        let mut config = auth_store_config(
+            &pod_identity_cluster_spec(),
+            "ASIA".to_string(),
+            "secret".to_string(),
+        )
+        .expect("config");
+        config.session_token = Some("session".to_string());
+        assert_eq!(config.auth, ravel_object_store::s3::S3AuthMode::Static);
+        assert_eq!(config.credentials_file, None);
+        assert_eq!(config.session_token.as_deref(), Some("session"));
     }
 }
