@@ -1511,8 +1511,9 @@ INFO allocator background purge thread resolved allocator_background_thread=true
 - `/metrics` reports the state as
   `ravel_process_allocator_background_thread{allocator="jemalloc"}`: `1` when
   the thread is enabled, `0` when it is not, read from the allocator at
-  scrape time. After a failed start (below) it reports `0` for the life of
-  the process without reading the allocator.
+  scrape time. After a failed start (below) it reports `0` without reading
+  the allocator; the server starts the thread once, so that holds for the
+  life of the process.
 - `source="unavailable"` means that this host's jemalloc has no
   background-thread support (macOS), so there is no thread to enable. The
   server logs one info line, stamps `false`, and starts. This is expected on
@@ -1522,10 +1523,10 @@ INFO allocator background purge thread resolved allocator_background_thread=true
   refused to create the thread. The allocator sets its enabled flag before
   it creates the thread and leaves it set when creation fails, and while the
   flag is set the allocator leaves decay purging to the thread that is not
-  running. So the server writes the thread back off, stamps `false`, and
-  starts anyway. Check the process's thread limit (`ulimit -u`, a container
-  `pids` limit) and the warning's error. What happens until the next restart
-  depends on the warnings:
+  running. So the server writes the thread back off (except in the last case
+  below), stamps `false`, and starts anyway. Check the process's thread
+  limit (`ulimit -u`, a container `pids` limit) and the warning's error.
+  What happens until the next restart depends on the warnings:
   - One warning, which says the server turned the thread back off: freed
     pages return to the operating system on allocator activity, as with
     `background_thread:false`.
@@ -1533,7 +1534,16 @@ INFO allocator background purge thread resolved allocator_background_thread=true
     restart: turning the thread back off failed too, so freed pages return
     to the operating system only through forced purges, such as the one the
     memory gate runs below `--memory-gate-purge-available-bytes`. Restart the
-    server once the thread limit is raised.
+    server once the thread limit is raised. If the second warning says this
+    only "if that start left jemalloc's enabled flag set", the server did
+    not recognise the first error, so it cannot tell whether the flag was
+    set; treat it the same way.
+  - One warning saying that jemalloc failed before it reached the setting:
+    the allocator could not initialise itself or its control interface,
+    which it reports as a memory allocation failure, so the server's write
+    never reached the enabled flag. The server writes nothing back, the
+    setting and decay purging are as they were, and the stamp still says
+    `source="start-failed"` because the start failed.
 - To turn the thread off, start the server with
   `_RJEM_MALLOC_CONF=background_thread:false`. To combine it with the
   profiling options below, separate the options with commas.
