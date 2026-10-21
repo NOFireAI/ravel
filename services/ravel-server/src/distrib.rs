@@ -3813,7 +3813,11 @@ mod tests {
     #[tokio::test]
     async fn worker_registration_appears_then_ages_out() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION, test_record_keys());
+        let workers = QueryWorkers::with_defaults(
+            "127.0.0.1:7000",
+            codec::PROTOCOL_VERSION,
+            test_record_keys(),
+        );
         let interval_ns =
             i64::try_from(workers.heartbeat_interval().as_nanos()).expect("interval fits i64");
 
@@ -3834,7 +3838,11 @@ mod tests {
         // Far past the staleness window (3x the interval by default): the record
         // is no longer live. `self` is always included by `live_set`, so read
         // from a different identity to observe the aged-out record's absence.
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, test_record_keys());
+        let observer = QueryWorkers::with_defaults(
+            "127.0.0.1:7001",
+            codec::PROTOCOL_VERSION,
+            test_record_keys(),
+        );
         let stale_now = 1_000 + interval_ns * 10;
         let live = observer
             .live_set(store.as_ref(), stale_now)
@@ -3875,7 +3883,8 @@ mod tests {
         for port in 0..3u16 {
             let dead = QueryWorkers::with_defaults(
                 format!("127.0.0.1:{}", 7200 + port),
-                codec::PROTOCOL_VERSION, test_record_keys()
+                codec::PROTOCOL_VERSION,
+                test_record_keys(),
             );
             dead.write_heartbeat(&memory, now_ns - 10 * H_NS)
                 .await
@@ -3896,7 +3905,8 @@ mod tests {
 
         let workers = Arc::new(QueryWorkers::with_defaults(
             "127.0.0.1:7000",
-            codec::PROTOCOL_VERSION, test_record_keys()
+            codec::PROTOCOL_VERSION,
+            test_record_keys(),
         ));
         let interval = workers.heartbeat_interval();
         let live_workers = Arc::new(RwLock::new(Arc::new(Vec::new())));
@@ -3913,7 +3923,11 @@ mod tests {
             tokio::time::sleep(interval).await;
         }
 
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, test_record_keys());
+        let observer = QueryWorkers::with_defaults(
+            "127.0.0.1:7001",
+            codec::PROTOCOL_VERSION,
+            test_record_keys(),
+        );
         let self_id = workers.process_id().to_string();
         let live = observer
             .live_set(store.as_ref(), now_ns)
