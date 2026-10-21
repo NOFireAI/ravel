@@ -8807,7 +8807,12 @@ pub(crate) mod tests {
     /// self.cache_bulk_scan_min_bytes)` with `false` fails the first filtered
     /// row above the threshold; making `reads_key_equality` return `false`
     /// fails the `user_id = 'u-1'` row; letting `size_trigger_applies` accept
-    /// a Metrics lane fails the filtered `samples` row; passing the
+    /// a Metrics lane fails the filtered `samples` row only together with
+    /// `reads_key_equality` reading a plan error as no key lookup, since a
+    /// `samples` statement does not plan over the `logs`-only session and so
+    /// fails closed (the lane check alone is pinned by
+    /// `the_size_trigger_applies_to_one_logs_lane_at_or_above_the_threshold`);
+    /// passing the
     /// unoptimized plan to `plan_has_key_equality` fails the `IN` and CTE
     /// rows, and the `JOIN` row once the `LogicalPlan::Join` arm is removed
     /// too; walking with `apply` instead of `apply_with_subqueries` fails the
@@ -8914,6 +8919,7 @@ pub(crate) mod tests {
                 [BulkScan, BulkScan, BulkScan],
             ),
         ];
+        let mut mismatches = Vec::new();
         for (column, min_bytes) in [Some(1_000), Some(2_000), None].into_iter().enumerate() {
             let exec = eviction_test_executor()
                 .with_declared_column_source(Arc::new(source.clone()))
@@ -8931,9 +8937,15 @@ pub(crate) mod tests {
                         &declared,
                     )
                     .await;
-                assert_eq!(intent, expected[column], "{min_bytes:?}: {sql}");
+                if intent != expected[column] {
+                    mismatches.push(format!(
+                        "{min_bytes:?}: {sql}: got {intent:?}, want {:?}",
+                        expected[column]
+                    ));
+                }
             }
         }
+        assert!(mismatches.is_empty(), "{mismatches:#?}");
     }
 
     /// A lowered statement has no SQL text, so the size trigger never reads
