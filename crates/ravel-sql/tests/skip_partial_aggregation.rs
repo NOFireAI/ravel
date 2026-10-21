@@ -43,6 +43,10 @@
 //!   tables held. That last figure is the quantity issue #680 is about: what
 //!   the pre-final state costs, counted in entries instead of bytes.
 //!
+//! The group-entry figure is also read for each partition on its own, and the
+//! tightened session's bound is held against the largest of those, since how
+//! many partitions take an object is up to the schedule.
+//!
 //! Its input row count is `output_rows` of its child, and the fixture's own
 //! [`TOTAL_ROWS`] independently.
 //!
@@ -53,13 +57,14 @@
 //! either threshold and the on-side session becomes DataFusion's stock
 //! 0.8-after-100,000 probe, which no partition of this fixture meets (see
 //! [`MAX_STOCK_PROBE_RATIO`]): every partition
-//! then aggregates, `skipped_aggregation_rows` falls to 0, `output_rows` falls
-//! from the input row count to one row per distinct value per partition, and
-//! the first assertion below fails.
+//! then aggregates, so each partition that takes an object holds a full
+//! [`DISTINCT`]-entry table, above [`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`],
+//! and the first assertion below fails whichever partitions took the objects.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::any::Any;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
@@ -92,8 +97,8 @@ use uuid::Uuid;
 /// makes the pre-final state `partitions x DISTINCT` instead of `DISTINCT`, and
 /// it is the shape issue #680 is about. It also has to stay above
 /// `2 x SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`, or one full-sized per-partition
-/// table would fit inside [`MAX_TIGHTENED_GROUP_ENTRIES`] and the bound this
-/// test holds the tightened session to would prove nothing.
+/// table would fit inside [`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`] and the
+/// bound this test holds each tightened partition to would prove nothing.
 const DISTINCT: usize = 25_000;
 
 /// How many times each object repeats its full run of [`DISTINCT`] values.
@@ -167,14 +172,8 @@ const _: () = assert!(
      under the stock ratio threshold, or the option-off session's probe fires \
      too and both sides of this test skip"
 );
-const _: () = assert!(
-    DISTINCT > 2 * SKIP_PARTIAL_AGGREGATION_PROBE_ROWS,
-    "one full-sized per-partition table must not fit inside the bound the \
-     tightened session is held to, or that bound proves nothing"
-);
-
-/// The largest number of group entries the tightened partial stage may hold
-/// across all partitions.
+/// The largest number of group entries any one partition of the tightened
+/// partial stage may hold.
 ///
 /// Structural, not tuned. A partition stops building its table as soon as the
 /// probe fires, and the probe fires on the first batch that takes the partition
@@ -183,8 +182,17 @@ const _: () = assert!(
 /// 8192, so a partition's table can reach two probe thresholds' worth of
 /// entries before it is frozen, and no more. Note what does not appear in this
 /// bound: [`DISTINCT`]. That is the whole point of the fix.
-const MAX_TIGHTENED_GROUP_ENTRIES: usize =
-    2 * SKIP_PARTIAL_AGGREGATION_PROBE_ROWS * FANNED_OUT_PARTITIONS;
+///
+/// The bound is per partition, not summed: how many partitions take an object
+/// from the shared queue is a scheduling property, and a sum over them would
+/// let a regressed partition's full table pass whenever few partitions ran.
+const MAX_TIGHTENED_PARTITION_GROUP_ENTRIES: usize = 2 * SKIP_PARTIAL_AGGREGATION_PROBE_ROWS;
+
+const _: () = assert!(
+    DISTINCT > MAX_TIGHTENED_PARTITION_GROUP_ENTRIES,
+    "one full-sized per-partition table must not fit inside the bound each \
+     tightened partition is held to, or that bound proves nothing"
+);
 
 const SCOPE_NAME: &str = "skip-partial-aggregation-test";
 const SCOPE_VERSION: &str = "1.0";
@@ -287,7 +295,8 @@ fn logs_scan_partitions(plan: &Arc<dyn ExecutionPlan>) -> usize {
 }
 
 /// Row counts read off the grouping `Partial` `AggregateExec` of an executed
-/// plan, summed over its partitions.
+/// plan, summed over its partitions, plus the largest single partition's group
+/// entries.
 #[derive(Debug, Default)]
 struct PartialAggregate {
     /// How many grouping `Partial` `AggregateExec` nodes were found. The plan
@@ -303,6 +312,11 @@ struct PartialAggregate {
     /// `BaselineMetrics::output_rows` of the child, which is the partial
     /// stage's input row count.
     input_rows: usize,
+    /// The largest `output_rows - skipped_aggregation_rows` of any one
+    /// partition: the most group entries a single partition's table held.
+    max_partition_group_entries: usize,
+    /// Partitions that published both counters, for the diagnostic print.
+    partitions: usize,
 }
 
 impl PartialAggregate {
@@ -323,6 +337,10 @@ fn partial_aggregate_rows(plan: &Arc<dyn ExecutionPlan>) -> PartialAggregate {
         totals.output_rows += below.output_rows;
         totals.skipped_rows += below.skipped_rows;
         totals.input_rows += below.input_rows;
+        totals.max_partition_group_entries = totals
+            .max_partition_group_entries
+            .max(below.max_partition_group_entries);
+        totals.partitions += below.partitions;
     }
 
     let Some(aggregate) = (plan.as_ref() as &dyn Any).downcast_ref::<AggregateExec>() else {
@@ -336,16 +354,61 @@ fn partial_aggregate_rows(plan: &Arc<dyn ExecutionPlan>) -> PartialAggregate {
         .metrics()
         .expect("an AggregateExec publishes a MetricsSet");
     totals.nodes += 1;
-    totals.output_rows += metrics
+    let output_rows = metrics
         .output_rows()
         .expect("an AggregateExec publishes BaselineMetrics::output_rows");
-    totals.skipped_rows += metrics
+    let skipped_rows = metrics
         .sum_by_name("skipped_aggregation_rows")
         .expect(
             "a grouping Partial AggregateExec over an unordered single group set \
              publishes skipped_aggregation_rows",
         )
         .as_usize();
+    totals.output_rows += output_rows;
+    totals.skipped_rows += skipped_rows;
+
+    // (output_rows, skipped_aggregation_rows) per partition.
+    let mut per_partition: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
+    for metric in metrics.iter() {
+        let value = metric.value();
+        let name = value.name();
+        if name != "output_rows" && name != "skipped_aggregation_rows" {
+            continue;
+        }
+        let partition = metric
+            .partition()
+            .expect("a Partial AggregateExec records its row counters per partition");
+        let entry = per_partition.entry(partition).or_default();
+        if name == "output_rows" {
+            entry.0 += value.as_usize();
+        } else {
+            entry.1 += value.as_usize();
+        }
+    }
+    // The per-partition split must account for every row the summed figures
+    // count, or a partition the loop above missed could hide a full table.
+    assert_eq!(
+        per_partition
+            .values()
+            .map(|(output, _)| output)
+            .sum::<usize>(),
+        output_rows,
+        "per-partition output_rows do not add up to the AggregateExec's total"
+    );
+    assert_eq!(
+        per_partition
+            .values()
+            .map(|(_, skipped)| skipped)
+            .sum::<usize>(),
+        skipped_rows,
+        "per-partition skipped_aggregation_rows do not add up to the \
+         AggregateExec's total"
+    );
+    totals.partitions += per_partition.len();
+    for (output, skipped) in per_partition.values() {
+        totals.max_partition_group_entries =
+            totals.max_partition_group_entries.max(output - skipped);
+    }
     totals.input_rows += plan
         .children()
         .iter()
@@ -485,9 +548,12 @@ fn check_run_shape(label: &str, observed: &Run) {
 /// the four partition tasks can run at once, as they do in the server.
 ///
 /// 1. With the option on, every partition's probe fires and the partial stage
-///    forwards: its `output_rows` equals its input row count exactly, and the
-///    rows it did aggregate fit in [`MAX_TIGHTENED_GROUP_ENTRIES`], a bound
-///    that does not mention [`DISTINCT`].
+///    forwards: each partition's own group entries fit in
+///    [`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`], a bound that does not mention
+///    [`DISTINCT`], and the stage's `output_rows` equals its input row count
+///    exactly. The bound is checked partition by partition, so it fails
+///    whenever any partition builds a full table, however many partitions
+///    took an object.
 /// 2. With the option off, no partition's probe fires at all: nothing is
 ///    skipped, and the partial stage emits one row per distinct value it saw
 ///    per partition, at most `FANNED_OUT_PARTITIONS x DISTINCT` and strictly
@@ -497,8 +563,8 @@ fn check_run_shape(label: &str, observed: &Run) {
 /// 3. That off-side entry count is at least [`DISTINCT`]: a partition that
 ///    takes an object builds a full table of every distinct value. One such
 ///    table is more than one on-side partition may hold
-///    (`2 x SKIP_PARTIAL_AGGREGATION_PROBE_ROWS`, the per-partition share of
-///    assertion 1's bound), which is what keeps assertion 1 from being vacuous:
+///    ([`MAX_TIGHTENED_PARTITION_GROUP_ENTRIES`], assertion 1's bound), which
+///    is what keeps assertion 1 from being vacuous:
 ///    the fixture has to actually reproduce a table that follows `DISTINCT`
 ///    for a bound on it to mean anything. The comparison is per partition, so
 ///    it holds whichever partitions took the objects.
@@ -514,21 +580,37 @@ async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables(
 
     println!(
         "tightened: input_rows={} output_rows={} skipped={} group_entries={} \
-         peak_bytes={}\n\
+         partitions={} max_partition_group_entries={} peak_bytes={}\n\
          stock:     input_rows={} output_rows={} skipped={} group_entries={} \
-         peak_bytes={}",
+         partitions={} max_partition_group_entries={} peak_bytes={}",
         tightened.partial.input_rows,
         tightened.partial.output_rows,
         tightened.partial.skipped_rows,
         tightened.partial.group_entries(),
+        tightened.partial.partitions,
+        tightened.partial.max_partition_group_entries,
         tightened.peak_bytes,
         stock.partial.input_rows,
         stock.partial.output_rows,
         stock.partial.skipped_rows,
         stock.partial.group_entries(),
+        stock.partial.partitions,
+        stock.partial.max_partition_group_entries,
         stock.peak_bytes,
     );
 
+    assert!(
+        tightened.partial.max_partition_group_entries <= MAX_TIGHTENED_PARTITION_GROUP_ENTRIES,
+        "a tightened partial partition aggregated {} rows into group entries, \
+         above the {MAX_TIGHTENED_PARTITION_GROUP_ENTRIES} its probe prefix allows \
+         one partition (2 x {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS}). The pre-final \
+         state is following DISTINCT again, which is issue #680: check that \
+         session_config still writes both \
+         datafusion.execution.skip_partial_aggregation_probe_* thresholds when \
+         SqlConfig::skip_partial_aggregation is on.\n{}",
+        tightened.partial.max_partition_group_entries,
+        tightened.plan_with_metrics
+    );
     assert_eq!(
         tightened.partial.output_rows, tightened.partial.input_rows,
         "the tightened partial stage emitted {} rows for {} input rows. Every \
@@ -539,16 +621,6 @@ async fn high_cardinality_partial_aggregate_forwards_instead_of_building_tables(
          datafusion.execution.skip_partial_aggregation_probe_* thresholds when \
          SqlConfig::skip_partial_aggregation is on.\n{}",
         tightened.partial.output_rows, tightened.partial.input_rows, tightened.plan_with_metrics
-    );
-    assert!(
-        tightened.partial.group_entries() <= MAX_TIGHTENED_GROUP_ENTRIES,
-        "the tightened partial stage aggregated {} rows into group entries, above \
-         the {MAX_TIGHTENED_GROUP_ENTRIES} its probe prefix allows \
-         (2 x {SKIP_PARTIAL_AGGREGATION_PROBE_ROWS} x {FANNED_OUT_PARTITIONS}). \
-         The pre-final state is following DISTINCT again, which is issue \
-         #680.\n{}",
-        tightened.partial.group_entries(),
-        tightened.plan_with_metrics
     );
 
     assert_eq!(
