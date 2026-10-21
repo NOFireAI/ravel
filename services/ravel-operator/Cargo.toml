@@ -71,8 +71,11 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # already resolved. Three fixed paths need no router (axum/tower are rejected
 # in the ADR), so only the low-level server pieces are pulled in: `http1`
 # (kubelet and Prometheus scrapers are HTTP/1.1) and `tokio` (for `TokioIo`),
-# not `client` or `http2`.
-hyper = { workspace = true, features = ["server", "http1"] }
+# not `http2`. `client` is the one-request HTTP/1.1 client the Pod Identity
+# credentials code (`src/pod_identity.rs`) uses to reach the node-local agent
+# over plain HTTP; no connection pool and no TLS, so `hyper-util`'s
+# `client-legacy` is not needed either.
+hyper = { workspace = true, features = ["server", "client", "http1"] }
 hyper-util = { workspace = true, features = ["tokio"] }
 http-body-util = { workspace = true }
 bytes = "1"
