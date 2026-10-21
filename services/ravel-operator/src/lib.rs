@@ -9,6 +9,9 @@
 //!   Kubernetes objects. No I/O, no runtime; unit-tested directly.
 //! - [`controller`]: the thin I/O layer that watches the resource, calls the
 //!   pure functions, and applies the results.
+//! - [`pod_identity`]: the EKS Pod Identity credentials sidecar
+//!   (`ravel-operator pod-identity-credentials`) and the operator's own
+//!   in-memory Pod Identity credentials, for `storage.s3.auth: podIdentity`.
 //!
 //! The operator renders Kubernetes objects from the CRD only. It never talks to
 //! the object store or links any `ravel-*` crate.
@@ -17,6 +20,7 @@ pub mod controller;
 pub mod crd;
 pub mod health;
 pub mod metrics;
+pub mod pod_identity;
 pub mod reconcile;
 
 pub use crd::{RavelCluster, RavelClusterSpec, RavelClusterStatus, ravel_cluster_crd};
