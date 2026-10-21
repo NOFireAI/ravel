@@ -202,8 +202,8 @@ every check that today sees zero source queries before a refusal
 cache is populated only when the evaluator is inside a range grid or a
 subquery, which is where the repeats are.
 
-1c. Forward-only cursors are not added. A `partition_point` per step is
-`O(log n)`, which already removes the full-vector walk the audit counted
+1c. Forward-only cursors are not added (superseded by the per-step cursor
+amendment below). A `partition_point` per step is `O(log n)`, which already removes the full-vector walk the audit counted
 (8,330,421 timestamp visits against 36,264 comparisons on its one-series
 model); a cursor would be valid only outside subqueries (Context, P1) and
 buys a constant factor on top. Borrowed or reference-counted sample windows
@@ -220,7 +220,7 @@ Acceptance (the task's tests, re-run at checkpoint):
 |---|---|---|---|
 | compound arm wall, 24 h x 200 and 24 h x 1000, same harness and box class as Stage 0 | at most 0.50x of the Stage 0 compound median (744.7 ms and 5,699.7 ms); the Stage 0 profile puts 77.6 % of the 24 h x 1000 wall in the clip alone, so 0.50x is cleared if the clip goes | over 0.6x | predicted (audit page 1); Stage 0 figures from issue #3072 comment 6253165175 |
 | compound arm wall, 1 h x 1000 | at most 0.65x of the Stage 0 median (96.5 ms, of which prefetch is 32.5 ms and unchanged by this decision, so 0.50x of the wall would need the clip to be 76 % of evaluate at 240 samples per series, where the linear walk is a smaller share than at 24 h) | over 0.75x | predicted; Stage 0 split from issue #3072 comment 6253165175 |
-| bare arm wall, each shape | within 5 % of Stage 0 | over 5 % slower | predicted (audit page 3) |
+| bare arm wall, each shape | within 5 % of Stage 0 (restated one-sided against a same-session rebaseline by the per-step cursor amendment below) | over 5 % slower | predicted (audit page 3) |
 | `MergedSource::query` calls, compound arm, 24 h / 60 s | 1 per distinct selector (1 for the Stage 0 query), refetches 0 | any more | predicted |
 | `MergedSource::query` calls for `f(x[1h:1m] offset -1h)` over the 24 h grid, and for a plain subquery | at most 2 per distinct selector and channel | more | predicted from the outer-step translation rule in 1b (the negative-offset subquery is the shape a per-inner-instant translation gets wrong) |
 | difftest, six new Generic range entries: `offset`, negative `offset`, `@ start()`, a subquery argument, `@ start()` on a selector inside a subquery argument, a stale marker inside the window | bit-identical to pinned Prometheus | any difference | predicted; today's corpus has three Generic range entries (`corpus/aggregate.txt:144`, `corpus/binop.txt:171`, `corpus/histogram_native.txt:186`) and none of these shapes; the `@ start()`-inside-a-subquery entry is what pins that the translation fields never rebind the `@` anchors |
@@ -612,3 +612,65 @@ inside the window; a `logs` statement also needs no pending erasure and
 every resolved segment inside the window. Every other statement is
 `Interactive`. The rest of decision 3 (the funnels, the policy in 3b, the
 other intents) stands as written.
+
+## Amendment (issue #3127, 2026-10-21): per-step cursors, and a one-sided bare-arm band against a same-session rebaseline
+
+<!-- amendment-applies: sections="1. Compound PromQL range queries fetch each selector once and slice per step" pointer="per-step cursor amendment" -->
+<!-- amendment-supersedes: phrase="Forward-only cursors are not added" pointer="per-step cursor amendment" -->
+<!-- amendment-supersedes: phrase="within 5 % of Stage 0" pointer="per-step cursor amendment" -->
+
+Decision 1c ruled out forward-only cursors as a constant factor on top of
+`partition_point`. With 1a and 1b in, the compound profile at 24 h x 1000
+cited on #3127 put 27.9 % of all samples (55.8 % of evaluate) in
+`CachedSelector::slices`, two binary searches per series per step, so #3127
+adds them. Each series in a
+cached entry keeps the lower and upper slice bounds of the previous step.
+The next step walks forward from them for at most 64 samples. A request that
+starts before the previous one, or that would walk past 64 samples, is found
+by binary search over the part of the series the cursor rules out, so every
+slice is the exact `partition_point` bound whatever the cursor holds. 1c's
+objection that a cursor is valid only outside subqueries does not apply to a
+cursor kept as a hint: an inner grid that restarts behind the previous outer
+step's last inner step costs one binary search per series, which is what
+every step cost before. A cap-refused replacement now also drops the entry it
+would have replaced, with its bytes and memory budget reservation.
+
+Decision 1's bare-arm row is restated one-sided. A two-sided band against
+the Stage 0 figure tests the box and the day as much as the change: the
+unchanged base commit (`ac5e3c3`, 1a and 1b already in) measured 0.882x,
+0.921x and 0.909x of Stage 0 bare in this session, outside "within 5 %" in
+the fast direction at every shape, and one bare round in five moved its
+shape's base wall by up to 10 % (B bare, 86.9 to 95.6 ms). The bare arm
+makes one source call and slices nothing per step, so the question the row
+asks is whether the candidate made it slower, and only a baseline measured
+beside the candidate answers that.
+
+| check | target | miss | basis |
+|---|---|---|---|
+| bare arm wall, each shape | no slower than 1.10x of a same-day rebaseline of the base commit, taken in the same session as the candidate on the same box, medians of 5 alternating rounds | over 1.10x | measured 2026-10-21: candidate over same-session base 1.017x (1 h x 1000), 0.999x (24 h x 200), 0.996x (24 h x 1000), HIT at every shape |
+
+Medians of 5 rounds, `query_latency_bench`, memory store, one range query
+per run, base and candidate alternating within each round, on an x86_64
+16 vCPU box with a 1-minute load average of at most 3.41 at every run.
+Matched series and accepted points are identical between base and
+candidate at every shape and arm. Stage 0 bare is the Stage 0 compound
+median divided by its measured compound-over-bare ratio.
+
+| shape | arm | base median (ms) | candidate median (ms) | candidate / base | Stage 0 median (ms) | candidate / Stage 0 | basis |
+|---|---|---|---|---|---|---|---|
+| 1 h x 1000 | compound | 74.106 | 71.953 | 0.971 | 96.5 | 0.745 | measured 2026-10-21 |
+| 1 h x 1000 | bare | 25.776 | 26.227 | 1.017 | 29.2 | 0.897 | measured 2026-10-21 |
+| 24 h x 200 | compound | 332.665 | 312.720 | 0.940 | 744.7 | 0.420 | measured 2026-10-21 |
+| 24 h x 200 | bare | 87.913 | 87.793 | 0.999 | 95.5 | 0.920 | measured 2026-10-21 |
+| 24 h x 1000 | compound | 1733.077 | 1543.542 | 0.891 | 5699.7 | 0.271 | measured 2026-10-21 |
+| 24 h x 1000 | bare | 483.039 | 480.942 | 0.996 | 531.2 | 0.905 | measured 2026-10-21 |
+
+Both 24 h compound shapes stay under decision 1's 0.50x target. The
+1 h x 1000 compound shape, at 0.745x, is under its 0.75x miss line and
+above its 0.65x target. A frame-pointer profile of the 24 h x 1000
+compound arm on the candidate (158 samples, a coarse profile) puts
+`CachedSelector::slices` at 2.5 % of all samples, down from 27.9 %, with
+prefetch at 61.4 % (segment decode, `decode_gorilla_into` alone 38.6 %) and
+evaluate at 38.0 %: the remaining distance to the 1 h target is in prefetch,
+which this decision does not change. The other acceptance rows of
+decision 1 stand.
