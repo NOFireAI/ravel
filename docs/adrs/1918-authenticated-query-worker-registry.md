@@ -23,7 +23,7 @@ PUT to the writer's own UUID. The live-set reader checks that the key parses as
 a UUID, that the body's `process_id` matches the key, and that the stamp is
 fresh. None of these checks keeps out a writer who is not a cluster member,
 and the module docs say so (`query_workers.rs:118-122`, `:309-312`; also
-`docs/guides/distributed-query.md:422-427`).
+`docs/guides/distributed-query.md:420-426`).
 
 When #1918 was filed, a forged record let an attacker harvest tenant bearer
 tokens, because the SQL lane sent the client credential in cleartext. ADR-1689
@@ -107,14 +107,34 @@ material only, not a merge candidate.
    when its MAC verifies under one of the reader's keys, compared in constant
    time. The existing UUID, `process_id` and staleness checks stay. Rejected
    records are skipped, never fatal to the whole read, and are counted under a
-   closed reason label as `ravel_query_worker_record_rejects_total{reason}`:
-   `missing_mac`, `bad_mac`, `oversize`, and `malformed` for a body that does
-   not decode or whose `process_id` does not match its key. `malformed` is the
-   label garbage-overwrite eviction (Consequences) shows up under, so the
-   residual attack is counted too. A record skipped only because its stamp is
-   stale is not counted: dead workers leave such records in normal operation.
-   The metric is rendered by the server's metrics endpoint beside
-   `ravel_distrib_fragment_capability_rejects_total`.
+   closed reason label as `ravel_query_worker_record_rejects_total{reason}`.
+   The checks run in this order, and a record is counted under the first one
+   it fails:
+   - The key does not parse as a UUID: skipped, not counted.
+   - The object's LIST mtime is outside the liveness window: skipped before
+     the GET, not counted. A dead worker leaves such a record in normal
+     operation.
+   - The body is longer than the bound in decision 5: `oversize`.
+   - The body does not decode, or its `process_id` does not match its key:
+     `malformed`. A garbage overwrite, the eviction path in Consequences,
+     lands here.
+   - No MAC: `missing_mac`. A MAC that verifies under no key: `bad_mac`.
+   - The MAC verifies and the stamp is `DRAINED_STAMP_NS`: skipped as a drain,
+     not counted. A graceful shutdown writes exactly this record, so counting
+     it would fire on every rolling deploy. A replay of a worker's own drained
+     record is signed the same way and cannot be told apart from a real drain.
+   - The MAC verifies but any other stamp is outside the liveness window:
+     `stale_stamp`. The object's mtime was fresh, and a live worker re-stamps
+     its record with its current clock on every write, so this pair is a
+     replayed older heartbeat or a clock skewed past the window. Both are
+     worth an operator's attention.
+
+   The counters are per-reason `AtomicU64`s in a metrics handle that
+   `QueryWorkers` owns in `ravel-fleet` and exposes by reference, the shape
+   of the capability-reject counters in `services/ravel-server/src/distrib.rs`.
+   The server's metrics endpoint snapshots that handle and renders the family
+   beside `ravel_distrib_fragment_capability_rejects_total`, every reason from
+   zero, so the series exists before the first reject.
 
 5. **The record read is bounded.** The reader issues a range read of
    4096 + 1 bytes. A response longer than 4096 bytes means the object is
@@ -218,9 +238,9 @@ flowchart LR
   SQL lane. That is the ADR-1689 trust model and this ADR does not change it.
 - `ravel_query_worker_record_rejects_total` is the operator-visible sign of
   either a rollout in progress (`missing_mac` from old workers) or a forger
-  (`bad_mac`, `oversize`, and `malformed` for a garbage overwrite). Replay of
-  an older signed record is not counted, because the reader cannot tell it
-  from a slow heartbeat.
+  (`bad_mac`, `oversize`, `malformed` for a garbage overwrite, and
+  `stale_stamp` for a replayed older heartbeat). A replayed drained record is
+  the one eviction that leaves no count, for the reason given in decision 4.
 - A process whose fragment key file shares no key with its siblings no longer
   sees them, and they no longer see it. Today such a process already fails
   every PromQL fragment, because capabilities verify only under shared keys.
@@ -229,9 +249,10 @@ flowchart LR
   disjoint fragment key files (`services/ravel-server/tests/sql_ticket_key_file_e2e.rs`)
   must share at least one key.
 - Docs that change with the implementation:
-  `docs/guides/distributed-query.md` (the admission paragraph at `:422-427`
-  and the trust description), the module docs in `query_workers.rs`, and the
-  ADR index.
+  `docs/guides/distributed-query.md` (the admission paragraph at `:420-426`
+  and the trust description), `docs/guides/observability.md` (the metric
+  catalog, beside `ravel_distrib_fragment_capability_rejects_total`), the
+  module docs in `query_workers.rs`, and the ADR index.
 - Out of scope and filed separately: a TLS handshake timeout and a per-attempt
   timeout on both lanes. A legitimate worker that hangs mid-handshake stalls
   queries the same way a tarpit does, so this is a robustness fix of its own
