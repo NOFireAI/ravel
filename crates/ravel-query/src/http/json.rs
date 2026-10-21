@@ -294,9 +294,11 @@ pub struct PhaseCostJson {
     /// DECOMPRESSED bytes: the typed-output footprint of every sample this
     /// phase decoded, whatever the encoding. A decode-time output size that no
     /// request paid for, so it is comparable neither with
-    /// [`Self::s3_get_wire_bytes`] nor with [`Self::cache_served_bytes`]. By
-    /// convention this lands on the `scan` phase, since decode always follows
-    /// a scan in this crate's fetch pipelines. Pooled counterpart:
+    /// [`Self::s3_get_wire_bytes`] nor with [`Self::cache_served_bytes`]. A
+    /// block decode lands on the `scan` phase. On `keyIndex` it is the KEY_IDX
+    /// probe's decoded bytes: each probed object's prefix (stored as is) plus
+    /// each decoded bucket frame's declared length (`entry_count x 12`), from
+    /// a GET, the cache or a resident probe alike. Pooled counterpart:
     /// `accounting.decompressedBytes`.
     #[serde(rename = "decompressedOutputBytes")]
     pub decompressed_output_bytes: u64,

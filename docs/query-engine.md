@@ -2831,7 +2831,16 @@ doc's own vocabulary:
   decision 5) and of a logs exact-key equality
   (`LogSegmentFetcher::plan_segment_keyed`, see "Exact-key probe" under
   "Declared typed attribute columns" below). The store's GET latency histogram has no key-index slot, so
-  these reads are timed there under `probe`.
+  these reads are timed there under `probe`. Its `decompressedOutputBytes`
+  is what the probe decoded: per probed object, the KEY_IDX prefix
+  (`[0, prefix_len)`, stored as is) once it parses, plus each bucket frame
+  that decodes, at its declared length (`entry_count x 12`, which the decode
+  checks the zstd output against). A bucket the prefix names empty is not
+  read and adds nothing. The bytes count whether they came from a GET, the
+  read cache or the tail probe, since the read cache holds frames as stored
+  and each probe decodes them again. On a small bucket this figure can be
+  below the wire bytes: the frame's 8-byte header and zstd framing outweigh
+  a few entries.
 
 Decode (turning fetched bytes into typed samples/rows) is deliberately
 not a sixth phase: it issues no store request, so it has nothing to

@@ -708,3 +708,87 @@ async fn unindexed_objects_the_scan_skips_are_read_whole_once() {
         assert_eq!(object.whole_read_phases(), [GetPhase::Scan], "object {n}");
     }
 }
+
+/// The bytes a probe for `TARGET` decodes from this object's KEY_IDX,
+/// recomputed from its bytes: the prefix as stored, plus the zstd output of
+/// the bucket frame's payload (past its 8-byte `entry_count` and crc header)
+/// when the probe reads one.
+fn expected_key_decoded(object: &Object) -> u64 {
+    let reads = object.expected_key_reads();
+    let slice = |g: &GetRange| {
+        let r = span(g, object.size());
+        object.bytes.slice(r.start as usize..r.end as usize)
+    };
+    let prefix = slice(&reads[0]).len() as u64;
+    let bucket = reads.get(1).map_or(0, |g| {
+        let frame = slice(g);
+        zstd::stream::decode_all(&frame[8..])
+            .expect("bucket frame decodes")
+            .len() as u64
+    });
+    prefix + bucket
+}
+
+/// Field `field` of the `stats.phases` entry for phase `name`.
+fn phase_field(response: &Value, name: &str, field: &str) -> u64 {
+    response["stats"]["phases"]
+        .as_array()
+        .expect("phases")
+        .iter()
+        .find(|p| p["phase"] == name)
+        .unwrap_or_else(|| panic!("no {name} phase in {response}"))[field]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{name}.{field} is a u64 in {response}"))
+}
+
+/// The keyIndex phase's decompressed bytes are exactly every probed object's
+/// prefix plus every bucket it decoded, recomputed from the fixture, on both
+/// the unplanned probe (`target_partitions` 4) and the keyed plan (32); its
+/// GETs and wire bytes are the probe reads' own.
+///
+/// FLIP: against the dispatch ref `decompressedOutputBytes` for `keyIndex`
+/// reads 0 on both routes.
+#[tokio::test]
+async fn key_index_phase_counts_the_probe_decoded_bytes() {
+    for target_partitions in [4, 32] {
+        let o = run(&Config {
+            pads: mixed(16),
+            target_partitions,
+            threshold: 256 * KIB,
+            break_even: 512 * KIB,
+            key_indexed: true,
+            every_object_holds: false,
+        })
+        .await;
+        let tp = target_partitions;
+        assert_every_object_probed(&o);
+        let decoded: Vec<u64> = o.objects.iter().map(expected_key_decoded).collect();
+        let reads: Vec<GetRange> = o
+            .objects
+            .iter()
+            .flat_map(Object::expected_key_reads)
+            .collect();
+        let wire: u64 = reads
+            .iter()
+            .map(|g| {
+                let r = span(g, 0);
+                r.end - r.start
+            })
+            .sum();
+        assert_eq!(
+            phase_field(&o.response, "keyIndex", "decompressedOutputBytes"),
+            decoded.iter().sum::<u64>(),
+            "tp {tp}: per object {decoded:?}"
+        );
+        assert_eq!(
+            phase_field(&o.response, "keyIndex", "s3GetWireBytes"),
+            wire,
+            "tp {tp}"
+        );
+        assert_eq!(
+            phase_field(&o.response, "keyIndex", "s3GetRequests"),
+            ALL_OBJECTS_KEY_READS,
+            "tp {tp}"
+        );
+    }
+}

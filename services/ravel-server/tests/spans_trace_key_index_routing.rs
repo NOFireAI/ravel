@@ -738,3 +738,93 @@ async fn a_trace_written_in_place_under_a_retired_shard_count_is_returned() {
         "the object is probed and its trace run read"
     );
 }
+
+/// The bytes a probe decodes from one object's KEY_IDX reads (`key_index` as
+/// [`expected_reads`] lists them), recomputed from the object's bytes: the
+/// prefix as stored, plus the zstd output of the bucket frame's payload (past
+/// its 8-byte `entry_count` and crc header) when the probe reads one.
+fn expected_key_decoded(bytes: &Bytes, key_index: &[GetRange]) -> u64 {
+    let slice = |range: &GetRange| match *range {
+        GetRange::Range(start, end) => bytes.slice(start as usize..end as usize),
+        other => panic!("expected a bounded range, got {other:?}"),
+    };
+    let prefix = slice(&key_index[0]).len() as u64;
+    let bucket = key_index.get(1).map_or(0, |range| {
+        let frame = slice(range);
+        zstd::stream::decode_all(&frame[8..])
+            .expect("bucket frame decodes")
+            .len() as u64
+    });
+    prefix + bucket
+}
+
+/// A trace lookup's keyIndex phase reports as decompressed bytes exactly every
+/// object's KEY_IDX prefix plus every bucket the probe decoded, recomputed
+/// from the fixture, and its GETs and wire bytes are the probe reads' own.
+///
+/// FLIP: against the dispatch ref `decompressedOutputBytes` for `keyIndex`
+/// reads 0.
+#[tokio::test]
+async fn trace_lookup_key_index_phase_counts_the_probe_decoded_bytes() {
+    let trace = trace_routed(1, 0);
+    let specs = [
+        ObjectSpec {
+            shard: 0,
+            hour: 0,
+            spans: bracket(&trace),
+        },
+        ObjectSpec {
+            shard: 1,
+            hour: 0,
+            spans: vec![(trace, "t-0"), (trace, "t-1")],
+        },
+        ObjectSpec {
+            shard: 0,
+            hour: 1,
+            spans: bracket(&trace),
+        },
+    ];
+    let (_recorder, app, objects) = serve(RESHARD_2_TO_3, NOW_NS, &specs).await;
+    let want: Vec<ExpectedReads> = objects
+        .iter()
+        .map(|o| expected_reads(&o.bytes, &trace))
+        .collect();
+    let decoded: Vec<u64> = objects
+        .iter()
+        .zip(&want)
+        .map(|(o, w)| expected_key_decoded(&o.bytes, &w.key_index))
+        .collect();
+    assert!(
+        want.iter().all(|w| w.key_index.len() == 2),
+        "fixture: every object's bucket for the trace is non-empty, so each probe decodes one"
+    );
+
+    let value = lookup(&app, NOW_NS, &trace).await;
+    assert_eq!(
+        value["data"]["rows"],
+        serde_json::json!([["t-0"], ["t-1"]]),
+        "{value}"
+    );
+    let key_reads: Vec<GetRange> = want.iter().flat_map(|r| r.key_index.clone()).collect();
+    assert_eq!(
+        phase(&value, "keyIndex", "decompressedOutputBytes"),
+        decoded.iter().sum::<u64>(),
+        "per object {decoded:?}: {value}"
+    );
+    assert_eq!(
+        phase(&value, "keyIndex", "s3GetRequests"),
+        key_reads.len() as u64,
+        "{value}"
+    );
+    assert_eq!(
+        phase(&value, "keyIndex", "s3GetWireBytes"),
+        key_reads.iter().map(len).sum::<u64>(),
+        "{value}"
+    );
+    // Buckets this small: the frame header and zstd framing make
+    // the wire figure the larger one.
+    assert!(
+        decoded.iter().sum::<u64>() < key_reads.iter().map(len).sum::<u64>(),
+        "{decoded:?}"
+    );
+}

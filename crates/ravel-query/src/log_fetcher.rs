@@ -59,7 +59,7 @@ use crate::erasure::ErasurePredicate;
 use crate::fetcher::{MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT, ReadCache, bound_runs, gate_not_run};
 use crate::phase_accounting::{PhaseAccounting, PhaseWireByteCounter, QueryPhase};
 use crate::reserved_bytes::attach_reservation;
-use crate::span_fetcher::KeyIndexPruning;
+use crate::span_fetcher::{KeyIndexPruning, key_idx_frame_decompressed_len};
 use bytes::Bytes;
 use ravel_cache::{CacheKey, ReadOutcome, SingleFlightError};
 use ravel_catalog::{SegmentLevel, SegmentRef};
@@ -2566,6 +2566,7 @@ impl LogSegmentFetcher {
             return Ok(KeyIndexPruning::default());
         }
         let phase = PhaseAccounting::new();
+        phase.set_access_intent(plan_accounting.access_intent());
         let accounting = phase.plan();
         let fetch_span = tracing::debug_span!(
             "page_fetch",
@@ -6422,7 +6423,9 @@ impl BlockRangeFetcher {
     /// object key). `Some(Absent)` when any arm is absent (the arms are a
     /// conjunction), else `Some(Present)` with the intersection of the
     /// present arms' block sets. A failed read is a typed error, never a
-    /// fallback.
+    /// fallback. Its decompressed bytes, charged to `accounting`, are the
+    /// prefix's length once it parses (stored as is) plus each decoded
+    /// bucket's declared length.
     #[allow(clippy::too_many_arguments)]
     async fn probe_key_index(
         &self,
@@ -6461,10 +6464,23 @@ impl BlockRangeFetcher {
             )
             .await?;
         let mut present: Option<Vec<u32>> = None;
+        let mut prefix_charged = false;
         for arm in keys {
-            let answer = match locate_key(footer, &arm.field, arm.key_type, &arm.key8, &prefix) {
-                Ok(KeyProbeStep::Done(answer)) => answer,
-                Ok(KeyProbeStep::Bucket(bucket)) => {
+            let step = match locate_key(footer, &arm.field, arm.key_type, &arm.key8, &prefix) {
+                Ok(step) => step,
+                Err(err) => {
+                    fall_back(err);
+                    return Ok(None);
+                }
+            };
+            // Every arm parses the same prefix; it is charged once.
+            if !prefix_charged {
+                accounting.add_decompressed_bytes(prefix.len() as u64);
+                prefix_charged = true;
+            }
+            let answer = match step {
+                KeyProbeStep::Done(answer) => answer,
+                KeyProbeStep::Bucket(bucket) => {
                     let frame = self
                         .key_index_read(
                             seg_ref,
@@ -6476,16 +6492,16 @@ impl BlockRangeFetcher {
                         )
                         .await?;
                     match bucket.finish(&frame) {
-                        Ok(answer) => answer,
+                        Ok(answer) => {
+                            accounting
+                                .add_decompressed_bytes(key_idx_frame_decompressed_len(&frame));
+                            answer
+                        }
                         Err(err) => {
                             fall_back(err);
                             return Ok(None);
                         }
                     }
-                }
-                Err(err) => {
-                    fall_back(err);
-                    return Ok(None);
                 }
             };
             match answer {
@@ -13413,6 +13429,58 @@ mod read_gate_tests {
             stats,
             key_blocks: keyed.key_blocks,
             decompressed_bytes: plan_accounting.snapshot().decompressed_bytes,
+        }
+    }
+
+    /// `probe_segment_keyed` reads under the caller's access intent: under
+    /// BulkScan the extents it admits (the footer probe and the KEY_IDX
+    /// reads, each its own GET past a 64-byte tail) land in the cache's bulk
+    /// region, and under Interactive none does.
+    ///
+    /// FLIP: without `phase.set_access_intent(plan_accounting.access_intent())`
+    /// in `probe_segment_keyed` the BulkScan pass admits as Interactive and
+    /// the bulk bookkeeping reads 0.
+    #[tokio::test]
+    async fn the_key_probe_admits_under_the_callers_intent() {
+        for intent in [AccessIntent::BulkScan, AccessIntent::Interactive] {
+            let (store, seg_ref) =
+                fixture_with_key_index(vec![("request.id".to_string(), KeyType::Str)]).await;
+            let backend: Arc<dyn ObjectStoreBackend> = store;
+            let cache = Arc::new(ravel_cache::Cache::<crate::fetcher::CacheFetchError>::new(
+                ravel_cache::CacheLimits::new(16 << 20, 1024, 16 << 20),
+            ));
+            let fetcher = LogSegmentFetcher::new(backend)
+                .with_block_range_threshold(0)
+                .with_suffix_len(64)
+                .with_cache(Arc::clone(&cache));
+            let plan_accounting = QueryAccounting::new();
+            plan_accounting.set_access_intent(intent);
+            let key_accounting = QueryAccounting::new();
+            let pruning = fetcher
+                .probe_segment_keyed(
+                    &seg_ref,
+                    TENANT,
+                    &keyed_on_r2(LogQuery::new(i64::MIN, i64::MAX)),
+                    &plan_accounting,
+                    &key_accounting,
+                )
+                .await
+                .expect("key probe");
+            assert_eq!(
+                pruning,
+                KeyIndexPruning::default(),
+                "{intent:?}: r2 is present"
+            );
+            assert!(
+                key_accounting.snapshot().decompressed_bytes > 0,
+                "{intent:?}: the probe read KEY_IDX"
+            );
+            assert!(!cache.is_empty(), "{intent:?}: the probe admitted nothing");
+            let bulk = cache.bulk_bookkeeping_bytes();
+            match intent {
+                AccessIntent::BulkScan => assert!(bulk > 0, "admitted outside the bulk region"),
+                _ => assert_eq!(bulk, 0, "{intent:?}"),
+            }
         }
     }
 

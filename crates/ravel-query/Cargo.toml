@@ -23,6 +23,10 @@ ravel-logseg = { workspace = true }
 # so this edge is acyclic; it mirrors the existing ravel-logseg dependency the
 # log fetch path uses.
 ravel-rspan = { workspace = true }
+# KEY_IDX_ENTRY_LEN: a decoded bucket frame's declared length, charged to the
+# keyIndex phase's decompressed bytes. Already in this graph through
+# ravel-logseg and ravel-rspan.
+ravel-codec = { workspace = true }
 ravel-catalog = { workspace = true }
 # ADR-0010 §7 record-key reconstruction and verification (`keys::commit_key`,
 # `keys::compaction_record_key`, `keys::verify_object_key` and the record
