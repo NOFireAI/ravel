@@ -453,8 +453,8 @@ impl Setup {
         self.cache = false;
         self
     }
-    /// Fan the scan out across `partitions`. Whole row groups are dealt to
-    /// partitions (ADR-2414 decision A1), and with the default group size a
+    /// Fan the scan out across `partitions`. Partitions take whole row groups
+    /// (ADR-2414 decision A1), and with the default group size a
     /// segment's four blocks are one group, so each segment goes whole to one
     /// partition; [`Setup::group_blocks`] splits a segment into several groups
     /// that can land on different partitions. Only the result set and the
@@ -870,9 +870,8 @@ async fn has_word_reaches_the_same_rows_through_the_striped_path() {
 }
 
 /// The same `has_word` statement fanned across four partitions. With the
-/// default group size a segment's four blocks are one row group, so the deal
-/// hands each segment whole to one partition (segments 0 to 3 to partitions 0 to
-/// 3); a segment is not split here, and the row refs of a partition's blocks are
+/// default group size a segment's four blocks are one row group, so each
+/// segment is taken whole by one partition; a segment is not split here, and the row refs of a partition's blocks are
 /// positions in that segment's survivor list, which is not the identity either
 /// (segment 0's survivors are blocks 0, 1 and 3). The split-group case is
 /// `split_row_groups_address_the_surviving_block_through_the_plan_list`.
