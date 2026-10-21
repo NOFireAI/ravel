@@ -172,7 +172,39 @@ impl Rustfs {
 
     /// Create the bucket with a one-shot AWS CLI container. The RustFS container
     /// this harness starts has no volume, so the bucket never pre-exists.
+    /// Creates the bucket with the host's `aws` binary when there is one
+    /// (GitHub-hosted runners ship it), and otherwise with the pinned
+    /// `AWS_CLI_IMAGE`. The host path keeps the lane off public.ecr.aws's
+    /// anonymous pull quota, which runners share and exhaust.
     fn make_bucket(&self) {
+        let host_aws = Command::new("aws")
+            .arg("--version")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if host_aws {
+            let status = Command::new("aws")
+                .env("AWS_ACCESS_KEY_ID", RUSTFS_USER)
+                .env("AWS_SECRET_ACCESS_KEY", RUSTFS_PASSWORD)
+                .env("AWS_DEFAULT_REGION", "us-east-1")
+                .env("AWS_EC2_METADATA_DISABLED", "true")
+                .env_remove("AWS_PROFILE")
+                .env_remove("AWS_SESSION_TOKEN")
+                .args([
+                    "--endpoint-url",
+                    &self.endpoint,
+                    "s3api",
+                    "create-bucket",
+                    "--bucket",
+                    BUCKET,
+                ])
+                .status()
+                .expect("run the host aws CLI");
+            assert!(
+                status.success(),
+                "the host aws CLI failed to create the bucket"
+            );
+            return;
+        }
         let status = Command::new("docker")
             .args([
                 "run",
