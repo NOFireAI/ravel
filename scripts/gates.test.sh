@@ -116,6 +116,7 @@ esql_test='==> cargo nextest run --locked -p ravel-server --features esql'
 stage_clippy='==> cargo clippy --locked -p ravel-logseg -p ravel-ingest --features stage-timing --all-targets -- -D warnings'
 cli_explain_clippy='==> cargo clippy --locked -p ravel-cli --features sql-explain --all-targets -- -D warnings'
 cli_explain_test='==> cargo nextest run --locked -p ravel-cli --features sql-explain'
+ingest_shipping_clippy='==> cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings'
 
 # --- gates.sh --dry-run -------------------------------------------------
 
@@ -161,8 +162,10 @@ check_eq "gates -p ravel-logseg: exit 0" "0" "${rc}"
 check_eq "gates -p ravel-logseg: ravel-ingest in the closure" "1" \
   "$(count_matching "${out}" '^==> closure of -p ravel-logseg: (.* )?ravel-ingest( |$)')"
 check_eq "gates -p ravel-logseg: scoped clippy names ravel-ingest" "1" \
-  "$(count_matching "${out}" '^==> cargo clippy --locked (-p [a-z-]+ )*-p ravel-ingest (-p [a-z-]+ )*--all-targets')"
+  "$(count_matching "${out}" '^==> cargo clippy --locked -p ravel-logseg (-p [a-z-]+ )*-p ravel-ingest (-p [a-z-]+ )*--all-targets')"
 check_eq "gates -p ravel-logseg: stage-timing lane" "1" "$(count "${out}" "${stage_clippy}")"
+check_eq "gates -p ravel-logseg: ravel-ingest shipping-features clippy" "1" \
+  "$(count "${out}" "${ingest_shipping_clippy}")"
 
 # -p ravel-cli: the sql-explain lane, and no lane of a crate outside it.
 run_stubbed cli bash "${SCRIPTS}/gates.sh" -p ravel-cli --dry-run
@@ -195,6 +198,8 @@ check_eq "gates -p ravel-affinity: closure" "1" \
 check_eq "gates -p ravel-affinity: scoped clippy" "1" \
   "$(count "${out}" '==> cargo clippy --locked -p ravel-affinity -p ravel-ingest-router --all-targets -- -D warnings')"
 check_eq "gates -p ravel-affinity: no feature lane" "0" "$(count_matching "${out}" '--features')"
+check_eq "gates -p ravel-affinity: no ravel-ingest shipping-features clippy" "0" \
+  "$(count "${out}" "${ingest_shipping_clippy}")"
 
 # -p ravel-esql: ravel-sql and ravel-server depend on it, so the esql lane
 # runs, and with it the lanes that follow ravel-server.
@@ -221,6 +226,8 @@ check_eq "gates --dry-run: sql lane" "1" "$(count "${out}" "${sql_clippy}")"
 check_eq "gates --dry-run: flight-sql lane" "1" "$(count "${out}" "${flight_clippy}")"
 check_eq "gates --dry-run: esql lane" "1" "$(count "${out}" "${esql_clippy}")"
 check_eq "gates --dry-run: sql-explain lane" "1" "$(count "${out}" "${cli_explain_clippy}")"
+check_eq "gates --dry-run: ravel-ingest shipping-features clippy" "1" \
+  "$(count "${out}" "${ingest_shipping_clippy}")"
 check_eq "gates --dry-run: feature lane clippy runs" "7" \
   "$(count_matching "${out}" '^==> cargo clippy --locked .*--features ')"
 check_eq "gates --dry-run: no cargo call" "0" "$(wc -l <"${tmp}/workspace.calls" | tr -d ' ')"

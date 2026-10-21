@@ -126,7 +126,11 @@ stage-timing in both crates transitively, but a `-p ravel-bench` selection
 builds them as dependencies and cargo never compiles a dependency's
 `#[cfg(test)]` module, so their own gated tests run in neither.
 gates.sh also runs a `-p ravel-cli --features sql-explain` clippy and test
-lane whenever ravel-cli is in scope, matching CI's `features` job. Do
+lane whenever ravel-cli is in scope, matching CI's `features` job. And
+it runs `cargo clippy -p ravel-ingest --all-targets` on its own whenever
+ravel-ingest is in scope, matching the `lint` job: a selection that also
+holds ravel-bench turns ravel-ingest's `flush-input-bytes` feature on, so
+the scoped and workspace clippy runs never lint ravel-ingest as it ships. Do
 not skip them: a workspace gate can print "All gates passed" on a tree where
 a feature lane fails. For `flight-sql`, `esql` and the ravel-bench features
 that is because the default workspace gate never compiles them. For `sql` it is

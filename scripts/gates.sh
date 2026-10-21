@@ -280,6 +280,7 @@ want_esql=0
 want_bench=0
 want_stage_timing=0
 want_cli_sql_explain=0
+want_ingest_shipping=0
 if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_sql=1
   want_flight_sql=1
@@ -287,6 +288,7 @@ if [[ ${#crate_args[@]} -eq 0 ]]; then
   want_bench=1
   want_stage_timing=1
   want_cli_sql_explain=1
+  want_ingest_shipping=1
 else
   for c in "${gate_crates[@]}"; do
     case "${c}" in
@@ -310,6 +312,9 @@ else
     esac
     case "${c}" in
       ravel-cli) want_cli_sql_explain=1 ;;
+    esac
+    case "${c}" in
+      ravel-ingest) want_ingest_shipping=1 ;;
     esac
   done
 fi
@@ -360,6 +365,14 @@ run_feature_lanes() {
   # `cli-sql-explain` features leg.
   if [[ ${want_cli_sql_explain} -eq 1 ]]; then
     run_feature_lane sql-explain -p ravel-cli
+  fi
+
+  # ravel-ingest as it ships, with `flush-input-bytes` off. Any selection that
+  # also holds ravel-bench, the workspace and every scoped closure of
+  # ravel-ingest included, unifies that feature on through ravel-bench's
+  # dev-dependency. Mirrors the `lint` job's shipping-features clippy step.
+  if [[ ${want_ingest_shipping} -eq 1 ]]; then
+    run cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings
   fi
 }
 

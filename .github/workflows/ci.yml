@@ -999,11 +999,11 @@ jobs:
   #    else, so the SQL handler, its error-to-HTTP redaction boundary and
   #    services/ravel-server/tests/sql_endpoint.rs run without the rest of
   #    the workspace's features. A separate `--features sql` run used to
-  #    precede it and ran the same suite twice (#3131). What it alone
-  #    covered is covered elsewhere: the sql-alone compile by the `lint`
-  #    job's `--features sql --all-targets` clippy, and the
-  #    `not(feature = "esql")` code by the `flight-sql` job, which selects
-  #    sql without esql under the same sql_area gate.
+  #    precede it and ran the same suite twice (#3131). The sql-alone
+  #    compile it gave is now the `lint` job's `--features sql
+  #    --all-targets` clippy. The `flight-sql` job compiles ravel-server
+  #    with sql on and esql off in a selection of its own, under the same
+  #    sql_area gate; no test exercises the `not(feature = "esql")` code.
   # 2. The layer-2 differential gate
   #    (crates/ravel-sql/tests/differential.rs) is only as strong as the
   #    number of proptest cases it runs. `check` runs it at the in-file
@@ -1086,11 +1086,6 @@ jobs:
   # Gated on sql_area like `sql`, and required like `sql`. When renaming this
   # job, update main's required status checks in the same change, or the
   # tests silently stop blocking again.
-  #
-  # Its `-p ravel-server --features flight-sql` run is also the only test run
-  # of ravel-server with `esql` off, since the `sql` job runs `--features
-  # esql` (#3131). Narrowing that selection, or adding `esql` to it, removes
-  # the only coverage of the `not(feature = "esql")` code.
   flight-sql:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
