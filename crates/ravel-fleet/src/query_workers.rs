@@ -874,6 +874,11 @@ mod tests {
         );
         assert_eq!(live.len(), 1, "only self survives");
         assert_eq!(live[0].process_id, a.process_id().to_string());
+        assert_eq!(
+            a.record_rejects().by_reason().map(|(_, n)| n),
+            [0; 4],
+            "a skip for staleness alone is not a reject"
+        );
     }
 
     /// A record whose body `process_id` disagrees with the id its key names is
@@ -1036,6 +1041,11 @@ mod tests {
             "a far-future-dated record must not read as live"
         );
         assert_eq!(live.len(), 1, "only self survives");
+        assert_eq!(
+            a.record_rejects().by_reason().map(|(_, n)| n),
+            [0; 4],
+            "a fetched, verified record skipped for its stamp is not a reject"
+        );
     }
 
     /// `live_set` pays one GET per LIVE sibling, not per listed key (issue
