@@ -1038,11 +1038,15 @@ Which template each ServiceAccount's role gets, for a cluster named
 | `<name>-qualify` | the store-qualification Job | `admin.json` |
 | `ravel-operator` (namespace `ravel-system`) | the operator's own `sys/auth` and reshard writes | `admin.json` |
 
-Admin is broader than either of the last two needs: qualification touches
-only `sys/qualify/<run>/` and `sys/qualification`, and the operator only
-`sys/auth` and the reshard records. No narrower shipped template exists yet,
-so a deployment that wants least privilege trims a copy of `admin.json` to
-those keys.
+Admin is broader than either of the last two needs. Qualification puts,
+gets, lists and deletes objects under its scratch prefix
+`sys/qualify/<run>/` and writes the `sys/qualification` record; it also
+reads the bucket configuration for its informational lines, which no
+template grants (see "Bucket-configuration reads" above). The operator
+touches only `sys/auth` and the reshard records. No narrower shipped template
+exists yet. A deployment that wants least privilege trims a copy of
+`admin.json`, keeping its object and `s3:ListBucket` statements for those
+keys and that prefix, and checks the result with a qualification run.
 
 Every pod also runs a credentials sidecar that fetches the role's
 credentials from the node-local Pod Identity agent at `169.254.170.23:80`

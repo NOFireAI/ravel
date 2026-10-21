@@ -190,7 +190,10 @@ tag can point at a different image after you have reviewed the manifest. A
 digest cannot. Pin `RAVEL_CREDENTIALS_SIDECAR_IMAGE` in the same manifest to
 the same reference: it names the image of the credentials sidecar the
 operator renders under `storage.s3.auth: podIdentity`, which is the operator
-image itself (see [Pod Identity](#pod-identity)).
+image itself (see [Pod Identity](#pod-identity)). A kustomize `images:`
+override rewrites the container's `image:` but not this env value, so
+change the env with its own patch and check that the rendered manifest
+carries the same reference in both places.
 
 `crd.yaml` is generated from the Rust spec types. To regenerate it, run
 `cargo run -p ravel-operator -- --print-crd`.
@@ -1084,9 +1087,13 @@ Each of the operator's three Deployments maps to one storage credential role:
 | `<name>-query` | `query` | Query | Reads commit and catalog objects, folds only through the on-demand fold route, appends query audit, and creates Parquet table manifest versions for `CREATE EXTERNAL TABLE` and `DROP TABLE` (create only, never an overwrite). Deletes only its own bucket-probe scratch objects under `sys/pq-probe/`: no data, catalog or control-plane object. |
 | `<name>-maintain` | `maintain` | Maintain | Compaction, retention, sweep and the scheduled catalog fold, so it writes catalog snapshot parts, `HEAD` and index objects. The only one granted delete over durable data: `l0/`, `l1/`, `c/`, `idem/`, the query-audit shard `t/*/u/*/0001/*`, `del/*.dreq` erasure requests and superseded Parquet table manifests `t/*/pq/t/*`. It also deletes superseded catalog snapshot parts and index objects, quarantined copies and dead worker records. |
 
-A fourth role, **Admin**, backs `ravel-cli`. The operator does not manage it:
-there is no CRD field for it and no pod runs it. Only out-of-band operator/CI
-invocations use it. See
+A fourth role, **Admin**, backs `ravel-cli`. Under `storage.s3.auth: static`
+the operator does not manage it: there is no CRD field for it and no pod runs
+it. Only out-of-band operator/CI invocations use it. Under
+`storage.s3.auth: podIdentity` the qualify Job's `<name>-qualify` account and
+the operator's own account get the Admin role through their Pod Identity
+associations until a narrower template exists (see
+[Pod Identity](#pod-identity)). See
 [the Admin credential](operations/deployment.md#the-admin-credential).
 
 The exact per-role AWS IAM policy JSON, the RustFS equivalent for dev/CI, and
@@ -1227,10 +1234,21 @@ How the credentials reach a pod:
 The operator needs to know its own image to render the sidecar. The shipped
 `operator.yaml` sets `RAVEL_CREDENTIALS_SIDECAR_IMAGE`
 (`--credentials-sidecar-image`) to the same image as the operator container.
-Pin both to the same tag and digest. A `podIdentity` cluster reconciled by
-an operator without it reports `Degraded` with reason
+Pin both to the same tag and digest. A kustomize `images:` override does not
+reach the env value, so patch it separately. A `podIdentity` cluster
+reconciled by an operator without it reports `Degraded` with reason
 `CredentialsSidecarImageUnset` and renders nothing, the qualify Job
 included.
+
+The sidecar image is part of every tier's pod template. An operator upgrade
+that changes the operator image therefore rolls every gateway, query and
+maintain pod of a `podIdentity` cluster, which a `static` cluster's upgrade
+does not.
+
+The sidecar writes the file as the operator image's user, the distroless
+`nonroot` user (UID 65532), and the operator sets no `runAsUser`. A custom
+`spec.image` must run as that same user, as the shipped server image does,
+or the server cannot read the mode-0600 file.
 
 What else changes under `podIdentity`:
 
@@ -1273,7 +1291,12 @@ Under the per-role policies, only Maintain and Admin can write it.
   `Degraded=True` with reason `GcBootstrapStalled`. The message names the
   maintain Deployment and its ready and unavailable replica counts. Maintain
   is then stuck, usually because of a wrong `maintain.credentialsSecretRef`
-  or a bad maintain image. Check those and the maintain pod's logs.
+  or a bad maintain image. Check those and the maintain pod's logs. Under
+  `storage.s3.auth: podIdentity` also check that `<name>-maintain` has a
+  Pod Identity association and that the pod's `pod-identity-credentials`
+  sidecar can reach the agent: its logs name the missing variables or the
+  failed fetch, and its startup probe holds the server container until it
+  has written the file.
 - **Maintain disabled.** With `maintain.enabled: false` under per-role
   Secrets, the operator still applies the gateway and query Deployments.
   Their pods restart until `sys/gc` exists, and the cluster reports
