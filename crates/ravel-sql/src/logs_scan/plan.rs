@@ -9,7 +9,8 @@ pub(super) struct PlanCounts {
     pub(super) segs: Vec<Option<SegPlan>>,
     /// Per segment, in snapshot order: relevant and accepted by
     /// [`may_skip_plan`] in a scan that [`skips_sub_bound_plans`], so not
-    /// planned (ADR-2677 decision 2). All
+    /// planned (ADR-2677 decision 2), and not dropped by a KEY_IDX probe
+    /// ([`LogSegmentFetcher::probe_segment_keyed`]). All
     /// false otherwise. Its owner opens it whole, once, and prunes its
     /// blocks from that read ([`open_segment_whole`]); its `segs` entry is
     /// `None`.
@@ -259,9 +260,10 @@ type PlanSegmentResult = Option<(
 /// Whether this scan opens its segments at or under
 /// [`LogSegmentFetcher::plan_whole_object_bound`] unplanned (ADR-2677
 /// decision 2): true when the scan holds at least `target_partitions` of them
-/// that are relevant to the query window and [`may_skip_plan`] accepts (a
-/// keyed query plans every segment above the block-range threshold, so its
-/// KEY_IDX is probed). Counted over the whole segment list
+/// that are relevant to the query window ([`may_skip_plan`]). A keyed query
+/// counts the ones above the block-range threshold too: the plan pass probes
+/// their KEY_IDX instead of planning them, and leaves unplanned every one the
+/// probe does not drop. Counted over the whole segment list
 /// once, inside the shared plan pass, so every partition routes every segment
 /// the same way.
 ///
@@ -289,15 +291,19 @@ fn skips_sub_bound_plans(
 }
 
 /// Whether `seg` is one [`skips_sub_bound_plans`] may open unplanned: at or
-/// under [`LogSegmentFetcher::plan_whole_object_bound`], and, for a query
-/// with KEY_IDX equalities, also at or under
-/// [`LogSegmentFetcher::block_range_threshold`]. Above the threshold the
-/// keyed plan probes KEY_IDX and drops the object when a key is absent,
-/// which the unplanned whole open would read in full.
+/// under [`LogSegmentFetcher::plan_whole_object_bound`]. For a query with
+/// KEY_IDX equalities one above [`LogSegmentFetcher::block_range_threshold`]
+/// is probed first ([`LogSegmentFetcher::probe_segment_keyed`]) and opened
+/// only when no key is absent.
 fn may_skip_plan(ctx: &PartitionCtx, seg: &SegmentRef) -> bool {
     !ctx.fetcher.plans_segment(seg)
-        && (ctx.query.key_equals.is_empty()
-            || seg.object_size <= ctx.fetcher.block_range_threshold())
+}
+
+/// One plan-pass read: the plan of a planned segment, or the KEY_IDX probe of
+/// a keyed segment the scan opens unplanned.
+enum PlanPassRead {
+    Planned(Box<ravel_query::KeyedSegmentPlan>),
+    Probed(KeyIndexPruning),
 }
 
 /// Prune every segment once (no block decode) to build the shared block plan.
@@ -363,19 +369,39 @@ async fn compute_plan_counts(
         // object whole only to count its survivors, so the scan reads it once
         // instead, when the scan has enough such segments to fill its
         // partitions (see `skips_sub_bound_plans`).
-        if skip_sub_bound && may_skip_plan(ctx, seg) {
-            unplanned[idx] =
-                LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns);
-            continue;
+        // ADR-2707 decision 5: a keyed one above the block-range threshold is
+        // probed here instead, and left unplanned unless a key is absent.
+        let probe_only = skip_sub_bound && may_skip_plan(ctx, seg);
+        if probe_only {
+            if !LogSegmentFetcher::ts_range_relevant(seg, ctx.query.ts_min_ns, ctx.query.ts_max_ns)
+            {
+                continue;
+            }
+            if ctx.query.key_equals.is_empty()
+                || seg.object_size <= ctx.fetcher.block_range_threshold()
+            {
+                unplanned[idx] = true;
+                continue;
+            }
         }
-        let prune = ctx.fetcher.plan_segment_keyed(
-            seg,
-            ctx.tenant_hash,
-            &ctx.query,
-            ctx.phase_accounting.plan(),
-            ctx.phase_accounting.key_index(),
-        );
-        prunes.push(async move { (idx, prune.await) });
+        prunes.push(async move {
+            let (plan, key_index) = (
+                ctx.phase_accounting.plan(),
+                ctx.phase_accounting.key_index(),
+            );
+            let read = if probe_only {
+                ctx.fetcher
+                    .probe_segment_keyed(seg, ctx.tenant_hash, &ctx.query, plan, key_index)
+                    .await
+                    .map(PlanPassRead::Probed)
+            } else {
+                ctx.fetcher
+                    .plan_segment_keyed(seg, ctx.tenant_hash, &ctx.query, plan, key_index)
+                    .await
+                    .map(|plan| PlanPassRead::Planned(Box::new(plan)))
+            };
+            (idx, read)
+        });
     }
     let budget = plan_concurrency.max(1);
     let mut stream = futures::stream::iter(prunes).buffer_unordered(budget);
@@ -393,7 +419,14 @@ async fn compute_plan_counts(
     let mut carried_seen = 0usize;
     let mut key_index = KeyIndexPruning::default();
     while let Some((idx, entry)) = stream.next().await {
-        let keyed = entry.map_err(SqlError::from)?;
+        let keyed = match entry.map_err(SqlError::from)? {
+            PlanPassRead::Planned(keyed) => *keyed,
+            PlanPassRead::Probed(probe) => {
+                key_index.segments_pruned += probe.segments_pruned;
+                unplanned[idx] = probe.segments_pruned == 0;
+                continue;
+            }
+        };
         key_index.segments_pruned += keyed.key_index.segments_pruned;
         key_index.blocks_pruned += keyed.key_index.blocks_pruned;
         let entry: PlanSegmentResult = keyed.plan;

@@ -1241,15 +1241,20 @@ This is #3117, the q20 bottleneck the T12 acceptance amendment names.
 For logs, decision 5's "every uncovered candidate" now reads "every
 uncovered candidate above the block-range threshold", whatever the
 break-even. `plan_segment_keyed` in `crates/ravel-query/src/log_fetcher.rs`
-gates the probe on `block_range_threshold`, and `may_skip_plan` in
-`crates/ravel-sql/src/logs_scan/plan.rs` keeps every segment above the
-threshold out of the unplanned set for a query with key equalities. An
-object the probe proves the key absent from is dropped. An object between
-the threshold and the whole-object bound that holds the key, or whose keys
-all decline, is read whole after the probe's reads, as the unkeyed plan
-reads it; only above the bound does a present key restrict the read to the
-KEY_IDX block set. An object at or under the threshold is read whole and not
-probed. `services/ravel-server/tests/sql_logs_key_index_probe_bound.rs` pins
-both routes and the threshold.
+gates the probe on `block_range_threshold`. On the unplanned route,
+`compute_plan_counts` in `crates/ravel-sql/src/logs_scan/plan.rs` probes each
+segment the scan may open unplanned that lies above the threshold, through
+`probe_segment_keyed`, which shares the tail read and KEY_IDX probe with
+`plan_segment_keyed` and reads nothing else, and plans none of them. The cost
+is exact: one probe per keyed object above the threshold (its tail read, the
+KEY_IDX prefix, and at most one bucket per key). An object the probe proves
+the key absent from is dropped with no other read. An object between the
+threshold and the whole-object bound that holds the key, or whose keys all
+decline, is then read whole once, with no second read: on the planned route
+where the unkeyed plan reads it (by the scan when the skip index alone decides
+the survivor count, #761), and by the scan on the unplanned route. Only above the bound does a present key restrict the read to
+the KEY_IDX block set. An object at or under the threshold is read whole and
+not probed. `services/ravel-server/tests/sql_logs_key_index_probe_bound.rs`
+pins both routes, the single whole read, and the threshold.
 
 Refs: #3117, #2961, #2762

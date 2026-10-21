@@ -1301,13 +1301,13 @@ async fn an_object_indexed_under_the_old_type_declines_after_a_retype() {
     assert_eq!(pruning(&v, "blocksPrunedByKeyIndex"), 0);
 }
 
-/// At or under the fetcher's whole-object bound an object is planned with no
-/// KEY_IDX read; one byte above it the probe runs. The bound defaults to
-/// 512 KiB. Each case pairs the object under test with one well above the
-/// bound, so the scan plans both rather than reading a lone small object
+/// At or under the fetcher's block-range threshold an object is planned with
+/// no KEY_IDX read; one byte above it the probe runs. The threshold defaults
+/// to 512 KiB. Each case pairs the object under test with one well above the
+/// threshold, so the scan plans both rather than reading a lone small object
 /// unplanned.
 #[tokio::test]
-async fn the_probe_runs_only_above_the_whole_object_bound() {
+async fn the_probe_runs_only_above_the_block_range_threshold() {
     let sql = "SELECT substr(body, 1, 6) AS id FROM logs WHERE status_code = 500 ORDER BY id";
     // The first 64 records of object 0 (record 50 holds 500, record 85 is
     // cut), then object 1, which holds no 500.

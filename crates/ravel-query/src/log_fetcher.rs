@@ -196,11 +196,13 @@ pub struct LogQuery {
     /// own fetch funnels.
     pub erasure: Vec<ErasurePredicate>,
     /// Prune-only KEY_IDX equalities, ANDed. Only
-    /// [`LogSegmentFetcher::plan_segment_keyed`] reads them: it probes the
-    /// KEY_IDX section of each planned object above the block-range threshold,
-    /// drops the object when an arm is absent, and above the whole-object
-    /// bound restricts the blocks read to the intersection of the answers. Every other entry point ignores them, so
-    /// they never remove a record, only block reads.
+    /// [`LogSegmentFetcher::plan_segment_keyed`] and
+    /// [`LogSegmentFetcher::probe_segment_keyed`] read them: each probes the
+    /// KEY_IDX section of an object above the block-range threshold and drops
+    /// the object when an arm is absent, and the planned route, above the
+    /// whole-object bound, restricts the blocks read to the intersection of the
+    /// answers. Every other entry point ignores them, so they never remove a
+    /// record, only block reads.
     pub key_equals: Vec<KeyEquals>,
 }
 
@@ -1544,9 +1546,10 @@ impl LogSegmentFetcher {
     /// [`plan_segment`](Self::plan_segment)'s two guards,
     /// [`plan_segment_block_stats`](Self::plan_segment_block_stats), and the
     /// log-series route's STREAM_DIR read. The KEY_IDX probe of
-    /// [`plan_segment_keyed`](Self::plan_segment_keyed) is the exception: it
-    /// gates on [`Self::block_range_threshold`]. Public so the SQL executor's I/O
-    /// shape reports a read's dependency depth against the bound the plan
+    /// [`plan_segment_keyed`](Self::plan_segment_keyed) and
+    /// [`probe_segment_keyed`](Self::probe_segment_keyed) is the exception: it
+    /// gates on [`Self::block_range_threshold`]. Public so the SQL executor's
+    /// I/O shape reports a read's dependency depth against the bound the plan
     /// routes on.
     #[must_use]
     pub fn plan_whole_object_bound(&self) -> u64 {
@@ -1564,8 +1567,10 @@ impl LogSegmentFetcher {
     /// the per-segment size test only: the SQL logs scan skips the plan for
     /// these segments only when it holds at least as many of them as target
     /// partitions, and plans them otherwise. For a query with [`KeyEquals`]
-    /// arms that scan also plans every segment above
-    /// [`Self::block_range_threshold`], so its KEY_IDX is probed.
+    /// arms that scan probes the KEY_IDX of each skipped segment above
+    /// [`Self::block_range_threshold`] first
+    /// ([`probe_segment_keyed`](Self::probe_segment_keyed)) and opens it only
+    /// when no arm is absent.
     #[must_use]
     pub fn plans_segment(&self, seg_ref: &SegmentRef) -> bool {
         seg_ref.object_size > self.plan_whole_object_bound()
@@ -2529,6 +2534,70 @@ impl LogSegmentFetcher {
             plan: Some((survivors, dirs, stats, Some(*footer), None)),
             key_blocks: Some(kept),
             key_index,
+        })
+    }
+
+    /// The KEY_IDX probe of [`plan_segment_keyed`](Self::plan_segment_keyed)
+    /// without the plan, for a segment the caller opens whole and unplanned
+    /// (ADR-2677 decision 2) unless the probe drops it. It reads the footer
+    /// probe, charged to `plan_accounting`, and the KEY_IDX prefix and
+    /// buckets, charged to `key_index_accounting`, and nothing else: no
+    /// directory past the footer, no block.
+    ///
+    /// `segments_pruned` is 1 when an arm is absent, so no block of the object
+    /// is read. Otherwise nothing is pruned (the key is present, or the probe
+    /// declined) and the caller reads the object as it would with no key. On
+    /// the segments `plan_segment_keyed` does not probe (no arm, an object at
+    /// or under [`block_range_threshold`](Self::block_range_threshold), a span
+    /// outside the query window) this reads nothing and prunes nothing.
+    pub async fn probe_segment_keyed(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        query: &LogQuery,
+        plan_accounting: &QueryAccounting,
+        key_index_accounting: &QueryAccounting,
+    ) -> Result<KeyIndexPruning, LogFetchError> {
+        if query.key_equals.is_empty()
+            || seg_ref.object_size <= self.block_range_threshold
+            || seg_ref.min_event_ts_ns > seg_ref.max_event_ts_ns
+            || !Self::ts_range_relevant(seg_ref, query.ts_min_ns, query.ts_max_ns)
+        {
+            return Ok(KeyIndexPruning::default());
+        }
+        let phase = PhaseAccounting::new();
+        let accounting = phase.plan();
+        let fetch_span = tracing::debug_span!(
+            "page_fetch",
+            signal = "logs",
+            s3_requests = tracing::field::Empty,
+            s3_bytes = tracing::field::Empty,
+            probe_misses = tracing::field::Empty,
+        );
+        let result = self
+            .block_range
+            .fetch_key_probe(
+                seg_ref,
+                tenant_hash,
+                &query.key_equals,
+                accounting,
+                phase.key_index(),
+            )
+            .instrument(fetch_span.clone())
+            .await;
+        let result = self
+            .settle_version_refusal(seg_ref, QueryPhase::Plan, accounting, result)
+            .await;
+        let snapshot = phase.snapshot();
+        plan_accounting.merge_snapshot(snapshot.phase(QueryPhase::Plan));
+        key_index_accounting.merge_snapshot(snapshot.phase(QueryPhase::KeyIndex));
+        let (absent, fetch) = result?;
+        fetch_span.record("s3_requests", fetch.probe_gets + fetch.metadata_gets);
+        fetch_span.record("s3_bytes", fetch.block_bytes_fetched);
+        self.record_probe_misses(&fetch_span, &fetch, ProbePhase::Plan);
+        Ok(KeyIndexPruning {
+            segments_pruned: u64::from(absent),
+            blocks_pruned: 0,
         })
     }
 
@@ -6138,30 +6207,18 @@ impl BlockRangeFetcher {
         let key = seg_ref.data_object_key.as_str();
         let mut stats = BlockRangeStats::default();
         let pin = EtagPin::default();
-        let (footer, extents) = self
-            .probe_footer_extents(
+        let (footer, extents, resident, probe) = self
+            .probe_footer_and_keys(
                 seg_ref,
                 tenant_hash,
-                ReadPhases::PLAN.metadata,
+                &query.key_equals,
                 &pin,
                 accounting,
+                key_accounting,
                 &mut stats,
             )
             .await?;
-        let resident: Vec<(u64, Bytes)> =
-            extents.iter().map(|e| (e.start, e.bytes.clone())).collect();
-        let key_blocks = match self
-            .probe_key_index(
-                seg_ref,
-                tenant_hash,
-                &footer,
-                &resident,
-                &query.key_equals,
-                &pin,
-                key_accounting,
-            )
-            .await?
-        {
+        let key_blocks = match probe {
             Some(KeyProbe::Absent) => return Ok(KeyedPlanRead::Absent { fetch: stats }),
             Some(KeyProbe::Present(blocks)) if plan_present => blocks,
             Some(KeyProbe::Present(_) | KeyProbe::Declined) | None => {
@@ -6241,6 +6298,83 @@ impl BlockRangeFetcher {
             fetch: stats,
             key_blocks,
         })
+    }
+
+    /// The KEY_IDX probe of [`Self::fetch_keyed_plan`] alone, for an object
+    /// the caller reads whole whatever the probe finds unless an arm is
+    /// absent: the footer probe, charged to `accounting`, and the KEY_IDX
+    /// reads, charged to `key_accounting`, with no directory past the footer
+    /// and no block read. True when an arm is absent.
+    pub(crate) async fn fetch_key_probe(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        keys: &[KeyEquals],
+        accounting: &QueryAccounting,
+        key_accounting: &QueryAccounting,
+    ) -> Result<(bool, BlockRangeStats), LogFetchError> {
+        let mut stats = BlockRangeStats::default();
+        let (_, _, _, probe) = self
+            .probe_footer_and_keys(
+                seg_ref,
+                tenant_hash,
+                keys,
+                &EtagPin::default(),
+                accounting,
+                key_accounting,
+                &mut stats,
+            )
+            .await?;
+        Ok((matches!(probe, Some(KeyProbe::Absent)), stats))
+    }
+
+    /// The footer probe, charged to `accounting` as a plan read, then
+    /// [`Self::probe_key_index`] over its extents for every arm in `keys`:
+    /// the footer, the probe's extents, the same extents as resident bytes,
+    /// and the probe's answer.
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    async fn probe_footer_and_keys(
+        &self,
+        seg_ref: &SegmentRef,
+        tenant_hash: TenantHash,
+        keys: &[KeyEquals],
+        pin: &EtagPin,
+        accounting: &QueryAccounting,
+        key_accounting: &QueryAccounting,
+        stats: &mut BlockRangeStats,
+    ) -> Result<
+        (
+            footer::LogFooter,
+            Vec<PrimedExtent>,
+            Vec<(u64, Bytes)>,
+            Option<KeyProbe>,
+        ),
+        LogFetchError,
+    > {
+        let (footer, extents) = self
+            .probe_footer_extents(
+                seg_ref,
+                tenant_hash,
+                ReadPhases::PLAN.metadata,
+                pin,
+                accounting,
+                stats,
+            )
+            .await?;
+        let resident: Vec<(u64, Bytes)> =
+            extents.iter().map(|e| (e.start, e.bytes.clone())).collect();
+        let probe = self
+            .probe_key_index(
+                seg_ref,
+                tenant_hash,
+                &footer,
+                &resident,
+                keys,
+                pin,
+                key_accounting,
+            )
+            .await?;
+        Ok((footer, extents, resident, probe))
     }
 
     /// The reader's block prune over already-decoded directories (the POSTINGS

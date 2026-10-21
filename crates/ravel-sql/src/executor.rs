@@ -349,6 +349,10 @@ impl LaneTokens {
 /// The longest qualifier, in bytes, a refusal quotes back.
 const MAX_QUOTED_QUALIFIER_BYTES: usize = 64;
 
+/// The dependent reads a KEY_IDX probe adds to an object's read chain: the
+/// section's prefix, then one bucket (ADR-2707 decision 5).
+const KEY_IDX_PROBE_DEPTH: u32 = 2;
+
 /// The HTTP SQL statement path's token rule (ADR-2904 decision 3), applied
 /// from the statement text and the request alone, before any catalog request:
 ///
@@ -1028,6 +1032,9 @@ struct BlockCounts {
     /// here rather than in a second walk because one traversal already reads
     /// every node's metric set, and that read is the expensive part.
     histogram_series_skipped: u64,
+    /// Whether a `LogsScanExec` in the plan carries KEY_IDX equalities, so
+    /// the statement's I/O shape reports the keyed dependency depth.
+    keyed_logs_scan: bool,
 }
 
 /// Sum the `blocks_total` / `blocks_scanned` / `blocks_pruned_by_postings` /
@@ -1048,11 +1055,9 @@ fn accumulate_block_counts(plan: &Arc<dyn ExecutionPlan>, counts: &mut BlockCoun
     // whole `MetricsSet` out of its mutex, and with the per-segment timeline on
     // the set holds three labelled metrics per segment per partition. Folding
     // the timing here rather than in a second traversal halves both.
-    if plan
-        .downcast_ref::<crate::logs_scan::LogsScanExec>()
-        .is_some()
-    {
+    if let Some(scan) = plan.downcast_ref::<crate::logs_scan::LogsScanExec>() {
         counts.timing.scans += 1;
+        counts.keyed_logs_scan |= scan.has_key_equals();
     }
     if let Some(metrics) = plan.metrics() {
         let sum = |name: &str| metrics.sum_by_name(name).map_or(0, |v| v.as_usize() as u64);
@@ -2264,8 +2269,21 @@ impl SqlExecutor {
                 req.now_ns,
                 predicate_free,
             ));
-            let io_shape =
-                self.sql_io_shape(&lane_refs, &phase_accounting, unfolded_segments_resolved);
+            // Whether a logs scan probes KEY_IDX is known only once the plan
+            // has pushed its filters down, so both shapes are taken here and
+            // the attempt's plan picks one.
+            let io_shape = self.sql_io_shape(
+                &lane_refs,
+                &phase_accounting,
+                unfolded_segments_resolved,
+                false,
+            );
+            let keyed_io_shape = self.sql_io_shape(
+                &lane_refs,
+                &phase_accounting,
+                unfolded_segments_resolved,
+                true,
+            );
 
             let (result, emitted, blocks, spill, spill_by_operator, caps) = self
                 .attempt(
@@ -2321,7 +2339,11 @@ impl SqlExecutor {
                         accounting: phase_snapshot.pooled(),
                         phase_accounting: phase_snapshot,
                         signals: signal_stats(&lane_counts, &phase_accounting),
-                        io_shape,
+                        io_shape: if blocks.keyed_logs_scan {
+                            keyed_io_shape
+                        } else {
+                            io_shape
+                        },
                         estimate,
                         spill_by_operator,
                         target,
@@ -3783,23 +3805,36 @@ impl SqlExecutor {
     /// segments through that lane's own fetcher: the dependency depth is the
     /// deepest lane's, the service batches are the sum of each lane's, and the
     /// plan class is `Unclassified`.
+    ///
+    /// `keyed` is whether a logs scan of the statement carries KEY_IDX
+    /// equalities (ADR-2707 decision 5); see [`Self::io_shape_bounds`].
     fn sql_io_shape(
         &self,
         lanes: &[(TargetSignal, &Snapshot)],
         phase_accounting: &StatementAccounting,
         unfolded_segments_resolved: u64,
+        keyed: bool,
     ) -> QueryIoShape {
         let mut counts = IoShapeCounts::default();
         let concurrency = self.config.engine.sql_partition_count().max(1) as u64;
         let mut depth = 0;
         let mut service_batches = 0u32;
         for (target, snapshot) in lanes {
-            let (whole_object_threshold, shared_get_permits) = self.io_shape_bounds(*target);
+            let (whole_object_threshold, key_probe_depth, shared_get_permits) =
+                self.io_shape_bounds(*target, keyed);
             depth = snapshot
                 .segments
                 .iter()
                 .map(|seg| {
-                    ravel_query::io_shape::depth_for_object(seg.object_size, whole_object_threshold)
+                    let chain = ravel_query::io_shape::depth_for_object(
+                        seg.object_size,
+                        whole_object_threshold,
+                    );
+                    if seg.object_size > whole_object_threshold {
+                        chain + key_probe_depth
+                    } else {
+                        chain
+                    }
                 })
                 .fold(depth, u32::max);
             // The two bounds `service_batches` divides by, mirroring
@@ -3857,12 +3892,15 @@ impl SqlExecutor {
         )
     }
 
-    /// The whole-object bound and GET permit count of `target`'s fetcher, the
-    /// two per-lane inputs of [`Self::sql_io_shape`].
-    fn io_shape_bounds(&self, target: TargetSignal) -> (u64, u64) {
+    /// The per-lane inputs of [`Self::sql_io_shape`]: the size at or under
+    /// which `target`'s fetcher reads an object in one whole-object GET with no
+    /// dependent read, the dependent reads a keyed statement adds above it,
+    /// and the fetcher's GET permit count.
+    fn io_shape_bounds(&self, target: TargetSignal, keyed: bool) -> (u64, u32, u64) {
         match target {
             TargetSignal::Metrics => (
                 self.fetcher.whole_object_threshold(),
+                0,
                 self.fetcher.get_limiter_permits() as u64,
             ),
             // `plan_whole_object_bound` is the bound `plan_segment`'s guard
@@ -3875,8 +3913,21 @@ impl SqlExecutor {
             // still read whole when `ranged_projection_pays` declines, so the
             // depth stays an upper bound there. Alerts and audit read
             // through this same `log_fetcher`.
+            //
+            // A keyed statement (ADR-2707 decision 5) probes KEY_IDX on every
+            // object above the routing threshold, under the break-even too:
+            // the footer probe, the KEY_IDX prefix and a bucket, each needing
+            // the previous read's bytes, then the whole-object GET or the
+            // directory and block reads. So it routes on the threshold and adds
+            // the prefix and bucket reads to the unkeyed chain above it.
+            TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit if keyed => (
+                self.log_fetcher.block_range_threshold(),
+                KEY_IDX_PROBE_DEPTH,
+                self.log_fetcher.get_limiter_permits() as u64,
+            ),
             TargetSignal::Logs | TargetSignal::Alerts | TargetSignal::Audit => (
                 self.log_fetcher.plan_whole_object_bound(),
+                0,
                 self.log_fetcher.get_limiter_permits() as u64,
             ),
             // `SpanSegmentFetcher` has no block-range/whole-object split: it
@@ -3887,10 +3938,10 @@ impl SqlExecutor {
             // depth 4 (see its own doc comment); a published commit record
             // should never carry a zero object size, so that case does not
             // arise here in practice.
-            TargetSignal::Spans => (u64::MAX, self.span_fetcher.get_limiter_permits() as u64),
+            TargetSignal::Spans => (u64::MAX, 0, self.span_fetcher.get_limiter_permits() as u64),
             // A Parquet statement resolves no segments, so neither figure is
             // read; the scan's own reads go through the same process limiter.
-            TargetSignal::Parquet => (u64::MAX, self.fetcher.get_limiter_permits() as u64),
+            TargetSignal::Parquet => (u64::MAX, 0, self.fetcher.get_limiter_permits() as u64),
         }
     }
 
@@ -8694,6 +8745,49 @@ pub(crate) mod tests {
     /// chain's depth 4.
     #[test]
     fn sql_io_shape_reports_whole_object_depth_under_the_break_even() {
+        let (exec, snapshot) = io_shape_fixture(1_000_000);
+        let shape = exec.sql_io_shape(
+            &[(TargetSignal::Logs, &snapshot)],
+            &StatementAccounting::new(),
+            0,
+            false,
+        );
+        assert_eq!(shape.dependency_depth, 1);
+    }
+
+    /// A keyed logs statement probes KEY_IDX on every object above the
+    /// 524,288 byte routing threshold, under the break-even too: the
+    /// 1,000,000 byte object's chain is the footer probe (and its chase), the
+    /// KEY_IDX prefix, a bucket, then the whole-object GET, so the reported
+    /// depth is 6, the unkeyed probe chain's 4 plus the two KEY_IDX reads. An
+    /// object at the threshold is read whole unprobed, depth 1. Fails against
+    /// routing a keyed statement on `plan_whole_object_bound`, which reports
+    /// depth 1 for the probed object.
+    #[test]
+    fn sql_io_shape_reports_key_probe_depth_for_a_keyed_statement() {
+        let (exec, snapshot) = io_shape_fixture(1_000_000);
+        let shape = exec.sql_io_shape(
+            &[(TargetSignal::Logs, &snapshot)],
+            &StatementAccounting::new(),
+            0,
+            true,
+        );
+        assert_eq!(shape.dependency_depth, 6);
+
+        let (exec, snapshot) = io_shape_fixture(524_288);
+        let shape = exec.sql_io_shape(
+            &[(TargetSignal::Logs, &snapshot)],
+            &StatementAccounting::new(),
+            0,
+            true,
+        );
+        assert_eq!(shape.dependency_depth, 1);
+    }
+
+    /// An executor whose log fetcher routes at 524,288 bytes with an
+    /// 18,900,000 byte projection break-even, and a logs snapshot of one
+    /// object of `object_size` bytes.
+    fn io_shape_fixture(object_size: u64) -> (SqlExecutor, Snapshot) {
         use ravel_catalog::{Catalog, CatalogConfig, SegmentLevel, SegmentRef};
         use ravel_object_store::memory::MemoryStore;
 
@@ -8714,7 +8808,7 @@ pub(crate) mod tests {
         let snapshot = Snapshot {
             segments: vec![SegmentRef {
                 data_object_key: "t/obj.rlog".to_string(),
-                object_size: 1_000_000,
+                object_size,
                 min_event_ts_ns: 0,
                 max_event_ts_ns: 1,
                 ingest_hour_bucket: 0,
@@ -8733,12 +8827,7 @@ pub(crate) mod tests {
             segments_pruned: 0,
             pending_erasure: Vec::new(),
         };
-        let shape = exec.sql_io_shape(
-            &[(TargetSignal::Logs, &snapshot)],
-            &StatementAccounting::new(),
-            0,
-        );
-        assert_eq!(shape.dependency_depth, 1);
+        (exec, snapshot)
     }
 
     /// ADR-0069 decision 2: a tenant idle past the TTL has its

@@ -4342,10 +4342,21 @@ the projection break-even, so an object between the threshold and the
 whole-object bound is dropped when a key is absent rather than read whole. An
 object at or under the threshold is read whole and not probed.
 
+The cost is one probe per keyed object above the threshold: its tail read,
+the KEY_IDX prefix, and at most one bucket per key. A present or declined
+object at or under the whole-object bound then takes one whole read, with no
+second read. When the scan opens such objects unplanned (ADR-2677 decision
+2), the plan pass probes each one through `probe_segment_keyed`, which reads
+nothing past the tail and KEY_IDX and plans nothing, and the scan reads each
+object the probe keeps whole once. When the scan plans them, the unkeyed plan
+takes that one read, or leaves it to the scan when the skip index alone
+decides the survivor count.
+
 A key counts as a block predicate (`LogQuery::is_block_predicate_free`), so a
 `trace_id`-only query on a tenant that indexes `trace_id` no longer takes the
-scan-level whole-segment fast path. It plans each object above the
-block-range threshold through the probe instead; an object whose every key
+scan-level whole-segment fast path. It probes each object above the
+block-range threshold instead, through the plan or, on the unplanned route,
+through `probe_segment_keyed`; on the planned route an object whose every key
 declines (no KEY_IDX section, a version 1 section, a field the section does
 not carry) is handed back to `plan_segment_primed` with its keys cleared, so
 the contained-segment plan still applies there. The cost of that route change
@@ -4354,7 +4365,7 @@ per object above the threshold, which on an object at or under the
 whole-object bound comes on top of its whole read. An equality on a typed
 attribute column already carried a prune predicate, so its route changes only
 for an object between the threshold and the whole-object bound, which is now
-planned and probed instead of read whole. The
+probed and read whole only when the probe keeps it. The
 ranged logs scan also stops fetching an object's KEY_IDX section as part of
 its tail sections on every route: the reader never reads it, so the bytes
 were a pure cost.
