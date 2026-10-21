@@ -288,3 +288,8 @@ classic histogram exploding into several series, not a separate rule.
   default-on needs a bench result that justifies the build cost.
 - Arrow Flight `DoPut` ingest would need its own decision record. Flight SQL
   is the query-side surface and already ships behind `flight-sql`.
+- The OTAP service accepts no gRPC message compression. The collector's
+  `otelarrow` exporter compresses with zstd by default (gRPC encoding
+  `zstdarrow<level>` on the Arrow stream, `zstd` when it falls back to plain
+  OTLP), and Ravel refuses both, so the exporter drops the data. Set
+  `compression: none` on the `otelarrow` exporter.

@@ -181,7 +181,10 @@ async fn start_test_server() -> ravel_server::Running {
 /// `otelarrow` exporter that streams OTAP to `ravel-server`'s gRPC listener.
 /// `tls.insecure` because the listener is plaintext tonic; the bearer token
 /// rides a gRPC header, exactly as `ravel-server` resolves the tenant from
-/// stream-open metadata.
+/// stream-open metadata. `compression: none` because the exporter's default,
+/// zstd, compresses the gRPC messages (`zstdarrow5` on the Arrow stream,
+/// `zstd` on its OTLP fallback), and the OTAP service accepts no gRPC
+/// compression (issue #3163).
 fn collector_config(ravel_grpc_port: u16) -> String {
     format!(
         r#"
@@ -194,6 +197,7 @@ receivers:
 exporters:
   otelarrow:
     endpoint: 127.0.0.1:{ravel_grpc_port}
+    compression: none
     tls:
       insecure: true
     headers:
@@ -345,11 +349,48 @@ async fn real_collector_otelarrow_export_is_queryable() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // On a miss, the collector's own log is the only record of what the
+    // otelarrow exporter did (a refused stream, an auth or protocol error),
+    // and the server's metrics say whether any OTAP batch arrived.
+    let diagnostics = if series.is_none() {
+        let collector_log = Command::new("docker")
+            .args(["logs", &container_name])
+            .output()
+            .map(|out| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .unwrap_or_else(|err| format!("docker logs failed: {err}"));
+        let server_metrics = match client
+            .get(format!("http://{http_addr}/metrics"))
+            .send()
+            .await
+        {
+            Ok(response) => response.text().await.unwrap_or_default(),
+            Err(err) => format!("metrics scrape failed: {err}"),
+        };
+        let otap_metrics: Vec<&str> = server_metrics
+            .lines()
+            .filter(|line| line.contains("otap") || line.contains("ingest_reject"))
+            .collect();
+        format!(
+            "collector log:\n{collector_log}\nserver otap and ingest-reject metrics:\n{}",
+            otap_metrics.join("\n")
+        )
+    } else {
+        String::new()
+    };
+
     let _ = Command::new("docker")
         .args(["stop", &container_name])
         .status();
 
-    let series = series.expect("collector-exported OTAP sample became queryable");
+    let series = series.unwrap_or_else(|| {
+        panic!("collector-exported OTAP sample never became queryable\n{diagnostics}")
+    });
     assert_eq!(series["metric"]["__name__"], METRIC_NAME);
     let got: f64 = series["value"][1]
         .as_str()
