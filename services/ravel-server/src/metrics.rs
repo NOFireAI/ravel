@@ -445,8 +445,8 @@ pub enum Label {
     /// address, `unparsed`. Shares the `outcome` key with `AlertOutcome`.
     IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome),
     /// Why a live-set read rejected a sibling `sys/query/workers/` record
-    /// (ADR-1918 decision 4): `missing_mac`, `bad_mac`, `oversize`, or
-    /// `malformed`. A closed enum owned by `ravel_fleet`, which also owns the
+    /// (ADR-1918 decision 4): `missing_mac`, `bad_mac`, `oversize`,
+    /// `malformed`, or `stale_stamp`. A closed enum owned by `ravel_fleet`, which also owns the
     /// label spelling. Shares the `reason` key with the other reason variants.
     QueryWorkerRecordRejectReason(ravel_fleet::query_workers::RecordReject),
 }
@@ -7798,7 +7798,10 @@ pub struct DistribSnapshot {
     pub quarantine_current: u64,
     /// Sibling query-worker records this process's live-set reads rejected,
     /// per reason, every reason present (ADR-1918 decision 4).
-    pub query_worker_record_rejects_by_reason: [(ravel_fleet::query_workers::RecordReject, u64); 4],
+    pub query_worker_record_rejects_by_reason: [(
+        ravel_fleet::query_workers::RecordReject,
+        u64,
+    ); ravel_fleet::query_workers::RecordReject::ALL.len()],
 }
 
 impl DistribSnapshot {
@@ -7885,9 +7888,10 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
     write_header(
         out,
         "ravel_query_worker_record_rejects_total",
-        "Sibling sys/query/workers/ records this process's live-set reads skipped because they \
-         did not authenticate, by reason (ADR-1918 decision 4). A record skipped only for a \
-         stale heartbeat stamp is not counted.",
+        "Sibling sys/query/workers/ records this process's live-set reads rejected, by reason \
+         (ADR-1918 decision 4). stale_stamp is a record that verified but whose stamp is \
+         outside the liveness window. A key skipped by its listed modification time before \
+         the GET, and a verified drained record, are not counted.",
         "counter",
     );
     for (reason, count) in snapshot.query_worker_record_rejects_by_reason {
@@ -13416,11 +13420,13 @@ mod tests {
                 "ravel_query_worker_record_rejects_total{mode=\"all\",reason=\"bad_mac\"} 0",
                 "ravel_query_worker_record_rejects_total{mode=\"all\",reason=\"oversize\"} 0",
                 "ravel_query_worker_record_rejects_total{mode=\"all\",reason=\"malformed\"} 0",
+                "ravel_query_worker_record_rejects_total{mode=\"all\",reason=\"stale_stamp\"} 0",
             ],
         );
 
-        // One unsigned record and one empty object under the prefix: a
-        // missing_mac and a malformed reject.
+        // One unsigned record, one empty object and one signed record stamped
+        // past the liveness window under the prefix: a missing_mac, a
+        // malformed and a stale_stamp reject.
         let store = MemoryStore::new();
         let now_ns = 1_000_000_000_000;
         let unsigned = QueryWorkerRecord {
@@ -13449,12 +13455,13 @@ mod tests {
             )
             .await
             .expect("put empty");
-        let reader = QueryWorkers::with_defaults(
-            "127.0.0.1:1",
-            5,
-            RecordKeys::from_file_keys(&[[3; 32]]).expect("one key"),
-        )
-        .with_record_rejects(metrics.query_worker_record_rejects().clone());
+        let record_keys = || RecordKeys::from_file_keys(&[[3; 32]]).expect("one key");
+        QueryWorkers::with_defaults("127.0.0.1:2", 5, record_keys())
+            .write_heartbeat(&store, now_ns - 2 * ravel_fleet::query_workers::default_liveness_window_ns())
+            .await
+            .expect("put stale signed");
+        let reader = QueryWorkers::with_defaults("127.0.0.1:1", 5, record_keys())
+            .with_record_rejects(metrics.query_worker_record_rejects().clone());
         let live = reader.live_set(&store, now_ns).await.expect("live set");
         assert_eq!(live.len(), 1, "only the reader itself is live");
 
@@ -13475,6 +13482,7 @@ mod tests {
                 "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"bad_mac\"} 0",
                 "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"oversize\"} 0",
                 "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"malformed\"} 1",
+                "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"stale_stamp\"} 1",
             ],
         );
         let lines: Vec<&str> = body.lines().collect();

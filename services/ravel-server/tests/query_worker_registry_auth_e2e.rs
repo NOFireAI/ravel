@@ -15,17 +15,18 @@
 //! read (which runs at startup, not one heartbeat interval later) is the one
 //! that sees it, and the test waits until C has read both sibling records.
 //!
-//! NON-VACUITY: build C's `RecordKeys` without the shared fragment key
-//! (`services/ravel-server/src/lib.rs`), and C rejects A's record, owns every
-//! unit itself, and the query never succeeds. Remove the MAC check, and C
-//! admits F and dials the listener.
+//! Both processes run the same `lib.rs`, so they would admit each other under
+//! any key both derive the same way. The key source is pinned from outside: a
+//! test-side `QueryWorkers` holding only `RecordKeys::from_file_keys` over the
+//! fixture's fragment key reads the shared store and must admit A's and C's
+//! records. Remove the MAC check, and C admits F and dials the listener.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 #[path = "support/fragment_tls.rs"]
 mod fragment_tls;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -34,7 +35,10 @@ use parking_lot::Mutex;
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
 use ravel_commit::{keys, publish, record};
-use ravel_fleet::query_workers::{QUERY_WORKERS_PREFIX, QueryWorkerRecord, query_worker_key};
+use ravel_fleet::query_workers::{
+    QUERY_WORKERS_PREFIX, QueryWorkerRecord, QueryWorkers, RecordKeys, RecordReject,
+    query_worker_key,
+};
 use ravel_fleet::worker_set;
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -253,7 +257,7 @@ struct CoordinatorStore {
     blocked: AtomicUsize,
     release: tokio::sync::Notify,
     registry_puts: Mutex<Vec<String>>,
-    registry_gets: Mutex<HashSet<String>>,
+    registry_gets: Mutex<HashMap<String, usize>>,
 }
 
 impl CoordinatorStore {
@@ -264,7 +268,7 @@ impl CoordinatorStore {
             blocked: AtomicUsize::new(0),
             release: tokio::sync::Notify::new(),
             registry_puts: Mutex::new(Vec::new()),
-            registry_gets: Mutex::new(HashSet::new()),
+            registry_gets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -282,7 +286,12 @@ impl CoordinatorStore {
     }
 
     fn has_read(&self, key: &str) -> bool {
-        self.registry_gets.lock().contains(key)
+        self.reads(key) > 0
+    }
+
+    /// How many GETs the coordinator issued for registry object `key`.
+    fn reads(&self, key: &str) -> usize {
+        self.registry_gets.lock().get(key).copied().unwrap_or(0)
     }
 
     async fn gate(&self, prefix: &str) {
@@ -328,7 +337,11 @@ impl ObjectStoreBackend for CoordinatorStore {
         }
         let outcome = self.inner.get(key, range).await;
         if key.starts_with(QUERY_WORKERS_PREFIX) {
-            self.registry_gets.lock().insert(key.to_string());
+            *self
+                .registry_gets
+                .lock()
+                .entry(key.to_string())
+                .or_default() += 1;
         }
         outcome
     }
@@ -540,6 +553,35 @@ async fn forged_unsigned_registry_record_is_never_dialed() {
     })
     .await;
 
+    // Both processes have beaten. A reader holding only the record keys
+    // derived from the fixture's fragment key file admits both of their
+    // records, so `start` signs under that file and nothing else.
+    let outside = QueryWorkers::with_defaults(
+        "127.0.0.1:1",
+        ravel_query::distrib::codec::PROTOCOL_VERSION,
+        RecordKeys::from_file_keys(&[FRAGMENT_KEY]).expect("one key"),
+    );
+    let outside_live: Vec<String> = outside
+        .live_set(shared.as_ref(), now_ns())
+        .await
+        .expect("outside live set")
+        .into_iter()
+        .map(|record| record.process_id)
+        .collect();
+    assert!(
+        outside_live.contains(&a.to_string()),
+        "A's record verifies under the fragment key file's derived key: {outside_live:?}"
+    );
+    assert!(
+        outside_live.contains(&c.to_string()),
+        "C's record verifies under the fragment key file's derived key: {outside_live:?}"
+    );
+    assert_eq!(
+        outside.record_rejects().get(RecordReject::BadMac),
+        0,
+        "no process signed under another key"
+    );
+
     // Only A can answer: C refuses its own segment reads. Two queries, so a
     // live set published just after the first one routes the second.
     let (start_s, end_s) = ((now - 15 * NS_PER_MIN) / NS_PER_SEC, now / NS_PER_SEC);
@@ -571,10 +613,29 @@ async fn forged_unsigned_registry_record_is_never_dialed() {
         0,
         "the forged endpoint must never be dialed"
     );
+    // Each of C's live-set reads GETs F's record once and counts it once. C
+    // reads once at startup and next after its 60 s heartbeat interval, so
+    // by the scrape it has read F exactly once.
+    assert_eq!(
+        coordinator_store.reads(&forged_key),
+        1,
+        "C ran one live-set read before the scrape"
+    );
     let metrics = scrape_metrics(&base).await;
-    assert!(
-        record_rejects(&metrics, "missing_mac") > 0.0,
-        "the forged record is counted as missing_mac"
+    assert_eq!(
+        coordinator_store.reads(&forged_key),
+        1,
+        "and none while the scrape was taken"
+    );
+    assert_eq!(
+        record_rejects(&metrics, "missing_mac"),
+        1.0,
+        "that one read counted the forged record once, as missing_mac"
+    );
+    assert_eq!(
+        record_rejects(&metrics, "bad_mac"),
+        0.0,
+        "A's record verified at C"
     );
 
     accept_task.abort();
