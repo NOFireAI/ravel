@@ -158,7 +158,9 @@ rule on thread placement.
    `ravel-catalog::snapshot_format`) stay synchronous and runtime-free. The
    gate is applied at the async caller. (Qualified by the #2669 amendment
    below: an ingest decompression whose format declares no uncompressed
-   length it can trust is sized by an upper bound on that length.)
+   length it can trust is sized by an upper bound on that length. The
+   non-framed OTAP payload amendment below records where an OTAP payload's
+   size undercounts its decode.)
 
 5. **Cancellation.** A waiter dropped before it holds a permit never runs.
    A decode that has started runs to completion, because a `zstd::bulk`
@@ -720,7 +722,8 @@ to no more than the floor.
   past that total, so a frame that understates its size cannot inflate past
   it. Otherwise the compressed length times 32768, zstd's maximum expansion
   (a 4-byte RLE block decodes to a whole 128 KiB block). The cap is 16 MiB by
-  default.
+  default. A payload with no zstd frame is sized differently; see the
+  non-framed OTAP payload amendment below.
 
 Decision 6 holds at each site. A job owns the byte charge its output needs and
 returns it with that output, so a charge is held while the job waits for a
@@ -958,3 +961,31 @@ query, more so now that decodes and flushes under 1 MiB run there; a
 cluster whose probes still point at it (`dedicatedHealthPort: false`, the
 value every RavelCluster written since v0.19.0 holds unless changed) should
 move them to the health listener. The trial measured neither probe.
+
+## Amendment (2026-10-21): the non-framed OTAP payload amendment (issue #1905)
+
+<!-- amendment-applies: sections="Decision" pointer="non-framed OTAP payload amendment" -->
+
+The `otap_decode` sizing in the #2669 amendment's task 9 assumed every OTAP payload is a zstd frame.
+The collector's `otelarrow` exporter sends Arrow IPC with no outer frame, and
+`ravel-otap` now accepts it: a payload is a zstd frame only when its first four
+bytes are the zstd magic, and any other payload is Arrow IPC as-is.
+
+- `otap_decode` for a zstd frame is sized exactly as task 9 states.
+- `otap_decode` for a payload with no zstd frame is sized by the payload's
+  length, capped at the same 16 MiB default. The job copies the payload into
+  the aligned buffer the IPC decoder reads and refuses one longer than the
+  cap, so that length is exact for the job's output.
+
+Decision 4 sizes a unit by its uncompressed length, and for an IPC
+body-compressed payload (the exporter's default `payload_compression: zstd`)
+the gate's size undercounts the decode's CPU work. The job's output is the
+compressed IPC bytes; arrow's reader decompresses the buffers inside them
+during the IPC decode, which runs on the stream's task, not on the gate, as
+task 9 already places it. That decompression is bounded in bytes, not moved
+onto the gate: before the IPC decoder runs, the stream reads each compressed
+buffer's declared uncompressed length from the IPC body and refuses a payload
+whose decoded buffers total more than the same per-payload cap, and arrow's
+reader rejects a buffer that does not decompress to exactly its declared
+length. So at most the cap, 16 MiB by default, of IPC body decompression per
+payload runs on the stream's task outside the gate.
