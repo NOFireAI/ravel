@@ -220,7 +220,10 @@ async fn oversize_record_is_skipped_without_being_decoded() {
     let store = MemoryStore::new();
     let reader = worker_with("10.0.0.1:9443", &[KEY_A]);
     let probe = worker_with("", &[KEY_A]);
-    probe.write_heartbeat(&store, NOW).await.expect("probe beat");
+    probe
+        .write_heartbeat(&store, NOW)
+        .await
+        .expect("probe beat");
     let probe_key = query_worker_key(&probe.process_id().to_string());
     let base_len = store
         .get(&probe_key, GetRange::Full)
@@ -236,7 +239,7 @@ async fn oversize_record_is_skipped_without_being_decoded() {
     let big_key = query_worker_key(&big.process_id().to_string());
     let stored = store.get(&big_key, GetRange::Full).await.expect("big");
     assert_eq!(stored.data.len(), 5000);
-    assert!(5000 > MAX_RECORD_BYTES);
+    const { assert!(5000 > MAX_RECORD_BYTES) };
 
     let live = reader.live_set(&store, NOW).await.expect("live set");
     assert_eq!(ids(&live), vec![reader.process_id().to_string()]);

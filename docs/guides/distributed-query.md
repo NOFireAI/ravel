@@ -361,8 +361,9 @@ sys/query/workers/<process_id>
 ```
 
 The record is a small JSON control-plane payload. It carries the process id,
-one endpoint, the `queryfrag` protocol version that the node speaks, and a
-liveness timestamp that every beat stamps again. The write is an unconditional
+one endpoint, the `queryfrag` protocol version that the node speaks, a
+liveness timestamp that every beat stamps again, and a MAC over those four
+fields (see [The live set](#the-live-set)). The write is an unconditional
 overwrite: one writer per key, no compare-and-swap, no contention. `maintain`
 mode processes use the same pattern for their own heartbeats.
 
@@ -419,11 +420,38 @@ A stuck future-dated record drops out like a stale past-dated one.
 
 Worker identity comes from the key, not from the record body. A record whose
 body disagrees with its key is skipped and is not admitted under the identity
-of another worker. That check does not keep a new identity out. The shipped
-query role (`deploy/iam/query.json`) can `PutObject` anywhere under
-`sys/query/workers/`, and records carry no MAC. Any principal that holds that
-role can therefore write a self-consistent record at a fresh UUID key and join
-the live set.
+of another worker. That check alone does not keep a new identity out: the
+shipped query role (`deploy/iam/query.json`) can `PutObject` anywhere under
+`sys/query/workers/`, and S3 cannot limit a writer to its own key.
+
+Records are therefore signed. Each record carries a `mac` field, a keyed
+BLAKE3 hash over the process id, the endpoint, the protocol version and the
+stamp. The key is derived from the first key in `--fragment-key-file`, so
+it differs from the key that signs fragment capabilities. A reader admits a
+sibling only when the MAC verifies under a key derived from any key in its own
+file, so the key file rotates the same way it does for capabilities. A reader
+fetches at most the first 4097 bytes of a record. A record with no MAC, a MAC
+that does not verify, or a body over 4096 bytes is skipped and counted under
+`ravel_query_worker_record_rejects_total{reason}` (`missing_mac`, `bad_mac`,
+`oversize`) on `/metrics`.
+
+What the MAC stops: a principal that can write the prefix but does not hold the
+fragment key file can no longer add a member to the live set, or change the
+endpoint an existing member's record names. What it does not stop:
+
+- Eviction. That principal can still overwrite a member's record with garbage,
+  or replay an older signed record of that member, a drained one included.
+  Readers then drop the member until its next heartbeat lands, and a writer
+  that keeps overwriting keeps it out. That member's slices go to the
+  next-ranked worker or run on the coordinator.
+- A holder of the fragment key file, who is a cluster member.
+
+Every node of a cluster must share at least one fragment key. A node whose file
+shares no key with its siblings does not see them and they do not see it; each
+side counts the other's records under `bad_mac`. A node from a release that
+predates signed records writes no MAC: newer readers count its record under
+`missing_mac` and route around it, so a rolling upgrade loses fan-out to the
+old nodes until they are replaced.
 
 A key whose modification time is already older than the liveness window is not
 fetched at all, because its stamp can only be older still. The read cost of a

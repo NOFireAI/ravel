@@ -3812,7 +3812,8 @@ mod tests {
     #[tokio::test]
     async fn worker_registration_appears_then_ages_out() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION, record_keys());
+        let workers =
+            QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION, record_keys());
         let interval_ns =
             i64::try_from(workers.heartbeat_interval().as_nanos()).expect("interval fits i64");
 
@@ -3833,7 +3834,8 @@ mod tests {
         // Far past the staleness window (3x the interval by default): the record
         // is no longer live. `self` is always included by `live_set`, so read
         // from a different identity to observe the aged-out record's absence.
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, record_keys());
+        let observer =
+            QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, record_keys());
         let stale_now = 1_000 + interval_ns * 10;
         let live = observer
             .live_set(store.as_ref(), stale_now)
@@ -3914,7 +3916,8 @@ mod tests {
             tokio::time::sleep(interval).await;
         }
 
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, record_keys());
+        let observer =
+            QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION, record_keys());
         let self_id = workers.process_id().to_string();
         let live = observer
             .live_set(store.as_ref(), now_ns)

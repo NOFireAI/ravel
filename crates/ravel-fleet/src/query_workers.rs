@@ -534,15 +534,17 @@ impl QueryWorkers {
     /// record whose body `process_id` disagrees with the id its key names is
     /// skipped as malformed, under either identity.
     ///
-    /// Before either check, the sibling's MAC must verify under one of this
-    /// reader's [`RecordKeys`] (ADR-1918; see the [module docs](self)). The
-    /// shipped query-role IAM grant allows `PutObject` across the whole prefix,
-    /// so the key check alone admits any self-consistent record at a fresh
-    /// UUID key; the MAC is what keeps a writer without the fragment key file
-    /// out. A record is read with a range GET of at most
-    /// [`MAX_RECORD_BYTES`]` + 1` bytes. A larger object, a record with no
+    /// A sibling is also admitted only when its MAC verifies under one of this
+    /// reader's [`RecordKeys`] (ADR-1918; see the [module docs](self)),
+    /// checked before the body `process_id` and the stamp. The shipped
+    /// query-role IAM grant allows `PutObject` across the whole prefix, so the
+    /// key check alone admits any self-consistent record at a fresh UUID key;
+    /// the MAC is what keeps a writer without the fragment key file out. A
+    /// record is read with a range GET of at most [`MAX_RECORD_BYTES`]` + 1`
+    /// bytes. An object larger than [`MAX_RECORD_BYTES`], a record with no
     /// `mac`, and a record whose MAC does not verify are each skipped and
-    /// counted in [`QueryWorkers::record_rejects`].
+    /// counted in [`QueryWorkers::record_rejects`]; an empty object is skipped
+    /// uncounted, like an undecodable one.
     ///
     /// A corrupt, rejected or mismatched sibling record is skipped (treated as
     /// absent, self-correcting next interval); only a failed LIST or GET is an
@@ -602,8 +604,8 @@ impl QueryWorkers {
                 continue;
             };
             let record = signed.record;
-            let verified = blake3::Hash::from_hex(&mac)
-                .is_ok_and(|mac| self.keys.verify(&record, &mac));
+            let verified =
+                blake3::Hash::from_hex(&mac).is_ok_and(|mac| self.keys.verify(&record, &mac));
             if !verified {
                 self.reject(&meta.key, RecordReject::BadMac);
                 continue;

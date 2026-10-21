@@ -7758,8 +7758,7 @@ pub struct DistribSnapshot {
     pub fragment_capability_rejects_by_reason: [(crate::distrib::CapabilityReject, u64); 5],
     /// Sibling query-worker records the heartbeat's live-set read refused per
     /// reason, every reason present (ADR-1918 decision 4).
-    pub query_worker_record_rejects_by_reason:
-        [(ravel_fleet::query_workers::RecordReject, u64); 3],
+    pub query_worker_record_rejects_by_reason: [(ravel_fleet::query_workers::RecordReject, u64); 3],
     /// In-flight fragment requests per fragment admission class
     /// (`Pinned`, `Resolve`; issue #1722).
     pub fragment_inflight_by_class: [(crate::distrib::AdmissionClass, u64); 2],
@@ -7884,7 +7883,10 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
         write_sample(
             out,
             "ravel_query_worker_record_rejects_total",
-            &[Label::Mode(mode), Label::QueryWorkerRecordRejectReason(reason)],
+            &[
+                Label::Mode(mode),
+                Label::QueryWorkerRecordRejectReason(reason),
+            ],
             count,
         );
     }
@@ -13298,7 +13300,9 @@ mod tests {
             "the distrib family must be absent without --distributed-query:\n{off}"
         );
         assert!(
-            body.contains("ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"missing_mac\"} 0"),
+            body.contains(
+                "ravel_query_worker_record_rejects_total{mode=\"query\",reason=\"missing_mac\"} 0"
+            ),
             "the record reject family renders with the distrib family:\n{body}"
         );
         assert!(
