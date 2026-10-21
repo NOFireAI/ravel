@@ -7,3 +7,4 @@
 cc f1df126bd872629e94a5c9acf3dc8bdaaca450633bf5abbab0b5f0e51f6afadb # shrinks to shapes = [Planned([0], [0, 0, 0]), NoSurvivor], mins = [0, 0, 0, 0, 0, 0, 0], stripe = false, by_min_ts = false, n = 1, schedule = []
 cc 69ac4faa4fdb8546febdc9e3ccc98044d24aeee09db0daadd70cd597b4dd4490 # shrinks to shapes = [Planned([0, 4], [0, 0, 0])], mins = [0, 0, 0, 0, 0, 0, 0], stripe = true, by_min_ts = false, n = 1, schedule = []
 cc 2cad16c9fd299ce5103b89e779d124370447b0296608b15d29f0fc5fdb7e45da # shrinks to survivors = [{0, 1, 2}], keys = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], mode = 0, n = 1, schedule = []
+cc 201cd9fec751218250f47b5d84d68fc33e42edb3a8084da9bedb3273e8ed418b # shrinks to survivors = [{0, 1, 2, 3, 4, 6}], keys = [[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]], mode = 1, n = 4, schedule = []

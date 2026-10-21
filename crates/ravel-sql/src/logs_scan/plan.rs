@@ -549,18 +549,16 @@ impl PlanCounts {
 
     /// The units this plan publishes for `partitions` partitions, in
     /// publication order, as `(snapshot segment index, blocks)` (ADR-0102
-    /// decision 1). With `stripe_blocks` a planned segment of `G` surviving
-    /// row groups is published as runs of [`run_len`]`(G, partitions)` row
-    /// groups, so it is opened at most `min(G, partitions)` times:
+    /// decision 1):
     ///
-    /// - Under [`global_order`] (`stripe_blocks` with a confirmed ascending
-    ///   `ts` TopK), a segment's row groups are taken in the order they appear
-    ///   in the global sequence and each consecutive [`run_len`] of them is one
-    ///   run, published where its first row group sits in that sequence. Each
-    ///   unplanned segment is one unit at its own place.
-    /// - With `stripe_blocks` otherwise, segments in `order` (see
-    ///   [`visit_order`]), each planned one as its runs of consecutive row
-    ///   groups in group order, each unplanned one as one unit.
+    /// - Under [`global_order`] (a read cache with a confirmed ascending `ts`
+    ///   TopK, at any partition count), the dealt runs of [`global_runs`].
+    /// - With `stripe_blocks` otherwise (a read cache and more than one
+    ///   partition), segments in `order` (see [`visit_order`]), each planned
+    ///   one of `G` surviving row groups as runs of [`run_len`]`(G,
+    ///   partitions)` consecutive row groups in group order, so it is opened
+    ///   at most `min(G, partitions)` times, and each unplanned one as one
+    ///   unit.
     /// - Without `stripe_blocks`, one unit per segment in `order` that has a
     ///   surviving block or is unplanned.
     ///
@@ -572,7 +570,7 @@ impl PlanCounts {
         partitions: usize,
     ) -> Vec<(usize, UnitBlocks)> {
         if let Some(global) = &self.global {
-            return global_runs(global, self.segs.len(), partitions);
+            return global_runs(global, partitions);
         }
         let mut units = Vec::new();
         for &seg_idx in order {
@@ -874,59 +872,40 @@ pub(super) fn global_order(
     units
 }
 
-/// [`global_order`] coalesced into runs for `partitions` partitions: each
-/// segment's row groups, in the order the global sequence holds them, are cut
-/// into runs of [`run_len`] of them, and a run is published where its first
-/// row group sits. A segment of `G` row groups is then opened at most
-/// `min(G, partitions)` times. A run's positions are sorted ascending so its
-/// block indices ascend, which the subset open relies on. `segments` is the
-/// snapshot's segment count.
-fn global_runs(
-    global: &[GlobalUnit],
-    segments: usize,
-    partitions: usize,
-) -> Vec<(usize, UnitBlocks)> {
-    let mut groups = vec![0usize; segments];
-    for unit in global {
-        if unit.group.is_some()
-            && let Some(count) = groups.get_mut(unit.seg)
-        {
-            *count += 1;
-        }
-    }
-    let mut taken = vec![0usize; segments];
-    // Per segment, the index into `units` of its run still being filled.
-    let mut open_run: Vec<Option<usize>> = vec![None; segments];
+/// [`global_order`] dealt as runs, as the per-partition deal of ADR-2677
+/// decision 6 dealt it: unit `i` goes to queue `i % partitions`, and extends
+/// the last run of that queue when the run holds row groups of the same
+/// segment ending at a smaller group position, since an open drains its
+/// blocks in block order; any other unit starts a new run, so a run is read in
+/// its global order. Runs are published in the global order of their first
+/// unit, which keeps every queue's runs in that queue's order.
+pub(super) fn global_runs(global: &[GlobalUnit], partitions: usize) -> Vec<(usize, UnitBlocks)> {
+    let n = partitions.max(1);
+    // Per queue, the index into `units` of its last run.
+    let mut last: Vec<Option<usize>> = vec![None; n];
     let mut units: Vec<(usize, UnitBlocks)> = Vec::new();
-    for unit in global {
-        let Some(pos) = unit.group else {
-            units.push((unit.seg, UnitBlocks::Unplanned));
+    for (i, unit) in global.iter().enumerate() {
+        let Some(tail) = last.get_mut(i % n) else {
             continue;
         };
-        let (Some(count), Some(run), Some(&g)) = (
-            taken.get_mut(unit.seg),
-            open_run.get_mut(unit.seg),
-            groups.get(unit.seg),
-        ) else {
-            continue;
+        let extended = match (unit.group, tail.and_then(|at| units.get_mut(at))) {
+            (Some(pos), Some((seg, UnitBlocks::Groups(positions))))
+                if *seg == unit.seg && positions.last().is_some_and(|&p| p < pos) =>
+            {
+                positions.push(pos);
+                true
+            }
+            _ => false,
         };
-        let starts_run = *count % run_len(g, partitions) == 0;
-        *count += 1;
-        match run {
-            Some(at) if !starts_run => {
-                if let Some((_, UnitBlocks::Groups(positions))) = units.get_mut(*at) {
-                    positions.push(pos);
-                }
-            }
-            _ => {
-                *run = Some(units.len());
-                units.push((unit.seg, UnitBlocks::Groups(vec![pos])));
-            }
-        }
-    }
-    for (_, blocks) in &mut units {
-        if let UnitBlocks::Groups(positions) = blocks {
-            positions.sort_unstable();
+        if !extended {
+            *tail = Some(units.len());
+            units.push((
+                unit.seg,
+                match unit.group {
+                    Some(pos) => UnitBlocks::Groups(vec![pos]),
+                    None => UnitBlocks::Unplanned,
+                },
+            ));
         }
     }
     units
@@ -1442,11 +1421,13 @@ mod owned_work_tests {
 
     /// An unplanned segment is one unit keyed by its `min_event_ts_ns`, so it
     /// is published between the groups whose keys bracket it; a group keyed
-    /// `i64::MIN` is published ahead of every other unit. With `GROUPS`
-    /// partitions every run is one row group.
+    /// `i64::MIN` is published ahead of every other unit. Over one partition
+    /// a segment's units that are not consecutive in the sorted sequence are
+    /// separate runs.
     ///
     /// Fails against keying an unplanned segment by snapshot position (it
-    /// would sort first or last) and against keying it at `i64::MIN`.
+    /// would sort first or last), against keying it at `i64::MIN`, and
+    /// against merging segment 0's units into one run.
     #[test]
     fn unplanned_segments_sort_by_their_minimum_and_boundless_groups_first() {
         let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
@@ -1458,11 +1439,10 @@ mod owned_work_tests {
         let refs = vec![seg_ref_at("a", 0), seg_ref_at("u", 5), seg_ref_at("b", 0)];
         let counts = assemble(segs, vec![false, true, false], &refs, true, true);
         assert_eq!(
-            published(&counts, &refs, true, true, GROUPS),
+            published(&counts, &refs, true, true, 1),
             vec![
                 (2, vec![0, 1, 2, 3], false),
-                (0, vec![0, 1, 2, 3], false),
-                (0, vec![4, 5, 6, 7], false),
+                (0, (0..8).collect(), false),
                 (1, vec![], true),
                 (0, vec![8, 9, 10, 11], false),
             ],
@@ -1470,18 +1450,17 @@ mod owned_work_tests {
         );
     }
 
-    /// Each unit's indices ascend even when [`global_order`] publishes a
-    /// segment's groups in descending position: the open path drains a
-    /// segment's blocks in ascending order and binary-searches
-    /// [`OwnedSeg::indices`] on that assumption
-    /// (`ravel-query/src/log_fetcher.rs`). One segment with group keys `[5,
-    /// 1]` publishes, for two partitions (runs of one group), group 1 (key 1)
-    /// ahead of group 0 (key 5) as two units; for one partition (one run of
-    /// both groups) one unit whose indices ascend although the run took group
-    /// 1 first.
+    /// A queue's consecutive units of one segment share a run only when their
+    /// group positions ascend: the open path drains a segment's blocks in
+    /// ascending order and binary-searches [`OwnedSeg::indices`] on that
+    /// assumption (`ravel-query/src/log_fetcher.rs`). One segment with group
+    /// keys `[5, 1]` sorts group 1 (key 1) ahead of group 0 (key 5), so both
+    /// for two partitions and for one, where the two units land in the same
+    /// queue, they are published as two units, group 1 first.
     ///
-    /// Fails against concatenating a run's groups in the order the global
-    /// sequence holds them, which gives indices `[4, 5, 6, 7, 0, 1, 2, 3]`.
+    /// Fails against merging a queue's consecutive units of one segment on
+    /// the segment alone, which for one partition publishes one unit of both
+    /// groups, read with group 0 first.
     #[test]
     fn descending_group_positions_publish_separate_units() {
         let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
@@ -1496,7 +1475,7 @@ mod owned_work_tests {
         );
         assert_eq!(
             published(&counts(&budget), &refs, true, true, 1),
-            vec![(0, (0..8).collect(), false)],
+            vec![(0, vec![4, 5, 6, 7], false), (0, vec![0, 1, 2, 3], false)],
         );
     }
 
@@ -1537,15 +1516,18 @@ mod owned_work_tests {
     /// (`by_min_ts`) the queue's publication order is the group-key order the
     /// global deal sorted by, across segments: ascending `(key, snapshot
     /// segment index, group position)`, an unplanned segment keyed by its
-    /// minimum and sorting ahead of a group of its own segment. Partitions
-    /// take units in that order, so the earliest row groups are taken first
-    /// whichever partition asks. Without either half of the precondition the
-    /// plan publishes in visit order instead.
+    /// minimum and sorting ahead of a group of its own segment, with the
+    /// groups the deal gave one partition consecutively from one segment
+    /// merged into one run. Partitions take units in that order, so the
+    /// earliest row groups are taken first whichever partition asks. Without
+    /// either half of the precondition the plan publishes in visit order
+    /// instead.
     ///
     /// Fails against publishing in visit order under the TopK (segment 0's
     /// three groups would come first), against selecting the global order on
     /// the TopK alone (the unstriped expectation below would sort row groups),
-    /// and against sorting by segment before key.
+    /// against sorting by segment before key, and against leaving the dealt
+    /// runs unmerged (two partitions would publish segment 0's groups apart).
     #[test]
     fn topk_units_are_published_in_global_deal_order() {
         let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
@@ -1567,22 +1549,21 @@ mod owned_work_tests {
         assert_eq!(
             published(&counts, &refs, true, true, 3),
             global,
-            "three partitions: every segment has at most three groups, so every run is one group"
+            "three partitions: no queue holds two consecutive units of one segment"
         );
 
-        // Two partitions: segments 0 and 1 (three groups) take runs of two,
-        // each run published where its first group sits in the global order.
-        let pair: Vec<usize> = group(0).into_iter().chain(group(1)).collect();
+        // Two partitions: queue 1 is dealt segment 0's three groups in a row
+        // and queue 0 segment 2's two, so each is one run, published where its
+        // first group sits in the global order.
         let runs = vec![
             (5, group(0), false),
-            (0, pair.clone(), false),
-            (1, pair, false),
+            (0, (0..3 * GROUP_BLOCKS).collect(), false),
+            (1, group(0), false),
             (4, vec![], true),
-            (0, group(2), false),
+            (1, group(1), false),
             (1, group(2), false),
-            (2, group(0), false),
+            (2, (0..2 * GROUP_BLOCKS).collect(), false),
             (3, group(0), false),
-            (2, group(1), false),
         ];
         let (segs, unplanned, refs) = global_fixture(&budget, [0; 4]);
         let counts = assemble(segs, unplanned, &refs, true, true);
@@ -1643,6 +1624,224 @@ mod owned_work_tests {
             ],
             "no TopK, two partitions: runs of ceil(G/2) groups in group order"
         );
+    }
+
+    /// One partition's run of consecutive units of one segment in
+    /// [`main_global_deal`]; `groups` is empty for an unplanned segment.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct DealtRun {
+        seg: usize,
+        groups: Vec<usize>,
+    }
+
+    /// The per-partition TopK deal as it stood before the shared queue
+    /// (ADR-2677 decision 6, issue #2694), kept verbatim as the oracle for
+    /// [`global_runs`]: every unit sorted by `(key, segment, position)`, unit
+    /// `i` dealt to partition `i % n`, and a partition's consecutive units of
+    /// one segment merged into one run while their positions ascend.
+    fn main_global_deal(
+        segs: &[Option<PlannedUnit>],
+        unplanned: &[bool],
+        segments: &[SegmentRef],
+        n: usize,
+    ) -> Vec<Vec<DealtRun>> {
+        let mut units: Vec<(i64, usize, Option<usize>)> = Vec::new();
+        for (seg_idx, plan) in segs.iter().enumerate() {
+            if unplanned.get(seg_idx).copied().unwrap_or(false) {
+                if let Some(seg) = segments.get(seg_idx) {
+                    units.push((seg.min_event_ts_ns, seg_idx, None));
+                }
+                continue;
+            }
+            let Some(planned) = plan.as_ref().and_then(|p| p.planned.as_ref()) else {
+                continue;
+            };
+            for (pos, &key) in planned.group_min_ts.iter().enumerate() {
+                units.push((key, seg_idx, Some(pos)));
+            }
+        }
+        units.sort_unstable();
+        let n = n.max(1);
+        let mut deal: Vec<Vec<DealtRun>> = vec![Vec::new(); n];
+        for (i, (_, seg, pos)) in units.into_iter().enumerate() {
+            let queue = &mut deal[i % n];
+            match (queue.last_mut(), pos) {
+                (Some(run), Some(pos))
+                    if run.seg == seg && run.groups.last().is_some_and(|&last| last < pos) =>
+                {
+                    run.groups.push(pos);
+                }
+                _ => queue.push(DealtRun {
+                    seg,
+                    groups: pos.into_iter().collect(),
+                }),
+            }
+        }
+        deal
+    }
+
+    /// `deal`'s runs as one sequence ordered by the global position of each
+    /// run's first unit, which for the `k`-th unit of partition `q`'s queue is
+    /// `q + k * n`.
+    fn main_publication(deal: &[Vec<DealtRun>]) -> Vec<(usize, UnitBlocks)> {
+        let n = deal.len();
+        let mut runs: Vec<(usize, &DealtRun)> = Vec::new();
+        for (q, queue) in deal.iter().enumerate() {
+            let mut dealt = 0usize;
+            for run in queue {
+                runs.push((q + dealt * n, run));
+                dealt += run.groups.len().max(1);
+            }
+        }
+        runs.sort_by_key(|&(first, _)| first);
+        runs.into_iter()
+            .map(|(_, run)| {
+                let blocks = if run.groups.is_empty() {
+                    UnitBlocks::Unplanned
+                } else {
+                    UnitBlocks::Groups(run.groups.clone())
+                };
+                (run.seg, blocks)
+            })
+            .collect()
+    }
+
+    /// Three time-disjoint segments: segment 0 keyed 0, 1, 2; segment 1 keyed
+    /// 10, 11, 12; segment 2 keyed 20, 21.
+    fn disjoint_fixture(
+        budget: &Arc<ravel_memory::MemoryBudget>,
+    ) -> (Vec<Option<PlannedUnit>>, Vec<bool>, Vec<SegmentRef>) {
+        let segs = vec![
+            planned_seg((0..BLOCKS).collect(), Some(vec![0, 1, 2]), budget, 0),
+            planned_seg((0..BLOCKS).collect(), Some(vec![10, 11, 12]), budget, 0),
+            planned_seg((0..8).collect(), Some(vec![20, 21]), budget, 0),
+        ];
+        let refs = [0, 10, 20]
+            .iter()
+            .enumerate()
+            .map(|(s, &min)| seg_ref_at(&format!("seg{s}"), min))
+            .collect();
+        (segs, vec![false; 3], refs)
+    }
+
+    /// Under a read cache and a confirmed ascending `ts` TopK the published
+    /// units are the per-partition deal's runs exactly, at every partition
+    /// count, one partition included: on time-disjoint and on overlapping
+    /// segments, for one, two and four partitions, against the ported
+    /// [`main_global_deal`] and against sequences derived by hand. Every
+    /// segment is opened once per dealt run of it.
+    ///
+    /// Fails against cutting a segment's groups into `ceil(G / n)` runs (the
+    /// time-disjoint segments over two partitions would publish runs of two
+    /// consecutive groups, and one partition would publish each overlapping
+    /// segment as one unit where its first group sits), and against merging
+    /// on the global sequence instead of per queue (over two partitions
+    /// segment 1's groups 1 and 2 would merge and segment 0's would not).
+    #[test]
+    fn topk_units_match_main_global_deal_with_dealt_run_merge() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        let g = |positions: &[usize]| UnitBlocks::Groups(positions.to_vec());
+        let disjoint = [
+            (
+                1,
+                vec![(0, g(&[0, 1, 2])), (1, g(&[0, 1, 2])), (2, g(&[0, 1]))],
+            ),
+            (
+                2,
+                vec![
+                    (0, g(&[0, 2])),
+                    (0, g(&[1])),
+                    (1, g(&[0, 2])),
+                    (1, g(&[1])),
+                    (2, g(&[0])),
+                    (2, g(&[1])),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    (0, g(&[0])),
+                    (0, g(&[1])),
+                    (0, g(&[2])),
+                    (1, g(&[0])),
+                    (1, g(&[1])),
+                    (1, g(&[2])),
+                    (2, g(&[0])),
+                    (2, g(&[1])),
+                ],
+            ),
+        ];
+        let unplanned = (4, UnitBlocks::Unplanned);
+        let overlapping = [
+            (
+                1,
+                vec![
+                    (5, g(&[0])),
+                    (0, g(&[0])),
+                    (1, g(&[0])),
+                    (0, g(&[1])),
+                    unplanned.clone(),
+                    (0, g(&[2])),
+                    (1, g(&[1, 2])),
+                    (2, g(&[0])),
+                    (3, g(&[0])),
+                    (2, g(&[1])),
+                ],
+            ),
+            (
+                2,
+                vec![
+                    (5, g(&[0])),
+                    (0, g(&[0, 1, 2])),
+                    (1, g(&[0])),
+                    unplanned.clone(),
+                    (1, g(&[1])),
+                    (1, g(&[2])),
+                    (2, g(&[0, 1])),
+                    (3, g(&[0])),
+                ],
+            ),
+            (
+                4,
+                vec![
+                    (5, g(&[0])),
+                    (0, g(&[0, 2])),
+                    (1, g(&[0, 1])),
+                    (0, g(&[1])),
+                    unplanned.clone(),
+                    (1, g(&[2])),
+                    (2, g(&[0])),
+                    (3, g(&[0])),
+                    (2, g(&[1])),
+                ],
+            ),
+        ];
+        for (name, cases) in [("disjoint", &disjoint), ("overlapping", &overlapping)] {
+            for (n, expected) in cases {
+                let (segs, unplanned, refs) = if name == "disjoint" {
+                    disjoint_fixture(&budget)
+                } else {
+                    global_fixture(&budget, [0; 4])
+                };
+                let deal = main_global_deal(&segs, &unplanned, &refs, *n);
+                let counts = assemble(segs, unplanned, &refs, true, true);
+                let units = counts.units(&[], true, *n);
+                assert_eq!(&units, expected, "{name}, {n} partitions, by hand");
+                assert_eq!(
+                    units,
+                    main_publication(&deal),
+                    "{name}, {n} partitions, the ported deal"
+                );
+                let published = counts.publish(&refs, &visit_order(&refs, true), true, *n);
+                for (seg, _) in refs.iter().enumerate() {
+                    assert_eq!(
+                        published.iter().filter(|o| o.ordinal == seg).count(),
+                        deal.iter().flatten().filter(|r| r.seg == seg).count(),
+                        "{name}, {n} partitions: segment {seg} opens once per dealt run"
+                    );
+                }
+            }
+        }
     }
 
     /// Every published unit of a planned segment carries a handle on its
@@ -1889,10 +2088,11 @@ mod owned_work_tests {
 
     /// What a plan of `shapes` must publish for `n` partitions, derived
     /// without [`PlanCounts`]: per segment its expected row groups, and the
-    /// units in publication order. A striped segment of `G` groups is cut into
-    /// runs of `ceil(G / n)` groups, taken in visit order by group position
-    /// and in the global order by key rank, each run published where its
-    /// first group would be.
+    /// units in publication order. In visit order a striped segment of `G`
+    /// groups is cut into runs of `ceil(G / n)` groups. In the global order
+    /// the units sorted by key are dealt round robin to `n` queues, a queue's
+    /// consecutive groups of one segment in ascending position form one run,
+    /// and each run is published where its first unit sits in the sort.
     fn model(
         shapes: &[Shape],
         mins: &[i64],
@@ -1929,25 +2129,29 @@ mod owned_work_tests {
                 }
             }
             sorted.sort();
-            let mut units: Vec<Unit> = Vec::new();
-            let mut rank = vec![0usize; shapes.len()];
-            let mut open = vec![0usize; shapes.len()];
-            for (_, s, g) in sorted {
-                let Some(g) = g else {
-                    units.push((s, vec![], true));
-                    continue;
-                };
-                if rank[s].is_multiple_of(run(s)) {
-                    open[s] = units.len();
-                    units.push((s, vec![], false));
+            // Per partition, its runs as (global index of the first unit,
+            // segment, group positions).
+            let mut queues: Vec<Vec<(usize, usize, Vec<usize>)>> = vec![Vec::new(); n];
+            for (i, (_, s, g)) in sorted.into_iter().enumerate() {
+                let queue = &mut queues[i % n];
+                match (queue.last_mut(), g) {
+                    (Some((_, rs, gs)), Some(g))
+                        if *rs == s && gs.last().is_some_and(|&last| last < g) =>
+                    {
+                        gs.push(g)
+                    }
+                    _ => queue.push((i, s, g.into_iter().collect())),
                 }
-                rank[s] += 1;
-                units[open[s]].1.extend(&groups[s][g]);
             }
-            for unit in &mut units {
-                unit.1.sort_unstable();
-            }
-            units
+            let mut runs: Vec<(usize, usize, Vec<usize>)> = queues.into_iter().flatten().collect();
+            runs.sort_by_key(|run| run.0);
+            runs.into_iter()
+                .map(|(_, s, gs)| {
+                    let blocks: Vec<usize> =
+                        gs.iter().flat_map(|&g| groups[s][g].clone()).collect();
+                    (s, blocks, gs.is_empty())
+                })
+                .collect()
         } else {
             let mut order: Vec<usize> = (0..shapes.len()).collect();
             if by_min_ts {
@@ -2072,17 +2276,19 @@ mod owned_work_tests {
 
         /// Over an object of one-block row groups, so a segment's `G` is its
         /// survivor count (1 to 12), with a read cache and no TopK, with a
-        /// read cache and the global order, and without a read cache: `n`
-        /// partitions open each segment at most `min(G, n)` times (exactly
-        /// once without a read cache), every surviving row group is read by
-        /// exactly one owner, each partition's units keep publication order,
-        /// and every unit's indices ascend.
+        /// read cache and the global order, and without a read cache: with a
+        /// read cache and no TopK `n` partitions open each segment at most
+        /// `min(G, n)` times, without a read cache exactly once, and in the
+        /// global order exactly as many times as [`main_global_deal`] deals
+        /// it runs; every surviving row group is read by exactly one owner,
+        /// each partition's units keep publication order, and every unit's
+        /// indices ascend.
         ///
         /// Fails against one unit per row group (a segment of `G > n` groups
         /// opens `G` times), against runs cut to `floor(G / n)` (`n + 1` runs
         /// when `n` does not divide `G`), and, in the global mode, against
-        /// cutting a run wherever another segment's group interleaves (the
-        /// interleaved case opens a segment once per alternation).
+        /// cutting runs to `ceil(G / n)` groups (a segment whose groups the
+        /// deal gives one partition in a row opens more than once).
         #[test]
         fn runs_open_each_segment_at_most_min_groups_partitions_times(
             survivors in proptest::collection::vec(
@@ -2100,7 +2306,7 @@ mod owned_work_tests {
             let refs: Vec<SegmentRef> = (0..survivors.len())
                 .map(|s| seg_ref(&format!("seg{s}")))
                 .collect();
-            let segs = survivors
+            let segs: Vec<Option<PlannedUnit>> = survivors
                 .iter()
                 .zip(&keys)
                 .map(|(blocks, keys)| {
@@ -2113,6 +2319,7 @@ mod owned_work_tests {
                     )
                 })
                 .collect();
+            let dealt = main_global_deal(&segs, &vec![false; survivors.len()], &refs, n);
             let counts = assemble(segs, vec![false; survivors.len()], &refs, stripe, by_min_ts);
             prop_assert_eq!(counts.global.is_some(), stripe && by_min_ts);
 
@@ -2123,15 +2330,26 @@ mod owned_work_tests {
 
             for (s, blocks) in survivors.iter().enumerate() {
                 let opens = owned.iter().flatten().filter(|o| o.ordinal == s).count();
-                let bound = if stripe { blocks.len().min(n) } else { 1 };
-                prop_assert!(
-                    (1..=bound).contains(&opens),
-                    "segment {} of {} groups opened {} times by {} partitions",
-                    s,
-                    blocks.len(),
-                    opens,
-                    n
-                );
+                if by_min_ts {
+                    prop_assert_eq!(
+                        opens,
+                        dealt.iter().flatten().filter(|run| run.seg == s).count(),
+                        "segment {} of {} groups by {} partitions",
+                        s,
+                        blocks.len(),
+                        n
+                    );
+                } else {
+                    let bound = if stripe { blocks.len().min(n) } else { 1 };
+                    prop_assert!(
+                        (1..=bound).contains(&opens),
+                        "segment {} of {} groups opened {} times by {} partitions",
+                        s,
+                        blocks.len(),
+                        opens,
+                        n
+                    );
+                }
                 for b in blocks {
                     let owners = owned
                         .iter()
@@ -2193,6 +2411,11 @@ mod carried_directory_reservation_tests {
 
     /// One-record blocks with timestamps `ts_step * i`.
     fn object(seq: u64, ts_step: i64) -> Vec<u8> {
+        object_from(seq, ts_step, 0)
+    }
+
+    /// One-record blocks with timestamps `base + ts_step * i`.
+    fn object_from(seq: u64, ts_step: i64, base: i64) -> Vec<u8> {
         let cfg = RlogConfig {
             block_target_records: 1,
             group_target_blocks: 4,
@@ -2208,7 +2431,7 @@ mod carried_directory_reservation_tests {
         let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
         let mut writer = RlogWriter::new(cfg, identity);
         for i in 0..BLOCKS as i64 {
-            let ts = ts_step * i;
+            let ts = base + ts_step * i;
             writer
                 .push(ravel_logseg::LogRecord {
                     stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
@@ -2815,13 +3038,13 @@ mod carried_directory_reservation_tests {
     /// ascending `ts` TopK whose filter never publishes, so the scan publishes
     /// row groups in [`global_order`] and skips nothing. Three identical
     /// segments whose groups key 1, 4 and 8 sort every segment's group 0,
-    /// then every group 1, then every group 2; over two partitions each
-    /// segment is two runs, so the queue publishes every segment's groups 0
-    /// and 1, then every segment's group 2. The read cache admits nothing (no
-    /// entry fits in one byte).
+    /// then every group 1, then every group 2; dealt over two partitions no
+    /// partition is dealt two groups of one segment in a row, so the queue
+    /// publishes the nine row groups as nine units in that order. The read
+    /// cache admits nothing (no entry fits in one byte).
     ///
-    /// Partition 0 takes segment 0's first run and partition 1 segment 1's;
-    /// partition 0 drains the other four units. Every slot handed its
+    /// Partition 0 takes segment 0's group 0 and partition 1 segment 1's;
+    /// partition 0 drains the other seven units. Every slot handed its
     /// handles out at publication, so only segment 1, which partition 1 is
     /// still on, stays reserved; once partition 1 drains too, exactly segment
     /// 1's directories are released while the exec is still alive.
@@ -2829,8 +3052,8 @@ mod carried_directory_reservation_tests {
     /// Fails against an owner count above the number of published units (a
     /// segment stays reserved after both partitions drain), against
     /// publishing in visit order (partition 1 would be on segment 0's group
-    /// 2), and against one unit per row group (nine units: 18 reopens and 60
-    /// block decodes).
+    /// 1), and against cutting each segment into `ceil(3 / 2)`-group runs (six
+    /// units: 12 reopens and 51 block decodes).
     #[tokio::test]
     async fn carried_directories_are_released_in_the_global_order() {
         use futures::StreamExt;
@@ -2907,15 +3130,11 @@ mod carried_directory_reservation_tests {
             .expect("a batch")
             .expect("partition 1 batch");
         let counts = exec.counts.get().expect("planned");
-        let runs =
-            |groups: Vec<usize>| (0..3).map(move |seg| (seg, UnitBlocks::Groups(groups.clone())));
+        let groups = |pos: usize| (0..3).map(move |seg| (seg, UnitBlocks::Groups(vec![pos])));
         assert_eq!(
             counts.units(&[], true, 2),
-            [vec![0, 1], vec![2]]
-                .into_iter()
-                .flat_map(runs)
-                .collect::<Vec<_>>(),
-            "every segment's groups 0 and 1, then every segment's group 2"
+            (0..3).flat_map(groups).collect::<Vec<_>>(),
+            "every segment's group 0, then every group 1, then every group 2"
         );
         let slots: Vec<(bool, bool, usize)> = counts
             .segs
@@ -2939,10 +3158,10 @@ mod carried_directory_reservation_tests {
 
         let drained: Vec<RecordBatch> =
             first.map(|b| b.expect("partition 0 batch")).collect().await;
-        // Every unit but segment 1's first run, blocks 1..8.
+        // Every unit but segment 1's group 0, blocks 1..4.
         assert_eq!(
             rows(std::slice::from_ref(&head)) + rows(&drained),
-            3 * (BLOCKS - 1) - 7
+            3 * (BLOCKS - 1) - 3
         );
         let after_first = budget.reserved();
         assert!(
@@ -2955,7 +3174,7 @@ mod carried_directory_reservation_tests {
             .map(|b| b.expect("partition 1 batch"))
             .collect()
             .await;
-        assert_eq!(rows(std::slice::from_ref(&mid)) + rows(&rest), 7);
+        assert_eq!(rows(std::slice::from_ref(&mid)) + rows(&rest), 3);
         assert!(
             budget.reserved() < slack,
             "segment 1's directories released while the exec is alive: {}",
@@ -2967,45 +3186,32 @@ mod carried_directory_reservation_tests {
         // and row-pathing the second) and then commits the rest to the row
         // path: two reopens and three decodes on top of its blocks' own, for
         // every unit, each of which here has at least two blocks. Each segment
-        // is two runs and decodes its 11 surviving blocks once each, so
-        // reopens are 3 * 2 * 2 = 12 and decodes 3 * (11 + 2 * 3) = 51. One
-        // unit per row group is three units a segment: 18 and 60.
-        assert_eq!(metric_total(&exec, "reopens"), 12);
-        assert_eq!(metric_total(&exec, "blocks_scanned"), 51);
+        // is three units and decodes its 11 surviving blocks once each, so
+        // reopens are 3 * 3 * 2 = 18 and decodes 3 * (11 + 3 * 3) = 60.
+        assert_eq!(metric_total(&exec, "reopens"), 18);
+        assert_eq!(metric_total(&exec, "blocks_scanned"), 60);
         drop(exec);
         assert_eq!(budget.reserved(), 0);
     }
 
-    /// A cache-wired scan with one partition under a confirmed ascending `ts`
-    /// TopK builds no global order and publishes each segment as one unit:
-    /// its sole partition opens each of the two segments of three row groups
-    /// once and reads every surviving block.
-    ///
-    /// Fails against selecting the global order on the read cache and the
-    /// TopK alone (the plan carries a global order, and one unit per row group
-    /// opens each segment three times).
-    #[tokio::test]
-    async fn topk_with_one_partition_publishes_whole_segments() {
+    /// A cache-wired scan of `segments` with one partition under a confirmed
+    /// ascending `ts` TopK whose filter never publishes, over the window
+    /// `[ts_min, ts_max]`, run to the end: the exec and the rows it read.
+    async fn sole_partition_topk_scan(
+        store: &Arc<MemoryStore>,
+        segments: &[SegmentRef],
+        ts_min: i64,
+        ts_max: i64,
+    ) -> (LogsScanExec, usize) {
         use futures::StreamExt;
 
-        let store = Arc::new(MemoryStore::new());
-        let mut segments = Vec::new();
-        for seq in 1..=2u64 {
-            let obj = object(seq, 1);
-            let key = format!("t/sole{seq}.rlog");
-            store
-                .put(&key, bytes::Bytes::from(obj.clone()), PutOptions::default())
-                .await
-                .expect("put");
-            segments.push(seg_ref(&key, &obj, 1, seq));
-        }
         let cache: Arc<ravel_cache::Cache<ravel_query::CacheFetchError>> = Arc::new(
             ravel_cache::Cache::new(ravel_cache::CacheLimits::new(64 << 20, 4096, 1)),
         );
-        let fetcher = LogSegmentFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+        let fetcher = LogSegmentFetcher::new(Arc::clone(store) as Arc<dyn ObjectStoreBackend>)
             .with_cache(cache)
             .with_block_range(
-                BlockRangeFetcher::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>)
+                BlockRangeFetcher::new(Arc::clone(store) as Arc<dyn ObjectStoreBackend>)
                     .with_suffix_len(256)
                     .with_whole_object_threshold(0),
             )
@@ -3016,15 +3222,13 @@ mod carried_directory_reservation_tests {
             vec![ts],
             datafusion::physical_expr::expressions::lit(true),
         ));
-        // The window starts after each segment's first block, so no segment is
-        // contained in it and the planned route runs.
         let exec = LogsScanExec::new(
             TENANT,
             fetcher,
-            &segments,
+            segments,
             1,
-            1,
-            BLOCKS as i64,
+            ts_min,
+            ts_max,
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
@@ -3044,12 +3248,103 @@ mod carried_directory_reservation_tests {
             .map(|b| b.expect("batch"))
             .collect()
             .await;
-        assert_eq!(rows(&batches), 2 * (BLOCKS - 1));
+        let read = rows(&batches);
+        (exec, read)
+    }
+
+    /// Puts `obj` under `key` and returns its reference, its timestamps
+    /// starting at `base`.
+    async fn put_segment(
+        store: &Arc<MemoryStore>,
+        key: &str,
+        obj: &[u8],
+        seq: u64,
+        base: i64,
+    ) -> SegmentRef {
+        store
+            .put(key, bytes::Bytes::from(obj.to_vec()), PutOptions::default())
+            .await
+            .expect("put");
+        let seg = seg_ref(key, obj, 1, seq);
+        SegmentRef {
+            min_event_ts_ns: base + seg.min_event_ts_ns,
+            max_event_ts_ns: base + seg.max_event_ts_ns,
+            ..seg
+        }
+    }
+
+    /// A cache-wired scan with one partition under a confirmed ascending `ts`
+    /// TopK builds the global order, as the per-partition deal did at one
+    /// partition: two identical segments of three row groups keyed 0, 4 and
+    /// 8 alternate in it, so its sole partition opens each segment once per
+    /// row group and reads every surviving block.
+    ///
+    /// Fails against building no global order for one partition (the plan
+    /// carries none, and each segment is one unit opened once).
+    #[tokio::test]
+    async fn topk_with_one_partition_follows_the_global_deal() {
+        let store = Arc::new(MemoryStore::new());
+        let mut segments = Vec::new();
+        for seq in 1..=2u64 {
+            let key = format!("t/sole{seq}.rlog");
+            segments.push(put_segment(&store, &key, &object(seq, 1), seq, 0).await);
+        }
+        // The window starts after each segment's first block, so no segment is
+        // contained in it and the planned route runs.
+        let (exec, read) = sole_partition_topk_scan(&store, &segments, 1, BLOCKS as i64).await;
+        assert_eq!(read, 2 * (BLOCKS - 1));
         let counts = exec.counts.get().expect("planned");
         assert!(counts.planned(0).is_some() && counts.planned(1).is_some());
         assert!(
-            counts.global.is_none(),
-            "one partition builds no global order"
+            counts.global.is_some(),
+            "one partition builds the global order"
+        );
+        assert_eq!(
+            counts.units(&[], true, 1),
+            (0..3)
+                .flat_map(|pos| (0..2).map(move |seg| (seg, UnitBlocks::Groups(vec![pos]))))
+                .collect::<Vec<_>>(),
+            "the segments' row groups alternate"
+        );
+        assert_eq!(
+            metric_total(&exec, "segments_opened"),
+            6,
+            "each segment opened once per row group"
+        );
+    }
+
+    /// One partition, a read cache and a confirmed ascending `ts` TopK over
+    /// two time-disjoint segments, the later one first in the snapshot: the
+    /// global order holds each segment's row groups consecutively, so each
+    /// segment is one unit, opened once, the earlier segment first.
+    ///
+    /// Fails against building no global order for one partition (the plan
+    /// carries none) and against one unit per row group (six opens).
+    #[tokio::test]
+    async fn topk_one_partition_time_disjoint_segments_open_once() {
+        let store = Arc::new(MemoryStore::new());
+        let segments = vec![
+            put_segment(&store, "t/late.rlog", &object_from(1, 1, 100), 1, 100).await,
+            put_segment(&store, "t/early.rlog", &object(2, 1), 2, 0).await,
+        ];
+        // The window excludes the early segment's first block and the late
+        // segment's last, so neither is contained in it and the planned route
+        // runs.
+        let (exec, read) = sole_partition_topk_scan(&store, &segments, 1, 110).await;
+        assert_eq!(read, 2 * (BLOCKS - 1));
+        let counts = exec.counts.get().expect("planned");
+        assert!(counts.planned(0).is_some() && counts.planned(1).is_some());
+        assert!(
+            counts.global.is_some(),
+            "one partition builds the global order"
+        );
+        assert_eq!(
+            counts.units(&[], true, 1),
+            vec![
+                (1, UnitBlocks::Groups(vec![0, 1, 2])),
+                (0, UnitBlocks::Groups(vec![0, 1, 2])),
+            ],
+            "each segment one unit, the earlier first"
         );
         assert_eq!(
             metric_total(&exec, "segments_opened"),

@@ -19,16 +19,17 @@
 //!   times. This lets a query touching fewer segments than
 //!   `target_partitions` still fan out to `target_partitions` partitions: the
 //!   old segment-granular rule (`min(target_partitions, segment_count)`)
-//!   pinned such a query to at most `segment_count` partitions. Under a
-//!   confirmed ascending `ts` TopK the row groups are instead sorted by their
-//!   blocks' least minimum `ts` across all segments, an unplanned segment by
-//!   its own minimum ([`global_order`]), and each segment's row groups, in
-//!   that sorted sequence, are cut into runs of the same length, each run
-//!   published where its first row group sorts; so the earliest row groups
-//!   are taken first and the same `min(G, n)` bound holds. A scan with one
-//!   partition publishes each segment as one unit, under a TopK too, since
-//!   its sole partition owns every row group anyway
-//!   ([`LogsScanExec::striped`]).
+//!   pinned such a query to at most `segment_count` partitions. A scan with
+//!   one partition publishes each segment as one unit, since its sole
+//!   partition owns every row group anyway ([`LogsScanExec::striped`]).
+//!   Under a confirmed ascending `ts` TopK, at any partition count, the row
+//!   groups are instead sorted by their blocks' least minimum `ts` across all
+//!   segments, an unplanned segment by its own minimum ([`global_order`]),
+//!   and dealt as ADR-2677 decision 6 deals them: unit `i` to queue `i % n`,
+//!   a queue's consecutive row groups of one segment in ascending position
+//!   merged into one run, and the runs published in the order of their first
+//!   row group ([`global_runs`]). The earliest row groups are taken first,
+//!   and each run is read in its global order.
 //! - **Un-cached: segment-granular.** Each segment is one unit, so every
 //!   segment is opened by exactly one partition. The partition count is
 //!   capped at the segment count.
@@ -1252,7 +1253,9 @@ pub struct LogsScanExec {
     /// [`LogSegmentFetcher::has_cache`] (ADR-0102, amended by #693). `true` (a
     /// cache is wired) publishes each segment as runs of its surviving row
     /// groups when the scan has more than one partition ([`Self::striped`]),
-    /// so a segment's row groups spread across partitions; `false` publishes each
+    /// or under a confirmed ascending `ts` TopK at any partition count
+    /// ([`global_order`]), so a segment's row groups spread across
+    /// partitions; `false` publishes each
     /// segment as one unit, so an un-cached scan opens each segment exactly
     /// once. Threaded into the stream and [`PlanCounts::publish`]; the same
     /// predicate gates `declared_partitions` above.
@@ -1837,10 +1840,11 @@ impl LogsScanExec {
         self.topk.as_ref().filter(|topk| topk.confirmed)
     }
 
-    /// Whether the planned route publishes row-group runs rather than whole
-    /// segments: a read cache is wired and the scan has more than one
-    /// partition. A sole partition owns every row group of a segment, so it
-    /// reads each segment as one unit, under a TopK too.
+    /// Whether the planned route without a confirmed TopK publishes row-group
+    /// runs rather than whole segments: a read cache is wired and the scan has
+    /// more than one partition. A sole partition owns every row group of a
+    /// segment, so it reads each segment as one unit. Under a confirmed
+    /// ascending `ts` TopK a read cache alone selects [`global_order`].
     fn striped(&self) -> bool {
         self.stripe_blocks && self.target_partitions > 1
     }
@@ -1950,9 +1954,10 @@ impl LogsScanExec {
         // never plans a partition whose extra GETs nothing absorbs.
         // `stripe_blocks` decides both the partition count and the per-unit
         // assignment, and is computed once from the same `has_cache` predicate:
-        // with the cache and more than one partition each segment is cut into
-        // runs of row groups, otherwise each segment is one unit taken whole
-        // by one partition (see `LogsScanExec::striped`, `PlanCounts::units`).
+        // with the cache and more than one partition, or with the cache under a
+        // confirmed ascending `ts` TopK, each segment is cut into runs of row
+        // groups, otherwise each segment is one unit taken whole by one
+        // partition (see `LogsScanExec::striped`, `PlanCounts::units`).
         let stripe_blocks = fetcher.has_cache();
         let declared_partitions = if stripe_blocks {
             target_partitions.max(1)
@@ -3064,7 +3069,7 @@ impl ExecutionPlan for LogsScanExec {
                         Arc::clone(&ctx),
                         Arc::clone(&self.segments),
                         self.target_partitions,
-                        self.striped(),
+                        self.stripe_blocks,
                         self.active_topk().is_some(),
                         blocks.plan_init_elapsed.clone(),
                     );
@@ -3198,7 +3203,8 @@ struct LogScanStream {
     /// The assignment mode (ADR-0102, amended by #693): row-group runs when a
     /// cache is wired and the scan has more than one partition, segment units
     /// otherwise, since a sole partition owns every row group of a segment and
-    /// reads them best as one share. Passed to [`PlanCounts::publish`].
+    /// reads them best as one share. Passed to [`PlanCounts::publish`], which
+    /// ignores it when the plan carries [`global_order`].
     stripe_blocks: bool,
     /// The predicate-free full-window whole-segment fast path (#693 part 3,
     /// deliverable 1). When set, `work` was filled by [`owned_whole_segments`]

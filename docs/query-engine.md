@@ -611,17 +611,22 @@ partition:
   by exactly one partition
   (`every_surviving_row_group_is_consumed_exactly_once_by_one_partition`).
   Behind a confirmed ascending `ORDER BY ts LIMIT k`
-  (`LogsScanExec::active_topk().is_some()`) with more than one partition,
-  `global_order` sorts every segment's groups by `(group_key, segment index,
-  group position)`, where `group_key` is a group's least stored minimum `ts`
-  (`i64::MIN` for a group with no bound) and an unplanned segment is one unit
-  keyed by its own minimum. Each segment's groups, in that order, are cut into
-  runs of `ceil(G / n)`, each run is published at the position of its first
-  group, and the queue hands units out in that order, so the earliest-`ts`
-  groups are taken first whichever partition asks and the TopK's threshold
-  skip can cut off the rest (`topk_units_are_published_in_global_deal_order`).
-  Otherwise the queue holds segments in visit order, each segment's runs in
-  group order (`striped_units_follow_visit_order_with_groups_in_sequence`).
+  (`LogsScanExec::active_topk().is_some()`) with a read cache, at any
+  partition count including one, the units and their order are the global
+  deal's, unchanged from the per-partition deal: `global_order` sorts every
+  segment's groups by `(group_key, segment index, group position)`, where
+  `group_key` is a group's least stored minimum `ts` (`i64::MIN` for a group
+  with no bound) and an unplanned segment is one unit keyed by its own
+  minimum; `global_runs` deals unit `i` to partition `i % n`, merges a
+  partition's consecutive groups of one segment in ascending position into
+  one run, and publishes each run at the position of its first group. No
+  `ceil(G / n)` cut applies, and a segment is opened once per dealt run
+  (`topk_units_match_main_global_deal_with_dealt_run_merge`). The queue hands
+  units out in that order, so the earliest-`ts` groups are taken first
+  whichever partition asks and the TopK's threshold skip can cut off the rest
+  (`topk_units_are_published_in_global_deal_order`). Otherwise the queue
+  holds segments in visit order, each segment's runs in group order
+  (`striped_units_follow_visit_order_with_groups_in_sequence`).
   Either way every block of a group is on one partition
   (`a_row_group_stays_with_one_owner`), so the partition that takes a group
   decodes each of its dictionary pages once, as the reader's dictionary cache
@@ -629,8 +634,11 @@ partition:
   would each decode them. How many units a partition takes depends on how
   soon it finishes the ones it has, not on a fixed share, and a partition that
   finds the queue empty runs an empty stream. Without a read cache, or with
-  one partition (TopK or not, `LogsScanExec::striped`), each segment is one
-  unit (`topk_with_one_partition_publishes_whole_segments`).
+  one partition and no TopK (`LogsScanExec::striped`), each segment is one
+  unit; with one partition under the TopK the global deal above applies
+  (`topk_with_one_partition_follows_the_global_deal`), which publishes a
+  segment whose groups no other segment's interleave as one unit
+  (`topk_one_partition_time_disjoint_segments_open_once`).
 - **The ranged plan covers the unit's own blocks.** A subset open
   intersects the ts and numeric candidate blocks with the blocks its unit
   holds before the projected page extents and the coverage crossover are
@@ -4440,9 +4448,12 @@ is the precondition ADR-0102 decision 1 names for it:
 - **Cache wired** (`ravel-server` built a read cache and called
   `LogSegmentFetcher::with_cache`, i.e. `--disable-cache` is off): the scan
   declares `target_partitions` partitions, even where the snapshot has fewer
-  segments than that. With `n > 1` partitions, each run of `ceil(G / n)` of a
-  segment's `G` surviving row groups is a unit, so the segment is opened at
-  most `min(G, n)` times; with one partition, TopK or not, each segment is.
+  segments than that. Under a confirmed ascending `ts` TopK the units are
+  the global deal's runs at any partition count (see "Row-group runs are
+  units, taken whole"). Otherwise, with `n > 1` partitions, each run of
+  `ceil(G / n)` of a segment's `G` surviving row groups is a unit, so the
+  segment is opened at most `min(G, n)` times; with one partition each
+  segment is.
 - **No cache** (`--disable-cache`, or any embedding that never calls
   `with_cache`): the scan declares `min(target_partitions, segment_count)`, the
   pre-ADR-0102 bound, and each segment is one unit.
@@ -4718,16 +4729,16 @@ of the TopK's, nothing is confirmed and nothing is skipped. A confirmed scan
 shows `topk_threshold=ts` in a `ravel-cli sql explain` plan. The scan only
 reads `t` off the confirmed filter's current expression and uses it twice:
 
-- Without a read cache wired, or with one partition, segments are visited in
+- Without a read cache wired, segments are visited in
   ascending `min_event_ts_ns` (ties by snapshot index) instead of snapshot order (dealt
   to partitions on the whole-segment fast path, queued as units otherwise),
   and a partition does not open a segment it owns whose `min_event_ts_ns` is
   strictly above `t`. A row ref's segment ordinal is still the snapshot
-  index. With a read cache wired and more than one partition, the order moves
+  index. With a read cache wired, at any partition count, the order moves
   to row-group granularity instead: `global_order` orders every segment's
   groups by `(group_key, segment index, group position)` and the unit queue
-  hands runs out in that global order, as described under "Row-group runs
-  are units, taken whole" above.
+  hands the global deal's runs out in that order, as described under
+  "Row-group runs are units, taken whole" above.
 - Before decoding each block, the scan skips every block at the cursor
   whose skip-index minimum `ts` is strictly above `t`. No column of a
   skipped block is fetched for decode or decoded. Each candidate is
