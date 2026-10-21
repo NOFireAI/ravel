@@ -651,7 +651,9 @@ operator itself, on EKS Pod Identity roles, with no key in any Secret
   takes `--credentials-sidecar-image` (env
   `RAVEL_CREDENTIALS_SIDECAR_IMAGE`), which must name the operator's own
   image. A `podIdentity` cluster reconciled without it is `Degraded` with
-  reason `CredentialsSidecarImageUnset`.
+  reason `CredentialsSidecarImageUnset`. Because the image is part of every
+  tier's pod template, an operator upgrade that changes it rolls every
+  tier pod of a `podIdentity` cluster.
 - **The operator's own credentials.** For `sys/auth` and the
   `shardOverrides` reshard the operator fetches its own pod's Pod Identity
   credentials in memory, with the sidecar's fetch code, and caches them

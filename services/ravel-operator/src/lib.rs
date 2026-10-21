@@ -1,8 +1,8 @@
 //! Ravel Kubernetes operator (ADR-0034).
 //!
 //! Reconciles a `RavelCluster` custom resource into gateway, query, and
-//! maintain Deployments and Services for `services/ravel-server`. The crate is
-//! split into three layers:
+//! maintain Deployments and Services for `services/ravel-server`. Its main
+//! modules:
 //!
 //! - [`crd`]: the `RavelCluster` custom resource types and CRD generation.
 //! - [`reconcile`]: pure functions that render a [`crd::RavelClusterSpec`] into
@@ -13,8 +13,10 @@
 //!   (`ravel-operator pod-identity-credentials`) and the operator's own
 //!   in-memory Pod Identity credentials, for `storage.s3.auth: podIdentity`.
 //!
-//! The operator renders Kubernetes objects from the CRD only. It never talks to
-//! the object store or links any `ravel-*` crate.
+//! The operator renders Kubernetes objects from the CRD. Outside the API
+//! server it talks to the object store, through `ravel-object-store`, only for
+//! `sys/auth` and the reshard records, and under `podIdentity` to the node's
+//! Pod Identity agent for its own credentials.
 
 pub mod controller;
 pub mod crd;
