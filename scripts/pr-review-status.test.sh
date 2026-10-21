@@ -1093,6 +1093,8 @@ E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion"
 rerun_fail_out="$(e2e "${CLEAN_BODY_JSON}")"
 E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T18:52:55Z"},{"name":"sql","workflowName":"nightly","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-10-20T17:57:40Z"}]'
 rerun_two_workflows_out="$(e2e "${CLEAN_BODY_JSON}")"
+E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T18:52:55Z"},{"name":"sql","workflowName":"ci","status":"QUEUED","conclusion":null,"startedAt":null}]'
+rerun_queued_out="$(e2e "${CLEAN_BODY_JSON}")"
 unset E2E_ROLLUP
 
 check_eq "superseded run: an older cancelled run under a newer success counts once, as a pass" \
@@ -1107,6 +1109,9 @@ check_eq "superseded run: a newer failure over an older success counts as a fail
 check_eq "superseded run: same job name in two workflows is two checks" \
   "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/1 fail (sql) | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
   "$(printf '%s\n' "${rerun_two_workflows_out}" | sed -n 1p)"
+check_eq "superseded run: a queued re-run with no startedAt reads as pending, not as the older pass" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=0 pass/1 pending/0 fail | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${rerun_queued_out}" | sed -n 1p)"
 
 # The post-fork shape guard (issue #2811) sits last before the merge line. A
 # hit refuses the merge line outright; a guard that could not answer prints a
