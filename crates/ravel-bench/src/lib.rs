@@ -43,6 +43,8 @@ pub mod logs_scan_scaling;
 pub mod metrics_gen;
 pub mod metrics_ingest;
 pub mod metrics_workload;
+#[cfg(feature = "sql-latency")]
+pub mod mixed_cache;
 // Compiled in the default test build too, where ravel-server is a
 // dev-dependency, so its count test runs without the `saturation` feature.
 #[cfg(any(feature = "saturation", test))]

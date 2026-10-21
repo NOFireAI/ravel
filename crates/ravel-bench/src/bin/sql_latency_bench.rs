@@ -29,10 +29,15 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use ravel_bench::harness::{DelayedGetStore, StoreKind, store_from_env};
+use ravel_bench::mixed_cache::{
+    MixedConfig, MixedReport, check_report, check_runs_table, parse_arms, render_report,
+    render_runs_table, run_mixed,
+};
 use ravel_bench::sql_corpus::{checked_default_corpus, load_external_corpus};
 use ravel_bench::sql_latency::{
-    Compaction, DatasetInfo, FlightTarget, GenerateConfig, Provenance, RunAccounting,
-    SqlLatencyReport, TenantConfigInput, run_generated_with_bulk_scan_min_bytes, run_tenant,
+    Compaction, DatasetInfo, ExecutorSettings, FlightTarget, GenerateConfig, Provenance,
+    RunAccounting, SqlLatencyReport, TenantConfigInput, logs_fetch_resolution,
+    run_generated_with_bulk_scan_min_bytes, run_tenant,
 };
 use ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 use ravel_types::TimeRange;
@@ -326,6 +331,96 @@ struct Args {
     /// command line lands in the shell history and in `ps`.
     #[arg(long = "flight-token", value_name = "TOKEN", requires = "flight")]
     flight_token: Option<String>,
+
+    // --- mixed scan and interactive workload (ADR-3072 track P5) ---------
+    /// Run the mixed workload instead of the per-statement corpus: on one
+    /// generated tenant, `--mixed-background` connections loop full-tenant
+    /// scans the block statistics cannot prune while `--mixed-foreground`
+    /// connections loop a small interactive set over the last
+    /// `--mixed-window-objects` objects, for `--mixed-duration-secs`, once per
+    /// arm of `--mixed-arms` per repetition, arms interleaved. Needs
+    /// `--generate` and `--cache-bytes > 0`; the report (JSON on stdout, table
+    /// on stderr) fails the run when a figure is missing or a class with
+    /// connections completed no statement.
+    #[arg(long, requires = "generate", conflicts_with_all = ["corpus", "cache_bulk_scan_min_bytes", "explain", "progress_jsonl"])]
+    mixed: bool,
+    /// Seconds each arm run loops its connections; a statement in flight at
+    /// the end completes and is counted.
+    #[arg(
+        long = "mixed-duration-secs",
+        value_name = "SECS",
+        default_value_t = 60,
+        requires = "mixed"
+    )]
+    mixed_duration_secs: u64,
+    /// Background (scan) connections per arm run.
+    #[arg(
+        long = "mixed-background",
+        value_name = "N",
+        default_value_t = 4,
+        requires = "mixed"
+    )]
+    mixed_background: usize,
+    /// Foreground (interactive) connections per arm run; 0 is the scans-only
+    /// shape, which reports the scans-only band instead of the mixed ones.
+    #[arg(
+        long = "mixed-foreground",
+        value_name = "N",
+        default_value_t = 4,
+        requires = "mixed"
+    )]
+    mixed_foreground: usize,
+    /// The arms, `label=value` separated by commas; value is `unset` (the
+    /// flag unset), `region` (the bulk region's bytes, `--cache-bytes` times
+    /// `--cache-bulk-share`), `cache` (`--cache-bytes`), or a byte count for
+    /// `--cache-bulk-scan-min-bytes`. The first arm is the bands' reference.
+    #[arg(
+        long = "mixed-arms",
+        value_name = "ARMS",
+        default_value = "A=unset,B=region,C=cache",
+        requires = "mixed"
+    )]
+    mixed_arms: String,
+    /// Repetitions of the whole arm sequence.
+    #[arg(
+        long = "mixed-repetitions",
+        value_name = "N",
+        default_value_t = 3,
+        requires = "mixed"
+    )]
+    mixed_repetitions: usize,
+    /// Length of each generated record's high-entropy body, which is what
+    /// sets the on-object bytes per record.
+    #[arg(
+        long = "mixed-body-bytes",
+        value_name = "BYTES",
+        default_value_t = 256,
+        requires = "mixed"
+    )]
+    mixed_body_bytes: usize,
+    /// How many of the most recent objects the foreground window covers; the
+    /// run refuses a window whose resolved bytes reach `--cache-bytes`.
+    #[arg(
+        long = "mixed-window-objects",
+        value_name = "N",
+        default_value_t = 2,
+        requires = "mixed"
+    )]
+    mixed_window_objects: usize,
+    /// Restrict the background set to these statement ids, comma-separated
+    /// (`bg_filter_count`, `bg_filter_group`, `bg_full_aggregate`); unset
+    /// loops all three. The scans-only check loops one.
+    #[arg(
+        long = "mixed-background-ids",
+        value_name = "IDS",
+        value_delimiter = ',',
+        requires = "mixed"
+    )]
+    mixed_background_ids: Vec<String>,
+    /// The read cache's bulk region share, the same knob as `ravel-server
+    /// --cache-bulk-share`. Mixed mode only.
+    #[arg(long = "cache-bulk-share", value_name = "SHARE", default_value_t = ravel_cache::DEFAULT_BULK_SHARE, requires = "mixed")]
+    cache_bulk_share: f64,
 }
 
 /// The `--logs-fetch-policy` values, the CLI-facing mirror of
@@ -407,6 +502,9 @@ fn provenance_strings(store: StoreKind) -> (String, String, String) {
 #[tokio::main]
 async fn main() -> ExitCode {
     let args = Args::parse();
+    if args.mixed {
+        return run_mixed_mode(&args).await;
+    }
     match run(&args).await {
         Ok(report) => {
             match serde_json::to_string_pretty(&report) {
@@ -433,6 +531,89 @@ async fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// The mixed workload mode (ADR-3072 track P5): print the report as JSON on
+/// stdout and the table on stderr, then refuse a report that lacks a figure
+/// or whose class with connections completed no statement, so the exit code
+/// says whether the figures are a measurement.
+async fn run_mixed_mode(args: &Args) -> ExitCode {
+    let report = match mixed_report(args).await {
+        Ok(report) => report,
+        Err(err) => {
+            eprintln!("sql_latency_bench: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => println!("{json}"),
+        Err(err) => {
+            eprintln!("sql_latency_bench: failed to serialize report: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+    eprint!("{}", render_report(&report));
+    let table = render_runs_table(&report);
+    if let Err(err) = check_report(&report).and_then(|()| check_runs_table(&table, &report)) {
+        eprintln!("sql_latency_bench: the mixed report is not a measurement: {err}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// Build the mixed configuration from the generated-lane knobs plus the
+/// `--mixed-*` flags and run it.
+async fn mixed_report(args: &Args) -> Result<MixedReport, ravel_bench::sql_latency::Error> {
+    let (mut store_backend, _region, _endpoint) = provenance_strings(args.store);
+    let mut store = store_from_env(args.store);
+    if let Some(ms) = args.inject_get_delay_ms {
+        store = Arc::new(DelayedGetStore::new(store, Duration::from_millis(ms)));
+        store_backend = format!("{store_backend}+get-delay-{ms}ms");
+    }
+    let policy = args.logs_fetch_policy.policy();
+    let resolved = logs_fetch_resolution(
+        policy,
+        &StoreCostProfile::reference(),
+        args.logs_request_cost_bytes,
+        args.logs_block_range_threshold,
+    );
+    let settings = ExecutorSettings {
+        max_query_bytes: args.sql_max_query_bytes,
+        shard_count: 1,
+        fetch_concurrency: args.fetch_concurrency,
+        sql_partition_count: args.sql_partition_count,
+        store_get_concurrency: args.store_get_concurrency,
+        tenant_max_bytes: args.sql_tenant_max_bytes,
+        parallel_final_aggregation: args.sql_parallel_final_aggregation,
+        max_segments: args.sql_max_segments,
+        logs_block_range_threshold: resolved.block_range_threshold,
+        logs_suffix_len: args.logs_suffix_len,
+        logs_request_cost_bytes: resolved.request_cost_bytes,
+        logs_projection_break_even_bytes: resolved.projection_break_even_bytes,
+        logs_fetch_policy: policy,
+        cache_bulk_scan_min_bytes: None,
+    };
+    let arms = parse_arms(&args.mixed_arms, args.cache_bytes, args.cache_bulk_share)?;
+    let cfg = MixedConfig {
+        store,
+        store_backend,
+        records: args.records,
+        records_per_object: args.records_per_object,
+        extra_attrs: args.extra_attrs,
+        body_bytes: args.mixed_body_bytes,
+        cache_bytes: args.cache_bytes,
+        cache_bulk_share: args.cache_bulk_share,
+        duration: Duration::from_secs(args.mixed_duration_secs),
+        background: args.mixed_background,
+        foreground: args.mixed_foreground,
+        arms,
+        repetitions: args.mixed_repetitions,
+        window_objects: args.mixed_window_objects,
+        background_ids: args.mixed_background_ids.clone(),
+        deadline: Duration::from_secs(args.deadline_secs),
+        settings,
+    };
+    run_mixed(&cfg).await
 }
 
 async fn run(args: &Args) -> Result<SqlLatencyReport, ravel_bench::sql_latency::Error> {

@@ -86,7 +86,7 @@ use crate::sql_corpus::CorpusEntry;
 /// of buckets per shard rather than a wall-clock number of them (the same
 /// technique `flight_sql_egress` uses).
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
-const NOW_NS: i64 = 4 * NS_PER_HOUR;
+pub(crate) const NOW_NS: i64 = 4 * NS_PER_HOUR;
 
 /// The `SqlExecutor` tenant-accountant ceiling the bench used before it was a
 /// flag: 1 GiB, matching `ravel-server`'s own default.
@@ -1681,8 +1681,8 @@ impl Default for ExecutorSettings {
 /// widening that type would change the distributed accounting protobuf, a frozen
 /// contract. See [`measure_corpus`] for how a per-run figure is taken from an
 /// accumulating counter.
-struct ColdExecutor {
-    executor: SqlExecutor,
+pub(crate) struct ColdExecutor {
+    pub(crate) executor: SqlExecutor,
     probe_misses: ProbeMissCounter,
     /// Per-phase WIRE bytes of the same log fetcher (#913), cloned out for the
     /// same reason as `probe_misses`: `SqlOutcome` carries only a pooled
@@ -1745,7 +1745,7 @@ fn executor_engine_config(settings: &ExecutorSettings) -> Result<EngineConfig, E
     Ok(engine)
 }
 
-fn cold_executor(
+pub(crate) fn cold_executor(
     store: &Arc<dyn ObjectStoreBackend>,
     declared: &[DeclaredColumn],
     cache: Option<Arc<Cache<CacheFetchError>>>,
@@ -2361,7 +2361,7 @@ async fn measure_over_flight(
 /// read off the resolve every caller already performs -- no new state, no
 /// operator input, and no way for it to drift from what the tenant actually
 /// is.
-async fn dataset_info(
+pub(crate) async fn dataset_info(
     store: &Arc<dyn ObjectStoreBackend>,
     tenant_hash: TenantHash,
     window: TimeRange,
@@ -2971,7 +2971,10 @@ async fn generate_dataset(
             writer_epoch: 1,
             writer_seq,
             object_size: bytes.len() as u64,
-            content_hash: [0u8; 32],
+            // The read cache keys an entry by this hash, so each object needs
+            // its own: an all-zero hash lets objects of equal size serve each
+            // other's bytes from cache.
+            content_hash: *blake3::hash(&bytes).as_bytes(),
             sample_count: chunk.len() as u64,
             series_count: 1,
             min_event_ts_ns: min,

@@ -545,6 +545,14 @@ path = "tests/sql_latency_smoke.rs"
 required-features = ["sql-latency"]
 bench = false
 
+# The mixed scan-and-interactive cache admission mode (ADR-3072 track P5):
+# drives `run_mixed` on a tiny corpus and pins the report contract.
+[[test]]
+name = "mixed_cache_smoke"
+path = "tests/mixed_cache_smoke.rs"
+required-features = ["sql-latency"]
+bench = false
+
 # Tripwire for the object_count invariant (issue #481): distinct data-object
 # keys reachable from the resolved snapshot equal the reported object_count.
 # Behind sql-latency because the L0 case drives the sql_latency harness.
