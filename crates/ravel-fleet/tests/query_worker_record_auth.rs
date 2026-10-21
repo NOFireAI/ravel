@@ -59,8 +59,8 @@ fn ids(live: &[QueryWorkerRecord]) -> Vec<String> {
 }
 
 /// The reader's reject counters, in `RecordReject::ALL` order:
-/// `[missing_mac, bad_mac, oversize, malformed]`.
-fn rejects(reader: &QueryWorkers) -> [u64; 4] {
+/// `[missing_mac, bad_mac, oversize, malformed, stale_stamp]`.
+fn rejects(reader: &QueryWorkers) -> [u64; RecordReject::ALL.len()] {
     reader.record_rejects().by_reason().map(|(_, n)| n)
 }
 
@@ -117,7 +117,7 @@ async fn forged_unsigned_record_at_fresh_uuid_is_excluded() {
 
     let live = reader.live_set(&store, NOW).await.expect("live set");
     assert_eq!(ids(&live), vec![reader.process_id().to_string()]);
-    assert_eq!(rejects(&reader), [1, 0, 0, 0], "exactly one missing_mac");
+    assert_eq!(rejects(&reader), [1, 0, 0, 0, 0], "exactly one missing_mac");
 }
 
 /// A sibling signed under the shared key is admitted; the same object with
@@ -132,7 +132,7 @@ async fn signed_sibling_is_admitted_and_a_bad_mac_is_rejected() {
     let live = reader.live_set(&store, NOW).await.expect("live set");
     assert!(ids(&live).contains(&sibling.process_id().to_string()));
     assert_eq!(live.len(), 2);
-    assert_eq!(rejects(&reader), [0, 0, 0, 0]);
+    assert_eq!(rejects(&reader), [0, 0, 0, 0, 0]);
 
     let mut value: serde_json::Value =
         serde_json::from_slice(&object(&store, &sibling).await).expect("decode");
@@ -150,7 +150,7 @@ async fn signed_sibling_is_admitted_and_a_bad_mac_is_rejected() {
 
     let live = reader.live_set(&store, NOW).await.expect("live set");
     assert_eq!(ids(&live), vec![reader.process_id().to_string()]);
-    assert_eq!(rejects(&reader), [0, 1, 0, 0], "exactly one bad_mac");
+    assert_eq!(rejects(&reader), [0, 1, 0, 0, 0], "exactly one bad_mac");
 }
 
 /// The MAC covers the endpoint: a signed record whose `fragment_endpoint`
@@ -175,7 +175,7 @@ async fn signed_record_with_an_edited_endpoint_is_rejected() {
 
     let live = reader.live_set(&store, NOW).await.expect("live set");
     assert_eq!(ids(&live), vec![reader.process_id().to_string()]);
-    assert_eq!(rejects(&reader), [0, 1, 0, 0]);
+    assert_eq!(rejects(&reader), [0, 1, 0, 0, 0]);
 }
 
 /// The record key is derived, not the file key itself: a MAC over the exact
@@ -217,7 +217,7 @@ async fn record_maced_under_the_raw_file_key_is_rejected() {
     );
     assert!(!live.contains(&raw.process_id), "the raw file key does not");
     assert_eq!(live.len(), 2);
-    assert_eq!(rejects(&reader), [0, 1, 0, 0]);
+    assert_eq!(rejects(&reader), [0, 1, 0, 0, 0]);
 }
 
 /// Key rotation: a record minted under B (B listed first) verifies at a
@@ -231,12 +231,12 @@ async fn record_minted_under_the_second_key_verifies_during_rotation() {
     let both = worker(&[KEY_A, KEY_B]);
     let live = both.live_set(&store, NOW).await.expect("live set");
     assert!(ids(&live).contains(&rotated.process_id().to_string()));
-    assert_eq!(rejects(&both), [0, 0, 0, 0]);
+    assert_eq!(rejects(&both), [0, 0, 0, 0, 0]);
 
     let only_a = worker(&[KEY_A]);
     let live = only_a.live_set(&store, NOW).await.expect("live set");
     assert!(!ids(&live).contains(&rotated.process_id().to_string()));
-    assert_eq!(rejects(&only_a), [0, 1, 0, 0]);
+    assert_eq!(rejects(&only_a), [0, 1, 0, 0, 0]);
 }
 
 /// A 5000-byte object is skipped as `oversize` without being decoded. Its
@@ -264,7 +264,98 @@ async fn five_thousand_byte_object_is_oversize_and_never_decoded() {
 
     let live = reader.live_set(&store, NOW).await.expect("live set");
     assert_eq!(ids(&live), vec![reader.process_id().to_string()]);
-    assert_eq!(rejects(&reader), [0, 0, 1, 0], "exactly one oversize");
+    assert_eq!(rejects(&reader), [0, 0, 1, 0, 0], "exactly one oversize");
+}
+
+/// The bound is inclusive: a valid signed record padded with trailing JSON
+/// whitespace to exactly `MAX_RECORD_BYTES` is decoded, verifies and is
+/// admitted, while the same record padded to one byte more is `oversize` and
+/// not admitted, although it would verify too if it were decoded.
+#[tokio::test]
+async fn record_of_exactly_the_bound_is_admitted_and_one_byte_more_is_oversize() {
+    let store = MemoryStore::new();
+    let reader = worker(&[KEY_A]);
+    let at_bound = worker(&[KEY_A]);
+    let over_bound = worker(&[KEY_A]);
+    let bound = usize::try_from(MAX_RECORD_BYTES).expect("bound fits usize");
+    assert_eq!(bound, 4096);
+    for (sibling, len) in [(&at_bound, bound), (&over_bound, bound + 1)] {
+        sibling.write_heartbeat(&store, NOW).await.expect("beat");
+        let mut bytes = object(&store, sibling).await;
+        assert!(bytes.len() < bound);
+        bytes.resize(len, b' ');
+        put(
+            &store,
+            &query_worker_key(&sibling.process_id().to_string()),
+            bytes,
+        )
+        .await;
+        assert_eq!(object(&store, sibling).await.len(), len);
+    }
+
+    let live = ids(&reader.live_set(&store, NOW).await.expect("live set"));
+    assert!(
+        live.contains(&at_bound.process_id().to_string()),
+        "a 4096-byte record is decoded and admitted"
+    );
+    assert!(
+        !live.contains(&over_bound.process_id().to_string()),
+        "a 4097-byte record is not"
+    );
+    assert_eq!(live.len(), 2);
+    assert_eq!(rejects(&reader), [0, 0, 1, 0, 0], "exactly one oversize");
+}
+
+/// A signed record whose stamp is outside the liveness window, read because
+/// the object's modification time does not rule it out (`MemoryStore` reports
+/// none), is a `stale_stamp` reject: a replayed older heartbeat.
+#[tokio::test]
+async fn verified_record_with_a_stale_stamp_is_stale_stamp() {
+    let store = MemoryStore::new();
+    let reader = worker(&[KEY_A]);
+    let replayed = worker(&[KEY_A]);
+    replayed
+        .write_heartbeat(&store, NOW - 4 * H.as_nanos() as i64)
+        .await
+        .expect("beat");
+
+    let live = reader.live_set(&store, NOW).await.expect("live set");
+    assert_eq!(ids(&live), vec![reader.process_id().to_string()]);
+    assert_eq!(rejects(&reader), [0, 0, 0, 0, 1], "exactly one stale_stamp");
+}
+
+/// The stamp is judged only after the MAC: an unsigned record with a stale
+/// stamp is `missing_mac`, not `stale_stamp`, so a forger cannot pass as a
+/// replay.
+#[tokio::test]
+async fn unsigned_record_with_a_stale_stamp_is_missing_mac() {
+    let store = MemoryStore::new();
+    let reader = worker(&[KEY_A]);
+    let mut forged = record_at(Uuid::new_v4(), "10.9.9.9:9443");
+    forged.started_unix_ns = NOW - 4 * H.as_nanos() as i64;
+    put(
+        &store,
+        &query_worker_key(&forged.process_id),
+        envelope(&forged, None),
+    )
+    .await;
+
+    let live = reader.live_set(&store, NOW).await.expect("live set");
+    assert_eq!(ids(&live), vec![reader.process_id().to_string()]);
+    assert_eq!(rejects(&reader), [1, 0, 0, 0, 0], "exactly one missing_mac");
+}
+
+/// A sibling's graceful drain is skipped and counted under no reason.
+#[tokio::test]
+async fn drained_sibling_is_skipped_uncounted() {
+    let store = MemoryStore::new();
+    let reader = worker(&[KEY_A]);
+    let drained = worker(&[KEY_A]);
+    drained.mark_drained(&store).await.expect("drain");
+
+    let live = reader.live_set(&store, NOW).await.expect("live set");
+    assert_eq!(ids(&live), vec![reader.process_id().to_string()]);
+    assert_eq!(rejects(&reader), [0, 0, 0, 0, 0]);
 }
 
 /// An empty key list cannot build a `RecordKeys`.
@@ -282,6 +373,12 @@ fn empty_key_list_fails_construction() {
 fn reject_reasons_have_stable_labels() {
     assert_eq!(
         RecordReject::ALL.map(RecordReject::reason),
-        ["missing_mac", "bad_mac", "oversize", "malformed"]
+        [
+            "missing_mac",
+            "bad_mac",
+            "oversize",
+            "malformed",
+            "stale_stamp"
+        ]
     );
 }
