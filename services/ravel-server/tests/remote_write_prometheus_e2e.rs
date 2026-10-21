@@ -159,6 +159,7 @@ remote_write:
       max_shards: 1
       min_backoff: 100ms
       max_backoff: 200ms
+      batch_send_deadline: 1s
 "#
     )
 }
@@ -185,10 +186,11 @@ async fn run_against_real_prometheus(protobuf_message: &str, metric_query: &str)
         std::process::id() // unique enough for one test process; not a security identifier
     );
 
+    // No `--rm`: a Prometheus that exits early must keep its log for the
+    // diagnostics below. `docker rm -f` removes it at the end instead.
     let status = Command::new("docker")
         .args([
             "run",
-            "--rm",
             "-d",
             "--network",
             "host",
@@ -207,34 +209,61 @@ async fn run_against_real_prometheus(protobuf_message: &str, metric_query: &str)
         .expect("docker must be runnable in an environment that executes this ignored test");
     assert!(status.success(), "docker run failed to start Prometheus");
 
-    // Give Prometheus a few scrape+remote-write cycles to land a sample.
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
+    // The first sample needs Prometheus to start, scrape, and flush its
+    // remote-write queue, so poll rather than query once after a fixed wait.
+    // The deadline bounds a broken pipeline; the loop exits on the first hit.
     let client = reqwest::Client::new();
-    let query_response = client
-        .get(format!("http://{}/api/v1/query", running.http_addr))
-        .header("authorization", format!("Bearer {TOKEN}"))
-        .query(&[("query", metric_query)])
-        .send()
-        .await
-        .expect("query request succeeds");
+    let mut last_body = serde_json::Value::Null;
+    let mut found = false;
+    for _ in 0..60 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let query_response = client
+            .get(format!("http://{}/api/v1/query", running.http_addr))
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .query(&[("query", metric_query)])
+            .send()
+            .await
+            .expect("query request succeeds");
+        assert_eq!(
+            query_response.status(),
+            200,
+            "query for a real-Prometheus-remote-written series should succeed"
+        );
+        last_body = query_response.json().await.expect("query response is JSON");
+        let result = last_body["data"]["result"]
+            .as_array()
+            .expect("result is an array");
+        if !result.is_empty() {
+            found = true;
+            break;
+        }
+    }
 
+    // On a miss, Prometheus's own log is the only record of what its
+    // remote-write queue did (a refused write, an auth error, a retry loop).
+    let prometheus_log = if found {
+        String::new()
+    } else {
+        Command::new("docker")
+            .args(["logs", &container_name])
+            .output()
+            .map(|out| {
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                )
+            })
+            .unwrap_or_else(|err| format!("docker logs failed: {err}"))
+    };
     let _ = Command::new("docker")
-        .args(["stop", &container_name])
+        .args(["rm", "-f", &container_name])
         .status();
 
-    assert_eq!(
-        query_response.status(),
-        200,
-        "query for a real-Prometheus-remote-written series should succeed"
-    );
-    let body: serde_json::Value = query_response.json().await.expect("query response is JSON");
-    let result = body["data"]["result"]
-        .as_array()
-        .expect("result is an array");
     assert!(
-        !result.is_empty(),
-        "expected at least one series remote-written by real Prometheus: {body}"
+        found,
+        "expected at least one series remote-written by real Prometheus within 30s: \
+         {last_body}\nprometheus log:\n{prometheus_log}"
     );
 
     running.shutdown().await.expect("graceful shutdown");
