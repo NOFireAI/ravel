@@ -26,10 +26,13 @@ Arrow IPC stream fragment. Ravel accepts a payload in either of two forms,
 told apart by its first four bytes: a zstd frame (the zstd magic
 `28 B5 2F FD`) around the IPC bytes, or the IPC bytes with no outer frame,
 with or without Arrow IPC body compression (zstd-compressed buffers inside
-the stream, which arrow's reader decompresses). The collector's `otelarrow`
-exporter sends the second form: its `payload_compression` setting is IPC
-body compression. Both forms are held to the same per-payload cap on
-decoded bytes. Schemas and dictionaries
+the stream, which arrow's reader decompresses). The only IPC body compression
+codec accepted is ZSTD; a payload using another codec (LZ4_FRAME) is refused
+before decode, since arrow's LZ4_FRAME reader does not hold a buffer to its
+declared length. The collector's `otelarrow` exporter sends the second form:
+its `payload_compression` setting is IPC body compression. Both forms are
+held to the same per-payload cap on decoded bytes, and the per-stream
+dictionary budget counts decoded dictionary bytes. Schemas and dictionaries
 arrive incrementally per stream; payloads reference them by `schema_id`.
 The receiver replies per batch with `BatchStatus` (ack/nack + retry hint).
 
