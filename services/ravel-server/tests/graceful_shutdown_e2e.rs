@@ -31,7 +31,7 @@ use opentelemetry_proto::tonic::metrics::v1::{
 use opentelemetry_proto::tonic::resource::v1::Resource;
 use prost::Message;
 use ravel_fleet::query_workers::{
-    DRAINED_STAMP_NS, QUERY_WORKERS_PREFIX, QueryWorkerRecord, QueryWorkers,
+    DRAINED_STAMP_NS, QUERY_WORKERS_PREFIX, QueryWorkerRecord, QueryWorkers, RecordKeys,
 };
 use ravel_object_store::fault::{FaultPlan, FaultStore, Occurrence, Op};
 use ravel_object_store::memory::MemoryStore;
@@ -276,8 +276,13 @@ async fn worker_records(store: &dyn ObjectStoreBackend) -> Vec<QueryWorkerRecord
 }
 
 /// A reader that is not the server under test, as a sibling coordinator is.
+/// It holds the server's fragment key, so the server's signed record verifies.
 fn sibling_reader() -> QueryWorkers {
-    QueryWorkers::with_defaults("127.0.0.1:1", 1)
+    QueryWorkers::with_defaults(
+        "127.0.0.1:1",
+        1,
+        RecordKeys::from_file_keys(&[FRAGMENT_KEY]).expect("one key"),
+    )
 }
 
 /// A buffered-mode ingest ack is written to the shard buffer and acked before
