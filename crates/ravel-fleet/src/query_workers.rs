@@ -185,8 +185,9 @@ impl QueryWorkerRecord {
 }
 
 /// The `blake3::derive_key` context the record keys are derived under
-/// (ADR-1918 decision 2). Distinct from every fragment capability and SQL
-/// ticket context, so a record MAC never verifies as either.
+/// (ADR-1918 decision 2). Fragment capabilities are MACed under the raw file
+/// key and SQL tickets under keys derived with their own contexts, so a record
+/// key is never a key either of them uses.
 pub const RECORD_KEY_CONTEXT: &str = "ravel query worker record v1";
 
 /// The largest heartbeat object [`QueryWorkers::live_set`] reads (ADR-1918
@@ -291,9 +292,10 @@ struct SignedRecord {
 
 /// Why [`QueryWorkers::live_set`] skipped a sibling's record (ADR-1918
 /// decision 4). Rendered as the closed `reason` label of
-/// `ravel_query_worker_record_rejects_total`. A record skipped before the GET
-/// because its LIST modification time is outside the liveness window, and a
-/// verified record stamped [`DRAINED_STAMP_NS`], are not rejects.
+/// `ravel_query_worker_record_rejects_total`. A key that is not a UUID, a
+/// record skipped before the GET because its LIST modification time is outside
+/// the liveness window, and a verified record stamped [`DRAINED_STAMP_NS`], are
+/// not rejects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordReject {
     /// The object decoded but carried no `mac`.
@@ -545,9 +547,10 @@ impl QueryWorkers {
     /// one byte, so a longer object is rejected as oversize without being
     /// decoded. Each rejected record is skipped (treated as absent) and counted
     /// by [`RecordReject`] reason in [`record_rejects`](Self::record_rejects),
-    /// under the first check it fails. Two skips are not counted: a key whose
-    /// LIST modification time is outside the liveness window (never fetched),
-    /// and a verified record stamped [`DRAINED_STAMP_NS`] (a graceful drain).
+    /// under the first check it fails. Three skips are not counted: a key that
+    /// is not a UUID, a key whose LIST modification time is outside the
+    /// liveness window (never fetched), and a verified record stamped
+    /// [`DRAINED_STAMP_NS`] (a graceful drain).
     /// A verified record with any other stamp outside the window is counted as
     /// [`RecordReject::StaleStamp`]. Only a failed
     /// LIST or GET is an `Err`, which the caller treats fail-open, never
