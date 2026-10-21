@@ -184,7 +184,10 @@ async fn start_test_server() -> ravel_server::Running {
 /// stream-open metadata. `compression: none` because the exporter's default,
 /// zstd, compresses the gRPC messages (`zstdarrow5` on the Arrow stream,
 /// `zstd` on its OTLP fallback), and the OTAP service accepts no gRPC
-/// compression (issue #3163).
+/// compression (issue #3163). `arrow.disable_downgrade` because the exporter
+/// otherwise falls back to plain OTLP when the Arrow stream is refused, and
+/// this server also serves OTLP on the same listener, so a pass would not
+/// prove the OTAP path ran.
 fn collector_config(ravel_grpc_port: u16) -> String {
     format!(
         r#"
@@ -204,6 +207,7 @@ exporters:
       authorization: 'Bearer {TOKEN}'
     arrow:
       num_streams: 1
+      disable_downgrade: true
 
 service:
   telemetry:
@@ -383,7 +387,7 @@ async fn real_collector_otelarrow_export_is_queryable() {
             })
             .collect();
         let ingest_metrics = if ingest_metrics.is_empty() {
-            server_metrics.clone()
+            format!("(no ingest counter matched; whole /metrics body)\n{server_metrics}")
         } else {
             ingest_metrics.join("\n")
         };
