@@ -396,9 +396,9 @@ async fn a_predicate_free_logs_statement_is_bulk_only_over_an_epoch_to_now_windo
 /// `--cache-bulk-scan-min-bytes` reads as bulkScan with the threshold set and
 /// interactive without it, or with the threshold one byte above the resolve.
 ///
-/// FLIP: replacing `size_trigger_lane(lanes, names_parquet,
+/// FLIP: replacing `size_trigger_applies(lanes, names_parquet,
 /// self.cache_bulk_scan_min_bytes)` in `statement_access_intent`
-/// (`crates/ravel-sql/src/executor.rs`) with `None` reports the thresholded
+/// (`crates/ravel-sql/src/executor.rs`) with `false` reports the thresholded
 /// statement as interactive.
 #[tokio::test]
 async fn a_filtered_logs_scan_above_the_bulk_scan_threshold_is_bulk_only_with_the_flag() {

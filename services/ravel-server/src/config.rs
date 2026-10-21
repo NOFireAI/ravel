@@ -2463,8 +2463,8 @@ pub struct Cli {
     /// epoch to now. A `samples` statement also needs a resolve that pruned no
     /// segment and every segment inside the window; a `logs` statement also
     /// needs no pending erasure and every resolved segment inside the window.
-    /// With `--cache-bulk-scan-min-bytes` set, a large filtered scan is a bulk
-    /// scan too. Every other read is interactive. Bulk reads are admitted into a bulk region; a bulk
+    /// With `--cache-bulk-scan-min-bytes` set, a large filtered `logs` scan
+    /// sent as SQL text is a bulk scan too. Every other read is interactive. Bulk reads are admitted into a bulk region; a bulk
     /// admission evicts other bulk entries and, while the region is below
     /// this share, probation entries, never the main queue. Region
     /// bytes up to this share are evicted only after the probation and main
@@ -2483,18 +2483,20 @@ pub struct Cli {
     )]
     pub cache_bulk_share: f64,
 
-    /// Resolved bytes at or above which a filtered `POST /api/v1/sql` scan also reads as a bulk scan, unless it is a KEY_IDX key lookup; unset (the default), only the predicate-free rule `--cache-bulk-share` describes applies.
+    /// Resolved bytes at or above which a filtered `logs` statement sent to `POST /api/v1/sql` as SQL text also reads as a bulk scan, unless it is a KEY_IDX key lookup; a `samples` statement never does; unset (the default), only the predicate-free rule `--cache-bulk-share` describes applies.
     ///
-    /// Set, a statement is also a bulk scan (ADR-3072's #3084 amendment) when
-    /// it names one `samples` or `logs` table and no Parquet table, the
-    /// segments its resolve returned sum to at least this many bytes of
-    /// `object_size` before any read, and its `WHERE` has no equality on a
-    /// field the tenant indexes in KEY_IDX (a `key_index` declared column, or
-    /// `trace_id` when that is indexed). A key lookup stays interactive
-    /// however much it resolves, since the KEY_IDX probe reads a few blocks
-    /// of each segment. The decision is made after resolve and before the
+    /// Set, a statement is also a bulk scan (ADR-3072's size trigger
+    /// amendment) when it is sent as SQL text, names one `logs` table and no
+    /// Parquet table, the segments its resolve returned sum to at least this
+    /// many bytes of `object_size` before any read, and its optimized plan
+    /// has no equality on a field the tenant indexes in KEY_IDX (a
+    /// `key_index` declared column, or `trace_id` when that is indexed). A
+    /// key lookup stays interactive however much it resolves, since the
+    /// KEY_IDX probe reads a few blocks of each segment; an ES|QL query never
+    /// reaches the rule. The decision is made after resolve and before the
     /// first segment read, and the statement's `stats.cache.intent` reports
-    /// it. Read at startup only. Ignored when the fetcher cache is off.
+    /// the resulting intent. Read at startup only. Ignored when the fetcher
+    /// cache is off.
     #[arg(long, value_name = "BYTES")]
     pub cache_bulk_scan_min_bytes: Option<u64>,
 
@@ -3220,8 +3222,8 @@ pub struct QueryBudgets {
     /// Reaches [`crate::query::build_sql_state_with_parquet`]. Default `false`.
     pub sql_scan_decode_inline: bool,
     /// `--cache-bulk-scan-min-bytes`: the resolved-bytes threshold at or
-    /// above which a filtered single-table SQL scan reads as a bulk scan
-    /// (ADR-3072's #3084 amendment). Reaches
+    /// above which a filtered `logs` statement sent as SQL text reads as a
+    /// bulk scan (ADR-3072's size trigger amendment). Reaches
     /// [`crate::query::build_sql_state_with_parquet`]. Default `None`, the
     /// predicate-free rule alone.
     pub sql_cache_bulk_scan_min_bytes: Option<u64>,

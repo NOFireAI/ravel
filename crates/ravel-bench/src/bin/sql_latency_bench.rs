@@ -169,10 +169,12 @@ struct Args {
     /// become meaningful.
     #[arg(long, default_value_t = 0)]
     cache_bytes: u64,
-    /// Resolved bytes at or above which a filtered scan also reads as a bulk
-    /// scan, the same flag as `ravel-server --cache-bulk-scan-min-bytes`.
-    /// Unset (the default), only the predicate-free rule applies. Generated
-    /// lane only.
+    /// Resolved bytes at or above which a filtered `logs` SQL scan also reads
+    /// as a bulk scan, the same flag as `ravel-server
+    /// --cache-bulk-scan-min-bytes`. Set, the read cache is attached to the
+    /// samples fetcher too, so `stats.cache` is reported. Unset (the default),
+    /// only the predicate-free rule applies and the samples fetcher stays
+    /// uncached. Generated lane only.
     #[arg(long, value_name = "BYTES", requires = "generate")]
     cache_bulk_scan_min_bytes: Option<u64>,
     /// Per-statement wall deadline, in seconds. A statement that exceeds it
@@ -749,9 +751,17 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
     }
     if let Some(n) = p.cache_bulk_scan_min_bytes {
         out.push_str(&format!(
-            "  bulk scan  : filtered scans of >= {n} resolved bytes\n"
+            "  bulk scan  : filtered logs SQL scans of >= {n} resolved bytes\n"
         ));
     }
+    out.push_str(&format!(
+        "  samples    : {}\n",
+        if p.samples_fetcher_cache {
+            "read cache attached (stats.cache reported)"
+        } else {
+            "uncached"
+        }
+    ));
     match p.logs_suffix_len {
         Some(n) => out.push_str(&format!(
             "  suffix len : {n} bytes (pinned; overrides per-object derivation)\n"
@@ -1167,6 +1177,7 @@ mod tests {
             store_cost_profile_requested: StoreCostProfile::reference(),
             store_cost_profile_effective: Some(StoreCostProfile::reference()),
             cache_bulk_scan_min_bytes: None,
+            samples_fetcher_cache: false,
         }
     }
 

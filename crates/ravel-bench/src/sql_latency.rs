@@ -438,6 +438,22 @@ pub struct Provenance {
     /// contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_bulk_scan_min_bytes: Option<u64>,
+    /// Whether the read cache was also attached to the samples fetcher, which
+    /// is what `stats.cache` reads: only on a run with both a read cache and
+    /// `cache_bulk_scan_min_bytes` set ([`attaches_samples_fetcher_cache`]),
+    /// so a run without the flag reads samples exactly as before the flag
+    /// existed. A report written before the field reads `false`.
+    #[serde(default)]
+    pub samples_fetcher_cache: bool,
+}
+
+/// Whether [`cold_executor`] attaches the read cache to the samples fetcher:
+/// a cache exists and the bulk-scan size trigger is set.
+pub fn attaches_samples_fetcher_cache(
+    has_cache: bool,
+    cache_bulk_scan_min_bytes: Option<u64>,
+) -> bool {
+    has_cache && cache_bulk_scan_min_bytes.is_some()
 }
 
 /// The profile a report written before the cost stamp existed deserializes to,
@@ -770,7 +786,9 @@ pub struct RunAccounting {
     /// The run's `stats.cache`, in the shape `POST /api/v1/sql` reports it
     /// (`ravel_sql::stats_json::cache_json`): the intent the statement read
     /// under and the read cache's per-intent hits and bytes served. `None` when
-    /// no cache was attached. Skipped in JSON when `None`.
+    /// the samples fetcher carries no cache, which is every run without
+    /// `--cache-bulk-scan-min-bytes` ([`Provenance::samples_fetcher_cache`]).
+    /// Skipped in JSON when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_cache: Option<serde_json::Value>,
 }
@@ -1567,7 +1585,9 @@ fn build_read_cache(cache_bytes: u64) -> Arc<Cache<CacheFetchError>> {
 
 /// Build a fresh executor over `store` with `declared` installed, its catalog
 /// configured for `shard_count` shards, and `cache` (when present) attached to
-/// the log and samples fetchers. Fresh per corpus entry so the first run is genuinely cold: a
+/// the log fetcher, and to the samples fetcher too when the bulk-scan size
+/// trigger is set ([`attaches_samples_fetcher_cache`]). Fresh per corpus entry
+/// so the first run is genuinely cold: a
 /// shared executor would let one statement warm the next through the catalog and
 /// fetch caches.
 ///
@@ -1637,10 +1657,11 @@ pub struct ExecutorSettings {
     /// [`EngineConfig::logs_fetch_policy`] so the engine config the bench builds
     /// names the same intent the server's would.
     pub logs_fetch_policy: LogsFetchPolicy,
-    /// Resolved bytes at or above which a filtered scan also reads as a bulk
-    /// scan (`--cache-bulk-scan-min-bytes`), handed to
+    /// Resolved bytes at or above which a filtered `logs` SQL scan also reads
+    /// as a bulk scan (`--cache-bulk-scan-min-bytes`), handed to
     /// [`SqlExecutor::with_cache_bulk_scan_min_bytes`]. `None` leaves the
-    /// predicate-free rule alone, as an unset server flag does.
+    /// predicate-free rule alone, as an unset server flag does, and keeps the
+    /// read cache off the samples fetcher.
     pub cache_bulk_scan_min_bytes: Option<u64>,
 }
 
@@ -1700,6 +1721,11 @@ struct ColdExecutor {
     /// field that goes dead in test builds too still reports.
     #[cfg_attr(not(test), allow(dead_code))]
     get_limiter_permits: usize,
+    /// Whether the samples fetcher was built with the read cache, read off the
+    /// fetcher before it moves into the executor, for the same tests-only
+    /// reason as `get_limiter_permits`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    samples_fetcher_cache: bool,
 }
 
 /// An executor setting [`EngineConfig::validate`] refuses, named by the bench
@@ -1806,13 +1832,16 @@ fn cold_executor(
     let probe_misses = log_fetcher.probe_miss_counter();
     let wire_bytes = log_fetcher.phase_wire_byte_counter();
     let get_limiter_permits = log_fetcher.get_limiter_permits();
-    // `stats.cache` is read off the samples fetcher's cache, so the same cache
-    // goes there too, as `ravel-server` wires it; a logs-only corpus reads
-    // nothing through that fetcher.
+    // `stats.cache` is read off the samples fetcher's cache, so a run with the
+    // size trigger set puts the same cache there too, as `ravel-server` wires
+    // it; a logs-only corpus reads nothing through that fetcher. Unset, the
+    // samples fetcher stays uncached, as it was before the trigger existed.
+    let attach = attaches_samples_fetcher_cache(cache.is_some(), cache_bulk_scan_min_bytes);
     let mut fetcher = SegmentFetcher::new(Arc::clone(store));
-    if let Some(cache) = cache {
+    if let Some(cache) = cache.filter(|_| attach) {
         fetcher = fetcher.with_cache(cache);
     }
+    let samples_fetcher_cache = fetcher.cache_ram_metrics().is_some();
     let executor = SqlExecutor::new(
         catalog,
         fetcher,
@@ -1838,6 +1867,7 @@ fn cold_executor(
         probe_misses,
         wire_bytes,
         get_limiter_permits,
+        samples_fetcher_cache,
     })
 }
 
@@ -2577,6 +2607,10 @@ pub async fn run_generated_with_bulk_scan_min_bytes(
             // run, so it is also the effective one.
             store_cost_profile_effective: Some(cfg.store_cost_profile.clone()),
             cache_bulk_scan_min_bytes,
+            samples_fetcher_cache: attaches_samples_fetcher_cache(
+                cfg.cache_bytes > 0,
+                cache_bulk_scan_min_bytes,
+            ),
         },
         dataset,
         // Generate is always in process (never Flight).
@@ -2835,6 +2869,7 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 None => Some(cfg.store_cost_profile.clone()),
             },
             cache_bulk_scan_min_bytes: None,
+            samples_fetcher_cache: false,
         },
         dataset,
         // The request term is absent on every lane (no attempt source). The
@@ -3729,6 +3764,41 @@ mod tests {
             DEFAULT_MAX_SEGMENTS,
             "an omitted flag leaves the compiled-in ceiling unchanged"
         );
+    }
+
+    /// A run with a read cache and no `--cache-bulk-scan-min-bytes` leaves
+    /// the samples fetcher uncached, as every run was before the flag; only
+    /// a run with both attaches it, and the provenance rule agrees.
+    ///
+    /// FLIP: attaching the cache whenever one exists (`cache.filter(|_|
+    /// attach)` in `cold_executor` replaced by `cache`) fails the first
+    /// assertion.
+    #[test]
+    fn an_unset_bulk_scan_threshold_leaves_the_samples_fetcher_uncached() {
+        let store = empty_store();
+        let unset = cold_executor(
+            &store,
+            &[],
+            Some(build_read_cache(1 << 20)),
+            ExecutorSettings::default(),
+        )
+        .expect("build executor");
+        assert!(!unset.samples_fetcher_cache, "unset must not attach");
+        assert!(!attaches_samples_fetcher_cache(true, None));
+
+        let set = cold_executor(
+            &store,
+            &[],
+            Some(build_read_cache(1 << 20)),
+            ExecutorSettings {
+                cache_bulk_scan_min_bytes: Some(1),
+                ..ExecutorSettings::default()
+            },
+        )
+        .expect("build executor");
+        assert!(set.samples_fetcher_cache);
+        assert!(attaches_samples_fetcher_cache(true, Some(1)));
+        assert!(!attaches_samples_fetcher_cache(false, Some(1)));
     }
 
     /// The `ExecutorConfigError` a refused `cold_executor` build carries.

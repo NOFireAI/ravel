@@ -369,7 +369,9 @@ field, which is a frozen-contract change under the format-change procedure
 and is filed as its own ticket, not folded in here. Intent is admission
 policy only: it never skips a fresh read and never changes what a hit
 returns. The executor's `BulkScan` trigger above is narrowed by the bulk
-trigger amendment (issue #3084) at the end of this ADR.
+trigger amendment (issue #3084) at the end of this ADR, and widened, behind
+an opt-in flag that is off by default, by the size trigger amendment (issue
+#3084, 2026-10-21) after it.
 
 3b. Policy. `Interactive` reads are admitted and promoted exactly as today.
 `BulkScan` reads do not raise `freq` on a hit and are admitted into a
@@ -674,3 +676,42 @@ prefetch at 61.4 % (segment decode, `decode_gorilla_into` alone 38.6 %) and
 evaluate at 38.0 %: the remaining distance to the 1 h target is in prefetch,
 which this decision does not change. The other acceptance rows of
 decision 1 stand.
+
+## Amendment (issue #3084, 2026-10-21): an opt-in size trigger for filtered logs scans
+
+<!-- amendment-applies: sections="3. The cache admits by access intent; memory refusals name their cause" pointer="size trigger amendment" -->
+
+The 2026-10-20 bulk trigger classifies none of the 43 ClickBench statements
+as `BulkScan`, and it classifies the Stage 0 P5 filtered shape as
+`Interactive` too. The kit's window does not start at the Unix epoch, and 36
+of the 43 statements carry a `WHERE` or a `LIMIT`. So the scans the cache
+most needs to keep out of the interactive queues never reach the bulk
+region.
+
+An opt-in flag, `--cache-bulk-scan-min-bytes`, adds a second arm, which is
+independent of the first. A `logs` statement reads as `BulkScan` under it
+when all of these hold:
+
+- it is sent as SQL text;
+- it names one `logs` table and no Parquet table;
+- the object sizes of its resolved segments sum to at least the threshold;
+- the plan the KEY_IDX probe sees has no equality on a KEY_IDX-indexed
+  field. That plan is the optimized plan, subqueries and join conditions
+  included.
+
+A `samples` statement never reads as `BulkScan` through this arm. A lowered
+statement (ES|QL, a plan source) has no SQL text to plan, so it never does
+either. Unset, which is the default, the 2026-10-20 rule decides alone,
+unchanged.
+
+The flag's default is decided by a later measurement and recorded as a
+further amendment. That measurement is a mixed workload of interactive
+statements and scans, plus a ClickBench A/B run with the flag set. Decision
+3's band rows are measured with the flag unset.
+
+These figures were measured 2026-10-21 with `sql_latency_bench` on a
+generated 25-object logs corpus of 2,089,843 bytes, with a 1,044,921-byte
+read cache. A filtered count served 48.2 % of runs 2 to 4 from cache at a
+522,460-byte threshold. It served 47.9 % at a 1,044,921-byte
+threshold. With the flag unset it served 4 % to 16 %. Every run returned the
+same single row.

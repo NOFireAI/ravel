@@ -141,7 +141,7 @@ use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange}
 
 use crate::access_intent::{
     CacheCounterMark, StatementCacheStats, classify_access_intent, plan_has_key_equality,
-    plan_is_predicate_free, reads_whole_lane, size_trigger_lane,
+    plan_is_predicate_free, reads_whole_lane, size_trigger_applies,
 };
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
@@ -1608,9 +1608,9 @@ pub struct SqlExecutor {
     /// [`SqlExecutor::new`] default) keeps that constant; the server installs
     /// the deployment's own sweep grace with [`Self::with_ddl_min_grace_ms`].
     ddl_min_grace_ms: Option<u64>,
-    /// The resolved-bytes threshold at or above which a single-lane `samples`
-    /// or `logs` statement with no exact-key equality reads as BulkScan
-    /// ([`crate::access_intent::size_trigger_lane`]). `None` (the
+    /// The resolved-bytes threshold at or above which a single-lane `logs`
+    /// statement sent as SQL text with no exact-key equality reads as BulkScan
+    /// ([`crate::access_intent::size_trigger_applies`]). `None` (the
     /// [`SqlExecutor::new`] default) leaves the predicate-free rule deciding
     /// alone; the server installs `--cache-bulk-scan-min-bytes` with
     /// [`Self::with_cache_bulk_scan_min_bytes`].
@@ -1775,12 +1775,13 @@ impl SqlExecutor {
         self
     }
 
-    /// Install the bulk-scan size trigger (ADR-3072's #3084 amendment): with
-    /// `Some(min_bytes)`, a statement naming one `samples` or `logs` table and
-    /// no Parquet table whose resolved segments' `object_size` sums to at
-    /// least `min_bytes`, and whose plan has no equality on a field the tenant
-    /// indexes in KEY_IDX, reads as BulkScan. `None` keeps the predicate-free
-    /// rule alone, as [`Self::new`] does.
+    /// Install the bulk-scan size trigger (ADR-3072's size trigger
+    /// amendment): with `Some(min_bytes)`, a statement sent as SQL text
+    /// naming one `logs` table and no Parquet table whose resolved segments'
+    /// `object_size` sums to at least `min_bytes`, and whose optimized plan
+    /// has no equality on a field the tenant indexes in KEY_IDX, reads as
+    /// BulkScan. A `samples` statement and a lowered statement (ES|QL) never
+    /// do. `None` keeps the predicate-free rule alone, as [`Self::new`] does.
     pub fn with_cache_bulk_scan_min_bytes(mut self, min_bytes: Option<u64>) -> Self {
         self.cache_bulk_scan_min_bytes = min_bytes;
         self
@@ -4035,10 +4036,10 @@ impl SqlExecutor {
     }
 
     /// The intent a resolved statement's reads carry: [`classify_access_intent`],
-    /// and, when that reads Interactive and the size trigger applies
-    /// ([`size_trigger_lane`]), BulkScan unless the statement is an exact-key
-    /// lookup ([`Self::reads_key_equality`]). Called once per attempt, after
-    /// resolve and before the first segment read.
+    /// and, when that reads Interactive, the statement has SQL text and the
+    /// size trigger applies ([`size_trigger_applies`]), BulkScan unless the
+    /// statement is an exact-key lookup ([`Self::reads_key_equality`]). Called
+    /// once per attempt, after resolve and before the first segment read.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn statement_access_intent(
         &self,
@@ -4066,19 +4067,16 @@ impl SqlExecutor {
         if intent != AccessIntent::Interactive {
             return intent;
         }
-        let Some(signal) = size_trigger_lane(lanes, names_parquet, self.cache_bulk_scan_min_bytes)
-        else {
+        // A lowered statement (ES|QL, a plan source) has no SQL text to plan
+        // the key-lookup test over, so it never reaches the trigger.
+        let Some(sql) = statement.sql() else {
             return intent;
         };
+        if !size_trigger_applies(lanes, names_parquet, self.cache_bulk_scan_min_bytes) {
+            return intent;
+        }
         if self
-            .reads_key_equality(
-                tenant_hash,
-                capabilities,
-                statement,
-                signal,
-                now_ns,
-                declared,
-            )
+            .reads_key_equality(tenant_hash, capabilities, sql, now_ns, declared)
             .await
         {
             AccessIntent::Interactive
@@ -4087,36 +4085,35 @@ impl SqlExecutor {
         }
     }
 
-    /// Whether `statement` over its one `signal` lane holds an equality on a
-    /// field the tenant indexes in KEY_IDX ([`plan_has_key_equality`]). Only
-    /// `logs` has KEY_IDX, and a tenant that indexes nothing has no key
-    /// lookup, so neither plans. Fails closed: a statement with no SQL text,
-    /// or one that fails to plan, counts as a key lookup.
+    /// Whether `sql` over the `logs` table holds an equality on a field the
+    /// tenant indexes in KEY_IDX ([`plan_has_key_equality`]), read off the
+    /// optimized plan, whose `TableScan` filters are the ones the logs
+    /// provider hands the KEY_IDX probe. A tenant that indexes nothing has no
+    /// key lookup and plans nothing. Fails closed: a statement that fails to
+    /// plan or optimize counts as a key lookup.
     async fn reads_key_equality(
         &self,
         tenant_hash: TenantHash,
         capabilities: SqlCapabilities,
-        statement: Statement<'_>,
-        signal: TargetSignal,
+        sql: &str,
         now_ns: i64,
         declared: &[DeclaredColumn],
     ) -> bool {
-        if signal != TargetSignal::Logs {
-            return false;
-        }
         let key_index = self.declared_source.key_index(tenant_hash, now_ns).await;
         if key_index.columns.is_empty() && !key_index.trace_id {
             return false;
         }
-        let Some(sql) = statement.sql() else {
+        let Some(ctx) =
+            self.empty_table_session(tenant_hash, capabilities, TargetSignal::Logs, declared)
+        else {
             return true;
         };
-        match self
-            .plan_over_empty_table(tenant_hash, capabilities, signal, sql, declared)
-            .await
-        {
-            Some(plan) => plan_has_key_equality(&plan, &key_index),
-            None => true,
+        let Ok(plan) = ctx.state().create_logical_plan(sql).await else {
+            return true;
+        };
+        match ctx.state().optimize(&plan) {
+            Ok(optimized) => plan_has_key_equality(&optimized, &key_index),
+            Err(_) => true,
         }
     }
 
@@ -4150,8 +4147,8 @@ impl SqlExecutor {
             .await
     }
 
-    /// Whether `sql`, planned over an empty `signal` table carrying the
-    /// tenant's `declared` columns ([`Self::plan_over_empty_table`]), is
+    /// Whether `sql`'s unoptimized plan over an empty `signal` table carrying
+    /// the tenant's `declared` columns ([`Self::empty_table_session`]) is
     /// predicate-free; a statement that fails to plan is not.
     async fn plans_predicate_free(
         &self,
@@ -4161,26 +4158,30 @@ impl SqlExecutor {
         sql: &str,
         declared: &[DeclaredColumn],
     ) -> bool {
-        self.plan_over_empty_table(tenant_hash, capabilities, signal, sql, declared)
-            .await
-            .is_some_and(|plan| plan_is_predicate_free(&plan))
+        let Some(ctx) = self.empty_table_session(tenant_hash, capabilities, signal, declared)
+        else {
+            return false;
+        };
+        match ctx.state().create_logical_plan(sql).await {
+            Ok(plan) => plan_is_predicate_free(&plan),
+            Err(_) => false,
+        }
     }
 
-    /// `sql`'s unoptimized logical plan over an empty `signal` table carrying
-    /// the tenant's `declared` columns, through the same throwaway session
-    /// [`Self::pushed_down_name_filter`] uses (no I/O); `None` when the
-    /// session cannot be built or the statement fails to plan.
-    async fn plan_over_empty_table(
+    /// A session over an empty `signal` table carrying the tenant's
+    /// `declared` columns, built the way [`Self::pushed_down_name_filter`]'s
+    /// throwaway session is (no I/O; never executed); `None` when it cannot
+    /// be built.
+    fn empty_table_session(
         &self,
         tenant_hash: TenantHash,
         capabilities: SqlCapabilities,
         signal: TargetSignal,
-        sql: &str,
         declared: &[DeclaredColumn],
-    ) -> Option<LogicalPlan> {
+    ) -> Option<SessionContext> {
         let tables = vec![self.empty_snapshot_table(signal, tenant_hash, declared)];
         let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
-        let ctx = build_session_with_tables(
+        build_session_with_tables(
             &self.config,
             pool,
             tables,
@@ -4188,8 +4189,7 @@ impl SqlExecutor {
             crate::session::SpillDecision::Disabled,
             &self.session_principal(tenant_hash, capabilities),
         )
-        .ok()?;
-        ctx.state().create_logical_plan(sql).await.ok()
+        .ok()
     }
 
     /// ADR-0094 decision 1: whether every aggregate expression and GROUP BY key
@@ -8795,23 +8795,27 @@ pub(crate) mod tests {
 
     /// The bulk-scan size trigger through `statement_access_intent`, the call
     /// the attempt loop makes after resolve: over a 1,200-byte resolve, a
-    /// filtered statement is BulkScan with the threshold at 1,000 and
+    /// filtered `logs` statement is BulkScan with the threshold at 1,000 and
     /// Interactive at 2,000, and an equality on a KEY_IDX field stays
-    /// Interactive at 1,000. Unset, every row reads as the predicate-free rule
+    /// Interactive at 1,000, including one the optimizer derives (a
+    /// one-element `IN`, a CTE alias, a join's `ON`) and one inside a scalar
+    /// subquery. A filtered `samples` statement never reads as BulkScan
+    /// through the trigger. Unset, every row reads as the predicate-free rule
     /// alone gives it.
     ///
-    /// FLIP: replacing `size_trigger_lane(lanes, names_parquet,
-    /// self.cache_bulk_scan_min_bytes)` with `None` fails the first filtered
+    /// FLIP: replacing `size_trigger_applies(lanes, names_parquet,
+    /// self.cache_bulk_scan_min_bytes)` with `false` fails the first filtered
     /// row above the threshold; making `reads_key_equality` return `false`
-    /// fails the `user_id = 'u-1'` row.
+    /// fails the `user_id = 'u-1'` row; letting `size_trigger_applies` accept
+    /// a Metrics lane fails the filtered `samples` row; passing the
+    /// unoptimized plan to `plan_has_key_equality` fails the `IN` and CTE
+    /// rows, and the `JOIN` row once the `LogicalPlan::Join` arm is removed
+    /// too; walking with `apply` instead of `apply_with_subqueries` fails the
+    /// scalar-subquery row.
     #[tokio::test]
     async fn the_size_trigger_reads_a_large_filtered_scan_as_bulk_unless_it_is_a_key_lookup() {
-        use ravel_catalog::{SegmentLevel, SegmentRef};
-
         use crate::declared::{KeyIndexDeclaration, StaticDeclaredColumns};
 
-        const HOUR: i64 = 3_600_000_000_000;
-        const NOW: i64 = 100 * HOUR;
         let declared = vec![
             DeclaredColumn::new("http_status", DeclaredType::I64),
             DeclaredColumn::new("user_id", DeclaredType::Str),
@@ -8822,36 +8826,14 @@ pub(crate) mod tests {
                 trace_id: true,
             });
         let t = TenantHash([3u8; 16]);
-        let segment = |hour: i64| SegmentRef {
-            data_object_key: format!("t/{hour}.obj"),
-            object_size: 600,
-            min_event_ts_ns: hour * HOUR,
-            max_event_ts_ns: (hour + 1) * HOUR - 1,
-            ingest_hour_bucket: u32::try_from(hour).expect("small hour"),
-            sample_count: 1,
-            series_count: 1,
-            shard: 0,
-            content_hash: [0u8; 32],
-            writer_id: Uuid::from_u128(1),
-            writer_epoch: 1,
-            writer_seq: u64::try_from(hour).expect("small hour"),
-            created_unix_ns: 0,
-            level: SegmentLevel::L0,
-            segment_format_version: 0,
-            declared_column_stats: Default::default(),
-        };
-        let snapshot = Snapshot {
-            segments: vec![segment(97), segment(98)],
-            segments_pruned: 0,
-            pending_erasure: Vec::new(),
-        };
+        let snapshot = size_trigger_snapshot();
         let window = TimeRange {
             start_ns: 0,
-            end_ns: NOW,
+            end_ns: SIZE_TRIGGER_NOW,
         };
         use AccessIntent::{BulkScan, Interactive};
         // (signal, statement, threshold 1,000, threshold 2,000, unset)
-        let cases: [(TargetSignal, &str, [AccessIntent; 3]); 10] = [
+        let cases: [(TargetSignal, &str, [AccessIntent; 3]); 15] = [
             (
                 TargetSignal::Logs,
                 "SELECT count(*) FROM logs WHERE http_status >= 500",
@@ -8891,13 +8873,40 @@ pub(crate) mod tests {
             ),
             (
                 TargetSignal::Logs,
+                "SELECT count(*) FROM logs WHERE user_id IN ('u-1')",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "WITH s AS (SELECT user_id AS u FROM logs) SELECT count(*) FROM s WHERE u = 'u-1'",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs a JOIN logs b \
+                 ON a.trace_id = b.trace_id AND a.user_id = 'u-1'",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs \
+                 WHERE http_status > (SELECT count(*) FROM logs WHERE user_id = 'u-1')",
+                [Interactive, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
+                "SELECT count(*) FROM logs WHERE http_status > (SELECT count(*) FROM logs)",
+                [BulkScan, Interactive, Interactive],
+            ),
+            (
+                TargetSignal::Logs,
                 "SELECT count(*) FROM logs",
                 [BulkScan, BulkScan, BulkScan],
             ),
             (
                 TargetSignal::Metrics,
                 "SELECT count(*) FROM samples WHERE value > 1",
-                [BulkScan, Interactive, Interactive],
+                [Interactive, Interactive, Interactive],
             ),
             (
                 TargetSignal::Metrics,
@@ -8918,12 +8927,92 @@ pub(crate) mod tests {
                         &[(*signal, &snapshot)],
                         false,
                         window,
-                        NOW,
+                        SIZE_TRIGGER_NOW,
                         &declared,
                     )
                     .await;
                 assert_eq!(intent, expected[column], "{min_bytes:?}: {sql}");
             }
+        }
+    }
+
+    /// A lowered statement has no SQL text, so the size trigger never reads
+    /// it as BulkScan, even over a tenant that indexes no key, where no
+    /// key-lookup test could hold it back.
+    ///
+    /// FLIP: replacing `let Some(sql) = statement.sql() else { return intent; };`
+    /// in `statement_access_intent` with
+    /// `let sql = statement.sql().unwrap_or("");` reads it as BulkScan.
+    #[tokio::test]
+    async fn a_lowered_statement_never_reads_as_bulk_through_the_size_trigger() {
+        use datafusion::logical_expr::{col, lit};
+
+        use crate::statement::DialectPolicy;
+        use crate::statement::plan_source::Programmatic;
+
+        let declared = vec![DeclaredColumn::new("http_status", DeclaredType::I64)];
+        let exec = eviction_test_executor().with_cache_bulk_scan_min_bytes(Some(1_000));
+        let statement = Programmatic::over_logs(
+            DialectPolicy::new(
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+                Vec::<String>::new(),
+            ),
+            |ctx, _call| {
+                ctx.scan("logs")?
+                    .filter(col("http_status").gt_eq(lit(500i64)))?
+                    .build()
+            },
+        );
+        let snapshot = size_trigger_snapshot();
+        let intent = exec
+            .statement_access_intent(
+                TenantHash([3u8; 16]),
+                SqlCapabilities::default(),
+                Statement::Lowered(&statement),
+                &[(TargetSignal::Logs, &snapshot)],
+                false,
+                TimeRange {
+                    start_ns: 0,
+                    end_ns: SIZE_TRIGGER_NOW,
+                },
+                SIZE_TRIGGER_NOW,
+                &declared,
+            )
+            .await;
+        assert_eq!(intent, AccessIntent::Interactive);
+    }
+
+    const SIZE_TRIGGER_HOUR: i64 = 3_600_000_000_000;
+    const SIZE_TRIGGER_NOW: i64 = 100 * SIZE_TRIGGER_HOUR;
+
+    /// A `logs` resolve of two 600-byte segments, 1,200 bytes in all, inside
+    /// `0..SIZE_TRIGGER_NOW`.
+    fn size_trigger_snapshot() -> Snapshot {
+        use ravel_catalog::{SegmentLevel, SegmentRef};
+
+        let segment = |hour: i64| SegmentRef {
+            data_object_key: format!("t/{hour}.obj"),
+            object_size: 600,
+            min_event_ts_ns: hour * SIZE_TRIGGER_HOUR,
+            max_event_ts_ns: (hour + 1) * SIZE_TRIGGER_HOUR - 1,
+            ingest_hour_bucket: u32::try_from(hour).expect("small hour"),
+            sample_count: 1,
+            series_count: 1,
+            shard: 0,
+            content_hash: [0u8; 32],
+            writer_id: Uuid::from_u128(1),
+            writer_epoch: 1,
+            writer_seq: u64::try_from(hour).expect("small hour"),
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: 0,
+            declared_column_stats: Default::default(),
+        };
+        Snapshot {
+            segments: vec![segment(97), segment(98)],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
         }
     }
 

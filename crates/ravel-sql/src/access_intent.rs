@@ -12,17 +12,18 @@
 //! ([`classify_access_intent`]).
 //!
 //! With a bulk-scan byte threshold set (the server's
-//! `--cache-bulk-scan-min-bytes`, ADR-3072's #3084 amendment), a statement is
-//! also BulkScan when it names one `samples` or `logs` table and no Parquet
-//! table, its resolved segments' `object_size` sums to at least the threshold,
-//! and its plan has no equality on a field the tenant indexes in KEY_IDX
-//! ([`size_trigger_lane`], [`plan_has_key_equality`]). Every other statement
-//! is Interactive. Unset, the first rule decides alone.
+//! `--cache-bulk-scan-min-bytes`, ADR-3072's size trigger amendment), a
+//! statement sent as SQL text is also BulkScan when it names one `logs` table
+//! and no Parquet table, its resolved segments' `object_size` sums to at least
+//! the threshold, and its optimized plan has no equality on a field the
+//! tenant indexes in KEY_IDX ([`size_trigger_applies`],
+//! [`plan_has_key_equality`]). Every other statement is Interactive. Unset,
+//! the first rule decides alone.
 
 use std::sync::Arc;
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator};
+use datafusion::logical_expr::{Expr, LogicalPlan, Operator};
 use ravel_cache::{CacheMetrics, CacheMetricsSnapshot, IntentCounters, IntentMetricsSnapshot};
 use ravel_catalog::Snapshot;
 use ravel_logseg::key_index::TRACE_ID_FIELD;
@@ -61,7 +62,7 @@ use crate::executor::TargetSignal;
 ///
 /// This is the rule without the size trigger; the executor reads an
 /// Interactive result as BulkScan when the trigger applies
-/// ([`size_trigger_lane`], [`plan_has_key_equality`]).
+/// ([`size_trigger_applies`], [`plan_has_key_equality`]).
 ///
 /// `names_parquet` is whether the statement names a Parquet table: those
 /// resolve outside `lanes`, so a `samples` join with one would otherwise
@@ -169,35 +170,36 @@ pub(crate) fn resolved_object_bytes(snapshot: &Snapshot) -> u64 {
         .fold(0u64, |sum, seg| sum.saturating_add(seg.object_size))
 }
 
-/// The lane the bulk-scan size trigger applies to, when it can: `min_bytes`
-/// is set, the statement names one `samples` or `logs` table and no Parquet
-/// table, and that lane's resolved segments sum to at least `min_bytes`
-/// ([`resolved_object_bytes`]). The caller still rules out an exact-key
-/// lookup ([`plan_has_key_equality`]) before reading the statement as
-/// BulkScan.
-pub(crate) fn size_trigger_lane(
+/// Whether the bulk-scan size trigger can apply: `min_bytes` is set, the
+/// statement names one `logs` table and no Parquet table, and that lane's
+/// resolved segments sum to at least `min_bytes` ([`resolved_object_bytes`]).
+/// A `samples` statement never applies. The caller still requires SQL text
+/// and rules out an exact-key lookup ([`plan_has_key_equality`]) before
+/// reading the statement as BulkScan.
+pub(crate) fn size_trigger_applies(
     lanes: &[(TargetSignal, &Snapshot)],
     names_parquet: bool,
     min_bytes: Option<u64>,
-) -> Option<TargetSignal> {
-    let min_bytes = min_bytes?;
-    if names_parquet {
-        return None;
-    }
-    let [(signal, snapshot)] = lanes else {
-        return None;
+) -> bool {
+    let Some(min_bytes) = min_bytes else {
+        return false;
     };
-    let scans_signal = matches!(signal, TargetSignal::Metrics | TargetSignal::Logs);
-    (scans_signal && resolved_object_bytes(snapshot) >= min_bytes).then_some(*signal)
+    let [(TargetSignal::Logs, snapshot)] = lanes else {
+        return false;
+    };
+    !names_parquet && resolved_object_bytes(snapshot) >= min_bytes
 }
 
 /// Whether `plan`, subqueries included, holds an `=` between a field
 /// `key_index` names (a declared column in its `columns`, or `trace_id` when
 /// its `trace_id` is set) and anything that is not a column, in a `Filter`
-/// predicate or a filter pushed into a `TableScan`. This is wider than the
-/// KEY_IDX probe's own test (any position in the predicate, a cast column,
-/// a literal of any type), so a statement the probe could answer is never
-/// read as a bulk scan.
+/// predicate, a filter pushed into a `TableScan`, or a `Join`'s filter or
+/// equijoin pairs. This is wider than the KEY_IDX probe's own test (any
+/// position in the predicate, a cast column, a literal of any type), so a
+/// statement the probe could answer is never read as a bulk scan. The caller
+/// passes the optimized plan, whose `TableScan` filters are the ones the
+/// probe reads, so a rewrite the optimizer makes (a one-element `IN` to `=`,
+/// a filter pushed through an alias or into a join side) is seen here too.
 pub(crate) fn plan_has_key_equality(plan: &LogicalPlan, key_index: &KeyIndexDeclaration) -> bool {
     if key_index.columns.is_empty() && !key_index.trace_id {
         return false;
@@ -215,12 +217,24 @@ pub(crate) fn plan_has_key_equality(plan: &LogicalPlan, key_index: &KeyIndexDecl
         let predicates: Vec<&Expr> = match node {
             LogicalPlan::Filter(filter) => vec![&filter.predicate],
             LogicalPlan::TableScan(scan) => scan.filters.iter().collect(),
+            LogicalPlan::Join(join) => {
+                if join
+                    .on
+                    .iter()
+                    .any(|(left, right)| key_equality_field(left, right).is_some_and(&indexed))
+                {
+                    found = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                join.filter.iter().collect()
+            }
             _ => Vec::new(),
         };
         for predicate in predicates {
             let _ = predicate.apply(|expr| {
                 if let Expr::BinaryExpr(be) = expr
-                    && key_equality_field(be).is_some_and(&indexed)
+                    && be.op == Operator::Eq
+                    && key_equality_field(&be.left, &be.right).is_some_and(&indexed)
                 {
                     found = true;
                     return Ok(TreeNodeRecursion::Stop);
@@ -237,12 +251,9 @@ pub(crate) fn plan_has_key_equality(plan: &LogicalPlan, key_index: &KeyIndexDecl
     found
 }
 
-/// The field name of an `=` with a column, bare or cast, on one side and a
-/// non-column on the other.
-fn key_equality_field(be: &BinaryExpr) -> Option<&str> {
-    if be.op != Operator::Eq {
-        return None;
-    }
+/// The field name of an equality between `left` and `right` with a column,
+/// bare or cast, on one side and a non-column on the other.
+fn key_equality_field<'a>(left: &'a Expr, right: &'a Expr) -> Option<&'a str> {
     fn column(e: &Expr) -> Option<&str> {
         match e {
             Expr::Column(c) => Some(&c.name),
@@ -251,7 +262,7 @@ fn key_equality_field(be: &BinaryExpr) -> Option<&str> {
             _ => None,
         }
     }
-    match (column(&be.left), column(&be.right)) {
+    match (column(left), column(right)) {
         (Some(name), None) | (None, Some(name)) => Some(name),
         _ => None,
     }
@@ -559,31 +570,29 @@ mod tests {
     }
 
     #[test]
-    fn the_size_trigger_applies_to_one_samples_or_logs_lane_at_or_above_the_threshold() {
+    fn the_size_trigger_applies_to_one_logs_lane_at_or_above_the_threshold() {
         // Two segments of one byte each.
         let snap = two_hours();
         assert_eq!(resolved_object_bytes(&snap), 2);
-        for signal in [TargetSignal::Metrics, TargetSignal::Logs] {
-            let lane = [(signal, &snap)];
-            assert_eq!(size_trigger_lane(&lane, false, Some(2)), Some(signal));
-            assert_eq!(size_trigger_lane(&lane, false, Some(3)), None);
-            assert_eq!(size_trigger_lane(&lane, false, None), None);
-            assert_eq!(size_trigger_lane(&lane, true, Some(1)), None);
-        }
+        let lane = [(TargetSignal::Logs, &snap)];
+        assert!(size_trigger_applies(&lane, false, Some(2)));
+        assert!(!size_trigger_applies(&lane, false, Some(3)));
+        assert!(!size_trigger_applies(&lane, false, None));
+        assert!(!size_trigger_applies(&lane, true, Some(1)));
         for signal in [
+            TargetSignal::Metrics,
             TargetSignal::Spans,
             TargetSignal::Alerts,
             TargetSignal::Audit,
             TargetSignal::Parquet,
         ] {
-            assert_eq!(
-                size_trigger_lane(&[(signal, &snap)], false, Some(1)),
-                None,
+            assert!(
+                !size_trigger_applies(&[(signal, &snap)], false, Some(1)),
                 "{signal:?}"
             );
         }
         let two_lanes = [(TargetSignal::Metrics, &snap), (TargetSignal::Logs, &snap)];
-        assert_eq!(size_trigger_lane(&two_lanes, false, Some(1)), None);
+        assert!(!size_trigger_applies(&two_lanes, false, Some(1)));
     }
 
     #[test]

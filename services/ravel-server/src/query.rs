@@ -1100,7 +1100,7 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// installs the default, which holds no key and so registers neither.
 ///
 /// `cache_bulk_scan_min_bytes` (`--cache-bulk-scan-min-bytes`, ADR-3072's
-/// #3084 amendment) is installed via
+/// size trigger amendment) is installed via
 /// `SqlExecutor::with_cache_bulk_scan_min_bytes`. [`build_sql_state`]
 /// installs `None`, the predicate-free bulk-scan rule alone.
 #[cfg(feature = "sql")]
