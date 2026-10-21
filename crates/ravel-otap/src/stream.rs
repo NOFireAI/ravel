@@ -39,8 +39,11 @@ use crate::proto::experimental::arrow::v1::{ArrowPayload, ArrowPayloadType, Batc
 /// oversized batches before we ever materialize Arrow arrays for them).
 #[derive(Debug, Clone, Copy)]
 pub struct StreamConfig {
-    /// Cap on decompressed bytes for a single `ArrowPayload.record`, checked
-    /// while decompressing (before the buffer is allowed to grow past it).
+    /// Cap on the Arrow IPC bytes a single `ArrowPayload.record` carries:
+    /// checked while decompressing a zstd frame (before the buffer is allowed
+    /// to grow past it), against the length of a payload with no frame, and,
+    /// before arrow's reader allocates them, against the decoded size of its
+    /// IPC body-compressed buffers.
     pub max_decompressed_payload_bytes: u64,
     /// Cumulative cap, across the whole gRPC stream, on bytes attributed to
     /// `DictionaryBatch` IPC messages (initial dictionaries and deltas).
@@ -113,7 +116,7 @@ pub enum StreamError {
     /// payloads' schema and dictionary messages to decoders that already took
     /// them, and any the failed payload carried never reach its decoder, so
     /// the stream is poisoned like a corrupted one.
-    #[error("zstd decompression did not complete on the CPU write gate: {0}")]
+    #[error("payload decode job did not complete on the CPU write gate: {0}")]
     Gate(CpuGateError),
 }
 
@@ -139,10 +142,47 @@ pub struct DecodedBatch {
 struct ScannedMessage {
     header: MessageHeader,
     body_len: u64,
+    /// The bytes arrow's reader produces from this message's body: `body_len`
+    /// without IPC body compression, and otherwise the sum of the
+    /// uncompressed lengths each compressed buffer's 8-byte prefix declares.
+    /// The reader allocates at most that length for a buffer before it
+    /// decompresses it, and refuses output of any other length.
+    decoded_body_len: u64,
     row_count: Option<i64>,
 }
 
 const CONTINUATION_MARKER: [u8; 4] = [0xff, 0xff, 0xff, 0xff];
+
+/// Arrow IPC's prefix on a body-compressed buffer: its uncompressed length
+/// as a little-endian i64, or -1 when the bytes after it are stored raw.
+const COMPRESSED_BUFFER_PREFIX_BYTES: usize = 8;
+const UNCOMPRESSED_BUFFER_PREFIX: i64 = -1;
+
+/// The bytes arrow's reader produces from the buffers of `batch`, whose
+/// metadata declares IPC body compression, read from each buffer's prefix
+/// in `body`. A buffer whose prefix lies outside `body` or carries a length
+/// arrow rejects counts as its stored length; arrow refuses it without
+/// decompressing it, with an error or a panic `StreamState` converts to one.
+fn compressed_body_decoded_len(batch: arrow_ipc::RecordBatch<'_>, body: &[u8]) -> u64 {
+    let Some(buffers) = batch.buffers() else {
+        return 0;
+    };
+    buffers.iter().fold(0u64, |total, buffer| {
+        let stored = buffer.length().max(0) as u64;
+        let prefix = usize::try_from(buffer.offset())
+            .ok()
+            .and_then(|start| body.get(start..start.checked_add(COMPRESSED_BUFFER_PREFIX_BYTES)?))
+            .filter(|_| stored >= COMPRESSED_BUFFER_PREFIX_BYTES as u64)
+            .and_then(|prefix| <[u8; 8]>::try_from(prefix).ok())
+            .map(i64::from_le_bytes);
+        let decoded = match prefix {
+            Some(UNCOMPRESSED_BUFFER_PREFIX) => stored - COMPRESSED_BUFFER_PREFIX_BYTES as u64,
+            Some(length) if length >= 0 => length as u64,
+            _ => stored,
+        };
+        total.saturating_add(decoded)
+    })
+}
 
 /// Walk the encapsulated Arrow IPC messages in `bytes`, reading only the
 /// flatbuffer message metadata (never array bodies) to report each
@@ -198,9 +238,21 @@ fn scan_messages(bytes: &[u8]) -> Result<Vec<ScannedMessage>, String> {
             Some(end) if end <= bytes.len() => end,
             _ => return Err("message body length out of bounds".to_string()),
         };
+        let batch = message.header_as_record_batch().or_else(|| {
+            message
+                .header_as_dictionary_batch()
+                .and_then(|dictionary| dictionary.data())
+        });
+        let decoded_body_len = match batch {
+            Some(batch) if batch.compression().is_some() => {
+                compressed_body_decoded_len(batch, &bytes[metadata_end..body_end])
+            }
+            _ => body_len,
+        };
         messages.push(ScannedMessage {
             header: message.header_type(),
             body_len,
+            decoded_body_len,
             row_count,
         });
         offset = body_end;
@@ -259,6 +311,32 @@ fn decompress_capped(record: &[u8], cap: u64) -> Result<MutableBuffer, BatchErro
     Ok(out)
 }
 
+/// The first four bytes of a zstd frame, `ZSTD_MAGICNUMBER` little-endian.
+const ZSTD_FRAME_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
+/// Whether `record` is a zstd frame, by its first four bytes alone. Any other
+/// payload is Arrow IPC with no outer frame, which is what the collector's
+/// `otelarrow` exporter sends: its `payload_compression` is IPC body
+/// compression, inside the stream, and arrow's reader undoes it.
+fn is_zstd_frame(record: &[u8]) -> bool {
+    record.starts_with(&ZSTD_FRAME_MAGIC)
+}
+
+/// The Arrow IPC bytes `record` carries, at most `cap` of them, in the same
+/// aligned buffer either way: a zstd frame goes through
+/// [`decompress_capped`], and any other payload is copied as-is.
+fn payload_capped(record: &[u8], cap: u64) -> Result<MutableBuffer, BatchError> {
+    if is_zstd_frame(record) {
+        return decompress_capped(record, cap);
+    }
+    if record.len() as u64 > cap {
+        return Err(BatchError::DecompressedPayloadTooLarge { limit: cap });
+    }
+    let mut out = MutableBuffer::new(record.len());
+    out.extend_from_slice(record);
+    Ok(out)
+}
+
 /// The decompressed length `record`'s frame headers declare: the sum of every
 /// frame's content size, or `None` when a frame declares none, a header does
 /// not parse, or `record` is empty.
@@ -295,6 +373,17 @@ fn zstd_job_bytes(record: &[u8], cap: u64) -> u64 {
     declared_content_size(record)
         .unwrap_or_else(|| (record.len() as u64).saturating_mul(ZSTD_MAX_EXPANSION))
         .min(cap)
+}
+
+/// The write gate's size for [`payload_capped`] on `record`: [`zstd_job_bytes`]
+/// for a zstd frame, and otherwise the payload's own length, capped, since
+/// the job only copies it.
+fn payload_job_bytes(record: &[u8], cap: u64) -> u64 {
+    if is_zstd_frame(record) {
+        zstd_job_bytes(record, cap)
+    } else {
+        (record.len() as u64).min(cap)
+    }
 }
 
 fn payload_type_of(payload: &ArrowPayload) -> Result<ArrowPayloadType, BatchError> {
@@ -407,9 +496,11 @@ impl StreamState {
         }
     }
 
-    /// Runs each payload's zstd decompression in [`decode_gated`] on the
-    /// ADR-1702 write gate under the `otap_decode` site, sized by an upper
-    /// bound on its decompressed length so the gate's inline floor applies.
+    /// Runs each payload's zstd decompression, or its copy when it carries no
+    /// zstd frame, in [`decode_gated`] on the ADR-1702 write gate under the
+    /// `otap_decode` site, sized by an upper bound on its output length so the
+    /// gate's inline floor applies. IPC body decompression stays on the
+    /// calling task, in the IPC decode.
     /// `None` decompresses inline, as [`decode`] always does.
     ///
     /// [`decode`]: Self::decode
@@ -448,7 +539,7 @@ impl StreamState {
         for payload in batch.arrow_payloads {
             let decoded = payload_type_of(&payload).and_then(|payload_type| {
                 let raw =
-                    decompress_capped(&payload.record, self.config.max_decompressed_payload_bytes)?;
+                    payload_capped(&payload.record, self.config.max_decompressed_payload_bytes)?;
                 Ok((payload_type, raw))
             });
             let decoded = match decoded {
@@ -463,8 +554,8 @@ impl StreamState {
         })
     }
 
-    /// [`decode`](Self::decode), with each payload's zstd decompression on the
-    /// write gate set by [`with_write_gate`](Self::with_write_gate). The
+    /// [`decode`](Self::decode), with each payload's zstd decompression (or
+    /// copy) on the write gate set by [`with_write_gate`](Self::with_write_gate). The
     /// decompression job owns the payload's compressed bytes; nothing else in
     /// the decode leaves the calling task, so the stateful IPC decoders are
     /// fed in payload order as before. A gate failure is a [`StreamError::Gate`]
@@ -504,16 +595,16 @@ impl StreamState {
                 if let Some(err) = self.fail_next_gate.take() {
                     return Err(StreamError::Gate(err).into());
                 }
-                let size = JobSize::Bytes(zstd_job_bytes(&record, cap));
+                let size = JobSize::Bytes(payload_job_bytes(&record, cap));
                 let decompressed = gate
                     .run(WriteSite::OtapDecode, size, move || {
-                        decompress_capped(&record, cap)
+                        payload_capped(&record, cap)
                     })
                     .await
                     .map_err(StreamError::Gate)?;
                 Ok(decompressed?)
             }
-            None => Ok(decompress_capped(&record, cap)?),
+            None => Ok(payload_capped(&record, cap)?),
         }
     }
 
@@ -544,6 +635,14 @@ impl StreamState {
         raw: MutableBuffer,
     ) -> Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError> {
         let scanned = scan_messages(&raw).map_err(BatchError::MalformedIpc)?;
+
+        let cap = self.config.max_decompressed_payload_bytes;
+        let decoded_bytes = scanned
+            .iter()
+            .fold(0u64, |total, m| total.saturating_add(m.decoded_body_len));
+        if decoded_bytes > cap {
+            return Err(BatchError::DecompressedPayloadTooLarge { limit: cap }.into());
+        }
 
         for message in &scanned {
             if let Some(rows) = message.row_count
@@ -757,6 +856,196 @@ mod tests {
             ),
             other => panic!("expected the declared-size stop, got {other:?}"),
         }
+    }
+
+    /// One-payload batch of `record`, typed as a root metrics payload; the
+    /// stream layer does not interpret columns, so any schema decodes.
+    fn one_payload(record: Vec<u8>) -> BatchArrowRecords {
+        BatchArrowRecords {
+            batch_id: 1,
+            arrow_payloads: vec![ArrowPayload {
+                schema_id: "s".to_string(),
+                r#type: ArrowPayloadType::UnivariateMetrics as i32,
+                record: record.into(),
+            }],
+            headers: Vec::new(),
+        }
+    }
+
+    fn decode_with(
+        config: StreamConfig,
+        batch: BatchArrowRecords,
+    ) -> Result<DecodedBatch, DecodeError> {
+        StreamState::new(config).decode(batch)
+    }
+
+    /// A schema and one record batch of `rows` rows, each a zero and `text`,
+    /// in one Arrow IPC stream fragment with no end-of-stream marker, as one
+    /// payload carries.
+    fn ipc_fragment(
+        rows: usize,
+        text: &str,
+        compression: Option<arrow_ipc::CompressionType>,
+    ) -> (Vec<u8>, RecordBatch) {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+        use arrow_ipc::writer::{IpcWriteOptions, StreamWriter};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("v", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![0i64; rows])),
+                Arc::new(StringArray::from(vec![text; rows])),
+            ],
+        )
+        .expect("batch");
+        let options = IpcWriteOptions::default()
+            .try_with_compression(compression)
+            .expect("options");
+        let mut writer =
+            StreamWriter::try_new_with_options(Vec::new(), &schema, options).expect("writer");
+        writer.write(&batch).expect("write");
+        (writer.get_ref().clone(), batch)
+    }
+
+    fn only_batch(decoded: DecodedBatch) -> RecordBatch {
+        let mut payloads = decoded.payloads;
+        assert_eq!(payloads.len(), 1, "one record batch");
+        payloads.remove(0).1
+    }
+
+    /// Arrow IPC with no zstd frame around it, the encoder's own bytes before
+    /// its zstd step, decodes to the same records as the framed payload.
+    #[test]
+    fn a_plain_ipc_payload_decodes_like_its_zstd_framed_form() {
+        let mut encoder = MetricsStreamEncoder::new("v1").expect("encoder");
+        let framed = encoder
+            .encode_batch(
+                1,
+                &[
+                    metric("cpu.load", &[(1_000, 0.5), (2_000, 0.75)]),
+                    metric("mem.used", &[(1_000, 42.0)]),
+                ],
+            )
+            .expect("encode batch");
+        let mut plain = framed.clone();
+        for payload in &mut plain.arrow_payloads {
+            assert!(is_zstd_frame(&payload.record), "the encoder frames");
+            let raw = zstd::stream::decode_all(&payload.record[..]).expect("unframe");
+            assert_eq!(raw[..4], CONTINUATION_MARKER, "plain Arrow IPC");
+            payload.record = raw.into();
+        }
+
+        let from_framed = decode_with(StreamConfig::default(), framed).expect("framed");
+        let from_plain = decode_with(StreamConfig::default(), plain).expect("plain");
+        assert!(!from_framed.payloads.is_empty());
+        assert_eq!(from_plain.payloads, from_framed.payloads);
+    }
+
+    /// The collector's `otelarrow` exporter's default: Arrow IPC whose buffers
+    /// are zstd-compressed inside the stream, with no outer frame.
+    #[test]
+    fn an_ipc_body_compressed_payload_decodes_without_an_outer_frame() {
+        let (compressed, batch) =
+            ipc_fragment(1000, "otelarrow", Some(arrow_ipc::CompressionType::ZSTD));
+        let (uncompressed, _) = ipc_fragment(1000, "otelarrow", None);
+        assert!(!is_zstd_frame(&compressed));
+        assert_eq!(compressed[..4], CONTINUATION_MARKER);
+        assert!(
+            compressed.len() < uncompressed.len(),
+            "the body is compressed"
+        );
+
+        let from_compressed = only_batch(
+            decode_with(StreamConfig::default(), one_payload(compressed)).expect("ipc zstd"),
+        );
+        let from_framed = only_batch(
+            decode_with(
+                StreamConfig::default(),
+                one_payload(declaring(&uncompressed)),
+            )
+            .expect("framed"),
+        );
+        assert_eq!(from_compressed, batch);
+        assert_eq!(from_framed, batch);
+    }
+
+    /// A payload with no zstd frame is held to the same cap as a decompressed
+    /// one, by its own length.
+    #[test]
+    fn a_plain_payload_over_the_cap_is_rejected_at_the_cap() {
+        let (plain, _) = ipc_fragment(100, "otelarrow", None);
+        let cap = plain.len() as u64 - 1;
+        assert!(matches!(
+            payload_capped(&plain, cap),
+            Err(BatchError::DecompressedPayloadTooLarge { limit }) if limit == cap
+        ));
+        let config = StreamConfig {
+            max_decompressed_payload_bytes: cap,
+            ..StreamConfig::default()
+        };
+        assert!(matches!(
+            decode_with(config, one_payload(plain.clone())),
+            Err(DecodeError::Batch(BatchError::DecompressedPayloadTooLarge { limit })) if limit == cap
+        ));
+        let at_cap = StreamConfig {
+            max_decompressed_payload_bytes: plain.len() as u64,
+            ..StreamConfig::default()
+        };
+        decode_with(at_cap, one_payload(plain)).expect("a payload at the cap decodes");
+    }
+
+    /// IPC body compression is bounded by the same cap: a payload well under
+    /// it whose compressed buffers declare more than it is refused before
+    /// arrow's reader allocates them.
+    #[test]
+    fn ipc_body_compression_past_the_cap_is_rejected_at_the_cap() {
+        const SMALL_CAP: u64 = 64 * 1024;
+        let (compressed, batch) = ipc_fragment(100_000, "", Some(arrow_ipc::CompressionType::ZSTD));
+        assert!(
+            (compressed.len() as u64) < SMALL_CAP,
+            "the payload is under the cap, {} bytes",
+            compressed.len()
+        );
+        assert!(
+            batch.get_array_memory_size() as u64 > 10 * SMALL_CAP,
+            "its buffers decode far past the cap"
+        );
+        let config = StreamConfig {
+            max_decompressed_payload_bytes: SMALL_CAP,
+            ..StreamConfig::default()
+        };
+        assert!(matches!(
+            decode_with(config, one_payload(compressed.clone())),
+            Err(DecodeError::Batch(BatchError::DecompressedPayloadTooLarge { limit })) if limit == SMALL_CAP
+        ));
+        let decoded = only_batch(
+            decode_with(StreamConfig::default(), one_payload(compressed))
+                .expect("under the default cap"),
+        );
+        assert_eq!(decoded, batch);
+    }
+
+    /// The gate sizes a payload with no zstd frame by its own length, capped,
+    /// and a zstd frame exactly as before.
+    #[test]
+    fn a_plain_payload_is_sized_by_its_length() {
+        let (plain, _) = ipc_fragment(100, "otelarrow", None);
+        assert_eq!(payload_job_bytes(&plain, CAP), plain.len() as u64);
+        assert_eq!(payload_job_bytes(&plain, 10), 10);
+        assert_eq!(payload_job_bytes(&vec![0xAB; 4096], CAP), 4096);
+
+        let framed = declaring(&vec![0u8; MIB]);
+        assert_eq!(
+            payload_job_bytes(&framed, CAP),
+            zstd_job_bytes(&framed, CAP)
+        );
+        let bare = undeclaring(&[3u8; 1000]);
+        assert_eq!(payload_job_bytes(&bare, CAP), zstd_job_bytes(&bare, CAP));
     }
 
     fn metric(name: &str, points: &[(i64, f64)]) -> MetricRow {

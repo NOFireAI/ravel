@@ -22,7 +22,14 @@ The OpenTelemetry Arrow Protocol (OTAP) from open-telemetry/otel-arrow:
 bidirectional gRPC streams carrying `BatchArrowRecords` messages. Each message
 has a `batch_id`, and one `ArrowPayload` per payload type (metrics table,
 resource attrs, scope attrs, data-point attrs, exemplars), each payload an
-Arrow IPC stream fragment compressed with zstd. Schemas and dictionaries
+Arrow IPC stream fragment. Ravel accepts a payload in either of two forms,
+told apart by its first four bytes: a zstd frame (the zstd magic
+`28 B5 2F FD`) around the IPC bytes, or the IPC bytes with no outer frame,
+with or without Arrow IPC body compression (zstd-compressed buffers inside
+the stream, which arrow's reader decompresses). The collector's `otelarrow`
+exporter sends the second form: its `payload_compression` setting is IPC
+body compression. Both forms are held to the same per-payload cap on
+decoded bytes. Schemas and dictionaries
 arrive incrementally per stream; payloads reference them by `schema_id`.
 The receiver replies per batch with `BatchStatus` (ack/nack + retry hint).
 

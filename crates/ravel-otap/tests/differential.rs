@@ -416,6 +416,69 @@ fn empty_batch_agrees() {
     assert_paths_agree(&[]);
 }
 
+/// The collector's `otelarrow` exporter sends each payload as Arrow IPC with
+/// no zstd frame around it. With the frame removed, the OTAP path still
+/// agrees with OTLP.
+#[test]
+fn unframed_payloads_agree() {
+    let point = |ts_offset_ns: i64, value: f64, host: &str| WorkloadPoint {
+        ts_offset_ns,
+        value,
+        flags: 0,
+        attrs: vec![WorkloadAttr {
+            key: "host".to_string(),
+            value: WorkloadValue::Str(host.to_string()),
+        }],
+    };
+    let workload = [
+        WorkloadMetric {
+            name: "cpu.load".to_string(),
+            unit: "1".to_string(),
+            kind: WorkloadKind::Gauge,
+            points: vec![point(-1_000, 0.5, "a"), point(0, 0.75, "b")],
+        },
+        WorkloadMetric {
+            name: "requests".to_string(),
+            unit: String::new(),
+            kind: WorkloadKind::Sum {
+                temporality: AGGREGATION_TEMPORALITY_CUMULATIVE,
+                is_monotonic: true,
+            },
+            points: vec![point(0, 12.0, "a")],
+        },
+    ];
+    let tenant = TenantId::new("acme");
+    let limits = IngestLimits::default();
+    let rules = TenantRules::none();
+    let otlp_out = normalize_metrics(
+        &tenant,
+        build_otlp_request(&workload),
+        &limits,
+        &rules,
+        INGEST_TS_NS,
+    );
+
+    let mut encoder = MetricsStreamEncoder::new("differential").expect("new encoder");
+    let mut batch = build_otap_batch(&workload, &mut encoder, 0);
+    for payload in &mut batch.arrow_payloads {
+        payload.record = zstd::stream::decode_all(payload.record.as_ref())
+            .expect("remove the zstd frame")
+            .into();
+    }
+    let decoded = StreamState::new(StreamConfig::default())
+        .decode(batch)
+        .expect("decode unframed otap batch");
+    let otap_out = normalize_decoded(&tenant, &decoded, &limits, &rules, INGEST_TS_NS);
+
+    assert_eq!(samples(&otap_out).len(), 3, "every point decoded");
+    assert_eq!(series_ids(&otlp_out), series_ids(&otap_out));
+    assert_eq!(samples(&otlp_out), samples(&otap_out));
+    assert_eq!(
+        rejection_multiset(&otlp_out.rejected),
+        rejection_multiset(&otap_out.rejected)
+    );
+}
+
 #[test]
 fn future_skew_boundary_agrees() {
     let limits = IngestLimits::default();
