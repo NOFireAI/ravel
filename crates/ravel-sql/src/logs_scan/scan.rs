@@ -110,8 +110,9 @@ impl PartitionCtx {
     /// On the planned route a segment [`may_skip_plan`] accepts in a scan
     /// that [`skips_sub_bound_plans`] is not planned (ADR-2677 decision 2):
     /// [`compute_plan_counts`] never calls `plan_segment` for it,
-    /// so the fetch-layer recorder cannot fire, and [`owned_work`] gives it to
-    /// exactly one partition, whose open records the touch here instead.
+    /// so the fetch-layer recorder cannot fire, and [`PlanCounts::publish`]
+    /// publishes it as one unit, whose one owner records the touch here
+    /// instead.
     fn record_data_object_touched(&self) {
         self.phase_accounting.scan().add_data_objects_touched(1);
     }
@@ -151,15 +152,15 @@ type OpenFuture = Pin<Box<dyn Future<Output = DFResult<Option<LogSegmentScan>>> 
 
 /// Fetch one segment's bytes and open its pruned, column-projected scan
 /// restricted to the whole-object block indices in `indices` (ADR-2414
-/// decision A1: `owned_work` deals whole row groups, so these are raw block
+/// decision A1: `PlanCounts::publish` publishes whole row groups, so these are raw block
 /// indices, not ordinal survivor positions).
 /// `Ok(None)` means the catalog summary proved the segment irrelevant, with no
 /// GET issued -- which cannot happen for a segment that was already counted
 /// with survivors, but is handled as end-of-segment rather than panicking.
 ///
 /// `survivors` is the segment's whole surviving-block list the plan phase
-/// produced ([`OwnedSeg::survivors`]), of which `indices` is this partition's
-/// share. Every caller of this function reaches it only through `owned_work`
+/// produced ([`OwnedSeg::survivors`]), of which `indices` is this unit's
+/// share. Every caller of this function reaches it only through `PlanCounts::publish`
 /// (never `owned_whole_segments`, which never calls this function), so
 /// `survivors` is architecturally always `Some`; `None` is refused with a
 /// typed error rather than silently scanning without the cross-check (issue
@@ -1366,6 +1367,8 @@ impl LogScanStream {
         }
         self.current_dirs = None;
         self.work.clear();
+        self.queue = None;
+        self.round = None;
         self.prefetch_pool.clear(self.partition);
         self.release_block();
         self.resident.free();
@@ -1377,6 +1380,8 @@ impl LogScanStream {
         self.state = LogScanState::Done;
         self.current_dirs = None;
         self.work.clear();
+        self.queue = None;
+        self.round = None;
         self.prefetch_pool.clear(self.partition);
         self.release_block();
         self.resident.free();
@@ -1486,11 +1491,6 @@ impl LogScanStream {
                         this.blocks
                             .planning_wait_elapsed
                             .add_elapsed(this.stream_started);
-                        // The stride the plan counted each segment's owners
-                        // against: `target_partitions` capped by the real block
-                        // count (ADR-0102), so with fewer blocks than partitions
-                        // the extra partitions get empty work.
-                        let n = counts.partitions;
                         // Partition 0 publishes every relevant segment's
                         // whole-segment prune totals, once, so striping a segment
                         // across partitions does not multiply them.
@@ -1506,15 +1506,12 @@ impl LogScanStream {
                                 .blocks_pruned_by_key_index
                                 .add(counts.key_index.blocks_pruned as usize);
                         }
-                        let order = visit_order(&this.segments, this.topk.is_some());
-                        this.work = owned_work(
-                            &counts,
-                            &this.segments,
-                            &order,
-                            this.partition,
-                            n,
-                            this.stripe_blocks,
-                        );
+                        this.queue = this.round.as_ref().map(|round| {
+                            round.queue(|| {
+                                let order = visit_order(&this.segments, this.topk.is_some());
+                                counts.publish(&this.segments, &order, this.stripe_blocks)
+                            })
+                        });
                         this.state = LogScanState::NextSegment;
                     }
                     Poll::Ready(Err(e)) => return this.fail(e),
@@ -1584,7 +1581,11 @@ impl LogScanStream {
                         }
                         continue;
                     }
-                    match this.work.pop_front() {
+                    let next = match this.work.pop_front() {
+                        Some(owned) => Some(owned),
+                        None => this.queue.as_ref().and_then(|queue| queue.take_next()),
+                    };
+                    match next {
                         Some(OwnedSeg {
                             seg,
                             ordinal,
@@ -1613,7 +1614,7 @@ impl LogScanStream {
                             this.current_dirs = dirs;
                             // Moved, not cloned: this `OwnedSeg` open consumes its
                             // carried whole object exactly once, by whichever open
-                            // below `take()`s it first. Under `global_deal` a
+                            // below `take()`s it first. With row-group units a
                             // stream can reach this transition several times for
                             // the same segment, one `OwnedSeg` at a time, each
                             // with its own carry. A later `ReopenRows` reopen of

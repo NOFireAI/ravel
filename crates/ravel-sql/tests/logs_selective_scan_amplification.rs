@@ -440,7 +440,8 @@ async fn write_segment_uniform_variant(
 /// `MARKER_FEW` anywhere (issue #835 follow-up, finding 3b): a `has_word`
 /// query against it still forces a plan-phase whole-object read (the skip
 /// index cannot decide the predicate without reading), but finds zero
-/// surviving blocks, so `owned_work` never lets any partition open it.
+/// surviving blocks, so `PlanCounts::publish` publishes no unit for it and no
+/// partition opens it.
 async fn build_snapshot_uniform_first_zero_survivor(store: &dyn ObjectStoreBackend) -> Snapshot {
     let mut segments = Vec::with_capacity(SEGMENTS);
     for s in 0..SEGMENTS {
@@ -1407,8 +1408,8 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
 /// decide a text predicate whether or not it ultimately matches, so EVERY
 /// relevant segment's plan phase reads the whole object to find out
 /// (`plan_full_reads == SEGMENTS`) -- but only the one segment containing the
-/// marker has a surviving block, so `owned_work` assigns no partition any
-/// work in the other `SEGMENTS - 1` segments and the scan phase never opens
+/// marker has a surviving block, so `PlanCounts::publish` publishes no unit
+/// for the other `SEGMENTS - 1` segments and the scan phase never opens
 /// them. The one surviving segment's scan reuses its plan-carried bytes (no
 /// second GET), so the total wire GET count is exactly `SEGMENTS`: the plan
 /// pass moves every object once, and the scan adds nothing.
@@ -1872,7 +1873,7 @@ async fn fewer_sub_break_even_segments_than_partitions_keep_the_plan() {
 }
 
 /// Issue #835 follow-up (finding 3): the carry budget must not be spent on a
-/// segment `owned_work` was always going to drop for having zero surviving
+/// segment `PlanCounts::publish` was always going to drop for having zero surviving
 /// blocks -- that would retain bytes no partition ever reuses while starving
 /// a segment that would have used the slot.
 ///
@@ -1956,7 +1957,7 @@ async fn plan_carry_skips_zero_survivor_segment_budget() {
         "plan phase pays for every segment's whole-object read regardless of \
          survivor count or carry budget"
     );
-    // Segment 0 is skipped by owned_work outright (zero survivors) and is
+    // Segment 0 is skipped by PlanCounts::publish outright (zero survivors) and is
     // never opened by anything past the plan phase, so it contributes zero
     // probe/scan GETs whether or not its carry was retained. Segments 1 and 2
     // are carried and reused for free. The remaining SEGMENTS - 1 - BUDGET

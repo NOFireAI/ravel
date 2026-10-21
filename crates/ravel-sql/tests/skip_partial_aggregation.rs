@@ -104,9 +104,10 @@ const DISTINCT: usize = 25_000;
 /// stage emits exactly as many rows as it aggregated. That is what makes its
 /// total `output_rows` its input row count exactly, not approximately.
 ///
-/// Three, not two, and the reason is the scan's block-to-partition rule: global
-/// block `i` goes to partition `i % target_partitions` (ADR-0102, `logs_scan`
-/// module docs). Two rounds put 8 blocks in an object, a multiple of the four
+/// Three, not two, and the reason is the scan's block-to-partition rule:
+/// partitions take units from one queue as they ask for work (ADR-0102,
+/// `logs_scan` module docs), so partitions running in step take global block
+/// `i` at partition `i % target_partitions`. Two rounds put 8 blocks in an object, a multiple of the four
 /// partitions, so every partition draws the same object-local block offsets from
 /// every object and sees only the slice of the value space those offsets cover;
 /// measured, the pre-final state fell to 41,072 entries instead of
