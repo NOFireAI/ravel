@@ -1495,12 +1495,13 @@ process three ways:
 | `stat="active"` minus `stat="allocated"` | Size-class fragmentation inside live allocations. |
 | `stat="allocated"` | The live allocations. If this is close to resident, live buffers hold the memory, and a heap profile names the allocation sites. |
 
-Two more samples describe address space rather than resident memory:
-`stat="mapped"` is the bytes the allocator has mapped for its active extents,
-an upper bound on how much of the process's memory is allocator mappings, and
+Two more samples describe address space rather than resident memory.
+`stat="mapped"` is the bytes in the allocator's active extents, and
 `stat="retained"` is virtual memory the allocator keeps reserved for reuse
-instead of unmapping it. `retained` holds no physical pages, so never subtract
-it from a resident figure.
+instead of unmapping it. Neither is a resident figure: `resident` can exceed
+`mapped`, because it also counts the allocator's metadata and unused dirty
+pages outside the active extents, and `retained` holds no physical pages, so
+never subtract either one from a resident figure.
 
 Freed pages that jemalloc has not yet returned count toward `stat="resident"`.
 At startup the server enables jemalloc's background thread, which returns
