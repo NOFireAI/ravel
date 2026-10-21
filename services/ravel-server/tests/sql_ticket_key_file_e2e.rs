@@ -3,11 +3,14 @@
 //! `ravel_server::start`, for two processes that find each other through the
 //! real query-worker heartbeat under `sys/query/workers/`.
 //!
-//! The two processes read one SQL ticket key file and DIFFERENT fragment key
-//! files. The SQL ticket key the pre-ADR-1689 wiring derived from the first
-//! fragment key would therefore differ between them, so every slice ticket the
-//! coordinator mints would fail the worker's MAC. Only keys read from the SQL
-//! ticket key file make the two agree.
+//! The two processes read one SQL ticket key file and fragment key files whose
+//! FIRST (minting) keys differ: `[A, B]` and `[B, A]`. The SQL ticket key the
+//! pre-ADR-1689 wiring derived from the first fragment key would therefore
+//! differ between them, so every slice ticket the coordinator mints would fail
+//! the worker's MAC. Only keys read from the SQL ticket key file make the two
+//! agree. The files share their keys, in different order, because each
+//! process's heartbeat record must verify at the other (ADR-1918): records are
+//! signed under the first fragment key and verified under every one.
 //!
 //! The coordinator's store refuses every GET of a published data object, so it
 //! cannot answer any part of the query itself: neither a whole-set local run
@@ -503,7 +506,8 @@ async fn await_heartbeat_records(store: &MemoryStore, count: usize) {
 
 /// Two processes on one shared store: a worker whose SQL ticket key file is
 /// `worker_sql_keys` and a coordinator whose file is `coordinator_sql_keys`,
-/// each with its own fragment key file. The worker's heartbeat record is in
+/// each with its own fragment key file, the same two keys with a different
+/// first (minting) key. The worker's heartbeat record is in
 /// the store before the coordinator starts, so the coordinator's first
 /// heartbeat read lists it.
 async fn start_pair(coordinator_sql_keys: &[&str], worker_sql_keys: &[&str]) -> Pair {
@@ -535,8 +539,8 @@ async fn start_pair(coordinator_sql_keys: &[&str], worker_sql_keys: &[&str]) -> 
 
     let coordinator_sql = key_file(coordinator_sql_keys);
     let worker_sql = key_file(worker_sql_keys);
-    let coordinator_fragment = key_file(&[FRAGMENT_KEY_A]);
-    let worker_fragment = key_file(&[FRAGMENT_KEY_B]);
+    let coordinator_fragment = key_file(&[FRAGMENT_KEY_A, FRAGMENT_KEY_B]);
+    let worker_fragment = key_file(&[FRAGMENT_KEY_B, FRAGMENT_KEY_A]);
 
     let worker_store = DataStore::new(shared.clone(), data_keys.clone(), false);
     let worker = start_server(
@@ -607,8 +611,8 @@ async fn cross_process_query(
 }
 
 /// Acceptance (ADR-1689 decision 2): two processes sharing one
-/// `--sql-ticket-key-file` and holding different `--fragment-key-file`
-/// contents run a distributed SQL query whose slices cross processes, and the
+/// `--sql-ticket-key-file` and holding `--fragment-key-file` contents with
+/// different first keys run a distributed SQL query whose slices cross processes, and the
 /// result equals the single-process result exactly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sql_ticket_key_file_keys_slice_tickets_across_processes() {
