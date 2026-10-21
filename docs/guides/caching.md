@@ -301,11 +301,14 @@ by default), a statement the predicate-free rule left `interactive` reads as
   counts as an equality, and so does a column renamed through a CTE or a
   subquery.
 
-A key lookup stays `interactive` however much it resolves, because the
-KEY_IDX probe reads only a few blocks of each segment. When the executor
-cannot tell whether a statement is a key lookup, it reads it as one. A
-statement's `stats.cache.intent` reports the intent it read under, not which
-rule set it.
+A key lookup stays `interactive` however much it resolves. Only an equality
+on a key-indexed field is exempt, because only the KEY_IDX probe reliably
+narrows the read; an equality on another typed attribute column can also be
+pruned by block postings, but that pruning can decline (on older sections, or
+where statistics are absent), so such a statement still counts toward the
+threshold. When the executor cannot tell whether a statement is a key lookup,
+it reads it as one. A statement's `stats.cache.intent` reports the intent it
+read under, not which rule set it.
 
 Everything else reads as `interactive`:
 

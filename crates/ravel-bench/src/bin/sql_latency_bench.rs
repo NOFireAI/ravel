@@ -171,10 +171,11 @@ struct Args {
     cache_bytes: u64,
     /// Resolved bytes at or above which a filtered `logs` statement sent as
     /// SQL text also reads as a bulk scan, the same flag as `ravel-server
-    /// --cache-bulk-scan-min-bytes`. Set, the read cache is also attached to
-    /// the samples fetcher, which the report's `read_cache` is read from.
-    /// Unset (the default), only the predicate-free rule applies and the
-    /// samples fetcher reads uncached. Generated lane only.
+    /// --cache-bulk-scan-min-bytes`. Unset (the default), only the
+    /// predicate-free rule applies. It moves the intent classification only:
+    /// the read cache goes on the samples fetcher, which the report's
+    /// `read_cache` is read from, whenever `--cache-bytes` builds one.
+    /// Generated lane only.
     #[arg(long, value_name = "BYTES", requires = "generate")]
     cache_bulk_scan_min_bytes: Option<u64>,
     /// Per-statement wall deadline, in seconds. A statement that exceeds it
