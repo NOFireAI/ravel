@@ -293,10 +293,11 @@ async fn real_collector_otelarrow_export_is_queryable() {
 
     let container_name = format!("ravel-otap-e2e-{}", std::process::id());
 
+    // No `--rm`: a collector that exits at startup must keep its log for the
+    // diagnostics below. `docker rm -f` removes it at the end instead.
     let status = Command::new("docker")
         .args([
             "run",
-            "--rm",
             "-d",
             "--network",
             "host",
@@ -339,7 +340,15 @@ async fn real_collector_otelarrow_export_is_queryable() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert!(pushed, "collector otlp receiver never accepted the metric");
+    if !pushed {
+        // A collector that exited at startup (an unknown config key, a bad
+        // image) never opens its receiver; its log says why.
+        let log = collector_log(&container_name);
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &container_name])
+            .status();
+        panic!("collector otlp receiver never accepted the metric\ncollector log:\n{log}");
+    }
 
     // Poll until the exported sample lands (strict commit through the OTAP
     // path makes it durable + visible), bounded so a broken pipeline fails
@@ -357,17 +366,7 @@ async fn real_collector_otelarrow_export_is_queryable() {
     // otelarrow exporter did (a refused stream, an auth or protocol error),
     // and the server's metrics say whether any OTAP batch arrived.
     let diagnostics = if series.is_none() {
-        let collector_log = Command::new("docker")
-            .args(["logs", &container_name])
-            .output()
-            .map(|out| {
-                format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                )
-            })
-            .unwrap_or_else(|err| format!("docker logs failed: {err}"));
+        let collector_log = collector_log(&container_name);
         let server_metrics = match client
             .get(format!("http://{http_addr}/metrics"))
             .send()
@@ -397,7 +396,7 @@ async fn real_collector_otelarrow_export_is_queryable() {
     };
 
     let _ = Command::new("docker")
-        .args(["stop", &container_name])
+        .args(["rm", "-f", &container_name])
         .status();
 
     let series = series.unwrap_or_else(|| {
@@ -415,4 +414,19 @@ async fn real_collector_otelarrow_export_is_queryable() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+/// The collector container's stdout and stderr, or why they could not be read.
+fn collector_log(container_name: &str) -> String {
+    Command::new("docker")
+        .args(["logs", container_name])
+        .output()
+        .map(|out| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+        .unwrap_or_else(|err| format!("docker logs failed: {err}"))
 }
