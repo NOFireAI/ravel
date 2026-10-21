@@ -204,6 +204,9 @@ async fn run_against_real_prometheus(protobuf_message: &str, metric_query: &str)
             PROMETHEUS_IMAGE,
             "--config.file=/etc/prometheus/prometheus.yml",
             "--storage.tsdb.retention.time=1h",
+            // Prometheus 3.0 refuses a remote-write 2.0 config at startup
+            // without it; it is inert for the 1.0 protocol.
+            "--enable-feature=metadata-wal-records",
         ])
         .status()
         .expect("docker must be runnable in an environment that executes this ignored test");
