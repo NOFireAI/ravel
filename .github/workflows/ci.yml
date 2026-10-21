@@ -2087,13 +2087,16 @@ jobs:
   # kind. The split moves work between jobs; no individual build/assemble/kind
   # step's command, env, or order changed.
   #
-  # The release binaries are built on the runner and the images assembled from
-  # them (Dockerfile.prebuilt) instead of letting kind-up.sh run the root
-  # Dockerfile's builder stage: that stage recompiles the whole workspace inside
-  # Docker with CARGO_BUILD_JOBS=2 and no access to this workflow's cache (57
-  # minutes measured on an 8 GiB arm64 host). RAVEL_SKIP_IMAGE_BUILD=1 exists
-  # for exactly this split, and the rust-cache setup here is the same one
-  # `check` uses, so the release build starts warm.
+  # The release binaries are built by scripts/build-prebuilt-binaries.sh and
+  # the images assembled from them (Dockerfile.prebuilt) instead of letting
+  # kind-up.sh run the root Dockerfile's full build: that build recompiles the
+  # whole workspace inside Docker with CARGO_BUILD_JOBS=2 and no access to
+  # this workflow's cache (57 minutes measured on an 8 GiB arm64 host). The
+  # script runs in the same builder image, so the binaries carry the shipping
+  # build's glibc whatever Ubuntu the runner is (#3146), but with the
+  # workspace's target/ and the cargo caches mounted from the runner, where
+  # rust-cache restores them, and without the jobs cap.
+  # RAVEL_SKIP_IMAGE_BUILD=1 exists for exactly this split.
   k8s-build:
     needs: changes
     # Same gate k8s-integration carries (docs_only plus server_or_operator,

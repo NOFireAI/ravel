@@ -83,7 +83,7 @@ leaves the cluster running so you can look at it.
 | `RAVEL_KIND_NODE_IMAGE` | pinned `kindest/node` | Control-plane version to test against. |
 | `RAVEL_SERVER_IMAGE` | `ravel-server:kind-dev` | Server image tag. |
 | `RAVEL_OPERATOR_IMAGE` | `ravel-operator:kind-dev` | Operator image tag. |
-| `RAVEL_SKIP_IMAGE_BUILD` | `0` | `1` skips `docker build` and uses the two tags as-is; they must already exist in the local docker daemon. This is how CI reuses host-built binaries. |
+| `RAVEL_SKIP_IMAGE_BUILD` | `0` | `1` skips `docker build` and uses the two tags as-is; they must already exist in the local docker daemon. This is how CI reuses the binaries `scripts/build-prebuilt-binaries.sh` builds. |
 | `RAVEL_FAKE_S3_BACKEND` | `floci` | `floci` or `rustfs`. |
 | `RAVEL_TENANT_NAME` | `demo-tenant` | Tenant to provision. |
 | `RAVEL_TENANT_TOKEN` | `demo-token` | Its bearer token. |

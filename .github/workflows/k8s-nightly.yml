@@ -65,8 +65,11 @@ jobs:
       # Inside the root Dockerfile's builder image, so the binaries link
       # against the shipping base's glibc rather than the runner's (#3146).
       # sccache does not reach into that container, so this job no longer
-      # installs it; rust-cache still restores target/ and the cargo caches
-      # the container builds into.
+      # installs it; rust-cache restores target/ and the cargo caches the
+      # container builds into. The first run after the move to the container
+      # rebuilds cold, since cargo's fingerprints record absolute paths and
+      # both the workspace and registry paths change inside it; later runs
+      # restore a container-built target/.
       - name: Build the release binaries in the builder image
         run: scripts/build-prebuilt-binaries.sh
       - name: Assemble both images from the prebuilt binaries

@@ -15,6 +15,11 @@
 # container builds into. The container runs as root; it hands everything it
 # wrote back to the calling user before it exits.
 #
+# The builder stage's CARGO_BUILD_JOBS=2 cap is deliberately not inherited:
+# CI builds at cargo's default against a 55-minute budget. On a small host
+# (the 8 GiB arm64 box the Dockerfile measured), set CARGO_BUILD_JOBS=2 in the
+# environment; the script passes it into the container.
+#
 # Usage: scripts/build-prebuilt-binaries.sh
 # Output: target/release/{ravel-server,ravel-cli,ravel-operator}
 set -euo pipefail
@@ -37,6 +42,7 @@ docker run --rm \
   -v "${cargo_home}/registry:/usr/local/cargo/registry" \
   -v "${cargo_home}/git:/usr/local/cargo/git" \
   -e CARGO_INCREMENTAL=0 \
+  ${CARGO_BUILD_JOBS:+-e CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS}"} \
   -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
   "${image}" \
   bash -c '
