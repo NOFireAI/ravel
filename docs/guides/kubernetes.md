@@ -675,7 +675,7 @@ For a `RavelCluster` named `dev`:
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
 | `dev-gateway-route` | HTTPRoute | Gateway API exposure. Only under `gateway.exposure.gatewayApi`, independent of the backend. |
 | `dev-gateway-route-grpc` | GRPCRoute | The same for OTLP/gRPC. Absent when `exposure.gatewayApi.grpc` is `false`. |
-| `dev-gateway`, `dev-query`, `dev-maintain`, `dev-qualify` | ServiceAccount | The accounts the three tiers and the qualify Job run as. Only under `storage.s3.auth: podIdentity`; see [Pod Identity](#pod-identity). The operator deletes them by name after a switch back to `static`, so do not create accounts with these names yourself. |
+| `dev-gateway`, `dev-query`, `dev-maintain`, `dev-qualify` | ServiceAccount | The accounts the three tiers and the qualify Job run as. Only under `storage.s3.auth: podIdentity`; see [Pod Identity](#pod-identity). After a switch back to `static` the operator deletes them by name, so do not create accounts with these names yourself in a cluster that has run under `podIdentity`. A cluster that never ran under `podIdentity` does not touch them. |
 
 You can scale `spec.maintain.replicas` above one safely. Maintain renders
 `RollingUpdate`, the same as gateway and query. It defaults to one replica
@@ -797,9 +797,12 @@ kubectl get -n ravel-system ravelcluster dev -o jsonpath='{.status}'
 `status` carries `observedGeneration`, `gatewayReadyReplicas`,
 `queryReadyReplicas`, `maintainReadyReplicas`, `storeQualifiedHash`,
 `qualifyFailureCount`, `qualifyNextRetryTime`, `qualifyRetryHash`,
-`gcBootstrapWaitingSince`, and conditions. `qualifyFailureCount` and
-`qualifyNextRetryTime` are the machine-readable form of the retry-budget
-state that the `StoreQualified` message describes in prose.
+`gcBootstrapWaitingSince`, `podIdentityServiceAccounts`, and conditions.
+`qualifyFailureCount` and `qualifyNextRetryTime` are the machine-readable
+form of the retry-budget state that the `StoreQualified` message describes in
+prose. `podIdentityServiceAccounts` is `true` from the first
+`storage.s3.auth: podIdentity` pass until the operator has deleted those
+ServiceAccounts after a switch back to `static`.
 
 The conditions are:
 

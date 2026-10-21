@@ -774,6 +774,11 @@
                     "nullable": true,
                     "type": "integer"
                   },
+                  "podIdentityServiceAccounts": {
+                    "description": "`true` once the operator has applied the `storage.s3.auth: podIdentity`\nServiceAccounts (`<name>-gateway`, `-query`, `-maintain`, `-qualify`).\nThe operator deletes those accounts after a switch back to `static`\nonly while this is set, and clears it once they are gone, so a cluster\nthat never ran under `podIdentity` never touches ServiceAccounts with\nthose names. Recorded here because the operator's RBAC cannot read a\nServiceAccount to check who owns it.\n\nSerialized even when absent (as explicit `null`) so the status merge\npatch clears it after the sweep.",
+                    "nullable": true,
+                    "type": "boolean"
+                  },
                   "qualifyFailureCount": {
                     "description": "Consecutive qualify-Job failures for the current inputs (issue #36, finding\n3). Drives the capped exponential recreation backoff and the terminal\ncooldown: the operator does not recreate a failing qualify Job unboundedly,\nit spaces the recreations out and, past a threshold, holds. Reset to absent\non a successful qualification and on any input change (a moving\n`storeQualifiedHash` input); never part of the qualified-input hash, so\ncounting failures never re-runs a qualification that would otherwise pass.\n\nSerialized even when absent (as explicit `null`) so the status merge patch\nclears it on success; a skipped field would leave a stale count behind.",
                     "format": "int32",
