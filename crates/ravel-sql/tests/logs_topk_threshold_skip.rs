@@ -792,7 +792,7 @@ async fn partitions_check_the_threshold_on_their_own() {
     );
 }
 
-/// The striped path: row groups of two blocks are dealt across partitions, a
+/// The striped path: row groups of two blocks are taken by partitions, a
 /// segment's groups can land on different partitions, and each skips by the
 /// same rule.
 #[tokio::test]

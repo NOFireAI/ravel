@@ -60,7 +60,7 @@
 //! partitions 0-2 only see it on their next poll, and whatever blocks were
 //! already in flight for them before the skip takes hold are decoded too: the
 //! lockstep drive decodes 67 blocks in all, confirmed by running this fixture
-//! with `global_deal` disabled. No committed test pins that number (it would
+//! with the global order (`global_order`) disabled. No committed test pins that number (it would
 //! need a production hook back to segment order), so it is not asserted here,
 //! only explained.
 

@@ -486,20 +486,28 @@ async fn run_scan_tp(
 
     let declared_partitions = scan.properties().output_partitioning().partition_count();
     let ctx = Arc::new(TaskContext::default());
+    // Partitions take units from a shared queue as they ask for work, so a
+    // sequential drain would hand every unit to partition 0. Poll them in
+    // turn, one batch each per pass, as concurrent execution would.
+    let mut streams = (0..declared_partitions)
+        .map(|p| Some(scan.execute(p, Arc::clone(&ctx)).expect("execute")))
+        .collect::<Vec<_>>();
+    let mut rows_per_partition = vec![0usize; declared_partitions];
     let mut batches = Vec::new();
-    let mut non_empty_partitions = 0;
-    for p in 0..declared_partitions {
-        let mut stream = scan.execute(p, Arc::clone(&ctx)).expect("execute");
-        let mut rows_here = 0usize;
-        while let Some(next) = stream.next().await {
-            let batch = next.expect("batch");
-            rows_here += batch.num_rows();
-            batches.push(batch);
-        }
-        if rows_here > 0 {
-            non_empty_partitions += 1;
+    while streams.iter().any(Option::is_some) {
+        for (p, slot) in streams.iter_mut().enumerate() {
+            let Some(stream) = slot else { continue };
+            match stream.next().await {
+                Some(next) => {
+                    let batch = next.expect("batch");
+                    rows_per_partition[p] += batch.num_rows();
+                    batches.push(batch);
+                }
+                None => *slot = None,
+            }
         }
     }
+    let non_empty_partitions = rows_per_partition.iter().filter(|&&n| n > 0).count();
 
     let metrics = scan.metrics().expect("metrics");
     let count = |name: &str| metrics.sum_by_name(name).map(|v| v.as_usize()).unwrap_or(0);
@@ -1293,25 +1301,24 @@ async fn every_block_with_attrs_raw_still_returns_every_row_exactly_once() {
 /// because a wrong `ReopenRows` fallback drops or duplicates rows *silently* --
 /// no crash, just a wrong answer.
 ///
-/// One segment of four two-record blocks is striped across `target_partitions =
-/// 2`. Blocks flatten to surviving positions 0..3 and unit `i` goes to partition
-/// `i % 2`, so partition 0 owns positions {0, 2} and partition 1 owns {1, 3}.
-/// The `attrs_raw` overflow is placed on positions 2 and 3 (the LATER block each
-/// partition owns), so on each partition the fallback fires on a block it does
-/// NOT own contiguously from the start of the segment: it has already emitted
-/// its position-0/1 block columnar (`block_cursor == 1`) and must skip
-/// exactly ONE position of its OWN index list, not one block of the whole
-/// segment.
+/// One segment of two row groups, each of two two-record blocks, is striped
+/// across `target_partitions = 2`. Each row group is one unit and the two
+/// partitions, polled in turn, take one unit each: partition 0 owns positions
+/// {0, 1} and partition 1 owns {2, 3}. The `attrs_raw` overflow is placed on
+/// positions 1 and 3 (the LATER block of each unit), so on each partition the
+/// fallback fires after it has already emitted its unit's first block columnar
+/// (`block_cursor == 1`) and must skip exactly ONE position of its OWN index
+/// list, not one block of the whole segment.
 ///
-/// The fix (ADR-0102) is that the reopened row scan is handed the SAME
-/// `current_indices` this partition owns, so `skip` is a position within that
-/// list. Proven by mutation: temporarily change the `LogScanState::Fallback`
-/// arm in `crates/ravel-sql/src/logs_scan.rs` to reopen a contiguous
+/// The reopened row scan is handed the SAME `current_indices` this partition
+/// owns, so `skip` is a position within that list. Proven by mutation:
+/// temporarily change the `LogScanState::Fallback` arm in
+/// `crates/ravel-sql/src/logs_scan/scan.rs` to reopen a contiguous
 /// whole-segment range instead of `this.current_indices.clone()` -- e.g.
-/// `open_segment_subset(ctx, seg, (0..=this.current_indices.iter().copied()
-/// .max().unwrap_or(0)).collect())` -- and this test goes RED with duplicated
-/// rows (each partition's whole-segment skip-by-count re-emits blocks the other
-/// partition owns). Restoring `this.current_indices.clone()` makes it pass.
+/// `(0..=this.current_indices.iter().copied().max().unwrap_or(0)).collect()`
+/// -- and this test goes RED: partition 1's whole-segment reopen skips one
+/// block and re-emits blocks partition 0 owns, and the columnar batch count
+/// reads 3 against 2.
 #[tokio::test]
 async fn a_strided_fallback_across_partitions_neither_drops_nor_repeats_rows() {
     let declared = vec![DeclaredColumn::new("tags", DeclaredType::Str)];
@@ -1335,25 +1342,25 @@ async fn a_strided_fallback_across_partitions_neither_drops_nor_repeats_rows() {
             attrs
         },
     };
-    // Four blocks of two records: positions 0 (ts 0,1) and 1 (ts 2,3) are clean,
-    // positions 2 (ts 4,5) and 3 (ts 6,7) carry the `attrs_raw` page. Under the
-    // 2-way stride, partition 0 gets {clean pos 0, spilled pos 2} and partition 1
-    // gets {clean pos 1, spilled pos 3}: each falls back on its SECOND owned
-    // block, so `skip == 1` against its own two-element index list.
+    // Four blocks of two records in two row groups: positions 0 (ts 0,1) and 2
+    // (ts 4,5) are clean, positions 1 (ts 2,3) and 3 (ts 6,7) carry the
+    // `attrs_raw` page. Partition 0 takes the unit {clean pos 0, spilled pos 1}
+    // and partition 1 takes {clean pos 2, spilled pos 3}: each falls back on its
+    // SECOND owned block, so `skip == 1` against its own two-element index list.
     let records = vec![
         mk(0, false),
         mk(1, false),
-        mk(2, false),
-        mk(3, false),
-        mk(4, true),
-        mk(5, true),
+        mk(2, true),
+        mk(3, true),
+        mk(4, false),
+        mk(5, false),
         mk(6, true),
         mk(7, true),
     ];
     let cfg = RlogConfig {
         block_target_records: 2,
         max_dynamic_columns: 1,
-        group_target_blocks: 1,
+        group_target_blocks: 2,
         ..RlogConfig::default()
     };
 
@@ -1396,10 +1403,10 @@ async fn a_strided_fallback_across_partitions_neither_drops_nor_repeats_rows() {
     let want = vec![
         vec![Cell::Ts(0), Cell::OptStr(None)],
         vec![Cell::Ts(1), Cell::OptStr(None)],
-        vec![Cell::Ts(2), Cell::OptStr(None)],
-        vec![Cell::Ts(3), Cell::OptStr(None)],
-        vec![Cell::Ts(4), Cell::OptStr(Some("spilled-4".to_string()))],
-        vec![Cell::Ts(5), Cell::OptStr(Some("spilled-5".to_string()))],
+        vec![Cell::Ts(2), Cell::OptStr(Some("spilled-2".to_string()))],
+        vec![Cell::Ts(3), Cell::OptStr(Some("spilled-3".to_string()))],
+        vec![Cell::Ts(4), Cell::OptStr(None)],
+        vec![Cell::Ts(5), Cell::OptStr(None)],
         vec![Cell::Ts(6), Cell::OptStr(Some("spilled-6".to_string()))],
         vec![Cell::Ts(7), Cell::OptStr(Some("spilled-7".to_string()))],
     ];
@@ -1419,8 +1426,8 @@ async fn a_strided_fallback_across_partitions_neither_drops_nor_repeats_rows() {
 /// being the one this item exists to fix.
 #[tokio::test]
 async fn block_striping_is_row_identical_to_single_partition() {
-    // One block per row group: the stride crosses segment boundaries block by
-    // block, which the pinned `blocks_scanned` figures below depend on.
+    // One block per row group: every unit is one block, which the pinned
+    // `blocks_scanned` figures below depend on.
     let cfg = RlogConfig {
         block_target_records: 3,
         max_dynamic_columns: 1,
@@ -1494,8 +1501,8 @@ async fn block_striping_is_row_identical_to_single_partition() {
 
 /// The same differential as [`block_striping_is_row_identical_to_single_partition`]
 /// over objects written with the writer's default row group size, so each
-/// segment's blocks form one multi-block row group that the deal hands whole to
-/// one partition. Rows must be identical to the single-partition run, and the
+/// segment's blocks form one multi-block row group that one partition takes
+/// whole. Rows must be identical to the single-partition run, and the
 /// whole-object `blocks_total` stable; the reopen-cost figures of the one-block
 /// groups case do not carry over, because a partition now owns a segment's
 /// blocks as a unit.
@@ -1521,8 +1528,9 @@ async fn default_row_groups_are_row_identical_to_single_partition() {
 /// every run returns the single-partition run's rows, and return the three.
 async fn striping_runs(cfg: RlogConfig) -> (MultiRun, MultiRun, MultiRun) {
     let declared = declared_columns();
-    // Vary block counts per segment so the stride crosses segment boundaries at
-    // non-trivial offsets (block_target_records = 3, see `small_blocks`).
+    // Vary block counts per segment so partitions taking units in turn cross
+    // segment boundaries at non-trivial offsets (block_target_records = 3, see
+    // `small_blocks`).
     let seg_sizes = [7usize, 4, 11, 5];
     let mut all_records: Vec<Vec<LogRecord>> = Vec::new();
     let mut ts = 0i64;
@@ -1636,9 +1644,9 @@ async fn striping_runs(cfg: RlogConfig) -> (MultiRun, MultiRun, MultiRun) {
 async fn undersubscribed_uses_more_partitions_than_segments() {
     let declared = declared_columns();
     // Two segments, but 18 and 21 records at 3 records/block => 6 and 7 blocks,
-    // 13 surviving blocks total. With target_partitions = 8 the stride is
-    // min(8, 13) = 8, so 8 partitions each own at least one block -- four times
-    // the segment count.
+    // 13 surviving blocks total, one unit each. With target_partitions = 8 and
+    // the partitions polled in turn, each of the 8 takes at least one unit --
+    // four times the segment count.
     let store = MemoryStore::new();
     let cfg = small_blocks();
     let mut segments = Vec::new();

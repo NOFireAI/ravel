@@ -531,21 +531,21 @@ refused open and retries on the row path with the same skip
 
 ## The striped route: directories once per segment, row groups whole
 
-The plan-then-stripe route opens a segment once per partition that owns some of
-its blocks. It runs for every logs statement the whole-segment fast path
+The plan-then-stripe route opens a segment once per unit of work a partition
+takes from it. It runs for every logs statement the whole-segment fast path
 declines, and that fast path refuses on a pending erasure, on any block-level
 predicate, on a segment the window only partly contains, and on fewer relevant
 segments than partitions (`FastPathRejection`). So the plan route, the row-group
-deal and the owned-block ranged plans below apply to every predicated statement,
+units and the unit-scoped ranged plans below apply to every predicated statement,
 and to every partially-windowed one, not only to statements whose partition
 count exceeds the segment count; the whole-segment fast path itself is
 unchanged. ADR-2414 decision A1 makes the directory decode independent of how
-many partitions open the same segment, and deals each row group to one
+many partitions open the same segment, and gives each row group to one
 partition:
 
 - **Directories decode once per (query, segment).** `plan_segment` decodes
   STREAM_DIR, FIELD_DIR, SKIP_IDX and PAGE_DIR for each relevant segment
-  (`SegmentDirectories`) and carries them to every per-partition subset open
+  (`SegmentDirectories`) and carries them to every per-unit subset open
   that follows. On the two footer-carrying branches (the predicate-free fast
   branch and the skip-decidable branch) it also carries the footer; the
   whole-object fallback branch carries no footer and carries the directories its
@@ -576,81 +576,112 @@ partition:
   refusal fails the statement with the same typed error. A relevant segment
   with no surviving block keeps nothing and reserves nothing
   (`carried_directories_reserve_decoded_bytes_for_segments_with_survivors`).
-  The plan phase counts the partitions that own a row group of each segment,
-  and each owner holds a handle it drops when it finishes the segment (its scan
-  is exhausted, its open finds nothing to read, or the stream fails); the
-  directories and their reservation are released when the last owner's handle
-  drops, not when the statement ends. An `attrs_raw` reopen of a segment by an
-  owner still on it uses that owner's handle
+  The plan phase counts the units each segment publishes, and every unit
+  carries a handle its owner drops when it finishes the unit (its scan is
+  exhausted, its open finds nothing to read, or the stream fails); the
+  directories and their reservation are released when the last unit's handle
+  drops, not when the statement ends. An `attrs_raw` reopen of a unit uses
+  that unit's handle
   (`carried_directories_are_released_when_every_owner_finishes_the_segment`).
+  A whole object the plan phase read and kept is carried to every unit of its
+  segment and released the same way, when the last unit's handle drops
+  (`carried_whole_objects_are_released_when_every_owner_finishes_the_segment`).
   The plan phase decodes and reserves every such segment's directories before
   any partition drains one, so the peak reservation still covers every segment
   with a surviving block; release only shortens how long each is held.
-- **An open must reproduce the plan's survivor list.** A partition's share is a
+- **An open must reproduce the plan's survivor list.** A unit's blocks are a
   subset of the survivor list the plan phase produced, and a row-ref position is
   taken from that list. The open prunes again over the same immutable object; if
   its survivor list differs from the plan's, the open fails with a typed
   `Corrupted` error naming a survivor mismatch instead of reading the
   intersection (`an_open_that_prunes_differently_from_the_plan_fails_closed`),
-  and a share naming a block that is not among the survivors fails the same way
+  and a unit naming a block that is not among the survivors fails the same way
   (`a_raw_subset_refuses_on_survivor_mismatch`).
-- **Row groups are dealt whole.** With a read cache wired, `owned_work` deals
-  every surviving row group, where a row group is the PAGE_DIR group
-  (`group_target_blocks` consecutive blocks, the unit the format stores
-  column-major) and a pruned block stays with its group. Behind a confirmed
-  ascending `ORDER BY ts LIMIT k` (`LogsScanExec::active_topk().is_some()`),
-  `global_deal` sorts every segment's groups by `(group_key, segment index,
-  group position)`, where `group_key` is a group's least stored minimum `ts`
-  (`i64::MIN` for a group with no bound), and deals group `i` of that global
-  order to partition `i % n`, so every partition reads its earliest-`ts`
-  groups first and the TopK's threshold skip can cut off the rest. Otherwise
-  `owned_work` numbers groups in segment-then-group order across the whole
-  scan and gives group `i` of that order to partition `i % n`. Either way,
-  every block of a group is on one partition (`owned_work_tests`), so the
-  partition that owns a group decodes each of its dictionary pages once, as
-  the reader's dictionary cache does for any scan over a whole group, where
-  partitions splitting the group would each decode them. Group counts differ
-  by at most one across partitions. When the scan has fewer row groups in
-  total than partitions, some partitions own nothing. Without a read cache the
-  assignment stays one whole segment per partition.
-- **The ranged plan covers the partition's own blocks.** A subset open
-  intersects the ts and numeric candidate blocks with the blocks it owns before
-  the projected page extents and the coverage crossover are computed, so a
-  partition fetches the pages of its own row groups only
+- **Row-group runs are units, taken whole.** With a read cache wired and
+  `n > 1` partitions, `PlanCounts::units` cuts a segment's `G` surviving row
+  groups into runs of `ceil(G / n)` (`run_len`) and makes every run one unit,
+  where a row group is the PAGE_DIR group (`group_target_blocks` consecutive
+  blocks, the unit the format stores column-major) and a pruned block stays
+  with its group. A segment therefore yields at most `min(G, n)` units and is
+  opened at most `min(G, n)` times, not once per row group
+  (`runs_open_each_segment_at_most_min_groups_partitions_times`). Every
+  partition waits for the whole plan pass, then the units are published once
+  into one shared `UnitQueue`, and each partition takes the next unit
+  whenever it finishes its current one, so every surviving row group is read
+  by exactly one partition
+  (`every_surviving_row_group_is_consumed_exactly_once_by_one_partition`).
+  Behind a confirmed ascending `ORDER BY ts LIMIT k`
+  (`LogsScanExec::active_topk().is_some()`) with a read cache, at any
+  partition count including one, the units and their order are the global
+  deal's, unchanged from the per-partition deal: `global_order` sorts every
+  segment's groups by `(group_key, segment index, group position)`, where
+  `group_key` is a group's least stored minimum `ts` (`i64::MIN` for a group
+  with no bound) and an unplanned segment is one unit keyed by its own
+  minimum; `global_runs` deals unit `i` to partition `i % n`, merges a
+  partition's consecutive groups of one segment in ascending position into
+  one run, and publishes each run at the position of its first group. No
+  `ceil(G / n)` cut applies, and a segment is opened once per dealt run
+  (`topk_units_match_main_global_deal_with_dealt_run_merge`). The queue hands
+  units out in that order, so the earliest-`ts` groups are taken first
+  whichever partition asks and the TopK's threshold skip can cut off the rest
+  (`topk_units_are_published_in_global_deal_order`). Otherwise the queue
+  holds segments in visit order, each segment's runs in group order
+  (`striped_units_follow_visit_order_with_groups_in_sequence`).
+  Either way every block of a group is on one partition
+  (`a_row_group_stays_with_one_owner`), so the partition that takes a group
+  decodes each of its dictionary pages once, as the reader's dictionary cache
+  does for any scan over a whole group, where partitions splitting the group
+  would each decode them. How many units a partition takes depends on how
+  soon it finishes the ones it has, not on a fixed share, and a partition that
+  finds the queue empty runs an empty stream. Without a read cache, or with
+  one partition and no TopK (`LogsScanExec::striped`), each segment is one
+  unit; with one partition under the TopK the global deal above applies
+  (`topk_with_one_partition_follows_the_global_deal`), which publishes a
+  segment whose groups no other segment's interleave as one unit
+  (`topk_one_partition_time_disjoint_segments_open_once`).
+- **The ranged plan covers the unit's own blocks.** A subset open
+  intersects the ts and numeric candidate blocks with the blocks its unit
+  holds before the projected page extents and the coverage crossover are
+  computed, so a partition fetches the pages of the row groups it took only
   (`owned_block_plan_tests`). The coverage crossover therefore weighs the
-  partition's own footprint. A partition that owns every row group holding a
-  surviving block of an object keeps the whole-object crossover, also when a
-  row group whose blocks were all pruned belongs to nobody
-  (`a_wholly_pruned_row_group_leaves_a_sole_reader_a_full_share`). A partition sharing the object
+  unit's own footprint. A unit holding every row group with a surviving block
+  of an object, as a one-partition scan's segment unit does, keeps the
+  whole-object crossover, also when a row group whose blocks were all pruned
+  belongs to nobody
+  (`a_wholly_pruned_row_group_leaves_a_sole_reader_a_full_share`,
+  `a_partial_share_crossover_moves_its_own_span`). A unit sharing the object
   never reads it whole: it weighs its runs against its own span, from its first
   wanted page to its last, and on crossing joins every gap between its runs
-  that holds no fence (below) into one range, so a share whose span holds no
-  other partition's page reads exactly that span in one GET
+  that holds no fence (below) into one range, so a unit whose span holds no
+  other unit's page reads exactly that span in one GET
   (`a_partial_share_crossover_reads_its_own_span_not_the_object`,
   `a_partial_share_crossover_collapses_its_runs_into_one_range`,
   `a_partial_share_crossover_moves_its_own_span`).
-- **A partition's runs never cross another partition's row group.** The pages
-  that row groups held by other partitions have in the projected columns are
+- **A unit's runs never cross another unit's row group.** The pages that row
+  groups held by other units have in the projected columns are
   fences: neither the coalescing of holes under the coalesce gap nor the bridging
   that holds an L0 object to `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` runs, nor a
   partial share's coverage crossover, joins two runs across one
-  (`a_partial_share_crossover_does_not_read_through_a_fence`). Partitions
+  (`a_partial_share_crossover_does_not_read_through_a_fence`). Units
   therefore fetch disjoint spans of an object, and
   the block bytes they move for one object sum to at most the object's BLOCKS
   section (`partitions_dealt_interleaved_groups_fetch_disjoint_spans`,
-  `interleaved_groups_move_each_groups_span_once`; the fence rule itself is
-  `a_fence_stops_coalescing_and_bridging`). Holes inside a partition's own
+  `two_partitions_move_each_runs_span_once`; the fence rule itself is
+  `a_fence_stops_coalescing_and_bridging`). Holes inside a unit's own
   groups are still bridged.
-  What this costs in requests: a partition issues one GET per run of its own
+  What this costs in requests: a unit's open issues one GET per run of its
   groups' projected chunks. With the default coalesce gap and projected chunks
-  within the gap of each other that is one GET per owned group, so a partition
-  owning `g` groups issues `g` of them. An L0 object's runs are capped at
-  `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` per partition, and a partition issues more
-  than that only when a fence forbids a bridge the cap would otherwise have made;
-  an L1 segment's runs are not capped. Partitions no longer issue identical range
-  sets for the read cache to merge, so an object's chunk requests are the sum
-  over its partitions of their own runs, and the section reads the plan did not
-  carry (the BLOOM section, in the fixtures above) come on top.
+  within the gap of each other that is at most one GET per group, so a
+  partition taking units that hold `g` row groups between them issues at most
+  `g` of them, fewer where consecutive groups of one unit coalesce. An L0
+  object's runs are
+  capped at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` per open, and an open issues
+  more than that only when a fence forbids a bridge the cap would otherwise
+  have made; an L1 segment's runs are not capped. Units do not issue
+  identical range sets for the read cache to merge, so an object's chunk
+  requests are the sum over its units of their own runs, and the section reads
+  the plan did not carry (the BLOOM section, in the fixtures above) come on
+  top.
 - A row-ref names a block by its position in the segment's surviving-block
   list, not by its whole-object index; the scan resolves the position through
   that list, so late materialization reopens the block the scan decoded. The
@@ -732,8 +763,8 @@ read rather than saving one when the scan's carry does not hold it. The scan
 decides once, over its whole segment list, before any partition starts: when it
 holds at least as many such segments relevant to the query window as it has
 target partitions, none of them is planned. The plan pass issues no read for
-them and they are not counted in `plan_full_reads`, `owned_work` gives each one
-whole to one partition, and that partition opens it with one whole-object GET
+them and they are not counted in `plan_full_reads`, `PlanCounts::units`
+publishes each as one unit, the one partition that takes it opens it with one whole-object GET
 and prunes blocks from the directory it already holds
 (`RlogReader::scan_pruned`), taking the survivor list for row refs from that
 open. `LogsScanExec` publishes `segments_unplanned` with the count. The TopK
@@ -792,11 +823,10 @@ ADR-2066 decision 1) on an L0 object and unbounded on an L1 segment, plus
 front-section ranges (STREAM_DIR and FIELD_DIR together, in one GET, when the
 query carries numeric arms or projects fewer than every column) only when the
 probe's cached suffix does not already cover them.**
-That law is per open. On the striped route an object's row groups are dealt to
-several partitions, each open bounds only its own chunk runs, and a run never
-bridges another partition's row group even where the cap would have bridged
-it, so a partition's runs can exceed the cap and an object's request count is
-the sum over the partitions that open it (see
+That law is per open. On the striped route an object's row groups are
+separate units, each open bounds only its own unit's chunk runs, and a run
+never bridges another unit's row group even where the cap would have bridged
+it, so an object's request count is the sum over the units that open it (see
 [the striped route](#the-striped-route-directories-once-per-segment-row-groups-whole)).
 For a typical narrow projection over a small L0 object that is one to seven
 GETs: the probe, a SKIP_IDX/PAGE_DIR chase when the probe falls short, the
@@ -4401,10 +4431,16 @@ partition count, not of table size.
 
 #### How many partitions, and the read-cache precondition (ADR-0102)
 
-What a partition owns is *blocks*, not whole segments: every
-`(segment, surviving-block)` pair is flattened into one list and unit `i` goes to
-partition `i % n`. So a query touching fewer segments than `target_partitions`
-can still fan out past the segment count.
+What a partition owns is *units of work*, not a fixed share of segments: once
+the plan pass has finished, every segment's surviving row groups are published
+as runs into one shared queue (whole segments where the bullets below say so),
+and each partition takes the next
+unit whenever it finishes its current one (take-next ownership, ADR-0102
+decision 1 as amended). So a query touching fewer segments than
+`target_partitions` can still fan out past the segment count. The declared
+partition count is set at construction and does not depend on how many units
+the plan publishes; a partition that finds the queue empty runs an empty
+stream.
 
 That fan-out is gated on the logs fetcher carrying ADR-0046's read cache, which
 is the precondition ADR-0102 decision 1 names for it:
@@ -4412,27 +4448,31 @@ is the precondition ADR-0102 decision 1 names for it:
 - **Cache wired** (`ravel-server` built a read cache and called
   `LogSegmentFetcher::with_cache`, i.e. `--disable-cache` is off): the scan
   declares `target_partitions` partitions, even where the snapshot has fewer
-  segments than that.
+  segments than that. Under a confirmed ascending `ts` TopK the units are
+  the global deal's runs at any partition count (see "Row-group runs are
+  units, taken whole"). Otherwise, with `n > 1` partitions, each run of
+  `ceil(G / n)` of a segment's `G` surviving row groups is a unit, so the
+  segment is opened at most `min(G, n)` times; with one partition each
+  segment is one unit.
 - **No cache** (`--disable-cache`, or any embedding that never calls
   `with_cache`): the scan declares `min(target_partitions, segment_count)`, the
-  pre-ADR-0102 bound.
+  pre-ADR-0102 bound, and each segment is one unit.
 
-The reason is the fetch unit. Each partition that owns blocks in a segment opens
-that segment itself, so each issues its own read sequence at that key. Which
+The reason is the fetch unit. The partition that takes a unit opens that unit's
+segment itself, so each unit issues its own read sequence at that key. Which
 sequence depends on the object's size (ADR-0107,
 `--logs-block-range-threshold`, 512 KiB by default): at or below the threshold
 one whole-object GET; above it a suffix probe, one GET per directory section,
 and coalesced GETs covering only the candidate blocks skip-index pruning kept.
 With the cache, every GET of either shape is keyed by the extent it fetched and
 coalesces through single-flight (the whole object below the threshold, and the
-probe, each section, and each block above it), so `n` partitions striping one
-segment cost one request per distinct extent rather than `n` sequences. Without
+probe, each section, and each block above it), so the units of one segment
+cost one request per distinct extent rather than one sequence each. Without
 a cache each is a real object-store GET, and partitions beyond the segment count
 would multiply GETs with nothing absorbing them. Note what the cap does and does
-not buy: it stops `target_partitions` from setting the multiplier, but below the
-cap a plan with `n` partitions still opens each sufficiently-blocky segment `n`
-times, and the planning prune that counts surviving blocks adds one more read
-per segment. `ravel-bench`'s `logs_scan_scaling` report measures the cached and
+not buy: it stops `target_partitions` from setting the multiplier, and without
+a cache each segment is one unit opened once, but the planning prune that
+counts surviving blocks adds one more read per segment above the plan bound. `ravel-bench`'s `logs_scan_scaling` report measures the cached and
 un-cached request counts side by side, on above-threshold and whole-object read
 shapes alike; its figures describe that fixture (a `MemoryStore`, and on the
 cached rows a cache sized to hold the whole dataset), not striping in general.
@@ -4689,14 +4729,16 @@ of the TopK's, nothing is confirmed and nothing is skipped. A confirmed scan
 shows `topk_threshold=ts` in a `ravel-cli sql explain` plan. The scan only
 reads `t` off the confirmed filter's current expression and uses it twice:
 
-- Without a read cache wired, segments are dealt to partitions in ascending
-  `min_event_ts_ns` (ties by snapshot index) instead of snapshot order, and a
-  partition does not open an owned segment whose `min_event_ts_ns` is
+- Without a read cache wired, segments are visited in
+  ascending `min_event_ts_ns` (ties by snapshot index) instead of snapshot order (dealt
+  to partitions on the whole-segment fast path, queued as units otherwise),
+  and a partition does not open a segment it owns whose `min_event_ts_ns` is
   strictly above `t`. A row ref's segment ordinal is still the snapshot
-  index. With a read cache wired, dealing moves to row-group granularity
-  instead: `global_deal` orders every segment's groups by `(group_key,
-  segment index, group position)` and deals that global order round-robin,
-  as described under "Row groups are dealt whole" above.
+  index. With a read cache wired, at any partition count, the order moves
+  to row-group granularity instead: `global_order` orders every segment's
+  groups by `(group_key, segment index, group position)` and the unit queue
+  hands the global deal's runs out in that order, as described under
+  "Row-group runs are units, taken whole" above.
 - Before decoding each block, the scan skips every block at the cursor
   whose skip-index minimum `ts` is strictly above `t`. No column of a
   skipped block is fetched for decode or decoded. Each candidate is
@@ -4710,7 +4752,7 @@ key (`ORDER BY ts, x`). Before the heap is full the filter is `true`, which
 bounds nothing, so nothing is skipped. Bounds that are inverted (`min >
 max`) prove nothing and are never skipped on; an empty block reads both
 bounds as 0 and has no rows to lose. A row that arrives late lowers its
-segment's `min_event_ts_ns`, so the min-ts dealing order visits that
+segment's `min_event_ts_ns`, so the min-ts visit order reaches that
 segment early, not last. Each partition reads the shared threshold on its
 own, before each segment open and each block decode. The whole-segment
 fast path's open pipelining (ADR-2414 decision A2) is off under a confirmed
