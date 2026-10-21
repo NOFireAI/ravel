@@ -750,9 +750,10 @@ mixes them with larger segments whose plan also reads whole shares that budget. 
 taken over the whole scan, not one partition's share, so every partition
 routes a segment the same way and none is read twice
 (`sub_break_even_segments_are_read_once`). For a query with exact-key
-equalities (the KEY_IDX probe below) such a segment is one also at or under
-the block-range threshold (`may_skip_plan`): every larger segment is planned,
-however many sub-bound segments the scan holds, so its KEY_IDX is probed.
+equalities (the KEY_IDX probe below) such a segment above the block-range
+threshold is not planned either: the plan pass probes its KEY_IDX
+(`probe_segment_keyed`), drops it when a key is absent, and otherwise leaves
+it to the one whole-object read.
 `plan_segment` itself still
 reads an object under the bound whole for a direct caller
 (`the_planned_route_reads_an_object_under_the_break_even_whole`). Above the
