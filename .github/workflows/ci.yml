@@ -866,6 +866,12 @@ jobs:
       # Nor does it imply `esql`, which compiles POST /api/v1/esql and its tests.
       - name: Clippy (esql feature)
         run: cargo clippy --locked -p ravel-server --features esql --all-targets -- -D warnings
+      # The workspace step above lints ravel-ingest with `flush-input-bytes`
+      # on, because ravel-bench enables it on its dev-dependency and the
+      # workspace selection unifies it. Selected alone, ravel-ingest builds
+      # without it, which is the configuration that ships.
+      - name: Clippy (ravel-ingest, shipping features)
+        run: cargo clippy --locked -p ravel-ingest --all-targets -- -D warnings
 
   # The workspace test run, split across four runners (issue #2518). The test
   # phase is CPU-bound: 9,483 tests summed to 2,374 CPU-seconds and took 641 s
@@ -1080,6 +1086,11 @@ jobs:
   # Gated on sql_area like `sql`, and required like `sql`. When renaming this
   # job, update main's required status checks in the same change, or the
   # tests silently stop blocking again.
+  #
+  # Its `-p ravel-server --features flight-sql` run is also the only test run
+  # of ravel-server with `esql` off, since the `sql` job runs `--features
+  # esql` (#3131). Narrowing that selection, or adding `esql` to it, removes
+  # the only coverage of the `not(feature = "esql")` code.
   flight-sql:
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.sql_area == 'true'
