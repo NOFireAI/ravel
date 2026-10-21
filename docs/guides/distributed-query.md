@@ -419,11 +419,58 @@ A stuck future-dated record drops out like a stale past-dated one.
 
 Worker identity comes from the key, not from the record body. A record whose
 body disagrees with its key is skipped and is not admitted under the identity
-of another worker. That check does not keep a new identity out. The shipped
-query role (`deploy/iam/query.json`) can `PutObject` anywhere under
-`sys/query/workers/`, and records carry no MAC. Any principal that holds that
-role can therefore write a self-consistent record at a fresh UUID key and join
-the live set.
+of another worker.
+
+Every record also carries a `mac`: a keyed BLAKE3 hash, under a key derived
+from the `--fragment-key-file` keys, over the process id, the endpoint, the
+protocol version and the liveness stamp. A node writes its own record under the
+first key in its file and admits a sibling whose MAC verifies under any key in
+its file. Two nodes therefore see each other only while each node's first key
+appears in the other's file; sharing some other key is not enough. The fleet
+stays joined while every node's first key appears in every other node's file.
+Rotate a key in three rolls:
+
+1. Append the new key to the end of every node's file, and roll every node.
+   Each node still mints under the old first key, which every file holds.
+2. Move the new key to the first line of every file, and roll every node.
+   A rolled node mints under the new key, which every file holds since
+   step 1, and still verifies the old key from nodes not yet rolled.
+3. Only after step 2 has finished on every node, remove the old key from
+   every file, and roll every node. A node still minting under the old key
+   at this point would drop out of the live set of every node that has
+   removed it.
+
+A record is read with a bounded range read of 4096 + 1 bytes, and a sibling
+that fails any check is skipped, never fatal to the read:
+
+- The shipped query role (`deploy/iam/query.json`) can `PutObject` anywhere
+  under `sys/query/workers/`. A writer with that grant but without the key
+  file cannot add a member at a fresh UUID key or change the endpoint of an
+  existing member: the record does not verify.
+- The MAC does not stop eviction. The same writer can overwrite a member's
+  record with garbage, or with an older record that member signed, and the
+  member drops out until its next beat stamps the key again. A holder of the
+  key file can mint any record.
+
+A rejected record counts once per read in
+`ravel_query_worker_record_rejects_total{mode,reason}`, under the first check
+it fails: `oversize` (more than 4096 bytes, not decoded), `malformed` (empty,
+not a record, or a body that names another key), `missing_mac` (no MAC),
+`bad_mac` (a MAC that does not parse or verifies under no key) or
+`stale_stamp` (the MAC verifies and the object's modification time is inside
+the liveness window, but the stamp is outside it: a replayed older heartbeat,
+or a clock skewed past the window). Three skips are not counted. A key that
+is not a UUID is not a record. A key whose LIST modification time is already
+outside the liveness window is skipped before the GET; a dead node's last
+record normally leaves the live set this way, since one write set both its
+stamp and its modification time, although a node clock running behind the
+store's clock can make a read count it as `stale_stamp` first. A record that
+verifies and carries the drained stamp is a graceful shutdown; a replay of a
+node's own drained record looks the same and is not counted either. A rising `bad_mac` during a key rotation means some node mints under a
+key that the reading node does not hold.
+A node from a release before record MACs writes none, so during a rolling
+upgrade an upgraded node skips it as `missing_mac` until it is upgraded too,
+while the older node still admits upgraded siblings.
 
 A key whose modification time is already older than the liveness window is not
 fetched at all, because its stamp can only be older still. The read cost of a
@@ -861,11 +908,13 @@ label.
 `GET /metrics` renders the `ravel_distrib_*` family on any process with
 distribution enabled. The family is absent when distribution is off. Its
 series carry the closed `mode` label alone, with no per-shard, per-worker, or
-per-tenant label. There are two exceptions:
+per-tenant label. There are three exceptions:
 
 - The fragment in-flight gauge and the admission-wait counter also carry a
   `class` label (`pinned`|`resolve`).
 - The fragment capability reject counter also carries a `reason` label.
+- `ravel_query_worker_record_rejects_total` renders with the family, beside
+  the fragment capability reject counter, and also carries a `reason` label.
 
 `ravel_sql_slice_rejects_total` and `ravel_sql_slice_tls_dials_total` are
 listed here because they count the slice fetches of the SQL lane, but they are
@@ -878,6 +927,7 @@ beside `mode`.
 | `ravel_distrib_fragment_requests_total` | counter | Inbound slice fetches this process served for other coordinators. |
 | `ravel_distrib_fragment_auth_failures_total` | counter | Inbound `Resolve`-scope federation requests whose presented credential did not resolve to a tenant. It does not count `Pinned` capability rejections: those are `ravel_distrib_fragment_capability_rejects_total`, and reach the coordinator as re-dispatch and fallback. |
 | `ravel_distrib_fragment_capability_rejects_total{reason}` | counter | Inbound `Pinned` fragment requests this worker refused at fragment capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `tenant_mismatch`, `query_mismatch`. What each reason counts is defined in [the observability guide](observability.md#distributed-read-fan-out-ravel_distrib_). A rising `bad_mac` during a key rotation means some coordinator is minting under a key this worker does not hold. A `Pinned` fetch refused on the public listener is refused before verification and counted under no reason. |
+| `ravel_query_worker_record_rejects_total{reason}` | counter | Sibling `sys/query/workers/` records this node's live-set reads rejected, one series per reason, each rendered from zero: `missing_mac`, `bad_mac`, `oversize`, `malformed`, `stale_stamp`. On a store that reports modification times, a forged record is counted on each read until its object ages past the liveness window, about three reads per node at the default `3 * H`, and is then skipped before the GET; a writer that keeps rewriting it keeps it counted. A key whose modification time is outside the liveness window and a verified drained record are skipped uncounted; a fetched, verified record with any other stamp outside the window is `stale_stamp`. See [the live set](#the-live-set). |
 | `ravel_sql_slice_tls_dials_total` | counter | Outbound SQL slice `DoGet` fetches this coordinator dialed over TLS to the dedicated fragment listener of a worker, one per slice fetch sent, a re-dispatch included. Defined in [the observability guide](observability.md#sql-slice-tls-dials-ravel_sql_slice_tls_dials_total). Absent on a process that serves no Flight SQL. |
 | `ravel_sql_slice_rejects_total{reason}` | counter | Inbound SQL slice `DoGet` requests refused at slice capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `wrong_surface`. What each reason counts, and which refusals are counted under none, is defined in [the observability guide](observability.md#sql-slice-capability-rejects-ravel_sql_slice_rejects_total). Absent on a process that serves no Flight SQL. |
 | `ravel_distrib_fragment_inflight{class}` | gauge | Fragments in flight now, split by admission class. `class="pinned"` riding at `--max-inflight-fragments` or `class="resolve"` riding at `--max-inflight-federated-resolves` means that class's inbound slices are queueing; the two never contend for the same permits. |

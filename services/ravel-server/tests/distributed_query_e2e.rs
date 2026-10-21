@@ -3197,8 +3197,8 @@ mod sql_slices {
         );
 
         // The heartbeat record names the dedicated listener and nothing else:
-        // its fields are exactly these four, and the public gRPC address
-        // appears in no record.
+        // its fields are exactly these four plus the record MAC (ADR-1918),
+        // and the public gRPC address appears in no record.
         let records = heartbeat_objects(&shared).await;
         assert_eq!(records.len(), 2, "one record per process: {records:?}");
         for record in &records {
@@ -3214,7 +3214,8 @@ mod sql_slices {
                     "process_id",
                     "fragment_endpoint",
                     "protocol_version",
-                    "started_unix_ns"
+                    "started_unix_ns",
+                    "mac"
                 ]),
                 "{record}"
             );

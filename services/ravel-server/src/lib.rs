@@ -3023,6 +3023,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // heartbeat fills `distrib_live_workers`, the router sees an empty live set
     // and runs every slice locally, which is always correct.
     let distrib_metrics: Option<Arc<distrib::FragmentMetrics>>;
+    let query_worker_record_keys: Option<ravel_fleet::query_workers::RecordKeys>;
     let fragment_service: Option<distrib::FragmentService>;
     let distributed: Option<Arc<ravel_query::distrib::Distributed>>;
     let distrib_self_id: Arc<std::sync::OnceLock<uuid::Uuid>> =
@@ -3043,6 +3044,12 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         // Shared by the worker (verifies against every key) and the coordinator
         // (mints under the first): ADR-0071 amendment, decision 2.
         let fragment_keys = Arc::new(settings.fragment_keys.clone());
+        // The same key file signs and verifies `sys/query/workers/` records,
+        // under a derived key (ADR-1918 decision 2).
+        query_worker_record_keys = Some(
+            ravel_fleet::query_workers::RecordKeys::from_file_keys(&settings.fragment_keys)
+                .map_err(|e| anyhow::anyhow!("query-worker record keys: {e}"))?,
+        );
         // `with_engine_config` before any clone is taken, so every mounted
         // listener AND the coordinator's no-hop local path below run slices
         // under this process's own limits (issue #1687 part A).
@@ -3081,6 +3088,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         distrib_metrics = Some(metrics);
     } else {
         distrib_metrics = None;
+        query_worker_record_keys = None;
         fragment_service = None;
         distributed = None;
     }
@@ -4268,51 +4276,59 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // returning; a draining process
     // must stop advertising itself to sibling coordinators, not linger in their
     // live set until its stamp ages past the staleness window.
-    let query_worker_heartbeat: Option<QueryWorkerHeartbeat> =
-        match (distributed.as_ref(), fragment_addr) {
-            (Some(_), Some(fragment_bound)) => {
-                // One endpoint, the dedicated TLS fragment listener, which both
-                // distributed lanes dial (ADR-0071 amendment decision 1,
-                // ADR-1689 decision 1): the PromQL lane's `SeriesFetch` and the
-                // SQL lane's slice `DoGet`.
-                //
-                // It is the address the listener actually bound, unless
-                // `--advertise-fragment-endpoint` supplies the host peers reach
-                // this process at (issue #1724). Startup already refused a
-                // wildcard bind without that flag, so an unadvertised endpoint
-                // here is one a sibling can dial. A host-only value keeps the
-                // bound port, which is what makes a `:0` test bind work.
-                let advertise = config
-                    .distrib
-                    .as_ref()
-                    .and_then(|s| s.advertise_endpoint.as_ref());
-                let fragment_endpoint = match advertise {
-                    Some(advertise) => advertise.fragment_endpoint(fragment_bound),
-                    None => fragment_bound.to_string(),
-                };
-                let workers = Arc::new(ravel_fleet::query_workers::QueryWorkers::with_defaults(
+    let query_worker_heartbeat: Option<QueryWorkerHeartbeat> = match (
+        distributed.as_ref(),
+        fragment_addr,
+        query_worker_record_keys,
+        distrib_metrics.as_ref(),
+    ) {
+        (Some(_), Some(fragment_bound), Some(record_keys), Some(metrics)) => {
+            // One endpoint, the dedicated TLS fragment listener, which both
+            // distributed lanes dial (ADR-0071 amendment decision 1,
+            // ADR-1689 decision 1): the PromQL lane's `SeriesFetch` and the
+            // SQL lane's slice `DoGet`.
+            //
+            // It is the address the listener actually bound, unless
+            // `--advertise-fragment-endpoint` supplies the host peers reach
+            // this process at (issue #1724). Startup already refused a
+            // wildcard bind without that flag, so an unadvertised endpoint
+            // here is one a sibling can dial. A host-only value keeps the
+            // bound port, which is what makes a `:0` test bind work.
+            let advertise = config
+                .distrib
+                .as_ref()
+                .and_then(|s| s.advertise_endpoint.as_ref());
+            let fragment_endpoint = match advertise {
+                Some(advertise) => advertise.fragment_endpoint(fragment_bound),
+                None => fragment_bound.to_string(),
+            };
+            let workers = Arc::new(
+                ravel_fleet::query_workers::QueryWorkers::with_defaults(
                     fragment_endpoint,
                     ravel_query::distrib::codec::PROTOCOL_VERSION,
-                ));
-                // Ignore a set() race: `start` sets this exactly once, so the
-                // first (only) write wins and any later call is a no-op.
-                let _ = distrib_self_id.set(workers.process_id());
-                let (hb_shutdown, hb_rx) = oneshot::channel::<()>();
-                let handle = distrib::spawn_heartbeat(
-                    workers,
-                    store.clone(),
-                    Arc::new(SystemClock),
-                    distrib_live_workers.clone(),
-                    hb_rx,
+                    record_keys,
                 )
-                .map_err(|e| anyhow::anyhow!("query-worker heartbeat refused to start: {e}"))?;
-                Some(QueryWorkerHeartbeat {
-                    shutdown: hb_shutdown,
-                    handle,
-                })
-            }
-            _ => None,
-        };
+                .with_record_rejects(metrics.query_worker_record_rejects().clone()),
+            );
+            // Ignore a set() race: `start` sets this exactly once, so the
+            // first (only) write wins and any later call is a no-op.
+            let _ = distrib_self_id.set(workers.process_id());
+            let (hb_shutdown, hb_rx) = oneshot::channel::<()>();
+            let handle = distrib::spawn_heartbeat(
+                workers,
+                store.clone(),
+                Arc::new(SystemClock),
+                distrib_live_workers.clone(),
+                hb_rx,
+            )
+            .map_err(|e| anyhow::anyhow!("query-worker heartbeat refused to start: {e}"))?;
+            Some(QueryWorkerHeartbeat {
+                shutdown: hb_shutdown,
+                handle,
+            })
+        }
+        _ => None,
+    };
 
     // The dedicated mTLS listener (ADR-0050 section 1): bound only when
     // `--mtls-listener` was configured, serving `mtls_router` built up above.
