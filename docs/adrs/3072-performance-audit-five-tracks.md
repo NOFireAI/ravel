@@ -369,7 +369,8 @@ field, which is a frozen-contract change under the format-change procedure
 and is filed as its own ticket, not folded in here. Intent is admission
 policy only: it never skips a fresh read and never changes what a hit
 returns. The executor's `BulkScan` trigger above is narrowed by the bulk
-trigger amendment (issue #3084) at the end of this ADR.
+trigger amendment (issue #3084) at the end of this ADR, and given a second,
+opt-in arm for filtered `logs` scans by the size trigger amendment after it.
 
 3b. Policy. `Interactive` reads are admitted and promoted exactly as today.
 `BulkScan` reads do not raise `freq` on a hit and are admitted into a
@@ -674,3 +675,43 @@ prefetch at 61.4 % (segment decode, `decode_gorilla_into` alone 38.6 %) and
 evaluate at 38.0 %: the remaining distance to the 1 h target is in prefetch,
 which this decision does not change. The other acceptance rows of
 decision 1 stand.
+
+## Amendment (issue #3084, 2026-10-21): an opt-in size trigger for filtered logs scans
+
+<!-- amendment-applies: sections="3. The cache admits by access intent; memory refusals name their cause" pointer="size trigger amendment" -->
+
+The bulk trigger as amended on 2026-10-20 classifies none of the 43
+ClickBench statements as `BulkScan`, and it classifies the Stage 0 P5
+filtered shape as `Interactive`. The kit's window does not start at the
+Unix epoch, and 36 of the 43 statements carry a `WHERE` or a `LIMIT`, so no
+statement in either workload meets the predicate-free, epoch-to-now
+conjunction. A filtered scan that reads most of a tenant's bytes therefore
+admits them all as interactive reads and cycles the interactive working
+set.
+
+An opt-in flag, `--cache-bulk-scan-min-bytes <BYTES>`, adds a second arm
+that is independent of the first. With it set, a statement the
+predicate-free rule leaves `Interactive` reads as `BulkScan` when all of
+these hold: it is a `logs` statement sent as SQL text; it names one `logs`
+table and no Parquet table; the object sizes of its resolved segments sum
+to at least `BYTES`, counted after resolve and before any segment read; and
+the plan the KEY_IDX probe takes its filters from (the optimized plan,
+subqueries, CTEs and join conditions included) has no equality on a field
+the tenant indexes in KEY_IDX. A one-element `IN` counts as an equality,
+and so does a column renamed through a CTE or a subquery. When the
+executor cannot tell whether a statement is a key lookup, it reads it as
+one. A `samples` statement and a statement with no SQL text (a lowered
+ES|QL query) never read as `BulkScan` through this arm, whether or not the
+tenant indexes any key.
+
+Unset, which is the default, the 2026-10-20 rule stands alone and nothing
+in this amendment applies. The flag's default is decided by a later
+measurement, a mixed interactive and scan workload and a ClickBench A/B with
+the flag set, and is recorded as a further amendment. The band rows of
+decision 3 are measured with the flag unset.
+
+With the flag set, runs 2 to 4 of a generated 25-object logs corpus of
+2,089,843 bytes, read through a 1,044,921-byte cache, served 48.2 % of read
+bytes from cache at a threshold of 522,460 bytes and 47.9 % at a threshold
+of 1,044,921 bytes, against 4 % to 16 % with the flag unset (measured
+2026-10-21).
