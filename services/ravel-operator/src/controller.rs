@@ -1341,7 +1341,13 @@ async fn hold_for_qualification(
     extra_conditions: &mut Vec<Condition>,
     job_action: impl Future<Output = Result<(), Error>>,
 ) -> Result<(), Error> {
-    let store_qualified = condition("StoreQualified", false, generation, reason, message);
+    let store_qualified = condition(
+        CONDITION_TYPE_STORE_QUALIFIED,
+        false,
+        generation,
+        reason,
+        message,
+    );
     *store_qualified_condition = Some(store_qualified.clone());
     extra_conditions.push(store_qualified);
     job_action.await
@@ -1629,7 +1635,7 @@ async fn reconcile_inner(
     let store_qualified_hash = match &decision {
         QualificationDecision::Proceed => {
             let store_qualified = condition(
-                "StoreQualified",
+                CONDITION_TYPE_STORE_QUALIFIED,
                 true,
                 obj.metadata.generation,
                 STORE_QUALIFIED_SUCCEEDED_REASON,
@@ -2214,7 +2220,7 @@ async fn reconcile_inner(
     let stalled = wait_status.as_ref().is_some_and(|w| w.stalled);
     let degraded_condition = match (&degraded, &wait_status) {
         (Some((reason, message)), _) if !stalled => Some(condition(
-            "Degraded",
+            CONDITION_TYPE_DEGRADED,
             true,
             obj.metadata.generation,
             reason,
@@ -2476,6 +2482,48 @@ fn child(instance: &str, component: &str) -> String {
     format!("{instance}-{component}")
 }
 
+/// `status.conditions[].type` value for the replica-availability gate: `True`
+/// once the gateway and query tiers report ready replicas.
+pub(crate) const CONDITION_TYPE_AVAILABLE: &str = "Available";
+
+/// `status.conditions[].type` value for a reconcile-pass failure or an
+/// unresolved `sys/gc` bootstrap stall.
+pub(crate) const CONDITION_TYPE_DEGRADED: &str = "Degraded";
+
+/// `status.conditions[].type` value for the object-store qualification gate
+/// (issue #36).
+pub(crate) const CONDITION_TYPE_STORE_QUALIFIED: &str = "StoreQualified";
+
+/// `status.conditions[].type` value for a cluster still using the retired
+/// ingress-nginx ingest-affinity backend.
+pub(crate) const CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED: &str =
+    "IngestAffinityBackendDeprecated";
+
+/// `status.conditions[].type` value for a cluster whose probes resolve to the
+/// main HTTP port instead of the dedicated health listener (issue #3112).
+pub(crate) const CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT: &str = "HealthProbeOnMainHttpPort";
+
+/// `status.conditions[].type` value for an apiserver below
+/// [`MIN_KUBERNETES_MINOR_VERSION`] (issue #1714).
+pub(crate) const CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED: &str =
+    "KubernetesVersionUnsupported";
+
+/// Every `status.conditions[].type` value the operator emits, in the order
+/// the crd.rs `status.conditions` description names them (issue #3140). It
+/// exists only under test: the doc-staleness and reachability tests read it,
+/// and `condition()` asserts every type it builds is listed, so a test that
+/// drives a builder emitting a new type fails until the type is added here,
+/// and the staleness test then demands it of the crd.rs prose.
+#[cfg(test)]
+pub(crate) const CONDITION_TYPES: &[&str] = &[
+    CONDITION_TYPE_AVAILABLE,
+    CONDITION_TYPE_DEGRADED,
+    CONDITION_TYPE_STORE_QUALIFIED,
+    CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED,
+    CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED,
+    CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT,
+];
+
 /// Build a status Condition, stamping the current time as its transition time.
 ///
 /// `last_transition_time` is a display-only Kubernetes status field, not
@@ -2490,6 +2538,14 @@ fn condition(
     reason: &str,
     message: &str,
 ) -> Condition {
+    // Every test that drives a status builder then fails on a type missing
+    // from the list the CRD description test checks against.
+    #[cfg(test)]
+    assert!(
+        CONDITION_TYPES.contains(&r#type),
+        "condition type {:?} is not in CONDITION_TYPES",
+        r#type
+    );
     Condition {
         r#type: r#type.to_string(),
         status: if status { "True" } else { "False" }.to_string(),
@@ -2552,7 +2608,7 @@ fn spec_conditions(spec: &RavelClusterSpec, observed_generation: Option<i64>) ->
         .is_some_and(|a| a.enabled && matches!(a.backend, AffinityBackend::IngressNginx));
     if legacy_backend {
         conditions.push(condition(
-            "IngestAffinityBackendDeprecated",
+            CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED,
             true,
             observed_generation,
             "IngressNginxRetired",
@@ -2592,7 +2648,7 @@ fn health_probe_on_main_http_port_condition(
         return None;
     }
     Some(condition(
-        "HealthProbeOnMainHttpPort",
+        CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT,
         true,
         observed_generation,
         "DedicatedHealthPortDisabled",
@@ -2663,7 +2719,7 @@ fn kubernetes_version_condition(
         info.git_version.as_str()
     };
     Some(condition(
-        "KubernetesVersionUnsupported",
+        CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED,
         true,
         observed_generation,
         "BelowMinimumKubernetesVersion",
@@ -2746,17 +2802,23 @@ fn build_status(
     let available = gateway_ready.unwrap_or(0) > 0 && query_ready.unwrap_or(0) > 0;
     let available_condition = if available {
         condition(
-            "Available",
+            CONDITION_TYPE_AVAILABLE,
             true,
             observed_generation,
             "MinimumReplicasAvailable",
             "gateway and query tiers report ready replicas",
         )
     } else if let Some((reason, message)) = unavailable_reason {
-        condition("Available", false, observed_generation, reason, message)
+        condition(
+            CONDITION_TYPE_AVAILABLE,
+            false,
+            observed_generation,
+            reason,
+            message,
+        )
     } else {
         condition(
-            "Available",
+            CONDITION_TYPE_AVAILABLE,
             false,
             observed_generation,
             "MinimumReplicasUnavailable",
@@ -2793,8 +2855,20 @@ fn build_degraded_status(
     extra_conditions: Vec<Condition>,
 ) -> RavelClusterStatus {
     let mut conditions = vec![
-        condition("Degraded", true, observed_generation, reason, message),
-        condition("Available", false, observed_generation, reason, message),
+        condition(
+            CONDITION_TYPE_DEGRADED,
+            true,
+            observed_generation,
+            reason,
+            message,
+        ),
+        condition(
+            CONDITION_TYPE_AVAILABLE,
+            false,
+            observed_generation,
+            reason,
+            message,
+        ),
     ];
     conditions.extend(extra_conditions);
     RavelClusterStatus {
@@ -3143,7 +3217,7 @@ fn gc_bootstrap_wait_status(
     let available_message = gc_bootstrap_waiting_message(maintain_ready, maintain_unavailable);
     let degraded = if stalled {
         condition(
-            "Degraded",
+            CONDITION_TYPE_DEGRADED,
             true,
             observed_generation,
             GC_BOOTSTRAP_STALLED_REASON,
@@ -3155,7 +3229,7 @@ fn gc_bootstrap_wait_status(
         )
     } else {
         condition(
-            "Degraded",
+            CONDITION_TYPE_DEGRADED,
             false,
             observed_generation,
             WAITING_FOR_GC_BOOTSTRAP_REASON,
@@ -3702,6 +3776,199 @@ mod tests {
             .iter()
             .find(|c| c.r#type == condition_type)
             .expect("condition present")
+    }
+
+    /// Every backtick-quoted, PascalCase-looking identifier in a crd.rs doc
+    /// comment, paired with whether the doc names it as NOT emitted (the
+    /// convention `crd.rs`'s `status.conditions` description uses: "the
+    /// operator emits no `Progressing` condition", where the token is
+    /// immediately preceded by the word "no"). Used to check the description
+    /// against [`CONDITION_TYPES`] without grepping crd.rs's source text
+    /// directly: this reads the same generated schema `--print-crd` does.
+    fn backtick_tokens_with_negation(description: &str) -> Vec<(String, bool)> {
+        let mut tokens = Vec::new();
+        let mut rest = description;
+        while let Some(start) = rest.find('`') {
+            let after_start = &rest[start + 1..];
+            let Some(end) = after_start.find('`') else {
+                break;
+            };
+            let token = &after_start[..end];
+            if token.len() > 1
+                && token.starts_with(|c: char| c.is_ascii_uppercase())
+                && token.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                let negated = rest[..start].split_whitespace().last() == Some("no");
+                tokens.push((token.to_string(), negated));
+            }
+            rest = &after_start[end + 1..];
+        }
+        tokens
+    }
+
+    /// Pins the `status.conditions` description in the generated CRD
+    /// (deploy/k8s/operator/crd.yaml) to [`CONDITION_TYPES`] (issue #3140):
+    /// the list went stale once already (PR #3136 found it still naming a
+    /// `Progressing` condition the operator never sets), and nothing
+    /// previously tied the prose to the emitters. Reads the description
+    /// through [`crate::crd::ravel_cluster_crd`], the exact function
+    /// `main`'s `--print-crd` calls, rather than grepping crd.rs's source,
+    /// so this checks what actually ships.
+    ///
+    /// Fails two ways, matching the two ways the list can go stale again: a
+    /// condition type production code emits (added to `CONDITION_TYPES`)
+    /// that the doc does not positively name, and a condition type the doc
+    /// positively names that is not in `CONDITION_TYPES` (a reintroduced
+    /// `Progressing` would be exactly this).
+    #[test]
+    fn crd_status_conditions_doc_matches_emitted_condition_types() {
+        let crd = crate::crd::ravel_cluster_crd();
+        let version = &crd.spec.versions[0];
+        let root = version
+            .schema
+            .as_ref()
+            .expect("schema")
+            .open_api_v3_schema
+            .as_ref()
+            .expect("root schema");
+        let description = root
+            .properties
+            .as_ref()
+            .expect("root props")
+            .get("status")
+            .expect("status prop")
+            .properties
+            .as_ref()
+            .expect("status props")
+            .get("conditions")
+            .expect("conditions prop")
+            .description
+            .as_ref()
+            .expect("conditions description");
+
+        let tokens = backtick_tokens_with_negation(description);
+
+        for condition_type in CONDITION_TYPES {
+            assert!(
+                tokens
+                    .iter()
+                    .any(|(token, negated)| token == condition_type && !negated),
+                "status.conditions description must positively name `{condition_type}`: {description}"
+            );
+        }
+
+        for (token, negated) in &tokens {
+            if *negated {
+                continue;
+            }
+            assert!(
+                CONDITION_TYPES.contains(&token.as_str()),
+                "status.conditions description names `{token}`, which is not an \
+                 operator-emitted condition type (CONDITION_TYPES): {description}"
+            );
+        }
+    }
+
+    /// Every type in [`CONDITION_TYPES`] is actually produced by some
+    /// production code path (issue #3140), each through the builder named in
+    /// the comment beside it. `reconcile`'s own call sites need a live
+    /// apiserver, so each builder is driven directly with the spec or input
+    /// that triggers it, the same way the single-condition tests elsewhere
+    /// in this module do.
+    #[tokio::test]
+    async fn every_condition_type_is_reachable_from_some_builder() {
+        let mut produced: Vec<&str> = Vec::new();
+
+        // Available: build_status's replica-ready success path.
+        let available_status = build_status(
+            Some(1),
+            Some(2),
+            Some(2),
+            None,
+            None,
+            PersistedStatus::default(),
+            Vec::new(),
+        );
+        assert_eq!(
+            find(&available_status.conditions, CONDITION_TYPE_AVAILABLE).status,
+            "True"
+        );
+        produced.push(CONDITION_TYPE_AVAILABLE);
+
+        // Degraded: build_degraded_status's failure path.
+        let degraded_status = build_degraded_status(
+            Some(1),
+            "ReconcileError",
+            "boom",
+            PersistedStatus::default(),
+            Vec::new(),
+        );
+        assert_eq!(
+            find(&degraded_status.conditions, CONDITION_TYPE_DEGRADED).status,
+            "True"
+        );
+        produced.push(CONDITION_TYPE_DEGRADED);
+
+        // StoreQualified: hold_for_qualification, the gate recorder
+        // `reconcile_inner` calls before the qualify-Job mutation.
+        let mut carried: Option<Condition> = None;
+        let mut extra = Vec::new();
+        hold_for_qualification(
+            Some(1),
+            STORE_QUALIFIED_PENDING_REASON,
+            STORE_QUALIFYING_MESSAGE,
+            &mut carried,
+            &mut extra,
+            async { Ok(()) },
+        )
+        .await
+        .expect("the no-op job action succeeds");
+        assert_eq!(
+            carried.as_ref().expect("recorded").r#type,
+            CONDITION_TYPE_STORE_QUALIFIED
+        );
+        produced.push(CONDITION_TYPE_STORE_QUALIFIED);
+
+        // IngestAffinityBackendDeprecated: spec_conditions on a spec still
+        // using the retired ingress-nginx backend.
+        let legacy_spec = spec_with_affinity(Some(IngestAffinitySpec::default()));
+        let legacy_extra = spec_conditions(&legacy_spec, Some(1));
+        assert_eq!(
+            condition_types(&legacy_extra),
+            vec![CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED]
+        );
+        produced.push(CONDITION_TYPE_INGEST_AFFINITY_BACKEND_DEPRECATED);
+
+        // HealthProbeOnMainHttpPort: spec_conditions on a spec with the
+        // dedicated health port turned off.
+        let mut no_dedicated_port_spec = spec_with_affinity(None);
+        no_dedicated_port_spec.probes.dedicated_health_port = false;
+        let probe_extra = spec_conditions(&no_dedicated_port_spec, Some(1));
+        assert_eq!(
+            condition_types(&probe_extra),
+            vec![CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT]
+        );
+        produced.push(CONDITION_TYPE_HEALTH_PROBE_ON_MAIN_HTTP_PORT);
+
+        // KubernetesVersionUnsupported: kubernetes_version_condition on an
+        // apiserver below MIN_KUBERNETES_MINOR_VERSION.
+        let below_floor = version_info("29", "v1.29.5");
+        let version_cond = kubernetes_version_condition(&below_floor, Some(1))
+            .expect("a below-floor apiserver version produces the condition");
+        assert_eq!(
+            version_cond.r#type,
+            CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED
+        );
+        produced.push(CONDITION_TYPE_KUBERNETES_VERSION_UNSUPPORTED);
+
+        let mut produced_sorted = produced.clone();
+        produced_sorted.sort_unstable();
+        let mut expected_sorted = CONDITION_TYPES.to_vec();
+        expected_sorted.sort_unstable();
+        assert_eq!(
+            produced_sorted, expected_sorted,
+            "every entry in CONDITION_TYPES must be demonstrated reachable here: got {produced:?}"
+        );
     }
 
     /// The legacy-backend deprecation condition rides alongside `Available` on
@@ -4484,7 +4751,7 @@ mod tests {
     #[test]
     fn degraded_status_keeps_store_qualified_after_a_post_proceed_failure() {
         let base = vec![condition(
-            "SpecValid",
+            "IngestAffinityBackendDeprecated",
             true,
             Some(7),
             "Accepted",
@@ -4510,7 +4777,11 @@ mod tests {
         assert_eq!(store_qualified.message, STORE_QUALIFIED_MESSAGE);
         assert_eq!(store_qualified.observed_generation, Some(7));
         // The base conditions are preserved, not replaced.
-        assert!(after.iter().any(|c| c.r#type == "SpecValid"));
+        assert!(
+            after
+                .iter()
+                .any(|c| c.r#type == "IngestAffinityBackendDeprecated")
+        );
 
         // Failed before the gate built its condition: base passes through,
         // StoreQualified absent.
@@ -4529,7 +4800,7 @@ mod tests {
     #[test]
     fn degraded_status_keeps_a_false_store_qualified_from_the_gate() {
         let base = vec![condition(
-            "SpecValid",
+            "IngestAffinityBackendDeprecated",
             true,
             Some(7),
             "Accepted",
@@ -4557,7 +4828,11 @@ mod tests {
         assert_eq!(store_qualified.reason, STORE_QUALIFIED_FAILED_REASON);
         assert_eq!(store_qualified.message, message);
         assert_eq!(store_qualified.observed_generation, Some(7));
-        assert!(after.iter().any(|c| c.r#type == "SpecValid"));
+        assert!(
+            after
+                .iter()
+                .any(|c| c.r#type == "IngestAffinityBackendDeprecated")
+        );
 
         // Flip: dropping the carried condition leaves StoreQualified absent.
         let dropped = degraded_extra_conditions(base.clone(), None);
@@ -4576,7 +4851,7 @@ mod tests {
     async fn a_failed_qualify_job_mutation_still_carries_the_gate_condition() {
         let mut carried: Option<Condition> = None;
         let mut extra = vec![condition(
-            "SpecValid",
+            "IngestAffinityBackendDeprecated",
             true,
             Some(11),
             "Accepted",
