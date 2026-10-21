@@ -1,7 +1,8 @@
 # ADR-3130: Authenticated maintain-worker registry records
 
 Status: Accepted (2026-10-21). Applies the ADR-1918 decision to the
-maintain-worker registry of ADR-0065. Changes the frozen `WorkerHeartbeat`
+maintain-worker registry of ADR-0065, and amends ADR-0065 decision 1 (the
+heartbeat payload and the live-set admission rule). Changes the frozen `WorkerHeartbeat`
 message in `proto/ravel/sys.proto` (additive field, `format_version` 1 to 2).
 Issue #3130, epic #1918.
 
@@ -67,12 +68,14 @@ Two constraints differ from ADR-1918:
    neither the maintain heartbeat task nor scrub, so it never writes or reads
    a registry record. Every maintain process in a cluster reads the same file.
 
-   Rotation is two-phase. A one-step swap to a file holding only the new key
+   Rotation takes three steps. A one-step swap to a file holding only the new key
    splits the live set for the length of the rollout: old-key pods reject
    new-key MACs and the reverse, and each side owns units the other also owns.
-   So append the new key after the old one everywhere and roll the pods, then
-   move it to the first line (the minting key) and roll again. Remove the old
-   key in a third roll once every pod mints with the new one.
+   So: (1) append the new key after the old one everywhere and roll the pods;
+   (2) move the new key to the first line (the minting key) and roll again;
+   (3) remove the old key and roll a third time. Step 3 must wait until step 2
+   has finished on every pod. It can happen any time after that, but until it
+   does, the old key still verifies.
 
 2. **`WorkerHeartbeat` gains `bytes mac = 5`, and `format_version` moves to
    2.** The MAC is `blake3::keyed_hash(record_key, claim)`, where
@@ -143,8 +146,14 @@ Two constraints differ from ADR-1918:
    maintain Deployment mounts it, passes `--maintain-key-file`, and includes
    the Secret's resourceVersion in its pod-template checksum, so a rotation
    rolls the pods. A cluster with `spec.maintain.enabled` (the default) and no
-   `keySecretRef` is refused with a status condition naming the field, rather
-   than rendered into pods that fail `Cli::validate`. The operator still
+   `keySecretRef` withholds the maintain Deployment only. The render error is
+   captured, as `distributed_query_render_error` is for a missing
+   distributed-query Secret ref (`services/ravel-operator/src/reconcile.rs`),
+   and it ends at a `Degraded` condition naming the field. The error is not
+   propagated out of `desired_objects`: every existing cluster hits this path
+   on upgrade, and the gateway and query tiers must keep reconciling until
+   the Secret exists. No pod is rendered with a flag set that fails
+   `Cli::validate`. The operator still
    generates no Secrets. `deploy/docker-compose` needs no key file: its only
    ravel-server runs `--mode all`.
 
@@ -224,8 +233,10 @@ flowchart LR
   here.
 - Docs updated with the implementation: `docs/catalog-and-mvcc.md` (the
   heartbeat record), the `WorkerHeartbeat` row of ADR-0066's R1 table (read
-  set `{2}`), `docs/reference/ravel-server-flags.md` (regenerated),
+  set `{2}`), an inline pointer to this ADR in ADR-0065 decision 1 at its
+  payload and admission rule (the precedent is ADR-0065's existing pointers
+  to ADR-1693), `docs/reference/ravel-server-flags.md` (regenerated),
   `docs/guides/kubernetes.md`, `docs/guides/operations/deployment.md` (with
-  the two-phase rotation from decision 1), `docs/guides/observability.md`,
+  the three-step rotation from decision 1), `docs/guides/observability.md`,
   the doc comments in `worker_set.rs` that call the key "self-owned" or
   "single writer per key", and the ADR index.
