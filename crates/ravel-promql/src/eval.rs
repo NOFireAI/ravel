@@ -634,9 +634,9 @@ impl QueryWindow {
     /// joined with any existing entry's window
     /// ([`SelectorCache::miss_window`]), and its result replaces the entry
     /// when [`SelectorCache::insert`] admits it; a read it does not admit
-    /// still answers this request. Once a key has fallen back, a request its
-    /// entry (if any) does not cover is read over `request` itself, as
-    /// without a cache. Either way the caller slices the result to `request`
+    /// still answers this request, and drops the entry it would have replaced.
+    /// Once a key has fallen back, every later request is read over `request`
+    /// itself, as without a cache. Either way the caller slices the result to `request`
     /// with [`CachedSelector::slices`].
     fn selector_read<S: CachedSeries>(
         &self,
@@ -647,10 +647,7 @@ impl QueryWindow {
         fetch: impl FnOnce(TimeRange) -> Result<Vec<S>, SourceError>,
     ) -> Result<Rc<CachedSelector<S>>, Error> {
         let Some(cache) = &self.selector_cache else {
-            return Ok(Rc::new(CachedSelector {
-                window: request,
-                series: fetch(request)?,
-            }));
+            return Ok(Rc::new(CachedSelector::new(request, fetch(request)?)));
         };
         let key = SelectorKey::new(
             matchers,
@@ -663,10 +660,7 @@ impl QueryWindow {
         }
         if cache.fell_back(&key) {
             cache.note_uncached_read();
-            return Ok(Rc::new(CachedSelector {
-                window: request,
-                series: fetch(request)?,
-            }));
+            return Ok(Rc::new(CachedSelector::new(request, fetch(request)?)));
         }
         let (t_outer, inner_pad) = match self.inner_grid_pad.get() {
             Some(pad) => (self.t_outer.get(), pad),
@@ -683,10 +677,7 @@ impl QueryWindow {
                 key.pinned(),
             ),
         );
-        let cached = Rc::new(CachedSelector {
-            window,
-            series: fetch(window)?,
-        });
+        let cached = Rc::new(CachedSelector::new(window, fetch(window)?));
         cache.insert(key, Rc::clone(&cached));
         Ok(cached)
     }
@@ -1205,7 +1196,7 @@ impl Evaluator {
         let series = ctx.selector_read(&selector_matchers, vs, window, eval_ts_ns, |w| {
             source.query(&selector_matchers, w)
         })?;
-        let mut out = Vec::with_capacity(series.series.len());
+        let mut out = Vec::with_capacity(series.len());
         for (labels, samples) in series.slices(window) {
             if let Some((value, orig_sample_ts_ns)) =
                 pick_sample(samples, sel_ts_ns, self.lookback_delta_ns)
@@ -1266,7 +1257,7 @@ impl Evaluator {
         let series = ctx.selector_read(&selector_matchers, &ms.vs, window, eval_ts_ns, |w| {
             source.query(&selector_matchers, w)
         })?;
-        let mut out = Vec::with_capacity(series.series.len());
+        let mut out = Vec::with_capacity(series.len());
         for (labels, samples) in series.slices(window) {
             // The window fetched from storage is inclusive on both ends
             // (`TimeRange`'s own contract); a matrix selector's window is
@@ -1417,7 +1408,7 @@ impl Evaluator {
         let series = ctx.selector_read(&selector_matchers, &ms.vs, window, eval_ts_ns, |w| {
             source.query_histograms(&selector_matchers, w)
         })?;
-        let mut out = Vec::with_capacity(series.series.len());
+        let mut out = Vec::with_capacity(series.len());
         for (labels, samples) in series.slices(window) {
             let samples: Vec<crate::histogram::TimedHistogram> = samples
                 .iter()
