@@ -107,14 +107,19 @@ material only, not a merge candidate.
    when its MAC verifies under one of the reader's keys, compared in constant
    time. The existing UUID, `process_id` and staleness checks stay. Rejected
    records are skipped, never fatal to the whole read, and are counted under a
-   closed reason label, `missing_mac`, `bad_mac` or `oversize`, as
-   `ravel_query_worker_record_rejects_total{reason}`. That metric is rendered
-   by the server's metrics endpoint beside
+   closed reason label as `ravel_query_worker_record_rejects_total{reason}`:
+   `missing_mac`, `bad_mac`, `oversize`, and `malformed` for a body that does
+   not decode or whose `process_id` does not match its key. `malformed` is the
+   label garbage-overwrite eviction (Consequences) shows up under, so the
+   residual attack is counted too. A record skipped only because its stamp is
+   stale is not counted: dead workers leave such records in normal operation.
+   The metric is rendered by the server's metrics endpoint beside
    `ravel_distrib_fragment_capability_rejects_total`.
 
-5. **The record read is bounded.** The reader fetches at most 4 KiB of a record
-   object with a bounded range read. A larger object is counted as `oversize`
-   and skipped. A real record is under 300 bytes.
+5. **The record read is bounded.** The reader issues a range read of
+   4096 + 1 bytes. A response longer than 4096 bytes means the object is
+   larger than the bound, and the record is counted as `oversize` and skipped
+   without being decoded. A real record is under 300 bytes.
 
 6. **No protocol version change and no transition mode.** The record is
    transient heartbeat state, not a frozen format (ADR-1689 decision 3 made the
@@ -185,6 +190,13 @@ flowchart LR
   setting that can drift from the network. An operator-rendered egress
   NetworkPolicy has the same problem, and the policy rendered today is
   ingress-only on purpose.
+- **A per-UUID high-water stamp, so a replayed older record is rejected.**
+  Each reader would remember the newest stamp it has admitted per UUID and
+  refuse anything older, which would stop replay of a worker's own drained
+  record. It does not change the eviction consequence: overwriting the record
+  with garbage evicts the worker just as well and needs no replay. The state
+  is also per reader and not durable, so a coordinator that has just started
+  has no high-water marks and admits any replay in its first read.
 
 ## Consequences
 
@@ -206,7 +218,9 @@ flowchart LR
   SQL lane. That is the ADR-1689 trust model and this ADR does not change it.
 - `ravel_query_worker_record_rejects_total` is the operator-visible sign of
   either a rollout in progress (`missing_mac` from old workers) or a forger
-  (`bad_mac`, `oversize`).
+  (`bad_mac`, `oversize`, and `malformed` for a garbage overwrite). Replay of
+  an older signed record is not counted, because the reader cannot tell it
+  from a slow heartbeat.
 - A process whose fragment key file shares no key with its siblings no longer
   sees them, and they no longer see it. Today such a process already fails
   every PromQL fragment, because capabilities verify only under shared keys.
