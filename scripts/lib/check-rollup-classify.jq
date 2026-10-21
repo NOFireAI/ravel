@@ -15,9 +15,29 @@
 # a pass either, so it gets its own class and a caller that folds it into the
 # pass count is making that choice visibly.
 #
+# A check that ran more than once on the same head (a re-run, or a fresh
+# suite after the pull request was closed and reopened) appears once per run.
+# Only the newest run of each check counts, as it does for GitHub's own merge
+# rules: an old cancelled run does not hold back a newer success, and a newer
+# failure is not hidden by an older success. A check run is keyed by workflow
+# and job name, so same-named jobs in different workflows stay separate; a
+# status context by its context. Newest is the latest `startedAt`; entries
+# without one keep their input order.
+#
 # Shared by scripts/pr-review-status.sh and scripts/guards/assert-green-head.sh
 # so the two can never disagree about whether a pull request is green.
-[.statusCheckRollup[]? | {
+[.statusCheckRollup[]?]
+| to_entries
+| map(.value + {
+    _key: (if (.value | has("state")) then "status:" + (.value.context // .value.name // "unknown")
+           else "check:" + (.value.workflowName // "") + "/" + (.value.name // "unknown") end),
+    _ts: (.value.startedAt // ""),
+    _ord: .key
+  })
+| group_by(._key)
+| map(sort_by([._ts, ._ord]) | last)
+| sort_by(._ord)
+| [.[] | {
   name: (.name // .context // "unknown"),
   class: (
     if has("state") then

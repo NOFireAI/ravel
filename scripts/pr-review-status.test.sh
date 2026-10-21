@@ -1083,6 +1083,31 @@ check_eq "one pass beside one skip: the verdict still says CI green" \
   "  -> clean: CI green, review at the current head with zero findings" \
   "$(printf '%s\n' "${mixed_out}" | sed -n 2p)"
 
+# A check that ran twice on the same head (a re-run, or a fresh suite after the
+# pull request was closed and reopened) counts once, by its newest run. The
+# older cancelled sql run must not hold back the newer success, and in the
+# other direction a newer failure must not hide behind an older success.
+E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"CANCELLED","startedAt":"2026-10-20T17:57:40Z"},{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T18:52:55Z"},{"name":"lint","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T18:52:55Z"}]'
+rerun_ok_out="$(e2e "${CLEAN_BODY_JSON}")"
+E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-10-20T18:52:55Z"},{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T17:57:40Z"}]'
+rerun_fail_out="$(e2e "${CLEAN_BODY_JSON}")"
+E2E_ROLLUP='[{"name":"sql","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-10-20T18:52:55Z"},{"name":"sql","workflowName":"nightly","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-10-20T17:57:40Z"}]'
+rerun_two_workflows_out="$(e2e "${CLEAN_BODY_JSON}")"
+unset E2E_ROLLUP
+
+check_eq "superseded run: an older cancelled run under a newer success counts once, as a pass" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=2 pass/0 pending/0 fail | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${rerun_ok_out}" | sed -n 1p)"
+check_eq "superseded run: the verdict is clean" \
+  "  -> clean: CI green, review at the current head with zero findings" \
+  "$(printf '%s\n' "${rerun_ok_out}" | sed -n 2p)"
+check_eq "superseded run: a newer failure over an older success counts as a failure" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=0 pass/0 pending/1 fail (sql) | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${rerun_fail_out}" | sed -n 1p)"
+check_eq "superseded run: same job name in two workflows is two checks" \
+  "PR #908 @ ${SHA}: state=OPEN mergeState=CLEAN CI=1 pass/0 pending/1 fail (sql) | review: task@head=done reviews@head=1 last=COMMENTED inline_comments=0" \
+  "$(printf '%s\n' "${rerun_two_workflows_out}" | sed -n 1p)"
+
 # The post-fork shape guard (issue #2811) sits last before the merge line. A
 # hit refuses the merge line outright; a guard that could not answer prints a
 # warning but keeps the line, since "could not check" is not "clean" and must
