@@ -181,7 +181,13 @@ async fn start_test_server() -> ravel_server::Running {
 /// `otelarrow` exporter that streams OTAP to `ravel-server`'s gRPC listener.
 /// `tls.insecure` because the listener is plaintext tonic; the bearer token
 /// rides a gRPC header, exactly as `ravel-server` resolves the tenant from
-/// stream-open metadata.
+/// stream-open metadata. `compression: none` because the exporter's default,
+/// zstd, compresses the gRPC messages (`zstdarrow5` on the Arrow stream,
+/// `zstd` on its OTLP fallback), and the OTAP service accepts no gRPC
+/// compression (issue #3163). `arrow.disable_downgrade` because the exporter
+/// otherwise falls back to plain OTLP when the Arrow stream is refused, and
+/// this server also serves OTLP on the same listener, so a pass would not
+/// prove the OTAP path ran.
 fn collector_config(ravel_grpc_port: u16) -> String {
     format!(
         r#"
@@ -194,12 +200,14 @@ receivers:
 exporters:
   otelarrow:
     endpoint: 127.0.0.1:{ravel_grpc_port}
+    compression: none
     tls:
       insecure: true
     headers:
       authorization: 'Bearer {TOKEN}'
     arrow:
       num_streams: 1
+      disable_downgrade: true
 
 service:
   telemetry:
@@ -285,10 +293,11 @@ async fn real_collector_otelarrow_export_is_queryable() {
 
     let container_name = format!("ravel-otap-e2e-{}", std::process::id());
 
+    // No `--rm`: a collector that exits at startup must keep its log for the
+    // diagnostics below. `docker rm -f` removes it at the end instead.
     let status = Command::new("docker")
         .args([
             "run",
-            "--rm",
             "-d",
             "--network",
             "host",
@@ -331,7 +340,15 @@ async fn real_collector_otelarrow_export_is_queryable() {
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    assert!(pushed, "collector otlp receiver never accepted the metric");
+    if !pushed {
+        // A collector that exited at startup (an unknown config key, a bad
+        // image) never opens its receiver; its log says why.
+        let log = collector_log(&container_name);
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &container_name])
+            .status();
+        panic!("collector otlp receiver never accepted the metric\ncollector log:\n{log}");
+    }
 
     // Poll until the exported sample lands (strict commit through the OTAP
     // path makes it durable + visible), bounded so a broken pipeline fails
@@ -345,11 +362,46 @@ async fn real_collector_otelarrow_export_is_queryable() {
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
+    // On a miss, the collector's own log is the only record of what the
+    // otelarrow exporter did (a refused stream, an auth or protocol error),
+    // and the server's metrics say whether any OTAP batch arrived.
+    let diagnostics = if series.is_none() {
+        let collector_log = collector_log(&container_name);
+        let server_metrics = match client
+            .get(format!("http://{http_addr}/metrics"))
+            .send()
+            .await
+        {
+            Ok(response) => response.text().await.unwrap_or_default(),
+            Err(err) => format!("metrics scrape failed: {err}"),
+        };
+        // Whether any batch reached the write path, and how it was answered.
+        let ingest_metrics: Vec<&str> = server_metrics
+            .lines()
+            .filter(|line| {
+                line.starts_with("ravel_ingest_acks_")
+                    || line.starts_with("ravel_ingest_abandoned_")
+                    || line.starts_with("ravel_admission_admitted_total")
+                    || line.starts_with("ravel_admission_rejected_total")
+            })
+            .collect();
+        let ingest_metrics = if ingest_metrics.is_empty() {
+            format!("(no ingest counter matched; whole /metrics body)\n{server_metrics}")
+        } else {
+            ingest_metrics.join("\n")
+        };
+        format!("collector log:\n{collector_log}\nserver ingest metrics:\n{ingest_metrics}")
+    } else {
+        String::new()
+    };
+
     let _ = Command::new("docker")
-        .args(["stop", &container_name])
+        .args(["rm", "-f", &container_name])
         .status();
 
-    let series = series.expect("collector-exported OTAP sample became queryable");
+    let series = series.unwrap_or_else(|| {
+        panic!("collector-exported OTAP sample never became queryable\n{diagnostics}")
+    });
     assert_eq!(series["metric"]["__name__"], METRIC_NAME);
     let got: f64 = series["value"][1]
         .as_str()
@@ -362,4 +414,19 @@ async fn real_collector_otelarrow_export_is_queryable() {
     );
 
     running.shutdown().await.expect("graceful shutdown");
+}
+
+/// The collector container's stdout and stderr, or why they could not be read.
+fn collector_log(container_name: &str) -> String {
+    Command::new("docker")
+        .args(["logs", container_name])
+        .output()
+        .map(|out| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        })
+        .unwrap_or_else(|err| format!("docker logs failed: {err}"))
 }

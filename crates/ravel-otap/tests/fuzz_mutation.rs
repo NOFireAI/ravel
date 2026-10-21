@@ -243,9 +243,9 @@ proptest! {
     }
 
     /// Arbitrary bytes as the raw `record` (NOT valid zstd) must be rejected
-    /// with a typed decompression error, never a panic: this is entirely
-    /// within Ravel's own guard code (before the arrow boundary), so here we
-    /// assert the strong contract directly.
+    /// with a typed error, never a panic escaping the decode: bytes without
+    /// the zstd magic reach the IPC scan and arrow's decoder, whose panics
+    /// `StreamState` catches, so here we assert the strong contract directly.
     #[test]
     fn arbitrary_non_zstd_record_never_panics(raw in proptest::collection::vec(any::<u8>(), 0..512)) {
         let mut state = StreamState::new(StreamConfig::default());

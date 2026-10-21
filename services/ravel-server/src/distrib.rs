@@ -286,6 +286,11 @@ pub struct FragmentMetrics {
     /// Endpoints currently held in the coordinator's quarantine map (gauge).
     /// Kept in step with the map's length after every mark, readmit, and prune.
     quarantine_current: AtomicU64,
+    /// Sibling `sys/query/workers/` records this process's live-set reads
+    /// rejected, by reason (ADR-1918 decision 4). Shared with the process's
+    /// `QueryWorkers`, which counts into it. Rendered under the closed
+    /// `reason` label as `ravel_query_worker_record_rejects_total`.
+    query_worker_record_rejects: Arc<ravel_fleet::query_workers::RecordRejectMetrics>,
 }
 
 impl Default for FragmentMetrics {
@@ -308,6 +313,7 @@ impl Default for FragmentMetrics {
             quarantine_marks_total: AtomicU64::new(0),
             quarantine_readmits_total: AtomicU64::new(0),
             quarantine_current: AtomicU64::new(0),
+            query_worker_record_rejects: Arc::default(),
         }
     }
 }
@@ -519,6 +525,14 @@ impl FragmentMetrics {
     /// Endpoints currently quarantined (gauge; ADR-0071 amendment, decision 3).
     pub fn quarantine_current(&self) -> u64 {
         self.quarantine_current.load(Ordering::Relaxed)
+    }
+
+    /// The query-worker record reject counters (ADR-1918 decision 4), to hand
+    /// to `QueryWorkers::with_record_rejects`.
+    pub fn query_worker_record_rejects(
+        &self,
+    ) -> &Arc<ravel_fleet::query_workers::RecordRejectMetrics> {
+        &self.query_worker_record_rejects
     }
 }
 
@@ -2606,6 +2620,11 @@ mod tests {
         Arc::new(vec![TEST_KEY])
     }
 
+    /// The query-worker record keys derived from [`TEST_KEY`].
+    fn test_record_keys() -> ravel_fleet::query_workers::RecordKeys {
+        ravel_fleet::query_workers::RecordKeys::from_file_keys(&[TEST_KEY]).expect("one key")
+    }
+
     /// Mint a capability for the request's own `(tenant, signal, query_id)` with
     /// `expires` under `key`, exactly as a coordinator does. Used to hand a
     /// worker-side `fetch` a valid or a deliberately-mismatched capability.
@@ -3794,7 +3813,11 @@ mod tests {
     #[tokio::test]
     async fn worker_registration_appears_then_ages_out() {
         let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
-        let workers = QueryWorkers::with_defaults("127.0.0.1:7000", codec::PROTOCOL_VERSION);
+        let workers = QueryWorkers::with_defaults(
+            "127.0.0.1:7000",
+            codec::PROTOCOL_VERSION,
+            test_record_keys(),
+        );
         let interval_ns =
             i64::try_from(workers.heartbeat_interval().as_nanos()).expect("interval fits i64");
 
@@ -3815,7 +3838,11 @@ mod tests {
         // Far past the staleness window (3x the interval by default): the record
         // is no longer live. `self` is always included by `live_set`, so read
         // from a different identity to observe the aged-out record's absence.
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
+        let observer = QueryWorkers::with_defaults(
+            "127.0.0.1:7001",
+            codec::PROTOCOL_VERSION,
+            test_record_keys(),
+        );
         let stale_now = 1_000 + interval_ns * 10;
         let live = observer
             .live_set(store.as_ref(), stale_now)
@@ -3857,6 +3884,7 @@ mod tests {
             let dead = QueryWorkers::with_defaults(
                 format!("127.0.0.1:{}", 7200 + port),
                 codec::PROTOCOL_VERSION,
+                test_record_keys(),
             );
             dead.write_heartbeat(&memory, now_ns - 10 * H_NS)
                 .await
@@ -3878,6 +3906,7 @@ mod tests {
         let workers = Arc::new(QueryWorkers::with_defaults(
             "127.0.0.1:7000",
             codec::PROTOCOL_VERSION,
+            test_record_keys(),
         ));
         let interval = workers.heartbeat_interval();
         let live_workers = Arc::new(RwLock::new(Arc::new(Vec::new())));
@@ -3894,7 +3923,11 @@ mod tests {
             tokio::time::sleep(interval).await;
         }
 
-        let observer = QueryWorkers::with_defaults("127.0.0.1:7001", codec::PROTOCOL_VERSION);
+        let observer = QueryWorkers::with_defaults(
+            "127.0.0.1:7001",
+            codec::PROTOCOL_VERSION,
+            test_record_keys(),
+        );
         let self_id = workers.process_id().to_string();
         let live = observer
             .live_set(store.as_ref(), now_ns)
@@ -4050,6 +4083,7 @@ mod tests {
         let workers = Arc::new(QueryWorkers::new(
             "127.0.0.1:7000",
             codec::PROTOCOL_VERSION,
+            test_record_keys(),
             Duration::ZERO,
             3,
         ));

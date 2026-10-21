@@ -36,6 +36,9 @@ opentelemetry-proto = { workspace = true }
 ravel-remote-write = { workspace = true }
 criterion = { workspace = true }
 stats_alloc = "0.1.10"
+# Writes LZ4_FRAME body-compressed IPC for the test that the decoder refuses
+# it; a server build already gets the feature through datafusion.
+arrow-ipc = { workspace = true, features = ["lz4"] }
 
 [[bench]]
 name = "decode"

@@ -28,8 +28,10 @@ commit-token header, and the status-code mapping are identical on all six.
 ## Compressed requests
 
 Ravel accepts gzip-compressed OTLP bodies on both transports. A stock
-OpenTelemetry Collector and a stock Grafana Alloy both default to gzip, so no
-client configuration is needed.
+OpenTelemetry Collector `otlp` or `otlphttp` exporter and a stock Grafana
+Alloy both default to gzip, so no client configuration is needed. The
+collector's `otelarrow` exporter defaults to zstd, which Ravel does not
+accept: set `compression: none` on it (see docs/otap-ingest.md).
 
 ### OTLP HTTP
 
