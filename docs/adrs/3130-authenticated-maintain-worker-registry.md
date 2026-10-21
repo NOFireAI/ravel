@@ -58,9 +58,10 @@ Two constraints differ from ADR-1918:
 
 ## Decision
 
-1. **A maintain key file.** New flag `--maintain-key-file`, in the format of
-   `--fragment-key-file`: one 64-hex-character key per line, the first key
-   mints and any key verifies, parsed by the same `parse_fragment_keys`.
+1. **A maintain key file.** New flag `--maintain-key-file`, in the same file
+   format as `--fragment-key-file` and parsed by the same
+   `parse_fragment_keys`: 64-hex-character keys, one per line; the first key
+   mints and any key verifies.
    `Cli::validate` requires it with `--mode maintain` and refuses it in every
    other mode, since no other mode reads the registry. That includes
    `--mode all`: it keeps a solo live set for its whole life
@@ -86,7 +87,7 @@ Two constraints differ from ADR-1918:
    a maintain one. `claim` is built from field values, not
    encoded protobuf bytes, since protobuf encoding is not canonical:
    `format_version` (u32 BE), `process_id` (u64 BE length prefix, then the
-   bytes), `started_unix_ns` (i64 BE), `heartbeat_unix_ns` (i64 BE). Before v1
+   bytes), `started_unix_ns` (i64 BE), `heartbeat_unix_ns` (i64 BE). Before 1.0
    there is one supported version (ADR-0027's regime), so readers accept
    exactly `{2}`. A version-1 record is rejected as `missing_mac`, not decoded
    through a dual path. Migration class C (an immutable metadata record,
@@ -146,14 +147,19 @@ Two constraints differ from ADR-1918:
    maintain Deployment mounts it, passes `--maintain-key-file`, and includes
    the Secret's resourceVersion in its pod-template checksum, so a rotation
    rolls the pods. A cluster with `spec.maintain.enabled` (the default) and no
-   `keySecretRef` withholds the maintain Deployment only. The render error is
-   captured, as `distributed_query_render_error` is for a missing
-   distributed-query Secret ref (`services/ravel-operator/src/reconcile.rs`),
-   and it ends at a `Degraded` condition naming the field. The error is not
-   propagated out of `desired_objects`: every existing cluster hits this path
-   on upgrade, and the gateway and query tiers must keep reconciling until
-   the Secret exists. No pod is rendered with a flag set that fails
-   `Cli::validate`. The operator still
+   `keySecretRef` withholds the maintain tier at apply time, the way the
+   query tier's `query_tier_apply_target` does
+   (`services/ravel-operator/src/controller.rs`): any live maintain
+   Deployment is left exactly as it is, not updated and not deleted, and the
+   cluster gets a `Degraded` condition naming the field. The render must not
+   express this as `maintain_deployment: None`, because the controller reads
+   `None` as "maintain disabled" and deletes the live Deployment, which would
+   stop retention, compaction, erasure, scrub and the fold on every cluster
+   that upgrades without the Secret. The error is not propagated out of
+   `desired_objects` either: the gateway and query tiers keep reconciling
+   until the Secret exists. A cluster upgrading this way keeps its previous
+   maintain pods, on the previous image, until the Secret is created. No pod
+   is rendered with a flag set that fails `Cli::validate`. The operator still
    generates no Secrets. `deploy/docker-compose` needs no key file: its only
    ravel-server runs `--mode all`.
 
@@ -219,9 +225,10 @@ flowchart LR
   duplicated, idempotent work (ADR-0065's stated failure mode), not lost work.
 - Every maintain deployment must provision a key file. Under the operator,
   that means creating a Secret and naming it in `spec.maintain.keySecretRef`;
-  a cluster with the maintain tier enabled and no ref is refused with a status
-  condition. There is no
-  default key, because a key shipped with the code authenticates nothing.
+  a cluster with the maintain tier enabled and no ref keeps its existing
+  maintain pods unchanged and reports `Degraded` until the Secret exists
+  (decision 5). There is no default key, because a key shipped with the code
+  authenticates nothing.
 - During a rolling deploy, old processes skip version-2 records (their
   `format_version > 1` guard) and new processes reject version-1 records. Each
   side sees a partial live set and may own units the other side also owns, so
