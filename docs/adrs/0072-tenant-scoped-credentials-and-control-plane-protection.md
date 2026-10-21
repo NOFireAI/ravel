@@ -89,7 +89,9 @@ changes on disk, so an external process (Kubernetes secret rotation, an
 STS sidecar, IRSA-style mounting) can rotate short-lived role
 credentials without a restart. Ravel itself never calls STS: the
 rejected credential-broker stance of ADR-0055 stands. This decision
-only makes externally minted short-lived credentials expressible.
+only makes externally minted short-lived credentials expressible. (The
+file's first in-tree writer is the operator's Pod Identity sidecar: see
+the Pod Identity sidecar amendment below.)
 
 ### 2. Per-tenant isolation is delivered by key custody, not credentials
 
@@ -445,3 +447,37 @@ caller samples whether any protected version carries retention (the
 only warns. It does not prevent the rollback either. This matches
 `docs/object-store-contract.md`, "Required bucket configuration". The
 residual-risk sentence that follows in the bullet is unchanged.
+
+## Amendment (2026-10-21): the Pod Identity sidecar amendment
+
+<!-- amendment-applies: sections="1. `S3Config` learns temporary credentials" pointer="Pod Identity sidecar amendment" -->
+
+Decision 1 describes the credentials file's writer as an external process.
+The file now has its first writer inside the repository: the
+`ravel-operator pod-identity-credentials` sidecar (ADR-0106, Pod Identity
+sidecar amendment; ADR-0034 decision 2). Under
+`storage.s3.auth: podIdentity` the operator renders it next to every
+`ravel-server` container and in the qualify Job. It fetches short-lived
+role credentials from the EKS Pod Identity agent and writes this
+decision's JSON shape onto a memory-backed `emptyDir` that the server
+reads through `--s3-credentials-file` (`RAVEL_S3_CREDENTIALS_FILE` for
+`ravel-cli`).
+
+The writer relies on three parts of this decision's contract, which
+therefore become load-bearing for the operator and not only for external
+tooling:
+
+- The file is re-read when its mtime changes. The sidecar replaces it by
+  rename, so every rewrite is a new inode with a new mtime, and a reader
+  never sees a half-written file.
+- `session_token` is accepted. Pod Identity credentials are temporary and
+  are useless without it.
+- A rotation that fails to parse keeps the last good credential. The
+  sidecar never writes a partial file, but this is what keeps a server
+  signing while the sidecar retries.
+
+Ravel itself still does not call STS: the Pod Identity agent does, and the
+sidecar only copies its answer into the file. The operator image now
+contains this writer, so a change to the file's shape must change both
+sides. The operator's round-trip test (the sidecar's writer read back
+through `S3Store::new`) pins that.
