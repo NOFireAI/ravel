@@ -372,14 +372,22 @@ async fn real_collector_otelarrow_export_is_queryable() {
             Ok(response) => response.text().await.unwrap_or_default(),
             Err(err) => format!("metrics scrape failed: {err}"),
         };
-        let otap_metrics: Vec<&str> = server_metrics
+        // Whether any batch reached the write path, and how it was answered.
+        let ingest_metrics: Vec<&str> = server_metrics
             .lines()
-            .filter(|line| line.contains("otap") || line.contains("ingest_reject"))
+            .filter(|line| {
+                line.starts_with("ravel_ingest_acks_")
+                    || line.starts_with("ravel_ingest_abandoned_")
+                    || line.starts_with("ravel_admission_admitted_total")
+                    || line.starts_with("ravel_admission_rejected_total")
+            })
             .collect();
-        format!(
-            "collector log:\n{collector_log}\nserver otap and ingest-reject metrics:\n{}",
-            otap_metrics.join("\n")
-        )
+        let ingest_metrics = if ingest_metrics.is_empty() {
+            server_metrics.clone()
+        } else {
+            ingest_metrics.join("\n")
+        };
+        format!("collector log:\n{collector_log}\nserver ingest metrics:\n{ingest_metrics}")
     } else {
         String::new()
     };
