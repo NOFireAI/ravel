@@ -16,8 +16,8 @@
 #[cfg(not(target_env = "msvc"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-/// The three jemalloc-native figures (`stats.allocated`/`active`/`resident`)
-/// on a build where jemalloc is the global allocator, or an explicit marker
+/// The five jemalloc-native figures (`stats.allocated`/`active`/`resident`/
+/// `mapped`/`retained`) on a build where jemalloc is the global allocator, or an explicit marker
 /// naming whichever allocator this process actually uses instead. There is
 /// no all-zeros case: a non-jemalloc build says so by name rather than
 /// reporting jemalloc figures it does not have.
@@ -27,6 +27,8 @@ pub enum AllocatorStats {
         allocated: u64,
         active: u64,
         resident: u64,
+        mapped: u64,
+        retained: u64,
         /// Whether jemalloc's background purge thread is enabled, read from
         /// the allocator at the same time as the byte figures, or `false`
         /// once [`configure_background_thread`] has failed to start it.
@@ -70,6 +72,8 @@ fn read_with(
         allocated: stats::allocated::read().unwrap_or(0) as u64,
         active: stats::active::read().unwrap_or(0) as u64,
         resident: stats::resident::read().unwrap_or(0) as u64,
+        mapped: stats::mapped::read().unwrap_or(0) as u64,
+        retained: stats::retained::read().unwrap_or(0) as u64,
         background_thread: !start_failed.load(Ordering::Relaxed)
             && background_thread().unwrap_or(false),
     }
@@ -456,6 +460,29 @@ mod tests {
                 panic!("expected Jemalloc on a non-msvc target, got Other({name})");
             }
         }
+    }
+
+    /// `mapped` and `retained` are live reads in the same epoch as the other
+    /// figures. jemalloc documents `stats.mapped` as larger than
+    /// `stats.active` and as having no strict ordering against
+    /// `stats.resident`, so the ordering pinned here is the documented one.
+    #[cfg(not(target_env = "msvc"))]
+    #[test]
+    fn read_reports_mapped_and_retained_live() {
+        match read() {
+            AllocatorStats::Jemalloc { active, mapped, .. } => {
+                assert!(mapped > 0, "a running process has mapped bytes");
+                assert!(
+                    mapped >= active,
+                    "mapped ({mapped}) must cover active ({active})"
+                );
+            }
+            AllocatorStats::Other { name } => {
+                panic!("expected Jemalloc on a non-msvc target, got Other({name})");
+            }
+        }
+        tikv_jemalloc_ctl::epoch::advance().expect("epoch advances");
+        tikv_jemalloc_ctl::stats::retained::read().expect("stats.retained reads");
     }
 
     #[test]

@@ -53,7 +53,7 @@ The renderer can attach only these label keys: `tenant_hash`, `signal`,
 | `cache`, `tier` | The read-cache family across its two caches and, when a disk tier is configured, its two tiers. The [caching guide](caching.md) documents both. |
 | `class` | The fragment in-flight gauge and admission-wait counter into their `pinned` and `resolve` fragment admission classes. |
 | `carrier` | The declared-statistics drop tally across its four carrier labels. |
-| `allocator`, `stat` | The process allocator gauges. |
+| `allocator`, `stat` | The process allocator gauges. `ravel_process_allocator_bytes` carries one sample per `stat`: `allocated`, `active`, `resident`, `mapped` and `retained`, the jemalloc byte figures read together at scrape time. |
 | `component` | The memory budget's reserved-bytes gauge by which side reserved it. |
 | `gate`, `site` | The CPU gate families by gate and by call site, each from a closed set. `site` also splits the memory gate's two refusal counters (`ravel_memory_gate_refusals_total`, refusals while host available memory was below `ravel_memory_gate_available_floor_bytes`, and `ravel_memory_budget_refusals_total`, refusals by the ledger) by check site. |
 | `worker` | The tokio runtime's per-worker busy counter, bounded by the runtime's fixed worker count. |
