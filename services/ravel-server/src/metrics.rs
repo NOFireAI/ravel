@@ -7798,10 +7798,8 @@ pub struct DistribSnapshot {
     pub quarantine_current: u64,
     /// Sibling query-worker records this process's live-set reads rejected,
     /// per reason, every reason present (ADR-1918 decision 4).
-    pub query_worker_record_rejects_by_reason: [(
-        ravel_fleet::query_workers::RecordReject,
-        u64,
-    ); ravel_fleet::query_workers::RecordReject::ALL.len()],
+    pub query_worker_record_rejects_by_reason: [(ravel_fleet::query_workers::RecordReject, u64);
+        ravel_fleet::query_workers::RecordReject::ALL.len()],
 }
 
 impl DistribSnapshot {
@@ -13457,7 +13455,10 @@ mod tests {
             .expect("put empty");
         let record_keys = || RecordKeys::from_file_keys(&[[3; 32]]).expect("one key");
         QueryWorkers::with_defaults("127.0.0.1:2", 5, record_keys())
-            .write_heartbeat(&store, now_ns - 2 * ravel_fleet::query_workers::default_liveness_window_ns())
+            .write_heartbeat(
+                &store,
+                now_ns - 2 * ravel_fleet::query_workers::default_liveness_window_ns(),
+            )
             .await
             .expect("put stale signed");
         let reader = QueryWorkers::with_defaults("127.0.0.1:1", 5, record_keys())

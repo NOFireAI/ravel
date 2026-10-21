@@ -425,9 +425,22 @@ Every record also carries a `mac`: a keyed BLAKE3 hash, under a key derived
 from the `--fragment-key-file` keys, over the process id, the endpoint, the
 protocol version and the liveness stamp. A node writes its own record under the
 first key in its file and admits a sibling whose MAC verifies under any key in
-its file, so a key rotation that keeps one key in common keeps the fleet
-joined. A record is read with a bounded range read of at most 4 KiB plus one
-byte, and a sibling that fails any check is skipped, never fatal to the read:
+its file. Two files that merely share a key are therefore not enough: the
+fleet stays joined only while the first key of every node's file appears in
+every other node's file. The rotation in
+[Rotating the fragment keys](#rotating-the-fragment-keys) keeps that true at
+every step:
+
+1. Append the new key to every file and roll the fleet. Every node still
+   signs under the old key and now also verifies the new one.
+2. Move the new key to the first line and roll again. Nodes that have rolled
+   sign under the new key, which every node already verifies.
+3. Only after step 2 has finished on every node, remove the old key and roll
+   a third time. A node still signing under the old key at that point drops
+   out of the live set of every node that no longer holds it.
+
+A record is read with a bounded range read of 4096 + 1 bytes, and a sibling
+that fails any check is skipped, never fatal to the read:
 
 - The shipped query role (`deploy/iam/query.json`) can `PutObject` anywhere
   under `sys/query/workers/`. A writer with that grant but without the key
@@ -438,12 +451,17 @@ byte, and a sibling that fails any check is skipped, never fatal to the read:
   member drops out until its next beat stamps the key again. A holder of the
   key file can mint any record.
 
-Each skipped record counts once per read in
-`ravel_query_worker_record_rejects_total{mode,reason}`, under `missing_mac`
-(no MAC), `bad_mac` (a MAC that does not parse or verifies under no key),
-`oversize` (more than 4 KiB) or `malformed` (empty, not a record, or a body
-that names another key). A record skipped only because its stamp is outside
-the liveness window is not counted. A rising `bad_mac` during a key rotation
+Each rejected record counts once per read in
+`ravel_query_worker_record_rejects_total{mode,reason}`, under the first check
+it fails: `oversize` (more than 4096 bytes, not decoded), `malformed` (empty,
+not a record, or a body that names another key), `missing_mac` (no MAC),
+`bad_mac` (a MAC that does not parse or verifies under no key), or
+`stale_stamp` (a record that verifies but whose stamp is outside the liveness
+window although the listing does not show its object as older than that: a
+replayed older record or a clock skewed past the window). Three skips are not counted: a key that is
+not a UUID, a key whose listed modification time is already outside the
+liveness window (it is not fetched, see below), and a verified drained record,
+which every graceful shutdown writes. A rising `bad_mac` during a key rotation
 means some node mints under a key that the reading node does not hold.
 A node from a release before record MACs writes none, so during a rolling
 upgrade an upgraded node skips it as `missing_mac` until it is upgraded too,
@@ -904,7 +922,7 @@ beside `mode`.
 | `ravel_distrib_fragment_requests_total` | counter | Inbound slice fetches this process served for other coordinators. |
 | `ravel_distrib_fragment_auth_failures_total` | counter | Inbound `Resolve`-scope federation requests whose presented credential did not resolve to a tenant. It does not count `Pinned` capability rejections: those are `ravel_distrib_fragment_capability_rejects_total`, and reach the coordinator as re-dispatch and fallback. |
 | `ravel_distrib_fragment_capability_rejects_total{reason}` | counter | Inbound `Pinned` fragment requests this worker refused at fragment capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `tenant_mismatch`, `query_mismatch`. What each reason counts is defined in [the observability guide](observability.md#distributed-read-fan-out-ravel_distrib_). A rising `bad_mac` during a key rotation means some coordinator is minting under a key this worker does not hold. A `Pinned` fetch refused on the public listener is refused before verification and counted under no reason. |
-| `ravel_query_worker_record_rejects_total{reason}` | counter | Sibling `sys/query/workers/` records this node's live-set reads skipped because they did not authenticate, one series per reason, each rendered from zero: `missing_mac`, `bad_mac`, `oversize`, `malformed`. Each read counts each skipped record once, so a forged record left in place grows the counter once per heartbeat interval on every node. A record skipped only for a stale stamp is not counted. See [the live set](#the-live-set). |
+| `ravel_query_worker_record_rejects_total{reason}` | counter | Sibling `sys/query/workers/` records this node's live-set reads rejected, one series per reason, each rendered from zero: `missing_mac`, `bad_mac`, `oversize`, `malformed`, `stale_stamp`. Each read counts each rejected record once, so a forged record left in place is counted on every read until its object ages past the liveness window, about three reads per node at the defaults, and from then on it is skipped before the GET. A key skipped by its listed modification time and a verified drained record are not counted; a fetched record that verifies but whose stamp is outside the liveness window is `stale_stamp`. See [the live set](#the-live-set). |
 | `ravel_sql_slice_tls_dials_total` | counter | Outbound SQL slice `DoGet` fetches this coordinator dialed over TLS to the dedicated fragment listener of a worker, one per slice fetch sent, a re-dispatch included. Defined in [the observability guide](observability.md#sql-slice-tls-dials-ravel_sql_slice_tls_dials_total). Absent on a process that serves no Flight SQL. |
 | `ravel_sql_slice_rejects_total{reason}` | counter | Inbound SQL slice `DoGet` requests refused at slice capability verification, one series per reason, each rendered from zero: `missing`, `bad_mac`, `expired`, `wrong_surface`. What each reason counts, and which refusals are counted under none, is defined in [the observability guide](observability.md#sql-slice-capability-rejects-ravel_sql_slice_rejects_total). Absent on a process that serves no Flight SQL. |
 | `ravel_distrib_fragment_inflight{class}` | gauge | Fragments in flight now, split by admission class. `class="pinned"` riding at `--max-inflight-fragments` or `class="resolve"` riding at `--max-inflight-federated-resolves` means that class's inbound slices are queueing; the two never contend for the same permits. |

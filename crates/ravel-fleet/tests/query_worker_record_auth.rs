@@ -358,6 +358,28 @@ async fn drained_sibling_is_skipped_uncounted() {
     assert_eq!(rejects(&reader), [0, 0, 0, 0, 0]);
 }
 
+/// A signed heartbeat object still decodes as a plain `QueryWorkerRecord`,
+/// which ignores the `mac` field, so a reader from before record MACs keeps
+/// admitting an upgraded node during a rolling deploy.
+#[tokio::test]
+async fn signed_object_decodes_as_a_plain_record() {
+    let store = MemoryStore::new();
+    let sibling = worker(&[KEY_A]);
+    sibling.write_heartbeat(&store, NOW).await.expect("beat");
+    let bytes = object(&store, &sibling).await;
+    assert!(String::from_utf8_lossy(&bytes).contains("\"mac\""));
+    let decoded = QueryWorkerRecord::decode(&bytes).expect("decodes without the mac");
+    assert_eq!(
+        decoded,
+        QueryWorkerRecord {
+            process_id: sibling.process_id().to_string(),
+            fragment_endpoint: "10.0.0.1:9443".to_string(),
+            protocol_version: 5,
+            started_unix_ns: NOW,
+        }
+    );
+}
+
 /// An empty key list cannot build a `RecordKeys`.
 #[test]
 fn empty_key_list_fails_construction() {
