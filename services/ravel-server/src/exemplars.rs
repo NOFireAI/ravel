@@ -1241,11 +1241,14 @@ impl Envelope {
 /// Mirrors `ravel_query::http`'s private `json::QueryStatsJson` field for
 /// field, minus the two parts that do not exist on this path: `estimate`
 /// (`estimate_cost` is private to `ravel-query`, and an estimate is only ever
-/// computed from a real resolved snapshot, never assumed) and the
-/// `rawF64Pages`/`rawF64Bytes` page counters (this endpoint reads whole
-/// objects and decodes one `EXEMPLARS` section, never a value page, so they
-/// would be a permanently-zero field, which `ravel-query`'s own accounting
-/// JSON explicitly refuses to carry).
+/// computed from a real resolved snapshot, never assumed) and three
+/// accounting counters this path can never move, each of which would be a
+/// permanently-zero field, which `ravel-query`'s own accounting JSON
+/// explicitly refuses to carry: the `rawF64Pages`/`rawF64Bytes` page
+/// counters (this endpoint reads whole objects and decodes one `EXEMPLARS`
+/// section, never a value page) and `lateServedBytes` (only the
+/// `ravel-query` fetchers' cache single flight serves a read late, and this
+/// endpoint reads the store directly).
 #[derive(Debug, Default, Serialize)]
 pub struct QueryStatsJson {
     #[serde(rename = "segmentsFetched")]
@@ -1255,9 +1258,10 @@ pub struct QueryStatsJson {
     accounting: QueryAccountingJson,
 }
 
-/// Actual per-request store/decode counters, the ADR-0044 cost surface. Field
-/// names match `/api/v1/query`'s `stats.accounting` exactly, so one collector
-/// reads both endpoints.
+/// Actual per-request store/decode counters, the ADR-0044 cost surface. Every
+/// field name here is one `/api/v1/query`'s `stats.accounting` uses, so one
+/// collector reads both endpoints; the fields left out are listed on
+/// [`QueryStatsJson`].
 #[derive(Debug, Default, Serialize)]
 struct QueryAccountingJson {
     #[serde(rename = "s3GetRequests")]
@@ -1278,8 +1282,6 @@ struct QueryAccountingJson {
     cache_misses: u64,
     #[serde(rename = "cacheBytes")]
     cache_bytes: u64,
-    #[serde(rename = "lateServedBytes")]
-    late_served_bytes: u64,
     #[serde(rename = "decompressedBytes")]
     decompressed_bytes: u64,
     #[serde(rename = "segmentsOpened")]
@@ -1304,7 +1306,6 @@ impl QueryAccountingJson {
             cache_hits: snapshot.cache_hits,
             cache_misses: snapshot.cache_misses,
             cache_bytes: snapshot.cache_bytes,
-            late_served_bytes: snapshot.late_served_bytes,
             decompressed_bytes: snapshot.decompressed_bytes,
             segments_opened: snapshot.segments_opened,
             series_matched: snapshot.series_matched,
@@ -3148,10 +3149,13 @@ mod tests {
         );
     }
 
-    /// `QueryAccountingJson` names every field `/api/v1/query`'s
-    /// `stats.accounting` names, and no other, so one collector reads both.
+    /// `QueryAccountingJson` carries every field of the server's own
+    /// accounting shape (`crate::query::accounting_stats_json`, which the SQL
+    /// endpoints render) except `lateServedBytes`, which this path never
+    /// moves. A field added there fails this test until it is added here or
+    /// listed as an exclusion on [`QueryStatsJson`].
     #[test]
-    fn accounting_json_names_the_same_fields_as_query_stats() {
+    fn accounting_json_names_the_server_accounting_fields_but_late_served() {
         let snapshot = QueryAccountingSnapshot::default();
         let ours =
             serde_json::to_value(QueryAccountingJson::from_snapshot(&snapshot)).expect("serialize");
@@ -3164,6 +3168,8 @@ mod tests {
             k.sort();
             k
         };
-        assert_eq!(keys(&ours), keys(&theirs["accounting"]));
+        let mut expected = keys(&theirs["accounting"]);
+        expected.retain(|k| k != "lateServedBytes");
+        assert_eq!(keys(&ours), expected);
     }
 }
