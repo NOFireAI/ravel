@@ -522,6 +522,7 @@ pub async fn start_ingest_server(
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        otap_max_decoded_batch_bytes: ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig {
             defaults: unlimited_admission(),

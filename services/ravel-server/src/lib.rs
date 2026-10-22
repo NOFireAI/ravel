@@ -602,6 +602,12 @@ pub struct ServerConfig {
     /// the service. Has no effect at all when built without the `otap`
     /// feature. `main` sets it from the `--otap` flag (`config::Cli::otap`).
     pub otap: bool,
+    /// The decoded bytes one OTAP `BatchArrowRecords` may hold across its
+    /// payloads; each stream's decoder is built with it. Has no effect when
+    /// built without the `otap` feature. `main` sets it from
+    /// `--otap-max-decoded-batch-bytes`
+    /// (`config::Cli::otap_max_decoded_batch_bytes`).
+    pub otap_max_decoded_batch_bytes: u64,
     /// Tenant admission limits resolved from `--limits-file` (ADR-0051
     /// section 3), fed into the single shared `AdmissionController` [`start`]
     /// constructs: `defaults` becomes the controller's baseline and each
@@ -3999,8 +4005,11 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             // tonic's own 4 MiB default happens to be stricter today, but the
             // cap must be explicit here rather than relying on that default
             // silently doing our job.
-            ArrowMetricsServiceServer::new(otap_grpc::GrpcArrowMetricsService::new(state.clone()))
-                .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
+            ArrowMetricsServiceServer::new(otap_grpc::GrpcArrowMetricsService::new(
+                state.clone(),
+                config.otap_max_decoded_batch_bytes,
+            ))
+            .max_decoding_message_size(MAX_DECODED_MESSAGE_BYTES)
         });
 
     // The gRPC listener carries OTLP ingest, so gateway modes always bind it.
@@ -5583,6 +5592,7 @@ mod startup_test_support {
             alerting: AlertEvalConfig::default(),
             oidc_refresh: None,
             otap: false,
+            otap_max_decoded_batch_bytes: crate::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
             limits: LimitsConfig::default(),
             metrics_tenant_labels: false,
             deployment_key: None,

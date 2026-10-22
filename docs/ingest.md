@@ -1346,8 +1346,9 @@ Four layers, each enforced before the allocation it bounds, in this order:
    the cap is set explicitly rather than left to that upstream default.
    The decoded Arrow IPC body bytes of one batch, summed across its
    payloads, are bounded separately by
-   `StreamConfig::max_decoded_batch_bytes` (64 MiB by default): a batch
-   that would cross it is refused before the crossing payload is decoded.
+   `StreamConfig::max_decoded_batch_bytes`, set from
+   `--otap-max-decoded-batch-bytes` (64 MiB by default): a batch that would
+   cross it is refused before the crossing payload is decoded.
 2. **Byte rate.** `check_byte_rate`, on wire body bytes, after tenant
    resolution and before decode. HTTP and gRPC each decode independently
    before calling into the shared normalize/write path, so this check has
@@ -1684,10 +1685,12 @@ terms:
    only the snappy inflate that produces the 64 MiB decompressed input. The wire
    body that produces all of it is separately capped at 16 MiB
    (`MAX_REQUEST_BODY_BYTES`), so the RW2 amplification to size for is 16 MiB on
-   the wire to as much as 1 GiB retained. The other uncharged decoded bodies
-   stay at their 16 MiB caps (OTLP gRPC / OTAP / identity HTTP); neither
-   inflate buffer is part of that product, since both are bounded by
-   `--max-ingest-buffer-bytes` instead.
+   the wire to as much as 1 GiB retained. The OTLP gRPC and identity HTTP
+   decoded bodies stay at their 16 MiB caps. OTAP's is the decoded IPC body
+   bytes of one in-flight batch, bounded by `--otap-max-decoded-batch-bytes`
+   (64 MiB by default), so the OTAP term of that product is the ceiling times
+   that flag's value, not 16 MiB. Neither inflate buffer is part of that
+   product, since both are bounded by `--max-ingest-buffer-bytes` instead.
 3. **Fixed overhead**: shard-actor and router state, the admission
    controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
    all bounded independently of ingest volume. Independent of ingest volume is
