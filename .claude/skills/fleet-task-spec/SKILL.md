@@ -214,10 +214,13 @@ each tool call is its own shell and a variable set in one call is empty
 in the next.
 
 If the guard exits non-zero, say so in your report and stop rather than
-picking another directory: a cold workspace gate writes 54 to 70 GB of
-target (CLAUDE.md's measured band; the largest lane completed in 56 GB),
+picking another directory: a cold gate writes 54 to 70 GB of target
+when its closure runs no feature lane, and each feature lane adds about
+55 GB more in the same target (CLAUDE.md's measured band; gates reaching
+the sql, flight-sql, esql and ravel-bench lanes measured 93 to 186 GB),
 so a host without 70 GB free cannot be trusted to finish the template's
-scripts/gates.sh -p run, and the run would die mid-link with a fake compiler
+scripts/gates.sh -p run. A spec whose `--dry-run` lists those lanes asks
+for 190 and says so. Short of that, the run dies mid-link with a fake compiler
 error (two gate runs died at link on a shared executor volume another
 task filled mid-run; 5 GB was the old floor and it measured nothing the
 gate needed). Scoped does not mean small: the closure of a crate low in
