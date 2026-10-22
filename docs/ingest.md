@@ -1344,6 +1344,10 @@ Four layers, each enforced before the allocation it bounds, in this order:
    the tonic service is therefore the explicit per-message bound for OTAP
    too; tonic's own 4 MiB default is stricter than our 16 MiB cap today, but
    the cap is set explicitly rather than left to that upstream default.
+   The decoded Arrow IPC body bytes of one batch, summed across its
+   payloads, are bounded separately by
+   `StreamConfig::max_decoded_batch_bytes` (64 MiB by default): a batch
+   that would cross it is refused before the crossing payload is decoded.
 2. **Byte rate.** `check_byte_rate`, on wire body bytes, after tenant
    resolution and before decode. HTTP and gRPC each decode independently
    before calling into the shared normalize/write path, so this check has
@@ -1665,7 +1669,8 @@ terms:
    per request by tonic's `max_decoding_message_size`, 16 MiB here), and the
    OTAP zstd payload buffers (bounded per payload by `StreamConfig`'s
    `max_decompressed_payload_bytes`, 16 MiB, with one such buffer per payload
-   in a batch), none of which the buffer budget charges. So
+   in a batch; `max_decoded_batch_bytes` bounds the decoded IPC bodies, not
+   these buffers), none of which the buffer budget charges. So
    the worst-case transient decode memory bounded only by
    `--max-inflight-ingest-requests` is still that ceiling times the largest
    *uncharged* decoded body. On the Remote Write RW2 path that body is not the
