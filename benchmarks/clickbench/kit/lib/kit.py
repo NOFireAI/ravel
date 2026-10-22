@@ -1268,7 +1268,7 @@ def _memory_gauges(body):
     (name and labels as exposed)."""
     out = {}
     for line in body.splitlines():
-        if not line.startswith(MEMORY_METRICS):
+        if line.split("{", 1)[0].split(" ", 1)[0] not in MEMORY_METRICS:
             continue
         try:
             series, value = line.rsplit(None, 1)
@@ -1423,6 +1423,14 @@ def healthz_summary(phase, d):
                       % (phase, d, "; ".join(sorted(set(bad)))))
     lines.append("HEARTBEAT phase=%s n=%d failures=%d bad=%d max_s=%.3f"
                  % (phase, len(scrapes), failures, len(bad), max(ages)))
+    # A warning, not a refusal: an arm on a server older than these gauges
+    # still runs, but a rename that empties every scrape is not silent.
+    usable = [r for r in scrapes if r.get("ok")]
+    empty = sum(1 for r in usable if not r.get("memory"))
+    if empty:
+        sys.stderr.write("kit: healthz-summary: warning: %d of %d usable /metrics scrapes for "
+                         "phase %s in %s carried none of %s\n"
+                         % (empty, len(usable), phase, d, ", ".join(MEMORY_METRICS)))
     return lines
 
 

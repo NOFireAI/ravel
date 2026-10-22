@@ -407,6 +407,9 @@ def handler(role):
                     except OSError:
                         age = "0.5"
                     body += 'ravel_health_heartbeat_age_seconds{mode="x"} %s\n' % age
+                body += 'ravel_process_allocator_bytes{mode="x",stat="allocated"} 123\n'
+                body += 'ravel_memory_reserved_bytes{mode="x",component="sql"} 7\n'
+                body += 'ravel_memory_budget_refusals_total{mode="x"} 9\n'
                 return self.answer(200, body)
             return self.answer(404, "no such path\n")
     return H
@@ -1263,6 +1266,44 @@ else
   fail "healthz bad scrapes" "mixed '$mixed', usable '$usable', allbad '$allbad'"
 fi
 
+# Catches: usable /metrics scrapes that carried none of the memory gauges (a
+# server-side rename, or a gauge moved behind a feature) passing without a
+# word, which leaves a memory death's bundle unreadable; or the warning
+# firing when the gauges are there.
+s_mem='{"gated": true, "ok": true, "answered": true, "status": 200, "error": "", "heartbeat_s": 0.3, "memory": {"ravel_memory_budget_bytes{mode=\"x\"}": 1.0}}'
+hz_synthetic memempty "$s_ok" "$s_mem" "$s_404"
+memempty="$code $(grep '^HEARTBEAT' "$TMP/healthz-syn-memempty/summary") | $(cat "$TMP/healthz-syn-memempty/summary.err")"
+hz_synthetic memfull "$s_mem" "$s_404"
+memfull="$code $(cat "$TMP/healthz-syn-memfull/summary.err")"
+if [ "${memempty%% |*}" = "0 HEARTBEAT phase=benchmark n=3 failures=0 bad=1 max_s=0.700" ] \
+  && case "$memempty" in *"warning: 1 of 2 usable /metrics scrapes for phase benchmark in $TMP/healthz-syn-memempty carried none of ravel_process_allocator_bytes"*) true ;; *) false ;; esac \
+  && [ "$memfull" = "0 " ]; then
+  pass "a phase whose usable /metrics scrapes lack the memory gauges is summarised with a warning naming the count, and one that has them is not"
+else
+  fail "healthz memory gauges" "memempty '$memempty', memfull '$memfull'"
+fi
+
+# Catches: the memory parser keeping a series it should not (a name that only
+# shares a prefix, a comment line) or splitting a label value with a space.
+mem="$(python3 -c 'import sys
+sys.path.insert(0, sys.argv[1])
+import kit
+body = "\n".join([
+    "# HELP ravel_process_allocator_bytes x",
+    "ravel_process_allocator_bytes{mode=\"x\",stat=\"resident\"} 5",
+    "ravel_memory_budget_refusals_total{mode=\"x\"} 3",
+    "ravel_cache_resident_entries{mode=\"x\",cache=\"fetch\"} 2",
+    "ravel_cache_resident_bytes{mode=\"x\",cache=\"a b\"} 4",
+    "ravel_memory_gate_available_floor_bytes{mode=\"x\"} 6",
+    "ravel_memory_reserved_bytes_total{mode=\"x\"} 8",
+])
+print(sorted(kit._memory_gauges(body).items()))' "$KIT_SRC/lib")"
+if [ "$mem" = "[('ravel_cache_resident_bytes{mode=\"x\",cache=\"a b\"}', 4.0), ('ravel_process_allocator_bytes{mode=\"x\",stat=\"resident\"}', 5.0)]" ]; then
+  pass "the memory parser keeps only the named gauge families, with labels intact"
+else
+  fail "memory parser" "$mem"
+fi
+
 # Catches: a request body without an explicit window (the server's default is
 # the last hour, which would hide the load), a window other than 200000 h, a
 # window that differs between statements or from the provenance stamp, or a
@@ -1379,6 +1420,15 @@ esac
 # off (box-a's), which would report it at startup.
 mkdir -p "$TMP/evidence-a"
 tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-a"
+# Every usable /metrics sample keeps exactly the stub's memory gauges, and
+# not the refusals counter that shares their family prefix.
+cat >"$TMP/memory-check.py" <<'PY'
+import json, sys
+want = {'ravel_process_allocator_bytes{mode="x",stat="allocated"}': 123.0,
+        'ravel_memory_reserved_bytes{mode="x",component="sql"}': 7.0}
+recs = [r for r in map(json.loads, open(sys.argv[1])) if r.get("ok")]
+print(bool(recs) and all(r.get("memory") == want for r in recs))
+PY
 token="$(sed -n 's/^KIT_TENANT_TOKEN=//p' "$BOX_A/kit/secrets.env")"
 secret="$(sed -n 's/^RUSTFS_SECRET_KEY=//p' "$BOX_A/kit/secrets.env")"
 access="$(sed -n 's/^RUSTFS_ACCESS_KEY=//p' "$BOX_A/kit/secrets.env")"
@@ -1397,10 +1447,12 @@ if [ "$audit_off_ok" = 1 ] && [ -f "$TMP/evidence-a/server-1.log" ] && [ -f "$TM
   && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/run.log" \
   && grep -qF 'access_key=[redacted] secret_key=[redacted]' "$TMP/evidence-a/server-1.log" \
   && ! grep -rqF -e "$token" -e "$secret" -e "$access" "$TMP/evidence-a" "$OUT_A" \
-  && [ ! -e "$TMP/evidence-a/secrets.env" ] && [ ! -e "$TMP/evidence-a/auth.header" ]; then
-  pass "evidence.tgz holds server logs, samplers, raw healthz samples and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
+  && [ ! -e "$TMP/evidence-a/secrets.env" ] && [ ! -e "$TMP/evidence-a/auth.header" ] \
+  && [ -s "$TMP/evidence-a/kernel.log" ] \
+  && [ "$(python3 "$TMP/memory-check.py" "$TMP/evidence-a/out/benchmark/healthz/metrics.jsonl")" = True ]; then
+  pass "evidence.tgz holds server logs, samplers, raw healthz samples with the memory gauges, the kernel log and object counts, no box secret is uploaded, and an audit_mode off server gets no audit key"
 else
-  fail "evidence" "audit key kept from an audit_mode off server: $audit_off_ok; $(tar -tzf "$OUT_A/evidence.tgz" | head -n 20 | tr '\n' ' ')"
+  fail "evidence" "audit key kept from an audit_mode off server: $audit_off_ok; kernel.log bytes $(wc -c <"$TMP/evidence-a/kernel.log" 2>&1); memory gauges kept: $(python3 "$TMP/memory-check.py" "$TMP/evidence-a/out/benchmark/healthz/metrics.jsonl" 2>&1); $(tar -tzf "$OUT_A/evidence.tgz" | head -n 20 | tr '\n' ' ')"
 fi
 mv "$OUT_A" "$TMP/fixture-pass"
 
