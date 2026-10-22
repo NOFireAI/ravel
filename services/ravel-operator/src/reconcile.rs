@@ -185,6 +185,63 @@ pub enum RenderError {
     )]
     MaintainKeySecretRefMissing,
 
+    /// `spec.query.memoryBudgetBytes` is set, and the query container has no
+    /// memory limit (`limit` is `None`) or one below the budget plus `held`,
+    /// what `--mode query` keeps outside its budget. Such a pod cannot hold
+    /// the budget even if every allocation were charged. Captured as
+    /// [`QueryMemoryBudgetCheck::Refused`], so the controller leaves the
+    /// running query Deployment unchanged and the other tiers keep
+    /// reconciling.
+    #[error("{}", query_budget_exceeds_limit_message(*.budget, *.held, *.limit))]
+    QueryMemoryBudgetExceedsLimit {
+        /// `spec.query.memoryBudgetBytes`.
+        budget: u64,
+        /// [`QUERY_HELD_OUTSIDE_BUDGET_BYTES`].
+        held: u64,
+        /// The parsed `resources.limits.memory`, or `None` when unset.
+        limit: Option<u64>,
+    },
+
+    /// `spec.query.memoryBudgetBytes` is set and the query container's
+    /// `resources.limits.memory` is not a Kubernetes quantity, so the budget
+    /// cannot be checked against it. Refused the same way as
+    /// [`RenderError::QueryMemoryBudgetExceedsLimit`].
+    #[error(
+        "spec.query.memoryBudgetBytes is set but the query container's memory limit {value:?} \
+         (spec.query.resources.limits.memory) is not a Kubernetes quantity: {reason}. The query \
+         Deployment is not applied until it parses, and a running one is left unchanged"
+    )]
+    QueryMemoryLimitUnparseable {
+        /// The limit as the spec wrote it.
+        value: String,
+        /// Why it did not parse.
+        reason: String,
+    },
+
+    /// The query container's memory limit covers `spec.query.memoryBudgetBytes`
+    /// plus what `--mode query` holds outside it, but not the headroom above
+    /// that. Advisory: captured as [`QueryMemoryBudgetCheck::HeadroomLow`],
+    /// the query Deployment still applies, and the controller reports it.
+    #[error(
+        "the query container's memory limit of {limit} bytes is less than {headroom} bytes above \
+         spec.query.memoryBudgetBytes plus the memory ravel-server holds outside its budget \
+         ({budget_plus_held} bytes), so the query pods can exceed the limit under concurrent SQL. \
+         The headroom is {}; set spec.query.memoryHeadroomBytes to override it, or raise the \
+         limit to at least {} bytes. The query Deployment runs with the pinned budget",
+        if *.explicit { "spec.query.memoryHeadroomBytes" } else { "the provisional default for this budget" },
+        u128::from(*.budget_plus_held) + u128::from(*.headroom)
+    )]
+    QueryMemoryHeadroomLow {
+        /// The parsed `resources.limits.memory`.
+        limit: u64,
+        /// `spec.query.memoryBudgetBytes` plus [`QUERY_HELD_OUTSIDE_BUDGET_BYTES`].
+        budget_plus_held: u64,
+        /// `spec.query.memoryHeadroomBytes`, or the default for the budget.
+        headroom: u64,
+        /// Whether the headroom came from `spec.query.memoryHeadroomBytes`.
+        explicit: bool,
+    },
+
     /// `spec.storage.s3.auth` is `podIdentity` but the operator runs without
     /// `--credentials-sidecar-image`, so it has no image for the credentials
     /// sidecar every pod needs. Nothing renders, the qualify Job included:
@@ -218,6 +275,23 @@ pub enum RenderError {
         /// The tier whose override is set: `gateway`, `query` or `maintain`.
         tier: &'static str,
     },
+}
+
+/// The [`RenderError::QueryMemoryBudgetExceedsLimit`] message, which differs
+/// for a missing limit and a small one.
+fn query_budget_exceeds_limit_message(budget: u64, held: u64, limit: Option<u64>) -> String {
+    let floor = u128::from(budget) + u128::from(held);
+    let found = match limit {
+        None => "the query container has no memory limit".to_string(),
+        Some(limit) => format!("the query container's memory limit is {limit} bytes"),
+    };
+    format!(
+        "spec.query.memoryBudgetBytes is {budget} bytes and {found} \
+         (spec.query.resources.limits.memory); the limit must be at least {floor} bytes, the \
+         budget plus the {held} bytes ravel-server holds outside its budget in --mode query. \
+         Raise the limit or lower the budget. The query Deployment is not applied until then, \
+         and a running one is left unchanged"
+    )
 }
 
 /// HTTP listener port (OTLP/HTTP, query API, and the `/healthz` `/readyz`
@@ -1719,7 +1793,202 @@ fn running_fold_interval_secs(spec: &RavelClusterSpec) -> Option<u64> {
         .and_then(|f| f.interval_secs)
 }
 
-/// The query Deployment: `--mode query`, HTTP listener, tenant tokens, and,
+/// What `ravel-server --mode query` holds outside its memory budget: the
+/// 256 MiB `NON_BUDGET_BASELINE_BYTES` (crates/ravel-maintain/src/config.rs,
+/// re-exported by services/ravel-server/src/config.rs).
+/// `non_budget_floor_bytes` there returns the baseline alone when the mode
+/// holds no ingest buffer, and `Mode::holds_ingest_buffer` is false for
+/// `query`. A query pod's memory limit must cover the pinned budget plus this
+/// (ADR-1170, issue #3200 amendment).
+pub const QUERY_HELD_OUTSIDE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The budget at and above which the default headroom's retention term stops
+/// growing: the 8 GB budget ADR-2633 measured retention at, taken as 8 GiB.
+const RETENTION_MEASURED_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// The default `spec.query.memoryHeadroomBytes` for a pinned budget `budget`:
+/// `ceil(0.53 * budget) + ceil(min(budget, 8 GiB) * 6.6 / 8)` (ADR-1170, issue
+/// #3200 amendment). Provisional: a workaround for issue #3181, expected to
+/// drop when that is fixed in 0.26.
+///
+/// - `0.53 * budget` is the SQL aggregation and logs-scan state the budget
+///   does not charge: up to 12.7 GB in the #3181 heap profiles at a 24 GiB
+///   budget with ten connections (PR #3194).
+/// - The second term is allocator-retained pages: 6.0 to 6.63 GB at peak in
+///   ADR-2633's 8 GB runs with ten connections. Retention follows allocator
+///   churn, not the budget, so it stays at 6.6 GiB from 8 GiB up. Below that it
+///   scales with the budget, since retained pages are freed allocations and
+///   cannot exceed the peak allocation; that scaling is unmeasured.
+pub fn default_query_memory_headroom(budget: u64) -> u64 {
+    let budget = u128::from(budget);
+    let sql_state = (budget * 53).div_ceil(100);
+    let retained = (budget.min(u128::from(RETENTION_MEASURED_BUDGET_BYTES)) * 33).div_ceil(40);
+    u64::try_from(sql_state + retained).unwrap_or(u64::MAX)
+}
+
+/// Parse a Kubernetes memory quantity (`3.5Gi`, `3584Mi`, `3758096384`,
+/// `4G`) into bytes, rounded up to a whole byte as Kubernetes rounds a
+/// quantity's integer value. Accepts the binary suffixes `Ki` to `Ei`, the
+/// decimal suffixes `n`, `u`, `m`, `k`, `M`, `G`, `T`, `P`, `E`, and a
+/// decimal exponent (`1e9`, `1E9`). The error says why the value is refused.
+pub fn parse_memory_quantity(value: &str) -> Result<u64, String> {
+    let unsigned = value.strip_prefix('+').unwrap_or(value);
+    if unsigned.starts_with('-') {
+        return Err("a memory limit cannot be negative".to_string());
+    }
+    let number_end = unsigned
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(unsigned.len());
+    let (number, suffix) = unsigned.split_at(number_end);
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, ""));
+    if (whole.is_empty() && fraction.is_empty()) || fraction.contains('.') {
+        return Err("it does not start with a number".to_string());
+    }
+    let too_large = || "the value is too large".to_string();
+    let mut mantissa: u128 = 0;
+    for digit in whole.bytes().chain(fraction.bytes()) {
+        mantissa = mantissa
+            .checked_mul(10)
+            .and_then(|m| m.checked_add(u128::from(digit - b'0')))
+            .ok_or_else(too_large)?;
+    }
+    let fraction_digits = u32::try_from(fraction.len()).map_err(|_| too_large())?;
+    // `value = mantissa * numerator / denominator`, rounded up.
+    let pow10 = |exp: u32| 10u128.checked_pow(exp).ok_or_else(too_large);
+    let mut denominator = pow10(fraction_digits)?;
+    let numerator = match suffix {
+        "" => 1,
+        "Ki" | "Mi" | "Gi" | "Ti" | "Pi" | "Ei" => {
+            let exp = match suffix {
+                "Ki" => 1,
+                "Mi" => 2,
+                "Gi" => 3,
+                "Ti" => 4,
+                "Pi" => 5,
+                _ => 6,
+            };
+            1024u128.pow(exp)
+        }
+        "n" | "u" | "m" => {
+            denominator = denominator
+                .checked_mul(pow10(match suffix {
+                    "n" => 9,
+                    "u" => 6,
+                    _ => 3,
+                })?)
+                .ok_or_else(too_large)?;
+            1
+        }
+        "k" => pow10(3)?,
+        "M" => pow10(6)?,
+        "G" => pow10(9)?,
+        "T" => pow10(12)?,
+        "P" => pow10(15)?,
+        "E" => pow10(18)?,
+        _ => {
+            let exponent = suffix
+                .strip_prefix(['e', 'E'])
+                .and_then(|e| e.parse::<i32>().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "{suffix:?} is not a quantity suffix (use Ki, Mi, Gi, Ti, Pi, Ei, or k, \
+                         M, G, T, P, E)"
+                    )
+                })?;
+            let magnitude = pow10(exponent.unsigned_abs())?;
+            if exponent < 0 {
+                denominator = denominator.checked_mul(magnitude).ok_or_else(too_large)?;
+                1
+            } else {
+                magnitude
+            }
+        }
+    };
+    let bytes = mantissa
+        .checked_mul(numerator)
+        .ok_or_else(too_large)?
+        .div_ceil(denominator);
+    u64::try_from(bytes).map_err(|_| too_large())
+}
+
+/// `Degraded` reason for [`RenderError::QueryMemoryBudgetExceedsLimit`].
+pub const QUERY_MEMORY_BUDGET_EXCEEDS_LIMIT_REASON: &str = "QueryMemoryBudgetExceedsLimit";
+/// `Degraded` reason for [`RenderError::QueryMemoryLimitUnparseable`].
+pub const QUERY_MEMORY_LIMIT_UNPARSEABLE_REASON: &str = "QueryMemoryLimitUnparseable";
+/// `Degraded` reason for [`RenderError::QueryMemoryHeadroomLow`].
+pub const QUERY_MEMORY_HEADROOM_LOW_REASON: &str = "QueryMemoryHeadroomLow";
+
+/// What `spec.query.memoryBudgetBytes` asks of one pass (ADR-1170, issue
+/// #3200 amendment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryMemoryBudgetCheck {
+    /// `memoryBudgetBytes` is unset: nothing renders and nothing is checked.
+    Unset,
+    /// The limit covers the budget, the memory held outside it, and the
+    /// headroom.
+    Clear,
+    /// The limit covers the budget and the memory held outside it but not the
+    /// headroom ([`RenderError::QueryMemoryHeadroomLow`]). The query
+    /// Deployment still applies; the controller reports `Degraded`.
+    HeadroomLow(RenderError),
+    /// No limit, an unparseable one, or one below the budget plus the memory
+    /// held outside it ([`RenderError::QueryMemoryBudgetExceedsLimit`],
+    /// [`RenderError::QueryMemoryLimitUnparseable`]). The controller does not
+    /// apply the query Deployment and reports `Degraded`.
+    Refused(RenderError),
+}
+
+/// Check the query container's `resources.limits.memory` against
+/// `spec.query.memoryBudgetBytes`: below the budget plus
+/// [`QUERY_HELD_OUTSIDE_BUDGET_BYTES`] (or no limit, or one that does not
+/// parse) is refused, and below that plus the headroom
+/// (`memoryHeadroomBytes`, else [`default_query_memory_headroom`]) is
+/// reported.
+pub fn query_memory_budget_check(spec: &RavelClusterSpec) -> QueryMemoryBudgetCheck {
+    let Some(budget) = spec.query.memory_budget_bytes else {
+        return QueryMemoryBudgetCheck::Unset;
+    };
+    let held = QUERY_HELD_OUTSIDE_BUDGET_BYTES;
+    let raw_limit = spec
+        .query
+        .resources
+        .as_ref()
+        .and_then(|r| r.limits.as_ref())
+        .and_then(|limits| limits.get("memory"));
+    let limit = match raw_limit.map(|raw| (raw, parse_memory_quantity(raw))) {
+        None => None,
+        Some((_, Ok(limit))) => Some(limit),
+        Some((raw, Err(reason))) => {
+            return QueryMemoryBudgetCheck::Refused(RenderError::QueryMemoryLimitUnparseable {
+                value: raw.clone(),
+                reason,
+            });
+        }
+    };
+    let floor = u128::from(budget) + u128::from(held);
+    let Some(limit) = limit.filter(|limit| u128::from(*limit) >= floor) else {
+        return QueryMemoryBudgetCheck::Refused(RenderError::QueryMemoryBudgetExceedsLimit {
+            budget,
+            held,
+            limit,
+        });
+    };
+    let explicit_headroom = spec.query.memory_headroom_bytes;
+    let headroom = explicit_headroom.unwrap_or_else(|| default_query_memory_headroom(budget));
+    if u128::from(limit) < floor + u128::from(headroom) {
+        QueryMemoryBudgetCheck::HeadroomLow(RenderError::QueryMemoryHeadroomLow {
+            limit,
+            budget_plus_held: budget.saturating_add(held),
+            headroom,
+            explicit: explicit_headroom.is_some(),
+        })
+    } else {
+        QueryMemoryBudgetCheck::Clear
+    }
+}
+
+/// The query Deployment: `--mode query`, HTTP listener, tenant tokens,
+/// `--memory-budget-bytes` when `spec.query.memoryBudgetBytes` is set, and,
 /// under an enabled and complete `spec.query.distributedQuery`, the
 /// distributed-query flags, the fragment listener port, and the four Secret
 /// mounts. RollingUpdate strategy.
@@ -1743,6 +2012,12 @@ pub fn desired_query_deployment(
     if let Some(secs) = running_fold_interval_secs(spec) {
         args.push("--fold-lag-interval-secs".to_string());
         args.push(secs.to_string());
+    }
+    // Rendered whatever `query_memory_budget_check` says: a refused limit
+    // withholds the apply in the controller, not the flag here.
+    if let Some(budget) = spec.query.memory_budget_bytes {
+        args.push("--memory-budget-bytes".to_string());
+        args.push(budget.to_string());
     }
 
     let tier_override = spec.query.credentials_secret_ref.as_ref();
@@ -4188,6 +4463,12 @@ pub struct DesiredObjects {
     /// carry none of the distributed-query rendering, and the controller
     /// records a `Degraded` condition naming the missing fields.
     pub distributed_query_render_error: Option<RenderError>,
+    /// The query container's memory limit against
+    /// `spec.query.memoryBudgetBytes`. On [`QueryMemoryBudgetCheck::Refused`]
+    /// the controller does not apply `query_deployment`; on
+    /// [`QueryMemoryBudgetCheck::HeadroomLow`] it applies it and reports
+    /// `Degraded`.
+    pub query_memory_budget: QueryMemoryBudgetCheck,
     /// What this pass does with the maintain Deployment.
     pub maintain: MaintainTier,
     /// One PodDisruptionBudget per rendered tier (issue #126, deliverable 4).
@@ -4215,7 +4496,9 @@ pub struct DesiredObjects {
 /// misconfigured router degrades only the router and every other tier still
 /// reconciles. Both paths end at a `Degraded` condition; they differ only in
 /// blast radius. A maintain tier enabled without `maintain.keySecretRef` is
-/// captured the same way, as [`MaintainTier::Withheld`].
+/// captured the same way, as [`MaintainTier::Withheld`], and so is a query
+/// memory limit that does not fit `spec.query.memoryBudgetBytes`, as
+/// [`DesiredObjects::query_memory_budget`].
 pub fn desired_objects(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -4293,6 +4576,7 @@ pub fn desired_objects(
         query_service: desired_query_service(spec, instance),
         query_network_policy,
         distributed_query_render_error,
+        query_memory_budget: query_memory_budget_check(spec),
         maintain: match desired_maintain_deployment(spec, instance, ctx) {
             Ok(Some(deployment)) => MaintainTier::Apply(Box::new(deployment)),
             Ok(None) => MaintainTier::Disabled,
@@ -4360,6 +4644,8 @@ mod tests {
                 resources: None,
                 credentials_secret_ref: None,
                 distributed_query: None,
+                memory_budget_bytes: None,
+                memory_headroom_bytes: None,
             },
             maintain: MaintainSpec {
                 enabled: true,
@@ -11069,5 +11355,311 @@ mod tests {
                 objects.maintain
             );
         }
+    }
+
+    /// The stg-1 values from the guide's worked example: a 1.5 GiB budget.
+    const STG1_BUDGET: u64 = 1_610_612_736;
+    /// 3.5 Gi, the stg-1 query limit.
+    const STG1_LIMIT: u64 = 3_758_096_384;
+
+    /// `base_spec` with the query container's memory limit set to `limit`
+    /// (request 2 Gi) and the budget and headroom fields as given.
+    fn memory_spec(
+        limit: Option<&str>,
+        budget: Option<u64>,
+        headroom: Option<u64>,
+    ) -> RavelClusterSpec {
+        let mut spec = base_spec();
+        spec.query.resources = Some(ResourceRequirementsSpec {
+            requests: Some(BTreeMap::from([("memory".to_string(), "2Gi".to_string())])),
+            limits: limit.map(|l| BTreeMap::from([("memory".to_string(), l.to_string())])),
+        });
+        spec.query.memory_budget_bytes = budget;
+        spec.query.memory_headroom_bytes = headroom;
+        spec
+    }
+
+    /// The blake3 of a query Deployment's JSON.
+    fn query_render_hash(spec: &RavelClusterSpec) -> String {
+        let deployment = desired_query_deployment(spec, "prod", &ctx());
+        blake3::hash(
+            serde_json::to_string(&deployment)
+                .expect("serializes")
+                .as_bytes(),
+        )
+        .to_hex()
+        .to_string()
+    }
+
+    /// Issue #3200: with `memoryBudgetBytes` unset the query Deployment is
+    /// byte-identical to what the operator rendered before the field existed.
+    /// The hashes were taken from the render at 35d957d81, with and without a
+    /// memory limit; `memoryHeadroomBytes` alone changes nothing either.
+    /// Guarding line: the `if let Some(budget)` around `--memory-budget-bytes`
+    /// in `desired_query_deployment`.
+    #[test]
+    fn unset_memory_budget_renders_the_query_deployment_byte_identical() {
+        let before_base = "8dd388d49b621b16038eace2f47d8f4544ad9e4009fb2c9557dc18e3b82dd3da";
+        let before_limited = "84480b2160dc44fe4551c39c1a9e4c93a9aea5e98d25f698b4124333c1406bc7";
+        assert_eq!(query_render_hash(&base_spec()), before_base);
+        assert_eq!(
+            query_render_hash(&memory_spec(Some("3.5Gi"), None, None)),
+            before_limited
+        );
+        assert_eq!(
+            query_render_hash(&memory_spec(Some("3.5Gi"), None, Some(1 << 30))),
+            before_limited,
+            "memoryHeadroomBytes without a budget renders nothing"
+        );
+        assert_eq!(
+            query_memory_budget_check(&memory_spec(None, None, Some(1 << 30))),
+            QueryMemoryBudgetCheck::Unset,
+            "and checks nothing, so an unset budget never withholds the query Deployment"
+        );
+    }
+
+    /// Issue #3200: `memoryBudgetBytes` renders `--memory-budget-bytes` once,
+    /// on the query container, and the rest of the query Deployment is
+    /// unchanged. The gateway, maintain and qualify renders do not carry it.
+    #[test]
+    fn memory_budget_renders_only_on_the_query_container() {
+        let unset = memory_spec(Some("3.5Gi"), None, None);
+        let set = memory_spec(Some("3.5Gi"), Some(STG1_BUDGET), None);
+        let q = args_of(&desired_query_deployment(&set, "prod", &ctx()));
+        assert_eq!(
+            arg_value(&q, "--memory-budget-bytes").as_deref(),
+            Some("1610612736")
+        );
+        assert_eq!(
+            q.iter().filter(|a| *a == "--memory-budget-bytes").count(),
+            1
+        );
+
+        // Removing the flag pair gives back the unset render exactly.
+        let mut without_flag = desired_query_deployment(&set, "prod", &ctx());
+        let container = &mut without_flag
+            .spec
+            .as_mut()
+            .expect("spec")
+            .template
+            .spec
+            .as_mut()
+            .expect("pod spec")
+            .containers[0];
+        let args = container.args.as_mut().expect("args");
+        let at = args
+            .iter()
+            .position(|a| a == "--memory-budget-bytes")
+            .expect("the flag");
+        args.drain(at..at + 2);
+        assert_eq!(
+            without_flag,
+            desired_query_deployment(&unset, "prod", &ctx())
+        );
+
+        let rendered_elsewhere = serde_json::to_string(&serde_json::json!({
+            "gateway": desired_gateway_deployment(&set, "prod", &ctx()),
+            "maintain": desired_maintain_deployment(&set, "prod", &ctx())
+                .expect("maintain renders")
+                .expect("maintain enabled"),
+            "qualify": desired_qualify_job(&set, "prod", Some("rv-1"), None),
+        }))
+        .expect("serializes");
+        assert!(
+            !rendered_elsewhere.contains("memory-budget"),
+            "only the query container carries the budget"
+        );
+    }
+
+    /// The default headroom at the two budgets the ADR-1170 amendment names:
+    /// 1.5 GiB (stg-1) and 24 GiB (the #3181 profiles), and at the 8 GiB
+    /// point where the retention term stops growing.
+    #[test]
+    fn default_query_memory_headroom_is_pinned_at_named_budgets() {
+        // ceil(0.53 * 1.5 GiB) = 853,624,751; ceil(1.5 GiB * 33/40) = 1,328,755,508.
+        assert_eq!(default_query_memory_headroom(STG1_BUDGET), 2_182_380_259);
+        // ceil(0.53 * 24 GiB) = 13,657,996,002; ceil(8 GiB * 33/40) = 7,086,696,039.
+        assert_eq!(
+            default_query_memory_headroom(24 * (1 << 30)),
+            20_744_692_041
+        );
+        assert_eq!(default_query_memory_headroom(8 * (1 << 30)), 11_639_361_373);
+        assert_eq!(default_query_memory_headroom(0), 0);
+        assert_eq!(
+            default_query_memory_headroom(u64::MAX),
+            9_776_774_366_152_758_395,
+            "the largest budget computes without overflow"
+        );
+    }
+
+    #[test]
+    fn memory_quantities_parse_with_binary_and_decimal_suffixes() {
+        for (value, bytes) in [
+            ("3.5Gi", 3_758_096_384),
+            ("3584Mi", 3_758_096_384),
+            ("3758096384", 3_758_096_384),
+            ("4G", 4_000_000_000),
+            ("2Gi", 2_147_483_648),
+            ("512Ki", 524_288),
+            ("1Ti", 1 << 40),
+            ("1.5k", 1_500),
+            ("+1M", 1_000_000),
+            (".5Ki", 512),
+            ("1e9", 1_000_000_000),
+            ("1E3", 1_000),
+            ("0", 0),
+            // Kubernetes rounds a fractional byte count up.
+            ("1500m", 2),
+            ("0.1", 1),
+        ] {
+            assert_eq!(parse_memory_quantity(value), Ok(bytes), "{value}");
+        }
+        for value in [
+            "", "Gi", "abc", "-1Gi", "1Zi", "1.2.3", "1 Gi", "1gi", "1e", "16Ei",
+        ] {
+            assert!(
+                parse_memory_quantity(value).is_err(),
+                "{value:?} must be refused"
+            );
+        }
+    }
+
+    /// The three outcomes of the limit check and their boundaries: below
+    /// `budget + held` (or no limit, or an unparseable one) refuses, from
+    /// `budget + held` up to `budget + held + headroom` reports, and from
+    /// there up is clear.
+    #[test]
+    fn query_memory_budget_check_refuses_reports_and_clears_at_the_boundaries() {
+        let held = QUERY_HELD_OUTSIDE_BUDGET_BYTES;
+        assert_eq!(held, 268_435_456, "the server's 256 MiB baseline");
+        let floor = STG1_BUDGET + held;
+        let headroom = default_query_memory_headroom(STG1_BUDGET);
+        let check = |limit: &str| {
+            query_memory_budget_check(&memory_spec(Some(limit), Some(STG1_BUDGET), None))
+        };
+
+        assert_eq!(
+            query_memory_budget_check(&memory_spec(None, Some(STG1_BUDGET), None)),
+            QueryMemoryBudgetCheck::Refused(RenderError::QueryMemoryBudgetExceedsLimit {
+                budget: STG1_BUDGET,
+                held,
+                limit: None,
+            })
+        );
+        let mut no_resources = base_spec();
+        no_resources.query.memory_budget_bytes = Some(STG1_BUDGET);
+        assert!(
+            matches!(
+                query_memory_budget_check(&no_resources),
+                QueryMemoryBudgetCheck::Refused(RenderError::QueryMemoryBudgetExceedsLimit {
+                    limit: None,
+                    ..
+                })
+            ),
+            "the default resources render no limit"
+        );
+        assert_eq!(
+            check(&(floor - 1).to_string()),
+            QueryMemoryBudgetCheck::Refused(RenderError::QueryMemoryBudgetExceedsLimit {
+                budget: STG1_BUDGET,
+                held,
+                limit: Some(floor - 1),
+            })
+        );
+        assert!(matches!(
+            check("lots"),
+            QueryMemoryBudgetCheck::Refused(RenderError::QueryMemoryLimitUnparseable { .. })
+        ));
+        assert_eq!(
+            check(&floor.to_string()),
+            QueryMemoryBudgetCheck::HeadroomLow(RenderError::QueryMemoryHeadroomLow {
+                limit: floor,
+                budget_plus_held: floor,
+                headroom,
+                explicit: false,
+            })
+        );
+        assert!(matches!(
+            check(&(floor + headroom - 1).to_string()),
+            QueryMemoryBudgetCheck::HeadroomLow(_)
+        ));
+        assert_eq!(
+            check(&(floor + headroom).to_string()),
+            QueryMemoryBudgetCheck::Clear
+        );
+    }
+
+    /// The stg-1 example: 3.5 Gi clears the floor but not the default
+    /// headroom, and the report gives the limit, the budget plus held memory
+    /// and the headroom. An explicit `memoryHeadroomBytes` replaces the
+    /// default in both directions.
+    #[test]
+    fn explicit_memory_headroom_overrides_the_default() {
+        let report =
+            query_memory_budget_check(&memory_spec(Some("3.5Gi"), Some(STG1_BUDGET), None));
+        let QueryMemoryBudgetCheck::HeadroomLow(err) = report else {
+            panic!("the default headroom is not met at 3.5Gi: {report:?}");
+        };
+        let message = err.to_string();
+        for figure in ["3758096384", "1879048192", "2182380259", "4061428451"] {
+            assert!(message.contains(figure), "{figure}: {message}");
+        }
+        assert!(
+            message.contains("spec.query.memoryHeadroomBytes"),
+            "{message}"
+        );
+        assert!(message.contains("provisional default"), "{message}");
+
+        // 1 GiB fits in the 1.75 GiB above the floor.
+        assert_eq!(
+            query_memory_budget_check(&memory_spec(
+                Some("3.5Gi"),
+                Some(STG1_BUDGET),
+                Some(1 << 30)
+            )),
+            QueryMemoryBudgetCheck::Clear
+        );
+        // A larger explicit headroom reports even where the limit is ample for
+        // the default.
+        let ample = (STG1_LIMIT * 2).to_string();
+        assert_eq!(
+            query_memory_budget_check(&memory_spec(Some(&ample), Some(STG1_BUDGET), Some(8 << 30))),
+            QueryMemoryBudgetCheck::HeadroomLow(RenderError::QueryMemoryHeadroomLow {
+                limit: STG1_LIMIT * 2,
+                budget_plus_held: STG1_BUDGET + QUERY_HELD_OUTSIDE_BUDGET_BYTES,
+                headroom: 8 << 30,
+                explicit: true,
+            })
+        );
+        assert_eq!(
+            query_memory_budget_check(&memory_spec(Some(&ample), Some(STG1_BUDGET), None)),
+            QueryMemoryBudgetCheck::Clear
+        );
+    }
+
+    /// `desired_objects` carries the check, and a refused limit still renders
+    /// the query Deployment (with the flag) for the controller to withhold.
+    #[test]
+    fn desired_objects_carry_the_query_memory_budget_check() {
+        let refused = memory_spec(Some("1Gi"), Some(STG1_BUDGET), None);
+        let objects = desired_objects(&refused, "prod", "ns", &ctx()).expect("spec renders");
+        let QueryMemoryBudgetCheck::Refused(err) = &objects.query_memory_budget else {
+            panic!("1Gi is below the floor: {:?}", objects.query_memory_budget);
+        };
+        let message = err.to_string();
+        for needle in [
+            "spec.query.memoryBudgetBytes",
+            "1610612736",
+            "268435456",
+            "1073741824",
+        ] {
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+        assert_eq!(
+            arg_value(&args_of(&objects.query_deployment), "--memory-budget-bytes").as_deref(),
+            Some("1610612736")
+        );
+        let objects = desired_objects(&base_spec(), "prod", "ns", &ctx()).expect("spec renders");
+        assert_eq!(objects.query_memory_budget, QueryMemoryBudgetCheck::Unset);
     }
 }

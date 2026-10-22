@@ -784,6 +784,42 @@ pub struct QuerySpec {
     /// the distributed-query flags, mounts, or NetworkPolicy rendered.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distributed_query: Option<DistributedQuerySpec>,
+
+    /// Pins the query pods' memory budget: renders `--memory-budget-bytes`
+    /// with this value on the query container only (ADR-1170, issue #3200
+    /// amendment). Unset, no flag renders and the server derives its budget
+    /// from the pod's memory limit minus a reserve (a quarter of the limit
+    /// below 8 GiB, 2 GiB from 8 GiB up), so raising the limit raises the
+    /// budget with it and adds no headroom beyond that reserve. Set,
+    /// `resources.limits.memory` must be at least this value plus the 256 MiB
+    /// the server holds outside its budget in `--mode query`.
+    /// A missing, unparseable or smaller limit is refused: the query
+    /// Deployment is not applied (a running one is left unchanged) and the
+    /// cluster reports `Degraded` with reason `QueryMemoryBudgetExceedsLimit`
+    /// or `QueryMemoryLimitUnparseable`. A limit below that floor plus the
+    /// headroom (`memoryHeadroomBytes`) still rolls the Deployment and reports
+    /// `Degraded` with reason `QueryMemoryHeadroomLow`. Minimum 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_budget_bytes: Option<u64>,
+
+    /// Memory, in bytes, to leave in the query pods' limit above
+    /// `memoryBudgetBytes` plus the 256 MiB held outside the budget, for
+    /// allocations the budget does not charge. Ignored while `memoryBudgetBytes` is
+    /// unset. A limit below the floor plus this headroom reports `Degraded` with
+    /// reason `QueryMemoryHeadroomLow` but still rolls the query Deployment. Unset,
+    /// the operator uses a provisional default of `ceil(0.53 * budget) +
+    /// ceil(min(budget, 8 GiB) * 6.6 / 8)`: about 2.03 GiB at a 1.5 GiB budget and
+    /// 19.3 GiB at 24 GiB. The first term is uncharged SQL aggregation and
+    /// logs-scan state, up to 12.7 GB measured at a 24 GiB budget with ten
+    /// connections (issue #3181). The second is allocator-retained pages, up to 6.6
+    /// GB measured at an 8 GB budget (ADR-2633); retained pages are freed
+    /// allocations the allocator keeps, so they cannot exceed the process's peak
+    /// allocation, which is why the term scales down with smaller budgets. Below 8
+    /// GB that scaling is unmeasured: measure your own peak resident memory and set
+    /// this field. The default is a workaround for issue #3181 and drops when that
+    /// is fixed in 0.26.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_headroom_bytes: Option<u64>,
 }
 
 impl Default for QuerySpec {
@@ -793,6 +829,8 @@ impl Default for QuerySpec {
             resources: None,
             credentials_secret_ref: None,
             distributed_query: None,
+            memory_budget_bytes: None,
+            memory_headroom_bytes: None,
         }
     }
 }
@@ -1331,6 +1369,15 @@ fn inject_minimum_bounds(crd: &mut CustomResourceDefinition) {
                 }
             }
         }
+        // ravel-server refuses an explicit `--memory-budget-bytes 0` at
+        // startup: the cache ceilings leave no remainder of a zero budget.
+        if let Some(budget) = spec_props
+            .get_mut("query")
+            .and_then(|q| q.properties.as_mut())
+            .and_then(|p| p.get_mut("memoryBudgetBytes"))
+        {
+            budget.minimum = Some(1.0);
+        }
         // ravel-server refuses a zero `--maintain-interval-secs` and a zero
         // `--fold-interval-secs` at startup, since either would run its loop
         // without pause.
@@ -1790,6 +1837,26 @@ mod tests {
                 "{tier}.replicas must reject negative/zero"
             );
         }
+    }
+
+    #[test]
+    fn query_memory_budget_carries_minimum_one_bound() {
+        // ravel-server refuses an explicit --memory-budget-bytes 0 at startup;
+        // a zero headroom is a legitimate override and keeps schemars' 0.
+        let crd = ravel_cluster_crd();
+        let query_props = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|root| root.properties.as_ref())
+            .and_then(|props| props.get("spec"))
+            .and_then(|spec| spec.properties.as_ref())
+            .and_then(|props| props.get("query"))
+            .and_then(|query| query.properties.as_ref())
+            .expect("query props");
+        let minimum = |field: &str| query_props.get(field).expect(field).minimum;
+        assert_eq!(minimum("memoryBudgetBytes"), Some(1.0));
+        assert_eq!(minimum("memoryHeadroomBytes"), Some(0.0));
     }
 
     #[test]

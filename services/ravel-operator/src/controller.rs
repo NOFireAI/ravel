@@ -61,8 +61,10 @@ use crate::reconcile::{
     query_network_policy_during_rollout, s3_allow_http,
 };
 use crate::reconcile::{
-    MaintainTier, desired_tier_service_accounts, maintain_key_secret_name, pod_identity,
-    pod_identity_service_accounts_marker, tier_service_accounts_to_sweep, validate_storage_auth,
+    MaintainTier, QUERY_MEMORY_BUDGET_EXCEEDS_LIMIT_REASON, QUERY_MEMORY_HEADROOM_LOW_REASON,
+    QUERY_MEMORY_LIMIT_UNPARSEABLE_REASON, QueryMemoryBudgetCheck, desired_tier_service_accounts,
+    maintain_key_secret_name, pod_identity, pod_identity_service_accounts_marker,
+    tier_service_accounts_to_sweep, validate_storage_auth,
 };
 
 /// Server-side-apply field manager name.
@@ -721,7 +723,7 @@ async fn resolve_audit_token_key(
 }
 
 /// The query tier's `Deployment` to apply this pass, or `None` when it is held
-/// back. Two cases withhold it, and both leave any existing query Deployment
+/// back. Three cases withhold it, and all leave any existing query Deployment
 /// exactly as it is rather than rolling it to a spec whose pods cannot serve:
 ///
 /// - [`audit_token_key_missing`] (#1487 rework): a cluster with neither
@@ -729,12 +731,17 @@ async fn resolve_audit_token_key(
 ///   query Deployment that starts cleanly with audit tokenization enabled.
 /// - `distributed_query_secret_missing` (#2403): a referenced distributed-query
 ///   Secret does not exist, so a rolled pod would fail to mount it.
+/// - `memory_budget_refused` (#3200): `spec.query.memoryBudgetBytes` is set
+///   and the memory limit is missing, unparseable, or below the budget plus
+///   what the server holds outside it
+///   ([`crate::reconcile::QueryMemoryBudgetCheck::Refused`]).
 fn query_tier_apply_target(
     spec: &RavelClusterSpec,
     distributed_query_secret_missing: bool,
+    memory_budget_refused: bool,
     rendered: Deployment,
 ) -> Option<Deployment> {
-    if audit_token_key_missing(spec) || distributed_query_secret_missing {
+    if audit_token_key_missing(spec) || distributed_query_secret_missing || memory_budget_refused {
         None
     } else {
         Some(rendered)
@@ -744,7 +751,8 @@ fn query_tier_apply_target(
 /// The query tier's ready-replica count to report on `.status` this pass.
 ///
 /// When [`query_tier_apply_target`] withheld the apply (`query_held`: a missing
-/// audit-token key, or a missing distributed-query Secret), this pass never
+/// audit-token key, a missing distributed-query Secret, or a refused memory
+/// budget), this pass never
 /// touched the query Deployment, so `applied_ready` (which
 /// [`TierDeployments::apply_tier`] leaves `None` for a tier it never applied)
 /// says nothing about whether the cluster is actually serving; `live_ready`,
@@ -1969,10 +1977,6 @@ async fn reconcile_inner(
             None
         }
     };
-    // Same predicate `audit_token_key_env`/`query_tier_apply_target` use, so
-    // this pass's `Degraded` decision can never disagree with what actually
-    // got rendered and applied for the query tier.
-    let audit_key_missing = audit_token_key_missing(&obj.spec);
 
     // Resolve the distributed-query Secrets' resourceVersions. A missing one
     // does not abort the reconcile: it holds back only the query tier (see
@@ -1981,7 +1985,6 @@ async fn reconcile_inner(
     // keep serving.
     let distributed_query =
         resolve_distributed_query_resource_versions(client, namespace, &obj.spec).await?;
-    let distributed_query_secret_missing = distributed_query.holds_query_tier();
 
     // The maintain key Secret (ADR-3130 decision 5), resolved the same way: a
     // missing one withholds only the maintain tier.
@@ -2315,10 +2318,11 @@ async fn reconcile_inner(
     let applied_query_ready = tiers
         .applied(DeploymentTier::Query)
         .and_then(ready_replicas);
-    // When the query tier's apply was withheld (a missing audit-token key, or a
-    // missing distributed-query Secret), this pass never touched the query
-    // Deployment, so the live object read before the apply still describes it.
-    let query_held = audit_key_missing || distributed_query_secret_missing;
+    // When the query tier's apply was withheld (a missing audit-token key, a
+    // missing distributed-query Secret, or a refused memory budget), this pass
+    // never touched the query Deployment, so the live object read before the
+    // apply still describes it.
+    let query_held = tiers.query_withheld;
     let live_query_ready = live_query.as_ref().and_then(ready_replicas);
     let query_ready = effective_query_ready(query_held, applied_query_ready, live_query_ready);
     let waiting = plan.waiting_for_bootstrap(maintain_ready_before, request_serving_exists);
@@ -2481,9 +2485,15 @@ fn plan_render(
         }
         _ => None,
     };
+    let query_memory = std::mem::replace(
+        &mut desired.query_memory_budget,
+        QueryMemoryBudgetCheck::Unset,
+    );
+    let memory_budget_refused = matches!(query_memory, QueryMemoryBudgetCheck::Refused(_));
     let degraded = render_degraded(
         audit_token_key_missing(spec),
         distributed_query.secret_missing_degrade(),
+        query_memory,
         maintain_withheld,
         desired.distributed_query_render_error.take(),
         desired.router_render_error.take(),
@@ -2491,6 +2501,7 @@ fn plan_render(
     let tiers = TierDeployments::new(
         spec,
         distributed_query.holds_query_tier(),
+        memory_budget_refused,
         std::mem::take(&mut desired.gateway_deployment),
         std::mem::take(&mut desired.query_deployment),
         maintain,
@@ -2518,27 +2529,40 @@ struct TierDeployments {
     /// The maintain tier is enabled but withheld ([`MaintainTier::Withheld`]):
     /// its Deployment is neither applied nor deleted.
     maintain_withheld: bool,
+    /// The query Deployment is withheld ([`query_tier_apply_target`]), so its
+    /// readiness comes from the live object. Kept apart from `query`, which
+    /// the apply takes.
+    query_withheld: bool,
     /// The live object each applied tier came back as.
     applied: BTreeMap<&'static str, Deployment>,
 }
 
 impl TierDeployments {
     /// The tiers to apply this pass. The query Deployment is withheld
-    /// (`None`) when the audit-token-key is missing (#1487 rework) or a
-    /// referenced distributed-query Secret does not exist (#2403): any existing
-    /// query Deployment is left exactly as it is rather than rolled to a spec
-    /// whose pods could not start. Neither case touches the gateway or maintain
-    /// Deployment.
+    /// (`None`) when the audit-token-key is missing (#1487 rework), a
+    /// referenced distributed-query Secret does not exist (#2403), or the
+    /// query memory limit does not fit `spec.query.memoryBudgetBytes` (#3200):
+    /// any existing query Deployment is left exactly as it is rather than
+    /// rolled to a spec whose pods could not start or could not hold their
+    /// budget. No case touches the gateway or maintain Deployment.
     fn new(
         spec: &RavelClusterSpec,
         distributed_query_secret_missing: bool,
+        memory_budget_refused: bool,
         gateway: Deployment,
         query: Deployment,
         maintain: MaintainTier,
     ) -> Self {
+        let query = query_tier_apply_target(
+            spec,
+            distributed_query_secret_missing,
+            memory_budget_refused,
+            query,
+        );
         Self {
             gateway: Some(gateway),
-            query: query_tier_apply_target(spec, distributed_query_secret_missing, query),
+            query_withheld: query.is_none(),
+            query,
             maintain_disabled: matches!(maintain, MaintainTier::Disabled),
             maintain_withheld: matches!(maintain, MaintainTier::Withheld),
             maintain: maintain.into_deployment(),
@@ -3227,6 +3251,18 @@ fn degraded_reason(err: &Error) -> (String, String) {
         Error::Render(RenderError::MaintainKeySecretRefMissing) => {
             ("MaintainKeySecretRefMissing".to_string(), err.to_string())
         }
+        Error::Render(RenderError::QueryMemoryBudgetExceedsLimit { .. }) => (
+            QUERY_MEMORY_BUDGET_EXCEEDS_LIMIT_REASON.to_string(),
+            err.to_string(),
+        ),
+        Error::Render(RenderError::QueryMemoryLimitUnparseable { .. }) => (
+            QUERY_MEMORY_LIMIT_UNPARSEABLE_REASON.to_string(),
+            err.to_string(),
+        ),
+        Error::Render(RenderError::QueryMemoryHeadroomLow { .. }) => (
+            QUERY_MEMORY_HEADROOM_LOW_REASON.to_string(),
+            err.to_string(),
+        ),
         // The remedy is an operator flag, not a CR edit: the message names
         // `--credentials-sidecar-image` and its env.
         Error::Render(RenderError::CredentialsSidecarImageUnset) => {
@@ -3259,10 +3295,20 @@ fn degraded_reason(err: &Error) -> (String, String) {
 /// `spec.query.distributedQuery` ranks next (the query tier runs, but without
 /// the distribution its spec asks for); it and the missing-Secret case are
 /// mutually exclusive (an incomplete block references no Secret to miss). A
-/// router render error ranks last.
+/// router render error ranks next.
+///
+/// The two `spec.query.memoryBudgetBytes` reasons (#3200) rank apart. A
+/// refused limit holds the query Deployment back, so it ranks with the other
+/// query holds: below the audit-token key and the distributed-query Secret,
+/// whose pods could not start at all, and above a withheld maintain tier,
+/// since the query Deployment is the one serving reads. A low headroom ranks
+/// last: every reason above it describes something not running as the spec
+/// asks, while the query pods here run exactly as asked and the condition
+/// only warns.
 fn render_degraded(
     audit_key_missing: bool,
     query_secret_missing: Option<(String, String)>,
+    query_memory: QueryMemoryBudgetCheck,
     maintain_withheld: Option<(String, String)>,
     distributed_query_error: Option<RenderError>,
     router_error: Option<RenderError>,
@@ -3273,11 +3319,20 @@ fn render_degraded(
             AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
         ));
     }
-    if let Some(degrade) = query_secret_missing.or(maintain_withheld) {
+    let (memory_refused, headroom_low) = match query_memory {
+        QueryMemoryBudgetCheck::Refused(err) => (Some(err), None),
+        QueryMemoryBudgetCheck::HeadroomLow(err) => (None, Some(err)),
+        QueryMemoryBudgetCheck::Unset | QueryMemoryBudgetCheck::Clear => (None, None),
+    };
+    if let Some(degrade) = query_secret_missing
+        .or_else(|| memory_refused.map(|err| degraded_reason(&Error::Render(err))))
+        .or(maintain_withheld)
+    {
         return Some(degrade);
     }
     distributed_query_error
         .or(router_error)
+        .or(headroom_low)
         .map(|err| degraded_reason(&Error::Render(err)))
 }
 
@@ -3481,7 +3536,10 @@ fn gc_bootstrap_wait_status(
 /// A stalled wait outranks the render's entry, except while the maintain tier
 /// is withheld (no `maintain.keySecretRef`, or its Secret missing): then the
 /// wait is the withheld tier's consequence, no maintain pod exists to inspect,
-/// and the withheld-tier reason names the fix.
+/// and the withheld-tier reason names the fix. A query Deployment withheld for
+/// its memory limit does not get that exception: the stalled wait is about
+/// maintain, which holds the whole cluster, and the memory refusal shows once
+/// maintain is ready.
 fn pass_degraded_condition(
     degraded: Option<&(String, String)>,
     wait_status: Option<&GcBootstrapWaitStatus>,
@@ -3782,9 +3840,11 @@ mod tests {
         let missing = || RenderError::DistributedQuerySecretRefMissing {
             missing: vec!["fragmentCaSecretRef"],
         };
+        let unset = || QueryMemoryBudgetCheck::Unset;
         let (reason, message) = render_degraded(
             false,
             None,
+            unset(),
             None,
             Some(missing()),
             Some(RenderError::RouterImageMissing),
@@ -3796,19 +3856,23 @@ mod tests {
             "{message}"
         );
 
-        let (reason, _) =
-            render_degraded(true, None, None, Some(missing()), None).expect("a Degraded entry");
+        let (reason, _) = render_degraded(true, None, unset(), None, Some(missing()), None)
+            .expect("a Degraded entry");
         assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
         let (reason, _) = render_degraded(
             false,
             None,
+            unset(),
             None,
             None,
             Some(RenderError::RouterImageMissing),
         )
         .expect("a Degraded entry");
         assert_eq!(reason, "RouterImageMissing");
-        assert_eq!(render_degraded(false, None, None, None, None), None);
+        assert_eq!(
+            render_degraded(false, None, unset(), None, None, None),
+            None
+        );
 
         // A missing distributed-query Secret ranks below the audit key and above
         // a router error, and names the Secret. Guarding line: the
@@ -3823,6 +3887,7 @@ mod tests {
         let (reason, message) = render_degraded(
             false,
             secret_missing(),
+            unset(),
             None,
             None,
             Some(RenderError::RouterImageMissing),
@@ -3831,8 +3896,8 @@ mod tests {
         assert_eq!(reason, "SecretNotFound");
         assert!(message.contains("frag-ca"), "{message}");
         // The audit key still outranks it.
-        let (reason, _) =
-            render_degraded(true, secret_missing(), None, None, None).expect("a Degraded entry");
+        let (reason, _) = render_degraded(true, secret_missing(), unset(), None, None, None)
+            .expect("a Degraded entry");
         assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
     }
 
@@ -5631,11 +5696,11 @@ mod tests {
         });
         assert!(!audit_token_key_missing(&keyed));
         assert!(
-            query_tier_apply_target(&keyed, true, Deployment::default()).is_none(),
+            query_tier_apply_target(&keyed, true, false, Deployment::default()).is_none(),
             "a missing distributed-query Secret holds the query tier back"
         );
         assert!(
-            query_tier_apply_target(&keyed, false, Deployment::default()).is_some(),
+            query_tier_apply_target(&keyed, false, false, Deployment::default()).is_some(),
             "with the Secret present the query tier applies normally"
         );
     }
@@ -5661,6 +5726,7 @@ mod tests {
         let tiers = TierDeployments::new(
             &keyed,
             true,
+            false,
             named("rc-gateway"),
             named("rc-query"),
             MaintainTier::Apply(Box::new(named("rc-maintain"))),
@@ -5925,6 +5991,7 @@ mod tests {
         let (reason, _) = render_degraded(
             false,
             None,
+            QueryMemoryBudgetCheck::Unset,
             maintain(),
             None,
             Some(RenderError::RouterImageMissing),
@@ -5932,9 +5999,205 @@ mod tests {
         .expect("a Degraded entry");
         assert_eq!(reason, "MaintainKeySecretRefMissing");
         let query = Some(("SecretNotFound".to_string(), "frag-ca".to_string()));
-        let (reason, _) =
-            render_degraded(false, query, maintain(), None, None).expect("a Degraded entry");
+        let (reason, _) = render_degraded(
+            false,
+            query,
+            QueryMemoryBudgetCheck::Unset,
+            maintain(),
+            None,
+            None,
+        )
+        .expect("a Degraded entry");
         assert_eq!(reason, "SecretNotFound");
+    }
+
+    /// A keyed spec (so the audit key is present) with a pinned 1.5 GiB query
+    /// budget and the given query memory limit.
+    fn memory_budget_spec(limit: Option<&str>, headroom: Option<u64>) -> RavelClusterSpec {
+        let mut spec = spec_with_affinity(None);
+        spec.deployment_key_secret_ref = Some(LocalSecretRef {
+            name: "dk".to_string(),
+        });
+        spec.query.resources = Some(crate::crd::ResourceRequirementsSpec {
+            requests: None,
+            limits: limit.map(|l| BTreeMap::from([("memory".to_string(), l.to_string())])),
+        });
+        spec.query.memory_budget_bytes = Some(1_610_612_736);
+        spec.query.memory_headroom_bytes = headroom;
+        spec
+    }
+
+    fn plan_memory_budget(spec: &RavelClusterSpec) -> PassRender {
+        plan_render(
+            spec,
+            "rc",
+            "ns",
+            RenderCtx::default(),
+            &DistributedQueryResolution::Resolved(Vec::new()),
+            &MaintainKeyResolution::Resolved(Some("mk-1".to_string())),
+        )
+        .expect("spec renders")
+    }
+
+    /// Issue #3200: a query memory limit below the pinned budget plus the
+    /// 256 MiB held outside it, or no limit, withholds the query Deployment
+    /// only, records it as withheld so `Available` reads the live object, and
+    /// degrades with `QueryMemoryBudgetExceedsLimit` naming the field, the
+    /// limit, the budget and held. Guarding lines: the `memory_budget_refused`
+    /// disjunct in `query_tier_apply_target` and the `memory_refused` arm in
+    /// `render_degraded`.
+    #[test]
+    fn plan_render_withholds_only_the_query_deployment_on_a_refused_memory_budget() {
+        for (limit, names) in [(Some("1Gi"), "1073741824 bytes"), (None, "no memory limit")] {
+            let plan = plan_memory_budget(&memory_budget_spec(limit, None));
+            assert!(
+                plan.tiers.query.is_none(),
+                "{limit:?}: the query Deployment is withheld"
+            );
+            assert!(plan.tiers.query_withheld, "{limit:?}");
+            assert!(
+                plan.tiers.gateway.is_some(),
+                "{limit:?}: the gateway still applies"
+            );
+            assert!(
+                plan.tiers.maintain.is_some(),
+                "{limit:?}: maintain still applies"
+            );
+            let (reason, message) = plan.degraded.expect("a refused budget degrades");
+            assert_eq!(reason, "QueryMemoryBudgetExceedsLimit");
+            for needle in [
+                "spec.query.memoryBudgetBytes",
+                "1610612736",
+                "268435456",
+                "1879048192",
+                names,
+            ] {
+                assert!(message.contains(needle), "{limit:?} {needle}: {message}");
+            }
+        }
+
+        let plan = plan_memory_budget(&memory_budget_spec(Some("3.5 Gi"), None));
+        assert!(
+            plan.tiers.query.is_none(),
+            "an unparseable limit is withheld too"
+        );
+        let (reason, message) = plan.degraded.expect("an unparseable limit degrades");
+        assert_eq!(reason, "QueryMemoryLimitUnparseable");
+        assert!(message.contains("\"3.5 Gi\""), "{message}");
+    }
+
+    /// Issue #3200: a limit above the floor but below the default headroom
+    /// still applies the query Deployment, with the flag, and degrades with
+    /// `QueryMemoryHeadroomLow` giving the limit, the budget plus held memory,
+    /// and the headroom. An explicit `memoryHeadroomBytes` that fits clears
+    /// it. Guarding lines: the `headroom_low` fallback in `render_degraded`,
+    /// and `memory_headroom_bytes` in `query_memory_budget_check`.
+    #[test]
+    fn plan_render_applies_the_query_deployment_and_reports_low_headroom() {
+        let plan = plan_memory_budget(&memory_budget_spec(Some("3.5Gi"), None));
+        assert!(!plan.tiers.query_withheld);
+        let args = plan
+            .tiers
+            .query
+            .as_ref()
+            .and_then(|d| d.spec.as_ref())
+            .and_then(|s| s.template.spec.as_ref())
+            .and_then(|p| p.containers[0].args.clone())
+            .expect("the query Deployment applies");
+        let at = args
+            .iter()
+            .position(|a| a == "--memory-budget-bytes")
+            .expect("the flag renders");
+        assert_eq!(args[at + 1], "1610612736");
+        let (reason, message) = plan.degraded.expect("low headroom degrades");
+        assert_eq!(reason, "QueryMemoryHeadroomLow");
+        for needle in [
+            "3758096384",
+            "1879048192",
+            "2182380259",
+            "spec.query.memoryHeadroomBytes",
+        ] {
+            assert!(message.contains(needle), "{needle}: {message}");
+        }
+
+        let plan = plan_memory_budget(&memory_budget_spec(Some("3.5Gi"), Some(1 << 30)));
+        assert!(plan.tiers.query.is_some());
+        assert_eq!(plan.degraded, None, "a 1 GiB headroom fits in 3.5Gi");
+    }
+
+    /// Where the two #3200 reasons rank in the pass's single `Degraded`
+    /// entry: the refusal below a missing query Secret and above a withheld
+    /// maintain tier, the headroom report below a router render error.
+    #[test]
+    fn query_memory_reasons_rank_between_the_query_holds_and_last() {
+        let refused = || {
+            QueryMemoryBudgetCheck::Refused(RenderError::QueryMemoryBudgetExceedsLimit {
+                budget: 1,
+                held: 2,
+                limit: None,
+            })
+        };
+        let low = || {
+            QueryMemoryBudgetCheck::HeadroomLow(RenderError::QueryMemoryHeadroomLow {
+                limit: 3,
+                budget_plus_held: 3,
+                headroom: 1,
+                explicit: false,
+            })
+        };
+        let maintain = || {
+            Some(degraded_reason(&Error::Render(
+                RenderError::MaintainKeySecretRefMissing,
+            )))
+        };
+        let query_secret = || Some(("SecretNotFound".to_string(), "frag-ca".to_string()));
+        let reason = |entry: Option<(String, String)>| entry.expect("a Degraded entry").0;
+
+        assert_eq!(
+            reason(render_degraded(
+                false,
+                None,
+                refused(),
+                maintain(),
+                None,
+                None
+            )),
+            "QueryMemoryBudgetExceedsLimit"
+        );
+        assert_eq!(
+            reason(render_degraded(
+                false,
+                query_secret(),
+                refused(),
+                None,
+                None,
+                None
+            )),
+            "SecretNotFound"
+        );
+        assert_eq!(
+            reason(render_degraded(true, None, refused(), None, None, None)),
+            AUDIT_TOKEN_KEY_MISSING_REASON
+        );
+        assert_eq!(
+            reason(render_degraded(
+                false,
+                None,
+                low(),
+                None,
+                None,
+                Some(RenderError::RouterImageMissing),
+            )),
+            "RouterImageMissing"
+        );
+        assert_eq!(
+            reason(render_degraded(false, None, low(), None, None, None)),
+            "QueryMemoryHeadroomLow"
+        );
+        assert_eq!(
+            render_degraded(false, None, QueryMemoryBudgetCheck::Clear, None, None, None),
+            None
+        );
     }
 
     /// The `Degraded` condition a fresh per-role cluster records once its
@@ -6347,7 +6610,7 @@ mod tests {
             "the Degraded message must name the field and the 64-hex requirement"
         );
         assert!(
-            query_tier_apply_target(&missing, false, Deployment::default()).is_none(),
+            query_tier_apply_target(&missing, false, false, Deployment::default()).is_none(),
             "the query tier's Deployment must be withheld from apply when the audit key is missing"
         );
 
@@ -6356,7 +6619,7 @@ mod tests {
             name: "audit-key".to_string(),
         });
         assert!(
-            query_tier_apply_target(&explicit_only, false, Deployment::default()).is_some(),
+            query_tier_apply_target(&explicit_only, false, false, Deployment::default()).is_some(),
             "an explicit ref must let the query tier apply normally"
         );
 
@@ -6365,7 +6628,7 @@ mod tests {
             name: "dk".to_string(),
         });
         assert!(
-            query_tier_apply_target(&keyed_only, false, Deployment::default()).is_some(),
+            query_tier_apply_target(&keyed_only, false, false, Deployment::default()).is_some(),
             "a deploymentKeySecretRef must let the query tier apply normally"
         );
 
@@ -6374,7 +6637,7 @@ mod tests {
             name: "audit-key".to_string(),
         });
         assert!(
-            query_tier_apply_target(&both, false, Deployment::default()).is_some(),
+            query_tier_apply_target(&both, false, false, Deployment::default()).is_some(),
             "both refs set must let the query tier apply normally"
         );
     }
