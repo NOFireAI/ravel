@@ -4053,7 +4053,7 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
     // No assertion here forbids a Get from reaching a `.dreq`. This pass parses
     // request bodies from their KEYS and never fetches one, but
     // `collect_pending_erasure_requests`
-    // (crates/ravel-maintain/src/erasure_rewrite.rs:147) GETs each `.dreq` to
+    // (crates/ravel-maintain/src/erasure_rewrite.rs) GETs each `.dreq` to
     // decode it, under the same Maintain identity, so the shape is justified
     // outside this function and is asserted by
     // `erasure_lifecycle_calls_outside_the_sweep_are_reachable`.
@@ -4070,15 +4070,15 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
 /// - Maintain GETs each pending `.dreq` to decode it:
 ///   `let got = store.get(&key, GetRange::Full).await?` in
 ///   `collect_pending_erasure_requests`
-///   (`crates/ravel-maintain/src/erasure_rewrite.rs:147`).
+///   (`crates/ravel-maintain/src/erasure_rewrite.rs`).
 /// - Maintain PUTs the completion record: `write_erasure_completion`
-///   (`services/ravel-server/src/maintain.rs:2358`) builds
+///   (`services/ravel-server/src/maintain.rs`) builds
 ///   `del/<request_id>.done` and puts it. Without this the sweep's
 ///   `completions.get(request_id)` always misses, every request counts as
 ///   kept, and no `.dreq` is ever deleted -- the delete grant is reachable and
 ///   still never fires.
 /// - Admin PUTs the request itself: `ravel-cli erase submit`
-///   (`services/ravel-cli/src/erase.rs:136`).
+///   (`services/ravel-cli/src/erase.rs`).
 ///
 /// Admin's LIST and GET already span `del/` through its blanket `t/*`, so
 /// only its PUT is asserted here.
@@ -4102,20 +4102,20 @@ fn erasure_lifecycle_calls_outside_the_sweep_are_reachable() {
             maintain_gets.iter().any(|p| glob_matches(p, &dreq)),
             "maintain: no GetObject Allow reaches the request object {dreq:?}, \
              which collect_pending_erasure_requests GETs to decode the subject \
-             predicate (erasure_rewrite.rs:147). The rewrite pass is refused \
+             predicate (erasure_rewrite.rs). The rewrite pass is refused \
              before it can erase anything. Grants: {maintain_gets:?}"
         );
         assert!(
             maintain_puts.iter().any(|p| glob_matches(p, &done)),
             "maintain: no PutObject Allow reaches the completion record \
-             {done:?}, which write_erasure_completion writes (maintain.rs:2358). \
+             {done:?}, which write_erasure_completion writes (maintain.rs). \
              With no .done the sweep counts every request as kept and deletes \
              no .dreq, so the delete grant never fires. Grants: {maintain_puts:?}"
         );
         assert!(
             admin_puts.iter().any(|p| glob_matches(p, &dreq)),
             "admin: no PutObject Allow reaches the request object {dreq:?}, \
-             which `ravel-cli erase submit` writes (erase.rs:136). No erasure \
+             which `ravel-cli erase submit` writes (erase.rs). No erasure \
              request can be submitted at all. Grants: {admin_puts:?}"
         );
     }
@@ -4163,19 +4163,19 @@ fn erasure_lifecycle_calls_outside_the_sweep_are_reachable() {
 /// #1847 each shipped a grant whose own listing was refused.
 ///
 /// - `sweep_orphans` (rule 1) builds `dest = quarantine_key(&meta.key, ...)`
-///   (sweep.rs:687) and calls `quarantine_object`, which GETs the LIVE object
-///   (`store.get(src, GetRange::Full)`, sweep.rs:762) and PUTs the copy
-///   (`store.put(dest, ...)`, sweep.rs:767).
+///   (sweep.rs) and calls `quarantine_object`, which GETs the LIVE object
+///   (`store.get(src, GetRange::Full)`, sweep.rs) and PUTs the copy
+///   (`store.put(dest, ...)`, sweep.rs).
 /// - `sweep_orphans` then deletes the live key (`store.delete(&meta.key)`,
-///   sweep.rs:690), copy-first and delete-second.
+///   sweep.rs), copy-first and delete-second.
 /// - `sweep_quarantine` (rule 1b, the reaper) LISTs the shard's quarantine
-///   prefix (`list_all(store, &quarantine_l0_data_prefix(...))`, sweep.rs:901)
+///   prefix (`list_all(store, &quarantine_l0_data_prefix(...))`, sweep.rs)
 ///   and DELETEs each copy past the second horizon
-///   (`store.delete(&meta.key)`, sweep.rs:921).
+///   (`store.delete(&meta.key)`, sweep.rs).
 ///
 /// Two of the five need a grant no `t/`-rooted pattern can give.
 /// `QUARANTINE_PREFIX` is a TOP-LEVEL key space alongside `t/` and `sys/`
-/// (sweep.rs:812), and under `StringLike` the literal `t/` in every other
+/// (sweep.rs), and under `StringLike` the literal `t/` in every other
 /// pattern anchors at the start of the key, so `quarantine/t/...` matches none
 /// of them -- asserted below rather than argued. IAM being default-deny, the
 /// reaper was refused at its `ListBucket` and the sweep's copy at its `PutObject`
@@ -4200,50 +4200,50 @@ fn maintain_template_covers_every_quarantine_call() {
         let copy = quarantine_key(live);
         let prefix = quarantine_l0_data_prefix(live);
 
-        // Call 1: quarantine_object GETs the live object (sweep.rs:762).
+        // Call 1: quarantine_object GETs the live object (sweep.rs).
         assert!(
             gets.iter().any(|p| glob_matches(p, live)),
             "maintain: no GetObject Allow reaches the live object {live:?}, which \
-             quarantine_object reads before it can copy it (sweep.rs:762). \
+             quarantine_object reads before it can copy it (sweep.rs). \
              Nothing is quarantined and, fail-closed, nothing is deleted. \
              Grants: {gets:?}"
         );
 
-        // Call 2: quarantine_object PUTs the copy (sweep.rs:767).
+        // Call 2: quarantine_object PUTs the copy (sweep.rs).
         assert!(
             puts.iter().any(|p| glob_matches(p, &copy)),
             "maintain: no PutObject Allow reaches the quarantine copy {copy:?}, \
-             which quarantine_object writes (sweep.rs:767). Every candidate's \
+             which quarantine_object writes (sweep.rs). Every candidate's \
              copy fails, so the sweep counts it refused and leaves it live \
              forever: orphan GC never collects anything (#1957). Grants: {puts:?}"
         );
 
-        // Call 3: sweep_orphans deletes the live key, copy-first (sweep.rs:690).
+        // Call 3: sweep_orphans deletes the live key, copy-first (sweep.rs).
         assert!(
             deletes.iter().any(|p| glob_matches(p, live)),
             "maintain: no delete Allow reaches the live object {live:?}, which \
-             sweep_orphans deletes once its copy landed (sweep.rs:690). The \
+             sweep_orphans deletes once its copy landed (sweep.rs). The \
              object stays live with a quarantine copy beside it. \
              Grants: {deletes:?}"
         );
 
-        // Call 4: the reaper LISTs the shard's quarantine prefix (sweep.rs:901).
+        // Call 4: the reaper LISTs the shard's quarantine prefix (sweep.rs).
         assert!(
             list_prefixes.iter().any(|p| glob_matches(p, &prefix)),
             "maintain: no ListBucket s3:prefix admits {prefix:?}, the prefix \
-             sweep_quarantine passes to list_all (sweep.rs:901). The reaper is \
+             sweep_quarantine passes to list_all (sweep.rs). The reaper is \
              refused with AccessDenied before it sees a single copy, so the \
              quarantine prefix grows without bound and its delete grant is \
              unreachable (#1957). s3:prefix values: {list_prefixes:?}"
         );
 
         // Call 5: the reaper deletes a copy past the second horizon
-        // (sweep.rs:921).
+        // (sweep.rs).
         assert!(
             deletes.iter().any(|p| glob_matches(p, &copy)),
             "maintain: no delete Allow reaches the quarantine copy {copy:?}, \
              which sweep_quarantine deletes past quarantine_horizon_ns \
-             (sweep.rs:921). This is the only place orphan-GC'd data is \
+             (sweep.rs). This is the only place orphan-GC'd data is \
              physically removed, so without it the prefix leaks forever \
              (ADR-0058 decision 6). Grants: {deletes:?}"
         );
@@ -4365,17 +4365,18 @@ fn maintain_template_covers_every_quarantine_call() {
 /// maintain tick in `services/ravel-server/src/maintain.rs`:
 ///
 /// - `WorkerSet::write_heartbeat` PUTs this process's own key
-///   (`store.put(&heartbeat_key(...), ..., PutMode::Overwrite)`,
-///   worker_set.rs:358).
+///   (`store.put(&heartbeat_key(...), ..., PutMode::Overwrite)`).
 /// - `WorkerSet::live_set_read` LISTs the whole prefix
-///   (`list_all(store, WORKERS_PREFIX)`, worker_set.rs:403) and GETs each
-///   sibling whose LIST metadata is inside the liveness window
-///   (`store.get(&meta.key, GetRange::Full)`, worker_set.rs:424).
+///   (`list_all(store, WORKERS_PREFIX)`) and, through `read_sibling`, GETs
+///   each sibling whose LIST metadata is inside the liveness window. The GET
+///   is `read_bounded` in `crates/ravel-fleet/src/record_auth.rs`, a range
+///   read of the first `MAX_RECORD_BYTES + 1` bytes
+///   (`GetRange::Range(0, MAX_RECORD_BYTES + 1)`).
 /// - `WorkerSet::reap_keys` DELETEs each key past the reap horizon
-///   (`store.delete(key)`, worker_set.rs:463), from the candidates that same
-///   listing already produced. `services/ravel-server/src/maintain.rs:1111` is
-///   the production caller; `WorkerSet::reap_dead_workers` is the standalone
-///   form and makes the same two calls.
+///   (`store.delete(key)`), from the candidates that same listing already
+///   produced. The maintain `run_loop` in `services/ravel-server/src/maintain.rs`
+///   is the production caller; `WorkerSet::reap_dead_workers` is the
+///   standalone form and makes the same two calls.
 ///
 /// IAM is default-deny and the delete axis named no resource under
 /// `sys/maintain/` before issue #1975, so on a shipped deployment every reap
@@ -4413,42 +4414,44 @@ fn maintain_template_covers_every_worker_heartbeat_call() {
         .expect("a heartbeat key ends in a process-id segment");
     let workers_prefix = format!("{workers_prefix_body}/");
 
-    // Call 1: write_heartbeat PUTs this process's own key (worker_set.rs:358).
+    // Call 1: write_heartbeat PUTs this process's own key.
     assert!(
         puts.iter().any(|p| glob_matches(p, &heartbeat)),
         "maintain: no PutObject Allow reaches the heartbeat key {heartbeat:?}, \
-         which WorkerSet::write_heartbeat writes every interval \
-         (worker_set.rs:358). The process never joins its own fleet's live set \
-         as seen by a sibling. Grants: {puts:?}"
+         which WorkerSet::write_heartbeat writes every interval. The process \
+         never joins its own fleet's live set as seen by a sibling. \
+         Grants: {puts:?}"
     );
 
-    // Call 2: live_set_read LISTs the whole prefix (worker_set.rs:403).
+    // Call 2: live_set_read LISTs the whole prefix.
     assert!(
         list_prefixes
             .iter()
             .any(|p| glob_matches(p, &workers_prefix)),
         "maintain: no ListBucket s3:prefix admits {workers_prefix:?}, the prefix \
-         WorkerSet::live_set_read passes to list_all (worker_set.rs:403). The \
-         live-set read is refused with AccessDenied before it sees a sibling, \
-         so unit ownership falls back to solo and the reap grant below is \
-         unreachable. s3:prefix values: {list_prefixes:?}"
+         WorkerSet::live_set_read passes to list_all. The live-set read is \
+         refused with AccessDenied before it sees a sibling, so unit ownership \
+         falls back to solo and the reap grant below is unreachable. \
+         s3:prefix values: {list_prefixes:?}"
     );
 
-    // Call 3: live_set_read GETs each in-window sibling (worker_set.rs:424).
+    // Call 3: live_set_read GETs each in-window sibling through
+    // record_auth::read_bounded.
     assert!(
         gets.iter().any(|p| glob_matches(p, &heartbeat)),
         "maintain: no GetObject Allow reaches the sibling heartbeat \
-         {heartbeat:?}, which WorkerSet::live_set_read decodes to read its \
-         stamped heartbeat_unix_ns (worker_set.rs:424). Grants: {gets:?}"
+         {heartbeat:?}, which WorkerSet::live_set_read reads with \
+         record_auth::read_bounded to verify its MAC and stamped \
+         heartbeat_unix_ns. Grants: {gets:?}"
     );
 
-    // Call 4: reap_keys DELETEs each key past the reap horizon
-    // (worker_set.rs:463), driven from maintain.rs:1111.
+    // Call 4: reap_keys DELETEs each key past the reap horizon, driven from
+    // the maintain run_loop.
     assert!(
         deletes.iter().any(|p| glob_matches(p, &heartbeat)),
         "maintain: no delete Allow reaches the dead-worker heartbeat \
          {heartbeat:?}, which WorkerSet::reap_keys deletes past the reap \
-         horizon (worker_set.rs:463, driven from maintain.rs:1111). IAM is \
+         horizon (driven from the maintain run_loop). IAM is \
          default-deny, so every reap is refused, no dead worker's key is ever \
          removed, and the per-tick LIST over {workers_prefix:?} grows with \
          every maintain process that has ever run (#1975). Grants: {deletes:?}"
