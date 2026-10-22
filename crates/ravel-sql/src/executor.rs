@@ -140,8 +140,9 @@ use ravel_types::accounting::{
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
 use crate::access_intent::{
-    CacheCounterMark, StatementCacheStats, classify_access_intent, plan_has_key_equality,
-    plan_is_predicate_free, reads_whole_lane, size_trigger_applies,
+    CacheCounterMark, StatementCacheStats, StatementReadBytes, classify_access_intent,
+    plan_has_key_equality, plan_is_predicate_free, reads_whole_lane, size_trigger_applies,
+    size_trigger_lane,
 };
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
@@ -1608,13 +1609,18 @@ pub struct SqlExecutor {
     /// [`SqlExecutor::new`] default) keeps that constant; the server installs
     /// the deployment's own sweep grace with [`Self::with_ddl_min_grace_ms`].
     ddl_min_grace_ms: Option<u64>,
-    /// The resolved-bytes threshold at or above which a single-lane `logs`
+    /// The read-bytes threshold at or above which a single-lane `logs`
     /// statement sent as SQL text with no exact-key equality reads as BulkScan
+    /// once its last successful execution read that much
     /// ([`crate::access_intent::size_trigger_applies`]). `None` (the
     /// [`SqlExecutor::new`] default) leaves the predicate-free rule deciding
-    /// alone; the server installs `--cache-bulk-scan-min-bytes` with
-    /// [`Self::with_cache_bulk_scan_min_bytes`].
+    /// alone; the server installs `--cache-bulk-scan-min-bytes`, raised to its
+    /// read cache's size, with [`Self::with_cache_bulk_scan_min_bytes`].
     cache_bulk_scan_min_bytes: Option<u64>,
+    /// The bytes each statement the size trigger considers read on its last
+    /// successful execution, recorded only while
+    /// [`Self::cache_bulk_scan_min_bytes`] is set.
+    statement_read_bytes: StatementReadBytes,
     /// The process spill ceiling every query granted spill reserves its
     /// scratch cap from (ADR-0954 requirement 2, issue #2416): the configured
     /// `spill.max_bytes`, shared by every query this executor serves. `None`
@@ -1678,6 +1684,7 @@ impl SqlExecutor {
             clock: Arc::new(SystemClock),
             ddl_min_grace_ms: None,
             cache_bulk_scan_min_bytes: None,
+            statement_read_bytes: StatementReadBytes::new(),
             ipcrypt: IpcryptDeployment::default(),
             #[cfg(test)]
             executed_plan_tamper: None,
@@ -1776,12 +1783,16 @@ impl SqlExecutor {
     }
 
     /// Install the bulk-scan size trigger (ADR-3072's size trigger
-    /// amendment): with `Some(min_bytes)`, a statement sent as SQL text,
-    /// naming one `logs` table and no Parquet table, whose resolved segments'
-    /// `object_size` sums to at least `min_bytes`, and whose optimized plan
-    /// has no equality on a field the tenant indexes in KEY_IDX, reads as
-    /// BulkScan. `None` keeps the predicate-free rule alone, as [`Self::new`]
-    /// does.
+    /// amendment and its read-bytes amendment): with `Some(min_bytes)`, a
+    /// statement sent as SQL text, naming one `logs` table and no Parquet
+    /// table, whose last successful execution by the same tenant with the same
+    /// text read at least `min_bytes` (cache-served plus store GET bytes, every
+    /// phase), and whose optimized plan has no equality on a field the tenant
+    /// indexes in KEY_IDX, reads as BulkScan. Its first execution has no
+    /// record and is Interactive. `None` keeps the predicate-free rule alone,
+    /// as [`Self::new`] does. The caller passes the threshold it means to
+    /// apply, [`crate::effective_bulk_scan_min_bytes`] for a server with a
+    /// read cache.
     pub fn with_cache_bulk_scan_min_bytes(mut self, min_bytes: Option<u64>) -> Self {
         self.cache_bulk_scan_min_bytes = min_bytes;
         self
@@ -2284,6 +2295,8 @@ impl SqlExecutor {
                 )
                 .await,
             );
+            let read_bytes_key =
+                self.read_bytes_key(tenant_hash, statement, &lane_refs, parquet.is_some());
             // Whether a logs scan probes KEY_IDX is known only once the plan
             // has pushed its filters down, so both shapes are taken here and
             // the attempt's plan picks one.
@@ -2348,10 +2361,19 @@ impl SqlExecutor {
                         .as_ref()
                         .map(|mark| mark.since(phase_accounting.access_intent()));
                     let phase_snapshot = phase_accounting.snapshot();
+                    let accounting = phase_snapshot.pooled();
+                    if let Some(key) = read_bytes_key {
+                        self.statement_read_bytes.record(
+                            key,
+                            accounting
+                                .cache_bytes
+                                .saturating_add(accounting.s3_bytes(AccountedOp::Get)),
+                        );
+                    }
                     return Ok(SqlOutcome {
                         output,
                         stats,
-                        accounting: phase_snapshot.pooled(),
+                        accounting,
                         phase_accounting: phase_snapshot,
                         signals: signal_stats(&lane_counts, &phase_accounting),
                         io_shape: if blocks.keyed_logs_scan {
@@ -4037,7 +4059,8 @@ impl SqlExecutor {
 
     /// The intent a resolved statement's reads carry: [`classify_access_intent`],
     /// and, when that reads Interactive, the statement carries SQL text and the
-    /// size trigger applies ([`size_trigger_applies`]), BulkScan unless the
+    /// size trigger applies to the bytes its last successful execution read
+    /// ([`size_trigger_applies`]), BulkScan unless the
     /// statement is an exact-key lookup ([`Self::reads_key_equality`]). A
     /// statement with no SQL text (a lowered plan) never reaches the trigger.
     /// Called once per attempt, after resolve and before the first segment
@@ -4069,10 +4092,18 @@ impl SqlExecutor {
         if intent != AccessIntent::Interactive {
             return intent;
         }
-        if statement.sql().is_none() {
+        let Some(sql) = statement.sql() else {
             return intent;
-        }
-        if !size_trigger_applies(lanes, names_parquet, self.cache_bulk_scan_min_bytes) {
+        };
+        let last_read_bytes = self
+            .statement_read_bytes
+            .get(StatementReadBytes::key(tenant_hash, sql));
+        if !size_trigger_applies(
+            lanes,
+            names_parquet,
+            self.cache_bulk_scan_min_bytes,
+            last_read_bytes,
+        ) {
             return intent;
         }
         if self
@@ -4083,6 +4114,22 @@ impl SqlExecutor {
         } else {
             AccessIntent::BulkScan
         }
+    }
+
+    /// The [`StatementReadBytes`] key a successful execution of `statement`
+    /// records its read bytes under: `None` unless the size trigger is set,
+    /// the statement carries SQL text, and its lanes are ones the trigger
+    /// reads ([`size_trigger_lane`]).
+    fn read_bytes_key(
+        &self,
+        tenant_hash: TenantHash,
+        statement: Statement<'_>,
+        lanes: &[(TargetSignal, &Snapshot)],
+        names_parquet: bool,
+    ) -> Option<u64> {
+        self.cache_bulk_scan_min_bytes?;
+        let sql = statement.sql()?;
+        size_trigger_lane(lanes, names_parquet).then(|| StatementReadBytes::key(tenant_hash, sql))
     }
 
     /// Whether `statement` over its one `logs` lane holds an equality on a
@@ -8847,17 +8894,32 @@ pub(crate) mod tests {
         (snapshot, window)
     }
 
+    /// The bytes every size-trigger statement below is recorded as having read
+    /// on its last execution: between the 1,000 and 2,000-byte thresholds.
+    const SIZE_TRIGGER_READ_BYTES: u64 = 1_500;
+
+    /// Record that `sql`, sent by `tenant`, read `bytes` on its last
+    /// execution, as a successful run of it would.
+    fn record_read_bytes(exec: &SqlExecutor, tenant: TenantHash, sql: &str, bytes: u64) {
+        exec.statement_read_bytes
+            .record(StatementReadBytes::key(tenant, sql), bytes);
+    }
+
     /// The bulk-scan size trigger through `statement_access_intent`, the call
-    /// the attempt loop makes after resolve: over a 1,200-byte resolve, a
-    /// filtered `logs` statement is BulkScan with the threshold at 1,000 and
-    /// Interactive at 2,000, and an equality on a KEY_IDX field stays
+    /// the attempt loop makes after resolve: before any execution is recorded
+    /// every row reads as the predicate-free rule alone gives it; once each
+    /// statement is recorded as having read 1,500 bytes, a filtered `logs`
+    /// statement is BulkScan with the threshold at 1,000 and Interactive at
+    /// 2,000, and an equality on a KEY_IDX field stays
     /// Interactive at 1,000 wherever the probe would see it: a one-element
     /// `IN`, a column renamed through a CTE, a join's `ON`, a subquery. A
     /// `samples` statement is never read as BulkScan by the trigger. Unset,
     /// every row reads as the predicate-free rule alone gives it.
     ///
     /// FLIP: making `size_trigger_applies` return `false` fails the first
-    /// filtered row above the threshold; making `reads_key_equality` return
+    /// filtered row above the threshold; comparing the 1,200-byte resolve
+    /// instead of the recorded read bytes fails the unrecorded pass at 1,000;
+    /// making `reads_key_equality` return
     /// `false` fails the `user_id = 'u-1'` row; dropping the optimized-plan
     /// walk in `reads_key_equality` fails the `IN` and CTE rows, and the
     /// `JOIN` row too once the `Join` arm of `plan_has_key_equality` goes
@@ -8983,6 +9045,25 @@ pub(crate) mod tests {
                 .with_declared_column_source(Arc::new(source.clone()))
                 .with_cache_bulk_scan_min_bytes(min_bytes);
             for (signal, sql, expected) in &cases {
+                let unrecorded = exec
+                    .statement_access_intent(
+                        t,
+                        SqlCapabilities::default(),
+                        Statement::Sql(sql),
+                        &[(*signal, &snapshot)],
+                        false,
+                        window,
+                        NOW,
+                        &declared,
+                    )
+                    .await;
+                if unrecorded != expected[2] {
+                    mismatches.push(format!(
+                        "{min_bytes:?} unrecorded: {sql}: got {unrecorded:?}, want {:?}",
+                        expected[2]
+                    ));
+                }
+                record_read_bytes(&exec, t, sql, SIZE_TRIGGER_READ_BYTES);
                 let intent = exec
                     .statement_access_intent(
                         t,
@@ -9008,8 +9089,8 @@ pub(crate) mod tests {
 
     /// A statement with no SQL text (a lowered plan, as ES|QL sends) never
     /// reads as BulkScan through the size trigger, even over a tenant that
-    /// indexes no key and a resolve above the threshold, while the same shape
-    /// sent as SQL text does.
+    /// indexes no key, while the same shape sent as SQL text, recorded as
+    /// having read more than the threshold, does.
     ///
     /// FLIP: removing the `statement.sql().is_none()` check at the head of
     /// the trigger in `statement_access_intent` fails the lowered assertion.
@@ -9030,6 +9111,7 @@ pub(crate) mod tests {
             |_ctx, _call| Err(DataFusionError::Internal("never lowered".to_string())),
         );
         let sql = "SELECT count(*) FROM logs WHERE http_status >= 500";
+        record_read_bytes(&exec, t, sql, SIZE_TRIGGER_READ_BYTES);
         let mut intents = Vec::new();
         for statement in [Statement::Lowered(&lowered), Statement::Sql(sql)] {
             intents.push(
@@ -9053,10 +9135,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// A filtered `samples` statement over a resolve above the threshold stays
-    /// Interactive with the size trigger set, over a tenant that indexes no
-    /// key, so no key-lookup test can be what keeps it there; the same
-    /// statement shape over `logs` reads as BulkScan.
+    /// A filtered `samples` statement recorded as having read more than the
+    /// threshold stays Interactive with the size trigger set, over a tenant
+    /// that indexes no key, so no key-lookup test can be what keeps it there;
+    /// the same statement shape over `logs` reads as BulkScan.
     ///
     /// FLIP: letting `size_trigger_applies` take `TargetSignal::Metrics` fails
     /// the `samples` assertion.
@@ -9081,6 +9163,7 @@ pub(crate) mod tests {
                 "SELECT count(*) FROM logs WHERE http_status > 1",
             ),
         ] {
+            record_read_bytes(&exec, t, sql, SIZE_TRIGGER_READ_BYTES);
             intents.push(
                 exec.statement_access_intent(
                     t,

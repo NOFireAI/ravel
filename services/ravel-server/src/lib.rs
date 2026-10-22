@@ -729,10 +729,12 @@ pub struct ServerConfig {
     /// a 512 MiB catalog byte cache.
     pub disable_cache: bool,
     /// The resolved RAM budget for the query fetcher cache
-    /// (`ResolvedPerformanceDefaults::cache_max_bytes`), recorded here for
-    /// provenance. Nothing on the library path reads it: `main` builds the
+    /// (`ResolvedPerformanceDefaults::cache_max_bytes`). `main` builds the
     /// fetcher cache from the resolved struct (`store::build_store`) before this
-    /// config exists, and [`start`] hands the catalog byte cache its own
+    /// config exists; [`start`] reads this value only as the floor of the SQL
+    /// bulk-scan threshold when it is handed a read cache
+    /// ([`query::resolve_cache_bulk_scan_min_bytes`]), and hands the catalog
+    /// byte cache its own
     /// [`Self::catalog_cache_max_bytes`]. The two are independent LRU ceilings,
     /// so neither claims the other's derived share of RAM. Ignored when
     /// `disable_cache` is set.
@@ -3404,6 +3406,15 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                     "on the read CPU gate"
                 }
             );
+            // ADR-3072's size trigger amendments: the read-bytes threshold at
+            // which a filtered `logs` statement sent as SQL text also reads
+            // as a bulk scan, `--cache-bulk-scan-min-bytes` raised to the read
+            // cache's size. Unset by default.
+            let bulk_scan_min_bytes = query::resolve_cache_bulk_scan_min_bytes(
+                config.query_budgets.sql_cache_bulk_scan_min_bytes,
+                cache.as_ref().map(|_| config.cache_max_bytes),
+            );
+            bulk_scan_min_bytes.emit();
             let state = query::build_sql_state_with_parquet(
                 catalog.clone(),
                 store.clone(),
@@ -3451,11 +3462,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
                             ravel_maintain::AuditTextPolicy::Plaintext
                         ),
                 ),
-                // ADR-3072's size trigger amendment: the resolved-bytes
-                // threshold at which a filtered `logs` statement sent as SQL
-                // text also reads as a bulk scan, from
-                // `--cache-bulk-scan-min-bytes`. Unset by default.
-                config.query_budgets.sql_cache_bulk_scan_min_bytes,
+                bulk_scan_min_bytes.value,
             )?;
             // `build_sql_state` installs `NoopQueryAuditSink` internally;
             // override with the process-wide pipeline (ADR-0062 decision 2b).
