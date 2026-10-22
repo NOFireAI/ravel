@@ -528,6 +528,59 @@ async fn written_record_matches_the_pinned_format() {
     );
 }
 
+/// The record key's derive context is the literal ADR-3130 names, not
+/// whatever the crate constant holds: a record signed here under
+/// `blake3::derive_key("ravel maintain worker record v1", file_key)`, over a
+/// claim laid out byte by byte, is admitted, and the crate's own writer mints
+/// the same MAC. Changing the constant splits a fleet whose processes run
+/// builds on either side of the change.
+#[tokio::test]
+async fn record_key_context_is_the_adr_literal() {
+    let record_key = blake3::derive_key("ravel maintain worker record v1", &KEY_A);
+    let sign = |id: Uuid, started_unix_ns: i64, heartbeat_unix_ns: i64| {
+        let mut claim = Vec::new();
+        claim.extend_from_slice(&2u32.to_be_bytes());
+        claim.extend_from_slice(&16u64.to_be_bytes());
+        claim.extend_from_slice(id.as_bytes());
+        claim.extend_from_slice(&started_unix_ns.to_be_bytes());
+        claim.extend_from_slice(&heartbeat_unix_ns.to_be_bytes());
+        assert_eq!(claim.len(), 4 + 8 + 16 + 8 + 8);
+        blake3::keyed_hash(&record_key, &claim).as_bytes().to_vec()
+    };
+
+    let store = MemoryStore::new();
+    let reader = worker();
+    let keys = membership(&[KEY_A]);
+    let hand = Uuid::new_v4();
+    let record = WorkerHeartbeat {
+        format_version: 2,
+        process_id: hand.as_bytes().to_vec(),
+        started_unix_ns: NOW - 7,
+        heartbeat_unix_ns: NOW,
+        mac: sign(hand, NOW - 7, NOW),
+    };
+    put_record(&store, hand, &record).await;
+
+    let mut want = vec![reader.process_id(), hand];
+    want.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    let live = reader.live_set(&store, &keys, NOW).await.expect("live set");
+    assert_eq!(live, want, "the hand-signed record is admitted");
+    assert_eq!(rejects(&keys), [0, 0, 0, 0, 0]);
+
+    let writer = worker();
+    writer
+        .write_heartbeat(&store, &membership(&[KEY_A]), NOW)
+        .await
+        .expect("beat");
+    let written = WorkerHeartbeat::decode(object(&store, &writer).await.as_slice())
+        .expect("decode the written record");
+    assert_eq!(
+        written.mac,
+        sign(writer.process_id(), written.started_unix_ns, NOW),
+        "the crate mints under the literal context"
+    );
+}
+
 #[test]
 fn empty_key_list_fails_construction() {
     assert_eq!(
