@@ -1225,6 +1225,13 @@ HEALTHZ_INTERVAL_S = 0.25
 METRICS_INTERVAL_S = 1.0
 HEALTHZ_TIMEOUT_S = 2.0
 HEARTBEAT_METRIC = "ravel_health_heartbeat_age_seconds"
+# The memory gauges each /metrics sample keeps, so an over-budget run can be
+# checked pointwise against ADR-1170's resident <= unique tracked + reserve.
+MEMORY_METRICS = (
+    "ravel_process_allocator_bytes", "ravel_memory_budget_bytes",
+    "ravel_memory_reserved_bytes", "ravel_memory_handoff_overlap_bytes",
+    "ravel_memory_gate_resident_bytes", "ravel_memory_gate_available_bytes",
+    "ravel_cache_resident_bytes")
 HEALTHZ_LINE_RE = re.compile(
     r"^HEALTHZ phase=(\S+) port=(\S+) n=([0-9]+) p50_ms=([0-9.]+) p99_ms=([0-9.]+) "
     r"max_ms=([0-9.]+) failures=([0-9]+)$")
@@ -1256,6 +1263,21 @@ def _heartbeat(body):
     return max(ages) if ages else None
 
 
+def _memory_gauges(body):
+    """Every MEMORY_METRICS sample in a /metrics body, keyed by its series
+    (name and labels as exposed)."""
+    out = {}
+    for line in body.splitlines():
+        if not line.startswith(MEMORY_METRICS):
+            continue
+        try:
+            series, value = line.rsplit(None, 1)
+            out[series] = float(value)
+        except ValueError:
+            pass
+    return out
+
+
 def _probe(opener, url, metrics):
     """One GET with HEALTHZ_TIMEOUT_S as the client timeout. A non-200, a
     transport error or an answer slower than the timeout is not ok; answered
@@ -1280,10 +1302,12 @@ def _probe(opener, url, metrics):
             rec["error"] = "answered after %.0f ms, past the %.0f ms timeout" % (
                 ms, HEALTHZ_TIMEOUT_S * 1000.0)
         elif metrics:
-            age = _heartbeat(body.decode("utf-8", "replace"))
+            text = body.decode("utf-8", "replace")
+            age = _heartbeat(text)
             if age is None:
                 rec["error"] = "no %s in /metrics" % HEARTBEAT_METRIC
             rec["heartbeat_s"] = age
+            rec["memory"] = _memory_gauges(text)
         rec["ok"] = not rec["error"]
     if not metrics:
         rec["ms"] = round(ms, 3)

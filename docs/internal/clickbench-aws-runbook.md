@@ -326,7 +326,10 @@ quotes them. A key still present after that refuses the tarball, and
 `FAILED` then says the tail was withheld instead of quoting it; `FAILED` is
 still uploaded. The audit token key reaches the server only under
 `audit_mode = "required"` with redacted audit text, the one mode that reads
-it.
+it. `evidence.tgz` also carries `kernel.log`, the box's kernel log
+(`journalctl -k`, else `dmesg -T`) taken when the evidence is written, so
+an arm whose server died under memory pressure shows whether the kernel
+killed it, which process it named, and its anonymous RSS.
 
 ## 7. Load, compact, fold, declare
 
@@ -725,7 +728,14 @@ when the gate was open on the same generation before and after it. Before a
 timed window opens `run.sh` waits until all three threads hold a counted
 sample of the current generation. The raw samples are kept in
 `out/<phase>/healthz/` (`out/concurrent/round-<N>/healthz/` for a round),
-which `evidence.tgz` carries. After each phase `out/healthz.txt` gains
+which `evidence.tgz` carries. Each `/metrics` sample in `metrics.jsonl`
+also keeps the server's memory gauges under `memory`, keyed by series:
+`ravel_process_allocator_bytes` by `stat`, `ravel_memory_budget_bytes`,
+`ravel_memory_reserved_bytes` by `component`,
+`ravel_memory_handoff_overlap_bytes`, the memory gate's resident and
+available bytes, and `ravel_cache_resident_bytes` by cache. They come from
+one scrape, so allocated or resident bytes can be compared with the tracked
+ledgers at the same instant. After each phase `out/healthz.txt` gains
 
 ```
 HEALTHZ phase=<phase> port=<4318|4319> n=<samples> p50_ms=<ms> p99_ms=<ms> max_ms=<ms> failures=<n>

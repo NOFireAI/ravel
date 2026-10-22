@@ -1485,7 +1485,11 @@ leaked() {
 write_evidence() {
   local items="" f g stage="$KIT/evidence-stage"
   rm -f "$KIT/evidence.tgz"
-  for f in server-*.log rustfs.log run.log progress.log arm.env load.out fold.out load.time \
+  # The kernel log names an OOM kill's victim and its anon-rss, which no
+  # sampler here can see.
+  journalctl -k --no-pager -o short-iso >"$KIT/kernel.log" 2>&1 \
+    || dmesg -T >"$KIT/kernel.log" 2>&1 || true
+  for f in kernel.log server-*.log rustfs.log run.log progress.log arm.env load.out fold.out load.time \
     compact.time object-counts stamps verify out phases.json burst-start.json burst-end.json; do
     # shellcheck disable=SC2086 # globs expand here on purpose
     for g in $(cd "$KIT" && ls -d $f 2>/dev/null); do items="$items $g"; done
