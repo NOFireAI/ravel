@@ -14,7 +14,8 @@
 //! [`PutMode::Overwrite`] -- one writer per key, no CAS, no contention. On
 //! startup, and whenever a membership change moves ownership of a unit to this
 //! process, the worker lists this prefix and GETs every sibling's snapshot (its
-//! own previous one included), seeding its in-memory [`crate::scan::MaintainMemo`]
+//! own previous one included) modified within [`MEMO_SNAPSHOT_MTIME_SKIP_NS`],
+//! seeding its in-memory [`crate::scan::MaintainMemo`]
 //! from the freshest non-stale entries for the units it now owns rather than
 //! starting cold.
 //!
@@ -51,8 +52,8 @@ use uuid::Uuid;
 #[cfg(doc)]
 use crate::scan::MAX_MEMO_SNAPSHOT_BYTES;
 use crate::scan::{
-    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MemoSnapshotLimits, MemoSnapshotReject, MemoSnapshotRejects,
-    VerifiedSnapshot,
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MemoSnapshotLimits, MemoSnapshotReject,
+    MemoSnapshotRejects, VerifiedSnapshot,
 };
 
 /// The prefix every maintain process's memo snapshot lives under (ADR-0065
@@ -116,8 +117,9 @@ fn process_id_of(key: &str) -> Option<Uuid> {
 /// [`ravel_fleet::worker_set::REAP_WINDOW_FACTOR`]), so 2 hours.
 pub const MEMO_SNAPSHOT_MTIME_SKIP_NS: i64 = reap_horizon_ns(DEFAULT_MEMO_SNAPSHOT_STALENESS_NS);
 
-/// List `sys/maintain/memo/` and GET every snapshot object under it (this
-/// process's own previous snapshot included), returning only those whose MAC
+/// List `sys/maintain/memo/` and GET every snapshot object under it that the
+/// checks below do not reject unread (this process's own previous snapshot
+/// included), returning only those whose MAC
 /// verifies under `keys` for the process id named by the object's key
 /// (ADR-3130, memo snapshot amendment). Decoding and per-snapshot
 /// staleness/ownership filtering happen at the seed site
@@ -196,7 +198,11 @@ async fn check_object(
     // A backend that reports no modification time (`<= 0`, as MemoryStore's
     // default clock does) is never skipped here: the object falls through to
     // the checks below and the seed-time staleness gate.
-    if mtime_stale(now_ns, meta.last_modified_unix_ms, MEMO_SNAPSHOT_MTIME_SKIP_NS) {
+    if mtime_stale(
+        now_ns,
+        meta.last_modified_unix_ms,
+        MEMO_SNAPSHOT_MTIME_SKIP_NS,
+    ) {
         return Ok(Err((MemoSnapshotReject::Stale, meta.size)));
     }
     if meta.size > cap {
@@ -581,7 +587,10 @@ mod tests {
         write_memo_snapshot(&store, &id, bytes.clone())
             .await
             .expect("write");
-        assert_eq!(read_default(&store).await.snapshots, vec![verified(id, &bytes)]);
+        assert_eq!(
+            read_default(&store).await.snapshots,
+            vec![verified(id, &bytes)]
+        );
     }
 
     /// The object store clock as milliseconds for a reader clock `ns`.

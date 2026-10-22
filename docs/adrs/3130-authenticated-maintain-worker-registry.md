@@ -272,6 +272,13 @@ keys as the registry record. Without it, any principal holding the
 verdicts for units it does not own, and the owner would skip those buckets
 until each verdict aged past its re-verify interval.
 
+With the MAC, a principal without the key file cannot seed verdicts that no
+key holder wrote. A principal with read and write grants can still replay
+one: put a process's own earlier honest snapshot back at that process's key,
+reinstating a verdict from before an invalidation. The 1-hour staleness bound
+(`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`) limits a replay to snapshots under an
+hour old, so it defers a bucket's re-evaluation by at most that hour.
+
 - **Key.** `memo_key = blake3::derive_key("ravel maintain memo snapshot v1",
   file_key)`, one per file key. The context differs from the registry
   record's, so a registry MAC never verifies as a memo MAC or the reverse. As
@@ -287,18 +294,30 @@ until each verdict aged past its re-verify interval.
   key's UUID suffix, not from anything inside the object. A snapshot copied
   verbatim under another process's key fails its MAC.
 - **Check order.** For each listed object, before any byte of the body is
-  decoded: a key that does not parse as a UUID is `non_uuid_key`, rejected
-  without a GET; a listed size over the cap, then a fetched length over the
-  cap (range GET of the cap plus one byte), is `oversize`; an empty object or
-  one shorter than 41 bytes is `malformed`; a tag other than 2 is
-  `unknown_tag`; a MAC that verifies under none of the reader's keys is
-  `bad_mac`. Seeding and decoding accept only a snapshot that passed all
-  five, so a forged object costs one GET and one MAC computation and is
-  never decoded, whatever counts its body claims.
+  decoded: a key whose suffix is not a UUID in the lowercase hyphenated form
+  the writer uses is `non_uuid_key`, rejected without a GET, so one process
+  has one key; a LIST modification time more than 2 hours before the
+  reader's clock is `stale`, rejected without a GET; a listed size over the
+  cap, then a fetched length over the cap (range GET of the cap plus one
+  byte), is `oversize`; an empty object or one shorter than 41 bytes is
+  `malformed`; a tag other than 2 is `unknown_tag`; a MAC that verifies
+  under none of the reader's keys is `bad_mac`. Seeding and decoding accept
+  only a snapshot that passed all six, so a forged object costs one GET and
+  one MAC computation per configured key and is never decoded, whatever
+  counts its body claims. The seed-time staleness gate reads the verified
+  timestamp and runs before the body is decoded.
+- **Stale objects.** Each process start takes a fresh id, and its snapshot
+  stays under the prefix after it exits, so the tag-1 objects of processes
+  gone since the upgrade and the snapshots of processes gone since a key
+  rotation stay listed. The 2-hour bound is the 1-hour staleness bound
+  widened by the worker registry's clock-skew margin (`reap_horizon_ns`, the
+  window times `REAP_WINDOW_FACTOR`, 2). An object a backend lists with no
+  modification time (`<= 0`) goes on to the checks after it.
 - **Logging.** Each reseed counts rejects per reason and logs one warning
   carrying every count when any `oversize`, `unknown_tag` or `bad_mac` reject
-  occurred; `non_uuid_key` and `malformed` alone log at debug. No metric is
-  added.
+  occurred; `non_uuid_key`, `stale` and `malformed` alone log at debug, so
+  leftovers older than the 2-hour bound do not raise the warning. No metric
+  is added.
 - **Rollout.** Tag 1, the unauthenticated frame earlier releases write, now
   reads as `unknown_tag`, and an earlier release reads a tag-2 frame as an
   unknown tag in the same way. During a rolling upgrade old and new processes
