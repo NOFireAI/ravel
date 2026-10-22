@@ -40,11 +40,16 @@ decoded bytes one batch may hold across all of its payloads
 refused before it is decoded, and the batch is nacked with
 `INVALID_ARGUMENT` and the status message "decoded batch exceeds cap of N
 bytes", N being the configured cap. The stream stays open when the refused
-payload is the batch's first. When an earlier payload of the same batch was
+payload is the batch's first and was refused before it reached its decoder,
+as this cap refuses it. When an earlier payload of the same batch was
 already decoded, the decoders hold that payload's schema and dictionary
 messages but not the refused one's, so the stream is ended after the nack and
 the exporter reconnects with fresh decoder state; this holds for every
-per-batch refusal, not only this cap. Each
+per-batch refusal, not only this cap. A payload whose IPC messages fail to
+decode once they reach their decoder ends the stream too, even as the
+batch's first: that decoder is removed with whatever messages it took, so
+the stream's decode state no longer follows what the exporter sent on it.
+Each
 payload may decode to the 16 MiB per-payload cap, so a batch carrying
 several payload types can need more than the default. The remedies are to
 raise `--otap-max-decoded-batch-bytes`, or to lower the exporter's batch
