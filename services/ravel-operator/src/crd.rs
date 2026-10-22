@@ -913,8 +913,8 @@ pub struct MaintainSpec {
     /// field or the Secret. The gateway and query tiers keep reconciling,
     /// except on a fresh cluster with per-role storage credentials (including
     /// `podIdentity`): there they wait for maintain to create `sys/gc`, so no
-    /// Deployment is created until the Secret exists. A change to the Secret
-    /// rolls the maintain pods.
+    /// `ravel-server` Deployment is created until the Secret exists. A change
+    /// to the Secret rolls the maintain pods.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_secret_ref: Option<LocalSecretRef>,
 }

@@ -6018,6 +6018,31 @@ mod tests {
         assert_eq!(keyed.reason, GC_BOOTSTRAP_STALLED_REASON);
     }
 
+    /// A stalled bootstrap wait outranks a concurrent render error unless the
+    /// maintain tier is withheld: only the withheld tier explains the wait.
+    #[test]
+    fn stalled_wait_outranks_a_render_error_unless_maintain_is_withheld() {
+        let start = 1_000_000;
+        let wait = gc_bootstrap_wait_status(
+            "dev-maintain",
+            Some(start),
+            start + stall_after_secs() + 1,
+            Some(0),
+            Some(1),
+            Some(1),
+        );
+        assert!(wait.stalled, "past the threshold the wait is stalled");
+        let render = ("RouterRenderError".to_string(), "router: bad".to_string());
+
+        let not_withheld = pass_degraded_condition(Some(&render), Some(&wait), false, Some(1))
+            .expect("a degraded condition");
+        assert_eq!(not_withheld.reason, GC_BOOTSTRAP_STALLED_REASON);
+
+        let withheld = pass_degraded_condition(Some(&render), Some(&wait), true, Some(1))
+            .expect("a degraded condition");
+        assert_eq!(withheld.reason, "RouterRenderError");
+    }
+
     /// Finding 3: credential resourceVersions are resolved before the gate and
     /// reused for the qualified-input hash. The value selected is the SHARED
     /// storage.s3 credential's (the one the qualify Job authenticates with),

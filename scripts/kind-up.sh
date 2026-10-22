@@ -123,7 +123,7 @@ wait_cluster_condition() {
 wait_maintain_ready() {
   local timeout="$1"
   local deadline=$(( SECONDS + timeout ))
-  local snap rest gen dstatus dreason obsgen ready
+  local snap rest gen dstatus dreason obsgen dgen dobs want updated total ready
   while (( SECONDS < deadline )); do
     snap="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
       -o jsonpath='{.metadata.generation}|{.status.conditions[?(@.type=="Degraded")].status}|{.status.conditions[?(@.type=="Degraded")].reason}|{.status.conditions[?(@.type=="Degraded")].observedGeneration}' \
@@ -141,14 +141,22 @@ wait_maintain_ready() {
           ;;
       esac
     fi
-    ready="$(kubectl get --namespace "$NAMESPACE" "deployment/${CLUSTER_CR}-maintain" \
-      -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
-    if [[ "$ready" =~ ^[0-9]+$ ]] && (( ready >= 1 )); then
+    # A rollout in progress still counts the old ReplicaSet's ready pod, so
+    # require the rollout to be complete: the Deployment observed its current
+    # generation, every replica runs the current template, and no old replica
+    # remains, the same test `kubectl rollout status` applies.
+    snap="$(kubectl get --namespace "$NAMESPACE" "deployment/${CLUSTER_CR}-maintain" \
+      -o jsonpath='{.metadata.generation}|{.status.observedGeneration}|{.spec.replicas}|{.status.updatedReplicas}|{.status.replicas}|{.status.readyReplicas}' \
+      2>/dev/null || true)"
+    IFS='|' read -r dgen dobs want updated total ready <<<"$snap"
+    if [[ -n "$dgen" && "$dobs" == "$dgen" && "$want" =~ ^[0-9]+$ ]] \
+      && (( want >= 1 )) \
+      && [[ "${updated:-0}" == "$want" && "${total:-0}" == "$want" && "${ready:-0}" == "$want" ]]; then
       return 0
     fi
     sleep 3
   done
-  die "timed out after ${timeout}s waiting for deployment ${CLUSTER_CR}-maintain to have a ready replica (Degraded=${dstatus:-<none>} reason ${dreason:-<none>})"
+  die "timed out after ${timeout}s waiting for deployment ${CLUSTER_CR}-maintain to finish rolling out (generation ${dgen:-?} observed ${dobs:-?}, replicas ${want:-?}, updated ${updated:-0}, total ${total:-0}, ready ${ready:-0}; Degraded=${dstatus:-<none>} reason ${dreason:-<none>})"
 }
 
 # On any failure after the cluster exists, dump what a human would ask for
