@@ -175,6 +175,10 @@ pub enum PodIdentityError {
         /// The I/O error.
         source: io::Error,
     },
+
+    /// Another caller's fetch, which this call waited on, failed.
+    #[error("the Pod Identity fetch this call waited on failed: {0}")]
+    SharedFetch(String),
 }
 
 /// Role credentials from the Pod Identity agent. `Debug` redacts the three
@@ -856,16 +860,40 @@ pub async fn run(args: PodIdentityArgs) -> Result<(), String> {
 /// same refresh point the sidecar uses. The operator pod mounts no volume and
 /// writes no file; each reconcile pass that needs an S3 handle asks this
 /// cache.
+///
+/// The state lock is never held across the agent fetch. One caller fetches at
+/// a time; a caller that finds a fetch in flight waits for its outcome only
+/// when the cache holds no unexpired credential.
 #[derive(Debug)]
 pub struct OperatorCredentialCache {
     margin: Duration,
-    state: tokio::sync::Mutex<Option<Cached>>,
+    state: std::sync::Mutex<CacheState>,
+}
+
+/// What a finished fetch publishes to the callers waiting on it: the
+/// credential the fetching caller returned, or its error message. `None`
+/// until it finishes.
+type FetchOutcome = Option<Result<PodIdentityCredentials, String>>;
+
+#[derive(Debug, Default)]
+struct CacheState {
+    cached: Option<Cached>,
+    /// The fetch in flight. Its sender belongs to the fetching caller, so a
+    /// closed channel means that caller was dropped before it finished.
+    in_flight: Option<tokio::sync::watch::Receiver<FetchOutcome>>,
 }
 
 #[derive(Debug)]
 struct Cached {
     credentials: PodIdentityCredentials,
     refresh_at: SystemTime,
+}
+
+/// What [`OperatorCredentialCache::get`] does next, decided under the lock.
+enum CacheStep {
+    Serve(PodIdentityCredentials),
+    Wait(tokio::sync::watch::Receiver<FetchOutcome>),
+    Fetch(tokio::sync::watch::Sender<FetchOutcome>),
 }
 
 impl Default for OperatorCredentialCache {
@@ -879,34 +907,91 @@ impl OperatorCredentialCache {
     pub fn new(margin: Duration) -> Self {
         Self {
             margin,
-            state: tokio::sync::Mutex::new(None),
+            state: std::sync::Mutex::new(CacheState::default()),
         }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        // The state is valid whenever the lock is released, so a panic in
+        // another holder leaves nothing half-updated.
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The cached credential while it is before its refresh point; otherwise
     /// a fresh fetch. A failed fetch falls back to the cached credential
     /// while it has not expired, with a warning, and fails once it has.
+    /// While another caller's fetch is in flight, an unexpired cached
+    /// credential is returned at once; with none, this call waits for that
+    /// fetch's outcome instead of starting a second one.
     pub async fn get(
         &self,
         endpoint: &AgentEndpoint,
         now: SystemTime,
     ) -> Result<PodIdentityCredentials, PodIdentityError> {
-        let mut state = self.state.lock().await;
-        if let Some(cached) = state.as_ref()
+        loop {
+            match self.next_step(now) {
+                CacheStep::Serve(credentials) => return Ok(credentials),
+                CacheStep::Fetch(publish) => {
+                    return self.fetch_and_store(endpoint, now, publish).await;
+                }
+                CacheStep::Wait(mut outcome) => {
+                    // An error here means the fetching caller was dropped;
+                    // the value read below is then `None`.
+                    let _ = outcome.changed().await;
+                    let finished = outcome.borrow().clone();
+                    match finished {
+                        Some(Ok(credentials)) => return Ok(credentials),
+                        Some(Err(reason)) => return Err(PodIdentityError::SharedFetch(reason)),
+                        None => continue,
+                    }
+                }
+            }
+        }
+    }
+
+    fn next_step(&self, now: SystemTime) -> CacheStep {
+        let mut state = self.lock();
+        if let Some(cached) = &state.cached
             && now < cached.refresh_at
         {
-            return Ok(cached.credentials.clone());
+            return CacheStep::Serve(cached.credentials.clone());
         }
-        match fetch(endpoint).await {
+        if let Some(in_flight) = &state.in_flight
+            && in_flight.has_changed().is_ok()
+        {
+            if let Some(cached) = &state.cached
+                && now < cached.credentials.expiration
+            {
+                return CacheStep::Serve(cached.credentials.clone());
+            }
+            return CacheStep::Wait(in_flight.clone());
+        }
+        let (publish, outcome) = tokio::sync::watch::channel(None);
+        state.in_flight = Some(outcome);
+        CacheStep::Fetch(publish)
+    }
+
+    async fn fetch_and_store(
+        &self,
+        endpoint: &AgentEndpoint,
+        now: SystemTime,
+        publish: tokio::sync::watch::Sender<FetchOutcome>,
+    ) -> Result<PodIdentityCredentials, PodIdentityError> {
+        let fetched = fetch(endpoint).await;
+        let mut state = self.lock();
+        state.in_flight = None;
+        let result = match fetched {
             Ok(credentials) => {
                 let refresh_at = now + next_refresh_delay(now, credentials.expiration, self.margin);
-                *state = Some(Cached {
+                state.cached = Some(Cached {
                     credentials: credentials.clone(),
                     refresh_at,
                 });
                 Ok(credentials)
             }
-            Err(err) => match state.as_ref() {
+            Err(err) => match &state.cached {
                 Some(cached) if now < cached.credentials.expiration => {
                     let expires_in = cached
                         .credentials
@@ -922,7 +1007,12 @@ impl OperatorCredentialCache {
                 }
                 _ => Err(err),
             },
-        }
+        };
+        publish.send_replace(Some(match &result {
+            Ok(credentials) => Ok(credentials.clone()),
+            Err(err) => Err(err.to_string()),
+        }));
+        result
     }
 }
 
@@ -1530,6 +1620,184 @@ mod tests {
         assert_eq!(agent.requests.lock().unwrap().len(), 2);
         let expired = expiration + Duration::from_secs(1);
         assert!(cache.get(&endpoint, expired).await.is_err());
+    }
+
+    /// A cache over a mock agent; returns the agent, the endpoint and the
+    /// `Expiration` its credentials carry.
+    async fn cache_fixture(
+        scratch: &Scratch,
+    ) -> (
+        Arc<Agent>,
+        AgentEndpoint,
+        Arc<OperatorCredentialCache>,
+        SystemTime,
+    ) {
+        let token_file = scratch.path("token");
+        fs::write(&token_file, "t").expect("write token");
+        let agent = Agent::new("t");
+        let uri = serve(Arc::clone(&agent)).await;
+        let endpoint = AgentEndpoint::new(&uri, token_file).expect("endpoint");
+        let expiration = parse_expiration(EXPIRATION).expect("expiration");
+        (
+            agent,
+            endpoint,
+            Arc::new(OperatorCredentialCache::default()),
+            expiration,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_stalled_refresh_does_not_hold_back_callers_the_cache_can_serve() {
+        use futures::FutureExt as _;
+
+        let scratch = Scratch::new("cache-stall");
+        let (agent, endpoint, cache, expiration) = cache_fixture(&scratch).await;
+        let now = expiration - Duration::from_secs(6 * 3600);
+        cache.get(&endpoint, now).await.expect("fill the cache");
+
+        // Past the refresh point (three hours in): this caller fetches, and
+        // the agent holds the answer.
+        agent.hold();
+        let refreshing = tokio::spawn({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move {
+                cache
+                    .get(&endpoint, now + Duration::from_secs(4 * 3600))
+                    .await
+            }
+        });
+        wait_until("the refresh reaches the agent", || {
+            agent.request_count() == 2
+        })
+        .await;
+
+        // Before the refresh point, and past it but before expiry: both are
+        // answered from the cache on the first poll.
+        for at in [
+            now + Duration::from_secs(60),
+            now + Duration::from_secs(5 * 3600),
+        ] {
+            let served = cache
+                .get(&endpoint, at)
+                .now_or_never()
+                .expect("a cached credential is served without waiting for the fetch")
+                .expect("served");
+            assert_eq!(served.access_key_id, "AKIA1");
+        }
+
+        agent.release();
+        refreshing
+            .await
+            .expect("join")
+            .expect("the refresh completes");
+        assert_eq!(agent.request_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_share_one_fetch() {
+        use futures::FutureExt as _;
+
+        let scratch = Scratch::new("cache-flight");
+        let (agent, endpoint, cache, expiration) = cache_fixture(&scratch).await;
+        let now = expiration - Duration::from_secs(6 * 3600);
+
+        agent.hold();
+        let first = tokio::spawn({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move { cache.get(&endpoint, now).await }
+        });
+        wait_until("the first fetch reaches the agent", || {
+            agent.request_count() == 1
+        })
+        .await;
+
+        // An empty cache has nothing to serve: the second caller waits on
+        // the first one's fetch.
+        let mut second = Box::pin({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move { cache.get(&endpoint, now).await }
+        });
+        assert!(
+            (&mut second).now_or_never().is_none(),
+            "the second caller waits"
+        );
+
+        agent.release();
+        let first = first.await.expect("join").expect("first");
+        let second = second.await.expect("second");
+        assert_eq!(first, second);
+        assert_eq!(agent.request_count(), 1, "one fetch for both callers");
+
+        // A failed shared fetch reaches the waiting caller as an error.
+        let later = expiration + Duration::from_secs(1);
+        *agent.status.lock().unwrap() = StatusCode::SERVICE_UNAVAILABLE;
+        agent.hold();
+        let first = tokio::spawn({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move { cache.get(&endpoint, later).await }
+        });
+        wait_until("the failing fetch reaches the agent", || {
+            agent.request_count() == 2
+        })
+        .await;
+        let mut second = Box::pin({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move { cache.get(&endpoint, later).await }
+        });
+        assert!(
+            (&mut second).now_or_never().is_none(),
+            "the second caller waits"
+        );
+        agent.release();
+        assert!(matches!(
+            first.await.expect("join"),
+            Err(PodIdentityError::Status { status: 503, .. })
+        ));
+        assert!(matches!(
+            second.await,
+            Err(PodIdentityError::SharedFetch(_))
+        ));
+        assert_eq!(agent.request_count(), 2, "the failure was not retried");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_waiting_caller_takes_over_when_the_fetching_caller_is_dropped() {
+        use futures::FutureExt as _;
+
+        let scratch = Scratch::new("cache-cancel");
+        let (agent, endpoint, cache, expiration) = cache_fixture(&scratch).await;
+        let now = expiration - Duration::from_secs(6 * 3600);
+
+        agent.hold();
+        let first = tokio::spawn({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move { cache.get(&endpoint, now).await }
+        });
+        wait_until("the first fetch reaches the agent", || {
+            agent.request_count() == 1
+        })
+        .await;
+        let mut second = Box::pin({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move { cache.get(&endpoint, now).await }
+        });
+        assert!(
+            (&mut second).now_or_never().is_none(),
+            "the second caller waits"
+        );
+
+        first.abort();
+        assert!(first.await.expect_err("aborted").is_cancelled());
+        let second = tokio::spawn(second);
+        wait_until("the second caller fetches", || agent.request_count() == 2).await;
+        agent.release();
+        let served = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("the second caller finishes")
+            .expect("join")
+            .expect("served");
+        assert_eq!(served.access_key_id, "AKIA1");
+        assert_eq!(agent.request_count(), 2);
     }
 
     /// The drift guard between this writer and the server's reader: a file
