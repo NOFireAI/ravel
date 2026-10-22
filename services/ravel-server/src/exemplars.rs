@@ -1278,6 +1278,8 @@ struct QueryAccountingJson {
     cache_misses: u64,
     #[serde(rename = "cacheBytes")]
     cache_bytes: u64,
+    #[serde(rename = "lateServedBytes")]
+    late_served_bytes: u64,
     #[serde(rename = "decompressedBytes")]
     decompressed_bytes: u64,
     #[serde(rename = "segmentsOpened")]
@@ -1302,6 +1304,7 @@ impl QueryAccountingJson {
             cache_hits: snapshot.cache_hits,
             cache_misses: snapshot.cache_misses,
             cache_bytes: snapshot.cache_bytes,
+            late_served_bytes: snapshot.late_served_bytes,
             decompressed_bytes: snapshot.decompressed_bytes,
             segments_opened: snapshot.segments_opened,
             series_matched: snapshot.series_matched,
@@ -3143,5 +3146,24 @@ mod tests {
             events.lock().expect("lock").is_empty(),
             "a request rejected before execution writes no audit event"
         );
+    }
+
+    /// `QueryAccountingJson` names every field `/api/v1/query`'s
+    /// `stats.accounting` names, and no other, so one collector reads both.
+    #[test]
+    fn accounting_json_names_the_same_fields_as_query_stats() {
+        let snapshot = QueryAccountingSnapshot::default();
+        let ours =
+            serde_json::to_value(QueryAccountingJson::from_snapshot(&snapshot)).expect("serialize");
+        let theirs = crate::query::accounting_stats_json(
+            &snapshot,
+            &ravel_types::accounting::CostEstimate::new(0, 0, 0, 0, 0),
+        );
+        let keys = |v: &Value| {
+            let mut k: Vec<String> = v.as_object().expect("object").keys().cloned().collect();
+            k.sort();
+            k
+        };
+        assert_eq!(keys(&ours), keys(&theirs["accounting"]));
     }
 }
