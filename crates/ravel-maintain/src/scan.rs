@@ -462,13 +462,12 @@ pub const DEFAULT_MEMO_SNAPSHOT_STALENESS_NS: i64 = DEFAULT_MEMO_REVERIFY_INTERV
 
 /// Largest framed memo snapshot object (ADR-0065 decision 3, issue #3199) a
 /// maintain process reads or writes, its trailing MAC included: 32 MiB. Each
-/// frontier or exception run
-/// encodes in 17 bytes (two four-byte hour fields, a one-byte state, an
-/// eight-byte verify time), so 32 MiB holds about 1.97 million runs, each one
-/// or more terminal hours. The reader skips a larger object
-/// ([`crate::memo_snapshot::read_all_memo_snapshots`]) and the maintain loop's
-/// writer does not write one, so an honest process over the cap leaves its
-/// units to a cold rescan on the next reseed, never a correctness change.
+/// frontier or exception run encodes in 17 bytes (two four-byte hour fields, a
+/// one-byte state, an eight-byte verify time), so 32 MiB holds about 1.97
+/// million runs, each one or more terminal hours. The reader skips a larger
+/// object ([`crate::memo_snapshot::read_all_memo_snapshots`]) and the maintain
+/// loop's writer does not write one, so an honest process over the cap leaves
+/// its units to a cold rescan on the next reseed, never a correctness change.
 pub const MAX_MEMO_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Largest number of per-hour terminal entries one decoded memo snapshot may
@@ -476,12 +475,11 @@ pub const MAX_MEMO_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 /// hour, a one-byte state, an `i64` verify time, padded), and the decoder
 /// admits every run of a unit, then reserves the unit's admitted total exactly
 /// before expanding it, so the entry vectors of one decoded snapshot hold at
-/// most 64 MiB of capacity
-/// however long the runs it carries claim to be. The count is snapshot-wide,
-/// across every unit and run, and is checked before a run is expanded. An
-/// honest process whose memo holds more terminal entries writes no snapshot,
-/// which costs its units a cold rescan on the next reseed, never a correctness
-/// change.
+/// most 64 MiB of capacity however long the runs it carries claim to be. The
+/// count is snapshot-wide, across every unit and run, and is checked before a
+/// run is expanded. An honest process whose memo holds more terminal entries
+/// writes no snapshot, which costs its units a cold rescan on the next reseed,
+/// never a correctness change.
 pub const MAX_MEMO_SNAPSHOT_ENTRIES: usize = 4 * 1024 * 1024;
 
 /// The two caps a memo snapshot is held to on the read, decode and write paths
@@ -559,8 +557,12 @@ fn memo_snapshot_claim(process_id: &Uuid, unmaced: &[u8]) -> Vec<u8> {
 /// before any of the object's body is decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemoSnapshotReject {
-    /// The key's suffix under `sys/maintain/memo/` is not a UUID; never read.
+    /// The key's suffix under `sys/maintain/memo/` is not a UUID in its
+    /// canonical form (lowercase, hyphenated); never read.
     NonUuidKey,
+    /// The LIST modification time is older than the staleness bound plus the
+    /// clock-skew allowance, so the snapshot could never seed; never read.
+    Stale,
     /// Longer than [`MemoSnapshotLimits::max_bytes`], by its listed size or by
     /// the bytes the bounded GET returned.
     Oversize,
@@ -575,8 +577,9 @@ pub enum MemoSnapshotReject {
 
 impl MemoSnapshotReject {
     /// Every reason, in check order.
-    pub const ALL: [MemoSnapshotReject; 5] = [
+    pub const ALL: [MemoSnapshotReject; 6] = [
         MemoSnapshotReject::NonUuidKey,
+        MemoSnapshotReject::Stale,
         MemoSnapshotReject::Oversize,
         MemoSnapshotReject::Malformed,
         MemoSnapshotReject::UnknownTag,
@@ -587,6 +590,7 @@ impl MemoSnapshotReject {
     pub fn reason(self) -> &'static str {
         match self {
             MemoSnapshotReject::NonUuidKey => "non_uuid_key",
+            MemoSnapshotReject::Stale => "stale",
             MemoSnapshotReject::Oversize => "oversize",
             MemoSnapshotReject::Malformed => "malformed",
             MemoSnapshotReject::UnknownTag => "unknown_tag",
@@ -597,10 +601,11 @@ impl MemoSnapshotReject {
     fn index(self) -> usize {
         match self {
             MemoSnapshotReject::NonUuidKey => 0,
-            MemoSnapshotReject::Oversize => 1,
-            MemoSnapshotReject::Malformed => 2,
-            MemoSnapshotReject::UnknownTag => 3,
-            MemoSnapshotReject::BadMac => 4,
+            MemoSnapshotReject::Stale => 1,
+            MemoSnapshotReject::Oversize => 2,
+            MemoSnapshotReject::Malformed => 3,
+            MemoSnapshotReject::UnknownTag => 4,
+            MemoSnapshotReject::BadMac => 5,
         }
     }
 }
@@ -683,6 +688,15 @@ mod snapshot_auth {
         /// The writer's process id, taken from the object key.
         pub fn process_id(&self) -> Uuid {
             self.process_id
+        }
+
+        /// The writer's `snapshot_unix_ns`, at its fixed offset after the tag
+        /// and covered by the MAC, read without decoding the body.
+        pub fn snapshot_unix_ns(&self) -> i64 {
+            let mut ts = [0u8; 8];
+            // `verify` admitted at least the tag and the timestamp before the MAC.
+            ts.copy_from_slice(&self.unmaced[1..9]);
+            i64::from_le_bytes(ts)
         }
 
         /// `[tag][snapshot_unix_ns i64 LE][body]`, MAC removed.
@@ -1325,7 +1339,8 @@ impl MaintainMemo {
     ///
     /// `staleness_ns` gates the whole snapshot on its `snapshot_unix_ns`: a
     /// snapshot further than `staleness_ns` from `now_ns` in either direction is
-    /// ignored ([`SeedStats::stale`] set, nothing seeded), matching the
+    /// ignored ([`SeedStats::stale`] set, nothing seeded, nothing decoded: the
+    /// timestamp is read from the verified frame), matching the
     /// far-future exclusion [`crate::worker_set`] applies to heartbeats. A
     /// non-positive `staleness_ns` disables the whole-snapshot gate (every
     /// snapshot is loaded; per-entry freshness still governs skipping). Seeded
@@ -1341,11 +1356,10 @@ impl MaintainMemo {
         staleness_ns: i64,
         owns: impl Fn(TenantHash, Signal, u32) -> bool,
     ) -> std::result::Result<SeedStats, MemoSnapshotError> {
-        let decoded = decode_snapshot(snapshot, limits.max_entries)?;
-
         if staleness_ns > 0 {
-            let too_old = now_ns.saturating_sub(decoded.snapshot_unix_ns) > staleness_ns;
-            let too_future = decoded.snapshot_unix_ns.saturating_sub(now_ns) > staleness_ns;
+            let snapshot_unix_ns = snapshot.snapshot_unix_ns();
+            let too_old = now_ns.saturating_sub(snapshot_unix_ns) > staleness_ns;
+            let too_future = snapshot_unix_ns.saturating_sub(now_ns) > staleness_ns;
             if too_old || too_future {
                 return Ok(SeedStats {
                     stale: true,
@@ -1354,6 +1368,8 @@ impl MaintainMemo {
                 });
             }
         }
+
+        let decoded = decode_snapshot(snapshot, limits.max_entries)?;
 
         let mut stats = SeedStats {
             stale: false,
@@ -2312,6 +2328,46 @@ mod memo_snapshot_tests {
         assert_eq!(body.len(), 47, "500 hours collapse to one frontier run");
     }
 
+    /// The staleness gate reads the verified frame's timestamp and runs before
+    /// the decoder: a stale snapshot, and a stale one whose body would not
+    /// decode, both return `stale` with the decoder never called, while the
+    /// same snapshot inside the bound is decoded exactly once.
+    #[test]
+    fn stale_snapshot_is_refused_before_decode() {
+        let t = tenant();
+        let mut memo = MaintainMemo::with_default_interval();
+        memo.mark_terminal((t, Signal::Metrics, 0, 1), TerminalState::Compacted, 0);
+        let bytes = encode(&memo, 0);
+        let undecodable = frame(&[0xFF; 8], 0);
+        let now = DEFAULT_MEMO_SNAPSHOT_STALENESS_NS + 1;
+        assert_eq!(verified(bytes.clone()).snapshot_unix_ns(), 0);
+
+        let before = decode_calls::get();
+        for stale in [&bytes, &undecodable] {
+            let stats = seed(
+                &mut MaintainMemo::with_default_interval(),
+                stale,
+                now,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("a stale snapshot is not decoded, so it cannot fail to decode");
+            assert!(stats.stale);
+        }
+        assert_eq!(decode_calls::get() - before, 0);
+
+        let stats = seed(
+            &mut MaintainMemo::with_default_interval(),
+            &bytes,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
+        assert!(!stats.stale);
+        assert_eq!(decode_calls::get() - before, 1);
+    }
+
     /// The whole-snapshot staleness gate excludes an old snapshot: nothing is
     /// seeded and `stale` is set, exactly one re-verify interval past the write.
     #[test]
@@ -2803,9 +2859,10 @@ mod memo_snapshot_tests {
         );
     }
 
-    /// Each run's capacity is reserved exactly: a unit of a three-hour
-    /// frontier and a three-hour exception holds six entries in six slots,
-    /// where growth by doubling would leave eight.
+    /// Each unit's capacity is reserved once, exactly, for the entries its
+    /// runs admitted: a unit of a three-hour frontier and a three-hour
+    /// exception holds six entries in six slots, where growth by doubling
+    /// would leave eight.
     #[test]
     fn decoded_unit_capacity_matches_its_entries() {
         let bytes = raw_snapshot(&[RawUnit {

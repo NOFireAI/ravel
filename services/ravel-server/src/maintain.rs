@@ -4075,21 +4075,25 @@ struct ReseedOutcome {
 
 /// Read every memo snapshot under `keys` and seed `memo` from the verified ones
 /// ([`read_all_memo_snapshots`], then [`seed_memo_from_snapshots`]), with
-/// `now_ns` read after the store reads. Rejected objects are logged once per
-/// call with their per-reason counts: at warn when any was oversize, an
-/// unknown tag or a bad MAC (each means a writer this process does not
-/// recognise, or one past the cap), at debug when the only rejects are
-/// non-UUID keys or malformed objects. Only a failed LIST or GET is an `Err`.
+/// `now_ns` read once before the store reads, for the modification time skip,
+/// and once after, for the seed-time staleness gate. Rejected objects are
+/// logged once per call with their per-reason counts: at warn when any was
+/// oversize, an unknown tag or a bad MAC (each means a writer this process
+/// does not recognise, or one past the cap), at debug when the only rejects
+/// are stale, non-UUID keys or malformed objects. A stale object is one whose
+/// modification time is past [`ravel_maintain::MEMO_SNAPSHOT_MTIME_SKIP_NS`],
+/// which a process gone since before an upgrade or a key rotation leaves
+/// behind. Only a failed LIST or GET is an `Err`.
 async fn reseed_memo(
     store: &dyn ObjectStoreBackend,
     keys: &MaintainRecordKeys,
     limits: MemoSnapshotLimits,
     memo: &mut MaintainMemo,
-    now_ns: impl FnOnce() -> i64,
+    now_ns: impl Fn() -> i64,
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> Result<ReseedOutcome, StoreError> {
-    let read = read_all_memo_snapshots(store, keys, limits).await?;
+    let read = read_all_memo_snapshots(store, keys, limits, now_ns()).await?;
     let rejects = read.rejects;
     log_memo_snapshot_rejects(&rejects, limits);
     let (units, buckets) =
@@ -4117,6 +4121,7 @@ fn log_memo_snapshot_rejects(rejects: &MemoSnapshotRejects, limits: MemoSnapshot
             oversize = count(MemoSnapshotReject::Oversize),
             malformed = count(MemoSnapshotReject::Malformed),
             non_uuid_key = count(MemoSnapshotReject::NonUuidKey),
+            stale = count(MemoSnapshotReject::Stale),
             cap_bytes = limits.max_bytes,
             "maintenance: rejected memo snapshots that did not verify under the maintain \
              key file or exceed the size cap; cold start for their units (ADR-3130)"
@@ -4125,7 +4130,9 @@ fn log_memo_snapshot_rejects(rejects: &MemoSnapshotRejects, limits: MemoSnapshot
         tracing::debug!(
             malformed = count(MemoSnapshotReject::Malformed),
             non_uuid_key = count(MemoSnapshotReject::NonUuidKey),
-            "maintenance: rejected malformed memo snapshot objects; cold start for their units"
+            stale = count(MemoSnapshotReject::Stale),
+            "maintenance: rejected stale or malformed memo snapshot objects; cold start for \
+             their units"
         );
     }
 }
@@ -9044,6 +9051,7 @@ mod tests {
             &store,
             test_membership().keys(),
             MemoSnapshotLimits::DEFAULT,
+            now,
         )
         .await
         .expect("read snapshots")
@@ -9255,6 +9263,7 @@ mod tests {
             &store,
             test_membership().keys(),
             MemoSnapshotLimits::DEFAULT,
+            snap_now,
         )
         .await
         .expect("read snapshots")
@@ -13974,7 +13983,7 @@ mod memo_snapshot_cap_tests {
         );
         assert_eq!(store.metrics().snapshot().put.calls, 1);
 
-        let read = read_all_memo_snapshots(&store, &keys, SMALL)
+        let read = read_all_memo_snapshots(&store, &keys, SMALL, NOW_NS)
             .await
             .expect("read");
         assert_eq!(read.rejects.total(), 0);
@@ -14079,8 +14088,15 @@ mod memo_snapshot_auth_tests {
 
     use super::*;
 
-    const NOW_NS: i64 = 1_000_000_000_000;
+    /// 100 hours past the epoch, so a store clock past
+    /// [`ravel_maintain::MEMO_SNAPSHOT_MTIME_SKIP_NS`] before it is positive.
+    const NOW_NS: i64 = 100 * 3_600_000_000_000;
     const HOURS: u32 = 3;
+
+    /// A store clock, in milliseconds, one millisecond past
+    /// [`ravel_maintain::MEMO_SNAPSHOT_MTIME_SKIP_NS`] before [`NOW_NS`].
+    const STALE_MTIME_MS: u64 =
+        ((NOW_NS - ravel_maintain::MEMO_SNAPSHOT_MTIME_SKIP_NS) / 1_000_000 - 1) as u64;
 
     fn tenant() -> TenantHash {
         TenantId::new("acme").hash()
@@ -14326,10 +14342,64 @@ mod memo_snapshot_auth_tests {
         (outcome, events)
     }
 
-    /// One reseed over a bad-MAC, an unknown-tag, an oversize, a malformed and
-    /// a non-UUID-key object logs exactly one WARN carrying every per-reason
-    /// count. A reseed whose only rejects are malformed or non-UUID keys logs
-    /// no WARN.
+    /// Write `bytes` at `writer`'s memo key with the store clock at
+    /// `mtime_ms`, then put the clock back to 0 (no modification time) for
+    /// later writes.
+    async fn write_at(store: &MemoryStore, mtime_ms: u64, writer: Uuid, bytes: Vec<u8>) {
+        store.set_clock_ms(mtime_ms);
+        write_memo_snapshot(store, &writer, bytes)
+            .await
+            .expect("write");
+        store.set_clock_ms(0);
+    }
+
+    fn tag_one_frame() -> Vec<u8> {
+        let mut tag_one = vec![1u8];
+        tag_one.extend_from_slice(&NOW_NS.to_le_bytes());
+        tag_one.extend_from_slice(&suppressing_body());
+        tag_one
+    }
+
+    fn rotated_out_frame(writer: Uuid) -> Vec<u8> {
+        MaintainMemo::snapshot_bytes_from_body(&suppressing_body(), NOW_NS, &writer, &other_keys())
+    }
+
+    /// What a process gone since before the upgrade (a tag-1 frame) and one
+    /// gone since its key was rotated out (a frame under a key the reader no
+    /// longer holds) leave behind: with a modification time past
+    /// [`ravel_maintain::MEMO_SNAPSHOT_MTIME_SKIP_NS`] both count as stale and
+    /// the reseed logs no WARN; the same objects with a fresh modification
+    /// time count as an unknown tag and a bad MAC and log one WARN.
+    #[tokio::test]
+    async fn leftovers_past_the_mtime_bound_are_stale_and_do_not_warn() {
+        let (old, rotated) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let fresh_mtime_ms = (NOW_NS / 1_000_000) as u64;
+        for (mtime_ms, stale) in [(STALE_MTIME_MS, true), (fresh_mtime_ms, false)] {
+            let store = MemoryStore::new();
+            write_at(&store, mtime_ms, old, tag_one_frame()).await;
+            write_at(&store, mtime_ms, rotated, rotated_out_frame(rotated)).await;
+            let (outcome, events) = reseed_logging(&store, MemoSnapshotLimits::DEFAULT).await;
+            let warns = events
+                .iter()
+                .filter(|(level, _)| *level == tracing::Level::WARN)
+                .count();
+            assert_eq!(outcome.rejects.total(), 2);
+            assert_eq!((outcome.units, outcome.buckets), (0, 0));
+            if stale {
+                assert_eq!(outcome.rejects.get(MemoSnapshotReject::Stale), 2);
+                assert_eq!(warns, 0, "stale leftovers log below warn: {events:?}");
+            } else {
+                assert_eq!(outcome.rejects.get(MemoSnapshotReject::UnknownTag), 1);
+                assert_eq!(outcome.rejects.get(MemoSnapshotReject::BadMac), 1);
+                assert_eq!(warns, 1, "{events:?}");
+            }
+        }
+    }
+
+    /// One reseed over a stale, a bad-MAC, an unknown-tag, an oversize, a
+    /// malformed and a non-UUID-key object logs exactly one WARN carrying
+    /// every per-reason count. A reseed whose only rejects are stale,
+    /// malformed or non-UUID keys logs no WARN.
     #[tokio::test]
     async fn reseed_warns_once_with_per_reason_counts() {
         let limits = MemoSnapshotLimits {
@@ -14337,23 +14407,13 @@ mod memo_snapshot_auth_tests {
             ..MemoSnapshotLimits::DEFAULT
         };
         let store = MemoryStore::new();
+        let gone = Uuid::from_u128(5);
+        write_at(&store, STALE_MTIME_MS, gone, rotated_out_frame(gone)).await;
         let forger = Uuid::from_u128(1);
-        write_memo_snapshot(
-            &store,
-            &forger,
-            MaintainMemo::snapshot_bytes_from_body(
-                &suppressing_body(),
-                NOW_NS,
-                &forger,
-                &other_keys(),
-            ),
-        )
-        .await
-        .expect("write");
-        let mut tag_one = vec![1u8];
-        tag_one.extend_from_slice(&NOW_NS.to_le_bytes());
-        tag_one.extend_from_slice(&suppressing_body());
-        write_memo_snapshot(&store, &Uuid::from_u128(2), tag_one)
+        write_memo_snapshot(&store, &forger, rotated_out_frame(forger))
+            .await
+            .expect("write");
+        write_memo_snapshot(&store, &Uuid::from_u128(2), tag_one_frame())
             .await
             .expect("write");
         write_memo_snapshot(&store, &Uuid::from_u128(3), vec![2u8; 257])
@@ -14370,7 +14430,7 @@ mod memo_snapshot_auth_tests {
         .await;
 
         let (outcome, events) = reseed_logging(&store, limits).await;
-        assert_eq!(outcome.rejects.total(), 5);
+        assert_eq!(outcome.rejects.total(), 6);
         for reason in MemoSnapshotReject::ALL {
             assert_eq!(outcome.rejects.get(reason), 1, "{}", reason.reason());
         }
@@ -14386,11 +14446,13 @@ mod memo_snapshot_auth_tests {
             "oversize=1",
             "malformed=1",
             "non_uuid_key=1",
+            "stale=1",
         ] {
             assert!(warns[0].contains(field), "{field} in {}", warns[0]);
         }
 
         let quiet = MemoryStore::new();
+        write_at(&quiet, STALE_MTIME_MS, gone, rotated_out_frame(gone)).await;
         write_memo_snapshot(&quiet, &Uuid::from_u128(4), vec![2u8; 10])
             .await
             .expect("write");
@@ -14401,12 +14463,13 @@ mod memo_snapshot_auth_tests {
         )
         .await;
         let (outcome, events) = reseed_logging(&quiet, limits).await;
-        assert_eq!(outcome.rejects.total(), 2);
+        assert_eq!(outcome.rejects.total(), 3);
+        assert_eq!(outcome.rejects.get(MemoSnapshotReject::Stale), 1);
         assert!(
             events
                 .iter()
                 .all(|(level, _)| *level != tracing::Level::WARN),
-            "malformed and non-UUID keys log below warn: {events:?}"
+            "stale, malformed and non-UUID keys log below warn: {events:?}"
         );
     }
 }

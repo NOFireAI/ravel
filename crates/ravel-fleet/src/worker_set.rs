@@ -356,7 +356,7 @@ pub const REAP_WINDOW_FACTOR: i64 = 2;
 /// [`REAP_WINDOW_FACTOR`], which is the clock-skew margin between the object
 /// store's clock (which stamps the modification time reaping reads) and this
 /// reader's.
-pub(crate) fn reap_horizon_ns(window_ns: i64) -> i64 {
+pub const fn reap_horizon_ns(window_ns: i64) -> i64 {
     window_ns.saturating_mul(REAP_WINDOW_FACTOR)
 }
 
@@ -374,7 +374,7 @@ pub(crate) fn reap_horizon_ns(window_ns: i64) -> i64 {
 /// modification time (the in-memory oracle's default clock does exactly this).
 /// That is "unknown", never "ancient": the key is read normally and never
 /// reaped.
-pub(crate) fn mtime_stale(now_ns: i64, last_modified_unix_ms: i64, window_ns: i64) -> bool {
+pub fn mtime_stale(now_ns: i64, last_modified_unix_ms: i64, window_ns: i64) -> bool {
     if last_modified_unix_ms <= 0 {
         return false;
     }
@@ -799,8 +799,6 @@ mod tests {
         keys
     }
 
-    /// The rendezvous hash is deterministic: same unit key and live set yields
-    /// the same owner every call, with no hidden randomness.
     /// The memo snapshot keys and the heartbeat record keys are derived from
     /// one file key under different contexts, so a MAC minted for one never
     /// verifies as the other over the same claim bytes. A second file key
@@ -842,6 +840,8 @@ mod tests {
         assert_ne!(both.memo_mac(claim), minted_by_k2);
     }
 
+    /// The rendezvous hash is deterministic: same unit key and live set yields
+    /// the same owner every call, with no hidden randomness.
     #[test]
     fn owner_is_deterministic() {
         let live: Vec<Uuid> = (0..5).map(|_| Uuid::new_v4()).collect();

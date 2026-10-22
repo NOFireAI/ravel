@@ -113,7 +113,8 @@ pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };
 pub use memo_snapshot::{
-    MEMO_PREFIX, MemoSnapshotRead, memo_key, read_all_memo_snapshots, write_memo_snapshot,
+    MEMO_PREFIX, MEMO_SNAPSHOT_MTIME_SKIP_NS, MemoSnapshotRead, memo_key, read_all_memo_snapshots,
+    write_memo_snapshot,
 };
 pub use migrate::{
     BelowTargetReport, BlockedBucket, BlockedReason, FamilyCensus, FamilyMigrateReport,
