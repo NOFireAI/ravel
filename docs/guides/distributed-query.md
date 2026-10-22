@@ -1027,9 +1027,10 @@ first batch does.
 
 What they do not catch: a live worker that is stuck before its first
 response while its HTTP/2 layer still answers PINGs, for example a slice
-blocked on a hung storage read. There is no per-attempt or
-time-to-first-response deadline. Such a slice holds its query until the query
-deadline.
+blocked on a hung storage read; and a peer that completes TLS but never
+finishes the HTTP/2 handshake, since keepalive PINGs start only once that
+handshake has completed. There is no per-attempt or time-to-first-response
+deadline. Such a slice holds its query until the query deadline.
 
 Two invariants make the retry logic safe. They help when you read a trace:
 
