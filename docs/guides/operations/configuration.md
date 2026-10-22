@@ -2021,14 +2021,16 @@ ten-connection concurrent SQL load:
 - Heap profiles found up to 12.7 GB of live SQL aggregation and scan state
   not charged to the budget.
 - Pages the allocator retained for reuse ranged from 2.5 to 6.6 GB at peak
-  (resident minus allocated), before C-library allocations.
+  (resident minus allocated), before C-library allocations, measured at an
+  8 GB budget. Retention follows the allocator's free and reuse churn, not
+  the budget value.
 - On a 32 GB host shared with an object store, with the flag at 24 GiB
   (25.8 GB), the resident set peaked at 29.2 GB, 3.4 GB above the flag; the
   host's own memory, not the budget, capped that run.
 
-These figures come from a 24 GiB budget at ten concurrent connections, and
-the uncharged query state grows with the budget and the concurrency. At
-that size and load, the resident set can exceed the flag by about 20 GB
+The uncharged query state was measured at a 24 GiB budget at ten concurrent
+connections, and it grows with the budget and the concurrency. At that size
+and load, the resident set can exceed the flag by about 20 GB
 when the charged allocations are near the budget, so leave about that much
 between the flag and the memory the other processes leave free. On a host
 too small to leave that much, lower the flag or the query concurrency
