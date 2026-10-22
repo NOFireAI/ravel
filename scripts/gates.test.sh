@@ -238,6 +238,17 @@ run_stubbed unknown bash "${SCRIPTS}/gates.sh" -p ravel-nope --dry-run
 check_eq "gates -p ravel-nope: exit 2" "2" "${rc}"
 check_eq "gates -p ravel-nope: no command listed" "0" "$(count_matching "${tmp}/unknown.out" '^==> cargo ')"
 
+# The documentation claims registry check CI's doc-scripts job runs is in the
+# ordinary gate run too (issue #3188): an invocation on a non-comment line,
+# after the dry-run exit, so a real run reaches it. The source guards are
+# skipped under --dry-run, so this reads the script instead of running it.
+dry_exit_line="$(grep -n 'gates.sh: dry run;' "${SCRIPTS}/gates.sh" | head -1 | cut -d: -f1)"
+claims_line="$(grep -n '^python3 .*check-doc-claims\.py"$' "${SCRIPTS}/gates.sh" | head -1 | cut -d: -f1)"
+check_eq "gates: runs check-doc-claims.py" "1" \
+  "$(grep -c '^python3 .*check-doc-claims\.py"$' "${SCRIPTS}/gates.sh")"
+check_eq "gates: check-doc-claims.py runs after the dry-run exit" "1" \
+  "$([[ -n "${dry_exit_line}" && -n "${claims_line}" && ${claims_line} -gt ${dry_exit_line} ]] && echo 1 || echo 0)"
+
 # --- affected-tests.sh --------------------------------------------------
 
 # -n prints the closure line and nothing else, and runs no test.
