@@ -89,12 +89,48 @@ use ravel_types::{Signal, TenantHash, TimeRange};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
-/// Bound on establishing a channel to a remote worker. A dead or unreachable
-/// worker must never stall a query: the coordinator times out here and falls
-/// back to local execution (ADR-0071 failure semantics), since it can always
-/// read any slice itself. Without this bound a black-holed endpoint blocks on
-/// the kernel's TCP SYN timeout (often over two minutes).
-const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Bound on the TCP connect to a remote worker. An unreachable worker times
+/// out here and the slice falls back to local execution (ADR-0071 failure
+/// semantics), since the coordinator can always read any slice itself.
+/// Without this bound a black-holed endpoint blocks on the kernel's TCP SYN
+/// timeout (often over two minutes). It covers the connect only: the TLS
+/// handshake is bounded by [`TLS_HANDSHAKE_TIMEOUT`].
+pub const REMOTE_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound on the TLS handshake of every client TLS configuration this process
+/// dials a gRPC peer with: [`fragment_client_tls`] (both distributed lanes) and
+/// a federated remote's. `connect_timeout` bounds the TCP connect only, so a
+/// peer that accepts the connection and never completes TLS would otherwise
+/// hold the dial until the query's deadline. A handshake that times out fails
+/// the dial as a transport error, which takes the same path as a refused
+/// connection on each lane.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long an intra-cluster or federation HTTP/2 connection may go without
+/// receiving a frame before the client sends a keepalive PING.
+pub const HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long the client waits for that PING's acknowledgement before it closes
+/// the connection. A peer or path that goes silent after connecting is then
+/// detected within [`HTTP2_KEEPALIVE_INTERVAL`] plus this, and the in-flight
+/// fetch fails as a transport error rather than waiting for the query
+/// deadline. A worker whose HTTP/2 layer still answers PINGs while its fetch
+/// is stuck is not detected here; the query deadline bounds that case.
+pub const HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether keepalive PINGs are sent on a connection with no open stream. On,
+/// so a cached channel whose peer died between queries is probed while idle
+/// rather than only once a query sends on it.
+pub const HTTP2_KEEPALIVE_WHILE_IDLE: bool = true;
+
+/// Apply the HTTP/2 keepalive this process uses on every intra-cluster and
+/// federation dial.
+fn with_http2_keepalive(endpoint: tonic::transport::Endpoint) -> tonic::transport::Endpoint {
+    endpoint
+        .http2_keep_alive_interval(HTTP2_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(HTTP2_KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(HTTP2_KEEPALIVE_WHILE_IDLE)
+}
 
 /// The per-message ceiling on a fragment response frame this coordinator will
 /// decode, set on every outbound `SeriesFetchClient` (issue #1687).
@@ -670,11 +706,13 @@ pub const FRAGMENT_TLS_SERVER_NAME: &str = "ravel-fragment";
 /// verifies [`FRAGMENT_TLS_SERVER_NAME`], and presents this process's own
 /// fragment certificate, since the listener requires one signed by that CA
 /// (issue #1690). One key pair serves both directions: every fragment process
-/// is both a worker and a coordinator.
+/// is both a worker and a coordinator. The handshake is bounded by
+/// [`TLS_HANDSHAKE_TIMEOUT`].
 pub fn fragment_client_tls(
     listener: &crate::config::FragmentListenerSettings,
 ) -> tonic::transport::ClientTlsConfig {
     tonic::transport::ClientTlsConfig::new()
+        .timeout(TLS_HANDSHAKE_TIMEOUT)
         .ca_certificate(tonic::transport::Certificate::from_pem(
             &listener.tls_ca_pem,
         ))
@@ -2055,15 +2093,20 @@ impl RoutingSliceFetcher {
     /// operator CA with the fixed [`FRAGMENT_TLS_SERVER_NAME`] server name
     /// (ADR-0071 amendment decision 1): the coordinator authenticates that it
     /// reached a real cluster worker before any capability crosses the wire.
+    /// The TCP connect, the TLS handshake and a silent connection are each
+    /// bounded ([`REMOTE_CONNECT_TIMEOUT`], [`TLS_HANDSHAKE_TIMEOUT`],
+    /// [`HTTP2_KEEPALIVE_INTERVAL`] plus [`HTTP2_KEEPALIVE_TIMEOUT`]), and each
+    /// fails as a [`DistribError::Transport`].
     async fn channel(&self, endpoint: &str) -> Result<Channel, DistribError> {
         if let Some(channel) = self.channels.lock().get(endpoint).cloned() {
             return Ok(channel);
         }
-        let channel = Channel::from_shared(format!("https://{endpoint}"))
+        let endpoint_config = Channel::from_shared(format!("https://{endpoint}"))
             .map_err(|e| {
                 DistribError::Transport(format!("invalid worker endpoint {endpoint}: {e}"))
             })?
-            .connect_timeout(REMOTE_CONNECT_TIMEOUT)
+            .connect_timeout(REMOTE_CONNECT_TIMEOUT);
+        let channel = with_http2_keepalive(endpoint_config)
             .tls_config(self.client_tls.clone())
             .map_err(|e| {
                 DistribError::Transport(format!(
@@ -2487,8 +2530,11 @@ impl FederationSliceFetcher {
                 )
             })?
             .connect_timeout(REMOTE_CONNECT_TIMEOUT);
+        endpoint = with_http2_keepalive(endpoint);
         if config.tls {
-            let mut tls = tonic::transport::ClientTlsConfig::new().with_native_roots();
+            let mut tls = tonic::transport::ClientTlsConfig::new()
+                .with_native_roots()
+                .timeout(TLS_HANDSHAKE_TIMEOUT);
             if let Some(ca_file) = &config.tls_ca_file {
                 let pem = std::fs::read(ca_file).map_err(|e| {
                     anyhow::anyhow!(
@@ -8215,5 +8261,19 @@ iFSzkVWOOnkdu5oasgIhAJFMWNwX8xQfZBeOpm6+wokjn/GMaPeQCes2yQ3Zcyir
             );
             assert_eq!(routing.metrics.quarantine_marks_total(), 1, "{name}");
         }
+    }
+
+    /// The SQL lane's slice dials carry the same HTTP/2 keepalive as this
+    /// lane's; ravel-sql cannot name these constants, so it keeps its own.
+    #[cfg(feature = "flight-sql")]
+    #[test]
+    fn sql_lane_keepalive_matches_this_lane() {
+        use ravel_sql::distributed::{
+            SLICE_HTTP2_KEEPALIVE_INTERVAL, SLICE_HTTP2_KEEPALIVE_TIMEOUT,
+            SLICE_HTTP2_KEEPALIVE_WHILE_IDLE,
+        };
+        assert_eq!(HTTP2_KEEPALIVE_INTERVAL, SLICE_HTTP2_KEEPALIVE_INTERVAL);
+        assert_eq!(HTTP2_KEEPALIVE_TIMEOUT, SLICE_HTTP2_KEEPALIVE_TIMEOUT);
+        assert_eq!(HTTP2_KEEPALIVE_WHILE_IDLE, SLICE_HTTP2_KEEPALIVE_WHILE_IDLE);
     }
 }
