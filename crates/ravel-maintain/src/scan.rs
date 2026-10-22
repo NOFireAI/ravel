@@ -460,15 +460,15 @@ pub const DEFAULT_MEMO_SNAPSHOT_STALENESS_NS: i64 = DEFAULT_MEMO_REVERIFY_INTERV
 /// encodes in 17 bytes (two four-byte hour fields, a one-byte state, an
 /// eight-byte verify time), so 32 MiB holds about 1.97 million runs, each one
 /// or more terminal hours. The reader skips a larger object
-/// unread ([`crate::memo_snapshot::read_all_memo_snapshots`]); the writer
-/// does not write one, so an honest process over the cap leaves its units to
-/// a cold rescan on the next reseed, never a correctness change.
+/// ([`crate::memo_snapshot::read_all_memo_snapshots`]) and the maintain loop's
+/// writer does not write one, so an honest process over the cap leaves its
+/// units to a cold rescan on the next reseed, never a correctness change.
 pub const MAX_MEMO_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Largest number of per-hour terminal entries one decoded memo snapshot may
 /// expand to (issue #3199): 4,194,304. A decoded entry is 16 bytes (a `u32`
-/// hour, a one-byte state, an `i64` verify time, padded), so this bounds one
-/// decoded snapshot's entry allocation at 64 MiB however long the runs it
+/// hour, a one-byte state, an `i64` verify time, padded), so this bounds the
+/// entries one decoded snapshot holds at 64 MiB however long the runs it
 /// carries claim to be. The count is snapshot-wide, across every unit and run,
 /// and is checked before a run is expanded. An honest process whose memo holds
 /// more terminal entries writes no snapshot, which costs its units a cold

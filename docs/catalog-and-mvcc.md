@@ -147,7 +147,13 @@ payload is a versioned-tag advisory record -- membership/warm-start state,
 deliberately **not** a lease -- and losing, staling, or corrupting it costs at
 most a rescan of the affected units, never correctness (the ADR-0003
 HEAD-pointer precedent). Nothing deletes these snapshots (staleness detection
-replaces a sweep; a bounded cleanup sweep is a future step if it ever matters).
+replaces a sweep; a bounded cleanup sweep is a future step if it ever matters). A
+reader skips an object over 32 MiB (`MAX_MEMO_SNAPSHOT_BYTES`), judged by its
+listed size and by a range GET of the cap plus one byte, and the decoder
+refuses a snapshot whose runs expand to more than 4,194,304 per-hour entries
+(`MAX_MEMO_SNAPSHOT_ENTRIES`); a writer whose snapshot is over either cap
+skips the write, leaving its units to a cold rescan (ADR-0065 snapshot size cap
+amendment).
 
 `sys/maintain/claims/compaction/<work_id_hex>` (ADR-1029 §1, Accepted) is the
 maintain role's advisory work-claim keyspace, the third root-level prefix
