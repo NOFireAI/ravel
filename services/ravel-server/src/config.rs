@@ -2412,7 +2412,8 @@ pub struct Cli {
     /// Cap on the decoded bytes one OTAP `BatchArrowRecords` may hold across
     /// all of its payloads, summed before each payload is decoded. A batch
     /// over the cap is nacked `INVALID_ARGUMENT` with "decoded batch exceeds
-    /// cap of N bytes" and the stream stays open. Each payload may decode to
+    /// cap of N bytes"; the stream then ends if an earlier payload of that
+    /// batch was already decoded, and stays open otherwise. Each payload may decode to
     /// its own 16 MiB cap, so a batch carrying several payload types can
     /// need more than the default; raise this, or lower the exporter's batch
     /// size. `0` is refused. Like `--otap`, the flag only exists in a build
