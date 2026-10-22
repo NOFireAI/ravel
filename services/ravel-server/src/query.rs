@@ -638,6 +638,76 @@ pub(crate) fn ddl_min_grace_ms(max_query_duration_ns: i64) -> anyhow::Result<u64
     Ok(grace_ms)
 }
 
+/// `source` of a `cache_bulk_scan_min_bytes` line whose threshold is
+/// `--cache-bulk-scan-min-bytes` as given: no read cache, or a flag at or
+/// above the read cache's `--cache-max-bytes`.
+pub const BULK_SCAN_SOURCE_FLAG: &str = "flag";
+/// `source` of a `cache_bulk_scan_min_bytes` line whose threshold is the read
+/// cache's `--cache-max-bytes`, because the flag was below it.
+pub const BULK_SCAN_SOURCE_CACHE_FLOOR: &str = "flag-floored-to-cache-max-bytes";
+/// `source` of a `cache_bulk_scan_min_bytes` line when the flag is unset and
+/// the size trigger is off.
+pub const BULK_SCAN_SOURCE_UNSET: &str = "unset";
+
+/// The bulk-scan size trigger threshold startup resolved, and where it came
+/// from.
+#[cfg(feature = "sql")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedBulkScanMinBytes {
+    /// What the executor applies; `None` is the size trigger off.
+    pub value: Option<u64>,
+    /// `--cache-bulk-scan-min-bytes` as the operator set it.
+    pub flag: Option<u64>,
+    /// One of the `BULK_SCAN_SOURCE_*` constants.
+    pub source: &'static str,
+}
+
+/// Resolve the size trigger's threshold from `--cache-bulk-scan-min-bytes`
+/// and the in-memory read cache's `max_bytes` (`None` when the process runs
+/// without a read cache), through [`ravel_sql::effective_bulk_scan_min_bytes`].
+#[cfg(feature = "sql")]
+pub fn resolve_cache_bulk_scan_min_bytes(
+    flag: Option<u64>,
+    cache_max_bytes: Option<u64>,
+) -> ResolvedBulkScanMinBytes {
+    let value = ravel_sql::effective_bulk_scan_min_bytes(flag, cache_max_bytes);
+    let source = match flag {
+        None => BULK_SCAN_SOURCE_UNSET,
+        Some(_) if value != flag => BULK_SCAN_SOURCE_CACHE_FLOOR,
+        Some(_) => BULK_SCAN_SOURCE_FLAG,
+    };
+    ResolvedBulkScanMinBytes {
+        value,
+        flag,
+        source,
+    }
+}
+
+#[cfg(feature = "sql")]
+impl ResolvedBulkScanMinBytes {
+    /// The `cache_bulk_scan_min_bytes` startup line, in the
+    /// `performance default resolved` layout
+    /// [`crate::config::ResolvedPerformanceDefaults::emit`] uses, carrying the
+    /// flag as given beside the value in force.
+    pub fn emit(&self) {
+        match self.value {
+            Some(value) => tracing::info!(
+                setting = "cache_bulk_scan_min_bytes",
+                value,
+                source = self.source,
+                flag = self.flag,
+                "performance default resolved"
+            ),
+            None => tracing::info!(
+                setting = "cache_bulk_scan_min_bytes",
+                value = "none",
+                source = self.source,
+                "performance default resolved"
+            ),
+        }
+    }
+}
+
 /// `source` of a `sql_spill_dir`/`sql_spill_max_bytes` line whose value came
 /// from the `RAVEL_SQL_SPILL_DIR`/`RAVEL_SQL_SPILL_MAX_BYTES` pair.
 pub const SQL_SPILL_SOURCE_ENV: &str = "env";
@@ -1099,9 +1169,10 @@ fn sweep_spill_roots(cache_dir: &std::path::Path) -> Vec<LeftSpillRoot> {
 /// installed via `SqlExecutor::with_ipcrypt_deployment`. [`build_sql_state`]
 /// installs the default, which holds no key and so registers neither.
 ///
-/// `cache_bulk_scan_min_bytes` (`--cache-bulk-scan-min-bytes`, ADR-3072's
-/// size trigger amendment) is installed via
-/// `SqlExecutor::with_cache_bulk_scan_min_bytes`. [`build_sql_state`]
+/// `cache_bulk_scan_min_bytes` is the read-bytes threshold of ADR-3072's size
+/// trigger amendments, as [`resolve_cache_bulk_scan_min_bytes`] resolved it
+/// from `--cache-bulk-scan-min-bytes` and the read cache's size, installed
+/// via `SqlExecutor::with_cache_bulk_scan_min_bytes`. [`build_sql_state`]
 /// installs `None`, the predicate-free bulk-scan rule alone.
 #[cfg(feature = "sql")]
 #[allow(clippy::too_many_arguments)]
@@ -3010,6 +3081,74 @@ mod tests {
             .collect();
         assert_eq!(matching.len(), 1, "exactly one {setting} line: {lines:?}");
         matching[0].clone()
+    }
+
+    /// The size trigger threshold startup resolves is the flag raised to the
+    /// read cache's `max_bytes`, and its one startup line says which applied:
+    /// a flag below a 6,184,752,906-byte cache resolves to the cache size with
+    /// source `flag-floored-to-cache-max-bytes`; a flag above it, or a flag
+    /// with no read cache, resolves to the flag; no flag leaves the trigger
+    /// off whatever the cache.
+    ///
+    /// FLIP: resolving to the flag as given reads the floored case as
+    /// 1,000,000,000 with source `flag`.
+    #[test]
+    fn the_bulk_scan_threshold_is_floored_at_the_cache_size_and_logged_once() {
+        const CACHE: u64 = 6_184_752_906;
+        for (label, flag, cache_max_bytes, value, source, line) in [
+            (
+                "flag below the cache",
+                Some(1_000_000_000),
+                Some(CACHE),
+                Some(CACHE),
+                BULK_SCAN_SOURCE_CACHE_FLOOR,
+                " setting=\"cache_bulk_scan_min_bytes\" value=6184752906 \
+                 source=\"flag-floored-to-cache-max-bytes\" flag=1000000000",
+            ),
+            (
+                "flag above the cache",
+                Some(8_000_000_000),
+                Some(CACHE),
+                Some(8_000_000_000),
+                BULK_SCAN_SOURCE_FLAG,
+                " setting=\"cache_bulk_scan_min_bytes\" value=8000000000 \
+                 source=\"flag\" flag=8000000000",
+            ),
+            (
+                "flag with no read cache",
+                Some(1_000_000_000),
+                None,
+                Some(1_000_000_000),
+                BULK_SCAN_SOURCE_FLAG,
+                " setting=\"cache_bulk_scan_min_bytes\" value=1000000000 \
+                 source=\"flag\" flag=1000000000",
+            ),
+            (
+                "no flag",
+                None,
+                Some(CACHE),
+                None,
+                BULK_SCAN_SOURCE_UNSET,
+                " setting=\"cache_bulk_scan_min_bytes\" value=\"none\" source=\"unset\"",
+            ),
+        ] {
+            let resolved = resolve_cache_bulk_scan_min_bytes(flag, cache_max_bytes);
+            assert_eq!(
+                resolved,
+                ResolvedBulkScanMinBytes {
+                    value,
+                    flag,
+                    source
+                },
+                "{label}"
+            );
+            let (capture, guard) = capture_info();
+            resolved.emit();
+            drop(guard);
+            let lines = capture.0.lock().clone();
+            let resolved_line = resolved_line(&lines, "cache_bulk_scan_min_bytes");
+            assert!(resolved_line.contains(line), "{label}: {resolved_line}");
+        }
     }
 
     /// `--cache-dir` alone derives the ceiling from the free bytes measured at

@@ -2497,21 +2497,31 @@ pub struct Cli {
     )]
     pub cache_bulk_share: f64,
 
-    /// Resolved bytes, a positive count, at or above which a filtered `logs` statement sent as SQL text also reads as a bulk scan, unless it is a KEY_IDX key lookup; default unset, which leaves only the predicate-free rule `--cache-bulk-share` describes.
+    /// Read bytes, a positive count, at or above which a filtered `logs` statement sent as SQL text reads as a bulk scan from its next execution, unless it is a KEY_IDX key lookup; raised to `--cache-max-bytes` when that is larger; default unset, which leaves only the predicate-free rule `--cache-bulk-share` describes.
     ///
     /// Set, a statement is also a bulk scan (ADR-3072's size trigger
-    /// amendment) when it arrives as SQL text, names one `logs` table and no
-    /// Parquet table, the segments its resolve returned sum to at least this
-    /// many bytes of `object_size` before any read, and its optimized plan
-    /// has no equality, anywhere, on a field the tenant indexes in KEY_IDX (a
-    /// `key_index` declared column, or `trace_id` when that is indexed). A key
-    /// lookup stays interactive however much it resolves, since the KEY_IDX
-    /// probe reads a few blocks of each segment. A `samples` statement and a
-    /// lowered ES|QL statement never read as bulk through this threshold. The
-    /// decision is made after resolve and before the first segment read, and
-    /// the statement's `stats.cache.intent` reports the intent. Read at
-    /// startup only. Ignored when the fetcher cache is off. `0` is refused at
-    /// startup; omit the flag to leave the trigger off.
+    /// amendments) when it arrives as SQL text, names one `logs` table and no
+    /// Parquet table, the same tenant's same statement text read at least
+    /// the threshold on its last successful execution (bytes served from the
+    /// read cache plus bytes fetched from the store, every phase), and its
+    /// optimized plan has no equality, anywhere, on a field the tenant
+    /// indexes in KEY_IDX (a `key_index` declared column, or `trace_id` when
+    /// that is indexed). A statement's first execution has no record and
+    /// reads as interactive, and so does every execution of a statement whose
+    /// text changes from run to run, such as one with absolute timestamps.
+    /// The process keeps the last read bytes of 4096 statements in memory,
+    /// dropping the oldest, and forgets them on restart. The threshold
+    /// applied is the larger of this flag and the in-memory read cache's
+    /// `--cache-max-bytes`, because the bulk region only helps a scan larger
+    /// than the cache; startup logs the value in force as the
+    /// `cache_bulk_scan_min_bytes` performance default. A key lookup stays
+    /// interactive however much it reads, since the KEY_IDX probe reads a few
+    /// blocks of each segment. A `samples` statement and a lowered ES|QL
+    /// statement never read as bulk through this threshold. The statement's
+    /// `stats.cache.intent` reports the intent. Read at startup only. With
+    /// the fetcher cache off the flag applies as given and the intent reaches
+    /// no cache. `0` is refused at startup; omit the flag to leave the
+    /// trigger off.
     #[arg(long, value_name = "BYTES", value_parser = parse_cache_bulk_scan_min_bytes)]
     pub cache_bulk_scan_min_bytes: Option<u64>,
 
@@ -3238,7 +3248,10 @@ pub struct QueryBudgets {
     pub sql_scan_decode_inline: bool,
     /// `--cache-bulk-scan-min-bytes`: the resolved-bytes threshold at or
     /// above which a filtered `logs` statement sent as SQL text reads as a
-    /// bulk scan (ADR-3072's size trigger amendment). Reaches
+    /// bulk scan once one of its executions has read that much (ADR-3072's
+    /// size trigger amendments), as the operator set it. `crate::start` raises
+    /// it to the read cache's size
+    /// (`crate::query::resolve_cache_bulk_scan_min_bytes`) before it reaches
     /// [`crate::query::build_sql_state_with_parquet`]. Default `None`, the
     /// predicate-free rule alone.
     pub sql_cache_bulk_scan_min_bytes: Option<u64>,

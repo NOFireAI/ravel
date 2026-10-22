@@ -392,16 +392,20 @@ async fn a_predicate_free_logs_statement_is_bulk_only_over_an_epoch_to_now_windo
     assert_eq!(all_history["intent"], "bulkScan", "{all_history}");
 }
 
-/// A filtered `logs` scan whose resolved segments reach
-/// `--cache-bulk-scan-min-bytes` reads as bulkScan with the threshold set and
-/// interactive without it, or with the threshold one byte above the resolve.
+/// A filtered `logs` scan reads as interactive on its first run with
+/// `--cache-bulk-scan-min-bytes` set, since nothing has recorded what it
+/// reads, and as bulkScan from its second once the first read at least the
+/// threshold: the four objects it scans are the threshold, and the catalog
+/// reads come on top. With a threshold above anything it reads, or without
+/// the flag, every run is interactive.
 ///
 /// FLIP: replacing `size_trigger_applies(lanes, names_parquet,
-/// self.cache_bulk_scan_min_bytes)` in `statement_access_intent`
-/// (`crates/ravel-sql/src/executor.rs`) with `false` reports the thresholded
-/// statement as interactive.
+/// self.cache_bulk_scan_min_bytes, last_read_bytes)` in
+/// `statement_access_intent` (`crates/ravel-sql/src/executor.rs`) with
+/// `false` reports the second thresholded run as interactive; comparing the
+/// lane's resolved object bytes instead reports the first as bulkScan.
 #[tokio::test]
-async fn a_filtered_logs_scan_above_the_bulk_scan_threshold_is_bulk_only_with_the_flag() {
+async fn a_filtered_logs_scan_is_bulk_from_its_second_run_once_it_read_the_threshold() {
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
     let tenant = TenantId::new("acme".to_string());
     let mut resolved = 0;
@@ -410,23 +414,46 @@ async fn a_filtered_logs_scan_above_the_bulk_scan_threshold_is_bulk_only_with_th
     }
     let cache = server_cache(8 * 1024 * 1024);
     let statement = "SELECT count(*) AS n FROM logs WHERE severity_text = 'INFO'";
+    let intents = |runs: &[Value]| -> Vec<String> {
+        runs.iter()
+            .map(|cache| cache["intent"].as_str().unwrap_or("missing").to_string())
+            .collect()
+    };
 
     let with_flag =
         sql_app_with_bulk_scan_min_bytes(Arc::clone(&store), &cache, &["acme"], Some(resolved));
-    let at_threshold = statement_cache(&with_flag, "acme", statement, 0).await;
-    assert_eq!(at_threshold["intent"], "bulkScan", "{at_threshold}");
-
-    let above =
-        sql_app_with_bulk_scan_min_bytes(Arc::clone(&store), &cache, &["acme"], Some(resolved + 1));
-    let below_threshold = statement_cache(&above, "acme", statement, 0).await;
+    let mut at_threshold = Vec::new();
+    for _ in 0..2 {
+        at_threshold.push(statement_cache(&with_flag, "acme", statement, 0).await);
+    }
     assert_eq!(
-        below_threshold["intent"], "interactive",
-        "{below_threshold}"
+        intents(&at_threshold),
+        ["interactive", "bulkScan"],
+        "{at_threshold:?}"
+    );
+
+    let above = sql_app_with_bulk_scan_min_bytes(
+        Arc::clone(&store),
+        &cache,
+        &["acme"],
+        Some(1024 * 1024 * 1024),
+    );
+    let mut above_threshold = Vec::new();
+    for _ in 0..2 {
+        above_threshold.push(statement_cache(&above, "acme", statement, 0).await);
+    }
+    assert_eq!(
+        intents(&above_threshold),
+        ["interactive", "interactive"],
+        "{above_threshold:?}"
     );
 
     let without_flag = sql_app(store, &cache, &["acme"]);
-    let unset = statement_cache(&without_flag, "acme", statement, 0).await;
-    assert_eq!(unset["intent"], "interactive", "{unset}");
+    let mut unset = Vec::new();
+    for _ in 0..2 {
+        unset.push(statement_cache(&without_flag, "acme", statement, 0).await);
+    }
+    assert_eq!(intents(&unset), ["interactive", "interactive"], "{unset:?}");
 }
 
 /// FLIP: dropping `&& predicate_free` from `classify_signal_lanes` in
