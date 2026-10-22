@@ -439,8 +439,9 @@ pub struct Provenance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_bulk_scan_min_bytes: Option<u64>,
     /// Whether the read cache was also attached to the samples fetcher, the
-    /// fetcher a run's `read_cache` is read from. True whenever the run had a
-    /// cache (`cache_bytes > 0`), independent of `cache_bulk_scan_min_bytes`;
+    /// fetcher a run's `read_cache` is read from. True whenever an in-process
+    /// run had a cache (`cache_bytes > 0`), independent of
+    /// `cache_bulk_scan_min_bytes`, and false on the Flight lane;
     /// without a cache the samples fetcher reads uncached and `read_cache` is
     /// absent. Skipped in JSON when `false`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -2853,7 +2854,10 @@ pub async fn run_tenant(cfg: &TenantConfigInput) -> Result<SqlLatencyReport, Err
                 None => Some(cfg.store_cost_profile.clone()),
             },
             cache_bulk_scan_min_bytes: None,
-            samples_fetcher_cache: false,
+            // The Flight lane's fetchers live in the foreign server; an
+            // in-process run attaches the cache as `cold_executor` does.
+            samples_fetcher_cache: cfg.flight.is_none()
+                && samples_fetcher_takes_cache(cfg.cache_bytes),
         },
         dataset,
         // The request term is absent on every lane (no attempt source). The
