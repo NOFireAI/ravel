@@ -639,15 +639,16 @@ than passing for "no pull request open".
   session here chose and which grows without warning; it has been observed
   at 46 GB. So "no other session is building" does not mean the volume is
   idle, and a gate failure is not evidence about the crates you scoped.
-  Measure before concluding: one feature lane adds about 55 GB of test
-  binaries to `target/`, and the lanes of one gates.sh run share a target
-  and nothing prunes between them, so a gate whose closure runs several
-  lanes grows by lane. Measured on 16-core amd64 executors (#3140): a
-  `-p ravel-server` gate reached 93 GB and 186 GB; a `-p ravel-sql -p
-  ravel-server -p ravel-bench` gate reached 144 GB of `debug/` and died at
-  link before its flight-sql lane finished.
+  Measure before concluding: the main suite and every feature lane of one
+  gates.sh run write into one `target/`, and nothing prunes between them.
+  Measured on 16-core amd64 executors (#3140), for closures that reach the
+  sql, flight-sql, esql and ravel-bench lanes: a `-p ravel-server` gate
+  finished at 93 GB in one run and 186 GB in another; a `-p ravel-sql -p
+  ravel-server -p ravel-bench` gate filled its volume at 188 GB (144 GB of
+  `debug/` plus 44 GB from a separate ci-profile run in the same target)
+  and died at link before its flight-sql lane finished.
 - A cold gate needs 54-70 GB of `target/` per worktree when its closure
-  runs no feature lane, and up to about 190 GB when it runs the sql,
+  runs no feature lane, and up to about 190 GB when it reaches the sql,
   flight-sql, esql and ravel-bench lanes, so this machine
   runs ONE at a time regardless of how many sessions are otherwise idle.
   Two sessions gating concurrently is the expected failure, not bad luck:
