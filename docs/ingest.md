@@ -1668,10 +1668,11 @@ terms:
    `MAX_REQUEST_BODY_BYTES` cap), the decoded and normalized structs every
    path holds after decompression, the OTLP gRPC gzip decode buffer (bounded
    per request by tonic's `max_decoding_message_size`, 16 MiB here), and the
-   OTAP zstd payload buffers (bounded per payload by `StreamConfig`'s
-   `max_decompressed_payload_bytes`, 16 MiB, with one such buffer per payload
-   in a batch; `max_decoded_batch_bytes` bounds the decoded IPC bodies, not
-   these buffers), none of which the buffer budget charges. So
+   OTAP zstd payload buffer (bounded by `StreamConfig`'s
+   `max_decompressed_payload_bytes`, 16 MiB; a batch decompresses one payload
+   at a time and drops its buffer before the next, so there is one such buffer
+   per in-flight batch; `max_decoded_batch_bytes` bounds the decoded IPC
+   bodies, not this buffer), none of which the buffer budget charges. So
    the worst-case transient decode memory bounded only by
    `--max-inflight-ingest-requests` is still that ceiling times the largest
    *uncharged* decoded body. On the Remote Write RW2 path that body is not the
@@ -1688,8 +1689,9 @@ terms:
    the wire to as much as 1 GiB retained. The OTLP gRPC and identity HTTP
    decoded bodies stay at their 16 MiB caps. OTAP's is the decoded IPC body
    bytes of one in-flight batch, bounded by `--otap-max-decoded-batch-bytes`
-   (64 MiB by default), so the OTAP term of that product is the ceiling times
-   that flag's value, not 16 MiB. Neither inflate buffer is part of that
+   (64 MiB by default), plus one 16 MiB payload buffer per in-flight batch, so
+   the OTAP term of that product is the ceiling times that flag's value plus
+   16 MiB, not 16 MiB. Neither inflate buffer is part of that
    product, since both are bounded by `--max-ingest-buffer-bytes` instead.
 3. **Fixed overhead**: shard-actor and router state, the admission
    controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
@@ -1729,10 +1731,11 @@ length and the decompression output at that value (ADR-0084; the 2026-09-12
 amendment to ADR-0069 records why bounding-and-documenting this path is the
 complete fix rather than a charge, and an end-to-end test pins the 16 MiB
 ceiling). OTAP's decoded IPC bodies are bounded per batch by
-`--otap-max-decoded-batch-bytes` (64 MiB by default), and its zstd payload
-buffers per payload at 16 MiB, one per payload in the batch. Both remain term
+`--otap-max-decoded-batch-bytes` (64 MiB by default), plus one 16 MiB zstd
+payload buffer per in-flight batch. Both remain term
 2: the gRPC path bounded by `--max-inflight-ingest-requests` times its 16 MiB
-per-message cap, and the OTAP path by the same ceiling times the batch bound. That bound is about these transients only,
+per-message cap, and the OTAP path by the same ceiling times the batch bound
+plus 16 MiB. That bound is about these transients only,
 not about total process RSS: the admission controller's per-tenant maps are
 deliberately excluded from idle-tenant eviction and still grow with tenant count
 (see below), so the inflate buffers' contribution to peak RSS is a

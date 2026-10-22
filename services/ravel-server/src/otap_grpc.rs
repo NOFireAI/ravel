@@ -16,8 +16,10 @@
 //!
 //! Per-batch error handling mirrors the [`StreamState`] contract exactly: a
 //! malformed batch ([`DecodeError::Batch`]) nacks only that `batch_id` and the
-//! stream keeps going, while a corrupt IPC stream ([`DecodeError::Stream`])
-//! nacks the batch and ends the gRPC stream so the client re-establishes it.
+//! stream keeps going unless an earlier payload of the batch already fed its
+//! decoder, which poisons the decoder; a poisoned decoder or a corrupt IPC
+//! stream ([`DecodeError::Stream`]) nacks the batch and ends the gRPC stream
+//! so the client re-establishes it.
 
 use std::borrow::Borrow;
 use std::collections::HashSet;
@@ -252,7 +254,7 @@ async fn process_batch(ctx: &mut StreamCtx, batch: BatchArrowRecords) -> (BatchS
             };
             write_reply(batch_id, written)
         }
-        Err(err) => decode_error_reply(batch_id, err),
+        Err(err) => decode_error_reply(batch_id, err, ctx.decoder.is_poisoned()),
     }
 }
 
@@ -328,14 +330,19 @@ fn write_reply(
 }
 
 /// The reply to a batch `StreamState::decode_gated` rejected, and whether the
-/// stream must be torn down after it.
-fn decode_error_reply(batch_id: i64, err: DecodeError) -> (BatchStatus, bool) {
+/// stream must be torn down after it. `poisoned` is the decoder's
+/// `is_poisoned()` after the rejection.
+fn decode_error_reply(batch_id: i64, err: DecodeError, poisoned: bool) -> (BatchStatus, bool) {
     match err {
-        // A malformed batch nacks only itself and the stream continues
-        // (stream.rs `BatchError` contract).
+        // A malformed batch nacks only itself. The stream continues when the
+        // refusal came before any decoder in the batch was fed; when an
+        // earlier payload of the batch already fed its decoder, the decoder
+        // is poisoned (stream.rs `BatchError` contract) and the stream ends,
+        // as on a pre-decode rejection, so the client reconnects with fresh
+        // decoder state.
         DecodeError::Batch(err) => (
             nack(batch_id, StatusCode::InvalidArgument, err.to_string()),
-            false,
+            poisoned,
         ),
         // The write gate returned no decompression result for one payload
         // after the batch's earlier payloads had already fed their decoders
@@ -623,6 +630,7 @@ mod tests {
     use ravel_ipcrypt::rules::TenantRules;
     use ravel_object_store::ObjectStoreBackend;
     use ravel_object_store::memory::MemoryStore;
+    use ravel_otap::proto::experimental::arrow::v1::{ArrowPayload, ArrowPayloadType};
     use ravel_otap::stream::DecodedBatch;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -833,8 +841,10 @@ mod tests {
 
     /// The service builds each stream's decoder with the configured decoded
     /// batch cap: under a 1-byte cap a batch is nacked INVALID_ARGUMENT naming
-    /// the cap and the stream stays open, and under the 64 MiB default the
-    /// same batch decodes.
+    /// the cap on its first payload and the stream stays open, and under the
+    /// 64 MiB default the same batch decodes. A refusal after an earlier
+    /// payload of the batch decoded is nacked INVALID_ARGUMENT and ends the
+    /// stream.
     #[tokio::test]
     async fn the_configured_decoded_batch_cap_reaches_the_stream_decoder() {
         use crate::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES;
@@ -862,19 +872,22 @@ mod tests {
         let state = crate::otlp_http::tests::state_with_limits(AdmissionLimits::default());
 
         let capped = GrpcArrowMetricsService::new(state.clone(), 1);
-        let err = capped
-            .stream_decoder()
+        let mut decoder = capped.stream_decoder();
+        let err = decoder
             .decode_gated(batch())
             .await
             .expect_err("a batch decoding past a 1-byte cap is refused");
-        let (status, terminate) = decode_error_reply(7, err);
+        let (status, terminate) = decode_error_reply(7, err, decoder.is_poisoned());
         assert_eq!(status.batch_id, 7);
         assert_eq!(status.status_code, StatusCode::InvalidArgument as i32);
         assert_eq!(
             status.status_message,
             "decoded batch exceeds cap of 1 bytes"
         );
-        assert!(!terminate, "a refused batch leaves the stream open");
+        assert!(
+            !terminate,
+            "a batch refused on its first payload leaves the stream open"
+        );
 
         assert_eq!(DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES, 64 * 1024 * 1024);
         let default = GrpcArrowMetricsService::new(state, DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES);
@@ -884,6 +897,24 @@ mod tests {
             .await
             .expect("the same batch decodes under the default cap");
         assert!(!decoded.payloads.is_empty());
+
+        let mut after_decoded = batch();
+        after_decoded.arrow_payloads.push(ArrowPayload {
+            schema_id: "unknown".to_string(),
+            r#type: ArrowPayloadType::Unknown as i32,
+            record: Vec::new().into(),
+        });
+        let mut decoder = default.stream_decoder();
+        let err = decoder
+            .decode_gated(after_decoded)
+            .await
+            .expect_err("a payload of unknown type is refused");
+        let (status, terminate) = decode_error_reply(7, err, decoder.is_poisoned());
+        assert_eq!(status.status_code, StatusCode::InvalidArgument as i32);
+        assert!(
+            terminate,
+            "a refusal after an earlier payload of the batch decoded ends the stream"
+        );
     }
 
     /// `(skew, structural)` for the tenant's Metrics rows of the
@@ -1069,27 +1100,28 @@ mod tests {
     /// INTERNAL when the job panicked and UNAVAILABLE when it was cancelled,
     /// and in both cases ends the stream, as a corrupted decoder does: the
     /// batch's earlier payloads already advanced the decoders, so a resend
-    /// must reach a fresh stream. A malformed batch still keeps it open.
+    /// must reach a fresh stream. A malformed batch refused before any of its
+    /// payloads fed a decoder still keeps it open.
     #[test]
     fn a_gate_failure_nacks_and_ends_the_stream() {
         use ravel_cpu_gate::CpuGateError;
         use ravel_otap::stream::BatchError;
 
-        let reply = |err| {
-            let (status, teardown) = decode_error_reply(7, err);
+        let reply = |err, poisoned| {
+            let (status, teardown) = decode_error_reply(7, err, poisoned);
             assert_eq!(status.batch_id, 7);
             (status.status_code, teardown)
         };
         assert_eq!(
-            reply(StreamError::Gate(CpuGateError::Panicked).into()),
+            reply(StreamError::Gate(CpuGateError::Panicked).into(), true),
             (StatusCode::Internal as i32, true)
         );
         assert_eq!(
-            reply(StreamError::Gate(CpuGateError::Cancelled).into()),
+            reply(StreamError::Gate(CpuGateError::Cancelled).into(), true),
             (StatusCode::Unavailable as i32, true)
         );
         assert_eq!(
-            reply(BatchError::MalformedIpc("x".into()).into()),
+            reply(BatchError::MalformedIpc("x".into()).into(), false),
             (StatusCode::InvalidArgument as i32, false)
         );
     }

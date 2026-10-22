@@ -77,8 +77,11 @@ impl Default for StreamConfig {
     }
 }
 
-/// A batch that failed to decode. The caller nacks `batch_id` and keeps
-/// using the same `StreamState` -- nothing here corrupts shared state.
+/// A batch that failed to decode. The caller nacks `batch_id`. When the
+/// refused payload was the batch's first, no decoder holds state from the
+/// batch and the caller keeps using the same `StreamState`; when an earlier payload of the batch
+/// already fed its decoder, the `StreamState` is poisoned (see
+/// [`StreamState::decode`]) and the caller ends the stream.
 #[derive(Debug, Error)]
 pub enum BatchError {
     #[error("arrow payload has invalid or UNKNOWN payload type (raw={raw})")]
@@ -539,8 +542,10 @@ impl StreamState {
         self
     }
 
-    /// True once a [`StreamError`] has torn this stream down; every future
-    /// [`decode`](Self::decode) call will return [`StreamError::Poisoned`].
+    /// True once a [`StreamError`], or a [`BatchError`] after an earlier
+    /// payload of the same batch fed its decoder, has torn this stream down;
+    /// every future [`decode`](Self::decode) call will return
+    /// [`StreamError::Poisoned`].
     pub fn is_poisoned(&self) -> bool {
         self.poisoned
     }
@@ -554,17 +559,21 @@ impl StreamState {
     /// Decode one `BatchArrowRecords` message into the `RecordBatch`es
     /// carried by its payloads.
     ///
-    /// On [`BatchError`], nothing in `self` that matters for future calls
-    /// has been left in a bad state: nack `batch_id` and keep using this
-    /// `StreamState`. On [`StreamError`], `self` is poisoned (every future
-    /// call returns [`StreamError::Poisoned`]) and the caller must tear
-    /// down the underlying gRPC stream.
+    /// On a [`BatchError`] for the batch's first payload, no decoder holds
+    /// state from the batch and nothing in `self` that matters for future calls has changed: nack
+    /// `batch_id` and keep using this `StreamState`. On a [`BatchError`] for a
+    /// later payload, the earlier payloads already applied their schema and
+    /// dictionary messages while the refused one and those after it did not,
+    /// so `self` is poisoned as on a [`StreamError`]: every future call
+    /// returns [`StreamError::Poisoned`] and the caller must tear down the
+    /// underlying gRPC stream.
     pub fn decode(&mut self, batch: BatchArrowRecords) -> Result<DecodedBatch, DecodeError> {
         if self.poisoned {
             return Err(StreamError::Poisoned.into());
         }
         let mut payloads = Vec::with_capacity(batch.arrow_payloads.len());
         let mut batch_decoded_bytes = 0u64;
+        let mut fed = false;
         for payload in batch.arrow_payloads {
             let decoded = payload_type_of(&payload).and_then(|payload_type| {
                 let raw =
@@ -580,7 +589,7 @@ impl StreamState {
                 ),
                 Err(e) => Err(e.into()),
             };
-            self.collect_payload(decoded, &mut payloads)?;
+            self.collect_payload(decoded, &mut payloads, &mut fed)?;
         }
         Ok(DecodedBatch {
             batch_id: batch.batch_id,
@@ -603,6 +612,7 @@ impl StreamState {
         }
         let mut payloads = Vec::with_capacity(batch.arrow_payloads.len());
         let mut batch_decoded_bytes = 0u64;
+        let mut fed = false;
         for payload in batch.arrow_payloads {
             let decoded = match payload_type_of(&payload) {
                 Ok(payload_type) => match self.decompress_on_gate(payload.record).await {
@@ -616,7 +626,7 @@ impl StreamState {
                 },
                 Err(e) => Err(e.into()),
             };
-            self.collect_payload(decoded, &mut payloads)?;
+            self.collect_payload(decoded, &mut payloads, &mut fed)?;
         }
         Ok(DecodedBatch {
             batch_id: batch.batch_id,
@@ -648,15 +658,19 @@ impl StreamState {
         }
     }
 
-    /// Appends one payload's batches, or poisons the stream on a
-    /// [`StreamError`] and returns the error that ends this batch.
+    /// Appends one payload's batches and records in `fed` that a decoder of
+    /// this batch was fed, or returns the error that ends this batch. The
+    /// stream is poisoned on a [`StreamError`], and on a [`BatchError`] once
+    /// `fed` is set.
     fn collect_payload(
         &mut self,
         decoded: Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError>,
         payloads: &mut Vec<(ArrowPayloadType, RecordBatch)>,
+        fed: &mut bool,
     ) -> Result<(), DecodeError> {
         match decoded {
             Ok(mut batches) => {
+                *fed = true;
                 payloads.append(&mut batches);
                 Ok(())
             }
@@ -664,7 +678,12 @@ impl StreamState {
                 self.poisoned = true;
                 Err(e.into())
             }
-            Err(e @ DecodeError::Batch(_)) => Err(e),
+            Err(e @ DecodeError::Batch(_)) => {
+                if *fed {
+                    self.poisoned = true;
+                }
+                Err(e)
+            }
         }
     }
 
@@ -1152,7 +1171,9 @@ mod tests {
     /// The payload that crosses the batch cap is refused before a decoder
     /// sees it: here it is a record batch with no schema before it, which a
     /// decoder rejects with a different error, and no decoder is created for
-    /// it. The next batch on the same stream decodes.
+    /// it. The batch's first payload already fed its decoder, so the refusal
+    /// poisons the stream and the next batch on it is refused, on both decode
+    /// entries.
     #[tokio::test]
     async fn the_batch_cap_refuses_before_the_crossing_payload_decodes() {
         let (first, _) = ipc_fragment(1000, "otelarrow", None);
@@ -1170,7 +1191,7 @@ mod tests {
         ));
 
         let total = decoded_len(&first) + decoded_len(&no_schema);
-        let (next, next_batch) = ipc_fragment(10, "next", None);
+        let (next, _) = ipc_fragment(10, "next", None);
         let crossing = || payloads(&[("a", first.clone()), ("b", no_schema.clone())]);
         let crossing_key = (ArrowPayloadType::UnivariateMetrics, "b".to_string());
 
@@ -1180,11 +1201,11 @@ mod tests {
             Err(DecodeError::Batch(BatchError::DecodedBatchTooLarge { .. }))
         ));
         assert!(!state.decoders.contains_key(&crossing_key));
-        assert!(!state.is_poisoned());
-        let decoded = state
-            .decode(payloads(&[("c", next.clone())]))
-            .expect("the next batch decodes");
-        assert_eq!(only_batch(decoded), next_batch);
+        assert!(state.is_poisoned());
+        assert!(matches!(
+            state.decode(payloads(&[("c", next.clone())])),
+            Err(DecodeError::Stream(StreamError::Poisoned))
+        ));
 
         let mut state = StreamState::new(batch_capped(total - 1));
         assert!(matches!(
@@ -1192,12 +1213,105 @@ mod tests {
             Err(DecodeError::Batch(BatchError::DecodedBatchTooLarge { .. }))
         ));
         assert!(!state.decoders.contains_key(&crossing_key));
+        assert!(state.is_poisoned());
+        assert!(matches!(
+            state.decode_gated(payloads(&[("c", next)])).await,
+            Err(DecodeError::Stream(StreamError::Poisoned))
+        ));
+    }
+
+    /// A batch refused on its first payload fed no decoder, so the stream is
+    /// not poisoned and the next batch decodes, on both decode entries; this
+    /// holds after an earlier batch on the stream decoded too.
+    #[tokio::test]
+    async fn a_refusal_on_the_first_payload_keeps_the_stream() {
+        let (small, small_batch) = ipc_fragment(10, "small", None);
+        let (large, _) = ipc_fragment(1000, "otelarrow", None);
+        let cap = decoded_len(&small);
+        assert!(decoded_len(&large) > cap);
+        let refused = || payloads(&[("b", large.clone()), ("c", small.clone())]);
+
+        let mut state = StreamState::new(batch_capped(cap));
+        let decoded = state
+            .decode(payloads(&[("a", small.clone())]))
+            .expect("an earlier batch decodes");
+        assert_eq!(only_batch(decoded), small_batch);
+        assert!(matches!(
+            state.decode(refused()),
+            Err(DecodeError::Batch(BatchError::DecodedBatchTooLarge { .. }))
+        ));
         assert!(!state.is_poisoned());
         let decoded = state
-            .decode_gated(payloads(&[("c", next)]))
+            .decode(payloads(&[("c", small.clone())]))
+            .expect("the next batch decodes");
+        assert_eq!(only_batch(decoded), small_batch);
+
+        let mut state = StreamState::new(batch_capped(cap));
+        let decoded = state
+            .decode_gated(payloads(&[("a", small.clone())]))
+            .await
+            .expect("an earlier batch decodes");
+        assert_eq!(only_batch(decoded), small_batch);
+        assert!(matches!(
+            state.decode_gated(refused()).await,
+            Err(DecodeError::Batch(BatchError::DecodedBatchTooLarge { .. }))
+        ));
+        assert!(!state.is_poisoned());
+        let decoded = state
+            .decode_gated(payloads(&[("c", small.clone())]))
             .await
             .expect("the next batch decodes");
-        assert_eq!(only_batch(decoded), next_batch);
+        assert_eq!(only_batch(decoded), small_batch);
+    }
+
+    /// A payload over the per-payload cap poisons the stream when an earlier
+    /// payload of its batch already decoded, and leaves it open when it is
+    /// the batch's first, on both decode entries.
+    #[tokio::test]
+    async fn a_payload_over_the_payload_cap_poisons_only_after_a_decoded_payload() {
+        let (small, small_batch) = ipc_fragment(10, "small", None);
+        let (large, _) = ipc_fragment(1000, "otelarrow", None);
+        let config = || StreamConfig {
+            max_decompressed_payload_bytes: small.len() as u64,
+            ..StreamConfig::default()
+        };
+        assert!(large.len() > small.len());
+        let second = || payloads(&[("a", small.clone()), ("b", large.clone())]);
+        let first = || payloads(&[("b", large.clone()), ("a", small.clone())]);
+        let too_large = |result: Result<DecodedBatch, DecodeError>| {
+            assert!(
+                matches!(
+                    result,
+                    Err(DecodeError::Batch(
+                        BatchError::DecompressedPayloadTooLarge { .. }
+                    ))
+                ),
+                "expected DecompressedPayloadTooLarge, got {result:?}"
+            );
+        };
+
+        let mut state = StreamState::new(config());
+        too_large(state.decode(second()));
+        assert!(state.is_poisoned());
+        let mut state = StreamState::new(config());
+        too_large(state.decode_gated(second()).await);
+        assert!(state.is_poisoned());
+
+        let mut state = StreamState::new(config());
+        too_large(state.decode(first()));
+        assert!(!state.is_poisoned());
+        let decoded = state
+            .decode(payloads(&[("a", small.clone())]))
+            .expect("the next batch decodes");
+        assert_eq!(only_batch(decoded), small_batch);
+        let mut state = StreamState::new(config());
+        too_large(state.decode_gated(first()).await);
+        assert!(!state.is_poisoned());
+        let decoded = state
+            .decode_gated(payloads(&[("a", small)]))
+            .await
+            .expect("the next batch decodes");
+        assert_eq!(only_batch(decoded), small_batch);
     }
 
     /// IPC body compression with any codec but ZSTD is refused before a decoder
