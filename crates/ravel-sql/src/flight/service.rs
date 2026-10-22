@@ -148,10 +148,12 @@ pub struct RavelFlightSqlService {
 }
 
 /// The bounded connect timeout the coordinator dials each worker slice with
-/// (ADR-0071). A worker that does not complete the TCP + HTTP/2
-/// handshake within this window fails the slice fetch with a typed error rather
-/// than hanging the whole distributed query; the ticket's own deadline still
-/// bounds the streaming phase after connect.
+/// (ADR-0071). A worker that does not accept the TCP connection within this
+/// window fails the slice fetch with a typed error rather than hanging the
+/// whole distributed query. The TLS handshake is bounded by the client TLS
+/// configuration the server passes in (`slice_client_tls`), a silent
+/// connection by the slice client's HTTP/2 keepalive, and the rest of the
+/// statement by its own deadline.
 const DISTRIB_SLICE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl RavelFlightSqlService {
