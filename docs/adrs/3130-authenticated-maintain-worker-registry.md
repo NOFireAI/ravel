@@ -249,7 +249,8 @@ flowchart LR
   PutObject grant. A forged memo snapshot seeds verdicts for owned units
   (`seed_memo_from_snapshots`). It is the same class of exposure on a
   different record, and it is filed as its own issue (#3155) rather than folded in
-  here.
+  here. The memo snapshot amendment below closes it with a MAC under the same
+  key file.
 - Docs updated with the implementation: `docs/catalog-and-mvcc.md` (the
   heartbeat record), the `WorkerHeartbeat` row of ADR-0066's R1 table (read
   set `{2}`), an inline pointer to this ADR in ADR-0065 decision 1 at its
@@ -259,3 +260,67 @@ flowchart LR
   the three-step rotation from decision 1), `docs/guides/observability.md`,
   the doc comments in `worker_set.rs` that call the key "self-owned" or
   "single writer per key", and the ADR index.
+
+## Amendment (2026-10-22): memo snapshot amendment (issue #3155)
+
+<!-- amendment-applies: sections="Consequences" pointer="memo snapshot amendment" -->
+
+A maintain memo snapshot at `sys/maintain/memo/<process_id>` (ADR-0065
+decision 3) now carries a keyed BLAKE3 MAC under the same `--maintain-key-file`
+keys as the registry record. Without it, any principal holding the
+`sys/maintain/*` PutObject grant could write a snapshot that seeds terminal
+verdicts for units it does not own, and the owner would skip those buckets
+until each verdict aged past its re-verify interval.
+
+With the MAC, a principal without the key file cannot seed verdicts that no
+key holder wrote. A principal with read and write grants can still replay
+one: put a process's own earlier honest snapshot back at that process's key,
+reinstating a verdict from before an invalidation. The 1-hour staleness bound
+(`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`) limits a replay to snapshots under an
+hour old, so it defers a bucket's re-evaluation by at most that hour.
+
+- **Key.** `memo_key = blake3::derive_key("ravel maintain memo snapshot v1",
+  file_key)`, one per file key. The context differs from the registry
+  record's, so a registry MAC never verifies as a memo MAC or the reverse. As
+  in decision 1, the first key mints and any key verifies; the comparison is
+  constant time, and a MAC that is not 32 bytes verifies under no key.
+- **Frame.** Tag 2, `[tag u8][snapshot_unix_ns i64 LE][body][mac 32]`. The
+  MAC covers the claim `tag || process_id (16 raw bytes) || snapshot_unix_ns
+  LE || body`, where `process_id` is the writer's own. The smallest frame is
+  41 bytes (tag, timestamp and MAC); a snapshot of an empty memo is 45 (its
+  body is a zero unit count). The #3199 byte cap counts the whole frame, MAC
+  included.
+- **Process id from the key.** The reader takes `process_id` from the object
+  key's UUID suffix, not from anything inside the object. A snapshot copied
+  verbatim under another process's key fails its MAC.
+- **Check order.** For each listed object, before any byte of the body is
+  decoded: a key whose suffix is not a UUID in the lowercase hyphenated form
+  the writer uses is `non_uuid_key`, rejected without a GET, so one process
+  has one key; a LIST modification time more than 2 hours before the
+  reader's clock is `stale`, rejected without a GET; a listed size over the
+  cap, then a fetched length over the cap (range GET of the cap plus one
+  byte), is `oversize`; an empty object or one shorter than 41 bytes is
+  `malformed`; a tag other than 2 is `unknown_tag`; a MAC that verifies
+  under none of the reader's keys is `bad_mac`. Seeding and decoding accept
+  only a snapshot that passed all six, so a forged object costs one GET and
+  one MAC computation per configured key and is never decoded, whatever
+  counts its body claims. The seed-time staleness gate reads the verified
+  timestamp and runs before the body is decoded.
+- **Stale objects.** Each process start takes a fresh id, and its snapshot
+  stays under the prefix after it exits, so the tag-1 objects of processes
+  gone since the upgrade and the snapshots of processes gone since a key
+  rotation stay listed. The 2-hour bound is the 1-hour staleness bound
+  widened by the worker registry's clock-skew margin (`reap_horizon_ns`, the
+  window times `REAP_WINDOW_FACTOR`, 2). An object a backend lists with no
+  modification time (`<= 0`) goes on to the checks after it.
+- **Logging.** Each reseed counts rejects per reason and logs one warning
+  carrying every count when any `oversize`, `unknown_tag` or `bad_mac` reject
+  occurred; `non_uuid_key`, `stale` and `malformed` alone log at debug, so
+  leftovers older than the 2-hour bound do not raise the warning. No metric
+  is added.
+- **Rollout.** Tag 1, the unauthenticated frame earlier releases write, now
+  reads as `unknown_tag`, and an earlier release reads a tag-2 frame as an
+  unknown tag in the same way. During a rolling upgrade old and new processes
+  therefore seed nothing from each other's snapshots, so each unit starts
+  cold once: a rescan of its buckets, never a correctness issue, because the
+  memo is advisory (ADR-0065 decision 3).

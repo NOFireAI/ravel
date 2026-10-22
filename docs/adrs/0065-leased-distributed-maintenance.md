@@ -222,7 +222,9 @@ interior of a retention window is one run), so the snapshot stays a small
 single-PUT object even at large retention.
 
 The snapshot size cap amendment below (issue #3199) bounds what a reader
-reads and decodes and what a writer persists.
+reads and decodes and what a writer persists. ADR-3130's memo snapshot
+amendment (issue #3155) MACs each snapshot under the maintain key file, and a
+reader seeds only from snapshots whose MAC verifies.
 
 **Warm start and handoff.** On startup — and whenever ownership of a unit
 arrives via a membership change — a worker reads all non-stale memo
