@@ -116,8 +116,14 @@ past the `3 * H` window, its owner is treated as gone and its units are taken
 over (idempotent overlap during the transition, never lost or double-counted
 work). A heartbeat key whose LIST modification time is older than twice the
 liveness window is deleted by the maintain heartbeat tick, from the same
-listing it reads the live set with, so the prefix stays
-proportional to the live fleet.
+listing it reads the live set with, so on a backend that reports a LIST
+modification time the prefix stays proportional to the running fleet. Two
+cases keep a key under the prefix that never joins the live set. A running
+sibling whose clock is skewed past the liveness window keeps its modification
+time fresh, so its key is neither skipped nor reaped, and every read GETs it
+and counts it as `stale_stamp`. A backend that reports no usable modification
+time (`<= 0`) gets neither the GET skip nor the reap, so a dead process's key
+is never deleted and every read GETs it and counts it as `stale_stamp`.
 
 `sys/maintain/memo/<process_id>` (ADR-0065 §3) is the maintain role's durable
 per-worker memo snapshot: the same self-owned, root-level, `Overwrite` pattern

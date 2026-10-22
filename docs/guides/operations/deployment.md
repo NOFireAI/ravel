@@ -623,8 +623,11 @@ twice until the rollout finishes.
 1. Append the new key after the old one in every copy of the file, and roll
    the maintain processes. Every process now verifies both keys and still
    signs with the old one.
-2. Move the new key to the first line, and roll again. Processes now sign
-   with the new key, and every process still verifies the old one.
+2. Once step 1 has finished on every process, move the new key to the first
+   line and roll again. Processes now sign with the new key, and every
+   process still verifies the old one. A process not yet restarted by step 1
+   verifies only the old key, and rejects every record signed with the new
+   one.
 3. Once step 2 has finished on every process, remove the old key and roll a
    third time. Until this step, the old key still verifies.
 

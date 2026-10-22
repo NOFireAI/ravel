@@ -107,7 +107,7 @@ cursor).
 ### 1. Worker membership via self-owned heartbeat keys
 
 Each maintain-role process writes, every heartbeat interval `H` (default
-60 s), a snapshot to a key it alone ever writes:
+60 s), a snapshot to a key no other maintain process writes:
 
 ```
 sys/maintain/workers/<process_id>
@@ -115,10 +115,12 @@ sys/maintain/workers/<process_id>
 
 `process_id` is a UUID generated at startup (the ADR-0057 convention).
 Payload: a versioned-tag protobuf `{process_id, started_unix_ns,
-heartbeat_unix_ns}`, written `PutMode::Overwrite` — self-owned, no CAS, no
-contention. ADR-3130 amends the payload: `format_version` 2 adds a `mac` keyed
-by `--maintain-key-file`, because the maintain role's IAM grant lets any
-holder write any key under the prefix. On the same cadence each process lists
+heartbeat_unix_ns}`, written `PutMode::Overwrite` — one writer per key, no
+CAS, no contention. ADR-3130 amends both the payload and that one-writer
+claim: the key is one process's by convention only, because the maintain
+role's IAM grant lets any holder write any key under the prefix, so
+`format_version` 2 adds a `mac` keyed by `--maintain-key-file` and a reader
+trusts a record's author by its MAC, not by its key. On the same cadence each process lists
 `sys/maintain/workers/` and GETs siblings; the **live set** is itself plus
 every sibling whose `heartbeat_unix_ns` is within `3 * H` of the reader's own
 clock (one factor wider than ADR-0057's `2 * R` to absorb skew plus write
