@@ -432,9 +432,11 @@ pub struct Provenance {
     /// when `None`, keeping the no-null contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_cost_profile_effective: Option<StoreCostProfile>,
-    /// The bulk-scan size trigger the executor ran with
-    /// (`--cache-bulk-scan-min-bytes`, the same flag as `ravel-server`'s), or
-    /// `None` when it was off. Skipped in JSON when `None`, keeping the no-null
+    /// The bulk-scan size trigger threshold the executor ran with:
+    /// `--cache-bulk-scan-min-bytes` (the same flag as `ravel-server`'s)
+    /// raised to `cache_bytes` when the run had a read cache, through
+    /// [`ravel_sql::effective_bulk_scan_min_bytes`], or `None` when it was
+    /// off. Skipped in JSON when `None`, keeping the no-null
     /// contract.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_bulk_scan_min_bytes: Option<u64>,
@@ -1646,9 +1648,11 @@ pub struct ExecutorSettings {
     /// [`EngineConfig::logs_fetch_policy`] so the engine config the bench builds
     /// names the same intent the server's would.
     pub logs_fetch_policy: LogsFetchPolicy,
-    /// Resolved bytes at or above which a filtered `logs` statement sent as
-    /// SQL text also reads as a bulk scan (`--cache-bulk-scan-min-bytes`),
-    /// handed to [`SqlExecutor::with_cache_bulk_scan_min_bytes`]. `None`
+    /// Read bytes at or above which a filtered `logs` statement sent as SQL
+    /// text reads as a bulk scan from its next execution, handed to
+    /// [`SqlExecutor::with_cache_bulk_scan_min_bytes`]: the generated lane
+    /// sets it to `--cache-bulk-scan-min-bytes` floored at the read cache's
+    /// size, as `ravel-server` does. `None`
     /// leaves the predicate-free rule alone, as an unset server flag does, and
     /// keeps the read cache off the samples fetcher.
     pub cache_bulk_scan_min_bytes: Option<u64>,
@@ -2450,11 +2454,17 @@ pub async fn run_generated(cfg: &GenerateConfig) -> Result<SqlLatencyReport, Err
 }
 
 /// [`run_generated`] with the bulk-scan size trigger
-/// (`--cache-bulk-scan-min-bytes`) set to `cache_bulk_scan_min_bytes`.
+/// (`--cache-bulk-scan-min-bytes`) set to `cache_bulk_scan_min_bytes`, raised
+/// to `cfg.cache_bytes` when the run has a read cache, as `ravel-server`
+/// raises it to `--cache-max-bytes`.
 pub async fn run_generated_with_bulk_scan_min_bytes(
     cfg: &GenerateConfig,
     cache_bulk_scan_min_bytes: Option<u64>,
 ) -> Result<SqlLatencyReport, Error> {
+    let cache_bulk_scan_min_bytes = ravel_sql::effective_bulk_scan_min_bytes(
+        cache_bulk_scan_min_bytes,
+        (cfg.cache_bytes > 0).then_some(cfg.cache_bytes),
+    );
     // The generated lane writes shard 0 only by construction (see
     // `generate_dataset`), so a single shard resolves the whole dataset.
     let shard_count = 1;
