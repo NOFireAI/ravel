@@ -6,6 +6,612 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-10-22
+
+### Changed
+
+- **`spec.probes.dedicatedHealthPort` on `RavelCluster` now defaults to `true`
+  in the CRD** (ADR-1702 follow-up task 12). A cluster created after the new
+  `deploy/k8s/operator/crd.yaml` is applied, without the field, renders the
+  dedicated health listener (`--listen-health 0.0.0.0:4316`, a container port
+  named `health` on 4316) and points both probes at it. Bumping the operator
+  image alone changes nothing: the default lives in the CRD's schema.
+  Existing clusters keep their stored setting. Since v0.19.0 the CRD has
+  defaulted the field to `false`, and the API server stores schema defaults on
+  every create and update, so a cluster written since then holds `false` and
+  keeps probing 4318 with a 45 s grace period, including after a re-apply of a
+  manifest that omits the field. To turn it on, set
+  `dedicatedHealthPort: true`; removing the field with a JSON-patch `remove`
+  also brings the new default back on that write. Only a cluster never
+  written since the v0.19.0 CRD picks up `true` without a change, which is
+  rare because the operator's own status updates are writes. Where the
+  field is `true`, `terminationGracePeriodSeconds` on the gateway, query, and
+  maintain pods becomes 51 s instead of 45 s. It requires a `ravel-server`
+  image of v0.19.0 or newer, the release that added `--listen-health`; an
+  older image rejects the flag and restart-loops. A NetworkPolicy that blocks
+  the kubelet from reaching port 4316 fails both probes and stalls the rollout
+  with no pod ever becoming Ready. Set `dedicatedHealthPort: false` to keep
+  probes on 4318.
+- **An ascending `ORDER BY ts LIMIT k` over a cached tenant reads row groups
+  in global time order** (ADR-2677 decision 6, issue #2694). On the planned
+  path with a read cache, every partition reads the row groups with the
+  smallest minimum `ts` across all segments first, rather than the next
+  segment by its minimum, so the limit's threshold is set from the earliest
+  blocks and can skip more of the rest.
+- **A spans trace_id lookup probes each object's KEY_IDX section** (ADR-2707
+  decision 5, issue #2761). A `trace_id =` statement probes every object the
+  skip index keeps with at most two ranged KEY_IDX reads, and an object that
+  does not hold the trace is not read further. No listed object is skipped
+  by its shard: spans shard routing is deferred to issue #3034.
+  The SQL response's `stats.pruning` gains `segmentsPrunedByKeyIndex` and
+  `blocksPrunedByKeyIndex`, and `stats.phases` gains a `keyIndex` entry for
+  the KEY_IDX reads on both the SQL and the PromQL JSON responses. Its
+  `decompressedOutputBytes` counts each probed object's KEY_IDX prefix
+  (stored as is) plus every bucket frame it decoded, at the frame's declared
+  length (`entry_count x 12`).
+- **A logs exact-key equality probes each object's KEY_IDX section**
+  (ADR-2707 decision 5, issue #2762). A SQL equality on a declared `i64`,
+  `str` or `bytes` column named in the tenant's key-index declaration, or on
+  `trace_id` when the tenant indexes it, against a literal of the column's
+  type reads one KEY_IDX prefix extent per object above the block-range
+  threshold (512 KiB by default), whatever the projection break-even (an
+  object at or under the threshold is read whole, as before), plus at most
+  one bucket extent per key, stopping at the first absent key: an object
+  without the value is not read further, and an object with it above the
+  whole-object bound reads only the blocks KEY_IDX names (at or under the
+  bound it is read whole). Equalities joined by `AND` intersect;
+  `OR` does not probe. An object the probe drops costs fewer bytes than its
+  read without the probe, and one it keeps costs the probe's requests on top
+  of that read (the KEY_IDX prefix, at most one bucket per key, and a tail
+  read on an object the scan opens whole unplanned), so a query can issue
+  more requests; a
+  `trace_id`-only query on a tenant that indexes `trace_id` now probes each
+  object above the threshold instead of taking the whole-segment fast path
+  (#3090 tracks that cost on objects written before the index). The ranged
+  logs scan no longer fetches an object's KEY_IDX section among its tail
+  sections, on every route. The probe reports through the existing
+  `stats.pruning.segmentsPrunedByKeyIndex` and `blocksPrunedByKeyIndex`
+  counters and the `keyIndex` phase, and the distributed logs slice ticket
+  carries the keys (ticket version 11; version 10 stays the multi-signal
+  client ticket). The keyed plan's block prune (the POSTINGS probe and the
+  per-block bloom check) runs on the CPU read gate as a `log_postings` job,
+  as the unkeyed plan's does. When the scan opens objects above the
+  threshold unplanned (ADR-2677 decision 2, at least `target_partitions` of
+  them), the plan pass reads only each object's tail and KEY_IDX, and the
+  scan reads each object it keeps whole in one GET and never a second time.
+  The probe reads under the statement's cache access intent, including for
+  an object it drops without planning, and a keyed statement's
+  `stats.io.dependencyDepth` counts the KEY_IDX prefix and bucket reads on
+  every object above the threshold.
+- **A strict ingest request over `--max-pending-strict-acks` is refused at
+  its request head, before its body is read or decoded** (ADR-2793, head
+  pending-ack amendment, issue #2805). On OTLP HTTP, Remote Write and the
+  unary OTLP gRPC services the admission layer takes the pending strict-ack
+  permit right after the in-flight permit and the credential check, for a
+  request the surface writes strictly: OTLP by `x-ravel-ingest-mode` under
+  `--strict-flush-policy`, as before, and every Remote Write, whatever header
+  it carries. The refusal is unchanged: HTTP 429 with `Retry-After: 1` and
+  the body "process pending strict-acknowledgement limit reached", or gRPC
+  `RESOURCE_EXHAUSTED`, counted by `ravel_ingest_pending_ack_shed_total`. It
+  now comes before decode, so a strict request with an undecodable body over
+  the bound gets the 429 rather than a 400, and on HTTP/1 its body is drained
+  after its in-flight slot is returned. Buffered writes take no permit. OTAP
+  batches still take theirs after decode. The gauge
+  `ravel_ingest_pending_strict_acks` now counts strict requests from
+  admission to their acknowledgement, so it includes requests still being
+  read or decoded. A `--max-pending-strict-acks` below
+  `--max-inflight-ingest-requests` (or any finite value while that ceiling is
+  0) now also bounds strict requests in that phase, and can shed strict
+  writes while fewer acknowledgements than the bound are pending. The
+  defaults stay 8,192 and 1,024.
+- **The write CPU gate's inline floor is 1 MiB.** A flush encode or ingest
+  payload decode sized under 1 MiB (the uncompressed size, or an upper bound
+  on it for gzip and OTAP bodies) now runs inline on the calling
+  async worker instead of taking a write gate permit. The read gate keeps its
+  256 KiB floor. On a fresh c6a.4xlarge, 64 KiB snappy Remote Write at 16
+  clients went from 0.879 to 1.001 of ungated throughput, and PromQL and SQL
+  query p99 stayed within 10% of the 256 KiB floor. The new
+  `--cpu-gate-write-inline-floor-bytes` flag moves the write gate's floor:
+  `0` sends every flush encode and ingest payload decode through the gate,
+  and a value larger than any job runs them all inline. The startup line
+  logs it. The `ingest_write_gate_overhead` bench takes the same setting as
+  `RAVEL_BENCH_WRITE_INLINE_FLOOR_BYTES`, prints the min, median and max
+  input bytes of each configuration's flush encodes, and takes
+  `RAVEL_BENCH_TABLE_RUNS`, `RAVEL_BENCH_HTTP_RUN_MS` and
+  `RAVEL_BENCH_FLUSH_RUN_MS` for a short table pass. A new advisory bin,
+  `ingest_query_latency_trial` (feature `saturation`), reports PromQL and SQL
+  query p50/p99 and Remote Write throughput under a fixed 64 KiB snappy load
+  at 1 and 16 clients, for three arms: ungated, the write gate at a 256 KiB
+  floor, and the write gate at the 1 MiB default. Because ingest decodes and
+  flushes now run on the main workers, a cluster that still probes the main
+  HTTP port (`spec.probes.dedicatedHealthPort: false`, which every cluster
+  written since v0.19.0 holds unless changed) should set it to `true` before
+  upgrading, so its probes use the isolated health listener on 4316.
+- **A `min_commit_token` on a statement that reads only Parquet tables is a
+  400.** A Parquet table has no commit tokens, and such a token used to be
+  accepted and never checked. `POST /api/v1/sql` now refuses it, unqualified
+  or qualified with the Parquet table's name, before any table is read;
+  send the statement without it.
+- **PromQL selectors clip each series to the step's window by binary search.**
+  The merged in-memory source a query evaluates against now finds a series'
+  samples inside the requested window with two binary searches instead of
+  testing every sample, with the same inclusive bounds and the same samples
+  returned. A compound range query calls this once per selector per grid
+  step, where the per-sample walk was 77.6 % of a 24 h query's profile
+  (epic #3072, Stage 0); #3078 reduces those calls to one per selector.
+- **Compound PromQL range queries read each distinct selector once per query.**
+  A range query whose top level is an aggregate or binary expression, such as
+  `sum by (service_name) (rate(http_requests_total[5m]))`, used to read every
+  selector from the query's prefetched series once per grid step; measured on
+  issue #3072, a 24 h / 60 s query made 1,441 reads that each walked every
+  series whole, and evaluation took 91.7 % of the wall time at 1,000 series. The
+  evaluator now keeps each selector's read (keyed by its matchers, its float or
+  histogram channel, `offset` and `@`; two selectors that differ in range only
+  share a key) in a per-query cache whose first read of a selector covers what
+  every grid step asks of that selector, and answers each step, including each
+  step of a subquery, by slicing it; it reads again only when a step asks for a
+  window outside the cached one, and that read covers the cached window too.
+  Results are unchanged. Each cached read is reserved against the query memory
+  budget and counted toward a per-query cap of two float copies of the
+  `max_samples` pool, and both are released when the query ends. A selector
+  whose read does not fit is read at every grid step instead, which returns the
+  same result, and the response carries one info annotation naming how many
+  selectors fell back and whether the budget or the cap refused them; a budget
+  fallback does not move `ravel_memory_budget_refusals_total` or
+  `ravel_memory_gate_refusals_total`, since the query still succeeds. A selector
+  whose wider re-read the cap refuses gives up the entry it would have replaced,
+  with its bytes and budget reservation, so that room can hold another
+  selector's entry.
+- **A compound PromQL range query slices each cached selector read from where
+  the previous step left off** (ADR-3072 decision 1, issue #3127). Each series
+  in a selector cache entry keeps a lower and an upper cursor, so a step whose
+  window moves forward by a few samples finds its slice by a short walk
+  instead of two binary searches. A window that moves backwards, or more than
+  64 samples ahead, is found by binary search as before. The slices are the
+  same either way.
+
+### Fixed
+
+- **OTAP ingest accepts Arrow IPC payloads that are not wrapped in a zstd
+  frame** (issue #1905), which is what the OpenTelemetry Collector's
+  `otelarrow` exporter sends. Every such batch was previously refused with
+  `zstd decompression failed: Unknown frame descriptor`. A payload is read as
+  a zstd frame only when it starts with the zstd magic; any other payload is
+  decoded as Arrow IPC, with or without ZSTD IPC body compression, and is held
+  to the same per-payload cap (`StreamConfig::max_decompressed_payload_bytes`,
+  16 MiB by default) on its length and on the decoded size of its compressed
+  buffers. A payload using any other IPC body compression codec (LZ4_FRAME) is
+  refused before decode. The per-stream dictionary budget
+  (`StreamConfig::max_stream_dictionary_bytes`) now counts a ZSTD-compressed
+  dictionary's decoded bytes rather than its compressed size.
+- **A shed HTTP ingest request is answered with a readable 429.** When the
+  in-flight ceiling (`--max-inflight-ingest-requests`) sheds an authenticated
+  HTTP/1.1 request, the server now reads and discards its body (up to 1 MiB,
+  for at most 1 second, never decoded or charged) before answering, so a
+  pooled client such as an OTLP/HTTP exporter or Prometheus remote write
+  receives the 429 with `Retry-After` instead of a broken pipe or a reset
+  connection. A shed whose drain is refused (an unauthenticated caller, a
+  body over the cap, no free drain slot, or the time limit) keeps the same
+  429 and adds `Connection: close`, counted by the new
+  `ravel_ingest_head_refusal_undrained_total{reason}`.
+- **Startup no longer warns about jemalloc's background purge thread on a
+  host whose jemalloc has no background-thread support** (macOS; issue
+  #2966). On such a host the server logged two warnings, one for enabling
+  the thread and one for reading its state back, and stamped
+  `allocator_background_thread=false source="server"`, as if it had decided
+  the state. It now logs one info line and stamps
+  `allocator_background_thread=false source="unavailable"`. The same applies
+  when `_RJEM_MALLOC_CONF` sets `background_thread` on such a host, which
+  previously logged one warning and stamped `source="malloc_conf"`. A real
+  failure to enable the thread on a host that supports it still logs a
+  warning (see issue #3096 for its stamp).
+- **`sql_latency_bench` refuses a zero `--sql-partition-count` or
+  `--store-get-concurrency` instead of measuring a run its report
+  misdescribes** (issue #2975). The in-process lanes built the executor's
+  `EngineConfig` without validating it, so `--sql-partition-count 0` reached
+  DataFusion as the host's core count while the report stamped 1, and
+  `--store-get-concurrency 0` left the engine config at 0 beside a GET limiter
+  clamped to 1. Both lanes now run `EngineConfig::validate`, the check
+  `ravel-server` runs, before generating or reading any data, and the error
+  names the flag. `--fetch-concurrency 0` is still clamped to 1, as
+  documented. The Flight lane is unchanged: the server's own configuration
+  governs it.
+- **A SQL query refused by the host memory gate says so.** The refusal message
+  now names the gate, the host's available memory and the floor it is below,
+  instead of reporting an exceeded process memory limit the process had not
+  reached. A refusal by the accounted process budget keeps its message.
+- **RLOG declared keys and numeric stats now resolve a field the way SQL
+  reads it** (issue #3039), for logs, alerts and audit. The writer
+  let a top-level Map or List resource entry claim a declared field's name,
+  so a scalar scope entry under it was never keyed in KEY_IDX or counted in
+  the field's min/max, though SQL returns it. The writer now skips nested
+  stream entries, takes the first remaining one (resource before scope),
+  lets a record-level value win, and lets a wrong-typed first entry yield
+  nothing while still shadowing later ones. RLOG KEY_IDX sections written
+  this way carry `version` 2 (RSPAN stays at 1); every reader accepts both,
+  `rlog inspect` prints the version, compaction and the erasure rewrite
+  write version 2, and the ranged probe declines on a version 1 section.
+  No released version writes or reads an RLOG KEY_IDX section: 0.24.0 skips
+  the section kind, so an upgrade from it needs no rollout order for this
+  change.
+  Numeric stats already stamped in older objects keep the old resolution
+  until rewritten (issue #3040).
+- **`sql-latency --generate` objects carry their own content hash.** The
+  generator stamped a zero hash on every object, so the read cache could serve
+  one equal-size object's bytes for another; generated-lane cache figures taken
+  before this fix may count those collisions as hits.
+- **A failed start of jemalloc's background purge thread is reported as not
+  running, and the thread is turned back off when jemalloc's flag was set**
+  (issue #3096). When the host
+  refused to create the thread, the server logged a warning and then stamped
+  `allocator_background_thread=true source="server"`, and
+  `ravel_process_allocator_background_thread` read `1`, because jemalloc sets
+  its enabled flag before it creates the thread and leaves it set when
+  creation fails. With that flag set and no thread running, jemalloc did no
+  decay purging at all, so freed pages went back to the operating system only
+  through forced purges. The startup stamp now reads
+  `allocator_background_thread=false source="start-failed"` and the gauge
+  reads `0`. When the failed start had set jemalloc's enabled flag, the server
+  writes the thread back off, so freed pages return on allocator activity as
+  with `background_thread:false`, and if that write fails too, a second
+  warning says that decay purging is off until restart. A start that failed
+  before jemalloc reached the setting (EAGAIN, a memory allocation failure)
+  leaves the setting as it was and logs one warning saying so. When the
+  server cannot tell whether the failed start set the flag, the follow-up
+  warning says decay purging is off only if it did.
+
+### Added
+
+- **`GET /api/v1/alerts`, and real health and state on `GET /api/v1/rules`.**
+  The alert evaluator publishes a per-tenant snapshot at the end of each tick,
+  and both routes render it in the Prometheus shapes. `/api/v1/alerts` lists the
+  caller's pending and firing alerts with `labels`, `annotations`, `state`,
+  `activeAt` and `value`; suppressed and resolved alerts are left out. `value`
+  is the matched sample, or the row count for a SQL rule, and is present only
+  when this process held the tenant's lease on the last tick and evaluated the
+  rule without error. Each rule on `/api/v1/rules` now carries `health` (`ok`,
+  or `err` with `lastError`, which never carries an object key, the tenant hash
+  or backend error text: a storage fault reads as a fixed message such as `alert
+  history unreadable`), `lastEvaluation`, `state` (`inactive`, `pending` or
+  `firing`) and an `alerts` array. Neither route reads object storage or runs a
+  query, and neither reads another process's state: before this process's first
+  tick, and in a process that runs no evaluator, a tenant's rules read `unknown`
+  and `/api/v1/alerts` answers it 503 rather than an empty list. A tenant with
+  no rules always gets 200 with an empty list, from every process, so the answer
+  does not reveal whether any other tenant on the server has rules. When the
+  last tick could not read alert history, rules read `err` health and `unknown`
+  state and `/api/v1/alerts` answers 503 until a tick reads it again, rather
+  than serving an earlier tick's list. A snapshot more than three evaluation
+  intervals old, as a stopped or stuck evaluator leaves behind, gets the same
+  503 naming its age, and its rules read `unknown`, until the evaluator
+  publishes again. History stays on the `alerts` SQL table (ADR-1101 amendment).
+- **Per-tenant exact-key index fields for logs.** `ravel-cli typed-attr-column
+  set` takes `--key-index KEY` (a declared `str`, `i64` or `bytes` column;
+  `bool` is refused), `--no-key-index`, and `--index-trace-id true|false`. The
+  logs flush, L0 to L1 compaction and the erasure rewrite then write a KEY_IDX
+  section (kind 9) into each RLOG object, listing the blocks that hold each
+  distinct value of every named field; the RLOG trailer stays at version 5.
+  Turning either setting on writes tenant config record version 4, which a
+  release that predates it refuses, so it needs `--readers-rolled-out` (ADR-0066
+  R1, readers first); turning both off needs no opt-in. `typed-attr-column show`
+  and `set` print both settings, and `rlog inspect` prints the section's
+  version, `bucket_bits` and each field's key type, entry count and bucket
+  spread. A retype of an indexed column leaves that column unindexed in
+  compacted objects whose inputs mix the two types; a merge whose fields exceed
+  the 64-field cap keeps `trace_id` and then the names that sort first, which
+  can leave an unchanged column unindexed in that output. Neither blocks
+  compaction or erasure, and a query over an unindexed column reads the object
+  instead of probing it. Logs exact-key equalities and spans `trace_id` lookups
+  probe the section (see the Changed entries for #2761 and #2762).
+- **Per-part key-index leaf codec and `ravel-cli inspect kidx`.** The
+  `.kidx` object of ADR-2707 decision 4 (RKI1 layout, docs/catalog-and-mvcc.md
+  "Per-part key-index leaves") now has an encoder, a key-range split for
+  leaves over the body ceiling, a whole-object verifier, and a two-GET probe
+  over a ranged byte source. The probe binds a leaf to its part's blake3,
+  selects the bucket from the header's `bucket_bits` only, and reports the
+  uncovered entry ordinals with every answer. A leaf whose tenant or signal
+  differs from the request is `CatalogError::FieldMismatch` and counts in
+  `ravel_catalog_isolation_breach_total`. `SnapshotPartRef` gains the
+  additive `key_index` field 8. `ravel-cli inspect kidx KEY...` verifies every
+  frame and prints the header, the bucket-size distribution and, with
+  `--entries`, every entry. The catalog fold writes leaves when its leaf
+  build is turned on, and `ravel-cli catalog fold --rebuild-key-index`
+  attaches them to existing parts (both below); no query reads them yet.
+- **The RLOG reader can evaluate a `LIKE '%needle%'` attribute filter on raw
+  page bytes.** A new `Predicate::Contains` arm (with a negated form for
+  `NOT LIKE`) tests each string cell of a plain, dictionary, or row-group
+  dictionary page as bytes, before any string value is built or UTF-8
+  validated. A cell that is absent or not valid UTF-8 reads as absent and
+  falls back to the stream's resource or scope value of the same key, else
+  NULL; a row whose attribute is another type is kept for the exact filter.
+  For the arm's column, the dictionary a block hands out is built from the
+  entries its surviving rows use, and only those entries, plus any entry whose
+  byte verdict differs from the stream value's, are UTF-8 validated, without
+  filling the reader's shared dictionary cache. `ScanStats` gains
+  `contains_cells_tested` and `str_cells_validated`. No SQL query constructs
+  the arm yet.
+- **ES|QL over `POST /api/v1/esql`, behind the `esql` cargo feature.** The route
+  runs one ES|QL statement over the `logs` table (`FROM logs` or `ROW`, with
+  `WHERE`, `EVAL`, `KEEP`, `DROP`, `RENAME`, `STATS ... BY`, `SORT` and `LIMIT`)
+  and answers with typed columns, rows, a `stats` object (for a statement that
+  reads the catalog, the `/api/v1/sql` sections other than `signals` and
+  `cache`; for a `ROW` statement, only `accounting` and `estimate`, all zero),
+  and `warnings` when a `LIMIT` above 10,000 was lowered. A statement that does
+  not end in `LIMIT` returns at most 1,000 rows. Anything outside the subset is
+  refused with a typed 400 naming the construct and its line and column; a
+  planning failure, or a time window wider than the catalog serves, is a 422. It
+  shares the SQL surface's admission ceiling, deadline clamp, usage accounting
+  and query audit, which records it with `query.language = esql` and redacts
+  string literals, value numbers, interval magnitudes and `PROMQL` parameter
+  values to the same tokens SQL and PromQL use. The feature turns on `sql`, and
+  the published image does not include it. `scripts/gates.sh` and CI gain an
+  `esql` clippy and test lane, and `scripts/affected-tests.sh` runs `-p
+  ravel-server --features esql` when ravel-server is in the closure.
+- **`POST /api/v1/sql` runs a statement that joins signal tables.** A query
+  can name two or more of `samples`, `logs`, `spans`, `alerts` and `audit`; it
+  reads one snapshot per signal, with no ordering between them, and joins on
+  the server that received it. A SQL alert rule may join signal
+  tables the same way, so a join rule that failed on every evaluation now
+  evaluates and can fire. ES|QL still refuses a query naming two signal
+  tables (ADR-2904).
+- **`min_commit_token` on `POST /api/v1/sql` can name the table it bounds.**
+  A token may be sent as `<table>:<token>`, for example `logs:<token>`, and
+  then bounds only that table's snapshot, so a statement joining `samples`
+  and `logs` can wait for one metrics write and one logs write. On a statement
+  that reads two or more of `samples`, `logs`, `spans`, `alerts` and `audit`,
+  every token must be qualified: an unqualified token is a 400 naming the
+  tables. A qualifier that is not exactly one of the statement's lower-case
+  table names is a 400 naming it. Both are refused before any catalog request.
+  `GET /api/traces/{trace_id}` accepts `spans:<token>`. Flight SQL takes
+  unqualified tokens only, and `POST /api/v1/esql` takes no `min_commit_token`
+  (ADR-2904 decision 3).
+- **`POST /api/v1/sql` reports cost per signal table in `stats.signals`.**
+  The JSON response's `stats` gains one entry per signal table the statement
+  reads, in the order `samples`, `logs`, `spans`, `alerts`, `audit`. Each
+  entry carries `table`, `segments`, `segmentsPruned` and `phases`, the
+  table's own cost in the shape of `stats.phases`. For every phase and field
+  the entries sum to `stats.phases`, less what Parquet tables cost, which have
+  no entry. Request and byte budgets still count the whole statement.
+  `SqlExecutor::explain` reports the same entries in `ExplainReport::signals`.
+- **Flight SQL runs statements that join two or more signal tables.** A
+  statement naming two or more of `samples`, `logs`, `spans`, `alerts` and
+  `audit`, such as `samples JOIN logs`, now runs over Flight SQL instead of
+  being refused. `GetFlightInfo` resolves one snapshot per table and pins
+  each in the ticket as its own segment group (ticket version 10), and
+  `DoGet` reads exactly those snapshots, so a commit to any of the tables
+  between the two calls is not visible. A ticket whose pins do not match its
+  statement's tables is refused with `INVALID_ARGUMENT` before any store
+  request. Flight SQL tokens cannot name a table, so such a statement sent
+  with a `min_commit_token` is refused with `INVALID_ARGUMENT` at
+  `GetFlightInfo`; without one it runs. Statements over one table keep their
+  existing tickets byte for byte. `ravel-cli sql explain --analyze` runs
+  these statements too (ADR-2904 decision 10); that subcommand exists only
+  in a ravel-cli built with `--features sql-explain`, which the published
+  image is not.
+- **A SQL statement can join a Parquet table with a signal table.** A query
+  on `POST /api/v1/sql` or Flight SQL may name Parquet tables beside any of
+  `samples`, `logs`, `spans`, `alerts` and `audit`, for example `hits JOIN
+  logs`, instead of being refused with a 400. The Parquet tables resolve
+  first, then each signal table its own snapshot, so each signal table's
+  resolve-time `max_s3_requests` check counts the Parquet resolve reads, and
+  the reported cost estimate is the Parquet estimate plus each signal
+  table's. The Parquet reader checks each read against the statement's
+  total requests and bytes, signal reads included, as the `samples` scan
+  does; the `logs`, `spans`, `alerts` and `audit` scans still make no
+  scan-time request check and no byte check. Flight SQL pins the Parquet
+  manifests and the signal snapshots in the ticket, so a write to either
+  between `GetFlightInfo` and `DoGet` is not visible. A `min_commit_token`
+  bounds the signal tables only, and a token qualified with a Parquet
+  table's name is a 400. A row window filters the signal tables only
+  (ADR-2904 decision 11). Beside a Parquet table a `samples` filter on
+  `__name__` does not prune segments by postings, so such a statement reads
+  every `samples` segment in its window. Flight SQL now refuses a
+  `min_commit_token` on a statement that reads only Parquet tables with
+  `INVALID_ARGUMENT` at `GetFlightInfo`, as HTTP does with a 400; it used to
+  accept the token and ignore it.
+- **Every read-path GET records its time to first byte and time to last
+  byte, by requested size and read phase.** The instrumented store keeps a
+  log-scale latency histogram per phase (`resolve`, `plan`, `probe`, `scan`,
+  `unattributed`) and per size bucket (below 4 KiB, power-of-two spans up to
+  64 MiB, above 64 MiB), with failed GETs counted separately. The RSEG, RLOG
+  and RSPAN fetchers attribute their GETs to a phase; the catalog's reads are
+  `unattributed`. `sql_latency_bench` reports it as `get_latency`: per phase
+  and size bucket, the count and the p50, p90, p99 and max of both latencies.
+  No request is split, hedged or timed out differently.
+- **`logbody_report` measures log body search and encoding options.** A
+  report-only `ravel-bench` binary that writes a line corpus through the
+  production RLOG writer and reports, per block, which blocks a substring needle
+  matches, what the word-token Bloom and an estimated per-block trigram Bloom
+  would keep, body page size against a template split, and integer page size
+  against a FastLanes-style bit-packed layout. See
+  `docs/internal/bench-reports.md`.
+- **The catalog fold can write per-part key-index leaves for logs and spans, off
+  by default.** `ravel-server --fold-key-index-leaves` and `ravel-cli catalog
+  fold --key-index-leaves` turn the build on; without either, the fold reads no
+  KEY_IDX section, writes no leaf, and writes a part it re-encodes without
+  key-index refs. No query uses the leaves yet. With the build on, for every
+  part it re-encodes the fold reads each entry's KEY_IDX section by ranged GET
+  (a footer suffix, a second footer read when the footer is larger than the 8
+  KiB suffix, then the section), once per fold however many HEAD CAS attempts it
+  makes, and writes one `.kidx` leaf per (part, field, key slice) before the
+  part, naming them in HEAD. A logs tenant that declares no key-index column and
+  leaves trace-id indexing off reads no section and writes no leaf. An entry it
+  cannot index is listed as uncovered in the leaf instead of failing the fold,
+  and a failed KEY_IDX read GET is logged at warn level with the object key. The
+  tail part is re-encoded on every fold that advances the watermark, so with the
+  build on each such fold reads the section of every entry in the tail. The fold
+  report (and `ravel-cli catalog fold`) gains `key_index_ranged_gets` and
+  `key_index_bytes_read` (the total the fold issued), and
+  `key_index_leaves_written`, `key_index_leaf_bytes_written` and
+  `key_index_uncovered_entries` (for the attempt that published); `ravel-cli
+  catalog inspect` prints each part's `key_index (field 8)` refs. The catalog
+  sweep keeps every leaf HEAD names, deletes unreferenced leaves past the
+  protection horizon, and reports its deletes by kind as
+  `ravel_maintain_catalog_objects_deleted_total{kind="csnap|npost|cstat|kidx|other"}`.
+- **`ravel-cli catalog fold --rebuild-key-index` attaches key-index leaves to
+  parts already in HEAD without re-encoding them.** For every logs or spans
+  part lacking a `key_index` ref for a declared field (or only for
+  `--field NAME`, refused unless the tenant declares it) it reads the part
+  object once and each entry's footer suffix (and the rest of the footer
+  when it is larger than the 8 KiB suffix) and KEY_IDX section, writes the
+  `.kidx` leaves for the declared fields (byte-identical to the ones the fold
+  writes for them), and publishes HEAD with the same part refs plus the new
+  `key_index` refs. It writes no part, `.csnap` or `.cstat`, lists nothing,
+  and runs regardless of the fold's leaf switch (`--key-index-leaves`, which
+  it refuses beside it). A logs tenant that declares no key-index field is
+  refused with the tenant named. Parts go in batches of at most
+  `--batch-entries` entries (default 250,000, at least 1, at least one part a
+  batch), each published by its own HEAD CAS, so an interrupted run keeps
+  every earlier batch and a rerun reads nothing for the parts they indexed.
+  A lost CAS re-reads HEAD and keeps only the refs whose part HEAD still
+  names. A part with an entry whose ranged GET failed gains no ref this run
+  and is counted in `parts_deferred`; a rerun reads it again. The report
+  prints the largest unindexed part's entries, the parts rebuilt and
+  deferred, leaves and leaf bytes written, section bytes read, ranged GETs,
+  uncovered entries, and per attempt the part GETs, ranged GETs, leaf PUTs
+  and HEAD CAS tries; `--json` prints the same fields. A later fold that
+  carries the part by reference keeps the refs; a fold that re-encodes the
+  part with the leaf build off drops them, so the rebuild has to be rerun
+  after one.
+- **`ravel_process_allocator_bytes` reports jemalloc's `mapped` and
+  `retained` bytes.** Two new `stat` samples sit beside `allocated`, `active`
+  and `resident`, read in the same allocator epoch. `mapped` is the bytes in
+  the allocator's active extents and `retained` is virtual memory it keeps
+  reserved for reuse; neither is a resident figure. The existing three series
+  are unchanged.
+- **IPCrypt pseudonymization at ingest.** `ravel-server --ipcrypt-config
+  <file>` loads a TOML policy of per-tenant rules (ADR-2993), and every ingest
+  surface (OTLP metrics, logs and traces over HTTP and gRPC, Remote Write and
+  OTAP) replaces an IP address under a ruled key with its IPCrypt ciphertext
+  before anything is stored; `ip:port` keeps the port, and any other value is
+  stored as sent. Rules match the key as sent on logs and traces and the
+  sanitized label name on metrics, so the metric `instance` label needs its
+  own rule apart from `service.instance.id`. A policy with rules needs
+  `--tenant-hash-key-file`. In the `all` and `gateway` modes the server
+  compares the policy with the bucket's `sys/ipcrypt/policy` marker at
+  startup, creates it when absent and the policy is non-empty, and refuses to
+  start on a mismatch or a marker it cannot read; the gateway IAM template
+  grants a create-only write on it. `ravel_ingest_ipcrypt_values_total{signal,
+  variant, outcome}` counts the ruled values of each acknowledged, fully
+  admitted batch as `encrypted` or `unparsed`. Data written before a rule was added is not rewritten.
+- **IPCrypt policy in `ravel-cli`.** `ravel-cli load --ipcrypt-config <file>`
+  encrypts ruled addresses in loaded metrics, logs and spans before anything is
+  stored, and every load and `erase submit` compares the policy with the
+  bucket's `sys/ipcrypt/policy` marker before its first write, refusing on a
+  mismatch or a marker it cannot read. `erase submit --ipcrypt-config <file>`
+  encrypts matcher values under a rule and submits one request per rule epoch
+  combination (at most 16), with ids derived from `--request-id` so a retry
+  re-submits the same requests. New `ravel-cli ipcrypt encrypt|decrypt`
+  translates addresses for a tenant, variant and epoch, and `ravel-cli ipcrypt
+  set-policy` replaces the marker with a compare-and-swap for a changed policy.
+  `erase submit` reads the marker and never creates it: with no marker and a
+  policy with rules, a request carrying a matcher the policy would encrypt is
+  refused before anything is written, with a message saying the bucket's data
+  was written without the policy and holds raw values, to be passed with
+  `--plaintext-matcher KEY=VALUE` instead of `--matcher`.
+- **`ipcrypt_encrypt(ip, epoch)` and `ipcrypt_prefix_encrypt(ip, epoch)` SQL
+  functions, behind an `ipcrypt` capability.** Each returns the value a
+  `deterministic` or `prefix` IPCrypt ingest rule stores for an address under
+  the caller's tenant at that epoch, so a query can match pseudonymized
+  attributes for a known address without a key argument. The key is derived
+  from the deployment key and the query's tenant, so tenants get different
+  values for the same address. The functions are registered only when the
+  caller holds the new `ipcrypt` capability (a token tenant written
+  `TENANT;ipcrypt`, or `--oidc-ipcrypt-claim`), the server has
+  `--tenant-hash-key-file`, and the query audit does not record text in
+  plaintext; otherwise a call is refused like a call to an unknown function.
+  The ingest router strips `ipcrypt` from token tenants the same way it strips
+  `ddl`. Flight SQL, ES|QL, explain, alert rules and MCP do not grant it
+  (ADR-2993 decision 6).
+- **The read cache admits by access intent.** `ravel-cache` gains `AccessIntent`
+  (`Interactive`, `BulkScan`, `Maintenance`) and intent-taking variants of the
+  RAM, tiered and S3-FIFO read and admit paths. A `BulkScan` read is admitted to
+  a bulk region that keeps a fixed, hash-chosen subset of a repeated scan larger
+  than the cache and never evicts the main queue, so an interactive hot set
+  survives the scan. A bulk read the region declines when it arrives is not
+  copied and evicts nothing, and one it accepts is copied with the cache
+  unlocked, so interactive reads do not wait on the copy. The admission copy
+  counters count every copy made, including one whose entry is then not stored.
+  The SQL executor sets `BulkScan` for whole-tenant scans (below). The caching
+  guide now describes the caps as S3-FIFO rather than LRU (#2738).
+- **Whole-tenant SQL scans are admitted to the read cache as bulk reads.** The
+  SQL executor tags a statement `bulk_scan` only when it names one `samples` or
+  `logs` table and no Parquet table, its plan is predicate-free (no `WHERE` or
+  `HAVING` clause anywhere, no join and no `LIMIT`), and its window runs from
+  the epoch to now; a `samples` statement also needs no segment pruned and every
+  segment inside the window, and a `logs` statement no pending erasure and every
+  resolved segment inside the window. Its bytes go to the fetcher RAM cache's
+  bulk region instead of evicting the interactive working set; every other
+  statement (any over `spans`, `alerts` or `audit` included), and PromQL, ES|QL,
+  Flight SQL, the startup warmup and distributed workers, reads as
+  `interactive`. Results are the same under either intent. `ravel-server
+  --cache-bulk-share <fraction>` (default `0.5`, strictly between 0 and 1) sets
+  the share of `--cache-max-bytes` the region holds against interactive
+  admissions. An interactive admission evicts the region's bytes below that
+  share only once the probation and main queues are empty, so they stay resident
+  after bulk reads stop. When the server runs a fetcher cache, the `/api/v1/sql`
+  response's `stats.cache` object reports the statement's intent, its RAM-tier
+  hits and served bytes per intent, and cache-wide misses and admitted bytes,
+  measured as the movement of process-wide counters, so concurrent statements
+  share them. `GET /metrics` adds `ravel_cache_intent_hits_total` and
+  `ravel_cache_intent_bytes_served_total` with an `intent` label, and leaves the
+  label set of every existing `ravel_cache_*` family unchanged.
+- **`erase submit --plaintext-matcher` for data written before an IPCrypt
+  rule.** The repeatable `--plaintext-matcher KEY=VALUE` submits its value
+  exactly as written, with no encryption and no epoch fan-out, for data
+  stored before the key's rule existed. The command warns on stderr that the
+  erasure log stores those values in the clear, refuses a key with no rule
+  for `--signal`, and refuses a command that also carries a matcher the
+  policy would encrypt, since no record could match both.
+- **`HealthProbeOnMainHttpPort` condition on a `RavelCluster` still probing the
+  main HTTP port.** The operator sets it with status `True` and reason
+  `DedicatedHealthPortDisabled` whenever the resolved
+  `spec.probes.dedicatedHealthPort` is `false`. Since v0.19.0 the CRD has
+  defaulted that field to `false` and the API server stores schema defaults on
+  every write, so a cluster written since then holds `false` until someone sets
+  `true` or removes the field. The message names the main HTTP port and the
+  dedicated health listener's port from the operator's own constants, names
+  the two preconditions for flipping the field (a `ravel-server` image
+  v0.19.0 or newer, a kubelet able to reach the health port), and points at
+  the upgrade note in `docs/guides/kubernetes.md`. The condition is absent,
+  not `False`, once probes resolve to the dedicated listener, whether from an
+  explicit `true` or the schema default. This change adds no write to
+  `spec.probes`; it only makes the stored state visible.
+- **The operator runs on EKS Pod Identity with no access key.**
+  `spec.storage.s3.auth: podIdentity` runs every tier, the store-qualification
+  Job and the operator itself on per-ServiceAccount Pod Identity roles. A
+  credentials sidecar from the operator image writes a short-lived credentials
+  file that ravel-server reads through `--s3-credentials-file`. Set
+  `--credentials-sidecar-image` (`RAVEL_CREDENTIALS_SIDECAR_IMAGE`) to the
+  operator image. IRSA is not supported.
+
+### Security
+
+- **Query-worker registry records are authenticated** (issue #1918). The
+  query role can write anywhere under `sys/query/workers/`, so any principal
+  holding it could add a self-consistent record at a fresh UUID and have
+  coordinators route slices to it and dial its endpoint. Every record now
+  carries a keyed BLAKE3 MAC, under a key derived from `--fragment-key-file`,
+  over its process id, endpoint, protocol version and liveness stamp. A node
+  admits a sibling only when the MAC verifies under one of its keys, and reads
+  each record with a bounded range read of 4096 + 1 bytes. A rejected record
+  is counted in `ravel_query_worker_record_rejects_total{mode,reason}` under
+  `oversize`, `malformed`, `missing_mac`, `bad_mac` or `stale_stamp` (a
+  verified record whose stamp is outside the liveness window although its
+  object is fresh). Not counted: a key that is not a UUID, a key whose
+  modification time is already outside the liveness window (skipped before
+  the read), and a verified drained record. A writer without the key file can
+  still evict a member by overwriting or replaying its record until the
+  member's next beat. Nodes from an earlier release write no MAC: during a
+  rolling upgrade an upgraded node skips them as `missing_mac` and runs their
+  share of slices elsewhere, while they still admit upgraded nodes.
+- **TLS certificate verification no longer accepts distrusted intermediates.**
+  Every shipped binary now builds with rustls-webpki 0.103.16, which fixes
+  RUSTSEC-2026-0382 (certificate verification could accept distrusted
+  intermediates). The lockfile also moves webpki-roots and webpki-root-certs to
+  1.0.10 (RUSTSEC-2026-0381 and RUSTSEC-2026-0383), crates no released binary
+  links.
+
 ## [0.24.0] - 2026-10-15
 
 ### Changed
