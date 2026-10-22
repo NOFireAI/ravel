@@ -804,8 +804,9 @@ pub struct QuerySpec {
 
     /// Memory, in bytes, to leave in the query pods' limit above
     /// `memoryBudgetBytes` plus the 256 MiB held outside the budget, for
-    /// allocations the budget does not charge. Ignored while `memoryBudgetBytes` is
-    /// unset. A limit below the floor plus this headroom reports `Degraded` with
+    /// allocations the budget does not charge. Refused at admission without
+    /// `memoryBudgetBytes`, and ignored on a cluster stored without one before that
+    /// rule. A limit below the floor plus this headroom reports `Degraded` with
     /// reason `QueryMemoryHeadroomLow` but still rolls the query Deployment. Unset,
     /// the operator uses a provisional default of `ceil(0.53 * budget) +
     /// ceil(min(budget, 8 GiB) * 6.6 / 8)`: about 2.03 GiB at a 1.5 GiB budget and
@@ -1263,6 +1264,7 @@ pub fn ravel_cluster_crd() -> CustomResourceDefinition {
     inject_canonical_tenant_backend_guard(&mut crd);
     inject_flush_share_guard(&mut crd);
     inject_storage_auth_guards(&mut crd);
+    inject_query_headroom_needs_budget(&mut crd);
     crd
 }
 
@@ -1661,6 +1663,53 @@ fn inject_flush_share_guard(crd: &mut CustomResourceDefinition) {
         let mut rules = gateway.x_kubernetes_validations.take().unwrap_or_default();
         rules.push(rule.clone());
         gateway.x_kubernetes_validations = Some(rules);
+    }
+}
+
+/// Message surfaced when `spec.query` sets a headroom without a budget.
+const QUERY_HEADROOM_NEEDS_BUDGET_MESSAGE: &str = "query.memoryHeadroomBytes needs \
+    query.memoryBudgetBytes: the headroom is measured above a pinned budget, and without \
+    one the operator would ignore it";
+
+/// The CEL rule refusing `memoryHeadroomBytes` without `memoryBudgetBytes`,
+/// kept as a constant so the injected rule and the logic unit test cannot
+/// drift. The operator checks the headroom only against a pinned budget, so a
+/// headroom alone would be accepted and do nothing.
+const QUERY_HEADROOM_NEEDS_BUDGET_RULE: &str =
+    "has(self.memoryBudgetBytes) || !has(self.memoryHeadroomBytes)";
+
+/// Attach the headroom guard to the `query` property, appended to any rules
+/// already there. The API server evaluates it when a CR is written, so a
+/// cluster stored with a headroom and no budget before the rule keeps
+/// reconciling with the headroom ignored, as before.
+fn inject_query_headroom_needs_budget(crd: &mut CustomResourceDefinition) {
+    let rule = ValidationRule {
+        rule: QUERY_HEADROOM_NEEDS_BUDGET_RULE.to_string(),
+        message: Some(QUERY_HEADROOM_NEEDS_BUDGET_MESSAGE.to_string()),
+        ..Default::default()
+    };
+    for version in &mut crd.spec.versions {
+        let Some(schema) = version.schema.as_mut() else {
+            continue;
+        };
+        let Some(root) = schema.open_api_v3_schema.as_mut() else {
+            continue;
+        };
+        let Some(props) = root.properties.as_mut() else {
+            continue;
+        };
+        let Some(spec) = props.get_mut("spec") else {
+            continue;
+        };
+        let Some(spec_props) = spec.properties.as_mut() else {
+            continue;
+        };
+        let Some(query) = spec_props.get_mut("query") else {
+            continue;
+        };
+        let mut rules = query.x_kubernetes_validations.take().unwrap_or_default();
+        rules.push(rule.clone());
+        query.x_kubernetes_validations = Some(rules);
     }
 }
 
@@ -2783,6 +2832,57 @@ mod tests {
         assert!(flush_share_cel_admits(None, Some(3)), "unset/3 admitted");
         assert!(flush_share_cel_admits(Some(2), None), "2/unset admitted");
         assert!(flush_share_cel_admits(None, None), "unset/unset admitted");
+    }
+
+    /// Rust mirror of [`QUERY_HEADROOM_NEEDS_BUDGET_RULE`]: whether a query
+    /// block with these optional fields is admitted. No CEL evaluator runs
+    /// here, so the schema test below pins the exact expression this mirrors.
+    fn query_headroom_cel_admits(budget: Option<u64>, headroom: Option<u64>) -> bool {
+        budget.is_some() || headroom.is_none()
+    }
+
+    #[test]
+    fn query_headroom_without_budget_is_refused_at_admission() {
+        let crd = ravel_cluster_crd();
+        let query = crd.spec.versions[0]
+            .schema
+            .as_ref()
+            .and_then(|s| s.open_api_v3_schema.as_ref())
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("spec"))
+            .and_then(|s| s.properties.as_ref())
+            .and_then(|p| p.get("query"))
+            .expect("query prop");
+        let rules = query
+            .x_kubernetes_validations
+            .as_ref()
+            .expect("query must carry CEL rules");
+        let guard = rules
+            .iter()
+            .find(|r| r.rule == "has(self.memoryBudgetBytes) || !has(self.memoryHeadroomBytes)")
+            .expect("query must carry the exact headroom rule");
+        assert_eq!(
+            guard.message.as_deref(),
+            Some(QUERY_HEADROOM_NEEDS_BUDGET_MESSAGE)
+        );
+
+        assert!(
+            !query_headroom_cel_admits(None, Some(0)),
+            "headroom alone refused"
+        );
+        assert!(
+            !query_headroom_cel_admits(None, Some(1 << 30)),
+            "headroom alone refused"
+        );
+        assert!(
+            query_headroom_cel_admits(Some(1 << 30), None),
+            "budget alone admitted"
+        );
+        assert!(
+            query_headroom_cel_admits(Some(1 << 30), Some(1 << 30)),
+            "both admitted"
+        );
+        assert!(query_headroom_cel_admits(None, None), "neither admitted");
     }
 
     #[test]
