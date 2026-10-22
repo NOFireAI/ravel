@@ -1668,12 +1668,15 @@ terms:
    `MAX_REQUEST_BODY_BYTES` cap), the decoded and normalized structs every
    path holds after decompression, the OTLP gRPC gzip decode buffer (bounded
    per request by tonic's `max_decoding_message_size`, 16 MiB here), and the
-   OTAP zstd payload buffer (bounded by `StreamConfig`'s
-   `max_decompressed_payload_bytes`, 16 MiB; a batch decompresses one payload
-   at a time and drops its buffer before the next, so there is one such buffer
-   per in-flight batch; `max_decoded_batch_bytes` bounds the decoded IPC
-   bodies, not this buffer), none of which the buffer budget charges. So
-   the worst-case transient decode memory bounded only by
+   OTAP payload buffers (each bounded by `StreamConfig`'s
+   `max_decompressed_payload_bytes`, 16 MiB; the record batches decoded from
+   a payload can be views into its buffer rather than copies, so each
+   accepted payload's buffer may stay alive as long as the batch's decoded
+   records; `max_decoded_batch_bytes` bounds the decoded IPC body bytes of
+   the batch, and for a buffer held that way what it does not count is the
+   rest of the buffer: IPC message metadata such as schema messages and
+   message headers, plus any spare capacity left in the allocation), none of
+   which the buffer budget charges. So the worst-case transient decode memory bounded only by
    `--max-inflight-ingest-requests` is still that ceiling times the largest
    *uncharged* decoded body. On the Remote Write RW2 path that body is not the
    64 MiB post-decompression cap but the resolved label bytes the decoder owns
@@ -1689,10 +1692,12 @@ terms:
    the wire to as much as 1 GiB retained. The OTLP gRPC and identity HTTP
    decoded bodies stay at their 16 MiB caps. OTAP's is the decoded IPC body
    bytes of one in-flight batch, bounded by `--otap-max-decoded-batch-bytes`
-   (64 MiB by default), plus one 16 MiB payload buffer per in-flight batch, so
-   the OTAP term of that product is the ceiling times that flag's value plus
-   16 MiB, not 16 MiB. Neither inflate buffer is part of that
-   product, since both are bounded by `--max-ingest-buffer-bytes` instead.
+   (64 MiB by default), so the OTAP term of that product is the ceiling times
+   that flag's value, not 16 MiB, plus per batch the IPC message metadata and
+   spare allocation capacity of its accepted payloads' buffers, which stay
+   alive with any buffer the decoded records are views into and which that
+   flag does not count. Neither inflate buffer is part of that product, since
+   both are bounded by `--max-ingest-buffer-bytes` instead.
 3. **Fixed overhead**: shard-actor and router state, the admission
    controller's per-tenant maps, and the read caches (`--cache-max-bytes`),
    all bounded independently of ingest volume. Independent of ingest volume is
