@@ -374,7 +374,7 @@
                         "type": "integer"
                       },
                       "keySecretRef": {
-                        "description": "Secret holding the maintain key file under `keys`: one\n64-hex-character key per line, the first mints and all verify\n(ADR-3130). Mounted on the maintain pods and passed as\n`--maintain-key-file`, which `--mode maintain` requires. Required while\n`enabled` is true: without it the operator leaves any existing maintain\nDeployment exactly as it is, creates none, and records a `Degraded`\ncondition naming this field. The gateway and query tiers keep\nreconciling. A change to the Secret rolls the maintain pods.",
+                        "description": "Secret holding the maintain key file under `keys`: one\n64-hex-character key per line, the first mints and all verify\n(ADR-3130). Mounted on the maintain pods and passed as\n`--maintain-key-file`, which `--mode maintain` requires. Required while\n`enabled` is true: without it, or while the Secret it names does not\nexist, the operator leaves any existing maintain Deployment exactly as\nit is, creates none, and records a `Degraded` condition naming this\nfield or the Secret. The gateway and query tiers keep reconciling,\nexcept on a fresh cluster with per-role storage credentials (including\n`podIdentity`): there they wait for maintain to create `sys/gc`, so no\nDeployment is created until the Secret exists. A change to the Secret\nrolls the maintain pods.",
                         "nullable": true,
                         "properties": {
                           "name": {
@@ -389,7 +389,7 @@
                       },
                       "replicas": {
                         "default": 1,
-                        "description": "Replica count for the maintain Deployment. Defaults to 1. Values above 1\nare made safe by the ADR-0065 ownership protocol (rendezvous over a\nheartbeat-derived live worker set); the workers coordinate entirely\nthrough the shared object store, so no per-pod wiring is needed beyond\n`--mode maintain`, the shared store flags, and the one key file every\nreplica mounts from `keySecretRef`. Omit to keep today's\nsingle-replica behavior.",
+                        "description": "Replica count for the maintain Deployment. Defaults to 1. Values above 1\nare made safe by the ADR-0065 ownership protocol (rendezvous over a\nheartbeat-derived live worker set); the workers coordinate entirely\nthrough the shared object store, so every replica shares the same\nflags, store, and key Secret (`keySecretRef`). Omit to keep today's\nsingle-replica behavior.",
                         "format": "int32",
                         "minimum": 1.0,
                         "type": "integer"
