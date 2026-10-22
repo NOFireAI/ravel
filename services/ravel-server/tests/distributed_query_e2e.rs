@@ -1906,9 +1906,9 @@ async fn silent_peer_after_connect_is_detected_by_keepalive() {
         "the silent peer must be detected within the keepalive bound: \
          {elapsed:?} >= {bound:?}"
     );
-    // A fresh dial through the silent proxy fails at the TLS handshake bound,
-    // well under one keepalive interval; only the cached channel's keepalive
-    // takes this long.
+    // hygiene-allow: wall-clock -- a fresh dial through the silent proxy fails
+    // at the real-time TLS handshake bound, well under one keepalive interval;
+    // only the cached channel's keepalive takes this long.
     assert!(
         elapsed >= HTTP2_KEEPALIVE_INTERVAL,
         "query 2 must have run on the cached channel until keepalive closed it: \
@@ -3917,9 +3917,10 @@ mod sql_slices {
         // The worker has accepted a slice's TLS connection and its `DoGet`, and
         // holds the read its first batch needs: the connection is established
         // and nothing has been sent on the slice stream.
+        let deadline = Instant::now() + DEADLINE;
         while worker_store.held.load(Ordering::SeqCst) == 0 {
             assert!(
-                started.elapsed() < DEADLINE,
+                Instant::now() < deadline,
                 "no slice reached the worker through the proxy"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3938,6 +3939,9 @@ mod sql_slices {
             "the silent slice must be detected within the keepalive bound: \
              {elapsed:?} >= {bound:?}"
         );
+        // hygiene-allow: wall-clock -- a re-dial through the silent proxy fails
+        // at the real-time TLS handshake bound, well under one keepalive
+        // interval; only the established connection's keepalive takes this long.
         assert!(
             elapsed >= SLICE_HTTP2_KEEPALIVE_INTERVAL,
             "the slice must have waited on its established connection until \
