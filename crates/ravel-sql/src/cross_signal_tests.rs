@@ -1356,7 +1356,7 @@ async fn stats_signals_sum_to_totals_per_phase() {
         let samples_fields = rendered_fields(&samples_json[index]);
         let logs_fields = rendered_fields(&logs_json[index]);
         let total_fields = rendered_fields(&total[index]);
-        assert_eq!(total_fields.len(), 10, "every rendered field is compared");
+        assert_eq!(total_fields.len(), 11, "every rendered field is compared");
         for (((key, samples), (logs_key, logs)), (total_key, total)) in
             samples_fields.iter().zip(&logs_fields).zip(&total_fields)
         {

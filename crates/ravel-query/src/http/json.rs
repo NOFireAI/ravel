@@ -186,6 +186,8 @@ pub struct QueryAccountingJson {
     pub cache_misses: u64,
     #[serde(rename = "cacheBytes")]
     pub cache_bytes: u64,
+    #[serde(rename = "lateServedBytes")]
+    pub late_served_bytes: u64,
     #[serde(rename = "decompressedBytes")]
     pub decompressed_bytes: u64,
     #[serde(rename = "segmentsOpened")]
@@ -217,6 +219,7 @@ impl QueryAccountingJson {
             cache_hits: snapshot.cache_hits,
             cache_misses: snapshot.cache_misses,
             cache_bytes: snapshot.cache_bytes,
+            late_served_bytes: snapshot.late_served_bytes,
             decompressed_bytes: snapshot.decompressed_bytes,
             segments_opened: snapshot.segments_opened,
             series_matched: snapshot.series_matched,
@@ -291,6 +294,15 @@ pub struct PhaseCostJson {
     /// bytes. Pooled counterpart: `accounting.cacheBytes`.
     #[serde(rename = "cacheServedBytes")]
     pub cache_served_bytes: u64,
+    /// Bytes a read cache handed this phase from another caller's in-flight
+    /// read of the same key (a single-flight follower, or the leader's RAM
+    /// recheck). Each such read counts as a cache miss, yet no GET of this
+    /// query's own moved the bytes and no resident entry served them, so they
+    /// are in neither [`Self::s3_get_wire_bytes`] nor
+    /// [`Self::cache_served_bytes`]. Decoded-entry bytes, NOT wire bytes.
+    /// Pooled counterpart: `accounting.lateServedBytes`.
+    #[serde(rename = "lateServedBytes")]
+    pub late_served_bytes: u64,
     /// DECOMPRESSED bytes: the typed-output footprint of every sample this
     /// phase decoded, whatever the encoding. A decode-time output size that no
     /// request paid for, so it is comparable neither with
@@ -339,6 +351,7 @@ fn phase_costs(snapshot: &PhaseAccountingSnapshot) -> Vec<PhaseCostJson> {
                 cache_hits: s.cache_hits,
                 cache_misses: s.cache_misses,
                 cache_served_bytes: s.cache_bytes,
+                late_served_bytes: s.late_served_bytes,
                 decompressed_output_bytes: s.decompressed_bytes,
                 reused_region_bytes: s.bytes_reused,
                 segments_opened: s.segments_opened,
@@ -1052,6 +1065,7 @@ mod tests {
         hits: u64,
         misses: u64,
         cache_bytes: u64,
+        late_bytes: u64,
         decompressed: u64,
         reused: u64,
         opened: u64,
@@ -1085,6 +1099,7 @@ mod tests {
             phases.resolve().record_cache_miss();
         }
         phases.resolve().add_cache_bytes(11);
+        phases.resolve().add_late_served_bytes(101);
 
         // plan: footer and skip-index probes.
         for _ in 0..5 {
@@ -1098,6 +1113,7 @@ mod tests {
             phases.plan().record_cache_miss();
         }
         phases.plan().add_cache_bytes(22);
+        phases.plan().add_late_served_bytes(202);
         phases.plan().add_segments_opened(6);
 
         // probe: segment catalog fetch.
@@ -1112,6 +1128,7 @@ mod tests {
             phases.probe().record_cache_miss();
         }
         phases.probe().add_cache_bytes(33);
+        phases.probe().add_late_served_bytes(303);
         phases.probe().add_series_matched(12);
 
         // scan: block and page data reads, plus decode's own byte figures.
@@ -1126,6 +1143,7 @@ mod tests {
             phases.scan().record_cache_miss();
         }
         phases.scan().add_cache_bytes(44);
+        phases.scan().add_late_served_bytes(404);
         phases.scan().add_decompressed_bytes(5_000);
         phases.scan().add_bytes_reused(640);
         phases.scan().add_segments_opened(15);
@@ -1143,6 +1161,7 @@ mod tests {
             phases.key_index().record_cache_miss();
         }
         phases.key_index().add_cache_bytes(55);
+        phases.key_index().add_late_served_bytes(505);
 
         let snapshot = phases.snapshot();
         crate::QueryStats {
@@ -1205,6 +1224,7 @@ mod tests {
                 hits: 1,
                 misses: 2,
                 cache_bytes: 11,
+                late_bytes: 101,
                 decompressed: 0,
                 reused: 0,
                 opened: 0,
@@ -1218,6 +1238,7 @@ mod tests {
                 hits: 3,
                 misses: 4,
                 cache_bytes: 22,
+                late_bytes: 202,
                 decompressed: 0,
                 reused: 0,
                 opened: 6,
@@ -1231,6 +1252,7 @@ mod tests {
                 hits: 8,
                 misses: 9,
                 cache_bytes: 33,
+                late_bytes: 303,
                 decompressed: 0,
                 reused: 0,
                 opened: 0,
@@ -1244,6 +1266,7 @@ mod tests {
                 hits: 13,
                 misses: 14,
                 cache_bytes: 44,
+                late_bytes: 404,
                 decompressed: 5_000,
                 reused: 640,
                 opened: 15,
@@ -1257,6 +1280,7 @@ mod tests {
                 hits: 18,
                 misses: 19,
                 cache_bytes: 55,
+                late_bytes: 505,
                 decompressed: 0,
                 reused: 0,
                 opened: 0,
@@ -1277,6 +1301,10 @@ mod tests {
             assert_eq!(
                 got["cacheServedBytes"], want.cache_bytes,
                 "{name} cacheServedBytes"
+            );
+            assert_eq!(
+                got["lateServedBytes"], want.late_bytes,
+                "{name} lateServedBytes"
             );
             assert_eq!(
                 got["decompressedOutputBytes"], want.decompressed,
@@ -1324,6 +1352,8 @@ mod tests {
         assert_eq!(value["accounting"]["cacheMisses"], 48);
         assert_eq!(sum("cacheServedBytes"), 11 + 22 + 33 + 44 + 55);
         assert_eq!(value["accounting"]["cacheBytes"], 165);
+        assert_eq!(sum("lateServedBytes"), 101 + 202 + 303 + 404 + 505);
+        assert_eq!(value["accounting"]["lateServedBytes"], 1_515);
         assert_eq!(sum("decompressedOutputBytes"), 5_000);
         assert_eq!(value["accounting"]["decompressedBytes"], 5_000);
         assert_eq!(sum("reusedRegionBytes"), 640);

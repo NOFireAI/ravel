@@ -3124,8 +3124,8 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
 - `stats.accounting`: the `QueryAccountingSnapshot`, split by op for the
   S3 counters (`s3GetRequests`/`s3GetBytes`, `s3ListRequests`/
   `s3ListBytes`, `s3HeadRequests`/`s3HeadBytes`), plus `cacheHits`/
-  `cacheMisses`/`cacheBytes`, `decompressedBytes`, `segmentsOpened`,
-  `seriesMatched`, `bytesReused`, `peakIntermediateBytes`, and the
+  `cacheMisses`/`cacheBytes`, `lateServedBytes`, `decompressedBytes`,
+  `segmentsOpened`, `seriesMatched`, `bytesReused`, `peakIntermediateBytes`, and the
   pre-existing per-run `rawF64Pages`/`rawF64Bytes`. No `segmentsPruned`
   here: `stats.segmentsPruned` (below) is the sole source. For the metrics
   lane it is `Catalog::resolve`'s own postings-pruning count. For the log
@@ -3147,18 +3147,23 @@ cost fields alongside the existing `segmentsFetched`/`segmentsPruned`:
   equality; 0 on every other statement). The rendering iterates `QueryPhase::ALL`, so a phase added to
   the enum cannot be silently dropped. Per-phase fields: `phase`,
   `s3GetRequests`, `s3GetWireBytes`, `s3ListRequests`, `cacheHits`,
-  `cacheMisses`, `cacheServedBytes`, `decompressedOutputBytes`,
-  `reusedRegionBytes`, `segmentsOpened`, `seriesMatched`.
+  `cacheMisses`, `cacheServedBytes`, `lateServedBytes`,
+  `decompressedOutputBytes`, `reusedRegionBytes`, `segmentsOpened`,
+  `seriesMatched`.
 
   Additive to `stats.accounting`, which is unchanged: every per-phase
   counter sums back to its pooled counterpart there. Each byte field
-  names its own kind because the four are different quantities that
+  names its own kind because the five are different quantities that
   cannot be compared or summed with each other: `s3GetWireBytes` is what
   the wire carried (range reads and a coalesced run's unwanted in-between
   bytes included; a retried GET's failed attempts not, since the counter
   is written once from the response that succeeded, and request counts are
   logical calls rather than billed requests per ADR-0927 decision 8),
-  `cacheServedBytes` never crossed the wire, `decompressedOutputBytes` is
+  `cacheServedBytes` never crossed the wire, `lateServedBytes` were handed
+  to this query by another caller's in-flight read of the same key (a
+  single-flight follower, or the leader's RAM recheck; the read counts as
+  a cache miss, and the bytes are in neither of the two figures before it),
+  `decompressedOutputBytes` is
   a decode-time output size no request paid for, and `reusedRegionBytes`
   is wire bytes avoided by reusing an already-fetched region rather than
   wire bytes moved.

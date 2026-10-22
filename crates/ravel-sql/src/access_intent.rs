@@ -12,23 +12,32 @@
 //! ([`classify_access_intent`]).
 //!
 //! With a bulk-scan byte threshold set (the server's
-//! `--cache-bulk-scan-min-bytes`, ADR-3072's size trigger amendment), a
-//! statement sent as SQL text is also BulkScan when it names one `logs` table
-//! and no Parquet table, its resolved segments' `object_size` sums to at least
-//! the threshold, and the plan the KEY_IDX probe takes its filters from has no
+//! `--cache-bulk-scan-min-bytes`, ADR-3072's size trigger amendment and its
+//! read-bytes amendment), a statement sent as SQL text is also BulkScan when it
+//! names one `logs` table and no Parquet table, the same tenant's same
+//! statement text read at least the threshold on its last successful
+//! execution, and the plan the KEY_IDX probe takes its filters from has no
 //! equality on a field the tenant indexes in KEY_IDX ([`size_trigger_applies`],
-//! [`plan_has_key_equality`]). Every other statement is Interactive. Unset,
-//! the first rule decides alone.
+//! [`StatementReadBytes`], [`plan_has_key_equality`]). A statement with no
+//! record of its own, its first execution included, is Interactive. Every
+//! other statement is Interactive. Unset, the first rule decides alone.
+//!
+//! The threshold the server applies is the flag raised to the in-memory read
+//! cache's `max_bytes` ([`effective_bulk_scan_min_bytes`]): the bulk region
+//! keeps a stable subset of a loop larger than the cache, and a loop that fits
+//! the cache is better served by plain recency.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator};
 use ravel_cache::{CacheMetrics, CacheMetricsSnapshot, IntentCounters, IntentMetricsSnapshot};
 use ravel_catalog::Snapshot;
 use ravel_logseg::key_index::TRACE_ID_FIELD;
-use ravel_types::TimeRange;
-use ravel_types::accounting::AccessIntent;
+use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccountingSnapshot};
+use ravel_types::{TenantHash, TimeRange};
 
 use crate::declared::KeyIndexDeclaration;
 use crate::executor::TargetSignal;
@@ -161,37 +170,151 @@ pub(crate) fn plan_is_predicate_free(plan: &LogicalPlan) -> bool {
     free
 }
 
-/// The sum of `object_size` over the segments `snapshot` resolved, read off
-/// the snapshot before any segment is fetched.
-pub(crate) fn resolved_object_bytes(snapshot: &Snapshot) -> u64 {
-    snapshot
-        .segments
-        .iter()
-        .fold(0u64, |sum, seg| sum.saturating_add(seg.object_size))
+/// Whether a statement's lanes are ones the bulk-scan size trigger reads:
+/// one `logs` table and no Parquet table. A `samples` statement never is, so
+/// a dashboard query over a large metrics resolve stays Interactive.
+pub(crate) fn size_trigger_lane(lanes: &[(TargetSignal, &Snapshot)], names_parquet: bool) -> bool {
+    !names_parquet && matches!(lanes, [(TargetSignal::Logs, _)])
 }
 
-/// Whether the bulk-scan size trigger can apply to a statement's lanes:
-/// `min_bytes` is set, the statement names one `logs` table and no Parquet
-/// table, and that lane's resolved segments sum to at least `min_bytes`
-/// ([`resolved_object_bytes`]). A `samples` statement never does, so a
-/// dashboard query over a large metrics resolve stays Interactive. The caller
-/// still requires SQL text and rules out an exact-key lookup
-/// ([`plan_has_key_equality`]) before reading the statement as BulkScan.
+/// Whether the bulk-scan size trigger applies to a statement: `min_bytes` is
+/// set, its lanes pass [`size_trigger_lane`], and `last_read_bytes`, the bytes
+/// the same statement read on its last successful execution
+/// ([`StatementReadBytes`]), is at least `min_bytes`. A statement with no
+/// record (`None`) never does. The caller still requires SQL text and rules
+/// out an exact-key lookup ([`plan_has_key_equality`]) before reading the
+/// statement as BulkScan.
 pub(crate) fn size_trigger_applies(
     lanes: &[(TargetSignal, &Snapshot)],
     names_parquet: bool,
     min_bytes: Option<u64>,
+    last_read_bytes: Option<u64>,
 ) -> bool {
-    let Some(min_bytes) = min_bytes else {
+    let (Some(min_bytes), Some(read_bytes)) = (min_bytes, last_read_bytes) else {
         return false;
     };
-    if names_parquet {
-        return false;
+    size_trigger_lane(lanes, names_parquet) && read_bytes >= min_bytes
+}
+
+/// The bulk-scan threshold a process applies: the configured `flag` raised to
+/// the in-memory read cache's `max_bytes` when a cache is configured, the
+/// flag as given when none is, and `None` when the flag is unset. The bulk
+/// region only beats recency on a loop larger than the cache, so a threshold
+/// below the cache would read as bulk the statements that fit it.
+pub fn effective_bulk_scan_min_bytes(
+    flag: Option<u64>,
+    cache_max_bytes: Option<u64>,
+) -> Option<u64> {
+    flag.map(|flag| cache_max_bytes.map_or(flag, |cache| flag.max(cache)))
+}
+
+/// The bytes a statement's execution read, as the size trigger records them:
+/// the bytes resident cache entries served, the bytes another caller's
+/// in-flight read handed it, and its own GET bytes, every phase. However the
+/// read cache served it, the same statement over the same data records the
+/// same figure.
+pub(crate) fn trigger_read_bytes(accounting: &QueryAccountingSnapshot) -> u64 {
+    accounting
+        .cache_bytes
+        .saturating_add(accounting.late_served_bytes)
+        .saturating_add(accounting.s3_bytes(AccountedOp::Get))
+}
+
+/// How many statements [`StatementReadBytes`] holds a record for.
+pub(crate) const STATEMENT_READ_BYTES_CAPACITY: usize = 4096;
+
+/// What bounds a statement's reads besides its text, as the read-bytes record
+/// keys it: the window's duration (its end minus its start, so a relative
+/// window re-sent with fresh bounds keeps its record), the row window's
+/// duration when the window is also applied as a row filter, and the row cap.
+/// The same text over a much shorter window, or under a row cap, reads far
+/// less, so it gets a record of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ReadShape {
+    window_ns: i64,
+    row_window_ns: Option<i64>,
+    max_rows: Option<usize>,
+}
+
+impl ReadShape {
+    pub(crate) fn new(window: TimeRange, row_window: bool, max_rows: Option<usize>) -> Self {
+        let window_ns = window.end_ns.saturating_sub(window.start_ns);
+        ReadShape {
+            window_ns,
+            row_window_ns: row_window.then_some(window_ns),
+            max_rows,
+        }
     }
-    let [(signal, snapshot)] = lanes else {
-        return false;
-    };
-    *signal == TargetSignal::Logs && resolved_object_bytes(snapshot) >= min_bytes
+}
+
+/// The bytes each statement read on its last successful execution, keyed by
+/// [`StatementReadBytes::key`] over the tenant, the exact SQL text and the
+/// request's [`ReadShape`]: cache served, late served and store GET bytes,
+/// every phase. Held in process memory, bounded
+/// at [`STATEMENT_READ_BYTES_CAPACITY`] entries with the least recently
+/// recorded dropped first, and charged to no cache. A restart forgets it, so
+/// every statement's first execution after one is Interactive.
+pub(crate) struct StatementReadBytes {
+    inner: Mutex<ReadBytesEntries>,
+}
+
+#[derive(Default)]
+struct ReadBytesEntries {
+    /// Key to (bytes read, recording sequence).
+    by_key: HashMap<u64, (u64, u64)>,
+    /// Recording sequence to key, oldest first.
+    by_age: BTreeMap<u64, u64>,
+    next_seq: u64,
+}
+
+impl StatementReadBytes {
+    pub(crate) fn new() -> Self {
+        StatementReadBytes {
+            inner: Mutex::new(ReadBytesEntries::default()),
+        }
+    }
+
+    /// The record key of `sql` sent by `tenant` with `shape`. Two statements
+    /// whose keys collide share a record, which only moves a cache intent.
+    pub(crate) fn key(tenant: TenantHash, sql: &str, shape: ReadShape) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        tenant.0.hash(&mut hasher);
+        sql.hash(&mut hasher);
+        shape.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The bytes the statement under `key` read on its last recorded
+    /// execution.
+    pub(crate) fn get(&self, key: u64) -> Option<u64> {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.by_key.get(&key).map(|&(bytes, _)| bytes)
+    }
+
+    /// Record that the statement under `key` read `bytes`, replacing its
+    /// previous record and dropping the least recently recorded statement
+    /// when the record is full.
+    pub(crate) fn record(&self, key: u64, bytes: u64) {
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let seq = entries.next_seq;
+        entries.next_seq += 1;
+        if let Some((_, old_seq)) = entries.by_key.insert(key, (bytes, seq)) {
+            entries.by_age.remove(&old_seq);
+        }
+        entries.by_age.insert(seq, key);
+        while entries.by_key.len() > STATEMENT_READ_BYTES_CAPACITY {
+            let Some((_, oldest)) = entries.by_age.pop_first() else {
+                break;
+            };
+            entries.by_key.remove(&oldest);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.by_key.len()
+    }
 }
 
 /// Whether `plan`, subqueries included, holds an `=` between a field
@@ -564,16 +687,22 @@ mod tests {
         }
     }
 
+    /// The trigger compares the statement's own last read bytes, never the
+    /// lane's resolve: over a 2-byte resolve a 3-byte read clears a 3-byte
+    /// threshold, and a 2-byte read under a 3-byte threshold does not.
     #[test]
-    fn the_size_trigger_applies_to_one_logs_lane_at_or_above_the_threshold() {
+    fn the_size_trigger_applies_to_one_logs_lane_whose_last_read_reached_the_threshold() {
         // Two segments of one byte each.
         let snap = two_hours();
-        assert_eq!(resolved_object_bytes(&snap), 2);
         let lane = [(TargetSignal::Logs, &snap)];
-        assert!(size_trigger_applies(&lane, false, Some(2)));
-        assert!(!size_trigger_applies(&lane, false, Some(3)));
-        assert!(!size_trigger_applies(&lane, false, None));
-        assert!(!size_trigger_applies(&lane, true, Some(1)));
+        assert!(size_trigger_applies(&lane, false, Some(3), Some(3)));
+        assert!(size_trigger_applies(&lane, false, Some(2), Some(5)));
+        assert!(!size_trigger_applies(&lane, false, Some(3), Some(2)));
+        assert!(!size_trigger_applies(&lane, false, Some(1), None));
+        assert!(!size_trigger_applies(&lane, false, None, Some(5)));
+        assert!(!size_trigger_applies(&lane, true, Some(1), Some(5)));
+        assert!(size_trigger_lane(&lane, false));
+        assert!(!size_trigger_lane(&lane, true));
         for signal in [
             TargetSignal::Metrics,
             TargetSignal::Spans,
@@ -582,12 +711,111 @@ mod tests {
             TargetSignal::Parquet,
         ] {
             assert!(
-                !size_trigger_applies(&[(signal, &snap)], false, Some(1)),
+                !size_trigger_applies(&[(signal, &snap)], false, Some(1), Some(5)),
                 "{signal:?}"
             );
+            assert!(!size_trigger_lane(&[(signal, &snap)], false), "{signal:?}");
         }
         let two_lanes = [(TargetSignal::Metrics, &snap), (TargetSignal::Logs, &snap)];
-        assert!(!size_trigger_applies(&two_lanes, false, Some(1)));
+        assert!(!size_trigger_applies(&two_lanes, false, Some(1), Some(5)));
+        assert!(!size_trigger_lane(&two_lanes, false));
+    }
+
+    /// The flag raised to the cache's size when a cache is configured, as given
+    /// when none is, and unset when the flag is.
+    #[test]
+    fn the_effective_bulk_scan_threshold_is_the_flag_floored_at_the_cache_size() {
+        let cache = 6_184_752_906;
+        assert_eq!(
+            effective_bulk_scan_min_bytes(Some(1_000), Some(cache)),
+            Some(cache),
+            "a flag below the cache"
+        );
+        assert_eq!(
+            effective_bulk_scan_min_bytes(Some(cache + 1), Some(cache)),
+            Some(cache + 1),
+            "a flag above the cache"
+        );
+        assert_eq!(
+            effective_bulk_scan_min_bytes(Some(cache), Some(cache)),
+            Some(cache),
+            "a flag equal to the cache"
+        );
+        assert_eq!(
+            effective_bulk_scan_min_bytes(Some(1_000), None),
+            Some(1_000),
+            "no cache"
+        );
+        assert_eq!(effective_bulk_scan_min_bytes(None, Some(cache)), None);
+        assert_eq!(effective_bulk_scan_min_bytes(None, None), None);
+    }
+
+    /// The record holds 4,096 statements: the 4,097th distinct one drops the
+    /// least recently recorded, and re-recording a statement makes it the most
+    /// recent, so the next overflow drops another. A key names the tenant and
+    /// the read shape as well as the text.
+    #[test]
+    fn the_read_bytes_record_drops_the_oldest_statement_past_its_bound() {
+        let tenant = TenantHash([7u8; 16]);
+        let shape = ReadShape::new(whole_tenant(), false, None);
+        let key =
+            |i: usize| StatementReadBytes::key(tenant, &format!("SELECT {i} FROM logs"), shape);
+        let record = StatementReadBytes::new();
+        for i in 0..STATEMENT_READ_BYTES_CAPACITY {
+            record.record(key(i), i as u64);
+        }
+        assert_eq!(record.len(), 4_096);
+        assert_eq!(record.get(key(0)), Some(0));
+
+        record.record(key(4_096), 4_096);
+        assert_eq!(record.len(), 4_096, "the 4,097th statement");
+        assert_eq!(record.get(key(0)), None, "the oldest is dropped");
+        assert_eq!(record.get(key(1)), Some(1));
+        assert_eq!(record.get(key(4_096)), Some(4_096));
+
+        record.record(key(1), 11);
+        record.record(key(4_097), 4_097);
+        assert_eq!(record.len(), 4_096);
+        assert_eq!(record.get(key(1)), Some(11), "re-recorded, so kept");
+        assert_eq!(record.get(key(2)), None, "now the oldest, so dropped");
+
+        let other = StatementReadBytes::key(TenantHash([8u8; 16]), "SELECT 1 FROM logs", shape);
+        assert_ne!(other, key(1));
+        assert_eq!(record.get(other), None);
+    }
+
+    /// The read shape keys a record by the window's duration, not its bounds:
+    /// the same window moved later shares a key, while a shorter window, the
+    /// same window applied as a row filter, and a row cap each get their own.
+    #[test]
+    fn the_read_bytes_key_names_the_window_duration_row_window_and_row_cap() {
+        let tenant = TenantHash([7u8; 16]);
+        let sql = "SELECT * FROM logs";
+        let hour = TimeRange {
+            start_ns: 0,
+            end_ns: 3_600_000_000_000,
+        };
+        let key = |window: TimeRange, row_window: bool, max_rows: Option<usize>| {
+            StatementReadBytes::key(tenant, sql, ReadShape::new(window, row_window, max_rows))
+        };
+        let base = key(hour, false, None);
+        let later_hour = TimeRange {
+            start_ns: hour.start_ns + 7_200_000_000_000,
+            end_ns: hour.end_ns + 7_200_000_000_000,
+        };
+        assert_eq!(
+            key(later_hour, false, None),
+            base,
+            "same duration, later bounds"
+        );
+        let minute = TimeRange {
+            start_ns: hour.end_ns - 60_000_000_000,
+            end_ns: hour.end_ns,
+        };
+        assert_ne!(key(minute, false, None), base, "a shorter window");
+        assert_ne!(key(hour, true, None), base, "the window as a row filter");
+        assert_ne!(key(hour, false, Some(100)), base, "a row cap");
+        assert_ne!(key(hour, false, Some(100)), key(hour, false, Some(1_000)));
     }
 
     #[test]

@@ -3488,9 +3488,11 @@ impl LogSegmentFetcher {
             }
             // A late serve (another caller's flight, or the RAM recheck) made
             // no GET of its own and is not a hit: the miss its lookup counted,
-            // no S3 cost. Its bytes are the cache entry's, as on a hit.
+            // no S3 cost. Its bytes are the cache entry's, as on a hit, and
+            // count as late-served bytes.
             ReadOutcome::LateServe => {
                 accounting.record_cache_miss();
+                accounting.add_late_served_bytes(bytes.len() as u64);
                 fetch_span.record("s3_requests", 0u64);
                 fetch_span.record("s3_bytes", 0u64);
                 reservation.mark_handed_off();
@@ -5626,7 +5628,11 @@ impl BlockRangeFetcher {
                 accounting.record_cache_hit();
                 accounting.add_cache_bytes(bytes.len() as u64);
             }
-            ReadOutcome::Fetched | ReadOutcome::LateServe => accounting.record_cache_miss(),
+            ReadOutcome::Fetched => accounting.record_cache_miss(),
+            ReadOutcome::LateServe => {
+                accounting.record_cache_miss();
+                accounting.add_late_served_bytes(bytes.len() as u64);
+            }
         }
         Ok((bytes, outcome))
     }
@@ -14422,13 +14428,18 @@ mod late_serve_accounting_tests {
     }
 
     /// A late serve's query accounting: no GET of its own, and the one cache
-    /// miss its lookup counted, with no hit and no cache bytes.
-    fn assert_late_served(snap: &QueryAccountingSnapshot, kind: Kind) {
+    /// miss its lookup counted, with no hit and no cache bytes; the `bytes` it
+    /// was handed count as late-served.
+    fn assert_late_served(snap: &QueryAccountingSnapshot, kind: Kind, bytes: u64) {
         assert_eq!(snap.total_s3_requests(), 0, "{kind:?}: no GET of its own");
         assert_eq!(snap.total_s3_bytes(), 0, "{kind:?}");
         assert_eq!(snap.cache_misses, 1, "{kind:?}: a late serve stays a miss");
         assert_eq!(snap.cache_hits, 0, "{kind:?}");
         assert_eq!(snap.cache_bytes, 0, "{kind:?}");
+        assert_eq!(
+            snap.late_served_bytes, bytes,
+            "{kind:?}: the bytes it was handed"
+        );
     }
 
     /// Two `cached_extent` calls for one extent, the second following the
@@ -14479,7 +14490,7 @@ mod late_serve_accounting_tests {
             );
             assert!(!follower_live, "{kind:?}: the follower made no GET");
             assert_fetching_leader(&leader_acc.snapshot(), kind);
-            assert_late_served(&follower_acc.snapshot(), kind);
+            assert_late_served(&follower_acc.snapshot(), kind, BLOCK);
         }
     }
 
@@ -14544,7 +14555,7 @@ mod late_serve_accounting_tests {
             assert_eq!(leader_stats.block_range_gets, 1, "{kind:?}");
             assert_eq!(leader_stats.block_bytes_fetched, size, "{kind:?}");
             assert_eq!(leader_stats.block_cache_hits, 0, "{kind:?}");
-            assert_late_served(&follower_snap, kind);
+            assert_late_served(&follower_snap, kind, size);
             assert_eq!(follower_stats.block_range_gets, 0, "{kind:?}");
             assert_eq!(follower_stats.block_bytes_fetched, 0, "{kind:?}");
             assert_eq!(
@@ -14650,7 +14661,7 @@ mod late_serve_accounting_tests {
             leader.expect("leader read");
             follower.expect("follower read");
             assert_fetching_leader(&leader_acc.snapshot(), kind);
-            assert_late_served(&follower_acc.snapshot(), kind);
+            assert_late_served(&follower_acc.snapshot(), kind, size);
             let mut spans = costs.closed.lock().expect("lock").clone();
             spans.sort_unstable();
             assert_eq!(

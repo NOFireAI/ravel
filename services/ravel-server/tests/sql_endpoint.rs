@@ -3564,7 +3564,7 @@ async fn stats_signals_is_rendered_in_the_json_response() {
 
     for (index, total) in phases.iter().enumerate() {
         let fields = total.as_object().expect("a phase entry");
-        assert_eq!(fields.len(), 11, "the phase name and ten figures");
+        assert_eq!(fields.len(), 12, "the phase name and eleven figures");
         for (key, figure) in fields.iter().filter(|(key, _)| key.as_str() != "phase") {
             let sum: u64 = signals
                 .iter()

@@ -370,7 +370,10 @@ and is filed as its own ticket, not folded in here. Intent is admission
 policy only: it never skips a fresh read and never changes what a hit
 returns. The executor's `BulkScan` trigger above is narrowed by the bulk
 trigger amendment (issue #3084) at the end of this ADR, and given a second,
-opt-in arm for filtered `logs` scans by the size trigger amendment after it.
+opt-in arm for filtered `logs` scans by the size trigger amendment after it,
+whose test the read-bytes amendment after that moves from the bytes a
+statement resolves to the bytes it last read, against a threshold floored at
+the cache size.
 
 3b. Policy. `Interactive` reads are admitted and promoted exactly as today.
 `BulkScan` reads do not raise `freq` on a hit and are admitted into a
@@ -694,7 +697,8 @@ that is independent of the first. With it set, a statement the
 predicate-free rule leaves `Interactive` reads as `BulkScan` when all of
 these hold: it is a `logs` statement sent as SQL text; it names one `logs`
 table and no Parquet table; the object sizes of its resolved segments sum
-to at least `BYTES`, counted after resolve and before any segment read; and
+(a condition the read-bytes amendment below replaces) to at least `BYTES`,
+counted after resolve and before any segment read; and
 the plan the KEY_IDX probe takes its filters from (the optimized plan,
 subqueries, CTEs and join conditions included) has no equality on a field
 the tenant indexes in KEY_IDX. A one-element `IN` counts as an equality,
@@ -720,3 +724,59 @@ commit record with the same all-zero content hash. The read cache keys an
 entry by that hash and the object size, so objects of equal size could serve
 each other's bytes and count them as hits. The figure is taken again once the
 generator stamps each object's own hash.
+
+## Amendment (issue #3084, 2026-10-22): the size trigger reads a statement's own last read bytes, floored at the cache size
+
+<!-- amendment-applies: sections="3. The cache admits by access intent; memory refusals name their cause|Amendment (issue #3084, 2026-10-21): an opt-in size trigger for filtered logs scans" pointer="read-bytes amendment" -->
+<!-- amendment-supersedes: phrase="object sizes of its resolved segments" pointer="read-bytes amendment" -->
+
+The size trigger as first written compared the bytes a statement's resolve
+returned with the threshold. A ClickBench kit A/B with the flag set showed
+that this measures the tenant, not the statement: every one of the 43
+statements resolved the same 10.0 GB, so 43 of 43 read as `BulkScan`, and
+concurrent throughput fell to 0.807x of the flag-unset arm. The largest
+statement read 5.3 GB, under the 6.18 GB (6,184,752,906-byte) read cache,
+so each statement's working set fit the cache and the bulk region only
+displaced bytes the interactive queues would have kept.
+
+The bulk region does better than recency only for a loop larger than the
+cache. The rule is therefore:
+
+- The trigger compares the bytes the statement read on its last successful
+  execution with the threshold: cache-served bytes, bytes a concurrent
+  in-flight read of the same object handed it, and store GET bytes, every
+  phase. A failed execution records nothing. The record is keyed by a hash
+  of the tenant, the exact SQL text and the request's read shape (the
+  window's length, whether it bounds rows, and the row cap), so the same
+  text over a much shorter window does not inherit a wide window's figure.
+  It is one per process, shared by every tenant, and bounded at 4,096
+  entries, the least recently recorded dropped first. A statement with no
+  record reads as `Interactive`, so its first execution in a process always
+  does.
+- The threshold in force is the larger of `--cache-bulk-scan-min-bytes` and
+  the in-memory read cache's `max_bytes` (the RAM tier's size; a disk tier
+  adds nothing to it), computed by
+  `ravel_sql::effective_bulk_scan_min_bytes` for both `ravel-server` and
+  `sql_latency_bench`. With no read cache the flag applies as given.
+  `ravel-server` logs the value once at startup as a `performance default
+  resolved` line whose `source` is `flag` or
+  `flag-floored-to-cache-max-bytes`.
+- Every other condition of the size trigger amendment stands: SQL text, one
+  `logs` table and no Parquet table, and no equality on a KEY_IDX field.
+  This covers alert-rule SQL as well as `POST /api/v1/sql`, since both reach
+  the executor as SQL text. Flight SQL does not reach the trigger: it plans
+  through the pinned-snapshot path, which classifies no intent, so its
+  statements read as `Interactive` whatever they read.
+
+The limitation: a statement whose text changes on every run, such as one
+that spells out absolute timestamps, never finds its own record and always
+reads as `Interactive`. Each of its successful executions still writes a
+record, and because the record is shared by every tenant in the process, a
+stream of such statements evicts the records of repeated statements, which
+then read as `Interactive` once more before their next record is written.
+The flag stays off by default.
+
+| check | band | miss | source |
+|---|---|---|---|
+| generated `sql_latency_bench` lane, `--cache-bytes` at half the corpus, flagged arms | runs 2 to 4 serve at least 40 % of read bytes from cache | under 25 % | predicted |
+| ClickBench kit A/B, flag set, 6.18 GB read cache | 0 of 43 statements `BulkScan`; concurrent QPS at least 0.95x the flag-unset arm; hot geomean at most 1.03x; rows equal on every statement | any statement `BulkScan`, QPS under 0.95x, hot geomean over 1.03x, or any row difference | predicted |
