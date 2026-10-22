@@ -221,6 +221,9 @@ Run-length encoding against the frontier keeps this KBs per unit (the
 interior of a retention window is one run), so the snapshot stays a small
 single-PUT object even at large retention.
 
+The snapshot size cap amendment below (issue #3199) bounds what a reader
+reads and decodes and what a writer persists.
+
 **Warm start and handoff.** On startup — and whenever ownership of a unit
 arrives via a membership change — a worker reads all non-stale memo
 snapshots (its own previous one and siblings'), and seeds its in-memory
@@ -430,3 +433,24 @@ splitting; filed as a named follow-up, not silently absorbed here.
   `ravel_maintain_full_sweep_passes_total`, plus the RLOG merge peak-bytes
   gauge from the tracker seam. Shipped alert rules: `workers_live == 0` in
   a maintaining mode, `units_stalled > 0` sustained.
+
+## Amendment (2026-10-22): snapshot size caps (issue #3199)
+
+<!-- amendment-applies: sections="3. Durable incremental cursor: per-worker maintain-state snapshot" pointer="snapshot size cap amendment" -->
+
+Any principal holding the maintain role's write can put an object under
+`sys/maintain/memo/` (issue #3155), and every maintain process reads that
+prefix at startup and on each membership change. Decision 3's snapshot is
+therefore bounded on both sides. A reader skips, and counts, an object over
+`MAX_MEMO_SNAPSHOT_BYTES` (32 MiB framed), judged by its listed size and
+again by a range GET of the cap plus one byte. The decoder bounds a
+snapshot's unit count by the bytes that follow it, and refuses a snapshot
+whose runs expand to more than `MAX_MEMO_SNAPSHOT_ENTRIES` (4,194,304
+per-hour entries), checked before each run is expanded, with each admitted
+run's capacity reserved exactly. The counts a snapshot carries still size
+what decoding it allocates, but only up to the two caps: at most 64 MiB of
+16-byte entries. A writer whose snapshot is over either cap does not write it
+and logs a warning, not repeated while the body is unchanged; it deletes
+nothing, so an older, smaller snapshot of the same process stays until the
+staleness bound excludes it. A skipped or refused snapshot costs its units
+the cold rescan decision 3 already falls back to, never correctness.
