@@ -645,11 +645,12 @@ than passing for "no pull request open".
   sql, flight-sql, esql and ravel-bench lanes: a `-p ravel-server` gate
   finished at 93 GB in one run and 186 GB in another; a `-p ravel-sql -p
   ravel-server -p ravel-bench` gate filled its volume at 188 GB (144 GB of
-  `debug/` plus 44 GB from a separate ci-profile run in the same target)
-  and died at link before its flight-sql lane finished.
+  `debug/` from the feature lanes, 44 GB of `ci/` from the ci-profile main
+  suite) and died at link before its flight-sql lane finished, so that
+  closure needs more than 188 GB.
 - A cold gate needs 54-70 GB of `target/` per worktree when its closure
-  runs no feature lane, and up to about 190 GB when it reaches the sql,
-  flight-sql, esql and ravel-bench lanes, so this machine
+  runs no feature lane, and from about 93 GB to more than 188 GB when it
+  reaches the sql, flight-sql, esql and ravel-bench lanes, so this machine
   runs ONE at a time regardless of how many sessions are otherwise idle.
   Two sessions gating concurrently is the expected failure, not bad luck:
   say so on the shared channel and sequence, or push the gate to PR CI
