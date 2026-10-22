@@ -3409,7 +3409,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             // ADR-3072's size trigger amendments: the read-bytes threshold at
             // which a filtered `logs` statement sent as SQL text also reads
             // as a bulk scan, `--cache-bulk-scan-min-bytes` raised to the read
-            // cache's size. Unset by default.
+            // cache's RAM tier size. Unset by default.
             let bulk_scan_min_bytes = query::resolve_cache_bulk_scan_min_bytes(
                 config.query_budgets.sql_cache_bulk_scan_min_bytes,
                 cache.as_ref().map(|_| config.cache_max_bytes),

@@ -743,13 +743,19 @@ The bulk region does better than recency only for a loop larger than the
 cache. The rule is therefore:
 
 - The trigger compares the bytes the statement read on its last successful
-  execution, cache-served plus store GET bytes, every phase, with the
-  threshold. The record is per process, keyed by a hash of the tenant and
-  the exact SQL text, and bounded at 4,096 entries, the oldest dropped first.
-  A statement with no record reads as `Interactive`, so its first execution
-  in a process always does.
+  execution with the threshold: cache-served bytes, bytes a concurrent
+  in-flight read of the same object handed it, and store GET bytes, every
+  phase. A failed execution records nothing. The record is keyed by a hash
+  of the tenant, the exact SQL text and the request's read shape (the
+  window's length, whether it bounds rows, and the row cap), so the same
+  text over a much shorter window does not inherit a wide window's figure.
+  It is one per process, shared by every tenant, and bounded at 4,096
+  entries, the least recently recorded dropped first. A statement with no
+  record reads as `Interactive`, so its first execution in a process always
+  does.
 - The threshold in force is the larger of `--cache-bulk-scan-min-bytes` and
-  the in-memory read cache's `max_bytes`, computed by
+  the in-memory read cache's `max_bytes` (the RAM tier's size; a disk tier
+  adds nothing to it), computed by
   `ravel_sql::effective_bulk_scan_min_bytes` for both `ravel-server` and
   `sql_latency_bench`. With no read cache the flag applies as given.
   `ravel-server` logs the value once at startup as a `performance default
@@ -758,11 +764,17 @@ cache. The rule is therefore:
 - Every other condition of the size trigger amendment stands: SQL text, one
   `logs` table and no Parquet table, and no equality on a KEY_IDX field.
   This covers alert-rule SQL as well as `POST /api/v1/sql`, since both reach
-  the executor as SQL text.
+  the executor as SQL text. Flight SQL does not reach the trigger: it plans
+  through the pinned-snapshot path, which classifies no intent, so its
+  statements read as `Interactive` whatever they read.
 
 The limitation: a statement whose text changes on every run, such as one
 that spells out absolute timestamps, never finds its own record and always
-reads as `Interactive`. The flag stays off by default.
+reads as `Interactive`. Each of its successful executions still writes a
+record, and because the record is shared by every tenant in the process, a
+stream of such statements evicts the records of repeated statements, which
+then read as `Interactive` once more before their next record is written.
+The flag stays off by default.
 
 | check | band | miss | source |
 |---|---|---|---|

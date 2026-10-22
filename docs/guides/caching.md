@@ -156,7 +156,7 @@ reclaiming a pre-namespacing cache directory.
 | `--catalog-cache-max-bytes <n>` | derived: 5% of the process memory budget (`268435456`, 256 MiB, when memory cannot be read; `0` in `--mode gateway`) | Maximum bytes the catalog byte cache's RAM tier holds. A separate ceiling from `--cache-max-bytes` above; unset, it derives its own 5% share of the process memory budget (`1503238553` on the 30 GiB reference host) regardless of `--cache-max-bytes` or the loopback share it may have taken. Counted in the same startup refusal as `--cache-max-bytes`. Read once at startup. |
 | `--cache-dir <path>` | none | Directory for the local-disk tier. Set, both the fetcher cache and the catalog byte cache gain a disk tier at this path, each bounded by its own resolved RAM ceiling: the fetcher cache's disk tier by its resolved `--cache-max-bytes`, the catalog byte cache's by its resolved `--catalog-cache-max-bytes`. There is no separate disk-tier capacity flag. Absent, the process has a RAM tier only. Bytes written here are not SSE-KMS encrypted, and on Unix Ravel keeps what it writes here readable by its own user only (see "Two tiers" above for both). |
 | `--cache-bulk-share <fraction>` | `0.5` | Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that `bulk_scan` reads hold against interactive admissions, strictly between 0 and 1. See [admission by access intent](#admission-by-access-intent) for what the region does with it and [which statements read as bulk](#which-statements-read-as-bulk) for what reaches it. It applies to the RAM tier only: the disk tier admits every read under its own policy whatever its intent. `0`, `1`, a value outside that range, and `NaN` are refused at startup. Ignored when the fetcher cache is off. Read once at startup. |
-| `--cache-bulk-scan-min-bytes <bytes>` | unset | Read bytes at or above which a filtered `logs` statement sent as SQL text reads as `bulk_scan` from its next execution, unless it is a KEY_IDX key lookup; a `samples` statement, or one that did not arrive as SQL text, is never affected; see [which statements read as bulk](#which-statements-read-as-bulk). The threshold in force is this value raised to `--cache-max-bytes` when that is larger; with the fetcher cache off it is this value as given. Startup logs it on a `performance default resolved` line with `setting="cache_bulk_scan_min_bytes"`, whose `source` is `flag`, or `flag-floored-to-cache-max-bytes` when the cache size replaced it. Unset, only the predicate-free rule applies. Read once at startup. |
+| `--cache-bulk-scan-min-bytes <bytes>` | unset | Read bytes at or above which a filtered `logs` statement sent as SQL text reads as `bulk_scan` from its next execution, unless it is a KEY_IDX key lookup; a `samples` statement, or one that did not arrive as SQL text, is never affected; see [which statements read as bulk](#which-statements-read-as-bulk). The threshold in force is this value raised to `--cache-max-bytes`, the RAM tier's size, when that is larger (a `--cache-dir` disk tier adds nothing to it); with the fetcher cache off it is this value as given. Startup logs it on a `performance default resolved` line with `setting="cache_bulk_scan_min_bytes"`, whose `source` is `flag`, or `flag-floored-to-cache-max-bytes` when the cache size replaced it. Unset, only the predicate-free rule applies. Read once at startup. |
 | `--disable-cache` | off | Turns **both** caches off. No cache is constructed at all, so query *results* are byte-for-byte the same as a build with no cache code, and the process holds no read-cache memory. This is the flag to set in a memory-constrained container. It covers the caches of object bytes only: the catalog's two per-tenant record caches stay on, held at their 10,000-entry floor rather than the derived capacity, about 18 MB per actively-queried tenant. See [the catalog record caches](#the-catalog-record-caches). Because neither cache exists, neither ceiling is charged against the process memory budget: the whole budget goes to the shared SQL/fetch accountant, and the startup refusal above cannot fire, whatever `--cache-max-bytes` says. |
 | `--logs-block-range-threshold <bytes>` | `524288` (512 KiB) | Log-object size above which a `logs` query reads only the pruning-relevant blocks (a tail probe plus per-block ranges, cached per block) instead of the whole object. Set it to `18446744073709551615` to read every log object whole regardless of size; set it to `0` to use the block-range path for every object. Read once at startup. Under a resolved fetch policy that reads every object whole (`--logs-fetch-policy request-minimal`, or `cost-based` at a profile whose bytes are free and which records no request timings) this flag is **overridden**, and startup logs a WARN naming the value it overrode. Under `cost-based` with a rate derived from the profile, the shipped default, it is kept, and a narrow projection is read ranged only where it skips more than the projection break-even, the larger of this threshold and three request costs. |
 | `--logs-fetch-policy <policy>` | `latency-first` against a loopback `--s3-endpoint`, `cost-based` otherwise | The logs read shape. `request-minimal` reads every object whole in one covering GET, with no tail probe and no ranged read: the cost-preferring shape where transfer is free and the object-store bill is requests. `byte-minimal` uses ranged reads wherever they save more bytes than a request costs, for egress-billed or network-constrained deployments. `cost-based` derives the choice from `--store-cost-profile`, as the larger of its price term and its time term; at the shipped reference profile (intra-region, transfer free) the rate is the time term, 6,300,000 bytes per request, so **a deployment on default flags against a remote store reads a log object whole unless the bytes a narrow projection skips exceed the 18,900,000-byte projection break-even**, which no object of that size or less can. `latency-first` resolves the same byte quantities as `byte-minimal`; it is the unset default against a loopback `--s3-endpoint`, where it measured faster cold than `cost-based` at the default concurrency, and elsewhere an intent for deployments where cold wall-clock matters more than the request bill, which on real S3 pays off only once GET concurrency is also raised explicitly (it sets no concurrency default of its own), which carries a memory caveat -- see the operations guide before turning it on. An explicit flag wins, on a loopback endpoint too: `--logs-fetch-policy cost-based` keeps the remote default there. Read once at startup; the running process never changes its own policy. The resolved policy, its source (`flag`, `default` or `default-loopback`), the profile, and the byte quantities are logged at startup on the `logs fetch policy resolved` line. |
@@ -208,8 +208,8 @@ the read's bytes are admitted and never what the read returns:
 - `bulk_scan`, for a predicate-free SQL statement over one signal table
   whose window runs from the epoch to now, or, with
   `--cache-bulk-scan-min-bytes` set, a `logs` statement sent as SQL text
-  that read more than the cache holds the last time it ran and is not a key
-  lookup (the full rule is under
+  that read at least the RAM tier's size the last time it ran and is not a
+  key lookup (the full rule is under
   [which statements read as bulk](#which-statements-read-as-bulk)): a hit
   does not count toward promotion, and a bulk read never moves bytes into
   the main queue. The bytes go to a bulk region, which holds up to its share
@@ -289,7 +289,8 @@ first data reads as `interactive` even when it holds most of the tenant, and
 so does a query whose metric name or label prunes any segment.
 
 The size trigger applies to `logs` statements only, and only to a statement
-sent as SQL text: `POST /api/v1/sql` and the SQL of alert rules. With
+sent as SQL text: `POST /api/v1/sql` and the SQL of alert rules. Flight SQL
+statements never reach it and read as `interactive` whatever they read. With
 `--cache-bulk-scan-min-bytes <BYTES>` set (it is unset by default), a
 statement the predicate-free rule left `interactive` reads as `bulk_scan`
 when all of these hold, whatever its `WHERE`, `LIMIT` or window:
@@ -297,8 +298,11 @@ when all of these hold, whatever its `WHERE`, `LIMIT` or window:
 - it arrived as SQL text;
 - it names exactly one `logs` table and no Parquet table;
 - the last successful execution of the same SQL text for the same tenant, in
-  this process, read at least the threshold: bytes served from the cache plus
-  bytes read from the object store, in every phase, catalog reads included;
+  this process, over a window of the same length with the same row-window
+  setting and row cap, read at least the threshold: bytes served from the
+  cache, bytes a concurrent read of the same object handed it, and bytes
+  read from the object store, in every phase, catalog reads included. A
+  failed execution records nothing;
 - it is not an exact-key lookup: nowhere in its plan as the optimizer leaves
   it, subqueries, CTEs and join conditions included, is there an equality on
   a field the tenant indexes in KEY_IDX (a `key_index` typed attribute
@@ -307,16 +311,21 @@ when all of these hold, whatever its `WHERE`, `LIMIT` or window:
   subquery.
 
 The threshold in force is `BYTES` raised to `--cache-max-bytes` when that is
-larger. The bulk region only does better than the probation and main queues
-for a statement that reads more than the cache holds, so a smaller threshold
-would hand the region statements the cache could have kept whole.
+larger. That floor is the RAM tier's size only; a `--cache-dir` disk tier
+does not raise it. The bulk region only does better than the probation and
+main queues for a statement that reads more than the RAM tier holds, so a
+smaller threshold would hand the region statements the RAM tier could have
+kept whole.
 
 A statement's first execution in a process always reads as `interactive`,
 because nothing has recorded what it reads. The process keeps the read bytes
-of the 4,096 most recently recorded statements and drops the oldest past
-that. A statement whose text changes on every run, for example one that
-spells out absolute timestamps, never finds a record and always reads as
-`interactive`.
+of the 4,096 most recently recorded statements, one record for every tenant
+together, and drops the oldest past that. A statement whose text changes on
+every run, for example one that spells out absolute timestamps, never finds
+a record and always reads as `interactive`. Each of its successful runs
+still writes a record, so a stream of such statements evicts the records of
+statements that do repeat, and those read as `interactive` again on their
+next run.
 
 A key lookup stays `interactive` however much it reads. Only an equality
 on a key-indexed field is exempt, because only the KEY_IDX probe reliably

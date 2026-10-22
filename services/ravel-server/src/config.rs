@@ -3246,9 +3246,9 @@ pub struct QueryBudgets {
     /// their blocks inline rather than on the read CPU gate (issue #2795).
     /// Reaches [`crate::query::build_sql_state_with_parquet`]. Default `false`.
     pub sql_scan_decode_inline: bool,
-    /// `--cache-bulk-scan-min-bytes`: the resolved-bytes threshold at or
-    /// above which a filtered `logs` statement sent as SQL text reads as a
-    /// bulk scan once one of its executions has read that much (ADR-3072's
+    /// `--cache-bulk-scan-min-bytes`: the read-bytes threshold at or above
+    /// which a filtered `logs` statement sent as SQL text reads as a bulk
+    /// scan once its last successful execution read that much (ADR-3072's
     /// size trigger amendments), as the operator set it. `crate::start` raises
     /// it to the read cache's size
     /// (`crate::query::resolve_cache_bulk_scan_min_bytes`) before it reaches
