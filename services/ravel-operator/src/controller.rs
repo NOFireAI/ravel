@@ -2377,21 +2377,16 @@ async fn reconcile_inner(
     // by type). A stalled wait is `Degraded=True` on `GcBootstrapStalled` and
     // outranks a concurrent router render error, since the whole cluster is
     // held, not just ingest routing; the Unavailable gate never coincides with a
-    // wait. A progressing wait is an explicit `Degraded=False`, so
+    // wait. A withheld maintain tier keeps its own reason even once the wait
+    // stalls, since the wait is waiting on that tier. A progressing wait is an explicit `Degraded=False`, so
     // `kubectl wait --for=condition=Degraded=false` succeeds while the bootstrap
     // is still in flight and only `Available` reports the wait.
-    let stalled = wait_status.as_ref().is_some_and(|w| w.stalled);
-    let degraded_condition = match (&degraded, &wait_status) {
-        (Some((reason, message)), _) if !stalled => Some(condition(
-            CONDITION_TYPE_DEGRADED,
-            true,
-            obj.metadata.generation,
-            reason,
-            message,
-        )),
-        (_, Some(w)) => Some(w.degraded.clone()),
-        _ => None,
-    };
+    let degraded_condition = pass_degraded_condition(
+        degraded.as_ref(),
+        wait_status.as_ref(),
+        tiers.maintain_withheld,
+        obj.metadata.generation,
+    );
     if let Some(c) = degraded_condition {
         extra_conditions.push(c);
     }
@@ -3477,6 +3472,33 @@ fn gc_bootstrap_wait_status(
         available_message,
         degraded,
         stalled,
+    }
+}
+
+/// The pass's single `Degraded` condition, from the render's `Degraded` entry
+/// and the `sys/gc` bootstrap wait.
+///
+/// A stalled wait outranks the render's entry, except while the maintain tier
+/// is withheld (no `maintain.keySecretRef`, or its Secret missing): then the
+/// wait is the withheld tier's consequence, no maintain pod exists to inspect,
+/// and the withheld-tier reason names the fix.
+fn pass_degraded_condition(
+    degraded: Option<&(String, String)>,
+    wait_status: Option<&GcBootstrapWaitStatus>,
+    maintain_withheld: bool,
+    observed_generation: Option<i64>,
+) -> Option<Condition> {
+    let stalled = wait_status.is_some_and(|w| w.stalled);
+    match (degraded, wait_status) {
+        (Some((reason, message)), _) if !stalled || maintain_withheld => Some(condition(
+            CONDITION_TYPE_DEGRADED,
+            true,
+            observed_generation,
+            reason,
+            message,
+        )),
+        (_, Some(w)) => Some(w.degraded.clone()),
+        _ => None,
     }
 }
 
@@ -5913,6 +5935,87 @@ mod tests {
         let (reason, _) =
             render_degraded(false, query, maintain(), None, None).expect("a Degraded entry");
         assert_eq!(reason, "SecretNotFound");
+    }
+
+    /// The `Degraded` condition a fresh per-role cluster records once its
+    /// `sys/gc` bootstrap wait is 6 minutes old, for one maintain key
+    /// resolution.
+    fn per_role_stalled_degraded(
+        key_ref: Option<&str>,
+        maintain_key: &MaintainKeyResolution,
+    ) -> Condition {
+        let mut spec = distributed_query_keyed_spec();
+        spec.maintain.credentials_secret_ref = Some(LocalSecretRef {
+            name: "maintain-s3".to_string(),
+        });
+        spec.maintain.key_secret_ref = key_ref.map(|name| LocalSecretRef {
+            name: name.to_string(),
+        });
+        assert!(crate::reconcile::per_role_credentials(&spec));
+        let plan = plan_render(
+            &spec,
+            "rc",
+            "ns",
+            RenderCtx::default(),
+            &DistributedQueryResolution::Resolved(vec!["1".into(); 4]),
+            maintain_key,
+        )
+        .expect("spec renders");
+        // A fresh cluster: no maintain Deployment, neither request-serving
+        // Deployment yet.
+        assert!(plan.desired.gc_bootstrap.waiting_for_bootstrap(None, false));
+        let now = 2_000_000;
+        let wait =
+            gc_bootstrap_wait_status("rc-maintain", Some(now - 6 * 60), now, None, None, Some(1));
+        assert!(wait.stalled, "a 6-minute wait is past the stall threshold");
+        pass_degraded_condition(
+            plan.degraded.as_ref(),
+            Some(&wait),
+            plan.tiers.maintain_withheld,
+            Some(1),
+        )
+        .expect("a Degraded condition")
+    }
+
+    /// Finding 5: on a fresh per-role cluster the bootstrap gate holds gateway
+    /// and query until maintain is ready, so a withheld maintain tier stalls
+    /// the wait. The stalled wait must not replace the withheld-tier reason
+    /// with `GcBootstrapStalled`, whose message points at a maintain pod that
+    /// was never created. Guarding clause: `|| maintain_withheld` in
+    /// `pass_degraded_condition`.
+    #[test]
+    fn withheld_maintain_reason_outlives_a_stalled_bootstrap_wait() {
+        let missing_ref = per_role_stalled_degraded(None, &MaintainKeyResolution::Resolved(None));
+        assert_eq!(missing_ref.status, "True");
+        assert_eq!(missing_ref.reason, "MaintainKeySecretRefMissing");
+        assert!(
+            missing_ref.message.contains("spec.maintain.keySecretRef"),
+            "{}",
+            missing_ref.message
+        );
+
+        let missing_secret = per_role_stalled_degraded(
+            Some("maintain-keys"),
+            &MaintainKeyResolution::SecretMissing {
+                name: "maintain-keys".to_string(),
+                reason: "referenced by maintain.keySecretRef".to_string(),
+            },
+        );
+        assert_eq!(missing_secret.status, "True");
+        assert_eq!(missing_secret.reason, "SecretNotFound");
+        assert!(
+            missing_secret.message.contains("maintain-keys"),
+            "{}",
+            missing_secret.message
+        );
+
+        // Control: with the key resolved the maintain tier applies, and a
+        // stalled wait still reports `GcBootstrapStalled`.
+        let keyed = per_role_stalled_degraded(
+            Some("maintain-keys"),
+            &MaintainKeyResolution::Resolved(Some("mk-1".to_string())),
+        );
+        assert_eq!(keyed.reason, GC_BOOTSTRAP_STALLED_REASON);
     }
 
     /// Finding 3: credential resourceVersions are resolved before the gate and
