@@ -1,25 +1,48 @@
 //! Worker membership and rendezvous-hash work partitioning (ADR-0065
 //! decisions 1 and 2, epic EI).
 //!
-//! # Membership via self-owned heartbeat keys (decision 1)
+//! # Membership via per-process heartbeat keys (decision 1)
 //!
 //! Each maintain-role process writes, every heartbeat interval `H`
-//! (default 60s), a [`WorkerHeartbeat`] to a key it alone ever writes:
+//! (default 60s), a signed [`WorkerHeartbeat`] to the key named by its own
+//! process id:
 //!
 //! ```text
 //! sys/maintain/workers/<process_id>
 //! ```
 //!
 //! `process_id` is a UUID generated once at construction (the ADR-0057
-//! convention every other self-owned-snapshot mechanism in this codebase uses).
-//! The write is [`PutMode::Overwrite`] -- single writer per key, no CAS, no
-//! contention. On the same cadence each process lists `sys/maintain/workers/`
-//! and GETs siblings; the **live set** is itself plus every sibling whose
+//! convention). No other maintain process writes that key, but the maintain
+//! role's S3 grant lets any holder of the role write or delete it, so the key
+//! name proves nothing on its own. The write is [`PutMode::Overwrite`]: no CAS,
+//! no contention between members. On the same cadence each process lists
+//! `sys/maintain/workers/` and GETs siblings; the **live set** is itself plus
+//! every sibling whose record authenticates (ADR-3130) and whose
 //! `heartbeat_unix_ns` is within `liveness_factor * H` (default `3 * H`) of the
 //! reader's own clock. A stale worker is treated as gone -- its work is taken
 //! over, and if it was merely slow the overlap is idempotent (the same
 //! fail-open direction ADR-0057 chose, so a slow heartbeat anywhere never
 //! freezes maintenance everywhere).
+//!
+//! # Authenticated records (ADR-3130)
+//!
+//! A [`WorkerSet`] is identity only and is built in every mode. Writing a
+//! heartbeat and reading the live set take a [`MaintainMembership`], which can
+//! only be built from a non-empty [`MaintainRecordKeys`] (the
+//! `--maintain-key-file` keys). The record carries
+//! `mac = blake3::keyed_hash(record_key, claim)` with
+//! `record_key = blake3::derive_key(`[`MAINTAIN_RECORD_KEY_CONTEXT`]`,
+//! file_key)`; the first key mints and any key verifies. A reader skips its own
+//! key, a key that is not a UUID, and a key whose LIST modification time is
+//! outside the liveness window, without counting them. Every other sibling it
+//! does not admit is counted once, under the first [`RecordReject`] it fails, in
+//! this order: `oversize` (the GET is a range read of [`MAX_RECORD_BYTES`] plus
+//! one byte), `malformed` (undecodable, or a body `process_id` that is not the
+//! key's), `missing_mac` (no MAC, or a `format_version` other than 2),
+//! `bad_mac`, then `stale_stamp`. A principal holding the maintain role's
+//! write grant but not the key file can no longer add a member; it can still
+//! overwrite or delete a real member's record and so evict it from the other
+//! members' live sets.
 //!
 //! # Work partitioning via rendezvous hash (decision 2)
 //!
@@ -71,15 +94,19 @@
 //! A backend reporting no usable modification time (`<= 0`) gets neither
 //! treatment: its keys are read as before and never reaped.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use prost::Message;
-use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
+use ravel_object_store::{ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
 use ravel_proto::sys::v1::WorkerHeartbeat;
 use ravel_types::{Signal, TenantHash};
 use uuid::Uuid;
 
 use futures::stream::{self, StreamExt};
+
+use crate::record_auth::{DerivedKeys, read_bounded};
+pub use crate::record_auth::{MAX_RECORD_BYTES, RecordReject, RecordRejectMetrics};
 
 /// Default heartbeat interval `H` (ADR-0065 decision 1): 60 seconds.
 pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
@@ -96,17 +123,122 @@ pub const DEFAULT_LIVENESS_FACTOR: u32 = 3;
 /// ownership.
 pub const DEFAULT_UNIT_CONCURRENCY: usize = 4;
 
-/// Format floor for [`WorkerHeartbeat`] (matches the guard every other `sys/`
-/// message uses). A sibling heartbeat advertising a higher floor is one this
-/// reader does not understand, so it is skipped (treated as absent) rather than
-/// misread.
-const HEARTBEAT_FORMAT_VERSION: u32 = 1;
+/// The one [`WorkerHeartbeat`] `format_version` this build writes and admits
+/// (ADR-3130 decision 2). A sibling record with any other version is rejected
+/// as [`RecordReject::MissingMac`]: version 1 carried no MAC.
+pub const HEARTBEAT_FORMAT_VERSION: u32 = 2;
+
+/// The `blake3::derive_key` context maintain-worker record keys are derived
+/// under (ADR-3130 decision 2). The query-worker registry derives under its own
+/// context, so a query record MAC never verifies as a maintain one even when a
+/// deployment reuses one key file for both.
+pub const MAINTAIN_RECORD_KEY_CONTEXT: &str = "ravel maintain worker record v1";
+
+/// The maintain-worker record keys of one process (ADR-3130 decision 1): one
+/// per `--maintain-key-file` key, each
+/// `blake3::derive_key(MAINTAIN_RECORD_KEY_CONTEXT, file_key)`. The first
+/// mints; a record verifies under any of them. Never empty.
+#[derive(Clone)]
+pub struct MaintainRecordKeys {
+    keys: DerivedKeys,
+}
+
+/// [`MaintainRecordKeys::from_file_keys`] was given no key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NoMaintainRecordKeys;
+
+impl std::fmt::Display for NoMaintainRecordKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("maintain-worker record keys need at least one maintain key")
+    }
+}
+
+impl std::error::Error for NoMaintainRecordKeys {}
+
+impl MaintainRecordKeys {
+    /// Derive one record key per maintain file key, in order.
+    pub fn from_file_keys(file_keys: &[[u8; 32]]) -> Result<Self, NoMaintainRecordKeys> {
+        let keys = DerivedKeys::derive(MAINTAIN_RECORD_KEY_CONTEXT, file_keys)
+            .ok_or(NoMaintainRecordKeys)?;
+        Ok(MaintainRecordKeys { keys })
+    }
+
+    /// How many keys verify.
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// Always `false`: a `MaintainRecordKeys` cannot be built empty.
+    pub fn is_empty(&self) -> bool {
+        self.keys.len() == 0
+    }
+}
+
+impl std::fmt::Debug for MaintainRecordKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintainRecordKeys")
+            .field("keys", &self.keys.len())
+            .finish()
+    }
+}
+
+/// What a [`WorkerSet`] needs to take part in membership (ADR-3130 decision 3):
+/// the record keys that sign its heartbeat and verify its siblings', and the
+/// reject counters every live-set read through this handle counts into. Clones
+/// share the counters, so the heartbeat task and scrub report one family.
+#[derive(Debug, Clone)]
+pub struct MaintainMembership {
+    keys: MaintainRecordKeys,
+    rejects: Arc<RecordRejectMetrics>,
+}
+
+impl MaintainMembership {
+    /// A membership handle with fresh, zeroed reject counters.
+    pub fn new(keys: MaintainRecordKeys) -> Self {
+        MaintainMembership {
+            keys,
+            rejects: Arc::new(RecordRejectMetrics::new()),
+        }
+    }
+
+    /// The same handle counting into `rejects`.
+    pub fn with_record_rejects(mut self, rejects: Arc<RecordRejectMetrics>) -> Self {
+        self.rejects = rejects;
+        self
+    }
+
+    /// The reject counters this handle's live-set reads count into.
+    pub fn record_rejects(&self) -> &Arc<RecordRejectMetrics> {
+        &self.rejects
+    }
+
+    /// The record keys this handle signs and verifies with.
+    pub fn keys(&self) -> &MaintainRecordKeys {
+        &self.keys
+    }
+}
+
+/// The bytes a heartbeat MAC covers (ADR-3130 decision 2), built from field
+/// values because protobuf encoding is not canonical: `format_version` (u32
+/// BE), `process_id` (u64 BE length, then the bytes), `started_unix_ns` (i64
+/// BE), `heartbeat_unix_ns` (i64 BE).
+fn heartbeat_claim(heartbeat: &WorkerHeartbeat) -> Vec<u8> {
+    let mut claim = Vec::with_capacity(4 + 8 + heartbeat.process_id.len() + 8 + 8);
+    claim.extend_from_slice(&heartbeat.format_version.to_be_bytes());
+    let len = u64::try_from(heartbeat.process_id.len()).unwrap_or(u64::MAX);
+    claim.extend_from_slice(&len.to_be_bytes());
+    claim.extend_from_slice(&heartbeat.process_id);
+    claim.extend_from_slice(&heartbeat.started_unix_ns.to_be_bytes());
+    claim.extend_from_slice(&heartbeat.heartbeat_unix_ns.to_be_bytes());
+    claim
+}
 
 /// The prefix every maintain process's heartbeat key lives under (ADR-0065
 /// decision 1): a new additive control-plane prefix under `sys/maintain/`.
 const WORKERS_PREFIX: &str = "sys/maintain/workers/";
 
-/// The heartbeat key one maintain process owns and alone ever writes.
+/// The heartbeat key named by one maintain process's id, which only that
+/// process writes in normal operation.
 pub fn heartbeat_key(process_id: &Uuid) -> String {
     format!("{WORKERS_PREFIX}{process_id}")
 }
@@ -339,20 +471,29 @@ impl WorkerSet {
         h.saturating_mul(i64::from(self.liveness_factor))
     }
 
-    /// Write this process's heartbeat (`Overwrite`: single writer per key, no
-    /// CAS). A failed write self-corrects on the next interval; the caller logs
-    /// it. `now_ns` is the injected clock reading stamped as `heartbeat_unix_ns`.
+    /// Write this process's heartbeat, signed under `membership`'s minting key
+    /// (`Overwrite`, no CAS). A failed write self-corrects on the next
+    /// interval; the caller logs it. `now_ns` is the injected clock reading
+    /// stamped as `heartbeat_unix_ns`.
     pub async fn write_heartbeat(
         &self,
         store: &dyn ObjectStoreBackend,
+        membership: &MaintainMembership,
         now_ns: i64,
     ) -> Result<(), StoreError> {
-        let heartbeat = WorkerHeartbeat {
+        let mut heartbeat = WorkerHeartbeat {
             format_version: HEARTBEAT_FORMAT_VERSION,
             process_id: self.process_id.as_bytes().to_vec(),
             started_unix_ns: self.started_unix_ns,
             heartbeat_unix_ns: now_ns,
+            mac: Vec::new(),
         };
+        heartbeat.mac = membership
+            .keys
+            .keys
+            .mac(&heartbeat_claim(&heartbeat))
+            .as_bytes()
+            .to_vec();
         let key = heartbeat_key(&self.process_id);
         store
             .put(
@@ -367,23 +508,26 @@ impl WorkerSet {
         Ok(())
     }
 
-    /// Compute the live worker set (ADR-0065 decision 1): this process plus
-    /// every non-stale sibling under `sys/maintain/workers/`. Self is always
-    /// included, even if its own heartbeat object is missing or stale, so a
-    /// process never disowns its own units. The returned set is sorted by
+    /// Compute the live worker set (ADR-0065 decision 1, ADR-3130 decision 4):
+    /// this process plus every sibling under `sys/maintain/workers/` whose
+    /// record verifies under `membership`'s keys and is not stale. Self is
+    /// always included, even if its own heartbeat object is missing or stale,
+    /// so a process never disowns its own units. The returned set is sorted by
     /// `process_id` and deduplicated, for a deterministic order (rendezvous
     /// ownership is order-independent; sorting only stabilizes tests and logs).
     ///
-    /// A corrupt or future-version sibling is skipped (treated as absent,
-    /// self-correcting next interval); only a failed LIST or GET is an `Err`,
-    /// which the caller treats fail-open (keep the last-known live set or fall
-    /// back to `{self}`), never freezing maintenance on a transient read fault.
+    /// A sibling that fails a check is skipped and counted by [`RecordReject`]
+    /// reason in `membership`'s counters (see the module docs for the order).
+    /// Only a failed LIST or GET is an `Err`, which the caller treats fail-open
+    /// (keep the last-known live set or fall back to `{self}`), never freezing
+    /// maintenance on a transient read fault.
     pub async fn live_set(
         &self,
         store: &dyn ObjectStoreBackend,
+        membership: &MaintainMembership,
         now_ns: i64,
     ) -> Result<Vec<Uuid>, StoreError> {
-        Ok(self.live_set_read(store, now_ns).await?.live)
+        Ok(self.live_set_read(store, membership, now_ns).await?.live)
     }
 
     /// The live set AND the keys past the reap horizon, from ONE listing.
@@ -396,6 +540,7 @@ impl WorkerSet {
     pub async fn live_set_read(
         &self,
         store: &dyn ObjectStoreBackend,
+        membership: &MaintainMembership,
         now_ns: i64,
     ) -> Result<LiveSetRead, StoreError> {
         let window = self.liveness_window_ns();
@@ -421,30 +566,64 @@ impl WorkerSet {
                 }
                 continue;
             }
-            let got = store.get(&meta.key, GetRange::Full).await?;
-            let Ok(heartbeat) = WorkerHeartbeat::decode(got.data.as_ref()) else {
-                tracing::debug!(
-                    key = %meta.key,
-                    "worker_set: skipping an undecodable sibling heartbeat"
-                );
-                continue;
+            let verdict = match Self::read_sibling(store, &meta, pid, membership).await? {
+                Ok(heartbeat) if is_stale(now_ns, heartbeat.heartbeat_unix_ns, window) => {
+                    Err(RecordReject::StaleStamp)
+                }
+                other => other,
             };
-            if heartbeat.format_version > HEARTBEAT_FORMAT_VERSION {
-                tracing::debug!(
-                    key = %meta.key,
-                    version = heartbeat.format_version,
-                    "worker_set: skipping a future-version sibling heartbeat"
-                );
-                continue;
+            match verdict {
+                Ok(_) => live.push(pid),
+                Err(reason) => {
+                    tracing::debug!(
+                        key = %meta.key,
+                        reason = reason.reason(),
+                        "worker_set: rejecting a sibling heartbeat"
+                    );
+                    membership.rejects.record(reason);
+                }
             }
-            if is_stale(now_ns, heartbeat.heartbeat_unix_ns, window) {
-                continue;
-            }
-            live.push(pid);
         }
         live.sort_unstable_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
         live.dedup();
         Ok(LiveSetRead { live, reapable })
+    }
+
+    /// Read and authenticate the record at `meta`, whose key names `pid`
+    /// (ADR-3130 decision 4, every check up to and excluding `stale_stamp`).
+    /// The outer `Err` is a store failure; the inner one is the reject reason.
+    async fn read_sibling(
+        store: &dyn ObjectStoreBackend,
+        meta: &ravel_object_store::ObjectMeta,
+        pid: Uuid,
+        membership: &MaintainMembership,
+    ) -> Result<Result<WorkerHeartbeat, RecordReject>, StoreError> {
+        let got = match read_bounded(store, meta).await? {
+            Ok(got) => got,
+            Err(reject) => return Ok(Err(reject)),
+        };
+        let Ok(heartbeat) = WorkerHeartbeat::decode(got.data.as_ref()) else {
+            return Ok(Err(RecordReject::Malformed));
+        };
+        // The body must name the process id its key does.
+        if heartbeat.process_id.as_slice() != pid.as_bytes() {
+            return Ok(Err(RecordReject::Malformed));
+        }
+        if heartbeat.format_version != HEARTBEAT_FORMAT_VERSION || heartbeat.mac.is_empty() {
+            return Ok(Err(RecordReject::MissingMac));
+        }
+        let Ok(presented) = <[u8; 32]>::try_from(heartbeat.mac.as_slice()) else {
+            return Ok(Err(RecordReject::BadMac));
+        };
+        let presented = blake3::Hash::from_bytes(presented);
+        if !membership
+            .keys
+            .keys
+            .verifies(&heartbeat_claim(&heartbeat), &presented)
+        {
+            return Ok(Err(RecordReject::BadMac));
+        }
+        Ok(Ok(heartbeat))
     }
 
     /// Delete the keys a [`live_set_read`] already identified. Issues no
@@ -517,9 +696,10 @@ impl WorkerSet {
     pub async fn reap_dead_workers(
         &self,
         store: &dyn ObjectStoreBackend,
+        membership: &MaintainMembership,
         now_ns: i64,
     ) -> Result<u64, StoreError> {
-        let read = self.live_set_read(store, now_ns).await?;
+        let read = self.live_set_read(store, membership, now_ns).await?;
         Ok(self.reap_keys(store, &read.reapable).await)
     }
 
@@ -538,6 +718,7 @@ mod tests {
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
+    use ravel_object_store::GetRange;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::TenantId;
 
@@ -548,6 +729,14 @@ mod tests {
     /// `H` in milliseconds. The default liveness window is `3 * H_MS`
     /// (`DEFAULT_LIVENESS_FACTOR` is 3), which is how the tests spell it.
     const H_MS: u64 = 60 * 1_000;
+
+    /// A membership handle under one fixed test key, shared by every worker a
+    /// test builds so they admit each other.
+    fn membership() -> MaintainMembership {
+        MaintainMembership::new(
+            MaintainRecordKeys::from_file_keys(&[[0x5A; 32]]).expect("one key"),
+        )
+    }
 
     fn worker(now_ns: i64) -> WorkerSet {
         WorkerSet::new(now_ns, H, DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY)
@@ -567,7 +756,7 @@ mod tests {
     ) {
         memory.set_clock_ms(mtime_ms);
         worker
-            .write_heartbeat(store, stamp_ns)
+            .write_heartbeat(store, &membership(), stamp_ns)
             .await
             .expect("seed heartbeat");
         memory.set_clock_ms(restore_ms);
@@ -711,11 +900,11 @@ mod tests {
         let a = worker(now);
         let b = worker(now);
 
-        a.write_heartbeat(&store, now).await.expect("a heartbeat");
-        b.write_heartbeat(&store, now).await.expect("b heartbeat");
+        a.write_heartbeat(&store, &membership(), now).await.expect("a heartbeat");
+        b.write_heartbeat(&store, &membership(), now).await.expect("b heartbeat");
 
-        let live_a = a.live_set(&store, now).await.expect("a live set");
-        let live_b = b.live_set(&store, now).await.expect("b live set");
+        let live_a = a.live_set(&store, &membership(), now).await.expect("a live set");
+        let live_b = b.live_set(&store, &membership(), now).await.expect("b live set");
 
         assert!(live_a.contains(&a.process_id()) && live_a.contains(&b.process_id()));
         assert_eq!(
@@ -734,17 +923,17 @@ mod tests {
         let b = worker(0);
 
         // `b` last beat at t=0; `a` reads at various later times.
-        b.write_heartbeat(&store, 0).await.expect("b heartbeat");
-        a.write_heartbeat(&store, 3 * H_NS)
+        b.write_heartbeat(&store, &membership(), 0).await.expect("b heartbeat");
+        a.write_heartbeat(&store, &membership(), 3 * H_NS)
             .await
             .expect("a heartbeat");
 
         // Exactly 3*H old: still live (inclusive on the fresh side).
-        let live = a.live_set(&store, 3 * H_NS).await.expect("live set");
+        let live = a.live_set(&store, &membership(), 3 * H_NS).await.expect("live set");
         assert!(live.contains(&b.process_id()), "3*H is still live");
 
         // One nanosecond past 3*H: excluded.
-        let live = a.live_set(&store, 3 * H_NS + 1).await.expect("live set");
+        let live = a.live_set(&store, &membership(), 3 * H_NS + 1).await.expect("live set");
         assert!(!live.contains(&b.process_id()), "past 3*H is stale");
         assert_eq!(live, vec![a.process_id()], "only self survives");
     }
@@ -783,12 +972,12 @@ mod tests {
         // The phantom's heartbeat claims a timestamp far past the liveness
         // window into the future relative to every real reader's clock.
         phantom
-            .write_heartbeat(&store, 100 * H_NS)
+            .write_heartbeat(&store, &membership(), 100 * H_NS)
             .await
             .expect("phantom heartbeat");
-        a.write_heartbeat(&store, 0).await.expect("a heartbeat");
+        a.write_heartbeat(&store, &membership(), 0).await.expect("a heartbeat");
 
-        let live = a.live_set(&store, 0).await.expect("live set");
+        let live = a.live_set(&store, &membership(), 0).await.expect("live set");
         assert!(
             !live.contains(&phantom.process_id()),
             "a far-future-dated heartbeat must not read as live"
@@ -874,10 +1063,10 @@ mod tests {
         let store = MemoryStore::new();
         let w = worker(0);
 
-        w.write_heartbeat(&store, 1_000)
+        w.write_heartbeat(&store, &membership(), 1_000)
             .await
             .expect("first heartbeat write succeeds");
-        w.write_heartbeat(&store, 2_000)
+        w.write_heartbeat(&store, &membership(), 2_000)
             .await
             .expect("second heartbeat write to the same key succeeds unconditionally");
 
@@ -948,7 +1137,7 @@ mod tests {
             .expect("seed foreign key");
         store.set_clock_ms(now_ms);
 
-        let reaped = me.reap_dead_workers(&store, now_ns).await.expect("reap");
+        let reaped = me.reap_dead_workers(&store, &membership(), now_ns).await.expect("reap");
         assert_eq!(reaped, 3, "exactly the three keys past the horizon");
 
         let mut expected = vec![
@@ -966,7 +1155,7 @@ mod tests {
 
         // Reaping again is idempotent: nothing left is past the horizon.
         assert_eq!(
-            me.reap_dead_workers(&store, now_ns)
+            me.reap_dead_workers(&store, &membership(), now_ns)
                 .await
                 .expect("second reap"),
             0
@@ -1023,7 +1212,7 @@ mod tests {
             ),
         );
 
-        let read = me.live_set_read(&store, now_ns).await.expect("one read");
+        let read = me.live_set_read(&store, &membership(), now_ns).await.expect("one read");
         let reaped = me.reap_keys(&store, &read.reapable).await;
 
         assert_eq!(
@@ -1082,7 +1271,7 @@ mod tests {
             .await;
         }
 
-        let set = me.live_set(&store, now_ns).await.expect("live set");
+        let set = me.live_set(&store, &membership(), now_ns).await.expect("live set");
         assert_eq!(
             store.fault_count(Op::Get, FaultKind::Transient),
             0,

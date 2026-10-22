@@ -22,4 +22,5 @@
 
 pub mod claim;
 pub mod query_workers;
+pub mod record_auth;
 pub mod worker_set;

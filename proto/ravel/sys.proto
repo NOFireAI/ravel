@@ -307,28 +307,30 @@ message AdmissionUsageSnapshot {
   sfixed64 snapshot_unix_ns = 6;
 }
 
-// One maintain-role process's periodic self-owned liveness heartbeat for
-// worker membership (ADR-0065 decision 1, epic EI). Written to
-// `sys/maintain/workers/<process_id>` with PutMode::Overwrite: the key has
-// exactly one writer (the owning process), so there is no concurrent writer to
-// race and no CAS. Every heartbeat interval H (default 60s) each maintain
-// process writes its own snapshot here and lists the prefix to compute the live
-// worker set; a sibling whose heartbeat_unix_ns is older than 3*H at read time
-// is treated as gone and its owned work is taken over (ADR-0065 decision 1).
-// Advisory and reconstructible: losing it costs at most one membership-
-// staleness window of duplicated (idempotent) work, never correctness. This is
+// One maintain-role process's periodic liveness heartbeat for worker
+// membership (ADR-0065 decision 1, epic EI), signed per ADR-3130. Written to
+// `sys/maintain/workers/<process_id>` with PutMode::Overwrite: in normal
+// operation only the owning process writes the key, so there is no CAS. The
+// maintain role's S3 grant lets any holder of the role write the key too, which
+// is why a reader admits a record only once its mac verifies (ADR-3130 decision
+// 4). Every heartbeat interval H (default 60s) each maintain process writes its
+// own record here and lists the prefix to compute the live worker set; a
+// sibling whose heartbeat_unix_ns is older than 3*H at read time is treated as
+// gone and its owned work is taken over (ADR-0065 decision 1). Advisory and
+// reconstructible: losing it costs at most one membership-staleness window of
+// duplicated (idempotent) work, never correctness. This is
 // membership/ownership, deliberately not a lease (the existing LeaseCheck trait
 // is the unrelated GC reader-protection gate; ADR-0065 decision 1).
 //
 // Its own top-level message, sharing no field number with the markers above.
 message WorkerHeartbeat {
-  // Format floor: the minimum reader version that understands this record,
-  // matching the guard every other sys/ message uses. A sibling advertising a
-  // higher version is skipped (treated as absent) rather than misread. = 1.
+  // The record's format version. Readers accept exactly 2 (ADR-3130 decision
+  // 2); a record with any other version, including a version-1 record written
+  // before records carried a mac, is rejected as missing_mac. = 2.
   uint32 format_version = 1;
-  // The writing process's UUID (16 bytes). Redundant with the <process_id> in
-  // the object key, carried here too so a snapshot is self-describing; the
-  // reader takes identity from the key.
+  // The writing process's UUID (16 bytes). Must equal the <process_id> in the
+  // object key; a reader rejects a record whose body names another id as
+  // malformed (ADR-3130 decision 4).
   bytes process_id = 2;
   // This process's clock when it first started. Informational (fleet age and
   // debugging); never used for the liveness decision, which reads
@@ -338,6 +340,13 @@ message WorkerHeartbeat {
   // reading side (a sibling older than 3*H is treated as gone, ADR-0065
   // decision 1).
   sfixed64 heartbeat_unix_ns = 4;
+  // blake3::keyed_hash(record_key, claim), 32 bytes (ADR-3130 decision 2).
+  // record_key = blake3::derive_key("ravel maintain worker record v1",
+  // file_key) for the first --maintain-key-file key. claim is built from field
+  // values, not these encoded bytes: format_version (u32 BE), process_id (u64
+  // BE length, then the bytes), started_unix_ns (i64 BE), heartbeat_unix_ns
+  // (i64 BE).
+  bytes mac = 5;
 }
 
 // The lifecycle state of a CompactionClaim (ADR-1029 decision 1). Two real
