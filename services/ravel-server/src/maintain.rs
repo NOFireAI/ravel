@@ -100,11 +100,11 @@ use ravel_maintain::worker_set::{
 use ravel_maintain::{
     AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
     DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureAbandon, ErasureRewriteOutcome, LeaseCheck,
-    LegalHoldCheck, MaintainError, OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD,
-    RetentionConfig, WorkerSet, erasure_rewrite_bucket, pending_erasure_requests,
-    read_all_memo_snapshots, scan_and_compact, sweep_alert_retention, sweep_audit_retention,
-    sweep_erasure_requests, sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
-    sweep_unreferenced_catalog_objects, write_memo_snapshot,
+    LegalHoldCheck, MAX_MEMO_SNAPSHOT_BYTES, MAX_MEMO_SNAPSHOT_ENTRIES, MaintainError, OrphanPass,
+    PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
+    pending_erasure_requests, read_all_memo_snapshots, scan_and_compact, sweep_alert_retention,
+    sweep_audit_retention, sweep_erasure_requests, sweep_idempotency_markers, sweep_shard,
+    sweep_shard_zoned_with_holds, sweep_unreferenced_catalog_objects, write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
 use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
@@ -1865,10 +1865,22 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                     // degrades to a cold start, never blocks the loop.
                     if reseed {
                         match read_all_memo_snapshots(store.as_ref()).await {
-                            Ok(snapshots) => {
+                            Ok(read) => {
+                                if read.skipped_oversize > 0 {
+                                    tracing::debug!(
+                                        skipped = read.skipped_oversize,
+                                        cap_bytes = MAX_MEMO_SNAPSHOT_BYTES,
+                                        "maintenance: skipped memo snapshots over the size cap \
+                                         (cold start for their units)"
+                                    );
+                                }
                                 let now = clock.now_ns();
                                 let (units, buckets) = seed_memo_from_snapshots(
-                                    &mut memo, &snapshots, now, &worker, &live_set,
+                                    &mut memo,
+                                    &read.snapshots,
+                                    now,
+                                    &worker,
+                                    &live_set,
                                 );
                                 ownership.add_memo_warm_start_units(units as u64);
                                 if buckets > 0 {
@@ -4097,6 +4109,12 @@ fn seed_memo_from_snapshots(
 /// body is framed with `now_ns` and written `Overwrite`; a write fault is logged
 /// and `last_body` left unchanged so the next cycle retries (fail-open). Returns
 /// whether a write happened (for tests and callers that count writes).
+///
+/// A snapshot over [`MAX_MEMO_SNAPSHOT_BYTES`] framed or
+/// [`MAX_MEMO_SNAPSHOT_ENTRIES`] expanded is not written, since every reader
+/// would skip or reject it (issue #3199). Nothing is deleted: an older, smaller
+/// snapshot of this process stays on the store until the staleness bound
+/// excludes it.
 async fn persist_memo_snapshot(
     store: &dyn ObjectStoreBackend,
     worker: &WorkerSet,
@@ -4109,6 +4127,22 @@ async fn persist_memo_snapshot(
         return false;
     }
     let bytes = MaintainMemo::snapshot_bytes_from_body(&body, now_ns);
+    let entries = memo.snapshot_entry_count();
+    let framed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if framed_bytes > MAX_MEMO_SNAPSHOT_BYTES || entries > MAX_MEMO_SNAPSHOT_ENTRIES {
+        tracing::warn!(
+            framed_bytes,
+            max_bytes = MAX_MEMO_SNAPSHOT_BYTES,
+            entries,
+            max_entries = MAX_MEMO_SNAPSHOT_ENTRIES,
+            "maintenance: memo snapshot over the size cap; not written, so its units \
+             cold-start on the next reseed (ADR-0065 decision 3)"
+        );
+        // Recorded as if written so the debounce suppresses the same warning
+        // on every later tick until the memo changes.
+        *last_body = Some(body);
+        return false;
+    }
     match write_memo_snapshot(store, &worker.process_id(), bytes).await {
         Ok(()) => {
             *last_body = Some(body);
@@ -8896,7 +8930,8 @@ mod tests {
         let live_b = worker_b.solo_live_set();
         let snapshots = read_all_memo_snapshots(&store)
             .await
-            .expect("read snapshots");
+            .expect("read snapshots")
+            .snapshots;
         assert_eq!(snapshots.len(), 1, "A's one snapshot is on the store");
 
         let mut memo_b = MaintainMemo::with_default_interval();
@@ -9087,7 +9122,8 @@ mod tests {
 
         let snapshots = read_all_memo_snapshots(&store)
             .await
-            .expect("read snapshots");
+            .expect("read snapshots")
+            .snapshots;
 
         // Counter-case: B's PRE-handoff view {A,B} does not own the shard, so
         // seeding filters it out. Proves the ownership filter is not vacuous.
@@ -13634,6 +13670,177 @@ mod erasure_rewrite_accounting_tests {
                 claims_acquired: 1,
                 ..ErasureRewritePass::default()
             }
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod memo_snapshot_cap_tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use ravel_object_store::instrument::InstrumentedStore;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::TenantId;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use super::*;
+
+    const NOW_NS: i64 = 1_000_000_000_000;
+    const CAP: u32 = MAX_MEMO_SNAPSHOT_ENTRIES as u32;
+
+    /// A framed snapshot of `(shard, hours)` units, each one Compacted frontier
+    /// over hours `0..hours`, laid out as `MaintainMemo::snapshot_body` does.
+    fn frontier_snapshot(units: &[(u32, u32)]) -> Vec<u8> {
+        let tenant = TenantId::new("acme").hash();
+        let mut body = Vec::new();
+        body.extend_from_slice(&(units.len() as u32).to_le_bytes());
+        for &(shard, hours) in units {
+            body.extend_from_slice(&tenant.0);
+            body.push(0); // Signal::Metrics
+            body.extend_from_slice(&shard.to_le_bytes());
+            body.push(1); // frontier present
+            body.extend_from_slice(&0u32.to_le_bytes());
+            body.extend_from_slice(&(hours - 1).to_le_bytes());
+            body.push(0); // TerminalState::Compacted
+            body.extend_from_slice(&NOW_NS.to_le_bytes());
+            body.extend_from_slice(&0u32.to_le_bytes()); // no exceptions
+        }
+        MaintainMemo::snapshot_bytes_from_body(&body, NOW_NS)
+    }
+
+    /// A memo seeded from one snapshot per entry of `snapshots`.
+    fn seeded_memo(snapshots: &[Vec<u8>]) -> MaintainMemo {
+        let mut memo = MaintainMemo::with_default_interval();
+        for bytes in snapshots {
+            memo.seed_from_snapshot(
+                bytes,
+                NOW_NS,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("seed");
+        }
+        memo
+    }
+
+    /// Counts WARN events naming the memo snapshot size cap.
+    struct CapWarnings(Arc<Mutex<usize>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapWarnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::WARN {
+                return;
+            }
+            #[derive(Default)]
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            if visitor.0.contains("over the size cap") {
+                *self.0.lock() += 1;
+            }
+        }
+    }
+
+    /// Persist `memo` twice through the debounce, returning per call whether it
+    /// wrote, the PUTs it issued and the cap warnings it logged.
+    async fn persist_twice(memo: &MaintainMemo) -> [(bool, u64, usize); 2] {
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let worker = WorkerSet::with_defaults(0);
+        let warnings = Arc::new(Mutex::new(0usize));
+        let subscriber = tracing_subscriber::registry().with(CapWarnings(warnings.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let mut last_body = None;
+        let mut out = [(false, 0, 0); 2];
+        for (i, slot) in out.iter_mut().enumerate() {
+            let puts_before = store.metrics().snapshot().put.calls;
+            let warns_before = *warnings.lock();
+            let wrote =
+                persist_memo_snapshot(&store, &worker, memo, &mut last_body, NOW_NS + i as i64)
+                    .await;
+            *slot = (
+                wrote,
+                store.metrics().snapshot().put.calls - puts_before,
+                *warnings.lock() - warns_before,
+            );
+        }
+        out
+    }
+
+    /// A memo of exactly the entry cap is written, read back, and seeds a
+    /// fresh memo with every entry.
+    #[tokio::test]
+    async fn memo_at_the_entry_cap_is_written_and_seeds_back() {
+        let memo = seeded_memo(&[frontier_snapshot(&[(0, CAP)])]);
+        assert_eq!(memo.snapshot_entry_count(), MAX_MEMO_SNAPSHOT_ENTRIES);
+
+        let store = InstrumentedStore::new(MemoryStore::new());
+        let worker = WorkerSet::with_defaults(0);
+        let mut last_body = None;
+        assert!(persist_memo_snapshot(&store, &worker, &memo, &mut last_body, NOW_NS).await);
+        assert_eq!(store.metrics().snapshot().put.calls, 1);
+
+        let read = read_all_memo_snapshots(&store).await.expect("read");
+        assert_eq!(read.skipped_oversize, 0);
+        assert_eq!(read.snapshots.len(), 1);
+        let mut successor = MaintainMemo::with_default_interval();
+        let stats = successor
+            .seed_from_snapshot(
+                &read.snapshots[0],
+                NOW_NS,
+                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+                |_, _, _| true,
+            )
+            .expect("an at-cap snapshot decodes");
+        assert_eq!(stats.seeded_buckets, MAX_MEMO_SNAPSHOT_ENTRIES);
+        assert_eq!(successor.len(), MAX_MEMO_SNAPSHOT_ENTRIES);
+    }
+
+    /// One entry over the cap is not written and warns once; the identical
+    /// next tick neither writes nor warns again.
+    #[tokio::test]
+    async fn memo_one_entry_over_the_cap_is_not_written() {
+        let memo = seeded_memo(&[
+            frontier_snapshot(&[(0, CAP / 2 + 1)]),
+            frontier_snapshot(&[(1, CAP / 2)]),
+        ]);
+        assert_eq!(memo.snapshot_entry_count(), MAX_MEMO_SNAPSHOT_ENTRIES + 1);
+        assert_eq!(
+            persist_twice(&memo).await,
+            [(false, 0, 1), (false, 0, 0)],
+            "no PUT on either tick, one warning on the first only"
+        );
+    }
+
+    /// A memo under the entry cap whose framed snapshot is over the byte cap
+    /// is not written either: 800,000 one-hour units at 43 bytes each frame to
+    /// more than 32 MiB.
+    #[tokio::test]
+    async fn memo_over_the_byte_cap_is_not_written() {
+        let units: Vec<(u32, u32)> = (0..800_000).map(|shard| (shard, 1)).collect();
+        let memo = seeded_memo(&[frontier_snapshot(&units)]);
+        assert_eq!(memo.snapshot_entry_count(), 800_000);
+        let framed = MaintainMemo::snapshot_bytes_from_body(&memo.snapshot_body(), NOW_NS).len();
+        assert!(framed as u64 > MAX_MEMO_SNAPSHOT_BYTES, "framed {framed}");
+        assert_eq!(
+            persist_twice(&memo).await,
+            [(false, 0, 1), (false, 0, 0)],
+            "no PUT on either tick, one warning on the first only"
         );
     }
 }

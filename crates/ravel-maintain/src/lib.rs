@@ -112,7 +112,9 @@ pub use gc_config::{
 pub use legal_hold::{
     AUDIT_HOLD_SHARD, LegalHoldCheck, shard_hold_scopes, write_hold_clear, write_hold_set,
 };
-pub use memo_snapshot::{MEMO_PREFIX, memo_key, read_all_memo_snapshots, write_memo_snapshot};
+pub use memo_snapshot::{
+    MEMO_PREFIX, MemoSnapshotRead, memo_key, read_all_memo_snapshots, write_memo_snapshot,
+};
 pub use migrate::{
     BelowTargetReport, BlockedBucket, BlockedReason, FamilyCensus, FamilyMigrateReport,
     MigrateBudget, MigrationPath, NotMigratedBucket, NotMigratedReason, ReencodeBlockedBucket,
@@ -139,8 +141,9 @@ pub use rewrite::{MigrateOutcome, RewriteOutcome, migrate_bucket_format, rewrite
 pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
 pub use scan::{
-    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainMemo, MaintainReport, MemoSnapshotError,
-    ScanReport, SeedStats, scan_and_compact, scan_and_maintain,
+    DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MAX_MEMO_SNAPSHOT_BYTES, MAX_MEMO_SNAPSHOT_ENTRIES,
+    MaintainMemo, MaintainReport, MemoSnapshotError, ScanReport, SeedStats, scan_and_compact,
+    scan_and_maintain,
 };
 pub use scrub::{
     CoveringPostings, SCRUB_MAX_CATCHUP, SCRUB_REQUESTS_PER_ENTRY, SCRUB_REQUESTS_PER_OBJECT,
