@@ -174,6 +174,23 @@ pub trait WorkerEndpoints: Send + Sync + 'static {
 /// coordinator instead of a worker.
 pub const COORDINATOR_LOCAL_LOCATION: &str = "coordinator-local";
 
+/// How long a slice connection may go without receiving a frame before
+/// [`FlightWorkerSliceClient`] sends an HTTP/2 keepalive PING. The same value
+/// as the PromQL lane's dial in `ravel-server`.
+pub const SLICE_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long [`FlightWorkerSliceClient`] waits for a keepalive PING's
+/// acknowledgement before it closes the connection, so a worker or path that
+/// goes silent after connecting fails the slice fetch as a transport error
+/// instead of holding it until the statement deadline (module doc, "Failure
+/// behavior", for which step that error then takes). A worker whose HTTP/2
+/// layer still answers PINGs while its slice is stuck is not detected here.
+pub const SLICE_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether keepalive PINGs are sent while a slice connection has no open
+/// stream.
+pub const SLICE_HTTP2_KEEPALIVE_WHILE_IDLE: bool = true;
+
 /// Per-query counters for [`DistributedScanExec`]'s fallback sequence, split by
 /// step (module doc, "Failure behavior").
 ///
@@ -510,8 +527,9 @@ pub struct FlightWorkerSliceClient {
     /// fragment listener (ADR-1689 decision 1). `None` dials plaintext.
     tls: Option<ClientTlsConfig>,
     /// Bounded connect timeout for dialing a worker location. The channel is
-    /// built lazily; this caps how long the first `DoGet` waits for the TCP and
-    /// HTTP/2 handshake before failing with a typed error.
+    /// built lazily; this caps how long the first `DoGet` waits for the TCP
+    /// connect before failing with a typed error. It does not bound the TLS
+    /// handshake: that bound is set on `tls` itself.
     connect_timeout: Duration,
     /// Counts each slice fetch whose channel is configured with `tls`.
     tls_dials: SliceTlsDialCounter,
@@ -586,7 +604,10 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
             .map_err(|err| {
                 DataFusionError::Internal(format!("invalid worker location {location:?}: {err}"))
             })?
-            .connect_timeout(self.connect_timeout);
+            .connect_timeout(self.connect_timeout)
+            .http2_keep_alive_interval(SLICE_HTTP2_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(SLICE_HTTP2_KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(SLICE_HTTP2_KEEPALIVE_WHILE_IDLE);
         if let Some(tls) = &self.tls {
             endpoint = endpoint.tls_config(tls.clone()).map_err(|err| {
                 DataFusionError::Internal(format!(

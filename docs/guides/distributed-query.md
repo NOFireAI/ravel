@@ -980,7 +980,7 @@ What an operator observes, case by case:
 
 | Condition | Behavior | Visible as |
 |---|---|---|
-| A worker is unreachable, or the stream dies mid-slice | Re-dispatch once to the next rendezvous worker, then run the slice on the coordinator, then fail typed | `slices_redispatched_total`, `slices_fallback_total`, a `fallback` entry in `stats.fragments[]`, a `warn` log naming the endpoint |
+| A worker is unreachable, never completes the TLS handshake, or its connection goes silent (see [Dial and connection bounds](#dial-and-connection-bounds)), or the stream dies mid-slice | Re-dispatch once to the next rendezvous worker, then run the slice on the coordinator, then fail typed | `slices_redispatched_total`, `slices_fallback_total`, a `fallback` entry in `stats.fragments[]`, a `warn` log naming the endpoint |
 | A worker answers `Unavailable` | Same sequence as unreachable | Same |
 | A pinned segment vanished (concurrent GC or compaction) | The coordinator re-resolves the snapshot once and re-dispatches the whole query, not one slice; a second occurrence fails | The same single-retry behavior a local query already has |
 | A worker reports a corrupt segment, or a frame fails to decode | Terminal immediately: no retry, no local fallback | Typed error; a retry would mask real corruption behind a clean local read |
@@ -993,6 +993,43 @@ What an operator observes, case by case:
 | A non-metrics signal | The worker answers `Unsupported` and the coordinator silently re-runs the whole query locally | Nothing to the client; the already-paid remote fetch is still folded into the reported cost, so such a query reports both fetches |
 | A remote cluster is slow or down | Fails typed by default; with `skip-unavailable=true`, continues with `partial: true` and one warning | `warnings[]` in the response envelope |
 | A remote cluster refuses a data object outside its reader window (bytes matching their recorded content hash) | Handled as an unavailable remote, not as the local 422: fails typed by default; with `skip-unavailable=true`, continues with `partial: true` | HTTP 503 by default; with `skip-unavailable=true`, HTTP 200 and the warning `remote cluster X unavailable; results are partial` |
+
+### Dial and connection bounds
+
+Every slice dial on both lanes carries three transport bounds:
+
+- **TCP connect**: 3 s on the PromQL lane, 5 s on the SQL lane.
+- **TLS handshake**: 3 s. Both lanes dial with the same TLS configuration,
+  and the bound is set on it.
+- **HTTP/2 keepalive**: the coordinator sends a PING every 10 s, on an idle
+  connection too, and closes the connection when a PING goes unanswered for
+  10 s.
+
+The federation dial to a remote cluster carries the same handshake bound and
+keepalive.
+
+What these bounds catch:
+
+- A peer that accepts the TCP connection and never completes TLS. The dial
+  fails once the handshake bound expires.
+- A peer or path that goes silent after connecting, such as a host that dies
+  or a network partition that drops packets. The connection fails within
+  about 20 s of the silence: up to one keepalive interval until the next
+  PING, plus the keepalive timeout for its answer. On the PromQL lane that
+  holds for a cached connection that earlier queries already used.
+
+Each one fails as the same transport-class error as an unreachable worker. On
+the PromQL lane the slice then takes the re-dispatch and coordinator-local
+sequence above, and the endpoint is quarantined. On the SQL lane a failure
+before the slice's first batch takes the same sequence. A failure after the
+first batch fails the statement typed, as any SQL slice failure after its
+first batch does.
+
+What they do not catch: a live worker that is stuck before its first
+response while its HTTP/2 layer still answers PINGs, for example a slice
+blocked on a hung storage read. There is no per-attempt or
+time-to-first-response deadline. Such a slice holds its query until the query
+deadline.
 
 Two invariants make the retry logic safe. They help when you read a trace:
 
