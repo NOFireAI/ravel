@@ -421,6 +421,20 @@ fn parse_cache_bulk_scan_min_bytes(value: &str) -> Result<u64, String> {
     Ok(bytes)
 }
 
+/// Default for `--otap-max-decoded-batch-bytes`: 64 MiB.
+pub const DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Parses `--otap-max-decoded-batch-bytes`: a positive byte count. `0` would
+/// refuse every batch that carries a payload.
+#[cfg(feature = "otap")]
+fn parse_otap_max_decoded_batch_bytes(value: &str) -> Result<u64, String> {
+    let bytes: u64 = value.parse().map_err(|err| format!("{err}"))?;
+    if bytes == 0 {
+        return Err("takes a positive byte count".to_string());
+    }
+    Ok(bytes)
+}
+
 /// Parses `--format-window-check-timeout`: a non-zero humantime duration.
 fn parse_format_window_check_timeout(value: &str) -> Result<Duration, String> {
     let duration = humantime::parse_duration(value).map_err(|err| err.to_string())?;
@@ -2394,6 +2408,24 @@ pub struct Cli {
     #[cfg(feature = "otap")]
     #[arg(long)]
     pub otap: bool,
+
+    /// Cap on the decoded bytes one OTAP `BatchArrowRecords` may hold across
+    /// all of its payloads, summed before each payload is decoded. A batch
+    /// over the cap is nacked `INVALID_ARGUMENT` with "decoded batch exceeds
+    /// cap of N bytes" and the stream stays open. Each payload may decode to
+    /// its own 16 MiB cap, so a batch carrying several payload types can
+    /// need more than the default; raise this, or lower the exporter's batch
+    /// size. `0` is refused. Like `--otap`, the flag only exists in a build
+    /// with the `otap` feature.
+    #[cfg(feature = "otap")]
+    #[arg(
+        long,
+        env = "RAVEL_OTAP_MAX_DECODED_BATCH_BYTES",
+        value_name = "BYTES",
+        default_value_t = DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
+        value_parser = parse_otap_max_decoded_batch_bytes
+    )]
+    pub otap_max_decoded_batch_bytes: u64,
 
     /// Explicit override for the process-wide memory budget
     /// (`memory_budget_bytes`, ADR-1170, amended 2026-10-03 by issue #2367)
@@ -16149,6 +16181,22 @@ mod tests {
         // build still does not register the service unless asked.
         assert!(!cli(&[]).otap, "--otap defaults off even in an otap build");
         assert!(cli(&["--otap"]).otap, "--otap enables the service");
+    }
+
+    #[cfg(feature = "otap")]
+    #[test]
+    fn otap_max_decoded_batch_bytes_defaults_to_64_mib_and_refuses_zero() {
+        assert_eq!(cli(&[]).otap_max_decoded_batch_bytes, 67_108_864);
+        assert_eq!(
+            cli(&["--otap-max-decoded-batch-bytes", "268435456"]).otap_max_decoded_batch_bytes,
+            268_435_456
+        );
+        let err = Cli::try_parse_from(["ravel-server", "--otap-max-decoded-batch-bytes", "0"])
+            .expect_err("0 is refused");
+        assert!(
+            err.to_string().contains("takes a positive byte count"),
+            "the refusal says why: {err}"
+        );
     }
 
     #[test]

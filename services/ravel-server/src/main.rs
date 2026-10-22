@@ -96,6 +96,10 @@ async fn main() -> anyhow::Result<()> {
     let otap = cli.otap;
     #[cfg(not(feature = "otap"))]
     let otap = false;
+    #[cfg(feature = "otap")]
+    let otap_max_decoded_batch_bytes = cli.otap_max_decoded_batch_bytes;
+    #[cfg(not(feature = "otap"))]
+    let otap_max_decoded_batch_bytes = ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES;
 
     // Every object-store call this process makes is counted by the decorator
     // `build_store` wraps the backend in, and the same handle is
@@ -625,6 +629,7 @@ async fn main() -> anyhow::Result<()> {
         },
         oidc_refresh: resolver_bundle.oidc_refresh,
         otap,
+        otap_max_decoded_batch_bytes,
         limits,
         metrics_tenant_labels: cli.metrics_tenant_labels,
         deployment_key,
