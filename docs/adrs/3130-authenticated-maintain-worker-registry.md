@@ -161,8 +161,8 @@ Two constraints differ from ADR-1918:
    that upgrades without the Secret. The error is not propagated out of
    `desired_objects` either, so an existing cluster keeps its gateway and
    query tiers reconciling until the Secret exists. A fresh cluster on
-   per-role storage credentials creates nothing until the Secret exists,
-   because its gateway and query tiers wait for maintain to bootstrap
+   per-role storage credentials creates no `ravel-server` Deployment until
+   the Secret exists, because its gateway and query tiers wait for maintain to bootstrap
    `sys/gc`; its `Degraded` reason stays the withheld tier's once that wait
    goes stale. A missing Secret behind a set ref withholds the tier the same
    way. A cluster upgrading this way keeps its previous maintain Deployment

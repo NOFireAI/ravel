@@ -510,8 +510,8 @@ What happens to the rest of the cluster depends on whether it already runs:
   `credentialsSecretRef`, or `storage.s3.auth: podIdentity`). The gateway
   and query Deployments wait for maintain to create `sys/gc` (see
   [the `sys/gc` bootstrap order](#the-sysgc-bootstrap-order)), and maintain
-  is withheld, so the operator creates no Deployment at all until the Secret
-  exists. The reason stays `MaintainKeySecretRefMissing` or
+  is withheld, so the operator creates no `ravel-server` Deployment until
+  the Secret exists. The reason stays `MaintainKeySecretRefMissing` or
   `SecretNotFound` after five minutes rather than turning into
   `GcBootstrapStalled`.
 - **Fresh cluster on one shared credential.** The gateway and query
@@ -1228,6 +1228,9 @@ spec:
     enabled: true
     credentialsSecretRef:
       name: ravel-s3-maintain
+    # Required while maintain is enabled; see "Maintain key file" below.
+    keySecretRef:
+      name: ravel-maintain-keys
   tenantTokensSecretRef:
     name: ravel-tenant-tokens
 ```
