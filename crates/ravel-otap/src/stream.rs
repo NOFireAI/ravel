@@ -46,6 +46,12 @@ pub struct StreamConfig {
     /// ZSTD body-compressed buffers declare. A payload using any other IPC
     /// body compression codec is refused before decode.
     pub max_decompressed_payload_bytes: u64,
+    /// Cap on the decoded bytes one `BatchArrowRecords` may hold across all
+    /// of its payloads: the sum of each payload's decoded IPC body bytes, as
+    /// counted for `max_decompressed_payload_bytes`. Checked for each payload
+    /// before arrow's reader decodes it, so the payload that would cross the
+    /// cap is never decoded and the batch is refused.
+    pub max_decoded_batch_bytes: u64,
     /// Cumulative cap, across the whole gRPC stream, on the decoded body bytes
     /// of `DictionaryBatch` IPC messages (initial dictionaries and deltas):
     /// the stored length of an uncompressed body, and the declared decoded
@@ -63,6 +69,7 @@ impl Default for StreamConfig {
     fn default() -> Self {
         Self {
             max_decompressed_payload_bytes: 16 * 1024 * 1024,
+            max_decoded_batch_bytes: 64 * 1024 * 1024,
             max_stream_dictionary_bytes: 64 * 1024 * 1024,
             max_schemas_per_stream: 256,
             max_rows_per_batch: 1_000_000,
@@ -78,6 +85,8 @@ pub enum BatchError {
     UnknownPayloadType { raw: i32 },
     #[error("decompressed payload exceeds cap of {limit} bytes")]
     DecompressedPayloadTooLarge { limit: u64 },
+    #[error("decoded batch exceeds cap of {limit} bytes")]
+    DecodedBatchTooLarge { limit: u64 },
     #[error("zstd decompression failed: {0}")]
     Decompression(String),
     #[error("malformed arrow IPC framing: {0}")]
@@ -555,6 +564,7 @@ impl StreamState {
             return Err(StreamError::Poisoned.into());
         }
         let mut payloads = Vec::with_capacity(batch.arrow_payloads.len());
+        let mut batch_decoded_bytes = 0u64;
         for payload in batch.arrow_payloads {
             let decoded = payload_type_of(&payload).and_then(|payload_type| {
                 let raw =
@@ -562,7 +572,12 @@ impl StreamState {
                 Ok((payload_type, raw))
             });
             let decoded = match decoded {
-                Ok((payload_type, raw)) => self.decode_raw(payload_type, payload.schema_id, raw),
+                Ok((payload_type, raw)) => self.decode_raw(
+                    payload_type,
+                    payload.schema_id,
+                    raw,
+                    &mut batch_decoded_bytes,
+                ),
                 Err(e) => Err(e.into()),
             };
             self.collect_payload(decoded, &mut payloads)?;
@@ -587,10 +602,16 @@ impl StreamState {
             return Err(StreamError::Poisoned.into());
         }
         let mut payloads = Vec::with_capacity(batch.arrow_payloads.len());
+        let mut batch_decoded_bytes = 0u64;
         for payload in batch.arrow_payloads {
             let decoded = match payload_type_of(&payload) {
                 Ok(payload_type) => match self.decompress_on_gate(payload.record).await {
-                    Ok(raw) => self.decode_raw(payload_type, payload.schema_id, raw),
+                    Ok(raw) => self.decode_raw(
+                        payload_type,
+                        payload.schema_id,
+                        raw,
+                        &mut batch_decoded_bytes,
+                    ),
                     Err(e) => Err(e),
                 },
                 Err(e) => Err(e.into()),
@@ -647,11 +668,16 @@ impl StreamState {
         }
     }
 
+    /// Decodes one payload's IPC bytes. `batch_decoded_bytes` is the running
+    /// total of decoded bytes the batch's earlier payloads hold; this
+    /// payload's are added to it, or the batch is refused, before any of its
+    /// messages reach a decoder.
     fn decode_raw(
         &mut self,
         payload_type: ArrowPayloadType,
         schema_id: String,
         raw: MutableBuffer,
+        batch_decoded_bytes: &mut u64,
     ) -> Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError> {
         let scanned = scan_messages(&raw)?;
 
@@ -662,6 +688,12 @@ impl StreamState {
         if decoded_bytes > cap {
             return Err(BatchError::DecompressedPayloadTooLarge { limit: cap }.into());
         }
+        let batch_cap = self.config.max_decoded_batch_bytes;
+        let batch_total = batch_decoded_bytes.saturating_add(decoded_bytes);
+        if batch_total > batch_cap {
+            return Err(BatchError::DecodedBatchTooLarge { limit: batch_cap }.into());
+        }
+        *batch_decoded_bytes = batch_total;
 
         for message in &scanned {
             if let Some(rows) = message.row_count
@@ -1047,6 +1079,125 @@ mod tests {
                 .expect("under the default cap"),
         );
         assert_eq!(decoded, batch);
+    }
+
+    /// A batch of `records`, each a root metrics payload under its own schema
+    /// id, so every payload feeds a decoder of its own.
+    fn payloads(records: &[(&str, Vec<u8>)]) -> BatchArrowRecords {
+        BatchArrowRecords {
+            batch_id: 1,
+            arrow_payloads: records
+                .iter()
+                .map(|(schema_id, record)| ArrowPayload {
+                    schema_id: (*schema_id).to_string(),
+                    r#type: ArrowPayloadType::UnivariateMetrics as i32,
+                    record: record.clone().into(),
+                })
+                .collect(),
+            headers: Vec::new(),
+        }
+    }
+
+    /// The decoded bytes the batch cap counts for one payload.
+    fn decoded_len(record: &[u8]) -> u64 {
+        scan_messages(record)
+            .expect("scan")
+            .iter()
+            .map(|m| m.decoded_body_len)
+            .sum()
+    }
+
+    fn batch_capped(limit: u64) -> StreamConfig {
+        StreamConfig {
+            max_decoded_batch_bytes: limit,
+            ..StreamConfig::default()
+        }
+    }
+
+    /// A batch whose payloads decode past the batch cap is refused, though
+    /// each payload is under the per-payload cap, on both decode entries; a
+    /// batch exactly at the cap decodes.
+    #[tokio::test]
+    async fn a_batch_whose_payloads_decode_past_the_batch_cap_is_refused() {
+        let (first, _) = ipc_fragment(1000, "otelarrow", None);
+        let (second, _) = ipc_fragment(1000, "otelarrow", Some(arrow_ipc::CompressionType::ZSTD));
+        let total = decoded_len(&first) + decoded_len(&second);
+        assert!(decoded_len(&second) > 0, "the second payload decodes bytes");
+        let batch = || payloads(&[("a", first.clone()), ("b", second.clone())]);
+        let refused = |result: Result<DecodedBatch, DecodeError>| match result {
+            Err(DecodeError::Batch(BatchError::DecodedBatchTooLarge { limit })) => {
+                assert_eq!(limit, total - 1);
+            }
+            other => panic!("expected DecodedBatchTooLarge, got {other:?}"),
+        };
+
+        refused(StreamState::new(batch_capped(total - 1)).decode(batch()));
+        refused(
+            StreamState::new(batch_capped(total - 1))
+                .decode_gated(batch())
+                .await,
+        );
+
+        let at_cap = StreamState::new(batch_capped(total))
+            .decode(batch())
+            .expect("a batch at the cap decodes");
+        assert_eq!(at_cap.payloads.len(), 2);
+        let at_cap = StreamState::new(batch_capped(total))
+            .decode_gated(batch())
+            .await
+            .expect("a batch at the cap decodes");
+        assert_eq!(at_cap.payloads.len(), 2);
+    }
+
+    /// The payload that crosses the batch cap is refused before a decoder
+    /// sees it: here it is a record batch with no schema before it, which a
+    /// decoder rejects with a different error, and no decoder is created for
+    /// it. The next batch on the same stream decodes.
+    #[tokio::test]
+    async fn the_batch_cap_refuses_before_the_crossing_payload_decodes() {
+        let (first, _) = ipc_fragment(1000, "otelarrow", None);
+        let schema_message_len = {
+            let metadata_len = i32::from_le_bytes([first[4], first[5], first[6], first[7]]);
+            8 + metadata_len as usize
+        };
+        let no_schema = first[schema_message_len..].to_vec();
+        let messages = scan_messages(&no_schema).expect("the metadata scans");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].header, MessageHeader::RecordBatch);
+        assert!(matches!(
+            decode_with(StreamConfig::default(), one_payload(no_schema.clone())),
+            Err(DecodeError::Batch(BatchError::IpcDecode(_)))
+        ));
+
+        let total = decoded_len(&first) + decoded_len(&no_schema);
+        let (next, next_batch) = ipc_fragment(10, "next", None);
+        let crossing = || payloads(&[("a", first.clone()), ("b", no_schema.clone())]);
+        let crossing_key = (ArrowPayloadType::UnivariateMetrics, "b".to_string());
+
+        let mut state = StreamState::new(batch_capped(total - 1));
+        assert!(matches!(
+            state.decode(crossing()),
+            Err(DecodeError::Batch(BatchError::DecodedBatchTooLarge { .. }))
+        ));
+        assert!(!state.decoders.contains_key(&crossing_key));
+        assert!(!state.is_poisoned());
+        let decoded = state
+            .decode(payloads(&[("c", next.clone())]))
+            .expect("the next batch decodes");
+        assert_eq!(only_batch(decoded), next_batch);
+
+        let mut state = StreamState::new(batch_capped(total - 1));
+        assert!(matches!(
+            state.decode_gated(crossing()).await,
+            Err(DecodeError::Batch(BatchError::DecodedBatchTooLarge { .. }))
+        ));
+        assert!(!state.decoders.contains_key(&crossing_key));
+        assert!(!state.is_poisoned());
+        let decoded = state
+            .decode_gated(payloads(&[("c", next)]))
+            .await
+            .expect("the next batch decodes");
+        assert_eq!(only_batch(decoded), next_batch);
     }
 
     /// IPC body compression with any codec but ZSTD is refused before a decoder
