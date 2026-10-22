@@ -79,6 +79,7 @@ async fn start_test_server() -> ravel_server::Running {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: true,
+        otap_max_decoded_batch_bytes: ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
@@ -160,6 +161,7 @@ async fn start_test_server_with_limits(tenant_limits: AdmissionLimits) -> ravel_
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: true,
+        otap_max_decoded_batch_bytes: ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
         metrics_tenant_labels: false,
         max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
         limits: LimitsConfig {
@@ -247,6 +249,7 @@ async fn start_test_server_fault(
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: true,
+        otap_max_decoded_batch_bytes: ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
         metrics_tenant_labels: false,
         limits: LimitsConfig::default(),
         max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,

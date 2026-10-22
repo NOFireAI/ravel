@@ -46,11 +46,26 @@ use crate::wire_byte_count::{WireByteCounter, wire_byte_counter};
 
 pub struct GrpcArrowMetricsService {
     state: Arc<GatewayState>,
+    /// `--otap-max-decoded-batch-bytes`: the decoded bytes one
+    /// `BatchArrowRecords` may hold across its payloads.
+    max_decoded_batch_bytes: u64,
 }
 
 impl GrpcArrowMetricsService {
-    pub fn new(state: Arc<GatewayState>) -> Self {
-        GrpcArrowMetricsService { state }
+    pub fn new(state: Arc<GatewayState>, max_decoded_batch_bytes: u64) -> Self {
+        GrpcArrowMetricsService {
+            state,
+            max_decoded_batch_bytes,
+        }
+    }
+
+    /// The decode state one inbound stream starts with.
+    fn stream_decoder(&self) -> StreamState {
+        StreamState::new(StreamConfig {
+            max_decoded_batch_bytes: self.max_decoded_batch_bytes,
+            ..StreamConfig::default()
+        })
+        .with_write_gate(self.state.write_gate.clone())
     }
 }
 
@@ -102,8 +117,7 @@ impl ArrowMetricsService for GrpcArrowMetricsService {
 
         let ctx = StreamCtx {
             inbound: request.into_inner(),
-            decoder: StreamState::new(StreamConfig::default())
-                .with_write_gate(self.state.write_gate.clone()),
+            decoder: self.stream_decoder(),
             state: self.state.clone(),
             tenant,
             mode,
@@ -815,6 +829,61 @@ mod tests {
             (0, POINT_COUNT as u64),
             "every rejected point counts once under structural, none under skew"
         );
+    }
+
+    /// The service builds each stream's decoder with the configured decoded
+    /// batch cap: under a 1-byte cap a batch is nacked INVALID_ARGUMENT naming
+    /// the cap and the stream stays open, and under the 64 MiB default the
+    /// same batch decodes.
+    #[tokio::test]
+    async fn the_configured_decoded_batch_cap_reaches_the_stream_decoder() {
+        use crate::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES;
+        use ravel_otap::encode::{DataPointRow, MetricKind, MetricRow, MetricsStreamEncoder};
+
+        let batch = || {
+            MetricsStreamEncoder::new("a9")
+                .expect("encoder")
+                .encode_batch(
+                    7,
+                    &[MetricRow {
+                        name: "requests".to_string(),
+                        kind: MetricKind::Gauge,
+                        data_points: vec![DataPointRow {
+                            time_unix_nano: BASE_TS_NS,
+                            value: 1.0,
+                            flags: 0,
+                            exemplars: vec![],
+                            attrs: vec![],
+                        }],
+                    }],
+                )
+                .expect("encode a gauge batch")
+        };
+        let state = crate::otlp_http::tests::state_with_limits(AdmissionLimits::default());
+
+        let capped = GrpcArrowMetricsService::new(state.clone(), 1);
+        let err = capped
+            .stream_decoder()
+            .decode_gated(batch())
+            .await
+            .expect_err("a batch decoding past a 1-byte cap is refused");
+        let (status, terminate) = decode_error_reply(7, err);
+        assert_eq!(status.batch_id, 7);
+        assert_eq!(status.status_code, StatusCode::InvalidArgument as i32);
+        assert_eq!(
+            status.status_message,
+            "decoded batch exceeds cap of 1 bytes"
+        );
+        assert!(!terminate, "a refused batch leaves the stream open");
+
+        assert_eq!(DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES, 64 * 1024 * 1024);
+        let default = GrpcArrowMetricsService::new(state, DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES);
+        let decoded = default
+            .stream_decoder()
+            .decode_gated(batch())
+            .await
+            .expect("the same batch decodes under the default cap");
+        assert!(!decoded.payloads.is_empty());
     }
 
     /// `(skew, structural)` for the tenant's Metrics rows of the
