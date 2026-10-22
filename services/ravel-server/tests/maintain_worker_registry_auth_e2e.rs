@@ -44,8 +44,14 @@ const MISSING_MAC: &str =
 /// The maintain record keys exactly as `main` reads them: `--maintain-key-file`
 /// through `Cli`, validated, then parsed.
 fn keys_from_cli(path: &str) -> MaintainRecordKeys {
-    let cli = Cli::try_parse_from(["ravel-server", "--mode", "maintain", "--maintain-key-file", path])
-        .expect("flags parse");
+    let cli = Cli::try_parse_from([
+        "ravel-server",
+        "--mode",
+        "maintain",
+        "--maintain-key-file",
+        path,
+    ])
+    .expect("flags parse");
     cli.validate().expect("maintain with a key file validates");
     cli.parse_maintain_record_keys()
         .expect("key file parses")
@@ -271,8 +277,12 @@ async fn unsigned_registry_record_is_refused_by_both_maintain_processes() {
             None,
         )
     };
-    let a = start(keys_from_cli(key_path)).await.expect("worker a starts");
-    let b = start(keys_from_cli(key_path)).await.expect("worker b starts");
+    let a = start(keys_from_cli(key_path))
+        .await
+        .expect("worker a starts");
+    let b = start(keys_from_cli(key_path))
+        .await
+        .expect("worker b starts");
     let client = reqwest::Client::new();
     let bases = [
         format!("http://{}", a.http_addr),
@@ -292,7 +302,10 @@ async fn unsigned_registry_record_is_refused_by_both_maintain_processes() {
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    assert!(converged, "the two maintain processes admit each other within 20 s");
+    assert!(
+        converged,
+        "the two maintain processes admit each other within 20 s"
+    );
 
     // A reader keyed by the same file admits both real records.
     let real = registered(store.as_ref()).await;

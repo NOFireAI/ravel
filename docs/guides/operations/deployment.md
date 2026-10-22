@@ -587,6 +587,44 @@ fails closed. The gap between them is the time in which a fix must land. Both
 alert rules are in
 [troubleshooting](troubleshooting.md#durable-auth-refresh-is-failing).
 
+## The maintain key file
+
+Maintain processes divide the maintenance work between them through
+heartbeat records under `sys/maintain/workers/`. The maintain role can write
+any key under that prefix, so each record carries a MAC, and a process admits
+a sibling to its live set only when that MAC verifies. Without it, a principal holding the maintain role's S3 write could add a
+member that owns units and never does their work.
+
+`--mode maintain` requires `--maintain-key-file`, and every other mode,
+`--mode all` included, refuses it. The file has the same shape as
+`--fragment-key-file`:
+
+- One key per non-empty line, each line 64 hexadecimal characters.
+- Blank lines and lines that begin with `#` are ignored.
+- A file with no key line fails startup. So does any line that is not 64
+  hexadecimal characters.
+- The first key signs this process's record. Any key in the file verifies a
+  sibling's record.
+
+Every maintain process in the cluster reads the same file. A record that
+fails a check is skipped and counted in
+`ravel_maintain_worker_record_rejects_total{reason}`; see
+[observability](../observability.md#maintenance-ownership-and-concurrency).
+
+Rotate the key in three rolling restarts. Replacing the old key with the new
+one in a single step splits the live set for the length of the rollout:
+processes on the old file reject records signed with the new key and the
+reverse, so each side owns units the other also owns, and that work is done
+twice until the rollout finishes.
+
+1. Append the new key after the old one in every copy of the file, and roll
+   the maintain processes. Every process now verifies both keys and still
+   signs with the old one.
+2. Move the new key to the first line, and roll again. Processes now sign
+   with the new key, and every process still verifies the old one.
+3. Once step 2 has finished on every process, remove the old key and roll a
+   third time. Until this step, the old key still verifies.
+
 <a id="the-dedicated-fragment-listener"></a>
 
 ## The dedicated fragment listener
@@ -1060,4 +1098,5 @@ Decision records behind this page:
 [tenant-scoped credentials and control-plane protection](../../adrs/0072-tenant-scoped-credentials-and-control-plane-protection.md),
 [credential scoping](../../adrs/0055-storage-credential-scoping.md),
 [distributed read fan-out](../../adrs/0071-distributed-read-fanout.md),
+[authenticated maintain-worker registry records](../../adrs/3130-authenticated-maintain-worker-registry.md),
 and [format migration machinery](../../adrs/0066-format-migration-machinery.md).

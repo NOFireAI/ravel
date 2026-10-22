@@ -216,7 +216,7 @@ which fails if a new versioned message lands unclassified):
 | `TenancyMarker` | never rewritten (write-once) | `sys/tenancy`, CreateIfAbsent | {1} |
 | `TenantRecoveryManifest` | never rewritten (write-once) | `sys/t/<h>`, CreateIfAbsent | {1} |
 | `AdmissionUsageSnapshot` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0057 snapshot, `PutMode::Overwrite` | {1} |
-| `WorkerHeartbeat` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0065 heartbeat, `PutMode::Overwrite` | {1} |
+| `WorkerHeartbeat` | never rewritten (sole-writer Overwrite, fresh dump) | ADR-0065 heartbeat, `PutMode::Overwrite` | **{2}** (version 2 adds the record MAC and version 1 is refused as `missing_mac`: ADR-3130 decision 2) |
 | `ProvisioningRecord` | **CAS-mutable** | `provisioning::append_generation`, `raise_format_floor` | **{1, 2, 3}** (3 read, not written: ADR-1746 Release A; 3 is written since the Release B amendment below) |
 | `TenantConfigRecord` | **CAS-mutable** | `tenant_config::set_tenant_config` | **{1, 2, 3}** (3 read, and written only behind the `StorageLayoutWrite` opt-in: ADR-2135's rollout opt-in amendment) |
 | `MetricMetadataRecord` | **CAS-mutable** | ingest metadata sink read→`merge_entries`→write | **{1, 2}** |

@@ -116,11 +116,17 @@ sys/maintain/workers/<process_id>
 `process_id` is a UUID generated at startup (the ADR-0057 convention).
 Payload: a versioned-tag protobuf `{process_id, started_unix_ns,
 heartbeat_unix_ns}`, written `PutMode::Overwrite` — self-owned, no CAS, no
-contention. On the same cadence each process lists `sys/maintain/workers/`
-and GETs siblings; the **live set** is itself plus every sibling whose
-`heartbeat_unix_ns` is within `3 * H` of the reader's own clock (one factor
-wider than ADR-0057's `2 * R` to absorb skew plus write jitter; the exact
-factor is a config knob, not a contract). A stale worker is treated as gone —
+contention. ADR-3130 amends the payload: `format_version` 2 adds a `mac` keyed
+by `--maintain-key-file`, because the maintain role's IAM grant lets any
+holder write any key under the prefix. On the same cadence each process lists
+`sys/maintain/workers/` and GETs siblings; the **live set** is itself plus
+every sibling whose `heartbeat_unix_ns` is within `3 * H` of the reader's own
+clock (one factor wider than ADR-0057's `2 * R` to absorb skew plus write
+jitter; the exact factor is a config knob, not a contract). ADR-3130 amends
+this admission rule: a sibling is admitted only when its key is a UUID equal
+to the body's `process_id`, its `format_version` is 2, and its MAC verifies
+under one of the reader's keys; a rejected record is skipped and counted by
+reason. A stale worker is treated as gone —
 its work is taken over, and if it was merely slow, the overlap is idempotent
 (the same fail-open direction ADR-0057 chose, for the same reason: a slow
 heartbeat anywhere must not freeze maintenance everywhere).

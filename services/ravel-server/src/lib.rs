@@ -2960,7 +2960,10 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // counting rejects into the ownership family above. A maintain process
     // without them refuses to start: an unauthenticated live set is the gap
     // the ADR closes.
-    let maintain_membership = match (&maintenance_ownership_metrics, &config.maintain.worker_record_keys) {
+    let maintain_membership = match (
+        &maintenance_ownership_metrics,
+        &config.maintain.worker_record_keys,
+    ) {
         (Some(ownership), Some(keys)) => Some(
             ravel_maintain::worker_set::MaintainMembership::new(keys.clone())
                 .with_record_rejects(Arc::clone(ownership.worker_record_rejects())),

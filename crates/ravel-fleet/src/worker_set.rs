@@ -715,10 +715,10 @@ impl WorkerSet {
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use ravel_object_store::GetRange;
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
-    use ravel_object_store::GetRange;
     use ravel_object_store::memory::MemoryStore;
     use ravel_types::TenantId;
 
@@ -733,9 +733,7 @@ mod tests {
     /// A membership handle under one fixed test key, shared by every worker a
     /// test builds so they admit each other.
     fn membership() -> MaintainMembership {
-        MaintainMembership::new(
-            MaintainRecordKeys::from_file_keys(&[[0x5A; 32]]).expect("one key"),
-        )
+        MaintainMembership::new(MaintainRecordKeys::from_file_keys(&[[0x5A; 32]]).expect("one key"))
     }
 
     fn worker(now_ns: i64) -> WorkerSet {
@@ -900,11 +898,21 @@ mod tests {
         let a = worker(now);
         let b = worker(now);
 
-        a.write_heartbeat(&store, &membership(), now).await.expect("a heartbeat");
-        b.write_heartbeat(&store, &membership(), now).await.expect("b heartbeat");
+        a.write_heartbeat(&store, &membership(), now)
+            .await
+            .expect("a heartbeat");
+        b.write_heartbeat(&store, &membership(), now)
+            .await
+            .expect("b heartbeat");
 
-        let live_a = a.live_set(&store, &membership(), now).await.expect("a live set");
-        let live_b = b.live_set(&store, &membership(), now).await.expect("b live set");
+        let live_a = a
+            .live_set(&store, &membership(), now)
+            .await
+            .expect("a live set");
+        let live_b = b
+            .live_set(&store, &membership(), now)
+            .await
+            .expect("b live set");
 
         assert!(live_a.contains(&a.process_id()) && live_a.contains(&b.process_id()));
         assert_eq!(
@@ -923,17 +931,25 @@ mod tests {
         let b = worker(0);
 
         // `b` last beat at t=0; `a` reads at various later times.
-        b.write_heartbeat(&store, &membership(), 0).await.expect("b heartbeat");
+        b.write_heartbeat(&store, &membership(), 0)
+            .await
+            .expect("b heartbeat");
         a.write_heartbeat(&store, &membership(), 3 * H_NS)
             .await
             .expect("a heartbeat");
 
         // Exactly 3*H old: still live (inclusive on the fresh side).
-        let live = a.live_set(&store, &membership(), 3 * H_NS).await.expect("live set");
+        let live = a
+            .live_set(&store, &membership(), 3 * H_NS)
+            .await
+            .expect("live set");
         assert!(live.contains(&b.process_id()), "3*H is still live");
 
         // One nanosecond past 3*H: excluded.
-        let live = a.live_set(&store, &membership(), 3 * H_NS + 1).await.expect("live set");
+        let live = a
+            .live_set(&store, &membership(), 3 * H_NS + 1)
+            .await
+            .expect("live set");
         assert!(!live.contains(&b.process_id()), "past 3*H is stale");
         assert_eq!(live, vec![a.process_id()], "only self survives");
     }
@@ -975,9 +991,14 @@ mod tests {
             .write_heartbeat(&store, &membership(), 100 * H_NS)
             .await
             .expect("phantom heartbeat");
-        a.write_heartbeat(&store, &membership(), 0).await.expect("a heartbeat");
+        a.write_heartbeat(&store, &membership(), 0)
+            .await
+            .expect("a heartbeat");
 
-        let live = a.live_set(&store, &membership(), 0).await.expect("live set");
+        let live = a
+            .live_set(&store, &membership(), 0)
+            .await
+            .expect("live set");
         assert!(
             !live.contains(&phantom.process_id()),
             "a far-future-dated heartbeat must not read as live"
@@ -1137,7 +1158,10 @@ mod tests {
             .expect("seed foreign key");
         store.set_clock_ms(now_ms);
 
-        let reaped = me.reap_dead_workers(&store, &membership(), now_ns).await.expect("reap");
+        let reaped = me
+            .reap_dead_workers(&store, &membership(), now_ns)
+            .await
+            .expect("reap");
         assert_eq!(reaped, 3, "exactly the three keys past the horizon");
 
         let mut expected = vec![
@@ -1212,7 +1236,10 @@ mod tests {
             ),
         );
 
-        let read = me.live_set_read(&store, &membership(), now_ns).await.expect("one read");
+        let read = me
+            .live_set_read(&store, &membership(), now_ns)
+            .await
+            .expect("one read");
         let reaped = me.reap_keys(&store, &read.reapable).await;
 
         assert_eq!(
@@ -1271,7 +1298,10 @@ mod tests {
             .await;
         }
 
-        let set = me.live_set(&store, &membership(), now_ns).await.expect("live set");
+        let set = me
+            .live_set(&store, &membership(), now_ns)
+            .await
+            .expect("live set");
         assert_eq!(
             store.fault_count(Op::Get, FaultKind::Transient),
             0,

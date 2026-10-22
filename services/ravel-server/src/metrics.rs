@@ -7944,10 +7944,7 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
         write_sample(
             out,
             "ravel_query_worker_record_rejects_total",
-            &[
-                Label::Mode(mode),
-                Label::WorkerRecordRejectReason(reason),
-            ],
+            &[Label::Mode(mode), Label::WorkerRecordRejectReason(reason)],
             count,
         );
     }
@@ -9458,9 +9455,7 @@ mod tests {
             ),
             Label::IpcryptVariant(ravel_ipcrypt::policy::Variant::Deterministic),
             Label::IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome::Encrypted),
-            Label::WorkerRecordRejectReason(
-                ravel_fleet::query_workers::RecordReject::MissingMac,
-            ),
+            Label::WorkerRecordRejectReason(ravel_fleet::query_workers::RecordReject::MissingMac),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()

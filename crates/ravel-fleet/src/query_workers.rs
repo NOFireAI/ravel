@@ -637,10 +637,10 @@ pub async fn reap_dead_query_workers(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use ravel_object_store::GetRange;
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
-    use ravel_object_store::GetRange;
     use ravel_object_store::memory::MemoryStore;
 
     use super::*;

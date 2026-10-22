@@ -434,7 +434,11 @@ async fn stale_stamp_is_counted_only_after_the_mac_verifies() {
     .await;
     let live = reader.live_set(&store, &keys, NOW).await.expect("live set");
     assert_eq!(live, vec![reader.process_id()]);
-    assert_eq!(rejects(&keys), [1, 0, 0, 0, 0], "missing_mac, not stale_stamp");
+    assert_eq!(
+        rejects(&keys),
+        [1, 0, 0, 0, 0],
+        "missing_mac, not stale_stamp"
+    );
 
     let replayed = worker();
     replayed
@@ -491,7 +495,10 @@ async fn readers_sharing_a_handle_count_into_the_same_counters() {
         .live_set(&store, &heartbeat_task, NOW)
         .await
         .expect("live set");
-    reader.live_set(&store, &scrub, NOW).await.expect("live set");
+    reader
+        .live_set(&store, &scrub, NOW)
+        .await
+        .expect("live set");
     assert_eq!(shared.get(RecordReject::MissingMac), 2);
     assert!(Arc::ptr_eq(scrub.record_rejects(), &shared));
 }

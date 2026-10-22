@@ -16964,7 +16964,10 @@ mod tests {
 
         for (body, needle) in [
             ("not a key\n", "invalid --maintain-key-file"),
-            ("# comments only\n\n", "must contain at least one 32-byte key"),
+            (
+                "# comments only\n\n",
+                "must contain at least one 32-byte key",
+            ),
         ] {
             std::fs::write(file.path(), body).expect("write key");
             let err = with_key()

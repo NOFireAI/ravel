@@ -156,7 +156,10 @@ async fn maintain_worker_killed_mid_compaction_sibling_takes_over() {
         .write_heartbeat(&inner, &membership, 0)
         .await
         .expect("survivor heartbeat");
-    let live0 = survivor.live_set(&inner, &membership, 0).await.expect("live set at t0");
+    let live0 = survivor
+        .live_set(&inner, &membership, 0)
+        .await
+        .expect("live set at t0");
     assert!(
         live0.contains(&dead_id) && live0.contains(&survivor_id),
         "both workers live at t0"
