@@ -59,7 +59,9 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // the owning process's live state, never a read-modify-write of prior
         // bytes, so a lagging binary cannot strip a sibling's additive field.
         ("AdmissionUsageSnapshot", Immutable(&[1])),
-        ("WorkerHeartbeat", Immutable(&[1])),
+        // ADR-3130 decision 2: version 2 carries the MAC, and a reader refuses
+        // a version-1 record as missing_mac, so {1} is no longer read.
+        ("WorkerHeartbeat", Immutable(&[2])),
         // Read-modify-write under CAS. ProvisioningRecord accepts {1, 2, 3}
         // after ADR-1746 Release A (the FormatFloor basis fields), and its
         // writer stamps 3 since Release B. TenantConfigRecord accepts {1, 2, 3}
@@ -248,9 +250,9 @@ fn catalog_read_sets_match_their_readers_constants() {
 }
 
 /// Every CasMutable supported set is non-empty and includes version 1 (the
-/// original floor); no Immutable record advertises a wider read set than {1}
-/// today. Pins the table's own shape so a typo (an empty set, a missing 1)
-/// cannot pass.
+/// original floor); every Immutable record reads exactly {1} today, except
+/// `WorkerHeartbeat`, which reads exactly {2} (ADR-3130 decision 2). Pins the
+/// table's own shape so a typo (an empty set, a missing 1) cannot pass.
 #[test]
 fn classification_table_is_well_formed() {
     for (name, class) in classification_table() {
@@ -263,10 +265,14 @@ fn classification_table_is_well_formed() {
                 );
             }
             Class::Immutable(versions) => {
+                let expected: &[u32] = if name == "WorkerHeartbeat" {
+                    &[2]
+                } else {
+                    &[1]
+                };
                 assert_eq!(
-                    versions,
-                    &[1],
-                    "{name}: an immutable record reads only {{1}}"
+                    versions, expected,
+                    "{name}: an immutable record reads only {expected:?}"
                 );
             }
         }

@@ -33,6 +33,15 @@ use uuid::Uuid;
 
 const NS_PER_HOUR: i64 = 3_600_000_000_000;
 
+/// The maintain-worker record keys `--mode maintain` requires (ADR-3130),
+/// under a fixed test key; `None` in every other mode.
+fn maintain_record_keys(mode: Mode) -> Option<ravel_maintain::worker_set::MaintainRecordKeys> {
+    matches!(mode, Mode::Maintain).then(|| {
+        ravel_maintain::worker_set::MaintainRecordKeys::from_file_keys(&[[0x5C; 32]])
+            .expect("one maintain key")
+    })
+}
+
 /// Build a `Mode::Maintain` server config over `store` with the scrubber
 /// running on a 1-second period (so a tick fires within the test's polling
 /// window) and the maintenance loop left disabled, so only the scrubber acts.
@@ -58,7 +67,10 @@ fn maintain_config(mode: Mode, tenant: &TenantId) -> ServerConfig {
         mtls_listener: None,
         fold_tenants: vec![tenant.hash()],
         fold: ravel_server::FoldTaskConfig::default(),
-        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        maintain: ravel_server::MaintenanceTaskConfig {
+            worker_record_keys: maintain_record_keys(mode),
+            ..ravel_server::MaintenanceTaskConfig::default()
+        },
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,

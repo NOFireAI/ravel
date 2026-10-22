@@ -20,6 +20,15 @@ use tower::ServiceExt;
 
 const TOKEN: &str = "testtoken";
 
+/// The maintain-worker record keys `--mode maintain` requires (ADR-3130),
+/// under a fixed test key; `None` in every other mode.
+fn maintain_record_keys(mode: Mode) -> Option<ravel_maintain::worker_set::MaintainRecordKeys> {
+    matches!(mode, Mode::Maintain).then(|| {
+        ravel_maintain::worker_set::MaintainRecordKeys::from_file_keys(&[[0x5C; 32]])
+            .expect("one maintain key")
+    })
+}
+
 /// Start an in-process server backed by `MemoryStore` in the given mode.
 /// Mirrors `integration.rs`'s helper but is parameterized by mode so the
 /// readiness assertion can run against each one. `start` binds the listeners
@@ -55,7 +64,10 @@ async fn start_test_server(mode: Mode) -> ravel_server::Running {
             enabled: false,
             ..FoldTaskConfig::default()
         },
-        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        maintain: ravel_server::MaintenanceTaskConfig {
+            worker_record_keys: maintain_record_keys(mode),
+            ..ravel_server::MaintenanceTaskConfig::default()
+        },
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,

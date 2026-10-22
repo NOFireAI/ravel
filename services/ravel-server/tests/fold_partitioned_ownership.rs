@@ -28,7 +28,9 @@ use ravel_catalog::{
 use ravel_commit::keys;
 use ravel_commit::publish::{self, RetryPolicy};
 use ravel_commit::record::{self, NewCommitRecord};
-use ravel_maintain::worker_set::{DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY};
+use ravel_maintain::worker_set::{
+    DEFAULT_LIVENESS_FACTOR, DEFAULT_UNIT_CONCURRENCY, MaintainMembership, MaintainRecordKeys,
+};
 use ravel_maintain::{FixedClock, RetentionConfig, WorkerSet};
 use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{
@@ -58,6 +60,14 @@ const SEAL_NOW_NS: i64 = (SEALED_HOUR as i64 + 1) * NS_PER_HOUR + MARGIN_NS;
 
 /// The heartbeat interval `H` both workers run on.
 const HEARTBEAT: Duration = Duration::from_secs(60);
+
+/// The maintain key the running server and every seeded heartbeat share
+/// (ADR-3130): a seeded record signed under any other key is not admitted.
+const MAINTAIN_KEY: [u8; 32] = [0x6B; 32];
+
+fn maintain_record_keys() -> MaintainRecordKeys {
+    MaintainRecordKeys::from_file_keys(&[MAINTAIN_KEY]).expect("one maintain key")
+}
 
 /// One fold tick's freshness interval. A HEAD younger than this is skipped, so
 /// the second tick over an already-folded pair is a peek and nothing more.
@@ -613,9 +623,9 @@ fn wall_now_ns() -> i64 {
 }
 
 /// Publish one heartbeat for `process_id`, dated now, through the same
-/// `WorkerSet` path a real maintain process uses. With the default 60s
-/// heartbeat interval the liveness window is 180s, so this record stays live
-/// for the whole of a test.
+/// `WorkerSet` path a real maintain process uses, signed under the shared
+/// [`MAINTAIN_KEY`]. With the default 60s heartbeat interval the liveness
+/// window is 180s, so this record stays live for the whole of a test.
 async fn seed_worker_heartbeat(store: &MemoryStore, process_id: Uuid) {
     let now_ns = wall_now_ns();
     WorkerSet::new(
@@ -625,7 +635,11 @@ async fn seed_worker_heartbeat(store: &MemoryStore, process_id: Uuid) {
         DEFAULT_UNIT_CONCURRENCY,
     )
     .with_process_id(process_id)
-    .write_heartbeat(store, now_ns)
+    .write_heartbeat(
+        store,
+        &MaintainMembership::new(maintain_record_keys()),
+        now_ns,
+    )
     .await
     .expect("seed a foreign worker heartbeat");
 }
@@ -826,6 +840,7 @@ fn maintain_test_config(tenant: &TenantId, fold_interval: Duration) -> ServerCon
         interval: Duration::from_secs(3_600),
         shard_count: 1,
         heartbeat_interval: HEARTBEAT,
+        worker_record_keys: Some(maintain_record_keys()),
         ..Default::default()
     };
     config

@@ -344,7 +344,8 @@ A minimal example is in
 | `spec.query.distributedQuery.fragmentCaSecretRef.name` | string | none | Secret with key `ca.crt`: the CA that signed every query pod's fragment certificate. May name the same Secret as `fragmentTlsSecretRef`. Required when `enabled`. |
 | `spec.query.distributedQuery.fragmentKeySecretRef.name` | string | none | Secret with key `keys`: the fragment key file. Required when `enabled`. |
 | `spec.query.distributedQuery.sqlTicketKeySecretRef.name` | string | none | Secret with key `keys`: the SQL ticket key file. Required when `enabled`. |
-| `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. |
+| `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. `true` renders it only with `keySecretRef` set. |
+| `spec.maintain.keySecretRef.name` | string | none | Secret with key `keys`: the maintain key file, mounted and passed as `--maintain-key-file`. Required when `enabled`. See "Maintain key file" below. |
 | `spec.maintain.replicas` | integer | `1` | |
 | `spec.maintain.intervalSecs` | integer | none | `--maintain-interval-secs`. Minimum `1`: `0` is refused at admission, since the server refuses a zero interval at startup. |
 | `spec.maintain.fold.disabled` | boolean | `false` | `--disable-fold` on the maintain pods, the only Deployment the operator renders that runs the scheduled fold. Fold is a query-cost optimization only; disabling it never changes results. |
@@ -440,6 +441,85 @@ reports a `Degraded` condition with reason `AuditTokenKeyMissing`. The
 operator leaves the query Deployment unchanged, and any existing query pods
 keep serving on their current spec, until you set `auditTokenKeySecretRef`
 or `deploymentKeySecretRef`.
+
+### Maintain key file
+
+`ravel-server --mode maintain` refuses to start without
+`--maintain-key-file`. The key authenticates the heartbeat records through
+which the maintain pods divide maintenance work; see
+[the maintain key file](operations/deployment.md#the-maintain-key-file) for
+the file format and why it exists. The operator renders the flag only from
+`spec.maintain.keySecretRef`:
+
+| Reference | Secret key | Mounted at | Flag |
+|---|---|---|---|
+| `maintain.keySecretRef` | `keys` | `/etc/ravel/maintain-key/` | `--maintain-key-file` |
+
+Only the maintain pods mount it. Create the Secret yourself; the operator
+reads only its `resourceVersion`, never its value:
+
+```sh
+kubectl create secret generic ravel-maintain-keys \
+  --namespace ravel-system \
+  --from-literal="keys=$(openssl rand -hex 32)"
+```
+
+```yaml
+spec:
+  maintain:
+    keySecretRef:
+      name: ravel-maintain-keys
+```
+
+The Secret's `resourceVersion` feeds the maintain pod template's secrets
+checksum, so an edit to the Secret rolls the maintain pods, and leaves the
+gateway and query pods alone. As with every other Secret, the operator
+notices the edit at its next reconcile of the `RavelCluster`, up to 5
+minutes later. Rotate the key with the three rolling restarts in
+[the deployment guide](operations/deployment.md#the-maintain-key-file): each
+of the three edits to the Secret is one roll, and each roll must finish
+before the next edit.
+
+#### Running without the reference
+
+With `maintain.enabled` and no `maintain.keySecretRef`, the operator
+withholds the maintain Deployment: it neither applies nor deletes an
+existing one, and on a cluster that has none it creates none, because a
+maintain pod without the flag cannot start. The `RavelCluster` reports
+`Degraded=True` with reason `MaintainKeySecretRefMissing` and a message
+naming `spec.maintain.keySecretRef`. A reference to a Secret that does not
+exist yet does the same with reason `SecretNotFound` and a message naming
+the Secret. The maintain PodDisruptionBudget is still applied; it selects
+no pods until a maintain pod exists. Once the Secret exists and the
+reference is set, the next reconcile applies the maintain Deployment with
+the key file.
+
+What happens to the rest of the cluster depends on whether it already runs:
+
+- **Existing cluster, upgraded to this operator.** The maintain Deployment
+  keeps the pod template an earlier operator applied, and the gateway and
+  query Deployments keep reconciling. The maintain pods keep running only
+  while they keep the image they started on. If `spec.image` uses a mutable
+  tag that now points at this release, a maintain pod that restarts for any
+  reason (a crash, an eviction, a node drain) pulls the new `ravel-server`
+  under `spec.imagePullPolicy: Always`, or on a node that has not cached the
+  old image. That binary refuses `--mode maintain` without
+  `--maintain-key-file`, so the pod does not start. Pin `spec.image` to a
+  digest or an immutable tag, or create the Secret before you upgrade.
+- **Fresh cluster on per-role storage credentials** (a per-mode
+  `credentialsSecretRef`, or `storage.s3.auth: podIdentity`). The gateway
+  and query Deployments wait for maintain to create `sys/gc` (see
+  [the `sys/gc` bootstrap order](#the-sysgc-bootstrap-order)), and maintain
+  is withheld, so the operator creates no Deployment at all until the Secret
+  exists. The reason stays `MaintainKeySecretRefMissing` or
+  `SecretNotFound` after five minutes rather than turning into
+  `GcBootstrapStalled`.
+- **Fresh cluster on one shared credential.** The gateway and query
+  Deployments are created and reconcile as usual; only maintain is missing.
+
+Maintain pods from an earlier release and pods on this one do not admit each
+other's heartbeat records, so during the roll onto the key file some
+maintenance work runs twice until it completes.
 
 ### Distributed query
 
@@ -672,7 +752,7 @@ For a `RavelCluster` named `dev`:
 | `dev-query` | Deployment | `--mode query`, RollingUpdate. |
 | `dev-query` | Service | Port 4318. The fragment port is not on the Service: coordinators dial each query pod's own IP. |
 | `dev-query-fragment` | NetworkPolicy | Admits port 4319 on the query pods only from the query pods. Only under `query.distributedQuery` enabled with every Secret reference set. |
-| `dev-maintain` | Deployment | `--mode maintain`, `spec.maintain.replicas` replicas (default 1), `RollingUpdate` strategy. Absent when `maintain.enabled` is `false`. |
+| `dev-maintain` | Deployment | `--mode maintain`, `spec.maintain.replicas` replicas (default 1), `RollingUpdate` strategy, mounting `maintain.keySecretRef` for `--maintain-key-file`. Absent when `maintain.enabled` is `false`. Without `maintain.keySecretRef`, or while its Secret does not exist, not created, and an existing one is left unchanged; see "Maintain key file" above. |
 | `dev-gateway-ingest` | Ingress | OTLP/HTTP ingest under the tenant-affinity hash. Only under `ingestAffinity` enabled on `backend: ingressNginx`. |
 | `dev-gateway-ingest-grpc` | Ingress | The same for OTLP/gRPC. Additionally absent when `ingestAffinity.grpc` is `false`. |
 | `dev-ingest-router` | Deployment, Service, ServiceAccount, Role, RoleBinding | The `ravel-ingest-router` and its least-privilege RBAC. Only under `ingestAffinity` enabled on `backend: ravelNative`. See [ingest-affinity.md](ingest-affinity.md). |
@@ -1289,6 +1369,12 @@ Under the per-role policies, only Maintain and Admin can write it.
 - **Existing cluster.** The hold applies only while neither request-serving
   Deployment exists yet. Once either does, the operator keeps reconciling
   both through a maintain rollout or outage and does not stall them.
+- **Maintain withheld.** Without `maintain.keySecretRef`, or with a
+  reference to a Secret that does not exist, the operator applies no
+  maintain Deployment, so on a fresh cluster the hold lasts until the Secret
+  exists and nothing is created. The cluster reports the withheld tier's
+  reason (`MaintainKeySecretRefMissing` or `SecretNotFound`), not
+  `GcBootstrapStalled`; see [Maintain key file](#maintain-key-file).
 - **Stalled hold.** If the hold lasts more than five minutes, the operator
   keeps `Available=False` with `WaitingForGcBootstrap` and adds
   `Degraded=True` with reason `GcBootstrapStalled`. The message names the

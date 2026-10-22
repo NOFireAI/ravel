@@ -165,6 +165,7 @@ use std::time::Duration;
 
 use ravel_commit::keys;
 use ravel_maintain::read_gate::MaintainReadGate;
+use ravel_maintain::worker_set::MaintainMembership;
 use ravel_maintain::{
     Clock, RetentionConfig, SCRUB_REQUESTS_PER_OBJECT, ScrubLevel, ScrubResult, ScrubTarget,
     UnreadableReason, WorkerSet, scrub_one_object_on_gate,
@@ -468,6 +469,7 @@ pub fn spawn(
     shard_count: u32,
     metrics: Arc<ScrubMetrics>,
     worker: Arc<WorkerSet>,
+    membership: MaintainMembership,
     retention: Arc<RetentionConfig>,
     clock: Arc<dyn Clock>,
     read_gate: MaintainReadGate,
@@ -502,10 +504,12 @@ pub fn spawn(
             // reads the resulting live set each cycle to gate which shards it
             // rotates over. A live-set read failure falls back to `{self}`
             // (owns everything: the fail-open direction, never scrubbing less
-            // than a lone process would), ADR-0065 decision 1.
+            // than a lone process would), ADR-0065 decision 1. The read verifies
+            // each sibling record under the same keys and counts rejects into
+            // the same handle as the heartbeat task (ADR-3130 decision 4).
             let now = clock.now_ns();
             let live_set = worker
-                .live_set(store.as_ref(), now)
+                .live_set(store.as_ref(), &membership, now)
                 .await
                 .unwrap_or_else(|err| {
                     tracing::warn!(
@@ -2194,6 +2198,7 @@ mod tests {
             1,
             Arc::new(ScrubMetrics::default()),
             Arc::new(solo_worker()),
+            crate::maintain::test_membership(),
             Arc::new(RetentionConfig::default()),
             Arc::new(FixedClock(NS_PER_HOUR)),
             MaintainReadGate::default(),

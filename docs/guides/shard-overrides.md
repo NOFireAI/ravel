@@ -18,7 +18,7 @@ kind: RavelCluster
 metadata:
   name: prod
 spec:
-  # ... image, shards, storage, tenantTokensSecretRef ...
+  # ... image, shards, storage, tenantTokensSecretRef, maintain.keySecretRef ...
   shardOverrides:
     leadHours: 4
     tenants:

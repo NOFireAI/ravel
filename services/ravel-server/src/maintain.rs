@@ -94,7 +94,8 @@ use ravel_maintain::scan::{
 };
 use ravel_maintain::sweep::CatalogObjectKind;
 use ravel_maintain::worker_set::{
-    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, owns, run_bounded,
+    DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_UNIT_CONCURRENCY, MaintainMembership, MaintainRecordKeys,
+    RecordRejectMetrics, owns, run_bounded,
 };
 use ravel_maintain::{
     AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
@@ -1115,6 +1116,10 @@ pub struct MaintenanceOwnershipMetrics {
     /// Membership here means "this process owns the unit under the rendezvous
     /// gate", not "this cycle evaluated it".
     owned_this_cycle: parking_lot::Mutex<std::collections::HashSet<(TenantHash, Signal, u32)>>,
+    /// Sibling registry records the live-set readers rejected, by reason
+    /// (ADR-3130 decision 4). The heartbeat task and scrub both count into
+    /// this one handle through the shared `MaintainMembership`.
+    worker_record_rejects: Arc<RecordRejectMetrics>,
 }
 
 impl MaintenanceOwnershipMetrics {
@@ -1129,7 +1134,14 @@ impl MaintenanceOwnershipMetrics {
             loop_panics_total: AtomicU64::new(0),
             stalls: UnitStallTracker::new(stalled_after_intervals),
             owned_this_cycle: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            worker_record_rejects: Arc::new(RecordRejectMetrics::new()),
         }
+    }
+
+    /// The maintain-worker registry reject counters (ADR-3130 decision 4),
+    /// shared with every `MaintainMembership` built for this process.
+    pub fn worker_record_rejects(&self) -> &Arc<RecordRejectMetrics> {
+        &self.worker_record_rejects
     }
 
     /// Clears the per-cycle owned-unit accumulator. Call once at the top of a
@@ -1271,6 +1283,11 @@ pub struct MaintenanceTaskConfig {
     /// enough that two-worker convergence does not depend on wall-clock
     /// margin around the real 60s production cadence (issue #1852).
     pub heartbeat_interval: Duration,
+    /// The `--maintain-key-file` keys that sign this process's registry
+    /// record and verify its siblings' (ADR-3130 decision 3).
+    /// `ravel_server::start` refuses `Mode::Maintain` when this is `None`;
+    /// every other mode ignores it.
+    pub worker_record_keys: Option<MaintainRecordKeys>,
 }
 
 impl Default for MaintenanceTaskConfig {
@@ -1284,6 +1301,7 @@ impl Default for MaintenanceTaskConfig {
             unit_concurrency: DEFAULT_UNIT_CONCURRENCY,
             stalled_after_intervals: DEFAULT_STALLED_AFTER_INTERVALS,
             heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            worker_record_keys: None,
         }
     }
 }
@@ -1413,6 +1431,7 @@ pub fn spawn(
     safety: Arc<MaintenanceSafetyMetrics>,
     ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
+    membership: MaintainMembership,
     live_tx: Arc<watch::Sender<Vec<Uuid>>>,
     clock: Arc<dyn Clock>,
     refold: Option<Arc<RefoldQueue>>,
@@ -1470,6 +1489,7 @@ pub fn spawn(
         safety,
         ownership,
         worker,
+        membership,
         rng,
         // The one blessed wall clock in this process, injected by the caller so
         // the scheduled fold reads the same instance (ADR-1693 decision 6);
@@ -1511,6 +1531,9 @@ struct LoopContext {
     safety: Arc<MaintenanceSafetyMetrics>,
     ownership: Arc<MaintenanceOwnershipMetrics>,
     worker: Arc<WorkerSet>,
+    /// Signs this process's registry record and verifies its siblings'
+    /// (ADR-3130 decision 3); its reject counters are `ownership`'s.
+    membership: MaintainMembership,
     rng: Arc<dyn RngSource>,
     clock: Arc<dyn Clock>,
     /// Publishes each freshly computed live set. The loop's own discovery reads
@@ -1653,6 +1676,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
         safety,
         ownership,
         worker,
+        membership,
         rng,
         clock,
         live_tx,
@@ -1729,6 +1753,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
     let heartbeat_handle = {
         let store = Arc::clone(&store);
         let worker = Arc::clone(&worker);
+        let membership = membership.clone();
         let ownership = Arc::clone(&ownership);
         // The injected clock, not a fresh `WallClock`: this task writes the
         // timestamp siblings judge this process by AND judges theirs, so both
@@ -1744,13 +1769,13 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                 tokio::select! {
                     _ = heartbeat.tick() => {
                         let now = clock.now_ns();
-                        if let Err(err) = worker.write_heartbeat(store.as_ref(), now).await {
+                        if let Err(err) = worker.write_heartbeat(store.as_ref(), &membership, now).await {
                             tracing::warn!(
                                 error = %err,
                                 "maintenance: worker heartbeat write failed; self-corrects next interval"
                             );
                         }
-                        match worker.live_set_read(store.as_ref(), now).await {
+                        match worker.live_set_read(store.as_ref(), &membership, now).await {
                             Ok(read) => {
                                 // One listing serves both: the live set the
                                 // discovery loop reads, and the keys past the
@@ -4111,6 +4136,13 @@ fn jittered(base: Duration, rng: &dyn RngSource) -> Duration {
     base + Duration::from_millis(extra_ms)
 }
 
+/// A membership under a fixed test key, with its own reject counters.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+pub(crate) fn test_membership() -> MaintainMembership {
+    MaintainMembership::new(MaintainRecordKeys::from_file_keys(&[[0x4D; 32]]).expect("one key"))
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
@@ -4212,13 +4244,24 @@ mod tests {
         let now = 1_000 * TEST_NS_PER_HOUR;
         let a = WorkerSet::with_defaults(now).with_process_id(PINNED_WORKER_ID);
         let b = WorkerSet::with_defaults(now).with_process_id(PINNED_PEER_ID);
-        a.write_heartbeat(&store, now).await.expect("a heartbeat");
-        b.write_heartbeat(&store, now).await.expect("b heartbeat");
+        let membership = test_membership();
+        a.write_heartbeat(&store, &membership, now)
+            .await
+            .expect("a heartbeat");
+        b.write_heartbeat(&store, &membership, now)
+            .await
+            .expect("b heartbeat");
 
         // Live sets converge: each sees both processes, and the sorted sets are
         // identical (so the rendezvous input is identical on both sides).
-        let live_a = a.live_set(&store, now).await.expect("a live set");
-        let live_b = b.live_set(&store, now).await.expect("b live set");
+        let live_a = a
+            .live_set(&store, &membership, now)
+            .await
+            .expect("a live set");
+        let live_b = b
+            .live_set(&store, &membership, now)
+            .await
+            .expect("b live set");
         assert_eq!(live_a, live_b, "both replicas compute the same live set");
         assert!(live_a.contains(&a.process_id()) && live_a.contains(&b.process_id()));
         assert_eq!(live_a.len(), 2);
@@ -8689,6 +8732,7 @@ mod tests {
                 safety,
                 ownership,
                 worker,
+                membership: test_membership(),
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
@@ -8950,10 +8994,23 @@ mod tests {
         let now = SystemClock.now_ns();
         let a = WorkerSet::with_defaults(now).with_process_id(PINNED_WORKER_ID);
         let b = WorkerSet::with_defaults(now).with_process_id(PINNED_PEER_ID);
-        a.write_heartbeat(&store, now).await.expect("a heartbeat");
-        b.write_heartbeat(&store, now).await.expect("b heartbeat");
-        let live_ab = a.live_set(&store, now).await.expect("a live set");
-        assert_eq!(live_ab, b.live_set(&store, now).await.expect("b live set"));
+        let membership = test_membership();
+        a.write_heartbeat(&store, &membership, now)
+            .await
+            .expect("a heartbeat");
+        b.write_heartbeat(&store, &membership, now)
+            .await
+            .expect("b heartbeat");
+        let live_ab = a
+            .live_set(&store, &membership, now)
+            .await
+            .expect("a live set");
+        assert_eq!(
+            live_ab,
+            b.live_set(&store, &membership, now)
+                .await
+                .expect("b live set")
+        );
         assert_eq!(live_ab.len(), 2, "both replicas are live");
 
         // The pinned ids were chosen for exactly this split. Any other
@@ -10751,6 +10808,7 @@ mod tests {
                 safety,
                 ownership,
                 worker,
+                membership: test_membership(),
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
@@ -10842,6 +10900,7 @@ mod tests {
                 safety,
                 ownership,
                 worker,
+                membership: test_membership(),
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(WallClock),
                 live_tx,
@@ -10926,6 +10985,7 @@ mod tests {
                 metrics: Arc::new(TenantDiscoveryMetrics::default()),
                 safety: Arc::new(MaintenanceSafetyMetrics::default()),
                 ownership,
+                membership: test_membership(),
                 rng: Arc::new(SystemRng),
                 clock: Arc::new(clock.clone()),
                 live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
@@ -11031,6 +11091,7 @@ mod tests {
             metrics: Arc::clone(&metrics),
             safety: Arc::new(MaintenanceSafetyMetrics::default()),
             ownership: Arc::clone(&ownership),
+            membership: test_membership(),
             rng: Arc::new(SystemRng),
             clock: Arc::new(clock),
             live_tx: Arc::new(watch::channel(worker.solo_live_set()).0),
@@ -11334,6 +11395,7 @@ mod tests {
             safety,
             ownership,
             Arc::clone(&worker),
+            test_membership(),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
             Some(Arc::new(RefoldQueue::default())),
@@ -11370,6 +11432,7 @@ mod tests {
             safety,
             ownership,
             Arc::clone(&worker),
+            test_membership(),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
             Some(Arc::new(RefoldQueue::default())),
@@ -11414,6 +11477,7 @@ mod tests {
                     DEFAULT_STALLED_AFTER_INTERVALS,
                 )),
                 Arc::clone(&worker),
+                test_membership(),
                 Arc::new(watch::channel(worker.solo_live_set()).0),
                 Arc::new(WallClock),
                 Some(Arc::new(RefoldQueue::default())),
@@ -11494,6 +11558,7 @@ mod tests {
                     DEFAULT_STALLED_AFTER_INTERVALS,
                 )),
                 Arc::clone(&worker),
+                test_membership(),
                 Arc::new(watch::channel(worker.solo_live_set()).0),
                 Arc::new(WallClock),
                 Some(Arc::new(RefoldQueue::default())),
@@ -11539,6 +11604,7 @@ mod tests {
                 DEFAULT_STALLED_AFTER_INTERVALS,
             )),
             Arc::clone(&worker),
+            test_membership(),
             Arc::new(watch::channel(worker.solo_live_set()).0),
             Arc::new(WallClock),
             Some(Arc::new(RefoldQueue::default())),

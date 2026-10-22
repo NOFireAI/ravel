@@ -86,15 +86,16 @@
 //! [`live_set`]: QueryWorkers::live_set
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use ravel_object_store::{
-    GetRange, ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all,
+    ObjectMeta, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::record_auth::{DerivedKeys, read_bounded};
+pub use crate::record_auth::{MAX_RECORD_BYTES, RecordReject, RecordRejectMetrics};
 use crate::worker_set::{
     DEFAULT_HEARTBEAT_INTERVAL, DEFAULT_LIVENESS_FACTOR, is_stale, mtime_stale, reap_horizon_ns,
 };
@@ -190,18 +191,13 @@ impl QueryWorkerRecord {
 /// key is never a key either of them uses.
 pub const RECORD_KEY_CONTEXT: &str = "ravel query worker record v1";
 
-/// The largest heartbeat object [`QueryWorkers::live_set`] reads (ADR-1918
-/// decision 5). The reader asks for one byte more, so a longer object is
-/// recognised as oversize without being decoded.
-pub const MAX_RECORD_BYTES: u64 = 4096;
-
 /// The record keys of one process (ADR-1918 decision 2): one per
 /// `--fragment-key-file` key, each derived as
 /// `blake3::derive_key(RECORD_KEY_CONTEXT, file_key)`. The first mints; a
 /// record verifies under any of them. Never empty.
 #[derive(Clone)]
 pub struct RecordKeys {
-    keys: Vec<[u8; 32]>,
+    keys: DerivedKeys,
 }
 
 /// [`RecordKeys::from_file_keys`] was given no key.
@@ -219,13 +215,7 @@ impl std::error::Error for NoRecordKeys {}
 impl RecordKeys {
     /// Derive one record key per fragment file key, in order.
     pub fn from_file_keys(file_keys: &[[u8; 32]]) -> Result<Self, NoRecordKeys> {
-        if file_keys.is_empty() {
-            return Err(NoRecordKeys);
-        }
-        let keys = file_keys
-            .iter()
-            .map(|file_key| blake3::derive_key(RECORD_KEY_CONTEXT, file_key))
-            .collect();
+        let keys = DerivedKeys::derive(RECORD_KEY_CONTEXT, file_keys).ok_or(NoRecordKeys)?;
         Ok(RecordKeys { keys })
     }
 
@@ -236,23 +226,16 @@ impl RecordKeys {
 
     /// Always `false`: a `RecordKeys` cannot be built empty.
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.keys.len() == 0
     }
 
     fn mac(&self, record: &QueryWorkerRecord) -> blake3::Hash {
-        // `from_file_keys` refuses an empty list, so `keys[0]` always exists;
-        // the fallback keeps the type total without a panic path.
-        let mint = self.keys.first().copied().unwrap_or([0; 32]);
-        blake3::keyed_hash(&mint, &record_claim(record))
+        self.keys.mac(&record_claim(record))
     }
 
-    /// Whether `presented` is the MAC of `record` under any key. Each
-    /// comparison is `blake3::Hash`'s constant-time equality.
+    /// Whether `presented` is the MAC of `record` under any key.
     fn verifies(&self, record: &QueryWorkerRecord, presented: &blake3::Hash) -> bool {
-        let claim = record_claim(record);
-        self.keys
-            .iter()
-            .any(|key| blake3::keyed_hash(key, &claim) == *presented)
+        self.keys.verifies(&record_claim(record), presented)
     }
 }
 
@@ -288,87 +271,6 @@ struct SignedRecord {
     mac: Option<String>,
     #[serde(flatten)]
     record: QueryWorkerRecord,
-}
-
-/// Why [`QueryWorkers::live_set`] skipped a sibling's record (ADR-1918
-/// decision 4). Rendered as the closed `reason` label of
-/// `ravel_query_worker_record_rejects_total`. A key that is not a UUID, a
-/// record skipped before the GET because its LIST modification time is outside
-/// the liveness window, and a verified record stamped [`DRAINED_STAMP_NS`], are
-/// not rejects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RecordReject {
-    /// The object decoded but carried no `mac`.
-    MissingMac,
-    /// The `mac` is not 64 hex characters or verifies under no record key.
-    BadMac,
-    /// The object is longer than [`MAX_RECORD_BYTES`]; it was not decoded.
-    Oversize,
-    /// The object is empty or does not decode, or its `process_id` disagrees
-    /// with its key.
-    Malformed,
-    /// The record verified, but its stamp is outside the liveness window
-    /// although its modification time is inside it: a replayed older heartbeat
-    /// or a clock skewed past the window.
-    StaleStamp,
-}
-
-impl RecordReject {
-    /// Every reason, in the fixed order the counters are indexed by.
-    pub const ALL: [RecordReject; 5] = [
-        RecordReject::MissingMac,
-        RecordReject::BadMac,
-        RecordReject::Oversize,
-        RecordReject::Malformed,
-        RecordReject::StaleStamp,
-    ];
-
-    /// The stable `reason` metric label value.
-    pub fn reason(self) -> &'static str {
-        match self {
-            RecordReject::MissingMac => "missing_mac",
-            RecordReject::BadMac => "bad_mac",
-            RecordReject::Oversize => "oversize",
-            RecordReject::Malformed => "malformed",
-            RecordReject::StaleStamp => "stale_stamp",
-        }
-    }
-
-    fn index(self) -> usize {
-        match self {
-            RecordReject::MissingMac => 0,
-            RecordReject::BadMac => 1,
-            RecordReject::Oversize => 2,
-            RecordReject::Malformed => 3,
-            RecordReject::StaleStamp => 4,
-        }
-    }
-}
-
-/// Cumulative [`RecordReject`] counts of one process's live-set reads.
-#[derive(Debug, Default)]
-pub struct RecordRejectMetrics {
-    rejects: [AtomicU64; RecordReject::ALL.len()],
-}
-
-impl RecordRejectMetrics {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Records rejected for `reason` so far.
-    pub fn get(&self, reason: RecordReject) -> u64 {
-        self.rejects[reason.index()].load(Ordering::Relaxed)
-    }
-
-    /// Every reason with its count, in [`RecordReject::ALL`] order.
-    pub fn by_reason(&self) -> [(RecordReject, u64); RecordReject::ALL.len()] {
-        RecordReject::ALL.map(|reason| (reason, self.get(reason)))
-    }
-
-    fn record(&self, reason: RecordReject) {
-        self.rejects[reason.index()].fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 /// One query-role process's membership handle (ADR-0071), the query-side analog
@@ -625,23 +527,11 @@ impl QueryWorkers {
         meta: &ObjectMeta,
         pid: Uuid,
     ) -> Result<Result<QueryWorkerRecord, RecordReject>, StoreError> {
-        if meta.size == 0 {
-            return Ok(Err(RecordReject::Malformed));
-        }
-        let got = match store
-            .get(&meta.key, GetRange::Range(0, MAX_RECORD_BYTES + 1))
-            .await
-        {
+        let got = match read_bounded(store, meta).await? {
             Ok(got) => got,
-            // The object shrank to nothing between the LIST and the GET.
-            Err(StoreError::InvalidRange(_)) => return Ok(Err(RecordReject::Malformed)),
-            Err(err) => return Err(err),
+            Err(reject) => return Ok(Err(reject)),
         };
-        let body = got.data.as_ref();
-        if u64::try_from(body.len()).unwrap_or(u64::MAX) > MAX_RECORD_BYTES {
-            return Ok(Err(RecordReject::Oversize));
-        }
-        let Ok(signed) = serde_json::from_slice::<SignedRecord>(body) else {
+        let Ok(signed) = serde_json::from_slice::<SignedRecord>(got.data.as_ref()) else {
             return Ok(Err(RecordReject::Malformed));
         };
         // The body must name the process id its key does; trust the key.
@@ -747,6 +637,7 @@ pub async fn reap_dead_query_workers(
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 mod tests {
+    use ravel_object_store::GetRange;
     use ravel_object_store::fault::{
         FaultKind, FaultPlan, FaultStore, Occurrence, Op, Rule, ScriptedFault,
     };
