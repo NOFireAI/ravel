@@ -4052,7 +4052,7 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
 
     // No assertion here forbids a Get from reaching a `.dreq`. This pass parses
     // request bodies from their KEYS and never fetches one, but
-    // `collect_pending_erasure_requests`
+    // `pending_erasure_requests`
     // (crates/ravel-maintain/src/erasure_rewrite.rs) GETs each `.dreq` to
     // decode it, under the same Maintain identity, so the shape is justified
     // outside this function and is asserted by
@@ -4069,7 +4069,7 @@ fn maintain_template_covers_every_erasure_request_sweep_call() {
 ///
 /// - Maintain GETs each pending `.dreq` to decode it:
 ///   `let got = store.get(&key, GetRange::Full).await?` in
-///   `collect_pending_erasure_requests`
+///   `pending_erasure_requests`
 ///   (`crates/ravel-maintain/src/erasure_rewrite.rs`).
 /// - Maintain PUTs the completion record: `write_erasure_completion`
 ///   (`services/ravel-server/src/maintain.rs`) builds
@@ -4101,7 +4101,7 @@ fn erasure_lifecycle_calls_outside_the_sweep_are_reachable() {
         assert!(
             maintain_gets.iter().any(|p| glob_matches(p, &dreq)),
             "maintain: no GetObject Allow reaches the request object {dreq:?}, \
-             which collect_pending_erasure_requests GETs to decode the subject \
+             which pending_erasure_requests GETs to decode the subject \
              predicate (erasure_rewrite.rs). The rewrite pass is refused \
              before it can erase anything. Grants: {maintain_gets:?}"
         );
@@ -4441,8 +4441,8 @@ fn maintain_template_covers_every_worker_heartbeat_call() {
         gets.iter().any(|p| glob_matches(p, &heartbeat)),
         "maintain: no GetObject Allow reaches the sibling heartbeat \
          {heartbeat:?}, which WorkerSet::live_set_read reads with \
-         record_auth::read_bounded to verify its MAC and stamped \
-         heartbeat_unix_ns. Grants: {gets:?}"
+         record_auth::read_bounded before read_sibling verifies its MAC and \
+         stamped heartbeat_unix_ns. Grants: {gets:?}"
     );
 
     // Call 4: reap_keys DELETEs each key past the reap horizon, driven from
