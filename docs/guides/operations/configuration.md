@@ -2013,12 +2013,14 @@ reads `MemAvailable` once at startup and cannot anticipate a sibling process
 that claims memory afterward.
 
 A flag budget subtracts no overhead reserve, and the resident set of the
-process can exceed the budget. The allocator keeps freed pages for reuse, C
-libraries allocate outside it, and under concurrent query load some
-allocations are not yet charged to the budget: on a 32 GB host shared with
-an object store, the uncharged live heap has measured several GB above the
-budget's 2 GiB reserve. On such a host, set `--memory-budget-bytes` about
-4 GB below the memory the other processes leave free.
+process can exceed the flag value. The allocator keeps freed pages for
+reuse, C libraries allocate outside the budget, and under concurrent query
+load some allocations are not yet charged to it. In one measured
+concurrent-query run on a 32 GB host shared with an object store, with
+`--memory-budget-bytes` at 24 GiB (25.8 GB), the resident set peaked at
+29.2 GB, about 3.4 GB above the flag. On such a host, set the flag at least
+4 GB below the memory the other processes leave free, and more if your
+concurrent query load is heavier than that run's ten connections.
 
 What the budget feeds:
 
