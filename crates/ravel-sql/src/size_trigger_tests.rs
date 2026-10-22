@@ -335,11 +335,13 @@ async fn a_late_served_read_records_the_same_figure_as_a_fetched_one() {
     };
     let (leader, follower, ()) = tokio::join!(leader, follower, release);
 
-    assert_eq!(
-        follower.late_served_bytes, lane.early.size,
-        "the follower was served the early object late"
+    // Only the early object's GET is gated; after the release the two race
+    // through the lane's other object, where either may be served late too.
+    assert!(
+        follower.late_served_bytes >= lane.early.size,
+        "the follower was served the early object late: {} bytes",
+        follower.late_served_bytes
     );
-    assert_eq!(leader.late_served_bytes, 0, "the leader fetched it");
     assert_eq!(
         [figure(&leader), figure(&follower)],
         [(AccessIntent::Interactive, 1_914); 2],
