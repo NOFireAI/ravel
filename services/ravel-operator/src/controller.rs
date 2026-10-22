@@ -61,7 +61,7 @@ use crate::reconcile::{
     query_network_policy_during_rollout, s3_allow_http,
 };
 use crate::reconcile::{
-    desired_tier_service_accounts, pod_identity, pod_identity_service_accounts_marker,
+    MaintainTier, desired_tier_service_accounts, maintain_key_secret_name, pod_identity, pod_identity_service_accounts_marker,
     tier_service_accounts_to_sweep, validate_storage_auth,
 };
 
@@ -394,6 +394,40 @@ async fn resolve_distributed_query_resource_versions(
         }
     }
     Ok(DistributedQueryResolution::Resolved(versions))
+}
+
+/// The outcome of resolving the `maintain.keySecretRef` Secret's
+/// `resourceVersion` (ADR-3130 decision 5).
+enum MaintainKeyResolution {
+    /// The referenced Secret exists (`Some` of its `resourceVersion`), or the
+    /// maintain tier mounts no key Secret this pass (`None`: maintain disabled,
+    /// or the ref unset, which the render withholds on its own).
+    Resolved(Option<String>),
+    /// The referenced Secret does not exist. The maintain tier is withheld,
+    /// like a missing distributed-query Secret holds the query tier: a rolled
+    /// maintain pod could not mount it.
+    SecretMissing { name: String, reason: String },
+}
+
+/// Read the `resourceVersion` of the `maintain.keySecretRef` Secret for the
+/// maintain tier's pod-template checksum, so a key rotation rolls the
+/// maintain pods. A missing Secret soft-degrades (only the maintain tier is
+/// withheld); any other read error propagates.
+async fn resolve_maintain_key_resource_version(
+    client: &Client,
+    namespace: &str,
+    spec: &RavelClusterSpec,
+) -> Result<MaintainKeyResolution, Error> {
+    let Some(name) = maintain_key_secret_name(spec) else {
+        return Ok(MaintainKeyResolution::Resolved(None));
+    };
+    match secret_resource_version(client, namespace, name, "maintain.keySecretRef").await {
+        Ok(rv) => Ok(MaintainKeyResolution::Resolved(Some(rv.unwrap_or_default()))),
+        Err(Error::SecretNotFound { name, reason }) => {
+            Ok(MaintainKeyResolution::SecretMissing { name, reason })
+        }
+        Err(other) => Err(other),
+    }
 }
 
 /// Read the `resourceVersion` of every credential Secret the spec references,
@@ -1946,6 +1980,10 @@ async fn reconcile_inner(
         resolve_distributed_query_resource_versions(client, namespace, &obj.spec).await?;
     let distributed_query_secret_missing = distributed_query.holds_query_tier();
 
+    // The maintain key Secret (ADR-3130 decision 5), resolved the same way: a
+    // missing one withholds only the maintain tier.
+    let maintain_key = resolve_maintain_key_resource_version(client, namespace, &obj.spec).await?;
+
     let render_ctx = RenderCtx {
         tenant_names: token_secret.tenant_names,
         token_resource_version: token_secret.resource_version,
@@ -1953,6 +1991,7 @@ async fn reconcile_inner(
         deployment_key_resource_version: deployment_key_secret.resource_version,
         audit_token_key_resource_version,
         distributed_query_resource_versions: Vec::new(),
+        maintain_key_resource_version: None,
         credentials_sidecar_image: ctx.credentials_sidecar_image.clone(),
     };
 
@@ -1981,6 +2020,7 @@ async fn reconcile_inner(
         namespace,
         render_ctx,
         &distributed_query,
+        &maintain_key,
     )?;
 
     // Services and routing first, then the three Deployments in the order the
@@ -2196,8 +2236,9 @@ async fn reconcile_inner(
             (None, None, false)
         };
 
-    // Maintain disabled: converge its Deployment away.
-    if tiers.maintain.is_none() {
+    // Maintain disabled: converge its Deployment away. A withheld maintain
+    // tier (no key Secret) is not disabled: its live Deployment is left alone.
+    if tiers.maintain_disabled {
         delete_if_present(&deployments, &maintain_name).await?;
     }
     // The fragment-port NetworkPolicy (ADR-1689 decision 4) converges around
@@ -2254,10 +2295,17 @@ async fn reconcile_inner(
     // Report the readiness the maintain apply just observed, but decide the
     // `Available` condition from the count the ORDERING used: that is the one
     // that describes what this pass actually applied.
+    // A withheld maintain tier was never applied, so its readiness comes from
+    // the live Deployment, read here unless the bootstrap plan already did.
+    let maintain_live_ready = if tiers.maintain_withheld && !plan.reads_live_state() {
+        live_replica_counts(&deployments, &maintain_name).await?.0
+    } else {
+        maintain_ready_before
+    };
     let maintain_ready = tiers
         .applied(DeploymentTier::Maintain)
         .and_then(ready_replicas)
-        .or(maintain_ready_before);
+        .or(maintain_live_ready);
     let gateway_ready = tiers
         .applied(DeploymentTier::Gateway)
         .and_then(ready_replicas);
@@ -2389,9 +2437,10 @@ async fn reconcile_inner(
 /// What [`plan_render`] decides for one pass, before any API call.
 struct PassRender {
     /// Everything the pass renders. Its `gateway_deployment`,
-    /// `query_deployment`, `maintain_deployment`, `router_render_error` and
+    /// `query_deployment`, `maintain`, `router_render_error` and
     /// `distributed_query_render_error` fields have been moved out (into
-    /// `tiers` and `degraded`) and are left at their defaults.
+    /// `tiers` and `degraded`) and are left at their defaults
+    /// (`MaintainTier::Withheld` for `maintain`).
     desired: DesiredObjects,
     /// The Deployments this pass applies.
     tiers: TierDeployments,
@@ -2400,23 +2449,44 @@ struct PassRender {
     degraded: Option<(String, String)>,
 }
 
-/// Turn the distributed-query Secret resolution into what this pass renders
-/// and applies: the resolved `resourceVersion`s go into `render_ctx` (so a
-/// rotated Secret moves the query pod-template checksum), a missing Secret
-/// withholds the query Deployment apply, and the render's `Degraded` entry
-/// names a missing Secret. Pure: no API client, so tests drive it directly.
+/// Turn the distributed-query and maintain-key Secret resolutions into what
+/// this pass renders and applies: the resolved `resourceVersion`s go into
+/// `render_ctx` (so a rotated Secret moves its tier's pod-template checksum), a
+/// missing Secret withholds that tier's Deployment apply, and the render's
+/// `Degraded` entry names a missing Secret or Secret ref. Pure: no API client,
+/// so tests drive it directly.
 fn plan_render(
     spec: &RavelClusterSpec,
     instance: &str,
     namespace: &str,
     mut render_ctx: RenderCtx,
     distributed_query: &DistributedQueryResolution,
+    maintain_key: &MaintainKeyResolution,
 ) -> Result<PassRender, Error> {
     render_ctx.distributed_query_resource_versions = distributed_query.resource_versions();
+    render_ctx.maintain_key_resource_version = match maintain_key {
+        MaintainKeyResolution::Resolved(rv) => rv.clone(),
+        MaintainKeyResolution::SecretMissing { .. } => None,
+    };
     let mut desired = desired_objects(spec, instance, namespace, &render_ctx)?;
+    let mut maintain = std::mem::replace(&mut desired.maintain, MaintainTier::Withheld);
+    let maintain_withheld = match (&maintain, maintain_key) {
+        (MaintainTier::Withheld, _) => Some(degraded_reason(&Error::Render(
+            RenderError::MaintainKeySecretRefMissing,
+        ))),
+        (MaintainTier::Apply(_), MaintainKeyResolution::SecretMissing { name, reason }) => {
+            maintain = MaintainTier::Withheld;
+            Some(degraded_reason(&Error::SecretNotFound {
+                name: name.clone(),
+                reason: reason.clone(),
+            }))
+        }
+        _ => None,
+    };
     let degraded = render_degraded(
         audit_token_key_missing(spec),
         distributed_query.secret_missing_degrade(),
+        maintain_withheld,
         desired.distributed_query_render_error.take(),
         desired.router_render_error.take(),
     );
@@ -2425,7 +2495,7 @@ fn plan_render(
         distributed_query.holds_query_tier(),
         std::mem::take(&mut desired.gateway_deployment),
         std::mem::take(&mut desired.query_deployment),
-        desired.maintain_deployment.take(),
+        maintain,
     );
     Ok(PassRender {
         desired,
@@ -2445,6 +2515,11 @@ struct TierDeployments {
     query: Option<Deployment>,
     /// The rendered maintain Deployment, taken when applied.
     maintain: Option<Deployment>,
+    /// The maintain tier is disabled: the controller deletes its Deployment.
+    maintain_disabled: bool,
+    /// The maintain tier is enabled but withheld ([`MaintainTier::Withheld`]):
+    /// its Deployment is neither applied nor deleted.
+    maintain_withheld: bool,
     /// The live object each applied tier came back as.
     applied: BTreeMap<&'static str, Deployment>,
 }
@@ -2461,12 +2536,14 @@ impl TierDeployments {
         distributed_query_secret_missing: bool,
         gateway: Deployment,
         query: Deployment,
-        maintain: Option<Deployment>,
+        maintain: MaintainTier,
     ) -> Self {
         Self {
             gateway: Some(gateway),
             query: query_tier_apply_target(spec, distributed_query_secret_missing, query),
-            maintain,
+            maintain_disabled: matches!(maintain, MaintainTier::Disabled),
+            maintain_withheld: matches!(maintain, MaintainTier::Withheld),
+            maintain: maintain.into_deployment(),
             applied: BTreeMap::new(),
         }
     }
@@ -3149,6 +3226,10 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "DistributedQuerySecretRefMissing".to_string(),
             err.to_string(),
         ),
+        Error::Render(RenderError::MaintainKeySecretRefMissing) => (
+            "MaintainKeySecretRefMissing".to_string(),
+            err.to_string(),
+        ),
         // The remedy is an operator flag, not a CR edit: the message names
         // `--credentials-sidecar-image` and its env.
         Error::Render(RenderError::CredentialsSidecarImageUnset) => {
@@ -3176,13 +3257,16 @@ fn degraded_reason(err: &Error) -> (String, String) {
 /// the query tier cannot be rolled at all. A referenced distributed-query
 /// Secret that does not exist ranks next: it holds the query tier back the same
 /// way, and outranks a router error whose blast radius is only ingest routing.
-/// An incomplete `spec.query.distributedQuery` ranks next (the query tier runs,
-/// but without the distribution its spec asks for); it and the missing-Secret
-/// case are mutually exclusive (an incomplete block references no Secret to
-/// miss). A router render error ranks last.
+/// A withheld maintain tier (no `maintain.keySecretRef`, or its Secret missing)
+/// ranks next: the maintain Deployment cannot be rolled. An incomplete
+/// `spec.query.distributedQuery` ranks next (the query tier runs, but without
+/// the distribution its spec asks for); it and the missing-Secret case are
+/// mutually exclusive (an incomplete block references no Secret to miss). A
+/// router render error ranks last.
 fn render_degraded(
     audit_key_missing: bool,
     query_secret_missing: Option<(String, String)>,
+    maintain_withheld: Option<(String, String)>,
     distributed_query_error: Option<RenderError>,
     router_error: Option<RenderError>,
 ) -> Option<(String, String)> {
@@ -3192,7 +3276,7 @@ fn render_degraded(
             AUDIT_TOKEN_KEY_MISSING_MESSAGE.to_string(),
         ));
     }
-    if let Some(degrade) = query_secret_missing {
+    if let Some(degrade) = query_secret_missing.or(maintain_withheld) {
         return Some(degrade);
     }
     distributed_query_error
@@ -3677,6 +3761,7 @@ mod tests {
         let (reason, message) = render_degraded(
             false,
             None,
+            None,
             Some(missing()),
             Some(RenderError::RouterImageMissing),
         )
@@ -3688,12 +3773,13 @@ mod tests {
         );
 
         let (reason, _) =
-            render_degraded(true, None, Some(missing()), None).expect("a Degraded entry");
+            render_degraded(true, None, None, Some(missing()), None).expect("a Degraded entry");
         assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
-        let (reason, _) = render_degraded(false, None, None, Some(RenderError::RouterImageMissing))
-            .expect("a Degraded entry");
+        let (reason, _) =
+            render_degraded(false, None, None, None, Some(RenderError::RouterImageMissing))
+                .expect("a Degraded entry");
         assert_eq!(reason, "RouterImageMissing");
-        assert_eq!(render_degraded(false, None, None, None), None);
+        assert_eq!(render_degraded(false, None, None, None, None), None);
 
         // A missing distributed-query Secret ranks below the audit key and above
         // a router error, and names the Secret. Guarding line: the
@@ -3709,6 +3795,7 @@ mod tests {
             false,
             secret_missing(),
             None,
+            None,
             Some(RenderError::RouterImageMissing),
         )
         .expect("a Degraded entry");
@@ -3716,7 +3803,7 @@ mod tests {
         assert!(message.contains("frag-ca"), "{message}");
         // The audit key still outranks it.
         let (reason, _) =
-            render_degraded(true, secret_missing(), None, None).expect("a Degraded entry");
+            render_degraded(true, secret_missing(), None, None, None).expect("a Degraded entry");
         assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
     }
 
@@ -3922,7 +4009,12 @@ mod tests {
                 ..GatewaySpec::default()
             },
             query: QuerySpec::default(),
-            maintain: MaintainSpec::default(),
+            maintain: MaintainSpec {
+                key_secret_ref: Some(LocalSecretRef {
+                    name: "maintain-keys".to_string(),
+                }),
+                ..MaintainSpec::default()
+            },
             probes: ProbesSpec::default(),
             gc: None,
             retention: None,
@@ -5542,7 +5634,7 @@ mod tests {
             true,
             named("rc-gateway"),
             named("rc-query"),
-            Some(named("rc-maintain")),
+            MaintainTier::Apply(Box::new(named("rc-maintain"))),
         );
         assert!(tiers.query.is_none(), "the query Deployment is held back");
         assert_eq!(
@@ -5611,6 +5703,7 @@ mod tests {
                 "ns",
                 RenderCtx::default(),
                 &DistributedQueryResolution::Resolved(rvs.map(String::from).to_vec()),
+                &MaintainKeyResolution::Resolved(Some("mk-1".to_string())),
             )
             .expect("spec renders")
         };
@@ -5648,8 +5741,15 @@ mod tests {
             name: "frag-ca".to_string(),
             reason: "referenced by spec.query.distributedQuery.fragmentCaSecretRef".to_string(),
         };
-        let plan =
-            plan_render(&spec, "rc", "ns", RenderCtx::default(), &missing).expect("spec renders");
+        let plan = plan_render(
+            &spec,
+            "rc",
+            "ns",
+            RenderCtx::default(),
+            &missing,
+            &MaintainKeyResolution::Resolved(Some("mk-1".to_string())),
+        )
+        .expect("spec renders");
         assert!(
             plan.tiers.query.is_none(),
             "the query Deployment is held back"
