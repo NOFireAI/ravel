@@ -171,6 +171,20 @@ pub enum RenderError {
         missing: Vec<&'static str>,
     },
 
+    /// `spec.maintain.enabled` is true but `spec.maintain.keySecretRef` is
+    /// unset. `ravel-server` refuses `--mode maintain` without
+    /// `--maintain-key-file` (ADR-3130), so no maintain pod can be rendered.
+    /// [`desired_maintain_deployment`] returns it; [`desired_objects`] turns
+    /// it into [`MaintainTier::Withheld`] rather than propagating it, so the
+    /// live maintain Deployment is neither updated nor deleted and the other
+    /// tiers keep reconciling.
+    #[error(
+        "spec.maintain.keySecretRef is not set; ravel-server requires --maintain-key-file in \
+         --mode maintain. Reference a Secret holding the maintain key file under `keys`. The \
+         existing maintain Deployment, if any, is left unchanged until then"
+    )]
+    MaintainKeySecretRefMissing,
+
     /// `spec.storage.s3.auth` is `podIdentity` but the operator runs without
     /// `--credentials-sidecar-image`, so it has no image for the credentials
     /// sidecar every pod needs. Nothing renders, the qualify Job included:
@@ -366,6 +380,12 @@ pub struct RenderCtx {
     /// query tier's checksum, since no other tier mounts them.
     pub distributed_query_resource_versions: Vec<String>,
 
+    /// `resourceVersion` of the `maintain.keySecretRef` Secret, or `None`
+    /// when the maintain tier mounts none. `ravel-server` reads the key file
+    /// once at startup, so a rotation must roll the maintain pods; folded only
+    /// into the maintain tier's checksum, since no other tier mounts it.
+    pub maintain_key_resource_version: Option<String>,
+
     /// The image of the Pod Identity credentials sidecar (the operator's
     /// `--credentials-sidecar-image`), rendered only under
     /// `storage.s3.auth: podIdentity`. `None` under `podIdentity` fails the
@@ -476,15 +496,16 @@ fn blake3_hex(fields: &[&str]) -> String {
 /// `audit_key_rv` is folded in only by the query tier's call site (#1487):
 /// gateway and maintain always pass `None` here regardless of
 /// `ctx.audit_token_key_resource_version`, so a rotation of that Secret never
-/// moves their checksum. `distributed_query_rvs` follows the same rule: only
-/// the query tier passes `ctx.distributed_query_resource_versions`, and an
-/// empty slice hashes exactly the fields [`secrets_checksum`] does.
+/// moves their checksum. `tier_key_rvs` follows the same rule: only the query
+/// tier passes `ctx.distributed_query_resource_versions` and only the maintain
+/// tier passes `ctx.maintain_key_resource_version`, and an empty slice hashes
+/// exactly the fields [`secrets_checksum`] does.
 fn tier_secrets_checksum(
     spec: &RavelClusterSpec,
     ctx: &RenderCtx,
     tier_override: Option<&LocalSecretRef>,
     audit_key_rv: Option<&str>,
-    distributed_query_rvs: &[String],
+    tier_key_rvs: &[String],
 ) -> String {
     let credentials_rv = tier_credentials_secret_name(spec, tier_override)
         .and_then(|secret_name| ctx.credential_resource_versions.get(secret_name))
@@ -495,7 +516,7 @@ fn tier_secrets_checksum(
         ctx.deployment_key_resource_version.as_deref(),
         audit_key_rv,
     );
-    fields.extend(distributed_query_rvs.iter().map(String::as_str));
+    fields.extend(tier_key_rvs.iter().map(String::as_str));
     blake3_hex(&fields)
 }
 
@@ -1113,6 +1134,8 @@ pub(crate) const FRAGMENT_CA_MOUNT_DIR: &str = "/etc/ravel/fragment-ca";
 pub(crate) const FRAGMENT_KEY_MOUNT_DIR: &str = "/etc/ravel/fragment-key";
 /// Mount directory of `distributedQuery.sqlTicketKeySecretRef`.
 pub(crate) const SQL_TICKET_KEY_MOUNT_DIR: &str = "/etc/ravel/sql-ticket-key";
+/// Mount directory of `maintain.keySecretRef`.
+pub(crate) const MAINTAIN_KEY_MOUNT_DIR: &str = "/etc/ravel/maintain-key";
 
 /// Secret key of the fragment certificate (the `kubernetes.io/tls` name).
 pub(crate) const FRAGMENT_TLS_CERT_KEY: &str = "tls.crt";
@@ -1120,8 +1143,19 @@ pub(crate) const FRAGMENT_TLS_CERT_KEY: &str = "tls.crt";
 pub(crate) const FRAGMENT_TLS_KEY_KEY: &str = "tls.key";
 /// Secret key of the fragment CA bundle (the cert-manager name).
 pub(crate) const FRAGMENT_CA_KEY: &str = "ca.crt";
-/// Secret key of the fragment and SQL ticket key files.
+/// Secret key of the fragment, SQL ticket and maintain key files.
 pub(crate) const KEY_FILE_SECRET_KEY: &str = "keys";
+
+/// The Secret named by `spec.maintain.keySecretRef` when the maintain tier is
+/// enabled, `None` otherwise. The maintain Deployment's mount and the
+/// controller's `resourceVersion` read both resolve the Secret here.
+pub fn maintain_key_secret_name(spec: &RavelClusterSpec) -> Option<&str> {
+    spec.maintain
+        .key_secret_ref
+        .as_ref()
+        .filter(|_| spec.maintain.enabled)
+        .map(|r| r.name.as_str())
+}
 
 /// The Secret names `spec.query.distributedQuery` renders from, once every
 /// reference is present.
@@ -1762,7 +1796,11 @@ pub fn desired_query_deployment(
 }
 
 /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
-/// controller deletes the Deployment in that case).
+/// controller deletes the Deployment in that case), or
+/// [`RenderError::MaintainKeySecretRefMissing`] when it is enabled without
+/// `maintain.keySecretRef`: every rendered maintain pod mounts that Secret at
+/// [`MAINTAIN_KEY_MOUNT_DIR`] and passes `--maintain-key-file`, which
+/// `--mode maintain` requires (ADR-3130 decision 5).
 ///
 /// Replica count comes from `spec.maintain.replicas` (default 1) and the
 /// strategy is `RollingUpdate`, superseding ADR-0034 decision 3's
@@ -1770,9 +1808,10 @@ pub fn desired_query_deployment(
 /// `replicas > 1` safe: every maintain pod runs `--mode maintain`, which spawns
 /// the heartbeat/rendezvous machinery that partitions the `(tenant, signal,
 /// shard)` unit space across the live worker set discovered from the shared
-/// store. The coordination is entirely store-side (self-owned keys under
-/// `sys/maintain/`), so the pod spec needs no extra ownership flags beyond
-/// `--mode maintain` and the shared store args every tier already carries; a
+/// store. The coordination is entirely store-side (heartbeat records under
+/// `sys/maintain/`, authenticated with the maintain key file), so the pod spec
+/// needs no extra ownership flags beyond `--mode maintain`, the key file, and
+/// the shared store args every tier already carries; a
 /// rolling restart is safe because a briefly-overlapping owner during the
 /// handoff window only duplicates idempotent work, never corrupts it (ADR-0065
 /// decision 2). Maintain serves `--listen-http` for the health probes only;
@@ -1801,11 +1840,15 @@ pub fn desired_maintain_deployment(
     if !spec.maintain.enabled {
         return Ok(None);
     }
+    let key_secret =
+        maintain_key_secret_name(spec).ok_or(RenderError::MaintainKeySecretRefMissing)?;
     let mut args = vec![
         "--mode".to_string(),
         "maintain".to_string(),
         "--listen-http".to_string(),
         format!("0.0.0.0:{HTTP_PORT}"),
+        "--maintain-key-file".to_string(),
+        format!("{MAINTAIN_KEY_MOUNT_DIR}/{KEY_FILE_SECRET_KEY}"),
     ];
     args.extend(common_store_args(spec));
     args.extend(tenant_token_args(spec, ctx));
@@ -1876,8 +1919,19 @@ pub fn desired_maintain_deployment(
             MAINTAIN_DEFAULT_MEMORY_REQUEST,
         ),
         "RollingUpdate",
-        &tier_secrets_checksum(spec, ctx, tier_override, None, &[]),
-        Vec::new(),
+        &tier_secrets_checksum(
+            spec,
+            ctx,
+            tier_override,
+            None,
+            ctx.maintain_key_resource_version.as_slice(),
+        ),
+        vec![secret_file_volume(
+            "maintain-key",
+            key_secret,
+            &[KEY_FILE_SECRET_KEY],
+            MAINTAIN_KEY_MOUNT_DIR,
+        )],
         ctx.credentials_sidecar_image.as_deref(),
     )))
 }
@@ -4048,6 +4102,39 @@ pub fn possible_pod_disruption_budget_names(instance: &str) -> Vec<String> {
     .collect()
 }
 
+/// What one reconcile pass does with the maintain Deployment.
+#[derive(Debug, Clone)]
+pub enum MaintainTier {
+    /// `maintain.enabled` is false: the controller deletes the Deployment.
+    Disabled,
+    /// The maintain tier is enabled but cannot render: today only a missing
+    /// `maintain.keySecretRef` ([`RenderError::MaintainKeySecretRefMissing`]),
+    /// or, in the controller, a referenced key Secret that does not exist. The
+    /// controller neither applies nor deletes, so a live maintain Deployment
+    /// keeps running unchanged and none is created.
+    Withheld,
+    /// Apply this Deployment.
+    Apply(Box<Deployment>),
+}
+
+impl MaintainTier {
+    /// The Deployment to apply, if any.
+    pub fn deployment(&self) -> Option<&Deployment> {
+        match self {
+            Self::Apply(deployment) => Some(deployment),
+            Self::Disabled | Self::Withheld => None,
+        }
+    }
+
+    /// The Deployment to apply, by value.
+    pub fn into_deployment(self) -> Option<Deployment> {
+        match self {
+            Self::Apply(deployment) => Some(*deployment),
+            Self::Disabled | Self::Withheld => None,
+        }
+    }
+}
+
 /// Everything one `RavelCluster` reconcile applies, rendered in one place.
 ///
 /// [`crate::controller`] builds this and applies exactly its contents, so a
@@ -4101,9 +4188,8 @@ pub struct DesiredObjects {
     /// carry none of the distributed-query rendering, and the controller
     /// records a `Degraded` condition naming the missing fields.
     pub distributed_query_render_error: Option<RenderError>,
-    /// The maintain Deployment, or `None` when `maintain.enabled` is false (the
-    /// controller deletes it in that case).
-    pub maintain_deployment: Option<Deployment>,
+    /// What this pass does with the maintain Deployment.
+    pub maintain: MaintainTier,
     /// One PodDisruptionBudget per rendered tier (issue #126, deliverable 4).
     /// The controller applies and sweeps these like the Deployments, so a manual
     /// patch does not survive a reconcile.
@@ -4128,7 +4214,8 @@ pub struct DesiredObjects {
 /// [`DesiredObjects::router_render_error`] rather than propagated, so a
 /// misconfigured router degrades only the router and every other tier still
 /// reconciles. Both paths end at a `Degraded` condition; they differ only in
-/// blast radius.
+/// blast radius. A maintain tier enabled without `maintain.keySecretRef` is
+/// captured the same way, as [`MaintainTier::Withheld`].
 pub fn desired_objects(
     spec: &RavelClusterSpec,
     instance: &str,
@@ -4206,7 +4293,12 @@ pub fn desired_objects(
         query_service: desired_query_service(spec, instance),
         query_network_policy,
         distributed_query_render_error,
-        maintain_deployment: desired_maintain_deployment(spec, instance, ctx)?,
+        maintain: match desired_maintain_deployment(spec, instance, ctx) {
+            Ok(Some(deployment)) => MaintainTier::Apply(Box::new(deployment)),
+            Ok(None) => MaintainTier::Disabled,
+            Err(RenderError::MaintainKeySecretRefMissing) => MaintainTier::Withheld,
+            Err(err) => return Err(err),
+        },
         pod_disruption_budgets: desired_pod_disruption_budgets(spec, instance),
         gc_bootstrap,
     })
@@ -4276,6 +4368,9 @@ mod tests {
                 fold: None,
                 resources: None,
                 credentials_secret_ref: None,
+                key_secret_ref: Some(LocalSecretRef {
+                    name: "maintain-keys".to_string(),
+                }),
             },
             // Explicit false: the pre-ADR-1702-task-12 default, kept as the
             // fixture every unrelated render test here builds on. The
@@ -4307,6 +4402,7 @@ mod tests {
             deployment_key_resource_version: None,
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            maintain_key_resource_version: None,
             credentials_sidecar_image: None,
         }
     }
@@ -4756,8 +4852,14 @@ mod tests {
                 .spec
                 .as_ref()
                 .expect("pod spec");
+            // The maintain pod mounts its own key file (ADR-3130), and only
+            // that.
             assert!(
-                pod_spec.volumes.is_none(),
+                pod_spec
+                    .volumes
+                    .iter()
+                    .flatten()
+                    .all(|v| v.name == "maintain-key"),
                 "keyless spec must mount no deployment-key volume"
             );
         }
@@ -4798,7 +4900,13 @@ mod tests {
                 .spec
                 .as_ref()
                 .expect("pod spec");
-            let volumes = pod_spec.volumes.as_ref().expect("volumes");
+            // The maintain pod's own key file (ADR-3130) is covered elsewhere.
+            let volumes: Vec<_> = pod_spec
+                .volumes
+                .iter()
+                .flatten()
+                .filter(|v| v.name != "maintain-key")
+                .collect();
             assert_eq!(volumes.len(), 1);
             let secret = volumes[0].secret.as_ref().expect("secret volume source");
             assert_eq!(secret.secret_name.as_deref(), Some("ravel-deployment-key"));
@@ -4807,7 +4915,12 @@ mod tests {
             assert_eq!(items[0].key, "key");
             assert_eq!(items[0].path, "key");
 
-            let mounts = container_of(dep).volume_mounts.as_ref().expect("mounts");
+            let mounts: Vec<_> = container_of(dep)
+                .volume_mounts
+                .iter()
+                .flatten()
+                .filter(|m| m.name != "maintain-key")
+                .collect();
             assert_eq!(mounts.len(), 1);
             assert_eq!(mounts[0].mount_path, "/etc/ravel/deployment-key");
             assert_eq!(mounts[0].read_only, Some(true));
@@ -6003,6 +6116,7 @@ mod tests {
             deployment_key_resource_version: None,
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            maintain_key_resource_version: None,
             credentials_sidecar_image: None,
         };
 
@@ -6126,6 +6240,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            maintain_key_resource_version: None,
             credentials_sidecar_image: None,
         };
         // Rotate ONLY the gateway credential Secret.
@@ -6138,6 +6253,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            maintain_key_resource_version: None,
             credentials_sidecar_image: None,
         };
 
@@ -6180,6 +6296,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            maintain_key_resource_version: None,
             credentials_sidecar_image: None,
         };
         let shared_after = RenderCtx {
@@ -6192,6 +6309,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            maintain_key_resource_version: None,
             credentials_sidecar_image: None,
         };
         let gb = desired_gateway_deployment(&shared_spec, "prod", &shared_before);
@@ -6526,7 +6644,7 @@ mod tests {
             objects.query_deployment.metadata.name.as_deref(),
             Some("prod-query")
         );
-        assert!(objects.maintain_deployment.is_some());
+        assert!(objects.maintain.deployment().is_some());
 
         // One override is enough. Whichever tier narrowed its credential, the
         // cluster is on the per-role policies and the same ordering holds.
@@ -6575,7 +6693,7 @@ mod tests {
             Some("prod-query"),
             "query still renders when maintain is disabled under per-role credentials"
         );
-        assert!(objects.maintain_deployment.is_none());
+        assert!(matches!(objects.maintain, MaintainTier::Disabled));
 
         // The pass always applies gateway and query, regardless of the live
         // state inputs, and never waits: this is a Degraded state to surface,
@@ -6661,7 +6779,7 @@ mod tests {
             objects.query_deployment.metadata.name.as_deref(),
             Some("prod-query")
         );
-        assert!(objects.maintain_deployment.is_none());
+        assert!(matches!(objects.maintain, MaintainTier::Disabled));
     }
 
     /// An affinity block with everything at its default: what an operator gets
@@ -7040,8 +7158,8 @@ mod tests {
                 "query Service",
             ),
             (
-                serde_json::to_value(&objects.maintain_deployment),
-                serde_json::to_value(&with_affinity.maintain_deployment),
+                serde_json::to_value(objects.maintain.deployment()),
+                serde_json::to_value(with_affinity.maintain.deployment()),
                 "maintain Deployment",
             ),
         ] {
@@ -7250,6 +7368,7 @@ mod tests {
             deployment_key_resource_version: Some("dk-1".to_string()),
             audit_token_key_resource_version: None,
             distributed_query_resource_versions: Vec::new(),
+            maintain_key_resource_version: None,
             credentials_sidecar_image: None,
         };
         let after = RenderCtx {
@@ -7855,7 +7974,7 @@ mod tests {
                 "query still renders when the router render fails"
             );
             assert!(
-                objects.maintain_deployment.is_some(),
+                objects.maintain.deployment().is_some(),
                 "maintain still renders when the router render fails"
             );
         }
@@ -8118,7 +8237,8 @@ mod tests {
             (
                 "maintain",
                 objects
-                    .maintain_deployment
+                    .maintain
+                    .into_deployment()
                     .expect("maintain.enabled renders a maintain Deployment"),
             ),
             (
@@ -8379,7 +8499,10 @@ mod tests {
             ("query", objects.query_deployment),
             (
                 "maintain",
-                objects.maintain_deployment.expect("maintain enabled"),
+                objects
+                    .maintain
+                    .into_deployment()
+                    .expect("maintain enabled"),
             ),
         ] {
             let anti = pod_spec_of(&dep)
@@ -10320,10 +10443,7 @@ mod tests {
             ("query", pod(&objects.query_deployment)),
             (
                 "maintain",
-                pod(objects
-                    .maintain_deployment
-                    .as_ref()
-                    .expect("maintain renders")),
+                pod(objects.maintain.deployment().expect("maintain renders")),
             ),
             (
                 "qualify",
@@ -10568,7 +10688,8 @@ mod tests {
                 .spec
                 .and_then(|s| s.template.spec),
             static_objects
-                .maintain_deployment
+                .maintain
+                .into_deployment()
                 .and_then(|d| d.spec)
                 .and_then(|s| s.template.spec),
             static_job.spec.and_then(|s| s.template.spec),
@@ -10629,7 +10750,8 @@ mod tests {
                 .and_then(|s| s.template.spec),
             objects.query_deployment.spec.and_then(|s| s.template.spec),
             objects
-                .maintain_deployment
+                .maintain
+                .into_deployment()
                 .and_then(|d| d.spec)
                 .and_then(|s| s.template.spec),
             job.spec.and_then(|s| s.template.spec),
@@ -10796,5 +10918,156 @@ mod tests {
             .and_then(|var| var.value)
             .expect("operator.yaml sets RAVEL_CREDENTIALS_SIDECAR_IMAGE");
         assert_eq!(Some(sidecar_image), container.image);
+    }
+
+    /// ADR-3130 decision 5: with `maintain.keySecretRef` set, the maintain pod
+    /// mounts that Secret's `keys` read-only and `--maintain-key-file` points
+    /// at the mounted file. No other tier mounts it or carries the flag.
+    #[test]
+    fn maintain_mounts_the_key_secret_and_passes_the_key_file_flag() {
+        let spec = base_spec();
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("renders")
+            .expect("maintain enabled");
+        assert_eq!(
+            arg_value(&args_of(&m), "--maintain-key-file").as_deref(),
+            Some("/etc/ravel/maintain-key/keys"),
+            "{:?}",
+            args_of(&m)
+        );
+        let volume = pod_spec_of(&m)
+            .volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == "maintain-key")
+            .expect("the maintain key volume");
+        assert_eq!(
+            serde_json::to_value(volume).expect("volume json"),
+            serde_json::json!({"name": "maintain-key", "secret": {
+                "secretName": "maintain-keys", "optional": false,
+                "items": [{"key": "keys", "path": "keys"}]}})
+        );
+        let mount = container_of(&m)
+            .volume_mounts
+            .iter()
+            .flatten()
+            .find(|v| v.name == "maintain-key")
+            .expect("the maintain key mount");
+        assert_eq!(
+            serde_json::to_value(mount).expect("mount json"),
+            serde_json::json!({"name": "maintain-key", "mountPath": "/etc/ravel/maintain-key",
+                "readOnly": true})
+        );
+
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        for dep in [&g, &q] {
+            assert!(!args_of(dep).iter().any(|a| a == "--maintain-key-file"));
+            assert!(
+                !pod_spec_of(dep)
+                    .volumes
+                    .iter()
+                    .flatten()
+                    .any(|v| v.name == "maintain-key")
+            );
+        }
+    }
+
+    /// A rotation of the maintain key Secret moves the maintain pod-template
+    /// checksum, so the maintain pods roll and reread the key file; the gateway
+    /// and query checksums do not move, since neither mounts it.
+    #[test]
+    fn maintain_checksum_follows_the_key_secret_resource_version() {
+        let spec = base_spec();
+        let with = |rv: &str| RenderCtx {
+            maintain_key_resource_version: Some(rv.to_string()),
+            ..ctx()
+        };
+        let maintain = |c: &RenderCtx| {
+            desired_maintain_deployment(&spec, "prod", c)
+                .expect("renders")
+                .expect("maintain enabled")
+        };
+        let before = with("mk-1");
+        let rotated = with("mk-2");
+        assert_ne!(
+            checksum_of(&maintain(&before)),
+            checksum_of(&maintain(&rotated)),
+            "a rotated maintain key Secret moves the maintain checksum"
+        );
+        assert_eq!(
+            checksum_of(&maintain(&before)),
+            checksum_of(&maintain(&with("mk-1"))),
+            "an unchanged resourceVersion keeps the checksum"
+        );
+        assert_eq!(
+            checksum_of(&desired_gateway_deployment(&spec, "prod", &before)),
+            checksum_of(&desired_gateway_deployment(&spec, "prod", &rotated)),
+        );
+        assert_eq!(
+            checksum_of(&desired_query_deployment(&spec, "prod", &before)),
+            checksum_of(&desired_query_deployment(&spec, "prod", &rotated)),
+        );
+    }
+
+    /// An enabled maintain tier without `maintain.keySecretRef` renders no
+    /// maintain pod at all: `desired_maintain_deployment` refuses with an error
+    /// naming the field, and `desired_objects` turns that into
+    /// `MaintainTier::Withheld` (not `Disabled`, which would delete the live
+    /// Deployment) while the gateway and query Deployments still render.
+    #[test]
+    fn maintain_without_key_secret_ref_is_withheld_not_disabled() {
+        let mut spec = base_spec();
+        spec.maintain.key_secret_ref = None;
+        let err = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect_err("no maintain pod renders without the key file");
+        assert_eq!(err, RenderError::MaintainKeySecretRefMissing);
+        assert!(
+            err.to_string().contains("spec.maintain.keySecretRef"),
+            "{err}"
+        );
+
+        let objects = desired_objects(&spec, "prod", "ns", &ctx()).expect("spec renders");
+        assert!(
+            matches!(objects.maintain, MaintainTier::Withheld),
+            "{:?}",
+            objects.maintain
+        );
+        assert_eq!(
+            objects.gateway_deployment.metadata.name.as_deref(),
+            Some("prod-gateway")
+        );
+        assert_eq!(
+            objects.query_deployment.metadata.name.as_deref(),
+            Some("prod-query")
+        );
+    }
+
+    /// A disabled maintain tier is `Disabled` (the controller deletes its
+    /// Deployment) whether or not `maintain.keySecretRef` is set.
+    #[test]
+    fn maintain_disabled_is_disabled_with_and_without_the_key_ref() {
+        for key_ref in [
+            None,
+            Some(LocalSecretRef {
+                name: "maintain-keys".to_string(),
+            }),
+        ] {
+            let mut spec = base_spec();
+            spec.maintain.enabled = false;
+            spec.maintain.key_secret_ref = key_ref.clone();
+            assert_eq!(maintain_key_secret_name(&spec), None, "{key_ref:?}");
+            assert_eq!(
+                desired_maintain_deployment(&spec, "prod", &ctx()),
+                Ok(None),
+                "{key_ref:?}"
+            );
+            let objects = desired_objects(&spec, "prod", "ns", &ctx()).expect("spec renders");
+            assert!(
+                matches!(objects.maintain, MaintainTier::Disabled),
+                "{key_ref:?}: {:?}",
+                objects.maintain
+            );
+        }
     }
 }

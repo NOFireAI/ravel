@@ -610,6 +610,9 @@ Every maintain process in the cluster reads the same file. A record that
 fails a check is skipped and counted in
 `ravel_maintain_worker_record_rejects_total{reason}`; see
 [observability](../observability.md#maintenance-ownership-and-concurrency).
+Under the Kubernetes operator, the file comes from the Secret named by
+`spec.maintain.keySecretRef`; see
+[the Kubernetes guide](../kubernetes.md#maintain-key-file).
 
 Rotate the key in three rolling restarts. Replacing the old key with the new
 one in a single step splits the live set for the length of the rollout:
