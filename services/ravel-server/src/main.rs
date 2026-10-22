@@ -1087,6 +1087,20 @@ mod tests {
         );
     }
 
+    /// ADR-3130 decision 1: the maintain-worker record keys reach `ServerConfig`
+    /// from `--maintain-key-file` and nowhere else. `maintain_worker_registry_auth_e2e`
+    /// runs `parse_maintain_record_keys` into `start`; this pins that `main`'s
+    /// literal is the same call, since the field's type accepts `None` or any
+    /// other key source equally. Needles built with `concat!` so this test's
+    /// own source cannot match itself.
+    #[test]
+    fn server_config_takes_the_maintain_record_keys_from_the_maintain_key_file() {
+        const SRC: &str = include_str!("main.rs");
+        let assigned = concat!("worker_record_", "keys: cli.parse_maintain_record_keys()?,");
+        assert_eq!(SRC.matches(assigned).count(), 1);
+        assert_eq!(SRC.matches(concat!("worker_record_", "keys:")).count(), 1);
+    }
+
     /// the modes that build a query engine (and therefore spawn the alert
     /// evaluator) must not warn; the modes that do not, must warn when rules are
     /// present. With no rules there is nothing to warn about in any mode.
