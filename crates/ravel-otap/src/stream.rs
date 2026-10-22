@@ -78,9 +78,12 @@ impl Default for StreamConfig {
 }
 
 /// A batch that failed to decode. The caller nacks `batch_id`. When the
-/// refused payload was the batch's first, no decoder holds state from the
-/// batch and the caller keeps using the same `StreamState`; when an earlier payload of the batch
-/// already fed its decoder, the `StreamState` is poisoned (see
+/// refused payload was the batch's first and was refused before it reached
+/// its decoder, no decoder holds state from the batch and the caller keeps
+/// using the same `StreamState`. When an earlier payload of the batch already
+/// fed its decoder, or the refused payload reached its decoder and the
+/// decoder was removed ([`BatchError::IpcDecode`],
+/// [`BatchError::InternalPanic`]), the `StreamState` is poisoned (see
 /// [`StreamState::decode`]) and the caller ends the stream.
 #[derive(Debug, Error)]
 pub enum BatchError {
@@ -542,8 +545,9 @@ impl StreamState {
         self
     }
 
-    /// True once a [`StreamError`], or a [`BatchError`] after an earlier
-    /// payload of the same batch fed its decoder, has torn this stream down;
+    /// True once a [`StreamError`], a [`BatchError`] after an earlier payload
+    /// of the same batch fed its decoder, or a [`BatchError`] that removed a
+    /// decoder has torn this stream down;
     /// every future [`decode`](Self::decode) call will return
     /// [`StreamError::Poisoned`].
     pub fn is_poisoned(&self) -> bool {
@@ -559,14 +563,19 @@ impl StreamState {
     /// Decode one `BatchArrowRecords` message into the `RecordBatch`es
     /// carried by its payloads.
     ///
-    /// On a [`BatchError`] for the batch's first payload, no decoder holds
-    /// state from the batch and nothing in `self` that matters for future calls has changed: nack
-    /// `batch_id` and keep using this `StreamState`. On a [`BatchError`] for a
-    /// later payload, the earlier payloads already applied their schema and
-    /// dictionary messages while the refused one and those after it did not,
-    /// so `self` is poisoned as on a [`StreamError`]: every future call
-    /// returns [`StreamError::Poisoned`] and the caller must tear down the
-    /// underlying gRPC stream.
+    /// On a [`BatchError`] raised for the batch's first payload before that
+    /// payload reached its decoder (every variant but [`BatchError::IpcDecode`]
+    /// and [`BatchError::InternalPanic`]), no decoder holds state from the
+    /// batch and nothing in `self` that matters for future calls has changed:
+    /// nack `batch_id` and keep using this `StreamState`. `self` is poisoned
+    /// as on a [`StreamError`] on a [`BatchError`] for a later payload, since
+    /// the earlier payloads already applied their schema and dictionary
+    /// messages while the refused one and those after it did not, and on a
+    /// [`BatchError::IpcDecode`] or [`BatchError::InternalPanic`] for any
+    /// payload, since its decoder is removed with whatever messages it took,
+    /// so the stream's decode state no longer follows what the client sent on
+    /// it. Once poisoned, every future call returns [`StreamError::Poisoned`]
+    /// and the caller must tear down the underlying gRPC stream.
     pub fn decode(&mut self, batch: BatchArrowRecords) -> Result<DecodedBatch, DecodeError> {
         if self.poisoned {
             return Err(StreamError::Poisoned.into());
@@ -661,7 +670,8 @@ impl StreamState {
     /// Appends one payload's batches and records in `fed` that a decoder of
     /// this batch was fed, or returns the error that ends this batch. The
     /// stream is poisoned on a [`StreamError`], and on a [`BatchError`] once
-    /// `fed` is set.
+    /// `fed` is set; [`decode_raw`](Self::decode_raw) poisons it itself when
+    /// it removes a decoder.
     fn collect_payload(
         &mut self,
         decoded: Result<Vec<(ArrowPayloadType, RecordBatch)>, DecodeError>,
@@ -690,7 +700,8 @@ impl StreamState {
     /// Decodes one payload's IPC bytes. `batch_decoded_bytes` is the running
     /// total of decoded bytes the batch's earlier payloads hold; this
     /// payload's are added to it, or the batch is refused, before any of its
-    /// messages reach a decoder.
+    /// messages reach a decoder. An error once they have reached it removes
+    /// that decoder and poisons the stream.
     fn decode_raw(
         &mut self,
         payload_type: ArrowPayloadType,
@@ -772,6 +783,7 @@ impl StreamState {
                 Ok(step) => step,
                 Err(panic_payload) => {
                     self.decoders.remove(&key);
+                    self.poisoned = true;
                     let detail = panic_detail(panic_payload.as_ref());
                     if had_schema_before {
                         return Err(StreamError::Corrupted {
@@ -796,6 +808,7 @@ impl StreamState {
                 Ok(None) => {}
                 Err(e) => {
                     self.decoders.remove(&key);
+                    self.poisoned = true;
                     if had_schema_before {
                         return Err(StreamError::Corrupted {
                             payload_type,
@@ -1177,11 +1190,7 @@ mod tests {
     #[tokio::test]
     async fn the_batch_cap_refuses_before_the_crossing_payload_decodes() {
         let (first, _) = ipc_fragment(1000, "otelarrow", None);
-        let schema_message_len = {
-            let metadata_len = i32::from_le_bytes([first[4], first[5], first[6], first[7]]);
-            8 + metadata_len as usize
-        };
-        let no_schema = first[schema_message_len..].to_vec();
+        let no_schema = without_schema(&first);
         let messages = scan_messages(&no_schema).expect("the metadata scans");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].header, MessageHeader::RecordBatch);
@@ -1216,6 +1225,49 @@ mod tests {
         assert!(state.is_poisoned());
         assert!(matches!(
             state.decode_gated(payloads(&[("c", next)])).await,
+            Err(DecodeError::Stream(StreamError::Poisoned))
+        ));
+    }
+
+    /// `fragment` with its leading schema message cut off, so a decoder
+    /// rejects the record batch left with an IPC decode error.
+    fn without_schema(fragment: &[u8]) -> Vec<u8> {
+        let metadata_len = i32::from_le_bytes([fragment[4], fragment[5], fragment[6], fragment[7]]);
+        fragment[8 + metadata_len as usize..].to_vec()
+    }
+
+    /// An IPC decode error on a batch's first payload comes after the payload
+    /// reached its decoder, which is then removed, so it poisons the stream
+    /// and the next batch on it is refused, on both decode entries.
+    #[tokio::test]
+    async fn an_ipc_decode_error_on_the_first_payload_poisons_the_stream() {
+        let (fragment, _) = ipc_fragment(10, "small", None);
+        let no_schema = without_schema(&fragment);
+        let refused = || payloads(&[("b", no_schema.clone()), ("a", fragment.clone())]);
+        let next = || payloads(&[("a", fragment.clone())]);
+        let key = (ArrowPayloadType::UnivariateMetrics, "b".to_string());
+
+        let mut state = StreamState::new(StreamConfig::default());
+        assert!(matches!(
+            state.decode(refused()),
+            Err(DecodeError::Batch(BatchError::IpcDecode(_)))
+        ));
+        assert!(!state.decoders.contains_key(&key));
+        assert!(state.is_poisoned());
+        assert!(matches!(
+            state.decode(next()),
+            Err(DecodeError::Stream(StreamError::Poisoned))
+        ));
+
+        let mut state = StreamState::new(StreamConfig::default());
+        assert!(matches!(
+            state.decode_gated(refused()).await,
+            Err(DecodeError::Batch(BatchError::IpcDecode(_)))
+        ));
+        assert!(!state.decoders.contains_key(&key));
+        assert!(state.is_poisoned());
+        assert!(matches!(
+            state.decode_gated(next()).await,
             Err(DecodeError::Stream(StreamError::Poisoned))
         ));
     }
