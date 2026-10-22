@@ -100,11 +100,12 @@ use ravel_maintain::worker_set::{
 use ravel_maintain::{
     AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
     DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureAbandon, ErasureRewriteOutcome, LeaseCheck,
-    LegalHoldCheck, MAX_MEMO_SNAPSHOT_BYTES, MaintainError, MemoSnapshotLimits, OrphanPass,
-    PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
-    pending_erasure_requests, read_all_memo_snapshots, scan_and_compact, sweep_alert_retention,
-    sweep_audit_retention, sweep_erasure_requests, sweep_idempotency_markers, sweep_shard,
-    sweep_shard_zoned_with_holds, sweep_unreferenced_catalog_objects, write_memo_snapshot,
+    LegalHoldCheck, MaintainError, MemoSnapshotLimits, MemoSnapshotReject, MemoSnapshotRejects,
+    OrphanPass, PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig, VerifiedSnapshot,
+    WorkerSet, erasure_rewrite_bucket, pending_erasure_requests, read_all_memo_snapshots,
+    scan_and_compact, sweep_alert_retention, sweep_audit_retention, sweep_erasure_requests,
+    sweep_idempotency_markers, sweep_shard, sweep_shard_zoned_with_holds,
+    sweep_unreferenced_catalog_objects, write_memo_snapshot,
 };
 use ravel_object_store::{ObjectStoreBackend, PutOptions, StoreError};
 use ravel_proto::commit::v1::{ErasureCompletion, ErasureDeferralCause, ErasureRequest};
@@ -1865,29 +1866,18 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                     // units this process now owns. Fail-open: a read fault logs and
                     // degrades to a cold start, never blocks the loop.
                     if reseed {
-                        match read_all_memo_snapshots(
+                        match reseed_memo(
                             store.as_ref(),
+                            membership.keys(),
                             MemoSnapshotLimits::DEFAULT,
+                            &mut memo,
+                            || clock.now_ns(),
+                            &worker,
+                            &live_set,
                         )
                         .await
                         {
-                            Ok(read) => {
-                                if read.skipped_oversize > 0 {
-                                    tracing::debug!(
-                                        skipped = read.skipped_oversize,
-                                        cap_bytes = MAX_MEMO_SNAPSHOT_BYTES,
-                                        "maintenance: skipped memo snapshots over the size cap \
-                                         (cold start for their units)"
-                                    );
-                                }
-                                let now = clock.now_ns();
-                                let (units, buckets) = seed_memo_from_snapshots(
-                                    &mut memo,
-                                    &read.snapshots,
-                                    now,
-                                    &worker,
-                                    &live_set,
-                                );
+                            Ok(ReseedOutcome { units, buckets, .. }) => {
                                 ownership.add_memo_warm_start_units(units as u64);
                                 if buckets > 0 {
                                     tracing::info!(
@@ -1938,6 +1928,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                     persist_memo_snapshot(
                         store.as_ref(),
                         &worker,
+                        membership.keys(),
                         &memo,
                         &mut last_memo_body,
                         clock.now_ns(),
@@ -4071,27 +4062,98 @@ fn membership_changed(previous: &[Uuid], computed: &[Uuid]) -> bool {
     previous != computed
 }
 
-/// Seed `memo` from durable memo snapshots (ADR-0065 decision 3's warm start
-/// and handoff). Each snapshot is gated on ownership -- only units this process
-/// owns under `live_set` are seeded, so a departing worker's units are picked up
-/// by whichever survivor the rendezvous hash now assigns them to -- and on
-/// staleness ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]). Merging several snapshots
-/// keeps the freshest verdict per bucket. An undecodable snapshot is skipped
-/// with a debug line (fail-open: cold start for whatever it would have seeded),
-/// never a panic. Returns `(seeded_units, seeded_buckets)` summed across the
-/// snapshots, for the caller's log line.
+/// What one [`reseed_memo`] call did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ReseedOutcome {
+    /// Owned units seeded, summed across the verified snapshots.
+    units: usize,
+    /// Terminal bucket entries seeded, summed across the verified snapshots.
+    buckets: usize,
+    /// Snapshot objects rejected before decoding, by reason.
+    rejects: MemoSnapshotRejects,
+}
+
+/// Read every memo snapshot under `keys` and seed `memo` from the verified ones
+/// ([`read_all_memo_snapshots`], then [`seed_memo_from_snapshots`]), with
+/// `now_ns` read after the store reads. Rejected objects are logged once per
+/// call with their per-reason counts: at warn when any was oversize, an
+/// unknown tag or a bad MAC (each means a writer this process does not
+/// recognise, or one past the cap), at debug when the only rejects are
+/// non-UUID keys or malformed objects. Only a failed LIST or GET is an `Err`.
+async fn reseed_memo(
+    store: &dyn ObjectStoreBackend,
+    keys: &MaintainRecordKeys,
+    limits: MemoSnapshotLimits,
+    memo: &mut MaintainMemo,
+    now_ns: impl FnOnce() -> i64,
+    worker: &WorkerSet,
+    live_set: &[Uuid],
+) -> Result<ReseedOutcome, StoreError> {
+    let read = read_all_memo_snapshots(store, keys, limits).await?;
+    let rejects = read.rejects;
+    log_memo_snapshot_rejects(&rejects, limits);
+    let (units, buckets) =
+        seed_memo_from_snapshots(memo, &read.snapshots, limits, now_ns(), worker, live_set);
+    Ok(ReseedOutcome {
+        units,
+        buckets,
+        rejects,
+    })
+}
+
+/// The one log line [`reseed_memo`] emits for its rejected snapshot objects.
+fn log_memo_snapshot_rejects(rejects: &MemoSnapshotRejects, limits: MemoSnapshotLimits) {
+    if rejects.total() == 0 {
+        return;
+    }
+    let count = |reason| rejects.get(reason);
+    let suspicious = count(MemoSnapshotReject::Oversize)
+        + count(MemoSnapshotReject::UnknownTag)
+        + count(MemoSnapshotReject::BadMac);
+    if suspicious > 0 {
+        tracing::warn!(
+            bad_mac = count(MemoSnapshotReject::BadMac),
+            unknown_tag = count(MemoSnapshotReject::UnknownTag),
+            oversize = count(MemoSnapshotReject::Oversize),
+            malformed = count(MemoSnapshotReject::Malformed),
+            non_uuid_key = count(MemoSnapshotReject::NonUuidKey),
+            cap_bytes = limits.max_bytes,
+            "maintenance: rejected memo snapshots that did not verify under the maintain \
+             key file or exceed the size cap; cold start for their units (ADR-3130)"
+        );
+    } else {
+        tracing::debug!(
+            malformed = count(MemoSnapshotReject::Malformed),
+            non_uuid_key = count(MemoSnapshotReject::NonUuidKey),
+            "maintenance: rejected malformed memo snapshot objects; cold start for their units"
+        );
+    }
+}
+
+/// Seed `memo` from verified durable memo snapshots (ADR-0065 decision 3's
+/// warm start and handoff). Each snapshot is gated on ownership -- only units
+/// this process owns under `live_set` are seeded, so a departing worker's units
+/// are picked up by whichever survivor the rendezvous hash now assigns them to
+/// -- and on staleness ([`DEFAULT_MEMO_SNAPSHOT_STALENESS_NS`]), and decoded
+/// under `limits`. Merging several snapshots keeps the freshest verdict per
+/// bucket. An undecodable snapshot is skipped with a debug line (fail-open:
+/// cold start for whatever it would have seeded), never a panic. Returns
+/// `(seeded_units, seeded_buckets)` summed across the snapshots, for the
+/// caller's log line.
 fn seed_memo_from_snapshots(
     memo: &mut MaintainMemo,
-    snapshots: &[Vec<u8>],
+    snapshots: &[VerifiedSnapshot],
+    limits: MemoSnapshotLimits,
     now_ns: i64,
     worker: &WorkerSet,
     live_set: &[Uuid],
 ) -> (usize, usize) {
     let mut units = 0usize;
     let mut buckets = 0usize;
-    for bytes in snapshots {
+    for snapshot in snapshots {
         match memo.seed_from_snapshot(
-            bytes,
+            snapshot,
+            limits,
             now_ns,
             DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
             |tenant, signal, shard| worker.owns_unit(live_set, &tenant, signal, shard),
@@ -4102,6 +4164,7 @@ fn seed_memo_from_snapshots(
             }
             Err(err) => tracing::debug!(
                 error = %err,
+                process_id = %snapshot.process_id(),
                 "maintenance: skipping an undecodable memo snapshot (cold start for its units)"
             ),
         }
@@ -4117,6 +4180,10 @@ fn seed_memo_from_snapshots(
 /// and `last_body` left unchanged so the next cycle retries (fail-open). Returns
 /// whether a write happened (for tests and callers that count writes).
 ///
+/// The frame carries a MAC minted under `keys` for this worker's process id
+/// (ADR-3130, memo snapshot amendment), so a reader holding the same key file
+/// verifies it under the key it was written to.
+///
 /// A snapshot over `limits.max_bytes` framed or `limits.max_entries` expanded
 /// is not written, since every reader under the same limits would skip or
 /// reject it (issue #3199); production passes [`MemoSnapshotLimits::DEFAULT`].
@@ -4126,6 +4193,7 @@ fn seed_memo_from_snapshots(
 async fn persist_memo_snapshot(
     store: &dyn ObjectStoreBackend,
     worker: &WorkerSet,
+    keys: &MaintainRecordKeys,
     memo: &MaintainMemo,
     last_body: &mut Option<Vec<u8>>,
     now_ns: i64,
@@ -4135,7 +4203,7 @@ async fn persist_memo_snapshot(
     if last_body.as_deref() == Some(body.as_slice()) {
         return false;
     }
-    let bytes = MaintainMemo::snapshot_bytes_from_body(&body, now_ns);
+    let bytes = MaintainMemo::snapshot_bytes_from_body(&body, now_ns, &worker.process_id(), keys);
     let entries = memo.snapshot_entry_count();
     if !limits.admits_write(bytes.len(), entries) {
         tracing::warn!(
@@ -8849,6 +8917,7 @@ mod tests {
             persist_memo_snapshot(
                 &store,
                 &worker,
+                test_membership().keys(),
                 &memo,
                 &mut last_body,
                 now,
@@ -8867,6 +8936,7 @@ mod tests {
             !persist_memo_snapshot(
                 &store,
                 &worker,
+                test_membership().keys(),
                 &memo,
                 &mut last_body,
                 now + 1_000_000,
@@ -8891,6 +8961,7 @@ mod tests {
             persist_memo_snapshot(
                 &store,
                 &worker,
+                test_membership().keys(),
                 &emptied,
                 &mut last_body,
                 now + 2_000_000,
@@ -8956,6 +9027,7 @@ mod tests {
             persist_memo_snapshot(
                 &store,
                 &worker_a,
+                test_membership().keys(),
                 &memo_a,
                 &mut last_body,
                 now,
@@ -8968,15 +9040,25 @@ mod tests {
         // Worker B (a different process id) reads the snapshots and warm-starts.
         let worker_b = WorkerSet::with_defaults(0);
         let live_b = worker_b.solo_live_set();
-        let snapshots = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
-            .await
-            .expect("read snapshots")
-            .snapshots;
+        let snapshots = read_all_memo_snapshots(
+            &store,
+            test_membership().keys(),
+            MemoSnapshotLimits::DEFAULT,
+        )
+        .await
+        .expect("read snapshots")
+        .snapshots;
         assert_eq!(snapshots.len(), 1, "A's one snapshot is on the store");
 
         let mut memo_b = MaintainMemo::with_default_interval();
-        let (b_units, b_buckets) =
-            seed_memo_from_snapshots(&mut memo_b, &snapshots, now, &worker_b, &live_b);
+        let (b_units, b_buckets) = seed_memo_from_snapshots(
+            &mut memo_b,
+            &snapshots,
+            MemoSnapshotLimits::DEFAULT,
+            now,
+            &worker_b,
+            &live_b,
+        );
         assert_eq!(b_units, 1, "B seeds the one unit it owns from A's snapshot");
         assert_eq!(b_buckets, 1);
         assert_eq!(memo_b.len(), 1, "B's memo warm-started from the store");
@@ -9148,6 +9230,7 @@ mod tests {
             persist_memo_snapshot(
                 &store,
                 &a,
+                test_membership().keys(),
                 &memo_a,
                 &mut last_body,
                 snap_now,
@@ -9168,16 +9251,26 @@ mod tests {
             "A's departure ({{A,B}} -> {{B}}) must trigger a reseed"
         );
 
-        let snapshots = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
-            .await
-            .expect("read snapshots")
-            .snapshots;
+        let snapshots = read_all_memo_snapshots(
+            &store,
+            test_membership().keys(),
+            MemoSnapshotLimits::DEFAULT,
+        )
+        .await
+        .expect("read snapshots")
+        .snapshots;
 
         // Counter-case: B's PRE-handoff view {A,B} does not own the shard, so
         // seeding filters it out. Proves the ownership filter is not vacuous.
         let mut memo_b_before = MaintainMemo::with_default_interval();
-        let (units_before, buckets_before) =
-            seed_memo_from_snapshots(&mut memo_b_before, &snapshots, snap_now, &b, &live_ab);
+        let (units_before, buckets_before) = seed_memo_from_snapshots(
+            &mut memo_b_before,
+            &snapshots,
+            MemoSnapshotLimits::DEFAULT,
+            snap_now,
+            &b,
+            &live_ab,
+        );
         assert_eq!(
             (units_before, buckets_before),
             (0, 0),
@@ -9188,8 +9281,14 @@ mod tests {
         // Post-handoff view {B}: B now owns the shard and seeds it from A's
         // snapshot, then skips it on its own tick (no cold rescan).
         let mut memo_b = MaintainMemo::with_default_interval();
-        let (units, buckets) =
-            seed_memo_from_snapshots(&mut memo_b, &snapshots, snap_now, &b, &live_b);
+        let (units, buckets) = seed_memo_from_snapshots(
+            &mut memo_b,
+            &snapshots,
+            MemoSnapshotLimits::DEFAULT,
+            snap_now,
+            &b,
+            &live_b,
+        );
         assert_eq!(units, 1, "B seeds the one unit it took over");
         assert_eq!(buckets, 1);
 
@@ -13744,8 +13843,12 @@ mod memo_snapshot_cap_tests {
         max_entries: 40,
     };
 
+    /// The process id every snapshot in these tests is minted for.
+    const PID: Uuid = Uuid::from_u128(0x5eed);
+
     /// A framed snapshot of `(shard, hours)` units, each one Compacted frontier
-    /// over hours `0..hours`, laid out as `MaintainMemo::snapshot_body` does.
+    /// over hours `0..hours`, laid out as `MaintainMemo::snapshot_body` does
+    /// and MAC'd for [`PID`] under [`test_membership`]'s key.
     fn frontier_snapshot(units: &[(u32, u32)]) -> Vec<u8> {
         let tenant = TenantId::new("acme").hash();
         let mut body = Vec::new();
@@ -13761,7 +13864,11 @@ mod memo_snapshot_cap_tests {
             body.extend_from_slice(&NOW_NS.to_le_bytes());
             body.extend_from_slice(&0u32.to_le_bytes()); // no exceptions
         }
-        MaintainMemo::snapshot_bytes_from_body(&body, NOW_NS)
+        MaintainMemo::snapshot_bytes_from_body(&body, NOW_NS, &PID, test_membership().keys())
+    }
+
+    fn verified(bytes: Vec<u8>) -> VerifiedSnapshot {
+        VerifiedSnapshot::verify(PID, bytes, test_membership().keys()).expect("verifies")
     }
 
     /// A memo seeded from one snapshot per entry of `snapshots`.
@@ -13769,7 +13876,8 @@ mod memo_snapshot_cap_tests {
         let mut memo = MaintainMemo::with_default_interval();
         for bytes in snapshots {
             memo.seed_from_snapshot(
-                bytes,
+                &verified(bytes.clone()),
+                MemoSnapshotLimits::DEFAULT,
                 NOW_NS,
                 DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
                 |_, _, _| true,
@@ -13830,6 +13938,7 @@ mod memo_snapshot_cap_tests {
             let wrote = persist_memo_snapshot(
                 &store,
                 &worker,
+                test_membership().keys(),
                 memo,
                 &mut last_body,
                 NOW_NS + i as i64,
@@ -13846,7 +13955,9 @@ mod memo_snapshot_cap_tests {
     }
 
     /// A memo of exactly the entry cap is written, read back under the same
-    /// limits, and seeds a fresh memo with every entry.
+    /// limits, and seeds a fresh memo with every entry through the server's
+    /// seed path under those limits; a snapshot one entry over them seeds
+    /// nothing there.
     #[tokio::test]
     async fn memo_at_the_entry_cap_is_written_and_seeds_back() {
         let cap = SMALL.max_entries as u32;
@@ -13855,24 +13966,46 @@ mod memo_snapshot_cap_tests {
 
         let store = InstrumentedStore::new(MemoryStore::new());
         let worker = WorkerSet::with_defaults(0);
+        let keys = test_membership().keys().clone();
         let mut last_body = None;
-        assert!(persist_memo_snapshot(&store, &worker, &memo, &mut last_body, NOW_NS, SMALL).await);
+        assert!(
+            persist_memo_snapshot(&store, &worker, &keys, &memo, &mut last_body, NOW_NS, SMALL)
+                .await
+        );
         assert_eq!(store.metrics().snapshot().put.calls, 1);
 
-        let read = read_all_memo_snapshots(&store, SMALL).await.expect("read");
-        assert_eq!(read.skipped_oversize, 0);
+        let read = read_all_memo_snapshots(&store, &keys, SMALL)
+            .await
+            .expect("read");
+        assert_eq!(read.rejects.total(), 0);
         assert_eq!(read.snapshots.len(), 1);
         let mut successor = MaintainMemo::with_default_interval();
-        let stats = successor
-            .seed_from_snapshot(
-                &read.snapshots[0],
-                NOW_NS,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                |_, _, _| true,
-            )
-            .expect("an at-cap snapshot decodes");
-        assert_eq!(stats.seeded_buckets, SMALL.max_entries);
+        let (units, buckets) = seed_memo_from_snapshots(
+            &mut successor,
+            &read.snapshots,
+            SMALL,
+            NOW_NS,
+            &worker,
+            &worker.solo_live_set(),
+        );
+        assert_eq!((units, buckets), (1, SMALL.max_entries));
         assert_eq!(successor.len(), SMALL.max_entries);
+
+        let over = verified(frontier_snapshot(&[(0, cap + 1)]));
+        let mut refused = MaintainMemo::with_default_interval();
+        assert_eq!(
+            seed_memo_from_snapshots(
+                &mut refused,
+                &[over],
+                SMALL,
+                NOW_NS,
+                &worker,
+                &worker.solo_live_set(),
+            ),
+            (0, 0),
+            "a snapshot past the entry cap the seed is given decodes to nothing"
+        );
+        assert!(refused.is_empty());
     }
 
     /// One entry over the cap is not written and warns once; the identical
@@ -13893,16 +14026,23 @@ mod memo_snapshot_cap_tests {
     }
 
     /// The byte cap is checked on the framed snapshot independently of the
-    /// entry cap: seven one-hour units at 43 bytes each frame to 314 bytes,
-    /// which is written under a byte cap of 314 and not written, with one
-    /// warning, under 313.
+    /// entry cap: seven one-hour units at 43 bytes each frame to 346 bytes
+    /// with the 32-byte MAC, which is written under a byte cap of 346 and not
+    /// written, with one warning, under 345.
     #[tokio::test]
     async fn memo_over_the_byte_cap_is_not_written() {
         let units: Vec<(u32, u32)> = (0..7).map(|shard| (shard, 1)).collect();
         let memo = seeded_memo(&[frontier_snapshot(&units)]);
         assert_eq!(memo.snapshot_entry_count(), 7);
-        let framed = MaintainMemo::snapshot_bytes_from_body(&memo.snapshot_body(), NOW_NS).len();
-        assert_eq!(framed, 1 + 8 + 4 + 7 * 43);
+        let framed = MaintainMemo::snapshot_bytes_from_body(
+            &memo.snapshot_body(),
+            NOW_NS,
+            &PID,
+            test_membership().keys(),
+        )
+        .len();
+        assert_eq!(framed, 1 + 8 + 4 + 7 * 43 + 32);
+        assert_eq!(framed, 346);
 
         let at = MemoSnapshotLimits {
             max_bytes: framed as u64,
@@ -13921,6 +14061,352 @@ mod memo_snapshot_cap_tests {
             persist_twice(&memo, under).await,
             [(false, 0, 1), (false, 0, 0)],
             "no PUT on either tick, one warning on the first only"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod memo_snapshot_auth_tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+    use ravel_maintain::scan::TerminalState;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_object_store::{PutMode, PutOptions};
+    use ravel_types::TenantId;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    use super::*;
+
+    const NOW_NS: i64 = 1_000_000_000_000;
+    const HOURS: u32 = 3;
+
+    fn tenant() -> TenantHash {
+        TenantId::new("acme").hash()
+    }
+
+    /// A snapshot body holding a fresh Compacted verdict for hours
+    /// `0..HOURS` of `(acme, metrics, shard 0)`: seeded, it would make the
+    /// owner skip those buckets.
+    fn suppressing_body() -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_le_bytes());
+        body.extend_from_slice(&tenant().0);
+        body.push(0); // Signal::Metrics
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.push(1); // frontier present
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&(HOURS - 1).to_le_bytes());
+        body.push(0); // TerminalState::Compacted
+        body.extend_from_slice(&NOW_NS.to_le_bytes());
+        body.extend_from_slice(&0u32.to_le_bytes()); // no exceptions
+        body
+    }
+
+    fn other_keys() -> MaintainRecordKeys {
+        MaintainRecordKeys::from_file_keys(&[[0x77; 32]]).expect("one key")
+    }
+
+    async fn put_raw(store: &MemoryStore, key: &str, bytes: Vec<u8>) {
+        store
+            .put(
+                key,
+                bytes.into(),
+                PutOptions {
+                    mode: PutMode::Overwrite,
+                    checksum: None,
+                },
+            )
+            .await
+            .expect("put");
+    }
+
+    /// Reseed a cold memo owning every unit from whatever `store` holds,
+    /// under [`test_membership`]'s key.
+    async fn reseed(
+        store: &MemoryStore,
+        limits: MemoSnapshotLimits,
+    ) -> (MaintainMemo, ReseedOutcome) {
+        let worker = WorkerSet::with_defaults(0);
+        let mut memo = MaintainMemo::with_default_interval();
+        let outcome = reseed_memo(
+            store,
+            test_membership().keys(),
+            limits,
+            &mut memo,
+            || NOW_NS,
+            &worker,
+            &worker.solo_live_set(),
+        )
+        .await
+        .expect("reseed");
+        (memo, outcome)
+    }
+
+    fn suppressed(memo: &MaintainMemo) -> Vec<Option<TerminalState>> {
+        (0..HOURS)
+            .map(|hour| memo.terminal_state(tenant(), Signal::Metrics, 0, hour))
+            .collect()
+    }
+
+    fn only(reason: MemoSnapshotReject) -> MemoSnapshotRejects {
+        let mut rejects = MemoSnapshotRejects::default();
+        rejects.record(reason);
+        rejects
+    }
+
+    /// The control for the two forgery tests: the same body under the
+    /// deployment's own key seeds a suppressing verdict for every hour, so the
+    /// empty memo below is the MAC check's doing, not staleness or ownership.
+    #[tokio::test]
+    async fn honest_suppressing_snapshot_seeds_its_verdicts() {
+        let store = MemoryStore::new();
+        let writer = Uuid::from_u128(0xC0FFEE);
+        let bytes = MaintainMemo::snapshot_bytes_from_body(
+            &suppressing_body(),
+            NOW_NS,
+            &writer,
+            test_membership().keys(),
+        );
+        write_memo_snapshot(&store, &writer, bytes)
+            .await
+            .expect("write");
+        let (memo, outcome) = reseed(&store, MemoSnapshotLimits::DEFAULT).await;
+        assert_eq!(suppressed(&memo), vec![Some(TerminalState::Compacted); 3]);
+        assert_eq!((outcome.units, outcome.buckets), (1, 3));
+        assert_eq!(outcome.rejects.total(), 0);
+    }
+
+    /// Issue #3155: a principal with the `sys/maintain/*` write grant but not
+    /// the key file writes an honest-looking tag-2 frame MAC'd under a
+    /// different file key. The owner's reseed seeds no verdict for the
+    /// bucket and counts exactly one bad-MAC reject.
+    #[tokio::test]
+    async fn forged_frame_under_another_key_seeds_nothing() {
+        let store = MemoryStore::new();
+        let forger = Uuid::from_u128(0xBAD);
+        let bytes = MaintainMemo::snapshot_bytes_from_body(
+            &suppressing_body(),
+            NOW_NS,
+            &forger,
+            &other_keys(),
+        );
+        write_memo_snapshot(&store, &forger, bytes)
+            .await
+            .expect("write");
+        let (memo, outcome) = reseed(&store, MemoSnapshotLimits::DEFAULT).await;
+        assert_eq!(suppressed(&memo), vec![None; 3]);
+        assert!(memo.is_empty());
+        assert_eq!(outcome.rejects, only(MemoSnapshotReject::BadMac));
+        assert_eq!(outcome.rejects.get(MemoSnapshotReject::BadMac), 1);
+    }
+
+    /// Issue #3155: a tag-1 frame of the pre-MAC format (`[1][ts][body]`, as
+    /// the #3199 writer produced) is never decoded: the reseed seeds no
+    /// verdict and counts exactly one unknown-tag reject.
+    #[tokio::test]
+    async fn tag_one_frame_seeds_nothing() {
+        let store = MemoryStore::new();
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&NOW_NS.to_le_bytes());
+        bytes.extend_from_slice(&suppressing_body());
+        write_memo_snapshot(&store, &Uuid::from_u128(0xBAD), bytes)
+            .await
+            .expect("write");
+        let (memo, outcome) = reseed(&store, MemoSnapshotLimits::DEFAULT).await;
+        assert_eq!(suppressed(&memo), vec![None; 3]);
+        assert!(memo.is_empty());
+        assert_eq!(outcome.rejects, only(MemoSnapshotReject::UnknownTag));
+        assert_eq!(outcome.rejects.get(MemoSnapshotReject::UnknownTag), 1);
+    }
+
+    /// A snapshot `persist_memo_snapshot` wrote seeds back in a successor
+    /// (another process id) holding the same key file, and seeds nothing in
+    /// one holding a different key file.
+    #[tokio::test]
+    async fn persisted_snapshot_seeds_a_successor_holding_the_same_key() {
+        let writer = WorkerSet::with_defaults(0);
+        let mut source = MaintainMemo::with_default_interval();
+        let honest = VerifiedSnapshot::verify(
+            writer.process_id(),
+            MaintainMemo::snapshot_bytes_from_body(
+                &suppressing_body(),
+                NOW_NS,
+                &writer.process_id(),
+                test_membership().keys(),
+            ),
+            test_membership().keys(),
+        )
+        .expect("verifies");
+        source
+            .seed_from_snapshot(
+                &honest,
+                MemoSnapshotLimits::DEFAULT,
+                NOW_NS,
+                0,
+                |_, _, _| true,
+            )
+            .expect("seed");
+        let store = MemoryStore::new();
+        let mut last_body = None;
+        assert!(
+            persist_memo_snapshot(
+                &store,
+                &writer,
+                test_membership().keys(),
+                &source,
+                &mut last_body,
+                NOW_NS,
+                MemoSnapshotLimits::DEFAULT,
+            )
+            .await
+        );
+
+        let (memo, outcome) = reseed(&store, MemoSnapshotLimits::DEFAULT).await;
+        assert_eq!(suppressed(&memo), vec![Some(TerminalState::Compacted); 3]);
+        assert_eq!(outcome.rejects.total(), 0);
+
+        let successor = WorkerSet::with_defaults(0);
+        let mut other = MaintainMemo::with_default_interval();
+        let outcome = reseed_memo(
+            &store,
+            &other_keys(),
+            MemoSnapshotLimits::DEFAULT,
+            &mut other,
+            || NOW_NS,
+            &successor,
+            &successor.solo_live_set(),
+        )
+        .await
+        .expect("reseed");
+        assert!(other.is_empty());
+        assert_eq!(outcome.rejects, only(MemoSnapshotReject::BadMac));
+    }
+
+    /// Collects the fields of every WARN and DEBUG event naming a rejected
+    /// memo snapshot.
+    struct RejectEvents(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RejectEvents {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write as _;
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+            let mut visitor = Visitor::default();
+            event.record(&mut visitor);
+            if visitor.0.contains("rejected") && visitor.0.contains("memo snapshot") {
+                self.0.lock().push((*event.metadata().level(), visitor.0));
+            }
+        }
+    }
+
+    async fn reseed_logging(
+        store: &MemoryStore,
+        limits: MemoSnapshotLimits,
+    ) -> (ReseedOutcome, Vec<(tracing::Level, String)>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(RejectEvents(events.clone()));
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (_, outcome) = reseed(store, limits).await;
+        let events = events.lock().clone();
+        (outcome, events)
+    }
+
+    /// One reseed over a bad-MAC, an unknown-tag, an oversize, a malformed and
+    /// a non-UUID-key object logs exactly one WARN carrying every per-reason
+    /// count. A reseed whose only rejects are malformed or non-UUID keys logs
+    /// no WARN.
+    #[tokio::test]
+    async fn reseed_warns_once_with_per_reason_counts() {
+        let limits = MemoSnapshotLimits {
+            max_bytes: 256,
+            ..MemoSnapshotLimits::DEFAULT
+        };
+        let store = MemoryStore::new();
+        let forger = Uuid::from_u128(1);
+        write_memo_snapshot(
+            &store,
+            &forger,
+            MaintainMemo::snapshot_bytes_from_body(
+                &suppressing_body(),
+                NOW_NS,
+                &forger,
+                &other_keys(),
+            ),
+        )
+        .await
+        .expect("write");
+        let mut tag_one = vec![1u8];
+        tag_one.extend_from_slice(&NOW_NS.to_le_bytes());
+        tag_one.extend_from_slice(&suppressing_body());
+        write_memo_snapshot(&store, &Uuid::from_u128(2), tag_one)
+            .await
+            .expect("write");
+        write_memo_snapshot(&store, &Uuid::from_u128(3), vec![2u8; 257])
+            .await
+            .expect("write");
+        write_memo_snapshot(&store, &Uuid::from_u128(4), vec![2u8; 10])
+            .await
+            .expect("write");
+        put_raw(
+            &store,
+            &format!("{}stray", ravel_maintain::MEMO_PREFIX),
+            vec![2u8; 50],
+        )
+        .await;
+
+        let (outcome, events) = reseed_logging(&store, limits).await;
+        assert_eq!(outcome.rejects.total(), 5);
+        for reason in MemoSnapshotReject::ALL {
+            assert_eq!(outcome.rejects.get(reason), 1, "{}", reason.reason());
+        }
+        let warns: Vec<&String> = events
+            .iter()
+            .filter(|(level, _)| *level == tracing::Level::WARN)
+            .map(|(_, fields)| fields)
+            .collect();
+        assert_eq!(warns.len(), 1, "one warn per reseed: {events:?}");
+        for field in [
+            "bad_mac=1",
+            "unknown_tag=1",
+            "oversize=1",
+            "malformed=1",
+            "non_uuid_key=1",
+        ] {
+            assert!(warns[0].contains(field), "{field} in {}", warns[0]);
+        }
+
+        let quiet = MemoryStore::new();
+        write_memo_snapshot(&quiet, &Uuid::from_u128(4), vec![2u8; 10])
+            .await
+            .expect("write");
+        put_raw(
+            &quiet,
+            &format!("{}stray", ravel_maintain::MEMO_PREFIX),
+            vec![2u8; 50],
+        )
+        .await;
+        let (outcome, events) = reseed_logging(&quiet, limits).await;
+        assert_eq!(outcome.rejects.total(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|(level, _)| *level != tracing::Level::WARN),
+            "malformed and non-UUID keys log below warn: {events:?}"
         );
     }
 }

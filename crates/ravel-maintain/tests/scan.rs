@@ -13,9 +13,11 @@ use ravel_maintain::scan::{
     DEFAULT_MEMO_REVERIFY_INTERVAL_NS, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MaintainMemo,
     ScanReport, TerminalState, Zone, classify_zone, scan_and_maintain_with_memo,
 };
+use ravel_maintain::worker_set::MaintainRecordKeys;
 use ravel_maintain::{
-    Bucket, MemoSnapshotLimits, VerifiedSnapshot, CompactorConfig, FixedClock, MaintainError, NoLeases, RetentionConfig, RetentionPolicy,
-    buckets_held_out_of_window_total, scan_and_compact,
+    Bucket, CompactorConfig, FixedClock, MaintainError, MemoSnapshotLimits, NoLeases,
+    RetentionConfig, RetentionPolicy, VerifiedSnapshot, buckets_held_out_of_window_total,
+    scan_and_compact,
 };
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
 use ravel_object_store::memory::MemoryStore;
@@ -23,7 +25,6 @@ use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_rspan::SpanSegError;
 use ravel_segment::SegmentError;
 use ravel_types::Signal;
-use ravel_maintain::worker_set::MaintainRecordKeys;
 use uuid::Uuid;
 
 /// `memo`'s snapshot at `snapshot_unix_ns`, MAC'd and verified as one

@@ -344,7 +344,8 @@ mod tests {
     async fn read_all_skips_an_object_over_the_size_cap() {
         let store = InstrumentedStore::new(MemoryStore::new());
         let cap = usize::try_from(SMALL.max_bytes).expect("cap fits usize");
-        let (over_id, at_id, small_id) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
+        let (over_id, at_id, small_id) =
+            (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
         let at_cap = frame_of_len(at_id, cap);
         let small = frame(small_id, &empty_body(), 3);
         write_memo_snapshot(&store, &over_id, frame_of_len(over_id, cap + 1))

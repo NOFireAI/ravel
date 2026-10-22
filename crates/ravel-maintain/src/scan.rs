@@ -2208,13 +2208,14 @@ mod memo_snapshot_tests {
         let memo = MaintainMemo::with_default_interval();
         let bytes = encode(&memo, 1_000);
         let mut seeded = MaintainMemo::with_default_interval();
-        let stats = seed(&mut seeded, 
-                &bytes,
-                1_000,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                |_, _, _| true,
-            )
-            .expect("decode empty");
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            1_000,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode empty");
         assert!(!stats.stale);
         assert_eq!(stats.seeded_buckets, 0);
         assert!(seeded.is_empty());
@@ -2254,13 +2255,14 @@ mod memo_snapshot_tests {
 
         let bytes = encode(&memo, 9_000);
         let mut seeded = MaintainMemo::with_default_interval();
-        let stats = seed(&mut seeded, 
-                &bytes,
-                9_000,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                |_, _, _| true,
-            )
-            .expect("decode");
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            9_000,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
         assert!(!stats.stale);
         assert_eq!(stats.seeded_units, 2);
         assert_eq!(seeded.len(), want_len);
@@ -2322,26 +2324,28 @@ mod memo_snapshot_tests {
         // Read one nanosecond past the staleness bound: excluded.
         let now = DEFAULT_MEMO_SNAPSHOT_STALENESS_NS + 1;
         let mut seeded = MaintainMemo::with_default_interval();
-        let stats = seed(&mut seeded, 
-                &bytes,
-                now,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                |_, _, _| true,
-            )
-            .expect("decode");
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            now,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
         assert!(stats.stale, "a snapshot past the bound is ignored");
         assert_eq!(stats.seeded_buckets, 0);
         assert!(seeded.is_empty());
 
         // Exactly at the bound: still trusted (inclusive), seeded.
         let mut seeded2 = MaintainMemo::with_default_interval();
-        let stats2 = seed(&mut seeded2, 
-                &bytes,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                |_, _, _| true,
-            )
-            .expect("decode");
+        let stats2 = seed(
+            &mut seeded2,
+            &bytes,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
         assert!(!stats2.stale);
         assert_eq!(stats2.seeded_buckets, 1);
     }
@@ -2359,10 +2363,14 @@ mod memo_snapshot_tests {
         );
         let bytes = encode(&memo, 10 * NS_PER_HOUR);
         let mut seeded = MaintainMemo::with_default_interval();
-        let stats = seed(&mut seeded, &bytes, 0, DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, |_, _, _| {
-                true
-            })
-            .expect("decode");
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            0,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
         assert!(stats.stale, "a future-dated snapshot is excluded");
     }
 
@@ -2377,13 +2385,14 @@ mod memo_snapshot_tests {
         let bytes = encode(&memo, 0);
 
         let mut seeded = MaintainMemo::with_default_interval();
-        let stats = seed(&mut seeded, 
-                &bytes,
-                0,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                |_, _, shard| shard == 0,
-            )
-            .expect("decode");
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            0,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, shard| shard == 0,
+        )
+        .expect("decode");
         assert_eq!(stats.seeded_units, 1);
         assert_eq!(
             seeded.terminal_state(t, Signal::Metrics, 0, 1),
@@ -2415,10 +2424,8 @@ mod memo_snapshot_tests {
 
         // Apply older then newer: newer wins.
         let mut a = MaintainMemo::new(0);
-        seed(&mut a, &older_bytes, 5_000, 0, |_, _, _| true)
-            .expect("older");
-        seed(&mut a, &newer_bytes, 5_000, 0, |_, _, _| true)
-            .expect("newer");
+        seed(&mut a, &older_bytes, 5_000, 0, |_, _, _| true).expect("older");
+        seed(&mut a, &newer_bytes, 5_000, 0, |_, _, _| true).expect("newer");
         assert_eq!(
             a.terminal_state(t, Signal::Metrics, 0, 1),
             Some(TerminalState::Compacted)
@@ -2426,10 +2433,8 @@ mod memo_snapshot_tests {
 
         // Apply newer then older: newer still wins (order independent).
         let mut b = MaintainMemo::new(0);
-        seed(&mut b, &newer_bytes, 5_000, 0, |_, _, _| true)
-            .expect("newer");
-        seed(&mut b, &older_bytes, 5_000, 0, |_, _, _| true)
-            .expect("older");
+        seed(&mut b, &newer_bytes, 5_000, 0, |_, _, _| true).expect("newer");
+        seed(&mut b, &older_bytes, 5_000, 0, |_, _, _| true).expect("older");
         assert_eq!(
             b.terminal_state(t, Signal::Metrics, 0, 1),
             Some(TerminalState::Compacted)
@@ -2522,17 +2527,17 @@ mod memo_snapshot_tests {
         );
         // Re-frame the poisoned body under an honest, fresh header, so the
         // whole-snapshot staleness gate passes and only the entry is skewed.
-        let bytes =
-            frame(&poisoned.snapshot_body(), snapshot_unix_ns);
+        let bytes = frame(&poisoned.snapshot_body(), snapshot_unix_ns);
 
         let mut seeded = MaintainMemo::with_default_interval();
-        let stats = seed(&mut seeded, 
-                &bytes,
-                snapshot_unix_ns,
-                DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
-                |_, _, _| true,
-            )
-            .expect("decode");
+        let stats = seed(
+            &mut seeded,
+            &bytes,
+            snapshot_unix_ns,
+            DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
+            |_, _, _| true,
+        )
+        .expect("decode");
         assert_eq!(stats.seeded_buckets, 1);
 
         let key = (t, Signal::Metrics, 0, 1);
@@ -2607,7 +2612,8 @@ mod memo_snapshot_tests {
         bytes: &[u8],
         max_entries: usize,
     ) -> std::result::Result<usize, MemoSnapshotError> {
-        decode_snapshot(&verified(bytes.to_vec()), max_entries).map(|d| d.units.iter().map(|u| u.entries.len()).sum())
+        decode_snapshot(&verified(bytes.to_vec()), max_entries)
+            .map(|d| d.units.iter().map(|u| u.entries.len()).sum())
     }
 
     const CAP: u32 = MAX_MEMO_SNAPSHOT_ENTRIES as u32;
@@ -2641,7 +2647,8 @@ mod memo_snapshot_tests {
     fn real_entry_cap_ties_the_writer_to_the_decoder() {
         let limits = MemoSnapshotLimits::DEFAULT;
         let at_cap = raw_snapshot(&[frontier_unit(0, 0, CAP - 1)]);
-        let decoded = decode_snapshot(&verified(at_cap.clone()), limits.max_entries).expect("at the cap decodes");
+        let decoded = decode_snapshot(&verified(at_cap.clone()), limits.max_entries)
+            .expect("at the cap decodes");
         assert_eq!(decoded.units.len(), 1);
         assert_eq!(decoded.units[0].entries.len(), MAX_MEMO_SNAPSHOT_ENTRIES);
         assert_eq!(
@@ -2806,7 +2813,8 @@ mod memo_snapshot_tests {
             frontier: Some((0, 2)),
             exceptions: vec![(10, 3)],
         }]);
-        let decoded = decode_snapshot(&verified(bytes.clone()), MAX_MEMO_SNAPSHOT_ENTRIES).expect("decode");
+        let decoded =
+            decode_snapshot(&verified(bytes.clone()), MAX_MEMO_SNAPSHOT_ENTRIES).expect("decode");
         assert_eq!(decoded.units[0].entries.len(), 6);
         assert_eq!(decoded.units[0].entries.capacity(), 6);
     }
