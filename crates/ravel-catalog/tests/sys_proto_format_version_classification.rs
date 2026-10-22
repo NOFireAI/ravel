@@ -59,7 +59,7 @@ fn classification_table() -> BTreeMap<&'static str, Class> {
         // the owning process's live state, never a read-modify-write of prior
         // bytes, so a lagging binary cannot strip a sibling's additive field.
         ("AdmissionUsageSnapshot", Immutable(&[1])),
-        ("WorkerHeartbeat", Immutable(&[1])),
+        ("WorkerHeartbeat", Immutable(&[2])),
         // Read-modify-write under CAS. ProvisioningRecord accepts {1, 2, 3}
         // after ADR-1746 Release A (the FormatFloor basis fields), and its
         // writer stamps 3 since Release B. TenantConfigRecord accepts {1, 2, 3}

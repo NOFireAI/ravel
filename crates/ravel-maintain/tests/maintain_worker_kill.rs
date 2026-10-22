@@ -33,6 +33,7 @@ use common::{
     sealed_now_ns, seed_input,
 };
 use ravel_commit::keys;
+use ravel_maintain::worker_set::{MaintainMembership, MaintainRecordKeys};
 use ravel_maintain::{
     Bucket, CompactionOutcome, CompactorConfig, FixedClock, WorkerSet, compact_bucket, owner, owns,
     unit_key,
@@ -140,18 +141,22 @@ async fn maintain_worker_killed_mid_compaction_sibling_takes_over() {
     };
     let dead = WorkerSet::with_defaults(0).with_process_id(dead_id);
     let survivor = WorkerSet::with_defaults(0).with_process_id(survivor_id);
+    // Both workers hold the same maintain key, so each admits the other.
+    let membership = MaintainMembership::new(
+        MaintainRecordKeys::from_file_keys(&[[0x4B; 32]]).expect("one maintain key"),
+    );
 
     // t = 0: both workers heartbeat and are live; the doomed worker owns the
     // unit. The store clock is 0, so both heartbeat objects carry mtime 0 and
     // staleness is decided purely by the `now_ns` each read below supplies.
-    dead.write_heartbeat(&inner, 0)
+    dead.write_heartbeat(&inner, &membership, 0)
         .await
         .expect("dead heartbeat");
     survivor
-        .write_heartbeat(&inner, 0)
+        .write_heartbeat(&inner, &membership, 0)
         .await
         .expect("survivor heartbeat");
-    let live0 = survivor.live_set(&inner, 0).await.expect("live set at t0");
+    let live0 = survivor.live_set(&inner, &membership, 0).await.expect("live set at t0");
     assert!(
         live0.contains(&dead_id) && live0.contains(&survivor_id),
         "both workers live at t0"
@@ -198,7 +203,7 @@ async fn maintain_worker_killed_mid_compaction_sibling_takes_over() {
     // (the window is inclusive), so membership has NOT changed and the survivor
     // has not taken over: the takeover is bounded, not immediate.
     let live_at_edge = survivor
-        .live_set(&store, WINDOW_NS)
+        .live_set(&store, &membership, WINDOW_NS)
         .await
         .expect("live set at exactly 3*H");
     assert!(
@@ -220,7 +225,7 @@ async fn maintain_worker_killed_mid_compaction_sibling_takes_over() {
         "takeover lands within 3*H + one maintenance tick"
     );
     let live_after = survivor
-        .live_set(&store, takeover_ns)
+        .live_set(&store, &membership, takeover_ns)
         .await
         .expect("live set past 3*H");
     assert!(
