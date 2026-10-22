@@ -192,6 +192,47 @@
   status: verified
   note: "A fresh per-role cluster without the ref applies no Deployment and keeps the withheld reason through a stalled sys/gc wait; a missing Secret behind a set ref withholds the maintain tier the same way."
 
+- id: kubernetes-query-memory-budget-withheld
+  doc: docs/guides/kubernetes.md
+  quote: "Below the floor, with no memory limit, or with a limit that is not a valid quantity, the operator does not apply the query Deployment."
+  kind: negative
+  binds:
+    - services/ravel-operator/tests/query_memory_budget_withheld.rs::refused_budget_leaves_the_running_query_deployment_alone
+    - services/ravel-operator/tests/query_memory_budget_withheld.rs::refused_budget_creates_no_query_deployment_on_a_fresh_cluster
+    - services/ravel-operator/src/controller.rs::tests::plan_render_withholds_only_the_query_deployment_on_a_refused_memory_budget
+  status: verified
+  note: "Against a fake apiserver, a limit below budget plus 256 MiB or no limit sends no PATCH, PUT, POST or DELETE for the query Deployment, applies gateway and maintain, and reports the live query readiness; the plan_render test covers the unparseable limit (ADR-1170, issue #3200 amendment)."
+
+- id: kubernetes-query-memory-limit-alone-no-headroom
+  doc: docs/guides/kubernetes.md
+  quote: "Raising the limit without pinning the budget raises the budget with it, by the whole increase from 8 GiB up and by three quarters of it below, so it gives no headroom beyond that reserve."
+  kind: negative
+  binds:
+    - services/ravel-server/src/config.rs::resolve_performance_defaults
+    - crates/ravel-maintain/src/config.rs::effective_memory_overhead_reserve_bytes
+    - services/ravel-operator/src/reconcile.rs::tests::unset_memory_budget_renders_the_query_deployment_byte_identical
+  status: verified
+  note: "Without the field the operator renders no --memory-budget-bytes (the pinned render test), so the server takes the derived-cgroup branch of resolve_performance_defaults: the cgroup limit minus effective_memory_overhead_reserve_bytes, max(min(2 GiB, limit / 4), 256 MiB) in --mode query."
+
+- id: kubernetes-query-memory-default-headroom-stg1
+  doc: docs/guides/kubernetes.md
+  quote: "The default headroom at a 1.5 GiB budget is 2,182,380,259 bytes, about 2.03 GiB."
+  kind: positive
+  binds:
+    - services/ravel-operator/src/reconcile.rs::default_query_memory_headroom
+    - services/ravel-operator/src/reconcile.rs::tests::default_query_memory_headroom_is_pinned_at_named_budgets
+    - services/ravel-operator/src/reconcile.rs::tests::explicit_memory_headroom_overrides_the_default
+  status: verified
+  note: "The bound unit test pins 2,182,380,259 at 1,610,612,736 bytes and 20,744,692,041 at 24 GiB; the override test pins the 4,061,428,451-byte floor plus headroom against the 3.5Gi limit in the condition message."
+
+- id: kubernetes-query-memory-retention-unmeasured-small-budgets
+  doc: docs/guides/kubernetes.md
+  quote: "Below 8 GB that scaling is unmeasured."
+  kind: not-a-claim
+  binds: []
+  status: verified
+  note: "States where measurements stop, not an absent capability: allocator retention was profiled only at an 8 GB budget (ADR-2633 Context), and the ADR-1170 issue #3200 amendment records the scaling below it as an assumption."
+
 - id: ingest-affinity-mtls-not-available
   doc: docs/guides/ingest-affinity.md
   quote: "mTLS resolution is not available at any layer"

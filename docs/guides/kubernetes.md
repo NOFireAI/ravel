@@ -344,6 +344,8 @@ A minimal example is in
 | `spec.query.distributedQuery.fragmentCaSecretRef.name` | string | none | Secret with key `ca.crt`: the CA that signed every query pod's fragment certificate. May name the same Secret as `fragmentTlsSecretRef`. Required when `enabled`. |
 | `spec.query.distributedQuery.fragmentKeySecretRef.name` | string | none | Secret with key `keys`: the fragment key file. Required when `enabled`. |
 | `spec.query.distributedQuery.sqlTicketKeySecretRef.name` | string | none | Secret with key `keys`: the SQL ticket key file. Required when `enabled`. |
+| `spec.query.memoryBudgetBytes` | integer | none | Pins the memory budget of the query pods: renders `--memory-budget-bytes` with this value on the query pods only. Needs `spec.query.resources.limits.memory` of at least the budget plus 256 MiB; otherwise the operator leaves the query Deployment unchanged and reports `Degraded`. Unset, the budget derives from the memory limit. Minimum `1`. See "Pinning the query memory budget" below. |
+| `spec.query.memoryHeadroomBytes` | integer | provisional default from the budget | Memory to leave in the limit above the budget plus 256 MiB. A smaller gap reports `Degraded` with reason `QueryMemoryHeadroomLow` and still rolls the query pods. Ignored while `memoryBudgetBytes` is unset. See "Pinning the query memory budget" below. |
 | `spec.maintain.enabled` | boolean | `true` | `false` deletes the maintain Deployment. `true` renders it only with `keySecretRef` set. |
 | `spec.maintain.keySecretRef.name` | string | none | Secret with key `keys`: the maintain key file, mounted and passed as `--maintain-key-file`. Required when `enabled`. See "Maintain key file" below. |
 | `spec.maintain.replicas` | integer | `1` | |
@@ -956,6 +958,87 @@ Two consequences follow when you upgrade the operator or edit those fields:
   or `spec.maintain.enabled` changes the query Deployment's arguments
   whenever the change adds, removes or changes the flag. It then rolls the
   query pods as well as the maintain pods.
+
+### Pinning the query memory budget
+
+Without `spec.query.memoryBudgetBytes`, the query pods derive their memory
+budget from the container's memory limit. The budget is the limit minus a
+reserve: a quarter of the limit below 8 GiB, and 2 GiB from 8 GiB up (see
+[Process memory budget](operations/configuration.md#process-memory-budget)).
+Raising the limit without pinning the budget raises the budget with it, by the
+whole increase from 8 GiB up and by three quarters of it below, so it gives no
+headroom beyond that reserve. Under concurrent SQL a
+query process can use more than its budget, because some allocations are not
+charged to it, and that excess grows with the budget.
+
+`spec.query.memoryBudgetBytes` pins the budget. The operator renders
+`--memory-budget-bytes` with that value on the query pods only. It then
+checks `spec.query.resources.limits.memory` against two figures:
+
+- The floor is the budget plus 256 MiB, the memory the server holds outside
+  its budget in `--mode query`. Below the floor, with no memory limit, or with
+  a limit that is not a valid quantity, the operator does not apply the query
+  Deployment. Running query pods are left unchanged and `Available` still
+  reports them; on a new cluster no query pods are created. The cluster
+  reports `Degraded=True` with reason `QueryMemoryBudgetExceedsLimit` (or
+  `QueryMemoryLimitUnparseable`), and the message names the field, the limit,
+  the budget and the 256 MiB. The gateway and maintain Deployments keep
+  reconciling.
+- The headroom is memory above the floor for allocations the budget does not
+  charge. A limit at or above the floor but below the floor plus the headroom
+  still rolls the query pods with the pinned budget. The cluster reports
+  `Degraded=True` with reason `QueryMemoryHeadroomLow`, and the message gives
+  the limit, the floor and the headroom.
+
+`spec.query.memoryHeadroomBytes` sets the headroom. If you do not set it, the
+operator uses a provisional default:
+
+```text
+ceil(0.53 * budget) + ceil(min(budget, 8 GiB) * 6.6 / 8)
+```
+
+- The first term is SQL aggregation and logs-scan state that the budget does
+  not charge. Heap profiles measured up to 12.7 GB of it at a 24 GiB budget
+  with ten concurrent connections.
+- The second term is pages the allocator keeps after they are freed. Up to
+  6.6 GB was measured at an 8 GB budget with ten connections. Retained pages
+  are freed allocations, so they cannot exceed what the process allocated at
+  its peak, and the term gets smaller with the budget. Below 8 GB that scaling
+  is unmeasured. On a small budget, measure the peak memory of the query pods
+  under your own concurrency, and set `memoryHeadroomBytes` from it.
+
+The default compensates for the uncharged SQL state. It is expected to drop in
+0.26, when that state is charged to the budget.
+
+A worked example with a 1.5 GiB budget, a 3.5 Gi limit and a 2 Gi request:
+
+```yaml
+spec:
+  query:
+    memoryBudgetBytes: 1610612736  # 1.5 GiB
+    resources:
+      requests:
+        memory: 2Gi
+      limits:
+        memory: 3.5Gi
+```
+
+- The floor is 1,879,048,192 bytes (1.75 GiB). The limit, 3,758,096,384
+  bytes, clears it, so the query pods roll with
+  `--memory-budget-bytes 1610612736`.
+- The default headroom at a 1.5 GiB budget is 2,182,380,259 bytes, about
+  2.03 GiB. The floor plus the headroom is 4,061,428,451 bytes, above the
+  limit, so the cluster reports `QueryMemoryHeadroomLow`. The pods have
+  1.75 GiB above the floor.
+- To clear the condition, raise the limit to `3874Mi` or more. Or measure the
+  peak memory of the query pods under load and set `memoryHeadroomBytes` to
+  the gap you need.
+- Without `memoryBudgetBytes`, the same 3.5 Gi limit derives a 2.625 GiB
+  budget and leaves 896 MiB, the reserve, between the budget and the limit.
+
+An edit to `memoryBudgetBytes` changes the query Deployment's arguments and
+rolls the query pods. An edit to `memoryHeadroomBytes` changes only the
+condition.
 
 ## Probe semantics
 
