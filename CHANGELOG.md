@@ -6,6 +6,39 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.25.1] - 2026-10-22
+
+### Fixed
+
+- **A slice worker that never completes TLS, or whose connection goes silent,
+  no longer holds a distributed query until its deadline.** Slice dials on the
+  PromQL and SQL lanes, and the federation dial, now bound the TLS handshake
+  at 3 s and send an HTTP/2 keepalive PING after 10 s with no frame received,
+  closing a connection whose PING goes unanswered for 10 s. Either failure
+  takes the existing re-dispatch and coordinator-local path, except on the
+  SQL lane after a slice's first batch has arrived, where the statement fails
+  with a typed error as before. A live worker that still answers PINGs but is
+  stuck before its first response is still bounded only by the query
+  deadline.
+- **OTAP ingest bounds the decoded bytes one batch may hold; the bound is
+  configurable.** A batch whose payloads together decode past
+  `--otap-max-decoded-batch-bytes` (env `RAVEL_OTAP_MAX_DECODED_BATCH_BYTES`,
+  64 MiB by default, `0` refused) is refused with `INVALID_ARGUMENT` before
+  the payload that would cross the cap is decoded. A batch refused after an
+  earlier payload of the same batch was decoded ends the stream, this cap or
+  any other per-batch refusal, so the exporter reconnects with fresh decoder
+  state, and so does an IPC decode error on any payload. A refusal on a
+  batch's first payload that comes before the payload is decoded keeps the
+  stream open.
+
+### Added
+
+- **`ravel-server --otap-max-decoded-batch-bytes`** (env
+  `RAVEL_OTAP_MAX_DECODED_BATCH_BYTES`, 64 MiB by default, `0` refused) sets
+  the cap on the decoded bytes one OTAP batch may hold. Like `--otap`, it
+  exists only in a build with the `otap` feature, which the published image
+  is.
+
 ## [0.25.0] - 2026-10-22
 
 ### Changed
