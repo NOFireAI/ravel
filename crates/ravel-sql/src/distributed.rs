@@ -191,6 +191,8 @@ pub const SLICE_HTTP2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// stream.
 pub const SLICE_HTTP2_KEEPALIVE_WHILE_IDLE: bool = true;
 
+pub use crate::flight::DISTRIB_SLICE_CONNECT_TIMEOUT;
+
 /// Per-query counters for [`DistributedScanExec`]'s fallback sequence, split by
 /// step (module doc, "Failure behavior").
 ///
@@ -598,8 +600,10 @@ impl WorkerSliceClient for FlightWorkerSliceClient {
             .map_err(|err| DataFusionError::Internal(err.to_string()))?;
         // Build the channel eagerly so an unparseable location or an unusable
         // TLS configuration fails here, as a typed error, rather than inside
-        // the stream. `connect_lazy` defers the actual TCP/HTTP2 handshake to
-        // the first `DoGet`, bounded by `connect_timeout`.
+        // the stream. `connect_lazy` defers the TCP connect and the TLS and
+        // HTTP/2 handshakes to the first `DoGet`. `connect_timeout` bounds the
+        // TCP connect only; the TLS handshake is bounded by the timeout set on
+        // `tls`, and the HTTP/2 handshake by neither.
         let mut endpoint = Channel::from_shared(location.to_string())
             .map_err(|err| {
                 DataFusionError::Internal(format!("invalid worker location {location:?}: {err}"))
