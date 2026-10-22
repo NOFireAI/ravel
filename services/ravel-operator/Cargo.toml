@@ -19,7 +19,9 @@ kube = { workspace = true }
 kube-runtime = { workspace = true, features = ["unstable-runtime-stream-control"] }
 k8s-openapi = { workspace = true }
 schemars = { workspace = true }
-tokio = { workspace = true }
+# `fs` for the Pod Identity token read (`src/pod_identity.rs`); the workspace
+# pin does not enable it.
+tokio = { workspace = true, features = ["fs"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
