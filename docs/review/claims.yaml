@@ -171,6 +171,27 @@
   status: verified
   note: "from_env reads only the Pod Identity webhook's AWS_CONTAINER_CREDENTIALS_FULL_URI and AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE and refuses to start without them; nothing reads AWS_WEB_IDENTITY_TOKEN_FILE or calls AssumeRoleWithWebIdentity. The bound test pins the refusal."
 
+- id: kubernetes-maintain-withheld-not-created
+  doc: docs/guides/kubernetes.md
+  quote: "Without `maintain.keySecretRef`, or while its Secret does not exist, not created, and an existing one is left unchanged"
+  kind: negative
+  binds:
+    - services/ravel-operator/tests/maintain_key_withheld.rs::no_maintain_deployment_is_created_without_the_key_ref
+    - services/ravel-operator/tests/maintain_key_withheld.rs::existing_maintain_deployment_is_left_alone_without_the_key_ref
+    - services/ravel-operator/tests/maintain_key_withheld.rs::missing_key_secret_leaves_existing_maintain_alone_and_applies_the_rest
+  status: verified
+  note: "Against a fake apiserver, a missing keySecretRef or a missing key Secret sends no PATCH, PUT, POST or DELETE for the maintain Deployment, whether or not one already exists (ADR-3130 decision 5)."
+
+- id: kubernetes-maintain-withheld-fresh-per-role
+  doc: docs/guides/kubernetes.md
+  quote: "reference to a Secret that does not exist, the operator applies no maintain Deployment"
+  kind: negative
+  binds:
+    - services/ravel-operator/tests/maintain_key_withheld.rs::fresh_per_role_cluster_creates_no_deployment_without_the_key_ref
+    - services/ravel-operator/tests/maintain_key_withheld.rs::missing_key_secret_leaves_existing_maintain_alone_and_applies_the_rest
+  status: verified
+  note: "A fresh per-role cluster without the ref applies no Deployment and keeps the withheld reason through a stalled sys/gc wait; a missing Secret behind a set ref withholds the maintain tier the same way."
+
 - id: ingest-affinity-mtls-not-available
   doc: docs/guides/ingest-affinity.md
   quote: "mTLS resolution is not available at any layer"
