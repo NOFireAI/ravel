@@ -446,9 +446,11 @@ therefore bounded on both sides. A reader skips, and counts, an object over
 again by a range GET of the cap plus one byte. The decoder bounds a
 snapshot's unit count by the bytes that follow it, and refuses a snapshot
 whose runs expand to more than `MAX_MEMO_SNAPSHOT_ENTRIES` (4,194,304
-per-hour entries, 64 MiB of 16-byte entries), checked before each run is
-expanded. A writer whose snapshot is over either cap does not write it and
-logs a warning, not repeated while the body is unchanged; it deletes
+per-hour entries), checked before each run is expanded, with each admitted
+run's capacity reserved exactly. The counts a snapshot carries still size
+what decoding it allocates, but only up to the two caps: at most 64 MiB of
+16-byte entries. A writer whose snapshot is over either cap does not write it
+and logs a warning, not repeated while the body is unchanged; it deletes
 nothing, so an older, smaller snapshot of the same process stays until the
-staleness bound excludes it. A skipped or refused snapshot costs its units the cold rescan
-decision 3 already falls back to, never correctness.
+staleness bound excludes it. A skipped or refused snapshot costs its units
+the cold rescan decision 3 already falls back to, never correctness.

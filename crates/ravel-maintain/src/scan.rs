@@ -25,6 +25,7 @@ use crate::retention::{
 };
 use crate::sweep::LeaseCheck;
 use crate::unnamed_marker::MarkerReapOutcome;
+use run_admission::{AdmittedRun, admit_run};
 
 /// One-byte version tag on the advisory cursor payload. The cursor is not a
 /// frozen format; the tag only lets a future encoding change be detected and
@@ -467,13 +468,49 @@ pub const MAX_MEMO_SNAPSHOT_BYTES: u64 = 32 * 1024 * 1024;
 
 /// Largest number of per-hour terminal entries one decoded memo snapshot may
 /// expand to (issue #3199): 4,194,304. A decoded entry is 16 bytes (a `u32`
-/// hour, a one-byte state, an `i64` verify time, padded), so this bounds the
-/// entries one decoded snapshot holds at 64 MiB however long the runs it
-/// carries claim to be. The count is snapshot-wide, across every unit and run,
-/// and is checked before a run is expanded. An honest process whose memo holds
-/// more terminal entries writes no snapshot, which costs its units a cold
-/// rescan on the next reseed, never a correctness change.
+/// hour, a one-byte state, an `i64` verify time, padded), and the decoder
+/// reserves each admitted run's capacity exactly before expanding it, so the
+/// entry vectors of one decoded snapshot hold at most 64 MiB of capacity
+/// however long the runs it carries claim to be. The count is snapshot-wide,
+/// across every unit and run, and is checked before a run is expanded. An
+/// honest process whose memo holds more terminal entries writes no snapshot,
+/// which costs its units a cold rescan on the next reseed, never a correctness
+/// change.
 pub const MAX_MEMO_SNAPSHOT_ENTRIES: usize = 4 * 1024 * 1024;
+
+/// The two caps a memo snapshot is held to on the read, decode and write paths
+/// (issue #3199). Production uses [`MemoSnapshotLimits::DEFAULT`]; tests inject
+/// small limits so a boundary can be reached without a cap-sized memo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoSnapshotLimits {
+    /// Largest framed snapshot object, in bytes.
+    pub max_bytes: u64,
+    /// Largest number of per-hour terminal entries a snapshot expands to.
+    pub max_entries: usize,
+}
+
+impl MemoSnapshotLimits {
+    /// [`MAX_MEMO_SNAPSHOT_BYTES`] and [`MAX_MEMO_SNAPSHOT_ENTRIES`].
+    pub const DEFAULT: Self = Self {
+        max_bytes: MAX_MEMO_SNAPSHOT_BYTES,
+        max_entries: MAX_MEMO_SNAPSHOT_ENTRIES,
+    };
+
+    /// Whether a writer may persist a framed snapshot of `framed_bytes` whose
+    /// memo holds `entries` terminal entries
+    /// ([`MaintainMemo::snapshot_entry_count`]): true exactly when a reader
+    /// under the same limits would neither skip nor refuse it.
+    pub fn admits_write(&self, framed_bytes: usize, entries: usize) -> bool {
+        let framed_bytes = u64::try_from(framed_bytes).unwrap_or(u64::MAX);
+        framed_bytes <= self.max_bytes && entries <= self.max_entries
+    }
+}
+
+impl Default for MemoSnapshotLimits {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
 
 /// Smallest encoded unit in a memo snapshot body: 16 tenant bytes, a one-byte
 /// signal, a four-byte shard, a one-byte frontier flag, and a four-byte
@@ -1066,7 +1103,7 @@ impl MaintainMemo {
 
     /// Number of per-hour terminal entries [`Self::snapshot_body`] encodes,
     /// which is how many a reader's decode expands it back to. The writer
-    /// compares it against [`MAX_MEMO_SNAPSHOT_ENTRIES`] so it never persists a
+    /// passes it to [`MemoSnapshotLimits::admits_write`] so it never persists a
     /// snapshot the reader would reject.
     pub fn snapshot_entry_count(&self) -> usize {
         self.entries.len()
@@ -1116,7 +1153,7 @@ impl MaintainMemo {
         staleness_ns: i64,
         owns: impl Fn(TenantHash, Signal, u32) -> bool,
     ) -> std::result::Result<SeedStats, MemoSnapshotError> {
-        let decoded = decode_snapshot(bytes)?;
+        let decoded = decode_snapshot(bytes, MemoSnapshotLimits::DEFAULT.max_entries)?;
 
         if staleness_ns > 0 {
             let too_old = now_ns.saturating_sub(decoded.snapshot_unix_ns) > staleness_ns;
@@ -1351,8 +1388,12 @@ impl<'a> SnapshotReader<'a> {
 /// typed [`MemoSnapshotError`] (fail-open at the caller), never a panic. No
 /// count the payload carries sizes an allocation unchecked: the unit count is
 /// bounded by the bytes that follow it, and the runs' total length by
-/// [`MAX_MEMO_SNAPSHOT_ENTRIES`] before each run is expanded.
-fn decode_snapshot(bytes: &[u8]) -> std::result::Result<DecodedSnapshot, MemoSnapshotError> {
+/// `max_entries` (production passes [`MAX_MEMO_SNAPSHOT_ENTRIES`]) before each
+/// run is expanded.
+fn decode_snapshot(
+    bytes: &[u8],
+    max_entries: usize,
+) -> std::result::Result<DecodedSnapshot, MemoSnapshotError> {
     let mut reader = SnapshotReader { bytes, offset: 0 };
     let tag = reader.u8()?;
     if tag != MEMO_SNAPSHOT_TAG {
@@ -1369,20 +1410,8 @@ fn decode_snapshot(bytes: &[u8]) -> std::result::Result<DecodedSnapshot, MemoSna
         });
     }
 
-    // Entries expanded so far across every unit; each run is checked against
-    // the cap before any of it is expanded.
+    // Entries admitted so far across every unit.
     let mut expanded: u64 = 0;
-    let mut admit_run = |run_len: u64| -> std::result::Result<(), MemoSnapshotError> {
-        let total = expanded.saturating_add(run_len);
-        if total > MAX_MEMO_SNAPSHOT_ENTRIES as u64 {
-            return Err(MemoSnapshotError::TooManyEntries {
-                total,
-                cap: MAX_MEMO_SNAPSHOT_ENTRIES,
-            });
-        }
-        expanded = total;
-        Ok(())
-    };
 
     let mut units = Vec::with_capacity(unit_count as usize);
     for _ in 0..unit_count {
@@ -1405,11 +1434,9 @@ fn decode_snapshot(bytes: &[u8]) -> std::result::Result<DecodedSnapshot, MemoSna
             let state = TerminalState::from_code(state_code)
                 .ok_or(MemoSnapshotError::UnknownState(state_code))?;
             let verified = reader.i64()?;
-            if end < start {
-                return Err(MemoSnapshotError::FrontierEndBeforeStart { start, end });
-            }
-            admit_run(u64::from(end - start) + 1)?;
-            expand_run(&mut entries, start, end, state, verified);
+            let run = admit_run(expanded, max_entries, start, end)?;
+            expanded = run.total();
+            expand_run(&mut entries, run, state, verified);
         }
 
         let exception_count = reader.u32()?;
@@ -1426,8 +1453,9 @@ fn decode_snapshot(bytes: &[u8]) -> std::result::Result<DecodedSnapshot, MemoSna
             let end = start
                 .checked_add(run_len - 1)
                 .ok_or(MemoSnapshotError::RunPastLastHour { start, run_len })?;
-            admit_run(u64::from(run_len))?;
-            expand_run(&mut entries, start, end, state, verified);
+            let run = admit_run(expanded, max_entries, start, end)?;
+            expanded = run.total();
+            expand_run(&mut entries, run, state, verified);
         }
 
         units.push(DecodedUnit {
@@ -1444,18 +1472,78 @@ fn decode_snapshot(bytes: &[u8]) -> std::result::Result<DecodedSnapshot, MemoSna
     })
 }
 
-/// Expand one RLE run covering hours `start..=end` into per-hour terminal
-/// entries. The caller has already checked `start <= end` and admitted the
-/// run's length against [`MAX_MEMO_SNAPSHOT_ENTRIES`].
+/// Expand one admitted RLE run into per-hour terminal entries, reserving its
+/// capacity exactly first. Taking [`AdmittedRun`] means a run can only be
+/// expanded after [`admit_run`] has checked it against the entry cap.
 fn expand_run(
     out: &mut Vec<(u32, TerminalState, i64)>,
-    start: u32,
-    end: u32,
+    run: AdmittedRun,
     state: TerminalState,
     verified_ns: i64,
 ) {
-    for hour in start..=end {
+    out.reserve_exact(run.len());
+    for hour in run.start()..=run.end() {
         out.push((hour, state, verified_ns));
+    }
+}
+
+/// Kept in its own module so [`AdmittedRun`]'s fields are private to
+/// [`admit_run`], its only constructor.
+mod run_admission {
+    use super::MemoSnapshotError;
+
+    /// A run of hours `start..=end` that [`admit_run`] found within the entry
+    /// cap, carrying the snapshot-wide total including it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct AdmittedRun {
+        start: u32,
+        end: u32,
+        total: u64,
+    }
+
+    impl AdmittedRun {
+        pub(super) fn start(self) -> u32 {
+            self.start
+        }
+
+        pub(super) fn end(self) -> u32 {
+            self.end
+        }
+
+        /// Hours in the run. Fits `usize` because it is at most `max_entries`.
+        pub(super) fn len(self) -> usize {
+            usize::try_from(self.end - self.start)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        }
+
+        /// Entries admitted across the snapshot, this run included.
+        pub(super) fn total(self) -> u64 {
+            self.total
+        }
+    }
+
+    /// Admit hours `start..=end` given `expanded` entries already admitted,
+    /// refusing the run when the total would pass `max_entries`. Pure: nothing
+    /// is allocated, so a refused run costs nothing however long it claims to
+    /// be.
+    pub(super) fn admit_run(
+        expanded: u64,
+        max_entries: usize,
+        start: u32,
+        end: u32,
+    ) -> Result<AdmittedRun, MemoSnapshotError> {
+        if end < start {
+            return Err(MemoSnapshotError::FrontierEndBeforeStart { start, end });
+        }
+        let total = expanded.saturating_add(u64::from(end - start) + 1);
+        if total > u64::try_from(max_entries).unwrap_or(u64::MAX) {
+            return Err(MemoSnapshotError::TooManyEntries {
+                total,
+                cap: max_entries,
+            });
+        }
+        Ok(AdmittedRun { start, end, total })
     }
 }
 
@@ -2250,11 +2338,18 @@ mod memo_snapshot_tests {
         }
     }
 
-    fn decoded_entries(bytes: &[u8]) -> std::result::Result<usize, MemoSnapshotError> {
-        decode_snapshot(bytes).map(|d| d.units.iter().map(|u| u.entries.len()).sum())
+    fn decoded_entries(
+        bytes: &[u8],
+        max_entries: usize,
+    ) -> std::result::Result<usize, MemoSnapshotError> {
+        decode_snapshot(bytes, max_entries).map(|d| d.units.iter().map(|u| u.entries.len()).sum())
     }
 
     const CAP: u32 = MAX_MEMO_SNAPSHOT_ENTRIES as u32;
+
+    /// An injected entry cap small enough that a boundary memo is a handful of
+    /// entries.
+    const SMALL_CAP: u32 = 16;
 
     /// The 64 MiB figure in [`MAX_MEMO_SNAPSHOT_ENTRIES`]'s doc rests on a
     /// decoded entry being 16 bytes.
@@ -2263,20 +2358,99 @@ mod memo_snapshot_tests {
         assert_eq!(std::mem::size_of::<(u32, TerminalState, i64)>(), 16);
         assert_eq!(MAX_MEMO_SNAPSHOT_ENTRIES * 16, 64 * 1024 * 1024);
         assert_eq!(MEMO_SNAPSHOT_MIN_UNIT_BYTES, 26);
+        assert_eq!(
+            MemoSnapshotLimits::default(),
+            MemoSnapshotLimits {
+                max_bytes: MAX_MEMO_SNAPSHOT_BYTES,
+                max_entries: MAX_MEMO_SNAPSHOT_ENTRIES,
+            }
+        );
     }
 
-    /// A frontier one hour longer than the entry cap is refused with the
-    /// would-be total, before any of it is expanded.
+    /// At the real cap, the writer's check and the decoder agree on what an
+    /// entry count is: one frontier spanning exactly
+    /// [`MAX_MEMO_SNAPSHOT_ENTRIES`] hours decodes to that many entries, with
+    /// exactly that much capacity, and the writer admits that count; one hour
+    /// more is refused by both, the decoder reporting the would-be total.
     #[test]
-    fn frontier_over_the_entry_cap_is_refused() {
-        let bytes = raw_snapshot(&[frontier_unit(0, 0, CAP)]);
+    fn real_entry_cap_ties_the_writer_to_the_decoder() {
+        let limits = MemoSnapshotLimits::DEFAULT;
+        let at_cap = raw_snapshot(&[frontier_unit(0, 0, CAP - 1)]);
+        let decoded = decode_snapshot(&at_cap, limits.max_entries).expect("at the cap decodes");
+        assert_eq!(decoded.units.len(), 1);
+        assert_eq!(decoded.units[0].entries.len(), MAX_MEMO_SNAPSHOT_ENTRIES);
         assert_eq!(
-            decoded_entries(&bytes),
+            decoded.units[0].entries.capacity(),
+            MAX_MEMO_SNAPSHOT_ENTRIES
+        );
+        drop(decoded);
+        assert!(limits.admits_write(at_cap.len(), MAX_MEMO_SNAPSHOT_ENTRIES));
+
+        let over = raw_snapshot(&[frontier_unit(0, 0, CAP)]);
+        assert_eq!(
+            decoded_entries(&over, limits.max_entries),
             Err(MemoSnapshotError::TooManyEntries {
                 total: u64::from(CAP) + 1,
                 cap: MAX_MEMO_SNAPSHOT_ENTRIES,
             })
         );
+        assert!(!limits.admits_write(over.len(), MAX_MEMO_SNAPSHOT_ENTRIES + 1));
+    }
+
+    /// At a small injected entry cap, a memo of exactly the cap is admitted by
+    /// the writer check and its own encoded bytes decode under the same cap,
+    /// while a memo one entry over is refused by both.
+    #[test]
+    fn small_entry_cap_writer_and_decoder_share_a_boundary() {
+        let limits = MemoSnapshotLimits {
+            max_bytes: MAX_MEMO_SNAPSHOT_BYTES,
+            max_entries: SMALL_CAP as usize,
+        };
+        let memo_of = |entries: u32| {
+            let mut memo = MaintainMemo::with_default_interval();
+            // Alternating states keep every hour its own run.
+            for hour in 0..entries {
+                let state = if hour % 2 == 0 {
+                    TerminalState::Compacted
+                } else {
+                    TerminalState::SweptEmpty
+                };
+                memo.mark_terminal((tenant(), Signal::Metrics, hour % 3, hour), state, 5_000);
+            }
+            memo
+        };
+
+        let at = memo_of(SMALL_CAP);
+        let at_bytes = at.encode_snapshot(9_000);
+        assert_eq!(at.snapshot_entry_count(), SMALL_CAP as usize);
+        assert!(limits.admits_write(at_bytes.len(), at.snapshot_entry_count()));
+        assert_eq!(
+            decoded_entries(&at_bytes, limits.max_entries),
+            Ok(SMALL_CAP as usize)
+        );
+
+        let over = memo_of(SMALL_CAP + 1);
+        let over_bytes = over.encode_snapshot(9_000);
+        assert_eq!(over.snapshot_entry_count(), SMALL_CAP as usize + 1);
+        assert!(!limits.admits_write(over_bytes.len(), over.snapshot_entry_count()));
+        assert!(matches!(
+            decoded_entries(&over_bytes, limits.max_entries),
+            Err(MemoSnapshotError::TooManyEntries { total, cap })
+                if total == u64::from(SMALL_CAP) + 1 && cap == SMALL_CAP as usize
+        ));
+    }
+
+    /// The writer check's byte cap admits a framed snapshot of exactly
+    /// `max_bytes` and refuses one byte more, independent of the entry count.
+    #[test]
+    fn writer_byte_cap_boundary() {
+        let limits = MemoSnapshotLimits {
+            max_bytes: 300,
+            max_entries: SMALL_CAP as usize,
+        };
+        assert!(limits.admits_write(300, 0));
+        assert!(!limits.admits_write(301, 0));
+        assert!(!limits.admits_write(0, SMALL_CAP as usize + 1));
     }
 
     /// The cap counts every unit's runs together: two units each just over
@@ -2284,13 +2458,13 @@ mod memo_snapshot_tests {
     /// run plus the offending one.
     #[test]
     fn entry_cap_is_snapshot_wide_across_units() {
-        let half = CAP / 2 + 1;
+        let half = SMALL_CAP / 2 + 1;
         let bytes = raw_snapshot(&[frontier_unit(0, 0, half - 1), frontier_unit(1, 0, half - 1)]);
         assert_eq!(
-            decoded_entries(&bytes),
+            decoded_entries(&bytes, SMALL_CAP as usize),
             Err(MemoSnapshotError::TooManyEntries {
                 total: 2 * u64::from(half),
-                cap: MAX_MEMO_SNAPSHOT_ENTRIES,
+                cap: SMALL_CAP as usize,
             })
         );
     }
@@ -2299,35 +2473,98 @@ mod memo_snapshot_tests {
     /// refused together, though neither run alone reaches the cap.
     #[test]
     fn entry_cap_is_snapshot_wide_across_runs() {
-        let half = CAP / 2 + 1;
+        let half = SMALL_CAP / 2 + 1;
         let bytes = raw_snapshot(&[RawUnit {
             shard: 0,
             frontier: None,
             exceptions: vec![(0, half), (half + 10, half)],
         }]);
         assert_eq!(
-            decoded_entries(&bytes),
+            decoded_entries(&bytes, SMALL_CAP as usize),
             Err(MemoSnapshotError::TooManyEntries {
                 total: 2 * u64::from(half),
+                cap: SMALL_CAP as usize,
+            })
+        );
+    }
+
+    /// Exactly the cap decodes when split across two units.
+    #[test]
+    fn exactly_the_entry_cap_decodes_split_across_units() {
+        let split = raw_snapshot(&[
+            frontier_unit(0, 0, SMALL_CAP / 2 - 1),
+            RawUnit {
+                shard: 1,
+                frontier: None,
+                exceptions: vec![(100, SMALL_CAP / 2)],
+            },
+        ]);
+        assert_eq!(
+            decoded_entries(&split, SMALL_CAP as usize),
+            Ok(SMALL_CAP as usize)
+        );
+    }
+
+    /// Each run's capacity is reserved exactly: a unit of a three-hour
+    /// frontier and a three-hour exception holds six entries in six slots,
+    /// where growth by doubling would leave eight.
+    #[test]
+    fn decoded_unit_capacity_matches_its_entries() {
+        let bytes = raw_snapshot(&[RawUnit {
+            shard: 0,
+            frontier: Some((0, 2)),
+            exceptions: vec![(10, 3)],
+        }]);
+        let decoded = decode_snapshot(&bytes, MAX_MEMO_SNAPSHOT_ENTRIES).expect("decode");
+        assert_eq!(decoded.units[0].entries.len(), 6);
+        assert_eq!(decoded.units[0].entries.capacity(), 6);
+    }
+
+    /// A frontier of `u32::MAX` hours (start 0, end `u32::MAX - 1`) under the
+    /// default cap is a typed error. Admission happens before expansion and
+    /// [`expand_run`] only accepts an [`AdmittedRun`], so an implementation
+    /// that expanded first (about 64 GiB here) does not compile.
+    #[test]
+    fn u32_max_run_is_refused_before_expansion() {
+        let bytes = raw_snapshot(&[frontier_unit(0, 0, u32::MAX - 1)]);
+        assert_eq!(
+            decoded_entries(&bytes, MemoSnapshotLimits::DEFAULT.max_entries),
+            Err(MemoSnapshotError::TooManyEntries {
+                total: u64::from(u32::MAX),
                 cap: MAX_MEMO_SNAPSHOT_ENTRIES,
             })
         );
     }
 
-    /// Exactly the cap decodes, as one unit and split across two units.
+    /// [`admit_run`] on its own: it admits a run that lands exactly on the
+    /// cap and reports the running total, refuses one hour more with the
+    /// would-be total, counts entries already admitted, and refuses a run
+    /// that ends before it starts.
     #[test]
-    fn exactly_the_entry_cap_decodes() {
-        let one = raw_snapshot(&[frontier_unit(0, 0, CAP - 1)]);
-        assert_eq!(decoded_entries(&one), Ok(MAX_MEMO_SNAPSHOT_ENTRIES));
-        let split = raw_snapshot(&[
-            frontier_unit(0, 0, CAP / 2 - 1),
-            RawUnit {
-                shard: 1,
-                frontier: None,
-                exceptions: vec![(100, CAP / 2)],
-            },
-        ]);
-        assert_eq!(decoded_entries(&split), Ok(MAX_MEMO_SNAPSHOT_ENTRIES));
+    fn admit_run_checks_the_running_total() {
+        let run = admit_run(0, 10, 5, 14).expect("ten hours fit a cap of ten");
+        assert_eq!(
+            (run.start(), run.end(), run.len(), run.total()),
+            (5, 14, 10, 10)
+        );
+        assert_eq!(
+            admit_run(0, 10, 5, 15),
+            Err(MemoSnapshotError::TooManyEntries { total: 11, cap: 10 })
+        );
+        let run = admit_run(7, 10, 0, 2).expect("seven plus three fit");
+        assert_eq!(run.total(), 10);
+        assert_eq!(
+            admit_run(8, 10, 0, 2),
+            Err(MemoSnapshotError::TooManyEntries { total: 11, cap: 10 })
+        );
+        assert_eq!(
+            admit_run(0, usize::MAX, 0, u32::MAX).map(AdmittedRun::len),
+            Ok(usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit usize"))
+        );
+        assert_eq!(
+            admit_run(0, 10, 3, 2),
+            Err(MemoSnapshotError::FrontierEndBeforeStart { start: 3, end: 2 })
+        );
     }
 
     /// A unit count no payload of this length could hold is refused before
@@ -2336,7 +2573,7 @@ mod memo_snapshot_tests {
     fn unit_count_beyond_the_payload_is_refused() {
         let mut bytes = MaintainMemo::snapshot_bytes_from_body(&u32::MAX.to_le_bytes(), 0);
         assert_eq!(
-            decode_snapshot(&bytes).err(),
+            decode_snapshot(&bytes, MAX_MEMO_SNAPSHOT_ENTRIES).err(),
             Some(MemoSnapshotError::UnitCountExceedsPayload {
                 unit_count: u32::MAX,
                 remaining: 0,
@@ -2352,13 +2589,13 @@ mod memo_snapshot_tests {
         bytes[9..13].copy_from_slice(&2u32.to_le_bytes());
         bytes.extend_from_slice(&[0u8; MEMO_SNAPSHOT_MIN_UNIT_BYTES - 1]);
         assert_eq!(
-            decode_snapshot(&bytes).err(),
+            decode_snapshot(&bytes, MAX_MEMO_SNAPSHOT_ENTRIES).err(),
             Some(MemoSnapshotError::UnitCountExceedsPayload {
                 unit_count: 2,
                 remaining: 2 * MEMO_SNAPSHOT_MIN_UNIT_BYTES - 1,
             })
         );
-        assert_eq!(decoded_entries(&one), Ok(0));
+        assert_eq!(decoded_entries(&one, MAX_MEMO_SNAPSHOT_ENTRIES), Ok(0));
     }
 
     /// The widest frontier is refused by the cap without wrapping its length,
@@ -2368,7 +2605,7 @@ mod memo_snapshot_tests {
     fn degenerate_frontiers_are_typed_errors() {
         let widest = raw_snapshot(&[frontier_unit(0, 0, u32::MAX)]);
         assert_eq!(
-            decoded_entries(&widest),
+            decoded_entries(&widest, MAX_MEMO_SNAPSHOT_ENTRIES),
             Err(MemoSnapshotError::TooManyEntries {
                 total: u64::from(u32::MAX) + 1,
                 cap: MAX_MEMO_SNAPSHOT_ENTRIES,
@@ -2376,7 +2613,7 @@ mod memo_snapshot_tests {
         );
         let backwards = raw_snapshot(&[frontier_unit(0, 10, 9)]);
         assert_eq!(
-            decoded_entries(&backwards),
+            decoded_entries(&backwards, MAX_MEMO_SNAPSHOT_ENTRIES),
             Err(MemoSnapshotError::FrontierEndBeforeStart { start: 10, end: 9 })
         );
     }
@@ -2391,7 +2628,7 @@ mod memo_snapshot_tests {
             exceptions: vec![(u32::MAX, 2)],
         }]);
         assert_eq!(
-            decoded_entries(&bytes),
+            decoded_entries(&bytes, MAX_MEMO_SNAPSHOT_ENTRIES),
             Err(MemoSnapshotError::RunPastLastHour {
                 start: u32::MAX,
                 run_len: 2,
@@ -2402,7 +2639,7 @@ mod memo_snapshot_tests {
             frontier: None,
             exceptions: vec![(u32::MAX - 1, 2)],
         }]);
-        assert_eq!(decoded_entries(&last), Ok(2));
+        assert_eq!(decoded_entries(&last, MAX_MEMO_SNAPSHOT_ENTRIES), Ok(2));
     }
 
     fn state_of(code: u8) -> TerminalState {

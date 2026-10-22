@@ -33,7 +33,9 @@
 use ravel_object_store::{GetRange, ObjectStoreBackend, PutMode, PutOptions, StoreError, list_all};
 use uuid::Uuid;
 
+#[cfg(doc)]
 use crate::scan::MAX_MEMO_SNAPSHOT_BYTES;
+use crate::scan::MemoSnapshotLimits;
 
 /// The prefix every maintain process's memo snapshot lives under (ADR-0065
 /// decision 3): a second additive control-plane prefix under `sys/maintain/`,
@@ -74,8 +76,8 @@ pub struct MemoSnapshotRead {
     /// Each read snapshot object's raw framed bytes, in listing order.
     pub snapshots: Vec<Vec<u8>>,
     /// Objects skipped unread or undecoded because they were longer than
-    /// [`MAX_MEMO_SNAPSHOT_BYTES`], by their listed size or by the bytes the
-    /// bounded GET returned.
+    /// [`MemoSnapshotLimits::max_bytes`], by their listed size or by the bytes
+    /// the bounded GET returned.
     pub skipped_oversize: usize,
 }
 
@@ -85,8 +87,9 @@ pub struct MemoSnapshotRead {
 /// site ([`crate::scan::MaintainMemo::seed_from_snapshot`]), so an undecodable
 /// sibling is skipped there rather than failing the whole read.
 ///
-/// The read is bounded by [`MAX_MEMO_SNAPSHOT_BYTES`] (issue #3199): an object
-/// whose listed size is over the cap is skipped without a GET, every other
+/// The read is bounded by `limits.max_bytes` (issue #3199), which production
+/// sets to [`MAX_MEMO_SNAPSHOT_BYTES`] through [`MemoSnapshotLimits::DEFAULT`]:
+/// an object whose listed size is over the cap is skipped without a GET, every other
 /// object is read with a range GET of the cap plus one byte, and a body longer
 /// than the cap is skipped. Each skip is logged at debug with the key and size
 /// and counted in [`MemoSnapshotRead::skipped_oversize`]; it is not an error.
@@ -96,15 +99,17 @@ pub struct MemoSnapshotRead {
 /// read fault.
 pub async fn read_all_memo_snapshots(
     store: &dyn ObjectStoreBackend,
+    limits: MemoSnapshotLimits,
 ) -> Result<MemoSnapshotRead, StoreError> {
+    let cap = limits.max_bytes;
     let objects = list_all(store, MEMO_PREFIX).await?;
     let mut read = MemoSnapshotRead::default();
     for meta in objects {
-        if meta.size > MAX_MEMO_SNAPSHOT_BYTES {
+        if meta.size > cap {
             tracing::debug!(
                 key = %meta.key,
                 size = meta.size,
-                cap = MAX_MEMO_SNAPSHOT_BYTES,
+                cap,
                 "maintenance: skipping a memo snapshot listed over the size cap"
             );
             read.skipped_oversize += 1;
@@ -117,7 +122,7 @@ pub async fn read_all_memo_snapshots(
             continue;
         }
         let got = match store
-            .get(&meta.key, GetRange::Range(0, MAX_MEMO_SNAPSHOT_BYTES + 1))
+            .get(&meta.key, GetRange::Range(0, cap.saturating_add(1)))
             .await
         {
             Ok(got) => got,
@@ -129,11 +134,11 @@ pub async fn read_all_memo_snapshots(
             Err(err) => return Err(err),
         };
         let len = u64::try_from(got.data.len()).unwrap_or(u64::MAX);
-        if len > MAX_MEMO_SNAPSHOT_BYTES {
+        if len > cap {
             tracing::debug!(
                 key = %meta.key,
                 size = len,
-                cap = MAX_MEMO_SNAPSHOT_BYTES,
+                cap,
                 "maintenance: skipping a memo snapshot read over the size cap"
             );
             read.skipped_oversize += 1;
@@ -181,7 +186,7 @@ mod tests {
             .await
             .expect("write");
 
-        let all = read_all_memo_snapshots(&store)
+        let all = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
             .await
             .expect("read")
             .snapshots;
@@ -200,7 +205,7 @@ mod tests {
                 .await
                 .expect("write");
         }
-        let all = read_all_memo_snapshots(&store)
+        let all = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
             .await
             .expect("read")
             .snapshots;
@@ -226,7 +231,7 @@ mod tests {
             .await
             .expect("a second write to the same key succeeds unconditionally under Overwrite");
 
-        let all = read_all_memo_snapshots(&store)
+        let all = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
             .await
             .expect("read")
             .snapshots;
@@ -237,15 +242,22 @@ mod tests {
         );
     }
 
-    /// An object one byte over [`MAX_MEMO_SNAPSHOT_BYTES`] is skipped and
-    /// counted without a GET, while an object of exactly the cap and a small
-    /// sibling are both returned in full; the oversized object fails nothing.
+    /// Byte limits small enough that a test object over the cap is a few
+    /// hundred bytes.
+    const SMALL: MemoSnapshotLimits = MemoSnapshotLimits {
+        max_bytes: 256,
+        max_entries: 16,
+    };
+
+    /// An object one byte over the byte cap is skipped and counted without a
+    /// GET, while an object of exactly the cap and a small sibling are both
+    /// returned in full; the oversized object fails nothing.
     #[tokio::test]
     async fn read_all_skips_an_object_over_the_size_cap() {
         use ravel_object_store::instrument::InstrumentedStore;
 
         let store = InstrumentedStore::new(MemoryStore::new());
-        let cap = usize::try_from(MAX_MEMO_SNAPSHOT_BYTES).expect("cap fits usize");
+        let cap = usize::try_from(SMALL.max_bytes).expect("cap fits usize");
         let at_cap = vec![0xA5u8; cap];
         let small = vec![1u8, 2, 3];
         write_memo_snapshot(&store, &Uuid::from_u128(1), vec![0x5Au8; cap + 1])
@@ -259,7 +271,7 @@ mod tests {
             .expect("write small");
 
         let before = store.metrics().snapshot();
-        let read = read_all_memo_snapshots(&store).await.expect("read");
+        let read = read_all_memo_snapshots(&store, SMALL).await.expect("read");
         let after = store.metrics().snapshot();
 
         assert_eq!(read.skipped_oversize, 1, "exactly the oversized object");
@@ -281,9 +293,87 @@ mod tests {
         write_memo_snapshot(&store, &Uuid::from_u128(1), Vec::new())
             .await
             .expect("write empty");
-        let read = read_all_memo_snapshots(&store).await.expect("read");
+        let read = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
+            .await
+            .expect("read");
         assert_eq!(read.snapshots, vec![Vec::<u8>::new()]);
         assert_eq!(read.skipped_oversize, 0);
+    }
+
+    /// Delegates to a [`MemoryStore`] but lists every object at no more than
+    /// `listed_size`, as a store whose LIST and GET disagree would.
+    struct UnderListingStore {
+        inner: MemoryStore,
+        listed_size: u64,
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for UnderListingStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<ravel_object_store::PutOutcome, StoreError> {
+            self.inner.put(key, data, opts).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+            range: GetRange,
+        ) -> Result<ravel_object_store::GetOutcome, StoreError> {
+            self.inner.get(key, range).await
+        }
+        async fn head(&self, key: &str) -> Result<ravel_object_store::ObjectMeta, StoreError> {
+            self.inner.head(key).await
+        }
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<ravel_object_store::PageToken>,
+        ) -> Result<ravel_object_store::ListPage, StoreError> {
+            let mut listed = self.inner.list(prefix, page).await?;
+            for meta in &mut listed.objects {
+                meta.size = meta.size.min(self.listed_size);
+            }
+            Ok(listed)
+        }
+        async fn list_delimited(
+            &self,
+            prefix: &str,
+        ) -> Result<ravel_object_store::DelimitedList, StoreError> {
+            self.inner.list_delimited(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.inner.delete(key).await
+        }
+        fn capabilities(&self) -> ravel_object_store::Capabilities {
+            self.inner.capabilities()
+        }
+    }
+
+    /// An object listed at the byte cap whose body is longer is still skipped
+    /// and counted: the range GET asks for one byte past the cap, and the
+    /// returned length is checked against the cap. A body of exactly the cap
+    /// listed the same way is returned in full.
+    #[tokio::test]
+    async fn read_all_skips_a_body_over_the_cap_listed_under_it() {
+        let cap = usize::try_from(SMALL.max_bytes).expect("cap fits usize");
+        let store = UnderListingStore {
+            inner: MemoryStore::new(),
+            listed_size: SMALL.max_bytes,
+        };
+        let at_cap = vec![0xA5u8; cap];
+        write_memo_snapshot(&store, &Uuid::from_u128(1), vec![0x5Au8; cap + 40])
+            .await
+            .expect("write oversized");
+        write_memo_snapshot(&store, &Uuid::from_u128(2), at_cap.clone())
+            .await
+            .expect("write at cap");
+
+        let read = read_all_memo_snapshots(&store, SMALL).await.expect("read");
+        assert_eq!(read.skipped_oversize, 1, "the over-cap body is skipped");
+        assert_eq!(read.snapshots, vec![at_cap]);
     }
 
     /// An empty prefix reads back as an empty set, not an error.
@@ -291,7 +381,7 @@ mod tests {
     async fn read_all_over_empty_prefix_is_empty() {
         let store = MemoryStore::new();
         assert!(
-            read_all_memo_snapshots(&store)
+            read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
                 .await
                 .expect("read")
                 .snapshots

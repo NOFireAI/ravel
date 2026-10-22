@@ -100,7 +100,7 @@ use ravel_maintain::worker_set::{
 use ravel_maintain::{
     AlertKeepSet, Bucket, ClaimParticipant, Clock, CompactorConfig,
     DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, ErasureAbandon, ErasureRewriteOutcome, LeaseCheck,
-    LegalHoldCheck, MAX_MEMO_SNAPSHOT_BYTES, MAX_MEMO_SNAPSHOT_ENTRIES, MaintainError, OrphanPass,
+    LegalHoldCheck, MAX_MEMO_SNAPSHOT_BYTES, MaintainError, MemoSnapshotLimits, OrphanPass,
     PendingErasureRequest, QUERY_AUDIT_SHARD, RetentionConfig, WorkerSet, erasure_rewrite_bucket,
     pending_erasure_requests, read_all_memo_snapshots, scan_and_compact, sweep_alert_retention,
     sweep_audit_retention, sweep_erasure_requests, sweep_idempotency_markers, sweep_shard,
@@ -1709,8 +1709,9 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
     //
     // `last_memo_body` debounces the durable write: it holds the last snapshot
     // *body* (the RLE unit/exception content, without the ever-changing
-    // timestamp header) we successfully wrote, so a tick that changed nothing
-    // writes nothing. The debounce piggybacks on the existing discovery cadence;
+    // timestamp header) that was either written or found over a snapshot cap
+    // and not written, so a tick that changed nothing writes and warns
+    // nothing. The debounce piggybacks on the existing discovery cadence;
     // it needs no dedicated timer.
     let mut reseed = true;
     let mut last_memo_body: Option<Vec<u8>> = None;
@@ -1864,7 +1865,12 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                     // units this process now owns. Fail-open: a read fault logs and
                     // degrades to a cold start, never blocks the loop.
                     if reseed {
-                        match read_all_memo_snapshots(store.as_ref()).await {
+                        match read_all_memo_snapshots(
+                            store.as_ref(),
+                            MemoSnapshotLimits::DEFAULT,
+                        )
+                        .await
+                        {
                             Ok(read) => {
                                 if read.skipped_oversize > 0 {
                                     tracing::debug!(
@@ -1935,6 +1941,7 @@ async fn run_loop(ctx: LoopContext, mut shutdown: oneshot::Receiver<()>) -> Loop
                         &memo,
                         &mut last_memo_body,
                         clock.now_ns(),
+                        MemoSnapshotLimits::DEFAULT,
                     )
                     .await;
                 });
@@ -4110,9 +4117,10 @@ fn seed_memo_from_snapshots(
 /// and `last_body` left unchanged so the next cycle retries (fail-open). Returns
 /// whether a write happened (for tests and callers that count writes).
 ///
-/// A snapshot over [`MAX_MEMO_SNAPSHOT_BYTES`] framed or
-/// [`MAX_MEMO_SNAPSHOT_ENTRIES`] expanded is not written, since every reader
-/// would skip or reject it (issue #3199). Nothing is deleted: an older, smaller
+/// A snapshot over `limits.max_bytes` framed or `limits.max_entries` expanded
+/// is not written, since every reader under the same limits would skip or
+/// reject it (issue #3199); production passes [`MemoSnapshotLimits::DEFAULT`].
+/// Nothing is deleted: an older, smaller
 /// snapshot of this process stays on the store until the staleness bound
 /// excludes it.
 async fn persist_memo_snapshot(
@@ -4121,6 +4129,7 @@ async fn persist_memo_snapshot(
     memo: &MaintainMemo,
     last_body: &mut Option<Vec<u8>>,
     now_ns: i64,
+    limits: MemoSnapshotLimits,
 ) -> bool {
     let body = memo.snapshot_body();
     if last_body.as_deref() == Some(body.as_slice()) {
@@ -4128,13 +4137,12 @@ async fn persist_memo_snapshot(
     }
     let bytes = MaintainMemo::snapshot_bytes_from_body(&body, now_ns);
     let entries = memo.snapshot_entry_count();
-    let framed_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    if framed_bytes > MAX_MEMO_SNAPSHOT_BYTES || entries > MAX_MEMO_SNAPSHOT_ENTRIES {
+    if !limits.admits_write(bytes.len(), entries) {
         tracing::warn!(
-            framed_bytes,
-            max_bytes = MAX_MEMO_SNAPSHOT_BYTES,
+            framed_bytes = bytes.len(),
+            max_bytes = limits.max_bytes,
             entries,
-            max_entries = MAX_MEMO_SNAPSHOT_ENTRIES,
+            max_entries = limits.max_entries,
             "maintenance: memo snapshot over the size cap; not written, so its units \
              cold-start on the next reseed (ADR-0065 decision 3)"
         );
@@ -8838,7 +8846,15 @@ mod tests {
         // First persist: writes the snapshot object (one PUT).
         let before = store.metrics().snapshot();
         assert!(
-            persist_memo_snapshot(&store, &worker, &memo, &mut last_body, now).await,
+            persist_memo_snapshot(
+                &store,
+                &worker,
+                &memo,
+                &mut last_body,
+                now,
+                MemoSnapshotLimits::DEFAULT
+            )
+            .await,
             "first persist writes"
         );
         let after = store.metrics().snapshot();
@@ -8848,7 +8864,15 @@ mod tests {
         // the timestamp advanced (debounce compares the timestamp-free body).
         let before = store.metrics().snapshot();
         assert!(
-            !persist_memo_snapshot(&store, &worker, &memo, &mut last_body, now + 1_000_000).await,
+            !persist_memo_snapshot(
+                &store,
+                &worker,
+                &memo,
+                &mut last_body,
+                now + 1_000_000,
+                MemoSnapshotLimits::DEFAULT
+            )
+            .await,
             "an unchanged memo persists nothing"
         );
         let after = store.metrics().snapshot();
@@ -8864,7 +8888,15 @@ mod tests {
         let emptied = MaintainMemo::with_default_interval();
         let before = store.metrics().snapshot();
         assert!(
-            persist_memo_snapshot(&store, &worker, &emptied, &mut last_body, now + 2_000_000).await,
+            persist_memo_snapshot(
+                &store,
+                &worker,
+                &emptied,
+                &mut last_body,
+                now + 2_000_000,
+                MemoSnapshotLimits::DEFAULT
+            )
+            .await,
             "a changed memo persists again"
         );
         let after = store.metrics().snapshot();
@@ -8921,14 +8953,22 @@ mod tests {
         let now = SystemClock.now_ns();
         let mut last_body = None;
         assert!(
-            persist_memo_snapshot(&store, &worker_a, &memo_a, &mut last_body, now).await,
+            persist_memo_snapshot(
+                &store,
+                &worker_a,
+                &memo_a,
+                &mut last_body,
+                now,
+                MemoSnapshotLimits::DEFAULT
+            )
+            .await,
             "A persists its snapshot"
         );
 
         // Worker B (a different process id) reads the snapshots and warm-starts.
         let worker_b = WorkerSet::with_defaults(0);
         let live_b = worker_b.solo_live_set();
-        let snapshots = read_all_memo_snapshots(&store)
+        let snapshots = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
             .await
             .expect("read snapshots")
             .snapshots;
@@ -9105,7 +9145,15 @@ mod tests {
         let snap_now = SystemClock.now_ns();
         let mut last_body = None;
         assert!(
-            persist_memo_snapshot(&store, &a, &memo_a, &mut last_body, snap_now).await,
+            persist_memo_snapshot(
+                &store,
+                &a,
+                &memo_a,
+                &mut last_body,
+                snap_now,
+                MemoSnapshotLimits::DEFAULT
+            )
+            .await,
             "A persists its snapshot"
         );
 
@@ -9120,7 +9168,7 @@ mod tests {
             "A's departure ({{A,B}} -> {{B}}) must trigger a reseed"
         );
 
-        let snapshots = read_all_memo_snapshots(&store)
+        let snapshots = read_all_memo_snapshots(&store, MemoSnapshotLimits::DEFAULT)
             .await
             .expect("read snapshots")
             .snapshots;
@@ -13688,7 +13736,13 @@ mod memo_snapshot_cap_tests {
     use super::*;
 
     const NOW_NS: i64 = 1_000_000_000_000;
-    const CAP: u32 = MAX_MEMO_SNAPSHOT_ENTRIES as u32;
+
+    /// Limits small enough that a memo at either cap is tens of entries and a
+    /// few hundred bytes.
+    const SMALL: MemoSnapshotLimits = MemoSnapshotLimits {
+        max_bytes: 4096,
+        max_entries: 40,
+    };
 
     /// A framed snapshot of `(shard, hours)` units, each one Compacted frontier
     /// over hours `0..hours`, laid out as `MaintainMemo::snapshot_body` does.
@@ -13759,7 +13813,10 @@ mod memo_snapshot_cap_tests {
 
     /// Persist `memo` twice through the debounce, returning per call whether it
     /// wrote, the PUTs it issued and the cap warnings it logged.
-    async fn persist_twice(memo: &MaintainMemo) -> [(bool, u64, usize); 2] {
+    async fn persist_twice(
+        memo: &MaintainMemo,
+        limits: MemoSnapshotLimits,
+    ) -> [(bool, u64, usize); 2] {
         let store = InstrumentedStore::new(MemoryStore::new());
         let worker = WorkerSet::with_defaults(0);
         let warnings = Arc::new(Mutex::new(0usize));
@@ -13770,9 +13827,15 @@ mod memo_snapshot_cap_tests {
         for (i, slot) in out.iter_mut().enumerate() {
             let puts_before = store.metrics().snapshot().put.calls;
             let warns_before = *warnings.lock();
-            let wrote =
-                persist_memo_snapshot(&store, &worker, memo, &mut last_body, NOW_NS + i as i64)
-                    .await;
+            let wrote = persist_memo_snapshot(
+                &store,
+                &worker,
+                memo,
+                &mut last_body,
+                NOW_NS + i as i64,
+                limits,
+            )
+            .await;
             *slot = (
                 wrote,
                 store.metrics().snapshot().put.calls - puts_before,
@@ -13782,20 +13845,21 @@ mod memo_snapshot_cap_tests {
         out
     }
 
-    /// A memo of exactly the entry cap is written, read back, and seeds a
-    /// fresh memo with every entry.
+    /// A memo of exactly the entry cap is written, read back under the same
+    /// limits, and seeds a fresh memo with every entry.
     #[tokio::test]
     async fn memo_at_the_entry_cap_is_written_and_seeds_back() {
-        let memo = seeded_memo(&[frontier_snapshot(&[(0, CAP)])]);
-        assert_eq!(memo.snapshot_entry_count(), MAX_MEMO_SNAPSHOT_ENTRIES);
+        let cap = SMALL.max_entries as u32;
+        let memo = seeded_memo(&[frontier_snapshot(&[(0, cap)])]);
+        assert_eq!(memo.snapshot_entry_count(), SMALL.max_entries);
 
         let store = InstrumentedStore::new(MemoryStore::new());
         let worker = WorkerSet::with_defaults(0);
         let mut last_body = None;
-        assert!(persist_memo_snapshot(&store, &worker, &memo, &mut last_body, NOW_NS).await);
+        assert!(persist_memo_snapshot(&store, &worker, &memo, &mut last_body, NOW_NS, SMALL).await);
         assert_eq!(store.metrics().snapshot().put.calls, 1);
 
-        let read = read_all_memo_snapshots(&store).await.expect("read");
+        let read = read_all_memo_snapshots(&store, SMALL).await.expect("read");
         assert_eq!(read.skipped_oversize, 0);
         assert_eq!(read.snapshots.len(), 1);
         let mut successor = MaintainMemo::with_default_interval();
@@ -13807,38 +13871,54 @@ mod memo_snapshot_cap_tests {
                 |_, _, _| true,
             )
             .expect("an at-cap snapshot decodes");
-        assert_eq!(stats.seeded_buckets, MAX_MEMO_SNAPSHOT_ENTRIES);
-        assert_eq!(successor.len(), MAX_MEMO_SNAPSHOT_ENTRIES);
+        assert_eq!(stats.seeded_buckets, SMALL.max_entries);
+        assert_eq!(successor.len(), SMALL.max_entries);
     }
 
     /// One entry over the cap is not written and warns once; the identical
     /// next tick neither writes nor warns again.
     #[tokio::test]
     async fn memo_one_entry_over_the_cap_is_not_written() {
+        let cap = SMALL.max_entries as u32;
         let memo = seeded_memo(&[
-            frontier_snapshot(&[(0, CAP / 2 + 1)]),
-            frontier_snapshot(&[(1, CAP / 2)]),
+            frontier_snapshot(&[(0, cap / 2 + 1)]),
+            frontier_snapshot(&[(1, cap / 2)]),
         ]);
-        assert_eq!(memo.snapshot_entry_count(), MAX_MEMO_SNAPSHOT_ENTRIES + 1);
+        assert_eq!(memo.snapshot_entry_count(), SMALL.max_entries + 1);
         assert_eq!(
-            persist_twice(&memo).await,
+            persist_twice(&memo, SMALL).await,
             [(false, 0, 1), (false, 0, 0)],
             "no PUT on either tick, one warning on the first only"
         );
     }
 
-    /// A memo under the entry cap whose framed snapshot is over the byte cap
-    /// is not written either: 800,000 one-hour units at 43 bytes each frame to
-    /// more than 32 MiB.
+    /// The byte cap is checked on the framed snapshot independently of the
+    /// entry cap: seven one-hour units at 43 bytes each frame to 314 bytes,
+    /// which is written under a byte cap of 314 and not written, with one
+    /// warning, under 313.
     #[tokio::test]
     async fn memo_over_the_byte_cap_is_not_written() {
-        let units: Vec<(u32, u32)> = (0..800_000).map(|shard| (shard, 1)).collect();
+        let units: Vec<(u32, u32)> = (0..7).map(|shard| (shard, 1)).collect();
         let memo = seeded_memo(&[frontier_snapshot(&units)]);
-        assert_eq!(memo.snapshot_entry_count(), 800_000);
+        assert_eq!(memo.snapshot_entry_count(), 7);
         let framed = MaintainMemo::snapshot_bytes_from_body(&memo.snapshot_body(), NOW_NS).len();
-        assert!(framed as u64 > MAX_MEMO_SNAPSHOT_BYTES, "framed {framed}");
+        assert_eq!(framed, 1 + 8 + 4 + 7 * 43);
+
+        let at = MemoSnapshotLimits {
+            max_bytes: framed as u64,
+            max_entries: SMALL.max_entries,
+        };
         assert_eq!(
-            persist_twice(&memo).await,
+            persist_twice(&memo, at).await,
+            [(true, 1, 0), (false, 0, 0)],
+            "written once at exactly the byte cap"
+        );
+        let under = MemoSnapshotLimits {
+            max_bytes: framed as u64 - 1,
+            ..at
+        };
+        assert_eq!(
+            persist_twice(&memo, under).await,
             [(false, 0, 1), (false, 0, 0)],
             "no PUT on either tick, one warning on the first only"
         );
