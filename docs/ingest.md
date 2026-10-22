@@ -1513,8 +1513,11 @@ size can be held across the allocation, and the path is instead bounded per
 request to 16 MiB by tonic's `max_decoding_message_size` (verified against tonic
 0.14.6 and pinned by an end-to-end test). The OTAP decode path is likewise
 uncharged and remains term 2, but its per-request bound is larger than one
-16 MiB message and is not yet quantified (a `BatchArrowRecords` carries an
-uncapped vector of payloads, each capped at 16 MiB).
+16 MiB message, because a `BatchArrowRecords` carries an uncapped vector of
+payloads, each capped at 16 MiB. The decoded IPC bodies of one batch are
+bounded by `--otap-max-decoded-batch-bytes` (64 MiB by default), plus one
+16 MiB zstd payload buffer per in-flight batch; "Worst-case resident memory"
+below gives the full term.
 
 ### Projected resolved-label bytes (ADR-2708 D2)
 
