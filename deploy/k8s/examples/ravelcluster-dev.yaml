@@ -1,8 +1,8 @@
 # A minimal RavelCluster for local/dev use (ADR-0034 decision 6). Points at an
-# S3-compatible endpoint (RustFS/floci) and references three Secrets the
-# platform owner creates: one with keys accessKeyId/secretAccessKey, one whose
-# keys are tenant names and whose values are bearer tokens, and one with a
-# single key `key` holding the query-audit token key.
+# S3-compatible endpoint (RustFS/floci) and references four Secrets the
+# platform owner creates: accessKeyId/secretAccessKey, tenant names to bearer
+# tokens, the query-audit token key under `key`, and the maintain key file
+# under `keys`.
 apiVersion: ravel.nofire.ai/v1alpha1
 kind: RavelCluster
 metadata:
@@ -65,5 +65,11 @@ spec:
   maintain:
     enabled: true
     intervalSecs: 300
+    # A development key, created for example with
+    #   kubectl create secret generic ravel-maintain-keys -n ravel-system \
+    #     --from-literal="keys=$(openssl rand -hex 32)"
+    # Without this reference the operator creates no maintain Deployment.
+    keySecretRef:
+      name: ravel-maintain-keys
   retention:
     default: 30d
