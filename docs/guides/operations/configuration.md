@@ -2015,15 +2015,21 @@ that claims memory afterward.
 A flag budget subtracts no overhead reserve, and the resident set of the
 process can exceed the flag value. The allocator keeps freed pages for
 reuse, C libraries allocate outside the budget, and under concurrent query
-load some allocations are not yet charged to it. In measured
-concurrent-query runs on a 32 GB host shared with an object store, with
-`--memory-budget-bytes` at 24 GiB (25.8 GB) and ten connections, the
-resident set peaked at 29.2 GB, about 3.4 GB above the flag, and heap
-profiles found up to 12.7 GB of live SQL aggregation and scan state not
-charged to the budget. When the charged allocations are near the budget at
-the same time, the process can exceed the flag by about that much. On such a
-host, set the flag about 12 GB below the memory the other processes leave
-free, and more if your concurrent query load is heavier.
+load some allocations are not yet charged to it. Measured under a
+ten-connection concurrent SQL load:
+
+- Heap profiles found up to 12.7 GB of live SQL aggregation and scan state
+  not charged to the budget.
+- The allocator's retained pages and C-library allocations added up to about
+  4 GB of resident set on top of the live allocations.
+- On a 32 GB host shared with an object store, with the flag at 24 GiB
+  (25.8 GB), the resident set peaked at 29.2 GB, 3.4 GB above the flag; the
+  host's own memory, not the budget, capped that run.
+
+So the resident set can exceed the flag by about 17 GB when the charged
+allocations are near the budget. Leave that much between the flag and the
+memory the other processes leave free, and more under a heavier concurrent
+load.
 
 What the budget feeds:
 
