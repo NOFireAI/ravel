@@ -134,13 +134,23 @@ pub const HEARTBEAT_FORMAT_VERSION: u32 = 2;
 /// deployment reuses one key file for both.
 pub const MAINTAIN_RECORD_KEY_CONTEXT: &str = "ravel maintain worker record v1";
 
+/// The `blake3::derive_key` context maintain memo snapshot keys are derived
+/// under (ADR-3130, memo snapshot amendment). Distinct from
+/// [`MAINTAIN_RECORD_KEY_CONTEXT`], so a memo MAC never verifies as a heartbeat
+/// record MAC, or the reverse, under the same `--maintain-key-file` key.
+pub const MAINTAIN_MEMO_KEY_CONTEXT: &str = "ravel maintain memo snapshot v1";
+
 /// The maintain-worker record keys of one process (ADR-3130 decision 1): one
 /// per `--maintain-key-file` key, each
 /// `blake3::derive_key(MAINTAIN_RECORD_KEY_CONTEXT, file_key)`. The first
 /// mints; a record verifies under any of them. Never empty.
+///
+/// It also holds the memo snapshot keys derived from the same file keys under
+/// [`MAINTAIN_MEMO_KEY_CONTEXT`] ([`Self::memo_mac`], [`Self::memo_verifies`]).
 #[derive(Clone)]
 pub struct MaintainRecordKeys {
     keys: DerivedKeys,
+    memo: DerivedKeys,
 }
 
 /// [`MaintainRecordKeys::from_file_keys`] was given no key.
@@ -160,7 +170,24 @@ impl MaintainRecordKeys {
     pub fn from_file_keys(file_keys: &[[u8; 32]]) -> Result<Self, NoMaintainRecordKeys> {
         let keys = DerivedKeys::derive(MAINTAIN_RECORD_KEY_CONTEXT, file_keys)
             .ok_or(NoMaintainRecordKeys)?;
-        Ok(MaintainRecordKeys { keys })
+        let memo = DerivedKeys::derive(MAINTAIN_MEMO_KEY_CONTEXT, file_keys)
+            .ok_or(NoMaintainRecordKeys)?;
+        Ok(MaintainRecordKeys { keys, memo })
+    }
+
+    /// The memo snapshot MAC of `claim` under the first file key's memo key.
+    pub fn memo_mac(&self, claim: &[u8]) -> [u8; 32] {
+        *self.memo.mac(claim).as_bytes()
+    }
+
+    /// Whether `mac` is the memo snapshot MAC of `claim` under any file key's
+    /// memo key, compared in constant time. A `mac` that is not 32 bytes never
+    /// verifies.
+    pub fn memo_verifies(&self, claim: &[u8], mac: &[u8]) -> bool {
+        let Ok(mac) = <[u8; 32]>::try_from(mac) else {
+            return false;
+        };
+        self.memo.verifies(claim, &blake3::Hash::from_bytes(mac))
     }
 
     /// How many keys verify.
@@ -329,7 +356,7 @@ pub const REAP_WINDOW_FACTOR: i64 = 2;
 /// [`REAP_WINDOW_FACTOR`], which is the clock-skew margin between the object
 /// store's clock (which stamps the modification time reaping reads) and this
 /// reader's.
-pub(crate) fn reap_horizon_ns(window_ns: i64) -> i64 {
+pub const fn reap_horizon_ns(window_ns: i64) -> i64 {
     window_ns.saturating_mul(REAP_WINDOW_FACTOR)
 }
 
@@ -347,7 +374,7 @@ pub(crate) fn reap_horizon_ns(window_ns: i64) -> i64 {
 /// modification time (the in-memory oracle's default clock does exactly this).
 /// That is "unknown", never "ancient": the key is read normally and never
 /// reaped.
-pub(crate) fn mtime_stale(now_ns: i64, last_modified_unix_ms: i64, window_ns: i64) -> bool {
+pub fn mtime_stale(now_ns: i64, last_modified_unix_ms: i64, window_ns: i64) -> bool {
     if last_modified_unix_ms <= 0 {
         return false;
     }
@@ -770,6 +797,47 @@ mod tests {
             .collect();
         keys.sort();
         keys
+    }
+
+    /// The memo snapshot keys and the heartbeat record keys are derived from
+    /// one file key under different contexts, so a MAC minted for one never
+    /// verifies as the other over the same claim bytes. A second file key
+    /// verifies a memo MAC minted under it but never mints one.
+    #[test]
+    fn memo_and_record_macs_are_separated_and_the_first_key_mints() {
+        let k1 = [0x11u8; 32];
+        let k2 = [0x22u8; 32];
+        let keys = MaintainRecordKeys::from_file_keys(&[k1]).expect("one key");
+        let claim = b"the same claim bytes";
+
+        let memo_mac = keys.memo_mac(claim);
+        let record_mac = keys.keys.mac(claim);
+        assert_ne!(memo_mac, *record_mac.as_bytes());
+        assert!(keys.memo_verifies(claim, &memo_mac));
+        assert!(!keys.memo_verifies(claim, record_mac.as_bytes()));
+        assert!(
+            !keys
+                .keys
+                .verifies(claim, &blake3::Hash::from_bytes(memo_mac))
+        );
+        assert!(keys.keys.verifies(claim, &record_mac));
+        assert_eq!(
+            memo_mac,
+            *blake3::keyed_hash(&blake3::derive_key(MAINTAIN_MEMO_KEY_CONTEXT, &k1), claim)
+                .as_bytes()
+        );
+
+        // A truncated MAC is not a MAC.
+        assert!(!keys.memo_verifies(claim, &memo_mac[..31]));
+        assert!(!keys.memo_verifies(claim, &[]));
+
+        let both = MaintainRecordKeys::from_file_keys(&[k1, k2]).expect("two keys");
+        let only_k2 = MaintainRecordKeys::from_file_keys(&[k2]).expect("one key");
+        let minted_by_k2 = only_k2.memo_mac(claim);
+        assert!(both.memo_verifies(claim, &minted_by_k2), "any key verifies");
+        assert!(!keys.memo_verifies(claim, &minted_by_k2));
+        assert_eq!(both.memo_mac(claim), memo_mac, "the first key mints");
+        assert_ne!(both.memo_mac(claim), minted_by_k2);
     }
 
     /// The rendezvous hash is deterministic: same unit key and live set yields

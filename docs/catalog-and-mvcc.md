@@ -153,7 +153,9 @@ listed size and by a range GET of the cap plus one byte, and the decoder
 refuses a snapshot whose runs expand to more than 4,194,304 per-hour entries
 (`MAX_MEMO_SNAPSHOT_ENTRIES`); a writer whose snapshot is over either cap
 skips the write, leaving its units to a cold rescan (ADR-0065 snapshot size cap
-amendment).
+amendment). Each snapshot carries a MAC under the `--maintain-key-file` keys
+over the writer's process id, timestamp and body, and a reader seeds only from
+snapshots whose MAC verifies (ADR-3130 memo snapshot amendment).
 
 `sys/maintain/claims/compaction/<work_id_hex>` (ADR-1029 §1, Accepted) is the
 maintain role's advisory work-claim keyspace, the third root-level prefix
