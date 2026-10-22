@@ -69,6 +69,7 @@ fn server_config(mcp: McpConfig) -> ServerConfig {
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,
+        otap_max_decoded_batch_bytes: ravel_server::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
         metrics_tenant_labels: false,
         limits: ravel_server::LimitsConfig::default(),
         max_ingest_lag: ravel_server::DEFAULT_MAX_INGEST_LAG,
