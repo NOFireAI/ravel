@@ -1906,6 +1906,14 @@ async fn silent_peer_after_connect_is_detected_by_keepalive() {
         "the silent peer must be detected within the keepalive bound: \
          {elapsed:?} >= {bound:?}"
     );
+    // A fresh dial through the silent proxy fails at the TLS handshake bound,
+    // well under one keepalive interval; only the cached channel's keepalive
+    // takes this long.
+    assert!(
+        elapsed >= HTTP2_KEEPALIVE_INTERVAL,
+        "query 2 must have run on the cached channel until keepalive closed it: \
+         {elapsed:?} < {HTTP2_KEEPALIVE_INTERVAL:?}"
+    );
     assert_eq!(
         second.expect("query 2 answers through fallback"),
         local_value,
@@ -3604,10 +3612,9 @@ mod sql_slices {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn sql_tarpit_worker_falls_back_within_the_handshake_bound() {
         use ravel_server::distrib::TLS_HANDSHAKE_TIMEOUT;
-        /// A copy of `ravel_sql`'s private `DISTRIB_SLICE_CONNECT_TIMEOUT`, used
-        /// only to size the bound below. The tarpit accepts TCP at once, so the
-        /// connect timeout never adds to the elapsed time.
-        const DISTRIB_SLICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+        // Sizes the bound below only: the tarpit accepts TCP at once, so the
+        // connect timeout never adds to the elapsed time.
+        use ravel_sql::distributed::DISTRIB_SLICE_CONNECT_TIMEOUT;
 
         let shared = Arc::new(MemoryStore::new());
         let base = now_ns() - 10 * NS_PER_MIN;
@@ -3714,5 +3721,244 @@ mod sql_slices {
             .shutdown()
             .await
             .expect("coordinator shuts down");
+    }
+
+    /// A worker's store: GETs of the published data objects park until
+    /// [`Self::release`], so a slice `DoGet` the worker has accepted never
+    /// produces its first batch, and the worker's own heartbeat records stay in
+    /// a private store, so the coordinator's roster names only the location the
+    /// test writes.
+    struct HeldWorkerStore {
+        shared: Arc<MemoryStore>,
+        own_records: MemoryStore,
+        data_keys: HashSet<String>,
+        held: AtomicUsize,
+        released: std::sync::atomic::AtomicBool,
+        release: tokio::sync::Notify,
+    }
+
+    impl HeldWorkerStore {
+        fn new(shared: Arc<MemoryStore>, data_keys: HashSet<String>) -> Self {
+            HeldWorkerStore {
+                shared,
+                own_records: MemoryStore::new(),
+                data_keys,
+                held: AtomicUsize::new(0),
+                released: std::sync::atomic::AtomicBool::new(false),
+                release: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn backing(&self, key: &str) -> &MemoryStore {
+            if key.starts_with(ravel_fleet::query_workers::QUERY_WORKERS_PREFIX) {
+                &self.own_records
+            } else {
+                self.shared.as_ref()
+            }
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStoreBackend for HeldWorkerStore {
+        async fn put(
+            &self,
+            key: &str,
+            data: bytes::Bytes,
+            opts: PutOptions,
+        ) -> Result<PutOutcome, StoreError> {
+            self.backing(key).put(key, data, opts).await
+        }
+
+        async fn get(&self, key: &str, range: GetRange) -> Result<GetOutcome, StoreError> {
+            if self.data_keys.contains(key) {
+                self.held.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    // Register before the check, so a release between the
+                    // check and the await still wakes this read.
+                    let notified = self.release.notified();
+                    if self.released.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    notified.await;
+                }
+            }
+            self.backing(key).get(key, range).await
+        }
+
+        async fn put_multipart<'a>(
+            &'a self,
+            key: &str,
+        ) -> Result<Box<dyn MultipartUpload + 'a>, StoreError> {
+            self.backing(key).put_multipart(key).await
+        }
+
+        async fn head(&self, key: &str) -> Result<ObjectMeta, StoreError> {
+            self.backing(key).head(key).await
+        }
+
+        async fn list(
+            &self,
+            prefix: &str,
+            page: Option<PageToken>,
+        ) -> Result<ListPage, StoreError> {
+            self.backing(prefix).list(prefix, page).await
+        }
+
+        async fn list_delimited(&self, prefix: &str) -> Result<DelimitedList, StoreError> {
+            self.backing(prefix).list_delimited(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), StoreError> {
+            self.backing(key).delete(key).await
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            self.shared.capabilities()
+        }
+    }
+
+    /// Issue #3129, SQL lane: a slice whose connection goes silent after the
+    /// worker accepted its `DoGet` and before the first batch is detected by
+    /// the slice client's HTTP/2 keepalive, and the slice takes the
+    /// coordinator-local read. The worker is reached through a proxy and holds
+    /// the slice's segment read, so no batch can arrive; the proxy then drops
+    /// every byte. The statement must complete within `interval + timeout`
+    /// plus slack, and no sooner than one keepalive interval, which a re-dial
+    /// failing at the handshake bound would undercut. Without keepalive the
+    /// dead connection is never noticed and the statement fails at its
+    /// deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sql_silent_peer_after_connect_is_detected_by_keepalive() {
+        use ravel_sql::distributed::{
+            SLICE_HTTP2_KEEPALIVE_INTERVAL, SLICE_HTTP2_KEEPALIVE_TIMEOUT,
+        };
+
+        let shared = Arc::new(MemoryStore::new());
+        let base = now_ns() - 10 * NS_PER_MIN;
+        let data_keys: HashSet<String> = [
+            publish_on_shard(&shared, 0, &[(base, 1.5), (base + NS_PER_MIN, 2.5)]).await,
+            publish_on_shard(&shared, 1, &[(base, 1.5), (base + 2 * NS_PER_MIN, 3.5)]).await,
+        ]
+        .into_iter()
+        .collect();
+        let (start_ns, end_ns) = (base - 5 * NS_PER_MIN, now_ns());
+
+        let worker_store = Arc::new(HeldWorkerStore::new(shared.clone(), data_keys.clone()));
+        let worker = start_server_with(
+            worker_store.clone(),
+            Some(always_distribute_settings()),
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+            2,
+        )
+        .await;
+        let worker_fragment = worker
+            .fragment_addr
+            .expect("the dedicated fragment listener binds");
+        let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (proxy_addr, proxy_task) =
+            super::spawn_blackhole_proxy(worker_fragment, blackhole.clone()).await;
+        // A valid, MAC'd heartbeat naming the proxy as the only live worker.
+        ravel_fleet::query_workers::QueryWorkers::with_defaults(
+            proxy_addr.to_string(),
+            ravel_query::distrib::codec::PROTOCOL_VERSION,
+            ravel_fleet::query_workers::RecordKeys::from_file_keys(&[FRAGMENT_KEY])
+                .expect("record keys"),
+        )
+        .write_heartbeat(shared.as_ref(), now_ns())
+        .await
+        .expect("write proxy heartbeat");
+
+        let coordinator_store = Arc::new(DataStore {
+            inner: shared.clone(),
+            data_keys,
+            refuse: false,
+            data_gets: AtomicUsize::new(0),
+        });
+        let coordinator = start_server_with(
+            coordinator_store.clone(),
+            Some(always_distribute_settings()),
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+            2,
+        )
+        .await;
+        let coordinator_grpc = coordinator.grpc_addr.expect("gRPC binds in All mode");
+        let roster = coordinator
+            .sql_slice_workers
+            .clone()
+            .expect("--distributed-query builds the SQL roster");
+        let deadline = Instant::now() + DEADLINE;
+        let locations = loop {
+            let locations = roster.endpoints();
+            if !locations.is_empty() {
+                break locations;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the coordinator never listed the proxy"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(locations, vec![format!("https://{proxy_addr}")]);
+
+        let dials = coordinator
+            .sql_slice_tls_dials
+            .clone()
+            .expect("Flight SQL is served");
+        let started = Instant::now();
+        let statement = tokio::spawn(tokio::time::timeout(
+            super::HUNG_PEER_TEST_DEADLINE,
+            run_query(coordinator_grpc, start_ns, end_ns),
+        ));
+        // The worker has accepted a slice's TLS connection and its `DoGet`, and
+        // holds the read its first batch needs: the connection is established
+        // and nothing has been sent on the slice stream.
+        while worker_store.held.load(Ordering::SeqCst) == 0 {
+            assert!(
+                started.elapsed() < DEADLINE,
+                "no slice reached the worker through the proxy"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        blackhole.store(true, Ordering::SeqCst);
+        let outcome = statement.await.expect("the statement task runs");
+        let elapsed = started.elapsed();
+
+        let bound =
+            SLICE_HTTP2_KEEPALIVE_INTERVAL + SLICE_HTTP2_KEEPALIVE_TIMEOUT + Duration::from_secs(5);
+        // hygiene-allow: wall-clock -- the bound under test is hyper's real-time
+        // keepalive timer over a real socket; the miss is the 30 s statement
+        // deadline against 25 s.
+        assert!(
+            elapsed < bound,
+            "the silent slice must be detected within the keepalive bound: \
+             {elapsed:?} >= {bound:?}"
+        );
+        assert!(
+            elapsed >= SLICE_HTTP2_KEEPALIVE_INTERVAL,
+            "the slice must have waited on its established connection until \
+             keepalive closed it: {elapsed:?} < {SLICE_HTTP2_KEEPALIVE_INTERVAL:?}"
+        );
+        let rows = outcome
+            .expect("the statement finishes before the test deadline")
+            .expect("the statement answers through the coordinator-local read");
+        assert_eq!(rows, 3, "the cross-shard duplicate dedups");
+        assert!(dials.get() > 0, "the slice dials went out over TLS");
+        assert!(
+            coordinator_store.data_gets.load(Ordering::SeqCst) > 0,
+            "the coordinator read the segments itself"
+        );
+
+        worker_store.release();
+        proxy_task.abort();
+        coordinator
+            .shutdown()
+            .await
+            .expect("coordinator shuts down");
+        worker.shutdown().await.expect("worker shuts down");
     }
 }
