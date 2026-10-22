@@ -34,11 +34,17 @@ its `payload_compression` setting is IPC body compression. Both forms are
 held to the same per-payload cap on decoded bytes, and the per-stream
 dictionary budget counts decoded dictionary bytes. OTAP also bounds the
 decoded bytes one batch may hold across all of its payloads
-(`StreamConfig::max_decoded_batch_bytes`, 64 MiB by default): the payload
-that would cross it is refused before it is decoded, and the batch is
-nacked with `INVALID_ARGUMENT` while the stream stays open. Schemas and
-dictionaries arrive incrementally per stream; payloads reference them by
-`schema_id`.
+(`StreamConfig::max_decoded_batch_bytes`, set by the ravel-server flag
+`--otap-max-decoded-batch-bytes`, env `RAVEL_OTAP_MAX_DECODED_BATCH_BYTES`,
+64 MiB by default; `0` is refused): the payload that would cross it is
+refused before it is decoded, and the batch is nacked with
+`INVALID_ARGUMENT` and the status message "decoded batch exceeds cap of N
+bytes", N being the configured cap, while the stream stays open. Each
+payload may decode to the 16 MiB per-payload cap, so a batch carrying
+several payload types can need more than the default. The remedies are to
+raise `--otap-max-decoded-batch-bytes`, or to lower the exporter's batch
+size. Schemas and dictionaries arrive incrementally per stream; payloads
+reference them by `schema_id`.
 The receiver replies per batch with `BatchStatus` (ack/nack + retry hint).
 
 This is NOT generic Arrow Flight. Flight's `DoPut` could carry the same

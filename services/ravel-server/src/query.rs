@@ -1792,6 +1792,7 @@ mod catalog_cache_tests {
             alerting: crate::AlertEvalConfig::default(),
             oidc_refresh: None,
             otap: false,
+            otap_max_decoded_batch_bytes: crate::config::DEFAULT_OTAP_MAX_DECODED_BATCH_BYTES,
             limits: crate::LimitsConfig::default(),
             metrics_tenant_labels: false,
             deployment_key: None,
