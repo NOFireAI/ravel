@@ -220,10 +220,13 @@ when its closure runs no feature lane, and from about 93 GB to more than
 (CLAUDE.md's measured band), since the main suite and every lane share one
 target. The template's 70 is the hard stop because the spec does not
 choose the host, and a higher floor would turn a smaller healthy host into
-a lost dispatch. A spec whose `--dry-run` lists those lanes says so and
-tells the executor to quote the `df` line beside any link failure, since
-short of the headroom the run needs, it dies mid-link with a fake compiler
-error (two gate runs died at link on a shared executor volume another
+a lost dispatch. So the 70 does not prove a feature-lane gate will fit,
+and short of the headroom the run needs, it dies mid-link with a fake
+compiler error. A spec whose `--dry-run` lists those lanes therefore tells
+the executor to run `df -h .` right after any link failure, before
+anything else, and treat a volume within a few GB of full as a disk
+failure rather than a code bug (two gate runs died at link on a shared
+executor volume another
 task filled mid-run; 5 GB was the old floor and it measured nothing the
 gate needed). Scoped does not mean small: the closure of a crate low in
 the dependency graph is most of the workspace plus every feature lane
