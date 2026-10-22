@@ -74,9 +74,12 @@ Two constraints differ from ADR-1918:
    new-key MACs and the reverse, and each side owns units the other also owns.
    So: (1) append the new key after the old one everywhere and roll the pods;
    (2) move the new key to the first line (the minting key) and roll again;
-   (3) remove the old key and roll a third time. Step 3 must wait until step 2
-   has finished on every pod. It can happen any time after that, but until it
-   does, the old key still verifies.
+   (3) remove the old key and roll a third time. Steps 2 and 3 each must wait
+   until the previous step has finished on every pod: a pod minting with the
+   new key before every pod verifies it is rejected by the pods that do not,
+   and a pod dropping the old key before every pod mints with the new one
+   rejects the pods still minting with the old. Step 3 can happen any time
+   after step 2 has finished, but until it does, the old key still verifies.
 
 2. **`WorkerHeartbeat` gains `bytes mac = 5`, and `format_version` moves to
    2.** The MAC is `blake3::keyed_hash(record_key, claim)`, where
@@ -156,9 +159,15 @@ Two constraints differ from ADR-1918:
    `None` as "maintain disabled" and deletes the live Deployment, which would
    stop retention, compaction, erasure, scrub and the fold on every cluster
    that upgrades without the Secret. The error is not propagated out of
-   `desired_objects` either: the gateway and query tiers keep reconciling
-   until the Secret exists. A cluster upgrading this way keeps its previous
-   maintain pods, on the previous image, until the Secret is created. No pod
+   `desired_objects` either, so an existing cluster keeps its gateway and
+   query tiers reconciling until the Secret exists. A fresh cluster on
+   per-role storage credentials creates nothing until the Secret exists,
+   because its gateway and query tiers wait for maintain to bootstrap
+   `sys/gc`; its `Degraded` reason stays the withheld tier's once that wait
+   goes stale. A missing Secret behind a set ref withholds the tier the same
+   way. A cluster upgrading this way keeps its previous maintain Deployment
+   until the Secret is created; its pods keep running only while they keep
+   the previous image, which a mutable tag does not guarantee. No pod
    is rendered with a flag set that fails `Cli::validate`. The operator still
    generates no Secrets. `deploy/docker-compose` needs no key file: its only
    ravel-server runs `--mode all`.
@@ -227,8 +236,11 @@ flowchart LR
   that means creating a Secret and naming it in `spec.maintain.keySecretRef`;
   a cluster with the maintain tier enabled and no ref keeps its existing
   maintain pods unchanged and reports `Degraded` until the Secret exists
-  (decision 5). There is no default key, because a key shipped with the code
-  authenticates nothing.
+  (decision 5). Unchanged means the old pod template, so this holds only
+  while those pods keep running their old image: with a mutable image tag
+  and `imagePullPolicy: Always`, a restarted old pod pulls the new binary and
+  fails `Cli::validate`. There is no default key, because a key shipped with
+  the code authenticates nothing.
 - During a rolling deploy, old processes skip version-2 records (their
   `format_version > 1` guard) and new processes reject version-1 records. Each
   side sees a partial live set and may own units the other side also owns, so

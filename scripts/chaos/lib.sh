@@ -766,6 +766,16 @@ ravel_server_cmd() {
   fi
 }
 
+# One fresh key in the --maintain-key-file format (ADR-3130): 64 lowercase hex
+# characters and a newline, from 32 bytes of /dev/urandom. Returns 1 rather
+# than print anything else.
+chaos_maintain_key_hex() {
+  local hex
+  hex="$(od -An -v -tx1 -N32 /dev/urandom | tr -d ' \n')" || return 1
+  [[ "$hex" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$hex"
+}
+
 # SIGKILL a process by PID (real `kill -9`, ADR-0077 section 4) and reap it.
 # Deliberately SIGKILL, never SIGTERM: the scenario tests death without any
 # graceful-shutdown path running.

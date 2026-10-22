@@ -33,6 +33,10 @@ If nothing is reclaimed, first make sure that a `maintain` process runs.
 all three signals and every shard, on `--maintain-interval-secs` (default 300).
 It needs a backend that reports the `multipart` capability. It serves no
 ingest or query routes, and it still binds `--listen-http` for liveness.
+It also requires `--maintain-key-file`, the keys that sign and verify the
+registry records maintain processes divide the work through, and refuses to
+start without it; see
+[the maintain key file](deployment.md#the-maintain-key-file).
 
 `--maintain-tenant <name>`, repeatable, names a tenant that this process
 maintains in addition to every tenant named by `--tenant-token` or

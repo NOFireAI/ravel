@@ -842,8 +842,9 @@ pub struct DistributedQuerySpec {
 /// Maintain tier: enabled flag, replicas, interval, resources.
 ///
 /// `replicas` defaults to 1 (today's behavior). ADR-0065's bounded
-/// multi-worker ownership protocol (self-owned heartbeat keys under
-/// `sys/maintain/workers/` plus rendezvous-hash unit partitioning) makes
+/// multi-worker ownership protocol (heartbeat records under
+/// `sys/maintain/workers/`, authenticated with the maintain key file per
+/// ADR-3130, plus rendezvous-hash unit partitioning) makes
 /// `replicas > 1` safe: every maintain pod runs `--mode maintain`, discovers
 /// the live worker set from the shared store, and independently owns a
 /// disjoint slice of the `(tenant, signal, shard)` unit space, so N replicas
@@ -860,9 +861,9 @@ pub struct MaintainSpec {
     /// Replica count for the maintain Deployment. Defaults to 1. Values above 1
     /// are made safe by the ADR-0065 ownership protocol (rendezvous over a
     /// heartbeat-derived live worker set); the workers coordinate entirely
-    /// through the shared object store, so no additional per-pod wiring is
-    /// needed beyond `--mode maintain` and the shared store flags. Omit to keep
-    /// today's single-replica behavior.
+    /// through the shared object store, so every replica shares the same
+    /// flags, store, and key Secret (`keySecretRef`). Omit to keep today's
+    /// single-replica behavior.
     #[serde(default = "default_replicas")]
     pub replicas: i32,
 
@@ -901,6 +902,21 @@ pub struct MaintainSpec {
     /// comes from its ServiceAccount's Pod Identity association.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credentials_secret_ref: Option<LocalSecretRef>,
+
+    /// Secret holding the maintain key file under `keys`: one
+    /// 64-hex-character key per line, the first mints and all verify
+    /// (ADR-3130). Mounted on the maintain pods and passed as
+    /// `--maintain-key-file`, which `--mode maintain` requires. Required while
+    /// `enabled` is true: without it, or while the Secret it names does not
+    /// exist, the operator leaves any existing maintain Deployment exactly as
+    /// it is, creates none, and records a `Degraded` condition naming this
+    /// field or the Secret. The gateway and query tiers keep reconciling,
+    /// except on a fresh cluster with per-role storage credentials (including
+    /// `podIdentity`): there they wait for maintain to create `sys/gc`, so no
+    /// Deployment is created until the Secret exists. A change to the Secret
+    /// rolls the maintain pods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_secret_ref: Option<LocalSecretRef>,
 }
 
 impl Default for MaintainSpec {
@@ -912,6 +928,7 @@ impl Default for MaintainSpec {
             fold: None,
             resources: None,
             credentials_secret_ref: None,
+            key_secret_ref: None,
         }
     }
 }

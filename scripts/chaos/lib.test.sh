@@ -407,6 +407,27 @@ check "scenario 2 stamps the ingest exit after reaping it and seals from that st
 check "scenario 2 never seals from the last ack" "0" \
   "$(grep -c -F 'chaos_sealed_at_unix_s "$LAST_ACK_UNIX_S"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
 
+# `--mode maintain` refuses to start without --maintain-key-file (ADR-3130),
+# and two workers on different keys reject each other's registry records. The
+# one worker launcher passes the one key file, written after the trap that
+# removes it and before either worker starts.
+key_one="$(chaos_maintain_key_hex)"
+key_two="$(chaos_maintain_key_hex)"
+check "maintain key: 64 lowercase hex characters" "yes" \
+  "$([[ "${key_one}" =~ ^[0-9a-f]{64}$ ]] && echo yes || echo no)"
+check "maintain key: two calls differ" "yes" \
+  "$([[ -n "${key_one}" && "${key_one}" != "${key_two}" ]] && echo yes || echo no)"
+check "scenario 2: every --mode maintain launch carries the shared key file" "1 1" \
+  "$(grep -c -E -- '^[[:space:]]+--mode maintain \\$' "${CHAOS_DIR}/kill-maintain-worker.sh") $(grep -c -E -- '^[[:space:]]+--maintain-key-file "\$MAINTAIN_KEY_FILE" \\$' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+check "scenario 2: both workers start through the one launcher" "2" \
+  "$(grep -c -E '^start_worker "\$WORKER_[AB]_HTTP"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+trap_line="$(scenario2_line 'trap cleanup EXIT')"
+key_write_line="$(scenario2_line 'chaos_maintain_key_hex >"$MAINTAIN_KEY_FILE"')"
+check "scenario 2 writes the key after arming the trap and before starting a worker" "yes" \
+  "$([[ -n "${trap_line}" && "${trap_line}" -lt "${key_write_line:-0}" && "${key_write_line}" -lt "${workers_line:-0}" ]] && echo yes || echo no)"
+check "scenario 2's cleanup removes the key file" "1" \
+  "$(grep -c -F 'rm -f "$FIXTURE_PATH" "$MAINTAIN_KEY_FILE"' "${CHAOS_DIR}/kill-maintain-worker.sh")"
+
 # ---------------------------------------------------------------------------
 # Scenario 2's conservation verdict, with the could-not-measure guard. The
 # stubbed /metrics serves conservation aborts 1: a baseline of 1 is no rise,

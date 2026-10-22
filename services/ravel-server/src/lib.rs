@@ -2955,6 +2955,25 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         ))
     });
 
+    // The keys the maintain-worker registry records are signed and verified
+    // under (ADR-3130 decision 3), shared by the heartbeat task and scrub and
+    // counting rejects into the ownership family above. A maintain process
+    // without them refuses to start: an unauthenticated live set is the gap
+    // the ADR closes.
+    let maintain_membership = match (
+        &maintenance_ownership_metrics,
+        &config.maintain.worker_record_keys,
+    ) {
+        (Some(ownership), Some(keys)) => Some(
+            ravel_maintain::worker_set::MaintainMembership::new(keys.clone())
+                .with_record_rejects(Arc::clone(ownership.worker_record_rejects())),
+        ),
+        (Some(_), None) => anyhow::bail!(
+            "--mode maintain needs maintain-worker record keys (--maintain-key-file, ADR-3130)"
+        ),
+        (None, _) => None,
+    };
+
     // The RLOG k-way merge peak-bytes gauge (ADR-0065 decision 4). Built here,
     // before `config.maintain` is handed to `maintain::spawn` below, and
     // assigned onto the compactor config in place so the maintenance
@@ -3848,7 +3867,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
         fold::FoldTasks::none()
     };
 
-    let maintenance_tasks = if matches!(config.mode, Mode::Maintain) {
+    let maintenance_tasks = if let Some(membership) = maintain_membership.clone() {
         let discovery_metrics = tenant_discovery_metrics
             .clone()
             .unwrap_or_else(|| Arc::new(tenant_discovery::TenantDiscoveryMetrics::default()));
@@ -3877,6 +3896,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             safety_metrics,
             ownership_metrics,
             maintain_worker.clone(),
+            membership,
             live_set_tx.clone(),
             maintain_clock.clone(),
             fold::refold_queue_for_maintain(config.mode, &config.fold, &refold_queue),
@@ -4441,8 +4461,8 @@ pub async fn start_with_heartbeat_and_ipcrypt(
     // state above holds. See scrub.rs's module docs for why its persisted
     // per-shard cursor no longer has a true single writer under ADR-0065's
     // N-replica Maintain role (a benign racing overwrite, not a hazard).
-    let scrub_task = match (matches!(config.mode, Mode::Maintain), &scrub_metrics) {
-        (true, Some(metrics)) => scrub::spawn(
+    let scrub_task = match (&maintain_membership, &scrub_metrics) {
+        (Some(membership), Some(metrics)) => scrub::spawn(
             // Background class (ADR-0070): at-rest scrubbing is the same
             // deferred class as compaction/retention/sweep.
             store_background.clone(),
@@ -4451,6 +4471,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
             config.shard_count,
             metrics.clone(),
             maintain_worker.clone(),
+            membership.clone(),
             // A rotation must not outlive the data it verifies (ADR-1686
             // amendment): the tenant's retention window caps the rotation
             // length below --scrub-period when it is shorter.
@@ -5552,7 +5573,13 @@ mod startup_test_support {
                 enabled: false,
                 ..FoldTaskConfig::default()
             },
-            maintain: MaintenanceTaskConfig::default(),
+            maintain: MaintenanceTaskConfig {
+                worker_record_keys: matches!(mode, Mode::Maintain).then(|| {
+                    ravel_maintain::worker_set::MaintainRecordKeys::from_file_keys(&[[0x5C; 32]])
+                        .expect("one maintain key")
+                }),
+                ..MaintenanceTaskConfig::default()
+            },
             alerting: AlertEvalConfig::default(),
             oidc_refresh: None,
             otap: false,
@@ -5698,11 +5725,8 @@ mod loop_interval_startup_tests {
                 };
             }
             Loop::Maintain => {
-                config.maintain = MaintenanceTaskConfig {
-                    enabled: true,
-                    interval,
-                    ..MaintenanceTaskConfig::default()
-                };
+                config.maintain.enabled = true;
+                config.maintain.interval = interval;
             }
             Loop::AlertEval => {
                 config.alerting = AlertEvalConfig {

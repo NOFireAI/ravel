@@ -39,7 +39,7 @@ sys/ipcrypt/policy                                                      IPCrypt 
 sys/auth                                                                deployment-wide keyed-token-hash -> tenant map (CAS whole-record replace, additive; ADR-0066 §6)
 sys/t/<tenant_hash>                                                     per-tenant recovery manifest (keyed buckets only, write-once; ADR-0050 §3)
 admission/query/<process_id>.snapshot                                   fleet-global query concurrency snapshot (root-level, per-process, Overwrite; ADR-0061 §2)
-sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite; ADR-0065 §1)
+sys/maintain/workers/<process_id>                                       maintain-worker liveness heartbeat (root-level, per-process, Overwrite, MACed; ADR-0065 §1, ADR-3130)
 sys/maintain/memo/<process_id>                                          maintain-worker durable memo snapshot for warm start/handoff (root-level, per-process, Overwrite; ADR-0065 §3)
 sys/maintain/claims/compaction/<work_id_hex>                            advisory compaction claim (root-level, per-work-unit, CreateIfAbsent then CAS, additive; ADR-1029 §1)
 quarantine/<original key>/q<quarantined_at_ns>                          orphan-GC quarantine copy (root-level, immutable, reaped after the second horizon; ADR-0058 §6)
@@ -87,12 +87,25 @@ so no role holds a delete grant for the prefix.
 `sys/maintain/workers/<process_id>` (ADR-0065 §1) is the maintain role's
 worker-membership keyspace. Every maintain-role process writes, on a heartbeat
 interval `H` (default 60s), a small versioned-tag protobuf `WorkerHeartbeat`
-(`format_version`, `process_id`, `started_unix_ns`, `heartbeat_unix_ns`) to the
-single key named by its own stable process id, with a plain `Overwrite` (one
-writer per key, no CAS). On the same cadence each process lists the
-`sys/maintain/workers/` prefix and GETs siblings to compute the **live set** --
-itself plus every sibling whose heartbeat is within `3 * H` of the reader's
-clock -- and every process partitions the `(tenant_hash, signal, shard)` unit
+(`format_version` 2, `process_id`, `started_unix_ns`, `heartbeat_unix_ns`,
+`mac`) to the key named by its own stable process id, with a plain `Overwrite`
+(no CAS). The maintain role's IAM grant lets any holder write any key under
+the prefix, so the key name proves nothing; the record is authenticated
+instead (ADR-3130). `mac` is `blake3::keyed_hash(record_key, claim)` with
+`record_key = blake3::derive_key("ravel maintain worker record v1", file_key)`
+and `claim` built from field values, not protobuf bytes: `format_version` (u32
+BE), `process_id` (u64 BE length, then the bytes), `started_unix_ns` (i64 BE),
+`heartbeat_unix_ns` (i64 BE). The file keys come from `--maintain-key-file`,
+which `--mode maintain` requires: the first key mints and any key verifies. On
+the same cadence each process lists the `sys/maintain/workers/` prefix and
+GETs siblings to compute the **live set** -- itself plus every sibling whose
+record passes the ADR-3130 decision 4 checks (a GET bounded to 4096 + 1 bytes,
+`process_id` equal to the key, `format_version` exactly 2, a MAC that verifies
+under one of the reader's keys) and whose `heartbeat_unix_ns` is within
+`3 * H` of the reader's clock. A record that fails a check is skipped and
+counted in `ravel_maintain_worker_record_rejects_total{reason}`; a version-1
+record from an older process is rejected as `missing_mac`. Every process
+partitions the `(tenant_hash, signal, shard)` unit
 space over that live set by rendezvous (highest-random-weight) hashing, so N
 replicas divide the maintenance work rather than each paying for all of it.
 This is membership/ownership, deliberately **not** a lease (the existing
@@ -101,7 +114,16 @@ root-level key with no tenant dimension, like the query-admission snapshot
 above; a stale or missing heartbeat is self-correcting on the next interval and,
 past the `3 * H` window, its owner is treated as gone and its units are taken
 over (idempotent overlap during the transition, never lost or double-counted
-work). Nothing deletes these heartbeats (staleness detection replaces a sweep).
+work). A heartbeat key whose LIST modification time is older than twice the
+liveness window is deleted by the maintain heartbeat tick, from the same
+listing it reads the live set with, so on a backend that reports a LIST
+modification time the prefix stays proportional to the running fleet. Two
+cases keep a key under the prefix that never joins the live set. A running
+sibling whose clock is skewed past the liveness window keeps its modification
+time fresh, so its key is neither skipped nor reaped, and every read GETs it
+and counts it as `stale_stamp`. A backend that reports no usable modification
+time (`<= 0`) gets neither the GET skip nor the reap, so a dead process's key
+is never deleted and every read GETs it and counts it as `stale_stamp`.
 
 `sys/maintain/memo/<process_id>` (ADR-0065 §3) is the maintain role's durable
 per-worker memo snapshot: the same self-owned, root-level, `Overwrite` pattern

@@ -58,6 +58,10 @@ fn maintain_config(tenant: &TenantId) -> ServerConfig {
             enabled: true,
             interval: Duration::from_secs(1),
             shard_count: 1,
+            worker_record_keys: Some(
+                ravel_maintain::worker_set::MaintainRecordKeys::from_file_keys(&[[0x5C; 32]])
+                    .expect("one maintain key"),
+            ),
             ..ravel_server::MaintenanceTaskConfig::default()
         },
         alerting: ravel_server::AlertEvalConfig::default(),

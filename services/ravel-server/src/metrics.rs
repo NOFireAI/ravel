@@ -43,7 +43,7 @@
 //! which enables `sql`, because some variants share a
 //! key: `RejectReason`, `ScrubReason`, `ScrubUnreadableReason`,
 //! `AlertRetentionSkipReason`, `SupersededHeldReason`,
-//! `CapabilityRejectReason`, `QueryWorkerRecordRejectReason` and, in a
+//! `CapabilityRejectReason`, `WorkerRecordRejectReason` and, in a
 //! `flight-sql` build,
 //! `SliceRejectReason` all render `reason`,
 //! `Level` (log/tracing
@@ -445,10 +445,12 @@ pub enum Label {
     /// address, `unparsed`. Shares the `outcome` key with `AlertOutcome`.
     IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome),
     /// Why a live-set read rejected a sibling `sys/query/workers/` record
-    /// (ADR-1918 decision 4): `missing_mac`, `bad_mac`, `oversize`, or
-    /// `malformed`. A closed enum owned by `ravel_fleet`, which also owns the
-    /// label spelling. Shares the `reason` key with the other reason variants.
-    QueryWorkerRecordRejectReason(ravel_fleet::query_workers::RecordReject),
+    /// (ADR-1918 decision 4) or `sys/maintain/workers/` record (ADR-3130
+    /// decision 4): `missing_mac`, `bad_mac`, `oversize`, `malformed`, or
+    /// `stale_stamp`. A closed enum owned by `ravel_fleet`, which also owns the
+    /// label spelling and shares it between the two registries. Shares the
+    /// `reason` key with the other reason variants.
+    WorkerRecordRejectReason(ravel_fleet::record_auth::RecordReject),
 }
 
 /// The closed `site` set of `ravel_memory_gate_refusals_total` and
@@ -664,7 +666,7 @@ impl Label {
             Label::HeadRefusalUndrainedReason(_) => "reason",
             Label::IpcryptVariant(_) => "variant",
             Label::IpcryptOutcome(_) => "outcome",
-            Label::QueryWorkerRecordRejectReason(_) => "reason",
+            Label::WorkerRecordRejectReason(_) => "reason",
         }
     }
 
@@ -717,7 +719,7 @@ impl Label {
             Label::HeadRefusalUndrainedReason(reason) => reason.as_str().to_string(),
             Label::IpcryptVariant(variant) => ipcrypt_variant_name(*variant).to_string(),
             Label::IpcryptOutcome(outcome) => ipcrypt_outcome_name(*outcome).to_string(),
-            Label::QueryWorkerRecordRejectReason(reason) => reason.reason().to_string(),
+            Label::WorkerRecordRejectReason(reason) => reason.reason().to_string(),
         }
     }
 
@@ -5332,6 +5334,31 @@ pub struct MaintenanceOwnershipSnapshot {
     pub last_cycle_completed_unix_ns: i64,
     /// Panics the supervisor caught in the loop body and restarted after.
     pub loop_panics_total: u64,
+    /// Sibling `sys/maintain/workers/` records the heartbeat task's and
+    /// scrub's live-set reads rejected, indexed in `RecordReject::ALL` order
+    /// (ADR-3130 decision 4).
+    pub worker_record_rejects: [u64; ravel_fleet::record_auth::RecordReject::ALL.len()],
+}
+
+impl MaintenanceOwnershipSnapshot {
+    /// Read a scrape from the live [`crate::maintain::MaintenanceOwnershipMetrics`],
+    /// the mapping the `/metrics` handler uses, shared with the tests.
+    pub fn from_metrics(metrics: &crate::maintain::MaintenanceOwnershipMetrics) -> Self {
+        MaintenanceOwnershipSnapshot {
+            workers_live: metrics.workers_live(),
+            units_owned: metrics.units_owned(),
+            compactions_in_flight: metrics.compactions_in_flight(),
+            units_stalled: metrics.units_stalled(),
+            memo_warm_start_units: metrics.memo_warm_start_units(),
+            full_sweep_passes_total: metrics.full_sweep_passes_total(),
+            last_cycle_completed_unix_ns: metrics.last_cycle_completed_unix_ns(),
+            loop_panics_total: metrics.loop_panics_total(),
+            worker_record_rejects: metrics
+                .worker_record_rejects()
+                .by_reason()
+                .map(|(_, count)| count),
+        }
+    }
 }
 
 /// No `tenant_hash` label on any series here (ADR-0044 section 4): every
@@ -5465,6 +5492,27 @@ fn render_maintain_ownership_family(
         &[Label::Mode(mode)],
         snapshot.loop_panics_total,
     );
+
+    write_header(
+        out,
+        "ravel_maintain_worker_record_rejects_total",
+        "Sibling sys/maintain/workers/ records this process's live-set reads (the heartbeat \
+         task's and scrub's) rejected, by reason (ADR-3130 decision 4). A key whose \
+         modification time is past the liveness window is skipped before the read, uncounted; \
+         a verified record whose stamp is past the window is stale_stamp.",
+        "counter",
+    );
+    for (reason, count) in ravel_fleet::record_auth::RecordReject::ALL
+        .into_iter()
+        .zip(snapshot.worker_record_rejects)
+    {
+        write_sample(
+            out,
+            "ravel_maintain_worker_record_rejects_total",
+            &[Label::Mode(mode), Label::WorkerRecordRejectReason(reason)],
+            count,
+        );
+    }
 }
 
 /// One scrape's RLOG k-way merge peak-bytes gauge (ADR-0065 decision 4),
@@ -7896,10 +7944,7 @@ fn render_distrib_family(out: &mut String, mode: Mode, snapshot: &DistribSnapsho
         write_sample(
             out,
             "ravel_query_worker_record_rejects_total",
-            &[
-                Label::Mode(mode),
-                Label::QueryWorkerRecordRejectReason(reason),
-            ],
+            &[Label::Mode(mode), Label::WorkerRecordRejectReason(reason)],
             count,
         );
     }
@@ -8701,20 +8746,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> impl IntoResponse
         .as_ref()
         .map(|metrics| MaintenanceSafetySnapshot::from_metrics(metrics));
 
-    let maintain_ownership_snapshot =
-        state
-            .maintenance_ownership
-            .as_ref()
-            .map(|metrics| MaintenanceOwnershipSnapshot {
-                workers_live: metrics.workers_live(),
-                units_owned: metrics.units_owned(),
-                compactions_in_flight: metrics.compactions_in_flight(),
-                units_stalled: metrics.units_stalled(),
-                memo_warm_start_units: metrics.memo_warm_start_units(),
-                full_sweep_passes_total: metrics.full_sweep_passes_total(),
-                last_cycle_completed_unix_ns: metrics.last_cycle_completed_unix_ns(),
-                loop_panics_total: metrics.loop_panics_total(),
-            });
+    let maintain_ownership_snapshot = state
+        .maintenance_ownership
+        .as_ref()
+        .map(|metrics| MaintenanceOwnershipSnapshot::from_metrics(metrics));
 
     let scrub_snapshot = state.scrub.as_ref().map(|metrics| ScrubSnapshot {
         signals: crate::maintain::MAINTAINED_SIGNALS
@@ -9420,9 +9455,7 @@ mod tests {
             ),
             Label::IpcryptVariant(ravel_ipcrypt::policy::Variant::Deterministic),
             Label::IpcryptOutcome(ravel_ipcrypt::render::RenderOutcome::Encrypted),
-            Label::QueryWorkerRecordRejectReason(
-                ravel_fleet::query_workers::RecordReject::MissingMac,
-            ),
+            Label::WorkerRecordRejectReason(ravel_fleet::query_workers::RecordReject::MissingMac),
         ];
         let keys: Vec<&'static str> = one_of_each
             .iter()
@@ -9478,7 +9511,7 @@ mod tests {
                 Label::HeadRefusalUndrainedReason(_) => "reason",
                 Label::IpcryptVariant(_) => "variant",
                 Label::IpcryptOutcome(_) => "outcome",
-                Label::QueryWorkerRecordRejectReason(_) => "reason",
+                Label::WorkerRecordRejectReason(_) => "reason",
             })
             .collect();
         assert_eq!(
@@ -9559,7 +9592,7 @@ mod tests {
                 "variant",
                 // IpcryptOutcome reuses the `outcome` key.
                 "outcome",
-                // QueryWorkerRecordRejectReason (ADR-1918 decision 4) reuses
+                // WorkerRecordRejectReason (ADR-1918 decision 4) reuses
                 // the `reason` key.
                 "reason",
             ],
@@ -11764,6 +11797,7 @@ mod tests {
             // 1_758_000_123_500_000_000 ns is 1758000123.5 s.
             last_cycle_completed_unix_ns: 1_758_000_123_500_000_000,
             loop_panics_total: 2,
+            worker_record_rejects: [0; 5],
         };
         let mut out = String::new();
         render_maintain_ownership_family(&mut out, Mode::All, &snapshot);
@@ -11789,6 +11823,118 @@ mod tests {
                 "expected exactly one `{expected}` sample line:\n{out}"
             );
         }
+    }
+
+    /// ADR-3130 decision 4: the maintain-worker record reject counter renders
+    /// one sample per reason under exactly `{mode, reason}`, every reason
+    /// present at zero before any read. The counts are the ones a real
+    /// `WorkerSet` live-set read wrote through a membership sharing the
+    /// process's `MaintenanceOwnershipMetrics` handle, read the way the
+    /// `/metrics` handler reads them.
+    #[tokio::test]
+    async fn maintain_worker_record_reject_family_renders_each_reason_exactly() {
+        use prost::Message;
+        use ravel_maintain::worker_set::{
+            MaintainMembership, MaintainRecordKeys, WorkerSet, heartbeat_key,
+        };
+        use ravel_object_store::memory::MemoryStore;
+        use ravel_object_store::{ObjectStoreBackend, PutMode, PutOptions};
+
+        let family = "ravel_maintain_worker_record_rejects_total";
+        let samples_of = |body: &str| -> Vec<String> {
+            body.lines()
+                .filter(|l| l.starts_with(&format!("{family}{{")))
+                .map(str::to_string)
+                .collect()
+        };
+        let ownership = crate::maintain::MaintenanceOwnershipMetrics::new(3);
+
+        let mut zero = String::new();
+        render_maintain_ownership_family(
+            &mut zero,
+            Mode::Maintain,
+            &MaintenanceOwnershipSnapshot::from_metrics(&ownership),
+        );
+        assert_eq!(
+            samples_of(&zero),
+            vec![
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"missing_mac\"} 0",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"bad_mac\"} 0",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"oversize\"} 0",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"malformed\"} 0",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"stale_stamp\"} 0",
+            ],
+        );
+
+        // One unsigned version-2 record and one empty object: a missing_mac
+        // and a malformed reject.
+        let store = MemoryStore::new();
+        let now_ns = 1_000_000_000_000;
+        let forged = uuid::Uuid::new_v4();
+        let unsigned = ravel_proto::sys::v1::WorkerHeartbeat {
+            format_version: 2,
+            process_id: forged.as_bytes().to_vec(),
+            started_unix_ns: now_ns,
+            heartbeat_unix_ns: now_ns,
+            mac: Vec::new(),
+        };
+        let opts = || PutOptions {
+            mode: PutMode::Overwrite,
+            checksum: None,
+        };
+        store
+            .put(
+                &heartbeat_key(&forged),
+                unsigned.encode_to_vec().into(),
+                opts(),
+            )
+            .await
+            .expect("put unsigned");
+        store
+            .put(
+                &heartbeat_key(&uuid::Uuid::new_v4()),
+                Vec::new().into(),
+                opts(),
+            )
+            .await
+            .expect("put empty");
+        let membership = MaintainMembership::new(
+            MaintainRecordKeys::from_file_keys(&[[3; 32]]).expect("one key"),
+        )
+        .with_record_rejects(Arc::clone(ownership.worker_record_rejects()));
+        let reader = WorkerSet::new(
+            now_ns,
+            std::time::Duration::from_secs(60),
+            3,
+            ravel_maintain::worker_set::DEFAULT_UNIT_CONCURRENCY,
+        );
+        let live = reader
+            .live_set(&store, &membership, now_ns)
+            .await
+            .expect("live set");
+        assert_eq!(live, vec![reader.process_id()], "only the reader is live");
+
+        let mut body = String::new();
+        render_maintain_ownership_family(
+            &mut body,
+            Mode::Maintain,
+            &MaintenanceOwnershipSnapshot::from_metrics(&ownership),
+        );
+        assert_eq!(
+            body.matches(&format!("# TYPE {family} counter\n")).count(),
+            1,
+            "exactly one counter TYPE header:\n{body}"
+        );
+        assert_eq!(
+            samples_of(&body),
+            vec![
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"missing_mac\"} 1",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"bad_mac\"} 0",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"oversize\"} 0",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"malformed\"} 1",
+                "ravel_maintain_worker_record_rejects_total{mode=\"maintain\",reason=\"stale_stamp\"} 0",
+            ],
+        );
     }
 
     /// The alerting family renders every `AlertEvalReport` figure with the
