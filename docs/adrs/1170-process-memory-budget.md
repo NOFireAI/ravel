@@ -1261,3 +1261,114 @@ sized the 40% share against. A 7 GB cache, 23.8% of a 29.4 GB budget,
 measured the same hot sum as the 40% share (59.92 s against 59.90 s,
 ADR-2023's issue #2683 amendment), so on that corpus the set the warm runs
 re-read fit in 7 GB; 6.67 GB itself was not measured.
+
+## Amendment (2026-10-22, issue #3200): the operator pins the query budget below the pod's memory limit
+
+<!-- amendment-applies: none reason="adds an operator decision on top of the available-memory and small-host reserve amendments; every server rule they state stands as written and no earlier wording is retired" -->
+
+**What was found.** Under concurrent SQL a query process can exceed its
+budget by about the budget's own size. The #3181 heap profiles (readout:
+https://github.com/NOFireAI/ravel/issues/3181#issuecomment-6340826606) found
+up to 12.7 GB of live DataFusion aggregation state and `ravel_sql::logs_scan`
+dictionary arrays that the budget never charges, at a 24 GiB budget with ten
+connections. Allocator-retained pages come on top of that (ADR-2633, below),
+and PR #3194 put both figures in the configuration guide.
+
+A larger pod limit does not help on its own. The operator rendered no
+`--memory-budget-bytes`, so under a cgroup limit the server derives the budget
+as the limit minus the reserve (`derived-cgroup`, available-memory amendment
+item 1, with the reserve of the small-host reserve amendment). Raising the
+limit raises the budget with it, by the whole increase from 8 GiB up and by
+three quarters of it below, and leaves the slack at the reserve: a quarter
+of the limit below 8 GiB, 2 GiB from 8 GiB up. The
+uncharged state grows with the budget, so no limit is large enough while the
+budget derives from it. The operator also had no way to set the budget:
+`--memory-budget-bytes` has no `env =` binding, and the RavelCluster CRD has
+no per-tier args field.
+
+**Decision.**
+
+1. `spec.query.memoryBudgetBytes` (optional, bytes, minimum 1) renders
+   `--memory-budget-bytes <value>` on the query container and nowhere else.
+   Unset, the query Deployment renders byte for byte as before. The gateway
+   claims no budget (gateway amendment). Maintain gets no field: #3181
+   profiled the query path, so maintain's uncharged state is unmeasured, not
+   cleared.
+2. With the field set, the operator compares the query container's
+   `resources.limits.memory` with two figures. `held` is what `--mode query`
+   keeps outside the budget: `NON_BUDGET_BASELINE_BYTES`, 256 MiB, which
+   `non_budget_floor_bytes` returns in a mode that holds no ingest buffer
+   (small-host reserve amendment). `headroom` is memory for what the budget
+   does not charge.
+   - **A hard floor that refuses.** No limit, a limit that does not parse as
+     a Kubernetes quantity, or a limit below `budget + held` is refused. Such a
+     pod cannot hold the budget and the baseline even if every allocation were
+     charged. The operator does not apply the query Deployment: a running one
+     stays exactly as it is and none is created. It reports `Degraded` with
+     reason `QueryMemoryBudgetExceedsLimit` (`QueryMemoryLimitUnparseable`
+     for a limit that does not parse), naming the field, the limit, the
+     budget and `held`. Gateway and maintain keep reconciling.
+   - **A reported, overridable headroom that does not refuse.** A limit at
+     or above the floor but below `budget + held + headroom` still renders
+     and rolls the query Deployment, and reports `Degraded` with reason
+     `QueryMemoryHeadroomLow`, giving the limit, `budget + held` and the
+     headroom, and naming `spec.query.memoryHeadroomBytes` as the override.
+     The headroom is an estimate from one workload, not a floor the pod
+     provably needs, so it reports rather than refuses, like an incomplete
+     `distributedQuery` block. A deployment that measured less sets
+     `memoryHeadroomBytes`, which replaces the default.
+3. The default headroom is one function in the operator
+   (`default_query_memory_headroom`), so it changes in one place. It is
+   provisional:
+
+   `headroom(B) = ceil(0.53 * B) + ceil(min(B, 8 GiB) * 6.6 / 8)`
+
+   - The SQL state term is from #3181: up to 12.7 GB uncharged at a
+     24 GiB budget with ten connections. 0.53 is 12.7 divided by 24, a GB
+     figure over a GiB budget; in bytes the measured ratio is 0.49, so the
+     term is about 7.5% above it. It assumes the uncharged state scales
+     linearly with the budget, which was measured at one budget and one
+     concurrency.
+   - The retention term is from ADR-2633's Context, measured at an 8 GB
+     budget with ten connections over 20 ClickBench files. Peak retention
+     (jemalloc `resident` minus `allocated`) was 2.54 to 6.54 GB across the
+     six runs under "What was measured" and 6.00 and 6.63 GB in the two runs
+     with the aggregate hold. Retention follows allocator churn, not the
+     budget value, so from 8 GiB up the term stays at that upper bound,
+     6.6 GiB (7,086,696,039 bytes, just above the 6.63 GB measured).
+   - Below 8 GiB the retention term scales down with the budget, at 6.6/8
+     of it. Retained pages are freed allocations the allocator keeps, so they
+     cannot exceed what the process allocated at its peak, and a smaller
+     budget bounds that peak lower. The linear scaling itself is
+     unmeasured: no profile exists below an 8 GB budget. A small-budget
+     cluster should measure its own peak resident set under its own
+     concurrency and set `memoryHeadroomBytes` from it.
+   - C-library allocations, the third uncharged source the configuration
+     guide names, are in neither term.
+
+   The default is 2,182,380,259 bytes at a 1.5 GiB budget and
+   20,744,692,041 bytes at 24 GiB, the configuration guide's "about 20 GB".
+   It is a workaround for #3181. When 0.26 charges the SQL state to the
+   budget, the SQL term drops and the default changes here and in the
+   operator function.
+4. The stg-1 query pods (NOFireAI/engineering#1834) are the worked example:
+   budget 1.5 GiB (1,610,612,736), limit 3.5 Gi (3,758,096,384), request
+   2 Gi. The floor is 1,879,048,192 bytes and the limit clears it, so the
+   Deployment rolls. Floor plus the default headroom is 4,061,428,451 bytes,
+   above the limit, so the cluster reports `QueryMemoryHeadroomLow`: the pod
+   has 1.75 GiB above the floor where the default asks for about 2.03 GiB.
+   With a derived budget at the old 2 Gi limit the slack was 512 MiB.
+
+**Ranking.** A pass reports one `Degraded` entry. The refusal ranks below a
+missing audit-token key and a missing distributed-query Secret, whose query
+pods could not start at all, and above a withheld maintain Deployment, since
+it holds back the Deployment that serves reads. The headroom report ranks
+last, below a router render error: every other reason describes something
+not running as the spec asks, while a cluster with low headroom runs exactly
+as asked.
+
+**Rejected.** A per-tier `extraArgs` field (NOFireAI/engineering#1846) would
+pin the budget but give the operator nothing to check the limit against.
+Refusing on the headroom as well as the floor was rejected: the headroom is
+measured on one workload and partly extrapolated, and a refusal there would
+block a cluster whose own measurement shows it is safe.
