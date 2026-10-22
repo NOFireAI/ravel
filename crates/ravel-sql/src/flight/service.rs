@@ -154,7 +154,7 @@ pub struct RavelFlightSqlService {
 /// configuration the server passes in (`slice_client_tls`), a silent
 /// connection by the slice client's HTTP/2 keepalive, and the rest of the
 /// statement by its own deadline.
-const DISTRIB_SLICE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const DISTRIB_SLICE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl RavelFlightSqlService {
     /// Build the service.

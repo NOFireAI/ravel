@@ -115,7 +115,7 @@ use tonic::metadata::MetadataMap;
 
 pub use metadata::{CATALOG_NAME, SCHEMA_NAME, TABLE_TYPE};
 pub use request::{END_KEY, START_KEY, TIMEOUT_KEY};
-pub use service::RavelFlightSqlService;
+pub use service::{DISTRIB_SLICE_CONNECT_TIMEOUT, RavelFlightSqlService};
 pub use slice::{FlightListenerRole, SliceReject, SliceRejectCounters};
 
 /// The injected wall clock the Flight path reads.
