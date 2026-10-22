@@ -32,8 +32,13 @@ before decode, since arrow's LZ4_FRAME reader does not hold a buffer to its
 declared length. The collector's `otelarrow` exporter sends the second form:
 its `payload_compression` setting is IPC body compression. Both forms are
 held to the same per-payload cap on decoded bytes, and the per-stream
-dictionary budget counts decoded dictionary bytes. Schemas and dictionaries
-arrive incrementally per stream; payloads reference them by `schema_id`.
+dictionary budget counts decoded dictionary bytes. OTAP also bounds the
+decoded bytes one batch may hold across all of its payloads
+(`StreamConfig::max_decoded_batch_bytes`, 64 MiB by default): the payload
+that would cross it is refused before it is decoded, and the batch is
+nacked with `INVALID_ARGUMENT` while the stream stays open. Schemas and
+dictionaries arrive incrementally per stream; payloads reference them by
+`schema_id`.
 The receiver replies per batch with `BatchStatus` (ack/nack + retry hint).
 
 This is NOT generic Arrow Flight. Flight's `DoPut` could carry the same
