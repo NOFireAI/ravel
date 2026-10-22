@@ -1487,8 +1487,17 @@ write_evidence() {
   rm -f "$KIT/evidence.tgz"
   # The kernel log names an OOM kill's victim and its anon-rss, which no
   # sampler here can see.
-  journalctl -k --no-pager -o short-iso >"$KIT/kernel.log" 2>&1 \
-    || dmesg -T >"$KIT/kernel.log" 2>&1 || true
+  if journalctl -k --no-pager -o short-iso >"$KIT/kernel.log" 2>"$KIT/kernel.err"; then
+    :
+  elif dmesg -T >"$KIT/kernel.log" 2>>"$KIT/kernel.err"; then
+    :
+  else
+    # A file holding only an error would read as a log with no OOM kill in it.
+    { echo "kernel log unavailable: journalctl -k and dmesg -T both failed"; cat "$KIT/kernel.err"; } \
+      >"$KIT/kernel.log"
+    say "kernel log unavailable; kernel.log in the evidence says why"
+  fi
+  rm -f "$KIT/kernel.err"
   for f in kernel.log server-*.log rustfs.log run.log progress.log arm.env load.out fold.out load.time \
     compact.time object-counts stamps verify out phases.json burst-start.json burst-end.json; do
     # shellcheck disable=SC2086 # globs expand here on purpose
