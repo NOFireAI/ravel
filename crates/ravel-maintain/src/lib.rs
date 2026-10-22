@@ -142,8 +142,9 @@ pub use rlog::RlogCodec;
 pub use rspan_codec::SpanCodec;
 pub use scan::{
     DEFAULT_MEMO_SNAPSHOT_STALENESS_NS, MAX_MEMO_SNAPSHOT_BYTES, MAX_MEMO_SNAPSHOT_ENTRIES,
-    MaintainMemo, MaintainReport, MemoSnapshotError, MemoSnapshotLimits, ScanReport, SeedStats,
-    scan_and_compact, scan_and_maintain,
+    MEMO_SNAPSHOT_MAC_BYTES, MIN_MEMO_SNAPSHOT_FRAME_BYTES, MaintainMemo, MaintainReport,
+    MemoSnapshotError, MemoSnapshotLimits, MemoSnapshotReject, MemoSnapshotRejects, ScanReport,
+    SeedStats, VerifiedSnapshot, scan_and_compact, scan_and_maintain,
 };
 pub use scrub::{
     CoveringPostings, SCRUB_MAX_CATCHUP, SCRUB_REQUESTS_PER_ENTRY, SCRUB_REQUESTS_PER_OBJECT,
