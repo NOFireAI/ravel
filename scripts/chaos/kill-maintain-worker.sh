@@ -241,6 +241,10 @@ WORKER_A_LOG="$(chaos_logfile maintain-worker worker-a)"
 WORKER_B_LOG="$(chaos_logfile maintain-worker worker-b)"
 INGEST_LOG="$(chaos_logfile maintain-worker ingest)"
 FIXTURE_PATH="$(mktemp --suffix=.pb)"
+# The one --maintain-key-file both workers read (ADR-3130). `--mode maintain`
+# refuses to start without one, and two workers keyed differently would reject
+# each other's registry records and each own every unit.
+MAINTAIN_KEY_FILE="$(mktemp --suffix=.key)"
 
 cleanup() {
   # The pending exit status, read before anything else can replace it. A
@@ -257,10 +261,11 @@ cleanup() {
     fi
   done
   chaos_release_logs "$code" "$WORKER_A_LOG" "$WORKER_B_LOG" "$INGEST_LOG"
-  rm -f "$FIXTURE_PATH"
+  rm -f "$FIXTURE_PATH" "$MAINTAIN_KEY_FILE"
   rustfs_down
 }
 trap cleanup EXIT
+chaos_maintain_key_hex >"$MAINTAIN_KEY_FILE"
 
 # Start a maintain-role worker. $1=http $2=grpc $3=logfile; echoes the PID via
 # the named global set by the caller. We set the PID through a nameref so the
@@ -272,6 +277,7 @@ start_worker() {
   mapfile -d '' -t argv < <(ravel_server_cmd \
     --store s3 \
     --mode maintain \
+    --maintain-key-file "$MAINTAIN_KEY_FILE" \
     --listen-http "$http_addr" \
     --listen-grpc "$grpc_addr" \
     --tenant-token "${CHAOS_TENANT_TOKEN}=${CHAOS_TENANT_NAME}" \
