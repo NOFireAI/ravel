@@ -157,6 +157,9 @@ struct Inner {
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
     cache_bytes: AtomicU64,
+    /// Bytes handed to this query by a read another caller had in flight
+    /// for the same key. See the snapshot field of the same name.
+    late_served_bytes: AtomicU64,
     /// Commit records served from the catalog's local decoded commit-record
     /// cache on the resolve path, counted once per record. See the snapshot
     /// field of the same name for the full contract and the four caches it
@@ -282,6 +285,14 @@ impl QueryAccounting {
     /// Add bytes served from an in-process cache.
     pub fn add_cache_bytes(&self, bytes: u64) {
         self.0.cache_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Add bytes a read cache handed this query from another caller's
+    /// in-flight read of the same key: no GET of this query's own moved them
+    /// and no resident entry served them. See
+    /// [`QueryAccountingSnapshot::late_served_bytes`].
+    pub fn add_late_served_bytes(&self, bytes: u64) {
+        self.0.late_served_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Record one commit record whose decoded bytes were served from the
@@ -446,6 +457,7 @@ impl QueryAccounting {
         saturating_fetch_add(&self.0.cache_hits, other.cache_hits);
         saturating_fetch_add(&self.0.cache_misses, other.cache_misses);
         saturating_fetch_add(&self.0.cache_bytes, other.cache_bytes);
+        saturating_fetch_add(&self.0.late_served_bytes, other.late_served_bytes);
         saturating_fetch_add(
             &self.0.commit_record_cache_hits,
             other.commit_record_cache_hits,
@@ -483,6 +495,7 @@ impl QueryAccounting {
             cache_hits: self.0.cache_hits.load(Ordering::Relaxed),
             cache_misses: self.0.cache_misses.load(Ordering::Relaxed),
             cache_bytes: self.0.cache_bytes.load(Ordering::Relaxed),
+            late_served_bytes: self.0.late_served_bytes.load(Ordering::Relaxed),
             commit_record_cache_hits: self.0.commit_record_cache_hits.load(Ordering::Relaxed),
             decompressed_bytes: self.0.decompressed_bytes.load(Ordering::Relaxed),
             segments_opened: self.0.segments_opened.load(Ordering::Relaxed),
@@ -513,6 +526,15 @@ pub struct QueryAccountingSnapshot {
     pub cache_hits: u64,
     pub cache_misses: u64,
     pub cache_bytes: u64,
+    /// Bytes a read cache handed this query from a read another caller had in
+    /// flight for the same key (a single-flight follower, or a re-check that
+    /// found the leader's bytes resident only after this query's own miss).
+    /// The read counts as a cache miss and charges neither
+    /// [`Self::cache_bytes`] nor [`Self::s3_bytes`], since this query neither
+    /// found the entry resident nor issued the GET; this is where those bytes
+    /// are counted. Decoded-entry bytes as the cache holds them, NOT wire
+    /// bytes. Process-local: a distributed worker's report does not carry it.
+    pub late_served_bytes: u64,
     /// Commit records whose decoded bytes were served from the catalog's local
     /// decoded commit-record cache during this resolve, counted **once per
     /// record**, at the resolve-wide cache lookup that runs before any record
@@ -688,6 +710,9 @@ impl QueryAccountingSnapshot {
             cache_hits: self.cache_hits.saturating_add(other.cache_hits),
             cache_misses: self.cache_misses.saturating_add(other.cache_misses),
             cache_bytes: self.cache_bytes.saturating_add(other.cache_bytes),
+            late_served_bytes: self
+                .late_served_bytes
+                .saturating_add(other.late_served_bytes),
             commit_record_cache_hits: self
                 .commit_record_cache_hits
                 .saturating_add(other.commit_record_cache_hits),
@@ -1139,6 +1164,29 @@ mod tests {
             merged.peak_intermediate_bytes, 200,
             "peak is the max across folded slices and the handle's own, never a sum"
         );
+    }
+
+    #[test]
+    fn late_served_bytes_count_apart_from_cache_and_get_bytes_and_merge() {
+        let a = QueryAccounting::new();
+        a.add_late_served_bytes(300);
+        a.add_cache_bytes(5);
+        let sa = a.snapshot();
+        assert_eq!(sa.late_served_bytes, 300);
+        assert_eq!(
+            sa.cache_bytes, 5,
+            "a late serve is not a resident-cache serve"
+        );
+        assert_eq!(sa.s3_bytes(AccountedOp::Get), 0, "nor a GET of its own");
+
+        let b = QueryAccounting::new();
+        b.add_late_served_bytes(u64::MAX);
+        assert_eq!(sa.saturating_add(&b.snapshot()).late_served_bytes, u64::MAX);
+
+        let agg = QueryAccounting::new();
+        agg.merge_snapshot(&sa);
+        agg.merge_snapshot(&sa);
+        assert_eq!(agg.snapshot().late_served_bytes, 600);
     }
 
     #[test]

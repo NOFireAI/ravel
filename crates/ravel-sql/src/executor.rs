@@ -140,9 +140,9 @@ use ravel_types::accounting::{
 use ravel_types::{CommitToken, METRIC_NAME_LABEL, Signal, TenantHash, TimeRange};
 
 use crate::access_intent::{
-    CacheCounterMark, StatementCacheStats, StatementReadBytes, classify_access_intent,
+    CacheCounterMark, ReadShape, StatementCacheStats, StatementReadBytes, classify_access_intent,
     plan_has_key_equality, plan_is_predicate_free, reads_whole_lane, size_trigger_applies,
-    size_trigger_lane,
+    size_trigger_lane, trigger_read_bytes,
 };
 use crate::alerts_provider::AlertsTableProvider;
 use crate::audit_provider::AuditTableProvider;
@@ -2282,6 +2282,7 @@ impl SqlExecutor {
                 .iter()
                 .map(|(signal, snapshot)| (*signal, snapshot))
                 .collect();
+            let read_shape = ReadShape::new(req.window, req.row_window, req.max_rows);
             phase_accounting.set_access_intent(
                 self.statement_access_intent(
                     tenant_hash,
@@ -2290,13 +2291,19 @@ impl SqlExecutor {
                     &lane_refs,
                     parquet.is_some(),
                     req.window,
+                    read_shape,
                     req.now_ns,
                     &declared,
                 )
                 .await,
             );
-            let read_bytes_key =
-                self.read_bytes_key(tenant_hash, statement, &lane_refs, parquet.is_some());
+            let read_bytes_key = self.read_bytes_key(
+                tenant_hash,
+                statement,
+                read_shape,
+                &lane_refs,
+                parquet.is_some(),
+            );
             // Whether a logs scan probes KEY_IDX is known only once the plan
             // has pushed its filters down, so both shapes are taken here and
             // the attempt's plan picks one.
@@ -2363,12 +2370,8 @@ impl SqlExecutor {
                     let phase_snapshot = phase_accounting.snapshot();
                     let accounting = phase_snapshot.pooled();
                     if let Some(key) = read_bytes_key {
-                        self.statement_read_bytes.record(
-                            key,
-                            accounting
-                                .cache_bytes
-                                .saturating_add(accounting.s3_bytes(AccountedOp::Get)),
-                        );
+                        self.statement_read_bytes
+                            .record(key, trigger_read_bytes(&accounting));
                     }
                     return Ok(SqlOutcome {
                         output,
@@ -4074,6 +4077,7 @@ impl SqlExecutor {
         lanes: &[(TargetSignal, &Snapshot)],
         names_parquet: bool,
         window: TimeRange,
+        shape: ReadShape,
         now_ns: i64,
         declared: &[DeclaredColumn],
     ) -> AccessIntent {
@@ -4095,9 +4099,9 @@ impl SqlExecutor {
         let Some(sql) = statement.sql() else {
             return intent;
         };
-        let last_read_bytes = self
-            .statement_read_bytes
-            .get(StatementReadBytes::key(tenant_hash, sql));
+        let last_read_bytes =
+            self.statement_read_bytes
+                .get(StatementReadBytes::key(tenant_hash, sql, shape));
         if !size_trigger_applies(
             lanes,
             names_parquet,
@@ -4124,12 +4128,14 @@ impl SqlExecutor {
         &self,
         tenant_hash: TenantHash,
         statement: Statement<'_>,
+        shape: ReadShape,
         lanes: &[(TargetSignal, &Snapshot)],
         names_parquet: bool,
     ) -> Option<u64> {
         self.cache_bulk_scan_min_bytes?;
         let sql = statement.sql()?;
-        size_trigger_lane(lanes, names_parquet).then(|| StatementReadBytes::key(tenant_hash, sql))
+        size_trigger_lane(lanes, names_parquet)
+            .then(|| StatementReadBytes::key(tenant_hash, sql, shape))
     }
 
     /// Whether `statement` over its one `logs` lane holds an equality on a
@@ -8900,9 +8906,17 @@ pub(crate) mod tests {
 
     /// Record that `sql`, sent by `tenant`, read `bytes` on its last
     /// execution, as a successful run of it would.
-    fn record_read_bytes(exec: &SqlExecutor, tenant: TenantHash, sql: &str, bytes: u64) {
-        exec.statement_read_bytes
-            .record(StatementReadBytes::key(tenant, sql), bytes);
+    fn record_read_bytes(
+        exec: &SqlExecutor,
+        tenant: TenantHash,
+        sql: &str,
+        window: TimeRange,
+        bytes: u64,
+    ) {
+        exec.statement_read_bytes.record(
+            StatementReadBytes::key(tenant, sql, ReadShape::new(window, false, None)),
+            bytes,
+        );
     }
 
     /// The bulk-scan size trigger through `statement_access_intent`, the call
@@ -9053,6 +9067,7 @@ pub(crate) mod tests {
                         &[(*signal, &snapshot)],
                         false,
                         window,
+                        ReadShape::new(window, false, None),
                         NOW,
                         &declared,
                     )
@@ -9063,7 +9078,7 @@ pub(crate) mod tests {
                         expected[2]
                     ));
                 }
-                record_read_bytes(&exec, t, sql, SIZE_TRIGGER_READ_BYTES);
+                record_read_bytes(&exec, t, sql, window, SIZE_TRIGGER_READ_BYTES);
                 let intent = exec
                     .statement_access_intent(
                         t,
@@ -9072,6 +9087,7 @@ pub(crate) mod tests {
                         &[(*signal, &snapshot)],
                         false,
                         window,
+                        ReadShape::new(window, false, None),
                         NOW,
                         &declared,
                     )
@@ -9111,7 +9127,7 @@ pub(crate) mod tests {
             |_ctx, _call| Err(DataFusionError::Internal("never lowered".to_string())),
         );
         let sql = "SELECT count(*) FROM logs WHERE http_status >= 500";
-        record_read_bytes(&exec, t, sql, SIZE_TRIGGER_READ_BYTES);
+        record_read_bytes(&exec, t, sql, window, SIZE_TRIGGER_READ_BYTES);
         let mut intents = Vec::new();
         for statement in [Statement::Lowered(&lowered), Statement::Sql(sql)] {
             intents.push(
@@ -9122,6 +9138,7 @@ pub(crate) mod tests {
                     &[(TargetSignal::Logs, &snapshot)],
                     false,
                     window,
+                    ReadShape::new(window, false, None),
                     SIZE_TRIGGER_NOW,
                     &declared,
                 )
@@ -9163,7 +9180,7 @@ pub(crate) mod tests {
                 "SELECT count(*) FROM logs WHERE http_status > 1",
             ),
         ] {
-            record_read_bytes(&exec, t, sql, SIZE_TRIGGER_READ_BYTES);
+            record_read_bytes(&exec, t, sql, window, SIZE_TRIGGER_READ_BYTES);
             intents.push(
                 exec.statement_access_intent(
                     t,
@@ -9172,6 +9189,7 @@ pub(crate) mod tests {
                     &[(signal, &snapshot)],
                     false,
                     window,
+                    ReadShape::new(window, false, None),
                     SIZE_TRIGGER_NOW,
                     &declared,
                 )

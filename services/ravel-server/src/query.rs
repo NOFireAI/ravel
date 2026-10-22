@@ -43,6 +43,7 @@ pub fn accounting_stats_json(
             "cacheHits": accounting.cache_hits,
             "cacheMisses": accounting.cache_misses,
             "cacheBytes": accounting.cache_bytes,
+            "lateServedBytes": accounting.late_served_bytes,
             "decompressedBytes": accounting.decompressed_bytes,
             "segmentsOpened": accounting.segments_opened,
             "seriesMatched": accounting.series_matched,

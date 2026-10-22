@@ -1584,6 +1584,9 @@ pub fn decode_accounting(snap: pb::QueryAccountingSnapshot) -> QueryAccountingSn
         cache_hits: snap.cache_hits,
         cache_misses: snap.cache_misses,
         cache_bytes: snap.cache_bytes,
+        // Process-local: a worker's late serves come from its own read cache's
+        // single flight and are not on the wire proto. Decoded back as zero.
+        late_served_bytes: 0,
         // Process-local, same reason as `page_bytes_fetched` below: not
         // carried on the wire proto, so a remote slice's exact-record count
         // is not visible to the coordinator. Decoded back as zero.
@@ -3148,6 +3151,7 @@ mod tests {
             cache_hits: 2,
             cache_misses: 4,
             cache_bytes: 8,
+            late_served_bytes: 23,
             commit_record_cache_hits: 19,
             decompressed_bytes: 16,
             segments_opened: 32,
@@ -3194,8 +3198,13 @@ mod tests {
             "the exact commit-record cache count is process-local and not on the wire proto"
         );
         assert_eq!(
+            round.late_served_bytes, 0,
+            "late-served bytes are process-local and not on the wire proto"
+        );
+        assert_eq!(
             round,
             QueryAccountingSnapshot {
+                late_served_bytes: 0,
                 page_bytes_fetched: 0,
                 page_bytes_decoded: 0,
                 logs_whole_object_opens: 0,

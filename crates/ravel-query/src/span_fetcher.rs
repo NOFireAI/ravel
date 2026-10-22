@@ -1470,9 +1470,13 @@ impl SpanSegmentFetcher {
             }
             // A miss. Only the call that ran the closure above recorded a
             // store GET; a late serve (another caller's flight, or the RAM
-            // recheck) recorded none and stays this miss alone.
+            // recheck) recorded none and stays this miss alone, its bytes
+            // counted as late-served.
             ReadOutcome::Fetched | ReadOutcome::LateServe => {
                 accounting.record_cache_miss();
+                if outcome == ReadOutcome::LateServe {
+                    accounting.add_late_served_bytes(bytes.len() as u64);
+                }
                 // Admitted to the read cache, which has its own byte ledger:
                 // mark the reservation handed off so the transient overlap is
                 // visible while both this buffer and the cache entry hold the
@@ -4795,6 +4799,8 @@ mod late_serve_accounting_tests {
             assert_eq!(follower_snap.cache_misses, 1, "tiered={tiered}");
             assert_eq!(follower_snap.cache_hits, 0, "tiered={tiered}");
             assert_eq!(follower_snap.cache_bytes, 0, "tiered={tiered}");
+            assert_eq!(follower_snap.late_served_bytes, SIZE, "tiered={tiered}");
+            assert_eq!(leader_snap.late_served_bytes, 0, "tiered={tiered}");
         }
     }
 }

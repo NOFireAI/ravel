@@ -36,7 +36,7 @@ use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator};
 use ravel_cache::{CacheMetrics, CacheMetricsSnapshot, IntentCounters, IntentMetricsSnapshot};
 use ravel_catalog::Snapshot;
 use ravel_logseg::key_index::TRACE_ID_FIELD;
-use ravel_types::accounting::AccessIntent;
+use ravel_types::accounting::{AccessIntent, AccountedOp, QueryAccountingSnapshot};
 use ravel_types::{TenantHash, TimeRange};
 
 use crate::declared::KeyIndexDeclaration;
@@ -208,12 +208,49 @@ pub fn effective_bulk_scan_min_bytes(
     flag.map(|flag| cache_max_bytes.map_or(flag, |cache| flag.max(cache)))
 }
 
+/// The bytes a statement's execution read, as the size trigger records them:
+/// the bytes resident cache entries served, the bytes another caller's
+/// in-flight read handed it, and its own GET bytes, every phase. However the
+/// read cache served it, the same statement over the same data records the
+/// same figure.
+pub(crate) fn trigger_read_bytes(accounting: &QueryAccountingSnapshot) -> u64 {
+    accounting
+        .cache_bytes
+        .saturating_add(accounting.late_served_bytes)
+        .saturating_add(accounting.s3_bytes(AccountedOp::Get))
+}
+
 /// How many statements [`StatementReadBytes`] holds a record for.
 pub(crate) const STATEMENT_READ_BYTES_CAPACITY: usize = 4096;
 
+/// What bounds a statement's reads besides its text, as the read-bytes record
+/// keys it: the window's duration (its end minus its start, so a relative
+/// window re-sent with fresh bounds keeps its record), the row window's
+/// duration when the window is also applied as a row filter, and the row cap.
+/// The same text over a much shorter window, or under a row cap, reads far
+/// less, so it gets a record of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct ReadShape {
+    window_ns: i64,
+    row_window_ns: Option<i64>,
+    max_rows: Option<usize>,
+}
+
+impl ReadShape {
+    pub(crate) fn new(window: TimeRange, row_window: bool, max_rows: Option<usize>) -> Self {
+        let window_ns = window.end_ns.saturating_sub(window.start_ns);
+        ReadShape {
+            window_ns,
+            row_window_ns: row_window.then_some(window_ns),
+            max_rows,
+        }
+    }
+}
+
 /// The bytes each statement read on its last successful execution, keyed by
-/// [`StatementReadBytes::key`] over the tenant and the exact SQL text: cache
-/// served plus store GET bytes, every phase. Held in process memory, bounded
+/// [`StatementReadBytes::key`] over the tenant, the exact SQL text and the
+/// request's [`ReadShape`]: cache served, late served and store GET bytes,
+/// every phase. Held in process memory, bounded
 /// at [`STATEMENT_READ_BYTES_CAPACITY`] entries with the least recently
 /// recorded dropped first, and charged to no cache. A restart forgets it, so
 /// every statement's first execution after one is Interactive.
@@ -237,12 +274,13 @@ impl StatementReadBytes {
         }
     }
 
-    /// The record key of `sql` sent by `tenant`. Two statements whose keys
-    /// collide share a record, which only moves a cache intent.
-    pub(crate) fn key(tenant: TenantHash, sql: &str) -> u64 {
+    /// The record key of `sql` sent by `tenant` with `shape`. Two statements
+    /// whose keys collide share a record, which only moves a cache intent.
+    pub(crate) fn key(tenant: TenantHash, sql: &str, shape: ReadShape) -> u64 {
         let mut hasher = DefaultHasher::new();
         tenant.0.hash(&mut hasher);
         sql.hash(&mut hasher);
+        shape.hash(&mut hasher);
         hasher.finish()
     }
 
@@ -714,12 +752,14 @@ mod tests {
 
     /// The record holds 4,096 statements: the 4,097th distinct one drops the
     /// least recently recorded, and re-recording a statement makes it the most
-    /// recent, so the next overflow drops another. A key names the tenant as
-    /// well as the text.
+    /// recent, so the next overflow drops another. A key names the tenant and
+    /// the read shape as well as the text.
     #[test]
     fn the_read_bytes_record_drops_the_oldest_statement_past_its_bound() {
         let tenant = TenantHash([7u8; 16]);
-        let key = |i: usize| StatementReadBytes::key(tenant, &format!("SELECT {i} FROM logs"));
+        let shape = ReadShape::new(whole_tenant(), false, None);
+        let key =
+            |i: usize| StatementReadBytes::key(tenant, &format!("SELECT {i} FROM logs"), shape);
         let record = StatementReadBytes::new();
         for i in 0..STATEMENT_READ_BYTES_CAPACITY {
             record.record(key(i), i as u64);
@@ -739,9 +779,43 @@ mod tests {
         assert_eq!(record.get(key(1)), Some(11), "re-recorded, so kept");
         assert_eq!(record.get(key(2)), None, "now the oldest, so dropped");
 
-        let other = StatementReadBytes::key(TenantHash([8u8; 16]), "SELECT 1 FROM logs");
+        let other = StatementReadBytes::key(TenantHash([8u8; 16]), "SELECT 1 FROM logs", shape);
         assert_ne!(other, key(1));
         assert_eq!(record.get(other), None);
+    }
+
+    /// The read shape keys a record by the window's duration, not its bounds:
+    /// the same window moved later shares a key, while a shorter window, the
+    /// same window applied as a row filter, and a row cap each get their own.
+    #[test]
+    fn the_read_bytes_key_names_the_window_duration_row_window_and_row_cap() {
+        let tenant = TenantHash([7u8; 16]);
+        let sql = "SELECT * FROM logs";
+        let hour = TimeRange {
+            start_ns: 0,
+            end_ns: 3_600_000_000_000,
+        };
+        let key = |window: TimeRange, row_window: bool, max_rows: Option<usize>| {
+            StatementReadBytes::key(tenant, sql, ReadShape::new(window, row_window, max_rows))
+        };
+        let base = key(hour, false, None);
+        let later_hour = TimeRange {
+            start_ns: hour.start_ns + 7_200_000_000_000,
+            end_ns: hour.end_ns + 7_200_000_000_000,
+        };
+        assert_eq!(
+            key(later_hour, false, None),
+            base,
+            "same duration, later bounds"
+        );
+        let minute = TimeRange {
+            start_ns: hour.end_ns - 60_000_000_000,
+            end_ns: hour.end_ns,
+        };
+        assert_ne!(key(minute, false, None), base, "a shorter window");
+        assert_ne!(key(hour, true, None), base, "the window as a row filter");
+        assert_ne!(key(hour, false, Some(100)), base, "a row cap");
+        assert_ne!(key(hour, false, Some(100)), key(hour, false, Some(1_000)));
     }
 
     #[test]
