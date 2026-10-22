@@ -1388,8 +1388,14 @@ How the credentials reach a pod:
   (`emptyDir`, `medium: Memory`, `sizeLimit: 1Mi`) as a mode-0600 JSON file.
   It refreshes at the earlier of halfway to the credential's expiry and
   15 minutes before it, and keeps the old file when a refresh fails.
-- A startup probe on the sidecar holds the server container until the file
-  exists. The server reads it through `--s3-credentials-file` and picks up
+- A startup probe on the sidecar holds the server container until the
+  sidecar has written the file. The volume outlives a sidecar restart, so
+  each sidecar process removes the marker the previous one left
+  (`.credentials.json.written`) when it starts and creates it again after its
+  first write. The probe fails until that marker exists. A restarted sidecar
+  leaves the previous file in place, so the running server keeps using it
+  until the new write replaces it.
+- The server reads the file through `--s3-credentials-file` and picks up
   each rewrite on its next S3 request; the qualify Job's `ravel-cli` reads it
   through `RAVEL_S3_CREDENTIALS_FILE`.
 - `RAVEL_S3_ACCESS_KEY` and `RAVEL_S3_SECRET_KEY` are set to the literal

@@ -165,6 +165,16 @@ pub enum PodIdentityError {
         /// The I/O error.
         source: io::Error,
     },
+
+    /// The written marker could not be removed at start or created after a
+    /// write.
+    #[error("updating the written marker {path}: {source}")]
+    Marker {
+        /// The marker path.
+        path: PathBuf,
+        /// The I/O error.
+        source: io::Error,
+    },
 }
 
 /// Role credentials from the Pod Identity agent. `Debug` redacts the three
@@ -499,9 +509,65 @@ pub fn write_credentials_file(
         .map_err(failed)
 }
 
-/// The startup probe: `Ok` when `path` exists and parses as ADR-0072's
-/// credentials file with both keys non-empty.
+/// The marker next to the credentials file `path` that the running sidecar
+/// creates after each successful write: `.<name>.written` in the same
+/// directory.
+pub fn written_marker_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!(".{name}.written"))
+}
+
+/// Remove the written marker of `path` left by a previous sidecar process, so
+/// the probe fails until this process has written once. A missing marker is
+/// fine; any other error is returned.
+///
+/// The previous credentials file stays in place. ravel-server re-reads it on
+/// each S3 request and keeps its last good credential while it is missing,
+/// but it also builds stores from it after startup (a per-tenant KMS store on
+/// a tenant's first write), and building one fails when the file is missing.
+pub fn clear_written_marker(path: &Path) -> Result<(), PodIdentityError> {
+    let marker = written_marker_path(path);
+    match fs::remove_file(&marker) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(PodIdentityError::Marker {
+            path: marker,
+            source,
+        }),
+    }
+}
+
+/// Create the written marker of `path` (mode 0600, empty).
+fn mark_written(path: &Path) -> Result<(), PodIdentityError> {
+    let marker = written_marker_path(path);
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&marker)
+        .map(drop)
+        .map_err(|source| PodIdentityError::Marker {
+            path: marker,
+            source,
+        })
+}
+
+/// The startup probe: `Ok` when the sidecar process running now has written
+/// `path` (its written marker exists; see [`clear_written_marker`]) and `path`
+/// parses as ADR-0072's credentials file with both keys non-empty.
 pub fn probe(path: &Path) -> Result<(), String> {
+    let marker = written_marker_path(path);
+    if !marker.exists() {
+        return Err(format!(
+            "{} is absent: this sidecar has not written {} since it started",
+            marker.display(),
+            path.display()
+        ));
+    }
     let bytes = fs::read(path).map_err(|err| format!("reading {}: {err}", path.display()))?;
     let parsed: CredentialsFile = serde_json::from_slice(&bytes).map_err(|err| {
         format!(
@@ -551,7 +617,8 @@ pub enum RefreshOutcome {
         /// Until the written credential expires.
         expires_in: Duration,
     },
-    /// The fetch or the write failed; the old file, if any, is untouched.
+    /// The fetch, the write or the written marker failed. The old file, if
+    /// any, is untouched unless only the marker failed.
     Failed {
         /// Consecutive failures, this one included.
         attempt: u32,
@@ -619,8 +686,8 @@ impl Refresher {
     }
 }
 
-/// One refresh attempt: fetch, write, and update `refresher` at `now`.
-/// Returns the outcome and, on failure, the error for the log line.
+/// One refresh attempt: fetch, write, mark written, and update `refresher` at
+/// `now`. Returns the outcome and, on failure, the error for the log line.
 pub async fn refresh_once(
     endpoint: &AgentEndpoint,
     output: &Path,
@@ -628,9 +695,9 @@ pub async fn refresh_once(
     now: SystemTime,
 ) -> (RefreshOutcome, Option<PodIdentityError>) {
     let written = match fetch(endpoint).await {
-        Ok(credentials) => {
-            write_credentials_file(output, &credentials).map(|()| credentials.expiration)
-        }
+        Ok(credentials) => write_credentials_file(output, &credentials)
+            .and_then(|()| mark_written(output))
+            .map(|()| credentials.expiration),
         Err(err) => Err(err),
     };
     match written {
@@ -701,8 +768,9 @@ pub struct PodIdentityArgs {
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
-    /// Exit 0 when this credentials file exists and parses, non-zero
-    /// otherwise. The startup probe of the rendered sidecar.
+    /// Exit 0 when the running sidecar has written this credentials file
+    /// since it started and the file parses, non-zero otherwise. The startup
+    /// probe of the rendered sidecar.
     #[arg(long, value_name = "PATH")]
     pub probe: Option<PathBuf>,
 
@@ -737,6 +805,7 @@ pub async fn run(args: PodIdentityArgs) -> Result<(), String> {
     let Some(output) = args.output.as_deref() else {
         return Err("either --output or --probe is required".to_string());
     };
+    clear_written_marker(output).map_err(|err| err.to_string())?;
     let endpoint = AgentEndpoint::resolve(
         args.credentials_uri.as_deref(),
         args.authorization_token_file.as_deref(),
@@ -902,12 +971,15 @@ mod tests {
         }
     }
 
-    /// What the mock agent answers with, and the token it accepts.
+    /// What the mock agent answers with, and the token it accepts. While
+    /// `gate` is set and open, each request is counted and then held until
+    /// the gate is closed.
     struct Agent {
         expected_token: Mutex<String>,
         status: Mutex<StatusCode>,
         body: Mutex<String>,
         requests: Mutex<Vec<String>>,
+        gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     }
 
     fn agent_body(key: &str) -> String {
@@ -923,8 +995,36 @@ mod tests {
                 status: Mutex::new(StatusCode::OK),
                 body: Mutex::new(agent_body("AKIA1")),
                 requests: Mutex::new(Vec::new()),
+                gate: Mutex::new(None),
             })
         }
+
+        /// Hold every request from now on until [`Self::release`].
+        fn hold(&self) {
+            *self.gate.lock().unwrap() = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+        }
+
+        /// Answer the held requests and every later one.
+        fn release(&self) {
+            if let Some(gate) = self.gate.lock().unwrap().take() {
+                gate.close();
+            }
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().unwrap().len()
+        }
+    }
+
+    /// Poll `condition` until it holds, failing the test after 10 s.
+    async fn wait_until(what: &str, condition: impl Fn() -> bool) {
+        let waited = tokio::time::timeout(Duration::from_secs(10), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "timed out waiting until {what}");
     }
 
     async fn answer(
@@ -942,6 +1042,11 @@ mod tests {
             .lock()
             .unwrap()
             .push(format!("{} {}", req.method(), req.uri().path()));
+        let gate = agent.gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            // Closing the semaphore is the release; no permit is ever added.
+            let _ = gate.acquire().await;
+        }
         let expected = agent.expected_token.lock().unwrap().clone();
         let (status, body) = if presented != expected {
             (
@@ -1307,12 +1412,94 @@ mod tests {
         let scratch = Scratch::new("probe");
         let output = scratch.path("credentials.json");
         assert!(probe(&output).is_err(), "absent");
+        mark_written(&output).expect("mark");
+        assert!(probe(&output).is_err(), "marked but absent");
         fs::write(&output, b"{\"access_key_id\":").expect("write");
         assert!(probe(&output).is_err(), "truncated JSON");
         fs::write(&output, br#"{"access_key_id":"","secret_access_key":"s"}"#).expect("write");
         assert!(probe(&output).is_err(), "empty key");
         write_credentials_file(&output, &credentials("A", SystemTime::now())).expect("write");
         assert!(probe(&output).is_ok(), "written by the sidecar");
+        clear_written_marker(&output).expect("clear");
+        assert!(probe(&output).is_err(), "a valid file without the marker");
+        clear_written_marker(&output).expect("clearing an absent marker is fine");
+    }
+
+    /// A restarted sidecar finds the previous process's file and marker in
+    /// the `emptyDir`. The probe must fail until this process has written,
+    /// and the previous file must stay readable for the server meanwhile.
+    #[tokio::test]
+    async fn after_a_restart_the_probe_fails_until_the_new_process_writes() {
+        let scratch = Scratch::new("restart");
+        let token_file = scratch.path("token");
+        fs::write(&token_file, "t").expect("write token");
+        let output = scratch.path("credentials.json");
+        // What the previous sidecar process left behind.
+        write_credentials_file(&output, &credentials("OLD", SystemTime::now()))
+            .expect("previous write");
+        mark_written(&output).expect("previous mark");
+        let old_bytes = fs::read(&output).expect("read");
+        probe(&output).expect("the previous process's state passes");
+
+        let agent = Agent::new("t");
+        *agent.body.lock().unwrap() = agent_body("NEW");
+        agent.hold();
+        let uri = serve(Arc::clone(&agent)).await;
+        let sidecar = tokio::spawn(run(PodIdentityArgs {
+            output: Some(output.clone()),
+            probe: None,
+            credentials_uri: Some(uri),
+            authorization_token_file: Some(token_file),
+            refresh_margin: DEFAULT_REFRESH_MARGIN,
+            once: false,
+        }));
+
+        wait_until("the new process asks the agent", || {
+            agent.request_count() == 1
+        })
+        .await;
+        assert!(
+            probe(&output).is_err(),
+            "the probe passed before the new process wrote"
+        );
+        assert_eq!(
+            fs::read(&output).expect("read"),
+            old_bytes,
+            "the previous file stays in place until the new write"
+        );
+
+        agent.release();
+        wait_until("the probe passes", || probe(&output).is_ok()).await;
+        assert_eq!(read_file(&output)["access_key_id"], "NEW");
+        sidecar.abort();
+    }
+
+    #[tokio::test]
+    async fn a_marker_that_cannot_be_removed_stops_the_sidecar_before_any_fetch() {
+        let scratch = Scratch::new("marker-stuck");
+        let token_file = scratch.path("token");
+        fs::write(&token_file, "t").expect("write token");
+        let output = scratch.path("credentials.json");
+        // A directory in the marker's place: removing it as a file fails
+        // with an error other than NotFound.
+        fs::create_dir(written_marker_path(&output)).expect("create dir");
+        let agent = Agent::new("t");
+        let uri = serve(Arc::clone(&agent)).await;
+
+        let sidecar = run(PodIdentityArgs {
+            output: Some(output.clone()),
+            probe: None,
+            credentials_uri: Some(uri),
+            authorization_token_file: Some(token_file),
+            refresh_margin: DEFAULT_REFRESH_MARGIN,
+            once: false,
+        });
+        let err = tokio::time::timeout(Duration::from_secs(10), sidecar)
+            .await
+            .expect("the sidecar stops instead of running its loop")
+            .expect_err("the sidecar stops with an error");
+        assert!(err.contains(".credentials.json.written"), "{err}");
+        assert_eq!(agent.request_count(), 0, "nothing was fetched");
     }
 
     #[tokio::test]
