@@ -61,8 +61,8 @@ use crate::reconcile::{
     query_network_policy_during_rollout, s3_allow_http,
 };
 use crate::reconcile::{
-    MaintainTier, desired_tier_service_accounts, maintain_key_secret_name, pod_identity, pod_identity_service_accounts_marker,
-    tier_service_accounts_to_sweep, validate_storage_auth,
+    MaintainTier, desired_tier_service_accounts, maintain_key_secret_name, pod_identity,
+    pod_identity_service_accounts_marker, tier_service_accounts_to_sweep, validate_storage_auth,
 };
 
 /// Server-side-apply field manager name.
@@ -423,7 +423,9 @@ async fn resolve_maintain_key_resource_version(
         return Ok(MaintainKeyResolution::Resolved(None));
     };
     match secret_resource_version(client, namespace, name, "maintain.keySecretRef").await {
-        Ok(rv) => Ok(MaintainKeyResolution::Resolved(Some(rv.unwrap_or_default()))),
+        Ok(rv) => Ok(MaintainKeyResolution::Resolved(Some(
+            rv.unwrap_or_default(),
+        ))),
         Err(Error::SecretNotFound { name, reason }) => {
             Ok(MaintainKeyResolution::SecretMissing { name, reason })
         }
@@ -3227,10 +3229,9 @@ fn degraded_reason(err: &Error) -> (String, String) {
             "DistributedQuerySecretRefMissing".to_string(),
             err.to_string(),
         ),
-        Error::Render(RenderError::MaintainKeySecretRefMissing) => (
-            "MaintainKeySecretRefMissing".to_string(),
-            err.to_string(),
-        ),
+        Error::Render(RenderError::MaintainKeySecretRefMissing) => {
+            ("MaintainKeySecretRefMissing".to_string(), err.to_string())
+        }
         // The remedy is an operator flag, not a CR edit: the message names
         // `--credentials-sidecar-image` and its env.
         Error::Render(RenderError::CredentialsSidecarImageUnset) => {
@@ -3776,9 +3777,14 @@ mod tests {
         let (reason, _) =
             render_degraded(true, None, None, Some(missing()), None).expect("a Degraded entry");
         assert_eq!(reason, AUDIT_TOKEN_KEY_MISSING_REASON);
-        let (reason, _) =
-            render_degraded(false, None, None, None, Some(RenderError::RouterImageMissing))
-                .expect("a Degraded entry");
+        let (reason, _) = render_degraded(
+            false,
+            None,
+            None,
+            None,
+            Some(RenderError::RouterImageMissing),
+        )
+        .expect("a Degraded entry");
         assert_eq!(reason, "RouterImageMissing");
         assert_eq!(render_degraded(false, None, None, None, None), None);
 

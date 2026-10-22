@@ -8499,7 +8499,10 @@ mod tests {
             ("query", objects.query_deployment),
             (
                 "maintain",
-                objects.maintain.into_deployment().expect("maintain enabled"),
+                objects
+                    .maintain
+                    .into_deployment()
+                    .expect("maintain enabled"),
             ),
         ] {
             let anti = pod_spec_of(&dep)
@@ -10440,10 +10443,7 @@ mod tests {
             ("query", pod(&objects.query_deployment)),
             (
                 "maintain",
-                pod(objects
-                    .maintain
-                    .deployment()
-                    .expect("maintain renders")),
+                pod(objects.maintain.deployment().expect("maintain renders")),
             ),
             (
                 "qualify",

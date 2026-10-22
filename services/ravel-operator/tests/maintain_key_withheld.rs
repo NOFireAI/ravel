@@ -196,7 +196,10 @@ async fn apiserver(
         ),
         (&Method::GET, p) if p == format!("{secrets}ravel-s3") => json_response(
             StatusCode::OK,
-            &secret("ravel-s3", json!({ "accessKeyId": "YQ==", "secretAccessKey": "Yg==" })),
+            &secret(
+                "ravel-s3",
+                json!({ "accessKeyId": "YQ==", "secretAccessKey": "Yg==" }),
+            ),
         ),
         (&Method::GET, p) if p == format!("{secrets}audit-key") => json_response(
             StatusCode::OK,
@@ -302,7 +305,10 @@ fn assert_withheld(requests: &[String], status: &Value) {
     }
     let condition = degraded(status);
     assert_eq!(condition["status"], "True", "{condition}");
-    assert_eq!(condition["reason"], "MaintainKeySecretRefMissing", "{condition}");
+    assert_eq!(
+        condition["reason"], "MaintainKeySecretRefMissing",
+        "{condition}"
+    );
     assert!(
         condition["message"]
             .as_str()
