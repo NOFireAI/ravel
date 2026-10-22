@@ -552,13 +552,17 @@ mod tests {
     /// A valid process id under its braced, simple, urn and uppercase
     /// spellings is rejected as a non-UUID key without a GET, so one process
     /// has one key; the lowercase hyphenated spelling [`memo_key`] writes is
-    /// read and verifies.
+    /// read and verifies. The store refuses a braced key at PUT, so that
+    /// spelling is checked on the key parser alone.
     #[tokio::test]
     async fn non_canonical_uuid_spellings_are_rejected_without_a_get() {
         let id = Uuid::from_u128(0xABCD_EF01_2345_6789_ABCD_EF01_2345_6789);
         let bytes = frame(id, &empty_body(), 1);
+        let braced = id.braced().to_string();
+        assert_eq!(Uuid::parse_str(&braced).expect("parses"), id);
+        assert_eq!(process_id_of(&format!("{MEMO_PREFIX}{braced}")), None);
+        assert_eq!(process_id_of(&memo_key(&id)), Some(id));
         let spellings = [
-            id.braced().to_string(),
             id.simple().to_string(),
             id.urn().to_string(),
             id.to_string().to_uppercase(),
