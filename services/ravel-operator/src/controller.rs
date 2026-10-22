@@ -5761,6 +5761,153 @@ mod tests {
         assert!(message.contains("frag-ca"), "{message}");
     }
 
+    /// ADR-3130 decision 5: the maintain key Secret's resolved resourceVersion
+    /// reaches the maintain pod-template checksum only, so a key rotation rolls
+    /// the maintain pods and nothing else. Guarding line:
+    /// `render_ctx.maintain_key_resource_version = ...` in `plan_render`.
+    #[test]
+    fn plan_render_puts_the_maintain_key_version_into_the_maintain_checksum_only() {
+        let spec = distributed_query_keyed_spec();
+        let plan = |rv: &str| {
+            plan_render(
+                &spec,
+                "rc",
+                "ns",
+                RenderCtx::default(),
+                &DistributedQueryResolution::Resolved(vec!["1".into(); 4]),
+                &MaintainKeyResolution::Resolved(Some(rv.to_string())),
+            )
+            .expect("spec renders")
+        };
+        let before = plan("mk-1");
+        let rotated = plan("mk-2");
+        assert_eq!(before.degraded, None);
+        assert!(!before.tiers.maintain_disabled && !before.tiers.maintain_withheld);
+        assert_ne!(
+            pod_template_checksum(before.tiers.maintain.as_ref()),
+            pod_template_checksum(rotated.tiers.maintain.as_ref()),
+            "a rotated maintain key Secret moves the maintain checksum"
+        );
+        assert_eq!(
+            pod_template_checksum(before.tiers.gateway.as_ref()),
+            pod_template_checksum(rotated.tiers.gateway.as_ref()),
+        );
+        assert_eq!(
+            pod_template_checksum(before.tiers.query.as_ref()),
+            pod_template_checksum(rotated.tiers.query.as_ref()),
+        );
+    }
+
+    /// Maintain enabled without `maintain.keySecretRef`: the maintain tier is
+    /// withheld (neither applied nor deleted), the gateway and query
+    /// Deployments are still apply targets, and the pass's `Degraded` entry
+    /// names the field.
+    #[test]
+    fn plan_render_withholds_maintain_without_the_key_ref_and_names_it() {
+        let mut spec = distributed_query_keyed_spec();
+        spec.maintain.key_secret_ref = None;
+        let plan = plan_render(
+            &spec,
+            "rc",
+            "ns",
+            RenderCtx::default(),
+            &DistributedQueryResolution::Resolved(vec!["1".into(); 4]),
+            &MaintainKeyResolution::Resolved(None),
+        )
+        .expect("a missing maintain key ref does not fail the pass");
+        assert!(plan.tiers.maintain.is_none(), "no maintain apply target");
+        assert!(
+            !plan.tiers.maintain_disabled,
+            "a withheld maintain tier is not deleted"
+        );
+        assert!(plan.tiers.maintain_withheld);
+        assert!(plan.tiers.gateway.is_some(), "the gateway still applies");
+        assert!(plan.tiers.query.is_some(), "the query tier still applies");
+        let (reason, message) = plan.degraded.expect("a Degraded entry");
+        assert_eq!(reason, "MaintainKeySecretRefMissing");
+        assert!(message.contains("spec.maintain.keySecretRef"), "{message}");
+    }
+
+    /// A `maintain.keySecretRef` naming a Secret that does not exist withholds
+    /// the maintain tier the same way (a rolled pod could not mount it), with a
+    /// `SecretNotFound` degrade naming the Secret.
+    #[test]
+    fn plan_render_withholds_maintain_when_the_key_secret_is_missing() {
+        let spec = distributed_query_keyed_spec();
+        let plan = plan_render(
+            &spec,
+            "rc",
+            "ns",
+            RenderCtx::default(),
+            &DistributedQueryResolution::Resolved(vec!["1".into(); 4]),
+            &MaintainKeyResolution::SecretMissing {
+                name: "maintain-keys".to_string(),
+                reason: "referenced by maintain.keySecretRef".to_string(),
+            },
+        )
+        .expect("a missing maintain key Secret does not fail the pass");
+        assert!(plan.tiers.maintain.is_none());
+        assert!(!plan.tiers.maintain_disabled);
+        assert!(plan.tiers.maintain_withheld);
+        assert!(plan.tiers.gateway.is_some() && plan.tiers.query.is_some());
+        let (reason, message) = plan.degraded.expect("a Degraded entry");
+        assert_eq!(reason, "SecretNotFound");
+        assert!(message.contains("maintain-keys"), "{message}");
+    }
+
+    /// Maintain disabled: the delete path is unchanged whether or not
+    /// `maintain.keySecretRef` is set, and nothing degrades.
+    #[test]
+    fn plan_render_disabled_maintain_deletes_with_and_without_the_key_ref() {
+        for key_ref in [
+            None,
+            Some(LocalSecretRef {
+                name: "maintain-keys".to_string(),
+            }),
+        ] {
+            let mut spec = distributed_query_keyed_spec();
+            spec.maintain.enabled = false;
+            spec.maintain.key_secret_ref = key_ref.clone();
+            let plan = plan_render(
+                &spec,
+                "rc",
+                "ns",
+                RenderCtx::default(),
+                &DistributedQueryResolution::Resolved(vec!["1".into(); 4]),
+                &MaintainKeyResolution::Resolved(None),
+            )
+            .expect("spec renders");
+            assert!(plan.tiers.maintain_disabled, "{key_ref:?}");
+            assert!(!plan.tiers.maintain_withheld, "{key_ref:?}");
+            assert!(plan.tiers.maintain.is_none(), "{key_ref:?}");
+            assert_eq!(plan.degraded, None, "{key_ref:?}");
+        }
+    }
+
+    /// A withheld maintain tier ranks below a missing query Secret and above a
+    /// router render error for the pass's single `Degraded` entry.
+    #[test]
+    fn maintain_withheld_degrade_ranks_between_query_holds_and_render_errors() {
+        let maintain = || {
+            Some(degraded_reason(&Error::Render(
+                RenderError::MaintainKeySecretRefMissing,
+            )))
+        };
+        let (reason, _) = render_degraded(
+            false,
+            None,
+            maintain(),
+            None,
+            Some(RenderError::RouterImageMissing),
+        )
+        .expect("a Degraded entry");
+        assert_eq!(reason, "MaintainKeySecretRefMissing");
+        let query = Some(("SecretNotFound".to_string(), "frag-ca".to_string()));
+        let (reason, _) =
+            render_degraded(false, query, maintain(), None, None).expect("a Degraded entry");
+        assert_eq!(reason, "SecretNotFound");
+    }
+
     /// Finding 3: credential resourceVersions are resolved before the gate and
     /// reused for the qualified-input hash. The value selected is the SHARED
     /// storage.s3 credential's (the one the qualify Job authenticates with),

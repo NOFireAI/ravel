@@ -4852,8 +4852,14 @@ mod tests {
                 .spec
                 .as_ref()
                 .expect("pod spec");
+            // The maintain pod mounts its own key file (ADR-3130), and only
+            // that.
             assert!(
-                pod_spec.volumes.is_none(),
+                pod_spec
+                    .volumes
+                    .iter()
+                    .flatten()
+                    .all(|v| v.name == "maintain-key"),
                 "keyless spec must mount no deployment-key volume"
             );
         }
@@ -4894,7 +4900,13 @@ mod tests {
                 .spec
                 .as_ref()
                 .expect("pod spec");
-            let volumes = pod_spec.volumes.as_ref().expect("volumes");
+            // The maintain pod's own key file (ADR-3130) is covered elsewhere.
+            let volumes: Vec<_> = pod_spec
+                .volumes
+                .iter()
+                .flatten()
+                .filter(|v| v.name != "maintain-key")
+                .collect();
             assert_eq!(volumes.len(), 1);
             let secret = volumes[0].secret.as_ref().expect("secret volume source");
             assert_eq!(secret.secret_name.as_deref(), Some("ravel-deployment-key"));
@@ -4903,7 +4915,12 @@ mod tests {
             assert_eq!(items[0].key, "key");
             assert_eq!(items[0].path, "key");
 
-            let mounts = container_of(dep).volume_mounts.as_ref().expect("mounts");
+            let mounts: Vec<_> = container_of(dep)
+                .volume_mounts
+                .iter()
+                .flatten()
+                .filter(|m| m.name != "maintain-key")
+                .collect();
             assert_eq!(mounts.len(), 1);
             assert_eq!(mounts[0].mount_path, "/etc/ravel/deployment-key");
             assert_eq!(mounts[0].read_only, Some(true));
@@ -10901,5 +10918,156 @@ mod tests {
             .and_then(|var| var.value)
             .expect("operator.yaml sets RAVEL_CREDENTIALS_SIDECAR_IMAGE");
         assert_eq!(Some(sidecar_image), container.image);
+    }
+
+    /// ADR-3130 decision 5: with `maintain.keySecretRef` set, the maintain pod
+    /// mounts that Secret's `keys` read-only and `--maintain-key-file` points
+    /// at the mounted file. No other tier mounts it or carries the flag.
+    #[test]
+    fn maintain_mounts_the_key_secret_and_passes_the_key_file_flag() {
+        let spec = base_spec();
+        let m = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect("renders")
+            .expect("maintain enabled");
+        assert_eq!(
+            arg_value(&args_of(&m), "--maintain-key-file").as_deref(),
+            Some("/etc/ravel/maintain-key/keys"),
+            "{:?}",
+            args_of(&m)
+        );
+        let volume = pod_spec_of(&m)
+            .volumes
+            .iter()
+            .flatten()
+            .find(|v| v.name == "maintain-key")
+            .expect("the maintain key volume");
+        assert_eq!(
+            serde_json::to_value(volume).expect("volume json"),
+            serde_json::json!({"name": "maintain-key", "secret": {
+                "secretName": "maintain-keys", "optional": false,
+                "items": [{"key": "keys", "path": "keys"}]}})
+        );
+        let mount = container_of(&m)
+            .volume_mounts
+            .iter()
+            .flatten()
+            .find(|v| v.name == "maintain-key")
+            .expect("the maintain key mount");
+        assert_eq!(
+            serde_json::to_value(mount).expect("mount json"),
+            serde_json::json!({"name": "maintain-key", "mountPath": "/etc/ravel/maintain-key",
+                "readOnly": true})
+        );
+
+        let g = desired_gateway_deployment(&spec, "prod", &ctx());
+        let q = desired_query_deployment(&spec, "prod", &ctx());
+        for dep in [&g, &q] {
+            assert!(!args_of(dep).iter().any(|a| a == "--maintain-key-file"));
+            assert!(
+                !pod_spec_of(dep)
+                    .volumes
+                    .iter()
+                    .flatten()
+                    .any(|v| v.name == "maintain-key")
+            );
+        }
+    }
+
+    /// A rotation of the maintain key Secret moves the maintain pod-template
+    /// checksum, so the maintain pods roll and reread the key file; the gateway
+    /// and query checksums do not move, since neither mounts it.
+    #[test]
+    fn maintain_checksum_follows_the_key_secret_resource_version() {
+        let spec = base_spec();
+        let with = |rv: &str| RenderCtx {
+            maintain_key_resource_version: Some(rv.to_string()),
+            ..ctx()
+        };
+        let maintain = |c: &RenderCtx| {
+            desired_maintain_deployment(&spec, "prod", c)
+                .expect("renders")
+                .expect("maintain enabled")
+        };
+        let before = with("mk-1");
+        let rotated = with("mk-2");
+        assert_ne!(
+            checksum_of(&maintain(&before)),
+            checksum_of(&maintain(&rotated)),
+            "a rotated maintain key Secret moves the maintain checksum"
+        );
+        assert_eq!(
+            checksum_of(&maintain(&before)),
+            checksum_of(&maintain(&with("mk-1"))),
+            "an unchanged resourceVersion keeps the checksum"
+        );
+        assert_eq!(
+            checksum_of(&desired_gateway_deployment(&spec, "prod", &before)),
+            checksum_of(&desired_gateway_deployment(&spec, "prod", &rotated)),
+        );
+        assert_eq!(
+            checksum_of(&desired_query_deployment(&spec, "prod", &before)),
+            checksum_of(&desired_query_deployment(&spec, "prod", &rotated)),
+        );
+    }
+
+    /// An enabled maintain tier without `maintain.keySecretRef` renders no
+    /// maintain pod at all: `desired_maintain_deployment` refuses with an error
+    /// naming the field, and `desired_objects` turns that into
+    /// `MaintainTier::Withheld` (not `Disabled`, which would delete the live
+    /// Deployment) while the gateway and query Deployments still render.
+    #[test]
+    fn maintain_without_key_secret_ref_is_withheld_not_disabled() {
+        let mut spec = base_spec();
+        spec.maintain.key_secret_ref = None;
+        let err = desired_maintain_deployment(&spec, "prod", &ctx())
+            .expect_err("no maintain pod renders without the key file");
+        assert_eq!(err, RenderError::MaintainKeySecretRefMissing);
+        assert!(
+            err.to_string().contains("spec.maintain.keySecretRef"),
+            "{err}"
+        );
+
+        let objects = desired_objects(&spec, "prod", "ns", &ctx()).expect("spec renders");
+        assert!(
+            matches!(objects.maintain, MaintainTier::Withheld),
+            "{:?}",
+            objects.maintain
+        );
+        assert_eq!(
+            objects.gateway_deployment.metadata.name.as_deref(),
+            Some("prod-gateway")
+        );
+        assert_eq!(
+            objects.query_deployment.metadata.name.as_deref(),
+            Some("prod-query")
+        );
+    }
+
+    /// A disabled maintain tier is `Disabled` (the controller deletes its
+    /// Deployment) whether or not `maintain.keySecretRef` is set.
+    #[test]
+    fn maintain_disabled_is_disabled_with_and_without_the_key_ref() {
+        for key_ref in [
+            None,
+            Some(LocalSecretRef {
+                name: "maintain-keys".to_string(),
+            }),
+        ] {
+            let mut spec = base_spec();
+            spec.maintain.enabled = false;
+            spec.maintain.key_secret_ref = key_ref.clone();
+            assert_eq!(maintain_key_secret_name(&spec), None, "{key_ref:?}");
+            assert_eq!(
+                desired_maintain_deployment(&spec, "prod", &ctx()),
+                Ok(None),
+                "{key_ref:?}"
+            );
+            let objects = desired_objects(&spec, "prod", "ns", &ctx()).expect("spec renders");
+            assert!(
+                matches!(objects.maintain, MaintainTier::Disabled),
+                "{key_ref:?}: {:?}",
+                objects.maintain
+            );
+        }
     }
 }

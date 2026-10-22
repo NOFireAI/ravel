@@ -373,9 +373,23 @@
                         "nullable": true,
                         "type": "integer"
                       },
+                      "keySecretRef": {
+                        "description": "Secret holding the maintain key file under `keys`: one\n64-hex-character key per line, the first mints and all verify\n(ADR-3130). Mounted on the maintain pods and passed as\n`--maintain-key-file`, which `--mode maintain` requires. Required while\n`enabled` is true: without it the operator leaves any existing maintain\nDeployment exactly as it is, creates none, and records a `Degraded`\ncondition naming this field. The gateway and query tiers keep\nreconciling. A change to the Secret rolls the maintain pods.",
+                        "nullable": true,
+                        "properties": {
+                          "name": {
+                            "description": "Name of the Secret.",
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "name"
+                        ],
+                        "type": "object"
+                      },
                       "replicas": {
                         "default": 1,
-                        "description": "Replica count for the maintain Deployment. Defaults to 1. Values above 1\nare made safe by the ADR-0065 ownership protocol (rendezvous over a\nheartbeat-derived live worker set); the workers coordinate entirely\nthrough the shared object store, so no additional per-pod wiring is\nneeded beyond `--mode maintain` and the shared store flags. Omit to keep\ntoday's single-replica behavior.",
+                        "description": "Replica count for the maintain Deployment. Defaults to 1. Values above 1\nare made safe by the ADR-0065 ownership protocol (rendezvous over a\nheartbeat-derived live worker set); the workers coordinate entirely\nthrough the shared object store, so no per-pod wiring is needed beyond\n`--mode maintain`, the shared store flags, and the one key file every\nreplica mounts from `keySecretRef`. Omit to keep today's\nsingle-replica behavior.",
                         "format": "int32",
                         "minimum": 1.0,
                         "type": "integer"
