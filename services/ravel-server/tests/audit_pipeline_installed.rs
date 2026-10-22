@@ -28,6 +28,15 @@ use ravel_types::{Label, LabelSet, Sample, SeriesId, Signal, TenantHash, TenantI
 use uuid::Uuid;
 
 const TOKEN: &str = "acme-token";
+
+/// The maintain-worker record keys `--mode maintain` requires (ADR-3130),
+/// under a fixed test key; `None` in every other mode.
+fn maintain_record_keys(mode: Mode) -> Option<ravel_maintain::worker_set::MaintainRecordKeys> {
+    matches!(mode, Mode::Maintain).then(|| {
+        ravel_maintain::worker_set::MaintainRecordKeys::from_file_keys(&[[0x5C; 32]])
+            .expect("one maintain key")
+    })
+}
 const TENANT: &str = "acme";
 /// A second tenant, for the per-tenant audit-routing tests. Distinct token and
 /// distinct tenant id, so the two resolve to different `TenantHash`es. Used
@@ -176,7 +185,10 @@ fn server_config(
             enabled: false,
             ..FoldTaskConfig::default()
         },
-        maintain: ravel_server::MaintenanceTaskConfig::default(),
+        maintain: ravel_server::MaintenanceTaskConfig {
+            worker_record_keys: maintain_record_keys(mode),
+            ..ravel_server::MaintenanceTaskConfig::default()
+        },
         alerting: ravel_server::AlertEvalConfig::default(),
         oidc_refresh: None,
         otap: false,

@@ -2877,6 +2877,21 @@ pub struct Cli {
     #[arg(long = "sql-ticket-key-file", value_name = "PATH")]
     pub sql_ticket_key_file: Option<PathBuf>,
 
+    /// Path to the maintain key file that signs and verifies maintain-worker
+    /// registry records at `sys/maintain/workers/<process_id>` (ADR-3130). A
+    /// maintain process admits a sibling into its live set, and so shares
+    /// ownership of compaction, retention, scrub and fold units with it, only
+    /// when the sibling's record carries a MAC under one of these keys. Same
+    /// file shape as `--fragment-key-file`: one 64-hex-character key per
+    /// non-empty line, `#` comments and blank lines ignored, the FIRST key mints
+    /// and ALL keys verify. Every maintain process in one cluster reads the same
+    /// file. Rotate in three rolls: append the new key and roll, move it to the
+    /// first line and roll, then drop the old key and roll. Required with
+    /// `--mode maintain` and refused in every other mode, `all` included: no
+    /// other mode writes or reads the registry.
+    #[arg(long = "maintain-key-file", value_name = "PATH")]
+    pub maintain_key_file: Option<PathBuf>,
+
     /// The dedicated TLS fragment listener address (ADR-0071 amendment decision
     /// 1): a fourth listener, alongside `--listen-http`, `--listen-grpc`, and
     /// `--mtls-listener`, that terminates TLS in-process and serves `Pinned`
@@ -6788,6 +6803,25 @@ impl Cli {
         })
     }
 
+    /// Read the `--maintain-key-file` keys the maintain-worker registry records
+    /// are signed and verified under (ADR-3130 decision 1). `Ok(None)` when the
+    /// flag is unset; an unreadable, empty, or malformed file fails.
+    pub fn parse_maintain_record_keys(
+        &self,
+    ) -> anyhow::Result<Option<ravel_maintain::worker_set::MaintainRecordKeys>> {
+        let Some(path) = &self.maintain_key_file else {
+            return Ok(None);
+        };
+        let raw = std::fs::read_to_string(path).map_err(|e| {
+            anyhow::anyhow!("failed to read --maintain-key-file {}: {e}", path.display())
+        })?;
+        let file_keys = parse_fragment_keys(&raw)
+            .map_err(|e| anyhow::anyhow!("invalid --maintain-key-file {}: {e}", path.display()))?;
+        let keys = ravel_maintain::worker_set::MaintainRecordKeys::from_file_keys(&file_keys)
+            .map_err(|e| anyhow::anyhow!("invalid --maintain-key-file {}: {e}", path.display()))?;
+        Ok(Some(keys))
+    }
+
     /// Resolve the ADR-0071 distributed read fan-out settings.
     /// `Ok(None)` when `--distributed-query` is off (the local-only default).
     /// When on, reads and parses the `--fragment-key-file` cluster fragment keys
@@ -7845,6 +7879,25 @@ impl Cli {
                 "--fragment-key-file was set but --distributed-query was not: the fragment \
                  surface is only registered under --distributed-query, so the key file would be \
                  inert. Set --distributed-query, or drop --fragment-key-file."
+            );
+        }
+        // ADR-3130 decision 1: the maintain-worker registry is written and read
+        // only by `--mode maintain`, so its key file is required there and
+        // refused everywhere else rather than left inert.
+        if matches!(self.mode, Mode::Maintain) && self.maintain_key_file.is_none() {
+            anyhow::bail!(
+                "--mode maintain requires --maintain-key-file (ADR-3130): a maintain process \
+                 admits a sibling into its live set only when the sibling's registry record is \
+                 signed under a maintain key. Provide the key file every maintain process in \
+                 the cluster shares."
+            );
+        }
+        if self.maintain_key_file.is_some() && !matches!(self.mode, Mode::Maintain) {
+            anyhow::bail!(
+                "--maintain-key-file was set with --mode {:?}: only --mode maintain writes or \
+                 reads maintain-worker registry records, so the key file would be inert. Drop \
+                 --maintain-key-file, or run --mode maintain.",
+                self.mode
             );
         }
         if self.sql_ticket_key_file.is_some() && !self.distributed_query {
@@ -16818,6 +16871,125 @@ mod tests {
         assert!(
             !msg.contains("fragment"),
             "an SQL ticket key file error does not call its key a fragment key: {msg}"
+        );
+    }
+
+    /// ADR-3130 decision 1: `--mode maintain` refuses to start without
+    /// `--maintain-key-file`, and every other mode, `all` included, refuses
+    /// the flag.
+    #[test]
+    fn maintain_key_file_is_required_in_maintain_and_refused_elsewhere() {
+        let key = fragment_key_tmp();
+        let key_path = key.path().to_str().expect("utf8");
+
+        let err = cli(&["--mode", "maintain"])
+            .validate()
+            .expect_err("--mode maintain without --maintain-key-file must refuse startup");
+        assert!(
+            err.to_string()
+                .starts_with("--mode maintain requires --maintain-key-file"),
+            "names the missing flag: {err}"
+        );
+        cli(&["--mode", "maintain", "--maintain-key-file", key_path])
+            .validate()
+            .expect("--mode maintain with a key file validates");
+
+        for mode in ["all", "query", "gateway"] {
+            let err = cli(&["--mode", mode, "--maintain-key-file", key_path])
+                .validate()
+                .expect_err("--maintain-key-file outside --mode maintain must refuse startup");
+            assert!(
+                err.to_string()
+                    .starts_with("--maintain-key-file was set with --mode"),
+                "{mode}: names the flag: {err}"
+            );
+        }
+    }
+
+    /// The maintain key file is read with the fragment key file's parser, in
+    /// file order (first mints), is `None` when the flag is unset, and an
+    /// unreadable, malformed or keyless file fails naming the flag.
+    #[tokio::test]
+    async fn maintain_key_file_is_read_into_record_keys() {
+        use ravel_maintain::worker_set::{MaintainMembership, MaintainRecordKeys, WorkerSet};
+
+        let file = tempfile::NamedTempFile::new().expect("temp key file");
+        std::fs::write(
+            file.path(),
+            format!("# new first\n{}\n\n{}\n", "cd".repeat(32), "ef".repeat(32)),
+        )
+        .expect("write key");
+        let path = file.path().to_str().expect("utf8");
+        let with_key = || cli(&["--mode", "maintain", "--maintain-key-file", path]);
+
+        let keys = with_key()
+            .parse_maintain_record_keys()
+            .expect("keys parse")
+            .expect("the flag yields keys");
+        assert_eq!(keys.len(), 2);
+        assert!(
+            cli(&["--mode", "all"])
+                .parse_maintain_record_keys()
+                .expect("no flag parses")
+                .is_none()
+        );
+
+        // The file's first key mints: a reader holding only it admits the
+        // record, a reader holding only the second does not.
+        let store = ravel_object_store::memory::MemoryStore::new();
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos() as i64;
+        let writer = WorkerSet::with_defaults(now_ns);
+        writer
+            .write_heartbeat(&store, &MaintainMembership::new(keys), now_ns)
+            .await
+            .expect("heartbeat written");
+        let reader = WorkerSet::with_defaults(now_ns);
+        let live_under = |file_key: [u8; 32]| {
+            let membership = MaintainMembership::new(
+                MaintainRecordKeys::from_file_keys(&[file_key]).expect("one key"),
+            );
+            let (reader, store) = (&reader, &store);
+            async move {
+                reader
+                    .live_set(store, &membership, now_ns)
+                    .await
+                    .expect("live set reads")
+            }
+        };
+        assert!(live_under([0xcd; 32]).await.contains(&writer.process_id()));
+        assert!(!live_under([0xef; 32]).await.contains(&writer.process_id()));
+
+        for (body, needle) in [
+            ("not a key\n", "invalid --maintain-key-file"),
+            ("# comments only\n\n", "must contain at least one 32-byte key"),
+        ] {
+            std::fs::write(file.path(), body).expect("write key");
+            let err = with_key()
+                .parse_maintain_record_keys()
+                .expect_err("a bad maintain key file fails startup");
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with("invalid --maintain-key-file") && msg.contains(needle),
+                "names the flag and the fault: {msg}"
+            );
+        }
+
+        let missing = cli(&[
+            "--mode",
+            "maintain",
+            "--maintain-key-file",
+            "/nonexistent/ravel-maintain-key",
+        ])
+        .parse_maintain_record_keys()
+        .expect_err("an unreadable key file fails startup");
+        assert!(
+            missing
+                .to_string()
+                .starts_with("failed to read --maintain-key-file"),
+            "names the flag: {missing}"
         );
     }
 
