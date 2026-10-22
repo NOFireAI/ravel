@@ -42,7 +42,7 @@ use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ravel_commit::publish::RetryPolicy;
 use ravel_commit::record::NewCommitRecord;
@@ -1620,6 +1620,309 @@ async fn version_mismatch_falls_back_to_local() {
         metrics.slices_local_total() > 0,
         "every slice ran on the coordinator with no hop"
     );
+}
+
+/// A coordinator engine whose only live worker is `fragment_endpoint` (self is
+/// absent from the set, so every slice dials it), a local-only engine over the
+/// same store, and the coordinator's fragment metrics.
+fn coordinator_with_sole_worker(
+    store: &Arc<dyn ObjectStoreBackend>,
+    fragment_endpoint: String,
+) -> (
+    ravel_query::QueryEngine,
+    ravel_query::QueryEngine,
+    Arc<ravel_server::distrib::FragmentMetrics>,
+) {
+    use std::sync::OnceLock;
+
+    use parking_lot::RwLock;
+    use ravel_fleet::query_workers::QueryWorkerRecord;
+    use ravel_query::distrib::codec;
+    use ravel_query::{EngineConfig, QueryEngine};
+    use ravel_server::distrib::{
+        AdmissionClasses, FragmentMetrics, FragmentService, RoutingSliceFetcher,
+    };
+
+    const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+    let catalog = || {
+        ravel_server::query::build_catalog(
+            store.clone(),
+            1,
+            false,
+            CACHE_BYTES,
+            None,
+            None,
+            None,
+            std::time::Duration::from_secs(2),
+        )
+        .expect("catalog")
+    };
+
+    let metrics = Arc::new(FragmentMetrics::new());
+    let admission = AdmissionClasses::new(8, 8, metrics.clone());
+    let clock: Arc<dyn ravel_ingest::Clock> = Arc::new(ravel_ingest::SystemClock);
+    let local_service = FragmentService::new(
+        Arc::new(vec![FRAGMENT_KEY]),
+        Arc::new(ravel_query::http::StaticBearerTokenResolver::new(
+            std::collections::HashMap::new(),
+        )),
+        admission,
+        catalog(),
+        store.clone(),
+        None,
+        clock,
+        metrics.clone(),
+        Arc::new(ravel_query::GetLimiter::new(8).expect("nonzero permits")),
+    );
+    let self_cell = Arc::new(OnceLock::new());
+    self_cell
+        .set(uuid::Uuid::from_u128(0xF00D))
+        .expect("set self id");
+    let live = Arc::new(RwLock::new(Arc::new(vec![QueryWorkerRecord {
+        process_id: uuid::Uuid::from_u128(0xBEEF).to_string(),
+        fragment_endpoint,
+        protocol_version: codec::PROTOCOL_VERSION,
+        started_unix_ns: 0,
+    }])));
+    let fetcher = Arc::new(RoutingSliceFetcher::new(
+        self_cell,
+        live,
+        Arc::new(vec![FRAGMENT_KEY]),
+        local_service,
+        metrics.clone(),
+        fragment_tls::client_tls(),
+    ));
+    let distributed = Arc::new(ravel_query::distrib::Distributed::new(
+        fetcher,
+        always_distribute_settings().thresholds,
+    ));
+    let coordinator = QueryEngine::new(catalog(), store.clone(), EngineConfig::default())
+        .with_distributed(distributed);
+    let plain = QueryEngine::new(catalog(), store.clone(), EngineConfig::default());
+    (coordinator, plain, metrics)
+}
+
+/// The deadline the hung-peer tests hand the engine: well past every
+/// transport bound they assert, so a query that stalls on the dial fails here
+/// rather than finishing inside the bound by accident.
+const HUNG_PEER_TEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// One range query over the window [`publish_segment`] covers when anchored
+/// ten minutes before `now`.
+async fn range_over_recent_segment(
+    engine: &ravel_query::QueryEngine,
+    now: i64,
+    deadline: std::time::Duration,
+) -> Result<ravel_promql::Value, ravel_query::QueryError> {
+    let (start_ms, end_ms, step_ms) = (
+        (now - 15 * NS_PER_MIN) / NS_PER_SEC * 1000,
+        now / NS_PER_SEC * 1000,
+        60_000,
+    );
+    engine
+        .range_with_stats(
+            TenantId::new(TENANT).hash(),
+            METRIC,
+            start_ms,
+            end_ms,
+            step_ms,
+            &[],
+            now,
+            deadline,
+        )
+        .await
+        .map(|(value, _)| value)
+}
+
+/// Issue #3129: a worker that accepts TCP and never completes TLS (a tarpit)
+/// fails the dial at the TLS handshake bound as a retryable transport error,
+/// so the slice takes the existing fallback and the query answers correctly
+/// in time bounded by `connect + handshake` per attempt, not by the query
+/// deadline. With `connect_timeout` alone the handshake waits forever and the
+/// query fails at [`HUNG_PEER_TEST_DEADLINE`].
+#[tokio::test]
+async fn tarpit_worker_falls_back_within_the_handshake_bound() {
+    use ravel_server::distrib::{REMOTE_CONNECT_TIMEOUT, TLS_HANDSHAKE_TIMEOUT};
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+
+    let tarpit = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind tarpit");
+    let tarpit_addr = tarpit.local_addr().expect("tarpit addr");
+    let accepted = Arc::new(AtomicU64::new(0));
+    let accepted_in_task = accepted.clone();
+    let tarpit_task = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((socket, _)) = tarpit.accept().await {
+            accepted_in_task.fetch_add(1, Ordering::SeqCst);
+            held.push(socket);
+        }
+    });
+
+    let (coordinator, plain, metrics) =
+        coordinator_with_sole_worker(&store, tarpit_addr.to_string());
+    let started = std::time::Instant::now();
+    let distributed_value =
+        range_over_recent_segment(&coordinator, now, HUNG_PEER_TEST_DEADLINE).await;
+    let elapsed = started.elapsed();
+    let local_value = range_over_recent_segment(&plain, now, HUNG_PEER_TEST_DEADLINE)
+        .await
+        .expect("local query completes");
+
+    let bound = (REMOTE_CONNECT_TIMEOUT + TLS_HANDSHAKE_TIMEOUT) * 2 + Duration::from_secs(2);
+    // hygiene-allow: wall-clock -- the bound under test is tonic's real-time
+    // handshake timer over a real socket; the miss is 60 s against 14 s.
+    assert!(
+        elapsed < bound,
+        "the tarpit must cost at most the dial bounds: {elapsed:?} >= {bound:?}"
+    );
+    assert_eq!(
+        distributed_value.expect("the query answers through fallback"),
+        local_value,
+        "the fallback result must equal local execution"
+    );
+    assert!(
+        accepted.load(Ordering::SeqCst) >= 1,
+        "the coordinator dialed the tarpit"
+    );
+    assert!(
+        metrics.slices_fallback_total() >= 1,
+        "the tarpit's slices fell back to local"
+    );
+    assert_eq!(
+        metrics.slices_remote_total(),
+        0,
+        "the tarpit served nothing"
+    );
+    assert!(
+        metrics.quarantine_marks_total() >= 1,
+        "the handshake timeout surfaced as the retryable transport error, \
+         which quarantines the endpoint"
+    );
+    tarpit_task.abort();
+}
+
+/// A TCP proxy to `upstream` that forwards both ways until `blackhole` is set,
+/// then reads and discards every byte in both directions: the connection stays
+/// open and every write succeeds, but nothing arrives at either end.
+async fn spawn_blackhole_proxy(
+    upstream: std::net::SocketAddr,
+    blackhole: Arc<std::sync::atomic::AtomicBool>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn pump(
+        mut from: tokio::net::tcp::OwnedReadHalf,
+        mut to: tokio::net::tcp::OwnedWriteHalf,
+        blackhole: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            let n = match from.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            if blackhole.load(Ordering::SeqCst) {
+                continue;
+            }
+            if to.write_all(&buf[..n]).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy");
+    let addr = listener.local_addr().expect("proxy addr");
+    let task = tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            let Ok(outbound) = tokio::net::TcpStream::connect(upstream).await else {
+                continue;
+            };
+            let (in_read, in_write) = inbound.into_split();
+            let (out_read, out_write) = outbound.into_split();
+            tokio::spawn(pump(in_read, out_write, blackhole.clone()));
+            tokio::spawn(pump(out_read, in_write, blackhole.clone()));
+        }
+    });
+    (addr, task)
+}
+
+/// Issue #3129: a peer that goes silent after connecting (a host that dies, a
+/// partition that drops packets) is detected by HTTP/2 keepalive on the cached
+/// channel within `interval + timeout`, and the slice takes the existing
+/// fallback. Query 1 runs through the proxy and caches the channel; the proxy
+/// then drops every byte, and query 2 on that same channel must answer through
+/// fallback inside the keepalive bound. Without keepalive the dead connection
+/// is never noticed and query 2 fails at [`HUNG_PEER_TEST_DEADLINE`].
+#[tokio::test]
+async fn silent_peer_after_connect_is_detected_by_keepalive() {
+    use ravel_server::distrib::{HTTP2_KEEPALIVE_INTERVAL, HTTP2_KEEPALIVE_TIMEOUT};
+
+    let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+    let tenant = TenantId::new(TENANT);
+    let now = now_ns();
+    publish_segment(store.as_ref(), &tenant, now - 10 * NS_PER_MIN).await;
+
+    let worker = start_server(Arc::clone(&store), Some(always_distribute_settings())).await;
+    let worker_fragment = worker
+        .fragment_addr
+        .expect("the dedicated fragment listener binds");
+    let blackhole = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (proxy_addr, proxy_task) = spawn_blackhole_proxy(worker_fragment, blackhole.clone()).await;
+
+    let (coordinator, plain, metrics) =
+        coordinator_with_sole_worker(&store, proxy_addr.to_string());
+    let local_value = range_over_recent_segment(&plain, now, HUNG_PEER_TEST_DEADLINE)
+        .await
+        .expect("local query completes");
+
+    let first = range_over_recent_segment(&coordinator, now, HUNG_PEER_TEST_DEADLINE)
+        .await
+        .expect("query 1 runs through the proxy");
+    assert_eq!(first, local_value);
+    assert!(
+        metrics.slices_remote_total() > 0,
+        "query 1 reached the worker through the proxy, caching the channel"
+    );
+    assert_eq!(metrics.slices_fallback_total(), 0);
+    assert_eq!(metrics.quarantine_marks_total(), 0);
+
+    blackhole.store(true, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    let second = range_over_recent_segment(&coordinator, now, HUNG_PEER_TEST_DEADLINE).await;
+    let elapsed = started.elapsed();
+
+    let bound = HTTP2_KEEPALIVE_INTERVAL + HTTP2_KEEPALIVE_TIMEOUT + Duration::from_secs(5);
+    // hygiene-allow: wall-clock -- the bound under test is hyper's real-time
+    // keepalive timer over a real socket; without keep_alive_timeout it is 30 s.
+    assert!(
+        elapsed < bound,
+        "the silent peer must be detected within the keepalive bound: \
+         {elapsed:?} >= {bound:?}"
+    );
+    assert_eq!(
+        second.expect("query 2 answers through fallback"),
+        local_value,
+        "the fallback result must equal local execution"
+    );
+    assert!(
+        metrics.slices_fallback_total() >= 1,
+        "query 2's slices fell back to local"
+    );
+    assert!(
+        metrics.quarantine_marks_total() >= 1,
+        "the keepalive failure surfaced as the retryable transport error, \
+         which quarantines the endpoint"
+    );
+
+    proxy_task.abort();
+    worker.shutdown().await.expect("worker shuts down");
 }
 
 /// ADR-0071 slice atomicity: a slice whose first attempt dies mid-frames
@@ -3290,5 +3593,126 @@ mod sql_slices {
             .await
             .expect("coordinator shuts down");
         worker.shutdown().await.expect("worker shuts down");
+    }
+
+    /// Issue #3129, SQL lane: the only live worker is a tarpit that accepts
+    /// TCP and never completes TLS. Each slice dial fails at the handshake
+    /// bound set on the TLS config the server hands the SQL lane, so the
+    /// statement completes through the coordinator-local read in time bounded
+    /// by `connect + handshake` per attempt. With `connect_timeout` alone the
+    /// handshake waits forever and the statement fails at its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sql_tarpit_worker_falls_back_within_the_handshake_bound() {
+        use ravel_server::distrib::TLS_HANDSHAKE_TIMEOUT;
+        /// A copy of `ravel_sql`'s private `DISTRIB_SLICE_CONNECT_TIMEOUT`, used
+        /// only to size the bound below. The tarpit accepts TCP at once, so the
+        /// connect timeout never adds to the elapsed time.
+        const DISTRIB_SLICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let shared = Arc::new(MemoryStore::new());
+        let base = now_ns() - 10 * NS_PER_MIN;
+        let data_keys: HashSet<String> = [
+            publish_on_shard(&shared, 0, &[(base, 1.5), (base + NS_PER_MIN, 2.5)]).await,
+            publish_on_shard(&shared, 1, &[(base, 1.5), (base + 2 * NS_PER_MIN, 3.5)]).await,
+        ]
+        .into_iter()
+        .collect();
+        let (start_ns, end_ns) = (base - 5 * NS_PER_MIN, now_ns());
+
+        let tarpit = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind tarpit");
+        let tarpit_addr = tarpit.local_addr().expect("tarpit addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_in_task = accepted.clone();
+        let tarpit_task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = tarpit.accept().await {
+                accepted_in_task.fetch_add(1, Ordering::SeqCst);
+                held.push(socket);
+            }
+        });
+        // A valid, MAC'd heartbeat naming the tarpit as a live query worker.
+        ravel_fleet::query_workers::QueryWorkers::with_defaults(
+            tarpit_addr.to_string(),
+            ravel_query::distrib::codec::PROTOCOL_VERSION,
+            ravel_fleet::query_workers::RecordKeys::from_file_keys(&[FRAGMENT_KEY])
+                .expect("record keys"),
+        )
+        .write_heartbeat(shared.as_ref(), now_ns())
+        .await
+        .expect("write tarpit heartbeat");
+
+        let coordinator_store = Arc::new(DataStore {
+            inner: shared.clone(),
+            data_keys,
+            refuse: false,
+            data_gets: AtomicUsize::new(0),
+        });
+        let coordinator = start_server_with(
+            coordinator_store.clone(),
+            Some(always_distribute_settings()),
+            ravel_query::QueryConcurrencyLimit::Unlimited,
+            2,
+        )
+        .await;
+        let coordinator_grpc = coordinator.grpc_addr.expect("gRPC binds in All mode");
+        let roster = coordinator
+            .sql_slice_workers
+            .clone()
+            .expect("--distributed-query builds the SQL roster");
+        let deadline = Instant::now() + DEADLINE;
+        let locations = loop {
+            let locations = roster.endpoints();
+            if !locations.is_empty() {
+                break locations;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the coordinator never listed the tarpit"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        assert_eq!(locations, vec![format!("https://{tarpit_addr}")]);
+
+        let dials = coordinator
+            .sql_slice_tls_dials
+            .clone()
+            .expect("Flight SQL is served");
+        let started = Instant::now();
+        let outcome = tokio::time::timeout(
+            super::HUNG_PEER_TEST_DEADLINE,
+            run_query(coordinator_grpc, start_ns, end_ns),
+        )
+        .await;
+        let elapsed = started.elapsed();
+
+        let bound =
+            (DISTRIB_SLICE_CONNECT_TIMEOUT + TLS_HANDSHAKE_TIMEOUT) * 2 + Duration::from_secs(2);
+        // hygiene-allow: wall-clock -- the bound under test is tonic's real-time
+        // handshake timer over a real socket; the miss is 30 s against 18 s.
+        assert!(
+            elapsed < bound,
+            "the tarpit must cost at most the dial bounds: {elapsed:?} >= {bound:?}"
+        );
+        let rows = outcome
+            .expect("the statement finishes before the test deadline")
+            .expect("the statement answers through the coordinator-local read");
+        assert_eq!(rows, 3, "the cross-shard duplicate dedups");
+        assert!(
+            accepted.load(Ordering::SeqCst) >= 1,
+            "the coordinator dialed the tarpit"
+        );
+        assert!(dials.get() > 0, "the slice dials went out over TLS");
+        assert!(
+            coordinator_store.data_gets.load(Ordering::SeqCst) > 0,
+            "the coordinator read the segments itself"
+        );
+
+        tarpit_task.abort();
+        coordinator
+            .shutdown()
+            .await
+            .expect("coordinator shuts down");
     }
 }
