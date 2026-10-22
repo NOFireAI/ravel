@@ -14,7 +14,7 @@ use ravel_maintain::scan::{
     ScanReport, TerminalState, Zone, classify_zone, scan_and_maintain_with_memo,
 };
 use ravel_maintain::{
-    Bucket, CompactorConfig, FixedClock, MaintainError, NoLeases, RetentionConfig, RetentionPolicy,
+    Bucket, MemoSnapshotLimits, VerifiedSnapshot, CompactorConfig, FixedClock, MaintainError, NoLeases, RetentionConfig, RetentionPolicy,
     buckets_held_out_of_window_total, scan_and_compact,
 };
 use ravel_object_store::instrument::{InstrumentedStore, StoreMetricsSnapshot};
@@ -23,7 +23,21 @@ use ravel_object_store::{GetRange, ObjectStoreBackend};
 use ravel_rspan::SpanSegError;
 use ravel_segment::SegmentError;
 use ravel_types::Signal;
+use ravel_maintain::worker_set::MaintainRecordKeys;
 use uuid::Uuid;
+
+/// `memo`'s snapshot at `snapshot_unix_ns`, MAC'd and verified as one
+/// process's under one test key, as a successor's reseed read returns it.
+fn verified_snapshot(memo: &MaintainMemo, snapshot_unix_ns: i64) -> VerifiedSnapshot {
+    let keys = MaintainRecordKeys::from_file_keys(&[[0x4D; 32]]).expect("one key");
+    let process_id = Uuid::from_u128(0x5eed);
+    VerifiedSnapshot::verify(
+        process_id,
+        memo.encode_snapshot(snapshot_unix_ns, &process_id, &keys),
+        &keys,
+    )
+    .expect("an honest snapshot verifies")
+}
 
 fn two_at(hour: u32, base: u128) -> Vec<InputSpec> {
     vec![
@@ -594,7 +608,7 @@ async fn warm_start_skips_terminal_buckets_without_reads() {
 
     // A first worker warms its memo and persists a durable snapshot.
     let warm = warm_terminal_memo(&store, &clock, &config, &retention, N).await;
-    let snapshot_bytes = warm.encode_snapshot(now);
+    let snapshot_bytes = verified_snapshot(&warm, now);
 
     // A second worker starts cold and warm-starts purely from the snapshot
     // bytes (the durability path: no in-memory memo carried over).
@@ -602,6 +616,7 @@ async fn warm_start_skips_terminal_buckets_without_reads() {
     let stats = seeded
         .seed_from_snapshot(
             &snapshot_bytes,
+            MemoSnapshotLimits::DEFAULT,
             now,
             DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
             |_, _, _| true,
@@ -679,7 +694,7 @@ async fn stale_memo_snapshot_is_ignored_and_forces_cold_start() {
     let config = CompactorConfig::default();
     let retention = retention_window(30 * DAY_NS);
     let warm = warm_terminal_memo(&store, &FixedClock::new(warm_now), &config, &retention, N).await;
-    let snapshot_bytes = warm.encode_snapshot(warm_now);
+    let snapshot_bytes = verified_snapshot(&warm, warm_now);
 
     // Read the snapshot one nanosecond past the staleness bound: ignored.
     let read_now = warm_now + DEFAULT_MEMO_SNAPSHOT_STALENESS_NS + 1;
@@ -687,6 +702,7 @@ async fn stale_memo_snapshot_is_ignored_and_forces_cold_start() {
     let stats = seeded
         .seed_from_snapshot(
             &snapshot_bytes,
+            MemoSnapshotLimits::DEFAULT,
             read_now,
             DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
             |_, _, _| true,
@@ -740,7 +756,7 @@ async fn ownership_handoff_seeds_successor_from_predecessor_snapshot() {
     // Worker A owned (tenant, Metrics, SHARD), warmed its memo, and left a
     // durable snapshot before dropping out of the live set.
     let warm_a = warm_terminal_memo(&store, &FixedClock::new(now), &config, &retention, N).await;
-    let a_snapshot = warm_a.encode_snapshot(now);
+    let a_snapshot = verified_snapshot(&warm_a, now);
 
     // Worker B newly owns the unit after the handoff. It starts cold and seeds
     // from A's snapshot, keeping only units it now owns (here, the moved unit).
@@ -748,6 +764,7 @@ async fn ownership_handoff_seeds_successor_from_predecessor_snapshot() {
     let stats = memo_b
         .seed_from_snapshot(
             &a_snapshot,
+            MemoSnapshotLimits::DEFAULT,
             now,
             DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
             |_, signal, shard| signal == Signal::Metrics && shard == SHARD,
@@ -1106,11 +1123,12 @@ async fn invalidate_forces_reevaluation_and_survives_snapshot_round_trip() {
         Some(TerminalState::Compacted),
     );
     memo.invalidate(tenant_hash(), Signal::Metrics, SHARD, &[HOUR]);
-    let snapshot_bytes = memo.encode_snapshot(t4);
+    let snapshot_bytes = verified_snapshot(&memo, t4);
     let mut seeded = MaintainMemo::new(config.interior_reverify_ns);
     let stats = seeded
         .seed_from_snapshot(
             &snapshot_bytes,
+            MemoSnapshotLimits::DEFAULT,
             t4,
             DEFAULT_MEMO_SNAPSHOT_STALENESS_NS,
             |_, _, _| true,
