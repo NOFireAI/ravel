@@ -204,7 +204,7 @@ Where that file goes is itself a rule, because both wrong answers have
 already cost a task. Run this first, as ONE command, substituting
 nothing:
 
-    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 70 && df -h /tmp . "$HOME"
+    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 190 && df -h /tmp . "$HOME"
 
 Every step is joined with `&&` so a failure anywhere fails the command:
 `git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
@@ -215,12 +215,13 @@ in the next.
 
 If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a cold gate writes 54 to 70 GB of target
-when its closure runs no feature lane, and each feature lane adds about
-55 GB more in the same target (CLAUDE.md's measured band; gates reaching
-the sql, flight-sql, esql and ravel-bench lanes measured 93 to 186 GB),
-so a host without 70 GB free cannot be trusted to finish the template's
-scripts/gates.sh -p run. A spec whose `--dry-run` lists those lanes asks
-for 190 and says so. Short of that, the run dies mid-link with a fake compiler
+when its closure runs no feature lane, and up to about 190 GB when it
+reaches the sql, flight-sql, esql and ravel-bench lanes (CLAUDE.md's
+measured band: 93, 186 and 188 GB on executors), since the main suite and
+every lane share one target. Most closures reach those lanes, so the
+template asks for 190. A spec whose `--dry-run` lists no feature lane may
+lower it to 70 and must say so. Short of the headroom the run needs, it dies
+mid-link with a fake compiler
 error (two gate runs died at link on a shared executor volume another
 task filled mid-run; 5 GB was the old floor and it measured nothing the
 gate needed). Scoped does not mean small: the closure of a crate low in
