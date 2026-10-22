@@ -1595,9 +1595,11 @@ impl SegmentFetcher {
                 ))
             }
             // A late serve made no GET of its own and is not a hit: it stays
-            // the miss its lookup counted, with no store cost and no etag.
+            // the miss its lookup counted, with no store cost and no etag. Its
+            // bytes still reached this query, as late-served bytes.
             ReadOutcome::LateServe => {
                 accounting.record_cache_miss();
+                accounting.add_late_served_bytes(bytes.len() as u64);
                 Ok((
                     placeholder_outcome(bytes, seg_ref.object_size),
                     GetCost::default(),
@@ -4639,13 +4641,14 @@ mod tests {
 
     /// A late serve's figures: no GET of its own in its `GetCost` or its query
     /// accounting, and the one cache miss its lookup counted, with no hit and
-    /// no cache bytes.
+    /// no cache bytes; the bytes it was handed count as late-served.
     fn assert_late_serve(cost: GetCost, snap: &ravel_types::accounting::QueryAccountingSnapshot) {
         assert_eq!((cost.requests, cost.bytes), (0, 0), "no GET of its own");
         assert_eq!(snap.s3_requests(AccountedOp::Get), 0);
         assert_eq!(snap.cache_misses, 1, "a late serve stays a miss");
         assert_eq!(snap.cache_hits, 0);
         assert_eq!(snap.cache_bytes, 0);
+        assert!(snap.late_served_bytes > 0, "the bytes it was handed");
     }
 
     /// A RAM-only cache's single-flight follower of another `cached_get`'s GET
@@ -4719,7 +4722,9 @@ mod tests {
             .await
             .expect("recheck-served read");
         assert_eq!(got.data, object_bytes);
-        assert_late_serve(cost, &acc.snapshot());
+        let snap = acc.snapshot();
+        assert_late_serve(cost, &snap);
+        assert_eq!(snap.late_served_bytes, len, "the whole object, late-served");
         assert_eq!(gate.held_count(), 0, "no GET reached the store");
         let tier = ram_metrics.snapshot();
         assert_eq!(tier.misses, 1, "the peek's miss");

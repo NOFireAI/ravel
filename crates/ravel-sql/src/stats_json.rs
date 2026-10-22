@@ -15,10 +15,12 @@
 //! attempts never reach this counter; `object_store` retries beneath
 //! `InstrumentedStore`, so a GET that retried counts once here) and range
 //! reads included (a range GET's counter is the bytes the range itself
-//! returned) -- with two named exceptions: `cacheServedBytes` never crossed
-//! the wire (served from the in-process cache) and `decompressedOutputBytes`
-//! is a decode-time output size no request paid for. The three are never
-//! comparable or summable with each other.
+//! returned) -- with three named exceptions: `cacheServedBytes` never crossed
+//! the wire (served from the in-process cache), `lateServedBytes` were handed
+//! over from another caller's in-flight read of the same key (no GET of this
+//! query's own moved them), and `decompressedOutputBytes` is a decode-time
+//! output size no request paid for. None of them is comparable or summable
+//! with the wire figures.
 
 use std::time::Duration;
 
@@ -45,6 +47,7 @@ pub fn phase_costs_json(snapshot: &PhaseAccountingSnapshot) -> Vec<Json> {
                 "cacheHits": s.cache_hits,
                 "cacheMisses": s.cache_misses,
                 "cacheServedBytes": s.cache_bytes,
+                "lateServedBytes": s.late_served_bytes,
                 "decompressedOutputBytes": s.decompressed_bytes,
                 "reusedRegionBytes": s.bytes_reused,
                 "segmentsOpened": s.segments_opened,
@@ -302,7 +305,7 @@ mod tests {
         assert_eq!(rendered["admittedBytes"], 8);
     }
 
-    /// `phase_costs_json`'s per-phase key set is exactly the eleven fields
+    /// `phase_costs_json`'s per-phase key set is exactly the twelve fields
     /// below, no more and no fewer, matching `ravel_query::http::json`'s
     /// PromQL `stats.phases` rendering (`http/json.rs`'s `PhaseCostJson`)
     /// exactly: a renamed, added, or dropped key here would otherwise ship
@@ -322,6 +325,7 @@ mod tests {
             "cacheHits",
             "cacheMisses",
             "cacheServedBytes",
+            "lateServedBytes",
             "decompressedOutputBytes",
             "reusedRegionBytes",
             "segmentsOpened",

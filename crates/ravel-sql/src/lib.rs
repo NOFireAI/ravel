@@ -103,6 +103,8 @@ mod rlog_attrs;
 mod scan;
 mod schema;
 mod session;
+#[cfg(test)]
+mod size_trigger_tests;
 mod spans_fetcher;
 mod spans_provider;
 mod spans_pushdown;
@@ -117,7 +119,7 @@ mod udf;
 mod validate;
 mod value_typed_results;
 
-pub use access_intent::{IntentCacheCounts, StatementCacheStats};
+pub use access_intent::{IntentCacheCounts, StatementCacheStats, effective_bulk_scan_min_bytes};
 pub use alerts_provider::AlertsTableProvider;
 pub use alerts_pushdown::{AlertsPushdown, extract_alerts};
 pub use alerts_schema::{

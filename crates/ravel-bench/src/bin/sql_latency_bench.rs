@@ -169,9 +169,10 @@ struct Args {
     /// become meaningful.
     #[arg(long, default_value_t = 0)]
     cache_bytes: u64,
-    /// Resolved bytes at or above which a filtered `logs` statement sent as
-    /// SQL text also reads as a bulk scan, the same flag as `ravel-server
-    /// --cache-bulk-scan-min-bytes`. Unset (the default), only the
+    /// Read bytes at or above which a filtered `logs` statement sent as SQL
+    /// text reads as a bulk scan from its next execution, the same flag as
+    /// `ravel-server --cache-bulk-scan-min-bytes`, and like it raised to
+    /// `--cache-bytes` when that is larger. Unset (the default), only the
     /// predicate-free rule applies. It moves the intent classification only:
     /// the read cache goes on the samples fetcher, which the report's
     /// `read_cache` is read from, whenever `--cache-bytes` builds one.
@@ -752,7 +753,7 @@ fn provenance_header(p: &Provenance, d: &DatasetInfo) -> String {
     }
     if let Some(n) = p.cache_bulk_scan_min_bytes {
         out.push_str(&format!(
-            "  bulk scan  : filtered logs scans of >= {n} resolved bytes (samples fetcher cache: {})\n",
+            "  bulk scan  : filtered logs statements that last read >= {n} bytes (samples fetcher cache: {})\n",
             if p.samples_fetcher_cache { "on" } else { "off" }
         ));
     }
