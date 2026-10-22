@@ -3926,18 +3926,22 @@ mod sql_slices {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         blackhole.store(true, Ordering::SeqCst);
+        let blackholed = Instant::now();
         let outcome = statement.await.expect("the statement task runs");
         let elapsed = started.elapsed();
+        let detected = blackholed.elapsed();
 
         let bound =
             SLICE_HTTP2_KEEPALIVE_INTERVAL + SLICE_HTTP2_KEEPALIVE_TIMEOUT + Duration::from_secs(5);
         // hygiene-allow: wall-clock -- the bound under test is hyper's real-time
-        // keepalive timer over a real socket; the miss is the 30 s statement
-        // deadline against 25 s.
+        // keepalive timer over a real socket, measured from the blackhole so the
+        // statement's setup is not charged to it; without keepalive the
+        // statement runs to its 30 s deadline, which misses 25 s by more than
+        // the setup that precedes the blackhole.
         assert!(
-            elapsed < bound,
+            detected < bound,
             "the silent slice must be detected within the keepalive bound: \
-             {elapsed:?} >= {bound:?}"
+             {detected:?} >= {bound:?}"
         );
         // hygiene-allow: wall-clock -- a re-dial through the silent proxy fails
         // at the real-time TLS handshake bound, well under one keepalive
