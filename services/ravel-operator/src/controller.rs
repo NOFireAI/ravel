@@ -306,9 +306,10 @@ async fn resolve_token_secret(
 
 /// Read a Secret's `resourceVersion` without pulling its values into operator
 /// memory. Used for every Secret that only needs change detection: the
-/// credential Secrets (fixed `accessKeyId`/`secretAccessKey` keys) and the four
+/// credential Secrets (fixed `accessKeyId`/`secretAccessKey` keys), the four
 /// distributed-query Secrets (the fragment TLS key, the fragment key file, and
-/// the SQL ticket key), whose values the operator must never load.
+/// the SQL ticket key), and the maintain key file, whose values the operator
+/// must never load.
 ///
 /// `Api::get_metadata` issues the same `get` verb against the Secret but asks
 /// the apiserver for metadata only, so the response carries the

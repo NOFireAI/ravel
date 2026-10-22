@@ -39,9 +39,9 @@
 #     is a merge PATCH; the status is never read back or replaced).
 #   - Secrets: get only, and NEVER granted by this cluster-wide ClusterRole
 #     (issue #126). The operator reads the credentials, tenant-token,
-#     deployment-key, audit-token-key, and the four distributed-query Secrets
-#     (fragment TLS, fragment CA, fragment key, SQL ticket key) a RavelCluster
-#     references; it loads values only where it must (tenant names, the
+#     deployment-key, audit-token-key, maintain-key, and the four
+#     distributed-query Secrets (fragment TLS, fragment CA, fragment key, SQL
+#     ticket key) a RavelCluster references; it loads values only where it must (tenant names, the
 #     deployment and audit-token keys) and otherwise reads metadata for the
 #     resourceVersion alone, and never lists, writes, or watches them. The
 #     cluster-wide secrets rule is gone. The read is carried by
@@ -164,15 +164,17 @@ subjects:
 ---
 # Secrets: get only, granted per namespace and never cluster-wide (issue #126).
 # The operator reads the credentials, tenant-token, deployment-key,
-# audit-token-key, and the four distributed-query Secrets (fragment TLS,
-# fragment CA, fragment key, SQL ticket key) a RavelCluster references
+# audit-token-key, maintain-key, and the four distributed-query Secrets
+# (fragment TLS, fragment CA, fragment key, SQL ticket key) a RavelCluster
+# references
 # (crate::controller resolves them via Api::<Secret>::namespaced on the
 # RavelCluster's OWN namespace) to resolve tenant names and stamp resource
 # versions; it never lists, writes, or watches them. The Secret names are
 # user-chosen CRD fields (credentialsSecretRef/tenantTokensSecretRef/
 # deploymentKeySecretRef/auditTokenKeySecretRef, the per-tier credential
-# overrides, and the distributedQuery fragmentTlsSecretRef/fragmentCaSecretRef/
-# fragmentKeySecretRef/sqlTicketKeySecretRef), not a fixed set, so resourceNames
+# overrides, maintain.keySecretRef, and the distributedQuery
+# fragmentTlsSecretRef/fragmentCaSecretRef/fragmentKeySecretRef/
+# sqlTicketKeySecretRef), not a fixed set, so resourceNames
 # cannot enumerate them; a bare `secrets get` bound per namespace is the
 # tightest grant that still works.
 #
