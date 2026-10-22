@@ -204,7 +204,7 @@ Where that file goes is itself a rule, because both wrong answers have
 already cost a task. Run this first, as ONE command, substituting
 nothing:
 
-    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 190 && df -h /tmp . "$HOME"
+    mkdir -p .gate-logs && git check-ignore -q .gate-logs && scripts/guards/check-disk-headroom.sh .gate-logs 70 && df -h /tmp . "$HOME"
 
 Every step is joined with `&&` so a failure anywhere fails the command:
 `git check-ignore -q .gate-logs` proves the tracked `.gitignore` covers
@@ -215,20 +215,19 @@ in the next.
 
 If the guard exits non-zero, say so in your report and stop rather than
 picking another directory: a cold gate writes 54 to 70 GB of target
-when its closure runs no feature lane, and up to about 190 GB when it
-reaches the sql, flight-sql, esql and ravel-bench lanes (CLAUDE.md's
-measured band: 93, 186 and 188 GB on executors), since the main suite and
-every lane share one target. Most closures reach those lanes, so the
-template asks for 190. A spec whose `--dry-run` lists no feature lane may
-lower it to 70 and must say so. Short of the headroom the run needs, it dies
-mid-link with a fake compiler
+when its closure runs no feature lane, and from about 93 GB to more than
+188 GB when it reaches the sql, flight-sql, esql and ravel-bench lanes
+(CLAUDE.md's measured band), since the main suite and every lane share one
+target. The template's 70 is the hard stop because the spec does not
+choose the host, and a higher floor would turn a smaller healthy host into
+a lost dispatch. A spec whose `--dry-run` lists those lanes says so and
+tells the executor to quote the `df` line beside any link failure, since
+short of the headroom the run needs, it dies mid-link with a fake compiler
 error (two gate runs died at link on a shared executor volume another
 task filled mid-run; 5 GB was the old floor and it measured nothing the
 gate needed). Scoped does not mean small: the closure of a crate low in
 the dependency graph is most of the workspace plus every feature lane
-(`-p ravel-types` reaches 27 of the 38 workspace crates). A spec whose
-`scripts/gates.sh -p <crate> --dry-run` lists a short closure and no
-feature lane may ask for 54, the band's low end, and must say so. Then
+(`-p ravel-types` reaches 27 of the 38 workspace crates). Then
 run every long gate in the LONG COMMANDS form, into
 `.gate-logs/<step>.log` with its `EXIT=` marker.
 
