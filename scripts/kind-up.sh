@@ -68,6 +68,7 @@ TENANT_TOKEN="${RAVEL_TENANT_TOKEN:-demo-token}"
 S3_CREDENTIALS_SECRET="ravel-s3-credentials"
 TENANT_TOKENS_SECRET="ravel-tenant-tokens"
 AUDIT_TOKEN_KEY_SECRET="ravel-audit-token-key"
+MAINTAIN_KEY_SECRET="ravel-maintain-keys"
 
 log() {
   echo "[kind-up] $*" >&2
@@ -112,6 +113,42 @@ wait_cluster_condition() {
     sleep 3
   done
   die "timed out after ${timeout}s waiting for ${desc}: ${ctype}=${want} at generation ${gen:-?} (observed ${ctype}=${cstatus:-<none>} at generation ${obsgen:-<none>})"
+}
+
+# Available covers only the gateway and query tiers, and the operator withholds
+# the maintain Deployment while spec.maintain.keySecretRef is unset or names no
+# Secret, so this waits for a ready maintain replica separately. A withholding
+# Degraded condition at the current generation fails at once rather than at
+# the timeout.
+wait_maintain_ready() {
+  local timeout="$1"
+  local deadline=$(( SECONDS + timeout ))
+  local snap rest gen dstatus dreason obsgen ready
+  while (( SECONDS < deadline )); do
+    snap="$(kubectl get --namespace "$NAMESPACE" "ravelcluster/${CLUSTER_CR}" \
+      -o jsonpath='{.metadata.generation}|{.status.conditions[?(@.type=="Degraded")].status}|{.status.conditions[?(@.type=="Degraded")].reason}|{.status.conditions[?(@.type=="Degraded")].observedGeneration}' \
+      2>/dev/null || true)"
+    gen="${snap%%|*}"
+    rest="${snap#*|}"
+    dstatus="${rest%%|*}"
+    rest="${rest#*|}"
+    dreason="${rest%%|*}"
+    obsgen="${rest##*|}"
+    if [[ -n "$gen" && "$dstatus" == "True" && "$obsgen" == "$gen" ]]; then
+      case "$dreason" in
+        MaintainKeySecretRefMissing | SecretNotFound)
+          die "maintain tier withheld at generation ${gen}: Degraded reason ${dreason}; check spec.maintain.keySecretRef and Secret ${MAINTAIN_KEY_SECRET}"
+          ;;
+      esac
+    fi
+    ready="$(kubectl get --namespace "$NAMESPACE" "deployment/${CLUSTER_CR}-maintain" \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+    if [[ "$ready" =~ ^[0-9]+$ ]] && (( ready >= 1 )); then
+      return 0
+    fi
+    sleep 3
+  done
+  die "timed out after ${timeout}s waiting for deployment ${CLUSTER_CR}-maintain to have a ready replica (Degraded=${dstatus:-<none>} reason ${dreason:-<none>})"
 }
 
 # On any failure after the cluster exists, dump what a human would ask for
@@ -222,7 +259,7 @@ kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -
 # Secrets are created by the script, not committed as manifests: committing a
 # Secret manifest -- even a dev one -- puts credentials in git and invites
 # copying into a real cluster.
-log "creating Secrets ${S3_CREDENTIALS_SECRET}, ${TENANT_TOKENS_SECRET}, and ${AUDIT_TOKEN_KEY_SECRET}"
+log "creating Secrets ${S3_CREDENTIALS_SECRET}, ${TENANT_TOKENS_SECRET}, ${AUDIT_TOKEN_KEY_SECRET}, and ${MAINTAIN_KEY_SECRET}"
 kubectl create secret generic "$S3_CREDENTIALS_SECRET" \
   --namespace "$NAMESPACE" \
   --from-literal="accessKeyId=${S3_ACCESS_KEY}" \
@@ -242,6 +279,14 @@ kubectl create secret generic "$AUDIT_TOKEN_KEY_SECRET" \
   --namespace "$NAMESPACE" \
   --from-literal="key=$(openssl rand -hex 32)" \
   --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+# The development maintain key file: one 64-hex key under `keys`. Created only
+# when absent, because a new key on a reused cluster rolls the maintain pods
+# and, until the roll finishes, splits them into two live sets.
+if ! kubectl get secret --namespace "$NAMESPACE" "$MAINTAIN_KEY_SECRET" >/dev/null 2>&1; then
+  kubectl create secret generic "$MAINTAIN_KEY_SECRET" \
+    --namespace "$NAMESPACE" \
+    --from-literal="keys=$(openssl rand -hex 32)" >/dev/null
+fi
 
 # ---- 4. fake S3 backend ------------------------------------------------------
 log "deploying fake S3 backend '${BACKEND}' from ${BACKEND_MANIFEST}"
@@ -339,6 +384,8 @@ spec:
   maintain:
     enabled: true
     intervalSecs: 300
+    keySecretRef:
+      name: ${MAINTAIN_KEY_SECRET}
   retention:
     default: 30d
 YAML
@@ -357,6 +404,8 @@ log "waiting for RavelCluster ${CLUSTER_CR} to report StoreQualified for the app
 wait_cluster_condition StoreQualified True 300 "store qualification to pass"
 log "waiting for RavelCluster ${CLUSTER_CR} to report Available for the applied spec"
 wait_cluster_condition Available True 300 "the gateway and query tiers to become ready"
+log "waiting for the maintain Deployment ${CLUSTER_CR}-maintain to have a ready replica"
+wait_maintain_ready 300
 
 log "cluster up. Deployments:"
 kubectl get --namespace "$NAMESPACE" deployments
