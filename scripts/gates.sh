@@ -485,6 +485,14 @@ echo "==> scripts/check-injected-clock-helpers.sh"
 echo "==> scripts/check_format_version_docs.py"
 python3 "$(dirname "$0")/check_format_version_docs.py"
 
+# Every absence-marker line in a normative doc is registered in
+# docs/review/claims.yaml and every bound symbol is still defined (ADR-1658).
+# CI's doc-scripts job runs it; without it here a branch passes every local
+# and executor gate and fails CI on a new "is not created" sentence (issue
+# #3188). Stdlib Python, no build.
+echo "==> scripts/check-doc-claims.py"
+python3 "$(dirname "$0")/check-doc-claims.py"
+
 # Every parse of caller text in ravel-sql runs the pre-parse complexity guard,
 # because the walks over the parsed tree abort the process on a statement the
 # parser's own recursion limit does not bound (issue #1680). That was a
