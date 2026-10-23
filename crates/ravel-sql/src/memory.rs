@@ -2128,12 +2128,22 @@ mod tests {
             res.try_grow(step).expect("within every ceiling");
             envelopes.push(envelope_on_budget(&budget));
             assert_eq!(
-                budget.reserved() - pool.reserved() as u64,
-                envelope_on_budget(&budget),
+                budget.reserved(),
+                pool.reserved() as u64 + envelope_on_budget(&budget),
                 "the envelope is on the process budget and nowhere else"
             );
         }
 
+        let last = *envelopes.last().expect("six steps");
+        assert!(
+            last >= 4 * 109_051_904,
+            "the next Vec doubling's transient: {last}"
+        );
+        assert!(
+            last as f64 >= 4.86 * 29_360_128.0,
+            "the next table doubling's transient: {last}"
+        );
+        assert_eq!(last, 545_259_520, "5 x the 109,051,904-byte Vec step");
         // Under 8 MiB the size bound alone: 2.43 x 7,340,032.
         assert_eq!(envelopes[0], 17_836_278);
         // From then on the smaller of 5 x J_max and 2.43 x S.
@@ -2150,16 +2160,6 @@ mod tests {
             let by_size = (sizes[index] as f64 * 2.43).ceil() as u64;
             assert_eq!(envelopes[index], (5 * largest).min(by_size), "step {index}");
         }
-        let last = *envelopes.last().expect("six steps");
-        assert_eq!(last, 545_259_520, "5 x the 109,051,904-byte Vec step");
-        assert!(
-            last >= 4 * 109_051_904,
-            "the next Vec doubling's transient: {last}"
-        );
-        assert!(
-            last as f64 >= 4.86 * 29_360_128.0,
-            "the next table doubling's transient: {last}"
-        );
         assert_eq!(
             pool.reserved(),
             (SERIES.iter().sum::<usize>() as f64 * 1.25).ceil() as usize
@@ -2225,8 +2225,8 @@ mod tests {
 
         let pools = (pool_one.reserved() + pool_two.reserved()) as u64;
         assert_eq!(
-            budget.reserved() - pools,
-            5 * (2 + 3) * MIB as u64,
+            budget.reserved(),
+            pools + 5 * (2 + 3) * MIB as u64,
             "only B's and C's envelopes, the two largest, are on the budget"
         );
         assert_eq!(envelope_on_budget(&budget), 5 * (2 + 3) * MIB as u64);
