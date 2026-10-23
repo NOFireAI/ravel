@@ -101,6 +101,8 @@ mod pushdown;
 pub mod redact;
 mod rlog_attrs;
 mod scan;
+#[cfg(test)]
+mod scan_alternation_tests;
 mod schema;
 mod session;
 #[cfg(test)]

@@ -639,6 +639,33 @@ partition:
   (`topk_with_one_partition_follows_the_global_deal`), which publishes a
   segment whose groups no other segment's interleave as one unit
   (`topk_one_partition_time_disjoint_segments_open_once`).
+- **A repeated scan alternates its publication direction** (ADR-0102's
+  #3192 amendment). `SqlExecutor` owns one `ScanExecutions` record, a count
+  per scan keyed by the tenant, the resolved segment set (content hashes in
+  snapshot order), the projection and the pushed predicates, but not the
+  time bounds. It holds at most 4,096 scans, drops the least recently
+  counted first, and is charged to no cache. With a read cache wired, no
+  confirmed TopK and no pushed fetch limit, an execution's first
+  publication takes and increments its scan's count, and an odd count
+  publishes the segments in reverse visit order (`publication_order`), each
+  segment's units still contiguous and in group order. A scan over more
+  objects than the read cache holds then reads first, on each execution,
+  the objects the previous one read last, while the cache still holds them.
+  A re-executed round of the same plan node takes the direction its
+  execution already took and is not counted again
+  (`a_repeated_cached_scan_alternates_its_publication_direction`), and a
+  scan under another pushed filter has its own count
+  (`a_scan_under_another_pushed_filter_has_its_own_count`). Without a read
+  cache, under a confirmed TopK, or under a pushed fetch, nothing is counted
+  and the order is as above
+  (`uncached_topk_and_fetch_publications_are_identical_across_executions`).
+  The predicate-free whole-segment fast path publishes no units and keeps
+  its `j % n` deal. Rows without an `ORDER BY` can come back in a different
+  order from one execution to the next, as they already can across
+  partitions. Eight objects read four times through a read cache that holds
+  four and a half of them are served 0, 2,792, 2,094 and 2,094 bytes from
+  it, against 0 on every run with one fixed order
+  (`a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs`).
 - **The ranged plan covers the unit's own blocks.** A subset open
   intersects the ts and numeric candidate blocks with the blocks its unit
   holds before the projected page extents and the coverage crossover are

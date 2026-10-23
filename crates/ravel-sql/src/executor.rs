@@ -154,6 +154,7 @@ use crate::error::SqlError;
 use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
+use crate::logs_scan::ScanExecutions;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
@@ -1621,6 +1622,10 @@ pub struct SqlExecutor {
     /// successful execution, recorded only while
     /// [`Self::cache_bulk_scan_min_bytes`] is set.
     statement_read_bytes: StatementReadBytes,
+    /// How often each logs scan has run (issue #3192), handed to every logs
+    /// scan this executor plans so a repeat of one publishes its units in the
+    /// opposite direction to the previous execution.
+    scan_executions: Arc<ScanExecutions>,
     /// The process spill ceiling every query granted spill reserves its
     /// scratch cap from (ADR-0954 requirement 2, issue #2416): the configured
     /// `spill.max_bytes`, shared by every query this executor serves. `None`
@@ -1685,6 +1690,7 @@ impl SqlExecutor {
             ddl_min_grace_ms: None,
             cache_bulk_scan_min_bytes: None,
             statement_read_bytes: StatementReadBytes::new(),
+            scan_executions: Arc::new(ScanExecutions::new()),
             ipcrypt: IpcryptDeployment::default(),
             #[cfg(test)]
             executed_plan_tamper: None,
@@ -3104,7 +3110,8 @@ impl SqlExecutor {
                             .with_declared_columns(extras.declared.clone())
                             .with_key_index(key_index)
                             .with_column_stats(column_stats)
-                            .with_segment_timing(config.segment_timing),
+                            .with_segment_timing(config.segment_timing)
+                            .with_scan_executions(Arc::clone(&self.scan_executions)),
                         ))
                     }
                     // The alerts and audit providers are not yet threaded onto the

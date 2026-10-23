@@ -56,7 +56,7 @@ use crate::distributed_rlog::{
 #[cfg(feature = "flight-sql")]
 use crate::flight_ticket::SlicePushdown;
 use crate::logs_pushdown::{LogsPushdown, extract_logs_keyed, filter_is_exact};
-use crate::logs_scan::LogsScanExec;
+use crate::logs_scan::{LogsScanExec, ScanExecutions};
 use crate::logs_schema::{logs_schema, logs_schema_with_declared};
 use crate::logs_stats_prune::prune_segments_by_stats;
 
@@ -106,6 +106,10 @@ pub struct LogsTableProvider {
     /// statistics (ADR-2121 D1). Always `true` outside tests, which turn it
     /// off to compare against the unpruned scan.
     stats_pruning: bool,
+    /// The executor's record of scan executions (issue #3192), handed to
+    /// every `LogsScanExec` this provider builds. `None` by default, installed
+    /// with [`Self::with_scan_executions`].
+    scan_executions: Option<Arc<ScanExecutions>>,
 }
 
 impl LogsTableProvider {
@@ -134,6 +138,7 @@ impl LogsTableProvider {
             distributed: None,
             segment_timing: false,
             stats_pruning: true,
+            scan_executions: None,
         }
     }
 
@@ -259,6 +264,15 @@ impl LogsTableProvider {
         self
     }
 
+    /// Hand every `LogsScanExec` this provider builds the executor's record of
+    /// scan executions, so a repeated scan alternates its publication
+    /// direction (issue #3192). A builder method for the same reason
+    /// [`Self::with_segment_timing`] is one.
+    pub(crate) fn with_scan_executions(mut self, scan_executions: Arc<ScanExecutions>) -> Self {
+        self.scan_executions = Some(scan_executions);
+        self
+    }
+
     /// Turn plan-time statistics pruning off, so a test can compare the rows
     /// and fetches of the same query with and without it.
     #[cfg(test)]
@@ -332,7 +346,8 @@ impl LogsTableProvider {
         .with_column_stats(self.column_stats.clone())
         .with_segment_timing(self.segment_timing)
         .with_segments_pruned_by_stats(pruned_by_stats)
-        .with_key_equals(Arc::new(pushdown.key_equals.clone()));
+        .with_key_equals(Arc::new(pushdown.key_equals.clone()))
+        .with_scan_executions(self.scan_executions.clone());
         Ok(Arc::new(scan))
     }
 
