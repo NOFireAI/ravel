@@ -642,7 +642,7 @@ partition:
   segment whose groups no other segment's interleave as one unit
   (`topk_one_partition_time_disjoint_segments_open_once`).
 - **A repeated scan alternates its publication direction** (ADR-0102's
-  #3192 amendment). `SqlExecutor` owns one `ScanExecutions` record, a count
+  repeated-scan amendment). `SqlExecutor` owns one `ScanExecutions` record, a count
   per scan keyed by the tenant, the resolved segment set (content hashes in
   snapshot order), the projection and the pushed predicates, but not the
   time bounds. It holds at most 4,096 scans, drops the least recently
