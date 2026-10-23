@@ -3261,6 +3261,7 @@ impl LogSegmentFetcher {
                         phases,
                         owned_blocks,
                         primed,
+                        FilterSections::for_query(query),
                         accounting,
                     )
                     .await
@@ -4486,6 +4487,41 @@ struct OwnedBlocks<'a> {
     blocks: &'a [usize],
     survivors: &'a [usize],
     dirs: Option<&'a SegmentDirectories>,
+}
+
+/// Whether the scan over a ranged read can read BLOOM or POSTINGS, so the
+/// read has to place them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FilterSections {
+    /// The scan can read either section.
+    Place,
+    /// The query carries no content arm, no stream-attribute arm and no
+    /// prune arm other than `NumRange`, so `RlogReader::scan_blocks` reads
+    /// neither section.
+    Skip,
+}
+
+impl FilterSections {
+    /// The rule `fetch_keyed_plan`'s `skip_decidable` applies, over the same
+    /// fields of `query`.
+    fn for_query(query: &LogQuery) -> Self {
+        let reads_none = query.content.is_empty()
+            && query.stream_attrs.is_empty()
+            && query
+                .prune
+                .iter()
+                .all(|p| matches!(p, Predicate::NumRange { .. }));
+        if reads_none {
+            FilterSections::Skip
+        } else {
+            FilterSections::Place
+        }
+    }
+
+    /// Whether a section of kind `k` is one this value leaves unplaced.
+    fn skips(self, k: u32) -> bool {
+        self == FilterSections::Skip && matches!(k, kind::BLOOM | kind::POSTINGS)
+    }
 }
 
 /// The whole-object bytes [`LogSegmentFetcher::plan_segment`]'s whole-object
@@ -6693,6 +6729,7 @@ impl BlockRangeFetcher {
             phases,
             None,
             None,
+            FilterSections::Place,
             accounting,
         )
         .await
@@ -6722,6 +6759,7 @@ impl BlockRangeFetcher {
         phases: ReadPhases,
         owned_blocks: Option<OwnedBlocks<'_>>,
         primed: Option<&PrimedProbe>,
+        filter_sections: FilterSections,
         accounting: &QueryAccounting,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         self.fetch_object_with_footer_impl(
@@ -6735,6 +6773,7 @@ impl BlockRangeFetcher {
             phases,
             owned_blocks,
             primed,
+            filter_sections,
             accounting,
         )
         .await
@@ -6753,6 +6792,7 @@ impl BlockRangeFetcher {
         phases: ReadPhases,
         owned_blocks: Option<OwnedBlocks<'_>>,
         primed: Option<&PrimedProbe>,
+        filter_sections: FilterSections,
         accounting: &QueryAccounting,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
         let key = seg_ref.data_object_key.as_str();
@@ -6947,6 +6987,7 @@ impl BlockRangeFetcher {
                     &pin,
                     phases,
                     owned_blocks,
+                    filter_sections,
                     accounting,
                     stats,
                 )
@@ -7162,12 +7203,15 @@ impl BlockRangeFetcher {
         // GET each, never coalesced with the front across the BLOCKS gap. The
         // reader re-verifies each section's crc on decode, so a corrupt section
         // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
-        // reader does not read it, and the plan probes it by range.
+        // reader does not read it, and the plan probes it by range. BLOOM and
+        // POSTINGS are placed only when `filter_sections` says the scan can
+        // read them.
         for section in &footer.sections {
             if matches!(
                 section.kind,
                 kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR | kind::KEY_IDX
-            ) {
+            ) || filter_sections.skips(section.kind)
+            {
                 continue;
             }
             self.place_section(
@@ -7254,6 +7298,7 @@ impl BlockRangeFetcher {
         pin: &EtagPin,
         phases: ReadPhases,
         owned_blocks: Option<OwnedBlocks<'_>>,
+        filter_sections: FilterSections,
         accounting: &QueryAccounting,
         mut stats: BlockRangeStats,
     ) -> Result<(LogObjectBytes, BlockRangeStats), LogFetchError> {
@@ -7600,12 +7645,15 @@ impl BlockRangeFetcher {
         // reader re-verifies each section's crc on decode, so a corrupt section
         // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
         // reader does not read it, and the plan probes it by range. With `dirs`, SKIP_IDX and PAGE_DIR
-        // are not placed either: nothing reads them from the buffer.
+        // are not placed either: nothing reads them from the buffer. BLOOM and
+        // POSTINGS are placed only when `filter_sections` says the scan can
+        // read them (`tail_section_placement_tests`).
         for section in &footer.sections {
             if matches!(
                 section.kind,
                 kind::BLOCKS | kind::STREAM_DIR | kind::FIELD_DIR | kind::KEY_IDX
             ) || (dirs.is_some() && matches!(section.kind, kind::SKIP_IDX | kind::PAGE_DIR))
+                || filter_sections.skips(section.kind)
             {
                 continue;
             }
@@ -12573,6 +12621,396 @@ mod assembly_buffer_tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tail_section_placement_tests {
+    //! Which tail sections the scan over a ranged open reads, and which the
+    //! ranged open places (issue #3219). The `#[test]` cases assemble a
+    //! version-4 object with one section left unplaced and run `scan_bytes`,
+    //! which opens the same `RlogReader::scan_blocks` every scan entry opens.
+    //! The `#[tokio::test]` cases run `scan_accounted_with_tenant`'s ranged
+    //! open over a store that records every GET's range.
+
+    use super::plan_block_stats_tests::RangeRecordingStore;
+    use super::*;
+    use ravel_catalog::SegmentLevel;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{FieldSel, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::PutOptions;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::accounting::AccountedOp;
+    use ravel_types::logstream::log_stream_id;
+    use uuid::Uuid;
+
+    const KEY: &str = "t/tail.rlog";
+    const BLOCKS: i64 = 8;
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let word = if ts % 2 == 0 { "alpha" } else { "beta" };
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("{word} {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    /// One block per record, with POSTINGS over `request.id`.
+    fn object() -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer =
+            RlogWriter::new(cfg, identity).with_indexed_fields(vec!["request.id".to_string()]);
+        for ts in 0..BLOCKS {
+            writer.push(record(ts)).expect("push");
+        }
+        writer.finish().expect("finish")
+    }
+
+    fn section(obj: &[u8], k: u32) -> SectionDesc {
+        let footer = footer::open(obj).expect("footer");
+        assert!(
+            footer.section(kind::PAGE_DIR).is_some(),
+            "a version-4 object"
+        );
+        *footer.section(k).expect("section present")
+    }
+
+    /// Every byte of `obj` placed except the sections of kind `holes`.
+    fn assembled_without(obj: &[u8], holes: &[u32]) -> LogObjectBytes {
+        let mut gaps: Vec<(u64, u64)> = holes
+            .iter()
+            .map(|&k| {
+                let d = section(obj, k);
+                assert!(d.len > 0, "section {k} is empty");
+                (d.offset, d.offset + d.len)
+            })
+            .collect();
+        gaps.sort_unstable();
+        let bytes = Bytes::copy_from_slice(obj);
+        let mut asm = ObjectAssembler::new(&Arc::new(AssemblyGauge::default()), obj.len() as u64);
+        let mut at = 0u64;
+        for (start, end) in gaps
+            .into_iter()
+            .chain([(obj.len() as u64, obj.len() as u64)])
+        {
+            if start > at {
+                asm.place(KEY, at, bytes.slice(at as usize..start as usize))
+                    .expect("place");
+            }
+            at = end;
+        }
+        asm.into_bytes()
+    }
+
+    fn scan(bytes: &LogObjectBytes, query: &LogQuery) -> Result<LogFetchOutput, LogFetchError> {
+        let fetcher = LogSegmentFetcher::new(Arc::new(MemoryStore::new()));
+        fetcher
+            .scan_bytes(
+                KEY,
+                bytes,
+                query,
+                &QueryAccounting::new(),
+                &tracing::Span::none(),
+            )
+            .map(|out| out.expect("the object is relevant"))
+    }
+
+    fn unplaced(result: Result<LogFetchOutput, LogFetchError>) -> (u64, u64) {
+        match result {
+            Err(LogFetchError::Corrupt {
+                source: LogSegError::Unplaced { start, end },
+                ..
+            }) => (start, end),
+            other => panic!("expected an Unplaced read, got {other:?}"),
+        }
+    }
+
+    /// A scan with no content, stream or prune arm reads no BLOOM byte, so an
+    /// assembly without the section returns the same rows as the full object.
+    /// A `HasWord` arm reads the section, prunes with it, and fails on its
+    /// exact range when it is unplaced.
+    ///
+    /// Prove-the-test: in `RlogReader::scan_blocks`
+    /// (crates/ravel-logseg/src/reader.rs), reading BLOOM whatever the arms
+    /// fails the holed predicate-free scan's `expect("holed scan")` with an
+    /// Unplaced read over the BLOOM range.
+    #[test]
+    fn a_predicate_free_scan_reads_no_bloom_byte() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let full = scan(&assembled_without(&obj, &[]), &query).expect("full scan");
+        assert_eq!(full.records.len(), BLOCKS as usize);
+
+        let holed = scan(&assembled_without(&obj, &[kind::BLOOM]), &query).expect("holed scan");
+        assert_eq!(
+            format!("{:?}", holed.records),
+            format!("{:?}", full.records)
+        );
+        assert!(!holed.stats.bloom_degraded);
+
+        // A content arm reads the section, and uses it to prune.
+        let alpha = query.clone().with_content(Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "alpha".into(),
+        });
+        let pruned = scan(&assembled_without(&obj, &[]), &alpha).expect("content scan");
+        assert_eq!(pruned.stats.blocks_after_bloom, (BLOCKS / 2) as u32);
+        assert_eq!(pruned.records.len(), (BLOCKS / 2) as usize);
+        let holed = scan(&assembled_without(&obj, &[kind::BLOOM]), &alpha);
+        assert_eq!(unplaced(holed), (bloom.offset, bloom.offset + bloom.len));
+    }
+
+    /// POSTINGS is read only when the query carries an equality arm it can
+    /// probe: a predicate-free scan over an assembly without it returns the
+    /// same rows as the full object, and a prune arm on the indexed field
+    /// fails the same holed scan on the POSTINGS range.
+    ///
+    /// Prove-the-test: in `RlogReader::scan_blocks`, entering the POSTINGS
+    /// branch whatever the arms (replacing `!content_arms.is_empty() ||
+    /// !prune_arms.is_empty()` with `true`) fails the predicate-free holed
+    /// scan's `expect` with an Unplaced read over the POSTINGS range.
+    #[test]
+    fn a_scan_reads_postings_only_for_an_equality_arm() {
+        let obj = object();
+        let postings = section(&obj, kind::POSTINGS);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let full = scan(&assembled_without(&obj, &[]), &query).expect("full scan");
+        let holed = scan(&assembled_without(&obj, &[kind::POSTINGS]), &query).expect("holed scan");
+        assert_eq!(
+            format!("{:?}", holed.records),
+            format!("{:?}", full.records)
+        );
+        assert_eq!(holed.records.len(), BLOCKS as usize);
+
+        let equality = query.clone().with_prune(Predicate::Equals {
+            field: FieldSel::Attr("request.id".into()),
+            value: AttrValue::Str("r3".into()),
+        });
+        let pruned = scan(&assembled_without(&obj, &[]), &equality).expect("prune scan");
+        assert_eq!(pruned.stats.blocks_after_postings, 1);
+        let holed = scan(&assembled_without(&obj, &[kind::POSTINGS]), &equality);
+        assert_eq!(
+            unplaced(holed),
+            (postings.offset, postings.offset + postings.len)
+        );
+    }
+
+    const TENANT: TenantHash = TenantHash([7u8; 16]);
+
+    /// What one ranged open moved and decoded.
+    struct Ranged {
+        records: Vec<LogRecord>,
+        stats: ScanStats,
+        gets: u64,
+        bytes: u64,
+        /// Every GET as an absolute `[start, end)` over the object.
+        ranges: Vec<(u64, u64)>,
+    }
+
+    /// Stores `obj` and runs `query` through `scan_accounted_with_tenant`
+    /// over a ranged fetcher whose probe reads exactly the footer region, so
+    /// every other section is a GET of its own run.
+    async fn ranged(obj: &[u8], query: &LogQuery) -> Ranged {
+        let size = obj.len() as u64;
+        let inner = Arc::new(MemoryStore::new());
+        inner
+            .put(KEY, Bytes::copy_from_slice(obj), PutOptions::default())
+            .await
+            .expect("put");
+        let store = Arc::new(RangeRecordingStore::new(inner));
+        let dyn_store: Arc<dyn ObjectStoreBackend> = store.clone();
+        let trailer = &obj[obj.len() - footer::TRAILER_LEN..];
+        let footer_len = u32::from_le_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+        let f = LogSegmentFetcher::new(dyn_store.clone())
+            .with_block_range_threshold(0)
+            .with_block_range(
+                BlockRangeFetcher::new(dyn_store)
+                    .with_suffix_len(u64::from(footer_len) + footer::TRAILER_LEN as u64)
+                    .with_whole_object_threshold(0)
+                    .with_coverage_threshold(2.0),
+            );
+        let seg = SegmentRef {
+            data_object_key: KEY.to_string(),
+            object_size: size,
+            min_event_ts_ns: 0,
+            max_event_ts_ns: BLOCKS - 1,
+            ingest_hour_bucket: 0,
+            sample_count: BLOCKS as u64,
+            series_count: 0,
+            shard: 0,
+            content_hash: [9u8; 32],
+            writer_id: Uuid::from_u128(2),
+            writer_epoch: 1,
+            writer_seq: 1,
+            created_unix_ns: 0,
+            level: SegmentLevel::L0,
+            segment_format_version: u32::from(footer::VERSION),
+            declared_column_stats: Default::default(),
+        };
+        let acc = QueryAccounting::new();
+        let mut scan = f
+            .scan_accounted_with_tenant(&seg, TENANT, query, &ColumnSelection::all(), &acc)
+            .await
+            .expect("scan")
+            .expect("relevant");
+        let mut records = Vec::new();
+        while let Some(block) = scan.next_block().expect("block") {
+            records.extend(block);
+        }
+        let stats = scan.stats();
+        drop(scan);
+        let snap = acc.snapshot();
+        assert_eq!(snap.s3_requests(AccountedOp::Get), store.get_count());
+        let ranges = store
+            .ranges()
+            .into_iter()
+            .map(|r| match r {
+                GetRange::Full => (0, size),
+                GetRange::Range(s, e) => (s, e),
+                GetRange::Suffix(n) => (size - n, size),
+            })
+            .collect();
+        Ranged {
+            records,
+            stats,
+            gets: snap.s3_requests(AccountedOp::Get),
+            bytes: snap.s3_bytes(AccountedOp::Get),
+            ranges,
+        }
+    }
+
+    fn intersects((s, e): (u64, u64), d: &SectionDesc) -> bool {
+        s < d.offset + d.len && d.offset < e
+    }
+
+    /// A predicate-free ranged open fetches no BLOOM or POSTINGS byte and
+    /// returns every row. Against the same open forced to place both
+    /// sections, by a prune arm on an attribute no record carries, it moves
+    /// exactly their stored sizes fewer bytes and two fewer GETs, since the
+    /// placement loop fetches each tail section with a GET of its own.
+    ///
+    /// Prove-the-test: in `fetch_object_v4`'s placement loop, dropping
+    /// `|| filter_sections.skips(section.kind)` makes the BLOOM-intersection
+    /// assertion fail; with the reader change reverted as well, the scan
+    /// fails `expect("scan")` with an Unplaced read over BLOOM.
+    #[tokio::test]
+    async fn a_predicate_free_ranged_scan_fetches_neither_filter_section() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let postings = section(&obj, kind::POSTINGS);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let whole = scan(&assembled_without(&obj, &[]), &query).expect("whole scan");
+        let skip = ranged(&obj, &query).await;
+        assert_eq!(skip.records.len(), BLOCKS as usize);
+        assert_eq!(
+            format!("{:?}", skip.records),
+            format!("{:?}", whole.records)
+        );
+        for r in &skip.ranges {
+            assert!(!intersects(*r, &bloom), "GET {r:?} reads BLOOM {bloom:?}");
+            assert!(
+                !intersects(*r, &postings),
+                "GET {r:?} reads POSTINGS {postings:?}"
+            );
+        }
+
+        let place = ranged(
+            &obj,
+            &query.clone().with_prune(Predicate::Equals {
+                field: FieldSel::Attr("absent.attr".into()),
+                value: AttrValue::Str("x".into()),
+            }),
+        )
+        .await;
+        assert_eq!(
+            format!("{:?}", place.records),
+            format!("{:?}", whole.records)
+        );
+        assert!(place.ranges.iter().any(|r| intersects(*r, &bloom)));
+        assert!(place.ranges.iter().any(|r| intersects(*r, &postings)));
+        assert_eq!(place.bytes - skip.bytes, bloom.len + postings.len);
+        assert_eq!(place.gets - skip.gets, 2);
+    }
+
+    /// A `HasWord` arm keeps BLOOM on the ranged open: one GET covers the
+    /// whole section and the scan prunes the four `beta` blocks with it.
+    ///
+    /// Prove-the-test: `FilterSections::for_query` that ignores `content`
+    /// leaves BLOOM unplaced and the scan fails `expect("scan")` with an
+    /// Unplaced read over BLOOM; a reader that never reads BLOOM decodes all
+    /// eight blocks and `blocks_after_bloom` is 8.
+    #[tokio::test]
+    async fn a_has_word_ranged_scan_fetches_and_prunes_with_bloom() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_content(Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "alpha".into(),
+        });
+        let out = ranged(&obj, &query).await;
+        assert!(
+            out.ranges
+                .iter()
+                .any(|&(s, e)| s <= bloom.offset && bloom.offset + bloom.len <= e),
+            "no GET covers BLOOM {bloom:?}: {:?}",
+            out.ranges
+        );
+        assert_eq!(out.stats.blocks_after_bloom, (BLOCKS / 2) as u32);
+        assert_eq!(out.records.len(), (BLOCKS / 2) as usize);
+        assert!(out.records.iter().all(|r| r.body.starts_with("alpha ")));
+    }
+
+    /// An `Equals` prune arm on the indexed field keeps POSTINGS on the
+    /// ranged open: one GET covers the whole section and the scan keeps only
+    /// the matching block.
+    ///
+    /// Prove-the-test: `FilterSections::for_query` that ignores `prune`
+    /// leaves POSTINGS unplaced and the scan fails `expect("scan")` with an
+    /// Unplaced read over POSTINGS.
+    #[tokio::test]
+    async fn an_equals_ranged_scan_fetches_postings() {
+        let obj = object();
+        let postings = section(&obj, kind::POSTINGS);
+        let query = LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::Equals {
+            field: FieldSel::Attr("request.id".into()),
+            value: AttrValue::Str("r3".into()),
+        });
+        let out = ranged(&obj, &query).await;
+        assert!(
+            out.ranges
+                .iter()
+                .any(|&(s, e)| s <= postings.offset && postings.offset + postings.len <= e),
+            "no GET covers POSTINGS {postings:?}: {:?}",
+            out.ranges
+        );
+        assert_eq!(out.stats.blocks_after_postings, 1);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].ts_ns, 3);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod ranged_projection_cost_tests {
     //! The arithmetic behind [`LogSegmentFetcher::ranged_projection_pays`]
     //! (issue #862), pinned at its break-even rather than at a convenient
@@ -12920,12 +13358,20 @@ mod projection_break_even_crossover_tests {
     /// Opens `seg` through the fast path's ranged entry point with a
     /// one-column projection and returns (GETs, bytes) it moved.
     async fn ranged_open(f: &LogSegmentFetcher, seg: &SegmentRef) -> (u64, u64) {
+        ranged_open_query(f, seg, &LogQuery::new(i64::MIN, i64::MAX)).await
+    }
+
+    async fn ranged_open_query(
+        f: &LogSegmentFetcher,
+        seg: &SegmentRef,
+        query: &LogQuery,
+    ) -> (u64, u64) {
         let acc = QueryAccounting::new();
         let scan = f
             .scan_accounted_with_tenant(
                 seg,
                 TENANT,
-                &LogQuery::new(i64::MIN, i64::MAX),
+                query,
                 &ColumnSelection::fixed_only().with_severity_num(),
                 &acc,
             )
@@ -12970,10 +13416,17 @@ mod projection_break_even_crossover_tests {
             large.object_size
         );
         // 490 records at 16 per block is 31 blocks, one row group of the
-        // default 32, so one fewer run GET than a two-row-group object.
-        let (gets, bytes) = ranged_open(&cost_based(store), &large).await;
+        // default 32, so one fewer run GET than a two-row-group object. The
+        // query has no filter arm, so BLOOM is not fetched; the object has no
+        // indexed field and so no POSTINGS.
+        let obj = store.get(KEY, GetRange::Full).await.expect("get").data;
+        let tail = footer::open(&obj).expect("footer");
+        assert!(tail.section(kind::POSTINGS).is_none());
+        let bloom = *tail.section(kind::BLOOM).expect("BLOOM");
+        let f = cost_based(store);
+        let (gets, bytes) = ranged_open(&f, &large).await;
         assert_eq!(
-            gets, 5,
+            gets, 4,
             "the ranged protocol's probe, directory and run GETs"
         );
         assert!(
@@ -12981,6 +13434,19 @@ mod projection_break_even_crossover_tests {
             "a one-column projection moves under a fifth of the object: {bytes} of {}",
             large.object_size
         );
+        // A prune arm on an attribute no record carries places BLOOM without
+        // changing what the scan decodes: one more GET, BLOOM's stored size.
+        let (place_gets, place_bytes) = ranged_open_query(
+            &f,
+            &large,
+            &LogQuery::new(i64::MIN, i64::MAX).with_prune(Predicate::Equals {
+                field: ravel_logseg::FieldSel::Attr("absent.attr".into()),
+                value: AttrValue::Str("x".into()),
+            }),
+        )
+        .await;
+        assert_eq!(place_gets, gets + 1);
+        assert_eq!(place_bytes, bytes + bloom.len);
     }
 }
 
@@ -14874,6 +15340,7 @@ mod owned_block_plan_tests {
                 ReadPhases::SCAN,
                 owned,
                 None,
+                FilterSections::Place,
                 &QueryAccounting::new(),
             )
             .await
@@ -15150,6 +15617,7 @@ mod owned_block_plan_tests {
                 ReadPhases::SCAN,
                 owned,
                 None,
+                FilterSections::Place,
                 &QueryAccounting::new(),
             )
             .await
@@ -15372,6 +15840,7 @@ mod owned_block_plan_tests {
                     dirs: None,
                 }),
                 None,
+                FilterSections::Place,
                 &QueryAccounting::new(),
             )
             .await
