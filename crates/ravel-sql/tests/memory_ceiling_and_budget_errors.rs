@@ -203,6 +203,7 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -290,6 +291,7 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -384,6 +386,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -497,6 +500,7 @@ async fn a_large_order_by_over_budget_is_resources_exhausted() {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

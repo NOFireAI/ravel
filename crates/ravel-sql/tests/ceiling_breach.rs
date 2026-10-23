@@ -74,6 +74,7 @@ async fn a_join_that_overruns_the_query_ceiling_aborts_and_frees_the_tenant_budg
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

@@ -22,7 +22,10 @@ use datafusion::execution::memory_pool::MemoryPool;
 use ravel_query::EngineConfig;
 use ravel_types::accounting::QueryAccounting;
 
-use crate::memory::{CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant};
+use crate::memory::{
+    AggregateReserveAhead, CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant,
+    process_envelope_width,
+};
 
 /// Default per-query RecordBatch byte budget: 256 MiB. This is the shipped
 /// default, not a guess awaiting a number: an operator overrides it per process
@@ -478,6 +481,17 @@ pub struct SqlConfig {
     /// `sql_latency` reporter is the one caller that turns it on. Set once at
     /// server startup, like every other field here.
     pub segment_timing: bool,
+    /// How far ahead of what they ask for the migrated partial, final and
+    /// single-stage hash aggregate streams are charged (issue #3181): an
+    /// undercount factor on every grow and shrink, on the query, tenant and
+    /// process ledgers, and an envelope for each building stream's next
+    /// doubling, of which the largest `min(available_parallelism, SQL
+    /// partition count)` in the process are reserved on the process budget
+    /// alone. Default [`AggregateReserveAhead::DEFAULT`];
+    /// [`AggregateReserveAhead::OFF`] charges every consumer one to one. A
+    /// value that fails [`AggregateReserveAhead::validate`] is replaced by the
+    /// default, with a warning, when the pool is built.
+    pub aggregate_reserve_ahead: AggregateReserveAhead,
 }
 
 impl Default for SqlConfig {
@@ -494,6 +508,7 @@ impl Default for SqlConfig {
             // an operator decision rather than a version upgrade.
             spill: None,
             segment_timing: false,
+            aggregate_reserve_ahead: AggregateReserveAhead::DEFAULT,
         }
     }
 }
@@ -557,18 +572,27 @@ impl SqlConfig {
     /// stream ends when that stream's memory consumer cannot spill, which
     /// DataFusion decides per stream from the aggregate mode and whether the
     /// session's runtime has a disk.
+    ///
+    /// It charges the migrated hash aggregate streams ahead of what they ask
+    /// for, per [`SqlConfig::aggregate_reserve_ahead`].
     pub fn query_pool(
         &self,
         tenant: Arc<TenantMemoryAccountant>,
         accounting: QueryAccounting,
     ) -> (Arc<dyn MemoryPool>, Arc<CeilingBreach>) {
         let breach = CeilingBreach::new();
-        let pool = Arc::new(TenantDelegatingPool::new(
-            self.max_query_bytes,
-            tenant,
-            Arc::clone(&breach),
-            accounting,
-        ));
+        let pool = Arc::new(
+            TenantDelegatingPool::new(
+                self.max_query_bytes,
+                tenant,
+                Arc::clone(&breach),
+                accounting,
+            )
+            .with_aggregate_reserve_ahead(
+                self.aggregate_reserve_ahead,
+                process_envelope_width(self.engine.sql_partition_count()),
+            ),
+        );
         (pool, breach)
     }
 }
