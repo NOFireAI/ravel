@@ -507,13 +507,13 @@ fn scale(bytes: usize, factor: f64) -> usize {
 
 /// How many migrated aggregate streams can be inside `aggregate_batch` at
 /// once in this process: the host's parallelism, or `partitions` when fewer.
-/// Resolved by the first caller and fixed for the life of the process.
+/// The host's parallelism is read once per process; a budget's ledger keeps
+/// the width of the first pool that reserves an envelope on it.
 pub fn process_envelope_width(partitions: usize) -> NonZeroUsize {
-    static WIDTH: OnceLock<NonZeroUsize> = OnceLock::new();
-    *WIDTH.get_or_init(|| {
-        let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
-        NonZeroUsize::new(parallelism.min(partitions)).unwrap_or(NonZeroUsize::MIN)
-    })
+    static PARALLELISM: OnceLock<usize> = OnceLock::new();
+    let parallelism = *PARALLELISM
+        .get_or_init(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
+    NonZeroUsize::new(parallelism.min(partitions)).unwrap_or(NonZeroUsize::MIN)
 }
 
 /// Envelope bytes currently reserved across every process budget: the figure
@@ -2390,6 +2390,18 @@ mod tests {
         assert_eq!(budget.reserved(), (asked - names.len() + 1) as u64);
         drop(reservations);
         assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn the_envelope_width_follows_each_callers_partition_count() {
+        let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        assert_eq!(process_envelope_width(1).get(), 1);
+        assert_eq!(
+            process_envelope_width(usize::MAX).get(),
+            parallelism,
+            "a later caller with more partitions is not held to the first caller's width"
+        );
+        assert_eq!(process_envelope_width(0).get(), 1);
     }
 
     #[test]
