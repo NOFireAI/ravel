@@ -361,7 +361,12 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
 
     let config = SqlConfig {
         engine: util::engine_config(),
-        max_query_bytes: 16 * 1024 * 1024,
+        // Which consumer's `try_grow` crosses the ceiling first depends on
+        // where the ceiling falls between the scan's and the aggregates'
+        // steps. At 24 MiB the final aggregate crosses first with the
+        // aggregate reserve-ahead charge on and off; at 16 MiB only with it
+        // off.
+        max_query_bytes: 24 * 1024 * 1024,
         parallel_final_aggregation: false,
         // Off deliberately, and it is the only test in this file that turns it
         // off (issue #680). This case's subject is the aggregate operator's own
