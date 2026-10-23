@@ -616,6 +616,10 @@ struct Lookup<'a> {
     rows: &'a [&'a str],
     /// The blocks of object 0 holding the key; objects 1 and 2 hold none.
     blocks: &'a [u32],
+    /// Whether the scan places BLOOM: only when the pushdown also builds a
+    /// prune-channel `Equals`, which a declared Str equality does and a
+    /// declared I64 (a `NumRange`) or `trace_id` (KEY_IDX only) does not.
+    places_bloom: bool,
 }
 
 /// Asserts `lookup` returns its rows having read exactly the KEY_IDX bytes
@@ -687,16 +691,65 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
         "{sql}: object 0 plan reads"
     );
     let scan = &got[plan.len()..];
-    for (block, page) in body_pages(&holding.bytes).iter().enumerate() {
+    let pages = body_pages(&holding.bytes);
+    for (block, page) in pages.iter().enumerate() {
         assert_eq!(
             touches(scan, size, page),
             lookup.blocks.contains(&(block as u32)),
             "{sql}: block {block}'s body page {page:?} against the scan reads {scan:?}"
         );
     }
-    // One GET per wanted body page, plus four that do not depend on which
-    // blocks are wanted: PAGE_DIR, BLOOM and two runs of narrow column pages.
-    assert_eq!(scan.len(), 4 + lookup.blocks.len(), "{sql}: {scan:?}");
+    let footer = ravel_logseg::footer::open(&holding.bytes).expect("footer");
+    assert!(
+        footer.section(kind::POSTINGS).is_none(),
+        "the fixture writes no POSTINGS"
+    );
+    let tail = GetRange::Range(
+        footer
+            .sections
+            .iter()
+            .map(|d| d.offset + d.len)
+            .max()
+            .expect("sections"),
+        size,
+    );
+    let bloom = section(&holding.bytes, kind::BLOOM);
+    let bloom_gets: Vec<GetRange> = scan
+        .iter()
+        .copied()
+        .filter(|g| touches(&[*g], size, &bloom))
+        .collect();
+    let want_bloom = if lookup.places_bloom {
+        vec![GetRange::Range(bloom.start, bloom.end)]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(bloom_gets, want_bloom, "{sql}: BLOOM reads in {scan:?}");
+    let blocks_section = section(&holding.bytes, kind::BLOCKS);
+    let narrow: Vec<GetRange> = scan
+        .iter()
+        .copied()
+        .filter(|g| {
+            *g != tail && !bloom_gets.contains(g) && !pages.iter().any(|p| touches(&[*g], size, p))
+        })
+        .collect();
+    // One GET per wanted body page; the footer and trailer past the last
+    // section, which the carried plan footer did not place; BLOOM only when
+    // the query places it; and two runs of narrow column pages inside BLOCKS.
+    assert_eq!(scan[0], tail, "{sql}: {scan:?}");
+    assert_eq!(narrow.len(), 2, "{sql}: narrow column runs in {scan:?}");
+    for g in &narrow {
+        let r = span(g, size);
+        assert!(
+            blocks_section.start <= r.start && r.end <= blocks_section.end,
+            "{sql}: {g:?} outside BLOCKS {blocks_section:?}"
+        );
+    }
+    assert_eq!(
+        scan.len(),
+        3 + want_bloom.len() + lookup.blocks.len(),
+        "{sql}: {scan:?}"
+    );
     assert_eq!(
         phase(&v, "scan", "s3GetRequests"),
         scan.len() as u64,
@@ -744,6 +797,7 @@ async fn declared_i64_equality_reads_only_the_indexed_blocks() {
             key8: key8_i64(500),
             rows: &["o0r050", "o0r085"],
             blocks: &[3, 5],
+            places_bloom: false,
         };
         assert_reads_only_the_indexed_blocks(&fx, &lookup).await;
     }
@@ -764,6 +818,7 @@ async fn declared_str_equality_reads_only_the_indexed_blocks() {
             key8: key8_str(REGION),
             rows: &["o0r050", "o0r100"],
             blocks: &[3, 6],
+            places_bloom: true,
         };
         assert_reads_only_the_indexed_blocks(&fx, &lookup).await;
     }
@@ -789,6 +844,7 @@ async fn trace_id_equality_reads_only_the_indexed_blocks() {
             key8: key8_id16(&TARGET_TRACE),
             rows: &["o0r050"],
             blocks: &[3],
+            places_bloom: false,
         };
         assert_reads_only_the_indexed_blocks(&fx, &lookup).await;
     }
