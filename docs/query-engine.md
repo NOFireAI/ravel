@@ -625,8 +625,10 @@ partition:
   units out in that order, so the earliest-`ts` groups are taken first
   whichever partition asks and the TopK's threshold skip can cut off the rest
   (`topk_units_are_published_in_global_deal_order`). Otherwise the queue
-  holds segments in visit order, each segment's runs in group order
-  (`striped_units_follow_visit_order_with_groups_in_sequence`).
+  holds segments in visit order, or with a read cache and no pushed fetch
+  in reverse visit order on alternate executions (see "A repeated scan
+  alternates its publication direction" below), each segment's runs in
+  group order (`striped_units_follow_visit_order_with_groups_in_sequence`).
   Either way every block of a group is on one partition
   (`a_row_group_stays_with_one_owner`), so the partition that takes a group
   decodes each of its dictionary pages once, as the reader's dictionary cache
@@ -639,6 +641,46 @@ partition:
   (`topk_with_one_partition_follows_the_global_deal`), which publishes a
   segment whose groups no other segment's interleave as one unit
   (`topk_one_partition_time_disjoint_segments_open_once`).
+- **A repeated scan alternates its publication direction** (ADR-0102's
+  #3192 amendment). `SqlExecutor` owns one `ScanExecutions` record, a count
+  per scan keyed by the tenant, the resolved segment set (content hashes in
+  snapshot order), the projection and the pushed predicates, but not the
+  time bounds. It holds at most 4,096 scans, drops the least recently
+  counted first, and is charged to no cache. With a read cache wired, no
+  confirmed TopK and no pushed fetch limit, an execution's first
+  publication takes and increments its scan's count, and an odd count
+  publishes the segments in reverse visit order (`publication_order`), each
+  segment's units still contiguous and in group order. A scan over more
+  objects than the read cache holds then reads first, on each execution,
+  the objects the previous one read last, while the cache still holds them.
+  A re-executed round of the same plan node takes the direction its
+  execution already took and is not counted again
+  (`a_repeated_cached_scan_alternates_its_publication_direction`), and a
+  scan under another pushed filter has its own count
+  (`a_scan_under_another_pushed_filter_has_its_own_count`). Without a read
+  cache, under a confirmed TopK, or under a pushed fetch, nothing is counted
+  and the order is as above
+  (`uncached_topk_and_fetch_publications_are_identical_across_executions`;
+  through `SqlExecutor`,
+  `a_pushed_fetch_and_a_confirmed_topk_do_not_alternate`).
+  The predicate-free whole-segment fast path publishes no units and keeps
+  its `j % n` deal. Rows without an `ORDER BY` can come back in a different
+  order from one execution to the next, and so can the rows of a statement
+  whose answer depends on which rows the scan yields first, each set a
+  valid answer: a `LIMIT` the scan does not take as a pushed fetch (one
+  above a filter that stays a `FilterExec`, such as `body LIKE '%x%'`, or
+  above a `SELECT DISTINCT`), an `ORDER BY` on a key other than `ts`, or on
+  `ts DESC`, whose `LIMIT` cuts through tied rows, and `first_value`,
+  `last_value` or `ARRAY_AGG` without an `ORDER BY`. These now differ on
+  alternate executions even at one partition, where they used to repeat;
+  with more than one partition they already varied with timing. On the
+  planned route with a read cache, only a pushed fetch and a confirmed TopK
+  keep the scan's order. Two identical scans in one statement (a self-join,
+  a `UNION` of the same scan) share one count, so which of them reverses on
+  a given execution depends on timing. Eight objects read four times through a read cache that holds
+  four and a half of them are served 0, 2,792, 2,094 and 2,094 bytes from
+  it, against 0 on every run with one fixed order
+  (`a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs`).
 - **The ranged plan covers the unit's own blocks.** A subset open
   intersects the ts and numeric candidate blocks with the blocks its unit
   holds before the projected page extents and the coverage crossover are
@@ -4736,9 +4778,15 @@ filter itself does not say which operator published it or in which
 direction: a descending TopK (`ts > t`), an `ASC NULLS FIRST` TopK
 (`ts IS NULL OR ts < t`), an aggregate's `min(ts)` bound, or a hash join's
 build-side bounds can all lead with `ts`, and none of them is a threshold
-this skip can serve. Such a scan keeps snapshot visit order and the fast
-path's open pipelining exactly as without the filter. The scan keeps only
-the first such filter, so when another operator's filter reaches it ahead
+this skip can serve. Such a scan orders and pipelines exactly as without
+the filter: the fast path keeps snapshot visit order and its open
+pipelining, and the planned route keeps snapshot visit order without a
+read cache, while with one (and no pushed fetch) it publishes in reverse
+visit order on alternate executions (the "A repeated scan alternates its
+publication direction" bullet under
+[the striped route](#the-striped-route-directories-once-per-segment-row-groups-whole)).
+The scan keeps only the first such filter, so when another operator's
+filter reaches it ahead
 of the TopK's, nothing is confirmed and nothing is skipped. A confirmed scan
 shows `topk_threshold=ts` in a `ravel-cli sql explain` plan. The scan only
 reads `t` off the confirmed filter's current expression and uses it twice:

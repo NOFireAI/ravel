@@ -150,7 +150,9 @@ entirely is claimed as ADR-0107, not folded into this decision.
 
 How partitions share the surviving blocks has since changed: they no longer
 stripe them by index but take runs of row groups, or whole segments, from
-one shared queue (see the #3080 amendment below).
+one shared queue (see the #3080 amendment below), and a repeated scan with a
+read cache publishes that queue in alternating directions (see the #3192
+amendment below).
 
 ### 2. Accept ADR-0094 in place; measure at production scale before flipping the default
 
@@ -790,7 +792,9 @@ finishes its current one, until the queue is empty.
   by the partition that takes it with the read sequence of a whole-segment
   scan: one whole-object GET at or under the block-range threshold, the
   ranged reads of ADR-0107 above it. Segments follow the scan's visit order,
-  each segment's runs in group order. A segment the plan leaves unplanned
+  each segment's runs in group order; with a read cache, a repeated scan
+  reverses the segment order on alternate executions (see the #3192
+  amendment below). A segment the plan leaves unplanned
   (at or under `plan_whole_object_bound`, or, under KEY_IDX equalities,
   probed instead of planned and not dropped) is one unit in every mode. A
   segment with no surviving block publishes nothing. A unit has exactly one
@@ -823,3 +827,96 @@ and `runs_open_each_segment_at_most_min_groups_partitions_times`
 `carried_whole_objects_are_released_when_every_owner_finishes_the_segment`.
 The bounded producer that removes the plan barrier is the next step of
 ADR-3072 decision 2 and is not part of this amendment.
+
+## Amendment (2026-10-23, #3192): a repeated scan alternates its publication direction
+
+<!-- amendment-applies: sections="1. Intra-segment partitioning — redesigned and shipped|Amendment (2026-10-21, #3080): partitions take whole units from one queue instead of the `i % n` deal" pointer="#3192 amendment" -->
+
+The #3080 amendment publishes the unit queue in the scan's visit order on
+every execution. A dashboard re-runs the same statement over the same
+objects, and when those objects hold more bytes than the read cache, the
+same order is the worst case for the cache's S3-FIFO admission: a scan
+inserts every object it misses into the small queue at frequency 0, and by
+the time the next execution comes back to an object, the objects read after
+it have evicted it from the small queue before its next lookup, and the
+ghost queue has forgotten it. Issue #3192's trace of repeated scans over a
+working set larger than the cache measured warm executions served 0 % from
+the cache. Before the queue, the `i % n` deal gave each partition a
+different slice of the order, so some objects were read again before their
+eviction, and the same trace served 12 % to 36 %. Once an object reaches the
+main queue it stays there across executions, so the fix only has to get a
+subset of the objects looked up again while they are still in the small
+queue.
+
+Decision 1's publication order changes as follows, and nothing else in it
+does.
+
+- **Alternate executions publish the segments in reverse visit order.**
+  `SqlExecutor` owns one `ScanExecutions` record, a count per scan, keyed by
+  a hash of the tenant, the resolved segment set (each segment's content
+  hash, in snapshot order), the projection (with its per-key attribute
+  columns and row refs) and the pushed content, prune and key-equality
+  predicates. The time bounds are not in the key: the segment set is what a
+  window selects, so a relative window re-sent with fresh bounds over the
+  same objects keeps its count. The record is bounded at 4,096 scans, the
+  least recently counted dropped first, held in process memory and charged
+  to no cache, the same shape as ADR-3072's statement read-bytes record
+  (issue #3084). At an execution's first publication its scan's count is
+  taken and incremented, and an odd count before the increment publishes
+  the segments in reverse visit order. Each segment's runs stay contiguous
+  and in group order. The second execution therefore reads first the
+  objects the first one read last, which are still resident, and an object
+  hit while in the small queue moves to the main queue instead of being
+  evicted, where it stays across later executions.
+- **One direction per execution.** The direction is decided once per plan
+  node and shared by all its partitions and every re-execution round
+  (`UnitRounds`), so a round published again within one execution takes the
+  direction that execution already took and is not counted twice.
+- **Only with a read cache, no confirmed TopK and no pushed fetch limit.**
+  Without a read cache a repeat reads the store whatever its order. Under a
+  confirmed ascending `ts` TopK with a read cache the global deal's order is
+  chosen to tighten the threshold early and is unchanged. Under a pushed
+  fetch limit the scan stops at the first rows it finds, so its rows would
+  depend on the direction. None of these cases counts anything. The
+  predicate-free whole-segment fast path of the #693 part 3 amendment
+  publishes no units and keeps its `j % n` deal over visit order, unchanged.
+
+Costs: on a working set the cache holds, every object is resident whichever
+end a scan starts from, so the change costs nothing there. The record is at
+most 4,096 entries of a key and two counters, and a statement takes its lock
+once per logs scan. Row order without an `ORDER BY` can now differ between
+two executions of one statement, and so can the rows of a statement whose
+answer depends on which rows the scan yields first, each set a valid
+answer: a `LIMIT` the scan does not take as a pushed fetch (one above a
+filter the scan does not evaluate exactly, such as `body LIKE '%x%'`, which
+stays a `FilterExec`, or above a `SELECT DISTINCT`), an `ORDER BY` on a key
+other than `ts`, or on `ts DESC`, whose `LIMIT` cuts through tied rows, and
+`first_value`, `last_value` or `ARRAY_AGG` without an `ORDER BY`. These
+now return different rows on alternate executions even at one partition,
+where they used to repeat. With more than one partition they already
+varied with timing, since the partitions' shares do. Of the scans this
+amendment reaches (the planned route with a read cache), only those under a
+pushed fetch or a confirmed TopK keep their order. Two identical scans in
+one statement, as in a self-join or a `UNION` of the same scan, share a
+key, so both count against it, and which counts first depends on timing:
+the direction each plan node takes is effectively random from one
+execution to the next, and the two nodes take opposite directions. A
+restart or a dropped entry starts that scan's count again at zero, which
+only costs the first warm execution its reversal.
+
+`crates/ravel-sql/src/logs_scan/plan.rs` pins the rules:
+`a_repeated_cached_scan_alternates_its_publication_direction`,
+`a_scan_under_another_pushed_filter_has_its_own_count`,
+`a_scan_under_another_key_equality_has_its_own_key`,
+`uncached_topk_and_fetch_publications_are_identical_across_executions`,
+`the_execution_record_drops_the_oldest_scan_past_its_bound`, and the two
+proptests of the #3080 amendment, now drawn over both directions.
+`crates/ravel-sql/src/scan_alternation_tests.rs` runs one filtered statement
+four times through `SqlExecutor` over eight objects and a read cache that
+holds four and a half of them, at one partition: the read cache serves 0,
+2,792, 2,094 and 2,094 bytes on the four runs, where every run served 0
+before this amendment. `a_pushed_fetch_and_a_confirmed_topk_do_not_alternate`
+there runs a statement whose `LIMIT` the scan takes as a pushed fetch and a
+confirmed ascending-`ts` TopK twice each through the same executor and read
+cache, and pins that neither counts an execution and each returns the same
+batches both times.
