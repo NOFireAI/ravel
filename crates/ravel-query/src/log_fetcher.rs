@@ -12573,6 +12573,187 @@ mod assembly_buffer_tests {
 
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used)]
+mod tail_section_placement_tests {
+    //! Which tail sections the scan over a ranged open reads (issue #3219):
+    //! the bytes `fetch_object_v4`'s placement loop has to place for
+    //! [`LogSegmentFetcher::scan_bytes`] to succeed. Each case assembles a
+    //! version-4 object with one section left unplaced and runs the scan the
+    //! fetcher runs over a ranged open's bytes.
+
+    use super::*;
+    use ravel_logseg::writer::ObjectIdentity;
+    use ravel_logseg::{FieldSel, RlogWriter, stream_attrs_bytes};
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_types::logstream::log_stream_id;
+
+    const KEY: &str = "t/tail.rlog";
+    const BLOCKS: i64 = 8;
+
+    fn record(ts: i64) -> LogRecord {
+        let resource = vec![("service.name".to_string(), AttrValue::Str("svc".into()))];
+        let word = if ts % 2 == 0 { "alpha" } else { "beta" };
+        LogRecord {
+            stream_id: log_stream_id(&resource, "scope", "1.0", &[]),
+            stream_attrs: stream_attrs_bytes(&resource, "scope", "1.0", &[]),
+            ts_ns: ts,
+            observed_ts_ns: ts,
+            severity_num: 9,
+            severity_text: "INFO".into(),
+            body: format!("{word} {ts}"),
+            trace_id: None,
+            span_id: None,
+            flags: 0,
+            attrs: vec![("request.id".to_string(), AttrValue::Str(format!("r{ts}")))],
+        }
+    }
+
+    /// One block per record, with POSTINGS over `request.id`.
+    fn object() -> Vec<u8> {
+        let cfg = RlogConfig {
+            block_target_records: 1,
+            ..RlogConfig::default()
+        };
+        let identity = ObjectIdentity {
+            tenant_hash: [7u8; 16],
+            shard: 0,
+            writer_id: [2u8; 16],
+            writer_epoch: 1,
+            writer_seq: 1,
+        };
+        let mut writer =
+            RlogWriter::new(cfg, identity).with_indexed_fields(vec!["request.id".to_string()]);
+        for ts in 0..BLOCKS {
+            writer.push(record(ts)).expect("push");
+        }
+        writer.finish().expect("finish")
+    }
+
+    fn section(obj: &[u8], k: u32) -> SectionDesc {
+        let footer = footer::open(obj).expect("footer");
+        assert!(
+            footer.section(kind::PAGE_DIR).is_some(),
+            "a version-4 object"
+        );
+        *footer.section(k).expect("section present")
+    }
+
+    /// Every byte of `obj` placed except the sections of kind `holes`.
+    fn assembled_without(obj: &[u8], holes: &[u32]) -> LogObjectBytes {
+        let mut gaps: Vec<(u64, u64)> = holes
+            .iter()
+            .map(|&k| {
+                let d = section(obj, k);
+                assert!(d.len > 0, "section {k} is empty");
+                (d.offset, d.offset + d.len)
+            })
+            .collect();
+        gaps.sort_unstable();
+        let bytes = Bytes::copy_from_slice(obj);
+        let mut asm = ObjectAssembler::new(&Arc::new(AssemblyGauge::default()), obj.len() as u64);
+        let mut at = 0u64;
+        for (start, end) in gaps.into_iter().chain([(obj.len() as u64, obj.len() as u64)]) {
+            if start > at {
+                asm.place(KEY, at, bytes.slice(at as usize..start as usize))
+                    .expect("place");
+            }
+            at = end;
+        }
+        asm.into_bytes()
+    }
+
+    fn scan(bytes: &LogObjectBytes, query: &LogQuery) -> Result<LogFetchOutput, LogFetchError> {
+        let fetcher = LogSegmentFetcher::new(Arc::new(MemoryStore::new()));
+        fetcher
+            .scan_bytes(
+                KEY,
+                bytes,
+                query,
+                &QueryAccounting::new(),
+                &tracing::Span::none(),
+            )
+            .map(|out| out.expect("the object is relevant"))
+    }
+
+    fn unplaced(result: Result<LogFetchOutput, LogFetchError>) -> (u64, u64) {
+        match result {
+            Err(LogFetchError::Corrupt {
+                source: LogSegError::Unplaced { start, end },
+                ..
+            }) => (start, end),
+            other => panic!("expected an Unplaced read, got {other:?}"),
+        }
+    }
+
+    /// A scan with no content, stream or prune arm still reads the whole
+    /// BLOOM section, so a ranged open that leaves it unplaced fails the scan
+    /// instead of returning rows. This is why the placement loop in
+    /// `fetch_object_v4` places BLOOM for every query.
+    ///
+    /// Prove-the-test: in `RlogReader::scan_blocks`
+    /// (crates/ravel-logseg/src/reader.rs), reading BLOOM only when `arms`
+    /// holds a `HasWord` or `Equals` arm makes the holed scan return its 8
+    /// rows and the `unplaced` call panics with "expected an Unplaced read".
+    #[test]
+    fn a_predicate_free_scan_reads_the_whole_bloom_section() {
+        let obj = object();
+        let bloom = section(&obj, kind::BLOOM);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let full = scan(&assembled_without(&obj, &[]), &query).expect("full scan");
+        assert_eq!(full.records.len(), BLOCKS as usize);
+
+        let holed = scan(&assembled_without(&obj, &[kind::BLOOM]), &query);
+        assert_eq!(unplaced(holed), (bloom.offset, bloom.offset + bloom.len));
+
+        // A content arm reads the same section, and uses it to prune.
+        let alpha = query.clone().with_content(Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "alpha".into(),
+        });
+        let pruned = scan(&assembled_without(&obj, &[]), &alpha).expect("content scan");
+        assert_eq!(pruned.stats.blocks_after_bloom, (BLOCKS / 2) as u32);
+        assert_eq!(pruned.records.len(), (BLOCKS / 2) as usize);
+        let holed = scan(&assembled_without(&obj, &[kind::BLOOM]), &alpha);
+        assert_eq!(unplaced(holed), (bloom.offset, bloom.offset + bloom.len));
+    }
+
+    /// POSTINGS is read only when the query carries an equality arm it can
+    /// probe: a predicate-free scan over an assembly without it returns the
+    /// same rows as the full object, and a prune arm on the indexed field
+    /// fails the same holed scan on the POSTINGS range.
+    ///
+    /// Prove-the-test: in `RlogReader::scan_blocks`, entering the POSTINGS
+    /// branch whatever the arms (replacing `!content_arms.is_empty() ||
+    /// !prune_arms.is_empty()` with `true`) fails the predicate-free holed
+    /// scan's `expect` with an Unplaced read over the POSTINGS range.
+    #[test]
+    fn a_scan_reads_postings_only_for_an_equality_arm() {
+        let obj = object();
+        let postings = section(&obj, kind::POSTINGS);
+        let query = LogQuery::new(i64::MIN, i64::MAX);
+
+        let full = scan(&assembled_without(&obj, &[]), &query).expect("full scan");
+        let holed =
+            scan(&assembled_without(&obj, &[kind::POSTINGS]), &query).expect("holed scan");
+        assert_eq!(format!("{:?}", holed.records), format!("{:?}", full.records));
+        assert_eq!(holed.records.len(), BLOCKS as usize);
+
+        let equality = query.clone().with_prune(Predicate::Equals {
+            field: FieldSel::Attr("request.id".into()),
+            value: AttrValue::Str("r3".into()),
+        });
+        let pruned = scan(&assembled_without(&obj, &[]), &equality).expect("prune scan");
+        assert_eq!(pruned.stats.blocks_after_postings, 1);
+        let holed = scan(&assembled_without(&obj, &[kind::POSTINGS]), &equality);
+        assert_eq!(
+            unplaced(holed),
+            (postings.offset, postings.offset + postings.len)
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
 mod ranged_projection_cost_tests {
     //! The arithmetic behind [`LogSegmentFetcher::ranged_projection_pays`]
     //! (issue #862), pinned at its break-even rather than at a convenient
