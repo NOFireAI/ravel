@@ -885,15 +885,29 @@ Costs: on a working set the cache holds, every object is resident whichever
 end a scan starts from, so the change costs nothing there. The record is at
 most 4,096 entries of a key and two counters, and a statement takes its lock
 once per logs scan. Row order without an `ORDER BY` can now differ between
-two executions of one statement; it already could across partitions, whose
-shares depend on timing. Two identical scans in one statement share a key,
-so both count against it. A restart or a dropped entry starts that scan's
-count again at zero, which only costs the first warm execution its
-reversal.
+two executions of one statement, and so can the rows of a statement whose
+answer depends on which rows the scan yields first, each set a valid
+answer: a `LIMIT` the scan does not take as a pushed fetch (one above a
+filter the scan does not evaluate exactly, such as `body LIKE '%x%'`, which
+stays a `FilterExec`, or above a `SELECT DISTINCT`), an `ORDER BY` on a key
+other than `ts`, or on `ts DESC`, whose `LIMIT` cuts through tied rows, and
+`first_value`, `last_value` or `ARRAY_AGG` without an `ORDER BY`. These
+now return different rows on alternate executions even at one partition,
+where they used to repeat. With more than one partition they already
+varied with timing, since the partitions' shares do. Of the scans this
+amendment reaches (the planned route with a read cache), only those under a
+pushed fetch or a confirmed TopK keep their order. Two identical scans in
+one statement, as in a self-join or a `UNION` of the same scan, share a
+key, so both count against it, and which counts first depends on timing:
+the direction each plan node takes is effectively random from one
+execution to the next, and the two nodes take opposite directions. A
+restart or a dropped entry starts that scan's count again at zero, which
+only costs the first warm execution its reversal.
 
 `crates/ravel-sql/src/logs_scan/plan.rs` pins the rules:
 `a_repeated_cached_scan_alternates_its_publication_direction`,
 `a_scan_under_another_pushed_filter_has_its_own_count`,
+`a_scan_under_another_key_equality_has_its_own_key`,
 `uncached_topk_and_fetch_publications_are_identical_across_executions`,
 `the_execution_record_drops_the_oldest_scan_past_its_bound`, and the two
 proptests of the #3080 amendment, now drawn over both directions.
@@ -901,4 +915,8 @@ proptests of the #3080 amendment, now drawn over both directions.
 four times through `SqlExecutor` over eight objects and a read cache that
 holds four and a half of them, at one partition: the read cache serves 0,
 2,792, 2,094 and 2,094 bytes on the four runs, where every run served 0
-before this amendment.
+before this amendment. `a_pushed_fetch_and_a_confirmed_topk_do_not_alternate`
+there runs a statement whose `LIMIT` the scan takes as a pushed fetch and a
+confirmed ascending-`ts` TopK twice each through the same executor and read
+cache, and pins that neither counts an execution and each returns the same
+batches both times.
