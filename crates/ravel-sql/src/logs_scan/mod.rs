@@ -3113,7 +3113,6 @@ impl ExecutionPlan for LogsScanExec {
                         || {
                             ScanExecutions::key(
                                 self.tenant_hash,
-                                &self.segments,
                                 &self.projection,
                                 &self.attr_keys,
                                 self.row_refs,
