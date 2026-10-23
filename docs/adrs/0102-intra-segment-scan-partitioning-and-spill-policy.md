@@ -724,7 +724,10 @@ keeps the materialized batch in its own reservation until the last
 `batch_size` slice is cut from it, so its emit hands no live bytes back to
 the pool. None registers a consumer named `GroupedHashAggregateStream[..]`,
 so the hold does not select them and their shrinks reach the budgets at
-once. With the disk manager disabled, `FinalHashAggregateStream` and
+once. (The last-release hold amendment below corrects both sentences for
+`FinalHashAggregateStream` and `SingleHashAggregateStream`: they resize
+their reservation to zero as they return the last slice, and the pool
+holds that shrink when their consumer cannot spill.) With the disk manager disabled, `FinalHashAggregateStream` and
 `SingleHashAggregateStream` register a consumer that cannot spill and return
 the pool's refusal; `PartialHashAggregateStream` and the ordered final stream
 register as spillable in every case.
@@ -943,3 +946,27 @@ there runs a statement whose `LIMIT` the scan takes as a pushed fetch and a
 confirmed ascending-`ts` TopK twice each through the same executor and read
 cache, and pins that neither counts an execution and each returns the same
 batches both times.
+
+## Amendment (2026-10-23, #3181): the migrated final and single-stage streams' last release is held
+
+<!-- amendment-applies: sections="Amendment (2026-10-10, #2720): on DataFusion 55.2 the hold covers only the legacy aggregate stream" pointer="last-release hold amendment" -->
+
+The DataFusion 55.2 hold amendment says each migrated stream keeps its
+materialized batch reserved until the last slice is cut from it, so its
+emit hands no live bytes back to the pool. `FinalHashAggregateStream` and
+`SingleHashAggregateStream` keep it reserved while they cut slices, but
+resize their reservation to zero as they return the last slice, which still
+points into the whole materialized output; a trace measured on #3181
+(comment 6361507509) read 124 MiB live with 0 reserved.
+
+`TenantDelegatingPool` therefore has a second selection beside the legacy
+hold: a consumer named `FinalHashAggregateStream[..]` or
+`SingleHashAggregateStream[..]` whose `can_spill` is false has its shrink to
+zero held until it unregisters. Only the shrink that leaves the reservation
+at zero is held; a partial shrink is released at once. `can_spill` selects
+for the same reason as in the #2633 amendment: with the disk manager
+disabled, as decision 3 sets it, both streams register a consumer that
+cannot spill and are held, while a final aggregate on a runtime with a disk
+can shrink after a spill, which frees the memory, and is not held. ADR-1170's
+last-release hold amendment records the budget consequence and the tests
+that pin it.

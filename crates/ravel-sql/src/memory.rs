@@ -18,19 +18,31 @@
 //! reserved bytes return to zero without any explicit cleanup path. A pool that
 //! did not forward `shrink` would leak tenant budget on every cancellation.
 //!
-//! One exception: a legacy grouped hash aggregate stream whose consumer cannot
-//! spill has its shrinks held on all three budgets rather than released,
-//! because `GroupedHashAggregateStream::emit` shrinks its reservation while the
-//! emitted batch still holds the bytes. DataFusion 55.2 runs that stream only
-//! for the aggregate shapes `AggregateExec::execute_typed` has not migrated,
-//! for example a single-stage aggregate with a limit or over ordered input;
-//! the migrated streams keep their emitted output reserved themselves, carry
-//! other consumer names, and are not held. The choice is made per
-//! stream, from the consumer itself. The hold is released when that consumer
-//! unregisters, which DataFusion does when the stream's last reservation
-//! drops, so cancellation still returns every byte. It can be removed once
-//! Ravel runs a DataFusion release whose `execute_typed` no longer falls back
-//! to the legacy stream (apache/datafusion#22710, #25902).
+//! Two exceptions hold released bytes on all three budgets instead of
+//! releasing them, both for grouped hash aggregate streams whose consumer
+//! cannot spill, because DataFusion 55.2 shrinks those reservations while the
+//! emitted output still holds the bytes:
+//!
+//! - The legacy `GroupedHashAggregateStream`, which 55.2 runs only for the
+//!   shapes `AggregateExec::execute_typed` has not migrated (for example a
+//!   single-stage aggregate with a limit or over ordered input), shrinks its
+//!   reservation at emit. Every shrink of that consumer is held.
+//! - The migrated `FinalHashAggregateStream` and `SingleHashAggregateStream`
+//!   keep their reservation at the output buffers' size while they hand out
+//!   slices, but resize it to zero as they return the last slice, which still
+//!   points into those buffers. Only that shrink to zero is held; a shrink
+//!   that leaves the reservation above zero is released.
+//!
+//! A consumer that can spill is never held: it is a partial aggregate that
+//! answers pressure by emitting into the exchange that reserves what it
+//! buffers, or a final aggregate on a runtime with a disk, and holding either
+//! would charge those bytes twice. The choice is made per stream, from the
+//! consumer itself. A hold is released when that consumer unregisters, which
+//! DataFusion does when the stream's last reservation drops, so cancellation
+//! still returns every byte. The legacy hold can be removed once Ravel runs a
+//! DataFusion release whose `execute_typed` no longer falls back to the legacy
+//! stream (apache/datafusion#22710, #25902), and the last-release hold once
+//! the migrated streams keep their final output reserved.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -321,6 +333,16 @@ impl TenantMemoryAccountant {
 /// so this prefix selects only the shapes DataFusion has not migrated.
 pub const HASH_AGGREGATE_CONSUMER_PREFIX: &str = "GroupedHashAggregateStream[";
 
+/// The name prefix DataFusion 55.2 gives the migrated final hash aggregate
+/// stream's memory consumer: `"FinalHashAggregateStream[{partition}]"` in
+/// `datafusion-physical-plan`'s `aggregates/hash_stream.rs`.
+pub const FINAL_HASH_AGGREGATE_CONSUMER_PREFIX: &str = "FinalHashAggregateStream[";
+
+/// The name prefix DataFusion 55.2 gives the migrated single-stage hash
+/// aggregate stream's memory consumer: `"SingleHashAggregateStream[{partition}]"`
+/// in `datafusion-physical-plan`'s `aggregates/single_stream.rs`.
+pub const SINGLE_HASH_AGGREGATE_CONSUMER_PREFIX: &str = "SingleHashAggregateStream[";
+
 /// Bytes currently held across every [`TenantDelegatingPool`] in the process:
 /// the process-wide figure behind [`sql_memory_held_bytes`].
 static HELD_BYTES: AtomicU64 = AtomicU64::new(0);
@@ -357,7 +379,7 @@ pub struct TenantDelegatingPool {
     accounting: QueryAccounting,
     /// Bytes each hash aggregate consumer, keyed by `MemoryConsumer::id`, has
     /// shrunk by and the pool still keeps charged on all three budgets. Only
-    /// consumers [`Self::holds`] selects ever add to it.
+    /// shrinks [`Self::holds_shrink`] selects ever add to it.
     held: Mutex<HashMap<usize, usize>>,
     /// Consumers registered and not yet unregistered, for the debug check
     /// that nothing is held once the last one is gone.
@@ -437,6 +459,32 @@ impl TenantDelegatingPool {
     /// depend on when each partial stream ends.
     fn holds(&self, consumer: &MemoryConsumer) -> bool {
         consumer.name().starts_with(HASH_AGGREGATE_CONSUMER_PREFIX) && !consumer.can_spill()
+    }
+
+    /// Whether `consumer`'s shrink to zero is held rather than released: a
+    /// migrated final or single-stage hash aggregate stream whose consumer
+    /// cannot spill. Those streams resize their reservation to zero as they
+    /// return the last output slice, which still points into the output
+    /// buffers. A consumer that can spill is not held, for the reason
+    /// [`Self::holds`] gives.
+    fn holds_last_release(&self, consumer: &MemoryConsumer) -> bool {
+        let name = consumer.name();
+        (name.starts_with(FINAL_HASH_AGGREGATE_CONSUMER_PREFIX)
+            || name.starts_with(SINGLE_HASH_AGGREGATE_CONSUMER_PREFIX))
+            && !consumer.can_spill()
+    }
+
+    /// Whether this shrink of `reservation` is held. `MemoryReservation`
+    /// lowers its own size before it calls the pool, so a size of zero here
+    /// means the shrink released the reservation's last byte.
+    fn holds_shrink(&self, reservation: &MemoryReservation) -> bool {
+        let consumer = reservation.consumer();
+        self.holds(consumer) || (reservation.size() == 0 && self.holds_last_release(consumer))
+    }
+
+    /// Whether a grow of `reservation` may be served from its consumer's hold.
+    fn may_hold(&self, consumer: &MemoryConsumer) -> bool {
+        self.holds(consumer) || self.holds_last_release(consumer)
     }
 
     fn held_map(&self) -> MutexGuard<'_, HashMap<usize, usize>> {
@@ -644,7 +692,7 @@ impl MemoryPool for TenantDelegatingPool {
 
     fn register(&self, consumer: &MemoryConsumer) {
         self.registered.fetch_add(1, Ordering::AcqRel);
-        if self.holds(consumer) {
+        if self.may_hold(consumer) {
             tracing::debug!(
                 consumer = consumer.name(),
                 query_limit = self.query_limit,
@@ -677,7 +725,7 @@ impl MemoryPool for TenantDelegatingPool {
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
         // Bytes this consumer already holds are already charged and already
         // passed the ceiling checks, so only the excess is charged here.
-        let from_held = if self.holds(reservation.consumer()) {
+        let from_held = if self.may_hold(reservation.consumer()) {
             self.take_held(reservation.consumer().id(), additional)
         } else {
             0
@@ -693,7 +741,7 @@ impl MemoryPool for TenantDelegatingPool {
         // issues when a MemoryReservation is dropped: this is what
         // makes a cancelled or dropped stream return its tenant reservation to
         // zero. A held aggregate's bytes return at its `unregister` instead.
-        if self.holds(reservation.consumer()) {
+        if self.holds_shrink(reservation) {
             self.hold(reservation.consumer().id(), shrink);
         } else {
             self.release(shrink);
@@ -701,8 +749,7 @@ impl MemoryPool for TenantDelegatingPool {
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
-        let holds = self.holds(reservation.consumer());
-        let from_held = if holds {
+        let from_held = if self.may_hold(reservation.consumer()) {
             self.take_held(reservation.consumer().id(), additional)
         } else {
             0
@@ -920,6 +967,109 @@ mod tests {
             drop(res);
             assert_eq!(ledgers.charged(), (0, 0, 0), "{case}");
         }
+    }
+
+    /// The name DataFusion 55.2 gives a partition-0 migrated final hash
+    /// aggregate.
+    const FINAL_AGGREGATE: &str = "FinalHashAggregateStream[0]";
+
+    /// A partial shrink, then the shrink to zero, of one consumer; the
+    /// figures and the hold after each, then after the reservation drops.
+    fn shrink_to_zero(consumer: MemoryConsumer) -> [((usize, usize, u64), usize); 3] {
+        let ledgers = Ledgers::holding();
+        let res = ledgers.register_consumer(consumer);
+        res.try_grow(1000).expect("within every ceiling");
+        res.shrink(400);
+        let partial = (ledgers.charged(), ledgers.pool.held_bytes());
+        res.shrink(600);
+        let last = (ledgers.charged(), ledgers.pool.held_bytes());
+        drop(res);
+        let dropped = (ledgers.charged(), ledgers.pool.held_bytes());
+        assert_eq!(ledgers.tenant.process_outstanding(), 0);
+        [partial, last, dropped]
+    }
+
+    /// FLIP: drop `holds_last_release` from `holds_shrink` and the second
+    /// shrink reads 0 on all three budgets with nothing held.
+    #[test]
+    fn a_final_aggregate_shrink_to_zero_is_held_until_it_unregisters() {
+        let [partial, last, dropped] =
+            shrink_to_zero(MemoryConsumer::new(FINAL_AGGREGATE).with_can_spill(false));
+        assert_eq!(
+            partial,
+            ((600, 600, 600), 0),
+            "a partial shrink is released"
+        );
+        assert_eq!(last, ((600, 600, 600), 600), "the shrink to zero is held");
+        assert_eq!(dropped, ((0, 0, 0), 0), "unregister releases the hold");
+    }
+
+    #[test]
+    fn a_single_stage_aggregate_shrink_to_zero_is_held_until_it_unregisters() {
+        let [partial, last, dropped] = shrink_to_zero(
+            MemoryConsumer::new("SingleHashAggregateStream[0]").with_can_spill(false),
+        );
+        assert_eq!(
+            partial,
+            ((600, 600, 600), 0),
+            "a partial shrink is released"
+        );
+        assert_eq!(last, ((600, 600, 600), 600), "the shrink to zero is held");
+        assert_eq!(dropped, ((0, 0, 0), 0), "unregister releases the hold");
+    }
+
+    /// FLIP: drop the `!consumer.can_spill()` conjunct from
+    /// `holds_last_release` and the second shrink reads 600 with 600 held.
+    #[test]
+    fn a_spillable_final_aggregate_releases_its_last_shrink() {
+        let [partial, last, dropped] =
+            shrink_to_zero(MemoryConsumer::new(FINAL_AGGREGATE).with_can_spill(true));
+        assert_eq!(partial, ((600, 600, 600), 0));
+        assert_eq!(last, ((0, 0, 0), 0));
+        assert_eq!(dropped, ((0, 0, 0), 0));
+    }
+
+    /// FLIP: make `holds_last_release` ignore the consumer name and the second
+    /// shrink reads 600 with 600 held.
+    #[test]
+    fn a_non_aggregate_unspillable_consumer_releases_its_last_shrink() {
+        let [partial, last, dropped] =
+            shrink_to_zero(MemoryConsumer::new("ExternalSorter[0]").with_can_spill(false));
+        assert_eq!(partial, ((600, 600, 600), 0));
+        assert_eq!(last, ((0, 0, 0), 0));
+        assert_eq!(dropped, ((0, 0, 0), 0));
+    }
+
+    /// A final aggregate's reservation dropped while still sized is a shrink
+    /// to zero too (`MemoryReservation::free`), so it is held until the
+    /// registration's other half drops.
+    #[test]
+    fn a_dropped_final_aggregate_reservation_is_held_until_it_unregisters() {
+        let ledgers = Ledgers::holding();
+        let res = ledgers.register_consumer(MemoryConsumer::new(FINAL_AGGREGATE));
+        res.try_grow(1000).expect("within every ceiling");
+        let split = res.split(0);
+        drop(res);
+        assert_eq!(ledgers.charged(), (1000, 1000, 1000));
+        assert_eq!(ledgers.pool.held_bytes(), 1000);
+        drop(split);
+        assert_eq!(ledgers.charged(), (0, 0, 0));
+        assert_eq!(ledgers.pool.held_bytes(), 0);
+    }
+
+    /// A grow after the shrink to zero is served from the hold, so the
+    /// output bytes are not charged twice.
+    #[test]
+    fn a_final_aggregate_regrow_after_its_last_shrink_is_served_from_the_hold() {
+        let ledgers = Ledgers::holding();
+        let res = ledgers.register_consumer(MemoryConsumer::new(FINAL_AGGREGATE));
+        res.try_grow(1000).expect("within every ceiling");
+        res.shrink(1000);
+        res.try_grow(300).expect("served from the hold");
+        assert_eq!(ledgers.charged(), (1000, 1000, 1000));
+        assert_eq!(ledgers.pool.held_bytes(), 700);
+        drop(res);
+        assert_eq!(ledgers.charged(), (0, 0, 0));
     }
 
     #[test]

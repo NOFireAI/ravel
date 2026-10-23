@@ -1,11 +1,12 @@
-//! Issues #2633 and #2720: a grouped aggregate's emitted output stays charged
-//! to the query pool while it is handed out.
+//! Issues #2633, #2720 and #3181: a grouped aggregate's emitted output stays
+//! charged to the query pool while it is handed out.
 //!
 //! A hash aggregate materializes every group's output at once and returns it
-//! in `batch_size` slices. DataFusion 55.2's migrated aggregate streams keep
-//! the materialized batch in their own reservation until the last slice is cut
-//! from it, so the output a consumer is still pulling is in the pool's
-//! `reserved()` without the pool's help. The legacy
+//! in `batch_size` slices. DataFusion 55.2's migrated final and single-stage
+//! aggregate streams keep their reservation at the materialized output's size
+//! while they cut slices from it, but resize it to zero as they return the
+//! last slice, which still points into that output. The pool holds that last
+//! release until the stream's consumer unregisters. The legacy
 //! `GroupedHashAggregateStream`, which DataFusion 55.2 still runs for the
 //! shapes `AggregateExec::execute_typed` has not migrated (for example a
 //! single-stage aggregate with a limit or over ordered input), shrinks its
@@ -13,12 +14,13 @@
 //! slice. On that path the pool's aggregate hold keeps the shrunk bytes
 //! charged.
 //!
-//! Both tests read the pool after the first `next()` returns and before the
-//! second is polled, then drain the stream and assert that further batches
-//! arrived, so at the read point the aggregate had not handed out its whole
-//! output; and they assert that the pool is back to zero once the stream
-//! drops, so a reading taken after the drain would be zero and could not
-//! satisfy the bound.
+//! The first two tests read the pool after the first `next()` returns and
+//! before the second is polled, then drain the stream and assert that further
+//! batches arrived, so at the read point the aggregate had not handed out its
+//! whole output. The third reads it after the stream has returned `None`
+//! while the last batch is still held. All three assert that the pool is back
+//! to zero once the stream drops, so a reading taken after the drop would be
+//! zero and could not satisfy the bound.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
@@ -74,50 +76,80 @@ struct FirstBatchReading {
     later_batches: usize,
 }
 
-/// Run `sql` through the production pool (`SqlConfig::query_pool`, then
-/// `build_session` with spill disabled) under `config`, reading the pool
+/// A statement planned through the production pool (`SqlConfig::query_pool`,
+/// then `build_session` with spill disabled), with the fixture it reads.
+struct Planned {
+    _fixture: Fixture,
+    accountant: Arc<TenantMemoryAccountant>,
+    pool: Arc<dyn MemoryPool>,
+    ctx: datafusion::prelude::SessionContext,
+    physical: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+    plan: String,
+}
+
+impl Planned {
+    async fn new(sql: &str, config: SqlConfig) -> Self {
+        let tenant = tenant_id("acme");
+        let specs = one_sample_per_group();
+        let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
+
+        let accountant = TenantMemoryAccountant::new(1 << 30);
+        let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
+
+        let provider = Arc::new(RavelTableProvider::new(
+            fixture.snapshot(&tenant).await,
+            tenant.hash(),
+            SegmentFetcher::new(Arc::clone(&fixture.store)),
+            config.clone(),
+            PhaseAccounting::new(),
+        ));
+        let ctx = build_session(
+            &config,
+            Arc::clone(&pool) as Arc<dyn MemoryPool>,
+            SessionTable::Metrics(provider),
+            false,
+            SpillDecision::Disabled,
+            &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
+        )
+        .expect("session");
+
+        let physical = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        let plan = displayable(physical.as_ref()).indent(true).to_string();
+        Planned {
+            _fixture: fixture,
+            accountant,
+            pool,
+            ctx,
+            physical,
+            plan,
+        }
+    }
+
+    fn held(&self) -> usize {
+        self.pool
+            .downcast_ref::<TenantDelegatingPool>()
+            .expect("query_pool builds a TenantDelegatingPool")
+            .held_bytes()
+    }
+}
+
+/// Run `sql` through the production pool under `config`, reading the pool
 /// between the first and second `next()`. Asserts one output row per group
 /// and that the pool and the tenant read zero once the stream drops.
 async fn read_while_first_batch_is_held(sql: &str, config: SqlConfig) -> FirstBatchReading {
-    let tenant = tenant_id("acme");
-    let specs = one_sample_per_group();
-    let fixture = Fixture::memory(&[(&tenant, &specs)]).await;
-
-    let accountant = TenantMemoryAccountant::new(1 << 30);
-    let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());
-    let held = || {
-        pool.downcast_ref::<TenantDelegatingPool>()
-            .expect("query_pool builds a TenantDelegatingPool")
-            .held_bytes()
-    };
-
-    let provider = Arc::new(RavelTableProvider::new(
-        fixture.snapshot(&tenant).await,
-        tenant.hash(),
-        SegmentFetcher::new(Arc::clone(&fixture.store)),
-        config.clone(),
-        PhaseAccounting::new(),
-    ));
-    let ctx = build_session(
-        &config,
-        Arc::clone(&pool) as Arc<dyn MemoryPool>,
-        SessionTable::Metrics(provider),
-        false,
-        SpillDecision::Disabled,
-        &ravel_sql::SessionPrincipal::without_capabilities(ravel_types::TenantHash([0u8; 16])),
-    )
-    .expect("session");
-    let batch_size = ctx.state().config().batch_size();
-
-    let physical = ctx
-        .sql(sql)
-        .await
-        .expect("plan")
-        .create_physical_plan()
-        .await
-        .expect("physical plan");
-    let plan = displayable(physical.as_ref()).indent(true).to_string();
-    let mut stream = execute_stream(physical, ctx.task_ctx()).expect("execute");
+    let planned = Planned::new(sql, config).await;
+    let pool = &planned.pool;
+    let held = || planned.held();
+    let batch_size = planned.ctx.state().config().batch_size();
+    let plan = planned.plan.clone();
+    let mut stream =
+        execute_stream(Arc::clone(&planned.physical), planned.ctx.task_ctx()).expect("execute");
 
     let first = stream
         .next()
@@ -151,7 +183,7 @@ async fn read_while_first_batch_is_held(sql: &str, config: SqlConfig) -> FirstBa
          is zero"
     );
     assert_eq!(held(), 0, "the hold is released when the stream drops");
-    assert_eq!(accountant.reserved(), 0);
+    assert_eq!(planned.accountant.reserved(), 0);
     FirstBatchReading {
         plan,
         batch_size,
@@ -235,4 +267,65 @@ async fn a_legacy_aggregate_batch_stays_reserved_through_the_hold() {
         reading.held_while_held > 0,
         "the pool held nothing for the legacy stream's consumer"
     );
+}
+
+/// The migrated final aggregate resizes its reservation to zero as it returns
+/// its last slice, which still points into the materialized output. The pool
+/// holds that release, so after the stream has returned `None` the pool still
+/// covers the last batch, and it returns to zero once the batch and the stream
+/// drop.
+///
+/// FLIP: drop `holds_last_release` from `TenantDelegatingPool::holds_shrink`
+/// and the first bound fails: measured 0 bytes reserved against a last batch
+/// of 3,539,120.
+#[tokio::test]
+async fn the_last_emitted_slice_stays_reserved_until_it_is_dropped() {
+    let planned = Planned::new(GROUP_BY, SqlConfig::default()).await;
+    assert!(
+        planned.plan.contains("AggregateExec: mode=Final,"),
+        "the statement must plan a final hash aggregate:\n{}",
+        planned.plan
+    );
+    let mut stream =
+        execute_stream(Arc::clone(&planned.physical), planned.ctx.task_ctx()).expect("execute");
+
+    let mut last = None;
+    let mut batches = 0usize;
+    let mut rows = 0usize;
+    while let Some(next) = stream.next().await {
+        let next = next.expect("batch");
+        rows += next.num_rows();
+        batches += 1;
+        last = Some(next);
+    }
+    let last = last.expect("the aggregate emits a batch");
+    let last_bytes = last.get_array_memory_size();
+    let reserved_after_end = planned.pool.reserved();
+    let held_after_end = planned.held();
+    eprintln!(
+        "{batches} batches, {rows} rows; last batch {last_bytes} bytes; after the stream \
+         ended the pool reserved {reserved_after_end}, of it held {held_after_end}\n{}",
+        planned.plan
+    );
+    assert_eq!(rows, GROUPS as usize, "one output row per group");
+    assert!(
+        batches >= 2,
+        "the output must span several slices, so the last one is cut from a \
+         buffer the stream materialized earlier; got {batches}"
+    );
+    assert!(
+        reserved_after_end >= last_bytes,
+        "the pool reserved {reserved_after_end} bytes after the stream ended, while \
+         its last batch ({last_bytes} bytes) was still held"
+    );
+
+    drop(last);
+    drop(stream);
+    assert_eq!(planned.pool.reserved(), 0, "the pool returns to zero");
+    assert_eq!(
+        planned.held(),
+        0,
+        "the hold is released when the stream drops"
+    );
+    assert_eq!(planned.accountant.reserved(), 0);
 }
