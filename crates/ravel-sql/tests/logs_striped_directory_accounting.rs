@@ -695,22 +695,20 @@ async fn two_partitions_move_each_runs_span_once() {
         "the two runs' spans are disjoint"
     );
     let get = ravel_types::accounting::AccountedOp::Get.index();
-    // Besides the group spans, each partition places BLOOM (the probe is too
-    // short to cover it), one range both partitions ask for and the cache
-    // serves with one GET.
+    // The query has no arm that reads BLOOM, so no partition places it.
     let bloom = ravel_logseg::footer::open(&obj[..])
         .expect("footer")
         .section(kind::BLOOM)
         .expect("BLOOM")
         .len;
+    assert!(bloom > 0, "fixture precondition: a nonempty BLOOM");
     assert_eq!(
-        run.phases.scan.s3_requests[get],
-        2 + 1,
-        "one GET per run, and the shared BLOOM range"
+        run.phases.scan.s3_requests[get], 2,
+        "one GET per run, and none for BLOOM"
     );
     assert_eq!(
         run.phases.scan.s3_bytes[get],
-        first_run + second_run + bloom,
+        first_run + second_run,
         "each run's projected span is moved once"
     );
     assert!(run.phases.scan.s3_bytes[get] <= obj.len() as u64);
@@ -803,10 +801,10 @@ fn section_len(obj: &[u8], k: u32) -> u64 {
 /// than the coverage threshold of the BLOCKS section, and the second owns the
 /// one-block group. Each partition's crossover weighs its own span, so the
 /// first issues one covering range of exactly its group and the second one
-/// range of its group: wire bytes are the two spans plus the BLOOM range both
-/// ask for, within the object's length. One partition, routed through the
-/// striped path by a predicate every block passes, owns every block and takes
-/// the one whole-object GET.
+/// range of its group: wire bytes are the two spans, within the object's
+/// length. The query has no arm that reads BLOOM, so neither share places
+/// it. One partition, routed through the striped path by a predicate every
+/// block passes, owns every block and takes the one whole-object GET.
 ///
 /// Fails against the whole-object crossover on a partial share (the first
 /// partition moves the object, and the sum passes its length) and against a
@@ -823,6 +821,7 @@ async fn a_partial_share_crossover_moves_its_own_span() {
         "the four-block group must cross the default threshold against the section"
     );
     let bloom = section_len(&obj, kind::BLOOM);
+    assert!(bloom > 0, "fixture precondition: a nonempty BLOOM");
     let get = ravel_types::accounting::AccountedOp::Get.index();
 
     let run = run_scan(
@@ -843,12 +842,12 @@ async fn a_partial_share_crossover_moves_its_own_span() {
         "the striped route"
     );
     assert_eq!(
-        run.phases.scan.s3_requests[get], 3,
-        "one covering range per share, and the shared BLOOM range"
+        run.phases.scan.s3_requests[get], 2,
+        "one covering range per share, and none for BLOOM"
     );
     assert_eq!(
         run.phases.scan.s3_bytes[get],
-        spans[0] + spans[1] + bloom,
+        spans[0] + spans[1],
         "each share moves exactly its own span"
     );
     assert!(run.phases.scan.s3_bytes[get] <= obj.len() as u64);
@@ -896,6 +895,7 @@ async fn a_partial_share_crossover_collapses_a_pruned_hole_into_one_range() {
     let (store, snapshot, obj) = short_segment(true).await;
     let spans = all_column_group_spans(&obj);
     let bloom = section_len(&obj, kind::BLOOM);
+    assert!(bloom > 0, "fixture precondition: a nonempty BLOOM");
     let get = ravel_types::accounting::AccountedOp::Get.index();
     let filters = vec![col(attr_name(0)).lt(lit(C0_BELOW))];
     let run = run_scan(
@@ -908,8 +908,9 @@ async fn a_partial_share_crossover_collapses_a_pruned_hole_into_one_range() {
     .await;
     assert_eq!(run.rows, SHORT_BLOCKS - 1, "block 1 is filtered out");
     assert_eq!(
-        run.phases.scan.s3_requests[get], 3,
-        "one covering range per share, and the shared BLOOM range"
+        run.phases.scan.s3_requests[get], 2,
+        "one covering range per share, and none for BLOOM: `c0 < 1000` is a \
+         range arm, which BLOOM cannot answer"
     );
-    assert_eq!(run.phases.scan.s3_bytes[get], spans[0] + spans[1] + bloom);
+    assert_eq!(run.phases.scan.s3_bytes[get], spans[0] + spans[1]);
 }

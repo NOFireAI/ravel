@@ -355,8 +355,10 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// [`RlogReader::new`] over any [`ByteSource`]. Every byte the open and the
     /// later scans address is read through `source`, so a sparse source must
     /// hold the footer and trailer, STREAM_DIR, FIELD_DIR, SKIP_IDX, PAGE_DIR,
-    /// BLOOM, POSTINGS when present, and the pages of every block a scan
-    /// decodes. A range it does not hold fails with
+    /// and the pages of every block a scan decodes, plus BLOOM for a scan
+    /// with a `HasWord` arm or an `Equals` arm on a string of at most 64
+    /// bytes, and POSTINGS (when present) for a scan with an `Equals` arm on
+    /// an attribute it can probe. A range it does not hold fails with
     /// [`LogSegError::Unplaced`].
     ///
     /// Decodes the directories fresh every call. A caller opening the same
@@ -694,15 +696,25 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
         }
         stats.blocks_after_postings = candidates.len() as u32;
 
-        // Bloom pruning. A parse failure, including a covered-column list that
-        // fails its crc or its validation, degrades to no bloom pruning.
-        let bloom_bytes = self.section_stored(&self.bloom)?;
-        let bloom_section = match RlogBloomSection::parse(&bloom_bytes, &self.field_dir) {
-            Ok(s) => Some(s),
-            Err(_) => {
-                stats.bloom_degraded = true;
-                None
-            }
+        // Bloom pruning. BLOOM is read only when an arm has a shape
+        // `bloom_arms` can map to it; whether the section covers that arm's
+        // column is known only after the parse. A parse failure, including a
+        // covered-column list that fails its crc or its validation, degrades
+        // to no bloom pruning.
+        let bloom_bytes = if arms.iter().any(|a| bloom_shaped(a)) {
+            Some(self.section_stored(&self.bloom)?)
+        } else {
+            None
+        };
+        let bloom_section = match bloom_bytes.as_deref() {
+            Some(bytes) => match RlogBloomSection::parse(bytes, &self.field_dir) {
+                Ok(s) => Some(s),
+                Err(_) => {
+                    stats.bloom_degraded = true;
+                    None
+                }
+            },
+            None => None,
         };
         let bloom_arms = match &bloom_section {
             Some(section) => self.bloom_arms(&arms, section),
@@ -1112,6 +1124,19 @@ fn source_extent<'s, S: ByteSource + ?Sized>(
         return Err(LogSegError::Corrupted(format!("{what} out of bounds")));
     }
     source.read(offset, len)
+}
+
+/// Whether `arm` has a shape [`RlogReader::bloom_arms`] can map to BLOOM:
+/// `HasWord` on any field, or `Equals` on a string of at most 64 bytes.
+fn bloom_shaped(arm: &Predicate) -> bool {
+    match arm {
+        Predicate::HasWord { .. } => true,
+        Predicate::Equals {
+            value: AttrValue::Str(s),
+            ..
+        } => s.len() <= 64,
+        _ => false,
+    }
 }
 
 /// Which surviving block to decode: its whole-object block index, resolved to
