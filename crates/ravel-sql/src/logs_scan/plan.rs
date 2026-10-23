@@ -1117,9 +1117,16 @@ impl ScanExecutions {
         projection.hash(&mut hasher);
         attr_keys.hash(&mut hasher);
         row_refs.hash(&mut hasher);
+        // `Predicate` has no `Hash`: its `Equals` arm holds an `AttrValue`,
+        // which can be an `f64`. Its `Debug` text stands in for one.
         format!("{content:?}").hash(&mut hasher);
         format!("{prune:?}").hash(&mut hasher);
-        format!("{key_equals:?}").hash(&mut hasher);
+        key_equals.len().hash(&mut hasher);
+        for key in key_equals {
+            key.field.hash(&mut hasher);
+            key.key_type.hash(&mut hasher);
+            key.key8.hash(&mut hasher);
+        }
         hasher.finish()
     }
 
@@ -2361,6 +2368,40 @@ mod unit_queue_tests {
         assert_eq!(b2, a2, "and so does the filtered scan's");
         assert_eq!(executions.count(unfiltered), Some(2));
         assert_eq!(executions.count(filtered), Some(2));
+    }
+
+    /// Scans under different pushed key equalities, or under one equality on
+    /// a different field, key type or key, are different scans.
+    ///
+    /// Fails against a key that leaves any of the equality's three fields out.
+    #[test]
+    fn a_scan_under_another_key_equality_has_its_own_key() {
+        use ravel_logseg::key_index::{KeyType, key8_i64, key8_str};
+        let (_, refs) = plan(3, true);
+        let key = |key_equals: &[KeyEquals]| {
+            ScanExecutions::key(
+                TenantHash([7u8; 16]),
+                &refs,
+                &[0, 1, 2],
+                &[],
+                false,
+                &[],
+                &[],
+                key_equals,
+            )
+        };
+        let base = KeyEquals::new("service", KeyType::Str, key8_str("checkout"));
+        let keys = [
+            key(&[]),
+            key(std::slice::from_ref(&base)),
+            key(&[KeyEquals::new("region", KeyType::Str, key8_str("checkout"))]),
+            key(&[KeyEquals::new("service", KeyType::I64, base.key8)]),
+            key(&[KeyEquals::new("service", KeyType::Str, key8_str("cart"))]),
+            key(&[base.clone(), base.clone()]),
+            key(&[KeyEquals::new("service", KeyType::I64, key8_i64(-3))]),
+        ];
+        let distinct: std::collections::HashSet<u64> = keys.iter().copied().collect();
+        assert_eq!(distinct.len(), keys.len(), "{keys:?}");
     }
 
     /// With no read cache, under a confirmed TopK, under a pushed fetch
