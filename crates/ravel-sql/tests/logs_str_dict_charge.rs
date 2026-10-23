@@ -185,24 +185,24 @@ fn main_chunk_charge() -> usize {
 /// Per block, after the block's first batch is handed out, the pool carries
 /// the block's decoded bytes, its two batches, and the group's values. Less
 /// the decoded bytes, that is the group's values once plus two chunks' keys:
-/// 217,560 bytes, under main's 361,008 (each of two chunks charged a fresh
-/// narrowed dictionary) and under the 434,832 a per-batch
+/// 209,308 bytes, under main's 361,008 (each of two chunks charged a fresh
+/// narrowed dictionary) and under the 418,328 a per-batch
 /// `get_array_memory_size` charges (the whole values array and the whole
 /// block's key buffer, twice).
 ///
 /// The three figures, from `get_array_memory_size` (buffer capacities plus the
 /// array structs):
 ///
-/// - this scan, `V + 2K` = 151,736 + 2 x 32,912. `V` is the group values
-///   array: 5,120 entries of 24 bytes, 122,880 string bytes in a buffer grown
-///   to 131,072, then 5,121 offsets of 4 bytes, 20,484 bytes rounded up to
-///   20,544, then the 120-byte `StringArray`. `K` is one chunk's keys: 8,192
-///   of 4 bytes, 32,768, plus the 144-byte `DictionaryArray`.
+/// - this scan, `V + 2K` = 143,484 + 2 x 32,912. `V` is the group values
+///   array, its buffers sized exactly before it is built: 5,120 entries of 24
+///   bytes, 122,880 string bytes, then 5,121 offsets of 4 bytes, 20,484 bytes,
+///   then the 120-byte `StringArray`. `K` is one chunk's keys: 8,192 of 4
+///   bytes, 32,768, plus the 144-byte `DictionaryArray`.
 /// - main, `2 (M + K)` = 2 x (147,592 + 32,912). `M` is a chunk's narrowed
 ///   dictionary from a fresh `StringBuilder`: 3,072 entries, 73,728 string
 ///   bytes in a buffer grown to 131,072, 3,073 offsets, 12,292 bytes in a
 ///   buffer grown to 16,400, plus 120.
-/// - per batch, `2 (V + B)` = 2 x (151,736 + 65,680). `B` is the block's whole
+/// - per batch, `2 (V + B)` = 2 x (143,484 + 65,680). `B` is the block's whole
 ///   key buffer, 16,384 keys, 65,536 bytes, plus 144, which a chunk's slice
 ///   still reports.
 ///
@@ -211,7 +211,7 @@ fn main_chunk_charge() -> usize {
 /// charge, so the drop releases only `K`.
 ///
 /// Flipped: charging `get_array_memory_size` per batch in `hold_batches`, and
-/// slicing the block's keys rather than copying a chunk's, reads 434,832.
+/// slicing the block's keys rather than copying a chunk's, reads 418,328.
 #[tokio::test]
 async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
     let t = tenant();
@@ -310,7 +310,7 @@ async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
     .get_array_memory_size();
     assert_eq!(
         (after, main, pre_fix),
-        (217_560, 361_008, 434_832),
+        (209_308, 361_008, 418_328),
         "the fixture's charges: this scan's, main's, per-batch"
     );
     let strings = values.as_string::<i32>();
@@ -320,7 +320,7 @@ async fn a_row_group_dictionary_is_charged_once_per_block_not_per_batch() {
     );
     assert_eq!(
         (string_buffer, offset_buffer),
-        (131_072, 20_544),
+        (122_880, 20_484),
         "V's string and offset buffer capacities"
     );
     assert_eq!(
@@ -433,12 +433,11 @@ fn region_texts(batches: &[RecordBatch], column: usize) -> Vec<Option<String>> {
 /// over the fixture completes on the columnar path and returns the rows the
 /// row path returns (`SELECT region, attrs FROM logs`, which projects the
 /// `attrs` map and so drains the row path), every record's own value. Its
-/// peak is 668,172 bytes.
+/// peak is 659,920 bytes.
 ///
 /// Flipped: with the per-batch charge (`get_array_memory_size` summed in
 /// `hold_batches`, block keys sliced rather than copied) the same statement
-/// peaks at 1,069,948 bytes unbounded and is refused with `ResourcesExhausted`
-/// under the ceiling.
+/// is refused with `ResourcesExhausted` under the ceiling.
 const CEILING: usize = 850_000;
 
 #[tokio::test]
@@ -458,7 +457,7 @@ async fn a_statement_the_per_batch_charge_refused_fits_the_ceiling() {
         Err(e) => panic!("query failed: {e:?}"),
     };
     let peak = columnar.accounting.peak_intermediate_bytes;
-    assert_eq!(peak, 668_172, "the statement's peak under the fixed charge");
+    assert_eq!(peak, 659_920, "the statement's peak under the fixed charge");
 
     let rows = executor(&store, SqlConfig::default().max_query_bytes)
         .execute(t.hash(), &request("SELECT region, attrs FROM logs"))
