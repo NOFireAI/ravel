@@ -1500,6 +1500,28 @@ the query, tenant and process budgets until the stream's consumer unregisters;
 every other shrink of a migrated stream is forwarded at once
 (`crates/ravel-sql/tests/aggregate_emit_reservation.rs`).
 
+The migrated streams grow their reservation only after `aggregate_batch` has
+grown the group table and the accumulator `Vec`s, and ask for less than
+those allocations hold, so the pool charges a consumer named
+`PartialHashAggregateStream[..]`, `FinalHashAggregateStream[..]` or
+`SingleHashAggregateStream[..]` ahead of what it asks for
+(`SqlConfig::aggregate_reserve_ahead`, issue #3181). Every grow and shrink
+is charged at 1.25 times the bytes asked on the query, tenant and process
+budgets, so a query's peak intermediate bytes and its ceiling checks read
+the charged figure. While a stream builds, until its first shrink, the
+process budget also reserves an envelope for its next doubling: 2.43 times
+its asked size while that is under 8 MiB, else the smaller of that and 5
+times its largest single grow. Only the largest `min(available parallelism,
+SQL partition count)` envelopes on a budget are reserved, and none is in a
+query or tenant figure; `ravel_sql::sql_memory_aggregate_envelope_bytes()`
+returns the bytes they hold across the process, and no metric renders it
+yet. A grow whose envelope the process budget cannot hold is refused with
+`ResourcesExhausted` before it is charged. `AggregateReserveAhead::OFF`
+charges every consumer one to one. ADR-1170's reserve-ahead amendment has
+the derivation; `crates/ravel-sql/tests/group_by_reservation_lag.rs`
+measures what live memory still leads the charge by, before a stream's
+first reservation and while it emits.
+
 Those slices share the materialized batch's buffers, and
 `RecordBatch::get_array_memory_size` reports every buffer an array
 references in full, so each slice reports the size of the whole output. A

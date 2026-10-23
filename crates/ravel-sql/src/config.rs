@@ -100,6 +100,9 @@ pub const GROUP_VALUES_CEILING_COMPENSATION: f64 =
 /// sizing an aggregate stage against the memory budget must compare the budget
 /// to this, not to the raw `size()`, or a table that reports fitting will in
 /// fact allocate up to 1.83x that and overrun (issue #740, findings 2 and 3).
+///
+/// The SQL pool does not call it: the pool charges the migrated aggregate
+/// streams ahead of what they ask for instead ([`AggregateReserveAhead`]).
 pub fn compensated_group_values_ceiling(reported_size: usize) -> usize {
     ((reported_size as f64) * GROUP_VALUES_CEILING_COMPENSATION).ceil() as usize
         + GROUP_VALUES_FIXED_OVERHEAD_CEILING

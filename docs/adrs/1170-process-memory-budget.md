@@ -160,11 +160,15 @@ counter, because its two consumers account differently:
   exception, see the aggregate hold amendment below, which the DataFusion
   55.2 hold amendment below narrows to the legacy aggregate stream and the
   last-release hold amendment below extends to the migrated final and
-  single-stage streams' shrink to zero); the
+  single-stage streams' shrink to zero; the migrated aggregate streams are
+  charged a factor above what they ask for, and the process counter alone
+  carries an envelope for their next doubling, see the reserve-ahead
+  amendment below); the
   adapter forwards
   each of those to the
   process counter with the same delta, in the same order, so process-level
-  bytes track SQL bytes exactly: tenant then process on the way up, process
+  bytes track SQL bytes exactly (apart from the envelope, per the reserve-ahead
+  amendment): tenant then process on the way up, process
   then tenant on the way down, and a refusal at either level rolls the other
   back before surfacing as `ResourcesExhausted`. No guard is held across a
   query; the counters are the ledger, as they are today.
@@ -1413,3 +1417,64 @@ in `crates/ravel-sql/tests/aggregate_emit_reservation.rs` pins it through
 the production pool: after a `GROUP BY` planned with a final aggregate has
 returned its last batch, the pool still reserves at least that batch's
 bytes, and it returns to zero once the batch and the stream drop.
+
+## Amendment (2026-10-23, #3181): the migrated aggregate streams are charged ahead of what they ask for
+
+<!-- amendment-applies: sections="1. `MemoryBudget`, a process-wide accountant" pointer="reserve-ahead amendment" -->
+
+Decision 1 has `TenantDelegatingPool` forward every DataFusion `grow`,
+`try_grow` and `shrink` to the tenant and process counters 1:1, so process
+bytes track SQL bytes exactly. DataFusion 55.2's migrated hash aggregate
+streams grow their reservation only after `aggregate_batch` has already
+grown the group table and the accumulator `Vec`s, and ask for less than
+those allocations hold, so a 1:1 forward leaves the doubling in flight on no
+ledger. In `crates/ravel-sql/tests/group_by_reservation_lag.rs` the
+32-partition string-key `COUNT(*)` row's live bytes led the pool's reserved
+figure by 84.6-94.7 MiB in five runs on DataFusion 54.1, and led reserved
+plus envelope by 5.8-12.2 MiB in three runs on DataFusion 55.2 with this
+amendment.
+
+For consumers named `PartialHashAggregateStream[..]`,
+`FinalHashAggregateStream[..]` or `SingleHashAggregateStream[..]`, the pool
+now forwards two things that differ from decision 1
+(`AggregateReserveAhead` in `crates/ravel-sql/src/memory.rs`, set by
+`SqlConfig::aggregate_reserve_ahead`):
+
+- Every grow and shrink is charged at `undercount_factor` (default 1.25)
+  times the bytes asked, on the query, tenant and process counters alike, so
+  those three still move together and still roll back together.
+- While a consumer builds, until its first shrink, it carries an envelope
+  for its next doubling: `envelope_size_factor x S` (default 2.43) while its
+  asked size `S` is under 8 MiB, else the smaller of that and
+  `envelope_multiplier x J_max` (default 5), where `J_max` is its largest
+  single grow. The next block of whichever structure doubles next is at most
+  4 x `J_max` (a `Vec` realloc that moves) or 4.86 x `J_max` (a hashbrown
+  rehash with the old table live). Only the `W` largest envelopes charged
+  to one `MemoryBudget` are reserved, on that process counter alone, where
+  `W` is `min(available_parallelism, SQL partition count)` of the first pool
+  that reserves an envelope on it: at most that many streams run
+  `aggregate_batch` at once. The envelope is in no query or tenant figure,
+  so the process counter now reads above the sum of the tenant counters by
+  the envelope bytes, which `ravel_sql::sql_memory_aggregate_envelope_bytes()`
+  returns.
+
+A checked grow moves the envelope first: a doubling the process budget
+cannot hold is refused as `ResourcesExhausted` before any counter is charged
+for it, and a charge the query or tenant ceiling then refuses puts the
+envelope back. The envelope is released at the consumer's first shrink, when
+it unregisters, and when its pool drops. `AggregateReserveAhead::OFF`
+restores decision 1's 1:1 forwarding for every consumer; a value that fails
+`AggregateReserveAhead::validate` is replaced by the default with a warning.
+The legacy `GroupedHashAggregateStream` and every other consumer are
+forwarded as before.
+
+The unit tests in `crates/ravel-sql/src/memory.rs` pin the arithmetic and
+the ledgers: `the_envelope_is_five_times_the_largest_step_and_covers_both_doublings`,
+`a_consumer_under_eight_mebibytes_carries_the_size_bound`,
+`only_the_w_largest_envelopes_in_the_process_are_on_the_budget`,
+`a_doubling_that_does_not_fit_the_budget_is_refused_before_it_is_made`,
+`the_envelope_is_released_at_the_first_shrink_and_at_unregister`,
+`a_pool_dropped_mid_build_releases_its_envelopes` and
+`the_opt_out_charges_every_consumer_one_to_one`. The ignored matrix in
+`crates/ravel-sql/tests/group_by_reservation_lag.rs` measures what is left:
+the gap between live bytes and the pool's reserved figure plus the envelope.
