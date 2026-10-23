@@ -1,0 +1,766 @@
+diff --git a/crates/ravel-bench/src/sql_latency.rs b/crates/ravel-bench/src/sql_latency.rs
+index 844e26902..cc447e903 100644
+--- a/crates/ravel-bench/src/sql_latency.rs
++++ b/crates/ravel-bench/src/sql_latency.rs
+@@ -1999,8 +1999,7 @@ pub async fn measure_corpus(
+         };
+ 
+         for run in 0..runs {
+-            // Taken here, after the EXPLAIN side artifact above, so a plan
+-            // written for `--explain-dir` is not charged to run 0.
++            ravel_cache::trace::emit("-", "RUN", &(run + 1).to_string(), "-", "-", &entry.id);
+             let probe_misses_before = probe_misses.snapshot();
+             let wire_bytes_before = wire_bytes.snapshot();
+             let cpu_before = process_cpu_ns();
+@@ -2037,9 +2036,17 @@ pub async fn measure_corpus(
+             // reads only or still fetches objects, and that is unreadable from
+             // the cold figures alone (issue #767).
+             let acc = &outcome.accounting;
+-            // #883: this run's share of an accumulating counter. The GETs a miss
+-            // costs are already in `object_store_get_requests` above; this says
+-            // how many of them the probe window is responsible for.
++            ravel_cache::trace::emit(
++                "-",
++                "RUNEND",
++                &(run + 1).to_string(),
++                "-",
++                "-",
++                &format!(
++                    "cache_hits={} cache_misses={} cache_bytes={}",
++                    acc.cache_hits, acc.cache_misses, acc.cache_bytes
++                ),
++            );
+             let run_probe_misses = probe_misses.snapshot().saturating_sub(&probe_misses_before);
+             // #913: this run's WIRE bytes per phase, and the amplification they
+             // and the run's STORED decoded page bytes form.
+diff --git a/crates/ravel-cache/src/cache.rs b/crates/ravel-cache/src/cache.rs
+index cc5515642..0bd57c2e1 100644
+--- a/crates/ravel-cache/src/cache.rs
++++ b/crates/ravel-cache/src/cache.rs
+@@ -83,6 +83,7 @@ struct CacheEntry {
+ /// sweeper never keeps the tier alive, so dropping the [`Cache`] frees this
+ /// state and the next tick sees a dead `Weak` and exits (see [`spawn_sweeper`]).
+ struct Inner {
++    trace_id: u64,
+     fifo: Mutex<S3Fifo<CacheEntry>>,
+     metrics: Arc<CacheMetrics>,
+     limits: CacheLimits,
+@@ -135,8 +136,23 @@ where
+     /// original signature so `ravel-query`/`ravel-server` callers compile
+     /// unchanged.
+     pub fn new_with_clock(limits: CacheLimits, clock: Arc<dyn Clock>) -> Self {
++        let trace_id = crate::trace::next_id();
++        let mut fifo = S3Fifo::new(limits);
++        fifo.trace_id = trace_id;
++        crate::trace::emit(
++            &format!("C{trace_id}"),
++            "new",
++            "-",
++            "-",
++            "-",
++            &format!(
++                "max_bytes={} max_entries={} max_entry_bytes={}",
++                limits.max_bytes, limits.max_entries, limits.max_entry_bytes
++            ),
++        );
+         let inner = Arc::new(Inner {
+-            fifo: Mutex::new(S3Fifo::new(limits)),
++            trace_id,
++            fifo: Mutex::new(fifo),
+             metrics: Arc::new(CacheMetrics::default()),
+             limits,
+             clock,
+@@ -222,7 +238,16 @@ where
+     /// [`get`](Self::get) already accounted this request. Unlike
+     /// [`peek_uncounted`](Self::peek_uncounted) it skips the corruption gate.
+     pub(crate) fn get_uncounted(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
+-        self.inner.lookup(key, intent)
++        let got = self.inner.lookup(key, intent);
++        crate::trace::emit_key(
++            self.inner.trace_id,
++            "get_uncounted",
++            key,
++            Some(intent),
++            if got.is_some() { "hit" } else { "miss" },
++            "",
++        );
++        got
+     }
+ 
+     /// Look up `key` without fetching and without recording a hit or a miss,
+@@ -241,9 +266,16 @@ where
+         key: &CacheKey,
+         intent: AccessIntent,
+     ) -> Option<Bytes> {
+-        self.inner
+-            .lookup(key, intent)
+-            .map(|bytes| self.maybe_corrupt(bytes))
++        let got = self.inner.lookup(key, intent);
++        crate::trace::emit_key(
++            self.inner.trace_id,
++            "peek_uncounted",
++            key,
++            Some(intent),
++            if got.is_some() { "hit" } else { "miss" },
++            "",
++        );
++        got.map(|bytes| self.maybe_corrupt(bytes))
+     }
+ 
+     /// Admit `value` under `key`. Not an error, and a no-op on the
+@@ -273,6 +305,14 @@ where
+     /// One it accepts is copied with the cache unlocked, so interactive reads
+     /// do not wait on the copy.
+     pub fn insert_with_intent(&self, key: CacheKey, value: Bytes, intent: AccessIntent) {
++        crate::trace::emit_key(
++            self.inner.trace_id,
++            "insert",
++            &key,
++            Some(intent),
++            "-",
++            &format!("size={}", value.len()),
++        );
+         self.inner.insert(key, value, intent);
+     }
+ 
+@@ -281,6 +321,14 @@ where
+     /// size limit), so an admitting caller that also serves the bytes need not
+     /// hold a second handle to `value` across the admission and force a copy.
+     pub(crate) fn admit(&self, key: CacheKey, value: Bytes, intent: AccessIntent) -> Bytes {
++        crate::trace::emit_key(
++            self.inner.trace_id,
++            "admit",
++            &key,
++            Some(intent),
++            "-",
++            &format!("size={}", value.len()),
++        );
+         self.inner.insert(key, value, intent)
+     }
+ 
+@@ -405,7 +453,16 @@ where
+         let (result, role) = self
+             .single_flight
+             .run(key, move || async move {
+-                if let Some(bytes) = self.inner.lookup(&key, intent) {
++                let recheck = self.inner.lookup(&key, intent);
++                crate::trace::emit_key(
++                    self.inner.trace_id,
++                    "sf_leader_recheck",
++                    &key,
++                    Some(intent),
++                    if recheck.is_some() { "hit" } else { "miss" },
++                    "",
++                );
++                if let Some(bytes) = recheck {
+                     return Ok((bytes, true));
+                 }
+                 let bytes = self.admit(key, fetch().await?, intent);
+@@ -421,6 +478,22 @@ where
+         } else {
+             ReadOutcome::LateServe
+         };
++        crate::trace::emit_key(
++            self.inner.trace_id,
++            "get_or_fetch",
++            &key,
++            Some(intent),
++            if outcome == ReadOutcome::Fetched {
++                "fetched"
++            } else {
++                "late-served"
++            },
++            &format!(
++                "role={} from_cache={from_cache} bytes={}",
++                if role == Role::Leader { "leader" } else { "follower" },
++                bytes.len()
++            ),
++        );
+         let bytes = if from_cache {
+             self.maybe_corrupt(bytes)
+         } else {
+@@ -466,7 +539,18 @@ impl Inner {
+     /// no max-age expiry counter, so an aged-out read moves the same `misses`
+     /// counter a cold miss does and nothing else.
+     fn get(&self, key: &CacheKey, intent: AccessIntent) -> Option<Bytes> {
+-        match self.lookup(key, intent) {
++        let got = self.lookup(key, intent);
++        crate::trace::emit_key(
++            self.trace_id,
++            "get",
++            key,
++            Some(intent),
++            if got.is_some() { "hit" } else { "miss" },
++            &got
++                .as_ref()
++                .map_or(String::new(), |b| format!("bytes={}", b.len())),
++        );
++        match got {
+             Some(bytes) => {
+                 self.metrics
+                     .record_hit_with_intent(intent, bytes.len() as u64);
+@@ -498,6 +582,7 @@ impl Inner {
+                 // entry is simply treated as not yet expired, mirroring the
+                 // disk tier.
+                 fifo.remove(key);
++                crate::trace::emit_key(self.trace_id, "aged_out", key, Some(intent), "-", "");
+                 None
+             }
+             Some(entry) => Some(entry.bytes),
+@@ -539,10 +624,26 @@ impl Inner {
+     ) -> Bytes {
+         let size = value.len() as u64;
+         let value = if size > self.limits.max_entry_bytes {
++            crate::trace::emit_key(
++                self.trace_id,
++                "admission",
++                &key,
++                Some(intent),
++                "declined",
++                &format!("over_size size={size}"),
++            );
+             value
+         } else if intent == AccessIntent::BulkScan {
+             let mut fifo = self.fifo.lock();
+             if !fifo.would_admit(&key, size, intent) {
++                crate::trace::emit_key(
++                    self.trace_id,
++                    "bulk_would_admit",
++                    &key,
++                    Some(intent),
++                    "declined",
++                    &format!("size={size} resident={}", fifo.contains(&key)),
++                );
+                 // Keys a window rotation evicted need no cleanup here: their
+                 // bytes drop with the entries.
+                 let _ = fifo.decline_bulk(&key, size, &self.metrics);
+diff --git a/crates/ravel-cache/src/lib.rs b/crates/ravel-cache/src/lib.rs
+index d0a8b45a1..0c7b8185e 100644
+--- a/crates/ravel-cache/src/lib.rs
++++ b/crates/ravel-cache/src/lib.rs
+@@ -107,6 +107,7 @@ mod single_flight;
+ #[cfg(test)]
+ mod test_support;
+ pub mod tiered;
++pub mod trace;
+ 
+ pub use cache::Cache;
+ pub use clock::{Clock, SystemClock};
+diff --git a/crates/ravel-cache/src/s3fifo.rs b/crates/ravel-cache/src/s3fifo.rs
+index 6f092e9f7..b28d69b36 100644
+--- a/crates/ravel-cache/src/s3fifo.rs
++++ b/crates/ravel-cache/src/s3fifo.rs
+@@ -278,6 +278,7 @@ fn splitmix64(mut z: u64) -> u64 {
+ }
+ 
+ pub(crate) struct S3Fifo<V> {
++    pub(crate) trace_id: u64,
+     entries: HashMap<CacheKey, Entry<V>>,
+     small: VecDeque<CacheKey>,
+     main: VecDeque<CacheKey>,
+@@ -323,6 +324,7 @@ impl<V: Clone> S3Fifo<V> {
+         let ghost_capacity = capacity_from_bytes.min(limits.max_entries).max(1);
+         let region_share_bytes = (limits.max_bytes as f64 * limits.effective_bulk_share()) as u64;
+         S3Fifo {
++            trace_id: 0,
+             entries: HashMap::new(),
+             small: VecDeque::new(),
+             main: VecDeque::new(),
+@@ -386,18 +388,26 @@ impl<V: Clone> S3Fifo<V> {
+         match intent {
+             AccessIntent::Interactive => (self.hit_interactive(key), Vec::new()),
+             AccessIntent::BulkScan => self.hit_bulk(key, metrics),
+-            AccessIntent::Maintenance => (
+-                self.entries.get(key).map(|entry| entry.value.clone()),
+-                Vec::new(),
+-            ),
++            AccessIntent::Maintenance => {
++                let got = self.entries.get(key);
++                if let Some(entry) = got {
++                    let extra = format!("freq={} queue={}", entry.freq, self.queue_of(key));
++                    self.t("fifo_hit", key, "maintenance", &extra);
++                }
++                (got.map(|entry| entry.value.clone()), Vec::new())
++            }
+         }
+     }
+ 
+     fn hit_interactive(&mut self, key: &CacheKey) -> Option<V> {
++        let queue = self.queue_of(key);
++        let trace_id = self.trace_id;
+         let entry = self.entries.get_mut(key)?;
+         entry.freq = entry.freq.saturating_add(1).min(MAX_FREQ);
+         let value = entry.value.clone();
++        let extra = format!("freq_after={} queue={queue}", entry.freq);
+         if entry.bulk {
++            crate::trace::emit_key(trace_id, "fifo_hit", key, None, "interactive", &format!("{extra} moved=bulk_to_small"));
+             // An interactive read of a region entry: it joins the small
+             // queue with this hit counted, as if admitted interactively and
+             // read once since.
+@@ -407,16 +417,54 @@ impl<V: Clone> S3Fifo<V> {
+             self.region.bytes -= size;
+             self.small.push_back(*key);
+             self.small_bytes += size;
++        } else {
++            crate::trace::emit_key(trace_id, "fifo_hit", key, None, "interactive", &extra);
+         }
+         Some(value)
+     }
+ 
++    fn queue_of(&self, key: &CacheKey) -> &'static str {
++        if !crate::trace::enabled() {
++            return "";
++        }
++        match self.entries.get(key) {
++            None => "absent",
++            Some(e) if e.bulk => "bulk",
++            Some(_) if self.small.contains(key) => "small",
++            Some(_) if self.main.contains(key) => "main",
++            Some(_) => "unqueued",
++        }
++    }
++
++    fn t(&self, op: &str, key: &CacheKey, outcome: &str, extra: &str) {
++        crate::trace::emit_key(self.trace_id, op, key, None, outcome, extra);
++    }
++
++    fn occupancy(&self) -> String {
++        if !crate::trace::enabled() {
++            return String::new();
++        }
++        format!(
++            "small={}/{}B main={}/{}B region={}/{}B ghost={}/{}",
++            self.small.len(),
++            self.small_bytes,
++            self.main.len(),
++            self.main_bytes,
++            self.region.by_rank.len(),
++            self.region.bytes,
++            self.ghost.len(),
++            self.ghost_capacity
++        )
++    }
++
+     fn hit_bulk(&mut self, key: &CacheKey, metrics: &CacheMetrics) -> (Option<V>, Vec<CacheKey>) {
+         let Some(entry) = self.entries.get(key) else {
+             return (None, Vec::new());
+         };
+         let value = entry.value.clone();
+         let size = entry.size;
++        let extra = format!("freq={} queue={}", entry.freq, self.queue_of(key));
++        self.t("fifo_hit", key, "bulk", &extra);
+         let mut evicted = Vec::new();
+         if self.region.tenants.contains_key(&key.tenant_hash) {
+             self.observe_bulk(key, rank_of(key), size, metrics, &mut evicted);
+@@ -468,11 +516,12 @@ impl<V: Clone> S3Fifo<V> {
+     ) -> (bool, Vec<CacheKey>) {
+         if size > self.limits.max_entry_bytes {
+             metrics.record_rejected_size();
++            self.t("fifo_admit", &key, "rejected_size", &format!("size={size}"));
+             return (false, Vec::new());
+         }
+         if self.entries.contains_key(&key) {
+-            // Content-addressed: an existing entry for this key is
+-            // already these exact bytes. Leave its queue position alone.
++            let extra = format!("size={size} queue={}", self.queue_of(&key));
++            self.t("fifo_admit", &key, "already_resident", &extra);
+             return (true, Vec::new());
+         }
+         if intent == AccessIntent::BulkScan {
+@@ -482,7 +531,8 @@ impl<V: Clone> S3Fifo<V> {
+         let Some(value) = make() else {
+             return (false, Vec::new());
+         };
+-        let promote_to_main = self.forget_ghost(&key) && intent == AccessIntent::Interactive;
++        let was_ghost = self.forget_ghost(&key);
++        let promote_to_main = was_ghost && intent == AccessIntent::Interactive;
+ 
+         self.entries.insert(key, Entry::interactive(value, size));
+         if promote_to_main {
+@@ -493,6 +543,21 @@ impl<V: Clone> S3Fifo<V> {
+             self.small_bytes += size;
+         }
+         metrics.record_admission(size);
++        let extra = format!(
++            "size={size} intent={} was_ghost={was_ghost} {}",
++            crate::trace::intent_str(intent),
++            self.occupancy()
++        );
++        self.t(
++            "fifo_admit",
++            &key,
++            if promote_to_main {
++                "main_via_ghost"
++            } else {
++                "small"
++            },
++            &extra,
++        );
+ 
+         let evicted = self.evict_to_bounds(metrics);
+         (true, evicted)
+@@ -552,6 +617,7 @@ impl<V: Clone> S3Fifo<V> {
+         {
+             self.observe_bulk(key, rank_of(key), size, metrics, &mut evicted);
+         }
++        self.t("fifo_admit", key, "bulk_declined_precheck", &format!("size={size}"));
+         evicted
+     }
+ 
+@@ -580,12 +646,12 @@ impl<V: Clone> S3Fifo<V> {
+         if !self.region.tenants.contains_key(&key.tenant_hash)
+             && !self.track_tenant(key.tenant_hash, metrics, &mut evicted)
+         {
++            self.t("fifo_admit", &key, "bulk_declined_no_tenant", "");
+             return (false, evicted);
+         }
+         self.observe_bulk(&key, rank, size, metrics, &mut evicted);
+-        // A rank already held by another key is a 64-bit collision; the
+-        // newcomer is simply not cached.
+         if self.region.by_rank.contains_key(&rank) || u128::from(rank) >= self.bulk_rank_bound() {
++            self.t("fifo_admit", &key, "bulk_declined_rank", &format!("size={size}"));
+             return (false, evicted);
+         }
+         while !self.bulk_fits(size) {
+@@ -607,6 +673,7 @@ impl<V: Clone> S3Fifo<V> {
+                 }
+                 continue;
+             }
++            self.t("fifo_admit", &key, "bulk_declined_room", &format!("size={size}"));
+             return (false, evicted);
+         }
+         let Some(value) = make() else {
+@@ -631,6 +698,8 @@ impl<V: Clone> S3Fifo<V> {
+         self.region.by_rank.insert(rank, key);
+         self.region.bytes += size;
+         metrics.record_admission(size);
++        let extra = format!("size={size} {}", self.occupancy());
++        self.t("fifo_admit", &key, "bulk_region", &extra);
+         (true, evicted)
+     }
+ 
+@@ -919,6 +988,7 @@ impl<V: Clone> S3Fifo<V> {
+         if let Some(entry) = self.entries.remove(&key) {
+             self.region.bytes -= entry.size;
+             metrics.record_eviction();
++            self.t("fifo_evict_bulk", &key, "dropped", &format!("size={}", entry.size));
+         }
+     }
+ 
+@@ -954,9 +1024,11 @@ impl<V: Clone> S3Fifo<V> {
+     /// (e.g. the backing file failed to open or verify), not for ordinary
+     /// capacity-driven eviction.
+     pub(crate) fn remove(&mut self, key: &CacheKey) -> bool {
++        let queue = self.queue_of(key);
+         let Some(entry) = self.entries.remove(key) else {
+             return false;
+         };
++        self.t("fifo_remove", key, "removed", &format!("queue={queue}"));
+         if entry.bulk {
+             self.region.by_rank.remove(&rank_of(key));
+             self.region.bytes -= entry.size;
+@@ -1034,18 +1106,27 @@ impl<V: Clone> S3Fifo<V> {
+         let size = entry.size;
+         self.small_bytes -= size;
+         if entry.freq > 0 {
++            let freq = entry.freq;
+             self.entries
+                 .insert(key, Entry::interactive(entry.value, size));
+             self.main.push_back(key);
+             self.main_bytes += size;
++            self.t(
++                "fifo_evict_small",
++                &key,
++                "to_main",
++                &format!("size={size} freq={freq}"),
++            );
+             Step::Skipped
+         } else {
+             metrics.record_eviction();
+             self.ghost.push_back(key);
+             self.ghost_set.insert(key);
++            self.t("fifo_evict_small", &key, "to_ghost", &format!("size={size}"));
+             while self.ghost.len() > self.ghost_capacity {
+                 if let Some(oldest) = self.ghost.pop_front() {
+                     self.ghost_set.remove(&oldest);
++                    self.t("fifo_ghost_drop", &oldest, "dropped", "");
+                 }
+             }
+             Step::Evicted(key)
+@@ -1067,12 +1148,19 @@ impl<V: Clone> S3Fifo<V> {
+             };
+             if entry.freq > 0 {
+                 entry.freq -= 1;
++                self.t(
++                    "fifo_evict_main",
++                    &key,
++                    "reinserted",
++                    &format!("freq_after={}", entry.freq),
++                );
+                 self.entries.insert(key, entry);
+                 self.main.push_back(key);
+                 continue;
+             }
+             self.main_bytes -= entry.size;
+             metrics.record_eviction();
++            self.t("fifo_evict_main", &key, "dropped", &format!("size={}", entry.size));
+             return Step::Evicted(key);
+         }
+     }
+diff --git a/crates/ravel-cache/src/tiered.rs b/crates/ravel-cache/src/tiered.rs
+index f52822cfb..7d674c6de 100644
+--- a/crates/ravel-cache/src/tiered.rs
++++ b/crates/ravel-cache/src/tiered.rs
+@@ -402,14 +402,20 @@ where
+             Err(err) => return Err(err),
+         };
+         if role == Role::Follower {
+-            // A follower rode the leader's single disk consult / upstream
+-            // fetch: count the collapse on the same counter the RAM tier uses,
+-            // feeding ADR-0046's single-flight-collapse SLI.
+             self.ram.metrics().record_collapse();
+         }
++        let outcome = served.outcome(role);
++        crate::trace::emit_key(
++            0,
++            "tiered_get_or_fetch",
++            &key,
++            Some(intent),
++            &format!("{outcome:?}"),
++            &format!("follower={}", role == Role::Follower),
++        );
+         Ok((
+             self.maybe_corrupt(bytes, served.is_cache_served()),
+-            served.outcome(role),
++            outcome,
+         ))
+     }
+ 
+diff --git a/crates/ravel-cache/src/trace.rs b/crates/ravel-cache/src/trace.rs
+new file mode 100644
+index 000000000..f7871550d
+--- /dev/null
++++ b/crates/ravel-cache/src/trace.rs
+@@ -0,0 +1,86 @@
++//! Diagnostic access trace (#3192), gated on `RAVEL_CACHE_TRACE=<file>`.
++//! One tab-separated line per event: seq, cache, op, key, intent, outcome,
++//! extra.
++
++use std::fs::File;
++use std::io::Write;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock};
++
++use crate::AccessIntent;
++use crate::key::CacheKey;
++
++static SINK: OnceLock<Option<Mutex<(u64, File)>>> = OnceLock::new();
++static NEXT_ID: AtomicU64 = AtomicU64::new(1);
++
++fn sink() -> Option<&'static Mutex<(u64, File)>> {
++    SINK.get_or_init(|| {
++        let path = std::env::var_os("RAVEL_CACHE_TRACE")?;
++        let file = std::fs::OpenOptions::new()
++            .create(true)
++            .append(true)
++            .open(path)
++            .ok()?;
++        Some(Mutex::new((0, file)))
++    })
++    .as_ref()
++}
++
++pub fn enabled() -> bool {
++    sink().is_some()
++}
++
++pub fn next_id() -> u64 {
++    NEXT_ID.fetch_add(1, Ordering::Relaxed)
++}
++
++pub fn key_str(key: &CacheKey) -> String {
++    let mut s = String::with_capacity(40);
++    for b in &key.content_hash[..8] {
++        s.push_str(&format!("{b:02x}"));
++    }
++    format!("{s}:{}:{}", key.offset, key.len)
++}
++
++pub fn intent_str(intent: AccessIntent) -> &'static str {
++    match intent {
++        AccessIntent::Interactive => "interactive",
++        AccessIntent::BulkScan => "bulk",
++        AccessIntent::Maintenance => "maintenance",
++    }
++}
++
++pub fn emit(cache: &str, op: &str, key: &str, intent: &str, outcome: &str, extra: &str) {
++    let Some(sink) = sink() else {
++        return;
++    };
++    if let Ok(mut guard) = sink.lock() {
++        guard.0 += 1;
++        let line = format!(
++            "{}\t{cache}\t{op}\t{key}\t{intent}\t{outcome}\t{extra}\n",
++            guard.0
++        );
++        let _ = guard.1.write_all(line.as_bytes());
++    }
++}
++
++pub fn emit_key(
++    cache: u64,
++    op: &str,
++    key: &CacheKey,
++    intent: Option<AccessIntent>,
++    outcome: &str,
++    extra: &str,
++) {
++    if !enabled() {
++        return;
++    }
++    emit(
++        &format!("C{cache}"),
++        op,
++        &key_str(key),
++        intent.map_or("-", intent_str),
++        outcome,
++        extra,
++    );
++}
+diff --git a/crates/ravel-catalog/src/cache.rs b/crates/ravel-catalog/src/cache.rs
+index c89ff2a92..4cb98f547 100644
+--- a/crates/ravel-catalog/src/cache.rs
++++ b/crates/ravel-catalog/src/cache.rs
+@@ -200,6 +200,14 @@ impl RecordCache {
+             .lock()
+             .get_mut(tenant)
+             .and_then(|c| c.touch(key));
++        ravel_cache::trace::emit(
++            "cat:RecordCache",
++            "get",
++            key,
++            "-",
++            if hit.is_some() { "hit" } else { "miss" },
++            &hit.as_ref().map_or(String::new(), |h| format!("bytes={}", h.1)),
++        );
+         match hit {
+             Some((record, bytes)) => {
+                 accounting.record_cache_hit();
+@@ -448,6 +456,14 @@ impl CompactionRecordCache {
+             .get(tenant)
+             .and_then(|c| c.entries.get(key))
+             .map(|entry| (entry.record.clone(), entry.bytes));
++        ravel_cache::trace::emit(
++            "cat:CompactionRecordCache",
++            "get",
++            key,
++            "-",
++            if hit.is_some() { "hit" } else { "miss" },
++            &hit.as_ref().map_or(String::new(), |h| format!("bytes={}", h.1)),
++        );
+         match hit {
+             Some((record, bytes)) => {
+                 accounting.record_cache_hit();
+@@ -636,6 +652,14 @@ impl HeadCache {
+                 .then(|| (entry.head.clone(), entry.bytes))
+         });
+         drop(state);
++        ravel_cache::trace::emit(
++            "cat:HeadCache",
++            "get",
++            &format!("{signal:?}"),
++            "-",
++            if fresh.is_some() { "hit" } else { "miss" },
++            &fresh.as_ref().map_or(String::new(), |h| format!("bytes={}", h.1)),
++        );
+         match fresh {
+             Some((head, bytes)) => {
+                 accounting.record_cache_hit();
+@@ -914,6 +938,14 @@ impl<V> DecodedCache<V> {
+             .lock()
+             .get_mut(tenant)
+             .and_then(|c| c.touch(key, tick));
++        ravel_cache::trace::emit(
++            &format!("cat:DecodedCache<{}>", std::any::type_name::<V>()),
++            "get",
++            key,
++            "-",
++            if hit.is_some() { "hit" } else { "miss" },
++            &hit.as_ref().map_or(String::new(), |h| format!("bytes={}", h.1)),
++        );
+         match hit {
+             Some((value, bytes)) => {
+                 accounting.record_cache_hit();
+diff --git a/crates/ravel-query/src/log_fetcher.rs b/crates/ravel-query/src/log_fetcher.rs
+index c6895d8f0..9cda1485a 100644
+--- a/crates/ravel-query/src/log_fetcher.rs
++++ b/crates/ravel-query/src/log_fetcher.rs
+@@ -3473,6 +3473,7 @@ impl LogSegmentFetcher {
+         match outcome {
+             ReadOutcome::Hit => {
+                 accounting.record_cache_hit();
++                ravel_cache::trace::emit("acct", "hit", &ravel_cache::trace::key_str(&cache_key), "-", "whole", "");
+                 accounting.add_cache_bytes(bytes.len() as u64);
+                 // Served from cache: no S3 GET on this call.
+                 fetch_span.record("s3_requests", 0u64);
+@@ -3491,6 +3492,7 @@ impl LogSegmentFetcher {
+             // no S3 cost. Its bytes are the cache entry's, as on a hit.
+             ReadOutcome::LateServe => {
+                 accounting.record_cache_miss();
++                ravel_cache::trace::emit("acct", "miss", &ravel_cache::trace::key_str(&cache_key), "-", "whole_lateserve", "");
+                 fetch_span.record("s3_requests", 0u64);
+                 fetch_span.record("s3_bytes", 0u64);
+                 reservation.mark_handed_off();
+@@ -3498,6 +3500,7 @@ impl LogSegmentFetcher {
+             // This call's own store GET produced the bytes.
+             ReadOutcome::Fetched => {
+                 accounting.record_cache_miss();
++                ravel_cache::trace::emit("acct", "miss", &ravel_cache::trace::key_str(&cache_key), "-", "whole_fetched", "");
+                 fetch_span.record("s3_requests", 1u64);
+                 fetch_span.record("s3_bytes", bytes.len() as u64);
+                 // The fetched buffer was just offered to the read cache, which
+@@ -5624,9 +5627,10 @@ impl BlockRangeFetcher {
+         match outcome {
+             ReadOutcome::Hit => {
+                 accounting.record_cache_hit();
++                ravel_cache::trace::emit("acct", "hit", &ravel_cache::trace::key_str(&cache_key), "-", "extent", "");
+                 accounting.add_cache_bytes(bytes.len() as u64);
+             }
+-            ReadOutcome::Fetched | ReadOutcome::LateServe => accounting.record_cache_miss(),
++            ReadOutcome::Fetched | ReadOutcome::LateServe => { ravel_cache::trace::emit("acct", "miss", &ravel_cache::trace::key_str(&cache_key), "-", "extent", &format!("{outcome:?}")); accounting.record_cache_miss() }
+         }
+         Ok((bytes, outcome))
+     }
+@@ -7948,6 +7952,7 @@ impl BlockRangeFetcher {
+                     CacheKey::new(tenant_hash.0, seg_ref.content_hash, desc.offset, desc.len);
+                 if let Some(bytes) = cache.get(&cache_key, accounting.access_intent()).await {
+                     accounting.record_cache_hit();
++                ravel_cache::trace::emit("acct", "hit", &ravel_cache::trace::key_str(&cache_key), "-", "front_section_peek", "");
+                     accounting.add_cache_bytes(bytes.len() as u64);
+                     let reservation = self.reserve_fetch(bytes.len() as u64)?;
+                     self.hold_placement(asm, reservation);
+@@ -7955,6 +7960,7 @@ impl BlockRangeFetcher {
+                     continue;
+                 }
+             }
++            if self.cache.is_some() { ravel_cache::trace::emit("acct", "none", &ravel_cache::trace::key_str(&CacheKey::new(tenant_hash.0, seg_ref.content_hash, desc.offset, desc.len)), "-", "front_section_peek_miss_uncounted", ""); }
+             missing.push(*desc);
+         }
+         if missing.is_empty() {
+@@ -8156,6 +8162,7 @@ impl BlockRangeFetcher {
+                 // as a live fetch of that block is, and fails closed on mismatch.
+                 verify_block_crc(key, &bytes, ext)?;
+                 accounting.record_cache_hit();
++                ravel_cache::trace::emit("acct", "hit", &ravel_cache::trace::key_str(&cache_key), "-", "block_peek", "");
+                 accounting.add_cache_bytes(bytes.len() as u64);
+                 stats.block_cache_hits += 1;
+                 let reservation = self.reserve_fetch(bytes.len() as u64)?;
+@@ -8165,6 +8172,7 @@ impl BlockRangeFetcher {
+             }
+             if self.cache.is_some() {
+                 accounting.record_cache_miss();
++                ravel_cache::trace::emit("acct", "miss", &ravel_cache::trace::key_str(&cache_key), "-", "block_peek", "");
+             }
+             missing.push(*ext);
+         }

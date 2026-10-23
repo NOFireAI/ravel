@@ -1,0 +1,874 @@
+1	C1	new	-	-	-	max_bytes=536870912 max_entries=512 max_entry_bytes=268435456
+2	cat:HeadCache	get	Logs	-	miss	
+3	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000001.cmt	-	miss	
+4	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000002.cmt	-	miss	
+5	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000003.cmt	-	miss	
+6	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000004.cmt	-	miss	
+7	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000005.cmt	-	miss	
+8	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000006.cmt	-	miss	
+9	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000007.cmt	-	miss	
+10	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000008.cmt	-	miss	
+11	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000009.cmt	-	miss	
+12	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000010.cmt	-	miss	
+13	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000011.cmt	-	miss	
+14	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000012.cmt	-	miss	
+15	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000013.cmt	-	miss	
+16	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000014.cmt	-	miss	
+17	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000015.cmt	-	miss	
+18	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000016.cmt	-	miss	
+19	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000017.cmt	-	miss	
+20	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000018.cmt	-	miss	
+21	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000019.cmt	-	miss	
+22	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000020.cmt	-	miss	
+23	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000021.cmt	-	miss	
+24	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000022.cmt	-	miss	
+25	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000023.cmt	-	miss	
+26	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000024.cmt	-	miss	
+27	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000025.cmt	-	miss	
+28	C2	new	-	-	-	max_bytes=1044922 max_entries=255 max_entry_bytes=1044922
+29	C3	new	-	-	-	max_bytes=536870912 max_entries=512 max_entry_bytes=268435456
+30	-	RUN	1	-	-	typed_duration_threshold_count
+31	cat:HeadCache	get	Logs	-	miss	
+32	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000001.cmt	-	miss	
+33	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000002.cmt	-	miss	
+34	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000003.cmt	-	miss	
+35	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000004.cmt	-	miss	
+36	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000005.cmt	-	miss	
+37	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000006.cmt	-	miss	
+38	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000007.cmt	-	miss	
+39	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000008.cmt	-	miss	
+40	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000009.cmt	-	miss	
+41	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000010.cmt	-	miss	
+42	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000011.cmt	-	miss	
+43	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000012.cmt	-	miss	
+44	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000013.cmt	-	miss	
+45	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000014.cmt	-	miss	
+46	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000015.cmt	-	miss	
+47	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000016.cmt	-	miss	
+48	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000017.cmt	-	miss	
+49	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000018.cmt	-	miss	
+50	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000019.cmt	-	miss	
+51	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000020.cmt	-	miss	
+52	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000021.cmt	-	miss	
+53	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000022.cmt	-	miss	
+54	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000023.cmt	-	miss	
+55	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000024.cmt	-	miss	
+56	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000025.cmt	-	miss	
+57	C2	get	648c733c62be88f7:0:84554	interactive	miss	
+58	C2	sf_leader_recheck	648c733c62be88f7:0:84554	interactive	miss	
+59	C2	get	e33c5cf50d923622:0:84364	interactive	miss	
+60	C2	sf_leader_recheck	e33c5cf50d923622:0:84364	interactive	miss	
+61	C2	get	aa08c189bc2251fe:0:81870	interactive	miss	
+62	C2	get	b0a6f754e7dc4e75:0:82527	interactive	miss	
+63	C2	get	32297dbf15e711fe:0:85060	interactive	miss	
+64	C2	sf_leader_recheck	32297dbf15e711fe:0:85060	interactive	miss	
+65	C2	get	9734b16e68fb5a36:0:84581	interactive	miss	
+66	C2	sf_leader_recheck	9734b16e68fb5a36:0:84581	interactive	miss	
+67	C2	sf_leader_recheck	b0a6f754e7dc4e75:0:82527	interactive	miss	
+68	C2	get	a06c804b9bd0840e:0:82023	interactive	miss	
+69	C2	sf_leader_recheck	a06c804b9bd0840e:0:82023	interactive	miss	
+70	C2	sf_leader_recheck	aa08c189bc2251fe:0:81870	interactive	miss	
+71	C2	admit	e33c5cf50d923622:0:84364	interactive	-	size=84364
+72	C2	fifo_admit	e33c5cf50d923622:0:84364	-	small	size=84364 intent=interactive was_ghost=false small=1/84364B main=0/0B region=0/0B ghost=0/1
+73	C2	get_or_fetch	e33c5cf50d923622:0:84364	interactive	fetched	role=leader from_cache=false bytes=84364
+74	acct	miss	e33c5cf50d923622:0:84364	-	whole_fetched	
+75	C2	admit	648c733c62be88f7:0:84554	interactive	-	size=84554
+76	C2	fifo_admit	648c733c62be88f7:0:84554	-	small	size=84554 intent=interactive was_ghost=false small=2/168918B main=0/0B region=0/0B ghost=0/1
+77	C2	get_or_fetch	648c733c62be88f7:0:84554	interactive	fetched	role=leader from_cache=false bytes=84554
+78	acct	miss	648c733c62be88f7:0:84554	-	whole_fetched	
+79	C2	admit	a06c804b9bd0840e:0:82023	interactive	-	size=82023
+80	C2	admit	32297dbf15e711fe:0:85060	interactive	-	size=85060
+81	C2	fifo_admit	a06c804b9bd0840e:0:82023	-	small	size=82023 intent=interactive was_ghost=false small=3/250941B main=0/0B region=0/0B ghost=0/1
+82	C2	get_or_fetch	a06c804b9bd0840e:0:82023	interactive	fetched	role=leader from_cache=false bytes=82023
+83	acct	miss	a06c804b9bd0840e:0:82023	-	whole_fetched	
+84	C2	admit	9734b16e68fb5a36:0:84581	interactive	-	size=84581
+85	C2	admit	b0a6f754e7dc4e75:0:82527	interactive	-	size=82527
+86	C2	admit	aa08c189bc2251fe:0:81870	interactive	-	size=81870
+87	C2	fifo_admit	32297dbf15e711fe:0:85060	-	small	size=85060 intent=interactive was_ghost=false small=4/336001B main=0/0B region=0/0B ghost=0/1
+88	C2	get_or_fetch	32297dbf15e711fe:0:85060	interactive	fetched	role=leader from_cache=false bytes=85060
+89	acct	miss	32297dbf15e711fe:0:85060	-	whole_fetched	
+90	C2	fifo_admit	9734b16e68fb5a36:0:84581	-	small	size=84581 intent=interactive was_ghost=false small=5/420582B main=0/0B region=0/0B ghost=0/1
+91	C2	get_or_fetch	9734b16e68fb5a36:0:84581	interactive	fetched	role=leader from_cache=false bytes=84581
+92	C2	fifo_admit	b0a6f754e7dc4e75:0:82527	-	small	size=82527 intent=interactive was_ghost=false small=6/503109B main=0/0B region=0/0B ghost=0/1
+93	C2	get_or_fetch	b0a6f754e7dc4e75:0:82527	interactive	fetched	role=leader from_cache=false bytes=82527
+94	acct	miss	b0a6f754e7dc4e75:0:82527	-	whole_fetched	
+95	C2	fifo_admit	aa08c189bc2251fe:0:81870	-	small	size=81870 intent=interactive was_ghost=false small=7/584979B main=0/0B region=0/0B ghost=0/1
+96	C2	get_or_fetch	aa08c189bc2251fe:0:81870	interactive	fetched	role=leader from_cache=false bytes=81870
+97	acct	miss	9734b16e68fb5a36:0:84581	-	whole_fetched	
+98	acct	miss	aa08c189bc2251fe:0:81870	-	whole_fetched	
+99	C2	get	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+100	C2	sf_leader_recheck	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+101	C2	get	44baa12e62cee44b:0:85402	interactive	miss	
+102	C2	sf_leader_recheck	44baa12e62cee44b:0:85402	interactive	miss	
+103	C2	get	e70ef8952d3b8c55:0:84247	interactive	miss	
+104	C2	sf_leader_recheck	e70ef8952d3b8c55:0:84247	interactive	miss	
+105	C2	get	b4a666a41ff41445:0:84703	interactive	miss	
+106	C2	sf_leader_recheck	b4a666a41ff41445:0:84703	interactive	miss	
+107	C2	get	95ea06fa912cbc99:0:82409	interactive	miss	
+108	C2	get	5aceeac724307b3a:0:85742	interactive	miss	
+109	C2	get	cd309dd1fc4931fb:0:84365	interactive	miss	
+110	C2	sf_leader_recheck	cd309dd1fc4931fb:0:84365	interactive	miss	
+111	C2	sf_leader_recheck	5aceeac724307b3a:0:85742	interactive	miss	
+112	C2	sf_leader_recheck	95ea06fa912cbc99:0:82409	interactive	miss	
+113	C2	admit	7dc5e93e8d9e84b0:0:84167	interactive	-	size=84167
+114	C2	fifo_admit	7dc5e93e8d9e84b0:0:84167	-	small	size=84167 intent=interactive was_ghost=false small=8/669146B main=0/0B region=0/0B ghost=0/1
+115	C2	get_or_fetch	7dc5e93e8d9e84b0:0:84167	interactive	fetched	role=leader from_cache=false bytes=84167
+116	acct	miss	7dc5e93e8d9e84b0:0:84167	-	whole_fetched	
+117	C2	admit	44baa12e62cee44b:0:85402	interactive	-	size=85402
+118	C2	fifo_admit	44baa12e62cee44b:0:85402	-	small	size=85402 intent=interactive was_ghost=false small=9/754548B main=0/0B region=0/0B ghost=0/1
+119	C2	get_or_fetch	44baa12e62cee44b:0:85402	interactive	fetched	role=leader from_cache=false bytes=85402
+120	acct	miss	44baa12e62cee44b:0:85402	-	whole_fetched	
+121	C2	admit	e70ef8952d3b8c55:0:84247	interactive	-	size=84247
+122	C2	admit	b4a666a41ff41445:0:84703	interactive	-	size=84703
+123	C2	fifo_admit	e70ef8952d3b8c55:0:84247	-	small	size=84247 intent=interactive was_ghost=false small=10/838795B main=0/0B region=0/0B ghost=0/1
+124	C2	get_or_fetch	e70ef8952d3b8c55:0:84247	interactive	fetched	role=leader from_cache=false bytes=84247
+125	acct	miss	e70ef8952d3b8c55:0:84247	-	whole_fetched	
+126	C2	fifo_admit	b4a666a41ff41445:0:84703	-	small	size=84703 intent=interactive was_ghost=false small=11/923498B main=0/0B region=0/0B ghost=0/1
+127	C2	get_or_fetch	b4a666a41ff41445:0:84703	interactive	fetched	role=leader from_cache=false bytes=84703
+128	acct	miss	b4a666a41ff41445:0:84703	-	whole_fetched	
+129	C2	admit	cd309dd1fc4931fb:0:84365	interactive	-	size=84365
+130	C2	fifo_admit	cd309dd1fc4931fb:0:84365	-	small	size=84365 intent=interactive was_ghost=false small=12/1007863B main=0/0B region=0/0B ghost=0/1
+131	C2	admit	5aceeac724307b3a:0:85742	interactive	-	size=85742
+132	C2	get_or_fetch	cd309dd1fc4931fb:0:84365	interactive	fetched	role=leader from_cache=false bytes=84365
+133	acct	miss	cd309dd1fc4931fb:0:84365	-	whole_fetched	
+134	C2	fifo_admit	5aceeac724307b3a:0:85742	-	small	size=85742 intent=interactive was_ghost=false small=13/1093605B main=0/0B region=0/0B ghost=0/1
+135	C2	fifo_evict_small	e33c5cf50d923622:0:84364	-	to_ghost	size=84364
+136	C2	get_or_fetch	5aceeac724307b3a:0:85742	interactive	fetched	role=leader from_cache=false bytes=85742
+137	acct	miss	5aceeac724307b3a:0:85742	-	whole_fetched	
+138	C2	get	da6fe285c406094e:0:83844	interactive	miss	
+139	C2	sf_leader_recheck	da6fe285c406094e:0:83844	interactive	miss	
+140	C2	admit	95ea06fa912cbc99:0:82409	interactive	-	size=82409
+141	C2	fifo_admit	95ea06fa912cbc99:0:82409	-	small	size=82409 intent=interactive was_ghost=false small=13/1091650B main=0/0B region=0/0B ghost=1/1
+142	C2	fifo_evict_small	648c733c62be88f7:0:84554	-	to_ghost	size=84554
+143	C2	fifo_ghost_drop	e33c5cf50d923622:0:84364	-	dropped	
+144	C2	get_or_fetch	95ea06fa912cbc99:0:82409	interactive	fetched	role=leader from_cache=false bytes=82409
+145	acct	miss	95ea06fa912cbc99:0:82409	-	whole_fetched	
+146	C2	get	09161411aa0bd56d:0:83118	interactive	miss	
+147	C2	sf_leader_recheck	09161411aa0bd56d:0:83118	interactive	miss	
+148	C2	get	cf241c4426a591c6:0:82463	interactive	miss	
+149	C2	sf_leader_recheck	cf241c4426a591c6:0:82463	interactive	miss	
+150	C2	get	8e4845ba8c09eb77:0:83728	interactive	miss	
+151	C2	sf_leader_recheck	8e4845ba8c09eb77:0:83728	interactive	miss	
+152	C2	get	367e776971e6087f:0:82345	interactive	miss	
+153	C2	sf_leader_recheck	367e776971e6087f:0:82345	interactive	miss	
+154	C2	admit	da6fe285c406094e:0:83844	interactive	-	size=83844
+155	C2	fifo_admit	da6fe285c406094e:0:83844	-	small	size=83844 intent=interactive was_ghost=false small=13/1090940B main=0/0B region=0/0B ghost=1/1
+156	C2	fifo_evict_small	a06c804b9bd0840e:0:82023	-	to_ghost	size=82023
+157	C2	fifo_ghost_drop	648c733c62be88f7:0:84554	-	dropped	
+158	C2	get_or_fetch	da6fe285c406094e:0:83844	interactive	fetched	role=leader from_cache=false bytes=83844
+159	acct	miss	da6fe285c406094e:0:83844	-	whole_fetched	
+160	C2	get	fc777304e7ddc553:0:82766	interactive	miss	
+161	C2	sf_leader_recheck	fc777304e7ddc553:0:82766	interactive	miss	
+162	C2	admit	09161411aa0bd56d:0:83118	interactive	-	size=83118
+163	C2	fifo_admit	09161411aa0bd56d:0:83118	-	small	size=83118 intent=interactive was_ghost=false small=13/1092035B main=0/0B region=0/0B ghost=1/1
+164	C2	fifo_evict_small	32297dbf15e711fe:0:85060	-	to_ghost	size=85060
+165	C2	fifo_ghost_drop	a06c804b9bd0840e:0:82023	-	dropped	
+166	C2	get_or_fetch	09161411aa0bd56d:0:83118	interactive	fetched	role=leader from_cache=false bytes=83118
+167	acct	miss	09161411aa0bd56d:0:83118	-	whole_fetched	
+168	C2	admit	cf241c4426a591c6:0:82463	interactive	-	size=82463
+169	C2	fifo_admit	cf241c4426a591c6:0:82463	-	small	size=82463 intent=interactive was_ghost=false small=13/1089438B main=0/0B region=0/0B ghost=1/1
+170	C2	fifo_evict_small	9734b16e68fb5a36:0:84581	-	to_ghost	size=84581
+171	C2	fifo_ghost_drop	32297dbf15e711fe:0:85060	-	dropped	
+172	C2	get_or_fetch	cf241c4426a591c6:0:82463	interactive	fetched	role=leader from_cache=false bytes=82463
+173	acct	miss	cf241c4426a591c6:0:82463	-	whole_fetched	
+174	C2	admit	8e4845ba8c09eb77:0:83728	interactive	-	size=83728
+175	C2	fifo_admit	8e4845ba8c09eb77:0:83728	-	small	size=83728 intent=interactive was_ghost=false small=13/1088585B main=0/0B region=0/0B ghost=1/1
+176	C2	fifo_evict_small	b0a6f754e7dc4e75:0:82527	-	to_ghost	size=82527
+177	C2	fifo_ghost_drop	9734b16e68fb5a36:0:84581	-	dropped	
+178	C2	get_or_fetch	8e4845ba8c09eb77:0:83728	interactive	fetched	role=leader from_cache=false bytes=83728
+179	acct	miss	8e4845ba8c09eb77:0:83728	-	whole_fetched	
+180	C2	admit	367e776971e6087f:0:82345	interactive	-	size=82345
+181	C2	fifo_admit	367e776971e6087f:0:82345	-	small	size=82345 intent=interactive was_ghost=false small=13/1088403B main=0/0B region=0/0B ghost=1/1
+182	C2	get	519d442ef931aa31:0:83489	interactive	miss	
+183	C2	fifo_evict_small	aa08c189bc2251fe:0:81870	-	to_ghost	size=81870
+184	C2	fifo_ghost_drop	b0a6f754e7dc4e75:0:82527	-	dropped	
+185	C2	get_or_fetch	367e776971e6087f:0:82345	interactive	fetched	role=leader from_cache=false bytes=82345
+186	acct	miss	367e776971e6087f:0:82345	-	whole_fetched	
+187	C2	sf_leader_recheck	519d442ef931aa31:0:83489	interactive	miss	
+188	C2	get	6a024199350d08de:0:82270	interactive	miss	
+189	C2	sf_leader_recheck	6a024199350d08de:0:82270	interactive	miss	
+190	C2	admit	fc777304e7ddc553:0:82766	interactive	-	size=82766
+191	C2	fifo_admit	fc777304e7ddc553:0:82766	-	small	size=82766 intent=interactive was_ghost=false small=13/1089299B main=0/0B region=0/0B ghost=1/1
+192	C2	fifo_evict_small	7dc5e93e8d9e84b0:0:84167	-	to_ghost	size=84167
+193	C2	fifo_ghost_drop	aa08c189bc2251fe:0:81870	-	dropped	
+194	C2	get_or_fetch	fc777304e7ddc553:0:82766	interactive	fetched	role=leader from_cache=false bytes=82766
+195	acct	miss	fc777304e7ddc553:0:82766	-	whole_fetched	
+196	C2	admit	6a024199350d08de:0:82270	interactive	-	size=82270
+197	C2	fifo_admit	6a024199350d08de:0:82270	-	small	size=82270 intent=interactive was_ghost=false small=13/1087402B main=0/0B region=0/0B ghost=1/1
+198	C2	fifo_evict_small	44baa12e62cee44b:0:85402	-	to_ghost	size=85402
+199	C2	fifo_ghost_drop	7dc5e93e8d9e84b0:0:84167	-	dropped	
+200	C2	get_or_fetch	6a024199350d08de:0:82270	interactive	fetched	role=leader from_cache=false bytes=82270
+201	acct	miss	6a024199350d08de:0:82270	-	whole_fetched	
+202	C2	admit	519d442ef931aa31:0:83489	interactive	-	size=83489
+203	C2	fifo_admit	519d442ef931aa31:0:83489	-	small	size=83489 intent=interactive was_ghost=false small=13/1085489B main=0/0B region=0/0B ghost=1/1
+204	C2	fifo_evict_small	e70ef8952d3b8c55:0:84247	-	to_ghost	size=84247
+205	C2	fifo_ghost_drop	44baa12e62cee44b:0:85402	-	dropped	
+206	C2	get_or_fetch	519d442ef931aa31:0:83489	interactive	fetched	role=leader from_cache=false bytes=83489
+207	acct	miss	519d442ef931aa31:0:83489	-	whole_fetched	
+208	C2	get	e7178eb222613a3a:0:83303	interactive	miss	
+209	C2	sf_leader_recheck	e7178eb222613a3a:0:83303	interactive	miss	
+210	C2	admit	e7178eb222613a3a:0:83303	interactive	-	size=83303
+211	C2	fifo_admit	e7178eb222613a3a:0:83303	-	small	size=83303 intent=interactive was_ghost=false small=13/1084545B main=0/0B region=0/0B ghost=1/1
+212	C2	fifo_evict_small	b4a666a41ff41445:0:84703	-	to_ghost	size=84703
+213	C2	fifo_ghost_drop	e70ef8952d3b8c55:0:84247	-	dropped	
+214	C2	get_or_fetch	e7178eb222613a3a:0:83303	interactive	fetched	role=leader from_cache=false bytes=83303
+215	acct	miss	e7178eb222613a3a:0:83303	-	whole_fetched	
+216	C2	get	85f2de5203e22c45:0:82406	interactive	miss	
+217	C2	sf_leader_recheck	85f2de5203e22c45:0:82406	interactive	miss	
+218	C2	admit	85f2de5203e22c45:0:82406	interactive	-	size=82406
+219	C2	fifo_admit	85f2de5203e22c45:0:82406	-	small	size=82406 intent=interactive was_ghost=false small=13/1082248B main=0/0B region=0/0B ghost=1/1
+220	C2	fifo_evict_small	cd309dd1fc4931fb:0:84365	-	to_ghost	size=84365
+221	C2	fifo_ghost_drop	b4a666a41ff41445:0:84703	-	dropped	
+222	C2	get_or_fetch	85f2de5203e22c45:0:82406	interactive	fetched	role=leader from_cache=false bytes=82406
+223	acct	miss	85f2de5203e22c45:0:82406	-	whole_fetched	
+224	C2	get	98abf5c94e51178e:0:84097	interactive	miss	
+225	C2	sf_leader_recheck	98abf5c94e51178e:0:84097	interactive	miss	
+226	C2	admit	98abf5c94e51178e:0:84097	interactive	-	size=84097
+227	C2	fifo_admit	98abf5c94e51178e:0:84097	-	small	size=84097 intent=interactive was_ghost=false small=13/1081980B main=0/0B region=0/0B ghost=1/1
+228	C2	fifo_evict_small	5aceeac724307b3a:0:85742	-	to_ghost	size=85742
+229	C2	fifo_ghost_drop	cd309dd1fc4931fb:0:84365	-	dropped	
+230	C2	get_or_fetch	98abf5c94e51178e:0:84097	interactive	fetched	role=leader from_cache=false bytes=84097
+231	acct	miss	98abf5c94e51178e:0:84097	-	whole_fetched	
+232	-	RUNEND	1	-	-	cache_hits=0 cache_misses=51 cache_bytes=0
+233	-	RUN	2	-	-	typed_duration_threshold_count
+234	cat:HeadCache	get	Logs	-	hit	bytes=0
+235	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000001.cmt	-	hit	bytes=286
+236	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000002.cmt	-	hit	bytes=286
+237	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000003.cmt	-	hit	bytes=286
+238	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000004.cmt	-	hit	bytes=286
+239	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000005.cmt	-	hit	bytes=286
+240	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000006.cmt	-	hit	bytes=286
+241	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000007.cmt	-	hit	bytes=286
+242	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000008.cmt	-	hit	bytes=286
+243	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000009.cmt	-	hit	bytes=286
+244	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000010.cmt	-	hit	bytes=286
+245	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000011.cmt	-	hit	bytes=286
+246	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000012.cmt	-	hit	bytes=286
+247	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000013.cmt	-	hit	bytes=286
+248	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000014.cmt	-	hit	bytes=286
+249	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000015.cmt	-	hit	bytes=286
+250	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000016.cmt	-	hit	bytes=286
+251	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000017.cmt	-	hit	bytes=286
+252	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000018.cmt	-	hit	bytes=286
+253	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000019.cmt	-	hit	bytes=286
+254	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000020.cmt	-	hit	bytes=286
+255	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000021.cmt	-	hit	bytes=286
+256	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000022.cmt	-	hit	bytes=286
+257	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000023.cmt	-	hit	bytes=286
+258	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000024.cmt	-	hit	bytes=286
+259	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000025.cmt	-	hit	bytes=286
+260	C2	get	648c733c62be88f7:0:84554	interactive	miss	
+261	C2	sf_leader_recheck	648c733c62be88f7:0:84554	interactive	miss	
+262	C2	fifo_hit	e7178eb222613a3a:0:83303	-	interactive	freq_after=1 queue=small
+263	C2	get	e7178eb222613a3a:0:83303	interactive	hit	bytes=83303
+264	acct	hit	e7178eb222613a3a:0:83303	-	whole	
+265	C2	get	b0a6f754e7dc4e75:0:82527	interactive	miss	
+266	C2	sf_leader_recheck	b0a6f754e7dc4e75:0:82527	interactive	miss	
+267	C2	get	a06c804b9bd0840e:0:82023	interactive	miss	
+268	C2	sf_leader_recheck	a06c804b9bd0840e:0:82023	interactive	miss	
+269	C2	get	e33c5cf50d923622:0:84364	interactive	miss	
+270	C2	get	aa08c189bc2251fe:0:81870	interactive	miss	
+271	C2	get	9734b16e68fb5a36:0:84581	interactive	miss	
+272	C2	sf_leader_recheck	e33c5cf50d923622:0:84364	interactive	miss	
+273	C2	sf_leader_recheck	9734b16e68fb5a36:0:84581	interactive	miss	
+274	C2	sf_leader_recheck	aa08c189bc2251fe:0:81870	interactive	miss	
+275	C2	get	32297dbf15e711fe:0:85060	interactive	miss	
+276	C2	sf_leader_recheck	32297dbf15e711fe:0:85060	interactive	miss	
+277	C2	admit	648c733c62be88f7:0:84554	interactive	-	size=84554
+278	C2	fifo_admit	648c733c62be88f7:0:84554	-	small	size=84554 intent=interactive was_ghost=false small=13/1080792B main=0/0B region=0/0B ghost=1/1
+279	C2	fifo_evict_small	95ea06fa912cbc99:0:82409	-	to_ghost	size=82409
+280	C2	fifo_ghost_drop	5aceeac724307b3a:0:85742	-	dropped	
+281	C2	get_or_fetch	648c733c62be88f7:0:84554	interactive	fetched	role=leader from_cache=false bytes=84554
+282	acct	miss	648c733c62be88f7:0:84554	-	whole_fetched	
+283	C2	admit	b0a6f754e7dc4e75:0:82527	interactive	-	size=82527
+284	C2	fifo_admit	b0a6f754e7dc4e75:0:82527	-	small	size=82527 intent=interactive was_ghost=false small=13/1080910B main=0/0B region=0/0B ghost=1/1
+285	C2	fifo_evict_small	da6fe285c406094e:0:83844	-	to_ghost	size=83844
+286	C2	fifo_ghost_drop	95ea06fa912cbc99:0:82409	-	dropped	
+287	C2	admit	a06c804b9bd0840e:0:82023	interactive	-	size=82023
+288	C2	get_or_fetch	b0a6f754e7dc4e75:0:82527	interactive	fetched	role=leader from_cache=false bytes=82527
+289	acct	miss	b0a6f754e7dc4e75:0:82527	-	whole_fetched	
+290	C2	fifo_admit	a06c804b9bd0840e:0:82023	-	small	size=82023 intent=interactive was_ghost=false small=13/1079089B main=0/0B region=0/0B ghost=1/1
+291	C2	fifo_evict_small	09161411aa0bd56d:0:83118	-	to_ghost	size=83118
+292	C2	admit	e33c5cf50d923622:0:84364	interactive	-	size=84364
+293	C2	fifo_ghost_drop	da6fe285c406094e:0:83844	-	dropped	
+294	C2	get_or_fetch	a06c804b9bd0840e:0:82023	interactive	fetched	role=leader from_cache=false bytes=82023
+295	acct	miss	a06c804b9bd0840e:0:82023	-	whole_fetched	
+296	C2	fifo_admit	e33c5cf50d923622:0:84364	-	small	size=84364 intent=interactive was_ghost=false small=13/1080335B main=0/0B region=0/0B ghost=1/1
+297	C2	fifo_evict_small	cf241c4426a591c6:0:82463	-	to_ghost	size=82463
+298	C2	fifo_ghost_drop	09161411aa0bd56d:0:83118	-	dropped	
+299	C2	get_or_fetch	e33c5cf50d923622:0:84364	interactive	fetched	role=leader from_cache=false bytes=84364
+300	acct	miss	e33c5cf50d923622:0:84364	-	whole_fetched	
+301	C2	fifo_hit	85f2de5203e22c45:0:82406	-	interactive	freq_after=1 queue=small
+302	C2	get	85f2de5203e22c45:0:82406	interactive	hit	bytes=82406
+303	acct	hit	85f2de5203e22c45:0:82406	-	whole	
+304	C2	admit	9734b16e68fb5a36:0:84581	interactive	-	size=84581
+305	C2	fifo_admit	9734b16e68fb5a36:0:84581	-	small	size=84581 intent=interactive was_ghost=false small=13/1082453B main=0/0B region=0/0B ghost=1/1
+306	C2	fifo_evict_small	8e4845ba8c09eb77:0:83728	-	to_ghost	size=83728
+307	C2	fifo_ghost_drop	cf241c4426a591c6:0:82463	-	dropped	
+308	C2	get_or_fetch	9734b16e68fb5a36:0:84581	interactive	fetched	role=leader from_cache=false bytes=84581
+309	acct	miss	9734b16e68fb5a36:0:84581	-	whole_fetched	
+310	C2	admit	32297dbf15e711fe:0:85060	interactive	-	size=85060
+311	C2	admit	aa08c189bc2251fe:0:81870	interactive	-	size=81870
+312	C2	fifo_admit	aa08c189bc2251fe:0:81870	-	small	size=81870 intent=interactive was_ghost=false small=13/1080595B main=0/0B region=0/0B ghost=1/1
+313	C2	fifo_evict_small	367e776971e6087f:0:82345	-	to_ghost	size=82345
+314	C2	fifo_ghost_drop	8e4845ba8c09eb77:0:83728	-	dropped	
+315	C2	get_or_fetch	aa08c189bc2251fe:0:81870	interactive	fetched	role=leader from_cache=false bytes=81870
+316	acct	miss	aa08c189bc2251fe:0:81870	-	whole_fetched	
+317	C2	get	44baa12e62cee44b:0:85402	interactive	miss	
+318	C2	fifo_admit	32297dbf15e711fe:0:85060	-	small	size=85060 intent=interactive was_ghost=false small=13/1083310B main=0/0B region=0/0B ghost=1/1
+319	C2	fifo_evict_small	fc777304e7ddc553:0:82766	-	to_ghost	size=82766
+320	C2	fifo_ghost_drop	367e776971e6087f:0:82345	-	dropped	
+321	C2	get_or_fetch	32297dbf15e711fe:0:85060	interactive	fetched	role=leader from_cache=false bytes=85060
+322	acct	miss	32297dbf15e711fe:0:85060	-	whole_fetched	
+323	C2	sf_leader_recheck	44baa12e62cee44b:0:85402	interactive	miss	
+324	C2	get	b4a666a41ff41445:0:84703	interactive	miss	
+325	C2	sf_leader_recheck	b4a666a41ff41445:0:84703	interactive	miss	
+326	C2	get	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+327	C2	sf_leader_recheck	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+328	C2	get	e70ef8952d3b8c55:0:84247	interactive	miss	
+329	C2	sf_leader_recheck	e70ef8952d3b8c55:0:84247	interactive	miss	
+330	C2	fifo_hit	98abf5c94e51178e:0:84097	-	interactive	freq_after=1 queue=small
+331	C2	get	98abf5c94e51178e:0:84097	interactive	hit	bytes=84097
+332	acct	hit	98abf5c94e51178e:0:84097	-	whole	
+333	C2	get	cd309dd1fc4931fb:0:84365	interactive	miss	
+334	C2	sf_leader_recheck	cd309dd1fc4931fb:0:84365	interactive	miss	
+335	C2	admit	44baa12e62cee44b:0:85402	interactive	-	size=85402
+336	C2	fifo_admit	44baa12e62cee44b:0:85402	-	small	size=85402 intent=interactive was_ghost=false small=13/1085946B main=0/0B region=0/0B ghost=1/1
+337	C2	admit	b4a666a41ff41445:0:84703	interactive	-	size=84703
+338	C2	fifo_evict_small	6a024199350d08de:0:82270	-	to_ghost	size=82270
+339	C2	fifo_ghost_drop	fc777304e7ddc553:0:82766	-	dropped	
+340	C2	get_or_fetch	44baa12e62cee44b:0:85402	interactive	fetched	role=leader from_cache=false bytes=85402
+341	C2	fifo_admit	b4a666a41ff41445:0:84703	-	small	size=84703 intent=interactive was_ghost=false small=13/1088379B main=0/0B region=0/0B ghost=1/1
+342	C2	admit	7dc5e93e8d9e84b0:0:84167	interactive	-	size=84167
+343	C2	fifo_evict_small	519d442ef931aa31:0:83489	-	to_ghost	size=83489
+344	C2	fifo_ghost_drop	6a024199350d08de:0:82270	-	dropped	
+345	acct	miss	44baa12e62cee44b:0:85402	-	whole_fetched	
+346	C2	fifo_admit	7dc5e93e8d9e84b0:0:84167	-	small	size=84167 intent=interactive was_ghost=false small=13/1089057B main=0/0B region=0/0B ghost=1/1
+347	C2	fifo_evict_small	e7178eb222613a3a:0:83303	-	to_main	size=83303 freq=1
+348	C2	fifo_evict_small	85f2de5203e22c45:0:82406	-	to_main	size=82406 freq=1
+349	C2	fifo_evict_small	98abf5c94e51178e:0:84097	-	to_main	size=84097 freq=1
+350	C2	fifo_evict_small	648c733c62be88f7:0:84554	-	to_ghost	size=84554
+351	C2	fifo_ghost_drop	519d442ef931aa31:0:83489	-	dropped	
+352	C2	get_or_fetch	b4a666a41ff41445:0:84703	interactive	fetched	role=leader from_cache=false bytes=84703
+353	acct	miss	b4a666a41ff41445:0:84703	-	whole_fetched	
+354	C2	get	5aceeac724307b3a:0:85742	interactive	miss	
+355	C2	admit	e70ef8952d3b8c55:0:84247	interactive	-	size=84247
+356	C2	sf_leader_recheck	5aceeac724307b3a:0:85742	interactive	miss	
+357	C2	get_or_fetch	7dc5e93e8d9e84b0:0:84167	interactive	fetched	role=leader from_cache=false bytes=84167
+358	acct	miss	7dc5e93e8d9e84b0:0:84167	-	whole_fetched	
+359	C2	fifo_admit	e70ef8952d3b8c55:0:84247	-	small	size=84247 intent=interactive was_ghost=false small=10/838944B main=3/249806B region=0/0B ghost=1/1
+360	C2	fifo_evict_small	b0a6f754e7dc4e75:0:82527	-	to_ghost	size=82527
+361	C2	fifo_ghost_drop	648c733c62be88f7:0:84554	-	dropped	
+362	C2	get_or_fetch	e70ef8952d3b8c55:0:84247	interactive	fetched	role=leader from_cache=false bytes=84247
+363	acct	miss	e70ef8952d3b8c55:0:84247	-	whole_fetched	
+364	C2	get	09161411aa0bd56d:0:83118	interactive	miss	
+365	C2	sf_leader_recheck	09161411aa0bd56d:0:83118	interactive	miss	
+366	C2	get	95ea06fa912cbc99:0:82409	interactive	miss	
+367	C2	sf_leader_recheck	95ea06fa912cbc99:0:82409	interactive	miss	
+368	C2	admit	cd309dd1fc4931fb:0:84365	interactive	-	size=84365
+369	C2	fifo_admit	cd309dd1fc4931fb:0:84365	-	small	size=84365 intent=interactive was_ghost=false small=10/840782B main=3/249806B region=0/0B ghost=1/1
+370	C2	fifo_evict_small	a06c804b9bd0840e:0:82023	-	to_ghost	size=82023
+371	C2	fifo_ghost_drop	b0a6f754e7dc4e75:0:82527	-	dropped	
+372	C2	get_or_fetch	cd309dd1fc4931fb:0:84365	interactive	fetched	role=leader from_cache=false bytes=84365
+373	acct	miss	cd309dd1fc4931fb:0:84365	-	whole_fetched	
+374	C2	get	cf241c4426a591c6:0:82463	interactive	miss	
+375	C2	get	da6fe285c406094e:0:83844	interactive	miss	
+376	C2	sf_leader_recheck	da6fe285c406094e:0:83844	interactive	miss	
+377	C2	sf_leader_recheck	cf241c4426a591c6:0:82463	interactive	miss	
+378	C2	get	fc777304e7ddc553:0:82766	interactive	miss	
+379	C2	sf_leader_recheck	fc777304e7ddc553:0:82766	interactive	miss	
+380	C2	admit	5aceeac724307b3a:0:85742	interactive	-	size=85742
+381	C2	fifo_admit	5aceeac724307b3a:0:85742	-	small	size=85742 intent=interactive was_ghost=false small=10/844501B main=3/249806B region=0/0B ghost=1/1
+382	C2	fifo_evict_small	e33c5cf50d923622:0:84364	-	to_ghost	size=84364
+383	C2	fifo_ghost_drop	a06c804b9bd0840e:0:82023	-	dropped	
+384	C2	get_or_fetch	5aceeac724307b3a:0:85742	interactive	fetched	role=leader from_cache=false bytes=85742
+385	acct	miss	5aceeac724307b3a:0:85742	-	whole_fetched	
+386	C2	admit	09161411aa0bd56d:0:83118	interactive	-	size=83118
+387	C2	fifo_admit	09161411aa0bd56d:0:83118	-	small	size=83118 intent=interactive was_ghost=false small=10/843255B main=3/249806B region=0/0B ghost=1/1
+388	C2	fifo_evict_small	9734b16e68fb5a36:0:84581	-	to_ghost	size=84581
+389	C2	fifo_ghost_drop	e33c5cf50d923622:0:84364	-	dropped	
+390	C2	get_or_fetch	09161411aa0bd56d:0:83118	interactive	fetched	role=leader from_cache=false bytes=83118
+391	acct	miss	09161411aa0bd56d:0:83118	-	whole_fetched	
+392	C2	get	8e4845ba8c09eb77:0:83728	interactive	miss	
+393	C2	sf_leader_recheck	8e4845ba8c09eb77:0:83728	interactive	miss	
+394	C2	admit	da6fe285c406094e:0:83844	interactive	-	size=83844
+395	C2	admit	cf241c4426a591c6:0:82463	interactive	-	size=82463
+396	C2	admit	fc777304e7ddc553:0:82766	interactive	-	size=82766
+397	C2	fifo_admit	da6fe285c406094e:0:83844	-	small	size=83844 intent=interactive was_ghost=false small=10/842518B main=3/249806B region=0/0B ghost=1/1
+398	C2	fifo_evict_small	aa08c189bc2251fe:0:81870	-	to_ghost	size=81870
+399	C2	fifo_ghost_drop	9734b16e68fb5a36:0:84581	-	dropped	
+400	C2	admit	95ea06fa912cbc99:0:82409	interactive	-	size=82409
+401	C2	get_or_fetch	da6fe285c406094e:0:83844	interactive	fetched	role=leader from_cache=false bytes=83844
+402	acct	miss	da6fe285c406094e:0:83844	-	whole_fetched	
+403	C2	fifo_admit	cf241c4426a591c6:0:82463	-	small	size=82463 intent=interactive was_ghost=false small=10/843111B main=3/249806B region=0/0B ghost=1/1
+404	C2	fifo_evict_small	32297dbf15e711fe:0:85060	-	to_ghost	size=85060
+405	C2	fifo_ghost_drop	aa08c189bc2251fe:0:81870	-	dropped	
+406	C2	get_or_fetch	cf241c4426a591c6:0:82463	interactive	fetched	role=leader from_cache=false bytes=82463
+407	acct	miss	cf241c4426a591c6:0:82463	-	whole_fetched	
+408	C2	fifo_admit	fc777304e7ddc553:0:82766	-	small	size=82766 intent=interactive was_ghost=false small=10/840817B main=3/249806B region=0/0B ghost=1/1
+409	C2	fifo_evict_small	44baa12e62cee44b:0:85402	-	to_ghost	size=85402
+410	C2	fifo_ghost_drop	32297dbf15e711fe:0:85060	-	dropped	
+411	C2	get_or_fetch	fc777304e7ddc553:0:82766	interactive	fetched	role=leader from_cache=false bytes=82766
+412	acct	miss	fc777304e7ddc553:0:82766	-	whole_fetched	
+413	C2	fifo_admit	95ea06fa912cbc99:0:82409	-	small	size=82409 intent=interactive was_ghost=false small=10/837824B main=3/249806B region=0/0B ghost=1/1
+414	C2	fifo_evict_small	b4a666a41ff41445:0:84703	-	to_ghost	size=84703
+415	C2	fifo_ghost_drop	44baa12e62cee44b:0:85402	-	dropped	
+416	C2	get_or_fetch	95ea06fa912cbc99:0:82409	interactive	fetched	role=leader from_cache=false bytes=82409
+417	acct	miss	95ea06fa912cbc99:0:82409	-	whole_fetched	
+418	C2	get	6a024199350d08de:0:82270	interactive	miss	
+419	C2	sf_leader_recheck	6a024199350d08de:0:82270	interactive	miss	
+420	C2	admit	8e4845ba8c09eb77:0:83728	interactive	-	size=83728
+421	C2	fifo_admit	8e4845ba8c09eb77:0:83728	-	small	size=83728 intent=interactive was_ghost=false small=10/836849B main=3/249806B region=0/0B ghost=1/1
+422	C2	fifo_evict_small	7dc5e93e8d9e84b0:0:84167	-	to_ghost	size=84167
+423	C2	fifo_ghost_drop	b4a666a41ff41445:0:84703	-	dropped	
+424	C2	get_or_fetch	8e4845ba8c09eb77:0:83728	interactive	fetched	role=leader from_cache=false bytes=83728
+425	acct	miss	8e4845ba8c09eb77:0:83728	-	whole_fetched	
+426	C2	get	367e776971e6087f:0:82345	interactive	miss	
+427	C2	sf_leader_recheck	367e776971e6087f:0:82345	interactive	miss	
+428	C2	admit	6a024199350d08de:0:82270	interactive	-	size=82270
+429	C2	fifo_admit	6a024199350d08de:0:82270	-	small	size=82270 intent=interactive was_ghost=false small=10/834952B main=3/249806B region=0/0B ghost=1/1
+430	C2	fifo_evict_small	e70ef8952d3b8c55:0:84247	-	to_ghost	size=84247
+431	C2	fifo_ghost_drop	7dc5e93e8d9e84b0:0:84167	-	dropped	
+432	C2	get_or_fetch	6a024199350d08de:0:82270	interactive	fetched	role=leader from_cache=false bytes=82270
+433	acct	miss	6a024199350d08de:0:82270	-	whole_fetched	
+434	C2	get	519d442ef931aa31:0:83489	interactive	miss	
+435	C2	sf_leader_recheck	519d442ef931aa31:0:83489	interactive	miss	
+436	C2	admit	367e776971e6087f:0:82345	interactive	-	size=82345
+437	C2	fifo_admit	367e776971e6087f:0:82345	-	small	size=82345 intent=interactive was_ghost=false small=10/833050B main=3/249806B region=0/0B ghost=1/1
+438	C2	fifo_evict_small	cd309dd1fc4931fb:0:84365	-	to_ghost	size=84365
+439	C2	fifo_ghost_drop	e70ef8952d3b8c55:0:84247	-	dropped	
+440	C2	get_or_fetch	367e776971e6087f:0:82345	interactive	fetched	role=leader from_cache=false bytes=82345
+441	acct	miss	367e776971e6087f:0:82345	-	whole_fetched	
+442	C2	admit	519d442ef931aa31:0:83489	interactive	-	size=83489
+443	C2	fifo_admit	519d442ef931aa31:0:83489	-	small	size=83489 intent=interactive was_ghost=false small=10/832174B main=3/249806B region=0/0B ghost=1/1
+444	C2	fifo_evict_small	5aceeac724307b3a:0:85742	-	to_ghost	size=85742
+445	C2	fifo_ghost_drop	cd309dd1fc4931fb:0:84365	-	dropped	
+446	C2	get_or_fetch	519d442ef931aa31:0:83489	interactive	fetched	role=leader from_cache=false bytes=83489
+447	acct	miss	519d442ef931aa31:0:83489	-	whole_fetched	
+448	-	RUNEND	2	-	-	cache_hits=29 cache_misses=22 cache_bytes=256956
+449	-	RUN	3	-	-	typed_duration_threshold_count
+450	cat:HeadCache	get	Logs	-	hit	bytes=0
+451	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000001.cmt	-	hit	bytes=286
+452	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000002.cmt	-	hit	bytes=286
+453	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000003.cmt	-	hit	bytes=286
+454	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000004.cmt	-	hit	bytes=286
+455	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000005.cmt	-	hit	bytes=286
+456	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000006.cmt	-	hit	bytes=286
+457	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000007.cmt	-	hit	bytes=286
+458	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000008.cmt	-	hit	bytes=286
+459	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000009.cmt	-	hit	bytes=286
+460	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000010.cmt	-	hit	bytes=286
+461	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000011.cmt	-	hit	bytes=286
+462	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000012.cmt	-	hit	bytes=286
+463	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000013.cmt	-	hit	bytes=286
+464	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000014.cmt	-	hit	bytes=286
+465	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000015.cmt	-	hit	bytes=286
+466	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000016.cmt	-	hit	bytes=286
+467	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000017.cmt	-	hit	bytes=286
+468	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000018.cmt	-	hit	bytes=286
+469	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000019.cmt	-	hit	bytes=286
+470	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000020.cmt	-	hit	bytes=286
+471	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000021.cmt	-	hit	bytes=286
+472	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000022.cmt	-	hit	bytes=286
+473	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000023.cmt	-	hit	bytes=286
+474	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000024.cmt	-	hit	bytes=286
+475	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000025.cmt	-	hit	bytes=286
+476	C2	get	648c733c62be88f7:0:84554	interactive	miss	
+477	C2	sf_leader_recheck	648c733c62be88f7:0:84554	interactive	miss	
+478	C2	fifo_hit	e7178eb222613a3a:0:83303	-	interactive	freq_after=1 queue=main
+479	C2	get	e7178eb222613a3a:0:83303	interactive	hit	bytes=83303
+480	acct	hit	e7178eb222613a3a:0:83303	-	whole	
+481	C2	get	9734b16e68fb5a36:0:84581	interactive	miss	
+482	C2	sf_leader_recheck	9734b16e68fb5a36:0:84581	interactive	miss	
+483	C2	get	b0a6f754e7dc4e75:0:82527	interactive	miss	
+484	C2	sf_leader_recheck	b0a6f754e7dc4e75:0:82527	interactive	miss	
+485	C2	get	e33c5cf50d923622:0:84364	interactive	miss	
+486	C2	sf_leader_recheck	e33c5cf50d923622:0:84364	interactive	miss	
+487	C2	get	a06c804b9bd0840e:0:82023	interactive	miss	
+488	C2	sf_leader_recheck	a06c804b9bd0840e:0:82023	interactive	miss	
+489	C2	get	aa08c189bc2251fe:0:81870	interactive	miss	
+490	C2	sf_leader_recheck	aa08c189bc2251fe:0:81870	interactive	miss	
+491	C2	get	32297dbf15e711fe:0:85060	interactive	miss	
+492	C2	sf_leader_recheck	32297dbf15e711fe:0:85060	interactive	miss	
+493	C2	admit	e33c5cf50d923622:0:84364	interactive	-	size=84364
+494	C2	fifo_admit	e33c5cf50d923622:0:84364	-	small	size=84364 intent=interactive was_ghost=false small=10/830796B main=3/249806B region=0/0B ghost=1/1
+495	C2	fifo_evict_small	09161411aa0bd56d:0:83118	-	to_ghost	size=83118
+496	C2	fifo_ghost_drop	5aceeac724307b3a:0:85742	-	dropped	
+497	C2	get_or_fetch	e33c5cf50d923622:0:84364	interactive	fetched	role=leader from_cache=false bytes=84364
+498	acct	miss	e33c5cf50d923622:0:84364	-	whole_fetched	
+499	C2	admit	9734b16e68fb5a36:0:84581	interactive	-	size=84581
+500	C2	admit	648c733c62be88f7:0:84554	interactive	-	size=84554
+501	C2	fifo_admit	9734b16e68fb5a36:0:84581	-	small	size=84581 intent=interactive was_ghost=false small=10/832259B main=3/249806B region=0/0B ghost=1/1
+502	C2	fifo_evict_small	da6fe285c406094e:0:83844	-	to_ghost	size=83844
+503	C2	fifo_ghost_drop	09161411aa0bd56d:0:83118	-	dropped	
+504	C2	get_or_fetch	9734b16e68fb5a36:0:84581	interactive	fetched	role=leader from_cache=false bytes=84581
+505	acct	miss	9734b16e68fb5a36:0:84581	-	whole_fetched	
+506	C2	fifo_admit	648c733c62be88f7:0:84554	-	small	size=84554 intent=interactive was_ghost=false small=10/832969B main=3/249806B region=0/0B ghost=1/1
+507	C2	fifo_evict_small	cf241c4426a591c6:0:82463	-	to_ghost	size=82463
+508	C2	fifo_ghost_drop	da6fe285c406094e:0:83844	-	dropped	
+509	C2	admit	a06c804b9bd0840e:0:82023	interactive	-	size=82023
+510	C2	get_or_fetch	648c733c62be88f7:0:84554	interactive	fetched	role=leader from_cache=false bytes=84554
+511	C2	fifo_admit	a06c804b9bd0840e:0:82023	-	small	size=82023 intent=interactive was_ghost=false small=10/832529B main=3/249806B region=0/0B ghost=1/1
+512	acct	miss	648c733c62be88f7:0:84554	-	whole_fetched	
+513	C2	admit	aa08c189bc2251fe:0:81870	interactive	-	size=81870
+514	C2	fifo_evict_small	fc777304e7ddc553:0:82766	-	to_ghost	size=82766
+515	C2	fifo_ghost_drop	cf241c4426a591c6:0:82463	-	dropped	
+516	C2	get_or_fetch	a06c804b9bd0840e:0:82023	interactive	fetched	role=leader from_cache=false bytes=82023
+517	acct	miss	a06c804b9bd0840e:0:82023	-	whole_fetched	
+518	C2	fifo_hit	85f2de5203e22c45:0:82406	-	interactive	freq_after=1 queue=main
+519	C2	get	85f2de5203e22c45:0:82406	interactive	hit	bytes=82406
+520	acct	hit	85f2de5203e22c45:0:82406	-	whole	
+521	C2	fifo_admit	aa08c189bc2251fe:0:81870	-	small	size=81870 intent=interactive was_ghost=false small=10/831633B main=3/249806B region=0/0B ghost=1/1
+522	C2	fifo_evict_small	95ea06fa912cbc99:0:82409	-	to_ghost	size=82409
+523	C2	fifo_ghost_drop	fc777304e7ddc553:0:82766	-	dropped	
+524	C2	get_or_fetch	aa08c189bc2251fe:0:81870	interactive	fetched	role=leader from_cache=false bytes=81870
+525	acct	miss	aa08c189bc2251fe:0:81870	-	whole_fetched	
+526	C2	admit	b0a6f754e7dc4e75:0:82527	interactive	-	size=82527
+527	C2	fifo_admit	b0a6f754e7dc4e75:0:82527	-	small	size=82527 intent=interactive was_ghost=false small=10/831751B main=3/249806B region=0/0B ghost=1/1
+528	C2	fifo_evict_small	8e4845ba8c09eb77:0:83728	-	to_ghost	size=83728
+529	C2	fifo_ghost_drop	95ea06fa912cbc99:0:82409	-	dropped	
+530	C2	get_or_fetch	b0a6f754e7dc4e75:0:82527	interactive	fetched	role=leader from_cache=false bytes=82527
+531	acct	miss	b0a6f754e7dc4e75:0:82527	-	whole_fetched	
+532	C2	get	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+533	C2	sf_leader_recheck	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+534	C2	admit	32297dbf15e711fe:0:85060	interactive	-	size=85060
+535	C2	fifo_admit	32297dbf15e711fe:0:85060	-	small	size=85060 intent=interactive was_ghost=false small=10/833083B main=3/249806B region=0/0B ghost=1/1
+536	C2	fifo_evict_small	6a024199350d08de:0:82270	-	to_ghost	size=82270
+537	C2	fifo_ghost_drop	8e4845ba8c09eb77:0:83728	-	dropped	
+538	C2	get_or_fetch	32297dbf15e711fe:0:85060	interactive	fetched	role=leader from_cache=false bytes=85060
+539	acct	miss	32297dbf15e711fe:0:85060	-	whole_fetched	
+540	C2	get	cd309dd1fc4931fb:0:84365	interactive	miss	
+541	C2	sf_leader_recheck	cd309dd1fc4931fb:0:84365	interactive	miss	
+542	C2	get	e70ef8952d3b8c55:0:84247	interactive	miss	
+543	C2	sf_leader_recheck	e70ef8952d3b8c55:0:84247	interactive	miss	
+544	C2	get	5aceeac724307b3a:0:85742	interactive	miss	
+545	C2	sf_leader_recheck	5aceeac724307b3a:0:85742	interactive	miss	
+546	C2	get	44baa12e62cee44b:0:85402	interactive	miss	
+547	C2	sf_leader_recheck	44baa12e62cee44b:0:85402	interactive	miss	
+548	C2	admit	7dc5e93e8d9e84b0:0:84167	interactive	-	size=84167
+549	C2	fifo_admit	7dc5e93e8d9e84b0:0:84167	-	small	size=84167 intent=interactive was_ghost=false small=10/834980B main=3/249806B region=0/0B ghost=1/1
+550	C2	fifo_evict_small	367e776971e6087f:0:82345	-	to_ghost	size=82345
+551	C2	fifo_ghost_drop	6a024199350d08de:0:82270	-	dropped	
+552	C2	get_or_fetch	7dc5e93e8d9e84b0:0:84167	interactive	fetched	role=leader from_cache=false bytes=84167
+553	acct	miss	7dc5e93e8d9e84b0:0:84167	-	whole_fetched	
+554	C2	fifo_hit	98abf5c94e51178e:0:84097	-	interactive	freq_after=1 queue=main
+555	C2	get	98abf5c94e51178e:0:84097	interactive	hit	bytes=84097
+556	acct	hit	98abf5c94e51178e:0:84097	-	whole	
+557	C2	get	b4a666a41ff41445:0:84703	interactive	miss	
+558	C2	admit	cd309dd1fc4931fb:0:84365	interactive	-	size=84365
+559	C2	fifo_admit	cd309dd1fc4931fb:0:84365	-	small	size=84365 intent=interactive was_ghost=false small=10/837000B main=3/249806B region=0/0B ghost=1/1
+560	C2	fifo_evict_small	519d442ef931aa31:0:83489	-	to_ghost	size=83489
+561	C2	sf_leader_recheck	b4a666a41ff41445:0:84703	interactive	miss	
+562	C2	fifo_ghost_drop	367e776971e6087f:0:82345	-	dropped	
+563	C2	get_or_fetch	cd309dd1fc4931fb:0:84365	interactive	fetched	role=leader from_cache=false bytes=84365
+564	acct	miss	cd309dd1fc4931fb:0:84365	-	whole_fetched	
+565	C2	admit	e70ef8952d3b8c55:0:84247	interactive	-	size=84247
+566	C2	fifo_admit	e70ef8952d3b8c55:0:84247	-	small	size=84247 intent=interactive was_ghost=false small=10/837758B main=3/249806B region=0/0B ghost=1/1
+567	C2	fifo_evict_small	e33c5cf50d923622:0:84364	-	to_ghost	size=84364
+568	C2	fifo_ghost_drop	519d442ef931aa31:0:83489	-	dropped	
+569	C2	get_or_fetch	e70ef8952d3b8c55:0:84247	interactive	fetched	role=leader from_cache=false bytes=84247
+570	acct	miss	e70ef8952d3b8c55:0:84247	-	whole_fetched	
+571	C2	get	95ea06fa912cbc99:0:82409	interactive	miss	
+572	C2	sf_leader_recheck	95ea06fa912cbc99:0:82409	interactive	miss	
+573	C2	admit	5aceeac724307b3a:0:85742	interactive	-	size=85742
+574	C2	fifo_admit	5aceeac724307b3a:0:85742	-	small	size=85742 intent=interactive was_ghost=false small=10/839136B main=3/249806B region=0/0B ghost=1/1
+575	C2	fifo_evict_small	9734b16e68fb5a36:0:84581	-	to_ghost	size=84581
+576	C2	fifo_ghost_drop	e33c5cf50d923622:0:84364	-	dropped	
+577	C2	get_or_fetch	5aceeac724307b3a:0:85742	interactive	fetched	role=leader from_cache=false bytes=85742
+578	acct	miss	5aceeac724307b3a:0:85742	-	whole_fetched	
+579	C2	get	da6fe285c406094e:0:83844	interactive	miss	
+580	C2	sf_leader_recheck	da6fe285c406094e:0:83844	interactive	miss	
+581	C2	admit	44baa12e62cee44b:0:85402	interactive	-	size=85402
+582	C2	fifo_admit	44baa12e62cee44b:0:85402	-	small	size=85402 intent=interactive was_ghost=false small=10/839957B main=3/249806B region=0/0B ghost=1/1
+583	C2	fifo_evict_small	648c733c62be88f7:0:84554	-	to_ghost	size=84554
+584	C2	fifo_ghost_drop	9734b16e68fb5a36:0:84581	-	dropped	
+585	C2	get	8e4845ba8c09eb77:0:83728	interactive	miss	
+586	C2	sf_leader_recheck	8e4845ba8c09eb77:0:83728	interactive	miss	
+587	C2	get_or_fetch	44baa12e62cee44b:0:85402	interactive	fetched	role=leader from_cache=false bytes=85402
+588	acct	miss	44baa12e62cee44b:0:85402	-	whole_fetched	
+589	C2	get	fc777304e7ddc553:0:82766	interactive	miss	
+590	C2	sf_leader_recheck	fc777304e7ddc553:0:82766	interactive	miss	
+591	C2	get	367e776971e6087f:0:82345	interactive	miss	
+592	C2	sf_leader_recheck	367e776971e6087f:0:82345	interactive	miss	
+593	C2	admit	b4a666a41ff41445:0:84703	interactive	-	size=84703
+594	C2	admit	da6fe285c406094e:0:83844	interactive	-	size=83844
+595	C2	fifo_admit	b4a666a41ff41445:0:84703	-	small	size=84703 intent=interactive was_ghost=false small=10/840106B main=3/249806B region=0/0B ghost=1/1
+596	C2	fifo_evict_small	a06c804b9bd0840e:0:82023	-	to_ghost	size=82023
+597	C2	fifo_ghost_drop	648c733c62be88f7:0:84554	-	dropped	
+598	C2	get_or_fetch	b4a666a41ff41445:0:84703	interactive	fetched	role=leader from_cache=false bytes=84703
+599	acct	miss	b4a666a41ff41445:0:84703	-	whole_fetched	
+600	C2	fifo_admit	da6fe285c406094e:0:83844	-	small	size=83844 intent=interactive was_ghost=false small=10/841927B main=3/249806B region=0/0B ghost=1/1
+601	C2	fifo_evict_small	aa08c189bc2251fe:0:81870	-	to_ghost	size=81870
+602	C2	fifo_ghost_drop	a06c804b9bd0840e:0:82023	-	dropped	
+603	C2	admit	95ea06fa912cbc99:0:82409	interactive	-	size=82409
+604	C2	fifo_admit	95ea06fa912cbc99:0:82409	-	small	size=82409 intent=interactive was_ghost=false small=10/842466B main=3/249806B region=0/0B ghost=1/1
+605	C2	fifo_evict_small	b0a6f754e7dc4e75:0:82527	-	to_ghost	size=82527
+606	C2	get_or_fetch	da6fe285c406094e:0:83844	interactive	fetched	role=leader from_cache=false bytes=83844
+607	acct	miss	da6fe285c406094e:0:83844	-	whole_fetched	
+608	C2	fifo_ghost_drop	aa08c189bc2251fe:0:81870	-	dropped	
+609	C2	get_or_fetch	95ea06fa912cbc99:0:82409	interactive	fetched	role=leader from_cache=false bytes=82409
+610	acct	miss	95ea06fa912cbc99:0:82409	-	whole_fetched	
+611	C2	admit	8e4845ba8c09eb77:0:83728	interactive	-	size=83728
+612	C2	fifo_admit	8e4845ba8c09eb77:0:83728	-	small	size=83728 intent=interactive was_ghost=false small=10/843667B main=3/249806B region=0/0B ghost=1/1
+613	C2	fifo_evict_small	32297dbf15e711fe:0:85060	-	to_ghost	size=85060
+614	C2	fifo_ghost_drop	b0a6f754e7dc4e75:0:82527	-	dropped	
+615	C2	get_or_fetch	8e4845ba8c09eb77:0:83728	interactive	fetched	role=leader from_cache=false bytes=83728
+616	acct	miss	8e4845ba8c09eb77:0:83728	-	whole_fetched	
+617	C2	admit	fc777304e7ddc553:0:82766	interactive	-	size=82766
+618	C2	get	09161411aa0bd56d:0:83118	interactive	miss	
+619	C2	fifo_admit	fc777304e7ddc553:0:82766	-	small	size=82766 intent=interactive was_ghost=false small=10/841373B main=3/249806B region=0/0B ghost=1/1
+620	C2	fifo_evict_small	7dc5e93e8d9e84b0:0:84167	-	to_ghost	size=84167
+621	C2	fifo_ghost_drop	32297dbf15e711fe:0:85060	-	dropped	
+622	C2	get_or_fetch	fc777304e7ddc553:0:82766	interactive	fetched	role=leader from_cache=false bytes=82766
+623	acct	miss	fc777304e7ddc553:0:82766	-	whole_fetched	
+624	C2	sf_leader_recheck	09161411aa0bd56d:0:83118	interactive	miss	
+625	C2	admit	367e776971e6087f:0:82345	interactive	-	size=82345
+626	C2	fifo_admit	367e776971e6087f:0:82345	-	small	size=82345 intent=interactive was_ghost=false small=10/839551B main=3/249806B region=0/0B ghost=1/1
+627	C2	fifo_evict_small	cd309dd1fc4931fb:0:84365	-	to_ghost	size=84365
+628	C2	fifo_ghost_drop	7dc5e93e8d9e84b0:0:84167	-	dropped	
+629	C2	get_or_fetch	367e776971e6087f:0:82345	interactive	fetched	role=leader from_cache=false bytes=82345
+630	acct	miss	367e776971e6087f:0:82345	-	whole_fetched	
+631	C2	get	cf241c4426a591c6:0:82463	interactive	miss	
+632	C2	sf_leader_recheck	cf241c4426a591c6:0:82463	interactive	miss	
+633	C2	admit	09161411aa0bd56d:0:83118	interactive	-	size=83118
+634	C2	fifo_admit	09161411aa0bd56d:0:83118	-	small	size=83118 intent=interactive was_ghost=false small=10/838304B main=3/249806B region=0/0B ghost=1/1
+635	C2	fifo_evict_small	e70ef8952d3b8c55:0:84247	-	to_ghost	size=84247
+636	C2	fifo_ghost_drop	cd309dd1fc4931fb:0:84365	-	dropped	
+637	C2	get_or_fetch	09161411aa0bd56d:0:83118	interactive	fetched	role=leader from_cache=false bytes=83118
+638	acct	miss	09161411aa0bd56d:0:83118	-	whole_fetched	
+639	C2	get	519d442ef931aa31:0:83489	interactive	miss	
+640	C2	sf_leader_recheck	519d442ef931aa31:0:83489	interactive	miss	
+641	C2	get	6a024199350d08de:0:82270	interactive	miss	
+642	C2	sf_leader_recheck	6a024199350d08de:0:82270	interactive	miss	
+643	C2	admit	cf241c4426a591c6:0:82463	interactive	-	size=82463
+644	C2	fifo_admit	cf241c4426a591c6:0:82463	-	small	size=82463 intent=interactive was_ghost=false small=10/836520B main=3/249806B region=0/0B ghost=1/1
+645	C2	fifo_evict_small	5aceeac724307b3a:0:85742	-	to_ghost	size=85742
+646	C2	fifo_ghost_drop	e70ef8952d3b8c55:0:84247	-	dropped	
+647	C2	get_or_fetch	cf241c4426a591c6:0:82463	interactive	fetched	role=leader from_cache=false bytes=82463
+648	acct	miss	cf241c4426a591c6:0:82463	-	whole_fetched	
+649	C2	admit	519d442ef931aa31:0:83489	interactive	-	size=83489
+650	C2	fifo_admit	519d442ef931aa31:0:83489	-	small	size=83489 intent=interactive was_ghost=false small=10/834267B main=3/249806B region=0/0B ghost=1/1
+651	C2	fifo_evict_small	44baa12e62cee44b:0:85402	-	to_ghost	size=85402
+652	C2	fifo_ghost_drop	5aceeac724307b3a:0:85742	-	dropped	
+653	C2	get_or_fetch	519d442ef931aa31:0:83489	interactive	fetched	role=leader from_cache=false bytes=83489
+654	acct	miss	519d442ef931aa31:0:83489	-	whole_fetched	
+655	C2	admit	6a024199350d08de:0:82270	interactive	-	size=82270
+656	C2	fifo_admit	6a024199350d08de:0:82270	-	small	size=82270 intent=interactive was_ghost=false small=10/831135B main=3/249806B region=0/0B ghost=1/1
+657	C2	fifo_evict_small	b4a666a41ff41445:0:84703	-	to_ghost	size=84703
+658	C2	fifo_ghost_drop	44baa12e62cee44b:0:85402	-	dropped	
+659	C2	get_or_fetch	6a024199350d08de:0:82270	interactive	fetched	role=leader from_cache=false bytes=82270
+660	acct	miss	6a024199350d08de:0:82270	-	whole_fetched	
+661	-	RUNEND	3	-	-	cache_hits=29 cache_misses=22 cache_bytes=256956
+662	-	RUN	4	-	-	typed_duration_threshold_count
+663	cat:HeadCache	get	Logs	-	hit	bytes=0
+664	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000001.cmt	-	hit	bytes=286
+665	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000002.cmt	-	hit	bytes=286
+666	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000003.cmt	-	hit	bytes=286
+667	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000004.cmt	-	hit	bytes=286
+668	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000005.cmt	-	hit	bytes=286
+669	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000006.cmt	-	hit	bytes=286
+670	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000007.cmt	-	hit	bytes=286
+671	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000008.cmt	-	hit	bytes=286
+672	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000009.cmt	-	hit	bytes=286
+673	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000010.cmt	-	hit	bytes=286
+674	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000011.cmt	-	hit	bytes=286
+675	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000012.cmt	-	hit	bytes=286
+676	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000013.cmt	-	hit	bytes=286
+677	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000014.cmt	-	hit	bytes=286
+678	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000015.cmt	-	hit	bytes=286
+679	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000016.cmt	-	hit	bytes=286
+680	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000017.cmt	-	hit	bytes=286
+681	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000018.cmt	-	hit	bytes=286
+682	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000019.cmt	-	hit	bytes=286
+683	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000020.cmt	-	hit	bytes=286
+684	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000021.cmt	-	hit	bytes=286
+685	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000022.cmt	-	hit	bytes=286
+686	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000023.cmt	-	hit	bytes=286
+687	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000024.cmt	-	hit	bytes=286
+688	cat:RecordCache	get	t/238ae9e47b130157d9ebaf042e6b04b3/l/c/0000/19700101T00/00000000-0000-0000-0000-000051000100.1.00000000000000000025.cmt	-	hit	bytes=286
+689	C2	get	648c733c62be88f7:0:84554	interactive	miss	
+690	C2	fifo_hit	e7178eb222613a3a:0:83303	-	interactive	freq_after=2 queue=main
+691	C2	get	e7178eb222613a3a:0:83303	interactive	hit	bytes=83303
+692	acct	hit	e7178eb222613a3a:0:83303	-	whole	
+693	C2	get	9734b16e68fb5a36:0:84581	interactive	miss	
+694	C2	sf_leader_recheck	648c733c62be88f7:0:84554	interactive	miss	
+695	C2	sf_leader_recheck	9734b16e68fb5a36:0:84581	interactive	miss	
+696	C2	get	aa08c189bc2251fe:0:81870	interactive	miss	
+697	C2	sf_leader_recheck	aa08c189bc2251fe:0:81870	interactive	miss	
+698	C2	get	a06c804b9bd0840e:0:82023	interactive	miss	
+699	C2	get	32297dbf15e711fe:0:85060	interactive	miss	
+700	C2	sf_leader_recheck	32297dbf15e711fe:0:85060	interactive	miss	
+701	C2	get	e33c5cf50d923622:0:84364	interactive	miss	
+702	C2	sf_leader_recheck	e33c5cf50d923622:0:84364	interactive	miss	
+703	C2	sf_leader_recheck	a06c804b9bd0840e:0:82023	interactive	miss	
+704	C2	get	b0a6f754e7dc4e75:0:82527	interactive	miss	
+705	C2	sf_leader_recheck	b0a6f754e7dc4e75:0:82527	interactive	miss	
+706	C2	admit	aa08c189bc2251fe:0:81870	interactive	-	size=81870
+707	C2	fifo_admit	aa08c189bc2251fe:0:81870	-	small	size=81870 intent=interactive was_ghost=false small=10/828302B main=3/249806B region=0/0B ghost=1/1
+708	C2	fifo_evict_small	da6fe285c406094e:0:83844	-	to_ghost	size=83844
+709	C2	fifo_ghost_drop	b4a666a41ff41445:0:84703	-	dropped	
+710	C2	get_or_fetch	aa08c189bc2251fe:0:81870	interactive	fetched	role=leader from_cache=false bytes=81870
+711	acct	miss	aa08c189bc2251fe:0:81870	-	whole_fetched	
+712	C2	admit	a06c804b9bd0840e:0:82023	interactive	-	size=82023
+713	C2	admit	e33c5cf50d923622:0:84364	interactive	-	size=84364
+714	C2	fifo_admit	a06c804b9bd0840e:0:82023	-	small	size=82023 intent=interactive was_ghost=false small=10/826481B main=3/249806B region=0/0B ghost=1/1
+715	C2	fifo_evict_small	95ea06fa912cbc99:0:82409	-	to_ghost	size=82409
+716	C2	fifo_ghost_drop	da6fe285c406094e:0:83844	-	dropped	
+717	C2	admit	b0a6f754e7dc4e75:0:82527	interactive	-	size=82527
+718	C2	get_or_fetch	a06c804b9bd0840e:0:82023	interactive	fetched	role=leader from_cache=false bytes=82023
+719	acct	miss	a06c804b9bd0840e:0:82023	-	whole_fetched	
+720	C2	fifo_admit	e33c5cf50d923622:0:84364	-	small	size=84364 intent=interactive was_ghost=false small=10/828436B main=3/249806B region=0/0B ghost=1/1
+721	C2	fifo_evict_small	8e4845ba8c09eb77:0:83728	-	to_ghost	size=83728
+722	C2	fifo_ghost_drop	95ea06fa912cbc99:0:82409	-	dropped	
+723	C2	get_or_fetch	e33c5cf50d923622:0:84364	interactive	fetched	role=leader from_cache=false bytes=84364
+724	acct	miss	e33c5cf50d923622:0:84364	-	whole_fetched	
+725	C2	fifo_admit	b0a6f754e7dc4e75:0:82527	-	small	size=82527 intent=interactive was_ghost=false small=10/827235B main=3/249806B region=0/0B ghost=1/1
+726	C2	fifo_evict_small	fc777304e7ddc553:0:82766	-	to_ghost	size=82766
+727	C2	fifo_ghost_drop	8e4845ba8c09eb77:0:83728	-	dropped	
+728	C2	admit	648c733c62be88f7:0:84554	interactive	-	size=84554
+729	C2	get_or_fetch	b0a6f754e7dc4e75:0:82527	interactive	fetched	role=leader from_cache=false bytes=82527
+730	acct	miss	b0a6f754e7dc4e75:0:82527	-	whole_fetched	
+731	C2	fifo_hit	85f2de5203e22c45:0:82406	-	interactive	freq_after=2 queue=main
+732	C2	get	85f2de5203e22c45:0:82406	interactive	hit	bytes=82406
+733	C2	fifo_admit	648c733c62be88f7:0:84554	-	small	size=84554 intent=interactive was_ghost=false small=10/829023B main=3/249806B region=0/0B ghost=1/1
+734	C2	fifo_evict_small	367e776971e6087f:0:82345	-	to_ghost	size=82345
+735	C2	admit	32297dbf15e711fe:0:85060	interactive	-	size=85060
+736	acct	hit	85f2de5203e22c45:0:82406	-	whole	
+737	C2	fifo_ghost_drop	fc777304e7ddc553:0:82766	-	dropped	
+738	C2	get_or_fetch	648c733c62be88f7:0:84554	interactive	fetched	role=leader from_cache=false bytes=84554
+739	C2	fifo_admit	32297dbf15e711fe:0:85060	-	small	size=85060 intent=interactive was_ghost=false small=10/831738B main=3/249806B region=0/0B ghost=1/1
+740	C2	admit	9734b16e68fb5a36:0:84581	interactive	-	size=84581
+741	C2	fifo_evict_small	09161411aa0bd56d:0:83118	-	to_ghost	size=83118
+742	C2	fifo_ghost_drop	367e776971e6087f:0:82345	-	dropped	
+743	acct	miss	648c733c62be88f7:0:84554	-	whole_fetched	
+744	C2	fifo_admit	9734b16e68fb5a36:0:84581	-	small	size=84581 intent=interactive was_ghost=false small=10/833201B main=3/249806B region=0/0B ghost=1/1
+745	C2	fifo_evict_small	cf241c4426a591c6:0:82463	-	to_ghost	size=82463
+746	C2	fifo_ghost_drop	09161411aa0bd56d:0:83118	-	dropped	
+747	C2	get_or_fetch	9734b16e68fb5a36:0:84581	interactive	fetched	role=leader from_cache=false bytes=84581
+748	acct	miss	9734b16e68fb5a36:0:84581	-	whole_fetched	
+749	C2	get	5aceeac724307b3a:0:85742	interactive	miss	
+750	C2	sf_leader_recheck	5aceeac724307b3a:0:85742	interactive	miss	
+751	C2	get_or_fetch	32297dbf15e711fe:0:85060	interactive	fetched	role=leader from_cache=false bytes=85060
+752	acct	miss	32297dbf15e711fe:0:85060	-	whole_fetched	
+753	C2	get	e70ef8952d3b8c55:0:84247	interactive	miss	
+754	C2	sf_leader_recheck	e70ef8952d3b8c55:0:84247	interactive	miss	
+755	C2	get	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+756	C2	sf_leader_recheck	7dc5e93e8d9e84b0:0:84167	interactive	miss	
+757	C2	get	b4a666a41ff41445:0:84703	interactive	miss	
+758	C2	sf_leader_recheck	b4a666a41ff41445:0:84703	interactive	miss	
+759	C2	admit	5aceeac724307b3a:0:85742	interactive	-	size=85742
+760	C2	fifo_hit	98abf5c94e51178e:0:84097	-	interactive	freq_after=2 queue=main
+761	C2	get	98abf5c94e51178e:0:84097	interactive	hit	bytes=84097
+762	acct	hit	98abf5c94e51178e:0:84097	-	whole	
+763	C2	admit	e70ef8952d3b8c55:0:84247	interactive	-	size=84247
+764	C2	fifo_admit	5aceeac724307b3a:0:85742	-	small	size=85742 intent=interactive was_ghost=false small=10/836480B main=3/249806B region=0/0B ghost=1/1
+765	C2	fifo_evict_small	519d442ef931aa31:0:83489	-	to_ghost	size=83489
+766	C2	admit	7dc5e93e8d9e84b0:0:84167	interactive	-	size=84167
+767	C2	fifo_ghost_drop	cf241c4426a591c6:0:82463	-	dropped	
+768	C2	get_or_fetch	5aceeac724307b3a:0:85742	interactive	fetched	role=leader from_cache=false bytes=85742
+769	acct	miss	5aceeac724307b3a:0:85742	-	whole_fetched	
+770	C2	fifo_admit	e70ef8952d3b8c55:0:84247	-	small	size=84247 intent=interactive was_ghost=false small=10/837238B main=3/249806B region=0/0B ghost=1/1
+771	C2	fifo_evict_small	6a024199350d08de:0:82270	-	to_ghost	size=82270
+772	C2	fifo_ghost_drop	519d442ef931aa31:0:83489	-	dropped	
+773	C2	get_or_fetch	e70ef8952d3b8c55:0:84247	interactive	fetched	role=leader from_cache=false bytes=84247
+774	acct	miss	e70ef8952d3b8c55:0:84247	-	whole_fetched	
+775	C2	fifo_admit	7dc5e93e8d9e84b0:0:84167	-	small	size=84167 intent=interactive was_ghost=false small=10/839135B main=3/249806B region=0/0B ghost=1/1
+776	C2	admit	b4a666a41ff41445:0:84703	interactive	-	size=84703
+777	C2	fifo_evict_small	aa08c189bc2251fe:0:81870	-	to_ghost	size=81870
+778	C2	fifo_ghost_drop	6a024199350d08de:0:82270	-	dropped	
+779	C2	get_or_fetch	7dc5e93e8d9e84b0:0:84167	interactive	fetched	role=leader from_cache=false bytes=84167
+780	acct	miss	7dc5e93e8d9e84b0:0:84167	-	whole_fetched	
+781	C2	get	cd309dd1fc4931fb:0:84365	interactive	miss	
+782	C2	fifo_admit	b4a666a41ff41445:0:84703	-	small	size=84703 intent=interactive was_ghost=false small=10/841968B main=3/249806B region=0/0B ghost=1/1
+783	C2	fifo_evict_small	a06c804b9bd0840e:0:82023	-	to_ghost	size=82023
+784	C2	get	44baa12e62cee44b:0:85402	interactive	miss	
+785	C2	fifo_ghost_drop	aa08c189bc2251fe:0:81870	-	dropped	
+786	C2	get_or_fetch	b4a666a41ff41445:0:84703	interactive	fetched	role=leader from_cache=false bytes=84703
+787	acct	miss	b4a666a41ff41445:0:84703	-	whole_fetched	
+788	C2	sf_leader_recheck	cd309dd1fc4931fb:0:84365	interactive	miss	
+789	C2	get	95ea06fa912cbc99:0:82409	interactive	miss	
+790	C2	sf_leader_recheck	95ea06fa912cbc99:0:82409	interactive	miss	
+791	C2	sf_leader_recheck	44baa12e62cee44b:0:85402	interactive	miss	
+792	C2	get	367e776971e6087f:0:82345	interactive	miss	
+793	C2	sf_leader_recheck	367e776971e6087f:0:82345	interactive	miss	
+794	C2	get	fc777304e7ddc553:0:82766	interactive	miss	
+795	C2	sf_leader_recheck	fc777304e7ddc553:0:82766	interactive	miss	
+796	C2	get	da6fe285c406094e:0:83844	interactive	miss	
+797	C2	sf_leader_recheck	da6fe285c406094e:0:83844	interactive	miss	
+798	C2	get	cf241c4426a591c6:0:82463	interactive	miss	
+799	C2	sf_leader_recheck	cf241c4426a591c6:0:82463	interactive	miss	
+800	C2	admit	44baa12e62cee44b:0:85402	interactive	-	size=85402
+801	C2	fifo_admit	44baa12e62cee44b:0:85402	-	small	size=85402 intent=interactive was_ghost=false small=10/845347B main=3/249806B region=0/0B ghost=1/1
+802	C2	fifo_evict_small	e33c5cf50d923622:0:84364	-	to_ghost	size=84364
+803	C2	fifo_ghost_drop	a06c804b9bd0840e:0:82023	-	dropped	
+804	C2	get_or_fetch	44baa12e62cee44b:0:85402	interactive	fetched	role=leader from_cache=false bytes=85402
+805	acct	miss	44baa12e62cee44b:0:85402	-	whole_fetched	
+806	C2	admit	cd309dd1fc4931fb:0:84365	interactive	-	size=84365
+807	C2	admit	367e776971e6087f:0:82345	interactive	-	size=82345
+808	C2	admit	95ea06fa912cbc99:0:82409	interactive	-	size=82409
+809	C2	fifo_admit	cd309dd1fc4931fb:0:84365	-	small	size=84365 intent=interactive was_ghost=false small=10/845348B main=3/249806B region=0/0B ghost=1/1
+810	C2	fifo_evict_small	b0a6f754e7dc4e75:0:82527	-	to_ghost	size=82527
+811	C2	admit	fc777304e7ddc553:0:82766	interactive	-	size=82766
+812	C2	fifo_ghost_drop	e33c5cf50d923622:0:84364	-	dropped	
+813	C2	get_or_fetch	cd309dd1fc4931fb:0:84365	interactive	fetched	role=leader from_cache=false bytes=84365
+814	acct	miss	cd309dd1fc4931fb:0:84365	-	whole_fetched	
+815	C2	admit	da6fe285c406094e:0:83844	interactive	-	size=83844
+816	C2	fifo_admit	367e776971e6087f:0:82345	-	small	size=82345 intent=interactive was_ghost=false small=10/845166B main=3/249806B region=0/0B ghost=1/1
+817	C2	fifo_evict_small	648c733c62be88f7:0:84554	-	to_ghost	size=84554
+818	C2	fifo_ghost_drop	b0a6f754e7dc4e75:0:82527	-	dropped	
+819	C2	get_or_fetch	367e776971e6087f:0:82345	interactive	fetched	role=leader from_cache=false bytes=82345
+820	acct	miss	367e776971e6087f:0:82345	-	whole_fetched	
+821	C2	fifo_admit	95ea06fa912cbc99:0:82409	-	small	size=82409 intent=interactive was_ghost=false small=10/843021B main=3/249806B region=0/0B ghost=1/1
+822	C2	fifo_evict_small	32297dbf15e711fe:0:85060	-	to_ghost	size=85060
+823	C2	fifo_ghost_drop	648c733c62be88f7:0:84554	-	dropped	
+824	C2	get_or_fetch	95ea06fa912cbc99:0:82409	interactive	fetched	role=leader from_cache=false bytes=82409
+825	acct	miss	95ea06fa912cbc99:0:82409	-	whole_fetched	
+826	C2	admit	cf241c4426a591c6:0:82463	interactive	-	size=82463
+827	C2	fifo_admit	fc777304e7ddc553:0:82766	-	small	size=82766 intent=interactive was_ghost=false small=10/840727B main=3/249806B region=0/0B ghost=1/1
+828	C2	fifo_evict_small	9734b16e68fb5a36:0:84581	-	to_ghost	size=84581
+829	C2	fifo_ghost_drop	32297dbf15e711fe:0:85060	-	dropped	
+830	C2	get_or_fetch	fc777304e7ddc553:0:82766	interactive	fetched	role=leader from_cache=false bytes=82766
+831	acct	miss	fc777304e7ddc553:0:82766	-	whole_fetched	
+832	C2	fifo_admit	da6fe285c406094e:0:83844	-	small	size=83844 intent=interactive was_ghost=false small=10/839990B main=3/249806B region=0/0B ghost=1/1
+833	C2	fifo_evict_small	5aceeac724307b3a:0:85742	-	to_ghost	size=85742
+834	C2	fifo_ghost_drop	9734b16e68fb5a36:0:84581	-	dropped	
+835	C2	get_or_fetch	da6fe285c406094e:0:83844	interactive	fetched	role=leader from_cache=false bytes=83844
+836	acct	miss	da6fe285c406094e:0:83844	-	whole_fetched	
+837	C2	fifo_admit	cf241c4426a591c6:0:82463	-	small	size=82463 intent=interactive was_ghost=false small=10/836711B main=3/249806B region=0/0B ghost=1/1
+838	C2	fifo_evict_small	e70ef8952d3b8c55:0:84247	-	to_ghost	size=84247
+839	C2	fifo_ghost_drop	5aceeac724307b3a:0:85742	-	dropped	
+840	C2	get_or_fetch	cf241c4426a591c6:0:82463	interactive	fetched	role=leader from_cache=false bytes=82463
+841	acct	miss	cf241c4426a591c6:0:82463	-	whole_fetched	
+842	C2	get	09161411aa0bd56d:0:83118	interactive	miss	
+843	C2	sf_leader_recheck	09161411aa0bd56d:0:83118	interactive	miss	
+844	C2	get	8e4845ba8c09eb77:0:83728	interactive	miss	
+845	C2	sf_leader_recheck	8e4845ba8c09eb77:0:83728	interactive	miss	
+846	C2	admit	09161411aa0bd56d:0:83118	interactive	-	size=83118
+847	C2	fifo_admit	09161411aa0bd56d:0:83118	-	small	size=83118 intent=interactive was_ghost=false small=10/835582B main=3/249806B region=0/0B ghost=1/1
+848	C2	fifo_evict_small	7dc5e93e8d9e84b0:0:84167	-	to_ghost	size=84167
+849	C2	fifo_ghost_drop	e70ef8952d3b8c55:0:84247	-	dropped	
+850	C2	get_or_fetch	09161411aa0bd56d:0:83118	interactive	fetched	role=leader from_cache=false bytes=83118
+851	acct	miss	09161411aa0bd56d:0:83118	-	whole_fetched	
+852	C2	get	519d442ef931aa31:0:83489	interactive	miss	
+853	C2	sf_leader_recheck	519d442ef931aa31:0:83489	interactive	miss	
+854	C2	get	6a024199350d08de:0:82270	interactive	miss	
+855	C2	sf_leader_recheck	6a024199350d08de:0:82270	interactive	miss	
+856	C2	admit	8e4845ba8c09eb77:0:83728	interactive	-	size=83728
+857	C2	fifo_admit	8e4845ba8c09eb77:0:83728	-	small	size=83728 intent=interactive was_ghost=false small=10/835143B main=3/249806B region=0/0B ghost=1/1
+858	C2	fifo_evict_small	b4a666a41ff41445:0:84703	-	to_ghost	size=84703
+859	C2	fifo_ghost_drop	7dc5e93e8d9e84b0:0:84167	-	dropped	
+860	C2	get_or_fetch	8e4845ba8c09eb77:0:83728	interactive	fetched	role=leader from_cache=false bytes=83728
+861	acct	miss	8e4845ba8c09eb77:0:83728	-	whole_fetched	
+862	C2	admit	519d442ef931aa31:0:83489	interactive	-	size=83489
+863	C2	fifo_admit	519d442ef931aa31:0:83489	-	small	size=83489 intent=interactive was_ghost=false small=10/833929B main=3/249806B region=0/0B ghost=1/1
+864	C2	fifo_evict_small	44baa12e62cee44b:0:85402	-	to_ghost	size=85402
+865	C2	fifo_ghost_drop	b4a666a41ff41445:0:84703	-	dropped	
+866	C2	get_or_fetch	519d442ef931aa31:0:83489	interactive	fetched	role=leader from_cache=false bytes=83489
+867	acct	miss	519d442ef931aa31:0:83489	-	whole_fetched	
+868	C2	admit	6a024199350d08de:0:82270	interactive	-	size=82270
+869	C2	fifo_admit	6a024199350d08de:0:82270	-	small	size=82270 intent=interactive was_ghost=false small=10/830797B main=3/249806B region=0/0B ghost=1/1
+870	C2	fifo_evict_small	cd309dd1fc4931fb:0:84365	-	to_ghost	size=84365
+871	C2	fifo_ghost_drop	44baa12e62cee44b:0:85402	-	dropped	
+872	C2	get_or_fetch	6a024199350d08de:0:82270	interactive	fetched	role=leader from_cache=false bytes=82270
+873	acct	miss	6a024199350d08de:0:82270	-	whole_fetched	
+874	-	RUNEND	4	-	-	cache_hits=29 cache_misses=22 cache_bytes=256956

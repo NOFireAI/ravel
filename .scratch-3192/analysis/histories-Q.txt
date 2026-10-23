@@ -1,0 +1,162 @@
+Q-1 run1: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+Q-1 run2: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+Q-1 run3: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+Q-1 run4: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+
+Q-1 s0/e7137e59 size=84554
+   run1: 57 get:miss; 80 admit:small; 84 fetch; 158 evict_small:to_ghost; 164 fifo_ghost_drop:dropped
+   run2: 260 get:miss; 299 admit:small; 305 fetch; 398 evict_small:to_ghost; 407 fifo_ghost_drop:dropped
+Q-1 s1/7424fa3e size=83303
+   run1: 63 get:miss; 87 admit:small; 88 fetch; 169 evict_small:to_ghost; 176 fifo_ghost_drop:dropped
+   run2: 261 get:miss; 319 admit:small; 322 fetch; 420 evict_small:to_ghost; 427 fifo_ghost_drop:dropped
+Q-1 s2/932bb185 size=84581
+   run1: 60 get:miss; 78 admit:small; 81 fetch; 150 evict_small:to_ghost; 159 fifo_ghost_drop:dropped
+   run2: 272 get:miss; 295 admit:small; 302 fetch; 394 evict_small:to_ghost; 399 fifo_ghost_drop:dropped
+Q-1 s3/a03dad78 size=82527
+   run1: 58 get:miss; 76 admit:small; 77 fetch; 146 evict_small:to_ghost; 153 fifo_ghost_drop:dropped
+   run2: 262 get:miss; 281 admit:small; 288 fetch; 378 evict_small:to_ghost; 389 fifo_ghost_drop:dropped
+Q-1 s4/a6d00295 size=81870
+   run1: 65 get:miss; 83 admit:small; 86 fetch; 163 evict_small:to_ghost; 170 fifo_ghost_drop:dropped
+   run2: 268 get:miss; 277 admit:small; 285 fetch; 365 evict_small:to_ghost; 379 fifo_ghost_drop:dropped
+Q-1 s5/4a45d7e3 size=82023
+   run1: 61 get:miss; 92 admit:small; 94 fetch; 175 evict_small:to_ghost; 181 fifo_ghost_drop:dropped
+   run2: 264 get:miss; 290 admit:small; 293 fetch; 388 evict_small:to_ghost; 395 fifo_ghost_drop:dropped
+Q-1 s6/500740be size=84364
+   run1: 68 get:miss; 96 admit:small; 97 fetch; 180 evict_small:to_ghost; 200 fifo_ghost_drop:dropped
+   run2: 266 get:miss; 308 admit:small; 311 fetch; 406 evict_small:to_ghost; 413 fifo_ghost_drop:dropped
+Q-1 s7/854cf645 size=85060
+   run1: 99 get:miss; 110 admit:small; 111 fetch; 199 evict_small:to_ghost; 205 fifo_ghost_drop:dropped
+   run2: 274 get:miss; 312 admit:small; 317 fetch; 412 evict_small:to_ghost; 421 fifo_ghost_drop:dropped
+Q-1 s8/0d16cf3b size=85402
+   run1: 101 get:miss; 114 admit:small; 116 fetch; 204 evict_small:to_ghost; 211 fifo_ghost_drop:dropped
+   run2: 324 get:miss; 336 admit:small; 339 fetch; 426 evict_small:to_ghost; 439 fifo_ghost_drop:dropped
+Q-1 s9/ff4edd8c size=82406
+   run1: 103 get:miss; 124 admit:small; 125 fetch; 218 evict_small:to_ghost; 224 fifo_ghost_drop:dropped
+   run2: 326 get:miss; 341 admit:small; 344 fetch; 438 evict_small:to_ghost; 445 fifo_ghost_drop:dropped
+Q-1 s10/4dca1f42 size=84365
+   run1: 104 get:miss; 120 admit:small; 121 fetch; 210 evict_small:to_ghost; 219 fifo_ghost_drop:dropped
+   run2: 328 get:miss; 351 admit:small; 354 fetch; 444 evict_small:to_ghost; 451 fifo_ghost_drop:dropped
+Q-1 s11/375d08b2 size=84703
+   run1: 106 get:miss; 128 admit:small; 129 fetch; 223 evict_small:to_ghost; 229 fifo_ghost_drop:dropped
+   run2: 330 get:miss; 359 admit:small; 362 fetch; 450 evict_small:to_ghost; 457 fifo_ghost_drop:dropped
+Q-1 s12/49f9bbcc size=85742
+   run1: 123 get:miss; 149 admit:small; 154 fetch
+   run2: 278 evict_small:to_ghost; 284 fifo_ghost_drop:dropped; 332 get:miss; 364 admit:small; 368 fetch; 456 evict_small:to_ghost
+Q-1 s13/4653a60a size=84247
+   run1: 127 get:miss; 145 admit:small; 147 fetch; 228 evict_small:to_ghost
+   run2: 279 fifo_ghost_drop:dropped; 346 get:miss; 387 admit:small; 390 fetch
+Q-1 s14/005049ac size=84167
+   run1: 133 get:miss; 156 admit:small; 160 fetch
+   run2: 283 evict_small:to_ghost; 292 fifo_ghost_drop:dropped; 348 get:miss; 377 admit:small; 380 fetch
+Q-1 s15/d7c0840d size=82409
+   run1: 135 get:miss; 162 admit:small; 166 fetch
+   run2: 291 evict_small:to_ghost; 297 fifo_ghost_drop:dropped; 356 get:miss; 393 admit:small; 400 fetch
+Q-1 s16/d3155aec size=83118
+   run1: 137 get:miss; 172 admit:small; 177 fetch
+   run2: 300 evict_small:to_ghost; 310 fifo_ghost_drop:dropped; 370 get:miss; 397 admit:small; 403 fetch
+Q-1 s17/22bd8f75 size=84097
+   run1: 139 get:miss; 168 admit:small; 171 fetch
+   run2: 296 evict_small:to_ghost; 301 fifo_ghost_drop:dropped; 372 get:miss; 405 admit:small; 408 fetch
+Q-1 s18/249cf9f1 size=83728
+   run1: 141 get:miss; 179 admit:small; 182 fetch
+   run2: 309 evict_small:to_ghost; 316 fifo_ghost_drop:dropped; 374 get:miss; 411 admit:small; 414 fetch
+Q-1 s19/35471e3f size=82463
+   run1: 184 get:miss; 197 admit:small; 201 fetch
+   run2: 315 evict_small:to_ghost; 321 fifo_ghost_drop:dropped; 382 get:miss; 419 admit:small; 422 fetch
+Q-1 s20/711e00af size=82345
+   run1: 186 get:miss; 203 admit:small; 206 fetch
+   run2: 320 evict_small:to_ghost; 338 fifo_ghost_drop:dropped; 384 get:miss; 425 admit:small; 428 fetch
+Q-1 s21/9b5de50a size=82766
+   run1: 188 get:miss; 209 admit:small; 214 fetch
+   run2: 337 evict_small:to_ghost; 343 fifo_ghost_drop:dropped; 416 get:miss; 437 admit:small; 440 fetch
+Q-1 s22/61307947 size=83844
+   run1: 190 get:miss; 217 admit:small; 220 fetch
+   run2: 342 evict_small:to_ghost; 353 fifo_ghost_drop:dropped; 430 get:miss; 443 admit:small; 446 fetch
+Q-1 s23/3c932cd1 size=83489
+   run1: 192 get:miss; 227 admit:small; 230 fetch
+   run2: 360 evict_small:to_ghost; 366 fifo_ghost_drop:dropped; 432 get:miss; 449 admit:small; 452 fetch
+Q-1 s24/f4d39b4b size=82270
+   run1: 193 get:miss; 222 admit:small; 225 fetch
+   run2: 352 evict_small:to_ghost; 361 fifo_ghost_drop:dropped; 434 get:miss; 455 admit:small; 458 fetch
+
+Q-2 run1: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+Q-2 run2: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+Q-2 run3: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+Q-2 run4: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+
+Q-2 s0/64e87ea7 size=84554
+   run1: 57 get:miss; 74 admit:small; 75 fetch; 136 evict_small:to_ghost; 141 fifo_ghost_drop:dropped
+   run2: 260 get:miss; 277 admit:small; 280 fetch; 364 evict_small:to_ghost; 371 fifo_ghost_drop:dropped
+Q-2 s1/cd5d2b91 size=83303
+   run1: 65 get:miss; 77 admit:small; 78 fetch; 140 evict_small:to_ghost; 161 fifo_ghost_drop:dropped
+   run2: 262 get:miss; 297 admit:small; 300 fetch; 396 evict_small:to_ghost; 403 fifo_ghost_drop:dropped
+Q-2 s2/8e11b524 size=84581
+   run1: 58 get:miss; 86 admit:small; 87 fetch; 166 evict_small:to_ghost; 173 fifo_ghost_drop:dropped
+   run2: 264 get:miss; 284 admit:small; 289 fetch; 370 evict_small:to_ghost; 391 fifo_ghost_drop:dropped
+Q-2 s3/04839c8f size=82527
+   run1: 67 get:miss; 92 admit:small; 94 fetch; 179 evict_small:to_ghost; 185 fifo_ghost_drop:dropped
+   run2: 266 get:miss; 291 admit:small; 295 fetch; 390 evict_small:to_ghost; 397 fifo_ghost_drop:dropped
+Q-2 s4/ff6bc3e7 size=81870
+   run1: 69 get:miss; 96 admit:small; 97 fetch; 184 evict_small:to_ghost; 192 fifo_ghost_drop:dropped
+   run2: 268 get:miss; 301 admit:small; 305 fetch; 402 evict_small:to_ghost; 409 fifo_ghost_drop:dropped
+Q-2 s5/7047bb08 size=82023
+   run1: 62 get:miss; 88 admit:small; 90 fetch; 172 evict_small:to_ghost; 180 fifo_ghost_drop:dropped
+   run2: 270 get:miss; 307 admit:small; 310 fetch; 408 evict_small:to_ghost; 417 fifo_ghost_drop:dropped
+Q-2 s6/3f32ac93 size=84364
+   run1: 59 get:miss; 80 admit:small; 81 fetch; 160 evict_small:to_ghost; 167 fifo_ghost_drop:dropped
+   run2: 272 get:miss; 312 admit:small; 317 fetch; 414 evict_small:to_ghost; 423 fifo_ghost_drop:dropped
+Q-2 s7/bbf4fcd1 size=85060
+   run1: 99 get:miss; 114 admit:small; 115 fetch; 189 evict_small:to_ghost; 197 fifo_ghost_drop:dropped
+   run2: 274 get:miss; 320 admit:small; 323 fetch; 422 evict_small:to_ghost; 428 fifo_ghost_drop:dropped
+Q-2 s8/e91b91e4 size=85402
+   run1: 101 get:miss; 118 admit:small; 119 fetch; 196 evict_small:to_ghost; 211 fifo_ghost_drop:dropped
+   run2: 319 get:miss; 338 admit:small; 342 fetch; 427 evict_small:to_ghost; 434 fifo_ghost_drop:dropped
+Q-2 s9/615e3ccc size=82406
+   run1: 107 get:miss; 125 admit:small; 128 fetch; 216 evict_small:to_ghost; 224 fifo_ghost_drop:dropped
+   run2: 325 get:miss; 344 admit:small; 347 fetch; 433 evict_small:to_ghost; 445 fifo_ghost_drop:dropped
+Q-2 s10/ce805050 size=84365
+   run1: 103 get:miss; 122 admit:small; 124 fetch; 210 evict_small:to_ghost; 217 fifo_ghost_drop:dropped
+   run2: 328 get:miss; 349 admit:small; 352 fetch; 444 evict_small:to_ghost; 451 fifo_ghost_drop:dropped
+Q-2 s11/14f98864 size=84703
+   run1: 111 get:miss; 139 admit:small; 142 fetch
+   run2: 278 evict_small:to_ghost; 288 fifo_ghost_drop:dropped; 330 get:miss; 356 admit:small; 359 fetch; 450 evict_small:to_ghost; 457 fifo_ghost_drop:dropped
+Q-2 s12/df31f6d6 size=85742
+   run1: 105 get:miss; 131 admit:small; 133 fetch; 222 evict_small:to_ghost; 228 fifo_ghost_drop:dropped
+   run2: 332 get:miss; 363 admit:small; 366 fetch; 456 evict_small:to_ghost
+Q-2 s13/6c33e1b5 size=84247
+   run1: 109 get:miss; 135 admit:small; 137 fetch; 227 evict_small:to_ghost
+   run2: 279 fifo_ghost_drop:dropped; 334 get:miss; 369 admit:small; 372 fetch
+Q-2 s14/b6f396ac size=84167
+   run1: 144 get:miss; 159 admit:small; 162 fetch
+   run2: 285 evict_small:to_ghost; 294 fifo_ghost_drop:dropped; 355 get:miss; 389 admit:small; 392 fetch
+Q-2 s15/16c80175 size=82409
+   run1: 146 get:miss; 165 admit:small; 168 fetch
+   run2: 292 evict_small:to_ghost; 299 fifo_ghost_drop:dropped; 374 get:miss; 395 admit:small; 398 fetch
+Q-2 s16/4cf655cc size=83118
+   run1: 148 get:miss; 171 admit:small; 174 fetch
+   run2: 298 evict_small:to_ghost; 304 fifo_ghost_drop:dropped; 376 get:miss; 413 admit:small; 418 fetch
+Q-2 s17/1f648e03 size=84097
+   run1: 150 get:miss; 177 admit:small; 181 fetch
+   run2: 302 evict_small:to_ghost; 309 fifo_ghost_drop:dropped; 378 get:miss; 401 admit:small; 404 fetch
+Q-2 s18/e55e6d32 size=83728
+   run1: 152 get:miss; 183 admit:small; 190 fetch
+   run2: 308 evict_small:to_ghost; 314 fifo_ghost_drop:dropped; 380 get:miss; 407 admit:small; 410 fetch
+Q-2 s19/f044f447 size=82463
+   run1: 154 get:miss; 188 admit:small; 193 fetch
+   run2: 313 evict_small:to_ghost; 322 fifo_ghost_drop:dropped; 382 get:miss; 419 admit:small; 424 fetch
+Q-2 s20/66d70e9a size=82345
+   run1: 156 get:miss; 195 admit:small; 198 fetch
+   run2: 321 evict_small:to_ghost; 341 fifo_ghost_drop:dropped; 383 get:miss; 426 admit:small; 429 fetch
+Q-2 s21/206b6eb0 size=82766
+   run1: 200 get:miss; 209 admit:small; 212 fetch
+   run2: 339 evict_small:to_ghost; 346 fifo_ghost_drop:dropped; 386 get:miss; 432 admit:small; 435 fetch
+Q-2 s22/39a2471c size=83844
+   run1: 202 get:miss; 215 admit:small; 218 fetch
+   run2: 345 evict_small:to_ghost; 351 fifo_ghost_drop:dropped; 431 get:miss; 449 admit:small; 452 fetch
+Q-2 s23/d4ab7393 size=83489
+   run1: 204 get:miss; 221 admit:small; 225 fetch
+   run2: 350 evict_small:to_ghost; 358 fifo_ghost_drop:dropped; 437 get:miss; 443 admit:small; 446 fetch
+Q-2 s24/4f05038c size=82270
+   run1: 206 get:miss; 226 admit:small; 229 fetch
+   run2: 357 evict_small:to_ghost; 365 fifo_ghost_drop:dropped; 440 get:miss; 455 admit:small; 458 fetch
+

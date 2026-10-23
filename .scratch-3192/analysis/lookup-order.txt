@@ -1,0 +1,16 @@
+P-1 run 1: s0 s6 s4 s3 s7 s2 s5 s14 s8 s13 s11 s15 s12 s10 s22 s16 s19 s18 s20 s21 s23 s24 s1 s9 s17
+P-1 run 2: s0 s1* s3 s5 s6 s4 s2 s7 s9* s8 s11 s14 s13 s17* s10 s12 s16 s15 s19 s22 s21 s18 s24 s20 s23
+P-1 run 3: s0 s1* s2 s3 s6 s5 s4 s7 s9* s14 s10 s13 s12 s8 s17* s11 s15 s22 s18 s21 s20 s16 s19 s23 s24
+P-1 run 4: s0 s1* s2 s4 s5 s7 s6 s3 s9* s12 s13 s14 s11 s17* s10 s8 s15 s20 s21 s22 s19 s16 s18 s23 s24
+P-2 run 1: s0 s3 s4 s2 s6 s7 s1 s15 s11 s10 s9 s12 s14 s8 s23 s19 s18 s17 s20 s16 s22 s24 s5 s13 s21
+P-2 run 2: s0 s1 s2 s3 s4 s5* s6 s7 s13* s11 s21* s10 s12 s14 s15 s9 s8 s19 s18 s22 s20 s23 s17 s16 s24
+P-2 run 3: s0 s1 s2 s3 s4 s5* s6 s7 s13* s10 s12 s21* s11 s14 s15 s9 s8 s18 s20 s19 s22 s23 s17 s16 s24
+P-2 run 4: s0 s1 s2 s3 s4 s5* s6 s7 s13* s21* s11 s12 s10 s15 s14 s9 s8 s19 s20 s23 s18 s22 s17 s16 s24
+Q-1 run 1: s0 s3 s2 s5 s1 s4 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24
+Q-1 run 2: s0 s1 s3 s5 s6 s4 s2 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24
+Q-1 run 3: s0 s1 s2 s3 s4 s5 s6 s7 s9 s8 s10 s11 s12 s13 s14 s15 s17 s16 s18 s19 s20 s21 s22 s23 s24
+Q-1 run 4: s0 s2 s1 s3 s5 s6 s4 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24
+Q-2 run 1: s0 s2 s6 s5 s1 s3 s4 s7 s8 s10 s12 s9 s13 s11 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24
+Q-2 run 2: s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24
+Q-2 run 3: s0 s1 s2 s5 s6 s4 s7 s3 s8 s9 s10 s11 s12 s13 s14 s15 s16 s17 s18 s19 s20 s21 s22 s23 s24
+Q-2 run 4: s0 s2 s4 s3 s1 s5 s6 s7 s8 s9 s10 s11 s12 s13 s14 s15 s17 s16 s18 s19 s20 s21 s22 s23 s24

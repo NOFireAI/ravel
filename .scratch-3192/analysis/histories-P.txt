@@ -1,0 +1,30 @@
+P-1 run1: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+P-1 run2: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=['s1/e7178eb2', 's9/85f2de52', 's17/98abf5c9'] to_main=['s1/e7178eb2', 's9/85f2de52', 's17/98abf5c9'] main_via_ghost=[] evict_main=0
+P-1 run3: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=['s1/e7178eb2', 's9/85f2de52', 's17/98abf5c9'] to_main=[] main_via_ghost=[] evict_main=0
+P-1 run4: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=['s1/e7178eb2', 's9/85f2de52', 's17/98abf5c9'] to_main=[] main_via_ghost=[] evict_main=0
+
+P-1 s1/e7178eb2 size=83303
+   run1: 208 get:miss; 211 admit:small; 214 fetch
+   run2: 262 fifo_hit(freq_after=1,small); 263 get:hit; 347 evict_small:to_main(freq=1)
+P-1 s9/85f2de52 size=82406
+   run1: 216 get:miss; 219 admit:small; 222 fetch
+   run2: 301 fifo_hit(freq_after=1,small); 302 get:hit; 348 evict_small:to_main(freq=1)
+P-1 s17/98abf5c9 size=84097
+   run1: 224 get:miss; 227 admit:small; 230 fetch
+   run2: 330 fifo_hit(freq_after=1,small); 331 get:hit; 349 evict_small:to_main(freq=1)
+
+P-2 run1: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=[] to_main=[] main_via_ghost=[] evict_main=0
+P-2 run2: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=['s5/506a46d9', 's13/12d4988f', 's21/da3d7361'] to_main=['s5/506a46d9', 's13/12d4988f', 's21/da3d7361'] main_via_ghost=[] evict_main=0
+P-2 run3: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=['s5/506a46d9', 's13/12d4988f', 's21/da3d7361'] to_main=[] main_via_ghost=[] evict_main=0
+P-2 run4: C2 gets=25 distinct=25 max/key=1 acct max/key=1 follower_or_lateserve=0 hits=['s5/506a46d9', 's13/12d4988f', 's21/da3d7361'] to_main=[] main_via_ghost=[] evict_main=0
+
+P-2 s5/506a46d9 size=82023
+   run1: 208 get:miss; 211 admit:small; 214 fetch
+   run2: 270 fifo_hit(freq_after=1,small); 271 get:hit; 353 evict_small:to_main(freq=1)
+P-2 s13/12d4988f size=84247
+   run1: 216 get:miss; 219 admit:small; 222 fetch
+   run2: 286 fifo_hit(freq_after=1,small); 287 get:hit; 355 evict_small:to_main(freq=1)
+P-2 s21/da3d7361 size=82766
+   run1: 224 get:miss; 227 admit:small; 230 fetch
+   run2: 324 fifo_hit(freq_after=1,small); 325 get:hit; 356 evict_small:to_main(freq=1)
+

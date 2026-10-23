@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "typed_duration_threshold_count",
+      "sql": "SELECT count(*) FROM logs WHERE duration_ms >= 1000",
+      "constructs": ["declared i64 typed comparison", "Filter (WHERE)", "count"],
+      "required_declarations": [{"key": "duration_ms", "ty": "i64"}]
+    }
+  ]
+}
