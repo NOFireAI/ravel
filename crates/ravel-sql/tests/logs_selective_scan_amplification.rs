@@ -1697,6 +1697,19 @@ async fn sub_break_even_segments_are_read_once() {
 
     let base = Arc::new(MemoryStore::new());
     let snapshot = build_snapshot(base.as_ref()).await;
+    let mut bloom_bytes = 0u64;
+    for seg in &snapshot.segments {
+        let obj = base
+            .get(&seg.data_object_key, GetRange::Full)
+            .await
+            .expect("get")
+            .data;
+        bloom_bytes += ravel_logseg::footer::open(&obj)
+            .expect("footer")
+            .section(ravel_logseg::footer::kind::BLOOM)
+            .expect("BLOOM")
+            .len;
+    }
     let planned = measure_with_snapshot(
         "q20 equality (planned)",
         &filters,
@@ -1774,9 +1787,10 @@ async fn sub_break_even_segments_are_read_once() {
         unplanned.row_lines, planned.row_lines,
         "both routes return the same rows"
     );
-    // The planned route, per object: two plan-phase GETs, two metadata GETs
-    // when the scan opens it, and four block-data GETs. Fewer bytes than the
-    // corpus, eight times the requests.
+    // The planned route, per object: two plan-phase GETs, one metadata GET
+    // when the scan opens it, and four block-data GETs. The I64 equality is a
+    // range arm, which BLOOM cannot answer, so the open does not fetch BLOOM.
+    // Fewer bytes than the corpus, seven times the requests.
     assert_eq!(
         (
             planned.gets,
@@ -1785,8 +1799,14 @@ async fn sub_break_even_segments_are_read_once() {
             planned.scan_phase_gets,
             planned.bytes
         ),
-        (64, 16, 16, 32, 197_690),
+        (56, 16, 8, 32, 167_066),
         "planned route cost on the same corpus"
+    );
+    assert_eq!(
+        (SEGMENTS as u64, bloom_bytes),
+        (8, 197_690 - 167_066),
+        "one BLOOM GET per object and the corpus's BLOOM bytes are what the \
+         open no longer fetches"
     );
 }
 

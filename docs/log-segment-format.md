@@ -1720,7 +1720,9 @@ section, but `RlogReader::scan` does not verify either. BLOCKS is read by
 page and by block, and verifying a whole-section crc would mean fetching
 the whole section, defeating the projection; its per-page and per-block
 crc32c are the access-path-verifiable equivalents. BLOOM is read whole by
-`scan` (one fetch of its stored bytes), and its checksums are the
+`scan` (one fetch of its stored bytes) when an arm can use it, a `HasWord`
+arm or a string `Equals` of at most 64 bytes, and not at all otherwise; its
+checksums are the
 covered-list crc and the per-entry crc above: the list crc covers every
 byte of the header that decides which columns may prune, and each entry's
 crc covers the filter it frames. The remaining bytes, `count` and each

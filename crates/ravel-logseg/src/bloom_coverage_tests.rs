@@ -279,6 +279,49 @@ fn flipped_coverage_list_is_refused_and_prunes_nothing() {
     }
 }
 
+/// A scan with no arm BLOOM could answer does not read the section, so a
+/// covered-column list that fails its crc does not set `bloom_degraded` for
+/// it. The cut-off is the one `bloom_arms` applies: an `Equals` on a string
+/// of 64 bytes reads the section and degrades, one of 65 bytes does not.
+///
+/// Prove-the-test: reading BLOOM whatever the arms in `scan_blocks` sets
+/// the flag on the predicate-free scan, and moving the cut-off by one byte
+/// either way flips one of the two `Equals` assertions.
+#[test]
+fn a_scan_with_no_bloom_shaped_arm_leaves_a_corrupt_bloom_unread() {
+    let mut object = object_without_note_coverage();
+    let dir = field_dir_of(&object);
+    let (note, region) = (str_column(&dir, "note"), str_column(&dir, "region"));
+    let bloom = open(&object)
+        .expect("open")
+        .section(kind::BLOOM)
+        .copied()
+        .expect("BLOOM");
+    let at = bloom.offset as usize + 4 + 2;
+    assert_eq!(object[at], region as u8);
+    object[at] = note as u8;
+
+    let cfg = RlogConfig::default();
+    let reader = RlogReader::new(&object, &cfg).expect("reader");
+    let (rows, stats) = reader.scan(&Predicate::And(Vec::new())).expect("scan");
+    assert_eq!(rows.len(), 2);
+    assert!(
+        !stats.bloom_degraded,
+        "a predicate-free scan reads no BLOOM"
+    );
+
+    let equals = |len: usize| Predicate::Equals {
+        field: FieldSel::Attr("region".into()),
+        value: AttrValue::Str("w".repeat(len)),
+    };
+    let (rows, stats) = reader.scan(&equals(64)).expect("scan");
+    assert!(rows.is_empty());
+    assert!(stats.bloom_degraded, "a 64-byte Equals reads BLOOM");
+    let (rows, stats) = reader.scan(&equals(65)).expect("scan");
+    assert!(rows.is_empty());
+    assert!(!stats.bloom_degraded, "a 65-byte Equals reads no BLOOM");
+}
+
 /// A BLOOM entry whose own crc fails is not a section degrade: the section
 /// still parses, `bloom_degraded` stays clear, and only that entry's block
 /// skips bloom pruning and reaches the exact scan. The entry's filter bits are
