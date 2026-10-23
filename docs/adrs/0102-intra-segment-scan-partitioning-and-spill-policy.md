@@ -688,7 +688,10 @@ DataFusion actually asked to reserve, not a predictive one). Findings 2 and 3
 are recorded and the compensation factor is derived and pinned so a future
 admission check has a bound to use, but nothing exercises it on a real query
 path yet; that wiring is unclaimed follow-up work, not part of this
-amendment's fix.
+amendment's fix. (The reserve-ahead amendment below supersedes that
+follow-up: the pool charges the migrated aggregate streams ahead of what
+they ask for, and `compensated_group_values_ceiling` stays without a
+caller.)
 
 ## Amendment (2026-10-09, #2633): the SQL pool holds a non-spillable aggregate's released bytes
 
@@ -970,3 +973,32 @@ cannot spill and are held, while a final aggregate on a runtime with a disk
 can shrink after a spill, which frees the memory, and is not held. ADR-1170's
 last-release hold amendment records the budget consequence and the tests
 that pin it.
+
+## Amendment (2026-10-23, #3181): the pool charges the migrated aggregate streams ahead of what they ask for
+
+<!-- amendment-applies: sections="Amendment (2026-08-27, #740): the pass-through spill error misattributes, and `GroupValues::size()` under-counts" pointer="reserve-ahead amendment" -->
+
+The #740 amendment derived `GROUP_VALUES_CEILING_COMPENSATION` (1.22 x 1.5)
+for a pre-execution admission check that was never built, and left
+`compensated_group_values_ceiling` without a caller. That compensation is
+superseded by the pool's own charge. On DataFusion 55.2 the migrated
+partial, final and single-stage hash aggregate streams grow their
+reservation only after `aggregate_batch` has grown the group table and the
+accumulator `Vec`s, so the pool now charges those consumers ahead of what
+they ask for (`AggregateReserveAhead`, `crates/ravel-sql/src/memory.rs`):
+every grow and shrink at an undercount factor (default 1.25) on the query,
+tenant and process ledgers, and, while a stream builds, an envelope for its
+next doubling on the process budget alone. ADR-1170's reserve-ahead
+amendment gives the envelope's arithmetic, which of the envelopes are
+reserved, and the tests that pin them.
+
+The factor and the envelope replace finding 3's 1.5 resize transient with a
+bound taken from what each stream has asked for: a hashbrown rehash with the
+old table live, at most 4.86 times the largest single grow, and a `Vec`
+realloc that moves, at most 4 times it. Neither covers what a stream
+allocates before its first reservation, nor the emit phase, where a final or
+single-stage stream materializes every group while its state is still live;
+the matrix in `crates/ravel-sql/tests/group_by_reservation_lag.rs` reports
+both phases separately. The partial-reduce stream
+(`PartialReduceHashAggregateStream[..]`) and the legacy
+`GroupedHashAggregateStream` are charged one to one, as before.
