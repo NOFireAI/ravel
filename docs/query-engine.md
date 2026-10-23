@@ -1492,9 +1492,13 @@ DataFusion 55.2 runs most grouped aggregates on its migrated streams
 (`PartialHashAggregateStream`, `FinalHashAggregateStream`,
 `SingleHashAggregateStream` and their ordered and partial-reduce variants).
 Each keeps its materialized output reserved in the SQL query memory pool
-(`TenantDelegatingPool`) until the last `batch_size` slice has been cut from
-it, and the pool forwards their shrinks to the query, tenant and process
-budgets at once (`crates/ravel-sql/tests/aggregate_emit_reservation.rs`).
+(`TenantDelegatingPool`) while it cuts `batch_size` slices from it, but the
+final and single-stage streams resize that reservation to zero as they return
+the last slice, which still points into the output buffers. For a final or
+single-stage stream that cannot spill, the pool holds that last release on
+the query, tenant and process budgets until the stream's consumer unregisters;
+every other shrink of a migrated stream is forwarded at once
+(`crates/ravel-sql/tests/aggregate_emit_reservation.rs`).
 
 Those slices share the materialized batch's buffers, and
 `RecordBatch::get_array_memory_size` reports every buffer an array
