@@ -74,6 +74,13 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                evaluate the lane's relative bands, print the
                                table, exit 1 on a miss; without RUN_TOML the
                                arms' extra server flags must be equal
+  memory-gap BANDS A.json A.tgz B.json B.tgz RUN_TOML
+                               judge ADR-1170's memory gap (allocated minus
+                               the unique tracked bytes) on arm B's concurrent
+                               /metrics scrapes per round and pooled, print
+                               arm A's figures as context, exit 1 on a miss;
+                               skipped when BANDS leaves either adr1170_* key
+                               out or a placeholder
 
 results.json carries SqlLatencyReport's statement shape
 (crates/ravel-bench/src/sql_latency.rs), so the runbook's analyse.py
@@ -140,7 +147,8 @@ LANE_BANDS = {
 # section: either way that band is skipped and adds no row.
 OPTIONAL_LANE_BANDS = {
     "rlog": {
-        "relative": ("healthz_p99_max_ratio_4318", "healthz_p99_max_ratio_4319"),
+        "relative": ("healthz_p99_max_ratio_4318", "healthz_p99_max_ratio_4319",
+                     "adr1170_gap_max_bytes", "adr1170_gap_share_above_max"),
         "absolute": ("healthz_p99_ms_max_4318", "healthz_p99_ms_max_4319"),
     },
 }
@@ -1534,6 +1542,144 @@ def healthz_relative(rel, a, b):
     return out
 
 
+# ADR-1170's gap between the allocator's allocated bytes and the unique
+# tracked bytes (decisions 3 and 4), each term a series as metrics.jsonl
+# records it and its sign in the gap.
+GAP_TERMS = (
+    ('ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}', 1),
+    ('ravel_cache_resident_bytes{mode="all",cache="fetch"}', -1),
+    ('ravel_cache_resident_bytes{mode="all",cache="catalog"}', -1),
+    ('ravel_memory_reserved_bytes{mode="all",component="sql"}', -1),
+    ('ravel_memory_reserved_bytes{mode="all",component="fetch"}', -1),
+    ('ravel_memory_handoff_overlap_bytes{mode="all"}', 1),
+)
+GAP_KEYS = ("adr1170_gap_max_bytes", "adr1170_gap_share_above_max")
+
+
+def scrape_gap(memory):
+    """allocated - cache_fetch - cache_catalog - reserved_sql - reserved_fetch
+    + handoff_overlap, or the list of GAP_TERMS series MEMORY lacks."""
+    memory = memory if isinstance(memory, dict) else {}
+    missing = [s for s, _ in GAP_TERMS if not _num(memory.get(s))]
+    if missing:
+        return None, missing
+    return sum(sign * memory[s] for s, sign in GAP_TERMS), []
+
+
+def memory_gap_rounds(tgz, rounds, bar):
+    """Per concurrent round, from out/concurrent/round-N/healthz/metrics.jsonl
+    in the evidence tarball TGZ: the answered scrapes, the unanswered ones
+    skipped, the max gap and the scrapes whose gap is above BAR. An answered
+    scrape missing a GAP_TERMS series, and a round with no answered scrape,
+    are refusals."""
+    if not rounds:
+        raise Refusal("adr1170 gap: %s records no concurrent round" % tgz)
+    out = []
+    try:
+        t = tarfile.open(tgz)
+    except (OSError, tarfile.TarError) as e:
+        raise Refusal("adr1170 gap: cannot read %s: %s" % (tgz, e))
+    with t:
+        for n in rounds:
+            name = "out/concurrent/round-%d/healthz/metrics.jsonl" % n
+            try:
+                f = t.extractfile(name)
+                lines = f.read().decode("utf-8").splitlines() if f else None
+            except (OSError, KeyError, tarfile.TarError) as e:
+                raise Refusal("adr1170 gap: round %d: cannot read %s from %s: %s"
+                              % (n, name, tgz, e))
+            if lines is None:
+                raise Refusal("adr1170 gap: round %d: %s holds no %s" % (n, tgz, name))
+            gaps, unanswered = [], 0
+            for i, line in enumerate(lines, 1):
+                try:
+                    rec = json.loads(line)
+                except ValueError as e:
+                    raise Refusal("adr1170 gap: round %d: %s:%s:%d is not a JSON line: %s"
+                                  % (n, tgz, name, i, e))
+                if not isinstance(rec, dict) or rec.get("answered") is not True:
+                    unanswered += 1
+                    continue
+                gap, missing = scrape_gap(rec.get("memory"))
+                if missing:
+                    raise Refusal("adr1170 gap: round %d: %s:%s:%d is an answered scrape "
+                                  "missing %s" % (n, tgz, name, i, ", ".join(missing)))
+                gaps.append(gap)
+            if not gaps:
+                raise Refusal("adr1170 gap: round %d: %s:%s holds no answered scrape (%d "
+                              "unanswered)" % (n, tgz, name, unanswered))
+            above = sum(1 for g in gaps if g > bar)
+            out.append({"round": n, "scrapes": len(gaps), "unanswered": unanswered,
+                        "max_gap": max(gaps), "above": above, "share": above / len(gaps)})
+    return out
+
+
+def _gap_pool(rounds):
+    scrapes = sum(r["scrapes"] for r in rounds)
+    above = sum(r["above"] for r in rounds)
+    return {"round": None, "scrapes": scrapes, "above": above, "share": above / scrapes,
+            "unanswered": sum(r["unanswered"] for r in rounds),
+            "max_gap": max(r["max_gap"] for r in rounds)}
+
+
+def _gap_text(fig, bar):
+    return "%.1f %% of %d scrapes > %d (max %s; %d unanswered skipped)" % (
+        fig["share"] * 100.0, fig["scrapes"], bar, "{:,.0f}".format(fig["max_gap"]),
+        fig["unanswered"])
+
+
+def _gap_absent(report, phases):
+    if report.get("concurrent") is None:
+        return "no concurrent phase ran"
+    if "concurrent" not in phases:
+        return "run.toml's healthz_phases leaves concurrent out"
+    return ""
+
+
+def memory_gap(path, a_json, a_tgz, b_json, b_tgz, run_toml):
+    """ADR-1170's memory gap band, judged on arm B's concurrent rounds only: per
+    round and pooled, the share of answered scrapes whose gap is above
+    adr1170_gap_max_bytes at most adr1170_gap_share_above_max. Arm A's figures
+    are printed as context and never judged; a refusal on A is printed, not
+    raised. Returns the rows judged."""
+    a, b = validate(a_json), validate(b_json)
+    sections = b["provenance"]["band_sections"]
+    if "relative" not in sections:
+        return []
+    rel = check_bands(lane_of(path), path, sections)["relative"]
+    unset = [k for k in GAP_KEYS if rel.get(k) is None or _placeholder(rel.get(k))]
+    if unset:
+        print("adr1170 gap: skipped, %s missing or a placeholder in %s"
+              % (" and ".join(unset), path))
+        return []
+    bar, share_max = rel["adr1170_gap_max_bytes"], rel["adr1170_gap_share_above_max"]
+    phases = healthz_phases(check_run(run_toml))
+    label = "adr1170 gap %s share > " + "%d" % bar
+    absent = _gap_absent(a, phases)
+    if absent:
+        print("adr1170 gap A (context, not judged): %s" % absent)
+    else:
+        try:
+            rounds = memory_gap_rounds(a_tgz, [rd["round"] for rd in a["concurrent"]["rounds"]],
+                                       bar)
+            for fig in rounds + [_gap_pool(rounds)]:
+                print("adr1170 gap A %s (context, not judged): %s"
+                      % ("round %d" % fig["round"] if fig["round"] is not None else "pooled",
+                         _gap_text(fig, bar)))
+        except Refusal as e:
+            print("adr1170 gap A (context, not judged): unreadable: %s" % e)
+    absent = _gap_absent(b, phases)
+    if absent:
+        return [_row("relative", label % "(no round)", None, share_max, "inconclusive", absent)]
+    rounds = memory_gap_rounds(b_tgz, [rd["round"] for rd in b["concurrent"]["rounds"]], bar)
+    out = []
+    for fig in rounds + [_gap_pool(rounds)]:
+        name = "round %d" % fig["round"] if fig["round"] is not None else "pooled"
+        out.append(_row("relative", label % name, fig["share"], share_max,
+                        "pass" if fig["share"] <= share_max else "miss", _gap_text(fig, bar)))
+    return out
+
+
 def fold_perf(lines):
     """`perf script` output folded to one `comm;outer;...;leaf count` line per
     distinct stack, the form flamegraph.pl and inferno read."""
@@ -1982,6 +2128,10 @@ def main(argv):
             a, b = validate(args[1]), validate(args[2])
             rows = relative_bands(args[0], a, b, declared_flags(args[3] if len(args) == 4 else None))
             print_table(rows, "B vs A")
+            return 1 if any(r["verdict"] == "miss" for r in rows) else 0
+        elif cmd == "memory-gap" and len(args) == 6:
+            rows = memory_gap(*args)
+            print_table(rows, "B")
             return 1 if any(r["verdict"] == "miss" for r in rows) else 0
         else:
             print(__doc__, file=sys.stderr)
