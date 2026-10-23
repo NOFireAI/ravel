@@ -158,7 +158,9 @@ counter, because its two consumers account differently:
   DataFusion `grow`, `try_grow` and `shrink` to it 1:1 with rollback on
   refusal (`memory.rs:264-348`; a held aggregate's shrink is the one
   exception, see the aggregate hold amendment below, which the DataFusion
-  55.2 hold amendment below narrows to the legacy aggregate stream); the
+  55.2 hold amendment below narrows to the legacy aggregate stream and the
+  last-release hold amendment below extends to the migrated final and
+  single-stage streams' shrink to zero); the
   adapter forwards
   each of those to the
   process counter with the same delta, in the same order, so process-level
@@ -1166,7 +1168,10 @@ DataFusion 55.2 runs most grouped aggregates on migrated streams that keep
 an emitted batch reserved until the last `batch_size` slice is cut from it
 and register consumers under other names, so `TenantDelegatingPool`
 forwards their `grow`, `try_grow` and `shrink` to the counters 1:1, as
-decision 1 states. The held shrink of the #2633 amendment now arises only
+decision 1 states. (The last-release hold amendment below corrects this:
+the migrated final and single-stage streams resize their reservation to
+zero as they return the last slice, and the pool holds that shrink.) The
+held shrink of the #2633 amendment now arises only
 from the legacy `GroupedHashAggregateStream`, which DataFusion 55.2 still
 runs for the shapes `AggregateExec::execute_typed` has not migrated and
 marks unable to spill (a single-stage aggregate with a limit or over ordered
@@ -1372,3 +1377,39 @@ pin the budget but give the operator nothing to check the limit against.
 Refusing on the headroom as well as the floor was rejected: the headroom is
 measured on one workload and partly extrapolated, and a refusal there would
 block a cluster whose own measurement shows it is safe.
+
+## Amendment (2026-10-23, #3181): the migrated final and single-stage streams' last release is held
+
+<!-- amendment-applies: sections="1. `MemoryBudget`, a process-wide accountant|Amendment (2026-10-10, #2720): on DataFusion 55.2 the hold covers only the legacy aggregate stream" pointer="last-release hold amendment" -->
+
+The DataFusion 55.2 hold amendment says the migrated streams keep an
+emitted batch reserved until the last `batch_size` slice is cut from it.
+They keep it reserved while they cut slices, but `FinalHashAggregateStream`
+and `SingleHashAggregateStream` resize their reservation to zero as they
+return the last slice, and that slice still points into the whole
+materialized output (`datafusion-physical-plan` 55.2,
+`aggregates/hash_stream.rs` and `aggregates/single_stream.rs`, the
+`ProducingOutput` handler). A trace measured on #3181 (comment 6361507509)
+read 124 MiB live with 0 reserved.
+
+`TenantDelegatingPool` now holds that shrink for a consumer named
+`FinalHashAggregateStream[..]` or `SingleHashAggregateStream[..]` that
+cannot spill, when the reservation's size after the shrink is zero.
+`MemoryReservation` lowers its own size before it calls the pool, so a zero
+there marks the last release. A shrink that leaves the reservation above
+zero is released at once, as before, and the legacy stream's hold is
+unchanged. The held bytes are released when the consumer unregisters, as
+the legacy hold's are, so cancellation still returns every byte; until then
+the budgets can read above what is live by at most the stream's own peak
+reservation. A consumer that can spill is not held, for the reason
+ADR-0102's aggregate hold amendment gives.
+
+The unit tests in `crates/ravel-sql/src/memory.rs`
+(`a_final_aggregate_shrink_to_zero_is_held_until_it_unregisters`,
+`a_spillable_final_aggregate_releases_its_last_shrink` and
+`a_non_aggregate_unspillable_consumer_releases_its_last_shrink`) pin the
+selection, and `the_last_emitted_slice_stays_reserved_until_it_is_dropped`
+in `crates/ravel-sql/tests/aggregate_emit_reservation.rs` pins it through
+the production pool: after a `GROUP BY` planned with a final aggregate has
+returned its last batch, the pool still reserves at least that batch's
+bytes, and it returns to zero once the batch and the stream drop.
