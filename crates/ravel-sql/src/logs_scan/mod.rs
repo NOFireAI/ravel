@@ -29,7 +29,12 @@
 //!   a queue's consecutive row groups of one segment in ascending position
 //!   merged into one run, and the runs published in the order of their first
 //!   row group ([`global_runs`]). The earliest row groups are taken first,
-//!   and each run is read in its global order.
+//!   and each run is read in its global order. Without that TopK and without
+//!   a pushed fetch, a repeated scan publishes its segments in reverse on
+//!   alternate executions, counted in the executor's [`ScanExecutions`]
+//!   (ADR-0102's #3192 amendment, [`Alternation`]), so each execution reads
+//!   first what the previous one read last, while the cache still holds it.
+//!   The whole-segment fast path keeps its deal in either case.
 //! - **Un-cached: segment-granular.** Each segment is one unit, so every
 //!   segment is opened by exactly one partition. The partition count is
 //!   capped at the segment count.
@@ -421,6 +426,7 @@ mod scan;
 mod threshold;
 
 use batch::*;
+pub(crate) use plan::ScanExecutions;
 use plan::*;
 use scan::*;
 use threshold::*;
@@ -1272,6 +1278,14 @@ pub struct LogsScanExec {
     /// from, so events from different partitions can be ordered against each
     /// other. Taken when the plan node is built, before any partition exists.
     created_at: Instant,
+    /// The executor's record of how often each scan has run (issue #3192),
+    /// from [`crate::logs_provider::LogsTableProvider::with_scan_executions`].
+    /// `None` publishes every execution in [`visit_order`].
+    scan_executions: Option<Arc<ScanExecutions>>,
+    /// This plan node's publication direction once its first publication has
+    /// counted it ([`Alternation::reversed`]), shared with its siblings so
+    /// every partition and re-execution round takes the same one.
+    reversed: Arc<std::sync::OnceLock<bool>>,
 }
 
 /// Which conjunct kept a statement off the predicate-free full-window
@@ -1704,6 +1718,7 @@ impl LogsScanExec {
                 .with_key_equals(Arc::clone(&self.key_equals))
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
+                .with_scan_executions(self.scan_executions.clone())
         })
     }
 
@@ -1748,6 +1763,7 @@ impl LogsScanExec {
                 .with_key_equals(Arc::clone(&self.key_equals))
                 .with_fetch_pushed(self.fetch)
                 .with_topk(self.topk.clone())
+                .with_scan_executions(self.scan_executions.clone())
         })
     }
 
@@ -1793,6 +1809,18 @@ impl LogsScanExec {
     /// (ADR-2707 decision 5), from [`crate::logs_pushdown::LogsPushdown::key_equals`].
     pub(crate) fn with_key_equals(mut self, key_equals: Arc<Vec<KeyEquals>>) -> Self {
         self.key_equals = key_equals;
+        self
+    }
+
+    /// Hand this scan the executor's record of scan executions (issue
+    /// #3192), so a repeated execution with a read cache, no confirmed TopK
+    /// and no pushed fetch publishes its units in the opposite direction to
+    /// the previous one ([`Alternation`]).
+    pub(crate) fn with_scan_executions(
+        mut self,
+        scan_executions: Option<Arc<ScanExecutions>>,
+    ) -> Self {
+        self.scan_executions = scan_executions;
         self
     }
 
@@ -1910,6 +1938,8 @@ impl LogsScanExec {
             phase_accounting: self.phase_accounting.clone(),
             metrics: self.metrics.clone(),
             created_at: self.created_at,
+            scan_executions: self.scan_executions.clone(),
+            reversed: Arc::clone(&self.reversed),
         }
     }
 
@@ -2058,6 +2088,8 @@ impl LogsScanExec {
             phase_accounting,
             metrics: ExecutionPlanMetricsSet::new(),
             created_at: Instant::now(),
+            scan_executions: None,
+            reversed: Arc::new(std::sync::OnceLock::new()),
         })
     }
 
@@ -3040,7 +3072,7 @@ impl ExecutionPlan for LogsScanExec {
         // falls to the plan-then-stripe path below, byte for byte, and records
         // which conjunct sent it there.
         let blocks = BlockMetrics::new(&self.metrics, partition);
-        let (work, round, fast_whole_segment, state) =
+        let (work, round, alternation, fast_whole_segment, state) =
             match self.whole_segment_fast_path(&ctx.query) {
                 Ok(relevant) => {
                     let n = self.target_partitions.max(1).min(relevant.max(1));
@@ -3053,7 +3085,7 @@ impl ExecutionPlan for LogsScanExec {
                         partition,
                         n,
                     );
-                    (work, None, true, LogScanState::NextSegment)
+                    (work, None, None, true, LogScanState::NextSegment)
                 }
                 Err(reason) => {
                     BlockMetrics::record_fast_path_rejection(&self.metrics, partition, reason);
@@ -3073,9 +3105,29 @@ impl ExecutionPlan for LogsScanExec {
                         self.active_topk().is_some(),
                         blocks.plan_init_elapsed.clone(),
                     );
+                    let alternation = Alternation::for_scan(
+                        self.scan_executions.as_ref(),
+                        self.stripe_blocks,
+                        self.active_topk().is_some(),
+                        self.fetch,
+                        || {
+                            ScanExecutions::key(
+                                self.tenant_hash,
+                                &self.segments,
+                                &self.projection,
+                                &self.attr_keys,
+                                self.row_refs,
+                                &self.content,
+                                &self.prune,
+                                &self.key_equals,
+                            )
+                        },
+                        &self.reversed,
+                    );
                     (
                         VecDeque::new(),
                         Some(self.units.join(partition)),
+                        alternation,
                         false,
                         LogScanState::Planning(counts_fut),
                     )
@@ -3125,6 +3177,7 @@ impl ExecutionPlan for LogsScanExec {
             segments: Arc::clone(&self.segments),
             work,
             round,
+            alternation,
             queue: None,
             resident: reservation.new_empty(),
             reservation,
@@ -3261,6 +3314,10 @@ struct LogScanStream {
     /// The planned route's membership of its execution round; `None` on the
     /// fast path and once the stream is finished.
     round: Option<RoundTicket>,
+    /// The planned route's publication direction (issue #3192); `None` on the
+    /// fast path and wherever [`Alternation::for_scan`] leaves the order as
+    /// it was.
+    alternation: Option<Alternation>,
     /// The round's shared unit queue, set once [`LogScanState::Planning`]
     /// resolves; this partition takes its next unit from it.
     queue: Option<Arc<UnitQueue>>,

@@ -1508,7 +1508,11 @@ impl LogScanStream {
                         }
                         this.queue = this.round.as_ref().map(|round| {
                             round.queue(|| {
-                                let order = visit_order(&this.segments, this.topk.is_some());
+                                let order = publication_order(
+                                    &this.segments,
+                                    this.topk.is_some(),
+                                    this.alternation.as_ref(),
+                                );
                                 counts.publish(
                                     &this.segments,
                                     &order,

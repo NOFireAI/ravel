@@ -1,5 +1,10 @@
 use super::*;
 
+use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::{Mutex, OnceLock, PoisonError};
+
 /// The shared per-segment block plan (ADR-0102): for each segment, in snapshot
 /// order, its [`PlannedUnit`], or `None` for a ts-irrelevant segment (no GET,
 /// no blocks) and for an unplanned one. Computed once; [`Self::publish`] turns
@@ -1039,6 +1044,194 @@ pub(super) fn visit_order(segments: &[SegmentRef], by_min_ts: bool) -> Vec<usize
     order
 }
 
+/// The publication order of the planned route: [`visit_order`], reversed
+/// when `alternation` says this execution of the scan runs backwards
+/// (issue #3192). Each segment's runs stay contiguous and in group order,
+/// since [`PlanCounts::units`] cuts them per segment in whatever order it
+/// is handed.
+pub(super) fn publication_order(
+    segments: &[SegmentRef],
+    by_min_ts: bool,
+    alternation: Option<&Alternation>,
+) -> Vec<usize> {
+    let mut order = visit_order(segments, by_min_ts);
+    if alternation.is_some_and(Alternation::reversed) {
+        order.reverse();
+    }
+    order
+}
+
+/// The most scans [`ScanExecutions`] remembers.
+pub(crate) const SCAN_EXECUTIONS_CAPACITY: usize = 4096;
+
+/// How many times each logs scan has published its units, keyed by
+/// [`ScanExecutions::key`] (issue #3192). Owned by
+/// [`crate::executor::SqlExecutor`] and handed to every logs scan it plans,
+/// held in process memory, bounded at [`SCAN_EXECUTIONS_CAPACITY`] entries
+/// with the least recently counted dropped first, and charged to no cache. A
+/// restart or a dropped entry starts that scan's count again at zero.
+pub(crate) struct ScanExecutions {
+    inner: Mutex<ExecutionEntries>,
+}
+
+#[derive(Default)]
+struct ExecutionEntries {
+    /// Key to (executions counted, counting sequence).
+    by_key: HashMap<u64, (u64, u64)>,
+    /// Counting sequence to key, oldest first.
+    by_age: BTreeMap<u64, u64>,
+    next_seq: u64,
+}
+
+impl ScanExecutions {
+    pub(crate) fn new() -> Self {
+        ScanExecutions {
+            inner: Mutex::new(ExecutionEntries::default()),
+        }
+    }
+
+    /// The record key of a scan: the tenant, the resolved segment set by
+    /// content hash in snapshot order, the projection (with its per-key
+    /// attribute columns and row refs) and the pushed filters. The time
+    /// bounds are not in it: the segment set is what the window selects, so
+    /// a relative window re-sent with fresh bounds over the same objects
+    /// keeps its count. Two scans whose keys collide share a count, which
+    /// only moves a publication direction.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn key(
+        tenant_hash: TenantHash,
+        segments: &[SegmentRef],
+        projection: &[usize],
+        attr_keys: &[String],
+        row_refs: bool,
+        content: &[Predicate],
+        prune: &[Predicate],
+        key_equals: &[KeyEquals],
+    ) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        tenant_hash.0.hash(&mut hasher);
+        segments.len().hash(&mut hasher);
+        for seg in segments {
+            seg.content_hash.hash(&mut hasher);
+        }
+        projection.hash(&mut hasher);
+        attr_keys.hash(&mut hasher);
+        row_refs.hash(&mut hasher);
+        // `Predicate` has no `Hash`: its `Equals` arm holds an `AttrValue`,
+        // which can be an `f64`. Its `Debug` text stands in for one.
+        format!("{content:?}").hash(&mut hasher);
+        format!("{prune:?}").hash(&mut hasher);
+        key_equals.len().hash(&mut hasher);
+        for key in key_equals {
+            key.field.hash(&mut hasher);
+            key.key_type.hash(&mut hasher);
+            key.key8.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Count one more execution of the scan under `key` and return how many
+    /// were counted before it, refreshing its age and dropping the least
+    /// recently counted scan when the record is full.
+    pub(super) fn next(&self, key: u64) -> u64 {
+        let mut entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let seq = entries.next_seq;
+        entries.next_seq += 1;
+        let prior = match entries.by_key.get(&key) {
+            Some(&(count, old_seq)) => {
+                entries.by_age.remove(&old_seq);
+                count
+            }
+            None => 0,
+        };
+        entries.by_key.insert(key, (prior + 1, seq));
+        entries.by_age.insert(seq, key);
+        while entries.by_key.len() > SCAN_EXECUTIONS_CAPACITY {
+            let Some((_, oldest)) = entries.by_age.pop_first() else {
+                break;
+            };
+            entries.by_key.remove(&oldest);
+        }
+        prior
+    }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.by_key.len()
+    }
+
+    /// Every scan's count, ascending, without counting one.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> Vec<u64> {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut counts: Vec<u64> = entries.by_key.values().map(|&(count, _)| count).collect();
+        counts.sort_unstable();
+        counts
+    }
+
+    /// The executions counted under `key`, without counting one.
+    #[cfg(test)]
+    pub(super) fn count(&self, key: u64) -> Option<u64> {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        entries.by_key.get(&key).map(|&(count, _)| count)
+    }
+}
+
+impl Default for ScanExecutions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One execution's publication direction on the planned route (issue
+/// #3192): its scan's count in [`ScanExecutions`] is taken and incremented
+/// at first publication, and an odd prior count publishes in reverse. The
+/// decision is shared by every partition and every re-execution round of
+/// one plan node, so a re-publication within one execution takes the same
+/// direction and is not counted again.
+#[derive(Clone)]
+pub(super) struct Alternation {
+    executions: Arc<ScanExecutions>,
+    key: u64,
+    reversed: Arc<OnceLock<bool>>,
+}
+
+impl Alternation {
+    /// The alternation of a scan under `key`, or `None` where the order is
+    /// left as it was: no record wired, no read cache (an un-cached repeat
+    /// reads the store whatever its order), a confirmed TopK (whose order
+    /// is chosen to tighten its threshold), or a pushed fetch limit (which
+    /// stops at the first rows it finds, so its rows would change with the
+    /// direction).
+    pub(super) fn for_scan(
+        executions: Option<&Arc<ScanExecutions>>,
+        has_cache: bool,
+        topk: bool,
+        fetch: Option<usize>,
+        key: impl FnOnce() -> u64,
+        reversed: &Arc<OnceLock<bool>>,
+    ) -> Option<Self> {
+        let executions = executions?;
+        if !has_cache || topk || fetch.is_some() {
+            return None;
+        }
+        Some(Alternation {
+            executions: Arc::clone(executions),
+            key: key(),
+            reversed: Arc::clone(reversed),
+        })
+    }
+
+    /// Whether this execution publishes in reverse, counting the execution
+    /// on the first call only.
+    pub(super) fn reversed(&self) -> bool {
+        *self
+            .reversed
+            .get_or_init(|| self.executions.next(self.key) % 2 == 1)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod unit_queue_tests {
@@ -2063,6 +2256,243 @@ mod unit_queue_tests {
         }
     }
 
+    /// The record key of a scan over `refs` with `content` pushed and every
+    /// other identity field fixed.
+    fn scan_key(refs: &[SegmentRef], content: &[Predicate]) -> u64 {
+        ScanExecutions::key(
+            TenantHash([7u8; 16]),
+            refs,
+            &[0, 1, 2],
+            &[],
+            false,
+            content,
+            &[],
+            &[],
+        )
+    }
+
+    /// Issue #3192: one execution of a scan with a read cache, no confirmed
+    /// TopK and no pushed fetch. Each call is a new plan node, as each
+    /// statement is, sharing `executions`; the publication is made twice, as
+    /// a re-executed partition round makes it again.
+    fn execution(
+        executions: &Arc<ScanExecutions>,
+        counts: &PlanCounts,
+        refs: &[SegmentRef],
+        stripe: bool,
+        key: u64,
+        n: usize,
+    ) -> (Vec<Unit>, Vec<Unit>) {
+        let cell = Arc::new(OnceLock::new());
+        let alternation = Alternation::for_scan(Some(executions), true, false, None, || key, &cell);
+        assert!(
+            alternation.is_some(),
+            "a cached scan with no TopK or fetch alternates"
+        );
+        let publish = || -> Vec<Unit> {
+            let order = publication_order(refs, false, alternation.as_ref());
+            counts
+                .publish(refs, &order, stripe, n)
+                .iter()
+                .map(unit)
+                .collect()
+        };
+        (publish(), publish())
+    }
+
+    /// A repeated scan with a read cache and no TopK publishes its segments
+    /// in snapshot order, then in reverse, then forward again; each segment's
+    /// runs stay contiguous and in group order; and a re-publication within
+    /// one execution takes that execution's direction and is not counted
+    /// again. Striped over two partitions (runs of two groups and one) and
+    /// with one partition, where each segment is one unit.
+    ///
+    /// Fails against `publication_order` ignoring the alternation (every
+    /// execution forward) and against counting each publication (the second
+    /// publication of an execution reversed).
+    #[test]
+    fn a_repeated_cached_scan_alternates_its_publication_direction() {
+        let (counts, refs) = plan(3, true);
+        let runs = |s: usize| {
+            [
+                (s, [group(0), group(1)].concat(), false),
+                (s, group(2), false),
+            ]
+        };
+        let forward: Vec<Unit> = (0..3).flat_map(runs).collect();
+        let backward: Vec<Unit> = (0..3).rev().flat_map(runs).collect();
+        let executions = Arc::new(ScanExecutions::new());
+        let key = scan_key(&refs, &[]);
+        for e in 0..4 {
+            let (first, again) = execution(&executions, &counts, &refs, true, key, 2);
+            let expected = if e % 2 == 0 { &forward } else { &backward };
+            assert_eq!(&first, expected, "execution {e}");
+            assert_eq!(first, again, "execution {e} published again");
+        }
+        assert_eq!(executions.count(key), Some(4), "one count per execution");
+
+        let (counts, refs) = plan(3, false);
+        let whole = |s: usize| (s, (0..BLOCKS).collect::<Vec<_>>(), false);
+        let executions = Arc::new(ScanExecutions::new());
+        let (first, _) = execution(&executions, &counts, &refs, false, key, 1);
+        let (second, _) = execution(&executions, &counts, &refs, false, key, 1);
+        assert_eq!(first, (0..3).map(whole).collect::<Vec<_>>());
+        assert_eq!(second, (0..3).rev().map(whole).collect::<Vec<_>>());
+    }
+
+    /// The same segments under another pushed filter are another scan, with
+    /// a count of its own: its first execution runs forward whatever the
+    /// first scan's count is, and does not move the first scan's count.
+    ///
+    /// Fails against a key that leaves the pushed content predicates out (the
+    /// two scans' keys collide).
+    #[test]
+    fn a_scan_under_another_pushed_filter_has_its_own_count() {
+        let (counts, refs) = plan(3, true);
+        let unfiltered = scan_key(&refs, &[]);
+        let filtered = scan_key(
+            &refs,
+            &[Predicate::HasWord {
+                field: FieldSel::Body,
+                word: "timeout".into(),
+            }],
+        );
+        assert_ne!(unfiltered, filtered);
+        let executions = Arc::new(ScanExecutions::new());
+        let (a1, _) = execution(&executions, &counts, &refs, true, unfiltered, 2);
+        let (b1, _) = execution(&executions, &counts, &refs, true, filtered, 2);
+        let (a2, _) = execution(&executions, &counts, &refs, true, unfiltered, 2);
+        let (b2, _) = execution(&executions, &counts, &refs, true, filtered, 2);
+        assert_eq!(b1, a1, "the filtered scan's first execution runs forward");
+        assert_ne!(a2, a1, "the unfiltered scan's second runs backwards");
+        assert_eq!(b2, a2, "and so does the filtered scan's");
+        assert_eq!(executions.count(unfiltered), Some(2));
+        assert_eq!(executions.count(filtered), Some(2));
+    }
+
+    /// Scans under different pushed key equalities, or under one equality on
+    /// a different field, key type or key, are different scans.
+    ///
+    /// Fails against a key that leaves any of the equality's three fields out.
+    #[test]
+    fn a_scan_under_another_key_equality_has_its_own_key() {
+        use ravel_logseg::key_index::{KeyType, key8_i64, key8_str};
+        let (_, refs) = plan(3, true);
+        let key = |key_equals: &[KeyEquals]| {
+            ScanExecutions::key(
+                TenantHash([7u8; 16]),
+                &refs,
+                &[0, 1, 2],
+                &[],
+                false,
+                &[],
+                &[],
+                key_equals,
+            )
+        };
+        let base = KeyEquals::new("service", KeyType::Str, key8_str("checkout"));
+        let keys = [
+            key(&[]),
+            key(std::slice::from_ref(&base)),
+            key(&[KeyEquals::new("region", KeyType::Str, key8_str("checkout"))]),
+            key(&[KeyEquals::new("service", KeyType::I64, base.key8)]),
+            key(&[KeyEquals::new("service", KeyType::Str, key8_str("cart"))]),
+            key(&[base.clone(), base.clone()]),
+            key(&[KeyEquals::new("service", KeyType::I64, key8_i64(-3))]),
+        ];
+        let distinct: std::collections::HashSet<u64> = keys.iter().copied().collect();
+        assert_eq!(distinct.len(), keys.len(), "{keys:?}");
+    }
+
+    /// With no read cache, under a confirmed TopK, under a pushed fetch
+    /// limit, or with no record wired, a scan does not alternate: every
+    /// execution publishes the same units in the same order as before issue
+    /// #3192, and nothing is counted.
+    ///
+    /// Fails against alternating in any of the four cases (the second
+    /// execution's publication differs, or a count is recorded).
+    #[test]
+    fn uncached_topk_and_fetch_publications_are_identical_across_executions() {
+        let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
+        // (record wired, read cache, confirmed TopK, pushed fetch)
+        let cases = [
+            (true, false, false, None),
+            (true, true, true, None),
+            (true, false, true, None),
+            (true, true, false, Some(10)),
+            (false, true, false, None),
+        ];
+        for (wired, cache, topk, fetch) in cases {
+            let executions = Arc::new(ScanExecutions::new());
+            let record = wired.then_some(&executions);
+            let (counts, refs) = mixed_plan(&budget, cache, topk);
+            let before = counts
+                .publish(&refs, &visit_order(&refs, topk), cache, GROUPS)
+                .iter()
+                .map(unit)
+                .collect::<Vec<_>>();
+            for e in 0..3 {
+                let cell = Arc::new(OnceLock::new());
+                let alternation = Alternation::for_scan(record, cache, topk, fetch, || 1, &cell);
+                assert!(
+                    alternation.is_none(),
+                    "wired {wired} cache {cache} topk {topk} fetch {fetch:?}"
+                );
+                let order = publication_order(&refs, topk, alternation.as_ref());
+                let units: Vec<Unit> = counts
+                    .publish(&refs, &order, cache, GROUPS)
+                    .iter()
+                    .map(unit)
+                    .collect();
+                assert_eq!(
+                    units, before,
+                    "execution {e}: wired {wired} cache {cache} topk {topk} fetch {fetch:?}"
+                );
+            }
+            assert_eq!(executions.len(), 0, "nothing counted");
+        }
+    }
+
+    /// The record holds at most 4,096 scans and drops the least recently
+    /// counted first; counting a scan again refreshes it.
+    ///
+    /// Fails against an unbounded record, and against dropping by first
+    /// count rather than last.
+    #[test]
+    fn the_execution_record_drops_the_oldest_scan_past_its_bound() {
+        let refs: Vec<SegmentRef> = (0..2).map(|s| seg_ref(&format!("seg{s}"))).collect();
+        let key = |i: usize| {
+            ScanExecutions::key(
+                TenantHash([7u8; 16]),
+                &refs,
+                &[i],
+                &[],
+                false,
+                &[],
+                &[],
+                &[],
+            )
+        };
+        let record = ScanExecutions::new();
+        for i in 0..SCAN_EXECUTIONS_CAPACITY {
+            assert_eq!(record.next(key(i)), 0);
+        }
+        assert_eq!(record.len(), 4_096);
+        assert_eq!(record.count(key(0)), Some(1));
+
+        assert_eq!(record.next(key(4_096)), 0);
+        assert_eq!(record.len(), 4_096, "the 4,097th scan");
+        assert_eq!(record.count(key(0)), None, "the oldest is dropped");
+        assert_eq!(record.count(key(1)), Some(1));
+
+        assert_eq!(record.next(key(1)), 1);
+        assert_eq!(record.next(key(4_097)), 0);
+        assert_eq!(record.len(), 4_096);
+        assert_eq!(record.count(key(1)), Some(2), "counted again, so kept");
+        assert_eq!(record.count(key(2)), None, "now the oldest, so dropped");
+        assert_eq!(record.next(key(0)), 0, "a dropped scan counts from zero");
+    }
+
     #[derive(Clone, Debug)]
     enum Shape {
         Irrelevant,
@@ -2098,6 +2528,7 @@ mod unit_queue_tests {
         mins: &[i64],
         stripe: bool,
         by_min_ts: bool,
+        reversed: bool,
         n: usize,
     ) -> (Vec<Vec<Vec<usize>>>, Vec<Unit>) {
         let groups: Vec<Vec<Vec<usize>>> = shapes
@@ -2157,6 +2588,9 @@ mod unit_queue_tests {
             if by_min_ts {
                 order.sort_by_key(|&s| (mins[s], s));
             }
+            if reversed {
+                order.reverse();
+            }
             order
                 .into_iter()
                 .flat_map(|s| {
@@ -2181,8 +2615,9 @@ mod unit_queue_tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(256))]
 
-        /// Whatever the plan's shape, mode, partition count and the order
-        /// partitions happen to take in: the takes, in the order they happen,
+        /// Whatever the plan's shape, mode, partition count, publication
+        /// direction (issue #3192) and the order partitions happen to take
+        /// in: the takes, in the order they happen,
         /// are the published units in publication order; every unit is taken
         /// exactly once, by one partition; each partition's units keep
         /// publication order; every surviving row group lies whole inside
@@ -2201,11 +2636,12 @@ mod unit_queue_tests {
             mins in proptest::collection::vec(-4i64..16, 7),
             stripe in any::<bool>(),
             by_min_ts in any::<bool>(),
+            reversed in any::<bool>(),
             n in 1usize..6,
             schedule in proptest::collection::vec(0usize..6, 0..48),
         ) {
             let budget = Arc::new(ravel_memory::MemoryBudget::unlimited());
-            let (groups, expected) = model(&shapes, &mins, stripe, by_min_ts, n);
+            let (groups, expected) = model(&shapes, &mins, stripe, by_min_ts, reversed, n);
             let refs: Vec<SegmentRef> = (0..shapes.len())
                 .map(|s| seg_ref_at(&format!("seg{s}"), mins[s]))
                 .collect();
@@ -2230,8 +2666,11 @@ mod unit_queue_tests {
             let unplanned = shapes.iter().map(|s| matches!(s, Shape::Unplanned)).collect();
             let counts = assemble(segs, unplanned, &refs, stripe, by_min_ts);
 
-            let queue =
-                UnitQueue::new(counts.publish(&refs, &visit_order(&refs, by_min_ts), stripe, n));
+            let mut order = visit_order(&refs, by_min_ts);
+            if reversed {
+                order.reverse();
+            }
+            let queue = UnitQueue::new(counts.publish(&refs, &order, stripe, n));
             let (owned, log) = take_all(&queue, n, &schedule);
             let taken: Vec<Unit> = log.iter().map(|(_, u)| u.clone()).collect();
             prop_assert_eq!(&taken, &expected);
@@ -2275,7 +2714,8 @@ mod unit_queue_tests {
         }
 
         /// Over an object of one-block row groups, so a segment's `G` is its
-        /// survivor count (1 to 12), with a read cache and no TopK, with a
+        /// survivor count (1 to 12), in either publication direction (issue
+        /// #3192, which the global order ignores), with a read cache and no TopK, with a
         /// read cache and the global order, and without a read cache: with a
         /// read cache and no TopK `n` partitions open each segment at most
         /// `min(G, n)` times, without a read cache exactly once, and in the
@@ -2297,6 +2737,7 @@ mod unit_queue_tests {
             ),
             keys in proptest::collection::vec(proptest::collection::vec(-4i64..16, BLOCKS), 3),
             mode in 0usize..3,
+            reversed in any::<bool>(),
             n in 1usize..8,
             schedule in proptest::collection::vec(0usize..8, 0..48),
         ) {
@@ -2323,7 +2764,11 @@ mod unit_queue_tests {
             let counts = assemble(segs, vec![false; survivors.len()], &refs, stripe, by_min_ts);
             prop_assert_eq!(counts.global.is_some(), stripe && by_min_ts);
 
-            let units = counts.publish(&refs, &visit_order(&refs, by_min_ts), stripe, n);
+            let mut visit = visit_order(&refs, by_min_ts);
+            if reversed {
+                visit.reverse();
+            }
+            let units = counts.publish(&refs, &visit, stripe, n);
             let order: Vec<Unit> = units.iter().map(unit).collect();
             let queue = UnitQueue::new(units);
             let (owned, _) = take_all(&queue, n, &schedule);
