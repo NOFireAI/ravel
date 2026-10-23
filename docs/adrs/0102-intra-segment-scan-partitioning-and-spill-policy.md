@@ -853,12 +853,14 @@ does.
 
 - **Alternate executions publish the segments in reverse visit order.**
   `SqlExecutor` owns one `ScanExecutions` record, a count per scan, keyed by
-  a hash of the tenant, the resolved segment set (each segment's content
-  hash, in snapshot order), the projection (with its per-key attribute
-  columns and row refs) and the pushed content, prune and key-equality
-  predicates. The time bounds are not in the key: the segment set is what a
-  window selects, so a relative window re-sent with fresh bounds over the
-  same objects keeps its count. The record is bounded at 4,096 scans, the
+  a hash of the tenant, the projection (with its per-key attribute columns
+  and row refs) and the pushed content, prune and key-equality predicates.
+  Neither the time bounds nor the resolved segment set are in the key
+  (issue #3215): a relative window re-sent with fresh bounds keeps its
+  count, and so does a scan on a tenant still ingesting, whose segment set
+  gains an object between two executions. A key that held the segments'
+  content hashes gave each such execution a new key, so every execution
+  counted as a first one and published forward. The record is bounded at 4,096 scans, the
   least recently counted dropped first, held in process memory and charged
   to no cache, the same shape as ADR-3072's statement read-bytes record
   (issue #3084). At an execution's first publication its scan's count is
@@ -882,7 +884,24 @@ does.
   publishes no units and keeps its `j % n` deal over visit order, unchanged.
 
 Costs: on a working set the cache holds, every object is resident whichever
-end a scan starts from, so the change costs nothing there. The record is at
+end a scan starts from, so the change costs nothing there. Two statements
+with the same tenant, projection and pushed predicates over different
+windows, and so over different segment sets, share one count; that moves
+only the direction each publishes in, and either direction is a valid
+order. It can cost cache benefit, though: two such statements that run in
+turn split the count's parity, so each is locked to one direction and
+neither alternates against its own previous execution (two dashboard panels
+over 1 h and 24 h with the same filters, or a `UNION ALL` of two windows).
+On one shared segment set that still served about 40 % each in a replay of
+the generated lane's recorded accesses, because each statement then reads
+first what the other read last; across two different windows it is not
+measured. A changing segment set no longer resets the count. Measured on the
+`scan_alternation_tests.rs` harness (eight objects, a read cache holding
+four and a half of them, one partition, eight executions), the read cache
+served 0.0 % of the bytes the seven warm executions read when one new
+object entered the window before each of them and the key held the segment
+set, and 30.8 % with the segment set out of the key; with no new objects it
+served 39.5 % under either key (issue #3215). The record is at
 most 4,096 entries of a key and two counters, and a statement takes its lock
 once per logs scan. Row order without an `ORDER BY` can now differ between
 two executions of one statement, and so can the rows of a statement whose
@@ -915,7 +934,11 @@ proptests of the #3080 amendment, now drawn over both directions.
 four times through `SqlExecutor` over eight objects and a read cache that
 holds four and a half of them, at one partition: the read cache serves 0,
 2,792, 2,094 and 2,094 bytes on the four runs, where every run served 0
-before this amendment. `a_pushed_fetch_and_a_confirmed_topk_do_not_alternate`
+before this amendment. `a_scan_over_a_growing_segment_set_keeps_alternating`
+there publishes one new object into the window before each of seven more
+executions and pins that the eight alternate from the second, share one
+count, and are served 0, 2,094, 2,094 and then 2,767 bytes on each of the
+last five, where a key holding the segment set served 0 on every run. `a_pushed_fetch_and_a_confirmed_topk_do_not_alternate`
 there runs a statement whose `LIMIT` the scan takes as a pushed fetch and a
 confirmed ascending-`ts` TopK twice each through the same executor and read
 cache, and pins that neither counts an execution and each returns the same

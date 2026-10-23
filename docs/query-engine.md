@@ -643,9 +643,12 @@ partition:
   (`topk_one_partition_time_disjoint_segments_open_once`).
 - **A repeated scan alternates its publication direction** (ADR-0102's
   repeated-scan amendment). `SqlExecutor` owns one `ScanExecutions` record, a count
-  per scan keyed by the tenant, the resolved segment set (content hashes in
-  snapshot order), the projection and the pushed predicates, but not the
-  time bounds. It holds at most 4,096 scans, drops the least recently
+  per scan keyed by the tenant, the projection and the pushed predicates,
+  but not the time bounds or the resolved segment set, so a scan keeps its
+  count when its window moves or its tenant publishes another object
+  between executions. Two statements with the same tenant, projection and
+  predicates over different windows share one count, which moves only the
+  direction each publishes in. It holds at most 4,096 scans, drops the least recently
   counted first, and is charged to no cache. With a read cache wired, no
   confirmed TopK and no pushed fetch limit, an execution's first
   publication takes and increments its scan's count, and an odd count
@@ -681,6 +684,11 @@ partition:
   four and a half of them are served 0, 2,792, 2,094 and 2,094 bytes from
   it, against 0 on every run with one fixed order
   (`a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs`).
+  With one new object published into the window before each of seven more
+  executions, the eight still alternate and are served 0, 2,094, 2,094 and
+  then 2,767 bytes on each of the last five, where a key holding the
+  segment set served 0 on every run
+  (`a_scan_over_a_growing_segment_set_keeps_alternating`).
 - **The ranged plan covers the unit's own blocks.** A subset open
   intersects the ts and numeric candidate blocks with the blocks its unit
   holds before the projected page extents and the coverage crossover are

@@ -1090,17 +1090,15 @@ impl ScanExecutions {
         }
     }
 
-    /// The record key of a scan: the tenant, the resolved segment set by
-    /// content hash in snapshot order, the projection (with its per-key
-    /// attribute columns and row refs) and the pushed filters. The time
-    /// bounds are not in it: the segment set is what the window selects, so
-    /// a relative window re-sent with fresh bounds over the same objects
-    /// keeps its count. Two scans whose keys collide share a count, which
-    /// only moves a publication direction.
-    #[allow(clippy::too_many_arguments)]
+    /// The record key of a scan: the tenant, the projection (with its
+    /// per-key attribute columns and row refs) and the pushed filters.
+    /// Neither the time bounds nor the resolved segment set are in it, so a
+    /// relative window re-sent with fresh bounds keeps its count, and so
+    /// does a scan whose tenant published another object since its last
+    /// execution. Two scans whose keys collide share a count, which only
+    /// moves a publication direction.
     pub(super) fn key(
         tenant_hash: TenantHash,
-        segments: &[SegmentRef],
         projection: &[usize],
         attr_keys: &[String],
         row_refs: bool,
@@ -1110,10 +1108,6 @@ impl ScanExecutions {
     ) -> u64 {
         let mut hasher = DefaultHasher::new();
         tenant_hash.0.hash(&mut hasher);
-        segments.len().hash(&mut hasher);
-        for seg in segments {
-            seg.content_hash.hash(&mut hasher);
-        }
         projection.hash(&mut hasher);
         attr_keys.hash(&mut hasher);
         row_refs.hash(&mut hasher);
@@ -2256,12 +2250,11 @@ mod unit_queue_tests {
         }
     }
 
-    /// The record key of a scan over `refs` with `content` pushed and every
-    /// other identity field fixed.
-    fn scan_key(refs: &[SegmentRef], content: &[Predicate]) -> u64 {
+    /// The record key of a scan with `content` pushed and every other
+    /// identity field fixed.
+    fn scan_key(content: &[Predicate]) -> u64 {
         ScanExecutions::key(
             TenantHash([7u8; 16]),
-            refs,
             &[0, 1, 2],
             &[],
             false,
@@ -2322,7 +2315,7 @@ mod unit_queue_tests {
         let forward: Vec<Unit> = (0..3).flat_map(runs).collect();
         let backward: Vec<Unit> = (0..3).rev().flat_map(runs).collect();
         let executions = Arc::new(ScanExecutions::new());
-        let key = scan_key(&refs, &[]);
+        let key = scan_key(&[]);
         for e in 0..4 {
             let (first, again) = execution(&executions, &counts, &refs, true, key, 2);
             let expected = if e % 2 == 0 { &forward } else { &backward };
@@ -2349,14 +2342,11 @@ mod unit_queue_tests {
     #[test]
     fn a_scan_under_another_pushed_filter_has_its_own_count() {
         let (counts, refs) = plan(3, true);
-        let unfiltered = scan_key(&refs, &[]);
-        let filtered = scan_key(
-            &refs,
-            &[Predicate::HasWord {
-                field: FieldSel::Body,
-                word: "timeout".into(),
-            }],
-        );
+        let unfiltered = scan_key(&[]);
+        let filtered = scan_key(&[Predicate::HasWord {
+            field: FieldSel::Body,
+            word: "timeout".into(),
+        }]);
         assert_ne!(unfiltered, filtered);
         let executions = Arc::new(ScanExecutions::new());
         let (a1, _) = execution(&executions, &counts, &refs, true, unfiltered, 2);
@@ -2377,11 +2367,9 @@ mod unit_queue_tests {
     #[test]
     fn a_scan_under_another_key_equality_has_its_own_key() {
         use ravel_logseg::key_index::{KeyType, key8_i64, key8_str};
-        let (_, refs) = plan(3, true);
         let key = |key_equals: &[KeyEquals]| {
             ScanExecutions::key(
                 TenantHash([7u8; 16]),
-                &refs,
                 &[0, 1, 2],
                 &[],
                 false,
@@ -2460,19 +2448,8 @@ mod unit_queue_tests {
     /// count rather than last.
     #[test]
     fn the_execution_record_drops_the_oldest_scan_past_its_bound() {
-        let refs: Vec<SegmentRef> = (0..2).map(|s| seg_ref(&format!("seg{s}"))).collect();
-        let key = |i: usize| {
-            ScanExecutions::key(
-                TenantHash([7u8; 16]),
-                &refs,
-                &[i],
-                &[],
-                false,
-                &[],
-                &[],
-                &[],
-            )
-        };
+        let key =
+            |i: usize| ScanExecutions::key(TenantHash([7u8; 16]), &[i], &[], false, &[], &[], &[]);
         let record = ScanExecutions::new();
         for i in 0..SCAN_EXECUTIONS_CAPACITY {
             assert_eq!(record.next(key(i)), 0);

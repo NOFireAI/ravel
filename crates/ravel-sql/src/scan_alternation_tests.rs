@@ -1,7 +1,9 @@
 //! A repeated `logs` scan over more data than the read cache holds, end to end
 //! through `SqlExecutor::execute` (issue #3192): consecutive executions of the
 //! same scan publish their segments in opposite directions, so each reads
-//! first what the previous one read last, while it is still resident.
+//! first what the previous one read last, while it is still resident. A
+//! tenant publishing new objects between executions keeps the scan's count
+//! (issue #3215).
 
 #![allow(clippy::expect_used)]
 
@@ -35,30 +37,43 @@ const WINDOW: TimeRange = TimeRange {
 /// every execution reads all eight objects.
 const STATEMENT: &str = "SELECT ts, body FROM logs WHERE has_word(body, 'query')";
 
+/// Publishes object `i` of `RECORDS` records at `ts` `i * 1,000,000` onward
+/// to one tenant's `logs` lane as writer sequence `i + 1`, and returns its
+/// size.
+async fn publish_object(memory: &MemoryStore, tenant_hash: TenantHash, i: u64) -> u64 {
+    let base = i as i64 * OBJECT_SPAN_NS;
+    let records: Vec<_> = (0..RECORDS)
+        .map(|r| log_record("api", base + r * 100))
+        .collect();
+    let key = publish_log_records(memory, tenant_hash, Signal::Logs, i + 1, &records).await;
+    memory
+        .get(&key, GetRange::Full)
+        .await
+        .expect("get the data object")
+        .data
+        .len() as u64
+}
+
 /// Eight 200-record RLOG objects on one tenant's `logs` lane, object `i` at
-/// `ts` `i * 1,000,000` onward, and their sizes.
-async fn eight_object_lane() -> (Arc<dyn ObjectStoreBackend>, TenantHash, Vec<u64>) {
+/// `ts` `i * 1,000,000` onward, their sizes, and the store they are in, for
+/// publishing more.
+async fn eight_object_lane() -> (
+    Arc<dyn ObjectStoreBackend>,
+    Arc<MemoryStore>,
+    TenantHash,
+    Vec<u64>,
+) {
     let tenant_hash = TenantId::new("scan-alternation".to_string()).hash();
-    let memory = MemoryStore::new();
+    let memory = Arc::new(MemoryStore::new());
     let mut sizes = Vec::new();
     for i in 0..OBJECTS {
-        let base = i as i64 * OBJECT_SPAN_NS;
-        let records: Vec<_> = (0..RECORDS)
-            .map(|r| log_record("api", base + r * 100))
-            .collect();
-        let key = publish_log_records(&memory, tenant_hash, Signal::Logs, i + 1, &records).await;
-        let bytes = memory
-            .get(&key, GetRange::Full)
-            .await
-            .expect("get the data object")
-            .data;
-        sizes.push(bytes.len() as u64);
+        sizes.push(publish_object(&memory, tenant_hash, i).await);
     }
     let store: Arc<dyn ObjectStoreBackend> = Arc::new(InstrumentedStore::new(FaultStore::new(
-        memory,
+        Arc::clone(&memory),
         FaultPlan::empty(),
     )));
-    (store, tenant_hash, sizes)
+    (store, memory, tenant_hash, sizes)
 }
 
 /// An executor over `store` whose logs fetcher reads through `cache`, at one
@@ -102,7 +117,7 @@ fn executor(store: Arc<dyn ObjectStoreBackend>, cache: Arc<Cache<CacheFetchError
 /// cache.
 #[tokio::test]
 async fn a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs() {
-    let (store, tenant_hash, sizes) = eight_object_lane().await;
+    let (store, _, tenant_hash, sizes) = eight_object_lane().await;
     let largest = sizes.iter().copied().max().expect("objects");
     let capacity = largest * 4 + largest / 2;
     let cache: Arc<Cache<CacheFetchError>> =
@@ -140,6 +155,96 @@ async fn a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs() 
     );
 }
 
+/// The first `ts` of an execution's output: at one partition the rows come
+/// back in publication order, so 0 is a forward execution and the newest
+/// object's first `ts` a reversed one.
+fn first_ts(output: &crate::output::QueryOutput) -> i64 {
+    output.batches()[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .expect("ts is a nanosecond timestamp")
+        .value(0)
+}
+
+/// Eight executions of `STATEMENT` over a tenant still ingesting: one new
+/// object, inside the window, is published into the same `logs` table before
+/// every execution after the first, so each resolves a segment set the
+/// previous one did not. The scan's count is keyed on the tenant, projection
+/// and pushed predicates only, so the eight executions share one count and
+/// alternate from the second: forward, reverse, forward, and so on.
+///
+/// The read cache holds four and a half of the first eight objects, as in
+/// `a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs`.
+/// One partition reads the objects one after another, so the per-execution
+/// figures are exact: 0, then 2094 bytes on the second and third executions
+/// and 2767 on each of the five after them. Only the read cache's own served
+/// bytes are counted.
+///
+/// FLIP: keying the count on the resolved segment set as well gives every
+/// execution a new key, so every execution publishes forward and the read
+/// cache serves 0 bytes on every run.
+#[tokio::test]
+async fn a_scan_over_a_growing_segment_set_keeps_alternating() {
+    const EXECUTIONS: u64 = 8;
+    let window = TimeRange {
+        start_ns: 0,
+        end_ns: OBJECT_SPAN_NS * (OBJECTS + EXECUTIONS) as i64,
+    };
+    let (store, memory, tenant_hash, sizes) = eight_object_lane().await;
+    let largest = sizes.iter().copied().max().expect("objects");
+    let capacity = largest * 4 + largest / 2;
+    let cache: Arc<Cache<CacheFetchError>> =
+        Arc::new(Cache::new(CacheLimits::new(capacity, 4096, capacity)));
+    let exec = executor(store, Arc::clone(&cache));
+
+    let mut served = Vec::new();
+    let mut rows = Vec::new();
+    let mut first = Vec::new();
+    for e in 0..EXECUTIONS {
+        if e > 0 {
+            publish_object(&memory, tenant_hash, OBJECTS + e - 1).await;
+        }
+        let before = cache.metrics().snapshot().bytes_served;
+        let output = exec
+            .execute(tenant_hash, &sql_request(STATEMENT, window))
+            .await
+            .expect("the statement runs");
+        served.push(cache.metrics().snapshot().bytes_served - before);
+        rows.push(output.output.num_rows());
+        first.push(first_ts(&output.output));
+    }
+
+    assert_eq!(
+        rows,
+        (0..EXECUTIONS)
+            .map(|e| (RECORDS * (OBJECTS + e) as i64) as usize)
+            .collect::<Vec<_>>(),
+        "each execution reads every object published so far"
+    );
+    assert_eq!(
+        served,
+        vec![0, 2094, 2094, 2767, 2767, 2767, 2767, 2767],
+        "read-cache bytes served per execution"
+    );
+    assert_eq!(
+        first,
+        (0..EXECUTIONS)
+            .map(|e| if e % 2 == 0 {
+                0
+            } else {
+                (OBJECTS + e - 1) as i64 * OBJECT_SPAN_NS
+            })
+            .collect::<Vec<_>>(),
+        "forward, then reverse from the newest object, alternating"
+    );
+    assert_eq!(
+        exec.scan_execution_counts(),
+        vec![EXECUTIONS],
+        "one count for the scan, whatever its segment set"
+    );
+}
+
 /// `STATEMENT` under a `LIMIT` the scan takes as a pushed fetch: `has_word`
 /// is pushed exactly, so no `FilterExec` sits between the limit and the scan.
 const FETCH_STATEMENT: &str = "SELECT ts, body FROM logs WHERE has_word(body, 'query') LIMIT 5";
@@ -163,7 +268,7 @@ const TOPK_STATEMENT: &str =
 /// confirmed TopK counts the TopK statement's scan.
 #[tokio::test]
 async fn a_pushed_fetch_and_a_confirmed_topk_do_not_alternate() {
-    let (store, tenant_hash, sizes) = eight_object_lane().await;
+    let (store, _, tenant_hash, sizes) = eight_object_lane().await;
     let capacity = sizes.iter().sum::<u64>() * 2;
     let cache: Arc<Cache<CacheFetchError>> =
         Arc::new(Cache::new(CacheLimits::new(capacity, 4096, capacity)));
