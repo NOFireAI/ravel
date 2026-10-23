@@ -3156,6 +3156,7 @@ impl ExecutionPlan for LogsScanExec {
             columnar_eligible: self.columnar_eligible,
             str_values: Arc::new(std::sync::Mutex::new(StrValuesCache::new(
                 blocks.str_dict_values_built.clone(),
+                reservation.new_empty(),
             ))),
             blocks,
             metrics: self.metrics.clone(),
@@ -3182,7 +3183,6 @@ impl ExecutionPlan for LogsScanExec {
             reservation,
             held: 0,
             emitted: 0,
-            str_values_charge: 0,
             pending: Pending::None,
             row_refs: self.row_refs,
             current_seg: None,
@@ -3243,11 +3243,10 @@ struct LogScanStream {
     blocks: BlockMetrics,
     /// The Arrow values of the shared string dictionaries this partition's
     /// columnar blocks read, built once per dictionary and fallback list
-    /// (ADR-2773 decision D3).
+    /// (ADR-2773 decision D3). The cache charges its arrays to a sibling of
+    /// [`Self::reservation`], once per array rather than once per batch
+    /// sharing it.
     str_values: SharedStrValuesCache,
-    /// Reservation bytes covering the live entries of [`Self::str_values`],
-    /// charged once per entry rather than once per batch sharing it.
-    str_values_charge: usize,
     /// This stream's DataFusion partition index: its round in
     /// [`LogsScanExec::units`], its prefetch slot, and partition 0 publishes
     /// the plan's per-segment totals.

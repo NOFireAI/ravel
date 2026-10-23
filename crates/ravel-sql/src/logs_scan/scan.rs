@@ -1188,54 +1188,27 @@ impl LogScanStream {
     }
 
     /// Take ownership of one block's pre-built columnar batches, charging the
-    /// pool for their Arrow footprint as [`columnar_charges`] splits it. The
-    /// decoded block they were built from is charged separately, in
-    /// [`Self::resident`], and the shared dictionary values the scan's
-    /// [`StrValuesCache`] holds in [`Self::str_values_charge`], resized here to
-    /// the cache's live entries.
+    /// pool for their Arrow footprint as [`columnar_charges`] splits it
+    /// ([`charge_columnar_batches`]). The decoded block they were built from
+    /// is charged separately, in [`Self::resident`], and the shared dictionary
+    /// values the scan's [`StrValuesCache`] holds by the cache, before each
+    /// was built.
     ///
     /// [`Self::emit_next_columnar_batch`] moves each emitted batch's own
     /// charge from `held` to `emitted`; the block's shared values stay in
     /// `held` until [`Self::release_block`].
     fn hold_batches(&mut self, batches: Vec<RecordBatch>) -> DFResult<()> {
-        let (charged, shared, live) = {
-            let mut cache = lock_str_values(&self.str_values);
-            let live = cache.live_bytes();
-            let (charged, shared) = columnar_charges(batches, &cache);
-            (charged, shared, live)
-        };
-        self.release_dead_str_values(live);
-        let bytes = charged.iter().map(|(_, c)| c).sum::<usize>() + shared;
-        let growth = live.saturating_sub(self.str_values_charge);
-        self.reservation.try_grow(bytes + growth)?;
-        self.str_values_charge += growth;
+        let (charged, bytes) =
+            charge_columnar_batches(batches, &self.str_values, &self.reservation)?;
         self.held = bytes;
         self.pending = Pending::Batches(charged);
         Ok(())
     }
 
-    /// Shrink [`Self::str_values_charge`] to `live` when the cache's live
-    /// entries have fallen below it.
-    ///
-    /// The batch handed out last keeps only its own keys charged, in
-    /// [`Self::emitted`], until the next emit. Its values can lose their charge
-    /// before that: a base values array here once the reader has moved past
-    /// its row group, a plain page's values in [`Self::release_block`]. The gap
-    /// is at most one values array per dictionary column of that one batch,
-    /// and it closes at the next emit, which releases the batch's charge in
-    /// any case.
-    fn release_dead_str_values(&mut self, live: usize) {
-        if live < self.str_values_charge {
-            self.reservation.shrink(self.str_values_charge - live);
-            self.str_values_charge = live;
-        }
-    }
-
     /// Drop every shared dictionary values array the scan's cache holds and
     /// release their charge: the stream has nothing left to read them for.
     fn release_str_values(&mut self) {
-        lock_str_values(&self.str_values).entries.clear();
-        self.release_dead_str_values(0);
+        lock_str_values(&self.str_values).clear();
     }
 
     /// True when the current block still has a batch to emit.
@@ -1254,8 +1227,7 @@ impl LogScanStream {
     fn release_block(&mut self) {
         self.reservation.shrink(std::mem::take(&mut self.held));
         self.pending = Pending::None;
-        let live = lock_str_values(&self.str_values).live_bytes();
-        self.release_dead_str_values(live);
+        lock_str_values(&self.str_values).retain_live();
     }
 
     /// The scan the state holds reported exhaustion: publish its final
@@ -1329,8 +1301,7 @@ impl LogScanStream {
     fn finish_segment(&mut self) {
         self.current_dirs = None;
         self.state = LogScanState::NextSegment;
-        let live = lock_str_values(&self.str_values).live_bytes();
-        self.release_dead_str_values(live);
+        lock_str_values(&self.str_values).retain_live();
     }
 
     /// This partition has emitted its pushed `fetch` rows: stop, mid-segment
