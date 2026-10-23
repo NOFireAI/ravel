@@ -356,74 +356,148 @@ impl<'a> StrCursor<'a> {
 /// (the base with fallback values appended) is dropped then too, or as soon
 /// as the cache holds its last reference: no batch reads it any more.
 ///
-/// So at each [`Self::live_bytes`] call the cache holds, per dictionary still
+/// So after each [`Self::retain_live`] the cache holds, per dictionary still
 /// being read, its base values plus one extended array per distinct sorted
 /// fallback value list that a live batch or a block being built still reads.
+///
+/// The cache charges the pool for every array it holds, once, through its own
+/// `reservation` (ADR-1170 decision 1): each array's [`ValuesLayout::bytes`]
+/// is reserved before the array is built, and released when the array leaves
+/// the cache. A batch reading a cached array is not charged for it again
+/// ([`columnar_charges`]).
 pub(super) struct StrValuesCache {
     pub(super) entries: Vec<SharedStrValues>,
     /// [`BlockMetrics::str_dict_values_built`].
     built: Count,
+    /// The sum of the `charge` of every array the entries hold.
+    reservation: MemoryReservation,
 }
 
 pub(super) struct SharedStrValues {
     dict: Arc<DictValues>,
-    values: ArrayRef,
+    pub(super) values: ChargedValues,
     /// The values with a block's resource/scope fallback values appended past
     /// them, keyed by those values sorted and deduplicated
     /// ([`canonical_fallbacks`]).
-    extended: Vec<(Vec<String>, ArrayRef)>,
+    pub(super) extended: Vec<(Vec<String>, ChargedValues)>,
+}
+
+/// A cached values array and the bytes [`StrValuesCache`] reserved for it.
+pub(super) struct ChargedValues {
+    pub(super) array: ArrayRef,
+    pub(super) charge: usize,
+}
+
+impl SharedStrValues {
+    fn charge(&self) -> usize {
+        self.values.charge + self.extended.iter().map(|(_, v)| v.charge).sum::<usize>()
+    }
 }
 
 impl StrValuesCache {
-    pub(super) fn new(built: Count) -> Self {
+    /// An empty cache charging the arrays it builds to `reservation`, which
+    /// it frees when dropped.
+    pub(super) fn new(built: Count, reservation: MemoryReservation) -> Self {
         StrValuesCache {
             entries: Vec::new(),
             built,
+            reservation,
         }
     }
 
     /// `dict`'s entries as an Arrow `StringArray`, a non-UTF-8 entry as NULL,
     /// with `extra` appended past them. Built on the first request for that
     /// dictionary and `extra`; every later request returns the same array.
-    fn values(&mut self, dict: &Arc<DictValues>, extra: Vec<String>) -> ArrayRef {
+    ///
+    /// A build is reserved first: when the pool refuses the array's bytes this
+    /// returns the pool's resources-exhausted error and builds nothing.
+    fn values(&mut self, dict: &Arc<DictValues>, extra: Vec<String>) -> DFResult<ArrayRef> {
         let at = match self.entries.iter().position(|e| Arc::ptr_eq(&e.dict, dict)) {
             Some(at) => at,
             None => {
                 self.retain_live();
-                self.built.add(1);
+                let values = self.build(dict, &[])?;
                 self.entries.push(SharedStrValues {
                     dict: Arc::clone(dict),
-                    values: dict_values_array(dict, &[]),
+                    values,
                     extended: Vec::new(),
                 });
                 self.entries.len() - 1
             }
         };
-        let entry = &mut self.entries[at];
         if extra.is_empty() {
-            return Arc::clone(&entry.values);
+            return Ok(Arc::clone(&self.entries[at].values.array));
         }
-        if let Some((_, values)) = entry.extended.iter().find(|(e, _)| *e == extra) {
-            return Arc::clone(values);
+        if let Some((_, values)) = self.entries[at].extended.iter().find(|(e, _)| *e == extra) {
+            return Ok(Arc::clone(&values.array));
         }
-        self.built.add(1);
-        let values = dict_values_array(dict, &extra);
-        entry.extended.push((extra, Arc::clone(&values)));
-        values
+        let values = self.build(dict, &extra)?;
+        let array = Arc::clone(&values.array);
+        self.entries[at].extended.push((extra, values));
+        Ok(array)
     }
 
-    fn retain_live(&mut self) {
-        self.entries.retain(|e| Arc::strong_count(&e.dict) > 1);
+    /// Reserve the bytes of `dict`'s values with `extra` appended, then build
+    /// them.
+    fn build(&mut self, dict: &DictValues, extra: &[String]) -> DFResult<ChargedValues> {
+        let layout = ValuesLayout::of(dict, extra);
+        let charge = layout.bytes();
+        self.reservation.try_grow(charge)?;
+        self.built.add(1);
+        Ok(ChargedValues {
+            array: dict_values_array(dict, extra, &layout),
+            charge,
+        })
+    }
+
+    /// Drop the entries whose row group the reader has moved past and the
+    /// extended arrays no batch reads any more, and release their charge.
+    ///
+    /// A base values array can lose its charge while the batch the stream
+    /// handed out last still reads it: the entry goes with its dictionary,
+    /// not with the batches. That gap is at most one values array per
+    /// dictionary column of that one batch, and it closes when the stream
+    /// releases the batch at its next emit.
+    pub(super) fn retain_live(&mut self) {
+        let mut freed = 0;
+        self.entries.retain(|e| {
+            let live = Arc::strong_count(&e.dict) > 1;
+            if !live {
+                freed += e.charge();
+            }
+            live
+        });
         for entry in &mut self.entries {
-            entry.extended.retain(|(_, v)| Arc::strong_count(v) > 1);
+            entry.extended.retain(|(_, v)| {
+                let live = Arc::strong_count(&v.array) > 1;
+                if !live {
+                    freed += v.charge;
+                }
+                live
+            });
         }
+        self.reservation.shrink(freed);
+    }
+
+    /// Drop every entry and release the whole charge: the stream has nothing
+    /// left to read them for.
+    pub(super) fn clear(&mut self) {
+        self.entries.clear();
+        self.reservation.free();
     }
 
     /// The Arrow bytes of every array the live entries hold, after dropping
     /// the entries whose row group the reader has moved past.
+    #[cfg(test)]
     pub(super) fn live_bytes(&mut self) -> usize {
         self.retain_live();
         self.arrays().map(|a| a.get_array_memory_size()).sum()
+    }
+
+    /// The bytes the cache has reserved for the arrays it holds.
+    #[cfg(test)]
+    pub(super) fn reserved(&self) -> usize {
+        self.reservation.size()
     }
 
     /// Whether `values` is one of the arrays this cache holds.
@@ -432,9 +506,9 @@ impl StrValuesCache {
     }
 
     fn arrays(&self) -> impl Iterator<Item = &ArrayRef> {
-        self.entries
-            .iter()
-            .flat_map(|e| std::iter::once(&e.values).chain(e.extended.iter().map(|(_, v)| v)))
+        self.entries.iter().flat_map(|e| {
+            std::iter::once(&e.values.array).chain(e.extended.iter().map(|(_, v)| &v.array))
+        })
     }
 }
 
@@ -445,8 +519,8 @@ impl StrValuesCache {
 /// column. Those values are shared by every chunk of the block, and a row group
 /// dictionary's by every block of its group, so `get_array_memory_size` would
 /// count them once per batch. A values array the scan's [`StrValuesCache`]
-/// holds is charged once per cache entry, by [`LogScanStream::hold_batches`];
-/// any other is charged once for the block, in the returned total.
+/// holds is charged by the cache, before it was built, and not here; any
+/// other is charged once for the block, in the returned total.
 pub(super) fn columnar_charges(
     batches: Vec<RecordBatch>,
     cache: &StrValuesCache,
@@ -478,8 +552,45 @@ pub(super) fn columnar_charges(
     (charged, shared)
 }
 
+/// What [`LogScanStream::hold_batches`] charges for one block's batches:
+/// releases the cache entries no longer read, then grows `reservation` by the
+/// batches' [`columnar_charges`] and their non-cached shared values. Returns
+/// the charged batches and the bytes grown.
+pub(super) fn charge_columnar_batches(
+    batches: Vec<RecordBatch>,
+    cache: &SharedStrValuesCache,
+    reservation: &MemoryReservation,
+) -> DFResult<(VecDeque<(RecordBatch, usize)>, usize)> {
+    let (charged, shared) = {
+        let mut cache = lock_str_values(cache);
+        cache.retain_live();
+        columnar_charges(batches, &cache)
+    };
+    let bytes = charged.iter().map(|(_, c)| c).sum::<usize>() + shared;
+    reservation.try_grow(bytes)?;
+    Ok((charged, bytes))
+}
+
 /// A partition scan's [`StrValuesCache`], shared by the block jobs it submits.
 pub(super) type SharedStrValuesCache = Arc<std::sync::Mutex<StrValuesCache>>;
+
+/// A pool with no limit, for a test that does not read the cache's charge.
+#[cfg(test)]
+pub(super) fn unbounded_pool() -> Arc<dyn datafusion::execution::memory_pool::MemoryPool> {
+    Arc::new(datafusion::execution::memory_pool::UnboundedMemoryPool::default())
+}
+
+/// An empty cache whose reservation is a consumer of `pool`, so a test reads
+/// the cache's charge from the pool.
+#[cfg(test)]
+pub(super) fn test_str_values(
+    pool: &Arc<dyn datafusion::execution::memory_pool::MemoryPool>,
+) -> SharedStrValuesCache {
+    Arc::new(std::sync::Mutex::new(StrValuesCache::new(
+        Count::new(),
+        MemoryConsumer::new("StrValuesCache").register(pool),
+    )))
+}
 
 pub(super) fn lock_str_values(
     cache: &SharedStrValuesCache,
@@ -489,17 +600,63 @@ pub(super) fn lock_str_values(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// `dict`'s entries then `extra` as one `StringArray`, a non-UTF-8 entry as
-/// NULL. The entries' text was validated once when the dictionary decoded.
-fn dict_values_array(dict: &DictValues, extra: &[String]) -> ArrayRef {
-    let extra = extra.iter().map(String::as_str);
-    if dict.all_valid() {
-        Arc::new(StringArray::from_iter_values(
-            dict.texts().flatten().chain(extra),
-        ))
-    } else {
-        Arc::new(StringArray::from_iter(dict.texts().chain(extra.map(Some))))
+/// The buffer sizes of the `StringArray` [`dict_values_array`] builds for a
+/// dictionary's entries then `extra`, read from the dictionary without
+/// building anything.
+struct ValuesLayout {
+    /// Entries plus appended values.
+    len: usize,
+    /// UTF-8 bytes of the valid entries and the appended values.
+    data: usize,
+    /// Whether any entry is not UTF-8 and so NULL.
+    nulls: bool,
+}
+
+impl ValuesLayout {
+    fn of(dict: &DictValues, extra: &[String]) -> Self {
+        let mut data = extra.iter().map(String::len).sum::<usize>();
+        let mut nulls = false;
+        for text in dict.texts() {
+            match text {
+                Some(t) => data += t.len(),
+                None => nulls = true,
+            }
+        }
+        ValuesLayout {
+            len: dict.len() + extra.len(),
+            data,
+            nulls,
+        }
     }
+
+    /// What `get_array_memory_size` reports for the built array: the
+    /// `StringArray` struct, `len + 1` `i32` offsets, `data` value bytes, and,
+    /// when an entry is NULL, a validity bitmap of `len` bits that Arrow
+    /// allocates rounded up to a multiple of 64 bytes. [`dict_values_array`]
+    /// sizes each buffer to exactly this before appending, so none grows.
+    fn bytes(&self) -> usize {
+        let offsets = (self.len + 1) * std::mem::size_of::<i32>();
+        let validity = if self.nulls {
+            self.len.div_ceil(8).next_multiple_of(64)
+        } else {
+            0
+        };
+        std::mem::size_of::<StringArray>() + offsets + self.data + validity
+    }
+}
+
+/// `dict`'s entries then `extra` as one `StringArray`, a non-UTF-8 entry as
+/// NULL, its buffers allocated to `layout`. The entries' text was validated
+/// once when the dictionary decoded.
+fn dict_values_array(dict: &DictValues, extra: &[String], layout: &ValuesLayout) -> ArrayRef {
+    let mut builder = StringBuilder::with_capacity(layout.len, layout.data);
+    for text in dict.texts() {
+        builder.append_option(text);
+    }
+    for value in extra {
+        builder.append_value(value);
+    }
+    Arc::new(builder.finish())
 }
 
 /// Whether a cursor sets the key at a row, and for a `Str` cursor the text its
@@ -746,13 +903,11 @@ struct StrBlock {
 }
 
 impl<'p, 'd, 'a> DeclaredResolver<'p, 'd, 'a> {
-    /// A resolver with a values cache of its own, which lives for this block.
+    /// A resolver with a values cache of its own, which lives for this block,
+    /// charged to an unbounded pool.
     #[cfg(test)]
     fn new(plan: &'p DeclaredPlan<'d, 'a>) -> Self {
-        Self::with_str_values(
-            plan,
-            Arc::new(std::sync::Mutex::new(StrValuesCache::new(Count::new()))),
-        )
+        Self::with_str_values(plan, test_str_values(&unbounded_pool()))
     }
 
     fn with_str_values(plan: &'p DeclaredPlan<'d, 'a>, str_values: SharedStrValuesCache) -> Self {
@@ -1123,7 +1278,7 @@ fn build_str_block(
                     })?;
                 *k = base + slot;
             }
-            lock_str_values(&resolver.str_values).values(shared, extra)
+            lock_str_values(&resolver.str_values).values(shared, extra)?
         }
         None => {
             let mut texts: Vec<&str> = Vec::with_capacity(n);
@@ -2421,7 +2576,7 @@ mod columnar_lookup_tests {
         let mut scan = reader
             .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
             .expect("scan");
-        let shared = Arc::new(std::sync::Mutex::new(StrValuesCache::new(Count::new())));
+        let shared = test_str_values(&unbounded_pool());
         let mut dicts: Vec<(Arc<DictValues>, ArrayRef)> = Vec::new();
         let mut blocks = 0;
         while let Some(view) = scan.next_block_columnar(&obj).expect("columnar exit") {
@@ -2550,7 +2705,7 @@ mod columnar_lookup_tests {
         let mut scan = reader
             .scan_blocks(&Predicate::And(Vec::new()), &[], &ColumnSelection::all())
             .expect("scan");
-        let shared = Arc::new(std::sync::Mutex::new(StrValuesCache::new(Count::new())));
+        let shared = test_str_values(&unbounded_pool());
         let live = |cache: &SharedStrValuesCache| {
             let mut cache = lock_str_values(cache);
             let bytes = cache.live_bytes();
@@ -2624,7 +2779,7 @@ mod columnar_lookup_tests {
         let base = {
             let cache = lock_str_values(&shared);
             assert_eq!(cache.entries.len(), 1, "one dictionary");
-            cache.entries[0].values.get_array_memory_size()
+            cache.entries[0].values.array.get_array_memory_size()
         };
         let built = lock_str_values(&shared).built.value();
         (held, released, base, extended_bytes, built)
@@ -3396,7 +3551,7 @@ mod tests {
         let mut scan = reader
             .scan_blocks(pred, &[], &ColumnSelection::all())
             .expect("scan");
-        let shared = Arc::new(std::sync::Mutex::new(StrValuesCache::new(Count::new())));
+        let shared = test_str_values(&unbounded_pool());
         let dc = DeclaredColumn::new(KEY, DeclaredType::Str);
         let mut last_dict: Option<Arc<DictValues>> = None;
         while let Some(view) = scan.next_block_columnar(obj).expect("columnar exit") {
@@ -3949,5 +4104,276 @@ mod tests {
             "a per-key read of a dictionary page validates nothing"
         );
         assert_eq!(cells, want);
+    }
+
+    // --- StrValuesCache pool charge (issue #3181) ---------------------------
+
+    use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
+
+    /// Three entries, every one UTF-8.
+    const VALID_ENTRIES: [&[u8]; 3] = [
+        b"checkout-service-request-id",
+        b"payments-gateway-upstream",
+        b"inventory",
+    ];
+    /// Three entries, the last not UTF-8, so the values array carries a
+    /// validity bitmap.
+    const MIXED_ENTRIES: [&[u8]; 3] = [
+        b"checkout-service-request-id",
+        b"payments-gateway-upstream",
+        &[b'b', 0xff, b'c'],
+    ];
+
+    /// The shared dictionary of a one-block object whose `Str` column cycles
+    /// through `entries` over 12 rows, which encodes as a dictionary page. The
+    /// reader is dropped on return, so the caller holds the dictionary's only
+    /// reference outside a cache.
+    fn page_dict(entries: &[&[u8]]) -> Arc<DictValues> {
+        let block = fixed_block(
+            &[FieldType::Str],
+            (0..12)
+                .map(|r| vec![str_value(entries[r % entries.len()])])
+                .collect(),
+            0,
+            11,
+        );
+        let cfg = cfg();
+        let obj = encode(&block, &cfg);
+        let reader = RlogReader::new(&obj, &cfg).expect("open");
+        let mut scan = reader
+            .scan_blocks(&window(&block), &[], &ColumnSelection::all())
+            .expect("scan");
+        let view = scan
+            .next_block_columnar(&obj)
+            .expect("columnar exit")
+            .expect("one block");
+        let dc = DeclaredColumn::new(KEY, DeclaredType::Str);
+        let plan = DeclaredPlan::build(&view, &dc);
+        let Some(DeclaredCursor::Str(StrCursor {
+            dict: Some(page), ..
+        })) = plan.matching_cursor()
+        else {
+            panic!("`k` reads a dictionary page");
+        };
+        let dict = Arc::clone(page.values());
+        assert_eq!(dict.len(), entries.len(), "one entry per distinct cell");
+        dict
+    }
+
+    fn extra(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    /// ADR-1170 decision 1: the cache reserves a values array's bytes before
+    /// it builds the array. A pool that cannot hold one dictionary's values
+    /// refuses with `ResourcesExhausted`, and nothing is built or left
+    /// reserved; the same holds for an extended array once the base fits.
+    ///
+    /// Flipped: building the array first and calling `try_grow` after it
+    /// returns the same error with the built counter at 1.
+    #[test]
+    fn str_values_reserved_before_build() {
+        let dict = page_dict(&VALID_ENTRIES);
+        let base = ValuesLayout::of(&dict, &[]).bytes();
+        const OTHER: usize = 1000;
+
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(OTHER + base - 1));
+        let other = MemoryConsumer::new("other").register(&pool);
+        other.try_grow(OTHER).expect("the other consumer fits");
+        let shared = test_str_values(&pool);
+        let err = lock_str_values(&shared)
+            .values(&dict, Vec::new())
+            .expect_err("a pool below one dictionary's values refuses it");
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "resources exhausted, got {err}"
+        );
+        let cache = lock_str_values(&shared);
+        assert_eq!(cache.built.value(), 0, "nothing built");
+        assert!(cache.entries.is_empty(), "nothing cached");
+        assert_eq!(cache.reserved(), 0, "the cache reserved nothing");
+        assert_eq!(
+            pool.reserved(),
+            OTHER,
+            "the pool's reserved total is unchanged"
+        );
+        drop(cache);
+
+        let ext = extra(&["resource-fallback"]);
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(base));
+        let shared = test_str_values(&pool);
+        lock_str_values(&shared)
+            .values(&dict, Vec::new())
+            .expect("the base values fit");
+        let err = lock_str_values(&shared)
+            .values(&dict, ext)
+            .expect_err("no room for the extended values");
+        assert!(
+            matches!(err, DataFusionError::ResourcesExhausted(_)),
+            "resources exhausted, got {err}"
+        );
+        let cache = lock_str_values(&shared);
+        assert_eq!(cache.built.value(), 1, "only the base built");
+        assert!(cache.entries[0].extended.is_empty(), "no extended array");
+        assert_eq!(pool.reserved(), base, "only the base reserved");
+    }
+
+    /// The charge the cache reserves for an array is what
+    /// `get_array_memory_size` reports for it once built, for an all-UTF-8
+    /// dictionary (no validity bitmap) and one with a non-UTF-8 entry (a
+    /// bitmap Arrow rounds up to 64 bytes).
+    ///
+    /// The slack is 0: `dict_values_array` sizes the offsets and value
+    /// buffers exactly from `ValuesLayout` before appending, so neither
+    /// grows, and the validity bitmap's only rounding (to a multiple of 64
+    /// bytes) is in the formula. A charge above the sum is over-counting this
+    /// test would let through only if the slack were raised.
+    #[test]
+    fn str_values_charge_matches_built_arrays() {
+        const SLACK: usize = 0;
+        for (entries, nulls) in [(&VALID_ENTRIES, 0), (&MIXED_ENTRIES, 1)] {
+            let dict = page_dict(entries);
+            let pool = unbounded_pool();
+            let shared = test_str_values(&pool);
+            let mut cache = lock_str_values(&shared);
+            let arrays = [
+                cache.values(&dict, Vec::new()).expect("base"),
+                cache.values(&dict, extra(&["ra"])).expect("first extended"),
+                cache
+                    .values(&dict, extra(&["rb", "scope-fallback-value"]))
+                    .expect("second extended"),
+            ];
+            assert_eq!(cache.built.value(), 3, "three arrays built");
+            assert_eq!(arrays[0].null_count(), nulls, "NULL per non-UTF-8 entry");
+            let sum: usize = arrays.iter().map(|a| a.get_array_memory_size()).sum();
+            let reserved = cache.reserved();
+            assert!(
+                reserved >= sum,
+                "{nulls} NULLs: charge {reserved} covers the built arrays' {sum}"
+            );
+            assert!(
+                reserved <= sum + SLACK,
+                "{nulls} NULLs: charge {reserved} within {SLACK} of the built arrays' {sum}"
+            );
+            assert_eq!(pool.reserved(), reserved, "charged to the pool");
+        }
+    }
+
+    /// The charge leaves with the arrays: an extended array no batch reads is
+    /// released on its own, and once the dictionary and every batch reading
+    /// it are gone, `retain_live` returns the reservation to 0.
+    #[test]
+    fn str_values_charge_released_with_entries() {
+        let dict = page_dict(&MIXED_ENTRIES);
+        let pool = unbounded_pool();
+        let shared = test_str_values(&pool);
+        let (base, ext) = {
+            let mut cache = lock_str_values(&shared);
+            (
+                cache.values(&dict, Vec::new()).expect("base"),
+                cache.values(&dict, extra(&["ra"])).expect("extended"),
+            )
+        };
+        let batch = |values: &ArrayRef| {
+            let keys = Int32Array::from(vec![0, 1, 0]);
+            let column = DictionaryArray::<Int32Type>::try_new(keys, Arc::clone(values))
+                .expect("dictionary column");
+            RecordBatch::try_from_iter([("k", Arc::new(column) as ArrayRef)]).expect("batch")
+        };
+        let (base_batch, ext_batch) = (batch(&base), batch(&ext));
+        let base_bytes = base.get_array_memory_size();
+        let ext_bytes = ext.get_array_memory_size();
+        drop((base, ext));
+        assert_eq!(
+            pool.reserved(),
+            base_bytes + ext_bytes,
+            "both arrays charged"
+        );
+
+        drop(ext_batch);
+        lock_str_values(&shared).retain_live();
+        assert_eq!(
+            pool.reserved(),
+            base_bytes,
+            "the extended array no batch reads is released"
+        );
+
+        drop((dict, base_batch));
+        let mut cache = lock_str_values(&shared);
+        cache.retain_live();
+        assert!(cache.entries.is_empty(), "the entry is dropped");
+        assert_eq!(cache.reserved(), 0, "the cache's charge is released");
+        assert_eq!(pool.reserved(), 0, "nothing left on the pool");
+    }
+
+    /// A values array the cache holds is charged once, by the cache, however
+    /// many batches read it: what `LogScanStream::hold_batches` grows the
+    /// stream's reservation by ([`charge_columnar_batches`]) plus the cache's
+    /// reservation is each batch's own charge, the cached values once, and a
+    /// non-cached values array the batches share once.
+    ///
+    /// Flipped: growing the stream's reservation by the cache's live bytes as
+    /// well counts the cached values twice.
+    #[test]
+    fn cache_values_charged_once() {
+        use datafusion::arrow::array::AsArray;
+        let dict = page_dict(&VALID_ENTRIES);
+        let pool = unbounded_pool();
+        let shared = test_str_values(&pool);
+        let stream = MemoryConsumer::new("stream").register(&pool);
+        let cached = lock_str_values(&shared)
+            .values(&dict, Vec::new())
+            .expect("base");
+        let plain: ArrayRef = Arc::new(StringArray::from(vec!["p0", "p1", "p2"]));
+        let batch = |keys: Vec<i32>| {
+            let column = |values: &ArrayRef| {
+                Arc::new(
+                    DictionaryArray::<Int32Type>::try_new(
+                        Int32Array::from(keys.clone()),
+                        Arc::clone(values),
+                    )
+                    .expect("dictionary column"),
+                ) as ArrayRef
+            };
+            let n = keys.len() as i64;
+            RecordBatch::try_from_iter([
+                ("k", column(&cached)),
+                ("p", column(&plain)),
+                (
+                    "n",
+                    Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef,
+                ),
+            ])
+            .expect("batch")
+        };
+        let batches = vec![batch(vec![0, 1, 2, 1]), batch(vec![2, 2])];
+        let own: usize = batches
+            .iter()
+            .flat_map(|b| b.columns())
+            .map(|c| {
+                let values = c
+                    .as_any_dictionary_opt()
+                    .map_or(0, |d| d.values().get_array_memory_size());
+                c.get_array_memory_size() - values
+            })
+            .sum();
+        let cached_bytes = cached.get_array_memory_size();
+        let plain_bytes = plain.get_array_memory_size();
+
+        let (charged, bytes) = charge_columnar_batches(batches, &shared, &stream).expect("charged");
+        assert_eq!(charged.len(), 2);
+        assert_eq!(
+            charged.iter().map(|(_, c)| c).sum::<usize>(),
+            own,
+            "each batch carries its own charge"
+        );
+        assert_eq!(
+            stream.size() + lock_str_values(&shared).reserved(),
+            own + plain_bytes + cached_bytes,
+            "the cached values counted once"
+        );
+        assert_eq!(bytes, own + plain_bytes, "the shared plain values once");
+        assert_eq!(stream.size(), bytes, "the stream grew by what it holds");
+        assert_eq!(pool.reserved(), own + plain_bytes + cached_bytes);
     }
 }
