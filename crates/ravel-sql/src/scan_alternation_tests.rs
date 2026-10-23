@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use datafusion::arrow::array::TimestampNanosecondArray;
 use ravel_cache::{Cache, CacheLimits};
 use ravel_catalog::{Catalog, CatalogConfig};
 use ravel_object_store::fault::{FaultPlan, FaultStore};
@@ -136,5 +137,81 @@ async fn a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs() 
         served,
         vec![0, 2792, 2094, 2094],
         "read-cache bytes served per execution"
+    );
+}
+
+/// `STATEMENT` under a `LIMIT` the scan takes as a pushed fetch: `has_word`
+/// is pushed exactly, so no `FilterExec` sits between the limit and the scan.
+const FETCH_STATEMENT: &str = "SELECT ts, body FROM logs WHERE has_word(body, 'query') LIMIT 5";
+
+/// `STATEMENT` under an ascending `ts` TopK the scan confirms.
+const TOPK_STATEMENT: &str =
+    "SELECT ts, body FROM logs WHERE has_word(body, 'query') ORDER BY ts LIMIT 5";
+
+/// Two executions each of a statement whose `LIMIT` reaches the scan as a
+/// pushed fetch and of a confirmed ascending-`ts` TopK, through
+/// `SqlExecutor::execute` and `LogsScanExec::execute` with a read cache
+/// wired: neither counts an execution in the executor's record, so neither
+/// alternates, and each returns the same batches twice. The fetch returns
+/// the first five records of object 0, its first object in visit order. Two
+/// executions of `STATEMENT` after them count one scan twice, so the record
+/// the assertions read is the one the scans write.
+///
+/// FLIP: handing `Alternation::for_scan` `None` for the fetch in
+/// `LogsScanExec::execute` counts the fetch statement's scan and returns
+/// object 7's records on its second execution; handing it `false` for the
+/// confirmed TopK counts the TopK statement's scan.
+#[tokio::test]
+async fn a_pushed_fetch_and_a_confirmed_topk_do_not_alternate() {
+    let (store, tenant_hash, sizes) = eight_object_lane().await;
+    let capacity = sizes.iter().sum::<u64>() * 2;
+    let cache: Arc<Cache<CacheFetchError>> =
+        Arc::new(Cache::new(CacheLimits::new(capacity, 4096, capacity)));
+    let exec = executor(store, cache);
+
+    for statement in [FETCH_STATEMENT, TOPK_STATEMENT] {
+        let mut runs = Vec::new();
+        for _ in 0..2 {
+            let output = exec
+                .execute(tenant_hash, &sql_request(statement, WINDOW))
+                .await
+                .expect("the statement runs");
+            runs.push(output.output);
+        }
+        let ts: Vec<i64> = runs[0]
+            .batches()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampNanosecondArray>()
+                    .expect("ts is a nanosecond timestamp")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        assert_eq!(ts, vec![0, 100, 200, 300, 400], "{statement}");
+        assert_eq!(
+            runs[0].batches(),
+            runs[1].batches(),
+            "{statement} returns the same batches on both executions"
+        );
+        assert_eq!(
+            exec.scan_execution_counts(),
+            Vec::<u64>::new(),
+            "{statement} counts no execution"
+        );
+    }
+
+    for _ in 0..2 {
+        exec.execute(tenant_hash, &sql_request(STATEMENT, WINDOW))
+            .await
+            .expect("the statement runs");
+    }
+    assert_eq!(
+        exec.scan_execution_counts(),
+        vec![2],
+        "the unbounded statement counts its scan on each execution"
     );
 }

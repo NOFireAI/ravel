@@ -4301,6 +4301,13 @@ impl SqlExecutor {
         }
     }
 
+    /// Every logs scan's execution count in [`Self::scan_executions`],
+    /// ascending.
+    #[cfg(test)]
+    pub(crate) fn scan_execution_counts(&self) -> Vec<u64> {
+        self.scan_executions.counts()
+    }
+
     /// [`Self::analyzed_classification_plan`] for SQL text, with any error
     /// read as `None`, as the unit tests below call it.
     #[cfg(test)]

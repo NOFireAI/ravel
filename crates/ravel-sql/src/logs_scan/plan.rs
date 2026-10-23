@@ -1154,6 +1154,15 @@ impl ScanExecutions {
         entries.by_key.len()
     }
 
+    /// Every scan's count, ascending, without counting one.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> Vec<u64> {
+        let entries = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut counts: Vec<u64> = entries.by_key.values().map(|&(count, _)| count).collect();
+        counts.sort_unstable();
+        counts
+    }
+
     /// The executions counted under `key`, without counting one.
     #[cfg(test)]
     pub(super) fn count(&self, key: u64) -> Option<u64> {
