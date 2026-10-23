@@ -4192,7 +4192,11 @@ mod tests {
         assert_eq!(cache.built.value(), 0, "nothing built");
         assert!(cache.entries.is_empty(), "nothing cached");
         assert_eq!(cache.reserved(), 0, "the cache reserved nothing");
-        assert_eq!(pool.reserved(), OTHER, "the pool's reserved total is unchanged");
+        assert_eq!(
+            pool.reserved(),
+            OTHER,
+            "the pool's reserved total is unchanged"
+        );
         drop(cache);
 
         let ext = extra(&["resource-fallback"]);
@@ -4280,7 +4284,11 @@ mod tests {
         let base_bytes = base.get_array_memory_size();
         let ext_bytes = ext.get_array_memory_size();
         drop((base, ext));
-        assert_eq!(pool.reserved(), base_bytes + ext_bytes, "both arrays charged");
+        assert_eq!(
+            pool.reserved(),
+            base_bytes + ext_bytes,
+            "both arrays charged"
+        );
 
         drop(ext_batch);
         lock_str_values(&shared).retain_live();
@@ -4331,7 +4339,10 @@ mod tests {
             RecordBatch::try_from_iter([
                 ("k", column(&cached)),
                 ("p", column(&plain)),
-                ("n", Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef),
+                (
+                    "n",
+                    Arc::new(Int64Array::from_iter_values(0..n)) as ArrayRef,
+                ),
             ])
             .expect("batch")
         };
@@ -4349,21 +4360,20 @@ mod tests {
         let cached_bytes = cached.get_array_memory_size();
         let plain_bytes = plain.get_array_memory_size();
 
-        let (charged, bytes) =
-            charge_columnar_batches(batches, &shared, &stream).expect("charged");
+        let (charged, bytes) = charge_columnar_batches(batches, &shared, &stream).expect("charged");
         assert_eq!(charged.len(), 2);
         assert_eq!(
             charged.iter().map(|(_, c)| c).sum::<usize>(),
             own,
             "each batch carries its own charge"
         );
-        assert_eq!(bytes, own + plain_bytes, "the shared plain values once");
-        assert_eq!(stream.size(), bytes, "the stream grew by what it holds");
         assert_eq!(
             stream.size() + lock_str_values(&shared).reserved(),
             own + plain_bytes + cached_bytes,
             "the cached values counted once"
         );
+        assert_eq!(bytes, own + plain_bytes, "the shared plain values once");
+        assert_eq!(stream.size(), bytes, "the stream grew by what it holds");
         assert_eq!(pool.reserved(), own + plain_bytes + cached_bytes);
     }
 }

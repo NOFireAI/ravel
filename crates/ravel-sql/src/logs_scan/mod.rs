@@ -247,7 +247,9 @@
 //! decoded block in `LogScanStream::resident` until the decode that replaces it
 //! has run, including any wait for a read-gate permit before that decode.
 //! Charging the batches alone would admit a query at a fraction of its
-//! resident footprint.
+//! resident footprint. A shared dictionary's values array, which the batches
+//! of many blocks read, is charged once, by the scan's [`StrValuesCache`],
+//! before the array is built.
 //!
 //! # Column projection
 //!
