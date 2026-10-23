@@ -7600,7 +7600,9 @@ impl BlockRangeFetcher {
         // reader re-verifies each section's crc on decode, so a corrupt section
         // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
         // reader does not read it, and the plan probes it by range. With `dirs`, SKIP_IDX and PAGE_DIR
-        // are not placed either: nothing reads them from the buffer.
+        // are not placed either: nothing reads them from the buffer. BLOOM is
+        // placed whatever the query's arms, because `RlogReader::scan_blocks`
+        // reads it for a query with no arm as well (`tail_section_placement_tests`).
         for section in &footer.sections {
             if matches!(
                 section.kind,
@@ -12577,8 +12579,8 @@ mod tail_section_placement_tests {
     //! Which tail sections the scan over a ranged open reads (issue #3219):
     //! the bytes `fetch_object_v4`'s placement loop has to place for
     //! [`LogSegmentFetcher::scan_bytes`] to succeed. Each case assembles a
-    //! version-4 object with one section left unplaced and runs the scan the
-    //! fetcher runs over a ranged open's bytes.
+    //! version-4 object with one section left unplaced and runs `scan_bytes`,
+    //! which opens the same `RlogReader::scan_blocks` every scan entry opens.
 
     use super::*;
     use ravel_logseg::writer::ObjectIdentity;
@@ -12651,7 +12653,10 @@ mod tail_section_placement_tests {
         let bytes = Bytes::copy_from_slice(obj);
         let mut asm = ObjectAssembler::new(&Arc::new(AssemblyGauge::default()), obj.len() as u64);
         let mut at = 0u64;
-        for (start, end) in gaps.into_iter().chain([(obj.len() as u64, obj.len() as u64)]) {
+        for (start, end) in gaps
+            .into_iter()
+            .chain([(obj.len() as u64, obj.len() as u64)])
+        {
             if start > at {
                 asm.place(KEY, at, bytes.slice(at as usize..start as usize))
                     .expect("place");
@@ -12733,9 +12738,11 @@ mod tail_section_placement_tests {
         let query = LogQuery::new(i64::MIN, i64::MAX);
 
         let full = scan(&assembled_without(&obj, &[]), &query).expect("full scan");
-        let holed =
-            scan(&assembled_without(&obj, &[kind::POSTINGS]), &query).expect("holed scan");
-        assert_eq!(format!("{:?}", holed.records), format!("{:?}", full.records));
+        let holed = scan(&assembled_without(&obj, &[kind::POSTINGS]), &query).expect("holed scan");
+        assert_eq!(
+            format!("{:?}", holed.records),
+            format!("{:?}", full.records)
+        );
         assert_eq!(holed.records.len(), BLOCKS as usize);
 
         let equality = query.clone().with_prune(Predicate::Equals {
