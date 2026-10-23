@@ -1304,6 +1304,7 @@ fn build_sql_state_inner(
         // default so a production logs query never pays its per-segment
         // metric registrations.
         segment_timing: SqlConfig::default().segment_timing,
+        aggregate_reserve_ahead: SqlConfig::default().aggregate_reserve_ahead,
     }
     .with_spill_resolved(
         spill.off,

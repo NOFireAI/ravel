@@ -382,6 +382,7 @@ async fn a_query_that_outgrows_its_pool_still_releases_tenant_bytes() {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let accountant = TenantMemoryAccountant::new(1 << 30);
     let (pool, _breach) = config.query_pool(Arc::clone(&accountant), QueryAccounting::new());

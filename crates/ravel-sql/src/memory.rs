@@ -43,9 +43,31 @@
 //! DataFusion release whose `execute_typed` no longer falls back to the legacy
 //! stream (apache/datafusion#22710, #25902), and the last-release hold once
 //! the migrated streams keep their final output reserved.
+//!
+//! The migrated partial, final and single-stage hash aggregate streams are
+//! also charged ahead of what they ask for ([`AggregateReserveAhead`], issue
+//! #3181), because DataFusion 55.2 grows their reservations only after
+//! `aggregate_batch` has already grown the group table and the accumulator
+//! `Vec`s, and counts less than those allocations hold:
+//!
+//! - Every grow and shrink of such a consumer is charged at
+//!   `undercount_factor` times the bytes asked, on the query, tenant and
+//!   process ledgers alike.
+//! - While the consumer builds (until its first shrink), it carries an
+//!   envelope for the next doubling it can make: `envelope_size_factor x S`
+//!   while its asked size `S` is under 8 MiB, else the smaller of that and
+//!   `envelope_multiplier x J_max`, where `J_max` is its largest single grow.
+//!   Only the `W` largest envelopes in the process are reserved, on the
+//!   process [`MemoryBudget`] alone, where `W` is the number of aggregate
+//!   streams that can run `aggregate_batch` at once. A grow whose envelope
+//!   change the budget refuses is itself refused before anything is charged.
+//!
+//! [`AggregateReserveAhead::OFF`] restores one-to-one charging and no
+//! envelope.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
@@ -355,6 +377,321 @@ pub fn sql_memory_held_bytes() -> u64 {
     HELD_BYTES.load(Ordering::Acquire)
 }
 
+/// The name prefix DataFusion 55.2 gives the migrated partial hash aggregate
+/// stream's memory consumer: `"PartialHashAggregateStream[{partition}]"` in
+/// `datafusion-physical-plan`'s `aggregates/hash_stream.rs`.
+pub const PARTIAL_HASH_AGGREGATE_CONSUMER_PREFIX: &str = "PartialHashAggregateStream[";
+
+/// The asked size under which a migrated aggregate's envelope is
+/// `envelope_size_factor` times its size alone: below it the first steps are
+/// too few to have shown the largest one.
+const ENVELOPE_STEP_BOUND_FROM: usize = 8 << 20;
+
+/// How far ahead of what they ask for the migrated hash aggregate streams are
+/// charged (issue #3181). See the module documentation for the two parts.
+///
+/// [`Self::OFF`] (`1.0`, `0`, `0`) charges every consumer one to one and
+/// reserves no envelope.
+#[derive(Debug, Clone, Copy)]
+pub struct AggregateReserveAhead {
+    /// Multiplier on every grow and shrink a migrated aggregate asks for,
+    /// applied on the query, tenant and process ledgers.
+    pub undercount_factor: f64,
+    /// Multiplier on a building consumer's largest single grow, once it has
+    /// asked for 8 MiB or more.
+    pub envelope_multiplier: f64,
+    /// Multiplier on a building consumer's asked size: its envelope while it
+    /// is under 8 MiB, and the cap on its envelope after.
+    pub envelope_size_factor: f64,
+}
+
+impl AggregateReserveAhead {
+    /// One-to-one charging and no envelope.
+    pub const OFF: AggregateReserveAhead = AggregateReserveAhead {
+        undercount_factor: 1.0,
+        envelope_multiplier: 0.0,
+        envelope_size_factor: 0.0,
+    };
+
+    /// The default: a 1.25 undercount factor, and an envelope of five times
+    /// the largest step, capped at 2.43 times the asked size.
+    pub const DEFAULT: AggregateReserveAhead = AggregateReserveAhead {
+        undercount_factor: 1.25,
+        envelope_multiplier: 5.0,
+        envelope_size_factor: 2.43,
+    };
+
+    /// Every value finite, the factor at least 1 and both multipliers at
+    /// least 0.
+    pub fn validate(&self) -> Result<(), AggregateReserveAheadError> {
+        let values = [
+            ("undercount_factor", self.undercount_factor),
+            ("envelope_multiplier", self.envelope_multiplier),
+            ("envelope_size_factor", self.envelope_size_factor),
+        ];
+        if let Some((name, value)) = values.iter().find(|(_, value)| !value.is_finite()) {
+            return Err(AggregateReserveAheadError::NotFinite {
+                name,
+                value: *value,
+            });
+        }
+        if self.undercount_factor < 1.0 {
+            return Err(AggregateReserveAheadError::FactorBelowOne {
+                value: self.undercount_factor,
+            });
+        }
+        if let Some((name, value)) = values[1..].iter().find(|(_, value)| *value < 0.0) {
+            return Err(AggregateReserveAheadError::Negative {
+                name,
+                value: *value,
+            });
+        }
+        Ok(())
+    }
+
+    /// The bytes charged for a migrated aggregate that has asked for `asked`.
+    /// Exactly `asked` under a factor of 1.
+    fn charge(&self, asked: usize) -> usize {
+        if self.undercount_factor.to_bits() == 1.0f64.to_bits() {
+            asked
+        } else {
+            scale(asked, self.undercount_factor)
+        }
+    }
+
+    /// The envelope of a building consumer that has asked for `size` bytes in
+    /// steps no larger than `largest_step`.
+    fn envelope(&self, size: usize, largest_step: usize) -> usize {
+        let by_size = scale(size, self.envelope_size_factor);
+        if size < ENVELOPE_STEP_BOUND_FROM {
+            by_size
+        } else {
+            scale(largest_step, self.envelope_multiplier).min(by_size)
+        }
+    }
+}
+
+impl Default for AggregateReserveAhead {
+    fn default() -> Self {
+        AggregateReserveAhead::DEFAULT
+    }
+}
+
+impl PartialEq for AggregateReserveAhead {
+    fn eq(&self, other: &Self) -> bool {
+        self.undercount_factor.to_bits() == other.undercount_factor.to_bits()
+            && self.envelope_multiplier.to_bits() == other.envelope_multiplier.to_bits()
+            && self.envelope_size_factor.to_bits() == other.envelope_size_factor.to_bits()
+    }
+}
+
+impl Eq for AggregateReserveAhead {}
+
+/// Why an [`AggregateReserveAhead`] was rejected.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum AggregateReserveAheadError {
+    #[error("aggregate reserve-ahead {name} must be finite, got {value}")]
+    NotFinite { name: &'static str, value: f64 },
+    #[error("aggregate reserve-ahead undercount_factor must be at least 1.0, got {value}")]
+    FactorBelowOne { value: f64 },
+    #[error("aggregate reserve-ahead {name} must be at least 0, got {value}")]
+    Negative { name: &'static str, value: f64 },
+}
+
+/// `bytes` times `factor`, rounded up and saturating at `usize::MAX`.
+fn scale(bytes: usize, factor: f64) -> usize {
+    // A float-to-integer `as` saturates, and `factor` is finite and
+    // non-negative once validated.
+    (bytes as f64 * factor).ceil() as usize
+}
+
+/// How many migrated aggregate streams can be inside `aggregate_batch` at
+/// once in this process: the host's parallelism, or `partitions` when fewer.
+/// Resolved by the first caller and fixed for the life of the process.
+pub fn process_envelope_width(partitions: usize) -> NonZeroUsize {
+    static WIDTH: OnceLock<NonZeroUsize> = OnceLock::new();
+    *WIDTH.get_or_init(|| {
+        let parallelism = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        NonZeroUsize::new(parallelism.min(partitions)).unwrap_or(NonZeroUsize::MIN)
+    })
+}
+
+/// Envelope bytes currently reserved across every process budget: the figure
+/// behind [`sql_memory_aggregate_envelope_bytes`].
+static ENVELOPE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Bytes the migrated hash aggregate streams' envelopes currently reserve on
+/// the process budget, summed over every budget in the process. These bytes
+/// are in the process reserved figure and in no query or tenant figure.
+pub fn sql_memory_aggregate_envelope_bytes() -> u64 {
+    ENVELOPE_BYTES.load(Ordering::Acquire)
+}
+
+/// The live envelopes charged to one process [`MemoryBudget`], and how many
+/// bytes their `width` largest hold on it.
+struct EnvelopeGroup {
+    budget: Arc<MemoryBudget>,
+    width: usize,
+    envelopes: BTreeMap<(u64, usize), usize>,
+    on_budget: u64,
+}
+
+impl EnvelopeGroup {
+    fn top_width_sum(&self) -> u64 {
+        let mut sizes: Vec<usize> = self.envelopes.values().copied().collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        sizes
+            .iter()
+            .take(self.width)
+            .fold(0u64, |sum, size| sum.saturating_add(*size as u64))
+    }
+}
+
+/// Every live envelope in the process, grouped by the budget it is charged
+/// to (keyed by the budget's address, which the group's `Arc` keeps unique).
+/// A group's width is the one its first envelope's pool was built with.
+fn envelope_ledger() -> MutexGuard<'static, BTreeMap<usize, EnvelopeGroup>> {
+    static LEDGER: OnceLock<Mutex<BTreeMap<usize, EnvelopeGroup>>> = OnceLock::new();
+    LEDGER
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn budget_key(budget: &Arc<MemoryBudget>) -> usize {
+    Arc::as_ptr(budget) as usize
+}
+
+/// Whether an envelope change that raises the budget's charge may be refused.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvelopeCheck {
+    Checked,
+    Unchecked,
+}
+
+/// An envelope change the process budget refused.
+struct EnvelopeRefused {
+    delta: u64,
+    exhausted: MemoryExhausted,
+}
+
+/// Set the envelope of consumer `key` on `budget` to `envelope` bytes (zero
+/// removes it), and move the budget by the change in the group's top-`width`
+/// sum. A checked change the budget refuses leaves the ledger and the budget
+/// as they were.
+fn set_process_envelope(
+    budget: &Arc<MemoryBudget>,
+    width: usize,
+    key: (u64, usize),
+    envelope: usize,
+    check: EnvelopeCheck,
+) -> Result<(), EnvelopeRefused> {
+    let mut ledger = envelope_ledger();
+    let budget_id = budget_key(budget);
+    let group = ledger.entry(budget_id).or_insert_with(|| EnvelopeGroup {
+        budget: Arc::clone(budget),
+        width,
+        envelopes: BTreeMap::new(),
+        on_budget: 0,
+    });
+    let previous = if envelope == 0 {
+        group.envelopes.remove(&key)
+    } else {
+        group.envelopes.insert(key, envelope)
+    };
+    let next = group.top_width_sum();
+    if next > group.on_budget {
+        let delta = next - group.on_budget;
+        if check == EnvelopeCheck::Checked {
+            if let Err(exhausted) = group.budget.try_reserve(delta) {
+                match previous {
+                    Some(previous) => group.envelopes.insert(key, previous),
+                    None => group.envelopes.remove(&key),
+                };
+                if group.envelopes.is_empty() && group.on_budget == 0 {
+                    ledger.remove(&budget_id);
+                }
+                return Err(EnvelopeRefused { delta, exhausted });
+            }
+        } else {
+            group.budget.reserve_unchecked(delta);
+        }
+        ENVELOPE_BYTES.fetch_add(delta, Ordering::AcqRel);
+    } else if next < group.on_budget {
+        let delta = group.on_budget - next;
+        group.budget.release(delta);
+        ENVELOPE_BYTES.fetch_sub(delta, Ordering::AcqRel);
+    }
+    group.on_budget = next;
+    if group.envelopes.is_empty() && group.on_budget == 0 {
+        ledger.remove(&budget_id);
+    }
+    Ok(())
+}
+
+/// Remove every envelope pool `pool_id` still has on `budget`.
+fn clear_pool_envelopes(budget: &Arc<MemoryBudget>, pool_id: u64) {
+    let mut ledger = envelope_ledger();
+    let budget_id = budget_key(budget);
+    let Some(group) = ledger.get_mut(&budget_id) else {
+        return;
+    };
+    group.envelopes.retain(|(pool, _), _| *pool != pool_id);
+    // Removing envelopes cannot raise the top-width sum.
+    let next = group.top_width_sum();
+    let delta = group.on_budget.saturating_sub(next);
+    if delta > 0 {
+        group.budget.release(delta);
+        ENVELOPE_BYTES.fetch_sub(delta, Ordering::AcqRel);
+    }
+    group.on_budget = next;
+    if group.envelopes.is_empty() && group.on_budget == 0 {
+        ledger.remove(&budget_id);
+    }
+}
+
+/// Envelope bytes currently on `budget`, for tests that share the process
+/// ledger with every other test in the binary.
+#[cfg(test)]
+fn envelope_on_budget(budget: &Arc<MemoryBudget>) -> u64 {
+    envelope_ledger()
+        .get(&budget_key(budget))
+        .map_or(0, |group| group.on_budget)
+}
+
+/// What a pool tracks for one migrated aggregate consumer.
+#[derive(Debug, Clone, Copy, Default)]
+struct AggregateState {
+    /// Bytes the consumer's reservations currently ask for.
+    asked: usize,
+    /// The largest single grow it asked for before its first shrink.
+    largest_step: usize,
+    /// Its envelope on the process ledger.
+    envelope: usize,
+    /// Whether it has shrunk; from then on it carries no envelope.
+    shrunk: bool,
+}
+
+impl AggregateState {
+    fn grown(self, additional: usize, reserve_ahead: &AggregateReserveAhead) -> Self {
+        let asked = self.asked.saturating_add(additional);
+        if self.shrunk {
+            return AggregateState { asked, ..self };
+        }
+        let largest_step = self.largest_step.max(additional);
+        AggregateState {
+            asked,
+            largest_step,
+            envelope: reserve_ahead.envelope(asked, largest_step),
+            shrunk: false,
+        }
+    }
+}
+
+/// Source of [`TenantDelegatingPool`] ids, which key a pool's envelopes on
+/// the process ledger.
+static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(0);
+
 /// The query's DataFusion `MemoryPool`: enforces a per-query byte ceiling and
 /// forwards all accounting to a shared [`TenantMemoryAccountant`].
 ///
@@ -384,6 +721,15 @@ pub struct TenantDelegatingPool {
     /// Consumers registered and not yet unregistered, for the debug check
     /// that nothing is held once the last one is gone.
     registered: AtomicUsize,
+    /// This pool's key on the process envelope ledger.
+    pool_id: u64,
+    /// How far ahead the migrated hash aggregate streams are charged.
+    reserve_ahead: AggregateReserveAhead,
+    /// How many of the process's largest envelopes are on the budget.
+    envelope_width: usize,
+    /// Each migrated aggregate consumer's state, keyed by
+    /// `MemoryConsumer::id`. Locked before `held` and the process ledger.
+    aggregates: Mutex<HashMap<usize, AggregateState>>,
 }
 
 impl fmt::Debug for TenantDelegatingPool {
@@ -392,6 +738,8 @@ impl fmt::Debug for TenantDelegatingPool {
             .field("query_limit", &self.query_limit)
             .field("query_used", &self.query_used.load(Ordering::Relaxed))
             .field("held", &self.held_bytes())
+            .field("reserve_ahead", &self.reserve_ahead)
+            .field("envelope_width", &self.envelope_width)
             .field("tenant_reserved", &self.tenant.reserved())
             .field("tenant_limit", &self.tenant.limit())
             .field("process_reserved", &self.tenant.process_reserved())
@@ -416,6 +764,10 @@ impl TenantDelegatingPool {
     /// trips `breach` if `grow`'s unconditional path overshoots either ceiling.
     /// `accounting` receives this query's reserved-bytes high-water mark on
     /// every successful grow.
+    ///
+    /// The pool charges every consumer one to one
+    /// ([`AggregateReserveAhead::OFF`]) until
+    /// [`Self::with_aggregate_reserve_ahead`] says otherwise.
     pub fn new(
         query_limit: usize,
         tenant: Arc<TenantMemoryAccountant>,
@@ -430,7 +782,32 @@ impl TenantDelegatingPool {
             accounting,
             held: Mutex::new(HashMap::new()),
             registered: AtomicUsize::new(0),
+            pool_id: NEXT_POOL_ID.fetch_add(1, Ordering::Relaxed),
+            reserve_ahead: AggregateReserveAhead::OFF,
+            envelope_width: 1,
+            aggregates: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Charge the migrated hash aggregate streams ahead of what they ask for,
+    /// keeping the `envelope_width` largest envelopes in the process on its
+    /// budget. A `reserve_ahead` that fails
+    /// [`AggregateReserveAhead::validate`] is replaced by
+    /// [`AggregateReserveAhead::DEFAULT`], with a warning.
+    pub fn with_aggregate_reserve_ahead(
+        mut self,
+        reserve_ahead: AggregateReserveAhead,
+        envelope_width: NonZeroUsize,
+    ) -> Self {
+        self.reserve_ahead = match reserve_ahead.validate() {
+            Ok(()) => reserve_ahead,
+            Err(error) => {
+                tracing::warn!(%error, "using the default aggregate reserve-ahead");
+                AggregateReserveAhead::DEFAULT
+            }
+        };
+        self.envelope_width = envelope_width.get();
+        self
     }
 
     /// The tenant accountant this pool delegates to (for tests and the
@@ -489,6 +866,152 @@ impl TenantDelegatingPool {
 
     fn held_map(&self) -> MutexGuard<'_, HashMap<usize, usize>> {
         self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `consumer` is a migrated hash aggregate stream this pool
+    /// charges ahead of what it asks for.
+    fn reserves_ahead(&self, consumer: &MemoryConsumer) -> bool {
+        let name = consumer.name();
+        self.reserve_ahead != AggregateReserveAhead::OFF
+            && (name.starts_with(PARTIAL_HASH_AGGREGATE_CONSUMER_PREFIX)
+                || name.starts_with(FINAL_HASH_AGGREGATE_CONSUMER_PREFIX)
+                || name.starts_with(SINGLE_HASH_AGGREGATE_CONSUMER_PREFIX))
+    }
+
+    fn aggregates_map(&self) -> MutexGuard<'_, HashMap<usize, AggregateState>> {
+        self.aggregates
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_envelope(
+        &self,
+        consumer_id: usize,
+        envelope: usize,
+        check: EnvelopeCheck,
+    ) -> Result<(), EnvelopeRefused> {
+        set_process_envelope(
+            &self.tenant.budget,
+            self.envelope_width,
+            (self.pool_id, consumer_id),
+            envelope,
+            check,
+        )
+    }
+
+    fn set_envelope_unchecked(&self, consumer_id: usize, envelope: usize) {
+        // An unchecked change is never refused.
+        self.set_envelope(consumer_id, envelope, EnvelopeCheck::Unchecked)
+            .unwrap_or(());
+    }
+
+    /// The checked grow of a migrated aggregate. Its envelope moves first, so
+    /// a doubling the process budget cannot hold is refused before any ledger
+    /// is charged for it; a refused charge puts the envelope back.
+    fn aggregate_try_grow(&self, consumer: &MemoryConsumer, additional: usize) -> DFResult<()> {
+        let id = consumer.id();
+        let mut aggregates = self.aggregates_map();
+        let state = aggregates.get(&id).copied().unwrap_or_default();
+        let next = state.grown(additional, &self.reserve_ahead);
+        if next.envelope != state.envelope {
+            self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
+                .map_err(|refused| {
+                    DataFusionError::ResourcesExhausted(format!(
+                        "aggregate reserve-ahead refused: {additional} bytes asked by {} need                          the process aggregate envelope to grow by {} bytes: {}",
+                        consumer.name(),
+                        refused.delta,
+                        refused.exhausted
+                    ))
+                })?;
+        }
+        let charged = self
+            .reserve_ahead
+            .charge(next.asked)
+            .saturating_sub(self.reserve_ahead.charge(state.asked));
+        if let Err(error) = self.try_grow_charged(consumer, charged) {
+            if next.envelope != state.envelope {
+                self.set_envelope_unchecked(id, state.envelope);
+            }
+            return Err(error);
+        }
+        aggregates.insert(id, next);
+        Ok(())
+    }
+
+    /// The unconditional grow of a migrated aggregate.
+    fn aggregate_grow(&self, consumer: &MemoryConsumer, additional: usize) {
+        let id = consumer.id();
+        let mut aggregates = self.aggregates_map();
+        let state = aggregates.get(&id).copied().unwrap_or_default();
+        let next = state.grown(additional, &self.reserve_ahead);
+        if next.envelope != state.envelope {
+            self.set_envelope_unchecked(id, next.envelope);
+        }
+        let charged = self
+            .reserve_ahead
+            .charge(next.asked)
+            .saturating_sub(self.reserve_ahead.charge(state.asked));
+        self.grow_charged(consumer, charged);
+        aggregates.insert(id, next);
+    }
+
+    /// Record a migrated aggregate's shrink and return the charged bytes it
+    /// frees. Its first shrink ends its build, and its envelope with it.
+    fn aggregate_shrink(&self, consumer: &MemoryConsumer, shrink: usize) -> usize {
+        let id = consumer.id();
+        let mut aggregates = self.aggregates_map();
+        let state = aggregates.entry(id).or_default();
+        let asked = state.asked.saturating_sub(shrink);
+        let released = self
+            .reserve_ahead
+            .charge(state.asked)
+            .saturating_sub(self.reserve_ahead.charge(asked));
+        state.asked = asked;
+        if !state.shrunk {
+            state.shrunk = true;
+            if state.envelope > 0 {
+                state.envelope = 0;
+                self.set_envelope_unchecked(id, 0);
+            }
+        }
+        released
+    }
+
+    /// Charge `amount` bytes for `consumer` unconditionally, serving what its
+    /// hold covers from the hold.
+    fn grow_charged(&self, consumer: &MemoryConsumer, amount: usize) {
+        // Bytes this consumer already holds are already charged and already
+        // passed the ceiling checks, so only the excess is charged here.
+        let from_held = if self.may_hold(consumer) {
+            self.take_held(consumer.id(), amount)
+        } else {
+            0
+        };
+        let excess = amount - from_held;
+        if excess > 0 {
+            self.charge(excess);
+        }
+    }
+
+    /// Charge `amount` bytes for `consumer` on all three budgets or none,
+    /// serving what its hold covers from the hold.
+    fn try_grow_charged(&self, consumer: &MemoryConsumer, amount: usize) -> DFResult<()> {
+        let from_held = if self.may_hold(consumer) {
+            self.take_held(consumer.id(), amount)
+        } else {
+            0
+        };
+        let excess = amount - from_held;
+        if excess == 0 {
+            return Ok(());
+        }
+        let charged = self.try_charge(excess);
+        if charged.is_err() && from_held > 0 {
+            // A refused try_grow leaves the reservation's size unchanged, so
+            // the bytes taken from the hold go back to it.
+            self.hold(consumer.id(), from_held);
+        }
+        charged
     }
 
     /// Add `amount` to consumer `id`'s hold. The bytes stay charged.
@@ -705,6 +1228,10 @@ impl MemoryPool for TenantDelegatingPool {
         // DataFusion calls this when the consumer's last reservation drops,
         // after that reservation's final shrink, so whatever the consumer
         // still holds is no longer live anywhere.
+        let state = self.aggregates_map().remove(&consumer.id());
+        if state.is_some_and(|state| state.envelope > 0) {
+            self.set_envelope_unchecked(consumer.id(), 0);
+        }
         let released = {
             let mut held = self.held_map();
             let released = held.remove(&consumer.id()).unwrap_or(0);
@@ -723,16 +1250,11 @@ impl MemoryPool for TenantDelegatingPool {
     }
 
     fn grow(&self, reservation: &MemoryReservation, additional: usize) {
-        // Bytes this consumer already holds are already charged and already
-        // passed the ceiling checks, so only the excess is charged here.
-        let from_held = if self.may_hold(reservation.consumer()) {
-            self.take_held(reservation.consumer().id(), additional)
+        let consumer = reservation.consumer();
+        if self.reserves_ahead(consumer) {
+            self.aggregate_grow(consumer, additional);
         } else {
-            0
-        };
-        let excess = additional - from_held;
-        if excess > 0 {
-            self.charge(excess);
+            self.grow_charged(consumer, additional);
         }
     }
 
@@ -741,30 +1263,26 @@ impl MemoryPool for TenantDelegatingPool {
         // issues when a MemoryReservation is dropped: this is what
         // makes a cancelled or dropped stream return its tenant reservation to
         // zero. A held aggregate's bytes return at its `unregister` instead.
-        if self.holds_shrink(reservation) {
-            self.hold(reservation.consumer().id(), shrink);
+        let consumer = reservation.consumer();
+        let charged = if self.reserves_ahead(consumer) {
+            self.aggregate_shrink(consumer, shrink)
         } else {
-            self.release(shrink);
+            shrink
+        };
+        if self.holds_shrink(reservation) {
+            self.hold(consumer.id(), charged);
+        } else {
+            self.release(charged);
         }
     }
 
     fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
-        let from_held = if self.may_hold(reservation.consumer()) {
-            self.take_held(reservation.consumer().id(), additional)
+        let consumer = reservation.consumer();
+        if self.reserves_ahead(consumer) {
+            self.aggregate_try_grow(consumer, additional)
         } else {
-            0
-        };
-        let excess = additional - from_held;
-        if excess == 0 {
-            return Ok(());
+            self.try_grow_charged(consumer, additional)
         }
-        let charged = self.try_charge(excess);
-        if charged.is_err() && from_held > 0 {
-            // A refused try_grow leaves the reservation's size unchanged, so
-            // the bytes taken from the hold go back to it.
-            self.hold(reservation.consumer().id(), from_held);
-        }
-        charged
     }
 
     fn reserved(&self) -> usize {
@@ -780,7 +1298,16 @@ impl Drop for TenantDelegatingPool {
     fn drop(&mut self) {
         // Every reservation keeps its pool alive, so a hold left here means a
         // consumer that never unregistered; release it rather than leak it
-        // onto the tenant and process budgets, which outlive this pool.
+        // onto the tenant and process budgets, which outlive this pool. The
+        // same goes for an envelope left on the process ledger.
+        let aggregates = self
+            .aggregates
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !aggregates.is_empty() {
+            aggregates.clear();
+            clear_pool_envelopes(&self.tenant.budget, self.pool_id);
+        }
         let held = std::mem::take(self.held.get_mut().unwrap_or_else(PoisonError::into_inner));
         let total = held
             .values()
@@ -795,6 +1322,7 @@ impl Drop for TenantDelegatingPool {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use datafusion::execution::memory_pool::UnboundedMemoryPool;
     use ravel_types::accounting::QueryAccounting;
 
     use super::*;
@@ -1527,5 +2055,376 @@ mod tests {
 
         res.shrink(4096);
         assert_eq!(tenant.process_reserved(), 0);
+    }
+
+    /// A migrated partial aggregate's consumer name, partition 0.
+    const PARTIAL: &str = "PartialHashAggregateStream[0]";
+
+    const MIB: usize = 1 << 20;
+
+    /// A tenant on `budget` and a pool over it that reserves ahead with
+    /// `reserve_ahead`, keeping the `width` largest envelopes on the budget.
+    fn ahead_pool(
+        budget: &Arc<MemoryBudget>,
+        width: usize,
+        reserve_ahead: AggregateReserveAhead,
+        accounting: QueryAccounting,
+    ) -> (Arc<TenantMemoryAccountant>, Arc<TenantDelegatingPool>) {
+        let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(budget));
+        let pool = TenantDelegatingPool::new(
+            1 << 40,
+            Arc::clone(&tenant),
+            CeilingBreach::new(),
+            accounting,
+        )
+        .with_aggregate_reserve_ahead(
+            reserve_ahead,
+            NonZeroUsize::new(width).expect("a non-zero width"),
+        );
+        (tenant, Arc::new(pool))
+    }
+
+    fn register_on(pool: &Arc<TenantDelegatingPool>, name: &str) -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::clone(pool) as Arc<dyn MemoryPool>;
+        MemoryConsumer::new(name).register(&pool)
+    }
+
+    /// A reservation registered on a pool other than the one under test, so a
+    /// test can call the pool's `MemoryPool` methods directly and drop the
+    /// pool while the consumer is still building.
+    fn detached(name: &str) -> MemoryReservation {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        MemoryConsumer::new(name).register(&pool)
+    }
+
+    /// The table and accumulator `Vec` steps of one partial aggregate
+    /// building 3.1M groups of q33's shape, as DataFusion 55.2 asks for them:
+    /// three table doublings of 14 bytes a bucket, each followed by the `Vec`
+    /// step that ends the batch.
+    const SERIES: [usize; 6] = [
+        7_340_032,
+        27_262_976,
+        14_680_064,
+        54_525_952,
+        29_360_128,
+        109_051_904,
+    ];
+
+    /// FLIP: an `envelope_multiplier` of 2 leaves 218,103,808 bytes, under
+    /// the 4 x 109,051,904 the next `Vec` doubling needs.
+    #[test]
+    fn the_envelope_is_five_times_the_largest_step_and_covers_both_doublings() {
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let res = register_on(&pool, PARTIAL);
+
+        let mut envelopes = Vec::new();
+        for step in SERIES {
+            res.try_grow(step).expect("within every ceiling");
+            envelopes.push(envelope_on_budget(&budget));
+            assert_eq!(
+                budget.reserved() - pool.reserved() as u64,
+                envelope_on_budget(&budget),
+                "the envelope is on the process budget and nowhere else"
+            );
+        }
+
+        // Under 8 MiB the size bound alone: 2.43 x 7,340,032.
+        assert_eq!(envelopes[0], 17_836_278);
+        // From then on the smaller of 5 x J_max and 2.43 x S.
+        let sizes: Vec<u64> = SERIES
+            .iter()
+            .scan(0u64, |size, step| {
+                *size += *step as u64;
+                Some(*size)
+            })
+            .collect();
+        let mut largest = 0u64;
+        for (index, step) in SERIES.iter().enumerate().skip(1) {
+            largest = largest.max(*step as u64);
+            let by_size = (sizes[index] as f64 * 2.43).ceil() as u64;
+            assert_eq!(envelopes[index], (5 * largest).min(by_size), "step {index}");
+        }
+        let last = *envelopes.last().expect("six steps");
+        assert_eq!(last, 545_259_520, "5 x the 109,051,904-byte Vec step");
+        assert!(
+            last >= 4 * 109_051_904,
+            "the next Vec doubling's transient: {last}"
+        );
+        assert!(
+            last as f64 >= 4.86 * 29_360_128.0,
+            "the next table doubling's transient: {last}"
+        );
+        assert_eq!(
+            pool.reserved(),
+            (SERIES.iter().sum::<usize>() as f64 * 1.25).ceil() as usize
+        );
+
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn a_consumer_under_eight_mebibytes_carries_the_size_bound() {
+        let small = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &small,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let res = register_on(&pool, PARTIAL);
+        res.try_grow(4 * MIB).expect("within every ceiling");
+        assert_eq!(envelope_on_budget(&small), 10_192_159, "2.43 x 4 MiB");
+
+        let large = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &large,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let res = register_on(&pool, "FinalHashAggregateStream[3]");
+        res.try_grow(100_000_000).expect("within every ceiling");
+        // min(5 x 100 MB, 2.43 x 100 MB), rounded up: 2.43 is not exact in
+        // binary.
+        assert_eq!(envelope_on_budget(&large), 243_000_001);
+    }
+
+    /// FLIP: summing every envelope (per query, or over the whole process)
+    /// reads 30 MiB; charging them on the query ledger moves the pools off
+    /// 1.25 x their asked bytes.
+    #[test]
+    fn only_the_w_largest_envelopes_in_the_process_are_on_the_budget() {
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (tenant_one, pool_one) = ahead_pool(
+            &budget,
+            2,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let (tenant_two, pool_two) = ahead_pool(
+            &budget,
+            2,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let a = register_on(&pool_one, "PartialHashAggregateStream[0]");
+        let b = register_on(&pool_one, "PartialHashAggregateStream[1]");
+        let c = register_on(&pool_two, "SingleHashAggregateStream[0]");
+        for (res, step, count) in [(&a, MIB, 9), (&b, 2 * MIB, 5), (&c, 3 * MIB, 3)] {
+            for _ in 0..count {
+                res.try_grow(step).expect("within every ceiling");
+            }
+        }
+
+        let pools = (pool_one.reserved() + pool_two.reserved()) as u64;
+        assert_eq!(
+            budget.reserved() - pools,
+            5 * (2 + 3) * MIB as u64,
+            "only B's and C's envelopes, the two largest, are on the budget"
+        );
+        assert_eq!(envelope_on_budget(&budget), 5 * (2 + 3) * MIB as u64);
+        assert!(sql_memory_aggregate_envelope_bytes() >= 25 * MIB as u64);
+        assert_eq!(pool_one.reserved(), 19 * MIB * 5 / 4);
+        assert_eq!(tenant_one.reserved(), 19 * MIB * 5 / 4);
+        assert_eq!(pool_two.reserved(), 9 * MIB * 5 / 4);
+        assert_eq!(tenant_two.reserved(), 9 * MIB * 5 / 4);
+
+        // C's envelope leaving brings A's onto the budget.
+        drop(c);
+        assert_eq!(envelope_on_budget(&budget), 5 * (1 + 2) * MIB as u64);
+        drop((a, b));
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// FLIP: checking the envelope after the charge records a 5 MiB peak for
+    /// the query (and, without a rollback, leaves the charge in place).
+    #[test]
+    fn a_doubling_that_does_not_fit_the_budget_is_refused_before_it_is_made() {
+        let budget = Arc::new(MemoryBudget::new(6 * MIB as u64));
+        let accounting = QueryAccounting::new();
+        let (tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            accounting.clone(),
+        );
+        let res = register_on(&pool, PARTIAL);
+
+        let err = res
+            .try_grow(4 * MIB)
+            .expect_err("a 10,192,159-byte envelope cannot fit a 6 MiB budget");
+        let message = err.to_string();
+        assert!(
+            message.contains("4194304 bytes asked by PartialHashAggregateStream[0]"),
+            "{message}"
+        );
+        assert!(message.contains("grow by 10192159 bytes"), "{message}");
+        assert_eq!(res.size(), 0);
+        assert_eq!(pool.reserved(), 0);
+        assert_eq!(tenant.reserved(), 0);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(envelope_on_budget(&budget), 0);
+        assert_eq!(accounting.snapshot().peak_intermediate_bytes, 0);
+
+        // An envelope that fits, under a charge the query ceiling refuses, is
+        // taken back with the charge.
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(&budget));
+        let pool = Arc::new(
+            TenantDelegatingPool::new(MIB, tenant, CeilingBreach::new(), QueryAccounting::new())
+                .with_aggregate_reserve_ahead(AggregateReserveAhead::DEFAULT, NonZeroUsize::MIN),
+        );
+        let res = register_on(&pool, PARTIAL);
+        res.try_grow(MIB)
+            .expect_err("1.25 MiB charged over a 1 MiB query ceiling");
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(envelope_on_budget(&budget), 0);
+    }
+
+    /// FLIP: re-arming J_max after the first shrink leaves an envelope of
+    /// 1.5 GB after the 300 MB grow.
+    #[test]
+    fn the_envelope_is_released_at_the_first_shrink_and_at_unregister() {
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let res = register_on(&pool, "FinalHashAggregateStream[0]");
+        for step in SERIES {
+            res.try_grow(step).expect("within every ceiling");
+        }
+        assert_eq!(envelope_on_budget(&budget), 545_259_520);
+
+        res.shrink(1);
+        assert_eq!(
+            envelope_on_budget(&budget),
+            0,
+            "released at the first shrink"
+        );
+        assert_eq!(budget.reserved(), pool.reserved() as u64);
+
+        res.try_grow(300_000_000).expect("within every ceiling");
+        assert_eq!(envelope_on_budget(&budget), 0, "the emit grow carries none");
+        assert_eq!(budget.reserved(), pool.reserved() as u64);
+        assert_eq!(tenant.reserved(), pool.reserved());
+
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(tenant.reserved(), 0);
+
+        // Unregister alone, without a shrink, releases the envelope too.
+        let res = detached(PARTIAL);
+        MemoryPool::try_grow(&*pool, &res, 4 * MIB).expect("within every ceiling");
+        assert_eq!(envelope_on_budget(&budget), 10_192_159);
+        pool.unregister(res.consumer());
+        assert_eq!(envelope_on_budget(&budget), 0);
+    }
+
+    #[test]
+    fn a_pool_dropped_mid_build_releases_its_envelopes() {
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (tenant, pool) = ahead_pool(
+            &budget,
+            4,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let partial = detached("PartialHashAggregateStream[0]");
+        let single = detached("SingleHashAggregateStream[1]");
+        MemoryPool::try_grow(&*pool, &partial, 16 * MIB).expect("within every ceiling");
+        MemoryPool::grow(&*pool, &single, 2 * MIB);
+        assert_eq!(
+            envelope_on_budget(&budget),
+            ((16.0 * MIB as f64 * 2.43).ceil() + (2.0 * MIB as f64 * 2.43).ceil()) as u64
+        );
+
+        drop(pool);
+        assert_eq!(envelope_on_budget(&budget), 0);
+        assert_eq!(budget.reserved(), tenant.reserved() as u64);
+    }
+
+    #[test]
+    fn the_opt_out_charges_every_consumer_one_to_one() {
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (tenant, pool) = ahead_pool(
+            &budget,
+            4,
+            AggregateReserveAhead::OFF,
+            QueryAccounting::new(),
+        );
+        let names = [
+            "PartialHashAggregateStream[0]",
+            "FinalHashAggregateStream[0]",
+            "SingleHashAggregateStream[0]",
+            AGGREGATE,
+            "RepartitionExec[0]",
+        ];
+        let reservations: Vec<_> = names.iter().map(|name| register_on(&pool, name)).collect();
+        let mut asked = 0;
+        for (index, res) in reservations.iter().enumerate() {
+            let step = 3 * MIB + index + 1;
+            res.try_grow(step).expect("within every ceiling");
+            res.grow(step);
+            asked += 2 * step;
+        }
+        assert_eq!(pool.reserved(), asked);
+        assert_eq!(tenant.reserved(), asked);
+        assert_eq!(budget.reserved(), asked as u64);
+        assert_eq!(envelope_on_budget(&budget), 0);
+
+        for res in &reservations {
+            res.shrink(1);
+        }
+        // The legacy aggregate holds its shrink; the rest release one byte.
+        assert_eq!(pool.held_bytes(), 1);
+        assert_eq!(budget.reserved(), (asked - names.len() + 1) as u64);
+        drop(reservations);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    #[test]
+    fn validate_refuses_a_non_finite_value_a_factor_below_one_and_a_negative_multiplier() {
+        assert_eq!(AggregateReserveAhead::DEFAULT.validate(), Ok(()));
+        assert_eq!(AggregateReserveAhead::OFF.validate(), Ok(()));
+        let nan = AggregateReserveAhead {
+            envelope_size_factor: f64::NAN,
+            ..AggregateReserveAhead::DEFAULT
+        };
+        assert!(matches!(
+            nan.validate(),
+            Err(AggregateReserveAheadError::NotFinite {
+                name: "envelope_size_factor",
+                ..
+            })
+        ));
+        let below = AggregateReserveAhead {
+            undercount_factor: 0.9,
+            ..AggregateReserveAhead::DEFAULT
+        };
+        assert!(matches!(
+            below.validate(),
+            Err(AggregateReserveAheadError::FactorBelowOne { .. })
+        ));
+        let negative = AggregateReserveAhead {
+            envelope_multiplier: -1.0,
+            ..AggregateReserveAhead::DEFAULT
+        };
+        assert!(matches!(
+            negative.validate(),
+            Err(AggregateReserveAheadError::Negative {
+                name: "envelope_multiplier",
+                ..
+            })
+        ));
     }
 }
