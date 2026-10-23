@@ -4502,13 +4502,28 @@ enum FilterSections {
 }
 
 impl FilterSections {
-    /// The rule `fetch_keyed_plan`'s `skip_decidable` applies, over the same
-    /// fields of `query`.
+    /// The rule `fetch_keyed_plan`'s `skip_decidable` uses too.
+    ///
+    /// Destructures `LogQuery` by name for the reason
+    /// [`LogQuery::is_block_predicate_free`] does: a field the reader could
+    /// answer from BLOOM or POSTINGS must be a build break here, not a `Skip`.
     fn for_query(query: &LogQuery) -> Self {
-        let reads_none = query.content.is_empty()
-            && query.stream_attrs.is_empty()
-            && query
-                .prune
+        let LogQuery {
+            ts_min_ns: _,
+            ts_max_ns: _,
+            stream_attrs,
+            content,
+            prune,
+            // Erasure filters decoded rows; the reader never answers it from
+            // either section.
+            erasure: _,
+            // Answered by the KEY_IDX probe before the scan, never by BLOOM
+            // or POSTINGS.
+            key_equals: _,
+        } = query;
+        let reads_none = content.is_empty()
+            && stream_attrs.is_empty()
+            && prune
                 .iter()
                 .all(|p| matches!(p, Predicate::NumRange { .. }));
         if reads_none {
@@ -6277,12 +6292,7 @@ impl BlockRangeFetcher {
         // `plan_skip_decidable` without its at-least-one-arm rule, which is a
         // cost choice: with no content, stream or POSTINGS arm the reader's
         // prune is its skip step, an empty prune list included.
-        let skip_decidable = query.content.is_empty()
-            && query.stream_attrs.is_empty()
-            && query
-                .prune
-                .iter()
-                .all(|p| matches!(p, Predicate::NumRange { .. }));
+        let skip_decidable = FilterSections::for_query(query) == FilterSections::Skip;
         let extra_tail: &[u32] = if skip_decidable {
             &[]
         } else {
