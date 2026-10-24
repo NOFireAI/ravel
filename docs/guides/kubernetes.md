@@ -1392,9 +1392,13 @@ How the credentials reach a pod:
   sidecar has written the file. The volume outlives a sidecar restart, so
   each sidecar process removes the marker the previous one left
   (`.credentials.json.written`) when it starts and creates it again after its
-  first write. The probe fails until that marker exists. A restarted sidecar
+  first write. Without that marker the probe passes only while the file's
+  credential has not expired: the sidecar records the credential's expiry in
+  the file as `expiration`, which the server ignores. A restarted sidecar
   leaves the previous file in place, so the running server keeps using it
-  until the new write replaces it.
+  until the new write replaces it, and an agent outage shorter than that
+  credential's remaining life does not get the restarted sidecar killed by
+  its probe.
 - The server reads the file through `--s3-credentials-file` and picks up
   each rewrite on its next S3 request; the qualify Job's `ravel-cli` reads it
   through `RAVEL_S3_CREDENTIALS_FILE`.
