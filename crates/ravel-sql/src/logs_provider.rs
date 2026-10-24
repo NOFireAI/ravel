@@ -674,6 +674,15 @@ mod tests {
         ctx: &datafusion::prelude::SessionContext,
         sql: &str,
     ) -> (BTreeSet<(i64, String)>, ScanCounts) {
+        let (batches, counts) = run_batches_counted(ctx, sql).await;
+        (rows(&batches), counts)
+    }
+
+    /// [`run_counted`] for a query whose result is not `(ts, body)` rows.
+    async fn run_batches_counted(
+        ctx: &datafusion::prelude::SessionContext,
+        sql: &str,
+    ) -> (Vec<RecordBatch>, ScanCounts) {
         let plan = ctx
             .sql(sql)
             .await
@@ -695,7 +704,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("metric {name} missing"))
         };
         (
-            rows(&batches),
+            batches,
             ScanCounts {
                 total: count("blocks_total"),
                 scanned: count("blocks_scanned"),
@@ -1614,6 +1623,84 @@ mod tests {
         assert_eq!(plain.scanned, 12, "the OR shape decodes every block");
         assert_eq!(pruned.scanned, 1, "the equality prune leaves one block");
         assert!(pruned.scanned < plain.scanned);
+    }
+
+    /// `status_code <> 0` through SQL: twelve one-record blocks, seven with
+    /// `status_code = 0`, four nonzero and one with no `status_code`. The
+    /// `NumNotEq` prune arm drops the seven all-zero blocks before decode and
+    /// keeps the no-stat block; the plain query, OR-ed with a body equality no
+    /// record satisfies so it yields no prune arm, decodes all twelve. Both
+    /// count the same four rows.
+    #[tokio::test]
+    async fn declared_i64_not_equal_prunes_all_equal_blocks() {
+        let store = MemoryStore::new();
+        let worker = vec![("service.name".to_string(), s("worker"))];
+        let records: Vec<LogRecord> = (1..=12)
+            .map(|ts| {
+                let attrs = match ts {
+                    4 | 6 | 7 | 11 => vec![("status_code".to_string(), AttrValue::I64(ts * 100))],
+                    12 => Vec::new(),
+                    _ => vec![("status_code".to_string(), AttrValue::I64(0))],
+                };
+                record(&worker, &attrs, ts, &format!("body {ts}"))
+            })
+            .collect();
+        let seg = write_object_with(
+            &store,
+            "logs/decl-ne.rlog",
+            &records,
+            one_record_per_block(),
+            &[],
+        )
+        .await;
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(store);
+        let fetcher = LogSegmentFetcher::new(store);
+        let snapshot = Snapshot {
+            segments: vec![seg],
+            segments_pruned: 0,
+            pending_erasure: Vec::new(),
+        };
+        let provider = LogsTableProvider::new(
+            snapshot,
+            TenantHash([7u8; 16]),
+            fetcher,
+            PhaseAccounting::new(),
+        )
+        .with_declared_columns(i64_status_code());
+        let ctx = logs_session(provider).expect("build session");
+
+        let count_of = |batches: &[RecordBatch]| -> i64 {
+            assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+            let b = batches.iter().find(|b| b.num_rows() == 1).expect("one row");
+            b.column(0)
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::Int64Array>()
+                .expect("COUNT(*) is Int64")
+                .value(0)
+        };
+        let (pruned_batches, pruned) = run_batches_counted(
+            &ctx,
+            "SELECT COUNT(*) FROM logs WHERE status_code <> 0",
+        )
+        .await;
+        let (plain_batches, plain) = run_batches_counted(
+            &ctx,
+            "SELECT COUNT(*) FROM logs WHERE status_code <> 0 OR body = 'zzz'",
+        )
+        .await;
+
+        assert_eq!(count_of(&pruned_batches), 4);
+        assert_eq!(count_of(&plain_batches), 4);
+        assert_eq!(
+            pruned,
+            ScanCounts {
+                total: 12,
+                scanned: 5,
+                pruned_by_postings: 0,
+            },
+            "the seven all-zero blocks are pruned before decode"
+        );
+        assert_eq!(plain.scanned, 12, "the OR shape decodes every block");
     }
 
     /// TEST 4: a predicate on a declared column absent from some objects (a
