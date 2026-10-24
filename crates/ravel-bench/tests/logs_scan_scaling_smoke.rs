@@ -95,9 +95,11 @@ const PROJECTED_FRACTION: f64 = 3.0 / 10.0;
 /// single range -- and if the projected pages instead cover the BLOCKS section
 /// past `DEFAULT_LOG_COVERAGE_THRESHOLD`, the crossover replaces them with one
 /// whole-object GET, which is also one. Hence 2 per segment when the probe
-/// carries the directory pair, and 3 when it does not.
+/// carries the directory pair, and 3 when it does not. Every object this test
+/// writes comes from the current writer, whose probe carries the pair, so the
+/// band is exactly 2.
 const RANGED_MIN_GETS_PER_SEGMENT: u64 = 2;
-const RANGED_MAX_GETS_PER_SEGMENT: u64 = 3;
+const RANGED_MAX_GETS_PER_SEGMENT: u64 = 2;
 
 /// Whether this row's scan takes #693 part 3's whole-segment fast path: at least
 /// as many relevant segments as the plan declared partitions (the fast path's
@@ -411,9 +413,9 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
                 c.object_store_get_requests >= RANGED_MIN_GETS_PER_SEGMENT * segs
                     && c.object_store_get_requests
                         <= RANGED_MAX_GETS_PER_SEGMENT * segs + CATALOG_GET_SLACK,
-                "{label}: the ranged fast-path route issues a suffix probe, a \
-                 front-section GET, and one coalesced data read per segment, so \
-                 the GET count over {segs} segments must be in [{}, {}] (the \
+                "{label}: the ranged fast-path route issues a suffix probe that \
+                 carries the directory pair and one coalesced data read per \
+                 segment, so the GET count over {segs} segments must be in [{}, {}] (the \
                  upper end plus at most {CATALOG_GET_SLACK} catalog read); got {} \
                  ({:.4} reads per segment). One read per segment means the route \
                  stopped engaging -- the segments must declare RLOG \
@@ -447,7 +449,7 @@ async fn logs_scan_scaling_smoke_proves_cache_gated_fanout_and_request_count() {
                 .expect("the same partition value on the whole-object read shape");
             assert!(
                 c.object_store_get_requests > whole.object_store_get_requests,
-                "{label}: the ranged route pays a probe and a front-section GET \
+                "{label}: the ranged route pays a suffix probe per segment that \
                  the whole-object route never issues, so it must read strictly \
                  more than its whole-object neighbour ({}); got {}",
                 whole.object_store_get_requests,

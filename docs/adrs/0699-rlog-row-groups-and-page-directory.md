@@ -499,6 +499,12 @@ group narrow read drops from three GETs to two (the probe and one chunk run,
 `metadata_gets` 0), and SKIP_IDX and PAGE_DIR no longer fall out of the
 probe when BLOOM is larger than it.
 
+The reorder trades one read for another. BLOOM now sits ahead of SKIP_IDX,
+PAGE_DIR and the directory pair, so a declared-Str equality that places BLOOM
+during planning can find it outside the tail probe on an object where the old
+order had it inside, and that costs one extra GET there. Where BLOOM is larger
+than the probe it was a separate read in either order.
+
 `BlockRangeStats::probe_misses` still excludes STREAM_DIR and FIELD_DIR.
 Objects written before this amendment keep them at the front, outside any
 suffix probe, and counting them there would still put a floor under the

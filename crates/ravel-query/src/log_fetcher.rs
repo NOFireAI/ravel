@@ -4044,10 +4044,13 @@ fn combined_predicate_with_streams(
 }
 
 /// Default suffix length of the etag-establishing probe GET (ADR-0107 decision
-/// 1, ADR-0699 decision 5). The RLOG tail metadata (SKIP_IDX, PAGE_DIR, BLOOM,
-/// POSTINGS) and the footer sit after the (large) BLOCKS section, so a suffix
-/// of this size covers the whole tail in one GET and no extra metadata GET is
-/// needed for them.
+/// 1, ADR-0699 decision 5). Since the ADR-0699 amendment of 2026-10-24 an RLOG
+/// object ends with SKIP_IDX, PAGE_DIR, STREAM_DIR, FIELD_DIR and the footer,
+/// all after the (large) BLOCKS section, so a suffix of this size covers that
+/// tail in one GET, directories included, and no extra metadata GET is needed
+/// for them. An object written before the amendment ends with SKIP_IDX,
+/// PAGE_DIR, BLOOM, POSTINGS and the footer instead, and holds the directory
+/// pair at its front, out of the probe's reach.
 ///
 /// 256 KiB rather than the 64 KiB this started at (issue #766). The plan phase
 /// needs SKIP_IDX, and under version 4 the fetch phase needs PAGE_DIR as well;
