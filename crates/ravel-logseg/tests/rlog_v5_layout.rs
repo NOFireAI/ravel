@@ -1,8 +1,10 @@
 //! RLOG trailer version 5 (ADR-2135, docs/log-segment-format.md): the footer
 //! sort descriptor and clustering generation, the BLOOM covered-column list, and
-//! the single-version window that refuses version 4. The reader's handling of an
-//! uncovered column is tested in the crate (`src/bloom_coverage_tests.rs`),
-//! where the writer's coverage seam is visible.
+//! the single-version window that refuses version 4, and the physical section
+//! order that puts every directory inside one tail probe (the ADR-0699
+//! 2026-10-24 amendment). The reader's handling of an uncovered column is
+//! tested in the crate (`src/bloom_coverage_tests.rs`), where the writer's
+//! coverage seam is visible.
 #![allow(clippy::expect_used)]
 
 use std::borrow::Cow;
@@ -11,14 +13,17 @@ use std::cell::RefCell;
 use ravel_logseg::bloom::BloomBuilder;
 use ravel_logseg::field_dir::FieldDir;
 use ravel_logseg::footer::{
-    self, LogFooter, SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType, kind, open,
-    write_footer_and_trailer,
+    self, LogFooter, SectionDesc, SortBucketWidth, SortDescriptor, SortKeyColumn, SortKeyType,
+    kind, open, write_footer_and_trailer,
 };
+use ravel_logseg::key_index::{KeyType, TRACE_ID_FIELD};
+use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::record::{COL_BODY, COL_SEVERITY_TEXT};
 use ravel_logseg::rlog_bloom::{RlogBloomSection, encode_rlog_bloom_section};
 use ravel_logseg::{
-    AttrValue, ByteSource, FieldType, LogRecord, LogSegError, LogStreamId, ObjectIdentity,
-    Predicate, RlogConfig, RlogReader, RlogWriter, read_section, stream_attrs_bytes,
+    AttrValue, BloomScope, ByteSource, ColumnarLogBatch, FieldType, LogRecord, LogSegError,
+    LogStreamId, ObjectIdentity, Predicate, RlogConfig, RlogReader, RlogWriter, read_section,
+    stream_attrs_bytes,
 };
 
 fn identity() -> ObjectIdentity {
@@ -352,4 +357,199 @@ fn bloom_coverage_list_is_validated() {
 
     let huge = encode_rlog_bloom_section(&[COL_BODY, u32::MAX], &entries);
     corrupted(RlogBloomSection::parse(&huge, &dir), "FIELD_DIR");
+}
+
+// ---- physical section order (ADR-0699, 2026-10-24 amendment) --------------
+
+/// ravel-query's `DEFAULT_LOG_SUFFIX_LEN`, the longest tail probe a reader
+/// issues. Pinned as a literal because this crate cannot depend on
+/// ravel-query; a change there has to move this number too.
+const DEFAULT_LOG_SUFFIX_LEN: u64 = 262_144;
+
+/// The order the writer emits sections in. KEY_IDX and POSTINGS are optional
+/// and only checked when present.
+const WRITE_ORDER: [u32; 8] = [
+    kind::BLOCKS,
+    kind::KEY_IDX,
+    kind::POSTINGS,
+    kind::BLOOM,
+    kind::SKIP_IDX,
+    kind::PAGE_DIR,
+    kind::STREAM_DIR,
+    kind::FIELD_DIR,
+];
+
+/// The ClickBench tenant's width in column chunks: the nine fixed columns this
+/// fixture fills and 95 dynamic attributes (`assert_shape` pins the sum).
+const WIDE_COLUMNS: usize = 104;
+const WIDE_DYNAMIC_ATTRS: usize = 95;
+
+/// One record of the wide fixture: odd attributes are strings carrying a
+/// per-row token, so BLOOM, SKIP_IDX and POSTINGS hold real content; even ones
+/// are integers.
+fn wide_record(i: usize) -> LogRecord {
+    let attrs = (0..WIDE_DYNAMIC_ATTRS)
+        .map(|c| {
+            let value = if c % 2 == 0 {
+                AttrValue::I64((i * c) as i64)
+            } else {
+                AttrValue::Str(format!("v{c}r{i}"))
+            };
+            (format!("col{c:03}"), value)
+        })
+        .collect();
+    LogRecord {
+        trace_id: Some([(i % 251) as u8; 16]),
+        span_id: Some([(i % 241) as u8; 8]),
+        flags: 1,
+        body: format!("request {i} served"),
+        attrs,
+        ..record(i as i64, "", "")
+    }
+}
+
+fn wide_records(blocks: usize, block_records: usize) -> Vec<LogRecord> {
+    (0..blocks * block_records).map(wide_record).collect()
+}
+
+fn wide_writer(cfg: RlogConfig) -> RlogWriter {
+    RlogWriter::new(cfg, identity())
+        .with_bloom_scope(BloomScope::All)
+        .with_indexed_fields(vec!["col001".to_string()])
+        .with_key_index_fields(vec![(TRACE_ID_FIELD.to_string(), KeyType::Id16)])
+}
+
+fn section(footer: &LogFooter, k: u32) -> &SectionDesc {
+    footer.section(k).expect("section present")
+}
+
+/// Asserts the column and block counts the fixture claims, so a writer change
+/// that folds columns or blocks cannot shrink the test's object silently.
+fn assert_shape(object: &[u8], blocks: u64, groups: usize) {
+    let raw = read_section(
+        object,
+        section(&open(object).expect("open"), kind::PAGE_DIR),
+        &RlogConfig::default(),
+    )
+    .expect("read PAGE_DIR");
+    let dir = PageDir::decode(&raw).expect("decode PAGE_DIR");
+    assert_eq!(dir.block_count(), blocks);
+    assert_eq!(dir.groups.len(), groups);
+    assert_eq!(dir.groups[0].chunks.len(), WIDE_COLUMNS);
+}
+
+/// The kinds of `object`'s sections, sorted by offset.
+fn kinds_by_offset(object: &[u8]) -> Vec<u32> {
+    let mut sections = open(object).expect("open").sections;
+    sections.sort_by_key(|s| s.offset);
+    sections.iter().map(|s| s.kind).collect()
+}
+
+fn assert_directories_at_the_tail(object: &[u8], path: &str) {
+    let f = open(object).expect("open");
+    let page_dir = section(&f, kind::PAGE_DIR);
+    let stream_dir = section(&f, kind::STREAM_DIR);
+    let field_dir = section(&f, kind::FIELD_DIR);
+    assert!(
+        stream_dir.offset >= page_dir.offset + page_dir.len,
+        "{path}: STREAM_DIR at {} must follow PAGE_DIR ending at {}",
+        stream_dir.offset,
+        page_dir.offset + page_dir.len
+    );
+    assert_eq!(
+        field_dir.offset,
+        stream_dir.offset + stream_dir.len,
+        "{path}: FIELD_DIR follows STREAM_DIR directly"
+    );
+    let present: Vec<u32> = WRITE_ORDER
+        .iter()
+        .copied()
+        .filter(|k| f.section(*k).is_some())
+        .collect();
+    assert_eq!(
+        present.len(),
+        WRITE_ORDER.len(),
+        "{path}: the fixture carries every kind, KEY_IDX and POSTINGS included"
+    );
+    assert_eq!(kinds_by_offset(object), present, "{path}: physical order");
+    let tail = object.len() as u64 - stream_dir.offset;
+    assert!(
+        tail <= DEFAULT_LOG_SUFFIX_LEN,
+        "{path}: STREAM_DIR to the trailer is {tail} B, past the {DEFAULT_LOG_SUFFIX_LEN} B probe"
+    );
+}
+
+/// Both writer paths emit STREAM_DIR and FIELD_DIR after PAGE_DIR, and BLOOM
+/// and POSTINGS before SKIP_IDX, so the footer and the four directories sit in
+/// the last `DEFAULT_LOG_SUFFIX_LEN` bytes of a 30-block, 104-column object.
+#[test]
+fn directories_follow_page_dir_in_both_writer_paths() {
+    const BLOCKS: usize = 30;
+    const BLOCK_RECORDS: usize = 8;
+    let cfg = RlogConfig {
+        block_target_records: BLOCK_RECORDS,
+        ..RlogConfig::default()
+    };
+    let records = wide_records(BLOCKS, BLOCK_RECORDS);
+
+    let rows = write(wide_writer(cfg), &records);
+    assert_shape(&rows, BLOCKS as u64, 1);
+    assert_directories_at_the_tail(&rows, "row path");
+
+    let mut w = wide_writer(cfg);
+    w.push_columnar(ColumnarLogBatch::from_records(&records))
+        .expect("push columnar");
+    let columnar = w.finish().expect("finish columnar");
+    assert_shape(&columnar, BLOCKS as u64, 1);
+    assert_directories_at_the_tail(&columnar, "columnar path");
+}
+
+/// The entry's geometry (one row group of 123 blocks, 104 columns, bloom scope
+/// all): BLOOM sits below SKIP_IDX, so SKIP_IDX, PAGE_DIR, STREAM_DIR,
+/// FIELD_DIR and the footer fit one `DEFAULT_LOG_SUFFIX_LEN` probe however
+/// large BLOOM grows.
+#[test]
+fn tail_from_skip_idx_to_trailer_fits_the_probe_at_123_blocks_104_columns() {
+    const BLOCKS: usize = 123;
+    const BLOCK_RECORDS: usize = 64;
+    let cfg = RlogConfig {
+        block_target_records: BLOCK_RECORDS,
+        group_target_blocks: BLOCKS,
+        ..RlogConfig::default()
+    };
+    let object = write(wide_writer(cfg), &wide_records(BLOCKS, BLOCK_RECORDS));
+    assert_shape(&object, BLOCKS as u64, 1);
+
+    let f = open(&object).expect("open");
+    let skip = section(&f, kind::SKIP_IDX);
+    let bloom = section(&f, kind::BLOOM);
+    let tail = object.len() as u64 - skip.offset;
+    eprintln!(
+        "[123 blocks x 104 columns] object={} BLOOM={} POSTINGS={} SKIP_IDX={} PAGE_DIR={} \
+         STREAM_DIR={} FIELD_DIR={} tail(SKIP_IDX..end)={tail}",
+        object.len(),
+        bloom.len,
+        section(&f, kind::POSTINGS).len,
+        skip.len,
+        section(&f, kind::PAGE_DIR).len,
+        section(&f, kind::STREAM_DIR).len,
+        section(&f, kind::FIELD_DIR).len,
+    );
+    // 262_144 is the probe ceiling, ravel-query's DEFAULT_LOG_SUFFIX_LEN: a
+    // BLOOM larger than the whole probe is what makes "however large" hold.
+    assert!(
+        bloom.len > 262_144,
+        "BLOOM is {} B, not larger than the 262144 B probe",
+        bloom.len
+    );
+    assert!(
+        bloom.offset < skip.offset,
+        "BLOOM at {} must precede SKIP_IDX at {}",
+        bloom.offset,
+        skip.offset
+    );
+    assert!(
+        tail <= DEFAULT_LOG_SUFFIX_LEN,
+        "SKIP_IDX to the trailer is {tail} B, past the {DEFAULT_LOG_SUFFIX_LEN} B probe"
+    );
 }

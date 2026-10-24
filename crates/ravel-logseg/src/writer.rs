@@ -1006,26 +1006,18 @@ impl RlogWriter {
         drop(postings_terms);
         drop(postings_capped);
 
-        // Assemble sections in kind order.
+        // Assemble sections as BLOCKS, KEY_IDX, POSTINGS, BLOOM, SKIP_IDX,
+        // PAGE_DIR, STREAM_DIR, FIELD_DIR, so that one tail probe reaches every
+        // directory whatever the index sizes (ADR-0699, 2026-10-24 amendment).
         let mut object = Vec::new();
         let mut sections: Vec<SectionDesc> = Vec::new();
 
-        push_section(
-            &mut object,
-            &mut sections,
-            kind::STREAM_DIR,
-            &compress(
-                &StreamDir::encode_borrowed(&stream_dir_entries),
-                self.cfg.zstd_level,
-            )?,
-        );
+        let stream_dir_stored = compress(
+            &StreamDir::encode_borrowed(&stream_dir_entries),
+            self.cfg.zstd_level,
+        )?;
         drop(stream_dir_entries);
-        push_section(
-            &mut object,
-            &mut sections,
-            kind::FIELD_DIR,
-            &compress(&field_dir.encode(), self.cfg.zstd_level)?,
-        );
+        let field_dir_stored = compress(&field_dir.encode(), self.cfg.zstd_level)?;
         drop(field_dir);
         push_section(
             &mut object,
@@ -1039,6 +1031,28 @@ impl RlogWriter {
             key_plan,
             self.key_idx_bucket_cap,
         )?;
+        let mut postings_bytes_len: u64 = 0;
+        if !indexed_column_ids.is_empty() {
+            let postings_bytes = encode_postings_section(
+                &postings_fields,
+                self.cfg.postings_stride,
+                self.cfg.zstd_level,
+            )?;
+            postings_bytes_len = postings_bytes.len() as u64;
+            push_section(
+                &mut object,
+                &mut sections,
+                kind::POSTINGS,
+                &Stored::raw(postings_bytes),
+            );
+        }
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::BLOOM,
+            &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
+        );
+        drop(bloom_entries);
         push_section(
             &mut object,
             &mut sections,
@@ -1059,25 +1073,17 @@ impl RlogWriter {
         push_section(
             &mut object,
             &mut sections,
-            kind::BLOOM,
-            &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
+            kind::STREAM_DIR,
+            &stream_dir_stored,
         );
-        drop(bloom_entries);
-        let mut postings_bytes_len: u64 = 0;
-        if !indexed_column_ids.is_empty() {
-            let postings_bytes = encode_postings_section(
-                &postings_fields,
-                self.cfg.postings_stride,
-                self.cfg.zstd_level,
-            )?;
-            postings_bytes_len = postings_bytes.len() as u64;
-            push_section(
-                &mut object,
-                &mut sections,
-                kind::POSTINGS,
-                &Stored::raw(postings_bytes),
-            );
-        }
+        drop(stream_dir_stored);
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::FIELD_DIR,
+            &field_dir_stored,
+        );
+        drop(field_dir_stored);
 
         let footer = LogFooter {
             tenant_hash: self.identity.tenant_hash,
@@ -2029,25 +2035,18 @@ impl RlogWriter {
         drop(postings_terms);
         drop(postings_capped);
 
-        // Assemble sections in kind order.
+        // Assemble sections as BLOCKS, KEY_IDX, POSTINGS, BLOOM, SKIP_IDX,
+        // PAGE_DIR, STREAM_DIR, FIELD_DIR, so that one tail probe reaches every
+        // directory whatever the index sizes (ADR-0699, 2026-10-24 amendment).
         let mut object = Vec::new();
         let mut sections: Vec<SectionDesc> = Vec::new();
-        push_section(
-            &mut object,
-            &mut sections,
-            kind::STREAM_DIR,
-            &compress(
-                &StreamDir::encode_borrowed(&stream_dir_entries),
-                self.cfg.zstd_level,
-            )?,
-        );
+
+        let stream_dir_stored = compress(
+            &StreamDir::encode_borrowed(&stream_dir_entries),
+            self.cfg.zstd_level,
+        )?;
         drop(stream_dir_entries);
-        push_section(
-            &mut object,
-            &mut sections,
-            kind::FIELD_DIR,
-            &compress(&field_dir.encode(), self.cfg.zstd_level)?,
-        );
+        let field_dir_stored = compress(&field_dir.encode(), self.cfg.zstd_level)?;
         drop(field_dir);
         push_section(
             &mut object,
@@ -2061,6 +2060,28 @@ impl RlogWriter {
             key_plan,
             self.key_idx_bucket_cap,
         )?;
+        let mut postings_bytes_len: u64 = 0;
+        if !indexed_column_ids.is_empty() {
+            let postings_bytes = encode_postings_section(
+                &postings_fields,
+                self.cfg.postings_stride,
+                self.cfg.zstd_level,
+            )?;
+            postings_bytes_len = postings_bytes.len() as u64;
+            push_section(
+                &mut object,
+                &mut sections,
+                kind::POSTINGS,
+                &Stored::raw(postings_bytes),
+            );
+        }
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::BLOOM,
+            &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
+        );
+        drop(bloom_entries);
         push_section(
             &mut object,
             &mut sections,
@@ -2081,25 +2102,17 @@ impl RlogWriter {
         push_section(
             &mut object,
             &mut sections,
-            kind::BLOOM,
-            &Stored::raw(encode_rlog_bloom_section(&bloom_covered, &bloom_entries)),
+            kind::STREAM_DIR,
+            &stream_dir_stored,
         );
-        drop(bloom_entries);
-        let mut postings_bytes_len: u64 = 0;
-        if !indexed_column_ids.is_empty() {
-            let postings_bytes = encode_postings_section(
-                &postings_fields,
-                self.cfg.postings_stride,
-                self.cfg.zstd_level,
-            )?;
-            postings_bytes_len = postings_bytes.len() as u64;
-            push_section(
-                &mut object,
-                &mut sections,
-                kind::POSTINGS,
-                &Stored::raw(postings_bytes),
-            );
-        }
+        drop(stream_dir_stored);
+        push_section(
+            &mut object,
+            &mut sections,
+            kind::FIELD_DIR,
+            &field_dir_stored,
+        );
+        drop(field_dir_stored);
 
         let footer = LogFooter {
             tenant_hash: self.identity.tenant_hash,
@@ -5385,9 +5398,17 @@ mod tests {
             .section(kind::BLOCKS)
             .map(|d| d.offset + d.len)
             .expect("blocks");
-        let skip_start = footer.section(kind::SKIP_IDX).expect("skip").offset;
+        let next_start = footer
+            .section(kind::POSTINGS)
+            .or(footer.section(kind::BLOOM))
+            .expect("bloom")
+            .offset;
         assert_eq!(desc.offset, blocks_end, "KEY_IDX follows BLOCKS");
-        assert_eq!(desc.offset + desc.len, skip_start, "and precedes SKIP_IDX");
+        assert_eq!(
+            desc.offset + desc.len,
+            next_start,
+            "and precedes POSTINGS, or BLOOM when there is none"
+        );
 
         let probe = |field: &str, ty: KeyType, key8| {
             let (out, reads) = key_probe(&obj, &footer, field, ty, key8);

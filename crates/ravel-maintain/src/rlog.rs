@@ -7814,8 +7814,12 @@ mod tests {
     /// among the candidates (#2140), and the part count again stayed six.
     /// Row-group string dictionaries (#2144) leave them unchanged: no string
     /// chunk in these parts stores smaller on one once each side counts its
-    /// PAGE_DIR entries. Between that change and here a diff can only come
-    /// from this crate.
+    /// PAGE_DIR entries. They were re-captured again, with both vectors, when
+    /// the writer moved STREAM_DIR and FIELD_DIR after PAGE_DIR and BLOOM and
+    /// POSTINGS before SKIP_IDX (ADR-0699 amendment of 2026-10-24, #3217): the
+    /// footer's section offsets change and no record does, and the part count
+    /// stayed six. Between that change and here a diff can only come from this
+    /// crate.
     ///
     /// The compactor's zstd level moved from the writer's 3 to 9 (ADR-2135
     /// decision 4). That changes every part's bytes and none of its records, so
@@ -7838,21 +7842,21 @@ mod tests {
         /// `l1_part_memory_target_bytes: 32 * 1024` at zstd level 3,
         /// re-captured at the stored-size encoding choice (see the note above).
         const LEVEL_3_PART_HASHES: &[&str] = &[
-            "59bc1b97b30c22fefd37082ca13fcea3f9ca413d184d4dad958c425918116463",
-            "79911944901ebc86cabe2f98a3638524e381cb454b292f161b7222c2b2e211a9",
-            "65c1b3b869e6ff4f5511b0860722faee7a9f8e7b418715f1a9f80a2edacb8e16",
-            "fff6977ad871a741019d199d2e08993db2201acfce64b14f9b5fdd1f74f3176e",
-            "d90295bbc856d208095d72acc9da9ff4e1ffd3865148efd87f80783c7ae0d3b5",
-            "71bd01a6239b6173a9bec9780947073323b3fdc799fc4604a1c00996413932d1",
+            "34c18e8f957eb8e7d50bd63007b42534371cf0774e7204d0c312be2437eed2af",
+            "a5940fbdfa99a4e20638599b74c7b294f0ca0a364cbce8dfc69d8d3a5b98690d",
+            "8b3dcdffa2786c43053e8d7a195cc28000aa62569e6dd8c2e275d871d3782205",
+            "f8319349b56d11d814e297f122a2c95089448e28e8f4549c6b28eb9094349406",
+            "3c7e526ed44b8abd9a3f515e787d3c209c112c707ce8aa95b780a7eacda3b9ad",
+            "9188988b0ae472ca36e143e46bb9a45f25b815d986e2b8c55408c1625db44c70",
         ];
         /// The same parts at the compactor's default zstd level.
         const DEFAULT_LEVEL_PART_HASHES: &[&str] = &[
-            "f818074dc4d98f63e542c0cee25857c382a4ca5af9e8420bea8e926f4ebfbd27",
-            "af1862540c68aa757aff3d102f15117588b51e7521ef8d2d5e1055d8ce9aa9d4",
-            "ef43879c673212c0f4f683035f251cf967c6aa0abb5b6915048a7605f3dd749a",
-            "3c98dd49618002dd85d6724a4c05bd0664d0e578b6650ac6c3314cb0f5de7e7e",
-            "db516727d8dcac498cd6d8d859cda3668a3952992c206258aab466cf6cc92a51",
-            "e078f0a2251f0f327fcb0c3b716af828294815e0b9f0853076057001f50c083d",
+            "32973629b90cc0aa0b5d97018f1f5c4880c701129c0877bcc66dda261d41b846",
+            "951d64f566a4ecf1ad02e5e438bf8b2fb1645f821074188e07f0e1b107bbd332",
+            "21bc3e20c7e67bf90aab05ed5d269b8c3968538f4e82041803fb771186989b16",
+            "84255311e4ef6610302ef320e1bfcf77984ec03ac6cf7b2ed523133a9e2a93c9",
+            "e5a869806cbde217f780dac07f5be72c97144d274c3d3e02564b9e39dc07f7a6",
+            "ed6751b03f8d77f8bc2d5cb8490024dd93d3b74515f2f3fef088819259e8ef21",
         ];
 
         let (hashes, rows) = differential_hash_run(3).await;
@@ -8343,7 +8347,7 @@ mod tests {
         // The exact bytes, not only the order: the part hashes under overlap-gated
         // and eager all-open admission, pinned as literals.
         const EXPECTED_HASHES: [&str; 1] =
-            ["6dad4dabf2d0cddd34b0969b97cfe933985533b7dc5578fa0cc19d620b696338"];
+            ["b843545604c87e9e9056effe52aca428af66fbff3ebed4f9c365a6fb57800cc3"];
         let overlap = compact_part_hashes(&inputs, &CompactorConfig::default()).await;
         let eager = compact_part_hashes(
             &inputs,

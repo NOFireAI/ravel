@@ -105,8 +105,8 @@ fn executor(store: Arc<dyn ObjectStoreBackend>, cache: Arc<Cache<CacheFetchError
 ///
 /// The first execution reads every object cold, in snapshot order, and
 /// leaves the last four resident. The second runs in reverse, so it reads
-/// those four first and is served all of them (2792 bytes). The third and
-/// fourth alternate again and are each served three 698-byte objects (2094
+/// those four first and is served all of them (2800 bytes). The third and
+/// fourth alternate again and are each served three 700-byte objects (2100
 /// bytes). One partition reads the objects one after another, so the figures
 /// are exact. Only the read cache's own served bytes are counted; the
 /// catalog's reads go through no read cache here.
@@ -141,7 +141,7 @@ async fn a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs() 
 
     assert_eq!(
         sizes,
-        vec![673, 695, 696, 698, 698, 698, 698, 698],
+        vec![675, 697, 698, 700, 700, 700, 700, 700],
         "the fixture's object sizes"
     );
     assert!(
@@ -150,7 +150,7 @@ async fn a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs() 
     );
     assert_eq!(
         served,
-        vec![0, 2792, 2094, 2094],
+        vec![0, 2800, 2100, 2100],
         "read-cache bytes served per execution"
     );
 }
@@ -177,8 +177,8 @@ fn first_ts(output: &crate::output::QueryOutput) -> i64 {
 /// The read cache holds four and a half of the first eight objects, as in
 /// `a_repeated_scan_larger_than_the_cache_is_served_from_it_on_warm_runs`.
 /// One partition reads the objects one after another, so the per-execution
-/// figures are exact: 0, then 2094 bytes on the second and third executions
-/// and 2767 on each of the five after them. Only the read cache's own served
+/// figures are exact: 0, then 2100 bytes on the second and third executions
+/// and 2775 on each of the five after them. Only the read cache's own served
 /// bytes are counted.
 ///
 /// FLIP: keying the count on the resolved segment set as well gives every
@@ -224,7 +224,7 @@ async fn a_scan_over_a_growing_segment_set_keeps_alternating() {
     );
     assert_eq!(
         served,
-        vec![0, 2094, 2094, 2767, 2767, 2767, 2767, 2767],
+        vec![0, 2100, 2100, 2775, 2775, 2775, 2775, 2775],
         "read-cache bytes served per execution"
     );
     assert_eq!(
