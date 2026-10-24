@@ -488,12 +488,11 @@ pub struct SqlConfig {
     /// single-stage hash aggregate streams are charged (issue #3181): an
     /// undercount factor on every grow and shrink, on the query, tenant and
     /// process ledgers, and an envelope for each building stream's next
-    /// doubling, of which the largest `min(available_parallelism, SQL
-    /// partition count)` in the process are reserved on the process budget
-    /// alone. Default [`AggregateReserveAhead::DEFAULT`], the factor with
-    /// the envelope off; [`AggregateReserveAhead::WITH_ENVELOPE`] turns the
-    /// envelope on, and [`AggregateReserveAhead::OFF`] charges every consumer
-    /// one to one. A
+    /// step, sized from the plan's aggregate layout, of which the largest
+    /// `min(available_parallelism, SQL partition count)` in the process are
+    /// reserved on the process budget alone. Default
+    /// [`AggregateReserveAhead::DEFAULT`], the factor and the envelope;
+    /// [`AggregateReserveAhead::OFF`] charges every consumer one to one. A
     /// value that fails [`AggregateReserveAhead::validate`] is replaced by the
     /// default, with a warning, when the pool is built.
     pub aggregate_reserve_ahead: AggregateReserveAhead,

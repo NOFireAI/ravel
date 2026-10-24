@@ -318,6 +318,11 @@ async fn the_last_emitted_slice_stays_reserved_until_it_is_dropped() {
         "the pool reserved {reserved_after_end} bytes after the stream ended, while \
          its last batch ({last_bytes} bytes) was still held"
     );
+    assert!(
+        held_after_end >= last_bytes,
+        "the pool held {held_after_end} bytes after the stream ended, while its \
+         last batch ({last_bytes} bytes) was still referenced"
+    );
 
     drop(last);
     drop(stream);

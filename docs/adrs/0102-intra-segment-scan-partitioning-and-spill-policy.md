@@ -730,7 +730,9 @@ so the hold does not select them and their shrinks reach the budgets at
 once. (The last-release hold amendment below corrects both sentences for
 `FinalHashAggregateStream` and `SingleHashAggregateStream`: they resize
 their reservation to zero as they return the last slice, and the pool
-holds that shrink when their consumer cannot spill.) With the disk manager disabled, `FinalHashAggregateStream` and
+holds that shrink when their consumer cannot spill. The ordered and
+partial-reduce amendment below corrects them for the ordered partial stream
+and `PartialReduceHashAggregateStream`.) With the disk manager disabled, `FinalHashAggregateStream` and
 `SingleHashAggregateStream` register a consumer that cannot spill and return
 the pool's refusal; `PartialHashAggregateStream` and the ordered final stream
 register as spillable in every case.
@@ -972,7 +974,8 @@ disabled, as decision 3 sets it, both streams register a consumer that
 cannot spill and are held, while a final aggregate on a runtime with a disk
 can shrink after a spill, which frees the memory, and is not held. ADR-1170's
 last-release hold amendment records the budget consequence and the tests
-that pin it.
+that pin it. The ordered and partial-reduce amendment below says why the two
+other migrated streams that shrink to zero are not selected.
 
 ## Amendment (2026-10-23, #3181): the pool charges the migrated aggregate streams ahead of what they ask for
 
@@ -991,17 +994,64 @@ tenant and process ledgers, and, while a stream builds, an envelope for its
 next doubling on the process budget alone. The envelope is available and off
 by default (`AggregateReserveAhead::DEFAULT` sets both envelope terms to 0)
 until it is sized from each stream's layout (#3181);
-`AggregateReserveAhead::WITH_ENVELOPE` turns it on. ADR-1170's reserve-ahead
+`AggregateReserveAhead::WITH_ENVELOPE` turns it on.
+(The layout envelope amendment below sizes it from the plan's layout, turns
+it on in the default and removes `WITH_ENVELOPE`.) ADR-1170's reserve-ahead
 amendment gives the envelope's arithmetic, which of the envelopes are
 reserved, and the tests that pin them.
 
 With the envelope on, the factor and the envelope replace finding 3's 1.5
 resize transient with a bound taken from what each stream has asked for: a hashbrown rehash with the
 old table live, at most 4.86 times the largest single grow, and a `Vec`
-realloc that moves, at most 4 times it. Neither covers what a stream
+realloc that moves, at most 4 times it. (The layout envelope amendment below
+replaces that bound with one per structure.) Neither covers what a stream
 allocates before its first reservation, nor the emit phase, where a final or
 single-stage stream materializes every group while its state is still live;
 the matrix in `crates/ravel-sql/tests/group_by_reservation_lag.rs` reports
 both phases separately. The partial-reduce stream
 (`PartialReduceHashAggregateStream[..]`) and the legacy
 `GroupedHashAggregateStream` are charged one to one, as before.
+
+## Amendment (2026-10-24, #3181): the ordered partial and partial-reduce streams are outside the last-release hold
+
+<!-- amendment-applies: sections="Amendment (2026-10-10, #2720): on DataFusion 55.2 the hold covers only the legacy aggregate stream|Amendment (2026-10-23, #3181): the migrated final and single-stage streams' last release is held" pointer="ordered and partial-reduce amendment" -->
+
+Two more migrated streams resize their reservation to zero while output
+they produced may still be live, and the pool holds neither.
+`OrderedPartialAggregateStream` drops its table and resizes to zero before
+it emits its last batch (`datafusion-physical-plan` 55.2,
+`aggregates/ordered_partial_stream.rs`). It is not held because its state is
+bounded to the groups still open under the input order, not to every group,
+and its output feeds an exchange that reserves what it buffers.
+`PartialReduceHashAggregateStream` resizes to zero the same way, and is not
+held because it never runs under Ravel: `should_use_partial_reduce_hash_stream`
+(`aggregates/mod.rs`) returns false for any pool whose `memory_limit` is
+`MemoryLimit::Finite`, and `TenantDelegatingPool` reports
+`Finite(query_limit)`, so `AggregateExec` plans that mode on another stream.
+
+## Amendment (2026-10-24, #3181): the aggregate envelope is sized from the plan's layout and on by default
+
+<!-- amendment-applies: sections="Amendment (2026-10-23, #3181): the pool charges the migrated aggregate streams ahead of what they ask for" pointer="layout envelope amendment" -->
+<!-- amendment-supersedes: phrase="WITH_ENVELOPE" pointer="layout envelope amendment" -->
+
+The reserve-ahead amendment left the envelope off by default until it could
+be sized from each stream's layout. It now is, and `AggregateReserveAhead::DEFAULT`
+carries it; the `WITH_ENVELOPE` constant is removed, and
+`AggregateReserveAhead::OFF` still restores one-to-one charging with no
+envelope. Before a statement executes, the executor reads the plan's
+`AggregateExec` nodes and sets one aggregate profile on the query's pool:
+the group table's entry size (16 bytes for primitive and multi-column keys,
+32 for a single string-view key), the per-group bytes `W` of the key column
+and accumulator states that grow with the group count, and the widest single
+one of them, `w_max`. A group-values or accumulator type it does not
+recognise makes the profile Unknown.
+
+Each grow a stream makes is matched, within 3%, to a hashbrown step
+(`7/8 x 2^k x entry`) or a `Vec` step (`2^k x W`), and the last of each
+kind is kept. The envelope is the larger of the next block of either
+structure: the table multiplier (5.0 for 16-byte entries, 4.9 for 32-byte
+ones) times the last table step, and 2.1 times the last `Vec` step times
+`1 + w_max/W`, capped at 2.43 times the stream's asked size, which alone
+applies under 8 MiB. A stream with an Unknown profile, no profile, or no
+matched step yet is charged 5 times its largest grow. ADR-1170's layout
+envelope amendment gives the measured basis and the tests that pin it.
