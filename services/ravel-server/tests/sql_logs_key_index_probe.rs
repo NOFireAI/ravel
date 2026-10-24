@@ -672,25 +672,44 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
     );
     assert_eq!(phase(&v, "keyIndex", "s3GetWireBytes"), key_bytes, "{sql}");
 
-    // Object 0: the tail probe, its KEY_IDX reads, SKIP_IDX with PAGE_DIR and
-    // the front directories (plan), then the scan.
+    // Object 0's plan: the tail probe, its KEY_IDX reads, then one GET for
+    // each of SKIP_IDX with PAGE_DIR, the STREAM_DIR and FIELD_DIR pair, and
+    // (when the query places it) BLOOM that does not lie wholly inside the
+    // probe window. Then the scan.
     let holding = &fx.objects[0];
     let size = holding.bytes.len() as u64;
     let got = fx.gets(0);
-    let blocks_start = section(&holding.bytes, kind::BLOCKS).start;
+    let probe_start = size - SUFFIX_LEN;
     let skip_idx = section(&holding.bytes, kind::SKIP_IDX);
     let page_dir = section(&holding.bytes, kind::PAGE_DIR);
     assert_eq!(skip_idx.end, page_dir.start, "PAGE_DIR follows SKIP_IDX");
     let mut plan = vec![GetRange::Suffix(SUFFIX_LEN)];
     plan.extend(holding_key_reads.iter().copied());
-    plan.push(GetRange::Range(skip_idx.start, page_dir.end));
-    plan.push(GetRange::Range(0, blocks_start));
+    if skip_idx.start < probe_start {
+        plan.push(GetRange::Range(skip_idx.start, page_dir.end));
+    }
+    let dirs: Vec<Range<u64>> = [kind::STREAM_DIR, kind::FIELD_DIR]
+        .into_iter()
+        .map(|k| section(&holding.bytes, k))
+        .filter(|r| r.start < probe_start)
+        .collect();
+    if let (Some(start), Some(end)) = (
+        dirs.iter().map(|r| r.start).min(),
+        dirs.iter().map(|r| r.end).max(),
+    ) {
+        plan.push(GetRange::Range(start, end));
+    }
+    let bloom = section(&holding.bytes, kind::BLOOM);
+    if lookup.places_bloom && bloom.start < probe_start {
+        plan.push(GetRange::Range(bloom.start, bloom.end));
+    }
     assert_eq!(
         &got[..plan.len()],
         plan.as_slice(),
         "{sql}: object 0 plan reads"
     );
     let scan = &got[plan.len()..];
+    let plan_reads = (plan.len() - 1 - holding_key_reads.len()) as u64;
     let pages = body_pages(&holding.bytes);
     for (block, page) in pages.iter().enumerate() {
         assert_eq!(
@@ -713,7 +732,6 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
             .expect("sections"),
         size,
     );
-    let bloom = section(&holding.bytes, kind::BLOOM);
     let bloom_gets: Vec<GetRange> = scan
         .iter()
         .copied()
@@ -762,8 +780,8 @@ async fn assert_reads_only_the_indexed_blocks(fx: &Fixture, lookup: &Lookup<'_>)
     );
     assert_eq!(
         phase(&v, "plan", "s3GetRequests"),
-        fx.objects.len() as u64 + 2,
-        "{sql}: one tail probe per object, SKIP_IDX and the front of object 0"
+        fx.objects.len() as u64 + plan_reads,
+        "{sql}: one tail probe per object and object 0's reads past its probe"
     );
 
     assert_eq!(pruning(&v, "segments"), 3, "{sql}");
@@ -1460,10 +1478,10 @@ fn ranged_fetcher(store: Arc<dyn ObjectStoreBackend>) -> LogSegmentFetcher {
 /// query's, read for read, plus the KEY_IDX prefix when the object has the
 /// section. An object with no KEY_IDX costs nothing extra. Per object, the
 /// `region` equality takes the plan's fallback, whose read crosses over to one
-/// whole-object GET carried to the scan (#835): the tail probe, SKIP_IDX with
-/// PAGE_DIR, then the object. The `status_code` equality takes the
-/// skip-decidable route (#761), which reads the front directories as well,
-/// and its scan, keeping every block, reads the object whole.
+/// whole-object GET carried to the scan (#835). The `status_code` equality
+/// takes the skip-decidable route (#761), and its scan, keeping every block,
+/// reads the object whole. Either way the reads are the tail probe, which
+/// carries SKIP_IDX, PAGE_DIR, STREAM_DIR and FIELD_DIR, then the object.
 #[tokio::test]
 async fn a_probe_that_prunes_nothing_reads_what_the_unkeyed_query_reads() {
     let unkeyed = KeyIndexDeclaration::default();
@@ -1474,13 +1492,13 @@ async fn a_probe_that_prunes_nothing_reads_what_the_unkeyed_query_reads() {
             "SELECT substr(body, 1, 6) AS id FROM logs WHERE region = 'ap-south-1' ORDER BY id",
             ["o0r050", "o0r100"],
             3,
-            9,
+            6,
         ),
         (
             "SELECT substr(body, 1, 6) AS id FROM logs WHERE status_code = 500 ORDER BY id",
             ["o0r050", "o0r085"],
             3,
-            12,
+            6,
         ),
     ] {
         // No KEY_IDX section: the same GETs as with no key at all.

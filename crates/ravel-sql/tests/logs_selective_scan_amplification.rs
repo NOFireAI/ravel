@@ -986,12 +986,12 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "full scan decodes every block"
     );
     assert_eq!(full.rows, TOTAL_BLOCKS, "full scan returns every record");
-    // 630,401 = the eight version-5 objects' bytes exactly (their sizes
+    // 630,433 = the eight version-5 objects' bytes exactly (their sizes
     // differ: each block's bloom filter is sized to its own token count). One
     // whole-object GET per segment and nothing else, so this is the object
     // bytes and not a byte more.
     assert_eq!(
-        full.bytes, 630_401,
+        full.bytes, 630_433,
         "full scan reads exactly the object bytes"
     );
     assert_eq!(full.plan_full_reads, 0, "full scan skips the plan phase");
@@ -1015,11 +1015,11 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         "q37: the plan phase counted survivors from the skip index, fetching no \
          block"
     );
-    // Exact GET count, 48 per 8 segments, 6 per segment:
-    // - the plan probe;
-    // - the plan phase's one combined STREAM_DIR + FIELD_DIR front GET
-    //   (ADR-2066 decision 1): the plan decodes all four directories once per
-    //   segment (ADR-2414 decision A1) and the scan reads none of them again;
+    // Exact GET count, 40 per 8 segments, 5 per segment:
+    // - the plan probe, which carries STREAM_DIR and FIELD_DIR as well as
+    //   SKIP_IDX and PAGE_DIR, since both follow PAGE_DIR: the plan decodes all
+    //   four directories once per segment (ADR-2414 decision A1) and the scan
+    //   reads none of them again;
     // - 4 chunk runs. Under version 4 the surviving block's bytes are one page
     //   per projected column chunk of its row group. At gap 0 they form 6
     //   disjoint runs per segment, because the pruned blocks' pages for the
@@ -1027,7 +1027,7 @@ async fn selective_numeric_reads_only_surviving_blocks() {
     //   (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`) bridges the two smallest gaps
     //   to leave 4.
     // Every tail section is absorbed by the probe. No whole-object GET anywhere.
-    assert_eq!(q37.gets, 48, "q37: exact GET count with no eviction");
+    assert_eq!(q37.gets, 40, "q37: exact GET count with no eviction");
     assert_eq!(
         q37.blocks_scanned, SEGMENTS,
         "q37 decodes exactly one block per segment"
@@ -1045,8 +1045,10 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q37.bytes,
         q37_block_bytes
     );
-    // 165,393 = 99,185 chunk-run bytes + 65,536 probe bytes (8 x 8 KiB) + 672
-    // front-section bytes (8 x (STREAM_DIR 62 + FIELD_DIR 22)). The chunk-run
+    // 164,721 = 99,185 chunk-run bytes + 65,536 probe bytes (8 x 8 KiB). The
+    // probe carries STREAM_DIR and FIELD_DIR, so no section GET adds to it,
+    // where an object with them ahead of BLOCKS adds 672 (8 x (STREAM_DIR 62
+    // + FIELD_DIR 22)). The chunk-run
     // term is 99,145 page bytes (the 8 surviving blocks' pages, each with its
     // segment's 6-byte `severity_text` row-group dictionary page; blocks differ
     // slightly in encoded size -- segment 0's surviving block also carries
@@ -1057,9 +1059,9 @@ async fn selective_numeric_reads_only_surviving_blocks() {
     // this deliberately tiny fixture is 40% of the total and on a production
     // 1.3 MB object is a rounding error.
     assert_eq!(
-        q37.bytes, 165_393,
-        "q37 moves the surviving blocks' page bytes plus the probe and the two \
-         front sections, not the object"
+        q37.bytes, 164_721,
+        "q37 moves the surviving blocks' page bytes plus the probe, not the \
+         object"
     );
     assert!(
         q37.bytes <= full.bytes * 2 / 5,
@@ -1076,14 +1078,13 @@ async fn selective_numeric_reads_only_surviving_blocks() {
     );
     assert_eq!(q20.full_gets, 0, "q20: no whole-object GET");
     assert_eq!(q20.plan_full_reads, 0, "q20: skip-index plan");
-    // Same shape as q37, 48: per segment the probe, the plan's combined front
-    // directory GET and
-    // 4 chunk runs. q20's second surviving block per segment is ADJACENT to
+    // Same shape as q37, 40: per segment the probe and 4 chunk runs. q20's
+    // second surviving block per segment is ADJACENT to
     // the first, so its page sits next to the first's in every chunk and the
     // pair coalesces even at gap 0 -- still 6 runs per segment before the L0
     // cap bridges them to 4, so the range count is unchanged and only the
     // bytes grow.
-    assert_eq!(q20.gets, 48, "q20: exact GET count with no eviction");
+    assert_eq!(q20.gets, 40, "q20: exact GET count with no eviction");
     assert_eq!(
         q20.blocks_scanned,
         SEGMENTS * 2,
@@ -1101,13 +1102,13 @@ async fn selective_numeric_reads_only_surviving_blocks() {
         q20.bytes,
         q20_block_bytes
     );
-    // 264,375 = 198,167 chunk-run bytes + the same 65,536 probe and 672
-    // front-section bytes q37 pays. The chunk-run term is 198,135 page bytes
+    // 263,703 = 198,167 chunk-run bytes + the same 65,536 probe bytes q37
+    // pays. The chunk-run term is 198,135 page bytes
     // (16 surviving blocks) plus 32 bridged gap bytes: the L0 cap merges one
     // gap per segment, 4 bytes each. About twice q37's page term, identical
     // fixed term.
     assert_eq!(
-        q20.bytes, 264_375,
+        q20.bytes, 263_703,
         "q20 moves about twice q37's page bytes and the same fixed directory bytes"
     );
     assert!(
@@ -1176,7 +1177,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     );
     assert_eq!(text.rows, SEGMENTS, "one matching record per segment");
     // The whole objects are read: bytes ~ a full scan plus the probes, the
-    // amplification #761 cannot remove for a text predicate. 695,937 = 630,401
+    // amplification #761 cannot remove for a text predicate. 695,969 = 630,433
     // object bytes + 65,536 probe bytes (8 x 8 KiB). The 176 FIELD_DIR bytes
     // (8 x 22) this figure carried before #835 were the scan open's, not the
     // plan's: the plan fallback selects every column, while the scan's
@@ -1185,7 +1186,7 @@ async fn text_predicate_falls_back_to_full_object_read() {
     // short-circuits that open, so the read goes with it.
     let full = measure("full_scan", &[], cache).await;
     assert_eq!(
-        text.bytes, 695_937,
+        text.bytes, 695_969,
         "text fallback: the whole objects plus one plan probe each"
     );
     assert!(
@@ -1248,12 +1249,11 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
         small.bytes,
         full.bytes
     );
-    // 264,375 with no eviction: the figure
+    // 263,703 with no eviction: the figure
     // `selective_numeric_reads_only_surviving_blocks` decomposes for q20.
     //
-    // 305,335 under pressure =
+    // 304,663 under pressure =
     //   65,536 (8 plan probes, 8 KiB each)
-    // +    672 (8 plan STREAM_DIR+FIELD_DIR front GETs, 84 each)
     // + 40,960 (5 probe-window range re-reads of an evicted tail, 8 KiB each)
     // + 198,167 (32 chunk-run GETs: 8 sets of 4 runs, one set per segment,
     //           the same chunk-run bytes as with no eviction -- the striped
@@ -1262,11 +1262,11 @@ async fn selective_third_no_partition_multiplication_under_cache_pressure() {
     //           partitions, and nothing is read twice to be evicted in
     //           between).
     // Only the tail re-reads are repeated under pressure, so the bound is one
-    // full pass, not the no-eviction figure: both stay under the 630,401 a
+    // full pass, not the no-eviction figure: both stay under the 630,433 a
     // full pass moves.
-    assert_eq!(big.bytes, 264_375, "q20 with no eviction");
+    assert_eq!(big.bytes, 263_703, "q20 with no eviction");
     assert_eq!(
-        small.bytes, 305_335,
+        small.bytes, 304_663,
         "q20 under eviction: tail re-reads only, still under one full pass"
     );
 }
@@ -1341,11 +1341,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
              nothing beyond that -- the scan adds no GET of any shape",
             s.label
         );
-        // 695,937: identical to the big-cache figure
+        // 695,969: identical to the big-cache figure
         // (`text_predicate_falls_back_to_full_object_read`), proving the byte
         // cost no longer depends on cache size.
         assert_eq!(
-            s.bytes, 695_937,
+            s.bytes, 695_969,
             "{}: exactly the corpus bytes plus the fixed per-segment plan \
              overhead, moved once, never twice",
             s.label
@@ -1371,11 +1371,11 @@ async fn text_predicate_no_second_wire_read_regardless_of_cache() {
             "{}: one matching record per segment",
             s.label
         );
-        // 630,401: the whole corpus (see `full.bytes` in the sibling test),
+        // 630,433: the whole corpus (see `full.bytes` in the sibling test),
         // charged as reused rather than folded into the GET-bytes figure the
         // plan phase already recorded -- the truthful-accounting deliverable.
         assert_eq!(
-            s.acc_bytes_reused, 630_401,
+            s.acc_bytes_reused, 630_433,
             "{}: the scan's reuse of every carried whole object is charged via \
              bytes_reused, not silently absorbed into acc_bytes",
             s.label
@@ -1446,11 +1446,11 @@ async fn text_predicate_prunes_most_scan_adds_no_gets() {
         "only the one segment carrying the marker survives"
     );
     assert_eq!(s.rows, 1, "exactly one matching record, from segment 0");
-    // 78,740: segment 0's whole-object size (its block 0 carries
+    // 78,744: segment 0's whole-object size (its block 0 carries
     // `MARKER_RARE` in addition to `MARKER_FEW`) -- the only segment whose
     // carry the scan ever reuses.
     assert_eq!(
-        s.acc_bytes_reused, 78_740,
+        s.acc_bytes_reused, 78_744,
         "the one surviving segment's scan reuses its plan-carried bytes \
          rather than issuing a second GET"
     );
@@ -1740,7 +1740,7 @@ async fn sub_break_even_segments_are_read_once() {
     );
     assert_eq!(
         (unplanned.bytes, corpus),
-        (630_401, 630_401),
+        (630_433, 630_433),
         "the wire carries each object exactly once"
     );
     assert!(
@@ -1787,10 +1787,11 @@ async fn sub_break_even_segments_are_read_once() {
         unplanned.row_lines, planned.row_lines,
         "both routes return the same rows"
     );
-    // The planned route, per object: two plan-phase GETs, one metadata GET
+    // The planned route, per object: one plan-phase GET (the suffix probe,
+    // which carries STREAM_DIR and FIELD_DIR after PAGE_DIR), one metadata GET
     // when the scan opens it, and four block-data GETs. The I64 equality is a
     // range arm, which BLOOM cannot answer, so the open does not fetch BLOOM.
-    // Fewer bytes than the corpus, seven times the requests.
+    // Fewer bytes than the corpus, six times the requests.
     assert_eq!(
         (
             planned.gets,
@@ -1799,12 +1800,12 @@ async fn sub_break_even_segments_are_read_once() {
             planned.scan_phase_gets,
             planned.bytes
         ),
-        (56, 16, 8, 32, 167_066),
+        (48, 8, 8, 32, 166_426),
         "planned route cost on the same corpus"
     );
     assert_eq!(
         (SEGMENTS as u64, bloom_bytes),
-        (8, 197_690 - 167_066),
+        (8, 30_624),
         "one BLOOM GET per object and the corpus's BLOOM bytes are what the \
          open no longer fetches"
     );
@@ -1862,7 +1863,7 @@ async fn fewer_sub_break_even_segments_than_partitions_keep_the_plan() {
     );
     assert_eq!(
         (at_count.gets, at_count.full_gets, at_count.bytes),
-        (SEGMENTS as u64, SEGMENTS as u64, 630_401),
+        (SEGMENTS as u64, SEGMENTS as u64, 630_433),
         "one whole-object GET per object, the corpus exactly once"
     );
 
@@ -1882,7 +1883,7 @@ async fn fewer_sub_break_even_segments_than_partitions_keep_the_plan() {
             above.bytes,
             above.acc_bytes_reused
         ),
-        (8, 8, 0, SEGMENTS, 630_401, 630_401),
+        (8, 8, 0, SEGMENTS, 630_433, 630_433),
         "planned route cost with more partitions than sub-bound segments"
     );
     assert_eq!(

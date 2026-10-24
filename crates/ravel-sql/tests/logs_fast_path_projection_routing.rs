@@ -563,20 +563,21 @@ async fn narrow_projection_reads_column_chunks_not_whole_objects() {
 
     let shape = measure(Some(narrow_projection()), Some(THRESHOLD_DIVISOR)).await;
 
-    // Exact request law: one suffix probe and four byte-range GETs per segment
-    // (STREAM_DIR and FIELD_DIR together in one GET, ADR-2066 decision 1, then
-    // one coalesced run per projected column chunk), and NO whole-object GET.
+    // Exact request law: one suffix probe and three byte-range GETs per
+    // segment (STREAM_DIR and FIELD_DIR follow PAGE_DIR, so the probe carries
+    // them; then one coalesced run per projected column chunk), and NO
+    // whole-object GET.
     assert_eq!(
         (shape.full_gets, shape.suffix_gets, shape.range_gets),
-        (0, SEGMENTS as u64, 4 * SEGMENTS as u64),
-        "exact request shape per segment: 0 full, 1 suffix probe, 4 ranges"
+        (0, SEGMENTS as u64, 3 * SEGMENTS as u64),
+        "exact request shape per segment: 0 full, 1 suffix probe, 3 ranges"
     );
 
     // Exact bytes: the projection reads three object columns of twenty, so the
     // wire cost is a fraction of the stored bytes rather than all of them.
     assert_eq!(
         (shape.bytes, stored),
-        (71_554, 405_944),
+        (71_026, 405_956),
         "exact wire bytes for the narrow shape, against the fixture's stored bytes"
     );
 
@@ -595,7 +596,7 @@ async fn narrow_projection_reads_column_chunks_not_whole_objects() {
 ///
 /// This is the direction that catches over-application. Nineteen object columns
 /// of twenty leaves nothing worth ranging for, and the ranged path would pay a
-/// probe and a section GET per segment to fetch the same bytes. Deleting the
+/// probe and a run GET per column chunk to fetch the same bytes. Deleting the
 /// `ranged_projection_pays` guard (returning `true` unconditionally from
 /// `LogSegmentFetcher::ranged_projection_pays`) fails this test.
 #[tokio::test]
@@ -614,7 +615,7 @@ async fn wide_projection_keeps_the_whole_object_read() {
     );
     assert_eq!(
         (shape.bytes, stored),
-        (405_944, 405_944),
+        (405_956, 405_956),
         "a whole-object read moves exactly the stored bytes"
     );
     assert_eq!(
@@ -643,7 +644,7 @@ async fn select_star_is_unchanged() {
     );
     assert_eq!(
         (shape.bytes, stored),
-        (405_944, 405_944),
+        (405_956, 405_956),
         "SELECT * moves exactly the stored bytes"
     );
     assert_eq!(
@@ -744,8 +745,8 @@ async fn narrow_projection_over_previous_version_segment_is_refused_before_any_r
     // The typed error, not a string match and not a generic internal error.
     assert_unsupported_version(&err, ravel_logseg::footer::VERSION - 1);
 
-    // Exact request law: nothing was fetched. The probe (`suffix`), the
-    // SKIP_IDX/PAGE_DIR front-section reads and every block range (`range`),
+    // Exact request law: nothing was fetched. The probe (`suffix`), any
+    // section read and every block range (`range`),
     // and the whole-object read (`full`) are each exactly zero, as are the
     // bytes they would have moved.
     assert_eq!(
@@ -819,7 +820,7 @@ async fn plan_path_over_previous_version_segment_is_refused_before_any_request()
     assert_unsupported_version(&err, ravel_logseg::footer::VERSION - 1);
 
     // Exact request law, identical to the scan-path sibling: the plan probe
-    // (`suffix`), any front-section/footer-range read (`range`), the
+    // (`suffix`), any section/footer-range read (`range`), the
     // whole-object read (`full`), and the bytes they would have moved are each
     // exactly zero.
     assert_eq!(
@@ -888,8 +889,8 @@ async fn measure_between_three_and_five_request_costs(projection: Vec<usize>) ->
     .await;
     let size = seg.object_size;
     // The suffix probe is sized from the fixture's own footer to cover every
-    // section after BLOCKS (SKIP_IDX, PAGE_DIR, BLOOM) and the footer, which
-    // at this object size outgrow `SUFFIX_LEN`.
+    // section after BLOCKS (BLOOM, SKIP_IDX, PAGE_DIR, STREAM_DIR, FIELD_DIR)
+    // and the footer, which at this object size outgrow `SUFFIX_LEN`.
     let object = base
         .get(&seg.data_object_key, GetRange::Full)
         .await
@@ -950,17 +951,17 @@ async fn measure_between_three_and_five_request_costs(projection: Vec<usize>) ->
 /// The narrow scan (`ts` and `d00`, three object columns of twenty) skips an
 /// estimated 0.85 S against a break-even of 0.63 S and reads ranged. Its GET
 /// count comes from the fixture: one suffix probe, sized from the footer to
-/// cover every section after BLOCKS and the footer; one range GET over STREAM_DIR
-/// and FIELD_DIR; and, with six blocks in one row group and a zero coalescing
-/// gap, one run per projected column chunk, three. So 0 full, 1 suffix and 4
+/// cover every section after BLOCKS and the footer, STREAM_DIR and FIELD_DIR
+/// among them; and, with six blocks in one row group and a zero coalescing
+/// gap, one run per projected column chunk, three. So 0 full, 1 suffix and 3
 /// range GETs. The half scan skips an estimated 0.5 S and reads whole: 1 full
 /// GET, no probe.
 ///
 /// Prove-the-test, each shown failing: the multiple left at 5 (break-even
 /// 1.05 S) reads the narrow scan whole in 1 GET; deciding on object size
-/// alone routes the half scan ranged, which pays a probe and a directory GET
-/// before the coverage crossover reads it whole; lowering only `ranged_projection_pays`
-/// to three request costs while the stored break-even stays at five routes
+/// alone routes the half scan ranged, which pays a probe before the coverage
+/// crossover reads it whole; lowering only `ranged_projection_pays` to three
+/// request costs while the stored break-even stays at five routes
 /// the narrow scan ranged and the size crossover then reads it whole in 1
 /// full GET.
 #[tokio::test]
@@ -968,8 +969,8 @@ async fn a_30mb_object_reads_ranged_narrow_and_whole_wide() {
     let (narrow, size) = measure_between_three_and_five_request_costs(narrow_projection()).await;
     assert_eq!(
         (narrow.full_gets, narrow.suffix_gets, narrow.range_gets),
-        (0, 1, 4),
-        "the narrow scan reads ranged: 1 suffix probe, 1 directory GET, 3 column runs"
+        (0, 1, 3),
+        "the narrow scan reads ranged: 1 suffix probe, 3 column runs"
     );
     assert_eq!(
         (narrow.ranged_segments, narrow.whole_object_segments),
