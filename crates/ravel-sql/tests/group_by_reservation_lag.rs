@@ -38,8 +38,8 @@
 //! first result batch, after one had grown) and `emit` (from the first result
 //! batch on). On DataFusion 55.2 with the default factor and layout envelope,
 //! in four runs sampled every millisecond, the build phase stayed within
-//! 26 MiB on every row but the 8-partition string-key ones, q33's included;
-//! those read 13.5-80.0 MiB, up to 17.2 MiB of it before any aggregate stream
+//! 26 MiB on every row (q33's among them) but the 8-partition string-key
+//! ones, which read 13.5-80.0 MiB, up to 17.2 MiB of it before any aggregate stream
 //! had grown; at the Ravel `COUNT(*)` row's largest live step, 27.7-39.6 MiB
 //! of the rise was unreserved against 4.6-32.9 MiB of envelope. The emit
 //! phase carries the largest gaps (q33's read 271, 461, 916 and 347 MiB): a

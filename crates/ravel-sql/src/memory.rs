@@ -56,8 +56,8 @@
 //! - While the consumer builds (until its first shrink), it carries an
 //!   envelope for the next step it can make: `envelope_size_factor x S`
 //!   while its asked size `S` is under 8 MiB, else the smaller of that and
-//!   its next step. Only the `W` largest envelopes in the process are
-//!   reserved, on the process [`MemoryBudget`] alone, where `W` is the
+//!   its next step. Only the `P` largest envelopes in the process are
+//!   reserved, on the process [`MemoryBudget`] alone, where `P` is the
 //!   number of aggregate streams that can run `aggregate_batch` at once. A
 //!   grow whose envelope change the budget refuses is itself refused before
 //!   anything is charged.

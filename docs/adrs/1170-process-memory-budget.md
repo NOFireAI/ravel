@@ -1535,7 +1535,7 @@ recognise is Unknown.
 
 Each grow is matched against its own size, within 3%, to a table step
 `7/8 x 2^k x entry_size` or a `Vec` step `2^k x W`; the pool keeps the
-largest of each, `J_t` and `J_v`. A building stream's envelope, at asked size
+last of each, `J_t` and `J_v`. A building stream's envelope, at asked size
 `S`, is `2.43 x S` while `S` is under 8 MiB, else
 `min(2.43 x S, max(m_t x J_t, 2.1 x J_v x (1 + w_max / W)))`, with `m_t`
 5.0 for 16-byte entries and 4.9 for 32-byte ones. The table term covers a

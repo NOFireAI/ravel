@@ -1520,8 +1520,8 @@ aggregate layout. Before the plan executes, the executor derives an
 table's entry size (16 bytes for a primitive or multi-column key, 32 for a
 single `Utf8View`/`BinaryView` key), `W`, the per-group bytes of every `Vec`
 that grows with the group count (key columns and accumulator state: 8 for
-`COUNT`, `SUM` and primitive `MIN`/`MAX`, 24 for Ravel's exact `AVG`, 16
-for DataFusion's float `AVG`), and `w_max`, the widest of them. Any other
+`COUNT`, the return type's width for `SUM`, `MIN` and `MAX` over a primitive
+type, 24 for Ravel's exact `AVG`, 16 for DataFusion's float `AVG`), and `w_max`, the widest of them. Any other
 key or accumulator (a single `Utf8` or `Boolean` key, a row-format key, a
 `DISTINCT` aggregate, an accumulator without a groups form) makes the
 profile `Unknown`, and across several aggregates `Unknown` wins, else the
