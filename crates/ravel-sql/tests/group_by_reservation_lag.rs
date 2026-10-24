@@ -80,8 +80,8 @@ use ravel_catalog::Snapshot;
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
-    LogsTableProvider, SessionTable, SpillDecision, SqlConfig, TenantMemoryAccountant,
-    build_session, session_config, sql_memory_aggregate_envelope_bytes,
+    AggregateReserveAhead, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
+    TenantMemoryAccountant, build_session, session_config, sql_memory_aggregate_envelope_bytes,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -385,6 +385,9 @@ fn run_once(
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(partitions);
     config.max_query_bytes = 64 << 30;
+    // The bands below were measured with the envelope on; the default leaves
+    // it off until it is sized per layout (#3181).
+    config.aggregate_reserve_ahead = AggregateReserveAhead::WITH_ENVELOPE;
     let plain = matches!(variant, Variant::Plain);
     let tenant = TenantMemoryAccountant::new(64 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());

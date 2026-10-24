@@ -988,12 +988,15 @@ accumulator `Vec`s, so the pool now charges those consumers ahead of what
 they ask for (`AggregateReserveAhead`, `crates/ravel-sql/src/memory.rs`):
 every grow and shrink at an undercount factor (default 1.25) on the query,
 tenant and process ledgers, and, while a stream builds, an envelope for its
-next doubling on the process budget alone. ADR-1170's reserve-ahead
+next doubling on the process budget alone. The envelope is available and off
+by default (`AggregateReserveAhead::DEFAULT` sets both envelope terms to 0)
+until it is sized from each stream's layout (#3181);
+`AggregateReserveAhead::WITH_ENVELOPE` turns it on. ADR-1170's reserve-ahead
 amendment gives the envelope's arithmetic, which of the envelopes are
 reserved, and the tests that pin them.
 
-The factor and the envelope replace finding 3's 1.5 resize transient with a
-bound taken from what each stream has asked for: a hashbrown rehash with the
+With the envelope on, the factor and the envelope replace finding 3's 1.5
+resize transient with a bound taken from what each stream has asked for: a hashbrown rehash with the
 old table live, at most 4.86 times the largest single grow, and a `Vec`
 realloc that moves, at most 4 times it. Neither covers what a stream
 allocates before its first reservation, nor the emit phase, where a final or

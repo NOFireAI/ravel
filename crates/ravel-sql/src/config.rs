@@ -490,8 +490,10 @@ pub struct SqlConfig {
     /// process ledgers, and an envelope for each building stream's next
     /// doubling, of which the largest `min(available_parallelism, SQL
     /// partition count)` in the process are reserved on the process budget
-    /// alone. Default [`AggregateReserveAhead::DEFAULT`];
-    /// [`AggregateReserveAhead::OFF`] charges every consumer one to one. A
+    /// alone. Default [`AggregateReserveAhead::DEFAULT`], the factor with
+    /// the envelope off; [`AggregateReserveAhead::WITH_ENVELOPE`] turns the
+    /// envelope on, and [`AggregateReserveAhead::OFF`] charges every consumer
+    /// one to one. A
     /// value that fails [`AggregateReserveAhead::validate`] is replaced by the
     /// default, with a warning, when the pool is built.
     pub aggregate_reserve_ahead: AggregateReserveAhead,

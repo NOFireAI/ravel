@@ -62,7 +62,10 @@
 //!   streams that can run `aggregate_batch` at once. A grow whose envelope
 //!   change the budget refuses is itself refused before anything is charged.
 //!
-//! [`AggregateReserveAhead::OFF`] restores one-to-one charging and no
+//! [`AggregateReserveAhead::DEFAULT`] charges the factor and reserves no
+//! envelope: both envelope terms are 0 until the envelope is sized from each
+//! stream's layout (#3181). [`AggregateReserveAhead::WITH_ENVELOPE`] turns it
+//! on, and [`AggregateReserveAhead::OFF`] restores one-to-one charging and no
 //! envelope.
 
 use std::collections::{BTreeMap, HashMap};
@@ -413,9 +416,18 @@ impl AggregateReserveAhead {
         envelope_size_factor: 0.0,
     };
 
-    /// The default: a 1.25 undercount factor, and an envelope of five times
-    /// the largest step, capped at 2.43 times the asked size.
+    /// The default: a 1.25 undercount factor and no envelope. Both envelope
+    /// terms are 0, so [`Self::envelope`] is 0 at every size.
     pub const DEFAULT: AggregateReserveAhead = AggregateReserveAhead {
+        undercount_factor: 1.25,
+        envelope_multiplier: 0.0,
+        envelope_size_factor: 0.0,
+    };
+
+    /// The default's factor with the designed envelope: five times the
+    /// largest step, capped at 2.43 times the asked size. Off by default
+    /// until the envelope is sized from each stream's layout (#3181).
+    pub const WITH_ENVELOPE: AggregateReserveAhead = AggregateReserveAhead {
         undercount_factor: 1.25,
         envelope_multiplier: 5.0,
         envelope_size_factor: 2.43,
@@ -2084,6 +2096,13 @@ mod tests {
         (tenant, Arc::new(pool))
     }
 
+    /// Serializes the tests that reserve an envelope with the one that reads
+    /// the process-wide envelope figure as 0.
+    fn envelope_tests() -> MutexGuard<'static, ()> {
+        static SERIAL: Mutex<()> = Mutex::new(());
+        SERIAL.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn register_on(pool: &Arc<TenantDelegatingPool>, name: &str) -> MemoryReservation {
         let pool: Arc<dyn MemoryPool> = Arc::clone(pool) as Arc<dyn MemoryPool>;
         MemoryConsumer::new(name).register(&pool)
@@ -2114,11 +2133,12 @@ mod tests {
     /// the 4 x 109,051,904 the next `Vec` doubling needs.
     #[test]
     fn the_envelope_is_five_times_the_largest_step_and_covers_both_doublings() {
+        let _serial = envelope_tests();
         let budget = Arc::new(MemoryBudget::new(1 << 40));
         let (_tenant, pool) = ahead_pool(
             &budget,
             1,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             QueryAccounting::new(),
         );
         let res = register_on(&pool, PARTIAL);
@@ -2171,11 +2191,12 @@ mod tests {
 
     #[test]
     fn a_consumer_under_eight_mebibytes_carries_the_size_bound() {
+        let _serial = envelope_tests();
         let small = Arc::new(MemoryBudget::new(1 << 40));
         let (_tenant, pool) = ahead_pool(
             &small,
             1,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             QueryAccounting::new(),
         );
         let res = register_on(&pool, PARTIAL);
@@ -2186,7 +2207,7 @@ mod tests {
         let (_tenant, pool) = ahead_pool(
             &large,
             1,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             QueryAccounting::new(),
         );
         let res = register_on(&pool, "FinalHashAggregateStream[3]");
@@ -2201,17 +2222,18 @@ mod tests {
     /// 1.25 x their asked bytes.
     #[test]
     fn only_the_w_largest_envelopes_in_the_process_are_on_the_budget() {
+        let _serial = envelope_tests();
         let budget = Arc::new(MemoryBudget::new(1 << 40));
         let (tenant_one, pool_one) = ahead_pool(
             &budget,
             2,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             QueryAccounting::new(),
         );
         let (tenant_two, pool_two) = ahead_pool(
             &budget,
             2,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             QueryAccounting::new(),
         );
         let a = register_on(&pool_one, "PartialHashAggregateStream[0]");
@@ -2247,12 +2269,13 @@ mod tests {
     /// the query (and, without a rollback, leaves the charge in place).
     #[test]
     fn a_doubling_that_does_not_fit_the_budget_is_refused_before_it_is_made() {
+        let _serial = envelope_tests();
         let budget = Arc::new(MemoryBudget::new(6 * MIB as u64));
         let accounting = QueryAccounting::new();
         let (tenant, pool) = ahead_pool(
             &budget,
             1,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             accounting.clone(),
         );
         let res = register_on(&pool, PARTIAL);
@@ -2279,7 +2302,10 @@ mod tests {
         let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(&budget));
         let pool = Arc::new(
             TenantDelegatingPool::new(MIB, tenant, CeilingBreach::new(), QueryAccounting::new())
-                .with_aggregate_reserve_ahead(AggregateReserveAhead::DEFAULT, NonZeroUsize::MIN),
+                .with_aggregate_reserve_ahead(
+                    AggregateReserveAhead::WITH_ENVELOPE,
+                    NonZeroUsize::MIN,
+                ),
         );
         let res = register_on(&pool, PARTIAL);
         res.try_grow(MIB)
@@ -2292,11 +2318,12 @@ mod tests {
     /// 1.5 GB after the 300 MB grow.
     #[test]
     fn the_envelope_is_released_at_the_first_shrink_and_at_unregister() {
+        let _serial = envelope_tests();
         let budget = Arc::new(MemoryBudget::new(1 << 40));
         let (tenant, pool) = ahead_pool(
             &budget,
             1,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             QueryAccounting::new(),
         );
         let res = register_on(&pool, "FinalHashAggregateStream[0]");
@@ -2332,11 +2359,12 @@ mod tests {
 
     #[test]
     fn a_pool_dropped_mid_build_releases_its_envelopes() {
+        let _serial = envelope_tests();
         let budget = Arc::new(MemoryBudget::new(1 << 40));
         let (tenant, pool) = ahead_pool(
             &budget,
             4,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::WITH_ENVELOPE,
             QueryAccounting::new(),
         );
         let partial = detached("PartialHashAggregateStream[0]");
@@ -2351,6 +2379,41 @@ mod tests {
         drop(pool);
         assert_eq!(envelope_on_budget(&budget), 0);
         assert_eq!(budget.reserved(), tenant.reserved() as u64);
+    }
+
+    /// FLIP: a `DEFAULT` that carries the envelope (5, 2.43) reserves
+    /// 17,836,278 bytes on the process budget at the first step.
+    #[test]
+    fn the_default_charges_the_factor_and_no_envelope() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let res = register_on(&pool, "FinalHashAggregateStream[0]");
+
+        let mut asked = 0usize;
+        for step in SERIES {
+            res.try_grow(step).expect("within every ceiling");
+            asked += step;
+            let charged = (asked as f64 * 1.25).ceil() as usize;
+            assert_eq!(
+                budget.reserved(),
+                charged as u64,
+                "process: 1.25 x {asked} and no envelope"
+            );
+            assert_eq!(pool.reserved(), charged, "query: 1.25 x {asked}");
+            assert_eq!(tenant.reserved(), charged, "tenant: 1.25 x {asked}");
+            assert_eq!(envelope_on_budget(&budget), 0);
+            assert_eq!(sql_memory_aggregate_envelope_bytes(), 0);
+        }
+
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+        assert_eq!(sql_memory_aggregate_envelope_bytes(), 0);
     }
 
     #[test]
@@ -2408,6 +2471,7 @@ mod tests {
     fn validate_refuses_a_non_finite_value_a_factor_below_one_and_a_negative_multiplier() {
         assert_eq!(AggregateReserveAhead::DEFAULT.validate(), Ok(()));
         assert_eq!(AggregateReserveAhead::OFF.validate(), Ok(()));
+        assert_eq!(AggregateReserveAhead::WITH_ENVELOPE.validate(), Ok(()));
         let nan = AggregateReserveAhead {
             envelope_size_factor: f64::NAN,
             ..AggregateReserveAhead::DEFAULT

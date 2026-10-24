@@ -1508,16 +1508,20 @@ those allocations hold, so the pool charges a consumer named
 (`SqlConfig::aggregate_reserve_ahead`, issue #3181). Every grow and shrink
 is charged at 1.25 times the bytes asked on the query, tenant and process
 budgets, so a query's peak intermediate bytes and its ceiling checks read
-the charged figure. While a stream builds, until its first shrink, the
-process budget also reserves an envelope for its next doubling: 2.43 times
-its asked size while that is under 8 MiB, else the smaller of that and 5
-times its largest single grow. Only the largest `min(available parallelism,
-SQL partition count)` envelopes on a budget are reserved, and none is in a
-query or tenant figure; `ravel_sql::sql_memory_aggregate_envelope_bytes()`
-returns the bytes they hold across the process, and no metric renders it
-yet. A grow whose envelope the process budget cannot hold is refused with
-`ResourcesExhausted` before it is charged. `AggregateReserveAhead::OFF`
-charges every consumer one to one. ADR-1170's reserve-ahead amendment has
+the charged figure. The pool can also reserve, on the process budget alone,
+an envelope for a building stream's next doubling, and that envelope is off
+by default (`AggregateReserveAhead::DEFAULT` sets both envelope terms to 0)
+until it is sized from each stream's layout (issue #3181).
+`AggregateReserveAhead::WITH_ENVELOPE` turns it on: while a stream builds,
+until its first shrink, the envelope is 2.43 times its asked size while that
+is under 8 MiB, else the smaller of that and 5 times its largest single
+grow. Only the largest `min(available parallelism, SQL partition count)`
+envelopes on a budget are reserved, and none is in a query or tenant figure;
+`ravel_sql::sql_memory_aggregate_envelope_bytes()` returns the bytes they
+hold across the process (0 under the default), and no metric renders it
+yet. With the envelope on, a grow whose envelope the process budget cannot
+hold is refused with `ResourcesExhausted` before it is charged.
+`AggregateReserveAhead::OFF` charges every consumer one to one. ADR-1170's reserve-ahead amendment has
 the derivation; `crates/ravel-sql/tests/group_by_reservation_lag.rs`
 measures what live memory still leads the charge by, before a stream's
 first reservation and while it emits.
