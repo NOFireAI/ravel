@@ -2100,6 +2100,10 @@ fi
 # stat="resident" 3 GiB above allocated and a budget gauge, which the band
 # must ignore. "bad" is a gated scrape answered with HTTP 503, and
 # {"ungated": [...]} is that list's ok scrape taken with the gate down.
+# {"tiered": [allocated, fetch_ram, fetch_disk, catalog_ram, catalog_disk,
+# reserved_sql, reserved_fetch, handoff_overlap]} is an ok scrape of a server
+# with a disk tier: no untiered cache series, each cache term a tier="ram" or
+# tier="disk" series, a null term leaving that series out.
 cat >"$TMP/gap_arm.py" <<'PY'
 import io, json, os, shutil, sys, tarfile
 src, dst, arm, rounds = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
@@ -2112,6 +2116,11 @@ SERIES = ['ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="a
           'ravel_memory_reserved_bytes{mode="all",component="fetch"}',
           'ravel_memory_handoff_overlap_bytes{mode="all"}']
 RESIDENT = 'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="resident"}'
+TIERED = ['ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}',
+          'ravel_cache_resident_bytes{mode="all",cache="fetch",tier="ram"}',
+          'ravel_cache_resident_bytes{mode="all",cache="fetch",tier="disk"}',
+          'ravel_cache_resident_bytes{mode="all",cache="catalog",tier="ram"}',
+          'ravel_cache_resident_bytes{mode="all",cache="catalog",tier="disk"}'] + SERIES[3:]
 if src != dst:
     shutil.rmtree(dst, ignore_errors=True)
     shutil.copytree(src, dst)
@@ -2141,7 +2150,10 @@ with tarfile.open(tgz, "w:gz") as t:
         lines = []
         for i, s in enumerate(scrapes):
             rec = {"t": 1000.0 + i, "gated": True, "gen": 1}
-            if isinstance(s, dict):
+            names = SERIES
+            if isinstance(s, dict) and "tiered" in s:
+                names, s = TIERED, s["tiered"]
+            elif isinstance(s, dict):
                 rec.update(gated=False, gen=None)
                 s = s["ungated"]
             if s is None:
@@ -2149,7 +2161,7 @@ with tarfile.open(tgz, "w:gz") as t:
             elif s == "bad":
                 rec.update(answered=True, ok=False, status=503, error="HTTP 503")
             else:
-                mem = dict((k, v * GIB) for k, v in zip(SERIES, s) if v is not None)
+                mem = dict((k, v * GIB) for k, v in zip(names, s) if v is not None)
                 mem[RESIDENT] = (s[0] + 3) * GIB
                 mem['ravel_memory_budget_bytes{mode="all"}'] = 24.0 * GIB
                 rec.update(answered=True, ok=True, status=200, error="", heartbeat_s=0.2,
@@ -3235,6 +3247,51 @@ if [ "$code" = 2 ] \
   pass "an ok scrape missing the handoff overlap gauge exits 2 naming round, line and series"
 else
   fail "gap missing gauge" "exit $code: $(tail -n 2 "$TMP/fetch-gapmiss.err")"
+fi
+
+# A server given --cache-dir exposes each cache family as tier="ram" and
+# tier="disk" series and no untiered one. In GiB, gap = allocated - fetch ram
+# - catalog ram - reserved_sql - reserved_fetch + handoff_overlap:
+#   10-4-1-2-1+0.5 = 2.5 (above 2, the max, 2,684,354,560); 6-2-0.5-1-1+0.25 = 1.75;
+#   1 of 2 above, 50.0 %. With the 50 and 30 GiB fetch disk tiers or the 20
+#   and 10 GiB catalog disk tiers subtracted every gap is negative, 0 above.
+# Catches: a tiered scrape refused as missing its cache series (exit 2), or
+# disk-tier bytes read into the gap.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gaptier-b" B '[[{"tiered":[10,4,50,1,20,2,1,0.5]},{"tiered":[6,2,30,0.5,10,1,1,0.25]}]]'
+fixture run-gaptier "$TMP/fixture-pass" "$TMP/fixture-gaptier-b"
+fetch gaptier run-gaptier --timeout 30
+if [ "$code" = 1 ] \
+  && grep -qx 'MISS         B        adr1170 gap round 1 share > 2147483648         0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,684,354,560; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gaptier.out" \
+  && grep -qx 'MISS         B        adr1170 gap pooled share > 2147483648          0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,684,354,560; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gaptier.out"; then
+  pass "a tiered cache's gap reads the tier=\"ram\" series and ignores tier=\"disk\""
+else
+  fail "gap tiered cache" "exit $code: $(grep 'adr1170' "$TMP/fetch-gaptier.out") $(tail -n 2 "$TMP/fetch-gaptier.err")"
+fi
+
+# A family with only a disk tier holds no RAM bytes: its term is 0. In GiB,
+# 2.5-1-0-0-0+0 = 1.5 = 1,610,612,736, under the bar. Catches: a disk-only
+# family refused as missing, or its 8 GiB disk tier subtracted.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapdisk-b" B '[[{"tiered":[2.5,1,5,null,8,0,0,0]}]]'
+fixture run-gapdisk "$TMP/fixture-pass" "$TMP/fixture-gapdisk-b"
+fetch gapdisk run-gapdisk --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,610,612,736; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapdisk.out"; then
+  pass "a cache family with only a disk tier counts 0 in the gap"
+else
+  fail "gap disk-only family" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapdisk.out") $(tail -n 2 "$TMP/fetch-gapdisk.err")"
+fi
+
+# Catches: a family with no cache series in any tier read as 0 instead of
+# refused, which drops a term from the gap without saying so.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapnocache-b" B '[[[1,0,null,0,0,0]]]'
+fixture run-gapnocache "$TMP/fixture-pass" "$TMP/fixture-gapnocache-b"
+fetch gapnocache run-gapnocache --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl:1 is an ok scrape missing ravel_cache_resident_bytes{mode="all",cache="catalog"} (no untiered, tier="ram" or tier="disk" series)' "$TMP/fetch-gapnocache.err" \
+  && ! grep -q 'adr1170 gap round' "$TMP/fetch-gapnocache.out"; then
+  pass "a cache family with no series in any tier exits 2 naming it"
+else
+  fail "gap no cache series" "exit $code: $(tail -n 2 "$TMP/fetch-gapnocache.err")"
 fi
 
 # Catches: a round with no ok gated scrape passing as 0 % above.

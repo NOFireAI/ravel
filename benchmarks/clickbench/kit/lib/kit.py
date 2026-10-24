@@ -1545,26 +1545,55 @@ def healthz_relative(rel, a, b):
 
 # ADR-1170's gap between the allocator's allocated bytes and the unique
 # tracked bytes (decisions 3 and 4), each term a series as metrics.jsonl
-# records it and its sign in the gap.
+# records it and its sign in the gap. A cache term names a family in
+# GAP_CACHES, read by _cache_ram.
 GAP_TERMS = (
     ('ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}', 1),
-    ('ravel_cache_resident_bytes{mode="all",cache="fetch"}', -1),
-    ('ravel_cache_resident_bytes{mode="all",cache="catalog"}', -1),
+    ("fetch", -1),
+    ("catalog", -1),
     ('ravel_memory_reserved_bytes{mode="all",component="sql"}', -1),
     ('ravel_memory_reserved_bytes{mode="all",component="fetch"}', -1),
     ('ravel_memory_handoff_overlap_bytes{mode="all"}', 1),
 )
+GAP_CACHES = ("fetch", "catalog")
 GAP_KEYS = ("adr1170_gap_max_bytes", "adr1170_gap_share_above_max")
+
+
+def _cache_ram(memory, cache):
+    """The RAM-resident bytes of cache family CACHE, else None. A server
+    with a disk tier (--cache-dir) labels the RAM sample tier="ram" and emits
+    no untiered one; a family with only a disk tier holds no RAM bytes, and
+    disk-tier bytes are not heap, so they never enter the gap."""
+    base = 'ravel_cache_resident_bytes{mode="all",cache="%s"' % cache
+    for series in (base + "}", base + ',tier="ram"}'):
+        if _num(memory.get(series)):
+            return memory[series]
+    if _num(memory.get(base + ',tier="disk"}')):
+        return 0.0
+    return None
 
 
 def scrape_gap(memory):
     """allocated - cache_fetch - cache_catalog - reserved_sql - reserved_fetch
-    + handoff_overlap, or the list of GAP_TERMS series MEMORY lacks."""
+    + handoff_overlap, or the list of GAP_TERMS terms MEMORY lacks."""
     memory = memory if isinstance(memory, dict) else {}
-    missing = [s for s, _ in GAP_TERMS if not _num(memory.get(s))]
+    values, missing = [], []
+    for term, sign in GAP_TERMS:
+        if term in GAP_CACHES:
+            v = _cache_ram(memory, term)
+            if v is None:
+                missing.append('ravel_cache_resident_bytes{mode="all",cache="%s"} '
+                               '(no untiered, tier="ram" or tier="disk" series)' % term)
+        else:
+            v = memory.get(term)
+            if not _num(v):
+                v = None
+                missing.append(term)
+        if v is not None:
+            values.append(sign * v)
     if missing:
         return None, missing
-    return sum(sign * memory[s] for s, sign in GAP_TERMS), []
+    return sum(values), []
 
 
 def memory_gap_rounds(tgz, rounds, bar):
