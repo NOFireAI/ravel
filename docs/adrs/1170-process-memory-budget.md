@@ -1406,7 +1406,9 @@ unchanged. The held bytes are released when the consumer unregisters, as
 the legacy hold's are, so cancellation still returns every byte; until then
 the budgets can read above what is live by at most the stream's own peak
 reservation. A consumer that can spill is not held, for the reason
-ADR-0102's aggregate hold amendment gives.
+ADR-0102's aggregate hold amendment gives. The ordered and partial-reduce
+amendment below says why the ordered partial and partial-reduce streams,
+which also shrink to zero, are not selected.
 
 The unit tests in `crates/ravel-sql/src/memory.rs`
 (`a_final_aggregate_shrink_to_zero_is_held_until_it_unregisters`,
@@ -1433,6 +1435,8 @@ ledger. In `crates/ravel-sql/tests/group_by_reservation_lag.rs` the
 figure by 84.6-94.7 MiB in five runs on DataFusion 54.1, and led reserved
 plus envelope by 5.8-12.2 MiB in three runs on DataFusion 55.2 with the
 factor and the envelope on (`AggregateReserveAhead::WITH_ENVELOPE`).
+(The layout envelope amendment below removes `WITH_ENVELOPE`, sizes the
+envelope from the plan's layout and turns it on in the default.)
 
 For consumers named `PartialHashAggregateStream[..]`,
 `FinalHashAggregateStream[..]` or `SingleHashAggregateStream[..]`, the pool
@@ -1450,6 +1454,7 @@ now forwards two things that differ from decision 1
   until the envelope is sized from each stream's layout (#3181; at
   multiplier 5 and 32 partitions a ClickBench q33 run would be charged about
   21.1 GB against an 18.3 GB process remainder and refused).
+  (The layout envelope amendment below replaces the two sentences around this one.)
   `AggregateReserveAhead::WITH_ENVELOPE` carries the designed envelope: `envelope_size_factor x S` (2.43) while its
   asked size `S` is under 8 MiB, else the smaller of that and
   `envelope_multiplier x J_max` (5), where `J_max` is its largest
@@ -1476,7 +1481,7 @@ forwarded as before.
 
 The unit tests in `crates/ravel-sql/src/memory.rs` pin the arithmetic and
 the ledgers: `the_default_charges_the_factor_and_no_envelope` for the
-default, and, under `WITH_ENVELOPE`,
+default, and, under `WITH_ENVELOPE` (renamed and re-pinned by the layout envelope amendment below),
 `the_envelope_is_five_times_the_largest_step_and_covers_both_doublings`,
 `a_consumer_under_eight_mebibytes_carries_the_size_bound`,
 `only_the_w_largest_envelopes_in_the_process_are_on_the_budget`,
@@ -1485,5 +1490,71 @@ default, and, under `WITH_ENVELOPE`,
 `a_pool_dropped_mid_build_releases_its_envelopes`; and
 `the_opt_out_charges_every_consumer_one_to_one`. The ignored matrix in
 `crates/ravel-sql/tests/group_by_reservation_lag.rs` runs under
-`WITH_ENVELOPE` and measures what is left:
+`WITH_ENVELOPE` (the default, since the layout envelope amendment below) and measures what is left:
 the gap between live bytes and the pool's reserved figure plus the envelope.
+
+## Amendment (2026-10-24, #3181): the ordered partial and partial-reduce streams are outside the last-release hold
+
+<!-- amendment-applies: sections="Amendment (2026-10-23, #3181): the migrated final and single-stage streams' last release is held" pointer="ordered and partial-reduce amendment" -->
+
+The last-release hold selects the final and single-stage streams only.
+`OrderedPartialAggregateStream` also drops its table and resizes to zero
+before it emits its last batch, and is not held because its state is
+bounded to the groups still open under the input order and its output feeds
+an exchange that reserves what it buffers. `PartialReduceHashAggregateStream`
+also resizes to zero, and is not held because it never runs under Ravel:
+`should_use_partial_reduce_hash_stream` (`datafusion-physical-plan` 55.2,
+`aggregates/mod.rs`) returns false for any pool whose `memory_limit` is
+`MemoryLimit::Finite`, which `TenantDelegatingPool` always reports.
+
+## Amendment (2026-10-24, #3181): the aggregate envelope is sized from the plan's layout and on by default
+
+<!-- amendment-applies: sections="Amendment (2026-10-23, #3181): the migrated aggregate streams are charged ahead of what they ask for" pointer="layout envelope amendment" -->
+<!-- amendment-supersedes: phrase="WITH_ENVELOPE" pointer="layout envelope amendment" -->
+
+The reserve-ahead amendment's envelope was `5 x J_max`, which charged a
+ClickBench q33 run at 32 partitions about 21.1 GB against an 18.3 GB process
+remainder, so it shipped off by default. It is now sized from each stream's
+layout and `AggregateReserveAhead::DEFAULT` carries it (factor 1.25, table
+multipliers 5.0 and 4.9, `Vec` multiplier 2.1, size factor 2.43, unknown
+layout multiplier 5.0). The `WITH_ENVELOPE` constant is removed;
+`AggregateReserveAhead::OFF` still forwards every consumer one to one with
+no envelope.
+
+`install_aggregate_profile` in `crates/ravel-sql/src/executor.rs` calls
+`plan_aggregate_profile` on the physical plan and sets the result on the
+query's `TenantDelegatingPool` before the plan executes. A profile is either
+a layout, `(entry_size, W, w_max)`, or Unknown. `entry_size` is the group
+table's bytes per bucket: 16 for primitive and multi-column keys, 32 for a
+single string-view key. `W` is the per-group bytes of every structure that
+grows with the group count (the key column, its views, each accumulator
+state), and `w_max` the widest single one. A plan with several aggregates
+takes Unknown if any is Unknown, else the layout with the largest
+`w_max / W`. A group-values or accumulator type the derivation does not
+recognise is Unknown.
+
+Each grow is matched against its own size, within 3%, to a table step
+`7/8 x 2^k x entry_size` or a `Vec` step `2^k x W`; the pool keeps the
+largest of each, `J_t` and `J_v`. A building stream's envelope, at asked size
+`S`, is `2.43 x S` while `S` is under 8 MiB, else
+`min(2.43 x S, max(m_t x J_t, 2.1 x J_v x (1 + w_max / W)))`, with `m_t`
+5.0 for 16-byte entries and 4.9 for 32-byte ones. The table term covers a
+rehash with the old table live; the `Vec` term covers every state `Vec`
+reallocating once with the widest still in flight. A stream with an Unknown
+profile, no profile, or no matched step falls back to `5 x J_max`. Which
+envelopes are reserved is unchanged: the largest
+`min(available_parallelism, SQL partition count)` in the process.
+
+The unit tests in `crates/ravel-sql/src/memory.rs` pin the arithmetic:
+`the_q33_series_classify_to_two_chains_and_the_envelope_is_the_larger_next_block`,
+`an_unknown_profile_falls_back_to_five_times_the_largest_step`,
+`a_delta_that_matches_both_ladders_takes_the_larger_multiplier`,
+`a_delta_off_both_ladders_by_more_than_three_percent_is_not_a_step`,
+`the_default_charges_the_factor_and_carries_the_envelope` and
+`a_reserve_ahead_with_no_envelope_terms_charges_the_factor_alone`; the tests
+listed in the reserve-ahead amendment now run under the default.
+`the_aggregate_profile_of_the_six_measured_statements` in
+`crates/ravel-sql/src/executor.rs` pins the profile derived from six
+ClickBench statements' plans. The ignored matrix in
+`crates/ravel-sql/tests/group_by_reservation_lag.rs` sets the derived
+profile the same way and samples every row at 1 ms.

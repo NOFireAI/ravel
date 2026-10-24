@@ -1498,7 +1498,11 @@ the last slice, which still points into the output buffers. For a final or
 single-stage stream that cannot spill, the pool holds that last release on
 the query, tenant and process budgets until the stream's consumer unregisters;
 every other shrink of a migrated stream is forwarded at once
-(`crates/ravel-sql/tests/aggregate_emit_reservation.rs`).
+(`crates/ravel-sql/tests/aggregate_emit_reservation.rs`). The ordered partial
+stream also resizes to zero before its last batch and is not held: its state
+covers only the groups still open under the input order, and an exchange
+reserves what it buffers of the output. The partial-reduce stream never runs
+here, because DataFusion skips it under a pool that reports a finite limit.
 
 The migrated streams grow their reservation only after `aggregate_batch` has
 grown the group table and the accumulator `Vec`s, and ask for less than
@@ -1508,23 +1512,40 @@ those allocations hold, so the pool charges a consumer named
 (`SqlConfig::aggregate_reserve_ahead`, issue #3181). Every grow and shrink
 is charged at 1.25 times the bytes asked on the query, tenant and process
 budgets, so a query's peak intermediate bytes and its ceiling checks read
-the charged figure. The pool can also reserve, on the process budget alone,
-an envelope for a building stream's next doubling, and that envelope is off
-by default (`AggregateReserveAhead::DEFAULT` sets both envelope terms to 0)
-until it is sized from each stream's layout (issue #3181).
-`AggregateReserveAhead::WITH_ENVELOPE` turns it on: while a stream builds,
-until its first shrink, the envelope is 2.43 times its asked size while that
-is under 8 MiB, else the smaller of that and 5 times its largest single
-grow. Only the largest `min(available parallelism, SQL partition count)`
-envelopes on a budget are reserved, and none is in a query or tenant figure;
-`ravel_sql::sql_memory_aggregate_envelope_bytes()` returns the bytes they
-hold across the process (0 under the default), and no metric renders it
-yet. With the envelope on, a grow whose envelope the process budget cannot
-hold is refused with `ResourcesExhausted` before it is charged.
-`AggregateReserveAhead::OFF` charges every consumer one to one. ADR-1170's reserve-ahead amendment has
-the derivation; `crates/ravel-sql/tests/group_by_reservation_lag.rs`
-measures what live memory still leads the charge by, before a stream's
-first reservation and while it emits.
+the charged figure. The pool also reserves, on the process budget alone, an
+envelope for a building stream's next step, sized from the query's
+aggregate layout. Before the plan executes, the executor derives an
+`AggregateProfile` from its grouped `AggregateExec` nodes
+(`ravel_sql::plan_aggregate_profile`) and sets it on the pool: the group
+table's entry size (16 bytes for a primitive or multi-column key, 32 for a
+single `Utf8View`/`BinaryView` key), `W`, the per-group bytes of every `Vec`
+that grows with the group count (key columns and accumulator state: 8 for
+`COUNT`, `SUM` and primitive `MIN`/`MAX`, 24 for Ravel's exact `AVG`, 16
+for DataFusion's float `AVG`), and `w_max`, the widest of them. Any other
+key or accumulator (a single `Utf8` or `Boolean` key, a row-format key, a
+`DISTINCT` aggregate, an accumulator without a groups form) makes the
+profile `Unknown`, and across several aggregates `Unknown` wins, else the
+largest `w_max / W`. Each grow is matched on its own size, within 3%, to
+the predicted table steps `7/8 x 2^k x entry_size` and `Vec` steps
+`2^k x W`; a match records the stream's last table step `J_t` or `Vec`
+step `J_v` (both, when it matches both), and a grow off both is per-batch
+growth. While a stream builds, until its first shrink, the envelope is 2.43
+times its asked size while that is under 8 MiB, else the smaller of that
+and the larger of `5.0 x J_t` (4.9 for 32-byte entries) and
+`2.1 x J_v x (1 + w_max / W)`. Under an `Unknown` profile, with no profile,
+or before the stream has made a step of either ladder, the second term is 5
+times its largest single grow. Only the largest `min(available parallelism,
+SQL partition count)` envelopes on a budget are reserved, and none is in a
+query or tenant figure; `ravel_sql::sql_memory_aggregate_envelope_bytes()`
+returns the bytes they hold across the process, and no metric renders it
+yet. A grow whose envelope the process budget cannot hold is refused with
+`ResourcesExhausted` before it is charged. `AggregateReserveAhead::DEFAULT`
+carries the factor and the envelope; `AggregateReserveAhead::OFF` charges
+every consumer one to one with no envelope. ADR-1170's reserve-ahead
+amendments have the derivation;
+`crates/ravel-sql/tests/group_by_reservation_lag.rs` measures what live
+memory still leads the charge by, before a stream's first reservation and
+while it emits.
 
 Those slices share the materialized batch's buffers, and
 `RecordBatch::get_array_memory_size` reports every buffer an array
