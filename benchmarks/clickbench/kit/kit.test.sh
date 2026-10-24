@@ -2098,7 +2098,8 @@ fi
 # cache_fetch, cache_catalog, reserved_sql, reserved_fetch, handoff_overlap] in
 # GiB, a null term leaving that gauge out. Each answered scrape also carries
 # stat="resident" 3 GiB above allocated and a budget gauge, which the band
-# must ignore.
+# must ignore. "bad" is a gated scrape answered with HTTP 503, and
+# {"ungated": [...]} is that list's ok scrape taken with the gate down.
 cat >"$TMP/gap_arm.py" <<'PY'
 import io, json, os, shutil, sys, tarfile
 src, dst, arm, rounds = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
@@ -2140,8 +2141,13 @@ with tarfile.open(tgz, "w:gz") as t:
         lines = []
         for i, s in enumerate(scrapes):
             rec = {"t": 1000.0 + i, "gated": True, "gen": 1}
+            if isinstance(s, dict):
+                rec.update(gated=False, gen=None)
+                s = s["ungated"]
             if s is None:
                 rec.update(answered=False, ok=False, status=0, error="URLError: refused")
+            elif s == "bad":
+                rec.update(answered=True, ok=False, status=503, error="HTTP 503")
             else:
                 mem = dict((k, v * GIB) for k, v in zip(SERIES, s) if v is not None)
                 mem[RESIDENT] = (s[0] + 3) * GIB
@@ -3206,9 +3212,9 @@ gap_arm "$TMP/fixture-pass" "$TMP/fixture-gap-b" B "$GAP_ROUNDS"
 fixture run-gap "$TMP/fixture-pass" "$TMP/fixture-gap-b"
 fetch gap run-gap --timeout 30
 if [ "$code" = 1 ] \
-  && grep -qx 'MISS         B        adr1170 gap round 1 share > 2147483648         0.500          0.000          50.0 % of 4 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered skipped)' "$TMP/fetch-gap.out" \
-  && grep -qx 'MISS         B        adr1170 gap round 2 share > 2147483648         0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,550,136,832; 0 unanswered skipped)' "$TMP/fetch-gap.out" \
-  && grep -qx 'MISS         B        adr1170 gap pooled share > 2147483648          0.500          0.000          50.0 % of 6 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'MISS         B        adr1170 gap round 1 share > 2147483648         0.500          0.000          50.0 % of 4 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'MISS         B        adr1170 gap round 2 share > 2147483648         0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,550,136,832; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'MISS         B        adr1170 gap pooled share > 2147483648          0.500          0.000          50.0 % of 6 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gap.out" \
   && grep -qx 'adr1170 gap A (context, not judged): no concurrent phase ran' "$TMP/fetch-gap.out" \
   && [ "$(grep -c 'adr1170 gap' "$TMP/fetch-gap.out")" = 4 ] \
   && grep -q '^fetch: at least one band MISSED' "$TMP/fetch-gap.err"; then
@@ -3217,30 +3223,70 @@ else
   fail "gap_band_reads_the_same_figure_as_the_hand_computation" "exit $code: $(grep 'adr1170' "$TMP/fetch-gap.out") $(tail -n 2 "$TMP/fetch-gap.err")"
 fi
 
-# Catches: an answered scrape missing a gauge skipped or read as zero, which
+# Catches: an ok scrape missing a gauge skipped or read as zero, which
 # shrinks the gap, instead of refusing with exit 2 naming round, line and series.
 gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapmiss-b" B '[[[1,0,0,0,0,0],null,[1,0,0,0,0,null]]]'
 fixture run-gapmiss "$TMP/fixture-pass" "$TMP/fixture-gapmiss-b"
 fetch gapmiss run-gapmiss --timeout 30
 if [ "$code" = 2 ] \
   && grep -qF 'kit: adr1170 gap: round 1: ' "$TMP/fetch-gapmiss.err" \
-  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl:3 is an answered scrape missing ravel_memory_handoff_overlap_bytes{mode="all"}' "$TMP/fetch-gapmiss.err" \
+  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl:3 is an ok scrape missing ravel_memory_handoff_overlap_bytes{mode="all"}' "$TMP/fetch-gapmiss.err" \
   && ! grep -q 'adr1170 gap round' "$TMP/fetch-gapmiss.out"; then
-  pass "an answered scrape missing the handoff overlap gauge exits 2 naming round, line and series"
+  pass "an ok scrape missing the handoff overlap gauge exits 2 naming round, line and series"
 else
   fail "gap missing gauge" "exit $code: $(tail -n 2 "$TMP/fetch-gapmiss.err")"
 fi
 
-# Catches: a round with no answered scrape passing as 0 % above.
+# Catches: a round with no ok gated scrape passing as 0 % above.
 gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapnone-b" B '[[[1,0,0,0,0,0]],[null,null]]'
 fixture run-gapnone "$TMP/fixture-pass" "$TMP/fixture-gapnone-b"
 fetch gapnone run-gapnone --timeout 30
 if [ "$code" = 2 ] \
   && grep -qF 'kit: adr1170 gap: round 2: ' "$TMP/fetch-gapnone.err" \
-  && grep -qF 'out/concurrent/round-2/healthz/metrics.jsonl holds no answered scrape (2 unanswered)' "$TMP/fetch-gapnone.err"; then
-  pass "a round with no answered scrape exits 2 naming the round"
+  && grep -qF 'out/concurrent/round-2/healthz/metrics.jsonl holds no ok gated scrape (2 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapnone.err"; then
+  pass "a round with no ok gated scrape exits 2 naming the round"
 else
   fail "gap empty round" "exit $code: $(tail -n 2 "$TMP/fetch-gapnone.err")"
+fi
+
+# Catches: a scrape taken with the gate down (a just-started server, before
+# the timed window) judged: its 10 GiB gap would set the max and its count the
+# share's denominator. Judged alone, the gated 1 GiB scrape passes.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapungated-b" B '[[[1,0,0,0,0,0],{"ungated":[10,0,0,0,0,0]}]]'
+fixture run-gapungated "$TMP/fixture-pass" "$TMP/fixture-gapungated-b"
+fetch gapungated run-gapungated --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 1 ungated, 0 bad skipped)' "$TMP/fetch-gapungated.out" \
+  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 1 ungated, 0 bad skipped)' "$TMP/fetch-gapungated.out"; then
+  pass "an ungated scrape is skipped and counted, not judged"
+else
+  fail "gap ungated" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapungated.out") $(tail -n 2 "$TMP/fetch-gapungated.err")"
+fi
+
+# Catches: one gated scrape answered with HTTP 503 read as missing all six
+# gauges, refusing the run, instead of counted as bad beside the ok scrape.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapbad-b" B '[[[1,0,0,0,0,0],"bad"]]'
+fixture run-gapbad "$TMP/fixture-pass" "$TMP/fixture-gapbad-b"
+fetch gapbad run-gapbad --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 0 ungated, 1 bad skipped)' "$TMP/fetch-gapbad.out" \
+  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,073,741,824; 0 unanswered, 0 ungated, 1 bad skipped)' "$TMP/fetch-gapbad.out"; then
+  pass "a gated scrape answered with a non-200 is counted as bad, not a refusal"
+else
+  fail "gap bad scrape" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapbad.out") $(tail -n 2 "$TMP/fetch-gapbad.err")"
+fi
+
+# Catches: a round whose every answered gated scrape is bad (and whose only ok
+# scrape is ungated) passing as 0 % above instead of refusing.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapallbad-b" B '[["bad",null,"bad",{"ungated":[1,0,0,0,0,0]}]]'
+fixture run-gapallbad "$TMP/fixture-pass" "$TMP/fixture-gapallbad-b"
+fetch gapallbad run-gapallbad --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'kit: adr1170 gap: round 1: ' "$TMP/fetch-gapallbad.err" \
+  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl holds no ok gated scrape (1 unanswered, 1 ungated, 2 bad skipped)' "$TMP/fetch-gapallbad.err"; then
+  pass "a round whose answered gated scrapes are all bad exits 2 naming the round"
+else
+  fail "gap all bad" "exit $code: $(tail -n 2 "$TMP/fetch-gapallbad.err")"
 fi
 
 # Catches: a B gap under the bar on every scrape missing, or the bar compared
@@ -3249,9 +3295,9 @@ gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapok-b" B '[[[3,0.5,0.25,0.25,0.5,0.2
 fixture run-gapok "$TMP/fixture-pass" "$TMP/fixture-gapok-b"
 fetch gapok run-gapok --timeout 30
 if [ "$code" = 0 ] \
-  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 2 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered skipped)' "$TMP/fetch-gapok.out" \
-  && grep -qx 'PASS         B        adr1170 gap round 2 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,610,612,736; 0 unanswered skipped)' "$TMP/fetch-gapok.out" \
-  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 3 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered skipped)' "$TMP/fetch-gapok.out"; then
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 2 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapok.out" \
+  && grep -qx 'PASS         B        adr1170 gap round 2 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,610,612,736; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapok.out" \
+  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 3 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapok.out"; then
   pass "a B gap under the bar on every scrape passes per round and pooled"
 else
   fail "gap pass" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapok.out") $(tail -n 2 "$TMP/fetch-gapok.err")"
@@ -3294,9 +3340,9 @@ gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapover-a" A '[[[8,1,0.5,0.5,0.5,0],[7
 fixture run-gapover "$TMP/fixture-gapover-a" "$TMP/fixture-gapok-b"
 fetch gapover run-gapover --timeout 30
 if [ "$code" = 0 ] \
-  && grep -qx 'adr1170 gap A round 1 (context, not judged): 100.0 % of 2 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered skipped)' "$TMP/fetch-gapover.out" \
-  && grep -qx 'adr1170 gap A round 2 (context, not judged): 100.0 % of 1 scrapes > 2147483648 (max 4,294,967,296; 0 unanswered skipped)' "$TMP/fetch-gapover.out" \
-  && grep -qx 'adr1170 gap A pooled (context, not judged): 100.0 % of 3 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered skipped)' "$TMP/fetch-gapover.out" \
+  && grep -qx 'adr1170 gap A round 1 (context, not judged): 100.0 % of 2 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapover.out" \
+  && grep -qx 'adr1170 gap A round 2 (context, not judged): 100.0 % of 1 scrapes > 2147483648 (max 4,294,967,296; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapover.out" \
+  && grep -qx 'adr1170 gap A pooled (context, not judged): 100.0 % of 3 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered, 0 ungated, 0 bad skipped)' "$TMP/fetch-gapover.out" \
   && grep -q '^PASS  *B  *adr1170 gap pooled share > 2147483648 ' "$TMP/fetch-gapover.out" \
   && ! grep -q '^MISS' "$TMP/fetch-gapover.out"; then
   pass "arm A over the gap bar is printed as context and never judged while B passes"
@@ -3324,7 +3370,7 @@ fi
 
 # Catches: the band not reading the sampler's own metrics.jsonl: the share
 # run's boxes scraped the stub server, whose gap is 1000-100-50-7-20+5 = 828.
-if grep -q '^PASS  *B  *adr1170 gap round 1 share > 2147483648  *0.000  *0.000  *0.0 % of [0-9]* scrapes > 2147483648 (max 828; 0 unanswered skipped)$' "$TMP/fetch-share.out" \
+if grep -q '^PASS  *B  *adr1170 gap round 1 share > 2147483648  *0.000  *0.000  *0.0 % of [0-9]* scrapes > 2147483648 (max 828; 0 unanswered, [0-9]* ungated, 0 bad skipped)$' "$TMP/fetch-share.out" \
   && grep -q '^adr1170 gap A round 1 (context, not judged): 0.0 % of [0-9]* scrapes > 2147483648 (max 828; ' "$TMP/fetch-share.out"; then
   pass "the gap band reads the box sampler's own concurrent scrapes"
 else
