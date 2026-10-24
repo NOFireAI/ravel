@@ -11608,8 +11608,8 @@ pub(crate) mod tests {
     /// reads exactly the sum of those lengths. No leaf-build GET reads a whole
     /// object.
     ///
-    /// Fixture figures (pinned below): objects of 22,326, 22,343 and 22,326
-    /// bytes (66,995 in all), KEY_IDX sections of 2,912 bytes each (8,736,
+    /// Fixture figures (pinned below): objects of 22,330, 22,347 and 22,330
+    /// bytes (67,007 in all), KEY_IDX sections of 2,912 bytes each (8,736,
     /// 13.0% of the object bytes), 33,312 bytes read by the build (3 x 8,192
     /// suffix plus the sections). The ratio is a property of this synthetic
     /// geometry (64 distinct I64 values in 64 rows per object, so the
@@ -11670,9 +11670,9 @@ pub(crate) mod tests {
         // The fixture geometry the doc comment states.
         let sizes: Vec<u64> = objects.iter().map(|(_, size, _)| *size).collect();
         let sections: Vec<u64> = objects.iter().map(|(_, _, s)| s.len).collect();
-        assert_eq!(sizes, vec![22_326, 22_343, 22_326]);
+        assert_eq!(sizes, vec![22_330, 22_347, 22_330]);
         assert_eq!(sections, vec![2_912, 2_912, 2_912]);
-        assert_eq!((object_bytes, section_bytes), (66_995, 8_736));
+        assert_eq!((object_bytes, section_bytes), (67_007, 8_736));
         assert_eq!(expected_bytes, 33_312);
         assert!(sizes.iter().all(|size| *size > KEY_INDEX_FOOTER_SUFFIX_LEN));
     }
