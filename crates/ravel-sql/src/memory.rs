@@ -68,10 +68,12 @@
 //! stream two ladders of predicted grows: group-table steps of
 //! `7/8 x 2^k x entry_size` and `Vec` steps of `2^k x W`, `W` the per-group
 //! bytes of every `Vec` that grows with the group count. Each grow is
-//! matched on its own size to the nearest predicted step of each ladder: one
-//! within 3% becomes the last table step `J_t` or the last `Vec` step `J_v`
-//! (both, when it matches both), and one off both is per-batch growth that
-//! moves neither. The next step is then the larger of
+//! matched on its own size to the nearest predicted step of each ladder: the
+//! largest grow within 3% of a table step is `J_t` and of a `Vec` step `J_v`
+//! (a grow can count for both), and one off both is per-batch growth that
+//! moves neither. Largest, not last: the groups only grow while a stream
+//! builds, so a per-batch grow that lands on a low rung is not its next step.
+//! The next step is then the larger of
 //! `table_multiplier x J_t` (5.0 for 16-byte entries, 4.9 for 32-byte
 //! entries) and `vec_multiplier x J_v x (1 + w_max / W)` (2.1), `w_max` the
 //! widest `Vec`'s per-group bytes. Under [`AggregateProfile::Unknown`], with
@@ -89,11 +91,13 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use datafusion::arrow::datatypes::DataType;
+use datafusion::config::ConfigOptions;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
+use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::AggregateExec;
 use ravel_memory::{ExhaustionCause, MemoryBudget, MemoryExhausted};
@@ -422,12 +426,12 @@ pub struct AggregateReserveAhead {
     /// Multiplier on every grow and shrink a migrated aggregate asks for,
     /// applied on the query, tenant and process ledgers.
     pub undercount_factor: f64,
-    /// Multiplier on the last group-table step of a stream whose table has
+    /// Multiplier on the largest group-table step of a stream whose table has
     /// 16-byte entries: its next table step, once it has asked for 8 MiB.
     pub table_multiplier_16_byte_entries: f64,
     /// The same for a stream whose table has 32-byte entries.
     pub table_multiplier_32_byte_entries: f64,
-    /// Multiplier on the last `Vec` step, before the `1 + w_max / W` term for
+    /// Multiplier on the largest `Vec` step, before the `1 + w_max / W` term for
     /// the widest `Vec` moving last: its next `Vec` step.
     pub vec_multiplier: f64,
     /// Multiplier on a building consumer's asked size: its envelope while it
@@ -596,6 +600,58 @@ impl AggregateLayout {
     /// The bytes a `Vec` step to `2^k` groups asks for.
     fn vec_step(&self, k: i32) -> f64 {
         2f64.powi(k) * self.vec_width_total as f64
+    }
+}
+
+/// Set the aggregate layout of `plan` on `pool`. A plan with no grouped
+/// aggregate sets nothing, and neither does a pool that is not a
+/// [`TenantDelegatingPool`].
+pub(crate) fn install_aggregate_profile(plan: &Arc<dyn ExecutionPlan>, pool: &Arc<dyn MemoryPool>) {
+    if let Some(pool) = pool.downcast_ref::<TenantDelegatingPool>()
+        && let Some(profile) = plan_aggregate_profile(plan)
+    {
+        pool.set_aggregate_profile(profile);
+    }
+}
+
+/// The name [`AggregateProfileRule`] registers under.
+pub(crate) const AGGREGATE_PROFILE_RULE: &str = "ravel_aggregate_profile";
+
+/// The last physical optimizer rule of every session
+/// [`build_session_with_tables`](crate::session::build_session_with_tables)
+/// builds. It leaves the plan as it is and sets the final plan's
+/// [`AggregateProfile`] on the session's pool, so every path that turns a
+/// logical plan into a physical one in such a session (a stream, a
+/// `DataFrame::collect`, an explain) has set the profile before anything can
+/// execute, with no call of its own to forget.
+#[derive(Debug)]
+pub(crate) struct AggregateProfileRule {
+    pool: Arc<dyn MemoryPool>,
+}
+
+impl AggregateProfileRule {
+    /// The rule for a session whose memory pool is `pool`.
+    pub(crate) fn new(pool: Arc<dyn MemoryPool>) -> Self {
+        AggregateProfileRule { pool }
+    }
+}
+
+impl PhysicalOptimizerRule for AggregateProfileRule {
+    fn optimize(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        _config: &ConfigOptions,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        install_aggregate_profile(&plan, &self.pool);
+        Ok(plan)
+    }
+
+    fn name(&self) -> &str {
+        AGGREGATE_PROFILE_RULE
+    }
+
+    fn schema_check(&self) -> bool {
+        true
     }
 }
 
@@ -920,9 +976,9 @@ struct AggregateState {
     asked: usize,
     /// The largest single grow it asked for before its first shrink.
     largest_step: usize,
-    /// Its last grow classified as a group-table step (`J_t`).
+    /// Its largest grow classified as a group-table step (`J_t`).
     table_step: usize,
-    /// Its last grow classified as a `Vec` step (`J_v`).
+    /// Its largest grow classified as a `Vec` step (`J_v`).
     vec_step: usize,
     /// Its envelope on the process ledger.
     envelope: usize,
@@ -934,8 +990,8 @@ impl AggregateState {
     /// The state after a grow of `additional` bytes. Under a known layout the
     /// grow is classified against both predicted ladders on its own size: a
     /// grow within [`STEP_TOLERANCE`] of a table step becomes `J_t`, of a
-    /// `Vec` step `J_v`, of both both, and of neither is per-batch growth
-    /// that moves neither.
+    /// `Vec` step `J_v`, of both both, unless the step it would replace is
+    /// larger; one of neither is per-batch growth that moves neither.
     fn grown(
         self,
         additional: usize,
@@ -953,15 +1009,30 @@ impl AggregateState {
         };
         if let Some(AggregateProfile::Layout(layout)) = profile {
             if matches_ladder(additional, layout.table_step(0), |k| layout.table_step(k)) {
-                next.table_step = additional;
+                next.table_step = next.table_step.max(additional);
             }
             if matches_ladder(additional, layout.vec_step(0), |k| layout.vec_step(k)) {
-                next.vec_step = additional;
+                next.vec_step = next.vec_step.max(additional);
             }
         }
         next.envelope = reserve_ahead.envelope(&next, profile);
         next
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Every profile [`TenantDelegatingPool::set_aggregate_profile`] set on
+    /// this thread, for tests whose pool the code under test builds itself.
+    static PROFILES_SET_ON_THIS_THREAD: std::cell::RefCell<Vec<AggregateProfile>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The profiles set on any pool on this thread since the last call, oldest
+/// first.
+#[cfg(test)]
+pub(crate) fn take_profiles_set_on_this_thread() -> Vec<AggregateProfile> {
+    PROFILES_SET_ON_THIS_THREAD.with(|set| std::mem::take(&mut *set.borrow_mut()))
 }
 
 /// Source of [`TenantDelegatingPool`] ids, which key a pool's envelopes on
@@ -1101,6 +1172,8 @@ impl TenantDelegatingPool {
     /// the layout [`plan_aggregate_profile`] derived from its plan. Set it before
     /// the plan executes: a grow already made was classified without it.
     pub fn set_aggregate_profile(&self, profile: AggregateProfile) {
+        #[cfg(test)]
+        PROFILES_SET_ON_THIS_THREAD.with(|set| set.borrow_mut().push(profile));
         *self
             .aggregate_profile
             .lock()
@@ -2587,8 +2660,9 @@ mod tests {
     }
 
     /// FLIP: classifying each delta as a doubling of the chain's last step
-    /// does not take the 0.975 `Vec` step, and the chains read
-    /// `(7,340,032, 27,262,976)` after it; the starting branch's
+    /// does not take the 0.975 `Vec` step of the next rung, and the chains
+    /// read `(7,340,032, 27,262,976)` after it; keeping the last matched step
+    /// rather than the largest records 26,581,402; the starting branch's
     /// `min(2.43 x S, 5 x J_max)` reads 84,085,310 after the first two.
     #[test]
     fn a_delta_off_both_ladders_by_more_than_three_percent_is_not_a_step() {
@@ -2611,12 +2685,50 @@ mod tests {
         assert_eq!(chain_steps(&pool, &res), (7_340_032, 27_262_976));
         assert_eq!(envelopes[0], 74_868_327);
 
-        // 0.975 x 52 x 2^19, rounded up, is within 3% of that Vec step.
+        // 0.975 x 52 x 2^19, rounded up, is within 3% of that Vec step, and
+        // smaller than the Vec step already recorded, so it does not replace
+        // it.
         let near = 26_581_402;
         let envelopes = envelopes_after(&budget, &pool, &res, &[near]);
+        assert_eq!(chain_steps(&pool, &res), (7_340_032, 27_262_976));
+        assert_eq!(envelopes[0], 74_868_327);
+
+        // 0.975 x 52 x 2^20, rounded up, is within 3% of the next Vec step.
+        let near = 53_162_804;
+        let envelopes = envelopes_after(&budget, &pool, &res, &[near]);
         assert_eq!(chain_steps(&pool, &res), (7_340_032, near));
-        // 2.1 x 26,581,402 x 68 / 52, over 5.0 x 7,340,032.
-        assert_eq!(envelopes[0], 72_996_620);
+        // 2.1 x 53,162,804 x 68 / 52, over 5.0 x 7,340,032.
+        assert_eq!(envelopes[0], 145_993_239);
+        drop(res);
+    }
+
+    /// A per-batch grow can land exactly on a low rung of a ladder:
+    /// 1,703,936 is 52 x 2^15. The groups only grow while a stream builds,
+    /// so its largest matched step is its latest real one.
+    /// FLIP: keeping the last matched step records 1,703,936 as `J_v` and the
+    /// envelope drops to 5.0 x 7,340,032 = 36,700,160, which leaves the next
+    /// real `Vec` doubling (54,525,952) unreserved.
+    #[test]
+    fn a_low_rung_grow_does_not_shrink_the_envelope() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_LAYOUT));
+        let res = register_on(&pool, PARTIAL);
+        let envelopes = envelopes_after(&budget, &pool, &res, &SERIES[..2]);
+        assert_eq!(chain_steps(&pool, &res), (7_340_032, 27_262_976));
+        assert_eq!(envelopes[1], 74_868_327);
+
+        let low_rung = 52 << 15;
+        assert_eq!(low_rung, 1_703_936);
+        let envelopes = envelopes_after(&budget, &pool, &res, &[low_rung]);
+        assert_eq!(chain_steps(&pool, &res), (7_340_032, 27_262_976));
+        assert_eq!(envelopes[0], 74_868_327);
         drop(res);
     }
 
