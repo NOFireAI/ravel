@@ -155,7 +155,9 @@ use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
 use crate::logs_scan::ScanExecutions;
-use crate::memory::{CeilingBreach, TenantMemoryAccountant};
+use crate::memory::{
+    CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant, plan_aggregate_profile,
+};
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
 use crate::parquet::{
@@ -4983,6 +4985,18 @@ pub struct AnalyzedRun {
     pub row_cap_hit: bool,
 }
 
+/// Set the aggregate layout of `plan` on `pool` before it executes, so the
+/// pool sizes each migrated aggregate's envelope from it (issue #3181). A
+/// plan with no grouped aggregate sets nothing, and neither does a pool that
+/// is not a [`TenantDelegatingPool`].
+fn install_aggregate_profile(plan: &Arc<dyn ExecutionPlan>, pool: &Arc<dyn MemoryPool>) {
+    if let Some(pool) = pool.downcast_ref::<TenantDelegatingPool>()
+        && let Some(profile) = plan_aggregate_profile(plan)
+    {
+        pool.set_aggregate_profile(profile);
+    }
+}
+
 /// A running plan's `RecordBatch` stream, with its session attached.
 ///
 /// Dropping this mid-stream is the cancellation path: the plan's operators
@@ -5101,6 +5115,7 @@ impl PinnedStream {
             active_since: None,
             elapsed: Duration::ZERO,
         });
+        install_aggregate_profile(&plan, &pool);
         let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
@@ -9570,6 +9585,116 @@ pub(crate) mod tests {
             message,
             "process memory ceiling breached: 4096 bytes reserved exceeds process limit 1024"
         );
+    }
+
+    /// The profile set on the pool before execution for the six statements
+    /// the reservation-lag matrix measured, each planned over `logs` with the
+    /// ClickBench columns it reads declared, and no profile for a plan with no
+    /// grouped aggregate.
+    ///
+    /// A declared `I64` is `Int64`, so q33's `ClientIP` key is 8 bytes and its
+    /// `W` is 8 + 8 (keys) + 8 (COUNT) + 8 (SUM) + 24 (Ravel's exact AVG) = 56.
+    /// The optimizer drops q35's constant key, leaving the single view key
+    /// q34 has. `date_part` is `Int32`, so q19's `W` is 8 + 4 + 16 + 8 = 36.
+    /// q14's `COUNT(DISTINCT)` is rewritten into two plain group-bys, the
+    /// outer one a view key with a COUNT: `W` 24, `w_max` 16, the same ratio
+    /// as the inner `(SearchPhrase, UserID)` stream, so the outer node, met
+    /// first, is kept.
+    ///
+    /// FLIP: an `install_aggregate_profile` that sets nothing reads `None`
+    /// for every statement.
+    #[tokio::test]
+    async fn the_aggregate_profile_of_the_six_measured_statements() {
+        use crate::memory::{AggregateLayout, AggregateProfile};
+
+        let declared = vec![
+            DeclaredColumn::new("WatchID", DeclaredType::I64),
+            DeclaredColumn::new("ClientIP", DeclaredType::I64),
+            DeclaredColumn::new("IsRefresh", DeclaredType::I64),
+            DeclaredColumn::new("ResolutionWidth", DeclaredType::I64),
+            DeclaredColumn::new("URL", DeclaredType::Str),
+            DeclaredColumn::new("UserID", DeclaredType::I64),
+            DeclaredColumn::new("SearchPhrase", DeclaredType::Str),
+        ];
+        let layout = |entry_size, vec_width_total, vec_width_max| {
+            Some(AggregateProfile::Layout(AggregateLayout {
+                entry_size,
+                vec_width_total,
+                vec_width_max,
+            }))
+        };
+        let statements = [
+            (
+                "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), \
+                 AVG(\"ResolutionWidth\") FROM logs GROUP BY \"WatchID\", \"ClientIP\" \
+                 ORDER BY c DESC LIMIT 10",
+                layout(16, 56, 16),
+            ),
+            (
+                "SELECT \"URL\", COUNT(*) AS c FROM logs GROUP BY \"URL\" \
+                 ORDER BY c DESC LIMIT 10",
+                layout(32, 24, 16),
+            ),
+            (
+                "SELECT 1, \"URL\", COUNT(*) AS c FROM logs GROUP BY 1, \"URL\" \
+                 ORDER BY c DESC LIMIT 10",
+                layout(32, 24, 16),
+            ),
+            (
+                "SELECT \"UserID\", date_part('minute', ts) AS m, \"SearchPhrase\", COUNT(*) \
+                 FROM logs GROUP BY \"UserID\", m, \"SearchPhrase\" \
+                 ORDER BY COUNT(*) DESC LIMIT 10",
+                layout(16, 36, 16),
+            ),
+            (
+                "SELECT \"UserID\", \"SearchPhrase\", COUNT(*) FROM logs \
+                 GROUP BY \"UserID\", \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10",
+                layout(16, 32, 16),
+            ),
+            (
+                "SELECT \"SearchPhrase\", COUNT(DISTINCT \"UserID\") AS u FROM logs \
+                 WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" \
+                 ORDER BY u DESC LIMIT 10",
+                layout(32, 24, 16),
+            ),
+            ("SELECT \"URL\", ts FROM logs ORDER BY ts LIMIT 10", None),
+        ];
+
+        let executor = executor_over(empty_store());
+        let mut installed = Vec::new();
+        for (sql, _) in &statements {
+            let snapshot = Snapshot {
+                segments: Vec::new(),
+                segments_pruned: 0,
+                pending_erasure: Vec::new(),
+            };
+            let plan = executor
+                .plan_pinned(
+                    TenantHash([111u8; 16]),
+                    snapshot,
+                    sql,
+                    &QueryAccounting::new(),
+                    &declared,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{sql} plans: {e}"))
+                .create_physical_plan()
+                .await
+                .expect("physical plan builds");
+            let pool: Arc<dyn MemoryPool> = Arc::new(TenantDelegatingPool::new(
+                1 << 30,
+                TenantMemoryAccountant::new(1 << 30),
+                CeilingBreach::new(),
+                QueryAccounting::new(),
+            ));
+            install_aggregate_profile(&plan, &pool);
+            let pool = pool
+                .downcast_ref::<TenantDelegatingPool>()
+                .expect("the pool is a TenantDelegatingPool");
+            installed.push((*sql, pool.aggregate_profile()));
+        }
+        let expected: Vec<_> = statements.iter().map(|(sql, p)| (*sql, *p)).collect();
+        assert_eq!(installed, expected);
     }
 
     /// ADR-0044 acceptance test: one `execute` call, checked
