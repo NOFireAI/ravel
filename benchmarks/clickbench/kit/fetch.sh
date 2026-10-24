@@ -28,13 +28,13 @@
 #                       relative.healthz_p99_max_ratio_<port> x A's; only
 #                       when the band file sets that key to a number
 #   ADR-1170 gap        arm B only, per concurrent round and pooled: the
-#                       share of answered /metrics scrapes in its
+#                       share of gated ok /metrics scrapes in its
 #                       evidence.tgz whose allocated minus unique tracked
 #                       bytes exceeds relative.adr1170_gap_max_bytes, at
 #                       most relative.adr1170_gap_share_above_max; arm A's
-#                       figures print as context and are never judged; an
-#                       answered scrape missing a gauge, or a round with no
-#                       answered scrape, on arm B exits 2; only when the band
+#                       figures print as context and are never judged; a
+#                       gated ok scrape missing a gauge, or a round with no
+#                       gated ok scrape, on arm B exits 2; only when the band
 #                       file sets both keys to numbers
 #
 # A band that cannot be judged (a concurrent or q29_probe band on a run where

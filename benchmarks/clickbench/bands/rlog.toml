@@ -74,13 +74,17 @@ healthz_p99_max_ratio_4319 = "FILL-IN-ON-REFERENCE-MACHINE"
 # mode="all" series, allocated being
 # ravel_process_allocator_bytes{allocator="jemalloc",stat="allocated"}. That is
 # ADR-1170 decisions 3 and 4's allocator bytes minus unique tracked bytes, with
-# allocated in place of the ADR's stat="resident" (issue #3204). Per round and
+# allocated in place of the ADR's stat="resident" (issue #3204). Each cache
+# term is the family's untiered series, else its tier="ram" series (a server
+# given --cache-dir), else 0 when only its tier="disk" series is present,
+# since disk-tier bytes are not heap. Per round and
 # pooled, the share of B's gated ok scrapes whose gap is above
 # adr1170_gap_max_bytes is at most adr1170_gap_share_above_max. Arm A's figures
 # print as context and are never judged. Unanswered scrapes, ungated ones
 # (taken with the gate down, outside the timed window) and bad ones (answered
 # with a non-200 or a transport error) are skipped and counted; an ok scrape on
-# B missing any of the six gauges, or a B round with no gated ok scrape, makes
+# B missing any of the six gauges (a cache family with no series in any
+# tier), or a B round with no gated ok scrape, makes
 # fetch exit 2. Inconclusive when B ran no
 # concurrent phase or run.toml's healthz_phases leaves concurrent out. A
 # placeholder or a missing key skips the band.
