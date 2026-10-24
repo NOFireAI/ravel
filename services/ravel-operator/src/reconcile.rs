@@ -1809,8 +1809,9 @@ const RETENTION_MEASURED_BUDGET_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// The default `spec.query.memoryHeadroomBytes` for a pinned budget `budget`:
 /// `ceil(0.53 * budget) + ceil(min(budget, 8 GiB) * 6.6 / 8)` (ADR-1170, issue
-/// #3200 amendment). Provisional: a workaround for issue #3181, expected to
-/// drop when that is fixed in 0.26.
+/// #3200 amendment). Provisional: sized before the 0.26 fixes for issue #3181,
+/// which leave it unchanged; issue #3237 tracks the logs-scan state still
+/// uncharged.
 ///
 /// - `0.53 * budget` is the SQL aggregation and logs-scan state the budget
 ///   does not charge: up to 12.7 GB in the #3181 heap profiles at a 24 GiB

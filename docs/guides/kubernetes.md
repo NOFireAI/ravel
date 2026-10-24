@@ -1007,8 +1007,9 @@ ceil(0.53 * budget) + ceil(min(budget, 8 GiB) * 6.6 / 8)
   is unmeasured. On a small budget, measure the peak memory of the query pods
   under your own concurrency, and set `memoryHeadroomBytes` from it.
 
-The default compensates for the uncharged SQL state. It is expected to drop in
-0.26, when that state is charged to the budget.
+The default compensates for the SQL state the budget does not charge. 0.26
+charges more of that state but leaves the default unchanged, because some
+logs-scan state is still uncharged.
 
 A worked example with a 1.5 GiB budget, a 3.5 Gi limit and a 2 Gi request:
 

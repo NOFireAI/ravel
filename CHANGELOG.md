@@ -69,7 +69,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   unchanged; measure the query pods' peak resident memory and set the field.
   The headroom is checked only against a pinned budget, so a CEL rule refuses
   `spec.query.memoryHeadroomBytes` without `spec.query.memoryBudgetBytes` at
-  admission (issue #3203).
+  admission (issue #3203); a cluster stored that way before the rule keeps
+  reconciling, with the headroom ignored.
 - **`ravel-cli export --parquet` writes bloom filters on the id columns**
   (ADR-1751 decision 4, issue #3229). Every row group carries a Parquet bloom
   filter, at a 1% false-positive target, on the mapping's trace id, span id
