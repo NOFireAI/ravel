@@ -21,9 +21,11 @@
 //! workspace denies `unsafe`, so a hand-rolled one cannot compile). A sampler
 //! thread reads live bytes (allocated minus deallocated, less the bytes live
 //! before the query started, so the input table is excluded), the pool's
-//! `reserved()` and `sql_memory_aggregate_envelope_bytes()`, back to back
-//! (yielding between reads) for the 3M-row rows and once a millisecond for
-//! the q33 row. The gap is live minus reserved minus envelope; the peak gap is
+//! `reserved()` and `sql_memory_aggregate_envelope_bytes()` once a
+//! millisecond on every row. Each statement is planned first and the plan's
+//! aggregate profile set on the pool, as the executor does, so the envelope
+//! is the one the default sizes from that layout. The gap is live minus
+//! reserved minus envelope; the peak gap is
 //! its maximum over the run. `reserved()` includes the undercount factor
 //! (issue #3181), and the envelope is charged on the process budget only, so
 //! the gap is what neither the query's ledger nor the process ledger holds.
