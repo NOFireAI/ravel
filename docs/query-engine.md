@@ -1505,13 +1505,13 @@ grown the group table and the accumulator `Vec`s, and ask for less than
 those allocations hold, so the pool charges a consumer named
 `PartialHashAggregateStream[..]`, `FinalHashAggregateStream[..]` or
 `SingleHashAggregateStream[..]` ahead of what it asks for
-(`SqlConfig::aggregate_reserve_ahead`, issue #3181). Every grow and shrink
+(`SqlConfig::aggregate_reserve_ahead`). Every grow and shrink
 is charged at 1.25 times the bytes asked on the query, tenant and process
 budgets, so a query's peak intermediate bytes and its ceiling checks read
 the charged figure. The pool can also reserve, on the process budget alone,
 an envelope for a building stream's next doubling, and that envelope is off
 by default (`AggregateReserveAhead::DEFAULT` sets both envelope terms to 0)
-until it is sized from each stream's layout (issue #3181).
+until it is sized from each stream's layout.
 `AggregateReserveAhead::WITH_ENVELOPE` turns it on: while a stream builds,
 until its first shrink, the envelope is 2.43 times its asked size while that
 is under 8 MiB, else the smaller of that and 5 times its largest single
