@@ -24,15 +24,24 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::alloc::System;
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use datafusion::arrow::array::{Array, AsArray, RecordBatch};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
+use datafusion::common::tree_node::TreeNodeRecursion;
+use datafusion::execution::TaskContext;
 use datafusion::execution::memory_pool::{MemoryPool, UnboundedMemoryPool};
+use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter::FilterExec;
-use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+    ReplaceChildrenOptions, SendableRecordBatchStream, displayable,
+};
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use ravel_catalog::{SegmentLevel, SegmentRef, Snapshot};
@@ -52,7 +61,14 @@ use ravel_sql::{
 };
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{TenantHash, TenantId};
+use stats_alloc::{INSTRUMENTED_SYSTEM, StatsAlloc};
 use uuid::Uuid;
+
+#[global_allocator]
+static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
+
+/// The heap figures are process-wide, so the tests run one at a time.
+static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const KEY: &str = "URL";
 const BLOCK_ROWS: usize = 8_192;
@@ -455,6 +471,7 @@ fn within_ten_percent(got: usize, want: usize) -> bool {
 /// most one block's charge.
 #[tokio::test]
 async fn p1_one_match_per_block_pins_every_blocks_values_array() {
+    let _serial = SERIAL.lock().await;
     let mut misses = Vec::new();
     for n in [8, 64, 256] {
         let fx = fixture(n, 1).await;
@@ -484,6 +501,7 @@ async fn p1_one_match_per_block_pins_every_blocks_values_array() {
 /// in the `FilterExec` output.
 #[tokio::test]
 async fn p2_count_star_filter_output_holds_no_string_bytes() {
+    let _serial = SERIAL.lock().await;
     let mut emitted = Vec::new();
     for n in [8, 64, 256] {
         let fx = fixture(n, 1).await;
@@ -507,6 +525,7 @@ async fn p2_count_star_filter_output_holds_no_string_bytes() {
 /// and the largest batch stops growing with N.
 #[tokio::test]
 async fn p3_flushed_batches_hold_at_most_128_blocks() {
+    let _serial = SERIAL.lock().await;
     let per_block = 64;
     let flush_blocks = COALESCE_ROWS / per_block;
     let bound = flush_blocks * block_values_bytes();
@@ -538,6 +557,7 @@ async fn p3_flushed_batches_hold_at_most_128_blocks() {
 /// `Utf8` array of the surviving values, at N = 256, one match per block.
 #[tokio::test]
 async fn p4_report_utf8_rebuild_size() {
+    let _serial = SERIAL.lock().await;
     let fx = fixture(256, 1).await;
     let m = measure(&fx, SELECT_URL).await;
     report("p4 SELECT URL rebuilt as Utf8", &fx, &m);
@@ -545,4 +565,134 @@ async fn p4_report_utf8_rebuild_size() {
         "  p4: dictionary output {} bytes, Utf8 rebuild {} bytes",
         m.emitted, m.cast_utf8_bytes
     );
+}
+
+/// Live heap bytes: allocated less freed, over the whole process.
+fn live_heap() -> isize {
+    let s = GLOBAL.stats();
+    s.bytes_allocated as isize - s.bytes_deallocated as isize + s.bytes_reallocated
+}
+
+/// Pass-through over the `FilterExec`'s input that samples the pool and the
+/// live heap each time it hands a batch to the filter. At sample `k` the
+/// coalescer holds what it kept of batches `0..k`.
+#[derive(Debug)]
+struct Probe {
+    input: Arc<dyn ExecutionPlan>,
+    pool: Arc<UnboundedMemoryPool>,
+    samples: Arc<Mutex<Vec<(usize, isize)>>>,
+}
+
+impl DisplayAs for Probe {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "Probe")
+    }
+}
+
+impl ExecutionPlan for Probe {
+    fn name(&self) -> &str {
+        "Probe"
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        self.input.properties()
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> datafusion::common::Result<TreeNodeRecursion>,
+    ) -> datafusion::common::Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        mut children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(Probe {
+            input: children.swap_remove(0),
+            pool: Arc::clone(&self.pool),
+            samples: Arc::clone(&self.samples),
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> datafusion::common::Result<SendableRecordBatchStream> {
+        let inner = self.input.execute(partition, context)?;
+        let pool = Arc::clone(&self.pool);
+        let samples = Arc::clone(&self.samples);
+        let stream = inner.inspect(move |_| {
+            samples.lock().unwrap().push((pool.reserved(), live_heap()));
+        });
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.input.schema(),
+            stream,
+        )))
+    }
+}
+
+/// Report only: the heap the `FilterExec` holds while its coalescer is still
+/// filling, which its emitted batches cannot show. Per input batch, the live
+/// heap less the pool's reading, relative to the first batch; its growth per
+/// block is what the coalescer keeps of each block and nothing charges.
+#[tokio::test]
+async fn p5_report_heap_held_before_the_coalescer_flushes() {
+    let _serial = SERIAL.lock().await;
+    for (sql, label) in [(SELECT_URL, "SELECT URL"), (COUNT_URL, "COUNT(*)")] {
+        for n in [8, 64, 256] {
+            let fx = fixture(n, 1).await;
+            let pool = Arc::new(UnboundedMemoryPool::default());
+            let (ctx, _, filter) = plan(&fx, &pool, sql).await;
+            let samples = Arc::new(Mutex::new(Vec::new()));
+            let probe: Arc<dyn ExecutionPlan> = Arc::new(Probe {
+                input: Arc::clone(filter.children()[0]),
+                pool: Arc::clone(&pool),
+                samples: Arc::clone(&samples),
+            });
+            let filter = Arc::clone(&filter)
+                .replace_children(
+                    vec![probe],
+                    ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+                )
+                .expect("probe under the filter");
+            let mut stream = filter.execute(0, ctx.task_ctx()).expect("execute");
+            let mut held = Vec::new();
+            while let Some(batch) = stream.next().await {
+                held.push(batch.expect("batch"));
+            }
+            let at_end = live_heap();
+            let samples = samples.lock().unwrap().clone();
+            let unaccounted: Vec<isize> = samples
+                .iter()
+                .map(|(reserved, live)| live - *reserved as isize)
+                .collect();
+            let first = unaccounted.first().copied().unwrap_or(0);
+            let last = unaccounted.last().copied().unwrap_or(0);
+            let per_block = if samples.len() > 1 {
+                (last - first) / (samples.len() as isize - 1)
+            } else {
+                0
+            };
+            let max_reserved = samples.iter().map(|(r, _)| *r).max().unwrap_or(0);
+            println!(
+                "[p5 {label} N={n}] input batches {}, output batches {}, max pool reading {max_reserved}",
+                samples.len(),
+                held.len()
+            );
+            println!(
+                "  live heap less pool at the last input batch, over the first: {} bytes, {per_block} per block (one block's values array {}); live heap after the output, over the last input batch: {}",
+                last - first,
+                block_values_bytes(),
+                at_end - samples.last().map_or(0, |(_, l)| *l)
+            );
+            drop(held);
+        }
+    }
 }
