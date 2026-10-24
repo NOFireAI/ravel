@@ -407,8 +407,13 @@ def handler(role):
                     except OSError:
                         age = "0.5"
                     body += 'ravel_health_heartbeat_age_seconds{mode="x"} %s\n' % age
-                body += 'ravel_process_allocator_bytes{mode="x",stat="allocated"} 123\n'
-                body += 'ravel_memory_reserved_bytes{mode="x",component="sql"} 7\n'
+                body += 'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"} 1000\n'
+                body += 'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="resident"} 4000\n'
+                body += 'ravel_cache_resident_bytes{mode="all",cache="fetch"} 100\n'
+                body += 'ravel_cache_resident_bytes{mode="all",cache="catalog"} 50\n'
+                body += 'ravel_memory_reserved_bytes{mode="all",component="sql"} 7\n'
+                body += 'ravel_memory_reserved_bytes{mode="all",component="fetch"} 20\n'
+                body += 'ravel_memory_handoff_overlap_bytes{mode="all"} 5\n'
                 body += 'ravel_memory_budget_refusals_total{mode="x"} 9\n'
                 return self.answer(200, body)
             return self.answer(404, "no such path\n")
@@ -1424,8 +1429,13 @@ tar -xzf "$OUT_A/evidence.tgz" -C "$TMP/evidence-a"
 # not the refusals counter that shares their family prefix.
 cat >"$TMP/memory-check.py" <<'PY'
 import json, sys
-want = {'ravel_process_allocator_bytes{mode="x",stat="allocated"}': 123.0,
-        'ravel_memory_reserved_bytes{mode="x",component="sql"}': 7.0}
+want = {'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}': 1000.0,
+        'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="resident"}': 4000.0,
+        'ravel_cache_resident_bytes{mode="all",cache="fetch"}': 100.0,
+        'ravel_cache_resident_bytes{mode="all",cache="catalog"}': 50.0,
+        'ravel_memory_reserved_bytes{mode="all",component="sql"}': 7.0,
+        'ravel_memory_reserved_bytes{mode="all",component="fetch"}': 20.0,
+        'ravel_memory_handoff_overlap_bytes{mode="all"}': 5.0}
 recs = [r for r in map(json.loads, open(sys.argv[1])) if r.get("ok")]
 print(bool(recs) and all(r.get("memory") == want for r in recs))
 PY
@@ -2080,6 +2090,74 @@ else
   fail "cold sum" "exit $code: $(grep -v '^PASS' "$TMP/fetch-cold.out" | head -n 4)"
 fi
 
+# gap_arm SRC DST ARM ROUNDS_JSON: a copy of arm SRC labelled ARM whose
+# concurrent block has one round per entry of ROUNDS_JSON and whose
+# evidence.tgz also holds each round's out/concurrent/round-N/healthz/metrics.jsonl
+# for the ADR-1170 gap band. ARM "keep" leaves results.json as SRC has it.
+# A round is a list of scrapes: null is an unanswered line, else [allocated,
+# cache_fetch, cache_catalog, reserved_sql, reserved_fetch, handoff_overlap] in
+# GiB, a null term leaving that gauge out. Each answered scrape also carries
+# stat="resident" 3 GiB above allocated and a budget gauge, which the band
+# must ignore.
+cat >"$TMP/gap_arm.py" <<'PY'
+import io, json, os, shutil, sys, tarfile
+src, dst, arm, rounds = sys.argv[1], sys.argv[2], sys.argv[3], json.loads(sys.argv[4])
+sha_b = sys.argv[5]
+GIB = 1 << 30
+SERIES = ['ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="allocated"}',
+          'ravel_cache_resident_bytes{mode="all",cache="fetch"}',
+          'ravel_cache_resident_bytes{mode="all",cache="catalog"}',
+          'ravel_memory_reserved_bytes{mode="all",component="sql"}',
+          'ravel_memory_reserved_bytes{mode="all",component="fetch"}',
+          'ravel_memory_handoff_overlap_bytes{mode="all"}']
+RESIDENT = 'ravel_process_allocator_bytes{mode="all",allocator="jemalloc",stat="resident"}'
+if src != dst:
+    shutil.rmtree(dst, ignore_errors=True)
+    shutil.copytree(src, dst)
+if arm != "keep":
+    r = json.load(open(os.path.join(dst, "results.json")))
+    if arm == "B":
+        r["provenance"].update(arm="b", kit_arm="B", git_sha=sha_b)
+    rds = [{"round": n, "duration_s": 600, "wall_s": 600.4, "connections": 10, "calls": 100,
+            "ok": 100, "err": 0, "wrong_answer": 0, "qps": 1.0, "error_ratio": 0.0}
+           for n in range(1, len(rounds) + 1)]
+    r["concurrent"] = {"rounds": rds, "pooled": {
+        "rounds": len(rds), "calls": 100 * len(rds), "ok": 100 * len(rds), "err": 0,
+        "wrong_answer": 0, "error_ratio_weighted": 0.0, "error_ratio_mean_of_rounds": 0.0,
+        "qps_pooled": 1.0}}
+    json.dump(r, open(os.path.join(dst, "results.json"), "w"))
+tgz = os.path.join(dst, "evidence.tgz")
+kept = []
+if os.path.exists(tgz):
+    with tarfile.open(tgz) as old:
+        kept = [(m, old.extractfile(m).read() if m.isfile() else None) for m in old.getmembers()
+                if not m.name.startswith("out/concurrent/round-")
+                or not m.name.endswith("/healthz/metrics.jsonl")]
+with tarfile.open(tgz, "w:gz") as t:
+    for m, data in kept:
+        t.addfile(m, io.BytesIO(data) if data is not None else None)
+    for n, scrapes in enumerate(rounds, 1):
+        lines = []
+        for i, s in enumerate(scrapes):
+            rec = {"t": 1000.0 + i, "gated": True, "gen": 1}
+            if s is None:
+                rec.update(answered=False, ok=False, status=0, error="URLError: refused")
+            else:
+                mem = dict((k, v * GIB) for k, v in zip(SERIES, s) if v is not None)
+                mem[RESIDENT] = (s[0] + 3) * GIB
+                mem['ravel_memory_budget_bytes{mode="all"}'] = 24.0 * GIB
+                rec.update(answered=True, ok=True, status=200, error="", heartbeat_s=0.2,
+                           memory=mem)
+            lines.append(json.dumps(rec, sort_keys=True))
+        data = ("\n".join(lines) + "\n").encode("utf-8")
+        info = tarfile.TarInfo("out/concurrent/round-%d/healthz/metrics.jsonl" % n)
+        info.size = len(data)
+        t.addfile(info, io.BytesIO(data))
+PY
+gap_arm() {
+  python3 "$TMP/gap_arm.py" "$1" "$2" "$3" "$4" "$SHA_B"
+}
+
 # CONC_PY: a python edit helper for edit_arm. conc(qps) is a one-round
 # concurrent block whose qps_pooled is qps, with no errors.
 CONC_PY='
@@ -2099,6 +2177,7 @@ r["concurrent"] = conc(1.0)'
 as_arm_b "$TMP/fixture-pass" "$TMP/fixture-qps-b" "$CONC_PY"'
 r["concurrent"] = conc(0.9)
 r["concurrent"]["rounds"][0].update(wall_s=700.0, overran={"wall_s": 700.0, "duration_s": 600})'
+gap_arm "$TMP/fixture-qps-b" "$TMP/fixture-qps-b" keep '[[[1,0,0,0,0,0]]]'
 fixture run-qps "$TMP/fixture-qps-a" "$TMP/fixture-qps-b"
 fetch qps run-qps --timeout 30
 if [ "$code" = 1 ] && grep -q '^MISS  *B vs A  *qps_pooled >= 0.95 x A  *0.900  *0.950$' "$TMP/fetch-qps.out" \
@@ -3103,6 +3182,154 @@ for edit in truncate drop; do
     fail "fetch $edit calls.jsonl" "exit $code: $(tail -n 4 "$TMP/fetch-$edit.err")"
   fi
 done
+
+# --- ADR-1170 memory gap band ---------------------------------------------------
+
+# The hand computation for the next case, in GiB. gap = allocated - cache_fetch
+# - cache_catalog - reserved_sql - reserved_fetch + handoff_overlap:
+#   round 1: 10-4-1-2-1+0.5 = 2.5 (above 2); 6-2-0.5-1-1+0.25 = 1.75;
+#            12-3-1-2-1+1 = 6 (above, the max); 5-2-1-0-0.5+0 = 1.5;
+#            plus one unanswered line, skipped: 2 of 4 above, 50.0 %
+#   round 2: 3-0.5-0.25-0-0+0.125 = 2.375 (above); 4-1-1-0.5-0.5+0 = 1.0;
+#            1 of 2 above, 50.0 %, max 2.375 GiB = 2,550,136,832
+#   pooled:  3 of 6 above, 50.0 %, max 6 GiB = 6,442,450,944
+# Without the + handoff_overlap term round 1's first scrape is exactly 2.0, not
+# above, and its max is 5 GiB; with stat="resident" every scrape is 3 GiB
+# higher, so all are above and round 1's max is 9 GiB.
+GAP_ROUNDS='[[[10,4,1,2,1,0.5],[6,2,0.5,1,1,0.25],null,[12,3,1,2,1,1],[5,2,1,0,0.5,0]],
+[[3,0.5,0.25,0,0,0.125],[4,1,1,0.5,0.5,0]]]'
+
+# gap_band_reads_the_same_figure_as_the_hand_computation. Catches: the gap
+# computed without the handoff overlap, or from stat="resident", or an
+# unanswered line counted, or a miss that does not exit 1.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gap-b" B "$GAP_ROUNDS"
+fixture run-gap "$TMP/fixture-pass" "$TMP/fixture-gap-b"
+fetch gap run-gap --timeout 30
+if [ "$code" = 1 ] \
+  && grep -qx 'MISS         B        adr1170 gap round 1 share > 2147483648         0.500          0.000          50.0 % of 4 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'MISS         B        adr1170 gap round 2 share > 2147483648         0.500          0.000          50.0 % of 2 scrapes > 2147483648 (max 2,550,136,832; 0 unanswered skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'MISS         B        adr1170 gap pooled share > 2147483648          0.500          0.000          50.0 % of 6 scrapes > 2147483648 (max 6,442,450,944; 1 unanswered skipped)' "$TMP/fetch-gap.out" \
+  && grep -qx 'adr1170 gap A (context, not judged): no concurrent phase ran' "$TMP/fetch-gap.out" \
+  && [ "$(grep -c 'adr1170 gap' "$TMP/fetch-gap.out")" = 4 ] \
+  && grep -q '^fetch: at least one band MISSED' "$TMP/fetch-gap.err"; then
+  pass "gap_band_reads_the_same_figure_as_the_hand_computation"
+else
+  fail "gap_band_reads_the_same_figure_as_the_hand_computation" "exit $code: $(grep 'adr1170' "$TMP/fetch-gap.out") $(tail -n 2 "$TMP/fetch-gap.err")"
+fi
+
+# Catches: an answered scrape missing a gauge skipped or read as zero, which
+# shrinks the gap, instead of refusing with exit 2 naming round, line and series.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapmiss-b" B '[[[1,0,0,0,0,0],null,[1,0,0,0,0,null]]]'
+fixture run-gapmiss "$TMP/fixture-pass" "$TMP/fixture-gapmiss-b"
+fetch gapmiss run-gapmiss --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'kit: adr1170 gap: round 1: ' "$TMP/fetch-gapmiss.err" \
+  && grep -qF 'out/concurrent/round-1/healthz/metrics.jsonl:3 is an answered scrape missing ravel_memory_handoff_overlap_bytes{mode="all"}' "$TMP/fetch-gapmiss.err" \
+  && ! grep -q 'adr1170 gap round' "$TMP/fetch-gapmiss.out"; then
+  pass "an answered scrape missing the handoff overlap gauge exits 2 naming round, line and series"
+else
+  fail "gap missing gauge" "exit $code: $(tail -n 2 "$TMP/fetch-gapmiss.err")"
+fi
+
+# Catches: a round with no answered scrape passing as 0 % above.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapnone-b" B '[[[1,0,0,0,0,0]],[null,null]]'
+fixture run-gapnone "$TMP/fixture-pass" "$TMP/fixture-gapnone-b"
+fetch gapnone run-gapnone --timeout 30
+if [ "$code" = 2 ] \
+  && grep -qF 'kit: adr1170 gap: round 2: ' "$TMP/fetch-gapnone.err" \
+  && grep -qF 'out/concurrent/round-2/healthz/metrics.jsonl holds no answered scrape (2 unanswered)' "$TMP/fetch-gapnone.err"; then
+  pass "a round with no answered scrape exits 2 naming the round"
+else
+  fail "gap empty round" "exit $code: $(tail -n 2 "$TMP/fetch-gapnone.err")"
+fi
+
+# Catches: a B gap under the bar on every scrape missing, or the bar compared
+# with >= rather than >: round 1's second scrape is exactly 2 GiB.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapok-b" B '[[[3,0.5,0.25,0.25,0.5,0.25],[4,1,0.5,0.25,0.25,0],null],[[2.5,1,0,0,0,0]]]'
+fixture run-gapok "$TMP/fixture-pass" "$TMP/fixture-gapok-b"
+fetch gapok run-gapok --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'PASS         B        adr1170 gap round 1 share > 2147483648         0.000          0.000          0.0 % of 2 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered skipped)' "$TMP/fetch-gapok.out" \
+  && grep -qx 'PASS         B        adr1170 gap round 2 share > 2147483648         0.000          0.000          0.0 % of 1 scrapes > 2147483648 (max 1,610,612,736; 0 unanswered skipped)' "$TMP/fetch-gapok.out" \
+  && grep -qx 'PASS         B        adr1170 gap pooled share > 2147483648          0.000          0.000          0.0 % of 3 scrapes > 2147483648 (max 2,147,483,648; 1 unanswered skipped)' "$TMP/fetch-gapok.out"; then
+  pass "a B gap under the bar on every scrape passes per round and pooled"
+else
+  fail "gap pass" "exit $code: $(grep 'adr1170' "$TMP/fetch-gapok.out") $(tail -n 2 "$TMP/fetch-gapok.err")"
+fi
+
+# Catches: a run without the concurrent phase reading as a pass instead of
+# inconclusive. fetch-pass is two arms with no concurrent phase.
+if grep -qx 'INCONCLUSIVE B        adr1170 gap (no round) share > 2147483648      None           0.000          no concurrent phase ran' "$TMP/fetch-pass.out" \
+  && ! grep -q '^PASS .*adr1170' "$TMP/fetch-pass.out"; then
+  pass "a run without the concurrent phase leaves the gap band inconclusive"
+else
+  fail "gap no concurrent" "$(grep adr1170 "$TMP/fetch-pass.out")"
+fi
+
+# Catches: healthz_phases leaving concurrent out read as a pass, or an
+# arm A refusal (its scrape lacks a gauge) raised instead of printed.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapbad-a" A '[[[1,0,0,0,0,null]]]'
+sed 's/^shards = /healthz_phases = ["benchmark"]\n&/' "$RUN_TOML" >"$TMP/run-nohz.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" memory-gap "$BANDS" "$TMP/fixture-gapbad-a/results.json" \
+  "$TMP/fixture-gapbad-a/evidence.tgz" "$TMP/fixture-gapok-b/results.json" \
+  "$TMP/fixture-gapok-b/evidence.tgz" "$TMP/run-nohz.toml" >"$TMP/gap-nohz.out" 2>&1 || code=$?
+code_a=0
+python3 "$KIT_SRC/lib/kit.py" memory-gap "$BANDS" "$TMP/fixture-gapbad-a/results.json" \
+  "$TMP/fixture-gapbad-a/evidence.tgz" "$TMP/fixture-gapok-b/results.json" \
+  "$TMP/fixture-gapok-b/evidence.tgz" "$RUN_TOML" >"$TMP/gap-bada.out" 2>&1 || code_a=$?
+if [ "$code" = 0 ] \
+  && grep -qx "INCONCLUSIVE B        adr1170 gap (no round) share > 2147483648      None           0.000          run.toml's healthz_phases leaves concurrent out" "$TMP/gap-nohz.out" \
+  && [ "$code_a" = 0 ] \
+  && grep -qF 'adr1170 gap A (context, not judged): unreadable: adr1170 gap: round 1: ' "$TMP/gap-bada.out" \
+  && grep -q '^PASS  *B  *adr1170 gap pooled ' "$TMP/gap-bada.out"; then
+  pass "healthz_phases without concurrent leaves the gap band inconclusive, and an arm A refusal is printed, not raised"
+else
+  fail "gap healthz_phases" "exit $code / $code_a: $(cat "$TMP/gap-nohz.out" "$TMP/gap-bada.out")"
+fi
+
+# Catches: arm A judged. A is over the bar on every scrape (5.5, 6 and 4
+# GiB) and B under it: B passes, A's figures print on context lines only.
+gap_arm "$TMP/fixture-pass" "$TMP/fixture-gapover-a" A '[[[8,1,0.5,0.5,0.5,0],[7,0.5,0.25,0.25,0.25,0.25]],[[6,1,1,0,0,0]]]'
+fixture run-gapover "$TMP/fixture-gapover-a" "$TMP/fixture-gapok-b"
+fetch gapover run-gapover --timeout 30
+if [ "$code" = 0 ] \
+  && grep -qx 'adr1170 gap A round 1 (context, not judged): 100.0 % of 2 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered skipped)' "$TMP/fetch-gapover.out" \
+  && grep -qx 'adr1170 gap A round 2 (context, not judged): 100.0 % of 1 scrapes > 2147483648 (max 4,294,967,296; 0 unanswered skipped)' "$TMP/fetch-gapover.out" \
+  && grep -qx 'adr1170 gap A pooled (context, not judged): 100.0 % of 3 scrapes > 2147483648 (max 6,442,450,944; 0 unanswered skipped)' "$TMP/fetch-gapover.out" \
+  && grep -q '^PASS  *B  *adr1170 gap pooled share > 2147483648 ' "$TMP/fetch-gapover.out" \
+  && ! grep -q '^MISS' "$TMP/fetch-gapover.out"; then
+  pass "arm A over the gap bar is printed as context and never judged while B passes"
+else
+  fail "gap arm A context" "exit $code: $(grep -e adr1170 -e '^MISS' "$TMP/fetch-gapover.out")"
+fi
+
+# Catches: the band judged with a key missing or a placeholder instead of
+# skipped with a printed line naming it: the bar is deleted, the share left a
+# placeholder.
+mkdir -p "$TMP/bands-gapoff"
+sed -e '/^adr1170_gap_max_bytes = /d' \
+  -e 's/^adr1170_gap_share_above_max = .*/adr1170_gap_share_above_max = "FILL-IN-ON-REFERENCE-MACHINE"/' \
+  "$BANDS" >"$TMP/bands-gapoff/rlog.toml"
+code=0
+python3 "$KIT_SRC/lib/kit.py" memory-gap "$TMP/bands-gapoff/rlog.toml" "$TMP/fixture-pass/results.json" \
+  "$TMP/fixture-pass/evidence.tgz" "$TMP/fixture-gap-b/results.json" \
+  "$TMP/fixture-gap-b/evidence.tgz" "$RUN_TOML" >"$TMP/gap-off.out" 2>&1 || code=$?
+if [ "$code" = 0 ] \
+  && [ "$(cat "$TMP/gap-off.out")" = "adr1170 gap: skipped, adr1170_gap_max_bytes and adr1170_gap_share_above_max missing or a placeholder in $TMP/bands-gapoff/rlog.toml" ]; then
+  pass "a missing or placeholder gap key skips the band with a printed line"
+else
+  fail "gap placeholder" "exit $code: $(cat "$TMP/gap-off.out")"
+fi
+
+# Catches: the band not reading the sampler's own metrics.jsonl: the share
+# run's boxes scraped the stub server, whose gap is 1000-100-50-7-20+5 = 828.
+if grep -q '^PASS  *B  *adr1170 gap round 1 share > 2147483648  *0.000  *0.000  *0.0 % of [0-9]* scrapes > 2147483648 (max 828; 0 unanswered skipped)$' "$TMP/fetch-share.out" \
+  && grep -q '^adr1170 gap A round 1 (context, not judged): 0.0 % of [0-9]* scrapes > 2147483648 (max 828; ' "$TMP/fetch-share.out"; then
+  pass "the gap band reads the box sampler's own concurrent scrapes"
+else
+  fail "gap from the box" "$(grep adr1170 "$TMP/fetch-share.out")"
+fi
 
 # lib_box BOX: boot an arm A box in BOX and write BOX/lib-setup.sh, which a
 # case's subshell sources: run.sh in library mode with its config loaded, the
