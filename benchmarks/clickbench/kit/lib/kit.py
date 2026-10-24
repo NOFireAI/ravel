@@ -76,8 +76,9 @@ Subcommands (each exits 0 on success, 2 on a refusal or an unexpected error,
                                arms' extra server flags must be equal
   memory-gap BANDS A.json A.tgz B.json B.tgz RUN_TOML
                                judge ADR-1170's memory gap (allocated minus
-                               the unique tracked bytes) on arm B's concurrent
-                               /metrics scrapes per round and pooled, print
+                               the unique tracked bytes) on arm B's gated ok
+                               concurrent /metrics scrapes per round and
+                               pooled, print
                                arm A's figures as context, exit 1 on a miss;
                                skipped when BANDS leaves either adr1170_* key
                                out or a placeholder
@@ -1568,10 +1569,12 @@ def scrape_gap(memory):
 
 def memory_gap_rounds(tgz, rounds, bar):
     """Per concurrent round, from out/concurrent/round-N/healthz/metrics.jsonl
-    in the evidence tarball TGZ: the answered scrapes, the unanswered ones
-    skipped, the max gap and the scrapes whose gap is above BAR. An answered
-    scrape missing a GAP_TERMS series, and a round with no answered scrape,
-    are refusals."""
+    in the evidence tarball TGZ: the gated ok scrapes, the max gap and the
+    scrapes whose gap is above BAR, with the unanswered, ungated and bad
+    scrapes skipped and counted, as healthz_summary does. An ungated scrape
+    falls outside the timed window, and a bad one (answered with a non-200 or
+    a transport error) carries no gauges. An ok scrape missing a GAP_TERMS
+    series, and a round with no gated ok scrape, are refusals."""
     if not rounds:
         raise Refusal("adr1170 gap: %s records no concurrent round" % tgz)
     out = []
@@ -1590,27 +1593,34 @@ def memory_gap_rounds(tgz, rounds, bar):
                               % (n, name, tgz, e))
             if lines is None:
                 raise Refusal("adr1170 gap: round %d: %s holds no %s" % (n, tgz, name))
-            gaps, unanswered = [], 0
+            gaps, unanswered, ungated, bad = [], 0, 0, 0
             for i, line in enumerate(lines, 1):
                 try:
                     rec = json.loads(line)
                 except ValueError as e:
                     raise Refusal("adr1170 gap: round %d: %s:%s:%d is not a JSON line: %s"
                                   % (n, tgz, name, i, e))
+                if isinstance(rec, dict) and rec.get("gated") is not True:
+                    ungated += 1
+                    continue
                 if not isinstance(rec, dict) or rec.get("answered") is not True:
                     unanswered += 1
                     continue
+                if rec.get("ok") is not True:
+                    bad += 1
+                    continue
                 gap, missing = scrape_gap(rec.get("memory"))
                 if missing:
-                    raise Refusal("adr1170 gap: round %d: %s:%s:%d is an answered scrape "
+                    raise Refusal("adr1170 gap: round %d: %s:%s:%d is an ok scrape "
                                   "missing %s" % (n, tgz, name, i, ", ".join(missing)))
                 gaps.append(gap)
             if not gaps:
-                raise Refusal("adr1170 gap: round %d: %s:%s holds no answered scrape (%d "
-                              "unanswered)" % (n, tgz, name, unanswered))
+                raise Refusal("adr1170 gap: round %d: %s:%s holds no ok gated scrape (%s)"
+                              % (n, tgz, name, _skipped(unanswered, ungated, bad)))
             above = sum(1 for g in gaps if g > bar)
             out.append({"round": n, "scrapes": len(gaps), "unanswered": unanswered,
-                        "max_gap": max(gaps), "above": above, "share": above / len(gaps)})
+                        "ungated": ungated, "bad": bad, "max_gap": max(gaps), "above": above,
+                        "share": above / len(gaps)})
     return out
 
 
@@ -1619,13 +1629,19 @@ def _gap_pool(rounds):
     above = sum(r["above"] for r in rounds)
     return {"round": None, "scrapes": scrapes, "above": above, "share": above / scrapes,
             "unanswered": sum(r["unanswered"] for r in rounds),
+            "ungated": sum(r["ungated"] for r in rounds),
+            "bad": sum(r["bad"] for r in rounds),
             "max_gap": max(r["max_gap"] for r in rounds)}
 
 
+def _skipped(unanswered, ungated, bad):
+    return "%d unanswered, %d ungated, %d bad skipped" % (unanswered, ungated, bad)
+
+
 def _gap_text(fig, bar):
-    return "%.1f %% of %d scrapes > %d (max %s; %d unanswered skipped)" % (
+    return "%.1f %% of %d scrapes > %d (max %s; %s)" % (
         fig["share"] * 100.0, fig["scrapes"], bar, "{:,.0f}".format(fig["max_gap"]),
-        fig["unanswered"])
+        _skipped(fig["unanswered"], fig["ungated"], fig["bad"]))
 
 
 def _gap_absent(report, phases):
@@ -1638,7 +1654,7 @@ def _gap_absent(report, phases):
 
 def memory_gap(path, a_json, a_tgz, b_json, b_tgz, run_toml):
     """ADR-1170's memory gap band, judged on arm B's concurrent rounds only: per
-    round and pooled, the share of answered scrapes whose gap is above
+    round and pooled, the share of gated ok scrapes whose gap is above
     adr1170_gap_max_bytes at most adr1170_gap_share_above_max. Arm A's figures
     are printed as context and never judged; a refusal on A is printed, not
     raised. Returns the rows judged."""

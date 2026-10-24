@@ -769,16 +769,19 @@ The band file's `adr1170_gap_max_bytes` and `adr1170_gap_share_above_max`
 judge ADR-1170's memory gap on arm B, from the `/metrics` scrapes in
 `out/concurrent/round-<N>/healthz/metrics.jsonl` inside each arm's
 `evidence.tgz` (`kit.py memory-gap`, run by `fetch.sh` after the relative
-bands). For each answered scrape the gap is `allocated - cache fetch - cache
+bands). For each gated ok scrape the gap is `allocated - cache fetch - cache
 catalog - reserved sql - reserved fetch + handoff overlap`, all `mode="all"`
 series, with `ravel_process_allocator_bytes{stat="allocated"}` rather than
 the ADR's `stat="resident"`. One `B` row per concurrent round and one pooled
-row give the share of answered scrapes above `adr1170_gap_max_bytes`, judged
+row give the share of gated ok scrapes above `adr1170_gap_max_bytes`, judged
 against `adr1170_gap_share_above_max`, with the scrape count, the max gap and
-the unanswered scrapes skipped in the note. Arm A's figures print on
+the scrapes skipped in the note, each kind counted: unanswered, ungated (taken
+with the gate down, outside the timed window, such as the scrapes of a
+just-started server before the round opens) and bad (answered with a non-200
+or a transport error). Arm A's figures print on
 `adr1170 gap A ... (context, not judged)` lines and never change the exit
-code. On arm B, an answered scrape missing any of the six gauges, or a round
-with no answered scrape, exits 2 naming the round, the line and the series;
+code. On arm B, an ok scrape missing any of the six gauges, or a round with no
+gated ok scrape, exits 2 naming the round, the line and the series;
 a run whose arm B ran no concurrent phase, or whose `healthz_phases` leaves
 `concurrent` out, prints the band INCONCLUSIVE. Like the healthz keys, both
 are optional: either left out or left a placeholder skips the band with a

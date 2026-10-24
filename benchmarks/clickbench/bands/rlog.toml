@@ -67,7 +67,7 @@ cold_sum_max_ratio = 1.05
 # the phases both arms ran. A placeholder or a missing key skips the band.
 healthz_p99_max_ratio_4318 = "FILL-IN-ON-REFERENCE-MACHINE"
 healthz_p99_max_ratio_4319 = "FILL-IN-ON-REFERENCE-MACHINE"
-# Optional: ADR-1170's memory gap, judged on arm B only. For each answered
+# Optional: ADR-1170's memory gap, judged on arm B only. For each gated ok
 # /metrics scrape of each concurrent round (out/concurrent/round-N/healthz/
 # metrics.jsonl in the arm's evidence.tgz), gap = allocated - cache fetch -
 # cache catalog - reserved sql - reserved fetch + handoff overlap, all
@@ -75,11 +75,13 @@ healthz_p99_max_ratio_4319 = "FILL-IN-ON-REFERENCE-MACHINE"
 # ravel_process_allocator_bytes{allocator="jemalloc",stat="allocated"}. That is
 # ADR-1170 decisions 3 and 4's allocator bytes minus unique tracked bytes, with
 # allocated in place of the ADR's stat="resident" (issue #3204). Per round and
-# pooled, the share of B's answered scrapes whose gap is above
+# pooled, the share of B's gated ok scrapes whose gap is above
 # adr1170_gap_max_bytes is at most adr1170_gap_share_above_max. Arm A's figures
-# print as context and are never judged. Unanswered scrapes are skipped and
-# counted; an answered scrape on B missing any of the six gauges, or a B round
-# with no answered scrape, makes fetch exit 2. Inconclusive when B ran no
+# print as context and are never judged. Unanswered scrapes, ungated ones
+# (taken with the gate down, outside the timed window) and bad ones (answered
+# with a non-200 or a transport error) are skipped and counted; an ok scrape on
+# B missing any of the six gauges, or a B round with no gated ok scrape, makes
+# fetch exit 2. Inconclusive when B ran no
 # concurrent phase or run.toml's healthz_phases leaves concurrent out. A
 # placeholder or a missing key skips the band.
 # Basis: 2 GiB is ADR-1170's overhead reserve, still its provisional
