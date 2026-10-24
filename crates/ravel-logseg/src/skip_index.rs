@@ -83,6 +83,23 @@ pub struct NumRangeArm {
     pub max_bits: Option<u64>,
 }
 
+/// A resolved prune-only numeric arm for [`SkipIndex::candidate_blocks`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumArm {
+    /// Keep rows inside an inclusive range (see [`NumRangeArm`]).
+    Range(NumRangeArm),
+    /// Keep rows of the `I64` column `column_id` not equal to `value`. An
+    /// entry whose stat has `min == max == value` holds no such row: every
+    /// non-NULL value equals `value` and NULL never satisfies `<>`.
+    NotEq { column_id: u32, value: i64 },
+}
+
+impl From<NumRangeArm> for NumArm {
+    fn from(arm: NumRangeArm) -> Self {
+        NumArm::Range(arm)
+    }
+}
+
 /// Merges the stats of `children` by column id: type-aware min/max and OR-ed NaN
 /// flags folded over the children that carry a stat for the column, and a
 /// `null_count` counting every row beneath the entry that resolves nothing of
@@ -220,12 +237,13 @@ fn stat_disjoint(stat: &NumStat, arm: &NumRangeArm) -> bool {
 /// information", never "no match" (ADR-0013, and the completeness contract in
 /// this module's header). Pruning on an absent stat would silently drop correct
 /// results, so this degrade-safe fallthrough is unconditional.
-fn numeric_prunes(stats: &[NumStat], numeric: &[NumRangeArm]) -> bool {
-    numeric.iter().any(|arm| {
-        stats
-            .iter()
-            .find(|s| s.column_id == arm.column_id)
-            .is_some_and(|stat| stat_disjoint(stat, arm))
+fn numeric_prunes(stats: &[NumStat], numeric: &[NumArm]) -> bool {
+    let stat = |column_id: u32| stats.iter().find(|s| s.column_id == column_id);
+    numeric.iter().any(|arm| match arm {
+        NumArm::Range(arm) => stat(arm.column_id).is_some_and(|s| stat_disjoint(s, arm)),
+        NumArm::NotEq { column_id, value } => stat(*column_id).is_some_and(|s| {
+            s.ty == FieldType::I64 && s.min_bits == *value as u64 && s.max_bits == *value as u64
+        }),
     })
 }
 
@@ -276,13 +294,14 @@ impl SkipIndex {
     /// its children resolve the column; a child that resolves none holds only
     /// nulls for it (write-path completeness, this module's header), and nulls
     /// never satisfy a range, so pruning such a group on its merged stat still
-    /// drops no matching row.
+    /// drops no matching row. A [`NumArm::NotEq`] arm prunes at both tiers on
+    /// the same reasoning: nulls never satisfy `<>` either.
     pub fn candidate_blocks(
         &self,
         ts_min: i64,
         ts_max: i64,
         stream_refs: Option<&[u32]>,
-        numeric: &[NumRangeArm],
+        numeric: &[NumArm],
     ) -> Vec<usize> {
         let mut out = Vec::new();
         for (g, group) in self.l1.iter().enumerate() {
@@ -588,21 +607,21 @@ mod tests {
         // Range [45, 65] overlaps only block 1.
         let arm = [i64_arm(10, Some(45), Some(65))];
         assert_eq!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from)),
             vec![1]
         );
 
         // Open upper bound: >= 55 keeps blocks 1 and 2, drops block 0.
         let arm = [i64_arm(10, Some(55), None)];
         assert_eq!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from)),
             vec![1, 2]
         );
 
         // Open lower bound: <= 5 keeps only block 0.
         let arm = [i64_arm(10, None, Some(5))];
         assert_eq!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from)),
             vec![0]
         );
     }
@@ -635,7 +654,7 @@ mod tests {
         // A range far above block 0's [0,10]. Block 0 is pruned; the no-stat
         // block (index 64) survives -- absence is no information.
         let arm = [i64_arm(10, Some(1_000_000), None)];
-        let got = idx.candidate_blocks(0, 1000, None, &arm);
+        let got = idx.candidate_blocks(0, 1000, None, &arm.map(NumArm::from));
         assert!(
             !got.contains(&0),
             "block 0's stat is disjoint, so it prunes"
@@ -664,7 +683,7 @@ mod tests {
 
         // Range [1050, 1200] overlaps only group 1's blocks.
         let arm = [i64_arm(10, Some(1050), Some(1200))];
-        let got = idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm);
+        let got = idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from));
         assert_eq!(got.len(), FANOUT, "only the 64 blocks of group 1 survive");
         assert!(got.iter().all(|&b| b >= FANOUT));
     }
@@ -694,7 +713,7 @@ mod tests {
             max_bits: Some(4.0f64.to_bits()),
         }];
         assert!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm)
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from))
                 .is_empty(),
             "f64 [1,2] is disjoint from [3,4]"
         );
@@ -705,7 +724,7 @@ mod tests {
             max_bits: None,
         }];
         assert_eq!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from)),
             vec![0]
         );
 
@@ -728,7 +747,7 @@ mod tests {
             max_bits: Some(1),
         }];
         assert!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm)
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from))
                 .is_empty()
         );
     }
@@ -761,7 +780,7 @@ mod tests {
             max_bits: None,
         }];
         assert_eq!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from)),
             vec![0],
             "a +NaN row would satisfy [500, inf) and the stat can't rule it out"
         );
@@ -773,7 +792,7 @@ mod tests {
             max_bits: Some((-500.0f64).to_bits()),
         }];
         assert_eq!(
-            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm.map(NumArm::from)),
             vec![0],
             "a -NaN row would satisfy (-inf, -500] and the stat can't rule it out"
         );

@@ -33,7 +33,7 @@ use crate::record::{
 };
 use crate::rlog_bloom::RlogBloomSection;
 use crate::rlog_codec::decode_dict_page;
-use crate::skip_index::{NumRangeArm, SkipIndex};
+use crate::skip_index::{NumArm, SkipIndex};
 use crate::source::ByteSource;
 use crate::stream_dir::StreamDir;
 use crate::tokenizer::tokens;
@@ -1020,7 +1020,7 @@ impl<'a, S: ByteSource + ?Sized> RlogReader<'a, S> {
     /// fallthrough the unindexed POSTINGS field takes. The bounds pass straight
     /// through as bit patterns; the range is prune-only, so the exact residual
     /// stays the caller's (SQL layer's) job (ADR-0095 decision 6, ADR-0013).
-    fn numeric_range_arms(&self, arms: &[&Predicate]) -> Vec<NumRangeArm> {
+    fn numeric_range_arms(&self, arms: &[&Predicate]) -> Vec<NumArm> {
         self.field_dir.numeric_range_arms(arms)
     }
 
@@ -1849,7 +1849,7 @@ fn compile_arms(stream_dir: &StreamDir, field_dir: &FieldDir, arms: &[&Predicate
     for &p in arms {
         let arm = match p {
             // `flatten` leaves no `And`; an empty one matches every row.
-            Predicate::And(_) | Predicate::NumRange { .. } => continue,
+            Predicate::And(_) | Predicate::NumRange { .. } | Predicate::NumNotEq { .. } => continue,
             Predicate::TsRange { min_ns, max_ns } => Arm::Ts {
                 min: *min_ns,
                 max: *max_ns,
@@ -2654,7 +2654,7 @@ fn eval(
         // into `content`; it matches every row (a no-op) rather than filtering,
         // and the caller re-evaluates the real, exactly-typed range above the
         // scan.
-        Predicate::NumRange { .. } => true,
+        Predicate::NumRange { .. } | Predicate::NumNotEq { .. } => true,
     })
 }
 
