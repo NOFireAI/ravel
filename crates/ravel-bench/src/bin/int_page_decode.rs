@@ -3,8 +3,14 @@
 //! Builds one 8,192-row page per shape and times
 //! `ravel_codec::encoding::decode_i64_into` over it, repeating until at least
 //! one second has elapsed. Prints one line per shape: the shape, the encoding
-//! the page carries, and nanoseconds per block row. An optional argument
-//! keeps only the shapes whose name starts with it.
+//! the page carries, nanoseconds per block row, the shape's ceiling, and
+//! PASS or MISS. An optional argument keeps only the shapes whose name starts
+//! with it.
+//!
+//! Exits 1 after printing every shape when any selected shape measured above
+//! its ceiling or produced no figure, or when the filter selects no shape.
+//! Exits 2 when built without `--release`. The ceilings are the release
+//! figures from the change that introduced bulk decode times about 1.5.
 //!
 //! Every page comes from `encode_i64` except the two Plain shapes: the
 //! encoder picks ForBitpack for both value ranges (a 7-bit and a 40-bit pack
@@ -81,9 +87,10 @@ struct Shape {
     bytes: Vec<u8>,
     presence: Option<Vec<u8>>,
     expect: Vec<i64>,
+    ceiling_ns: f64,
 }
 
-fn encoded(name: &'static str, want: Enc, values: Vec<i64>) -> Shape {
+fn encoded(name: &'static str, ceiling_ns: f64, want: Enc, values: Vec<i64>) -> Shape {
     let (enc, bytes) = encode_i64(&values);
     assert_eq!(enc, want, "shape {name}: encode_i64 picked {enc:?}");
     Shape {
@@ -92,10 +99,11 @@ fn encoded(name: &'static str, want: Enc, values: Vec<i64>) -> Shape {
         bytes,
         presence: None,
         expect: values,
+        ceiling_ns,
     }
 }
 
-fn plain(name: &'static str, values: Vec<i64>) -> Shape {
+fn plain(name: &'static str, ceiling_ns: f64, values: Vec<i64>) -> Shape {
     let bytes = plain_page(&values);
     assert_eq!(
         decode_i64(Enc::Plain, &bytes, values.len()).expect("plain page decodes"),
@@ -107,32 +115,38 @@ fn plain(name: &'static str, values: Vec<i64>) -> Shape {
         bytes,
         presence: None,
         expect: values,
+        ceiling_ns,
     }
 }
 
 fn shapes() -> Vec<Shape> {
     let mut rng = Rng(0x3235);
-    let mut out = vec![encoded("a_constant_0", Enc::Constant, vec![0; ROWS])];
+    let mut out = vec![encoded("a_constant_0", 0.25, Enc::Constant, vec![0; ROWS])];
     out.push(encoded(
         "b_rle_runs_400",
+        0.25,
         Enc::Rle,
         rle_values(&mut rng, ROWS),
     ));
     out.push(plain(
         "c_plain_0_100",
+        3.0,
         (0..ROWS).map(|_| rng.below(100) as i64).collect(),
     ));
     out.push(plain(
         "c2_plain_0_64",
+        0.9,
         (0..ROWS).map(|_| rng.below(64) as i64).collect(),
     ));
     out.push(plain(
         "d_plain_0_2e40",
+        6.5,
         (0..ROWS).map(|_| rng.below(1 << 40) as i64).collect(),
     ));
     let mut acc = 1_700_000_000_000i64;
     out.push(encoded(
         "e_delta_rising",
+        1.8,
         Enc::DeltaZigzag,
         (0..ROWS)
             .map(|_| {
@@ -143,6 +157,7 @@ fn shapes() -> Vec<Shape> {
     ));
     out.push(encoded(
         "f_for_8bit",
+        1.3,
         Enc::ForBitpack,
         (0..ROWS).map(|_| 1_000 + rng.below(256) as i64).collect(),
     ));
@@ -169,17 +184,32 @@ fn shapes() -> Vec<Shape> {
         bytes,
         presence: Some(presence),
         expect,
+        ceiling_ns: 1.5,
     });
     out
 }
 
 fn main() {
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    println!("int_page_decode profile={profile} rows={ROWS}");
+    if cfg!(debug_assertions) {
+        eprintln!("int_page_decode: refusing to time a debug build; rerun with --release");
+        std::process::exit(2);
+    }
+
     let only = std::env::args().nth(1);
     let mut out = vec![0i64; ROWS];
+    let mut expected = Vec::new();
+    let mut figures: Vec<(&'static str, f64)> = Vec::new();
     for s in shapes() {
         if only.as_deref().is_some_and(|p| !s.name.starts_with(p)) {
             continue;
         }
+        expected.push((s.name, s.ceiling_ns));
         let presence = s.presence.as_deref();
         decode_i64_into(s.enc, &s.bytes, presence, &mut out, Ok).expect("decodes");
         assert_eq!(out, s.expect, "shape {} decoded wrong values", s.name);
@@ -201,13 +231,52 @@ fn main() {
             reps += 64;
         }
         let ns = start.elapsed().as_nanos() as f64 / (reps as f64 * ROWS as f64);
+        let verdict = if ns.is_finite() && ns <= s.ceiling_ns {
+            "PASS"
+        } else {
+            "MISS"
+        };
         println!(
-            "{:<20} {:<12} {:>8.3} ns/value  ({} bytes, {} reps)",
+            "{:<20} {:<12} {:>8.3} ns/value  ceiling {:>5.2}  {}  ({} bytes, {} reps)",
             s.name,
             format!("{:?}", s.enc),
             ns,
+            s.ceiling_ns,
+            verdict,
             s.bytes.len(),
             reps
         );
+        if reps > 0 && ns.is_finite() {
+            figures.push((s.name, ns));
+        }
+    }
+
+    let mut failed = Vec::new();
+    if expected.is_empty() {
+        failed.push(format!(
+            "no shape matches filter {:?}",
+            only.as_deref().unwrap_or("")
+        ));
+    }
+    for &(name, ceiling) in &expected {
+        let got: Vec<f64> = figures
+            .iter()
+            .filter(|(n, _)| *n == name)
+            .map(|&(_, ns)| ns)
+            .collect();
+        match got.as_slice() {
+            [ns] if *ns <= ceiling => {}
+            [ns] => failed.push(format!(
+                "{name}: {ns:.3} ns/value above ceiling {ceiling:.2}"
+            )),
+            [] => failed.push(format!("{name}: no figure")),
+            many => failed.push(format!("{name}: {} figures, expected one", many.len())),
+        }
+    }
+    if !failed.is_empty() {
+        for f in &failed {
+            eprintln!("int_page_decode MISS {f}");
+        }
+        std::process::exit(1);
     }
 }
