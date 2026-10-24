@@ -1558,3 +1558,14 @@ listed in the reserve-ahead amendment now run under the default.
 ClickBench statements' plans. The ignored matrix in
 `crates/ravel-sql/tests/group_by_reservation_lag.rs` sets the derived
 profile the same way and samples every row at 1 ms.
+
+That matrix does not meet #3181's 16 MiB bar on the gap between live bytes
+and reserved plus envelope. In four `--release` runs on a 16 vCPU amd64
+host, the unreserved part of the q33-shaped row's largest build-phase live
+step stayed under the envelope held at that sample, but 6 to 9 of the 14
+Ravel rows read over 16 MiB in each run: in the emit phase (the q33-shaped
+row read 271 to 916 MiB, a stream's materialized output and not something
+the envelope covers), and in the build phase of the 8-partition string-key
+rows (up to 80.0 MiB). One run of the matrix on the reserve-ahead
+amendment's code and sampler, `5 x J_max` included, read over 16 MiB on 8
+of its 14 Ravel rows on that host.

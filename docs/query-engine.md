@@ -1509,7 +1509,7 @@ grown the group table and the accumulator `Vec`s, and ask for less than
 those allocations hold, so the pool charges a consumer named
 `PartialHashAggregateStream[..]`, `FinalHashAggregateStream[..]` or
 `SingleHashAggregateStream[..]` ahead of what it asks for
-(`SqlConfig::aggregate_reserve_ahead`, issue #3181). Every grow and shrink
+(`SqlConfig::aggregate_reserve_ahead`). Every grow and shrink
 is charged at 1.25 times the bytes asked on the query, tenant and process
 budgets, so a query's peak intermediate bytes and its ceiling checks read
 the charged figure. The pool also reserves, on the process budget alone, an

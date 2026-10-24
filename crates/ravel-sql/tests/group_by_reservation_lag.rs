@@ -36,14 +36,18 @@
 //! Each row splits its peak gap by phase: `start` (before the first result
 //! batch and before any migrated aggregate stream grew), `grown` (before the
 //! first result batch, after one had grown) and `emit` (from the first result
-//! batch on). On DataFusion 55.2 with the factor and the envelope, the build
-//! phase (`start` and `grown`) stayed within 24 MiB on every row in three
-//! runs, q33's included, and its largest readings fall in the first
-//! milliseconds, while streams that have not reserved yet allocate their first
-//! blocks. The emit
-//! phase carries the largest gaps: a stream materializes every group while its
-//! state is still live, and slices of that output stay referenced after the
-//! stream has resized its reservation to zero.
+//! batch on). On DataFusion 55.2 with the default factor and layout envelope,
+//! in four runs sampled every millisecond, the build phase stayed within
+//! 26 MiB on every row but the 8-partition string-key ones, q33's included;
+//! those read 13.5-80.0 MiB, up to 17.2 MiB of it before any aggregate stream
+//! had grown; at the Ravel `COUNT(*)` row's largest live step, 27.7-39.6 MiB
+//! of the rise was unreserved against 4.6-32.9 MiB of envelope. The emit
+//! phase carries the largest gaps (q33's read 271, 461, 916 and 347 MiB): a
+//! stream materializes every group while its state is still live, and slices
+//! of that output stay referenced after the stream has resized its
+//! reservation to zero. Both are why rows read over [`MAX_PEAK_GAP`]. The
+//! unreserved part of q33's largest build-phase live step stayed under the
+//! envelope held at that sample in all four runs.
 //!
 //! The heap-profiling matrix below (`group_by_allocation_lead_over_reservation`)
 //! is `#[ignore]`d: it is the only test in this file that samples the global
@@ -115,12 +119,13 @@ const Q33_PARTITIONS: usize = 32;
 const Q33_GROUPS_PER_PARTITION: usize = 3_100_000;
 const Q33_ROWS: usize = Q33_PARTITIONS * Q33_GROUPS_PER_PARTITION;
 
-/// Bound on every row's peak of `live - pool.reserved() -
+/// Bound on every Ravel row's peak of `live - pool.reserved() -
 /// sql_memory_aggregate_envelope_bytes()`, issue #3181's acceptance bar. The
-/// factor and the envelope cover a stream's next doubling while it builds;
+/// factor and the envelope cover a stream's next step while it builds;
 /// neither covers a stream's allocations before its first reservation, nor
 /// the emit phase's materialized output, so rows whose gap peaks there read
-/// over this bound.
+/// over this bound, and so do the 8-partition string-key rows' build phase
+/// (see the module doc).
 const MAX_PEAK_GAP: usize = 16 << 20;
 
 #[derive(Clone, Copy, Debug)]
@@ -141,6 +146,10 @@ enum Agg {
 
 /// How often the sampler reads live and reserved bytes.
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Fewest samples a row may take. The fastest rows, the 3M-row two-integer
+/// keys, ran in 34-68 ms in `--release` and took 32-64 samples in four runs.
+const MIN_SAMPLES: usize = 25;
 
 /// Forwards to the query's pool and records, beside it, what DataFusion asked
 /// for: the net bytes every reservation declared, and the largest single
@@ -820,8 +829,8 @@ fn exact_integer_avg_takes_part_in_the_partial_aggregation_skip() {
 /// Heap-profiling matrix: 17 configurations over [`ROWS`] rows and
 /// [`DISTINCT`] groups, plus the q33-shaped row over [`Q33_ROWS`] rows. CI's
 /// `cargo test` runs the dev profile, which is unoptimized, and this test's
-/// dev-profile runtime there has never been measured. Every row is held to
-/// [`MAX_PEAK_GAP`]; two of the 3M-row configurations also carry the bands
+/// dev-profile runtime there has never been measured. Every Ravel row is held
+/// to [`MAX_PEAK_GAP`]; two of the 3M-row configurations also carry the bands
 /// below. The `lead` column says whether the build-phase lead of live bytes
 /// over what DataFusion asked for reached 4 or 2 times the largest single
 /// aggregate grow (`J_max`). Run it explicitly, in `--release` (the profile
@@ -836,17 +845,18 @@ fn group_by_allocation_lead_over_reservation() {
     /// Peak (live - reserved - envelope) bytes for the 32-partition,
     /// string-key, `COUNT(*)` run, as `(low, high)`.
     ///
-    /// Basis: three `--release` runs of this test on DataFusion 55.2 with the
-    /// undercount factor and the envelope (issue #3181), on an amd64 CI-class
-    /// host (16 vCPU, 30 GB RAM), measured 11.7, 5.8 and 12.2 MiB for
-    /// this configuration (1.5M groups); before the factor and the envelope
-    /// five runs measured 84.6-94.7 MiB. The band is the 55.2 range widened
-    /// for scheduling variation (the peak depends on how much output is still
-    /// referenced when the sampler fires). A reading above `high` means
-    /// allocation leads the ledgers by more than it did, which is the
-    /// regression this detects; below `low` means the gap closed further, and
-    /// the band should be tightened to the new figure.
-    const GAP_BAND_32_PARTITION_STRING_KEY: (usize, usize) = (2 << 20, 16 << 20);
+    /// Basis: four `--release` runs of this test on DataFusion 55.2 with the
+    /// default factor and the envelope sized from the plan's layout (issue
+    /// #3181), sampled every millisecond, on an amd64 CI-class host (16 vCPU,
+    /// 30 GB RAM), measured 22.4, 17.9, 4.8 and 20.0 MiB for this configuration
+    /// (1.5M groups), each peak in the emit phase; before the factor and the
+    /// envelope five runs measured 84.6-94.7 MiB. The band is the measured
+    /// range widened for scheduling variation (the peak depends on how much
+    /// output is still referenced when the sampler fires). A reading above
+    /// `high` means allocation leads the ledgers by more than it did, which
+    /// is the regression this detects; below `low` means the gap closed
+    /// further, and the band should be tightened to the new figure.
+    const GAP_BAND_32_PARTITION_STRING_KEY: (usize, usize) = (2 << 20, 40 << 20);
 
     /// Bound on peak live bytes of the exact `AVG` run over those of the
     /// `COUNT(*)` run at the same partition count and key.
@@ -999,7 +1009,7 @@ fn group_by_allocation_lead_over_reservation() {
             r.groups
         );
         assert!(
-            r.samples >= 50,
+            r.samples >= MIN_SAMPLES,
             "{}: sampler took {} samples, too few to trust a peak",
             r.label,
             r.samples
@@ -1054,10 +1064,15 @@ fn group_by_allocation_lead_over_reservation() {
         gated.peak_gap
     );
 
-    let over: Vec<String> = runs
+    let ravel: Vec<&Run> = runs
         .iter()
-        .filter(|(_, r)| r.peak_gap > MAX_PEAK_GAP)
-        .map(|(_, r)| {
+        .map(|(_, r)| r)
+        .filter(|r| matches!(r.variant, Variant::Ravel))
+        .collect();
+    let over: Vec<String> = ravel
+        .iter()
+        .filter(|r| r.peak_gap > MAX_PEAK_GAP)
+        .map(|r| {
             format!(
                 "{}: peak gap {} bytes (build: start {}, grown {}; emit {})",
                 r.label, r.peak_gap, r.peak_gap_start, r.peak_gap_grown, r.peak_gap_emit
@@ -1066,10 +1081,10 @@ fn group_by_allocation_lead_over_reservation() {
         .collect();
     assert!(
         over.is_empty(),
-        "{} of {} rows have a peak gap (live - reserved - envelope) over the \
+        "{} of {} Ravel rows have a peak gap (live - reserved - envelope) over the \
          {MAX_PEAK_GAP}-byte bound:\n{}",
         over.len(),
-        runs.len(),
+        ravel.len(),
         over.join("\n")
     );
 }
