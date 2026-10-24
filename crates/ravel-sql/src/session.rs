@@ -155,6 +155,7 @@ use crate::logs_provider::LogsTableProvider;
 use crate::logs_scan::ConfirmTopKThreshold;
 use crate::logs_udf::has_word_udf;
 use crate::map_field_planner::map_field_access_planner;
+use crate::memory::AggregateProfileRule;
 use crate::metadata_agg::MetadataOnlyAggregate;
 use crate::minmax::{total_order_max_udaf, total_order_min_udaf};
 use crate::parquet::ParquetSession;
@@ -792,6 +793,7 @@ pub fn build_session_with_tables(
         Some(store) => Arc::new(SingleStoreRegistry::new(Arc::clone(store))),
         None => Arc::new(EmptyObjectStoreRegistry),
     };
+    let profile_rule = AggregateProfileRule::new(Arc::clone(&pool));
     let runtime = RuntimeEnvBuilder::new()
         .with_memory_pool(pool)
         .with_object_store_registry(registry)
@@ -875,6 +877,10 @@ pub fn build_session_with_tables(
     // refuses on any other node). Placed last, it decorates the final plan
     // and nothing has to see through it. See `crate::compact_slices`.
     builder = builder.with_physical_optimizer_rule(Arc::new(CompactSlices));
+    // Set the final plan's aggregate layout on the query pool, so a grouped
+    // aggregate's envelope is sized from it on every path that executes a
+    // plan this session built. Last, so it reads the plan that runs.
+    builder = builder.with_physical_optimizer_rule(Arc::new(profile_rule));
     let state = builder.build();
     let mut ctx = SessionContext::new_with_state(state);
 
@@ -2161,6 +2167,17 @@ mod tests {
         );
         let s3 = Url::parse("s3://bucket/").expect("valid url");
         assert!(registry.get_store(&s3).is_err());
+    }
+
+    #[test]
+    fn the_aggregate_profile_rule_is_the_last_physical_optimizer_rule() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let last = state
+            .physical_optimizers()
+            .last()
+            .expect("the session has physical optimizer rules");
+        assert_eq!(last.name(), crate::memory::AGGREGATE_PROFILE_RULE);
     }
 
     fn session_with(tables: Vec<SessionTable>) -> SessionContext {

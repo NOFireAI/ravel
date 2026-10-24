@@ -1514,9 +1514,10 @@ is charged at 1.25 times the bytes asked on the query, tenant and process
 budgets, so a query's peak intermediate bytes and its ceiling checks read
 the charged figure. The pool also reserves, on the process budget alone, an
 envelope for a building stream's next step, sized from the query's
-aggregate layout. Before the plan executes, the executor derives an
-`AggregateProfile` from its grouped `AggregateExec` nodes
-(`ravel_sql::plan_aggregate_profile`) and sets it on the pool: the group
+aggregate layout. The last physical optimizer rule of every SQL session
+derives an `AggregateProfile` from the final plan's grouped `AggregateExec`
+nodes (`ravel_sql::plan_aggregate_profile`) and sets it on the pool, so SQL,
+Flight SQL and ES|QL plans all carry one before they execute: the group
 table's entry size (16 bytes for a primitive or multi-column key, 32 for a
 single `Utf8View`/`BinaryView` key), `W`, the per-group bytes of every `Vec`
 that grows with the group count (key columns and accumulator state: 8 for
@@ -1527,8 +1528,9 @@ key or accumulator (a single `Utf8` or `Boolean` key, a row-format key, a
 profile `Unknown`, and across several aggregates `Unknown` wins, else the
 largest `w_max / W`. Each grow is matched on its own size, within 3%, to
 the predicted table steps `7/8 x 2^k x entry_size` and `Vec` steps
-`2^k x W`; a match records the stream's last table step `J_t` or `Vec`
-step `J_v` (both, when it matches both), and a grow off both is per-batch
+`2^k x W`; a match records the stream's largest table step `J_t` or `Vec`
+step `J_v` so far (both, when it matches both), so a per-batch grow that
+lands on a low rung does not lower either, and a grow off both is per-batch
 growth. While a stream builds, until its first shrink, the envelope is 2.43
 times its asked size while that is under 8 MiB, else the smaller of that
 and the larger of `5.0 x J_t` (4.9 for 32-byte entries) and
