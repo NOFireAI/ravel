@@ -817,8 +817,8 @@ pub struct QuerySpec {
     /// allocations the allocator keeps, so they cannot exceed the process's peak
     /// allocation, which is why the term scales down with smaller budgets. Below 8
     /// GB that scaling is unmeasured: measure your own peak resident memory and set
-    /// this field. The default is a workaround for issue #3181 and drops when that
-    /// is fixed in 0.26.
+    /// this field. The default was sized before the 0.26 fixes for issue #3181, which
+    /// leave it unchanged; issue #3237 tracks the logs-scan state still uncharged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_headroom_bytes: Option<u64>,
 }
