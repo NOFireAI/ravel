@@ -769,9 +769,9 @@ fn aws_credentials_mount(read_only: bool) -> VolumeMount {
 /// default since Kubernetes 1.29 and stable in 1.33, so inside the
 /// [`MIN_KUBERNETES_MINOR_VERSION`] floor) running the operator image's
 /// `pod-identity-credentials` subcommand. Its startup probe passes once the
-/// running sidecar process has written the credentials file and the file
-/// parses, and the kubelet starts the main container only after that, so the
-/// server never starts without a file.
+/// credentials file parses and either the running sidecar process has written
+/// it or its credential has not yet expired, and the kubelet starts the main
+/// container only after that, so the server never starts without a file.
 ///
 /// It carries the server's [`container_security_context`] and sets no user:
 /// both images are distroless `nonroot` (UID 65532), so the 0600 file it

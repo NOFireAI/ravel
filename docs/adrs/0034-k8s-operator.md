@@ -641,7 +641,8 @@ operator itself, on EKS Pod Identity roles, with no key in any Secret
   `ravel-operator pod-identity-credentials --output
   /var/run/ravel/aws/credentials.json` on a memory-backed `emptyDir`
   (`sizeLimit: 1Mi`), and a startup probe execs the same binary with
-  `--probe`, so the server container starts only once the file exists.
+  `--probe`, so the server container starts only once the file exists
+  (narrowed by the sidecar probe correction below).
   The server container mounts the volume read-only and gets
   `--s3-credentials-file`; the Job's `ravel-cli` gets
   `RAVEL_S3_CREDENTIALS_FILE`. Both images run as the distroless `nonroot`
@@ -671,3 +672,28 @@ operator itself, on EKS Pod Identity roles, with no key in any Secret
   enters the qualified-input hash only under `podIdentity`, so a `static`
   cluster's hash, and its qualification, do not move on upgrade, while
   switching modes re-runs qualification.
+
+## Correction (2026-10-24): the sidecar probe correction
+
+<!-- amendment-supersedes: phrase="so the server container starts only once the file exists" pointer="sidecar probe correction" -->
+
+The Pod Identity amendment says the sidecar's startup probe means "the
+server container starts only once the file exists". The file's existence is
+not the rule, because the `emptyDir` outlives a sidecar restart and keeps
+the previous process's file. The probe (`ravel-operator
+pod-identity-credentials --probe PATH`) passes when the file parses with
+both keys non-empty and either of these holds:
+
+- the sidecar process running now has written it: each process removes the
+  written marker (`.credentials.json.written`) when it starts and creates it
+  after each successful write;
+- the file's `expiration`, which the sidecar writes beside the three keys
+  as the credential's RFC 3339 `Expiration` and which ravel-server ignores,
+  is after the time of the probe.
+
+A file left by an earlier process whose credential has expired, or that
+records no expiration, fails until the new process writes. An unexpired one
+passes, so a sidecar restarted during a Pod Identity agent outage shorter
+than the credential's remaining life keeps passing its probe and retries in
+place with its capped backoff, instead of being killed by the probe after
+two minutes and restarted with its backoff reset.
