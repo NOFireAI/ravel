@@ -9585,10 +9585,13 @@ pub(crate) mod tests {
     /// q14's `COUNT(DISTINCT)` is rewritten into two plain group-bys, the
     /// outer one a view key with a COUNT: `W` 24, `w_max` 16, the same ratio
     /// as the inner `(SearchPhrase, UserID)` stream, so the outer node, met
-    /// first, is kept.
+    /// first, is kept. The multi-column streams (q33, q19, q17) report every
+    /// table and `Vec` by capacity, view columns included; the single view
+    /// key map (q34, q35, q14) reports its views by length.
     ///
     /// FLIP: an `install_aggregate_profile` that sets nothing reads `None`
-    /// for every statement.
+    /// for every statement; one that marks every layout capacity accounted
+    /// reads `true` for q34, q35 and q14.
     #[tokio::test]
     async fn the_aggregate_profile_of_the_six_measured_statements() {
         use crate::memory::{AggregateLayout, AggregateProfile};
@@ -9602,11 +9605,12 @@ pub(crate) mod tests {
             DeclaredColumn::new("UserID", DeclaredType::I64),
             DeclaredColumn::new("SearchPhrase", DeclaredType::Str),
         ];
-        let layout = |entry_size, vec_width_total, vec_width_max| {
+        let layout = |entry_size, vec_width_total, vec_width_max, capacity_accounted| {
             Some(AggregateProfile::Layout(AggregateLayout {
                 entry_size,
                 vec_width_total,
                 vec_width_max,
+                capacity_accounted,
             }))
         };
         let statements = [
@@ -9614,34 +9618,34 @@ pub(crate) mod tests {
                 "SELECT \"WatchID\", \"ClientIP\", COUNT(*) AS c, SUM(\"IsRefresh\"), \
                  AVG(\"ResolutionWidth\") FROM logs GROUP BY \"WatchID\", \"ClientIP\" \
                  ORDER BY c DESC LIMIT 10",
-                layout(16, 56, 16),
+                layout(16, 56, 16, true),
             ),
             (
                 "SELECT \"URL\", COUNT(*) AS c FROM logs GROUP BY \"URL\" \
                  ORDER BY c DESC LIMIT 10",
-                layout(32, 24, 16),
+                layout(32, 24, 16, false),
             ),
             (
                 "SELECT 1, \"URL\", COUNT(*) AS c FROM logs GROUP BY 1, \"URL\" \
                  ORDER BY c DESC LIMIT 10",
-                layout(32, 24, 16),
+                layout(32, 24, 16, false),
             ),
             (
                 "SELECT \"UserID\", date_part('minute', ts) AS m, \"SearchPhrase\", COUNT(*) \
                  FROM logs GROUP BY \"UserID\", m, \"SearchPhrase\" \
                  ORDER BY COUNT(*) DESC LIMIT 10",
-                layout(16, 36, 16),
+                layout(16, 36, 16, true),
             ),
             (
                 "SELECT \"UserID\", \"SearchPhrase\", COUNT(*) FROM logs \
                  GROUP BY \"UserID\", \"SearchPhrase\" ORDER BY COUNT(*) DESC LIMIT 10",
-                layout(16, 32, 16),
+                layout(16, 32, 16, true),
             ),
             (
                 "SELECT \"SearchPhrase\", COUNT(DISTINCT \"UserID\") AS u FROM logs \
                  WHERE \"SearchPhrase\" <> '' GROUP BY \"SearchPhrase\" \
                  ORDER BY u DESC LIMIT 10",
-                layout(32, 24, 16),
+                layout(32, 24, 16, false),
             ),
             ("SELECT \"URL\", ts FROM logs ORDER BY ts LIMIT 10", None),
         ];
@@ -9727,6 +9731,7 @@ pub(crate) mod tests {
                 entry_size: 16,
                 vec_width_total: 16,
                 vec_width_max: 8,
+                capacity_accounted: true,
             })),
             "{profiles:?}"
         );
@@ -9746,6 +9751,7 @@ pub(crate) mod tests {
                 entry_size: 16,
                 vec_width_total: 16,
                 vec_width_max: 8,
+                capacity_accounted: true,
             })),
             "{profiles:?}"
         );

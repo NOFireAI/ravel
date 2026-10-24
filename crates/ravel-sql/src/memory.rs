@@ -80,6 +80,17 @@
 //! no profile, or before the stream has shown a step of either ladder, it is
 //! `unknown_layout_multiplier x J_max` (5.0), `J_max` its largest grow.
 //!
+//! A layout whose group table and `Vec`s are all reported by capacity
+//! ([`AggregateLayout::capacity_accounted`]) also bounds the next step by the
+//! share of `S` each can hold: every one holds between one and two times its
+//! live groups, so the next table block is at most
+//! `16/7 x (s + 1) x (2S / (W + 2s) + 12) + 16` and the next `Vec` transient
+//! at most `(S + 12s) x 2(W + w_max) / (2W + s)`, `s` the entry size. The
+//! envelope is the smallest of the size bound, the next step and that share
+//! bound. When the two ladders coincide (q33's `14 x 2^k` and `56 x 2^j`),
+//! every grow counts for both and the next step reads `5 x J_max`; the share
+//! bound reads `1.125 x (S + 192)`.
+//!
 //! [`AggregateReserveAhead::DEFAULT`] charges the factor and carries the
 //! envelope; [`AggregateReserveAhead::OFF`] restores one-to-one charging and
 //! no envelope.
@@ -542,7 +553,11 @@ impl AggregateReserveAhead {
             }
             _ => scale(state.largest_step, self.unknown_layout_multiplier),
         };
-        next.min(by_size)
+        let share = match profile {
+            Some(AggregateProfile::Layout(layout)) => layout.share_bound(state.asked),
+            _ => None,
+        };
+        next.min(by_size).min(share.unwrap_or(usize::MAX))
     }
 }
 
@@ -588,6 +603,11 @@ pub struct AggregateLayout {
     pub vec_width_total: usize,
     /// Bytes per group of the widest of those `Vec`s.
     pub vec_width_max: usize,
+    /// Whether the group table and every `Vec` in `vec_width_total` are
+    /// reported to the reservation by capacity, which bounds each one's share
+    /// of the asked size (see [`AggregateLayout::share_bound`]). DataFusion's
+    /// single string-view key map reports its views by length, so it is not.
+    pub capacity_accounted: bool,
 }
 
 impl AggregateLayout {
@@ -601,7 +621,49 @@ impl AggregateLayout {
     fn vec_step(&self, k: i32) -> f64 {
         2f64.powi(k) * self.vec_width_total as f64
     }
+
+    /// An upper bound on the next block of a capacity-accounted stream that
+    /// has asked for `asked` bytes, from the share of `asked` its table and
+    /// its `Vec`s can each hold; `None` when the layout is not capacity
+    /// accounted.
+    ///
+    /// With `g` groups, entry size `s`, table capacity `C_t` and table bytes
+    /// `A_t`: `g <= C_t <= 2g` and `s x (C_t - 12) <= A_t <= s x C_t`, and
+    /// every `Vec` has `g <= C_v <= 2g`, so its family's bytes `A_v` lie in
+    /// `[W x g, 2W x g]`. With `A_t + A_v <= asked` that gives
+    /// `A_t <= asked x 2s / (W + 2s)` and
+    /// `A_v <= (asked + 12s) x 2W / (2W + s)`. The next table block is twice
+    /// the table's `8/7 x C_t` buckets at `s + 1` bytes each plus a control
+    /// tail, at most `16/7 x (s + 1) x (A_t / s + 12) + 16`. The next `Vec`
+    /// transient is at most `A_v x (1 + w_max / W)`, which takes the `Vec`
+    /// that moves to hold no more than `A_v / W` groups: true while one batch
+    /// adds under `asked x s / ((2W + s) x (W + s))` groups.
+    fn share_bound(&self, asked: usize) -> Option<usize> {
+        if !self.capacity_accounted || self.entry_size == 0 || self.vec_width_total == 0 {
+            return None;
+        }
+        let s = self.entry_size as f64;
+        let w_total = self.vec_width_total as f64;
+        let w_max = self.vec_width_max as f64;
+        let asked = asked as f64;
+        let table_entries = asked * 2.0 / (w_total + 2.0 * s) + TABLE_UNACCOUNTED_ENTRIES;
+        let next_table = 16.0 / 7.0 * (s + 1.0) * table_entries + TABLE_CONTROL_TAIL_BYTES;
+        let next_vec =
+            (asked + TABLE_UNACCOUNTED_ENTRIES * s) * 2.0 * (w_total + w_max) / (2.0 * w_total + s);
+        // A float-to-integer `as` saturates.
+        Some(next_table.max(next_vec).ceil() as usize)
+    }
 }
+
+/// How many entries of a group table's capacity its accounted bytes can miss:
+/// `insert_accounted` (datafusion-common 55.2 `utils/proxy.rs`) bumps by 16
+/// entries into a table whose capacity becomes 28, then by the capacity, so
+/// the bumps sum to the capacity less 12.
+const TABLE_UNACCOUNTED_ENTRIES: f64 = 12.0;
+
+/// The control bytes a hashbrown table allocates past one per bucket: one
+/// group width, at most 16.
+const TABLE_CONTROL_TAIL_BYTES: f64 = 16.0;
 
 /// Set the aggregate layout of `plan` on `pool`. A plan with no grouped
 /// aggregate sets nothing, and neither does a pool that is not a
@@ -717,17 +779,20 @@ fn aggregate_layout(aggregate: &AggregateExec) -> Option<AggregateLayout> {
         .iter()
         .map(|field| field.data_type())
         .collect();
-    let (entry_size, mut widths) = match key_types.as_slice() {
-        // `GroupValuesPrimitive`: a `(usize, u64)` map and one values `Vec`.
-        [key] if key.primitive_width().is_some() => (16, vec![key.primitive_width()?]),
+    let (entry_size, capacity_accounted, mut widths) = match key_types.as_slice() {
+        // `GroupValuesPrimitive`: a `(usize, u64)` map and one values `Vec`,
+        // both sized by capacity.
+        [key] if key.primitive_width().is_some() => (16, true, vec![key.primitive_width()?]),
         // `GroupValuesBytesView`: `ArrowBytesViewMap`'s 32-byte entries and
-        // its 16-byte views `Vec`.
-        [DataType::Utf8View | DataType::BinaryView] => (32, vec![16]),
+        // its 16-byte views `Vec`, whose size counts the views by length.
+        [DataType::Utf8View | DataType::BinaryView] => (32, false, vec![16]),
         [_] => return None,
-        // `GroupValuesColumn`: a `(u64, GroupIndexView)` map and one `Vec`
-        // per column.
+        // `GroupValuesColumn`: a `(u64, GroupIndexView)` map counted by
+        // `insert_accounted` and one `Vec` per column, primitive values and
+        // byte views alike sized by capacity.
         _ => (
             16,
+            true,
             key_types
                 .iter()
                 .map(|key| match key {
@@ -746,10 +811,12 @@ fn aggregate_layout(aggregate: &AggregateExec) -> Option<AggregateLayout> {
         entry_size,
         vec_width_total,
         vec_width_max,
+        capacity_accounted,
     })
 }
 
-/// The per-group widths of the `Vec`s `expr`'s groups accumulator grows.
+/// The per-group widths of the `Vec`s `expr`'s groups accumulator grows. Every
+/// accumulator classified here reports its `Vec`s by capacity.
 fn accumulator_widths(expr: &AggregateFunctionExpr) -> Option<Vec<usize>> {
     if expr.is_distinct() || !expr.groups_accumulator_supported() {
         return None;
@@ -2494,12 +2561,23 @@ mod tests {
         109_051_904,
     ];
 
-    /// q33's layout: a 16-byte multi-column table entry, and per group 52
-    /// bytes of `Vec`s whose widest is exact `AVG`'s 16-byte sum.
+    /// A q33-like layout: a 16-byte multi-column table entry, and per group
+    /// 52 bytes of `Vec`s whose widest is exact `AVG`'s 16-byte sum. Not
+    /// capacity accounted, so the envelope these tests read is the ladder.
     const Q33_LAYOUT: AggregateLayout = AggregateLayout {
         entry_size: 16,
         vec_width_total: 52,
         vec_width_max: 16,
+        capacity_accounted: false,
+    };
+
+    /// q33's layout as `plan_aggregate_profile` reads it: per group 56 bytes
+    /// of `Vec`s, all of them reported by capacity.
+    const Q33_ACCOUNTED_LAYOUT: AggregateLayout = AggregateLayout {
+        entry_size: 16,
+        vec_width_total: 56,
+        vec_width_max: 16,
+        capacity_accounted: true,
     };
 
     /// Grow `res` by each of `steps`, returning the envelope on `budget`
@@ -2643,6 +2721,7 @@ mod tests {
             entry_size: 32,
             vec_width_total: 28,
             vec_width_max: 16,
+            capacity_accounted: false,
         }));
         let res = register_on(&pool, PARTIAL);
         // Off both ladders (28 x 2^18 = 7,340,032 and 28 x 2^19 =
@@ -2657,6 +2736,125 @@ mod tests {
         assert_eq!(envelopes[0], 143_864_628);
         assert_eq!(envelopes[0], scale(delta, 4.9) as u64);
         drop(res);
+    }
+
+    /// q33's table ladder `14 x 2^k` and `Vec` ladder `56 x 2^j` are one set,
+    /// so every step is both chains' step and the ladder bound is
+    /// `5 x J_max`. The capacity share of the asked size bounds it instead.
+    /// FLIP: the PR head's `min(2.43 x S, ladder)` reads 587,202,560 at the
+    /// end; taking the share over the charged bytes reads 361,267,416.
+    #[test]
+    fn the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_ACCOUNTED_LAYOUT));
+        let res = register_on(&pool, PARTIAL);
+        // Table, `Vec`, table, `Vec`, table, `Vec`: 14 x 2^19, 56 x 2^19,
+        // 14 x 2^20, 56 x 2^20, 14 x 2^21, 56 x 2^21.
+        let steps = [
+            7_340_032,
+            29_360_128,
+            14_680_064,
+            58_720_256,
+            29_360_128,
+            117_440_512,
+        ];
+        let envelopes = envelopes_after(&budget, &pool, &res, &steps);
+        assert_eq!(chain_steps(&pool, &res), (117_440_512, 117_440_512));
+
+        let asked: usize = steps.iter().sum();
+        assert_eq!(asked, 256_901_120);
+        let last = envelopes[5];
+        // (S + 12 x 16) x 2 x (56 + 16) / (2 x 56 + 16) = 1.125 x 256,901,312.
+        assert_eq!(last, 289_013_976);
+        assert!(
+            last <= (1.125 * (asked + 12 * 16) as f64).ceil() as u64,
+            "the capacity share bound: {last}"
+        );
+        assert!(
+            last < 5 * 117_440_512,
+            "under the ladder bound 5 x J_max: {last}"
+        );
+        let vec_bytes: u64 = 29_360_128 + 58_720_256 + 117_440_512;
+        assert!(
+            last >= vec_bytes * (56 + 16) / 56,
+            "the next Vec step, with its widest Vec moving last: {last}"
+        );
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// A single view key map reports its views by length, so the share of
+    /// the asked size its table and `Vec`s hold is not bounded, and its
+    /// envelope stays the ladder or size bound.
+    /// FLIP: applying the share bound to every layout reads 101,761,141.
+    #[test]
+    fn a_view_key_layout_does_not_take_the_capacity_share_bound() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        let layout = AggregateLayout {
+            entry_size: 32,
+            vec_width_total: 24,
+            vec_width_max: 16,
+            capacity_accounted: false,
+        };
+        pool.set_aggregate_profile(AggregateProfile::Layout(layout));
+        let res = register_on(&pool, PARTIAL);
+        // Off both ladders, then the 28 x 2^20 table step.
+        envelopes_after(&budget, &pool, &res, &[10_000_000; 3]);
+        let delta = 28 << 20;
+        let envelopes = envelopes_after(&budget, &pool, &res, &[delta]);
+        assert_eq!(chain_steps(&pool, &res), (delta, 0));
+        assert_eq!(layout.share_bound(30_000_000 + delta), None);
+        // 4.9 x 29,360,128, under 2.43 x 59,360,128 = 144,245,112.
+        assert_eq!(envelopes[0], 143_864_628);
+        assert_eq!(envelopes[0], scale(delta, 4.9) as u64);
+        drop(res);
+    }
+
+    /// The share bound is taken over the bytes the consumer asked for, not
+    /// the 1.25 times that the pool charges.
+    /// FLIP: taking it over the charged 45,875,200 reads 51,609,816; the PR
+    /// head's `min(2.43 x S, ladder)` reads 89,181,389.
+    #[test]
+    fn the_share_bound_reads_asked_not_charged_bytes() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_ACCOUNTED_LAYOUT));
+        let res = register_on(&pool, PARTIAL);
+        let envelopes = envelopes_after(&budget, &pool, &res, &[7_340_032, 29_360_128]);
+        let asked = 7_340_032 + 29_360_128;
+        assert_eq!(pool.reserved(), 45_875_200, "1.25 x {asked} charged");
+        // 1.125 x (36,700,160 + 192), under 2.43 x S and 5 x 29,360,128.
+        assert_eq!(envelopes[1], 41_287_896);
+        assert_eq!(
+            Some(envelopes[1] as usize),
+            Q33_ACCOUNTED_LAYOUT.share_bound(asked)
+        );
+        assert_ne!(
+            Q33_ACCOUNTED_LAYOUT.share_bound(pool.reserved()),
+            Some(envelopes[1] as usize)
+        );
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
     }
 
     /// FLIP: classifying each delta as a doubling of the chain's last step
