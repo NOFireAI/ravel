@@ -4051,8 +4051,10 @@ fn combined_predicate_with_streams(
 ///
 /// 256 KiB rather than the 64 KiB this started at (issue #766). The plan phase
 /// needs SKIP_IDX, and under version 4 the fetch phase needs PAGE_DIR as well;
-/// both sit *before* BLOOM in the object, so a suffix probe reaches them only
-/// by spanning BLOOM too. On the reference ClickBench tenant BLOOM averages
+/// in an object written before the ADR-0699 amendment of 2026-10-24 both sit
+/// *before* BLOOM, so a suffix probe reaches them only by spanning BLOOM too
+/// (the amendment moves BLOOM and POSTINGS ahead of SKIP_IDX, so on a newer
+/// object they are not in the way). On the reference ClickBench tenant BLOOM averages
 /// 86 KB, so the 64 KiB probe missed SKIP_IDX on 68.8% of above-threshold
 /// objects and cost 4,415 extra GETs per predicated statement. The
 /// `probe_covers_the_plan_sections_on_a_wide_row_group_object` test measures
@@ -4075,15 +4077,17 @@ fn combined_predicate_with_streams(
 /// keeping this ceiling for a wide one whose tail genuinely approaches it. The
 /// ceiling stays 256 KiB because the widest object measured (a 105-column,
 /// 128-block object, issue #766) needs a probe this large to carry footer +
-/// SKIP_IDX + PAGE_DIR past the BLOOM section between them in one GET; beyond it
-/// a longer probe is pure over-read.
+/// SKIP_IDX + PAGE_DIR past the BLOOM section between them in one GET, which
+/// holds for objects written before the ADR-0699 amendment of 2026-10-24;
+/// beyond it a longer probe is pure over-read.
 pub const DEFAULT_LOG_SUFFIX_LEN: u64 = 256 * 1024;
 
 /// Floor of the per-object suffix-probe derivation ([`derive_suffix_len`], issue
 /// #883): the smallest probe issued for any object above the whole-object
 /// threshold. The plan and scan probes must reach SKIP_IDX (and, on a version-4
-/// object, PAGE_DIR), which sit BEFORE the BLOOM section in the object, so a
-/// suffix probe reaches them only by spanning BLOOM too. On the reference
+/// object, PAGE_DIR), which in an object written before the ADR-0699 amendment
+/// of 2026-10-24 sit BEFORE the BLOOM section, so a suffix probe reaches them
+/// only by spanning BLOOM too. On the reference
 /// ClickBench tenant BLOOM averages 86 KB (issue #766); 128 KiB covers that
 /// average plus the adjacent PAGE_DIR/SKIP_IDX/POSTINGS/footer with headroom, so
 /// a floor-sized probe still captures the plan sections of a low-block-count
@@ -15150,8 +15154,9 @@ mod owned_block_plan_tests {
     //! plan covers only the partition's own blocks, and with the plan phase's
     //! decoded directories in hand it fetches no directory section. The current
     //! writer puts STREAM_DIR and FIELD_DIR in the tail probe (ADR-0699,
-    //! 2026-10-24 amendment); [`front_order_fixture`] keeps the order before it,
-    //! where only the carried directories spare the open a section GET.
+    //! 2026-10-24 amendment); [`front_directory_order_fixture`] moves the pair
+    //! back to the front, where only the carried directories spare the open a
+    //! section GET.
     //!
     //! The object has three row groups of four one-record blocks. The projection
     //! is the fixed columns only (`ts` and the stream reference), so the ranged
@@ -15251,12 +15256,14 @@ mod owned_block_plan_tests {
         fixture_over(object, coalesce_gap, blocks, coverage).await
     }
 
-    /// The [`BLOCKS`]-block fixture rewritten in the section order before the
-    /// ADR-0699 2026-10-24 amendment: STREAM_DIR and FIELD_DIR at offset 0,
-    /// ahead of BLOCKS, outside any tail probe. Every section is
+    /// The [`BLOCKS`]-block fixture rewritten in front-directory order:
+    /// STREAM_DIR and FIELD_DIR moved to offset 0, ahead of BLOCKS, outside any
+    /// tail probe, where objects written before the ADR-0699 2026-10-24
+    /// amendment hold them. The other sections keep the current writer's
+    /// order, so this is not the whole pre-amendment layout. Every section is
     /// position-independent (PAGE_DIR offsets are relative to BLOCKS), so the
     /// rewrite moves stored bytes and footer offsets only.
-    async fn front_order_fixture(two_streams: bool) -> Fixture {
+    async fn front_directory_order_fixture(two_streams: bool) -> Fixture {
         let current = fixture_with(two_streams).await.object;
         let mut f = footer::open(&current).expect("footer");
         let rank = |k: u32| match k {
@@ -15456,13 +15463,13 @@ mod owned_block_plan_tests {
 
     /// The open issues no directory section GET, with or without the plan
     /// phase's directories: the current writer puts STREAM_DIR and FIELD_DIR in
-    /// the tail probe, so both arms place them from it. On an object in the
-    /// order before the ADR-0699 2026-10-24 amendment the carried directories
+    /// the tail probe, so both arms place them from it. On a front-directory
+    /// order object the carried directories
     /// are what spare the GET: STREAM_DIR and FIELD_DIR are not placed with
     /// them, and one section GET places both without.
     ///
     /// Fails against an open that ignores the carried directories and fetches
-    /// the sections again (the front-order arm with them), and against the
+    /// the sections again (the front-directory-order arm with them), and against the
     /// writer order before that amendment (`metadata_gets` 1 in the current
     /// arms).
     #[tokio::test]
@@ -15491,7 +15498,7 @@ mod owned_block_plan_tests {
             assert_eq!(placed_blocks(&fx, &bytes), vec![4, 5, 6, 7]);
         }
 
-        let fx = front_order_fixture(false).await;
+        let fx = front_directory_order_fixture(false).await;
         let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
             .expect("directories");
         let owned = [4usize, 5, 6, 7];
@@ -15532,7 +15539,7 @@ mod owned_block_plan_tests {
     }
 
     /// A stream-attribute filter resolves against the carried STREAM_DIR: on an
-    /// object with STREAM_DIR ahead of BLOCKS ([`front_order_fixture`]) the
+    /// object with STREAM_DIR ahead of BLOCKS ([`front_directory_order_fixture`]) the
     /// open's ranged fetch places no front section, so reading STREAM_DIR out
     /// of the fetched buffer would fail, and the rows must still be exactly
     /// the matching stream's.
@@ -15541,7 +15548,7 @@ mod owned_block_plan_tests {
     /// (`Unplaced` on STREAM_DIR) rather than from the carried directories.
     #[tokio::test]
     async fn a_stream_filter_resolves_from_the_carried_directories() {
-        let fx = front_order_fixture(true).await;
+        let fx = front_directory_order_fixture(true).await;
         let query = LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(StreamAttrEquals::new(
             "service.name",
             AttrValue::Str("even".into()),

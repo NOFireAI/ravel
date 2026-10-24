@@ -230,11 +230,13 @@ fn tail_len(bytes: &[u8]) -> u64 {
     bytes.len() as u64 - (offset + len)
 }
 
-/// `bytes` rewritten in the section order before the ADR-0699 2026-10-24
-/// amendment: STREAM_DIR and FIELD_DIR at offset 0, ahead of BLOCKS, where a
-/// tail probe cannot reach them. Readers still open objects stored that way,
-/// and every section is position-independent (PAGE_DIR offsets are relative
-/// to BLOCKS), so moving stored bytes and footer offsets is the whole rewrite.
+/// `bytes` rewritten in front-directory order: STREAM_DIR and FIELD_DIR moved
+/// to offset 0, ahead of BLOCKS, where a tail probe cannot reach them and where
+/// objects written before the ADR-0699 2026-10-24 amendment hold them. The
+/// other sections keep the current writer's order, so this is not the whole
+/// pre-amendment layout. Readers still open objects stored that way, and every
+/// section is position-independent (PAGE_DIR offsets are relative to BLOCKS),
+/// so moving stored bytes and footer offsets is the whole rewrite.
 fn front_directory_order(bytes: &[u8]) -> Vec<u8> {
     let mut f = footer_of(bytes);
     let rank = |k: u32| match k {

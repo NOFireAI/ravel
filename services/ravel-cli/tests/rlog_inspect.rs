@@ -129,7 +129,8 @@ fn rlog_inspect_output_matches_golden_fixture() {
         stdout, expected,
         "`rlog inspect` output regressed; the RLOG format is frozen \
          (docs/log-segment-format.md, currently trailer v5) -- this must not \
-         change without a version bump and ADR"
+         change except by a deliberate format change recorded in an ADR or \
+         an ADR amendment"
     );
     assert!(
         expected.contains("name=SKIP_IDX")
@@ -533,8 +534,9 @@ fn corrupt_key_idx_prints_typed_error_not_panic() {
     assert!(!stderr.contains("panicked"), "inspector panicked: {stderr}");
 }
 
-/// Regenerates `tests/fixtures/rlog_inspect.txt` after a deliberate, versioned
-/// format change (never for an internal refactor). Run explicitly:
+/// Regenerates `tests/fixtures/rlog_inspect.txt` after a deliberate format
+/// change recorded in an ADR or an ADR amendment (never for an internal
+/// refactor). Run explicitly:
 ///   cargo test -p ravel-cli --test rlog_inspect -- --ignored capture
 #[test]
 #[ignore = "regenerates a golden fixture; run explicitly, never in CI"]

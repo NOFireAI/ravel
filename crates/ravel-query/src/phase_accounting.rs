@@ -145,8 +145,9 @@ impl From<QueryPhase> for GetPhase {
 ///   fallback. A planning read fetches no block data, so all of its bytes are
 ///   plan bytes.
 /// - [`QueryPhase::Probe`]: the metadata GETs of a DATA read -- its suffix
-///   probe, footer chase, SKIP_IDX, PAGE_DIR, the front directories, BLOOM and
-///   POSTINGS, and the object's trailing bytes.
+///   probe, footer chase, SKIP_IDX, PAGE_DIR, STREAM_DIR and FIELD_DIR (at the
+///   object's front only in objects written before the ADR-0699 amendment of
+///   2026-10-24), BLOOM and POSTINGS, and the object's trailing bytes.
 /// - [`QueryPhase::Scan`]: the BLOCKS-section data ranges of a data read, and a
 ///   whole-object GET a data read issued to obtain block data.
 /// - [`QueryPhase::Resolve`]: never written by the RLOG read path. The catalog

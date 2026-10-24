@@ -141,8 +141,10 @@ fn layout(bytes: &[u8]) -> (u64, u64, u64) {
     (blocks.offset, blocks.len, tail_len)
 }
 
-/// `bytes` rewritten in the section order before the ADR-0699 2026-10-24
-/// amendment: STREAM_DIR and FIELD_DIR at offset 0, ahead of BLOCKS. Readers
+/// `bytes` rewritten in front-directory order: STREAM_DIR and FIELD_DIR moved
+/// to offset 0, ahead of BLOCKS, where objects written before the ADR-0699
+/// 2026-10-24 amendment hold them. The other sections keep the current
+/// writer's order, so this is not the whole pre-amendment layout. Readers
 /// still open objects stored that way, and every section is
 /// position-independent, so moving stored bytes and footer offsets is the
 /// whole rewrite.

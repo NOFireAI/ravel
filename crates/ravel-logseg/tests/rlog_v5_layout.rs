@@ -535,6 +535,13 @@ fn tail_from_skip_idx_to_trailer_fits_the_probe_at_123_blocks_104_columns() {
         section(&f, kind::STREAM_DIR).len,
         section(&f, kind::FIELD_DIR).len,
     );
+    // 262_144 is the probe ceiling, ravel-query's DEFAULT_LOG_SUFFIX_LEN: a
+    // BLOOM larger than the whole probe is what makes "however large" hold.
+    assert!(
+        bloom.len > 262_144,
+        "BLOOM is {} B, not larger than the 262144 B probe",
+        bloom.len
+    );
     assert!(
         bloom.offset < skip.offset,
         "BLOOM at {} must precede SKIP_IDX at {}",
