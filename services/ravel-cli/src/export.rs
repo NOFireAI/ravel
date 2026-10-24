@@ -73,6 +73,19 @@
 //! a sample with sub-unit precision instead of truncating it, because a
 //! truncated timestamp re-loads as a different sample.
 //!
+//! # Bloom filters
+//!
+//! Each row group carries a Parquet bloom filter on the signal's id columns,
+//! so a reader looking up one trace or span id can skip the row groups that
+//! do not hold it: for spans, the mapping's trace id, span id and parent span
+//! id output columns; for logs, its trace id and span id output columns when
+//! the mapping sets them; for metrics, none. `--parquet-bloom-columns`
+//! replaces that list ([`BloomColumns`]). Every filter targets a
+//! false-positive rate of [`BLOOM_FILTER_FPP`] and is sized for
+//! [`BLOOM_FILTER_MAX_NDV`] distinct values; the parquet writer folds each
+//! one down after its row group is written, to the smallest size that still
+//! meets the target for the values it actually holds.
+//!
 //! # Metrics: duplicates and series identity
 //!
 //! The query path serves one sample per `(series, ts)`, chosen by
@@ -154,6 +167,8 @@ use arrow::array::{
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
+use parquet::schema::types::ColumnPath;
 use ravel_logseg::record::{attr_value_to_string, decode_stream_attrs};
 use ravel_logseg::{AttrValue, LogRecord, LogStreamId};
 use ravel_object_store::ObjectStoreBackend;
@@ -181,6 +196,109 @@ use crate::store::{StoreSelection, require_tenant_data_present};
 /// Rows per output Arrow batch. The decoded records are already resident, so
 /// this bounds only the Arrow/Parquet write buffer, not the peak of the read.
 const EXPORT_BATCH_ROWS: usize = 10_000;
+
+/// Most rows the writer puts in one row group: the parquet crate's default,
+/// set explicitly because [`BLOOM_FILTER_MAX_NDV`] is derived from it.
+const EXPORT_MAX_ROW_GROUP_ROWS: usize = parquet::file::properties::DEFAULT_MAX_ROW_GROUP_ROW_COUNT;
+
+/// False-positive probability every bloom filter is sized and folded to.
+pub const BLOOM_FILTER_FPP: f64 = 0.01;
+
+/// Distinct values a column chunk's bloom filter is first sized for: one per
+/// row a row group can hold, so no row group overfills its filter.
+pub const BLOOM_FILTER_MAX_NDV: u64 = EXPORT_MAX_ROW_GROUP_ROWS as u64;
+
+/// Which output columns get a Parquet bloom filter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum BloomColumns {
+    /// The signal's id columns, as listed in the [module documentation](self).
+    #[default]
+    Default,
+    /// No column.
+    None,
+    /// Exactly these output columns, each checked against the export's
+    /// output columns before any object-store request.
+    Named(Vec<String>),
+}
+
+impl BloomColumns {
+    /// Reads `--parquet-bloom-columns`: absent is [`BloomColumns::Default`],
+    /// the single value `none` is [`BloomColumns::None`], anything else is
+    /// the list of column names. `none` beside a column name is refused,
+    /// since either reading of it would drop half of what was asked for.
+    pub fn from_flag(values: Option<Vec<String>>) -> anyhow::Result<Self> {
+        let Some(values) = values else {
+            return Ok(Self::Default);
+        };
+        if values.iter().any(|value| value == "none") {
+            if values.len() == 1 {
+                return Ok(Self::None);
+            }
+            anyhow::bail!(
+                "--parquet-bloom-columns none must be the only value: it writes no bloom filter, \
+                 so it cannot be combined with column names"
+            );
+        }
+        Ok(Self::Named(values))
+    }
+
+    /// The output columns of `schema` to write a filter on, given the
+    /// signal's `defaults`. A named column the schema does not hold, or one
+    /// that is not a flat (non-nested) column, is refused by name.
+    fn resolve<'a>(
+        &self,
+        defaults: impl IntoIterator<Item = &'a String>,
+        schema: &arrow::datatypes::Schema,
+    ) -> anyhow::Result<Vec<String>> {
+        let names = match self {
+            Self::Default => return Ok(defaults.into_iter().cloned().collect()),
+            Self::None => return Ok(Vec::new()),
+            Self::Named(names) => names,
+        };
+        let mut resolved: Vec<String> = Vec::new();
+        for name in names {
+            let Ok(field) = schema.field_with_name(name) else {
+                let columns: Vec<&str> = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect();
+                anyhow::bail!(
+                    "--parquet-bloom-columns names {name:?}, which is not an output column of \
+                     this export; its output columns are: {}",
+                    columns.join(", ")
+                );
+            };
+            if field.data_type().is_nested() {
+                anyhow::bail!(
+                    "--parquet-bloom-columns names {name:?}, a nested column; a bloom filter is \
+                     written only on a flat column"
+                );
+            }
+            if !resolved.contains(name) {
+                resolved.push(name.clone());
+            }
+        }
+        Ok(resolved)
+    }
+}
+
+/// The writer properties every export uses: [`EXPORT_MAX_ROW_GROUP_ROWS`]
+/// rows per row group, and a bloom filter at [`BLOOM_FILTER_FPP`] sized for
+/// [`BLOOM_FILTER_MAX_NDV`] values on each of `bloom_columns` and on no other
+/// column.
+pub fn export_writer_properties(bloom_columns: &[String]) -> WriterProperties {
+    let mut builder =
+        WriterProperties::builder().set_max_row_group_row_count(Some(EXPORT_MAX_ROW_GROUP_ROWS));
+    for name in bloom_columns {
+        let path = ColumnPath::from(name.as_str());
+        builder = builder
+            .set_column_bloom_filter_enabled(path.clone(), true)
+            .set_column_bloom_filter_fpp(path.clone(), BLOOM_FILTER_FPP)
+            .set_column_bloom_filter_max_ndv(path, BLOOM_FILTER_MAX_NDV);
+    }
+    builder.build()
+}
 
 /// What one `export --signal logs` run did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -285,6 +403,7 @@ pub async fn run(
     shards: u32,
     max_ingest_lag_ns: Option<i64>,
     now_ns: i64,
+    bloom: &BloomColumns,
 ) -> anyhow::Result<()> {
     if let Some(message) = unsupported_signal_message(signal) {
         return Err(anyhow::anyhow!(message));
@@ -305,6 +424,7 @@ pub async fn run(
             shards,
             max_ingest_lag_ns,
             now_ns,
+            bloom,
         )
         .await?;
         println!("output: {}", out.display());
@@ -331,6 +451,7 @@ pub async fn run(
             shards,
             max_ingest_lag_ns,
             now_ns,
+            bloom,
         )
         .await?;
         println!("output: {}", out.display());
@@ -357,6 +478,7 @@ pub async fn run(
         shards,
         max_ingest_lag_ns,
         now_ns,
+        bloom,
     )
     .await?;
     println!("output: {}", out.display());
@@ -386,6 +508,10 @@ pub async fn run(
 /// any other existing non-regular file, and any path under `/dev` are refused
 /// up front, because the final step is a rename that cannot write through to
 /// them (see [`write_parquet`]).
+///
+/// `bloom` picks the columns that get a bloom filter (see the [module
+/// documentation](self)); a named column the output does not have is refused
+/// before any object-store request too.
 #[allow(clippy::too_many_arguments)]
 pub async fn export_logs(
     store: Arc<dyn ObjectStoreBackend>,
@@ -398,9 +524,20 @@ pub async fn export_logs(
     shards: u32,
     max_ingest_lag_ns: Option<i64>,
     now_ns: i64,
+    bloom: &BloomColumns,
 ) -> anyhow::Result<ExportReport> {
     check_window(start_ns, end_ns)?;
     check_output_path(out)?;
+    let empty = build_batch(mapping, &[])?;
+    let props = export_writer_properties(
+        &bloom.resolve(
+            mapping
+                .trace_id_column
+                .iter()
+                .chain(&mapping.span_id_column),
+            &empty.schema(),
+        )?,
+    );
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(selection, store.as_ref(), "export", tenant, &tenant_hash).await?;
 
@@ -446,7 +583,7 @@ pub async fn export_logs(
     records.sort_by_key(|record| record.ts_ns);
 
     let resource_by_stream = decode_resources(&records)?;
-    let rows_written = write_parquet(mapping, &records, &resource_by_stream, out)?;
+    let rows_written = write_parquet(mapping, &records, &resource_by_stream, out, props)?;
 
     Ok(ExportReport {
         rows_written,
@@ -532,7 +669,7 @@ async fn resolve_snapshot(
 /// Parquet file laid out by `mapping`: one row per `(series, ts)`, sorted by
 /// event time, carrying the columns the `[metrics]` section names.
 ///
-/// `shards`, `max_ingest_lag_ns` and `out` mean what they mean for
+/// `shards`, `max_ingest_lag_ns`, `out` and `bloom` mean what they mean for
 /// [`export_logs`]. A mapping shape the export refuses (a
 /// `[metrics.histogram]`, an unusable `name` literal, two fields sharing one
 /// output column), and an unusable `out`, are all refused before any
@@ -556,6 +693,7 @@ pub async fn export_metrics(
     shards: u32,
     max_ingest_lag_ns: Option<i64>,
     now_ns: i64,
+    bloom: &BloomColumns,
 ) -> anyhow::Result<MetricsExportReport> {
     check_window(start_ns, end_ns)?;
     if mapping.is_histogram() {
@@ -576,6 +714,9 @@ pub async fn export_metrics(
         None => None,
     };
     check_output_path(out)?;
+    let props = export_writer_properties(
+        &bloom.resolve([], &build_metrics_batch(mapping, &[], &[])?.schema())?,
+    );
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(selection, store.as_ref(), "export", tenant, &tenant_hash).await?;
 
@@ -739,7 +880,7 @@ pub async fn export_metrics(
     rows.sort_by_key(|row| (row.ts_ns, row.series));
 
     let empty = build_metrics_batch(mapping, &series_out, &[])?;
-    let rows_written = write_output(out, empty.schema(), |writer| {
+    let rows_written = write_output(out, empty.schema(), props, |writer| {
         let mut rows_written = 0u64;
         for chunk in rows.chunks(EXPORT_BATCH_ROWS) {
             let batch = build_metrics_batch(mapping, &series_out, chunk)?;
@@ -1184,7 +1325,7 @@ fn build_metrics_batch(
 /// `(start_ts, trace_id, span_id)`, carrying the columns the `[spans]` section
 /// names.
 ///
-/// `shards`, `max_ingest_lag_ns` and `out` mean what they mean for
+/// `shards`, `max_ingest_lag_ns`, `out` and `bloom` mean what they mean for
 /// [`export_logs`]. Two fields sharing one output column, and an unusable
 /// `out`, are refused before any object-store request.
 ///
@@ -1207,10 +1348,20 @@ pub async fn export_spans(
     shards: u32,
     max_ingest_lag_ns: Option<i64>,
     now_ns: i64,
+    bloom: &BloomColumns,
 ) -> anyhow::Result<SpansExportReport> {
     check_window(start_ns, end_ns)?;
     check_spans_output_columns(mapping)?;
     check_output_path(out)?;
+    let empty = build_spans_batch(mapping, &[])?;
+    let props = export_writer_properties(
+        &bloom.resolve(
+            [&mapping.trace_id_column, &mapping.span_id_column]
+                .into_iter()
+                .chain(&mapping.parent_span_id_column),
+            &empty.schema(),
+        )?,
+    );
     let tenant_hash = TenantId::new(tenant).hash();
     require_tenant_data_present(selection, store.as_ref(), "export", tenant, &tenant_hash).await?;
 
@@ -1260,8 +1411,7 @@ pub async fn export_spans(
 
     let rows = span_output_rows(mapping, &spans)?;
     let spans_with_unwritten_data = spans_with_unwritten_data(mapping, &rows);
-    let empty = build_spans_batch(mapping, &[])?;
-    let rows_written = write_output(out, empty.schema(), |writer| {
+    let rows_written = write_output(out, empty.schema(), props, |writer| {
         let mut rows_written = 0u64;
         for chunk in rows.chunks(EXPORT_BATCH_ROWS) {
             let batch = build_spans_batch(mapping, chunk)?;
@@ -1693,15 +1843,17 @@ fn check_output_path(out: &Path) -> anyhow::Result<()> {
 }
 
 /// Writes `records` to `out` in `EXPORT_BATCH_ROWS`-row batches through
-/// [`write_output`] and returns the row count written.
+/// [`write_output`] and returns the row count written. `props` is
+/// [`export_writer_properties`] of the bloom filter columns.
 fn write_parquet(
     mapping: &Mapping,
     records: &[LogRecord],
     resource_by_stream: &HashMap<LogStreamId, Vec<(String, AttrValue)>>,
     out: &Path,
+    props: WriterProperties,
 ) -> anyhow::Result<u64> {
     let empty = build_batch(mapping, &[])?;
-    write_output(out, empty.schema(), |writer| {
+    write_output(out, empty.schema(), props, |writer| {
         let mut rows_written = 0u64;
         for chunk in records.chunks(EXPORT_BATCH_ROWS) {
             let rows: Vec<ExportRow<'_>> = chunk
@@ -1748,13 +1900,14 @@ fn write_parquet(
 fn write_output(
     out: &Path,
     schema: SchemaRef,
+    props: WriterProperties,
     write_rows: impl FnOnce(&mut ArrowWriter<std::fs::File>) -> anyhow::Result<u64>,
 ) -> anyhow::Result<u64> {
     let (tmp_path, file) = create_temp_output(out)?;
     let written = file
         .try_clone()
         .context("failed to duplicate the temporary export file handle")
-        .and_then(|writer_file| write_batches(writer_file, schema, write_rows, out))
+        .and_then(|writer_file| write_batches(writer_file, schema, props, write_rows, out))
         .and_then(|rows| {
             file.sync_all().with_context(|| {
                 format!(
@@ -1846,10 +1999,11 @@ fn create_temp_output(out: &Path) -> anyhow::Result<(std::path::PathBuf, std::fs
 fn write_batches(
     file: std::fs::File,
     schema: SchemaRef,
+    props: WriterProperties,
     write_rows: impl FnOnce(&mut ArrowWriter<std::fs::File>) -> anyhow::Result<u64>,
     out: &Path,
 ) -> anyhow::Result<u64> {
-    let mut writer = ArrowWriter::try_new(file, schema, None)
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))
         .with_context(|| format!("failed to open a Parquet writer on {}", out.display()))?;
     let rows_written = write_rows(&mut writer)?;
     writer
