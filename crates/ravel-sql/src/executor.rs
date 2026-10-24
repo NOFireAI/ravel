@@ -155,9 +155,7 @@ use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
 use crate::logs_pushdown::extract_logs;
 use crate::logs_scan::ScanExecutions;
-use crate::memory::{
-    CeilingBreach, TenantDelegatingPool, TenantMemoryAccountant, plan_aggregate_profile,
-};
+use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::min_commit_token::MinCommitToken;
 use crate::output::QueryOutput;
 use crate::parquet::{
@@ -4985,18 +4983,6 @@ pub struct AnalyzedRun {
     pub row_cap_hit: bool,
 }
 
-/// Set the aggregate layout of `plan` on `pool` before it executes, so the
-/// pool sizes each migrated aggregate's envelope from it (issue #3181). A
-/// plan with no grouped aggregate sets nothing, and neither does a pool that
-/// is not a [`TenantDelegatingPool`].
-fn install_aggregate_profile(plan: &Arc<dyn ExecutionPlan>, pool: &Arc<dyn MemoryPool>) {
-    if let Some(pool) = pool.downcast_ref::<TenantDelegatingPool>()
-        && let Some(profile) = plan_aggregate_profile(plan)
-    {
-        pool.set_aggregate_profile(profile);
-    }
-}
-
 /// A running plan's `RecordBatch` stream, with its session attached.
 ///
 /// Dropping this mid-stream is the cancellation path: the plan's operators
@@ -5115,7 +5101,6 @@ impl PinnedStream {
             active_since: None,
             elapsed: Duration::ZERO,
         });
-        install_aggregate_profile(&plan, &pool);
         let inner = execute_stream(Arc::clone(&plan), ctx.task_ctx()).map_err(plan_error)?;
         Ok(PinnedStream {
             _ctx: ctx,
@@ -6912,6 +6897,7 @@ pub(crate) mod tests {
     use uuid::Uuid;
 
     use crate::declared::{DeclaredType, StaticDeclaredColumns};
+    use crate::memory::TenantDelegatingPool;
 
     use super::*;
 
@@ -9687,7 +9673,7 @@ pub(crate) mod tests {
                 CeilingBreach::new(),
                 QueryAccounting::new(),
             ));
-            install_aggregate_profile(&plan, &pool);
+            crate::memory::install_aggregate_profile(&plan, &pool);
             let pool = pool
                 .downcast_ref::<TenantDelegatingPool>()
                 .expect("the pool is a TenantDelegatingPool");
@@ -9695,6 +9681,74 @@ pub(crate) mod tests {
         }
         let expected: Vec<_> = statements.iter().map(|(sql, p)| (*sql, *p)).collect();
         assert_eq!(installed, expected);
+    }
+
+    /// Run `source` through the ES|QL entry point and return the aggregate
+    /// profiles set on any pool while it ran.
+    async fn esql_profiles(source: &str) -> Vec<crate::memory::AggregateProfile> {
+        let executor = executor_over(empty_store());
+        let context = crate::esql::PrepareContext {
+            declared: Vec::new(),
+            now_ns: 1_700_000_000_000_000_000,
+            start: None,
+            end: None,
+        };
+        let prepared = crate::esql::prepare(source, &ravel_esql::Limits::default(), &context)
+            .unwrap_or_else(|e| panic!("{source} prepares: {e:?}"));
+        let request = crate::esql::EsqlRequest {
+            min_tokens: Vec::new(),
+            deadline: Duration::from_secs(30),
+            budgets: None,
+            max_rows: None,
+        };
+        crate::memory::take_profiles_set_on_this_thread();
+        crate::esql::execute(
+            &executor,
+            TenantHash([112u8; 16]),
+            &prepared,
+            &request,
+            &LiveAccounting::new(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{source} runs: {e:?}"));
+        crate::memory::take_profiles_set_on_this_thread()
+    }
+
+    /// A `FROM logs` statement's grouped aggregate, keyed on the 8-byte
+    /// timestamp with an 8-byte `COUNT`, gets its layout on the query pool.
+    #[tokio::test]
+    async fn the_esql_path_installs_the_aggregate_profile() {
+        use crate::memory::{AggregateLayout, AggregateProfile};
+
+        let profiles = esql_profiles("FROM logs | STATS c = COUNT(*) BY @timestamp").await;
+        assert_eq!(
+            profiles.last(),
+            Some(&AggregateProfile::Layout(AggregateLayout {
+                entry_size: 16,
+                vec_width_total: 16,
+                vec_width_max: 8,
+            })),
+            "{profiles:?}"
+        );
+    }
+
+    /// A `ROW` statement runs in a session of its own, outside the executor's
+    /// stream, and its grouped aggregate gets its layout on that pool too.
+    /// FLIP: collecting the frame without the profile sets none.
+    #[tokio::test]
+    async fn the_esql_row_path_installs_the_aggregate_profile() {
+        use crate::memory::{AggregateLayout, AggregateProfile};
+
+        let profiles = esql_profiles("ROW k = 1 | STATS c = COUNT(*) BY k").await;
+        assert_eq!(
+            profiles.last(),
+            Some(&AggregateProfile::Layout(AggregateLayout {
+                entry_size: 16,
+                vec_width_total: 16,
+                vec_width_max: 8,
+            })),
+            "{profiles:?}"
+        );
     }
 
     /// ADR-0044 acceptance test: one `execute` call, checked
