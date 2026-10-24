@@ -185,9 +185,10 @@ fn columnar_load_matches_row_load_byte_for_byte() {
     // writer: this one is the RLOG version 5 layout (ADR-2135) with each
     // page's encoding chosen by stored size (#2140). No string chunk here
     // stores smaller on a row-group dictionary (#2144), so that change
-    // leaves it as it was.
+    // leaves it as it was. Re-captured when STREAM_DIR and FIELD_DIR moved
+    // after PAGE_DIR (ADR-0699 amendment of 2026-10-24, #3217).
     const RICH_OBJECT_BLAKE3: &str =
-        "ea47c829f32093565b57cab1ff344a55180f7b350a620ad287ff2ec739871c22";
+        "d76e847362412966435dea5c839dc4b0cf9d8f1f70a7bc9eba275cff5e97960b";
     assert_eq!(
         blake3::hash(&bytes_off).to_hex().as_str(),
         RICH_OBJECT_BLAKE3,

@@ -4,9 +4,13 @@
 //! encode path. RLOG v5 is a frozen persistent contract; this test is the
 //! tripwire for an accidental format change.
 //!
-//! To regenerate `golden_rlog_v5.bin` after a deliberate, versioned format
-//! change (never for an internal refactor), run:
+//! Regenerate `golden_rlog_v5.bin` only after a deliberate format change
+//! recorded in an ADR or an ADR amendment (never for an internal refactor); the
+//! last regeneration is the ADR-0699 2026-10-24 amendment, which moved
+//! STREAM_DIR and FIELD_DIR after PAGE_DIR with no trailer bump. Run:
 //!   cargo test -p ravel-logseg --test golden_bytes_v5 -- --ignored --nocapture
+//! `golden_rlog_v5_front_dirs.bin` is the same input in the order before that
+//! amendment, kept so a reader keeps opening objects of either order.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use ravel_logseg::encoding::Enc;
@@ -97,8 +101,8 @@ fn matches_golden_fixture() {
         written.as_slice(),
         fixture,
         "RLOG v5 writer output diverged from the captured golden fixture; \
-         RLOG v5 is frozen (docs/log-segment-format.md) -- this must never change \
-         without a version bump and ADR"
+         RLOG v5 is frozen (docs/log-segment-format.md) -- this must not change \
+         without an ADR or an ADR amendment recording the format change"
     );
 
     // The trailer carries the live footer::VERSION (never a mirrored literal),
@@ -177,6 +181,34 @@ fn write_is_deterministic_across_repeated_calls() {
         write_golden(),
         write_golden(),
         "v5 output must be deterministic"
+    );
+}
+
+/// An object written before the ADR-0699 2026-10-24 amendment (STREAM_DIR and
+/// FIELD_DIR at offset 0, ahead of BLOCKS) and the same input written today
+/// (both after PAGE_DIR) decode to the same records: readers locate sections by
+/// footer offset, so the order is a writer convention and needs no trailer
+/// bump.
+#[test]
+fn front_directory_objects_decode_to_the_same_records_as_tail_directory_objects() {
+    let front: &[u8] = include_bytes!("fixtures/golden_rlog_v5_front_dirs.bin");
+    let tail = write_golden();
+    let cfg = RlogConfig::default();
+    let scan_all = |bytes: &[u8]| {
+        let reader = RlogReader::new(bytes, &cfg).expect("reader");
+        reader.scan(&Predicate::And(vec![])).expect("scan").0
+    };
+    let from_front = scan_all(front);
+    assert_eq!(from_front.len(), golden_records().len());
+    assert_eq!(from_front, scan_all(&tail));
+
+    let front_footer = open(front).expect("open front-directory object");
+    let tail_footer = open(&tail).expect("open tail-directory object");
+    let offset = |f: &footer::LogFooter, k: u32| f.section(k).expect("section present").offset;
+    assert_eq!(offset(&front_footer, kind::STREAM_DIR), 0);
+    assert!(
+        offset(&tail_footer, kind::STREAM_DIR) > offset(&tail_footer, kind::PAGE_DIR),
+        "the current writer puts STREAM_DIR after PAGE_DIR"
     );
 }
 

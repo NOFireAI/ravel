@@ -4901,7 +4901,10 @@ mod tests {
         // 2-byte constant page) and the zstd-compressed PAGE_DIR goes from 86
         // to 92 bytes at the same 100 uncompressed: its ts and observed_ts
         // page entries, identical down to their crc32c before, now differ.
-        assert_eq!(acc[0].object_store_bytes, 851, "cold run's store bytes");
+        // 852 = that 851 plus 1 from the section order of the ADR-0699
+        // amendment of 2026-10-24: every section's bytes are unchanged and
+        // only the footer's offsets move, which encode one byte longer.
+        assert_eq!(acc[0].object_store_bytes, 852, "cold run's store bytes");
 
         // Warm run: served from cache, and the never-folded tenant's NotFound
         // l/HEAD stays cached too (ADR-2509 decision 3), so no store GET.

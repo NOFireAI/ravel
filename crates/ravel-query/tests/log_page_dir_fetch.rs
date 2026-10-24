@@ -20,7 +20,9 @@
 //! 5. The plan phase fetches no page byte.
 //! 6. Two partitions reading the same chunk collapse onto one store GET.
 //! 7. The default suffix probe covers the plan sections (footer, SKIP_IDX,
-//!    PAGE_DIR) of a wide, full-row-group object, so #766's second GET is gone.
+//!    PAGE_DIR) and the STREAM_DIR and FIELD_DIR after them of a wide,
+//!    full-row-group object, so #766's second GET and the front-section GET
+//!    are gone.
 //! 8. What a chunk read decodes is what a whole-object read decodes.
 //! 9. A tail-section probe miss is counted exactly once per object per read
 //!    path, by whichever layer issued the probe (#883, issue #885 review).
@@ -219,12 +221,47 @@ fn blocks_extent(bytes: &[u8]) -> (u64, u64) {
     (b.offset, b.len)
 }
 
-/// Bytes after the BLOCKS section: SKIP_IDX, PAGE_DIR, BLOOM, POSTINGS, then the
-/// footer and trailer. A probe suffix of exactly this length covers the whole
-/// tail and reaches no page.
+/// Bytes after the BLOCKS section: BLOOM, SKIP_IDX, PAGE_DIR, STREAM_DIR and
+/// FIELD_DIR (KEY_IDX and POSTINGS ahead of BLOOM when written), then the footer
+/// and trailer. A probe suffix of exactly this length covers the whole tail and
+/// reaches no page.
 fn tail_len(bytes: &[u8]) -> u64 {
     let (offset, len) = blocks_extent(bytes);
     bytes.len() as u64 - (offset + len)
+}
+
+/// `bytes` rewritten in front-directory order: STREAM_DIR and FIELD_DIR moved
+/// to offset 0, ahead of BLOCKS, where a tail probe cannot reach them and where
+/// objects written before the ADR-0699 2026-10-24 amendment hold them. The
+/// other sections keep the current writer's order, so this is not the whole
+/// pre-amendment layout. Readers still open objects stored that way, and every
+/// section is position-independent (PAGE_DIR offsets are relative to BLOCKS),
+/// so moving stored bytes and footer offsets is the whole rewrite.
+fn front_directory_order(bytes: &[u8]) -> Vec<u8> {
+    let mut f = footer_of(bytes);
+    let rank = |k: u32| match k {
+        kind::STREAM_DIR => 0,
+        kind::FIELD_DIR => 1,
+        _ => 2,
+    };
+    f.sections.sort_by_key(|d| (rank(d.kind), d.offset));
+    let mut out = Vec::new();
+    for d in &mut f.sections {
+        let start = d.offset as usize;
+        d.offset = out.len() as u64;
+        out.extend_from_slice(&bytes[start..start + d.len as usize]);
+    }
+    footer::write_footer_and_trailer(&mut out, &f);
+    let reopened = footer_of(&out);
+    assert_eq!(
+        reopened
+            .section(kind::STREAM_DIR)
+            .expect("STREAM_DIR")
+            .offset,
+        0,
+        "the rewrite leads with STREAM_DIR"
+    );
+    out
 }
 
 /// The absolute page extents a version-4 read must resolve for the whole-object
@@ -426,8 +463,8 @@ async fn store_with(bytes: &[u8]) -> Arc<MemoryStore> {
 }
 
 /// A block-range fetcher forced onto the ranged path on this small fixture,
-/// with a probe sized to exactly the object tail (so it carries the footer,
-/// SKIP_IDX and PAGE_DIR and reaches no page) and no coalescing slack (so each
+/// with a probe sized to exactly the object tail (so it carries the footer and
+/// every directory and reaches no page) and no coalescing slack (so each
 /// column chunk is its own GET and the range count is the chunk count).
 fn ranged(store: Arc<dyn ObjectStoreBackend>, bytes: &[u8]) -> BlockRangeFetcher {
     BlockRangeFetcher::new(store)
@@ -451,22 +488,21 @@ fn code_between(min: i64, max: i64) -> Predicate {
     }
 }
 
-// ---- 1a. one row group, narrow projection: 3 GETs total --------------------
+// ---- 1a. one row group, narrow projection: 2 GETs total --------------------
 
-/// ADR-2066 decision 1's headline number: a narrow projection of a
-/// one-row-group object costs at most 3 GETs -- probe, front sections, one
-/// run -- because `ts`/`stream_ref`'s chunks and the unselected `observed_ts`
-/// page between them coalesce (at the production default gap, not the
-/// zero-slack harness gap the other tests in this file use) into one run, and
-/// STREAM_DIR+FIELD_DIR are one combined-span GET.
+/// ADR-2066 decision 1's headline number, lowered by the ADR-0699 2026-10-24
+/// amendment: a narrow projection of a one-row-group object costs 2 GETs --
+/// the probe and one run -- because `ts`/`stream_ref`'s chunks and the
+/// unselected `observed_ts` page between them coalesce (at the production
+/// default gap, not the zero-slack harness gap the other tests in this file
+/// use) into one run, and STREAM_DIR and FIELD_DIR sit after PAGE_DIR inside
+/// the probe.
 ///
-/// Non-vacuity: before `place_and_decode_field_dir` was changed to call
-/// `place_front_sections` (this task's predecessor commit), FIELD_DIR alone
-/// was fetched on the narrow-projection path and STREAM_DIR followed
-/// separately once the coverage decision needed it, so `metadata_gets` read 2
-/// and the total read 4, not 3.
+/// Non-vacuity: against the writer order before that amendment (STREAM_DIR and
+/// FIELD_DIR ahead of BLOCKS) they are one combined-span GET outside the
+/// probe, so `metadata_gets` reads 1 and the total 3.
 #[tokio::test]
-async fn version_4_narrow_projection_of_one_row_group_object_costs_three_gets() {
+async fn version_4_narrow_projection_of_one_row_group_object_costs_two_gets() {
     // One row group of every block this fixture has: `group_target_blocks`
     // set to the block count folds every block into a single group.
     const ONE_GROUP_BLOCKS: usize = BLOCKS;
@@ -524,15 +560,83 @@ async fn version_4_narrow_projection_of_one_row_group_object_costs_three_gets() 
     );
     assert_eq!(stats.block_range_gets, 1, "the one fused chunk run");
     assert_eq!(
-        stats.metadata_gets, 1,
-        "STREAM_DIR and FIELD_DIR in one combined-span GET"
+        stats.metadata_gets, 0,
+        "STREAM_DIR and FIELD_DIR come from the probe"
     );
-    assert_eq!(
-        recording.gets(),
-        3,
-        "1 probe + 1 front-section GET + 1 chunk run"
-    );
+    assert_eq!(recording.gets(), 2, "1 probe + 1 chunk run");
     assert_eq!(recording.full_gets(), 0, "no whole-object GET");
+}
+
+/// The fixture of
+/// `version_4_narrow_projection_of_one_row_group_object_costs_two_gets`, one
+/// row group of every block.
+fn one_group_object(recs: &[LogRecord]) -> Vec<u8> {
+    let cfg = RlogConfig {
+        block_target_records: BLOCK_RECORDS,
+        group_target_blocks: BLOCKS,
+        ..RlogConfig::default()
+    };
+    let mut w = RlogWriter::new(cfg, identity());
+    for r in recs {
+        w.push(r.clone()).expect("push");
+    }
+    w.finish().expect("finish")
+}
+
+/// ADR-3217 decision 4: STREAM_DIR and FIELD_DIR sit after PAGE_DIR, so the
+/// suffix probe that carries the footer, SKIP_IDX and PAGE_DIR carries them
+/// too, and the narrow fast path issues no section GET: one probe and one
+/// chunk run.
+///
+/// Non-vacuity: against the writer order before the ADR-0699 2026-10-24
+/// amendment (STREAM_DIR and FIELD_DIR ahead of BLOCKS) the front pair is
+/// outside the probe and `metadata_gets` reads 1, `gets()` 3.
+#[tokio::test]
+async fn narrow_fast_path_reads_the_directories_from_the_probe() {
+    let recs = records();
+    let bytes = one_group_object(&recs);
+
+    let recording = RecordingStore::new(store_with(&bytes).await);
+    let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
+    let seg = seg_ref(bytes.len() as u64, &recs);
+    let acc = QueryAccounting::new();
+    let (_got, stats) = BlockRangeFetcher::new(store)
+        .with_whole_object_threshold(0)
+        .with_suffix_len(tail_len(&bytes))
+        .with_coalesce_gap(ravel_query::DEFAULT_LOG_COALESCE_GAP)
+        .fetch_object_projected(
+            &seg,
+            TENANT,
+            i64::MIN,
+            i64::MAX,
+            &ColumnSelection::fixed_only(),
+            &acc,
+        )
+        .await
+        .expect("projected fetch");
+
+    assert_eq!(
+        (
+            stats.probe_gets,
+            stats.probe_misses,
+            stats.metadata_gets,
+            stats.block_range_gets
+        ),
+        (1, 0, 0, 1),
+        "(probe, probe misses, section GETs, chunk runs)"
+    );
+    assert_eq!(recording.gets(), 2, "the probe and the one chunk run");
+
+    let f = footer_of(&bytes);
+    let probe_start = bytes.len() as u64 - tail_len(&bytes);
+    for k in [kind::STREAM_DIR, kind::FIELD_DIR, kind::PAGE_DIR] {
+        let desc = f.section(k).expect("directory present");
+        assert!(
+            desc.offset >= probe_start,
+            "kind {k} at {} lies inside the probe from {probe_start}",
+            desc.offset
+        );
+    }
 }
 
 // ---- 1b. multiple row groups: chunk runs cap at 4, bridging smallest gaps --
@@ -625,17 +729,17 @@ async fn version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap() {
         stats.block_range_gets, MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
         "9 candidate runs cap at 4 chunk-run GETs"
     );
-    // STREAM_DIR and FIELD_DIR sit at the object's front; no suffix probe of any
-    // length reaches them. On this narrow-projection path FIELD_DIR is needed
-    // early to resolve the projection, and `place_front_sections` fetches every
-    // not-yet-resident front section in one combined-span GET, so STREAM_DIR
-    // rides along with it instead of following separately after the coverage
-    // decision.
-    assert_eq!(stats.metadata_gets, 1, "the two front sections, one GET");
+    // STREAM_DIR and FIELD_DIR follow PAGE_DIR (ADR-0699, 2026-10-24
+    // amendment), so the tail-sized probe carries them and resolving the
+    // projection issues no section GET.
+    assert_eq!(
+        stats.metadata_gets, 0,
+        "the directories come from the probe"
+    );
     assert_eq!(
         recording.gets(),
-        1 + 1 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
-        "1 probe + 1 front-section GET + 4 bridged chunk-run GETs"
+        1 + MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT as u64,
+        "1 probe + 4 bridged chunk-run GETs"
     );
     assert_eq!(recording.full_gets(), 0, "no whole-object GET");
 
@@ -699,7 +803,7 @@ async fn version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap() {
     );
     assert!(
         acc.snapshot().total_s3_bytes() < object,
-        "including the probe and the front sections, still under one whole-object read"
+        "including the probe, still under one whole-object read"
     );
     assert_eq!(
         got.len(),
@@ -782,7 +886,7 @@ async fn version_4_l1_part_issues_every_chunk_run_while_l0_caps_at_four() {
         chunk_ranges, raw_ends,
         "L1: the chunk GETs are exactly the raw coalesced runs"
     );
-    assert_eq!(gets, 1 + 1 + 9, "L1: probe + front sections + 9 runs");
+    assert_eq!(gets, 1 + 9, "L1: probe + 9 runs");
     let raw_bytes: u64 = raw_ends.iter().map(|(s, e)| e - s).sum();
     assert_eq!(
         stats.block_bytes_fetched, raw_bytes,
@@ -801,7 +905,7 @@ async fn version_4_l1_part_issues_every_chunk_run_while_l0_caps_at_four() {
         chunk_ranges, bridged,
         "L0: the chunk GETs are the bridged runs"
     );
-    assert_eq!(gets, 1 + 1 + 4, "L0: probe + front sections + 4 runs");
+    assert_eq!(gets, 1 + 4, "L0: probe + 4 runs");
 }
 
 /// The coverage crossover sizes an L1 read on the runs that read would
@@ -924,13 +1028,8 @@ async fn version_4_prune_reads_ranges_in_the_surviving_group_only() {
     let (g0_start, g0_len) = group_span(&bytes, 0);
     let (g1_start, _) = group_span(&bytes, 1);
     assert!(g1_start >= g0_start + g0_len, "the groups are disjoint");
+    // The directories ride in the probe, so every range GET is a page range.
     for (start, end) in recording.ranges() {
-        // The front sections sit before BLOCKS; only the page ranges are
-        // checked against the group span.
-        let (blocks_offset, _) = blocks_extent(&bytes);
-        if start < blocks_offset {
-            continue;
-        }
         assert!(
             start >= g0_start && end <= g0_start + g0_len,
             "range [{start},{end}) escaped row group 0 [{g0_start},{})",
@@ -998,8 +1097,8 @@ async fn version_4_all_columns_all_blocks_crosses_over_to_one_whole_object_get()
         Some(bytes.as_slice()),
         "and it is the object, whole"
     );
-    // The probe plus the crossover read, and nothing in between: no front
-    // section GET is paid before the decision (an all-columns query with no
+    // The probe plus the crossover read, and nothing in between: no section
+    // GET is paid before the decision (an all-columns query with no
     // numeric arm needs no FIELD_DIR to resolve either channel).
     assert_eq!(recording.gets(), 2, "the probe and the whole-object GET");
 }
@@ -1279,12 +1378,11 @@ async fn plan_segment_on_a_version_4_object_fetches_no_page_bytes() {
             blocks_offset + blocks_len
         );
     }
-    // The probe covers the whole tail here, so the only range GET left is
-    // FIELD_DIR at the object front, which no suffix can reach.
-    assert_eq!(
-        recording.ranges().len(),
-        1,
-        "at most one section GET beyond the probe: {:?}",
+    // The probe covers the whole tail here, FIELD_DIR included, so the plan
+    // issues no range GET at all.
+    assert!(
+        recording.ranges().is_empty(),
+        "no section GET beyond the probe: {:?}",
         recording.ranges()
     );
     assert!(
@@ -1420,7 +1518,9 @@ async fn plan_segment_fallback_charges_the_reader_open_to_the_plan_phase() {
 /// desc.offset, desc.len)`); a narrow-projection scan on the SAME fetcher and
 /// cache resolves FIELD_DIR through `place_and_decode_field_dir` ->
 /// `place_front_sections`, which must peek that exact key and find it
-/// resident rather than folding FIELD_DIR into a fresh combined-span GET.
+/// resident rather than folding FIELD_DIR into a fresh combined-span GET. The
+/// object is in [`front_directory_order`], the only order in which FIELD_DIR
+/// is outside the probe and takes a section GET at all.
 ///
 /// Non-vacuity: reverting `place_front_sections` to always fetch the
 /// STREAM_DIR+FIELD_DIR span without first checking the per-section cache key
@@ -1430,7 +1530,7 @@ async fn plan_segment_fallback_charges_the_reader_open_to_the_plan_phase() {
 #[tokio::test]
 async fn plan_phase_field_dir_cache_is_reused_by_a_narrow_scan() {
     let recs = records();
-    let bytes = build_object(&recs);
+    let bytes = front_directory_order(&build_object(&recs));
     let mem = store_with(&bytes).await;
     let recording = RecordingStore::new(mem);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
@@ -1504,7 +1604,10 @@ async fn plan_phase_field_dir_cache_is_reused_by_a_narrow_scan() {
 /// The combined STREAM_DIR+FIELD_DIR GET admits each section under its own
 /// per-section cache key, the key `place_front_sections` peeks: a second read
 /// of the same object through the same cached fetcher, with a fresh
-/// assembler, serves both front sections from those peeks.
+/// assembler, serves both front sections from those peeks. The object is in
+/// [`front_directory_order`]: the current writer puts both sections inside
+/// the probe, so only an object written before the ADR-0699 2026-10-24
+/// amendment takes this GET.
 ///
 /// The first read is cold: it misses the probe, the front span and the 4
 /// bridged chunk runs (6 read-through misses on the query's accounting), and
@@ -1519,7 +1622,7 @@ async fn plan_phase_field_dir_cache_is_reused_by_a_narrow_scan() {
 #[tokio::test]
 async fn combined_front_get_admits_each_section_under_its_own_key() {
     let recs = records();
-    let bytes = build_object(&recs);
+    let bytes = front_directory_order(&build_object(&recs));
     let mem = store_with(&bytes).await;
     let recording = RecordingStore::new(mem);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
@@ -1632,9 +1735,9 @@ async fn concurrent_partitions_reading_one_chunk_collapse_onto_one_get() {
         .with_coalesce_gap(gap)
         .with_cache(Arc::clone(&cache));
 
-    // Warm-up over row group 0 only (ts 0..=1 is block 0): admits the probe and
-    // both front sections, leaving the cold window below with nothing uncached
-    // but its own chunk range.
+    // Warm-up over row group 0 only (ts 0..=1 is block 0): admits the probe,
+    // which carries every directory, leaving the cold window below with nothing
+    // uncached but its own chunk range.
     let warm = QueryAccounting::new();
     br.fetch_object_projected(&seg, TENANT, 0, 1, &sel, &warm)
         .await
@@ -1720,10 +1823,11 @@ async fn concurrent_partitions_reading_one_chunk_collapse_onto_one_get() {
 // ---- 7. the probe covers the plan sections -------------------------------
 
 /// The ceiling suffix probe (`DEFAULT_LOG_SUFFIX_LEN`) covers footer + SKIP_IDX
-/// + PAGE_DIR on a full-row-group, wide object, so a predicated statement over a
-/// production-sized object of this width (where the #883 derivation reaches the
-/// ceiling) pays one probe per object and no second GET for the plan sections
-/// (issue #766).
+/// + PAGE_DIR + STREAM_DIR + FIELD_DIR on a full-row-group, wide object, so a
+/// predicated statement over a production-sized object of this width (where the
+/// #883 derivation reaches the ceiling) pays one probe per object and no second
+/// GET for the plan sections (issue #766) or the directories after them (the
+/// ADR-0699 2026-10-24 amendment).
 ///
 /// The measured section sizes are printed, because the ceiling is chosen from
 /// them: this test is the measurement that justifies `DEFAULT_LOG_SUFFIX_LEN` as
@@ -1733,7 +1837,9 @@ async fn concurrent_partitions_reading_one_chunk_collapse_onto_one_get() {
 ///
 /// Non-vacuity: reverting `DEFAULT_LOG_SUFFIX_LEN` to the 64 KiB it was before
 /// #766 makes the tail exceed the probe and both the `tail <= suffix` assertion
-/// and `probe_misses == 0` fail.
+/// and `probe_misses == 0` fail. Against the writer order before the 2026-10-24
+/// amendment, STREAM_DIR sits at offset 0 and the directory-offset assertion
+/// fails, as does the empty range list (one front-section GET).
 #[tokio::test]
 async fn probe_covers_the_plan_sections_on_a_wide_row_group_object() {
     // A full default-sized row group (32 blocks) of a 105-column object: the
@@ -1815,8 +1921,8 @@ async fn probe_covers_the_plan_sections_on_a_wide_row_group_object() {
     );
     assert!(
         tail <= ravel_query::DEFAULT_LOG_SUFFIX_LEN,
-        "one suffix probe of {} B must cover footer + SKIP_IDX + PAGE_DIR (+ the \
-         BLOOM and POSTINGS sitting between them), which is {tail} B here",
+        "one suffix probe of {} B must cover SKIP_IDX, PAGE_DIR, STREAM_DIR, \
+         FIELD_DIR and the footer, which is {tail} B here",
         ravel_query::DEFAULT_LOG_SUFFIX_LEN,
     );
 
@@ -1854,10 +1960,20 @@ async fn probe_covers_the_plan_sections_on_a_wide_row_group_object() {
         stats.probe_misses, 0,
         "the ceiling probe covered SKIP_IDX and PAGE_DIR"
     );
+    let probe_start =
+        bytes.len() as u64 - ravel_query::DEFAULT_LOG_SUFFIX_LEN.min(bytes.len() as u64);
+    for k in [kind::STREAM_DIR, kind::FIELD_DIR] {
+        let desc = f.section(k).expect("directory present");
+        assert!(
+            desc.offset >= probe_start,
+            "kind {k} at {} lies inside the last {} B, from {probe_start}",
+            desc.offset,
+            ravel_query::DEFAULT_LOG_SUFFIX_LEN
+        );
+    }
     assert!(
-        recording.ranges().len() <= 1,
-        "at most one section GET beyond the probe, and only ever the front pair \
-         (STREAM_DIR and FIELD_DIR) at the object front: {:?}",
+        recording.ranges().is_empty(),
+        "no section GET beyond the probe, front range included: {:?}",
         recording.ranges()
     );
 }
@@ -2342,7 +2458,7 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
          becomes one whole-object GET"
     );
     assert_eq!(
-        hole_numerator, 78_899,
+        hole_numerator, 78_903,
         "exact object size for this fixture, once coalescing crosses the \
          covering-read threshold"
     );
@@ -2352,7 +2468,7 @@ async fn fetch_amplification_pins_exact_wire_and_stored_page_bytes() {
     );
     assert_eq!(
         hole_numerator as f64 / hole_acc.page_bytes_decoded as f64,
-        78_899.0 / 30.0,
+        78_903.0 / 30.0,
         "exact amplification once coalescing crosses the covering-read threshold"
     );
 }
@@ -2394,17 +2510,12 @@ async fn per_phase_wire_bytes_sum_to_the_pooled_object_store_bytes() {
         "a scan funnel issues no planning read"
     );
 
-    // The probe is a suffix of exactly the object tail, plus the two front
-    // sections no suffix reaches.
-    let footer = footer_of(&bytes);
-    let front: u64 = [kind::STREAM_DIR, kind::FIELD_DIR]
-        .iter()
-        .map(|k| footer.section(*k).expect("front section").len)
-        .sum();
+    // The probe is a suffix of exactly the object tail, which carries
+    // STREAM_DIR and FIELD_DIR too, so no section GET adds probe-phase bytes.
     assert_eq!(
         wire.phase(QueryPhase::Probe),
-        tail_len(&bytes) + front,
-        "probe-phase wire bytes are the tail probe and the two front sections"
+        tail_len(&bytes),
+        "probe-phase wire bytes are the tail probe alone"
     );
     assert_eq!(
         wire.phase(QueryPhase::Probe) + wire.phase(QueryPhase::Scan),
@@ -2480,7 +2591,7 @@ async fn narrow_projection_amplification_is_below_the_legacy_page_byte_ratio() {
 /// The placed extents of the narrow projection
 /// `version_4_projected_read_bridges_chunk_runs_to_the_four_get_cap` reads,
 /// derived from the directories rather than from the fetcher: the tail probe
-/// (`ranged` sizes it to exactly the tail), the one STREAM_DIR+FIELD_DIR span,
+/// (`ranged` sizes it to exactly the tail, STREAM_DIR and FIELD_DIR included)
 /// and the four bridged chunk runs. Returns `(placed, projection)`.
 fn narrow_projection_placed_bytes(bytes: &[u8]) -> (u64, ColumnSelection) {
     let sel = ColumnSelection::fixed_only().with_flags();
@@ -2491,9 +2602,13 @@ fn narrow_projection_placed_bytes(bytes: &[u8]) -> (u64, ColumnSelection) {
     assert_eq!(
         stream.offset + stream.len,
         field.offset,
-        "the front sections are adjacent, so their span is their two lengths"
+        "the directories are adjacent, so their span is their two lengths"
     );
-    let front = stream.len + field.len;
+    let dirs = stream.len + field.len;
+    assert!(
+        stream.offset >= bytes.len() as u64 - tail_len(bytes),
+        "the directory span lies inside the tail probe"
+    );
     let all_blocks: Vec<usize> = (0..BLOCKS).collect();
     let raw: Vec<(u64, u64)> = expected_runs(bytes, &all_blocks, Some(&ids), 0)
         .into_iter()
@@ -2507,39 +2622,39 @@ fn narrow_projection_placed_bytes(bytes: &[u8]) -> (u64, ColumnSelection) {
     // in the oracle moves a number rather than two agreeing sums. The 46 run
     // bytes are the wire figure the amplification test above pins.
     assert_eq!(
-        (tail_len(bytes), front, runs),
-        (4_494, 84, 46),
-        "tail probe, front span, bridged runs"
+        (tail_len(bytes), dirs, runs),
+        (4_582, 84, 46),
+        "tail probe, the directory span inside it, bridged runs"
     );
-    (tail_len(bytes) + front + runs, sel)
+    (tail_len(bytes) + runs, sel)
 }
 
 /// Issue #2066: a narrow projection over a three-row-group version-4 object
 /// holds exactly the bytes it placed, not the object. The assembly gauge and
 /// the fetch budget's `fetch_reserved` both read the placed figure -- the tail
-/// probe, the front-section span and the four bridged chunk runs, 4,494 + 84 +
-/// 46 = 4,624 of a 78,899-byte object -- while the reader holds the bytes,
+/// probe and the four bridged chunk runs, 4,582 + 46 = 4,628 of a
+/// 78,903-byte object -- while the reader holds the bytes,
 /// and both return to zero when it drops them.
 ///
 /// With no cache wired nothing is offered to a second byte ledger, so the
 /// placed regions are this read's alone and `handoff_overlap` stays 0.
 ///
 /// Prove-the-test: against the object-sized pooled buffer this replaced, the
-/// gauge and `fetch_reserved` both read 78,899 at the first figure asserted
+/// gauge and `fetch_reserved` both read 78,903 at the first figure asserted
 /// after the fetch. A sparse assembler that still reserved the object size
 /// fails the `fetch_reserved` assertion; one that kept a pooled object-sized
 /// buffer beside its regions and charged it fails the gauge assertion. Making
 /// `hold_placement` mark every reservation handed off unconditionally, instead
 /// of only when a cache is wired, fails the `handoff_overlap` assertion below
-/// with 4,624 against 0.
+/// with 4,628 against 0.
 #[tokio::test]
 async fn version_4_narrow_projection_holds_exactly_its_placed_bytes() {
     let recs = records();
     let bytes = build_object(&recs);
     let object_size = bytes.len() as u64;
     let (placed, sel) = narrow_projection_placed_bytes(&bytes);
-    assert_eq!(object_size, 78_899, "fixture object size");
-    assert_eq!(placed, 4_624, "placed bytes of the narrow projection");
+    assert_eq!(object_size, 78_903, "fixture object size");
+    assert_eq!(placed, 4_628, "placed bytes of the narrow projection");
 
     let recording = RecordingStore::new(store_with(&bytes).await);
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&recording) as Arc<dyn ObjectStoreBackend>;
@@ -2594,15 +2709,14 @@ async fn version_4_narrow_projection_holds_exactly_its_placed_bytes() {
 /// Issue #2066, ADR-1170 decision 2: during the read of
 /// `version_4_narrow_projection_holds_exactly_its_placed_bytes`, with the
 /// first chunk-run GET held in flight, `fetch_reserved` already equals the
-/// read's placed bytes: the probe and the front span are placed and reserved,
-/// and the four runs were reserved together before any of them was issued.
-/// Nothing else is reserved, and the figure returns to zero once the reader
-/// drops the bytes. GET 1 is the probe, GET 2 the front span, GET 3 the first
-/// chunk run.
+/// read's placed bytes: the probe is placed and reserved, and the four runs
+/// were reserved together before any of them was issued. Nothing else is
+/// reserved, and the figure returns to zero once the reader drops the bytes.
+/// GET 1 is the probe, GET 2 the first chunk run.
 ///
 /// Prove-the-test: against the object-sized reservation this replaced, the
 /// in-flight figure read the object size plus the transient run reservation,
-/// 78,899 + 46 = 78,945, not 4,624.
+/// 78,903 + 46 = 78,949, not 4,628.
 #[tokio::test]
 async fn version_4_ranged_read_reserves_its_placed_bytes_while_a_get_is_in_flight() {
     let recs = records();
@@ -2614,7 +2728,7 @@ async fn version_4_ranged_read_reserves_its_placed_bytes_while_a_get_is_in_fligh
         store_with(&bytes).await,
         FaultPlan::empty(),
     ));
-    let gate = faulty.hold(Op::Get, Some(KEY.to_string()), Occurrence::Nth(3));
+    let gate = faulty.hold(Op::Get, Some(KEY.to_string()), Occurrence::Nth(2));
     let store: Arc<dyn ObjectStoreBackend> = Arc::clone(&faulty) as Arc<dyn ObjectStoreBackend>;
     let budget = Arc::new(ravel_memory::MemoryBudget::new(4 * object_size));
     let br = ranged(store, &bytes).with_memory_budget(Arc::clone(&budget));
@@ -2653,7 +2767,9 @@ async fn version_4_ranged_read_reserves_its_placed_bytes_while_a_get_is_in_fligh
 /// BEFORE the GET that fetches it, so a refused placement issues no request at
 /// all. The budget here is exactly the suffix probe's length, which admits the
 /// probe and nothing after it; the next placement on this read is the 84-byte
-/// STREAM_DIR+FIELD_DIR front span, and it is refused.
+/// STREAM_DIR+FIELD_DIR front span, and it is refused. The object is in
+/// [`front_directory_order`], the order in which that span is a placement of
+/// its own through `place_extent`; the current writer puts it in the probe.
 ///
 /// Prove-the-test: moving `self.reserve_fetch(len)?` in `place_extent` below
 /// the `cached_extent` call it precedes leaves the read failing with the same
@@ -2664,9 +2780,9 @@ async fn version_4_ranged_read_reserves_its_placed_bytes_while_a_get_is_in_fligh
 #[tokio::test]
 async fn version_4_ranged_read_refuses_a_placement_before_issuing_its_get() {
     let recs = records();
-    let bytes = build_object(&recs);
+    let bytes = front_directory_order(&build_object(&recs));
     let object_size = bytes.len() as u64;
-    let (_, sel) = narrow_projection_placed_bytes(&bytes);
+    let sel = ColumnSelection::fixed_only().with_flags();
     let probe = tail_len(&bytes);
 
     let recording = RecordingStore::new(store_with(&bytes).await);
@@ -2725,12 +2841,12 @@ async fn version_4_ranged_read_refuses_a_placement_before_issuing_its_get() {
 /// The figure bounds the overlap from above rather than counting it exactly:
 /// the mark is made per placement, not per admission, so a value the cache
 /// refused over its single-entry cap still counts. This fixture's cache admits
-/// every region (64 MiB single-entry cap against a 4,624-byte read), so the
+/// every region (64 MiB single-entry cap against a 4,628-byte read), so the
 /// bound is tight here.
 ///
 /// Prove-the-test: dropping the `reservation.mark_handed_off()` call from
 /// `hold_placement` leaves `handoff_overlap()` at 0 on both reads below, so
-/// the first cached assertion fails with 0 against 4,624.
+/// the first cached assertion fails with 0 against 4,628.
 #[tokio::test]
 async fn version_4_cached_ranged_read_marks_its_placements_handed_off() {
     let recs = records();

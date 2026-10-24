@@ -497,7 +497,7 @@ fn order_inputs() -> Vec<Input> {
 }
 
 /// The pinned hash of the merged part [`order_inputs`] compacts to.
-const ORDER_PART_HASH: &str = "e178d48641c5087dc35f5ac745cd2fc6327170c7518d17df87d5510ce528d003";
+const ORDER_PART_HASH: &str = "01ddf5fa99bb1b4c047f77d03611ad1129e8515f83561d780612ce3c6b44aae6";
 
 /// Each stream merges by `(ts.div_euclid(1 day), input_index)`, the widest
 /// input bucket, in both admission modes, and the part equals the reference
@@ -543,12 +543,12 @@ async fn merge_order_is_bucket_then_input_index() {
 /// The pinned part hashes [`order_inputs`] compacts to under a memory target
 /// small enough to cut each stream into several parts.
 const ORDER_MULTI_PART_HASHES: &[&str] = &[
-    "2b27d5771d9e59c556ad175ce21360b838d8a7fa02c950b501060250a30bf4a2",
-    "b3101deba268f08a8e8f2ed8a85fa936fe55a1eb3eafdf6a8a64d2daf2fff820",
-    "cbf8ce717079e18d7ffa00e932a8999d65ab4f905d72ca15bd77db9f3ced0400",
-    "4851b9df83d7f2dbf629c03804bf7e23ea6188ee2f8c9384372f65a6274857f3",
-    "256ccff6107deabaefcf1fa29574909fcc61192848e1405d3a7f73de9ef3d63c",
-    "31f761cc74fd46e0cd2744a817c193f185594c82fbdbf097cf4b9ced732594b4",
+    "700580e0e7ec40b10926a96baf1abf31f2fed8fd837094e9c828514892f1a503",
+    "f365f37f31418f3f11a2d4daa9af2f71e401fc33c3490802af5864b195f25d81",
+    "a4eb997d5e11f02af3f78483546a054e58887ac1f8cb7fbcf8b74a4e1c2373b6",
+    "7d3ba97b05ac99331e2a0b6a82fbfeda48d0f403555544f280721ddfe1bcdfb6",
+    "977011aa321aaa5e9aaf4adbed2b8654d4af87c96eee4d2d7b0b5ed216cec457",
+    "dd36c0fb9e6e826c1193b061acf474ac092a4c4806c2053b2a793faa314205d6",
 ];
 
 /// With the output cut into several parts, which records land in which part
@@ -888,8 +888,8 @@ fn level_inputs() -> Vec<Input> {
         .collect()
 }
 
-const LEVEL_3_PART_BYTES: usize = 17_701;
-const LEVEL_9_PART_BYTES: usize = 13_972;
+const LEVEL_3_PART_BYTES: usize = 17_707;
+const LEVEL_9_PART_BYTES: usize = 13_974;
 
 /// `CompactorConfig::rlog_zstd_level` reaches the part writer: level 9 stores
 /// fewer bytes than level 3, both sizes pinned, and the two parts read back to
@@ -936,21 +936,24 @@ fn unkeyed_inputs() -> Vec<Input> {
 }
 
 const UNKEYED_PART_HASHES: &[&str] = &[
-    "69aaaad4a181f1cae281447ced464526246a570471ab82f2652502bf1f73b8d2",
-    "29da13093b95ad99f18b9688fe25f21b58141523351c5d78690d53214b93092f",
-    "c8f2b078e4f59e2a730bf06236fe918b465a1780d8e75fc69e4337c5b7a59911",
-    "392aa6eec93cb02f614eab5a56aedcd83367fd9669907da3455d96ab4bfba3b7",
-    "65d2104a71739f7a7fb1dd0c77a99ed539968bebf1bb001e9288b37c759ea475",
-    "37e1b2f449b7cc1119c146cf3f2167a6ef1fbb6fcf79365aa289df006ef5a09d",
-    "d3444e84dd571c810d7794d8f8e8d2f4d7592865e2e4dc3ca25f7e300b59f505",
+    "5d0d4c1829adfb9d48a28789448eff62b9f0524e3bce80bb3c09e792c665a112",
+    "9d41d165a0158d982f8a9eb52305a89bc163cd469e195b4ba294408d58885eb3",
+    "5916ad0be50ceb91a0ee7912fbe955891e41839ba21a1cfdbadff9a962599de7",
+    "400937b931e3167ba5bafc3f9872fef6d7349f0e599f82ee05b76a98665bc8ab",
+    "745ea7ba154d8a4cd4e7197b129dbbdffb864224924dac4b83cf239a716ff29f",
+    "860c753e3b5378ded1b1dd5136ae3fb20ceeece53159c2c2520ac6b54e27b67a",
+    "3754ad15c7538142389247703b166c6209b02a0750ebfb12baf2d0aeaddeb605",
 ];
 
 /// Unkeyed inputs merge by `(ts, input_index)` exactly as before ADR-2135:
-/// at level 3 every part's bytes are pinned by hash, and these are the hashes
-/// the compactor at 655e56fc (fixed level 3, no clustered merge) writes for
-/// this corpus, checked by running the same corpus there. The memory target
-/// cuts the output mid-stream, so a merge pushing records in any other order
-/// puts different records in each part.
+/// at level 3 every part's bytes are pinned by hash, and these were first the
+/// hashes the compactor at 655e56fc (fixed level 3, no clustered merge) writes
+/// for this corpus, checked by running the same corpus there. They were
+/// re-captured, with the part count still seven, when the writer moved
+/// STREAM_DIR and FIELD_DIR after PAGE_DIR (ADR-0699 amendment of 2026-10-24,
+/// #3217), which changes every footer's section offsets and no record. The
+/// memory target cuts the output mid-stream, so a merge pushing records in any
+/// other order puts different records in each part.
 #[tokio::test]
 async fn unkeyed_inputs_merge_exactly_as_before() {
     let config = CompactorConfig {

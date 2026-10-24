@@ -637,37 +637,37 @@ fn dictionary_is_only_chosen_when_it_is_smaller() {
     };
 
     let one = vec![vec![w(0), w(1), w(0), w(1)]];
-    let c = keeps(&one, Enc::Dict, 540);
+    let c = keeps(&one, Enc::Dict, 542);
     assert_eq!((c.per_block, c.dict), (30, 38));
     assert_eq!((c.per_block_pages, c.dict_pages), (21, 20));
     let two = vec![one[0].clone(), one[0].clone()];
-    let c = takes(&two, 701);
+    let c = takes(&two, 702);
     assert_eq!((c.per_block, c.dict), (60, 48));
 
     let v = |n: usize| vec![vec![word(7, n); 2], vec![word(7, n); 2]];
-    let c = keeps(&v(5), Enc::Dict, 682);
+    let c = keeps(&v(5), Enc::Dict, 684);
     assert_eq!((c.per_block, c.dict), (34, 34));
-    let c = takes(&v(6), 681);
+    let c = takes(&v(6), 683);
     assert_eq!((c.per_block, c.dict), (36, 35));
 
     let half = vec![vec![w(0), w(1)], vec![w(0), w(1)]];
-    let c = takes(&half, 699);
+    let c = takes(&half, 700);
     assert_eq!((c.per_block, c.dict), (54, 48));
 
     let half_larger: Vec<Vec<String>> = (0..32).map(|i| vec![w(i), w(i)]).collect();
-    let c = keeps(&half_larger, Enc::Dict, 4503);
+    let c = keeps(&half_larger, Enc::Dict, 4505);
     assert_eq!((c.per_block, c.dict), (640, 652));
 
     for (blocks, costs, object_len) in [
         (
             vec![vec![w(0), w(1), w(2)], vec![w(0), w(1)]],
             (63, 57),
-            717,
+            718,
         ),
         (
             vec![vec![w(0), w(1), w(2), w(3)], vec![w(0), w(1)]],
             (72, 66),
-            726,
+            727,
         ),
     ] {
         let c = chunk_costs(&blocks);
@@ -728,7 +728,7 @@ fn dictionary_size_rule_compares_bytes_after_compression() {
     assert!(dict.uncomp_len >= COMPRESSION_FLOOR as u64);
     assert_eq!((dict.uncomp_len, dict.len), (769, 134));
     assert!(got.pages[1..].iter().all(|p| p.comp == COMP_NONE));
-    assert_eq!(len, 1134);
+    assert_eq!(len, 1136);
 }
 
 /// A row-group dictionary holds at most `MAX_DICT_ENTRIES` (65,536) entries.
