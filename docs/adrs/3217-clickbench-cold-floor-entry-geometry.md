@@ -7,8 +7,29 @@ every RLOG object keeps its grammar, its trailer version and its footer.
 Decision 4 moves two sections inside the writer's emission order, which
 `docs/log-segment-format.md` names a writer convention, and lands as an
 ADR-0699 amendment with no trailer bump (the basis is quoted in decision
-4). Every other decision is an entry-script change, a loader flag or a
-tenant setting the v5 format already carries.
+4). Decision 8 changes the order in which the writer assigns column ids,
+also a writer convention. Every other decision is an entry-script change,
+a loader flag or a tenant setting the v5 format already carries.
+
+**Correction (2026-10-24).** The cost model this ADR was written with,
+"disk bytes = requested bytes plus about 0.5 MB per GET", was refuted on
+the day it merged. Run 2, the #3219 A/B (comment 6384701235), removed one
+GET and 1.17 MB of wire per object on every ranged scan, and the cold sum
+moved from 367.9 s to 364.9 s: disk bytes per object were unchanged within
+1 % on every statement and the answers byte-equal on all 43. The store
+probe (comment 6384802590) then measured the read granularity directly,
+and run 2's own per-object figures fix it on the bench box: a request
+costs its requested bytes plus about 1 MB (0.9 to 1.1 MB on run 2's q2
+and q34; the probe read 0.6 to 4 MB across two boxes) for each distinct
+1 MiB-aligned block position of the object it touches, and a request
+inside a position already read costs almost nothing. The model is now
+the block model stated in Context; every band and estimate below is
+restated in it; the delivery order moves the position-removing decisions
+(4, then 5 with 6, then the new decision 8) ahead of the byte trims; and
+the cumulative table starts from run 2's 364.9 s. This ADR is Proposed, so it
+is edited in place (`docs/adrs/README.md`, "Amending an ADR", applies to
+Accepted decisions). The two measured anchors are run 1 and run 2;
+every other figure below is predicted until the run that reads it.
 
 ## Context
 
@@ -37,74 +58,126 @@ Run 1 settled what the cold sum is made of (readout #3217 comment
   a 2x store over-read. The mean GET latency of 68 to 243 ms cold is
   queueing at 32 in flight on a saturated volume (under 1 ms hot), so the
   request-bound and latency-bound readings are excluded.
-- **The store over-reads every ranged GET.** `O = (disk - wire) / GETs`
-  reads 0.39 MB on q2, 0.49 on q23, 0.58 on q34, 0.62 on q33; the
-  device check's tail-corrected figure is about 0.8 MB. Every GET removed
-  from an object is therefore worth 0.5 to 0.8 MB of disk on top of the
-  wire it saves. 0.5 is the central value in every estimate below and 0.8
-  the upper bound.
-- **A narrow statement spends its bytes on fixed per-object metadata.**
+- **The store reads about 1 MB around every distinct block position a
+  request touches, not a fixed amount per GET and not the requested
+  bytes.** Run
+  1 read the over-read as `O = (disk - wire) / GETs`, 0.39 to 0.62 MB per
+  GET, and this ADR first priced every removed GET at 0.5 MB of disk. Run
+  2 (comment 6384701235) refuted that: #3219 removed one GET and 1.17 MB
+  of wire per object on every ranged scan and the disk bytes per object
+  did not move (q2 4.00 to 3.96 MB for 1.585 to 0.411 MB of wire; q34
+  8.94 to 8.90 for 5.147 to 3.981; q23 14.47 to 14.41 for 10.837 to
+  9.670); the cold sum went from 367.9 s to 364.9 s (B / A 0.992) and the
+  answers were byte-equal on all 43 statements. The probe (comment
+  6384802590) then measured the granularity on a 24.4 MB object with the
+  server stopped and the page cache dropped before each request: a cold
+  10 KB request costs RustFS 2.8 to 3.95 MB of file reads wherever it sits
+  on one box (the first request after a drop also carries the store's own
+  code pages) and 0.6 to 1.8 MB on a second; 1 MiB costs about 2.9 MB;
+  4 MiB about 6 MB; the whole object its own size plus 0.4 to 0.8 MB; and
+  a range inside a block an earlier request already read costs 4 KB,
+  because RustFS keeps an in-process cache. The probe's device column is
+  confounded by the AWS CLI's own page-ins and is not evidence. So
+  removing requested bytes inside a position a statement still touches
+  saves nothing, and removing a position saves about `K`, whatever its
+  requested size.
+- **A narrow statement spends its disk time on fixed per-object positions.**
   q2 and q8 open every object with 5.50 GETs and 1.58 MB (2,239 GETs,
-  645 MB per statement); q34 6.57 GETs and 5.15 MB; q33 7.93 and 5.84;
-  q12 7.49 and 2.89. The per-object GETs are a 256 KiB suffix probe, a
-  SKIP_IDX+PAGE_DIR chase, a STREAM_DIR+FIELD_DIR front GET, a BLOOM GET of
-  1,191,906 B that no ClickBench statement reads, and 1 to 4 chunk runs.
-  The median object's footprint puts the fixed bytes at BLOOM 1.19 MB
-  plus the 256 KiB probe plus about 30 KB of directories (PAGE_DIR 22,312
-  B, SKIP_IDX 5,970, FIELD_DIR 1,043, STREAM_DIR 201): 1.48 MB per object
-  per statement, about 170 s of the 367 s at the measured over-read. q2's
-  projected column is 3.8 KB of the 1.58 MB it reads per object. Stored
-  column bytes on the median object: AdvEngineID 3.8 KB, UserID 0.80 MB,
-  SearchPhrase 0.65 MB, URL 2.44 MB; summed over the 30 footprinted
-  statements the projected bytes are about 19 GB.
+  645 MB per statement) on run 1; q34 6.57 GETs and 5.15 MB; q33 7.93 and
+  5.84; q12 7.49 and 2.89. The per-object GETs are a 256 KiB suffix probe,
+  a SKIP_IDX+PAGE_DIR chase, a STREAM_DIR+FIELD_DIR front GET, a BLOOM GET
+  of 1,191,906 B that no ClickBench statement reads (gone since #3219),
+  and 1 to 4 chunk runs. In positions, after #3219: the front
+  directories (STREAM_DIR 201 B and FIELD_DIR 1,043 B on the median
+  object) at offset 0; the chase (SKIP_IDX 5,970 B and PAGE_DIR 22,312 B)
+  about 1.22 MB before the end; the probe, the last 256 KiB; and each
+  column run. The 1.19 MB BLOOM sits between the chase and the probe, so
+  those two are about 0.95 MB apart and land in different 1 MiB blocks.
+  q2 touches 4.5 positions per object (the half is the second run on the
+  two-row-group objects) and reads 3.96 MB from disk for 0.41 MB of wire
+  (run 2, arm B): 3.55 MB over the requested bytes, about 0.8 to 0.9 MB
+  per position; q34 reads 8.90 MB for 3.98 requested over about 5.6
+  positions, about 0.9 MB each; four 1 MiB blocks would be 4.2 MB against
+  q2's measured 3.96. So the bench box reads `K` of about 0.9 to 1.1 MB
+  per position, one aligned 1 MiB block. The front and chase positions are
+  then about 2 MB per object per statement, about 100 s of the 365 s
+  (x 407 objects x 32 statements above 3 s / 262 MB/s).
+  q2's projected column is 3.8 KB of the 0.41 MB it requests per object.
+  Stored column bytes on the median object: AdvEngineID 3.8 KB, UserID
+  0.80 MB, SearchPhrase 0.65 MB, URL 2.44 MB; summed over the 30
+  footprinted statements the projected bytes are about 19 GB.
 - **The other classes are settled.** The four LIKE statements (q21 to
   q24) run the fast path with 0 or 1 plan GET, so there is no reader fix
   for an undecidable LIKE branch in this round. q37 to q43 keep 30
   survivors of 407 (`segmentsPrunedByStats` 377) and cost about 3 s in
   total. Hot tries are served from the fetch cache (resident maximum
   4.41 GB, no evictions) and the hot wall is decode: hot 59.3 s, QPS 0.663,
-  error ratio 0.020, each inside its band.
+  error ratio 0.020, each inside its band. The hot profile (comment
+  6385475852) reads the heavy statements CPU-bound at 9 to 14 of 16 cores
+  and the sub-second ones idle, waiting on resolve round trips, so none
+  of the cold levers here moves hot; hot belongs to a hot-path epic.
 
 Already on `main`, not a decision here: #3219 (pull request #3221, landed
 on `main` as a7194f402 then 46df74786) stops the reader fetching BLOOM and
-POSTINGS when no arm needs them. On this corpus that removes the 1.19 MB
-BLOOM GET from every object a scanning statement opens, predicted at about
-90 s (407 objects x (1.19 MB + 0.5 MB over-read) / 262 MB/s on 34
-statements), landing near 277 s. Every A commit in the run plan below
+POSTINGS when no arm needs them. Run 2 measured it (comment 6384701235):
+minus one GET and 1.17 MB of wire per object on every ranged scan (wire
+over the statements above 3 s 49.6 to 34.4 GB), the cold sum 367.9 to
+364.9 s, disk bytes per object unchanged within 1 %, hot 58.1 to 57.3 s,
+answers byte-equal. It stays: it costs nothing and the wire it saves is
+the cost on S3. The 90 s this ADR first credited it with was the per-GET
+model's figure and is withdrawn. Every A commit in the run plan below
 carries it.
 
 The cost model every estimate uses, per scanning statement over `N`
 objects on the fast path:
 
 ```
-disk bytes = N x (wire overhead + G x O) + C
-cold wall  = T0 + disk bytes / 262 MB/s
+disk bytes per object = requested bytes + positions x K
+disk bytes            = N x (requested bytes + positions x K)
+cold wall             = T0 + disk bytes / 262 MB/s
 ```
 
-`G` is GETs per object, `O` the over-read per ranged GET, `C` the
-projected column pages (moved only by decisions 3 and 7), `T0` about
-0.2 s. Run 1 puts `disk bytes / 262 MB/s` about 1 s above each full-scan
-statement's wall, so the formula is a floor to within 5%. The `O = 0`
-column in the tables below is the no-amplification reference, kept so the
-request term stays visible.
+A position is a 1 MiB-aligned block of the object the store reads as a
+unit; the requests that fall inside one share its cost, however many GETs
+they are and however many bytes they ask for. `K` is the per-position
+cost: 0.9 to 1.1 MB from run 2's own q2 and q34 figures on the bench box
+(above), consistent with one 1 MiB block, and the probe's 0.6 to 4 MB
+across two boxes (comment 6384802590) as the outer bound. Every table
+below prices `K` at 1.1 MB and 0.9 MB, and every pool of disk bytes is
+taken over the 32 statements above 3 s that run 2 measured, 407 x 32 =
+13,024 object-statements. The requested
+bytes are the probe, the directories and the projected column pages `W`
+plus the bridged gaps `g`; decisions 3 and 7 move `W`, decisions 5 and 6
+the probe count. `T0` is about 0.2 s. Run 1 puts `disk bytes / 262 MB/s`
+about 1 s above each full-scan statement's wall, so the formula is a floor
+to within 5%. The wire floor, disk equal to wire with every position cost
+gone, bounds every column: run 2's 34.4 GB of wire over the statements
+above 3 s is 131 s at 262 MB/s, plus about 6 s of statements under 3 s.
 
 Per-object request map for the narrow predicate-free class (29 of the 34
-scanning statements), `R` chunk runs per object (1 for one column on a
-one-group object, up to `min(k, 4)` for `k` columns; a two-row-group
-object adds a run; `chunk_run_cap` at
+scanning statements), in delivery order; `R` chunk runs per object (1 for
+one column on a one-group object, up to `min(k, 4)` for `k` columns; a
+two-row-group object adds a run; `chunk_run_cap` at
 `crates/ravel-query/src/log_fetcher.rs:8762-8767`,
 `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` at `crates/ravel-query/src/fetcher.rs:294`),
-`W` projected page bytes, `g` bridged gap bytes, `B` the 1.19 MB BLOOM:
+`W` projected page bytes, `g` bridged gap bytes, `B` the 1.19 MB BLOOM.
+The wire column is rounded to 0.01 MB, so decision 4's 1.2 KB front pair
+is below its resolution and the 0.03 MB step on that row is the chase
+(SKIP_IDX plus PAGE_DIR), which the new section order also takes out of
+the request set. `R` here counts chunk runs, not positions; the probe
+is one position, two on the objects where its 256 KiB straddles a block
+boundary (about a quarter):
 
-| stage | GETs per object | wire per object | objects |
-|---|---|---|---|
-| v0.25.1 stock (run 1) | probe, chase, front, BLOOM, R runs = 4 + R | 0.30 MB + B + W + g | 407 |
-| after #3219 | probe, chase, front, R runs = 3 + R | 0.30 + W + g | 407 |
-| decision 1 (bloom scope `text`) | probe, front, R runs = 2 + R | 0.27 + W + g | 407 |
-| decision 4 (directories at the tail) | probe, R runs = 1 + R | 0.26 + W + g | 407 |
-| decision 3 (zstd 9) | 1 + R | 0.26 + 0.93 W + g | 407 |
-| decisions 5 and 6 (100 MB one-group objects) | 1 + R | 0.26 + 4 x 0.93 W + 4 g | 103 |
-| decision 7 (clustering key) | 1 + R | 0.26 + 4 x 0.80 W + 4 g | 103 |
+| stage | GETs per object | positions per object | wire per object | objects |
+|---|---|---|---|---|
+| v0.25.1 stock (run 1) | probe, chase, front, BLOOM, R runs = 4 + R | front, chase, probe, R runs = 3 + R | 0.30 MB + B + W + g | 407 |
+| after #3219 (run 2) | probe, chase, front, R runs = 3 + R | 3 + R | 0.30 + W + g | 407 |
+| decision 4 (directories at the tail) | probe, R runs = 1 + R | probe, R runs = 1 + R (2 + R when the probe straddles a block boundary) | 0.27 + W + g | 407 |
+| decisions 5 and 6 (100 MB one-group objects) | 1 + R | 1 + R | 0.27 + 4 W + 4 g | 103 |
+| decision 8 (column ids in affinity order) | 1 + R', R' at most R | 1 + R' | 0.27 + 4 W + 4 g', g' under g | 103 |
+| decision 1 (bloom scope `text`) | 1 + R' | 1 + R' (the tail shrinks; it was one position already) | 0.27 + 4 W + 4 g' | 103 |
+| decision 3 (zstd 9) | 1 + R' | 1 + R' | 0.27 + 4 x 0.93 W + 4 g' | 103 |
+| decision 7 (clustering key) | 1 + R' | 1 + R' | 0.27 + 4 x 0.80 W + 4 g' | 103 |
 
 The goal is a cold sum under 200 s on the stock entry, under 150 s as the
 stretch, open-ended rather than bound to v0.26 or the next ClickBench pin
@@ -116,13 +189,16 @@ ratio of 0.058 (ADR-2023 decision 4), and no change may alter an answer.
 
 ## Decision
 
-Seven decisions, in delivery order. Each names the design change it
-carries, its class, what it does not change, and its own pre-registered
-A/B band. Every A/B compares all 43 statements against its A box under the
-answer comparison rule in Measurement, and a difference stops the change.
-The GET-removing decisions (1, 4, 5 with 6) go first because on this box a
-GET removed per object is worth its over-read on disk whatever the store's
-mechanism; the byte trims (3, 7) follow.
+Eight decisions, numbered as first proposed (the numbers are cited on
+#3217 and in the run readouts, so they keep their numbers). Delivery
+order: 4, then 5 with 6, then 8, then 1 with 2, then 3, then 7. Each names
+the design change it carries, its class, what it does not change, and its
+own pre-registered A/B band. Every A/B compares all 43 statements against
+its A box under the answer comparison rule in Measurement, and a
+difference stops the change. The position-removing decisions (4; 5 with
+6; 8) go first because on this box a position removed per object is worth
+about `K` of disk whatever its requested size (run 2, the probe); the
+byte trims (1, 3, 7) follow, each small.
 
 ### 1. The entry's tenant sets bloom scope `text` (design change 1)
 
@@ -167,32 +243,42 @@ substring LIKE is neither a prune nor a bloom probe,
 Wide statements are unchanged. An uncovered column is scanned, never
 pruned (ADR-2135 decision 5), so the scope cannot drop a row.
 
-Effect: minus one GET and about 30 KB per object on the narrow, point
-lookup and LIKE classes; minus one GET per opened object on the pruned
-class. Cold sum (model): minus 28 s at `O = 0.5` (277 to 249 s), 44 s at
-`O = 0.8`, 2 s at `O = 0`.
+Effect: small. The tail shrinks from about 1.5 MB to about 30 KB, but
+after decision 4 the probe already reads the whole directory tail in one
+position, and a position's cost is `K`, not its size (run 2: removing the
+1.19 MB BLOOM request changed no disk byte).
+After decision 4 the chase is already gone, so on this corpus the scope
+removes no request and no position; it takes about 0.5 GB of BLOOM out of
+`data_size` and keeps the whole tail, BLOOM included, inside the 256 KiB
+probe, so a statement that does build a bloom arm (none here) reads no
+extra position, and a wide tenant with a BLOOM larger than the probe gets
+the same. Cold sum (model): under 2 s, not counted in the cumulative
+table. The 28 s this ADR first credited it with was the per-GET model's
+figure and is withdrawn.
 
-Pre-registered A/B (run 2, shared with decision 2 because their stamps are
-disjoint and decision 2's cold effect is inside noise). Stamps:
-`bloom-scope show` prints `text`; one object's `rlog inspect` shows a
-BLOOM section under 8 KB and one row group; the binary digest equals the A
-box's. Each figure present exactly once:
+Pre-registered A/B (run 6, shared with decision 2 because their stamps are
+disjoint and both cold effects are inside noise; the A box is run 5's B).
+Stamps: `bloom-scope show` prints `text`; one object's `rlog inspect`
+shows a BLOOM section under 8 KB and one row group; the binary digest
+equals the A box's. Each figure present exactly once:
 
 | figure | band | miss | source |
 |---|---|---|---|
-| scan GETs per object on q2 and q34 (`P.scan.s3GetRequests / 407`) | run 1's 5.50 on q2 and 6.57 on q34 minus 1 (the chase) on a binary carrying #3219, minus 2 without it, to within 0.05; the 0.50 above the one-run count on q2 is the second run on the two-row-group objects and stays | still at run 1's value: the scope did not reach the objects (check the BLOOM covered list on one object) | run 1 values comment 6368995087; pre-registered as run 2, comment 6372406698 |
-| scan wire bytes per object on q2 | run 1's 1.58 MB minus 30 KB = 1.55 MB with #3219 (0.36 MB without it) | outside by more than 0.1 MB | run 1 value comment 6368995087; run 2 pre-registration comment 6372406698 |
-| cold sum | run 1 minus 2 to 45 s with #3219 (minus 55 to 155 s without it) | a drop under 40 s on a binary without #3219, with the GET stamp passing, means `O` is under 0.2 MB and the model is wrong: re-derive `O` from this run's disk/wire before any later step | run 2 pre-registration comment 6372406698; the model figures are predicted |
-| answers | all 43 equal the A box under the Measurement comparison rule | any difference: stop, this change must not change an answer | run 2 pre-registration comment 6372406698 |
-| hot sum, QPS, error ratio | 54 to 64 s; at least 0.60; at most 0.058 | outside | run 1 hot 59.3 s, QPS 0.663, error ratio 0.020, comment 6368995087; the 0.058 bar is ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
+| scan GETs per object on q2 and q34 (`P.scan.s3GetRequests / objects`) | equal to the A box's to within 0.05 (the chase is gone since decision 4; the scope removes no request) | a change in either direction: read the request shape before crediting or blaming the scope | run 2 values 4.51 and 5.58 on 407 objects, comment 6384701235; band predicted |
+| one object's BLOOM section, and `data_size` | BLOOM under 8 KB; `data_size` 0.4 to 0.6 GB under the A box's | BLOOM near 1.19 MB: the scope did not reach the objects (check the BLOOM covered list on one object) | run 1 BLOOM 1,191,906 B and `data_size` 10.21 GB, comment 6368995087; band predicted |
+| disk bytes per object on q2 and q34 | the A box's within 5 % | a drop above 5 % with the GET stamp passing means the probe straddled block boundaries often enough to matter and the shorter tail removed the straddle: record the per-position figure it implies | run 2 values 3.96 and 8.90 MB, comment 6384701235; band predicted |
+| cold sum | the A box's within minus 5 to plus 5 s | outside: read the disk-per-object row first | predicted |
+| answers | all 43 equal the A box under the Measurement comparison rule | any difference: stop, this change must not change an answer | predicted |
+| hot sum, QPS, error ratio | 54 to 64 s; at least 0.60; at most 0.058 | outside | run 2 hot 57.3 s, QPS 0.703, error ratio 0.023, comment 6384701235; the 0.058 bar is ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 
 Proof. A test beside
 `probe_covers_the_plan_sections_on_a_wide_row_group_object`
 (`crates/ravel-query/tests/log_page_dir_fetch.rs:1738`): a 30-block,
 104-column object written at scope `text`, opened on the narrow fast path,
-reports `probe_misses == 0` and `metadata_gets == 1` (the front GET only);
-the same object at scope `all` with a 1 MB BLOOM reports `probe_misses ==
-2` and `metadata_gets == 2`. The mutation "writer ignores the scope" fails
+reports `probe_misses == 0` and `metadata_gets == 1` (the front GET only;
+0 once decision 4 has landed, which this test is written after); the same
+object at scope `all` with a 1 MB BLOOM reports `probe_misses == 2` and
+`metadata_gets == 2` on today's order. The mutation "writer ignores the scope" fails
 the first; the mutation "`probe_window_covers` returns true" fails the
 second.
 
@@ -225,14 +311,14 @@ counted in the cold-sum table. If the resolve wall does not move, the
 change stays as hygiene (two lines, independently revertible) and claims
 nothing.
 
-Pre-registered A/B (shares run 2). Stamp: the load log prints the fold
+Pre-registered A/B (shares run 6). Stamp: the load log prints the fold
 report with the seal-through hour equal to the load's last ingest hour.
 
 | figure | band | miss | source |
 |---|---|---|---|
-| resolve LISTs per statement (`P.resolve` list requests) | exactly 1 inside the load's last hour, exactly 5 after it | other | run 1 read 5, comment 6368995087; run 2 pre-registration comment 6372406698 |
-| listing keys returned per LIST, and resolve wall | 0 keys per shard folded (about 100 unfolded); resolve wall at or under run 1's 29 to 33 ms | keys per LIST at run 1's count: the hour was not sealed | run 1 values comment 6368995087; run 2 pre-registration comment 6372406698 |
-| load time | under run 1's plus 60 s | above | run 2 pre-registration comment 6372406698 |
+| resolve LISTs per statement (`P.resolve` list requests) | exactly 1 inside the load's last hour, exactly 5 after it | other | run 1 read 5, comment 6368995087; band predicted |
+| listing keys returned per LIST, and resolve wall | 0 keys per shard folded (about 100 unfolded); resolve wall at or under run 1's 29 to 33 ms | keys per LIST at run 1's count: the hour was not sealed | run 1 values comment 6368995087; band predicted |
+| load time | under the A box's plus 60 s | above | run 2 load 865 s, comment 6384701235; band predicted |
 
 Proof: ADR-2677 decision 1's own tests;
 `services/ravel-cli/tests/load_fold_after_load_sql_e2e.rs` drives
@@ -262,21 +348,24 @@ is unknown; the 90 s ack deadline (`write_ack_deadline`,
 `services/ravel-cli/src/load/mod.rs:234-240`, `max(60 s, delay + 60 s)`)
 bounds a flush's encode.
 
-Effect: bytes only, 0.93 W on every scanning class. Cold sum (model): 7 s
-at the model's 25 GB of projected bytes, about 5 s at run 1's 19 GB
-(249 to 242 s at `O = 0.5`).
+Effect: bytes only, 0.93 W on every scanning class, and no position. Cold
+sum (model): about 8 s at run 2's 30.8 GB of column wire (34.4 GB over the
+statements above 3 s less 3.6 GB of probe bytes, x 0.07 / 262 MB/s),
+about 5 s at run 1's 19 GB of projected bytes; the same at either `R`.
+Last in the delivery order because it is the smallest lever that is not
+free.
 
-Pre-registered A/B (run 3, on top of run 2's script; its own run because
-its effect is bytes and would confound the per-object `O` reading run 2
-produces). Stamps: the load log shows `--zstd-level 9`; one object's pages
-decode.
+Pre-registered A/B (run 7, on top of run 6's script; its own run because
+its effect is bytes and would confound the per-position reading the runs
+before it produce). Stamps: the load log shows `--zstd-level 9`; one
+object's pages decode.
 
 | figure | band | miss | source |
 |---|---|---|---|
-| `data_size` | 0.925 to 0.95 x run 2's measured value (run 2's script already carries decision 1, which takes about 0.5 GB of BLOOM out of run 1's 10.21 GB, so the band is relative to run 2) | above 0.97 x run 2's: the level did not reach the pages | 7.1% from `docs/adrs/2135-rlog-v5-storage-footprint.md:67`; run 1 `data_size` 10.21 GB comment 6368995087; band predicted |
-| load time | 840 to 1,100 s | above 1,100 s abandons the change: a cold gain under 5 s is not worth 170 s of load | predicted (the entry's load today is about 931 s) |
-| cold sum | run 2 minus 4 to 12 s | outside | predicted |
-| hot sum | within 5% of run 2 | outside | predicted |
+| `data_size` | 0.925 to 0.95 x run 6's measured value (run 6's script already carries decision 1, which takes about 0.5 GB of BLOOM out of run 1's 10.21 GB, so the band is relative to run 6) | above 0.97 x run 6's: the level did not reach the pages | 7.1% from `docs/adrs/2135-rlog-v5-storage-footprint.md:67`; run 1 `data_size` 10.21 GB comment 6368995087; band predicted |
+| load time | 840 to 1,100 s | above 1,100 s abandons the change: a cold gain under 8 s is not worth 170 s of load | predicted (the entry's load today is about 865 to 931 s, run 2 comment 6384701235) |
+| cold sum | run 6's B minus 4 to 12 s | outside | predicted |
+| hot sum | within 5% of run 6's B | outside | predicted |
 | answers | equal under the Measurement comparison rule | any difference | predicted |
 
 Proof: `services/ravel-cli/tests/load_zstd_level.rs` pins the flag
@@ -315,8 +404,14 @@ the probe pushes SKIP_IDX and PAGE_DIR out of the 256 KiB window and the
 chase GET fires. With the two large optional indexes before the four small
 directories, on any tenant the 256 KiB probe holds the footer, PAGE_DIR,
 SKIP_IDX, STREAM_DIR and FIELD_DIR, and BLOOM or POSTINGS cost the one GET
-they cost today when large. On this entry with decision 1 the whole tail
-is under 50 KB.
+they cost today when large. On this entry the probe holds the four
+directories under the new order whether or not decision 1 has landed,
+because the 1.19 MB BLOOM sits before them; with decision 1 the whole
+tail is under 50 KB. Both the front GET and the chase GET go, so on this
+corpus the change removes two GETs per object and two positions: the
+front, at offset 0, and the chase, about 1.22 MB before the end and so
+about 0.95 MB from the probe's block, behind the 1.19 MB BLOOM (Context).
+Run 3's disk-per-object row reads whether both positions go.
 
 Why an amendment and not a trailer bump. The format doc states its own
 bump rule (`docs/log-segment-format.md:1288-1295`): "Only a change to an
@@ -379,38 +474,43 @@ read with no numeric arm skips FIELD_DIR already). Writer memory:
 object) stay alive until the tail push, where today `writer.rs:1022` and
 `:1029` drop them right after the front push, unless the builder
 compresses early and pushes the bytes late. The probe length stays
-at 256 KiB: with decisions 1 and 4 landed the probe holds about 30 KB of
-tail, so a probe sized to the tail would save about 0.23 MB of wire per
-object (12 s on the sum) and up to one over-read on disk (39 s, the
-ceiling), but only if it never misses the tail, since a miss costs the
-chase GET back, and whether a 32 KiB read moves fewer disk bytes than a
-256 KiB one under the store's read-ahead is what the single-GET probe
-measurement on RustFS (epic step 5) answers. Until it does the length
-stays, and if it ever changes the plan's probe must be replayed into the
-scan by the recorded `PrimedExtent` (`log_fetcher.rs:8559`) rather than
+at 256 KiB. The single-GET probe (comment 6384802590) answered the
+question this paragraph first left open: a 10 KB read at the end of the
+object costs 2.8 MB of file reads and the 256 KiB suffix 2.9 MB, so a
+probe sized to the tail would save about 0.23 MB of wire per object
+(12 s of wire on the sum, which on this volume is paid once as part of the
+probe's block and not again) and no position; it is not a disk lever here. If the
+length ever changes the plan's probe must be replayed into the scan by
+the recorded `PrimedExtent` (`log_fetcher.rs:8559`) rather than
 recomputed, or the cached replay becomes a live GET per object.
 
-Effect: minus one GET and about 1.2 KB per object on the narrow, point
-lookup and LIKE classes (STREAM_DIR 201 B plus FIELD_DIR 1,043 B stored on
-the median object, the two sections the front GET fetches and nothing
-else); minus one per opened object on the pruned class. Cold sum (model):
-minus 26 s at `O = 0.5` (242 to 216 s), 42 s at `O = 0.8`, under 0.1 s at
-`O = 0`. With no amplification the removed GET is worth only its wire,
-1.2 KB x 407 x 34 = 17 MB, the same derivation that gives decision 1 its
-2 s for the chase GET's 30 KB; at `O = 0.5` or `O = 0.8` the disk saving
-is that wire plus one over-read per object.
+Effect: minus two positions per object on every statement that opens an
+object with a front GET (the narrow, point lookup and LIKE classes, and
+each opened object on the pruned class): the front directories' block at
+offset 0 and the chase's block before BLOOM. In requests, minus two GETs
+and about 30 KB per object (the chase's SKIP_IDX plus PAGE_DIR; the front
+pair itself is STREAM_DIR 201 B plus FIELD_DIR 1,043 B on the median
+object). Cold sum (model): 2 x `K` x 13,024 object-statements / 262 MB/s,
+minus 110 s at `K = 1.1 MB` (28.7 GB; 364.9 to 255 s) and minus 89 s at
+`K = 0.9 MB` (23.4 GB; to 276 s), a little less if the probe straddles a
+block boundary more often than a quarter of the time; q2 from 3.96 to
+about 2.3 to 2.8 MB of disk per object (0.38 MB requested plus about 2.5
+positions). The 26 s this ADR first credited it with was the per-GET
+model's figure and is withdrawn: under the block model this is the
+largest single lever, which is why it now goes first.
 
-Pre-registered A/B (run 4, the first run on a binary carrying this
-change; pairs with run 3). Stamps: the binary digest equals the B commit
-(the last of the pull request's commits as they landed on `main`,
-Measurement); one object's `rlog inspect` lists STREAM_DIR and FIELD_DIR at
-offsets above PAGE_DIR's, tail under 200 KB.
+Pre-registered A/B (run 3, the first run on a binary carrying this
+change; pairs with run 2, whose B arm is the A box). Stamps: the binary
+digest equals the B commit (the last of the pull request's commits as
+they landed on `main`, Measurement); one object's `rlog inspect` lists
+STREAM_DIR and FIELD_DIR at offsets above PAGE_DIR's, tail under 200 KB.
 
 | figure | band | miss | source |
 |---|---|---|---|
-| scan GETs per object on q2, q34, q33; plan GETs per object on q20 | q2 at run 2's value minus 1 (2.50: probe and one run, plus the second run on the two-row-group objects); q34 run 2's minus 1 (3.57); q33 (4 columns) 2 to 5; q20 exactly 1 (probe only) | q2 at run 2's value: the front GET still fires (order unchanged, or the tail exceeds 256 KiB: read the inspect stamp) | run 1 values comment 6368995087; band predicted |
-| cold sum | run 3 minus 20 to 45 s (`O` = 0.5 to 0.8), or under 1 s at `O = 0` | outside with the GET stamp passing means `O` moved | predicted |
-| hot sum, QPS, error ratio | 54 to 64 s; at least 0.60; at most 0.058 | outside | run 1 comment 6368995087; the 0.058 bar is ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
+| scan GETs per object on q2, q34, q33; plan GETs per object on q20 | q2 at run 2's 4.51 minus 2 (2.51: probe and one run, plus the second run on the two-row-group objects); q34 run 2's 5.58 minus 2 (3.58); q33 (4 columns) run 2's 6.93 minus 2, to within 0.1; q20 exactly 1 (probe only) | q2 at run 2's value: the front GET still fires (order unchanged, or the tail exceeds 256 KiB: read the inspect stamp); minus 1 only: the chase still fires, BLOOM is not ahead of the directories | run 2 values comment 6384701235; band predicted |
+| disk bytes per object on q2, q34, q23 (`disk read / objects`, cold try) | q2 1.8 to 3.0 MB from run 2's 3.96; q34 6.5 to 7.6 from 8.90; q23 12.0 to 13.0 from 14.41 (minus two positions at `K` = 0.9 to 1.1 MB) | unchanged within 5 % with the GET stamp passing: the positions are not the unit this store charges, re-read the block map from this run; minus one position only: the chase shared the probe's block, record `K` | run 2 values comment 6384701235; band predicted |
+| cold sum | run 2's B (364.9 s) minus 45 to 110 s | a drop under 30 s with the GET and disk stamps passing means the disk is not the floor on the statements that moved: read the per-statement walls against their disk time before any later step | run 2 value comment 6384701235; band predicted |
+| hot sum, QPS, error ratio | 54 to 64 s; at least 0.60; at most 0.058 | outside | run 2 hot 57.3 s, QPS 0.703, error ratio 0.023, comment 6384701235; the 0.058 bar is ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 | answers | equal under the Measurement comparison rule | any difference | predicted |
 
 Proof. Writer test: on a 30-block, 104-column object,
@@ -424,7 +524,9 @@ shown failing at the old count first.
 Cancellation read against run 1: the change would have been cancelled had
 q2's disk/wire been at most 1.3 and the mean GET latency under 3 ms (a
 removed GET then worth under 0.2 s per statement). Run 1 read disk/wire
-2.36 to 2.50 on q2 and 68 ms: not cancelled.
+2.36 to 2.50 on q2 and 68 ms: not cancelled. Run 2 read q2 at 3.96 MB of
+disk for 0.41 MB of wire, disk/wire 9.6, with the front and chase GETs two
+of about 4.5 positions: the strongest reading for this change so far.
 
 ### 5. The loader exposes `group_target_blocks` (design change 6)
 
@@ -577,18 +679,25 @@ now span 1M rows (direction unknown, within a few percent); compaction of
 such a tenant later holds 100 MB per cursor (a documented cost, not run by
 the entry).
 
-Effect (after #3219 and decisions 1 and 4, per statement): a narrow
-statement goes from 1,230 GETs (3 per object at `R = 2`) to 309, 921
-fewer GETs and 80 MB fewer probe bytes. Cold sum (model): minus 70 s at
-`O = 0.5` less 2 s of pruned-class regression (216 to 148 s); 106 s less
-2 at `O = 0.8`; 10 s less 2 at `O = 0` (after decisions 1 and 4 the fixed
-per-object wire is the 256 KiB probe, so 304 fewer objects is 79 MB per
-statement, 0.3 s at 262 MB/s, over 34 statements).
+Effect (after #3219 and decision 4, per statement): a narrow statement
+goes from 1,230 GETs (3 per object) to 309, 921 fewer GETs and 80 MB
+fewer probe bytes, and every position a statement pays per object is paid
+103 times instead of 407. Cold sum (model), from the measured position
+overhead rather than from `K` alone: run 2 read 102.8 GB of disk for
+34.4 GB of wire over the 32 statements above 3 s (comment 6384701235), so
+68.4 GB is position overhead; decision 4 removes 2 x 13,024 x `K` of it
+(28.7 GB at `K = 1.1 MB`, 23.4 GB at `K = 0.9 MB`), leaving 39.7 or
+45.0 GB; decision 6 divides what is left by 407 / 103 = 3.95, saving 0.75
+of it: 29.7 GB (113 s) at `K = 1.1` and 33.6 GB (128 s) at `K = 0.9`,
+less about 2 s of pruned-class regression. The lower `K` gives the larger
+saving here because more of the measured overhead is then left in the
+positions this decision divides. Cold sum 255 to 144 s at `K = 1.1`, 276
+to 150 s at `K = 0.9`.
 
 Pre-registered A/B, two stages. Stage 1 is the load alone on a
 c6a.4xlarge, server stopped, before any statement runs; every figure
 present exactly once and inside its band, or the query run does not
-start. Stage 2 is the full entry run (run 5, paired with run 4). A miss on
+start. Stage 2 is the full entry run (run 4, paired with run 3). A miss on
 any hot or concurrent figure abandons 1M for 500k before giving up the
 lever.
 
@@ -598,10 +707,11 @@ lever.
 | stage 1: age-trigger share; loader peak RSS; load time | under 5% of objects; at most 16 GB sampled every second; 840 to 1,100 s | above 20 GB abandons the 1M tier for 500k; above 1,100 s means flushes queue behind the 37 s fill | predicted; the 7.03 GB peak at depth 32 is `docs/guides/ingest.md:1478-1482` |
 | stage 2: narrow scan GETs per statement; q20 | 200 to 500 (q2 at exactly 206: 103 x 2); q20 at most 400 GETs and at most 0.5 GB scan wire | outside | predicted |
 | stage 2: q37 to q43 | cold sum at most 7 s; `segmentsPrunedByStats` at least 70 of about 100 | outside | run 1 keeps 30 of 407 at about 3 s, comment 6368995087; band predicted |
-| stage 2: hot | hot sum 54 to 64 s; q34, q35, q29 hot at most 1.3x run 4's | outside abandons 1M for 500k | run 1 hot 59.3 s comment 6368995087; 1.3x predicted from the 1.28x partition tail |
+| stage 2: hot | hot sum 54 to 64 s; q34, q35, q29 hot at most 1.3x run 3's | outside abandons 1M for 500k | run 1 hot 59.3 s comment 6368995087; 1.3x predicted from the 1.28x partition tail |
 | stage 2: concurrent | QPS at least 0.60, error ratio at most 0.058, with the per-partition `prefetch_memory_reopens` and `prefetch_revocations` counters (`crates/ravel-sql/src/logs_scan/mod.rs:1424-1434`) stamped per phase | outside abandons 1M for 500k | run 1 QPS 0.663, error ratio 0.020, comment 6368995087; the 0.058 bar is ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 | stage 2: largest fetch run (`peak_fetch_run_bytes`, `log_fetcher.rs:5287`) on q31 and q32 | at or under 64 MiB | larger: the covering split did not engage and the hot re-read would miss the cache | predicted |
-| stage 2: cold sum | run 4 minus 50 to 110 s (`O` = 0.5 to 0.8), or minus 5 to 12 s at `O = 0` | outside | predicted |
+| stage 2: disk bytes per statement over the statements above 3 s | at most 0.40 of run 3's position overhead (disk minus wire) plus run 3's wire | the overhead falls by less than half: positions are not the unit this store charges, re-read the probe | run 2's 68.4 GB of overhead, comment 6384701235; band predicted |
+| stage 2: cold sum | run 3 minus 95 to 140 s | under 60 s with the object-count and disk stamps passing: the block model overstates the per-object cost, re-derive it from this run before any later step | run 2 value comment 6384701235; band predicted |
 | stage 2: answers | equal under the Measurement comparison rule | any difference | predicted |
 
 Proof: decision 5's tests; the fork script asserts the stage 1 stamps
@@ -639,7 +749,8 @@ object (`with_sort_descriptor`, applied by the flush at
 `crates/ravel-ingest/src/log_shard.rs:906-910`). CounterID is the stream,
 so a key on it would add nothing, and the CounterID stamps that prune q37
 to q43 are stream-level, so the key is predicted not to move the survivor
-count run 5 reads (run 1's 30 of 407); run 6 bands that prediction below
+count decision 6's run reads (about 30 survivors of about 100 objects,
+from run 1's pre-decision-6 figure of 30 of 407); run 8 bands that prediction below
 rather than assuming it. ADR-2135's simulator measured a
 `(stream, day, user, ts)` sort, UserID alone: minus 13.1% page bytes
 (`docs/adrs/2135-rlog-v5-storage-footprint.md:65`), minus 1.8% for the
@@ -666,20 +777,22 @@ Effect: bytes on every scanning class (0.80 to 0.87 W); q20's scan half
 shrinks by block pruning on UserID (a block's UserID `[min, max]` is
 narrow for every stream longer than a block, and the NumRange arms
 resolved at `log_fetcher.rs:7452-7456` drop most blocks; figure
-unknown). Cold sum (model): 13 to 16% of W, 15 s at the model's 25 GB
-(about 12 s at run 1's 19 GB): 148 to 133 s at `O = 0.5`.
+unknown). Cold sum (model): bytes only, so it moves the requested bytes
+and not the positions: 13 to 16% of W at run 1's 19 GB of projected bytes,
+about 10 s (decision 3's zstd saving taken first), and the q20 pruning on
+top, figure unknown.
 
-Pre-registered A/B (run 6, paired with run 5). Stamps: `clustering-key
+Pre-registered A/B (run 8, paired with run 7). Stamps: `clustering-key
 show` prints the key; one object's footer carries the descriptor.
 
 | figure | band | miss | source |
 |---|---|---|---|
-| answers | equal run 5 under the Measurement comparison rule | any difference abandons the change at once: it is a correctness question | predicted |
-| `data_size` | 10 to 16% under run 5's | outside | 13.1% and 1.8% from `docs/adrs/2135-rlog-v5-storage-footprint.md:65` and `:71`; band predicted |
-| q20 scan GETs and wire | below run 5's | not below | predicted |
+| answers | equal run 7 under the Measurement comparison rule | any difference abandons the change at once: it is a correctness question | predicted |
+| `data_size` | 10 to 16% under run 7's | outside | 13.1% and 1.8% from `docs/adrs/2135-rlog-v5-storage-footprint.md:65` and `:71`; band predicted |
+| q20 scan GETs and wire | below run 7's | not below | predicted |
 | q24 + q25 + q27 cold sum | growth under 15 s | at or above: abandon | predicted; run 1's walls for the three are the baseline, comment 6368995087 |
-| q37 to q43: `segmentsPrunedByStats` per statement on arm B against arm A, and the seven statements' cold sum | each statement prunes the same count as arm A (run 5's band: at least 70 of about 100), to within 2 objects; the cold sum of the seven at or under arm A's plus 1 s | fewer pruned on any statement, or the sum above arm A's plus 1 s: the key moved the stream-level CounterID stamps and the pruned class regressed, which the cold-sum band below cannot show because the byte saving absorbs it; stop and read the per-statement survivor counts before the byte saving is credited | run 5's stage 2 q37 to q43 band (decision 6), predicted; the per-statement discipline is ADR-0815 acceptance 12, `docs/adrs/0815-clustered-compaction-and-object-pruning.md:1568-1612` |
-| cold sum | run 5 minus 10 to 20 s | outside | predicted |
+| q37 to q43: `segmentsPrunedByStats` per statement on arm B against arm A, and the seven statements' cold sum | each statement prunes the same count as arm A (run 4's band: at least 70 of about 100), to within 2 objects; the cold sum of the seven at or under arm A's plus 1 s | fewer pruned on any statement, or the sum above arm A's plus 1 s: the key moved the stream-level CounterID stamps and the pruned class regressed, which the cold-sum band below cannot show because the byte saving absorbs it; stop and read the per-statement survivor counts before the byte saving is credited | run 4's stage 2 q37 to q43 band (decision 6), predicted; the per-statement discipline is ADR-0815 acceptance 12, `docs/adrs/0815-clustered-compaction-and-object-pruning.md:1568-1612` |
+| cold sum | run 7 minus 10 to 20 s | outside | predicted |
 | hot sum | 54 to 64 s | outside | run 1 hot 59.3 s comment 6368995087; band predicted |
 
 Proof: `crates/ravel-ingest/tests/clustering_key_flush.rs` and
@@ -688,15 +801,65 @@ that `UserID = N` over a keyed 30-block object yields fewer candidate
 blocks than over the unkeyed twin (mutation: the unkeyed object), and an
 answer-equality test for `ORDER BY ts LIMIT 10` on keyed objects.
 
+### 8. The writer assigns column ids in a tenant-declared affinity order (new, 2026-10-24)
+
+Class: writer convention in `ravel-logseg`, plus a tenant setting that
+carries the order; no format change. After decision 6, and only after its
+own A/B.
+
+Mechanism. The writer assigns each object's dynamic column ids from a
+`BTreeSet<(String, u8)>` of the names and types it saw
+(`crates/ravel-logseg/src/writer.rs:537`, ids handed out in that order at
+`:592-602`), and BLOCKS stores a row group's column chunks in ascending
+column id (`docs/log-segment-format.md:862-867`). So a row group's chunks
+lie in alphabetical order of column name, and the column names are the SQL
+identifiers, so the entry cannot reorder them by editing its mapping.
+Every reader maps a name to its id through FIELD_DIR and reads chunk
+extents from PAGE_DIR, never assuming an order, so any id assignment is
+readable. The writer takes an ordered list of column names from the
+tenant's configuration, assigns those ids first in list order, and
+assigns the rest alphabetically after them. Co-projected columns then sit
+next to each other in every row group, and a statement that projects
+them reads one block position where it read several.
+
+The entry declares the sets its statements project together
+(`queries.sql` co-occurrence, counted 2026-10-24): `SearchPhrase, UserID`
+(5 statements); `WatchID, ClientIP, IsRefresh, ResolutionWidth` (q31 to
+q33); `URL, Title, Referer`; `EventDate, IsRefresh, DontCountHits` (q37 to
+q43, with CounterID as the stream attribute).
+
+What it does not change: no format, no reader code, no answer; a tenant
+without the setting keeps today's alphabetical order byte for byte.
+
+Effect (model): on the 16 to 18 multi-column statements, about one
+position fewer per object, 103 x 17 x `K` = 1.9 GB (7 s) at `K = 1.1` and
+1.6 GB (6 s) at `K = 0.9`; nothing on the one-column statements.
+
+Pre-registered A/B (run 5, paired with run 4, both after decision 6).
+
+| figure | band | miss | source |
+|---|---|---|---|
+| chunk-run GETs per object on q31, q32, q33 | run 4's minus 1 to 3 | unchanged: the chunks were already within one bridged run, or the order did not reach the objects (read one object's FIELD_DIR) | predicted |
+| disk bytes per object on q33 | run 4's minus `K` (0.9 to 1.1 MB) | unchanged within 5 % | predicted |
+| cold sum | run 4 minus 3 to 10 s | outside | predicted |
+| answers | equal run 4 under the Measurement comparison rule | any difference | predicted |
+
+Proof: a writer test that the declared names receive the lowest dynamic
+ids in list order and the rest follow alphabetically (mutation: the
+`BTreeSet` order); a fetcher test that a three-column projection of
+adjacent declared columns issues one chunk run where the alphabetical
+order issued three.
+
 ## Consequences
 
 Positive.
 
-- The stock entry's cold sum is predicted at about 155 s at the measured
-  central over-read and about 270 s with no amplification (Measurement),
-  from 367 s, with no server flag, no cache tier and no format bump.
-- Every object a scanning statement opens costs one probe plus its chunk
-  runs after decisions 1 and 4, on every tenant whose tail fits the probe,
+- The stock entry's cold sum is predicted at about 120 to 130 s
+  (Measurement), from run 2's 364.9 s, with no server flag, no cache tier
+  and no format bump; under 200 s after decisions 4, 5 and 6 at either
+  `K`.
+- Every object a scanning statement opens costs one tail position plus its
+  chunk runs after decision 4, on every tenant whose tail fits the probe,
   not only on this entry; the compactor and the ingest flush get the same
   order.
 - `--group-target-blocks` gives an operator the row-group size ADR-0699
@@ -717,7 +880,7 @@ Negative.
   of a tenant written this way holds one 100 MB row group per cursor
   (ADR-0979). The entry does not compact; an operator who copies the
   recipe should read the ingest guide's row.
-- Decision 7's ordered-`LIMIT` cost is unknown until run 6 and can abandon
+- Decision 7's ordered-`LIMIT` cost is unknown until run 8 and can abandon
   the change; its hot and concurrent bands are the ones most likely to be
   the binding ones at 100 MB objects.
 - Decision 3 adds load time of unknown size; its band abandons the change
@@ -753,9 +916,16 @@ Follow-ups the design leaves to the builder or to a later pass:
   Rendering the two under `accounting` would let runs 2 and 4 band on
   them directly instead of inferring the chase and front GETs from GETs
   per object. No band above needs it.
-- The single-GET probe measurement on RustFS (epic step 5) decides whether
-  a shorter probe saves disk under the store's read-ahead; until then the
-  probe length is not a lever.
+- The store probe (comment 6384802590) read 0.6 to 4 MB per cold request
+  across two boxes, with the first request after a cache drop carrying
+  the store's own code pages. A cleaner probe (RustFS restarted and the
+  page cache dropped before each object, a client that stays warm, 10 KB
+  reads at offsets 0, 512 KiB, 1 MiB less 5 KB and a far block, repeated
+  on a second fresh object far block first, and the device's
+  `read_ahead_kb` and RustFS's erasure block size recorded) tells aligned
+  blocks from a per-object first-touch cost and decides whether a probe
+  sized to end on a block boundary is a lever: under aligned blocks a
+  256 KiB probe straddles a boundary on about a quarter of objects.
 - Stale text seen while checking, reported and not fixed here: ADR-0699
   section 5.3 describes a 64 KiB `coalesce_gap` while the code's gap is the
   request cost with 64 KiB as a floor
@@ -809,9 +979,9 @@ Follow-ups the design leaves to the builder or to a later pass:
   tuned entry, its own separately labelled result; the stock result is
   what this ADR moves.
 - Also out of this round, each a format change: chunk order inside a row
-  group (the format doc states ascending column id,
-  `docs/log-segment-format.md:470-476`; byte order puts URL at slot 87 and
-  UserID at 99 of 104, so the change would help); larger blocks (coarsens
+  group other than ascending column id (the format doc states it,
+  `docs/log-segment-format.md:470-476`; decision 8 gets the same adjacency
+  without it, by assigning the ids in a declared order); larger blocks (coarsens
   every block-level index 1:1, ADR-0699 rejected alternative 1); an
   object-level string dictionary or one zstd frame per chunk (ADR-2135
   rejected alternatives, `docs/adrs/2135-rlog-v5-storage-footprint.md:345-350`).
@@ -822,17 +992,20 @@ Follow-ups the design leaves to the builder or to a later pass:
 
 ## Measurement
 
-Run plan. Run 1 is done (367.2 s, v0.25.1, A box the v0.24.0 release box
-at 367.0 s). Each later run carries one change and pairs with the run
-before it:
+Run plan. Runs 1 and 2 are done (run 1: 367.2 s, v0.25.1, A box the
+v0.24.0 release box at 367.0 s; run 2: the #3219 A/B, 367.9 s against
+364.9 s, comment 6384701235). Each later run carries one change and pairs
+with the run before it, in the delivery order:
 
 | run | carries | A box | B box |
 |---|---|---|---|
-| 2 | decisions 1 and 2 (fork PR 1) | current `main` with #3221, stock `load` (band both rows of decision 1 if #3221 has not merged) | the same commit, fork PR 1 |
-| 3 | decision 3 (fork PR 2) | one `main` commit, fork PR 1 | the same commit, fork PR 2 |
-| 4 | decision 4 (Ravel, one PR) | the parent of the first of decision 4's commits as they landed on `main`, fork PR 2 | the last of decision 4's commits as they landed on `main`, fork PR 2 |
-| 5 | decision 6 (fork PR 3), after the stage 1 load stamp | a `main` commit carrying decision 5, fork PR 2 | the same commit, fork PR 3 |
-| 6 | decision 7 (fork PR 4) | run 5's B commit, fork PR 3 | the same commit, fork PR 4 |
+| 3 | decision 4 (Ravel, one PR, #3227) | the parent of the first of decision 4's commits as they landed on `main`, stock `load` | the last of decision 4's commits as they landed on `main`, stock `load` |
+| 4 | decision 6 (fork PR 1), after the stage 1 load stamp | a `main` commit carrying decisions 4 and 5, stock `load` | the same commit, fork PR 1 |
+| 5 | decision 8 (Ravel PR plus a fork line) | the parent of decision 8's first landed commit, fork PR 1 | its last landed commit, fork PR 1 plus the declared order |
+| 6 | decisions 1 and 2 (fork PR 2) | one `main` commit, the previous fork head | the same commit, fork PR 2 |
+| 7 | decision 3 (fork PR 3) | one `main` commit, fork PR 2 | the same commit, fork PR 3 |
+| 8 | decision 7 (fork PR 4) | one `main` commit, fork PR 3 | the same commit, fork PR 4 |
+
 
 A/B binaries. Every measurement run builds Ravel from source at a `main`
 commit through the entry's `RAVEL_REF` path, as the kit runs on #3072
@@ -875,43 +1048,39 @@ with its header amended, the reader comments, the test re-pins; gate
 decision 2 shares fork PR 1 with decision 1 as two independently
 revertible lines.
 
-Cumulative cold-sum arithmetic, in delivery order. The anchor is run 1's
-367.2 s. The `O = 0.5 MB` column is the central estimate and is
-cumulative; the `O = 0` column is the no-amplification reference; the last
-column is each change's own saving at the upper bound and is not
-cumulative, because those upper bounds sum to about 320 s, more than the
-GET-attributable disk bytes hold, so each is the most that change can
-show on its own A/B. Every figure below the anchor is predicted.
+Cumulative cold-sum arithmetic, in delivery order, under the block
+model in Context. The anchor is run 2's arm B, 364.9 s, with 102.8 GB of
+disk for 34.4 GB of wire over the 32 statements above 3 s, so 68.4 GB of
+position overhead (comment 6384701235); every pool below is over those 32
+statements, 13,024 object-statements. Decision 4 removes two positions
+per object, 2 x 13,024 x `K`; decisions 5 and 6 divide what remains by
+3.95 (saving 0.75 of it); decision 8 removes about one position per
+object on 17 statements at 103 objects; decisions 1, 2, 3 and 7 move
+requested bytes only. Both columns are cumulative and every figure below
+the anchors is predicted.
 
-| after | GETs per object, narrow one-column | cold sum at O = 0.5 MB | cold sum at O = 0 | own saving at O = 0.8 | basis |
-|---|---|---|---|---|---|
-| v0.25.1 stock (run 1) | 5.5 | 367.2 (anchor) | 367.2 (anchor) | | measured 2026-10-23, comment 6368995087 |
-| #3219, PR #3221 (landed) | 4.5 | 277 | 303 | 106 | predicted |
-| decision 1, bloom scope `text` | 3.5 | 249 | 301 | 44 | predicted |
-| decision 2, fold after load | 3.5 | 249 (0 to 2 s, not counted) | 301 | 0 to 2 | predicted |
-| decision 3, zstd 9 | 3.5 | 242 | 294 | 7 (bytes only) | predicted |
-| decision 4, directories at the tail | 2.5 | 216 | 294 (under 0.1 s) | 42 | predicted |
-| decisions 5 and 6, 100 MB one-group objects | 2 over 103 objects | 148 | 286 | 104 | predicted |
-| decision 7, clustering key | 2 over 103 | 133 | 271 | 15 (bytes only) | predicted |
+| after | positions per object, narrow one-column | cold sum at `K` = 1.1 MB | cold sum at `K` = 0.9 MB | basis |
+|---|---|---|---|---|
+| v0.25.1 stock (run 1) | 4.5 | 367.2 (anchor) | 367.2 (anchor) | measured 2026-10-23, comment 6368995087 |
+| #3219, PR #3221 (run 2, landed) | 4.5 | 364.9 (anchor) | 364.9 (anchor) | measured 2026-10-24, comment 6384701235 |
+| decision 4, directories at the tail | 2.5 | 255 (28.7 GB of overhead removed) | 276 (23.4 GB) | predicted |
+| decisions 5 and 6, 100 MB one-group objects | 2 over 103 objects | 144 (29.7 GB, less 2 s of pruned-class cost) | 150 (33.6 GB, less 2 s) | predicted |
+| decision 8, columns in affinity order | 1 to 2 over 103 | 137 (1.9 GB) | 144 (1.6 GB) | predicted |
+| decisions 1 and 2, bloom scope `text`, fold | unchanged | 136 | 143 | predicted |
+| decision 3, zstd 9 | unchanged | 131 (7 % of 19 GB) | 138 | predicted |
+| decision 7, clustering key | unchanged | 122 (13 % of the rest) | 129 | predicted |
 
-Stated estimate (predicted): about 155 s at the measured central `O`
-(133 s central plus about 20 s for non-additivity and a 3 to 5% box
-spread); about 270 s with no amplification. Run 1's `O` of 0.39 to
-0.62 MB per GET confirms the central column, and that column says the
-goal (under 200 s) needs decisions 1 to 4 and 5 with 6: decisions 1 to 4
-alone land at about 216 s at `O = 0.5` (294 s at `O = 0`), and decision 6,
-with decision 5 under it, is the one that crosses 200 s, to 148 s. The
-stretch (under 150 s) needs the central reading and all seven decisions.
-With no amplification the design reaches about 270 s and the remaining
-term is column bytes, about 80 s after decisions 3 and 7, which only a
-format change (object-level dictionaries, or one frame per chunk, both
-rejected by ADR-2135) or the tuned entry's cache tier moves; neither is
-in this ADR, and that is stated rather than stretched.
+Stated estimate (predicted): about 120 to 130 s, under 200 s once
+decisions 4, 5 and 6 land at either `K`. The wire floor, every position
+cost gone, is about 105 s after decisions 3 and 7 (run 2's 34.4 GB of
+wire less three quarters of the probe bytes and the byte trims, at
+262 MB/s). The stretch (under 150 s) holds after decisions 5 and 6 at
+`K = 1.1` and needs decision 8 at `K = 0.9`. Run 3 (decision 4) reads `K`
+on this box directly from its per-object disk delta, and every later band
+is restated against that figure before its run.
 
-Device check after the design: a narrow statement at 103 objects x 3 GETs
-is 309 GETs and 0.28 GB of wire; its bandwidth floor is 1.1 s with no
-amplification and 3.5 s at a MinIO-like 2 MiB per GET, against today's 2.7
-to 4.2 s and 16 to 23 s. The design moves the per-statement floor 2.5x
-with no amplification and 5 to 6x under it, which is why the two sums
-differ so much: request count only matters if the store charges per
-request, in money or in disk bytes.
+Device check after the design: a narrow one-column statement at 103
+objects is about 2 positions and 0.3 MB requested per object, about
+0.26 GB of disk, 1.0 s against today's 5 s. The levers move the floor
+because they remove positions; the requested bytes inside a position the
+statement still touches are nearly free on this store.
