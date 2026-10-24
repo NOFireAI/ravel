@@ -29,7 +29,7 @@ ravel-promql = { workspace = true }
 # (`metricsbench_gen`) runs the gate, which a dev-dependency would be invisible
 # to. It is already a workspace member, so a `--workspace` build compiled it
 # before this edge existed too.
-ravel-promql-difftest = { path = "../ravel-promql-difftest", version = "0.25.1" }
+ravel-promql-difftest = { path = "../ravel-promql-difftest", version = "0.26.0" }
 prost = { workspace = true }
 # MetricsBench Remote Write 1.0 ingest lane (ADR-0927, issue #937, task M5).
 # `ravel-remote-write` supplies the `prometheus.WriteRequest`/`TimeSeries`/
@@ -110,7 +110,7 @@ futures = { workspace = true, optional = true }
 # ravel-sql is an internal path crate not yet listed in the workspace
 # `[workspace.dependencies]`, so it is named by path here; every other dep
 # below reuses a workspace pin.
-ravel-sql = { path = "../ravel-sql", version = "0.25.1", optional = true, features = ["flight-sql"] }
+ravel-sql = { path = "../ravel-sql", version = "0.26.0", optional = true, features = ["flight-sql"] }
 # Gated behind `sql-latency`. The ClickBench Parquet lane's in-process engine
 # (`src/clickbench_parquet/engine.rs`) builds a `SqlExecutor` wired to a
 # second "lake" `MemoryStore` the same way `ravel-sql`'s own
@@ -171,7 +171,7 @@ pprof = { version = "0.15", optional = true, features = ["flamegraph"] }
 # `[workspace.dependencies]`, so it is named by path here as ravel-cli's
 # dev-dependency names it. The gate crate supplies the default permit and
 # inline floor values the bins print. No new external crate.
-ravel-server = { path = "../../services/ravel-server", version = "0.25.1", optional = true, features = ["sql"] }
+ravel-server = { path = "../../services/ravel-server", version = "0.26.0", optional = true, features = ["sql"] }
 ravel-cpu-gate = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 # The pending-ack shed cost lane (`pending_ack_shed`) reads the process CPU
@@ -253,7 +253,7 @@ tempfile = { workspace = true }
 # ADR-1702 write gate. ravel-server is named by path as the optional
 # `saturation` entry above names it, here without the `sql` feature; the
 # others are workspace pins ravel-server already links. No new external crate.
-ravel-server = { path = "../../services/ravel-server", version = "0.25.1" }
+ravel-server = { path = "../../services/ravel-server", version = "0.26.0" }
 ravel-cpu-gate = { workspace = true }
 # The same bench records each flush encode's input bytes through
 # `ravel_ingest::FlushInputBytes`. Enabled on the dev-dependency only, so a

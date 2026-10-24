@@ -6,6 +6,234 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-10-25
+
+### Fixed
+
+- **The Pod Identity sidecar's startup probe no longer passes on an earlier
+  sidecar process's file once its credential has expired or when it records
+  no expiry.** The credentials volume outlives a sidecar
+  restart, so the probe found the old file and passed before the new process
+  had fetched anything. The sidecar now removes its written marker
+  (`.credentials.json.written`) when it starts and creates it after each
+  successful write. Without the marker the probe passes only while the file's
+  credential, whose expiry the sidecar now records in the file as
+  `expiration`, has not expired, so a sidecar restarted during a short Pod
+  Identity agent outage is not killed by its probe. The previous credentials
+  file stays in place, so a running server keeps its credentials while the
+  new process fetches.
+- **A slow Pod Identity agent no longer holds back operator reconciles that its
+  cached credential can serve.** The operator's credential cache held its lock
+  across the agent fetch, so every reconcile that needed credentials waited on
+  that fetch. A cached credential that has not expired is now returned at
+  once while a refresh is in flight, and callers with nothing cached share
+  the one fetch instead of each starting their own. A caller that waited
+  takes the shared result only if it has not expired at its own time, and
+  otherwise fetches itself.
+- **A logs scan reserves a dictionary's values before building them.** The
+  SQL memory pool now counts a shared dictionary's Arrow values while a block
+  is built, not only after, and a pool that cannot hold them refuses the
+  build with a resources-exhausted error instead of after the allocation.
+- **The SQL memory pool keeps a grouped aggregate's final output charged
+  until the query releases it.** Previously, on a statement running without
+  spill, the last output batch of a `GROUP BY` was released from the query,
+  tenant and process budgets while it was still in memory.
+- **A logs scan with no filter, or only numeric-range filters, no longer
+  fetches BLOOM and POSTINGS.** A ranged open places BLOOM and POSTINGS only when the query carries a
+  content arm, a stream-attribute arm, or a prune arm other than a numeric
+  range, and the reader reads BLOOM only for a content-channel `HasWord` arm or
+  string equality of at most 64 bytes, so a prune-channel `Equals` has the
+  fetcher place BLOOM that the reader does not read. Previously every ranged
+  open fetched both sections, one GET each, so a predicate-free or
+  numeric-range scan now saves one GET and the section's stored bytes per
+  section per object.
+
+### Added
+
+- **`RavelCluster` can pin the query pods' memory budget** (ADR-1170, issue
+  #3200 amendment). `spec.query.memoryBudgetBytes` renders
+  `--memory-budget-bytes` on the query pods only; unset, the query Deployment
+  renders exactly as before and the budget still derives from the memory
+  limit, so a larger limit alone raises the budget with it and adds no
+  headroom beyond the reserve. With the field set, a query memory limit that
+  is missing, not a valid quantity, or below the budget plus the 256 MiB the
+  server holds outside it in `--mode query` leaves the query Deployment
+  unchanged (none is created on a new cluster) and reports `Degraded` with
+  reason `QueryMemoryBudgetExceedsLimit` or `QueryMemoryLimitUnparseable`. A
+  limit above that floor but below the floor plus the headroom rolls the
+  query pods and reports `Degraded` with reason `QueryMemoryHeadroomLow`.
+  `spec.query.memoryHeadroomBytes` sets the headroom; the provisional default
+  is `ceil(0.53 * budget) + ceil(min(budget, 8 GiB) * 6.6 / 8)`, from the
+  uncharged SQL state measured in #3181 and the allocator retention measured
+  in ADR-2633. It was sized before this release's #3181 fixes, which leave it
+  unchanged; measure the query pods' peak resident memory and set the field.
+  The headroom is checked only against a pinned budget, so a CEL rule refuses
+  `spec.query.memoryHeadroomBytes` without `spec.query.memoryBudgetBytes` at
+  admission (issue #3203).
+- **`ravel-cli export --parquet` writes bloom filters on the id columns**
+  (ADR-1751 decision 4, issue #3229). Every row group carries a Parquet bloom
+  filter, at a 1% false-positive target, on the mapping's trace id, span id
+  and (when set) parent span id output columns for spans, and on its trace id
+  and span id output columns for logs when the mapping sets them; metrics
+  exports carry none. Each filter is sized for the row group's maximum row
+  count and folded down by the parquet writer to the values it actually
+  holds, so a row group holding one trace's spans carries a filter of a few
+  dozen bytes. `--parquet-bloom-columns <a,b,...>` replaces the default list,
+  `--parquet-bloom-columns none` writes no filter, and a name that is not an
+  output column of the export is refused before the export reads anything.
+- **`stats.accounting.lateServedBytes` reports the bytes another in-flight
+  read of the same object handed the statement.** Those bytes are counted
+  neither in `cacheBytes` nor in the GET bytes. The field appears in every
+  response that carries `stats.accounting`.
+
+### Changed
+
+- **The logs scan hands its partitions work from one shared queue** (ADR-3072
+  decision 2, ADR-0102 decision 1 as amended by #3080). Once the plan
+  resolves, units of work are published to one queue and each partition
+  takes the next unit when it finishes its current one, instead of being
+  dealt every `n`th block or segment up front, so a partition that finishes
+  early takes more of the remaining work. Under an ascending `ts` TopK with a
+  read cache the units and their order are unchanged at every partition
+  count, one included: the global deal's row groups in ascending `ts`, with
+  the consecutive row groups of one segment that the deal gave one partition
+  merged into one unit, so a segment is opened exactly as often as before.
+  Outside that TopK, with a read cache and more than one SQL partition, a
+  segment of `G` surviving row groups is cut into runs of `ceil(G / n)`
+  consecutive row groups for `n` partitions, so it is opened at most
+  `min(G, n)` times; without a read cache, or with one partition, each
+  segment is one unit. A
+  row group is still read by exactly one partition, the declared partition
+  count is unchanged, and a statement returns the same rows. The
+  predicate-free whole-segment fast path keeps its round-robin assignment.
+  Two costs move: a run of adjacent row groups is fetched as one coalesced
+  range, so it issues fewer requests and also moves the bytes between its
+  groups, and a re-executed scan fetches its carried whole objects again
+  instead of reusing the first execution's.
+- **`--cache-bulk-scan-min-bytes <BYTES>` reads filtered `logs` statements
+  larger than the cache as bulk scans** (ADR-3072's size trigger amendments).
+  It applies to `logs` statements sent as SQL text, through
+  `POST /api/v1/sql` or as an alert rule's SQL, not through Flight SQL; default
+  unset, which keeps the predicate-free rule alone. Set, such a statement is
+  also a bulk scan when it names one `logs` table and no Parquet table, its
+  optimized plan has no equality on a field the tenant indexes in KEY_IDX, and
+  the last successful execution of the same SQL text for the same tenant, over
+  a window of the same length with the same row-window setting and row cap,
+  read at least the threshold (bytes served from the cache, bytes a concurrent
+  read of the same object handed it, and bytes read from the store, every
+  phase; `stats.accounting` reports the second as `lateServedBytes`). Its first
+  execution in a process therefore reads as interactive, and a statement whose
+  text changes every run never reads as bulk, though each of its runs still
+  writes a record. The process keeps one record, for every tenant together,
+  of the 4,096 most recent statements, so such a stream evicts the records of
+  statements that repeat. The threshold in force is the flag raised to
+  `--cache-max-bytes`, the RAM tier's size, when that is larger, and
+  startup logs it as a `performance default resolved` line with
+  `setting="cache_bulk_scan_min_bytes"` and a `source` of `flag` or
+  `flag-floored-to-cache-max-bytes`. A bulk scan's reads go to the fetcher
+  cache's bulk region (`--cache-bulk-share`) instead of the interactive
+  queues, and `stats.cache.intent` reports `bulkScan`. `samples` statements and
+  lowered ES|QL statements are unaffected. Rows returned are unchanged.
+  `0` is refused at startup; omit the flag to leave the trigger off.
+  `sql_latency_bench --cache-bulk-scan-min-bytes` applies the same floor at
+  `--cache-bytes`.
+- **The SQL memory pool charges a grouped aggregate ahead of what it asks
+  for.** On a SQL `GROUP BY` or an ES|QL `STATS ... BY` that runs on the
+  migrated aggregate streams, the
+  query, tenant and process budgets are charged 1.25 times the bytes the
+  aggregate reserves. The pool also reserves, on the process budget, an
+  envelope for the next step of the largest building aggregates, so an
+  aggregate whose next step the process budget cannot hold is refused
+  before it makes it. The envelope is capped at 2.43 times the aggregate's
+  asked size and sized from the plan's aggregate layout: the group table's
+  entry size and the per-group bytes of the columns and accumulator states
+  that grow with the group count. A layout whose group table and columns
+  report their capacity is also bounded by the share of the reservation each
+  can hold, and a layout the planner does not classify uses five times its
+  largest step, under the same cap (#3181). Under concurrent load, large
+  `GROUP BY` statements are refused more often than in 0.25, and more of the
+  refusals come from the process budget than from the tenant budget, so one
+  tenant's load can now refuse another tenant's large aggregate. `ravel-server`
+  turns this on and has no setting to turn it off. Library embedders can set
+  `SqlConfig::aggregate_reserve_ahead`, where `AggregateReserveAhead::OFF`
+  restores one-to-one charging and no envelope.
+- **A repeated logs scan alternates the direction it reads its segments in**
+  (ADR-0102's #3192 amendment). With a read cache wired, no confirmed
+  `ORDER BY ts LIMIT` TopK and no pushed fetch limit, every second execution
+  of the same scan (same tenant, projection and pushed filters, whichever
+  objects the window selects) publishes its segments in reverse order, so it
+  reads first what the previous execution read last, while the cache still
+  holds it. Previously a dashboard re-running a statement over more data than
+  the cache held was served nothing from it on warm runs. A tenant still
+  ingesting keeps the alternation as new objects arrive. The executor keeps the count per scan
+  in a record of at most 4,096 scans, charged to no cache. Rows without an
+  `ORDER BY` can come back in a different order between executions, and
+  some statements can return different rows, each set a valid answer: a
+  `LIMIT` the scan does not take as a pushed fetch (one above a filter the
+  scan does not evaluate exactly, such as `body LIKE '%x%'`, or above a
+  `SELECT DISTINCT`), an `ORDER BY` on a key other than `ts`, or on
+  `ts DESC`, whose `LIMIT` cuts through tied rows, and `first_value`,
+  `last_value` or `ARRAY_AGG` without an `ORDER BY`. These now differ on
+  alternate executions even at one partition, where they used to repeat;
+  with more than one partition they already varied with timing. Of the
+  scans that read through a read cache and leave the predicate-free
+  whole-segment fast path, only one under a pushed fetch or a confirmed
+  TopK keeps its order. The fast path, the TopK order and uncached scans
+  are unchanged.
+
+### Security
+
+- **Maintain-worker registry records are authenticated, and `--mode maintain`
+  requires `--maintain-key-file`.** A principal holding the maintain role's
+  S3 write could previously put a fresh heartbeat under
+  `sys/maintain/workers/` and join the live set, owning maintenance units
+  (retention, compaction, erasure, the catalog fold, scrub) that nobody then
+  worked. `WorkerHeartbeat` moves to `format_version` 2 with a MAC keyed by
+  the new key file, and both live-set readers, the heartbeat task and scrub,
+  admit a sibling only when its MAC verifies. Rejected records are counted in
+  `ravel_maintain_worker_record_rejects_total{reason}`. Every other mode,
+  `--mode all` included, refuses the flag. A maintain process on this release
+  and one on an earlier release do not admit each other's records, so a
+  rolling upgrade does some maintenance work twice until it completes. The
+  operator renders the flag from the new `RavelCluster` field
+  `spec.maintain.keySecretRef`, which is required while maintain is enabled.
+  Without it, or while the Secret it names does not exist, the operator
+  leaves an existing maintain Deployment unchanged, creates none, and reports
+  `Degraded` with reason `MaintainKeySecretRefMissing` or `SecretNotFound`.
+  An existing cluster keeps reconciling its gateway and query Deployments; a
+  fresh cluster on per-role storage credentials creates no `ravel-server`
+  Deployment until the Secret exists, because gateway and query wait for
+  maintain to create
+  `sys/gc`. If `spec.image` is a mutable tag, create the Secret before
+  upgrading: an old maintain pod that restarts and pulls this release cannot
+  start without the flag. See the three-step key rotation in the deployment
+  guide.
+- **Maintain memo snapshots are authenticated.** A principal holding the
+  maintain role's S3 write could previously put a snapshot under
+  `sys/maintain/memo/` that seeded terminal verdicts into every maintain
+  process, so the owners of those buckets skipped them until the verdicts went
+  stale. Each snapshot now carries a MAC under the `--maintain-key-file` keys
+  over the writer's process id, which a reader takes from the object key, so a
+  snapshot that no key holder wrote, or one copied under another process's
+  key, seeds nothing and is never decoded. A principal with read and write
+  access can still put a process's own earlier snapshot back at its key; the
+  1-hour staleness bound limits that replay to snapshots under an hour old, so
+  it defers a bucket's re-evaluation by at most an hour. Rejected snapshots are
+  logged with a count per reason, and snapshot objects last modified more than
+  2 hours ago are skipped unread and logged below warning level. During a
+  rolling upgrade, processes on this release and on an earlier release cannot
+  read each other's snapshots, so each maintenance unit starts cold once and
+  rescans its buckets.
+- **The allocation a maintain memo snapshot can cause is now bounded.** The
+  counts a snapshot carries still size what decoding it allocates, but only up
+  to two caps: a process skips a snapshot object over 32 MiB and refuses one
+  whose runs expand to more than 4,194,304 per-hour entries, checked before
+  each run is expanded, leaving the units it covers to a cold rescan. A
+  snapshot of its own over either cap is skipped and never written.
+- **tokio is updated to 1.53.3 for RUSTSEC-2026-0386.** The advisory marks
+  tokio 1.53.1's safe `AsyncFd` constructors unsound. Ravel never constructs
+  an `AsyncFd`, so no shipped path reached the unsound API.
+
 ## [0.25.1] - 2026-10-22
 
 ### Fixed
