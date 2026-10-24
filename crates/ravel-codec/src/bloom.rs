@@ -17,23 +17,23 @@ use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
 
 /// Hash count per probe, sized for a ~1% false-positive rate.
-const K: u8 = 7;
+pub(crate) const K: u8 = 7;
 /// Block size in bits; a probe stays inside one block.
-const BLOCK_BITS: u64 = 512;
+pub(crate) const BLOCK_BITS: u64 = 512;
 /// Bits per element for p = 0.01: `-ln(0.01) / (ln 2)^2`.
-const BITS_PER_ELEM: f64 = 9.585;
+pub(crate) const BITS_PER_ELEM: f64 = 9.585;
 
 /// The three 64-bit hashes for a `(column_id, token)` key under `seed`,
 /// read from disjoint bytes of the BLAKE3 digest so block selection and the
 /// within-block probes are independent.
-struct KeyHash {
+pub(crate) struct KeyHash {
     /// Selects the 512-bit block.
-    block: u64,
+    pub(crate) block: u64,
     /// Within-block double-hashing base.
-    g1: u64,
+    pub(crate) g1: u64,
     /// Within-block double-hashing stride, low bit forced set so it is never
     /// zero (mod 512).
-    g2: u64,
+    pub(crate) g2: u64,
 }
 
 /// Test-only instrument: counts `key_hash` (BLAKE3) invocations on the
@@ -66,7 +66,7 @@ mod hash_calls {
 /// set. Using disjoint digest bytes for the block and the offsets keeps the
 /// first probe from being congruent to the block index (which would collapse
 /// most set bits onto two offsets and wreck the false-positive rate).
-fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
+pub(crate) fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
     #[cfg(test)]
     hash_calls::bump();
     let mut hasher = blake3::Hasher::new();
@@ -88,18 +88,18 @@ fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
 }
 
 /// The `k` bit indices a key sets or probes, given the filter geometry.
-fn probe_bits(h: &KeyHash, k: u8, block_count: u64) -> impl Iterator<Item = u64> {
+pub(crate) fn probe_bits(h: &KeyHash, k: u8, block_count: u64) -> impl Iterator<Item = u64> {
     let base = (h.block % block_count) * BLOCK_BITS;
     let g1 = h.g1;
     let g2 = h.g2;
     (0..u64::from(k)).map(move |i| base + (g1.wrapping_add(i.wrapping_mul(g2)) % BLOCK_BITS))
 }
 
-fn set_bit(bits: &mut [u8], bit: u64) {
+pub(crate) fn set_bit(bits: &mut [u8], bit: u64) {
     bits[(bit / 8) as usize] |= 1u8 << ((bit % 8) as u32);
 }
 
-fn get_bit(bits: &[u8], bit: u64) -> bool {
+pub(crate) fn get_bit(bits: &[u8], bit: u64) -> bool {
     bits[(bit / 8) as usize] & (1u8 << ((bit % 8) as u32)) != 0
 }
 
