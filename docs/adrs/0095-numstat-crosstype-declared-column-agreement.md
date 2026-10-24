@@ -211,6 +211,10 @@ numeric range that the merged winner falsifies. This does **not** include
 wiring a SQL-planner-side predicate extraction from a declared-column
 comparison; that is #278's job, unblocked once this mechanism is sound.
 
+The same prune channel also takes an integer not-equal arm, which prunes a
+block on its recorded min/max by a different rule; see the prune-only
+not-equal amendment at the end of this ADR.
+
 ### 7. Checksum coverage
 
 SKIP_IDX bytes are already inside RLOG's existing trailer-covered span;
@@ -340,3 +344,36 @@ not two implementations -- is what the single `StampScratch::finish` plus
 merged view `emit_merged` projects, so a second divergent implementation is
 no longer even reachable as a separate code path. The RLOG v3 trailer
 decision (decision 4) is untouched by any of this.
+
+## Amendment 2026-10-25: prune-only integer not-equal arm (#3240)
+
+<!-- amendment-applies: sections="6. Reader-side wiring, epic #331's second wave" pointer="prune-only not-equal amendment" -->
+
+Decision 6 wires numeric-range arms into `SkipIndex::candidate_blocks`. This
+amendment adds a second numeric arm on the same channel,
+`Predicate::NumNotEq { field, value }`, for `field <> value` on an
+attribute's dynamic `I64` column. The SQL planner pushes it for `col <> lit`
+or `lit <> col` on a declared `I64` column with an integer literal; the arm
+resolves to a column id exactly as a `NumRange` arm does, and an arm whose
+`(name, I64)` pair resolves to no column prunes nothing.
+
+The prune rule: a block, or a whole level-1 group of blocks, is pruned when
+its NumStat for the column has `min == max == value`. Every non-null cell in
+it then equals `value`, and a null cell never satisfies `<>`, so no row in it
+can match. An all-null block's stat is written as `[0, 0]`, which this rule
+correctly prunes for `<> 0` and keeps for any other value. A block with no
+stat for the column is kept. A range that merely contains `value` is kept:
+any other value inside it may match.
+
+The arm is prune-only, like `NumRange`. It never decides a row: the reader's
+residual evaluation treats it as true, and the SQL filter stays `Inexact`,
+so the `<>` is still evaluated above the scan. Making it exact would need
+the reader to evaluate the merged value (record, scope or resource) per row
+with SQL's three-valued semantics, which the prune path does not do.
+
+The arm is not carried in Flight SQL tickets. `prune_is_carried` excludes
+it, so a pushdown holding it encodes to the same ticket bytes as the
+pushdown without it and the ticket wire format and version are unchanged; a
+ticket-driven scan reads more blocks, never different rows. Plan-time
+segment skipping by declared-column statistics (ADR-2121 D1) ignores it.
+No persisted format, proto, or commit record changes.
