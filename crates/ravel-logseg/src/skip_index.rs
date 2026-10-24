@@ -582,6 +582,44 @@ mod tests {
         e
     }
 
+    /// A `NotEq` arm drops a block, and a whole level-1 group, only when the
+    /// stat is `[value, value]`. Group 0 is 64 blocks of `[0, 0]` and is pruned
+    /// whole; in group 1, `[0, 0]` is pruned, `[0, 1]`, `[-1, 0]` and `[3, 3]`
+    /// are kept, and a block with no stat for the column is kept.
+    #[test]
+    fn candidate_blocks_not_eq_prunes_only_all_equal_entries() {
+        let mut l0: Vec<Level0Entry> = (0..FANOUT as u64).map(|i| i64_entry(i, 10, 0, 0)).collect();
+        let base = FANOUT as u64;
+        l0.push(i64_entry(base, 10, 0, 0));
+        l0.push(i64_entry(base + 1, 10, 0, 1));
+        l0.push(i64_entry(base + 2, 10, -1, 0));
+        l0.push(i64_entry(base + 3, 10, 3, 3));
+        let mut no_stat = entry(base + 4, 0, 1000, 0, 0);
+        no_stat.record_count = 1;
+        no_stat.stats = Vec::new();
+        l0.push(no_stat);
+        let idx = SkipIndex::build(l0);
+        assert_eq!(idx.l1.len(), 2);
+
+        let arm = [NumArm::NotEq {
+            column_id: 10,
+            value: 0,
+        }];
+        let f = FANOUT;
+        assert_eq!(
+            idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm),
+            vec![f + 1, f + 2, f + 3, f + 4]
+        );
+        // `[3, 3]` is all-equal to 3, so `<> 3` drops it and keeps the rest.
+        let arm = [NumArm::NotEq {
+            column_id: 10,
+            value: 3,
+        }];
+        let got = idx.candidate_blocks(i64::MIN, i64::MAX, None, &arm);
+        assert_eq!(got.len(), f + 4);
+        assert!(!got.contains(&(f + 3)));
+    }
+
     fn i64_arm(column_id: u32, min: Option<i64>, max: Option<i64>) -> NumRangeArm {
         NumRangeArm {
             column_id,
