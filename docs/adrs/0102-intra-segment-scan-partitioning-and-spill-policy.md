@@ -1038,20 +1038,22 @@ The reserve-ahead amendment left the envelope off by default until it could
 be sized from each stream's layout. It now is, and `AggregateReserveAhead::DEFAULT`
 carries it; the `WITH_ENVELOPE` constant is removed, and
 `AggregateReserveAhead::OFF` still restores one-to-one charging with no
-envelope. Before a statement executes, the executor reads the plan's
-`AggregateExec` nodes and sets one aggregate profile on the query's pool:
-the group table's entry size (16 bytes for primitive and multi-column keys,
-32 for a single string-view key), the per-group bytes `W` of the key column
-and accumulator states that grow with the group count, and the widest single
-one of them, `w_max`. A group-values or accumulator type it does not
-recognise makes the profile Unknown.
+envelope. The last physical optimizer rule of every SQL session reads the
+final plan's `AggregateExec` nodes and sets one aggregate profile on the
+query's pool, so every path that executes a plan the session built is
+covered. The profile is the group table's entry size (16 bytes for
+primitive and multi-column keys, 32 for a single string-view key), the
+per-group bytes `W` of the key column and accumulator states that grow with
+the group count, and the widest single one of them, `w_max`. A group-values
+or accumulator type it does not recognise makes the profile Unknown.
 
 Each grow a stream makes is matched, within 3%, to a hashbrown step
-(`7/8 x 2^k x entry`) or a `Vec` step (`2^k x W`), and the last of each
-kind is kept. The envelope is the larger of the next block of either
-structure: the table multiplier (5.0 for 16-byte entries, 4.9 for 32-byte
-ones) times the last table step, and 2.1 times the last `Vec` step times
-`1 + w_max/W`, capped at 2.43 times the stream's asked size, which alone
+(`7/8 x 2^k x entry`) or a `Vec` step (`2^k x W`), and the largest of each
+kind is kept: the groups only grow while a stream builds, so a per-batch
+grow that lands on a low rung does not lower it. The envelope is the larger
+of the next block of either structure: the table multiplier (5.0 for
+16-byte entries, 4.9 for 32-byte ones) times the largest table step, and
+2.1 times the largest `Vec` step times `1 + w_max/W`, capped at 2.43 times the stream's asked size, which alone
 applies under 8 MiB. A stream with an Unknown profile, no profile, or no
 matched step yet is charged 5 times its largest grow. ADR-1170's layout
 envelope amendment gives the measured basis and the tests that pin it.
