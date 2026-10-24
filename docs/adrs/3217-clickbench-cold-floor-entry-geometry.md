@@ -19,10 +19,11 @@ moved from 367.9 s to 364.9 s: disk bytes per object were unchanged within
 1 % on every statement and the answers byte-equal on all 43. The store
 probe (comment 6384802590) then measured the read granularity directly,
 and run 2's own per-object figures fix it on the bench box: a request
-costs its requested bytes plus about 0.8 to 0.9 MB (run 2's q2 and q34;
-the probe read 0.6 to 4 MB across two boxes) for each distinct
-1 MiB-aligned block position of the object it touches, and a request
-inside a position already read costs almost nothing. The model is now
+costs its requested bytes plus about 0.8 to 0.9 MB (run 2's q2, q34 and
+q23; the probe read 0.6 to 4 MB across two boxes) for each contiguous span
+of the object it reads, the store reading every span out to whole
+1 MiB-aligned blocks, and a request inside a block an earlier request
+already read costs almost nothing. The model is now
 the block model stated in Context; every band and estimate below is
 restated in it; the delivery order moves the position-removing decisions
 (4, then 5 with 6, then the new decision 8) ahead of the byte trims; and
@@ -87,23 +88,26 @@ Run 1 settled what the cold sum is made of (readout #3217 comment
   5.84; q12 7.49 and 2.89. The per-object GETs are a 256 KiB suffix probe,
   a SKIP_IDX+PAGE_DIR chase, a STREAM_DIR+FIELD_DIR front GET, a BLOOM GET
   of 1,191,906 B that no ClickBench statement reads (gone since #3219),
-  and 1 to 4 chunk runs. In positions, after #3219: the front
-  directories (STREAM_DIR 201 B and FIELD_DIR 1,043 B on the median
-  object) at offset 0; the chase (SKIP_IDX 5,970 B and PAGE_DIR 22,312 B)
-  about 1.22 MB before the end; the probe, the last 256 KiB; and each
-  column run. The 1.19 MB BLOOM sits between the chase and the probe, so
-  those two are about 0.95 MB apart and land in different 1 MiB blocks.
-  q2 touches 4.5 positions per object (the half is the second run on the
-  two-row-group objects) and reads 3.96 MB from disk for 0.41 MB of wire
-  (run 2, arm B): 3.55 MB over the requested bytes, (3.96 - 0.41) / 4.5 =
-  0.79 MB per position; q34 reads 8.90 MB for 3.98 requested over about
-  5.6 positions, (8.90 - 3.98) / 5.6 = 0.88 MB each. One whole 1 MiB block
-  is 1.05 MB, so the measured cost sits a little under a block per
-  position (the probe's tail block is partial on most objects). So the
-  bench box reads `K` of about 0.8 to 0.9 MB per position. The front and
-  chase positions are then about 1.6 to 1.8 MB per object per statement,
-  about 80 to 90 s of the 365 s (x 407 objects x 32 statements above 3 s
-  / 262 MB/s).
+  and 1 to 4 chunk runs. Each GET reads one contiguous span; after #3219
+  the spans are the front directories (STREAM_DIR 201 B and FIELD_DIR
+  1,043 B on the median object) at offset 0, the chase (SKIP_IDX 5,970 B
+  and PAGE_DIR 22,312 B) about 1.22 MB before the end, the probe (the last
+  256 KiB), and each column run. The 1.19 MB BLOOM sits between the chase
+  and the probe, so those two are about 0.95 MB apart and land in
+  different 1 MiB blocks. The store reads every span out to whole
+  1 MiB-aligned blocks at both ends: a span of `s` bytes touches about
+  `s` / 1 MiB + 1 blocks, so it costs about `s` + 1 MiB of disk, the
+  requested bytes plus about one block of edge waste (less on the probe's
+  span, which ends at the object's partial last block). The requested
+  bytes are the wire; the edge waste per span, `K`, is the overhead.
+  Dividing run 2's disk-minus-wire by its GETs per object (arm B) gives
+  the same `K` on statements of very different width: q2 (3.96 - 0.41) /
+  4.51 = 0.79 MB, q34 (8.90 - 3.98) / 5.58 = 0.88 MB, q23 (14.41 - 9.67) /
+  5.51 = 0.86 MB, against 9.7 MB of requested bytes on q23 and 0.41 on q2.
+  So the bench box reads `K` of about 0.8 to 0.9 MB per span, a little
+  under one whole 1 MiB block (1.05 MB). The front and chase spans are
+  then about 1.6 to 1.8 MB per object per statement, about 80 to 90 s of
+  the 365 s (x 407 objects x 32 statements above 3 s / 262 MB/s).
   q2's projected column is 3.8 KB of the 0.41 MB it requests per object.
   Stored column bytes on the median object: AdvEngineID 3.8 KB, UserID
   0.80 MB, SearchPhrase 0.65 MB, URL 2.44 MB; summed over the 30
@@ -139,13 +143,16 @@ disk bytes            = N x (requested bytes + positions x K)
 cold wall             = T0 + disk bytes / 262 MB/s
 ```
 
-A position is a 1 MiB-aligned block of the object the store reads as a
-unit; the requests that fall inside one share its cost, however many GETs
-they are and however many bytes they ask for. `K` is the per-position
-cost: 0.79 and 0.88 MB measured from run 2's own q2 and q34 figures on
-the bench box (above), a little under one whole 1 MiB block (1.05 MB),
-with the probe's 0.6 to 4 MB across two boxes (comment 6384802590) as the
-outer bound. Every table below prices `K` at 0.9 MB and 0.8 MB, and every
+A position is one contiguous span of the object a request reads (one GET,
+one span). The store reads it out to whole 1 MiB-aligned blocks at both
+ends, so a span of `s` requested bytes costs about `s` + `K` of disk: the
+requested bytes are in the wire term and `K` is the edge waste, about one
+block per span; two spans inside one block share it. The bytes a long
+span forces through many blocks are its own requested bytes, already
+counted in the wire, so `K` does not grow with span length. `K` is 0.79,
+0.88 and 0.86 MB on run 2's q2, q34 and q23 (above), a little under one
+whole 1 MiB block (1.05 MB), with the probe's 0.6 to 4 MB per cold request
+across two boxes (comment 6384802590) as the outer bound. Every table below prices `K` at 0.9 MB and 0.8 MB, and every
 pool of disk bytes is
 taken over the 32 statements above 3 s that run 2 measured, 407 x 32 =
 13,024 object-statements. The requested
@@ -511,8 +518,8 @@ STREAM_DIR and FIELD_DIR at offsets above PAGE_DIR's, tail under 200 KB.
 | figure | band | miss | source |
 |---|---|---|---|
 | scan GETs per object on q2, q34, q33; plan GETs per object on q20 | q2 at run 2's 4.51 minus 2 (2.51: probe and one run, plus the second run on the two-row-group objects); q34 run 2's 5.58 minus 2 (3.58); q33 (4 columns) run 2's 6.93 minus 2, to within 0.1; q20 exactly 1 (probe only) | q2 at run 2's value: the front GET still fires (order unchanged, or the tail exceeds 256 KiB: read the inspect stamp); minus 1 only: the chase still fires, BLOOM is not ahead of the directories | run 2 values comment 6384701235; band predicted |
-| disk bytes per object on q2, q34, q23 (`disk read / objects`, cold try) | q2 1.8 to 3.0 MB from run 2's 3.96; q34 6.5 to 7.6 from 8.90; q23 12.0 to 13.0 from 14.41 (minus two positions at `K` = 0.8 to 0.9 MB) | unchanged within 5 % with the GET stamp passing: the positions are not the unit this store charges, re-read the block map from this run; minus one position only: the chase shared the probe's block, record `K` | run 2 values comment 6384701235; band predicted |
-| cold sum | run 2's B (364.9 s) minus 45 to 110 s | a drop under 30 s with the GET and disk stamps passing means the disk is not the floor on the statements that moved: read the per-statement walls against their disk time before any later step | run 2 value comment 6384701235; band predicted |
+| disk bytes per object on q2, q34, q23 (`disk read / objects`, cold try) | q2 2.0 to 2.6 MB from run 2's 3.96; q34 6.9 to 7.5 from 8.90; q23 12.4 to 13.0 from 14.41 (minus two spans at `K` = 0.8 to 0.9 MB, plus the 30 KB the chase requested) | unchanged within 5 % with the GET stamp passing: the positions are not the unit this store charges, re-read the block map from this run; minus one position only: the chase shared the probe's block, record `K` | run 2 values comment 6384701235; band predicted |
+| cold sum | run 2's B (364.9 s) minus 65 to 100 s | a drop under 30 s with the GET and disk stamps passing means the disk is not the floor on the statements that moved: read the per-statement walls against their disk time before any later step | run 2 value comment 6384701235; band predicted |
 | hot sum, QPS, error ratio | 54 to 64 s; at least 0.60; at most 0.058 | outside | run 2 hot 57.3 s, QPS 0.703, error ratio 0.023, comment 6384701235; the 0.058 bar is ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 | answers | equal under the Measurement comparison rule | any difference | predicted |
 
@@ -684,11 +691,19 @@ the entry).
 
 Effect (after #3219 and decision 4, per statement): a narrow statement
 goes from 1,230 GETs (3 per object) to 309, 921 fewer GETs and 80 MB
-fewer probe bytes, and every position a statement pays per object is paid
-103 times instead of 407. Cold sum (model), from the measured position
-overhead rather than from `K` alone: run 2 read 102.8 GB of disk for
+fewer probe bytes. A 100 MB one-group object holds what four 25 MB
+objects held, so each of a statement's column runs becomes one span four
+times as long instead of four spans: under aligned blocks four spans of
+`s` bytes touch about 4 `s` / 1 MiB + 4 blocks and the merged span
+4 `s` / 1 MiB + 1. The requested bytes are unchanged (they are the wire
+term) and the edge waste per run falls from four `K` to one; the probe's
+span goes from four to one the same way. So every span a statement pays
+per object is paid 103 times instead of 407, and what this decision
+divides is the edge waste, never the column bytes. Cold sum (model), from
+the measured overhead rather than from `K` alone: run 2 read 102.8 GB of disk for
 34.4 GB of wire over the 32 statements above 3 s (comment 6384701235), so
-68.4 GB is position overhead; decision 4 removes 2 x 13,024 x `K` of it
+68.4 GB is edge waste, the disk-minus-wire that holds no requested byte;
+decision 4 removes 2 x 13,024 x `K` of it
 (23.4 GB at `K = 0.9 MB`, 20.8 GB at `K = 0.8 MB`), leaving 45.0 or
 47.6 GB; decision 6 divides what is left by 407 / 103 = 3.95, saving 0.75
 of it: 33.6 GB (128 s) at `K = 0.9` and 35.6 GB (136 s) at `K = 0.8`,
@@ -839,7 +854,8 @@ ResolutionWidth, SearchPhrase, UserID, EventDate, DontCountHits, URL`.
 q33 projects `WatchID, ClientIP, IsRefresh, ResolutionWidth`; q32 the
 same plus `SearchPhrase`; q31 `SearchEngineID, ClientIP, IsRefresh,
 ResolutionWidth, SearchPhrase`; so all three read one contiguous span
-(q32's span carries `SearchEngineID`, one small column, bridged).
+(q32's and q33's spans carry `SearchEngineID`, one small column,
+bridged; q31's is contiguous).
 `SearchPhrase, UserID` co-occur on 5 statements. `EventDate, IsRefresh,
 URL` and `DontCountHits` serve the pruned class q37 to q43 (`DontCountHits`
 on q37, q38, q42 and q43; CounterID is the stream attribute), whose
