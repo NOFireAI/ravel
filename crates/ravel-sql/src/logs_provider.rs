@@ -1678,11 +1678,8 @@ mod tests {
                 .expect("COUNT(*) is Int64")
                 .value(0)
         };
-        let (pruned_batches, pruned) = run_batches_counted(
-            &ctx,
-            "SELECT COUNT(*) FROM logs WHERE status_code <> 0",
-        )
-        .await;
+        let (pruned_batches, pruned) =
+            run_batches_counted(&ctx, "SELECT COUNT(*) FROM logs WHERE status_code <> 0").await;
         let (plain_batches, plain) = run_batches_counted(
             &ctx,
             "SELECT COUNT(*) FROM logs WHERE status_code <> 0 OR body = 'zzz'",
