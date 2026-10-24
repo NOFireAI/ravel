@@ -19,8 +19,8 @@ moved from 367.9 s to 364.9 s: disk bytes per object were unchanged within
 1 % on every statement and the answers byte-equal on all 43. The store
 probe (comment 6384802590) then measured the read granularity directly,
 and run 2's own per-object figures fix it on the bench box: a request
-costs its requested bytes plus about 1 MB (0.9 to 1.1 MB on run 2's q2
-and q34; the probe read 0.6 to 4 MB across two boxes) for each distinct
+costs its requested bytes plus about 0.8 to 0.9 MB (run 2's q2 and q34;
+the probe read 0.6 to 4 MB across two boxes) for each distinct
 1 MiB-aligned block position of the object it touches, and a request
 inside a position already read costs almost nothing. The model is now
 the block model stated in Context; every band and estimate below is
@@ -95,13 +95,15 @@ Run 1 settled what the cold sum is made of (readout #3217 comment
   those two are about 0.95 MB apart and land in different 1 MiB blocks.
   q2 touches 4.5 positions per object (the half is the second run on the
   two-row-group objects) and reads 3.96 MB from disk for 0.41 MB of wire
-  (run 2, arm B): 3.55 MB over the requested bytes, about 0.8 to 0.9 MB
-  per position; q34 reads 8.90 MB for 3.98 requested over about 5.6
-  positions, about 0.9 MB each; four 1 MiB blocks would be 4.2 MB against
-  q2's measured 3.96. So the bench box reads `K` of about 0.9 to 1.1 MB
-  per position, one aligned 1 MiB block. The front and chase positions are
-  then about 2 MB per object per statement, about 100 s of the 365 s
-  (x 407 objects x 32 statements above 3 s / 262 MB/s).
+  (run 2, arm B): 3.55 MB over the requested bytes, (3.96 - 0.41) / 4.5 =
+  0.79 MB per position; q34 reads 8.90 MB for 3.98 requested over about
+  5.6 positions, (8.90 - 3.98) / 5.6 = 0.88 MB each. One whole 1 MiB block
+  is 1.05 MB, so the measured cost sits a little under a block per
+  position (the probe's tail block is partial on most objects). So the
+  bench box reads `K` of about 0.8 to 0.9 MB per position. The front and
+  chase positions are then about 1.6 to 1.8 MB per object per statement,
+  about 80 to 90 s of the 365 s (x 407 objects x 32 statements above 3 s
+  / 262 MB/s).
   q2's projected column is 3.8 KB of the 0.41 MB it requests per object.
   Stored column bytes on the median object: AdvEngineID 3.8 KB, UserID
   0.80 MB, SearchPhrase 0.65 MB, URL 2.44 MB; summed over the 30
@@ -140,10 +142,11 @@ cold wall             = T0 + disk bytes / 262 MB/s
 A position is a 1 MiB-aligned block of the object the store reads as a
 unit; the requests that fall inside one share its cost, however many GETs
 they are and however many bytes they ask for. `K` is the per-position
-cost: 0.9 to 1.1 MB from run 2's own q2 and q34 figures on the bench box
-(above), consistent with one 1 MiB block, and the probe's 0.6 to 4 MB
-across two boxes (comment 6384802590) as the outer bound. Every table
-below prices `K` at 1.1 MB and 0.9 MB, and every pool of disk bytes is
+cost: 0.79 and 0.88 MB measured from run 2's own q2 and q34 figures on
+the bench box (above), a little under one whole 1 MiB block (1.05 MB),
+with the probe's 0.6 to 4 MB across two boxes (comment 6384802590) as the
+outer bound. Every table below prices `K` at 0.9 MB and 0.8 MB, and every
+pool of disk bytes is
 taken over the 32 statements above 3 s that run 2 measured, 407 x 32 =
 13,024 object-statements. The requested
 bytes are the probe, the directories and the projected column pages `W`
@@ -350,8 +353,8 @@ bounds a flush's encode.
 
 Effect: bytes only, 0.93 W on every scanning class, and no position. Cold
 sum (model): about 8 s at run 2's 30.8 GB of column wire (34.4 GB over the
-statements above 3 s less 3.6 GB of probe bytes, x 0.07 / 262 MB/s),
-about 5 s at run 1's 19 GB of projected bytes; the same at either `R`.
+statements above 3 s less 3.6 GB of probe bytes, x 0.07 / 262 MB/s); the
+cumulative table uses that basis, and the same figure at either `K`.
 Last in the delivery order because it is the smallest lever that is not
 free.
 
@@ -491,10 +494,10 @@ offset 0 and the chase's block before BLOOM. In requests, minus two GETs
 and about 30 KB per object (the chase's SKIP_IDX plus PAGE_DIR; the front
 pair itself is STREAM_DIR 201 B plus FIELD_DIR 1,043 B on the median
 object). Cold sum (model): 2 x `K` x 13,024 object-statements / 262 MB/s,
-minus 110 s at `K = 1.1 MB` (28.7 GB; 364.9 to 255 s) and minus 89 s at
-`K = 0.9 MB` (23.4 GB; to 276 s), a little less if the probe straddles a
+minus 89 s at `K = 0.9 MB` (23.4 GB; 364.9 to 276 s) and minus 79 s at
+`K = 0.8 MB` (20.8 GB; to 286 s), a little less if the probe straddles a
 block boundary more often than a quarter of the time; q2 from 3.96 to
-about 2.3 to 2.8 MB of disk per object (0.38 MB requested plus about 2.5
+about 2.2 to 2.4 MB of disk per object (0.38 MB requested plus about 2.5
 positions). The 26 s this ADR first credited it with was the per-GET
 model's figure and is withdrawn: under the block model this is the
 largest single lever, which is why it now goes first.
@@ -508,7 +511,7 @@ STREAM_DIR and FIELD_DIR at offsets above PAGE_DIR's, tail under 200 KB.
 | figure | band | miss | source |
 |---|---|---|---|
 | scan GETs per object on q2, q34, q33; plan GETs per object on q20 | q2 at run 2's 4.51 minus 2 (2.51: probe and one run, plus the second run on the two-row-group objects); q34 run 2's 5.58 minus 2 (3.58); q33 (4 columns) run 2's 6.93 minus 2, to within 0.1; q20 exactly 1 (probe only) | q2 at run 2's value: the front GET still fires (order unchanged, or the tail exceeds 256 KiB: read the inspect stamp); minus 1 only: the chase still fires, BLOOM is not ahead of the directories | run 2 values comment 6384701235; band predicted |
-| disk bytes per object on q2, q34, q23 (`disk read / objects`, cold try) | q2 1.8 to 3.0 MB from run 2's 3.96; q34 6.5 to 7.6 from 8.90; q23 12.0 to 13.0 from 14.41 (minus two positions at `K` = 0.9 to 1.1 MB) | unchanged within 5 % with the GET stamp passing: the positions are not the unit this store charges, re-read the block map from this run; minus one position only: the chase shared the probe's block, record `K` | run 2 values comment 6384701235; band predicted |
+| disk bytes per object on q2, q34, q23 (`disk read / objects`, cold try) | q2 1.8 to 3.0 MB from run 2's 3.96; q34 6.5 to 7.6 from 8.90; q23 12.0 to 13.0 from 14.41 (minus two positions at `K` = 0.8 to 0.9 MB) | unchanged within 5 % with the GET stamp passing: the positions are not the unit this store charges, re-read the block map from this run; minus one position only: the chase shared the probe's block, record `K` | run 2 values comment 6384701235; band predicted |
 | cold sum | run 2's B (364.9 s) minus 45 to 110 s | a drop under 30 s with the GET and disk stamps passing means the disk is not the floor on the statements that moved: read the per-statement walls against their disk time before any later step | run 2 value comment 6384701235; band predicted |
 | hot sum, QPS, error ratio | 54 to 64 s; at least 0.60; at most 0.058 | outside | run 2 hot 57.3 s, QPS 0.703, error ratio 0.023, comment 6384701235; the 0.058 bar is ADR-2023 decision 4, `docs/adrs/2023-loopback-fetch-cache-share-and-independent-catalog-cache.md:100` |
 | answers | equal under the Measurement comparison rule | any difference | predicted |
@@ -686,13 +689,13 @@ fewer probe bytes, and every position a statement pays per object is paid
 overhead rather than from `K` alone: run 2 read 102.8 GB of disk for
 34.4 GB of wire over the 32 statements above 3 s (comment 6384701235), so
 68.4 GB is position overhead; decision 4 removes 2 x 13,024 x `K` of it
-(28.7 GB at `K = 1.1 MB`, 23.4 GB at `K = 0.9 MB`), leaving 39.7 or
-45.0 GB; decision 6 divides what is left by 407 / 103 = 3.95, saving 0.75
-of it: 29.7 GB (113 s) at `K = 1.1` and 33.6 GB (128 s) at `K = 0.9`,
+(23.4 GB at `K = 0.9 MB`, 20.8 GB at `K = 0.8 MB`), leaving 45.0 or
+47.6 GB; decision 6 divides what is left by 407 / 103 = 3.95, saving 0.75
+of it: 33.6 GB (128 s) at `K = 0.9` and 35.6 GB (136 s) at `K = 0.8`,
 less about 2 s of pruned-class regression. The lower `K` gives the larger
 saving here because more of the measured overhead is then left in the
-positions this decision divides. Cold sum 255 to 144 s at `K = 1.1`, 276
-to 150 s at `K = 0.9`.
+positions this decision divides. Cold sum 276 to 150 s at `K = 0.9`, 286
+to 152 s at `K = 0.8`.
 
 Pre-registered A/B, two stages. Stage 1 is the load alone on a
 c6a.4xlarge, server stopped, before any statement runs; every figure
@@ -778,9 +781,9 @@ shrinks by block pruning on UserID (a block's UserID `[min, max]` is
 narrow for every stream longer than a block, and the NumRange arms
 resolved at `log_fetcher.rs:7452-7456` drop most blocks; figure
 unknown). Cold sum (model): bytes only, so it moves the requested bytes
-and not the positions: 13 to 16% of W at run 1's 19 GB of projected bytes,
-about 10 s (decision 3's zstd saving taken first), and the q20 pruning on
-top, figure unknown.
+and not the positions: 13 to 16% of W at run 2's 30.8 GB of column wire
+less decision 3's 7 %, about 14 s, and the q20 pruning on top, figure
+unknown.
 
 Pre-registered A/B (run 8, paired with run 7). Stamps: `clustering-key
 show` prints the key; one object's footer carries the descriptor.
@@ -808,10 +811,17 @@ carries the order; no format change. After decision 6, and only after its
 own A/B.
 
 Mechanism. The writer assigns each object's dynamic column ids from a
-`BTreeSet<(String, u8)>` of the names and types it saw
-(`crates/ravel-logseg/src/writer.rs:537`, ids handed out in that order at
-`:592-602`), and BLOCKS stores a row group's column chunks in ascending
-column id (`docs/log-segment-format.md:862-867`). So a row group's chunks
+`BTreeSet<(String, u8)>` of the names and types it saw, in both of its
+object builders: `build_object` (`crates/ravel-logseg/src/writer.rs:537`,
+ids handed out at `:592-602`) and `build_object_columnar` (`:1243`, ids at
+`:1260-1270`). `RlogWriter::build` routes between them on whether any
+columnar batch was pushed (`:415-419`), both are live (the ingest flush
+sends `FlushPayload::Rows` to one and `FlushPayload::Columnar` to the
+other, `crates/ravel-ingest/src/log_shard.rs:911-916`), and `build`
+promises the two produce the same bytes for the same records
+(`writer.rs:397-399`), so the change goes into both sites at once, as
+decision 4's does. BLOCKS stores a row group's column chunks in ascending
+column id (`docs/log-segment-format.md:472-476`). So a row group's chunks
 lie in alphabetical order of column name, and the column names are the SQL
 identifiers, so the entry cannot reorder them by editing its mapping.
 Every reader maps a name to its id through FIELD_DIR and reads chunk
@@ -822,25 +832,32 @@ assigns the rest alphabetically after them. Co-projected columns then sit
 next to each other in every row group, and a statement that projects
 them reads one block position where it read several.
 
-The entry declares the sets its statements project together
-(`queries.sql` co-occurrence, counted 2026-10-24): `SearchPhrase, UserID`
-(5 statements); `WatchID, ClientIP, IsRefresh, ResolutionWidth` (q31 to
-q33); `URL, Title, Referer`; `EventDate, IsRefresh, DontCountHits` (q37 to
-q43, with CounterID as the stream attribute).
+The entry declares one ordered list, built from the columns its
+statements project together (`queries.sql` co-occurrence, counted
+2026-10-24): `WatchID, SearchEngineID, ClientIP, IsRefresh,
+ResolutionWidth, SearchPhrase, UserID, EventDate, DontCountHits, URL`.
+q33 projects `WatchID, ClientIP, IsRefresh, ResolutionWidth`; q32 the
+same plus `SearchPhrase`; q31 `SearchEngineID, ClientIP, IsRefresh,
+ResolutionWidth, SearchPhrase`; so all three read one contiguous span
+(q32's span carries `SearchEngineID`, one small column, bridged).
+`SearchPhrase, UserID` co-occur on 5 statements. `EventDate, IsRefresh,
+URL` and `DontCountHits` serve the pruned class q37 to q43 (`DontCountHits`
+on q37, q38, q42 and q43; CounterID is the stream attribute), whose
+objects are few after pruning, so their order is the least valuable.
 
 What it does not change: no format, no reader code, no answer; a tenant
 without the setting keeps today's alphabetical order byte for byte.
 
 Effect (model): on the 16 to 18 multi-column statements, about one
-position fewer per object, 103 x 17 x `K` = 1.9 GB (7 s) at `K = 1.1` and
-1.6 GB (6 s) at `K = 0.9`; nothing on the one-column statements.
+position fewer per object, 103 x 17 x `K` = 1.6 GB (6 s) at `K = 0.9` and
+1.4 GB (5 s) at `K = 0.8`; nothing on the one-column statements.
 
 Pre-registered A/B (run 5, paired with run 4, both after decision 6).
 
 | figure | band | miss | source |
 |---|---|---|---|
 | chunk-run GETs per object on q31, q32, q33 | run 4's minus 1 to 3 | unchanged: the chunks were already within one bridged run, or the order did not reach the objects (read one object's FIELD_DIR) | predicted |
-| disk bytes per object on q33 | run 4's minus `K` (0.9 to 1.1 MB) | unchanged within 5 % | predicted |
+| disk bytes per object on q33 | run 4's minus `K` (0.8 to 0.9 MB) | unchanged within 5 % | predicted |
 | cold sum | run 4 minus 3 to 10 s | outside | predicted |
 | answers | equal run 4 under the Measurement comparison rule | any difference | predicted |
 
@@ -854,7 +871,7 @@ order issued three.
 
 Positive.
 
-- The stock entry's cold sum is predicted at about 120 to 130 s
+- The stock entry's cold sum is predicted at about 120 to 125 s
   (Measurement), from run 2's 364.9 s, with no server flag, no cache tier
   and no format bump; under 200 s after decisions 4, 5 and 6 at either
   `K`.
@@ -913,9 +930,9 @@ Follow-ups the design leaves to the builder or to a later pass:
   (`crates/ravel-query/src/log_fetcher.rs:4223-4264`) but are not
   rendered in the response; the phases carry `s3GetRequests` and
   `s3GetWireBytes` (`crates/ravel-sql/src/stats_json.rs:44-45`).
-  Rendering the two under `accounting` would let runs 2 and 4 band on
-  them directly instead of inferring the chase and front GETs from GETs
-  per object. No band above needs it.
+  Rendering the two under `accounting` would let run 3 band on them
+  directly instead of inferring the chase and front GETs from GETs per
+  object. No band above needs it.
 - The store probe (comment 6384802590) read 0.6 to 4 MB per cold request
   across two boxes, with the first request after a cache drop carrying
   the store's own code pages. A cleaner probe (RustFS restarted and the
@@ -1021,12 +1038,12 @@ delta is the change's own and not the sum of whatever else landed on
 `main` between runs; pull requests that landed ahead of the change in the
 same queue batch sit on both arms. When the two commits are adjacent, A's
 commit is the previous run's B commit; when they are not, the run has one
-extra A box at a commit no earlier run measured. Run 4's A is the parent
-of decision 4's first landed commit, not run 3's binary. For a fork-side
-change (runs 2, 3, 5, 6) the two boxes share one `main` commit and differ
-only in the fork's `load`. A band that reads against the
-previous run ("run 2's value", "run 3 minus") reads against the A box
-launched with it. Every run stamps the burst-credit state: the cold sweep
+extra A box at a commit no earlier run measured. Run 3's A is the parent
+of decision 4's first landed commit, not run 2's B binary; run 5
+(decision 8) is Ravel-side the same way. For a fork-side change (runs 4,
+6, 7 and 8) the two boxes share one `main` commit and differ only in the
+fork's `load`. A band that reads against the previous run ("run 2's
+value", "run 3 minus") reads against the A box launched with it. Every run stamps the burst-credit state: the cold sweep
 moves under 10% of the credit bucket and run 1 saw no fall in the r/s
 ceiling, but the stamp is taken all the same.
 
@@ -1059,28 +1076,28 @@ object on 17 statements at 103 objects; decisions 1, 2, 3 and 7 move
 requested bytes only. Both columns are cumulative and every figure below
 the anchors is predicted.
 
-| after | positions per object, narrow one-column | cold sum at `K` = 1.1 MB | cold sum at `K` = 0.9 MB | basis |
+| after | positions per object, narrow one-column | cold sum at `K` = 0.9 MB | cold sum at `K` = 0.8 MB | basis |
 |---|---|---|---|---|
 | v0.25.1 stock (run 1) | 4.5 | 367.2 (anchor) | 367.2 (anchor) | measured 2026-10-23, comment 6368995087 |
 | #3219, PR #3221 (run 2, landed) | 4.5 | 364.9 (anchor) | 364.9 (anchor) | measured 2026-10-24, comment 6384701235 |
-| decision 4, directories at the tail | 2.5 | 255 (28.7 GB of overhead removed) | 276 (23.4 GB) | predicted |
-| decisions 5 and 6, 100 MB one-group objects | 2 over 103 objects | 144 (29.7 GB, less 2 s of pruned-class cost) | 150 (33.6 GB, less 2 s) | predicted |
-| decision 8, columns in affinity order | 1 to 2 over 103 | 137 (1.9 GB) | 144 (1.6 GB) | predicted |
-| decisions 1 and 2, bloom scope `text`, fold | unchanged | 136 | 143 | predicted |
-| decision 3, zstd 9 | unchanged | 131 (7 % of 19 GB) | 138 | predicted |
-| decision 7, clustering key | unchanged | 122 (13 % of the rest) | 129 | predicted |
+| decision 4, directories at the tail | 2.5 | 276 (23.4 GB of overhead removed) | 286 (20.8 GB) | predicted |
+| decisions 5 and 6, 100 MB one-group objects | 2 over 103 objects | 150 (33.6 GB, less 2 s of pruned-class cost) | 152 (35.6 GB, less 2 s) | predicted |
+| decision 8, columns in affinity order | 2 over 103 (unchanged; the saving is on the 17 multi-column statements) | 144 (1.6 GB) | 147 (1.4 GB) | predicted |
+| decisions 1 and 2, bloom scope `text`, fold | unchanged | 143 | 146 | predicted |
+| decision 3, zstd 9 | unchanged | 135 (7 % of 30.8 GB) | 138 | predicted |
+| decision 7, clustering key | unchanged | 121 (13 % of the rest) | 124 | predicted |
 
-Stated estimate (predicted): about 120 to 130 s, under 200 s once
+Stated estimate (predicted): about 120 to 125 s, under 200 s once
 decisions 4, 5 and 6 land at either `K`. The wire floor, every position
 cost gone, is about 105 s after decisions 3 and 7 (run 2's 34.4 GB of
 wire less three quarters of the probe bytes and the byte trims, at
-262 MB/s). The stretch (under 150 s) holds after decisions 5 and 6 at
-`K = 1.1` and needs decision 8 at `K = 0.9`. Run 3 (decision 4) reads `K`
+262 MB/s). The stretch (under 150 s) needs decision 8 at either `K`
+(150 and 152 s after decisions 5 and 6). Run 3 (decision 4) reads `K`
 on this box directly from its per-object disk delta, and every later band
 is restated against that figure before its run.
 
 Device check after the design: a narrow one-column statement at 103
 objects is about 2 positions and 0.3 MB requested per object, about
-0.26 GB of disk, 1.0 s against today's 5 s. The levers move the floor
+0.21 GB of disk at `K = 0.9`, 0.8 s against today's 5 s. The levers move the floor
 because they remove positions; the requested bytes inside a position the
 statement still touches are nearly free on this store.
