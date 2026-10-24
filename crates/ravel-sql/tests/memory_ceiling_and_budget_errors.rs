@@ -203,6 +203,7 @@ async fn a_sort_or_aggregate_budget_error_keeps_its_type() {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -290,6 +291,7 @@ async fn a_high_cardinality_aggregation_over_budget_is_resources_exhausted() {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -359,7 +361,12 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
 
     let config = SqlConfig {
         engine: util::engine_config(),
-        max_query_bytes: 16 * 1024 * 1024,
+        // Which consumer's `try_grow` crosses the ceiling first depends on
+        // where the ceiling falls between the scan's and the aggregates'
+        // steps. At 24 MiB the final aggregate crosses first with the
+        // aggregate reserve-ahead charge on and off; at 16 MiB only with it
+        // off.
+        max_query_bytes: 24 * 1024 * 1024,
         parallel_final_aggregation: false,
         // Off deliberately, and it is the only test in this file that turns it
         // off (issue #680). This case's subject is the aggregate operator's own
@@ -384,6 +391,7 @@ async fn a_high_cardinality_aggregation_is_refused_by_the_aggregate_not_the_scan
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),
@@ -497,6 +505,7 @@ async fn a_large_order_by_over_budget_is_resources_exhausted() {
         spill: None,
         // Issue #913: the per-segment timeline off, as on the shipped default.
         segment_timing: false,
+        aggregate_reserve_ahead: ravel_sql::AggregateReserveAhead::DEFAULT,
     };
     let fixture = Fixture::build(
         Arc::new(MemoryStore::new()),

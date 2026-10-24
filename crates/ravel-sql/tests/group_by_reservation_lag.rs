@@ -19,26 +19,29 @@
 //!
 //! Method. The binary installs `stats_alloc`'s instrumented allocator (the
 //! workspace denies `unsafe`, so a hand-rolled one cannot compile). A sampler
-//! thread reads, back to back (yielding between reads), live bytes (allocated
-//! minus deallocated, less the bytes live before the query started, so the
-//! input table is excluded) and the pool's `reserved()`. The gap is live minus
-//! reserved; the peak gap is its maximum over the run. Result batches are
-//! dropped as they arrive.
+//! thread reads live bytes (allocated minus deallocated, less the bytes live
+//! before the query started, so the input table is excluded), the pool's
+//! `reserved()` and `sql_memory_aggregate_envelope_bytes()`, back to back
+//! (yielding between reads) for the 3M-row rows and once a millisecond for
+//! the q33 row. The gap is live minus reserved minus envelope; the peak gap is
+//! its maximum over the run. `reserved()` includes the undercount factor
+//! (issue #3181), and the envelope is charged on the process budget only, so
+//! the gap is what neither the query's ledger nor the process ledger holds.
+//! Result batches are dropped as they arrive.
 //!
-//! On DataFusion 54.1 the emit phase widened the gap: the aggregate released
-//! its reservation before handing out its output. The pool's aggregate hold
-//! (issue #2633) closed that part, and with it every Ravel-path row's peak gap
-//! equaled its build gap, the largest gap sampled before the first result
-//! batch, in three `--release` runs. One run with the hold disabled showed the
-//! emit-phase gap again, for example 142.7 MiB of peak gap against 104.5 MiB of
-//! build gap at 8 partitions with a string key and `COUNT(*)`. The plain
-//! DataFusion rows still showed it: their runtime has DataFusion's default disk
-//! manager, so their aggregate consumers can spill and the pool does not hold
-//! them. This file's statements carry no limit, no grouping set and no ordered
-//! input, so on DataFusion 55.2 they run on the migrated aggregate streams,
-//! which keep their output reserved until the last slice is cut
-//! (`tests/aggregate_emit_reservation.rs`) and which the hold does not select
-//! (issue #2720). The matrix has not been re-run on DataFusion 55.2.
+//! This file's statements carry no limit, no grouping set and no ordered
+//! input, so on DataFusion 55.2 they run on the migrated aggregate streams.
+//! Each row splits its peak gap by phase: `start` (before the first result
+//! batch and before any migrated aggregate stream grew), `grown` (before the
+//! first result batch, after one had grown) and `emit` (from the first result
+//! batch on). On DataFusion 55.2 with the factor and the envelope, the build
+//! phase (`start` and `grown`) stayed within 24 MiB on every row in three
+//! runs, q33's included, and its largest readings fall in the first
+//! milliseconds, while streams that have not reserved yet allocate their first
+//! blocks. The emit
+//! phase carries the largest gaps: a stream materializes every group while its
+//! state is still live, and slices of that output stay referenced after the
+//! stream has resized its reservation to zero.
 //!
 //! The heap-profiling matrix below (`group_by_allocation_lead_over_reservation`)
 //! is `#[ignore]`d: it is the only test in this file that samples the global
@@ -56,16 +59,18 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::alloc::System;
+use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use datafusion::arrow::array::{ArrayRef, Float64Array, Int64Array, StringViewArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::Result as DFResult;
 use datafusion::datasource::MemTable;
-use datafusion::execution::memory_pool::MemoryPool;
+use datafusion::execution::memory_pool::{MemoryLimit, MemoryPool, MemoryReservation};
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_plan::{ExecutionPlan, execute_stream};
@@ -75,8 +80,8 @@ use ravel_catalog::Snapshot;
 use ravel_object_store::memory::MemoryStore;
 use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
-    LogsTableProvider, SessionTable, SpillDecision, SqlConfig, TenantMemoryAccountant,
-    build_session, session_config,
+    AggregateReserveAhead, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
+    TenantMemoryAccountant, build_session, session_config, sql_memory_aggregate_envelope_bytes,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -99,6 +104,22 @@ const INPUT_PARTITIONS: usize = 8;
 /// holds fixed while another varies.
 const BASE_PARTITIONS: usize = 8;
 
+/// The q33-shaped row: `GROUP BY watch_id, client_ip` with `COUNT(*)`,
+/// `SUM` and exact `AVG` over all-distinct key pairs, at 32 partitions, so
+/// each final aggregate stream builds about [`Q33_GROUPS_PER_PARTITION`]
+/// groups, the size of T1's measured q33 series on issue #3181.
+const Q33_PARTITIONS: usize = 32;
+const Q33_GROUPS_PER_PARTITION: usize = 3_100_000;
+const Q33_ROWS: usize = Q33_PARTITIONS * Q33_GROUPS_PER_PARTITION;
+
+/// Bound on every row's peak of `live - pool.reserved() -
+/// sql_memory_aggregate_envelope_bytes()`, issue #3181's acceptance bar. The
+/// factor and the envelope cover a stream's next doubling while it builds;
+/// neither covers a stream's allocations before its first reservation, nor
+/// the emit phase's materialized output, so rows whose gap peaks there read
+/// over this bound.
+const MAX_PEAK_GAP: usize = 16 << 20;
+
 #[derive(Clone, Copy, Debug)]
 enum Key {
     Str,
@@ -111,6 +132,98 @@ enum Agg {
     Count,
     Sum,
     Avg,
+    /// `COUNT(*)`, `SUM(v)` and exact `AVG(v)` in one statement.
+    CountSumAvg,
+}
+
+/// How often the sampler reads live and reserved bytes.
+#[derive(Clone, Copy, Debug)]
+enum Sampling {
+    /// Back to back, yielding between reads.
+    Spin,
+    /// One read per interval.
+    Every(Duration),
+}
+
+/// Forwards to the query's pool and records, beside it, what DataFusion asked
+/// for: the net bytes every reservation declared, and the largest single
+/// grow a migrated aggregate stream made (`J_max` on issue #3181). The pool
+/// it wraps is the `TenantDelegatingPool` from `SqlConfig::query_pool`, whose
+/// `reserved()` is in charged units.
+#[derive(Debug)]
+struct AskedProbe {
+    inner: Arc<dyn MemoryPool>,
+    asked: AtomicIsize,
+    largest_step: AtomicUsize,
+}
+
+impl AskedProbe {
+    fn new(inner: Arc<dyn MemoryPool>) -> Self {
+        Self {
+            inner,
+            asked: AtomicIsize::new(0),
+            largest_step: AtomicUsize::new(0),
+        }
+    }
+
+    fn grown(&self, reservation: &MemoryReservation, additional: usize) {
+        self.asked.fetch_add(additional as isize, Ordering::Relaxed);
+        let name = reservation.consumer().name();
+        if [
+            "PartialHashAggregateStream[",
+            "FinalHashAggregateStream[",
+            "SingleHashAggregateStream[",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+        {
+            self.largest_step.fetch_max(additional, Ordering::Relaxed);
+        }
+    }
+}
+
+impl fmt::Display for AskedProbe {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "AskedProbe({})", self.inner)
+    }
+}
+
+impl MemoryPool for AskedProbe {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn register(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.inner.register(consumer);
+    }
+
+    fn unregister(&self, consumer: &datafusion::execution::memory_pool::MemoryConsumer) {
+        self.inner.unregister(consumer);
+    }
+
+    fn grow(&self, reservation: &MemoryReservation, additional: usize) {
+        self.inner.grow(reservation, additional);
+        self.grown(reservation, additional);
+    }
+
+    fn shrink(&self, reservation: &MemoryReservation, shrink: usize) {
+        self.inner.shrink(reservation, shrink);
+        self.asked.fetch_sub(shrink as isize, Ordering::Relaxed);
+    }
+
+    fn try_grow(&self, reservation: &MemoryReservation, additional: usize) -> DFResult<()> {
+        self.inner.try_grow(reservation, additional)?;
+        self.grown(reservation, additional);
+        Ok(())
+    }
+
+    fn reserved(&self) -> usize {
+        self.inner.reserved()
+    }
+
+    fn memory_limit(&self) -> MemoryLimit {
+        self.inner.memory_limit()
+    }
 }
 
 /// Which session the query runs on.
@@ -129,11 +242,43 @@ struct Run {
     groups: usize,
     peak_live: usize,
     peak_reserved: usize,
+    peak_envelope: usize,
+    /// Peak of `live - reserved - envelope`.
     peak_gap: usize,
     /// Peak gap before the first result batch reached the consumer: the
     /// accumulation phase, where the group tables only grow.
     peak_gap_build: usize,
+    /// The part of `peak_gap_build` sampled before any migrated aggregate
+    /// stream had grown, when no stream has an envelope yet.
+    peak_gap_start: usize,
+    /// The part of `peak_gap_build` sampled after the first aggregate grow:
+    /// the window the factor and the envelope are sized for.
+    peak_gap_grown: usize,
+    /// Peak gap from the first result batch on.
+    peak_gap_emit: usize,
+    /// Peak of `live - asked` before the first result batch: how far
+    /// allocation led what DataFusion had declared while the tables grew,
+    /// before the factor and the envelope.
+    peak_lead: usize,
+    /// Largest single grow of a migrated aggregate stream.
+    largest_step: usize,
     samples: usize,
+}
+
+impl Run {
+    /// The largest multiple of `J_max` the lead reached, of the two the
+    /// envelope is sized against: a Vec realloc that moves (4 x J) and the
+    /// plain copy of the next block (2 x J).
+    fn lead_reached(&self) -> &'static str {
+        let j = self.largest_step.max(1);
+        if self.peak_lead >= 4 * j {
+            "4J"
+        } else if self.peak_lead >= 2 * j {
+            "2J"
+        } else {
+            "<2J"
+        }
+    }
 }
 
 fn live_bytes() -> isize {
@@ -185,6 +330,34 @@ fn input_partitions() -> Vec<Vec<RecordBatch>> {
     parts
 }
 
+/// q33's input: `(watch_id, client_ip)` pairs that are all distinct, so the
+/// group count equals the row count, and `v` the aggregated column. Rows are
+/// dealt round-robin by batch over [`Q33_PARTITIONS`] input partitions.
+fn q33_partitions() -> Vec<Vec<RecordBatch>> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("watch_id", DataType::Int64, false),
+        Field::new("client_ip", DataType::Int64, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let mut parts: Vec<Vec<RecordBatch>> = (0..Q33_PARTITIONS).map(|_| Vec::new()).collect();
+    let mut start = 0usize;
+    let mut batch_no = 0usize;
+    while start < Q33_ROWS {
+        let end = (start + BATCH_ROWS).min(Q33_ROWS);
+        let watch: Int64Array = (start..end)
+            .map(|i| (i as i64).wrapping_mul(0x9E37_79B9_7F4A_7C15_u64 as i64))
+            .collect();
+        let ip: Int64Array = (start..end).map(|i| (i % 7_919) as i64).collect();
+        let v: Int64Array = (start..end).map(|i| (i % 1_000) as i64).collect();
+        let columns: Vec<ArrayRef> = vec![Arc::new(watch), Arc::new(ip), Arc::new(v)];
+        parts[batch_no % Q33_PARTITIONS]
+            .push(RecordBatch::try_new(Arc::clone(&schema), columns).expect("batch builds"));
+        batch_no += 1;
+        start = end;
+    }
+    parts
+}
+
 fn sql_for(key: Key, agg: Agg) -> String {
     let keys = match key {
         Key::Str => "url",
@@ -192,11 +365,12 @@ fn sql_for(key: Key, agg: Agg) -> String {
         Key::StrInt => "url, client_ip",
     };
     let agg = match agg {
-        Agg::Count => "count(*)",
-        Agg::Sum => "sum(v)",
-        Agg::Avg => "avg(v)",
+        Agg::Count => "count(*) AS a",
+        Agg::Sum => "sum(v) AS a",
+        Agg::Avg => "avg(v) AS a",
+        Agg::CountSumAvg => "count(*) AS c, sum(v) AS s, avg(v) AS a",
     };
-    format!("SELECT {keys}, {agg} AS a FROM t GROUP BY {keys}")
+    format!("SELECT {keys}, {agg} FROM t GROUP BY {keys}")
 }
 
 fn run_once(
@@ -206,13 +380,18 @@ fn run_once(
     key: Key,
     agg: Agg,
     variant: Variant,
+    sampling: Sampling,
 ) -> Run {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(partitions);
     config.max_query_bytes = 64 << 30;
+    // The bands below were measured with the envelope on; the default leaves
+    // it off until it is sized per layout (#3181).
+    config.aggregate_reserve_ahead = AggregateReserveAhead::WITH_ENVELOPE;
     let plain = matches!(variant, Variant::Plain);
     let tenant = TenantMemoryAccountant::new(64 << 30);
     let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
+    let pool = Arc::new(AskedProbe::new(pool));
 
     let store = Arc::new(MemoryStore::new());
     let logs = SessionTable::Logs(Arc::new(LogsTableProvider::new(
@@ -225,9 +404,6 @@ fn run_once(
         LogSegmentFetcher::new(store),
         PhaseAccounting::new(),
     )));
-    // `exact_typed_aggregates = true`: the endpoint's classification for a
-    // COUNT/SUM/exact-AVG query over exact-typed keys, which is what lets the
-    // final aggregation fan out across `target_partitions`.
     let ctx = if plain {
         // The same session knobs and pool, but none of Ravel's rules or
         // UDAF replacements: DataFusion's own `avg` and no group-key rewrite.
@@ -255,7 +431,8 @@ fn run_once(
         )
         .expect("session builds")
     };
-    let table = MemTable::try_new(schema(), parts.to_vec()).expect("mem table builds");
+    let schema = parts[0][0].schema();
+    let table = MemTable::try_new(schema, parts.to_vec()).expect("mem table builds");
     ctx.register_table("t", Arc::new(table))
         .expect("table registers");
 
@@ -263,17 +440,31 @@ fn run_once(
     let stop = Arc::new(AtomicBool::new(false));
     let peak_live = Arc::new(AtomicIsize::new(0));
     let peak_reserved = Arc::new(AtomicUsize::new(0));
+    let peak_envelope = Arc::new(AtomicUsize::new(0));
     let peak_gap = Arc::new(AtomicIsize::new(isize::MIN));
     let peak_gap_build = Arc::new(AtomicIsize::new(isize::MIN));
+    let peak_gap_start = Arc::new(AtomicIsize::new(isize::MIN));
+    let peak_gap_grown = Arc::new(AtomicIsize::new(isize::MIN));
+    let peak_gap_emit = Arc::new(AtomicIsize::new(isize::MIN));
+    let peak_lead = Arc::new(AtomicIsize::new(isize::MIN));
     let emitting = Arc::new(AtomicBool::new(false));
     let samples = Arc::new(AtomicUsize::new(0));
     let sampler = {
-        let (stop, peak_live, peak_reserved, peak_gap, peak_gap_build, emitting, samples) = (
+        let (stop, peak_live, peak_reserved, peak_envelope) = (
             Arc::clone(&stop),
             Arc::clone(&peak_live),
             Arc::clone(&peak_reserved),
+            Arc::clone(&peak_envelope),
+        );
+        let (peak_gap_start, peak_gap_grown, peak_gap_emit) = (
+            Arc::clone(&peak_gap_start),
+            Arc::clone(&peak_gap_grown),
+            Arc::clone(&peak_gap_emit),
+        );
+        let (peak_gap, peak_gap_build, peak_lead, emitting, samples) = (
             Arc::clone(&peak_gap),
             Arc::clone(&peak_gap_build),
+            Arc::clone(&peak_lead),
             Arc::clone(&emitting),
             Arc::clone(&samples),
         );
@@ -281,24 +472,40 @@ fn run_once(
         thread::spawn(move || {
             let t0 = Instant::now();
             let mut next_trace = 0u128;
-            let mut trace: Vec<(u128, isize, usize, bool)> = Vec::new();
+            let mut trace: Vec<(u128, isize, usize, usize, bool)> = Vec::new();
             while !stop.load(Ordering::Acquire) {
                 let live = live_bytes() - baseline;
                 let reserved = pool.reserved();
+                let envelope = sql_memory_aggregate_envelope_bytes() as usize;
+                let asked = pool.asked.load(Ordering::Relaxed);
                 peak_live.fetch_max(live, Ordering::Relaxed);
                 peak_reserved.fetch_max(reserved, Ordering::Relaxed);
-                let gap = live - reserved as isize;
+                peak_envelope.fetch_max(envelope, Ordering::Relaxed);
+                let gap = live - reserved as isize - envelope as isize;
+                let emit = emitting.load(Ordering::Acquire);
                 peak_gap.fetch_max(gap, Ordering::Relaxed);
-                if !emitting.load(Ordering::Acquire) {
+                if !emit {
                     peak_gap_build.fetch_max(gap, Ordering::Relaxed);
+                    peak_lead.fetch_max(live - asked, Ordering::Relaxed);
                 }
+                let phase = if emit {
+                    &peak_gap_emit
+                } else if pool.largest_step.load(Ordering::Relaxed) == 0 {
+                    &peak_gap_start
+                } else {
+                    &peak_gap_grown
+                };
+                phase.fetch_max(gap, Ordering::Relaxed);
                 samples.fetch_add(1, Ordering::Relaxed);
                 let ms = t0.elapsed().as_millis();
                 if ms >= next_trace {
-                    trace.push((ms, live, reserved, emitting.load(Ordering::Acquire)));
+                    trace.push((ms, live, reserved, envelope, emit));
                     next_trace = ms + 20;
                 }
-                thread::yield_now();
+                match sampling {
+                    Sampling::Spin => thread::yield_now(),
+                    Sampling::Every(interval) => thread::sleep(interval),
+                }
             }
             trace
         })
@@ -326,12 +533,14 @@ fn run_once(
     stop.store(true, Ordering::Release);
     let trace = sampler.join().expect("sampler joins");
     if std::env::var("RAVEL_SQL_GAP_TRACE").as_deref() == Ok("1") {
-        for (ms, live, reserved, emit) in &trace {
+        for (ms, live, reserved, envelope, emit) in &trace {
             eprintln!(
-                "TRACE P={partitions} {key:?} {agg:?} t={ms}ms live={} reserved={} gap={} emit={emit}",
+                "TRACE P={partitions} {key:?} {agg:?} t={ms}ms live={} reserved={} \
+                 envelope={} gap={} emit={emit}",
                 mib(*live as usize),
                 mib(*reserved),
-                mib((*live - *reserved as isize).max(0) as usize)
+                mib(*envelope),
+                mib((*live - *reserved as isize - *envelope as isize).max(0) as usize)
             );
         }
     }
@@ -349,8 +558,14 @@ fn run_once(
         groups,
         peak_live: peak_live.load(Ordering::Relaxed).max(0) as usize,
         peak_reserved: peak_reserved.load(Ordering::Relaxed),
+        peak_envelope: peak_envelope.load(Ordering::Relaxed),
         peak_gap: peak_gap.load(Ordering::Relaxed).max(0) as usize,
         peak_gap_build: peak_gap_build.load(Ordering::Relaxed).max(0) as usize,
+        peak_gap_start: peak_gap_start.load(Ordering::Relaxed).max(0) as usize,
+        peak_gap_grown: peak_gap_grown.load(Ordering::Relaxed).max(0) as usize,
+        peak_gap_emit: peak_gap_emit.load(Ordering::Relaxed).max(0) as usize,
+        peak_lead: peak_lead.load(Ordering::Relaxed).max(0) as usize,
+        largest_step: pool.largest_step.load(Ordering::Relaxed),
         samples: samples.load(Ordering::Relaxed),
     };
     eprintln!("  ({} took {elapsed:?})", run.label);
@@ -566,12 +781,14 @@ fn exact_integer_avg_takes_part_in_the_partial_aggregation_skip() {
 }
 
 /// Heap-profiling matrix: 17 configurations over [`ROWS`] rows and
-/// [`DISTINCT`] groups. CI's `cargo test` runs the dev profile, which is
-/// unoptimized, and this test's dev-profile runtime there has never been
-/// measured; only two of the 17 printed configurations are asserted on below,
-/// the rest are diagnostic context for a reader chasing a regression in the
-/// other 15. Run it explicitly, in `--release` (the profile the bands below
-/// were measured in):
+/// [`DISTINCT`] groups, plus the q33-shaped row over [`Q33_ROWS`] rows. CI's
+/// `cargo test` runs the dev profile, which is unoptimized, and this test's
+/// dev-profile runtime there has never been measured. Every row is held to
+/// [`MAX_PEAK_GAP`]; two of the 3M-row configurations also carry the bands
+/// below. The `lead` column says whether the build-phase lead of live bytes
+/// over what DataFusion asked for reached 4 or 2 times the largest single
+/// aggregate grow (`J_max`). Run it explicitly, in `--release` (the profile
+/// the bands below were measured in):
 ///
 /// ```sh
 /// cargo test -p ravel-sql --release --test group_by_reservation_lag -- --ignored --nocapture
@@ -579,26 +796,20 @@ fn exact_integer_avg_takes_part_in_the_partial_aggregation_skip() {
 #[test]
 #[ignore = "heap-profiling matrix: run with --release --ignored, see doc comment"]
 fn group_by_allocation_lead_over_reservation() {
-    /// Peak (live - reserved) bytes for the 32-partition, string-key,
-    /// `COUNT(*)` run, as `(low, high)`.
+    /// Peak (live - reserved - envelope) bytes for the 32-partition,
+    /// string-key, `COUNT(*)` run, as `(low, high)`.
     ///
-    /// Basis: five full `--release` runs of this test on this amd64 CI-class
-    /// host (16 vCPU, 30 GB RAM) measured 84.6-94.7 MiB for this configuration
-    /// (1.5M groups). The band is that range widened for scheduling variation
-    /// (the peak depends on how much hash-table and repartition state is in
-    /// flight when the sampler fires), kept wide on the low side since a
-    /// tighter upstream or Ravel fix should not fail this test. A reading
-    /// above `high` means allocation now leads reservation by more than it
-    /// did, which is the regression this detects; below `low` means the gap
-    /// closed, and the band should be tightened to the new figure.
-    ///
-    /// Re-measured on DataFusion 54.1 with the aggregate hold (issue #2633):
-    /// three runs read 83.9, 91.5 and 94.5 MiB, and one with the hold
-    /// disabled 93.0 MiB. This configuration's peak gap falls before the first
-    /// result batch, which neither the hold nor DataFusion 55.2's emit-time
-    /// reservation touches, so the band stands. Not re-measured on DataFusion
-    /// 55.2.
-    const GAP_BAND_32_PARTITION_STRING_KEY: (usize, usize) = (60 << 20, 110 << 20);
+    /// Basis: three `--release` runs of this test on DataFusion 55.2 with the
+    /// undercount factor and the envelope (issue #3181), on an amd64 CI-class
+    /// host (16 vCPU, 30 GB RAM), measured 11.7, 5.8 and 12.2 MiB for
+    /// this configuration (1.5M groups); before the factor and the envelope
+    /// five runs measured 84.6-94.7 MiB. The band is the 55.2 range widened
+    /// for scheduling variation (the peak depends on how much output is still
+    /// referenced when the sampler fires). A reading above `high` means
+    /// allocation leads the ledgers by more than it did, which is the
+    /// regression this detects; below `low` means the gap closed further, and
+    /// the band should be tightened to the new figure.
+    const GAP_BAND_32_PARTITION_STRING_KEY: (usize, usize) = (2 << 20, 16 << 20);
 
     /// Bound on peak live bytes of the exact `AVG` run over those of the
     /// `COUNT(*)` run at the same partition count and key.
@@ -612,8 +823,9 @@ fn group_by_allocation_lead_over_reservation() {
     /// at 32. With it restored, five runs measured 1.09x-1.21x at 8 partitions
     /// and 1.07x-1.14x at 32. The bound sits between the two, closer to the
     /// fixed side. DataFusion 55.2 removed that gate, so the unskipped
-    /// configuration can no longer be produced by flipping it; not
-    /// re-measured on DataFusion 55.2.
+    /// configuration can no longer be produced by flipping it; three runs on
+    /// DataFusion 55.2 measured 1.11x-1.17x at 8 partitions and 1.06x-1.22x
+    /// at 32.
     const MAX_AVG_LIVE_OVER_COUNT_LIVE: f64 = 1.5;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -622,6 +834,7 @@ fn group_by_allocation_lead_over_reservation() {
         .build()
         .expect("runtime builds");
     let parts = input_partitions();
+    let spin = Sampling::Spin;
 
     let mut runs: Vec<(&str, Run)> = Vec::new();
     // Series 1: target_partitions, string key, each aggregate.
@@ -629,7 +842,7 @@ fn group_by_allocation_lead_over_reservation() {
         for p in [1, 8, 32] {
             runs.push((
                 "partitions",
-                run_once(&runtime, &parts, p, Key::Str, agg, Variant::Ravel),
+                run_once(&runtime, &parts, p, Key::Str, agg, Variant::Ravel, spin),
             ));
         }
     }
@@ -644,6 +857,7 @@ fn group_by_allocation_lead_over_reservation() {
                 key,
                 Agg::Count,
                 Variant::Ravel,
+                spin,
             ),
         ));
     }
@@ -660,6 +874,7 @@ fn group_by_allocation_lead_over_reservation() {
                 Key::Str,
                 agg,
                 Variant::Plain,
+                spin,
             ),
         ));
     }
@@ -669,33 +884,77 @@ fn group_by_allocation_lead_over_reservation() {
         for agg in [Agg::Count, Agg::Avg] {
             runs.push((
                 "int-avg",
-                run_once(&runtime, &parts, BASE_PARTITIONS, Key::TwoInt, agg, variant),
+                run_once(
+                    &runtime,
+                    &parts,
+                    BASE_PARTITIONS,
+                    Key::TwoInt,
+                    agg,
+                    variant,
+                    spin,
+                ),
             ));
         }
     }
+    drop(parts);
+
+    // Series 5: q33's shape at its own scale, sampled every millisecond.
+    let q33_parts = q33_partitions();
+    runs.push((
+        "q33",
+        run_once(
+            &runtime,
+            &q33_parts,
+            Q33_PARTITIONS,
+            Key::TwoInt,
+            Agg::CountSumAvg,
+            Variant::Ravel,
+            Sampling::Every(Duration::from_millis(1)),
+        ),
+    ));
+    drop(q33_parts);
 
     eprintln!(
-        "\n{:<44} {:>9} {:>11} {:>13} {:>11} {:>7} {:>11}",
-        "configuration", "groups", "peak live", "peak reserved", "peak gap", "ratio", "build gap"
+        "\n{:<40} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4}",
+        "configuration",
+        "groups",
+        "live",
+        "reserv",
+        "envel",
+        "gap",
+        "build",
+        "start",
+        "grown",
+        "emit",
+        "lead",
+        "J_max",
+        "lead"
     );
     for (_, r) in &runs {
         eprintln!(
-            "{:<44} {:>9} {:>9} M {:>11} M {:>9} M {:>7.2} {:>9} M  ({} samples)",
+            "{:<40} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4}  ({} samples)",
             r.label,
             r.groups,
             mib(r.peak_live),
             mib(r.peak_reserved),
+            mib(r.peak_envelope),
             mib(r.peak_gap),
-            r.peak_gap as f64 / r.peak_reserved.max(1) as f64,
             mib(r.peak_gap_build),
+            mib(r.peak_gap_start),
+            mib(r.peak_gap_grown),
+            mib(r.peak_gap_emit),
+            mib(r.peak_lead),
+            mib(r.largest_step),
+            r.lead_reached(),
             r.samples
         );
     }
 
-    for (_, r) in &runs {
+    for (series, r) in &runs {
+        let expected_groups = if *series == "q33" { Q33_ROWS } else { DISTINCT };
         assert!(
-            r.groups >= DISTINCT,
-            "{}: {} groups, expected at least {DISTINCT}",
+            r.groups >= expected_groups,
+            "{}: {} groups, expected at least {expected_groups}",
             r.label,
             r.groups
         );
@@ -739,5 +998,24 @@ fn group_by_allocation_lead_over_reservation() {
         (low..=high).contains(&gated.peak_gap),
         "32-partition string-key peak gap {} bytes is outside the band {low}..={high}",
         gated.peak_gap
+    );
+
+    let over: Vec<String> = runs
+        .iter()
+        .filter(|(_, r)| r.peak_gap > MAX_PEAK_GAP)
+        .map(|(_, r)| {
+            format!(
+                "{}: peak gap {} bytes (build: start {}, grown {}; emit {})",
+                r.label, r.peak_gap, r.peak_gap_start, r.peak_gap_grown, r.peak_gap_emit
+            )
+        })
+        .collect();
+    assert!(
+        over.is_empty(),
+        "{} of {} rows have a peak gap (live - reserved - envelope) over the \
+         {MAX_PEAK_GAP}-byte bound:\n{}",
+        over.len(),
+        runs.len(),
+        over.join("\n")
     );
 }

@@ -201,7 +201,9 @@ pub use logs_schema::{
 };
 pub use logs_udf::{HAS_WORD_UDF, has_word_udf};
 pub use memory::{
-    CeilingBreach, HASH_AGGREGATE_CONSUMER_PREFIX, TenantDelegatingPool, TenantMemoryAccountant,
+    AggregateReserveAhead, AggregateReserveAheadError, CeilingBreach,
+    HASH_AGGREGATE_CONSUMER_PREFIX, PARTIAL_HASH_AGGREGATE_CONSUMER_PREFIX, TenantDelegatingPool,
+    TenantMemoryAccountant, process_envelope_width, sql_memory_aggregate_envelope_bytes,
     sql_memory_held_bytes,
 };
 pub use metadata_agg::{METADATA_ONLY_AGGREGATE_RULE, MetadataOnlyAggregate, MetadataOnlyExec};
