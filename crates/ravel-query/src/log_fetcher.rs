@@ -3855,13 +3855,13 @@ impl LogSegmentFetcher {
 
     /// Fetch and decode just the STREAM_DIR section (ADR-1103 decision 2's
     /// cost model): the same ADR-0107 probe [`fetch_footer`](Self::fetch_footer)
-    /// issues, then the one front section the footer's directory locates it
-    /// at, reading no BLOCKS byte and no other directory section. Mirrors
-    /// [`fetch_skip_index`](Self::fetch_skip_index)'s shape; the only
-    /// difference is that STREAM_DIR sits at the object FRONT, so unlike
-    /// SKIP_IDX it is essentially never covered by the tail suffix probe and
-    /// [`plan_section_raw`](Self::plan_section_raw) issues its own range GET
-    /// for it.
+    /// issues, then the one section the footer's directory locates it at,
+    /// reading no BLOCKS byte and no other directory section. Mirrors
+    /// [`fetch_skip_index`](Self::fetch_skip_index)'s shape. The writer places
+    /// STREAM_DIR after PAGE_DIR, so a probe that reaches PAGE_DIR carries it
+    /// too; on an object written with STREAM_DIR at the front, no probe reaches
+    /// it and [`plan_section_raw`](Self::plan_section_raw) issues its own range
+    /// GET for it.
     ///
     /// Returns `None` when the object's footer carries no STREAM_DIR section
     /// at all (never observed on a real object today, but the same
@@ -4162,11 +4162,12 @@ pub const DEFAULT_LOG_COALESCE_GAP: u64 = 64 * 1024;
 
 /// Multiple of the request cost at which a whole-object read breaks even against
 /// the probe+ranged path. The ranged protocol adds on the order of this many
-/// store round trips over a single whole-object GET (a probe, one coalesced
-/// front-section GET, and a small number of block/chunk-run GETs -- ~5.46
-/// GETs/object measured on q20), so it cannot save enough bytes to pay for
-/// itself until the object exceeds this many request-costs. 5 x 1.8 MiB ~= 8.9
-/// MiB reproduces q20's measured whole-object break-even.
+/// store round trips over a single whole-object GET (a probe, a directory GET
+/// on an object whose probe misses a directory, and a small number of
+/// block/chunk-run GETs -- ~5.46 GETs/object measured on q20, on objects that
+/// held STREAM_DIR and FIELD_DIR at the front), so it cannot save enough bytes
+/// to pay for itself until the object exceeds this many request-costs. 5 x 1.8
+/// MiB ~= 8.9 MiB reproduces q20's measured whole-object break-even.
 ///
 /// This is ADR-0904's derived crossover. The cost-based projection break-even
 /// does not use it: [`crate::resolve_logs_fetch`] sets that one at three
@@ -4225,8 +4226,8 @@ pub struct BlockRangeStats {
     /// footer-range chase if the suffix did not cover the whole footer).
     pub probe_gets: u64,
     /// Store GETs for non-BLOCKS directory sections not already covered by the
-    /// probe (STREAM_DIR/FIELD_DIR at the object front, and any tail section a
-    /// short probe missed).
+    /// probe (STREAM_DIR/FIELD_DIR on an object that holds them at the front,
+    /// and any tail section a short probe missed).
     pub metadata_gets: u64,
     /// Store GETs for coalesced candidate-block ranges (cache misses only).
     pub block_range_gets: u64,
@@ -4251,9 +4252,9 @@ pub struct BlockRangeStats {
     /// suffix probe's WINDOW did not cover, so a report can show the residual
     /// miss rate the probe length leaves (issue #766). SKIP_IDX always counts;
     /// PAGE_DIR counts on a version-4 object. FIELD_DIR and STREAM_DIR never
-    /// do: they sit at the object's front, where no suffix probe can reach them
-    /// at any length, so counting them would put a floor under the metric and
-    /// hide the quantity it exists to expose.
+    /// do: an object may hold them at the front, where no suffix probe reaches
+    /// them at any length, so counting them would make the metric report the
+    /// object's section order rather than the probe length.
     ///
     /// Measured against the probe window, not against what the read cache
     /// happened to hold, so it is a property of `suffix_len` and the object's
@@ -4317,7 +4318,7 @@ impl ProbePhase {
 ///
 /// A single read of one object issues two kinds of request and they answer
 /// different questions. The metadata GETs -- the suffix probe, a footer chase,
-/// SKIP_IDX, PAGE_DIR, the front directories, BLOOM/POSTINGS, and the object's
+/// SKIP_IDX, PAGE_DIR, STREAM_DIR/FIELD_DIR, BLOOM/POSTINGS, and the object's
 /// trailing bytes -- are what it costs to find out where the data is. The
 /// BLOCKS-section GETs are the data. Charging both to one phase makes fetch
 /// amplification unmeasurable: the numerator would carry directory bytes that
@@ -6004,9 +6005,9 @@ impl BlockRangeFetcher {
     ///
     /// The miss count is meaningful for TAIL sections, the ones a probe can
     /// cover. [`fetch_plan_directories`](Self::fetch_plan_directories) also
-    /// brings the two front sections (STREAM_DIR and FIELD_DIR) through here,
-    /// passing a scratch `stats` whose misses it discards, since a front
-    /// section is never inside the probe window.
+    /// brings STREAM_DIR and FIELD_DIR through here, passing a scratch `stats`
+    /// whose misses it discards, since an object may hold them at the front,
+    /// outside every probe window.
     ///
     /// A kind the footer does not carry is skipped, which is how a version-3
     /// object passes PAGE_DIR here harmlessly.
@@ -6187,10 +6188,10 @@ impl BlockRangeFetcher {
         let mut tail = vec![kind::SKIP_IDX, kind::PAGE_DIR];
         tail.extend_from_slice(extra_tail);
         // SKIP_IDX and PAGE_DIR are the tail sections whose probe misses the
-        // plan phase counts. The front pair is brought through a scratch stats
-        // value: a front section is never inside the suffix probe, so counting
-        // it would add two misses per object that report a property of the
-        // section order, not of the probe length.
+        // plan phase counts. The directory pair is brought through a scratch
+        // stats value: an object may hold it at the front, outside the suffix
+        // probe, so counting it would add two misses per such object that
+        // report a property of the section order, not of the probe length.
         self.ensure_tail_plan_sections(
             seg_ref,
             tenant_hash,
@@ -7062,12 +7063,14 @@ impl BlockRangeFetcher {
         // FIELD_DIR so `candidate_blocks` can drop blocks the numeric bounds
         // prove hold no match (#761). Without this the candidate set was ts-only
         // and every block survived, so a month-wide selective query crossed the
-        // coverage threshold and read the whole object. On the ranged branch
-        // FIELD_DIR is a front section the section loop below fetches anyway,
-        // so placing it here only reorders that GET; on the coverage-crossover
-        // branch it is one extra small GET in front of the whole-object read,
-        // unavoidable because the arms decide the candidate set that decides
-        // coverage. It is skipped entirely when the query carries no NumRange
+        // coverage threshold and read the whole object. The probe usually
+        // carries FIELD_DIR, which the writer places after PAGE_DIR; on an
+        // object that holds it at the front, the ranged branch's section loop
+        // below fetches it anyway, so placing it here only reorders that GET,
+        // and the coverage-crossover branch pays one extra small GET in front
+        // of the whole-object read, unavoidable because the arms decide the
+        // candidate set that decides coverage. It is skipped entirely when the
+        // query carries no NumRange
         // arm (a predicate-free or text-only query keeps the pre-#761 ts-only
         // candidate set). Bloom/POSTINGS arms are not resolved
         // here: they narrow further at decode over the fetched buffer, which is
@@ -7194,9 +7197,10 @@ impl BlockRangeFetcher {
             }
         }
 
-        // The two front sections (STREAM_DIR/FIELD_DIR): one coalesced GET over
-        // their adjacent span (deliverable 4), skipped entirely when an earlier
-        // FIELD_DIR resolution already brought them.
+        // STREAM_DIR and FIELD_DIR: one coalesced GET over their adjacent span
+        // (deliverable 4) for whatever the probe did not carry, skipped
+        // entirely when the probe or an earlier FIELD_DIR resolution already
+        // brought them.
         self.place_front_sections(
             seg_ref,
             tenant_hash,
@@ -7210,7 +7214,7 @@ impl BlockRangeFetcher {
         .await?;
 
         // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
-        // GET each, never coalesced with the front across the BLOCKS gap. The
+        // GET each, never coalesced with the directory pair. The
         // reader re-verifies each section's crc on decode, so a corrupt section
         // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
         // reader does not read it, and the plan probes it by range. BLOOM and
@@ -7425,9 +7429,9 @@ impl BlockRangeFetcher {
 
         // FIELD_DIR, when either channel needs it: the prune-only NumRange arms
         // resolve to this object's column ids through it (#761), and so does the
-        // projection. An all-columns query with no numeric arm needs neither, and
-        // FIELD_DIR is a front section a suffix probe never covers, so skipping
-        // it there is a real saved GET.
+        // projection. An all-columns query with no numeric arm needs neither,
+        // and on an object that holds FIELD_DIR at the front a suffix probe
+        // never covers it, so skipping it there is a real saved GET.
         let wants_numeric = prune
             .iter()
             .any(|p| matches!(p, Predicate::NumRange { .. }));
@@ -7630,10 +7634,11 @@ impl BlockRangeFetcher {
             }
         }
 
-        // The two front sections (STREAM_DIR/FIELD_DIR): one coalesced GET over
-        // their adjacent span (ADR-2066 decision 1). On the narrow-projection
-        // path `place_and_decode_field_dir` already brought both, so this is a
-        // no-op there; on an all-columns v4 read it is the read's one front GET.
+        // STREAM_DIR and FIELD_DIR: one coalesced GET over their adjacent span
+        // (ADR-2066 decision 1) for whatever the probe did not carry. On the
+        // narrow-projection path `place_and_decode_field_dir` already brought
+        // both, so this is a no-op there; on an all-columns v4 read of an
+        // object that holds them at the front it is the read's one front GET.
         // Skipped when `dirs` carries the decoded directories (ADR-2414
         // decision A1): the reader takes both from it.
         if dirs.is_none() {
@@ -7651,7 +7656,7 @@ impl BlockRangeFetcher {
         }
 
         // Any remaining tail section (BLOOM/POSTINGS) a short probe missed: one
-        // GET each, never coalesced with the front across the BLOCKS gap. The
+        // GET each, never coalesced with the directory pair. The
         // reader re-verifies each section's crc on decode, so a corrupt section
         // hit fails closed there (ADR-0046). KEY_IDX is never placed: the
         // reader does not read it, and the plan probes it by range. With `dirs`, SKIP_IDX and PAGE_DIR
@@ -7961,13 +7966,16 @@ impl BlockRangeFetcher {
         Ok(out)
     }
 
-    /// Place the object's two front directory sections -- STREAM_DIR (kind 1)
-    /// then FIELD_DIR (kind 2), which the writer emits ADJACENT at the object
-    /// front (docs/log-segment-format.md) -- in ONE range GET over their combined
-    /// span, instead of one GET each (deliverable 4). No suffix probe of any
-    /// length reaches a front section, so without coalescing the two are two of
-    /// the ~5.46 store round trips an object's ranged read costs (ADR-0107), for
-    /// a byte volume that is a rounding error against one request cost; presenting
+    /// Place the object's two directory sections -- STREAM_DIR (kind 1) then
+    /// FIELD_DIR (kind 2), which the writer emits ADJACENT, after PAGE_DIR, and
+    /// which objects written before the ADR-0699 2026-10-24 amendment hold at
+    /// the object front (docs/log-segment-format.md) -- in ONE range GET over
+    /// their combined span, instead of one GET each (deliverable 4). A section
+    /// the probe already carried costs nothing, which is the usual case for the
+    /// current order. No suffix probe of any length reaches a front section, so
+    /// on a front-order object without coalescing the two are two of the ~5.46
+    /// store round trips an object's ranged read costs (ADR-0107), for a byte
+    /// volume that is a rounding error against one request cost; presenting
     /// them together to one GET removes one whole request per object. A section
     /// already resident (an earlier call, or a footer that omits one of the two)
     /// costs nothing, and the span then covers only whichever remains. A section
@@ -7977,9 +7985,9 @@ impl BlockRangeFetcher {
     /// cached under a narrower key. A combined GET of both sections admits each
     /// under its per-section key as well as the span's, so while those entries
     /// stay resident the next read of the object serves both from those peeks. Counts one [`BlockRangeStats::metadata_gets`]
-    /// when it fetches, never a `probe_miss` (the front is unreachable by any
-    /// probe, so counting it there would put a floor under that metric -- see
-    /// the `probe_misses` field doc).
+    /// when it fetches, never a `probe_miss` (an object may hold the pair at
+    /// the front, unreachable by any probe, so counting it there would make
+    /// that metric report section order -- see the `probe_misses` field doc).
     #[allow(clippy::too_many_arguments)]
     async fn place_front_sections(
         &self,
@@ -8086,8 +8094,9 @@ impl BlockRangeFetcher {
     /// allows: a query that crosses over afterward reads STREAM_DIR bytes it
     /// does not need, the same bridged-bytes-for-requests trade ADR-2066
     /// makes for chunk runs, but a narrow projection of a one-row-group
-    /// object -- the case that never crosses over -- costs one front-section
-    /// GET instead of two. FIELD_DIR is compressed as a whole section
+    /// object -- the case that never crosses over -- costs at most one
+    /// directory GET instead of two, and none when the probe carried both.
+    /// FIELD_DIR is compressed as a whole section
     /// (docs/log-segment-format.md), the same shape SKIP_IDX is decoded with
     /// just above.
     #[allow(clippy::too_many_arguments)]
@@ -9239,26 +9248,13 @@ mod plan_fast_path_tests {
         }
     }
 
-    /// Bytes after the BLOCKS section: SKIP_IDX/BLOOM/POSTINGS then footer and
-    /// trailer. A probe suffix of exactly this length covers the whole tail
+    /// Bytes after the BLOCKS section: the indexes and directories, then footer
+    /// and trailer. A probe suffix of exactly this length covers the whole tail
     /// (footer parses with no range chase) yet reaches no block byte.
     fn tail_len(bytes: &[u8]) -> u64 {
         let f = footer::open(bytes).expect("footer");
         let b = f.section(kind::BLOCKS).expect("BLOCKS");
         bytes.len() as u64 - (b.offset + b.len)
-    }
-
-    /// Stored bytes of the two front directory sections (STREAM_DIR and
-    /// FIELD_DIR): the part of a segment's directories the suffix probe does not
-    /// cover, which `plan_segment` reads with one extra range GET so the
-    /// segment's decoded directories can be carried to every later open
-    /// (ADR-2414 decision A1).
-    fn front_dirs_len(bytes: &[u8]) -> u64 {
-        let f = footer::open(bytes).expect("footer");
-        [kind::STREAM_DIR, kind::FIELD_DIR]
-            .iter()
-            .map(|k| f.section(*k).expect("front section").len)
-            .sum()
     }
 
     async fn store_with_object(bytes: Vec<u8>) -> Arc<MemoryStore> {
@@ -9286,25 +9282,27 @@ mod plan_fast_path_tests {
 
     /// (Test b) The fast path fires for a predicate-free, fully-contained query:
     /// the returned count is the block count, the stats show nothing scanned,
-    /// and only the tail probe plus the two front directory sections crossed the
-    /// wire -- never a block-range fetch sized to the object.
+    /// and only the tail probe crossed the wire, STREAM_DIR and FIELD_DIR inside
+    /// it (ADR-0699, 2026-10-24 amendment) -- never a block-range fetch sized to
+    /// the object.
     ///
     /// Non-vacuity: deleting the fast-path branch in `plan_segment` (the
     /// `if seg_ref.object_size > 0 && query.is_block_predicate_free() ...`
     /// block that `return`s `plan_segment_fast(...)`) routes this same query
     /// through the block-range slow path, whose all-block candidate set trips
     /// the coverage crossover into a whole-object GET, so `total_s3_bytes` jumps
-    /// from `tail + front` to roughly `tail + object_size`. The
-    /// `read == tail + front` assertion then fails. The `predicate_present_cases_take_the_slow_path` test below
-    /// exercises exactly that slow path and shows the larger byte count directly.
+    /// from `tail` to roughly `tail + object_size`. The `read == tail`
+    /// assertion then fails. Against the writer order before that amendment the
+    /// read is `tail` plus the two directories' stored bytes, and it fails too.
+    /// The `predicate_present_cases_take_the_slow_path` test below exercises
+    /// exactly that slow path and shows the larger byte count directly.
     #[tokio::test]
-    async fn fast_path_reads_the_probe_and_the_front_directory_sections() {
+    async fn fast_path_reads_only_the_probe() {
         const N: usize = 6;
         let records: Vec<LogRecord> = (0..N as i64).map(record).collect();
         let bytes = build_object(&records);
         let total = bytes.len() as u64;
         let tail = tail_len(&bytes);
-        let front = front_dirs_len(&bytes);
         assert!(
             tail < total,
             "the object must carry a nonempty BLOCKS section"
@@ -9335,10 +9333,9 @@ mod plan_fast_path_tests {
 
         let read = acc.snapshot().total_s3_bytes();
         assert_eq!(
-            read,
-            tail + front,
-            "fast path reads the footer probe ({tail} B) and the front directory \
-             sections ({front} B), not the {total} B object"
+            read, tail,
+            "fast path reads the tail probe ({tail} B), which carries every \
+             directory, not the {total} B object"
         );
     }
 
@@ -9351,7 +9348,6 @@ mod plan_fast_path_tests {
         let bytes = build_object(&records);
         let total = bytes.len() as u64;
         let tail = tail_len(&bytes);
-        let front = front_dirs_len(&bytes);
         let seg = seg_ref(total, &records);
         let store = store_with_object(bytes).await;
         let f = fetcher(store, tail);
@@ -9366,11 +9362,7 @@ mod plan_fast_path_tests {
             .expect("relevant segment");
         let count = indices.len();
         assert_eq!(count, N);
-        assert_eq!(
-            acc.snapshot().total_s3_bytes(),
-            tail + front,
-            "fast path fired"
-        );
+        assert_eq!(acc.snapshot().total_s3_bytes(), tail, "fast path fired");
     }
 
     /// (Test c) Every case that is NOT predicate-free-and-contained goes through
@@ -11727,7 +11719,10 @@ mod fetch_stream_dir_tests {
         }
 
         let (gets, get_bytes, probes) = stream_dir_reads(&bytes, &seg, 0, size - 1).await;
-        assert!(gets >= 2, "above the bound: probe then section, got {gets}");
+        assert_eq!(
+            gets, 1,
+            "above the bound: the suffix probe alone, STREAM_DIR inside it"
+        );
         assert!(
             get_bytes * 2 < size,
             "above the bound the read moves under half the object: {get_bytes} of {size}"
@@ -13428,17 +13423,16 @@ mod projection_break_even_crossover_tests {
         // 490 records at 16 per block is 31 blocks, one row group of the
         // default 32, so one fewer run GET than a two-row-group object. The
         // query has no filter arm, so BLOOM is not fetched; the object has no
-        // indexed field and so no POSTINGS.
+        // indexed field and so no POSTINGS. BLOOM (about 3 MB here) precedes
+        // SKIP_IDX, so the probe carries SKIP_IDX, PAGE_DIR and both
+        // directories, and the read is the probe and the one run.
         let obj = store.get(KEY, GetRange::Full).await.expect("get").data;
         let tail = footer::open(&obj).expect("footer");
         assert!(tail.section(kind::POSTINGS).is_none());
         let bloom = *tail.section(kind::BLOOM).expect("BLOOM");
         let f = cost_based(store);
         let (gets, bytes) = ranged_open(&f, &large).await;
-        assert_eq!(
-            gets, 4,
-            "the ranged protocol's probe, directory and run GETs"
-        );
+        assert_eq!(gets, 2, "the ranged protocol's probe and run GETs");
         assert!(
             bytes * 5 < large.object_size,
             "a one-column projection moves under a fifth of the object: {bytes} of {}",
@@ -15154,7 +15148,10 @@ mod late_serve_accounting_tests {
 mod owned_block_plan_tests {
     //! ADR-2414 decision A1, deliverables 1 and 3: a per-partition open's ranged
     //! plan covers only the partition's own blocks, and with the plan phase's
-    //! decoded directories in hand it fetches no front directory section.
+    //! decoded directories in hand it fetches no directory section. The current
+    //! writer puts STREAM_DIR and FIELD_DIR in the tail probe (ADR-0699,
+    //! 2026-10-24 amendment); [`front_order_fixture`] keeps the order before it,
+    //! where only the carried directories spare the open a section GET.
     //!
     //! The object has three row groups of four one-record blocks. The projection
     //! is the fixed columns only (`ts` and the stream reference), so the ranged
@@ -15251,6 +15248,39 @@ mod owned_block_plan_tests {
             writer.push(record(ts, two_streams)).expect("push");
         }
         let object = writer.finish().expect("finish");
+        fixture_over(object, coalesce_gap, blocks, coverage).await
+    }
+
+    /// The [`BLOCKS`]-block fixture rewritten in the section order before the
+    /// ADR-0699 2026-10-24 amendment: STREAM_DIR and FIELD_DIR at offset 0,
+    /// ahead of BLOCKS, outside any tail probe. Every section is
+    /// position-independent (PAGE_DIR offsets are relative to BLOCKS), so the
+    /// rewrite moves stored bytes and footer offsets only.
+    async fn front_order_fixture(two_streams: bool) -> Fixture {
+        let current = fixture_with(two_streams).await.object;
+        let mut f = footer::open(&current).expect("footer");
+        let rank = |k: u32| match k {
+            kind::STREAM_DIR => 0,
+            kind::FIELD_DIR => 1,
+            _ => 2,
+        };
+        f.sections.sort_by_key(|d| (rank(d.kind), d.offset));
+        let mut object = Vec::new();
+        for d in &mut f.sections {
+            let start = d.offset as usize;
+            d.offset = object.len() as u64;
+            object.extend_from_slice(&current[start..start + d.len as usize]);
+        }
+        footer::write_footer_and_trailer(&mut object, &f);
+        fixture_over(object, Some(0), BLOCKS, None).await
+    }
+
+    async fn fixture_over(
+        object: Vec<u8>,
+        coalesce_gap: Option<u64>,
+        blocks: usize,
+        coverage: Option<f64>,
+    ) -> Fixture {
         let store = Arc::new(MemoryStore::new());
         store
             .put(KEY, Bytes::from(object.clone()), PutOptions::default())
@@ -15275,7 +15305,7 @@ mod owned_block_plan_tests {
             declared_column_stats: Default::default(),
         };
         // A probe reaching the whole tail, so SKIP_IDX and PAGE_DIR arrive with
-        // it and only the front sections and block pages are separate reads.
+        // it, and STREAM_DIR and FIELD_DIR too unless they lead the object.
         let parsed = footer::open(&object).expect("footer");
         let blocks = parsed.section(kind::BLOCKS).expect("BLOCKS");
         let tail = object.len() as u64 - (blocks.offset + blocks.len);
@@ -15424,15 +15454,44 @@ mod owned_block_plan_tests {
         assert_eq!(placed_blocks(&fx, &bytes), vec![4, 5, 6, 7]);
     }
 
-    /// With the plan phase's directories in hand the open fetches no front
-    /// directory section: STREAM_DIR and FIELD_DIR are not placed, where
-    /// without them both are.
+    /// The open issues no directory section GET, with or without the plan
+    /// phase's directories: the current writer puts STREAM_DIR and FIELD_DIR in
+    /// the tail probe, so both arms place them from it. On an object in the
+    /// order before the ADR-0699 2026-10-24 amendment the carried directories
+    /// are what spare the GET: STREAM_DIR and FIELD_DIR are not placed with
+    /// them, and one section GET places both without.
     ///
     /// Fails against an open that ignores the carried directories and fetches
-    /// the sections again.
+    /// the sections again (the front-order arm with them), and against the
+    /// writer order before that amendment (`metadata_gets` 1 in the current
+    /// arms).
     #[tokio::test]
-    async fn carried_directories_fetch_no_front_section() {
+    async fn carried_directories_fetch_no_section_get() {
         let fx = fixture().await;
+        let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
+            .expect("directories");
+        let owned = [4usize, 5, 6, 7];
+        for carried in [Some(&dirs), None] {
+            let (bytes, stats) = plan(
+                &fx,
+                i64::MIN,
+                Some(OwnedBlocks {
+                    blocks: &owned,
+                    survivors: &EVERY_BLOCK,
+                    dirs: carried,
+                }),
+            )
+            .await;
+            assert_eq!(
+                stats.metadata_gets,
+                0,
+                "carried directories: {}",
+                carried.is_some()
+            );
+            assert_eq!(placed_blocks(&fx, &bytes), vec![4, 5, 6, 7]);
+        }
+
+        let fx = front_order_fixture(false).await;
         let dirs = RlogReader::decode_directories(&fx.object[..], &RlogConfig::default())
             .expect("directories");
         let owned = [4usize, 5, 6, 7];
@@ -15444,7 +15503,7 @@ mod owned_block_plan_tests {
             })
         };
 
-        let (with, _) = plan(
+        let with = plan(
             &fx,
             i64::MIN,
             Some(OwnedBlocks {
@@ -15454,10 +15513,11 @@ mod owned_block_plan_tests {
             }),
         )
         .await;
-        assert_eq!(front_placed(&with), [false, false]);
-        assert_eq!(placed_blocks(&fx, &with), vec![4, 5, 6, 7]);
+        assert_eq!(front_placed(&with.0), [false, false]);
+        assert_eq!(with.1.metadata_gets, 0);
+        assert_eq!(placed_blocks(&fx, &with.0), vec![4, 5, 6, 7]);
 
-        let (without, _) = plan(
+        let without = plan(
             &fx,
             i64::MIN,
             Some(OwnedBlocks {
@@ -15467,10 +15527,12 @@ mod owned_block_plan_tests {
             }),
         )
         .await;
-        assert_eq!(front_placed(&without), [true, true]);
+        assert_eq!(front_placed(&without.0), [true, true]);
+        assert_eq!(without.1.metadata_gets, 1, "one GET for the front pair");
     }
 
-    /// A stream-attribute filter resolves against the carried STREAM_DIR: the
+    /// A stream-attribute filter resolves against the carried STREAM_DIR: on an
+    /// object with STREAM_DIR ahead of BLOCKS ([`front_order_fixture`]) the
     /// open's ranged fetch places no front section, so reading STREAM_DIR out
     /// of the fetched buffer would fail, and the rows must still be exactly
     /// the matching stream's.
@@ -15479,7 +15541,7 @@ mod owned_block_plan_tests {
     /// (`Unplaced` on STREAM_DIR) rather than from the carried directories.
     #[tokio::test]
     async fn a_stream_filter_resolves_from_the_carried_directories() {
-        let fx = fixture_with(true).await;
+        let fx = front_order_fixture(true).await;
         let query = LogQuery::new(i64::MIN, i64::MAX).with_stream_attr(StreamAttrEquals::new(
             "service.name",
             AttrValue::Str("even".into()),

@@ -444,16 +444,17 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     // incidental total size. This fetcher has no cache, so nothing the Plan
     // phase read is reused by the Scan phase.
     //
-    // Plan (2): the footer probe, then STREAM_DIR, which no tail probe reaches.
-    // Scan (5): its own footer probe; SKIP_IDX and PAGE_DIR in one coalesced
-    // GET (the 300-byte probe reaches neither); STREAM_DIR and FIELD_DIR in
-    // one combined front GET (ADR-2066 decision 1); BLOOM, the tail section
-    // the probe also missed; and one chunk run, because the projection's
+    // Plan (2): the footer probe, then STREAM_DIR, which the 300-byte probe
+    // does not reach. Scan (5): its own footer probe; SKIP_IDX and PAGE_DIR in
+    // one coalesced GET (the probe reaches neither); STREAM_DIR, which the
+    // probe reaches only part of, while FIELD_DIR after it lies wholly inside
+    // the probe window and costs no GET; BLOOM, the tail section the probe
+    // also missed; and one chunk run, because the projection's
     // pages across the 4 blocks `small_blocks()` cuts 11 records into (one
     // row group) coalesce into a single run at the default gap. The cap
     // (`MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT`, 4) cannot bind on one run: the
-    // count fell from 6 to 5 because FIELD_DIR and STREAM_DIR stopped being
-    // fetched separately, not because of bridging.
+    // count is 5 because the probe carries FIELD_DIR, not because of
+    // bridging.
     let snap = accounting.snapshot();
     let plan_gets = snap.phase(QueryPhase::Plan).s3_requests(AccountedOp::Get);
     let scan_gets = snap.phase(QueryPhase::Scan).s3_requests(AccountedOp::Get);
@@ -468,8 +469,8 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     );
     assert_eq!(
         scan_gets, 5,
-        "Scan: footer probe + SKIP_IDX/PAGE_DIR + combined STREAM_DIR/FIELD_DIR \
-         + BLOOM + one chunk run"
+        "Scan: footer probe + SKIP_IDX/PAGE_DIR + STREAM_DIR + BLOOM + one \
+         chunk run"
     );
 
     let object_a = raw
@@ -485,7 +486,13 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
     assert_eq!(
         field_dir.offset,
         stream_dir.offset + stream_dir.len,
-        "the two front sections are adjacent"
+        "the two directories are adjacent"
+    );
+    let probe_start = object_a.len() as u64 - 300;
+    assert!(
+        stream_dir.offset < probe_start && field_dir.offset >= probe_start,
+        "fixture precondition: the 300-byte probe window starts inside \
+         STREAM_DIR and holds FIELD_DIR"
     );
     assert_eq!(
         page_dir.offset,
@@ -507,10 +514,10 @@ async fn log_series_fetch_counts_lines_and_bytes_exactly() {
         [
             GetRange::Suffix(300),
             GetRange::Range(skip_idx.offset, page_dir.offset + page_dir.len),
-            GetRange::Range(stream_dir.offset, field_dir.offset + field_dir.len),
+            GetRange::Range(stream_dir.offset, stream_dir.offset + stream_dir.len),
             GetRange::Range(bloom.offset, bloom.offset + bloom.len),
         ],
-        "Scan: probe, SKIP_IDX+PAGE_DIR, STREAM_DIR+FIELD_DIR, BLOOM"
+        "Scan: probe, SKIP_IDX+PAGE_DIR, STREAM_DIR, BLOOM"
     );
     let chunk_runs: Vec<&GetRange> = scan[4..]
         .iter()

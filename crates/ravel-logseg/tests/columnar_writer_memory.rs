@@ -45,11 +45,13 @@ const NUM_COLUMNS: usize = 105;
 /// format bump, again when BLOOM's covered-column list gained its crc, and
 /// again when the writer began choosing each page's encoding by stored size
 /// with the GCD and column-reference codecs among the candidates (#2140), and
-/// again when string chunks gained row-group dictionaries (#2144).
+/// again when string chunks gained row-group dictionaries (#2144), and again
+/// when STREAM_DIR and FIELD_DIR moved after PAGE_DIR (the ADR-0699
+/// 2026-10-24 amendment).
 /// #682's invariant is unchanged -- the per-block cell materialization must not
 /// alter an output byte within a fixed writer version.
-const HASH_8K: &str = "dbb42113e56ee30e68497dbcd643aef00fc94acd5632d204b5f1ce6489d9837b";
-const HASH_64K: &str = "1ecb7bc1e46b0239d8d5c08f7db708d4408bbc658ff808beb8728a40e1d1f68e";
+const HASH_8K: &str = "18f4b76d30ea5a67b23358b0b1b3d2ed22b1e982f72c4f960df2b2f9e064eaa4";
+const HASH_64K: &str = "0a750ba6ba5ae20eb2b2ab94fc75392cbdbeec42bbb229d911062a696f6702b8";
 
 /// Peak-live-bytes bound as a multiple of the total cell payload `P`. Measured
 /// K = peak(65536) / P = 1.676 (151,509,919 over 90,400,596); rounded up to the

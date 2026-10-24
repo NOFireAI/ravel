@@ -130,15 +130,38 @@ fn seg_ref(key: &str, size: u64, records: &[LogRecord]) -> SegmentRef {
 }
 
 /// The object's BLOCKS-section absolute offset and its byte length, and the
-/// object's tail length (the bytes after the BLOCKS section, namely
-/// SKIP_IDX/BLOOM/POSTINGS then footer and trailer). A probe suffix of exactly
-/// `tail_len` covers the whole tail (so no tail-section GET is needed) but
-/// reaches no block.
+/// object's tail length (the bytes after the BLOCKS section, namely the index
+/// sections and the directories, then footer and trailer). A probe suffix of
+/// exactly `tail_len` covers the whole tail (so no tail-section GET is needed)
+/// but reaches no block.
 fn layout(bytes: &[u8]) -> (u64, u64, u64) {
     let footer = footer::open(bytes).expect("footer");
     let blocks = footer.section(kind::BLOCKS).expect("BLOCKS");
     let tail_len = bytes.len() as u64 - (blocks.offset + blocks.len);
     (blocks.offset, blocks.len, tail_len)
+}
+
+/// `bytes` rewritten in the section order before the ADR-0699 2026-10-24
+/// amendment: STREAM_DIR and FIELD_DIR at offset 0, ahead of BLOCKS. Readers
+/// still open objects stored that way, and every section is
+/// position-independent, so moving stored bytes and footer offsets is the
+/// whole rewrite.
+fn front_directory_order(bytes: &[u8]) -> Vec<u8> {
+    let mut f = footer::open(bytes).expect("footer");
+    let rank = |k: u32| match k {
+        kind::STREAM_DIR => 0,
+        kind::FIELD_DIR => 1,
+        _ => 2,
+    };
+    f.sections.sort_by_key(|d| (rank(d.kind), d.offset));
+    let mut out = Vec::new();
+    for d in &mut f.sections {
+        let start = d.offset as usize;
+        d.offset = out.len() as u64;
+        out.extend_from_slice(&bytes[start..start + d.len as usize]);
+    }
+    footer::write_footer_and_trailer(&mut out, &f);
+    out
 }
 
 /// The candidate block extents `(abs_start, len, crc32c)` a ts query resolves,
@@ -179,9 +202,9 @@ impl CountingStore {
 }
 
 /// Swaps the etag of any `Range` GET starting at or beyond `blocks_offset` to a
-/// different value, so a block-range GET (never the front-metadata GETs, which
-/// start before `blocks_offset`, nor the `Suffix` probe) observes an etag
-/// different from the probe's.
+/// different value, so a block-range GET (never the `Suffix` probe, nor a GET
+/// for a section an object places ahead of BLOCKS) observes an etag different
+/// from the probe's.
 struct EtagSwapStore {
     inner: Arc<MemoryStore>,
     blocks_offset: u64,
@@ -344,56 +367,66 @@ fn dirtying_object() -> (Vec<LogRecord>, Vec<u8>) {
 /// path's over the same candidate (ts) set, even though the block-range buffer
 /// holds only the candidate blocks (pruned blocks are zeroed gaps the reader
 /// never touches). The probe suffix is sized to the tail only, so the ranged
-/// path genuinely range-fetches the front metadata and the candidate blocks.
+/// path genuinely range-fetches the candidate blocks, and, on the object
+/// rewritten with STREAM_DIR and FIELD_DIR ahead of BLOCKS, the front
+/// directories as well.
 #[tokio::test]
 async fn block_range_rows_match_whole_object_over_same_candidate_set() {
-    let (records, bytes) = subset_object();
-    let (blocks_offset, _blocks_len, tail_len) = layout(&bytes);
-    assert!(blocks_offset > 0 && tail_len > 0);
+    let (records, written) = subset_object();
+    let front = front_directory_order(&written);
+    for (bytes, front_dirs) in [(written, false), (front, true)] {
+        let (blocks_offset, _blocks_len, tail_len) = layout(&bytes);
+        assert_eq!(
+            blocks_offset > 0,
+            front_dirs,
+            "BLOCKS leads the object unless the directories precede it"
+        );
+        assert!(tail_len > 0);
 
-    let mem = Arc::new(MemoryStore::new());
-    mem.put("logs/s.rlog", bytes.clone().into(), PutOptions::default())
-        .await
-        .expect("put");
-    let seg = seg_ref("logs/s.rlog", bytes.len() as u64, &records);
-    let store: Arc<dyn ObjectStoreBackend> = mem;
+        let mem = Arc::new(MemoryStore::new());
+        mem.put("logs/s.rlog", bytes.clone().into(), PutOptions::default())
+            .await
+            .expect("put");
+        let seg = seg_ref("logs/s.rlog", bytes.len() as u64, &records);
+        let store: Arc<dyn ObjectStoreBackend> = mem;
 
-    let query = LogQuery::new(6, 13);
+        let query = LogQuery::new(6, 13);
 
-    // Whole-object path: plain `fetch` issues one GetRange::Full and scans it.
-    let whole = LogSegmentFetcher::new(Arc::clone(&store))
-        .fetch(&seg, &query)
-        .await
-        .expect("whole fetch")
-        .expect("in range");
+        // Whole-object path: plain `fetch` issues one GetRange::Full and scans it.
+        let whole = LogSegmentFetcher::new(Arc::clone(&store))
+            .fetch(&seg, &query)
+            .await
+            .expect("whole fetch")
+            .expect("in range");
 
-    // Block-range path: route every object through it, probe only the tail, and
-    // disable the coverage crossover so the true per-block ranged path runs.
-    let br = BlockRangeFetcher::new(Arc::clone(&store))
-        .with_whole_object_threshold(0)
-        .with_suffix_len(tail_len)
-        .with_coverage_threshold(2.0);
-    let ranged = LogSegmentFetcher::new(Arc::clone(&store))
-        .with_block_range_threshold(0)
-        .with_block_range(br)
-        .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
-        .await
-        .expect("ranged fetch")
-        .expect("in range");
+        // Block-range path: route every object through it, probe only the tail, and
+        // disable the coverage crossover so the true per-block ranged path runs.
+        let br = BlockRangeFetcher::new(Arc::clone(&store))
+            .with_whole_object_threshold(0)
+            .with_suffix_len(tail_len)
+            .with_coverage_threshold(2.0);
+        let ranged = LogSegmentFetcher::new(Arc::clone(&store))
+            .with_block_range_threshold(0)
+            .with_block_range(br)
+            .fetch_accounted_with_tenant(&seg, TENANT, &query, &QueryAccounting::new())
+            .await
+            .expect("ranged fetch")
+            .expect("in range");
 
-    assert!(!whole.records.is_empty(), "the subset is nontrivial");
-    assert_eq!(
-        whole.records, ranged.records,
-        "block-range decoded rows must be byte-identical to whole-object rows"
-    );
+        assert!(!whole.records.is_empty(), "the subset is nontrivial");
+        assert_eq!(
+            whole.records, ranged.records,
+            "block-range decoded rows must be byte-identical to whole-object rows"
+        );
 
-    // The candidate set is a strict, nontrivial subset of the 20 blocks.
-    let cands = candidate_extents(&bytes, 6, 13);
-    assert!(
-        cands.len() > 1 && cands.len() < 20,
-        "candidate blocks must be a strict nontrivial subset, got {}",
-        cands.len()
-    );
+        // The candidate set is a strict, nontrivial subset of the 20 blocks.
+        let cands = candidate_extents(&bytes, 6, 13);
+        assert!(
+            cands.len() > 1 && cands.len() < 20,
+            "candidate blocks must be a strict nontrivial subset, got {}",
+            cands.len()
+        );
+    }
 }
 
 // ---- Test 1b: a ranged read holds its placed bytes, not the object ---------
@@ -544,9 +577,9 @@ async fn ranged_rows_match_whole_object_on_a_buffer_dirtied_by_another_object() 
 
 /// An etag change between the probe and a later block-range GET surfaces the
 /// typed [`LogFetchError::EtagChanged`]. The store swaps the etag on any GET at
-/// or beyond the BLOCKS offset, so the probe (a suffix over the tail) and the
-/// front-metadata GETs keep the pinned etag and a block-range GET is the one
-/// that observes the change.
+/// or beyond the BLOCKS offset, so the probe (a suffix over the tail, which
+/// carries the directories) keeps the pinned etag and a block-range GET is the
+/// one that observes the change.
 ///
 /// Prove-the-test: with the etag check in `BlockRangeFetcher::store_get_pinned`
 /// removed (the `if &got.etag != expected` guard), the store still returns the

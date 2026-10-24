@@ -1168,10 +1168,11 @@ async fn plan_counts(
 /// `plan_segment` branches (the predicate-free fast path and the
 /// skip-decidable branch) read an object at or below the larger of the
 /// routing threshold and the projection break-even whole, in one GET with no
-/// probe, and carry it to the scan; above that bound they probe and read the
-/// directories ranged. At or below the break-even the scan's ranged fetch reads
-/// the object whole, so a plan-phase probe there would read it twice under two
-/// cache keys, the per-object GET overhead ADR-2023 measured.
+/// probe, and carry it to the scan; above that bound they read the directories
+/// from one probe, which carries STREAM_DIR and FIELD_DIR after PAGE_DIR. At
+/// or below the break-even the scan's ranged fetch reads the object whole, so
+/// a plan-phase probe there would read it twice under two cache keys, the
+/// per-object GET overhead ADR-2023 measured.
 ///
 /// The scan that follows the under-the-break-even plan opens on the carried
 /// bytes and issues no GET of its own.
@@ -1262,9 +1263,9 @@ async fn the_planned_route_reads_an_object_under_the_break_even_whole() {
             "{name}: above the break-even the plan probes once"
         );
         assert!(
-            gets >= 2 && max_get < size / 4,
-            "{name}: above the break-even the plan reads the directories ranged, \
-             got {gets} GETs with a largest of {max_get} bytes of {size}"
+            gets == 1 && max_get < size / 4,
+            "{name}: above the break-even the plan reads the directories from the \
+             probe alone, got {gets} GETs with a largest of {max_get} bytes of {size}"
         );
         assert!(
             footer && !carried,
