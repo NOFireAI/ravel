@@ -18,6 +18,8 @@ mod varint;
 
 pub mod bloom;
 pub mod bloom_section;
+#[cfg(test)]
+mod bloom_variants;
 pub mod encoding;
 pub mod error;
 pub mod key_idx;

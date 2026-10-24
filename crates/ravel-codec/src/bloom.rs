@@ -12,28 +12,29 @@
 //! collides with an `attr.k` match.
 
 use std::collections::HashSet;
+use std::hash::{BuildHasher, Hasher};
 
 use crate::error::CodecError;
 use crate::varint::{get_uvarint, put_uvarint};
 
 /// Hash count per probe, sized for a ~1% false-positive rate.
-const K: u8 = 7;
+pub(crate) const K: u8 = 7;
 /// Block size in bits; a probe stays inside one block.
-const BLOCK_BITS: u64 = 512;
+pub(crate) const BLOCK_BITS: u64 = 512;
 /// Bits per element for p = 0.01: `-ln(0.01) / (ln 2)^2`.
-const BITS_PER_ELEM: f64 = 9.585;
+pub(crate) const BITS_PER_ELEM: f64 = 9.585;
 
 /// The three 64-bit hashes for a `(column_id, token)` key under `seed`,
 /// read from disjoint bytes of the BLAKE3 digest so block selection and the
 /// within-block probes are independent.
-struct KeyHash {
+pub(crate) struct KeyHash {
     /// Selects the 512-bit block.
-    block: u64,
+    pub(crate) block: u64,
     /// Within-block double-hashing base.
-    g1: u64,
+    pub(crate) g1: u64,
     /// Within-block double-hashing stride, low bit forced set so it is never
     /// zero (mod 512).
-    g2: u64,
+    pub(crate) g2: u64,
 }
 
 /// Test-only instrument: counts `key_hash` (BLAKE3) invocations on the
@@ -66,7 +67,7 @@ mod hash_calls {
 /// set. Using disjoint digest bytes for the block and the offsets keeps the
 /// first probe from being congruent to the block index (which would collapse
 /// most set bits onto two offsets and wreck the false-positive rate).
-fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
+pub(crate) fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
     #[cfg(test)]
     hash_calls::bump();
     let mut hasher = blake3::Hasher::new();
@@ -88,19 +89,71 @@ fn key_hash(seed: u64, column_id: u32, token: &[u8]) -> KeyHash {
 }
 
 /// The `k` bit indices a key sets or probes, given the filter geometry.
-fn probe_bits(h: &KeyHash, k: u8, block_count: u64) -> impl Iterator<Item = u64> {
+pub(crate) fn probe_bits(h: &KeyHash, k: u8, block_count: u64) -> impl Iterator<Item = u64> {
     let base = (h.block % block_count) * BLOCK_BITS;
     let g1 = h.g1;
     let g2 = h.g2;
     (0..u64::from(k)).map(move |i| base + (g1.wrapping_add(i.wrapping_mul(g2)) % BLOCK_BITS))
 }
 
-fn set_bit(bits: &mut [u8], bit: u64) {
+pub(crate) fn set_bit(bits: &mut [u8], bit: u64) {
     bits[(bit / 8) as usize] |= 1u8 << ((bit % 8) as u32);
 }
 
-fn get_bit(bits: &[u8], bit: u64) -> bool {
+pub(crate) fn get_bit(bits: &[u8], bit: u64) -> bool {
     bits[(bit / 8) as usize] & (1u8 << ((bit % 8) as u32)) != 0
+}
+
+/// FxHash-style hasher for [`BloomBuilder`]'s staging sets. It only orders
+/// those sets and never reaches emitted bytes, which come from [`key_hash`].
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+const FX_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+impl FxHasher {
+    fn add(&mut self, word: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ word).wrapping_mul(FX_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for c in &mut chunks {
+            let mut w = [0u8; 8];
+            w.copy_from_slice(c);
+            self.add(u64::from_le_bytes(w));
+        }
+        let rest = chunks.remainder();
+        if !rest.is_empty() {
+            let mut w = [0u8; 8];
+            w[..rest.len()].copy_from_slice(rest);
+            self.add(u64::from_le_bytes(w));
+        }
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+
+    // The rotate moves the multiply's well-mixed high bits down to where
+    // hashbrown takes the bucket index from.
+    fn finish(&self) -> u64 {
+        self.hash.rotate_left(26)
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct FxBuildHasher;
+
+impl BuildHasher for FxBuildHasher {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher::default()
+    }
 }
 
 /// Accumulates distinct `(column_id, token)` keys, then sizes and serializes a
@@ -134,18 +187,18 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// 0.4375 just after a resize and 0.875 just before the next one, so a
 /// slot's real cost is `(value_width + 1) / load_factor`, not the bare
 /// value width):
-/// - `staged: HashSet<Box<[u8]>>` -- each slot holds a `Box<[u8]>` fat
-///   pointer (16 bytes: data pointer + length), so the slot itself costs
-///   `(16 + 1) / 0.875` to `(16 + 1) / 0.4375`, roughly 19 to 39 bytes. That
-///   pointer addresses a separate heap allocation for the raw
+/// - `staged: HashSet<Box<[u8]>, FxBuildHasher>` -- each slot holds a
+///   `Box<[u8]>` fat pointer (16 bytes: data pointer + length), so the slot
+///   itself costs `(16 + 1) / 0.875` to `(16 + 1) / 0.4375`, roughly 19 to
+///   39 bytes. That pointer addresses a separate heap allocation for the raw
 ///   `column_id_le || token` bytes: up to 4 + 64 = 68 bytes of data (the
 ///   64-byte token bound `insert` documents below) plus a typical ~16-byte
 ///   allocator header, roughly 84 bytes. Staged cost: roughly 103 to 123
 ///   bytes per distinct key.
-/// - `triples: HashSet<(u64, u64, u64)>` -- the 24-byte tuple lives inline
-///   in the slot, no separate heap allocation, so the slot costs
-///   `(24 + 1) / 0.875` to `(24 + 1) / 0.4375`, roughly 29 to 57 bytes per
-///   distinct key.
+/// - `triples: HashSet<(u64, u64, u64), FxBuildHasher>` -- the 24-byte
+///   tuple lives inline in the slot, no separate heap allocation, so the
+///   slot costs `(24 + 1) / 0.875` to `(24 + 1) / 0.4375`, roughly 29 to 57
+///   bytes per distinct key.
 ///
 /// Both tables are live at peak (above), so the combined peak cost is their
 /// sum: roughly 132 to 180 bytes per distinct key. That is an increase over
@@ -153,12 +206,16 @@ fn get_bit(bits: &[u8], bit: u64) -> bool {
 /// bytes per distinct key on the same basis), roughly 3x -- negligible in
 /// absolute terms at a per-block builder's typical scale (a few MB at
 /// ~16k distinct keys).
+///
+/// Both sets hash with the crate-private `FxBuildHasher` rather than SipHash
+/// (issue #3228). Keys are still compared by their full bytes, so the hasher
+/// picks buckets and nothing else, and the emitted bytes do not depend on it.
 pub struct BloomBuilder {
     seed: u64,
     /// Distinct `column_id_le || token` byte strings. Queried by `&[u8]` via
     /// `Box<[u8]>: Borrow<[u8]>`, so a duplicate insert probes without
     /// allocating.
-    staged: HashSet<Box<[u8]>>,
+    staged: HashSet<Box<[u8]>, FxBuildHasher>,
     /// Reused `column_id_le || token` buffer for the membership probe, so a
     /// duplicate insert copies bytes but allocates nothing.
     scratch: Vec<u8>,
@@ -168,7 +225,7 @@ impl BloomBuilder {
     pub fn new(seed: u64) -> Self {
         BloomBuilder {
             seed,
-            staged: HashSet::new(),
+            staged: HashSet::with_hasher(FxBuildHasher),
             scratch: Vec::new(),
         }
     }
@@ -229,7 +286,8 @@ impl BloomBuilder {
         // `with_capacity` below reserves the full table up front, so `staged`
         // and `triples` are both fully live once the loop starts -- see the
         // struct doc for the measured peak and per-key arithmetic.
-        let mut triples: HashSet<(u64, u64, u64)> = HashSet::with_capacity(self.staged.len());
+        let mut triples: HashSet<(u64, u64, u64), FxBuildHasher> =
+            HashSet::with_capacity_and_hasher(self.staged.len(), FxBuildHasher);
         for key in self.staged.drain() {
             let mut col = [0u8; 4];
             col.copy_from_slice(&key[..4]);
