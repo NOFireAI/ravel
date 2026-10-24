@@ -1055,5 +1055,28 @@ of the next block of either structure: the table multiplier (5.0 for
 16-byte entries, 4.9 for 32-byte ones) times the largest table step, and
 2.1 times the largest `Vec` step times `1 + w_max/W`, capped at 2.43 times the stream's asked size, which alone
 applies under 8 MiB. A stream with an Unknown profile, no profile, or no
-matched step yet is charged 5 times its largest grow. ADR-1170's layout
-envelope amendment gives the measured basis and the tests that pin it.
+matched step yet is charged 5 times its largest grow. A layout reported by
+capacity takes a third bound (see the capacity share amendment below).
+ADR-1170's layout envelope amendment gives the measured basis and the tests
+that pin it.
+
+## Amendment (2026-10-24, #3181): the aggregate envelope is bounded by its capacity share
+
+<!-- amendment-applies: sections="Amendment (2026-10-24, #3181): the aggregate envelope is sized from the plan's layout and on by default" pointer="capacity share amendment" -->
+
+When a layout's two ladders are one set, as q33's are (`14 x 2^k` table
+steps, `56 x 2^j` `Vec` steps), every grow matches both and the envelope
+reads 5 times the largest grow, the figure that refused serial q33 at 32
+partitions. A profile now also records whether the group table and every
+`Vec` in `W` report their bytes by capacity: true for primitive single-key
+and multi-column group values and every classified accumulator, false for
+the single string-view key map, which reports its views by length. Each
+such structure holds between one and two times the live groups, so for a
+stream that has asked for `S` bytes, with entry size `s`, the next table
+block is at most `16/7 x (s + 1) x (2S / (W + 2s) + 12) + 16` and the next
+`Vec` transient at most `(S + 12s) x 2(W + w_max) / (2W + s)`. The larger
+of the two bounds the envelope alongside the ladder and size bounds; for q33
+it is `1.125 x (S + 192)`. `S` is the asked size, not the charged one. The
+`Vec` term holds while one batch adds fewer than `S x s / ((2W + s)(W + s))`
+groups. ADR-1170's capacity share amendment gives the derivation, what
+memory sits outside the bound, and the tests that pin it.

@@ -1536,7 +1536,18 @@ times its asked size while that is under 8 MiB, else the smaller of that
 and the larger of `5.0 x J_t` (4.9 for 32-byte entries) and
 `2.1 x J_v x (1 + w_max / W)`. Under an `Unknown` profile, with no profile,
 or before the stream has made a step of either ladder, the second term is 5
-times its largest single grow. Only the largest `min(available parallelism,
+times its largest single grow. A profile also records whether the group
+table and every `Vec` in `W` report their bytes by capacity (true for
+primitive and multi-column keys, false for the single string-view key map,
+which counts its views by length). When they do, each holds between one and
+two times the live groups, which bounds its share of the asked size `S`, and
+the envelope from 8 MiB is also capped at the larger of
+`16/7 x (s + 1) x (2S / (W + 2s) + 12) + 16` (the next table block, `s` the
+entry size) and `(S + 12s) x 2(W + w_max) / (2W + s)` (the next `Vec`
+transient). That cap matters when the two ladders coincide: a q33-shaped
+layout (16-byte entries, `W` 56) has table steps `14 x 2^k` and `Vec` steps
+`56 x 2^j`, every grow matches both and the ladder term reads 5 times the
+largest grow, while the cap reads `1.125 x (S + 192)`. Only the largest `min(available parallelism,
 SQL partition count)` envelopes on a budget are reserved, and none is in a
 query or tenant figure; `ravel_sql::sql_memory_aggregate_envelope_bytes()`
 returns the bytes they hold across the process, and no metric renders it

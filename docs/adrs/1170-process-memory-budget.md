@@ -1548,7 +1548,9 @@ and does not lower the envelope. A building stream's envelope, at asked size
 5.0 for 16-byte entries and 4.9 for 32-byte ones. The table term covers a
 rehash with the old table live; the `Vec` term covers every state `Vec`
 reallocating once with the widest still in flight. A stream with an Unknown
-profile, no profile, or no matched step falls back to `5 x J_max`. Which
+profile, no profile, or no matched step falls back to `5 x J_max`. A layout
+reported by capacity takes a third bound (see the capacity share amendment
+below). Which
 envelopes are reserved is unchanged: the largest
 `min(available_parallelism, SQL partition count)` in the process.
 
@@ -1581,3 +1583,52 @@ the envelope covers), and in the build phase of the 8-partition string-key
 rows (up to 80.0 MiB). One run of the matrix on the reserve-ahead
 amendment's code and sampler, `5 x J_max` included, read over 16 MiB on 8
 of its 14 Ravel rows on that host.
+
+## Amendment (2026-10-24, #3181): the aggregate envelope is bounded by its capacity share
+
+<!-- amendment-applies: sections="Amendment (2026-10-24, #3181): the aggregate envelope is sized from the plan's layout and on by default" pointer="capacity share amendment" -->
+
+q33's two ladders are one set: its table steps are `14 x 2^k` and its `Vec`
+steps, with `W` 56, are `56 x 2^j = 14 x 2^(j + 2)`. Every grow matches
+both, `J_t = J_v = J_max`, and the layout envelope reads
+`max(5 x J_max, 2.1 x J_max x 72 / 56) = 5 x J_max`, the same envelope that
+refused serial q33 at 32 partitions.
+
+A layout now carries `capacity_accounted`, true when the group table and
+every `Vec` in `W` report their bytes by capacity: DataFusion 55.2's
+primitive single-key and multi-column group values (string-view columns
+included) and every accumulator the derivation classifies. The single
+string-view key map reports its views by length and is false. For such a
+layout, with `g` groups, entry size `s`, table capacity `C_t` and asked size
+`S`: the table holds between `g` and `2g` entries and reports between
+`s x (C_t - 12)` and `s x C_t` (`insert_accounted` bumps by 16 entries into
+a table that becomes 28, then by the capacity); every `Vec` holds between
+`g` and `2g` groups, so the `Vec` family reports between `W x g` and
+`2W x g`. With the table and the `Vec`s inside `S`, the next table block,
+twice its `8/7 x C_t` buckets at `s + 1` bytes plus a 16-byte control tail,
+is at most `16/7 x (s + 1) x (2S / (W + 2s) + 12) + 16`, and the next `Vec`
+transient at most `(S + 12s) x 2(W + w_max) / (2W + s)`. The larger of the
+two is the share bound, and a building stream's envelope from 8 MiB is
+`min(2.43 x S, ladder bound, share bound)`. The size bound under 8 MiB, the
+`5 x J_max` fallback for an Unknown profile, and the ladder bound for a
+layout not reported by capacity are unchanged. `S` is the asked size, not
+the charged `1.25 x S`. For q33 the share bound is `1.125 x (S + 192)`.
+
+The `Vec` term takes the `Vec` that moves to hold at most `A_v / W` groups,
+which holds while one batch adds fewer than `S x s / ((2W + s)(W + s))`
+groups: for q33 about `S / 576`, 14,563 groups at 8 MiB. A layout with a
+wider `W` near 8 MiB can add a batch past that, and its `Vec` term can then
+fall short by up to `(W + w_max)` bytes per excess group. Group-sized
+memory outside `W` is not in the bound: hashbrown control bytes and empty
+buckets past the counted entries (covered for the next block by the table
+term), a nullable key's or `SUM`'s validity bitmap (about one bit per group,
+its next block left to the slack), and the collision lists of the
+multi-column map.
+
+`the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound`,
+`a_view_key_layout_does_not_take_the_capacity_share_bound` and
+`the_share_bound_reads_asked_not_charged_bytes` in
+`crates/ravel-sql/src/memory.rs` pin the bound, its scope, and its input;
+`the_aggregate_profile_of_the_six_measured_statements` in
+`crates/ravel-sql/src/executor.rs` pins `capacity_accounted` for q33, q19
+and q17 (true) and q34, q35 and q14 (false).

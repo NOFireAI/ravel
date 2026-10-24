@@ -80,6 +80,17 @@
 //! no profile, or before the stream has shown a step of either ladder, it is
 //! `unknown_layout_multiplier x J_max` (5.0), `J_max` its largest grow.
 //!
+//! A layout whose group table and `Vec`s are all reported by capacity
+//! ([`AggregateLayout::capacity_accounted`]) also bounds the next step by the
+//! share of `S` each can hold: every one holds between one and two times its
+//! live groups, so the next table block is at most
+//! `16/7 x (s + 1) x (2S / (W + 2s) + 12) + 16` and the next `Vec` transient
+//! at most `(S + 12s) x 2(W + w_max) / (2W + s)`, `s` the entry size. The
+//! envelope is the smallest of the size bound, the next step and that share
+//! bound. When the two ladders coincide (q33's `14 x 2^k` and `56 x 2^j`),
+//! every grow counts for both and the next step reads `5 x J_max`; the share
+//! bound reads `1.125 x (S + 192)`.
+//!
 //! [`AggregateReserveAhead::DEFAULT`] charges the factor and carries the
 //! envelope; [`AggregateReserveAhead::OFF`] restores one-to-one charging and
 //! no envelope.
@@ -637,8 +648,8 @@ impl AggregateLayout {
         let asked = asked as f64;
         let table_entries = asked * 2.0 / (w_total + 2.0 * s) + TABLE_UNACCOUNTED_ENTRIES;
         let next_table = 16.0 / 7.0 * (s + 1.0) * table_entries + TABLE_CONTROL_TAIL_BYTES;
-        let next_vec = (asked + TABLE_UNACCOUNTED_ENTRIES * s) * 2.0 * (w_total + w_max)
-            / (2.0 * w_total + s);
+        let next_vec =
+            (asked + TABLE_UNACCOUNTED_ENTRIES * s) * 2.0 * (w_total + w_max) / (2.0 * w_total + s);
         // A float-to-integer `as` saturates.
         Some(next_table.max(next_vec).ceil() as usize)
     }
@@ -2731,7 +2742,7 @@ mod tests {
     /// so every step is both chains' step and the ladder bound is
     /// `5 x J_max`. The capacity share of the asked size bounds it instead.
     /// FLIP: the PR head's `min(2.43 x S, ladder)` reads 587,202,560 at the
-    /// end.
+    /// end; taking the share over the charged bytes reads 361,267,416.
     #[test]
     fn the_q33_layout_with_coinciding_ladders_takes_the_capacity_share_bound() {
         let _serial = envelope_tests();
@@ -2815,7 +2826,8 @@ mod tests {
 
     /// The share bound is taken over the bytes the consumer asked for, not
     /// the 1.25 times that the pool charges.
-    /// FLIP: taking it over the charged 45,875,200 reads 51,609,816.
+    /// FLIP: taking it over the charged 45,875,200 reads 51,609,816; the PR
+    /// head's `min(2.43 x S, ladder)` reads 89,181,389.
     #[test]
     fn the_share_bound_reads_asked_not_charged_bytes() {
         let _serial = envelope_tests();
