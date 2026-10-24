@@ -335,3 +335,29 @@ fn export_logs_carries_the_tenant_flag_into_the_store_walk() {
         "a refused export must not create the --parquet file"
     );
 }
+
+/// `--parquet-bloom-columns` reaches the export as a comma-separated list: the
+/// second name is the one refused, which a flag read as one value
+/// (`"body,bogus"`) or dropped on the way would not produce.
+#[test]
+fn export_parquet_bloom_columns_reaches_the_export_as_a_list() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let out = dir.path().join("out.parquet");
+    let out_arg = out.display().to_string();
+    let output = run_export_with(&dir, &out_arg, &["--parquet-bloom-columns", "body,bogus"]);
+
+    assert!(
+        !output.status.success(),
+        "an unknown bloom column must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.trim_end(),
+        "Error: --parquet-bloom-columns names \"bogus\", which is not an output column of this \
+         export; its output columns are: ts, body"
+    );
+    assert!(
+        !out.exists(),
+        "a refused export must not create the --parquet file"
+    );
+}

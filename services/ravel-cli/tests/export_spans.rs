@@ -334,6 +334,7 @@ async fn export_window(
         1,
         None,
         LOAD_NS,
+        &export::BloomColumns::Default,
     )
     .await
 }
@@ -1130,6 +1131,7 @@ async fn run_dispatches_signal_spans_to_the_spans_export() {
         1,
         None,
         LOAD_NS,
+        &export::BloomColumns::Default,
     )
     .await
     .expect_err("the duplicate output column is refused");

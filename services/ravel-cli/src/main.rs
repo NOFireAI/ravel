@@ -957,6 +957,16 @@ enum Command {
         /// same range. Zero is refused, as the server refuses it.
         #[arg(long, value_name = "DURATION", value_parser = ravel_cli::parse_max_ingest_lag_ns)]
         max_ingest_lag: Option<i64>,
+        /// Comma-separated output columns to write a Parquet bloom filter
+        /// on (1% false-positive target), replacing the default list. The
+        /// default is, for spans, the mapping's trace id, span id and (when
+        /// set) parent span id columns; for logs, its trace id and span id
+        /// columns when the mapping sets them; for metrics, none. The single
+        /// value `none` writes no filter. A name that is not an output
+        /// column of this export is refused before the export reads
+        /// anything.
+        #[arg(long, value_name = "COLUMNS", value_delimiter = ',')]
+        parquet_bloom_columns: Option<Vec<String>>,
     },
     /// Run SQL diagnostics outside the HTTP endpoint (built only with
     /// `--features sql-explain`).
@@ -3374,7 +3384,9 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
             mapping,
             shards,
             max_ingest_lag,
+            parquet_bloom_columns,
         } => {
+            let bloom = ravel_cli::export::BloomColumns::from_flag(parquet_bloom_columns)?;
             ravel_cli::export::run(
                 store::build_store(&cli.store)?,
                 cli.store.selection(),
@@ -3387,6 +3399,7 @@ async fn run_logged(cli: Cli, log: &mut (dyn std::io::Write + Send)) -> anyhow::
                 shards,
                 max_ingest_lag,
                 now_ns()?,
+                &bloom,
             )
             .await
         }

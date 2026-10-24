@@ -259,6 +259,7 @@ async fn load_then_export_round_trips_logs_field_by_field() {
         1,
         None,
         load_now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -494,6 +495,7 @@ async fn export_reloads_into_a_second_tenant_field_for_field() {
         1,
         None,
         T2,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("the first export succeeds");
@@ -531,6 +533,7 @@ async fn export_reloads_into_a_second_tenant_field_for_field() {
         1,
         None,
         T2,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("the second export succeeds");
@@ -821,6 +824,7 @@ async fn a_record_at_exactly_the_window_end_is_not_exported() {
         1,
         None,
         load_now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -892,6 +896,7 @@ async fn an_object_holding_only_the_record_at_the_window_end_is_not_fetched() {
         1,
         None,
         load_now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -970,6 +975,7 @@ async fn a_failing_export_leaves_an_existing_output_file_byte_identical() {
         1,
         None,
         BASE_NS + ONE_SEC_NS,
+        &export::BloomColumns::Default,
     )
     .await
     .expect_err("a declared type the stored value does not match is refused");
@@ -1125,6 +1131,7 @@ async fn a_pending_erasure_request_excludes_exactly_its_subject() {
         1,
         None,
         T2 + 1,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -1239,6 +1246,7 @@ async fn a_pending_erasure_on_a_resource_attribute_excludes_its_subject() {
         1,
         None,
         now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -1375,6 +1383,7 @@ async fn a_pending_erasure_on_a_scope_or_resource_attribute_excludes_its_subject
         1,
         None,
         now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -1447,6 +1456,7 @@ async fn a_retention_tombstone_removes_exactly_its_buckets_records() {
         1,
         None,
         export_now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -1468,6 +1478,7 @@ async fn a_retention_tombstone_removes_exactly_its_buckets_records() {
         1,
         None,
         export_now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -1624,6 +1635,7 @@ async fn a_compacted_bucket_exports_each_record_exactly_once() {
         1,
         None,
         compact_now_ns,
+        &export::BloomColumns::Default,
     )
     .await
     .expect("export succeeds");
@@ -1698,6 +1710,7 @@ async fn max_ingest_lag_decides_which_buckets_the_resolve_lists() {
             1,
             max_ingest_lag_ns,
             export_now_ns,
+            &export::BloomColumns::Default,
         )
     };
 
@@ -1742,6 +1755,7 @@ async fn export_refuses_a_directory_output_before_any_store_request() {
         1,
         None,
         BASE_NS,
+        &export::BloomColumns::Default,
     )
     .await
     .expect_err("a directory --parquet is refused");

@@ -193,6 +193,7 @@ async fn export_window(
         1,
         None,
         now_ns,
+        &export::BloomColumns::Default,
     )
     .await
 }
