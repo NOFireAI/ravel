@@ -563,12 +563,14 @@ partition:
   is the projected block pages alone, on the ranged route and on the route that
   reads whole objects
   (`striped_projection_decompresses_once_per_segment`,
-  `whole_object_route_decompresses_once_per_segment`). Where the suffix probe
-  covers SKIP_IDX and PAGE_DIR but not the two front sections, the plan phase
-  reads those two itself and the plan-phase wire bytes of the predicate-free fast
-  branch are the probe plus them
-  (`fast_path_reads_the_probe_and_the_front_directory_sections`), in exchange
-  for the scan phase requesting none of them.
+  `whole_object_route_decompresses_once_per_segment`). The writer places
+  STREAM_DIR and FIELD_DIR right after PAGE_DIR, ahead of the footer, so the
+  suffix probe that covers SKIP_IDX and PAGE_DIR covers the directory pair too,
+  and the plan-phase wire bytes of the predicate-free fast branch are the probe
+  alone (`fast_path_reads_only_the_probe`), with the scan phase requesting none
+  of the four sections. Only an object written before the ADR-0699 amendment of
+  2026-10-24 holds the pair at its front, outside every probe; there the plan
+  phase reads the pair itself in one extra GET.
 - **The carried directories are reserved.** A segment with at least one
   surviving block keeps its directories resident and reserves their decoded
   length (`SegmentDirectories::decoded_bytes`, the four sections' `uncomp_len`)
@@ -869,8 +871,8 @@ than a block. The request law for one statement over one such object:
 
 **One suffix probe, plus one coalesced range per surviving `(row group,
 projected column)`, bounded at `MAX_PAGE_RANGE_GETS_PER_L0_SEGMENT` (4,
-ADR-2066 decision 1) on an L0 object and unbounded on an L1 segment, plus
-front-section ranges (STREAM_DIR and FIELD_DIR together, in one GET, when the
+ADR-2066 decision 1) on an L0 object and unbounded on an L1 segment, plus a
+directory range (STREAM_DIR and FIELD_DIR together, in one GET, when the
 query carries numeric arms or projects fewer than every column) only when the
 probe's cached suffix does not already cover them.**
 That law is per open. On the striped route an object's row groups are
@@ -880,7 +882,8 @@ it, so an object's request count is the sum over the units that open it (see
 [the striped route](#the-striped-route-directories-once-per-segment-row-groups-whole)).
 For a typical narrow projection over a small L0 object that is one to seven
 GETs: the probe, a SKIP_IDX/PAGE_DIR chase when the probe falls short, the
-front sections, and up to 4 chunk-run GETs. The count excludes the tail
+directory pair when the probe does not cover it, and up to 4 chunk-run GETs.
+The count excludes the tail
 sections a predicate can need beyond those (BLOOM and POSTINGS, each one GET
 when the probe does not cover it), which add to it. Below the cap the
 chunk-run count grows with `row_groups x projected_columns` rather than with
@@ -889,11 +892,14 @@ to the cap, while an L1 segment issues one GET per coalesced run.
 
 The pieces, and why each is where it is:
 
-- The 256 KiB suffix probe brings the footer, SKIP_IDX and PAGE_DIR in one GET.
-  A 64 KiB probe would not: BLOOM (86 KB mean on the reference tenant) sits
-  between SKIP_IDX and the footer, so the shorter probe missed SKIP_IDX on
-  68.8% of above-threshold objects and cost 4,415 extra GETs per predicated
-  statement. A probe that still falls short costs one extra GET, not one per
+- The 256 KiB suffix probe brings the footer, SKIP_IDX and PAGE_DIR in one GET,
+  and on an object written since the ADR-0699 amendment of 2026-10-24 also
+  STREAM_DIR and FIELD_DIR, which follow PAGE_DIR. A 64 KiB probe would not:
+  BLOOM (86 KB mean on the reference tenant) sat between SKIP_IDX and the
+  footer in objects written before that amendment, so the shorter probe missed
+  SKIP_IDX on 68.8% of above-threshold objects and cost 4,415 extra GETs per
+  predicated statement. BLOOM and POSTINGS now sit before SKIP_IDX, so however
+  large BLOOM grows it no longer pushes the directories out of the probe. A probe that still falls short costs one extra GET, not one per
   section: SKIP_IDX and PAGE_DIR are adjacent and are fetched as one range, and
   `BlockRangeStats::probe_misses` reports the residual rate. That per-read
   figure is also accumulated per phase on the `LogSegmentFetcher` that served
@@ -906,11 +912,14 @@ The pieces, and why each is where it is:
   which phase's probe spent the extra requests. A miss is measured against the
   probe *window*, not against cache residency, so a warm run reports the same
   count as a cold one.
-- STREAM_DIR and FIELD_DIR sit at the object's *front*, so no suffix probe of
-  any length reaches them. FIELD_DIR is read only when the query needs it (a
-  NumRange arm to resolve, or a projection narrower than every column), and it
-  is an extra GET only when the probe's cached suffix does not cover it, which
-  on a small object, where the probe spans the whole object, it does.
+- STREAM_DIR and FIELD_DIR follow PAGE_DIR, ahead of the footer, so the narrow
+  fast path reads the directory pair from the tail probe. FIELD_DIR is read only
+  when the query needs it (a NumRange arm to resolve, or a projection narrower
+  than every column), and it is an extra GET only when the probe's cached
+  suffix does not cover it. That happens on an object written before the
+  ADR-0699 amendment of 2026-10-24, which holds the pair at its *front*, where
+  no suffix probe shorter than the object reaches it; `probe_misses` excludes
+  the pair for that reason.
 - Chunk ranges: one per surviving `(row group, projected column)`, fewer when
   adjacent chunks coalesce, and one for the whole group when the projection
   keeps every column and every block of the group survives. Pruned blocks' pages

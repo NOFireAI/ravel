@@ -102,15 +102,15 @@ encodings.
 
 ```
 +---------------------------------------------------+
-| STREAM_DIR   stream directory                     |  kind 1
-| FIELD_DIR    field directory                      |  kind 2
 | BLOCKS       row blocks (column pages)            |  kind 3
 | KEY_IDX      per-field exact (key8, block) index  |  kind 9 (optional, ADR-2707)
+| POSTINGS     per-field term -> block postings     |  kind 6 (optional)
+| BLOOM        per-block token blooms               |  kind 5
 | SKIP_IDX     multi-level min/max index            |  kind 4
 | PAGE_DIR     per row group, per column chunk,     |  kind 8
 |              per page: offset/len/enc/comp/crc    |
-| BLOOM        per-block token blooms               |  kind 5
-| POSTINGS     per-field term -> block postings     |  kind 6 (optional)
+| STREAM_DIR   stream directory                     |  kind 1
+| FIELD_DIR    field directory                      |  kind 2
 | footer: LogFooter protobuf bytes                  |
 | trailer (16 bytes):                               |
 |   footer_len:   u32                               |
@@ -122,11 +122,18 @@ encodings.
 +---------------------------------------------------+
 ```
 
-Writers emit the sections physically in the order shown above (PAGE_DIR
-between SKIP_IDX and BLOOM, not in kind order; KEY_IDX, when present,
-between BLOCKS and SKIP_IDX, so the tail probe keeps covering the footer,
-SKIP_IDX, PAGE_DIR and BLOOM); readers rely only on the footer's section
-offsets, never on adjacency or on kind order. Bytes between
+Writers emit the sections physically in the order shown above, not in
+kind order. STREAM_DIR and FIELD_DIR follow PAGE_DIR, and BLOOM and
+POSTINGS (with KEY_IDX, when present) precede SKIP_IDX, so the four
+directories (SKIP_IDX, PAGE_DIR, STREAM_DIR, FIELD_DIR) sit next to the
+footer and a tail probe long enough for them and the footer carries all of
+them whatever the index sizes (ADR-0699, 2026-10-24 amendment). Objects
+written before that amendment hold STREAM_DIR and FIELD_DIR at offset 0,
+ahead of BLOCKS, and BLOOM and POSTINGS after PAGE_DIR. The reorder needed
+no trailer version bump: it changes no section's grammar and no kind's
+legality, the only changes the bump rule under "Version" below covers.
+Readers rely only on the footer's section offsets, never on adjacency or
+on kind order, so they open objects of either order. Bytes between
 sections are permitted and MUST be `0x00`; readers never interpret them.
 
 `footer_crc32c` is computed over: the `LogFooter` bytes, then `footer_len`
