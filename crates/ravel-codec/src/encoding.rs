@@ -6,7 +6,7 @@
 //! typed [`CodecError`] on any violation, never panicking.
 
 use crate::error::CodecError;
-use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint};
+use crate::varint::{get_ivarint, get_uvarint, put_ivarint, put_uvarint, zigzag_decode};
 
 /// Encoding tag registry (frozen contract, docs/log-segment-format.md).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -308,22 +308,60 @@ pub fn encode_i64(values: &[i64]) -> (Enc, Vec<u8>) {
 
 /// Decodes `count` i64 values encoded with `enc`.
 pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, CodecError> {
-    let mut out = Vec::with_capacity(cap(count));
-    decode_i64_each(enc, bytes, count, &mut |v| {
-        out.push(v);
-        Ok(())
-    })?;
-    Ok(out)
+    let mut identity = Ok;
+    match enc {
+        Enc::Constant => {
+            let mut pos = 0usize;
+            let v = get_ivarint(bytes, &mut pos)?;
+            expect_consumed(pos, bytes.len())?;
+            Ok(vec![v; count])
+        }
+        Enc::Rle => {
+            let mut out = Vec::with_capacity(cap(count));
+            let pos = decode_rle(bytes, count, |v, run| {
+                out.resize(out.len() + run, v);
+                Ok(())
+            })?;
+            expect_consumed(pos, bytes.len())?;
+            Ok(out)
+        }
+        Enc::ForBitpack => {
+            let (min, bit_width, payload) = for_header(bytes, count)?;
+            let mut out = vec![0; count];
+            unpack_for(payload, bit_width, min, &mut out);
+            Ok(out)
+        }
+        Enc::Plain | Enc::DeltaZigzag | Enc::DoubleDelta if count > bytes.len() => {
+            // Every value takes at least one byte, so decoding stops at a
+            // varint error no later than the value after the last byte.
+            let mut out = vec![0; bytes.len()];
+            let mut pos = decode_varints(enc, bytes, &mut out, &mut identity)?;
+            get_ivarint(bytes, &mut pos)?;
+            Err(CodecError::Corrupted("varint truncated".into()))
+        }
+        Enc::Plain | Enc::DeltaZigzag | Enc::DoubleDelta => {
+            let mut out = vec![0; count];
+            let pos = decode_varints(enc, bytes, &mut out, &mut identity)?;
+            expect_consumed(pos, bytes.len())?;
+            Ok(out)
+        }
+        other => Err(not_integer(other)),
+    }
 }
 
 /// Decodes the present values of an i64 page straight into a block-length
-/// buffer, in the same pass that reads the varints.
+/// buffer.
 ///
 /// `out` holds one slot per block row. `presence` is the column's LSB-first
 /// presence bitmap (`None` when every row is present); it must be exactly
 /// `ceil(out.len() / 8)` bytes. The page carries one value per present row;
 /// each decoded value passes through `map` and is stored at the next present
 /// row. Absent rows are written as 0. Returns the number of present rows.
+///
+/// `map` is applied once per decoded value, except on Constant and RLE pages,
+/// where it is applied once per run, so it must be a pure function of its
+/// input. When a decode error follows values that `map` rejects, the first
+/// rejection is returned, as it would be value by value.
 pub fn decode_i64_into(
     enc: Enc,
     bytes: &[u8],
@@ -333,34 +371,12 @@ pub fn decode_i64_into(
 ) -> Result<usize, CodecError> {
     let rows = out.len();
     let Some(bits) = presence else {
-        let mut row = 0usize;
-        decode_i64_each(enc, bytes, rows, &mut |v| {
-            let slot = out
-                .get_mut(row)
-                .ok_or_else(|| CodecError::Corrupted("value page longer than block".into()))?;
-            *slot = map(v)?;
-            row += 1;
-            Ok(())
-        })?;
+        decode_dense(enc, bytes, out, &mut map)?;
         return Ok(rows);
     };
     let count = count_present(bits, rows)?;
-    let mut row = 0usize;
-    decode_i64_each(enc, bytes, count, &mut |v| {
-        while row < rows && !bit_is_set(bits, row) {
-            out[row] = 0;
-            row += 1;
-        }
-        let slot = out
-            .get_mut(row)
-            .ok_or_else(|| CodecError::Corrupted("value page longer than presence".into()))?;
-        *slot = map(v)?;
-        row += 1;
-        Ok(())
-    })?;
-    for slot in out.iter_mut().skip(row) {
-        *slot = 0;
-    }
+    decode_dense(enc, bytes, &mut out[rows - count..], &mut map)?;
+    scatter_present(bits, out, count);
     Ok(count)
 }
 
@@ -375,7 +391,16 @@ pub fn count_present(bits: &[u8], rows: usize) -> Result<usize, CodecError> {
         )));
     }
     let full = rows / 8;
-    let mut n: usize = bits[..full].iter().map(|b| b.count_ones() as usize).sum();
+    let words = bits[..full].chunks_exact(8);
+    let rest = words.remainder();
+    let mut n: usize = words
+        .map(|w| {
+            let mut word = [0u8; 8];
+            word.copy_from_slice(w);
+            u64::from_le_bytes(word).count_ones() as usize
+        })
+        .sum();
+    n += rest.iter().map(|b| b.count_ones() as usize).sum::<usize>();
     let tail = rows % 8;
     if tail > 0 {
         n += (bits[full] & ((1u8 << tail) - 1)).count_ones() as usize;
@@ -383,108 +408,365 @@ pub fn count_present(bits: &[u8], rows: usize) -> Result<usize, CodecError> {
     Ok(n)
 }
 
-fn bit_is_set(bits: &[u8], i: usize) -> bool {
-    bits[i / 8] & (1 << (i % 8)) != 0
+fn not_integer(enc: Enc) -> CodecError {
+    CodecError::Corrupted(format!("enc {enc:?} is not an integer codec"))
 }
 
-/// Core of [`decode_i64`]: hands each of the `count` decoded values to `emit`
-/// in order, then checks the page was consumed exactly.
-fn decode_i64_each(
-    enc: Enc,
-    bytes: &[u8],
-    count: usize,
-    emit: &mut impl FnMut(i64) -> Result<(), CodecError>,
-) -> Result<(), CodecError> {
-    let mut pos = 0usize;
-    match enc {
-        Enc::Plain => {
-            for _ in 0..count {
-                emit(get_ivarint(bytes, &mut pos)?)?;
-            }
+/// Moves the `count` dense values at the back of `out` to the rows whose
+/// presence bit is set, in order, and writes 0 to every other row. `count`
+/// must be the number of set bits among the first `out.len()` bits.
+fn scatter_present(bits: &[u8], out: &mut [i64], count: usize) {
+    let rows = out.len();
+    // Walking front to back, the next value to place sits at or after the
+    // row it goes to, and after every row of the current byte that is
+    // absent, so nothing is overwritten before it is read.
+    let mut src = rows - count;
+    for (byte_idx, &stored) in bits.iter().enumerate() {
+        let base = byte_idx * 8;
+        if src == base {
+            // No absent row is left, so every remaining value is in place.
+            return;
         }
-        Enc::Constant => {
-            let v = get_ivarint(bytes, &mut pos)?;
-            for _ in 0..count {
-                emit(v)?;
-            }
+        let width = (rows - base).min(8);
+        let byte = stored & (0xffu16 >> (8 - width)) as u8;
+        if byte == 0 {
+            out[base..base + width].fill(0);
+            continue;
         }
-        Enc::Rle => {
-            let run_count = get_uvarint(bytes, &mut pos)?;
-            let mut total: u64 = 0;
-            for _ in 0..run_count {
-                let v = get_ivarint(bytes, &mut pos)?;
-                let run = get_uvarint(bytes, &mut pos)?;
-                total = total
-                    .checked_add(run)
-                    .ok_or_else(|| CodecError::Corrupted("rle run overflow".into()))?;
-                if total > count as u64 {
-                    return Err(CodecError::Corrupted("rle exceeds count".into()));
-                }
-                for _ in 0..run {
-                    emit(v)?;
-                }
+        if width == 8 && src + 8 <= rows {
+            // Take the byte's values, and the slots after them, before
+            // writing any of its rows, then give each row the value of its
+            // rank among the present rows.
+            let mut vals = [0i64; 8];
+            vals.copy_from_slice(&out[src..src + 8]);
+            let mut rank = 0usize;
+            for (bit, slot) in out[base..base + 8].iter_mut().enumerate() {
+                let present = (byte >> bit) & 1;
+                *slot = vals[rank] & i64::from(present).wrapping_neg();
+                rank += usize::from(present);
             }
-            if total != count as u64 {
-                return Err(CodecError::Corrupted("rle short of count".into()));
+            src += rank;
+            continue;
+        }
+        for bit in 0..width {
+            if byte & (1 << bit) != 0 {
+                out[base + bit] = out[src];
+                src += 1;
+            } else {
+                out[base + bit] = 0;
             }
-        }
-        Enc::DeltaZigzag => {
-            if count > 0 {
-                let mut acc = get_ivarint(bytes, &mut pos)?;
-                emit(acc)?;
-                for _ in 1..count {
-                    let delta = get_ivarint(bytes, &mut pos)?;
-                    acc = acc
-                        .checked_add(delta)
-                        .ok_or_else(|| CodecError::Corrupted("delta overflow".into()))?;
-                    emit(acc)?;
-                }
-            }
-        }
-        Enc::DoubleDelta => {
-            if count > 0 {
-                let mut value = get_ivarint(bytes, &mut pos)?;
-                emit(value)?;
-                if count > 1 {
-                    let mut prev_delta = get_ivarint(bytes, &mut pos)?;
-                    value = value
-                        .checked_add(prev_delta)
-                        .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
-                    emit(value)?;
-                    for _ in 2..count {
-                        let dod = get_ivarint(bytes, &mut pos)?;
-                        prev_delta = prev_delta
-                            .checked_add(dod)
-                            .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
-                        value = value
-                            .checked_add(prev_delta)
-                            .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
-                        emit(value)?;
-                    }
-                }
-            }
-        }
-        Enc::ForBitpack => {
-            let min = get_ivarint(bytes, &mut pos)?;
-            let bit_width = u32::from(
-                *bytes
-                    .get(pos)
-                    .ok_or_else(|| CodecError::Corrupted("for truncated".into()))?,
-            );
-            pos += 1;
-            unpack_bits_each(&bytes[pos..], count, bit_width, &mut |o| {
-                emit((min as u64).wrapping_add(o) as i64)
-            })?;
-            pos = bytes.len();
-        }
-        other => {
-            return Err(CodecError::Corrupted(format!(
-                "enc {other:?} is not an integer codec"
-            )));
         }
     }
+}
+
+/// Decodes exactly `out.len()` values into `out`, each passed through `map`,
+/// and checks the page was consumed exactly.
+fn decode_dense(
+    enc: Enc,
+    bytes: &[u8],
+    out: &mut [i64],
+    map: &mut impl FnMut(i64) -> Result<i64, CodecError>,
+) -> Result<(), CodecError> {
+    let pos = match enc {
+        Enc::Constant => {
+            let mut pos = 0usize;
+            let v = get_ivarint(bytes, &mut pos)?;
+            if !out.is_empty() {
+                out.fill(map(v)?);
+            }
+            pos
+        }
+        Enc::Rle => {
+            let mut start = 0usize;
+            decode_rle(bytes, out.len(), |v, run| {
+                let m = map(v)?;
+                out[start..start + run].fill(m);
+                start += run;
+                Ok(())
+            })?
+        }
+        Enc::ForBitpack => {
+            let (min, bit_width, payload) = for_header(bytes, out.len())?;
+            unpack_for(payload, bit_width, min, out);
+            map_all(out, map)?;
+            bytes.len()
+        }
+        Enc::Plain | Enc::DeltaZigzag | Enc::DoubleDelta => decode_varints(enc, bytes, out, map)?,
+        other => return Err(not_integer(other)),
+    };
     expect_consumed(pos, bytes.len())
 }
+
+fn map_all(
+    out: &mut [i64],
+    map: &mut impl FnMut(i64) -> Result<i64, CodecError>,
+) -> Result<(), CodecError> {
+    for v in out.iter_mut() {
+        *v = map(*v)?;
+    }
+    Ok(())
+}
+
+/// Reads the runs of an RLE page and hands each non-empty `(value, length)`
+/// to `fill` in order; the lengths sum to `count`. Returns the position after
+/// the last run.
+fn decode_rle(
+    bytes: &[u8],
+    count: usize,
+    mut fill: impl FnMut(i64, usize) -> Result<(), CodecError>,
+) -> Result<usize, CodecError> {
+    let mut pos = 0usize;
+    let run_count = get_uvarint(bytes, &mut pos)?;
+    let mut total: u64 = 0;
+    for _ in 0..run_count {
+        let v = get_ivarint(bytes, &mut pos)?;
+        let run = get_uvarint(bytes, &mut pos)?;
+        total = total
+            .checked_add(run)
+            .ok_or_else(|| CodecError::Corrupted("rle run overflow".into()))?;
+        if total > count as u64 {
+            return Err(CodecError::Corrupted("rle exceeds count".into()));
+        }
+        if run > 0 {
+            // `run <= total <= count`, so it fits in usize.
+            fill(v, run as usize)?;
+        }
+    }
+    if total != count as u64 {
+        return Err(CodecError::Corrupted("rle short of count".into()));
+    }
+    Ok(pos)
+}
+
+/// Reads one zigzag varint, taking the one-byte form inline and leaving
+/// everything else, errors included, to [`get_ivarint`].
+#[inline]
+fn read_ivarint(bytes: &[u8], pos: &mut usize) -> Result<i64, CodecError> {
+    match bytes.get(*pos) {
+        Some(&b) if b < 0x80 => {
+            *pos += 1;
+            Ok(zigzag_decode(u64::from(b)))
+        }
+        _ => get_ivarint(bytes, pos),
+    }
+}
+
+/// Decodes `out.len()` values of a Plain, DeltaZigzag or DoubleDelta page
+/// into `out`, each passed through `map`, and returns the position after the
+/// last one. On a decode error, the values before it are mapped first, so a
+/// rejection by `map` wins as it would value by value.
+fn decode_varints(
+    enc: Enc,
+    bytes: &[u8],
+    out: &mut [i64],
+    map: &mut impl FnMut(i64) -> Result<i64, CodecError>,
+) -> Result<usize, CodecError> {
+    // All three carry one varint per value; the deltas are summed in a second
+    // pass. An overflow in the sums comes before the first unreadable varint,
+    // since only the varints read before it are summed.
+    let mut pos = 0usize;
+    let read = varints_into(bytes, &mut pos, out);
+    let done = match &read {
+        Ok(()) => out.len(),
+        Err((done, _)) => *done,
+    };
+    let summed = match enc {
+        Enc::DeltaZigzag => delta_sums(&mut out[..done]),
+        Enc::DoubleDelta => double_delta_sums(&mut out[..done]),
+        _ => Ok(()),
+    };
+    if let Err((valid, e)) = summed.and(read) {
+        map_all(&mut out[..valid], map)?;
+        return Err(e);
+    }
+    map_all(out, map)?;
+    Ok(pos)
+}
+
+/// The decoders below fill `out` from the front and report a failure as the
+/// number of leading values that are final and the error.
+type Partial = Result<(), (usize, CodecError)>;
+
+const STOP_BITS: u64 = 0x8080_8080_8080_8080;
+
+/// Reads `out.len()` zigzag varints into `out`. Eight bytes are loaded at a
+/// time and every canonical varint that ends inside them is decoded from that
+/// load, found through the bytes without a continuation bit; a varint that
+/// does not fit in one load, a non-canonical one, and the last bytes of the
+/// page go through [`get_ivarint`].
+fn varints_into(bytes: &[u8], pos: &mut usize, out: &mut [i64]) -> Partial {
+    let n = out.len();
+    let mut i = 0usize;
+    while i < n {
+        let Some(Ok(window)) = bytes.get(*pos..*pos + 8).map(<[u8; 8]>::try_from) else {
+            break;
+        };
+        let w = u64::from_le_bytes(window);
+        if w & STOP_BITS == 0 && n - i >= 8 {
+            for (slot, &b) in out[i..i + 8].iter_mut().zip(&window) {
+                *slot = zigzag_decode(u64::from(b));
+            }
+            i += 8;
+            *pos += 8;
+            continue;
+        }
+        let mut stops = !w & STOP_BITS;
+        // Bit offset in the window of the next varint.
+        let mut start = 0u32;
+        while stops != 0 && i < n {
+            let end = stops.trailing_zeros() + 1;
+            let bits = end - start;
+            let x = (w >> start) & (u64::MAX >> (64 - bits));
+            // A zero last byte after the first is non-canonical.
+            if bits > 8 && x >> (bits - 8) == 0 {
+                break;
+            }
+            let v = if bits <= 16 {
+                (x & 0x7f) | ((x >> 1) & 0x3f80)
+            } else {
+                compact_varint(x)
+            };
+            out[i] = zigzag_decode(v);
+            i += 1;
+            start = end;
+            stops &= stops - 1;
+        }
+        *pos += (start / 8) as usize;
+        if start == 0 {
+            out[i] = get_ivarint(bytes, pos).map_err(|e| (i, e))?;
+            i += 1;
+        }
+    }
+    while i < n {
+        out[i] = read_ivarint(bytes, pos).map_err(|e| (i, e))?;
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Joins the 7-bit groups of a varint of up to eight bytes, LSB-first,
+/// pairing neighbours: bytes into 14-bit, then 28-bit, then 56-bit groups.
+#[inline]
+fn compact_varint(x: u64) -> u64 {
+    let x = (x & 0x007f_007f_007f_007f) | ((x & 0x7f00_7f00_7f00_7f00) >> 1);
+    let x = (x & 0x0000_3fff_0000_3fff) | ((x & 0x3fff_0000_3fff_0000) >> 2);
+    (x & 0x0000_0000_0fff_ffff) | ((x & 0x0fff_ffff_0000_0000) >> 4)
+}
+
+/// Turns a first value and its deltas into values, in place.
+fn delta_sums(out: &mut [i64]) -> Partial {
+    for i in 1..out.len() {
+        out[i] = out[i - 1]
+            .checked_add(out[i])
+            .ok_or_else(|| (i, CodecError::Corrupted("delta overflow".into())))?;
+    }
+    Ok(())
+}
+
+/// Turns a first value, a first delta and the deltas of deltas into values,
+/// in place.
+fn double_delta_sums(out: &mut [i64]) -> Partial {
+    let overflow = |i| (i, CodecError::Corrupted("double-delta overflow".into()));
+    if out.len() < 2 {
+        return Ok(());
+    }
+    let mut prev_delta = out[1];
+    let mut value = out[0].checked_add(prev_delta).ok_or_else(|| overflow(1))?;
+    out[1] = value;
+    for (i, slot) in out.iter_mut().enumerate().skip(2) {
+        prev_delta = prev_delta.checked_add(*slot).ok_or_else(|| overflow(i))?;
+        value = value.checked_add(prev_delta).ok_or_else(|| overflow(i))?;
+        *slot = value;
+    }
+    Ok(())
+}
+
+/// Parses and validates a ForBitpack page header for `count` values:
+/// `(min, bit_width, packed payload)`. Every length check happens here, so
+/// [`unpack_for`] cannot fail.
+fn for_header(bytes: &[u8], count: usize) -> Result<(i64, u32, &[u8]), CodecError> {
+    let mut pos = 0usize;
+    let min = get_ivarint(bytes, &mut pos)?;
+    let bit_width = u32::from(
+        *bytes
+            .get(pos)
+            .ok_or_else(|| CodecError::Corrupted("for truncated".into()))?,
+    );
+    pos += 1;
+    let payload = &bytes[pos..];
+    check_packed_len(payload, count, bit_width)?;
+    Ok((min, bit_width, payload))
+}
+
+/// The length checks of [`unpack_bits_each`], in its order and with its
+/// messages.
+fn check_packed_len(buf: &[u8], count: usize, bit_width: u32) -> Result<(), CodecError> {
+    if bit_width > 64 {
+        return Err(CodecError::Corrupted(format!("bit_width {bit_width} > 64")));
+    }
+    if bit_width == 0 {
+        if !buf.is_empty() {
+            return Err(CodecError::Corrupted("bit_width 0 with payload".into()));
+        }
+        return Ok(());
+    }
+    let need_bits = (count as u64)
+        .checked_mul(u64::from(bit_width))
+        .ok_or_else(|| CodecError::Corrupted("packed length overflow".into()))?;
+    let need = need_bits.div_ceil(8);
+    if buf.len() as u64 != need {
+        return Err(CodecError::Corrupted(format!(
+            "packed length {} != {need}",
+            buf.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Unpacks `out.len()` offsets of `bit_width` bits from `buf` (already
+/// length-checked by [`check_packed_len`]) and stores `min + offset` in each
+/// slot, wrapping.
+fn unpack_for(buf: &[u8], bit_width: u32, min: i64, out: &mut [i64]) {
+    let base = min as u64;
+    if bit_width == 0 {
+        out.fill(min);
+        return;
+    }
+    let w = u64::from(bit_width);
+    let mask = if bit_width == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bit_width) - 1
+    };
+    let mut i = 0usize;
+    if bit_width <= 56 {
+        // A value starts at most 7 bits into its first byte, so one
+        // little-endian 8-byte window holds all of it.
+        while i < out.len() {
+            let off = i as u64 * w;
+            let byte = (off / 8) as usize;
+            let Some(Ok(window)) = buf.get(byte..byte + 8).map(<[u8; 8]>::try_from) else {
+                break;
+            };
+            let o = (u64::from_le_bytes(window) >> (off % 8)) & mask;
+            out[i] = base.wrapping_add(o) as i64;
+            i += 1;
+        }
+    }
+    // The last few values, and every value wider than 56 bits, read up to
+    // nine bytes into a u128.
+    for (j, slot) in out.iter_mut().enumerate().skip(i) {
+        let off = j as u64 * w;
+        let byte = (off / 8) as usize;
+        let mut acc: u128 = 0;
+        for (k, &b) in buf[byte..].iter().take(9).enumerate() {
+            acc |= u128::from(b) << (8 * k);
+        }
+        let o = ((acc >> (off % 8)) as u64) & mask;
+        *slot = base.wrapping_add(o) as i64;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bitmap codec (bool columns and presence bitmaps)
 // ---------------------------------------------------------------------------
@@ -942,6 +1224,481 @@ pub fn decode_fixed(
     };
     expect_consumed(pos, bytes.len())?;
     Ok(out)
+}
+
+/// The value-at-a-time integer decode this module shipped before the bulk
+/// decode (issue #3235), kept verbatim as the oracle the bulk decode is
+/// tested against.
+#[cfg(test)]
+mod oracle {
+    use super::*;
+
+    /// Decodes `count` i64 values encoded with `enc`.
+    pub fn decode_i64(enc: Enc, bytes: &[u8], count: usize) -> Result<Vec<i64>, CodecError> {
+        let mut out = Vec::with_capacity(cap(count));
+        decode_i64_each(enc, bytes, count, &mut |v| {
+            out.push(v);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Decodes the present values of an i64 page straight into a block-length
+    /// buffer, in the same pass that reads the varints.
+    ///
+    /// `out` holds one slot per block row. `presence` is the column's LSB-first
+    /// presence bitmap (`None` when every row is present); it must be exactly
+    /// `ceil(out.len() / 8)` bytes. The page carries one value per present row;
+    /// each decoded value passes through `map` and is stored at the next present
+    /// row. Absent rows are written as 0. Returns the number of present rows.
+    pub fn decode_i64_into(
+        enc: Enc,
+        bytes: &[u8],
+        presence: Option<&[u8]>,
+        out: &mut [i64],
+        mut map: impl FnMut(i64) -> Result<i64, CodecError>,
+    ) -> Result<usize, CodecError> {
+        let rows = out.len();
+        let Some(bits) = presence else {
+            let mut row = 0usize;
+            decode_i64_each(enc, bytes, rows, &mut |v| {
+                let slot = out
+                    .get_mut(row)
+                    .ok_or_else(|| CodecError::Corrupted("value page longer than block".into()))?;
+                *slot = map(v)?;
+                row += 1;
+                Ok(())
+            })?;
+            return Ok(rows);
+        };
+        let count = count_present(bits, rows)?;
+        let mut row = 0usize;
+        decode_i64_each(enc, bytes, count, &mut |v| {
+            while row < rows && !bit_is_set(bits, row) {
+                out[row] = 0;
+                row += 1;
+            }
+            let slot = out
+                .get_mut(row)
+                .ok_or_else(|| CodecError::Corrupted("value page longer than presence".into()))?;
+            *slot = map(v)?;
+            row += 1;
+            Ok(())
+        })?;
+        for slot in out.iter_mut().skip(row) {
+            *slot = 0;
+        }
+        Ok(count)
+    }
+
+    fn bit_is_set(bits: &[u8], i: usize) -> bool {
+        bits[i / 8] & (1 << (i % 8)) != 0
+    }
+
+    /// Core of [`decode_i64`]: hands each of the `count` decoded values to `emit`
+    /// in order, then checks the page was consumed exactly.
+    fn decode_i64_each(
+        enc: Enc,
+        bytes: &[u8],
+        count: usize,
+        emit: &mut impl FnMut(i64) -> Result<(), CodecError>,
+    ) -> Result<(), CodecError> {
+        let mut pos = 0usize;
+        match enc {
+            Enc::Plain => {
+                for _ in 0..count {
+                    emit(get_ivarint(bytes, &mut pos)?)?;
+                }
+            }
+            Enc::Constant => {
+                let v = get_ivarint(bytes, &mut pos)?;
+                for _ in 0..count {
+                    emit(v)?;
+                }
+            }
+            Enc::Rle => {
+                let run_count = get_uvarint(bytes, &mut pos)?;
+                let mut total: u64 = 0;
+                for _ in 0..run_count {
+                    let v = get_ivarint(bytes, &mut pos)?;
+                    let run = get_uvarint(bytes, &mut pos)?;
+                    total = total
+                        .checked_add(run)
+                        .ok_or_else(|| CodecError::Corrupted("rle run overflow".into()))?;
+                    if total > count as u64 {
+                        return Err(CodecError::Corrupted("rle exceeds count".into()));
+                    }
+                    for _ in 0..run {
+                        emit(v)?;
+                    }
+                }
+                if total != count as u64 {
+                    return Err(CodecError::Corrupted("rle short of count".into()));
+                }
+            }
+            Enc::DeltaZigzag => {
+                if count > 0 {
+                    let mut acc = get_ivarint(bytes, &mut pos)?;
+                    emit(acc)?;
+                    for _ in 1..count {
+                        let delta = get_ivarint(bytes, &mut pos)?;
+                        acc = acc
+                            .checked_add(delta)
+                            .ok_or_else(|| CodecError::Corrupted("delta overflow".into()))?;
+                        emit(acc)?;
+                    }
+                }
+            }
+            Enc::DoubleDelta => {
+                if count > 0 {
+                    let mut value = get_ivarint(bytes, &mut pos)?;
+                    emit(value)?;
+                    if count > 1 {
+                        let mut prev_delta = get_ivarint(bytes, &mut pos)?;
+                        value = value
+                            .checked_add(prev_delta)
+                            .ok_or_else(|| CodecError::Corrupted("double-delta overflow".into()))?;
+                        emit(value)?;
+                        for _ in 2..count {
+                            let dod = get_ivarint(bytes, &mut pos)?;
+                            prev_delta = prev_delta.checked_add(dod).ok_or_else(|| {
+                                CodecError::Corrupted("double-delta overflow".into())
+                            })?;
+                            value = value.checked_add(prev_delta).ok_or_else(|| {
+                                CodecError::Corrupted("double-delta overflow".into())
+                            })?;
+                            emit(value)?;
+                        }
+                    }
+                }
+            }
+            Enc::ForBitpack => {
+                let min = get_ivarint(bytes, &mut pos)?;
+                let bit_width = u32::from(
+                    *bytes
+                        .get(pos)
+                        .ok_or_else(|| CodecError::Corrupted("for truncated".into()))?,
+                );
+                pos += 1;
+                unpack_bits_each(&bytes[pos..], count, bit_width, &mut |o| {
+                    emit((min as u64).wrapping_add(o) as i64)
+                })?;
+                pos = bytes.len();
+            }
+            other => {
+                return Err(CodecError::Corrupted(format!(
+                    "enc {other:?} is not an integer codec"
+                )));
+            }
+        }
+        expect_consumed(pos, bytes.len())
+    }
+
+    /// [`unpack_bits`], handing each value to `emit` in order instead of
+    /// collecting them, so a caller can store them wherever they belong.
+    fn unpack_bits_each(
+        buf: &[u8],
+        count: usize,
+        bit_width: u32,
+        emit: &mut impl FnMut(u64) -> Result<(), CodecError>,
+    ) -> Result<(), CodecError> {
+        if bit_width > 64 {
+            return Err(CodecError::Corrupted(format!("bit_width {bit_width} > 64")));
+        }
+        if bit_width == 0 {
+            if !buf.is_empty() {
+                return Err(CodecError::Corrupted("bit_width 0 with payload".into()));
+            }
+            for _ in 0..count {
+                emit(0)?;
+            }
+            return Ok(());
+        }
+        let need_bits = (count as u64)
+            .checked_mul(u64::from(bit_width))
+            .ok_or_else(|| CodecError::Corrupted("packed length overflow".into()))?;
+        let need = need_bits.div_ceil(8);
+        if buf.len() as u64 != need {
+            return Err(CodecError::Corrupted(format!(
+                "packed length {} != {need}",
+                buf.len()
+            )));
+        }
+        let mask = if bit_width == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bit_width) - 1
+        };
+        let mut acc: u128 = 0;
+        let mut nbits: u32 = 0;
+        let mut idx = 0usize;
+        for _ in 0..count {
+            while nbits < bit_width {
+                acc |= u128::from(buf[idx]) << nbits;
+                idx += 1;
+                nbits += 8;
+            }
+            emit((acc & u128::from(mask)) as u64)?;
+            acc >>= bit_width;
+            nbits -= bit_width;
+        }
+        Ok(())
+    }
+}
+
+/// The bulk integer decode against the value-at-a-time [`oracle`] it
+/// replaced: the same values on every valid page, and on mutated, truncated
+/// or mislabelled pages the same values or the same error.
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod bulk_decode_oracle {
+    use super::*;
+    use proptest::prelude::*;
+    use proptest::test_runner::TestCaseError;
+
+    fn values() -> impl Strategy<Value = Vec<i64>> {
+        let runs = proptest::collection::vec(
+            (prop_oneof![Just(0i64), -5i64..5, any::<i64>()], 1usize..40),
+            0..20,
+        )
+        .prop_map(|runs| {
+            runs.into_iter()
+                .flat_map(|(v, n)| std::iter::repeat_n(v, n))
+                .collect()
+        });
+        let rising = (any::<i64>(), proptest::collection::vec(-1i64..4, 0..300)).prop_map(
+            |(start, deltas)| {
+                let mut acc = start;
+                deltas
+                    .into_iter()
+                    .map(|d| {
+                        acc = acc.wrapping_add(d);
+                        acc
+                    })
+                    .collect()
+            },
+        );
+        prop_oneof![
+            proptest::collection::vec(any::<i64>(), 0..300),
+            proptest::collection::vec(-100i64..100, 0..300),
+            proptest::collection::vec(0i64..(1 << 40), 0..300),
+            runs,
+            rising,
+            proptest::collection::vec(
+                prop_oneof![Just(i64::MIN), Just(i64::MAX), Just(0i64), Just(-1i64)],
+                0..50
+            ),
+        ]
+    }
+
+    /// One page per integer encoding that can hold `vals`. The Constant page
+    /// carries the first value, so it decodes to `vals` only when they are
+    /// all equal; either way both decoders read the same page.
+    fn pages(vals: &[i64]) -> Vec<(Enc, Vec<u8>)> {
+        let mut out = vec![
+            (Enc::Plain, enc_plain_i64(vals)),
+            (
+                Enc::Constant,
+                enc_constant_i64(vals.first().copied().unwrap_or(0)),
+            ),
+            (Enc::Rle, enc_rle_i64(vals)),
+            (Enc::ForBitpack, enc_for_i64(vals)),
+        ];
+        if let Some(b) = enc_delta_i64(vals) {
+            out.push((Enc::DeltaZigzag, b));
+        }
+        if let Some(b) = enc_double_delta_i64(vals) {
+            out.push((Enc::DoubleDelta, b));
+        }
+        out
+    }
+
+    /// A pure map that rejects some values, naming the one it rejected, so
+    /// the comparison also pins which value is rejected first.
+    fn picky(v: i64) -> Result<i64, CodecError> {
+        if v.rem_euclid(5) == 2 {
+            Err(CodecError::Corrupted(format!("rejected {v}")))
+        } else {
+            Ok(v.wrapping_mul(3))
+        }
+    }
+
+    fn same<T: PartialEq + std::fmt::Debug>(
+        what: &str,
+        new: Result<T, CodecError>,
+        old: Result<T, CodecError>,
+    ) -> Result<(), TestCaseError> {
+        match (new, old) {
+            (Ok(a), Ok(b)) => prop_assert_eq!(a, b, "{}", what),
+            (Err(a), Err(b)) => prop_assert_eq!(a.to_string(), b.to_string(), "{}", what),
+            (a, b) => prop_assert!(false, "{}: bulk {:?}, oracle {:?}", what, a, b),
+        }
+        Ok(())
+    }
+
+    /// Runs `decode_i64` and `decode_i64_into` (identity map and [`picky`])
+    /// through both implementations and requires identical results. Slots
+    /// start as junk so a row either decoder leaves unwritten shows up.
+    fn check(
+        enc: Enc,
+        bytes: &[u8],
+        count: usize,
+        presence: Option<(&[u8], usize)>,
+    ) -> Result<(), TestCaseError> {
+        same(
+            "decode_i64",
+            decode_i64(enc, bytes, count),
+            oracle::decode_i64(enc, bytes, count),
+        )?;
+        let (bits, rows) = match presence {
+            Some((bits, rows)) => (Some(bits), rows),
+            None => (None, count),
+        };
+        for picky_map in [false, true] {
+            let mut a = vec![0x5a5a_5a5a_i64; rows];
+            let mut b = a.clone();
+            let (ra, rb) = if picky_map {
+                (
+                    decode_i64_into(enc, bytes, bits, &mut a, picky),
+                    oracle::decode_i64_into(enc, bytes, bits, &mut b, picky),
+                )
+            } else {
+                (
+                    decode_i64_into(enc, bytes, bits, &mut a, Ok),
+                    oracle::decode_i64_into(enc, bytes, bits, &mut b, Ok),
+                )
+            };
+            let ok = ra.is_ok() && rb.is_ok();
+            same("decode_i64_into", ra, rb)?;
+            if ok {
+                prop_assert_eq!(a, b, "decode_i64_into slots, picky {}", picky_map);
+            }
+        }
+        Ok(())
+    }
+
+    /// `count` present rows spread over `count + absent` rows, laid out by
+    /// `layout`, with junk in the bitmap's padding bits.
+    fn presence(count: usize, absent: usize, layout: &[bool], pad: u8) -> (Vec<u8>, usize) {
+        let rows = count + absent;
+        let mut bits = vec![0u8; rows.div_ceil(8)];
+        let (mut present_left, mut absent_left) = (count, absent);
+        for row in 0..rows {
+            let take =
+                absent_left == 0 || (present_left > 0 && layout.get(row).copied().unwrap_or(true));
+            if take {
+                bits[row / 8] |= 1 << (row % 8);
+                present_left -= 1;
+            } else {
+                absent_left -= 1;
+            }
+        }
+        if !rows.is_multiple_of(8) {
+            bits[rows / 8] |= pad << (rows % 8);
+        }
+        (bits, rows)
+    }
+
+    #[derive(Debug, Clone)]
+    enum Mutation {
+        FlipBit { at: usize, bit: u8 },
+        SetByte { at: usize, value: u8 },
+        Overwrite { at: usize, bytes: Vec<u8> },
+        Truncate { len: usize },
+        Append { bytes: Vec<u8> },
+    }
+
+    fn mutation() -> impl Strategy<Value = Mutation> {
+        prop_oneof![
+            (any::<usize>(), 0u8..8).prop_map(|(at, bit)| Mutation::FlipBit { at, bit }),
+            (any::<usize>(), any::<u8>()).prop_map(|(at, value)| Mutation::SetByte { at, value }),
+            (
+                any::<usize>(),
+                proptest::collection::vec(any::<u8>(), 1..=4)
+            )
+                .prop_map(|(at, bytes)| Mutation::Overwrite { at, bytes }),
+            any::<usize>().prop_map(|len| Mutation::Truncate { len }),
+            proptest::collection::vec(any::<u8>(), 1..=3)
+                .prop_map(|bytes| Mutation::Append { bytes }),
+        ]
+    }
+
+    fn mutate(page: &[u8], m: &Mutation) -> Vec<u8> {
+        let mut out = page.to_vec();
+        if let Mutation::Append { bytes } = m {
+            out.extend_from_slice(bytes);
+            return out;
+        }
+        if out.is_empty() {
+            return out;
+        }
+        let n = out.len();
+        match m {
+            Mutation::FlipBit { at, bit } => out[at % n] ^= 1 << bit,
+            Mutation::SetByte { at, value } => out[at % n] = *value,
+            Mutation::Overwrite { at, bytes } => {
+                let start = at % n;
+                for (slot, b) in out[start..].iter_mut().zip(bytes) {
+                    *slot = *b;
+                }
+            }
+            Mutation::Truncate { len } => out.truncate(len % n),
+            Mutation::Append { .. } => {}
+        }
+        out
+    }
+
+    proptest! {
+        #[test]
+        fn bulk_matches_oracle_on_valid_pages(
+            vals in values(),
+            absent in 0usize..40,
+            layout in proptest::collection::vec(any::<bool>(), 0..400),
+            pad in any::<u8>(),
+        ) {
+            let (bits, rows) = presence(vals.len(), absent, &layout, pad);
+            for (enc, bytes) in pages(&vals) {
+                if enc != Enc::Constant || vals.iter().all(|&v| Some(&v) == vals.first()) {
+                    prop_assert_eq!(&decode_i64(enc, &bytes, vals.len()).expect("valid page"), &vals);
+                }
+                check(enc, &bytes, vals.len(), None)?;
+                check(enc, &bytes, vals.len(), Some((&bits, rows)))?;
+            }
+        }
+
+        #[test]
+        fn bulk_matches_oracle_on_corrupt_pages(
+            vals in values(),
+            m in mutation(),
+            absent in 0usize..40,
+            layout in proptest::collection::vec(any::<bool>(), 0..400),
+            relabel in proptest::option::of(1u8..=13),
+            count_shift in -3i64..=3,
+        ) {
+            let (bits, rows) = presence(vals.len(), absent, &layout, 0);
+            for (enc, page) in pages(&vals) {
+                let bytes = mutate(&page, &m);
+                let enc = relabel.map_or(Ok(enc), Enc::from_u8).expect("tag in range");
+                let count = vals.len().saturating_add_signed(count_shift as isize);
+                check(enc, &bytes, count, None)?;
+                check(enc, &bytes, vals.len(), Some((&bits, rows)))?;
+            }
+        }
+
+        #[test]
+        fn bulk_matches_oracle_on_arbitrary_bytes(
+            tag in 1u8..=13,
+            bytes in proptest::collection::vec(any::<u8>(), 0..256),
+            count in 0usize..400,
+            absent in 0usize..40,
+            layout in proptest::collection::vec(any::<bool>(), 0..440),
+        ) {
+            let enc = Enc::from_u8(tag).expect("tag in range");
+            let (bits, rows) = presence(count, absent, &layout, 0);
+            check(enc, &bytes, count, None)?;
+            check(enc, &bytes, count, Some((&bits, rows)))?;
+        }
+    }
 }
 
 #[cfg(test)]
