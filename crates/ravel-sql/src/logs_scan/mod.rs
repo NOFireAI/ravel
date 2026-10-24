@@ -686,8 +686,12 @@ fn content_columns(pred: &Predicate, fixed: &mut BTreeSet<usize>, attrs: &mut BT
         }
         // `NumRange` is prune-only (ADR-0095 decision 6): it never reaches the
         // exact content channel, so it reads no columns, same as ts/stream. The
-        // planner-side pushdown that would emit it is #278's job.
-        Predicate::TsRange { .. } | Predicate::StreamIn(_) | Predicate::NumRange { .. } => {}
+        // planner-side pushdown that would emit it is #278's job. `NumNotEq` is
+        // prune-only on the same terms.
+        Predicate::TsRange { .. }
+        | Predicate::StreamIn(_)
+        | Predicate::NumRange { .. }
+        | Predicate::NumNotEq { .. } => {}
         Predicate::HasWord { field, .. } | Predicate::Equals { field, .. } => match field {
             FieldSel::Body => {
                 fixed.insert(LOG_COL_BODY);
