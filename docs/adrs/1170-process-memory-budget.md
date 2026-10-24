@@ -1521,9 +1521,14 @@ layout multiplier 5.0). The `WITH_ENVELOPE` constant is removed;
 `AggregateReserveAhead::OFF` still forwards every consumer one to one with
 no envelope.
 
-`install_aggregate_profile` in `crates/ravel-sql/src/executor.rs` calls
+`AggregateProfileRule` in `crates/ravel-sql/src/memory.rs` calls
 `plan_aggregate_profile` on the physical plan and sets the result on the
-query's `TenantDelegatingPool` before the plan executes. A profile is either
+query's `TenantDelegatingPool`. It is the last physical optimizer rule of
+every session `build_session_with_tables` builds, so it reads the plan that
+runs, and every path that plans through such a session gets a profile
+before execution: the SQL and Flight SQL executor, EXPLAIN ANALYZE, and the
+ES|QL `FROM` and `ROW` paths, the last of which collects a `DataFrame`
+without going through the executor. A profile is either
 a layout, `(entry_size, W, w_max)`, or Unknown. `entry_size` is the group
 table's bytes per bucket: 16 for primitive and multi-column keys, 32 for a
 single string-view key. `W` is the per-group bytes of every structure that
@@ -1535,7 +1540,9 @@ recognise is Unknown.
 
 Each grow is matched against its own size, within 3%, to a table step
 `7/8 x 2^k x entry_size` or a `Vec` step `2^k x W`; the pool keeps the
-last of each, `J_t` and `J_v`. A building stream's envelope, at asked size
+largest of each, `J_t` and `J_v`. The groups only grow while a stream
+builds, so a per-batch grow that lands on a low rung is not its next step
+and does not lower the envelope. A building stream's envelope, at asked size
 `S`, is `2.43 x S` while `S` is under 8 MiB, else
 `min(2.43 x S, max(m_t x J_t, 2.1 x J_v x (1 + w_max / W)))`, with `m_t`
 5.0 for 16-byte entries and 4.9 for 32-byte ones. The table term covers a
@@ -1550,12 +1557,17 @@ The unit tests in `crates/ravel-sql/src/memory.rs` pin the arithmetic:
 `an_unknown_profile_falls_back_to_five_times_the_largest_step`,
 `a_delta_that_matches_both_ladders_takes_the_larger_multiplier`,
 `a_delta_off_both_ladders_by_more_than_three_percent_is_not_a_step`,
+`a_low_rung_grow_does_not_shrink_the_envelope`,
 `the_default_charges_the_factor_and_carries_the_envelope` and
 `a_reserve_ahead_with_no_envelope_terms_charges_the_factor_alone`; the tests
 listed in the reserve-ahead amendment now run under the default.
 `the_aggregate_profile_of_the_six_measured_statements` in
 `crates/ravel-sql/src/executor.rs` pins the profile derived from six
-ClickBench statements' plans. The ignored matrix in
+ClickBench statements' plans, and
+`the_esql_path_installs_the_aggregate_profile` and
+`the_esql_row_path_installs_the_aggregate_profile` there pin that both
+ES|QL paths set it. `the_aggregate_profile_rule_is_the_last_physical_optimizer_rule`
+in `crates/ravel-sql/src/session.rs` pins the rule's place. The ignored matrix in
 `crates/ravel-sql/tests/group_by_reservation_lag.rs` sets the derived
 profile the same way and samples every row at 1 ms.
 

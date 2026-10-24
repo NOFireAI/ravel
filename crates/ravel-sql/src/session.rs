@@ -2169,6 +2169,17 @@ mod tests {
         assert!(registry.get_store(&s3).is_err());
     }
 
+    #[test]
+    fn the_aggregate_profile_rule_is_the_last_physical_optimizer_rule() {
+        let ctx = samples_and_logs();
+        let state = ctx.state();
+        let last = state
+            .physical_optimizers()
+            .last()
+            .expect("the session has physical optimizer rules");
+        assert_eq!(last.name(), crate::memory::AGGREGATE_PROFILE_RULE);
+    }
+
     fn session_with(tables: Vec<SessionTable>) -> SessionContext {
         build_session_with_tables(
             &SqlConfig::default(),
