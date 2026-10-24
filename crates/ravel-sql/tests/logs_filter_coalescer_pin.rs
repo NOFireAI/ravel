@@ -39,8 +39,8 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::filter::FilterExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
-    ReplaceChildrenOptions, SendableRecordBatchStream, displayable,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties,
+    PlanProperties, ReplaceChildrenOptions, SendableRecordBatchStream, displayable,
 };
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
@@ -56,8 +56,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_object_store::{ObjectStoreBackend, PutOptions};
 use ravel_query::{EngineConfig, LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
-    DeclaredColumn, DeclaredType, LogsTableProvider, SessionPrincipal, SessionTable,
-    SpillDecision, SqlConfig, build_session,
+    DeclaredColumn, DeclaredType, LogsTableProvider, SessionPrincipal, SessionTable, SpillDecision,
+    SqlConfig, build_session,
 };
 use ravel_types::logstream::log_stream_id;
 use ravel_types::{TenantHash, TenantId};
@@ -221,10 +221,11 @@ async fn fixture(blocks: usize, per_block: usize) -> Fixture {
         "[fixture N={blocks} matches/block={per_block}] object {} bytes, URL page encodings: {} pages, {:?}",
         obj.len(),
         encs.len(),
-        encs.iter().fold(BTreeMap::<String, usize>::new(), |mut m, e| {
-            *m.entry(format!("{e:?}")).or_default() += 1;
-            m
-        }),
+        encs.iter()
+            .fold(BTreeMap::<String, usize>::new(), |mut m, e| {
+                *m.entry(format!("{e:?}")).or_default() += 1;
+                m
+            }),
     );
     assert_eq!(
         encs,
@@ -372,10 +373,7 @@ fn values_arrays(column: &dyn Array) -> Vec<(usize, usize)> {
         DataType::Dictionary(_, _) => {
             let values = column.as_any_dictionary().values();
             let data = values.to_data();
-            let ptr = data
-                .buffers()
-                .last()
-                .map_or(0, |b| b.as_ptr() as usize);
+            let ptr = data.buffers().last().map_or(0, |b| b.as_ptr() as usize);
             vec![(ptr, values.get_array_memory_size())]
         }
         _ => Vec::new(),
@@ -542,9 +540,7 @@ async fn p3_flushed_batches_hold_at_most_128_blocks() {
     let max_of = |n: usize| largest.iter().find(|(k, _)| *k == n).map(|(_, b)| *b);
     let (b128, b256) = (max_of(128).unwrap(), max_of(256).unwrap());
     assert!(
-        largest
-            .iter()
-            .all(|(_, b)| *b <= bound + bound / 10),
+        largest.iter().all(|(_, b)| *b <= bound + bound / 10),
         "prediction 3 missed: a batch above {flush_blocks} blocks' values: {largest:?}"
     );
     assert!(
@@ -645,9 +641,15 @@ impl ExecutionPlan for Probe {
 #[tokio::test]
 async fn p5_report_heap_held_before_the_coalescer_flushes() {
     let _serial = SERIAL.lock().await;
-    for (sql, label) in [(SELECT_URL, "SELECT URL"), (COUNT_URL, "COUNT(*)")] {
-        for n in [8, 64, 256] {
-            let fx = fixture(n, 1).await;
+    let cases = [
+        (SELECT_URL, "SELECT URL", 1, [8, 64, 256]),
+        (COUNT_URL, "COUNT(*)", 1, [8, 64, 256]),
+        (SELECT_URL, "SELECT URL, 64/block", 64, [64, 128, 256]),
+    ];
+    for (sql, label, matches, ns) in cases {
+        for n in ns {
+            let fx = fixture(n, matches).await;
+            scan_alone_heap(&fx, sql, label).await;
             let pool = Arc::new(UnboundedMemoryPool::default());
             let (ctx, _, filter) = plan(&fx, &pool, sql).await;
             let samples = Arc::new(Mutex::new(Vec::new()));
@@ -681,6 +683,7 @@ async fn p5_report_heap_held_before_the_coalescer_flushes() {
                 0
             };
             let max_reserved = samples.iter().map(|(r, _)| *r).max().unwrap_or(0);
+            let peak = unaccounted.iter().max().copied().unwrap_or(0) - first;
             println!(
                 "[p5 {label} N={n}] input batches {}, output batches {}, max pool reading {max_reserved}",
                 samples.len(),
@@ -692,7 +695,37 @@ async fn p5_report_heap_held_before_the_coalescer_flushes() {
                 block_values_bytes(),
                 at_end - samples.last().map_or(0, |(_, l)| *l)
             );
+            println!(
+                "  peak live heap less pool over the first input batch: {peak} bytes, {:.2} blocks' values arrays",
+                peak as f64 / block_values_bytes() as f64
+            );
             drop(held);
         }
     }
+}
+
+/// The live heap growth of the `FilterExec`'s input executed alone, each batch
+/// dropped on arrival: what the scan itself keeps per block.
+async fn scan_alone_heap(fx: &Fixture, sql: &str, label: &str) {
+    let pool = Arc::new(UnboundedMemoryPool::default());
+    let (ctx, _, filter) = plan(fx, &pool, sql).await;
+    let input = Arc::clone(filter.children()[0]);
+    let mut stream = input.execute(0, ctx.task_ctx()).expect("execute input");
+    let mut unaccounted = Vec::new();
+    while let Some(batch) = stream.next().await {
+        drop(batch.expect("input batch"));
+        unaccounted.push(live_heap() - pool.reserved() as isize);
+    }
+    let first = unaccounted.first().copied().unwrap_or(0);
+    let last = unaccounted.last().copied().unwrap_or(0);
+    let per_block = if unaccounted.len() > 1 {
+        (last - first) / (unaccounted.len() as isize - 1)
+    } else {
+        0
+    };
+    println!(
+        "[p5 scan alone under {label} N={}] live heap less pool, last batch over first: {} bytes, {per_block} per block",
+        fx.blocks,
+        last - first
+    );
 }
