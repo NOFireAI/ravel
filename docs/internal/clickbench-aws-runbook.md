@@ -772,7 +772,10 @@ judge ADR-1170's memory gap on arm B, from the `/metrics` scrapes in
 bands). For each gated ok scrape the gap is `allocated - cache fetch - cache
 catalog - reserved sql - reserved fetch + handoff overlap`, all `mode="all"`
 series, with `ravel_process_allocator_bytes{stat="allocated"}` rather than
-the ADR's `stat="resident"`. One `B` row per concurrent round and one pooled
+the ADR's `stat="resident"`. Each cache term is the family's untiered
+series, else its `tier="ram"` series (an arm given `--cache-dir`), else 0
+when only its `tier="disk"` series is present, since disk-tier bytes are not
+heap. One `B` row per concurrent round and one pooled
 row give the share of gated ok scrapes above `adr1170_gap_max_bytes`, judged
 against `adr1170_gap_share_above_max`, with the scrape count, the max gap and
 the scrapes skipped in the note, each kind counted: unanswered, ungated (taken
@@ -780,7 +783,8 @@ with the gate down, outside the timed window, such as the scrapes of a
 just-started server before the round opens) and bad (answered with a non-200
 or a transport error). Arm A's figures print on
 `adr1170 gap A ... (context, not judged)` lines and never change the exit
-code. On arm B, an ok scrape missing any of the six gauges, or a round with no
+code. On arm B, an ok scrape missing any of the six gauges (a cache family
+with no series in any tier), or a round with no
 gated ok scrape, exits 2 naming the round, the line and the series;
 a run whose arm B ran no concurrent phase, or whose `healthz_phases` leaves
 `concurrent` out, prints the band INCONCLUSIVE. Like the healthz keys, both
