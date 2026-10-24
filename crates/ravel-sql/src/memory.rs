@@ -54,19 +54,33 @@
 //!   `undercount_factor` times the bytes asked, on the query, tenant and
 //!   process ledgers alike.
 //! - While the consumer builds (until its first shrink), it carries an
-//!   envelope for the next doubling it can make: `envelope_size_factor x S`
+//!   envelope for the next step it can make: `envelope_size_factor x S`
 //!   while its asked size `S` is under 8 MiB, else the smaller of that and
-//!   `envelope_multiplier x J_max`, where `J_max` is its largest single grow.
-//!   Only the `W` largest envelopes in the process are reserved, on the
-//!   process [`MemoryBudget`] alone, where `W` is the number of aggregate
-//!   streams that can run `aggregate_batch` at once. A grow whose envelope
-//!   change the budget refuses is itself refused before anything is charged.
+//!   its next step. Only the `W` largest envelopes in the process are
+//!   reserved, on the process [`MemoryBudget`] alone, where `W` is the
+//!   number of aggregate streams that can run `aggregate_batch` at once. A
+//!   grow whose envelope change the budget refuses is itself refused before
+//!   anything is charged.
 //!
-//! [`AggregateReserveAhead::DEFAULT`] charges the factor and reserves no
-//! envelope: both envelope terms are 0 until the envelope is sized from each
-//! stream's layout (#3181). [`AggregateReserveAhead::WITH_ENVELOPE`] turns it
-//! on, and [`AggregateReserveAhead::OFF`] restores one-to-one charging and no
-//! envelope.
+//! The next step comes from the query's [`AggregateProfile`], which the
+//! executor derives from the plan ([`plan_aggregate_profile`]) and sets on
+//! the pool before the plan executes. A known [`AggregateLayout`] gives each
+//! stream two ladders of predicted grows: group-table steps of
+//! `7/8 x 2^k x entry_size` and `Vec` steps of `2^k x W`, `W` the per-group
+//! bytes of every `Vec` that grows with the group count. Each grow is
+//! matched on its own size to the nearest predicted step of each ladder: one
+//! within 3% becomes the last table step `J_t` or the last `Vec` step `J_v`
+//! (both, when it matches both), and one off both is per-batch growth that
+//! moves neither. The next step is then the larger of
+//! `table_multiplier x J_t` (5.0 for 16-byte entries, 4.9 for 32-byte
+//! entries) and `vec_multiplier x J_v x (1 + w_max / W)` (2.1), `w_max` the
+//! widest `Vec`'s per-group bytes. Under [`AggregateProfile::Unknown`], with
+//! no profile, or before the stream has shown a step of either ladder, it is
+//! `unknown_layout_multiplier x J_max` (5.0), `J_max` its largest grow.
+//!
+//! [`AggregateReserveAhead::DEFAULT`] charges the factor and carries the
+//! envelope; [`AggregateReserveAhead::OFF`] restores one-to-one charging and
+//! no envelope.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -74,10 +88,14 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
+use datafusion::arrow::datatypes::DataType;
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::memory_pool::{
     MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
+use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::aggregates::AggregateExec;
 use ravel_memory::{ExhaustionCause, MemoryBudget, MemoryExhausted};
 use ravel_types::accounting::QueryAccounting;
 
@@ -390,57 +408,80 @@ pub const PARTIAL_HASH_AGGREGATE_CONSUMER_PREFIX: &str = "PartialHashAggregateSt
 /// too few to have shown the largest one.
 const ENVELOPE_STEP_BOUND_FROM: usize = 8 << 20;
 
+/// How far a grow may sit from a predicted table or `Vec` step and still be
+/// classified as that step, as a fraction of the step.
+const STEP_TOLERANCE: f64 = 0.03;
+
 /// How far ahead of what they ask for the migrated hash aggregate streams are
 /// charged (issue #3181). See the module documentation for the two parts.
 ///
-/// [`Self::OFF`] (`1.0`, `0`, `0`) charges every consumer one to one and
-/// reserves no envelope.
+/// [`Self::OFF`] (`1.0` and every envelope term `0`) charges every consumer
+/// one to one and reserves no envelope.
 #[derive(Debug, Clone, Copy)]
 pub struct AggregateReserveAhead {
     /// Multiplier on every grow and shrink a migrated aggregate asks for,
     /// applied on the query, tenant and process ledgers.
     pub undercount_factor: f64,
-    /// Multiplier on a building consumer's largest single grow, once it has
-    /// asked for 8 MiB or more.
-    pub envelope_multiplier: f64,
+    /// Multiplier on the last group-table step of a stream whose table has
+    /// 16-byte entries: its next table step, once it has asked for 8 MiB.
+    pub table_multiplier_16_byte_entries: f64,
+    /// The same for a stream whose table has 32-byte entries.
+    pub table_multiplier_32_byte_entries: f64,
+    /// Multiplier on the last `Vec` step, before the `1 + w_max / W` term for
+    /// the widest `Vec` moving last: its next `Vec` step.
+    pub vec_multiplier: f64,
     /// Multiplier on a building consumer's asked size: its envelope while it
     /// is under 8 MiB, and the cap on its envelope after.
     pub envelope_size_factor: f64,
+    /// Multiplier on the largest single grow of a stream whose layout is
+    /// [`AggregateProfile::Unknown`], or that has no profile, or that has
+    /// shown no table or `Vec` step yet.
+    pub unknown_layout_multiplier: f64,
 }
 
 impl AggregateReserveAhead {
     /// One-to-one charging and no envelope.
     pub const OFF: AggregateReserveAhead = AggregateReserveAhead {
         undercount_factor: 1.0,
-        envelope_multiplier: 0.0,
+        table_multiplier_16_byte_entries: 0.0,
+        table_multiplier_32_byte_entries: 0.0,
+        vec_multiplier: 0.0,
         envelope_size_factor: 0.0,
+        unknown_layout_multiplier: 0.0,
     };
 
-    /// The default: a 1.25 undercount factor and no envelope. Both envelope
-    /// terms are 0, so [`Self::envelope`] is 0 at every size.
+    /// The default: a 1.25 undercount factor and the envelope sized from the
+    /// stream's layout, capped at 2.43 times its asked size.
     pub const DEFAULT: AggregateReserveAhead = AggregateReserveAhead {
         undercount_factor: 1.25,
-        envelope_multiplier: 0.0,
-        envelope_size_factor: 0.0,
-    };
-
-    /// The default's factor with the designed envelope: five times the
-    /// largest step, capped at 2.43 times the asked size. Off by default
-    /// until the envelope is sized from each stream's layout (#3181).
-    pub const WITH_ENVELOPE: AggregateReserveAhead = AggregateReserveAhead {
-        undercount_factor: 1.25,
-        envelope_multiplier: 5.0,
+        table_multiplier_16_byte_entries: 5.0,
+        table_multiplier_32_byte_entries: 4.9,
+        vec_multiplier: 2.1,
         envelope_size_factor: 2.43,
+        unknown_layout_multiplier: 5.0,
     };
 
-    /// Every value finite, the factor at least 1 and both multipliers at
+    fn values(&self) -> [(&'static str, f64); 6] {
+        [
+            ("undercount_factor", self.undercount_factor),
+            (
+                "table_multiplier_16_byte_entries",
+                self.table_multiplier_16_byte_entries,
+            ),
+            (
+                "table_multiplier_32_byte_entries",
+                self.table_multiplier_32_byte_entries,
+            ),
+            ("vec_multiplier", self.vec_multiplier),
+            ("envelope_size_factor", self.envelope_size_factor),
+            ("unknown_layout_multiplier", self.unknown_layout_multiplier),
+        ]
+    }
+
+    /// Every value finite, the factor at least 1 and every multiplier at
     /// least 0.
     pub fn validate(&self) -> Result<(), AggregateReserveAheadError> {
-        let values = [
-            ("undercount_factor", self.undercount_factor),
-            ("envelope_multiplier", self.envelope_multiplier),
-            ("envelope_size_factor", self.envelope_size_factor),
-        ];
+        let values = self.values();
         if let Some((name, value)) = values.iter().find(|(_, value)| !value.is_finite()) {
             return Err(AggregateReserveAheadError::NotFinite {
                 name,
@@ -471,15 +512,33 @@ impl AggregateReserveAhead {
         }
     }
 
-    /// The envelope of a building consumer that has asked for `size` bytes in
-    /// steps no larger than `largest_step`.
-    fn envelope(&self, size: usize, largest_step: usize) -> usize {
-        let by_size = scale(size, self.envelope_size_factor);
-        if size < ENVELOPE_STEP_BOUND_FROM {
-            by_size
-        } else {
-            scale(largest_step, self.envelope_multiplier).min(by_size)
+    /// The envelope of a building consumer in state `state`, whose layout is
+    /// `profile`.
+    fn envelope(&self, state: &AggregateState, profile: Option<AggregateProfile>) -> usize {
+        let by_size = scale(state.asked, self.envelope_size_factor);
+        if state.asked < ENVELOPE_STEP_BOUND_FROM {
+            return by_size;
         }
+        let next = match profile {
+            Some(AggregateProfile::Layout(layout))
+                if state.table_step > 0 || state.vec_step > 0 =>
+            {
+                let table_multiplier = if layout.entry_size >= 32 {
+                    self.table_multiplier_32_byte_entries
+                } else {
+                    self.table_multiplier_16_byte_entries
+                };
+                let next_table = scale(state.table_step, table_multiplier);
+                let next_vec = scale(
+                    state.vec_step,
+                    self.vec_multiplier * (layout.vec_width_total + layout.vec_width_max) as f64
+                        / layout.vec_width_total as f64,
+                );
+                next_table.max(next_vec)
+            }
+            _ => scale(state.largest_step, self.unknown_layout_multiplier),
+        };
+        next.min(by_size)
     }
 }
 
@@ -491,13 +550,196 @@ impl Default for AggregateReserveAhead {
 
 impl PartialEq for AggregateReserveAhead {
     fn eq(&self, other: &Self) -> bool {
-        self.undercount_factor.to_bits() == other.undercount_factor.to_bits()
-            && self.envelope_multiplier.to_bits() == other.envelope_multiplier.to_bits()
-            && self.envelope_size_factor.to_bits() == other.envelope_size_factor.to_bits()
+        self.values()
+            .iter()
+            .zip(other.values().iter())
+            .all(|((_, a), (_, b))| a.to_bits() == b.to_bits())
     }
 }
 
 impl Eq for AggregateReserveAhead {}
+
+/// The memory layout of a query's migrated hash aggregates, derived from its
+/// physical plan by [`plan_aggregate_profile`] and set on the query's pool with
+/// [`TenantDelegatingPool::set_aggregate_profile`] before it executes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateProfile {
+    /// Every grouped aggregate's group values and accumulators were
+    /// classified; the layout the envelope is sized from.
+    Layout(AggregateLayout),
+    /// Some grouped aggregate's layout is not one this module knows how the
+    /// streams grow; its envelope falls back to
+    /// [`AggregateReserveAhead::unknown_layout_multiplier`].
+    Unknown,
+}
+
+/// What one grouped aggregate's state grows by, per group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateLayout {
+    /// Bytes per group-table entry: 16 for DataFusion's primitive and
+    /// multi-column group values, 32 for its single string-view key map.
+    pub entry_size: usize,
+    /// Bytes per group summed over every `Vec` that grows with the group
+    /// count: the group values' own `Vec`s and every accumulator's.
+    pub vec_width_total: usize,
+    /// Bytes per group of the widest of those `Vec`s.
+    pub vec_width_max: usize,
+}
+
+impl AggregateLayout {
+    /// The bytes a table step of `2^k` buckets asks for: seven eighths of
+    /// the buckets, times the entry size.
+    fn table_step(&self, k: i32) -> f64 {
+        0.875 * 2f64.powi(k) * self.entry_size as f64
+    }
+
+    /// The bytes a `Vec` step to `2^k` groups asks for.
+    fn vec_step(&self, k: i32) -> f64 {
+        2f64.powi(k) * self.vec_width_total as f64
+    }
+}
+
+/// The aggregate layout of `plan`: the [`AggregateLayout`] of its grouped
+/// `AggregateExec` nodes, [`AggregateProfile::Unknown`] when any of them is
+/// unclassified, and `None` when it has none. Of several known layouts the
+/// one whose widest `Vec` is the largest share of its total wins, since its
+/// next `Vec` step is the largest multiple of the last one; a tie keeps the
+/// earlier node.
+pub fn plan_aggregate_profile(plan: &Arc<dyn ExecutionPlan>) -> Option<AggregateProfile> {
+    let mut profile = None;
+    collect_aggregate_profile(plan, &mut profile);
+    profile
+}
+
+fn collect_aggregate_profile(
+    plan: &Arc<dyn ExecutionPlan>,
+    profile: &mut Option<AggregateProfile>,
+) {
+    if let Some(aggregate) = plan.downcast_ref::<AggregateExec>()
+        && !aggregate.group_expr().expr().is_empty()
+    {
+        let next = match aggregate_layout(aggregate) {
+            Some(layout) => AggregateProfile::Layout(layout),
+            None => AggregateProfile::Unknown,
+        };
+        *profile = Some(match (*profile, next) {
+            (None, next) => next,
+            (Some(AggregateProfile::Unknown), _) | (_, AggregateProfile::Unknown) => {
+                AggregateProfile::Unknown
+            }
+            (Some(AggregateProfile::Layout(held)), AggregateProfile::Layout(layout)) => {
+                // w_max / W compared by cross-multiplication.
+                if layout.vec_width_max * held.vec_width_total
+                    > held.vec_width_max * layout.vec_width_total
+                {
+                    AggregateProfile::Layout(layout)
+                } else {
+                    AggregateProfile::Layout(held)
+                }
+            }
+        });
+    }
+    for child in plan.children() {
+        collect_aggregate_profile(child, profile);
+    }
+}
+
+/// The layout of one grouped `AggregateExec`, following DataFusion 55.2's
+/// `new_group_values` and the accumulators Ravel's session runs. `None` for
+/// anything this does not classify.
+fn aggregate_layout(aggregate: &AggregateExec) -> Option<AggregateLayout> {
+    let group_by = aggregate.group_expr();
+    if !group_by.is_single() {
+        return None;
+    }
+    let schema = aggregate.schema();
+    let keys = group_by.expr().len();
+    if schema.fields().len() < keys {
+        return None;
+    }
+    let key_types: Vec<&DataType> = schema.fields()[..keys]
+        .iter()
+        .map(|field| field.data_type())
+        .collect();
+    let (entry_size, mut widths) = match key_types.as_slice() {
+        // `GroupValuesPrimitive`: a `(usize, u64)` map and one values `Vec`.
+        [key] if key.primitive_width().is_some() => (16, vec![key.primitive_width()?]),
+        // `GroupValuesBytesView`: `ArrowBytesViewMap`'s 32-byte entries and
+        // its 16-byte views `Vec`.
+        [DataType::Utf8View | DataType::BinaryView] => (32, vec![16]),
+        [_] => return None,
+        // `GroupValuesColumn`: a `(u64, GroupIndexView)` map and one `Vec`
+        // per column.
+        _ => (
+            16,
+            key_types
+                .iter()
+                .map(|key| match key {
+                    DataType::Utf8View | DataType::BinaryView => Some(16),
+                    key => key.primitive_width(),
+                })
+                .collect::<Option<Vec<usize>>>()?,
+        ),
+    };
+    for expr in aggregate.aggr_expr() {
+        widths.extend(accumulator_widths(expr)?);
+    }
+    let vec_width_total = widths.iter().sum::<usize>();
+    let vec_width_max = widths.iter().copied().max()?;
+    (vec_width_total > 0).then_some(AggregateLayout {
+        entry_size,
+        vec_width_total,
+        vec_width_max,
+    })
+}
+
+/// The per-group widths of the `Vec`s `expr`'s groups accumulator grows.
+fn accumulator_widths(expr: &AggregateFunctionExpr) -> Option<Vec<usize>> {
+    if expr.is_distinct() || !expr.groups_accumulator_supported() {
+        return None;
+    }
+    let return_type = expr.field().data_type().clone();
+    match expr.fun().name() {
+        // `CountGroupsAccumulator`: one `i64` per group.
+        "count" => Some(vec![8]),
+        // `PrimitiveGroupsAccumulator` over the return type.
+        "sum" | "min" | "max" => Some(vec![return_type.primitive_width()?]),
+        "avg" => {
+            let state = expr.state_fields().ok()?;
+            let names: Vec<&str> = state.iter().map(|field| field.name().as_str()).collect();
+            match names.as_slice() {
+                // Ravel's exact `AVG`: a 16-byte sum (`Option<f64>` or
+                // `i128`) and an `i64` count per group.
+                [sum, count] if sum.ends_with("[avg_sum]") && count.ends_with("[avg_count]") => {
+                    Some(vec![16, 8])
+                }
+                // DataFusion's float `AVG`: a `u64` count and an `f64` sum.
+                [count, sum]
+                    if count.ends_with("[count]")
+                        && sum.ends_with("[sum]")
+                        && state[1].data_type() == &DataType::Float64 =>
+                {
+                    Some(vec![8, 8])
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether `delta` is within [`STEP_TOLERANCE`] of the `step(k)` nearest it.
+fn matches_ladder(delta: usize, unit: f64, step: impl Fn(i32) -> f64) -> bool {
+    if delta == 0 || unit <= 0.0 {
+        return false;
+    }
+    let delta = delta as f64;
+    let k = (delta / unit).log2().round() as i32;
+    [k - 1, k, k + 1].into_iter().filter(|k| *k >= 0).any(|k| {
+        let predicted = step(k);
+        (delta - predicted).abs() <= STEP_TOLERANCE * predicted
+    })
+}
 
 /// Why an [`AggregateReserveAhead`] was rejected.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
@@ -678,6 +920,10 @@ struct AggregateState {
     asked: usize,
     /// The largest single grow it asked for before its first shrink.
     largest_step: usize,
+    /// Its last grow classified as a group-table step (`J_t`).
+    table_step: usize,
+    /// Its last grow classified as a `Vec` step (`J_v`).
+    vec_step: usize,
     /// Its envelope on the process ledger.
     envelope: usize,
     /// Whether it has shrunk; from then on it carries no envelope.
@@ -685,18 +931,36 @@ struct AggregateState {
 }
 
 impl AggregateState {
-    fn grown(self, additional: usize, reserve_ahead: &AggregateReserveAhead) -> Self {
+    /// The state after a grow of `additional` bytes. Under a known layout the
+    /// grow is classified against both predicted ladders on its own size: a
+    /// grow within [`STEP_TOLERANCE`] of a table step becomes `J_t`, of a
+    /// `Vec` step `J_v`, of both both, and of neither is per-batch growth
+    /// that moves neither.
+    fn grown(
+        self,
+        additional: usize,
+        reserve_ahead: &AggregateReserveAhead,
+        profile: Option<AggregateProfile>,
+    ) -> Self {
         let asked = self.asked.saturating_add(additional);
         if self.shrunk {
             return AggregateState { asked, ..self };
         }
-        let largest_step = self.largest_step.max(additional);
-        AggregateState {
+        let mut next = AggregateState {
             asked,
-            largest_step,
-            envelope: reserve_ahead.envelope(asked, largest_step),
-            shrunk: false,
+            largest_step: self.largest_step.max(additional),
+            ..self
+        };
+        if let Some(AggregateProfile::Layout(layout)) = profile {
+            if matches_ladder(additional, layout.table_step(0), |k| layout.table_step(k)) {
+                next.table_step = additional;
+            }
+            if matches_ladder(additional, layout.vec_step(0), |k| layout.vec_step(k)) {
+                next.vec_step = additional;
+            }
         }
+        next.envelope = reserve_ahead.envelope(&next, profile);
+        next
     }
 }
 
@@ -742,6 +1006,10 @@ pub struct TenantDelegatingPool {
     /// Each migrated aggregate consumer's state, keyed by
     /// `MemoryConsumer::id`. Locked before `held` and the process ledger.
     aggregates: Mutex<HashMap<usize, AggregateState>>,
+    /// The layout of the query's grouped aggregates, once the executor has
+    /// derived it from the plan. `None` sizes every envelope as
+    /// [`AggregateProfile::Unknown`].
+    aggregate_profile: Mutex<Option<AggregateProfile>>,
 }
 
 impl fmt::Debug for TenantDelegatingPool {
@@ -798,6 +1066,7 @@ impl TenantDelegatingPool {
             reserve_ahead: AggregateReserveAhead::OFF,
             envelope_width: 1,
             aggregates: Mutex::new(HashMap::new()),
+            aggregate_profile: Mutex::new(None),
         }
     }
 
@@ -826,6 +1095,24 @@ impl TenantDelegatingPool {
     /// endpoint that owns the tenant budget).
     pub fn tenant(&self) -> &Arc<TenantMemoryAccountant> {
         &self.tenant
+    }
+
+    /// Size the envelopes of this query's migrated aggregates from `profile`,
+    /// the layout [`plan_aggregate_profile`] derived from its plan. Set it before
+    /// the plan executes: a grow already made was classified without it.
+    pub fn set_aggregate_profile(&self, profile: AggregateProfile) {
+        *self
+            .aggregate_profile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(profile);
+    }
+
+    /// The profile [`Self::set_aggregate_profile`] set, if any.
+    pub fn aggregate_profile(&self) -> Option<AggregateProfile> {
+        *self
+            .aggregate_profile
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Bytes this pool currently holds for hash aggregate consumers. They are
@@ -924,12 +1211,13 @@ impl TenantDelegatingPool {
         let id = consumer.id();
         let mut aggregates = self.aggregates_map();
         let state = aggregates.get(&id).copied().unwrap_or_default();
-        let next = state.grown(additional, &self.reserve_ahead);
+        let next = state.grown(additional, &self.reserve_ahead, self.aggregate_profile());
         if next.envelope != state.envelope {
             self.set_envelope(id, next.envelope, EnvelopeCheck::Checked)
                 .map_err(|refused| {
                     DataFusionError::ResourcesExhausted(format!(
-                        "aggregate reserve-ahead refused: {additional} bytes asked by {} need                          the process aggregate envelope to grow by {} bytes: {}",
+                        "aggregate reserve-ahead refused: {additional} bytes asked by {} need \
+                         the process aggregate envelope to grow by {} bytes: {}",
                         consumer.name(),
                         refused.delta,
                         refused.exhausted
@@ -955,7 +1243,7 @@ impl TenantDelegatingPool {
         let id = consumer.id();
         let mut aggregates = self.aggregates_map();
         let state = aggregates.get(&id).copied().unwrap_or_default();
-        let next = state.grown(additional, &self.reserve_ahead);
+        let next = state.grown(additional, &self.reserve_ahead, self.aggregate_profile());
         if next.envelope != state.envelope {
             self.set_envelope_unchecked(id, next.envelope);
         }
@@ -1586,7 +1874,8 @@ mod tests {
     #[test]
     fn a_dropped_final_aggregate_reservation_is_held_until_it_unregisters() {
         let ledgers = Ledgers::holding();
-        let res = ledgers.register_consumer(MemoryConsumer::new(FINAL_AGGREGATE));
+        let res =
+            ledgers.register_consumer(MemoryConsumer::new(FINAL_AGGREGATE).with_can_spill(false));
         res.try_grow(1000).expect("within every ceiling");
         let split = res.split(0);
         drop(res);
@@ -1602,7 +1891,8 @@ mod tests {
     #[test]
     fn a_final_aggregate_regrow_after_its_last_shrink_is_served_from_the_hold() {
         let ledgers = Ledgers::holding();
-        let res = ledgers.register_consumer(MemoryConsumer::new(FINAL_AGGREGATE));
+        let res =
+            ledgers.register_consumer(MemoryConsumer::new(FINAL_AGGREGATE).with_can_spill(false));
         res.try_grow(1000).expect("within every ceiling");
         res.shrink(1000);
         res.try_grow(300).expect("served from the hold");
@@ -2117,9 +2407,11 @@ mod tests {
     }
 
     /// The table and accumulator `Vec` steps of one partial aggregate
-    /// building 3.1M groups of q33's shape, as DataFusion 55.2 asks for them:
-    /// three table doublings of 14 bytes a bucket, each followed by the `Vec`
-    /// step that ends the batch.
+    /// building 3.1M groups of q33's shape (layout `(16, 52, 16)`), as
+    /// DataFusion 55.2 asks for them: the table steps
+    /// `7/8 x 2^k x 16` for k = 19, 20, 21 (7,340,032, 14,680,064 and
+    /// 29,360,128 bytes), each followed by the `Vec` step `2^k x 52` that
+    /// ends the batch (27,262,976, 54,525,952 and 109,051,904 bytes).
     const SERIES: [usize; 6] = [
         7_340_032,
         27_262_976,
@@ -2129,57 +2421,86 @@ mod tests {
         109_051_904,
     ];
 
-    /// FLIP: an `envelope_multiplier` of 2 leaves 218,103,808 bytes, under
-    /// the 4 x 109,051,904 the next `Vec` doubling needs.
+    /// q33's layout: a 16-byte multi-column table entry, and per group 52
+    /// bytes of `Vec`s whose widest is exact `AVG`'s 16-byte sum.
+    const Q33_LAYOUT: AggregateLayout = AggregateLayout {
+        entry_size: 16,
+        vec_width_total: 52,
+        vec_width_max: 16,
+    };
+
+    /// Grow `res` by each of `steps`, returning the envelope on `budget`
+    /// after each.
+    fn envelopes_after(
+        budget: &Arc<MemoryBudget>,
+        pool: &TenantDelegatingPool,
+        res: &MemoryReservation,
+        steps: &[usize],
+    ) -> Vec<u64> {
+        steps
+            .iter()
+            .map(|step| {
+                res.try_grow(*step).expect("within every ceiling");
+                assert_eq!(
+                    budget.reserved(),
+                    pool.reserved() as u64 + envelope_on_budget(budget),
+                    "the envelope is on the process budget and nowhere else"
+                );
+                envelope_on_budget(budget)
+            })
+            .collect()
+    }
+
+    /// The table step and `Vec` step the pool has recorded for `res`.
+    fn chain_steps(pool: &TenantDelegatingPool, res: &MemoryReservation) -> (usize, usize) {
+        let state = pool
+            .aggregates_map()
+            .get(&res.consumer().id())
+            .copied()
+            .unwrap_or_default();
+        (state.table_step, state.vec_step)
+    }
+
+    /// FLIP: the starting branch's `min(2.43 x S, 5 x J_max)` reads
+    /// 545,259,520 at the end; sizing the `Vec` family as one `Vec`
+    /// (`1 + w_max / W` = 2) reads 458,017,997.
     #[test]
-    fn the_envelope_is_five_times_the_largest_step_and_covers_both_doublings() {
+    fn the_q33_series_classify_to_two_chains_and_the_envelope_is_the_larger_next_block() {
         let _serial = envelope_tests();
         let budget = Arc::new(MemoryBudget::new(1 << 40));
         let (_tenant, pool) = ahead_pool(
             &budget,
             1,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
+        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_LAYOUT));
         let res = register_on(&pool, PARTIAL);
 
-        let mut envelopes = Vec::new();
-        for step in SERIES {
-            res.try_grow(step).expect("within every ceiling");
-            envelopes.push(envelope_on_budget(&budget));
-            assert_eq!(
-                budget.reserved(),
-                pool.reserved() as u64 + envelope_on_budget(&budget),
-                "the envelope is on the process budget and nowhere else"
-            );
-        }
-
-        let last = *envelopes.last().expect("six steps");
+        let envelopes = envelopes_after(&budget, &pool, &res, &SERIES);
+        // Under 8 MiB the size bound: 2.43 x 7,340,032. From then on
+        // max(5.0 x J_t, 2.1 x J_v x 68 / 52), under 2.43 x S at every step.
+        assert_eq!(
+            envelopes,
+            [
+                17_836_278,
+                74_868_327,
+                74_868_327,
+                149_736_653,
+                149_736_653,
+                299_473_306
+            ]
+        );
+        assert_eq!(chain_steps(&pool, &res), (29_360_128, 109_051_904));
+        let last = envelopes[5];
         assert!(
-            last >= 4 * 109_051_904,
-            "the next Vec doubling's transient: {last}"
+            last >= (1 << 22) * (52 + 16),
+            "the next Vec step, with its widest Vec moving last: {last}"
         );
         assert!(
-            last as f64 >= 4.86 * 29_360_128.0,
-            "the next table doubling's transient: {last}"
+            last >= (1 << 23) * 17,
+            "the next table step's old and new tables: {last}"
         );
-        assert_eq!(last, 545_259_520, "5 x the 109,051,904-byte Vec step");
-        // Under 8 MiB the size bound alone: 2.43 x 7,340,032.
-        assert_eq!(envelopes[0], 17_836_278);
-        // From then on the smaller of 5 x J_max and 2.43 x S.
-        let sizes: Vec<u64> = SERIES
-            .iter()
-            .scan(0u64, |size, step| {
-                *size += *step as u64;
-                Some(*size)
-            })
-            .collect();
-        let mut largest = 0u64;
-        for (index, step) in SERIES.iter().enumerate().skip(1) {
-            largest = largest.max(*step as u64);
-            let by_size = (sizes[index] as f64 * 2.43).ceil() as u64;
-            assert_eq!(envelopes[index], (5 * largest).min(by_size), "step {index}");
-        }
         assert_eq!(
             pool.reserved(),
             (SERIES.iter().sum::<usize>() as f64 * 1.25).ceil() as usize
@@ -2189,6 +2510,116 @@ mod tests {
         assert_eq!(budget.reserved(), 0);
     }
 
+    /// FLIP: the starting branch's `DEFAULT`, whose envelope terms are 0,
+    /// reads 0 at the end.
+    #[test]
+    fn an_unknown_profile_falls_back_to_five_times_the_largest_step() {
+        let _serial = envelope_tests();
+        for profile in [None, Some(AggregateProfile::Unknown)] {
+            let budget = Arc::new(MemoryBudget::new(1 << 40));
+            let (_tenant, pool) = ahead_pool(
+                &budget,
+                1,
+                AggregateReserveAhead::DEFAULT,
+                QueryAccounting::new(),
+            );
+            if let Some(profile) = profile {
+                pool.set_aggregate_profile(profile);
+            }
+            let res = register_on(&pool, PARTIAL);
+            let envelopes = envelopes_after(&budget, &pool, &res, &SERIES);
+
+            assert_eq!(envelopes[5], 545_259_520, "5 x 109,051,904 ({profile:?})");
+            assert_eq!(envelopes[0], 17_836_278, "2.43 x 7,340,032 ({profile:?})");
+            // From then on the smaller of 5 x J_max and 2.43 x S.
+            let mut size = 0u64;
+            let mut largest = 0u64;
+            for (index, step) in SERIES.iter().enumerate() {
+                size += *step as u64;
+                largest = largest.max(*step as u64);
+                if index > 0 {
+                    let by_size = (size as f64 * 2.43).ceil() as u64;
+                    assert_eq!(
+                        envelopes[index],
+                        (5 * largest).min(by_size),
+                        "step {index} ({profile:?})"
+                    );
+                }
+            }
+            assert_eq!(chain_steps(&pool, &res), (0, 0), "{profile:?}");
+            drop(res);
+            assert_eq!(budget.reserved(), 0);
+        }
+    }
+
+    /// With 32-byte entries and W = 28 the two ladders coincide.
+    /// FLIP: classifying each delta as a doubling of the chain's last step
+    /// takes the padding grows as steps, `(10,000,000, 10,000,000)`; the
+    /// starting branch's `min(2.43 x S, 5 x J_max)` reads 144,245,112.
+    #[test]
+    fn a_delta_that_matches_both_ladders_takes_the_larger_multiplier() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(AggregateLayout {
+            entry_size: 32,
+            vec_width_total: 28,
+            vec_width_max: 16,
+        }));
+        let res = register_on(&pool, PARTIAL);
+        // Off both ladders (28 x 2^18 = 7,340,032 and 28 x 2^19 =
+        // 14,680,064): size the consumer so 2.43 x S does not bind.
+        envelopes_after(&budget, &pool, &res, &[10_000_000; 3]);
+        assert_eq!(chain_steps(&pool, &res), (0, 0));
+
+        let delta = 28 << 20;
+        let envelopes = envelopes_after(&budget, &pool, &res, &[delta]);
+        assert_eq!(chain_steps(&pool, &res), (delta, delta));
+        // max(4.9, 2.1 x (1 + 16 / 28)) x 29,360,128 = 4.9 x 29,360,128.
+        assert_eq!(envelopes[0], 143_864_628);
+        assert_eq!(envelopes[0], scale(delta, 4.9) as u64);
+        drop(res);
+    }
+
+    /// FLIP: classifying each delta as a doubling of the chain's last step
+    /// does not take the 0.975 `Vec` step, and the chains read
+    /// `(7,340,032, 27,262,976)` after it; the starting branch's
+    /// `min(2.43 x S, 5 x J_max)` reads 84,085,310 after the first two.
+    #[test]
+    fn a_delta_off_both_ladders_by_more_than_three_percent_is_not_a_step() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let (_tenant, pool) = ahead_pool(
+            &budget,
+            1,
+            AggregateReserveAhead::DEFAULT,
+            QueryAccounting::new(),
+        );
+        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_LAYOUT));
+        let res = register_on(&pool, PARTIAL);
+        let envelopes = envelopes_after(&budget, &pool, &res, &SERIES[..2]);
+        assert_eq!(chain_steps(&pool, &res), (7_340_032, 27_262_976));
+        assert_eq!(envelopes[1], 74_868_327);
+
+        // 1,600,000 is 12.8% under 14 x 2^17 and 6.1% under 52 x 2^15.
+        let envelopes = envelopes_after(&budget, &pool, &res, &[1_600_000]);
+        assert_eq!(chain_steps(&pool, &res), (7_340_032, 27_262_976));
+        assert_eq!(envelopes[0], 74_868_327);
+
+        // 0.975 x 52 x 2^19, rounded up, is within 3% of that Vec step.
+        let near = 26_581_402;
+        let envelopes = envelopes_after(&budget, &pool, &res, &[near]);
+        assert_eq!(chain_steps(&pool, &res), (7_340_032, near));
+        // 2.1 x 26,581,402 x 68 / 52, over 5.0 x 7,340,032.
+        assert_eq!(envelopes[0], 72_996_620);
+        drop(res);
+    }
+
     #[test]
     fn a_consumer_under_eight_mebibytes_carries_the_size_bound() {
         let _serial = envelope_tests();
@@ -2196,7 +2627,7 @@ mod tests {
         let (_tenant, pool) = ahead_pool(
             &small,
             1,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
         let res = register_on(&pool, PARTIAL);
@@ -2207,7 +2638,7 @@ mod tests {
         let (_tenant, pool) = ahead_pool(
             &large,
             1,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
         let res = register_on(&pool, "FinalHashAggregateStream[3]");
@@ -2227,13 +2658,13 @@ mod tests {
         let (tenant_one, pool_one) = ahead_pool(
             &budget,
             2,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
         let (tenant_two, pool_two) = ahead_pool(
             &budget,
             2,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
         let a = register_on(&pool_one, "PartialHashAggregateStream[0]");
@@ -2275,7 +2706,7 @@ mod tests {
         let (tenant, pool) = ahead_pool(
             &budget,
             1,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             accounting.clone(),
         );
         let res = register_on(&pool, PARTIAL);
@@ -2302,10 +2733,7 @@ mod tests {
         let tenant = TenantMemoryAccountant::with_process_budget(1 << 40, Arc::clone(&budget));
         let pool = Arc::new(
             TenantDelegatingPool::new(MIB, tenant, CeilingBreach::new(), QueryAccounting::new())
-                .with_aggregate_reserve_ahead(
-                    AggregateReserveAhead::WITH_ENVELOPE,
-                    NonZeroUsize::MIN,
-                ),
+                .with_aggregate_reserve_ahead(AggregateReserveAhead::DEFAULT, NonZeroUsize::MIN),
         );
         let res = register_on(&pool, PARTIAL);
         res.try_grow(MIB)
@@ -2323,7 +2751,7 @@ mod tests {
         let (tenant, pool) = ahead_pool(
             &budget,
             1,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
         let res = register_on(&pool, "FinalHashAggregateStream[0]");
@@ -2364,7 +2792,7 @@ mod tests {
         let (tenant, pool) = ahead_pool(
             &budget,
             4,
-            AggregateReserveAhead::WITH_ENVELOPE,
+            AggregateReserveAhead::DEFAULT,
             QueryAccounting::new(),
         );
         let partial = detached("PartialHashAggregateStream[0]");
@@ -2381,18 +2809,40 @@ mod tests {
         assert_eq!(budget.reserved(), tenant.reserved() as u64);
     }
 
-    /// FLIP: a `DEFAULT` that carries the envelope (5, 2.43) reserves
-    /// 17,836,278 bytes on the process budget at the first step.
+    /// FLIP: the starting branch's `DEFAULT`, whose envelope terms are 0,
+    /// reserves no envelope at the first step.
     #[test]
-    fn the_default_charges_the_factor_and_no_envelope() {
+    fn the_default_charges_the_factor_and_carries_the_envelope() {
         let _serial = envelope_tests();
         let budget = Arc::new(MemoryBudget::new(1 << 40));
         let (tenant, pool) = ahead_pool(
             &budget,
             1,
-            AggregateReserveAhead::DEFAULT,
+            AggregateReserveAhead::default(),
             QueryAccounting::new(),
         );
+        let res = register_on(&pool, "FinalHashAggregateStream[0]");
+        res.try_grow(SERIES[0]).expect("within every ceiling");
+        let charged = (SERIES[0] as f64 * 1.25).ceil() as usize;
+        assert_eq!(pool.reserved(), charged, "query: 1.25 x the ask");
+        assert_eq!(tenant.reserved(), charged, "tenant: 1.25 x the ask");
+        assert_eq!(envelope_on_budget(&budget), 17_836_278, "2.43 x the ask");
+        assert_eq!(budget.reserved(), charged as u64 + 17_836_278);
+        drop(res);
+        assert_eq!(budget.reserved(), 0);
+    }
+
+    /// Every envelope term at 0 charges the factor and reserves nothing.
+    #[test]
+    fn a_reserve_ahead_with_no_envelope_terms_charges_the_factor_alone() {
+        let _serial = envelope_tests();
+        let budget = Arc::new(MemoryBudget::new(1 << 40));
+        let factor_only = AggregateReserveAhead {
+            undercount_factor: 1.25,
+            ..AggregateReserveAhead::OFF
+        };
+        let (tenant, pool) = ahead_pool(&budget, 1, factor_only, QueryAccounting::new());
+        pool.set_aggregate_profile(AggregateProfile::Layout(Q33_LAYOUT));
         let res = register_on(&pool, "FinalHashAggregateStream[0]");
 
         let mut asked = 0usize;
@@ -2471,7 +2921,6 @@ mod tests {
     fn validate_refuses_a_non_finite_value_a_factor_below_one_and_a_negative_multiplier() {
         assert_eq!(AggregateReserveAhead::DEFAULT.validate(), Ok(()));
         assert_eq!(AggregateReserveAhead::OFF.validate(), Ok(()));
-        assert_eq!(AggregateReserveAhead::WITH_ENVELOPE.validate(), Ok(()));
         let nan = AggregateReserveAhead {
             envelope_size_factor: f64::NAN,
             ..AggregateReserveAhead::DEFAULT
@@ -2492,13 +2941,13 @@ mod tests {
             Err(AggregateReserveAheadError::FactorBelowOne { .. })
         ));
         let negative = AggregateReserveAhead {
-            envelope_multiplier: -1.0,
+            vec_multiplier: -1.0,
             ..AggregateReserveAhead::DEFAULT
         };
         assert!(matches!(
             negative.validate(),
             Err(AggregateReserveAheadError::Negative {
-                name: "envelope_multiplier",
+                name: "vec_multiplier",
                 ..
             })
         ));

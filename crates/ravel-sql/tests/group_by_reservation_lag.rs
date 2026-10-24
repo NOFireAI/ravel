@@ -81,7 +81,8 @@ use ravel_object_store::memory::MemoryStore;
 use ravel_query::{LogSegmentFetcher, PhaseAccounting};
 use ravel_sql::{
     AggregateReserveAhead, LogsTableProvider, SessionTable, SpillDecision, SqlConfig,
-    TenantMemoryAccountant, build_session, session_config, sql_memory_aggregate_envelope_bytes,
+    TenantDelegatingPool, TenantMemoryAccountant, build_session, plan_aggregate_profile,
+    session_config, sql_memory_aggregate_envelope_bytes,
 };
 use ravel_types::TenantHash;
 use ravel_types::accounting::QueryAccounting;
@@ -137,13 +138,7 @@ enum Agg {
 }
 
 /// How often the sampler reads live and reserved bytes.
-#[derive(Clone, Copy, Debug)]
-enum Sampling {
-    /// Back to back, yielding between reads.
-    Spin,
-    /// One read per interval.
-    Every(Duration),
-}
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(1);
 
 /// Forwards to the query's pool and records, beside it, what DataFusion asked
 /// for: the net bytes every reservation declared, and the largest single
@@ -238,6 +233,8 @@ enum Variant {
 #[derive(Debug)]
 struct Run {
     label: String,
+    variant: Variant,
+    key: Key,
     partitions: usize,
     groups: usize,
     peak_live: usize,
@@ -262,7 +259,19 @@ struct Run {
     peak_lead: usize,
     /// Largest single grow of a migrated aggregate stream.
     largest_step: usize,
+    /// The build-phase sample at which live bytes rose most since the
+    /// previous sample.
+    largest_live_step: LiveStep,
     samples: usize,
+}
+
+/// One sample-to-sample rise in live bytes, the part of it the pool's
+/// `reserved()` did not rise by, and the envelope held at that sample.
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveStep {
+    live: usize,
+    unaccounted: usize,
+    envelope: usize,
 }
 
 impl Run {
@@ -380,18 +389,19 @@ fn run_once(
     key: Key,
     agg: Agg,
     variant: Variant,
-    sampling: Sampling,
 ) -> Run {
     let mut config = SqlConfig::default();
     config.engine.sql_partition_count = Some(partitions);
     config.max_query_bytes = 64 << 30;
-    // The bands below were measured with the envelope on; the default leaves
-    // it off until it is sized per layout (#3181).
-    config.aggregate_reserve_ahead = AggregateReserveAhead::WITH_ENVELOPE;
+    assert_eq!(
+        config.aggregate_reserve_ahead,
+        AggregateReserveAhead::DEFAULT,
+        "the matrix measures the default reserve-ahead"
+    );
     let plain = matches!(variant, Variant::Plain);
     let tenant = TenantMemoryAccountant::new(64 << 30);
-    let (pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
-    let pool = Arc::new(AskedProbe::new(pool));
+    let (query_pool, _breach) = config.query_pool(tenant, QueryAccounting::new());
+    let pool = Arc::new(AskedProbe::new(Arc::clone(&query_pool)));
 
     let store = Arc::new(MemoryStore::new());
     let logs = SessionTable::Logs(Arc::new(LogsTableProvider::new(
@@ -473,11 +483,26 @@ fn run_once(
             let t0 = Instant::now();
             let mut next_trace = 0u128;
             let mut trace: Vec<(u128, isize, usize, usize, bool)> = Vec::new();
+            let mut previous: Option<(isize, usize)> = None;
+            let mut largest_live_step = LiveStep::default();
             while !stop.load(Ordering::Acquire) {
                 let live = live_bytes() - baseline;
                 let reserved = pool.reserved();
                 let envelope = sql_memory_aggregate_envelope_bytes() as usize;
                 let asked = pool.asked.load(Ordering::Relaxed);
+                if let Some((previous_live, previous_reserved)) = previous.replace((live, reserved))
+                    && !emitting.load(Ordering::Acquire)
+                {
+                    let rise = (live - previous_live).max(0) as usize;
+                    if rise > largest_live_step.live {
+                        largest_live_step = LiveStep {
+                            live: rise,
+                            unaccounted: rise
+                                .saturating_sub(reserved.saturating_sub(previous_reserved)),
+                            envelope,
+                        };
+                    }
+                }
                 peak_live.fetch_max(live, Ordering::Relaxed);
                 peak_reserved.fetch_max(reserved, Ordering::Relaxed);
                 peak_envelope.fetch_max(envelope, Ordering::Relaxed);
@@ -502,12 +527,9 @@ fn run_once(
                     trace.push((ms, live, reserved, envelope, emit));
                     next_trace = ms + 20;
                 }
-                match sampling {
-                    Sampling::Spin => thread::yield_now(),
-                    Sampling::Every(interval) => thread::sleep(interval),
-                }
+                thread::sleep(SAMPLE_INTERVAL);
             }
-            trace
+            (trace, largest_live_step)
         })
     };
 
@@ -515,13 +537,23 @@ fn run_once(
     let started = Instant::now();
     let emitting_flag = Arc::clone(&emitting);
     let groups = runtime.block_on(async {
-        let mut stream = ctx
+        let plan = ctx
             .sql(&sql)
             .await
             .expect("query plans")
-            .execute_stream()
+            .create_physical_plan()
             .await
-            .expect("stream starts");
+            .expect("physical plan builds");
+        // The executor sets the plan's aggregate profile on the pool before
+        // `execute_stream`; this test drives DataFusion directly, so it does
+        // the same.
+        if let Some(profile) = plan_aggregate_profile(&plan) {
+            query_pool
+                .downcast_ref::<TenantDelegatingPool>()
+                .expect("the query pool is a TenantDelegatingPool")
+                .set_aggregate_profile(profile);
+        }
+        let mut stream = execute_stream(plan, ctx.task_ctx()).expect("stream starts");
         let mut groups = 0usize;
         while let Some(batch) = stream.next().await {
             emitting_flag.store(true, Ordering::Release);
@@ -531,7 +563,7 @@ fn run_once(
     });
     let elapsed = started.elapsed();
     stop.store(true, Ordering::Release);
-    let trace = sampler.join().expect("sampler joins");
+    let (trace, largest_live_step) = sampler.join().expect("sampler joins");
     if std::env::var("RAVEL_SQL_GAP_TRACE").as_deref() == Ok("1") {
         for (ms, live, reserved, envelope, emit) in &trace {
             eprintln!(
@@ -554,6 +586,8 @@ fn run_once(
                 Variant::Plain => " [plain DF]",
             }
         ),
+        variant,
+        key,
         partitions,
         groups,
         peak_live: peak_live.load(Ordering::Relaxed).max(0) as usize,
@@ -566,6 +600,7 @@ fn run_once(
         peak_gap_emit: peak_gap_emit.load(Ordering::Relaxed).max(0) as usize,
         peak_lead: peak_lead.load(Ordering::Relaxed).max(0) as usize,
         largest_step: pool.largest_step.load(Ordering::Relaxed),
+        largest_live_step,
         samples: samples.load(Ordering::Relaxed),
     };
     eprintln!("  ({} took {elapsed:?})", run.label);
@@ -834,7 +869,6 @@ fn group_by_allocation_lead_over_reservation() {
         .build()
         .expect("runtime builds");
     let parts = input_partitions();
-    let spin = Sampling::Spin;
 
     let mut runs: Vec<(&str, Run)> = Vec::new();
     // Series 1: target_partitions, string key, each aggregate.
@@ -842,7 +876,7 @@ fn group_by_allocation_lead_over_reservation() {
         for p in [1, 8, 32] {
             runs.push((
                 "partitions",
-                run_once(&runtime, &parts, p, Key::Str, agg, Variant::Ravel, spin),
+                run_once(&runtime, &parts, p, Key::Str, agg, Variant::Ravel),
             ));
         }
     }
@@ -857,7 +891,6 @@ fn group_by_allocation_lead_over_reservation() {
                 key,
                 Agg::Count,
                 Variant::Ravel,
-                spin,
             ),
         ));
     }
@@ -874,7 +907,6 @@ fn group_by_allocation_lead_over_reservation() {
                 Key::Str,
                 agg,
                 Variant::Plain,
-                spin,
             ),
         ));
     }
@@ -884,21 +916,13 @@ fn group_by_allocation_lead_over_reservation() {
         for agg in [Agg::Count, Agg::Avg] {
             runs.push((
                 "int-avg",
-                run_once(
-                    &runtime,
-                    &parts,
-                    BASE_PARTITIONS,
-                    Key::TwoInt,
-                    agg,
-                    variant,
-                    spin,
-                ),
+                run_once(&runtime, &parts, BASE_PARTITIONS, Key::TwoInt, agg, variant),
             ));
         }
     }
     drop(parts);
 
-    // Series 5: q33's shape at its own scale, sampled every millisecond.
+    // Series 5: q33's shape at its own scale.
     let q33_parts = q33_partitions();
     runs.push((
         "q33",
@@ -909,13 +933,12 @@ fn group_by_allocation_lead_over_reservation() {
             Key::TwoInt,
             Agg::CountSumAvg,
             Variant::Ravel,
-            Sampling::Every(Duration::from_millis(1)),
         ),
     ));
     drop(q33_parts);
 
     eprintln!(
-        "\n{:<40} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4}",
+        "\n{:<40} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4} {:>6} {:>6} {:>6}",
         "configuration",
         "groups",
         "live",
@@ -928,11 +951,14 @@ fn group_by_allocation_lead_over_reservation() {
         "emit",
         "lead",
         "J_max",
-        "lead"
+        "lead",
+        "step",
+        "unacc",
+        "env@st"
     );
     for (_, r) in &runs {
         eprintln!(
-            "{:<40} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4}  ({} samples)",
+            "{:<40} {:>8} {:>7} {:>7} {:>7} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>6} {:>4} {:>6} {:>6} {:>6}  ({} samples)",
             r.label,
             r.groups,
             mib(r.peak_live),
@@ -946,7 +972,19 @@ fn group_by_allocation_lead_over_reservation() {
             mib(r.peak_lead),
             mib(r.largest_step),
             r.lead_reached(),
+            mib(r.largest_live_step.live),
+            mib(r.largest_live_step.unaccounted),
+            mib(r.largest_live_step.envelope),
             r.samples
+        );
+    }
+    for (_, r) in runs.iter().filter(|(_, r)| {
+        matches!((r.variant, r.key), (Variant::Ravel, Key::Str)) && r.partitions == BASE_PARTITIONS
+    }) {
+        eprintln!(
+            "{}: margin under the {MAX_PEAK_GAP}-byte bound {} bytes",
+            r.label,
+            MAX_PEAK_GAP as isize - r.peak_gap as isize
         );
     }
 
@@ -992,6 +1030,20 @@ fn group_by_allocation_lead_over_reservation() {
              {MAX_AVG_LIVE_OVER_COUNT_LIVE}x bound"
         );
     }
+
+    let (_, q33) = runs
+        .iter()
+        .find(|(series, _)| *series == "q33")
+        .expect("the q33 run exists");
+    let step = q33.largest_live_step;
+    assert!(
+        step.envelope >= step.unaccounted,
+        "q33: the largest build-phase live step rose {} bytes, {} of them not \
+         reserved, while the envelope held {} bytes",
+        step.live,
+        step.unaccounted,
+        step.envelope
+    );
 
     let (low, high) = GAP_BAND_32_PARTITION_STRING_KEY;
     assert!(
