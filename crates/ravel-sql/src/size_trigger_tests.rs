@@ -32,18 +32,18 @@ const WINDOW: TimeRange = TimeRange {
     end_ns: 2_000_000,
 };
 
-/// The threshold every test here runs with: below the lane's 1,368 resolved
-/// bytes, above [`EARLY_PRUNED`]'s 1,241 read bytes, below [`WHOLE_LANE`]'s
-/// 1,914.
+/// The threshold every test here runs with: below the lane's 1,372 resolved
+/// bytes, above [`EARLY_PRUNED`]'s 1,243 read bytes, below [`WHOLE_LANE`]'s
+/// 1,918.
 const MIN_BYTES: u64 = 1_300;
 
 /// Filters on the late object's time range, so the scan skips the early
-/// object: it reads the catalog (546 bytes) and the late object (695).
+/// object: it reads the catalog (546 bytes) and the late object (697).
 const EARLY_PRUNED: &str = "SELECT body FROM logs \
      WHERE ts >= TIMESTAMP '1970-01-01 00:00:00.001' AND severity_text = 'ERROR'";
 
 /// Filters on a field no object's statistics prune, so the scan reads both
-/// objects (1,368 bytes) after the catalog (546).
+/// objects (1,372 bytes) after the catalog (546).
 const WHOLE_LANE: &str = "SELECT ts, body FROM logs WHERE severity_text = 'ERROR'";
 
 /// The catalog bytes every statement here reads before any data object.
@@ -176,8 +176,8 @@ fn figure(accounting: &QueryAccountingSnapshot) -> (AccessIntent, u64) {
     (accounting.access_intent, trigger_read_bytes(accounting))
 }
 
-/// A filtered `logs` statement over a lane whose resolve (1,368 bytes) is at
-/// or above the threshold (1,300), but which itself reads 1,241 bytes, stays
+/// A filtered `logs` statement over a lane whose resolve (1,372 bytes) is at
+/// or above the threshold (1,300), but which itself reads 1,243 bytes, stays
 /// Interactive on its first execution and on its second.
 ///
 /// FLIP: comparing the lane's resolved object bytes to the threshold, as the
@@ -185,21 +185,21 @@ fn figure(accounting: &QueryAccountingSnapshot) -> (AccessIntent, u64) {
 #[tokio::test]
 async fn a_statement_that_reads_less_than_the_threshold_stays_interactive_over_a_larger_lane() {
     let (store, tenant_hash, resolved) = two_object_lane().await;
-    assert_eq!(resolved, 1_368, "the lane's resolved object bytes");
+    assert_eq!(resolved, 1_372, "the lane's resolved object bytes");
     let exec = trigger_executor(store);
 
     let first = run(&exec, tenant_hash, EARLY_PRUNED).await;
     let second = run(&exec, tenant_hash, EARLY_PRUNED).await;
 
-    assert_eq!(first, (AccessIntent::Interactive, 1_241), "first execution");
+    assert_eq!(first, (AccessIntent::Interactive, 1_243), "first execution");
     assert_eq!(
         second,
-        (AccessIntent::Interactive, 1_241),
+        (AccessIntent::Interactive, 1_243),
         "second execution"
     );
 }
 
-/// A filtered `logs` statement that reads 1,914 bytes against a 1,300-byte
+/// A filtered `logs` statement that reads 1,918 bytes against a 1,300-byte
 /// threshold is Interactive on its first execution, having no record yet, and
 /// BulkScan on its second. A different statement text over the same lane has
 /// no record of its own and is Interactive. An equality on a KEY_IDX field
@@ -221,9 +221,9 @@ async fn a_statement_that_reads_the_threshold_is_bulk_from_its_second_execution(
     assert_eq!(
         whole_lane,
         [
-            (AccessIntent::Interactive, 1_914),
-            (AccessIntent::BulkScan, 1_914),
-            (AccessIntent::BulkScan, 1_914),
+            (AccessIntent::Interactive, 1_918),
+            (AccessIntent::BulkScan, 1_918),
+            (AccessIntent::BulkScan, 1_918),
         ],
         "the same statement text, three executions"
     );
@@ -231,7 +231,7 @@ async fn a_statement_that_reads_the_threshold_is_bulk_from_its_second_execution(
     let other_text = "SELECT count(*) FROM logs WHERE severity_text = 'ERROR'";
     assert_eq!(
         run(&exec, tenant_hash, other_text).await,
-        (AccessIntent::Interactive, 1_914),
+        (AccessIntent::Interactive, 1_918),
         "a different statement text over the same lane"
     );
 
@@ -243,7 +243,7 @@ async fn a_statement_that_reads_the_threshold_is_bulk_from_its_second_execution(
     ];
     assert_eq!(
         key_runs,
-        [(AccessIntent::Interactive, 1_914); 3],
+        [(AccessIntent::Interactive, 1_918); 3],
         "a KEY_IDX equality, three executions"
     );
 }
@@ -268,9 +268,9 @@ async fn a_cache_served_execution_records_its_cache_bytes() {
     assert_eq!(
         runs.each_ref().map(figure),
         [
-            (AccessIntent::Interactive, 1_914),
-            (AccessIntent::BulkScan, 1_914),
-            (AccessIntent::BulkScan, 1_914),
+            (AccessIntent::Interactive, 1_918),
+            (AccessIntent::BulkScan, 1_918),
+            (AccessIntent::BulkScan, 1_918),
         ],
         "the same statement text, three executions"
     );
@@ -292,11 +292,11 @@ async fn a_cache_served_execution_records_its_cache_bytes() {
 
 /// Two statements reading the same objects at once: the second parks on the
 /// first one's in-flight fetch of the early object and is served it late.
-/// Each records the 1,914 bytes it reads when run alone, and each reads its
+/// Each records the 1,918 bytes it reads when run alone, and each reads its
 /// next execution as BulkScan.
 ///
 /// FLIP: leaving the late-served bytes out of the recorded figure records
-/// the follower's 1,914 less the early object's size, below the threshold,
+/// the follower's 1,918 less the early object's size, below the threshold,
 /// and reads its next execution as Interactive.
 #[tokio::test]
 async fn a_late_served_read_records_the_same_figure_as_a_fetched_one() {
@@ -344,7 +344,7 @@ async fn a_late_served_read_records_the_same_figure_as_a_fetched_one() {
     );
     assert_eq!(
         [figure(&leader), figure(&follower)],
-        [(AccessIntent::Interactive, 1_914); 2],
+        [(AccessIntent::Interactive, 1_918); 2],
         "each statement records what it reads when run alone"
     );
     assert_eq!(
@@ -352,7 +352,7 @@ async fn a_late_served_read_records_the_same_figure_as_a_fetched_one() {
             run(&exec, lane.tenant_hash, leader_sql).await,
             run(&exec, lane.tenant_hash, follower_sql).await,
         ],
-        [(AccessIntent::BulkScan, 1_914); 2],
+        [(AccessIntent::BulkScan, 1_918); 2],
         "each statement's next execution"
     );
 }
@@ -398,8 +398,8 @@ async fn a_failed_execution_records_nothing() {
             run(&exec, lane.tenant_hash, WHOLE_LANE).await,
         ],
         [
-            (AccessIntent::Interactive, 1_914),
-            (AccessIntent::BulkScan, 1_914),
+            (AccessIntent::Interactive, 1_918),
+            (AccessIntent::BulkScan, 1_918),
         ],
         "the two executions after the failed one"
     );

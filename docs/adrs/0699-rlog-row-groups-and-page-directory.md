@@ -376,7 +376,9 @@ from the footer, so no earlier placement is possible.
 5.2 **What the probe carries, and what a miss costs.**
 `DEFAULT_LOG_SUFFIX_LEN` rose from 64 KiB to 256 KiB (issue #766). The plan
 phase needs SKIP_IDX and the fetch phase needs PAGE_DIR, and both sit *before*
-BLOOM in the object, so a suffix probe reaches them only by spanning BLOOM too.
+BLOOM in the object, so a suffix probe reaches them only by spanning BLOOM too
+(objects written before the 2026-10-24 amendment; it moved BLOOM ahead of
+SKIP_IDX).
 Measured on a 32-block-group, 105-column object (7,168 pages, two full row
 groups): SKIP_IDX 31,082 B, PAGE_DIR 29,853 B, BLOOM 5,124 B, footer and trailer
 200 B, giving a 66,259 B tail -- 723 bytes past the old 64 KiB probe. On the
@@ -391,7 +393,9 @@ those tail sections the probe *window* failed to cover, so a report can show the
 residual miss rate. It is measured against the window rather than against cache
 residency, and it deliberately excludes STREAM_DIR and FIELD_DIR: those sit at
 the object's front, where no suffix probe of any length reaches them, so
-counting them would put a floor under the metric.
+counting them would put a floor under the metric (2026-10-24 amendment:
+new objects carry them after PAGE_DIR, inside the probe; the exclusion
+stays for objects of the earlier order).
 
 The probe is a fixed per-object read that a narrow projection does not shrink.
 On a small object it can exceed the column chunks themselves; on the reference
@@ -472,4 +476,46 @@ and every reader verifies its own crc32c before using it. For that page only,
 PAGE_DIR's decoder accepts a block index equal to the group's block count, an
 entry ahead of block 0 in an otherwise ascending chunk, and one page beyond
 two per block; the ranged fetch adds its extent to every kept chunk.
+
+## Amendment (2026-10-24): STREAM_DIR and FIELD_DIR follow PAGE_DIR, BLOOM and POSTINGS precede SKIP_IDX
+
+<!-- amendment-applies: sections="Amendment (2026-08-26, as implemented)" pointer="2026-10-24 amendment" -->
+<!-- amendment-supersedes: phrase="where no suffix probe of any length reaches them" pointer="2026-10-24 amendment" -->
+
+ADR-3217 decision 4 changes the order in which the writer emits sections.
+Both writer paths (columnar and row) now emit BLOCKS, KEY_IDX, POSTINGS,
+BLOOM, SKIP_IDX, PAGE_DIR, STREAM_DIR, FIELD_DIR, then the footer and
+trailer. Before this amendment they emitted STREAM_DIR and FIELD_DIR at
+offset 0, ahead of BLOCKS, and BLOOM and POSTINGS after PAGE_DIR, which is
+the order section 5.2 above describes.
+
+The four directories now sit next to the footer, and the two large optional
+indexes sit ahead of them, so a tail probe long enough for the directories
+and the footer carries all four whatever BLOOM and POSTINGS weigh. A narrow
+projection on the fast path no longer pays a GET for STREAM_DIR and
+FIELD_DIR: the probe already holds them, and `place_front_sections` skips a
+section the probe covers, so the fetcher needed no code change. A one-row-
+group narrow read drops from three GETs to two (the probe and one chunk run,
+`metadata_gets` 0), and SKIP_IDX and PAGE_DIR no longer fall out of the
+probe when BLOOM is larger than it.
+
+The reorder trades one read for another. BLOOM now sits ahead of SKIP_IDX,
+PAGE_DIR and the directory pair, so a declared-Str equality that places BLOOM
+during planning can find it outside the tail probe on an object where the old
+order had it inside, and that costs one extra GET there. Where BLOOM is larger
+than the probe it was a separate read in either order.
+
+`BlockRangeStats::probe_misses` still excludes STREAM_DIR and FIELD_DIR.
+Objects written before this amendment keep them at the front, outside any
+suffix probe, and counting them there would still put a floor under the
+metric.
+
+No trailer version bump. The bump rule under "Version" in
+`docs/log-segment-format.md` covers a change to an existing section's grammar
+or to a kind's legality, and this changes neither. Readers locate every
+section by the footer's offsets, never by adjacency or kind order (the same
+document, under the section figure), so objects of the old and the new order
+coexist and both open. The golden v5 fixture was regenerated for the new
+order, and the old-order bytes are kept as a second fixture that the reader
+tests open.
 
