@@ -220,12 +220,17 @@ struct AgentResponse {
 /// ADR-0072's credentials file, the shape `ravel-object-store`'s
 /// `FileCredentialProvider` reads. The operator's round-trip test pins this
 /// writer against that reader through `S3Store::new`.
+///
+/// `expiration` is the sidecar's own addition (RFC 3339, the credential's
+/// `Expiration`), read only by [`probe`]; the reader ignores it.
 #[derive(Serialize, Deserialize)]
 struct CredentialsFile {
     access_key_id: String,
     secret_access_key: String,
     #[serde(default)]
     session_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expiration: Option<String>,
 }
 
 /// Where to fetch credentials: the agent URI and the projected token file.
@@ -483,6 +488,7 @@ pub fn write_credentials_file(
         access_key_id: credentials.access_key_id.clone(),
         secret_access_key: credentials.secret_access_key.clone(),
         session_token: Some(credentials.session_token.clone()),
+        expiration: Some(humantime::format_rfc3339_nanos(credentials.expiration).to_string()),
     })
     .map_err(|err| failed(io::Error::other(err)))?;
 
@@ -560,18 +566,14 @@ fn mark_written(path: &Path) -> Result<(), PodIdentityError> {
         })
 }
 
-/// The startup probe: `Ok` when the sidecar process running now has written
-/// `path` (its written marker exists; see [`clear_written_marker`]) and `path`
-/// parses as ADR-0072's credentials file with both keys non-empty.
-pub fn probe(path: &Path) -> Result<(), String> {
-    let marker = written_marker_path(path);
-    if !marker.exists() {
-        return Err(format!(
-            "{} is absent: this sidecar has not written {} since it started",
-            marker.display(),
-            path.display()
-        ));
-    }
+/// The startup probe at `now`: `Ok` when `path` parses as ADR-0072's
+/// credentials file with both keys non-empty, and either the sidecar process
+/// running now has written it (its written marker exists; see
+/// [`clear_written_marker`]) or its `expiration` is after `now`. A file a
+/// previous process left passes only while its credential is still valid, so
+/// a restart during an agent outage is not turned into a restart loop, and a
+/// stale file never passes.
+pub fn probe(path: &Path, now: SystemTime) -> Result<(), String> {
     let bytes = fs::read(path).map_err(|err| format!("reading {}: {err}", path.display()))?;
     let parsed: CredentialsFile = serde_json::from_slice(&bytes).map_err(|err| {
         format!(
@@ -588,7 +590,31 @@ pub fn probe(path: &Path) -> Result<(), String> {
             path.display()
         ));
     }
-    Ok(())
+    let marker = written_marker_path(path);
+    if marker.exists() {
+        return Ok(());
+    }
+    let expiration = parsed
+        .expiration
+        .as_deref()
+        .map(parse_expiration)
+        .transpose()
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    match expiration {
+        Some(expiration) if now < expiration => Ok(()),
+        Some(_) => Err(format!(
+            "{} is absent and {} holds an expired credential: this sidecar has not written it \
+             since it started",
+            marker.display(),
+            path.display()
+        )),
+        None => Err(format!(
+            "{} is absent and {} records no expiration: this sidecar has not written it since \
+             it started",
+            marker.display(),
+            path.display()
+        )),
+    }
 }
 
 /// When the next refresh is due after a successful fetch at `now`: the
@@ -772,9 +798,9 @@ pub struct PodIdentityArgs {
     #[arg(long, value_name = "PATH")]
     pub output: Option<PathBuf>,
 
-    /// Exit 0 when the running sidecar has written this credentials file
-    /// since it started and the file parses, non-zero otherwise. The startup
-    /// probe of the rendered sidecar.
+    /// Exit 0 when this credentials file parses and either the running
+    /// sidecar has written it since it started or its credential has not
+    /// expired, non-zero otherwise. The startup probe of the rendered sidecar.
     #[arg(long, value_name = "PATH")]
     pub probe: Option<PathBuf>,
 
@@ -804,7 +830,7 @@ pub struct PodIdentityArgs {
 /// `--once`.
 pub async fn run(args: PodIdentityArgs) -> Result<(), String> {
     if let Some(path) = args.probe.as_deref() {
-        return probe(path);
+        return probe(path, SystemTime::now());
     }
     let Some(output) = args.output.as_deref() else {
         return Err("either --output or --probe is required".to_string());
@@ -924,7 +950,9 @@ impl OperatorCredentialCache {
     /// while it has not expired, with a warning, and fails once it has.
     /// While another caller's fetch is in flight, an unexpired cached
     /// credential is returned at once; with none, this call waits for that
-    /// fetch's outcome instead of starting a second one.
+    /// fetch's outcome instead of starting a second one, and takes the
+    /// credential it published only if it has not expired at this call's
+    /// `now`.
     pub async fn get(
         &self,
         endpoint: &AgentEndpoint,
@@ -942,7 +970,12 @@ impl OperatorCredentialCache {
                     let _ = outcome.changed().await;
                     let finished = outcome.borrow().clone();
                     match finished {
-                        Some(Ok(credentials)) => return Ok(credentials),
+                        // The fetching caller may have returned a cached
+                        // fallback that is valid at its `now` but not at ours.
+                        Some(Ok(credentials)) if now < credentials.expiration => {
+                            return Ok(credentials);
+                        }
+                        Some(Ok(_)) => continue,
                         Some(Err(reason)) => return Err(PodIdentityError::SharedFetch(reason)),
                         None => continue,
                     }
@@ -1211,11 +1244,12 @@ mod tests {
                 "access_key_id": "AKIA1",
                 "secret_access_key": "secret-AKIA1",
                 "session_token": "token-AKIA1",
+                "expiration": EXPIRATION,
             })
         );
         let mode = fs::metadata(&output).expect("stat").permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "the credentials file is 0600");
-        probe(&output).expect("the written file passes the probe");
+        probe(&output, now).expect("the written file passes the probe");
         assert_eq!(
             agent.requests.lock().unwrap().as_slice(),
             ["GET /v1/credentials"]
@@ -1501,35 +1535,72 @@ mod tests {
     fn probe_accepts_a_written_file_and_refuses_absent_or_malformed_ones() {
         let scratch = Scratch::new("probe");
         let output = scratch.path("credentials.json");
-        assert!(probe(&output).is_err(), "absent");
+        let now = parse_expiration("2026-10-21T12:00:00Z").expect("now");
+        assert!(probe(&output, now).is_err(), "absent");
         mark_written(&output).expect("mark");
-        assert!(probe(&output).is_err(), "marked but absent");
+        assert!(probe(&output, now).is_err(), "marked but absent");
         fs::write(&output, b"{\"access_key_id\":").expect("write");
-        assert!(probe(&output).is_err(), "truncated JSON");
+        assert!(probe(&output, now).is_err(), "truncated JSON");
         fs::write(&output, br#"{"access_key_id":"","secret_access_key":"s"}"#).expect("write");
-        assert!(probe(&output).is_err(), "empty key");
-        write_credentials_file(&output, &credentials("A", SystemTime::now())).expect("write");
-        assert!(probe(&output).is_ok(), "written by the sidecar");
+        assert!(probe(&output, now).is_err(), "empty key");
+        write_credentials_file(&output, &credentials("A", now)).expect("write");
+        assert!(probe(&output, now).is_ok(), "written by the sidecar");
         clear_written_marker(&output).expect("clear");
-        assert!(probe(&output).is_err(), "a valid file without the marker");
+        assert!(
+            probe(&output, now).is_err(),
+            "a file expiring at the probe's own now, without the marker"
+        );
         clear_written_marker(&output).expect("clearing an absent marker is fine");
     }
 
-    /// A restarted sidecar finds the previous process's file and marker in
-    /// the `emptyDir`. The probe must fail until this process has written,
-    /// and the previous file must stay readable for the server meanwhile.
-    #[tokio::test]
-    async fn after_a_restart_the_probe_fails_until_the_new_process_writes() {
-        let scratch = Scratch::new("restart");
+    /// A file a previous sidecar process wrote, with no marker: the probe
+    /// passes while its credential is unexpired and fails from the moment it
+    /// expires, and a file recording no expiration (or a malformed one) never
+    /// passes.
+    #[test]
+    fn without_the_marker_the_probe_passes_only_on_an_unexpired_file() {
+        let scratch = Scratch::new("probe-expiry");
+        let output = scratch.path("credentials.json");
+        let now = parse_expiration("2026-10-21T12:00:00Z").expect("now");
+        write_credentials_file(&output, &credentials("OLD", now + Duration::from_secs(1)))
+            .expect("write");
+        assert!(probe(&output, now).is_ok(), "one second left");
+        assert!(
+            probe(&output, now + Duration::from_secs(1)).is_err(),
+            "expired"
+        );
+
+        fs::write(&output, br#"{"access_key_id":"a","secret_access_key":"s"}"#).expect("write");
+        assert!(probe(&output, now).is_err(), "no expiration recorded");
+        fs::write(
+            &output,
+            br#"{"access_key_id":"a","secret_access_key":"s","expiration":"soon"}"#,
+        )
+        .expect("write");
+        assert!(probe(&output, now).is_err(), "malformed expiration");
+    }
+
+    /// A restarted sidecar whose agent is not answering yet, over a file a
+    /// previous process wrote. `previous_expiration` is that file's
+    /// credential's expiry; the probe runs at `now`. Returns the probe's
+    /// verdict while the new process's first fetch is held, after checking
+    /// that the previous file is still in place, and then lets the fetch
+    /// finish and waits for the probe to pass on the new write.
+    async fn probe_during_a_restart(
+        label: &str,
+        now: SystemTime,
+        previous_expiration: SystemTime,
+    ) -> Result<(), String> {
+        let scratch = Scratch::new(label);
         let token_file = scratch.path("token");
         fs::write(&token_file, "t").expect("write token");
         let output = scratch.path("credentials.json");
         // What the previous sidecar process left behind.
-        write_credentials_file(&output, &credentials("OLD", SystemTime::now()))
+        write_credentials_file(&output, &credentials("OLD", previous_expiration))
             .expect("previous write");
         mark_written(&output).expect("previous mark");
         let old_bytes = fs::read(&output).expect("read");
-        probe(&output).expect("the previous process's state passes");
+        probe(&output, now).expect("the previous process's state passes");
 
         let agent = Agent::new("t");
         *agent.body.lock().unwrap() = agent_body("NEW");
@@ -1548,10 +1619,7 @@ mod tests {
             agent.request_count() == 1
         })
         .await;
-        assert!(
-            probe(&output).is_err(),
-            "the probe passed before the new process wrote"
-        );
+        let verdict = probe(&output, now);
         assert_eq!(
             fs::read(&output).expect("read"),
             old_bytes,
@@ -1559,9 +1627,42 @@ mod tests {
         );
 
         agent.release();
-        wait_until("the probe passes", || probe(&output).is_ok()).await;
-        assert_eq!(read_file(&output)["access_key_id"], "NEW");
+        wait_until("the new process writes", || {
+            read_file(&output)["access_key_id"] == "NEW"
+        })
+        .await;
+        probe(&output, now).expect("the new write passes");
         sidecar.abort();
+        verdict
+    }
+
+    /// A restarted sidecar finds the previous process's file and marker in
+    /// the `emptyDir`. When that file's credential has expired, the probe
+    /// must fail until this process has written, and the previous file must
+    /// stay readable for the server meanwhile.
+    #[tokio::test]
+    async fn after_a_restart_the_probe_fails_until_the_new_process_writes() {
+        let now = parse_expiration("2026-10-21T12:00:00Z").expect("now");
+        let verdict = probe_during_a_restart("restart", now, now - Duration::from_secs(1)).await;
+        assert!(
+            verdict.is_err(),
+            "the probe passed on an expired file before the new process wrote"
+        );
+    }
+
+    /// The same restart over a file whose credential is still valid: the
+    /// probe passes while the agent is not answering, so an agent outage
+    /// shorter than the credential's remaining life does not get the sidecar
+    /// killed by its startup probe.
+    #[tokio::test]
+    async fn after_a_restart_an_unexpired_file_passes_the_probe_before_the_new_write() {
+        let now = parse_expiration("2026-10-21T12:00:00Z").expect("now");
+        let verdict =
+            probe_during_a_restart("restart-valid", now, now + Duration::from_secs(3600)).await;
+        assert!(
+            verdict.is_ok(),
+            "the probe failed on an unexpired file: {verdict:?}"
+        );
     }
 
     #[tokio::test]
@@ -1758,6 +1859,54 @@ mod tests {
             Err(PodIdentityError::SharedFetch(_))
         ));
         assert_eq!(agent.request_count(), 2, "the failure was not retried");
+    }
+
+    /// The fetching caller falls back to the cached credential, valid at its
+    /// own `now`; a caller that waited on it with a later `now`, at which
+    /// that credential has expired, does not take it and fetches itself.
+    #[tokio::test]
+    async fn a_waiter_does_not_take_a_credential_expired_at_its_own_now() {
+        use futures::FutureExt as _;
+
+        let scratch = Scratch::new("cache-expired-share");
+        let (agent, endpoint, cache, expiration) = cache_fixture(&scratch).await;
+        let now = expiration - Duration::from_secs(6 * 3600);
+        cache.get(&endpoint, now).await.expect("fill the cache");
+
+        *agent.status.lock().unwrap() = StatusCode::SERVICE_UNAVAILABLE;
+        agent.hold();
+        let fetching = tokio::spawn({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move {
+                cache
+                    .get(&endpoint, now + Duration::from_secs(4 * 3600))
+                    .await
+            }
+        });
+        wait_until("the refresh reaches the agent", || {
+            agent.request_count() == 2
+        })
+        .await;
+        let mut waiting = Box::pin({
+            let (cache, endpoint) = (Arc::clone(&cache), endpoint.clone());
+            async move { cache.get(&endpoint, expiration).await }
+        });
+        assert!(
+            (&mut waiting).now_or_never().is_none(),
+            "nothing unexpired is cached at the waiter's now, so it waits"
+        );
+
+        agent.release();
+        let fallback = fetching.await.expect("join").expect("fallback");
+        assert_eq!(fallback.expiration, expiration);
+        let waited = tokio::time::timeout(Duration::from_secs(10), waiting)
+            .await
+            .expect("the waiter finishes");
+        assert!(
+            matches!(waited, Err(PodIdentityError::Status { status: 503, .. })),
+            "the waiter took a credential expired at its now: {waited:?}"
+        );
+        assert_eq!(agent.request_count(), 3, "the waiter fetched itself");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
