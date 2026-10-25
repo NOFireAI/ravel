@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array};
+use datafusion::arrow::array::{Array, Float64Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::displayable;
 use futures::StreamExt;
@@ -615,4 +615,190 @@ async fn plan_pinned_loads_stats_when_ingest_hour_diverges_from_event_time() {
         2,
         "exactly the HEAD GET and the one column-stats GET; no scan"
     );
+}
+
+/// The two declared columns the two-key `GROUP BY` test needs; `code` has no
+/// statistics installed anywhere, and needs none, since the load never fires.
+fn status_and_code_cols() -> Vec<DeclaredColumn> {
+    vec![
+        DeclaredColumn::new("status", DeclaredType::I64),
+        DeclaredColumn::new("code", DeclaredType::I64),
+    ]
+}
+
+/// Run `sql` against an empty snapshot and return the GET count. An empty
+/// snapshot still issues the HEAD GET when the gate admits the statement (see
+/// [`ineligible_no_declared_reference_issues_zero_gets`]), so a refused shape
+/// reads 0 and an admitted one reads 1.
+async fn gets_for_empty_snapshot(sql: &str, declared: &[DeclaredColumn]) -> u64 {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let executor = executor(&store);
+    let (_plan, _batches) = run(&executor, snapshot_of(Vec::new()), sql, declared).await;
+    store.gets()
+}
+
+/// Issue #3244, exact ZERO. ClickBench q03's shape, `SUM` beside `COUNT(*)`
+/// and `AVG`, names the declared column, so the old "aggregate plus declared
+/// reference" gate loaded the statistics. Neither consumer can answer it:
+/// `MetadataOnlyAggregate` takes one aggregate, and DataFusion's
+/// `AggregateStatistics` replaces all or none and has no `SUM`/`AVG`.
+#[tokio::test]
+async fn q03_shape_sum_count_avg_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT SUM(status), COUNT(*), AVG(status) FROM logs",
+            &status_col()
+        )
+        .await,
+        0,
+        "no statistics consumer answers SUM beside AVG, so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. `COUNT(DISTINCT status)` needs an exact distinct
+/// count, which no statistics path supplies.
+#[tokio::test]
+async fn count_distinct_declared_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot("SELECT COUNT(DISTINCT status) FROM logs", &status_col()).await,
+        0,
+        "no statistics consumer answers COUNT(DISTINCT), so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. A `<>` filter goes with an ungrouped `COUNT(*)`
+/// only; `MetadataOnlyAggregate`'s group-by path takes no filter at all.
+#[tokio::test]
+async fn not_equal_filter_with_group_by_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT status, COUNT(*) FROM logs WHERE status <> 200 GROUP BY status",
+            &status_col()
+        )
+        .await,
+        0,
+        "the group-by path takes no filter, so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. Three `SUM`s are three aggregates;
+/// `MetadataOnlyAggregate` answers one.
+#[tokio::test]
+async fn three_sums_issue_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT SUM(status), SUM(status + 1), SUM(status + 2) FROM logs",
+            &status_col()
+        )
+        .await,
+        0,
+        "no statistics consumer answers several SUMs, so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. The group-by path answers a single declared key.
+#[tokio::test]
+async fn group_by_two_keys_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT status, code, COUNT(*) FROM logs GROUP BY status, code",
+            &status_and_code_cols()
+        )
+        .await,
+        0,
+        "the group-by path takes one key, so the load must not fire"
+    );
+}
+
+/// One segment with `status` = {200:3, 404:2} installed with its `.cstat`
+/// entry; returns the store and the snapshot holding the segment.
+async fn installed_status_segment() -> (Arc<CountingStore>, Snapshot) {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let seg = seg_ref(1, 5);
+    install_head_and_stats(&*store, &[stats_segment(&seg, vec![status_stat()])]).await;
+    (store, snapshot_of(vec![seg]))
+}
+
+/// Run `sql` over [`installed_status_segment`] and assert the metadata answer:
+/// `MetadataOnlyExec` in the plan, no `LogsScanExec`, and exactly the HEAD GET
+/// and the one `.cstat` GET. Returns the result batches.
+async fn assert_metadata_answer_with_two_gets(sql: &str) -> Vec<RecordBatch> {
+    let (store, snapshot) = installed_status_segment().await;
+    let executor = executor(&store);
+    let (plan, batches) = run(&executor, snapshot, sql, &status_col()).await;
+    assert!(
+        plan.contains("MetadataOnlyExec"),
+        "{sql} must answer from the column statistics; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("LogsScanExec"),
+        "{sql} must not scan; plan was:\n{plan}"
+    );
+    assert_eq!(
+        store.gets(),
+        2,
+        "{sql}: exactly the HEAD GET and the one column-stats GET; no scan"
+    );
+    batches
+}
+
+/// Issue #3244, exact TWO. q08's shape: `COUNT(*)` grouped by one declared
+/// column with no filter answers from the dictionary.
+#[tokio::test]
+async fn group_by_declared_count_answers_from_metadata_with_two_gets() {
+    let batches =
+        assert_metadata_answer_with_two_gets("SELECT status, COUNT(*) FROM logs GROUP BY status")
+            .await;
+    let mut groups = Vec::new();
+    for batch in &batches {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 key");
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 count");
+        for row in 0..batch.num_rows() {
+            groups.push((keys.value(row), counts.value(row)));
+        }
+    }
+    groups.sort_unstable();
+    assert_eq!(groups, vec![(200, 3), (404, 2)], "the dictionary's groups");
+}
+
+/// Issue #3244, exact TWO. `SUM(status)` answers from the stored sum.
+#[tokio::test]
+async fn sum_declared_answers_from_metadata_with_two_gets() {
+    let batches = assert_metadata_answer_with_two_gets("SELECT SUM(status) FROM logs").await;
+    assert_eq!(scalar(&batches, 0), Some(1408), "200*3 + 404*2");
+}
+
+/// Issue #3244, exact TWO. `SUM(status + 1)` answers from the stored sum plus
+/// the addend times the non-null count.
+#[tokio::test]
+async fn sum_declared_plus_literal_answers_from_metadata_with_two_gets() {
+    let batches = assert_metadata_answer_with_two_gets("SELECT SUM(status + 1) FROM logs").await;
+    assert_eq!(scalar(&batches, 0), Some(1413), "1408 + 1*5");
+}
+
+/// Issue #3244, exact TWO. `AVG(status)` answers from the stored sum over the
+/// non-null count.
+#[tokio::test]
+async fn avg_declared_answers_from_metadata_with_two_gets() {
+    let batches = assert_metadata_answer_with_two_gets("SELECT AVG(status) FROM logs").await;
+    let avg = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64 avg")
+                .value(0)
+        })
+        .expect("one avg row");
+    assert_eq!(avg.to_bits(), (1408.0_f64 / 5.0).to_bits(), "1408 / 5");
 }
