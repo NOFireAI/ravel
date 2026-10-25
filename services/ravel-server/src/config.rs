@@ -2473,11 +2473,13 @@ pub struct Cli {
     /// [`LOOPBACK_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`, a share
     /// set from a loopback measurement rather than sized to hold the corpus:
     /// with the catalog cache's derived share it leaves the shared SQL and
-    /// fetch remainder about 71% of the budget (ADR-2023 decision 3, as
-    /// amended for ADR-2677 decision 7).
+    /// fetch remainder about 69% of the budget once the column-statistics
+    /// cache's derived share is also taken (ADR-2023 decision 3, as amended
+    /// for ADR-2677 decision 7).
     /// Fallback when MemTotal is unknown: [`DEFAULT_CACHE_MAX_BYTES`]
     /// (256 MiB). Startup refuses (does not clamp) a value that, together
-    /// with the resolved `--catalog-cache-max-bytes`, reaches or exceeds
+    /// with the resolved `--catalog-cache-max-bytes` and
+    /// `--column-stats-cache-max-bytes`, reaches or exceeds
     /// `memory_budget_bytes`.
     #[arg(long, value_name = "BYTES")]
     pub cache_max_bytes: Option<u64>,
@@ -2498,9 +2500,29 @@ pub struct Cli {
     /// loopback; reference host: 1,503,238,553. Fallback when MemTotal is
     /// unknown: [`DEFAULT_CACHE_MAX_BYTES`] (256 MiB). Startup refuses (does
     /// not clamp) a value that, together with the resolved
-    /// `--cache-max-bytes`, reaches or exceeds `memory_budget_bytes`.
+    /// `--cache-max-bytes` and `--column-stats-cache-max-bytes`, reaches or
+    /// exceeds `memory_budget_bytes`.
     #[arg(long, value_name = "BYTES")]
     pub catalog_cache_max_bytes: Option<u64>,
+
+    /// Maximum resident bytes for the catalog's column-statistics cache
+    /// (`query::build_catalog_for_server`), the decoded `.cstat` objects the
+    /// resolve path reuses per tenant and signal, a SEPARATE LRU ceiling from
+    /// `--cache-max-bytes` and `--catalog-cache-max-bytes` (ADR-1413 decision
+    /// 5). An entry larger than this is served but not cached. A value of `0`
+    /// builds no column-statistics cache. Read at startup only; there is no
+    /// live resize. Ignored when `--disable-cache` is set. Unset, it derives
+    /// at 2% of the memory budget, and 64 MiB when memory is unknown.
+    ///
+    /// Omitted, the value derives at [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of
+    /// `memory_budget_bytes`, unaffected by whether the store is loopback;
+    /// reference host: 601,295,421. Fallback when MemTotal is unknown:
+    /// `ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES` (64 MiB).
+    /// Startup refuses (does not clamp) a value that, together with the
+    /// resolved `--cache-max-bytes` and `--catalog-cache-max-bytes`, reaches
+    /// or exceeds `memory_budget_bytes`.
+    #[arg(long, value_name = "BYTES")]
+    pub column_stats_cache_max_bytes: Option<u64>,
 
     /// Share of the fetcher cache's RAM tier (`--cache-max-bytes`) that bulk-scan reads hold against interactive admissions, strictly between 0 and 1; default 0.5.
     ///
@@ -3334,6 +3356,15 @@ pub struct QueryBudgets {
     /// `EngineConfig::logs_max_fetch_run_bytes` and from there
     /// `LogSegmentFetcher::with_max_fetch_run_bytes`.
     pub logs_max_fetch_run_bytes: u64,
+    /// The column-statistics cache ceiling,
+    /// [`ResolvedPerformanceDefaults::column_stats_cache_max_bytes`]
+    /// (ADR-1413 decision 5). Reaches
+    /// `CatalogConfig::column_stats_cache_max_bytes` through
+    /// [`crate::query::build_catalog_for_server`], which turns it into the
+    /// `0` disabled sentinel under `--disable-cache`. Not a query budget; it
+    /// rides here because it comes from the resolved performance defaults,
+    /// which `start` does not otherwise see.
+    pub column_stats_cache_max_bytes: u64,
     /// The MCP surface's settings (ADR-1374). Not a query budget; it rides
     /// here because this is the query-surface configuration `start` receives.
     pub mcp: McpConfig,
@@ -3367,6 +3398,7 @@ impl Default for QueryBudgets {
             logs_fetch_policy_source: LOGS_FETCH_POLICY_SOURCE_DEFAULT,
             store_cost_profile: StoreCostProfile::reference(),
             logs_max_fetch_run_bytes: ravel_query::DEFAULT_LOG_MAX_FETCH_RUN_BYTES,
+            column_stats_cache_max_bytes: ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
             mcp: McpConfig::default(),
             fold_lag_interval: None,
             sql_spill: SqlSpillSettings::default(),
@@ -4114,6 +4146,16 @@ pub const LOOPBACK_CACHE_MEMORY_PERCENT: u64 = 24;
 /// no longer bounds it.
 pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
 
+/// Share of `memory_budget_bytes` the derived column-statistics cache takes
+/// (`CatalogConfig::column_stats_cache_max_bytes`, ADR-1413 decision 5): the
+/// third hard carve beside the fetcher and catalog byte caches (ADR-1170,
+/// column-statistics carve amendment). 2% of the 30 GiB reference host's
+/// budget is 601,295,421 bytes, which admits the 266,736,092-byte whole
+/// entry measured on the ClickBench hits tenant (issue #3244). Like the
+/// catalog byte cache's share it does not change on a loopback store. Set
+/// it explicitly with `--column-stats-cache-max-bytes`.
+pub const COLUMN_STATS_CACHE_MEMORY_PERCENT: u64 = 2;
+
 /// Share of `MemTotal` the derived `--sql-max-query-bytes` takes (~15 GiB on
 /// the reference host), equal to [`SQL_TENANT_MEMORY_PERCENT`] (ADR-2414
 /// decision B1): a lone statement may use the tenant's whole SQL share.
@@ -4121,8 +4163,9 @@ pub const CATALOG_CACHE_MEMORY_PERCENT: u64 = 5;
 /// nests inside (`ravel-sql`'s `memory.rs` charges the same bytes to both), so
 /// N statements share the total they shared at 25%; a second concurrent
 /// statement no longer has a guaranteed quarter of memory, it gets what the
-/// first left. One tenant's sum stays 80% of memory (fetch cache 25%, catalog
-/// cache 5%, SQL tenant share 50%), not 130%: the per-query share is a
+/// first left. One tenant's sum stays 82% of memory (fetch cache 25%, catalog
+/// cache 5%, column-statistics cache 2%, SQL tenant share 50%), not 132%:
+/// the per-query share is a
 /// ceiling inside the tenant share, not a reservation on top of it. An
 /// explicit `--sql-max-query-bytes` still wins: over an explicit
 /// `--sql-tenant-max-bytes` it is clamped to that ceiling, and over a derived
@@ -4242,6 +4285,9 @@ pub struct PerformanceFlags {
     /// `--catalog-cache-max-bytes` (ADR-2023): independent of
     /// `cache_max_bytes` above.
     pub catalog_cache_max_bytes: Option<u64>,
+    /// `--column-stats-cache-max-bytes` (ADR-1413 decision 5): independent of
+    /// both cache flags above.
+    pub column_stats_cache_max_bytes: Option<u64>,
     /// Whether this deployment's store is a `--store s3` deployment against a
     /// loopback `--s3-endpoint`, computed by [`Cli::store_is_loopback`]: the
     /// same predicate [`Cli::resolve_logs_fetch_policy`] uses. Only the
@@ -4257,11 +4303,11 @@ pub struct PerformanceFlags {
     /// `--disable-cache`. Not an `Option` because it is a bool flag with no
     /// "derive" state: it is off unless the operator set it.
     ///
-    /// It carves nothing itself, but it decides whether the two resolved cache
-    /// ceilings hold any memory at all. With it set, `store::build_cache`
-    /// returns no fetcher cache and `query::build_catalog` forces the catalog
-    /// byte cache to its `0` disabled sentinel, so both hard caps are
-    /// fictitious and the whole budget is really available to the shared
+    /// It carves nothing itself, but it decides whether the three resolved
+    /// cache ceilings hold any memory at all. With it set,
+    /// `store::build_cache` returns no fetcher cache and `query::build_catalog`
+    /// forces the catalog byte cache and the column-statistics cache to their
+    /// `0` disabled sentinels, so all three hard caps are fictitious and the whole budget is really available to the shared
     /// SQL/fetch accountant.
     pub disable_cache: bool,
     /// Whether this process's mode uses no part of the memory budget
@@ -4363,6 +4409,14 @@ pub struct ResolvedPerformanceDefaults {
     /// [`CATALOG_CACHE_MEMORY_PERCENT`] rather than sharing
     /// [`Self::cache_max_bytes`]'s share, whatever that share is.
     pub catalog_cache_max_bytes: u64,
+    /// Reaches `CatalogConfig::column_stats_cache_max_bytes`
+    /// (`query::build_catalog_for_server`), the decoded `.cstat` reuse cache,
+    /// resolved from its own `--column-stats-cache-max-bytes` flag. Derived
+    /// at [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of
+    /// [`Self::memory_budget_bytes`], else
+    /// `ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES` when the budget
+    /// is unknown, and `0` in a mode outside the budget (ADR-1413 decision 5).
+    pub column_stats_cache_max_bytes: u64,
     /// Reaches `SqlConfig::max_query_bytes`. Never above
     /// [`Self::sql_tenant_max_bytes`].
     pub sql_max_query_bytes: usize,
@@ -4374,11 +4428,12 @@ pub struct ResolvedPerformanceDefaults {
     /// #1255) that [`Self::cache_max_bytes`] and
     /// [`Self::catalog_cache_max_bytes`] are now carved from: cgroup-capped
     /// effective memory minus [`Self::memory_overhead_reserve_bytes`], or
-    /// `u64::MAX` when memory is unknown (the two caches then fall back to
-    /// [`DEFAULT_CACHE_MAX_BYTES`] instead of carving a meaningless budget;
+    /// `u64::MAX` when memory is unknown (the caches then fall back to their
+    /// fixed defaults, such as [`DEFAULT_CACHE_MAX_BYTES`], instead of carving
+    /// a meaningless budget;
     /// `u64::MAX` rather than `0` because an unmeasured host has no
     /// trustworthy ceiling, not the tightest possible one). The shared
-    /// remainder after both hard caps (`Self::memory_remainder_bytes`) sizes
+    /// remainder after the hard caps (`Self::memory_remainder_bytes`) sizes
     /// the `MemoryBudget` handed to the SQL/fetch accountant; the per-tenant
     /// SQL ceiling is the fairness bound WITHIN that remainder, not a second
     /// separate budget.
@@ -4398,14 +4453,15 @@ pub struct ResolvedPerformanceDefaults {
     /// at the [`NON_BUDGET_BASELINE_BYTES`] floor alone would make it. `None`
     /// otherwise, including on every source that deducts no reserve.
     pub memory_overhead_reserve_ingest_limit: Option<ravel_ingest::IngestByteBudgetLimit>,
-    /// `cache_max_bytes + catalog_cache_max_bytes`: the two hard, non-shedding
-    /// eviction caps carved from [`Self::memory_budget_bytes`]. Startup
+    /// `cache_max_bytes + catalog_cache_max_bytes +
+    /// column_stats_cache_max_bytes`: the three hard, non-shedding eviction
+    /// caps carved from [`Self::memory_budget_bytes`]. Startup
     /// refuses (see `Cli::resolve_performance`) rather than clamps when this
     /// is at or above the budget (issue #1255: a shared remainder of `0` is
     /// as unusable as a negative one, since a `MemoryBudget::new(0)` refuses
     /// every real reservation).
     ///
-    /// `0` under [`Self::cache_disabled`], where the two ceilings above bound
+    /// `0` under [`Self::cache_disabled`], where the three ceilings above bound
     /// caches that are never built, so this is NOT their sum on that path.
     pub memory_hard_caps_bytes: u64,
     /// `memory_budget_bytes - memory_hard_caps_bytes`: what sizes the shared
@@ -4422,10 +4478,11 @@ pub struct ResolvedPerformanceDefaults {
     /// that combination rather than refusing: no flag can raise a budget the
     /// host's memory did not produce, and the process still ingests.
     pub memory_remainder_bytes: u64,
-    /// `--disable-cache`: no fetcher cache and no catalog byte cache is built,
-    /// so [`Self::cache_max_bytes`] and [`Self::catalog_cache_max_bytes`] hold
-    /// no memory and [`Self::memory_hard_caps_bytes`] is `0` regardless of
-    /// them.
+    /// `--disable-cache`: no fetcher cache, no catalog byte cache and no
+    /// column-statistics cache is built, so [`Self::cache_max_bytes`],
+    /// [`Self::catalog_cache_max_bytes`] and
+    /// [`Self::column_stats_cache_max_bytes`] hold no memory and
+    /// [`Self::memory_hard_caps_bytes`] is `0` regardless of them.
     pub cache_disabled: bool,
     /// The mode uses no part of the memory budget
     /// ([`PerformanceFlags::memory_budget_not_applicable`]). Then
@@ -4491,6 +4548,7 @@ pub struct PerformanceSources {
     pub max_segments: &'static str,
     pub cache_max_bytes: &'static str,
     pub catalog_cache_max_bytes: &'static str,
+    pub column_stats_cache_max_bytes: &'static str,
     pub sql_max_query_bytes: &'static str,
     pub sql_tenant_max_bytes: &'static str,
     pub query_deadline: &'static str,
@@ -4581,17 +4639,23 @@ fn resolve_knob(
 ///   (ADR-2023): unset, it derives at [`CATALOG_CACHE_MEMORY_PERCENT`] of
 ///   `memory_budget_bytes`, unaffected by whether the store is loopback,
 ///   else [`DEFAULT_CACHE_MAX_BYTES`] when memory is unknown.
-///   `memory_hard_caps_bytes` is the sum of these two, and
+/// - `column_stats_cache_max_bytes` (column-statistics cache, ADR-1413
+///   decision 5): its own `--column-stats-cache-max-bytes` flag, else
+///   [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`,
+///   unaffected by whether the store is loopback, else
+///   `ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES` when memory is
+///   unknown.
+///   `memory_hard_caps_bytes` is the sum of these three, and
 ///   `memory_remainder_bytes` is what's left of the budget after them: what
 ///   sizes the shared `MemoryBudget` the SQL/fetch accountant draws from,
 ///   with the per-tenant ceiling below as the fairness bound WITHIN it, not a
 ///   second separate budget. `Cli::resolve_performance` refuses (does not
 ///   clamp) a flag combination whose hard caps alone exceed the budget.
-///   `--disable-cache` builds neither cache, so `memory_hard_caps_bytes` is
+///   `--disable-cache` builds none of the three, so `memory_hard_caps_bytes` is
 ///   `0`, the remainder is the whole budget, and there is nothing for that
 ///   refusal to fire on.
 /// - `flags.memory_budget_not_applicable` (`--mode gateway`) replaces the
-///   three rules above: `memory_budget_bytes` and `memory_remainder_bytes`
+///   four rules above: `memory_budget_bytes` and `memory_remainder_bytes`
 ///   are `u64::MAX`, `memory_hard_caps_bytes` is `0`, and each cache
 ///   ceiling is its explicit flag (sourced as a flag) or else `0`, sourced
 ///   [`PERF_SOURCE_NOT_APPLICABLE`].
@@ -4836,18 +4900,37 @@ pub fn resolve_performance_defaults(
         None => (DEFAULT_CACHE_MAX_BYTES, PERF_SOURCE_FALLBACK),
     };
 
-    // `--disable-cache` builds neither cache: `store::build_cache` returns
-    // `None` and `query::build_catalog` forces the byte cache's `0` disabled
-    // sentinel. Both resolved ceilings above are then ceilings on nothing, so
-    // charging them against the budget would carve memory no cache holds and
-    // shrink the shared SQL/fetch remainder by up to 30% of the budget (the
-    // remote fetch share plus the catalog share).
+    // ADR-1413 decision 5: the column-statistics cache is the third hard
+    // carve, with its own flag and a share that ignores the loopback store.
+    let (column_stats_cache_max_bytes, column_stats_cache_source) =
+        match flags.column_stats_cache_max_bytes {
+            Some(n) => (n, PERF_SOURCE_FLAG),
+            None if flags.memory_budget_not_applicable => (0, PERF_SOURCE_NOT_APPLICABLE),
+            None if memory_budget_known => (
+                percent_of(memory_budget_bytes, COLUMN_STATS_CACHE_MEMORY_PERCENT),
+                PERF_SOURCE_BUDGET_CARVE,
+            ),
+            None => (
+                ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
+                PERF_SOURCE_FALLBACK,
+            ),
+        };
+
+    // `--disable-cache` builds none of the three: `store::build_cache` returns
+    // `None` and `query::build_catalog_for_server` forces the catalog's byte
+    // and column-statistics caches to their `0` disabled sentinels. The
+    // resolved ceilings above are then ceilings on nothing, so charging them
+    // against the budget would carve memory no cache holds and shrink the
+    // shared SQL/fetch remainder by up to 32% of the budget (the remote fetch
+    // share plus the catalog and column-statistics shares).
     // A mode outside the budget is charged nothing either: its caches are
     // never read through, so an explicit ceiling there bounds no memory.
     let memory_hard_caps_bytes = if flags.disable_cache || flags.memory_budget_not_applicable {
         0
     } else {
-        cache_max_bytes.saturating_add(catalog_cache_max_bytes)
+        cache_max_bytes
+            .saturating_add(catalog_cache_max_bytes)
+            .saturating_add(column_stats_cache_max_bytes)
     };
     let memory_remainder_bytes = memory_budget_bytes.saturating_sub(memory_hard_caps_bytes);
 
@@ -4937,6 +5020,7 @@ pub fn resolve_performance_defaults(
         max_segments,
         cache_max_bytes,
         catalog_cache_max_bytes,
+        column_stats_cache_max_bytes,
         sql_max_query_bytes,
         sql_tenant_max_bytes,
         query_deadline,
@@ -4956,6 +5040,7 @@ pub fn resolve_performance_defaults(
             max_segments: segments_source,
             cache_max_bytes: cache_source,
             catalog_cache_max_bytes: catalog_cache_source,
+            column_stats_cache_max_bytes: column_stats_cache_source,
             sql_max_query_bytes: query_bytes_source,
             sql_tenant_max_bytes: tenant_source,
             query_deadline: deadline_source,
@@ -4995,9 +5080,12 @@ pub struct MemoryBudgetExceeded {
     pub cache_max_bytes: u64,
     /// The resolved catalog byte cache ceiling.
     pub catalog_cache_max_bytes: u64,
-    /// `cache_max_bytes + catalog_cache_max_bytes`.
+    /// The resolved column-statistics cache ceiling (ADR-1413 decision 5).
+    pub column_stats_cache_max_bytes: u64,
+    /// `cache_max_bytes + catalog_cache_max_bytes +
+    /// column_stats_cache_max_bytes`.
     pub hard_caps_total: u64,
-    /// The budget the two hard caps were checked against.
+    /// The budget the three hard caps were checked against.
     pub memory_budget_bytes: u64,
 }
 
@@ -5005,11 +5093,13 @@ impl std::fmt::Display for MemoryBudgetExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "cache_max_bytes ({}) + catalog_cache_max_bytes ({}) = {} bytes leaves no \
-             strictly positive remainder of memory_budget_bytes ({} bytes) for the shared \
-             SQL/fetch memory budget; ",
+            "cache_max_bytes ({}) + catalog_cache_max_bytes ({}) + \
+             column_stats_cache_max_bytes ({}) = {} bytes leaves no strictly positive \
+             remainder of memory_budget_bytes ({} bytes) for the shared SQL/fetch memory \
+             budget; ",
             self.cache_max_bytes,
             self.catalog_cache_max_bytes,
+            self.column_stats_cache_max_bytes,
             self.hard_caps_total,
             self.memory_budget_bytes
         )?;
@@ -5024,14 +5114,14 @@ impl std::fmt::Display for MemoryBudgetExceeded {
         if self.memory_budget_bytes == 0 {
             f.write_str(
                 "no --cache-max-bytes value can satisfy this check against a 0-byte budget, \
-                 because both hard caps are non-negative byte counts and their sum can never \
+                 because the hard caps are non-negative byte counts and their sum can never \
                  go below 0: set --memory-budget-bytes above 0, or leave it unset to derive \
                  the budget from the host's memory",
             )
         } else {
             f.write_str(
-                "lower --cache-max-bytes or --catalog-cache-max-bytes, or raise the host's \
-                 available memory",
+                "lower --cache-max-bytes, --catalog-cache-max-bytes or \
+                 --column-stats-cache-max-bytes, or raise the host's available memory",
             )
         }
     }
@@ -5099,7 +5189,7 @@ impl std::fmt::Display for MemoryBudgetBelowMinimum {
 impl std::error::Error for MemoryBudgetBelowMinimum {}
 
 impl ResolvedPerformanceDefaults {
-    /// Refuse a flag combination whose two hard cache caps together leave no
+    /// Refuse a flag combination whose three hard cache caps together leave no
     /// strictly positive remainder of [`Self::memory_budget_bytes`]
     /// (ADR-1170 decision 3, amended by issue #1255), rather than silently
     /// clamping either cache or letting a zero or negative remainder reach
@@ -5114,8 +5204,8 @@ impl ResolvedPerformanceDefaults {
     /// `0` with today's compiled-in cache constants.
     ///
     /// Also a no-op under `--disable-cache` ([`Self::cache_disabled`]), which
-    /// is what this refusal's own remedy reduces to on a small host: no cache
-    /// of either kind is built, so the process holds no read-cache memory,
+    /// is what this refusal's own remedy reduces to on a small host: none of
+    /// the three caches is built, so the process holds no read-cache memory,
     /// `memory_hard_caps_bytes` is `0`, and the remainder is the whole budget.
     /// Refusing there would refuse a process that has already given back
     /// every byte the refusal asks it to give back, and an explicit
@@ -5126,7 +5216,8 @@ impl ResolvedPerformanceDefaults {
     /// Also a no-op in a mode that uses no part of the budget
     /// ([`Self::memory_budget_not_applicable`], `--mode gateway`): it builds
     /// no query surface and runs no fold, so no fetcher, SQL executor or fold
-    /// reads through either cache or reserves against the shared accountant,
+    /// reads through any of the caches or reserves against the shared
+    /// accountant,
     /// and there is no remainder this check could be protecting. Every other
     /// mode keeps the check and its message unchanged.
     pub fn check_memory_budget(&self) -> Result<(), MemoryBudgetExceeded> {
@@ -5140,6 +5231,7 @@ impl ResolvedPerformanceDefaults {
             return Err(MemoryBudgetExceeded {
                 cache_max_bytes: self.cache_max_bytes,
                 catalog_cache_max_bytes: self.catalog_cache_max_bytes,
+                column_stats_cache_max_bytes: self.column_stats_cache_max_bytes,
                 hard_caps_total: self.memory_hard_caps_bytes,
                 memory_budget_bytes: self.memory_budget_bytes,
             });
@@ -5272,8 +5364,14 @@ impl ResolvedPerformanceDefaults {
             source = self.sources.catalog_cache_max_bytes,
             "performance default resolved"
         );
-        // ADR-1170 decision 3/4: the budget the two caches above were carved
-        // from, the reserve subtracted to get it, the sum of the two hard
+        tracing::info!(
+            setting = "column_stats_cache_max_bytes",
+            value = self.column_stats_cache_max_bytes,
+            source = self.sources.column_stats_cache_max_bytes,
+            "performance default resolved"
+        );
+        // ADR-1170 decision 3/4: the budget the three caches above were carved
+        // from, the reserve subtracted to get it, the sum of the three hard
         // caps, and what's left for the shared SQL/fetch accountant. One line
         // per figure, each exactly once, so an operator can reconstruct
         // budget = hard_caps + remainder from this log alone. The reserve
@@ -5317,7 +5415,7 @@ impl ResolvedPerformanceDefaults {
             }
             // `cache_disabled` rides on the hard-caps line for the reason
             // `clamped` rides on `sql_max_query_bytes` below: when it is true
-            // this value is `0` rather than the sum of the two cache lines
+            // this value is `0` rather than the sum of the three cache lines
             // above it, and a reader adding those two up would not get this
             // number.
             tracing::info!(
@@ -6832,6 +6930,7 @@ impl Cli {
             logs_fetch_policy_source,
             store_cost_profile: self.resolve_store_cost_profile()?,
             logs_max_fetch_run_bytes: self.logs_max_fetch_run_bytes,
+            column_stats_cache_max_bytes: resolved.column_stats_cache_max_bytes,
             mcp: McpConfig {
                 enabled: self.mcp,
                 allowed_origins: self.mcp_allowed_origins.clone(),
@@ -8327,6 +8426,7 @@ impl Cli {
             max_segments: self.max_segments,
             cache_max_bytes: self.cache_max_bytes,
             catalog_cache_max_bytes: self.catalog_cache_max_bytes,
+            column_stats_cache_max_bytes: self.column_stats_cache_max_bytes,
             store_is_loopback: self.store_is_loopback(),
             sql_max_query_bytes: self.sql_max_query_bytes,
             sql_tenant_max_bytes: self.sql_tenant_max_bytes,
@@ -11403,10 +11503,12 @@ mod tests {
         // ceiling from the fetcher cache's 25%, so the pair does not commit
         // 50% of the budget.
         assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
-        // Both hard caps together, and what the derivation leaves for the
+        // The column-statistics cache's 2% (ADR-1413 decision 5), truncated.
+        assert_eq!(resolved.column_stats_cache_max_bytes, 601_295_421);
+        // All three hard caps together, and what the derivation leaves for the
         // shared SQL/fetch MemoryBudget accountant: budget = hard_caps + remainder.
-        assert_eq!(resolved.memory_hard_caps_bytes, 9_019_431_321);
-        assert_eq!(resolved.memory_remainder_bytes, 21_045_339_751);
+        assert_eq!(resolved.memory_hard_caps_bytes, 9_620_726_742);
+        assert_eq!(resolved.memory_remainder_bytes, 20_444_044_330);
         assert_eq!(resolved.sql_max_query_bytes, 16_106_127_360);
         assert_eq!(resolved.sql_tenant_max_bytes, 16_106_127_360);
         assert_eq!(resolved.max_segments, 1_000_000);
@@ -11420,6 +11522,10 @@ mod tests {
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
         assert_eq!(
             resolved.sources.catalog_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
             PERF_SOURCE_BUDGET_CARVE
         );
         assert_eq!(resolved.sources.sql_max_query_bytes, PERF_SOURCE_DERIVED);
@@ -11459,14 +11565,16 @@ mod tests {
         assert_eq!(resolved.cache_max_bytes, 1_610_612_736);
         // Catalog cache is 5% of the same budget, truncated.
         assert_eq!(resolved.catalog_cache_max_bytes, 322_122_547);
-        assert_eq!(resolved.memory_hard_caps_bytes, 1_932_735_283);
-        assert_eq!(resolved.memory_remainder_bytes, 4_509_715_661);
+        // Column-statistics cache is 2% of the same budget, truncated.
+        assert_eq!(resolved.column_stats_cache_max_bytes, 128_849_018);
+        assert_eq!(resolved.memory_hard_caps_bytes, 2_061_584_301);
+        assert_eq!(resolved.memory_remainder_bytes, 4_380_866_643);
         // The 50%-of-total derived figure (4,294,967,296) exceeds
         // SQL_POOL_REMAINDER_CAP_PERCENT of the remainder above, so
         // ADR-1170, amended by issue #2367 item 3, caps both pools down to
-        // 90% of 4,509,715,661, truncated.
-        assert_eq!(resolved.sql_max_query_bytes, 4_058_744_094);
-        assert_eq!(resolved.sql_tenant_max_bytes, 4_058_744_094);
+        // 90% of 4,380,866,643, truncated.
+        assert_eq!(resolved.sql_max_query_bytes, 3_942_779_978);
+        assert_eq!(resolved.sql_tenant_max_bytes, 3_942_779_978);
         assert!(resolved.sql_pools_remainder_capped);
         // The two host-independent rules do not shrink with the host: a
         // segment-count cap and a deadline are not resident bytes.
@@ -11687,6 +11795,7 @@ mod tests {
         let fixable = MemoryBudgetExceeded {
             cache_max_bytes: 8 * 1024 * 1024 * 1024,
             catalog_cache_max_bytes: 8 * 1024 * 1024 * 1024,
+            column_stats_cache_max_bytes: 0,
             hard_caps_total: 16 * 1024 * 1024 * 1024,
             memory_budget_bytes: 14 * 1024 * 1024 * 1024,
         };
@@ -12140,6 +12249,229 @@ mod tests {
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
     }
 
+    /// Issue #3244 step 1: the column-statistics cache takes
+    /// [`COLUMN_STATS_CACHE_MEMORY_PERCENT`] of `memory_budget_bytes`. On the
+    /// reference host that is 2% of the 30,064,771,072-byte budget,
+    /// truncated: 601,295,421 bytes, from the budget-carve source.
+    ///
+    /// Prove-the-test: take the share of `host.mem_total_bytes` instead of
+    /// `memory_budget_bytes` and the cap reads 644,245,094 (2% of
+    /// 32,212,254,720) against the expected 601,295,421.
+    #[test]
+    fn column_stats_cache_derives_two_percent_of_the_reference_budget() {
+        let resolved = resolve_performance_defaults(reference_host(), PerformanceFlags::default());
+        assert_eq!(resolved.memory_budget_bytes, 30_064_771_072);
+        assert_eq!(resolved.column_stats_cache_max_bytes, 601_295_421);
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+    }
+
+    /// `--column-stats-cache-max-bytes` wins over the derived share, through
+    /// the CLI parse path, and leaves the other two caches deriving as before.
+    ///
+    /// Prove-the-test: drop the `Some(n) => (n, PERF_SOURCE_FLAG)` arm from
+    /// the column-statistics match and the cap reads 601,295,421 against the
+    /// expected 12,345.
+    #[test]
+    fn column_stats_cache_flag_wins_over_the_derived_share() {
+        let resolved = resolved_from(&cli(&["--column-stats-cache-max-bytes", "12345"]));
+        assert_eq!(resolved.column_stats_cache_max_bytes, 12_345);
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_FLAG
+        );
+        assert_eq!(resolved.cache_max_bytes, REFERENCE_CACHE_MAX_BYTES);
+        assert_eq!(resolved.catalog_cache_max_bytes, 1_503_238_553);
+    }
+
+    /// With no known budget the column-statistics cache keeps the catalog's
+    /// own default, 64 MiB, from the fallback source.
+    ///
+    /// Prove-the-test: drop the `memory_budget_known` guard from the
+    /// budget-carve arm and the cap reads 2% of the `u64::MAX` fallback
+    /// budget, 368,934,881,474,191,032, against the expected 67,108,864.
+    #[test]
+    fn column_stats_cache_falls_back_to_the_catalog_default_on_unknown_memory() {
+        let unknown = HostProfile::new(16, None, None, None, None, None);
+        let resolved = cli(&[])
+            .resolve_performance(unknown)
+            .expect("fallback path resolves");
+        assert_eq!(
+            ravel_catalog::DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES,
+            67_108_864
+        );
+        assert_eq!(resolved.column_stats_cache_max_bytes, 67_108_864);
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_FALLBACK
+        );
+    }
+
+    /// A gateway uses no memory budget, so its column-statistics cap is `0`
+    /// from the not-applicable source.
+    ///
+    /// Prove-the-test: drop the `memory_budget_not_applicable` arm from the
+    /// column-statistics match and the cap reads the fallback 67,108,864
+    /// (the gateway's budget is the `u64::MAX` sentinel, which the
+    /// budget-known check rejects) against the expected 0.
+    #[test]
+    fn column_stats_cache_is_zero_in_a_gateway() {
+        let resolved = resolved_from(&cli(&["--mode", "gateway"]));
+        assert!(resolved.memory_budget_not_applicable);
+        assert_eq!(resolved.column_stats_cache_max_bytes, 0);
+        assert_eq!(
+            resolved.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_NOT_APPLICABLE
+        );
+    }
+
+    /// A loopback store changes the fetcher cache's share (ADR-2677) and
+    /// nothing else: the column-statistics cap and its source are the same
+    /// on a loopback and a remote store on the same host.
+    ///
+    /// Prove-the-test: key the column-statistics share on
+    /// `flags.store_is_loopback` the way the fetcher cache is (24% of the
+    /// budget there) and the loopback cap reads 7,215,545,057 against the
+    /// expected 601,295,421.
+    #[test]
+    fn column_stats_cache_does_not_vary_with_a_loopback_store() {
+        let loopback = resolved_from(&cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "http://127.0.0.1:9000",
+        ]));
+        let remote = resolved_from(&cli(&[
+            "--store",
+            "s3",
+            "--s3-endpoint",
+            "https://s3.us-east-1.amazonaws.com",
+        ]));
+        assert_eq!(
+            loopback.sources.cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE_LOOPBACK
+        );
+        assert_eq!(loopback.column_stats_cache_max_bytes, 601_295_421);
+        assert_eq!(remote.column_stats_cache_max_bytes, 601_295_421);
+        assert_eq!(
+            loopback.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+        assert_eq!(
+            remote.sources.column_stats_cache_max_bytes,
+            PERF_SOURCE_BUDGET_CARVE
+        );
+    }
+
+    /// `memory_hard_caps_bytes` is the exact sum of the three cache caps, and
+    /// `0` under `--disable-cache`, which builds none of them.
+    ///
+    /// Prove-the-test: leave `column_stats_cache_max_bytes` out of the
+    /// hard-caps sum and the derived row reads 9,019,431,321 against
+    /// 9,620,726,742 and the flagged row 3,000 against 7,000.
+    #[test]
+    fn hard_caps_are_the_exact_sum_of_the_three_caches() {
+        let derived = resolved_from(&cli(&[]));
+        assert_eq!(derived.cache_max_bytes, 7_516_192_768);
+        assert_eq!(derived.catalog_cache_max_bytes, 1_503_238_553);
+        assert_eq!(derived.column_stats_cache_max_bytes, 601_295_421);
+        assert_eq!(derived.memory_hard_caps_bytes, 9_620_726_742);
+        assert_eq!(derived.memory_remainder_bytes, 20_444_044_330);
+
+        let flagged = resolved_from(&cli(&[
+            "--cache-max-bytes",
+            "1000",
+            "--catalog-cache-max-bytes",
+            "2000",
+            "--column-stats-cache-max-bytes",
+            "4000",
+        ]));
+        assert_eq!(flagged.memory_hard_caps_bytes, 7_000);
+        assert_eq!(flagged.memory_remainder_bytes, 30_064_764_072);
+
+        let disabled = resolved_from(&cli(&["--disable-cache"]));
+        assert_eq!(disabled.column_stats_cache_max_bytes, 601_295_421);
+        assert_eq!(disabled.memory_hard_caps_bytes, 0);
+        assert_eq!(disabled.memory_remainder_bytes, 30_064_771_072);
+    }
+
+    /// The startup refusal counts the column-statistics cap: caps of
+    /// 400,000,000 + 400,000,000 against a 1,000,000,000-byte budget leave
+    /// room on their own, and a 200,000,000-byte column-statistics cap
+    /// brings the sum to exactly the budget, which refuses. One byte less
+    /// starts with a 1-byte remainder.
+    ///
+    /// Prove-the-test: leave `column_stats_cache_max_bytes` out of the
+    /// hard-caps sum and `expect_err` panics on `Ok` (800,000,000 is below
+    /// the budget).
+    #[test]
+    fn startup_refuses_when_the_column_stats_cap_reaches_the_budget() {
+        let base = [
+            "--memory-budget-bytes",
+            "1000000000",
+            "--cache-max-bytes",
+            "400000000",
+            "--catalog-cache-max-bytes",
+            "400000000",
+        ];
+        let two_caps = cli(&[&base[..], &["--column-stats-cache-max-bytes", "0"]].concat())
+            .resolve_performance(reference_host())
+            .expect("the first two caps alone leave room");
+        assert_eq!(two_caps.memory_hard_caps_bytes, 800_000_000);
+
+        let err = cli(&[&base[..], &["--column-stats-cache-max-bytes", "200000000"]].concat())
+            .resolve_performance(reference_host())
+            .expect_err("three caps summing to the budget must refuse");
+        let exceeded = err
+            .downcast_ref::<MemoryBudgetExceeded>()
+            .expect("typed MemoryBudgetExceeded error");
+        assert_eq!(exceeded.cache_max_bytes, 400_000_000);
+        assert_eq!(exceeded.catalog_cache_max_bytes, 400_000_000);
+        assert_eq!(exceeded.column_stats_cache_max_bytes, 200_000_000);
+        assert_eq!(exceeded.hard_caps_total, 1_000_000_000);
+        assert_eq!(exceeded.memory_budget_bytes, 1_000_000_000);
+        let message = exceeded.to_string();
+        assert!(
+            message.contains("column_stats_cache_max_bytes (200000000)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("--column-stats-cache-max-bytes"),
+            "{message}"
+        );
+
+        let started = cli(&[&base[..], &["--column-stats-cache-max-bytes", "199999999"]].concat())
+            .resolve_performance(reference_host())
+            .expect("one byte under the budget starts");
+        assert_eq!(started.memory_remainder_bytes, 1);
+    }
+
+    /// `--column-stats-cache-max-bytes` parses, defaults to unset (derive),
+    /// and is documented in `--help` beside `--catalog-cache-max-bytes`.
+    #[test]
+    fn column_stats_cache_flag_parses_and_is_documented() {
+        use clap::CommandFactory;
+        assert_eq!(cli(&[]).column_stats_cache_max_bytes, None);
+        assert_eq!(
+            cli(&["--column-stats-cache-max-bytes", "0"]).column_stats_cache_max_bytes,
+            Some(0)
+        );
+        assert!(
+            Cli::try_parse_from(["ravel-server", "--column-stats-cache-max-bytes", "-1"]).is_err()
+        );
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--column-stats-cache-max-bytes"), "{help}");
+        let arg_help = Cli::command()
+            .get_arguments()
+            .find(|a| a.get_id() == "column_stats_cache_max_bytes")
+            .and_then(|a| a.get_long_help())
+            .map(|h| h.to_string())
+            .expect("the flag carries long help");
+        assert!(arg_help.contains("601,295,421"), "{arg_help}");
+    }
+
     /// Unknown memory (the fallback path) on a loopback store: neither cache
     /// can derive a share of a budget that does not exist, so both fall back
     /// to [`DEFAULT_CACHE_MAX_BYTES`] exactly as on a non-loopback host.
@@ -12330,12 +12662,13 @@ mod tests {
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_FLAG);
     }
 
-    /// Startup refuses, never clamps, a flag combination whose two hard cache
+    /// Startup refuses, never clamps, a flag combination whose hard cache
     /// caps together reach or exceed `memory_budget_bytes` (ADR-1170 decision
     /// 3). Since
     /// ADR-2023 the two flags bound their own cache independently, so both
     /// must be set explicitly to make their sum exceed half the reference
-    /// host's 30,064,771,072-byte budget.
+    /// host's 30,064,771,072-byte budget. The column-statistics cap is set
+    /// to 0 so the total is the two flags alone.
     ///
     /// Prove-the-test: replace `self.memory_hard_caps_bytes >=
     /// self.memory_budget_bytes` in `check_memory_budget` with `false` and
@@ -12349,6 +12682,8 @@ mod tests {
             "20000000000",
             "--catalog-cache-max-bytes",
             "20000000000",
+            "--column-stats-cache-max-bytes",
+            "0",
         ])
         .expect("flags parse");
 
@@ -12360,6 +12695,7 @@ mod tests {
             .expect("typed MemoryBudgetExceeded error");
         assert_eq!(exceeded.cache_max_bytes, 20_000_000_000);
         assert_eq!(exceeded.catalog_cache_max_bytes, 20_000_000_000);
+        assert_eq!(exceeded.column_stats_cache_max_bytes, 0);
         assert_eq!(exceeded.hard_caps_total, 40_000_000_000);
         assert_eq!(exceeded.memory_budget_bytes, 30_064_771_072);
 
@@ -12406,6 +12742,8 @@ mod tests {
             &half.to_string(),
             "--catalog-cache-max-bytes",
             &half.to_string(),
+            "--column-stats-cache-max-bytes",
+            "0",
         ])
         .expect("flags parse");
         let err = cli
@@ -12610,8 +12948,9 @@ mod tests {
     }
 
     /// `--disable-cache` builds no fetcher cache (`store::build_cache` returns
-    /// `None`) and no catalog byte cache (`query::build_catalog` forces the
-    /// `0` sentinel), so both hard caps hold no memory and the whole budget
+    /// `None`), no catalog byte cache and no column-statistics cache
+    /// (`query::build_catalog` forces their `0` sentinels), so the three hard
+    /// caps hold no memory and the whole budget
     /// belongs to the shared SQL/fetch accountant. Startup must not refuse a
     /// process that holds no read-cache memory, on either of the two
     /// configurations that otherwise refuse:
@@ -12632,16 +12971,15 @@ mod tests {
     /// `|| self.cache_disabled` from `check_memory_budget`'s early return
     /// panics the third `expect` against a `0 >= 0` refusal on the 0-byte
     /// budget. Restoring both and replacing the `flags.disable_cache` branch in
-    /// `resolve_performance_defaults` with the plain
-    /// `cache_max_bytes.saturating_add(catalog_cache_max_bytes)` panics the
-    /// first hard-caps assertion instead, reading 40,000,000,000 against the
+    /// `resolve_performance_defaults` with the plain three-way sum panics the
+    /// first hard-caps assertion instead, reading 60,000,000,000 against the
     /// expected 0. Both halves are needed: caps of `0` do not survive the
     /// `>=` comparison against a budget of `0`.
     #[test]
     fn disabling_the_cache_starts_where_the_hard_caps_would_refuse() {
         // Configuration 1: caps an operator set well above the budget, with
         // the caches turned off. Each flag bounds its own cache at 20 GB, so
-        // the sum is 40 GB against the reference host's 30,064,771,072-byte
+        // the sum is 60 GB against the reference host's 30,064,771,072-byte
         // budget.
         let cli = Cli::try_parse_from([
             "ravel-server",
@@ -12650,10 +12988,12 @@ mod tests {
             "20000000000",
             "--catalog-cache-max-bytes",
             "20000000000",
+            "--column-stats-cache-max-bytes",
+            "20000000000",
         ])
         .expect("flags parse");
         let resolved = cli.resolve_performance(reference_host()).expect(
-            "a process that builds no cache holds no cache memory, so the two fictitious hard \
+            "a process that builds no cache holds no cache memory, so the three fictitious hard \
              caps must not refuse startup",
         );
         assert!(resolved.cache_disabled);
@@ -12669,6 +13009,7 @@ mod tests {
         // operator typed, and they are simply not carved from the budget.
         assert_eq!(resolved.cache_max_bytes, 20_000_000_000);
         assert_eq!(resolved.catalog_cache_max_bytes, 20_000_000_000);
+        assert_eq!(resolved.column_stats_cache_max_bytes, 20_000_000_000);
 
         // Configuration 2: the small container. In `--mode all` 300 MiB of
         // effective memory takes a 768 MiB reserve (the 512 MiB ingest buffer
@@ -13013,9 +13354,10 @@ mod tests {
     /// `memory_overhead_reserve_bytes`, `memory_hard_caps_bytes`, and
     /// `memory_remainder_bytes` -- must each appear on the existing
     /// "performance default resolved" pattern exactly once per `emit()` call,
-    /// carrying the exact value the derivation computed. On a flag or
-    /// fallback budget, which subtracts no reserve, the reserve line is
-    /// absent and the other three appear once each.
+    /// carrying the exact value the derivation computed. The
+    /// `column_stats_cache_max_bytes` line (issue #3244) is held to the same
+    /// rule. On a flag or fallback budget, which subtracts no reserve, the
+    /// reserve line is absent and the other three appear once each.
     ///
     /// Prove-the-test: duplicate the `memory_budget_bytes` `tracing::info!`
     /// call in `emit()` (call it a second time) and
@@ -13035,8 +13377,9 @@ mod tests {
         for (setting, value) in [
             ("memory_budget_bytes", "30064771072"),
             ("memory_overhead_reserve_bytes", "2147483648"),
-            ("memory_hard_caps_bytes", "9019431321"),
-            ("memory_remainder_bytes", "21045339751"),
+            ("memory_hard_caps_bytes", "9620726742"),
+            ("memory_remainder_bytes", "20444044330"),
+            ("column_stats_cache_max_bytes", "601295421"),
         ] {
             let needle = format!("setting=\"{setting}\"");
             let occurrences = joined.matches(&needle).count();
@@ -14934,7 +15277,7 @@ mod tests {
     ///
     /// Prove-the-test: write `off: false` in `Cli::query_budgets` and the `off`
     /// row reads `false`; pass `resolved.memory_remainder_bytes` instead of
-    /// `memory_budget_bytes` and the budget reads 21,045,339,751 against
+    /// `memory_budget_bytes` and the budget reads 20,444,044,330 against
     /// 30,064,771,072; pass `resolved.cache_max_bytes` alone as
     /// `read_cache_bytes` and the default row reads 7,516,192,768 against
     /// 9,019,431,321; drop the `cache_disabled` branch and the
@@ -18634,9 +18977,11 @@ mod tests {
     /// ADR-2677 decision 7 (T5): on the reference box, resolved through the
     /// `derived-available` budget of 27,775,004,672 B, a loopback store's
     /// fetcher cache is `floor(budget * 24 / 100)` = 6,666,001,121 B, the
-    /// catalog cache keeps its 5% (1,388,750,233 B), and the remainder the
-    /// SQL pools and logs fetches share is 19,720,253,318 B. A remote S3
-    /// endpoint on the same host keeps the 25% carve, 6,943,751,168 B.
+    /// catalog cache keeps its 5% (1,388,750,233 B), the column-statistics
+    /// cache its 2% (555,500,093 B), and the remainder the SQL pools and logs
+    /// fetches share is 19,164,753,225 B. A remote S3 endpoint on the same
+    /// host keeps the 25% carve, 6,943,751,168 B, and the same 555,500,093 B
+    /// column-statistics cap.
     /// The startup line for `cache_max_bytes` names the loopback value and
     /// source, and the remainder line names the remainder.
     ///
@@ -18670,13 +19015,15 @@ mod tests {
             PERF_SOURCE_BUDGET_CARVE_LOOPBACK
         );
         assert_eq!(resolved.catalog_cache_max_bytes, 1_388_750_233);
-        assert_eq!(resolved.memory_hard_caps_bytes, 8_054_751_354);
-        assert_eq!(resolved.memory_remainder_bytes, 19_720_253_318);
+        assert_eq!(resolved.column_stats_cache_max_bytes, 555_500_093);
+        assert_eq!(resolved.memory_hard_caps_bytes, 8_610_251_447);
+        assert_eq!(resolved.memory_remainder_bytes, 19_164_753_225);
         assert_eq!(
             resolved.memory_remainder_bytes,
             AVAILABLE_ADR_EXPECTED_BUDGET_BYTES
                 - resolved.cache_max_bytes
                 - resolved.catalog_cache_max_bytes
+                - resolved.column_stats_cache_max_bytes
         );
 
         let (captured, _guard) = capture_events(tracing::Level::INFO);
@@ -18698,7 +19045,7 @@ mod tests {
             lines
                 .iter()
                 .any(|l| l.contains("setting=\"memory_remainder_bytes\"")
-                    && l.contains("value=19720253318")),
+                    && l.contains("value=19164753225")),
             "the remainder line must carry the remainder left by the 24% carve, lines: {lines:?}"
         );
         drop(lines);
@@ -18714,7 +19061,8 @@ mod tests {
             .expect("performance defaults resolve");
         assert_eq!(resolved.cache_max_bytes, 6_943_751_168);
         assert_eq!(resolved.sources.cache_max_bytes, PERF_SOURCE_BUDGET_CARVE);
-        assert_eq!(resolved.memory_remainder_bytes, 19_442_503_271);
+        assert_eq!(resolved.column_stats_cache_max_bytes, 555_500_093);
+        assert_eq!(resolved.memory_remainder_bytes, 18_887_003_178);
     }
 
     /// Under a finite cgroup limit the pre-amendment derivation is
@@ -18984,9 +19332,10 @@ mod tests {
     /// A derived tenant ceiling that the cap lowered and an explicit
     /// `--sql-max-query-bytes` then raised past the cap is not reported as
     /// capped: the logged value is the raised one. The explicit
-    /// `--cache-max-bytes` is the earlier 40% loopback carve, which leaves a
-    /// remainder of 15,276,252,571 whose 90% (13,748,627,313) is below the
-    /// derived 16,451,897,344 tenant pool, so the cap binds before the raise.
+    /// `--cache-max-bytes` is the earlier 40% loopback carve, which with the
+    /// catalog and column-statistics carves leaves a remainder of
+    /// 14,720,752,478 whose 90% (13,248,677,230) is below the derived
+    /// 16,451,897,344 tenant pool, so the cap binds before the raise.
     ///
     /// Prove-the-test: drop the `tenant_remainder_capped = false` in the
     /// raise arm and both capped flags read `true` beside a 20,000,000,000
@@ -19020,11 +19369,11 @@ mod tests {
         ])
         .resolve_performance(host)
         .expect("performance defaults resolve");
-        assert_eq!(unraised.memory_remainder_bytes, 15_276_252_571);
-        assert_eq!(unraised.sql_tenant_max_bytes, 13_748_627_313);
+        assert_eq!(unraised.memory_remainder_bytes, 14_720_752_478);
+        assert_eq!(unraised.sql_tenant_max_bytes, 13_248_677_230);
         assert!(unraised.sql_tenant_max_bytes_remainder_capped);
 
-        assert_eq!(resolved.memory_remainder_bytes, 15_276_252_571);
+        assert_eq!(resolved.memory_remainder_bytes, 14_720_752_478);
         assert_eq!(resolved.sql_tenant_max_bytes, 20_000_000_000);
         assert!(resolved.sql_tenant_max_bytes_raised);
         assert!(!resolved.sql_tenant_max_bytes_remainder_capped);
@@ -19143,9 +19492,11 @@ mod tests {
         );
         assert_eq!(resolved.cache_max_bytes, 268_435_456);
         assert_eq!(resolved.catalog_cache_max_bytes, 53_687_091);
-        assert_eq!(resolved.memory_remainder_bytes, 751_619_277);
+        assert_eq!(resolved.column_stats_cache_max_bytes, 21_474_836);
+        assert_eq!(resolved.memory_remainder_bytes, 730_144_441);
         assert!(resolved.cache_max_bytes > 0);
         assert!(resolved.catalog_cache_max_bytes > 0);
+        assert!(resolved.column_stats_cache_max_bytes > 0);
         assert!(resolved.memory_remainder_bytes > 0);
 
         let cli = Cli::try_parse_from(["ravel-server"]).expect("defaults parse");
@@ -19214,7 +19565,8 @@ mod tests {
             let budget = old_budget(total, available, own_rss);
             let cache = budget / 4;
             let catalog = budget * 5 / 100;
-            let remainder = budget - cache - catalog;
+            let column_stats = budget * 2 / 100;
+            let remainder = budget - cache - catalog - column_stats;
             let pool = (total / 2).min(remainder * 9 / 10);
             let label = format!("MemTotal {total}, MemAvailable {available}, RSS {own_rss}");
             assert_eq!(
@@ -19224,7 +19576,15 @@ mod tests {
             assert_eq!(resolved.memory_budget_bytes, budget, "{label}");
             assert_eq!(resolved.cache_max_bytes, cache, "{label}");
             assert_eq!(resolved.catalog_cache_max_bytes, catalog, "{label}");
-            assert_eq!(resolved.memory_hard_caps_bytes, cache + catalog, "{label}");
+            assert_eq!(
+                resolved.column_stats_cache_max_bytes, column_stats,
+                "{label}"
+            );
+            assert_eq!(
+                resolved.memory_hard_caps_bytes,
+                cache + catalog + column_stats,
+                "{label}"
+            );
             assert_eq!(resolved.memory_remainder_bytes, remainder, "{label}");
             assert_eq!(resolved.sql_tenant_max_bytes as u64, pool, "{label}");
             assert_eq!(resolved.sql_max_query_bytes as u64, pool, "{label}");
