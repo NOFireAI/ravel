@@ -51,6 +51,10 @@ rand = { workspace = true }
 # this crate's instrumented global allocator instead of a hand-rolled one
 # (the same pin six other workspace crates use).
 stats_alloc = "0.1.10"
+# A high-water heap peak for the postings memory bench (issue #3263):
+# `HeapStats::max_bytes` is a running maximum kept inside the allocator,
+# which stats_alloc does not track, without `unsafe` in this crate.
+dhat = "0.3.3"
 
 [lints]
 workspace = true
@@ -69,4 +73,12 @@ harness = false
 
 [[bench]]
 name = "rlog_postings_alloc"
+harness = false
+
+[[bench]]
+name = "rlog_postings_dhat"
+harness = false
+
+[[bench]]
+name = "rlog_postings_share"
 harness = false
