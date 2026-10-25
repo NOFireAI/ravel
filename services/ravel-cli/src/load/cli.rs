@@ -245,6 +245,7 @@ pub async fn run(
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
     load_memory_bytes: Option<u64>,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -267,6 +268,7 @@ pub async fn run(
         max_flush_delay,
         zstd_level,
         group_target_blocks,
+        chunk_order,
         LoadMemoryRequest::from_flag_on_host(load_memory_bytes),
         fold_after_load,
         ipcrypt,
@@ -370,6 +372,7 @@ pub(crate) async fn run_memory_warning_to(
         max_flush_delay,
         zstd_level,
         RlogGroupTargetBlocks::DEFAULT,
+        RlogChunkOrder::DEFAULT,
         load_memory,
         false,
         &IpcryptPolicy::empty(),
@@ -401,6 +404,7 @@ pub(crate) async fn run_fold_warning_to(
     max_flush_delay: Option<Duration>,
     zstd_level: RlogZstdLevel,
     group_target_blocks: RlogGroupTargetBlocks,
+    chunk_order: RlogChunkOrder,
     load_memory: LoadMemoryRequest,
     fold_after_load: bool,
     ipcrypt: &IpcryptPolicy,
@@ -433,6 +437,9 @@ pub(crate) async fn run_fold_warning_to(
         let _ = writeln!(warnings, "{warning}");
     }
     if let Some(warning) = unused_group_target_blocks_warning(group_target_blocks, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
+    if let Some(warning) = unused_chunk_order_warning(chunk_order, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
     // Every signal's loader resolves the budget once it knows the read-cursor
@@ -548,6 +555,7 @@ pub(crate) async fn run_fold_warning_to(
             None,
             zstd_level,
             group_target_blocks,
+            chunk_order,
             Some(memory_options),
             fold_after_load,
             rules,
@@ -972,6 +980,27 @@ pub(super) fn unused_group_target_blocks_warning(
             "warning: a {noun} load ignores --group-target-blocks {}. The row-group size \
              applies only to the RLOG objects a logs load writes.",
             group_target_blocks.get()
+        )
+    })
+}
+
+/// The warning for a `--chunk-order` a metrics or spans load cannot use, or
+/// `None` when the order is empty or the load is a logs load. The order
+/// reaches only the RLOG writer a logs flush runs.
+pub(super) fn unused_chunk_order_warning(
+    chunk_order: RlogChunkOrder,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (chunk_order != RlogChunkOrder::DEFAULT).then(|| {
+        format!(
+            "warning: a {noun} load ignores --chunk-order {}. The chunk order applies only \
+             to the RLOG objects a logs load writes.",
+            chunk_order.get().join(",")
         )
     })
 }

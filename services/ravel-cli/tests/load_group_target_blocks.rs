@@ -15,7 +15,7 @@ use parquet::arrow::ArrowWriter;
 
 use ravel_cli::load::{self, DEFAULT_DECODE_QUEUE_BATCHES, PER_BATCH_TARGET_BYTES};
 use ravel_cli::maintain::SignalArg;
-use ravel_ingest::{RlogGroupTargetBlocks, RlogZstdLevel};
+use ravel_ingest::{RlogChunkOrder, RlogGroupTargetBlocks, RlogZstdLevel};
 use ravel_logseg::footer::{self, kind};
 use ravel_logseg::page_dir::PageDir;
 use ravel_logseg::{RlogConfig, read_section};
@@ -79,6 +79,7 @@ async fn row_groups_at(
         None,
         RlogZstdLevel::DEFAULT,
         group_target_blocks,
+        RlogChunkOrder::DEFAULT,
         None,
         false,
         &ravel_cli::ipcrypt::IpcryptPolicy::empty(),

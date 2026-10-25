@@ -72,6 +72,20 @@ pub struct RlogConfig {
     /// treated as one block per group; an object with fewer blocks than this
     /// has one short row group.
     pub group_target_blocks: usize,
+    /// Attribute names whose columns take the lowest dynamic column ids, so
+    /// their chunks sit first and adjacent in every row group (ADR-3217
+    /// decision 8). The object's distinct `(name, type)` pairs whose name is
+    /// listed here get ids from `FIRST_DYNAMIC_COL` up, in this list's order
+    /// (one name with several types in type-byte order); the remaining pairs
+    /// follow in `(name bytes, type)` order. A listed name no record carries
+    /// is skipped. `max_dynamic_columns` truncates the combined order, so when
+    /// an object has more distinct pairs than the cap, a listed name takes a
+    /// column an unlisted one would otherwise have had. FIELD_DIR stays sorted
+    /// by `(name bytes, type)` and readers resolve ids through it, so this
+    /// changes which name gets which id and nothing else. Empty by default,
+    /// which is the alphabetical assignment. A `'static` slice keeps the config
+    /// `Copy`.
+    pub chunk_order: &'static [&'static str],
 }
 
 impl Default for RlogConfig {
@@ -86,6 +100,7 @@ impl Default for RlogConfig {
             postings_max_distinct: 10_000,
             postings_stride: DEFAULT_STRIDE,
             group_target_blocks: 32,
+            chunk_order: &[],
         }
     }
 }
@@ -533,7 +548,8 @@ impl RlogWriter {
             .collect();
 
         // Dynamic column assignment: distinct (name, type) sorted by
-        // (name bytes, type), the first `max_dynamic_columns` get columns.
+        // (name bytes, type), reordered by `chunk_order`, the first
+        // `max_dynamic_columns` get columns.
         let mut distinct: BTreeSet<(String, u8)> = BTreeSet::new();
         for r in &self.records {
             for (k, v) in &r.attrs {
@@ -589,7 +605,10 @@ impl RlogWriter {
         let distinct_total = distinct.len();
         let mut column_of: ColumnIndex = HashMap::new();
         let mut columns: Vec<(String, FieldType, u32)> = Vec::new();
-        for (idx, (name, ty_byte)) in distinct.into_iter().enumerate() {
+        for (idx, (name, ty_byte)) in dynamic_column_order(distinct, self.cfg.chunk_order)
+            .into_iter()
+            .enumerate()
+        {
             if idx >= self.cfg.max_dynamic_columns {
                 break;
             }
@@ -970,7 +989,7 @@ impl RlogWriter {
                 }
             })
             .collect();
-        let field_dir = FieldDir::new(field_entries);
+        let field_dir = sorted_field_dir(field_entries);
 
         let (blocks_bytes, l0, page_dir) = blocks.finish_checked()?;
         let skip = SkipIndex::build(l0);
@@ -1245,7 +1264,8 @@ impl RlogWriter {
         // Dynamic column assignment: distinct (name, type) over every batch's
         // dynamic columns (each is one (name, type) pair), plus the
         // stream-level-only columns build_object grants, sorted by
-        // (name bytes, type) and truncated at max_dynamic_columns.
+        // (name bytes, type), reordered by `chunk_order` and truncated at
+        // max_dynamic_columns.
         let mut distinct: BTreeSet<(String, u8)> = BTreeSet::new();
         for b in batches {
             for c in &b.dyn_columns {
@@ -1263,7 +1283,10 @@ impl RlogWriter {
         let distinct_total = distinct.len();
         let mut column_of: ColumnIndex = HashMap::new();
         let mut columns: Vec<(String, FieldType, u32)> = Vec::new();
-        for (idx, (name, ty_byte)) in distinct.into_iter().enumerate() {
+        for (idx, (name, ty_byte)) in dynamic_column_order(distinct, self.cfg.chunk_order)
+            .into_iter()
+            .enumerate()
+        {
             if idx >= self.cfg.max_dynamic_columns {
                 break;
             }
@@ -1994,7 +2017,7 @@ impl RlogWriter {
         drop(last_blk);
         drop(streams);
 
-        // FIELD_DIR.
+        // FIELD_DIR: one entry per in-budget column, sorted by (name, type).
         let field_entries: Vec<FieldEntry> = columns
             .iter()
             .map(|(name, ty, cid)| {
@@ -2009,7 +2032,7 @@ impl RlogWriter {
                 }
             })
             .collect();
-        let field_dir = FieldDir::new(field_entries);
+        let field_dir = sorted_field_dir(field_entries);
 
         let (blocks_bytes, l0, page_dir) = blocks.finish_checked()?;
         let skip = SkipIndex::build(l0);
@@ -3146,6 +3169,39 @@ fn insert_text(builder: &mut BloomBuilder, column_id: u32, bytes: &[u8]) {
     if bytes.len() <= EXACT_BLOOM_MAX {
         builder.insert(column_id, bytes);
     }
+}
+
+/// The order an object's distinct `(name, type)` pairs take dynamic column ids
+/// in ([`RlogConfig::chunk_order`]): the pairs named in `chunk_order` first, by
+/// their position there and then by type byte, then the rest in `distinct`'s
+/// `(name bytes, type)` order.
+fn dynamic_column_order(
+    distinct: BTreeSet<(String, u8)>,
+    chunk_order: &[&str],
+) -> Vec<(String, u8)> {
+    let mut position: HashMap<&str, usize> = HashMap::new();
+    for (i, name) in chunk_order.iter().enumerate() {
+        position.entry(name).or_insert(i);
+    }
+    let (mut ordered, rest): (Vec<_>, Vec<_>) = distinct
+        .into_iter()
+        .partition(|(name, _)| position.contains_key(name.as_str()));
+    // Stable, so one name's types keep `distinct`'s type-byte order.
+    ordered.sort_by_key(|(name, _)| position.get(name.as_str()).copied());
+    ordered.extend(rest);
+    ordered
+}
+
+/// FIELD_DIR over `entries`, sorted by `(name bytes, type)`: the format's
+/// entry order, which [`dynamic_column_order`] does not keep for the ids.
+fn sorted_field_dir(mut entries: Vec<FieldEntry>) -> FieldDir {
+    entries.sort_unstable_by(|a, b| {
+        a.name
+            .as_bytes()
+            .cmp(b.name.as_bytes())
+            .then_with(|| a.ty.to_u8().cmp(&b.ty.to_u8()))
+    });
+    FieldDir::new(entries)
 }
 
 /// The BLOOM coverage of one object under `scope`: `severity_text`, `body`, and

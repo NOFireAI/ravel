@@ -352,6 +352,33 @@ fn metrics_and_spans_warn_on_a_non_default_group_target_blocks_and_logs_does_not
     );
 }
 
+/// A non-empty `--chunk-order` on a metrics or spans load is named as
+/// ignored; the default, or any order on a logs load, is not.
+#[test]
+fn metrics_and_spans_warn_on_a_non_default_chunk_order_and_logs_does_not() {
+    let order =
+        RlogChunkOrder::new(vec!["UserID".into(), "SearchPhrase".into()]).expect("valid order");
+    assert_eq!(unused_chunk_order_warning(order, SignalArg::Logs), None);
+    assert_eq!(
+        unused_chunk_order_warning(RlogChunkOrder::DEFAULT, SignalArg::Spans),
+        None
+    );
+    assert_eq!(
+        unused_chunk_order_warning(order, SignalArg::Metrics).as_deref(),
+        Some(
+            "warning: a metrics load ignores --chunk-order UserID,SearchPhrase. The chunk \
+             order applies only to the RLOG objects a logs load writes."
+        )
+    );
+    assert_eq!(
+        unused_chunk_order_warning(order, SignalArg::Spans).as_deref(),
+        Some(
+            "warning: a spans load ignores --chunk-order UserID,SearchPhrase. The chunk \
+             order applies only to the RLOG objects a logs load writes."
+        )
+    );
+}
+
 /// The future-skew bound is kept and the past-lag bound is relaxed,
 /// both anchored on the span's END exactly as `checked_span_interval`
 /// anchors them.

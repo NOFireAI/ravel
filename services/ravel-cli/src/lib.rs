@@ -119,6 +119,15 @@ pub fn parse_group_target_blocks(s: &str) -> Result<ravel_ingest::RlogGroupTarge
         .map_err(|e| format!("invalid --group-target-blocks: {e}"))
 }
 
+/// Parse a `load --chunk-order` value, a comma-separated list of attribute
+/// names, refusing an empty, whitespace-padded, or repeated name with
+/// [`ravel_ingest::RlogChunkOrderError`]'s message. The whole list is one
+/// value so a repeated name is caught here, at parse time.
+pub fn parse_chunk_order(s: &str) -> Result<ravel_ingest::RlogChunkOrder, String> {
+    ravel_ingest::RlogChunkOrder::new(s.split(',').map(str::to_string).collect())
+        .map_err(|e| format!("invalid --chunk-order: {e}"))
+}
+
 /// Parse an `export --max-ingest-lag` value into nanoseconds.
 ///
 /// Same humantime grammar as [`parse_max_flush_lifetime_ns`], naming the flag
