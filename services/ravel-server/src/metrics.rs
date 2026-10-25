@@ -11664,9 +11664,9 @@ mod tests {
     /// HELP, TYPE and value each was driven with. Every field carries a
     /// distinct value, and so does each signal's drop count, so a renderer
     /// that read one field into another's series, or paired a drop count with
-    /// the wrong signal, fails here. A gateway process renders the four
-    /// process-wide series and no fold-drop family, which renders only where a
-    /// fold can run.
+    /// the wrong signal, fails here. The fold-drop family renders only where a
+    /// fold can run: a query process, which folds on demand, renders it, and a
+    /// gateway renders the four process-wide series and no fold-drop family.
     #[test]
     fn column_stats_cache_and_fold_drop_series_render_at_metrics() {
         let mut catalog = CatalogCountersSnapshot {
@@ -11756,6 +11756,17 @@ mod tests {
         assert_eq!(
             drop_samples, 3,
             "one drop series per folded signal:\n{body}"
+        );
+
+        let query = render_in(Mode::Query);
+        assert_eq!(
+            query
+                .lines()
+                .filter(|line| *line
+                    == "ravel_catalog_fold_column_stats_dictionaries_dropped_total{mode=\"query\",signal=\"logs\"} 22")
+                .count(),
+            1,
+            "a query process folds on demand and renders the drop counter:\n{query}"
         );
 
         let gateway = render_in(Mode::Gateway);
