@@ -8,12 +8,15 @@
 //! every such panic.
 //!
 //! The same boundary types the decoder's errors. An error the stream yields
-//! whose chain holds no [`ParquetReadError`] and ends at a `ParquetError`, or
-//! at the `ArrowError::ParquetError` the parquet crate converts one into,
+//! whose chain holds no [`ParquetReadError`] and holds a `ParquetError`, or
+//! ends at the `ArrowError::ParquetError` the parquet crate converts one into,
 //! becomes [`ParquetReadError::Corrupt`] naming the file the partition opened
 //! last. Every other error, a budget refusal, a store failure or a DataFusion
 //! error among them, passes through unchanged, and so does every error
-//! yielded before the partition opened a file.
+//! yielded before the partition opened a file. A SQL client therefore gets a
+//! decoder error the same answer as a decoder panic, the integrity-validation
+//! error (HTTP 500) rather than an execution error (HTTP 422); the file and
+//! table are named only in the server-side error.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -292,21 +295,26 @@ impl BoundaryStream {
     }
 }
 
-/// Whether `err` is one the Parquet decoder raised and nothing typed: its
-/// chain holds no [`ParquetReadError`] and ends at a `ParquetError`, or at
-/// the `ArrowError::ParquetError` the parquet crate converts one into.
+/// Whether `err` is one the Parquet decoder raised and nothing typed: no link
+/// of its chain is a [`ParquetReadError`], and some link is a `ParquetError`
+/// or the chain ends at the `ArrowError::ParquetError` the parquet crate
+/// converts one into. The `ParquetError` need not be last: parquet's
+/// `From<ArrowError>` wraps an arrow error in `ParquetError::External`, and
+/// that arrow error ends the chain.
 fn is_untyped_decoder_error(err: &DataFusionError) -> bool {
     let mut current: &(dyn std::error::Error + 'static) = err;
+    let mut parquet = false;
     loop {
         if current.is::<ParquetReadError>() {
             return false;
         }
+        parquet |= current.is::<ParquetError>();
         match current.source() {
             Some(source) => current = source,
             None => break,
         }
     }
-    current.is::<ParquetError>()
+    parquet
         || matches!(
             current.downcast_ref::<ArrowError>(),
             Some(ArrowError::ParquetError(_))
@@ -355,6 +363,11 @@ mod tests {
     use ravel_object_store::memory::MemoryStore;
     use ravel_query::{ByteLimit, RequestLimit};
 
+    use datafusion::arrow::error::ArrowError;
+    use datafusion::error::DataFusionError;
+    use parquet::errors::ParquetError;
+
+    use super::is_untyped_decoder_error;
     use crate::error::ParquetReadError;
     use crate::limits::ReadLimits;
     use crate::test_support::{Fixture, footer_len_of, parquet_bytes, read_all, read_error};
@@ -455,5 +468,56 @@ mod tests {
             ),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn a_bare_parquet_error_is_an_untyped_decoder_error() {
+        let err = DataFusionError::ParquetError(Box::new(ParquetError::General(
+            "Required field type_ is missing".to_string(),
+        )));
+        assert!(is_untyped_decoder_error(&err), "{err:?}");
+    }
+
+    /// parquet's `From<ArrowError>` wraps the arrow error in
+    /// `ParquetError::External`, and an `ArrowError` other than
+    /// `ArrowError::ParquetError` has no source, so the chain ends at it.
+    #[test]
+    fn an_arrow_error_inside_a_parquet_error_is_an_untyped_decoder_error() {
+        let err = DataFusionError::External(Box::new(ParquetError::External(Box::new(
+            ArrowError::InvalidArgumentError("offset overflow".to_string()),
+        ))));
+        assert!(is_untyped_decoder_error(&err), "{err:?}");
+    }
+
+    #[test]
+    fn an_arrow_parquet_error_is_an_untyped_decoder_error() {
+        let err = DataFusionError::ArrowError(
+            Box::new(ArrowError::ParquetError(
+                "eof decoding byte array".to_string(),
+            )),
+            None,
+        );
+        assert!(is_untyped_decoder_error(&err), "{err:?}");
+    }
+
+    #[test]
+    fn a_chain_holding_a_parquet_read_error_is_not_untyped() {
+        let typed = ParquetReadError::Corrupt {
+            key: BAD.to_string(),
+            message: "bad page".to_string(),
+        };
+        let err = DataFusionError::External(Box::new(typed.into_parquet()));
+        assert!(!is_untyped_decoder_error(&err), "{err:?}");
+    }
+
+    #[test]
+    fn an_error_with_no_parquet_error_is_not_untyped() {
+        let plan = DataFusionError::Plan("no such column".to_string());
+        assert!(!is_untyped_decoder_error(&plan), "{plan:?}");
+        let compute = DataFusionError::ArrowError(
+            Box::new(ArrowError::ComputeError("overflow".to_string())),
+            None,
+        );
+        assert!(!is_untyped_decoder_error(&compute), "{compute:?}");
     }
 }
