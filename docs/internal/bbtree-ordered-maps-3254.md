@@ -1,7 +1,9 @@
-# bbtree's single-owner map on the compaction grouping stage (issue #3254)
+# bbtree's single-owner map on two Ravel hot paths (issue #3254)
 
 Whether `bbtree::unsync::BBTreeMap` (bbtree 0.1.5) beats std's `BTreeMap`
-on one Ravel hot path: the series grouping map of metrics compaction. Every
+on two Ravel hot paths: the series grouping map of metrics compaction
+(candidate 1, the sections up to Decision) and the RLOG writer's postings
+maps (candidate 2, its own section below). Every
 figure below names the command that produced it and the run it came from.
 Logs live under `.gate-logs/` (ignored) in the checkout that ran them; the
 numbers are copied here.
@@ -257,6 +259,103 @@ clause; C fails the speed clause. Because no arm passed the stage-level
 rule, the 2% whole-build clause was not reached and the stage was not
 profiled against a whole build. The benchmark stays in the tree as the
 record of the measurement.
+
+## Candidate 2: the RLOG writer's postings maps
+
+### What was measured
+
+`RlogWriter::build_object` and `build_object_columnar` in
+`crates/ravel-logseg/src/writer.rs` accumulate the POSTINGS section in
+
+```rust
+let mut postings_terms: BTreeMap<u32, BTreeMap<Vec<u8>, BTreeSet<u32>>> = BTreeMap::new();
+...
+for row in block_rows {
+    for (cid, v) in &row.indexed_terms {
+        if postings_capped.contains(cid) { continue; }
+        let field_map = postings_terms.entry(*cid).or_default();
+        field_map.entry(term_key(v)).or_default().insert(blk_idx_u32);
+        if field_map.len() > self.cfg.postings_max_distinct { /* drop, mark capped */ }
+    }
+}
+```
+
+and hand each field's term map to the encoder as `FieldTerms::Terms(map)`,
+which takes a `BTreeMap<Vec<u8>, BTreeSet<u32>>`. This runs on every logs
+flush: `crates/ravel-ingest/src/log_shard.rs` builds an `RlogWriter` with
+`with_indexed_fields`, and the server's default indexed fields are
+`service.name`, `k8s.namespace.name` and `http.status_code`
+(`services/ravel-server/src/postings_config.rs`). RLOG compaction in this
+crate re-encodes through the same writer (`RlogWriter::finish_compacted`,
+called from `src/rlog.rs`), which is why the bench sits in
+`crates/ravel-maintain/benches` next to candidate 1 rather than in
+ravel-logseg: one dev-dependency, one gate scope.
+
+Per indexed term: one `term_key` (an owned `Vec<u8>` clone of the value, or
+the 8 big-endian bytes of an integer), a lookup in a 3-entry outer map, an
+`entry` on the field's term map (a `Vec<u8>` key compare per node visited;
+the key is dropped when the term already exists), and a `BTreeSet<u32>`
+insert of the block index, which is a no-op after a term's first row in a
+block. Then one ordered conversion per field at the encoding boundary.
+
+### Fixture and arms
+
+`crates/ravel-maintain/benches/common/postings.rs`. Rows of 8,192 per block
+(`block_target_records`), each with three indexed values drawn uniformly:
+two string fields whose terms are 8 to 40 bytes over 4 or 5 shared prefixes
+(`payments-`, `prod-eu-west-1-`, ...), and an integer status field with 20
+values. Seed `0x3254_0b7e_e5ee_d002`. No geometry reaches the 10,000
+distinct-term cap (`postings_max_distinct`), so every insert is counted.
+
+| geometry | blocks | rows | inserts | string field terms |
+|---|---|---|---|---|
+| small | 2 | 16,384 | 49,152 | 200 and 40 |
+| medium | 16 | 131,072 | 393,216 | 200 and 40 |
+| large | 64 | 524,288 | 1,572,864 | 2,000 and 200 |
+| highcard | 16 | 131,072 | 393,216 | 5,000 and 5,000 |
+
+Arms: A, std maps as the writer has them; B, `bbtree::unsync::BBTreeMap`
+and `BBTreeSet` throughout, converted to the std types at the boundary; C,
+`HashMap` for the outer and term maps (block sets stay `BTreeSet`), the
+term map collected into a `BTreeMap` at the boundary. Conversions are
+charged to their arm. A checksum over every field, term and block id in the
+converted maps, in order, is asserted equal to A's before timing. Timing:
+`benches/rlog_postings.rs`, same command shape and same two arm orders as
+candidate 1. Memory: `benches/rlog_postings_alloc.rs` on large.
+
+### Pre-registered expectations
+
+Written and committed before any figure from these benches was produced.
+
+| geometry | expected A median | miss band |
+|---|---|---|
+| small | 7 ms | outside 2.3 to 21 ms |
+| medium | 60 ms | outside 20 to 180 ms |
+| large | 280 ms | outside 90 to 840 ms |
+| highcard | 80 ms | outside 27 to 240 ms |
+
+Basis: candidate 1's A cost about 180 ns per contribution on this box;
+per term here, a small allocation and free (the term key), a descent over
+at most a few thousand terms with prefix-sharing compares, and a set insert
+that is usually a hit.
+
+Expected A memory on large: peak live about 1 MB (2,220 terms, each a key
+of about 25 bytes plus a block set of up to 64 ids plus its tree slot), miss
+band outside 0.3 to 3 MB; allocations about 1.58 million, dominated by one
+`term_key` per insert; reallocations near zero.
+
+Expectations for the alternatives: B within 20% of A either way; C 10 to 30%
+faster than A on medium, large and highcard (one SipHash of about 25 bytes
+against a descent with several prefix-sharing compares); C's peak within
+10% of A's.
+
+Decision rule: candidate 1's, with highcard in distinct's role (the
+geometry with the most distinct keys): adopt only if, in both runs, the arm
+is at least 10% faster than A on medium AND large, no slower beyond noise on
+small and highcard, and its peak live bytes on large are not more than 5%
+above A. If both pass, take the smaller `src/` diff. If the accumulation is
+under 2% of a whole RLOG object build, a stage win stays a documented
+experiment.
 
 ## Not tested
 

@@ -65,3 +65,11 @@ harness = false
 [[bench]]
 name = "compaction_grouping_alloc"
 harness = false
+
+[[bench]]
+name = "rlog_postings"
+harness = false
+
+[[bench]]
+name = "rlog_postings_alloc"
+harness = false
