@@ -357,6 +357,124 @@ above A. If both pass, take the smaller `src/` diff. If the accumulation is
 under 2% of a whole RLOG object build, a stage win stays a documented
 experiment.
 
+### Results
+
+Same box, toolchain and `CARGO_BUILD_JOBS=2` as candidate 1. Both runs:
+`GROUPING_ARM_ORDER=<order> CARGO_BUILD_JOBS=2 cargo bench -p
+ravel-maintain --bench rlog_postings -- --noplot`; medians and 95%
+confidence intervals of the median, in ms, from
+`target/criterion/postings_<geometry>/<arm>/new/estimates.json`. Another
+session on the host was compiling during both runs (load average 1.41
+rising to 2.94 across run 1, 2.66 rising to 3.86 across run 2, one `rustc`
+at 99.7% CPU when run 2 started), so absolute figures moved between runs:
+A on large read 482.1 ms in run 1 and 340.4 ms in run 2.
+
+Run 1, `GROUPING_ARM_ORDER=ABC`:
+
+| geometry | A std BTreeMap | B bbtree | C HashMap + collect | B vs A | C vs A |
+|---|---|---|---|---|---|
+| small | 6.027 (6.026 to 6.029) | 9.438 (9.429 to 9.455) | 4.532 (4.529 to 4.534) | +57% | -25% |
+| medium | 52.2 (52.2 to 52.2) | 77.3 (76.8 to 77.3) | 40.3 (39.2 to 41.5) | +48% | -23% |
+| large | 482.1 (462.4 to 497.6) | 576.6 (567.0 to 612.4) | 301.4 (283.6 to 315.1) | +20% | -37% |
+| highcard | 187.2 (184.6 to 190.6) | 242.8 (238.5 to 255.4) | 124.7 (123.0 to 126.4) | +30% | -33% |
+
+Run 2, `GROUPING_ARM_ORDER=CBA`:
+
+| geometry | A std BTreeMap | B bbtree | C HashMap + collect | B vs A | C vs A |
+|---|---|---|---|---|---|
+| small | 6.330 (6.306 to 6.348) | 10.054 (10.010 to 10.126) | 4.801 (4.781 to 4.835) | +59% | -24% |
+| medium | 53.7 (53.7 to 53.8) | 80.2 (79.6 to 80.8) | 41.1 (40.7 to 41.3) | +49% | -23% |
+| large | 340.4 (339.1 to 341.0) | 483.6 (441.9 to 555.5) | 230.1 (219.7 to 251.1) | +42% | -32% |
+| highcard | 123.3 (122.4 to 192.9) | 231.2 (227.7 to 233.0) | 125.4 (80.3 to 128.5) | +87% | +2% |
+
+Every arm's checksum matched A's on every geometry before timing. Every A
+median fell inside its pre-registered band. Pre-registered expectations
+that missed: B was 20 to 87% slower, outside the expected 20% either way;
+C on large (32 to 37% faster) beat the expected 10 to 30%; C on highcard
+was 33% faster in run 1 and level in run 2, where both A's and C's
+intervals are wide (A 122.4 to 192.9 ms, C 80.3 to 128.5 ms).
+
+### Memory
+
+`CARGO_BUILD_JOBS=2 cargo bench -p ravel-maintain --bench
+rlog_postings_alloc -- large` (exit 0; 1,572,864 inserts, 1,572,865
+samples per arm as the binary checks; every arm left 0 bytes live and
+produced checksum 0x353d05aff71b5dee):
+
+| arm | peak live, sampled (bytes) | peak live, bound (bytes) | allocations | reallocations |
+|---|---|---|---|---|
+| A std BTreeMap | 1,681,633 | 1,681,633 | 1,595,340 | 0 |
+| B bbtree | 2,674,945 (+59%) | 4,644,873 (+176%) | 1,593,251 | 0 |
+| C HashMap + collect | 1,724,869 (+2.6%) | 2,051,781 (+22%) | 1,595,266 | 0 |
+
+A's peak sits inside its pre-registered 0.3 to 3 MB band, and its
+allocation count matches the prediction of about 1.58 million (one
+`term_key` per insert). The sampled figure is a lower bound on an arm's
+true peak and the bound an upper one. For C they straddle the 5% line: its
+bound includes the encoding-boundary conversion, which the bench samples
+once after all three fields, so it adds every allocation of that step
+(`BTreeMap::from_iter` collects into a `Vec`, sorts it, and builds nodes)
+on top of the live figure before it, even those freed before the next was
+made. This method cannot place C's true peak more tightly.
+
+### Decision
+
+No change to `writer.rs`. B fails the speed clause on every geometry and
+the memory clause. C passes the speed clauses in both runs: at least 10%
+faster than A on medium (23%, 23%) and large (37%, 32%), faster than A
+beyond noise on small in both runs, and not slower beyond noise on
+highcard (its interval in run 2 is not wholly above A's). C does not
+demonstrably pass the memory clause: its sampled peak is 2.6% above A's,
+its upper bound 22% above, and the rule adopts only on evidence that the
+peak is within 5%. Because no arm passed every clause, the 2% whole-build
+clause was not assessed. In absolute terms the gap in question is at most
+370,148 bytes (2,051,781 minus 1,681,633) on a 524,288-row object; the
+rule is applied as fixed rather than re-weighed after the fact.
+
+## Class closure: `BTreeMap<[u8; 16]` across crates/
+
+`grep -rn "BTreeMap<\[u8; 16\]" crates/`, excluding the benches added here:
+
+| site | status |
+|---|---|
+| `ravel-maintain/src/build.rs:219` (`by_series`) | measured as candidate 1; no change |
+| `ravel-maintain/src/build.rs:203` (exemplars) | out of scope: optional section, absent in the scale fixtures (see What was measured) |
+| `ravel-maintain/src/erasure_rewrite.rs:1090` (`build_rewrite`'s `by_series`) | out of scope: same type and fill/drain shape as `build.rs:219`, so candidate 1's result is the expected one; runs on erasure rewrites, not every compaction; not measured separately |
+| `ravel-maintain/src/rspan_codec.rs:1301`, `:1844`, `:1967` | out of scope: inside the `#[cfg(test)]` module (from line 918) |
+| `ravel-maintain/src/compact.rs:1361` | out of scope: inside the `#[cfg(test)]` module (from line 757) |
+| `ravel-maintain/tests/common/mod.rs:278`, `:286`, `:321`, `:322`, `:793`, `:795`, `:811`, `:812` | out of scope: test helpers |
+| `ravel-maintain/tests/erasure_rewrite_provenance.rs:511` to `:820`, `ravel-maintain/tests/erasure_sweep.rs:1183` | out of scope: test code |
+| `ravel-query/tests/differential_compaction.rs:236`, `:238` | out of scope: test oracle |
+| `ravel-sql/tests/differential.rs:700`, `ravel-sql/tests/util/gate.rs:373` | out of scope: test oracle |
+
 ## Not tested
 
-(filled in after the runs)
+- Candidate 3, named only: `fold_value` in ravel-catalog's
+  `column_stats_build.rs`, the catalog cache's recency index, and the
+  ravel-cache bulk region. None was read or measured.
+- The exemplar map at `build.rs:203` and the erasure-rewrite grouping at
+  `erasure_rewrite.rs:1090` (see Class closure).
+- Production's allocator. Both benches run on the system allocator; the
+  shipped `ravel-server` and `ravel-cli` use jemalloc, where the per-insert
+  `term_key` allocation and free that every postings arm pays costs
+  differently.
+- Whole-build share. Neither stage was timed against a whole compaction or
+  a whole RLOG object build, because no arm passed the stage-level rule.
+- A quiet host. Both postings runs and candidate 1's run 2 shared the box
+  with another session's compile.
+- The sorted-input hypothesis for candidate 1's C result (shuffle each
+  input's series order and rerun).
+
+Next experiment: candidate 2's C on its own. Pin its true peak with a
+high-water allocator (one that tracks a running maximum inside the
+allocation call, which stats_alloc does not do and which needs either an
+exemption from `unsafe_code = "forbid"` for one bench file or a new
+dev-dependency), rerun both orders on a quiet host, and time the postings
+pass against a whole RLOG object build to settle the 2% clause (the
+writer's `stage-timing` feature times only the bloom window,
+`WriteStats::bloom_total_ns`, so the postings pass needs a profile or a
+timer of its own). If C's peak is within
+5% and the postings pass is at least 2% of the build, the change is local
+to `writer.rs`: `HashMap` accumulation and a `collect` into the
+`BTreeMap` that `FieldTerms::Terms` takes, at the two `postings_terms`
+sites.
