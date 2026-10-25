@@ -2745,11 +2745,11 @@ mod tests {
             let original = valid();
             let mutated = mutation.apply(&original);
             prop_assume!(mutated != original);
-            if let Err(err) = scan_second_file_where(mutated, Some(page_pruning_filter()))
-                && let Some(found) = read_error(&err)
-            {
+            if let Err(err) = scan_second_file_where(mutated, Some(page_pruning_filter())) {
+                let found = read_error(&err);
+                prop_assert!(found.is_some(), "no ParquetReadError in {err:?}");
                 prop_assert!(
-                    matches!(&found, ParquetReadError::Corrupt { key, .. } if key == KEY),
+                    matches!(&found, Some(ParquetReadError::Corrupt { key, .. }) if key == KEY),
                     "{err}"
                 );
             }
@@ -2758,8 +2758,8 @@ mod tests {
         /// Any byte change, anywhere in the file, ends the scan with an error
         /// or with rows, never a panic. The reader cannot refuse every change:
         /// nothing it checks covers the page values, so a flipped value byte
-        /// decodes as a different value. When the error carries a
-        /// `ParquetReadError`, it is `Corrupt` and names the changed file.
+        /// decodes as a different value. Every error carries a
+        /// `ParquetReadError`: `Corrupt`, naming the changed file.
         #[test]
         fn any_byte_change_is_an_error_or_rows_never_a_panic(
             mutation in any_mutation(),
@@ -2767,11 +2767,11 @@ mod tests {
             let original = valid();
             let mutated = mutation.apply(&original);
             prop_assume!(mutated != original);
-            if let Err(err) = scan_with_second_file(mutated)
-                && let Some(found) = read_error(&err)
-            {
+            if let Err(err) = scan_with_second_file(mutated) {
+                let found = read_error(&err);
+                prop_assert!(found.is_some(), "no ParquetReadError in {err:?}");
                 prop_assert!(
-                    matches!(&found, ParquetReadError::Corrupt { key, .. } if key == KEY),
+                    matches!(&found, Some(ParquetReadError::Corrupt { key, .. }) if key == KEY),
                     "{err}"
                 );
             }

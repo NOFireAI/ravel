@@ -6,6 +6,14 @@
 //! stream's `poll_next` (DataFusion's `FileStream` polls the decoder in
 //! place and spawns no task for it), so a boundary around that stream sees
 //! every such panic.
+//!
+//! The same boundary types the decoder's errors. An error the stream yields
+//! whose chain holds no [`ParquetReadError`] and ends at a `ParquetError`, or
+//! at the `ArrowError::ParquetError` the parquet crate converts one into,
+//! becomes [`ParquetReadError::Corrupt`] naming the file the partition opened
+//! last. Every other error, a budget refusal, a store failure or a DataFusion
+//! error among them, passes through unchanged, and so does every error
+//! yielded before the partition opened a file.
 
 use std::any::Any;
 use std::cell::Cell;
@@ -17,6 +25,7 @@ use std::task::{Context, Poll};
 
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::error::ArrowError;
 use datafusion::common::Statistics;
 use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::config::ConfigOptions;
@@ -33,6 +42,7 @@ use datafusion::physical_plan::{
     ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, StatisticsArgs,
 };
 use futures::{Stream, StreamExt};
+use parquet::errors::ParquetError;
 
 use crate::error::ParquetReadError;
 
@@ -52,7 +62,8 @@ pub(crate) fn record_opened(key: String) {
 }
 
 /// A Parquet table's scan, whose output stream turns a panic raised while it
-/// is polled into [`ParquetReadError::Corrupt`] naming the table and the file.
+/// is polled, and an untyped decoder error it yields, into
+/// [`ParquetReadError::Corrupt`] naming the table and the file.
 ///
 /// It is transparent to the optimizer: its properties are the inner plan's,
 /// and every rewrite DataFusion would apply to the inner plan (projection,
@@ -262,6 +273,44 @@ impl BoundaryStream {
         };
         DataFusionError::External(Box::new(error))
     }
+
+    /// `err` as [`ParquetReadError::Corrupt`] naming the file this partition
+    /// opened last when it is an untyped decoder error, and as is otherwise.
+    fn decoder_failed(&self, err: DataFusionError) -> DataFusionError {
+        match &self.opened {
+            Some(key) if is_untyped_decoder_error(&err) => {
+                DataFusionError::External(Box::new(ParquetReadError::Corrupt {
+                    key: key.clone(),
+                    message: format!(
+                        "the Parquet decoder failed while scanning table {}: {err}",
+                        self.table
+                    ),
+                }))
+            }
+            _ => err,
+        }
+    }
+}
+
+/// Whether `err` is one the Parquet decoder raised and nothing typed: its
+/// chain holds no [`ParquetReadError`] and ends at a `ParquetError`, or at
+/// the `ArrowError::ParquetError` the parquet crate converts one into.
+fn is_untyped_decoder_error(err: &DataFusionError) -> bool {
+    let mut current: &(dyn std::error::Error + 'static) = err;
+    loop {
+        if current.is::<ParquetReadError>() {
+            return false;
+        }
+        match current.source() {
+            Some(source) => current = source,
+            None => break,
+        }
+    }
+    current.is::<ParquetError>()
+        || matches!(
+            current.downcast_ref::<ArrowError>(),
+            Some(ArrowError::ParquetError(_))
+        )
 }
 
 impl Stream for BoundaryStream {
@@ -278,6 +327,7 @@ impl Stream for BoundaryStream {
         let polled = catch_unwind(AssertUnwindSafe(|| self.inner.poll_next_unpin(cx)));
         self.opened = OPENED.replace(outer);
         match polled {
+            Ok(Poll::Ready(Some(Err(err)))) => Poll::Ready(Some(Err(self.decoder_failed(err)))),
             Ok(next) => next,
             Err(payload) => {
                 self.panicked = true;
@@ -291,5 +341,119 @@ impl Stream for BoundaryStream {
 impl RecordBatchStream for BoundaryStream {
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.schema)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use datafusion::prelude::SessionConfig;
+    use ravel_object_store::ObjectStoreBackend;
+    use ravel_object_store::memory::MemoryStore;
+    use ravel_query::{ByteLimit, RequestLimit};
+
+    use crate::error::ParquetReadError;
+    use crate::limits::ReadLimits;
+    use crate::test_support::{Fixture, footer_len_of, parquet_bytes, read_all, read_error};
+
+    const GOOD: &str = "lake/t/good.parquet";
+    const BAD: &str = "lake/t/bad.parquet";
+
+    /// A file whose first value of column `b`, "four", has its PLAIN length
+    /// prefix raised past the end of its page, so the decoder returns an
+    /// error reading it rather than panicking.
+    fn byte_array_longer_than_its_page() -> Vec<u8> {
+        let mut bytes = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]).to_vec();
+        let prefix = [4, 0, 0, 0, b'f', b'o', b'u', b'r'];
+        let at: Vec<usize> = bytes
+            .windows(prefix.len())
+            .enumerate()
+            .filter(|(_, w)| *w == prefix)
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(at.len(), 1, "one length-prefixed \"four\": {at:?}");
+        bytes[at[0] + 3] = 0x7f;
+        bytes
+    }
+
+    /// Scan `a` and `b` of a table of `GOOD`, intact, then `second` at
+    /// `BAD`, in one partition, with reads admitted against `limits`. With
+    /// `exhaust`, the budget is used up after the table is built and before
+    /// the scan.
+    async fn scan_good_then(
+        second: Vec<u8>,
+        memory: Arc<ravel_memory::MemoryBudget>,
+        exhaust: bool,
+    ) -> datafusion::error::Result<String> {
+        let store = Arc::new(MemoryStore::new());
+        let limits = ReadLimits::new(
+            Arc::clone(&memory),
+            ByteLimit::Unlimited,
+            RequestLimit::Unlimited,
+        );
+        let fixture =
+            Fixture::new(Arc::clone(&store) as Arc<dyn ObjectStoreBackend>).with_limits(limits);
+        let good = fixture
+            .put_file(
+                &store,
+                GOOD,
+                parquet_bytes(&[1, 2, 3], &["one", "two", "six"]),
+                false,
+            )
+            .await;
+        let (size, footer_len) = (second.len() as u64, footer_len_of(&second));
+        let bad = fixture
+            .put_raw(&store, BAD, Bytes::from(second), size, footer_len)
+            .await;
+        let table = fixture.provider("t", 1, vec![good, bad], false).await;
+        let ctx = fixture.session_with(
+            SessionConfig::new().with_target_partitions(1),
+            &[("t", table)],
+        );
+        if exhaust {
+            memory.reserve_unchecked(memory.limit());
+        }
+        read_all(&ctx, "t", &["a", "b"]).await
+    }
+
+    /// A decoder error in the second file of a one-partition scan is
+    /// `Corrupt` naming that file, not the first one the partition opened.
+    #[tokio::test]
+    async fn a_decoder_error_in_the_second_file_is_corrupt_naming_it() {
+        let memory = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let err = scan_good_then(byte_array_longer_than_its_page(), memory, false)
+            .await
+            .expect_err("the corrupt file must fail the scan");
+        match read_error(&err) {
+            Some(ParquetReadError::Corrupt { key, message }) => {
+                assert_eq!(key, BAD, "{err}");
+                assert!(
+                    message.contains("the Parquet decoder failed while scanning table t: "),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Corrupt for {BAD}, got {other:?} from {err:?}"),
+        }
+    }
+
+    /// A read the memory budget refuses during the scan surfaces as
+    /// `MemoryExhausted`, not as `Corrupt`.
+    #[tokio::test]
+    async fn a_memory_refusal_during_the_scan_stays_memory_exhausted() {
+        let memory = Arc::new(ravel_memory::MemoryBudget::new(1 << 30));
+        let intact = parquet_bytes(&[4, 5, 6], &["four", "five", "sixx"]).to_vec();
+        let err = scan_good_then(intact, memory, true)
+            .await
+            .expect_err("an exhausted budget must fail the scan");
+        assert!(
+            matches!(
+                read_error(&err),
+                Some(ParquetReadError::MemoryExhausted { .. })
+            ),
+            "{err:?}"
+        );
     }
 }
