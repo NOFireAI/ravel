@@ -10,14 +10,15 @@
 //! fixture, which is built before measuring.
 //!
 //! Usage: `cargo bench -p ravel-maintain --bench rlog_postings_alloc`,
-//! optionally followed by `-- <geometry>` (default `large`). Exits non-zero
-//! when an arm's checksum disagrees with arm A, an arm leaves bytes live
-//! after it returns, the sample count is not exactly one per insert plus one
-//! per field, or, on `large`, arm A's peak live bytes fall outside the
-//! pre-registered band.
+//! optionally followed by `-- <geometry> [<family>]` (default `large`
+//! `random`). Exits non-zero when an arm's checksum disagrees with arm A, an
+//! arm leaves bytes live after it returns, the sample count is not exactly
+//! one per insert plus one per field, or, on `large`, arm A's peak live bytes
+//! fall outside the family's pre-registered band.
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::alloc::System;
+use std::ops::RangeInclusive;
 use std::process::ExitCode;
 
 use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
@@ -25,14 +26,20 @@ use stats_alloc::{INSTRUMENTED_SYSTEM, Region, Stats, StatsAlloc};
 #[path = "common/postings.rs"]
 mod postings;
 
-use postings::{INDEXED, Value, arm_label, fixture, geometry, run_arm};
+use postings::{Family, INDEXED, Value, arm_label, fixture_for, geometry, run_arm};
 
 #[global_allocator]
 static GLOBAL: &StatsAlloc<System> = &INSTRUMENTED_SYSTEM;
 
-/// Arm A's pre-registered peak live band on `large`, in bytes (0.3 to 3 MB; the
-/// postings pre-registration in docs/internal/bbtree-ordered-maps-3254.md).
-const A_LARGE_PEAK_BAND: std::ops::RangeInclusive<isize> = 300_000..=3_000_000;
+/// Arm A's pre-registered peak live band on `large`, in bytes, per family
+/// (docs/internal/bbtree-ordered-maps-3254.md, Candidate 2): 0.3 to 3 MB for
+/// random (#3254), 0.15 to 1 MB for sorted (#3263).
+fn a_large_peak_band(family: Family) -> RangeInclusive<isize> {
+    match family {
+        Family::Random => 300_000..=3_000_000,
+        Family::Sorted => 150_000..=1_000_000,
+    }
+}
 
 fn live(s: &Stats) -> isize {
     s.bytes_allocated as isize - s.bytes_deallocated as isize
@@ -88,12 +95,19 @@ fn main() -> ExitCode {
     } else {
         "small".to_string()
     };
+    let family = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .nth(1)
+        .map(|f| Family::parse(&f).unwrap_or_else(|| panic!("no fixture family named {f}")))
+        .unwrap_or(Family::Random);
     let g = geometry(&name);
-    let rows = fixture(g);
+    let rows = fixture_for(family, g);
     let inserts = rows.len() * INDEXED.len();
     println!(
-        "rlog_postings_alloc geometry={} blocks={} rows={} inserts={inserts} \
+        "rlog_postings_alloc family={} geometry={} blocks={} rows={} inserts={inserts} \
          service_terms={} namespace_terms={} seed={:#x}",
+        family.name(),
         g.name,
         g.blocks,
         rows.len(),
@@ -151,23 +165,24 @@ fn main() -> ExitCode {
     // The band was registered for `large` only; on that geometry A's peak
     // must be present exactly once and inside it.
     if g.name == "large" {
-        let lo = A_LARGE_PEAK_BAND.start();
-        let hi = A_LARGE_PEAK_BAND.end();
+        let band = a_large_peak_band(family);
+        let (lo, hi) = (band.start(), band.end());
+        let fam = family.name();
         match a_peaks.as_slice() {
             [peak] => {
-                let verdict = if A_LARGE_PEAK_BAND.contains(peak) {
+                let verdict = if band.contains(peak) {
                     "PASS"
                 } else {
                     failed = true;
                     "MISS"
                 };
                 println!(
-                    "band arm=A geometry=large peak_live_sampled={peak} band={lo}..={hi} {verdict}"
+                    "band arm=A family={fam} geometry=large peak_live_sampled={peak} band={lo}..={hi} {verdict}"
                 );
             }
             other => {
                 println!(
-                    "band arm=A geometry=large peak_live_sampled present {} times, expected 1 MISS",
+                    "band arm=A family={fam} geometry=large peak_live_sampled present {} times, expected 1 MISS",
                     other.len()
                 );
                 failed = true;

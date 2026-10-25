@@ -19,6 +19,12 @@
 //!
 //! RLOG compaction in this crate (`src/rlog.rs`) encodes through the same
 //! writer, via `RlogWriter::finish_compacted`.
+//!
+//! Two row-order families share each geometry's term sets (issue #3263):
+//! `random` draws every indexed value per row; `sorted` assigns each row a
+//! stream, draws `service.name` and `k8s.namespace.name` once per stream and
+//! orders rows by stream, as the writer's `(stream_ref, ts_ns)` sort does
+//! before it cuts blocks, so a block carries those two fields in runs.
 // Each bench binary uses a different subset of these helpers.
 #![allow(dead_code)]
 
@@ -44,6 +50,9 @@ pub struct Geometry {
     /// an integer `http.status_code` with 20 distinct values.
     pub service_terms: usize,
     pub namespace_terms: usize,
+    /// Streams in the `sorted` family, twice `service_terms`; each draws its
+    /// two string terms once, so some terms go unused.
+    pub streams: usize,
 }
 
 pub const GEOMETRIES: &[Geometry] = &[
@@ -52,24 +61,28 @@ pub const GEOMETRIES: &[Geometry] = &[
         blocks: 2,
         service_terms: 200,
         namespace_terms: 40,
+        streams: 400,
     },
     Geometry {
         name: "medium",
         blocks: 16,
         service_terms: 200,
         namespace_terms: 40,
+        streams: 400,
     },
     Geometry {
         name: "large",
         blocks: 64,
         service_terms: 2_000,
         namespace_terms: 200,
+        streams: 4_000,
     },
     Geometry {
         name: "highcard",
         blocks: 16,
         service_terms: 5_000,
         namespace_terms: 5_000,
+        streams: 10_000,
     },
 ];
 
@@ -122,9 +135,37 @@ fn terms(rng: &mut StdRng, count: usize, prefixes: &[&str]) -> Vec<Vec<u8>> {
     v
 }
 
-/// Rows in object order, each with its indexed `(column id, value)` pairs, as
-/// `ResolvedRow::indexed_terms`. Values are drawn uniformly per row.
-pub fn fixture(g: &Geometry) -> Vec<Vec<(u32, Value)>> {
+/// Row order of a fixture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Family {
+    /// Every indexed value drawn uniformly per row.
+    Random,
+    /// Rows grouped by stream, the two string fields fixed per stream.
+    Sorted,
+}
+
+pub const FAMILIES: [Family; 2] = [Family::Random, Family::Sorted];
+
+impl Family {
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Random => "random",
+            Family::Sorted => "sorted",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Family> {
+        FAMILIES.into_iter().find(|f| f.name() == s)
+    }
+}
+
+const STATUSES: [i64; 20] = [
+    200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 422, 429, 500, 502, 503, 504,
+    599,
+];
+
+/// The two string term sets, identical for both families of one geometry.
+fn term_sets(g: &Geometry) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
     let mut rng = StdRng::seed_from_u64(SEED);
     let services = terms(
         &mut rng,
@@ -142,10 +183,81 @@ pub fn fixture(g: &Geometry) -> Vec<Vec<(u32, Value)>> {
         g.namespace_terms,
         &["prod-", "prod-eu-west-1-", "staging-", "team-"],
     );
-    const STATUSES: [i64; 20] = [
-        200, 201, 202, 204, 301, 302, 304, 400, 401, 403, 404, 405, 409, 422, 429, 500, 502, 503,
-        504, 599,
-    ];
+    (services, namespaces)
+}
+
+/// Rows in object order, each with its indexed `(column id, value)` pairs, as
+/// `ResolvedRow::indexed_terms`.
+pub fn fixture_for(family: Family, g: &Geometry) -> Vec<Vec<(u32, Value)>> {
+    match family {
+        Family::Random => fixture(g),
+        Family::Sorted => sorted_fixture(g).rows,
+    }
+}
+
+/// The `sorted` family with each row's stream index kept beside it.
+pub struct SortedFixture {
+    /// Stream index of each row, ascending.
+    pub row_stream: Vec<u32>,
+    pub rows: Vec<Vec<(u32, Value)>>,
+}
+
+/// `g.streams` streams, each with a `service.name` and a `k8s.namespace.name`
+/// drawn once; every row draws its stream and its `http.status_code`
+/// uniformly. Rows are then grouped by stream index, keeping draw order
+/// within a stream (the writer's timestamp order), and cut into blocks by
+/// `ROWS_PER_BLOCK` as before.
+pub fn sorted_fixture(g: &Geometry) -> SortedFixture {
+    let (services, namespaces) = term_sets(g);
+    let mut s = StdRng::seed_from_u64(SEED ^ 2);
+    let stream_terms: Vec<(usize, usize)> = (0..g.streams)
+        .map(|_| {
+            (
+                s.random_range(0..services.len()),
+                s.random_range(0..namespaces.len()),
+            )
+        })
+        .collect();
+    let mut drawn: Vec<(u32, i64)> = (0..g.blocks * ROWS_PER_BLOCK)
+        .map(|_| {
+            (
+                s.random_range(0..g.streams) as u32,
+                STATUSES[s.random_range(0..STATUSES.len())],
+            )
+        })
+        .collect();
+    drawn.sort_by_key(|(stream, _)| *stream);
+    let row_stream = drawn.iter().map(|(stream, _)| *stream).collect();
+    let rows = drawn
+        .into_iter()
+        .map(|(stream, status)| {
+            let (svc, ns) = stream_terms[stream as usize];
+            vec![
+                (SERVICE, Value::Str(services[svc].clone())),
+                (NAMESPACE, Value::Str(namespaces[ns].clone())),
+                (STATUS, Value::I64(status)),
+            ]
+        })
+        .collect();
+    SortedFixture { row_stream, rows }
+}
+
+/// Distinct terms per indexed field, in `INDEXED` order.
+pub fn distinct_terms(rows: &[Vec<(u32, Value)>]) -> [usize; 3] {
+    let mut sets: [BTreeSet<Vec<u8>>; 3] = Default::default();
+    for row in rows {
+        for (cid, v) in row {
+            if let Some(i) = INDEXED.iter().position(|c| c == cid) {
+                sets[i].insert(term_key(v));
+            }
+        }
+    }
+    [sets[0].len(), sets[1].len(), sets[2].len()]
+}
+
+/// The `random` family: rows in object order, values drawn uniformly per row.
+pub fn fixture(g: &Geometry) -> Vec<Vec<(u32, Value)>> {
+    let (services, namespaces) = term_sets(g);
     let mut s = StdRng::seed_from_u64(SEED ^ 1);
     (0..g.blocks * ROWS_PER_BLOCK)
         .map(|_| {

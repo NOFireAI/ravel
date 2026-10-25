@@ -320,6 +320,9 @@ record of the measurement.
 
 ## Candidate 2: the RLOG writer's postings maps
 
+Issue #3263 reran arm C against A on stream-sorted rows with a dhat peak
+and a whole-build share; see the Follow-up section below (no change).
+
 ### What was measured
 
 `RlogWriter::build_object` and `build_object_columnar` in
@@ -551,6 +554,208 @@ is at most 337,124 bytes (2,018,757 minus 1,681,633) on a 524,288-row
 object; the rule is applied as fixed rather than re-weighed after the
 fact.
 
+### Follow-up (issue #3263): sorted rows, a true peak, the whole-build share
+
+#### Fixture: the sorted family
+
+`benches/common/postings.rs` now builds two row-order families per
+geometry from the same term sets (same seed, same terms, same row counts,
+8,192 rows per block, the 10,000 distinct cap). `random` is the fixture
+above, unchanged. `sorted` gives each geometry twice its service term count
+in streams (400, 400, 4,000 and 10,000), draws each stream's `service.name`
+and `k8s.namespace.name` once (seed `SEED ^ 2`), then per row draws a
+stream and an `http.status_code` uniformly, and groups the rows by stream
+in draw order, which is the writer's `(stream_ref, ts_ns)` order. A block
+then carries the two string fields in runs, about 131 rows long on large.
+Since streams draw their terms, some terms go unused; the distinct counts
+the timing bench prints (`fixture family=sorted ...` lines) are:
+
+| geometry | rows | streams | distinct service, namespace, status (sorted) |
+|---|---|---|---|
+| small | 16,384 | 400 | 176, 40, 20 |
+| medium | 131,072 | 400 | 176, 40, 20 |
+| large | 524,288 | 4,000 | 1,705, 200, 20 |
+| highcard | 131,072 | 10,000 | 4,339, 4,326, 20 |
+
+#### Method
+
+- Timing: `benches/rlog_postings.rs` runs both families as criterion groups
+  `postings_<family>/<geometry>`. Run 1 `GROUPING_ARM_ORDER=AC`, run 2
+  `GROUPING_ARM_ORDER=CA`, each `CARGO_BUILD_JOBS=4 cargo bench -p
+  ravel-maintain --bench rlog_postings -- --noplot`.
+- Peak: `benches/rlog_postings_dhat.rs`, dhat 0.3.3's
+  `HeapStats::max_bytes`, the live-byte maximum its global allocator keeps
+  on every call. The parent re-executes the binary once per (family, arm),
+  so each maximum covers one arm alone; the fixture is built before the
+  profiler starts and dhat ignores blocks it did not see allocated.
+  `CARGO_BUILD_JOBS=4 cargo bench -p ravel-maintain --bench
+  rlog_postings_dhat -- large`. The stats_alloc binary also runs on both
+  families (`-- large random`, `-- large sorted`).
+- Share: `benches/rlog_postings_share.rs` on sorted large, 21 iterations,
+  each timing arm A's loop, `RlogWriter::finish_with_stats` over the same
+  rows as `LogRecord`s with the three fields indexed (push included), and
+  the same build with no indexed field, in an order that rotates per
+  iteration. `share_loop` is loop over indexed build per iteration;
+  `share_delta` is the indexed build's extra time over the plain one, which
+  also charges merged-view resolution and POSTINGS encoding. Each is the
+  median with a distribution-free 95% interval (binomial order
+  statistics). The records carry the fixture's two string fields as
+  resource attributes and its status as a record attribute, plus the body
+  and the three other attributes of the logseg benches' `make_record`.
+  `CARGO_BUILD_JOBS=4 cargo bench -p ravel-maintain --bench
+  rlog_postings_share`.
+- Host: an amd64 fleet executor (x86_64, 16 vCPU, 30.6 GB, glibc system
+  allocator, rustc 1.97.1), not the Pi; load average 0.61 before the
+  calibration run.
+
+#### Pre-registered expectations and rule (#3263)
+
+Written and committed before any sorted-family figure or any C figure on
+this host was produced. One calibration run came first, arm A on the
+random family only (`GROUPING_ARM_ORDER=A CARGO_BUILD_JOBS=4 cargo bench
+-p ravel-maintain --bench rlog_postings -- --noplot postings_random`):
+small 3.722 ms, medium 31.21 ms, large 206.15 ms, highcard 71.66 ms
+(criterion medians). The sorted A expectations scale from it.
+
+| geometry | expected A median, sorted | miss band |
+|---|---|---|
+| small | 2.0 ms | outside 0.7 to 6 ms |
+| medium | 16 ms | outside 5.3 to 48 ms |
+| large | 105 ms | outside 35 to 315 ms |
+| highcard | 50 ms | outside 17 to 150 ms |
+
+Basis: on sorted rows consecutive inserts repeat the previous key, so A's
+descent is cached and its branches predictable while every insert still
+pays the `term_key` allocation and free; about half the random cost,
+somewhat more on highcard, where runs are about 13 rows long.
+
+Expected peaks on large, dhat `max_bytes`, and the stats_alloc sampled
+peak for A:
+
+- A random: 1,681,633 bytes, the stats_alloc figure above, since A's
+  sampled peak and bound agree; band 0.3 to 3 MB (the #3254 band).
+- A sorted: about 0.36 MB. Each of the 1,705 service terms sits in about
+  2.3 blocks (one 56-byte set leaf), against 64 blocks and about 12 nodes
+  per term on random. Band 0.15 to 1.0 MB, checked by both binaries.
+- C against A: 9% above on random and 10 to 15% above on sorted. At the
+  service field's conversion `BTreeMap::from_iter` collects the hash map
+  into a `Vec` of `(Vec<u8>, BTreeSet<u32>)` pairs (48 bytes each) while
+  the table is still allocated, then a stable sort allocates scratch of the
+  same size after the table is freed; the `Vec` is the excess over A, less
+  the difference between the table and A's term-map nodes.
+
+Expected C against A in time: on random, 20 to 40% faster (the Pi's 23 to
+37%); on sorted, 5 to 20% faster, since A's cached descent removes most of
+what the hash probe saved.
+
+Expected share on sorted large: `share_loop` about 5% (A's loop about
+105 ms against a whole build of about 2 s), band 1 to 12%, checked by the
+share binary; `share_delta` above `share_loop`.
+
+Rule, as fixed in issue #3263: adopt C only if, on the sorted family, C is
+at least 10% faster than A on medium and large in both runs (C's median at
+most 0.9 of A's), its dhat `max_bytes` on large is at most 1.05 of A's on
+both families, and the postings pass is at least 2% of the whole object
+build (read as: the lower end of `share_loop`'s 95% interval at or above
+2%). Otherwise `writer.rs` does not change. The random family is reported
+alongside and does not enter the rule.
+
+Predicted outcome from the figures above: the memory clause fails on both
+families, so no change.
+
+#### Results (#3263)
+
+All runs on 2026-10-25 on the amd64 executor above, `CARGO_BUILD_JOBS=4`,
+each exit 0. The host was not quiet: load average rose from 0.49 to 2.39
+over run 1 and from 2.20 to 4.05 over run 2, another task's build sharing
+the box. Every C interval below lies wholly below A's in the same group, so
+no comparison rests on overlapping intervals.
+
+Timing, criterion medians in ms, C against A in the last column. Run 1:
+`GROUPING_ARM_ORDER=AC CARGO_BUILD_JOBS=4 cargo bench -p ravel-maintain
+--bench rlog_postings -- --noplot`. Run 2: the same with
+`GROUPING_ARM_ORDER=CA`. Both runs printed the distinct counts of the
+fixture table above, and the random family's arms all produced checksum
+0x353d05aff71b5dee on large, as before #3263, so that family is unchanged.
+
+| family | geometry | run 1 A | run 1 C | run 1 C vs A | run 2 A | run 2 C | run 2 C vs A |
+|---|---|---|---|---|---|---|---|
+| sorted | small | 2.994 | 2.159 | -27.9% | 2.927 | 2.110 | -27.9% |
+| sorted | medium | 22.43 | 17.18 | -23.4% | 22.62 | 16.77 | -25.9% |
+| sorted | large | 113.16 | 71.40 | -36.9% | 116.43 | 75.51 | -35.1% |
+| sorted | highcard | 39.14 | 21.13 | -46.0% | 38.64 | 21.22 | -45.1% |
+| random | small | 3.740 | 2.352 | -37.1% | 3.754 | 2.355 | -37.3% |
+| random | medium | 30.95 | 20.20 | -34.8% | 31.72 | 20.64 | -34.9% |
+| random | large | 206.32 | 111.25 | -46.1% | 207.68 | 113.27 | -45.5% |
+| random | highcard | 73.16 | 33.29 | -54.5% | 76.92 | 35.49 | -53.9% |
+
+Every sorted A median is inside its miss band. The sorted A figures came
+in near the calibration on medium and large (22 ms against an expected 16,
+113 against 105), so sorted rows saved A less than predicted, and C's lead
+on sorted input (23 to 37% on medium and large) is outside the 5 to 20%
+predicted: most of C's saving survives stream-sorted input.
+The random family's 35 to 55% on this host is above the Pi's 23 to 37%.
+
+Peak, `CARGO_BUILD_JOBS=4 cargo bench -p ravel-maintain --bench
+rlog_postings_dhat -- large`, one process per (family, arm), every arm 0
+bytes live after it returned and checksums equal within each family
+(sorted 0x3c1fd24b953191b8). It printed `band arm=A family=random
+geometry=large max_bytes=1681633 band=300000..=3000000 PASS` and `band
+arm=A family=sorted geometry=large max_bytes=354682 band=150000..=1000000
+PASS`. The stats_alloc columns are from `CARGO_BUILD_JOBS=4 cargo bench -p
+ravel-maintain --bench rlog_postings_alloc -- large random` and `-- large
+sorted` (1,572,867 samples per arm; the same two A figures with `PASS`
+band lines).
+
+| family | arm | dhat `max_bytes` | vs A | stats_alloc sampled | stats_alloc bound |
+|---|---|---|---|---|---|
+| random | A | 1,681,633 | | 1,681,633 | 1,681,633 |
+| random | C | 1,820,901 | +8.3% | 1,724,901 | 2,018,757 |
+| sorted | A | 354,682 | | 354,682 | 354,682 |
+| sorted | C | 408,494 | +15.2% | 326,654 | 576,574 |
+
+Both dhat C peaks fall inside the stats_alloc bracket, and both A peaks
+equal stats_alloc's figures, so the two instruments agree where they
+overlap. On sorted rows C's sampled figure is below A's while its true
+peak is 15.2% above: the excess is transient, inside one operation
+between two samples, which by the Memory analysis above is a field's
+`BTreeMap::from_iter` (inferred, not split by field here). That is the
+case the earlier method could not settle. In absolute terms C's peak is 139,268 bytes above A's on random
+and 53,812 bytes on sorted, per 524,288-row object.
+
+Share, `CARGO_BUILD_JOBS=4 cargo bench -p ravel-maintain --bench
+rlog_postings_share`, sorted large, 21 iterations (the indexed build
+reported 3 indexed fields, 0 capped, 1,925 distinct terms, 33,466
+postings bytes, as the binary checks):
+
+| figure | median | 95% interval |
+|---|---|---|
+| A's postings loop | 109.99 ms | 108.79 to 113.46 |
+| indexed build | 2,730.74 ms | 2,715.05 to 2,808.56 |
+| plain build | 2,362.20 ms | 2,338.25 to 2,460.00 |
+| `share_loop` | 4.01% | 3.96 to 4.09 |
+| `share_delta` | 13.54% | 12.63 to 15.35 |
+
+It printed `band share_loop geometry=large median_pct=4.01 band=1..=12
+PASS` and `clause share_loop>=2% ci95_lower_pct=3.96 MET`. Indexing costs
+about 369 ms per build over the plain one, of which the accumulation loop
+is about 110; the remainder is in the work `share_delta` also charges
+(merged-view resolution and POSTINGS encoding), not split here. From
+these medians, C's 35 to 37% on sorted large would take about 40 ms off a
+2.7 s build, about 1.5%; that is arithmetic over two benches, not a
+measurement of a changed writer.
+
+#### Decision (#3263)
+
+No change to `writer.rs`. Of the three clauses, two pass: C is at least
+10% faster than A on sorted medium (23.4%, 25.9%) and large (36.9%, 35.1%)
+in both runs, and the postings loop is 4.01% of the indexed build with an
+interval lower end of 3.96%. The memory clause fails on both families: C's
+dhat peak is 8.3% above A's on random and 15.2% on sorted, against a 5%
+limit. The rule is applied as fixed. This closes the question #3254 left
+open: with a true peak in hand, C's speed comes with a transient peak
+above the limit, on both row orders.
+
 ## Class closure: `BTreeMap<[u8; 16]` across crates/
 
 `grep -rn "BTreeMap<\[u8; 16\]" crates/`, excluding the benches added here:
@@ -574,35 +779,37 @@ fact.
   ravel-cache bulk region. None was read or measured.
 - The exemplar map at `build.rs:203` and the erasure-rewrite grouping at
   `erasure_rewrite.rs:1090` (see Class closure).
-- Production's allocator and hardware. Both benches run on the system
-  allocator; the shipped `ravel-server` and `ravel-cli` use jemalloc, where
-  the per-insert `term_key` allocation and free that every postings arm
-  pays costs differently. No timing ran on amd64 production hardware: the
-  timings are from a Raspberry Pi 5 (aarch64, 2 MB L3), and bbtree's SIMD
-  search and C's cache behaviour both depend on the machine.
-- Whole-build share. Neither stage was timed against a whole compaction or
-  a whole RLOG object build, because no arm passed the stage-level rule.
-- A quiet host. Both postings runs and candidate 1's run 2 shared the box
-  with another session's compile.
+- Production's allocator and hardware. Every bench runs on the glibc
+  system allocator; the shipped `ravel-server` and `ravel-cli` use
+  jemalloc, where the per-insert `term_key` allocation and free that every
+  postings arm pays costs differently, and where the size classes behind a
+  peak differ (dhat and stats_alloc count requested sizes). The #3254
+  postings timings are from a Raspberry Pi 5 (aarch64, 2 MB L3); the #3263
+  ones are from an amd64 fleet executor, which is not production hardware
+  either.
+- Whole-build share for candidate 1. Its stage was not timed against a
+  whole compaction. Candidate 2's postings loop was timed against a whole
+  RLOG object build on sorted large only, arm A only, in the row path
+  (`RlogWriter::push` and `finish_with_stats`), not the columnar path.
+- A quiet host. Both #3254 postings runs, candidate 1's run 2, and both
+  #3263 timing runs shared the box with another build (load averages in
+  the #3263 Results).
 - The sorted-input hypothesis for candidate 1's C result (shuffle each
   input's series order and rerun).
-- Candidate 2 on a realistic row order. The postings fixture draws the two
-  per-stream string fields at random per row, while the writer's blocks
-  carry them in runs of one value per stream (see the row order caveat
-  under Fixture and arms).
+- Candidate 2 on a production corpus. The sorted family carries each
+  stream's two string fields in runs, as the writer's blocks do, but its
+  stream count, term draw and uniform status codes are synthetic; no
+  corpus's term distribution was replayed.
+- Per-field split of C's dhat peak. The 8.3% and 15.2% excesses are whole
+  arm maxima; which field's conversion sets them is inferred from the
+  stats_alloc analysis, not measured.
 
-Next experiment: candidate 2's C on its own. Pin its true peak with a
-high-water allocator (one that tracks a running maximum inside the
-allocation call, which stats_alloc does not do). A hand-written one needs
-`unsafe`, and `unsafe_code = "forbid"` admits no scoped allow while
-Cargo's `[lints]` table applies to the whole package, so the route is a
-new dev-dependency: dhat's `HeapStats::max_bytes`, one process per arm, so
-each maximum covers one arm alone. Then sort the fixture's rows by stream,
-rerun both orders on a quiet host, and time the postings pass against a
-whole RLOG object build to settle the 2% clause (the writer's
-`stage-timing` feature times only the bloom window,
-`WriteStats::bloom_total_ns`, so the postings pass needs a profile or a
-timer of its own). If C's peak is within 5% and the postings pass is at
-least 2% of the build, the change is local to `writer.rs`: `HashMap`
-accumulation and a `collect` into the `BTreeMap` that `FieldTerms::Terms`
-takes, at the two `postings_terms` sites.
+Next experiment: none is queued for candidate 2. Under the #3263 rule C
+fails on memory, not speed, and by the share figures its saving is about
+1.5% of a sorted large build. Reopening it would mean a change outside
+`writer.rs`: the excess is attributed (by the analysis, not a per-field
+measurement) to the intermediate `Vec` that std's `BTreeMap::from_iter`
+collects and sorts before its bulk build, so the lever is an encoder boundary that takes the terms as a
+sorted `Vec` rather than a `BTreeMap` (`FieldTerms::Terms`), measured with
+the same dhat binary against a rule fixed before the run. Candidate 3
+remains unread.
