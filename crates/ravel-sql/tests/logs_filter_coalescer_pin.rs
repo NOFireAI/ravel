@@ -695,15 +695,13 @@ impl ExecutionPlan for Probe {
 /// filling, which its emitted batches cannot show, is charged to the pool.
 ///
 /// Per input batch, the live heap less the pool's reading, relative to the
-/// first batch. The scan alone grows that figure too (a fixed amount per block
-/// that no downstream operator holds), so the excess over the scan alone is
-/// what the filter keeps and nothing charges. At the last input batch, for
-/// every case:
+/// first batch, less the flushed output this test holds. At the last input
+/// batch, for every case:
 ///
 /// - the coalescer holds the very `Arc` of each earlier block's values array
 ///   that has a surviving row, and the scan alone holds none of them, so a
 ///   `strong_count` test on the scan's array sees the coalescer;
-/// - the excess is at most one block's values array plus 10%;
+/// - that figure is at most one block's values array plus 10%;
 /// - the pool reads at least one values array per block the coalescer holds:
 ///   the bytes moved into the pool, rather than out of the heap.
 ///
@@ -740,11 +738,24 @@ async fn p5_heap_held_before_the_coalescer_flushes_is_charged() {
                 .expect("probe under the filter");
             let mut stream = filter.execute(0, ctx.task_ctx()).expect("execute");
             let mut held = Vec::new();
+            // How many input batches had passed the probe when each output
+            // batch arrived.
+            let mut arrivals = Vec::new();
             while let Some(batch) = stream.next().await {
-                held.push(batch.expect("batch"));
+                let batch = batch.expect("batch");
+                arrivals.push(samples.lock().unwrap().len());
+                held.push(batch);
             }
             let at_end = live_heap();
             let samples = samples.lock().unwrap().clone();
+            // The output this test itself holds at the last input batch: the
+            // coalescer rebuilt it, so the pool rightly does not charge it.
+            let output_held: isize = held
+                .iter()
+                .zip(&arrivals)
+                .filter(|(_, at)| **at < samples.len())
+                .map(|(b, _)| b.get_array_memory_size() as isize)
+                .sum();
             let output_sharing = {
                 let seen = seen.lock().unwrap();
                 held.iter()
@@ -772,7 +783,8 @@ async fn p5_heap_held_before_the_coalescer_flushes_is_charged() {
             let max_reserved = samples.iter().map(|s| s.reserved).max().unwrap_or(0);
             let peak = unaccounted.iter().max().copied().unwrap_or(0) - first;
             let end = *samples.last().expect("at least one input batch");
-            let excess = (last - first) - alone.growth;
+            let gap = (last - first) - output_held;
+            let excess = gap - alone.growth;
             let charge = end.values_bytes;
             // The blocks before the last whose surviving rows the coalescer
             // still holds: none under COUNT(*), whose filter output carries no
@@ -798,8 +810,9 @@ async fn p5_heap_held_before_the_coalescer_flushes_is_charged() {
                 peak as f64 / block_values_bytes() as f64
             );
             println!(
-                "  at the last input batch: excess over the scan alone {excess} bytes (bound {}), pool {} (floor {held_blocks} x {charge} = {}), earlier values arrays alive {} (want {held_blocks}); output batches sharing a scan values array {output_sharing}",
+                "  at the last input batch: live heap less pool and held output, over the first: {gap} bytes (bound {}), of which the scan alone {} and the rest {excess}; output held {output_held}; pool {} (floor {held_blocks} x {charge} = {}), earlier values arrays alive {} (want {held_blocks}); output batches sharing a scan values array {output_sharing}",
                 charge + charge / 10,
+                alone.growth,
                 end.reserved,
                 held_blocks * charge,
                 end.alive_before,
@@ -816,9 +829,9 @@ async fn p5_heap_held_before_the_coalescer_flushes_is_charged() {
                     end.alive_before
                 ));
             }
-            if excess > (charge + charge / 10) as isize {
+            if gap > (charge + charge / 10) as isize {
                 misses.push(format!(
-                    "{label} N={n}: {excess} bytes held outside the pool over the scan alone, above one values array {charge} + 10%"
+                    "{label} N={n}: {gap} bytes held outside the pool, above one values array {charge} + 10%"
                 ));
             }
             if end.reserved < held_blocks * charge {
