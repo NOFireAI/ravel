@@ -51,9 +51,10 @@ use uuid::Uuid;
 /// (which needs at least one relevant segment per partition) is taken.
 const OBJECTS: usize = 4;
 const PARTITIONS: usize = 2;
-/// The q02 shape from #2121 Stage 0: a count over a declared-column predicate
-/// that the whole-segment fast path still serves.
-const SQL: &str = "SELECT count(*) FROM logs WHERE dur <> 0";
+/// A count over a declared-column predicate that pushes no block predicate, so
+/// the whole-segment fast path serves it. The bare q02 shape `dur <> 0` pushes
+/// a prune-only arm (#3240) and leaves the fast path for the plan phase.
+const SQL: &str = "SELECT count(*) FROM logs WHERE abs(dur) <> 0";
 
 fn tenant() -> TenantId {
     TenantId::new("logs-whole-object-phase-wire-bytes".to_string())

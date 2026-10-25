@@ -48,7 +48,8 @@ struct StatsArm<'a> {
 /// The `NumRange` arms in `prune` that name a declared column of the arm's
 /// exact type. An arm on an undeclared name or of another type resolves to
 /// nothing and so skips nothing, matching the reader's resolution of an arm to
-/// one `(name, type)` column.
+/// one `(name, type)` column. Every other arm, a `NumNotEq` included, skips
+/// nothing at this level.
 fn resolve_arms<'a>(prune: &[Predicate], declared: &'a [DeclaredColumn]) -> Vec<StatsArm<'a>> {
     prune
         .iter()

@@ -153,7 +153,7 @@ use crate::declared::{DeclaredColumn, DeclaredColumnSource, default_declared_sou
 use crate::error::SqlError;
 use crate::ipcrypt_udf::{IpcryptDeployment, SessionPrincipal, SqlCapabilities};
 use crate::logs_provider::LogsTableProvider;
-use crate::logs_pushdown::extract_logs;
+use crate::logs_pushdown::{extract_logs, prune_is_rewrite_neutral};
 use crate::logs_scan::ScanExecutions;
 use crate::memory::{CeilingBreach, TenantMemoryAccountant};
 use crate::min_commit_token::MinCommitToken;
@@ -4431,8 +4431,9 @@ impl SqlExecutor {
     /// that could have used it. The three metadata-only paths -- q07
     /// `MIN`/`MAX(declared)`, q02 `COUNT(*)` with a residual `declared <> lit`
     /// filter, q08 `COUNT(*) GROUP BY declared` -- all gate downstream on
-    /// [`crate::logs_scan`]'s `stats_are_exact` (no pending erasure, no content
-    /// or prune predicate, and a ts bound that clips no touched segment) and
+    /// [`crate::logs_scan`]'s `metadata_rewrite_stats_are_exact` (no pending
+    /// erasure, no content predicate, no prune arm other than `NumNotEq`, and
+    /// a ts bound that clips no touched segment) and
     /// all are aggregates referencing a declared column. This mirrors exactly
     /// those necessary conditions; anything they cannot prove is left to
     /// decline downstream and still loads here.
@@ -4475,14 +4476,15 @@ impl SqlExecutor {
         }
         // Re-derive the reader pushdown from the plan's filter conjuncts with
         // the SAME extractor the scan uses, so the content/prune/ts decisions
-        // match `stats_are_exact` exactly. A content or prune predicate makes
-        // every path decline; the analyzed (pre-optimizer) plan can only carry
-        // fewer such predicates than the scan ultimately sees, so a match here
-        // is real and skipping is safe, while a miss merely loads.
+        // match the scan's metadata-rewrite gate exactly. A content predicate,
+        // or a prune arm other than `NumNotEq`, makes every path decline; the
+        // analyzed (pre-optimizer) plan can only carry fewer such predicates
+        // than the scan ultimately sees, so a match here is real and skipping
+        // is safe, while a miss merely loads.
         let mut filters = Vec::new();
         collect_filter_predicates(plan, &mut filters);
         let pushdown = extract_logs(&filters, declared);
-        if !pushdown.content.is_empty() || !pushdown.prune.is_empty() {
+        if !pushdown.content.is_empty() || !prune_is_rewrite_neutral(&pushdown.prune) {
             return false;
         }
         // A ts bound that clips even one touched segment makes `stats_are_exact`
@@ -4527,7 +4529,7 @@ impl SqlExecutor {
         logs_scans.any(|(_, own)| {
             let pushdown = extract_logs(own, declared);
             pushdown.content.is_empty()
-                && pushdown.prune.is_empty()
+                && prune_is_rewrite_neutral(&pushdown.prune)
                 && !Self::ts_bound_clips(snapshot, pushdown.ts_min(), pushdown.ts_max())
         })
     }

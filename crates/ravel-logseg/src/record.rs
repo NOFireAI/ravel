@@ -567,6 +567,19 @@ pub enum Predicate {
         min: Option<u64>,
         max: Option<u64>,
     },
+    /// Prune-only `field <> value` on the attribute's dynamic `I64` column
+    /// (ADR-0095, prune-only not-equal amendment).
+    ///
+    /// Resolved like [`Predicate::NumRange`] with `ty` fixed to `I64`, and
+    /// bound by the same contract: it drives block pruning ONLY, through the
+    /// `prune` channel, and matches every row in `content`. A block is pruned
+    /// when its stat for the column has `min == max == value`: every non-NULL
+    /// resolved value equals `value`, and NULL never satisfies `<>`. The caller
+    /// re-evaluates the exact `<>` above the scan.
+    NumNotEq {
+        field: FieldSel,
+        value: i64,
+    },
 }
 
 #[cfg(test)]
