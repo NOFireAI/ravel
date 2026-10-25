@@ -198,6 +198,9 @@ second.
 
 ### 2. The entry's load folds the catalog before it exits (design change 2)
 
+Withdrawn for the competing entry: see the decision 2 fairness amendment
+at the end of this ADR.
+
 Class: loader flag, shipped in 0.24.0 (`--fold-after-load`,
 `services/ravel-cli/src/main.rs:866-867`,
 `services/ravel-cli/src/load/cli.rs:248`; ADR-2677 decision 1).
@@ -915,3 +918,42 @@ to 4.2 s and 16 to 23 s. The design moves the per-statement floor 2.5x
 with no amplification and 5 to 6x under it, which is why the two sums
 differ so much: request count only matters if the store charges per
 request, in money or in disk bytes.
+
+## Amendment (2026-10-25): decision 2 fairness amendment, the competing entry does not fold
+
+<!-- amendment-applies: sections="2. The entry's load folds the catalog before it exits (design change 2)" pointer="decision 2 fairness amendment" -->
+
+The owner decided on 2026-10-25 (issue #3244 comment 6397193245, also on
+#3217 and #3243) that the competing ClickBench entry stays stock and
+unfolded. Decision 2 is withdrawn for that entry. A folded variant may be
+published only as a separately labelled result outside the competition,
+which ClickBench's README allows for tuned setups.
+
+The reasons are two rules in ClickBench's README (read on 2026-10-25):
+
+- "You should not wait for cool down after data loading or running
+  OPTIMIZE / VACUUM before the main benchmark queries unless the database
+  strictly requires this." A tenant is folded by the maintain tier only
+  after the seal margin, and #3243 is open because the load's last hour
+  never seals before the sweep. `--fold-after-load` in `./load` runs that
+  maintenance step early. Counting its time inside the load does not
+  change what the step is.
+- "The creation of pre-aggregated tables or indices, projections, or
+  materialized views is not recommended for the purpose of this
+  benchmark." A fold writes a `.cstat` object per part with a value to
+  count dictionary for each declared column, and the metadata aggregate
+  path answers `COUNT(*) WHERE col <> v` (q2) and a `GROUP BY col` count
+  (q8) from those counts. That is a pre-aggregated index, even though the
+  fold builds it for every tenant and not for this benchmark.
+
+The decision 2 A/B that was run (#3243, with the folded catalog's column
+statistics) measured a hot loss, not a gain, because a folded catalog
+re-reads its column statistics on every statement (#3244). That defect is
+fixed under #3244 for every folded tenant; this amendment does not depend
+on it.
+
+Decisions 1 and 3 to 7 are not affected: a single clustering key is the
+"clustered (table sorting)" primary key the rules allow, decisions 3 to 6
+change storage layout and compression, and decision 1 narrows an index the
+database builds by itself. The cold-sum table's decision 2 row predicted 0
+to 2 s and was not counted in the stated estimate, so the estimate stands.
