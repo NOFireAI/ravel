@@ -432,6 +432,9 @@ pub(crate) async fn run_fold_warning_to(
     if let Some(warning) = unused_zstd_level_warning(zstd_level, signal) {
         let _ = writeln!(warnings, "{warning}");
     }
+    if let Some(warning) = unused_group_target_blocks_warning(group_target_blocks, signal) {
+        let _ = writeln!(warnings, "{warning}");
+    }
     // Every signal's loader resolves the budget once it knows the read-cursor
     // count the floor depends on; metrics and spans read one cursor.
     if let Some(warning) = load_memory.fallback_warning() {
@@ -649,8 +652,8 @@ fn write_report_warnings(warnings: &mut dyn std::io::Write, report: &LoadReport)
         let _ = writeln!(warnings, "{warning}");
     }
     // The loader's writer uses `RlogConfig::default()` apart from its zstd
-    // level (log_shard.rs), so its per-object dynamic-column budget is
-    // that default.
+    // level and its row-group size (log_shard.rs), so its per-object
+    // dynamic-column budget is that default.
     let max_dynamic_columns = ravel_logseg::RlogConfig::default().max_dynamic_columns;
     for warning in dynamic_column_warnings(&report.metrics, max_dynamic_columns) {
         let _ = writeln!(warnings, "{warning}");
@@ -948,6 +951,27 @@ pub(super) fn unused_zstd_level_warning(
             "warning: a {noun} load ignores --zstd-level {}. The level applies only to the \
              RLOG objects a logs load writes.",
             zstd_level.get()
+        )
+    })
+}
+
+/// The warning for a `--group-target-blocks` a metrics or spans load cannot
+/// use, or `None` when the value is the default or the load is a logs load.
+/// The row-group size reaches only the RLOG writer a logs flush runs.
+pub(super) fn unused_group_target_blocks_warning(
+    group_target_blocks: RlogGroupTargetBlocks,
+    signal: SignalArg,
+) -> Option<String> {
+    let noun = match signal {
+        SignalArg::Logs => return None,
+        SignalArg::Metrics => "metrics",
+        SignalArg::Spans => "spans",
+    };
+    (group_target_blocks != RlogGroupTargetBlocks::DEFAULT).then(|| {
+        format!(
+            "warning: a {noun} load ignores --group-target-blocks {}. The row-group size \
+             applies only to the RLOG objects a logs load writes.",
+            group_target_blocks.get()
         )
     })
 }

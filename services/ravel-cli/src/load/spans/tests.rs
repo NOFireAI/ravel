@@ -323,6 +323,35 @@ fn metrics_and_spans_warn_on_a_non_default_zstd_level_and_logs_does_not() {
     );
 }
 
+/// A non-default `--group-target-blocks` on a metrics or spans load is named
+/// as ignored; the default, or any value on a logs load, is not.
+#[test]
+fn metrics_and_spans_warn_on_a_non_default_group_target_blocks_and_logs_does_not() {
+    let five_twelve = RlogGroupTargetBlocks::new(512).expect("non-zero");
+    assert_eq!(
+        unused_group_target_blocks_warning(five_twelve, SignalArg::Logs),
+        None
+    );
+    assert_eq!(
+        unused_group_target_blocks_warning(RlogGroupTargetBlocks::DEFAULT, SignalArg::Spans),
+        None
+    );
+    assert_eq!(
+        unused_group_target_blocks_warning(five_twelve, SignalArg::Metrics).as_deref(),
+        Some(
+            "warning: a metrics load ignores --group-target-blocks 512. The row-group size \
+             applies only to the RLOG objects a logs load writes."
+        )
+    );
+    assert_eq!(
+        unused_group_target_blocks_warning(five_twelve, SignalArg::Spans).as_deref(),
+        Some(
+            "warning: a spans load ignores --group-target-blocks 512. The row-group size \
+             applies only to the RLOG objects a logs load writes."
+        )
+    );
+}
+
 /// The future-skew bound is kept and the past-lag bound is relaxed,
 /// both anchored on the span's END exactly as `checked_span_interval`
 /// anchors them.
