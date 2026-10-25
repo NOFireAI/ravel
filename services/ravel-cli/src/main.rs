@@ -5004,7 +5004,9 @@ mod tests {
         assert_eq!(blocks_of(&["--group-target-blocks", "512"]), Ok(512));
         let err = blocks_of(&["--group-target-blocks", "0"]).expect_err("0 is refused");
         assert!(
-            err.contains("invalid --group-target-blocks: RLOG row-group size must be at least 1 block"),
+            err.contains(
+                "invalid --group-target-blocks: RLOG row-group size must be at least 1 block"
+            ),
             "{err}"
         );
         let err = blocks_of(&["--group-target-blocks", "x"]).expect_err("not a number");

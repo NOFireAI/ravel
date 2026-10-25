@@ -664,7 +664,12 @@ fn wide_record(i: usize) -> LogRecord {
         span_id: None,
         flags: 1,
         attrs: (0..WIDE_ATTRS)
-            .map(|a| (format!("a{a:02}"), AttrValue::I64((i * WIDE_ATTRS + a) as i64)))
+            .map(|a| {
+                (
+                    format!("a{a:02}"),
+                    AttrValue::I64((i * WIDE_ATTRS + a) as i64),
+                )
+            })
             .collect(),
     }
 }
@@ -762,7 +767,10 @@ async fn one_row_group_of_120_blocks_reads_three_far_apart_columns_in_three_gets
     assert_eq!(runs.len(), 3, "one run per projected chunk: {runs:?}");
 
     let (stats, full_gets) = read(one.clone()).await;
-    assert!(!stats.whole_object, "the one-group object is not read whole");
+    assert!(
+        !stats.whole_object,
+        "the one-group object is not read whole"
+    );
     assert_eq!(full_gets, 0, "no whole-object GET");
     assert_eq!(stats.probe_gets, 1, "one suffix probe");
     assert_eq!(stats.block_range_gets, 3, "exactly 3 chunk-run GETs");
@@ -797,8 +805,7 @@ async fn one_row_group_of_120_blocks_reads_three_far_apart_columns_in_three_gets
         stats.block_range_gets
     );
     assert!(
-        stats.whole_object && full_gets == 1
-            || stats.block_bytes_fetched > 3 * grouped_chunk_bytes,
+        stats.whole_object && full_gets == 1 || stats.block_bytes_fetched > 3 * grouped_chunk_bytes,
         "either a covering read or bridged bytes above 3x the chunk bytes: \
          whole {}, fetched {} against chunk bytes {grouped_chunk_bytes}",
         stats.whole_object,
