@@ -24,7 +24,7 @@
 
 use std::sync::Arc;
 
-use datafusion::arrow::array::{Array, Int64Array};
+use datafusion::arrow::array::{Array, Float64Array, Int64Array};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::displayable;
 use futures::StreamExt;
@@ -294,8 +294,9 @@ async fn run(
 /// with; the hoist skips the load entirely, so the store sees zero GETs.
 ///
 /// Pre-fix demonstration: making `logs_column_stats_eligible` return `true`
-/// unconditionally (equivalently, deleting the `|| !plan_references_declared(
-/// &plan, declared)` clause) fires the load and this becomes 1.
+/// unconditionally (equivalently, deleting its
+/// `plan_has_stats_answerable_aggregate` check) fires the load and this
+/// becomes 1.
 #[tokio::test]
 async fn ineligible_no_declared_reference_issues_zero_gets() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -323,10 +324,10 @@ async fn ineligible_no_declared_reference_issues_zero_gets() {
 
 /// Deliverable 1, exact ZERO. A content predicate (`has_word`) makes every
 /// ADR-0850 path decline at `stats_are_exact`, so the hoist skips the load even
-/// though the aggregate names the declared `status` column.
+/// though `SUM(status)` is a shape the metadata-only rewrite answers.
 ///
-/// Pre-fix demonstration: deleting the `if !pushdown.content.is_empty() ||
-/// !pushdown.prune.is_empty()` guard fires the load and this becomes 1.
+/// Pre-fix demonstration: deleting the `!pushdown.content.is_empty()` check
+/// from the gate fires the load and this becomes 1.
 #[tokio::test]
 async fn ineligible_content_predicate_issues_zero_gets() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
@@ -335,7 +336,7 @@ async fn ineligible_content_predicate_issues_zero_gets() {
     let (_plan, _batches) = run(
         &executor,
         snapshot_of(Vec::new()),
-        "SELECT min(status) FROM logs WHERE has_word(body, 'timeout')",
+        "SELECT SUM(status) FROM logs WHERE has_word(body, 'timeout')",
         &status_col(),
     )
     .await;
@@ -347,17 +348,15 @@ async fn ineligible_content_predicate_issues_zero_gets() {
     );
 }
 
-/// Deliverable 1 regression, exact TWO. `MIN`/`MAX(status)` (q07) over a
-/// stamped segment with exact statistics must still resolve the stats (the
-/// HEAD GET and the one `.cstat` GET, exactly two) and still answer from
-/// catalog metadata: the plan carries no `LogsScanExec` and no data object is
-/// read. The extrema come from the stamp, so the GET count is what pins the
-/// load.
+/// Issue #3244, exact ZERO. `MIN`/`MAX(status)` (q07) over a stamped segment
+/// answers from the segment's stamp through DataFusion's
+/// `AggregateStatistics`, which reads no `.cstat` entry, so the load does not
+/// fire: no GET at all, no `LogsScanExec`, and the extrema of the stamp.
 ///
-/// Pre-fix demonstration: making `logs_column_stats_eligible` return `false`
-/// skips the load and the GET count reads 0.
+/// Pre-fix demonstration: a gate that still admits a lone `MIN`/`MAX` (the
+/// `StatsAggregate::Min`/`Max` arm) fires the load and the GET count reads 2.
 #[tokio::test]
-async fn eligible_min_max_answers_from_metadata_with_two_gets() {
+async fn min_max_answers_from_the_stamp_with_zero_gets() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let seg = seg_ref(1, 5);
     install_head_and_stats(
@@ -386,19 +385,18 @@ async fn eligible_min_max_answers_from_metadata_with_two_gets() {
     assert_eq!(scalar(&batches, 1), Some(404), "max(status)");
     assert_eq!(
         store.gets(),
-        2,
-        "exactly the HEAD GET and the one column-stats GET; no scan"
+        0,
+        "the stamp answers min/max, so no HEAD, `.cstat` or data GET"
     );
 }
 
-/// The declared reference can sit inside a subquery expression rather than the
-/// outer plan. A subquery's plan hangs off the expression, not off
-/// `plan.inputs()`, so an eligibility walk that only recurses inputs misses it
-/// and skips the stats load -- which fails open (the nested aggregate falls
-/// back to scanning) but throws away exactly the case ADR-0850 exists for.
-/// The MIN itself comes from the stamp, so the GET count is what pins the load.
+/// Issue #3244, exact ZERO. A `MIN` inside a scalar subquery answers from the
+/// stamp like a top-level one, and loads nothing either.
+///
+/// Pre-fix demonstration: a gate that still admits a lone `MIN`/`MAX` (the
+/// `StatsAggregate::Min`/`Max` arm) fires the load and the GET count reads 2.
 #[tokio::test]
-async fn eligible_min_max_inside_a_scalar_subquery_still_answers_from_metadata() {
+async fn min_inside_a_scalar_subquery_answers_from_the_stamp_with_zero_gets() {
     let store = CountingStore::new(Arc::new(MemoryStore::new()));
     let seg = seg_ref(1, 5);
     install_head_and_stats(
@@ -427,8 +425,8 @@ async fn eligible_min_max_inside_a_scalar_subquery_still_answers_from_metadata()
     assert_eq!(scalar(&batches, 0), Some(200), "min(status) via subquery");
     assert_eq!(
         store.gets(),
-        2,
-        "exactly the HEAD GET and the one column-stats GET; no scan"
+        0,
+        "the stamp answers the min, so no HEAD, `.cstat` or data GET"
     );
 }
 
@@ -816,4 +814,289 @@ async fn not_equal_without_cstat_scans_and_prunes_the_all_equal_blocks() {
         "the four all-zero blocks are pruned; the no-stat block is kept"
     );
     assert_eq!((plain_total, plain_scanned), (8, 8), "no arm, no pruning");
+}
+
+/// The two declared columns the two-key `GROUP BY` test needs; `code` has no
+/// statistics installed anywhere, and needs none, since the load never fires.
+fn status_and_code_cols() -> Vec<DeclaredColumn> {
+    vec![
+        DeclaredColumn::new("status", DeclaredType::I64),
+        DeclaredColumn::new("code", DeclaredType::I64),
+    ]
+}
+
+/// Run `sql` against an empty snapshot and return the GET count. An empty
+/// snapshot still issues the HEAD GET when the gate admits the statement (see
+/// [`ineligible_no_declared_reference_issues_zero_gets`]), so a refused shape
+/// reads 0 and an admitted one reads 1.
+async fn gets_for_empty_snapshot(sql: &str, declared: &[DeclaredColumn]) -> u64 {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let executor = executor(&store);
+    let (_plan, _batches) = run(&executor, snapshot_of(Vec::new()), sql, declared).await;
+    store.gets()
+}
+
+/// Issue #3244, exact ZERO. ClickBench q03's shape, `SUM` beside `COUNT(*)`
+/// and `AVG`, names the declared column, so the old "aggregate plus declared
+/// reference" gate loaded the statistics. Neither consumer can answer it:
+/// `MetadataOnlyAggregate` takes one aggregate, and DataFusion's
+/// `AggregateStatistics` replaces all or none and has no `SUM`/`AVG`.
+#[tokio::test]
+async fn q03_shape_sum_count_avg_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT SUM(status), COUNT(*), AVG(status) FROM logs",
+            &status_col()
+        )
+        .await,
+        0,
+        "no statistics consumer answers SUM beside AVG, so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. `COUNT(DISTINCT status)` needs an exact distinct
+/// count, which no statistics path supplies.
+#[tokio::test]
+async fn count_distinct_declared_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot("SELECT COUNT(DISTINCT status) FROM logs", &status_col()).await,
+        0,
+        "no statistics consumer answers COUNT(DISTINCT), so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. A `<>` filter goes with an ungrouped `COUNT(*)`
+/// only; `MetadataOnlyAggregate`'s group-by path takes no filter at all.
+#[tokio::test]
+async fn not_equal_filter_with_group_by_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT status, COUNT(*) FROM logs WHERE status <> 200 GROUP BY status",
+            &status_col()
+        )
+        .await,
+        0,
+        "the group-by path takes no filter, so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. Three `SUM`s are three aggregates;
+/// `MetadataOnlyAggregate` answers one.
+#[tokio::test]
+async fn three_sums_issue_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT SUM(status), SUM(status + 1), SUM(status + 2) FROM logs",
+            &status_col()
+        )
+        .await,
+        0,
+        "no statistics consumer answers several SUMs, so the load must not fire"
+    );
+}
+
+/// Issue #3244, exact ZERO. The group-by path answers a single declared key.
+#[tokio::test]
+async fn group_by_two_keys_issues_zero_gets() {
+    assert_eq!(
+        gets_for_empty_snapshot(
+            "SELECT status, code, COUNT(*) FROM logs GROUP BY status, code",
+            &status_and_code_cols()
+        )
+        .await,
+        0,
+        "the group-by path takes one key, so the load must not fire"
+    );
+}
+
+/// One segment with `status` = {200:3, 404:2} installed with its `.cstat`
+/// entry; returns the store and the snapshot holding the segment.
+async fn installed_status_segment() -> (Arc<CountingStore>, Snapshot) {
+    let store = CountingStore::new(Arc::new(MemoryStore::new()));
+    let seg = seg_ref(1, 5);
+    install_head_and_stats(&*store, &[stats_segment(&seg, vec![status_stat()])]).await;
+    (store, snapshot_of(vec![seg]))
+}
+
+/// Run `sql` over [`installed_status_segment`] and assert the metadata answer:
+/// exactly the HEAD GET and the one `.cstat` GET once planned,
+/// `MetadataOnlyExec` in the plan and no `LogsScanExec`. Both are asserted
+/// before execution, since the fixture's data object does not exist and a
+/// scan fails on it. Returns the result batches.
+async fn assert_metadata_answer_with_two_gets(sql: &str) -> Vec<RecordBatch> {
+    let (store, snapshot) = installed_status_segment().await;
+    let executor = executor(&store);
+    let accounting = QueryAccounting::new();
+    let pinned = executor
+        .plan_pinned(TENANT, snapshot, sql, &accounting, &status_col())
+        .await
+        .expect("plan");
+    let plan = pinned.create_physical_plan().await.expect("physical plan");
+    let plan = displayable(plan.as_ref()).indent(true).to_string();
+    assert_eq!(
+        store.gets(),
+        2,
+        "{sql}: exactly the HEAD GET and the one column-stats GET"
+    );
+    assert!(
+        plan.contains("MetadataOnlyExec"),
+        "{sql} must answer from the column statistics; plan was:\n{plan}"
+    );
+    assert!(
+        !plan.contains("LogsScanExec"),
+        "{sql} must not scan; plan was:\n{plan}"
+    );
+    let mut stream = pinned.execute().await.expect("execute");
+    let mut batches = Vec::new();
+    while let Some(next) = stream.next().await {
+        batches.push(next.expect("batch"));
+    }
+    assert_eq!(store.gets(), 2, "{sql}: no GET while executing");
+    batches
+}
+
+/// Issue #3244, exact TWO. q08's shape: `COUNT(*)` grouped by one declared
+/// column with no filter answers from the dictionary.
+#[tokio::test]
+async fn group_by_declared_count_answers_from_metadata_with_two_gets() {
+    let batches =
+        assert_metadata_answer_with_two_gets("SELECT status, COUNT(*) FROM logs GROUP BY status")
+            .await;
+    assert_eq!(
+        status_groups(&batches),
+        vec![(200, 3), (404, 2)],
+        "the dictionary's groups"
+    );
+}
+
+/// The `(status, COUNT(*))` rows of a grouped result, sorted.
+fn status_groups(batches: &[RecordBatch]) -> Vec<(i64, i64)> {
+    let mut groups = Vec::new();
+    for batch in batches {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 key");
+        let counts = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("int64 count");
+        for row in 0..batch.num_rows() {
+            groups.push((keys.value(row), counts.value(row)));
+        }
+    }
+    groups.sort_unstable();
+    groups
+}
+
+/// Issue #3244, exact TWO. `SUM(status)` answers from the stored sum.
+#[tokio::test]
+async fn sum_declared_answers_from_metadata_with_two_gets() {
+    let batches = assert_metadata_answer_with_two_gets("SELECT SUM(status) FROM logs").await;
+    assert_eq!(scalar(&batches, 0), Some(1408), "200*3 + 404*2");
+}
+
+/// Issue #3244, exact TWO. `SUM(status + 1)` answers from the stored sum plus
+/// the addend times the non-null count.
+#[tokio::test]
+async fn sum_declared_plus_literal_answers_from_metadata_with_two_gets() {
+    let batches = assert_metadata_answer_with_two_gets("SELECT SUM(status + 1) FROM logs").await;
+    assert_eq!(scalar(&batches, 0), Some(1413), "1408 + 1*5");
+}
+
+/// Issue #3244, exact TWO. `AVG(status)` answers from the stored sum over the
+/// non-null count.
+#[tokio::test]
+async fn avg_declared_answers_from_metadata_with_two_gets() {
+    let batches = assert_metadata_answer_with_two_gets("SELECT AVG(status) FROM logs").await;
+    let avg = batches
+        .iter()
+        .find(|b| b.num_rows() > 0)
+        .map(|b| {
+            b.column(0)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("float64 avg")
+                .value(0)
+        })
+        .expect("one avg row");
+    assert_eq!(avg.to_bits(), (1408.0_f64 / 5.0).to_bits(), "1408 / 5");
+}
+
+/// A `ts` bound written with `TIMESTAMP` literals, containing the fixture
+/// segment's whole `0..=1000` ns range.
+const CONTAINING_TS_BOUND: &str = "ts BETWEEN TIMESTAMP '1970-01-01 00:00:00.000000000' \
+     AND TIMESTAMP '1970-01-01 00:00:00.000001000'";
+
+/// Issue #3244, exact TWO. q02 beside a `ts` bound written with `TIMESTAMP`
+/// literals. The gate reads the analyzed plan, where each literal is still a
+/// cast of a string, so it cannot show the conjunct is a pure `ts` bound; an
+/// unclassified conjunct inside an admitted shape keeps the load, and the
+/// rewrite answers on the optimized plan.
+///
+/// Pre-fix demonstration: on the first round's gate, which refused any
+/// residual conjunct it could not classify, the GET count reads 0.
+#[tokio::test]
+async fn not_equal_count_beside_a_timestamp_bound_loads_and_answers() {
+    let sql = format!("SELECT COUNT(*) FROM logs WHERE status <> 200 AND {CONTAINING_TS_BOUND}");
+    let batches = assert_metadata_answer_with_two_gets(&sql).await;
+    assert_eq!(scalar(&batches, 0), Some(2), "5 non-null minus 3 with 200");
+}
+
+/// Issue #3244, exact TWO. q08 beside the same `TIMESTAMP` bound loads and
+/// answers the dictionary's groups.
+///
+/// Pre-fix demonstration: on the first round's gate the GET count reads 0.
+#[tokio::test]
+async fn group_by_declared_beside_a_timestamp_bound_loads_and_answers() {
+    let sql =
+        format!("SELECT status, COUNT(*) FROM logs WHERE {CONTAINING_TS_BOUND} GROUP BY status");
+    let batches = assert_metadata_answer_with_two_gets(&sql).await;
+    assert_eq!(
+        status_groups(&batches),
+        vec![(200, 3), (404, 2)],
+        "the dictionary's groups"
+    );
+}
+
+/// Issue #3244, exact TWO. `NOT (status = 200)` is not a `<>` conjunct in
+/// the analyzed plan; the optimizer rewrites it to `status <> 200`, and the
+/// rewrite answers that. The gate loads because the conjunct is unknown, not
+/// because it reads through the negation.
+///
+/// Pre-fix demonstration: a gate that refuses an unclassified conjunct (with
+/// or without stripping casts from literals) reads 0 GETs here.
+#[tokio::test]
+async fn negated_equality_count_loads_and_answers() {
+    let batches =
+        assert_metadata_answer_with_two_gets("SELECT COUNT(*) FROM logs WHERE NOT (status = 200)")
+            .await;
+    assert_eq!(scalar(&batches, 0), Some(2), "5 non-null minus 3 with 200");
+}
+
+/// Issue #3244, exact TWO. `status <> 100 + 100` holds an unfolded constant
+/// expression in the analyzed plan; the optimizer folds it to `<> 200`.
+///
+/// Pre-fix demonstration: on the first round's gate the GET count reads 0.
+#[tokio::test]
+async fn not_equal_to_a_constant_expression_loads_and_answers() {
+    let batches =
+        assert_metadata_answer_with_two_gets("SELECT COUNT(*) FROM logs WHERE status <> 100 + 100")
+            .await;
+    assert_eq!(scalar(&batches, 0), Some(2), "5 non-null minus 3 with 200");
+}
+
+/// Issue #3244, exact ZERO. A `COUNT(*)` whose only filter is a `ts` bound
+/// names no declared column, so the rewrite has nothing to read from the
+/// statistics and the load does not fire, `TIMESTAMP` literals or not.
+#[tokio::test]
+async fn count_star_beside_only_a_timestamp_bound_issues_zero_gets() {
+    let sql = format!("SELECT COUNT(*) FROM logs WHERE {CONTAINING_TS_BOUND}");
+    assert_eq!(
+        gets_for_empty_snapshot(&sql, &status_col()).await,
+        0,
+        "no declared column is filtered, so the load must not fire"
+    );
 }
