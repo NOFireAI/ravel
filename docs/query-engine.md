@@ -751,9 +751,13 @@ partition:
 
 A statement with a block-level predicate (a declared-column or `attrs`
 numeric comparison, the ClickBench q20 and q37-q43 shapes; a text
-`has_word`; a pushed `LIKE '%literal%'` contains arm; a stream filter) is not
-block-predicate-free, so it takes the
-plan-then-stripe path, never the whole-segment fast path above. Without the
+`has_word`; a stream filter) is not block-predicate-free, so it takes the
+plan-then-stripe path, never the whole-segment fast path above. A pushed
+`LIKE '%literal%'` contains arm is not a block predicate for this choice: no
+index covers it, so it excludes no block, and a content list holding only
+such arms keeps the whole-segment fast path, whose open carries the arm and
+evaluates it per row (`route_predicate_free`,
+`crates/ravel-sql/tests/logs_contains_route.rs`). Without the
 numeric prune arms below, that path read every relevant object WHOLE twice
 over: the plan phase opened
 each segment to count survivors, and the scan's `fetch_object_with_footer`
@@ -4372,9 +4376,11 @@ never drop a true result):
     so does the same pattern on `body`, on `attrs['k']`, on an undeclared
     name, on a column of another declared type, or under `OR` or `NOT`.
     `stats.pruning.containsCellsTested` counts the cells the arm tested.
-    The arm prunes no block, but as a content arm it makes the statement not
-    block-predicate-free, so even a full-window statement takes the
-    plan-then-stripe path and records `fast_path_rejected_block_predicate`.
+    The arm prunes no block, and a content list holding only `Contains`
+    arms does not count as a block predicate for the route, so a
+    full-window statement keeps the whole-segment fast path. A `has_word`
+    arm beside it still makes the statement not block-predicate-free, and
+    the scan records `fast_path_rejected_block_predicate`.
   Everything else (`!=`, `NOT`, negated `BETWEEN`, `IS [NOT] NULL`, a general
   `OR`, a range operator on a `str`/`bytes` column, a `str`/`bytes` `IN`, or a
   type-mismatched literal, including one DataFusion coercion has already wrapped
@@ -4808,8 +4814,9 @@ is a candidate and the scan decodes all 105 columns of every one of them before
 the filter or the TopK sees a row. These figures predate the contains arm: a
 declared `str` column such as `URL` now pushes `LIKE '%google%'` as a content
 predicate (`content=1`), which drops rows inside each decoded block but still
-prunes no block, so every block remains a candidate; the arm also moves the
-statement from the whole-segment fast path to the plan-then-stripe path. The whole difference is the 103
+prunes no block, so every block remains a candidate, and a statement that
+takes the whole-segment fast path without the arm keeps it with the arm. The
+whole difference is the 103
 columns nobody looks at until ten rows have been chosen.
 
 `TopKLateMaterialization` is a physical optimizer rule (installed by
