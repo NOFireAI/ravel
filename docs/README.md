@@ -196,6 +196,10 @@ rule as every other page.
 - [internal/loader-memory-2613.md](internal/loader-memory-2613.md): where
   `ravel-cli load` puts its memory at large `--batch-rows` on ClickBench,
   by allocation site, and the ranked reductions.
+- [internal/bbtree-ordered-maps-3254.md](internal/bbtree-ordered-maps-3254.md):
+  bbtree's single-owner map and a hash-then-sort map against std's
+  `BTreeMap` on the compaction grouping stage and the RLOG postings maps,
+  with the benches, both runs, and why neither change landed.
 - [internal/bench-reports.md](internal/bench-reports.md): report-only
   measurement tools in `ravel-bench`, starting with `logbody_report` (log
   body substring selectivity, template split, FastLanes integer pages).
