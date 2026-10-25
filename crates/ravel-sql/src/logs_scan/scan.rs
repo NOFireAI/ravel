@@ -1207,13 +1207,14 @@ impl LogScanStream {
     /// Take ownership of one block's pre-built columnar batches, charging the
     /// pool for their Arrow footprint as [`columnar_charges`] splits it
     /// ([`charge_columnar_batches`]). The decoded block they were built from
-    /// is charged separately, in [`Self::resident`], and the shared dictionary
-    /// values the scan's [`StrValuesCache`] holds by the cache, before each
-    /// was built.
+    /// is charged separately, in [`Self::resident`], and the string values
+    /// arrays the scan's [`StrValuesCache`] holds by the cache, from before
+    /// each was built until nothing outside the cache holds its `Arc` or the
+    /// stream releases the cache ([`StrValuesCache::retain_live`]).
     ///
     /// [`Self::emit_next_columnar_batch`] moves each emitted batch's own
-    /// charge from `held` to `emitted`; the block's shared values stay in
-    /// `held` until [`Self::release_block`].
+    /// charge from `held` to `emitted`; shared values the cache does not hold
+    /// stay in `held` until [`Self::release_block`].
     fn hold_batches(&mut self, batches: Vec<RecordBatch>) -> DFResult<()> {
         let (charged, bytes) =
             charge_columnar_batches(batches, &self.str_values, &self.reservation)?;
@@ -1222,8 +1223,9 @@ impl LogScanStream {
         Ok(())
     }
 
-    /// Drop every shared dictionary values array the scan's cache holds and
-    /// release their charge: the stream has nothing left to read them for.
+    /// Drop every string values array the scan's cache holds and release
+    /// their charge: the stream has nothing left to read them for, though an
+    /// operator downstream may still hold some ([`StrValuesCache::clear`]).
     fn release_str_values(&mut self) {
         lock_str_values(&self.str_values).clear();
     }
