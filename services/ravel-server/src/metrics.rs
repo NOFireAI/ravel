@@ -3373,10 +3373,11 @@ fn render_ingest_buffer_budget_family(
 /// `is_fallback` is set (the budget was sized on an unmeasured host,
 /// `config::PERF_SOURCE_FALLBACK`). On that path `raw_limit` is
 /// `ravel_memory::MemoryBudget::limit()`'s actual value: `u64::MAX` minus
-/// the two hard cache carves (`DEFAULT_CACHE_MAX_BYTES` each), not `u64::MAX`
-/// itself, which would leave the "unlimited" doc claim on
-/// `ravel_memory_budget_bytes` unmet and a `== u64::MAX` dashboard check
-/// permanently unmatched.
+/// the three hard cache carves (`DEFAULT_CACHE_MAX_BYTES` for each byte cache
+/// and `DEFAULT_COLUMN_STATS_CACHE_MAX_BYTES` for the column-statistics
+/// cache), not `u64::MAX` itself, which would leave the "unlimited" doc
+/// claim on `ravel_memory_budget_bytes` unmet and a `== u64::MAX` dashboard
+/// check permanently unmatched.
 fn exposed_memory_budget_limit(raw_limit: u64, is_fallback: bool) -> u64 {
     if is_fallback { u64::MAX } else { raw_limit }
 }

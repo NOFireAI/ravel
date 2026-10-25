@@ -464,8 +464,10 @@ than what the calibration run linked from decision 2 already computes. (The
 ### 3. A static carve under one number
 
 `resolve_performance_defaults` derives one `memory_budget_bytes` from the
-cgroup-capped effective memory minus an overhead reserve. The two caches keep
+cgroup-capped effective memory minus an overhead reserve. The caches keep
 hard eviction caps carved from it (they cannot shed, so they cannot share);
+the catalog's column-statistics cache is the third such carve, see the
+column-statistics carve amendment below;
 SQL and fetch draw from the remainder through the accountant, with the
 per-tenant ceiling as the fairness bound within it. The sum of hard caps plus
 the shared remainder equals the budget by construction, and startup refuses a
@@ -1632,3 +1634,48 @@ multi-column map.
 `the_aggregate_profile_of_the_six_measured_statements` in
 `crates/ravel-sql/src/executor.rs` pins `capacity_accounted` for q33, q19
 and q17 (true) and q34, q35 and q14 (false).
+
+## Amendment (2026-10-25, issue #3244): the column-statistics cache is the third hard carve
+
+<!-- amendment-applies: sections="3. A static carve under one number" pointer="column-statistics carve amendment" -->
+
+This is the column-statistics carve amendment. The catalog's
+`ColumnStatsCache`, which holds decoded `.cstat` statistics (ADR-1413), was
+sized by the catalog's fixed 64 MiB default and sat outside the budget. It is
+now the third hard carve beside the fetcher and catalog caches:
+`COLUMN_STATS_CACHE_MEMORY_PERCENT` is 2, and the server derives
+`column_stats_cache_max_bytes` as 2% of `memory_budget_bytes`, which is
+601,295,421 bytes on the reference budget of 30,064,771,072. The share does
+not change on a loopback store. `--column-stats-cache-max-bytes` overrides
+it, a gateway resolves it to 0, and a host whose memory cannot be read
+falls back to the catalog's 64 MiB default, as the other two caches fall
+back to theirs.
+
+The cap is a term of `memory_hard_caps_bytes` and so comes out of the
+remainder, and the startup refusal counts it with the other two caps,
+naming each figure and its flag. The refusal's exemptions are unchanged:
+`--disable-cache` builds none of the three caches, hands the catalog a
+column-statistics cap of 0 and charges no ceiling, and a gateway derives no
+budget. The column-statistics cache has no disk tier, so it does not enter
+the SQL spill path's read-cache figure, which bounds that tier.
+
+The share is 2 because it admits the largest single entry measured today.
+The cache holds one decoded entry per tenant until ADR-1413's per-part
+entries land, and an entry larger than the cap is served but not cached, so
+every query reads and decodes the whole `.cstat` object again. The
+whole-tenant entry on the reference host was 266,736,092 bytes (measured
+2026-10-25, issue #3244 comment 6397066052); 2% of the reference budget is
+601,295,421 bytes and admits it with room for growth, and 2% of the
+available-memory budget on the same host, 27,775,004,672 bytes, is
+555,500,093 and admits it too. 1%, about 278 to 301 MB on those budgets,
+would leave the entry less than 13% of headroom to grow. Once per-part entries land (issue #3244 plan step 2), an
+entry is one part's statistics rather than a tenant's, and the share is
+expected to be slack rather than the bound that decides what is cached.
+
+`column_stats_cache_derives_two_percent_of_the_reference_budget`,
+`hard_caps_are_the_exact_sum_of_the_three_caches` and
+`startup_refuses_when_the_column_stats_cap_reaches_the_budget` in
+`services/ravel-server/src/config.rs`, and
+`build_catalog_for_server_applies_the_column_stats_cache_cap` in
+`services/ravel-server/src/query.rs`, pin the derivation, the sum, the
+refusal, and the value reaching the catalog.

@@ -807,21 +807,22 @@ startup. With no cgroup limit and a readable `MemAvailable`, the budget is
 `min(MemTotal - RESERVE, max(FLOOR, MemAvailable + own RSS - RESERVE))`:
 `27,775,004,672` here, resolved with `source="derived-available"`, against
 32,903,794,688 - 2,147,483,648 = 30,756,311,040 if the derivation still used
-raw `MemTotal` as it did before the amendment. The two caches carve this
-budget, not `MemTotal`: a 25% read cache of 6,943,751,168 bytes and a 5%
-catalog byte cache of 1,388,750,233 bytes against an `s3` store. Against a
+raw `MemTotal` as it did before the amendment. The three caches carve this
+budget, not `MemTotal`: a 25% read cache of 6,943,751,168 bytes, a 5%
+catalog byte cache of 1,388,750,233 bytes and a 2% column-statistics cache
+of 555,500,093 bytes against an `s3` store. Against a
 loopback store the read cache instead carves a 24% share, 6,666,001,121
 bytes.
 
 The 50% per-query and per-tenant SQL pools still carve raw `MemTotal` first
 (16,451,897,344 each, unchanged by the amendment), but a DERIVED (not
 explicit-flag) pool is then held at or below 90% of
-`memory_remainder_bytes` -- what the budget above leaves once the two
+`memory_remainder_bytes` -- what the budget above leaves once the three
 caches are carved out of it. Against the `s3` store, the remainder is
-19,442,503,271 and its 90% cap (17,498,252,943) does not bind, so both SQL
+18,887,003,178 and its 90% cap (16,998,302,860) does not bind, so both SQL
 pools stay at 16,451,897,344 with `remainder_capped=false`. Against the
 loopback store, the 24% read-cache carve leaves a remainder of
-19,720,253,318, whose 90% cap (17,748,227,986) does not bind either, so
+19,164,753,225, whose 90% cap (17,248,277,902) does not bind either, so
 both SQL pools also stay at 16,451,897,344 with `remainder_capped=false`.
 This box's exact numbers depend on
 `MemAvailable` at the moment the server starts, not only on its fixed

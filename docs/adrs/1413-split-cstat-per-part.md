@@ -187,7 +187,9 @@ holding per-part entries rather than one entry per tenant, so eviction has
 a unit smaller than "everything". The cache's budget is the third hard
 carve in ADR-1170's derivation and its resident bytes are the
 `column_stats_resident` term in `unique`, which PR #1436 (the carve
-rework) adds; this ADR names that home and does not create a second one. A tenant whose
+rework) adds; this ADR names that home and does not create a second one.
+ADR-1170's column-statistics carve amendment (issue #3244) sets that carve
+at 2% of the budget. A tenant whose
 per-part entries exceed the carve is evicted per part, in LRU order, exactly
 as the fetcher and catalog caches evict.
 
