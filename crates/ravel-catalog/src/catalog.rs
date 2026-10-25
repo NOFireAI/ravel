@@ -1555,12 +1555,7 @@ impl Catalog {
     /// `succeeded` carries the successful fold's
     /// [`crate::FoldReport::column_stats_dictionaries_dropped`]; `None` is a
     /// failed fold.
-    pub(crate) fn record_fold_outcome(
-        &self,
-        signal: Signal,
-        now_ns: i64,
-        succeeded: Option<u64>,
-    ) {
+    pub(crate) fn record_fold_outcome(&self, signal: Signal, now_ns: i64, succeeded: Option<u64>) {
         let slot = fold_slot(signal);
         if let Some(dictionaries_dropped) = succeeded {
             self.fold_cycles[slot].fetch_add(1, Ordering::Relaxed);

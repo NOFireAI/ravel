@@ -11753,7 +11753,10 @@ mod tests {
                 line.starts_with("ravel_catalog_fold_column_stats_dictionaries_dropped_total")
             })
             .count();
-        assert_eq!(drop_samples, 3, "one drop series per folded signal:\n{body}");
+        assert_eq!(
+            drop_samples, 3,
+            "one drop series per folded signal:\n{body}"
+        );
 
         let gateway = render_in(Mode::Gateway);
         for expected in [
@@ -12556,10 +12559,10 @@ mod tests {
     /// the second is a cache hit and leaves decoded bytes where the first put
     /// it, and held bytes equals the cached entry's `heap_bytes`.
     ///
-    /// Prove-the-test: adding `body_uncompressed_len` on the cache-hit return
-    /// in `Catalog::load_column_stats` reads twice the body length after the
-    /// second load; adding the object's wire length instead reads the wire
-    /// length, which the fixture asserts differs from the body length.
+    /// Prove-the-test: adding the cached entry's `heap_bytes` on the cache-hit
+    /// return in `Catalog::load_column_stats` reads 243 against 106 after the
+    /// second load; feeding the object's wire length in place of
+    /// `body_uncompressed_len` reads 192 against 106 after the first.
     #[tokio::test]
     async fn column_stats_cache_and_decoded_bytes_read_the_live_catalog() {
         use ravel_catalog::{Catalog, CatalogConfig};
@@ -12575,7 +12578,10 @@ mod tests {
         let tenant = TenantId::new("column-stats-cache-snapshot").hash();
         let store = std::sync::Arc::new(MemoryStore::new());
         let (body_len, wire_len) = install_real_column_stats(&store, tenant).await;
-        assert_ne!(body_len, wire_len, "the fixture tells the two byte kinds apart");
+        assert_ne!(
+            body_len, wire_len,
+            "the fixture tells the two byte kinds apart"
+        );
 
         let refusing = Catalog::new(
             std::sync::Arc::clone(&store) as _,
@@ -12610,9 +12616,8 @@ mod tests {
         assert_eq!(after.column_stats_cache_held_bytes, 0);
         assert_eq!(after.column_stats_decoded_bytes, body_len);
 
-        let admitting =
-            Catalog::new(std::sync::Arc::clone(&store) as _, CatalogConfig::default())
-                .expect("catalog");
+        let admitting = Catalog::new(std::sync::Arc::clone(&store) as _, CatalogConfig::default())
+            .expect("catalog");
         let first = admitting
             .load_column_stats(
                 &tenant,

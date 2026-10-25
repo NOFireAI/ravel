@@ -6515,7 +6515,10 @@ pub(crate) mod tests {
         publish_logs_segment_wide(store.as_ref(), 0, 10, rows).await;
         let mut catalog = Catalog::new(store.clone(), config(1)).expect("catalog");
         catalog.set_column_stats_part_ceiling_for_test(ceiling);
-        assert_eq!(catalog.fold_column_stats_dictionaries_dropped(Signal::Logs), 0);
+        assert_eq!(
+            catalog.fold_column_stats_dictionaries_dropped(Signal::Logs),
+            0
+        );
 
         let report = catalog
             .fold(
@@ -6547,7 +6550,10 @@ pub(crate) mod tests {
             )
             .await
             .expect("second fold succeeds");
-        assert!(no_op.no_op, "nothing new sealed, so the second fold is a no-op");
+        assert!(
+            no_op.no_op,
+            "nothing new sealed, so the second fold is a no-op"
+        );
         assert_eq!(no_op.column_stats_dictionaries_dropped, 0);
         assert_eq!(catalog.fold_cycles(Signal::Logs), 2);
         assert_eq!(
