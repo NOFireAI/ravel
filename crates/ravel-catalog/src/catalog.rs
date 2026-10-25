@@ -5315,6 +5315,7 @@ mod tests {
     };
     use ravel_object_store::memory::MemoryStore;
     use ravel_object_store::{Capabilities, DelimitedList, ListPage, PageToken, PutOutcome};
+    use ravel_proto::catalog::v1::ColumnStatsSegment;
 
     use super::*;
 
@@ -9715,6 +9716,343 @@ mod tests {
             Some(ravel_proto::catalog::v1::column_value::Kind::I64(v)) => *v,
             other => panic!("expected an I64 min, got {other:?}"),
         }
+    }
+
+    /// One I64 column of [`two_column_segment`]: two non-null rows, both
+    /// `value`, with the dictionary present.
+    fn i64_column(name: &str, value: i64) -> ravel_proto::catalog::v1::ColumnStat {
+        ravel_proto::catalog::v1::ColumnStat {
+            name: name.to_string(),
+            declared_type: 2,
+            non_null_count: 2,
+            null_count: 0,
+            min: Some(i64_value(value)),
+            max: Some(i64_value(value)),
+            dictionary_present: true,
+            dictionary: vec![ravel_proto::catalog::v1::DictEntry {
+                value: Some(i64_value(value)),
+                count: 2,
+            }],
+            sum: Some(2 * value),
+        }
+    }
+
+    /// The one segment a part written by [`install_parts`] carries: I64
+    /// columns `a` and `b`, keyed by `part_hash` as its content hash.
+    fn two_column_segment(part_hash: [u8; 32], a: i64, b: i64) -> ColumnStatsSegment {
+        ColumnStatsSegment {
+            ingest_hour_bucket: 1,
+            shard: 0,
+            writer_id: part_hash.to_vec(),
+            writer_epoch: 1,
+            writer_seq: 1,
+            columns: vec![i64_column("a", a), i64_column("b", b)],
+        }
+    }
+
+    /// The encoded length of `segment` with the dictionary of every column not
+    /// in `keep` emptied: what a cache entry holding `keep` must charge.
+    fn stripped_len(segment: &ColumnStatsSegment, keep: &[&str]) -> u64 {
+        let mut segment = segment.clone();
+        for column in &mut segment.columns {
+            if !keep.contains(&column.name.as_str()) {
+                column.dictionary.clear();
+            }
+        }
+        segment.encoded_len() as u64
+    }
+
+    /// `name`'s statistics in the record `loaded` holds for `part`.
+    fn loaded_column<'a>(
+        loaded: &'a LoadedColumnStats,
+        part: &[u8; 32],
+        name: &str,
+    ) -> &'a ravel_proto::catalog::v1::ColumnStat {
+        loaded.by_content_hash()[part]
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .expect("column present")
+    }
+
+    /// One part written by [`install_parts`]: its segment as encoded, and the
+    /// object's declared `body_uncompressed_len`.
+    struct InstalledPart {
+        segment: ColumnStatsSegment,
+        body_len: u64,
+    }
+
+    /// Write one v3 `.cstat` object per `(part_hash, a, b)` (each at its own
+    /// key, one [`two_column_segment`] each) and a HEAD listing every part,
+    /// part `i` covering hours `[5i, 5i + 4]`, inside [`full_window`] for up
+    /// to ten parts. Calling it again with a longer list is the shape a fold
+    /// that adds a part leaves: the earlier parts' objects are rewritten byte
+    /// for byte, so their declared blake3s do not move.
+    async fn install_parts(
+        store: &MemoryStore,
+        tenant: TenantHash,
+        signal: Signal,
+        parts: &[([u8; 32], i64, i64)],
+    ) -> Vec<InstalledPart> {
+        let signal_num = signal::to_proto(signal) as u32;
+        let prefix = signal.key_prefix();
+        let mut part_refs = Vec::new();
+        let mut segments = Vec::new();
+        let mut watermark_hour = 0;
+        for (i, &(part_hash, a, b)) in parts.iter().enumerate() {
+            let min_hour = 5 * i as u32;
+            watermark_hour = min_hour + 4;
+            let segment = two_column_segment(part_hash, a, b);
+            let stats_bytes = crate::snapshot_format::encode_column_stats_v3(
+                tenant.0,
+                signal_num,
+                part_hash,
+                std::slice::from_ref(&segment),
+                crate::snapshot_format::DEFAULT_MAX_COLUMN_STATS_BYTES,
+            )
+            .expect("encode v3 column stats");
+            let name: String = part_hash[..8].iter().map(|b| format!("{b:02x}")).collect();
+            let stats_key = format!("t/{}/catalog/{prefix}/cstat/{name}.cstat", tenant.to_hex());
+            store
+                .put(
+                    &stats_key,
+                    Bytes::from(stats_bytes.clone()),
+                    PutOptions::default(),
+                )
+                .await
+                .expect("put stats");
+            part_refs.push(ravel_proto::catalog::v1::SnapshotPartRef {
+                key: format!("t/{}/catalog/{prefix}/snap/{name}.csnap", tenant.to_hex()),
+                blake3: part_hash.to_vec(),
+                size: 1,
+                entry_count: 0,
+                watermark_hour,
+                min_hour,
+                column_stats: Some(ravel_proto::catalog::v1::SnapshotColumnStatsPartRef {
+                    key: stats_key,
+                    blake3: blake3::hash(&stats_bytes).as_bytes().to_vec(),
+                    size: stats_bytes.len() as u64,
+                    segment_count: 1,
+                    part_blake3: vec![part_hash.to_vec()],
+                }),
+                key_index: Vec::new(),
+            });
+            let body_len = crate::snapshot_format::decode_column_stats_header(&stats_bytes)
+                .expect("the object just written has a readable header")
+                .header
+                .body_uncompressed_len;
+            segments.push(InstalledPart { segment, body_len });
+        }
+        let head = ravel_proto::catalog::v1::SnapshotHead {
+            format_version: crate::snapshot_format::HEAD_FORMAT_VERSION,
+            tenant_hash: tenant.0.to_vec(),
+            signal: signal_num,
+            shard_count: 8,
+            watermark_hour,
+            parts: part_refs,
+            folder_id: Uuid::new_v4().into_bytes().to_vec(),
+            created_unix_ns: 0,
+            postings: None,
+            shard_generation_count: 1,
+        };
+        let head_bytes = crate::snapshot_format::encode_head(&head).expect("encode head");
+        store
+            .put(
+                &crate::fold::head_object_key(&tenant, signal),
+                Bytes::from(head_bytes),
+                PutOptions::default(),
+            )
+            .await
+            .expect("put head");
+        segments
+    }
+
+    /// One `load_column_stats` over [`full_window`] for the default tenant's
+    /// logs, returning the result and the GETs it was charged.
+    async fn load_counting(
+        catalog: &Catalog,
+        request: &ColumnStatsRequest,
+    ) -> (Arc<LoadedColumnStats>, u64) {
+        let acc = QueryAccounting::new();
+        let (range, now_ns) = full_window();
+        let loaded = catalog
+            .load_column_stats(&tenant(), Signal::Logs, range, now_ns, request, &acc)
+            .await
+            .expect("load ok")
+            .expect("stats present");
+        (loaded, acc.snapshot().s3_requests(AccountedOp::Get))
+    }
+
+    /// Issue #3244: an entry is one part's summary plus only the dictionaries
+    /// asked for so far. A request the entry covers costs the HEAD GET alone;
+    /// a dictionary it lacks re-fetches that part's object once, and the new
+    /// entry keeps the union, so asking for `b` never drops `a`. The held
+    /// bytes are the stripped segment's encoded length, summed here
+    /// independently of the cache.
+    ///
+    /// FLIP: make `PartColumnStats::from_decoded` ignore `previous` (an entry
+    /// holding only the latest request's dictionaries); "the union keeps a"
+    /// fails, then the held bytes (90 != 98), then the final q02 on `a`
+    /// (2 GETs != 1).
+    #[tokio::test]
+    async fn column_stats_cache_entry_fetches_only_missing_dictionaries() {
+        let store = Arc::new(MemoryStore::new());
+        let part = *blake3::hash(b"part-a").as_bytes();
+        let installed = install_parts(&store, tenant(), Signal::Logs, &[(part, 7, 9)]).await;
+        let segment = &installed[0].segment;
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+
+        let summary = ColumnStatsRequest::summary_only();
+        let q02_a = ColumnStatsRequest::summary_only().with_dictionary("a");
+        let q08_b = ColumnStatsRequest::summary_only().with_dictionary("b");
+
+        let (loaded, gets) = load_counting(&catalog, &summary).await;
+        assert_eq!(gets, 2, "cold summary: HEAD and the part's object");
+        assert!(!loaded.dictionary_loaded("a"));
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            stripped_len(segment, &[])
+        );
+        let summary_stat = loaded_column(&loaded, &part, "a");
+        assert!(summary_stat.dictionary.is_empty());
+        assert!(summary_stat.dictionary_present, "left as decoded");
+        assert_eq!(summary_stat.sum, Some(14), "the summary is kept whole");
+        assert_eq!(summary_stat.non_null_count, 2);
+
+        let (loaded, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 2, "the summary entry lacks a's dictionary");
+        assert!(loaded.dictionary_loaded("a"));
+        assert!(!loaded.dictionary_loaded("b"));
+        assert_eq!(
+            loaded_column(&loaded, &part, "a").dictionary,
+            segment.columns[0].dictionary
+        );
+        assert!(loaded_column(&loaded, &part, "b").dictionary.is_empty());
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            stripped_len(segment, &["a"])
+        );
+
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "a's dictionary is held: HEAD only");
+
+        let (_, gets) = load_counting(&catalog, &summary).await;
+        assert_eq!(gets, 1, "a summary is covered by any entry");
+
+        let (loaded, gets) = load_counting(&catalog, &q08_b).await;
+        assert_eq!(gets, 2, "b's dictionary is not held yet");
+        assert!(loaded.dictionary_loaded("a"), "the union keeps a");
+        assert!(loaded.dictionary_loaded("b"));
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            stripped_len(segment, &["a", "b"])
+        );
+
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "a survived the b fetch");
+
+        assert_eq!(catalog.column_stats_cache_evictions(), 0);
+        assert_eq!(catalog.column_stats_cache_refusals(), 0);
+        assert_eq!(
+            catalog.column_stats_decoded_bytes(),
+            3 * installed[0].body_len,
+            "three fetches, each decoded body counted once"
+        );
+    }
+
+    /// Issue #3244: entries are per part, keyed by the part's declared
+    /// `.cstat` blake3, so a HEAD that gains a third part (what a fold
+    /// publishes) costs the HEAD GET plus the new part's object only; the two
+    /// parts that did not change are still served from the cache.
+    ///
+    /// FLIP: in `load_column_stats`, key each entry by a hash of every covered
+    /// part's blake3 plus its own (a window-keyed cache); the post-fold load
+    /// charges 4 GETs, not 2.
+    #[tokio::test]
+    async fn column_stats_cache_fetches_only_the_part_a_fold_added() {
+        let store = Arc::new(MemoryStore::new());
+        let p1 = *blake3::hash(b"part-1").as_bytes();
+        let p2 = *blake3::hash(b"part-2").as_bytes();
+        let p3 = *blake3::hash(b"part-3").as_bytes();
+        install_parts(&store, tenant(), Signal::Logs, &[(p1, 1, 2), (p2, 3, 4)]).await;
+        let catalog = Catalog::new(store.clone(), config(8)).expect("catalog");
+        let q02_a = ColumnStatsRequest::summary_only().with_dictionary("a");
+
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 3, "cold: HEAD and both parts' objects");
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "warm: HEAD only");
+
+        let installed = install_parts(
+            &store,
+            tenant(),
+            Signal::Logs,
+            &[(p1, 1, 2), (p2, 3, 4), (p3, 5, 6)],
+        )
+        .await;
+        let (loaded, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 2, "after the fold: HEAD and the new part's object");
+        assert_eq!(loaded.content_hash_segments().count(), 3);
+        assert!(loaded.dictionary_loaded("a"));
+        assert_eq!(
+            catalog.column_stats_cache_held_bytes(),
+            installed
+                .iter()
+                .map(|part| stripped_len(&part.segment, &["a"]))
+                .sum::<u64>()
+        );
+        let (_, gets) = load_counting(&catalog, &q02_a).await;
+        assert_eq!(gets, 1, "all three parts held");
+    }
+
+    /// Issue #3244: the byte budget is enforced per part entry. A budget
+    /// holding one summary entry but not two evicts once over a two-part
+    /// load; a budget below one entry refuses it (once per part) and the load
+    /// is still answered in full.
+    #[tokio::test]
+    async fn column_stats_cache_budget_evicts_and_refuses_per_part_entry() {
+        let p1 = *blake3::hash(b"budget-1").as_bytes();
+        let p2 = *blake3::hash(b"budget-2").as_bytes();
+        let entry_bytes = stripped_len(&two_column_segment(p1, 1, 2), &[]);
+        assert_eq!(
+            entry_bytes,
+            stripped_len(&two_column_segment(p2, 1, 2), &[]),
+            "both entries weigh the same"
+        );
+        let summary = ColumnStatsRequest::summary_only();
+
+        let store = Arc::new(MemoryStore::new());
+        install_parts(&store, tenant(), Signal::Logs, &[(p1, 1, 2), (p2, 1, 2)]).await;
+        let fits_one = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                column_stats_cache_max_bytes: entry_bytes + entry_bytes / 2,
+                ..config(8)
+            },
+        )
+        .expect("catalog");
+        let (loaded, gets) = load_counting(&fits_one, &summary).await;
+        assert_eq!(gets, 3);
+        assert_eq!(loaded.content_hash_segments().count(), 2);
+        assert_eq!(fits_one.column_stats_cache_evictions(), 1);
+        assert_eq!(fits_one.column_stats_cache_refusals(), 0);
+        assert_eq!(fits_one.column_stats_cache_held_bytes(), entry_bytes);
+
+        let too_small = Catalog::new(
+            store.clone(),
+            CatalogConfig {
+                column_stats_cache_max_bytes: entry_bytes - 1,
+                ..config(8)
+            },
+        )
+        .expect("catalog");
+        install_parts(&store, tenant(), Signal::Logs, &[(p1, 1, 2)]).await;
+        let (loaded, gets) = load_counting(&too_small, &summary).await;
+        assert_eq!(gets, 2);
+        assert_eq!(loaded.content_hash_segments().count(), 1, "served anyway");
+        assert_eq!(too_small.column_stats_cache_refusals(), 1);
+        assert_eq!(too_small.column_stats_cache_evictions(), 0);
+        assert_eq!(too_small.column_stats_cache_held_bytes(), 0);
     }
 
     /// Write a folded HEAD for `(tenant, signal)` whose one part's field-7
