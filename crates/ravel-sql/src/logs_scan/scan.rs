@@ -1069,6 +1069,13 @@ impl LogScanStream {
         }
     }
 
+    /// Whether this whole-segment fast-path open prunes blocks: its query
+    /// carries `NumNotEq` arms (`route_predicate_free`), so the open's
+    /// survivor list, not the whole segment, is what a row ref indexes.
+    fn fast_path_prunes(&self) -> bool {
+        self.fast_whole_segment && !self.ctx.query.prune.is_empty()
+    }
+
     /// The surviving-block index of the block just decoded, or `None` when
     /// this scan emits no row refs. `decoded_block` is that block's
     /// whole-object index, read from the scan before it decoded the block
@@ -1541,6 +1548,10 @@ impl LogScanStream {
                                     .add_duration(at.saturating_duration_since(issued));
                                 match *opened {
                                     Ok(Some(scan)) => {
+                                        if this.fast_path_prunes() {
+                                            this.current_survivors =
+                                                Some(Arc::new(scan.survivor_block_indices()));
+                                        }
                                         this.state = if this.columnar_eligible {
                                             LogScanState::Columnar(Box::new(scan))
                                         } else {
@@ -1683,8 +1694,9 @@ impl LogScanStream {
                         // An unplanned segment's survivor list is the one its
                         // open just pruned to, which is also the list a
                         // late-materialization reopen prunes to, so a row-ref's
-                        // block position resolves the same way on both.
-                        if this.current_unplanned {
+                        // block position resolves the same way on both. A
+                        // fast-path open that prunes is the same case.
+                        if this.current_unplanned || this.fast_path_prunes() {
                             this.current_survivors = Some(Arc::new(scan.survivor_block_indices()));
                         }
                         this.state = if this.columnar_eligible {
