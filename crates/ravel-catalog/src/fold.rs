@@ -1711,7 +1711,14 @@ impl Catalog {
                 seal_through_hour,
             )
             .await;
-        self.record_fold_outcome(signal, now_ns, result.is_ok());
+        self.record_fold_outcome(
+            signal,
+            now_ns,
+            result
+                .as_ref()
+                .ok()
+                .map(|report| report.column_stats_dictionaries_dropped),
+        );
         result
     }
 

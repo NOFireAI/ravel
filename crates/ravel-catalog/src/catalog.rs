@@ -503,6 +503,10 @@ pub struct Catalog {
     /// a liveness signal a bounded false positive is the safe side; an
     /// unbounded false negative is not.
     fold_last_success_unix_ns: [AtomicI64; SIGNAL_SLOTS],
+    /// Sum of [`crate::FoldReport::column_stats_dictionaries_dropped`] over
+    /// every [`Catalog::fold`] call for this signal that returned `Ok`
+    /// (issue #3244). Indexed by [`fold_slot`].
+    fold_column_stats_dictionaries_dropped: [AtomicU64; SIGNAL_SLOTS],
     /// Bounds the object-store requests this catalog keeps in flight across
     /// every tenant, shard and hour at once, sized from
     /// `CatalogConfig::resolve_get_concurrency` (ADR-1733 decision 1).
@@ -590,6 +594,10 @@ pub struct Catalog {
     /// CPU gate (issue #2402), incremented on every panic whether or not it
     /// logged. Surfaced by [`Catalog::column_stats_decode_panics`].
     column_stats_decode_panics: AtomicU64,
+    /// Cumulative declared `body_uncompressed_len` of every column-stats
+    /// object [`Catalog::load_column_stats`] decoded (issue #3244). Surfaced by
+    /// [`Catalog::column_stats_decoded_bytes`].
+    column_stats_decoded_bytes: AtomicU64,
     /// Test-only: when set, every column-stats object that would load fails
     /// its decode with this gate error instead (issue #2402).
     /// [`ravel_cpu_gate::CpuGateError::Panicked`] is produced by running a
@@ -794,6 +802,7 @@ impl Catalog {
             fold_cycles: std::array::from_fn(|_| AtomicU64::new(0)),
             fold_failures: std::array::from_fn(|_| AtomicU64::new(0)),
             fold_last_success_unix_ns: std::array::from_fn(|_| AtomicI64::new(0)),
+            fold_column_stats_dictionaries_dropped: std::array::from_fn(|_| AtomicU64::new(0)),
             request_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 config.resolve_get_concurrency,
             )),
@@ -806,6 +815,7 @@ impl Catalog {
             column_stats_decode_refusals: AtomicU64::new(0),
             warned_decode_panics: Mutex::new(HashSet::new()),
             column_stats_decode_panics: AtomicU64::new(0),
+            column_stats_decoded_bytes: AtomicU64::new(0),
             #[cfg(test)]
             column_stats_decode_job_fault: None,
             column_stats_part_ceiling_override: None,
@@ -1521,6 +1531,16 @@ impl Catalog {
         self.fold_last_success_unix_ns[fold_slot(signal)].load(Ordering::Relaxed)
     }
 
+    /// Column-statistics dictionaries the fold dropped for `signal` to bring
+    /// an over-ceiling part under the reader ceiling, summed over every
+    /// [`Catalog::fold`] call for that signal that returned `Ok` across this
+    /// catalog's lifetime: the sum of each report's
+    /// [`crate::FoldReport::column_stats_dictionaries_dropped`]. A failed fold
+    /// adds nothing, even if it dropped dictionaries before failing.
+    pub fn fold_column_stats_dictionaries_dropped(&self, signal: Signal) -> u64 {
+        self.fold_column_stats_dictionaries_dropped[fold_slot(signal)].load(Ordering::Relaxed)
+    }
+
     /// `pub(crate)`: the single accounting point every [`Catalog::fold`]
     /// outcome passes through, called from the wrapper in `fold.rs` rather
     /// than from each of the fold body's many exits. Keeping it in one place
@@ -1531,11 +1551,22 @@ impl Catalog {
     /// read as healthy while the other was dead. A `ravel-cli` fold and the
     /// catalog bench run in their own processes, each with its own `Catalog`
     /// and no `/metrics` route, so they account into counters nothing scrapes.
-    pub(crate) fn record_fold_outcome(&self, signal: Signal, now_ns: i64, succeeded: bool) {
+    ///
+    /// `succeeded` carries the successful fold's
+    /// [`crate::FoldReport::column_stats_dictionaries_dropped`]; `None` is a
+    /// failed fold.
+    pub(crate) fn record_fold_outcome(
+        &self,
+        signal: Signal,
+        now_ns: i64,
+        succeeded: Option<u64>,
+    ) {
         let slot = fold_slot(signal);
-        if succeeded {
+        if let Some(dictionaries_dropped) = succeeded {
             self.fold_cycles[slot].fetch_add(1, Ordering::Relaxed);
             self.fold_last_success_unix_ns[slot].store(now_ns, Ordering::Relaxed);
+            self.fold_column_stats_dictionaries_dropped[slot]
+                .fetch_add(dictionaries_dropped, Ordering::Relaxed);
         } else {
             self.fold_failures[slot].fetch_add(1, Ordering::Relaxed);
         }
@@ -1686,6 +1717,8 @@ impl Catalog {
                 let outcome = self.inject_column_stats_decode_job_fault(outcome).await;
                 match outcome {
                     column_stats_resolve::FetchOutcome::Loaded(decoded, reservation) => {
+                        self.column_stats_decoded_bytes
+                            .fetch_add(decoded.body_uncompressed_len, Ordering::Relaxed);
                         segments.extend(decoded.segments);
                         by_content_hash.extend(decoded.by_content_hash);
                         reservations.push(reservation);
@@ -2076,6 +2109,18 @@ impl Catalog {
         self.column_stats_cache
             .as_ref()
             .map_or(0, ColumnStatsCache::held_bytes)
+    }
+
+    /// Cumulative decompressed body bytes of the column-statistics objects
+    /// [`Catalog::load_column_stats`] decoded (issue #3244): each object's
+    /// declared `body_uncompressed_len`, not its wire size. A load served from
+    /// the column-statistics cache decodes nothing and adds nothing, and so
+    /// does an object the reader refused to decode. Counted whether or not the
+    /// cache then admits the result. The fold's own read of the previous
+    /// fold's objects is not counted. `ravel-server` exports it on `/metrics`
+    /// as `ravel_catalog_column_stats_decoded_bytes_total`.
+    pub fn column_stats_decoded_bytes(&self) -> u64 {
+        self.column_stats_decoded_bytes.load(Ordering::Relaxed)
     }
 
     /// `pub(crate)`: exposed for `cache`'s own tests to inspect and seed the

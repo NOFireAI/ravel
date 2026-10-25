@@ -238,6 +238,9 @@ pub(crate) enum FetchOutcome {
 pub(crate) struct DecodedStats {
     pub segments: HashMap<EntryIdentity, ColumnStatsSegment>,
     pub by_content_hash: HashMap<[u8; 32], ColumnStatsSegment>,
+    /// The decoded object's declared decompressed body length, the figure
+    /// [`crate::Catalog::column_stats_decoded_bytes`] sums.
+    pub body_uncompressed_len: u64,
 }
 
 /// A genuinely unparseable HEAD, or an isolation breach, encountered while
@@ -499,6 +502,7 @@ pub(crate) async fn fetch_stats_object(
         DecodedStats {
             segments,
             by_content_hash,
+            body_uncompressed_len: header.body_uncompressed_len,
         },
         reservation,
     ))
