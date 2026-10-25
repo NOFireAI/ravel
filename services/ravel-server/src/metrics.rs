@@ -12660,8 +12660,20 @@ mod tests {
             .await
             .expect("load")
             .expect("the cached object covers the window");
-        assert!(
-            std::sync::Arc::ptr_eq(&first, &second),
+        // Each load assembles its own carrier over the cached part entries, so
+        // a cache hit shows as the second load's records being the first's.
+        let records = |loaded: &ravel_catalog::LoadedColumnStats| {
+            let mut records: Vec<_> = loaded
+                .content_hash_segments()
+                .map(|(hash, segment)| (*hash, std::ptr::from_ref(segment)))
+                .collect();
+            records.sort_unstable();
+            records
+        };
+        assert!(!records(&first).is_empty(), "the load holds records");
+        assert_eq!(
+            records(&first),
+            records(&second),
             "the second load is served from the cache"
         );
         let cached = CatalogCountersSnapshot::from_catalog(&admitting);
