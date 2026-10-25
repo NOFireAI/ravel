@@ -437,8 +437,8 @@ pub fn verify_and_decompress_chunk_frame(
     }
     let cap = usize::try_from(chunk.frame_uncompressed_len)
         .map_err(|_| SegmentError::SectionOutOfBounds)?;
-    let out =
-        zstd::bulk::decompress(stored, cap).map_err(|e| SegmentError::Decompress(e.to_string()))?;
+    let out = ravel_codec::zstd_frame::decompress(stored, cap)
+        .map_err(|e| SegmentError::Decompress(e.to_string()))?;
     if out.len() as u64 != chunk.frame_uncompressed_len {
         return Err(SegmentError::DecompressedLenMismatch {
             expected: chunk.frame_uncompressed_len,
@@ -974,7 +974,7 @@ pub fn decode_catalog_v5_chunked(
                 cap: limits.max_section_uncompressed_bytes,
             });
         }
-        let frame_raw = zstd::bulk::decompress(stored, cap)
+        let frame_raw = ravel_codec::zstd_frame::decompress(stored, cap)
             .map_err(|e| SegmentError::Decompress(e.to_string()))?;
         let frame = decode_chunk_frame(&frame_raw, footer, ts_len, val_len, hist_len, limits)?;
         if frame.n != chunk.n as usize {
