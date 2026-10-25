@@ -1160,6 +1160,23 @@ async fn not_equal_on_a_string_column_count_issues_zero_gets() {
     );
 }
 
+/// Issue #3244, exact ZERO. A `<>` on a `Str` column beside a conjunct the
+/// gate cannot read (a `TIMESTAMP` bound, a cast on the analyzed plan) is
+/// still a `<>` no consumer answers, so the load must not fire.
+///
+/// Pre-fix demonstration: on a gate whose unknown-conjunct branch keeps the
+/// load for any classified `<>`, whatever its column's type, the GET count
+/// reads 2.
+#[tokio::test]
+async fn not_equal_on_a_string_column_beside_a_timestamp_bound_issues_zero_gets() {
+    let sql = format!("SELECT COUNT(*) FROM logs WHERE url <> 'x' AND {CONTAINING_TS_BOUND}");
+    assert_eq!(
+        gets_to_plan_with_url(&sql).await,
+        0,
+        "a Str <> beside an unknown conjunct answers nothing either"
+    );
+}
+
 /// Issue #3244, exact TWO. A `Str` column declared beside `status` does not
 /// change q02 beside a `TIMESTAMP` bound: the unknown `ts` conjunct sits
 /// beside a non-`Str` `<>`, so the load still fires.
