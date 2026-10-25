@@ -837,7 +837,7 @@ before it:
 
 | run | carries | A box | B box |
 |---|---|---|---|
-| 2 | decisions 1 and 2 (fork PR 1) | current `main` with #3221, stock `load` (band both rows of decision 1 if #3221 has not merged) | the same commit, fork PR 1 |
+| 2 | decision 1 (fork PR 1; decision 2 withdrawn, see the decision 2 fairness amendment) | current `main` with #3221, stock `load` (band both rows of decision 1 if #3221 has not merged) | the same commit, fork PR 1 |
 | 3 | decision 3 (fork PR 2) | one `main` commit, fork PR 1 | the same commit, fork PR 2 |
 | 4 | decision 4 (Ravel, one PR) | the parent of the first of decision 4's commits as they landed on `main`, fork PR 2 | the last of decision 4's commits as they landed on `main`, fork PR 2 |
 | 5 | decision 6 (fork PR 3), after the stage 1 load stamp | a `main` commit carrying decision 5, fork PR 2 | the same commit, fork PR 3 |
@@ -898,7 +898,7 @@ show on its own A/B. Every figure below the anchor is predicted.
 | v0.25.1 stock (run 1) | 5.5 | 367.2 (anchor) | 367.2 (anchor) | | measured 2026-10-23, comment 6368995087 |
 | #3219, PR #3221 (landed) | 4.5 | 277 | 303 | 106 | predicted |
 | decision 1, bloom scope `text` | 3.5 | 249 | 301 | 44 | predicted |
-| decision 2, fold after load | 3.5 | 249 (0 to 2 s, not counted) | 301 | 0 to 2 | predicted |
+| decision 2, fold after load (withdrawn, see the decision 2 fairness amendment) | 3.5 | 249 (0 to 2 s, not counted) | 301 | 0 to 2 | predicted |
 | decision 3, zstd 9 | 3.5 | 242 | 294 | 7 (bytes only) | predicted |
 | decision 4, directories at the tail | 2.5 | 216 | 294 (under 0.1 s) | 42 | predicted |
 | decisions 5 and 6, 100 MB one-group objects | 2 over 103 objects | 148 | 286 | 104 | predicted |
@@ -948,9 +948,11 @@ The reasons are two rules in ClickBench's README (read on 2026-10-25):
 - "The creation of pre-aggregated tables or indices, projections, or
   materialized views is not recommended for the purpose of this
   benchmark." A fold writes a `.cstat` object per part with a value to
-  count dictionary for each declared column, and the metadata aggregate
-  path answers `COUNT(*) WHERE col <> v` (q2) and a `GROUP BY col` count
-  (q8) from those counts. That is a pre-aggregated index, even though the
+  count dictionary and a stored sum for each declared column, and the
+  metadata aggregate path answers `COUNT(*) WHERE col <> v` (q2) and a
+  `GROUP BY col` count (q8) from the dictionaries, and `SUM(col + k)` (q3,
+  q4) and `AVG(col)` (q30) from the stored sums
+  (`crates/ravel-sql/src/metadata_agg.rs:1-32`). That is a pre-aggregated index, even though the
   fold builds it for every tenant and not for this benchmark.
 
 The decision 2 A/B that was run (#3243, with the folded catalog's column
