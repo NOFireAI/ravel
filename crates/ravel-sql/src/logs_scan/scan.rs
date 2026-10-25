@@ -1192,7 +1192,8 @@ impl LogScanStream {
     /// ([`charge_columnar_batches`]). The decoded block they were built from
     /// is charged separately, in [`Self::resident`], and the string values
     /// arrays the scan's [`StrValuesCache`] holds by the cache, from before
-    /// each was built until nothing outside the cache holds it.
+    /// each was built until nothing outside the cache holds its `Arc` or the
+    /// stream releases the cache ([`StrValuesCache::retain_live`]).
     ///
     /// [`Self::emit_next_columnar_batch`] moves each emitted batch's own
     /// charge from `held` to `emitted`; shared values the cache does not hold

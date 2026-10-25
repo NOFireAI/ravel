@@ -8,8 +8,8 @@
 //! `FilterExec` keeps a slice of each filtered batch until it has 8,192 rows.
 //! Neither holds a reservation, so a selective `LIKE` could hold every
 //! block's values while the pool reads one block's charge. Since issue #3241
-//! the scan keeps each values array charged while anything downstream holds
-//! it, which [`p5_heap_held_before_the_coalescer_flushes_is_charged`] asserts.
+//! the scan keeps each values array charged while the coalescer holds it,
+//! which [`p5_heap_held_before_the_coalescer_flushes_is_charged`] asserts.
 //!
 //! The fixture is one RLOG object of `N` blocks of [`BLOCK_ROWS`] rows. Every
 //! `URL` value is [`L`] bytes and distinct across the whole object, so each
@@ -22,7 +22,14 @@
 //! once the stream is exhausted, before the batches drop. Every figure is
 //! printed before it is asserted, so a miss still yields the numbers.
 //!
-//! The bands are the ones pre-registered on #3237; a miss is a finding.
+//! Predictions 2 and 3 assert the bands pre-registered on #3237; a miss is a
+//! finding. Prediction 1 missed as registered and
+//! [`p1_report_one_match_per_block_output_size`] reports it without a band:
+//! the coalescer's finish rebuilds the dictionary over the surviving values,
+//! so at N = 256 the flushed output measured 18,700 bytes, 73 per matched row,
+//! against the registered `N x (8192 x L + 4 x 8193)` = 142,607,360. The pin
+//! is on the coalescer's input before it flushes, which p5 measures; p4
+//! reports a `Utf8` rebuild's size.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
