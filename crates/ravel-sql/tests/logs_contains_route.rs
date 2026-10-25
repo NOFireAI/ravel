@@ -308,7 +308,11 @@ async fn contains_count_keeps_the_whole_segment_route() {
 
     let blocks = BLOCKS_PER_OBJECT * OBJECTS;
     let expected = (MATCHES_PER_BLOCK * blocks) as i64;
-    assert_eq!(count(&pushed.batches), expected, "two needle rows per block");
+    assert_eq!(
+        count(&pushed.batches),
+        expected,
+        "two needle rows per block"
+    );
     assert_eq!(count(&plain.batches), expected);
 
     assert_eq!((plain.blocks_total, plain.blocks_scanned), (blocks, blocks));
