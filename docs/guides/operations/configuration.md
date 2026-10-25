@@ -775,26 +775,27 @@ resize.
 
 ### Cache ceilings
 
-The fetcher cache and the catalog byte cache are two independent LRU caches.
-Each flag bounds only its own cache.
+The fetcher cache, the catalog byte cache and the catalog's column-statistics
+cache are three independent caches. Each flag bounds only its own cache.
 
 | Cache | Flag | Unset, derives from the process memory budget |
 |---|---|---|
 | Fetcher cache | `--cache-max-bytes` | 25%, or 24% against a loopback `--s3-endpoint`. `7516192768` on the 30 GiB reference host at the 25% share, `7215545057` at the 24% share. |
 | Catalog byte cache | `--catalog-cache-max-bytes` | Always a smaller 5%. `1503238553` on the 30 GiB reference host. |
+| Column-statistics cache | `--column-stats-cache-max-bytes` | Always 2%, loopback or not. `601295421` on the 30 GiB reference host. 64 MiB when memory is unknown and `--memory-budget-bytes` is unset; `0` in `--mode gateway`. |
 
 [Per-query budgets](#per-query-budgets) describes the process memory budget.
 
-- Startup refuses to start, and does not clamp, if the two resolved hard caps
-  together reach or exceed the process memory budget. This never happens in
-  `--mode gateway`, which derives no budget.
-- Both ceilings are LRU caps, not reservations. Neither cache pre-allocates,
-  and each holds only the bytes that it admitted.
-- The sum of the two cache ceilings and the SQL memory pools can exceed
+- Startup refuses to start, and does not clamp, if the three resolved hard
+  caps together reach or exceed the process memory budget. This never happens
+  in `--mode gateway`, which derives no budget.
+- The ceilings are caps, not reservations. No cache pre-allocates, and each
+  holds only the bytes that it admitted.
+- The sum of the cache ceilings and the SQL memory pools can exceed
   physical RAM by design. The SQL pools derive from raw host memory, not from
   the process memory budget. The caches fill only under a working set that
   large, and a SQL query aborts before it grows past its own pool.
-- `--disable-cache` turns both caches off and holds no read-cache memory.
+- `--disable-cache` turns all three caches off and holds no read-cache memory.
 
 ### Disk tier behaviour
 
@@ -1889,11 +1890,12 @@ not change the total of the tenant.
   is left, not a reserved quarter.
 - So the SQL memory of one tenant is still at most 50% of `MemTotal`.
 
-The two caches carve the memory budget (`MemTotal` less the overhead reserve:
-2 GiB from 8 GiB of memory up, scaled down below it at the default ingest
-ceiling, as described below), not `MemTotal`. So the three ceilings together come to about 78% of
-`MemTotal` on the reference host (25,125,558,681 of 32,212,254,720). They
-come to about 77% (24,824,910,970) on a loopback store, where the fetcher
+The three caches carve the memory budget (`MemTotal` less the overhead
+reserve: 2 GiB from 8 GiB of memory up, scaled down below it at the default
+ingest ceiling, as described below), not `MemTotal`. So the four ceilings
+(three caches and the SQL tenant ceiling) together come to about 80% of
+`MemTotal` on the reference host (25,726,854,102 of 32,212,254,720). They
+come to about 79% (25,426,206,391) on a loopback store, where the fetcher
 cache derives at 24%.
 
 ### Catalog resolve concurrency
@@ -1939,12 +1941,13 @@ So a higher ceiling adds breadth across prefixes and never depth within one.
 
 ### Other derived settings
 
-Three more settings are derived the same way:
+Four more settings are derived the same way:
 
 | Setting | Derived value |
 |---|---|
 | `--cache-max-bytes` (fetcher cache) | 25% normally, or 24% against a loopback `--s3-endpoint`. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
 | `--catalog-cache-max-bytes` (catalog byte cache) | Always a separate 5% ceiling. 256 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
+| `--column-stats-cache-max-bytes` (column-statistics cache) | Always a separate 2% ceiling. 64 MiB if memory is unknown and `--memory-budget-bytes` is unset. |
 | `--gc-max-query-duration` | 11 minutes. |
 
 - Memory is read from the `MemTotal` of `/proc/meminfo` on Linux and is
@@ -2038,7 +2041,7 @@ further, and re-measure on a different budget or load.
 
 What the budget feeds:
 
-- The part of the budget that the two resolved cache ceilings do not claim
+- The part of the budget that the three resolved cache ceilings do not claim
   sizes a shared memory accountant. The per-tenant tracking of the SQL
   executor reserves against that accountant. So a higher `--cache-max-bytes`
   on a memory-constrained host leaves less headroom for concurrent SQL
@@ -2051,24 +2054,24 @@ What the budget feeds:
 
 The 90% cap binds in these cases:
 
-- An S3 deployment whose effective memory is below about 9.7 GiB (about
-  9.2 GiB against a loopback endpoint, whose 24% fetch-cache share leaves a
+- An S3 deployment whose effective memory is below about 10.9 GiB (about
+  10.3 GiB against a loopback endpoint, whose 24% fetch-cache share leaves a
   slightly larger remainder), cgroup pods included.
 - A host with co-resident processes where available memory is well below
   total.
 
-The budget, its two cache carves, the SQL cap, and the remainder are computed
+The budget, its three cache carves, the SQL cap, and the remainder are computed
 once at startup from the host profile observed at that moment. Nothing about
 them changes while the process runs. A container whose cgroup limit or
 available memory changes later is not noticed until the next restart.
 
-Startup refuses when the two cache ceilings leave no strictly positive
-remainder, and the error names both figures. `--disable-cache` is exempt: a
-process that builds neither cache claims nothing against the budget, and the
-remainder is all of it.
+Startup refuses when the three cache ceilings leave no strictly positive
+remainder, and the error names each figure. `--disable-cache` is exempt: a
+process that builds none of the caches claims nothing against the budget, and
+the remainder is all of it.
 
 Every mode except gateway (`all`, `query`, `maintain`) needs a derived budget
-of at least 256 MiB after the overhead reserve, plus room for what its two
+of at least 256 MiB after the overhead reserve, plus room for what its three
 cache ceilings claim.
 
 ### Gateway mode memory
@@ -2108,7 +2111,7 @@ The current state is visible live at `/metrics`:
 
 | Metric | Meaning |
 |---|---|
-| `ravel_memory_budget_bytes` | The ceiling of the shared accountant. It is the `memory_remainder_bytes` of the startup log: the budget MINUS the two cache ceilings. It is not the pre-carve `memory_budget_bytes` figure logged beside it. `u64::MAX` means unlimited, which is what any host with unreadable memory reports regardless of the caps set on it. |
+| `ravel_memory_budget_bytes` | The ceiling of the shared accountant. It is the `memory_remainder_bytes` of the startup log: the budget MINUS the three cache ceilings. It is not the pre-carve `memory_budget_bytes` figure logged beside it. `u64::MAX` means unlimited, which is what any host with unreadable memory reports regardless of the caps set on it. |
 | `ravel_memory_reserved_bytes` | The reserved total, split by a `component` label. `fetch` is the bytes held by fetch reservations on the PromQL and SQL paths, including distributed fragment slices and the startup cache warm pass. `sql` is the rest of the reserved total: what the per-tenant accountants of the SQL executor hold. |
 | `ravel_memory_handoff_overlap_bytes` | The part of the `fetch` share whose bytes went through the read cache, hit or miss, whether or not the cache kept them. `0` when no read cache is configured. |
 
@@ -2132,7 +2135,7 @@ from:
 | `derived` | Computed from the host profile, or from a host-independent rule. |
 | `derived-available` | `memory_budget_bytes` only: no cgroup limit, derived from `MemAvailable`. |
 | `derived-cgroup` | `memory_budget_bytes` only: a cgroup memory limit is present, so the budget is that limit minus the reserve, ignoring `MemAvailable`. |
-| `budget-carve` | A fixed share of `memory_budget_bytes` and not of raw `MemTotal`. The two cache ceilings resolve to this on a host whose memory could be read or whose budget was set with `--memory-budget-bytes`. |
+| `budget-carve` | A fixed share of `memory_budget_bytes` and not of raw `MemTotal`. The three cache ceilings resolve to this on a host whose memory could be read or whose budget was set with `--memory-budget-bytes`. |
 | `budget-carve-loopback` | The 24% share of the fetcher cache. It is resolved in place of `budget-carve` when the store is `s3` against a loopback endpoint and `--cache-max-bytes` is unset. |
 | `fallback` | No flag and no readable `MemTotal`, so the compiled-in constant is used. |
 
@@ -2147,10 +2150,11 @@ INFO performance default resolved setting="promql_fetch_fanout" value=32 source=
 INFO performance default resolved setting="max_segments" value=1000000 source="derived"
 INFO performance default resolved setting="cache_max_bytes" value=7516192768 source="budget-carve"
 INFO performance default resolved setting="catalog_cache_max_bytes" value=1503238553 source="budget-carve"
+INFO performance default resolved setting="column_stats_cache_max_bytes" value=601295421 source="budget-carve"
 INFO performance default resolved setting="memory_budget_bytes" value=30064771072 source="derived"
 INFO performance default resolved setting="memory_overhead_reserve_bytes" value=2147483648 source="derived"
-INFO performance default resolved setting="memory_hard_caps_bytes" value=9019431321 source="derived"
-INFO performance default resolved setting="memory_remainder_bytes" value=21045339751 source="derived"
+INFO performance default resolved setting="memory_hard_caps_bytes" value=9620726742 source="derived"
+INFO performance default resolved setting="memory_remainder_bytes" value=20444044330 source="derived"
 INFO performance default resolved setting="sql_max_query_bytes" value=16106127360 source="derived" clamped=false remainder_capped=false
 INFO performance default resolved setting="sql_tenant_max_bytes" value=16106127360 source="derived" raised=false remainder_capped=false
 INFO performance default resolved setting="gc_max_query_duration" value_ms=660000 source="derived"

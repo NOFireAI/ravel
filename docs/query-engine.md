@@ -1392,25 +1392,29 @@ number, so when memory cannot be read each cache falls back to a flat
 compiled-in 256 MiB (`268435456`) rather than carving from the `u64::MAX`
 budget above. An explicit `--cache-max-bytes` bounds the fetcher cache and an
 explicit `--catalog-cache-max-bytes` bounds the catalog byte cache, each on
-either path; neither flag reaches the other cache. Whatever remains
-after both carves (`memory_budget_bytes` minus the sum of the two resolved
-cache ceilings) sizes a single shared `ravel_memory::MemoryBudget`
+either path; neither flag reaches the other cache. The column-statistics
+cache is the third hard carve: 2% of the budget
+(`--column-stats-cache-max-bytes` overrides it), and a flat 64 MiB when
+memory cannot be read. Whatever remains after the three carves
+(`memory_budget_bytes` minus the sum of the three resolved cache ceilings)
+sizes a single shared `ravel_memory::MemoryBudget`
 accountant, one instance per process, that the SQL executor's per-tenant
 memory accountants and the PromQL engine's RSEG and RLOG fetchers all reserve
 against. Startup **refuses** to start, rather
-than silently clamping, when the two resolved hard caps together leave no
+than silently clamping, when the three resolved hard caps together leave no
 strictly positive remainder of `memory_budget_bytes` -- caps at or above the
 budget, not only strictly above it (see ADR-1170's 2026-09-07 amendment): a
 remainder of exactly `0` is exactly as unusable as a negative one, since it
 builds the same refuse-everything `MemoryBudget::new(0)`. A typed
-`MemoryBudgetExceeded` error names both figures so the fix is in the error
-message: lower `--cache-max-bytes` or `--catalog-cache-max-bytes`, or raise
+`MemoryBudgetExceeded` error names every figure so the fix is in the error
+message: lower `--cache-max-bytes`, `--catalog-cache-max-bytes` or
+`--column-stats-cache-max-bytes`, or raise
 the host's available memory. A `0`-byte `memory_budget_bytes` reaching this
 check at all is only possible through an explicit `--memory-budget-bytes 0`
 today: a *derived* budget that small already refuses earlier, at startup,
 with the separate `MemoryBudgetBelowMinimum` error below the 256 MiB minimum
 (see above). Against an explicit `0`, the message says so instead: no
-`--cache-max-bytes` value can satisfy the check (both hard caps are
+`--cache-max-bytes` value can satisfy the check (the hard caps are
 non-negative byte counts, so their sum can never go below `0`), and the fix
 is `--memory-budget-bytes` above `0`, or leaving it unset to derive the
 budget from the host's memory.
@@ -1463,13 +1467,13 @@ too, defined below).
 `ravel_memory_budget_bytes` is the ceiling of the shared accountant, which is
 the POST-carve remainder: the startup log's `memory_remainder_bytes`, not the
 `memory_budget_bytes` it is named after. Both figures appear in that log, and
-on the 30 GiB reference host they differ by 9.0 GB, so a dashboard comparing
+on the 30 GiB reference host they differ by 9.6 GB, so a dashboard comparing
 the gauge against the pre-carve line will find bytes it cannot account for.
 The gauge reads `u64::MAX` (unlimited) on the fallback path, which is any host
 where memory could not be read, whatever `--cache-max-bytes` was set to: that
 clamp keys off the budget's source alone, so an explicit cap on an unmeasured
 host still renders unlimited here while the real ceiling behind it is
-`u64::MAX` minus the two caps. It also reads `u64::MAX` on every
+`u64::MAX` minus the three caps. It also reads `u64::MAX` on every
 `--mode gateway` process, which derives no budget, so a panel that takes the
 maximum across pods filters on `mode!="gateway"`.
 

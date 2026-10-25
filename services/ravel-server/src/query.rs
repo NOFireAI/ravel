@@ -104,6 +104,11 @@ pub fn fragments_json(entries: &[crate::distrib::FragmentStatEntry]) -> serde_js
 /// the catalog byte cache's total budget. The other two byte-cache bounds keep
 /// their catalog defaults (the CLI has no flag for them).
 ///
+/// The column-statistics cache keeps the catalog's default ceiling here;
+/// [`build_catalog_for_server`] passes the server's resolved
+/// `--column-stats-cache-max-bytes` instead (ADR-1413 decision 5). Either way
+/// `--disable-cache` builds it with its `0` disabled sentinel.
+///
 /// `cache_dir` is the CLI's `--cache-dir` (#97). When present and the byte cache
 /// is not disabled, the catalog byte cache gains an ADR-0046 local-disk tier at
 /// that path. Its [`CacheLimits`] reuse the SAME `cache_max_bytes` number for
@@ -179,12 +184,15 @@ pub fn build_catalog(
     max_ingest_lag_ns: Option<i64>,
     max_flush_delay: Duration,
 ) -> anyhow::Result<Arc<Catalog>> {
+    let base = server_catalog_config_base();
+    let column_stats_cache_max_bytes = base.column_stats_cache_max_bytes;
     build_catalog_from(
-        server_catalog_config_base(),
+        base,
         store,
         shard_count,
         disable_cache,
         cache_max_bytes,
+        column_stats_cache_max_bytes,
         cache_dir,
         resolve_ceiling,
         max_ingest_lag_ns,
@@ -200,6 +208,7 @@ fn build_catalog_from(
     shard_count: u32,
     disable_cache: bool,
     cache_max_bytes: u64,
+    column_stats_cache_max_bytes: u64,
     cache_dir: Option<PathBuf>,
     resolve_ceiling: Option<usize>,
     max_ingest_lag_ns: Option<i64>,
@@ -209,6 +218,13 @@ fn build_catalog_from(
     // Catalog::new then constructs no byte cache. Mirrors how build_cache turns
     // --disable-cache into a `None` fetcher cache.
     let byte_cache_max_bytes = if disable_cache { 0 } else { cache_max_bytes };
+    // The column-statistics cache has the same `0` sentinel, and
+    // `memory_hard_caps_bytes` charges it nothing under --disable-cache.
+    let column_stats_cache_max_bytes = if disable_cache {
+        0
+    } else {
+        column_stats_cache_max_bytes
+    };
     // `--disable-cache` is documented as the flag for a memory-constrained
     // container, so it must not raise record-cache memory: under it the
     // capacity stays at the flat floor the cache ran on before the derivation
@@ -223,6 +239,7 @@ fn build_catalog_from(
     let mut catalog_config = CatalogConfig {
         shard_count,
         byte_cache_max_bytes,
+        column_stats_cache_max_bytes,
         cache_capacity_per_tenant,
         ..base
     };
@@ -321,6 +338,7 @@ pub fn build_catalog_for_server(
         config.shard_count,
         config.disable_cache,
         config.catalog_cache_max_bytes,
+        config.query_budgets.column_stats_cache_max_bytes,
         config.cache_dir.clone(),
         config.catalog_resolve_concurrency,
         Some(catalog_window_ns),
@@ -555,7 +573,7 @@ pub const DEFAULT_MAX_QUERY_BYTES: usize = ravel_sql::DEFAULT_MAX_QUERY_BYTES;
 /// horizon and still exercise this exact wiring.
 ///
 /// `process_memory_budget` is the ADR-1170 decisions 1/3 process-wide
-/// accountant: the shared remainder left after both hard cache carves
+/// accountant: the shared remainder left after the three hard cache carves
 /// (`ResolvedPerformanceDefaults::memory_remainder_bytes`). It is installed
 /// on the executor via `SqlExecutor::with_process_memory_budget` so every
 /// tenant's SQL memory reservation counts against the SAME instance
@@ -2490,6 +2508,42 @@ mod catalog_cache_tests {
             "--disable-cache reaches the catalog's byte cache"
         );
         assert!(catalog.byte_cache_disk_metrics().is_none());
+    }
+
+    /// The resolved column-statistics cap (issue #3244) reaches
+    /// `CatalogConfig::column_stats_cache_max_bytes` on the catalog the
+    /// server builds, and `--disable-cache` turns it into the `0` sentinel.
+    ///
+    /// RED: pass `server_catalog_config_base().column_stats_cache_max_bytes`
+    /// instead of the parameter in `build_catalog_from` and the first
+    /// assertion reads 67,108,864 against 601,295,421; drop the
+    /// `disable_cache` branch and the second reads 601,295,421 against 0.
+    #[test]
+    fn build_catalog_for_server_applies_the_column_stats_cache_cap() {
+        let config = crate::ServerConfig {
+            query_budgets: crate::config::QueryBudgets {
+                column_stats_cache_max_bytes: 601_295_421,
+                ..crate::config::QueryBudgets::default()
+            },
+            ..server_config()
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &config, 9_000_000_000_000).expect("catalog builds");
+        assert_eq!(catalog.config().column_stats_cache_max_bytes, 601_295_421);
+
+        let disabled = crate::ServerConfig {
+            disable_cache: true,
+            ..config
+        };
+        let store: Arc<dyn ObjectStoreBackend> = Arc::new(MemoryStore::new());
+        let catalog =
+            build_catalog_for_server(store, &disabled, 9_000_000_000_000).expect("catalog builds");
+        assert_eq!(
+            catalog.config().column_stats_cache_max_bytes,
+            0,
+            "--disable-cache reaches the column-statistics cache"
+        );
     }
 }
 

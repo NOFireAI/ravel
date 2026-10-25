@@ -755,7 +755,7 @@ pub struct ServerConfig {
     /// store or otherwise. Ignored when `disable_cache` is set.
     pub catalog_cache_max_bytes: u64,
     /// The ADR-1170 decisions 1/3/4 process-wide memory budget: the shared
-    /// remainder left after both hard cache carves
+    /// remainder left after the three hard cache carves
     /// (`ResolvedPerformanceDefaults::memory_remainder_bytes`), which `main`
     /// fills from the resolved struct. [`start`] wraps this in ONE
     /// `Arc<ravel_memory::MemoryBudget>` shared by the `sql`-featured
@@ -768,7 +768,7 @@ pub struct ServerConfig {
     /// Whether [`Self::process_memory_budget_bytes`] was sized from
     /// [`config::PERF_SOURCE_FALLBACK`] (host memory unknown), rather than
     /// derived from a measured host. On that path the raw remainder is
-    /// `u64::MAX` minus the two hard cache carves, not `u64::MAX` itself; the
+    /// `u64::MAX` minus the three hard cache carves, not `u64::MAX` itself; the
     /// `/metrics` `ravel_memory_budget_bytes` gauge clamps to `u64::MAX` when
     /// this is `true` so a dashboard's `== u64::MAX` unlimited check matches.
     pub process_memory_budget_is_fallback: bool,
@@ -2790,7 +2790,7 @@ pub async fn start_with_heartbeat_and_ipcrypt(
 
     // The ADR-1170 process-wide memory accountant, sized from
     // `ResolvedPerformanceDefaults::memory_remainder_bytes` (the shared
-    // headroom left after both hard cache carves, `main`'s
+    // headroom left after the three hard cache carves, `main`'s
     // `config.process_memory_budget_bytes`). Built once, here, before
     // `metrics_state` and the `sql`-featured executor below so both install
     // the SAME instance rather than two independently drifting counters: the
