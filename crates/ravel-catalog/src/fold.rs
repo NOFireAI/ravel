@@ -4900,13 +4900,14 @@ pub(crate) mod tests {
                     end_ns: 50 * NS_PER_HOUR,
                 },
                 50 * NS_PER_HOUR,
+                &crate::ColumnStatsRequest::summary_only(),
                 &acc,
             )
             .await
             .expect("load ok")
             .expect("stats present");
         assert_eq!(
-            loaded.by_content_hash.len(),
+            loaded.content_hash_segments().count(),
             3,
             "the reused baseline plus the new segment cover all three"
         );

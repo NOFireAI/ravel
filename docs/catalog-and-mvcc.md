@@ -793,8 +793,39 @@ is no whole-tenant fallback and no declared-entry-count coverage comparison to d
 per-part coverage is decided per part, from that part's own field-7 ref
 alone.
 
+Every load takes a `ColumnStatsRequest` naming the columns whose value
+dictionaries the statement reads: `summary_only()` names none,
+`with_dictionary(column)` adds one. Each part's statistics are held in memory
+without the dictionaries the request did not name: a column's `dictionary` is
+emptied while its `dictionary_present` and every other summary field stay as
+decoded. `LoadedColumnStats::dictionary_loaded(column)` is true only when every
+covered part holds that column's dictionary, and a reader that needs one (the
+not-equal count and the per-value group counts) declines when it is false, so
+the statement scans rather than reading an emptied dictionary. SQL over logs
+derives the request from the plan: a `GROUP BY` key's column, and every
+non-string typed column a `<>` conjunct or a conjunct the load decision cannot
+read names; `SUM` and `AVG` read the summary alone.
+
+The decoded parts are kept in a per-process cache with one entry per part,
+keyed by (tenant, signal, the part's declared `.cstat` blake3) as HEAD's
+field-7 ref names it. Every load reads HEAD first, so a fold that changes a
+part's statistics changes its key and the old entry is never served. An entry holds the part's stripped
+segments, the set of dictionaries it holds, and its exact size in bytes (the
+summed encoded length of those segments). A covered part is fetched only when
+it has no entry or its entry lacks a dictionary the request names; the refetch
+stores the union of the held and requested dictionaries, so the entry never
+loses a dictionary an earlier statement loaded. Entries are shared by `Arc`.
+The cache is bounded by `CatalogConfig::column_stats_cache_max_bytes` across
+all tenants and evicts least-recently-used entries past it; an entry larger
+than the whole budget is refused (served to its own load, not stored). Each
+decoded body adds to `Catalog::column_stats_decoded_bytes`, and a cache hit
+adds nothing.
+
 Cost, in accounted GETs: one HEAD GET, plus exactly one GET per covered part
-that carries its own field-7 ref, and nothing else. A part without a field-7
+that carries its own field-7 ref and is not already cached with every
+dictionary the request names, and nothing else. A load whose covered parts are
+all cached with those dictionaries costs the HEAD GET alone. A fold that adds
+one part costs the next load one GET for that part. A part without a field-7
 ref, or whose v3 object is absent or refused, costs no additional GET beyond
 the one already spent (or not spent) on it; the query scans that part's
 segments directly.

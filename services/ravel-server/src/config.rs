@@ -2508,7 +2508,7 @@ pub struct Cli {
 
     /// Maximum resident bytes for the catalog's column-statistics cache
     /// (`query::build_catalog_for_server`), the decoded `.cstat` objects the
-    /// resolve path reuses per tenant, signal and query window, a SEPARATE
+    /// resolve path reuses, one entry per snapshot part, a SEPARATE
     /// LRU ceiling from `--cache-max-bytes` and `--catalog-cache-max-bytes`
     /// (ADR-1413 decision 5). An entry larger than this is served but not
     /// cached. A value of `0` builds no column-statistics cache. Read at
