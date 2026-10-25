@@ -1091,9 +1091,8 @@ mod tests {
     /// size, and what it hands back holds exactly the kept bytes.
     ///
     /// FLIP: reserve the declared body before decoding, as the bulk decode
-    /// did, or hold each segment's working charge until the decode ends;
-    /// either is refused by this budget, and on an unlimited one peaks at
-    /// the declared body.
+    /// did, or strip the dictionaries only after every segment is read;
+    /// either is refused by this budget, failing the `expect`.
     #[tokio::test]
     async fn a_summary_only_fetch_reserves_one_segment_plus_the_kept_bytes() {
         let segments: Vec<ColumnStatsSegment> = (0..WIDE_SEGMENTS).map(wide_segment).collect();

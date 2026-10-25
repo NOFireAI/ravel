@@ -13752,9 +13752,8 @@ mod tests {
     /// body less its one-byte length prefix.
     ///
     /// FLIP: drop the `reserve_decoded` call in `WorkingReservation`'s
-    /// `before_segment` and the refusal moves to the kept bytes, failing the
-    /// `requested` assertion; drop both of its calls and the load succeeds,
-    /// failing `expect_err`.
+    /// `before_segment` and the refusal moves to the segment's kept bytes,
+    /// failing the `requested` assertion.
     #[tokio::test]
     async fn column_stats_decode_reserves_its_output() {
         let store = Arc::new(MemoryStore::new());
