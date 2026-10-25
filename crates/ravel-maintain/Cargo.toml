@@ -48,6 +48,20 @@ ravel-otlp = { workspace = true }
 # Issue #3254: the single-owner ordered map measured against std's BTreeMap
 # in benches/compaction_grouping.rs. Not in [workspace.dependencies].
 bbtree = "=0.1.5"
+criterion = { workspace = true }
+rand = { workspace = true }
+# The workspace forbids `unsafe_code`, so the allocation bench counts through
+# this crate's instrumented global allocator instead of a hand-rolled one
+# (the same pin ravel-logseg, ravel-otap and ravel-otlp use).
+stats_alloc = "0.1.10"
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "compaction_grouping"
+harness = false
+
+[[bench]]
+name = "compaction_grouping_alloc"
+harness = false
