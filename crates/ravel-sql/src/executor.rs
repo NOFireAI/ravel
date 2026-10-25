@@ -7813,6 +7813,90 @@ pub(crate) mod tests {
         );
     }
 
+    /// Issue #3244: the column-statistics request each admitted shape derives,
+    /// read from the same analyzed plan the executor's gate judges. q02 names
+    /// its `<>` column, q08 its group key, SUM and AVG no dictionary, an
+    /// unknown conjunct every non-`Str` declared column it names, and two
+    /// `logs` aggregates in one statement the union of theirs.
+    ///
+    /// FLIP: make `plan_stats_answerable_request` return every non-`Str`
+    /// declared column's dictionary for an admitted plan (what the
+    /// pre-change load always carried); the q02 case fails first, naming
+    /// `code`, `level` and `status`. `level` is declared and named by no
+    /// statement here so the unknown-conjunct and union cases fail too.
+    #[tokio::test]
+    async fn column_stats_request_names_only_the_dictionaries_a_shape_reads() {
+        let exec = eviction_test_executor();
+        let t = TenantHash([3u8; 16]);
+        let declared = [
+            DeclaredColumn::new("status", DeclaredType::I64),
+            DeclaredColumn::new("code", DeclaredType::I64),
+            DeclaredColumn::new("level", DeclaredType::I64),
+            DeclaredColumn::new("region", DeclaredType::Str),
+        ];
+        let request_for = |sql: &'static str| {
+            let exec = &exec;
+            let declared = &declared;
+            async move {
+                let plan = exec
+                    .sql_classification_plan(t, sql, declared, None)
+                    .await
+                    .expect("the statement plans");
+                plan_stats_answerable_request(&plan, declared)
+            }
+        };
+        let names = |request: Option<ColumnStatsRequest>| {
+            request.map(|request| {
+                request
+                    .dictionary_columns()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+        };
+
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE status <> 500").await),
+            Some(vec!["status".to_string()]),
+            "q02 names exactly its <> column"
+        );
+        assert_eq!(
+            names(request_for("SELECT code, COUNT(*) FROM logs GROUP BY code").await),
+            Some(vec!["code".to_string()]),
+            "q08 names exactly its key"
+        );
+        assert_eq!(
+            names(request_for("SELECT SUM(status) FROM logs").await),
+            Some(Vec::new()),
+            "SUM is summary only"
+        );
+        assert_eq!(
+            names(request_for("SELECT AVG(status) FROM logs").await),
+            Some(Vec::new()),
+            "AVG is summary only"
+        );
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE status + code <> 7").await),
+            Some(vec!["code".to_string(), "status".to_string()]),
+            "an unknown conjunct names both non-Str columns it reads"
+        );
+        assert_eq!(
+            names(
+                request_for(
+                    "SELECT (SELECT COUNT(*) FROM logs WHERE status <> 1) AS a, \
+                     (SELECT COUNT(*) FROM logs WHERE code <> 2) AS b"
+                )
+                .await
+            ),
+            Some(vec!["code".to_string(), "status".to_string()]),
+            "two logs aggregates take the union"
+        );
+        assert_eq!(
+            names(request_for("SELECT COUNT(*) FROM logs WHERE region <> 'eu'").await),
+            None,
+            "a <> on a Str column is refused"
+        );
+    }
+
     /// ADR-0094 decision 1: the classifier admits exactly the exact-typed
     /// shapes and rejects the rest, exercised through the real throwaway-session
     /// plan+analyze path (not the pure helpers in isolation).
