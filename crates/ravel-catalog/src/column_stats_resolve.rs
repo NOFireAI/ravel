@@ -609,7 +609,7 @@ pub(crate) fn resolve_part_stats_ref(part: &SnapshotPartRef) -> Option<ResolvedS
 ///
 /// The decode streams one segment at a time and keeps only the dictionaries
 /// `keep` holds, so the memory it reserves peaks at the largest segment's
-/// encoded length plus the bytes kept, never the declared body.
+/// encoded length plus the bytes kept, rather than the declared body up front.
 ///
 /// A record's `writer_id` selects which map it lands in: 16 bytes is the
 /// retired v1 `EntryIdentity` tuple (never produced anymore), 32 bytes is a

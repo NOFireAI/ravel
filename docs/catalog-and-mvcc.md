@@ -799,11 +799,12 @@ dictionaries the statement reads: `summary_only()` names none,
 without the dictionaries the request did not name: a column's `dictionary` is
 emptied while its `dictionary_present` and every other summary field stay as
 decoded. The decode streams the body one segment at a time, validating each
-segment in full before clearing its unrequested dictionaries. An object with
-one defect is refused with the same error the whole-object decode gives (one
-with several can be refused for a different one of them), and the load never
-holds more than one segment plus the kept bytes (step 1 of "Snapshot
-resolution from a folded snapshot" below).
+segment in full before clearing the dictionaries it does not keep (those the
+request names, plus those the part's cached entry already held). An object
+with one defect is refused with the same `SnapshotFormatError` variant the
+whole-object decode gives (one with several can be refused for a different
+one of them), and the load never reserves more than one segment plus the kept
+bytes (step 1 of "Snapshot resolution from a folded snapshot" below).
 `LoadedColumnStats::dictionary_loaded(column)` is true only when every
 covered part holds that column's dictionary, and a reader that needs one (the
 not-equal count and the per-value group counts) declines when it is false, so
@@ -2215,9 +2216,10 @@ pinning are unchanged:
    but its decode streams (issue #3244): the body is decompressed one
    length-delimited segment at a time, each segment's encoded length is
    reserved before it is read, and once the segment is validated and its
-   unrequested dictionaries are cleared that charge is replaced by one for
-   the bytes it keeps. A load therefore reserves at most one segment plus
-   the kept bytes, never the whole declared body; a body declared over the
+   unkept dictionaries are cleared that charge is replaced by one for the
+   bytes it keeps. A load therefore reserves at most its largest segment
+   plus the kept bytes, rather than the whole declared body up front; a
+   body declared over the
    ceiling is charged 0 and refused before any segment is read. A refusal
    fails the load with `LoadColumnStatsError::MemoryExhausted`, which a SQL
    client sees as 422 with the budget's own message (ADR-2633 section 5),
