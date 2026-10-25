@@ -167,7 +167,7 @@ pub fn read_page(bytes: &[u8], desc: &PageDesc, max_uncomp: u64) -> Result<Vec<u
             Ok(bytes.to_vec())
         }
         COMP_ZSTD => {
-            let decoded = zstd::bulk::decompress(bytes, desc.uncomp_len as usize)
+            let decoded = ravel_codec::zstd_frame::decompress(bytes, desc.uncomp_len as usize)
                 .map_err(|e| LogSegError::Corrupted(format!("zstd decompress: {e}")))?;
             if decoded.len() as u64 != desc.uncomp_len {
                 return Err(LogSegError::Corrupted(format!(
@@ -304,6 +304,64 @@ mod tests {
             read_page(&buf, &desc, DEFAULT_MAX_UNCOMP),
             Err(LogSegError::Corrupted(_))
         ));
+    }
+
+    fn zstd_page(len: usize, seed: u8) -> (Vec<u8>, Vec<u8>, PageDesc) {
+        let encoded: Vec<u8> = (0..len)
+            .map(|i| ((i / 9) as u8).wrapping_add(seed))
+            .collect();
+        let mut buf = Vec::new();
+        let desc = write_page(&mut buf, 0, Enc::Plain, &encoded, 3);
+        assert_eq!(desc.comp, COMP_ZSTD);
+        (encoded, buf, desc)
+    }
+
+    #[test]
+    fn consecutive_pages_of_different_sizes_decode_exactly() {
+        let pages = [
+            zstd_page(600, 1),
+            zstd_page(90_000, 2),
+            zstd_page(600, 3),
+            zstd_page(7_000, 4),
+        ];
+        for (encoded, stored, desc) in &pages {
+            assert_eq!(
+                &read_page(stored, desc, DEFAULT_MAX_UNCOMP).expect("read"),
+                encoded
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_or_corrupt_frame_is_corrupted_and_next_page_decodes() {
+        let (encoded, stored, desc) = zstd_page(40_000, 5);
+        assert_eq!(
+            read_page(&stored, &desc, DEFAULT_MAX_UNCOMP).expect("warm"),
+            encoded
+        );
+
+        // Descriptor agrees with the cut length, so only zstd can reject it.
+        let cut = &stored[..stored.len() / 2];
+        let cut_desc = PageDesc {
+            len: cut.len() as u64,
+            ..desc
+        };
+        assert!(matches!(
+            read_page(cut, &cut_desc, DEFAULT_MAX_UNCOMP),
+            Err(LogSegError::Corrupted(_))
+        ));
+
+        let mut bad = stored.clone();
+        bad[0] ^= 0xff;
+        assert!(matches!(
+            read_page(&bad, &desc, DEFAULT_MAX_UNCOMP),
+            Err(LogSegError::Corrupted(_))
+        ));
+
+        assert_eq!(
+            read_page(&stored, &desc, DEFAULT_MAX_UNCOMP).expect("after errors"),
+            encoded
+        );
     }
 }
 

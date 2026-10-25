@@ -528,7 +528,7 @@ pub(crate) fn decode_section_bytes(
         lz4_flex::decompress_size_prepended(stored)
             .map_err(|e| SegmentError::Decompress(e.to_string()))?
     } else if section.comp == compression::ZSTD {
-        zstd::bulk::decompress(stored, capacity)
+        ravel_codec::zstd_frame::decompress(stored, capacity)
             .map_err(|e| SegmentError::Decompress(e.to_string()))?
     } else {
         return Err(SegmentError::InvalidSectionCompression(section.comp));
@@ -2627,5 +2627,85 @@ mod provenance_extension_tests {
         let err = take_encoded_i64_block(&meta, &mut pos, 1)
             .expect_err("an empty column block has no Enc tag");
         assert!(matches!(err, SegmentError::ProvenanceColumnCodec(_)));
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod zstd_section_tests {
+    use ravel_proto::segment::v1::Section;
+
+    use super::decode_section_bytes;
+    use crate::error::SegmentError;
+    use crate::format::{ReaderLimits, compression, section_kind};
+
+    fn zstd_section(raw: &[u8]) -> (Section, Vec<u8>) {
+        let stored = zstd::bulk::compress(raw, 3).expect("compress");
+        let section = Section {
+            kind: section_kind::SERIES_META,
+            offset: 0,
+            len: stored.len() as u64,
+            crc32c: crc32c::crc32c(&stored),
+            comp: compression::ZSTD,
+            uncompressed_len: raw.len() as u64,
+        };
+        (section, stored)
+    }
+
+    fn raw(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| ((i / 3) as u8).wrapping_add(seed))
+            .collect()
+    }
+
+    #[test]
+    fn consecutive_sections_of_different_sizes_decode_exactly() {
+        let limits = ReaderLimits::default();
+        let (small, big, mid) = (raw(700, 1), raw(80_000, 2), raw(5_000, 3));
+        for want in [&small, &big, &small, &mid] {
+            let (section, stored) = zstd_section(want);
+            let got = decode_section_bytes(&section, &stored, limits).expect("decode");
+            assert_eq!(&got, want);
+        }
+    }
+
+    #[test]
+    fn truncated_or_corrupt_frame_is_a_typed_error_and_context_recovers() {
+        let limits = ReaderLimits::default();
+        let data = raw(30_000, 4);
+        let (section, stored) = zstd_section(&data);
+        assert_eq!(
+            decode_section_bytes(&section, &stored, limits).expect("warm"),
+            data
+        );
+
+        // Truncated frame with a crc and length that agree with it, so only
+        // the decompressor can reject it.
+        let cut = &stored[..stored.len() / 2];
+        let truncated = Section {
+            len: cut.len() as u64,
+            crc32c: crc32c::crc32c(cut),
+            ..section.clone()
+        };
+        assert!(matches!(
+            decode_section_bytes(&truncated, cut, limits),
+            Err(SegmentError::Decompress(_))
+        ));
+
+        let mut bad = stored.clone();
+        bad[0] ^= 0xff;
+        let corrupt = Section {
+            crc32c: crc32c::crc32c(&bad),
+            ..section.clone()
+        };
+        assert!(matches!(
+            decode_section_bytes(&corrupt, &bad, limits),
+            Err(SegmentError::Decompress(_))
+        ));
+
+        assert_eq!(
+            decode_section_bytes(&section, &stored, limits).expect("after errors"),
+            data
+        );
     }
 }
